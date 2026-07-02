@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .virtual import virtual_config, virtual_config_with_overrides
-from .base import CameraDevice, SequencerDevice, TrapArrayDevice, validate_device_contract
+from .base import BaseDevice, CameraDevice, SequencerDevice, TrapArrayDevice, validate_device_contract
 
 
 BUILTIN_DEVICE_CLASS_PATHS = {
@@ -145,8 +145,14 @@ def load_devices(
     *,
     overrides: Mapping[str, Mapping[str, Any]] | None = None,
     open_devices: bool = False,
+    lookup: Mapping[str, Any] | None = None,
 ) -> DeviceSet:
-    """Load a device graph from ``virtual``, JSON, or a Python dict."""
+    """Load a device graph from ``virtual``, JSON, or a Python dict.
+
+    ``lookup`` (optional) is a caller namespace consulted FIRST when resolving each
+    entry's ``"type"`` -- pass ``globals()`` and any device class defined in the calling
+    notebook is usable in a config without registration (the confocal lookup_dict
+    pattern).  See :func:`resolve_class` for the full resolution order."""
 
     cfg = read_config(config)
     apply_device_overrides(cfg, overrides)
@@ -171,7 +177,7 @@ def load_devices(
             raise KeyError(f"device {name!r} is not present in config.")
         visiting.add(name)
         entry = cfg[name]
-        cls = resolve_class(str(entry["type"]))
+        cls = resolve_class(str(entry["type"]), lookup=lookup)
         params = resolve(dict(entry.get("params", {})))
         devices[name] = cls(**params)
         validate_device_contract(name, devices[name])
@@ -274,7 +280,19 @@ def deep_update(target: dict[str, Any], source: Mapping[str, Any]) -> None:
             target[key] = deepcopy(value)
 
 
-def resolve_class(name: str) -> type:
+def resolve_class(name: str, lookup: Mapping[str, Any] | None = None) -> type:
+    """Resolve a config ``"type"`` name to a device class.
+
+    Resolution order: the caller's ``lookup`` namespace first (only entries that ARE
+    ``BaseDevice`` subclasses count, so ``globals()`` passes verbatim -- helpers, modules,
+    and constants in the namespace are ignored), then the registry (built-ins plus
+    :func:`register_device_class`), then a fully-qualified import path.  A ``lookup`` hit
+    is per-call: it never writes into the shared registry."""
+
+    if lookup is not None:
+        candidate = lookup.get(str(name))
+        if isinstance(candidate, type) and issubclass(candidate, BaseDevice):
+            return candidate
     target = DEVICE_CLASSES.get(name, name)
     if isinstance(target, type):
         return target

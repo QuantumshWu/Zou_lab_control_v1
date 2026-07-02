@@ -36,6 +36,7 @@ from .measurement import (
     ScannedMeasurement,
     ShotPlan,
     axis_range_tuple,
+    triggered_frames,
 )
 from .measurement_registry import (
     discovered_specs,
@@ -95,6 +96,7 @@ __all__ = [
     "ProcessorSpec",
     "discovered_task_specs",
     "task",
+    "triggered_frames",
     "register_task",
     "registered_tasks",
     "unregister_task",

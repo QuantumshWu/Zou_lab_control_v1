@@ -502,7 +502,7 @@ def test_camera_measurement_region_is_editable_and_applies_to_virtual():
         node = exp.readout.camera_spec().build(SignalHub(), region="10, 50, 8, 40")
         assert node.camera.roi is not None
         fire_live_imaging(exp)                            # On Pulse: the trigger-driven camera streams
-        frame = node.camera.acquire(1, sequence=getattr(node.sequencer, "firing", None))[0]
+        frame = node.camera.acquire(1)[0]                # the wired camera senses the firing itself
         assert np.asarray(frame).shape != (40, 50)        # ROI actually crops the virtual frame
         assert "region" in node.acquisition_parameters()  # round-trips (endpoints)
     finally:

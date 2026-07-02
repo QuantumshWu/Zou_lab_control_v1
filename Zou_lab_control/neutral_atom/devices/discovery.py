@@ -7,11 +7,12 @@ missing -- a missing library is itself a reported row ("pip install ..."), not a
 Decoupling rule: **a device class owns its own discovery.**  Any class in the device registry
 may implement a ``discover() -> list[DiscoveredDevice]`` classmethod that enumerates its bus and
 returns rows whose ``config`` is a ready ``{"type", "params"}`` entry for itself (see
-:meth:`~.pylon.PylonCamera.discover`).  This module only AGGREGATES: it walks the registry,
-asks each discoverable class, and appends the one bus that belongs to no class (bare VISA
-instruments, listed informationally with their ``*IDN?`` identity so the operator can wire the
-address into a custom class via ``register_device_class``).  Adding a new discoverable device
-touches ONLY that device's class -- never this file.
+:meth:`~.pylon.PylonCamera.discover`).  A bus that belongs to NO device class is scanned by a
+DISCOVERY PROVIDER -- a plain zero-arg callable returning rows, registered under a name in
+``DISCOVERY_PROVIDERS`` via :func:`register_discovery_provider`.  VISA is the built-in provider:
+it lists every resource with its ``*IDN?`` identity so the operator can wire the address into a
+custom device class (``register_device_class``).  This module only AGGREGATES the two
+registries -- adding a discoverable device or a new bus never touches this file.
 
     >>> import Zou_lab_control.neutral_atom as na
     >>> found = na.discover_devices()          # prints a table, returns the rows
@@ -22,6 +23,7 @@ touches ONLY that device's class -- never this file.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Callable
 
 
 @dataclass(frozen=True)
@@ -71,7 +73,30 @@ def _registered_discoverers() -> tuple[list[tuple[str, object]], list[Discovered
     return found, notes
 
 
-# --------------------------------------------------------------------------- the class-less bus
+# --------------------------------------------------------------------------- class-less buses
+#: Named bus scanners for instruments NO device class claims (name -> zero-arg callable
+#: returning :class:`DiscoveredDevice` rows).  Every provider obeys the same contract as a
+#: class's ``discover()``: report rows/notes, never raise.  VISA is the built-in entry;
+#: operators add their own via :func:`register_discovery_provider`.
+DISCOVERY_PROVIDERS: dict[str, Callable[[], "list[DiscoveredDevice]"]] = {}
+
+
+def register_discovery_provider(name: str, provider: Callable[[], "list[DiscoveredDevice]"]) -> None:
+    """Register a bus scanner under ``name`` so ``discover_devices()`` runs it.
+
+    A provider is for a bus that belongs to no single device class (a serial port zoo, a
+    site-specific chassis...).  It takes no arguments and returns :class:`DiscoveredDevice`
+    rows -- use :func:`discovery_note` for a missing library / empty bus, and NEVER raise
+    (a crash is caught and reported as a note row anyway).  Re-registering a name replaces
+    the previous provider."""
+
+    if not str(name).strip():
+        raise ValueError("discovery provider name must not be empty.")
+    if not callable(provider):
+        raise TypeError("discovery provider must be a callable returning DiscoveredDevice rows.")
+    DISCOVERY_PROVIDERS[str(name)] = provider
+
+
 def visa_rows(resources, idn_of) -> list[DiscoveredDevice]:
     """VISA enumeration -> rows.  ``resources`` is the ``list_resources()`` tuple, ``idn_of``
     maps a resource name to its ``*IDN?`` reply (or a placeholder) -- pure apart from the
@@ -83,7 +108,12 @@ def visa_rows(resources, idn_of) -> list[DiscoveredDevice]:
             for r in resources]
 
 
-def _probe_visa(idn_timeout_ms: int = 300) -> list[DiscoveredDevice]:
+def probe_visa(idn_timeout_ms: int = 300) -> list[DiscoveredDevice]:
+    """The built-in VISA provider: every resource listed with its ``*IDN?`` identity.
+
+    Missing pyvisa / empty bus / probe failures are note rows (report, never raise).
+    Registered under ``"visa"``; an operator needing a longer identity timeout replaces it:
+    ``register_discovery_provider("visa", lambda: probe_visa(idn_timeout_ms=1000))``."""
     try:
         import pyvisa
     except ImportError:
@@ -117,32 +147,39 @@ def _probe_visa(idn_timeout_ms: int = 300) -> list[DiscoveredDevice]:
     return visa_rows(resources, idn_of)
 
 
-def discover_devices(*, visa: bool = True, idn_timeout_ms: int = 300,
-                     display: bool = True) -> list[DiscoveredDevice]:
+DISCOVERY_PROVIDERS["visa"] = probe_visa
+
+
+def discover_devices(*, display: bool = True) -> list[DiscoveredDevice]:
     """Scan the buses lab instruments live on and return :class:`DiscoveredDevice` rows.
 
     Every REGISTERED device class that implements ``discover()`` scans its own bus (the class
-    owns the knowledge of how it is found and what its config looks like); ``visa=True`` also
-    lists bare VISA resources (each queried with ``*IDN?`` under ``idn_timeout_ms``).  A missing
-    driver library or an empty bus is reported as a row, never raised.  ``display=True`` also
-    prints the table."""
+    owns the knowledge of how it is found and what its config looks like), then every named
+    DISCOVERY PROVIDER scans its class-less bus (VISA built in, each resource queried with
+    ``*IDN?``).  A missing driver library, an empty bus, or a crashing scanner is reported
+    as a row, never raised.  ``display=True`` also prints the table."""
 
     discoverers, rows = _registered_discoverers()
     rows = list(rows)                           # import-failure notes lead the table
     seen: set[tuple[str, str]] = set()
-    for _name, cls in discoverers:
+
+    def scan(source: str, fn) -> None:
+        """One scanner's rows, deduped -- classes and providers share this exact path."""
         try:
-            class_rows = list(cls.discover())
-        except Exception as exc:                # a discover() must not break the whole scan
-            class_rows = [discovery_note(cls.__name__, f"discover failed: {exc}")]
-        for row in class_rows:
+            new_rows = list(fn())
+        except Exception as exc:                # one broken scanner must not break the scan
+            new_rows = [discovery_note(source, f"discover failed: {exc}")]
+        for row in new_rows:
             key = (row.kind, row.ident)         # two registry names for one class scan once
             if key in seen:
                 continue
             seen.add(key)
             rows.append(row)
-    if visa:
-        rows += _probe_visa(idn_timeout_ms)
+
+    for _name, cls in discoverers:
+        scan(cls.__name__, cls.discover)
+    for name, provider in sorted(DISCOVERY_PROVIDERS.items()):
+        scan(name, provider)
     if display:
         for row in rows:
             print(row)

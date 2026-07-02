@@ -30,9 +30,10 @@ zf.apply_style()
 
 推荐调用边界：
 
-- `na.BaseDevice` / `na.CameraDevice` / `na.SequencerDevice` / `na.TrapArrayDevice`：硬件契约。真实 camera 至少要满足 `exposure`、`configure(...)`、`acquire(frames, *, sequence=None, on_armed=None)`（纯 grabber：arm 后回调 `on_armed` 让测量层 fire FPGA，相机自己不驱动序列器）。
+- `na.BaseDevice` / `na.CameraDevice` / `na.SequencerDevice` / `na.TrapArrayDevice`：硬件契约。真实 camera 至少要满足 `exposure`、`configure(...)` 和纯 grabber 三原语 `arm(frames)`（返回即硬件就绪等触发）/ `read_frames(n)`（从设备自有缓冲取帧，武装期间不丢帧）/ `disarm()`；`acquire(frames)` 是三者的免触发便捷组合。相机不感知时序——arm 之后到达的触发边沿产生帧，仅此而已。
+- `na.triggered_frames(camera, sequencer, sequence, frames)`：测量层**唯一**的 arm-before-fire 编排（arm 相机 → prepare+fire 序列 → 读回帧）。需要 sequencer 的是测量层，从来不是相机。
 - `na.load_devices(...)`：按 JSON/dict 构造 device graph，合并本次运行的 device 参数，并要求每个 device 继承对应 base class；需要时也可以统一 open。
-- `exp.camera`：真实 camera device 本体，`capture()` 是 camera device 方法。
+- `exp.camera`：真实 camera device 本体；一键快照是会话级编排 `exp.capture()`。
 - `exp.readout`：camera readout subsystem，包含 sitemap、threshold、detect、detection-time fidelity calibration。
 - `exp.timing.*`：pulse sequence、preflight、Verilog 生成。
 
@@ -79,10 +80,10 @@ preflight.summary()
 <!-- cell:markdown -->
 ## Capture a camera image
 
-`capture` 是 camera device 的方法，所以调用是 `exp.camera.capture()`。它永远只显示 raw camera frame，不自动叠加 sitemap 圈；site overlay 只属于 calibration/readout/detect 图。virtual camera 参考 C15550-22UP 的量级：约 200 counts offset、0.107 electrons/count、0.43 electrons RMS readout noise。
+`capture` 是会话级编排（相机本身不感知会话），所以调用是 `exp.capture()`；`camera=` 可指名任意一台相机。它永远只显示 raw camera frame，不自动叠加 sitemap 圈；site overlay 只属于 calibration/readout/detect 图。virtual camera 参考 C15550-22UP 的量级：约 200 counts offset、0.107 electrons/count、0.43 electrons RMS readout noise。
 
 <!-- cell:code -->
-capture = exp.camera.capture(display=True)
+capture = exp.capture(display=True)
 capture.summary()
 
 <!-- cell:markdown -->
@@ -127,14 +128,15 @@ occupancy_grid
 
 <!-- cell:code -->
 standalone_sequence = na.imaging_sequence(exposure=exp.camera.exposure, load=True, name="sitemap")
-standalone_images = exp.camera.acquire(4, sequence=standalone_sequence)
+standalone_images = na.triggered_frames(
+    exp.devices.camera, exp.devices.sequencer, standalone_sequence, 4)
 standalone_sitemap = na.calibrate_sitemap_from_images(
     standalone_images,
     grid_shape=exp.devices.trap_array.grid_shape,
     display=False,
 )
 standalone_threshold = na.calibrate_threshold_from_images(
-    exp.camera.capture(frames=12, display=False).images,
+    exp.capture(frames=12, display=False).images,
     standalone_sitemap.calibration,
     display=False,
 )
@@ -149,12 +151,12 @@ standalone_shot.occupied.shape
 1. **从全亮模板图像提取 PSF**(`method="psf"`):`core.psf.fit_site_psfs` 对每个检测到的 site 裁框、扣环形背景、拟合 2D 高斯,得到**逐站点归一化 PSF 权重**;逐发提取改成 PSF 加权点积(已知形状 + 加性噪声下信噪比最优)。权重是**拟合出来的**,不是预设的——下面 `psf_cal.psf_weights.shape` 就是它。
 2. **从计数分布定阈值**(`method="bimodal"`):拟合暗/亮双高斯峰核,阈值放在两高斯总错判率最小处,并给出模型保真度。
 
-二者都接在同一套 `TrapCalibration.detect` 契约后面(box/otsu 仍是默认)。下面用 standalone 路径演示,不改动上面 session 的 box 标定。`psf_template_images` 这里由 `exp.camera.acquire(...)` 拿到(虚拟相机产帧);真机上同一行换成真相机即可,`calibrate_sitemap_from_images`/`calibrate_threshold_from_images` 一字不改。
+二者都接在同一套 `TrapCalibration.detect` 契约后面(box/otsu 仍是默认)。下面用 standalone 路径演示,不改动上面 session 的 box 标定。`psf_template_images` 这里由 `na.triggered_frames(...)` 拿到(armed 相机 + fired 成像序列,虚拟相机经触发线产帧);真机上同一行换成真相机即可,`calibrate_sitemap_from_images`/`calibrate_threshold_from_images` 一字不改。
 
 <!-- cell:code -->
-psf_template_images = exp.camera.acquire(
-    8, sequence=na.imaging_sequence(exposure=exp.camera.exposure, load=True, name="sitemap")
-)
+psf_template_images = na.triggered_frames(
+    exp.devices.camera, exp.devices.sequencer,
+    na.imaging_sequence(exposure=exp.camera.exposure, load=True, name="sitemap"), 8)
 psf_sitemap = na.calibrate_sitemap_from_images(
     psf_template_images,
     grid_shape=exp.devices.trap_array.grid_shape,
@@ -162,14 +164,14 @@ psf_sitemap = na.calibrate_sitemap_from_images(
     display=False,
 )
 psf_threshold = na.calibrate_threshold_from_images(
-    exp.camera.capture(frames=120, display=False).images,
+    exp.capture(frames=120, display=False).images,
     psf_sitemap.calibration,
     method="bimodal",
     display=False,
 )
 psf_cal = psf_threshold.calibration
 print("method:", psf_cal.method, "| psf weights:", psf_cal.psf_weights.shape)
-na.detect_image(exp.camera.capture(display=False).image, psf_cal, display=True).occupied.sum()
+na.detect_image(exp.capture(display=False).image, psf_cal, display=True).occupied.sum()
 
 <!-- cell:markdown -->
 ## Per-site readout fidelity from data — Rb87 文件夹工作流(与真机完全一致)

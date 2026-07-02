@@ -23,6 +23,7 @@ if sys.path[0] != str(REPO_ROOT):
 from Zou_lab_control.neutral_atom.devices.virtual import (
     VirtualCamera, VirtualSequencer, VirtualTrapArray,
 )
+from Zou_lab_control.neutral_atom.operations.measurement import triggered_frames
 from Zou_lab_control.neutral_atom.timing import imaging_sequence
 
 from conftest import fire_imaging_pulse   # the live "On Pulse" the trigger-driven camera needs
@@ -34,8 +35,8 @@ def _rig(**trap):
     user has hit "On Pulse").  ``set_safe_state()`` would stop it (the camera then sees no
     trigger and freezes)."""
     trap_array = VirtualTrapArray(grid_shape=(4, 5), seed=11, **trap)
-    cam = VirtualCamera(trap_array)
     seqr = VirtualSequencer()
+    cam = VirtualCamera(trap_array, sequencer=seqr)   # the trigger cable, wired at construction
     fire_imaging_pulse(seqr, exposure=cam.exposure, cooling=trap_array.mot_load_s)
     return trap_array, cam, seqr
 
@@ -46,7 +47,7 @@ def test_each_shot_is_a_fresh_random_loading():
     trap, cam, seqr = _rig(loading_probability=0.5)
     fractions, patterns = [], set()
     for _ in range(40):
-        cam.acquire(1, sequence=getattr(seqr, "firing", None))          # the live-monitor path (no explicit sequence)
+        cam.acquire(1)                               # the live-monitor path (the wire senses the firing)
         fractions.append(float(trap.occupancy.mean()))
         patterns.add(trap.occupancy.tobytes())
     assert 0.4 <= np.mean(fractions) <= 0.6      # ~50% loading on average
@@ -57,9 +58,9 @@ def test_set_occupancy_is_a_one_shot_pin():
     """set_occupancy images THAT loading on the next shot, then resumes reloading."""
     trap, cam, seqr = _rig()
     trap.set_occupancy([0, 1, 4, 9])
-    cam.acquire(1, sequence=getattr(seqr, "firing", None))
+    cam.acquire(1)
     assert list(np.flatnonzero(trap.occupancy)) == [0, 1, 4, 9]   # pinned loading imaged
-    cam.acquire(1, sequence=getattr(seqr, "firing", None))
+    cam.acquire(1)
     # the shot after the pin is a fresh stochastic loading again (extremely unlikely
     # to reproduce the exact 4-site pattern by chance)
     assert list(np.flatnonzero(trap.occupancy)) != [0, 1, 4, 9]
@@ -71,7 +72,7 @@ def test_threshold_frames_are_independent_loadings():
     when empty) -- the spread an otsu threshold needs."""
     trap, cam, seqr = _rig(loading_probability=0.5)
     seq = imaging_sequence(exposure=20e-3, load=True, name="readout")
-    frames = cam.acquire(40, sequence=seq, on_armed=lambda: (seqr.prepare(seq), seqr.fire(seq)))
+    frames = triggered_frames(cam, seqr, seq, 40)
     # central pixel of site 0 over the 40 independent shots: a clear bright/dark split
     cy, cx = (int(round(c)) for c in trap._site_centers()[0][::-1])
     centre = np.array([float(f[cy, cx]) for f in frames])
@@ -89,7 +90,7 @@ def test_repeated_single_trigger_frames_all_use_the_window_exposure():
     regression this guards (the threshold floated 209 -> 286 above the ~210 atom signal at 2 ms)."""
     trap, cam, seqr = _rig(loading_probability=1.0)            # every site loaded -> brightness == exposure
     seq = imaging_sequence(exposure=2e-3, load=True, name="readout")   # a SHORT 2 ms readout window
-    frames = cam.acquire(8, sequence=seq, on_armed=lambda: (seqr.prepare(seq), seqr.fire(seq)))
+    frames = triggered_frames(cam, seqr, seq, 8)
     over_bg = np.array([float(np.asarray(f).max()) - 200.0 for f in frames])   # peak atom signal per frame
     assert over_bg.min() > 0                                   # every frame imaged a real atom
     # all frames at the SAME short-exposure brightness; the bug made the repeats ~6x brighter
@@ -196,11 +197,11 @@ def test_acquire_applies_vacuum_loss_over_a_dark_hold_between_frames():
 
     def survival(hold: float) -> float:
         trap = VirtualTrapArray(grid_shape=(10, 10), loading_probability=1.0, seed=12, trap_lifetime_s=8.0)
-        cam, seqr = VirtualCamera(trap), VirtualSequencer()
+        seqr = VirtualSequencer()
+        cam = VirtualCamera(trap, sequencer=seqr)
         kept = total = 0
         for _ in range(8):
-            _s = hold_seq(hold)
-            cam.acquire(2, sequence=_s, on_armed=lambda s=_s: (seqr.prepare(s), seqr.fire(s)))  # frame0 loads, dark hold, frame1
+            triggered_frames(cam, seqr, hold_seq(hold), 2)  # frame0 loads, dark hold, frame1
             # the survivors after the hold ARE the current occupancy (data-source physics test)
             total += trap.n_sites
             kept += int(trap.occupancy.sum())

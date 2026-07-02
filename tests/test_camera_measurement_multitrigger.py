@@ -150,7 +150,7 @@ def test_occupancy_falls_back_to_session_calibration_on_shape_mismatch():
     det = OccupancyProcessor(hub, calibration=stale_cal, session_calibration=lambda: session_cal,
                              source_expr={"inputs": ["frame_0"], "source": "value = signal"}, grid_shape=(3, 4))
     fire_live_imaging(exp)
-    img = exp.devices.camera.acquire(1, sequence=getattr(exp.devices.sequencer, "firing", None))[0]
+    img = exp.devices.camera.acquire(1)[0]                # the wired camera senses the firing itself
     hub.publish({"frame_0": np.asarray(img, dtype=float)})
     out = det.step()                                     # stale cal mismatches (48,60) -> falls back
     assert "occupied" in out and "rate" in out           # readout keeps flowing (not wedged)
@@ -221,45 +221,117 @@ def test_region_is_always_exposed_even_at_full_frame():
     assert exp.camera.roi is not None
 
 
-def test_arm_then_fire_is_the_single_on_armed_factory():
-    """``arm_then_fire`` is the ONE arm-before-fire ``on_armed`` factory every readout/scan/capture
-    path uses (no hand-copied ``lambda: (seq.prepare(s), seq.fire(s))`` per call site).  Pin its two
-    behaviours: None sequencer -> None callback (a notebook readout that leans on the virtual atom
-    array fires nothing); a real sequencer -> a callable that prepares THEN fires the SAME sequence."""
-    from Zou_lab_control.neutral_atom.devices.base import arm_then_fire
-
-    assert arm_then_fire(None, object()) is None          # no bound sequencer -> nothing to fire
-
-    calls: list[tuple[str, object]] = []
-
-    class _Spy:
-        def prepare(self, s): calls.append(("prepare", s))
-        def fire(self, s=None): calls.append(("fire", s))
-
-    seq = object()
-    cb = arm_then_fire(_Spy(), seq)
-    assert callable(cb)
-    cb()
-    assert calls == [("prepare", seq), ("fire", seq)]      # prepare THEN fire, both on this sequence
+def _camera_classes():
+    """The base contract + every concrete camera backend (real and virtual)."""
+    from Zou_lab_control.neutral_atom.devices.base import CameraDevice
+    from Zou_lab_control.neutral_atom.devices.pylon import PylonCamera
+    from Zou_lab_control.neutral_atom.devices.qcmos import QCMOSCamera
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualMotCamera
+    return (CameraDevice, QCMOSCamera, PylonCamera, VirtualCamera, VirtualMotCamera)
 
 
-def test_no_call_site_hand_copies_the_arm_then_fire_lambda():
-    """Mechanical single-source guard: the arm-before-fire idiom must route through
-    ``devices.base.arm_then_fire`` -- not be re-typed as an inline ``prepare(...)...fire(...)`` lambda.
-    Scans the analysis/subsystem/device modules that orchestrate shots; the ONLY allowed occurrence
-    of a ``prepare(...).fire(...)`` pair is the helper's own one-line body."""
+def test_camera_is_a_pure_grabber_no_session_or_fire_coupling():
+    """A camera NEVER binds a session, NEVER hosts orchestration, NEVER takes a fire hook:
+    ``bind_experiment`` / ``capture`` / ``on_armed`` must not exist on the contract or any
+    backend (this pins the decoupling -- the session orchestrates, the camera just grabs)."""
+    for cls in _camera_classes():
+        for attr in ("bind_experiment", "capture", "on_armed", "arm_then_fire"):
+            assert not hasattr(cls, attr), f"{cls.__name__}.{attr} resurrects camera/session coupling"
+
+
+def test_acquire_signature_carries_no_sequence_or_fire_hook():
+    """``acquire`` (and the primitives) take no ``sequence``/``on_armed``: a pulse reaches a
+    camera ONLY as trigger edges (real hardware) or over the virtual trigger wire (the
+    ``sequencer`` construction parameter) -- never as a per-call argument from above."""
+    import inspect
+    for cls in _camera_classes():
+        for method in ("acquire", "arm", "read_frames", "disarm"):
+            params = set(inspect.signature(getattr(cls, method)).parameters)
+            assert "sequence" not in params and "on_armed" not in params, (
+                f"{cls.__name__}.{method} re-grew a sequence/on_armed parameter")
+
+
+def test_arm_fire_read_yields_the_armed_frame_count_end_to_end():
+    """The three primitives end-to-end on the virtual rig: arm(N) -> fire the wired streamer ->
+    read_frames(N) returns exactly N frames -- the same ordering ``triggered_frames`` (the ONE
+    measurement-layer helper) performs."""
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
+    try:
+        cam, seqr = exp.devices.camera, exp.devices.sequencer
+        seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")
+        cam.arm(2)
+        try:
+            seqr.prepare(seq)
+            seqr.fire(seq)
+            frames = cam.read_frames(2)
+        finally:
+            cam.disarm()
+        assert len(frames) == 2 and all(np.asarray(f).shape == (40, 50) for f in frames)
+        # the single helper is the same story in one call
+        assert len(na.triggered_frames(cam, seqr, seq, 3)) == 3
+    finally:
+        exp.close()
+
+
+def test_armed_buffer_is_lossless_for_late_consumption():
+    """Frame-loss protection: frames fired while armed are queued LOSSLESSLY until read --
+    a fire that completes BEFORE ``read_frames`` starts drops nothing, even when the burst
+    exceeds the (lossy, live-view) recent ring's capacity."""
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
+    try:
+        cam, seqr = exp.devices.camera, exp.devices.sequencer
+        cam.recent_capacity = 2                     # tiny live-view ring (set before first frame)
+        seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")
+        cam.arm(5)
+        try:
+            seqr.prepare(seq)
+            seqr.fire(seq)                          # all 5 frames land in the buffer NOW
+            frames = cam.read_frames(5)             # ... and are consumed late, losslessly
+        finally:
+            cam.disarm()
+        assert len(frames) == 5                     # nothing dropped
+        assert len(cam.recent_frames()) == 2        # the live-view ring stays a bounded view
+    finally:
+        exp.close()
+
+
+def test_unarmed_camera_misses_the_trigger_like_hardware():
+    """A fire with the camera NOT armed produces nothing to read later -- the trigger edge is
+    gone, exactly like real hardware (arming after the fact cannot recover it)."""
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
+    try:
+        cam, seqr = exp.devices.camera, exp.devices.sequencer
+        seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")
+        seqr.prepare(seq)
+        seqr.fire(seq)                              # nobody armed -> the edge is lost
+        assert cam.acquire(1) == []                 # arming afterwards finds nothing
+    finally:
+        exp.close()
+
+
+def test_triggered_frames_is_the_only_fire_call_in_the_orchestration_layer():
+    """Mechanical single-source guard: pairing a camera with a sequencer (``.fire(...)`` /
+    ``.prepare(...)``) is allowed ONLY inside ``operations.measurement.triggered_frames`` --
+    every readout / calibration / scan / capture path must call the helper, never hand-roll
+    the pair.  Scans the orchestration layer (operations / subsystems / session); the device
+    layer (backends implementing fire) and notebook direct control are out of scope."""
     import re
     na_root = REPO_ROOT / "Zou_lab_control" / "neutral_atom"
-    pattern = re.compile(r"\.prepare\([^\n]*\)[^\n]*\.fire\(")
+    scan_roots = [na_root / "operations", na_root / "subsystems", na_root / "session.py"]
+    pattern = re.compile(r"\.(?:fire|prepare)\(")
     offenders: list[str] = []
-    for py in na_root.rglob("*.py"):
-        for i, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1):
-            if pattern.search(line):
-                # the helper body in devices/base.py is the single legitimate occurrence
-                if py.name == "base.py" and "return lambda:" in line:
-                    continue
-                offenders.append(f"{py.relative_to(REPO_ROOT)}:{i}: {line.strip()}")
-    assert not offenders, "hand-copied arm-then-fire lambda; use arm_then_fire():\n" + "\n".join(offenders)
+    for root in scan_roots:
+        files = [root] if root.is_file() else sorted(root.rglob("*.py"))
+        for py in files:
+            if py.name == "measurement.py":          # the helper's own body -- the ONE legal home
+                continue
+            for i, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1):
+                code = line.split("#", 1)[0]
+                if pattern.search(code):
+                    offenders.append(f"{py.relative_to(REPO_ROOT)}:{i}: {line.strip()}")
+    assert not offenders, (
+        "hand-rolled sequencer fire/prepare in the orchestration layer; route through "
+        "operations.measurement.triggered_frames:\n" + "\n".join(offenders))
 
 
 def test_camera_exposure_setter_round_trips_on_every_backend():

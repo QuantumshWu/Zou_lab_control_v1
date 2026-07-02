@@ -31,12 +31,40 @@ from Zou_lab_control._viewer_registry import active_plotter
 from ._spec import REQUIRED, CatalogSpec
 
 from ..core.analysis import estimate_threshold_fidelity, otsu_threshold, positive_int
-from ..devices.base import arm_then_fire
 from ..core.calibration import TrapCalibration
 from ..core.results import MeasurementTaskResult
 from ..core.utils import site_index
 from ..timing.sequence import snap_seconds_to_clock
 from ..views.plots import plot_detection_scan
+
+
+def triggered_frames(camera, sequencer, sequence, frames: int = 1, *, stop=None) -> list:
+    """THE arm-before-fire shot: arm the camera, fire the sequence, read the frames back.
+
+    This is the SINGLE place the measurement layer pairs a camera with a sequencer --
+    every readout / calibration / scan / capture path calls it (never a hand-rolled
+    ``prepare(...); fire(...)`` around a camera; ``tests/test_camera_measurement_multitrigger.py``
+    greps for offenders).  The ordering is the whole point: the camera is armed FIRST
+    (:meth:`~..devices.base.CameraDevice.arm` returns only once the hardware waits for
+    triggers), so the fire can never outrun it and the first trigger edge is never lost;
+    the frames are then consumed from the camera's own lossless buffer and the camera is
+    stood down.
+
+    ``sequencer=None`` degrades to the camera's free-run ``acquire`` (nothing to fire: a
+    self-triggering sensor such as a Basler in ``Software`` mode still yields frames; an
+    externally triggered camera then honestly reads nothing).  ``stop`` cancels a blocking
+    wait cooperatively.  Returns what arrived (backends with a loud fault model raise
+    ``TimeoutError`` / ``AcquisitionCancelled`` instead of returning short)."""
+    frames = positive_int(frames, "frames")
+    if sequencer is None:
+        return camera.acquire(frames, stop=stop)
+    camera.arm(frames)
+    try:
+        sequencer.prepare(sequence)
+        sequencer.fire(sequence)
+        return camera.read_frames(frames, stop=stop)
+    finally:
+        camera.disarm()
 
 
 # --------------------------------------------------------------- declarative spec
@@ -480,10 +508,8 @@ class ScannedMeasurement:
         sequencer = self._sequencer()
         rows = []
         for _ in range(self.shots_per_point):
-            frames = self.camera.acquire(
-                self.plan.n_frames, sequence=sequence,
-                on_armed=arm_then_fire(sequencer, sequence),
-                stop=self.stop_event)
+            frames = triggered_frames(
+                self.camera, sequencer, sequence, self.plan.n_frames, stop=self.stop_event)
             rows.append(np.atleast_1d(np.asarray(self.reducer.reduce(frames, self.calibration), dtype=float)))
         # nanmean, not mean: a per-site reducer returns NaN for a site that was
         # empty on a given shot (no atom -> survival undefined).  Plain mean would
@@ -532,4 +558,5 @@ __all__ = [
     "ScanResult",
     "ScannedMeasurement",
     "ShotPlan",
+    "triggered_frames",
 ]

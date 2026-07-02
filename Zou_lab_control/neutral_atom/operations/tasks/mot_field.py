@@ -2,8 +2,8 @@
 optimum.
 
 The one-click flow the notebook / console runs: for every (Bx, By, Bz) point of a 3-D coil grid
-the task resolves the pulse template's three DAC api slots, fires the sequence (arm-before-fire,
-the H4f grabber contract) and measures the MOT fluorescence on the MONITOR camera through the
+the task resolves the pulse template's three DAC api slots, fires the sequence through the one
+arm-before-fire helper (``triggered_frames``) and measures the MOT fluorescence on the MONITOR camera through the
 SAME :func:`~..processors.mot_intensity.mot_roi_intensity` primitive the live "MOT intensity"
 processor uses -- so the optimiser and the live view can never disagree.  The optimum is the
 argmax refined by a local centre-of-mass; the report (a facet grid of the Bz planes + the raw
@@ -25,9 +25,9 @@ import numpy as np
 from Zou_lab_control._paths import resolve_under_project
 from Zou_lab_control._viewer_registry import active_plotter
 
-from ...devices.base import CameraDevice, arm_then_fire
+from ...devices.base import CameraDevice
 from ..logic import Task, TaskOutput
-from ..measurement import ParamDecl
+from ..measurement import ParamDecl, triggered_frames
 from ..task import TaskSpec
 from ..task_registry import task
 from ..measurements.pulse_scan import _resolve_probe_template
@@ -115,9 +115,7 @@ class OptimizeMotFieldTask(Task):
                     resolved = state.with_api_resolved(
                         {slots[0]: int(bx), slots[1]: int(by), slots[2]: int(bz)})
                     sequence = resolved.to_sequence()
-                    frames = self.camera.acquire(
-                        1, sequence=sequence,
-                        on_armed=arm_then_fire(self.sequencer, sequence), stop=self._stop)
+                    frames = triggered_frames(self.camera, self.sequencer, sequence, 1, stop=self._stop)
                     if not frames:
                         continue                      # stopped mid-wait / no trigger
                     frame = frames[0]

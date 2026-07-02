@@ -111,7 +111,9 @@ class _FakePlan:
 
 
 class _FakePulse:
-    sequencer = "seq-dev"
+    # No bound streamer: the scan degrades to the camera's free-run acquire (the helper's
+    # sequencer=None branch), which is all these engine-shape tests need.
+    sequencer = None
 
     def frame_sequence(self, *a, **k):
         return "seq"
@@ -123,7 +125,7 @@ class _FakePulse:
 class _CountCamera:
     last_stop = None
 
-    def acquire(self, frames=1, *, sequence=None, on_armed=None, stop=None, **kw):
+    def acquire(self, frames=1, *, stop=None, **kw):
         self.last_stop = stop
         return [np.zeros((2, 2))]
 
@@ -132,7 +134,7 @@ def test_per_site_nan_does_not_poison_scan_point():
     """np.nanmean over shots: a site empty on ONE shot must not drag that site's
     whole scan point to NaN (plain np.mean would)."""
     meas = ScannedMeasurement(
-        pulse=_FakePulse(), camera=_CountCamera(), sequencer="seq-dev",
+        pulse=_FakePulse(), camera=_CountCamera(), sequencer=None,
         calibration=None,
         axis=ScanAxis(slot="s0", values=[1.0], kind="duration"),
         plan=_FakePlan(),
@@ -159,14 +161,14 @@ def test_dac_axis_rejects_unknown_slot_early():
 
     with pytest.raises(ValueError, match="not a scan slot"):
         ScannedMeasurement(
-            pulse=_SlotPulse(), camera=_CountCamera(), sequencer="seq-dev",
+            pulse=_SlotPulse(), camera=_CountCamera(), sequencer=None,
             calibration=None,
             axis=ScanAxis(slot="s5", values=[0.0], kind="dac"),  # s5 absent
             plan=_FakePlan(), reducer=_PresetReducer([[0.0, 0.0]]),
         )
     # positive control: a real slot constructs fine
     ScannedMeasurement(
-        pulse=_SlotPulse(), camera=_CountCamera(), sequencer="seq-dev",
+        pulse=_SlotPulse(), camera=_CountCamera(), sequencer=None,
         calibration=None,
         axis=ScanAxis(slot="s0", values=[0.0], kind="dac"),
         plan=_FakePlan(), reducer=_PresetReducer([[0.0, 0.0]]),
@@ -297,7 +299,7 @@ def test_qcmos_acquire_times_out_without_stop():
 
     cam = _camera_with(_WedgedDcam())
     with pytest.raises(TimeoutError):
-        cam.acquire(1, timeout_ms=10)
+        cam.acquire(1, timeout=0.01)
 
 
 # --------------------------------------------------------------------------- M8
@@ -353,7 +355,7 @@ def test_scan_engine_threads_stop_into_acquire():
 
     hub = SignalHub()
     meas = ScannedMeasurement(
-        pulse=_FakePulse(), camera=_CountCamera(), sequencer="seq-dev",
+        pulse=_FakePulse(), camera=_CountCamera(), sequencer=None,
         calibration=None,
         axis=ScanAxis(slot="s0", values=[1.0, 2.0], kind="duration"),
         plan=_FakePlan(), reducer=_PresetReducer([[1.0, 2.0]]),
@@ -399,15 +401,24 @@ def test_panel_kind_tables_agree():
     """A panel kind is driven by parallel tables (label / params); a kind
     half-registered in only some of them is the asymmetry the audit flagged.
     Mechanically require every kind to appear in both so a half-registration fails
-    here instead of silently misbehaving in the console.  (A fresh plot is BLANK --
-    its source is kind-independent now, so there is no per-kind default-source
-    table to keep in sync.)"""
+    here instead of silently misbehaving in the console.  The ONE deliberate
+    exception is ``"grid"``: a grid panel's params ARE its per-cell
+    ``sub_plot_kind``'s params (resolved dynamically by ``PanelCard._param_kind``),
+    so instead of a table entry the contract is that EVERY cell family's
+    ``sub_plot_kind`` lands on a real PANEL_PARAMS entry -- the dynamic resolution
+    can never dangle.  (A fresh plot is BLANK -- its source is kind-independent
+    now, so there is no per-kind default-source table to keep in sync.)"""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend.live import GridCell
     from Zou_lab_control.frontend.task_console import PANEL_KINDS, PANEL_PARAMS
 
     kinds = set(PANEL_KINDS)
-    assert set(PANEL_PARAMS) == kinds, "every panel kind needs a PANEL_PARAMS entry (empty tuple allowed)"
+    assert set(PANEL_PARAMS) == kinds - {"grid"}, \
+        "every non-grid panel kind needs a PANEL_PARAMS entry (empty tuple allowed)"
+    cell_kinds = {cls.sub_plot_kind for cls in GridCell.__subclasses__()}
+    assert cell_kinds and cell_kinds <= set(PANEL_PARAMS), \
+        "a grid resolves its params through its cells' sub_plot_kind -- every cell family must land on PANEL_PARAMS"
 
 
 # --------------------------------------------------------------------------- Edit snapshot not squished

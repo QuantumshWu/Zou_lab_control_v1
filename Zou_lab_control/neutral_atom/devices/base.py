@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 
+from ..core.analysis import positive_int
 from .camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS
 
 
@@ -46,22 +47,29 @@ class BaseDevice(ABC):
 class CameraDevice(BaseDevice):
     """Required contract for a camera used by ``NeutralAtomSession``.
 
-    Owns a small RECENT-FRAMES ring (``recent_capacity`` frames).  The camera is
-    externally triggered, so a single fired shot can yield MORE frames than a
-    consumer requested (e.g. two ``emCCD`` triggers inside one pulse); every
-    ``acquire`` retains its frames here so a live consumer that polls :meth:`drain`
-    never misses the extra ones and :meth:`latest` always holds the newest.  This
-    lives on the base class, so the virtual and real cameras retain identically
-    (virtual == real); subclasses only call :meth:`_retain` at the end of acquire.
+    A camera is a PURE frame-grabber with THREE acquisition primitives:
 
-    A camera is a PURE frame-grabber: it arms for N frames and reads N externally
-    triggered frames (a real qCMOS: ``buf_alloc(N)`` -> ``cap_start`` -> wait for the
-    FPGA's hardware trigger edges -> ``buf_getframedata``).  It NEVER drives a sequencer,
-    NEVER counts triggers in a pulse, NEVER infers exposure -- the MEASUREMENT orchestrates
-    the shot (fire the sequencer, then read the camera).  The one thing a camera owns about
-    the wider system is ``capture_trigger_channels`` -- which sequencer line its hardware
-    trigger input is wired to -- a PASSIVE fact it exposes upward (so a measurement / the
-    virtual atom simulation can read the fired pulse), never used to control the sequencer.
+    * :meth:`arm` -- ready the hardware for externally triggered frames;
+    * :meth:`read_frames` -- blockingly consume frames from the device's own buffer;
+    * :meth:`disarm` -- stand the hardware down.
+
+    (:meth:`acquire` is the free-run convenience composing the three.)  The camera NEVER
+    drives a sequencer, NEVER counts triggers in a pulse, NEVER infers exposure, and knows
+    NOTHING about the experiment session -- once armed it simply waits for triggers.  The
+    MEASUREMENT layer orchestrates the shot (arm the camera, fire the sequencer, read the
+    frames back): see ``operations.measurement.triggered_frames``, the single arm-before-fire
+    helper.  The one thing a camera owns about the wider system is
+    ``capture_trigger_channels`` -- which sequencer line its hardware trigger input is wired
+    to -- a PASSIVE fact it exposes upward, never used to control the sequencer.
+
+    Frame-loss protection is a DEVICE-OWNED buffer: every frame that arrives while the
+    camera is armed is queued LOSSLESSLY (unbounded ``pending`` queue) until
+    :meth:`read_frames` consumes it, so a fire that lands before the consumer starts
+    reading ("late consumption") drops nothing.  Independently, a small RECENT-FRAMES ring
+    (``recent_capacity``) keeps the newest frames for live viewers (:meth:`drain` /
+    :meth:`latest`) -- lossy by design, a convenience view, never the acquisition path.
+    Both live on this base class so the virtual and real cameras buffer identically
+    (virtual == real); subclasses feed frames through :meth:`_deliver`.
     """
 
     recent_capacity: int = 16
@@ -69,12 +77,6 @@ class CameraDevice(BaseDevice):
     #: device property (the camera is the source of this wiring fact), default the conventional
     #: ``emCCD`` line; a real camera is configured with its actual chNN at construction.
     capture_trigger_channels: tuple[str, ...] = DEFAULT_CAMERA_TRIGGER_CHANNELS
-
-    def bind_experiment(self, session) -> "CameraDevice":
-        """Attach experiment defaults used by convenience methods like capture."""
-
-        self._zlc_session = session
-        return self
 
     @property
     @abstractmethod
@@ -138,53 +140,169 @@ class CameraDevice(BaseDevice):
             raise ValueError(
                 f"unknown configure option(s) {unknown}; configurable: {sorted(allowed)}")
 
-    @abstractmethod
-    def acquire(self, frames: int = 1, *, sequence=None, on_armed=None, stop=None, **kwargs) -> list[np.ndarray]:
-        """Arm for ``frames`` frames and return one numpy array per externally-triggered frame.
+    # ------------------------------------------------------------- acquisition
+    def arm(self, frames: int | None = None) -> None:
+        """Ready the camera for ``frames`` externally triggered frames (None = continuous).
 
-        The camera is a PURE grabber: ``frames`` is the count the MEASUREMENT wants (it knows
-        how many camera triggers its pulse carries -- e.g. ``frames_per_cycle`` for a live cycle,
-        or the bracket length for a calibration shot).  The camera does NOT count the sequence's
-        triggers, does NOT prepare/fire any sequencer, does NOT infer exposure.
+        When this method RETURNS the hardware is armed and waiting for triggers, so a fire
+        issued after ``arm()`` can NEVER outrun the camera -- this ordering IS the
+        arm-before-fire guarantee every measurement relies on (arm the camera, THEN fire the
+        sequencer, then :meth:`read_frames`).  Frames arriving while armed are queued
+        losslessly until read.  Arming also takes the camera's acquisition lock, serializing
+        concurrent consumers (a live monitor polling :meth:`acquire` waits while a
+        measurement holds an armed session); :meth:`disarm` releases it."""
+        if frames is not None:
+            frames = positive_int(frames, "frames")
+        self._acquire_lock().acquire()
+        state = self._recent_state()
+        with state["cond"]:
+            state["pending"].clear()
+            state["armed"] = True
+            state["armed_frames"] = frames
+        try:
+            self._arm(frames)
+        except BaseException:
+            with state["cond"]:
+                state["armed"] = False
+                state["pending"].clear()
+            self._acquire_lock().release()
+            raise
 
-        ``on_armed`` (optional) is a callback the camera invokes AFTER it has armed (a real
-        ``cap_start``) and BEFORE it waits -- so the measurement can fire the FPGA exactly when
-        the camera is ready for triggers (arm-before-fire), without the camera knowing anything
-        about the sequencer.  ``sequence`` (optional) is the fired pulse, passed purely so the
-        VIRTUAL camera can SIMULATE the frames it would have captured (a real camera ignores it --
-        its frames come from the sensor); ``None`` with no firing pulse -> no frame (the live image
-        freezes, exactly as a real externally-triggered camera produces nothing without triggers).
+    def read_frames(self, n: int = 1, *, timeout: float | None = None, stop=None, **kwargs) -> list[np.ndarray]:
+        """Blockingly consume ``n`` frames from the device's own buffer (one numpy array each).
 
-        Optional ``stop``: a ``threading.Event`` a live logic node can set to interrupt a blocking
-        wait (a camera awaiting an external trigger that never comes).  Implementations that honour
-        it poll the event and raise :class:`AcquisitionCancelled` when set; others may ignore it."""
+        Frames queued while armed (pushed by the data source, or fetched by the backend's own
+        grab hook) are drained first -- so a fire that happened BEFORE this call loses nothing;
+        when the buffer runs dry the backend's ``_grab`` hook produces/awaits more.  ``timeout``
+        (seconds, backend default when None) bounds the wait for a trigger that never comes;
+        ``stop`` (a ``threading.Event``) cancels a blocking wait cooperatively.  Returns what
+        arrived (possibly fewer than ``n``); backends whose fault model is loud (the qCMOS)
+        raise ``TimeoutError`` / :class:`AcquisitionCancelled` from their hook instead."""
+        n = positive_int(n, "n")
+        state = self._recent_state()
+        out: list[np.ndarray] = []
+        while len(out) < n:
+            with state["cond"]:
+                while state["pending"] and len(out) < n:
+                    out.append(state["pending"].pop(0))
+            if len(out) >= n:
+                break
+            if not self._grab(n - len(out), timeout=timeout, stop=stop, **kwargs):
+                break
+        return out
 
-    # ----------------------------------------------------------- recent frames
+    def disarm(self) -> None:
+        """Stand the camera down and release the acquisition lock taken by :meth:`arm`."""
+        state = self._recent_state()
+        try:
+            self._disarm()
+        finally:
+            with state["cond"]:
+                state["armed"] = False
+                state["pending"].clear()
+            try:
+                self._acquire_lock().release()
+            except RuntimeError:
+                pass  # disarm without a matching arm -- defensive no-op
+
+    def acquire(self, frames: int = 1, *, stop=None, **kwargs) -> list[np.ndarray]:
+        """Convenience one-shot: ``arm(frames)`` + ``read_frames(frames)`` + ``disarm()``.
+
+        For a camera that needs no external fire -- a free-running sensor (Basler
+        ``Software`` mode), or a virtual camera watching an already-firing continuous
+        pulse -- this is the whole story.  An externally TRIGGERED measurement must fire
+        its sequencer between arm and read: use the single measurement-layer helper
+        ``operations.measurement.triggered_frames`` (never hand-roll prepare+fire)."""
+        frames = positive_int(frames, "frames")
+        self.arm(frames)
+        try:
+            return self.read_frames(frames, stop=stop, **kwargs)
+        finally:
+            self.disarm()
+
+    # --------------------------------------------------- backend hooks (subclass seam)
+    def _arm(self, frames: int | None) -> None:
+        """Backend hook: ready the hardware (``buf_alloc`` + ``cap_start`` on a qCMOS,
+        ``StartGrabbing`` on a pylon camera).  Default: nothing to do (a push-fed source)."""
+
+    def _grab(self, n: int, *, timeout: float | None = None, stop=None) -> bool:
+        """Backend hook: produce or await at least one more frame for :meth:`read_frames`.
+
+        Pull-based hardware fetches from its driver and feeds :meth:`_deliver`; a push-fed
+        source may simply wait on the buffer condition.  Return True when new frames were
+        (or will now be found) queued; False when none will arrive within ``timeout``
+        (``read_frames`` then returns what it has).  Default: wait for a pushed frame."""
+        state = self._recent_state()
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        with state["cond"]:
+            while not state["pending"]:
+                if stop is not None and stop.is_set():
+                    return False
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0.0:
+                    return False
+                state["cond"].wait(0.05 if remaining is None else min(0.05, remaining))
+            return True
+
+    def _disarm(self) -> None:
+        """Backend hook: stand the hardware down (``cap_stop`` / ``StopGrabbing``)."""
+
+    # ----------------------------------------------------------- frame buffers
     def _recent_state(self) -> dict:
-        """Lazily create the recent-frames ring (subclasses define their own
+        """Lazily create the frame-buffer state (subclasses define their own
         ``__init__`` and need not call ``super().__init__()``)."""
         state = self.__dict__.get("_zlc_recent")
         if state is None:
+            lock = threading.Lock()
             state = {
                 "frames": deque(maxlen=max(1, int(self.recent_capacity))),
-                "lock": threading.Lock(),
-                "seq": 0,       # total frames ever retained
-                "cursor": 0,    # drain watermark
+                "lock": lock,
+                "cond": threading.Condition(lock),
+                "seq": 0,        # total frames ever retained
+                "cursor": 0,     # drain watermark
+                "pending": [],   # LOSSLESS armed-session queue read_frames consumes
+                "armed": False,
+                "armed_frames": None,
             }
             self.__dict__["_zlc_recent"] = state
         return state
 
-    def _retain(self, images) -> Any:
-        """Append freshly-acquired frames to the recent-frames ring (thread-safe).
+    def _acquire_lock(self) -> "threading.RLock":
+        """The per-camera acquisition lock :meth:`arm`/:meth:`disarm` hold across an armed
+        session, so two consumers (a measurement + a live monitor) never interleave their
+        armed state on one sensor (lazily created, like ``_recent_state``)."""
+        lock = self.__dict__.get("_zlc_acquire_lock")
+        if lock is None:
+            lock = threading.RLock()
+            self.__dict__["_zlc_acquire_lock"] = lock
+        return lock
 
-        Subclasses call this once at the end of ``acquire`` and return ``images``
-        unchanged.  Returns ``images`` so ``return self._retain(images)`` reads
-        cleanly."""
+    def _deliver(self, images) -> list[np.ndarray]:
+        """Queue freshly captured frames: into the lossless armed ``pending`` queue (when
+        armed) AND the recent-frames ring, then wake any waiting reader.  The ONE entry
+        point every frame source uses (a real backend's grab hook, the virtual trigger
+        wire), so buffering behaviour cannot drift between backends."""
+        state = self._recent_state()
+        arrs = [np.asarray(image) for image in images]
+        with state["cond"]:
+            if state["armed"]:
+                state["pending"].extend(arrs)
+            self._retain_locked(state, arrs)
+            state["cond"].notify_all()
+        return arrs
+
+    @staticmethod
+    def _retain_locked(state: dict, images) -> None:
+        """Append frames to the recent ring; caller holds ``state['lock']``."""
+        for image in images:
+            state["frames"].append(np.asarray(image))
+            state["seq"] += 1
+
+    def _retain(self, images) -> Any:
+        """Append frames to the recent-frames ring only (thread-safe); returns ``images``."""
         state = self._recent_state()
         with state["lock"]:
-            for image in images:
-                state["frames"].append(np.asarray(image))
-                state["seq"] += 1
+            self._retain_locked(state, images)
         return images
 
     def recent_frames(self, n: int | None = None) -> list[np.ndarray]:
@@ -219,44 +337,6 @@ class CameraDevice(BaseDevice):
             state["frames"].clear()
             state["cursor"] = state["seq"]
 
-    def capture(self, *, frames: int = 1, exposure: float | None = None, sequence=None, display: bool = True, **kwargs):
-        """Acquire images and return a notebook-friendly ``CaptureResult``.
-
-        This is a camera-device method, not a session wrapper.  When the
-        camera is attached to a ``NeutralAtomSession``, the session supplies
-        default timing, sequencer, history, and frontend plotting.  A standalone
-        camera can still call this method by passing an explicit
-        sequence/sequencer.  ``capture`` always shows raw camera data; site
-        overlays belong to calibrated readout/detection, not to capture.
-        """
-
-        from ..core.results import CaptureResult
-        from ..timing import imaging_sequence
-        from ..views.plots import plot_image
-
-        explicit_sequencer = kwargs.pop("sequencer", None)
-        session = getattr(self, "_zlc_session", None)
-        if session is not None:
-            sequence = sequence or (session._configure_imaging(exposure=exposure) if exposure is not None else session.sequence)
-            sequencer = explicit_sequencer if explicit_sequencer is not None else getattr(session.devices, "sequencer", None)
-        else:
-            if exposure is not None:
-                self.configure(exposure=exposure)
-            sequence = sequence or imaging_sequence(exposure=self.exposure, load=True)
-            sequencer = explicit_sequencer
-
-        # Orchestrate the shot the decoupled way: the camera arms, then (on_armed) we fire the
-        # sequencer -- the camera never drives it.  ``sequence`` is handed in only so the virtual
-        # camera can simulate; a real camera reads the frames its hardware trigger gates.
-        on_armed = arm_then_fire(sequencer if sequence is not None else None, sequence)
-        images = self.acquire(frames, sequence=sequence, on_armed=on_armed, **kwargs)
-        plot = plot_image(images[-1], display=display)
-        result = CaptureResult(images=images, sequence=sequence, plot=plot)
-        if session is not None:
-            session.history.append(result)
-        return result
-
-
 class SequencerDevice(BaseDevice):
     """Required contract for a timing/sequencer backend."""
 
@@ -274,14 +354,14 @@ class SequencerDevice(BaseDevice):
     @property
     def firing(self) -> "Any | None":
         """The ``repeat_forever`` program the streamer is continuously playing, or None when
-        idle/safe.  The live (no-sequence) camera read is gated on this -- it is the software
-        model of "the FPGA is emitting camera triggers right now".
+        idle/safe -- the software model of "the FPGA is emitting camera triggers right now".
 
-        Part of the contract (like :meth:`scan_progress`) so the camera/measurement layer reads
-        the live firing state through the abstraction, not via a duck-typed ``getattr`` on a
-        concrete backend.  Default None: a real/remote streamer keeps no local firing flag -- the
-        camera learns "is it triggering" from the PRESENCE/ABSENCE of hardware trigger edges, not
-        from a host-side handle -- so None is the correct real-hardware semantics.  The in-process
+        Part of the contract (like :meth:`scan_progress`) so a DEVICE-layer consumer (the
+        virtual trigger wire inside ``devices.virtual``) reads the live firing state through
+        the abstraction, not via a duck-typed ``getattr`` on a concrete backend.  Default
+        None: a real/remote streamer keeps no local firing flag -- a real camera learns "is it
+        triggering" from the PRESENCE/ABSENCE of hardware trigger edges, not from a host-side
+        handle -- so None is the correct real-hardware semantics.  The in-process
         VirtualSequencer overrides this to expose the program it is simulating."""
 
         return None
@@ -337,27 +417,6 @@ class SequencerDevice(BaseDevice):
         """Drive outputs to a safe idle state, when supported."""
 
         self.stop()
-
-
-def arm_then_fire(sequencer, sequence):
-    """The single ``on_armed`` callback factory for the arm-before-fire shot.
-
-    A camera is a pure grabber: a consumer arms it (:meth:`CameraDevice.acquire`),
-    and the camera invokes ``on_armed`` AFTER it is armed and BEFORE it waits, so
-    the measurement fires the sequencer at exactly the moment the camera is ready
-    for triggers -- the camera never drives the sequencer.  Every readout / scan /
-    capture path needs the same callback ("prepare then fire this sequence on this
-    sequencer"), so it lives here next to the :class:`SequencerDevice` contract
-    rather than being hand-copied as an inline lambda at each call site.
-
-    Returns ``None`` when there is no bound sequencer (a notebook-composed readout
-    that leans on the virtual atom array -- nothing to fire), otherwise a no-arg
-    callable that prepares then fires ``sequence``.  The returned closure captures
-    ``sequencer``/``sequence`` directly (they are this call's arguments, so there is
-    no late-binding loop-variable hazard)."""
-    if sequencer is None:
-        return None
-    return lambda: (sequencer.prepare(sequence), sequencer.fire(sequence))
 
 
 class TrapArrayDevice(BaseDevice):
@@ -431,7 +490,6 @@ __all__ = [
     "CameraDevice",
     "SequencerDevice",
     "TrapArrayDevice",
-    "arm_then_fire",
     "snap_subarray",
     "validate_device_contract",
 ]

@@ -1,16 +1,20 @@
 """Basler pylon MONITOR camera -- the real MOT-viewer sensor.
 
 A thin :class:`~.base.CameraDevice` wrapper over ``pypylon`` with the SAME pure-grabber contract
-the qCMOS keeps (H4f): ``acquire(N, sequence=..., on_armed=...)`` arms the camera, invokes the
-fire hook (the measurement fires the FPGA -- arm-before-fire), then collects ``N`` externally- or
-software-triggered frames.  ``sequence`` is accepted and ignored (a real sensor images the real
-world; only the virtual :class:`~.virtual.VirtualMotCamera` consumes it to simulate the MOT), so
-the virtual and real monitor cameras are drop-in swaps: switching changes only the device config.
+every camera keeps: :meth:`~.base.CameraDevice.arm` readies the sensor, the frames its trigger
+gates are consumed with :meth:`~.base.CameraDevice.read_frames`, and
+:meth:`~.base.CameraDevice.disarm` stands it down (a measurement fires the FPGA between arm and
+read through ``operations.measurement.triggered_frames``; a free-running ``Software`` sensor just
+calls ``acquire``).  The camera never touches a sequencer, so the virtual
+:class:`~.virtual.VirtualMotCamera` and this real monitor camera are drop-in swaps: switching
+changes only the device config.
 
-The grab stream is RESIDENT (like the qCMOS ``cap_start`` once / poll thereafter): ``acquire``
-starts ``StartGrabbing`` on first use and leaves it running between calls -- restarting the USB3
-stream per frame costs tens of milliseconds and was the live-monitor stutter.  Anything that must
-reconfigure the sensor (ROI, pixel format) pauses the stream and resumes it afterwards.
+In ``Software`` (free-run) mode the grab stream is RESIDENT (like the qCMOS ``cap_start`` once /
+poll thereafter): arming starts ``StartGrabbing`` on first use and disarm leaves it running --
+restarting the USB3 stream per frame costs tens of milliseconds and was the live-monitor stutter.
+Anything that must reconfigure the sensor (ROI, pixel format) pauses the stream and resumes it
+afterwards.  A HARDWARE-triggered session (e.g. ``Line1``) instead spans exactly one arm..disarm:
+one grab session per armed request, stopped when done, STRICTLY (see :meth:`_arm`).
 
 ``pypylon`` is imported lazily in :meth:`open` -- a machine without the Basler runtime can still
 import the package, run the virtual backend and the full test suite.
@@ -213,55 +217,68 @@ class PylonCamera(CameraDevice):
             cam.OffsetY.SetValue(y)
             self._roi = (x, w, y, h)            # what the sensor actually granted
 
-    # ------------------------------------------------------------------ acquisition
-    def acquire(self, frames: int = 1, *, sequence=None, on_armed=None,
-                stop=None, **_) -> list[np.ndarray]:
-        """Arm, invoke the fire hook, then grab ``frames`` frames (the H4f grabber contract).
-        ``sequence`` is ignored -- the real MOT answers through the real coils.
+    # ------------------------------------------------------------------ acquisition hooks
+    # The public surface (arm / read_frames / disarm / acquire) lives on the CameraDevice
+    # base; this adapter implements only the pylon-facing hooks.
 
-        Two grab modes, each with the strategy its semantics need:
+    @property
+    def _free_run(self) -> bool:
+        return self.trigger_source.lower() == "software"
 
-        * ``Software`` (free-run) -- the stream is RESIDENT: it starts on the first call and
-          stays running between calls (a live monitor calls ``acquire(1)`` per shot; restarting
-          the USB3 stream each time costs tens of ms and was the stutter).
+    def _arm(self, frames: int | None) -> None:
+        """Start the grab session for an armed request.  Two modes, each with the strategy its
+        semantics need:
+
+        * ``Software`` (free-run) -- the stream is RESIDENT: it starts on the first arm and
+          stays running across arm/disarm (a live monitor calls ``acquire(1)`` per shot;
+          restarting the USB3 stream each time costs tens of ms and was the stutter).
           ``GrabStrategy_LatestImageOnly`` keeps the newest frame so a slow consumer always
           sees the live image, never a stale backlog.
-        * hardware trigger (e.g. ``Line1``) -- one ``StartGrabbingMax`` per acquire, stopped
-          when done: one trigger = one frame = one shot, STRICTLY.  A resident latest-only
-          stream could hand point K+1 a late frame from point K (a timed-out trigger whose
-          frame arrives after the retry fired); per-point scans are slow anyway, so the
-          restart cost is irrelevant there."""
-        del sequence
+        * hardware trigger (e.g. ``Line1``) -- one ``StartGrabbingMax`` per armed session,
+          stopped by :meth:`_disarm`: one trigger = one frame = one shot, STRICTLY.  A
+          resident latest-only stream could hand point K+1 a late frame from point K (a
+          timed-out trigger whose frame arrives after the retry fired); per-point scans are
+          slow anyway, so the restart cost is irrelevant there."""
         if self._camera is None:
-            raise RuntimeError("PylonCamera.acquire before open() -- the device set opens cameras last.")
+            raise RuntimeError("PylonCamera.arm before open() -- the device set opens cameras last.")
         from pypylon import pylon
 
         cam = self._camera
-        free_run = self.trigger_source.lower() == "software"
-        if free_run:
+        if self._free_run:
             if not cam.IsGrabbing():
                 cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
         else:
             if cam.IsGrabbing():
                 cam.StopGrabbing()              # no resident stream in triggered mode (see above)
-            cam.StartGrabbingMax(int(frames), pylon.GrabStrategy_OneByOne)
-        if on_armed is not None:
-            on_armed()                          # the measurement fires the FPGA now (arm-before-fire)
-        out: list[np.ndarray] = []
-        timeout_ms = int(self.timeout * 1000)
-        while len(out) < int(frames):
-            if stop is not None and stop.is_set():
-                break
-            result = cam.RetrieveResult(timeout_ms, pylon.TimeoutHandling_Return)
-            if result is None or not result.GrabSucceeded():
-                if result is not None:
-                    result.Release()
-                break                           # no trigger within timeout -> freeze (partial ok)
-            out.append(np.array(result.Array, copy=True))
-            result.Release()
-        if not free_run and cam.IsGrabbing():
-            cam.StopGrabbing()                  # strict one-shot semantics: never leave a live queue
-        return self._retain(out)
+            if frames is None:
+                cam.StartGrabbing(pylon.GrabStrategy_OneByOne)
+            else:
+                cam.StartGrabbingMax(int(frames), pylon.GrabStrategy_OneByOne)
+
+    def _grab(self, n: int, *, timeout: float | None = None, stop=None) -> bool:
+        """Retrieve ONE frame from the running grab session into the base frame queue.
+        No trigger within the timeout -> False (the live view freezes; a partial read is
+        the pylon fault model, matching a monitor sensor that just sees no edges)."""
+        from pypylon import pylon
+
+        if stop is not None and stop.is_set():
+            return False
+        cam = self._camera
+        timeout_ms = int((self.timeout if timeout is None else float(timeout)) * 1000)
+        result = cam.RetrieveResult(timeout_ms, pylon.TimeoutHandling_Return)
+        if result is None or not result.GrabSucceeded():
+            if result is not None:
+                result.Release()
+            return False                        # no trigger within timeout -> freeze (partial ok)
+        self._deliver([np.array(result.Array, copy=True)])
+        result.Release()
+        return True
+
+    def _disarm(self) -> None:
+        # Free-run keeps its resident stream; a triggered session ends STRICTLY here so a
+        # late frame can never leak into the next armed request (the Y-round misalignment fix).
+        if not self._free_run and self._camera is not None and self._camera.IsGrabbing():
+            self._camera.StopGrabbing()
 
     def snapshot(self) -> dict[str, object]:
         return {

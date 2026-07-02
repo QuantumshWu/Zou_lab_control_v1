@@ -589,10 +589,75 @@ def _sequence_triggers_camera(sequence, trigger_channels) -> bool:
     return any(getattr(p, "channel", None) in trig for p in getattr(sequence, "pulses", ()))
 
 
-class VirtualCamera(CameraDevice):
+class _TriggerWiredCamera(CameraDevice):
+    """Virtual camera plumbing for the TRIGGER CABLE that physically exists on the real rig.
+
+    On hardware the FPGA's trigger line is a real wire into the camera's trigger input: the
+    armed sensor reads out exactly when edges arrive.  A virtual camera simulates THAT WIRE --
+    the one lowest-layer fake -- as a ``sequencer`` constructor parameter (injected from the
+    device config via ``"$device:sequencer"``):
+
+    * a FINITE fire on the wired :class:`VirtualSequencer` notifies the camera; while ARMED it
+      renders the frames those trigger edges would have gated straight into the device buffer
+      (an unarmed camera misses the trigger, exactly like real hardware);
+    * while the streamer is CONTINUOUSLY firing (``repeat_forever``, the live On Pulse),
+      :meth:`_grab` renders frames on demand at the firing cadence -- the simulation of an
+      endless trigger train;
+    * no wire, or a wire that is idle -> no trigger edges -> no frame, and the live view
+      FREEZES instantly (the software mirror of "no hardware edges arrive").
+
+    Everything above the device contract is untouched: measurements arm/fire/read through the
+    SAME code path as on a real camera (virtual == real; swapping in real hardware changes only
+    the device config)."""
+
+    def _wire_to(self, sequencer) -> None:
+        """Plug the trigger cable in (constructor-time): remember the wired streamer and
+        subscribe to its fire events when it supports them."""
+        self.sequencer = sequencer
+        if sequencer is not None and hasattr(sequencer, "add_fire_listener"):
+            sequencer.add_fire_listener(self._on_wire_fired)
+
+    def _render_frames(self, sequence, frames: int) -> list[np.ndarray]:
+        raise NotImplementedError
+
+    def _pace(self, sequence, stop) -> None:
+        """Optional per-frame wall-clock pacing for a continuous firing (subclass hook)."""
+
+    def _on_wire_fired(self, sequence) -> None:
+        # A FINITE fire = the burst of trigger edges this camera's wire carries.  A continuous
+        # (repeat_forever) program is instead pulled on demand in _grab, paced per frame.
+        if sequence is None or bool(getattr(sequence, "repeat_forever", False)):
+            return
+        state = self._recent_state()
+        with state["cond"]:
+            if not state["armed"]:
+                return              # an unarmed camera misses the trigger, exactly like hardware
+            wanted = state["armed_frames"]
+        if wanted is None:
+            trig = getattr(self, "capture_trigger_channels", None)
+            wanted = max(1, count_trigger_pulses(sequence, **({"trigger_channels": trig} if trig else {})))
+        self._deliver(self._render_frames(sequence, int(wanted)))
+
+    def _grab(self, n: int, *, timeout: float | None = None, stop=None) -> bool:
+        # The wire is authoritative about trigger edges: an idle (or absent) wire means no
+        # edge can arrive, so the read returns immediately and the live view freezes -- the
+        # data-source gate the live monitor relies on (no fabricated frames, no dead wait).
+        wire = getattr(self, "sequencer", None)
+        firing = None if wire is None else wire.firing
+        if firing is None:
+            return False
+        frames = self._render_frames(firing, 1)
+        if not frames:
+            return False            # the firing pulse carries no camera trigger -> dark
+        self._deliver(frames)
+        self._pace(firing, stop)
+        return True
+
+
+class VirtualCamera(_TriggerWiredCamera):
     def __init__(self, trap_array: VirtualTrapArray, exposure: float = 20e-3, timeout: float = 2.0,
                  subarray_step: int = 4, capture_trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
-                 sleep_scale: float | None = None):
+                 sleep_scale: float | None = None, sequencer=None):
         self.trap_array = trap_array
         self._exposure = positive_float(exposure, "exposure")
         self.timeout = positive_float(timeout, "timeout")
@@ -613,6 +678,14 @@ class VirtualCamera(CameraDevice):
         # connect().  None = full frame (the default; all existing behaviour).
         self.subarray_step = int(subarray_step)
         self._roi: tuple[int, int, int, int] | None = None
+        # SIMULATION-ONLY knob: render every site as loaded (an idealized full array for a
+        # deterministic device-level test).  Real production never sets it -- a sitemap
+        # calibration finds sites by AVERAGING realistic ~50% loadings, same as hardware.
+        self.force_all_sites: bool = False
+        # The virtual TRIGGER CABLE (see _TriggerWiredCamera): the wired in-process streamer
+        # whose fire events / continuous firing gate this camera's frames.  None = a bare
+        # bench camera with no cable -- it then never sees a trigger and reads no frames.
+        self._wire_to(sequencer)
 
     @property
     def exposure(self) -> float:
@@ -644,34 +717,19 @@ class VirtualCamera(CameraDevice):
                 h, w = self.trap_array.image_shape
                 self._roi = snap_subarray(tuple(roi), step=self.subarray_step, max_w=w, max_h=h)
 
-    def acquire(
-        self,
-        frames: int = 1,
-        *,
-        sequence: PulseSequence | None = None,
-        on_armed=None,
-        force_all_sites: bool | None = None,
-        stop=None,
-        **_,
-    ) -> list[np.ndarray]:
-        # A pure grabber, exactly like the real qCMOS: the camera is armed; now (on_armed) the
-        # measurement fires the FPGA -- the camera invokes the hook but never knows it drives a
-        # sequencer (arm-before-fire; virtual == real).
-        if on_armed is not None:
-            on_armed()
-        frames = positive_int(frames, "frames")
+    def _render_frames(self, sequence: PulseSequence | None, frames: int) -> list[np.ndarray]:
         # Image what the atoms (the VirtualTrapArray) are doing under the fired pulse.  The
         # pulse-driven physics lives in the ATOM device -- mirroring real hardware where the FPGA
         # outputs drive the atoms and the camera merely images them; the camera owns ONLY its
-        # capture-trigger channel + imaging (exposure / ROI).  ``sequence`` is the fired pulse the
-        # MEASUREMENT hands in (the live monitor passes the streamer's current firing; a calibration
-        # passes its bracket); ``None`` / no camera trigger -> no frame, so the live image FREEZES,
-        # exactly as a real externally-triggered camera produces nothing without a trigger edge.
+        # capture-trigger channel + imaging (exposure / ROI).  ``sequence`` arrives ONLY through
+        # the trigger wire (a finite fire event, or the continuous firing _grab pulls from) --
+        # nothing above the device layer ever hands the camera a pulse.
+        frames = positive_int(frames, "frames")
         images = self.trap_array.image_frames(
             sequence, frames,
             capture_trigger_channels=self.capture_trigger_channels,
             exposure=self.exposure,
-            all_sites=bool(force_all_sites),
+            all_sites=bool(self.force_all_sites),
         )
         out: list[np.ndarray] = []
         for image in images:
@@ -680,17 +738,19 @@ class VirtualCamera(CameraDevice):
                 x, w, y, h = self._roi
                 image = image[y:y + h, x:x + w]
             out.append(image)
-        # Block for the trigger cycle's wall-clock when imaging a CONTINUOUS (live) firing, exactly as a
-        # real qCMOS's wait_capevent blocks until the next trigger -- so lengthening the imaging period
-        # genuinely slows the live image.  Only for a continuous (repeat_forever) program; a finite shot's
-        # timing is the measurement's wait_done, not a per-cycle camera block.  Interruptible by ``stop`` so
-        # Stop Pulse / teardown never blocks a full cycle.  No frame (Stop) -> no wait (the image freezes).
-        if out and self.sleep_scale > 0.0 and bool(getattr(sequence, "repeat_forever", False)):
+        self.last_sequence = None if sequence is None else getattr(sequence, "name", None)
+        return out
+
+    def _pace(self, sequence, stop) -> None:
+        # Block for the trigger cycle's wall-clock when imaging a CONTINUOUS (live) firing, exactly
+        # as a real qCMOS's wait_capevent blocks until the next trigger -- so lengthening the
+        # imaging period genuinely slows the live image.  Only for a continuous (repeat_forever)
+        # program; a finite shot's timing is the measurement's wait_done, not a per-frame camera
+        # block.  Interruptible by ``stop`` so Stop Pulse / teardown never blocks a full cycle.
+        if self.sleep_scale > 0.0 and bool(getattr(sequence, "repeat_forever", False)):
             wall = float(getattr(sequence, "duration", 0.0)) * self.sleep_scale
             if wall > 0.0:
                 stop.wait(wall) if stop is not None else time.sleep(wall)
-        self.last_sequence = None if sequence is None else getattr(sequence, "name", None)
-        return self._retain(out)
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -708,7 +768,7 @@ class VirtualCamera(CameraDevice):
         pass
 
 
-class VirtualMotCamera(CameraDevice):
+class VirtualMotCamera(_TriggerWiredCamera):
     """The virtual MOT MONITOR camera (the pylon-viewer stand-in): a second, independent sensor
     watching the MOT fluorescence, whose brightness depends on the THREE coil-field DACs.
 
@@ -718,9 +778,11 @@ class VirtualMotCamera(CameraDevice):
     bit-channel pulses through :func:`~..timing.sequence.decode_analog_bus` (the encoder's exact
     inverse, pinned by a round-trip contract test) -- never from a task's set-points, so the virtual
     sensing chain goes through the same artefact the hardware plays (virtual == real; swapping in a
-    real pylon camera changes only ``connect()``).  The frame is a Gaussian fluorescence spot at the
-    sensor centre with Poisson photon noise + Gaussian read noise on a constant offset, mirroring the
-    qCMOS noise chain."""
+    real pylon camera changes only ``connect()``).  The fired sequence reaches the camera ONLY over
+    the virtual trigger wire (the ``sequencer`` constructor parameter -- see
+    :class:`_TriggerWiredCamera`).  The frame is a Gaussian fluorescence spot at the sensor centre
+    with Poisson photon noise + Gaussian read noise on a constant offset, mirroring the qCMOS noise
+    chain."""
 
     def __init__(self, *, width: int = 64, height: int = 64, exposure: float = 5e-3,
                  coil_buses: Mapping[str, Sequence[str]] | None = None,
@@ -728,7 +790,8 @@ class VirtualMotCamera(CameraDevice):
                  b_sigma: Mapping[str, float] | None = None,
                  peak_rate: float = 4.0e5, background_rate: float = 2.0e3,
                  offset_counts: float = 100.0, read_noise: float = 2.0,
-                 spot_sigma_px: float = 6.0, timeout: float = 2.0, seed: int | None = None):
+                 spot_sigma_px: float = 6.0, timeout: float = 2.0, seed: int | None = None,
+                 sequencer=None):
         self.width, self.height = int(width), int(height)
         self._exposure = positive_float(exposure, "exposure")
         self.timeout = positive_float(timeout, "timeout")
@@ -750,6 +813,9 @@ class VirtualMotCamera(CameraDevice):
         self._rng = np.random.default_rng(seed)
         self._roi: tuple[int, int, int, int] | None = None
         self.last_levels: dict[str, int] | None = None    # what the last frame sensed (snapshot/debug)
+        # The virtual TRIGGER CABLE (see _TriggerWiredCamera): fired coil sequences reach this
+        # sensor only through the wired in-process streamer.  None = no cable, never a frame.
+        self._wire_to(sequencer)
 
     @property
     def exposure(self) -> float:
@@ -783,13 +849,9 @@ class VirtualMotCamera(CameraDevice):
             z += ((float(levels.get(bus, 0.0)) - b0) / self.b_sigma[bus]) ** 2
         return float(np.exp(-0.5 * z))
 
-    def acquire(self, frames: int = 1, *, sequence: PulseSequence | None = None,
-                on_armed=None, stop=None, **_) -> list[np.ndarray]:
-        # A pure externally-triggered grabber (the H4f contract): arm, invoke the fire hook, then
-        # image what the FIRED sequence actually drives -- no trigger (no sequence) -> no frame,
-        # exactly like a real triggered sensor.
-        if on_armed is not None:
-            on_armed()
+    def _render_frames(self, sequence: PulseSequence | None, frames: int) -> list[np.ndarray]:
+        # A pure externally-triggered sensor: image what the FIRED sequence (arriving over the
+        # trigger wire) actually drives -- no fired pulses -> no frame, exactly like real hardware.
         frames = positive_int(frames, "frames")
         if sequence is None or not getattr(sequence, "pulses", None):
             return []
@@ -813,7 +875,7 @@ class VirtualMotCamera(CameraDevice):
                 x, w, y, h = self._roi
                 frame = frame[y:y + h, x:x + w]
             out.append(frame)
-        return self._retain(out)
+        return out
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -890,6 +952,11 @@ class VirtualSequencer(SequencerDevice):
         # Latched once a finite scan has played its K sweeps: the scan reading then keeps returning
         # the SATURATED done value (not idle) until the next prepare/stop -- == the real backend.
         self._scan_done: bool = False
+        # The virtual TRIGGER CABLES plugged into this streamer's output lines: each wired
+        # camera registers a callback (see _TriggerWiredCamera._wire_to) that fire() invokes
+        # with the fired program -- the software mirror of the electrical trigger edges the
+        # FPGA would emit.  Purely a device-layer artefact (the one legal lowest-layer fake).
+        self._fire_listeners: list = []
 
     @property
     def history(self) -> list[dict[str, object]]:
@@ -969,12 +1036,32 @@ class VirtualSequencer(SequencerDevice):
         # then paces at the firing cadence.
         self.service.fire()
         # A repeat_forever program keeps the streamer firing (continuous camera triggers) until
-        # set_safe_state.  A finite program plays ONCE -- a measurement's own acquire fires + reads
-        # it within that call -- so it does NOT leave the streamer continuously firing (and must not
-        # make a later live read see a stale finite shot).
+        # set_safe_state.  A finite program plays ONCE -- the measurement arms the camera, fires
+        # here, then reads the frames back -- so it does NOT leave the streamer continuously
+        # firing (and must not make a later live read see a stale finite shot).
         if bool(getattr(self._prepared, "repeat_forever", False)):
             self._firing = self._prepared
             self._scan_fire_time = time.monotonic()
+        # Emit the trigger edges: every wired camera (the virtual trigger cables) sees this
+        # fire.  An ARMED camera renders the frames a finite program's edges gate; a
+        # continuous program is instead consumed at the firing cadence via ``firing``.
+        for listener in tuple(self._fire_listeners):
+            listener(self._prepared)
+
+    # ------------------------------------------------------------------ trigger cables
+    def add_fire_listener(self, listener) -> None:
+        """Plug a virtual trigger cable in: ``listener(program)`` is invoked on every fire.
+        Registered by a wired camera at construction (``sequencer="$device:sequencer"`` in the
+        device config) -- the simulation of the physical trigger wire, device layer only."""
+        if listener not in self._fire_listeners:
+            self._fire_listeners.append(listener)
+
+    def remove_fire_listener(self, listener) -> None:
+        """Unplug a trigger cable (no error if it was never plugged in)."""
+        try:
+            self._fire_listeners.remove(listener)
+        except ValueError:
+            pass
 
     def _scan_progress(self) -> dict:
         """Where the streamed scan is now -- the real-time-paced reading wired into the service as
@@ -1136,10 +1223,14 @@ def write_virtual_run(
 
 
 def virtual_config() -> dict[str, object]:
+    # Both cameras are WIRED to the streamer ("$device:sequencer" = the virtual trigger
+    # cable): fired programs reach a camera only over that wire, exactly like the physical
+    # trigger line on the real rig (see _TriggerWiredCamera).
     return {
         "trap_array": {"type": "VirtualTrapArray"},
-        "camera": {"type": "VirtualCamera", "params": {"trap_array": "$device:trap_array"}},
-        "monitor_camera": {"type": "VirtualMotCamera"},
+        "camera": {"type": "VirtualCamera",
+                   "params": {"trap_array": "$device:trap_array", "sequencer": "$device:sequencer"}},
+        "monitor_camera": {"type": "VirtualMotCamera", "params": {"sequencer": "$device:sequencer"}},
         "sequencer": {"type": "VirtualSequencer"},
     }
 

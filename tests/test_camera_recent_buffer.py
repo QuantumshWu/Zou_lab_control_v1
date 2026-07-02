@@ -21,23 +21,29 @@ if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
 
-def _camera(grid=(2, 3), image=(20, 24), seed=1):
-    from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualTrapArray
-    return VirtualCamera(VirtualTrapArray(grid_shape=grid, image_shape=image, seed=seed), exposure=0.01)
+def _rig(grid=(2, 3), image=(20, 24), seed=1):
+    """A camera WIRED to an in-process streamer (the virtual trigger cable).  The camera is
+    purely trigger-driven (no fabricated frames): frames exist only when the wired sequencer
+    fires an imaging pulse while the camera is armed -- exactly the real-hardware topology."""
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualSequencer, VirtualTrapArray
+    seqr = VirtualSequencer()
+    cam = VirtualCamera(VirtualTrapArray(grid_shape=grid, image_shape=image, seed=seed),
+                        exposure=0.01, sequencer=seqr)
+    return cam, seqr
 
 
-def _seq():
-    """The explicit fired trigger this device-level test images on.  The camera is purely
-    trigger-driven (no fabricated frames), so a standalone camera with no streamer reads via
-    ``acquire(sequence=...)`` -- it fires this imaging pulse and reads the frame(s)."""
+def _acquire(cam, seqr, frames):
+    """One fired shot through the single measurement-layer helper (arm -> fire -> read)."""
+    from Zou_lab_control.neutral_atom.operations.measurement import triggered_frames
     from Zou_lab_control.neutral_atom.timing import imaging_sequence
-    return imaging_sequence(exposure=0.01, load=True, name="readout")
+    seq = imaging_sequence(exposure=0.01, load=True, name="readout")
+    return triggered_frames(cam, seqr, seq, frames)
 
 
 def test_acquire_retains_and_latest_is_newest():
-    cam = _camera()
+    cam, seqr = _rig()
     assert cam.latest() is None                      # nothing acquired yet
-    frames = cam.acquire(2, sequence=_seq())
+    frames = _acquire(cam, seqr, 2)
     assert len(frames) == 2
     np.testing.assert_array_equal(cam.latest(), frames[-1])
     assert len(cam.recent_frames()) == 2
@@ -45,20 +51,20 @@ def test_acquire_retains_and_latest_is_newest():
 
 
 def test_drain_is_lossless_across_acquires():
-    cam = _camera(seed=2)
-    cam.acquire(2, sequence=_seq())
+    cam, seqr = _rig(seed=2)
+    _acquire(cam, seqr, 2)
     assert len(cam.drain()) == 2                      # all frames since start
     assert cam.drain() == []                          # nothing new since last drain
-    later = cam.acquire(3, sequence=_seq())
+    later = _acquire(cam, seqr, 3)
     new = cam.drain()
     assert len(new) == 3                              # only the new ones
     np.testing.assert_array_equal(new[-1], later[-1])
 
 
 def test_recent_capacity_bounds_retention():
-    cam = _camera(grid=(2, 2), image=(16, 16), seed=3)
+    cam, seqr = _rig(grid=(2, 2), image=(16, 16), seed=3)
     cam.recent_capacity = 3                           # set before first retain (lazy init)
-    cam.acquire(5, sequence=_seq())
+    _acquire(cam, seqr, 5)
     assert len(cam.recent_frames()) == 3              # bounded ring
     assert len(cam.drain()) == 3                      # drain capped at what's retained
     cam.clear_recent()

@@ -10,7 +10,8 @@ can never silently rot:
 * decode_analog_bus really is set_api's inverse THROUGH the compiled artefact (this also pins the
   ``_set_api_field`` dac fix: set_api must bake the plan into period states, else the sequence a
   virtual/real machine plays would ignore software-set DAC values entirely);
-* the virtual monitor camera is a PURE triggered grabber sensing only the fired sequence;
+* the virtual monitor camera is a PURE triggered grabber sensing only the sequence FIRED over
+  its trigger wire (the ``sequencer`` construction parameter -- the simulated trigger cable);
 * the intensity primitive + processor shapes;
 * the api sweep carries its declared scan_shape (grid facet parity with the hardware scan);
 * the task converges on the SAME model the frames obey (no ground-truth peeking: the test talks
@@ -36,6 +37,7 @@ from Zou_lab_control.neutral_atom.devices.registry import load_devices
 from Zou_lab_control.neutral_atom.operations.measurements.pulse_scan import _resolve_probe_template
 from Zou_lab_control.neutral_atom.operations.processors.mot_intensity import (
     MotIntensityProcessor, mot_roi_intensity)
+from Zou_lab_control.neutral_atom.operations.measurement import triggered_frames
 from Zou_lab_control.neutral_atom.operations.tasks.mot_field import (
     DEFAULT_MOT_TEMPLATE, OptimizeMotFieldTask)
 from Zou_lab_control.neutral_atom.timing.sequence import decode_analog_bus
@@ -71,23 +73,24 @@ def test_decode_analog_bus_inverts_set_api_through_compiled_sequence(values):
 
 # --------------------------------------------------------------------------- virtual sensing
 def test_virtual_mot_camera_senses_only_the_fired_sequence():
-    """The virtual monitor camera is a PURE triggered grabber: no sequence -> no frame; with a
-    fired sequence it reconstructs each coil level from the compiled bit-channel pulses (never
-    from anyone's set-points), and the frame brightness follows its own public MOT model."""
+    """The virtual monitor camera is a PURE triggered grabber: nothing fired -> no frame; a
+    sequence FIRED on its wired streamer reconstructs each coil level from the compiled
+    bit-channel pulses (never from anyone's set-points), and the frame brightness follows its
+    own public MOT model."""
     ds = load_devices("virtual", open_devices=False)
-    cam = ds.devices["monitor_camera"]
+    cam, seqr = ds.devices["monitor_camera"], ds.devices["sequencer"]
     state = _mot_state()
     slots = [s.name for s in state.api_slots if s.kind == "dac"]
 
-    assert cam.acquire(1) == []                        # no trigger -> no frame (H4f grabber)
+    assert cam.acquire(1) == []                        # nothing fired -> no trigger -> no frame
 
     at_peak = {name: int(cam.b0[bus]) for name, bus in zip(slots, cam.coil_buses)}
     seq = state.with_api_resolved(at_peak).to_sequence()
-    frame_peak = cam.acquire(1, sequence=seq)[0]
+    frame_peak = triggered_frames(cam, seqr, seq, 1)[0]
     assert cam.last_levels == {bus: int(cam.b0[bus]) for bus in cam.coil_buses}
 
     far = {name: int(cam.b0[bus] - 4 * cam.b_sigma[bus]) for name, bus in zip(slots, cam.coil_buses)}
-    frame_far = cam.acquire(1, sequence=state.with_api_resolved(far).to_sequence())[0]
+    frame_far = triggered_frames(cam, seqr, state.with_api_resolved(far).to_sequence(), 1)[0]
     # brightness ratio follows the SAME public model the optimum test uses
     assert cam.mot_efficiency(cam.last_levels) < 1e-3
     assert float(frame_peak.mean()) > float(frame_far.mean()) + 10

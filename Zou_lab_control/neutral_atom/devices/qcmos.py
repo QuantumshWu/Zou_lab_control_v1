@@ -76,6 +76,10 @@ class QCMOSCamera(CameraDevice):
         # -- so a consumer (the Edit 'now:' reference, the 2D panel's axes) reflects
         # the region truly being imaged.
         self._applied_roi: tuple[int, int, int, int] | None = None
+        # Armed-session bookkeeping for the acquisition hooks (_arm/_grab/_disarm):
+        # the DCAM buffer depth of the current session + the next frame index to transfer.
+        self._buf_alloc = 0
+        self._next_frame = 0
 
     # ------------------------------------------------------------------ discovery (self-describing)
     @classmethod
@@ -187,63 +191,82 @@ class QCMOSCamera(CameraDevice):
         self._write_settings()
         return self
 
-    def acquire(self, frames: int = 1, *, sequence=None, on_armed=None, timeout_ms: int | None = None, stop=None) -> list[np.ndarray]:
-        """Arm for ``frames`` frames, let the measurement fire (``on_armed``), read N back.
+    # ------------------------------------------------------------------ acquisition hooks
+    # The public acquisition surface (arm / read_frames / disarm / acquire) lives on the
+    # CameraDevice base; this adapter only implements the DCAM-facing hooks.  A measurement
+    # that needs an external fire between arm and read goes through the single helper
+    # ``operations.measurement.triggered_frames``.
 
-        Pure grabber: no sequencer, no trigger counting, no exposure inference.  Exposure/ROI are
-        the camera's own config (``configure``); the FPGA's external trigger gates each readout.
-        ``sequence`` is ignored here (a real sensor needs no pulse to image); it exists in the
-        contract only so the VIRTUAL camera can simulate."""
+    def _arm(self, frames: int | None) -> None:
+        """Allocate the DCAM frame buffer and start capture -- the hardware is then armed and
+        waiting for FPGA trigger edges.  ``frames=None`` (continuous) allocates a
+        ``recent_capacity``-deep ring the sequence capture cycles through."""
         self.open()
-        frames = positive_int(frames, "frames")
         dcam = self._dcam
-        if dcam.buf_alloc(frames) is False:
-            raise RuntimeError(f"qCMOS buf_alloc({frames}) failed: {dcam.lasterr()}")
-        images: list[np.ndarray] = []
+        alloc = int(frames) if frames is not None else max(1, int(self.recent_capacity))
+        if dcam.buf_alloc(alloc) is False:
+            raise RuntimeError(f"qCMOS buf_alloc({alloc}) failed: {dcam.lasterr()}")
         try:
             if dcam.cap_start(bSequence=True) is False:
                 raise RuntimeError(f"qCMOS cap_start failed: {dcam.lasterr()}")
-            # The camera is armed and waiting for hardware triggers; NOW the measurement fires the
-            # FPGA (arm-before-fire).  The camera invokes the hook but knows nothing about it.
-            if on_armed is not None:
-                on_armed()
-            timeout = self.config.timeout_ms if timeout_ms is None else positive_int(timeout_ms, "timeout_ms")
-            # When a live logic node passes a stop event, wait in short slices and check
-            # it between slices so Stop interrupts a wedged trigger within ~one
-            # slice instead of blocking the full timeout.  Without a stop event,
-            # one wait of the full timeout (the original behaviour).
-            poll_ms = min(timeout, 200) if stop is not None else timeout
-            next_frame = 0
-            deadline = time.monotonic() + timeout / 1000.0
-            while next_frame < frames:
+        except BaseException:
+            try:
+                dcam.buf_release()
+            except Exception:
+                pass
+            raise
+        self._buf_alloc = alloc
+        self._next_frame = 0
+
+    def _grab(self, n: int, *, timeout: float | None = None, stop=None) -> bool:
+        """Wait for and transfer up to ``n`` externally triggered frames from the DCAM buffer
+        into the base-class frame queue.  The qCMOS fault model is LOUD: a trigger that never
+        comes raises ``TimeoutError`` after ``timeout`` (seconds; the config ``timeout_ms``
+        default), and a Stop raises :class:`AcquisitionCancelled` within one poll slice."""
+        dcam = self._dcam
+        n = positive_int(n, "n")
+        timeout_ms = self.config.timeout_ms if timeout is None else max(1, int(float(timeout) * 1000))
+        # When a live logic node passes a stop event, wait in short slices and check it
+        # between slices so Stop interrupts a wedged trigger within ~one slice instead of
+        # blocking the full timeout.  Without a stop event, one wait of the full timeout.
+        poll_ms = min(timeout_ms, 200) if stop is not None else timeout_ms
+        got = 0
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while got < n:
+            if stop is not None and stop.is_set():
+                raise AcquisitionCancelled(f"qCMOS cancelled while waiting for frame {self._next_frame}.")
+            slice_ms = poll_ms
+            if stop is not None:
+                slice_ms = max(1, min(poll_ms, int((deadline - time.monotonic()) * 1000)))
+            if dcam.wait_capevent_frameready(slice_ms) is False:
+                if stop is not None and not stop.is_set() and time.monotonic() < deadline:
+                    continue  # slice expired but neither stopped nor timed out -- keep polling
                 if stop is not None and stop.is_set():
-                    raise AcquisitionCancelled(f"qCMOS acquire cancelled while waiting for frame {next_frame}.")
-                slice_ms = poll_ms
-                if stop is not None:
-                    slice_ms = max(1, min(poll_ms, int((deadline - time.monotonic()) * 1000)))
-                if dcam.wait_capevent_frameready(slice_ms) is False:
-                    if stop is not None and not stop.is_set() and time.monotonic() < deadline:
-                        continue  # slice expired but neither stopped nor timed out -- keep polling
-                    if stop is not None and stop.is_set():
-                        raise AcquisitionCancelled(f"qCMOS acquire cancelled while waiting for frame {next_frame}.")
-                    raise TimeoutError(f"qCMOS timed out after {timeout} ms waiting for frame {next_frame}.")
-                info = dcam.cap_transferinfo()
-                available = int(getattr(info, "nFrameCount", next_frame + 1)) if info is not False else next_frame + 1
-                while next_frame < min(available, frames):
-                    data = dcam.buf_getframedata(next_frame)
-                    if data is False:
-                        raise RuntimeError(f"qCMOS buf_getframedata({next_frame}) failed: {dcam.lasterr()}")
-                    images.append(np.asarray(data[1]).copy())
-                    next_frame += 1
-            return self._retain(images)
+                    raise AcquisitionCancelled(f"qCMOS cancelled while waiting for frame {self._next_frame}.")
+                raise TimeoutError(f"qCMOS timed out after {timeout_ms} ms waiting for frame {self._next_frame}.")
+            info = dcam.cap_transferinfo()
+            available = int(getattr(info, "nFrameCount", self._next_frame + 1)) if info is not False else self._next_frame + 1
+            while self._next_frame < available and got < n:
+                # A continuous session cycles the allocated ring; a finite one indexes 0..N-1.
+                data = dcam.buf_getframedata(self._next_frame % max(1, int(self._buf_alloc)))
+                if data is False:
+                    raise RuntimeError(f"qCMOS buf_getframedata({self._next_frame}) failed: {dcam.lasterr()}")
+                self._deliver([np.asarray(data[1]).copy()])
+                self._next_frame += 1
+                got += 1
+        return True
+
+    def _disarm(self) -> None:
+        dcam = self._dcam
+        if dcam is None:
+            return
+        try:
+            dcam.cap_stop()
         finally:
             try:
-                dcam.cap_stop()
-            finally:
-                try:
-                    dcam.buf_release()
-                except Exception:
-                    pass
+                dcam.buf_release()
+            except Exception:
+                pass
 
     def _set_prop(self, idprop, value, name: str, *, verify: bool = False) -> None:
         """Write a DCAM property and FAIL LOUDLY if the camera rejects it.

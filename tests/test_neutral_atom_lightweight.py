@@ -68,17 +68,17 @@ def test_virtual_jupyter_session_runs_end_to_end(tmp_path):
     assert exp.calibration_data is None
 
     preflight = exp.timing.preflight()
-    capture = exp.camera.capture(display=False)
+    capture = exp.capture(display=False)
     assert [patch for patch in capture.plot.ax.patches if isinstance(patch, Circle)] == []
     assert "truth_available" not in capture.summary()
     assert not hasattr(capture, "truth")
     assert not hasattr(exp.camera, "last_truth")
     assert not hasattr(exp.devices.trap_array, "centers")
     sitemap = exp.readout.sitemap(frames=6, display=False)
-    capture_after_sitemap = exp.camera.capture(display=False)
+    capture_after_sitemap = exp.capture(display=False)
     assert [patch for patch in capture_after_sitemap.plot.ax.patches if isinstance(patch, Circle)] == []
     threshold = exp.readout.thresholds(frames=12, display=False)
-    capture_after_threshold = exp.camera.capture(display=False)
+    capture_after_threshold = exp.capture(display=False)
     assert [patch for patch in capture_after_threshold.plot.ax.patches if isinstance(patch, Circle)] == []
     detection = exp.readout.detect(display=False)
     scan = exp.readout.detection_time([5e-6, 2e-5, 0.0002], shots=8, live=False, display=False)
@@ -266,14 +266,13 @@ def test_timing_and_verilog_boundaries(tmp_path):
 
 
 def test_multiframe_acquisition_reads_n_frames_from_one_trigger_pulse():
-    """The camera reads N frames off a pulse it is handed -- a single-trigger imaging pulse read for
-    3 frames is 3 independent shots (the atom device reloads per armed frame), NOT a sequence
-    rewritten to carry 3 triggers.  The pulse carries its OWN triggers; there is no 1->N expansion."""
+    """The camera reads the N frames its armed request wants -- a single-trigger imaging pulse
+    fired into a 3-frame arm is 3 independent shots (the atom device reloads per armed frame),
+    NOT a sequence rewritten to carry 3 triggers.  The pulse carries its OWN triggers; there is
+    no 1->N expansion, and the shot goes through the ONE arm-before-fire helper."""
     exp = na.connect("virtual")
     seq = na.imaging_sequence(exposure=1e-3, load=True, name="multi_frame")
-    images = exp.camera.acquire(
-        3, sequence=seq,
-        on_armed=lambda: (exp.devices.sequencer.prepare(seq), exp.devices.sequencer.fire(seq)))
+    images = na.triggered_frames(exp.camera, exp.devices.sequencer, seq, 3)
 
     assert len(images) == 3
     assert na.count_trigger_pulses(seq) == 1                 # the pulse itself is unchanged (1 trigger)
@@ -3168,6 +3167,23 @@ def test_bind_pulse_controller_can_override_sequence_repeat_forever():
     assert sequencer.snapshot()["state"] == "done"
 
 
+def _bench_trigger_cable(camera, sequencer):
+    """Test-bench TRIGGER CABLE: plug the virtual camera's trigger input into THIS streamer.
+
+    On a real rig the cable is copper -- a RuntimeSequencer/RemoteSequencer emits real edges the
+    camera's hardware input sees.  On the bench the virtual camera needs the software mirror of
+    that wire, so re-point its ``sequencer`` and forward every ``fire`` to the camera's wire
+    listener (exactly what a VirtualSequencer's fire-listener seam does natively)."""
+    camera.sequencer = sequencer
+    inner_fire = sequencer.fire
+
+    def fire(sequence=None):
+        inner_fire(sequence)
+        camera._on_wire_fired(sequence)
+
+    sequencer.fire = fire
+
+
 def test_detection_time_scan_uses_bound_40ch_pulse_controller():
     exp = na.connect("virtual")
     exp.readout.sitemap(frames=3, display=False)
@@ -3184,6 +3200,7 @@ def test_detection_time_scan_uses_bound_40ch_pulse_controller():
             return program
 
     sequencer = RecordingRuntimeSequencer(channels=hardware_channels, clock_hz=100_000_000, sleep_scale=0.0)
+    _bench_trigger_cable(exp.devices.camera, sequencer)   # this streamer's edges now gate the camera
     state = na.PulseTableState(
         channels=["ch00", "ch02", "ch03"],
         periods=[
@@ -3240,6 +3257,7 @@ def test_timing_subsystem_bind_pulse_loads_json_for_40ch_remote_style_scan(tmp_p
 
     sequencer = RecordingRuntimeSequencer(channels=hardware_channels, clock_hz=100_000_000, sleep_scale=0.0)
     exp.devices.devices["sequencer"] = sequencer
+    _bench_trigger_cable(exp.devices.camera, sequencer)   # re-plug the camera onto the new streamer
     state = na.PulseTableState(
         channels=["ch00", "ch02", "ch03"],
         periods=[
@@ -4562,6 +4580,7 @@ def test_remote_detection_time_scan_uses_bound_pulse_controller_over_json_protoc
         repeat_forever=True,
     )
     pulse = na.bind_pulse(remote, state)
+    _bench_trigger_cable(exp.devices.camera, remote)      # the remote streamer's edges gate the camera
     try:
         scan = exp.readout.detection_time(
             [2e-6, 4e-6],
@@ -4667,7 +4686,7 @@ def test_load_devices_can_open_device_graph(monkeypatch):
         def configure(self, *, exposure=None, **kwargs):
             pass
 
-        def acquire(self, frames=1, *, sequence=None, on_armed=None, **kwargs):
+        def acquire(self, frames=1, *, stop=None, **kwargs):
             return [np.zeros((2, 2))]
 
         def open(self):
@@ -4826,16 +4845,18 @@ def test_qcmos_camera_acquire_reads_n_frames(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "fake_dcam_for_qcmos_test", fake_module)
 
-    # Pure grabber: the camera arms N frames and calls ``on_armed`` (the fire hook);
-    # it does NOT touch the sequencer or expand any pulse.  The DCAM mock must see N
-    # buffer allocations / read N frames back.
+    # Pure grabber through the three primitives: arm(N) allocates + starts capture (the
+    # hardware is then ready BEFORE any fire could happen), read_frames(N) drains the
+    # triggered frames, disarm() stands the sensor down.  It never touches a sequencer or
+    # expands any pulse.  The DCAM mock must see N buffer allocations / read N frames back.
     camera = na.QCMOSCamera({"exposure": 2e-3, "roi": [1, 4, 2, 3], "timeout_ms": 100}, dcam_module="fake_dcam_for_qcmos_test")
-    armed = []
-    images = camera.acquire(2, on_armed=lambda: armed.append(True))
+    camera.arm(2)
+    assert FakeDcam.instance.frames == 2          # buf_alloc(N) happened AT arm (ready pre-fire)
+    assert FakeDcam.instance.started is True      # cap_start ran: armed and waiting for triggers
+    images = camera.read_frames(2)
+    camera.disarm()
 
     assert len(images) == 2
-    assert FakeDcam.instance.frames == 2          # N frames allocated/read via the dcam mock
-    assert armed == [True]                          # the fire hook ran after the camera armed
     assert FakeApi.initialized is True
     assert FakeDcam.instance.released is True
     assert ("TRIGGERSOURCE", "EXTERNAL") in FakeDcam.instance.props
@@ -4844,12 +4865,10 @@ def test_qcmos_camera_acquire_reads_n_frames(monkeypatch):
     assert FakeApi.initialized is False
 
     camera = na.QCMOSCamera({"exposure": 2e-3, "timeout_ms": 100}, dcam_module="fake_dcam_for_qcmos_test")
-    armed = []
-    images = camera.acquire(3, on_armed=lambda: armed.append(True))
+    images = camera.acquire(3)                     # the arm+read+disarm convenience
 
     assert len(images) == 3
     assert FakeDcam.instance.frames == 3
-    assert armed == [True]
     camera.close()
     assert FakeApi.initialized is False
 
@@ -4857,9 +4876,9 @@ def test_qcmos_camera_acquire_reads_n_frames(monkeypatch):
 def test_standalone_calibration_and_detection_from_arrays():
     exp = na.connect("virtual")
     sequence = na.imaging_sequence(exposure=exp.camera.exposure, load=True, name="sitemap")
-    images = exp.camera.acquire(4, sequence=sequence)
+    images = na.triggered_frames(exp.camera, exp.devices.sequencer, sequence, 4)
     sitemap = na.calibrate_sitemap_from_images(images, grid_shape=exp.devices.trap_array.grid_shape, display=False)
-    threshold_images = exp.camera.capture(frames=8, display=False).images
+    threshold_images = exp.capture(frames=8, display=False).images
     threshold = na.calibrate_threshold_from_images(threshold_images, sitemap.calibration, display=False)
     shot = na.detect_image(threshold_images[-1], threshold.calibration, display=False)
 
@@ -7358,10 +7377,10 @@ def test_user_composed_loading_readout_publishes_standard_signals():
 
     def _build(hub, *, prefix, seed, loading_probability):
         trap = VirtualTrapArray(grid_shape=(5, 7), loading_probability=loading_probability, seed=seed)
-        camera = VirtualCamera(trap, exposure=0.02)
         seqr = VirtualSequencer()
+        camera = VirtualCamera(trap, exposure=0.02, sequencer=seqr)   # the trigger cable
         fire_imaging_pulse(seqr, exposure=0.02, cooling=trap.mot_load_s)   # On Pulse: trigger-driven camera streams
-        task = CalibrateReadoutTask(hub, camera, grid_shape=trap.grid_shape,
+        task = CalibrateReadoutTask(hub, camera, sequencer=seqr, grid_shape=trap.grid_shape,
                                     readout_exposure=0.02,
                                     roi_radius=1, threshold_frames=24,
                                     prefix=f"{prefix}cal_")
@@ -7606,7 +7625,7 @@ def test_psf_bimodal_readout_end_to_end_on_virtual_backend():
     from conftest import fire_live_imaging
     exp.devices.trap_array.set_occupancy([0, 1, 2, 5, 9])
     fire_live_imaging(exp)            # On Pulse: the trigger-driven camera streams the pinned shot
-    image = exp.devices.camera.acquire(1, sequence=getattr(exp.devices.sequencer, "firing", None), force_all_sites=False)[-1]
+    image = exp.devices.camera.acquire(1)[-1]      # the wired camera senses the firing itself
     assert cal.detect(image).occupied_indices == [0, 1, 2, 5, 9]
 
 
@@ -7652,7 +7671,7 @@ def test_sequence_name_does_not_switch_the_virtual_camera_to_all_bright():
         from conftest import fire_live_imaging
         fire_live_imaging(exp)
         seq = exp.readout._session._imaging_sequence(load=True, name="sitemap")   # the MAGIC name
-        img = exp.devices.camera.acquire(1, sequence=seq)[-1]
+        img = na.triggered_frames(exp.devices.camera, exp.devices.sequencer, seq, 1)[-1]
         loaded = int(np.sum(np.asarray(cal.detect(img).occupied)))
         assert 0 < loaded < cal.n_sites      # realistic partial loading -- the name does NOT force all-bright
     finally:

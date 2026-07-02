@@ -39,7 +39,8 @@ import numpy as np
 from Zou_lab_control._paths import CALIBRATION_DIR
 from ..core.analysis import grid_shape_tuple
 from ..core.signals import NO_LINEAGE, SignalHub
-from ..devices.base import CameraDevice, arm_then_fire
+from ..devices.base import CameraDevice
+from .measurement import triggered_frames
 from .signal_expr import DEFAULT_SOURCE, SignalExpr, hub_namespace
 
 
@@ -1351,13 +1352,11 @@ class CalibrateReadoutTask(Task):
         for g in range(n_groups):
             if self._stop.is_set():
                 break
-            # Decoupled shot: the camera arms for the bracket's N frames, then (on_armed) WE fire the
-            # sequencer -- the camera never drives it.  The bracket (the fired pulse) is handed in only
-            # so the virtual camera can simulate; a real qCMOS reads the frames its trigger gates.
-            # Without a bound sequencer (a notebook-composed readout that leans on the virtual atom
-            # array) there is nothing to fire -- the camera still simulates from the bracket sequence.
-            batch = self.camera.acquire(
-                n_frames, sequence=bracket, on_armed=arm_then_fire(self.sequencer, bracket), stop=self._stop)
+            # Decoupled shot through the ONE measurement-layer helper: arm the camera for the
+            # bracket's N frames, fire the sequencer, read the frames back -- the camera never
+            # drives (or even sees) the sequencer; its trigger input gates the readout, real or
+            # virtual alike.
+            batch = triggered_frames(self.camera, self.sequencer, bracket, n_frames, stop=self._stop)
             frames = [np.asarray(f, dtype=float) for f in batch]
             if len(frames) <= readout_index:
                 break                                          # stopped mid-bracket -> no full shot
@@ -1520,8 +1519,13 @@ class CameraMeasurement(Measurement):
     single-frame measurement always shows the first emCCD image.  Put ``value = frame_0`` on
     one panel and ``value = frame_1`` on another to watch the two triggers side by
     side.  (``frames_per_cycle`` must match the camera-trigger count per cycle so the
-    per-trigger assignment stays phase-aligned; for a measurement that FIRES the sequence,
-    ``acquire`` enforces frames == trigger count.)"""
+    per-trigger assignment stays phase-aligned.)
+
+    The node is PASSIVE: the streamer runs independently (the pulse GUI's On Pulse) and the
+    camera just reads what its trigger input gates -- no frames means the view freezes.
+    ``sequencer`` is the RECORD of which streamer this live view rides on (the console reads
+    it off the running node, e.g. for the scan-progress readout); the node itself never
+    drives or reads it."""
 
     node_label = "camera"
 
@@ -1571,20 +1575,16 @@ class CameraMeasurement(Measurement):
 
     def shot(self) -> dict[str, object]:
         n = max(1, int(self.frames_per_cycle))
-        # Live monitor: the streamer is already firing continuously; the camera images whatever it is
-        # firing now (we hand it that pulse).  None / not firing a camera trigger -> no frame (freeze).
-        # No sequencer at all is the same idle state -- ``firing`` is a guaranteed SequencerDevice
-        # contract, but the device itself may be absent (a camera node wired without a streamer).
-        firing = None if self.sequencer is None else self.sequencer.firing
-        frames = self.camera.acquire(n, sequence=firing, stop=self._stop)
+        # PASSIVE live monitor: the camera is armed and reads whatever the (independently
+        # running) streamer triggers -- the node never fires, never reads the streamer's state.
+        frames = self.camera.acquire(n, stop=self._stop)
         if not frames:
             # The streamer is not firing a camera-triggering pulse (e.g. the user hit "Stop
             # Pulse") -> no trigger -> no frame.  Publish nothing: the live view holds its last
             # image and FREEZES, exactly as a real externally-triggered camera does.  The gate
-            # lives in the DATA SOURCE (only the lowest layer is faked): the virtual camera reads
-            # the in-process sequencer's firing state; a real qCMOS learns it directly from the
-            # absence of hardware trigger edges -- so this is correct for a real streamer driven
-            # from another process too (the camera sees the actual triggers, not a local flag).
+            # lives in the DATA SOURCE (only the lowest layer is faked): the virtual camera
+            # senses its own trigger wire's firing state; a real qCMOS learns it directly from
+            # the absence of hardware trigger edges -- the node sees only "frames or no frames".
             return {}
         # A real cycle WAS acquired -> mint this shot's SOURCE-shot id; every ``frame_i`` published this
         # cycle carries it, and the OccupancyProcessor consuming a chosen ``frame_i`` inherits it, so the
@@ -1910,10 +1910,10 @@ class PulseScanNode(_SweptBlockMeasurement):
         the only thing touching it.
     Both paths read y through the SAME expression once the consumer is fresh.
 
-    It touches only ``with_slots_resolved`` + ``to_sequence`` + ``camera.acquire`` + the hub
-    (publish / signal_versions / latest), reads no simulation ground truth and imports no
-    concrete backend -- guarded by ``tests/test_virtual_equals_real_contract.py`` like the rest
-    of the analysis layer.
+    It touches only ``with_slots_resolved`` + ``to_sequence`` + ``triggered_frames`` (the one
+    arm-fire-read helper) + the hub (publish / signal_versions / latest), reads no simulation
+    ground truth and imports no concrete backend -- guarded by
+    ``tests/test_virtual_equals_real_contract.py`` like the rest of the analysis layer.
     """
 
     node_label = "pulse_scan"
@@ -2030,13 +2030,13 @@ class PulseScanNode(_SweptBlockMeasurement):
         sequence = resolved.to_sequence(name="pulse_scan")
         # ONE trigger per point: pulse-scan FIRES the pulse and reads the UPSTREAM signal (y) -- it
         # is decoupled from the camera's exposure/averaging (no n_frames knob; temporal averaging
-        # belongs to the upstream camera/processor).  The camera never drives the sequencer; WE fire
-        # it from on_armed.  No bound sequencer -> nothing to fire (the virtual camera still simulates).
-        frames = self.camera.acquire(
-            1, sequence=sequence, on_armed=arm_then_fire(self.sequencer, sequence), stop=self._stop)
+        # belongs to the upstream camera/processor).  The shot goes through the ONE measurement-
+        # layer helper (arm camera -> fire sequencer -> read frames); the camera never drives the
+        # sequencer.  No bound sequencer -> nothing to fire -> no trigger -> no frame.
+        frames = triggered_frames(self.camera, self.sequencer, sequence, 1, stop=self._stop)
         if not frames:
-            # Streamer not firing (e.g. Stop) -> no trigger -> no frame: freeze, do not advance
-            # (the SAME data-source gate the camera measurement uses).
+            # No trigger reached the camera (streamer stopped / no streamer bound): freeze, do
+            # not advance -- the SAME data-source gate the live camera measurement uses.
             return {}
         # 1) publish the camera frame(s) under BARE names so the reactive consumers (e.g. a
         #    Judge-occupancy processor consuming ``frame_0``) pick them up -- this is the SAME
@@ -2054,13 +2054,12 @@ class PulseScanNode(_SweptBlockMeasurement):
         # 2) make the y signals FRESH for this frame, then 3) read y from the source expression.
         self._await_y_inputs(before)
         y = self._read_y()
-        # 4) device-owned inter-point settle: load -> on_pulse -> wait pulse done (camera.acquire)
-        #    -> settle (extra_delay_s) -> next.  The sequencer owns the wait (the caller just sets
-        #    the adjustable extra delay); honours Stop so a long settle does not wedge teardown.
-        #    No bound sequencer -> nothing to settle, exactly like ``arm_then_fire`` returns None
-        #    when there is no streamer (a notebook-composed readout on the virtual atom array): the
-        #    sequencer-owned actions (fire AND settle) are all no-ops when ``self.sequencer is None``,
-        #    so an api-only / virtual scan with extra_delay_s>0 advances instead of wedging on
+        # 4) device-owned inter-point settle: load -> fire -> read the point's frame -> settle
+        #    (extra_delay_s) -> next.  The sequencer owns the wait (the caller just sets the
+        #    adjustable extra delay); honours Stop so a long settle does not wedge teardown.
+        #    No bound sequencer -> nothing to settle, exactly like ``triggered_frames`` fires
+        #    nothing without a streamer: every sequencer-owned action (fire AND settle) is a
+        #    no-op when ``self.sequencer is None``, so a sequencer-less scan never wedges on
         #    ``None.settle``.
         if self.extra_delay_s > 0.0 and self.sequencer is not None and not self._stop.is_set():
             self.sequencer.settle(self.extra_delay_s, stop=self._stop)

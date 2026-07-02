@@ -35,7 +35,7 @@ def _live_frame_seconds(exp, exposure):
     seqr.prepare(seq)
     seqr.fire(seq)
     t0 = time.monotonic()
-    exp.devices.camera.acquire(1, sequence=getattr(seqr, "firing", None))
+    exp.devices.camera.acquire(1)                 # the wired camera senses the firing itself
     return time.monotonic() - t0, float(seq.duration)
 
 
@@ -79,7 +79,7 @@ def test_stop_pulse_freezes_the_live_image_immediately():
         seqr.fire(seq)
         seqr.set_safe_state()
         t0 = time.monotonic()
-        frames = exp.devices.camera.acquire(1, sequence=getattr(seqr, "firing", None))
+        frames = exp.devices.camera.acquire(1)
         assert frames == []                                       # no trigger -> no frame
         assert time.monotonic() - t0 < 0.05                       # and it did NOT block a cycle
     finally:

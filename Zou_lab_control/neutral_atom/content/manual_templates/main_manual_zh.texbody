@@ -221,7 +221,7 @@ exp = na.connect("remote_template",
 exp.timing.configure_imaging(exposure=2e-3, load=True)
 exp.timing.preflight().raise_if_failed()
 
-capture   = exp.camera.capture(frames=1)
+capture   = exp.capture(frames=1)
 sitemap   = exp.readout.sitemap(frames=20, grid_shape=(5, 7))
 threshold = exp.readout.thresholds(frames=120, site=0)
 shot      = exp.readout.detect()

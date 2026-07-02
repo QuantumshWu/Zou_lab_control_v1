@@ -24,10 +24,10 @@ from ..operations.measurement import (
     ScanResult,
     ScannedMeasurement,
     otsu_fidelity_from_frames,
+    triggered_frames,
 )
 from ..operations.temperature import ReleaseRecapturePlan, SurvivalReducer
 from ..timing import PulseTableState
-from ..devices.base import arm_then_fire
 from .base import ExperimentSubsystem
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -79,10 +79,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         exposure = s.defaults.get("sitemap_exposure", s._camera_exposure())
         sequence = s._imaging_sequence(exposure=exposure, load=True, name="sitemap")
         seq_dev = getattr(s.devices, "sequencer", None)
-        images = s.devices.camera.acquire(
-            positive_int(frames, "frames"), sequence=sequence,
-            on_armed=arm_then_fire(seq_dev, sequence),
-        )
+        images = triggered_frames(s.devices.camera, seq_dev, sequence, positive_int(frames, "frames"))
         result = calibrate_sitemap_from_images(
             images, grid_shape=grid_shape, ordering=ordering, roi_radius=roi_radius, reducer=reducer,
             method=method, psf_half_width=psf_half_width, display=display,
@@ -110,10 +107,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         expo = s._camera_exposure() if exposure is None else float(exposure)
         sequence = s._imaging_sequence(exposure=expo, load=True, name="threshold")
         seq_dev = getattr(s.devices, "sequencer", None)
-        images = s.devices.camera.acquire(
-            positive_int(frames, "frames"), sequence=sequence,
-            on_armed=arm_then_fire(seq_dev, sequence),
-        )
+        images = triggered_frames(s.devices.camera, seq_dev, sequence, positive_int(frames, "frames"))
         # The exposure these thresholds are learnt at is stamped INSIDE calibrate_threshold_from_images
         # (the single source every threshold path routes through, #H3w-3) so a later readout -- e.g. the
         # release-recapture survival frames -- self-matches it and never floors/sticks (#H3v-2).
@@ -150,8 +144,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
             exposure = calibration.readout_exposure(fallback=s._camera_exposure())
         sequence = s._imaging_sequence(exposure=float(exposure), load=True, name="detect")
         seq_dev = getattr(s.devices, "sequencer", None)
-        images = s.devices.camera.acquire(
-            1, sequence=sequence, on_armed=arm_then_fire(seq_dev, sequence))
+        images = triggered_frames(s.devices.camera, seq_dev, sequence, 1)
         result = detect_image(images[-1], calibration, sequence=sequence, display=display, what=what)
         s.history.append(result)
         return result
@@ -368,10 +361,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
             configure(exposure=float(reference_exposure))
         reference_sequence = reference_controller.frame_sequence(reference_shots, time_ns=float(reference_exposure) * 1e9)
         ref_seqr = reference_controller.sequencer
-        reference_images = s.devices.camera.acquire(
-            reference_shots, sequence=reference_sequence,
-            on_armed=arm_then_fire(ref_seqr, reference_sequence),
-        )
+        reference_images = triggered_frames(s.devices.camera, ref_seqr, reference_sequence, reference_shots)
         # Extract through the calibration's own method (box or PSF) and Otsu-split + score via the
         # ONE shared pipeline -- so the held-out reference uses the SAME signals/threshold/fidelity
         # the live OtsuFidelityReducer does, the same quantity detect() compares (#C3).

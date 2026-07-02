@@ -51,6 +51,10 @@ from .devices import (
     serve_runtime_sequencer,
     validate_device_contract,
 )
+# The discovery protocol pieces a user's own hardware plugs into: a device class's
+# ``discover()`` classmethod returns ``DiscoveredDevice`` rows (``discovery_note`` for a
+# missing library / empty bus), and a class-less bus scanner registers as a named provider.
+from .devices.discovery import DiscoveredDevice, discovery_note, register_discovery_provider
 from .views import image_to_points, plot_detection_image, plot_detection_scan, plot_image, plot_site_values, plot_threshold_hist
 from .devices import VerilogSequencer
 from .timing import (
@@ -107,6 +111,7 @@ from .operations import (
     release_recapture_survival,
     save_frame,
     task,
+    triggered_frames,
     unregister_measurement,
     unregister_processor,
     unregister_task,
@@ -201,6 +206,7 @@ __all__ = [
     "DetectionResult",
     "DetectionTimeScanResult",
     "DeviceSet",
+    "DiscoveredDevice",
     "CameraMeasurement",
     "LogicNode",
     "ExperimentSubsystem",
@@ -269,6 +275,7 @@ __all__ = [
     "imaging_sequence",
     "infer_bus_channels",
     "discover_devices",
+    "discovery_note",
     "infer_xdc_channel_count",
     "infer_xdc_channel_labels",
     "infer_xdc_channels",
@@ -287,6 +294,7 @@ __all__ = [
     "quantized_time_steps",
     "roi_counts",
     "register_device_class",
+    "register_discovery_provider",
     "run_sequencer_server",
     "serve_runtime_sequencer",
     "sort_centers_grid",
@@ -310,6 +318,7 @@ __all__ = [
     "registered_processors",
     "unregister_processor",
     "task",
+    "triggered_frames",
     "register_task",
     "registered_tasks",
     "unregister_task",

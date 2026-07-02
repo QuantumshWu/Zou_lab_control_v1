@@ -51,13 +51,9 @@ class NeutralAtomSession:
         self.sequence = self._imaging_sequence(exposure=self._camera_exposure(), load=True)
         self._calibration: TrapCalibration | None = None
         self.history: list[Any] = []
-        # EVERY camera in the set binds to the session (its capture() then gets timing /
-        # sequencer / history for free) -- by TYPE, never by a hardcoded role name, and NO role
-        # is mandatory: a camera-less or sequencer-less config (e.g. a bare monitor rig) is a
-        # legal session, the roles that exist simply light up.
-        for device in devices.devices.values():
-            if isinstance(device, CameraDevice):
-                device.bind_experiment(self)
+        # Devices stay session-blind: a camera is a pure grabber and a sequencer a pure
+        # streamer; ALL cross-device orchestration (capture / readout / scans) lives on the
+        # session + subsystems, which reach devices only through their contracts.
         self._readout_subsystem = ReadoutSubsystem(self)
         self._timing_subsystem = TimingSubsystem(self)
 
@@ -117,6 +113,32 @@ class NeutralAtomSession:
         session call ``Zou_lab_control.frontend.show_figure_viewer()`` directly."""
         from ._gui import open_figure_viewer
         return open_figure_viewer(self, path=path, **kwargs)
+
+    def capture(self, frames: int = 1, *, camera: str | None = None, exposure: float | None = None,
+                display: bool = True) -> CaptureResult:
+        """Grab raw frames from a named camera and return a notebook-friendly ``CaptureResult``.
+
+        SESSION-level orchestration of the one-off snapshot: the session picks the sensor
+        (``camera`` names any camera in the device config; None = the conventional readout
+        role), optionally writes ``exposure`` to THAT camera and refreshes the imaging
+        sequence, then runs the standard arm-before-fire shot (``triggered_frames``: arm the
+        camera, fire the session sequencer, read the frames back).  The camera itself stays a
+        pure grabber -- it knows nothing about the session.  ``capture`` always shows raw
+        camera data; site overlays belong to calibrated readout/detection, not to capture."""
+        from .operations.measurement import triggered_frames
+        from .views.plots import plot_image
+
+        name = str(camera) if camera else self.devices.default_camera_name()
+        cam = self.devices[name]
+        if exposure is not None:
+            cam.configure(exposure=float(exposure))
+            self.sequence = self._imaging_sequence(exposure=float(exposure), load=True)
+        sequence = self.sequence
+        images = triggered_frames(cam, getattr(self.devices, "sequencer", None), sequence, int(frames))
+        plot = plot_image(images[-1], display=display)
+        result = CaptureResult(images=images, sequence=sequence, plot=plot)
+        self.history.append(result)
+        return result
 
     def _configure_imaging(self, *, exposure: float | None = None, load: bool = True, trigger_width: float = 20e-6, pre_trigger: float = 100e-6) -> PulseSequence:
         camera = getattr(self.devices, "camera", None)

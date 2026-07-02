@@ -70,22 +70,24 @@ def test_live_camera_streams_only_while_the_pulse_is_firing():
 
 
 def test_virtual_camera_device_does_not_fabricate_a_frame_when_idle():
-    """At the DATA-SOURCE level: the virtual camera, given a sequencer that is not firing,
+    """At the DATA-SOURCE level: the virtual camera, wired to a sequencer that is not firing,
     returns NO frame (it never fabricates one) -- the bottom-up gate the live monitor relies
-    on, and the faithful mirror of a real qCMOS that just sees no trigger edges."""
+    on, and the faithful mirror of a real qCMOS that just sees no trigger edges.  The wire
+    (the camera's ``sequencer`` construction parameter) is the ONLY way a pulse reaches the
+    sensor -- the acquiring code never hands the camera a sequence."""
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     cam, seqr = exp.devices.camera, exp.devices.sequencer
     try:
         assert seqr.firing is None
-        assert len(cam.acquire(1, sequence=getattr(seqr, "firing", None))) == 0          # idle -> no fabricated frame
+        assert len(cam.acquire(1)) == 0          # idle wire -> no fabricated frame
 
         fire_live_imaging(exp)
         assert seqr.firing is not None
-        frames = cam.acquire(1, sequence=getattr(seqr, "firing", None))
+        frames = cam.acquire(1)
         assert len(frames) == 1 and np.asarray(frames[0]).ndim == 2
 
         seqr.set_safe_state()
         assert seqr.firing is None
-        assert len(cam.acquire(1, sequence=getattr(seqr, "firing", None))) == 0          # Stop Pulse -> no frame again
+        assert len(cam.acquire(1)) == 0          # Stop Pulse -> no frame again
     finally:
         exp.close()

@@ -11,7 +11,7 @@
 \end{description}
 
 \begin{notebox}[一个贯穿全书的不变式]
-\pyapi{exp.camera.capture()} 只显示\tfocus{原始}相机图像，永远不画格点圈或阈值叠加。格点圈、占据判定属于\tfocus{读出结果}（\pyapi{sitemap}/\pyapi{detect}），不属于相机设备。如果你在一张 capture 上看到了格点圈，说明把标定状态错放进了相机层。
+\pyapi{exp.capture()} 只显示\tfocus{原始}相机图像，永远不画格点圈或阈值叠加。格点圈、占据判定属于\tfocus{读出结果}（\pyapi{sitemap}/\pyapi{detect}），不属于相机设备。如果你在一张 capture 上看到了格点圈，说明把标定状态错放进了相机层。
 \end{notebox}
 
 \section{三种后端，同一套 notebook 接口}
@@ -90,7 +90,7 @@ na.register_device_class("MyCamera", "mypkg.devices:MyCamera")
 所有设备继承 \pyapi{BaseDevice}（\pyapi{open/close/stop/snapshot}）。三个\tfocus{类型化}子类是强约束（用 \pyapi{isinstance} 校验，不是鸭子类型）：
 
 \begin{description}
-  \item[\pyapi{CameraDevice}] \pyapi{exposure} 属性、\pyapi{configure(exposure=...)}、\pyapi{acquire(frames, *, sequence=None, on_armed=None) -> list[np.ndarray]}、便捷的 \pyapi{capture(...) -> CaptureResult}、\pyapi{bind_experiment(session)}。
+  \item[\pyapi{CameraDevice}] \pyapi{exposure} 属性、\pyapi{configure(exposure=...)}，以及三个采集原语：\pyapi{arm(frames=None)}（就绪等外触发）、\pyapi{read_frames(n) -> list[np.ndarray]}（从设备自有缓冲阻塞取帧）、\pyapi{disarm()}；\pyapi{acquire(frames)} 是三者的免触发便捷组合。相机是纯取帧器：不碰序列器、不感知会话。
   \item[\pyapi{SequencerDevice}] \pyapi{channels}、\pyapi{clock_hz}、\pyapi{prepare(sequence)}、\pyapi{fire(sequence=None)}；可选 \pyapi{wait_done(timeout)}、\pyapi{abort()}、\pyapi{set_safe_state()}。
   \item[\pyapi{TrapArrayDevice}] \pyapi{n_sites}。刻意精简：它\tfocus{不}暴露相机像素坐标的格点中心（那是标定的产物）。\pyapi{VirtualTrapArray} 额外有 \pyapi{grid_shape}/\pyapi{occupancy}/\pyapi{render_image()}/\pyapi{reload()}。
 \end{description}
@@ -98,16 +98,16 @@ na.register_device_class("MyCamera", "mypkg.devices:MyCamera")
 \chapter{相机采集原理}
 
 \section{capture 返回什么}
-\pyapi{exp.camera.capture(frames=1, exposure=None, display=True)} 抓若干帧，返回一个 \pyapi{CaptureResult}：
+\pyapi{exp.capture(frames=1, camera=None, exposure=None, display=True)} 抓若干帧，返回一个 \pyapi{CaptureResult}。它是\tfocus{会话级}编排（相机本身不感知会话）：会话选定相机（\pyapi{camera} 指名任意一台，缺省为读出主相机）、必要时写曝光并刷新成像序列，然后走标准的 arm-before-fire 一发。
 
 \begin{codeblock}[Python]
-res = exp.camera.capture(frames=1, display=True)
+res = exp.capture(frames=1, display=True)
 res.images     # list[np.ndarray]，原始 uint16 帧
 res.image      # 便捷取最后一帧
 res.plot       # frontend 绘图对象（只画原始像素，无任何叠加）
 \end{codeblock}
 
-\pyapi{capture()} 内部调 \pyapi{acquire(frames, *, sequence=None, on_armed=None)}：相机是\tfocus{纯 grabber}，它先武装等 \pyapi{frames} 帧，arm 完成后回调 \pyapi{on_armed}——成像序列的 \pyapi{prepare()} 上传、\pyapi{fire()} 启动就发生在这里（arm-before-fire），相机用外触发采集回 N 帧。相机自己\tfocus{不}驱动序列器、不数触发、不推断曝光；序列器只流送脉冲。\pyapi{sequence} 仅供虚拟相机据此模拟应当采到的帧，真相机忽略它（帧来自传感器）。
+\pyapi{exp.capture} 内部调用测量层唯一的采集编排 helper \pyapi{na.triggered_frames(camera, sequencer, sequence, frames)}：先 \pyapi{camera.arm(frames)}（返回时硬件已就绪等触发），再 \pyapi{sequencer.prepare(seq)}、\pyapi{sequencer.fire(seq)}，最后 \pyapi{camera.read_frames(frames)} 从相机自有缓冲取回帧并 \pyapi{disarm()}。相机是\tfocus{纯 grabber}：自己\tfocus{不}驱动序列器、不数触发、不推断曝光；序列器只流送脉冲。脉冲到达相机的唯一途径是\tfocus{触发线}——真机是物理触发电缆，虚拟相机在构造时接一根等价的"虚拟触发线"（设备配置里 \pyapi{"sequencer": "\$device:sequencer"}）。
 
 \begin{notebox}[曝光时间的真相来源]
 曝光既能在相机上设（\pyapi{camera.configure(exposure=...)}），也写在脉冲序列里（probe 脉冲宽度）。约定：\tfocus{序列里的曝光是真相来源}；相机应当从序列取曝光，而不是反过来。改曝光时优先改成像序列（\pyapi{exp.timing.configure_imaging(exposure=...)}）。
@@ -117,7 +117,7 @@ res.plot       # frontend 绘图对象（只画原始像素，无任何叠加）
 \pyapi{VirtualCamera}（\filepath{virtual.py}）用 \pyapi{trap_array.render_image()} 合成图：每个被占据的格点画一个高斯 PSF，叠泊松噪声，按曝光与原子寿命采样。它让你\tfocus{不接硬件也能跑通整条读出链路}做开发和回归。
 
 \begin{notebox}[虚拟 vs 真实的一个差异]
-虚拟相机在采\pyapi{名为 "sitemap" 的序列}时会强制"所有格点都加载"（方便标定）。真实硬件没有这个隐藏行为——做 sitemap 时你必须自己保证原子都加载好。把这条记在心里，别被虚拟后端的"理想 sitemap"误导。
+虚拟相机有一个仿真专属开关 \pyapi{cam.force_all_sites = True}（设备属性，默认 \pyapi{False}）：打开后渲染器把每个格点都画成已装载原子，方便确定性的设备级测试。生产路径从不使用它——sitemap 标定靠\tfocus{对多帧真实 ${\sim}50\%$ 装载求平均}找出全部站点，与真机走同一条路。真实硬件没有这种捷径：要"全亮"就必须真的装载原子。
 \end{notebox}
 
 \section{相机由脉冲门控：没有脉冲就没有帧}
@@ -495,16 +495,14 @@ print(json.dumps(state, indent=2))   # 可序列化的设备状态全景
 把 \pyapi{open()}/\pyapi{close()} 配对使用，确保无论实验成功还是抛异常都能干净关闭：
 
 \begin{codeblock}[Python]
+from Zou_lab_control.neutral_atom.operations.measurement import triggered_frames
+
 devices = load_devices("virtual")
 devices.open()                 # 按顺序打开，相机最后；失败自动回滚
 try:
-    seq = devices.sequencer
-    # 相机是纯 grabber：先武装等帧，arm 完成后在 on_armed 里 prepare+fire 序列器
-    # （arm-before-fire），相机绝不漏触发；序列器只流送脉冲，不驱动相机。
-    frames = devices.camera.acquire(
-        1, sequence=sequence,
-        on_armed=lambda: (seq.prepare(sequence), seq.fire(sequence)),
-    )
+    # 唯一的 arm-before-fire 编排入口：先 arm 相机（返回即就绪），再 fire 序列器，
+    # 最后从相机缓冲取帧。相机绝不漏触发；序列器只流送脉冲，不驱动相机。
+    frames = triggered_frames(devices.camera, devices.sequencer, sequence, 1)
     frame = frames[-1]
 finally:
     devices.close()            # 相机最先关，逆序拆解
@@ -538,10 +536,13 @@ finally:
 \begin{description}
 \item[\pyapi{exposure}] 曝光时间（属性/配置项）。
 \item[\pyapi{configure(...)}] 配置相机参数。
-\item[\pyapi{acquire()}] 采集一帧/一批数据。
-\item[\pyapi{capture(...)}] 触发并取像（采集的高层封装）。
-\item[\pyapi{bind\_experiment(...)}] 把相机绑定到某次实验上下文，使采集与实验时序协同。
+\item[\pyapi{arm(frames=None)}] 就绪等外触发；返回时硬件已武装（fire 永远发生在 arm 返回之后——这就是 arm-before-fire 的时序保证）。\pyapi{None} 表示连续采集。
+\item[\pyapi{read_frames(n)}] 从设备自有缓冲\tfocus{阻塞}取 \pyapi{n} 帧。武装期间到达的帧全部无损排队（防丢帧缓冲），先 fire 后取也一帧不丢。
+\item[\pyapi{disarm()}] 解除武装。
+\item[\pyapi{acquire(frames)}] 三原语的便捷组合（arm + read + disarm），适合免外触发的自由运行场景。
 \end{description}
+
+相机对更大系统唯一"知道"的事实是 \pyapi{capture\_trigger\_channels}——自己的触发输入接在序列器哪条线上——一个只向上暴露、从不用来控制序列器的被动布线事实。
 
 \subsection{\pyapi{SequencerDevice}：时序器额外契约}
 
@@ -606,16 +607,15 @@ config = {
     "trap": {"type": "VirtualTrapArray", "params": {"n_sites": 100}},
 }
 
+from Zou_lab_control.neutral_atom.operations.measurement import triggered_frames
+
 devices = load_devices(config)
 devices.open()      # RemoteSequencer.open() 会从远端 snapshot 同步 channels/clock_hz
 seqr = devices.sequencer
 try:
-    # 相机是纯 grabber：先武装等 N 帧，arm 完成后再在 on_armed 里 prepare+fire 序列器
-    # （arm-before-fire），让相机绝不漏掉触发。序列器只流送脉冲，不驱动相机；真相机的
-    # 帧来自传感器，无需把脉冲传给它。
-    frames = devices.camera.acquire(
-        1, on_armed=lambda: (seqr.prepare(program), seqr.fire()),
-    )
+    # 唯一的 arm-before-fire 编排入口：相机先 arm（返回即就绪等触发），随后 fire 序列器，
+    # 相机绝不漏掉触发。序列器只流送脉冲，不驱动相机；真相机的帧来自传感器。
+    frames = triggered_frames(devices.camera, seqr, program, 1)
     img = frames[-1]
 finally:
     devices.close()
@@ -659,14 +659,17 @@ class MyCamera(CameraDevice):
         return self._exposure
     def configure(self, **kwargs):
         self._exposure = kwargs.get("exposure", self._exposure)
-    def acquire(self, frames=1, *, sequence=None, on_armed=None, **_):
-        if on_armed is not None:   # arm 完成后让上层 fire FPGA（arm-before-fire）
-            on_armed()
-        ...                        # 按外触发取 frames 帧，返回 list[np.ndarray]
-    def capture(self, *a, **k):
-        ...
-    def bind_experiment(self, experiment):
-        ...
+
+    # 采集面（arm/read_frames/disarm/acquire）由基类实现；子类只填三个硬件钩子：
+    def _arm(self, frames):
+        ...                        # 让硬件进入外触发等待（如 buf_alloc + cap_start）
+    def _grab(self, n, *, timeout=None, stop=None):
+        # 从驱动取回一帧并交给基类缓冲（_deliver），返回 True；超时无帧返回 False
+        frame = ...                # 等待硬件触发边沿产出的一帧
+        self._deliver([frame])
+        return True
+    def _disarm(self):
+        ...                        # 停止采集（如 cap_stop）
 \end{codeblock}
 
 \subsection{步骤二：注册短名}
@@ -724,11 +727,9 @@ print("sites:", trap.n_sites, "channels:", seq.channels, "clock:", seq.clock_hz)
 
 devices.open()                          # 相机最后开；失败回滚
 try:
-    # 真正采集走 arm-before-fire：相机先武装，arm 完成后在 on_armed 里 prepare+fire。
-    # frame = cam.acquire(
-    #     1, sequence=sequence,
-    #     on_armed=lambda: (seq.prepare(sequence), seq.fire(sequence)),
-    # )[-1]
+    # 真正采集走唯一的 arm-before-fire 编排 helper（arm 相机 -> fire 序列器 -> 取帧）：
+    # from Zou_lab_control.neutral_atom.operations.measurement import triggered_frames
+    # frame = triggered_frames(cam, seq, sequence, 1)[-1]
     pass
 finally:
     devices.close()                     # 相机最先关
@@ -752,16 +753,17 @@ print(json.dumps(devices.snapshot(), indent=2))   # JSON-safe 状态全景
 \begin{description}
 \item[\pyapi{exposure}（property）] 当前曝光时间。注意它只是相机当前持有的一个数值；\tfocus{真正的曝光真值来自时序序列}（见后文“曝光即真值”一节），相机上的这个属性应当被序列驱动，而不是反过来去驱动序列。
 \item[\pyapi{configure(exposure=..., **kwargs)}] 配置相机参数。\pyapi{exposure} 是最常用的关键字参数，用来设置曝光时间；\pyapi{**kwargs} 允许具体实现接受额外的设备相关参数（例如读出速度、ROI 等）。该方法只改变相机内部状态，不触发任何采集。
-\item[\pyapi{bind_experiment(session)}] 把相机绑定到一个实验会话对象。绑定后相机可以访问会话里的时序（\pyapi{exp.timing}）等资源，这是相机参与“成像序列”协作的前提。
 \end{description}
 
-\subsection{采集：\pyapi{acquire} 与 \pyapi{capture} 的区别}
+相机\tfocus{不感知实验会话}：它不持有 \pyapi{exp}、不读时序。所有跨设备协作（成像序列、历史记录、显示）都在会话/测量层完成，相机只暴露上面的设备契约。
+
+\subsection{采集：设备原语与 \pyapi{exp.capture} 的区别}
 
 系统刻意提供了两层采集入口，职责不同，初学者必须分清。
 
 \begin{description}
-\item[\pyapi{acquire(frames, *, sequence=None, on_armed=None) -> list[np.ndarray]}] 底层采集。它返回一个\tfocus{原始帧列表}，每个元素是一帧 \pyapi{uint16} 的 NumPy 数组（原始像素，未做任何处理）。相机是纯取帧器：它先武装等 \pyapi{frames} 帧、arm 完成后回调 \pyapi{on_armed}（上层在这里 fire FPGA），自己只按外触发逐帧取，绝不驱动时序器。这是与硬件/触发最贴近的接口，读出流水线内部依赖它。
-\item[\pyapi{capture(frames=1, exposure=None, sequence=None, display=True) -> CaptureResult}] 面向交互/调试的高层包装。它在内部调用采集，并把结果打包成一个 \pyapi{CaptureResult}。
+\item[设备原语 \pyapi{arm / read\_frames / disarm}（及组合 \pyapi{acquire}）] 底层采集，返回\tfocus{原始帧列表}（每帧一个 \pyapi{uint16} NumPy 数组，未做任何处理）。\pyapi{arm(frames)} 返回时硬件已就绪等触发；\pyapi{read_frames(n)} 从设备自有缓冲阻塞取帧——武装期间到达的帧\tfocus{全部无损排队}，先 fire 后取也一帧不丢；\pyapi{disarm()} 收尾。相机是纯取帧器，绝不驱动时序器；需要外触发的一发由测量层唯一的编排 helper \pyapi{triggered_frames(camera, sequencer, sequence, frames)} 完成（arm $\to$ fire $\to$ read）。免触发的自由运行传感器直接 \pyapi{acquire(frames)}。
+\item[\pyapi{exp.capture(frames=1, camera=None, exposure=None, display=True) -> CaptureResult}] 面向交互/调试的\tfocus{会话级}包装。会话选定相机、必要时写曝光并刷新成像序列，经 \pyapi{triggered_frames} 拿帧后打包成 \pyapi{CaptureResult} 并记入历史。
 \end{description}
 
 \pyapi{CaptureResult} 上有几个常用字段：
@@ -775,38 +777,37 @@ print(json.dumps(devices.snapshot(), indent=2))   # JSON-safe 状态全景
 \subsection{核心不变量：capture 只显示原始图像}
 
 \begin{notebox}[最重要的一条边界]
-\pyapi{capture()}（以及 \pyapi{CaptureResult.plot}）\tfocus{只显示原始图像}。站点圆圈（site circles）、阈值（thresholds）这些都属于读出层（sitemap / detect），\tfocus{永远不属于相机}。
+\pyapi{exp.capture()}（以及 \pyapi{CaptureResult.plot}）\tfocus{只显示原始图像}。站点圆圈（site circles）、阈值（thresholds）这些都属于读出层（sitemap / detect），\tfocus{永远不属于相机}。
 
 如果你发现一次 \pyapi{capture()} 居然画出了圆圈或阈值，这\tfocus{不是一个显示选项问题}，而是一个架构 bug 的征兆：说明标定状态（calibration state）被错误地放进了相机层。正确的做法是把这些标定/检测逻辑移回 readout 层。
 \end{notebox}
 
-为什么如此强调这条不变量？因为相机层一旦“知道”站点在哪里、阈值是多少，它就和某次特定标定耦合了，换一组 trap、换一次对焦都会让相机层失真，且会让“原始数据”不再纯净——你无法再相信 \pyapi{capture()} 给你的是探测器真实读到的东西。把相机层保持为“只产出原始像素”，才能让下游的 sitemap/detect 自由演化、可重复标定。
+为什么如此强调这条不变量？因为相机层一旦“知道”站点在哪里、阈值是多少，它就和某次特定标定耦合了，换一组 trap、换一次对焦都会让相机层失真，且会让“原始数据”不再纯净——你无法再相信 \pyapi{exp.capture()} 给你的是探测器真实读到的东西。把相机层保持为“只产出原始像素”，才能让下游的 sitemap/detect 自由演化、可重复标定。
 
 \section{相机与时序器的协作：arm-before-fire}
 
-相机自己\tfocus{不会}凭空拍照；在真实实验里，曝光由时序硬件用外触发（external trigger）精确控制。但\tfocus{相机不驱动时序器}——它是纯取帧器，只负责武装、按外触发逐帧读出。是\tfocus{测量层}编排两者：相机 \pyapi{acquire} 武装好之后，经 \pyapi{on_armed} 钩子让上层 fire FPGA。这条次序叫 \tfocus{arm-before-fire}，保证相机在第一个触发到来前已就绪、绝不漏帧。
+相机自己\tfocus{不会}凭空拍照；在真实实验里，曝光由时序硬件用外触发（external trigger）精确控制。但\tfocus{相机不驱动时序器}——它是纯取帧器：\pyapi{arm} 之后就只等触发、按边沿逐帧读出。是\tfocus{测量层}编排两者，且整个系统只有\tfocus{一个}编排入口：\pyapi{operations.measurement.triggered_frames(camera, sequencer, sequence, frames)}。这条次序叫 \tfocus{arm-before-fire}，保证相机在第一个触发到来前已就绪、绝不漏帧。
 
 一次带时序的采集，流程如下：
 
 \begin{enumerate}
-\item \tfocus{相机武装}：\pyapi{acquire(frames, ...)} 让相机进入外触发等待，准备接 \pyapi{frames} 个触发。
-\item \tfocus{回调 on\_armed}：相机 arm 完成后调用 \pyapi{on_armed()}——测量层在这个钩子里 \pyapi{sequencer.prepare(seq)} 上传边沿表、\pyapi{sequencer.fire(seq)} 启动序列。
-\item \tfocus{相机经外触发采集}：每来一个相机触发脉冲就曝光读出一帧，直到收满 \pyapi{frames} 帧。
-\item \tfocus{测量层等序列跑完}：需要时 \pyapi{sequencer.wait_done()} 确保所有触发都已发出。
+\item \tfocus{相机武装}：\pyapi{camera.arm(frames)}——返回时硬件已进入外触发等待，准备接 \pyapi{frames} 个触发。
+\item \tfocus{测量层 fire}：\pyapi{sequencer.prepare(seq)} 上传边沿表、\pyapi{sequencer.fire(seq)} 启动序列。因为 fire 发生在 \pyapi{arm} 返回之后，它永远追不上相机——第一个边沿必然被接住。
+\item \tfocus{取帧}：\pyapi{camera.read_frames(frames)} 从相机自有缓冲阻塞取帧。武装期间到达的帧\tfocus{全部无损排队}，即使序列先跑完、消费方后来取（迟到消费）也一帧不丢。
+\item \tfocus{收尾}：\pyapi{camera.disarm()}；需要时 \pyapi{sequencer.wait_done()} 确保序列跑完。
 \end{enumerate}
 
-注意职责划分：相机被动等触发，\tfocus{prepare/fire/wait\_done 都在 on\_armed 钩子里、由测量层调}，相机本身从不碰时序器。\pyapi{frames} 是测量层想要的帧数（它知道自己的脉冲带几个相机触发），相机\tfocus{不}把单触发序列改写成 \pyapi{frames} 个触发。这样虚拟与真机走同一条契约路径，换真机只换最底层的相机帧来源。
+注意职责划分：相机被动等触发，\tfocus{prepare/fire 只出现在 \pyapi{triggered_frames} 一处、由测量层调}，相机本身从不碰时序器。\pyapi{frames} 是测量层想要的帧数（它知道自己的脉冲带几个相机触发），相机\tfocus{不}把单触发序列改写成 \pyapi{frames} 个触发。这样虚拟与真机走同一条契约路径，换真机只换最底层的相机帧来源。
 
 \begin{codeblock}[Python]
-# 测量层编排：相机 arm 后才 fire FPGA（arm-before-fire）
-raw = camera.acquire(
-    frames=3, sequence=imaging_seq,
-    on_armed=lambda: (sequencer.prepare(imaging_seq), sequencer.fire(imaging_seq)),
-)
+from Zou_lab_control.neutral_atom.operations.measurement import triggered_frames
+
+# 测量层编排：arm 相机 -> fire 序列器 -> 从相机缓冲取帧（arm-before-fire）
+raw = triggered_frames(camera, sequencer, imaging_seq, 3)
 \end{codeblock}
 
 \begin{notebox}[常见错误]
-不要先 \pyapi{sequencer.fire()} 再 \pyapi{camera.acquire()}——那样相机还没武装、第一批触发就丢了。也不要让相机层自己去 \pyapi{prepare/fire}：相机是纯取帧器，时序编排属于测量层，经 \pyapi{on_armed} 钩子完成。
+不要先 \pyapi{sequencer.fire()} 再 \pyapi{camera.arm()}——那样相机还没武装、第一批触发就丢了。也不要在调用方手拼 \pyapi{prepare}+\pyapi{fire} 包住相机：唯一合法的配对处就是 \pyapi{triggered_frames}（契约测试会 grep 编排层抓违例）；相机层则永远只做取帧。
 \end{notebox}
 
 \section{曝光即真值（exposure-as-truth）}
@@ -895,67 +896,57 @@ close()     # 关闭设备，释放句柄
 
 \subsection{\pyapi{force\_all\_sites}：渲染满阵列（仿真专属）}
 
-\pyapi{VirtualCamera.acquire} 接受一个 \pyapi{force_all_sites} 参数，用来\tfocus{显式}控制“是否把所有站点都视为已装载（loaded）”。这是一个仿真专属的细节：
+\pyapi{VirtualCamera} 有一个仿真专属的设备属性 \pyapi{force_all_sites}（默认 \pyapi{False}），用来\tfocus{显式}控制“是否把所有站点都视为已装载（loaded）”：
 
 \begin{description}
-\item[作用] 需要一张“满阵列”图像时（典型场景是生成 site-map 标定图，要求每个光阱都亮），传 \pyapi{force_all_sites=True}，渲染器就把每个站点都画成一个原子。不传时，按本帧实际装载情况渲染。
-\item[一个便利约定] 若没有\tfocus{显式}传 \pyapi{force_all_sites}，而 \pyapi{sequence} 的名字恰为 \pyapi{"sitemap"}，渲染器也会当作满阵列——这让标定序列无需额外参数即可拿到满阵列图。显式传入的值\tfocus{始终优先}于这个按名字的约定。
-\item[与真机的本质区别] 真实硬件\tfocus{没有}这种捷径：要得到“所有站点都亮”的图像，必须真的把原子装载到每个站点上。仿真可以“假装”全装载，真机不行——所以在真机上不要指望传个名叫 \pyapi{"sitemap"} 的序列就能得到满阵列。
+\item[作用] 需要一张“满阵列”图像做确定性的设备级测试时，设 \pyapi{cam.force_all_sites = True}，渲染器就把每个站点都画成一个原子；平时保持 \pyapi{False}，按本帧实际装载情况渲染。
+\item[生产路径从不使用它] sitemap 标定靠对多帧真实 ${\sim}50\%$ 装载\tfocus{求平均}找出全部站点——与真机走同一条路，不依赖任何仿真捷径。
+\item[与真机的本质区别] 真实硬件\tfocus{没有}这种捷径：要得到“所有站点都亮”的图像，必须真的把原子装载到每个站点上。仿真可以“假装”全装载，真机不行——所以别把这个开关写进期望在真机上同样生效的代码路径。
 \end{description}
-
-\begin{notebox}[写法建议]
-表达“我要满阵列”时优先用显式的 \pyapi{force_all_sites=True}：意图清晰，且不依赖序列名这个仿真约定，也就不会把仿真专属行为误带进期望在真机上同样生效的代码路径。
-\end{notebox}
 
 \section{一个可运行的采集示例}
 
-下面给出一个从绑定实验到拿到原始帧的最小例子，串起本章所有概念。注意：\tfocus{先用序列设定曝光真值}，再采集；带时序器时由 \pyapi{acquire} 完成 prepare/fire/wait\_done 协作；最后用 \pyapi{capture} 的 \pyapi{.plot} 只看原始图。
+下面给出一个从设定曝光到拿到原始帧的最小例子，串起本章所有概念。注意：\tfocus{先用序列设定曝光真值}，再采集；带时序器的一发经 \pyapi{triggered_frames} 编排；最后用 \pyapi{exp.capture} 的 \pyapi{.plot} 只看原始图。
 
 \begin{codeblock}[Python]
-# 1) 绑定实验会话：让相机能访问 exp.timing 等资源
-camera.bind_experiment(session)
-
-# 2) 曝光即真值：改曝光要改序列，而不是只改相机
+# 1) 曝光即真值：改曝光要改序列，而不是只改相机
 #    这会更新成像序列里探测脉冲的宽度（=曝光窗口）
 exp.timing.configure_imaging(exposure=20e-3)  # 20 ms
 
-# 3) 高层采集：capture 内部完成采集并打包成 CaptureResult
-#    sequence=成像序列；display=True 会画出原始图
-result = camera.capture(frames=3, sequence=imaging_seq, display=True)
+# 2) 高层采集：会话编排一发并打包成 CaptureResult
+result = exp.capture(frames=3, display=True)
 
 # CaptureResult 的常用字段：
 all_frames = result.images   # list[np.ndarray]，全部原始帧（uint16）
 last_frame = result.image    # 最后一帧 == images[-1]
 result.plot()                # 只画原始像素，绝不叠加圆圈/阈值
 
-# 4) 若需要底层、解耦式的采集（readout 流水线内部用法）：
-#    相机是纯取帧器，绝不碰时序器；它先 arm，再回调 on_armed 让上层 fire FPGA
-#    （arm-before-fire），自己只按外触发取帧。所以是测量层编排 prepare/fire：
-raw = camera.acquire(
-    frames=3, sequence=imaging_seq,
-    on_armed=lambda: (sequencer.prepare(imaging_seq), sequencer.fire(imaging_seq)),
-)
+# 3) 若需要底层、解耦式的采集（readout 流水线内部用法）：
+#    相机是纯取帧器，绝不碰时序器；测量层唯一的编排 helper 完成
+#    arm 相机 -> fire 序列器 -> 从相机缓冲取帧（arm-before-fire）：
+from Zou_lab_control.neutral_atom.operations.measurement import triggered_frames
+raw = triggered_frames(camera, sequencer, imaging_seq, 3)
 # raw 是 list[np.ndarray]，每个元素是一帧 uint16 原始像素
 \end{codeblock}
 
 \begin{notebox}[自检清单]
 \begin{itemize}
-\item \pyapi{capture()} 画出来\tfocus{有圆圈或阈值}？——架构 bug，标定状态被放进了相机层，应移回 readout（sitemap/detect）。
+\item \pyapi{exp.capture()} 画出来\tfocus{有圆圈或阈值}？——架构 bug，标定状态被放进了相机层，应移回 readout（sitemap/detect）。
 \item 想改曝光却去调 \pyapi{camera.configure(exposure=...)}？——在外触发实验里请改序列：\pyapi{exp.timing.configure_imaging(exposure=...)}。
-\item 真机采集报句柄无效？——检查是否漏了 \pyapi{open()}（此时 \pyapi{_dcam is None}），顺序应为 open→configure→acquire→close。
-\item 仿真想要满阵列图？——优先用显式 \pyapi{force_all_sites=True}（比按序列名 \pyapi{"sitemap"} 的约定更清晰）；真机则必须真正装载原子。
-\item 相机没出帧 / 帧数对不上？——相机是纯取帧器，绝不自己驱动时序器：由测量层经 \pyapi{acquire(..., on_armed=...)} 钩子在相机 arm 后 fire FPGA。别让相机层去 prepare/fire，也别指望它把单触发序列改写成 \pyapi{frames} 个触发——它就按外触发逐帧取。
+\item 真机采集报句柄无效？——检查是否漏了 \pyapi{open()}（此时 \pyapi{_dcam is None}），顺序应为 open→configure→arm/read→close。
+\item 仿真想要满阵列图？——设备级测试用 \pyapi{cam.force_all_sites = True}；真机则必须真正装载原子。
+\item 相机没出帧 / 帧数对不上？——相机是纯取帧器，绝不自己驱动时序器：外触发的一发由测量层的 \pyapi{triggered_frames} 编排（arm $\to$ fire $\to$ read）。别在调用方手拼 prepare/fire，也别指望相机把单触发序列改写成 \pyapi{frames} 个触发——它就按外触发逐帧取。
 \end{itemize}
 \end{notebox}
 
 \section{第二只相机：MOT 监视相机与线圈磁场寻优}
 
-除了负责读出的主相机（\pyapi{"camera"}），设备清单里还可以有一只\tfocus{监视相机}（约定名 \pyapi{"monitor_camera"}）：它不参与站点读出，只盯着 MOT 的荧光斑。典型用途是\tfocus{扫 x/y/z 三路线圈电流（DAC 码），同时看 MOT 亮度，找出装载最好的磁场}。监视相机与主相机遵守\tfocus{完全相同}的纯取帧器契约（\pyapi{acquire(N, sequence=..., on\_armed=...)}，arm-before-fire），所以扫描引擎、面板、处理器对"哪只相机"完全无感。
+除了负责读出的主相机（\pyapi{"camera"}），设备清单里还可以有一只\tfocus{监视相机}（约定名 \pyapi{"monitor_camera"}）：它不参与站点读出，只盯着 MOT 的荧光斑。典型用途是\tfocus{扫 x/y/z 三路线圈电流（DAC 码），同时看 MOT 亮度，找出装载最好的磁场}。监视相机与主相机遵守\tfocus{完全相同}的纯取帧器契约（\pyapi{arm / read\_frames / disarm}，经 \pyapi{triggered_frames} 完成 arm-before-fire），所以扫描引擎、面板、处理器对"哪只相机"完全无感。
 
 \subsection{两种实现：PylonCamera 真机 vs VirtualMotCamera 仿真}
 
 \begin{description}
-\item[\pyapi{PylonCamera}（\filepath{devices/pylon.py}）] Basler pylon 相机的薄封装（\pyapi{pypylon} 在 \pyapi{open()} 内惰性导入，没装 Basler 运行库的机器照样可以导入包、跑虚拟后端）。\pyapi{trigger\_source} 选外触发线（如 \pyapi{"Line1"}）或 \pyapi{"Software"} 自由运行；\pyapi{serial} 在多相机时选定一台。真机拍的是真实世界，所以 \pyapi{acquire} 里的 \pyapi{sequence} 参数被\tfocus{接受并忽略}。
+\item[\pyapi{PylonCamera}（\filepath{devices/pylon.py}）] Basler pylon 相机的薄封装（\pyapi{pypylon} 在 \pyapi{open()} 内惰性导入，没装 Basler 运行库的机器照样可以导入包、跑虚拟后端）。\pyapi{trigger\_source} 选外触发线（如 \pyapi{"Line1"}）或 \pyapi{"Software"} 自由运行；\pyapi{serial} 在多相机时选定一台。真机拍的是真实世界——脉冲到达它的唯一途径就是物理触发线。
 \item[\pyapi{VirtualMotCamera}（\filepath{devices/virtual.py}）] 虚拟 MOT 物理相机。它\tfocus{只感知真正 fire 出去的序列}：在帧中点时刻用 \pyapi{decode\_analog\_bus}（\filepath{timing/sequence.py}，DAC 编码链的精确逆变换）从编译后的位通道脉冲里重建每路线圈总线的带符号电平，再按三维高斯模型算 MOT 俘获效率 \(\eta=\exp\!\big(-\tfrac12\sum_i\big(\tfrac{L_i-B_{0,i}}{\sigma_i}\big)^2\big)\)，渲染一颗中心高斯荧光斑（泊松光子噪声 + 读出噪声 + 常数 offset，与 qCMOS 噪声链同构）。\tfocus{它从不读任何人的设定值}——虚拟与真机走同一条"编译产物"路径，换真机只改 \pyapi{connect()} 的配置。
 \end{description}
 
@@ -980,7 +971,7 @@ devices = na.load_devices({"monitor_camera": cams[0].config})   # 片段直接�
 
 \begin{codeblock}[Python]
 exp = na.connect("basler_monitor", open_devices=True)
-exp.devices["monitor_camera"].capture(frames=1, display=True)   # notebook 直接看图
+exp.capture(camera="monitor_camera", frames=1, display=True)  # notebook 直接看图
 \end{codeblock}
 
 控制台同一路径：\pyapi{task\_console.bat --config basler\_monitor} 启动，Add Panel → Measurement → \tfocus{Camera (live frames)}，\pyapi{Camera} 下拉切 \pyapi{monitor\_camera}，Start 即实时看图（该下拉与 Pulse scan 的相机选择同出一源 \pyapi{DeviceSet.camera\_names()}）。自由跑模式（\pyapi{Software} 触发）不需要任何脉冲接线；接好 FPGA 触发线后把 \pyapi{trigger\_source} 改 \pyapi{"Line1"}，其余代码全部不动。acA1920-155um 的 \pyapi{pixel\_format} 可选 \pyapi{"Mono8"}（快）或 \pyapi{"Mono12"}（动态范围）。

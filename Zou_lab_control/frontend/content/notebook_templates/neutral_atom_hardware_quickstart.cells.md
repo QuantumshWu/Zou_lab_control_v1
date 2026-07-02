@@ -190,11 +190,11 @@ scope_program
 <!-- cell:markdown -->
 ## Capture a camera image
 
-`capture` 只显示 raw camera frame；site overlay 只属于
-calibration/readout/detect 图。
+`capture` 是会话级编排（选相机、写曝光、arm→fire→读帧一条龙），只显示 raw camera
+frame；site overlay 只属于 calibration/readout/detect 图。
 
 <!-- cell:code -->
-capture = exp.camera.capture(frames=1, display=True)
+capture = exp.capture(frames=1, display=True)
 capture.summary()
 
 <!-- cell:markdown -->
@@ -211,7 +211,7 @@ notebook 看图就是同一个 `capture`——真机自由跑时不需要任何�
 
 ```python
 exp2 = na.connect("basler_monitor", open_devices=True)
-mot = exp2.devices["monitor_camera"].capture(frames=1, display=True)
+mot = exp2.capture(camera="monitor_camera", frames=1, display=True)
 ```
 
 task_console 里看图：`task_console.bat --config basler_monitor` 启动，

@@ -1,10 +1,15 @@
-"""Device auto-discovery + named-camera selection -- the X-round contracts.
+"""Device auto-discovery + named-camera selection + user-owned hardware contracts.
 
-The chain: ``na.discover_devices()`` scans the buses (Basler / VISA, confocal-style: a missing
-library or empty bus is a REPORTED ROW, never an exception) and each camera hit carries a READY
+The chain: ``na.discover_devices()`` scans the buses (confocal-style: a missing library or
+empty bus is a REPORTED ROW, never an exception) and each camera hit carries a READY
 ``{"type", "params"}`` config entry -> ``load_devices`` builds the device -> every "which
 camera?" choice in the measurement layer derives from the ONE :meth:`DeviceSet.camera_names`
 source -> the console's Camera measurement / the notebook's ``capture()`` show the image.
+
+User-owned hardware is a first-class citizen on the same chain: a class registered via
+``register_device_class`` (or resolved straight from the caller's namespace with
+``load_devices(..., lookup=globals())``) is discovered/built exactly like a built-in, and a
+class-less bus plugs in as a named DISCOVERY PROVIDER (VISA is the built-in one).
 
 Pure row builders are tested with fake enumerations (no hardware); the IO shell is only
 asserted never to raise.  Expected names derive from the live device set, never re-typed.
@@ -12,6 +17,7 @@ asserted never to raise.  Expected names derive from the live device set, never 
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 import sys
 
@@ -22,10 +28,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
+from Zou_lab_control.neutral_atom.devices.base import CameraDevice
 from Zou_lab_control.neutral_atom.devices.discovery import (
-    DiscoveredDevice, discover_devices, visa_rows)
+    DISCOVERY_PROVIDERS, DiscoveredDevice, discover_devices, discovery_note,
+    probe_visa, register_discovery_provider, visa_rows)
 from Zou_lab_control.neutral_atom.devices.pylon import PylonCamera
-from Zou_lab_control.neutral_atom.devices.registry import load_devices
+from Zou_lab_control.neutral_atom.devices.registry import (
+    DEVICE_CLASSES, load_devices, register_device_class)
 
 
 class _FakeInfo:
@@ -37,6 +46,53 @@ class _FakeInfo:
 
     def GetSerialNumber(self):
         return self._serial
+
+
+class ToyCamera(CameraDevice):
+    """A USER-authored camera (defined outside the framework): registered at runtime or
+    resolved straight from the caller's namespace -- zero framework edits either way."""
+
+    def __init__(self, address: str = "toy:0"):
+        self.address = str(address)
+        self._exposure = 1e-3
+
+    @property
+    def exposure(self) -> float:
+        return self._exposure
+
+    @exposure.setter
+    def exposure(self, value: float) -> None:
+        self.configure(exposure=float(value))
+
+    def configure(self, *, exposure: float | None = None, **kwargs) -> None:
+        self._reject_unknown_configure_keys({"exposure"}, kwargs)
+        if exposure is not None:
+            self._exposure = float(exposure)
+
+    def acquire(self, frames: int = 1, *, stop=None, **kwargs):
+        return self._retain([np.zeros((4, 4)) for _ in range(int(frames))])
+
+    @classmethod
+    def discover(cls):
+        return [DiscoveredDevice(
+            kind="toy", ident="toy:0", label="Toy frame source",
+            config={"type": cls.__name__, "params": {"address": "toy:0"}})]
+
+
+@pytest.fixture
+def discovery_sandbox():
+    """Snapshot the shared class/provider registries so a test's registrations never leak."""
+    from Zou_lab_control.neutral_atom.devices import discovery, registry
+
+    classes = dict(registry.DEVICE_CLASSES)
+    providers = dict(discovery.DISCOVERY_PROVIDERS)
+    try:
+        yield
+    finally:
+        registry.DEVICE_CLASSES.clear()
+        registry.DEVICE_CLASSES.update(classes)
+        discovery.DISCOVERY_PROVIDERS.clear()
+        discovery.DISCOVERY_PROVIDERS.update(providers)
 
 
 def test_pylon_discovery_rows_yield_ready_configs_for_the_class_itself():
@@ -62,7 +118,7 @@ def test_discovery_aggregates_registered_self_describing_classes():
     assert "PylonCamera" in names
     assert "QCMOSCamera" in names                        # BOTH real cameras self-describe
     assert all(n.kind == "note" for n in import_notes)   # broken drivers become rows, not holes
-    rows = discover_devices(visa=False, display=False)
+    rows = discover_devices(display=False)
     assert rows and all(isinstance(r, DiscoveredDevice) for r in rows)
     assert any(r.kind in ("basler", "note") for r in rows)
 
@@ -93,6 +149,45 @@ def test_qcmos_discovery_rows_yield_ready_configs_for_the_class_itself():
     assert QCMOSCamera.discovery_rows(0, lambda i: "") == []
 
 
+def test_registered_custom_class_is_discovered_end_to_end(discovery_sandbox):
+    """The user-extension contract: ``register_device_class(MyCam)`` is ALL it takes for
+    ``discover_devices()`` to include MyCam's own rows, and the row's ready config builds
+    the device through ``load_devices`` under the registered name -- same chain as a
+    built-in camera, zero framework edits."""
+    register_device_class("ToyCamera", ToyCamera)
+    rows = discover_devices(display=False)
+    toy = [r for r in rows if r.kind == "toy"]
+    assert [r.ident for r in toy] == ["toy:0"]
+    devices = load_devices({"monitor_camera": toy[0].config}, open_devices=False)
+    cam = devices["monitor_camera"]
+    assert isinstance(cam, ToyCamera)
+    assert cam.address == "toy:0"
+
+
+def test_load_devices_lookup_namespace_resolves_user_classes():
+    """The confocal lookup_dict pattern: a config ``"type"`` resolves from the CALLER's
+    namespace first -- non-class entries are ignored, names absent from the namespace fall
+    back to the registry, and a lookup hit never leaks into the shared registry."""
+    namespace = {"ToyCamera": ToyCamera, "np": np, "Path": Path, "answer": 42}
+    devices = load_devices({"camera": {"type": "ToyCamera", "params": {"address": "toy:7"}},
+                            "sequencer": {"type": "VirtualSequencer"}},
+                           lookup=namespace, open_devices=False)
+    assert isinstance(devices["camera"], ToyCamera)
+    assert devices["camera"].address == "toy:7"
+    assert type(devices["sequencer"]).__name__ == "VirtualSequencer"   # registry fallback
+    assert "ToyCamera" not in DEVICE_CLASSES                           # per-call, no leak
+    with pytest.raises(KeyError, match="unknown device class"):
+        load_devices({"camera": {"type": "ToyCamera"}}, open_devices=False)
+
+
+def test_load_devices_lookup_accepts_module_globals():
+    """``lookup=globals()`` works verbatim: the whole calling namespace (imports, helpers,
+    fixtures, dunders) filters down to its device classes automatically."""
+    devices = load_devices({"camera": {"type": "ToyCamera"}}, lookup=globals(),
+                           open_devices=False)
+    assert isinstance(devices["camera"], ToyCamera)
+
+
 def test_visa_rows_are_informational_listings():
     """Bare VISA instruments have no driver class here -> rows list address + *IDN? identity
     with config=None (the operator wires the address into a custom class)."""
@@ -100,6 +195,53 @@ def test_visa_rows_are_informational_listings():
     assert rows[0].ident == "GPIB0::17::INSTR"
     assert rows[0].label.startswith("Rigol")
     assert rows[0].config is None
+
+
+def test_visa_is_a_builtin_discovery_provider():
+    """The class-less VISA bus is no aggregator special case: it is the first entry of the
+    SAME provider registry operators extend, and its scan obeys the confocal contract
+    (rows or notes, never an exception -- with or without pyvisa installed)."""
+    assert DISCOVERY_PROVIDERS["visa"] is probe_visa
+    rows = probe_visa()
+    assert rows and all(isinstance(r, DiscoveredDevice) for r in rows)
+    assert all(r.kind in ("visa", "note") for r in rows)
+
+
+def test_registered_provider_scans_and_a_crash_becomes_a_note(discovery_sandbox):
+    """``register_discovery_provider`` puts a user bus into the same scan; a provider that
+    raises is reported as a note row, never an exception out of ``discover_devices()``."""
+    register_discovery_provider(
+        "toybus", lambda: [DiscoveredDevice(kind="toybus", ident="usb:9", label="Widget")])
+
+    def broken():
+        raise RuntimeError("bus exploded")
+
+    register_discovery_provider("brokenbus", broken)
+    rows = discover_devices(display=False)
+    assert any(r.kind == "toybus" and r.ident == "usb:9" for r in rows)
+    note = next(r for r in rows if r.kind == "note" and r.ident == "brokenbus")
+    assert "bus exploded" in note.label
+
+
+def test_register_discovery_provider_validates_inputs():
+    with pytest.raises(ValueError, match="not be empty"):
+        register_discovery_provider("  ", lambda: [])
+    with pytest.raises(TypeError, match="callable"):
+        register_discovery_provider("x", "not a callable")
+
+
+def test_discovery_protocol_is_public_at_the_package_level():
+    """Everything a user needs to wire their OWN hardware is importable from ``na``: the
+    row/note builders, both registration calls, and the lookup-capable loader."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from Zou_lab_control import neutral_atom as na
+
+    assert na.DiscoveredDevice is DiscoveredDevice
+    assert na.discovery_note is discovery_note
+    assert na.register_discovery_provider is register_discovery_provider
+    assert na.register_device_class is register_device_class
+    assert "lookup" in inspect.signature(na.load_devices).parameters
 
 
 def test_discover_devices_never_raises_and_always_reports():
