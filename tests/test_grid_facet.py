@@ -178,7 +178,8 @@ def test_console_facet_panel_builds_updates_and_stays_enlarged():
     card = _facet_card({"facet": "points:0"})
     try:
         options = [card.facet_combo.itemData(i) for i in range(card.facet_combo.count())]
-        assert {"", "repeat", "points:0", "points:1", "points:2"} <= set(options)
+        assert {"repeat", "points:0", "points:1", "points:2"} <= set(options)
+        assert "" not in options      # "(saved figure)" exists only when a recipe node is bound
         card._render(card._coerce(BLOCK), {})
         grid_plot = card.plotter
         assert card._param_kind() == "2d" and grid_plot.n_cells == 3
@@ -309,4 +310,64 @@ def test_add_panel_grid_shows_every_repeat_as_a_cell_and_rows_follow_the_kind(mo
         assert "could not snapshot" not in editor.status.text()
     finally:
         console.shutdown()
+        plt.close("all")
+
+
+def test_every_display_param_of_the_sub_kind_is_consumed_by_the_grid():
+    """MECHANICAL anti-drift (round S): every display ParamDecl of a cell family's standalone kind
+    must be CONSUMED on the grid -- the cell family renders it (consume_param -> thumbnails redraw)
+    through the SAME primitives the standalone plot uses (fit_histogram_curves, set_yscale, cmap).
+    A new PANEL_PARAMS knob that silently does nothing on a grid fails here (the 'grid params are
+    baked / the fit chooser is dead' class of bug the user hit twice)."""
+    from Zou_lab_control.frontend.task_console import PANEL_PARAMS
+
+    per_kind_data = {
+        "hist": [RNG.normal(100, 8, size=200) for _ in range(4)],
+        "2d": [RNG.normal(100, 8, size=(6, 7)) for _ in range(4)],
+        "1d": [RNG.normal(100, 8, size=30) for _ in range(4)],
+    }
+    for kind, data in per_kind_data.items():
+        g = grid(data, sub_plot_kind=kind, display=False)
+        try:
+            cell = g.cell_renderer
+            for spec in PANEL_PARAMS.get(kind, ()):
+                if not spec.display:
+                    continue
+                current = getattr(cell, spec.key, spec.default)
+                if spec.kind == "bool":
+                    new = not bool(current)
+                elif spec.kind == "choice":
+                    new = next(c for c in spec.choices if c != current)
+                else:
+                    new = int(current if current is not None else spec.default) + 1
+                assert g.store_display_param(spec.key, new) is True, \
+                    f"{kind} grid must consume its standalone kind's {spec.key!r} (got a dead knob)"
+        finally:
+            plt.close(g.fig)
+    plt.close("all")
+
+
+def test_grid_hist_fit_draws_the_standard_curves_on_the_thumbnails():
+    """apply_param('fit', 'double') on a hist grid fits + draws the SAME three curves the standalone
+    dis draws (ONE primitive: fit_histogram_curves), keeps them tracking on a live in-place update,
+    and seeds the enlarged view's fit -- the 'dis fit is missing on the grid' fix."""
+    vals = [np.concatenate([RNG.normal(100, 8, 300), RNG.normal(200, 12, 200)]) for _ in range(4)]
+    g = grid(vals, sub_plot_kind="hist", display=False)
+    try:
+        cell = g.cell_renderer
+        assert cell.fit == "none" and all(l is None for l in cell._fit_lines)   # opt-in on a grid
+        g.apply_param("fit", "double")
+        lines = cell._fit_lines[0]
+        assert lines is not None and len(lines) == 3
+        assert len(lines[0].get_xdata()) == 400 and len(lines[2].get_xdata()) == 400
+        cell.set_cell_data(0, np.concatenate([RNG.normal(90, 8, 300), RNG.normal(210, 12, 200)]))
+        g.update_cells([cell.values[k] for k in range(4)])
+        assert len(cell._fit_lines[0][2].get_xdata()) == 400        # the fit tracks the moved samples
+        g.apply_param("ylog", True)
+        assert g.site_axes[0].get_yscale() == "log"                 # the dis's log-count rule, per cell
+        focus = g.build_focus_plotter(0, size="2x2")
+        assert focus._fit == "double"                               # the enlarged view inherits the pick
+        plt.close(focus.fig)
+    finally:
+        plt.close(g.fig)
         plt.close("all")

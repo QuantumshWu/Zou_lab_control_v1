@@ -1180,7 +1180,7 @@ zf.grid(block, facet="repeat")   # 每个 repeat 一格（其余轴自动成形�
 zf.grid(vec_block, facet="dim:0")  # 逐站点向量按站展开，每站一张分布
 \end{codeblock}
 
-在 task 控制台里同样直观：Add Panel 选 \tfocus{Site grid}（新面板默认 \pyapi{facet=repeat}，绑上块信号立即出图），在 Setting 的 \tfocus{facet} 下拉里选展开轴（选项由生产节点声明的轴结构自动生成，标注每根轴的长度；\tfocus{(recipe)} = 载入图的静态快照），\tfocus{sub plot} 下拉选每格画什么（\pyapi{auto} 按剩余形状自动，或显式 hist/2d/1d）——Setting 的参数行随解析出的每格类型自动切换（hist 网格给 bins/fit/ylog，2d 网格给 colormap）。相机块 \pyapi{(repeat, 1, H, W)} facet 到 repeat 就是\tfocus{每个 repeat 一张帧图}；面板的 Edit 页照常给出当前数据的交互快照。此后每个 shot 网格\tfocus{就地增量刷新}（artist 复用，绝不重建）；双击放大后 live 更新只喂放大图，Esc 返回时缩略图一次补齐——relim/fixed/cmap/bins/repeat\_mode 等参数与所有 plot 同一机制。扫描程序里 \pyapi{scan_shape} 可声明\tfocus{任意层数}（如 \pyapi{(5, 4, 3)}），流送的表保持扁平，只有显示层按声明还原。
+在 task 控制台里同样直观：Add Panel 选 \tfocus{Site grid}（新面板默认 \pyapi{facet=repeat}，绑上块信号立即出图），在 Setting 的 \tfocus{facet} 下拉里选展开轴（选项由生产节点声明的轴结构自动生成，标注每根轴的长度；超过 80 格的轴会置灰——一次画太多格会卡死前端，请换轴或用表达式先折叠；\tfocus{(saved figure)} 选项只在绑定的是载入保存图的节点时出现），\tfocus{sub plot} 下拉选每格画什么（\pyapi{auto} 按剩余形状自动，或显式 hist/2d/1d）——Setting 的参数行随解析出的每格类型自动切换（hist 网格给 bins/fit/ylog，2d 网格给 colormap）。hist 网格的 fit 与单面板 dis 是\tfocus{同一份拟合}（同色三条曲线画在每个缩略图上），因 N 格逐格拟合有开销而默认关闭，需要时在 Setting 打开即可。相机块 \pyapi{(repeat, 1, H, W)} facet 到 repeat 就是\tfocus{每个 repeat 一张帧图}；面板的 Edit 页照常给出当前数据的交互快照，参数行同样跟随每格类型。此后每个 shot 网格\tfocus{就地增量刷新}（artist 复用，绝不重建）；双击放大后 live 更新只喂放大图，Esc 返回时缩略图一次补齐——relim/fixed/cmap/bins/repeat\_mode 等参数与所有 plot 同一机制。扫描程序里 \pyapi{scan_shape} 可声明\tfocus{任意层数}（如 \pyapi{(5, 4, 3)}），流送的表保持扁平，只有显示层按声明还原。
 
 \section{第三步：detect 探测（逐发判定）}
 

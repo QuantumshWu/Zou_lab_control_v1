@@ -212,6 +212,10 @@ _SITE_COL_GAP_PX = 12
 # title never crowds the row above -- wider than the column gap for exactly that title band.
 _SITE_ROW_GAP_PX = 26
 _SITE_MAX_COLS = 7                        # column cap (pulse-style width cap); extra sites wrap to rows
+#: Hard cap on the number of grid cells: beyond this the per-tick thumbnail update (and the first
+#: matplotlib layout) freezes the UI.  ONE source -- the grid factory raises past it and the console
+#: greys out facet axes that would exceed it.
+MAX_GRID_CELLS = 80
 
 
 def _as_data_x(data_x) -> np.ndarray:
@@ -2306,6 +2310,90 @@ class PulseSequenceFigure(BaseLivePlot):
         self.fig._zlc_state = PlotState(plot_type="pulse", x_array=None, y_array=None)
 
 
+def fit_histogram_curves(vals, edges, counts, mode: str):
+    """The ONE histogram-fit rule: fit ``mode`` ("none" / "single" / "double") to a binned sample set
+    and return the CURVE DATA + threshold -- consumed by :class:`HistogramFigure` (the standalone dis)
+    AND by the grid's :class:`HistogramCell` thumbnails, so the two can never fit differently.
+
+    Returns ``None`` when there is nothing to draw (mode "none", too few samples, or a genuinely
+    failed fit), else ``{"x", "left", "right", "total", "threshold", "separated", "bimodal_popt",
+    "single_popt"}`` (``left``/``right`` are None for a single-Gaussian outcome; ``threshold`` is set
+    only when the two fitted peaks separate by >= 1.5 summed widths -- the honest-threshold gate)."""
+    vals = np.asarray(vals, dtype=float).reshape(-1)
+    vals = vals[np.isfinite(vals)]
+    mode = str(mode)
+    if mode == "none" or vals.size < 6 or np.ptp(vals) == 0:
+        return None
+    edges = np.asarray(edges, dtype=float)
+    centers = (edges[:-1] + edges[1:]) / 2
+    counts = np.asarray(counts, dtype=float)
+    span = float(np.ptp(vals)) or 1.0
+    x_fit = np.linspace(edges[0], edges[-1], 400)
+
+    def _single():
+        try:
+            p0 = [max(float(np.max(counts)), 1.0), float(np.mean(vals)),
+                  max(float(np.std(vals)), span / 40, 1e-9)]
+            popt, _ = curve_fit(gaussian, centers, counts, p0=p0, maxfev=20000)
+        except Exception:
+            return None
+        return {"x": x_fit, "left": None, "right": None, "total": gaussian(x_fit, *popt),
+                "threshold": None, "separated": False, "bimodal_popt": None,
+                "single_popt": (float(popt[0]), float(popt[1]), float(popt[2]))}
+
+    if mode != "double":
+        return _single()                     # "single": one Gaussian, no dark/bright split
+    # Otsu split on the sorted samples (between-class variance), NOT the median -- seeds each side.
+    xs = np.sort(vals)
+    csum = np.cumsum(xs)
+    k = np.arange(1, xs.size, dtype=float)
+    score = k * (xs.size - k) * ((csum[-1] - csum[:-1]) / (xs.size - k) - csum[:-1] / k) ** 2
+    si = int(np.argmax(score))
+    split = float(0.5 * (xs[si] + xs[si + 1]))
+    left, right = vals[vals <= split], vals[vals > split]
+    if left.size < 2 or right.size < 2:
+        left, right = vals[: vals.size // 2], vals[vals.size // 2:]
+    mu0, mu1 = float(np.mean(left)), float(np.mean(right))
+    if mu0 > mu1:
+        mu0, mu1 = mu1, mu0
+    s0 = max(float(np.std(left)), span / 40, 1e-9)
+    s1 = max(float(np.std(right)), span / 40, 1e-9)
+
+    def _amp_near(mu):
+        return max(float(counts[int(np.clip(np.searchsorted(centers, mu), 0, len(counts) - 1))]), 1.0)
+
+    # DOUBLE mode ALWAYS attempts the two-Gaussian decomposition -- the toggle drives the display
+    # DIRECTLY, never a hidden auto-collapse based on how the data looks; only a genuine curve_fit
+    # failure falls back to the single Gaussian (the "toggle does nothing" bug).
+    p0 = [_amp_near(mu0), mu0, s0, _amp_near(mu1), mu1, s1]
+    bounds = (
+        [0, float(np.min(vals)), span / 200, 0, float(np.min(vals)), span / 200],
+        [max(_amp_near(mu0) * 5, 1), float(np.max(vals)), span * 2,
+         max(_amp_near(mu1) * 5, 1), float(np.max(vals)), span * 2],
+    )
+    try:
+        popt, _ = curve_fit(bimodal_model, centers, counts, p0=p0, bounds=bounds,
+                            jac=bimodal_jacobian, maxfev=20000)
+    except Exception:
+        return _single()
+    if popt[1] > popt[4]:
+        popt = np.array([popt[3], popt[4], popt[5], popt[0], popt[1], popt[2]], dtype=float)
+    # Both peaks always DRAW in double mode; the threshold (and the fidelity stat upstream) is only
+    # meaningful when the fitted means separate by >= 1.5 summed widths -- the same gate as before.
+    fitted_sep = abs(popt[4] - popt[1]) / (abs(popt[2]) + abs(popt[5]) + 1e-12)
+    separated = fitted_sep >= 1.5
+    y0 = gaussian(x_fit, *popt[:3])
+    y1 = gaussian(x_fit, *popt[3:])
+    threshold = None
+    lo, hi = float(popt[1]), float(popt[4])
+    if separated and hi > lo:
+        x_mid = np.linspace(lo, hi, 400)
+        diff = np.abs(gaussian(x_mid, *popt[:3]) - gaussian(x_mid, *popt[3:]))
+        threshold = float(x_mid[int(np.nanargmin(diff))])
+    return {"x": x_fit, "left": y0, "right": y1, "total": y0 + y1, "threshold": threshold,
+            "separated": separated, "bimodal_popt": popt, "single_popt": None}
+
+
 class HistogramFigure(BaseLivePlot):
     """Neutral-atom-friendly histogram with threshold classification tools.
 
@@ -2561,8 +2649,9 @@ class HistogramFigure(BaseLivePlot):
         # on dark so curve_fit collapsed to one blob and reported a MISLEADING fidelity.  Fix: split by
         # between-class variance (Otsu) over the samples, seed each side's amplitude from its own bin
         # counts, and -- when the bright mode is too sparse or unseparated -- fit ONE Gaussian and
-        # report fit F = N/A (honest), never a fake number.
-        vals = self.values[np.isfinite(self.values)]
+        # report fit F = N/A (honest), never a fake number.  The MATH lives in the ONE
+        # fit_histogram_curves primitive (shared with the grid's HistogramCell thumbnails);
+        # this method only lands the result on the figure's artists + stat state.
         self.bimodal_popt = None
         self.fit_threshold = None
         self.single_popt = None
@@ -2570,99 +2659,18 @@ class HistogramFigure(BaseLivePlot):
         self._has_threshold = self._explicit_thr        # no fit yet -> only an explicit cut shows
         for ln in (self.fit_line_left, self.fit_line_right, self.fit_line_total):
             ln.set_data([], [])
-        if vals.size < 6 or np.ptp(vals) == 0:
+        res = fit_histogram_curves(self.values, self.bins, self.n.astype(float), self._fit)
+        if res is None:
             return
-        centers = (self.bins[:-1] + self.bins[1:]) / 2
-        counts = self.n.astype(float)
-        span = float(np.ptp(vals)) or 1.0
-        x_fit = np.linspace(self.bins[0], self.bins[-1], 400)
-
-        # Otsu split on the sorted samples (between-class variance), NOT the median.
-        xs = np.sort(vals)
-        csum = np.cumsum(xs)
-        k = np.arange(1, xs.size, dtype=float)
-        score = k * (xs.size - k) * ((csum[-1] - csum[:-1]) / (xs.size - k) - csum[:-1] / k) ** 2
-        si = int(np.argmax(score))
-        split = float(0.5 * (xs[si] + xs[si + 1]))
-        left, right = vals[vals <= split], vals[vals > split]
-        if left.size < 2 or right.size < 2:
-            left, right = vals[: vals.size // 2], vals[vals.size // 2:]
-        mu0, mu1 = float(np.mean(left)), float(np.mean(right))
-        if mu0 > mu1:
-            mu0, mu1 = mu1, mu0
-        s0 = max(float(np.std(left)), span / 40, 1e-9)
-        s1 = max(float(np.std(right)), span / 40, 1e-9)
-
-        def _amp_near(mu):
-            return max(float(counts[int(np.clip(np.searchsorted(centers, mu), 0, len(counts) - 1))]), 1.0)
-
-        def _draw_unimodal():
-            try:
-                p0 = [max(float(np.max(counts)), 1.0), float(np.mean(vals)), max(float(np.std(vals)), span / 40, 1e-9)]
-                popt, _ = curve_fit(gaussian, centers, counts, p0=p0, maxfev=20000)
-                self.fit_line_total.set_data(x_fit, gaussian(x_fit, *popt))   # one curve, fit F = N/A
-                self.single_popt = (float(popt[0]), float(popt[1]), float(popt[2]))   # for the no-threshold stat
-            except Exception:
-                pass
-
-        # A SINGLE-Gaussian outcome -> NO threshold (a cut between two populations is meaningless when
-        # there is one): only show a cut if it was supplied EXPLICITLY (a calibration's per-site cut).
-        def _single_gaussian():
-            _draw_unimodal()
-            self.fit_threshold = None
-            self._has_threshold = self._explicit_thr
-
-        # The FIT chooser drives the display directly (none / single / double) -- no hardcoding, no
-        # data-driven auto-decision.
-        if self._fit == "none":
-            return                       # no fit lines at all (the lines cleared above stay empty)
-        if self._fit != "double":
-            _single_gaussian()           # "single": one Gaussian, no dark/bright split, fit F = N/A
-            return
-
-        # DOUBLE mode: ALWAYS attempt the two-Gaussian dark/bright decomposition -- the toggle drives the
-        # display DIRECTLY, never a hidden auto-collapse-to-one-peak based on how the data happens to look.
-        # If the bright mode is sparse the two peaks may overlap, but selecting double MUST visibly fit two
-        # Gaussians, not silently fall back to one (the "toggle does nothing / button is broken" bug: the
-        # old `right.size` pre-gate quietly reverted to single on near-unimodal data).  Only a genuine
-        # curve_fit FAILURE (caught below) falls back to a single Gaussian.
-        p0 = [_amp_near(mu0), mu0, s0, _amp_near(mu1), mu1, s1]
-        bounds = (
-            [0, float(np.min(vals)), span / 200, 0, float(np.min(vals)), span / 200],
-            [max(_amp_near(mu0) * 5, 1), float(np.max(vals)), span * 2,
-             max(_amp_near(mu1) * 5, 1), float(np.max(vals)), span * 2],
-        )
-        try:
-            popt, _ = curve_fit(bimodal_model, centers, counts, p0=p0, bounds=bounds,
-                                 jac=bimodal_jacobian, maxfev=20000)
-        except Exception:
-            _single_gaussian()
-            return
-        if popt[1] > popt[4]:
-            popt = np.array([popt[3], popt[4], popt[5], popt[0], popt[1], popt[2]], dtype=float)
-        # DRAW both peaks always (bimodal mode).  The FIDELITY stat stays honest: it is reported only
-        # when the fitted means separate by >~1.5 summed widths (a real readout bimodal); below that the
-        # two peaks still draw but ``_fit_fidelity`` returns N/A (never a fake number) -- the same
-        # FITTED-separation gate as before, now driving only the stat, not the visual.
-        self.bimodal_popt = popt
-        fitted_sep = abs(popt[4] - popt[1]) / (abs(popt[2]) + abs(popt[5]) + 1e-12)
-        self._fit_separated = fitted_sep >= 1.5
-        y0 = gaussian(x_fit, *popt[:3])
-        y1 = gaussian(x_fit, *popt[3:])
-        self.fit_line_left.set_data(x_fit, y0)
-        self.fit_line_right.set_data(x_fit, y1)
-        self.fit_line_total.set_data(x_fit, y0 + y1)
-        # A threshold is only meaningful when the two peaks actually SEPARATED.  Separated -> the cut at
-        # the cross-over; not separated (one effective population) -> NO auto cut (#issue-2): show the fit
-        # + out-of-fit fraction instead.  An explicitly-supplied cut (calibration) still shows either way.
+        if res["left"] is not None:
+            self.fit_line_left.set_data(res["x"], res["left"])
+            self.fit_line_right.set_data(res["x"], res["right"])
+        self.fit_line_total.set_data(res["x"], res["total"])
+        self.bimodal_popt = res["bimodal_popt"]
+        self.single_popt = res["single_popt"]
+        self._fit_separated = bool(res["separated"])
+        self.fit_threshold = res["threshold"]
         self._has_threshold = self._fit_separated or self._explicit_thr
-        lo, hi = float(popt[1]), float(popt[4])
-        if self._fit_separated and hi > lo:
-            x_mid = np.linspace(lo, hi, 400)
-            diff = np.abs(gaussian(x_mid, *popt[:3]) - gaussian(x_mid, *popt[3:]))
-            self.fit_threshold = float(x_mid[int(np.nanargmin(diff))])
-        else:
-            self.fit_threshold = None
 
     def _fit_fidelity(self, threshold: float) -> float | None:
         # Honest fidelity only when the two-Gaussian fit cleanly SEPARATED (>=1.5 summed widths); the
@@ -3134,6 +3142,15 @@ class GridCell:
         flips relim to ``fixed`` without an enlarged cell (fixed freezes what you see, never 0..1)."""
         raise NotImplementedError
 
+    def consume_param(self, key: str, value) -> bool:
+        """Land a per-kind DISPLAY knob on this cell family's own state (a hist cell's bins / fit /
+        ylog, an image cell's cmap) and return True when the THUMBNAILS are now stale.  The single
+        param fan-out: ``GridPlot.store_display_param`` owns only the generic relim family and hands
+        every other key HERE -- the cell family, not the grid, declares which of its standalone
+        kind's ``PANEL_PARAMS`` it renders (so a new knob is one method here, never a GridPlot edit).
+        Unknown keys return False (stored on the grid for the focus seed, thumbnails untouched)."""
+        return False
+
     def prepare(self) -> None:
         """Compute any shared state (e.g. common histogram bin edges) once."""
 
@@ -3210,10 +3227,35 @@ class HistogramCell(GridCell):
         self.bins_arg = int(bins)
         self.labels = tuple(labels)
         self.edges = None
+        # The hist kind's OWN display knobs, rendered on the thumbnails through the SAME primitives
+        # the standalone HistogramFigure uses (fit_histogram_curves / set_yscale).  ``fit`` defaults
+        # to "none" here -- an N-cell grid re-fits every cell on each redraw, so the fit is an
+        # explicit opt-in on a grid (the ENLARGED cell always fits, it is a standalone hist panel).
+        self.fit = "none"
+        self.ylog = False
         self.threshold_lines: list = [None] * self.n_cells
         self.tag_texts: list = [None] * self.n_cells
         self.cell_counts: list = [None] * self.n_cells
         self._bar_colls: list = [None] * self.n_cells      # cell k's PolyCollections, for the live in-place move
+        self._fit_lines: list = [None] * self.n_cells      # cell k's (left, right, total) fit Line2Ds
+
+    def consume_param(self, key: str, value) -> bool:
+        if str(key) == "bins":
+            self.bins_arg = int(value)
+            self.edges = None
+            self.prepare()
+            return True
+        if str(key) == "fit":
+            if self.fit == str(value):
+                return False
+            self.fit = str(value)
+            return True
+        if str(key) == "ylog":
+            if self.ylog == bool(value):
+                return False
+            self.ylog = bool(value)
+            return True
+        return False
 
     def prepare(self) -> None:
         vals = self.values
@@ -3230,6 +3272,40 @@ class HistogramCell(GridCell):
         cell's small axes title ABOVE the plot (never inside the data area), so the histogram stays clean."""
         fids = self.site_fidelities
         return f"s{k}" if fids is None or not np.isfinite(fids[k]) else f"s{k}  {fids[k] * 100:.0f}%"
+
+    def _apply_fit_lines(self, ax, k: int, counts) -> None:
+        """(Re)fit + draw cell ``k``'s fit curves through the ONE primitive the standalone dis uses
+        (:func:`fit_histogram_curves`) -- the same three lines in the same colours, moved in place on
+        a live tick.  Off ("none") / impossible fits leave the lines empty."""
+        lines = self._fit_lines[k]
+        if self.fit == "none" and lines is None:
+            return                              # never fitted on this cell -> nothing to build/clear
+        if lines is None:                       # lazily build the same 3-line set the standalone dis owns
+            lines = (ax.plot([], [], color=PALETTE["fit_left"], linewidth=1, alpha=0.8)[0],
+                     ax.plot([], [], color=PALETTE["fit_right"], linewidth=1, alpha=0.8)[0],
+                     ax.plot([], [], color=PALETTE["fit_total"], linewidth=1, alpha=0.35)[0])
+            self._fit_lines[k] = lines
+        for ln in lines:
+            ln.set_data([], [])
+        res = fit_histogram_curves(self.values[k], self.edges, counts, self.fit)
+        if res is None:
+            return
+        if res["left"] is not None:
+            lines[0].set_data(res["x"], res["left"])
+            lines[1].set_data(res["x"], res["right"])
+        lines[2].set_data(res["x"], res["total"])
+
+    def _apply_count_ylim(self, ax, counts) -> None:
+        """The thumbnail's count-axis scale + range: the operator's relim family via ``thumb_lims``,
+        with the standalone dis's log rule (floor at 0.5 so 0-count bars sit below the axis)."""
+        top = float(counts.max()) if len(counts) else 0.0
+        lo, hi = self.thumb_lims(0.0, top * 1.08 if top > 0 else 1.0)
+        if self.ylog:
+            ax.set_yscale("log")
+            ax.set_ylim(max(0.5, lo), max(hi, 1.0))
+        else:
+            ax.set_yscale("linear")
+            ax.set_ylim(lo, hi)
 
     def draw(self, ax, k: int):
         """The compact grid THUMBNAIL of cell ``k`` (corner tag, hidden counts axis; the SHAPE is the
@@ -3269,6 +3345,8 @@ class HistogramCell(GridCell):
             _bars(counts_all, PALETTE["hist_fill"])
         self.cell_counts[k] = counts_all
         self._bar_colls[k] = colls
+        self._fit_lines[k] = None               # the axes were cleared -> the old fit lines are gone
+        self._apply_fit_lines(ax, k, counts_all)
         line = None
         if self.thresholds is not None and np.isfinite(self.thresholds[k]):
             line = ax.axvline(float(self.thresholds[k]), **threshold_line_kwargs(1.4))
@@ -3276,8 +3354,7 @@ class HistogramCell(GridCell):
         # collections do not autoscale -- set the count axis from the binned data directly (cheaper too);
         # in ``fixed`` mode the operator's pinned lo/hi win (thumb_lims -- the SAME relim family the
         # enlarged view honours, so a lim edit changes thumbnails AND zoom together, like cmap/bins do)
-        top = float(counts_all.max()) if counts_all.size else 0.0
-        ax.set_ylim(*self.thumb_lims(0.0, top * 1.08 if top > 0 else 1.0))
+        self._apply_count_ylim(ax, counts_all)
         # A THUMBNAIL keeps few ticks (the standalone hist uses nbins=5; a compact cell needs less):
         # every tick costs a Text layout on EVERY draw, and with N cells that tick work dominated the
         # grid's first render (#perf) -- fewer ticks = proportionally less _update_ticks/text-metrics.
@@ -3344,9 +3421,9 @@ class HistogramCell(GridCell):
         _update_verts(self.edges, counts, verts, mode="vertical")
         colls[0].set_verts(verts)
         self.cell_counts[k] = counts
+        self._apply_fit_lines(ax, k, counts)   # the fit curves track the moved samples (one primitive)
         ax.set_xlim(self.x_lo, self.x_hi)      # shared edges track the pooled samples (prepare)
-        top = float(counts.max()) if counts.size else 0.0
-        ax.set_ylim(*self.thumb_lims(0.0, top * 1.08 if top > 0 else 1.0))
+        self._apply_count_ylim(ax, counts)
         return True
 
     def focus_update(self, focus_plotter, k: int) -> None:
@@ -3426,6 +3503,12 @@ class ImageCell(GridCell):
         self.cmap = str(cmap) if cmap else PALETTE["cmap_camera"]
         self.vmin, self.vmax = 0.0, 1.0
         self._image_artists: list = [None] * self.n_cells   # cell k's AxesImage, for the live in-place move
+
+    def consume_param(self, key: str, value) -> bool:
+        if str(key) in ("cmap", "colorset"):
+            self.cmap = str(value)
+            return True
+        return False
 
     def prepare(self) -> None:
         finite = [im[np.isfinite(im)] for im in self.images if im.size]
@@ -3886,14 +3969,6 @@ class GridPlot(BaseLivePlot):
         once when the grid is showing; the console's focused path defers to unfocus, so a Setting edit on an
         ENLARGED cell never synchronously repaints N invisible cells)."""
         self._display_params[str(key)] = value
-        if str(key) == "bins" and isinstance(self.cell_renderer, HistogramCell):
-            self.cell_renderer.bins_arg = int(value)
-            self.cell_renderer.edges = None
-            self.cell_renderer.prepare()
-            return True
-        if str(key) in ("cmap", "colorset") and isinstance(self.cell_renderer, ImageCell):
-            self.cell_renderer.cmap = str(value)
-            return True
         # The relim family updates the CELL state exactly like bins/cmap (GridCell.relim_mode /
         # fixed_lo / fixed_hi -- every thumbnail's draw consumes it via thumb_lims), so a lim edit
         # reaches the thumbnails through the SAME store -> cell-state -> redraw mechanism, never
@@ -3921,7 +3996,9 @@ class GridPlot(BaseLivePlot):
                 return False
             setattr(self.cell_renderer, str(key), float(value))
             return self.cell_renderer.relim_mode == "fixed"   # thumbnails only move in fixed mode
-        return False
+        # Every other key is the CELL FAMILY's own knob (a hist's bins/fit/ylog, a 2d's cmap) -- the
+        # family declares what it renders (GridCell.consume_param), the grid never key-matches per kind.
+        return self.cell_renderer.consume_param(str(key), value)
 
     def current_lims(self) -> tuple[float, float]:
         """What the grid 'shows now' as one (lo, hi) pair: the enlarged cell's own lims when zoomed,
@@ -4192,6 +4269,10 @@ def grid(
         # expand, and the single slicing rule (facet_cells) produces the per-cell inputs
         per_cell = facet_cells(per_cell, facet, sub_plot_kind=kind,
                                points_shape=points_shape, repeat_mode=repeat_mode)
+    if len(per_cell) > MAX_GRID_CELLS:
+        raise ValueError(
+            f"a grid of {len(per_cell)} cells would freeze the UI (limit {MAX_GRID_CELLS}); "
+            "pick a shorter facet axis, or collapse that axis via repeat_mode / an expression instead.")
     if labels is None:
         labels = {"hist": ("Signal", "Shots"), "1d": ("X", "Y")}.get(kind, ("x (px)", "y (px)"))
     if kind == "hist":

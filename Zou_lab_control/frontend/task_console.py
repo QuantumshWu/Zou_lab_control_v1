@@ -2550,14 +2550,21 @@ class PanelCard(FluentGroupBox):
             return str(sub)
         if self._facet():
             return self._resolved_sub_kind()     # a facet grid's kind derives from the slice, not a recipe
-        if callable(self.grid_recipe_provider) and self.config.inputs and self.config.inputs[0]:
-            try:
-                recipe = self.grid_recipe_provider(self.config.inputs[0])
-                if recipe:
-                    return str(recipe.get("sub_plot_kind") or "hist")
-            except Exception:
-                pass
+        recipe = self._grid_recipe_or_none()
+        if recipe:
+            return str(recipe.get("sub_plot_kind") or "hist")
         return "hist"
+
+    def _grid_recipe_or_none(self):
+        """The bound signal's grid RECIPE (a loaded saved-figure's reproduction dict) when its
+        producing node carries one -- else None.  The ONE probe _param_kind and the facet choices
+        share (a "(saved figure)" option only exists when there IS a saved figure to show)."""
+        if not (callable(self.grid_recipe_provider) and self.config.inputs and self.config.inputs[0]):
+            return None
+        try:
+            return self.grid_recipe_provider(self.config.inputs[0])
+        except Exception:
+            return None
 
     def _grid_recipe_with_params(self, recipe: Mapping[str, object]) -> dict:
         """Fold THIS panel's live grid DISPLAY knobs (the per-site ``sub_plot_kind``'s params -- ``bins`` /
@@ -2638,22 +2645,36 @@ class PanelCard(FluentGroupBox):
                 plotter.apply_param(key, self.config.params[key])
         return plotter
 
-    def _facet_choices(self) -> list[tuple[str, str]]:
-        """The facet dropdown's ``[(stored value, display text)]`` -- derived from the producing
-        node's declared axis structure, with the axis LENGTH shown so the operator picks by meaning
-        ('scan axis 0 (5)') instead of guessing indices."""
-        out = [("", "(recipe)"), ("repeat", "repeat")]
+    def _facet_choices(self) -> list[tuple[str, str, bool]]:
+        """The facet dropdown's ``[(stored value, display text, enabled)]`` -- derived from the
+        producing node's declared axis structure, with the axis LENGTH shown so the operator picks
+        by meaning ('scan axis 0 (5)').  An axis longer than :data:`MAX_GRID_CELLS` is listed but
+        DISABLED (the grid factory refuses it -- the UI would freeze); the "(saved figure)" row
+        exists only when the bound node actually carries a saved grid recipe to replay."""
+        from .live import MAX_GRID_CELLS
+        out = []
+        if self._grid_recipe_or_none() is not None:
+            out.append(("", "(saved figure)", True))
+        out.append(("repeat", "repeat", True))
+
+        def _axis(value, text, n):
+            ok = int(n) <= MAX_GRID_CELLS
+            out.append((value, text if ok else f"{text} – too many", ok))
+
         pts, dim = self._facet_value_shapes()
         if len(pts) > 1:
-            out.extend((f"points:{i}", f"scan axis {i} ({n})") for i, n in enumerate(pts))
+            for i, n in enumerate(pts):
+                _axis(f"points:{i}", f"scan axis {i} ({n})", n)
         elif pts and pts[0] > 1:
-            out.append(("points:0", f"scan axis 0 ({pts[0]})"))
-        out.extend((f"dim:{i}", f"data axis {i} ({n})") for i, n in enumerate(dim) if n > 1)
+            _axis("points:0", f"scan axis 0 ({pts[0]})", pts[0])
+        for i, n in enumerate(dim):
+            if n > 1:
+                _axis(f"dim:{i}", f"data axis {i} ({n})", n)
         return out
 
     def _refresh_facet_combo(self) -> None:
         """Refill the facet dropdown from the CURRENT node structure (a Setting open re-derives it,
-        like the signal combo) keeping the stored pick selected."""
+        like the signal combo) keeping the stored pick selected; over-limit axes come out greyed."""
         combo = getattr(self, "facet_combo", None)
         if combo is None:
             return
@@ -2661,8 +2682,12 @@ class PanelCard(FluentGroupBox):
         with _signals_blocked(combo):
             combo.clear()
             index = 0
-            for j, (value, text) in enumerate(self._facet_choices()):
+            for j, (value, text, enabled) in enumerate(self._facet_choices()):
                 combo.addItem(text, value)
+                if not enabled:
+                    item = combo.model().item(combo.count() - 1)
+                    if item is not None:
+                        item.setEnabled(False)
                 if value == current:
                     index = j
             combo.setCurrentIndex(index)
@@ -4381,6 +4406,10 @@ class PanelEditor(QtWidgets.QWidget):
         self.card = card
         self.console = console
         self.setStyleSheet("background: transparent;")
+        # Which kind's PANEL_PARAMS this page baked its rows from -- a grid's RESOLVED per-cell
+        # kind can change later (a facet / sub-plot pick), and refresh_on_show then rebuilds this
+        # page so the rows never lie (the Edit mirror of _sync_settings_param_rows).
+        self._param_kind_built = card._param_kind() if card is not None else None
         self._plotter = None
         self._canvas = None
         self._df = None
@@ -5185,6 +5214,14 @@ class PanelEditor(QtWidgets.QWidget):
         fields to current view, re-read the producing source's 'now' acquisition values, and refresh
         any embedded source form's dynamic combos (the ONE hook the tab-switch handler calls -- nothing
         special-cases PanelEditor versus LogicNodeEditor)."""
+        # A grid's param rows follow its RESOLVED per-cell kind: when a facet / sub-plot pick changed
+        # it since this page was built, rebuild the page in place (fresh rows + snapshot) -- the Edit
+        # mirror of the Setting popup's _sync_settings_param_rows.
+        card = self.card
+        if card is not None and card.config.kind == "grid" \
+                and card._param_kind() != self._param_kind_built:
+            self.console._refresh_panel_editor(card)
+            return
         self._refresh_display_params()
         self.fill_limits()
         self.refresh_node_now_labels()
@@ -6502,6 +6539,27 @@ class TaskConsole(QtWidgets.QWidget):
         editor.teardown()
         editor.setParent(None)
         editor.deleteLater()
+
+    def _refresh_panel_editor(self, card: "PanelCard") -> None:
+        """Rebuild a card's OPEN Edit tab in place (same tab slot, same selection) -- used when the
+        panel's resolved param kind changed underneath it (a grid's facet / sub-plot pick), so the
+        page's baked param rows follow instead of lying."""
+        old = self._panel_editors.get(id(card))
+        if old is None:
+            return
+        index = self.tabs.indexOf(old)
+        was_current = self.tabs.currentWidget() is old
+        self._close_panel_editor(card)
+        editor = PanelEditor(card, self)
+        self._panel_editors[id(card)] = editor
+        title = (card.config.title or PANEL_KINDS[card.config.kind]).strip() or "panel"
+        self.tabs.add_closable_tab(editor, title)
+        new_index = self.tabs.indexOf(editor)
+        if 0 <= index < new_index:
+            self.tabs.tabBar().moveTab(new_index, index)     # keep the tab where the user left it
+        if was_current:
+            self.tabs.setCurrentWidget(editor)
+        editor.rebuild()
 
     def _on_editor_tab_closed(self, widget) -> None:
         """X on a PanelEditor / LogicNodeEditor tab: tear it down + drop it from the

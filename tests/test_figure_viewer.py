@@ -502,10 +502,10 @@ def test_grid_reopens_as_a_normal_panelcard_on_the_same_board(tmp_path):
         plotter = card.plotter
         assert type(plotter).__name__ in ("SiteHistogramGrid", "GridPlot"), "PanelCard renders grid faithfully"
         assert plotter.n_cells == 6, "the reproduced grid has the saved site count"
-        # grid is a SEEDABLE kind but NOT live-addable -> absent from the Add-Panel dropdown
+        # grid is BOTH seedable (a loaded figure, this test) and live-addable (the facet
+        # axis-expander, round R) -- so it appears in the Add-Panel dropdown like every plot kind.
         combo_kinds = {con.kind_combo.itemData(i) for i in range(con.kind_combo.count())}
-        assert "grid" not in {k for k in combo_kinds if isinstance(k, str)}, \
-            "grid is not offered in the live Add-Panel dropdown (seedable, not live-addable)"
+        assert "grid" in {k for k in combo_kinds if isinstance(k, str)}
     finally:
         win = v.window()
         if win is not None:
