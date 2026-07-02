@@ -198,7 +198,7 @@ class DataFigure:
         simply omits it."""
         src = self._figure_source or {}
         from Zou_lab_control.neutral_atom.operations.figure_capture import (
-            capture_figure_signals, capture_figure_provenance, capture_flow_graph)
+            capture_figure_signals, capture_figure_provenance, capture_flow_graph, raw_data_flow_graph)
         out: dict[str, Any] = {}
         try:
             signals = capture_figure_signals(src.get("hub"), src.get("node"), src.get("inputs"))
@@ -219,10 +219,11 @@ class DataFigure:
                                       resolve_node=src.get("resolve_node"))
         except Exception:
             flow = None
-        if flow is not None:
-            if prov is None:
-                prov = {}
-            prov["flow_graph"] = flow
+        if not flow:                          # a capture that failed / returned nothing STILL saves raw->plot,
+            flow = raw_data_flow_graph()      # so the Flow tab of every saved figure has a tree (never "no data")
+        if prov is None:
+            prov = {}
+        prov["flow_graph"] = flow
         if prov is not None:
             out["provenance"] = prov
         return out

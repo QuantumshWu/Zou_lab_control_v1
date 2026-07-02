@@ -25,7 +25,7 @@ import numpy as np
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
-from .live import HistogramFigure, LiveSiteMap, SiteHistogramGrid, site_psf_grid, site_ring_radius
+from .live import HistogramFigure, LiveSiteMap, grid, site_ring_radius
 
 
 def _agg_figure() -> Figure:
@@ -55,23 +55,23 @@ def _save_plot(plot, path: Path) -> str:
 
 
 def _site_grid(per_method_counts, thresholds, fidelity, *, title):
-    """One per-site distribution grid (one histogram per site, threshold line + fidelity)."""
-    return SiteHistogramGrid(
-        per_method_counts, thresholds=list(thresholds), site_fidelities=list(fidelity),
-        labels=("Readout counts", "Shots"), title=title,
-        fig=_agg_figure(), interactions=False).show(display=False)
+    """One per-site distribution grid (one histogram per site, threshold line + fidelity) -- built through
+    the UNIFIED grid factory with ``sub_plot_kind="hist"``, the SAME entry the per-site PSF kernel grid
+    uses (``sub_plot_kind="2d"``): the report creates every grid the ONE way."""
+    return grid(per_method_counts, sub_plot_kind="hist", thresholds=list(thresholds),
+                site_fidelities=list(fidelity), labels=("Readout counts", "Shots"), title=title,
+                fig=_agg_figure(), interactions=False, display=False)
 
 
 def _psf_grid(psf_weights, *, title):
-    """The calibration's PSF *shape* output: one ``imshow`` per site of its empirical
-    matched-filter kernel (the real asymmetric, non-Gaussian spot), on the reusable
-    per-site image grid (a :class:`GridPlot` of :class:`ImageCell`) -- NOT hand-rolled
-    matplotlib (frontend rule 7), so it gets the same selectors / focus-zoom / save
-    contract as every other report figure.  Mirrors the rb87 readout's ``02_psf_grid.png``."""
-    return site_psf_grid(
-        [np.asarray(w, dtype=float) for w in psf_weights],
-        labels=("x (px)", "y (px)"), title=title,
-        fig=_agg_figure(), interactions=False, display=False)
+    """The calibration's PSF *shape* output: one ``imshow`` per site of its empirical matched-filter kernel
+    (the real asymmetric, non-Gaussian spot) -- built through the SAME unified grid factory with
+    ``sub_plot_kind="2d"`` (a :class:`GridPlot` of :class:`ImageCell`), NOT hand-rolled matplotlib
+    (frontend rule 7), so it gets the same selectors / focus-zoom / save contract as every other report
+    figure.  Mirrors the rb87 readout's ``02_psf_grid.png``."""
+    return grid([np.asarray(w, dtype=float) for w in psf_weights], sub_plot_kind="2d",
+                labels=("x (px)", "y (px)"), title=title, fig=_agg_figure(),
+                interactions=False, display=False)
 
 
 def save_calibration_report(folder, *, counts, thresholds, fidelity, centers,

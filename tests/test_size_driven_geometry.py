@@ -6,7 +6,7 @@ These pin the invariants of the size-unification round:
    the single-axes kinds -- the size preset carries the content density, not a bespoke content-inches;
 2. a grid's TOTAL figure px (data box + OUTER margins) EQUALS a same-size single-axes panel's to the pixel
    (#5, ONE ``panel_margins_px`` source), and a FOCUSED cell IS a standalone ``panel_plot`` of the cell's
-   KIND (dispatched generically off ``focus_kind`` through ``PLOT_KIND_BY_KEY`` -- hist -> HistogramFigure,
+   KIND (dispatched generically off ``sub_plot_kind`` through ``PLOT_KIND_BY_KEY`` -- hist -> HistogramFigure,
    image -> Live2DDis), so its lim edit sticks and never bounces back to the thumbnail;
 3. a Monitor-card pulse / grid plotter is display-only (``interactions is False`` -> no selectors);
 4. ``optimal_pulse_size`` is the ONE default-size source (the preview default and the loaded-panel default
@@ -133,22 +133,29 @@ def test_grid_cells_scale_with_size():
     plt.close(small.fig); plt.close(big.fig)
 
 
-def test_optimal_grid_size_is_the_4_cell_boundary_default():
-    """``optimal_grid_size`` is the ONE grid default-size source (part A) with the 4-cell boundary per axis:
-    a dimension with < 4 cells gets the compact half-unit (2), >= 4 gets the double half-unit (4), mapped to
-    the NEAREST available ``PANEL_SIZES`` preset.  So a small grid opens ``2x2`` and a big grid ``4x4`` -- and
-    a grid built with ``size=None`` (the factory default) adopts exactly this preset (single source, no drift)."""
-    # the 4-cell boundary on each axis
-    for r, c in [(1, 1), (2, 2), (2, 3), (3, 3)]:
-        assert panel_size_cells(optimal_grid_size(r, c)) == (2, 2), f"{r}x{c} (all < 4) -> compact 2x2"
-    for r, c in [(4, 4), (5, 5), (4, 6)]:
-        assert panel_size_cells(optimal_grid_size(r, c)) == (4, 4), f"{r}x{c} (>= 4) -> double 4x4"
+def test_optimal_grid_size_judges_each_axis_independently():
+    """``optimal_grid_size`` is the ONE grid default-size source (part A): EACH axis independently gets the
+    compact half-unit (2) up to ITS OWN boundary (rows: 4, columns: 5 -- a cell is wider than tall, so more
+    columns fit before the double width is needed) and the double (4) beyond it.  Rows and columns are never
+    coupled, so a tall 5x3 grid opens ``4x2``, a wide 3x6 opens ``2x4``, a 5x7 opens ``4x4`` (every {2,4}^2
+    combination is a real preset, no nearest-preset snap).  A grid built with ``size=None`` (the factory
+    default) adopts exactly this preset (single source, no drift)."""
+    # up to the per-axis boundary on BOTH axes -> compact 2x2 (<=4 rows, <=5 columns)
+    for r, c in [(1, 1), (2, 2), (2, 3), (4, 4), (4, 5), (3, 5)]:
+        assert panel_size_cells(optimal_grid_size(r, c)) == (2, 2), f"{r}x{c} (within bounds) -> compact 2x2"
+    # each axis independently: tall -> 4x2, wide -> 2x4, both big -> 4x4
+    for r, c in [(5, 3), (7, 5)]:
+        assert panel_size_cells(optimal_grid_size(r, c)) == (4, 2), f"{r}x{c} (tall) -> 4x2"
+    for r, c in [(3, 6), (4, 7)]:
+        assert panel_size_cells(optimal_grid_size(r, c)) == (2, 4), f"{r}x{c} (wide) -> 2x4"
+    for r, c in [(5, 6), (6, 8)]:
+        assert panel_size_cells(optimal_grid_size(r, c)) == (4, 4), f"{r}x{c} (both big) -> double 4x4"
     # every returned preset is a real PANEL_SIZES member
-    for r in range(1, 8):
-        for c in range(1, 8):
+    for r in range(1, 9):
+        for c in range(1, 9):
             assert optimal_grid_size(r, c) in PANEL_SIZES
     # a grid built with size=None adopts the shape-driven default (the factory reads the SAME source)
-    recipe = _grid_recipe(n=16)                 # 4x4 shape -> the 4x4 preset
+    recipe = _grid_recipe(n=16)                 # 4x4 shape -> the compact 2x2 preset (both axes <= 4)
     g = build_grid_figure(recipe, size=None, display=False)
     assert g._size == optimal_grid_size(g.nrows, g.ncols)
     plt.close(g.fig)
@@ -178,7 +185,7 @@ def test_grid_focus_is_a_full_plot_kind_not_a_thumbnail():
 
 
 def test_grid_focus_dispatches_by_cell_kind_generically():
-    """Focus dispatch is GENERIC through the ONE ``PLOT_KIND_BY_KEY`` table off each cell's ``focus_kind``
+    """Focus dispatch is GENERIC through the ONE ``PLOT_KIND_BY_KEY`` table off each cell's ``sub_plot_kind``
     (never a hard-coded class): a HIST grid focuses into a :class:`HistogramFigure` AND an IMAGE grid focuses
     into a :class:`Live2DDis` -- proving the SAME builder resolves the right standalone plot kind per cell."""
     from Zou_lab_control.frontend.live import (
@@ -188,14 +195,14 @@ def test_grid_focus_dispatches_by_cell_kind_generically():
     # a hist grid -> HistogramFigure
     per = [np.concatenate([rng.normal(200, 25, 40), rng.normal(1200, 70, 40)]) for _ in range(4)]
     gh = GridPlot(HistogramCell(per, thresholds=[700.0] * 4), grid_shape=(2, 2), size="2x2").show(display=False)
-    assert gh.cell_renderer.focus_kind == "hist" and PLOT_KIND_BY_KEY["hist"].cls is HistogramFigure
+    assert gh.cell_renderer.sub_plot_kind == "hist" and PLOT_KIND_BY_KEY["hist"].cls is HistogramFigure
     gh.focus(0)
     assert isinstance(gh._focus_plotter, HistogramFigure), "hist cell -> standalone HistogramFigure"
     gh.unfocus(); plt.close(gh.fig)
-    # an image grid -> Live2DDis (the SAME focus() path, only the cell's focus_kind differs)
+    # an image grid -> Live2DDis (the SAME focus() path, only the cell's sub_plot_kind differs)
     imgs = [rng.random((9, 9)) for _ in range(4)]
     gi = GridPlot(ImageCell(imgs), grid_shape=(2, 2), size="2x2").show(display=False)
-    assert gi.cell_renderer.focus_kind == "2d" and PLOT_KIND_BY_KEY["2d"].cls is Live2DDis
+    assert gi.cell_renderer.sub_plot_kind == "2d" and PLOT_KIND_BY_KEY["2d"].cls is Live2DDis
     gi.focus(1)
     assert isinstance(gi._focus_plotter, Live2DDis), "image cell -> standalone Live2DDis"
     gi.unfocus(); plt.close(gi.fig)
@@ -305,6 +312,369 @@ def test_console_grid_focus_swaps_to_real_panel_lim_sticks_no_bounce():
     finally:
         card.shutdown()
         plt.close("all")
+
+
+def _psf_recipe(n=6):
+    from Zou_lab_control.frontend.live import GridPlot, ImageCell, grid_recipe_from_cells as _rec
+    rng = np.random.default_rng(1)
+    g = GridPlot(ImageCell([np.abs(rng.normal(size=(7, 7))) for _ in range(n)]),
+                 grid_shape=(2, 3)).show(display=False)
+    recipe = _rec(g)
+    plt.close(g.fig)
+    return recipe
+
+
+class _DblClick:
+    dblclick = True
+    button = 1
+    def __init__(self, ax):
+        self.inaxes = ax
+
+
+def test_grid_panel_params_follow_sub_plot_kind():
+    """#4: a grid panel's Setting / Edit param UI is driven by the grid's per-site ``sub_plot_kind`` -- a hist
+    grid shows the hist params (bins/fit/ylog), a 2d (kernel) grid shows the 2d colormap -- resolved by
+    ``PanelCard._param_kind``, NOT a hard-coded ``"grid"`` PANEL_PARAMS entry (which no longer exists)."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import PANEL_PARAMS, PanelCard, PanelConfig
+    ensure_qt_app()
+    assert "grid" not in PANEL_PARAMS, "a grid has NO fixed params -- they come from its sub_plot_kind"
+    for recipe, kind, must_have in ((_grid_recipe(), "hist", "bins"), (_psf_recipe(), "2d", "cmap")):
+        cfg = PanelConfig(kind="grid", row=0, col=0, size="2x2", inputs=["fig_value"], source="value = signal")
+        card = PanelCard(cfg, grid_recipe_provider=lambda _s, _r=recipe: _r)
+        try:
+            card._build_plot(0.0, {})
+            assert card.plotter.sub_plot_kind == kind
+            assert card._param_kind() == kind, f"a {kind} grid drives its {kind} param UI"
+            keys = {d.key for d in PANEL_PARAMS.get(card._param_kind(), ())}
+            assert must_have in keys, f"a {kind} grid exposes the {must_have} param, got {keys}"
+        finally:
+            card.shutdown()
+            plt.close("all")
+
+
+def test_grid_param_edit_while_focused_stays_focused():
+    """#4: adjusting a param while a grid cell is ENLARGED applies to the focus view + persists onto the
+    parked grid, and STAYS zoomed -- it never bounces back to the main grid (the reported revert bug)."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+    ensure_qt_app()
+    recipe = _grid_recipe()
+    cfg = PanelConfig(kind="grid", row=0, col=0, size="2x2", inputs=["fig_value"], source="value = signal")
+    card = PanelCard(cfg, grid_recipe_provider=lambda _s: recipe)
+    try:
+        card._build_plot(0.0, {})
+        grid = card.plotter
+        card._on_grid_canvas_click(_DblClick(grid.site_axes[1]))
+        assert card._grid_focus is not None, "focused into a cell"
+        focus = card.plotter
+        card._set_param("bins", 48)                    # a Setting edit while zoomed
+        assert card._grid_focus is not None, "the param edit MUST NOT revert to the grid"
+        assert card.config.params.get("bins") == 48
+        assert grid.cell_renderer.bins_arg == 48, "the parked grid re-binned so it persists on unfocus"
+        card._set_param("ylog", True)                  # another edit -- still focused
+        assert card._grid_focus is not None and card.plotter is focus
+    finally:
+        card.shutdown()
+        plt.close("all")
+
+
+def test_relim_fixed_freezes_the_current_view():
+    """Flipping relim to ``fixed`` FREEZES the view: fixed_lo/hi seed from the plotter's live limits
+    (``current_lims``), NEVER the blind 0..1 default -- pinning a counts axis / camera clim to 0..1
+    empties the plot (every bar/pixel outside the range), which read as "the enlarged plot died".
+    The view must be pixel-identical across the flip, and a focused grid stays focused."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+    ensure_qt_app()
+    for recipe, kind in ((_grid_recipe(), "hist"), (_psf_recipe(), "2d")):
+        cfg = PanelConfig(kind="grid", row=0, col=0, size="2x2", inputs=["fig_value"], source="value = signal")
+        card = PanelCard(cfg, grid_recipe_provider=lambda _s, _r=recipe: _r)
+        try:
+            card._build_plot(0.0, {})
+            card._on_grid_canvas_click(_DblClick(card.plotter.site_axes[1]))
+            focus = card.plotter
+            before = focus.current_lims()
+            assert before != (0.0, 1.0), f"{kind}: a real view never sits exactly at the 0..1 default"
+            card._set_param("relim", "fixed")
+            assert card._grid_focus is not None and card.plotter is focus, \
+                f"{kind}: the relim flip MUST stay zoomed on the same focus plotter"
+            seeded = (card.config.params.get("fixed_lo"), card.config.params.get("fixed_hi"))
+            assert seeded == before, f"{kind}: fixed seeds the CURRENT view {before}, got {seeded}"
+            assert focus.current_lims() == before, f"{kind}: the view must not move on the flip"
+        finally:
+            card.shutdown()
+            plt.close("all")
+
+
+def test_relim_family_applies_in_place_at_the_plotter_layer():
+    """The relim family (relim / fixed_lo / fixed_hi) is handled by ``BaseLivePlot.apply_param`` for
+    EVERY kind -- the ONE in-place path all surfaces (Setting, Edit tab, a grid's focused cell) route
+    through, so no surface ever needs a teardown/rebuild for a lim edit.  Flipping INTO fixed seeds
+    lo/hi from the CURRENT view (fixed = freeze what you see, never a blind 0..1)."""
+    from Zou_lab_control.frontend.live import panel_plot
+    rng = np.random.default_rng(3)
+    plotters = [
+        panel_plot(np.concatenate([rng.normal(200, 20, 50), rng.normal(900, 50, 50)]),
+                   kind="hist", size="2x2"),
+        panel_plot(np.column_stack([np.repeat(np.arange(6.0), 6), np.tile(np.arange(6.0), 6)]),
+                   rng.uniform(50, 400, 36), kind="2d", size="2x2"),
+    ]
+    for p in plotters:
+        before = p.current_lims()
+        assert p.apply_param("relim", "fixed"), f"{type(p).__name__} handles relim in place"
+        assert (p.fixed_lo, p.fixed_hi) == before, \
+            f"{type(p).__name__}: fixed seeds from the current view {before}"
+        assert p.current_lims() == before, f"{type(p).__name__}: the view must not move on the flip"
+        assert p.apply_param("fixed_hi", before[1] * 2), "fixed_hi lands in place too"
+        assert p.current_lims() == (before[0], before[1] * 2)
+        plt.close(p.fig)
+
+
+def test_pulse_timeline_ignores_the_relim_family():
+    """A pulse timeline's y axis IS the channel-row layout, not a measured quantity: the console
+    pushes the relim family onto EVERY plotter after a rebuild (_apply_display_params), and that
+    push must leave the timeline untouched -- the base relim against the dummy zero data_y would
+    squash every channel row to (-0.1, 0.1) (the adversarial-review critical)."""
+    from Zou_lab_control.frontend.live import build_pulse_preview_plot
+    st = _busy_state()
+    plotter, _c, _r = build_pulse_preview_plot(st, include_always_off=True, size="2x2")
+    before = plotter.ax.get_ylim()
+    plotter.apply_param("relim", "tight")
+    plotter.apply_param("fixed_lo", 0.0)
+    plotter.apply_param("fixed_hi", 1.0)
+    assert plotter.ax.get_ylim() == before, "the relim family is a no-op on a pulse timeline"
+    plt.close(plotter.fig)
+
+
+def test_unfocused_grid_fixed_seeds_from_the_cells_auto_range():
+    """Flipping relim to ``fixed`` on a grid card WITHOUT an enlarged cell seeds lo/hi from the
+    cells' SHARED auto range (GridPlot.current_lims -> GridCell.auto_lims) -- never the base-class
+    0..1 pair a grid's dormant ylim_min/max would give (the adversarial-review major: every
+    thumbnail pinned to 0..1 = clipped to garbage)."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+    ensure_qt_app()
+    recipe = _grid_recipe()
+    cfg = PanelConfig(kind="grid", row=0, col=0, size="2x2", inputs=["fig_value"], source="value = signal")
+    card = PanelCard(cfg, grid_recipe_provider=lambda _s: recipe)
+    try:
+        card._build_plot(0.0, {})
+        auto = card.plotter.cell_renderer.auto_lims()
+        assert auto != (0.0, 1.0), "real data never sits exactly at the 0..1 default"
+        card._set_param("relim", "fixed")
+        seeded = (card.config.params["fixed_lo"], card.config.params["fixed_hi"])
+        assert seeded == auto, f"fixed seeds the cells' shared auto range {auto}, got {seeded}"
+        assert card.plotter.site_axes[0].get_ylim() == auto, \
+            "and the thumbnails freeze AT that range (no visual jump, nothing clipped)"
+    finally:
+        card.shutdown()
+        plt.close("all")
+
+
+def test_zoomed_fixed_flip_reaches_thumbnails_without_typing_lims():
+    """Flipping to ``fixed`` while a cell is ENLARGED and returning WITHOUT typing lo/hi: the seeded
+    freeze (the enlarged view's own lims) must already live on the parked grid's cell state, so the
+    thumbnails come back pinned to the frozen view -- never the 0..1 default (the matrix-agent
+    finding: relim alone was forwarded, the just-seeded lo/hi were not)."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+    ensure_qt_app()
+    recipe = _grid_recipe()
+    cfg = PanelConfig(kind="grid", row=0, col=0, size="2x2", inputs=["fig_value"], source="value = signal")
+    card = PanelCard(cfg, grid_recipe_provider=lambda _s: recipe)
+    try:
+        card._build_plot(0.0, {})
+        grid = card.plotter
+        card._on_grid_canvas_click(_DblClick(grid.site_axes[1]))
+        frozen = card.plotter.current_lims()               # the enlarged view the user is looking at
+        card._set_param("relim", "fixed")                  # flip -- and type NOTHING
+        card._unfocus_grid_cell()
+        assert grid.site_axes[0].get_ylim() == frozen, \
+            f"thumbnails must return pinned to the frozen view {frozen}, got {grid.site_axes[0].get_ylim()}"
+    finally:
+        card.shutdown()
+        plt.close("all")
+
+
+def test_relim_replay_with_unchanged_values_is_not_thumb_dirty():
+    """The console re-pushes the relim family after EVERY grid rebuild (_apply_display_params): an
+    UNCHANGED value must report not-dirty from store_display_param, or every rebuild pays an extra
+    N-cell thumbnail repaint (the adversarial-review perf finding)."""
+    from Zou_lab_control.frontend.live import build_grid_figure
+    g = build_grid_figure(_grid_recipe(), interactions=False, size="2x2", display=False)
+    g.apply_param("relim", "fixed")
+    for key, value in (("relim", "fixed"),
+                       ("fixed_lo", g.cell_renderer.fixed_lo),
+                       ("fixed_hi", g.cell_renderer.fixed_hi)):
+        assert g.store_display_param(key, value) is False, f"unchanged {key} must not dirty the thumbnails"
+    plt.close(g.fig)
+
+
+def test_fixed_lims_reach_the_parked_grid_thumbnails():
+    """A lim edit while a dashboard grid cell is ENLARGED lands on the enlarged view AND is stored on
+    the PARKED grid (the same store -> cell-state -> redraw mechanism cmap/bins use), so returning to
+    the grid shows every thumbnail pinned to the operator's lo/hi -- never 'only the zoom changed'."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+    ensure_qt_app()
+    recipe = _grid_recipe()
+    cfg = PanelConfig(kind="grid", row=0, col=0, size="2x2", inputs=["fig_value"], source="value = signal")
+    card = PanelCard(cfg, grid_recipe_provider=lambda _s: recipe)
+    try:
+        card._build_plot(0.0, {})
+        grid = card.plotter
+        card._on_grid_canvas_click(_DblClick(grid.site_axes[1]))
+        card._set_param("relim", "fixed")                  # the Setting relim combo while zoomed
+        card.apply_fixed_lims(0.0, 120.0)                  # the Setting / Edit lo-hi inputs (ONE path)
+        assert card._grid_focus is not None, "still zoomed"
+        assert card.plotter.current_lims() == (0.0, 120.0)
+        card._unfocus_grid_cell()
+        assert grid.site_axes[0].get_ylim() == (0.0, 120.0), \
+            "back on the grid, the thumbnails carry the pinned count axis"
+    finally:
+        card.shutdown()
+        plt.close("all")
+
+
+def test_dashboard_focus_view_is_display_only():
+    """The Monitor card is DISPLAY-ONLY (no selectors -- every _build_plot branch passes
+    interactions=False): the ENLARGED grid cell on the dashboard follows the SAME rule.  Interactive
+    zoom / region-select lives in the Edit tab's snapshot only."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+    ensure_qt_app()
+    recipe = _grid_recipe()
+    cfg = PanelConfig(kind="grid", row=0, col=0, size="2x2", inputs=["fig_value"], source="value = signal")
+    card = PanelCard(cfg, grid_recipe_provider=lambda _s: recipe)
+    try:
+        card._build_plot(0.0, {})
+        card._on_grid_canvas_click(_DblClick(card.plotter.site_axes[1]))
+        assert card._grid_focus is not None
+        assert list(card.plotter.interaction_handles()) == [], \
+            "the dashboard's enlarged cell carries NO selectors (Monitor cards are display-only)"
+    finally:
+        card.shutdown()
+        plt.close("all")
+
+
+def test_focused_cell_centres_with_equal_stretch():
+    """The enlarged (stock 2x2) cell sits at the CENTRE of the card's plot region: a TOP stretch with the
+    SAME factor (1) as the holder's trailing one splits the spare height evenly (a factor-0 spacer wins
+    nothing and pins the view to the top).  Unfocus removes the top stretch (the grid re-tops)."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+    ensure_qt_app()
+    recipe = _grid_recipe()
+    cfg = PanelConfig(kind="grid", row=0, col=0, size="4x4", inputs=["fig_value"], source="value = signal")
+    card = PanelCard(cfg, grid_recipe_provider=lambda _s: recipe)
+    try:
+        card._build_plot(0.0, {})
+        card._on_grid_canvas_click(_DblClick(card.plotter.site_axes[1]))
+        holder = card.canvas_holder
+        assert holder.itemAt(0).spacerItem() is not None, "focus inserts a TOP stretch"
+        assert holder.stretch(0) == holder.stretch(holder.count() - 1) == 1, \
+            "top and trailing stretch factors MUST match (1) -- equal split = vertical centring"
+        card._unfocus_grid_cell()
+        assert holder.itemAt(0).spacerItem() is None, "unfocus removes the top stretch"
+    finally:
+        card.shutdown()
+        plt.close("all")
+
+
+def test_grid_panel_not_rebuilt_every_tick():
+    """#3 perf: a grid panel is a SNAPSHOT -- a fresh hub tick (no rebuild flag) must NOT re-render all N
+    cells (the "grid drawing is very slow" cause); the plotter object is unchanged across ticks."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+    ensure_qt_app()
+    recipe = _grid_recipe()
+    cfg = PanelConfig(kind="grid", row=0, col=0, size="2x2", inputs=["fig_value"], source="value = signal")
+    card = PanelCard(cfg, grid_recipe_provider=lambda _s: recipe)
+    try:
+        card._build_plot(0.0, {})
+        first = card.plotter
+        assert first is not None
+        card._render(0.0, {})                          # a plain tick, no _force_rebuild
+        card._render(0.0, {})
+        assert card.plotter is first, "a grid is not rebuilt on an ordinary tick (no per-cell re-render)"
+    finally:
+        card.shutdown()
+        plt.close("all")
+
+
+def test_grid_rebuild_while_focused_refocuses_the_same_cell():
+    """A rebuild-class edit made while a grid cell is ENLARGED (a size change tears the plot down) must
+    land back on the SAME enlarged cell after the rebuild -- never silently bounce to the main grid view
+    (#no-focus-bounce).  An EXPLICIT unfocus (double-click) stays unfocused across later rebuilds."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+    ensure_qt_app()
+    recipe = _grid_recipe()
+    cfg = PanelConfig(kind="grid", row=0, col=0, size="2x2", inputs=["fig_value"], source="value = signal")
+    card = PanelCard(cfg, grid_recipe_provider=lambda _s: recipe)
+    try:
+        card._build_plot(0.0, {})
+        card._on_grid_canvas_click(_DblClick(card.plotter.site_axes[3]))
+        assert card._grid_focus is not None and card._grid_focus.k == 3
+        card._on_size("4x4")                    # teardown records the focused index
+        card._build_plot(0.0, {})               # the next tick's rebuild
+        assert card._grid_focus is not None and card._grid_focus.k == 3, \
+            "a size change while zoomed re-focuses the SAME cell (no bounce to the main grid)"
+        assert isinstance(card.plotter, HistogramFigure), "the enlarged view is back (a real hist panel)"
+        # an explicit unfocus must NOT be resurrected by a later rebuild
+        card._on_grid_canvas_click(_DblClick(None))
+        assert card._grid_focus is None
+        card._build_plot(0.0, {})
+        assert card._grid_focus is None, "an explicit unfocus stays unfocused across rebuilds"
+    finally:
+        card.shutdown()
+        plt.close("all")
+
+
+def test_focused_2d_grid_cmap_applies_in_place_no_rebuild():
+    """A cmap edit on a FOCUSED 2d (kernel) grid cell applies IN PLACE on the enlarged Live2DDis (the
+    colorbar hangs off the same artist) -- the focus plotter object is UNCHANGED, so the view never
+    bounces through a rebuild ('jumps back to the main view then recolours', the reported #4)."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+    from Zou_lab_control.frontend.live import Live2DDis
+    ensure_qt_app()
+    recipe = _psf_recipe()
+    cfg = PanelConfig(kind="grid", row=0, col=0, size="2x2", inputs=["fig_value"], source="value = signal")
+    card = PanelCard(cfg, grid_recipe_provider=lambda _s: recipe)
+    try:
+        card._build_plot(0.0, {})
+        card._on_grid_canvas_click(_DblClick(card.plotter.site_axes[0]))
+        focus = card.plotter
+        assert isinstance(focus, Live2DDis)
+        assert focus.apply_param("cmap", "viridis") is True, "Live2DDis handles cmap in place"
+        card._set_param("cmap", "plasma")
+        assert card._grid_focus is not None and card.plotter is focus, \
+            "a cmap edit while zoomed stays on the SAME enlarged plotter (no refocus rebuild)"
+        assert focus.image.get_cmap().name == "plasma"
+        # the parked grid recorded the pick (recipe/params single source) for the unfocus redraw
+        assert card._grid_focus.grid._display_params.get("cmap") == "plasma"
+    finally:
+        card.shutdown()
+        plt.close("all")
+
+
+def test_hist_grid_cells_draw_collections_not_per_bin_patches():
+    """#perf contract: a hist grid cell's bars are PolyCollections (the standalone hist's bar geometry via
+    _update_verts, one artist per population) -- NEVER ax.hist's per-bin Rectangle patches, which made an
+    N-cell grid carry ~N x bins artists and draw far slower than a same-size single plot."""
+    per = [np.random.default_rng(0).normal(0, 1, 80) for _ in range(6)]
+    # interactions=False = the console Monitor card's own path (selectors add their OWN helper
+    # rectangle/cross artists, which are not bin bars -- exclude them from the count).
+    g = SiteHistogramGrid(per, grid_shape=(2, 3), thresholds=[0.0] * 6, bins=30,
+                          interactions=False).show(display=False)
+    try:
+        for ax in g.site_axes:
+            assert len(ax.patches) == 0, "no per-bin Rectangle patches in a grid cell"
+            assert len(ax.collections) >= 1, "the bars are PolyCollection(s)"
+    finally:
+        plt.close(g.fig)
 
 
 def test_no_external_ax_symbol_anywhere():

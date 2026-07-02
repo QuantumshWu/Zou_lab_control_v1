@@ -493,12 +493,10 @@ class FigureViewer(QtWidgets.QWidget):
         # fills the whole right pane and its gravity board reads the real viewport width -> reflows into
         # 2+ columns (vs a frozen-width console that stacks every card in one column).
         self._console_holder = QtWidgets.QVBoxLayout()
-        # The embedded TaskConsole's own tab card carries a downward drop shadow (offset > 0); a zero
-        # bottom margin clips that soft bottom bleed so the card reads as CUT at the base (unlike the
-        # standalone console, whose window chrome leaves room below).  Reserve EXACTLY the shadow's
-        # bleed extent below -- the SAME single source the Info column reserves ABOVE its tab card
-        # (fluent_tab_shadow_margin), so the two can never drift out of step.
-        self._console_holder.setContentsMargins(0, 0, 0, fluent_tab_shadow_margin())
+        # The embedded TaskConsole reserves its OWN tab-card drop-shadow bleed inside its root layout (a host
+        # margin here sits OUTSIDE the console and cannot un-clip a shadow already clipped inside its tree --
+        # that was the real root cause of the "bottom shadow cut off"), so the holder itself adds no margin.
+        self._console_holder.setContentsMargins(0, 0, 0, 0)
         holder_host = QtWidgets.QWidget()
         holder_host.setStyleSheet("background: transparent;")
         holder_host.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
@@ -752,10 +750,15 @@ class FigureViewer(QtWidgets.QWidget):
             self._add_info_row("provenance", "(none recorded)")
 
         # --- Flow tab: the upstream DAG of how the data was produced (raw / measurement / processor
-        # chain, branching upward).  Read off ``provenance['flow_graph']``; absent (old npz / no binding)
-        # -> the view shows its own muted placeholder, never a crash.
+        # chain, branching upward).  Read off ``provenance['flow_graph']``; when it is ABSENT (an old npz
+        # that predates flow_graph, or a figure saved with no producing node) synthesize the raw-data->plot
+        # fallback from the ONE source (figure_capture.raw_data_flow_graph) -- so the Flow tab ALWAYS draws
+        # at least ``raw data -> plot`` and NEVER shows a "no data-flow" message.
         provenance = saved.info.get("provenance")
         flow = provenance.get("flow_graph") if isinstance(provenance, Mapping) else None
+        if not flow:
+            from Zou_lab_control.neutral_atom.operations.figure_capture import raw_data_flow_graph
+            flow = raw_data_flow_graph()
         self.flow_view.set_graph(flow)
 
         # --- Raw tab: the WHOLE dict verbatim (every key the npz stored), multi-line + scrollable ---

@@ -259,7 +259,7 @@ def test_grid_save_stores_a_faithful_figure_recipe(tmp_path):
         saved = load_figure(out["data"])
         assert saved.kind == "grid"
         recipe = saved.figure_recipe
-        assert isinstance(recipe, dict) and recipe.get("kind") == "grid" and recipe.get("cell") == "hist"
+        assert isinstance(recipe, dict) and recipe.get("kind") == "grid" and recipe.get("sub_plot_kind") == "hist"
         assert len(recipe["per_cell"]) == 6
         assert recipe["thresholds"] == [700.0] * 6
         assert saved.compatible_kinds() == ["grid"], "structured grid figure: only its recipe kind"
@@ -294,7 +294,7 @@ def test_grid_recipe_reopens_as_faithful_grid(tmp_path):
     plt.close(psf_grid.fig)
     saved2 = na.load_figure(out2["data"])
     try:
-        assert saved2.kind == "grid" and saved2.figure_recipe["cell"] == "image"
+        assert saved2.kind == "grid" and saved2.figure_recipe["sub_plot_kind"] == "2d"
         reopened2 = saved2.plot()
         assert isinstance(reopened2.grid, GridPlot) and reopened2.grid.n_cells == 6
     finally:
@@ -322,7 +322,7 @@ def test_focused_dis_grid_save_reopens_as_a_faithful_hist_grid(tmp_path):
     try:
         assert saved.kind == "grid", "a dis grid saves as kind='grid'"
         recipe = saved.figure_recipe
-        assert recipe["cell"] == "hist", "the recipe's cell family is hist (drives the reopen -> NOT sites)"
+        assert recipe["sub_plot_kind"] == "hist", "the recipe's sub_plot_kind is hist (drives the reopen -> NOT sites)"
         assert recipe["focused_cell_index"] == 3, "the focused cell index is recorded"
         assert recipe["display_params"].get("bins") == 48 and recipe["display_params"].get("ylog") is True
         assert saved.compatible_kinds() == ["grid"], "a structured grid figure offers only its recipe kind"

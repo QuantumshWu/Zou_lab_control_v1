@@ -2069,8 +2069,18 @@ class FluentTabWidget(QtWidgets.QTabWidget):
         )
         add_fluent_shadow(self, blur=_TAB_SHADOW_BLUR, alpha=_TAB_SHADOW_ALPHA, offset=_TAB_SHADOW_OFFSET)
         self._overflow_btn = self._build_overflow_button()
-        self.setCornerWidget(self._overflow_btn, QtCore.Qt.TopRightCorner)
-        self._overflow_btn.hide()
+        # The corner widget sits FLUSH at the widget's right edge, so the button's rounded hover
+        # background used to be CLIPPED on the right.  Wrap it in a transparent holder whose right
+        # margin reserves the clearance, so the full hover pill is visible.
+        corner = QtWidgets.QWidget(self)
+        corner.setStyleSheet("background: transparent;")
+        corner_lay = QtWidgets.QHBoxLayout(corner)
+        corner_lay.setContentsMargins(0, 0, scaled_px(6, minimum=4), 0)
+        corner_lay.setSpacing(0)
+        corner_lay.addWidget(self._overflow_btn)
+        self._overflow_corner = corner
+        self.setCornerWidget(corner, QtCore.Qt.TopRightCorner)
+        corner.hide()
         self.currentChanged.connect(lambda _i: self._update_overflow())
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
@@ -2133,10 +2143,11 @@ class FluentTabWidget(QtWidgets.QTabWidget):
     def _update_overflow(self) -> None:
         """Show the overflow ``...`` button only while the tabs do not all fit.  Run on a
         0-ms timer after a resize / tab change so the tab bar has been re-laid-out first
-        (its width is stale inside the resize/insert event itself)."""
-        btn = getattr(self, "_overflow_btn", None)
-        if btn is not None:
-            btn.setVisible(self._tabs_overflow())
+        (its width is stale inside the resize/insert event itself).  Visibility toggles the
+        HOLDER (the margin-bearing corner widget), so a hidden overflow reserves no corner space."""
+        corner = getattr(self, "_overflow_corner", None)
+        if corner is not None:
+            corner.setVisible(self._tabs_overflow())
 
     def _schedule_overflow_update(self) -> None:
         QtCore.QTimer.singleShot(0, self._update_overflow)

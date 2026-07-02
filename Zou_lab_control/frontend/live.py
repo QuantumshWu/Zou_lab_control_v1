@@ -208,7 +208,9 @@ _IMAGE_SPLIT = ([0.75, 0.1, 0.1], [0.025, 0.025])  # 2D image | side dist | colo
 # panel's of the same size to the pixel (the same three-region L|data|R / B|data|T layout), and the grid
 # thumbnail's padding matches every other kind's card instead of looking visibly different (#5).
 _SITE_COL_GAP_PX = 12
-_SITE_ROW_GAP_PX = 16
+# The row gap must clear each cell's small TITLE (the site index, above the axes, #5) so a lower row's
+# title never crowds the row above -- wider than the column gap for exactly that title band.
+_SITE_ROW_GAP_PX = 26
 _SITE_MAX_COLS = 7                        # column cap (pulse-style width cap); extra sites wrap to rows
 
 
@@ -678,6 +680,14 @@ class BaseLivePlot:
             self.ylim_min, self.ylim_max = self._mode_target(min_y, max_y)
         return old != (self.ylim_min, self.ylim_max)
 
+    def current_lims(self) -> tuple[float, float]:
+        """The (lo, hi) the view shows NOW -- the ``ylim_min``/``ylim_max`` pair EVERY relim path
+        maintains (1D/monitor y-axis, 2D/sitemap colour-limit alike).  Read when the Setting flips
+        relim to ``fixed``: fixed FREEZES the current view, so its lo/hi seed from here instead of
+        a blind 0..1 default that would blank the plot (bars/image all outside the pinned range).
+        HistogramFigure overrides (its count axis is set directly on the axes, not via ylim_*)."""
+        return float(self.ylim_min), float(self.ylim_max)
+
     def apply_relim_now(self) -> None:
         """Force the axis limits to the current relim_mode and redraw immediately.
         Called when the mode toggles (Setting combo) -- a switch must take effect
@@ -694,10 +704,28 @@ class BaseLivePlot:
 
     def apply_param(self, key: str, value) -> bool:
         """Apply a DISPLAY-ONLY plot knob IN PLACE on the existing axes (no figure/canvas rebuild) and
-        return True if handled.  The default handles nothing, so the caller falls back to a teardown +
-        re-render.  A subclass overrides this for knobs that change only the curve/scale -- NOT the
-        layout -- so toggling them never reflows the Qt holder and visibly resizes the plot
-        (#dis-resize).  This is the in-place path ``relim`` already uses, generalized."""
+        return True if handled.  The RELIM FAMILY (``relim`` / ``fixed_lo`` / ``fixed_hi``) is handled
+        HERE for every kind -- it maps onto the one relim path every plot already maintains
+        (``relim_mode`` + :meth:`apply_relim_now`), so a lim edit from ANY surface (Setting popup,
+        Edit tab, a grid's focused cell) lands in place and never falls back to a teardown/rebuild.
+        Subclass overrides handle their own knobs and DELEGATE unknown keys back here (super()), so
+        the family works uniformly.  Anything else returns False -> the caller may rebuild."""
+        if str(key) == "relim":
+            if str(value) == "fixed" and getattr(self, "relim_mode", "") != "fixed":
+                # fixed FREEZES the current view: seed lo/hi from what the plot shows NOW, never
+                # a stale/default 0..1 pair (which empties a counts axis / camera clim).  Seeded
+                # HERE so EVERY surface -- Setting, Edit tab, a grid's focused cell -- agrees.
+                self.fixed_lo, self.fixed_hi = self.current_lims()
+            self.relim_mode = str(value)
+            self.apply_relim_now()
+            self.draw()
+            return True
+        if str(key) in ("fixed_lo", "fixed_hi"):
+            setattr(self, str(key), float(value))
+            if getattr(self, "relim_mode", "") == "fixed":
+                self.apply_relim_now()
+                self.draw()
+            return True
         return False
 
     def after_plot(self):
@@ -1039,6 +1067,17 @@ class Live2DDis(BaseLivePlot):
         self.line_l.set_ydata([self.ylim_min, self.ylim_min])
         self.line_h.set_ydata([self.ylim_max, self.ylim_max])
 
+    def apply_param(self, key: str, value) -> bool:
+        """The colormap is DISPLAY-ONLY: swap it on the EXISTING image in place (the colorbar hangs off
+        the same artist, so it recolours with it) and redraw -- no figure/canvas rebuild, so a cmap change
+        never flashes/resizes the panel (#dis-resize) and a FOCUSED grid cell's enlarged 2d view recolours
+        while STAYING zoomed (never bouncing through a rebuild).  Returns True if handled."""
+        if str(key) in ("cmap", "colorset"):
+            self.image.set_cmap(str(value))
+            self.draw()
+            return True
+        return super().apply_param(key, value)   # the relim family lands in place via the base class
+
     def update_core(self) -> None:
         self.grid = self.fill_grid()
         self.image.set_array(self.grid)
@@ -1373,7 +1412,7 @@ def pulse_plot_channels(
 #
 # The geometry below is NOT a public knob: hosts pick a kind and a size preset,
 # nothing else -- the visual language is owned here.
-PANEL_SIZES = ("1x2", "2x2", "1x4", "2x4", "4x4")
+PANEL_SIZES = ("1x2", "2x2", "4x2", "1x4", "2x4", "4x4")
 PANEL_UNIT_PX = (180, 240)     # (height, width) of one half-unit of the stock region
 PANEL_MARGINS_PX = (STOCK_MARGINS_PX[0], 86, 80, TITLE_SLOT_PX)   # stock margins (L, R, B, T).
                                          # L = STOCK_MARGINS_PX[0] (confocal's left, 110) and
@@ -1457,34 +1496,29 @@ def _site_grid_geometry(size: str = "2x2") -> tuple[tuple[int, int], int, int, t
     return data_px, col_gap, row_gap, (l, r, b, t)
 
 
-# The 4-cell THRESHOLD a grid dimension crosses to earn a double-size half-unit: a grid with FEW rows /
-# columns (< this) opens compact (2 half-units on that axis = a stock 2x2 side), a grid with MANY (>=)
-# opens double (4 half-units = a 4x4 side).  The ONE source for the "when does a grid need a bigger side"
-# rule, so optimal_grid_size and its contract test read the same boundary.
-_GRID_DOUBLE_SIZE_THRESHOLD = 4
+# The cell-count THRESHOLDS a grid dimension crosses to earn a double-size half-unit, PER AXIS: an axis
+# with UP TO its threshold opens compact (2 half-units = a stock 2x2 side), MORE opens double (4 = a 4x4
+# side).  The column threshold is one higher than the row threshold because a cell is WIDER than tall
+# (PANEL_UNIT_PX), so more columns fit legibly before the grid needs the double width.  Each axis is
+# judged INDEPENDENTLY (a tall 5x3 grid opens 4x2, never forced square).  The ONE source for the "when
+# does a grid need a bigger side" rule, shared with the contract test.
+_GRID_DOUBLE_ROWS_THRESHOLD = 4    # > 4 rows    -> the double height (4 half-units)
+_GRID_DOUBLE_COLS_THRESHOLD = 5    # > 5 columns -> the double width  (4 half-units)
 
 
 def optimal_grid_size(nrows: int, ncols: int) -> str:
     """The ``PANEL_SIZES`` preset a per-site grid of ``nrows`` x ``ncols`` cells defaults to -- the grid
-    counterpart of :func:`optimal_pulse_size`.  The rule is the 4-cell boundary (:data:`_GRID_DOUBLE_SIZE_THRESHOLD`)
-    per axis: a dimension with ``>= 4`` cells earns the DOUBLE half-unit (4) so its cells stay legible, a
-    smaller dimension gets the compact half-unit (2).  The resulting ``(rows_half, cols_half)`` is mapped to
-    the NEAREST available ``PANEL_SIZES`` preset (by half-unit distance), so a wide 2x5 grid opens ``2x4``,
-    a tall 5x2 opens ``4x2``-nearest (``2x4``'s transpose is not a preset -> the closest ``4x4``), and a big
-    5x5 opens ``4x4``.  ONE default-size source: the grid factories and the reopen/seed paths all call it, so
-    a saved grid with no recorded ``panel_size`` and a fresh grid pick the same preset."""
-
-    def _half(n: int) -> int:
-        return _GRID_DOUBLE_SIZE_THRESHOLD if int(n) >= _GRID_DOUBLE_SIZE_THRESHOLD else 2
-
-    want = (_half(nrows), _half(ncols))
-    # Map to the NEAREST real preset by half-unit distance (PANEL_SIZES is a fixed curated set, e.g. no
-    # "4x2"), preferring the larger preset on a tie so cells never get squeezed below the wanted side.
-    def _score(size: str) -> tuple[int, int]:
-        rh, ch = panel_size_cells(size)
-        return (abs(rh - want[0]) + abs(ch - want[1]), -(rh * ch))
-
-    return min(PANEL_SIZES, key=_score)
+    counterpart of :func:`optimal_pulse_size`.  EACH axis is judged INDEPENDENTLY against its own
+    boundary (:data:`_GRID_DOUBLE_ROWS_THRESHOLD` rows / :data:`_GRID_DOUBLE_COLS_THRESHOLD` columns):
+    up to the boundary gets the compact half-unit (2), more gets the double (4) -- rows and columns are
+    never coupled, so a tall 5x3 grid opens ``4x2`` (tall), a wide 3x6 opens ``2x4`` (wide), a 5x7 opens
+    ``4x4``, and a 4x5 stays the compact ``2x2``.  Every {2,4}^2 combination is a real ``PANEL_SIZES``
+    preset, so the result maps directly (no nearest-preset snap).  ONE default-size source: the grid
+    factories and the reopen/seed paths all call it, so a saved grid with no recorded ``panel_size``
+    and a fresh grid pick the same preset."""
+    rows_half = 4 if int(nrows) > _GRID_DOUBLE_ROWS_THRESHOLD else 2
+    cols_half = 4 if int(ncols) > _GRID_DOUBLE_COLS_THRESHOLD else 2
+    return f"{rows_half}x{cols_half}"
 
 
 # The readability floor a pulse timeline needs in the size-preset DATA region: enough px PER ROW that a
@@ -1926,6 +1960,12 @@ class PulseSequenceFigure(BaseLivePlot):
     """Filled-rectangle pulse timeline for sequencer/verilog inspection."""
 
     plot_type = "pulse"
+
+    def apply_relim_now(self) -> None:
+        """A pulse timeline has NO dependent-axis relim: its y axis IS the channel-row layout
+        (set once by init_core), not a measured quantity.  The base implementation would relim
+        against the dummy zero data_y and squash every channel row to (-0.1, 0.1) -- so the relim
+        family's apply (pushed uniformly by the console's _apply_lim_to_plotter) is a no-op here."""
 
     def __init__(
         self,
@@ -2447,6 +2487,13 @@ class HistogramFigure(BaseLivePlot):
         (:meth:`_apply_count_yscale`)."""
         self.ax.set_xlim(self.bins[0], self.bins[-1])
 
+    def current_lims(self) -> tuple[float, float]:
+        """The count (y) axis range the view shows NOW.  A histogram sets its count axis directly on
+        the axes (:meth:`_apply_count_yscale`), not via the base ``ylim_min``/``ylim_max`` pair -- so
+        the fixed-mode seed reads the live axis instead (same semantics: fixed freezes this view)."""
+        lo, hi = self.ax.get_ylim()
+        return float(lo), float(hi)
+
     def apply_relim_now(self) -> None:
         """A histogram's relim controls the COUNT (y) axis -- the measured quantity, like a 1D plot's
         signal axis, NOT the value/binning axis: re-apply the tight/normal/fixed count range NOW (the
@@ -2466,7 +2513,8 @@ class HistogramFigure(BaseLivePlot):
         elif key == "bins":
             self.bins_arg = int(value)               # re-bin in place: update_core refills the SAME
         else:                                        # PolyCollection (set_verts) -- no figure rebuild,
-            return False                             # so changing bins never flashes/resizes the dis
+            # not a histogram knob -> the base class (the relim family in place)
+            return super().apply_param(key, value)
         self.update_core()
         self.draw()
         return True
@@ -2908,21 +2956,47 @@ class GridCell:
     DataFigure plumbing); the cell only knows how to DRAW one panel and what its
     threshold/DataFigure are.  ``draw(ax, k)`` draws the small grid THUMBNAIL; the
     ENLARGED focus view is a STANDALONE ``panel_plot`` of the cell's own plot KIND
-    (``focus_kind`` + :meth:`focus_data`), never a hand-rolled copy -- which is
+    (``sub_plot_kind`` + :meth:`focus_data`), never a hand-rolled copy -- which is
     exactly why the focus-zoom is plot-type-agnostic.
 
-    A subclass declares which ``PLOT_KINDS`` key its enlarged view is
-    (``focus_kind`` -- ``"hist"`` for a distribution cell, ``"2d"`` for an image
+    A subclass declares which ``PLOT_KINDS`` key its per-site plot is
+    (``sub_plot_kind`` -- ``"hist"`` for a distribution cell, ``"2d"`` for an image
     cell) and supplies that cell's data as ``panel_plot`` kwargs (:meth:`focus_data`).
     :meth:`GridPlot.build_focus_plotter` then dispatches through the ONE
-    ``PLOT_KIND_BY_KEY`` table, so a NEW cell family adds ONE ``focus_kind`` +
+    ``PLOT_KIND_BY_KEY`` table, so a NEW cell family adds ONE ``sub_plot_kind`` +
     ``focus_data`` (never a bespoke figure) -- the SAME plot the standalone panel of
     that kind uses, so its lim / fit / threshold-drag all work on the standard path."""
 
     n_cells: int = 0
-    #: The ``PLOT_KINDS`` key of this cell's ENLARGED (focused) standalone view -- the SINGLE source the
-    #: focus-swap dispatches on (never a hard-coded class).  Subclasses set it ("hist" / "2d" / ...).
-    focus_kind: str = "hist"
+    #: The ``PLOT_KINDS`` key of this cell's PER-SITE plot -- the SINGLE source that (a) selects the cell
+    #: class (``GRID_CELL_BY_KIND``), (b) dispatches the focus-zoom to that kind's standalone panel, and
+    #: (c) drives which PANEL_PARAMS the grid panel's Setting/Edit UI shows.  Subclasses set it
+    #: ("hist" / "2d" / ...).  It is the grid's ``sub_plot_kind`` -- ONE declaration, no hard-coded class.
+    sub_plot_kind: str = "hist"
+    #: The operator's lim state for every cell thumbnail's DEPENDENT axis (a hist cell's count axis, an
+    #: image cell's colour scale) -- the SAME relim family the standalone kinds keep (``relim_mode`` /
+    #: ``fixed_lo`` / ``fixed_hi``), fed by ``GridPlot.store_display_param`` exactly like ``bins``/``cmap``
+    #: are.  So a lim edit reaches the THUMBNAILS through the one store -> cell-state -> redraw mechanism
+    #: every display knob uses -- never "only the enlarged view changed".  ``fixed`` pins every cell to
+    #: the operator's lo/hi; any other mode keeps the cell's own auto range (a static thumbnail has no
+    #: dead-band autoscaler to re-run).
+    relim_mode: str = "tight"
+    fixed_lo: float = 0.0
+    fixed_hi: float = 1.0
+
+    def thumb_lims(self, auto_lo: float, auto_hi: float) -> tuple[float, float]:
+        """The thumbnail's dependent-axis range: the operator's pinned lo/hi in ``fixed`` mode, else the
+        cell's own auto range -- the ONE place a cell's draw asks, so every cell family honours fixed."""
+        if self.relim_mode == "fixed":
+            return float(self.fixed_lo), float(self.fixed_hi)
+        return float(auto_lo), float(auto_hi)
+
+    def auto_lims(self) -> tuple[float, float]:
+        """The cells' SHARED auto range for the dependent axis -- what the grid 'shows now' as one
+        number pair (an image family already keeps ONE colour scale; a distribution family's is the
+        tallest cell's count axis).  This is the grid's ``current_lims`` -- the seed when the operator
+        flips relim to ``fixed`` without an enlarged cell (fixed freezes what you see, never 0..1)."""
+        raise NotImplementedError
 
     def prepare(self) -> None:
         """Compute any shared state (e.g. common histogram bin edges) once."""
@@ -2930,7 +3004,7 @@ class GridCell:
     def draw(self, ax, k: int):
         """Draw the THUMBNAIL of cell ``k`` into ``ax`` -- the compact grid-cell view (a corner tag, hidden
         axes; the SHAPE is the point).  The ENLARGED focus view is a STANDALONE ``panel_plot`` of this cell's
-        :data:`focus_kind`, built from :meth:`focus_data`, NOT a detail flag on this draw.  Return the cell's
+        :data:`sub_plot_kind`, built from :meth:`focus_data`, NOT a detail flag on this draw.  Return the cell's
         draggable threshold line or ``None``."""
         raise NotImplementedError
 
@@ -2946,11 +3020,11 @@ class GridCell:
 
     def focus_data(self, k: int, *, display_params: Mapping[str, Any] | None = None) -> dict:
         """The ``panel_plot`` args for the STANDALONE enlarged view of cell ``k``: ``{"data_x": ..., "data_y":
-        ..., ...kind-specific kwargs...}`` merged into ``panel_plot(kind=self.focus_kind, size=..., **here)``
+        ..., ...kind-specific kwargs...}`` merged into ``panel_plot(kind=self.sub_plot_kind, size=..., **here)``
         by :meth:`GridPlot.build_focus_plotter`.  A distribution cell returns its sample vector + bins / fit /
         threshold; an image cell returns the pixel-coordinate scatter + cmap.  ``display_params`` are the
         grid's live display knobs (bins / fit / ylog / cmap) folded in, so a Setting change reaches the
-        enlarged cell.  Because the result is a REAL standalone ``panel_plot`` of ``focus_kind``, the enlarged
+        enlarged cell.  Because the result is a REAL standalone ``panel_plot`` of ``sub_plot_kind``, the enlarged
         cell carries that kind's full x/y axes, draggable threshold, fit and standard relim -- no bespoke code."""
         raise NotImplementedError
 
@@ -2962,7 +3036,7 @@ class HistogramCell(GridCell):
     colours dark/bright populations; ``thresholds`` draws a draggable cut;
     ``site_fidelities`` annotates each cell."""
 
-    focus_kind = "hist"          # the enlarged cell is a standalone ``hist`` panel (HistogramFigure)
+    sub_plot_kind = "hist"       # each cell is a ``hist`` per-site plot (enlarged -> a standalone HistogramFigure)
 
     def __init__(self, per_site_values, *, occupied=None, thresholds=None,
                  site_fidelities=None, bins: int = 36, labels: Sequence[str] = ("Signal", "Shots")):
@@ -2994,36 +3068,64 @@ class HistogramCell(GridCell):
         self.edges = np.linspace(self.x_lo, self.x_hi, self.bins_arg + 1)
 
     def _tag_text(self, k: int) -> str:
+        """The per-cell TITLE text -- the site index (+ its fidelity when known).  It is placed in the
+        cell's small axes title ABOVE the plot (never inside the data area), so the histogram stays clean."""
         fids = self.site_fidelities
-        return f"s{k}" if fids is None or not np.isfinite(fids[k]) else f"s{k}\n{fids[k] * 100:.0f}%"
+        return f"s{k}" if fids is None or not np.isfinite(fids[k]) else f"s{k}  {fids[k] * 100:.0f}%"
 
     def draw(self, ax, k: int):
         """The compact grid THUMBNAIL of cell ``k`` (corner tag, hidden counts axis; the SHAPE is the
-        point).  The enlarged focus view is a standalone ``hist`` panel (:class:`HistogramFigure`) -- see :meth:`focus_data`."""
+        point).  The bars are ONE filled :class:`PolyCollection` per population -- the SAME bar geometry
+        the standalone hist builds via :func:`_update_verts` (single source) -- NEVER ``ax.hist``, whose
+        per-bin ``Rectangle`` patches made an N-cell grid carry ~N x bins artists and drew visibly slower
+        than a same-size single plot (#perf: 16 cells x 36 bins = 576 patches -> 32 collections).  The
+        enlarged focus view is a standalone ``hist`` panel (:class:`HistogramFigure`) -- see :meth:`focus_data`."""
         if self.edges is None:
             self.prepare()
         edges = self.edges
         v = self.values[k]
         v = v[np.isfinite(v)]
+
+        def _bars(counts, color):
+            verts = np.empty((len(counts), 4, 2), dtype=float)
+            _update_verts(edges, counts, verts, mode="vertical")
+            ax.add_collection(PolyCollection(verts, facecolors=color, edgecolors="none"))
+
+        counts_all = np.histogram(v, bins=edges)[0].astype(float) if v.size else np.zeros(self.bins_arg)
         occ = self.occupied
-        if occ is not None and occ[k].size == self.values[k].size:
+        if occ is not None and occ[k].size == self.values[k].size and v.size:
             mask = np.asarray(occ[k], dtype=bool)[np.isfinite(self.values[k])]
-            dark, bright = v[~mask], v[mask]
-            if dark.size or bright.size:
-                ax.hist([dark, bright], bins=edges, stacked=True, color=[PALETTE["dark"], PALETTE["bright"]], edgecolor="none")
+            dark = v[~mask]
+            dark_counts = (np.histogram(dark, bins=edges)[0].astype(float) if dark.size
+                           else np.zeros(len(edges) - 1))
+            # The stacked dark/bright look with TWO collections: the full bar in the bright colour,
+            # the dark portion overdrawn from zero -- per bin the top segment (dark..total) reads bright,
+            # exactly the ax.hist(stacked=True) rendering.
+            _bars(counts_all, PALETTE["bright"])
+            _bars(dark_counts, PALETTE["dark"])
         elif v.size:
-            ax.hist(v, bins=edges, color=PALETTE["hist_fill"], edgecolor="none")
-        self.cell_counts[k] = np.histogram(v, bins=edges)[0].astype(float) if v.size else np.zeros(self.bins_arg)
+            _bars(counts_all, PALETTE["hist_fill"])
+        self.cell_counts[k] = counts_all
         line = None
         if self.thresholds is not None and np.isfinite(self.thresholds[k]):
             line = ax.axvline(float(self.thresholds[k]), **threshold_line_kwargs(1.4))
         ax.set_xlim(self.x_lo, self.x_hi)
-        top = ax.get_ylim()[1]
-        ax.set_ylim(0, top * 1.45 if top > 0 else 1.0)   # headroom so the tag clears the bars
-        ax.text(0.06, 0.95, self._tag_text(k), transform=ax.transAxes, ha="left", va="top",
-                fontsize=small_fontsize(), color=PALETTE["annotation"], linespacing=0.92)
-        ax.tick_params(labelsize=tick_fontsize(), length=2)
-        ax.set_yticklabels([])                   # counts scale varies per cell; shape is the point
+        # collections do not autoscale -- set the count axis from the binned data directly (cheaper too);
+        # in ``fixed`` mode the operator's pinned lo/hi win (thumb_lims -- the SAME relim family the
+        # enlarged view honours, so a lim edit changes thumbnails AND zoom together, like cmap/bins do)
+        top = float(counts_all.max()) if counts_all.size else 0.0
+        ax.set_ylim(*self.thumb_lims(0.0, top * 1.08 if top > 0 else 1.0))
+        # A THUMBNAIL keeps few ticks (the standalone hist uses nbins=5; a compact cell needs less):
+        # every tick costs a Text layout on EVERY draw, and with N cells that tick work dominated the
+        # grid's first render (#perf) -- fewer ticks = proportionally less _update_ticks/text-metrics.
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=3, prune="lower"))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=3))
+        # The site index (+ fidelity) is the cell's small TITLE, ABOVE the axes -- NOT text inside the data
+        # area (#5) -- through the ONE title mechanism (apply_title), just at small_fontsize().
+        apply_title(ax, self._tag_text(k), size=small_fontsize(), pad=1.5)
+        # labelleft=False (NOT set_yticklabels([]) -- that would instantiate every major tick's Text,
+        # which dominated the N-cell build time, #perf): counts scale varies per cell; shape is the point.
+        ax.tick_params(labelsize=tick_fontsize(), length=2, labelleft=False)
         self.threshold_lines[k] = line           # grid line, kept for per-cell drag
         return line
 
@@ -3044,6 +3146,18 @@ class HistogramCell(GridCell):
         ylabel = self.labels[1] if len(self.labels) > 1 else "Shots"
         return DataFigure(fig=fig, ax=ax, data_x=centers, data_y=self.cell_counts[k],
                           labels=(self.labels[0], ylabel), name=f"site{k}")
+
+    def auto_lims(self) -> tuple[float, float]:
+        """The tallest cell's count-axis range (same 8% headroom the thumbnail draw applies) --
+        the distribution grid's shared 'what you see now' pair."""
+        if self.edges is None:
+            self.prepare()
+        top = 0.0
+        for v in self.values:
+            v = v[np.isfinite(v)]
+            if v.size:
+                top = max(top, float(np.histogram(v, bins=self.edges)[0].max()))
+        return 0.0, top * 1.08 if top > 0 else 1.0
 
     def classify(self, k: int, values=None) -> np.ndarray:
         vals = self.values[k] if values is None else np.asarray(values, dtype=float)
@@ -3105,14 +3219,18 @@ class ImageCell(GridCell):
     cut, so it contributes the zoom/pan/area/cross selectors but no draggable threshold
     line -- exactly the ``Image2DCell`` the :class:`GridCell` docstring reserves."""
 
-    focus_kind = "2d"            # the enlarged cell is a standalone ``2d`` panel (Live2DDis)
+    sub_plot_kind = "2d"         # each cell is a ``2d`` per-site plot (enlarged -> a standalone Live2DDis)
 
-    def __init__(self, images, *, labels: Sequence[str] = ("x (px)", "y (px)")):
+    def __init__(self, images, *, labels: Sequence[str] = ("x (px)", "y (px)"), cmap: str | None = None):
         self.images = [np.asarray(im, dtype=float) for im in images]
         self.n_cells = len(self.images)
         if self.n_cells == 0:
             raise ValueError("images must contain at least one cell.")
         self.labels = tuple(labels)
+        # The colormap the thumbnails + the enlarged cell draw with -- the grid's ``cmap`` display param
+        # (PANEL_PARAMS["2d"]) flows here so a 2d grid's Setting colormap chooser recolours the cells (a
+        # hist grid has no cmap).  ``None`` = the camera default (the single PALETTE source).
+        self.cmap = str(cmap) if cmap else PALETTE["cmap_camera"]
         self.vmax = 1.0
 
     def prepare(self) -> None:
@@ -3121,18 +3239,21 @@ class ImageCell(GridCell):
         hi = float(np.nanmax(pooled)) if pooled.size else 1.0
         self.vmax = hi if hi > 0 else 1.0   # one shared colour scale -> cells comparable
 
+    def auto_lims(self) -> tuple[float, float]:
+        """The ONE shared colour scale every cell already draws with -- the image grid's
+        'what you see now' pair (exact, since the family keeps a single scale by design)."""
+        return 0.0, float(self.vmax)
+
     def draw(self, ax, k: int):
-        """The compact grid THUMBNAIL of kernel cell ``k`` (a corner tag, no ticks; the kernel SHAPE is the
-        point).  The enlarged focus view is a standalone ``2d`` panel (:class:`Live2DDis`) -- see :meth:`focus_data`."""
-        ax.imshow(self.images[k], origin="lower", cmap=PALETTE["cmap_camera"],
-                  vmin=0.0, vmax=self.vmax, aspect="equal")
-        # The tag sits ON the image, so a plain dark label vanishes on the dark corner -- draw it light (the
-        # "label on a coloured fill" token) with a dark stroke so it reads on ANY grayscale pixel (dark
-        # corner OR a bright lobe that reaches the corner).
-        import matplotlib.patheffects as pe
-        txt = ax.text(0.06, 0.95, f"s{k}", transform=ax.transAxes, ha="left", va="top",
-                      fontsize=small_fontsize(), color=PALETTE["pulse_name"], linespacing=0.92)
-        txt.set_path_effects([pe.withStroke(linewidth=1.4, foreground=PALETTE["annotation"])])
+        """The compact grid THUMBNAIL of kernel cell ``k`` (no ticks; the kernel SHAPE is the point).  The
+        site index goes in the cell's small TITLE (above the axes), NOT inside the image (#5).  The enlarged
+        focus view is a standalone ``2d`` panel (:class:`Live2DDis`) -- see :meth:`focus_data`."""
+        # one shared colour scale keeps cells comparable; in ``fixed`` mode the operator's pinned
+        # lo/hi win (thumb_lims -- the SAME relim family the enlarged view honours, like cmap)
+        vmin, vmax = self.thumb_lims(0.0, self.vmax)
+        ax.imshow(self.images[k], origin="lower", cmap=self.cmap,
+                  vmin=vmin, vmax=vmax, aspect="equal")
+        apply_title(ax, f"s{k}", size=small_fontsize(), pad=1.5)
         ax.set_xticks([])
         ax.set_yticks([])
         return None
@@ -3158,7 +3279,7 @@ class ImageCell(GridCell):
         ny, nx = im.shape
         xx, yy = np.meshgrid(np.arange(nx, dtype=float), np.arange(ny, dtype=float))
         data_x = np.column_stack([xx.ravel(), yy.ravel()])
-        cmap = str(params.get("cmap") or params.get("colorset") or PALETTE["cmap_camera"])
+        cmap = str(params.get("cmap") or params.get("colorset") or self.cmap)
         return {
             "data_x": data_x,
             "data_y": im.ravel(),
@@ -3252,6 +3373,10 @@ class GridPlot(BaseLivePlot):
     def __init__(self, cell: GridCell, *, grid_shape: tuple[int, int] | None = None,
                  size: str | None = None, labels: Sequence[str] = ("X", "Y"), **kwargs):
         self.cell_renderer = cell
+        # The grid's per-site plot kind (``"hist"`` / ``"2d"``) -- the ONE declaration that (a) chose the
+        # cell class, (b) dispatches the focus-zoom, and (c) drives the panel's Setting/Edit param UI
+        # (PANEL_PARAMS[sub_plot_kind]).  Read straight off the cell so there is a single source.
+        self.sub_plot_kind = str(cell.sub_plot_kind)
         self.n_cells = int(cell.n_cells)
         if self.n_cells == 0:
             raise ValueError("a GridPlot needs at least one cell.")
@@ -3302,7 +3427,9 @@ class GridPlot(BaseLivePlot):
             self.site_axes.append(ax)
             self.cell_renderer.draw(ax, k)
             if (k + self.ncols) < self.n_cells:        # hide x tick labels off the bottom row
-                ax.set_xticklabels([])
+                # labelbottom=False, NOT set_xticklabels([]) -- the latter instantiates every major
+                # tick's Text and dominated the N-cell build time (#perf).
+                ax.tick_params(labelbottom=False)
 
     def update_core(self) -> None:
         # A snapshot plot; a fresh acquisition rebuilds via show().
@@ -3387,7 +3514,7 @@ class GridPlot(BaseLivePlot):
         focus builder both surfaces call.
 
         The enlarged cell is a REAL ``panel_plot`` of the cell's own KIND, dispatched through the ONE
-        ``PLOT_KIND_BY_KEY`` table off :data:`GridCell.focus_kind` (``"hist"`` -> a :class:`HistogramFigure`,
+        ``PLOT_KIND_BY_KEY`` table off :data:`GridCell.sub_plot_kind` (``"hist"`` -> a :class:`HistogramFigure`,
         ``"2d"`` -> a :class:`Live2DDis`) -- never a hard-coded class and never a hand-rolled copy.  So the
         enlarged cell is EXACTLY a standalone panel of that kind: the standard ``size`` geometry (default the
         stock ``2x2``), the full x/y axes, the draggable threshold that live-updates fidelity, the fit chooser
@@ -3398,11 +3525,20 @@ class GridPlot(BaseLivePlot):
         display knobs (bins / fit / ylog / cmap) folded in.  ``fig`` builds it ONTO an existing figure (the
         notebook path swaps it into the grid's own canvas); ``None`` builds a fresh figure (the console path,
         which embeds it in a new canvas)."""
-        pk = PLOT_KIND_BY_KEY.get(str(self.cell_renderer.focus_kind))
-        if pk is None:                                   # a cell family whose focus_kind is not a real panel kind
+        pk = PLOT_KIND_BY_KEY.get(str(self.cell_renderer.sub_plot_kind))
+        if pk is None:                                   # a cell family whose sub_plot_kind is not a real panel kind
             raise ValueError(
-                f"grid cell {type(self.cell_renderer).__name__}.focus_kind="
-                f"{self.cell_renderer.focus_kind!r} is not a known PLOT_KINDS panel kind")
+                f"grid cell {type(self.cell_renderer).__name__}.sub_plot_kind="
+                f"{self.cell_renderer.sub_plot_kind!r} is not a known PLOT_KINDS panel kind")
+        # The grid's STORED relim family (apply_param stashed it in _display_params) seeds the enlarged
+        # view, so a re-focus (a knob that rebuilt the focus view, the notebook focus(), a re-snapshot)
+        # keeps the operator's fixed lim instead of silently reverting to the default autoscale.  An
+        # EXPLICIT view kwarg from the caller (the console card's _view_kwargs) still wins (setdefault).
+        if "relim" in self._display_params:
+            view.setdefault("relim_mode", str(self._display_params["relim"]))
+        for lim_key in ("fixed_lo", "fixed_hi"):
+            if lim_key in self._display_params:
+                view.setdefault(lim_key, float(self._display_params[lim_key]))
         data = dict(self.cell_renderer.focus_data(int(k), display_params=self._display_params))
         data_x = data.pop("data_x")
         data_y = data.pop("data_y", None)
@@ -3489,29 +3625,81 @@ class GridPlot(BaseLivePlot):
         except Exception:
             return []
 
-    def apply_param(self, key: str, value) -> bool:
-        """A DISPLAY-ONLY grid knob (part B): store it, apply it to the FOCUSED cell's full plot-kind figure
-        in place (so a Setting change reaches the enlarged cell -- ylog / fit / bins / colorset), and for a
-        knob that changes the THUMBNAIL binning (``bins``) re-draw the grid cells too.  The stored params are
-        saved with the grid (part C) so a reopen restores them.  Returns True (a grid handles its display
-        knobs itself, so the console never falls back to a full teardown/rebuild)."""
+    def store_display_param(self, key: str, value) -> bool:
+        """Record a DISPLAY knob on the grid WITHOUT drawing: stash it in ``_display_params`` (the save
+        recipe + the focus seed read it) and update the cell renderer's own state for a knob that changes
+        the THUMBNAILS (``bins`` re-bins a hist grid, ``cmap`` recolours a 2d grid).  Returns True when the
+        thumbnails are now STALE (the caller decides when to redraw them -- :meth:`apply_param` redraws at
+        once when the grid is showing; the console's focused path defers to unfocus, so a Setting edit on an
+        ENLARGED cell never synchronously repaints N invisible cells)."""
         self._display_params[str(key)] = value
-        # bins changes the shared histogram edges -> re-bin the cell renderer + re-draw the thumbnails so
-        # the grid cells (not just a focused one) reflect the new binning.
         if str(key) == "bins" and isinstance(self.cell_renderer, HistogramCell):
             self.cell_renderer.bins_arg = int(value)
             self.cell_renderer.edges = None
             self.cell_renderer.prepare()
-            if self._focused is None:                    # only redraw thumbnails when not zoomed in
-                self._redraw_thumbnails()
-        # Apply to the focused STANDALONE figure in place (HistogramFigure / Live2DDis apply_param), else it
-        # takes effect the next time a cell is focused (the stored param seeds build_focus_plotter's focus_data).
+            return True
+        if str(key) in ("cmap", "colorset") and isinstance(self.cell_renderer, ImageCell):
+            self.cell_renderer.cmap = str(value)
+            return True
+        # The relim family updates the CELL state exactly like bins/cmap (GridCell.relim_mode /
+        # fixed_lo / fixed_hi -- every thumbnail's draw consumes it via thumb_lims), so a lim edit
+        # reaches the thumbnails through the SAME store -> cell-state -> redraw mechanism, never
+        # "only the enlarged view changed".  An UNCHANGED value returns False (not dirty): the
+        # console re-pushes the whole relim family after every rebuild (_apply_display_params),
+        # and a no-change push must not cost an N-cell thumbnail repaint.
+        if str(key) == "relim":
+            cell = self.cell_renderer
+            if cell.relim_mode == str(value):
+                return False
+            if str(value) == "fixed":
+                # Flipping INTO fixed freezes what is showing NOW -- the SAME rule
+                # BaseLivePlot.apply_param applies to a standalone panel, landed on the CELL
+                # state (and _display_params, so a refocus / save / re-snapshot keeps it): the
+                # zoomed cell's own lims when enlarged, else the cells' shared auto range.
+                lo, hi = (self._focus_plotter.current_lims() if self._focus_plotter is not None
+                          else cell.auto_lims())
+                cell.fixed_lo, cell.fixed_hi = float(lo), float(hi)
+                self._display_params.setdefault("fixed_lo", float(lo))
+                self._display_params.setdefault("fixed_hi", float(hi))
+            cell.relim_mode = str(value)
+            return True
+        if str(key) in ("fixed_lo", "fixed_hi"):
+            if getattr(self.cell_renderer, str(key)) == float(value):
+                return False
+            setattr(self.cell_renderer, str(key), float(value))
+            return self.cell_renderer.relim_mode == "fixed"   # thumbnails only move in fixed mode
+        return False
+
+    def current_lims(self) -> tuple[float, float]:
+        """What the grid 'shows now' as one (lo, hi) pair: the enlarged cell's own lims when zoomed,
+        else the cells' SHARED auto range (:meth:`GridCell.auto_lims`).  Overrides the base class --
+        a grid never maintains ``ylim_min``/``ylim_max`` (its update_core is a no-op), so the base
+        pair would sit at the constructor's 0..1 forever and a fixed flip would seed garbage."""
+        if self._focus_plotter is not None:
+            return self._focus_plotter.current_lims()
+        if self.cell_renderer.relim_mode == "fixed":
+            return float(self.cell_renderer.fixed_lo), float(self.cell_renderer.fixed_hi)
+        return self.cell_renderer.auto_lims()
+
+    def apply_param(self, key: str, value) -> bool:
+        """A DISPLAY-ONLY grid knob (part B): store it (:meth:`store_display_param`), apply it to the
+        FOCUSED cell's full plot-kind figure in place (so a Setting change reaches the enlarged cell --
+        ylog / fit / bins / colorset), and for a knob that changes the THUMBNAILS re-draw the grid cells
+        too.  The stored params are saved with the grid (part C) so a reopen restores them.  Returns True
+        (a grid handles its display knobs itself, so the console never falls back to a full
+        teardown/rebuild)."""
+        thumb_dirty = self.store_display_param(key, value)
+        if thumb_dirty and self._focused is None:        # only redraw thumbnails when not zoomed in
+            self._redraw_thumbnails()
+        # Apply to the focused STANDALONE figure in place (HistogramFigure / Live2DDis / the base
+        # relim family).  A key the enlarged view has NO in-place use for (e.g. ``repeat_mode``) was
+        # STORED above and simply does not touch the view -- NEVER an unfocus/refocus rebuild: every
+        # per-site-kind knob (bins / fit / ylog / cmap / relim family) applies in place, so a rebuild
+        # here could only mean flashing the whole grid for a knob that changes nothing visible (the
+        # "adjusting repeat_mode bounces the enlarged cell" bug).  The stored param still seeds the
+        # next build_focus_plotter, so nothing is lost.
         if self._focused is not None and self._focus_plotter is not None:
-            if not self._focus_plotter.apply_param(str(key), value):
-                # a knob the focus plotter cannot apply in place -> rebuild the focus view with it
-                k = self._focused
-                self.unfocus()
-                self.focus(k)
+            self._focus_plotter.apply_param(str(key), value)
         self.draw()
         return True
 
@@ -3523,7 +3711,7 @@ class GridPlot(BaseLivePlot):
             ax.clear()
             self.cell_renderer.draw(ax, k)
             if (k + self.ncols) < self.n_cells:
-                ax.set_xticklabels([])
+                ax.tick_params(labelbottom=False)   # mirror init_core (labelbottom, not set_xticklabels -- #perf)
 
     def to_data_figure(self):
         self.data_figure = _GridData(self)
@@ -3602,6 +3790,57 @@ def _append_grid_plot_kind() -> None:
 _append_grid_plot_kind()
 
 
+#: ``sub_plot_kind -> GridCell class`` -- the SINGLE source that turns a grid's declared per-site plot kind
+#: into the cell strategy that draws it.  The unified :func:`grid` factory and :func:`build_grid_figure`
+#: both look up here (never a hard-coded ``if kind == ...``), so ADDING a per-site kind to a grid is ONE
+#: entry here + the cell class (which already declares its ``sub_plot_kind``) -- nothing else to touch.
+GRID_CELL_BY_KIND: dict[str, type[GridCell]] = {"hist": HistogramCell, "2d": ImageCell}
+
+
+def grid(
+    per_cell,
+    *,
+    sub_plot_kind: str = "hist",
+    grid_shape: tuple[int, int] | None = None,
+    size: str | None = None,
+    labels: Sequence[str] | None = None,
+    title: str = "",
+    display: bool = True,
+    fig: "plt.Figure | None" = None,
+    interactions: bool = True,
+    **cell_kwargs,
+):
+    """The ONE per-site GRID factory: N aligned cells, each a ``sub_plot_kind`` PER-SITE plot.
+
+    ``sub_plot_kind`` is a :data:`PLOT_KINDS` key (``"hist"`` = one distribution per site, ``"2d"`` = one
+    image per site) -- the SINGLE declaration that drives (a) which cell class draws the grid
+    (:data:`GRID_CELL_BY_KIND`), (b) the double-click focus-zoom (each cell enlarges to a standalone panel of
+    that kind), and (c) which ``PANEL_PARAMS`` the console panel's Setting / Edit UI shows.  The remaining
+    ``**cell_kwargs`` are that kind's own cell arguments (a ``hist`` grid takes ``thresholds`` / ``occupied`` /
+    ``bins`` / ``site_fidelities``; a ``2d`` grid takes ``cmap``).
+
+    EVERY grid is built through THIS entry -- the calibration report, the notebook helpers
+    (:func:`site_histogram_grid` / :func:`site_psf_grid` are one-line ``sub_plot_kind`` presets over it), and
+    the reopened-recipe path (:func:`build_grid_figure`) -- so a grid is created the SAME way everywhere:
+    pick the per-site kind, hand the per-cell data.  Geometry / gaps / colours / dpi / fonts are frontend-owned
+    (cells never overlap / clip, all cells align).  Returns the :class:`GridPlot` plotter (already ``show``-n)."""
+    kind = str(sub_plot_kind)
+    if kind not in GRID_CELL_BY_KIND:
+        raise ValueError(
+            f"unknown grid sub_plot_kind {sub_plot_kind!r}; choose from {sorted(GRID_CELL_BY_KIND)}.")
+    if labels is None:
+        labels = ("Signal", "Shots") if kind == "hist" else ("x (px)", "y (px)")
+    if kind == "hist":
+        # the readout hist grid keeps its named type + property surface (n_sites / thresholds / classify);
+        # it builds the HistogramCell itself, so the hist cell kwargs flow straight through.
+        return SiteHistogramGrid(
+            per_cell, grid_shape=grid_shape, labels=labels, title=title, size=size,
+            fig=fig, interactions=interactions, **cell_kwargs).show(display=display)
+    cell = GRID_CELL_BY_KIND[kind](per_cell, labels=labels, **cell_kwargs)
+    return GridPlot(cell, grid_shape=grid_shape, labels=labels, title=title, size=size,
+                    fig=fig, interactions=interactions).show(display=display)
+
+
 def site_histogram_grid(
     per_site_values,
     *,
@@ -3624,17 +3863,10 @@ def site_histogram_grid(
     Geometry/gaps/colours/dpi/fonts are owned by the frontend (cells never overlap,
     nothing is cut off, all cells align)."""
 
-    return SiteHistogramGrid(
-        per_site_values,
-        thresholds=thresholds,
-        occupied=occupied,
-        grid_shape=grid_shape,
-        bins=bins,
-        site_fidelities=site_fidelities,
-        labels=labels,
-        title=title,
-        size=size,
-    ).show(display=display)
+    return grid(
+        per_site_values, sub_plot_kind="hist", thresholds=thresholds, occupied=occupied,
+        grid_shape=grid_shape, bins=bins, site_fidelities=site_fidelities, labels=labels,
+        title=title, size=size, display=display)
 
 
 def site_psf_grid(
@@ -3656,9 +3888,7 @@ def site_psf_grid(
     gaps/colours/dpi/fonts are owned by the frontend (cells never overlap / cut off,
     all cells align)."""
 
-    return GridPlot(
-        ImageCell(images, labels=labels), labels=labels, title=title, **kwargs
-    ).show(display=display)
+    return grid(images, sub_plot_kind="2d", labels=labels, title=title, display=display, **kwargs)
 
 
 def grid_recipe_from_cells(grid: "GridPlot") -> dict:
@@ -3666,7 +3896,7 @@ def grid_recipe_from_cells(grid: "GridPlot") -> dict:
     grid counterpart of a pulse figure's ``figure_recipe``.  A grid's per-cell distributions / kernels
     cannot be recovered from the flat ``data_x`` / ``data_y`` a bare save writes (``data_x`` is just the
     cell index), so the recipe carries everything :func:`build_grid_figure` needs to rebuild the exact
-    grid: the cell FAMILY (``"hist"`` per-site distribution / ``"image"`` per-site kernel), the per-cell
+    grid: the ``sub_plot_kind`` (``"hist"`` per-site distribution / ``"2d"`` per-site kernel), the per-cell
     payload, and the shared thresholds / fidelities / labels / title / grid shape.
 
     Dispatch is by the concrete :class:`GridCell` the grid was built with, so a NEW grid-cell family adds
@@ -3677,8 +3907,8 @@ def grid_recipe_from_cells(grid: "GridPlot") -> dict:
     saved (part C): the ``panel_size`` (the preset the grid was drawn at), the ``focused_cell_index`` (which
     cell, if any, was enlarged), and the live ``display_params`` (bins / fit / ylog / colorset).  ``build_grid_figure``
     restores all three, so ``na.load_figure(grid_npz).plot()`` and the figure viewer reopen a grid at its saved
-    size, display knobs and even zoomed into the same cell -- and the ``cell`` family drives the reopen renderer
-    (a dis / hist grid -> the hist grid, NEVER the site map)."""
+    size, display knobs and even zoomed into the same cell -- and the ``sub_plot_kind`` drives the reopen
+    renderer (a hist grid -> the hist grid, NEVER the site map)."""
     cell = grid.cell_renderer
     recipe: dict[str, Any] = {
         "kind": "grid",
@@ -3689,8 +3919,11 @@ def grid_recipe_from_cells(grid: "GridPlot") -> dict:
         "focused_cell_index": (None if getattr(grid, "_focused", None) is None else int(grid._focused)),
         "display_params": dict(getattr(grid, "_display_params", {}) or {}),
     }
+    # ``sub_plot_kind`` (the grid's per-site plot kind: "hist" / "2d") is the ONE dispatch key -- it selects
+    # the cell class on reopen (GRID_CELL_BY_KIND) exactly as it did on create.  The per-cell payload branch
+    # is keyed off the concrete GridCell type (each family stores its own data shape).
+    recipe["sub_plot_kind"] = str(cell.sub_plot_kind)
     if isinstance(cell, HistogramCell):
-        recipe["cell"] = "hist"
         recipe["per_cell"] = [np.asarray(v, dtype=float).reshape(-1).tolist() for v in cell.values]
         recipe["bins"] = int(cell.bins_arg)
         recipe["thresholds"] = None if cell.thresholds is None else [float(t) for t in cell.thresholds]
@@ -3699,8 +3932,8 @@ def grid_recipe_from_cells(grid: "GridPlot") -> dict:
         recipe["occupied"] = (None if cell.occupied is None
                               else [np.asarray(o, dtype=float).reshape(-1).tolist() for o in cell.occupied])
     elif isinstance(cell, ImageCell):
-        recipe["cell"] = "image"
         recipe["per_cell"] = [np.asarray(im, dtype=float).tolist() for im in cell.images]
+        recipe["cmap"] = str(cell.cmap)
     else:
         raise TypeError(f"grid cell {type(cell).__name__} has no replay recipe")
     return recipe
@@ -3711,9 +3944,10 @@ def build_grid_figure(recipe: Mapping[str, Any], *, fig: plt.Figure | None = Non
     """Rebuild a per-site GRID figure from its :func:`grid_recipe_from_cells` recipe -- the SINGLE source
     of the grid reproduction, the grid counterpart of :func:`build_pulse_preview_plot`.
 
-    ``recipe['cell']`` selects the family: ``"hist"`` rebuilds the per-site distribution grid
+    ``recipe['sub_plot_kind']`` selects the family: ``"hist"`` rebuilds the per-site distribution grid
     (:class:`SiteHistogramGrid`, one histogram per site with its threshold line + fidelity annotation);
-    ``"image"`` rebuilds the per-site kernel grid (:func:`site_psf_grid`, one imshow per site).  Every
+    ``"2d"`` rebuilds the per-site kernel grid (a :class:`GridPlot` of :class:`ImageCell`, one imshow per
+    site).  It is the SAME ``sub_plot_kind`` the unified :func:`grid` factory takes on create.  Every
     consumer -- ``na.load_figure(npz).plot()``, the figure viewer, a seeded ``kind="grid"`` console panel
     -- draws through THIS one builder, so all three reproduce the identical faithful grid (never a
     flattened 1-D line off the fallback arrays).  Returns the :class:`GridPlot` plotter (already ``show``-n
@@ -3726,7 +3960,11 @@ def build_grid_figure(recipe: Mapping[str, Any], *, fig: plt.Figure | None = Non
     ``interactions=False`` builds a display-only grid (the read-only Monitor card) with no selectors.  The
     recipe's saved DISPLAY params (bins / fit / ylog for a hist grid) and any ``focused_cell_index`` are
     re-applied after the build, so a reopened grid looks EXACTLY as it did when saved (part C)."""
-    cell = str(recipe.get("cell") or "hist")
+    # Saved-DATA migration (not an API compat shim): npz written before the sub_plot_kind rename
+    # recorded the family as recipe['cell'] = 'hist'/'image' -- map it so an operator's stored
+    # image grid never silently reopens as a histogram of flattened pixels.
+    legacy = {"image": "2d", "hist": "hist"}.get(str(recipe.get("cell") or ""))
+    sub_plot_kind = str(recipe.get("sub_plot_kind") or legacy or "hist")
     labels = tuple(str(x) for x in (recipe.get("labels") or ("X", "Y")))
     title = str(recipe.get("title") or "")
     grid_shape = recipe.get("grid_shape")
@@ -3738,9 +3976,10 @@ def build_grid_figure(recipe: Mapping[str, Any], *, fig: plt.Figure | None = Non
         size = str(recorded) if recorded else None
     display_params = dict(recipe.get("display_params") or {})
     focused = recipe.get("focused_cell_index")
-    if cell == "image":
+    if sub_plot_kind == "2d":
         images = [np.asarray(im, dtype=float) for im in (recipe.get("per_cell") or [])]
-        plotter = GridPlot(ImageCell(images, labels=labels), grid_shape=grid_shape, labels=labels,
+        cmap = recipe.get("cmap") or (display_params.get("cmap") or display_params.get("colorset"))
+        plotter = GridPlot(ImageCell(images, labels=labels, cmap=cmap), grid_shape=grid_shape, labels=labels,
                            title=title, fig=fig, interactions=interactions, size=size).show(display=display)
     else:
         # per-site distribution grid (the default)
@@ -3906,6 +4145,8 @@ __all__ = [
     "HistogramCell",
     "SiteHistogramGrid",
     "ImageCell",
+    "GRID_CELL_BY_KIND",
+    "grid",
     "kind_for_plotter",
     "build_grid_figure",
     "grid_recipe_from_cells",

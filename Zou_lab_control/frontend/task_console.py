@@ -1063,22 +1063,10 @@ PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
         ParamDecl(key="include_always_off", label="show off rows", kind="bool", default=True, display=True,
                   tooltip="Draw channel rows that stay OFF the whole sequence (and idle DAC buses)"),
     ),
-    # A grid panel (seeded from a saved per-site grid figure) carries the SAME display knobs as a hist
-    # panel -- bins / fit / log axis -- which flow to the grid's cells (and especially the ENLARGED focused
-    # cell, which is a full HistogramFigure via GridPlot.apply_param).  ``bins`` re-bins the thumbnails too;
-    # ``fit`` / ``ylog`` take effect on a focused cell (a thumbnail has no fit).  A kernel (image) grid
-    # ignores the hist-only knobs.  The whole grid's cell family / thresholds / fidelities stay fixed by the
-    # saved recipe; these only change HOW the same data is drawn, so they belong here with size / relim.
-    "grid": (
-        ParamDecl(key="bins", label="bins", kind="int", default=36, lo=5, hi=500, display=True,
-                  tooltip="Histogram bins for the per-site distributions (re-bins the cells)"),
-        ParamDecl(key="fit", label="fit", kind="choice", choices=("none", "single", "double"),
-                  default="double", segmented=True, display=True,
-                  tooltip="Distribution fit drawn in the ENLARGED (double-click) cell view:\n"
-                          "  none / single / double (the dark/bright two-Gaussian readout)"),
-        ParamDecl(key="ylog", label="log count axis", kind="bool", default=False, display=True,
-                  tooltip="Log-scale the count axis in the ENLARGED cell view (reveals a sparse bright tail)"),
-    ),
+    # NOTE: there is DELIBERATELY no ``"grid"`` entry.  A grid panel's params are its per-site
+    # ``sub_plot_kind``'s params (a hist grid -> the ``"hist"`` bins/fit/ylog, a 2d grid -> the ``"2d"``
+    # colormap), resolved dynamically by ``PanelCard._param_kind`` -- so the Setting/Edit UI ALWAYS matches
+    # what each cell actually is, instead of a hard-coded hist set that lied for a kernel grid (#4).
 }
 
 
@@ -1743,6 +1731,16 @@ class PanelCard(FluentGroupBox):
         # so the grid never rebuilds over it (no bounce-back).  ``None`` = showing the grid; else a
         # ``_GridFocus`` holding the parked grid plotter/canvas + the focused cell index + the click/key cids.
         self._grid_focus = None
+        # The TOP spacer that centres the stock-size (2x2) enlarged cell vertically inside a larger grid
+        # region while focused -- inserted by _focus_grid_cell, removed on unfocus/teardown.
+        self._focus_top_stretch = None
+        # The cell index to AUTO RE-FOCUS after a teardown+rebuild (size / source / structure-param
+        # change) that happened WHILE a grid cell was enlarged: _teardown_plot records the focused index
+        # here, _build_plot's grid branch re-focuses it -- so a rebuild-class edit lands the operator back
+        # on the SAME enlarged cell (at the new size/params) instead of silently bouncing to the main
+        # grid view (#no-focus-bounce).  ``None`` = nothing to restore.  An EXPLICIT unfocus (double-click
+        # / Esc) never passes through _teardown_plot, so it never re-focuses.
+        self._pending_refocus_k: int | None = None
         self._value_shape: tuple[int, ...] | None = None
         # A STRUCTURE knob (bins / colormap / fit ...) sets this to force the NEXT _render to REBUILD
         # the plotter -- WITHOUT pre-tearing it down.  _build_plot build-then-swaps, so a failed rebuild
@@ -2012,7 +2010,7 @@ class PanelCard(FluentGroupBox):
         # {key: kind} for every declarative Setting control, so refresh_on_show can re-seed each widget
         # from config.params through its kind's PARAM_WIDGETS.write (one source -- no per-key handwiring).
         self._param_kinds: dict[str, str] = {}
-        display_specs = [s for s in PANEL_PARAMS.get(self.config.kind, ()) if s.display]
+        display_specs = [s for s in PANEL_PARAMS.get(self._param_kind(), ()) if s.display]
         if self.config.role == "plot":
             display_specs = display_specs + [_RELIM_PARAM]
         self.param_widgets.update(
@@ -2176,14 +2174,16 @@ class PanelCard(FluentGroupBox):
         return row, button, label
 
     def _apply_lim_to_plotter(self) -> None:
-        """Push the relim mode + fixed lo/hi onto the LIVE plotter and apply NOW (2D colour-limit / 1D
-        y-axis), bypassing the relim dead-band so a toggle takes effect immediately even on a static
-        panel.  Shared by the declarative relim edit (_set_param) and the rebuild-time re-apply."""
-        if self.plotter is not None and hasattr(self.plotter, "relim_mode"):
-            self.plotter.relim_mode = self._relim()
-            self._push_fixed_lims()                 # keep plotter.fixed_lo/hi in step before re-relim
-            if hasattr(self.plotter, "apply_relim_now"):
-                self.plotter.apply_relim_now()
+        """Push the relim mode + fixed lo/hi onto the LIVE plotter through the ONE in-place entry
+        every surface uses -- ``apply_param``'s relim family (BaseLivePlot applies mode + lo/hi and
+        re-relims now; a GridPlot stores them and fans out to its THUMBNAILS and any focused cell) --
+        never a bare attribute poke, which a grid would silently ignore.  Shared by the declarative
+        relim edit (_set_param) and the rebuild-time re-apply (_apply_display_params)."""
+        if self.plotter is None:
+            return
+        self.plotter.apply_param("relim", self._relim())
+        self.plotter.apply_param("fixed_lo", float(self.config.params.get("fixed_lo", 0.0)))
+        self.plotter.apply_param("fixed_hi", float(self.config.params.get("fixed_hi", 1.0)))
         if self.canvas is not None:
             self.canvas.draw_idle()
 
@@ -2449,25 +2449,27 @@ class PanelCard(FluentGroupBox):
         tests -- still work; ``_set_param`` does the persist + plotter push + fixed-row reveal."""
         self._set_param("relim", str(mode))
 
-    def _push_fixed_lims(self) -> None:
-        """Copy ``config.params["fixed_lo"/"fixed_hi"]`` onto the live plotter (no rebuild)."""
-        if self.plotter is None or not hasattr(self.plotter, "fixed_lo"):
-            return
-        self.plotter.fixed_lo = float(self.config.params.get("fixed_lo", 0.0))
-        self.plotter.fixed_hi = float(self.config.params.get("fixed_hi", 1.0))
+    def apply_fixed_lims(self, lo: float, hi: float) -> None:
+        """Persist + apply the fixed lo/hi NOW through the ONE in-place entry every surface uses
+        (``apply_param``'s relim family): on a ZOOMED grid the pin is ALSO stored on the parked grid
+        (thumbnails carry it when the zoom returns); otherwise it lands on the live plotter directly
+        (a GridPlot fans it out to its thumbnails itself).  The Setting popup's lo/hi inputs and the
+        Edit tab's both route here -- no second hand-copied push path."""
+        self.config.params["fixed_lo"], self.config.params["fixed_hi"] = float(lo), float(hi)
+        if self._grid_focus is not None:
+            self._set_focused_grid_param("fixed_lo", float(lo))
+            self._set_focused_grid_param("fixed_hi", float(hi))
+        elif self.plotter is not None:
+            self.plotter.apply_param("fixed_lo", float(lo))
+            self.plotter.apply_param("fixed_hi", float(hi))
+        if self.canvas is not None:
+            self.canvas.draw_idle()
+        self.changed.emit()
 
     def _on_fixed_lim_edited(self) -> None:
-        """Persist the fixed lo/hi inputs (#8) and re-apply them to the live plotter NOW
-        (no rebuild -- just push the bounds + re-relim so the axis snaps immediately)."""
-        self.config.params["fixed_lo"] = _safe_float(self.fixed_lo_edit.text(), 0.0)
-        self.config.params["fixed_hi"] = _safe_float(self.fixed_hi_edit.text(), 1.0)
-        self._push_fixed_lims()
-        if self.plotter is not None and self._relim() == "fixed" \
-                and hasattr(self.plotter, "apply_relim_now"):
-            self.plotter.apply_relim_now()
-            if self.canvas is not None:
-                self.canvas.draw_idle()
-        self.changed.emit()
+        """The Setting popup's fixed lo/hi inputs committed (#8): read + apply via the ONE path."""
+        self.apply_fixed_lims(_safe_float(self.fixed_lo_edit.text(), 0.0),
+                              _safe_float(self.fixed_hi_edit.text(), 1.0))
 
     def _on_update_interval(self, _idx: int) -> None:
         """Persist THIS panel's display refresh interval (``config.params["update_ms"]``,
@@ -2481,17 +2483,46 @@ class PanelCard(FluentGroupBox):
         self.changed.emit()                    # mark the layout dirty
 
     # --------------------------------------------- basic display application
+    def _param_kind(self) -> str:
+        """The plot kind whose :data:`PANEL_PARAMS` drive THIS panel's Setting / Edit param UI.
+
+        For every ordinary kind that is ``config.kind``.  For a GRID panel it is the grid's per-site
+        ``sub_plot_kind`` -- so a hist grid shows the ``"hist"`` bins/fit/ylog knobs and a 2d (kernel) grid
+        shows the ``"2d"`` colormap chooser, INSTEAD of the one hard-coded hist set a fixed ``"grid"`` entry
+        used to give every grid regardless of what its cells actually were (#4).  Resolved from the built grid
+        (``plotter.sub_plot_kind``); before the grid is built, peeked off its producing node's recipe."""
+        if self.config.kind != "grid":
+            return self.config.kind
+        sub = getattr(self.plotter, "sub_plot_kind", None)
+        if sub:
+            return str(sub)
+        if callable(self.grid_recipe_provider) and self.config.inputs and self.config.inputs[0]:
+            try:
+                recipe = self.grid_recipe_provider(self.config.inputs[0])
+                if recipe:
+                    return str(recipe.get("sub_plot_kind") or "hist")
+            except Exception:
+                pass
+        return "hist"
+
     def _grid_recipe_with_params(self, recipe: Mapping[str, object]) -> dict:
-        """Fold THIS panel's live grid DISPLAY knobs (``bins`` / ``fit`` / ``ylog`` from ``config.params``)
-        into the producing node's grid recipe, so a rebuild redraws the grid with the operator's current
-        Setting choices (not just the recipe's saved defaults).  The panel's params WIN over the recipe's
-        stored ``display_params`` (the operator's live pick is the source of truth); ``bins`` also overrides
-        the recipe's top-level ``bins`` so the thumbnails re-bin.  A copy -- the node's recipe is untouched."""
+        """Fold THIS panel's live grid DISPLAY knobs (the per-site ``sub_plot_kind``'s params -- ``bins`` /
+        ``fit`` / ``ylog`` for a hist grid, ``cmap`` for a 2d grid) from ``config.params`` into the producing
+        node's grid recipe, so a rebuild redraws the grid with the operator's current Setting choices (not just
+        the recipe's saved defaults).  The panel's params WIN over the recipe's stored ``display_params`` (the
+        operator's live pick is the source of truth); ``bins`` also overrides the recipe's top-level ``bins`` so
+        the thumbnails re-bin.  A copy -- the node's recipe is untouched."""
         out = dict(recipe)
         display = dict(out.get("display_params") or {})
-        for key in ("bins", "fit", "ylog"):
-            if key in self.config.params:
-                display[key] = self.config.params[key]
+        for decl in PANEL_PARAMS.get(self._param_kind(), ()):    # exactly the sub_plot_kind's knobs -- no hard-code
+            if decl.key in self.config.params:
+                display[decl.key] = self.config.params[decl.key]
+        # The relim family is display state too (it lives beside PANEL_PARAMS as _RELIM_PARAM + the
+        # bespoke lo/hi row): folded in like every other knob, so a rebuilt grid / Edit snapshot
+        # replays the operator's lim onto the thumbnails and the focus seed -- never a silent revert.
+        for lim_key in ("relim", "fixed_lo", "fixed_hi"):
+            if lim_key in self.config.params:
+                display[lim_key] = self.config.params[lim_key]
         if "bins" in display:
             out["bins"] = int(display["bins"])          # top-level bins drives the thumbnail binning
         out["display_params"] = display
@@ -2509,9 +2540,7 @@ class PanelCard(FluentGroupBox):
         path is absent because the colormap chooser IS the colorset chooser."""
         if self.plotter is None:
             return
-        if hasattr(self.plotter, "relim_mode"):
-            self.plotter.relim_mode = self._relim()
-            self._push_fixed_lims()                      # keep fixed lo/hi (#8) applied after rebuild
+        self._apply_lim_to_plotter()                     # relim family via the ONE in-place entry
         self._apply_unit()
 
     def _unit_df(self):
@@ -2655,6 +2684,18 @@ class PanelCard(FluentGroupBox):
             return
         self.config.params[key] = value
         if key == "relim":
+            # Flipping INTO ``fixed`` FREEZES the current view: seed lo/hi from what the plot shows
+            # NOW (the plotter's live limits), never the stale/default 0..1 pair -- pinning a counts
+            # histogram or a camera image to 0..1 empties it (every bar/pixel outside the range),
+            # which reads as "the enlarged plot just died".  The operator then types exact bounds.
+            if str(value) == "fixed" and self.plotter is not None \
+                    and hasattr(self.plotter, "current_lims"):
+                lo, hi = self.plotter.current_lims()
+                self.config.params["fixed_lo"], self.config.params["fixed_hi"] = lo, hi
+                for edit, val in ((getattr(self, "fixed_lo_edit", None), lo),
+                                  (getattr(self, "fixed_hi_edit", None), hi)):
+                    if edit is not None:
+                        edit.setText(f"{val:g}")     # setText does NOT re-fire editingFinished
             if getattr(self, "fixed_lim_row", None) is not None:        # the Setting popup's lo/hi row
                 self.fixed_lim_row.setVisible(str(value) == "fixed")    # (the Edit tab toggles its own)
                 # Revealing/hiding the lo/hi row CHANGES the popup's content height.  The Setting popup
@@ -2665,7 +2706,27 @@ class PanelCard(FluentGroupBox):
                 # smooth single-direction expand, not a jump (#fixed-lim-row-jump).
                 if getattr(self, "settings_popup", None) is not None and self.settings_popup.isVisible():
                     self._size_settings_popup()
-            self._apply_lim_to_plotter()
+            # A ZOOMED grid: route through the focused-param path so the mode lands on the enlarged
+            # view AND is stored on the parked grid (the thumbnails carry it when the zoom returns);
+            # otherwise apply to the live plotter directly (a GridPlot fans out to its cells itself).
+            if self._grid_focus is not None:
+                self._set_focused_grid_param(key, value)
+                if str(value) == "fixed":
+                    # land the just-seeded lo/hi on the parked grid too: its own flip-seed could only
+                    # use the cells' auto envelope, but the operator froze the ENLARGED view -- the
+                    # config values (read from that view above) are the authority.
+                    self._set_focused_grid_param("fixed_lo", float(self.config.params.get("fixed_lo", 0.0)))
+                    self._set_focused_grid_param("fixed_hi", float(self.config.params.get("fixed_hi", 1.0)))
+            else:
+                self._apply_lim_to_plotter()
+            self.changed.emit()
+            return
+        # A GRID cell is currently ENLARGED (``_grid_focus`` set): a param edit must apply to the FOCUS view
+        # and persist onto the PARKED grid, and NEVER mark a grid rebuild -- a grid rebuild swaps the focus
+        # canvas out and bounces back to the thumbnail (the "adjusting a param jumps back to the main grid
+        # view instead of staying zoomed" bug, #4).  Route through the dedicated focus-param path.
+        if self._grid_focus is not None:
+            self._set_focused_grid_param(key, value)
             self.changed.emit()
             return
         # Display-only knobs the plotter applies IN PLACE (e.g. log y-scale / bimodal-fit toggle): like
@@ -3105,6 +3166,16 @@ class PanelCard(FluentGroupBox):
             self._build_plot(value, namespace)
             self._force_rebuild = False
             return
+        # A grid panel is a SNAPSHOT built from its recipe: (re)build only on the FIRST show or when a
+        # display knob marked a rebuild -- NEVER a per-tick redraw.  Without this gate a grid fell through to
+        # the trailing ``plotter.update(value)`` and re-rendered ALL N cells on EVERY (even unrelated) hub
+        # bump, which froze the console -- the real "grid drawing is very slow" cause (#3).  The hub ``value``
+        # is only a numeric placeholder; the per-site content lives in the recipe.
+        if kind == "grid":
+            if self.plotter is None or self._force_rebuild:
+                self._build_plot(value, namespace)
+                self._force_rebuild = False
+            return
         rebuild = self.plotter is None or self._force_rebuild
         if not rebuild and kind in ("2d", "1d", "sites"):
             rebuild = tuple(np.shape(value)) != self._value_shape
@@ -3391,6 +3462,14 @@ class PanelCard(FluentGroupBox):
         # on the grid canvas and swaps to the clicked cell's standalone plot-kind figure (build_focus_plotter).
         if kind == "grid" and self._grid_focus is None:
             self._connect_grid_focus_click(self.plotter)
+            # A rebuild that interrupted an ENLARGED cell (recorded by _teardown_plot) re-focuses the SAME
+            # cell on the fresh grid -- a size/structure edit while zoomed stays zoomed (#no-focus-bounce).
+            k = self._pending_refocus_k
+            self._pending_refocus_k = None
+            if k is not None and 0 <= k < int(getattr(self.plotter, "n_cells", 0)):
+                self._focus_grid_cell(self.plotter, k)
+        else:
+            self._pending_refocus_k = None      # a non-grid rebuild has no cell to restore
 
     def _connect_grid_focus_click(self, grid) -> None:
         """Wire a double-click on the GRID canvas to enlarge the clicked cell into its standalone plot-kind
@@ -3421,21 +3500,32 @@ class PanelCard(FluentGroupBox):
 
     def _focus_grid_cell(self, grid, k: int) -> None:
         """Enlarge grid cell ``k`` into its STANDALONE plot-kind figure and SWAP it into this card's canvas,
-        parking the grid (plotter + canvas) to swap back on unfocus.  The enlarged view is a real
-        ``panel_plot`` of the cell's kind with the STANDARD relim view kwargs, so a subsequent lim / fit /
-        relim edit reaches it through the ordinary _set_param / _apply_lim_to_plotter path -- and the live
-        tick is gated off (``_grid_focus`` set), so it never bounces back to the thumbnail."""
+        parking the grid (plotter + canvas) to swap back on unfocus.  The enlarged view is the STOCK ``2x2``
+        panel of the cell's kind -- the SAME size the notebook path (:meth:`GridPlot.focus`) enlarges to,
+        never the grid's own (possibly larger) preset -- CENTRED in the card's plot region, with the
+        STANDARD relim view kwargs so a subsequent lim / fit / relim edit reaches it through the ordinary
+        _set_param / _apply_lim_to_plotter path; the live tick is gated off (``_grid_focus`` set), so it
+        never bounces back to the thumbnail."""
         if panel_canvas is None:
             return
-        # the enlarged view is a standalone panel of the CELL's kind -> its standard relim view kwargs
-        focus_kind = str(getattr(grid.cell_renderer, "focus_kind", "hist"))
+        # the enlarged view is a standalone panel of the cell's per-site kind -> its standard relim view
+        # kwargs.  interactions=False: the Monitor card is DISPLAY-ONLY (no selectors -- the same rule
+        # every _build_plot branch applies); interactive zoom / select lives in the Edit tab.
+        sub_kind = str(getattr(grid, "sub_plot_kind", "hist"))
         focus = grid.build_focus_plotter(
-            k, size=self.config.size, interactions=True, **self._view_kwargs(focus_kind))
+            k, size="2x2", interactions=False, **self._view_kwargs(sub_kind))
         focus_canvas = panel_canvas(focus.fig, isolate_wheel=False)
         # atomic swap-in (mirror _build_plot): insert the focus canvas, remove the grid canvas but do NOT
-        # close the grid figure -- it is parked for the return.
+        # close the grid figure -- it is parked for the return.  A TOP stretch balances the holder's
+        # trailing one, so the stock-size enlarged view sits at the CENTRE of the (larger) grid region
+        # instead of pinned to the top-left.
         grid_canvas = self.canvas
-        self.canvas_holder.insertWidget(0, focus_canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
+        self.canvas_holder.insertWidget(0, focus_canvas, alignment=QtCore.Qt.AlignHCenter)
+        # SAME stretch factor (1) as the holder's trailing addStretch(1): equal factors split the
+        # spare height evenly above/below -- a factor-0 spacer would win nothing against the
+        # trailing factor-1 stretch and the enlarged view would pin to the top, not the centre.
+        self.canvas_holder.insertStretch(0, 1)
+        self._focus_top_stretch = self.canvas_holder.itemAt(0)
         if grid_canvas is not None:
             self.canvas_holder.removeWidget(grid_canvas)
             grid_canvas.setParent(None)
@@ -3446,6 +3536,70 @@ class PanelCard(FluentGroupBox):
         self._grid_focus.click_cid = focus_canvas.mpl_connect("button_press_event", self._on_grid_canvas_click)
         self._apply_display_params()        # re-apply unit / manual lims to the fresh focus plotter
         focus_canvas.draw()
+        self._place_setting_button()
+
+    def _set_focused_grid_param(self, key: str, value) -> None:
+        """Apply a param edit while a grid cell is ENLARGED (#4): keep it on the FOCUS view AND persist it onto
+        the parked grid, and NEVER rebuild the grid (which would swap the focus canvas out and bounce back to
+        the thumbnail).  The focus plotter (``self.plotter``) applies the sub-kind's knob in place; a knob it
+        can't apply in place re-focuses the SAME cell -- rebuilding ONLY the enlarged view, staying zoomed."""
+        parked = self._grid_focus
+        if parked is None:
+            return
+        # Persist on the parked grid WITHOUT drawing (store_display_param): the stored params travel into
+        # the save recipe and re-seed build_focus_plotter; the (invisible) thumbnails are NOT synchronously
+        # repainted here -- _unfocus_grid_cell redraws them on return, so a Setting edit while zoomed costs
+        # only the enlarged view's own in-place apply, never an N-cell repaint stall.
+        try:
+            parked.grid.store_display_param(str(key), value)
+        except Exception:
+            pass
+        # Apply to the enlarged view in place.  A knob it can't apply live re-focuses the same cell ONLY
+        # when the knob actually belongs to the per-site kind's own param set (bins/fit/ylog/cmap ...) --
+        # an unrelated panel knob (e.g. ``repeat_mode``, which has no effect on a snapshot grid's enlarged
+        # cell) is just stored, so it never triggers a visible rebuild/flash of the enlarged view.
+        if self.plotter is not None and not self.plotter.apply_param(str(key), value):
+            if any(d.key == str(key) for d in PANEL_PARAMS.get(self._param_kind(), ())):
+                self._refocus_current_cell()   # rebuild ONLY the enlarged view, staying zoomed
+        elif self.canvas is not None:
+            self.canvas.draw_idle()
+
+    def _remove_focus_stretch(self) -> None:
+        """Drop the TOP spacer that centred the enlarged cell in the grid region (no-op when absent)."""
+        stretch = self._focus_top_stretch
+        self._focus_top_stretch = None
+        if stretch is not None:
+            self.canvas_holder.removeItem(stretch)
+
+    def _refocus_current_cell(self) -> None:
+        """Rebuild the ENLARGED cell view in place (same cell, current display params) -- used when the focus
+        plotter cannot apply a knob live.  Swaps ONLY the focus canvas; the grid stays parked and
+        ``_grid_focus`` stays set, so the view never bounces back to the thumbnail."""
+        parked = self._grid_focus
+        if parked is None or panel_canvas is None:
+            return
+        grid, k = parked.grid, parked.k
+        old_focus, old_canvas = self.plotter, self.canvas
+        sub_kind = str(getattr(grid, "sub_plot_kind", "hist"))
+        focus = grid.build_focus_plotter(k, size="2x2", interactions=False,
+                                         **self._view_kwargs(sub_kind))    # reads grid._display_params
+        # (interactions=False: Monitor cards are display-only -- no selectors, same as _focus_grid_cell)
+        focus_canvas = panel_canvas(focus.fig, isolate_wheel=False)
+        # replace the old focus canvas IN PLACE (the centring top stretch stays where it is)
+        at = self.canvas_holder.indexOf(old_canvas) if old_canvas is not None else 0
+        self.canvas_holder.insertWidget(max(0, at), focus_canvas, alignment=QtCore.Qt.AlignHCenter)
+        if old_canvas is not None:
+            self.canvas_holder.removeWidget(old_canvas)
+            old_canvas.setParent(None)
+            old_canvas.deleteLater()
+        self.plotter = focus
+        self.canvas = focus_canvas
+        parked.key_cid = focus_canvas.mpl_connect("key_press_event", self._on_grid_focus_key)
+        parked.click_cid = focus_canvas.mpl_connect("button_press_event", self._on_grid_canvas_click)
+        self._apply_display_params()
+        focus_canvas.draw()
+        if old_focus is not None and plt is not None and getattr(old_focus, "fig", None) is not None:
+            plt.close(old_focus.fig)
         self._place_setting_button()
 
     def _unfocus_grid_cell(self) -> None:
@@ -3464,6 +3618,7 @@ class PanelCard(FluentGroupBox):
             except Exception:
                 pass
         self._grid_focus = None
+        self._remove_focus_stretch()
         # swap the grid canvas back in FIRST (never a blank holder), then retire the focus canvas + figure
         if grid_canvas is not None:
             self.canvas_holder.insertWidget(0, grid_canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
@@ -3493,9 +3648,14 @@ class PanelCard(FluentGroupBox):
     def _teardown_plot(self) -> None:
         # If a grid cell is ENLARGED, the parked grid holds a SECOND figure/canvas -- close it too so a
         # teardown while focused leaks neither figure (self.plotter/self.canvas are the FOCUS view here).
+        # Record the focused index so the NEXT _build_plot re-focuses the SAME cell: a rebuild-class edit
+        # (size / source / structure param) made while zoomed lands back on the enlarged cell, never
+        # silently bouncing to the main grid (#no-focus-bounce).
         parked = self._grid_focus
         self._grid_focus = None
         if parked is not None:
+            self._pending_refocus_k = int(parked.k)
+            self._remove_focus_stretch()
             if parked.grid_canvas is not None:
                 parked.grid_canvas.setParent(None)
                 parked.grid_canvas.deleteLater()
@@ -3506,6 +3666,10 @@ class PanelCard(FluentGroupBox):
         self.plotter = None
         if canvas is not None:
             self.canvas_holder.removeWidget(canvas)
+            # setParent(None) BEFORE deleteLater: removeWidget only detaches from the LAYOUT -- the
+            # widget stays parented (and painted!) until the deferred delete runs, so the old figure
+            # lingered on screen under the replacement (the ghost/overlap the size-change showed).
+            canvas.setParent(None)
             canvas.deleteLater()
         if plotter is not None and plt is not None and plotter.fig is not None:
             plt.close(plotter.fig)
@@ -4120,7 +4284,7 @@ class PanelEditor(QtWidgets.QWidget):
         # the LIVE panel AND this snapshot.  This is where "the params the plot
         # call exposes" live -- NOT in the basic Setting popup (which keeps only
         # source / size / colormap / relim / unit), so the two never duplicate.
-        functional = [s for s in PANEL_PARAMS.get(card.config.kind, ()) if not s.display]
+        functional = [s for s in PANEL_PARAMS.get(card._param_kind(), ()) if not s.display]
         if is_plot and functional:
             section("Parameters")
             for s in functional:
@@ -4145,7 +4309,7 @@ class PanelEditor(QtWidgets.QWidget):
             # via _RELIM_PARAM, repeat_mode via _repeat_param_specs) are present HERE too, so the Edit tab
             # is the FULL data_figure UI (whatever the Setting can tune, the Edit can too).  Both route
             # through _edit_param -> card._set_param -- the ONE writer -- so Setting and Edit never drift.
-            display_specs = ([s for s in PANEL_PARAMS.get(card.config.kind, ()) if s.display]
+            display_specs = ([s for s in PANEL_PARAMS.get(card._param_kind(), ()) if s.display]
                              + [_RELIM_PARAM] + list(card._repeat_param_specs()))
             self.ed_params = card._emit_param_rows(display_specs, col.addWidget, self._edit_param, disp_lw)
             self.ed_cmap = self.ed_params.get("cmap")        # named back-refs (kept for tests / clarity)
@@ -4436,8 +4600,14 @@ class PanelEditor(QtWidgets.QWidget):
             return                       # build failed -> keep the LAST good snapshot, never blank (#4 "图有时消失")
         # Build-then-swap: the new plotter built cleanly, so ONLY NOW tear down the old snapshot and
         # install the new -- a failed rebuild above left the previous figure intact.
+        # A grid snapshot may be showing an ENLARGED cell (GridPlot.focus): re-enlarge the SAME cell
+        # on the fresh snapshot, so a knob that genuinely needs a re-snapshot still returns the user
+        # to the zoomed view -- the generic mirror of the card's own refocus-across-rebuild rule.
+        refocus_k = getattr(self._plotter, "_focused", None)
         self.teardown()
         self._plotter = new_plotter
+        if refocus_k is not None and hasattr(self._plotter, "focus"):
+            self._plotter.focus(int(refocus_k))
         self._canvas = panel_canvas(self._plotter.fig)
         # The Edit page lives in a SCROLL AREA: the page SCROLLS when the figure is taller than the
         # viewport, and the snapshot must never squish (clip) NOR grow.  The canvas already setFixedSize's
@@ -4488,10 +4658,19 @@ class PanelEditor(QtWidgets.QWidget):
             self.card._set_param(key, value)
         if key == "relim" and getattr(self, "ed_fixed_row", None) is not None:
             self._sync_fixed_lim_enabled(str(value))   # enable lo/hi in fixed WITHOUT moving the page
-        # A display-only knob the snapshot can apply IN PLACE updates here too without a re-snapshot:
-        # rebuild() tears down + recreates this canvas, which flashes/resizes it (#dis-resize).
+            if str(value) == "fixed" and self.card is not None:
+                # mirror the freeze-current-view seed _set_param just wrote (config.params is the
+                # one source) into THIS tab's lo/hi inputs -- setText does not re-fire editingFinished
+                for edit, pkey in ((self.ed_fixed_lo, "fixed_lo"), (self.ed_fixed_hi, "fixed_hi")):
+                    if edit is not None and pkey in self.card.config.params:
+                        edit.setText(f"{float(self.card.config.params[pkey]):g}")
+        # EVERY knob first tries the snapshot's own in-place apply (BaseLivePlot.apply_param handles
+        # the relim family for every kind; a GridPlot stores + forwards to its focused cell and NEVER
+        # asks for a rebuild) -- rebuild() is only the fallback for a knob the snapshot truly cannot
+        # apply, because it tears down + recreates the whole snapshot (which would throw away a
+        # focused grid cell = the "changing lim bounces the enlarged cell back to the grid" bug).
         snap = getattr(self, "_plotter", None)
-        if key != "relim" and snap is not None and snap.apply_param(key, value):
+        if snap is not None and snap.apply_param(key, value):
             if getattr(self, "_canvas", None) is not None:
                 self._canvas.draw_idle()
             return
@@ -4514,17 +4693,21 @@ class PanelEditor(QtWidgets.QWidget):
                 w.setEnabled(fixed)
 
     def _edit_fixed_lim(self) -> None:
-        """Persist the Edit-tab fixed lo/hi (#H2) through the card's own handler (SAME
-        config.params + live re-relim as the Setting popup), then re-snapshot this canvas."""
+        """The Edit tab's fixed lo/hi committed (#H2): apply to the LIVE card through its ONE
+        ``apply_fixed_lims`` path (config.params + in-place apply_param; a zoomed grid also stores
+        onto the parked grid), then push onto THIS tab's SNAPSHOT in place too (the same apply_param
+        relim family; a GridPlot forwards to its focused cell) -- never a re-snapshot, which would
+        bounce a focused grid cell back to the grid."""
         if self.card is None:
             return
-        self.card.config.params["fixed_lo"] = _safe_float(self.ed_fixed_lo.text(), 0.0)
-        self.card.config.params["fixed_hi"] = _safe_float(self.ed_fixed_hi.text(), 1.0)
-        self.card._push_fixed_lims()
-        if self.card._relim() == "fixed" and self.card.plotter is not None \
-                and hasattr(self.card.plotter, "apply_relim_now"):
-            self.card.plotter.apply_relim_now()
-        self.card.changed.emit()
+        lo = _safe_float(self.ed_fixed_lo.text(), 0.0)
+        hi = _safe_float(self.ed_fixed_hi.text(), 1.0)
+        self.card.apply_fixed_lims(lo, hi)
+        snap = getattr(self, "_plotter", None)
+        if snap is not None and snap.apply_param("fixed_lo", lo) and snap.apply_param("fixed_hi", hi):
+            if getattr(self, "_canvas", None) is not None:
+                self._canvas.draw_idle()
+            return
         self.rebuild()
 
     def _edit_unit_cycle(self) -> None:
@@ -5256,7 +5439,16 @@ class TaskConsole(QtWidgets.QWidget):
         # visible top/bottom edges line up with the Info card beside it.  Standalone keeps the 8 px inset
         # off the window chrome.
         v_margin = 0 if self.embedded else scaled_px(8)
-        root.setContentsMargins(margin, v_margin, margin, v_margin)
+        # The tab card is the LAST child of this root layout, and its soft drop shadow bleeds
+        # ``fluent_tab_shadow_margin`` px BELOW its geometry.  Reserve that bleed at the BOTTOM of the
+        # console's OWN layout so the shadow is not clipped by the console's bottom edge.  (An EMBEDDED host
+        # margin -- the figure viewer's console holder -- sits OUTSIDE the console widget and therefore
+        # cannot un-clip a shadow that is already clipped INSIDE the console's tree: this is the real root
+        # cause of the "bottom shadow cut off" the outer holder margin never fixed.)  The TOP inset stays
+        # ``v_margin`` (0 embedded) so the header still lines up flush with the Info card beside it; the top
+        # shadow bleed is topped up separately just above the tab widget (see ``root.addSpacing`` below).
+        bottom_margin = max(v_margin, fluent_tab_shadow_margin())
+        root.setContentsMargins(margin, v_margin, margin, bottom_margin)
         # A clear GAP separates the three rows -- the header card, the (hidden) task banner and
         # the tab card -- so they read as DISTINCT rounded cards on the grey window background.
         # The header is flat (no drop shadow) and the tab bar draws no top base line, so this

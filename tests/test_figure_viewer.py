@@ -515,12 +515,12 @@ def test_grid_reopens_as_a_normal_panelcard_on_the_same_board(tmp_path):
 
 
 def test_grid_image_cell_reopens_faithfully(tmp_path):
-    """A PSF-kernel GRID (cell='image') reopens the same way and renders imshow cells (a GridPlot of
-    ImageCell), not a hist grid -- the recipe's ``cell`` selects the family faithfully."""
+    """A PSF-kernel GRID (sub_plot_kind='2d') reopens the same way and renders imshow cells (a GridPlot of
+    ImageCell), not a hist grid -- the recipe's ``sub_plot_kind`` selects the family faithfully."""
     npz = _saved_grid_npz(tmp_path, cell="image")
     v = show_figure_viewer(npz)
     try:
-        assert v.saved.grid_recipe()["cell"] == "image"
+        assert v.saved.grid_recipe()["sub_plot_kind"] == "2d"
         card = v.console.cards[0]
         assert card.config.kind == "grid"
         v.console._tick()
@@ -900,3 +900,101 @@ def test_tab_overflow_menu_actions_are_not_checkable():
         menu.deleteLater()
     finally:
         tabs.deleteLater()
+
+
+def test_flow_tab_always_shows_at_least_raw_to_plot(tmp_path):
+    """#1: the Flow tab NEVER shows a "no data-flow" message.  A BARE figure (a plain ``plot(arr).save()``
+    with no producing node -- so its npz carries no ``flow_graph``) still lays out a ``raw data -> plot``
+    tree when reopened, because the viewer synthesizes the fallback from the ONE source
+    (figure_capture.raw_data_flow_graph) at load time."""
+    npz = tmp_path / "bare.npz"
+    p = plot(np.linspace(0, 1, 20), np.random.default_rng(0).normal(size=20), display=False)
+    out = p.save(str(npz))
+    v = show_figure_viewer(out["data"] if isinstance(out, dict) else npz)
+    try:
+        boxes = set(v.flow_view._boxes.keys())
+        assert boxes, "the Flow tab lays out a tree even for a figure with no recorded flow_graph"
+        roles = {n.get("role") for n in v.flow_view._graph["nodes"]}
+        assert {"plot", "raw data"} <= roles, f"a bare figure shows raw data -> plot, got roles {roles}"
+    finally:
+        win = v.window()
+        if win is not None:
+            win.close(); win.deleteLater()
+        v.teardown()
+        plt.close("all")
+
+
+def test_embedded_console_reserves_tab_shadow_bleed(tmp_path):
+    """#2: the embedded TaskConsole reserves its own tab-card drop-shadow bleed at the BOTTOM of its root
+    layout (a host margin sits OUTSIDE the console and cannot un-clip a shadow clipped inside its tree --
+    the real 'bottom shadow cut off' root cause).  The bottom content margin must be >= the shadow bleed."""
+    from Zou_lab_control.frontend.qt_fluent import fluent_tab_shadow_margin
+    npz = tmp_path / "bare.npz"
+    p = plot(np.linspace(0, 1, 20), np.random.default_rng(0).normal(size=20), display=False)
+    out = p.save(str(npz))
+    v = show_figure_viewer(out["data"] if isinstance(out, dict) else npz)
+    try:
+        con = v.console                                  # the real EMBEDDED TaskConsole the viewer hosts
+        assert con.embedded
+        bottom = con.layout().contentsMargins().bottom()
+        assert bottom >= fluent_tab_shadow_margin(), \
+            f"embedded console bottom margin {bottom} must reserve the tab shadow bleed {fluent_tab_shadow_margin()}"
+    finally:
+        win = v.window()
+        if win is not None:
+            win.close(); win.deleteLater()
+        v.teardown()
+        plt.close("all")
+
+
+@pytest.mark.parametrize("cell", ["hist", "image"])
+def test_edit_tab_param_edits_keep_the_snapshots_enlarged_cell(tmp_path, cell):
+    """ROOT-CAUSE contract for the Edit tab's grid snapshot: the user enlarges a cell ON THE SNAPSHOT
+    (GridPlot.focus, the notebook path), then edits relim / repeat_mode / fixed lo-hi in the Edit tab.
+    EVERY edit must land through the snapshot's own in-place ``apply_param`` -- the SAME plotter-owned
+    logic every surface uses -- so the snapshot object survives and the enlarged cell NEVER bounces
+    back to the thumbnail grid (the reported bug: ``_edit_param`` used to hard-skip relim and nuke the
+    whole snapshot through rebuild()).  Flipping INTO fixed must FREEZE the enlarged cell's current
+    view (BaseLivePlot.apply_param seeds fixed_lo/hi from current_lims), never pin it to 0..1."""
+    npz = _saved_grid_npz(tmp_path, cell=cell)
+    v = show_figure_viewer(npz)
+    try:
+        v.console.refresh_once()
+        card = v.console.cards[0]
+        v.console._edit_card(card)
+        editor = v.console._panel_editors[id(card)]
+        snap = editor._plotter
+        snap.focus(1)                                       # the user's double-click on the snapshot
+        assert getattr(snap, "_focused", None) == 1
+        focus_view = snap._focus_plotter
+        before = focus_view.current_lims()
+        editor._edit_param("relim", "fixed")                # the Edit tab's relim combo
+        assert editor._plotter is snap and snap._focused == 1, \
+            "a relim edit must stay on the enlarged snapshot cell (no re-snapshot)"
+        assert snap._focus_plotter.current_lims() == before, \
+            "fixed FREEZES the enlarged cell's current view (never the 0..1 default)"
+        editor._edit_param("repeat_mode", "add")            # a key the enlarged view has no use for
+        assert editor._plotter is snap and snap._focused == 1
+        assert snap._focus_plotter is focus_view, \
+            "an inapplicable key is STORED only -- never an unfocus/refocus rebuild (the flash/bounce)"
+        editor.ed_fixed_lo.setText("0")
+        editor.ed_fixed_hi.setText("100")
+        editor._edit_fixed_lim()                            # the Edit tab's lo/hi inputs
+        assert editor._plotter is snap and snap._focused == 1, \
+            "typing fixed lo/hi must stay on the enlarged snapshot cell"
+        assert snap._focus_plotter.current_lims() == (0.0, 100.0)
+        # ... and the pin reaches the THUMBNAILS too (the one store -> cell-state -> redraw
+        # mechanism cmap/bins use): back on the grid, every cell shows the operator's lo/hi.
+        snap.unfocus()
+        if cell == "hist":
+            assert snap.site_axes[0].get_ylim() == (0.0, 100.0), \
+                "a hist thumbnail's count axis honours the pinned lims"
+        else:
+            assert snap.site_axes[0].get_images()[0].get_clim() == (0.0, 100.0), \
+                "an image thumbnail's colour scale honours the pinned lims"
+    finally:
+        win = v.window()
+        if win is not None:
+            win.close(); win.deleteLater()
+        v.teardown()
+        plt.close("all")

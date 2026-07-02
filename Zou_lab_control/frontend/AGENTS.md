@@ -114,9 +114,10 @@ the rules don't get re-broken.
 A figure is only correct if every element is fully visible and orderly. This is
 a core art principle, not a nicety:
 
-- **No overlap.** Panels/cells never overlap each other; annotations (per-cell
-  labels, threshold lines, stats text) never sit on top of the data bars/points
-  — give the axes headroom so labels float in clear space.
+- **No overlap.** Panels/cells never overlap each other; a per-cell IDENTIFIER
+  (the site index, +fidelity) goes in the cell's small `apply_title(size=small_fontsize())`
+  TITLE ABOVE the axes — never `ax.text` inside the data area — and threshold
+  lines / stats text never sit on top of the data bars (give the axes headroom).
 - **No cutoff.** Nothing is clipped by the figure edge: titles, tick labels,
   outer axis labels and the last row/column must all fit inside the canvas.
 - **Aligned.** Cells in a grid share one fixed grid and (where comparable) one
@@ -125,7 +126,12 @@ a core art principle, not a nicety:
 Build multi-panel figures on `canvas.create_axes_grid` (fixed-pixel cells +
 explicit gaps + a figure sized to fit them + margins) so these three hold **by
 construction**; `grid_shape_for` picks a general `(rows, cols)` for any N (do not
-hard-code a site count). `site_histogram_grid` is the reference implementation.
+hard-code a site count). Every per-site grid is built through the ONE `grid(per_cell,
+*, sub_plot_kind=...)` factory — `sub_plot_kind` (a `PLOT_KINDS` key: `"hist"` / `"2d"`)
+is the SINGLE declaration that picks the cell class (`GRID_CELL_BY_KIND`), the double-click
+focus panel, and the console panel's injected params — so `site_histogram_grid` /
+`site_psf_grid` are thin `sub_plot_kind` presets, not separate code paths. `grid` is the
+reference implementation.
 
 ## Verifying visual changes
 

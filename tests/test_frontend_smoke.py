@@ -1075,7 +1075,7 @@ def test_panel_plot_spec_is_the_confocal_modular_region():
     # margin) therefore propagates here automatically and can never leave a stale
     # green assertion (the drift that once asserted (110,110,100,70) long after the
     # code had moved on).
-    assert PANEL_SIZES == ("1x2", "2x2", "1x4", "2x4", "4x4")
+    assert PANEL_SIZES == ("1x2", "2x2", "4x2", "1x4", "2x4", "4x4")
     assert panel_size_cells("1x4") == (1, 4)
     stock = panel_plot_spec("2x2")
     assert stock.data_px == FigureSpec().data_px        # "2x2" IS the stock frontend region

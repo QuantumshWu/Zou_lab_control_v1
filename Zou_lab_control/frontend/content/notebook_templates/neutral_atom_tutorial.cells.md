@@ -202,14 +202,15 @@ report = exp.readout.characterize_from_dir(data_dir, prefix="img", train_fractio
 report.summary()
 
 <!-- cell:markdown -->
-## The per-site readout histogram grid（通用 N，这里 35 站）
+## The per-site readout grid（`zf.grid(sub_plot_kind=…)`，通用 N，这里 35 站）
 
-每个站点一张直方图：暗=灰、亮=蓝、橙线=该站**训练出的**阈值，标题给 held-out 保真度；按 trap 网格 `(rows, cols)` 排布。布局由 frontend 拥有——**不重叠、不裁切、对齐**，且通用任意站点数（不写死 35）。
+所有逐站点网格都走**同一个** `zf.grid(...)`，用 `sub_plot_kind` 声明每格是哪种 plot kind：`"hist"` = 每格一张读出分布直方图，`"2d"` = 每格一张图像（如 PSF 核）。这一个声明同时驱动缩略图、双击放大成该 kind 的标准单图、以及 `exp.figure_viewer()` 里 Setting 显示该 kind 的参数。每格：暗=灰、亮=蓝、橙线=该站**训练出的**阈值，**站号（+保真度）画在每格小标题里、不占图内**；按 trap 网格 `(rows, cols)` 排布，布局由 frontend 拥有（**不重叠、不裁切、对齐**，通用任意站点数）。`zf.site_histogram_grid` / `zf.site_psf_grid` 只是 `sub_plot_kind="hist"` / `"2d"` 的薄壳预设。
 
 <!-- cell:code -->
 values, occupied = report.per_site_arrays()
-grid = zf.site_histogram_grid(
-    values, occupied=occupied, thresholds=report.thresholds,
+hist_grid = zf.grid(
+    values, sub_plot_kind="hist",
+    occupied=occupied, thresholds=report.thresholds,
     site_fidelities=report.site_fidelities, grid_shape=exp.devices.trap_array.grid_shape,
     labels=("PSF signal (counts)", "Shots"),
     title=f"Per-site readout histograms (held-out F={report.aggregate_fidelity:.3f})",

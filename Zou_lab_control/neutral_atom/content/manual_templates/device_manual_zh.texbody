@@ -1147,21 +1147,25 @@ report.summary()                # aggregate/global/min 保真度、ambiguous 比
 
 返回 \pyapi{FidelityReport}：\pyapi{per_site}（逐站 \pyapi{SiteFidelity}）、\pyapi{thresholds (N,)}、\pyapi{site_fidelities (N,)}、\pyapi{aggregate_fidelity}（逐站阈值 held-out）、\pyapi{global_fidelity}（单阈值 held-out）、\pyapi{ablation}（drop-worst-k 行）、\pyapi{labels}/\pyapi{split}，以及 \pyapi{per_site_arrays()} 给绘图用的逐站 \pyapi{(values, occupied)}。
 
-\subsection{逐站点直方图网格：site\_histogram\_grid}
+\subsection{逐站点网格：grid(sub\_plot\_kind=…)}
 
-把每个站点的读出分布画成一张小直方图，按 trap 网格排布，一眼看出哪个站点分得开、阈值卡得对：
+把每个站点画成一张\tfocus{小图}、按 trap 网格排布，一眼看出哪个站点分得开、阈值卡得对。所有逐站点网格都走\tfocus{同一个} \pyapi{zf.grid(...)} 工厂，用 \pyapi{sub_plot_kind} 声明\tfocus{每格是哪种 plot kind}——\pyapi{"hist"} 每格一张读出分布直方图、\pyapi{"2d"} 每格一张图像（如 PSF 核）。这一个声明同时驱动：格内缩略图、双击放大成\tfocus{该 kind 的标准单图}、以及 figure\_viewer 里 Setting/Edit 显示\tfocus{该 kind 的参数}（hist 给 bins/fit/log 轴，2d 给 colormap）：
 
 \begin{codeblock}[Python]
 values, occupied = report.per_site_arrays()
-zf.site_histogram_grid(
-    values, occupied=occupied, thresholds=report.thresholds,
+zf.grid(
+    values, sub_plot_kind="hist",           # 每格 = 一张读出分布直方图
+    occupied=occupied, thresholds=report.thresholds,
     site_fidelities=report.site_fidelities,
     grid_shape=exp.devices.trap_array.grid_shape,   # 例如 (5, 7) = 35 站
     labels=("PSF signal (counts)", "Shots"),
 )
+
+# PSF 核网格（每格一张图像）= 同一入口，只换 sub_plot_kind：
+zf.grid(psf_weights, sub_plot_kind="2d", labels=("x (px)", "y (px)"))
 \end{codeblock}
 
-每格：暗=灰、亮=蓝、橙线=该站阈值、标题=站号+保真度；所有格共享 x 轴便于比较。这是 frontend 的\tfocus{通用}多面板图（站点数任意，不写死 35），建在 \pyapi{canvas.create_axes_grid} 上——固定格 + 显式间距 + 图尺寸自适应，因此\tfocus{不重叠、不裁切、对齐}由构造保证（见 \filepath{frontend/AGENTS.md} 的 Layout 节）。
+\pyapi{zf.site_histogram_grid(...)} 与 \pyapi{zf.site_psf_grid(...)} 只是 \pyapi{sub_plot_kind="hist"} / \pyapi{"2d"} 的\tfocus{薄壳预设}（同一条真实路径）。hist 每格：暗=灰、亮=蓝、橙线=该站阈值；\tfocus{站号（+保真度）画在每格的小标题里、不占图内区域}；所有格共享 x 轴便于比较。这是 frontend 的\tfocus{通用}多面板图（站点数任意，不写死 35），建在 \pyapi{canvas.create_axes_grid} 上——固定格 + 显式间距 + 图尺寸自适应，因此\tfocus{不重叠、不裁切、对齐}由构造保证（见 \filepath{frontend/AGENTS.md} 的 Layout 节）。保存后可用 \pyapi{exp.figure_viewer()} 重开：双击任一格放大成该 kind 的标准图、再双击/Esc 返回，Flow 页始终画出数据从何而来（至少 \pyapi{raw data -> plot}）。
 
 \section{第三步：detect 探测（逐发判定）}
 

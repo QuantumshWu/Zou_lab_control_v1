@@ -78,7 +78,6 @@ class FlowGraphView(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._graph: dict | None = None
-        self._placeholder = "No data-flow was recorded for this figure."
         # Laid-out geometry, rebuilt on every set_graph: node id -> QRectF (box), plus the edge list.
         self._boxes: dict[str, QtCore.QRectF] = {}
         self._layout_nodes: dict[str, dict] = {}
@@ -130,8 +129,8 @@ class FlowGraphView(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------ public
     def set_graph(self, graph: object) -> None:
-        """Accept a ``{"nodes": [...], "edges": [...]}`` mapping (or ``None`` / anything malformed -> the
-        placeholder) and lay it out.  Tolerant of a stored dict whose lists came back from an npz as
+        """Accept a ``{"nodes": [...], "edges": [...]}`` mapping (or ``None`` / anything malformed -> a blank
+        view, never a "no data-flow" message) and lay it out.  Tolerant of a stored dict whose lists came back from an npz as
         object arrays -- it only reads ``id`` / ``name`` / ``role`` off each node and ``from`` / ``to`` /
         ``signal`` / ``shape`` off each edge."""
         self._graph = graph if self._valid(graph) else None
@@ -275,11 +274,9 @@ class FlowGraphView(QtWidgets.QWidget):
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
         painter.setRenderHint(QtGui.QPainter.TextAntialiasing)
         if self._graph is None or not self._boxes:
-            painter.setPen(QtGui.QColor(GREY))
-            painter.setFont(self._small_font())
-            painter.drawText(self.rect().adjusted(scaled_px(14), 0, -scaled_px(14), 0),
-                             int(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft | QtCore.Qt.TextWordWrap),
-                             self._placeholder)
+            # An unset / empty graph draws NOTHING -- never a "no data-flow" message (the figure viewer
+            # always synthesizes at least a raw-data->plot tree before showing this view, so a LOADED figure
+            # always has a graph; a bare unset widget just stays blank rather than printing that forbidden text).
             painter.end()
             return
         self._paint_edges(painter)

@@ -199,16 +199,21 @@ def smaller_fontsize(delta: float = 1.0, floor: float = 5.5) -> float:
     return max(float(floor), small_fontsize() - float(delta))
 
 
-def apply_title(target, title: str, *, pad: float | None = None):
+def apply_title(target, title: str, *, pad: float | None = None, size: float | None = None):
     """Render a plot title consistently on an Axes OR a Figure.
 
     One title mechanism, so single-axes plots and figure-level grids never drift
     on title size/position.  Returns the artist, or ``None`` for an empty title.
+    ``size`` overrides the title point size (still read from style.py, never a raw
+    literal) -- a grid CELL identifies itself with a small ``small_fontsize()`` title
+    ABOVE its axes through this SAME mechanism, just smaller, so the site index never
+    sits inside the cell's data area.
     """
 
     if not title:
         return None
-    size = title_fontsize()
+    if size is None:
+        size = title_fontsize()
     if hasattr(target, "set_title"):  # an Axes
         if pad is None:
             pad = max(float(matplotlib.rcParams["axes.titlepad"]), 2.5)

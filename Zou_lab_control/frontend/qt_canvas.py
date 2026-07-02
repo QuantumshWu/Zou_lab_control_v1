@@ -31,7 +31,7 @@ from __future__ import annotations
 from .style import DESIGN_DPI
 
 try:
-    from PyQt5 import QtCore, QtWidgets
+    from PyQt5 import QtCore, QtGui, QtWidgets
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as _FigureCanvasQTAgg
 except Exception:  # pragma: no cover - depends on the local matplotlib install
     _FigureCanvasQTAgg = None
@@ -171,6 +171,29 @@ else:
             # mid-sync and balloons the size).  After construction the canvas is setFixedSize to this
             # same value, so this resize() is the pre-fix construction sizing and a no-op thereafter.
             self.resize(self._zlc_design_size())
+
+        def paintEvent(self, event):  # noqa: N802 - Qt naming
+            # EXPLICIT stretch-blit of the rendered Agg buffer over the ENTIRE fixed widget rect.
+            # The stock backend paints the buffer as a QImage whose devicePixelRatio is our combined
+            # ratio (screen x 1/display_scale x render_scale) -- but Qt's image-DPR semantics are only
+            # defined for ratios >= 1, and ours drops BELOW 1 (0.7 display scale x 0.5 render scale),
+            # where Qt blits the buffer 1:1 into the TOP-LEFT corner and leaves the right/bottom of the
+            # widget blank (the "enlarged view is not centred in its display region" bug -- the content
+            # occupied ~71% of the canvas).  Drawing it ourselves over ``rect()`` needs no image-DPR at
+            # all: the widget size is the DPR-invariant design constant, the buffer is whatever dpi the
+            # sync chose, and the smooth-transform scale maps one onto the other exactly.
+            del event
+            renderer = getattr(self, "renderer", None)
+            if renderer is None or not getattr(self, "_zlc_painted_once", False):
+                self.draw()                     # ensure a rendered buffer before the first blit
+                self._zlc_painted_once = True
+                renderer = self.renderer
+            w, h = int(renderer.width), int(renderer.height)
+            image = QtGui.QImage(self.buffer_rgba(), w, h, QtGui.QImage.Format_RGBA8888)
+            painter = QtGui.QPainter(self)
+            painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+            painter.drawImage(self.rect(), image)
+            painter.end()
 
         def resizeEvent(self, event):  # noqa: N802 - Qt naming
             # spec-owned figure: NEVER re-derive the figure geometry from the

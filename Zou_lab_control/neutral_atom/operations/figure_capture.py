@@ -161,6 +161,21 @@ _RAW_ID = "__raw__"
 _DEVICE_ID_PREFIX = "__dev__"
 
 
+def raw_data_flow_graph() -> dict:
+    """The minimal flow graph a figure with NO producing node degrades to: a single ``raw data`` leaf into
+    the ``plot`` terminal (``raw data -> plot``).  The SINGLE source of that fallback -- both
+    :func:`capture_flow_graph` (a bare-array figure) and the viewer's load-time synthesis (an old npz that
+    predates ``flow_graph``, or a capture that failed) build it from HERE, so the Flow tab NEVER shows a
+    "no data-flow" placeholder: there is always at least this tree to draw."""
+    return {
+        "nodes": [
+            {"id": _PLOT_ID, "name": "figure", "role": "plot"},
+            {"id": _RAW_ID, "name": "raw data", "role": "raw data"},
+        ],
+        "edges": [{"from": _RAW_ID, "to": _PLOT_ID}],
+    }
+
+
 def _node_id(node) -> str:
     """A stable per-instance id for a producing node in the flow graph.  ``id()`` is unique within one
     capture (the whole graph is built in a single call), so two same-kind nodes (two occupancy judges)
@@ -331,10 +346,10 @@ def capture_flow_graph(hub, node, inputs, *, resolve_node: ResolveNode | None = 
     nodes[_PLOT_ID] = {"id": _PLOT_ID, "name": "figure", "role": "plot"}
 
     if node is None:
-        # No producing node: the figure's data was handed in directly -> a single raw-data leaf.
-        nodes[_RAW_ID] = {"id": _RAW_ID, "name": "raw data", "role": "raw data"}
-        _add_edge(_RAW_ID, _PLOT_ID)
-        return {"nodes": list(nodes.values()), "edges": edges}
+        # No producing node: the figure's data was handed in directly -> the raw-data->plot fallback (the
+        # ONE source, so the console Save, a notebook plot(arr).save(), and the viewer's load-time synthesis
+        # all draw the identical tree).
+        return raw_data_flow_graph()
 
     # The DIRECT edges INTO the plot: each wired role's signal -> its producing node -> the plot.  The
     # producing node of the panel's own value is ``node`` (already resolved by the caller); the companion
