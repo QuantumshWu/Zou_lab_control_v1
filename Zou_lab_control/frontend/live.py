@@ -212,15 +212,15 @@ _SITE_MAX_COLS = 7                        # column cap (pulse-style width cap); 
 #: matplotlib layout) freezes the UI.  ONE source -- the grid factory raises past it and the console
 #: greys out facet axes that would exceed it.
 MAX_GRID_CELLS = 80
-#: Cell-text rule (fixed by the operator): a panel SMALLER than 2x2 (either side below two
-#: half-units, i.e. the half-height 1x2 / 1x4) uses ONE NOTCH smaller text
-#: (``smaller_fontsize()``); 2x2 and larger use the plot kind's STANDARD style sizes unscaled.
-#: Exactly two tiers -- no continuous shrink.
-def _cell_font_scale(size: str) -> float:
+#: Cell-text rule (fixed by the operator): a grid squeezed into a panel size SMALLER than its
+#: recommended default (:func:`optimal_grid_size`; "smaller" = EITHER side below the
+#: recommendation) uses HALF the standard 2x2 cell text; every other size uses the plot kind's
+#: STANDARD style sizes unscaled.  Exactly two tiers -- a binary squeezed-or-not rule, no
+#: continuous shrink.
+def _cell_font_scale(size: str, recommended: str) -> float:
     rows, cols = panel_size_cells(size)
-    if rows >= 2 and cols >= 2:
-        return 1.0
-    return smaller_fontsize() / small_fontsize()          # one notch, derived from style (no literal)
+    rec_rows, rec_cols = panel_size_cells(recommended)
+    return 0.5 if (rows < rec_rows or cols < rec_cols) else 1.0
 
 
 def _as_data_x(data_x) -> np.ndarray:
@@ -1021,6 +1021,65 @@ class LiveLiveDis(LiveLive):
         self.fig._zlc_state = PlotState(plot_type="1D", x_array=self.data_x[:, 0], y_array=self.data_y, axdis=self.axdis)
 
 
+def _image_axes_px_budget(ax) -> tuple[int, int]:
+    """The image axes' size in DESIGN pixels (position fraction x figure design px) -- the
+    upper bound of what the screen can show of it, renderer-free.  Used as the display
+    decimation budget: an array decimated to >= this budget loses nothing on screen."""
+    pos = ax.get_position()
+    fig = ax.figure
+    w_in, h_in = fig.get_size_inches()
+    return (max(1, int(round(pos.width * w_in * DESIGN_DPI))),
+            max(1, int(round(pos.height * h_in * DESIGN_DPI))))
+
+
+def _decimate_image_view(grid, extent, xlim, ylim, budget) -> tuple[np.ndarray, tuple]:
+    """Slice the current VIEW out of a full-resolution image and block-mean it down to the
+    display budget: ``(array, extent)`` ready for ``imshow``.
+
+    matplotlib happily resamples a full camera frame (1920x1200+) on EVERY draw -- ~90 ms
+    per tick, at the wrong layer.  The display layer instead keeps the full array and shows
+    an area-averaged view: each displayed pixel is the mean of an integer block (photometric,
+    the same filtering a camera viewer's smooth scaling applies -- and it IMPROVES SNR,
+    unlike subsampling), recomputed per new frame / view change (a ~2 ms numpy pass).
+    Zooming re-slices from the full array, so detail comes back progressively until the
+    factor hits 1 (a plain no-copy view).  Arrays already within budget pass through.
+
+    ``extent``/``xlim``/``ylim`` follow imshow's edge conventions and may be inverted on
+    either axis (the 2D plots draw y top-to-bottom); the returned extent maps EXACTLY the
+    pixels kept.  The block factor is floor-based, so the result is never smaller than the
+    budget (never softer than the screen)."""
+    grid = np.asarray(grid)
+    ny, nx = grid.shape[:2]
+    ex0, ex1 = float(extent[0]), float(extent[1])       # column edges: col 0 -> nx
+    ey1, ey0 = float(extent[2]), float(extent[3])       # imshow extent = (left, right, bottom, top)
+
+    def _index_window(lo, hi, e0, e1, n):
+        # data coords -> half-open index window on an axis whose edge j sits at
+        # e0 + j*(e1-e0)/n; handles inverted extents and inverted view limits.
+        step = (e1 - e0) / n
+        a, b = (lo - e0) / step, (hi - e0) / step
+        a, b = (a, b) if a <= b else (b, a)
+        return max(0, min(int(np.floor(a)), n - 1)), max(1, min(int(np.ceil(b)), n))
+
+    jx0, jx1 = _index_window(float(xlim[0]), float(xlim[1]), ex0, ex1, nx)
+    jy0, jy1 = _index_window(float(ylim[0]), float(ylim[1]), ey0, ey1, ny)
+    sub = grid[jy0:jy1, jx0:jx1]
+    sy, sx = sub.shape[:2]
+    bx, by = (budget, budget) if np.isscalar(budget) else (int(budget[0]), int(budget[1]))
+    fx = max(1, sx // max(1, bx))
+    fy = max(1, sy // max(1, by))
+    if fx == 1 and fy == 1:
+        small, ky, kx = sub, sy, sx
+    else:
+        ky, kx = (sy // fy) * fy, (sx // fx) * fx
+        small = sub[:ky, :kx].reshape(ky // fy, fy, kx // fx, fx).mean(axis=(1, 3))
+    sxp = (ex1 - ex0) / nx
+    syp = (ey1 - ey0) / ny
+    small_extent = (ex0 + jx0 * sxp, ex0 + (jx0 + kx) * sxp,
+                    ey0 + (jy0 + ky) * syp, ey0 + jy0 * syp)
+    return small, small_extent
+
+
 class Live2DDis(BaseLivePlot):
     """Live 2D image with side distribution, colorbar, and draggable clim."""
 
@@ -1062,7 +1121,18 @@ class Live2DDis(BaseLivePlot):
         dx = 0.5 * (self.x_array[-1] - self.x_array[0]) / len(self.x_array) if len(self.x_array) > 1 else 0.5
         dy = 0.5 * (self.y_array[-1] - self.y_array[0]) / len(self.y_array) if len(self.y_array) > 1 else 0.5
         self.extent = [self.x_array[0] - dx, self.x_array[-1] + dx, self.y_array[-1] + dy, self.y_array[0] - dy]
-        self.image = self.ax.imshow(self.grid, cmap=cmap, extent=self.extent, interpolation="none")
+        # "auto" interpolation: nearest when the grid is smaller than the screen (scan grids keep
+        # crisp pixels), filtered when larger (a decimated camera frame never shows aliasing).
+        # The budget is read PER REFRESH: the split axes reach their final position only at the
+        # first layout pass, so a cached value would freeze the pre-layout (full-figure) size.
+        small, small_ext = _decimate_image_view(self.grid, self.extent,
+                                                (self.extent[0], self.extent[1]),
+                                                (self.extent[2], self.extent[3]),
+                                                _image_axes_px_budget(self.ax))
+        self.image = self.ax.imshow(small, cmap=cmap, extent=small_ext, interpolation="auto")
+        self._in_display_refresh = False
+        self.ax.callbacks.connect("xlim_changed", lambda _ax: self._refresh_display_image())
+        self.ax.callbacks.connect("ylim_changed", lambda _ax: self._refresh_display_image())
         self.lines = [self.image]
         self.ax.set_anchor("W")
         self.ax.set_aspect("equal", adjustable="box")
@@ -1112,6 +1182,22 @@ class Live2DDis(BaseLivePlot):
         self.tools = attach_interaction(self.ax, drag=self.drag, axdis=self.axdis, cax=self.cax)
         self.area, self.cross, self.zoom, self.drag = self.tools.area, self.tools.cross, self.tools.zoom, self.tools.drag
 
+    def _refresh_display_image(self) -> None:
+        """Re-slice + re-decimate the displayed view from the full-resolution grid -- on every
+        new frame and every xlim/ylim change (zooming back INTO the full array is what brings
+        the detail back).  Guarded: set_extent inside the refresh must not recurse through the
+        lim callbacks that triggered it."""
+        if self._in_display_refresh:
+            return
+        self._in_display_refresh = True
+        try:
+            small, small_ext = _decimate_image_view(self.grid, self.extent, self.ax.get_xlim(),
+                                                    self.ax.get_ylim(), _image_axes_px_budget(self.ax))
+            self.image.set_array(small)
+            self.image.set_extent(small_ext)
+        finally:
+            self._in_display_refresh = False
+
     def update_clim(self) -> None:
         self.image.set_clim(float(self.line_l.get_ydata()[0]), float(self.line_h.get_ydata()[0]))
 
@@ -1143,7 +1229,7 @@ class Live2DDis(BaseLivePlot):
 
     def update_core(self) -> None:
         self.grid = self.fill_grid()
-        self.image.set_array(self.grid)
+        self._refresh_display_image()
         vals = self._finite_values()
         if vals.size:
             y_min = float(np.nanmin(vals))
@@ -1213,13 +1299,27 @@ class LiveSiteMap(BaseLivePlot):
         if self.background is not None and getattr(self, "_bg_image", None) is not None \
                 and arr.shape == self.background.shape:
             self.background = arr
-            self._bg_image.set_data(arr)
+            self._refresh_display_image()
             # The colour limit + side histogram are owned by the distribution band (per the
             # lim-mode), not pinned to this frame's min/max here -- update_core re-clims + refreshes.
             if draw:
                 self.draw()
         else:
             self.background = arr               # shape changed: rebuilt by the host
+
+    def _refresh_display_image(self) -> None:
+        """Same display refresh as :meth:`Live2DDis._refresh_display_image`, over the sitemap's
+        full-resolution camera frame (``self.background``)."""
+        if self._bg_image is None or self._in_display_refresh:
+            return
+        self._in_display_refresh = True
+        try:
+            small, small_ext = _decimate_image_view(self.background, self.extent, self.ax.get_xlim(),
+                                                    self.ax.get_ylim(), _image_axes_px_budget(self.ax))
+            self._bg_image.set_array(small)
+            self._bg_image.set_extent(small_ext)
+        finally:
+            self._in_display_refresh = False
 
     def _ring_styles(self, values: np.ndarray):
         """Per-site (edge RGBA, linewidth) from occupancy: value >= 0.5 -> occupied
@@ -1248,7 +1348,16 @@ class LiveSiteMap(BaseLivePlot):
                       float(centers[:, 1].max()) + pad, float(centers[:, 1].min()) - pad]
         self.extent = extent
         if self.background is not None:
-            self._bg_image = self.ax.imshow(self.background, cmap=self.cmap, extent=extent, interpolation="none")
+            # same display policy as Live2DDis: the FULL frame stays in self.background, the
+            # artist shows a block-mean view within the axes' pixel budget, re-sliced on zoom
+            # (budget read per refresh -- see Live2DDis.init_core).
+            small, small_ext = _decimate_image_view(self.background, extent,
+                                                    (extent[0], extent[1]), (extent[2], extent[3]),
+                                                    _image_axes_px_budget(self.ax))
+            self._bg_image = self.ax.imshow(small, cmap=self.cmap, extent=small_ext, interpolation="auto")
+            self._in_display_refresh = False
+            self.ax.callbacks.connect("xlim_changed", lambda _ax: self._refresh_display_image())
+            self.ax.callbacks.connect("ylim_changed", lambda _ax: self._refresh_display_image())
         else:
             self._bg_image = None
         diameter = 2.0 * self.roi_radius
@@ -1549,17 +1658,18 @@ def panel_plot_spec(size: str = "2x2", *, kind: str = "default") -> FigureSpec:
 # margins are :func:`panel_margins_px` -- the SAME margins every single-axes panel uses -- so the grid's
 # TOTAL figure px (data box + margins) EQUALS a same-size single-axes panel's to the pixel, and the grid
 # thumbnail's outer padding matches every other kind's card (#5).  ONE size rule, ONE margin source.
-def _site_grid_geometry(size: str = "2x2") -> tuple[tuple[int, int], int, int, tuple[int, int, int, int], float]:
+def _site_grid_geometry(size: str, recommended: str) -> tuple[tuple[int, int], int, int, tuple[int, int, int, int], float]:
     """The grid's layout numbers for a panel-size preset: total data region (== every other kind's at
     this size), the inter-cell gaps, the outer margins, and the CELL-TEXT scale.
 
-    The text scale follows the PANEL SIZE with exactly TWO tiers (the operator's fixed rule,
-    :func:`_cell_font_scale`): below 2x2 the cell text is one notch smaller, from 2x2 up it is
-    the plot kind's standard style size.  The gaps then DERIVE from that text -- exactly the band
+    The text scale compares the panel size against the grid's RECOMMENDED default size with exactly
+    TWO tiers (the operator's fixed rule, :func:`_cell_font_scale`): squeezed below the
+    recommendation halves the standard 2x2 cell text, everything else keeps the plot kind's
+    standard style size.  The gaps then DERIVE from that text -- exactly the band
     the cell title (+ a row's x tick labels) needs, nothing more -- so every spare pixel goes into
     the CELLS (resize fills the area; the only hard constraint is that no cell title is cut)."""
     data_px = panel_plot_spec(size).data_px               # total data region == every other kind's at this size
-    font_scale = _cell_font_scale(size)
+    font_scale = _cell_font_scale(size, recommended)
     # All grid geometry is in DESIGN px (300 dpi -- style.DESIGN_DPI), so pt -> px is DPI/72.
     # The row corridor carries exactly ONE cell-title line (the edge-label policy strips x tick
     # labels off every non-bottom row, and the bottom row's labels live in the B margin), so its
@@ -3209,10 +3319,10 @@ class GridCell:
     relim_mode: str = "tight"
     fixed_lo: float = 0.0
     fixed_hi: float = 1.0
-    #: Cell-text scale, set by the GRID from the PANEL SIZE preset (_site_grid_geometry): a
-    #: 2x2-or-taller panel uses the standard small/tick font sizes (the cap), a half-height panel
-    #: shrinks proportionally.  Cells multiply their apply_title size by it; the grid's tick policy
-    #: multiplies its label size by it.
+    #: Cell-text scale, set by the GRID from the PANEL SIZE preset (_site_grid_geometry): a grid
+    #: squeezed below its RECOMMENDED default size uses HALF the standard small/tick font sizes,
+    #: every other size uses them unscaled.  Cells multiply their apply_title size by it; the
+    #: grid's tick policy multiplies its label size by it.
     font_scale: float = 1.0
 
     def thumb_lims(self, auto_lo: float, auto_hi: float) -> tuple[float, float]:
@@ -3787,8 +3897,11 @@ class GridPlot(BaseLivePlot):
         # single-axes panel (panel_plot_spec) so its x label never clips.  ``size=None`` picks the default
         # preset from the grid SHAPE (optimal_grid_size: >=4 cells on an axis -> the double half-unit), the
         # ONE default-size source the reopen / seed paths also use, so a fresh grid and a recorded-size-less
-        # reopen agree; an explicit ``size`` (a Setting pick) overrides it.
-        self._size = optimal_grid_size(self.nrows, self.ncols) if size is None else str(size)
+        # reopen agree; an explicit ``size`` (a Setting pick) overrides it.  The recommendation is KEPT
+        # (not consumed only by the default): the cell-text rule (_cell_font_scale) compares the current
+        # size against it -- a grid squeezed below its recommended preset halves the cell text.
+        self._recommended_size = optimal_grid_size(self.nrows, self.ncols)
+        self._size = self._recommended_size if size is None else str(size)
         panel_size_cells(self._size)                     # validate against PANEL_SIZES (raises otherwise)
         # cells set their own ticks; the base single-axes smart-tick pass would
         # only touch cell 0 and make it differ from the rest.
@@ -3809,7 +3922,7 @@ class GridPlot(BaseLivePlot):
         # other panel kind uses at this size) and create_axes_grid SUBDIVIDES it into cells -- so a grid's
         # data region equals a single-axes panel's of the same size (part A), records fig._zlc_fixed_box_in,
         # and a size change truly rescales the cells.
-        data_px, col_gap, row_gap, margins, font_scale = _site_grid_geometry(self._size)
+        data_px, col_gap, row_gap, margins, font_scale = _site_grid_geometry(self._size, self._recommended_size)
         axes = create_axes_grid(
             self.fig, self.nrows, self.ncols,
             data_px=data_px, col_gap_px=col_gap,
@@ -3829,8 +3942,9 @@ class GridPlot(BaseLivePlot):
         their dependent-axis range across cells (pooled clim / shared count top / shared y), so an
         edge label reads for the whole grid.  EVERY (re)draw path funnels back through this method --
         a ylog / fit toggle re-applies it after ``set_yscale`` rebuilt the locators, so the policy
-        never silently decays.  Label sizes follow the cell's ``font_scale`` (small panels shrink
-        proportionally; a full-size cell caps at the standard tick size)."""
+        never silently decays.  Label sizes follow the cell's ``font_scale`` (a panel squeezed
+        below the grid's recommended size halves them; every other size uses the standard tick
+        size)."""
         scale = float(getattr(self.cell_renderer, "font_scale", 1.0))
         if (k % self.ncols) == 0:               # the row's leftmost cell carries the y labels
             if ax.get_yscale() == "linear":

@@ -1283,6 +1283,57 @@ def _gravity_slot(cfg, placed, board_w: int) -> tuple[int, int]:
     return (x, y)
 
 
+def _snap_drop_anchor(cfg, placed, board_w: int) -> tuple[int, int]:
+    """NEAREST-ANCHOR landing rule for a DRAG-DROP: the dragged card's raw drop TOP-LEFT
+    (``cfg.col``, ``cfg.row``) competes over two candidate anchor sets and lands on the
+    closest one (squared euclidean distance).
+
+    A. CORNERS -- every OTHER placed card's top-left ``(c.col, c.row)``.  Winning means the
+       drop DISPLACES that card: the dragged card is seeded exactly on its corner, and the
+       subsequent :func:`_compact` (with the dragged card ``active``) lets it win the
+       coincident slot while NW gravity re-settles the displaced card out of the way (below).
+    B. VACANCIES -- the :func:`_first_free_slot` candidate lattice (x = GAP, each placed
+       card's right edge + GAP, and each left edge; y = GAP and each bottom edge + GAP),
+       kept only where the dragged card FITS: on the board (``GAP <= x <= max_x``, the same
+       clamp as :func:`_gravity_slot`) and clear of every placed card by GAP
+       (:func:`_overlaps_with_gap`).  Winning means the drop lands on that free anchor.
+
+    Deterministic tie-break: distance, then y, then x, then corner-over-vacancy.  Pure
+    geometry (no Qt).  Snapping only picks the SEED -- the ordinary :func:`_compact` NW
+    gravity then packs from it, so the no-teleport law still holds: the geometrically
+    NEAREST anchor wins, never a far free slot.  Applied ONLY on the drag-release path
+    (resize / reflow / Add placement never snap)."""
+    w, h = _card_size(cfg.size)
+    max_x = max(GAP, board_w - GAP - w)
+    drop_x, drop_y = int(round(cfg.col)), int(round(cfg.row))
+
+    def _key(x: int, y: int, rank: int) -> tuple[int, int, int, int]:
+        return ((x - drop_x) ** 2 + (y - drop_y) ** 2, y, x, rank)
+
+    best = None
+    for p in placed:                                     # A: corners (rank 0 wins a full tie)
+        cand = _key(int(p.col), int(p.row), 0)
+        best = cand if best is None or cand < best else best
+    xs = {GAP}
+    ys = {GAP}
+    for p in placed:                                     # B: the _first_free_slot vacancy lattice
+        px0, _py0, px1, py1 = _aabb(p)
+        xs.add(px1 + GAP)
+        xs.add(px0)                                      # align left edges (tuck under a wider card)
+        ys.add(py1 + GAP)
+    for x in xs:
+        if not (GAP <= x <= max_x):
+            continue
+        for y in ys:
+            if _overlaps_with_gap((x, y, x + w, y + h), placed):
+                continue
+            cand = _key(x, y, 1)
+            best = cand if best is None or cand < best else best
+    # ``placed`` empty -> A is empty but (GAP, GAP) is always a clear vacancy, so best is set.
+    _d2, y, x, _rank = best
+    return (x, y)
+
+
 def _first_free_slot(cfg, placed, board_w: int) -> tuple[int, int]:
     """The TOP-MOST then LEFT-MOST free ``(col, row)`` where ``cfg`` fits clear of every placed card (GAP
     apart, inside ``board_w``).  Used ONLY to SEED where a freshly-Added panel spawns, so an Add TILES into
@@ -1666,6 +1717,7 @@ class PanelCard(FluentGroupBox):
 
     changed = QtCore.pyqtSignal()          # any config edit (console marks dirty)
     layout_changed = QtCore.pyqtSignal()   # size/slot change (console re-arranges)
+    dropped = QtCore.pyqtSignal(object)    # drag-release ONLY (console snaps the drop to its nearest anchor)
     update_interval_changed = QtCore.pyqtSignal()  # per-panel refresh rate change (console re-bases the timer)
     remove_requested = QtCore.pyqtSignal(object)
     edit_requested = QtCore.pyqtSignal(object)   # "Edit…" -> open the panel's Edit tab
@@ -2836,12 +2888,15 @@ class PanelCard(FluentGroupBox):
         if self._drag_offset is not None:
             self._drag_offset = None
             self.setCursor(QtCore.Qt.OpenHandCursor)
-            # Record the raw drop pixel as this card's (col, row) seed; _compact then gravity-packs
-            # it top-left (it is the ``active`` card so it wins the spot nearest the drop point).
+            # Record the raw drop pixel as this card's (col, row) seed; the console then SNAPS the
+            # seed to the NEAREST anchor (another card's corner = displace it, or the closest free
+            # lattice point -- :func:`_snap_drop_anchor`) via ``dropped``, and _compact gravity-packs
+            # it top-left (it is the ``active`` card so it wins the anchor it snapped onto).
             col, row = max(0, self.x()), max(0, self.y())
             if (col, row) != (self.config.col, self.config.row):
                 self.config.col, self.config.row = col, row
                 self.changed.emit()
+            self.dropped.emit(self)         # drag-release ONLY: the console snaps the drop seed
             self.layout_changed.emit()      # re-pack (even when dropped back near the same spot)
         super().mouseReleaseEvent(event)
 
@@ -6049,6 +6104,7 @@ class TaskConsole(QtWidgets.QWidget):
         # reads -> refresh the frame-title legend NOW (it is self-guarded, so this is cheap and
         # a no-op when nothing changed), instead of lagging a tick behind the pick.
         card.changed.connect(self._refresh_signal_info)
+        card.dropped.connect(self._snap_dropped_card)   # drag-release only: snap BEFORE the re-pack
         card.layout_changed.connect(self._arrange)
         card.update_interval_changed.connect(self._recompute_tick_interval)
         card.remove_requested.connect(self._remove_panel)
@@ -6688,6 +6744,18 @@ class TaskConsole(QtWidgets.QWidget):
                 self._board_view_w = w
                 self._arrange()
         return super().eventFilter(obj, event)
+
+    def _snap_dropped_card(self, card: PanelCard) -> None:
+        """Snap a JUST-DROPPED card's raw pixel seed to its NEAREST anchor (:func:`_snap_drop_anchor`):
+        another card's top-left corner (= displace that card) or the closest free lattice point.
+        Connected to ``PanelCard.dropped`` -- the drag-release path ONLY, so resize / reflow / Add
+        placement stay snap-free; the ``layout_changed`` the card emits right after re-packs as usual
+        (the card is ``active`` in :func:`_compact`, so it wins the anchor it snapped onto)."""
+        if card not in self.cards:
+            return
+        others = [c.config for c in self.cards if c is not card]
+        board_w = self._pack_width([c.config for c in self.cards])
+        card.config.col, card.config.row = _snap_drop_anchor(card.config, others, board_w)
 
     def _arrange(self) -> None:
         # Top-left gravity pack (see _compact): every card floats UP then LEFT until blocked, with a

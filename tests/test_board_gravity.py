@@ -6,13 +6,18 @@ bottom, left, right -- and the margin from the top-left origin is a UNIFORM ``GA
 inter-card gap the user liked).  ``_compact`` re-packs ``PanelConfig.col`` (pixel x) / ``row``
 (pixel y) in place; there is NO column grid.
 
-These guards pin the five properties the redesign must hold:
+These guards pin the six properties the board must hold:
   (a) no two card AABBs overlap;
   (b) every neighbour and the board edges are separated by exactly ``GAP`` (a card with nothing
       above or left of it sits at ``(GAP, GAP)``);
   (c) determinism -- packing a settled board a second time is a fixed point (returns False);
   (d) stability -- moving one card and dropping it back reproduces the original layout;
-  (e) a dragged ``active`` card wins its spot and the others reflow around it.
+  (e) a dragged ``active`` card wins its spot and the others reflow around it;
+  (f) a DRAG-DROP lands on the NEAREST anchor (``_snap_drop_anchor``): the drop point competes
+      every other card's top-left CORNER (winning = the dragged card takes that exact corner and
+      DISPLACES the card, which gravity re-settles below) against every free VACANCY lattice
+      point (winning = the card lands there); ties break distance -> y -> x -> corner-first, and
+      the winner is always the geometrically nearest anchor -- never a far free slot.
 Pure functions (no Qt window beyond the QApplication ``scaled_px`` needs), so this runs in the suite.
 """
 
@@ -24,7 +29,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
 from Zou_lab_control.frontend.task_console import (
-    GAP, PanelConfig, _aabb, _card_size, _compact, _min_board_width,
+    GAP, PanelConfig, _aabb, _card_size, _compact, _min_board_width, _snap_drop_anchor,
 )
 
 
@@ -199,35 +204,106 @@ def test_drag_to_bottom_left_stays_below_the_top_left_card():
 
 
 def test_drop_beside_a_card_lands_at_its_right_edge_not_under_it():
-    """ROBUST drag (majority-overlap gravity): dropping card B to the RIGHT of card A with only a
-    SLIGHT horizontal overlap must land B at A's RIGHT EDGE (one GAP over), leaving A EXACTLY where it
-    was -- NOT sink B under A.  The old "any x-overlap = same column" rule made B fall beneath A the
-    moment their edges touched; the majority-overlap rule counts B as sharing A's column only when B
-    mostly covers A, so a card dragged to sit beside another rests beside it."""
+    """(f) The DROP PIPELINE (snap then compact): dropping card B to the RIGHT of card A with only a
+    slight horizontal overlap lands B at A's RIGHT EDGE (one GAP over), leaving A exactly where it
+    was -- NOT under A.  The drop point sits nearer the free VACANCY anchor at A's right edge than
+    A's corner, so the vacancy wins the nearest-anchor competition and gravity keeps B there."""
     w, h = _card_size("2x2")
     board_w = GAP + 2 * w + 2 * GAP                    # room for two side-by-side columns
     A = _cfg(GAP, GAP, "2x2")
-    B = _cfg(GAP + w - 30, GAP, "2x2")                 # dragged to A's right, only 30px of overlap
-    _compact([A, B], active=B, board_w=board_w)
+    B = _cfg(GAP + w - 30, GAP, "2x2")                 # dropped at A's right, only 30px of overlap
+    B.col, B.row = _snap_drop_anchor(B, [A], board_w)
     ax0, ay0, ax1, ay1 = _aabb(A)
+    assert (B.col, B.row) == (ax1 + GAP, GAP), "the snap picks the vacancy at A's right edge"
+    _compact([A, B], active=B, board_w=board_w)
     assert (A.col, A.row) == (GAP, GAP), "A stays put -- the dropped card does not shove it"
-    assert (B.col, B.row) == (ax1 + GAP, GAP), "B lands one GAP to the RIGHT of A, not beneath it"
+    assert (B.col, B.row) == (ax1 + GAP, GAP), "B rests one GAP to the RIGHT of A, not beneath it"
     _assert_no_overlap([A, B])
 
 
-def test_drop_mostly_onto_a_card_sinks_below_it():
-    """The other side of the majority rule: dropping B so it MOSTLY covers A (>half A's width) DOES
-    count as sharing A's column, so B sinks to just below A (one GAP under) -- the operator clearly
-    meant to stack, not to sit beside.  This is the boundary that keeps the packer's no-overlap
-    guarantee: a card that is mostly on top of another is placed under it, never left overlapping."""
+def test_drop_onto_a_cards_corner_displaces_it():
+    """(f) The corner side of the nearest-anchor rule: dropping B with its top-left CLOSE TO A's
+    top-left corner snaps B EXACTLY onto that corner -- B takes A's position and DISPLACES A, whose
+    anchored NW gravity (blocked above by B) re-settles it one GAP below.  The displaced card sinks;
+    the dropped card claims the spot (it is ``active`` so it wins the coincident slot in _compact)."""
     w, h = _card_size("2x2")
     board_w = GAP + 2 * w + 2 * GAP
     A = _cfg(GAP, GAP, "2x2")
-    B = _cfg(GAP + w - int(w * 0.9), GAP, "2x2")       # dragged mostly ON TOP of A (90% overlap)
+    B = _cfg(GAP + max(1, w // 10), GAP + 4, "2x2")    # dropped nearly ON A's corner
+    B.col, B.row = _snap_drop_anchor(B, [A], board_w)
+    assert (B.col, B.row) == (GAP, GAP), "the snap returns A's EXACT corner, not a rounded spot"
     _compact([A, B], active=B, board_w=board_w)
-    assert (A.col, A.row) == (GAP, GAP), "A stays put"
-    assert B.col == GAP and B.row == GAP + h + GAP, "B sinks to one GAP below A (it mostly covered A)"
+    assert (B.col, B.row) == (GAP, GAP), "B claimed A's position"
+    assert (A.col, A.row) == (GAP, GAP + h + GAP), "A is displaced: gravity re-settles it one GAP below"
     _assert_no_overlap([A, B])
+
+
+# ------------------------------------------------- (f) drop snapping (_snap_drop_anchor contract)
+def test_snap_drop_anchor_returns_exact_corner_when_nearest():
+    """Pure-function contract, corner side: a drop point a few px off another card's top-left
+    returns that card's EXACT corner (the displace semantics need the coincident-slot tie in
+    _compact, so the snap must not round or offset)."""
+    w, _h = _card_size("2x2")
+    board_w = GAP + 2 * w + 2 * GAP
+    A = _cfg(GAP, GAP, "2x2")
+    drop = _cfg(GAP + 12, GAP + 4, "2x2")
+    assert _snap_drop_anchor(drop, [A], board_w) == (GAP, GAP)
+
+
+def test_snap_drop_anchor_returns_vacancy_when_nearest():
+    """Pure-function contract, vacancy side: a drop point sitting nearly on the free lattice anchor
+    at A's right edge returns THAT point (right edge + GAP, top margin) -- not A's corner."""
+    w, _h = _card_size("2x2")
+    board_w = GAP + 2 * w + 2 * GAP
+    A = _cfg(GAP, GAP, "2x2")
+    drop = _cfg(GAP + w + GAP - 6, GAP + 10, "2x2")    # a few px off the vacancy right of A
+    assert _snap_drop_anchor(drop, [A], board_w) == (GAP + w + GAP, GAP)
+
+
+def test_snap_drop_anchor_tie_breaks_deterministically():
+    """Two corners EXACTLY equidistant from the drop point: the tie breaks by y then x, so the
+    LEFT card's corner wins -- and the result is independent of the ``placed`` iteration order
+    (same input, same output)."""
+    w, _h = _card_size("2x2")
+    D = (w + GAP + 1) // 2 + 10                        # half the two-card pitch (rounded up) + margin
+    A = _cfg(GAP, GAP, "2x2")
+    C = _cfg(GAP + 2 * D, GAP, "2x2")                  # same row, symmetric about the drop point
+    board_w = C.col + w + GAP
+    drop = _cfg(GAP + D, GAP, "2x2")
+    assert (drop.col - A.col) ** 2 == (C.col - drop.col) ** 2   # construction: an exact tie
+    assert _snap_drop_anchor(drop, [A, C], board_w) == (A.col, A.row)
+    assert _snap_drop_anchor(drop, [C, A], board_w) == (A.col, A.row)
+
+
+def test_displaced_board_keeps_no_overlap_and_uniform_gap():
+    """After a corner-win displaces a card in a settled stack, the packed board still holds the
+    core contract: no overlaps and every stacked neighbour exactly one GAP apart -- the dropped
+    card takes the corner, the displaced card the NEXT slot, the rest reflow beneath."""
+    w, h = _card_size("2x2")
+    board_w = _one_col_width("2x2")                    # one column -> a clean vertical stack
+    A = _cfg(GAP, GAP, "2x2")
+    C = _cfg(GAP, GAP + h + GAP, "2x2")
+    B = _cfg(GAP + 10, GAP + 6, "2x2")                 # dropped onto A's corner
+    B.col, B.row = _snap_drop_anchor(B, [A, C], board_w)
+    assert (B.col, B.row) == (GAP, GAP)
+    _compact([A, B, C], active=B, board_w=board_w)
+    _assert_no_overlap([A, B, C])
+    top, mid, bot = sorted([A, B, C], key=lambda c: c.row)
+    assert top is B and (top.col, top.row) == (GAP, GAP)
+    assert mid is A and mid.row == top.row + h + GAP   # the displaced card sinks to the next slot
+    assert bot is C and bot.row == mid.row + h + GAP   # the rest reflow, still one GAP apart
+
+
+def test_snap_prefers_the_near_corner_over_a_far_free_slot():
+    """(f) no-teleport: with the whole TOP-RIGHT column free, a drop right next to the bottom-left
+    card's corner snaps to THAT corner -- the winner is the geometrically nearest anchor, never a
+    far free slot (the old candidate-sweep teleport must not come back through the snap layer)."""
+    w, h = _card_size("1x2")
+    board_w = 2 * w + 3 * GAP                          # two columns; the right column is EMPTY
+    A = _cfg(GAP, GAP, "1x2")
+    C = _cfg(GAP, GAP + h + GAP, "1x2")
+    drop = _cfg(GAP + 8, GAP + h + GAP + 6, "1x2")     # a few px off C's corner
+    assert _snap_drop_anchor(drop, [A, C], board_w) == (C.col, C.row)
 
 
 def test_save_composite_fills_a_hidpi_grab_with_no_white_margin():

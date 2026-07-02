@@ -98,19 +98,19 @@ def test_embedded_canvas_pins_design_dpi_against_backend_inflation():
     from matplotlib.figure import Figure
 
     from Zou_lab_control.frontend.qt_canvas import EmbeddedFigureCanvas
-    from Zou_lab_control.frontend.style import DESIGN_DPI, LIVE_RENDER_SCALE
+    from Zou_lab_control.frontend.style import DESIGN_DPI
 
     if EmbeddedFigureCanvas is None:
         pytest.skip("matplotlib Qt canvas unavailable")
     fig = Figure(dpi=DESIGN_DPI)
     fig.set_size_inches(2.0, 1.5)
-    cv = EmbeddedFigureCanvas(fig, display_scale=1.0, render_scale=LIVE_RENDER_SCALE)
+    cv = EmbeddedFigureCanvas(fig, display_scale=1.0, render_scale=0.5)
     assert cv._zlc_design_dpi == float(DESIGN_DPI)        # captured the design dpi
     fig._original_dpi = 999.0                              # simulate the backend inflating it later
     cv._zlc_sync()
     real = float(super(type(cv), cv).devicePixelRatioF()) or 1.0
     # figure.dpi follows the DESIGN dpi (x real x render_scale), NOT the inflated 999
-    assert abs(fig.dpi - DESIGN_DPI * real * LIVE_RENDER_SCALE) < 1e-6
+    assert abs(fig.dpi - DESIGN_DPI * real * 0.5) < 1e-6
 
 
 def test_embedded_canvas_first_figure_boosted_dpi_unset_original_still_design_sized():
@@ -126,7 +126,7 @@ def test_embedded_canvas_first_figure_boosted_dpi_unset_original_still_design_si
     from matplotlib.figure import Figure
 
     from Zou_lab_control.frontend.qt_canvas import EmbeddedFigureCanvas
-    from Zou_lab_control.frontend.style import DESIGN_DPI, LIVE_RENDER_SCALE
+    from Zou_lab_control.frontend.style import DESIGN_DPI
 
     if EmbeddedFigureCanvas is None:
         pytest.skip("matplotlib Qt canvas unavailable")
@@ -136,7 +136,7 @@ def test_embedded_canvas_first_figure_boosted_dpi_unset_original_still_design_si
     if hasattr(fig, "_original_dpi"):
         del fig._original_dpi
     fig._set_dpi(float(DESIGN_DPI) * 2.5, forward=False)   # boosted (e.g. 750), _original_dpi unset
-    cv = EmbeddedFigureCanvas(fig, display_scale=1.0, render_scale=LIVE_RENDER_SCALE)
+    cv = EmbeddedFigureCanvas(fig, display_scale=1.0, render_scale=0.5)
     # must take the canonical DESIGN dpi, NOT the boosted 750 -> size-correct on the FIRST run
     assert cv._zlc_design_dpi == float(DESIGN_DPI)
     # the displayed widget is inches x DESIGN_DPI x display_scale (DPR cancels): NOT 2.5x bigger
@@ -156,7 +156,7 @@ def test_first_and_second_task_panel_build_both_design_sized_under_ipympl_boost(
 
     from Zou_lab_control.frontend.qt_canvas import EmbeddedFigureCanvas
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
-    from Zou_lab_control.frontend.style import DESIGN_DPI, LIVE_RENDER_SCALE
+    from Zou_lab_control.frontend.style import DESIGN_DPI
 
     if EmbeddedFigureCanvas is None:
         pytest.skip("matplotlib Qt canvas unavailable")
@@ -168,7 +168,7 @@ def test_first_and_second_task_panel_build_both_design_sized_under_ipympl_boost(
         if hasattr(fig, "_original_dpi"):
             del fig._original_dpi                              # _original_dpi UNSET (first-figure state)
         fig._set_dpi(float(DESIGN_DPI) * 2.5, forward=False)  # ipympl 2.5x browser boost: 300 -> 750
-        cv = EmbeddedFigureCanvas(fig, display_scale=1.0, render_scale=LIVE_RENDER_SCALE)
+        cv = EmbeddedFigureCanvas(fig, display_scale=1.0, render_scale=0.5)
         cv.setMinimumSize(cv.sizeHint())                      # the floor PanelCard pins at build
         app.processEvents()                                   # fire the deferred singleShot(0) resync
         return cv._zlc_design_dpi, cv.width(), cv.height(), cv.minimumWidth()
@@ -194,14 +194,14 @@ def test_embedded_canvas_deferred_resync_corrects_stale_layout_size():
 
     from Zou_lab_control.frontend.qt_canvas import EmbeddedFigureCanvas
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
-    from Zou_lab_control.frontend.style import DESIGN_DPI, LIVE_RENDER_SCALE
+    from Zou_lab_control.frontend.style import DESIGN_DPI
 
     if EmbeddedFigureCanvas is None:
         pytest.skip("matplotlib Qt canvas unavailable")
     app = ensure_qt_app()
     fig = Figure(dpi=DESIGN_DPI)
     fig.set_size_inches(2.0, 1.5)
-    cv = EmbeddedFigureCanvas(fig, display_scale=1.0, render_scale=LIVE_RENDER_SCALE)
+    cv = EmbeddedFigureCanvas(fig, display_scale=1.0, render_scale=0.5)
     assert hasattr(cv, "_zlc_resync")                     # the deferred-resync hook exists
     app.processEvents()                                   # fire the queued singleShot(0, _zlc_resync)
     # Pin a STALE, too-big minimum floor (as a pre-layout build-time setMinimumSize would) AND leave

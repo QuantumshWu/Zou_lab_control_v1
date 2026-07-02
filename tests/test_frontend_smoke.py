@@ -1381,14 +1381,14 @@ def test_task_console_cards_are_modular(monkeypatch):
             assert abs(card.canvas.width() - canvas_w) <= 1
             assert abs(card.canvas.height() - canvas_h) <= 1
             # the figure carries the ONE design dpi in _original_dpi; the live canvas
-            # renders the Agg buffer at LIVE_RENDER_SCALE x that (cheaper text raster) and
-            # UPSCALES it to the fixed display size (asserted above) -- so the render buffer
-            # is SMALLER than the on-screen widget (the speed win), unchanged display size.
-            from Zou_lab_control.frontend.style import LIVE_RENDER_SCALE
+            # renders the Agg buffer at EXACTLY the widget's on-screen device pixels
+            # (render_scale == display_scale in panel_canvas: a 1:1 blit, never rendered
+            # small and stretched up), so buffer px == widget logical px x the screen ratio.
+            from PyQt5 import QtWidgets
             fig = card.plotter.fig
             assert getattr(fig, "_original_dpi", fig.dpi) == DESIGN_DPI
-            if LIVE_RENDER_SCALE < 1.0:
-                assert fig.get_size_inches()[0] * fig.dpi < card.canvas.width()
+            real = QtWidgets.QWidget.devicePixelRatioF(card.canvas) or 1.0
+            assert abs(fig.get_size_inches()[0] * fig.dpi - card.canvas.width() * real) <= 1.0
     # same size -> identical card (the hist and monitor 1x2 cards)
     sizes = {}
     for card in console.cards:

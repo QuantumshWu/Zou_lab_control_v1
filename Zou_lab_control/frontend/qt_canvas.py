@@ -235,11 +235,12 @@ def panel_canvas(figure, *, isolate_wheel: bool = True):
     if EmbeddedFigureCanvas is None:  # pragma: no cover - matplotlib-qt missing
         raise RuntimeError("matplotlib Qt canvas is not available")
     from .live import PANEL_DISPLAY_SCALE
-    from .style import LIVE_RENDER_SCALE
-    # Live panels render at LIVE_RENDER_SCALE x design dpi (150 dpi) for speed; the display
-    # size is unchanged (Qt upscales the smaller buffer).  Saved figures use savefig.dpi.
+    # render_scale == display_scale: the Agg buffer matches the widget's on-screen device
+    # pixels EXACTLY (the two factors cancel in devicePixelRatioF, which then reads the real
+    # screen ratio).  Anything lower renders a smaller buffer that paintEvent must stretch
+    # up -- a permanent softness on every live panel.  Saved figures use savefig.dpi.
     return EmbeddedFigureCanvas(figure, display_scale=PANEL_DISPLAY_SCALE,
-                                isolate_wheel=isolate_wheel, render_scale=LIVE_RENDER_SCALE)
+                                isolate_wheel=isolate_wheel, render_scale=PANEL_DISPLAY_SCALE)
 
 
 __all__ = ["EmbeddedFigureCanvas", "panel_canvas"]
