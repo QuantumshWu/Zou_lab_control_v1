@@ -1167,6 +1167,21 @@ zf.grid(psf_weights, sub_plot_kind="2d", labels=("x (px)", "y (px)"))
 
 \pyapi{zf.site_histogram_grid(...)} 与 \pyapi{zf.site_psf_grid(...)} 只是 \pyapi{sub_plot_kind="hist"} / \pyapi{"2d"} 的\tfocus{薄壳预设}（同一条真实路径）。hist 每格：暗=灰、亮=蓝、橙线=该站阈值；\tfocus{站号（+保真度）画在每格的小标题里、不占图内区域}；所有格共享 x 轴便于比较。这是 frontend 的\tfocus{通用}多面板图（站点数任意，不写死 35），建在 \pyapi{canvas.create_axes_grid} 上——固定格 + 显式间距 + 图尺寸自适应，因此\tfocus{不重叠、不裁切、对齐}由构造保证（见 \filepath{frontend/AGENTS.md} 的 Layout 节）。保存后可用 \pyapi{exp.figure_viewer()} 重开：双击任一格放大成该 kind 的标准图、再双击/Esc 返回，Flow 页始终画出数据从何而来（至少 \pyapi{raw data -> plot}）。
 
+\subsubsection{facet：把任意一根轴展开成网格}
+
+grid 同时是一个\tfocus{维度展开工具}：把测量块 \pyapi{(repeat, points, *data\_dim)} 的\tfocus{某一根轴}展开成 N 个格子，每格是其余轴的一张标准小图。给 \pyapi{zf.grid} 传整块数组 + \pyapi{facet}（切哪根轴）即可；\pyapi{sub_plot_kind} 缺省时按每格剩余的形状自动选（剩 2 维扫描网格 $\to$ \pyapi{"2d"} 图像；剩多点 $\to$ \pyapi{"1d"} 曲线；只剩重复采样 $\to$ \pyapi{"hist"} 分布）：
+
+\begin{codeblock}[Python]
+# 3 层嵌套扫描（scan_shape=(n0, n1, n2)）的原始块 (repeat, n0*n1*n2, 1)：
+# 沿最外层扫描轴展开 -> n0 个格子，每格一张 (n1, n2) 的 2D 扫描图
+zf.grid(block, facet="points:0", points_shape=(n0, n1, n2), sub_plot_kind="2d")
+
+zf.grid(block, facet="repeat")   # 每个 repeat 一格（其余轴自动成形）
+zf.grid(vec_block, facet="dim:0")  # 逐站点向量按站展开，每站一张分布
+\end{codeblock}
+
+在 task 控制台里同样直观：Add Panel 选 \tfocus{Site grid}（新面板默认 \pyapi{facet=repeat}，绑上块信号立即出图），在 Setting 的 \tfocus{facet} 下拉里选展开轴（选项由生产节点声明的轴结构自动生成，标注每根轴的长度；\tfocus{(recipe)} = 载入图的静态快照），\tfocus{sub plot} 下拉选每格画什么（\pyapi{auto} 按剩余形状自动，或显式 hist/2d/1d）——Setting 的参数行随解析出的每格类型自动切换（hist 网格给 bins/fit/ylog，2d 网格给 colormap）。相机块 \pyapi{(repeat, 1, H, W)} facet 到 repeat 就是\tfocus{每个 repeat 一张帧图}；面板的 Edit 页照常给出当前数据的交互快照。此后每个 shot 网格\tfocus{就地增量刷新}（artist 复用，绝不重建）；双击放大后 live 更新只喂放大图，Esc 返回时缩略图一次补齐——relim/fixed/cmap/bins/repeat\_mode 等参数与所有 plot 同一机制。扫描程序里 \pyapi{scan_shape} 可声明\tfocus{任意层数}（如 \pyapi{(5, 4, 3)}），流送的表保持扁平，只有显示层按声明还原。
+
 \section{第三步：detect 探测（逐发判定）}
 
 \subsection{调用与返回}

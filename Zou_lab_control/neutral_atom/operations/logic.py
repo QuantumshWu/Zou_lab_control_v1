@@ -1976,11 +1976,12 @@ class PulseScanNode(_SweptBlockMeasurement):
         self._axis_unit = str(plan.axis_unit)
 
     def _publish_grid(self) -> np.ndarray:
-        """For a 2-D scan: the SAME raw block reshaped to ``(repeat, n0, n1)`` -- a pure reshape of
-        this node's own data, NO cross-repeat combine.  The 2-D panel reduces the repeat axis (per
-        ``repeat_mode``) then shows the (n0, n1) map, exactly as a 1-D panel reduces (repeat,points)."""
-        n0, n1 = self.scan_shape
-        return self._publish_raw()[:, :, 0].reshape(self._ring, int(n0), int(n1))
+        """For a GRID scan: the SAME raw block reshaped to ``(repeat, *scan_shape)`` -- a pure reshape
+        of this node's own data, NO cross-repeat combine.  A 2-level scan gives the ``(repeat, n0, n1)``
+        map a 2-D panel shows; a deeper scan (3-level ...) gives the block a facet grid expands along
+        its outer axis.  The plot reduces the repeat axis (per ``repeat_mode``), never this node."""
+        dims = tuple(int(n) for n in self.scan_shape)
+        return self._publish_raw()[:, :, 0].reshape(self._ring, *dims)
 
     def published_signals(self) -> frozenset:
         """The signals this scan publishes (behind ``prefix``): the swept x axis, the RAW y block,

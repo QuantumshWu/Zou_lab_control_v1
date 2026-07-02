@@ -2411,17 +2411,22 @@ def evaluate_scan_table_code(code: str, n_slots: int) -> tuple[list[list[float]]
             "per slot (the points advance in lockstep; build correlations into the columns).")
     rows = [[float(v) for v in row] for row in arr]
     shape = namespace.get("scan_shape")
-    scan_shape: tuple[int, int] | None = None
+    scan_shape: tuple[int, ...] | None = None
     if shape is not None:
+        # a GRID scan declares its point-axes shape -- ANY number of nested axes (a 2-level scan is
+        # (n0, n1), a 3-level scan (n0, n1, n2), ...): the streamed table stays flat, the shape only
+        # tells the display layer how to un-flatten (a 2-D map, a facet grid's outer axis, ...).
         try:
-            n0, n1 = (int(shape[0]), int(shape[1]))
-        except (TypeError, ValueError, IndexError):
-            raise ValueError(f"scan_shape must be a 2-tuple (n0, n1); got {shape!r}.")
-        if n0 * n1 != arr.shape[0]:
+            dims = tuple(int(v) for v in shape)
+        except (TypeError, ValueError):
+            raise ValueError(f"scan_shape must be a tuple of axis lengths (n0, n1, ...); got {shape!r}.")
+        if len(dims) < 2 or any(v < 1 for v in dims):
+            raise ValueError(f"scan_shape needs at least two axes of length >= 1; got {shape!r}.")
+        if int(np.prod(dims)) != arr.shape[0]:
             raise ValueError(
-                f"scan_shape {(n0, n1)} (= {n0 * n1} points) does not match the {arr.shape[0]} scan "
-                "rows -- a grid scan needs n0*n1 == N_points.")
-        scan_shape = (n0, n1)
+                f"scan_shape {dims} (= {int(np.prod(dims))} points) does not match the {arr.shape[0]} "
+                "scan rows -- a grid scan needs prod(scan_shape) == N_points.")
+        scan_shape = dims
     return rows, scan_shape
 
 

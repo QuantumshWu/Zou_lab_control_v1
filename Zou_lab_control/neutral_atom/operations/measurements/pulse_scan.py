@@ -205,7 +205,7 @@ class PulseScanPlan:
     def __init__(self, base_state: PulseTableState, scan_names: Sequence[str],
                  scan_arrays: Sequence[np.ndarray], camera, sequencer, *,
                  axis_label: str = "point", axis_unit: str = "", y_key: str = "signal",
-                 y_expr=None, scan_shape: tuple[int, int] | None = None, settle=None,
+                 y_expr=None, scan_shape: tuple[int, ...] | None = None, settle=None,
                  api_names: Sequence[str] = (), api_arrays: Sequence[np.ndarray] = (),
                  extra_delay_s: float = 0.0):
         self.base_state = base_state

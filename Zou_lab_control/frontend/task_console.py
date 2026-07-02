@@ -2010,7 +2010,11 @@ class PanelCard(FluentGroupBox):
         # {key: kind} for every declarative Setting control, so refresh_on_show can re-seed each widget
         # from config.params through its kind's PARAM_WIDGETS.write (one source -- no per-key handwiring).
         self._param_kinds: dict[str, str] = {}
-        display_specs = [s for s in PANEL_PARAMS.get(self._param_kind(), ()) if s.display]
+        # remember which kind's params this popup baked -- when a grid panel's RESOLVED per-cell
+        # kind changes later (facet / sub-plot pick, a signal bind), _sync_settings_param_rows
+        # rebuilds the popup so the rows below are never a stale bake of the old kind.
+        self._settings_param_kind = self._param_kind()
+        display_specs = [s for s in PANEL_PARAMS.get(self._settings_param_kind, ()) if s.display]
         if self.config.role == "plot":
             display_specs = display_specs + [_RELIM_PARAM]
         self.param_widgets.update(
@@ -2034,6 +2038,36 @@ class PanelCard(FluentGroupBox):
             self.fixed_lim_row, self.fixed_lo_edit, self.fixed_hi_edit = \
                 self._make_fixed_lim_row(self._on_fixed_lim_edited, label_w)
             sec.addWidget(self.fixed_lim_row)
+
+            # FACET chooser (grid panels only): which axis of the bound (repeat, points, *data_dim)
+            # block expands into the cells -- the grid-as-axis-expander declaration.  Options derive
+            # from the producing node's declared structure and refresh on every Setting open (the
+            # signal-combo rule); "(recipe)" keeps the loaded-figure snapshot behaviour.  Beside it
+            # the SUB PLOT chooser picks what each cell draws (auto = derive from what the slice
+            # leaves; else an explicit hist / 2d / 1d) -- the params section below always shows the
+            # RESOLVED kind's knobs (see _sync_settings_param_rows).
+            self.facet_combo = None
+            self.sub_kind_combo = None
+            if self.config.kind == "grid":
+                self.facet_combo = FluentComboBox()
+                self.facet_combo.setToolTip(
+                    "Expand ONE axis of the bound block into the grid cells: each repeat / scan-axis "
+                    "entry / data-axis entry becomes its own cell ((recipe) = a loaded figure's snapshot)")
+                self.facet_combo.activated.connect(self._on_facet_changed)
+                sec.addWidget(FluentSettingRow("facet", self.facet_combo, label_width=label_w))
+                self._refresh_facet_combo()
+                from .live import GRID_CELL_BY_KIND
+                self.sub_kind_combo = FluentComboBox()
+                self.sub_kind_combo.addItem("auto", "")
+                for cell_kind in GRID_CELL_BY_KIND:     # the cell families, ONE source
+                    self.sub_kind_combo.addItem(cell_kind, cell_kind)
+                self.sub_kind_combo.setToolTip(
+                    "What each cell draws: auto derives it from what the facet slice leaves "
+                    "(a 2-D frame -> 2d, an ordered axis -> 1d, bare samples -> hist); "
+                    "an explicit pick overrides")
+                self.sub_kind_combo.activated.connect(self._on_sub_kind_changed)
+                sec.addWidget(FluentSettingRow("sub plot", self.sub_kind_combo, label_width=label_w))
+                self._refresh_sub_kind_combo()
 
             # unit cycle: a single row [Unit button | <stretch> | current unit text] under the "unit"
             # label (one-control-per-row rhythm) -- the IDENTICAL row the Edit tab builds via the helper.
@@ -2297,8 +2331,12 @@ class PanelCard(FluentGroupBox):
             return
         if time.monotonic() - self._settings_dismissed_at < 0.25:
             return
+        self._sync_settings_param_rows()   # a grid's resolved kind may have changed since the last bake
+        popup = self.settings_popup        # (the sync may have swapped in a fresh popup)
         self.refresh_on_show()          # Setting controls are a VIEW of config.params -- refresh on open (#6)
         self._refresh_signal_combo()
+        self._refresh_facet_combo()     # facet choices re-derive from the CURRENT node structure
+        self._refresh_sub_kind_combo()
         anchor = self.setting_button.mapToGlobal(
             QtCore.QPoint(self.setting_button.width(), self.setting_button.height()))
         self._size_settings_popup()                        # height: show-all, grow-not-shrink (#H3i-2)
@@ -2383,6 +2421,7 @@ class PanelCard(FluentGroupBox):
         if len(self.slot_combos) <= 1 and idx == 0:
             self.source_edit.setText("value = signal" if name else _BLANK_SOURCE)
         self._apply_source()                      # picking a slot applies instantly
+        self._sync_settings_param_rows()          # a grid's resolved cell kind follows the new bind
 
     def _add_signal_slot(self) -> None:
         """Add a signal slot (signal[i]) so the panel can combine more signals.  When growing
@@ -2407,16 +2446,29 @@ class PanelCard(FluentGroupBox):
         self._rebuild_settings_popup()
         self._apply_source()
 
-    def _rebuild_settings_popup(self) -> None:
-        """Rebuild + reopen the Setting popup (the slot count is fixed at build time, so adding /
-        removing a slot rebuilds it) so the new combo row shows without the user re-clicking."""
+    def _rebuild_settings_popup(self, *, reopen: bool = True) -> None:
+        """Rebuild the Setting popup (the slot count and the per-kind param rows are fixed at build
+        time, so adding/removing a slot or a resolved-kind change rebuilds it).  ``reopen`` shows the
+        fresh popup at once (the user was in it); False rebuilds silently for the next open."""
         old = getattr(self, "settings_popup", None)
         if old is not None:
             old.hide()
             old.deleteLater()
         self._build_settings()                    # builds a fresh self.settings_popup + combos
-        self._settings_dismissed_at = 0.0
-        self._open_settings()                     # reopen (positioned + height-capped)
+        if reopen:
+            self._settings_dismissed_at = 0.0
+            self._open_settings()                 # reopen (positioned + height-capped)
+
+    def _sync_settings_param_rows(self) -> None:
+        """A grid panel's per-kind Setting rows (bins/fit/ylog for hist cells, the colormap for 2d
+        cells, ...) follow the RESOLVED per-cell kind: whenever the resolve changes -- a facet or
+        sub-plot pick, a signal bind, a load -- the popup is rebuilt so the rows are the new kind's
+        PANEL_PARAMS, never a stale bake of the kind the popup happened to open with."""
+        if self.config.kind != "grid":
+            return
+        if self._param_kind() == getattr(self, "_settings_param_kind", None):
+            return
+        self._rebuild_settings_popup(reopen=self.settings_popup.isVisible())
 
     # ------------------------------------------------ basic display toggles
     def _current_unit_text(self) -> str:
@@ -2496,6 +2548,8 @@ class PanelCard(FluentGroupBox):
         sub = getattr(self.plotter, "sub_plot_kind", None)
         if sub:
             return str(sub)
+        if self._facet():
+            return self._resolved_sub_kind()     # a facet grid's kind derives from the slice, not a recipe
         if callable(self.grid_recipe_provider) and self.config.inputs and self.config.inputs[0]:
             try:
                 recipe = self.grid_recipe_provider(self.config.inputs[0])
@@ -2527,6 +2581,130 @@ class PanelCard(FluentGroupBox):
             out["bins"] = int(display["bins"])          # top-level bins drives the thumbnail binning
         out["display_params"] = display
         return out
+
+    # --------------------------------------------------------------- facet (the grid as an axis-expander)
+    def _facet(self) -> str:
+        """The panel's facet declaration (``config.params["facet"]``): which axis of the bound
+        ``(repeat, points, *data_dim)`` block expands into the grid cells.  Empty = a RECIPE grid
+        (the loaded-figure snapshot, the pre-facet behaviour)."""
+        return str(self.config.params.get("facet") or "")
+
+    def _facet_value_shapes(self) -> tuple[tuple, tuple]:
+        """(points multi-D shape, data shape) from the producing node's declared structure (#H3o) --
+        the points axis is stored FLAT, its multi-D form lives in ``grid_shape`` when the scan
+        declared one.  The ONE source the facet choices, the auto sub-kind and the slicer share."""
+        st = self._bound_structure() or {}
+        gs = tuple(int(n) for n in (st.get("grid_shape") or ()))
+        ps = tuple(int(n) for n in (st.get("points_shape") or ()))
+        ds = tuple(int(n) for n in (st.get("data_shape") or ()))
+        return (gs or ps), ds
+
+    def _resolved_sub_kind(self) -> str:
+        """The facet grid's per-cell kind: the operator's explicit ``sub_plot_kind`` param when set,
+        else the ONE auto rule (``default_sub_plot_kind``: what each cell has left after the slice)."""
+        from .live import GRID_CELL_BY_KIND, default_sub_plot_kind
+        sub = str(self.config.params.get("sub_plot_kind") or "")
+        if sub in GRID_CELL_BY_KIND:
+            return sub
+        pts, dim = self._facet_value_shapes()
+        return default_sub_plot_kind(self._facet() or "repeat", points_shape=pts, data_shape=dim)
+
+    def _facet_cells(self, value):
+        """Slice the bound block into the per-cell inputs through the ONE rule (live.facet_cells)."""
+        from .live import facet_cells
+        block = np.asarray(value, dtype=float)
+        if block.ndim < 2:
+            raise ValueError(
+                "a facet grid slices the bound signal's (repeat, points, *data_dim) block; got shape "
+                f"{block.shape} -- bind a measurement's block signal (not a scalar).")
+        pts, _ = self._facet_value_shapes()
+        if int(np.prod(pts, dtype=np.int64) if pts else 0) != int(block.shape[1]):
+            pts = ()                              # declared shape does not match this block -> flat points
+        return facet_cells(block, self._facet(), sub_plot_kind=self._resolved_sub_kind(),
+                           points_shape=pts, repeat_mode=self._repeat_mode_value())
+
+    def _build_facet_plotter(self, value, *, interactions: bool):
+        """Build this panel's FACET grid through the ONE factory + replay its persisted per-kind
+        display knobs (bins / fit / ylog / cmap) AND the relim family (BaseLivePlot.apply_param owns
+        them all).  The ONE builder the live card (display-only) and the Edit-tab snapshot
+        (interactive) share -- so the two can never drift."""
+        from .live import grid as build_facet_grid
+        sub = self._resolved_sub_kind()
+        plotter = build_facet_grid(
+            self._facet_cells(value), sub_plot_kind=sub, size=self.config.size,
+            display=False, interactions=interactions, title=self.config.title or "")
+        for key in [d.key for d in PANEL_PARAMS.get(sub, ())] + ["relim", "fixed_lo", "fixed_hi"]:
+            if key in self.config.params:
+                plotter.apply_param(key, self.config.params[key])
+        return plotter
+
+    def _facet_choices(self) -> list[tuple[str, str]]:
+        """The facet dropdown's ``[(stored value, display text)]`` -- derived from the producing
+        node's declared axis structure, with the axis LENGTH shown so the operator picks by meaning
+        ('scan axis 0 (5)') instead of guessing indices."""
+        out = [("", "(recipe)"), ("repeat", "repeat")]
+        pts, dim = self._facet_value_shapes()
+        if len(pts) > 1:
+            out.extend((f"points:{i}", f"scan axis {i} ({n})") for i, n in enumerate(pts))
+        elif pts and pts[0] > 1:
+            out.append(("points:0", f"scan axis 0 ({pts[0]})"))
+        out.extend((f"dim:{i}", f"data axis {i} ({n})") for i, n in enumerate(dim) if n > 1)
+        return out
+
+    def _refresh_facet_combo(self) -> None:
+        """Refill the facet dropdown from the CURRENT node structure (a Setting open re-derives it,
+        like the signal combo) keeping the stored pick selected."""
+        combo = getattr(self, "facet_combo", None)
+        if combo is None:
+            return
+        current = self._facet()
+        with _signals_blocked(combo):
+            combo.clear()
+            index = 0
+            for j, (value, text) in enumerate(self._facet_choices()):
+                combo.addItem(text, value)
+                if value == current:
+                    index = j
+            combo.setCurrentIndex(index)
+
+    def _on_facet_changed(self, index: int) -> None:
+        """The operator picked a facet axis: persist + rebuild.  A facet change is a STRUCTURE change
+        (the cell count and even the per-cell kind may differ), so it goes through the ordinary reset
+        path -- the generic refocus rule returns to the enlarged cell when it survives the rebuild."""
+        value = str(self.facet_combo.itemData(int(index)) or "")
+        if value == self._facet():
+            return
+        self.config.params["facet"] = value
+        self._reset_plot()
+        self._render_version = -1
+        self._rerender_last()
+        self._sync_settings_param_rows()   # the resolved per-cell kind may have changed with the axis
+        self.changed.emit()
+
+    def _refresh_sub_kind_combo(self) -> None:
+        """Re-select the stored ``sub_plot_kind`` pick ("" = auto) on the Setting's sub-plot chooser."""
+        combo = getattr(self, "sub_kind_combo", None)
+        if combo is None:
+            return
+        with _signals_blocked(combo):
+            combo.setCurrentIndex(max(0, combo.findData(str(self.config.params.get("sub_plot_kind") or ""))))
+
+    def _on_sub_kind_changed(self, index: int) -> None:
+        """The operator picked what each cell draws (auto / hist / 2d / 1d): persist + rebuild -- a
+        per-cell kind change is a structure change exactly like a facet change, and the Setting's
+        param rows follow the new resolve."""
+        value = str(self.sub_kind_combo.itemData(int(index)) or "")
+        if value == str(self.config.params.get("sub_plot_kind") or ""):
+            return
+        if value:
+            self.config.params["sub_plot_kind"] = value
+        else:
+            self.config.params.pop("sub_plot_kind", None)      # auto: derive from the slice
+        self._reset_plot()
+        self._render_version = -1
+        self._rerender_last()
+        self._sync_settings_param_rows()
+        self.changed.emit()
 
     def _apply_display_params(self) -> None:
         """Apply the persisted Setting toggles (relim mode + unit cycle) to
@@ -2890,6 +3068,12 @@ class PanelCard(FluentGroupBox):
         # a repeat block (axis 0 = repeat) -- structure-driven when core_ndim is declared, else ndim>=3
         if had_repeat and (b.ndim == 1 + core_ndim if core_ndim is not None else b.ndim >= 3):
             self._repeat_cur = repeats_with_data(b, core_ndim=core_ndim)   # scan / camera / occupancy block
+            if self.config.kind == "grid" and self._facet():
+                # A FACET grid owns the repeat axis ITSELF: facet=repeat slices it into cells, and any
+                # other facet collapses the leftover repeats INSIDE facet_cells (per repeat_mode) --
+                # reducing here would hand the slicer a block whose repeat axis is already gone
+                # (facet=repeat would always show ONE cell).
+                return b
             # ONE reducer dispatches on the chosen mode; the only kind input is hist=, because a histogram
             # has NO x-axis in its core (#iron-law): every non-pool reduction flattens to one sample set,
             # and 'create' keeps each repeat's whole core as a column (n_samples, R) -- a trace's create
@@ -2985,6 +3169,10 @@ class PanelCard(FluentGroupBox):
         if kind == "pulse":
             return value
         arr = np.asarray(value, dtype=float)
+        if kind == "grid":
+            # A FACET grid consumes the bound block in its RAW (repeat, points, *data_dim) form --
+            # facet_cells owns the slicing; a recipe grid's value is only a numeric placeholder.
+            return arr
         # The producing node's structure (#H3o): reshape is decided by the DATA dimensionality (NOT a
         # size threshold).  ``data_shape`` 1-D -> the data is multiple series -> LINES (data does not
         # reshape); ``data_shape`` 2-D -> the data is an image -> it reshapes (image / flat trace).
@@ -3154,8 +3342,17 @@ class PanelCard(FluentGroupBox):
         # pixels, honestly.  Whatever the source gives the dis is what the dis bins.
         # A GRID cell is ENLARGED into a standalone plot-kind figure (``_grid_focus`` set): the live tick
         # must NOT rebuild the grid over it, or the enlarged view (and any lim edit on it) would bounce back
-        # to the thumbnail.  Skip rendering entirely while focused -- the parked grid is redrawn on unfocus.
+        # to the thumbnail.  A LIVE facet grid still feeds the ENLARGED view (update_cells' host-focus
+        # channel touches ONLY the focus plotter; the thumbnails redraw once on unfocus); a recipe grid
+        # stays a gated snapshot.
         if self._grid_focus is not None:
+            if self.config.kind == "grid" and self._facet():
+                parked = self._grid_focus
+                per_cell = self._facet_cells(self._coerce(value))
+                if len(per_cell) == parked.grid.n_cells:
+                    parked.grid.update_cells(per_cell, focus=(self.plotter, parked.k))
+                    if self.canvas is not None:
+                        self.canvas.draw_idle()
             return
         value = self._coerce(value)
         kind = self.config.kind
@@ -3166,12 +3363,33 @@ class PanelCard(FluentGroupBox):
             self._build_plot(value, namespace)
             self._force_rebuild = False
             return
-        # A grid panel is a SNAPSHOT built from its recipe: (re)build only on the FIRST show or when a
-        # display knob marked a rebuild -- NEVER a per-tick redraw.  Without this gate a grid fell through to
-        # the trailing ``plotter.update(value)`` and re-rendered ALL N cells on EVERY (even unrelated) hub
-        # bump, which froze the console -- the real "grid drawing is very slow" cause (#3).  The hub ``value``
-        # is only a numeric placeholder; the per-site content lives in the recipe.
+        # A grid panel is either a LIVE facet grid (the bound block sliced along the declared axis,
+        # cells moved in place each tick) or a RECIPE snapshot (a loaded figure -- built once, never a
+        # per-tick redraw: re-rendering all N cells on every hub bump froze the console, #3).
         if kind == "grid":
+            if self._facet():
+                # A LIVE facet grid: first show builds; every later tick moves the cells IN PLACE
+                # (update_cells -- the grid counterpart of a standalone kind's update).  A cell-count
+                # change (the scan restructured) rebuilds through the ordinary build-then-swap.
+                # Every (re)build is followed by the Setting-rows sync: the build is the ONE point
+                # every kind-changing path converges on (a pick, a load, an expression edit).
+                if self.plotter is None or self._force_rebuild:
+                    self._build_plot(value, namespace)
+                    self._force_rebuild = False
+                    self._sync_settings_param_rows()
+                    return
+                per_cell = self._facet_cells(value)
+                if len(per_cell) != getattr(self.plotter, "n_cells", -1):
+                    self._build_plot(value, namespace)
+                    self._force_rebuild = False
+                    self._sync_settings_param_rows()
+                    return
+                self.plotter.update_cells(per_cell)
+                if self.canvas is not None:
+                    self.canvas.draw_idle()
+                return
+            # a RECIPE grid is a SNAPSHOT built from its recipe: (re)build only on the FIRST show or
+            # when a display knob marked a rebuild -- NEVER a per-tick redraw (#3).
             if self.plotter is None or self._force_rebuild:
                 self._build_plot(value, namespace)
                 self._force_rebuild = False
@@ -3313,16 +3531,25 @@ class PanelCard(FluentGroupBox):
             # carry, so it is resolved off the producing node via ``grid_recipe_provider`` -- the SAME "aux
             # data from the producing node" wiring the pulse panel + site map use (the hub ``value`` here is
             # only a numeric placeholder).  Its geometry (cell count-driven size) is frontend-owned.
-            from .live import build_grid_figure
+            facet = self._facet()
+            if facet:
+                # A FACET grid: the bound block IS the data -- slice it along the declared axis
+                # (facet_cells, the ONE rule) and build through the ONE shared builder (the Edit-tab
+                # snapshot uses the same one); every tick after this first build moves the cells in
+                # place (update_cells in _render).
+                plotter = self._build_facet_plotter(value, interactions=False)
+            else:
+                from .live import build_grid_figure
 
-            recipe = self.grid_recipe_provider(self.config.inputs[0]) \
-                if (callable(self.grid_recipe_provider) and self.config.inputs) else None
-            if recipe is None:
-                raise ValueError(
-                    "grid panel needs a grid figure's producing node -- point it at a loaded grid "
-                    "figure's fig_value signal (it carries the grid recipe to reproduce).")
-            recipe = self._grid_recipe_with_params(recipe)   # fold the panel's live display knobs in
-            plotter = build_grid_figure(recipe, interactions=False, size=size, display=False)
+                recipe = self.grid_recipe_provider(self.config.inputs[0]) \
+                    if (callable(self.grid_recipe_provider) and self.config.inputs) else None
+                if recipe is None:
+                    raise ValueError(
+                        "grid panel needs a grid figure's producing node (a loaded grid figure's "
+                        "fig_value signal) -- or pick a facet in Setting to expand a measurement "
+                        "block's axis into cells.")
+                recipe = self._grid_recipe_with_params(recipe)   # fold the panel's live display knobs in
+                plotter = build_grid_figure(recipe, interactions=False, size=size, display=False)
         elif kind == "sites":
             centers, image = self._sites_aux(namespace or {})
             vec = np.asarray(value, dtype=float).reshape(-1)
@@ -4559,15 +4786,22 @@ class PanelEditor(QtWidgets.QWidget):
                 new_plotter, _channels, _repeat = build_pulse_preview_plot(
                     state, include_always_off=include_off, size=size)   # Edit tab: interactive (default)
             elif kind == "grid":
-                # A grid panel's snapshot rebuilds through the SAME grid builder the live card uses
-                # (``build_grid_figure`` via the console's ``_grid_recipe`` provider) -- the grid mirror of
-                # the pulse branch, never the array else branch.
-                from .live import build_grid_figure
-                recipe = self.console._grid_recipe(card.config.inputs[0]) if card.config.inputs else None
-                if recipe is None:
-                    raise ValueError("grid panel has no producing node to snapshot")
-                recipe = card._grid_recipe_with_params(recipe)   # fold the panel's live display knobs in
-                new_plotter = build_grid_figure(recipe, interactions=True, size=size, display=False)
+                # A grid panel's snapshot rebuilds through the SAME builders the live card uses --
+                # never the array else branch.  A FACET grid re-slices the card's last good data
+                # through the ONE shared builder (_build_facet_plotter -- interactive here, like
+                # every Edit snapshot); a recipe grid rebuilds via the _grid_recipe provider.
+                if card._facet():
+                    if card._last_namespace is None:
+                        raise ValueError("facet grid has no data yet to snapshot")
+                    new_plotter = card._build_facet_plotter(
+                        card._signal_then_repeat(card._last_namespace), interactions=True)
+                else:
+                    from .live import build_grid_figure
+                    recipe = self.console._grid_recipe(card.config.inputs[0]) if card.config.inputs else None
+                    if recipe is None:
+                        raise ValueError("grid panel has no producing node to snapshot")
+                    recipe = card._grid_recipe_with_params(recipe)   # fold the panel's live display knobs in
+                    new_plotter = build_grid_figure(recipe, interactions=True, size=size, display=False)
             elif kind == "2d":
                 new_plotter = panel_plot(np.array(src.data_x, dtype=float),
                                          np.array(src.data_y[:, 0], dtype=float), kind="2d",
@@ -6373,6 +6607,10 @@ class TaskConsole(QtWidgets.QWidget):
         # one name in the card header / Edit tab / frame title.
         title = indexed_unique_name(PANEL_KINDS[str(kind)], {c.config.title for c in self.cards})
         config = PanelConfig(kind=str(kind), title=title, row=GAP, col=GAP, size="1x2")
+        if str(kind) == "grid":
+            # An Add-Panel grid IS the axis-expander: default to faceting the repeat axis so binding
+            # a signal shows cells at once ("(recipe)" is only meaningful for a LOADED figure's grid).
+            config.params["facet"] = "repeat"
         # SPAWN the new card at the first free TOP-LEFT slot (tile into the board: fill the top row
         # then wrap), NOT a fresh column -- the local NW gravity in _compact then keeps it there.  Seed
         # against the live VIEWPORT width so Add only ever tiles WITHIN the visible pane (it never

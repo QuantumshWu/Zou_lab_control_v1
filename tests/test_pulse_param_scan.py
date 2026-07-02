@@ -550,3 +550,48 @@ def test_pulse_scan_table_column_count_must_match_slots():
     finally:
         _safe_unlink(probe)
         exp.close()
+
+
+def test_pulse_scan_3_level_grid_publishes_the_nested_block_for_a_facet_grid():
+    """A 3-LEVEL grid scan -- the program declares scan_shape (n0, n1, n2) -- publishes the per-point
+    y reshaped into the (repeat, n0, n1, n2) block, and the ONE facet rule (live.facet_cells) expands
+    its OUTER axis into n0 cells of (n1, n2) maps: the 3-D pulse scan displayed as a 2d facet grid.
+    (The old scan_shape validator hard-rejected anything but a 2-tuple; a nested scan is now a
+    first-class declaration -- the streamed table stays flat, only the display un-flattens.)"""
+    from Zou_lab_control.neutral_atom.timing import PulseTableState, single_imaging_template
+    exp = _calibrated()
+    st = single_imaging_template()
+    st.add_period(20.0, name="probe2", unit="us")
+    st.add_period(20.0, name="probe3", unit="us")
+    st.bind_field("duration", "1", unit="us")
+    st.bind_field("duration", "2", unit="us")
+    st.bind_field("duration", "3", unit="us")
+    probe = Path("pulses") / "_test_probe_3d.json"
+    st.save(str(probe))
+    prog = ("import numpy as np\n"
+            "a = np.linspace(10000, 30000, 3)\n"
+            "b = np.linspace(10000, 20000, 2)\n"
+            "c = np.linspace(15000, 25000, 2)\n"
+            "A, B, C = np.meshgrid(a, b, c, indexing='ij')\n"
+            "scan_table = np.column_stack([A.ravel(), B.ravel(), C.ravel()])\n"
+            "scan_shape = (len(a), len(b), len(c))\n")
+    try:
+        x, y, node, hub = _run_pulse_scan(
+            exp, template=str(probe), pulse_slots={"api": {}, "scan_code": prog},
+            y={"inputs": ["rate"], "source": "value = signal"})
+        assert node.scan_shape == (3, 2, 2)
+        assert node.grid_shape == (3, 2, 2)
+        grid_name = node.y_signal + "_grid"
+        assert grid_name in hub.names()
+        raw_grid = np.asarray(hub.latest(grid_name))
+        assert raw_grid.shape == (1, 3, 2, 2), raw_grid.shape
+        # the flat y block + the declared points shape feed the facet slicer: outer axis -> 3 cells,
+        # each a (2, 2) frame -- exactly what a console grid panel bound to <y> with facet=points:0 shows
+        from Zou_lab_control.frontend.live import facet_cells
+        block = np.asarray(hub.latest(node.y_signal))          # (repeat, 12, 1)
+        cells = facet_cells(block, "points:0", sub_plot_kind="2d", points_shape=(3, 2, 2))
+        assert len(cells) == 3 and cells[0].shape == (2, 2)
+        np.testing.assert_allclose(np.stack(cells).reshape(3, 2, 2), raw_grid[0])
+    finally:
+        _safe_unlink(probe)
+        exp.close()

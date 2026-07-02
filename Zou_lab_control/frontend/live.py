@@ -2948,6 +2948,142 @@ def _as_per_site_list(per_site_values, n_sites: int | None = None):
     return out
 
 
+# ------------------------------------------------------------------ facet: the grid as an axis-expander
+# A grid is a DIMENSION-EXPANSION tool: pick ONE axis of a measurement block -- the block always obeys
+# the shape iron law ``(repeat, points, *data_dim)`` -- and lay that axis out as N aligned cells, each a
+# standard ``sub_plot_kind`` panel of the REMAINING axes.  ``facet_cells`` below is the ONE slicing rule
+# every surface shares (the console's live grid panel, the notebook ``grid(value, facet=...)`` factory),
+# so "which axis becomes the cells and what each cell shows" is defined in exactly one place.
+
+def normalize_facet(facet):
+    """Parse a facet spec into the canonical ``(group, index)`` pair -- or ``None`` (no faceting:
+    the grid shows a static per-cell recipe, the pre-facet behaviour).
+
+    Accepted spellings: ``"repeat"`` (one cell per repeat), ``"points"``/``"points:i"`` (one cell per
+    entry of the i-th POINTS axis -- the scan grid's axes, e.g. the outer axis of a 3-D pulse scan),
+    ``"dim"``/``"dim:i"`` (one cell per entry of the i-th DATA axis, e.g. per site of a per-site
+    vector), or an explicit ``(group, index)`` tuple.  Anything else raises."""
+    if facet is None or facet == "":
+        return None
+    if isinstance(facet, (tuple, list)) and len(facet) == 2:
+        group, index = str(facet[0]), int(facet[1])
+    else:
+        text = str(facet).strip()
+        group, _, idx = text.partition(":")
+        group = group.strip()
+        index = int(idx) if idx.strip() else 0
+    if group not in ("repeat", "points", "dim") or index < 0:
+        raise ValueError(
+            f"facet must be 'repeat', 'points[:i]' or 'dim[:i]' (or a (group, i) pair); got {facet!r}.")
+    return group, index
+
+
+def _collapse_repeat(sliced, repeat_mode: str):
+    """Collapse the leading REPEAT axis of a per-cell slice for an image/line cell -- the same display
+    verbs the standalone kinds use (``average`` mean / ``add`` sum / ``replace`` latest).  A histogram
+    cell never calls this: a distribution POOLS every repeat's samples by definition."""
+    mode = str(repeat_mode)
+    if mode == "add":
+        return np.nansum(sliced, axis=0)
+    if mode == "replace":
+        return np.asarray(sliced[-1], dtype=float)
+    return np.nanmean(sliced, axis=0)          # 'average' -- and the fallback for any other verb
+
+
+def default_sub_plot_kind(facet, *, points_shape=(), data_shape=()) -> str:
+    """The natural per-cell kind for a facet slice -- from what each cell has LEFT after the slice
+    (the same by-dimensionality rule the console's reshape uses, #H3o): a remaining 2-D points grid
+    OR a remaining 2-D data_dim (a camera frame) is an image cell, more than one remaining value is
+    a curve, a bare sample set is a distribution.  The ONE auto rule the console's 'auto'
+    sub_plot_kind and the notebook factory share."""
+    group, index = normalize_facet(facet) or ("", 0)
+    pts = tuple(int(n) for n in points_shape) or (1,)
+    dim = tuple(int(n) for n in data_shape) or (1,)
+    if group == "points":
+        pts = tuple(n for i, n in enumerate(pts) if i != index)
+    elif group == "dim":
+        dim = tuple(n for i, n in enumerate(dim) if i != index)
+    if len(pts) == 2:
+        return "2d"                            # a remaining 2-D scan grid is an image
+    if int(np.prod(pts, dtype=np.int64)) == 1 and len([n for n in dim if n > 1]) == 2:
+        return "2d"                            # a remaining 2-D data_dim (a camera frame) is an image
+    if int(np.prod(pts, dtype=np.int64)) > 1 or int(np.prod(dim, dtype=np.int64)) > 1:
+        return "1d"                            # an ordered remaining axis reads as a curve
+    return "hist"                              # nothing left but repeats -> a sample distribution
+
+
+def facet_cells(value, facet, *, sub_plot_kind: str, points_shape=(), repeat_mode: str = "average"):
+    """Slice ONE ``(repeat, points, *data_dim)`` block along the facet axis into the per-cell inputs a
+    :class:`GridPlot` of ``sub_plot_kind`` cells displays -- the SINGLE data rule of the grid-as-facet
+    design.  Returns ``[cell_0_data, cell_1_data, ...]``.
+
+    ``points_shape`` is the MULTI-D shape of the points axis when the producing scan declared one (the
+    node's ``grid_shape`` -- e.g. ``(n_outer, ny, nx)`` for a 3-level scan; the stored block keeps points
+    FLAT).  Each cell keeps the iron law's remaining axes and is shaped for its kind:
+
+    * ``hist``  -- the cell's SAMPLES: everything left after the slice, pooled (a distribution pools
+      repeats by definition; ``repeat_mode`` is not consulted).
+    * ``2d``    -- the cell's FRAME: repeats collapsed by ``repeat_mode``, then the remaining points
+      grid (2-D) or the 2-D data_dim is the image.
+    * ``1d``    -- the cell's CURVE: repeats collapsed by ``repeat_mode``, remaining values flattened.
+    """
+    spec = normalize_facet(facet)
+    if spec is None:
+        raise ValueError("facet_cells needs an explicit facet; None means a recipe (non-faceted) grid.")
+    group, index = spec
+    a = np.asarray(value, dtype=float)
+    if a.ndim < 2:
+        raise ValueError(f"a facet grid slices a (repeat, points, *data_dim) block; got shape {a.shape}.")
+    n_repeat, n_points = int(a.shape[0]), int(a.shape[1])
+    dim_shape = tuple(int(n) for n in a.shape[2:])
+    pts_shape = tuple(int(n) for n in (points_shape or (n_points,)))
+    if int(np.prod(pts_shape)) != n_points:
+        raise ValueError(f"points_shape {pts_shape} does not match the block's points axis ({n_points}).")
+    # expose the points axis in its declared multi-D form: (repeat, *pts_shape, *dim_shape)
+    a = a.reshape((n_repeat, *pts_shape, *dim_shape))
+    if group == "repeat":
+        slices = [a[r] for r in range(n_repeat)]                    # each: (*pts, *dim), repeat consumed
+        pts_rest, dim_rest, has_repeat = pts_shape, dim_shape, False
+    elif group == "points":
+        if index >= len(pts_shape):
+            raise ValueError(f"facet points:{index} out of range for points_shape {pts_shape}.")
+        moved = np.moveaxis(a, 1 + index, 0)                        # (n_i, repeat, *pts_rest, *dim)
+        slices = [moved[j] for j in range(moved.shape[0])]
+        pts_rest = tuple(n for i, n in enumerate(pts_shape) if i != index)
+        dim_rest, has_repeat = dim_shape, True
+    else:  # "dim"
+        if index >= len(dim_shape):
+            raise ValueError(f"facet dim:{index} out of range for data_dim {dim_shape}.")
+        moved = np.moveaxis(a, 1 + len(pts_shape) + index, 0)       # (n_i, repeat, *pts, *dim_rest)
+        slices = [moved[j] for j in range(moved.shape[0])]
+        pts_rest = pts_shape
+        dim_rest = tuple(n for i, n in enumerate(dim_shape) if i != index)
+        has_repeat = True
+
+    kind = str(sub_plot_kind)
+    if kind == "hist":
+        return [s.reshape(-1) for s in slices]                      # a distribution pools everything left
+    cells = []
+    for s in slices:
+        core = _collapse_repeat(s, repeat_mode) if has_repeat else np.asarray(s, dtype=float)
+        if kind == "2d":
+            # the frame is the remaining 2-D points grid (data_dim trivial -- keep declared 1-length
+            # scan axes), else whatever 2-D core the slice leaves (a camera frame).  Anything that is
+            # not exactly 2-D after dropping 1-length axes raises -- NEVER a silent component pick.
+            if len(pts_rest) == 2 and int(np.prod(dim_rest, dtype=np.int64)) == 1:
+                core = core.reshape(pts_rest)
+            else:
+                core = np.squeeze(core)
+            if core.ndim != 2:
+                raise ValueError(
+                    f"a 2d facet cell needs a 2-D frame after slicing; got shape {core.shape} "
+                    f"(points left {pts_rest}, data_dim left {dim_rest}).")
+            cells.append(core)
+        else:  # "1d"
+            cells.append(core.reshape(-1))
+    return cells
+
+
 class GridCell:
     """Strategy for ONE cell of a :class:`GridPlot` -- subclass per multi-panel
     plot type (``HistogramCell`` now; future ``Image2DCell`` / ``Line1DCell``).
@@ -3008,6 +3144,27 @@ class GridCell:
         draggable threshold line or ``None``."""
         raise NotImplementedError
 
+    # ---- live (facet) update contract: replace the data, move the EXISTING artists.  A live facet
+    # grid refreshes every shot; rebuilding N axes' ticks/text each tick is exactly the cost the grid
+    # perf work removed (#perf), so a cell family updates in place and only falls back to a full
+    # thumbnail redraw when it says so (update_cell -> False).
+    def set_cell_data(self, k: int, data) -> None:
+        """Replace cell ``k``'s data (the live facet feed).  Same per-cell payload the constructor
+        takes for this family (hist: sample vector; 2d: 2-D frame; 1d: y curve)."""
+        raise NotImplementedError
+
+    def update_cell(self, ax, k: int) -> bool:
+        """Move cell ``k``'s EXISTING artists to the current data (no axes clear, no new artists --
+        the ticks/text built once by :meth:`draw` stay).  Return False when an in-place move cannot
+        represent the change (artist structure changed) -- the grid then redraws that thumbnail."""
+        raise NotImplementedError
+
+    def focus_update(self, focus_plotter, k: int) -> None:
+        """Feed cell ``k``'s current data to its ENLARGED standalone view -- the kind's ordinary
+        ``update`` (a HistogramFigure rebins, a Live2DDis re-images), so the zoomed cell stays live
+        with zero bespoke code."""
+        raise NotImplementedError
+
     def threshold_line(self, k: int):
         return None
 
@@ -3056,6 +3213,7 @@ class HistogramCell(GridCell):
         self.threshold_lines: list = [None] * self.n_cells
         self.tag_texts: list = [None] * self.n_cells
         self.cell_counts: list = [None] * self.n_cells
+        self._bar_colls: list = [None] * self.n_cells      # cell k's PolyCollections, for the live in-place move
 
     def prepare(self) -> None:
         vals = self.values
@@ -3086,10 +3244,14 @@ class HistogramCell(GridCell):
         v = self.values[k]
         v = v[np.isfinite(v)]
 
+        colls = []
+
         def _bars(counts, color):
             verts = np.empty((len(counts), 4, 2), dtype=float)
             _update_verts(edges, counts, verts, mode="vertical")
-            ax.add_collection(PolyCollection(verts, facecolors=color, edgecolors="none"))
+            coll = PolyCollection(verts, facecolors=color, edgecolors="none")
+            ax.add_collection(coll)
+            colls.append(coll)                 # kept so the live facet feed can move bars in place
 
         counts_all = np.histogram(v, bins=edges)[0].astype(float) if v.size else np.zeros(self.bins_arg)
         occ = self.occupied
@@ -3106,6 +3268,7 @@ class HistogramCell(GridCell):
         elif v.size:
             _bars(counts_all, PALETTE["hist_fill"])
         self.cell_counts[k] = counts_all
+        self._bar_colls[k] = colls
         line = None
         if self.thresholds is not None and np.isfinite(self.thresholds[k]):
             line = ax.axvline(float(self.thresholds[k]), **threshold_line_kwargs(1.4))
@@ -3158,6 +3321,36 @@ class HistogramCell(GridCell):
             if v.size:
                 top = max(top, float(np.histogram(v, bins=self.edges)[0].max()))
         return 0.0, top * 1.08 if top > 0 else 1.0
+
+    def set_cell_data(self, k: int, data) -> None:
+        self.values[k] = np.asarray(data, dtype=float).reshape(-1)
+        self.edges = None                      # samples moved -> the shared bin edges re-derive (prepare)
+
+    def update_cell(self, ax, k: int) -> bool:
+        """Move cell ``k``'s EXISTING bar collections to the current samples: recompute counts on the
+        (re-)prepared shared edges and ``set_verts`` -- the same bar geometry :meth:`draw` builds, with
+        no axes clear and no new artists (the live-grid perf contract).  The stacked dark/bright pair
+        cannot be re-derived without a matching ``occupied`` mask, so a structure mismatch returns
+        False and the grid redraws that thumbnail once."""
+        if self.edges is None:
+            self.prepare()
+        colls = self._bar_colls[k]
+        v = self.values[k]
+        v = v[np.isfinite(v)]
+        counts = np.histogram(v, bins=self.edges)[0].astype(float) if v.size else np.zeros(len(self.edges) - 1)
+        if not colls or len(colls) != 1 or len(counts) != len(colls[0].get_paths()):
+            return False                       # empty-born / stacked / re-binned cell -> full redraw
+        verts = np.empty((len(counts), 4, 2), dtype=float)
+        _update_verts(self.edges, counts, verts, mode="vertical")
+        colls[0].set_verts(verts)
+        self.cell_counts[k] = counts
+        ax.set_xlim(self.x_lo, self.x_hi)      # shared edges track the pooled samples (prepare)
+        top = float(counts.max()) if counts.size else 0.0
+        ax.set_ylim(*self.thumb_lims(0.0, top * 1.08 if top > 0 else 1.0))
+        return True
+
+    def focus_update(self, focus_plotter, k: int) -> None:
+        focus_plotter.update(self.values[k])   # the standalone hist rebins itself (its ordinary update)
 
     def classify(self, k: int, values=None) -> np.ndarray:
         vals = self.values[k] if values is None else np.asarray(values, dtype=float)
@@ -3231,18 +3424,25 @@ class ImageCell(GridCell):
         # (PANEL_PARAMS["2d"]) flows here so a 2d grid's Setting colormap chooser recolours the cells (a
         # hist grid has no cmap).  ``None`` = the camera default (the single PALETTE source).
         self.cmap = str(cmap) if cmap else PALETTE["cmap_camera"]
-        self.vmax = 1.0
+        self.vmin, self.vmax = 0.0, 1.0
+        self._image_artists: list = [None] * self.n_cells   # cell k's AxesImage, for the live in-place move
 
     def prepare(self) -> None:
         finite = [im[np.isfinite(im)] for im in self.images if im.size]
         pooled = np.concatenate(finite) if finite else np.array([0.0, 1.0])
+        lo = float(np.nanmin(pooled)) if pooled.size else 0.0
         hi = float(np.nanmax(pooled)) if pooled.size else 1.0
-        self.vmax = hi if hi > 0 else 1.0   # one shared colour scale -> cells comparable
+        if not hi > lo:
+            lo, hi = lo, lo + 1.0
+        # ONE shared colour scale spanning the pooled data -> cells comparable AND contrasty: a
+        # zero-anchored scale washed out any family whose values sit on a baseline (a PSF kernel
+        # starts at ~0 so it renders identically; a camera-count facet keeps its contrast).
+        self.vmin, self.vmax = lo, hi
 
     def auto_lims(self) -> tuple[float, float]:
         """The ONE shared colour scale every cell already draws with -- the image grid's
         'what you see now' pair (exact, since the family keeps a single scale by design)."""
-        return 0.0, float(self.vmax)
+        return float(self.vmin), float(self.vmax)
 
     def draw(self, ax, k: int):
         """The compact grid THUMBNAIL of kernel cell ``k`` (no ticks; the kernel SHAPE is the point).  The
@@ -3250,13 +3450,33 @@ class ImageCell(GridCell):
         focus view is a standalone ``2d`` panel (:class:`Live2DDis`) -- see :meth:`focus_data`."""
         # one shared colour scale keeps cells comparable; in ``fixed`` mode the operator's pinned
         # lo/hi win (thumb_lims -- the SAME relim family the enlarged view honours, like cmap)
-        vmin, vmax = self.thumb_lims(0.0, self.vmax)
-        ax.imshow(self.images[k], origin="lower", cmap=self.cmap,
-                  vmin=vmin, vmax=vmax, aspect="equal")
+        vmin, vmax = self.thumb_lims(self.vmin, self.vmax)
+        self._image_artists[k] = ax.imshow(self.images[k], origin="lower", cmap=self.cmap,
+                                           vmin=vmin, vmax=vmax, aspect="equal")
         apply_title(ax, f"s{k}", size=small_fontsize(), pad=1.5)
         ax.set_xticks([])
         ax.set_yticks([])
         return None
+
+    def set_cell_data(self, k: int, data) -> None:
+        frame = np.asarray(data, dtype=float)
+        if frame.ndim != 2:
+            raise ValueError(f"an image cell takes a 2-D frame; got shape {frame.shape}.")
+        self.images[k] = frame                 # the shared colour scale re-derives in prepare()
+
+    def update_cell(self, ax, k: int) -> bool:
+        """Move cell ``k``'s EXISTING image to the current frame (set_array + the shared/pinned colour
+        scale) -- no axes clear, no new artists.  A frame whose SHAPE changed cannot reuse the image's
+        pixel extent, so it returns False and the grid redraws that thumbnail once."""
+        im = self._image_artists[k]
+        if im is None or tuple(im.get_array().shape) != tuple(self.images[k].shape):
+            return False
+        im.set_array(self.images[k])
+        im.set_clim(*self.thumb_lims(self.vmin, self.vmax))
+        return True
+
+    def focus_update(self, focus_plotter, k: int) -> None:
+        focus_plotter.update(self.images[k].reshape(-1))     # the standalone 2d consumes the flat frame
 
     def data_figure(self, fig, ax, k: int):
         from .data_figure import DataFigure
@@ -3432,8 +3652,41 @@ class GridPlot(BaseLivePlot):
                 ax.tick_params(labelbottom=False)
 
     def update_core(self) -> None:
-        # A snapshot plot; a fresh acquisition rebuilds via show().
+        # A recipe (non-faceted) grid is a snapshot; the LIVE facet feed arrives via update_cells.
         pass
+
+    def update_cells(self, per_cell, *, focus=None, draw: bool = False) -> None:
+        """The LIVE facet feed: replace every cell's data and move the EXISTING artists (the grid
+        counterpart of a standalone kind's ``update``).  ``per_cell`` is the cell-input sequence
+        :func:`facet_cells` produces -- one entry per cell, same payload the cell family's
+        constructor takes.
+
+        While a cell is ENLARGED only the focus view updates (its kind's ordinary ``update``);
+        the thumbnails are redrawn once on unfocus -- the same defer rule every display knob uses.
+        The enlarged view is this grid's own (:meth:`focus`, the notebook path) or the HOST's
+        ``focus=(plotter, k)`` (the console card enlarges into its own canvas) -- one rule for both.
+        Otherwise each thumbnail moves in place (``update_cell``: set_verts / set_array /
+        set_data -- never an axes clear, the live-grid perf contract) and only a cell whose artist
+        structure changed redraws.  A different CELL COUNT is a structure change the caller owns
+        (the console rebuilds the panel); this raises so it is never papered over."""
+        cell = self.cell_renderer
+        if len(per_cell) != self.n_cells:
+            raise ValueError(
+                f"update_cells got {len(per_cell)} cells for a {self.n_cells}-cell grid -- a cell-count "
+                "change is a rebuild, not an update.")
+        for k, data in enumerate(per_cell):
+            cell.set_cell_data(k, data)
+        cell.prepare()                                   # shared scales (edges / vmax / y range) re-derive
+        focus_plotter, focus_k = ((self._focus_plotter, self._focused)
+                                  if self._focused is not None else (focus or (None, None)))
+        if focus_plotter is not None:
+            cell.focus_update(focus_plotter, int(focus_k))
+        else:
+            for k, ax in enumerate(self.site_axes):
+                if not cell.update_cell(ax, k):
+                    self._redraw_thumbnail(k, ax)        # artist structure changed -> one full redraw
+        if draw:
+            self.draw()
 
     def _apply_title(self) -> None:
         labels = self.labels
@@ -3703,15 +3956,20 @@ class GridPlot(BaseLivePlot):
         self.draw()
         return True
 
+    def _redraw_thumbnail(self, k: int, ax) -> None:
+        """Fully re-draw ONE cell thumbnail (axes cleared) -- the fallback when an in-place move cannot
+        represent the change.  Mirrors the :meth:`init_core` cell step, then re-hides the off-row x tick
+        labels the grid layout hides, so the redraw looks identical to a fresh grid."""
+        ax.clear()
+        self.cell_renderer.draw(ax, k)
+        if (k + self.ncols) < self.n_cells:
+            ax.tick_params(labelbottom=False)       # mirror init_core (labelbottom, not set_xticklabels -- #perf)
+
     def _redraw_thumbnails(self) -> None:
         """Re-draw every grid cell thumbnail from the (re-prepared) cell renderer -- used when a display
-        knob changes the thumbnail binning.  Mirrors :meth:`init_core` cell loop, then re-hides the off-row
-        x tick labels the grid layout hides, so the redraw looks identical to a fresh grid."""
+        knob changes the thumbnail binning."""
         for k, ax in enumerate(self.site_axes):
-            ax.clear()
-            self.cell_renderer.draw(ax, k)
-            if (k + self.ncols) < self.n_cells:
-                ax.tick_params(labelbottom=False)   # mirror init_core (labelbottom, not set_xticklabels -- #perf)
+            self._redraw_thumbnail(k, ax)
 
     def to_data_figure(self):
         self.data_figure = _GridData(self)
@@ -3782,7 +4040,10 @@ def _append_grid_plot_kind() -> None:
     if "grid" in PLOT_KIND_BY_KEY:
         return
     PLOT_KINDS = PLOT_KINDS + (
-        PlotKind(key="grid", cls=GridPlot, label="Site grid", render_family="1D", panel=False),
+        # panel=True: since the FACET design a grid is a live Add-Panel kind like any other -- bind a
+        # measurement block signal and pick the facet axis in Setting (the recipe/snapshot path is the
+        # facet="" case, it no longer makes the grid seed-only).
+        PlotKind(key="grid", cls=GridPlot, label="Site grid", render_family="1D", panel=True),
     )
     PLOT_KIND_BY_KEY = {pk.key: pk for pk in PLOT_KINDS}
 
@@ -3794,13 +4055,111 @@ _append_grid_plot_kind()
 #: into the cell strategy that draws it.  The unified :func:`grid` factory and :func:`build_grid_figure`
 #: both look up here (never a hard-coded ``if kind == ...``), so ADDING a per-site kind to a grid is ONE
 #: entry here + the cell class (which already declares its ``sub_plot_kind``) -- nothing else to touch.
-GRID_CELL_BY_KIND: dict[str, type[GridCell]] = {"hist": HistogramCell, "2d": ImageCell}
+class LineCell(GridCell):
+    """A GridPlot cell that is a 1-D curve -- one thin line per cell.  The facet family for a sliced
+    scan whose remaining axes flatten to a curve (e.g. a 3-level scan faceted on TWO axes, or a
+    per-repeat trace).  ``per_cell`` is a sequence of 1-D y vectors; ``x`` is the shared coordinate
+    (``None`` = the point index).  The enlarged focus view is a standalone ``1d`` panel
+    (:class:`Live1D`), so fit / relim / zoom all arrive on the standard path."""
+
+    sub_plot_kind = "1d"         # each cell is a ``1d`` per-site plot (enlarged -> a standalone Live1D)
+
+    def __init__(self, per_cell, *, x=None, labels: Sequence[str] = ("X", "Y")):
+        self.ys = [np.asarray(y, dtype=float).reshape(-1) for y in per_cell]
+        self.n_cells = len(self.ys)
+        if self.n_cells == 0:
+            raise ValueError("per_cell must contain at least one curve.")
+        self.x = None if x is None else np.asarray(x, dtype=float).reshape(-1)
+        self.labels = tuple(labels)
+        self._line_artists: list = [None] * self.n_cells    # cell k's Line2D, for the live in-place move
+
+    def _cell_x(self, k: int) -> np.ndarray:
+        y = self.ys[k]
+        if self.x is not None and self.x.size == y.size:
+            return self.x
+        return np.arange(y.size, dtype=float)
+
+    def prepare(self) -> None:
+        finite = [y[np.isfinite(y)] for y in self.ys if y.size]
+        pooled = np.concatenate(finite) if finite else np.array([0.0, 1.0])
+        lo = float(np.nanmin(pooled)) if pooled.size else 0.0
+        hi = float(np.nanmax(pooled)) if pooled.size else 1.0
+        pad = 0.08 * ((hi - lo) or (abs(hi) or 1.0))
+        self.y_lo, self.y_hi = lo - pad, hi + pad            # one shared y range -> cells comparable
+
+    def auto_lims(self) -> tuple[float, float]:
+        """The ONE shared y range every cell already draws with -- the line grid's
+        'what you see now' pair."""
+        if not hasattr(self, "y_lo"):
+            self.prepare()
+        return float(self.y_lo), float(self.y_hi)
+
+    def draw(self, ax, k: int):
+        if not hasattr(self, "y_lo"):
+            self.prepare()
+        x = self._cell_x(k)
+        (line,) = ax.plot(x, self.ys[k], color=PALETTE["line_single"])
+        self._line_artists[k] = line
+        if x.size:
+            ax.set_xlim(float(x[0]), float(x[-1]) if x[-1] > x[0] else float(x[0]) + 1.0)
+        ax.set_ylim(*self.thumb_lims(self.y_lo, self.y_hi))
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=3, prune="lower"))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=3))
+        apply_title(ax, f"s{k}", size=small_fontsize(), pad=1.5)
+        ax.tick_params(labelsize=tick_fontsize(), length=2, labelleft=False)
+        return None
+
+    def set_cell_data(self, k: int, data) -> None:
+        self.ys[k] = np.asarray(data, dtype=float).reshape(-1)
+        if hasattr(self, "y_lo"):
+            del self.y_lo, self.y_hi           # curves moved -> the shared y range re-derives (prepare)
+
+    def update_cell(self, ax, k: int) -> bool:
+        """Move cell ``k``'s EXISTING line to the current curve -- no axes clear, no new artists.
+        A curve whose LENGTH changed moves the same Line2D too (set_data replaces both arrays)."""
+        if not hasattr(self, "y_lo"):
+            self.prepare()
+        line = self._line_artists[k]
+        if line is None:
+            return False
+        x = self._cell_x(k)
+        line.set_data(x, self.ys[k])
+        if x.size:
+            ax.set_xlim(float(x[0]), float(x[-1]) if x[-1] > x[0] else float(x[0]) + 1.0)
+        ax.set_ylim(*self.thumb_lims(self.y_lo, self.y_hi))
+        return True
+
+    def focus_update(self, focus_plotter, k: int) -> None:
+        focus_plotter.update(self.ys[k])       # the standalone 1d redraws its single curve
+
+    def data_figure(self, fig, ax, k: int):
+        from .data_figure import DataFigure
+        ylabel = self.labels[1] if len(self.labels) > 1 else "Y"
+        return DataFigure(fig=fig, ax=ax, data_x=self._cell_x(k), data_y=self.ys[k],
+                          labels=(self.labels[0], ylabel), name=f"site{k}")
+
+    def focus_data(self, k: int, *, display_params: Mapping[str, Any] | None = None) -> dict:
+        """The ``panel_plot(kind="1d")`` args for the STANDALONE enlarged view of curve cell ``k`` --
+        the SAME ``1d`` panel a standalone line uses (full axes, fit, relim), reusing the ONE
+        plot-kind renderer.  :meth:`GridPlot.build_focus_plotter` merges this into ``panel_plot``."""
+        return {
+            "data_x": self._cell_x(k),
+            "data_y": self.ys[k],
+            "labels": (self.labels[0], self.labels[1] if len(self.labels) > 1 else "Y", "Z"),
+            "title": f"site {k}",
+        }
+
+
+GRID_CELL_BY_KIND: dict[str, type[GridCell]] = {"hist": HistogramCell, "2d": ImageCell, "1d": LineCell}
 
 
 def grid(
     per_cell,
     *,
     sub_plot_kind: str = "hist",
+    facet=None,
+    points_shape=(),
+    repeat_mode: str = "average",
     grid_shape: tuple[int, int] | None = None,
     size: str | None = None,
     labels: Sequence[str] | None = None,
@@ -3828,8 +4187,13 @@ def grid(
     if kind not in GRID_CELL_BY_KIND:
         raise ValueError(
             f"unknown grid sub_plot_kind {sub_plot_kind!r}; choose from {sorted(GRID_CELL_BY_KIND)}.")
+    if facet is not None:
+        # the grid as an AXIS-EXPANDER: hand ONE (repeat, points, *data_dim) block + the axis to
+        # expand, and the single slicing rule (facet_cells) produces the per-cell inputs
+        per_cell = facet_cells(per_cell, facet, sub_plot_kind=kind,
+                               points_shape=points_shape, repeat_mode=repeat_mode)
     if labels is None:
-        labels = ("Signal", "Shots") if kind == "hist" else ("x (px)", "y (px)")
+        labels = {"hist": ("Signal", "Shots"), "1d": ("X", "Y")}.get(kind, ("x (px)", "y (px)"))
     if kind == "hist":
         # the readout hist grid keeps its named type + property surface (n_sites / thresholds / classify);
         # it builds the HistogramCell itself, so the hist cell kwargs flow straight through.
@@ -3934,6 +4298,9 @@ def grid_recipe_from_cells(grid: "GridPlot") -> dict:
     elif isinstance(cell, ImageCell):
         recipe["per_cell"] = [np.asarray(im, dtype=float).tolist() for im in cell.images]
         recipe["cmap"] = str(cell.cmap)
+    elif isinstance(cell, LineCell):
+        recipe["per_cell"] = [np.asarray(y, dtype=float).reshape(-1).tolist() for y in cell.ys]
+        recipe["x"] = None if cell.x is None else np.asarray(cell.x, dtype=float).reshape(-1).tolist()
     else:
         raise TypeError(f"grid cell {type(cell).__name__} has no replay recipe")
     return recipe
@@ -3980,6 +4347,12 @@ def build_grid_figure(recipe: Mapping[str, Any], *, fig: plt.Figure | None = Non
         images = [np.asarray(im, dtype=float) for im in (recipe.get("per_cell") or [])]
         cmap = recipe.get("cmap") or (display_params.get("cmap") or display_params.get("colorset"))
         plotter = GridPlot(ImageCell(images, labels=labels, cmap=cmap), grid_shape=grid_shape, labels=labels,
+                           title=title, fig=fig, interactions=interactions, size=size).show(display=display)
+    elif sub_plot_kind == "1d":
+        curves = [np.asarray(y, dtype=float).reshape(-1) for y in (recipe.get("per_cell") or [])]
+        x = recipe.get("x")
+        plotter = GridPlot(LineCell(curves, x=None if x is None else np.asarray(x, dtype=float), labels=labels),
+                           grid_shape=grid_shape, labels=labels,
                            title=title, fig=fig, interactions=interactions, size=size).show(display=display)
     else:
         # per-site distribution grid (the default)
