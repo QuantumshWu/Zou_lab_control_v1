@@ -311,10 +311,11 @@ def pulse_scan(readout) -> MeasurementSpec:
                   path_mode="file", base_dir="pulses", file_filter="Pulse program (*.json);;All files (*)",
                   tooltip="The pulse program fired each point.  Its api / scan slots populate the "
                           "auto-form below (one numeric input per api slot + ONE scan-table program)."),
-        ParamDecl("camera", "Camera", "choice", default="camera",
+        ParamDecl("camera", "Camera", "choice", default=s.devices.default_camera_name(),
                   choices=s.devices.camera_names(),
-                  tooltip="Which camera grabs each point's frame: 'camera' = the readout sensor; "
-                          "'monitor_camera' = the MOT viewer (sweep the coils, watch the MOT)."),
+                  tooltip="Which camera grabs each point's frame (every camera in the device "
+                          "config is listed -- e.g. the readout sensor, or a monitor viewer to "
+                          "sweep the coils and watch the MOT)."),
         ParamDecl("pulse_slots", "Slots", "pulse_slots", default={}, depends_on="template",
                   tooltip="One numeric input per API slot (the fixed operator-set value), then a "
                           "Scan: [None | API | Scan] mode toggle that picks WHAT one shared scan "

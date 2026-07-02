@@ -61,11 +61,22 @@ class DeviceSet:
 
     def camera_names(self) -> tuple[str, ...]:
         """Every camera in the set, sorted by name -- THE source for any "which camera?"
-        choice (a measurement's ``camera`` ParamDecl, a sweep's frame grabber).  Falls back
-        to ``("camera",)`` so a choice widget never renders empty."""
-        names = tuple(sorted(name for name, dev in self.devices.items()
-                             if isinstance(dev, CameraDevice)))
-        return names or ("camera",)
+        choice (a measurement's ``camera`` ParamDecl, a sweep's frame grabber).  Empty when
+        the config has no camera at all -- callers decide what a camera-less setup means
+        (hide the panel / raise with guidance), never a fabricated placeholder name."""
+        return tuple(sorted(name for name, dev in self.devices.items()
+                            if isinstance(dev, CameraDevice)))
+
+    def default_camera_name(self) -> str:
+        """The camera a measurement uses when the operator names none: the conventional
+        readout role (``"camera"``) when present, else the only/first camera in the set.
+        Raises with guidance when the config has no camera at all."""
+        names = self.camera_names()
+        if not names:
+            raise AttributeError(
+                "this device config has no camera -- add one (e.g. via na.discover_devices(); "
+                "each found camera's row carries a ready config entry).")
+        return "camera" if "camera" in names else names[0]
 
     def require(self, name: str, expected_type: type | tuple[type, ...] | None = None):
         if name not in self.devices:
@@ -117,8 +128,12 @@ class DeviceSet:
         return out
 
     def _open_order(self) -> list[str]:
+        # Cameras open LAST (they may bind to an already-open sequencer/trigger source) --
+        # decided by TYPE, not by a hardcoded device name, so a monitor_camera or any other
+        # camera role gets the same treatment.
         names = list(self.devices)
-        return [name for name in names if name != "camera"] + [name for name in names if name == "camera"]
+        return ([name for name in names if not isinstance(self.devices[name], CameraDevice)]
+                + [name for name in names if isinstance(self.devices[name], CameraDevice)])
 
 
 def device_config_dir() -> Path:

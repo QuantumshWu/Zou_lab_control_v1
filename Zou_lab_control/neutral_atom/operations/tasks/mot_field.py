@@ -201,8 +201,11 @@ def optimize_mot_field(readout) -> TaskSpec:
     s = readout.session
 
     def build(hub, *, prefix: str = "mot_", **values):
-        camera = s.devices["monitor_camera"] if "monitor_camera" in s.devices.devices \
-            else s.devices.camera
+        # the MOT viewer when the config has one, else whatever camera the set declares
+        # (default_camera_name raises with guidance on a camera-less config)
+        names = s.devices.camera_names()
+        camera = s.devices["monitor_camera" if "monitor_camera" in names
+                           else s.devices.default_camera_name()]
         return OptimizeMotFieldTask(hub, camera, s.devices.sequencer, prefix=prefix, **values)
 
     return TaskSpec(name="Optimize MOT field", build=build, params=MOT_FIELD_PARAMS,

@@ -23,7 +23,7 @@ if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
 from Zou_lab_control.neutral_atom.devices.discovery import (
-    DiscoveredDevice, basler_rows, discover_devices, visa_rows)
+    DiscoveredDevice, discover_devices, visa_rows)
 from Zou_lab_control.neutral_atom.devices.pylon import PylonCamera
 from Zou_lab_control.neutral_atom.devices.registry import load_devices
 
@@ -39,21 +39,36 @@ class _FakeInfo:
         return self._serial
 
 
-def test_basler_rows_yield_ready_pylon_configs():
-    """Every enumerated Basler camera becomes a row whose config is a READY device entry:
-    a PylonCamera pinned to that serial, free-running (no pulse wiring needed for first light)."""
-    rows = basler_rows([_FakeInfo("acA1920-155um", "24012345"),
-                        _FakeInfo("acA2440-20gm", "40098765")])
+def test_pylon_discovery_rows_yield_ready_configs_for_the_class_itself():
+    """The DEVICE CLASS owns its discovery: every enumerated Basler camera becomes a row whose
+    config is a READY entry for PylonCamera itself (serial-pinned, free-running) -- the class
+    name comes from the class, never a hand-written mapping in the aggregator."""
+    rows = PylonCamera.discovery_rows([_FakeInfo("acA1920-155um", "24012345"),
+                                       _FakeInfo("acA2440-20gm", "40098765")])
     assert [r.ident for r in rows] == ["24012345", "40098765"]
     assert rows[0].label == "acA1920-155um"
-    assert rows[0].config == {"type": "PylonCamera",
+    assert rows[0].config == {"type": PylonCamera.__name__,
                               "params": {"serial": "24012345", "trigger_source": "Software"}}
+
+
+def test_discovery_aggregates_registered_self_describing_classes():
+    """discover_devices() walks the registry and asks each class with a ``discover()``
+    classmethod -- adding a discoverable device never touches discovery.py.  PylonCamera is
+    registered and self-describing, so its bus is scanned (a note row when nothing attached)."""
+    from Zou_lab_control.neutral_atom.devices.discovery import _registered_discoverers
+
+    discoverers, import_notes = _registered_discoverers()
+    assert "PylonCamera" in [name for name, _cls in discoverers]
+    assert all(n.kind == "note" for n in import_notes)   # broken drivers become rows, not holes
+    rows = discover_devices(visa=False, display=False)
+    assert rows and all(isinstance(r, DiscoveredDevice) for r in rows)
+    assert any(r.kind in ("basler", "note") for r in rows)
 
 
 def test_discovered_config_loads_straight_into_a_device_set():
     """The discovery row's config is not a suggestion to retype -- load_devices consumes it
     verbatim and builds the pinned PylonCamera (not opened: no hardware in CI)."""
-    row = basler_rows([_FakeInfo("acA1920-155um", "24012345")])[0]
+    row = PylonCamera.discovery_rows([_FakeInfo("acA1920-155um", "24012345")])[0]
     devices = load_devices({"monitor_camera": row.config}, open_devices=False)
     cam = devices["monitor_camera"]
     assert isinstance(cam, PylonCamera)
@@ -142,14 +157,42 @@ def test_camera_spec_exposure_is_per_selected_camera():
         exp.close()
 
 
-def test_basler_monitor_config_mixes_real_monitor_into_virtual_roster():
-    """The shipped ``basler_monitor`` config is the incremental bring-up step: virtual
-    readout roster + a REAL free-running PylonCamera as monitor_camera (first attached
-    camera; discovery prints serials to pin one)."""
+def test_basler_monitor_config_is_a_bare_monitor_rig():
+    """The shipped ``basler_monitor`` config declares ONLY what physically exists: one real
+    free-running PylonCamera.  No fabricated virtual placeholders pad the roster -- missing
+    roles are simply absent, and the session tolerates that (the decoupling contract)."""
     devices = load_devices("basler_monitor", open_devices=False)
+    assert set(devices.devices) == {"monitor_camera"}
     assert isinstance(devices["monitor_camera"], PylonCamera)
     assert devices["monitor_camera"].trigger_source == "Software"
-    assert devices.camera_names() == ("camera", "monitor_camera")
+    assert devices.camera_names() == ("monitor_camera",)
+    assert devices.default_camera_name() == "monitor_camera"
+
+
+def test_session_tolerates_missing_roles():
+    """NO role is mandatory: a config with only a monitor camera (or with no camera at all)
+    still builds a working session -- the roles that exist light up, the rest raise only when
+    actually asked for.  This is what lets a config declare ONLY the real hardware."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from Zou_lab_control.neutral_atom.session import NeutralAtomSession
+
+    # a bare monitor rig (the basler_monitor shape, camera not opened)
+    session = NeutralAtomSession(load_devices("basler_monitor", open_devices=False))
+    assert session.devices.default_camera_name() == "monitor_camera"
+    assert session.sequence is not None                    # imaging sequence composes w/o a readout camera
+    # readout's camera spec picks the only camera as its default
+    spec = session.readout.camera_spec()
+    camera_param = next(p for p in spec.params if p.key == "camera")
+    assert camera_param.default == "monitor_camera"
+    assert camera_param.choices == ("monitor_camera",)
+
+    # a config with NO camera at all is still a legal session; camera asks raise with guidance
+    empty = NeutralAtomSession(load_devices({"sequencer": {"type": "VirtualSequencer"}},
+                                            open_devices=False))
+    assert empty.devices.camera_names() == ()
+    with pytest.raises(AttributeError, match="no camera"):
+        empty.devices.default_camera_name()
 
 
 def test_pylon_camera_construction_needs_no_pylon_runtime():

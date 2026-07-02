@@ -51,7 +51,13 @@ class NeutralAtomSession:
         self.sequence = self._imaging_sequence(exposure=self._camera_exposure(), load=True)
         self._calibration: TrapCalibration | None = None
         self.history: list[Any] = []
-        self.devices.camera.bind_experiment(self)
+        # EVERY camera in the set binds to the session (its capture() then gets timing /
+        # sequencer / history for free) -- by TYPE, never by a hardcoded role name, and NO role
+        # is mandatory: a camera-less or sequencer-less config (e.g. a bare monitor rig) is a
+        # legal session, the roles that exist simply light up.
+        for device in devices.devices.values():
+            if isinstance(device, CameraDevice):
+                device.bind_experiment(self)
         self._readout_subsystem = ReadoutSubsystem(self)
         self._timing_subsystem = TimingSubsystem(self)
 
@@ -113,8 +119,9 @@ class NeutralAtomSession:
         return open_figure_viewer(self, path=path, **kwargs)
 
     def _configure_imaging(self, *, exposure: float | None = None, load: bool = True, trigger_width: float = 20e-6, pre_trigger: float = 100e-6) -> PulseSequence:
-        if exposure is not None and hasattr(self.devices.camera, "configure"):
-            self.devices.camera.configure(exposure=exposure)
+        camera = getattr(self.devices, "camera", None)
+        if exposure is not None and hasattr(camera, "configure"):
+            camera.configure(exposure=exposure)
         self.sequence = self._imaging_sequence(
             exposure=self._camera_exposure() if exposure is None else exposure,
             trigger_width=trigger_width,
@@ -216,7 +223,12 @@ class NeutralAtomSession:
         self.devices.close()
 
     def _camera_exposure(self) -> float:
-        return float(getattr(self.devices.camera, "exposure", getattr(getattr(self.devices.camera, "config", None), "exposure", 20e-3)))
+        # The READOUT camera's exposure when that role exists; a camera-less config still
+        # composes imaging sequences with the stock default (no fabricated device needed).
+        camera = getattr(self.devices, "camera", None)
+        if camera is None:
+            return 20e-3
+        return float(getattr(camera, "exposure", getattr(getattr(camera, "config", None), "exposure", 20e-3)))
 
     def _grid_shape(self, grid_shape: Sequence[int] | None) -> tuple[int, int]:
         if grid_shape is not None:

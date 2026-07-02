@@ -230,7 +230,8 @@ def test_shipped_notebook_template_panel_sources_assign_value():
     sources = []
     for md in templates.glob("*.cells.md"):
         text = md.read_text(encoding="utf-8")
-        for m in re.finditer(r'source\s*=\s*([\'"])(.*?)\1', text):
+        # a BARE `source=` kwarg only -- `trigger_source=` etc. are ordinary device params
+        for m in re.finditer(r'(?<![A-Za-z0-9_])source\s*=\s*([\'"])(.*?)\1', text):
             sources.append((md.name, m.group(2)))
     assert sources, "expected at least one PanelConfig(source=...) in the shipped templates"
     bad = [(name, s) for name, s in sources if s.strip() and not s.strip().startswith("value")]

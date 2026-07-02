@@ -576,7 +576,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
         return discovered_task_specs(self)
 
-    def camera_measurement(self, hub, *, camera: str = "camera", prefix: str = "",
+    def camera_measurement(self, hub, *, camera: str | None = None, prefix: str = "",
                            frames_per_cycle: int = 1, repeat: int = 0):
         """Build a CONTINUOUS camera Measurement over a NAMED session camera (a
         :class:`~..operations.logic.CameraMeasurement` publishing raw ``frame``s).
@@ -601,7 +601,8 @@ class ReadoutSubsystem(ExperimentSubsystem):
         from ..operations.logic import CameraMeasurement
 
         s = self._session
-        return CameraMeasurement(hub, s.devices[str(camera or "camera")],
+        name = str(camera) if camera else s.devices.default_camera_name()
+        return CameraMeasurement(hub, s.devices[name],
                                  sequencer=getattr(s.devices, "sequencer", None),
                                  frames_per_cycle=frames_per_cycle, prefix=prefix, repeat=repeat)
 
@@ -635,9 +636,9 @@ class ReadoutSubsystem(ExperimentSubsystem):
                 raise ValueError("region must be 'x0, x1, y0, y1' (4 numbers) or blank for full sensor.")
             return [float(p) for p in parts]
 
-        def _build(hub, *, camera: str = "camera", frames_per_cycle: int = 1,
+        def _build(hub, *, camera: str | None = None, frames_per_cycle: int = 1,
                    exposure: float | None = None, region: str = "", repeat: int = 0, **_ignored):
-            node = self.camera_measurement(hub, camera=str(camera or "camera"),
+            node = self.camera_measurement(hub, camera=camera,
                                            frames_per_cycle=int(frames_per_cycle),
                                            repeat=max(0, int(repeat)))
             apply: dict[str, object] = {}
@@ -659,11 +660,12 @@ class ReadoutSubsystem(ExperimentSubsystem):
         return MeasurementSpec(
             name="Camera (live frames)",
             params=(
-                ParamDecl(key="camera", label="Camera", kind="choice", default="camera",
+                ParamDecl(key="camera", label="Camera", kind="choice",
+                          default=s.devices.default_camera_name(),
                           choices=s.devices.camera_names(),
-                          tooltip="Which sensor streams: 'camera' = the readout sensor; "
-                                  "'monitor_camera' = the MOT viewer (a free-running Basler "
-                                  "shows an image with no pulse wiring at all)."),
+                          tooltip="Which sensor streams (every camera in the device config is "
+                                  "listed; a free-running sensor shows an image with no pulse "
+                                  "wiring at all)."),
                 ParamDecl(key="frames_per_cycle", label="frames / cycle", kind="int",
                           default=1, lo=1, hi=10000,
                           tooltip="emCCD events (camera triggers) per cycle.  Each event i publishes its "

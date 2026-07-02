@@ -212,10 +212,15 @@ _SITE_MAX_COLS = 7                        # column cap (pulse-style width cap); 
 #: matplotlib layout) freezes the UI.  ONE source -- the grid factory raises past it and the console
 #: greys out facet axes that would exceed it.
 MAX_GRID_CELLS = 80
-#: Cell-text scaling floor: the PANEL SIZE preset picks the cell text scale (a 2x2-or-taller panel
-#: uses the STANDARD small/tick font sizes -- the cap; a half-height 1x2 shrinks proportionally),
-#: never below this floor so the text stays legible.
-_CELL_FONT_MIN_SCALE = 0.55
+#: Cell-text rule (fixed by the operator): a panel SMALLER than 2x2 (either side below two
+#: half-units, i.e. the half-height 1x2 / 1x4) uses ONE NOTCH smaller text
+#: (``smaller_fontsize()``); 2x2 and larger use the plot kind's STANDARD style sizes unscaled.
+#: Exactly two tiers -- no continuous shrink.
+def _cell_font_scale(size: str) -> float:
+    rows, cols = panel_size_cells(size)
+    if rows >= 2 and cols >= 2:
+        return 1.0
+    return smaller_fontsize() / small_fontsize()          # one notch, derived from style (no literal)
 
 
 def _as_data_x(data_x) -> np.ndarray:
@@ -570,6 +575,54 @@ class BaseLivePlot:
         NON-EMPTY list -- enforced for every plot type by the plot-contract test,
         so a hand-rolled figure that skips selectors cannot ship."""
         return [h for h in (self.zoom, self.area, self.cross, self.drag) if h is not None]
+
+    def set_selectors_active(self, active: bool) -> None:
+        """Enable/disable every mouse selector on this plot IN PLACE (a DATA-level behaviour
+        gate, no art/geometry): the tools stay constructed -- their artists, thresholds and
+        selections keep their state -- only their EVENT HANDLING is gated, so flipping the gate
+        never rebuilds a figure.  The consumer is the console's Monitor "Selectors" switch: a
+        dashboard panel builds WITH its selector layer and parks it inactive (display-only, the
+        historical default), and the switch re-arms it live.  Safe no-op on a plot with no tools
+        (``interactions=False``, e.g. the grid thumbnails).
+
+        Two tool families, one rule each:
+
+        * ``AreaSelector`` wraps a matplotlib widget with a REAL active gate -- delegate to
+          ``selector.set_active`` (the same surface ``DragVLine._set_area_active`` already uses).
+        * ``CrossSelector`` / ``ZoomPan`` / ``DragVLine`` / ``DragHLine`` self-manage their
+          canvas callbacks under the UNIFORM ``cid_*``/``on_*`` names (selectors.py convention),
+          so ONE wiring table disconnects/reconnects exactly the events each tool owns --
+          idempotent via the ``_zlc_selectors_off`` marker, so repeated calls never double-connect.
+
+        The enumeration reuses :meth:`interaction_handles` (the grid override contributes every
+        per-cell bundle) plus the histogram's ``threshold_draggers`` (its extra draggable lines
+        live outside the bundle), so no tool escapes the gate."""
+        active = bool(active)
+        wiring = (
+            ("cid_scroll", "scroll_event", "on_scroll"),
+            ("cid_press", "button_press_event", "on_press"),
+            ("cid_motion", "motion_notify_event", "on_motion"),
+            ("cid_release", "button_release_event", "on_release"),
+        )
+        handles = list(self.interaction_handles())
+        handles.extend(d for d in getattr(self, "threshold_draggers", ()) if d is not None)
+        for handle in handles:
+            selector = getattr(handle, "selector", None)
+            if selector is not None and hasattr(selector, "set_active"):
+                selector.set_active(active)
+                continue
+            if bool(getattr(handle, "_zlc_selectors_off", False)) == (not active):
+                continue                     # already in the requested state (idempotent)
+            canvas = handle.ax.figure.canvas
+            for cid_attr, event_name, cb_attr in wiring:
+                cid = getattr(handle, cid_attr, None)
+                if cid is None:
+                    continue                 # this tool never owned that event
+                if active:
+                    setattr(handle, cid_attr, canvas.mpl_connect(event_name, getattr(handle, cb_attr)))
+                else:
+                    canvas.mpl_disconnect(cid)
+            handle._zlc_selectors_off = not active
 
     def _apply_title(self) -> None:
         if self.ax is not None:
@@ -1500,21 +1553,24 @@ def _site_grid_geometry(size: str = "2x2") -> tuple[tuple[int, int], int, int, t
     """The grid's layout numbers for a panel-size preset: total data region (== every other kind's at
     this size), the inter-cell gaps, the outer margins, and the CELL-TEXT scale.
 
-    The text scale follows the PANEL SIZE (the preset the operator picked): a 2x2-or-larger panel
-    uses the STANDARD small/tick font sizes (the cap), a half-height panel shrinks proportionally.
-    The gaps then DERIVE from that scaled text -- exactly the band the cell title (+ a ragged
-    column's bottom x labels) needs, nothing more -- so bigger panels put the extra pixels into the
-    CELLS, never into wider corridors (gaps used to double with the size preset, wasting the area)."""
+    The text scale follows the PANEL SIZE with exactly TWO tiers (the operator's fixed rule,
+    :func:`_cell_font_scale`): below 2x2 the cell text is one notch smaller, from 2x2 up it is
+    the plot kind's standard style size.  The gaps then DERIVE from that text -- exactly the band
+    the cell title (+ a row's x tick labels) needs, nothing more -- so every spare pixel goes into
+    the CELLS (resize fills the area; the only hard constraint is that no cell title is cut)."""
     data_px = panel_plot_spec(size).data_px               # total data region == every other kind's at this size
-    ref_h = panel_plot_spec("2x2").data_px[1]
-    font_scale = float(min(1.0, max(_CELL_FONT_MIN_SCALE, data_px[1] / ref_h)))
-    # pt -> logical px at the design dpi (100/72); the row band holds one title line (pad included)
-    # plus one x-tick-label line, the column gap is a thin corridor (y labels live in the L margin).
-    px_per_pt = 100.0 / 72.0
-    row_gap = round((small_fontsize() * 1.7 + tick_fontsize() * 1.5) * px_per_pt * font_scale) + 2
-    # the column corridor must clear the bottom row's OUTERMOST x labels (each spills ~half a label
-    # past its cell edge) -- y labels live in the L margin, so this is the only text it carries
-    col_gap = max(6, round(16 * font_scale))
+    font_scale = _cell_font_scale(size)
+    # All grid geometry is in DESIGN px (300 dpi -- style.DESIGN_DPI), so pt -> px is DPI/72.
+    # The row corridor carries exactly ONE cell-title line (the edge-label policy strips x tick
+    # labels off every non-bottom row, and the bottom row's labels live in the B margin), so its
+    # budget is the title's own height (~= its point size, probe-pinned) + a few px of air.
+    # Tighter clips the title into the cell above; looser only steals area from the cells.
+    px_per_pt = DESIGN_DPI / 72.0
+    row_gap = round(small_fontsize() * font_scale * px_per_pt) + 4
+    # the column corridor carries NO text at all (the centered-single-tick policy keeps x labels
+    # inside their cell -- zero spill, probe-verified -- and y labels live in the L margin): it
+    # is a pure visual separator.
+    col_gap = max(6, round(10 * font_scale))
     l, r, b, t = panel_margins_px()                       # SAME outer margins as a single-axes panel -> total px matches
     return data_px, col_gap, row_gap, (l, r, b, t), font_scale
 

@@ -976,7 +976,7 @@ devices = na.load_devices({"monitor_camera": cams[0].config})   # 片段直接�
 
 规则与 confocal 参考实现一致：枚举 Basler（pypylon）相机与 VISA 资源（逐个 \pyapi{*IDN?} 短超时问身份）；\tfocus{缺库或空总线是一行提示，绝不抛异常}。每台 Basler 相机的行自带 \tfocus{ready config 片段}（一台钉死 serial、\pyapi{Software} 自由跑的 \pyapi{PylonCamera}），\pyapi{load\_devices} 原样消费——发现结果与设备构造之间没有手工转抄。裸 VISA 仪器本包没有对应设备类，只列地址+身份供你接进自定义类（\pyapi{register\_device\_class}）。
 
-再快一步：自带设备图 \pyapi{"basler\_monitor"} 是\tfocus{渐进接线}配置——读出链保持虚拟，\pyapi{monitor\_camera} 是真 Basler（\pyapi{serial=""} 取第一台）。插上 USB：
+再快一步：自带设备图 \pyapi{"basler\_monitor"} \tfocus{只声明真实存在的硬件}——一台自由跑的真 Basler（\pyapi{serial=""} 取第一台），别无他物。缺的角色（读出相机 / sequencer / trap）就是缺：session 对缺角色宽容，存在的角色自然点亮，config 里\tfocus{绝不}用假设备凑数（这正是设备层的解耦契约——声明什么就是什么）。插上 USB：
 
 \begin{codeblock}[Python]
 exp = na.connect("basler_monitor", open_devices=True)

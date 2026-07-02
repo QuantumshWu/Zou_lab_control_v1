@@ -1723,6 +1723,11 @@ class PanelCard(FluentGroupBox):
         self.grid_recipe_provider = grid_recipe_provider
         self.plotter = None
         self.canvas = None
+        # The console header's "Selectors" switch state for THIS card (set via
+        # ``set_selectors_enabled``; default OFF = the historical display-only Monitor board).
+        # Every plotter (re)build parks its selector layer to this flag (``_apply_selectors_state``),
+        # so a fresh figure always inherits the switch instead of coming up live.
+        self._selectors_on = False
         # GRID focus-zoom state (console path).  A GRID panel is display-only (interactions=False), so its
         # own double-click handler is dormant; THIS card catches the double-click on the grid canvas and
         # swaps ``self.plotter`` / ``self.canvas`` to a STANDALONE plot-kind figure of the clicked cell
@@ -3354,6 +3359,31 @@ class PanelCard(FluentGroupBox):
             return None
         return tuple(sorted((n, versions[n]) for n in refs))
 
+    def set_selectors_enabled(self, on: bool) -> None:
+        """The console header's "Selectors" switch for THIS card: remember the desired state and
+        gate the CURRENT plotter now (in place -- no rebuild, no flash).  Every later (re)build /
+        focus swap re-applies it through ``_apply_selectors_state``, so a fresh figure always
+        inherits the switch."""
+        self._selectors_on = bool(on)
+        self._apply_selectors_state()
+
+    def _apply_selectors_state(self) -> None:
+        """Gate the current plotter's selector layer to the card's switch state (the ONE apply
+        point every build / focus / tick path converges on).  Delegates to
+        ``BaseLivePlot.set_selectors_active`` -- a safe no-op for a tool-less plot (the grid
+        thumbnails) -- and aligns the canvas WHEEL policy with it: selectors ON isolates the
+        wheel (in-plot scroll-zoom, the Edit-tab behaviour), OFF returns it to the board scroll.
+        Only a plotter that actually HAS tools flips the wheel, so a grid card keeps scrolling
+        the board either way."""
+        plotter = self.plotter
+        if plotter is None or not hasattr(plotter, "set_selectors_active"):
+            return
+        on = bool(self._selectors_on)
+        plotter.set_selectors_active(on)
+        canvas = self.canvas
+        if canvas is not None and hasattr(canvas, "_zlc_isolate_wheel"):
+            canvas._zlc_isolate_wheel = on and bool(plotter.interaction_handles())
+
     def _render(self, value, namespace: Mapping[str, object] | None = None) -> None:
         # PERFORMANCE: push data with draw=False and queue ONE draw_idle per
         # panel -- rendering happens in Qt's paint pass (coalesced per frame),
@@ -3377,6 +3407,9 @@ class PanelCard(FluentGroupBox):
                 per_cell = self._facet_cells(self._coerce(value))
                 if len(per_cell) == parked.grid.n_cells:
                     parked.grid.update_cells(per_cell, focus=(self.plotter, parked.k))
+                    # a hist focus feed can grow NEW threshold draggers inside update_core --
+                    # re-park them to the switch (idempotent, cheap) so OFF stays display-only.
+                    self._apply_selectors_state()
                     if self.canvas is not None:
                         self.canvas.draw_idle()
             return
@@ -3468,6 +3501,10 @@ class PanelCard(FluentGroupBox):
             self.plotter.update(value, repeat_cur=int(getattr(self, "_repeat_cur", 1)), draw=False)
         else:  # hist / 1d-vector
             self.plotter.update(value, draw=False)
+        # an in-place update can grow NEW selector handles (a hist whose threshold count changed
+        # rebuilds its draggers inside update_core) -- re-park them to the switch state.  Idempotent
+        # and cheap (a few attribute checks), so it never weighs on the live tick.
+        self._apply_selectors_state()
         if self.canvas is not None:
             self.canvas.draw_idle()
 
@@ -3545,11 +3582,13 @@ class PanelCard(FluentGroupBox):
             # The "show off rows" toggle is the panel's own display param (seeded from the saved value);
             # fall back to the node's recorded value when the param is unset -- so toggling re-renders.
             include_off = bool(self.config.params.get("include_always_off", node_include_off))
-            # size drives the geometry like every other kind (config.size); interactions=False keeps the
-            # Monitor card display-only (NO selectors -- the same rule the sites / 2d / hist / 1d branches
-            # apply below).  Interactive zoom / drag lives in the Edit tab.
+            # size drives the geometry like every other kind (config.size); interactions=True builds the
+            # selector layer, then _apply_selectors_state (end of this build) PARKS it to the header's
+            # "Selectors" switch -- OFF (default) keeps the Monitor card display-only exactly as before,
+            # ON arms zoom / area / cross in place (the same rule the sites / 2d / hist / 1d branches
+            # apply below).  The Edit tab stays the always-interactive surface.
             plotter, _channels, _repeat = build_pulse_preview_plot(
-                state, include_always_off=include_off, size=size, interactions=False)
+                state, include_always_off=include_off, size=size, interactions=True)
         elif kind == "grid":
             # A grid panel renders its per-site distribution / kernel grid through the ONE grid builder in
             # the PLOT LAYER (``live.build_grid_figure`` -- the SAME one ``na.load_figure(npz).plot()`` and
@@ -3557,6 +3596,11 @@ class PanelCard(FluentGroupBox):
             # carry, so it is resolved off the producing node via ``grid_recipe_provider`` -- the SAME "aux
             # data from the producing node" wiring the pulse panel + site map use (the hub ``value`` here is
             # only a numeric placeholder).  Its geometry (cell count-driven size) is frontend-owned.
+            # A GRID stays interactions=False even under the "Selectors" switch: GridPlot's own
+            # _attach_interactions wires a canvas-level double-click focus-zoom that would DOUBLE-FIRE
+            # against this card's _on_grid_canvas_click (two competing focus mechanisms).  The grid's
+            # interactive surface is its ENLARGED cell (see _focus_grid_cell), which builds WITH
+            # selectors and follows the switch like any standalone panel.
             facet = self._facet()
             if facet:
                 # A FACET grid: the bound block IS the data -- slice it along the declared axis
@@ -3583,7 +3627,7 @@ class PanelCard(FluentGroupBox):
                 raise ValueError(
                     f"site-map value has {len(vec)} entries but the centers signal has {len(centers)} sites")
             plotter = panel_plot(
-                centers, vec, kind="sites", size=size, interactions=False,
+                centers, vec, kind="sites", size=size, interactions=True,
                 image=image, roi_radius=site_ring_radius(centers),
                 cmap=_resolved_cmap("sites", self.config.params),   # operator pick, else the kind default (ONE resolver)
                 **self._view_kwargs("sites"),
@@ -3608,7 +3652,7 @@ class PanelCard(FluentGroupBox):
             xx, yy = np.meshgrid(x0 + np.arange(nx, dtype=float), y0 + np.arange(ny, dtype=float))
             data_x = np.column_stack([xx.ravel(), yy.ravel()])
             plotter = panel_plot(
-                data_x, arr.ravel(), kind="2d", size=size, interactions=False,
+                data_x, arr.ravel(), kind="2d", size=size, interactions=True,
                 cmap=_resolved_cmap("2d", self.config.params),   # operator pick, else the kind default (ONE resolver)
                 **self._view_kwargs("2d"),
                 labels=(xlabel, ylabel, ""), title=self.config.title or None)
@@ -3616,7 +3660,7 @@ class PanelCard(FluentGroupBox):
             length = max(20, int(self.config.params.get("length", 300)))
             history = np.full(length, np.nan)
             plotter = panel_plot(
-                np.arange(length, dtype=float), history, kind="monitor", size=size, interactions=False,
+                np.arange(length, dtype=float), history, kind="monitor", size=size, interactions=True,
                 show_dist=bool(self.config.params.get("show_dist", True)),
                 labels=("Shots ago", self._source_axis_label() or label, "Z"),
                 **self._view_kwargs("monitor"),
@@ -3624,7 +3668,7 @@ class PanelCard(FluentGroupBox):
             plotter.roll(float(value), draw=False)
         elif kind == "hist":
             plotter = panel_plot(
-                np.asarray(value, dtype=float), kind="hist", size=size, interactions=False,
+                np.asarray(value, dtype=float), kind="hist", size=size, interactions=True,
                 bins=int(self.config.params.get("bins", 60)), ylog=bool(self.config.params.get("ylog", False)),
                 fit=str(self.config.params.get("fit", "double")),
                 **self._view_kwargs("hist"),                # relim/fixed pins the VALUE (x) axis (#3)
@@ -3662,7 +3706,7 @@ class PanelCard(FluentGroupBox):
                 else:
                     data_x, xlabel = np.arange(npts, dtype=float), "Site"
             plotter = panel_plot(
-                data_x, vec, kind="1d", size=size, interactions=False,
+                data_x, vec, kind="1d", size=size, interactions=True,
                 labels=(xlabel, ylabel, "Z"),
                 **self._view_kwargs("1d"),
                 title=self.config.title or None)
@@ -3682,9 +3726,11 @@ class PanelCard(FluentGroupBox):
         # swap cannot reflow its geometry -- the plot never visibly resizes/jumps either (#5 "图变大").
         old_canvas, old_plotter = self.canvas, self.plotter
         self.plotter = plotter
-        # Monitor cards are display-only: NO selectors (interactions=False above)
-        # and the wheel scrolls the board (isolate_wheel=False) instead of being
-        # swallowed.  Interactive zoom / select lives in the Edit tab.
+        # Monitor cards default to display-only: the selector layer is built but PARKED
+        # inactive (see _apply_selectors_state below, gated by the header's "Selectors"
+        # switch) and the wheel scrolls the board (isolate_wheel=False) instead of being
+        # swallowed.  Switch ON arms the selectors in place -- Edit-tab behaviour on the
+        # live board; _apply_selectors_state also flips the wheel policy to match.
         self.canvas = panel_canvas(self.plotter.fig, isolate_wheel=False)
         # The canvas OWNS its size: EmbeddedFigureCanvas setFixedSize's itself to its DPR-invariant
         # design size at construction (and renders its buffer synchronously), so the host no longer pins
@@ -3709,6 +3755,9 @@ class PanelCard(FluentGroupBox):
         # FRESH plotter every rebuild -- the panel rebuilds whenever its data
         # shape changes, so without this the toggle would silently revert.
         self._apply_display_params()
+        # park (or arm) the fresh plotter's selector layer to the header's "Selectors" switch --
+        # a rebuild must inherit the current state, never come up with live selectors while OFF.
+        self._apply_selectors_state()
         self.canvas.draw()          # SYNCHRONOUS: the swapped-in canvas shows its FINAL frame at once
         self._place_setting_button()
         # A GRID panel is display-only, so its own focus-zoom is dormant -- THIS card catches the double-click
@@ -3762,11 +3811,13 @@ class PanelCard(FluentGroupBox):
         if panel_canvas is None:
             return
         # the enlarged view is a standalone panel of the cell's per-site kind -> its standard relim view
-        # kwargs.  interactions=False: the Monitor card is DISPLAY-ONLY (no selectors -- the same rule
-        # every _build_plot branch applies); interactive zoom / select lives in the Edit tab.
+        # kwargs.  interactions=True builds its selector layer; _apply_selectors_state (below) parks it
+        # to the header's "Selectors" switch -- OFF (default) keeps the enlarged view display-only as
+        # before, ON arms zoom / area / cross / the threshold drag (the same rule every _build_plot
+        # branch applies).  The Edit tab stays the always-interactive surface.
         sub_kind = str(getattr(grid, "sub_plot_kind", "hist"))
         focus = grid.build_focus_plotter(
-            k, size="2x2", interactions=False, **self._view_kwargs(sub_kind))
+            k, size="2x2", interactions=True, **self._view_kwargs(sub_kind))
         focus_canvas = panel_canvas(focus.fig, isolate_wheel=False)
         # atomic swap-in (mirror _build_plot): insert the focus canvas, remove the grid canvas but do NOT
         # close the grid figure -- it is parked for the return.  A TOP stretch balances the holder's
@@ -3788,6 +3839,7 @@ class PanelCard(FluentGroupBox):
         self._grid_focus.key_cid = focus_canvas.mpl_connect("key_press_event", self._on_grid_focus_key)
         self._grid_focus.click_cid = focus_canvas.mpl_connect("button_press_event", self._on_grid_canvas_click)
         self._apply_display_params()        # re-apply unit / manual lims to the fresh focus plotter
+        self._apply_selectors_state()       # park/arm the enlarged view's selectors to the switch
         focus_canvas.draw()
         self._place_setting_button()
 
@@ -3834,9 +3886,10 @@ class PanelCard(FluentGroupBox):
         grid, k = parked.grid, parked.k
         old_focus, old_canvas = self.plotter, self.canvas
         sub_kind = str(getattr(grid, "sub_plot_kind", "hist"))
-        focus = grid.build_focus_plotter(k, size="2x2", interactions=False,
+        focus = grid.build_focus_plotter(k, size="2x2", interactions=True,
                                          **self._view_kwargs(sub_kind))    # reads grid._display_params
-        # (interactions=False: Monitor cards are display-only -- no selectors, same as _focus_grid_cell)
+        # (interactions=True + _apply_selectors_state below: the rebuilt enlarged view parks/arms its
+        # selector layer to the header's "Selectors" switch, same as _focus_grid_cell)
         focus_canvas = panel_canvas(focus.fig, isolate_wheel=False)
         # replace the old focus canvas IN PLACE (the centring top stretch stays where it is)
         at = self.canvas_holder.indexOf(old_canvas) if old_canvas is not None else 0
@@ -3850,6 +3903,7 @@ class PanelCard(FluentGroupBox):
         parked.key_cid = focus_canvas.mpl_connect("key_press_event", self._on_grid_focus_key)
         parked.click_cid = focus_canvas.mpl_connect("button_press_event", self._on_grid_canvas_click)
         self._apply_display_params()
+        self._apply_selectors_state()
         focus_canvas.draw()
         if old_focus is not None and plt is not None and getattr(old_focus, "fig", None) is not None:
             plt.close(old_focus.fig)
@@ -5782,6 +5836,20 @@ class TaskConsole(QtWidgets.QWidget):
         self.kind_combo.setFixedWidth(scaled_px(170, minimum=130))
         add_button = FluentButton("Add Panel", color=ACCENT)
         add_button.clicked.connect(self._add_panel)
+        # "Selectors" switch: the Monitor board is display-only BY DEFAULT (every panel builds
+        # its selector layer but parks it inactive; the wheel scrolls the board) -- the original
+        # anti-misclick rule.  Flip ON to arm the full selector layer (zoom/pan, area, cross,
+        # draggable threshold/clim lines) on every dashboard panel IN PLACE -- no rebuild, and a
+        # panel added while ON inherits it (see _attach_card).  A DISPLAY control like Pause, so
+        # it stays OUT of the running-task lockout.  (Trailing pad: FluentSwitch.sizeHint
+        # reserves the track width but paints the label past track+gap -- see save_autoname.)
+        self.selectors_switch = FluentSwitch("Selectors  ")
+        self.selectors_switch.setChecked(False)
+        self.selectors_switch.setToolTip(
+            "OFF: panels are display-only (wheel scrolls the board).\n"
+            "ON: zoom / area / cross / draggable lines work on every panel\n"
+            "(the wheel zooms inside a plot, like the Edit tab).")
+        self.selectors_switch.toggled.connect(self._toggle_selectors)
         # Whole-console layout + monitor controls: Save/Load persist the LAYOUT (json); Pause/Resume
         # freezes every plot at once (a display freeze -- acquisition keeps running); Save image grabs
         # the WHOLE board region to a PNG.  EMBEDDED (figure-viewer host) has nothing to acquire, freeze
@@ -5805,9 +5873,10 @@ class TaskConsole(QtWidgets.QWidget):
         for widget in (self.status_dot, self.name_edit):
             header.addWidget(widget)
         header.addWidget(self.summary, 1)
-        # Add Panel stays even when embedded (a loaded figure is re-wired + extra panels added), the
-        # four whole-console buttons only when they exist.
-        for widget in (self.kind_combo, add_button, self.pause_button,
+        # Add Panel stays even when embedded (a loaded figure is re-wired + extra panels added), and so
+        # does the Selectors switch (inspecting a loaded figure is exactly when the selectors help);
+        # the four whole-console buttons only when they exist.
+        for widget in (self.kind_combo, add_button, self.selectors_switch, self.pause_button,
                        self.save_image_button, self.save_button, load_button):
             if widget is not None:
                 header.addWidget(widget)
@@ -5985,6 +6054,11 @@ class TaskConsole(QtWidgets.QWidget):
         card.update_interval_changed.connect(self._recompute_tick_interval)
         card.remove_requested.connect(self._remove_panel)
         card.edit_requested.connect(self._edit_card)
+        # a panel added (or loaded) while the header's "Selectors" switch is ON inherits it --
+        # the guard covers construction order (state panels may attach before the header exists).
+        switch = getattr(self, "selectors_switch", None)
+        if switch is not None:
+            card.set_selectors_enabled(switch.isChecked())
         self.cards.append(card)
         self._recompute_tick_interval()        # a new panel's rate may change the timer base
 
@@ -7291,6 +7365,13 @@ class TaskConsole(QtWidgets.QWidget):
         # _render_version), and Resume redraws them all -- hub.version has moved on, so the version gate fires.
         if not self._paused:
             self._tick()                          # immediate catch-up redraw of every panel
+
+    def _toggle_selectors(self, on: bool) -> None:
+        """Header "Selectors" switch: arm (ON) or park (OFF) the selector layer of EVERY dashboard
+        panel in place (``PanelCard.set_selectors_enabled`` -> ``BaseLivePlot.set_selectors_active``)
+        -- a pure display gate, no rebuild, no effect on acquisition or the Edit tabs."""
+        for card in self.cards:
+            card.set_selectors_enabled(bool(on))
 
     def _save_board_image(self) -> None:
         """Save the WHOLE monitor board (every panel, composited in its laid-out position) to a PNG.

@@ -200,10 +200,12 @@ capture.summary()
 <!-- cell:markdown -->
 ## MOT 监视相机（Basler pylon，如 acA1920-155um）
 
-第二只相机 `monitor_camera` 盯 MOT 荧光斑。`configs/basler_monitor.json` 是渐进
-接线 config：读出链保持虚拟，`monitor_camera` 是真 Basler（`serial=""` = 第一台，
-`trigger_source="Software"` = 自由跑，插上 USB 就能看图；接好 FPGA 触发线后改
-`"Line1"`）。上面 `discover_devices()` 打印的序列号可以直接填进 config 钉住某一台。
+第二只相机 `monitor_camera` 盯 MOT 荧光斑。`configs/basler_monitor.json` 只声明
+**真实存在的硬件**：一台自由跑的 Basler（`serial=""` = 第一台，
+`trigger_source="Software"`，插上 USB 就能看图；接好 FPGA 触发线后改 `"Line1"`）。
+缺的角色（读出相机 / sequencer / trap）就是缺——session 对缺角色宽容，存在的角色
+自然点亮，config 里绝不用假设备凑数。上面 `discover_devices()` 打印的序列号可以
+直接填进 config 钉住某一台。
 
 notebook 看图就是同一个 `capture`——真机自由跑时不需要任何脉冲：
 

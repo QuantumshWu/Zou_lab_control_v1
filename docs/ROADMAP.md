@@ -18,6 +18,9 @@ notebook 调用侧的解耦 + Rb87 读出 + **task_console 大改(Monitor/Contro
 
 7. **设备自动发现 + Basler 监视相机接入(2026-07)**:`na.discover_devices()`(仿 confocal:枚举 Basler/pypylon + VISA `*IDN?`,缺库/空总线=提示行绝不 raise;相机行自带 ready config 片段直接喂 `load_devices`);camera 选择单源 `DeviceSet.camera_names()`(Camera 测量 + Pulse scan 两下拉,契约钉相等);`camera_spec/camera_measurement` 加 `camera` 参数(console Add Panel 下拉切 `monitor_camera` 即看图);PylonCamera 补 `pixel_format`,Software 触发自由跑**免脉冲免 sequencer 出帧**;`configs/basler_monitor.json`=虚拟读出链+真 Basler 渐进接线;**exposure 改为逐相机状态**(表单空白=保持选中相机现值——对抗审查揪出的主相机默认冻结误写 bug);tutorial 两本更新;守卫 `tests/test_device_discovery.py`。本机已装 pypylon。
 
+8. **设备层去硬编码 + 五项体验修(2026-07,Y 轮)**:`discover()` 成为设备类的自描述协议(discovery 只汇集,import 失败=提示行);session **缺角色容忍**(按类型 bind 全部相机、`DeviceSet.default_camera_name()` 单源、camera_names 空即空、开序按类型)——config 只声明真实硬件(`basler_monitor` 仅一台 Basler);grid 单元字号恰两档(<2x2 小一档)+ 行缝=恰一行 title、列缝纯分隔(渲染 bbox 契约钉死);pulse_gui Scan 加 `◀ step`/`step ▶` 逐点步进调试(hold 单源);PylonCamera 分模式抓流(Software 常驻 LatestImageOnly 修 live 卡顿+旧帧显示;外触发每次重启保证一触发一帧不错位)+ ROI 停流/Offset 归零/硬件 Inc 对齐;console header **Selectors** 开关(就地武装/停用全部面板选择器)。守卫 test_grid_font_gap / test_console_selector_toggle / test_pulse_gui_scan_step + test_device_discovery 扩充。
+- 待议(confocal 对照中未采纳,将来可讨论):DeviceManager 式 reload(改 config 就地重建变更设备)、unique_id 单例。
+
 **下一步(待做)**
 - 真机 qCMOS 相机后端(`devices/qcmos.py`)接 PSF/bimodal 读出,在真实数据上验证保真度;4-shot group / 参考帧定 ground-truth 标签作为可选标定流程(算法已具备,缺采集编排)。换真机时:`na.connect("qcmos", ...)` + loading 节点组合(`CameraMeasurement`+`OccupancyProcessor`+`CalibrateReadoutTask`),分析/逻辑节点代码不动;**温度/读出测量(`exp.readout.temperature`/`readout_duration_fidelity` 与 GUI 一键 Start)走同一路径**,只换 connect。
 - 真机 MOT 监视相机验收(代码侧已备好,等相机插上):`na.discover_devices()` 看到 acA1920-155um → `na.connect("basler_monitor")` notebook capture 出图 → console Camera 下拉 `monitor_camera` 出图;接 FPGA 触发线后 `trigger_source` 改 `"Line1"`,脉冲模板三条线圈总线对准真实 DAC 通道(见 device manual"第二只相机"节)。

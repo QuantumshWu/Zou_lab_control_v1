@@ -7,17 +7,28 @@ software-triggered frames.  ``sequence`` is accepted and ignored (a real sensor 
 world; only the virtual :class:`~.virtual.VirtualMotCamera` consumes it to simulate the MOT), so
 the virtual and real monitor cameras are drop-in swaps: switching changes only the device config.
 
+The grab stream is RESIDENT (like the qCMOS ``cap_start`` once / poll thereafter): ``acquire``
+starts ``StartGrabbing`` on first use and leaves it running between calls -- restarting the USB3
+stream per frame costs tens of milliseconds and was the live-monitor stutter.  Anything that must
+reconfigure the sensor (ROI, pixel format) pauses the stream and resumes it afterwards.
+
 ``pypylon`` is imported lazily in :meth:`open` -- a machine without the Basler runtime can still
 import the package, run the virtual backend and the full test suite.
 """
 
 from __future__ import annotations
 
-from typing import Sequence
-
 import numpy as np
 
 from .base import CameraDevice, snap_subarray
+
+
+def _snap_to_inc(value: int, lo: int, hi: int, inc: int) -> int:
+    """Clamp ``value`` into the camera's own [lo, hi] and align it to the GenICam increment --
+    the hardware, not a hardcoded step, owns the legal grid."""
+    inc = max(1, int(inc))
+    v = max(int(lo), min(int(hi), int(value)))
+    return int(lo) + ((v - int(lo)) // inc) * inc
 
 
 class PylonCamera(CameraDevice):
@@ -40,9 +51,43 @@ class PylonCamera(CameraDevice):
         self.trigger_source = str(trigger_source)
         self.pixel_format = str(pixel_format)
         self.timeout = float(timeout)
+        # Fallback ROI grid when the camera is not open yet; once open, the camera's OWN GenICam
+        # increments (Width.Inc / OffsetX.Inc) own the legal grid -- never a hardcoded step.
         self.subarray_step = int(subarray_step)
         self._camera = None                     # the pypylon InstantCamera, created in open()
         self._roi: tuple[int, int, int, int] | None = None
+
+    # ------------------------------------------------------------------ discovery (self-describing)
+    @classmethod
+    def discover(cls):
+        """Enumerate attached Basler cameras -- each hit carries a READY config entry for THIS
+        class (serial-pinned, free-running so first light needs no trigger wiring).  The device
+        class owns its own discovery: :func:`~.discovery.discover_devices` only aggregates."""
+        from .discovery import DiscoveredDevice, discovery_note
+
+        try:
+            from pypylon import pylon
+        except ImportError:
+            return [discovery_note("basler", "pypylon not installed -- pip install pypylon")]
+        try:
+            infos = pylon.TlFactory.GetInstance().EnumerateDevices()
+        except Exception as exc:                # runtime present but transport layer unhappy
+            return [discovery_note("basler", f"enumerate failed: {exc}")]
+        if not infos:
+            return [discovery_note("basler", "no Basler camera attached")]
+        return cls.discovery_rows(infos)
+
+    @classmethod
+    def discovery_rows(cls, infos):
+        """Pure enumeration->rows mapping (tests feed fakes): each attached camera becomes a row
+        whose config is a ready entry for THIS class -- serial-pinned, free-running."""
+        from .discovery import DiscoveredDevice
+
+        return [DiscoveredDevice(
+            kind="basler", ident=str(i.GetSerialNumber()), label=str(i.GetModelName()),
+            config={"type": cls.__name__,
+                    "params": {"serial": str(i.GetSerialNumber()), "trigger_source": "Software"}})
+            for i in infos]
 
     # ------------------------------------------------------------------ lifecycle
     def open(self) -> None:
@@ -65,13 +110,34 @@ class PylonCamera(CameraDevice):
     def close(self) -> None:
         if self._camera is not None:
             try:
-                self._camera.Close()
+                self.stop()
             finally:
-                self._camera = None
+                try:
+                    self._camera.Close()
+                finally:
+                    self._camera = None
 
     def stop(self) -> None:
         if self._camera is not None and self._camera.IsGrabbing():
             self._camera.StopGrabbing()
+
+    def _paused_stream(self):
+        """Context manager: stop the resident grab stream around a sensor reconfiguration
+        (GenICam rejects ROI/format writes while grabbing) and resume it afterwards."""
+        camera = self._camera
+
+        class _Pause:
+            def __enter__(self_inner):
+                self_inner.was_grabbing = camera is not None and camera.IsGrabbing()
+                if self_inner.was_grabbing:
+                    camera.StopGrabbing()
+                return self_inner
+
+            def __exit__(self_inner, *exc):
+                # the stream restarts lazily on the next acquire (no eager restart on error)
+                return False
+
+        return _Pause()
 
     # ------------------------------------------------------------------ configuration
     @property
@@ -108,7 +174,7 @@ class PylonCamera(CameraDevice):
             self._apply_roi()
 
     def _apply_exposure(self) -> None:
-        # Basler exposes ExposureTime in microseconds
+        # Basler exposes ExposureTime in microseconds; legal while grabbing (no stream pause)
         self._camera.ExposureTime.SetValue(float(self._exposure) * 1e6)
 
     def _apply_trigger(self) -> None:
@@ -121,42 +187,80 @@ class PylonCamera(CameraDevice):
             cam.TriggerSource.SetValue(self.trigger_source)
 
     def _apply_roi(self) -> None:
-        if self._camera is None or self._roi is None:
+        """Push the ROI in the GenICam-safe order: pause the stream, zero the offsets, size the
+        window, then place it.  Setting Width/Height while a stale OffsetX/Y is still active can
+        violate ``Offset + Width <= SensorWidth`` and the camera rejects the write (the same
+        zero-offsets-first dance the qCMOS subarray code does).  Every value is clamped/aligned
+        to the CAMERA'S own Min/Max/Inc -- the hardware owns its legal grid."""
+        if self._camera is None:
             return
-        x, w, y, h = self._roi
         cam = self._camera
-        cam.Width.SetValue(int(w))
-        cam.Height.SetValue(int(h))
-        cam.OffsetX.SetValue(int(x))
-        cam.OffsetY.SetValue(int(y))
+        with self._paused_stream():
+            cam.OffsetX.SetValue(int(cam.OffsetX.GetMin()))
+            cam.OffsetY.SetValue(int(cam.OffsetY.GetMin()))
+            if self._roi is None:               # blank -> the FULL sensor, not a stale window
+                cam.Width.SetValue(int(cam.WidthMax.GetValue()))
+                cam.Height.SetValue(int(cam.HeightMax.GetValue()))
+                return
+            x, w, y, h = self._roi
+            w = _snap_to_inc(w, cam.Width.GetMin(), cam.Width.GetMax(), cam.Width.GetInc())
+            h = _snap_to_inc(h, cam.Height.GetMin(), cam.Height.GetMax(), cam.Height.GetInc())
+            cam.Width.SetValue(w)
+            cam.Height.SetValue(h)
+            x = _snap_to_inc(x, cam.OffsetX.GetMin(), cam.OffsetX.GetMax(), cam.OffsetX.GetInc())
+            y = _snap_to_inc(y, cam.OffsetY.GetMin(), cam.OffsetY.GetMax(), cam.OffsetY.GetInc())
+            cam.OffsetX.SetValue(x)
+            cam.OffsetY.SetValue(y)
+            self._roi = (x, w, y, h)            # what the sensor actually granted
 
     # ------------------------------------------------------------------ acquisition
     def acquire(self, frames: int = 1, *, sequence=None, on_armed=None,
                 stop=None, **_) -> list[np.ndarray]:
         """Arm, invoke the fire hook, then grab ``frames`` frames (the H4f grabber contract).
-        ``sequence`` is ignored -- the real MOT answers through the real coils."""
+        ``sequence`` is ignored -- the real MOT answers through the real coils.
+
+        Two grab modes, each with the strategy its semantics need:
+
+        * ``Software`` (free-run) -- the stream is RESIDENT: it starts on the first call and
+          stays running between calls (a live monitor calls ``acquire(1)`` per shot; restarting
+          the USB3 stream each time costs tens of ms and was the stutter).
+          ``GrabStrategy_LatestImageOnly`` keeps the newest frame so a slow consumer always
+          sees the live image, never a stale backlog.
+        * hardware trigger (e.g. ``Line1``) -- one ``StartGrabbingMax`` per acquire, stopped
+          when done: one trigger = one frame = one shot, STRICTLY.  A resident latest-only
+          stream could hand point K+1 a late frame from point K (a timed-out trigger whose
+          frame arrives after the retry fired); per-point scans are slow anyway, so the
+          restart cost is irrelevant there."""
         del sequence
         if self._camera is None:
             raise RuntimeError("PylonCamera.acquire before open() -- the device set opens cameras last.")
         from pypylon import pylon
 
         cam = self._camera
-        cam.StartGrabbingMax(int(frames), pylon.GrabStrategy_OneByOne)
+        free_run = self.trigger_source.lower() == "software"
+        if free_run:
+            if not cam.IsGrabbing():
+                cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+        else:
+            if cam.IsGrabbing():
+                cam.StopGrabbing()              # no resident stream in triggered mode (see above)
+            cam.StartGrabbingMax(int(frames), pylon.GrabStrategy_OneByOne)
         if on_armed is not None:
             on_armed()                          # the measurement fires the FPGA now (arm-before-fire)
         out: list[np.ndarray] = []
         timeout_ms = int(self.timeout * 1000)
-        while cam.IsGrabbing():
+        while len(out) < int(frames):
             if stop is not None and stop.is_set():
-                cam.StopGrabbing()
                 break
             result = cam.RetrieveResult(timeout_ms, pylon.TimeoutHandling_Return)
             if result is None or not result.GrabSucceeded():
                 if result is not None:
                     result.Release()
-                break
+                break                           # no trigger within timeout -> freeze (partial ok)
             out.append(np.array(result.Array, copy=True))
             result.Release()
+        if not free_run and cam.IsGrabbing():
+            cam.StopGrabbing()                  # strict one-shot semantics: never leave a live queue
         return self._retain(out)
 
     def snapshot(self) -> dict[str, object]:

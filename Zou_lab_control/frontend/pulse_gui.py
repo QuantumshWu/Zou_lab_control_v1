@@ -1683,6 +1683,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self._clock_hz = float(getattr(self.sequencer, "clock_hz", None) or (1e9 / self.state.time_step_ns))
         self._connection_label = ""
         self.last_program = None
+        # The HELD scan point (Stop ▸ hold point / ◀ step / step ▶): ``(index, raw row, table length)``,
+        # or None when not holding.  Set only by _hold_at_point (the single hold seam); cleared by every
+        # fresh device upload (_prepare_to_device) and by Stop Pulse (safe_state).
+        self._held_scan_point: tuple[int, list[float], int] | None = None
         self.bracket_exists = False
         self.address_str = ""
         # Two scan-table sources, switched by the Delay/Scan panel toggle:
@@ -2874,6 +2878,23 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             "from that point's values and loops it forever.  Re-run the Scan to resume sweeping.")
         self.scan_hold_button.clicked.connect(self._stop_scan_to_current_point)
         run_row.addWidget(self.scan_hold_button)
+        # Debug stepping through the scan table: walk the HELD point one row back / forward
+        # (clamped at the table ends, no wrap).  Pressing step while the sweep is still RUNNING
+        # first stops+holds like Stop ▸ hold point, stepping FROM the live point in ONE reload;
+        # with no scan table they fall into _hold_at_point's harmless message (same as the hold
+        # button).  ORANGE = the in-file utility-action colour (Remove / Load / Sync).
+        self.scan_step_back_button = FluentButton("◀ step", color=ORANGE)
+        self.scan_step_back_button.setToolTip(
+            "Step the HELD scan point one row BACK in the scan table (clamped at point 1, no wrap).  "
+            "If the scan is still running, stops and holds first -- like Stop ▸ hold point.")
+        self.scan_step_forward_button = FluentButton("step ▶", color=ORANGE)
+        self.scan_step_forward_button.setToolTip(
+            "Step the HELD scan point one row FORWARD in the scan table (clamped at the last point, no "
+            "wrap).  If the scan is still running, stops and holds first -- like Stop ▸ hold point.")
+        for step_button, step_delta in ((self.scan_step_back_button, -1), (self.scan_step_forward_button, +1)):
+            step_button.setFixedHeight(_row_height())
+            step_button.clicked.connect(lambda _checked=False, d=step_delta: self._step_held_scan_point(d))
+            run_row.addWidget(step_button)
         # Live scan-position readout (#4): a QTimer polls the connected sequencer's scan_progress()
         # while a scan runs and writes this label (single-source text via _format_scan_progress) PLUS the
         # current point's VALUES (#1 "show the current scan points"); blank when idle / no sequencer.
@@ -3036,25 +3057,36 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         k, row, total = held
         return f"held at point {int(k) + 1}/{int(total)}: {self._scan_point_values_text(row)}"
 
-    def _stop_scan_to_current_point(self) -> None:
-        """#1: stop the running scan and HOLD the current scan point -- reload a single-point program
-        built from exactly that point's values and loop it forever (not seamless).  Re-Run to resume."""
-        if self.sequencer is None:
-            self._message("No sequencer attached.")
-            return
+    def _live_scan_point_index(self) -> int:
+        """The device's CURRENT scan-point index (0-based) from ``scan_progress()`` -- 0 when no
+        sequencer / idle / unreadable, the same defensive read the Stop handler always did."""
         try:
             progress = self.sequencer.scan_progress() if hasattr(self.sequencer, "scan_progress") else {}
         except Exception:
             progress = {}
+        try:
+            return int((progress or {}).get("point", 0) or 0)
+        except Exception:
+            return 0
+
+    def _hold_at_point(self, index: int) -> None:
+        """HOLD scan point ``index`` (clamped into the table): reload a single-point program built from
+        exactly that point's values and loop it forever (not seamless).  The SINGLE source of the hold
+        mechanics -- Stop ▸ hold point and the ◀ step / step ▶ buttons all land here.  Re-Run to resume."""
+        if self.sequencer is None:
+            self._message("No sequencer attached.")
+            return
         state = self.read_state()
         table = list(getattr(state, "scan_table", None) or [])
         if not table:
             self._message("No scan table to hold -- run a scan first.")
             return
-        try:
-            k = max(0, min(int((progress or {}).get("point", 0) or 0), len(table) - 1))
-        except Exception:
-            k = 0
+        k = max(0, min(int(index), len(table) - 1))
+        # Plain-dict read, NOT getattr: on a test's ``Editor.__new__(Editor)`` instance (no Qt
+        # __init__) a missing attribute falls through to sip's wrapper check -> RuntimeError.
+        held = self.__dict__.get("_held_scan_point")
+        if held is not None and int(held[0]) == k:
+            return                               # already holding exactly this point (a step clamped at an end)
         frozen_row = list(table[k])              # the raw row (for the readout); device gets the baked state
         frozen = self._freeze_state_to_scan_point(state, k)
         try:
@@ -3071,6 +3103,20 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         except Exception as exc:
             self.stateui_manager.runstate = PulseStateUIManager.RunState.ERROR
             self._message(str(exc))
+
+    def _stop_scan_to_current_point(self) -> None:
+        """#1 thin shell: stop the running scan and HOLD the point the device is on RIGHT NOW.  The
+        hold mechanics live in :meth:`_hold_at_point` (single source, shared with ◀ step / step ▶)."""
+        self._hold_at_point(self._live_scan_point_index())
+
+    def _step_held_scan_point(self, delta: int) -> None:
+        """◀ step / step ▶ (debug): move the HELD scan point by ``delta`` rows, clamped to the table
+        ends (no wrap-around).  Not held yet (the sweep is still running) -> stop+hold like Stop ▸ hold
+        point and step FROM the live point, in ONE reload.  No sequencer / no scan table -> the same
+        harmless message path as the hold button (via :meth:`_hold_at_point`)."""
+        held = self.__dict__.get("_held_scan_point")     # dict read: see _hold_at_point's note
+        base = int(held[0]) if held is not None else self._live_scan_point_index()
+        self._hold_at_point(base + int(delta))
 
     def _refresh_scan_tab(self) -> None:
         if not hasattr(self, "scan_slots_label"):
@@ -3695,6 +3741,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         return json.dumps(state.to_dict(), sort_keys=True, separators=(",", ":"))
 
     def _prepare_to_device(self, *, fire: bool = False):
+        # ANY fresh device upload (On Pulse / Prepare / re-running the Scan) supersedes a held scan
+        # point -> clear the HELD readout so the label returns to the live position (#1).  The hold
+        # path itself does NOT come through here (it uploads via _hold_at_point, which re-marks it).
+        self._held_scan_point = None
         state = self.read_state()
         # RE-DERIVE the scan table for the CURRENT slots before every upload, from the active SOURCE
         # (the generated-code output cache / the loaded array) rather than the table read_state carried
@@ -3750,7 +3800,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 
     def fire(self) -> None:
         RunState = PulseStateUIManager.RunState
-        self._held_scan_point = None          # a fresh Run resumes the full sweep -> no longer HELD (#1)
+        # (the HELD-point clear rides on _prepare_to_device -- the single "fresh upload" seam)
         try:
             # On Pulse = prepare + fire through the PulseController seam in ONE call (controller.on_pulse
             # prepares then fires); no second self.sequencer.fire() here.
@@ -3766,6 +3816,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 
     def safe_state(self) -> None:
         RunState = PulseStateUIManager.RunState
+        self._held_scan_point = None          # Stop Pulse ends the held single-point loop -> no longer HELD (#1)
         try:
             if self.sequencer is not None:
                 if hasattr(self.sequencer, "set_safe_state"):
