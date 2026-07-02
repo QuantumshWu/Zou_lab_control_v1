@@ -11,7 +11,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.collections import PolyCollection
 from matplotlib.patches import Rectangle
-from matplotlib.ticker import Formatter, FuncFormatter, LogLocator, MaxNLocator, NullLocator, ScalarFormatter
+from matplotlib.ticker import FixedLocator, Formatter, FuncFormatter, LogLocator, MaxNLocator, NullLocator, ScalarFormatter
 import numpy as np
 from scipy.optimize import curve_fit
 
@@ -207,20 +207,14 @@ _IMAGE_SPLIT = ([0.75, 0.1, 0.1], [0.025, 0.025])  # 2D image | side dist | colo
 # NOT a bespoke grid margin tuple -- so a grid's TOTAL figure px (data box + margins) equals a single-axes
 # panel's of the same size to the pixel (the same three-region L|data|R / B|data|T layout), and the grid
 # thumbnail's padding matches every other kind's card instead of looking visibly different (#5).
-_SITE_COL_GAP_PX = 12
-# The row gap must clear each cell's small TITLE (the site index, above the axes, #5) AND a ragged
-# column's bottom-edge x tick labels (the shared-axes policy puts x labels on each column's LOWEST
-# cell, which can sit mid-grid) -- so the band holds label + title without crowding.
-_SITE_ROW_GAP_PX = 34
 _SITE_MAX_COLS = 7                        # column cap (pulse-style width cap); extra sites wrap to rows
 #: Hard cap on the number of grid cells: beyond this the per-tick thumbnail update (and the first
 #: matplotlib layout) freezes the UI.  ONE source -- the grid factory raises past it and the console
 #: greys out facet axes that would exceed it.
 MAX_GRID_CELLS = 80
-#: Cell-text scaling reference: a cell whose data box is at least this tall (logical px) uses the
-#: STANDARD small/tick font sizes (the cap -- never larger than a 2x2 panel's text); shorter cells
-#: shrink their title/label text proportionally so a small grid panel never drowns in text.
-_CELL_FONT_REF_PX = 120
+#: Cell-text scaling floor: the PANEL SIZE preset picks the cell text scale (a 2x2-or-taller panel
+#: uses the STANDARD small/tick font sizes -- the cap; a half-height 1x2 shrinks proportionally),
+#: never below this floor so the text stays legible.
 _CELL_FONT_MIN_SCALE = 0.55
 
 
@@ -1502,14 +1496,27 @@ def panel_plot_spec(size: str = "2x2", *, kind: str = "default") -> FigureSpec:
 # margins are :func:`panel_margins_px` -- the SAME margins every single-axes panel uses -- so the grid's
 # TOTAL figure px (data box + margins) EQUALS a same-size single-axes panel's to the pixel, and the grid
 # thumbnail's outer padding matches every other kind's card (#5).  ONE size rule, ONE margin source.
-def _site_grid_geometry(size: str = "2x2") -> tuple[tuple[int, int], int, int, tuple[int, int, int, int]]:
-    rows, cols = panel_size_cells(size)
-    wf, hf = cols / 2.0, rows / 2.0                       # gap scale factors vs the 2x2 baseline
+def _site_grid_geometry(size: str = "2x2") -> tuple[tuple[int, int], int, int, tuple[int, int, int, int], float]:
+    """The grid's layout numbers for a panel-size preset: total data region (== every other kind's at
+    this size), the inter-cell gaps, the outer margins, and the CELL-TEXT scale.
+
+    The text scale follows the PANEL SIZE (the preset the operator picked): a 2x2-or-larger panel
+    uses the STANDARD small/tick font sizes (the cap), a half-height panel shrinks proportionally.
+    The gaps then DERIVE from that scaled text -- exactly the band the cell title (+ a ragged
+    column's bottom x labels) needs, nothing more -- so bigger panels put the extra pixels into the
+    CELLS, never into wider corridors (gaps used to double with the size preset, wasting the area)."""
     data_px = panel_plot_spec(size).data_px               # total data region == every other kind's at this size
-    col_gap = round(_SITE_COL_GAP_PX * wf)
-    row_gap = round(_SITE_ROW_GAP_PX * hf)
+    ref_h = panel_plot_spec("2x2").data_px[1]
+    font_scale = float(min(1.0, max(_CELL_FONT_MIN_SCALE, data_px[1] / ref_h)))
+    # pt -> logical px at the design dpi (100/72); the row band holds one title line (pad included)
+    # plus one x-tick-label line, the column gap is a thin corridor (y labels live in the L margin).
+    px_per_pt = 100.0 / 72.0
+    row_gap = round((small_fontsize() * 1.7 + tick_fontsize() * 1.5) * px_per_pt * font_scale) + 2
+    # the column corridor must clear the bottom row's OUTERMOST x labels (each spills ~half a label
+    # past its cell edge) -- y labels live in the L margin, so this is the only text it carries
+    col_gap = max(6, round(16 * font_scale))
     l, r, b, t = panel_margins_px()                       # SAME outer margins as a single-axes panel -> total px matches
-    return data_px, col_gap, row_gap, (l, r, b, t)
+    return data_px, col_gap, row_gap, (l, r, b, t), font_scale
 
 
 # The cell-count THRESHOLDS a grid dimension crosses to earn a double-size half-unit, PER AXIS: an axis
@@ -3146,10 +3153,10 @@ class GridCell:
     relim_mode: str = "tight"
     fixed_lo: float = 0.0
     fixed_hi: float = 1.0
-    #: Cell-text scale, set by the GRID from its cell geometry (cell height / _CELL_FONT_REF_PX,
-    #: capped at 1.0): a small panel's cell titles + edge tick labels shrink with the cells, and a
-    #: full-size cell never exceeds the standard small/tick font sizes.  Cells multiply their
-    #: apply_title size by it; the grid's tick policy multiplies its label size by it.
+    #: Cell-text scale, set by the GRID from the PANEL SIZE preset (_site_grid_geometry): a
+    #: 2x2-or-taller panel uses the standard small/tick font sizes (the cap), a half-height panel
+    #: shrinks proportionally.  Cells multiply their apply_title size by it; the grid's tick policy
+    #: multiplies its label size by it.
     font_scale: float = 1.0
 
     def thumb_lims(self, auto_lo: float, auto_hi: float) -> tuple[float, float]:
@@ -3746,19 +3753,16 @@ class GridPlot(BaseLivePlot):
         # other panel kind uses at this size) and create_axes_grid SUBDIVIDES it into cells -- so a grid's
         # data region equals a single-axes panel's of the same size (part A), records fig._zlc_fixed_box_in,
         # and a size change truly rescales the cells.
-        data_px, col_gap, row_gap, margins = _site_grid_geometry(self._size)
+        data_px, col_gap, row_gap, margins, font_scale = _site_grid_geometry(self._size)
         axes = create_axes_grid(
             self.fig, self.nrows, self.ncols,
             data_px=data_px, col_gap_px=col_gap,
             row_gap_px=row_gap, margins_px=margins,
         )
         self.axes = axes
-        # Cell-text scale from the CELL geometry: titles + edge tick labels shrink with the cells
-        # (a small panel size), capping at the standard sizes for full-height cells -- set once per
-        # layout, consumed by the cell draws (apply_title) and the grid's tick policy.
-        cell_h = (data_px[1] - (self.nrows - 1) * row_gap) / max(1, self.nrows)
-        self.cell_renderer.font_scale = float(
-            min(1.0, max(_CELL_FONT_MIN_SCALE, cell_h / _CELL_FONT_REF_PX)))
+        # The PANEL-SIZE-derived cell-text scale (ONE source: _site_grid_geometry) -- consumed by
+        # the cell draws (apply_title) and the grid's tick policy.
+        self.cell_renderer.font_scale = font_scale
         return axes[0]
 
     def _style_cell_ticks(self, ax, k: int) -> None:
@@ -3784,7 +3788,12 @@ class GridPlot(BaseLivePlot):
             if ax.get_yscale() != "linear":     # log installs minor ticks too -- clear them as well
                 ax.yaxis.set_minor_locator(NullLocator())
         if (k + self.ncols) >= self.n_cells:    # the column's bottom cell carries the x labels
-            ax.xaxis.set_major_locator(MaxNLocator(nbins=3, prune="lower"))
+            # ONE nice tick per cell, nearest the centre: a cell is ~1/6 of a panel wide, so even two
+            # standard-size labels collide (with each other or across the gap with the neighbour's).
+            lo, hi = ax.get_xlim()
+            interior = [t for t in MaxNLocator(nbins=4).tick_values(lo, hi) if lo < t < hi]
+            pick = [min(interior, key=lambda t: abs(t - (lo + hi) / 2.0))] if interior else []
+            ax.xaxis.set_major_locator(FixedLocator(pick))
             ax.tick_params(axis="x", labelbottom=True, labelsize=tick_fontsize() * scale, length=2)
         else:
             ax.set_xticks([])
@@ -3839,6 +3848,8 @@ class GridPlot(BaseLivePlot):
             for k, ax in enumerate(self.site_axes):
                 if not cell.update_cell(ax, k):
                     self._redraw_thumbnail(k, ax)        # artist structure changed -> one full redraw
+                else:
+                    self._style_cell_ticks(ax, k)        # the centre tick tracks the moved lims
         if draw:
             self.draw()
 
