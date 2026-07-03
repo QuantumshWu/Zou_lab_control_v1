@@ -65,6 +65,79 @@ cameras = [d for d in found if d.config is not None]
 cameras
 
 <!-- cell:markdown -->
+## 接入你自己的硬件（自定义设备类 / 发现提供者）
+
+`discover_devices()` 只认识**注册表里、且实现了 `discover()` 的类**（内置的 Basler 相机 + VISA
+provider）。你的相机 / DAQ / 线圈电源不在其中时，**不用改本仓库源码**——三个扩展点就够
+（和 confocal 的 `lookup_dict` 同源）：
+
+1. **写一个设备类**——继承正确的领域基类（`na.CameraDevice` / `na.SequencerDevice` /
+   `na.TrapArrayDevice`），实现它的契约。相机契约 = `exposure` + `configure(...)` + 纯 grabber
+   三原语 `arm` / `read_frames` / `disarm`（无损缓冲逻辑在**基类**，子类只把到达的帧喂进
+   `self._deliver(frame)`）。可选：加一个 `discover()` classmethod 让它**自报家门**——扫到就
+   返回一行带 **ready config** 的 `na.DiscoveredDevice`；缺库 / 空总线用
+   `na.discovery_note(kind, "pip install ...")` 报一行、**绝不 raise**（和内置 Basler 的
+   `discover()` 一模一样）。
+2. **注册 / 引用**——`na.register_device_class("MyCam", MyCam)`（或传可导入路径字符串
+   `"my_pkg.cams:MyCam"` 延迟导入），之后任何 config 里 `{"type": "MyCam"}` 按短名引用；只在
+   本 notebook **临时**用则 `na.load_devices({...}, lookup=globals())`——把这里定义的类直接拿来
+   构造，**零注册、不写全局注册表**（`lookup` 命中是 per-call 的，不留痕）。
+3. **class-less 总线**——一台没有任何设备类认领的仪器（一堆串口 / site-specific 机箱），写一个
+   零参扫描函数，`na.register_discovery_provider("mybus", scan)` 注册进 `discover_devices()`
+   （VISA 就是内置的这种 provider，逐个资源发 `*IDN?`）。
+
+下面这格**不接任何真硬件就能跑**：定义一个占位相机类，注册它，看它出现在扫描里、并被
+`load_devices` 按短名 / 按 `globals()` 构造出来。把 `DemoCamera` 换成你自己的相机 SDK 封装，
+真机上流程一字不变。**设备只管硬件动作**；标定 / 检测算法属于 `core/`，别塞进设备类。完整的
+“编写并注册一个自定义设备”一章见 **device manual**。
+
+<!-- cell:code -->
+# 一个占位相机:换成你自己的相机 SDK 封装即可(这里不接硬件,只演示注册/发现/构造的接线)。
+class DemoCamera(na.CameraDevice):
+    def __init__(self, *, serial="", exposure=3e-3):
+        self._serial = str(serial)
+        self._exposure = float(exposure)
+
+    @property
+    def exposure(self):
+        return self._exposure
+
+    @exposure.setter
+    def exposure(self, value):
+        self.configure(exposure=float(value))     # 唯一硬件写入口
+
+    def configure(self, *, exposure=None, **kwargs):
+        self._reject_unknown_configure_keys({"exposure"}, kwargs)   # 未知键大声报错
+        if exposure is not None:
+            self._exposure = float(exposure)
+        # 真机:这里把曝光写进相机;帧到达时子类调用 self._deliver(frame)。
+
+    @classmethod
+    def discover(cls):
+        # 自报家门:返回带 ready config 的行(缺库/空总线改用 na.discovery_note(...),绝不 raise)。
+        return [na.DiscoveredDevice(
+            kind="demo", ident="demo-0001", label="DemoCamera (example)",
+            config={"type": cls.__name__, "params": {"serial": "demo-0001"}})]
+
+
+# (1)+(2) 注册短名 -> 它自报家门出现在扫描里(和 Basler/VISA 并列),且带 ready config:
+na.register_device_class("DemoCamera", DemoCamera)
+demo_rows = [row for row in na.discover_devices(display=False) if row.kind == "demo"]
+
+# (2') 零注册路径:notebook 里定义的类,直接用 lookup=globals() 构造(不写全局注册表):
+built = na.load_devices({"monitor_camera": {"type": "DemoCamera", "params": {"serial": "x"}}},
+                        lookup=globals())
+
+# (3) class-less 总线:注册一个自定义发现 provider(VISA 是内置的同类)。
+def scan_my_bus():
+    return [na.discovery_note("mybus", "example provider: 0 instruments on this bus")]
+
+na.register_discovery_provider("mybus", scan_my_bus)
+provider_row = [row for row in na.discover_devices(display=False) if row.ident == "mybus"]
+
+demo_rows[0].config, built.camera_names(), provider_row[0].label
+
+<!-- cell:markdown -->
 ## Connect hardware
 
 `na.connect(..., open_devices=True)` 会通过 device loader 构造、校验并打开
