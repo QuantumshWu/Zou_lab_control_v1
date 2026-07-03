@@ -1778,6 +1778,88 @@ def panel_display_size(size: str = "2x2") -> tuple[int, int]:
     return (round(width * PANEL_DISPLAY_SCALE), round(height * PANEL_DISPLAY_SCALE))
 
 
+def coerce_panel_value(kind, value, *, structure=None, params=None, repeat_mode="last"):
+    """Turn a hub signal VALUE (+ its producing node's declared ``structure``) into the array a
+    panel of ``kind`` consumes -- the ONE place that owns each plot kind's INPUT contract (2d wants
+    an image, hist bins samples, monitor a scalar, sites one value/site).  This lives WITH the plots,
+    NOT in task_console: the console only GATHERS the inputs (value, structure, params, repeat mode)
+    and calls here, so the wiring layer holds zero per-kind reshape logic.  ``structure`` is the
+    producing node's ``{"data_shape", "grid_shape"}`` mapping, or None when unknown (a custom
+    expression / raw array) -- then shape is INFERRED from the value, never assumed."""
+    params = params or {}
+    # A pulse panel's value is a STRUCTURED object (a sequence / PulseTableState) with no array shape.
+    if kind == "pulse":
+        return value
+    arr = np.asarray(value, dtype=float)
+    if kind == "grid":
+        # A FACET grid consumes the bound block RAW (repeat, points, *data_dim); facet_cells slices it.
+        return arr
+    # Reshape is decided by the DATA dimensionality (#H3o, NOT a size threshold): data_shape 2-D -> an
+    # image; 1-D -> multiple series (lines); grid_shape un-flattens a 2-D scan's points to a map.
+    st = structure
+    ds = tuple(st["data_shape"]) if st else ()
+    gs = tuple(st["grid_shape"]) if st else ()
+    if kind == "1d":
+        # y-vs-index by default; only an explicit xy=True panel reads (N, 2) as an x-y curve.
+        if params.get("xy") and arr.ndim == 2 and arr.shape[1] == 2 and arr.shape[0] >= 1:
+            return arr
+        a = np.squeeze(arr)
+        if len(ds) == 2:
+            # 2-D DATA: 'create' arrived as (pixels, repeat) -> one line per repeat; else flatten to one trace.
+            if repeat_mode == "create" and a.ndim == 2:
+                return a
+            flat = a.reshape(-1)
+            if flat.size < 1:
+                raise ValueError("panel value is empty")
+            return flat
+        # 1-D DATA / unknown: a 2-D (points, lines) stays 2-D (one line per series); a 1-D value is one line.
+        if a.ndim == 2:
+            return a
+        flat = a.reshape(-1)
+        if flat.size < 1:
+            raise ValueError("panel value is empty")
+        return flat
+    if kind == "2d":
+        # Image by structure: a 2-D data core IS the image; a 2-D scan un-flattens to grid_shape; an
+        # unknown-structure 2-D value is shown as-is.  NATIVE resolution -- the DISPLAY layer (Live2DDis)
+        # block-means only for the screen budget, reversibly (zoom re-slices the full array to 1:1).
+        a = np.asarray(arr, dtype=float)
+        if len(ds) == 2:
+            img = np.squeeze(a)
+            if img.ndim > 2:
+                img = img.reshape(img.shape[0], img.shape[1], -1)[:, :, 0]
+        elif gs and int(np.prod(gs)) == int(a.size):
+            img = a.reshape(tuple(int(n) for n in gs))
+        elif st is None and np.squeeze(a).ndim == 2:
+            img = np.squeeze(a)
+        else:
+            raise ValueError(
+                f"2D panel needs an image (a 2-D data_shape or a grid_shape); got value shape "
+                f"{arr.shape}, data_shape={ds}, grid_shape={gs}")
+        if img.ndim != 2 or min(img.shape) < 2:
+            raise ValueError(f"2D panel needs a 2D image value (got shape {arr.shape})")
+        return img
+    if kind == "hist":
+        # Bin SAMPLES: 'create' per-repeat COLUMNS (n_samples, R) stay 2-D (one histogram per repeat);
+        # anything else flattens to ONE histogram -- bin exactly what the source gives.
+        return arr if (arr.ndim == 2 and arr.shape[1] > 1) else arr.reshape(-1)
+    if kind == "monitor":
+        flat = arr.reshape(-1)
+        if flat.size != 1:
+            raise ValueError(f"rolling-trace panel needs a scalar value (got shape {arr.shape})")
+        return float(flat[0])
+    flat = arr.reshape(-1)
+    if flat.size < 1:
+        raise ValueError("panel value is empty")
+    if kind == "sites":
+        # ONE value per site: 'create' concatenates repeats -> collapse back to n_sites (mean over repeats).
+        if len(ds) == 1 and int(ds[0]) > 0 and flat.size != int(ds[0]) and flat.size % int(ds[0]) == 0:
+            flat = np.nanmean(flat.reshape(-1, int(ds[0])), axis=0)
+        if flat.size > 4096:
+            raise ValueError(f"site-map panel needs one value per site (got {flat.size} values)")
+    return flat
+
+
 def panel_plot(data_x, data_y=None, *, kind: str, size: str = "2x2", **kwargs):
     """``plot()`` preset for dashboard panels: pick a kind and one of the
     LIMITED ``PANEL_SIZES`` and get a correctly sized, consistently styled live

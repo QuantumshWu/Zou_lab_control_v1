@@ -50,6 +50,7 @@ from .live import (
     DEFAULT_HIST_FIT,
     PANEL_SIZES,
     PLOT_KINDS,
+    coerce_panel_value,
     panel_display_size,
     panel_plot,
     panel_size_cells,
@@ -3248,103 +3249,16 @@ class PanelCard(FluentGroupBox):
         return int(st.get("core_ndim", 0))
 
     def _coerce(self, value):
-        kind = self.config.kind
-        # A pulse panel's value is a STRUCTURED object (a sequence / PulseTableState), consumed as-is by
-        # the ``pulse`` branch of _build_plot -- it has no array shape to coerce/reshape (the same way the
-        # 2d branch reshapes its own frame and sites uses its own centres: each kind owns its data form).
-        if kind == "pulse":
-            return value
-        arr = np.asarray(value, dtype=float)
-        if kind == "grid":
-            # A FACET grid consumes the bound block in its RAW (repeat, points, *data_dim) form --
-            # facet_cells owns the slicing; a recipe grid's value is only a numeric placeholder.
-            return arr
-        # The producing node's structure (#H3o): reshape is decided by the DATA dimensionality (NOT a
-        # size threshold).  ``data_shape`` 1-D -> the data is multiple series -> LINES (data does not
-        # reshape); ``data_shape`` 2-D -> the data is an image -> it reshapes (image / flat trace).
-        # ``grid_shape`` un-flattens a 2-D scan's points to a map.  Empty (a custom expression / a raw
-        # array) -> fall back to shape inference, never assume.
-        st = self._bound_structure()
-        ds = tuple(st["data_shape"]) if st else ()
-        gs = tuple(st["grid_shape"]) if st else ()
-        if kind == "1d":
-            # 1D panels are y-vs-index by default.  Only a panel EXPLICITLY
-            # flagged xy=True (e.g. a curve view whose source is
-            # value = column_stack([x_key, y_key])) reads an (N, 2) value as an
-            # x-y curve (col0 = x, col1 = y).
-            if self.config.params.get("xy") and arr.ndim == 2 and arr.shape[1] == 2 and arr.shape[0] >= 1:
-                return arr
-            a = np.squeeze(arr)
-            mode = self._repeat_mode_value()      # the ONE clamped reader (#A2)
-            if len(ds) == 2:
-                # the DATA is a 2-D image -> it does NOT make per-data lines.  ``create`` already
-                # arrived as ``(pixels, repeat)`` from reduce_repeat, so one line per repeat; otherwise
-                # UNROLL the image to a single 1-D trace (a camera frame "just shows" flattened).
-                if mode == "create" and a.ndim == 2:
-                    return a
-                flat = a.reshape(-1)
-                if flat.size < 1:
-                    raise ValueError("panel value is empty")
-                return flat
-            # 1-D DATA (a scan's series) OR unknown: a 2-D ``(points, lines)`` stays 2-D so each data
-            # series (and each ``create`` repeat) draws as its own line; a 1-D value is a single line.
-            if a.ndim == 2:
-                return a
-            flat = a.reshape(-1)
-            if flat.size < 1:
-                raise ValueError("panel value is empty")
-            return flat
-        if kind == "2d":
-            # Reshape to an image by the structure (#H3o): a 2-D DATA core (a camera frame's (H, W))
-            # IS the image; else a 2-D scan's flattened points reshape to ``grid_shape``; else a value
-            # that is already a 2-D map (a derived expression) is shown as-is.  A 1-D-data / 1-D-points
-            # value has no map and raises (no silently-wrong image).
-            a = np.asarray(arr, dtype=float)
-            if len(ds) == 2:                                  # camera: the image lives in the data axis
-                img = np.squeeze(a)
-                if img.ndim > 2:
-                    img = img.reshape(img.shape[0], img.shape[1], -1)[:, :, 0]
-            elif gs and int(np.prod(gs)) == int(a.size):      # 2-D scan: un-flatten points to the grid
-                img = a.reshape(tuple(int(n) for n in gs))
-            elif st is None and np.squeeze(a).ndim == 2:      # a derived 2-D map (unknown structure)
-                img = np.squeeze(a)
-            else:
-                raise ValueError(
-                    f"2D panel needs an image (a 2-D data_shape or a grid_shape); got value shape "
-                    f"{arr.shape}, data_shape={ds}, grid_shape={gs}")
-            if img.ndim != 2 or min(img.shape) < 2:
-                raise ValueError(f"2D panel needs a 2D image value (got shape {arr.shape})")
-            # NATIVE resolution: the image reaches the plot at its full size, so the axes span its
-            # REAL pixels (a selection maps straight back to a true ROI) and no detail is discarded.
-            # Cheapness is the DISPLAY layer's job -- Live2DDis keeps the full array, reshapes a
-            # regular raster in O(1) (no per-tick scatter), and block-means ONLY for the screen
-            # budget (reversible: zoom re-slices the full array back to 1:1).
-            return img
-        if kind == "hist":
-            # A histogram bins SAMPLES.  ``reduce_repeat(hist=True)`` already flattened every non-'create'
-            # mode to a 1-D sample set, so the ONLY 2-D a dis receives is 'create' per-repeat COLUMNS
-            # (n_samples, R) -> keep them (HistogramFigure draws one histogram per repeat: first full, the
-            # rest outlined).  Anything else flattens to ONE histogram -- the dis bins EXACTLY what the
-            # source gives it (no reach into any calibration, no shape guessing).
-            return arr if (arr.ndim == 2 and arr.shape[1] > 1) else arr.reshape(-1)
-        if kind == "monitor":
-            flat = arr.reshape(-1)
-            if flat.size != 1:
-                raise ValueError(f"rolling-trace panel needs a scalar value (got shape {arr.shape})")
-            return float(flat[0])
-        flat = arr.reshape(-1)
-        if flat.size < 1:
-            raise ValueError("panel value is empty")
-        if kind == "sites":
-            # A site map has ONE value per site.  A repeat block bound here arrives post-reduce as
-            # (1, n_sites) -> n_sites (fine), but ``create`` mode concatenates the repeats ->
-            # (repeat*n_sites,); collapse that back to one value/site (mean over repeats) using the
-            # node's declared data_shape, so a 'create' sites panel still draws exactly n_sites rings.
-            if len(ds) == 1 and int(ds[0]) > 0 and flat.size != int(ds[0]) and flat.size % int(ds[0]) == 0:
-                flat = np.nanmean(flat.reshape(-1, int(ds[0])), axis=0)
-            if flat.size > 4096:
-                raise ValueError(f"site-map panel needs one value per site (got {flat.size} values)")
-        return flat
+        # The per-kind reshape (image / lines / samples / one-value-per-site) lives WITH the plots
+        # now -- ``live.coerce_panel_value`` owns every plot kind's INPUT contract.  The console only
+        # GATHERS the inputs (value + the bound node's structure + params + repeat mode) and dispatches,
+        # so the wiring layer holds ZERO per-kind reshape logic (a plot kind's input shape can change
+        # without touching task_console).
+        return coerce_panel_value(
+            self.config.kind, value,
+            structure=self._bound_structure(),
+            params=self.config.params,
+            repeat_mode=self._repeat_mode_value())
 
     def _sites_aux(self, namespace: Mapping[str, object]):
         """The site map's centres + camera underlay, resolved from the SAME producing node as its
