@@ -3314,10 +3314,12 @@ class PanelCard(FluentGroupBox):
                     f"{arr.shape}, data_shape={ds}, grid_shape={gs}")
             if img.ndim != 2 or min(img.shape) < 2:
                 raise ValueError(f"2D panel needs a 2D image value (got shape {arr.shape})")
-            # bound the point table so the grid scatter stays cheap per tick
-            sy = max(1, int(np.ceil(img.shape[0] / 192)))
-            sx = max(1, int(np.ceil(img.shape[1] / 192)))
-            return img[::sy, ::sx]
+            # NATIVE resolution: the image reaches the plot at its full size, so the axes span its
+            # REAL pixels (a selection maps straight back to a true ROI) and no detail is discarded.
+            # Cheapness is the DISPLAY layer's job -- Live2DDis keeps the full array, reshapes a
+            # regular raster in O(1) (no per-tick scatter), and block-means ONLY for the screen
+            # budget (reversible: zoom re-slices the full array back to 1:1).
+            return img
         if kind == "hist":
             # A histogram bins SAMPLES.  ``reduce_repeat(hist=True)`` already flattened every non-'create'
             # mode to a 1-D sample set, so the ONLY 2-D a dis receives is 'create' per-repeat COLUMNS

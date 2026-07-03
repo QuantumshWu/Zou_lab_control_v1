@@ -110,6 +110,42 @@ def test_live2d_displays_a_budgeted_view_and_keeps_the_full_grid():
     assert p.image.get_interpolation() == "antialiased"  # filtered when minified; portable ("auto" only exists in mpl>=3.5)
 
 
+def test_camera_panel_is_native_resolution_with_real_pixel_axes():
+    """A camera frame reaches the plot at NATIVE resolution and its axes span the SOURCE's REAL
+    pixels -- so a selector rectangle maps straight back to a true camera ROI.  There is NO
+    upstream point-count cap (the old 192-stride blurred the image AND compressed the coordinate
+    axes ~10x, silently breaking the selection->measurement-region writeback).  The full regular
+    raster reshapes in O(1), so full resolution costs no per-frame scatter."""
+    H, W = 1200, 1920
+    frame = np.arange(H * W, dtype=float).reshape(H, W)    # every pixel distinct -> exact reconstruction
+    x0, y0 = 100.0, 50.0                                   # a camera ROI origin (like a qCMOS window)
+    xx, yy = np.meshgrid(x0 + np.arange(W, dtype=float), y0 + np.arange(H, dtype=float))
+    data_x = np.column_stack([xx.ravel(), yy.ravel()])
+    p = panel_plot(data_x, frame.ravel(), kind="2d", size="2x2")
+    # native resolution: the analysis grid is the FULL frame, reconstructed EXACTLY (O(1) reshape)
+    assert p._regular_raster is True
+    assert p.grid.shape == (H, W)
+    assert np.array_equal(p.grid, frame)
+    # axes span the REAL pixel range x0..x0+W, y0..y0+H (NOT a compressed 0..N): a selection at a
+    # data coordinate denotes the SAME real pixel the image draws there.
+    assert abs(p.extent[0] - (x0 - 0.5)) < 1.0 and abs(p.extent[1] - (x0 + W - 0.5)) < 1.0
+    ylo, yhi = sorted((p.extent[2], p.extent[3]))
+    assert abs(ylo - (y0 - 0.5)) < 1.0 and abs(yhi - (y0 + H - 0.5)) < 1.0
+    # a new frame updates the grid through the SAME O(1) reshape (no scatter, no cap)
+    frame2 = frame[::-1].copy()
+    p.update(frame2.ravel(), draw=False)
+    assert np.array_equal(p.grid, frame2)
+
+
+def test_sparse_scan_grid_still_scatters():
+    """A genuine sparse / incomplete scan is NOT a complete raster, so it falls back to the
+    searchsorted scatter (the reshape fast path is opt-in on a verified full raster only)."""
+    pts = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])   # 3 pts over a 2x2 grid -> one cell empty
+    p = panel_plot(pts, np.array([1.0, 2.0, 3.0]), kind="2d", size="2x2")
+    assert p._regular_raster is False
+    assert np.isnan(p.grid[1, 1])                          # the missing cell stays NaN (scatter semantics)
+
+
 def test_live2d_zoom_reslices_to_full_resolution():
     frame = _camera_frame()
     p = _camera_panel(frame)

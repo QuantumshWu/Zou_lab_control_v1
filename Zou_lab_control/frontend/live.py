@@ -1094,11 +1094,26 @@ class Live2DDis(BaseLivePlot):
         self.bad_color = bad_color
         self.square = square
 
+    def _is_regular_raster(self) -> bool:
+        """True when the points are a COMPLETE row-major grid -- a camera frame or any dense 2-D
+        map: exactly one point per cell, ascending in (y, then x).  Detected ONCE (``data_x`` is
+        fixed for the plot's life) so :meth:`fill_grid` reshapes in O(1) per frame instead of an
+        O(N) searchsorted scatter -- a full 1920x1200 frame then updates with no per-tick cost,
+        which is why the image reaches the plot at NATIVE resolution (no upstream point-count cap)."""
+        ny, nx = self.data_shape
+        if self.data_x.shape[0] != ny * nx:
+            return False
+        ix = np.searchsorted(self.x_array, self.data_x[:, 0])
+        iy = np.searchsorted(self.y_array, self.data_x[:, 1])
+        return bool(np.array_equal(iy * nx + ix, np.arange(ny * nx)))
+
     def fill_grid(self) -> np.ndarray:
-        # vectorised point->grid scatter (the per-point Python loop took ~50 ms
-        # per refresh on a camera-frame panel); same semantics as the old loop:
-        # searchsorted indices, out-of-range points dropped, and on duplicate
-        # indices the LAST point wins (C-order fancy assignment).
+        # A complete regular raster (a camera frame / dense 2-D map) IS the row-major image, so
+        # reshape in O(1) -- no per-frame scatter (regularity detected once in init_core).
+        if self._regular_raster:
+            return self.data_y[:, 0].reshape(self.data_shape)
+        # General scatter -- a sparse / unordered scan grid; same semantics as the old loop:
+        # searchsorted indices, out-of-range points dropped, LAST point wins on a duplicate.
         grid = np.full(self.data_shape, np.nan)
         ix = np.searchsorted(self.x_array, self.data_x[:, 0])
         iy = np.searchsorted(self.y_array, self.data_x[:, 1])
@@ -1112,6 +1127,7 @@ class Live2DDis(BaseLivePlot):
         self.x_array = np.unique(self.data_x[:, 0])
         self.y_array = np.unique(self.data_x[:, 1])
         self.data_shape = (len(self.y_array), len(self.x_array))
+        self._regular_raster = self._is_regular_raster()   # cache once: data_x is fixed for the plot's life
         self.grid = self.fill_grid()
         try:
             cmap = matplotlib.colormaps[self.cmap].copy()
@@ -1584,7 +1600,7 @@ def pulse_plot_channels(
 #
 # The geometry below is NOT a public knob: hosts pick a kind and a size preset,
 # nothing else -- the visual language is owned here.
-PANEL_SIZES = ("1x2", "2x2", "4x2", "1x4", "2x4", "4x4")
+PANEL_SIZES = ("1x2", "2x2", "4x2", "1x4", "2x4", "4x4", "4x8", "8x4", "8x8")
 PANEL_UNIT_PX = (180, 240)     # (height, width) of one half-unit of the stock region
 PANEL_MARGINS_PX = (STOCK_MARGINS_PX[0], 86, 80, TITLE_SLOT_PX)   # stock margins (L, R, B, T).
                                          # L = STOCK_MARGINS_PX[0] (confocal's left, 110) and
