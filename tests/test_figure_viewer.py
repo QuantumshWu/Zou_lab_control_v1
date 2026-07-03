@@ -215,6 +215,53 @@ def test_every_panel_kind_saves_its_declared_display_knobs_in_the_view():
         exp.close()
 
 
+def test_edit_x_range_pin_is_global_live_and_persisted():
+    """#3: the Edit tab's x-range pin has NO separate y input (the VALUE axis is relim-owned), Apply
+    reaches the LIVE panel and EVERY grid cell (not just the frozen snapshot), it is persisted in
+    ``config.params['view_xlim']`` so a rebuild keeps it, and it round-trips through the saved
+    ``info['view']`` -- one x-range mechanism that is live, global-per-grid, and reopens as saved."""
+    import numpy as np
+
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import (
+        PanelConfig, TaskConsole, default_console_state)
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    ensure_qt_app()
+    exp = na.connect("virtual")
+    con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
+                      measurements=exp.readout.measurement_specs(),
+                      processors=exp.readout.processor_specs(),
+                      tasks=exp.readout.task_specs(), window_px=(900, 600))
+    try:
+        # a GRID panel: Apply must fan the x-range out to every cell.
+        block = np.random.default_rng(0).normal(20, 5, (6, 1, 80))
+        card = con._new_panel_card(PanelConfig(kind="grid", title="G", size="4x4",
+                                               source="value = __probe__",
+                                               params={"sub_plot_kind": "hist", "facet": "repeat",
+                                                       "points_shape": (1,)}))
+        con._attach_card(card)
+        card._render(block, {})
+        con._tick()
+        con._edit_card(card)
+        ed = con._panel_editors[id(card)]
+        assert ed.ymin is None and ed.ymax is None, "the Edit Limits section has NO y input (#3)"
+
+        ed.xmin.setText("10"); ed.xmax.setText("30"); ed.apply_limits()
+        # LIVE + GLOBAL: every cell's x-axis is pinned (not just the snapshot).
+        assert all(tuple(ax.get_xlim()) == (10.0, 30.0) for ax in card.plotter.site_axes)
+        # persisted -> survives a rebuild (re-applied in _apply_display_params).
+        assert card.config.params.get("view_xlim") == (10.0, 30.0)
+        card._apply_display_params()
+        assert all(tuple(ax.get_xlim()) == (10.0, 30.0) for ax in card.plotter.site_axes)
+        # round-trips through the saved view (so a reopened figure keeps the x-window).
+        assert ed._save_view_state().get("view_xlim") == [10.0, 30.0]
+    finally:
+        con.shutdown()
+        exp.close()
+
+
 def test_window_opens_at_screen_fit_not_content_width(tmp_path):
     """The viewer opens at the shared screen-fraction size (the task console / pulse editor both return
     ``screen_fit_window_size`` verbatim from ``sizeHint``), NEVER collapsed to the bare Info-column

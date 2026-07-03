@@ -2820,16 +2820,29 @@ class PanelCard(FluentGroupBox):
         """Apply the persisted Setting toggles (relim mode + unit cycle) to
         the current plotter -- called after every rebuild and on each edit.
 
-        Two persisted knobs: ``config.params["relim"]`` (confocal naming:
-        ``tight`` / ``normal``) and ``config.params["unit_index"]`` (the
-        x-axis unit cycle count).  There is no manual xlim/ylim path -- the
-        Setting popup has no manual lim controls (zoom/pan + Edit… to the
-        panel's Edit tab handle interactive ranging), and a colorbar visibility
-        path is absent because the colormap chooser IS the colorset chooser."""
+        Three persisted knobs: ``config.params["relim"]`` (confocal naming:
+        ``tight`` / ``normal``), ``config.params["unit_index"]`` (the x-axis unit
+        cycle count), and ``config.params["view_xlim"]`` (the Edit tab's x-range
+        pin, #3) -- re-applied here so a rebuild / reopen keeps the operator's
+        x-window instead of snapping back to autoscale.  (No manual y path: the
+        VALUE axis is relim-owned; the colormap chooser IS the colorset chooser.)"""
         if self.plotter is None:
             return
         self._apply_lim_to_plotter()                     # relim family via the ONE in-place entry
         self._apply_unit()
+        self._apply_view_xlim()
+
+    def _apply_view_xlim(self) -> None:
+        """Re-apply the persisted x-range pin (#3) to the LIVE plotter -- a grid fans out to EVERY cell
+        (``_GridData.xlim``), a flat panel is its one axes -- so the operator's Apply survives a rebuild /
+        reopen.  Absent (the default) leaves the plot's own autoscale untouched."""
+        pin = self.config.params.get("view_xlim")
+        if not pin or self.plotter is None:
+            return
+        try:
+            self.plotter.to_data_figure().xlim(float(pin[0]), float(pin[1]))
+        except Exception:
+            pass                                          # a stale pin from a re-interpreted kind: ignore
 
     def _unit_df(self):
         """A DataFigure bound to the live card's figure/axes for the x-axis unit cycle
@@ -4703,19 +4716,20 @@ class PanelEditor(QtWidgets.QWidget):
             self.fit_cmd.returnPressed.connect(self.do_fit)
             col.addWidget(FluentSettingRow("args", self.fit_cmd, label_width=proc_lw))
 
-            # manual x/y limits (DataFigure.xlim/ylim).  Together with the Display section
-            # above (colormap / relim / unit) the Edit tab now covers the whole DataFigure
-            # surface -- the same knobs as Setting plus the per-axis detail Setting omits.
+            # x-range pin (#3): ONE domain (x) range, applied to the LIVE panel AND every grid cell (global,
+            # not the snapshot only), a live VIEW of the panel's current x-window that a zoom/pan reflects.
+            # There is NO y-range input: the VALUE axis is already owned by the relim family (tight/normal/
+            # fixed + fixed lo/hi in the Display section), and the perpendicular axis (a hist's count, a 2d/
+            # sites image extent) is intrinsically auto -- a manual y just fought the autoscaler.
             section("Limits")
             self.xmin = FluentLineEdit(""); self.xmax = FluentLineEdit("")
-            self.ymin = FluentLineEdit(""); self.ymax = FluentLineEdit("")
-            for w in (self.xmin, self.xmax, self.ymin, self.ymax):
+            self.ymin = self.ymax = None                     # no y input -- the value axis is relim-owned (#3)
+            for w in (self.xmin, self.xmax):
                 w.setFixedWidth(scaled_px(88, minimum=68))   # wide enough not to clip "-0.4960"
                 w.returnPressed.connect(self.apply_limits)
             apply_btn = FluentButton("Apply lim", color=ACCENT)
             apply_btn.clicked.connect(self.apply_limits)
-            col.addWidget(FluentSettingRow("x range", _inline(self.xmin, self.xmax), label_width=proc_lw))
-            col.addWidget(FluentSettingRow("y range", _inline(self.ymin, self.ymax, trailing=apply_btn), label_width=proc_lw))
+            col.addWidget(FluentSettingRow("x range", _inline(self.xmin, self.xmax, trailing=apply_btn), label_width=proc_lw))
 
             # ---- Command: a one-line REPL on the panel's DataFigure (confocal runs the same
             # `data_figure.<fn>(...)` form).  Type e.g. `data_figure.xlim(0, 10)`,
@@ -5322,27 +5336,49 @@ class PanelEditor(QtWidgets.QWidget):
                 except (TypeError, ValueError):
                     continue
 
+    def _limits_ax(self):
+        """The axes the x-range boxes are a live VIEW of (#3): the LIVE card's plotter when it exists (so a
+        zoom / pan on the panel reflects here), else the Edit-tab snapshot.  For a grid the x-window is
+        shared across cells, so cell-0's axes is representative."""
+        for plotter in (getattr(self.card, "plotter", None) if self.card is not None else None, self._plotter):
+            if plotter is None:
+                continue
+            ax = getattr(plotter, "ax", None)
+            if ax is None:
+                axes = getattr(plotter, "site_axes", None)     # a grid: cells share one x-window
+                ax = axes[0] if axes else None
+            if ax is not None:
+                return ax
+        return None
+
     def fill_limits(self) -> None:
-        if self._plotter is None or self.xmin is None:
+        if self.xmin is None:
             return                          # no Limits section (a non-"plot" role)
-        ax = getattr(self._plotter, "ax", None)
+        ax = self._limits_ax()
         if ax is None:
             return
-        xlo, xhi = ax.get_xlim()
-        ylo, yhi = ax.get_ylim()
-        with _signals_blocked(self.xmin, self.xmax, self.ymin, self.ymax):
+        xlo, xhi = ax.get_xlim()            # x only -- the value (y) axis is relim-owned (#3)
+        with _signals_blocked(self.xmin, self.xmax):
             self.xmin.setText(f"{xlo:.6g}"); self.xmax.setText(f"{xhi:.6g}")
-            self.ymin.setText(f"{ylo:.6g}"); self.ymax.setText(f"{yhi:.6g}")
 
     def apply_limits(self) -> None:
-        if self._plotter is None:
+        if self.xmin is None:
             return
         try:
-            df = self._df_for()
-            df.xlim(float(self.xmin.text()), float(self.xmax.text()))
-            df.ylim(float(self.ymin.text()), float(self.ymax.text()))
-            self._canvas.draw_idle()
-            self.status.setText("limits applied")
+            lo, hi = float(self.xmin.text()), float(self.xmax.text())
+            # GLOBAL + LIVE (#3): pin the x-window on the LIVE card through its OWN to_data_figure() -- a
+            # grid fans out to EVERY cell (_GridData.xlim), a flat panel is its one axes -- so Apply reaches
+            # the running panel, not just the Edit preview.  Persist it in config.params so it survives a
+            # rebuild and the save (view round-trip), then mirror it onto the snapshot so the preview agrees.
+            self.card.config.params["view_xlim"] = (lo, hi)
+            live = getattr(self.card, "plotter", None)
+            if live is not None:
+                live.to_data_figure().xlim(lo, hi)
+            if self._plotter is not None:
+                self._df_for().xlim(lo, hi)
+            if self._canvas is not None:
+                self._canvas.draw_idle()
+            self.status.setText("x range applied (all cells)")
         except Exception as exc:
             self.status.setText(f"bad limits: {str(exc).splitlines()[0][:100]}")
 
@@ -5414,6 +5450,11 @@ class PanelEditor(QtWidgets.QWidget):
             "unit_index": int(params.get("unit_index", 0) or 0),
             "repeat_mode": self.card._repeat_mode_value(),
         }
+        # the x-range pin (#3) is a cross-kind view knob too: persist it so a reopened figure keeps the
+        # operator's x-window (only when actually set -- a never-pinned panel omits it, staying autoscale).
+        pin = params.get("view_xlim")
+        if pin:
+            view["view_xlim"] = [float(pin[0]), float(pin[1])]
         for decl in PANEL_PARAMS.get(self.card._param_kind(), ()):
             view[decl.key] = params.get(decl.key, decl.default)
         return view
