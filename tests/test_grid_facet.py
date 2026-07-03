@@ -65,6 +65,18 @@ def test_facet_cells_slices_every_axis_group_per_the_shape_iron_law():
     np.testing.assert_allclose(latest[0], BLOCK[-1, :30, 0].reshape(5, 6))
 
 
+def test_all_nan_facet_collapse_is_a_silent_gap_not_a_warning():
+    """The up-front EMPTY grid a scanning task publishes (an all-NaN (repeat, points, 1) block before
+    its first point) collapses to all-NaN cells BY INTENT -- a blank grid -- and must NOT spam numpy's
+    benign 'Mean of empty slice' RuntimeWarning once per empty cell.  Pins the gap-safe average."""
+    import warnings
+    empty = np.full((4, 3 * 5 * 6, 1), np.nan)          # every repeat/point NaN -> every cell averages to NaN
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)  # ANY RuntimeWarning here fails the test
+        cells = facet_cells(empty, "points:0", sub_plot_kind="2d", points_shape=PTS)
+    assert len(cells) == 3 and all(c.shape == (5, 6) and np.isnan(c).all() for c in cells)
+
+
 def test_normalize_facet_spellings_and_rejects():
     assert normalize_facet(None) is None and normalize_facet("") is None
     assert normalize_facet("repeat") == ("repeat", 0)
