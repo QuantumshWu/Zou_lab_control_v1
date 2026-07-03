@@ -82,3 +82,14 @@ def test_real_camera_inherits_the_same_buffer():
         assert getattr(QCMOSCamera, name) is getattr(CameraDevice, name), (
             f"QCMOSCamera overrides {name}; the recent-frames buffer must stay single-source on the base"
         )
+
+
+def test_lazy_state_and_lock_are_created_once_atomically():
+    """F4: the lazily-created buffer state and acquisition lock are created ATOMICALLY (``setdefault``),
+    so every touch returns the SAME object -- a check-then-set could build two divergent buffers /
+    two locks and defeat the arm/disarm mutual exclusion.  A structural stand-in for the (hard to
+    provoke) first-touch race: repeated accesses are object-identical."""
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualTrapArray
+    cam = VirtualCamera(VirtualTrapArray(grid_shape=(2, 2), image_shape=(16, 16), seed=1), exposure=1e-3)
+    assert cam._recent_state() is cam._recent_state()          # one buffer, never two
+    assert cam._acquire_lock() is cam._acquire_lock()          # one lock, never two

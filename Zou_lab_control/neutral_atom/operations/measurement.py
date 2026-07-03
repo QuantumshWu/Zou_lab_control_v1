@@ -39,7 +39,7 @@ from ..views.plots import plot_detection_scan
 
 
 def triggered_frames(camera, sequencer, sequence, frames: int = 1, *, stop=None) -> list:
-    """THE arm-before-fire shot: arm the camera, fire the sequence, read the frames back.
+    """THE arm-before-fire shot: arm the camera, fire N trigger edges, read the frames back.
 
     This is the SINGLE place the measurement layer pairs a camera with a sequencer --
     every readout / calibration / scan / capture path calls it (never a hand-rolled
@@ -50,6 +50,17 @@ def triggered_frames(camera, sequencer, sequence, frames: int = 1, *, stop=None)
     the frames are then consumed from the camera's own lossless buffer and the camera is
     stood down.
 
+    N FRAMES = N TRIGGER EDGES.  A camera reads out exactly one frame per capture-trigger edge,
+    so to read ``frames`` frames the sequencer must EMIT ``frames`` edges on the camera's own
+    trigger line.  A sequence's ONE base cycle already carries ``base_triggers`` edges (1 for a
+    plain imaging pulse; 2/3 for a release-recapture / long-short-long bracket -- one loading read
+    several times); this REPEATS that base cycle just enough that the fired program's total edge
+    count reaches ``frames`` (a single-trigger imaging pulse -> ``sequence.repeated(frames)``, N
+    independent shots; a bracket that already carries ``frames`` edges fires once, unchanged).  On
+    real hardware the FPGA emits those N edges the same way; the virtual streamer's wired camera
+    counts them and renders N frames.  Firing a single-trigger pulse ONCE and hoping for N frames
+    is the bug this closes -- a real camera would time out waiting for edge 2.
+
     ``sequencer=None`` degrades to the camera's free-run ``acquire`` (nothing to fire: a
     self-triggering sensor such as a Basler in ``Software`` mode still yields frames; an
     externally triggered camera then honestly reads nothing).  ``stop`` cancels a blocking
@@ -58,13 +69,38 @@ def triggered_frames(camera, sequencer, sequence, frames: int = 1, *, stop=None)
     frames = positive_int(frames, "frames")
     if sequencer is None:
         return camera.acquire(frames, stop=stop)
+    program = _program_for_frames(camera, sequence, frames)
     camera.arm(frames)
     try:
-        sequencer.prepare(sequence)
-        sequencer.fire(sequence)
+        sequencer.prepare(program)
+        sequencer.fire(program)
         return camera.read_frames(frames, stop=stop)
     finally:
         camera.disarm()
+
+
+def _program_for_frames(camera, sequence, frames: int):
+    """Repeat ``sequence``'s base cycle just enough to emit ``frames`` camera-trigger edges.
+
+    ``base_triggers`` = how many capture edges the ONE base cycle carries on the camera's own
+    trigger line (via ``count_trigger_pulses`` and the camera's ``capture_trigger_channels``).
+    ``repeats = ceil(frames / base_triggers)`` reaches ``frames`` edges: a single-trigger imaging
+    pulse (base_triggers=1) becomes ``repeated(frames)`` (N independent shots); a bracket already
+    carrying >= ``frames`` edges (base_triggers >= frames) fires once, untouched.  A sequence that
+    carries NO camera trigger, or one that is already a repeat program / lacks ``repeated`` (a raw
+    device payload), is fired as-is -- the edge-faithful count then flows from what actually fires."""
+    from ..devices.camera_trigger import count_trigger_pulses
+
+    if frames <= 1 or not hasattr(sequence, "repeated"):
+        return sequence
+    if getattr(sequence, "repeat_forever", False) or int(getattr(sequence, "repeat_count", 1)) > 1:
+        return sequence                      # already a multi-cycle / continuous program
+    trig = getattr(camera, "capture_trigger_channels", None)
+    base_triggers = count_trigger_pulses(sequence, **({"trigger_channels": trig} if trig else {}))
+    if base_triggers <= 0 or base_triggers >= frames:
+        return sequence                      # no camera trigger, or the base already carries enough edges
+    repeats = -(-frames // base_triggers)    # ceil: reach at least `frames` edges
+    return sequence.repeated(repeats) if repeats > 1 else sequence
 
 
 # --------------------------------------------------------------- declarative spec

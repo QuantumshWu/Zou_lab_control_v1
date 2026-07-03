@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+import threading
 import time
 from typing import Any, Sequence
 
@@ -12,6 +13,62 @@ import numpy as np
 from ..core.analysis import nonnegative_int, positive_float, positive_int
 from .base import AcquisitionCancelled, CameraDevice, snap_subarray
 from .camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS
+
+
+# --------------------------------------------------------------------------- DCAM API ownership
+# The Hamamatsu ``Dcamapi`` runtime is a PROCESS-WIDE singleton: ``init()`` flips one class bool
+# and ``uninit()`` clears it with NO reference count of its own.  So two qCMOS cameras -- or a
+# camera plus a ``discover()`` enumeration running while that camera is open -- must NOT each call
+# ``uninit()`` blindly: the first ``uninit`` would tear the driver out from under the still-open
+# camera, whose next wait / prop / buf call then crashes.  This module owns the single reference
+# count the driver lacks: every ``open`` / ``discover`` that needs the runtime ACQUIRES it, every
+# ``close`` / end-of-enumeration RELEASES it, and only the LAST release actually calls ``uninit``.
+_DCAM_API_LOCK = threading.Lock()
+_DCAM_API_REFCOUNT: dict[int, list] = {}   # id(api) -> [refcount, api]
+
+
+def _dcam_acquire(api) -> None:
+    """Take a reference on the process-wide DCAM runtime, initialising it on the FIRST holder.
+
+    A driver that reports ``ALREADYINITIALIZED`` is already live (another holder, or a prior
+    session that outlived its owner): that is SUCCESS for us -- we still record the reference so
+    the matching :func:`_dcam_release` participates in the shared count -- never a failure.  Any
+    other init error is a real fault and raised."""
+    with _DCAM_API_LOCK:
+        entry = _DCAM_API_REFCOUNT.get(id(api))
+        if entry is not None:
+            entry[0] += 1                       # already ours: another holder joins, no re-init
+            return
+        if api.init() is False:
+            # Import the error enum lazily -- only when we must classify an init failure -- so the
+            # SUCCESS path never touches the DCAM DLL-backed module (a machine without the runtime
+            # still constructs/tests the counter with a fake api).
+            from .drivers.dcam.dcamapi4 import DCAMERR
+            if int(api.lasterr()) != int(DCAMERR.ALREADYINITIALIZED):
+                raise RuntimeError(f"DCAM init failed: {api.lasterr()}")
+            # Runtime already up (initialised outside this counter): adopt it -- take the first
+            # reference WITHOUT calling uninit on release-to-zero, since we did not init it.
+            _DCAM_API_REFCOUNT[id(api)] = [1, api]
+            return
+        _DCAM_API_REFCOUNT[id(api)] = [1, api]
+
+
+def _dcam_release(api) -> None:
+    """Drop a reference taken by :func:`_dcam_acquire`; only the LAST holder calls ``uninit``.
+
+    Releasing an untracked api (double release / never acquired) is a defensive no-op -- it must
+    never reach through to ``uninit`` and tear the runtime out from under another live camera."""
+    with _DCAM_API_LOCK:
+        entry = _DCAM_API_REFCOUNT.get(id(api))
+        if entry is None:
+            return
+        entry[0] -= 1
+        if entry[0] <= 0:
+            _DCAM_API_REFCOUNT.pop(id(api), None)
+            try:
+                api.uninit()
+            except Exception:
+                pass
 
 
 @dataclass
@@ -95,10 +152,15 @@ class QCMOSCamera(CameraDevice):
         except Exception as exc:
             return [discovery_note("qcmos", f"DCAM driver not importable: {exc}")]
         api = mod.Dcamapi
+        # Take a reference on the shared runtime rather than a raw init/uninit: if a camera is
+        # ALREADY OPEN, the runtime is up and this reference just joins the count -- enumeration
+        # reads the bus without ever tearing the API out from under that live camera.  An
+        # ALREADYINITIALIZED report is therefore normal (enumerate anyway), never a failure note.
         try:
-            if api.init() is False:
-                return [discovery_note(
-                    "qcmos", "DCAM runtime init failed -- DCAM-API not installed / no camera")]
+            _dcam_acquire(api)
+        except Exception as exc:
+            return [discovery_note("qcmos", f"DCAM runtime init failed -- {exc}")]
+        try:
             count = int(api.get_devicecount() or 0)
 
             def model_of(index: int) -> str:
@@ -114,10 +176,7 @@ class QCMOSCamera(CameraDevice):
         except Exception as exc:                # runtime present but transport layer unhappy
             return [discovery_note("qcmos", f"enumerate failed: {exc}")]
         finally:
-            try:
-                api.uninit()
-            except Exception:
-                pass                            # enumeration must never leave the API held open
+            _dcam_release(api)                   # drop only OUR reference; a live camera keeps the API up
 
     @classmethod
     def discovery_rows(cls, count: int, model_of):
@@ -180,11 +239,17 @@ class QCMOSCamera(CameraDevice):
             return self
         mod = importlib.import_module(self.dcam_module_name)
         api = mod.Dcamapi
-        api.init()
-        dcam = mod.Dcam(self.config.device_index)
-        if dcam.dev_open() is False:
-            api.uninit()
-            raise RuntimeError(f"failed to open qCMOS device {self.config.device_index}: {dcam.lasterr()}")
+        # Reference-counted acquire: initialises the runtime on the FIRST camera, joins the count
+        # on the next -- so opening a second qCMOS never re-inits, and closing one never uninits
+        # the other (the ownership seam the raw init/uninit lacked).
+        _dcam_acquire(api)
+        try:
+            dcam = mod.Dcam(self.config.device_index)
+            if dcam.dev_open() is False:
+                raise RuntimeError(f"failed to open qCMOS device {self.config.device_index}: {dcam.lasterr()}")
+        except BaseException:
+            _dcam_release(api)                   # give back the reference we took; last holder uninits
+            raise
         self._module = mod
         self._api = api
         self._dcam = dcam
@@ -222,13 +287,19 @@ class QCMOSCamera(CameraDevice):
         """Wait for and transfer up to ``n`` externally triggered frames from the DCAM buffer
         into the base-class frame queue.  The qCMOS fault model is LOUD: a trigger that never
         comes raises ``TimeoutError`` after ``timeout`` (seconds; the config ``timeout_ms``
-        default), and a Stop raises :class:`AcquisitionCancelled` within one poll slice."""
+        default), and a Stop raises :class:`AcquisitionCancelled` within one poll slice.
+
+        ``timeout`` is the budget PER AWAITED TRIGGER, not for the whole ``n``-frame read: it
+        resets each time a frame arrives.  So an FPGA firing ``n`` triggers spaced under the
+        timeout succeeds the same whether or not a Stop event is passed -- the stop event only
+        shortens the POLL SLICE (so a Stop is honoured within ~one slice), never the trigger
+        budget itself."""
         dcam = self._dcam
         n = positive_int(n, "n")
         timeout_ms = self.config.timeout_ms if timeout is None else max(1, int(float(timeout) * 1000))
-        # When a live logic node passes a stop event, wait in short slices and check it
-        # between slices so Stop interrupts a wedged trigger within ~one slice instead of
-        # blocking the full timeout.  Without a stop event, one wait of the full timeout.
+        # When a live logic node passes a stop event, wait in short slices and check it between
+        # slices so Stop interrupts a wedged trigger within ~one slice instead of blocking the
+        # full per-trigger timeout.  Without a stop event, one wait of the full timeout.
         poll_ms = min(timeout_ms, 200) if stop is not None else timeout_ms
         got = 0
         deadline = time.monotonic() + timeout_ms / 1000.0
@@ -246,6 +317,16 @@ class QCMOSCamera(CameraDevice):
                 raise TimeoutError(f"qCMOS timed out after {timeout_ms} ms waiting for frame {self._next_frame}.")
             info = dcam.cap_transferinfo()
             available = int(getattr(info, "nFrameCount", self._next_frame + 1)) if info is not False else self._next_frame + 1
+            # Ring-overrun guard: the DCAM buffer holds ``_buf_alloc`` frames; if the camera has
+            # produced more than that beyond our read cursor, the hardware has already overwritten
+            # the slot we are about to read (``next % buf_alloc`` now points at a NEWER frame).
+            # Fail LOUD with the dropped-frame count rather than silently deliver mis-ordered frames.
+            if available - self._next_frame > int(self._buf_alloc):
+                dropped = available - self._next_frame - int(self._buf_alloc)
+                raise RuntimeError(
+                    f"qCMOS ring overrun: {dropped} frame(s) overwritten -- the camera produced "
+                    f"{available} frames but the {self._buf_alloc}-deep buffer was read only up to "
+                    f"frame {self._next_frame}. Read frames faster or allocate a deeper ring.")
             while self._next_frame < available and got < n:
                 # A continuous session cycles the allocated ring; a finite one indexes 0..N-1.
                 data = dcam.buf_getframedata(self._next_frame % max(1, int(self._buf_alloc)))
@@ -254,6 +335,7 @@ class QCMOSCamera(CameraDevice):
                 self._deliver([np.asarray(data[1]).copy()])
                 self._next_frame += 1
                 got += 1
+                deadline = time.monotonic() + timeout_ms / 1000.0   # per-trigger budget resets on delivery
         return True
 
     def _disarm(self) -> None:
@@ -375,8 +457,10 @@ class QCMOSCamera(CameraDevice):
             finally:
                 self._dcam = None
         if self._api is not None:
+            # Drop THIS camera's reference; the runtime is uninited only once the LAST holder
+            # closes -- so closing one of two qCMOS cameras leaves the other's DCAM handle live.
             try:
-                self._api.uninit()
+                _dcam_release(self._api)
             finally:
                 self._api = None
 

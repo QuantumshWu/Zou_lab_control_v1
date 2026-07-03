@@ -300,10 +300,12 @@ def test_detection_time_scan_sends_probe_duration_per_point():
 
     prepares = [row for row in exp.devices.sequencer.history if row["action"] == "prepare"]
     scan_prepares = [row for row in prepares if row["sequence"] == "detect_time_scan"]
-    # Each point fires the single-trigger imaging pulse at that exposure; the camera reads the
-    # shots off it (no 1->N expansion), so the fired duration is the one imaging sequence's duration.
+    # Each point images at that exposure across ``shots`` independent readout frames.  N frames = N
+    # capture-trigger edges, so the fired program is the single-trigger imaging pulse REPEATED to
+    # ``shots`` edges -- its duration is ``shots`` x the one imaging sequence's duration (a real FPGA
+    # emits ``shots`` edges the same way; the camera reads one frame per edge).
     expected = [
-        na.imaging_sequence(exposure=float(t), load=True, name="detect_time_scan").duration
+        na.imaging_sequence(exposure=float(t), load=True, name="detect_time_scan").repeated(4).duration
         for t in times
     ]
     assert [row["duration"] for row in scan_prepares] == expected
@@ -3167,14 +3169,20 @@ def test_bind_pulse_controller_can_override_sequence_repeat_forever():
     assert sequencer.snapshot()["state"] == "done"
 
 
-def _bench_trigger_cable(camera, sequencer):
+def _bench_trigger_cable(camera, sequencer, *, trigger_channel="ch03"):
     """Test-bench TRIGGER CABLE: plug the virtual camera's trigger input into THIS streamer.
 
     On a real rig the cable is copper -- a RuntimeSequencer/RemoteSequencer emits real edges the
     camera's hardware input sees.  On the bench the virtual camera needs the software mirror of
     that wire, so re-point its ``sequencer`` and forward every ``fire`` to the camera's wire
-    listener (exactly what a VirtualSequencer's fire-listener seam does natively)."""
+    listener (exactly what a VirtualSequencer's fire-listener seam does natively).
+
+    The bench also declares WHICH board channel the camera's trigger input is wired to
+    (``trigger_channel``): the 40-channel bench pulses pulse ``ch03`` as their camera-trigger line,
+    so the camera counts edges on THAT line (edge-faithful frame count) -- exactly as a real camera
+    is configured with its actual chNN, not the friendly ``emCCD`` default."""
     camera.sequencer = sequencer
+    camera.capture_trigger_channels = (str(trigger_channel),)
     inner_fire = sequencer.fire
 
     def fire(sequence=None):
@@ -3225,15 +3233,15 @@ def test_detection_time_scan_uses_bound_40ch_pulse_controller():
     )
 
     assert scan.summary()["finished"] is True
-    # The bound exposure slot is driven per scan point via frame_sequence(time_ns=...): the program
-    # runs the WHOLE period the table defines (the edges PLUS the trailing 100 ns all-low gap), so
-    # reference 8 us -> 820, then 2 us -> 220 and 4 us -> 420 loop end ticks.
-    assert [program.loop_end_tick for program in sequencer.prepared_programs] == [820, 220, 420]
-    # The streamer is a PURE pulse streamer: each scan point FIRES the bound pulse ONCE (repeat_count
-    # = 1) and the camera grabs ``shots`` frames from that single firing -- ``frame_sequence`` never
-    # rewrites the pulse's own trigger count into N copies (see
-    # test_bound_pulse_frame_sequence_keeps_pulse_own_trigger_count_regardless_of_frames).
-    assert [program.source_sequence["repeat_count"] for program in sequencer.prepared_programs] == [1, 1, 1]
+    # N frames = N capture-trigger EDGES: reading ``shots``=2 frames per point fires the bound pulse
+    # REPEATED to 2 edges (``triggered_frames`` reaches the frame count in edges).  ``frame_sequence``
+    # still returns the pulse's OWN single cycle (repeat_count=1, see
+    # test_bound_pulse_frame_sequence_keeps_pulse_own_trigger_count_regardless_of_frames); the repeat
+    # to N edges is the measurement-layer's job, so the FIRED program has repeat_count=2.  A repeated
+    # program loops back at the cycle boundary (the trailing 100 ns all-low tail is the inter-cycle
+    # gap, not re-run), so reference 8 us -> 810, 2 us -> 210, 4 us -> 410 loop end ticks.
+    assert [program.loop_end_tick for program in sequencer.prepared_programs] == [810, 210, 410]
+    assert [program.source_sequence["repeat_count"] for program in sequencer.prepared_programs] == [2, 2, 2]
     assert sequencer.last_program is not None
     assert sequencer.last_program.channels == hardware_channels
     assert sequencer.last_program.repeat_forever is False
@@ -3293,7 +3301,10 @@ def test_timing_subsystem_bind_pulse_loads_json_for_40ch_remote_style_scan(tmp_p
     )
 
     assert scan.summary()["finished"] is True
-    assert [program.loop_end_tick for program in sequencer.prepared_programs[-3:]] == [820, 220, 420]
+    # Each point reads ``shots``=2 frames = 2 capture-trigger edges, so the bound pulse is fired
+    # REPEATED to 2 edges: reference 8 us -> 810, then 2 us -> 210, 4 us -> 410 (repeated-program loop
+    # ends, one tail-gap shorter than the 820/220/420 single cycle -- the tail is the inter-cycle gap).
+    assert [program.loop_end_tick for program in sequencer.prepared_programs[-3:]] == [810, 210, 410]
     assert sequencer.prepared_programs[-1].channels == hardware_channels
     assert sequencer.prepared_programs[-1].repeat_forever is False
 
@@ -4427,6 +4438,49 @@ def test_virtual_equals_real_scan_progress_same_dict():
     assert virtual_done == {"scanning": False, "point": 2, "n_points": 3, "sweep": 1, "n_repeats": 2}
 
 
+def test_virtual_single_pass_streamed_scan_reports_scanning():
+    """F8: a FINITE SINGLE-PASS streamed scan (repeat_forever=False + a scan_table) reports
+    scanning=True -- the progress gate keys off the SCAN TABLE (a streamed scan), NOT the
+    repeat_forever ``firing`` handle (which is only set for a cyclic sweep).  Without this a
+    single-pass scan would idle even while playing, unlike the real backend (virtual == real)."""
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+
+    st = PulseTableState(channels=["probe", "trig"])
+    st.bind_field("duration", "0", unit="us")
+    st.set_scan_table([[10.0], [20.0], [30.0]])
+    st.repeat_forever = False                          # single-pass: N points played once
+    st.scan_repeats = 0
+    seq = VirtualSequencer(channels=["probe", "trig"], sleep_scale=1.0)   # real-time so it does not race to done
+    seq.prepare(st)
+    assert seq.scan_progress()["scanning"] is False    # prepared but not yet fired -> idle
+    assert seq.firing is None                          # a single-pass scan sets NO repeat_forever firing
+    seq.fire()
+    prog = seq.scan_progress()
+    assert prog["scanning"] is True and prog["n_points"] == 3   # ... yet it IS scanning once fired
+    seq.stop()
+
+
+def test_virtual_stop_unconditionally_drives_safe_state():
+    """F8: ``stop`` ALWAYS parks the streamer safe (like real hardware: Stop parks the outputs
+    whatever was running), not only when a repeat_forever ``firing`` was set -- so a finite scan
+    (which leaves ``firing`` None) is still safed on Stop, and the scan state is fully cleared."""
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+
+    st = PulseTableState(channels=["probe", "trig"])
+    st.bind_field("duration", "0", unit="us")
+    st.set_scan_table([[10.0], [20.0], [30.0]])
+    st.repeat_forever = False
+    st.scan_repeats = 0
+    seq = VirtualSequencer(channels=["probe", "trig"], sleep_scale=1.0)
+    seq.prepare(st); seq.fire()
+    seq.stop()
+    assert seq.firing is None
+    assert seq.scan_progress()["scanning"] is False    # scan state cleared -> idle
+    assert seq.service.history[-1]["action"] == "safe"  # the streamer was parked safe
+
+
 def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
     try:
         import rpyc  # noqa: F401
@@ -4600,7 +4654,11 @@ def test_remote_detection_time_scan_uses_bound_pulse_controller_over_json_protoc
     assert remote.channels == hardware_channels
     assert remote.clock_hz == 100_000_000
     assert [program.channels for program in prepared_programs] == [hardware_channels] * 3
-    assert [program.loop_end_tick for program in prepared_programs] == [820, 220, 420]
+    # ``shots``=2 frames = 2 capture-trigger edges, so each fired program is the bound pulse REPEATED
+    # to 2 edges: reference 8 us -> 810, 2 us -> 210, 4 us -> 410 (repeated-program loop ends, one
+    # tail-gap shorter than the single-cycle 820/220/420) -- the same edge-faithful count on the
+    # remote streamer (virtual == real: the remote FPGA emits the repeated edges too).
+    assert [program.loop_end_tick for program in prepared_programs] == [810, 210, 410]
     assert all(not program.repeat_forever for program in prepared_programs)
     assert [program.sequence_id for program in fired_programs] == [program.sequence_id for program in prepared_programs]
     assert all(mask < (1 << 4) for program in prepared_programs for mask in program.masks)
@@ -7385,6 +7443,12 @@ def test_user_composed_loading_readout_publishes_standard_signals():
                                     roi_radius=1, threshold_frames=24,
                                     prefix=f"{prefix}cal_")
         task.run_to_completion()
+        # The calibrate task uploads + fires its own FINITE bracket programs, which (like real
+        # hardware: a prepare replaces whatever the streamer was playing) stop the continuous On
+        # Pulse.  Re-fire it so the LIVE CameraMeasurement below has an active imaging pulse to
+        # stream from -- exactly the step a real operator takes to resume the live view after a
+        # calibration run (virtual == real).
+        fire_imaging_pulse(seqr, exposure=0.02, cooling=trap.mot_load_s)
         cam = CameraMeasurement(hub, camera, sequencer=seqr, prefix=prefix)
         # occupancy preserves the repeat axis (#H3q); loading probability = repeat_mode=average
         det = OccupancyProcessor(hub, calibration=task.calibration, source_expr={"inputs": [f"{prefix}frame_0"], "source": "value = signal"},

@@ -177,9 +177,20 @@ class CameraDevice(BaseDevice):
         (seconds, backend default when None) bounds the wait for a trigger that never comes;
         ``stop`` (a ``threading.Event``) cancels a blocking wait cooperatively.  Returns what
         arrived (possibly fewer than ``n``); backends whose fault model is loud (the qCMOS)
-        raise ``TimeoutError`` / :class:`AcquisitionCancelled` from their hook instead."""
+        raise ``TimeoutError`` / :class:`AcquisitionCancelled` from their hook instead.
+
+        Requires the camera to be ARMED first: the three primitives are ordered arm -> read ->
+        disarm, and only :meth:`arm` fills the lossless ``pending`` queue the data source pushes
+        into.  Reading unarmed would consume from an empty queue while a push-fed source's
+        ``_grab`` (e.g. the virtual trigger wire during a continuous firing) reports "more will
+        arrive" -- an unbounded live-lock.  So an unarmed read is a programming error, raised
+        loudly; use :meth:`acquire` for a one-shot (it arms internally)."""
         n = positive_int(n, "n")
         state = self._recent_state()
+        if not state["armed"]:
+            raise RuntimeError(
+                "read_frames() requires arm() first (the primitives are arm -> read -> disarm); "
+                "use acquire() for a one-shot that arms internally.")
         out: list[np.ndarray] = []
         while len(out) < n:
             with state["cond"]:
@@ -250,32 +261,34 @@ class CameraDevice(BaseDevice):
     # ----------------------------------------------------------- frame buffers
     def _recent_state(self) -> dict:
         """Lazily create the frame-buffer state (subclasses define their own
-        ``__init__`` and need not call ``super().__init__()``)."""
-        state = self.__dict__.get("_zlc_recent")
-        if state is None:
-            lock = threading.Lock()
-            state = {
-                "frames": deque(maxlen=max(1, int(self.recent_capacity))),
-                "lock": lock,
-                "cond": threading.Condition(lock),
-                "seq": 0,        # total frames ever retained
-                "cursor": 0,     # drain watermark
-                "pending": [],   # LOSSLESS armed-session queue read_frames consumes
-                "armed": False,
-                "armed_frames": None,
-            }
-            self.__dict__["_zlc_recent"] = state
-        return state
+        ``__init__`` and need not call ``super().__init__()``).
+
+        ``dict.setdefault`` is the ATOMIC create-or-get: two threads first touching an
+        unbuilt camera (a measurement arming while a live monitor drains) both build a
+        candidate, but the GIL makes ``setdefault`` a single winner -- both then read back
+        the SAME state, never two divergent buffers with acquisitions serialised against
+        different locks.  The loser's freshly-built dict is discarded (harmless -- it holds
+        no frames yet)."""
+        lock = threading.Lock()
+        fresh = {
+            "frames": deque(maxlen=max(1, int(self.recent_capacity))),
+            "lock": lock,
+            "cond": threading.Condition(lock),
+            "seq": 0,        # total frames ever retained
+            "cursor": 0,     # drain watermark
+            "pending": [],   # LOSSLESS armed-session queue read_frames consumes
+            "armed": False,
+            "armed_frames": None,
+        }
+        return self.__dict__.setdefault("_zlc_recent", fresh)
 
     def _acquire_lock(self) -> "threading.RLock":
         """The per-camera acquisition lock :meth:`arm`/:meth:`disarm` hold across an armed
         session, so two consumers (a measurement + a live monitor) never interleave their
-        armed state on one sensor (lazily created, like ``_recent_state``)."""
-        lock = self.__dict__.get("_zlc_acquire_lock")
-        if lock is None:
-            lock = threading.RLock()
-            self.__dict__["_zlc_acquire_lock"] = lock
-        return lock
+        armed state on one sensor.  Atomically create-or-get via ``setdefault`` (like
+        :meth:`_recent_state`) so concurrent first touches share ONE lock -- a check-then-set
+        would let two threads build two locks and defeat the mutual exclusion."""
+        return self.__dict__.setdefault("_zlc_acquire_lock", threading.RLock())
 
     def _deliver(self, images) -> list[np.ndarray]:
         """Queue freshly captured frames: into the lossless armed ``pending`` queue (when

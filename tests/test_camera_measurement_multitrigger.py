@@ -16,6 +16,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
@@ -230,6 +231,22 @@ def _camera_classes():
     return (CameraDevice, QCMOSCamera, PylonCamera, VirtualCamera, VirtualMotCamera)
 
 
+def test_device_type_hints_resolve_no_missing_import():
+    """F5: every device class's method annotations RESOLVE (``get_type_hints`` succeeds) -- a name
+    used in an annotation (e.g. ``Mapping`` on ``VirtualMotCamera.__init__``) must be imported, not
+    left to survive only as a frozen string under ``from __future__ import annotations``.  A missing
+    import is silent until something evaluates the hints (get_type_hints / eval_str); this pins it."""
+    import inspect
+    import typing
+    from Zou_lab_control.neutral_atom.devices import virtual as _virtual
+    for _name, obj in inspect.getmembers(_virtual, inspect.isclass):
+        if obj.__module__ != _virtual.__name__:
+            continue
+        for attr in vars(obj).values():
+            if inspect.isfunction(attr):
+                typing.get_type_hints(attr)          # raises NameError on an unimported annotation name
+
+
 def test_camera_is_a_pure_grabber_no_session_or_fire_coupling():
     """A camera NEVER binds a session, NEVER hosts orchestration, NEVER takes a fire hook:
     ``bind_experiment`` / ``capture`` / ``on_armed`` must not exist on the contract or any
@@ -252,22 +269,25 @@ def test_acquire_signature_carries_no_sequence_or_fire_hook():
 
 
 def test_arm_fire_read_yields_the_armed_frame_count_end_to_end():
-    """The three primitives end-to-end on the virtual rig: arm(N) -> fire the wired streamer ->
-    read_frames(N) returns exactly N frames -- the same ordering ``triggered_frames`` (the ONE
-    measurement-layer helper) performs."""
+    """The three primitives end-to-end on the virtual rig: arm(N) -> fire a program that emits N
+    capture-trigger edges -> read_frames(N) returns exactly N frames -- the same ordering
+    ``triggered_frames`` (the ONE measurement-layer helper) performs.  N FRAMES = N EDGES: a
+    single-trigger imaging pulse must be REPEATED to N edges (``.repeated(N)``); a real camera reads
+    one frame per edge and would otherwise time out waiting for edge 2."""
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     try:
         cam, seqr = exp.devices.camera, exp.devices.sequencer
         seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")
+        program = seq.repeated(2)                    # emit TWO camera-trigger edges (two shots)
         cam.arm(2)
         try:
-            seqr.prepare(seq)
-            seqr.fire(seq)
+            seqr.prepare(program)
+            seqr.fire(program)
             frames = cam.read_frames(2)
         finally:
             cam.disarm()
         assert len(frames) == 2 and all(np.asarray(f).shape == (40, 50) for f in frames)
-        # the single helper is the same story in one call
+        # the single helper is the same story in one call: it repeats the single-trigger pulse to N edges
         assert len(na.triggered_frames(cam, seqr, seq, 3)) == 3
     finally:
         exp.close()
@@ -276,21 +296,76 @@ def test_arm_fire_read_yields_the_armed_frame_count_end_to_end():
 def test_armed_buffer_is_lossless_for_late_consumption():
     """Frame-loss protection: frames fired while armed are queued LOSSLESSLY until read --
     a fire that completes BEFORE ``read_frames`` starts drops nothing, even when the burst
-    exceeds the (lossy, live-view) recent ring's capacity."""
+    exceeds the (lossy, live-view) recent ring's capacity.  The burst is the 5 edges of a
+    ``repeated(5)`` program (N frames = N edges)."""
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     try:
         cam, seqr = exp.devices.camera, exp.devices.sequencer
         cam.recent_capacity = 2                     # tiny live-view ring (set before first frame)
         seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")
+        program = seq.repeated(5)                   # FIVE camera-trigger edges in one fired program
         cam.arm(5)
         try:
-            seqr.prepare(seq)
-            seqr.fire(seq)                          # all 5 frames land in the buffer NOW
+            seqr.prepare(program)
+            seqr.fire(program)                      # all 5 frames land in the buffer NOW
             frames = cam.read_frames(5)             # ... and are consumed late, losslessly
         finally:
             cam.disarm()
         assert len(frames) == 5                     # nothing dropped
         assert len(cam.recent_frames()) == 2        # the live-view ring stays a bounded view
+    finally:
+        exp.close()
+
+
+def test_single_trigger_fired_once_delivers_exactly_one_frame_edge_faithful():
+    """F1(a) EDGE FIDELITY: a SINGLE-trigger imaging pulse fired ONCE delivers exactly ONE frame,
+    even when the camera is armed for many more -- the frame count is the number of capture-trigger
+    EDGES the fired program carries, NOT the count the consumer armed for.  (The old virtual camera
+    fabricated ``armed_frames`` frames from one edge -- a fiction a real sensor, which reads one
+    frame per edge and would time out waiting for edge 2, could never produce.)"""
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
+    try:
+        cam, seqr = exp.devices.camera, exp.devices.sequencer
+        seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")   # ONE emCCD edge
+        cam.arm(20)                                  # arm generously ...
+        try:
+            seqr.prepare(seq)
+            seqr.fire(seq)                           # ... but fire only ONE edge
+            frames = cam.read_frames(20, timeout=0.1)
+        finally:
+            cam.disarm()
+        assert len(frames) == 1                      # one edge -> one frame (not 20 fabricated)
+    finally:
+        exp.close()
+
+
+def test_triggered_frames_repeats_single_trigger_to_n_edges():
+    """F1(b): ``triggered_frames(cam, seqr, imaging_sequence(), N)`` really yields N frames, because
+    the helper fires ``imaging_sequence().repeated(N)`` -- N independent camera-trigger edges -- and
+    ``count_trigger_pulses`` on that repeated program is N.  Pins the N-frames = N-edges contract at
+    both the helper and the trigger-count level."""
+    from Zou_lab_control.neutral_atom.devices.camera_trigger import count_trigger_pulses
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
+    try:
+        cam, seqr = exp.devices.camera, exp.devices.sequencer
+        seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")
+        assert count_trigger_pulses(seq.repeated(20)) == 20          # the repeated program carries 20 edges
+        frames = na.triggered_frames(cam, seqr, seq, 20)
+        assert len(frames) == 20 and all(np.asarray(f).shape == (40, 50) for f in frames)
+    finally:
+        exp.close()
+
+
+def test_read_frames_requires_arm():
+    """F3: ``read_frames`` without a preceding ``arm()`` is a programming error (the primitives are
+    ordered arm -> read -> disarm), raised loudly -- NOT a silent live-lock against an empty queue
+    while a push-fed ``_grab`` reports 'more will arrive'.  ``acquire`` (which arms internally) is
+    the one-shot that does not need a manual arm."""
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
+    try:
+        cam = exp.devices.camera
+        with pytest.raises(RuntimeError, match="arm"):
+            cam.read_frames(1)
     finally:
         exp.close()
 

@@ -9,6 +9,7 @@ code a real run executes.
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 import types
@@ -641,3 +642,75 @@ def test_finite_scan_repeat_needs_two_points_on_the_compiled_program():
     RuntimeSequenceProgram(**base, scan_points=[[0], [1]], scan_repeats=3)  # 2-point finite K-sweep
     RuntimeSequenceProgram(**base, scan_points=[[0]], scan_repeats=0)       # 1-point seamless (cyclic)
     RuntimeSequenceProgram(**base)                                          # a plain non-scan program
+
+
+# --------------------------------------------------------------------------- B7 (re-audit)
+def test_remote_sequencer_ssl_and_plain_share_one_rpyc_config():
+    """B7: the client connection policy (pickle allowed + a generous finite backstop timeout) is
+    ONE dict handed to BOTH transports.  The SSL branch used to omit ``config`` entirely, so a
+    secured lab's long finite-scan wait_done silently hit rpyc's 30 s default and raised
+    AsyncResultTimeout while the non-SSL lab was fine.  Pin that both branches carry the SAME
+    config."""
+    from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer
+
+    seen = {}
+
+    class _Conn:
+        closed = False
+        root = types.SimpleNamespace(snapshot=lambda: {})
+
+    def fake_connect(host, port, config=None):
+        seen["plain"] = config
+        return _Conn()
+
+    def fake_ssl_connect(host=None, port=None, ca_certs=None, config=None):
+        seen["ssl"] = config
+        return _Conn()
+
+    fake_rpyc = types.SimpleNamespace(
+        connect=fake_connect,
+        utils=types.SimpleNamespace(classic=types.SimpleNamespace(ssl_connect=fake_ssl_connect)),
+    )
+    saved = sys.modules.get("rpyc")
+    sys.modules["rpyc"] = fake_rpyc
+    try:
+        RemoteSequencer(host="10.0.0.5", port=18861, channels=["ch00"], ssl=False).open()
+        RemoteSequencer(host="10.0.0.5", port=18861, channels=["ch00"], ssl=True,
+                        ca_certs="ca.pem").open()
+    finally:
+        if saved is None:
+            sys.modules.pop("rpyc", None)
+        else:
+            sys.modules["rpyc"] = saved
+
+    assert seen["plain"] is not None and seen["ssl"] is not None
+    assert seen["ssl"] == seen["plain"], "SSL and plain transports must carry the same rpyc config"
+    assert seen["plain"]["sync_request_timeout"] == 3600.0            # the generous backstop, not 30 s
+    assert seen["plain"]["allow_pickle"] is True
+
+
+# --------------------------------------------------------------------------- B8 (re-audit)
+def test_delay_capacity_rejects_rewind_and_has_no_dead_start_index_pipeline():
+    """B8: ``repeat_from_index`` is a single rejected-outright statement (delays are physical
+    output delays, never rewound preambles), so the frame-schedule helpers carry NO dead
+    ``start_index`` pipeline -- every frame plays from edge 0.  A normal repeat_forever + delay
+    program's capacity analysis still runs (the removed branch was pure dead weight)."""
+    import inspect
+    from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
+
+    # the start_index knob (which only ever served the rejected rewind) is gone from the pipeline
+    for fn in (fps._frame_events_for_point, fps._frame_duration_for_point, fps._sweep_events):
+        assert "start_index" not in inspect.signature(fn).parameters, \
+            f"{fn.__name__} still carries the dead start_index rewind pipeline"
+
+    # a repeat_forever program WITH a channel delay still analyses (steady sweep == first sweep):
+    prog = types.SimpleNamespace(
+        ticks=[0, 5, 10], masks=[0b1, 0b0, 0b1], channel_delays=[3],
+        repeat_forever=True, repeat_from_index=0, loop_count=1,
+        scan_points=None, scan_coeff_frac_bits=16)
+    fps._check_delay_event_capacity(prog, evt_depth=256, frac_bits=16)    # no raise: fits the FIFO
+
+    # a hand-built payload that sets a nonzero rewind together with a delay is still rejected loud.
+    prog.repeat_from_index = 2
+    with pytest.raises(ValueError, match="repeat_from_index"):
+        fps._check_delay_event_capacity(prog, evt_depth=256, frac_bits=16)

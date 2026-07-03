@@ -22,6 +22,8 @@ import the package, run the virtual backend and the full test suite.
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from .base import CameraDevice, snap_subarray
@@ -107,9 +109,13 @@ class PylonCamera(CameraDevice):
         else:
             self._camera = pylon.InstantCamera(factory.CreateFirstDevice())
         self._camera.Open()
+        # A single "push every configured setting" path -- so no setting made BEFORE open (a
+        # configure(roi=) before the device set opens cameras, or a close->reopen) can be dropped.
+        # ROI is applied LAST: it snaps against the now-live GenICam Width/Offset increments.
         self._camera.PixelFormat.SetValue(self.pixel_format)
         self._apply_exposure()
         self._apply_trigger()
+        self._apply_roi()
 
     def close(self) -> None:
         if self._camera is not None:
@@ -258,21 +264,37 @@ class PylonCamera(CameraDevice):
     def _grab(self, n: int, *, timeout: float | None = None, stop=None) -> bool:
         """Retrieve ONE frame from the running grab session into the base frame queue.
         No trigger within the timeout -> False (the live view freezes; a partial read is
-        the pylon fault model, matching a monitor sensor that just sees no edges)."""
+        the pylon fault model, matching a monitor sensor that just sees no edges).
+
+        When a stop event is passed the wait is SLICED (``min(timeout, 200 ms)`` per
+        ``RetrieveResult``) with the event re-checked between slices, so a Stop pressed mid-wait
+        interrupts within ~one slice instead of sitting inside RetrieveResult for the full timeout
+        (the same cooperative-cancel granularity the qCMOS grab uses).  The TOTAL timeout budget is
+        unchanged -- only a genuinely absent trigger for the whole timeout freezes the view."""
         from pypylon import pylon
 
-        if stop is not None and stop.is_set():
-            return False
         cam = self._camera
         timeout_ms = int((self.timeout if timeout is None else float(timeout)) * 1000)
-        result = cam.RetrieveResult(timeout_ms, pylon.TimeoutHandling_Return)
-        if result is None or not result.GrabSucceeded():
-            if result is not None:
+        slice_ms = min(timeout_ms, 200) if stop is not None else timeout_ms
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while True:
+            if stop is not None and stop.is_set():
+                return False
+            wait_ms = slice_ms
+            if stop is not None:
+                wait_ms = max(1, min(slice_ms, int((deadline - time.monotonic()) * 1000)))
+            result = cam.RetrieveResult(wait_ms, pylon.TimeoutHandling_Return)
+            if result is None:
+                # This slice saw no frame: keep polling until stopped or the total timeout expires.
+                if stop is not None and not stop.is_set() and time.monotonic() < deadline:
+                    continue
+                return False                    # no trigger within the full timeout -> freeze
+            if not result.GrabSucceeded():
                 result.Release()
-            return False                        # no trigger within timeout -> freeze (partial ok)
-        self._deliver([np.array(result.Array, copy=True)])
-        result.Release()
-        return True
+                return False                    # a real grab failure -> freeze (partial ok)
+            self._deliver([np.array(result.Array, copy=True)])
+            result.Release()
+            return True
 
     def _disarm(self) -> None:
         # Free-run keeps its resident stream; a triggered session ends STRICTLY here so a

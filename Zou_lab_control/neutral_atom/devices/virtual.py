@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from math import cos, erf, radians, sin, sqrt
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 import time
 
 import numpy as np
@@ -511,20 +511,20 @@ class VirtualTrapArray(TrapArrayDevice):
         cooling_durations = cooling_durations_per_frame(sequence, frames, trigger_channels=trig)
         trap_off_per_frame = trap_off_durations_per_frame(sequence, frames, trigger_channels=trig)
         trap_hold_per_frame = trap_hold_durations_per_frame(sequence, frames, trigger_channels=trig)
-        # A SINGLE multi-trigger cycle (the base sequence already carries every trigger -- e.g. a
-        # release-recapture bracket) holds ONE loading across all its frames, so a mid-cycle cooling
-        # phase RE-COOLS the held atoms.  A single-trigger sequence the measurement reads N times is
-        # a fresh shot per frame, so its cooling phase RELOADS.  Tell them apart by the base trigger
-        # count vs the requested frame count.
-        base_triggers = count_trigger_pulses(sequence, trigger_channels=trig) if hasattr(sequence, "effective_pulses") else 0
-        single_cycle = base_triggers >= frames
-        # A repeated SINGLE-trigger sequence (the measurement reads ``frames`` windows from a pulse that
-        # carries ONE camera trigger -- sitemap / threshold / detect / detection-time scan) is a fresh,
-        # independent shot per frame, so EVERY frame reloads.  The pulse defines only ONE cooling window
-        # (count_trigger_pulses == 1 < frames), so ``cooling_durations`` is non-zero only on frame 0;
-        # the reload duration each repeated shot uses is that base cooling (None when the pulse has no
-        # cooling phase -> saturated load).  A multi-trigger cycle (base_triggers >= frames, e.g. a
-        # release-recapture bracket) instead HOLDS one loading and a mid-cycle cooling RE-cools it.
+        # A SINGLE cycle (repeat_count == 1) holds ONE atom loading across every camera-trigger
+        # window its ONE base cycle carries -- a release-recapture bracket (2 triggers) or a
+        # long-short-long imaging bracket (3 triggers) -- so a mid-cycle cooling phase RE-COOLS the
+        # held atoms and the frames are comparable (the same atoms imaged twice).  A REPEATED program
+        # (repeat_count > 1: the measurement layer fired ``sequence.repeated(N)`` so the streamer emits
+        # N independent camera-trigger edges -- sitemap / threshold / detect / detection-time scan)
+        # is a FRESH shot per repeat, so every frame RELOADS.  The criterion is repeat_count, NOT the
+        # raw trigger count: a repeated single-trigger program ALSO has N triggers (== frames), so
+        # "base_triggers >= frames" cannot tell it apart from a held N-trigger bracket -- only
+        # repeat_count distinguishes "N copies of one shot" from "one shot with N windows".
+        single_cycle = not (getattr(sequence, "repeat_count", 1) > 1 or getattr(sequence, "repeat_forever", False))
+        # A repeated SINGLE-trigger sequence images a fresh independent loading every frame; each
+        # repeat is one base cycle, so every frame's cooling window equals the base cooling
+        # (``cooling_durations[0]``; None when the pulse has no cooling phase -> saturated load).
         repeated_shot_cooling = cooling_durations[0] if cooling_durations else 0.0
         # A repeated single-trigger shot images EVERY frame through the SAME one trigger window, so
         # every frame uses THAT window's exposure -- not the camera-default `exposures_per_frame`
@@ -617,6 +617,31 @@ class _TriggerWiredCamera(CameraDevice):
         if sequencer is not None and hasattr(sequencer, "add_fire_listener"):
             sequencer.add_fire_listener(self._on_wire_fired)
 
+    def close(self) -> None:
+        """Unplug the trigger cable: stop listening to the wired streamer's fires (the mirror of
+        the physical trigger wire being disconnected).  Symmetric with :meth:`_wire_to` -- so a
+        closed camera stops rendering frames on every fire (and does not linger as a fire listener
+        holding a reference).  Concrete cameras override ``close`` for their own teardown but call
+        ``super().close()`` to unwire."""
+        wire = getattr(self, "sequencer", None)
+        if wire is not None and hasattr(wire, "remove_fire_listener"):
+            wire.remove_fire_listener(self._on_wire_fired)
+
+    @property
+    def sleep_scale(self) -> float:
+        """The virtual time scale, OWNED by the wired VirtualSequencer and read through the wire.
+
+        A real externally-triggered sensor's wait-for-trigger cadence is dictated by the FPGA's
+        firing rate, so the camera has no independent time scale -- it paces with the streamer.  The
+        virtual camera reads the SAME ``sleep_scale`` the sequencer plays at (the one the pytest
+        suite flips to 0 via ``DEFAULT_SLEEP_SCALE`` to fast-forward), through the wire it already
+        consults for ``.firing`` -- so the two can never drift out of lockstep (whichever config
+        path set the sequencer's scale, the camera honours it with no separate mirror to keep in
+        sync).  No wire -> the module default."""
+        wire = getattr(self, "sequencer", None)
+        scale = getattr(wire, "sleep_scale", None)
+        return float(DEFAULT_SLEEP_SCALE if scale is None else scale)
+
     def _render_frames(self, sequence, frames: int) -> list[np.ndarray]:
         raise NotImplementedError
 
@@ -632,10 +657,20 @@ class _TriggerWiredCamera(CameraDevice):
         with state["cond"]:
             if not state["armed"]:
                 return              # an unarmed camera misses the trigger, exactly like hardware
-            wanted = state["armed_frames"]
-        if wanted is None:
-            trig = getattr(self, "capture_trigger_channels", None)
-            wanted = max(1, count_trigger_pulses(sequence, **({"trigger_channels": trig} if trig else {})))
+            armed_frames = state["armed_frames"]
+        # EDGE-FAITHFUL: the number of frames this fire delivers is the number of camera-trigger
+        # EDGES the fired program carries on THIS camera's own trigger line -- exactly what a real
+        # sensor reads out (one frame per rising edge), never the count the consumer happened to arm
+        # for.  ``armed_frames`` is only an UPPER BOUND (arm(N) reads at most N); the truth is the
+        # edge count.  So a single-trigger pulse fired once delivers ONE frame even if armed for 20
+        # -- the measurement layer that wants N frames fires N edges (``triggered_frames`` repeats a
+        # single-trigger sequence to N triggers; a real FPGA emits N edges the same way).  Zero edges
+        # -> zero frames delivered (nothing rendered), like a fire on a line this camera isn't wired to.
+        trig = getattr(self, "capture_trigger_channels", None)
+        edges = count_trigger_pulses(sequence, **({"trigger_channels": trig} if trig else {}))
+        wanted = edges if armed_frames is None else min(int(armed_frames), edges)
+        if wanted <= 0:
+            return
         self._deliver(self._render_frames(sequence, int(wanted)))
 
     def _grab(self, n: int, *, timeout: float | None = None, stop=None) -> bool:
@@ -657,19 +692,16 @@ class _TriggerWiredCamera(CameraDevice):
 class VirtualCamera(_TriggerWiredCamera):
     def __init__(self, trap_array: VirtualTrapArray, exposure: float = 20e-3, timeout: float = 2.0,
                  subarray_step: int = 4, capture_trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
-                 sleep_scale: float | None = None, sequencer=None):
+                 sequencer=None):
         self.trap_array = trap_array
         self._exposure = positive_float(exposure, "exposure")
         self.timeout = positive_float(timeout, "timeout")
         # Which line the camera's trigger is wired to -- a PASSIVE device property the camera owns
         # and exposes; it images the atoms the FPGA drives, never touching the sequencer (virtual==real).
         self.capture_trigger_channels = tuple(str(c) for c in capture_trigger_channels)
-        # A real externally-triggered qCMOS BLOCKS in wait_capevent until the FPGA trigger arrives, so
-        # acquire() takes the inter-trigger wall-clock -- editing the imaging period to several seconds
-        # genuinely slows the live image.  The virtual camera mirrors that block (NOT pacing the
-        # experiment -- it is WAITING FOR ITS TRIGGER, intrinsic to a triggered sensor); ``sleep_scale``
-        # is the virtual time scale (the pytest suite flips DEFAULT_SLEEP_SCALE to 0 to fast-forward).
-        self.sleep_scale = nonnegative_float(DEFAULT_SLEEP_SCALE if sleep_scale is None else sleep_scale, "sleep_scale")
+        # The virtual time scale is OWNED by the wired sequencer and read through the wire (the
+        # ``sleep_scale`` property on _TriggerWiredCamera) -- a real triggered sensor paces with the
+        # FPGA's firing, so there is NO independent camera time scale to fall out of sync.
         self.last_sequence: str | None = None
         # Mirror the real qCMOS sub-array: a ROI is snapped to a hardware grid
         # (the Hamamatsu step is 4) and the rendered frame is CROPPED to it, so the
@@ -762,7 +794,7 @@ class VirtualCamera(_TriggerWiredCamera):
         }
 
     def close(self) -> None:
-        pass
+        super().close()          # unplug the trigger cable (stop rendering on the streamer's fires)
 
     def stop(self) -> None:
         pass
@@ -791,10 +823,17 @@ class VirtualMotCamera(_TriggerWiredCamera):
                  peak_rate: float = 4.0e5, background_rate: float = 2.0e3,
                  offset_counts: float = 100.0, read_noise: float = 2.0,
                  spot_sigma_px: float = 6.0, timeout: float = 2.0, seed: int | None = None,
+                 capture_trigger_channels: Sequence[str] = ("mot_trigger",),
                  sequencer=None):
         self.width, self.height = int(width), int(height)
         self._exposure = positive_float(exposure, "exposure")
         self.timeout = positive_float(timeout, "timeout")
+        # Which sequencer line the MOT monitor camera's external trigger is wired to -- its OWN
+        # capture-trigger channel (the coil/probe template pulses ``mot_trigger`` once per cycle),
+        # NOT the readout qCMOS's ``emCCD``.  A PASSIVE device property (the camera owns the wiring
+        # fact): the edge-faithful frame count reads THIS line, so a MOT probe fired once delivers
+        # one monitor frame.  A real MOT camera is configured with its actual chNN here.
+        self.capture_trigger_channels = tuple(str(c) for c in capture_trigger_channels)
         # The coil DAC buses this camera's MOT responds to: {bus name: member bit channels LSB..MSB}.
         # Defaults mirror pulses/mot_field_template.json (three 6-bit buses) so the virtual demo is
         # zero-config; a real setup names its own buses in the device config.
@@ -887,7 +926,7 @@ class VirtualMotCamera(_TriggerWiredCamera):
         }
 
     def close(self) -> None:
-        pass
+        super().close()          # unplug the trigger cable (stop rendering on the streamer's fires)
 
     def stop(self) -> None:
         pass
@@ -978,6 +1017,14 @@ class VirtualSequencer(SequencerDevice):
         return self._firing
 
     def prepare(self, sequence: PulseSequence | PulseTableState):
+        # Uploading a new program REPLACES whatever the streamer was playing: on real hardware a
+        # prepare loads the next sequence, so the previous continuous firing is no longer what the
+        # streamer will emit.  Clear ``_firing`` here (the ONE place upload happens) so a measurement
+        # that prepare+fires a FINITE program right after a continuous On Pulse -- without an explicit
+        # Stop -- does not leave the wired camera rendering against the STALE continuous program.
+        # ``fire`` re-sets ``_firing`` iff the freshly prepared program is itself repeat_forever, so
+        # the firing lifecycle is owned entirely by prepare (clear) / fire (set) / stop (clear).
+        self._firing = None
         # Accept either a PulseSequence or a GUI PulseTableState (what bind_pulse/on_pulse and a
         # loaded pulse .json pass).  Compile a table to a PulseSequence so fire()/firing/acquire
         # all work on ONE type, carrying repeat_forever for a continuous (On Pulse) program.
@@ -1012,6 +1059,7 @@ class VirtualSequencer(SequencerDevice):
         # scan_table): N points + the requested sweep count, plus a per-point wall-clock estimate
         # (the program's one-frame duration) so the scan reading reports "point K / N · sweep r".
         self._scan_done = False          # a fresh prepare clears any prior finite-scan done latch
+        self._scan_fire_time = 0.0       # prepared but not yet fired -> scan_progress idles until fire()
         rows = list(getattr(sequence, "scan_table", None) or []) if isinstance(sequence, PulseTableState) else []
         if rows:
             self._scan_info = {
@@ -1041,6 +1089,12 @@ class VirtualSequencer(SequencerDevice):
         # firing (and must not make a later live read see a stale finite shot).
         if bool(getattr(self._prepared, "repeat_forever", False)):
             self._firing = self._prepared
+        # Stamp the wall-clock fire time for ANY streamed scan (a prepared scan_table), whether it is
+        # a cyclic repeat_forever sweep OR a finite single-pass one (repeat_forever=False + scan_points):
+        # ``_scan_progress`` derives the played-point count from this timestamp, so single-pass progress
+        # advances too (keying scanning off the scan_table, not repeat_forever -- virtual == real, which
+        # the real backend already does for a single-pass streamed scan).
+        if self._scan_info is not None:
             self._scan_fire_time = time.monotonic()
         # Emit the trigger edges: every wired camera (the virtual trigger cables) sees this
         # fire.  An ARMED camera renders the frames a finite program's edges gate; a
@@ -1079,7 +1133,11 @@ class VirtualSequencer(SequencerDevice):
         k = int(self._scan_info["scan_repeats"])
         if self._scan_done:              # finite scan finished -> latch the SATURATED done reading (== real)
             return scan_progress_fields(max(1, k) * n, n, k)
-        if self._firing is None:
+        # Scanning is judged by whether a streamed scan has been FIRED (``_scan_fire_time``), NOT by the
+        # ``_firing`` (repeat_forever) handle: a finite SINGLE-PASS streamed scan (repeat_forever=False +
+        # scan_points) advances its progress too, exactly like the real backend, and ``_firing`` is only
+        # set for a cyclic repeat_forever sweep.  Prepared-but-not-yet-fired (fire time 0) reads idle.
+        if self._scan_fire_time <= 0.0:
             return dict(SCAN_PROGRESS_IDLE)
         dt = float(self._scan_info["base_dt"]) * self.sleep_scale
         if dt <= 0:                      # fast-forward: a finite scan is instantly done, an infinite one sits at point 0
@@ -1145,12 +1203,17 @@ class VirtualSequencer(SequencerDevice):
     def stop(self) -> None:
         """Drive the streamer to a safe idle state -- it stops firing, so the camera sees no
         more triggers.  ``abort`` / ``set_safe_state`` (base) route here, so "Stop Pulse"
-        from the GUI clears the firing state and the live image freezes."""
-        if self._firing is not None:
-            self.service.set_safe_state()
+        from the GUI clears the firing state and the live image freezes.
+
+        ALWAYS drives the service to its safe state (unconditionally, like real hardware: Stop
+        parks the outputs whatever was running) -- not only when a repeat_forever ``_firing`` was
+        set.  A finite single-pass streamed scan leaves ``_firing`` None yet still must be parked
+        on Stop, and a redundant safe-state on an already-idle streamer is a harmless no-op."""
+        self.service.set_safe_state()
         self._firing = None
         self._scan_info = None
         self._scan_done = False
+        self._scan_fire_time = 0.0
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -1294,11 +1357,10 @@ def virtual_config_with_overrides(
             elif key in {"exposure", "timeout"}:
                 camera_params[key] = value
             elif key in {"clock_hz", "sleep_scale", "channels"}:
+                # ``sleep_scale`` is set ONCE on the sequencer; the camera reads it through the wire
+                # (its ``sleep_scale`` property), so there is no camera-side mirror to keep in sync --
+                # every connect path (params or the sequencer-override dict) lands in one place.
                 sequencer_params[key] = value
-                # The camera's wait-for-trigger block uses the SAME virtual time scale as the
-                # sequencer (real qCMOS wait_capevent blocks in lockstep with the FPGA cadence).
-                if key == "sleep_scale":
-                    camera_params["sleep_scale"] = value
             else:
                 raise TypeError(f"unknown virtual configuration parameter {key!r}.")
     cfg["trap_array"].setdefault("params", {}).update(trap_params)

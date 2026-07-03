@@ -91,3 +91,49 @@ def test_virtual_camera_device_does_not_fabricate_a_frame_when_idle():
         assert len(cam.acquire(1)) == 0          # Stop Pulse -> no frame again
     finally:
         exp.close()
+
+
+def test_prepare_replaces_the_continuous_firing():
+    """F2: uploading a new program (``prepare``) REPLACES whatever the streamer was continuously
+    firing -- on real hardware a prepare loads the next sequence, so a continuous On Pulse is no
+    longer what the streamer emits.  A measurement that prepare+fires a FINITE program right after
+    an On Pulse (without an explicit Stop) therefore clears ``firing`` -- the wired camera does NOT
+    keep rendering the STALE continuous program."""
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
+    try:
+        seqr = exp.devices.sequencer
+        fire_live_imaging(exp)                       # continuous On Pulse -> firing set
+        assert seqr.firing is not None
+        # a measurement's arm-before-fire shot uploads a FINITE program: prepare replaces the play
+        na.triggered_frames(exp.devices.camera, seqr, na.imaging_sequence(exposure=1e-3, load=True), 2)
+        assert seqr.firing is None                   # the continuous On Pulse is no longer firing
+    finally:
+        exp.close()
+
+
+def test_closing_the_camera_unplugs_the_trigger_cable():
+    """F6: a closed camera stops rendering on the streamer's fires -- ``close`` unplugs the trigger
+    cable (removes the fire listener), symmetric with the constructor-time wire-up, so a closed
+    camera does not linger as a fire listener still producing frames."""
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualSequencer, VirtualTrapArray
+    seqr = VirtualSequencer()
+    cam = VirtualCamera(VirtualTrapArray(grid_shape=(2, 3), image_shape=(16, 20), seed=1),
+                        exposure=1e-3, sequencer=seqr)
+    seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")
+    cam.arm(1)
+    cam.close()                                      # unplug the cable
+    seqr.prepare(seq); seqr.fire(seq)                # a fire the closed camera must NOT see
+    assert cam.read_frames(1, timeout=0.05) == []    # nothing rendered: the listener was removed
+
+
+def test_camera_sleep_scale_is_owned_by_the_sequencer():
+    """F7: the virtual time scale has ONE owner -- the wired sequencer -- and the camera reads it
+    through the wire, so the two can never drift.  Setting the sequencer's ``sleep_scale`` is
+    immediately what the camera reports (no separate camera-side mirror to keep in sync)."""
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualSequencer, VirtualTrapArray
+    seqr = VirtualSequencer(sleep_scale=0.25)
+    cam = VirtualCamera(VirtualTrapArray(grid_shape=(2, 3), image_shape=(16, 20), seed=1),
+                        exposure=1e-3, sequencer=seqr)
+    assert cam.sleep_scale == 0.25                   # read straight from the wired sequencer
+    seqr.sleep_scale = 0.0                            # the sequencer is the single owner
+    assert cam.sleep_scale == 0.0                    # ... and the camera tracks it with no mirror

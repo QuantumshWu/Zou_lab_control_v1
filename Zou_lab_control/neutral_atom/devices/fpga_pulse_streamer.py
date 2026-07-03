@@ -682,14 +682,14 @@ def _program_tick_coeffs(program) -> list:
 
 def _frame_events_for_point(ticks, masks, coeffs, slots, frac_bits,
                             loop_start_index, loop_end_tick, loop_end_coeffs,
-                            loop_count, start_index=0):
+                            loop_count):
     """One frame's played ``[(wall_tick, mask)]`` (in play order) + wall duration.
 
     Mirrors the engine: edges play at their affine effective ticks; a finite
     bracket (``loop_count > 1``) replays the [loop_start, loop_end) time slice,
     each iteration advancing the wall clock by the slice length while the edge
-    timeline rewinds.  ``start_index`` plays the frame from that edge (the
-    repeat-forever rewind point), supported for plain frames."""
+    timeline rewinds.  Every frame plays from edge 0 -- ``repeat_forever`` always
+    rewinds to edge 0 (a nonzero ``repeat_from_index`` is rejected before this)."""
     n = len(ticks)
     if n == 0:
         return [], 0
@@ -697,14 +697,7 @@ def _frame_events_for_point(ticks, masks, coeffs, slots, frac_bits,
     final = eff[-1]
     loop_count = max(1, int(loop_count))
     if loop_count <= 1:
-        s = max(0, min(int(start_index), n - 1))
-        base = eff[s] if s > 0 else 0
-        return [(eff[i] - base, int(masks[i])) for i in range(s, n)], max(1, final - base)
-    if start_index:
-        # No compiler emits a rewind together with a finite bracket
-        # (repeat_from_index is forced to 0 there); fall back to the full frame,
-        # which only ADDS the preamble toggles -- conservative for capacity.
-        start_index = 0
+        return [(eff[i], int(masks[i])) for i in range(n)], max(1, final)
     ls_i = max(0, min(int(loop_start_index), n - 1))
     ls_t = eff[ls_i]
     le_t = _apply_scan_tick(int(loop_end_tick), loop_end_coeffs or (), slots, frac_bits)
@@ -719,17 +712,13 @@ def _frame_events_for_point(ticks, masks, coeffs, slots, frac_bits,
     return events, max(1, final + tail_off)
 
 
-def _frame_duration_for_point(program, slots, frac_bits, start_index=0) -> int:
+def _frame_duration_for_point(program, slots, frac_bits) -> int:
     ticks = program.ticks
     n = len(ticks)
     if n == 0:
         return 0
     coeffs = _program_tick_coeffs(program)
     final = _apply_scan_tick(int(ticks[-1]), coeffs[-1], slots, frac_bits)
-    base = 0
-    s = max(0, min(int(start_index), n - 1))
-    if s > 0:
-        base = _apply_scan_tick(int(ticks[s]), coeffs[s], slots, frac_bits)
     loop_count = max(1, int(getattr(program, "loop_count", 1) or 1))
     tail = 0
     if loop_count > 1:
@@ -738,10 +727,10 @@ def _frame_duration_for_point(program, slots, frac_bits, start_index=0) -> int:
         le_t = _apply_scan_tick(int(getattr(program, "loop_end_tick", 0) or 0),
                                 getattr(program, "loop_end_slot_coeffs", None) or (), slots, frac_bits)
         tail = (loop_count - 1) * max(0, le_t - ls_t)
-    return max(1, final - base + tail)
+    return max(1, final + tail)
 
 
-def _sweep_events(program, frac_bits, start_index=0):
+def _sweep_events(program, frac_bits):
     """``[(wall, mask)]`` across one full sweep (every scan point) + sweep ticks."""
     points = _program_scan_slots(program)
     coeffs = _program_tick_coeffs(program)
@@ -751,11 +740,10 @@ def _sweep_events(program, frac_bits, start_index=0):
     loop_count = max(1, int(getattr(program, "loop_count", 1) or 1))
     events: list = []
     offset = 0
-    for index, slots in enumerate(points):
+    for slots in points:
         frame, duration = _frame_events_for_point(
             program.ticks, program.masks, coeffs, slots, frac_bits,
-            loop_start_index, loop_end_tick, loop_end_coeffs, loop_count,
-            start_index=start_index if index == 0 else 0)
+            loop_start_index, loop_end_tick, loop_end_coeffs, loop_count)
         events.extend((offset + t, m) for t, m in frame)
         offset += duration
     return events, offset
@@ -764,16 +752,13 @@ def _sweep_events(program, frac_bits, start_index=0):
 def steady_sweep_ticks(program, *, frac_bits: int | None = None) -> int:
     """Wall ticks of one steady-state sweep (all scan points, bracket loops in).
 
-    This is the period of the undelayed output stream under ``repeat_forever``
-    (the wrap rewinds to ``repeat_from_index``, so the steady first frame may be
-    shorter than the very first one)."""
+    This is the period of the undelayed output stream under ``repeat_forever`` (the wrap always
+    rewinds to edge 0, so every frame plays in full)."""
     frac = int(getattr(program, "scan_coeff_frac_bits", DEFAULT_SCAN_COEFF_FRAC_BITS)
                if frac_bits is None else frac_bits)
-    start = int(getattr(program, "repeat_from_index", 0) or 0)
     total = 0
-    for index, slots in enumerate(_program_scan_slots(program)):
-        total += _frame_duration_for_point(program, slots, frac,
-                                           start_index=start if index == 0 else 0)
+    for slots in _program_scan_slots(program):
+        total += _frame_duration_for_point(program, slots, frac)
     return total
 
 
@@ -913,34 +898,32 @@ def _check_delay_event_capacity(program, *, evt_depth: int, frac_bits: int,
                     f"larger evt_fifo_depth.")
         return
 
-    sweep_a, period_a = _sweep_events(program, frac_bits, start_index=0)
-    rewind = int(getattr(program, "repeat_from_index", 0) or 0)
-    if forever:
-        if rewind:
-            sweep_b, period_b = _sweep_events(program, frac_bits, start_index=rewind)
-        else:
-            sweep_b, period_b = sweep_a, period_a
+    # repeat_forever always rewinds from edge 0 (a nonzero repeat_from_index is rejected outright,
+    # both here above and in the program validator -- delays are physical OUTPUT delays, never
+    # baked preambles), so the steady-state sweep IS the first sweep: no separate rewound-preamble
+    # sweep exists to model.
+    sweep, period = _sweep_events(program, frac_bits)
     for b, d in checked:
-        toggles, end_bit = _channel_toggle_times(sweep_a, b, 0)
-        if forever and sweep_b:
-            if d >= period_b > 0:
+        toggles, end_bit = _channel_toggle_times(sweep, b, 0)
+        if forever and sweep:
+            if d >= period > 0:
                 # TRUE PHYSICAL delay spanning whole sweeps (no modulo reduction):
                 # the steady stream is periodic, so the exact in-flight count is the
                 # periodic d-window maximum.  The longest delay that fits the FIFO is
                 # ~ depth * period / toggles_per_period.
-                steady_toggles, _ = _channel_toggle_times(sweep_b, b, end_bit)
+                steady_toggles, _ = _channel_toggle_times(sweep, b, end_bit)
                 per_period = max(1, len(steady_toggles))
-                cheap = per_period * (d // period_b + 2)   # cheap upper bound (exact is O(n^2))
+                cheap = per_period * (d // period + 2)   # cheap upper bound (exact is O(n^2))
                 if cheap <= evt_depth:
                     continue
                 worst = (cheap if per_period ** 2 > max_work
-                         else _max_in_flight_periodic(steady_toggles, period_b, d))
+                         else _max_in_flight_periodic(steady_toggles, period, d))
                 if worst > evt_depth:
-                    max_d = max(0, evt_depth * period_b // per_period)
+                    max_d = max(0, evt_depth * period // per_period)
                     raise ValueError(
                         f"channel-delay output bit {b}: a PHYSICAL delay of {d} ticks "
-                        f"({d * 20e-9 * 1e3:.3f} ms) spans {d // period_b} repeating frames "
-                        f"(period {period_b} ticks) and keeps up to {worst} edges in flight, but "
+                        f"({d * 20e-9 * 1e3:.3f} ms) spans {d // period} repeating frames "
+                        f"(period {period} ticks) and keeps up to {worst} edges in flight, but "
                         f"the per-channel event FIFO holds {evt_depth}. The longest physical delay "
                         f"this channel's toggle rate allows is about {max_d} ticks "
                         f"({max_d * 20e-9 * 1e3:.3f} ms). Reduce the delay or the channel's toggle "
@@ -948,11 +931,11 @@ def _check_delay_event_capacity(program, *, evt_depth: int, frac_bits: int,
                 continue
             # d < period: the first sweep plus TWO steady sweeps cover every
             # window, including all wrap seams.
-            offset = period_a
+            offset = period
             for _ in range(2):
-                more, end_bit = _channel_toggle_times(sweep_b, b, end_bit)
+                more, end_bit = _channel_toggle_times(sweep, b, end_bit)
                 toggles.extend(offset + t for t in more)
-                offset += period_b
+                offset += period
         worst = _max_in_flight_toggles(toggles, d)
         if worst > evt_depth:
             # longest delay that fits: shrink d until the worst window holds <= depth.

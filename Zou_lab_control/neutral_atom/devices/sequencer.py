@@ -1305,14 +1305,18 @@ class RemoteSequencer(SequencerDevice):
             import rpyc
         except ImportError as exc:  # pragma: no cover - depends on lab install
             raise RuntimeError("RemoteSequencer requires `rpyc`. Install it on the control computer.") from exc
+        # ONE client connection policy, shared by both transports: pickle allowed (the payloads
+        # are trusted lab JSON/arrays) and a FINITE backstop timeout that is GENEROUS -- it must
+        # exceed the longest server-side action (e.g. wait_done on a big finite scan) so a wedged
+        # server cannot block the caller (the GUI worker thread) forever, while prepare/fire that
+        # return in seconds are unaffected.  The SSL transport carries the SAME config, so a
+        # secured lab's long scans do not silently hit rpyc's 30 s default and AsyncResultTimeout.
+        rpyc_config = {"allow_pickle": True, "sync_request_timeout": 3600.0}
         if self.ssl:
-            self._conn = rpyc.utils.classic.ssl_connect(host=self.host, port=self.port, ca_certs=self.ca_certs)
+            self._conn = rpyc.utils.classic.ssl_connect(
+                host=self.host, port=self.port, ca_certs=self.ca_certs, config=rpyc_config)
         else:
-            # Finite backstop timeout (generous: must exceed the longest server-side
-            # action, e.g. wait_done on a big finite scan) so a genuinely wedged server
-            # cannot block the caller -- the GUI worker thread -- forever.  prepare/fire
-            # return in seconds; this only bounds a truly stuck request.
-            self._conn = rpyc.connect(self.host, self.port, config={"allow_pickle": True, "sync_request_timeout": 3600.0})
+            self._conn = rpyc.connect(self.host, self.port, config=rpyc_config)
         snap = self._conn.root.snapshot()
         self.channels = list(snap.get("channels", self.channels))
         self.clock_hz = float(snap.get("clock_hz", self.clock_hz))

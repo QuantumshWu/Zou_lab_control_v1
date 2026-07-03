@@ -180,6 +180,29 @@ def test_load_devices_lookup_namespace_resolves_user_classes():
         load_devices({"camera": {"type": "ToyCamera"}}, open_devices=False)
 
 
+def test_fully_qualified_config_type_does_not_leak_into_registry(discovery_sandbox):
+    """B6: a fully-qualified path typed straight into a config (``{"type": "pkg.mod.Cls"}``) is
+    resolved per-call via importlib -- but NEVER written back into the shared DEVICE_CLASSES.
+    Otherwise every later ``discover_devices`` would scan an arbitrary (possibly COM-port-opening)
+    class whose presence depends on what was loaded earlier.  Only REGISTERED keys whose value is
+    a lazy import-path string are cached (the built-ins); an ad-hoc fq path is not a key."""
+    from Zou_lab_control.neutral_atom.devices.registry import resolve_class
+
+    fq = "Zou_lab_control.neutral_atom.devices.virtual.VirtualSequencer"
+    assert fq not in DEVICE_CLASSES
+    cls = resolve_class(fq)                                            # resolves via importlib
+    assert cls.__name__ == "VirtualSequencer"
+    assert fq not in DEVICE_CLASSES, "an ad-hoc fq config type leaked into the shared registry"
+
+    # A REGISTERED name whose value is a lazy import string IS materialised in place (a pure cache
+    # hit): resolving a built-in turns its path string into the class, still under the same key.
+    # (Force the lazy-string state -- the sandbox fixture restores it -- so this is order-robust.)
+    DEVICE_CLASSES["PylonCamera"] = "Zou_lab_control.neutral_atom.devices.pylon.PylonCamera"
+    resolved = resolve_class("PylonCamera")
+    assert resolved is PylonCamera
+    assert DEVICE_CLASSES["PylonCamera"] is PylonCamera               # cached back under its own key
+
+
 def test_load_devices_lookup_accepts_module_globals():
     """``lookup=globals()`` works verbatim: the whole calling namespace (imports, helpers,
     fixtures, dunders) filters down to its device classes automatically."""

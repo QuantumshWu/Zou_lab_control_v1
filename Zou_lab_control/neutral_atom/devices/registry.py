@@ -293,6 +293,7 @@ def resolve_class(name: str, lookup: Mapping[str, Any] | None = None) -> type:
         candidate = lookup.get(str(name))
         if isinstance(candidate, type) and issubclass(candidate, BaseDevice):
             return candidate
+    registered = name in DEVICE_CLASSES
     target = DEVICE_CLASSES.get(name, name)
     if isinstance(target, type):
         return target
@@ -302,7 +303,15 @@ def resolve_class(name: str, lookup: Mapping[str, Any] | None = None) -> type:
     cls = getattr(importlib.import_module(module_name), class_name)
     if not isinstance(cls, type):
         raise TypeError(f"resolved device class {name!r} is not a class.")
-    DEVICE_CLASSES[name] = cls
+    # Cache back ONLY when ``name`` is a REGISTERED key whose value is a lazy import-path string
+    # (the built-ins, or a ``register_device_class(name, "pkg.Cls")`` entry): materialising it to
+    # the class is a pure cache hit.  A fully-qualified path typed straight into a config
+    # (``{"type": "my_lab.SerialCam"}``) is NOT a registry key -- writing it back would silently
+    # pin an arbitrary class (even a non-device one) into the shared registry forever, so every
+    # later ``discover_devices`` would scan it.  ``importlib`` already caches the module, so the
+    # per-call re-resolve is free; the registry stays exactly what was registered.
+    if registered:
+        DEVICE_CLASSES[name] = cls
     return cls
 
 
