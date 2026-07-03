@@ -353,8 +353,16 @@ def _saved_1d_with_repeat_npz(tmp_path) -> Path:
 
 
 def _line_count(plotter) -> int:
-    """Data-carrying Line2D artists on the plotter's main axes (a create trace draws one per repeat)."""
-    return len([ln for ln in plotter.ax.get_lines() if len(ln.get_xdata()) > 0])
+    """Data-carrying Line2D artists the plotter itself tracks (a create trace draws one per repeat).
+
+    Count the plotter's OWN ``self.lines`` list, NOT every ``ax.get_lines()`` -- the axes also holds
+    the AreaSelector's invisible ``RectangleSelector`` drag handles (corner/edge/centre ToolHandles =
+    4+4+1-point Line2D markers that ``attach_interaction`` adds for box-select -> scan-param), which
+    are NOT data and would inflate the count by three."""
+    lines = getattr(plotter, "lines", None)
+    if lines is None:
+        lines = plotter.ax.get_lines()
+    return len([ln for ln in lines if len(ln.get_xdata()) > 0])
 
 
 def test_edit_tab_repeat_mode_create_redraws_snapshot_per_repeat(tmp_path):
