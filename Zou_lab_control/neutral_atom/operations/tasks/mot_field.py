@@ -26,6 +26,7 @@ from Zou_lab_control._paths import resolve_under_project
 from Zou_lab_control._viewer_registry import active_plotter
 
 from ...devices.base import CameraDevice
+from ..measurement import device_param
 from ..logic import Task, TaskOutput
 from ..measurement import ParamDecl, triggered_frames
 from ..task import TaskSpec
@@ -197,14 +198,15 @@ def optimize_mot_field(readout) -> TaskSpec:
     """Sweep the x/y/z coil DACs, measure the MOT on the monitor camera, report the optimum."""
 
     s = readout.session
+    # The camera is a USER CHOICE (a dropdown), not hardcoded: one device_param, defaulting to the
+    # MOT viewer ("monitor_camera") when the config has one, else the conventional camera.  Same
+    # declarative selection every device-using node uses -- a new device domain needs no edit here.
+    cam_param = device_param("camera", s.devices, default="monitor_camera",
+                             tooltip="Which camera watches the MOT fluorescence.")
 
     def build(hub, *, prefix: str = "mot_", **values):
-        # the MOT viewer when the config has one, else whatever camera the set declares
-        # (default_camera_name raises with guidance on a camera-less config)
-        names = s.devices.camera_names()
-        camera = s.devices["monitor_camera" if "monitor_camera" in names
-                           else s.devices.default_camera_name()]
+        camera = s.devices[values.pop("camera", cam_param.default)]
         return OptimizeMotFieldTask(hub, camera, s.devices.sequencer, prefix=prefix, **values)
 
-    return TaskSpec(name="Optimize MOT field", build=build, params=MOT_FIELD_PARAMS,
+    return TaskSpec(name="Optimize MOT field", build=build, params=(*MOT_FIELD_PARAMS, cam_param),
                     mid_run_key="frame", default_kind="2d", prefix="mot_")

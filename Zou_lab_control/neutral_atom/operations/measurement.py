@@ -194,7 +194,7 @@ class ParamDecl:
 
 
 def device_param(role, device_set, *, key: str | None = None, label: str | None = None,
-                 tooltip: str | None = None) -> "ParamDecl":
+                 tooltip: str | None = None, default: str | None = None) -> "ParamDecl":
     """The ONE source for a device-selection control on ANY measurement/task form: a ``choice``
     ``ParamDecl`` whose choices are the devices of ``role``'s type in ``device_set`` and whose
     default is the conventional device for that role.  Every spec that uses a device declares its
@@ -209,11 +209,13 @@ def device_param(role, device_set, *, key: str | None = None, label: str | None 
 
     domain = role if hasattr(role, "base_type") else DEVICE_DOMAINS[str(role)]
     names = device_set.device_names(domain.base_type)
-    default = (device_set.default_device_name(domain.base_type, conventional=domain.key)
-               if names else None)
+    if default is not None and default in names:            # a spec's PREFERRED device for this role
+        chosen = default                                    # (e.g. MOT optimise -> "monitor_camera")
+    else:
+        chosen = device_set.default_device_name(domain.base_type, conventional=domain.key) if names else None
     return ParamDecl(
         key=str(key or domain.key), label=str(label or domain.label), kind="choice",
-        choices=names, default=default,
+        choices=names, default=chosen,
         tooltip=str(tooltip or f"Which {domain.label.lower()} this node uses."))
 
 
