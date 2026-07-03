@@ -23,6 +23,7 @@ from ..operations.measurement import (
     ScanAxis,
     ScanResult,
     ScannedMeasurement,
+    device_param,
     otsu_fidelity_from_frames,
     triggered_frames,
 )
@@ -650,12 +651,10 @@ class ReadoutSubsystem(ExperimentSubsystem):
         return MeasurementSpec(
             name="Camera (live frames)",
             params=(
-                ParamDecl(key="camera", label="Camera", kind="choice",
-                          default=s.devices.default_camera_name(),
-                          choices=s.devices.camera_names(),
-                          tooltip="Which sensor streams (every camera in the device config is "
-                                  "listed; a free-running sensor shows an image with no pulse "
-                                  "wiring at all)."),
+                device_param("camera", s.devices,   # ONE source: choices/default from the device-DOMAIN registry
+                             tooltip="Which sensor streams (every camera in the device config is "
+                                     "listed; a free-running sensor shows an image with no pulse "
+                                     "wiring at all)."),
                 ParamDecl(key="frames_per_cycle", label="frames / cycle", kind="int",
                           default=1, lo=1, hi=10000,
                           tooltip="emCCD events (camera triggers) per cycle.  Each event i publishes its "
