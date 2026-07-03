@@ -106,7 +106,7 @@ class OptimizeMotFieldTask(Task):
 
     # ------------------------------------------------------------------ the flow
     def run(self, out: TaskOutput) -> dict:
-        state = _resolve_probe_template(self.template)
+        state = _resolve_probe_template(self.template, sequencer=self.sequencer)
         slots = self._coil_slots(state)
         axes = [self._axis_codes(c) for c in self.centers]
         nx, ny, nz = (len(a) for a in axes)

@@ -54,8 +54,10 @@ from .live import (
     panel_display_size,
     panel_plot,
     panel_size_cells,
+    recommended_grid_size,
     site_ring_radius,
 )
+from .style import PALETTE          # the ONE colour source -- panel cmap DEFAULTS reference it (never a literal)
 from .pulse_gui import slot_label   # the ONE human slot-label formatter (period/channel, #H3s-F2)
 from .qt_fluent import (
     ACCENT,
@@ -1022,7 +1024,7 @@ _BLANK_SOURCE = ""
 # handler in param_widgets + one whitelist entry on ParamDecl.
 PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
     "2d": (
-        ParamDecl(key="cmap", label="colormap", kind="choice", default="inferno", choices=CMAPS,
+        ParamDecl(key="cmap", label="colormap", kind="choice", default=PALETTE["cmap_scan"], choices=CMAPS,
                   tooltip="Image colormap", display=True),
     ),
     "sites": (
@@ -1032,7 +1034,7 @@ PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
         # the per-site occupancy (PANEL_INPUT_SLOTS["sites"], picked in the Setting's Source
         # section); its ring CENTRES and the frame UNDERLAY auto-resolve from that signal's
         # producing node, so they are NOT extra slots or params here.
-        ParamDecl(key="cmap", label="colormap", kind="choice", default="gray", choices=CMAPS,
+        ParamDecl(key="cmap", label="colormap", kind="choice", default=PALETTE["cmap_camera"], choices=CMAPS,
                   tooltip="Colormap for the camera-frame underlay", display=True),
     ),
     # Pure DISPLAY knobs (history / bins / fit / log axis / colormap) live in the lightweight
@@ -2710,7 +2712,14 @@ class PanelCard(FluentGroupBox):
             self._facet_cells(value), sub_plot_kind=sub, size=self.config.size,
             display=False, interactions=interactions, title=self.config.title or "")
         for key in [d.key for d in PANEL_PARAMS.get(sub, ())] + ["relim", "fixed_lo", "fixed_hi"]:
-            if key in self.config.params:
+            if key == "cmap":
+                # Inject the RESOLVED cmap (operator's pick ELSE the sub-kind's declared PANEL_PARAMS
+                # default) through the ONE ``_resolved_cmap`` resolver -- the SAME source the Setting
+                # popup shows.  Without this a grid whose params carry no explicit cmap fell through to
+                # ImageCell's own default (grey), so the live grid drew grey while the Setting said the
+                # default: render == Setting now, one source, no silent divergence.
+                plotter.apply_param("cmap", _resolved_cmap(sub, self.config.params))
+            elif key in self.config.params:
                 plotter.apply_param(key, self.config.params[key])
         return plotter
 
@@ -6975,35 +6984,41 @@ class TaskConsole(QtWidgets.QWidget):
         if getattr(node, "layer", "") == "task":
             self._set_task_running(row, node)
 
+    def _task_mid_run_config(self, spec, node, *, title: str) -> "PanelConfig":
+        """The task's mid-run panel, DECLARED as a plain ``PanelConfig`` -- so it is built by the SAME
+        ``_new_panel_card`` path a manually Added / a saved-and-reloaded panel uses, never a bespoke
+        widget.  The task declares only DATA: its spec's ``default_kind`` + ``mid_run_key`` and, for a
+        SCANNING task, its ``grid_shape`` (a plain tuple).  The console maps that to a panel whose size
+        comes from the ONE :func:`recommended_grid_size` rule (a few cells -> ``2x2``, never a magic
+        size) and whose cmap the ONE ``_resolved_cmap`` resolver fills at draw (render == Setting).
+
+        A scanning task (``default_kind='grid'`` + a >=2-D grid_shape) shows a live facet grid over its
+        LAST scan axis -- one 2-D map per outer-axis plane, filling in point-by-point (the SAME facet
+        machinery a pulse-scan grid panel uses; the panel's ``sub_plot_kind`` auto-derives from the
+        remaining axes, so it is not hand-set here).  Anything else is a plain frame panel.  Every task
+        panel reads the reserved ``__task_frame__`` the console injects each tick from the task's OWN
+        output buffer (off the hub, #6); its ``points_shape`` reaches ``_facet_value_shapes`` through the
+        panel params (a task panel binds no producing hub node to read a declared structure from)."""
+        kind = str(getattr(spec, "default_kind", "2d") or "2d")
+        source = "value = __task_frame__"
+        gshape = tuple(int(n) for n in (getattr(node, "grid_shape", ()) or ()))
+        if kind == "grid" and len(gshape) >= 2:
+            facet_axis = len(gshape) - 1                 # facet the LAST scan axis -> one plane per cell
+            return PanelConfig(kind="grid", title=title, source=source,
+                               size=recommended_grid_size(gshape[facet_axis]),
+                               params={"facet": f"points:{facet_axis}", "points_shape": list(gshape)})
+        if kind == "grid":
+            kind = "1d"                                  # a 0/1-D "scan" is a plain task curve, not a grid
+        return PanelConfig(kind=kind, title=title, source=source)
+
     def _set_task_running(self, row: "LogicNodeRow", node) -> None:
-        """Engage task-run mode: open a dedicated Monitor panel that shows the task's
-        mid-run output (read off its OWN buffer, NOT the hub -- #6), and LOCK all other
+        """Engage task-run mode: open the task's dedicated mid-run panel (declared by
+        :meth:`_task_mid_run_config`, built through the generic panel path) and LOCK all other
         controls so the only actions are Stop / wait (#5, confocal task semantics)."""
         spec = self._spec_for_logic(row.node)
         self._task_mid_key = str(getattr(spec, "mid_run_key", "frame"))
         self._task_card_frame = None
-        kind = str(getattr(spec, "default_kind", "2d") or "2d")
-        title = f"Task: {row.node.title}"
-        # The dedicated panel reads the reserved ``__task_frame__`` injected each tick
-        # from the task's output buffer (see _tick) -- never a hub signal.
-        params: dict = {}
-        size = "2x2"
-        if kind == "grid":
-            # A task whose mid-run block is a MULTI-D scan (e.g. Optimize-MOT-field's (repeat, n_points, 1)
-            # intensity block over an (nx,ny,nz) coil grid) shows its LIVE facet grid here: the task
-            # declares its scan shape up front (``node.grid_shape``), so the panel facets the LAST axis
-            # (one 2-D map per outer-axis plane) and fills in point-by-point.  Reuses the SAME facet-grid
-            # machinery a pulse-scan grid panel uses; ``points_shape`` reaches ``_facet_value_shapes``
-            # through the panel params (a task panel has no producing hub node to read structure from).
-            gshape = tuple(int(n) for n in (getattr(node, "grid_shape", ()) or ()))
-            if len(gshape) >= 2:
-                params = {"facet": f"points:{len(gshape) - 1}", "points_shape": list(gshape),
-                          "sub_plot_kind": "2d"}
-                size = "4x4"
-            else:                                    # a 1-D / degenerate scan -> a plain 1-D task curve
-                kind = "1d"
-        config = PanelConfig(kind=kind, title=title, size=size,
-                             source="value = __task_frame__", params=params)
+        config = self._task_mid_run_config(spec, node, title=f"Task: {row.node.title}")
         card = self._new_panel_card(config)
         self._attach_card(card)
         self._task_card = card

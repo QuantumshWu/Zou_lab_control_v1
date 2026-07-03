@@ -52,3 +52,27 @@ def test_bundled_fireable_templates_author_on_the_hardware_clock_grid():
         assert state.time_step_ns == tick_ns, (
             f"{os.path.basename(path)} authors at time_step_ns={state.time_step_ns} ns, not the hardware "
             f"tick {tick_ns} ns; a DURATION api/scan sweep of it produces off-grid values that cannot fire.")
+
+
+def test_template_tick_comes_from_the_connected_device_not_a_constant():
+    """The fireable tick is a DEVICE property: ``_resolve_probe_template(template, sequencer=dev)`` snaps
+    the template to ``1e9 / dev.clock_hz`` -- read off the connected sequencer, exactly as confocal reads
+    a device's resolution off the device.  A board reporting a DIFFERENT clock snaps to a DIFFERENT tick;
+    only when NO device is passed (a GUI template preview) does it fall back to the config default.  Pins
+    that the snap is not hardcoded to a module constant."""
+    from Zou_lab_control.neutral_atom.operations.measurements.pulse_scan import (
+        _resolve_probe_template, _hardware_tick_ns)
+    from Zou_lab_control.neutral_atom.timing.pulse_table import DEFAULT_CLOCK_HZ
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    template = os.path.join(here, "pulses", "mot_field_template.json")
+
+    class _Board:
+        def __init__(self, clock_hz): self.clock_hz = clock_hz
+
+    for clock_hz in (50e6, 100e6, 25e6):
+        assert _hardware_tick_ns(_Board(clock_hz)) == 1_000_000_000.0 / clock_hz
+        state = _resolve_probe_template(template, sequencer=_Board(clock_hz))
+        assert state.time_step_ns == 1_000_000_000.0 / clock_hz, "template tick must follow the board clock"
+    # no device in scope -> the streamer-config default clock (single source), never a bare literal
+    assert _hardware_tick_ns(None) == 1_000_000_000.0 / DEFAULT_CLOCK_HZ

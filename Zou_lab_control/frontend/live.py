@@ -1734,6 +1734,17 @@ def optimal_grid_size(nrows: int, ncols: int) -> str:
     return f"{rows_half}x{cols_half}"
 
 
+def recommended_grid_size(n_cells: int) -> str:
+    """The ``PANEL_SIZES`` preset an ``n_cells``-cell facet grid defaults to, from the CELL COUNT alone.
+    Lays the cells out with the SAME rule :class:`GridPlot` uses (:func:`grid_shape_for` + the shared
+    ``_SITE_MAX_COLS`` column cap) then maps that shape through the ONE :func:`optimal_grid_size` -- so a
+    caller that only knows how many cells it will have (a task's mid-run facet panel, sized BEFORE the
+    grid object exists) picks the SAME preset the grid itself would (a few cells -> ``2x2``, never an
+    over-large magic size)."""
+    nrows, ncols = grid_shape_for(int(n_cells), max_cols=_SITE_MAX_COLS)
+    return optimal_grid_size(nrows, ncols)
+
+
 # The readability floor a pulse timeline needs in the size-preset DATA region: enough px PER ROW that a
 # channel name is not squashed, and enough px PER PERIOD that the periods do not blur into one band.
 # These REPLACE the old content-driven inches (_PULSE_X_PERIODS_PER_BLOCK / auto-height): instead of
@@ -4977,6 +4988,7 @@ __all__ = [
     "build_grid_figure",
     "grid_recipe_from_cells",
     "optimal_grid_size",
+    "recommended_grid_size",
     "default_pulse_size",
     "optimal_pulse_size",
     "panel_margins_px",

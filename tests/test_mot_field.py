@@ -243,12 +243,20 @@ def test_task_mid_run_channel_is_the_live_3d_grid(tmp_path):
 
 def test_console_task_panel_is_a_live_facet_grid():
     """Driving the REAL console's task-run path for the one-click MOT task opens its mid-run panel as
-    a FACET GRID bound to the reserved ``__task_frame__`` (one (Bx,By) map per Bz plane), sized from
-    the task's own ``grid_shape`` -- NOT a lone 2-D frame.  Mechanically pins the regression where the
-    operator saw only the current camera image while the task ran."""
+    a FACET GRID bound to the reserved ``__task_frame__`` (one (Bx,By) map per Bz plane) -- NOT a lone
+    2-D frame -- built through the SAME PanelConfig path a manual panel uses, with every knob from a
+    SINGLE source (no magic constants in ``_set_task_running``):
+
+    * size == the ONE ``recommended_grid_size`` rule (a 3-cell grid -> ``2x2``, never a hardcoded 4x4);
+    * ``sub_plot_kind`` is NOT hand-set (it auto-derives from the remaining axes);
+    * the live grid's cmap == the Setting popup's default == ``PALETTE`` (``_resolved_cmap`` -- render
+      and Setting can never diverge into the grey-vs-inferno bug again).
+    """
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     from Zou_lab_control.frontend.task_console import (
-        TaskConsole, LogicNodeConfig, default_console_state)
+        TaskConsole, LogicNodeConfig, default_console_state, PANEL_PARAMS, _resolved_cmap)
+    from Zou_lab_control.frontend.style import PALETTE
+    from Zou_lab_control.frontend.live import recommended_grid_size
     from Zou_lab_control import neutral_atom as na
 
     ensure_qt_app()
@@ -272,6 +280,13 @@ def test_console_task_panel_is_a_live_facet_grid():
         assert cfg.params["points_shape"] == list(node.grid_shape)
         assert cfg.params["facet"] == f"points:{len(node.grid_shape) - 1}"
         assert "__task_frame__" in cfg.source
+        # size from the ONE recommendation rule, not a magic constant
+        assert cfg.size == recommended_grid_size(node.grid_shape[-1]) == "2x2"
+        # sub_plot_kind auto-derives (it is not hand-set in the task panel config)
+        assert "sub_plot_kind" not in cfg.params
+        # the live grid render cmap == the Setting default == the ONE PALETTE source
+        setting_default = next(d.default for d in PANEL_PARAMS["2d"] if d.key == "cmap")
+        assert _resolved_cmap("2d", cfg.params) == setting_default == PALETTE["cmap_scan"]
         con.shutdown()
     finally:
         exp.close()

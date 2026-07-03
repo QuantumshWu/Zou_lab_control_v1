@@ -75,22 +75,35 @@ class _Axis:
         self.unit = str(unit)
 
 
-def _resolve_probe_template(template: str) -> PulseTableState:
+def _hardware_tick_ns(sequencer=None) -> float:
+    """The ONE hardware tick (ns) a fireable template must author on -- read FROM THE CONNECTED
+    sequencer device (``sequencer.clock_hz``, a device property carried by both the real
+    ``RemoteSequencer`` -- which reads it back from the FPGA on connect -- and the ``VirtualSequencer``),
+    exactly as confocal reads a device's resolution off the device rather than a hard constant.  Only
+    when no device is in scope (a GUI template preview) does it fall back to the streamer-config default
+    clock (``DEFAULT_CLOCK_HZ``, single-sourced from ``streamer_config.json``)."""
+    clock_hz = float(getattr(sequencer, "clock_hz", 0.0) or 0.0) if sequencer is not None else 0.0
+    if clock_hz <= 0.0:
+        from ...timing.pulse_table import DEFAULT_CLOCK_HZ
+        clock_hz = float(DEFAULT_CLOCK_HZ)
+    return 1_000_000_000.0 / clock_hz
+
+
+def _resolve_probe_template(template: str, sequencer=None) -> PulseTableState:
     """Load the pulse template the operator picked via the ONE shared resolver: the given path if
     real, else the same-named file shipped under the project ``pulses/`` folder, else the in-memory
     single-image default.
 
     A template loaded to FIRE must author on the HARDWARE clock grid: its ``time_step_ns`` is forced
-    to the one hardware tick (``1e9 / DEFAULT_CLOCK_HZ`` = 20 ns), single-sourced from the streamer
-    clock -- NOT whatever a saved file happened to carry.  A finer authoring grid (an old save with
-    ``time_step_ns = 1``) would let an api/scan DURATION sweep produce sub-tick durations that fail
-    the 50 MHz grid validation and cannot fire ("api slot does not work"); snapping the grid here
-    makes author == snap == fire for every template, including a user-local one under ``pulses/``."""
-    from ...timing.pulse_table import DEFAULT_CLOCK_HZ
-
+    to the one hardware tick (:func:`_hardware_tick_ns`), taken FROM the connected ``sequencer`` device
+    when one is given -- NOT whatever a saved file happened to carry, and NOT a constant baked into this
+    module.  A finer authoring grid (an old save with ``time_step_ns = 1``) would let an api/scan
+    DURATION sweep produce sub-tick durations that fail the clock-grid validation and cannot fire ("api
+    slot does not work"); snapping the grid here makes author == snap == fire for every template,
+    including a user-local one under ``pulses/``, on whatever clock the connected board reports."""
     state = resolve_pulse_template(template, default_name=DEFAULT_PROBE_TEMPLATE,
                                    default_factory=single_imaging_template)
-    tick_ns = 1_000_000_000.0 / DEFAULT_CLOCK_HZ
+    tick_ns = _hardware_tick_ns(sequencer)
     if state.time_step_ns != tick_ns:
         state.time_step_ns = tick_ns
     return state
@@ -268,7 +281,7 @@ def pulse_scan(readout) -> MeasurementSpec:
     def build(*, template: str = DEFAULT_PROBE_TEMPLATE, pulse_slots: Mapping | None = None,
               camera=None,
               y=None, y_name: str = "signal", **_ignored) -> PulseScanPlan:
-        state = _resolve_probe_template(template)
+        state = _resolve_probe_template(template, sequencer=s.devices.sequencer)
         spec = dict(pulse_slots or {})
         api_values: Mapping[str, float] = dict(spec.get("api") or {})
         scan_code = str(spec.get("scan_code") or "")
