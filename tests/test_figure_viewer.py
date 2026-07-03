@@ -215,6 +215,58 @@ def test_every_panel_kind_saves_its_declared_display_knobs_in_the_view():
         exp.close()
 
 
+def test_grid_panel_exposes_editable_cell_title_template_and_size():
+    """#5: a GRID panel's Edit tab exposes the per-cell title TEMPLATE + fixed font SIZE as editable
+    controls (grid-only -- a flat panel has no per-cell title), an edit re-titles EVERY cell through the
+    ONE ``card._set_param`` -> ``consume_param`` path, and both round-trip through the saved ``info['view']``
+    -- the ``_panel_display_decls`` single source folds the grid title knobs into the same enumeration
+    bins/cmap use, so they are shown, applied, saved and reopened identically."""
+    import numpy as np
+
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import (
+        GRID_TITLE_PARAMS, PanelConfig, TaskConsole, _panel_display_decls, default_console_state)
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    # grid folds the title knobs into its enumeration; a flat panel does NOT.
+    grid_keys = [d.key for d in _panel_display_decls("grid", "hist")]
+    assert grid_keys[-2:] == [d.key for d in GRID_TITLE_PARAMS] == ["title_template", "title_size"]
+    assert "title_template" not in [d.key for d in _panel_display_decls("hist", "hist")]
+
+    ensure_qt_app()
+    exp = na.connect("virtual")
+    con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
+                      measurements=exp.readout.measurement_specs(),
+                      processors=exp.readout.processor_specs(),
+                      tasks=exp.readout.task_specs(), window_px=(1000, 700))
+    try:
+        block = np.stack([np.concatenate([np.random.default_rng(k).normal(3, 1, 50),
+                                          np.random.default_rng(k).normal(40, 3, 60)]) for k in range(4)],
+                         axis=0).reshape(4, 1, 110)
+        card = con._new_panel_card(PanelConfig(kind="grid", title="G", size="4x4",
+                                               source="value = __probe__",
+                                               params={"sub_plot_kind": "hist", "facet": "repeat",
+                                                       "points_shape": (1,)}))
+        con._attach_card(card)
+        card._render(block, {})
+        con._tick()
+        con._edit_card(card)
+        ed = con._panel_editors[id(card)]
+        # editing the template (the ONE set_param path) re-titles EVERY cell.
+        card._set_param("title_template", "{id}  n={k}"); card._run_pending_rebuild(); con._tick()
+        assert [card.plotter.cell_renderer.cell_title(k) for k in range(4)] == \
+            ["rep 0  n=0", "rep 1  n=1", "rep 2  n=2", "rep 3  n=3"]
+        card._set_param("title_size", 7); card._run_pending_rebuild()
+        assert card.plotter.cell_renderer.title_size_pt() == 7.0
+        # both round-trip through the saved view.
+        view = ed._save_view_state()
+        assert view.get("title_template") == "{id}  n={k}" and view.get("title_size") == 7
+    finally:
+        con.shutdown()
+        exp.close()
+
+
 def test_edit_x_range_pin_is_global_live_and_persisted():
     """#3: the Edit tab's x-range pin has NO separate y input (the VALUE axis is relim-owned), Apply
     reaches the LIVE panel and EVERY grid cell (not just the frozen snapshot), it is persisted in

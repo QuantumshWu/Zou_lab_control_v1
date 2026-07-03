@@ -1082,6 +1082,31 @@ PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
 }
 
 
+# Grid-ONLY per-cell title knobs (#5): a grid panel ADDS these to its sub_plot_kind's ``PANEL_PARAMS`` so
+# the operator can edit the per-cell title TEMPLATE + fix its font SIZE from the Edit tab.  ``display=False``
+# => the Edit tab (a functional knob), not the lightweight Setting popup.  They flow through the SAME
+# ``store_display_param`` -> ``GridCell.consume_param`` path every grid display knob uses, and round-trip
+# through the saved view -- so ``{id}`` (the facet-aware identifier), ``{popt[i]}`` (a fit param), ``{fid}``
+# (readout fidelity) are all reachable, and the fixed title size is a real interface (0 = auto default).
+GRID_TITLE_PARAMS: tuple[ParamDecl, ...] = (
+    ParamDecl(key="title_template", label="cell title", kind="text", default="{id}", display=False,
+              tooltip="Per-cell title template.  {id}=facet identifier (site / repeat / scan value); "
+                      "{k}=cell index; {popt[i]}=a fit parameter; {fid}=readout fidelity.  "
+                      "e.g. '{id}  F={popt[2]:.2f}'"),
+    ParamDecl(key="title_size", label="title size", kind="int", default=0, lo=0, hi=40, display=False,
+              tooltip="Cell-title font size in points; 0 = the automatic two-tier default"),
+)
+
+
+def _panel_display_decls(kind: str, param_kind: str) -> tuple[ParamDecl, ...]:
+    """The FULL ParamDecl list a panel's Setting / Edit UI + save / recipe enumerate: the kind's own
+    ``PANEL_PARAMS`` plus, for a GRID, the grid-generic per-cell title knobs (#5).  The ONE place the two
+    are combined, so every enumeration site shows the SAME set and a grid's title template / size are
+    edited, applied, saved and reopened through the very same path as bins / cmap."""
+    decls = PANEL_PARAMS.get(param_kind, ())
+    return decls + GRID_TITLE_PARAMS if kind == "grid" else decls
+
+
 def _panel_param_default(kind: str, key: str) -> object:
     """The declared default of a panel kind's param, from the ONE ``PANEL_PARAMS`` catalog -- so a
     kind's colormap default (``2d`` -> ``inferno``, ``sites`` -> ``gray``) has a SINGLE source and is
@@ -2644,7 +2669,7 @@ class PanelCard(FluentGroupBox):
         the thumbnails re-bin.  A copy -- the node's recipe is untouched."""
         out = dict(recipe)
         display = dict(out.get("display_params") or {})
-        for decl in PANEL_PARAMS.get(self._param_kind(), ()):    # exactly the sub_plot_kind's knobs -- no hard-code
+        for decl in _panel_display_decls(self.config.kind, self._param_kind()):   # sub-kind knobs + grid title (#5)
             if decl.key in self.config.params:
                 display[decl.key] = self.config.params[decl.key]
         # The relim family is display state too (it lives beside PANEL_PARAMS as _RELIM_PARAM + the
@@ -2718,7 +2743,7 @@ class PanelCard(FluentGroupBox):
         plotter = build_facet_grid(
             cells, sub_plot_kind=sub, size=self.config.size, cell_labels=cell_labels,
             display=False, interactions=interactions, title=self.config.title or "")
-        for key in [d.key for d in PANEL_PARAMS.get(sub, ())] + ["relim", "fixed_lo", "fixed_hi"]:
+        for key in [d.key for d in _panel_display_decls("grid", sub)] + ["relim", "fixed_lo", "fixed_hi"]:
             if key == "cmap":
                 # Inject the RESOLVED cmap (operator's pick ELSE the sub-kind's declared PANEL_PARAMS
                 # default) through the ONE ``_resolved_cmap`` resolver -- the SAME source the Setting
@@ -3874,7 +3899,7 @@ class PanelCard(FluentGroupBox):
         # an unrelated panel knob (e.g. ``repeat_mode``, which has no effect on a snapshot grid's enlarged
         # cell) is just stored, so it never triggers a visible rebuild/flash of the enlarged view.
         if self.plotter is not None and not self.plotter.apply_param(str(key), value):
-            if any(d.key == str(key) for d in PANEL_PARAMS.get(self._param_kind(), ())):
+            if any(d.key == str(key) for d in _panel_display_decls(self.config.kind, self._param_kind())):
                 self._refocus_current_cell()   # rebuild ONLY the enlarged view, staying zoomed
         elif self.canvas is not None:
             self.canvas.draw_idle()
@@ -4605,7 +4630,7 @@ class PanelEditor(QtWidgets.QWidget):
         # the LIVE panel AND this snapshot.  This is where "the params the plot
         # call exposes" live -- NOT in the basic Setting popup (which keeps only
         # source / size / colormap / relim / unit), so the two never duplicate.
-        functional = [s for s in PANEL_PARAMS.get(card._param_kind(), ()) if not s.display]
+        functional = [s for s in _panel_display_decls(card.config.kind, card._param_kind()) if not s.display]
         if is_plot and functional:
             section("Parameters")
             for s in functional:
@@ -4630,7 +4655,7 @@ class PanelEditor(QtWidgets.QWidget):
             # via _RELIM_PARAM, repeat_mode via _repeat_param_specs) are present HERE too, so the Edit tab
             # is the FULL data_figure UI (whatever the Setting can tune, the Edit can too).  Both route
             # through _edit_param -> card._set_param -- the ONE writer -- so Setting and Edit never drift.
-            display_specs = ([s for s in PANEL_PARAMS.get(card._param_kind(), ()) if s.display]
+            display_specs = ([s for s in _panel_display_decls(card.config.kind, card._param_kind()) if s.display]
                              + [_RELIM_PARAM] + list(card._repeat_param_specs()))
             self.ed_params = card._emit_param_rows(display_specs, col.addWidget, self._edit_param, disp_lw)
             self.ed_cmap = self.ed_params.get("cmap")        # named back-refs (kept for tests / clarity)
@@ -5455,7 +5480,7 @@ class PanelEditor(QtWidgets.QWidget):
         pin = params.get("view_xlim")
         if pin:
             view["view_xlim"] = [float(pin[0]), float(pin[1])]
-        for decl in PANEL_PARAMS.get(self.card._param_kind(), ()):
+        for decl in _panel_display_decls(self.card.config.kind, self.card._param_kind()):
             view[decl.key] = params.get(decl.key, decl.default)
         return view
 
