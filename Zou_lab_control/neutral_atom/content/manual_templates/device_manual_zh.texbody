@@ -544,6 +544,8 @@ finally:
 
 相机对更大系统唯一"知道"的事实是 \pyapi{capture\_trigger\_channels}——自己的触发输入接在序列器哪条线上——一个只向上暴露、从不用来控制序列器的被动布线事实。
 
+__CAMERA_GRABBER_FIG__
+
 \subsection{\pyapi{SequencerDevice}：时序器额外契约}
 
 \begin{description}

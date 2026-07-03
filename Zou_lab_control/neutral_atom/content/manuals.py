@@ -54,12 +54,88 @@ def _render_threshold_hist(path: Path) -> Path:
         return _device_placeholder_image(path, "阈值直方图（暗/亮双峰 + Otsu 阈值）")
 
 
+def _render_grabber_timing(path: Path) -> Path:
+    """Schematic of the arm-before-fire contract: three lanes (measurement / camera /
+    sequencer) on one timeline.  In-figure labels are English/code terms (Helvetica
+    Light carries no CJK glyphs); the Chinese teaching text is in the LaTeX caption."""
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
+
+        from Zou_lab_control.frontend import style as S
+        from Zou_lab_control.frontend.devtools import install_screenshot_font
+
+        install_screenshot_font()
+        S.apply_style()
+        ink, accent, faint, boxfc = "#222222", "#c0563f", "#8a8a8a", "#f0efec"
+
+        fig, ax = plt.subplots(figsize=(7.6, 3.4))
+        ax.set_xlim(0, 100)
+        ax.set_ylim(0, 30)
+        ax.axis("off")
+        for label, y in (("measurement\n(triggered_frames)", 23.5), ("camera\n(pure grabber)", 15.0),
+                         ("sequencer\n(pure streamer)", 6.5)):
+            ax.axhline(y, xmin=0.17, xmax=0.99, color=faint, lw=0.7, zorder=1)
+            ax.text(1.0, y, label, ha="left", va="center", fontsize=7.6, color=ink, linespacing=1.3)
+
+        def box(x, y, w, h, text, *, fc=boxfc, ec=ink, tc=ink, fs=7.5):
+            ax.add_patch(FancyBboxPatch((x, y - h / 2), w, h,
+                                        boxstyle="round,pad=0.15,rounding_size=0.6",
+                                        fc=fc, ec=ec, lw=1.0, zorder=3))
+            ax.text(x + w / 2, y, text, ha="center", va="center", fontsize=fs, color=tc, zorder=4)
+
+        def arrow(x0, y0, x1, y1, *, color=ink, style="-|>", lw=1.1, ls="-"):
+            ax.add_patch(FancyArrowPatch((x0, y0), (x1, y1), arrowstyle=style, mutation_scale=10,
+                                         color=color, lw=lw, ls=ls, zorder=5, shrinkA=0, shrinkB=0))
+
+        fx_all = [44, 55, 66, 77]
+        box(18, 23.5, 13, 4.2, "arm(N)", fc="#e8eef2")
+        box(75, 23.5, 20, 4.2, "read_frames(N)", fc="#e8eef2")
+        box(18, 15.0, 13, 3.6, "armed:\nwaiting", fc=boxfc, fs=6.8)
+        for i, fx in enumerate(fx_all):
+            box(fx, 15.0, 8.2, 3.2, f"frame {i + 1}", fc="#fbf3ee", ec=accent, tc=accent, fs=6.6)
+        box(31, 6.5, 14, 3.6, "prepare + fire", fc=boxfc, fs=6.8)
+        for fx in fx_all:
+            ax.plot([fx, fx], [5.1, 7.9], color=accent, lw=1.6, zorder=4)
+        ax.text(fx_all[0], 9.0, "trigger edges", ha="left", va="bottom", fontsize=6.2, color=accent)
+        arrow(24.5, 21.4, 21, 16.8, color=ink)
+        ax.text(16.5, 19.6, "arm() returns:\nhardware ready", ha="right", va="center",
+                fontsize=6.4, color=ink, linespacing=1.2)
+        arrow(24.5, 21.4, 31, 8.3, color=faint, style="-|>", ls=(0, (3, 2)))
+        ax.text(33, 11.4, "fire always\nafter arm", ha="left", va="center", fontsize=6.4,
+                color=faint, linespacing=1.2)
+        for fx in fx_all:
+            arrow(fx, 8.0, fx, 13.4, color=accent, lw=1.0)
+        arrow(fx_all[-1] + 5, 15.0, 69, 21.4, color=ink, style="-|>")
+        ax.text(71, 18.6, "lossless buffer:\na late read keeps every frame", ha="left",
+                va="center", fontsize=6.4, color=ink, linespacing=1.2)
+        ax.text(50, 1.4, "N frames  =  N trigger periods    "
+                "(triggered_frames repeats the base cycle to carry N edges)",
+                ha="center", va="center", fontsize=7.2, color=accent,
+                bbox=dict(boxstyle="round,pad=0.4", fc="#fbf3ee", ec=accent, lw=0.8))
+        arrow(17, 29.0, 99, 29.0, color=faint, lw=0.8)
+        ax.text(99, 29.0, "time", ha="right", va="bottom", fontsize=6.3, color=faint)
+
+        fig.savefig(path, bbox_inches="tight", dpi=150)
+        plt.close(fig)
+        return path
+    except Exception:  # pragma: no cover - keep the manual buildable
+        return _device_placeholder_image(path, "arm -> fire N edges -> read_frames（纯 grabber 时序）")
+
+
 def generate_device_manual_figures(asset_dir: str | Path) -> dict[str, Path]:
     """Render the device-manual figures (real tutorial output) into asset_dir."""
 
     asset_dir = Path(asset_dir)
     asset_dir.mkdir(parents=True, exist_ok=True)
-    return {"threshold_hist": _render_threshold_hist(asset_dir / "device_threshold_hist.png")}
+    return {
+        "threshold_hist": _render_threshold_hist(asset_dir / "device_threshold_hist.png"),
+        "grabber_timing": _render_grabber_timing(asset_dir / "device_grabber_timing.png"),
+    }
 
 
 def _threshold_figure_tex(fig_path: str) -> str:
@@ -73,6 +149,25 @@ def _threshold_figure_tex(fig_path: str) -> str:
     return (
         "\\begin{figure}[h]\n\\centering\n"
         f"\\includegraphics[width=0.6\\linewidth]{{{fig_path}}}\n"
+        f"\\caption{{{caption}}}\n"
+        "\\end{figure}"
+    )
+
+
+def _grabber_figure_tex(fig_path: str) -> str:
+    caption = (
+        "\\tfocus{纯 grabber 的 arm-before-fire 时序}（三泳道：measurement / camera / sequencer，"
+        "同一条时间轴）。相机先 \\pyapi{arm(N)}，\\tfocus{返回时硬件已就绪、等外触发}——所以 fire "
+        "\\tfocus{永远}发生在 arm 返回之后，第一个触发边沿绝不丢失。随后 measurement 层的 "
+        "\\pyapi{triggered\\_frames} 让序列器 \\pyapi{prepare + fire} 一段\\tfocus{携带 N 个触发边沿}"
+        "的程序（把成像基周期重复到 N 个边沿）：每个边沿门控一帧进相机\\tfocus{自有的无损缓冲}，"
+        "\\pyapi{read\\_frames(N)} 再把它们取走——即使先 fire、后取帧，缓冲也一帧不丢。一句话记住："
+        "\\tfocus{N 帧 = N 个触发周期}；相机从不驱动序列器，只按到达的边沿取帧（虚拟后端亦然，"
+        "只是把这根触发线也仿真了）。"
+    )
+    return (
+        "\\begin{figure}[h]\n\\centering\n"
+        f"\\includegraphics[width=0.92\\linewidth]{{{fig_path}}}\n"
         f"\\caption{{{caption}}}\n"
         "\\end{figure}"
     )
@@ -249,7 +344,10 @@ def device_manual_body(figures: Mapping[str, Path] | None = None) -> str:
     body = _template_text("device_manual_zh.texbody")
     fig_path = None if not figures else figures.get("threshold_hist")
     figure_tex = _threshold_figure_tex(Path(fig_path).as_posix()) if fig_path else ""
-    return body.replace("__READOUT_THRESHOLD_FIG__", figure_tex)
+    body = body.replace("__READOUT_THRESHOLD_FIG__", figure_tex)
+    grab_path = None if not figures else figures.get("grabber_timing")
+    grab_tex = _grabber_figure_tex(Path(grab_path).as_posix()) if grab_path else ""
+    return body.replace("__CAMERA_GRABBER_FIG__", grab_tex)
 
 
 __all__ = [
