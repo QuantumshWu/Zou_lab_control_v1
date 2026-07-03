@@ -127,6 +127,81 @@ def _render_grabber_timing(path: Path) -> Path:
         return _device_placeholder_image(path, "arm -> fire N edges -> read_frames（纯 grabber 时序）")
 
 
+def _render_trigger_cable(path: Path) -> Path:
+    """Virtual==real parity: the measurement/analysis stack is ONE object over both a real
+    (sequencer --copper trigger line--> camera) and a virtual (VirtualSequencer --fire notify /
+    firing pull--> VirtualCamera, config \"$device:sequencer\") bottom layer.  English labels;
+    Chinese teaching in the LaTeX caption."""
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
+
+        from Zou_lab_control.frontend import style as S
+        from Zou_lab_control.frontend.devtools import install_screenshot_font
+
+        install_screenshot_font()
+        S.apply_style()
+        ink, accent, faint, boxfc = "#222222", "#c0563f", "#8a8a8a", "#f0efec"
+
+        fig, ax = plt.subplots(figsize=(7.6, 3.6))
+        ax.set_xlim(0, 100)
+        ax.set_ylim(0, 34)
+        ax.axis("off")
+
+        def box(x, y, w, h, text, *, fc=boxfc, ec=ink, tc=ink, fs=7.2):
+            ax.add_patch(FancyBboxPatch((x - w / 2, y - h / 2), w, h,
+                                        boxstyle="round,pad=0.15,rounding_size=0.6",
+                                        fc=fc, ec=ec, lw=1.0, zorder=3))
+            ax.text(x, y, text, ha="center", va="center", fontsize=fs, color=tc, zorder=4, linespacing=1.2)
+
+        def arrow(x0, y0, x1, y1, *, color=ink, style="-|>", lw=1.2, ls="-"):
+            ax.add_patch(FancyArrowPatch((x0, y0), (x1, y1), arrowstyle=style, mutation_scale=11,
+                                         color=color, lw=lw, ls=ls, zorder=5, shrinkA=1, shrinkB=1))
+
+        ax.add_patch(FancyBboxPatch((14, 27.0), 72, 5.0, boxstyle="round,pad=0.2,rounding_size=0.8",
+                                    fc="#eef2f4", ec=ink, lw=1.1, zorder=2))
+        ax.text(50, 29.5, "measurement / analysis  (session, subsystems, operations)\n"
+                "-- identical object, same triggered_frames path in both --",
+                ha="center", va="center", fontsize=7.2, color=ink, linespacing=1.35)
+        ax.text(28, 24.0, "REAL hardware", ha="center", va="center", fontsize=7.8, color=ink, weight="bold")
+        ax.text(74, 24.0, "VIRTUAL (only the bottom layer is faked)", ha="center", va="center",
+                fontsize=7.8, color=accent, weight="bold")
+        ax.axvline(51, ymin=0.03, ymax=0.68, color=faint, lw=0.7, ls=(0, (2, 3)))
+
+        box(16, 15.5, 17, 4.4, "SequencerDevice\n(FPGA streamer)")
+        box(40, 15.5, 15, 4.4, "CameraDevice\n(qCMOS / Basler)")
+        arrow(24.6, 15.5, 32.4, 15.5, color=accent, lw=1.6)
+        ax.text(28.5, 17.3, "copper\ntrigger line", ha="center", va="bottom", fontsize=6.2,
+                color=accent, linespacing=1.1)
+        arrow(16, 26.9, 16, 17.8, color=faint, style="<->", lw=0.9)
+        arrow(40, 26.9, 40, 17.8, color=faint, style="<->", lw=0.9)
+
+        box(63, 15.5, 17, 4.4, "VirtualSequencer")
+        box(87, 15.5, 15, 4.4, "VirtualCamera")
+        arrow(71.6, 16.6, 79.4, 16.6, color=accent, lw=1.4)
+        ax.text(75.5, 18.2, "fire notify /\nfiring pull", ha="center", va="bottom", fontsize=6.2,
+                color=accent, linespacing=1.1)
+        ax.text(75.5, 12.6, '(config: "$device:sequencer")', ha="center", va="top", fontsize=6.0, color=faint)
+        arrow(63, 26.9, 63, 17.8, color=faint, style="<->", lw=0.9)
+        arrow(87, 26.9, 87, 17.8, color=faint, style="<->", lw=0.9)
+
+        ax.text(50, 5.2, "The camera images the atoms the sequencer's edges gate -- it never drives the "
+                "sequencer.\nThe virtual camera renders exactly the edges the fired program carries "
+                "(armed only) -- an unarmed camera misses them, like hardware.",
+                ha="center", va="center", fontsize=6.9, color=ink, linespacing=1.4,
+                bbox=dict(boxstyle="round,pad=0.5", fc="#fbf3ee", ec=accent, lw=0.8))
+
+        fig.savefig(path, bbox_inches="tight", dpi=150)
+        plt.close(fig)
+        return path
+    except Exception:  # pragma: no cover - keep the manual buildable
+        return _device_placeholder_image(path, "虚拟触发电缆:真机铜线 vs 虚拟 fire 通知(上层同栈)")
+
+
 def generate_device_manual_figures(asset_dir: str | Path) -> dict[str, Path]:
     """Render the device-manual figures (real tutorial output) into asset_dir."""
 
@@ -135,6 +210,7 @@ def generate_device_manual_figures(asset_dir: str | Path) -> dict[str, Path]:
     return {
         "threshold_hist": _render_threshold_hist(asset_dir / "device_threshold_hist.png"),
         "grabber_timing": _render_grabber_timing(asset_dir / "device_grabber_timing.png"),
+        "trigger_cable": _render_trigger_cable(asset_dir / "device_trigger_cable.png"),
     }
 
 
@@ -164,6 +240,24 @@ def _grabber_figure_tex(fig_path: str) -> str:
         "\\pyapi{read\\_frames(N)} 再把它们取走——即使先 fire、后取帧，缓冲也一帧不丢。一句话记住："
         "\\tfocus{N 帧 = N 个触发周期}；相机从不驱动序列器，只按到达的边沿取帧（虚拟后端亦然，"
         "只是把这根触发线也仿真了）。"
+    )
+    return (
+        "\\begin{figure}[h]\n\\centering\n"
+        f"\\includegraphics[width=0.92\\linewidth]{{{fig_path}}}\n"
+        f"\\caption{{{caption}}}\n"
+        "\\end{figure}"
+    )
+
+
+def _cable_figure_tex(fig_path: str) -> str:
+    caption = (
+        "\\tfocus{虚拟 == 实机：只有最底层被仿真}。上方的 measurement / analysis 栈（session / "
+        "subsystems / operations，含唯一编排 \\pyapi{triggered\\_frames}）在真机与虚拟下是\\tfocus{同一个对象、"
+        "走同一条代码路径}。真机里序列器用一根\\tfocus{铜触发线}接到相机；虚拟里 \\pyapi{VirtualSequencer} 的 "
+        "fire 通知 / firing 拉取这根\\tfocus{被仿真的触发线}驱动 \\pyapi{VirtualCamera}（config 用 "
+        "\\pyapi{\"\\$device:sequencer\"} 接线）。两边相机都\\tfocus{只按到达的触发边沿成像、从不驱动序列器}；"
+        "虚拟相机严格按 fired 程序在其触发线上\\tfocus{真实携带}的边沿数渲染帧，\\tfocus{未武装就漏掉边沿}——"
+        "和真机一模一样。所以换真机只改 \\pyapi{connect()}，上面一行分析代码都不用动。"
     )
     return (
         "\\begin{figure}[h]\n\\centering\n"
@@ -347,7 +441,10 @@ def device_manual_body(figures: Mapping[str, Path] | None = None) -> str:
     body = body.replace("__READOUT_THRESHOLD_FIG__", figure_tex)
     grab_path = None if not figures else figures.get("grabber_timing")
     grab_tex = _grabber_figure_tex(Path(grab_path).as_posix()) if grab_path else ""
-    return body.replace("__CAMERA_GRABBER_FIG__", grab_tex)
+    body = body.replace("__CAMERA_GRABBER_FIG__", grab_tex)
+    cable_path = None if not figures else figures.get("trigger_cable")
+    cable_tex = _cable_figure_tex(Path(cable_path).as_posix()) if cable_path else ""
+    return body.replace("__CAMERA_CABLE_FIG__", cable_tex)
 
 
 __all__ = [

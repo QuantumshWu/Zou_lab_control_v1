@@ -279,6 +279,8 @@ scan = exp.readout.detection_time(times=[5e-6, 2e-5, 1e-4], shots=60, live=True)
 \chapter{离线虚拟后端}
 \pyapi{na.connect("virtual")} 给你一套完全离线的 \pyapi{VirtualCamera + VirtualSequencer + VirtualTrapArray}。它对写实验逻辑、回归测试、教学非常有用：整条 sitemap/thresholds/detect/scan 链路都能跑，不接任何硬件。\pyapi{VirtualTrapArray} 可设 \pyapi{occupancy}、\pyapi{reload()} 重新随机装载、\pyapi{render_image()} 出图。本仓库的大量测试就跑在虚拟后端上。
 
+__CAMERA_CABLE_FIG__
+
 \chapter{设备配置与加载（深入）}
 
 本章是给"从零开始"理解本系统设备层的人写的一份参考手册。它回答四个核心问题：一份\tfocus{设备配置}长什么样、\pyapi{load_devices} 与 \pyapi{DeviceSet} 如何把配置变成可用的设备对象、所有设备共同遵守的\tfocus{契约}（contract）是什么、以及在五个时序器（sequencer）类之间如何取舍。每一节都尽量给出可直接运行的代码片段，并标注常见错误。
