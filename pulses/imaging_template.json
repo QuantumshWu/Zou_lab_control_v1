@@ -30,7 +30,7 @@
       "unit": "s"
     }
   ],
-  "time_step_ns": 1.0,
+  "time_step_ns": 20.0,
   "periods": [
     {
       "duration": 0.002,

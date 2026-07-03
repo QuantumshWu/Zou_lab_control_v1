@@ -1,218 +1,204 @@
 {
- "schema": "Zou_lab_control.neutral_atom.PulseTableState",
- "version": 3,
- "name": "mot_field_scan",
- "channels": [
-  "mot_trigger",
-  "dx0",
-  "dx1",
-  "dx2",
-  "dx3",
-  "dx4",
-  "dx5",
-  "dy0",
-  "dy1",
-  "dy2",
-  "dy3",
-  "dy4",
-  "dy5",
-  "dz0",
-  "dz1",
-  "dz2",
-  "dz3",
-  "dz4",
-  "dz5"
- ],
- "scan_slots": [],
- "scan_table": [],
- "api_slots": [
-  {
-   "name": "a1",
-   "kind": "dac",
-   "target": "da_x@0",
-   "unit": "ns"
-  },
-  {
-   "name": "a2",
-   "kind": "dac",
-   "target": "da_y@0",
-   "unit": "ns"
-  },
-  {
-   "name": "a3",
-   "kind": "dac",
-   "target": "da_z@0",
-   "unit": "ns"
-  }
- ],
- "time_step_ns": 1.0,
- "periods": [
-  {
-   "duration": 1000000.0,
-   "unit": "ns",
-   "name": "settle",
-   "states": [
-    1,
-    0,
-    0,
-    0,
-    0,
-    0,
-    1,
-    0,
-    0,
-    0,
-    0,
-    0,
-    1,
-    0,
-    0,
-    0,
-    0,
-    0,
-    1
-   ]
-  },
-  {
-   "duration": 1000,
-   "unit": "ns",
-   "name": "",
-   "states": [
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    1,
-    0,
-    0,
-    0,
-    0,
-    0,
-    1,
-    0,
-    0,
-    0,
-    0,
-    0,
-    1
-   ]
-  },
-  {
-   "duration": 5000000.0,
-   "unit": "ns",
-   "name": "expose",
-   "states": [
-    1,
-    0,
-    0,
-    0,
-    0,
-    0,
-    1,
-    0,
-    0,
-    0,
-    0,
-    0,
-    1,
-    0,
-    0,
-    0,
-    0,
-    0,
-    1
-   ]
-  }
- ],
- "visible_channels": [
-  "mot_trigger",
-  "dx0",
-  "dx1",
-  "dx2",
-  "dx3",
-  "dx4",
-  "dx5",
-  "dy0"
- ],
- "channel_labels": {},
- "analog_buses": {
-  "da_x": [
-   "dx0",
-   "dx1",
-   "dx2",
-   "dx3",
-   "dx4",
-   "dx5"
+  "schema": "Zou_lab_control.neutral_atom.PulseTableState",
+  "version": 3,
+  "name": "mot_field_scan",
+  "channels": [
+    "mot_trigger",
+    "dx0",
+    "dx1",
+    "dx2",
+    "dx3",
+    "dx4",
+    "dx5",
+    "dy0",
+    "dy1",
+    "dy2",
+    "dy3",
+    "dy4",
+    "dy5",
+    "dz0",
+    "dz1",
+    "dz2",
+    "dz3",
+    "dz4",
+    "dz5"
   ],
-  "da_y": [
-   "dy0",
-   "dy1",
-   "dy2",
-   "dy3",
-   "dy4",
-   "dy5"
+  "scan_slots": [],
+  "scan_table": [],
+  "api_slots": [
+    {
+      "name": "a1",
+      "kind": "dac",
+      "target": "da_x@0",
+      "unit": "ns"
+    },
+    {
+      "name": "a2",
+      "kind": "dac",
+      "target": "da_y@0",
+      "unit": "ns"
+    },
+    {
+      "name": "a3",
+      "kind": "dac",
+      "target": "da_z@0",
+      "unit": "ns"
+    }
   ],
-  "da_z": [
-   "dz0",
-   "dz1",
-   "dz2",
-   "dz3",
-   "dz4",
-   "dz5"
-  ]
- },
- "analog_bus_modes": {
-  "da_x": [
-   {
-    "mode": "edge",
-    "value": 0
-   },
-   {
-    "mode": "hold",
-    "value": null
-   },
-   {
-    "mode": "hold",
-    "value": null
-   }
+  "time_step_ns": 20.0,
+  "periods": [
+    {
+      "duration": "1000000000",
+      "unit": "ns",
+      "name": "settle",
+      "states": [
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "duration": "100000",
+      "unit": "ns",
+      "name": "",
+      "states": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "duration": "500000000",
+      "unit": "ns",
+      "name": "expose",
+      "states": [
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    }
   ],
-  "da_y": [
-   {
-    "mode": "edge",
-    "value": 0
-   },
-   {
-    "mode": "hold",
-    "value": null
-   },
-   {
-    "mode": "hold",
-    "value": null
-   }
+  "visible_channels": [
+    "mot_trigger",
+    "dx0",
+    "dx1",
+    "dx2",
+    "dx3",
+    "dx4",
+    "dx5",
+    "dy0"
   ],
-  "da_z": [
-   {
-    "mode": "edge",
-    "value": 0
-   },
-   {
-    "mode": "hold",
-    "value": null
-   },
-   {
-    "mode": "hold",
-    "value": null
-   }
-  ]
- },
- "delays": {},
- "delay_units": {},
- "repeat_start": null,
- "repeat_end": null,
- "repeat_count": 1,
- "repeat_forever": true,
- "scan_repeats": 0,
- "clk_channels": []
+  "channel_labels": {},
+  "analog_buses": {
+    "da_x": [
+      "dx0",
+      "dx1",
+      "dx2",
+      "dx3",
+      "dx4",
+      "dx5"
+    ],
+    "da_y": [
+      "dy0",
+      "dy1",
+      "dy2",
+      "dy3",
+      "dy4",
+      "dy5"
+    ],
+    "da_z": [
+      "dz0",
+      "dz1",
+      "dz2",
+      "dz3",
+      "dz4",
+      "dz5"
+    ]
+  },
+  "analog_bus_modes": {
+    "da_x": [
+      {
+        "mode": "edge",
+        "value": 0
+      },
+      {
+        "mode": "hold",
+        "value": null
+      },
+      {
+        "mode": "hold",
+        "value": null
+      }
+    ],
+    "da_y": [
+      {
+        "mode": "edge",
+        "value": 0
+      },
+      {
+        "mode": "hold",
+        "value": null
+      },
+      {
+        "mode": "hold",
+        "value": null
+      }
+    ]
+  },
+  "delays": {},
+  "delay_units": {},
+  "repeat_start": null,
+  "repeat_end": null,
+  "repeat_count": 1,
+  "repeat_forever": true,
+  "scan_repeats": 0,
+  "clk_channels": []
 }

@@ -338,6 +338,17 @@ def fill_grouped_signal_combo(combo, *, names, sources, formats, current, none_l
     visible label is indented.  Shared by the plot panel's slot picker and the logic-node
     source field, so the nested picker is identical everywhere."""
     cur = str(current or "")
+    # A configured input may NAME a signal that is declared but not published yet -- a node's own future
+    # output (a pulse-scan reading its own ``frame_0``), or a not-yet-started producer's signal.  The
+    # binding is by NAME, resolved at RUN time, so keep such a name in the pool: BOTH the tree and the
+    # flat picker then render it as a "waiting" leaf AND read it back.  Single-sources the docstring's
+    # "kept selectable" promise across both branches -- the tree branch used to drop a not-listed name,
+    # so ``read_editable_combo`` returned '' and the configured input vanished (e.g. a Start that then
+    # built the node with an empty y-expression input -> every point NaN).  ``signal_state`` renders the
+    # added name honestly as "waiting" (it has no live shape in ``formats``).
+    names = list(names or [])
+    if cur and cur not in {str(n) for n in names}:
+        names = [*names, cur]
     if isinstance(combo, FluentTreeComboBox):
         # The collapsible-tree picker (G2): one expandable producer group, leaves = signals.
         with _signals_blocked(combo):
@@ -349,7 +360,6 @@ def fill_grouped_signal_combo(combo, *, names, sources, formats, current, none_l
         if none_label is not None:
             combo.addItem(none_label, "")
         items = grouped_signal_items(names, sources, formats, labels)
-        have = {bare for _, bare in items if bare}
         for label, name in items:
             if name is None:                      # group header: visible but not selectable
                 combo.addItem(label, None)
@@ -359,8 +369,6 @@ def fill_grouped_signal_combo(combo, *, names, sources, formats, current, none_l
                     font = item.font(); font.setBold(True); item.setFont(font)
                 continue
             combo.addItem(label, name)            # indented signal; data is the bare name
-        if cur and cur not in have:               # preserve a still-waiting (not yet published) name
-            combo.addItem(f"{cur}  waiting", cur)
         idx = combo.findData(cur)
         # No match: select the leading none-row if there is one, else leave it BLANK (index -1)
         # -- never auto-land on a disabled group HEADER (data None), whose label would otherwise
