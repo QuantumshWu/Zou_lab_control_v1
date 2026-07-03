@@ -1412,7 +1412,8 @@ for the decoupled `"pulse_scan"` tier, else a `ScannedMeasurementNode` (the coup
 temperature/fidelity tier reduces inline over a loading's frames). The console's `_build_logic_node`
 just calls `spec.make_node(...)` — it never imports a concrete na node class to pick one by the
 metadata string. Pulse-scan
-images ONCE per point (`camera.acquire(1)`) — it is decoupled from the camera's exposure/averaging,
+images ONCE per point (`triggered_frames(camera, sequencer, sequence, 1)`, the single arm-fire-read
+helper — no hand-rolled `camera.acquire`) — it is decoupled from the camera's exposure/averaging,
 so there is no frame-count knob; the params are `template` + `pulse_slots` (api fixed/sweep + scan
 program + extra settle) + `y` (signal_expr) + `y_name` (the output signal name).
 

@@ -672,6 +672,18 @@ class _TriggerWiredCamera(CameraDevice):
         if wanted <= 0:
             return
         self._deliver(self._render_frames(sequence, int(wanted)))
+        # REAL-TIME pacing of the FINITE readout: on real hardware read_frames() blocks until the
+        # triggered exposures have been read out, which takes ~= the fired sequence's play duration
+        # (the FPGA plays the pulse in real time, the camera exposes/reads out per trigger edge).
+        # Stamp when that readout would COMPLETE so read_frames() below blocks the same wall-clock --
+        # so a LONGER pulse template genuinely slows each shot (and the whole scan), the device-layer
+        # mirror of the qCMOS wait_capevent block.  Single-sourced with _pace / wait_done / the scan
+        # base_dt: per-shot wall-clock = duration * sleep_scale, so sleep_scale=0 (pytest) stamps
+        # nothing and the suite stays instant.
+        pace = float(getattr(sequence, "duration", 0.0)) * self.sleep_scale
+        if pace > 0.0:
+            with state["cond"]:
+                state["_finite_pace_until"] = time.monotonic() + pace
 
     def _grab(self, n: int, *, timeout: float | None = None, stop=None) -> bool:
         # The wire is authoritative about trigger edges: an idle (or absent) wire means no
@@ -687,6 +699,25 @@ class _TriggerWiredCamera(CameraDevice):
         self._deliver(frames)
         self._pace(firing, stop)
         return True
+
+    def read_frames(self, n: int = 1, *, timeout: float | None = None, stop=None, **kwargs) -> list[np.ndarray]:
+        """Drain the armed frames, THEN block the fired sequence's remaining play time -- the
+        device-layer mirror of a real externally-triggered sensor whose read blocks until the
+        exposures the trigger burst gated have been read out.  The finite frames were pushed at
+        fire (lossless, unchanged); the deadline stamped there (``_finite_pace_until``) makes the
+        read consume ``duration * sleep_scale``, so a longer pulse template really slows each shot
+        (virtual == real).  ``sleep_scale=0`` (pytest) stamps no deadline, so tests stay instant;
+        ``stop`` cancels the wall-clock wait cooperatively.  The continuous live path sets no
+        deadline (repeat_forever is paced per frame in :meth:`_grab`), so it is untouched."""
+        out = super().read_frames(n, timeout=timeout, stop=stop, **kwargs)
+        state = self._recent_state()
+        with state["cond"]:
+            until = state.pop("_finite_pace_until", None)   # pop unconditionally: never leak a stale deadline
+        if out and until is not None:
+            wall = until - time.monotonic()
+            if wall > 0.0:
+                stop.wait(wall) if stop is not None else time.sleep(wall)
+        return out
 
 
 class VirtualCamera(_TriggerWiredCamera):

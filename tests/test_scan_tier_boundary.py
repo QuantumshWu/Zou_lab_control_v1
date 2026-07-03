@@ -5,8 +5,9 @@ every scan sweeps one or more NAMED pulse slots and reduces each point (MAINTAIN
 temperature / detection-time already share the ONE slot-scan spine (`_build_slot_scan`).  But there are
 two TIERS by WHERE the per-point reduce lives, and the boundary between them is physics, not taste:
 
-* DECOUPLED tier (`PulseScanNode`): per-point acquisition is ``camera.acquire(1)`` -- ONE camera
-  trigger, ONE frame -- and y is a SINGLE-frame ``signal_expr`` read off another node.
+* DECOUPLED tier (`PulseScanNode`): per-point acquisition fires ONE frame through the single
+  arm-fire-read helper ``triggered_frames(camera, sequencer, sequence, 1)`` -- ONE camera trigger,
+  ONE frame -- and y is a SINGLE-frame ``signal_expr`` read off another node.
 * COUPLED tier (`ScannedMeasurement` + inline reducer): release-recapture survival needs EXACTLY two
   frames from ONE atom loading (a 2-trigger sequence, trap-off between the triggers), and Otsu fidelity
   needs the per-point frame SET.  Neither can be a single published frame.
@@ -51,20 +52,27 @@ def test_one_trigger_imaging_is_a_single_capture_edge():
     assert na.count_trigger_pulses(img) == 1
 
 
-def test_decoupled_pulse_scan_per_point_acquisition_is_acquire_one():
-    """The decoupled tier's per-point acquisition is acquire(1): `PulseScanNode` images ONCE per scan
-    point, then y is a single-frame signal_expr off another node.  Pin the one-frame contract -- the
-    structural reason survival / fidelity (which need >=2 frames from ONE loading, or the per-point
-    frame SET) cannot live in this tier.  A refactor that made pulse-scan multi-frame -- the exact
-    encroachment on the coupled physics -- changes this line and must reckon with the boundary here."""
+def test_decoupled_pulse_scan_per_point_acquisition_is_one_frame():
+    """The decoupled tier images ONCE per scan point: `PulseScanNode` fires ONE camera trigger
+    through the single arm-fire-read helper ``triggered_frames(camera, sequencer, sequence, 1)`` (the
+    camera/sequencer decouple routes ALL readout through that one seam -- no hand-rolled
+    ``camera.acquire``), then y is a single-frame signal_expr off another node.  Pin the one-frame
+    contract -- the structural reason survival / fidelity (which need >=2 frames from ONE loading, or
+    the per-point frame SET) cannot live in this tier.  A refactor that made pulse-scan multi-frame --
+    the exact encroachment on the coupled physics -- changes the frame count and must reckon here."""
+    import re
     from Zou_lab_control.neutral_atom.operations import logic as logic_mod
 
-    # Normalise whitespace so the contract holds regardless of how the acquire() call is wrapped
-    # across lines (the camera contract is acquire(frames, ...) -- frames=1 is the first positional).
+    # Normalise whitespace so the contract holds regardless of how the call is wrapped across lines,
+    # then read the FRAME COUNT out of the one arm-fire-read helper: triggered_frames(camera,
+    # sequencer, sequence, FRAMES, ...) -- its 4th positional argument is the frame count, pinned to 1.
     node_src = " ".join(inspect.getsource(logic_mod.PulseScanNode).split())
-    assert "camera.acquire( 1," in node_src or "camera.acquire(1," in node_src, (
-        "decoupled PulseScanNode must acquire exactly ONE frame per scan point; a multi-frame "
-        "acquisition would encroach on the coupled survival/fidelity tier (see MAINTAINER_NOTES §19).")
+    assert "triggered_frames(" in node_src, (
+        "decoupled PulseScanNode must read through the single arm-fire-read helper triggered_frames().")
+    m = re.search(r"triggered_frames\(\s*[^,]+,\s*[^,]+,\s*[^,]+,\s*(\d+)", node_src)
+    assert m is not None and m.group(1) == "1", (
+        "decoupled PulseScanNode must fire exactly ONE frame per scan point; a multi-frame acquisition "
+        "would encroach on the coupled survival/fidelity tier (see MAINTAINER_NOTES §19).")
 
 
 def test_temperature_and_detection_share_the_one_slot_scan_spine():
