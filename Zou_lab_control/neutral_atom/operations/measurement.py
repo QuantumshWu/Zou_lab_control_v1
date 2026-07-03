@@ -193,6 +193,30 @@ class ParamDecl:
         object.__setattr__(self, "choices", tuple(self.choices))
 
 
+def device_param(role, device_set, *, key: str | None = None, label: str | None = None,
+                 tooltip: str | None = None) -> "ParamDecl":
+    """The ONE source for a device-selection control on ANY measurement/task form: a ``choice``
+    ``ParamDecl`` whose choices are the devices of ``role``'s type in ``device_set`` and whose
+    default is the conventional device for that role.  Every spec that uses a device declares its
+    role via this -- never a hand-rolled ``choices=s.devices.camera_names()`` and never a hardcoded
+    ``s.devices.camera`` -- so a measurement runs on ANY device of the right type by picking it in
+    the GUI, and a NEW device domain (an RF source, a DAQ, ...) needs no edit here or in any spec.
+
+    ``role`` is a :class:`~..devices.registry.DeviceDomain` or its key string (``"camera"`` /
+    ``"sequencer"`` / a registered ``"rf"``); ``key`` overrides the param key when a spec binds two
+    devices of the SAME domain (e.g. ``pump_camera`` and ``probe_camera``)."""
+    from ..devices.registry import DEVICE_DOMAINS
+
+    domain = role if hasattr(role, "base_type") else DEVICE_DOMAINS[str(role)]
+    names = device_set.device_names(domain.base_type)
+    default = (device_set.default_device_name(domain.base_type, conventional=domain.key)
+               if names else None)
+    return ParamDecl(
+        key=str(key or domain.key), label=str(label or domain.label), kind="choice",
+        choices=names, default=default,
+        tooltip=str(tooltip or f"Which {domain.label.lower()} this node uses."))
+
+
 def measurement_slug(name: str) -> str:
     """Canonical machine token for a measurement, derived from its display ``name``
     (lower-case, non-alphanumeric runs -> single ``_``, trimmed).  ONE source: the
