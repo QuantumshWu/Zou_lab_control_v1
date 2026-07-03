@@ -1148,14 +1148,43 @@ Both are pinned by `tests/test_scan_slot_and_manual_parity.py`.
   `collect_values()` lost the input → `_start_logic_node` built a node with an EMPTY y-expression → every
   scan point NaN → an empty grid on Start (looked like an async/daemon race; it was the picker dropping the
   input). One rule for both branches — the flat branch's old special-case is gone.
-- **A fireable pulse template authors on the HARDWARE clock grid.** `_resolve_probe_template` forces
-  `time_step_ns = 1e9 / DEFAULT_CLOCK_HZ` (= 20 ns) after loading, single-sourced from the streamer clock —
-  NOT whatever a saved file under the (gitignored) `pulses/` folder carried. A finer authoring grid (an old
+- **A fireable pulse template authors on the connected board's clock grid (resolution comes FROM the
+  device).** `_resolve_probe_template(template, sequencer=...)` forces `time_step_ns = _hardware_tick_ns(seqr)`
+  after loading — the tick is read off the CONNECTED sequencer's `clock_hz` (a `SequencerDevice` property the
+  real `RemoteSequencer` reads back from the FPGA on connect, and the `VirtualSequencer` carries), exactly as
+  confocal reads a device's resolution off the device, NOT a constant baked into this module and NOT whatever
+  a saved file under the (gitignored) `pulses/` folder carried. Only when NO device is in scope (a GUI template
+  preview) does it fall back to the streamer-config default `DEFAULT_CLOCK_HZ`. A finer authoring grid (an old
   save with `time_step_ns = 1`) lets an api/scan DURATION sweep produce sub-tick durations (`np.linspace` →
-  5.95 ns …) that `set_api` snaps to the template grid but that still fail the 50 MHz grid validation → the
-  sweep cannot fire ("api slot does not work"). Snapping the grid at load makes **author == snap == fire**
-  for every template, so both the software api sweep (`SCAN_MODE_API`) and the hardware scan table
-  (`SCAN_MODE_SCAN`) of a duration slot always produce a fireable sequence.
+  5.95 ns …) that `set_api` snaps to the template grid but that still fail the clock-grid validation → the
+  sweep cannot fire ("api slot does not work"). Snapping to the board's tick at load makes **author == snap ==
+  fire** for every template on whatever clock the connected board reports, so both the software api sweep
+  (`SCAN_MODE_API`) and the hardware scan table (`SCAN_MODE_SCAN`) of a duration slot always fire.
+  Callers with a device in scope (`pulse_scan.build` → `s.devices.sequencer`, `mot_field.run` →
+  `self.sequencer`) pass it; the tick is pinned by `tests/test_scan_slot_and_manual_parity.py`.
+
+### A task's mid-run panel is DECLARED, sized and coloured from single sources (no console special-case)
+
+The four fixes below all trace to ONE lesson: a task's mid-run visualization must be built by the SAME path,
+with the SAME single sources, a user's manually-composed panel uses — never a bespoke branch with magic numbers.
+
+- **Declared, not hand-assembled.** `_set_task_running` no longer hand-builds a grid PanelConfig inline. A task
+  declares only DATA — its spec's `default_kind`/`mid_run_key` and (for a scanning task) `node.grid_shape` (a
+  plain tuple; `neutral_atom/**` never imports `frontend`) — and `_task_mid_run_config(spec, node)` maps that to
+  an ordinary `PanelConfig` fed to the SAME `_new_panel_card` that manual Add-Panel and save/load use. A scanning
+  task (`default_kind="grid"` + a ≥2-D grid_shape) faceting its LAST scan axis is the only special shape; its
+  `sub_plot_kind` auto-derives (`_resolved_sub_kind` → `default_sub_plot_kind`), not hand-set.
+- **Size from the ONE recommendation rule.** The panel's `size` is `recommended_grid_size(n_cells)`
+  (`live.py`: `optimal_grid_size(*grid_shape_for(n_cells, max_cols=_SITE_MAX_COLS))` — the SAME rule `GridPlot`
+  uses), never a magic constant. A 3-cell MOT grid opens `2x2`, not the old hardcoded `4x4`.
+- **cmap: render == Setting, one source.** A panel's default colormap has ONE home: `PANEL_PARAMS[kind].default`
+  now REFERENCES `PALETTE["cmap_scan"]`/`["cmap_camera"]` (not a `"inferno"`/`"gray"` literal), so `PALETTE` is
+  the single colour source. The live facet grid (`_build_facet_plotter`) resolves its cmap through the ONE
+  `_resolved_cmap(sub, params)` (operator's pick ELSE the kind default) — the SAME resolver the Setting popup,
+  the standalone 2-D panel and the save state use — so a grid whose params carry no explicit cmap draws with the
+  SAME default the Setting shows. (Before: the grid fell through to `ImageCell`'s own grey default while the
+  Setting said inferno — the render-vs-Setting divergence.) The na-side calibration report (`build_grid_figure`)
+  keeps its camera-crop grey default; that is a different, device-frame path, correctly separate.
 
 ### Repeat is a measurement param; repeat_mode is a plot param (the data model)
 
