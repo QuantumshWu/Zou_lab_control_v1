@@ -28,6 +28,47 @@ BUILTIN_DEVICE_CLASS_PATHS = {
 DEVICE_CLASSES: dict[str, type | str] = dict(BUILTIN_DEVICE_CLASS_PATHS)
 
 
+@dataclass(frozen=True)
+class DeviceDomain:
+    """One ROLE-TYPE of device (camera, sequencer, trap array, and future RF source / DAQ / ...).
+
+    The single source that makes device SELECTION and the device-manager GUI fully type-generic:
+    nothing names a concrete type like ``"camera"`` -- every measurement/task role and every GUI
+    section iterates :data:`DEVICE_DOMAINS`, so adding an RF source is ONE
+    :func:`register_device_domain` call and every selection dropdown + the device manager pick it
+    up with no edits to specs or the GUI."""
+
+    key: str            # the conventional config role name ("camera", "sequencer")
+    base_type: type     # the domain base class every device of this role subclasses
+    label: str          # human label for a GUI section ("Camera", "Sequencer")
+
+
+#: The registered device role-types -- the ONE list device selection + the device manager read.
+DEVICE_DOMAINS: dict[str, DeviceDomain] = {}
+
+
+def register_device_domain(key: str, base_type: type, label: str | None = None) -> None:
+    """Register a device ROLE-TYPE so selection dropdowns + the device manager list it.  Built-ins
+    are camera / sequencer / trap_array; a lab adding an RF source registers ``RFSourceDevice`` here
+    and every measurement/GUI picks it up automatically (no camera-special code anywhere)."""
+    if not str(key).strip():
+        raise ValueError("device domain key must not be empty.")
+    if not isinstance(base_type, type):
+        raise TypeError("device domain base_type must be a class.")
+    DEVICE_DOMAINS[str(key)] = DeviceDomain(
+        str(key), base_type, str(label or str(key).replace("_", " ").title()))
+
+
+def device_domains() -> tuple["DeviceDomain", ...]:
+    """The registered device role-types, sorted by key -- the ONE sequence the GUI + specs iterate."""
+    return tuple(DEVICE_DOMAINS[k] for k in sorted(DEVICE_DOMAINS))
+
+
+register_device_domain("camera", CameraDevice, "Camera")
+register_device_domain("sequencer", SequencerDevice, "Sequencer")
+register_device_domain("trap_array", TrapArrayDevice, "Trap array")
+
+
 @dataclass
 class DeviceSet:
     """Attribute-access container returned by ``load_devices``."""
@@ -59,24 +100,35 @@ class DeviceSet:
     def __getitem__(self, name: str):
         return self.devices[name]
 
-    def camera_names(self) -> tuple[str, ...]:
-        """Every camera in the set, sorted by name -- THE source for any "which camera?"
-        choice (a measurement's ``camera`` ParamDecl, a sweep's frame grabber).  Empty when
-        the config has no camera at all -- callers decide what a camera-less setup means
+    def device_names(self, base_type: type) -> tuple[str, ...]:
+        """Every device of a given ROLE TYPE in the set, sorted by name -- THE source for any
+        "which <role>?" choice (a measurement's ``camera`` / ``sequencer`` ParamDecl).  One
+        role-agnostic reader so camera, sequencer, trap-array (and any future role) answer the
+        same way.  Empty when the config has no such device -- callers decide what that means
         (hide the panel / raise with guidance), never a fabricated placeholder name."""
         return tuple(sorted(name for name, dev in self.devices.items()
-                            if isinstance(dev, CameraDevice)))
+                            if isinstance(dev, base_type)))
+
+    def default_device_name(self, base_type: type, conventional: str | None = None) -> str:
+        """The device a spec binds to a role when the operator names none: the CONVENTIONAL role
+        name (e.g. ``"camera"`` / ``"sequencer"``) when present, else the only/first device of that
+        type.  Raises with guidance when the config has no device of the role at all."""
+        names = self.device_names(base_type)
+        if not names:
+            role = conventional or base_type.__name__      # the human role word ("camera") if known
+            raise AttributeError(
+                f"this device config has no {role} -- add one (e.g. via na.discover_devices(); "
+                "each found device's row carries a ready config entry).")
+        return conventional if (conventional and conventional in names) else names[0]
+
+    def camera_names(self) -> tuple[str, ...]:
+        """Every camera in the set (thin wrapper over :meth:`device_names` -- ONE role-agnostic core)."""
+        return self.device_names(CameraDevice)
 
     def default_camera_name(self) -> str:
-        """The camera a measurement uses when the operator names none: the conventional
-        readout role (``"camera"``) when present, else the only/first camera in the set.
-        Raises with guidance when the config has no camera at all."""
-        names = self.camera_names()
-        if not names:
-            raise AttributeError(
-                "this device config has no camera -- add one (e.g. via na.discover_devices(); "
-                "each found camera's row carries a ready config entry).")
-        return "camera" if "camera" in names else names[0]
+        """The default readout camera (``"camera"`` role, else the first) -- thin wrapper over
+        :meth:`default_device_name`."""
+        return self.default_device_name(CameraDevice, conventional="camera")
 
     def require(self, name: str, expected_type: type | tuple[type, ...] | None = None):
         if name not in self.devices:
@@ -346,7 +398,11 @@ def available_device_configs() -> list[str]:
 
 __all__ = [
     "DEVICE_CLASSES",
+    "DEVICE_DOMAINS",
+    "DeviceDomain",
     "DeviceSet",
+    "device_domains",
+    "register_device_domain",
     "apply_device_overrides",
     "available_device_configs",
     "device_class_registry",
