@@ -228,6 +228,50 @@ def test_grid_cell_title_is_facet_aware_and_templated_from_one_source():
         plt.close(cal.fig)
 
 
+def test_double_click_focus_shares_the_thumbnail_display_contract():
+    """#2: double-clicking a grid cell enlarges it to a standalone panel that reads with the SAME window
+    / colour scale / title as the thumbnail, not a self-scaled one.  ``focus_data`` carries the cell's
+    OWN display state -- the hist value x-window (thumbnail pooled range), the image clim (pooled scale),
+    and the ONE ``cell_title`` -- so the enlarged view and the grid cell never diverge; a STANDALONE panel
+    (no seed) keeps its natural auto-scale, so non-grid plots are unchanged."""
+    from Zou_lab_control.frontend.live import grid, panel_plot
+
+    # hist cell: focus value_xlim == the thumbnail's SHARED pooled x-window, title == cell_title.
+    rng = np.random.default_rng(7)
+    hblock = np.stack([np.concatenate([rng.normal(3, 1, 50), rng.normal(40, 3, 60)]) for _ in range(4)],
+                      axis=0).reshape(4, 1, 110)
+    gh = grid(hblock, sub_plot_kind="hist", facet="repeat", points_shape=(1,), display=False)
+    try:
+        cell = gh.cell_renderer
+        fd = cell.focus_data(1, display_params={})
+        assert tuple(fd["value_xlim"]) == (cell.x_lo, cell.x_hi) and fd["title"] == cell.cell_title(1)
+        fp = panel_plot(fd["data_x"], kind="hist", size="2x2",
+                        **{k: v for k, v in fd.items() if k != "data_x"})
+        assert fp.ax.get_xlim() == (cell.x_lo, cell.x_hi)              # enlarged x-window == thumbnail
+        plt.close(fp.fig)
+        # a STANDALONE hist (no value_xlim) keeps the natural bin span -- non-grid unchanged.
+        std = panel_plot(hblock[0].reshape(-1), kind="hist", size="2x2", bins=30)
+        assert std.ax.get_xlim() != (cell.x_lo, cell.x_hi)
+        plt.close(std.fig)
+    finally:
+        plt.close(gh.fig)
+
+    # image cell: focus clim == the thumbnail's SHARED pooled colour scale, title == cell_title.
+    iblock = np.stack([np.abs(rng.normal(0, 1, (7, 7))) * (k + 1) for k in range(4)],
+                      axis=0).reshape(4, 1, 7, 7)
+    gi = grid(iblock, sub_plot_kind="2d", facet="repeat", points_shape=(1,), display=False)
+    try:
+        cell = gi.cell_renderer
+        fd = cell.focus_data(2, display_params={})
+        assert tuple(fd["clim"]) == (cell.vmin, cell.vmax) and fd["title"] == cell.cell_title(2)
+        fp = panel_plot(fd["data_x"], fd["data_y"], kind="2d", size="2x2",
+                        **{k: v for k, v in fd.items() if k not in ("data_x", "data_y")})
+        assert fp.image.get_clim() == (cell.vmin, cell.vmax)          # enlarged colour scale == thumbnail
+        plt.close(fp.fig)
+    finally:
+        plt.close(gi.fig)
+
+
 def test_grid_focus_zoom_enlarges_one_cell_and_returns():
     """Multi-panel zoom = focus one cell: a double-click enlarges the cell into its STANDALONE plot-kind
     figure (a real HistogramFigure swapped onto the grid's own canvas), and a double-click / Esc on the

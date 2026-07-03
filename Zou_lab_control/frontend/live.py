@@ -1080,13 +1080,18 @@ class Live2DDis(BaseLivePlot):
     plot_type = "2D"
     render_family = "2D"
 
-    def __init__(self, *args, cmap: str = PALETTE["cmap_scan"], bad_color: str = PALETTE["bad"], square: bool = True, **kwargs):
+    def __init__(self, *args, cmap: str = PALETTE["cmap_scan"], bad_color: str = PALETTE["bad"], square: bool = True,
+                 clim: "tuple[float, float] | None" = None, **kwargs):
         super().__init__(*args, **kwargs)
         if self.data_x.shape[1] != 2:
             raise ValueError("Live2DDis requires data_x with shape (N, 2).")
         self.cmap = cmap
         self.bad_color = bad_color
         self.square = square
+        # A pinned initial colour scale (#2): when a grid enlarges an image cell it passes the
+        # thumbnail's SHARED pooled range so the enlarged image reads on the SAME scale, instead of
+        # self-scaling to this one frame.  ``None`` (a standalone 2D) keeps the single-frame auto range.
+        self._seed_clim = None if clim is None else (float(clim[0]), float(clim[1]))
 
     def _is_regular_raster(self) -> bool:
         """True when the points are a COMPLETE row-major grid -- a camera frame or any dense 2-D
@@ -1187,7 +1192,13 @@ class Live2DDis(BaseLivePlot):
         # SAME relim_mode via the shared _mode_target: "normal" anchors the colorbar
         # at 0 (counts read against zero), "tight" brackets the data.  (Previously
         # this was hard-coded tight, so the Setting's normal/tight did nothing.)
-        self.ylim_min, self.ylim_max = self._mode_target(y_min, y_max)
+        # A grid-supplied ``clim`` seed (the enlarged-cell case, #2) pins the INITIAL scale to the
+        # thumbnail's SHARED pooled range EXACTLY (like the thumbnail's ``thumb_lims``, no _mode_target
+        # padding), so double-click reads on the same scale; ``fixed`` still honours the pinned lo/hi.
+        if self._seed_clim is not None and self.relim_mode != "fixed":
+            self.ylim_min, self.ylim_max = self._seed_clim
+        else:
+            self.ylim_min, self.ylim_max = self._mode_target(y_min, y_max)
         self.image.set_clim(self.ylim_min, self.ylim_max)
         self.axdis.set_ylim(self.ylim_min, self.ylim_max)
         # shared band (#C1): histogram + faint guide lines (this kind has them) + draggable clim
@@ -2720,8 +2731,13 @@ class HistogramFigure(BaseLivePlot):
         labels: Sequence[str] = ("Counts", "Shots", "Population"),
         ylog: bool = False,
         fit: str = DEFAULT_HIST_FIT,    # fit chooser: "none" | "single" | "double" (ONE default source)
+        value_xlim: "tuple[float, float] | None" = None,
         **kwargs,
     ):
+        # A pinned VALUE (x) window (#2): when a grid enlarges a cell it passes the thumbnail's SHARED
+        # pooled range so the enlarged x-axis MATCHES the grid, instead of self-scaling to bins[0..-1].
+        # ``None`` (a standalone histogram) keeps the natural bin span -- byte-identical old behaviour.
+        self._value_xlim = None if value_xlim is None else (float(value_xlim[0]), float(value_xlim[1]))
         # 'create' repeat mode delivers (n_samples, R): column 0 is the FIRST repeat (the FULL
         # treatment -- fill + fit + threshold + stats), columns 1.. draw the SAME FILLED histogram as a
         # no-repeat dis, just a different LINE_CYCLE colour + alpha so overlaps stay legible (NOT outlines
@@ -2875,8 +2891,12 @@ class HistogramFigure(BaseLivePlot):
         relim/fixed acts on the COUNT (y) axis -- the measured quantity -- exactly as a 1D plot's
         relim acts on its SIGNAL (dependent) axis, not on its independent scan coordinate.  So the
         value axis simply frames the data's bins; tight/normal/fixed live on the count axis
-        (:meth:`_apply_count_yscale`)."""
-        self.ax.set_xlim(self.bins[0], self.bins[-1])
+        (:meth:`_apply_count_yscale`).  A grid-supplied ``value_xlim`` (the enlarged-cell case, #2) pins the
+        window to the thumbnail's SHARED pooled range so the two match; ``None`` = the natural bin span."""
+        if self._value_xlim is not None:
+            self.ax.set_xlim(*self._value_xlim)
+        else:
+            self.ax.set_xlim(self.bins[0], self.bins[-1])
 
     def current_lims(self) -> tuple[float, float]:
         """The count (y) axis range the view shows NOW.  A histogram sets its count axis directly on
@@ -3891,16 +3911,22 @@ class HistogramCell(GridCell):
         thr = None
         if self.thresholds is not None and np.isfinite(self.thresholds[k]):
             thr = [float(self.thresholds[k])]
-        fid = self.site_fidelities
-        ftxt = "" if (fid is None or not np.isfinite(fid[k])) else f"   F={fid[k] * 100:.1f}%"
+        if self.edges is None:
+            self.prepare()
+        # The enlarged view shares the THUMBNAIL's display contract (#2): the defaults are the CELL's own
+        # bins / fit / ylog (not literals), the value x-window is the thumbnail's SHARED pooled range
+        # (value_xlim -- so the enlarged x-axis matches the grid instead of self-scaling to bins[0..-1]),
+        # and the title is the ONE cell_title (so the focus reads 'rep k' / 's k 87%' exactly like the
+        # thumbnail, never a separate 'site k').  A Setting change still wins via display_params.
         return {
             "data_x": self.values[k],                    # hist reads data_x as the values array (plot() convention)
             "bins": int(params.get("bins", self.bins_arg)),
             "thresholds": thr,
-            "fit": str(params.get("fit", "double")),
-            "ylog": bool(params.get("ylog", False)),
+            "fit": str(params.get("fit", self.fit)),
+            "ylog": bool(params.get("ylog", self.ylog)),
+            "value_xlim": (float(self.x_lo), float(self.x_hi)),
             "labels": (self.labels[0], self.labels[1] if len(self.labels) > 1 else "Shots", "Population"),
-            "title": f"site {k}{ftxt}",
+            "title": self.cell_title(k),
         }
 
     def sync_threshold_from_focus(self, k: int, focus_plotter) -> None:
@@ -4022,12 +4048,19 @@ class ImageCell(GridCell):
         xx, yy = np.meshgrid(np.arange(nx, dtype=float), np.arange(ny, dtype=float))
         data_x = np.column_stack([xx.ravel(), yy.ravel()])
         cmap = str(params.get("cmap") or params.get("colorset") or self.cmap)
+        if not hasattr(self, "vmin"):
+            self.prepare()
+        # The enlarged view shares the THUMBNAIL's display contract (#2): the cmap default is the CELL's
+        # own cmap (not a literal), the colour scale is the grid's SHARED pooled clim (so the enlarged
+        # image reads on the SAME scale as the thumbnail instead of self-scaling to this one frame), and
+        # the title is the ONE cell_title (so the focus reads exactly like the thumbnail).
         return {
             "data_x": data_x,
             "data_y": im.ravel(),
             "cmap": cmap,
+            "clim": (float(self.vmin), float(self.vmax)),
             "labels": (self.labels[0], self.labels[1] if len(self.labels) > 1 else "y (px)", "weight"),
-            "title": f"site {k}",
+            "title": self.cell_title(k),
         }
 
 
@@ -4738,7 +4771,7 @@ class LineCell(GridCell):
             "data_x": self._cell_x(k),
             "data_y": self.ys[k],
             "labels": (self.labels[0], self.labels[1] if len(self.labels) > 1 else "Y", "Z"),
-            "title": f"site {k}",
+            "title": self.cell_title(k),      # the ONE cell_title, so the focus reads like the thumbnail (#2)
         }
 
 
