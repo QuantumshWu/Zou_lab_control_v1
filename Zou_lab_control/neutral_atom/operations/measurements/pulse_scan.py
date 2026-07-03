@@ -78,10 +78,22 @@ class _Axis:
 def _resolve_probe_template(template: str) -> PulseTableState:
     """Load the pulse template the operator picked via the ONE shared resolver: the given path if
     real, else the same-named file shipped under the project ``pulses/`` folder, else the in-memory
-    single-image default."""
+    single-image default.
 
-    return resolve_pulse_template(template, default_name=DEFAULT_PROBE_TEMPLATE,
-                                  default_factory=single_imaging_template)
+    A template loaded to FIRE must author on the HARDWARE clock grid: its ``time_step_ns`` is forced
+    to the one hardware tick (``1e9 / DEFAULT_CLOCK_HZ`` = 20 ns), single-sourced from the streamer
+    clock -- NOT whatever a saved file happened to carry.  A finer authoring grid (an old save with
+    ``time_step_ns = 1``) would let an api/scan DURATION sweep produce sub-tick durations that fail
+    the 50 MHz grid validation and cannot fire ("api slot does not work"); snapping the grid here
+    makes author == snap == fire for every template, including a user-local one under ``pulses/``."""
+    from ...timing.pulse_table import DEFAULT_CLOCK_HZ
+
+    state = resolve_pulse_template(template, default_name=DEFAULT_PROBE_TEMPLATE,
+                                   default_factory=single_imaging_template)
+    tick_ns = 1_000_000_000.0 / DEFAULT_CLOCK_HZ
+    if state.time_step_ns != tick_ns:
+        state.time_step_ns = tick_ns
+    return state
 
 
 def _scan_table_arrays(
