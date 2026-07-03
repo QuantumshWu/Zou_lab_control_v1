@@ -5359,26 +5359,38 @@ class PanelEditor(QtWidgets.QWidget):
             f"{display_path(str(self._save_stem(None)))}.{self._save_image_ext()} + .npz")
 
     def _save_view_state(self) -> dict[str, object]:
-        """The panel's DISPLAY knobs, read from ``config.params`` (the one source), folded into the
-        saved ``info['view']`` so ``load_figure(...).plot()`` reopens the figure AS SEEN: relim mode
-        + fixed lo/hi (``card._relim`` / the fixed bounds), unit index, colormap and repeat mode.
-        Everything defaults, so a panel saved before a knob was touched still round-trips cleanly.
+        """The panel's DISPLAY knobs, DERIVED from the ONE source (``config.params`` keyed by the ONE
+        ``PANEL_PARAMS`` catalog), folded into saved ``info['view']`` so ``load_figure(...).plot()`` and
+        the figure viewer reopen the figure AS SEEN.  Captures BOTH:
 
-        ``cmap`` stores the RESOLVED colormap name -- the actual colormap the panel drew with -- via the
-        ONE ``_resolved_cmap`` resolver (operator's pick, else the kind's declared ``PANEL_PARAMS``
-        default: ``gray`` for a site map, ``inferno`` for a 2-D image).  So the npz records a REAL name an
-        image/site-map save drew with, never an empty ``''`` a consumer would have to second-guess; kinds
-        with no colormap param (1-D / hist / monitor) resolve to ``''`` -- they never feed it to
-        matplotlib."""
+        * the cross-kind view knobs that live OUTSIDE ``PANEL_PARAMS`` (relim mode + fixed lo/hi from
+          ``card._relim`` / the fixed bounds, unit index, repeat mode);
+        * EVERY kind-specific knob the panel actually renders from -- looped from
+          ``PANEL_PARAMS[_param_kind()]`` (a hist(-grid)'s bins/fit/ylog, a 2d/sites(-grid)'s colormap,
+          a monitor's length/show_dist), the SAME declarative catalog the render path (``_build_plot`` /
+          ``_build_facet_plotter``) and the Setting/Edit UI read.  Each stores the panel's EFFECTIVE
+          value (operator's pick else the declared default), so the npz is self-describing and reopens
+          exactly as drawn.
+
+        This kills the old divergence where the save HARD-LISTED only 6 keys and silently dropped every
+        other rendered knob (bins/fit/ylog/length/show_dist) -- a knob added to ``PANEL_PARAMS`` is now
+        saved automatically, so *display == reopened figure* by construction.  ``_param_kind()`` yields a
+        grid's per-cell ``sub_plot_kind``, so a grid captures its cells' knobs through the very same loop
+        (the same thing ``_grid_recipe_with_params`` already does).  ``cmap`` is one of these declared
+        keys: ``params.get('cmap', decl.default)`` is exactly the operator-pick-else-kind-default the
+        ``_resolved_cmap`` resolver gives, so an image/site-map save still records the real colormap name
+        it drew with; a kind with no colormap param simply omits the key (never a stray ``''``)."""
         params = self.card.config.params
-        return {
+        view: dict[str, object] = {
             "relim": self.card._relim(),
             "fixed_lo": _safe_float(str(params.get("fixed_lo", 0.0)), 0.0),
             "fixed_hi": _safe_float(str(params.get("fixed_hi", 1.0)), 1.0),
             "unit_index": int(params.get("unit_index", 0) or 0),
-            "cmap": _resolved_cmap(str(self.card.config.kind or ""), params),
             "repeat_mode": self.card._repeat_mode_value(),
         }
+        for decl in PANEL_PARAMS.get(self.card._param_kind(), ()):
+            view[decl.key] = params.get(decl.key, decl.default)
+        return view
 
     def save(self) -> None:
         if self._plotter is None:

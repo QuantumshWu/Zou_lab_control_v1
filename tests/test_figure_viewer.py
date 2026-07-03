@@ -162,6 +162,59 @@ def test_board_reuse_add_second_panel_reads_same_signal(viewer):
     assert kinds == {"hist", "monitor"}, "the same signal is viewed as two different kinds"
 
 
+def test_every_panel_kind_saves_its_declared_display_knobs_in_the_view():
+    """MECHANICAL round-trip guard for the 'figure_viewer 载入的 fig 不统一' root cause: every display
+    knob a panel CARRIES -- its ``PANEL_PARAMS[kind]`` catalog -- must appear in the saved
+    ``info['view']``, so re-opening a saved figure restores EXACTLY what was on screen (bins / fit /
+    ylog / cmap / length / show_dist), not just the handful of cross-kind knobs.
+
+    ``PanelEditor._save_view_state`` DERIVES its key set from the ONE ``PANEL_PARAMS`` source (never a
+    hand-typed dict), so a newly declared display param is round-tripped the instant it is added, with
+    no second edit site to forget.  This test re-derives the expected keys from that same source, so it
+    can never drift into re-typing the literals it guards."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import (
+        PANEL_PARAMS, PanelConfig, TaskConsole, default_console_state)
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    ensure_qt_app()
+    exp = na.connect("virtual")
+    con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
+                      measurements=exp.readout.measurement_specs(),
+                      processors=exp.readout.processor_specs(),
+                      tasks=exp.readout.task_specs(), window_px=(900, 600))
+
+    def _saved_view(kind, params):
+        card = con._new_panel_card(PanelConfig(kind=kind, title="P", size="2x2",
+                                               source="value = __probe__", params=dict(params)))
+        con._attach_card(card)
+        con._edit_card(card)
+        return card, con._panel_editors[id(card)]._save_view_state()
+
+    try:
+        # (1) EVERY declared knob of EVERY kind is present in the saved view (key completeness).
+        for kind in ("hist", "monitor", "2d", "sites", "1d"):
+            card, view = _saved_view(kind, {})
+            pk = card._param_kind()
+            missing = [d.key for d in PANEL_PARAMS.get(pk, ()) if d.key not in view]
+            assert not missing, (
+                f"{kind}: declared display knobs missing from saved view: {missing} "
+                f"-- _save_view_state must derive its keys from PANEL_PARAMS[{pk!r}]")
+        # (2) the SET value (not the catalog default) is what round-trips -- change one knob per kind.
+        _, hv = _saved_view("hist", {"bins": 33, "fit": "single", "ylog": True})
+        assert (hv["bins"], hv["fit"], hv["ylog"]) == (33, "single", True), \
+            "a hist panel's SET bins/fit/ylog (not the defaults) round-trip through the view"
+        _, mv = _saved_view("monitor", {"length": 123, "show_dist": False})
+        assert (mv["length"], mv["show_dist"]) == (123, False), \
+            "a monitor panel's SET length/show_dist round-trip through the view"
+        _, iv = _saved_view("2d", {"cmap": "viridis"})
+        assert iv["cmap"] == "viridis", "a 2d panel's SET cmap round-trips through the view"
+    finally:
+        con.shutdown()
+        exp.close()
+
+
 def test_window_opens_at_screen_fit_not_content_width(tmp_path):
     """The viewer opens at the shared screen-fraction size (the task console / pulse editor both return
     ``screen_fit_window_size`` verbatim from ``sizeHint``), NEVER collapsed to the bare Info-column
