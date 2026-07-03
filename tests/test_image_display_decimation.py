@@ -107,7 +107,7 @@ def test_live2d_displays_a_budgeted_view_and_keeps_the_full_grid():
     assert shown.shape[1] < 2 * bx and shown.shape[0] < 2 * by
     assert shown.shape[1] >= min(bx, frame.shape[1]) and shown.shape[0] >= min(by, frame.shape[0])
     assert shown.shape[0] < frame.shape[0]           # a camera frame IS decimated for display
-    assert p.image.get_interpolation() == "auto"     # filtered when minified, nearest when magnified
+    assert p.image.get_interpolation() == "antialiased"  # filtered when minified; portable ("auto" only exists in mpl>=3.5)
 
 
 def test_live2d_zoom_reslices_to_full_resolution():
@@ -134,7 +134,7 @@ def test_sitemap_background_uses_the_same_display_policy():
     shown = np.asarray(p._bg_image.get_array())
     bx, by = _image_axes_px_budget(p.ax)
     assert shown.shape[1] < 2 * bx and shown.shape[0] < 2 * by
-    assert p._bg_image.get_interpolation() == "auto"
+    assert p._bg_image.get_interpolation() == "antialiased"
     assert p.background.shape == frame.shape
     # a new frame refreshes the displayed view through the same decimation
     p.set_background(frame + 100.0)

@@ -1129,7 +1129,7 @@ class Live2DDis(BaseLivePlot):
                                                 (self.extent[0], self.extent[1]),
                                                 (self.extent[2], self.extent[3]),
                                                 _image_axes_px_budget(self.ax))
-        self.image = self.ax.imshow(small, cmap=cmap, extent=small_ext, interpolation="auto")
+        self.image = self.ax.imshow(small, cmap=cmap, extent=small_ext, interpolation="antialiased")
         self._in_display_refresh = False
         self.ax.callbacks.connect("xlim_changed", lambda _ax: self._refresh_display_image())
         self.ax.callbacks.connect("ylim_changed", lambda _ax: self._refresh_display_image())
@@ -1354,7 +1354,7 @@ class LiveSiteMap(BaseLivePlot):
             small, small_ext = _decimate_image_view(self.background, extent,
                                                     (extent[0], extent[1]), (extent[2], extent[3]),
                                                     _image_axes_px_budget(self.ax))
-            self._bg_image = self.ax.imshow(small, cmap=self.cmap, extent=small_ext, interpolation="auto")
+            self._bg_image = self.ax.imshow(small, cmap=self.cmap, extent=small_ext, interpolation="antialiased")
             self._in_display_refresh = False
             self.ax.callbacks.connect("xlim_changed", lambda _ax: self._refresh_display_image())
             self.ax.callbacks.connect("ylim_changed", lambda _ax: self._refresh_display_image())

@@ -911,7 +911,7 @@ Task 控制台（\filepath{task\_console.bat} / \pyapi{frontend.show\_task\_cons
 \begin{figure}[h]
 \centering
 \includegraphics[width=0.94\linewidth]{__DISPLAY_CHAIN__}
-\caption{\tfocus{2D live 图像的显示链}。满分辨率数组留在内存；显示层按当前视野裁剪 + 块平均到 axes 像素预算（\tfocus{面积平均，提信噪}），\pyapi{imshow(interpolation="auto")} 渲染，Agg 缓冲\tfocus{等于屏幕设备像素}做 1:1 贴图。整条链\tfocus{只一次重采样}；放大重新切片、细节渐进回归到 1:1。这就是为什么 monitor 相机既不卡、又不比原图糊。}
+\caption{\tfocus{2D live 图像的显示链}。满分辨率数组留在内存；显示层按当前视野裁剪 + 块平均到 axes 像素预算（\tfocus{面积平均，提信噪}），\pyapi{imshow(interpolation="antialiased")} 渲染，Agg 缓冲\tfocus{等于屏幕设备像素}做 1:1 贴图。整条链\tfocus{只一次重采样}；放大重新切片、细节渐进回归到 1:1。这就是为什么 monitor 相机既不卡、又不比原图糊。}
 \end{figure}
 \begin{notebox}
 弹窗用 \pyapi{FluentPopup}（\filepath{qt\_fluent.py}）：\tfocus{半透明、无边框}的顶层 \pyapi{Qt.Popup}，圆角白卡由 \pyapi{paintEvent} 抗锯齿描一笔（填充 + 1px 边框）。两条教训：① 不可在\tfocus{不透明}顶层弹窗上用样式表 \pyapi{border-radius}——方形窗体留在圆弧外，右下角露出方角白块（那条"奇怪的线"），Windows 还叠一层原生阴影；② 光加 \pyapi{WA\_TranslucentBackground} 不够，它会让样式表背景\tfocus{整块不画}（弹窗变透明）。所以圆角卡\tfocus{自己画}。边框是画出来的、不是样式表规则，因此也\tfocus{绝不会级联}到 QLabel/QComboBox 等子控件。
