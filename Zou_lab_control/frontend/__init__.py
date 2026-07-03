@@ -98,6 +98,7 @@ _PULSE_GUI_EXPORTS = {"PulseSequenceEditor", "show_pulse_gui"}
 _TASK_CONSOLE_EXPORTS = {"TaskConsole", "TaskConsoleState", "PanelConfig", "LogicNodeConfig",
                          "default_console_state", "show_task_console"}
 _FIGURE_VIEWER_EXPORTS = {"FigureViewer", "LoadedFigureNode", "show_figure_viewer"}
+_DEVICE_MANAGER_EXPORTS = {"DeviceManagerPanel", "show_device_manager"}
 
 
 def __getattr__(name: str):
@@ -110,6 +111,9 @@ def __getattr__(name: str):
     if name in _FIGURE_VIEWER_EXPORTS:
         figure_viewer = import_module(".figure_viewer", __name__)
         return getattr(figure_viewer, name)
+    if name in _DEVICE_MANAGER_EXPORTS:
+        device_manager = import_module(".device_manager", __name__)
+        return getattr(device_manager, name)
     raise AttributeError(name)
 
 
@@ -228,6 +232,7 @@ __all__ = [
     "render_tex_pdf",
     "run",
     "save_figure_data",
+    "show_device_manager",
     "show_figure_viewer",
     "show_pulse_gui",
     "show_task_console",
