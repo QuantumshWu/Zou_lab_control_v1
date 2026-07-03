@@ -3289,6 +3289,41 @@ def normalize_facet(facet):
     return group, index
 
 
+def facet_cell_labels(facet, n_cells, *, points_shape=(), coords=None, param_names=None):
+    """The per-cell IDENTIFIER strings (grid-title part 1) -- the ONE source that turns the (facet group,
+    cell index ``k``) into human text, so a cell's label MATCHES the axis it was faceted on instead of a
+    hardcoded ``s{k}`` everywhere:
+
+    * ``dim`` (a per-SITE data slice) or a non-faceted recipe grid -> ``s{k}`` (the readout/calibration tag),
+    * ``repeat`` -> ``rep {k}``,
+    * ``points`` (a SCAN axis) -> the scan coordinate: ``{name}={value}`` when the producing scan's param
+      ``name`` / ``coords`` are known (e.g. ``Bz=1.2``), else the bare value, else ``pt {k}``.
+
+    ``points_shape`` is accepted for symmetry with :func:`facet_cells` (a multi-D scan). This is shared by
+    :meth:`GridCell.cell_title`, so the label a cell shows is DERIVED here, never re-hardcoded per cell
+    family -- the DRY fix for the three ``f"s{k}"`` literals."""
+    del points_shape                                   # reserved for future per-axis coordinate mapping
+    spec = normalize_facet(facet)
+    n = int(n_cells)
+    if spec is None or spec[0] == "dim":
+        return [f"s{k}" for k in range(n)]
+    group, index = spec
+    if group == "repeat":
+        return [f"rep {k}" for k in range(n)]
+    name = str(param_names[index]) if param_names is not None and index < len(param_names) else ""
+    out = []
+    for k in range(n):
+        if coords is not None and k < len(coords):
+            try:
+                text = f"{float(coords[k]):g}"
+            except (TypeError, ValueError):
+                text = str(coords[k])
+            out.append(f"{name}={text}" if name else text)
+        else:
+            out.append(f"{name} {k}".strip() if name else f"pt {k}")
+    return out
+
+
 def _collapse_repeat(sliced, repeat_mode: str):
     """Collapse the leading REPEAT axis of a per-cell slice for an image/line cell -- the same display
     verbs the standalone kinds use (``average`` mean / ``add`` sum / ``replace`` latest).  A histogram
@@ -3438,6 +3473,18 @@ class GridCell:
     #: every other size uses them unscaled.  Cells multiply their apply_title size by it; the
     #: grid's tick policy multiplies its label size by it.
     font_scale: float = 1.0
+    #: Per-cell TITLE (#5), two parts through the ONE :meth:`cell_title` hook every cell family's draw
+    #: reads (no per-family ``f"s{k}"`` literal):
+    #:  * ``labels_per_cell`` = part 1, the facet-aware IDENTIFIER list from :func:`facet_cell_labels`
+    #:    (``s{k}`` / ``rep {k}`` / a scan coordinate), threaded in by the grid factory; ``None`` before it
+    #:    is set falls back to the site tag.
+    #:  * ``title_template`` = part 2, the user template rendered with a ``{id, k, popt, fid}`` context so a
+    #:    user can add e.g. ``"{id}  F={popt[2]:.2f}"``; default ``"{id}"`` shows just the identifier.
+    #:  * ``title_size`` = the fixed cell-title point size as a settable INTERFACE; ``0`` = derive the
+    #:    two-tier default from ``small_fontsize() * font_scale`` (never a raw literal).
+    labels_per_cell: "Sequence[str] | None" = None
+    title_template: str = "{id}"
+    title_size: float = 0.0
 
     def thumb_lims(self, auto_lo: float, auto_hi: float) -> tuple[float, float]:
         """The thumbnail's dependent-axis range: the operator's pinned lo/hi in ``fixed`` mode, else the
@@ -3453,13 +3500,63 @@ class GridCell:
         flips relim to ``fixed`` without an enlarged cell (fixed freezes what you see, never 0..1)."""
         raise NotImplementedError
 
+    def _cell_identifier(self, k: int) -> str:
+        """Title part 1: the cell's facet-aware IDENTIFIER (``labels_per_cell[k]`` from
+        :func:`facet_cell_labels`), falling back to the site tag before the labels are threaded in.  A
+        family may extend it (a hist cell appends its fidelity)."""
+        labels = self.labels_per_cell
+        if labels is not None and k < len(labels):
+            return str(labels[k])
+        return f"s{k}"
+
+    def _cell_popt(self, k: int):
+        """The cell's fitted parameters for the title template's ``{popt}`` -- empty on families / cells
+        with no fit (a template referencing ``popt`` then degrades to the identifier)."""
+        return ()
+
+    def _cell_fid(self, k: int) -> float:
+        """The cell's readout fidelity for the title context's ``{fid}`` -- NaN when none."""
+        return float("nan")
+
+    def cell_title(self, k: int) -> str:
+        """The cell's title = part 1 (:meth:`_cell_identifier`) rendered through the user
+        :data:`title_template` with a context of ``{id, k, popt, fid}``.  The ONE title source EVERY cell
+        family's :meth:`draw` (and the focus view) reads, so thumbnail and enlarged cell never drift and
+        no family re-hardcodes ``s{k}``.  A bad template (an unknown key / index) degrades to the bare
+        identifier rather than raising."""
+        ident = self._cell_identifier(k)
+        ctx = {"id": ident, "k": int(k), "popt": self._cell_popt(k), "fid": self._cell_fid(k)}
+        try:
+            return str(self.title_template or "{id}").format(**ctx)
+        except Exception:
+            return ident
+
+    def title_size_pt(self) -> float:
+        """The cell title point size: the operator's :data:`title_size` when set (>0), else the fixed
+        two-tier default ``small_fontsize() * font_scale`` -- never a raw literal, so the size is a
+        settable INTERFACE with a single-source default (#5)."""
+        size = float(self.title_size or 0.0)
+        return size if size > 0 else small_fontsize() * self.font_scale
+
     def consume_param(self, key: str, value) -> bool:
-        """Land a per-kind DISPLAY knob on this cell family's own state (a hist cell's bins / fit /
-        ylog, an image cell's cmap) and return True when the THUMBNAILS are now stale.  The single
-        param fan-out: ``GridPlot.store_display_param`` owns only the generic relim family and hands
-        every other key HERE -- the cell family, not the grid, declares which of its standalone
-        kind's ``PANEL_PARAMS`` it renders (so a new knob is one method here, never a GridPlot edit).
-        Unknown keys return False (stored on the grid for the focus seed, thumbnails untouched)."""
+        """Land a DISPLAY knob on this cell family's state and return True when the THUMBNAILS are now
+        stale.  The single param fan-out: ``GridPlot.store_display_param`` owns only the generic relim
+        family and hands every other key HERE.  The BASE owns the generic per-cell TITLE knobs
+        (``title_template`` / ``title_size``, common to every family); a family override handles its own
+        kind's ``PANEL_PARAMS`` (bins / fit / ylog / cmap) and CHAINS to ``super().consume_param`` for
+        anything it does not own, so a new generic knob is one branch HERE, never per family."""
+        if str(key) == "title_template":
+            new = "{id}" if value in (None, "") else str(value)
+            if self.title_template == new:
+                return False
+            self.title_template = new
+            return True
+        if str(key) == "title_size":
+            v = 0.0 if str(value).strip() in ("", "None") else float(value)
+            if self.title_size == v:
+                return False
+            self.title_size = v
+            return True
         return False
 
     def prepare(self) -> None:
@@ -3549,6 +3646,7 @@ class HistogramCell(GridCell):
         self.cell_counts: list = [None] * self.n_cells
         self._bar_colls: list = [None] * self.n_cells      # cell k's PolyCollections, for the live in-place move
         self._fit_lines: list = [None] * self.n_cells      # cell k's (left, right, total) fit Line2Ds
+        self._cell_popt_store: dict = {}                    # cell k -> last fit popt, for the title {popt} context
 
     def consume_param(self, key: str, value) -> bool:
         if str(key) == "bins":
@@ -3566,7 +3664,7 @@ class HistogramCell(GridCell):
                 return False
             self.ylog = bool(value)
             return True
-        return False
+        return super().consume_param(key, value)   # generic title_template / title_size knobs
 
     def prepare(self) -> None:
         vals = self.values
@@ -3587,11 +3685,24 @@ class HistogramCell(GridCell):
                 top = max(top, float(np.histogram(v, bins=self.edges)[0].max()))
         self.y_top = top
 
-    def _tag_text(self, k: int) -> str:
-        """The per-cell TITLE text -- the site index (+ its fidelity when known).  It is placed in the
-        cell's small axes title ABOVE the plot (never inside the data area), so the histogram stays clean."""
+    def _cell_identifier(self, k: int) -> str:
+        """Title part 1 for a hist cell = the facet-aware identifier (base) + the site FIDELITY when known
+        -- so the calibration report keeps its ``s{k}  87%`` per-site annotation as the default title, while
+        a repeat / scan facet reads ``rep {k}`` / the scan coordinate from :func:`facet_cell_labels`."""
+        base = super()._cell_identifier(k)
         fids = self.site_fidelities
-        return f"s{k}" if fids is None or not np.isfinite(fids[k]) else f"s{k}  {fids[k] * 100:.0f}%"
+        if fids is not None and k < len(fids) and np.isfinite(fids[k]):
+            return f"{base}  {fids[k] * 100:.0f}%"
+        return base
+
+    def _cell_fid(self, k: int) -> float:
+        fids = self.site_fidelities
+        return float(fids[k]) if fids is not None and k < len(fids) and np.isfinite(fids[k]) else float("nan")
+
+    def _cell_popt(self, k: int):
+        """The cell's last fit popt (bimodal 6-tuple or single 3-tuple) for the title ``{popt}`` context;
+        empty until the cell has been fitted (a ``{popt}`` template then falls back to the identifier)."""
+        return self._cell_popt_store.get(int(k), ())
 
     def _apply_fit_lines(self, ax, k: int, counts) -> None:
         """(Re)fit + draw cell ``k``'s fit curves through the ONE primitive the standalone dis uses
@@ -3609,7 +3720,14 @@ class HistogramCell(GridCell):
             ln.set_data([], [])
         res = fit_histogram_curves(self.values[k], self.edges, counts, self.fit)
         if res is None:
+            self._cell_popt_store.pop(int(k), None)         # no fit on this cell -> drop stale popt
             return
+        # expose the fitted params for the title {popt} context (bimodal 6-tuple else single 3-tuple);
+        # ``is not None`` (not ``or``) -- a popt is a numpy array whose truth value is ambiguous.
+        popt = res.get("bimodal_popt")
+        if popt is None:
+            popt = res.get("single_popt")
+        self._cell_popt_store[int(k)] = tuple(popt) if popt is not None else ()
         if res["left"] is not None:
             lines[0].set_data(res["x"], res["left"])
             lines[1].set_data(res["x"], res["right"])
@@ -3688,7 +3806,7 @@ class HistogramCell(GridCell):
         self._apply_count_ylim(ax, counts_all)
         # The site index (+ fidelity) is the cell's small TITLE, ABOVE the axes -- NOT text inside the data
         # area (#5) -- through the ONE title mechanism (apply_title), just at small_fontsize().
-        apply_title(ax, self._tag_text(k), size=small_fontsize() * self.font_scale, pad=1.5)
+        apply_title(ax, self.cell_title(k), size=self.title_size_pt(), pad=1.5)
         self.threshold_lines[k] = line           # grid line, kept for per-cell drag
         return line
 
@@ -3830,7 +3948,7 @@ class ImageCell(GridCell):
         if str(key) in ("cmap", "colorset"):
             self.cmap = str(value)
             return True
-        return False
+        return super().consume_param(key, value)   # generic title_template / title_size knobs
 
     def prepare(self) -> None:
         finite = [im[np.isfinite(im)] for im in self.images if im.size]
@@ -3858,7 +3976,7 @@ class ImageCell(GridCell):
         vmin, vmax = self.thumb_lims(self.vmin, self.vmax)
         self._image_artists[k] = ax.imshow(self.images[k], origin="lower", cmap=self.cmap,
                                            vmin=vmin, vmax=vmax, aspect="equal")
-        apply_title(ax, f"s{k}", size=small_fontsize() * self.font_scale, pad=1.5)   # ticks are the grid's ONE policy
+        apply_title(ax, self.cell_title(k), size=self.title_size_pt(), pad=1.5)   # ticks are the grid's ONE policy
         return None
 
     def set_cell_data(self, k: int, data) -> None:
@@ -4580,7 +4698,7 @@ class LineCell(GridCell):
         if x.size:
             ax.set_xlim(float(x[0]), float(x[-1]) if x[-1] > x[0] else float(x[0]) + 1.0)
         ax.set_ylim(*self.thumb_lims(self.y_lo, self.y_hi))
-        apply_title(ax, f"s{k}", size=small_fontsize() * self.font_scale, pad=1.5)   # ticks are the grid's ONE policy
+        apply_title(ax, self.cell_title(k), size=self.title_size_pt(), pad=1.5)   # ticks are the grid's ONE policy
         return None
 
     def set_cell_data(self, k: int, data) -> None:
@@ -4637,6 +4755,7 @@ def grid(
     grid_shape: tuple[int, int] | None = None,
     size: str | None = None,
     labels: Sequence[str] | None = None,
+    cell_labels: "Sequence[str] | None" = None,
     title: str = "",
     display: bool = True,
     fig: "plt.Figure | None" = None,
@@ -4672,15 +4791,26 @@ def grid(
             "pick a shorter facet axis, or collapse that axis via repeat_mode / an expression instead.")
     if labels is None:
         labels = {"hist": ("Signal", "Shots"), "1d": ("X", "Y")}.get(kind, ("x (px)", "y (px)"))
+    # Per-cell TITLE identifiers (#5): use the caller's ``cell_labels`` (the console, which pre-slices and
+    # knows the facet + scan coords) else DERIVE them from the facet through the ONE ``facet_cell_labels``
+    # source -- so a repeat / scan / site grid labels its cells by what the axis MEANS, and the derivation
+    # lives in exactly one place whether the block was sliced here or upstream.
+    if cell_labels is None and facet is not None:
+        cell_labels = facet_cell_labels(facet, len(per_cell), points_shape=points_shape)
     if kind == "hist":
         # the readout hist grid keeps its named type + property surface (n_sites / thresholds / classify);
         # it builds the HistogramCell itself, so the hist cell kwargs flow straight through.
-        return SiteHistogramGrid(
+        plotter = SiteHistogramGrid(
             per_cell, grid_shape=grid_shape, labels=labels, title=title, size=size,
-            fig=fig, interactions=interactions, **cell_kwargs).show(display=display)
-    cell = GRID_CELL_BY_KIND[kind](per_cell, labels=labels, **cell_kwargs)
-    return GridPlot(cell, grid_shape=grid_shape, labels=labels, title=title, size=size,
-                    fig=fig, interactions=interactions).show(display=display)
+            fig=fig, interactions=interactions, **cell_kwargs)
+    else:
+        cell = GRID_CELL_BY_KIND[kind](per_cell, labels=labels, **cell_kwargs)
+        plotter = GridPlot(cell, grid_shape=grid_shape, labels=labels, title=title, size=size,
+                           fig=fig, interactions=interactions)
+    if cell_labels is not None:
+        # ONE place the identifiers reach the cell renderer, BEFORE show() draws the titles.
+        plotter.cell_renderer.labels_per_cell = list(cell_labels)
+    return plotter.show(display=display)
 
 
 def site_histogram_grid(

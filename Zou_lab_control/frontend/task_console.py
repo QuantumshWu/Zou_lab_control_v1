@@ -2706,10 +2706,17 @@ class PanelCard(FluentGroupBox):
         display knobs (bins / fit / ylog / cmap) AND the relim family (BaseLivePlot.apply_param owns
         them all).  The ONE builder the live card (display-only) and the Edit-tab snapshot
         (interactive) share -- so the two can never drift."""
-        from .live import grid as build_facet_grid
+        from .live import facet_cell_labels, grid as build_facet_grid
         sub = self._resolved_sub_kind()
+        cells = self._facet_cells(value)
+        # Per-cell TITLE identifiers (#5): the console pre-slices (facet=None to the factory), so it hands
+        # the labels EXPLICITLY, derived from the bound facet + its points shape through the ONE
+        # ``facet_cell_labels`` source -- so a repeat / scan / site grid's cells read 'rep k' / a scan
+        # coordinate / 's k' instead of a hardcoded site tag, from the same source the notebook path uses.
+        pts, _ = self._facet_value_shapes()
+        cell_labels = facet_cell_labels(self._facet(), len(cells), points_shape=pts)
         plotter = build_facet_grid(
-            self._facet_cells(value), sub_plot_kind=sub, size=self.config.size,
+            cells, sub_plot_kind=sub, size=self.config.size, cell_labels=cell_labels,
             display=False, interactions=interactions, title=self.config.title or "")
         for key in [d.key for d in PANEL_PARAMS.get(sub, ())] + ["relim", "fixed_lo", "fixed_hi"]:
             if key == "cmap":

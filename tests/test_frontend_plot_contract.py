@@ -182,6 +182,52 @@ def test_fit_targets_is_the_one_fanout_seam_for_grid_and_flat():
         plt.close(g.fig)
 
 
+def test_grid_cell_title_is_facet_aware_and_templated_from_one_source():
+    """#5: a grid cell's title comes from the ONE :meth:`GridCell.cell_title` hook (no per-family
+    ``f"s{k}"`` literal), with part 1 = the facet-aware identifier from the ONE :func:`facet_cell_labels`
+    source and part 2 = a user ``title_template`` that can reference the fit ``{popt}``; the cell-title
+    point size is a settable interface with a single-source default."""
+    from Zou_lab_control.frontend.live import GridCell, HistogramCell, facet_cell_labels, grid
+
+    # (1) facet_cell_labels is the ONE identifier source, facet-aware per group.
+    assert facet_cell_labels("repeat", 3) == ["rep 0", "rep 1", "rep 2"]
+    assert facet_cell_labels("dim", 3) == ["s0", "s1", "s2"]                     # per-site
+    assert facet_cell_labels("points:0", 2, coords=[1.0, 2.5], param_names=["Bz"]) == ["Bz=1", "Bz=2.5"]
+    assert facet_cell_labels(None, 2) == ["s0", "s1"]                            # recipe grid keeps the tag
+
+    # (2) the ONE cell_title hook every family shares (base defines it; no per-family s{k}).
+    assert "cell_title" in vars(GridCell) and "_tag_text" not in vars(HistogramCell)
+
+    rng = np.random.default_rng(6)
+    block = np.stack([np.concatenate([rng.normal(3, 1, 50), rng.normal(40, 3, 60)]) for _ in range(4)],
+                     axis=0).reshape(4, 1, 110)
+    g = grid(block, sub_plot_kind="hist", facet="repeat", points_shape=(1,), display=False)
+    try:
+        cell = g.cell_renderer
+        assert [cell.cell_title(k) for k in range(4)] == ["rep 0", "rep 1", "rep 2", "rep 3"]  # facet-aware
+        # (3) a user template rendered with the {popt} context (fit the cells first so popt exists).
+        cell.consume_param("fit", "double")
+        for k in range(4):
+            cell._apply_fit_lines(g.site_axes[k], k, cell.cell_counts[k])
+        cell.consume_param("title_template", "{id} n={k}")
+        assert cell.cell_title(2) == "rep 2 n=2"
+        assert cell._cell_popt(0)                                   # popt exposed for a {popt} template
+        # (4) title_size is a settable interface; 0 -> the single-source default (>0), never a literal.
+        assert cell.consume_param("title_size", 8.5) and cell.title_size_pt() == 8.5
+        cell.consume_param("title_size", 0)
+        assert cell.title_size_pt() > 0
+    finally:
+        plt.close(g.fig)
+
+    # (5) the calibration hist grid keeps its s{k} + fidelity default title (part-1 fidelity suffix).
+    cal = zf.site_histogram_grid([np.concatenate([rng.normal(3, 1, 60), rng.normal(50, 3, 70)]) for _ in range(3)],
+                                 thresholds=[25.0] * 3, site_fidelities=[0.87, 0.85, np.nan], display=False)
+    try:
+        assert [cal.cell_renderer.cell_title(k) for k in range(3)] == ["s0  87%", "s1  85%", "s2"]
+    finally:
+        plt.close(cal.fig)
+
+
 def test_grid_focus_zoom_enlarges_one_cell_and_returns():
     """Multi-panel zoom = focus one cell: a double-click enlarges the cell into its STANDALONE plot-kind
     figure (a real HistogramFigure swapped onto the grid's own canvas), and a double-click / Esc on the
