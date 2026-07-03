@@ -63,3 +63,37 @@ def test_both_sides_use_the_same_shared_objects():
     assert bimodal.normal_cdf is rm.normal_cdf
     assert live.confidence_weighted_fidelity is rm.confidence_weighted_fidelity
     assert live.gaussian is rm.gaussian and live.bimodal_model is rm.bimodal_model
+
+
+def test_finite_mean_is_the_one_gap_safe_average_on_both_sides():
+    """``finite_mean`` -- the ONE gap-safe average shared by the live plots and the per-site shot
+    reduce -- equals ``np.nanmean`` on finite data, yields NaN for an all-NaN slice, EXCLUDES inf, and
+    (unlike ``np.nanmean``) NEVER emits a RuntimeWarning.  The SAME object on both layers, so the
+    live-plot empty-grid collapse and the na per-site reduce cannot diverge (and neither suppresses a
+    warning after the fact)."""
+    import warnings
+
+    import numpy as np
+
+    import sys
+
+    from Zou_lab_control import _readout_math as rm
+    from Zou_lab_control.frontend import live
+    # ``operations.measurement`` (the ATTRIBUTE) re-exports the @measurement decorator, shadowing the
+    # same-named submodule -- so reach the real module via ``sys.modules`` to read its ``finite_mean``.
+    import Zou_lab_control.neutral_atom.operations.measurement  # noqa: F401 -- register the submodule
+    meas_mod = sys.modules["Zou_lab_control.neutral_atom.operations.measurement"]
+
+    assert live.finite_mean is rm.finite_mean is meas_mod.finite_mean   # ONE object, both layers
+
+    a = np.array([[1.0, np.nan, 3.0], [np.nan, np.nan, 5.0], [2.0, np.nan, np.nan]])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)                     # NO warning may be raised
+        got = rm.finite_mean(a, 0)
+        assert rm.finite_mean(np.full(4, np.nan), 0).shape == ()           # scalar reduce, all-NaN -> NaN
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")                                    # nanmean itself warns; ignore ONLY here
+        want = np.nanmean(a, 0)
+    np.testing.assert_allclose(got, want, equal_nan=True)                  # equals nanmean on finite
+    assert np.isnan(got[1])                                                # all-NaN column -> NaN
+    assert rm.finite_mean(np.array([1.0, np.inf, 3.0]), 0) == 2.0          # inf excluded (not just NaN)

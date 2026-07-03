@@ -20,12 +20,12 @@ test_virtual_equals_real_contract.py`` guards this).
 
 from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, ClassVar, Protocol, runtime_checkable
 
 import numpy as np
 
+from Zou_lab_control._readout_math import finite_mean
 from Zou_lab_control._viewer_registry import active_plotter
 
 from ._spec import REQUIRED, CatalogSpec
@@ -608,14 +608,13 @@ class ScannedMeasurement:
             frames = triggered_frames(
                 self.camera, sequencer, sequence, self.plan.n_frames, stop=self.stop_event)
             rows.append(np.atleast_1d(np.asarray(self.reducer.reduce(frames, self.calibration), dtype=float)))
-        # nanmean, not mean: a per-site reducer returns NaN for a site that was
-        # empty on a given shot (no atom -> survival undefined).  Plain mean would
-        # let one NaN shot poison that site's entire scan point to NaN.  nanmean
-        # averages the shots where the site was occupied; a site empty across ALL
-        # shots stays NaN (correctly: no data), with the all-NaN warning silenced.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=RuntimeWarning)
-            return np.nanmean(np.vstack(rows), axis=0)
+        # Average over the shots where each site HAD an atom: a per-site reducer returns NaN for a
+        # site that was empty on a given shot (no atom -> survival undefined), and a plain mean would
+        # let one NaN shot poison that site's whole scan point.  ``finite_mean`` (the ONE gap-safe
+        # average, shared with the live plots) averages the occupied shots; a site empty across ALL
+        # shots stays NaN (correctly: no data) -- computed directly as sum/count, so it neither warns
+        # nor needs a catch_warnings that would blanket-ignore every other RuntimeWarning here.
+        return finite_mean(np.vstack(rows), axis=0)
 
     def run(self, *, live: bool = True, update_time: float = 0.05, display: bool = True,
             stop_hint: str | bool = True) -> ScanResult:

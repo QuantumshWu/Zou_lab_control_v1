@@ -102,10 +102,32 @@ def confidence_weighted_fidelity(threshold, mu0, sigma0, weight0, mu1, sigma1, w
     return float(fidelity), float(raw), float(separation)
 
 
+def finite_mean(a, axis=None):
+    """Mean over the FINITE (non-NaN, non-inf) entries along ``axis``; a slice with NO finite entry
+    yields NaN.
+
+    Computed DIRECTLY as sum-of-finite / count-of-finite, with the empty (count == 0) slices left NaN
+    through a masked ``divide`` -- so, unlike ``np.nanmean``, it NEVER computes a 0/0 and NEVER emits the
+    "Mean of empty slice" ``RuntimeWarning``.  An all-NaN slice is a legitimate GAP (a not-yet-measured
+    LIVE scan point, an unfilled grid cell, a site empty across every shot), so the right result is a
+    silent NaN produced by construction -- not a warning suppressed after the fact.  The ONE gap-safe
+    average shared by the live-plot repeat/facet collapse and the per-site shot reduce, so a partly
+    filled scan / grid never spams the console with one warning per empty cell, and no ``catch_warnings``
+    (global, non-thread-safe, mask-everything) is needed on any hot render / reduce path."""
+    a = np.asarray(a, dtype=float)
+    finite = np.isfinite(a)
+    count = np.count_nonzero(finite, axis=axis)
+    total = np.sum(np.where(finite, a, 0.0), axis=axis)
+    out = np.full(np.shape(count), np.nan, dtype=float)
+    np.divide(total, count, out=out, where=count > 0)   # empty slices stay NaN -- no 0/0, no warning
+    return out
+
+
 __all__ = [
     "bimodal_jacobian",
     "bimodal_model",
     "confidence_weighted_fidelity",
+    "finite_mean",
     "gaussian",
     "gaussian_jacobian",
     "gaussian_jacobian_columns",

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass, field
 from math import ceil
 from typing import Any, Mapping, Sequence
@@ -22,6 +21,7 @@ from Zou_lab_control._readout_math import (
     bimodal_jacobian,
     bimodal_model,
     confidence_weighted_fidelity,
+    finite_mean,
     gaussian,
     gaussian_jacobian,
 )
@@ -86,18 +86,6 @@ def _has_repeat_axis(a, core_ndim) -> bool:
     return a.ndim >= 3
 
 
-def _nanmean_gap_safe(a, axis):
-    """``np.nanmean`` that treats an ALL-NaN slice as an intended GAP (result NaN), not an error: a
-    not-yet-measured LIVE scan point / an empty grid cell / an unfilled site averages to NaN BY INTENT.
-    numpy flags that via TWO channels -- the 0/0 it computes (``errstate``) and a separate ``warnings``
-    message ("Mean of empty slice") that ``errstate`` does NOT catch -- so silence exactly that benign
-    pair here.  The ONE gap-safe average every repeat-collapse / decimation / site-pool shares, so a
-    partly-filled live plot never spams the console with a warning per empty cell."""
-    with warnings.catch_warnings(), np.errstate(invalid="ignore", divide="ignore"):
-        warnings.filterwarnings("ignore", message="Mean of empty slice", category=RuntimeWarning)
-        return np.nanmean(a, axis=axis)
-
-
 def reduce_repeat(raw, mode: str = "average", *, core_ndim=None, hist=False):
     """Collapse a raw block over its LEADING (repeat) axis O0 for display.  Works for ANY trailing
     shape -- a 1-D scan's ``(repeat, points, dim)``, a 2-D scan's ``(repeat, n0*n1, dim)``, a camera's
@@ -147,7 +135,7 @@ def reduce_repeat(raw, mode: str = "average", *, core_ndim=None, hist=False):
     if mode in ("replace", "roll"):
         out = a[idx[-1]] if idx.size else a[0]
         return out.reshape(-1) if hist else out
-    out = _nanmean_gap_safe(a, 0)      # 'average': an all-NaN (not-yet-measured) cell -> NaN gap, silently
+    out = finite_mean(a, 0)            # 'average': an all-NaN (not-yet-measured) cell -> NaN gap, silently
     return out.reshape(-1) if hist else out
 
 
@@ -1871,7 +1859,7 @@ def coerce_panel_value(kind, value, *, structure=None, params=None, repeat_mode=
     if kind == "sites":
         # ONE value per site: 'create' concatenates repeats -> collapse back to n_sites (mean over repeats).
         if len(ds) == 1 and int(ds[0]) > 0 and flat.size != int(ds[0]) and flat.size % int(ds[0]) == 0:
-            flat = _nanmean_gap_safe(flat.reshape(-1, int(ds[0])), 0)   # unfilled sites -> NaN, silently
+            flat = finite_mean(flat.reshape(-1, int(ds[0])), 0)   # unfilled sites -> NaN, silently
         if flat.size > 4096:
             raise ValueError(f"site-map panel needs one value per site (got {flat.size} values)")
     return flat
@@ -3313,7 +3301,7 @@ def _collapse_repeat(sliced, repeat_mode: str):
     # 'average' (and the fallback for any other verb): an all-NaN cell -- the up-front EMPTY grid a
     # scanning task publishes before its first point, or a not-yet-filled facet plane -- collapses to
     # NaN (a blank cell) BY INTENT, through the ONE gap-safe mean so it never warns per empty cell.
-    return _nanmean_gap_safe(sliced, 0)
+    return finite_mean(sliced, 0)
 
 
 def default_sub_plot_kind(facet, *, points_shape=(), data_shape=()) -> str:
