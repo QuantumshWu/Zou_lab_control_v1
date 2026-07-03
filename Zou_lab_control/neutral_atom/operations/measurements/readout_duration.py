@@ -68,6 +68,9 @@ def readout_duration_fidelity(readout) -> MeasurementSpec:
         # DURATION (the camera gate-open window) is the swept axis -- build_detection_scan configures it
         # per point through this bound pulse (the coupled OtsuFidelityReducer reduces each point inline).
         # The CAMERA owns the capture-trigger line now, so its channel is threaded in for a real streamer.
+        # INTENTIONALLY pinned to the readout (science) camera -- readout-fidelity imaging needs the
+        # science sensor, not a MOT monitor -- so it declares NO ``devices=[...]`` role (a dropdown
+        # would offer a camera it cannot run on).  pulse_scan, being device-agnostic, DOES declare it.
         cam = getattr(s.devices, "camera", None)
         cam_trig = getattr(cam, "capture_trigger_channels", None)
         state = _resolve_imaging_template(

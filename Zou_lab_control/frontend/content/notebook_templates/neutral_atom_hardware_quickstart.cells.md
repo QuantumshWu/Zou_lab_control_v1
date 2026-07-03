@@ -56,12 +56,16 @@ zf.apply_style()
 
 连接前先扫一遍本机总线：`na.discover_devices()` 枚举 Basler (pypylon) 相机和
 VISA 资源(每个资源用 `*IDN?` 短超时询问身份)。缺库/空总线不会报错，而是打印
-一行提示(confocal 式)。每台相机的行自带 **ready config 片段**——直接塞进
-device config 就能用，不用手抄序列号。
+一行提示(confocal 式)。每台相机的行自带 **ready config 片段**——把 `row.config` 直接给
+`na.load_devices({角色: row.config})` / `na.connect(...)` 就能用，闭环 discover→select→connect，
+不用手抄序列号。
 
 <!-- cell:code -->
 found = na.discover_devices()
 cameras = [d for d in found if d.config is not None]
+# 闭环:把发现到的 ready config 按角色喂进 loader(有真相机时;这里没接硬件则 cameras 为空)。
+if cameras:
+    devset = na.load_devices({"monitor_camera": cameras[0].config})
 cameras
 
 <!-- cell:markdown -->
@@ -135,7 +139,10 @@ def scan_my_bus():
 na.register_discovery_provider("mybus", scan_my_bus)
 provider_row = [row for row in na.discover_devices(display=False) if row.ident == "mybus"]
 
-demo_rows[0].config, built.camera_names(), provider_row[0].label
+# 列出一个 DeviceSet 里某角色类型的设备 = 角色通用的单源 device_names(base_type)（camera_names()
+# 只是它的相机薄封装）。平时你不用手列——每个用相机的 measurement 表单里自带 Camera 下拉，
+# GUI 里也可 exp.device_manager() 一眼看全。
+demo_rows[0].config, built.device_names(na.CameraDevice), provider_row[0].label
 
 <!-- cell:markdown -->
 ## Connect hardware
@@ -146,7 +153,7 @@ camera/sequencer。把 `host` 改成 FPGA/Vivado 电脑的 IP。
 <!-- cell:code -->
 exp = na.connect(
     "remote_template",
-    sequencer={"host": "192.168.0.20", "port": 18861},
+    sequencer={"host": "FPGA_SERVER_IP", "port": 18861},   # 改成你 FPGA/Vivado 电脑的 IP
     open_devices=True,
 )
 
@@ -154,6 +161,18 @@ exp = na.connect(
 # exp = na.connect("manual_template", open_devices=True)
 
 exp
+
+<!-- cell:markdown -->
+## See your devices（设备管理 GUI）
+
+连上后 `exp.device_manager()` 开一个窗口，按角色类型（Camera / Sequencer / Trap array / 你注册的
+RF …）列出这次配置真正载入的每台设备，并有 “Scan hardware” 现场扫总线——就是上面
+`na.discover_devices()` / `na.load_devices()` 的图形面。task console 顶栏也有个 “Devices” 按钮开同一
+窗口。之后每个用相机的测量表单里都自带 **Camera 下拉**，从这些设备里挑哪台跑该测量（单相机时
+用默认，双相机时挑读出相机还是 `monitor_camera`）。
+
+<!-- cell:code -->
+exp.device_manager()
 
 <!-- cell:markdown -->
 ## Configure and preflight the imaging sequence

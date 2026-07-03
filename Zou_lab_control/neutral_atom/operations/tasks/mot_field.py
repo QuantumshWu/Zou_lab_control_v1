@@ -26,7 +26,6 @@ from Zou_lab_control._paths import resolve_under_project
 from Zou_lab_control._viewer_registry import active_plotter
 
 from ...devices.base import CameraDevice
-from ..measurement import device_param
 from ..logic import Task, TaskOutput
 from ..measurement import ParamDecl, triggered_frames
 from ..task import TaskSpec
@@ -193,20 +192,20 @@ MOT_FIELD_PARAMS = (
 )
 
 
-@task(order=20)
+@task(order=20, devices=[("camera", {"default": "monitor_camera",
+                                     "tooltip": "Which camera watches the MOT fluorescence."})])
 def optimize_mot_field(readout) -> TaskSpec:
-    """Sweep the x/y/z coil DACs, measure the MOT on the monitor camera, report the optimum."""
+    """Sweep the x/y/z coil DACs, measure the MOT on the monitor camera, report the optimum.
+
+    The camera is a declared device ROLE (``devices=[("camera", {"default": "monitor_camera"})]``):
+    the base appends its dropdown (defaulting to the MOT viewer when the config has one, else the
+    conventional camera) and injects the RESOLVED device into ``build`` -- the SAME declarative
+    selection every device-using node uses, so a new device domain needs no edit here."""
 
     s = readout.session
-    # The camera is a USER CHOICE (a dropdown), not hardcoded: one device_param, defaulting to the
-    # MOT viewer ("monitor_camera") when the config has one, else the conventional camera.  Same
-    # declarative selection every device-using node uses -- a new device domain needs no edit here.
-    cam_param = device_param("camera", s.devices, default="monitor_camera",
-                             tooltip="Which camera watches the MOT fluorescence.")
 
-    def build(hub, *, prefix: str = "mot_", **values):
-        camera = s.devices[values.pop("camera", cam_param.default)]
+    def build(hub, *, prefix: str = "mot_", camera=None, **values):
         return OptimizeMotFieldTask(hub, camera, s.devices.sequencer, prefix=prefix, **values)
 
-    return TaskSpec(name="Optimize MOT field", build=build, params=(*MOT_FIELD_PARAMS, cam_param),
+    return TaskSpec(name="Optimize MOT field", build=build, params=MOT_FIELD_PARAMS,
                     mid_run_key="frame", default_kind="2d", prefix="mot_")

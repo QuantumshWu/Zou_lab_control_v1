@@ -219,6 +219,41 @@ def device_param(role, device_set, *, key: str | None = None, label: str | None 
         tooltip=str(tooltip or f"Which {domain.label.lower()} this node uses."))
 
 
+def normalize_device_roles(devices):
+    """Normalise a spec's ``devices=[...]`` declaration to ``(param_key, domain, opts)`` triples.
+
+    A role entry is either a bare string / :class:`DeviceDomain` (``"camera"``) or a
+    ``(role, opts)`` pair, where ``opts`` may set ``key=`` (two devices of the SAME domain --
+    e.g. ``pump_camera`` / ``probe_camera``), ``default=``, ``label=`` or ``tooltip=``.  ONE
+    normaliser so the decorator, the param appender (:func:`device_params_for`) and the
+    build-wrapper all read a role the same way -- no per-spec spelling of the role shape."""
+
+    from ..devices.registry import DEVICE_DOMAINS
+
+    out = []
+    for entry in (devices or ()):
+        if isinstance(entry, (tuple, list)):
+            role, opts = entry[0], dict(entry[1] if len(entry) > 1 else {})
+        else:
+            role, opts = entry, {}
+        domain = role if hasattr(role, "base_type") else DEVICE_DOMAINS[str(role)]
+        key = str(opts.get("key") or domain.key)      # the param key AND the **values key
+        out.append((key, domain, opts))
+    return tuple(out)
+
+
+def device_params_for(roles, device_set):
+    """The choice :class:`ParamDecl`s for a spec's declared device ``roles`` (one per role) --
+    the SINGLE bridge :meth:`CatalogSpec.with_devices_bound` uses to turn ``devices=[...]`` into
+    form controls, each built by the ONE :func:`device_param` source."""
+
+    return tuple(
+        device_param(domain, device_set, key=key,
+                     label=opts.get("label"), tooltip=opts.get("tooltip"),
+                     default=opts.get("default"))
+        for key, domain, opts in normalize_device_roles(roles))
+
+
 def measurement_slug(name: str) -> str:
     """Canonical machine token for a measurement, derived from its display ``name``
     (lower-case, non-alphanumeric runs -> single ``_``, trimmed).  ONE source: the

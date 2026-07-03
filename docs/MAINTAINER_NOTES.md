@@ -1213,9 +1213,34 @@ Start button drive identical acquisition — they cannot drift.
 `MeasurementSpec` / `ParamDecl` (declared once; API default AND GUI control derive
 from the one declaration — explicit declaration, NOT signature reflection/AST, to
 avoid the confocal AST-guess pitfall). `ParamDecl.kind` ∈
-float/int/axis_range/bool/choice; **no value is ever `eval`'d** — consumers
+`float/int/axis_range/bool/choice/text/path/signal/signal_expr/pulse_param/pulse_slots`
+(the whitelist is enforced in `measurement.py`); **no value is ever `eval`'d** — consumers
 validate/coerce by kind (the confocal free-text-eval lesson). `MeasurementSpec.build`
 closure captures `exp`, so the console never holds the session (decoupling).
+
+**Device-role injection (declare `devices=[...]`, get a dropdown + a resolved device).**
+A spec that uses a device does NOT hand-roll a `choices=camera_names()` ParamDecl or index
+`s.devices[name]`; it DECLARES its device roles on the decorator —
+`@measurement(devices=["camera"])` / `@task(devices=[("camera", {"default": "monitor_camera"})])` —
+and the base wires it in ONE place. The mechanism: `OpenRegistry.register`/`decorator` carry the
+`devices=` list; the single funnel `OpenRegistry.discovered_specs` (the only place
+`readout.session.devices` is in scope) calls `CatalogSpec.with_devices_bound(device_set, roles)`,
+which (a) appends one `choice` ParamDecl per role (`device_param`/`device_params_for`, choices =
+`DeviceSet.device_names(base_type)`, i.e. every device of that role's type — a camera role lists
+BOTH `camera` and `monitor_camera` because they are the same `CameraDevice` domain, just different
+physical devices) and (b) wraps the build-callable (`_bind_device_args`) so the operator's chosen
+NAME is resolved to the device INSTANCE and injected as that keyword before `build` runs. So a
+factory's `build(*, camera, ...)` receives a `CameraDevice`, never a string. **Pitfall:
+`_DEVICE_INJECTABLE = ("build", "make_node")` is applied only to attributes that are real dataclass
+FIELDS (field-guarded) — `MeasurementSpec.build` is a field (its `make_node` method calls the wrapped
+build), `ProcessorSpec.make_node` is a field; `dataclasses.replace` cannot swap a method.** Adding a
+new device DOMAIN (RF, DAQ, …) is one `register_device_domain(key, base_type)` call — no spec edits.
+`camera_spec` (an imperative builder, not a `@measurement` factory) calls `with_devices_bound(...)`
+by hand. Readout-locked measurements (temperature / readout-fidelity) intentionally do NOT declare a
+role (they image single atoms and must run on the science camera, not a MOT monitor). Guard:
+`tests/test_device_role_injection_contract.py` (Pin A: no hand-rolled camera dropdown via AST; Pin B:
+declared roles → real choice params; Pin C: injection passes a device, not a string). The GUI face of
+the device-DOMAIN registry is `exp.device_manager()` / the task-console "Devices" button.
 
 `ScannedMeasurementNode` (`operations/logic.py`) wraps a measurement as a console
 logic node: each `shot()` advances ONE scan point and publishes the CUMULATIVE

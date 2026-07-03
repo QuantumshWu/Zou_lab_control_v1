@@ -135,7 +135,7 @@ class DeviceManagerPanel(QtWidgets.QWidget):
 def show_device_manager(device_set, *, discover=None):
     """Open the device manager in a standalone Fluent window (parity with show_pulse_gui)."""
     panel = DeviceManagerPanel(device_set, discover=discover)
-    window = FramelessFluentWindow(panel, title="Devices@Zou lab")
+    window = FluentWindow(widget=panel, title="Devices@Zou lab")
     window.resize(scaled_px(420), scaled_px(560))
     window.show()
     return window

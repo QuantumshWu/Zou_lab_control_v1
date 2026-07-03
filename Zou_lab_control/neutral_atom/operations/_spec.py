@@ -28,7 +28,7 @@ Kept dependency-free on purpose (no import of `ParamDecl` or any operations modu
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields as _dc_fields
+from dataclasses import dataclass, field, fields as _dc_fields, replace as _dc_replace
 from typing import Any, ClassVar
 
 #: Sentinel default for a REQUIRED field on a catalog spec.  ``@dataclass(kw_only=True)`` made
@@ -38,6 +38,30 @@ from typing import Any, ClassVar
 #: ordering is always valid -- 3.9-compatible) and :meth:`CatalogSpec.__post_init__` raises if one
 #: was left unset -- the SAME "you must pass it" contract, no version dependency.
 REQUIRED: Any = object()
+
+
+def _bind_device_args(fn, keys, decls, device_set):
+    """Wrap a build-callable so each declared device-role key is popped from the caller's
+    ``**values``, resolved to a device INSTANCE via ``device_set[name]``, and passed to
+    ``fn`` as that same keyword (``camera=<CameraDevice>``) -- so a spec's ``build`` receives
+    the resolved device and never hand-writes ``device_set[name]``.  A blank / missing
+    selection falls back to the role param's own default (the conventional device).  Leading
+    POSITIONAL args (``hub`` / ``prefix``) pass through untouched -- only the role KWARGS are
+    rewritten, so the one wrapper fits every call convention (``build(**values)`` for a
+    measurement, ``build(hub, **values)`` for a task/camera_spec)."""
+
+    defaults = {d.key: d.default for d in decls}
+
+    def bound(*args, **values):
+        for key in keys:
+            name = values.pop(key, None)
+            if name in (None, ""):
+                name = defaults.get(key)
+            values[key] = device_set[name] if name is not None else None
+        return fn(*args, **values)
+
+    bound.__wrapped__ = fn          # keep introspection / tests able to reach the original
+    return bound
 
 
 @dataclass(frozen=True)
@@ -53,6 +77,14 @@ class CatalogSpec:
 
     # The sentence appended to a collision error, overridden per subclass.
     collision_advice: ClassVar[str] = "give each entry a unique signal key."
+
+    #: The spec ATTRIBUTES whose value is a build-callable taking ``**param_values``.  The
+    #: device wrapper is applied to each that is an actual dataclass FIELD (so ``replace`` can
+    #: swap it) -- ``MeasurementSpec.build`` (its ``make_node`` method then calls the wrapped
+    #: build), ``TaskSpec.build``, ``ProcessorSpec.make_node`` (a field closure).  A one-shot
+    #: processor's ``run(ctx)`` is intentionally NOT here: it receives devices via
+    #: ``ctx.camera`` / ``ctx.sequencer``, not ``**values``.
+    _DEVICE_INJECTABLE: ClassVar[tuple[str, ...]] = ("build", "make_node")
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -104,6 +136,36 @@ class CatalogSpec:
         """The declared default value for every parameter, keyed by ``key``."""
 
         return {decl.key: decl.default for decl in self.params}
+
+    def with_devices_bound(self, device_set, roles):
+        """Return a COPY of this spec with each declared device ``role`` wired ONCE:
+        (a) a ``choice`` param appended (its choices = the ``device_set`` devices of that
+        role's type, default = the conventional device), and (b) the resolved device
+        injected into every build-callable, so the factory's ``build`` receives
+        ``camera=<CameraDevice>`` instead of hand-writing ``device_set[name]``.
+
+        This is the SINGLE place device selection is turned into UI + resolution -- the
+        registry funnel calls it (where ``device_set`` is in scope) for any spec that declared
+        ``devices=[...]``, and an imperative builder (``readout.camera_spec``) calls it directly.
+        A spec that declares no roles is returned unchanged.  Only build-callables that are
+        real dataclass FIELDS are wrapped (``replace`` can swap those); a method like
+        ``MeasurementSpec.make_node`` is left alone -- it calls the wrapped ``build`` itself."""
+
+        from .measurement import device_params_for, normalize_device_roles
+
+        norm = normalize_device_roles(roles)
+        if not norm:
+            return self
+        keys = [key for key, _domain, _opts in norm]
+        appended = device_params_for(roles, device_set)
+        field_names = {f.name for f in _dc_fields(self)}
+        new_fields: dict = {"params": (*self.params, *appended)}
+        for attr in self._DEVICE_INJECTABLE:
+            if attr in field_names:
+                fn = getattr(self, attr, None)
+                if callable(fn):
+                    new_fields[attr] = _bind_device_args(fn, keys, appended, device_set)
+        return _dc_replace(self, **new_fields)
 
 
 __all__ = ["CatalogSpec", "REQUIRED"]

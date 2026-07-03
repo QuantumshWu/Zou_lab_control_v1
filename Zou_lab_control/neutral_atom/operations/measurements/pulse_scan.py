@@ -241,15 +241,20 @@ class PulseScanPlan:
         self.settle = settle
 
 
-@measurement(order=30)
+@measurement(order=30, devices=["camera"])
 def pulse_scan(readout) -> MeasurementSpec:
     """Pulse-template scan: set every API slot's value, give scan-points per scan slot (x),
-    sweep the points, and record y from a source signal published by another running node."""
+    sweep the points, and record y from a source signal published by another running node.
+
+    The camera is a declared device ROLE (``devices=["camera"]``): the base appends the camera
+    dropdown to this form and injects the RESOLVED device into ``build`` -- so this factory
+    never spells ``choices=camera_names()`` or ``s.devices[name]`` itself (any camera in the
+    config sweeps the same way, and a new device domain needs no edit here)."""
 
     s = readout.session
 
     def build(*, template: str = DEFAULT_PROBE_TEMPLATE, pulse_slots: Mapping | None = None,
-              camera: str = "camera",
+              camera=None,
               y=None, y_name: str = "signal", **_ignored) -> PulseScanPlan:
         state = _resolve_probe_template(template)
         spec = dict(pulse_slots or {})
@@ -296,10 +301,10 @@ def pulse_scan(readout) -> MeasurementSpec:
         else:
             axis_label, axis_unit = _label_for_first_api_slot(state)
         y_expr = SignalExpr.from_value(y if y is not None else DEFAULT_Y_SOURCE)
-        # The frame source is a NAMED camera device ("camera" = the readout qCMOS; a second
-        # sensor like the MOT monitor_camera sweeps the same way) -- the pure-grabber contract
+        # ``camera`` is ALREADY the resolved device the base injected from the dropdown choice
+        # (the readout qCMOS, or a monitor sensor for a MOT sweep) -- the pure-grabber contract
         # is identical, so the scan engine never cares which sensor it arms.
-        scan_camera = s.devices[str(camera or "camera")]
+        scan_camera = camera
         return PulseScanPlan(
             state, scan_names, scan_arrays, scan_camera, s.devices.sequencer,
             axis_label=axis_label, axis_unit=axis_unit, y_key=y_name, y_expr=y_expr,
@@ -311,11 +316,7 @@ def pulse_scan(readout) -> MeasurementSpec:
                   path_mode="file", base_dir="pulses", file_filter="Pulse program (*.json);;All files (*)",
                   tooltip="The pulse program fired each point.  Its api / scan slots populate the "
                           "auto-form below (one numeric input per api slot + ONE scan-table program)."),
-        ParamDecl("camera", "Camera", "choice", default=s.devices.default_camera_name(),
-                  choices=s.devices.camera_names(),
-                  tooltip="Which camera grabs each point's frame (every camera in the device "
-                          "config is listed -- e.g. the readout sensor, or a monitor viewer to "
-                          "sweep the coils and watch the MOT)."),
+        # (the "Camera" dropdown is appended by the base from devices=["camera"] -- not hand-rolled here)
         ParamDecl("pulse_slots", "Slots", "pulse_slots", default={}, depends_on="template",
                   tooltip="One numeric input per API slot (the fixed operator-set value), then a "
                           "Scan: [None | API | Scan] mode toggle that picks WHAT one shared scan "

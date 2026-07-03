@@ -68,6 +68,10 @@ def temperature_release_recapture(readout) -> MeasurementSpec:
         # The SELECTED release-recapture pulse, channel-mapped to this sequencer (real ch00.. vs
         # virtual roles).  Its trap-off duration slot s0 is the t_off scan axis.  The CAMERA owns
         # the capture-trigger line now, so its channel is threaded in for a real chNN streamer.
+        # This measurement is INTENTIONALLY pinned to the readout (science) camera -- it images
+        # single-atom survival, which a MOT monitor cannot do -- so it declares NO ``devices=[...]``
+        # role (a camera dropdown would offer a sensor it cannot run on).  Contrast pulse_scan, which
+        # is device-agnostic and DOES declare the role.
         cam = getattr(s.devices, "camera", None)
         cam_trig = getattr(cam, "capture_trigger_channels", None)
         state = _resolve_release_recapture_template(

@@ -1204,6 +1204,7 @@ zf.render_tex_pdf("notes/manual.tex", "notes/manual.pdf")
 做仪表盘面板（嵌进宿主） & \pyapi{zf.panel_plot(x, y, kind=, size=)} \\
 打开脉冲编辑器 GUI & \pyapi{zf.show_pulse_gui(sequencer=)} \\
 打开实时监控台 & \pyapi{zf.show_task_console(hub=, task=)} \\
+打开设备管理器 GUI & \pyapi{exp.device_manager()}（或 \pyapi{zf.show_device_manager(device_set)}；监控台顶栏也有 \pyapi{Devices} 按钮） \\
 推送一个 shot 给监控台 & \pyapi{hub.publish(...)} \\
 TeX/字符串 -> PDF & \pyapi{zf.render_tex_pdf(tex, out)} \\
 \bottomrule

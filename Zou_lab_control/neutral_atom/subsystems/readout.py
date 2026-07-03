@@ -23,7 +23,6 @@ from ..operations.measurement import (
     ScanAxis,
     ScanResult,
     ScannedMeasurement,
-    device_param,
     otsu_fidelity_from_frames,
     triggered_frames,
 )
@@ -567,13 +566,15 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
         return discovered_task_specs(self)
 
-    def camera_measurement(self, hub, *, camera: str | None = None, prefix: str = "",
+    def camera_measurement(self, hub, *, camera=None, prefix: str = "",
                            frames_per_cycle: int = 1, repeat: int = 0):
-        """Build a CONTINUOUS camera Measurement over a NAMED session camera (a
+        """Build a CONTINUOUS camera Measurement over a session camera (a
         :class:`~..operations.logic.CameraMeasurement` publishing raw ``frame``s).
-        ``camera`` picks the sensor by device name -- ``"camera"`` is the readout qCMOS,
-        ``"monitor_camera"`` the MOT viewer; the node is identical either way (the
-        pure-grabber contract).
+        ``camera`` is EITHER a resolved :class:`~..devices.base.CameraDevice` (what the
+        spec's device-role injection passes) OR a device NAME (``"camera"`` = the readout
+        qCMOS, ``"monitor_camera"`` = the MOT viewer, the notebook's convenience) -- ONE
+        resolution rule here so both entry points share a path; the node is identical
+        either way (the pure-grabber contract).
 
         This is the standalone live-image logic node -- one of the primitives a
         notebook or the task console composes the loading readout from by wiring
@@ -590,10 +591,15 @@ class ReadoutSubsystem(ExperimentSubsystem):
         like the console's Repeat=50 form does -- they must never diverge (virtual == real == notebook)."""
 
         from ..operations.logic import CameraMeasurement
+        from ..devices.base import CameraDevice
 
         s = self._session
-        name = str(camera) if camera else s.devices.default_camera_name()
-        return CameraMeasurement(hub, s.devices[name],
+        if isinstance(camera, CameraDevice):
+            device = camera                                    # already resolved (spec injection)
+        else:
+            name = str(camera) if camera else s.devices.default_camera_name()
+            device = s.devices[name]                           # a name (notebook convenience)
+        return CameraMeasurement(hub, device,
                                  sequencer=getattr(s.devices, "sequencer", None),
                                  frames_per_cycle=frames_per_cycle, prefix=prefix, repeat=repeat)
 
@@ -627,8 +633,10 @@ class ReadoutSubsystem(ExperimentSubsystem):
                 raise ValueError("region must be 'x0, x1, y0, y1' (4 numbers) or blank for full sensor.")
             return [float(p) for p in parts]
 
-        def _build(hub, *, camera: str | None = None, frames_per_cycle: int = 1,
+        def _build(hub, *, camera=None, frames_per_cycle: int = 1,
                    exposure: float | None = None, region: str = "", repeat: int = 0, **_ignored):
+            # ``camera`` is the RESOLVED device the base injected from the dropdown choice (or a
+            # name, on the notebook path -- camera_measurement resolves either).
             node = self.camera_measurement(hub, camera=camera,
                                            frames_per_cycle=int(frames_per_cycle),
                                            repeat=max(0, int(repeat)))
@@ -648,13 +656,9 @@ class ReadoutSubsystem(ExperimentSubsystem):
                 node.apply_acquisition_parameters(**apply)
             return node
 
-        return MeasurementSpec(
+        spec = MeasurementSpec(
             name="Camera (live frames)",
             params=(
-                device_param("camera", s.devices,   # ONE source: choices/default from the device-DOMAIN registry
-                             tooltip="Which sensor streams (every camera in the device config is "
-                                     "listed; a free-running sensor shows an image with no pulse "
-                                     "wiring at all)."),
                 ParamDecl(key="frames_per_cycle", label="frames / cycle", kind="int",
                           default=1, lo=1, hi=10000,
                           tooltip="emCCD events (camera triggers) per cycle.  Each event i publishes its "
@@ -673,8 +677,16 @@ class ReadoutSubsystem(ExperimentSubsystem):
             x_key="frame_0", y_key="frame_0",
             build=_build,
         )
+        # camera_spec is an IMPERATIVE builder (not a registered @measurement factory that the
+        # discovery funnel binds), so it wires its device role through the SAME base mechanism
+        # by hand: the "camera" dropdown is appended + the resolved device injected into _build.
+        return spec.with_devices_bound(
+            s.devices,
+            [("camera", {"tooltip": "Which sensor streams (every camera in the device config is "
+                                    "listed; a free-running sensor shows an image with no pulse "
+                                    "wiring at all)."})])
 
-    def calibrate_task(self, hub, *, prefix: str = "cal_", **params):
+    def calibrate_task(self, hub, *, prefix: str = "cal_", camera=None, **params):
         """Build the calibrate-readout TASK over the session camera (the sitemap +
         per-site threshold calibration as a first-class one-shot
         :class:`~..operations.logic.CalibrateReadoutTask`).
@@ -690,6 +702,10 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
         s = self._session
         params["grid_shape"] = s._grid_shape(params.get("grid_shape"))
+        # ``camera`` is the RESOLVED device the calibrate-readout task's device-role injection
+        # passes (the operator's dropdown choice); the notebook path calls with camera=None and
+        # gets the conventional readout camera.  ONE camera drives the whole calibration.
+        cam = camera if camera is not None else s.devices.camera
 
         def _adopt(calibration):
             # The finished calibration BECOMES the session calibration (``readout.current``),
@@ -707,11 +723,11 @@ class ReadoutSubsystem(ExperimentSubsystem):
             expo = calibration.readout_exposure(fallback=None)
             if expo:
                 try:
-                    s.devices.camera.exposure = float(expo)
+                    cam.exposure = float(expo)
                 except Exception:
                     pass
 
-        return CalibrateReadoutTask(hub, s.devices.camera,
+        return CalibrateReadoutTask(hub, cam,
                                     sequencer=getattr(s.devices, "sequencer", None),
                                     calibration_sink=_adopt, prefix=prefix, **params)
 

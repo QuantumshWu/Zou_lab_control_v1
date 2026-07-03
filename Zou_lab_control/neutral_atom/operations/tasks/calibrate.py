@@ -92,7 +92,7 @@ CALIBRATE_PARAMS = (
 )
 
 
-@task(order=10)
+@task(order=10, devices=["camera"])
 def calibrate_readout(readout) -> TaskSpec:
     """The readout-calibration task (sitemap + per-site thresholds).
 
@@ -101,12 +101,14 @@ def calibrate_readout(readout) -> TaskSpec:
     (no blank fields): one ``folder`` (default ``calibrations``) is the data + report
     directory (everything lands there, no hidden sub-folder), and ``source`` decides
     live-acquire vs saved-frames (there is NO "saved calibration" source: reusing a finished
-    calibration just loads its calibration.json in the Judge-occupancy processor).  They are
-    threaded into the built :class:`~..logic.CalibrateReadoutTask`; mid-run it streams the
-    template frame to its dedicated panel under the ``cal_`` namespace (``cal_frame``)."""
+    calibration just loads its calibration.json in the Judge-occupancy processor).  The camera
+    is a declared device ROLE (``devices=["camera"]``): the base appends its dropdown and injects
+    the RESOLVED device, which is threaded (with the other params) into the built
+    :class:`~..logic.CalibrateReadoutTask`; mid-run it streams the template frame to its
+    dedicated panel under the ``cal_`` namespace (``cal_frame``)."""
 
-    def build(hub, *, prefix: str = "cal_", **param_values):
-        return readout.calibrate_task(hub, prefix=prefix, **param_values)
+    def build(hub, *, prefix: str = "cal_", camera=None, **param_values):
+        return readout.calibrate_task(hub, prefix=prefix, camera=camera, **param_values)
 
     return TaskSpec(name="Calibrate readout", build=build, params=CALIBRATE_PARAMS,
                     mid_run_key="frame", default_kind="2d", prefix="cal_")

@@ -127,6 +127,27 @@ def open_figure_viewer(session: Any = None, *, path=None, **kwargs):
     return viewer
 
 
+def open_device_manager(session: Any, **kwargs):
+    """Open the device manager bound to ``session`` -- ONE per session (confocal-style singleton).
+
+    Shows every device the session's config loaded, grouped by device DOMAIN (Camera / Sequencer /
+    Trap array / a future RF source -- the same registry the per-measurement device dropdowns read),
+    plus a "Scan hardware" button that probes the buses.  It is the GUI face of ``na.load_devices`` /
+    ``na.discover_devices``.  A later call RESHOWS the same window (rebuilt from the live DeviceSet if
+    it was closed) -- so a notebook never accumulates duplicates."""
+
+    from Zou_lab_control.frontend import show_device_manager
+
+    existing = getattr(session, "_zlc_device_manager", None)
+    if existing is not None and _alive(existing):
+        _reshow(existing)
+        return existing
+
+    window = show_device_manager(session.devices, **kwargs)
+    session._zlc_device_manager = window
+    return window
+
+
 def load_figure(path):
     """Reopen a ``.npz`` saved by a panel's / notebook figure's Save as a hardware-free
     ``SavedFigure`` -- ``na.load_figure('scan.npz').info_summary()`` tells what it holds and
@@ -138,4 +159,5 @@ def load_figure(path):
     return _load_figure(path)
 
 
-__all__ = ["open_task_console", "open_pulse_gui", "open_figure_viewer", "load_figure"]
+__all__ = ["open_task_console", "open_pulse_gui", "open_figure_viewer",
+           "open_device_manager", "load_figure"]

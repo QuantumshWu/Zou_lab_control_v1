@@ -114,6 +114,15 @@ class NeutralAtomSession:
         from ._gui import open_figure_viewer
         return open_figure_viewer(self, path=path, **kwargs)
 
+    def device_manager(self, **kwargs):
+        """Open the device-manager GUI bound to this session: see every device the config loaded,
+        grouped by device DOMAIN (Camera / Sequencer / Trap array / a future RF source -- the SAME
+        registry the per-measurement device dropdowns read), and a "Scan hardware" button that probes
+        the buses.  The GUI face of ``na.load_devices`` / ``na.discover_devices``; a ONE-per-session
+        window."""
+        from ._gui import open_device_manager
+        return open_device_manager(self, **kwargs)
+
     def capture(self, frames: int = 1, *, camera: str | None = None, exposure: float | None = None,
                 display: bool = True) -> CaptureResult:
         """Grab raw frames from a named camera and return a notebook-friendly ``CaptureResult``.
@@ -135,7 +144,19 @@ class NeutralAtomSession:
             self.sequence = self._imaging_sequence(exposure=float(exposure), load=True)
         sequence = self.sequence
         images = triggered_frames(cam, getattr(self.devices, "sequencer", None), sequence, int(frames))
-        plot = plot_image(images[-1], display=display)
+        if not images:
+            # No edge on this camera's trigger line -> no frame (the pure-grabber contract).  The
+            # readout imaging sequence gates the READOUT camera's trigger; a camera wired to another
+            # line (e.g. the MOT monitor on ``mot_trigger``) is snapshotted through ITS own template,
+            # not this convenience.  Fail with an actionable message, never an IndexError on ``[-1]``.
+            trig = tuple(getattr(cam, "capture_trigger_channels", ()) or ())
+            raise RuntimeError(
+                f"camera {name!r} captured no frames: the imaging sequence gates the readout "
+                f"camera's trigger, but {name!r} is triggered on {trig or '(unknown line)'}.  "
+                f"Snapshot a non-readout camera (e.g. the MOT monitor) through its OWN pulse "
+                f"template -- run a Pulse-scan measurement or the Optimize-MOT-field task with "
+                f"camera={name!r} (they fire the coil template that pulses its trigger).")
+        plot = plot_image(images[-1], display=display)      # display=False builds the figure, doesn't show it
         result = CaptureResult(images=images, sequence=sequence, plot=plot)
         self.history.append(result)
         return result

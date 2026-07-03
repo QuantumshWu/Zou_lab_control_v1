@@ -43,33 +43,42 @@ class OpenRegistry:
     def __init__(self, *, noun: str, package: str) -> None:
         self._noun = noun
         self._package = package
-        # Each entry is (order, sequence, factory).  ``sequence`` is a monotonic
-        # tie-break so equal-order factories keep registration order; a list (not a
-        # dict) keeps duplicates out via identity while preserving order.
-        self._registered: list[tuple[int, int, Callable]] = []
+        # Each entry is (order, sequence, factory, device_roles).  ``sequence`` is a
+        # monotonic tie-break so equal-order factories keep registration order; a list
+        # (not a dict) keeps duplicates out via identity while preserving order.
+        # ``device_roles`` is the decorator's ``devices=[...]`` declaration -- the SINGLE
+        # place a spec says which device dropdowns it needs; the funnel binds them (a
+        # param + a resolved device) so no spec hand-rolls a camera choice or indexes
+        # ``s.devices.camera``.
+        self._registered: list[tuple[int, int, Callable, tuple]] = []
         self._seq = 0
         self._discovered = False
 
-    def register(self, factory: Callable, *, order: int = DEFAULT_ORDER) -> Callable:
+    def register(self, factory: Callable, *, order: int = DEFAULT_ORDER, devices=()) -> Callable:
         """Register ``factory(readout) -> Spec`` (idempotent by identity).
 
         Returns the factory unchanged so it doubles as a decorator.  ``order`` sets
-        catalog position (lower = earlier); built-ins use small orders."""
+        catalog position (lower = earlier); built-ins use small orders.  ``devices`` is
+        the spec's declared device roles (e.g. ``["camera"]`` or
+        ``[("camera", {"default": "monitor_camera"})]``) -- the base turns each into a
+        choice param AND injects the resolved device into ``build``/``make_node`` at
+        discovery, so the factory never touches ``s.devices[...]`` itself."""
 
         if not callable(factory):
             raise TypeError(f"{self._noun} factory must be callable, got {factory!r}.")
         if any(entry[2] is factory for entry in self._registered):
             return factory
-        self._registered.append((int(order), self._seq, factory))
+        self._registered.append((int(order), self._seq, factory, tuple(devices)))
         self._seq += 1
         return factory
 
-    def decorator(self, factory: Callable | None = None, *, order: int = DEFAULT_ORDER):
-        """Decorator form of :meth:`register` -- bare or with an order."""
+    def decorator(self, factory: Callable | None = None, *, order: int = DEFAULT_ORDER, devices=()):
+        """Decorator form of :meth:`register` -- bare, with an order, and/or with the
+        spec's declared device roles (``devices=[...]``)."""
 
         if factory is None:
-            return lambda fn: self.register(fn, order=order)
-        return self.register(factory, order=order)
+            return lambda fn: self.register(fn, order=order, devices=devices)
+        return self.register(factory, order=order, devices=devices)
 
     def unregister(self, factory: Callable) -> bool:
         """Remove a previously registered factory.  Returns True if one was removed."""
@@ -121,10 +130,16 @@ class OpenRegistry:
         self._autodiscover()
         out: list = []
         pos: dict[str, int] = {}
-        for _, _, factory in sorted(self._registered, key=lambda e: (e[0], e[1])):
+        for _, _, factory, roles in sorted(self._registered, key=lambda e: (e[0], e[1])):
             spec = factory(readout)
             if spec is None:
                 continue
+            # ONE place device selection is wired: a spec that declared ``devices=[...]``
+            # gets each role turned into a choice param + a resolved device injected into
+            # its build closure (``readout.session.devices`` is only in scope HERE).  A
+            # spec with no roles is untouched.
+            if roles:
+                spec = spec.with_devices_bound(readout.session.devices, roles)
             name = spec.name
             if name in pos:
                 out[pos[name]] = spec  # later registration overrides, same slot

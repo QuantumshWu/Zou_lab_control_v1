@@ -5830,6 +5830,7 @@ class TaskConsole(QtWidgets.QWidget):
             load_button = None
             self.pause_button = None
             self.save_image_button = None
+            self.devices_button = None
         else:
             self.save_button = FluentButton("Save", color=ACCENT)
             self.save_button.clicked.connect(self.save_to_file)
@@ -5839,6 +5840,14 @@ class TaskConsole(QtWidgets.QWidget):
             self.pause_button.clicked.connect(self._toggle_pause)
             self.save_image_button = FluentButton("Save image", color=ACCENT)
             self.save_image_button.clicked.connect(self._save_board_image)
+            # The device manager: see every device the config loaded (by role-type) + Scan hardware --
+            # the GUI face of na.load_devices/discover_devices, and the SAME device registry the per-
+            # measurement Camera dropdowns read.  A launcher (like Selectors/Pause), OUT of the running-
+            # task lockout: inspecting devices is read-only.
+            self.devices_button = FluentButton("Devices", color=GREY)
+            self.devices_button.setToolTip("Open the device manager: every loaded device grouped by "
+                                           "role-type (Camera / Sequencer / …) + a Scan-hardware button.")
+            self.devices_button.clicked.connect(self._open_device_manager)
 
         for widget in (self.status_dot, self.name_edit):
             header.addWidget(widget)
@@ -5846,8 +5855,8 @@ class TaskConsole(QtWidgets.QWidget):
         # Add Panel stays even when embedded (a loaded figure is re-wired + extra panels added), and so
         # does the Selectors switch (inspecting a loaded figure is exactly when the selectors help);
         # the four whole-console buttons only when they exist.
-        for widget in (self.kind_combo, add_button, self.selectors_switch, self.pause_button,
-                       self.save_image_button, self.save_button, load_button):
+        for widget in (self.kind_combo, add_button, self.selectors_switch, self.devices_button,
+                       self.pause_button, self.save_image_button, self.save_button, load_button):
             if widget is not None:
                 header.addWidget(widget)
         # header controls disabled while a task runs (the lockout, #5); kept as a group
@@ -7355,6 +7364,16 @@ class TaskConsole(QtWidgets.QWidget):
         -- a pure display gate, no rebuild, no effect on acquisition or the Edit tabs."""
         for card in self.cards:
             card.set_selectors_enabled(bool(on))
+
+    def _open_device_manager(self) -> None:
+        """Header "Devices" button: open the device-manager window (every loaded device by role-type
+        + Scan hardware).  Routes through the session's ONE-per-session ``device_manager()`` facade
+        (``na._gui.open_device_manager`` -> ``show_device_manager``) so it reuses the same singleton
+        the notebook opens -- the console never builds the window itself."""
+        session = getattr(self, "session", None)
+        opener = getattr(session, "device_manager", None)
+        if callable(opener):
+            opener()
 
     def _save_board_image(self) -> None:
         """Save the WHOLE monitor board (every panel, composited in its laid-out position) to a PNG.

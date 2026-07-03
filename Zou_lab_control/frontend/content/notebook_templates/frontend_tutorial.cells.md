@@ -161,7 +161,7 @@ FPGA/Vivado computer, then attach the same `RemoteSequencer` from GUI or API:
 
 ```python
 sequencer = na.RemoteSequencer(
-    host="192.168.0.20",
+    host="FPGA_SERVER_IP",   # 改成你 FPGA/Vivado 电脑的 IP
     port=18861,
     channels=[f"ch{i:02d}" for i in range(62)],
     clock_hz=50_000_000,
