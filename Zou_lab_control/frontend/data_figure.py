@@ -172,6 +172,14 @@ class DataFigure:
             self.unit_original = self.unit
         self._update_transform_back()
 
+    def fit_targets(self):
+        """The per-axes fit handles this figure represents.  A plain :class:`DataFigure` IS one target
+        (itself), so the Edit-tab fit / clear stack loops UNIFORMLY over ``fit_targets()`` regardless of
+        whether the panel is a single plot or a grid.  :class:`~.live._GridData` overrides this to yield
+        its N per-cell DataFigures, so a grid fit fans out over EVERY subplot through this identical
+        DataFigure primitive -- one fit conception, the multiplicity owned by the grid handle."""
+        return (self,)
+
     def xlim(self, x_min: float, x_max: float) -> None:
         self._ax.set_xlim(x_min, x_max)
         self.fig.canvas.draw_idle()

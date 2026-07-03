@@ -3926,6 +3926,23 @@ class _GridData:
     def cell(self, k: int):
         return self.cells[k]
 
+    def fit_targets(self):
+        """The grid's per-cell DataFigures -- the fit / limit stack loops over these so a grid fit or
+        Apply-limits fans out over EVERY subplot through the same single-axes DataFigure primitive (the
+        composite counterpart of :meth:`DataFigure.fit_targets`, whose single-target case is the base)."""
+        return tuple(self.cells)
+
+    def xlim(self, x_min: float, x_max: float) -> None:
+        """Fan an x-range out to EVERY cell (a grid Apply-limits is global-per-cell by construction),
+        mirroring :meth:`DataFigure.xlim` on each per-cell axes."""
+        for c in self.cells:
+            c.xlim(x_min, x_max)
+
+    def ylim(self, y_min: float, y_max: float) -> None:
+        """Fan a y-range out to EVERY cell -- the per-cell counterpart of :meth:`DataFigure.ylim`."""
+        for c in self.cells:
+            c.ylim(y_min, y_max)
+
     def save(self, path: str = "", *, extra_info=None, image_ext: str = ".png", **kwargs):
         """Save the whole grid the SAME way DataFigure saves a single plot: ONE png AND ONE matching
         ``.npz`` that ``load_figure`` reopens FAITHFULLY.  A grid is a first-class LOADABLE kind (like the

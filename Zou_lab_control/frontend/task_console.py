@@ -5211,9 +5211,14 @@ class PanelEditor(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(25, lambda: self._await_fresh_frame(node, epoch0, _tries=_tries + 1))
 
     def _df_for(self):
-        from .data_figure import DataFigure
+        # Route through the plotter's OWN to_data_figure() -- the SINGLE source that already knows a
+        # GridPlot is N per-cell DataFigures (returns a _GridData composite) while every other kind is a
+        # flat DataFigure.  Building DataFigure(self._plotter) directly would collapse a grid to cell-0's
+        # axes over placeholder arrays, so fit/limits would touch one subplot with garbage; going through
+        # the override makes fit_targets()/xlim()/ylim() fan out over every cell.  Cached so repeated
+        # Fit/Clear reuse the SAME per-cell handles (clear_fit clears this instance, not a fresh one).
         if self._df is None:
-            self._df = DataFigure(self._plotter)
+            self._df = self._plotter.to_data_figure()
         return self._df
 
     def do_fit(self) -> None:
@@ -5224,28 +5229,42 @@ class PanelEditor(QtWidgets.QWidget):
             return
         cmd = self.fit_cmd.text().strip()
         try:
-            df = self._df_for()
-            if df.fit is not None:
-                df.clear()
-            # trusted-local-tool posture: the typed args are injected into the
-            # fit call -- p0 / fixed-params / is_fit.
-            call = f"_df.{method}({cmd})" if cmd else f"_df.{method}(is_display=True)"
-            result, _ = eval(call, {"_df": df, "np": np})  # noqa: S307 - local experiment tool
+            # Fan the SAME fit call over every target: a flat panel is ONE target (itself), a grid is its
+            # N per-cell DataFigures (fit_targets()).  Each cell fits INDEPENDENTLY through the identical
+            # DataFigure primitive on its own bin-centres/counts + its own axes, so every subplot gets its
+            # curve + popt -- the "apply to all subplots" behaviour every other display knob has.
+            targets = list(self._df_for().fit_targets())
+            converged: list = []
+            for target in targets:
+                if getattr(target, "fit", None) is not None:
+                    target.clear()
+                # trusted-local-tool posture: the typed args are injected into the fit call (p0 / fixed
+                # params / is_fit).  ``_df`` is rebound per target so the same command fits each cell.
+                call = f"_df.{method}({cmd})" if cmd else f"_df.{method}(is_display=True)"
+                try:
+                    result, _ = eval(call, {"_df": target, "np": np})  # noqa: S307 - local experiment tool
+                except Exception:
+                    result = None            # this cell did not converge -- leave it unfitted, keep going
+                if getattr(result, "popt", None) is not None:
+                    converged.append(result)
             self._canvas.draw_idle()
-            popt = getattr(result, "popt", None)
-            names = getattr(result, "names", None) or []
-            if popt is None:
-                self.status.setText(f"fit {self.fit_combo.currentText()}: did not converge")
-                return
-            self.status.setText(f"fit {self.fit_combo.currentText()}: "
-                                + ", ".join(f"{n}={v:.4g}" for n, v in zip(names, popt)))
+            label = self.fit_combo.currentText()
+            if not converged:
+                self.status.setText(f"fit {label}: did not converge")
+            elif len(targets) == 1:
+                names = getattr(converged[0], "names", None) or []
+                self.status.setText(f"fit {label}: "
+                                    + ", ".join(f"{n}={v:.4g}" for n, v in zip(names, converged[0].popt)))
+            else:
+                self.status.setText(f"fit {label}: {len(converged)}/{len(targets)} cells converged")
         except Exception as exc:
             self.status.setText(f"fit failed: {str(exc).splitlines()[0][:140]}")
 
     def clear_fit(self) -> None:
         if self._df is not None:
             try:
-                self._df.clear()
+                for target in self._df.fit_targets():   # clear EVERY cell (grid) / the one plot (flat)
+                    target.clear()
             except Exception:
                 pass
             self._df = None

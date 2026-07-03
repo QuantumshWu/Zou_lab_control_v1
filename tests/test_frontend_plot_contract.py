@@ -154,6 +154,34 @@ def test_site_grid_exposes_per_cell_selectors_and_fitting():
         plt.close(g.fig)
 
 
+def test_fit_targets_is_the_one_fanout_seam_for_grid_and_flat():
+    """The Edit-tab fit / clear / Apply-limits stack loops over ``fit_targets()`` so ONE code path works on
+    a flat plot AND a grid: a plain :class:`DataFigure` is its OWN single target, and a grid's ``_GridData``
+    yields its N per-cell DataFigures -- so a single ``do_fit`` fans out to EVERY subplot (the regression:
+    ``do_fit`` used to build ``DataFigure(gridplot)`` and fit only cell-0's placeholder arrays).  Also pins
+    the grid ``xlim``/``ylim`` fan-out (Apply-limits is global-per-cell by construction)."""
+    rng = np.random.default_rng(5)
+    sites = [np.concatenate([rng.normal(3, 1, 60), rng.normal(50, 3, 70)]) for _ in range(6)]
+    g = zf.site_histogram_grid(sites, thresholds=[25.0] * 6, display=False)
+    try:
+        gd = g.to_data_figure()
+        targets = list(gd.fit_targets())
+        # grid multiplicity == the per-cell DataFigures (one per visible cell), each a real fit handle
+        assert targets == list(gd.cells) and len(targets) == 6
+        assert all(isinstance(t, DataFigure) for t in targets)
+        # fan-out: fitting each target INDEPENDENTLY gives every cell a popt (all subplots fitted)
+        for target in targets:
+            _, popt = target.gaussian(is_display=False)
+            assert popt is not None
+        # a flat DataFigure is its OWN single target -- the base case do_fit shares with the grid
+        assert list(targets[0].fit_targets()) == [targets[0]]
+        # Apply-limits fans out over every cell (a grid Apply is global-per-cell)
+        gd.xlim(0.0, 100.0)
+        assert all(tuple(t._ax.get_xlim()) == (0.0, 100.0) for t in targets)
+    finally:
+        plt.close(g.fig)
+
+
 def test_grid_focus_zoom_enlarges_one_cell_and_returns():
     """Multi-panel zoom = focus one cell: a double-click enlarges the cell into its STANDALONE plot-kind
     figure (a real HistogramFigure swapped onto the grid's own canvas), and a double-click / Esc on the
