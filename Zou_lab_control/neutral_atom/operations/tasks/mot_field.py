@@ -150,18 +150,20 @@ class OptimizeMotFieldTask(Task):
                  intensity=block, bx=axes[0], by=axes[1], bz=axes[2],
                  best=np.asarray(best, dtype=float))
         plotter = active_plotter()
-        if plotter is not None and hasattr(plotter, "plot"):
+        if plotter is not None and hasattr(plotter, "grid"):
             try:
                 import matplotlib.pyplot as plt
                 # facet the Bz axis: one (Bx, By) intensity map per plane -- the SAME grid facet
-                # display a console panel shows live (dim order: block is (bx, by, bz)).
-                g = plotter.plot([block[:, :, k].T for k in range(block.shape[2])],
-                                 kind="grid", sub_plot_kind="2d", display=False,
+                # (frontend.grid) a console panel shows live during the scan (block is (bx, by, bz)).
+                g = plotter.grid([block[:, :, k].T for k in range(block.shape[2])],
+                                 sub_plot_kind="2d", display=False,
                                  title="MOT intensity vs coil field (one Bz plane per cell)")
                 g.fig.savefig(folder / "mot_field_planes.png", dpi=200)
                 plt.close(g.fig)
-            except Exception:
-                pass                              # a headless/plotter-less run keeps the npz
+            except Exception as exc:              # a plotter-less run keeps the npz, but a REAL figure
+                import warnings                    # break must SURFACE (it was silently swallowed before,
+                warnings.warn(                     # which hid a wrong plotter.plot(kind="grid") call).
+                    f"MOT field report figure not written: {exc!r}", RuntimeWarning, stacklevel=2)
         return folder
 
 

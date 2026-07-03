@@ -194,6 +194,27 @@ def test_optimize_mot_field_task_converges_on_the_device_model(tmp_path):
     assert np.isfinite(saved["intensity"]).all()
 
 
+def test_report_saves_the_bz_plane_grid_figure(tmp_path):
+    """The final report is BOTH the npz block AND the Bz-plane facet-grid figure
+    (``mot_field_planes.png``, one (Bx,By) map per Bz plane).  The figure goes through the ONE
+    ``frontend.grid`` factory, exposed on the registered plotter; a wrong ``plotter.plot(kind="grid")``
+    call used to raise and be SWALLOWED by ``except: pass``, silently dropping the figure.  Importing
+    the frontend registers the plotter, so this pins that the report image is actually written."""
+    import Zou_lab_control.frontend  # noqa: F401 -- registers the neutral-atom plotter (with .grid)
+
+    ds = load_devices("virtual", open_devices=False)
+    cam = ds.devices["monitor_camera"]
+    b0 = [cam.b0[bus] for bus in cam.coil_buses]
+    task = OptimizeMotFieldTask(
+        SignalHub(), cam, ds.devices["sequencer"], template=MOT_TEMPLATE,
+        center_x=b0[0], center_y=b0[1], center_z=b0[2], span=6, points=3,
+        folder=str(tmp_path / "rep"))
+    task.run_to_completion()
+    report = Path(task.result["report_dir"])
+    assert (report / "mot_field_scan.npz").exists()
+    assert (report / "mot_field_planes.png").exists(), "the report Bz-plane grid figure is missing"
+
+
 # --------------------------------------------------------------------------- discovery
 def test_registries_discover_the_mot_chain():
     """Console visibility: the task, the processor and the monitor camera choice are all
