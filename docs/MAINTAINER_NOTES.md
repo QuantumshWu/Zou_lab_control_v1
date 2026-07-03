@@ -1135,6 +1135,28 @@ Naming note (two different "fidelity" things): **"Fidelity vs duration"** = `rea
 image GROUPS) is NOT a scan at all — no swept axis, no per-point acquire loop — so it is not a pulse-scan
 special case; it is the rigorous offline counterpart to the live `OtsuFidelityReducer` quick-look.
 
+### Two invariants every scan/pulse flow depends on (api slot AND scan slot must fire; manual config == one-click)
+
+Both are pinned by `tests/test_scan_slot_and_manual_parity.py`.
+
+- **A manually-configured logic node behaves like the one-click task.** A node's `y` (or a plot/processor
+  source) binds a signal BY NAME, resolved at RUN time — the name may reference a signal that is not live yet
+  (a pulse-scan reading its OWN `frame_0`, or a not-yet-started producer's output). The console signal picker
+  (`fill_grouped_signal_combo`) must therefore ROUND-TRIP any configured name, live or not: it adds a
+  configured `current` to the name pool so BOTH the tree and flat picker render it as a "waiting" leaf and
+  read it back. The tree branch used to drop a not-listed name → `read_editable_combo` returned `''` →
+  `collect_values()` lost the input → `_start_logic_node` built a node with an EMPTY y-expression → every
+  scan point NaN → an empty grid on Start (looked like an async/daemon race; it was the picker dropping the
+  input). One rule for both branches — the flat branch's old special-case is gone.
+- **A fireable pulse template authors on the HARDWARE clock grid.** `_resolve_probe_template` forces
+  `time_step_ns = 1e9 / DEFAULT_CLOCK_HZ` (= 20 ns) after loading, single-sourced from the streamer clock —
+  NOT whatever a saved file under the (gitignored) `pulses/` folder carried. A finer authoring grid (an old
+  save with `time_step_ns = 1`) lets an api/scan DURATION sweep produce sub-tick durations (`np.linspace` →
+  5.95 ns …) that `set_api` snaps to the template grid but that still fail the 50 MHz grid validation → the
+  sweep cannot fire ("api slot does not work"). Snapping the grid at load makes **author == snap == fire**
+  for every template, so both the software api sweep (`SCAN_MODE_API`) and the hardware scan table
+  (`SCAN_MODE_SCAN`) of a duration slot always produce a fireable sequence.
+
 ### Repeat is a measurement param; repeat_mode is a plot param (the data model)
 
 **Uniform output contract (#H3n), enforced by the base class + `tests/test_measurement_output_contract.py`:**
