@@ -98,7 +98,13 @@ _PULSE_GUI_EXPORTS = {"PulseSequenceEditor", "show_pulse_gui"}
 _TASK_CONSOLE_EXPORTS = {"TaskConsole", "TaskConsoleState", "PanelConfig", "LogicNodeConfig",
                          "default_console_state", "show_task_console"}
 _FIGURE_VIEWER_EXPORTS = {"FigureViewer", "LoadedFigureNode", "show_figure_viewer"}
-_DEVICE_MANAGER_EXPORTS = {"DeviceManagerPanel", "show_device_manager"}
+# NOTE: the device manager is DELIBERATELY NOT a public ``zf`` export.  Unlike the other three GUIs
+# (task console / pulse editor / figure viewer -- each meaningfully runs WITHOUT a session: a pure viewer,
+# or picks its own server connection), the device manager DISPLAYS the devices the neutral_atom device
+# layer loaded, and ``frontend`` is sealed from ``neutral_atom`` (one-directional), so its factory can only
+# ever take a ``DeviceSet`` that ``na`` hands it -- it cannot self-discover.  So its ONE public entry is the
+# SESSION facade ``exp.device_manager()`` (``na`` owns the DeviceSet); the widget factory
+# ``frontend.device_manager.show_device_manager`` stays INTERNAL (imported directly by ``na._gui``).
 
 
 def __getattr__(name: str):
@@ -111,9 +117,6 @@ def __getattr__(name: str):
     if name in _FIGURE_VIEWER_EXPORTS:
         figure_viewer = import_module(".figure_viewer", __name__)
         return getattr(figure_viewer, name)
-    if name in _DEVICE_MANAGER_EXPORTS:
-        device_manager = import_module(".device_manager", __name__)
-        return getattr(device_manager, name)
     raise AttributeError(name)
 
 
@@ -232,7 +235,6 @@ __all__ = [
     "render_tex_pdf",
     "run",
     "save_figure_data",
-    "show_device_manager",
     "show_figure_viewer",
     "show_pulse_gui",
     "show_task_console",

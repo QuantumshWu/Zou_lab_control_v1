@@ -54,5 +54,26 @@ def test_scan_adds_a_discovered_card_without_crashing():
     assert len(after) == before + 1 and after[-1].title().startswith("Discovered")
 
 
-def test_launcher_is_exported():
-    assert "show_device_manager" in zf.__all__ and callable(zf.show_device_manager)
+def test_device_manager_is_session_bound_not_a_public_zf_launcher():
+    """The device manager's ONE public entry is the SESSION facade ``exp.device_manager()`` -- NOT a
+    ``zf.show_device_manager(device_set)`` module function.  Unlike the other three GUIs (which run
+    session-less), it displays the devices ``na`` loaded, and ``frontend`` is sealed from ``na``, so its
+    factory can only take a ``DeviceSet`` na hands it: exposing it on ``zf`` was a leak that made callers
+    reach for ``zf.show_device_manager()`` (which then TypeErrors on the missing ``device_set``).  So:
+      * it is NOT on the public ``zf`` surface (``__all__`` nor a lazy attribute), and
+      * ``exp.device_manager()`` opens it (na owns the DeviceSet), while the internal factory stays
+        reachable from the submodule for ``na._gui`` to call."""
+    assert "show_device_manager" not in zf.__all__
+    for gone in ("show_device_manager", "DeviceManagerPanel"):
+        assert not hasattr(zf, gone), f"{gone} must not be a public zf attribute (use exp.device_manager())"
+    # the SESSION facade is the public entry, and it opens the manager without any device_set argument.
+    exp = na.connect("virtual")
+    try:
+        assert callable(exp.device_manager)
+        window = exp.device_manager()
+        assert window is not None and exp.device_manager() is window   # one-per-session singleton
+    finally:
+        exp.close()
+    # the internal factory is still importable from the submodule (the ONE caller, na._gui, uses this path)
+    from Zou_lab_control.frontend.device_manager import show_device_manager
+    assert callable(show_device_manager)

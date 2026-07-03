@@ -136,7 +136,10 @@ def open_device_manager(session: Any, **kwargs):
     ``na.discover_devices``.  A later call RESHOWS the same window (rebuilt from the live DeviceSet if
     it was closed) -- so a notebook never accumulates duplicates."""
 
-    from Zou_lab_control.frontend import show_device_manager
+    # Import the INTERNAL factory directly from the submodule: the device manager is not a public ``zf``
+    # export (unlike the other GUIs it is inherently coupled to na's DeviceSet), so ``exp.device_manager()``
+    # is the ONE public entry and this is the sole caller of the widget factory.
+    from Zou_lab_control.frontend.device_manager import show_device_manager
 
     existing = getattr(session, "_zlc_device_manager", None)
     if existing is not None and _alive(existing):

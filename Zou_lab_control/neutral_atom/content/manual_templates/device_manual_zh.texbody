@@ -86,6 +86,25 @@ na.available_device_configs()   # 列出 configs/ 下可用配置名
 na.register_device_class("MyCamera", "mypkg.devices:MyCamera")
 \end{codeblock}
 
+\section{探测总线：discover\_devices}
+\pyapi{na.discover_devices()}（\filepath{registry.py}）主动\tfocus{探测总线}——枚举在线相机（DCAM / Pylon / VISA 等）与序列器连接，返回一份"发现清单"。它\tfocus{不}构造设备、也不改会话；只回答"这台机器上现在插着什么"。缺库或空总线时它\tfocus{记一条 note 而非 raise}（与 confocal 同款容错），所以在没有硬件的开发机上调用也安全。它是"我该往配置里写哪些 \pyapi{type}"的侦察工具，和 \pyapi{load_devices}（据配置\tfocus{构造}设备）互补。
+
+\section{设备管理器 GUI：\pyapi{exp.device\_manager()}}
+把上面这些——配置里加载出的 \pyapi{DeviceSet}、以及 \pyapi{discover_devices} 的总线探测——摆到一个窗口里看，就是\tfocus{设备管理器}。它的\tfocus{唯一公开入口是会话门面 \pyapi{exp.device\_manager()}}（监控台顶栏也有一个 \pyapi{Devices} 按钮走同一入口）：
+
+\begin{codeblock}[Python]
+exp = na.connect("virtual")     # 或某份 .json 配置
+exp.device_manager()            # 打开设备管理器；每会话单例，重复调用复用同一窗口
+\end{codeblock}
+
+\begin{notebox}[为什么挂在 exp 上、而不是 zf 模块函数]
+另外三个 GUI（task console / 脉冲编辑器 / 图查看器）都能\tfocus{脱离会话}独立运行，所以它们是 \pyapi{zf.*} 模块级函数。设备管理器不同：它展示的正是 \pyapi{neutral_atom} 设备层\tfocus{已经加载好的那套 \pyapi{DeviceSet}}，而 \pyapi{frontend} 对 \pyapi{neutral_atom} 是\tfocus{单向密封}的（前端不 import na）——它的窗口工厂只能接一个"na 递进来的 \pyapi{DeviceSet}"，无法自己去发现设备。所以设备管理器\tfocus{天然与会话绑定}，唯一正确入口就是 \pyapi{exp.device\_manager()}（\pyapi{na} 持有 \pyapi{DeviceSet}）；它\tfocus{不是} \pyapi{zf} 上的函数。
+\end{notebox}
+
+窗口\tfocus{按设备域分区}（相机 / 序列器 / 阱阵列 / 未来的射频源……）——每个域一张卡，列出该域下每台设备的类型与状态。分区不是相机专属硬清单，而是\tfocus{读注册表的设备域}（与各测量的设备下拉框同一个源）：注册一个新域，管理器自动多出一张卡，无需改面板代码。顶部的\tfocus{Scan hardware}按钮就地调用 \pyapi{discover_devices} 探测总线，把发现到的设备并成一张"Discovered"卡。
+
+__DEVICE_MANAGER_FIG__
+
 \section{设备契约（四种类型）}
 所有设备继承 \pyapi{BaseDevice}（\pyapi{open/close/stop/snapshot}）。三个\tfocus{类型化}子类是强约束（用 \pyapi{isinstance} 校验，不是鸭子类型）：
 

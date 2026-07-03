@@ -211,6 +211,7 @@ def generate_device_manual_figures(asset_dir: str | Path) -> dict[str, Path]:
         "threshold_hist": _render_threshold_hist(asset_dir / "device_threshold_hist.png"),
         "grabber_timing": _render_grabber_timing(asset_dir / "device_grabber_timing.png"),
         "trigger_cable": _render_trigger_cable(asset_dir / "device_trigger_cable.png"),
+        "device_manager": _render_device_manager_shot(asset_dir / "device_manager_shot.png"),
     }
 
 
@@ -262,6 +263,52 @@ def _cable_figure_tex(fig_path: str) -> str:
     return (
         "\\begin{figure}[h]\n\\centering\n"
         f"\\includegraphics[width=0.92\\linewidth]{{{fig_path}}}\n"
+        f"\\caption{{{caption}}}\n"
+        "\\end{figure}"
+    )
+
+
+def _render_device_manager_shot(path: Path) -> Path:
+    """Real screenshot of the device-manager GUI (``exp.device_manager()``): ONE section per registered
+    device domain, driven by the device registry.  Built on a virtual DeviceSet so it renders with no
+    hardware -- the SAME widget the session facade opens (this doc-build tool may reach the frontend, like
+    the other GUI figures here; the runtime analysis path stays sealed)."""
+    try:
+        import os
+
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from Zou_lab_control.frontend import devtools as dt
+        from Zou_lab_control.frontend.device_manager import DeviceManagerPanel
+        from Zou_lab_control.frontend.devtools import install_screenshot_font
+        from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+        from Zou_lab_control.neutral_atom.devices.registry import load_devices
+
+        ensure_qt_app()
+        install_screenshot_font()
+        panel = DeviceManagerPanel(load_devices("virtual"))
+        panel.resize(430, 480)
+        panel.show()
+        dt.settle(panel, 500)
+        panel.grab().save(str(path))
+        return path
+    except Exception:
+        return _device_placeholder_image(
+            path, "设备管理器 GUI：按域分区（Camera / Sequencer / Trap array）+ Scan hardware 按钮")
+
+
+def _device_manager_figure_tex(fig_path: str) -> str:
+    caption = (
+        "\\tfocus{设备管理器 GUI}（\\pyapi{exp.device\\_manager()}）：把 \\pyapi{connect} / "
+        "\\pyapi{load\\_devices} 加载出的每个设备\\tfocus{按域分区}列出（Camera / Sequencer / Trap array / "
+        "未来的 RF 源——与逐测量的设备下拉读的是\\tfocus{同一个注册表}），底部 \\pyapi{Scan hardware} 按钮"
+        "现场探一遍总线并把发现的设备补一张卡。它是 \\pyapi{load\\_devices} / \\pyapi{discover\\_devices} 的"
+        "\\tfocus{GUI 面孔}，\\tfocus{与会话绑定}——唯一入口是 \\pyapi{exp.device\\_manager()}（监控台顶栏的 "
+        "\\pyapi{Devices} 按钮走同一个每会话单例）。它天生依赖会话的 \\pyapi{DeviceSet}（frontend 被密封、"
+        "拿不到设备），所以\\tfocus{不}是一个 \\pyapi{zf} 模块级函数。"
+    )
+    return (
+        "\\begin{figure}[h]\n\\centering\n"
+        f"\\includegraphics[width=0.5\\linewidth]{{{fig_path}}}\n"
         f"\\caption{{{caption}}}\n"
         "\\end{figure}"
     )
@@ -444,7 +491,10 @@ def device_manual_body(figures: Mapping[str, Path] | None = None) -> str:
     body = body.replace("__CAMERA_GRABBER_FIG__", grab_tex)
     cable_path = None if not figures else figures.get("trigger_cable")
     cable_tex = _cable_figure_tex(Path(cable_path).as_posix()) if cable_path else ""
-    return body.replace("__CAMERA_CABLE_FIG__", cable_tex)
+    body = body.replace("__CAMERA_CABLE_FIG__", cable_tex)
+    dm_path = None if not figures else figures.get("device_manager")
+    dm_tex = _device_manager_figure_tex(Path(dm_path).as_posix()) if dm_path else ""
+    return body.replace("__DEVICE_MANAGER_FIG__", dm_tex)
 
 
 __all__ = [
