@@ -40,7 +40,11 @@ class OptimizeMotFieldTask(Task):
     """Scan the three coil-field DAC api slots over a 3-D grid, measure the MOT spot intensity per
     point on the monitor camera, and report the optimum field (argmax + local centre-of-mass)."""
 
-    mid_run = ("frame", "progress", "stage")
+    # The mid-run signals the console shows LIVE while the task runs: ``grid`` (the accumulating 3-D
+    # intensity block, one (Bx,By) map per Bz plane, filling in point-by-point) is the primary panel;
+    # ``frame`` / ``progress`` / ``stage`` back the banner.  ``grid`` is FIRST so a console that shows a
+    # single mid-run panel shows the live 3-D scan grid, not just the current camera frame.
+    mid_run = ("grid", "frame", "progress", "stage")
 
     def __init__(self, hub, camera: CameraDevice, sequencer, *,
                  template: str = DEFAULT_MOT_TEMPLATE,
@@ -57,6 +61,10 @@ class OptimizeMotFieldTask(Task):
         self.points = max(2, int(points))
         self.roi_cx, self.roi_cy, self.roi_radius = float(roi_cx), float(roi_cy), float(roi_radius)
         self.folder = str(folder)
+        # The 3-D scan shape (nx, ny, nz) is DETERMINISTIC from the sweep params (each axis' distinct
+        # integer DAC codes), so the console can lay out the live facet grid the moment the task starts,
+        # BEFORE run() fires a point.  Same rule run() uses (``_axis_codes``), so panel shape == data shape.
+        self.grid_shape = tuple(len(self._axis_codes(c)) for c in self.centers)
 
     # ------------------------------------------------------------------ pieces
     def _coil_slots(self, state) -> list[str]:
@@ -105,7 +113,12 @@ class OptimizeMotFieldTask(Task):
         n_total = nx * ny * nz
         block = np.full((nx, ny, nz), np.nan)
 
-        out.publish(progress=0.0, stage=f"sweeping {nx}x{ny}x{nz} coil grid on {slots}")
+        # The LIVE 3-D grid: the console binds a facet grid to this (repeat=1, n_points, 1) block +
+        # points_shape=(nx,ny,nz) (see ``grid_shape``), facets the Bz axis -> one (Bx,By) map per plane
+        # that fills in point-by-point.  Publish the all-NaN block ONCE up front so the empty grid shows
+        # immediately, then re-publish after every point (a copy -- the reader must not see it mutate).
+        out.publish(progress=0.0, stage=f"sweeping {nx}x{ny}x{nz} coil grid on {slots}",
+                    grid=block.reshape(1, -1, 1).copy())
         done = 0
         for i, bx in enumerate(axes[0]):
             for j, by in enumerate(axes[1]):
@@ -126,7 +139,8 @@ class OptimizeMotFieldTask(Task):
                     done += 1
                     out.publish(frame=np.asarray(frame, dtype=float),
                                 progress=done / n_total,
-                                stage=f"({bx}, {by}, {bz}) -> {block[i, j, k]:.1f}")
+                                stage=f"({bx}, {by}, {bz}) -> {block[i, j, k]:.1f}",
+                                grid=block.reshape(1, -1, 1).copy())     # the live 3-D grid, one point fuller
 
         if not np.isfinite(block).any():
             raise RuntimeError("the coil sweep produced no frames -- is the sequencer firing?")
@@ -210,4 +224,4 @@ def optimize_mot_field(readout) -> TaskSpec:
         return OptimizeMotFieldTask(hub, camera, s.devices.sequencer, prefix=prefix, **values)
 
     return TaskSpec(name="Optimize MOT field", build=build, params=MOT_FIELD_PARAMS,
-                    mid_run_key="frame", default_kind="2d", prefix="mot_")
+                    mid_run_key="grid", default_kind="grid", prefix="mot_")

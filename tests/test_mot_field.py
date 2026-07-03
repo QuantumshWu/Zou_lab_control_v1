@@ -215,6 +215,68 @@ def test_report_saves_the_bz_plane_grid_figure(tmp_path):
     assert (report / "mot_field_planes.png").exists(), "the report Bz-plane grid figure is missing"
 
 
+# --------------------------------------------------------------------------- LIVE mid-run 3-D grid
+def test_task_mid_run_channel_is_the_live_3d_grid(tmp_path):
+    """The one-click task's PRIMARY mid-run channel is the accumulating 3-D scan GRID, not just the
+    current camera frame: ``grid`` is declared FIRST in ``mid_run`` (so a single mid-run panel shows
+    the grid), the task announces its ``grid_shape`` up front (before firing a point, so the console
+    can lay out the empty facet grid immediately), and the published (repeat, n_points, 1) block --
+    reshaped by that shape -- IS the exact scan the report saves.  This pins that the live panel is
+    the real 3-D scan filling in, never a lone 2-D image (the exact thing the operator watched)."""
+    ds = load_devices("virtual", open_devices=False)
+    cam = ds.devices["monitor_camera"]
+    b0 = [cam.b0[bus] for bus in cam.coil_buses]
+    task = OptimizeMotFieldTask(
+        SignalHub(), cam, ds.devices["sequencer"], template=MOT_TEMPLATE,
+        center_x=b0[0], center_y=b0[1], center_z=b0[2], span=6, points=3,
+        folder=str(tmp_path / "rep"))
+    assert task.mid_run[0] == "grid"                   # grid is the panel's DEFAULT (first) mid-run key
+    assert task.grid_shape == (3, 3, 3)                # deterministic from the sweep params, pre-run
+    assert len(task.grid_shape) >= 2                   # -> the console facets it (a 1-D shape would not)
+    task.run_to_completion()
+    block = np.asarray(task.output.latest("grid"), dtype=float)
+    assert block.shape == (1, int(np.prod(task.grid_shape)), 1)   # the (repeat, n_points, 1) facet block
+    saved = np.load(Path(task.result["report_dir"]) / "mot_field_scan.npz")["intensity"]
+    # the LIVE grid IS the report scan (same numbers), reshaped by the DECLARED grid_shape
+    np.testing.assert_allclose(block.reshape(task.grid_shape), saved, equal_nan=True)
+
+
+def test_console_task_panel_is_a_live_facet_grid():
+    """Driving the REAL console's task-run path for the one-click MOT task opens its mid-run panel as
+    a FACET GRID bound to the reserved ``__task_frame__`` (one (Bx,By) map per Bz plane), sized from
+    the task's own ``grid_shape`` -- NOT a lone 2-D frame.  Mechanically pins the regression where the
+    operator saw only the current camera image while the task ran."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import (
+        TaskConsole, LogicNodeConfig, default_console_state)
+    from Zou_lab_control import neutral_atom as na
+
+    ensure_qt_app()
+    exp = na.connect("virtual")
+    try:
+        con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
+                          measurements=exp.readout.measurement_specs(),
+                          processors=exp.readout.processor_specs(),
+                          tasks=exp.readout.task_specs(), window_px=(1000, 700))
+        cam = exp.devices["monitor_camera"]
+        b0 = [cam.b0[bus] for bus in cam.coil_buses]
+        con._add_logic_node(LogicNodeConfig(
+            kind="task", name="Optimize MOT field", title="Optimize MOT field",
+            values={"center_x": b0[0], "center_y": b0[1], "center_z": b0[2], "span": 6, "points": 3}))
+        row = con.logic_nodes[-1]
+        node = con._build_logic_node(row.node, dict(row.node.values))   # build only -- do NOT run the daemon
+        con._set_task_running(row, node)                                # the panel-open path
+        cfg = con._task_card.config
+        assert cfg.kind == "grid"
+        assert list(node.grid_shape) == [3, 3, 3]
+        assert cfg.params["points_shape"] == list(node.grid_shape)
+        assert cfg.params["facet"] == f"points:{len(node.grid_shape) - 1}"
+        assert "__task_frame__" in cfg.source
+        con.shutdown()
+    finally:
+        exp.close()
+
+
 # --------------------------------------------------------------------------- discovery
 def test_registries_discover_the_mot_chain():
     """Console visibility: the task, the processor and the monitor camera choice are all

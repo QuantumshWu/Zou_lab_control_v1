@@ -726,3 +726,18 @@ per-site 信号 (photons) & \pyapi{counts} → Distribution(双高斯+阈值) \\
 
 \section{优先级}
 (1) 是现状基线。其上的优先级:(2) 性能激进档需先定是否接受行为/视觉变化、(3)(4) 形状启发式收口与死码清理较顺手、(5)(6)(7) 是更大的架构决定,定方向后再做。
+
+\section{scan/pulse 流程的两条不变量(api slot 与 scan slot 都能扫;手动配 == 一键)}
+每一个扫描/脉冲流程都靠这两条不变量成立,由 \filepath{tests/test\_scan\_slot\_and\_manual\_parity.py} 机械守卫。
+
+\begin{itemize}
+  \item \tfocus{手动配一个逻辑节点,和一键任务得到同样的结果}。逻辑节点的 \pyapi{y}(以及面板/processor 的 source)按\tfocus{名字}绑定信号,在\tfocus{运行时}解析——这个名字\tfocus{可以引用一个当前还没 live 的信号}:一个 pulse-scan 读它\tfocus{自己}的 \pyapi{frame\_0},或一个还没启动的 producer 的输出。所以控制台的信号选择器(\pyapi{fill\_grouped\_signal\_combo})必须\tfocus{原样保留}你配置的名字,不管它当前是否 live:它把配置的名字补进候选池,让\tfocus{树形与扁平两种选择器}都渲染成一个 waiting 叶子并能\tfocus{读回}。早先树形分支会丢掉不在列表里的名字 → \pyapi{read\_editable\_combo} 返回空 → \pyapi{collect\_values} 丢掉 \pyapi{y} 的输入 → 点 Start 建出一个\tfocus{空 y 表达式}的节点 → 每个扫描点都 NaN → grid 空白(看起来像异步竞争,其实是选择器丢了输入)。两个分支现在一条规则。
+  \item \tfocus{可 fire 的脉冲模板一律落在硬件时钟栅格上}。\pyapi{\_resolve\_probe\_template} 加载后强制 \pyapi{time\_step\_ns = 1e9 / DEFAULT\_CLOCK\_HZ}(= 20\,ns),单一真相源=流送器时钟,而\tfocus{不是}被 gitignore 的 \filepath{pulses/} 里某个存档文件碰巧带的值。授权栅格更细(旧存档 \pyapi{time\_step\_ns = 1})会让一个 duration 型 api/scan 扫描扫出\tfocus{非整 tick} 的时长(\pyapi{np.linspace} → 5.95\,ns …),\pyapi{set\_api} 只 snap 到模板栅格、仍过不了 50\,MHz 栅格验证 → 扫描\tfocus{无法 fire}(api slot 不能用)。在加载处 snap 让\tfocus{授权==snap==fire} 对每个模板都成立,于是一个 duration 槽的\tfocus{软件 api 扫描}(\pyapi{SCAN\_MODE\_API})和\tfocus{硬件 scan 表扫描}(\pyapi{SCAN\_MODE\_SCAN})都总能产出可 fire 的序列。
+\end{itemize}
+
+实测(真控制台手动 build+step / 一键 run\_to\_completion,都出真数据):pulse-scan 的 api-slot(软件扫)/ scan-slot(硬件扫表)/ MOT 3D api 线圈扫、温度、保真、Calibrate 与 Optimize-MOT 任务全部产出真实曲线/结果,MOT 任务最优精确命中 b0。
+
+\subsection{一键任务的 mid-run 面板 = live 3D facet grid(不是当前帧)}
+一个任务(Task)跑起来时,控制台开一个专属 mid-run 面板(\pyapi{\_set\_task\_running})显示它\tfocus{正在做的工作}。默认这个面板只画任务的\tfocus{当前帧}(\pyapi{mid\_run\_key});但对一个\tfocus{扫场}的任务——Optimize-MOT-field 扫 x/y/z 三线圈 DAC——操作者要看的是\tfocus{整个 3D 扫描网格逐点填满},而不是某一发的相机 2D 图。
+
+所以:任务把 \pyapi{grid} 声明为 \pyapi{mid\_run} 的\tfocus{第一个}通道(单面板默认取第一个 → 显示 grid 而非 frame),并在 \pyapi{\_\_init\_\_} 里\tfocus{确定性地}算出 \pyapi{grid\_shape = (nx, ny, nz)}(从扫描参数派生,\tfocus{开跑前}就知道,和 \pyapi{run()} 用同一 \pyapi{\_axis\_codes} 规则 → 面板形状 == 数据形状)。\pyapi{run()} 每测完一点就 \pyapi{out.publish(grid = block.reshape(1, -1, 1))} 重发一份累积块。控制台侧 \pyapi{\_set\_task\_running} 见到 \pyapi{default\_kind = "grid"} 且 \pyapi{grid\_shape} 维数 $\ge 2$,就建一个\tfocus{和 pulse-scan grid 面板同一套} facet-grid 机制的面板:\pyapi{facet = "points:<末轴>"}、\pyapi{points\_shape = grid\_shape}、绑定保留信号 \pyapi{\_\_task\_frame\_\_}(任务输出\tfocus{不上 hub},见 §Task-output)。因为任务面板没有产出信号的 hub 节点可读结构,\pyapi{points\_shape} 通过\tfocus{面板参数}送达 \pyapi{\_facet\_value\_shapes}。于是面板\tfocus{一开跑就摆好空网格},随每点 publish 一格一格填,末轴每个平面一张 (Bx, By) 图——正是操作者要盯着看的 live 3D grid。由 \filepath{tests/test\_mot\_field.py} 的 \pyapi{test\_task\_mid\_run\_channel\_is\_the\_live\_3d\_grid}(发布的块 reshape 后 == 报告 npz)与 \pyapi{test\_console\_task\_panel\_is\_a\_live\_facet\_grid}(真控制台 task-run 路径建出 facet grid 面板)机械守卫。

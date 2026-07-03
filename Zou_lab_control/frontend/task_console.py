@@ -2669,7 +2669,9 @@ class PanelCard(FluentGroupBox):
         declared one.  The ONE source the facet choices, the auto sub-kind and the slicer share."""
         st = self._bound_structure() or {}
         gs = tuple(int(n) for n in (st.get("grid_shape") or ()))
-        ps = tuple(int(n) for n in (st.get("points_shape") or ()))
+        # A task mid-run panel binds ``__task_frame__`` (off-hub, #6), so there is no producing hub node
+        # to read structure from -- its scan shape comes from the panel params the task set at start.
+        ps = tuple(int(n) for n in (st.get("points_shape") or self.config.params.get("points_shape") or ()))
         ds = tuple(int(n) for n in (st.get("data_shape") or ()))
         return (gs or ps), ds
 
@@ -6984,8 +6986,24 @@ class TaskConsole(QtWidgets.QWidget):
         title = f"Task: {row.node.title}"
         # The dedicated panel reads the reserved ``__task_frame__`` injected each tick
         # from the task's output buffer (see _tick) -- never a hub signal.
-        config = PanelConfig(kind=kind, title=title, size="2x2",
-                             source="value = __task_frame__")
+        params: dict = {}
+        size = "2x2"
+        if kind == "grid":
+            # A task whose mid-run block is a MULTI-D scan (e.g. Optimize-MOT-field's (repeat, n_points, 1)
+            # intensity block over an (nx,ny,nz) coil grid) shows its LIVE facet grid here: the task
+            # declares its scan shape up front (``node.grid_shape``), so the panel facets the LAST axis
+            # (one 2-D map per outer-axis plane) and fills in point-by-point.  Reuses the SAME facet-grid
+            # machinery a pulse-scan grid panel uses; ``points_shape`` reaches ``_facet_value_shapes``
+            # through the panel params (a task panel has no producing hub node to read structure from).
+            gshape = tuple(int(n) for n in (getattr(node, "grid_shape", ()) or ()))
+            if len(gshape) >= 2:
+                params = {"facet": f"points:{len(gshape) - 1}", "points_shape": list(gshape),
+                          "sub_plot_kind": "2d"}
+                size = "4x4"
+            else:                                    # a 1-D / degenerate scan -> a plain 1-D task curve
+                kind = "1d"
+        config = PanelConfig(kind=kind, title=title, size=size,
+                             source="value = __task_frame__", params=params)
         card = self._new_panel_card(config)
         self._attach_card(card)
         self._task_card = card
