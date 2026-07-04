@@ -34,7 +34,7 @@ zf.apply_style()
 - `na.triggered_frames(camera, sequencer, sequence, frames)`：测量层**唯一**的 arm-before-fire 编排（arm 相机 → prepare+fire 序列 → 读回帧）。需要 sequencer 的是测量层，从来不是相机。
 - `na.load_devices(...)`：按 JSON/dict 构造 device graph，合并本次运行的 device 参数，并要求每个 device 继承对应 base class；需要时也可以统一 open。**接自己的硬件**：写一个继承 `CameraDevice` / `SequencerDevice` / `TrapArrayDevice` 的类，`na.register_device_class(名, 类)` 注册后按短名引用（或 `load_devices(..., lookup=globals())` 零注册直接用），可选给它一个 `discover()` 让 `na.discover_devices()` 扫到它——完整示例见 hardware quickstart 与 device manual。
 - `exp.camera`：默认（读出角色）camera device 本体；一键快照是会话级编排 `exp.capture()`（`exp.capture(camera="名")` 指定某台相机；非读出相机如 MOT 监视相机走它自己的 coil 模板/measurement，不是这个便捷接口）。
-- `exp.device_manager()`：**设备管理 GUI**——按角色类型（Camera / Sequencer / Trap array / 未来的 RF …）列出当前配置载入的每台设备，并有 “Scan hardware” 扫总线；task console 顶栏也有个 “Devices” 按钮开它。它是 `na.load_devices` / `na.discover_devices` 的图形面。
+- `exp.device_manager()`：**设备管理 GUI**——按角色类型（Camera / Sequencer / Trap array / 未来的 RF …）列出当前配置载入的每台设备，顶栏有 “Scan hardware” 扫总线、“Open devices” 初始化硬件、“Load config…” / “Save config…” 存取实验配置（对应会话 `exp.open_devices()` / `exp.load_config()` / `exp.save_config()`——存一份调好的配置、下次 `na.connect(那份.json)` 一行连回来）；task console 顶栏也有个 “Devices” 按钮开它。它是 `na.load_devices` / `na.discover_devices` 的图形面。
 - **按测量选设备**：凡用到相机的 measurement / task（*Pulse scan*、*Camera (live frames)*、*Optimize MOT field*）表单里都自动带一个 **Camera 下拉**——它的 spec 声明了 `devices=["camera"]`，基类就自动追加下拉并把**你选中**的设备注入进去（单相机用默认；双相机时在这里挑 `monitor_camera` 还是读出相机）。加一台新设备域（RF…）无需改任何 spec。读出/存活/保真类测量**故意**锁定读出科学相机（MOT 监视相机无法成像单原子）所以不给下拉。
 - `exp.readout`：camera readout subsystem，包含 sitemap、threshold、detect、detection-time fidelity calibration。
 - `exp.timing.*`：pulse sequence、preflight、Verilog 生成。
