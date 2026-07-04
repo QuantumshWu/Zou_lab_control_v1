@@ -537,10 +537,14 @@ def test_fixed_lims_reach_the_parked_grid_thumbnails():
         plt.close("all")
 
 
-def test_dashboard_focus_view_is_display_only():
-    """The Monitor card is DISPLAY-ONLY (no selectors -- every _build_plot branch passes
-    interactions=False): the ENLARGED grid cell on the dashboard follows the SAME rule.  Interactive
-    zoom / region-select lives in the Edit tab's snapshot only."""
+def test_dashboard_focus_view_parks_selectors_by_default():
+    """The Monitor board is display-only BY DEFAULT via the header "Selectors" switch (OFF).  Its ONE
+    interactive surface is the ENLARGED focus cell (the grid thumbnails stay display-only by design):
+    that enlarged standalone plot-kind figure BUILDS its selector layer -- the plot-contract requires
+    every shown plot to carry a NON-EMPTY interaction_handles() -- but PARKS it inactive to the switch,
+    so a fresh double-click zoom cannot misfire until the switch arms it.  (The switch's live arm/park
+    across a whole board is proven end-to-end in test_console_selector_toggle; here we pin that the
+    FOCUS cell obeys the same default-parked rule, via the same _zlc_selectors_off observable.)"""
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
     ensure_qt_app()
@@ -551,8 +555,19 @@ def test_dashboard_focus_view_is_display_only():
         card._build_plot(0.0, {})
         card._on_grid_canvas_click(_DblClick(card.plotter.site_axes[1]))
         assert card._grid_focus is not None
-        assert list(card.plotter.interaction_handles()) == [], \
-            "the dashboard's enlarged cell carries NO selectors (Monitor cards are display-only)"
+        p = card.plotter                                   # the enlarged standalone plot-kind figure
+        handles = list(p.interaction_handles())
+        assert handles, "the enlarged focus cell BUILDS its selector layer (plot-contract: non-empty)"
+        assert not card._selectors_on, "the switch defaults OFF (display-only board)"
+        # switch OFF -> every tool parked: the AreaSelector widget inactive, self-managed tools disconnected
+        area = getattr(p, "area", None)
+        if area is not None and getattr(area, "selector", None) is not None:
+            assert not area.selector.get_active(), "area selector parked while the switch is OFF"
+        self_managed = [h for h in handles if getattr(h, "selector", None) is None]
+        assert self_managed, "the enlarged cell has self-managed tools (zoom / cross / clim drag)"
+        for h in self_managed:
+            assert getattr(h, "_zlc_selectors_off", False), \
+                f"{type(h).__name__} must be parked (disconnected) while the switch is OFF"
     finally:
         card.shutdown()
         plt.close("all")
