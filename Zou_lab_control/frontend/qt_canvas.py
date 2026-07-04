@@ -228,11 +228,13 @@ else:
             painter.end()
 
         def resizeEvent(self, event):  # noqa: N802 - Qt naming
-            # spec-owned figure: NEVER re-derive the figure geometry from the
-            # widget size (the stock handler does, and any transient mismatch
-            # warps the fixed-inches axes layout).  Accept the size, repaint.
+            # spec-owned figure: NEVER re-derive the figure geometry from the widget size (the stock
+            # handler does, and any transient mismatch warps the fixed-inches axes layout).  The Agg
+            # BUFFER is dpi-based -- independent of widget size (paintEvent stretch-blits it over rect())
+            # -- so a resize needs only a RE-BLIT, not a re-render: update() repaints the existing buffer,
+            # NOT draw_idle() (which re-renders the whole heavy figure for a pixel-identical result).
             QtWidgets.QWidget.resizeEvent(self, event)
-            self.draw_idle()
+            self.update()
 
         # ------------------------------------------------------------- behaviour
         def wheelEvent(self, event):  # noqa: N802 - Qt naming
