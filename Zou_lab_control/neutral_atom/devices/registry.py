@@ -179,6 +179,16 @@ class DeviceSet:
             out[name] = snap() if callable(snap) else {"type": type(device).__name__}
         return out
 
+    def to_config(self) -> dict[str, Any]:
+        """The round-trippable device CONFIG that reproduces THIS set: the ``{role: {"type", "params"}}``
+        dict ``load_devices`` built the set from (``$device:`` cross-references intact), deep-copied so a
+        caller can serialize / mutate it freely.  ``na.connect(device_set.to_config())`` -- or writing it
+        to JSON and ``na.connect("that.json")`` -- rebuilds an equivalent device set.  This is the ONE
+        source the session's ``save_config`` / the device-manager "Save config" button writes (vs
+        :meth:`snapshot`, which is a per-device STATE dump that does NOT round-trip through ``type`` /
+        ``params``)."""
+        return deepcopy(self.config)
+
     def _open_order(self) -> list[str]:
         # Cameras open LAST (they may bind to an already-open sequencer/trigger source) --
         # decided by TYPE, not by a hardcoded device name, so a monitor_camera or any other

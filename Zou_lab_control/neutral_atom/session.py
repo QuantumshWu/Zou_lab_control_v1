@@ -123,6 +123,57 @@ class NeutralAtomSession:
         from ._gui import open_device_manager
         return open_device_manager(self, **kwargs)
 
+    def save_config(self, path: str | Path) -> Path:
+        """Write this session's device CONFIG to ``path`` as JSON so it can be reloaded later.
+
+        The config is ``self.devices.to_config()`` -- the round-trippable ``{role: {"type", "params"}}``
+        dict the device set was built from -- so ``na.connect(path)`` (or the device manager's "Load
+        config" button, or :meth:`load_config`) reproduces the SAME hardware set on the next session.  A
+        missing ``.json`` suffix is added; parent dirs are created.  Returns the written path."""
+        import json
+
+        path = Path(path)
+        if path.suffix.lower() != ".json":
+            path = path.with_suffix(".json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.devices.to_config(), indent=2, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    def load_config(self, config: str | Path | dict[str, Any], *, open_devices: bool = False):
+        """Rebuild this session's devices from a NEW experiment config -- a SETUP-time swap of what
+        hardware the session drives (do it before running measurements, not mid-acquisition).
+
+        ``config`` takes the SAME forms as :func:`connect` (``"virtual"``, a bundled config name, a JSON
+        path, or a ``{role: {type, params}}`` dict).  The NEW set is built FIRST (so a bad config leaves
+        the current session untouched), then swapped in and every device-derived piece of state -- the
+        imaging sequence, the calibration, the readout / timing subsystems -- is re-derived so the
+        session is consistent with the new hardware; the OLD devices are then closed.  ``open_devices``
+        opens the real hardware immediately (else it stays lazy, opened on first use / :meth:`open_devices`).
+        The device manager's "Load config" button routes here.  Returns ``self``."""
+        from .devices import load_devices, read_config
+
+        new_devices = load_devices(read_config(config), open_devices=open_devices)
+        old_devices = getattr(self, "devices", None)
+        self.devices = new_devices
+        self.sequence = self._imaging_sequence(exposure=self._camera_exposure(), load=True)
+        self._calibration = None                          # the old calibration was for the old camera
+        self._readout_subsystem = ReadoutSubsystem(self)  # subsystems read devices through the session
+        self._timing_subsystem = TimingSubsystem(self)
+        if old_devices is not None and old_devices is not new_devices:
+            try:
+                old_devices.close()
+            except Exception:
+                pass
+        return self
+
+    def open_devices(self):
+        """Initialize / connect the loaded hardware -- open every device in dependency order (cameras
+        LAST, so they bind to an already-open sequencer / trigger source).  A no-op-safe convenience over
+        ``self.devices.open()`` for the notebook and the device manager's "Open devices" button; on the
+        virtual backend the opens are trivial.  Returns ``self``."""
+        self.devices.open()
+        return self
+
     def capture(self, frames: int = 1, *, camera: str | None = None, exposure: float | None = None,
                 display: bool = True) -> CaptureResult:
         """Grab raw frames from a named camera and return a notebook-friendly ``CaptureResult``.

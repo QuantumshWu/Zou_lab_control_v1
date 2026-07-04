@@ -141,12 +141,27 @@ def open_device_manager(session: Any, **kwargs):
     # is the ONE public entry and this is the sole caller of the widget factory.
     from Zou_lab_control.frontend.device_manager import show_device_manager
 
+    from .devices.registry import device_config_dir
+
     existing = getattr(session, "_zlc_device_manager", None)
     if existing is not None and _alive(existing):
         _reshow(existing)
         return existing
 
-    window = show_device_manager(session.devices, **kwargs)
+    # Wire the session's config actions as plain callbacks (the panel stays session-agnostic, like
+    # ``discover``): load a new config, save the current one, or open (initialise) the hardware.  Load /
+    # open return the session's (now current) DeviceSet so the panel re-lists it.
+    def _load(path):
+        session.load_config(path)
+        return session.devices
+
+    def _open():
+        session.open_devices()
+        return session.devices
+
+    window = show_device_manager(
+        session.devices, on_load_config=_load, on_save_config=session.save_config,
+        on_open_devices=_open, config_dir=str(device_config_dir()), **kwargs)
     session._zlc_device_manager = window
     return window
 

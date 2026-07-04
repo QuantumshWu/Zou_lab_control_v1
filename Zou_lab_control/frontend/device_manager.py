@@ -11,6 +11,8 @@ entirely from the shared Fluent primitives (``FluentGroupBox`` cards, ``FluentSe
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PyQt5 import QtCore, QtWidgets
 
 from .qt_fluent import (
@@ -36,10 +38,18 @@ class DeviceManagerPanel(QtWidgets.QWidget):
     """List the loaded devices by role-type and scan the buses.  ``device_set`` is the ``DeviceSet``
     the session loaded; ``discover`` is the scan callable (defaults to ``discover_devices``)."""
 
-    def __init__(self, device_set, *, discover=None, parent=None):
+    def __init__(self, device_set, *, discover=None, on_load_config=None, on_save_config=None,
+                 on_open_devices=None, config_dir=None, parent=None):
         super().__init__(parent)
         self._device_set = device_set
         self._discover = discover
+        # Session-wired actions (None when opened bare, e.g. show_device_manager(device_set) with no
+        # session): load/save the experiment device config, open (initialise) the hardware.  Each is a
+        # plain callback -- the panel stays session-agnostic, exactly like ``discover``.
+        self._on_load_config = on_load_config
+        self._on_save_config = on_save_config
+        self._on_open_devices = on_open_devices
+        self._config_dir = str(config_dir) if config_dir else ""
         outer = QtWidgets.QVBoxLayout(self)
         # SAME window-edge inset as every other GUI: ``window_pad(1)`` all four sides (title-aligned),
         # header<->body and card<->card gaps are HALF that unit (``window_pad(0.5)``).
@@ -55,6 +65,21 @@ class DeviceManagerPanel(QtWidgets.QWidget):
         header.addWidget(self._scan_btn)
         outer.addLayout(header)
 
+        # Config toolbar: load / save the experiment device config + open (initialise) the hardware.
+        # Only shown when the session wired the action -- a bare panel has nothing to load/save/open.
+        if any((on_load_config, on_save_config, on_open_devices)):
+            tools = QtWidgets.QHBoxLayout()
+            tools.setSpacing(scaled_px(8, minimum=4))
+            if on_open_devices is not None:
+                b = FluentButton("Open devices", color=GREEN); b.clicked.connect(self._open_devices)
+                tools.addWidget(b)
+            tools.addStretch(1)
+            if on_load_config is not None:
+                b = FluentButton("Load config…"); b.clicked.connect(self._load_config); tools.addWidget(b)
+            if on_save_config is not None:
+                b = FluentButton("Save config…"); b.clicked.connect(self._save_config); tools.addWidget(b)
+            outer.addLayout(tools)
+
         scroll = FluentScrollArea()
         body = QtWidgets.QWidget()
         self._body = QtWidgets.QVBoxLayout(body)
@@ -64,8 +89,69 @@ class DeviceManagerPanel(QtWidgets.QWidget):
         scroll.setWidgetResizable(True)
         outer.addWidget(scroll, 1)
 
+        self._status = self._muted("")                  # one-line result of the last load/save/open action
+        outer.addWidget(self._status)
+
         self._scan_card = None
         self._rebuild()
+
+    def _set_status(self, text: str) -> None:
+        self._status.setText(str(text))
+
+    def _default_dir(self) -> str:
+        return self._config_dir or ""
+
+    # ---------------------------------------------------------------- experiment config load / save / open
+    def _load_config(self) -> None:
+        """Pick an experiment config JSON and rebuild the session's devices from it (via the wired
+        ``on_load_config``), then re-list the -- now different -- devices.  A bad config leaves the
+        session untouched (the callback builds the new set before swapping) and reports the error."""
+        if self._on_load_config is None:
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load experiment config", self._default_dir(), "Config (*.json);;All files (*)")
+        if not path:
+            return
+        try:
+            new_set = self._on_load_config(path)
+        except Exception as exc:                         # a bad config must never crash the panel
+            self._set_status(f"load failed: {exc}")
+            return
+        if new_set is not None:
+            self._device_set = new_set
+        self._rebuild()
+        self._set_status(f"loaded {Path(path).name}")
+
+    def _save_config(self) -> None:
+        """Write the session's current device config to a JSON file (via ``on_save_config``) so
+        ``na.connect(that_file)`` / Load config reproduces it."""
+        if self._on_save_config is None:
+            return
+        start = str(Path(self._default_dir()) / "my_experiment.json") if self._default_dir() else "my_experiment.json"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save experiment config", start, "Config (*.json);;All files (*)")
+        if not path:
+            return
+        try:
+            written = self._on_save_config(path)
+        except Exception as exc:
+            self._set_status(f"save failed: {exc}")
+            return
+        self._set_status(f"saved {Path(str(written)).name}")
+
+    def _open_devices(self) -> None:
+        """Initialise / connect the loaded hardware (via ``on_open_devices``) and re-list the devices."""
+        if self._on_open_devices is None:
+            return
+        try:
+            new_set = self._on_open_devices()
+        except Exception as exc:                         # a hardware open must never crash the panel
+            self._set_status(f"open failed: {exc}")
+            return
+        if new_set is not None:
+            self._device_set = new_set
+        self._rebuild()
+        self._set_status("devices opened")
 
     # ---------------------------------------------------------------- loaded devices, by domain
     def _rebuild(self) -> None:
@@ -135,10 +221,17 @@ class DeviceManagerPanel(QtWidgets.QWidget):
         self._scan_card = card
 
 
-def show_device_manager(device_set, *, discover=None):
-    """Open the device manager in a standalone Fluent window (parity with show_pulse_gui)."""
-    panel = DeviceManagerPanel(device_set, discover=discover)
+def show_device_manager(device_set, *, discover=None, on_load_config=None, on_save_config=None,
+                        on_open_devices=None, config_dir=None):
+    """Open the device manager in a standalone Fluent window (parity with show_pulse_gui).
+
+    ``on_load_config`` / ``on_save_config`` / ``on_open_devices`` (wired by the session through
+    ``exp.device_manager()``) enable the Load config / Save config + Open-devices toolbar; omit them
+    (a bare ``device_set``) and the window is view-only (device list + Scan hardware)."""
+    panel = DeviceManagerPanel(device_set, discover=discover, on_load_config=on_load_config,
+                               on_save_config=on_save_config, on_open_devices=on_open_devices,
+                               config_dir=config_dir)
     window = FluentWindow(widget=panel, title="Devices@Zou lab")
-    window.resize(scaled_px(420), scaled_px(560))
+    window.resize(scaled_px(460), scaled_px(560))
     window.show()
     return window
