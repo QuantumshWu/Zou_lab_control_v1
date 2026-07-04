@@ -105,6 +105,29 @@ exp.device_manager()            # 打开设备管理器；每会话单例，重�
 
 __DEVICE_MANAGER_FIG__
 
+\section{存 / 取实验配置：\pyapi{save\_config} / \pyapi{load\_config} / \pyapi{open\_devices}}
+一份配置——就是 \pyapi{na.connect(...)} 吃的那张 \pyapi{\{角色: \{"type", "params"\}\}} JSON 表——往往是你现场\tfocus{扫总线、填串号、调曝光试出来}的，值得存下来复用，而不是每次从头连一遍。设备管理器顶栏的\tfocus{配置工具栏}和会话 API 是\tfocus{同一套动作}（GUI 只是这三个方法的图形面）：
+
+\begin{description}
+  \item[存 \quad\pyapi{exp.save\_config(path)}] 把当前 \pyapi{DeviceSet} 序列化成 JSON 写到 \pyapi{path}（缺 \pyapi{.json} 后缀自动补，返回真正写出的 \pyapi{Path}）。序列化走 \pyapi{DeviceSet.to\_config()}——它是\tfocus{唯一可回灌的序列化器}（返回配置的深拷贝，与逐设备状态转储的 \pyapi{snapshot()} 是两回事）。GUI 里点右侧 \pyapi{Save config\ldots}。
+  \item[取 \quad\pyapi{na.connect(path)} / \pyapi{exp.load\_config(path)}] \pyapi{na.connect(path)} 从文件\tfocus{新开}一个 session；已有 session 时 \pyapi{exp.load\_config(path)} 就地把设备\tfocus{换成}该配置——它先\tfocus{构造好新 \pyapi{DeviceSet} 再原子替换}（坏配置不动老会话），随后重建成像序列、\tfocus{清掉旧标定}（换了硬件，旧 sitemap/thresholds 不再成立），返回 \pyapi{self}。GUI 里点 \pyapi{Load config\ldots}，设备列表随即刷新成新配置。
+  \item[开 \quad\pyapi{exp.open\_devices()}] 真正连接 / 初始化硬件（等价于 \pyapi{na.connect(..., open\_devices=True)}）。当你 \pyapi{connect(..., open\_devices=False)} 只构造不打开、或刚 \pyapi{load\_config} 换了一套设备时，用它补上打开这一步（相机总是最后打开）。GUI 里点左上角绿色 \pyapi{Open devices}。
+\end{description}
+
+\begin{codeblock}[Python]
+exp = na.connect("virtual")                      # 或某份 .json / 探测出来的配置
+saved = exp.save_config("configs/my_experiment.json")   # 存下这次连接(返回写出的 Path)
+
+exp2 = na.connect("configs/my_experiment.json", open_devices=True)   # 下次一行连回来
+# 或在已有 session 上就地换配置、再按需开硬件:
+exp.load_config("configs/my_experiment.json")
+exp.open_devices()
+\end{codeblock}
+
+\begin{notebox}[round-trip 契约]
+\pyapi{save\_config} 写出的文件，\pyapi{na.connect(那个文件)} / \pyapi{load\_config} 必须\tfocus{重建出同一套 \pyapi{DeviceSet}}——一份调好的配置是可复用资产，而不是每次重打。这条由契约测试 \filepath{tests/test\_device\_config\_io.py} 机械守卫。工具栏只在会话把这三个回调接进来时才出现（\pyapi{exp.device\_manager()} 会接）；\pyapi{show\_device\_manager(device\_set)} 裸开一个 \pyapi{DeviceSet} 时没有可存取的会话，面板退化为\tfocus{只读}（设备列表 + Scan hardware）。
+\end{notebox}
+
 \section{设备契约（四种类型）}
 所有设备继承 \pyapi{BaseDevice}（\pyapi{open/close/stop/snapshot}）。三个\tfocus{类型化}子类是强约束（用 \pyapi{isinstance} 校验，不是鸭子类型）：
 

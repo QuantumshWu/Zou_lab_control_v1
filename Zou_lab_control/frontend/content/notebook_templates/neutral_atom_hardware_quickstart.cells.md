@@ -175,6 +175,36 @@ RF …）列出这次配置真正载入的每台设备，并有 “Scan hardware
 exp.device_manager()
 
 <!-- cell:markdown -->
+## Save / load an experiment config（设备管理 GUI 里存取）
+
+一次配置（`{角色: {"type", "params"}}` 这张 JSON 表，就是 `na.connect(...)` 吃的东西）往往是
+你现场扫总线、填串号、调曝光**试出来**的，值得存下来下次直接复用——不用再从头连一遍。三个动作，
+notebook API 和 device manager GUI **同一套**：
+
+- **存**：`exp.save_config("configs/my_experiment.json")` 把当前 DeviceSet 序列化成 JSON
+  （`.json` 后缀会自动补）。GUI 里点 **Save config…**，同一个文件对话框。
+- **载**：`na.connect("configs/my_experiment.json")` 从文件**新开**一个 session；已经有 session 时用
+  `exp.load_config(path)` 就地把设备**换成**该配置（会重建 imaging sequence、清掉旧标定）。GUI 里点
+  **Load config…**，设备列表随即刷新成新配置。
+- **开**：`exp.open_devices()` 真正连接 / 初始化硬件（等价于 `na.connect(..., open_devices=True)`；
+  之前 `open_devices=False` 只构造不打开时用它补上一步）。GUI 里点左上角绿色 **Open devices**。
+
+GUI 的这三个按钮就在 device manager 顶栏，默认目录指向仓库的 `configs/`。下面几格演示 API 侧；
+文件路径按你机器改。
+
+<!-- cell:code -->
+# 存下这次连接的配置(扫总线 / 填串号 / 调曝光试出来的那套),下次一行连回来。
+saved = exp.save_config("configs/my_experiment.json")   # 返回真正写出的 Path(.json 自动补)
+print("saved ->", saved)
+
+# 换台机器 / 下次开工:从文件新开一个 session(和 GUI 的 Load config… 等价)。
+# exp2 = na.connect("configs/my_experiment.json", open_devices=True)
+
+# 已有 session 时就地换配置(重建 imaging sequence、清旧标定),再按需开硬件:
+# exp.load_config("configs/my_experiment.json")
+# exp.open_devices()
+
+<!-- cell:markdown -->
 ## Configure and preflight the imaging sequence
 
 `PulseSequence` 是 hardware 和 notebook 共同使用的时序源。address-switch

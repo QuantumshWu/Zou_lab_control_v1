@@ -270,30 +270,48 @@ def _cable_figure_tex(fig_path: str) -> str:
 
 def _render_device_manager_shot(path: Path) -> Path:
     """Real screenshot of the device-manager GUI (``exp.device_manager()``): ONE section per registered
-    device domain, driven by the device registry.  Built on a virtual DeviceSet so it renders with no
-    hardware -- the SAME widget the session facade opens (this doc-build tool may reach the frontend, like
-    the other GUI figures here; the runtime analysis path stays sealed)."""
+    device domain, driven by the device registry, PLUS the config toolbar (Open devices / Load config /
+    Save config) the session wires in.  Built on a real virtual session so it renders with no hardware and
+    shows EXACTLY what ``exp.device_manager()`` opens -- same callbacks, same buttons (this doc-build tool
+    may reach the frontend, like the other GUI figures here; the runtime analysis path stays sealed)."""
     try:
         import os
 
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        import Zou_lab_control.neutral_atom as na
         from Zou_lab_control.frontend import devtools as dt
         from Zou_lab_control.frontend.device_manager import DeviceManagerPanel
         from Zou_lab_control.frontend.devtools import install_screenshot_font
         from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
-        from Zou_lab_control.neutral_atom.devices.registry import load_devices
+        from Zou_lab_control.neutral_atom.devices.registry import device_config_dir
 
         ensure_qt_app()
         install_screenshot_font()
-        panel = DeviceManagerPanel(load_devices("virtual"))
-        panel.resize(430, 480)
-        panel.show()
-        dt.settle(panel, 500)
-        panel.grab().save(str(path))
+        exp = na.connect("virtual")
+        try:
+            # Wire the SAME config callbacks exp.device_manager() does, so the figure shows the real
+            # Load / Save / Open toolbar (not a bare view-only panel).
+            def _load(p):
+                exp.load_config(p)
+                return exp.devices
+
+            def _open():
+                exp.open_devices()
+                return exp.devices
+
+            panel = DeviceManagerPanel(
+                exp.devices, on_load_config=_load, on_save_config=exp.save_config,
+                on_open_devices=_open, config_dir=str(device_config_dir()))
+            panel.resize(440, 520)
+            panel.show()
+            dt.settle(panel, 500)
+            panel.grab().save(str(path))
+        finally:
+            exp.close()
         return path
     except Exception:
         return _device_placeholder_image(
-            path, "设备管理器 GUI：按域分区（Camera / Sequencer / Trap array）+ Scan hardware 按钮")
+            path, "设备管理器 GUI：按域分区 + Open/Load/Save config 工具栏 + Scan hardware")
 
 
 def _device_manager_figure_tex(fig_path: str) -> str:
@@ -301,10 +319,12 @@ def _device_manager_figure_tex(fig_path: str) -> str:
         "\\tfocus{设备管理器 GUI}（\\pyapi{exp.device\\_manager()}）：把 \\pyapi{connect} / "
         "\\pyapi{load\\_devices} 加载出的每个设备\\tfocus{按域分区}列出（Camera / Sequencer / Trap array / "
         "未来的 RF 源——与逐测量的设备下拉读的是\\tfocus{同一个注册表}），底部 \\pyapi{Scan hardware} 按钮"
-        "现场探一遍总线并把发现的设备补一张卡。它是 \\pyapi{load\\_devices} / \\pyapi{discover\\_devices} 的"
-        "\\tfocus{GUI 面孔}，\\tfocus{与会话绑定}——唯一入口是 \\pyapi{exp.device\\_manager()}（监控台顶栏的 "
-        "\\pyapi{Devices} 按钮走同一个每会话单例）。它天生依赖会话的 \\pyapi{DeviceSet}（frontend 被密封、"
-        "拿不到设备），所以\\tfocus{不}是一个 \\pyapi{zf} 模块级函数。"
+        "现场探一遍总线并把发现的设备补一张卡。顶部的\\tfocus{配置工具栏}——绿色 \\pyapi{Open devices}（初始化硬件）、"
+        "\\pyapi{Load config\\ldots} / \\pyapi{Save config\\ldots}——就是会话 \\pyapi{exp.open\\_devices()} / "
+        "\\pyapi{exp.load\\_config()} / \\pyapi{exp.save\\_config()} 的图形面（存一份配置、下次一行连回来）。它是 "
+        "\\pyapi{load\\_devices} / \\pyapi{discover\\_devices} 的\\tfocus{GUI 面孔}，\\tfocus{与会话绑定}——唯一入口是 "
+        "\\pyapi{exp.device\\_manager()}（监控台顶栏的 \\pyapi{Devices} 按钮走同一个每会话单例）。它天生依赖会话的 "
+        "\\pyapi{DeviceSet}（frontend 被密封、拿不到设备），所以\\tfocus{不}是一个 \\pyapi{zf} 模块级函数。"
     )
     return (
         "\\begin{figure}[h]\n\\centering\n"
