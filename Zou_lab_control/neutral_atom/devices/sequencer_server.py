@@ -11,7 +11,7 @@ import socket
 import subprocess
 from typing import Sequence
 
-from .sequencer import DEFAULT_CAMERA_TRIGGER_CHANNELS, DEFAULT_RUNTIME_CLOCK_HZ, RuntimeSequenceProgram, SequencerService, serve_runtime_sequencer
+from .sequencer import DEFAULT_RUNTIME_CLOCK_HZ, RuntimeSequenceProgram, SequencerService, serve_runtime_sequencer
 
 
 @dataclass
@@ -80,7 +80,6 @@ class CommandSequencerBackend:
             env["ZLC_SEQUENCE_NAME"] = program.sequence_name
             env["ZLC_CLOCK_HZ"] = str(program.clock_hz)
             env["ZLC_DURATION"] = str(program.duration)
-            env["ZLC_TRIGGER_COUNT"] = str(program.trigger_count)
         result = subprocess.run(
             command,
             shell=True,
@@ -89,7 +88,10 @@ class CommandSequencerBackend:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=self.timeout,
+            # Honour the PER-CALL timeout (e.g. a long wait_done) for the actual process kill, not just
+            # the ZLC_TIMEOUT env var -- else a slow command is killed at the instance default while the
+            # env says otherwise.  Falls back to the instance timeout when the caller gives none.
+            timeout=timeout if timeout is not None else self.timeout,
         )
         log_path = self.state_dir / f"{action}.log"
         log_path.write_text(result.stdout, encoding="utf-8", errors="replace")
@@ -121,7 +123,6 @@ def run_server(
     host: str = "0.0.0.0",
     port: int = 18861,
     clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
-    trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
     state_dir: str | Path = "zlc_sequencer_state",
     prepare_command: str | None = None,
     fire_command: str | None = None,
@@ -134,17 +135,45 @@ def run_server(
     """Start the RPyC sequencer service used by ``RemoteSequencer``."""
 
     backend_name = str(backend).strip().lower().replace("_", "-")
-    if backend_name in {"vivado-session", "persistent-vivado", "fpga-pulse-streamer"}:
-        from .fpga_pulse_streamer import VivadoPulseStreamerSession
+    if backend_name in {"jtag-axi", "axi", "loader", "edge-table"}:
+        # The FINAL affine edge-table engine (1-tick FIFO prefetch + 2-bank
+        # streaming scan), driven over JTAG-to-AXI (hw_axi).  The host BRAM image
+        # geometry is solved from the part + channel count (single source of truth
+        # with the create-project tcl + the top localparams).
+        from .axi_session import VivadoAxiStreamerSession
+        from fpga.pulse_streamer.host.image import solve_capacity
 
-        hardware_backend = VivadoPulseStreamerSession(state_dir=state_dir)
+        program_on_start = _env_bool("ZLC_PS_VIVADO_PROGRAM_ON_RUN", False)
+        part = os.environ.get("ZLC_PS_FPGA_PART", "xc7a35tfgg484-2")
+        params = solve_capacity(part, channel_count=max(1, len(list(channels)))).params
+        hardware_backend = VivadoAxiStreamerSession(
+            state_dir=state_dir,
+            clock_hz=clock_hz,
+            program_on_start=program_on_start,
+            params=params,
+        )
         if warm_start:
-            print("Starting persistent Vivado session before accepting clients...")
+            print("Starting persistent Vivado JTAG-to-AXI session before accepting clients...")
             hardware_backend.start()
+            # Always boot into a clean idle state: zero the host-owned CTRL config
+            # (per-channel/per-bus delays + the per-channel CLK mask) and halt.  Without
+            # this, leftovers on a running board (e.g. a clk_en bit) persist until the
+            # first prepare -- a channel would keep running on the FPGA clock.
+            print("Clearing host-owned CTRL config (delays + clk mask) to a safe idle state...")
+            hardware_backend.clear_host_config()
+            # Fail-fast bring-up check: a burst write + single-beat read-back proves the
+            # AXI4 INCR-burst upload path works (right -data byte order, AXI4 -- not
+            # Lite -- bitstream) BEFORE any client uploads a pulse.  Disable with
+            # ZLC_PS_AXI_SELF_TEST=0 if a flaky cable makes it spurious.
+            if _env_bool("ZLC_PS_AXI_SELF_TEST", True):
+                print("Verifying AXI burst upload path (write + read-back self-test)...")
+                hardware_backend.axi_self_test()
+                print("AXI burst self-test OK.")
         prepare_callback = hardware_backend.prepare
         fire_callback = hardware_backend.fire
         wait_done_callback = hardware_backend.wait_done
         safe_state_callback = hardware_backend.safe_state
+        scan_progress_callback = hardware_backend.scan_progress   # live scan cursor for the GUI poll
     elif backend_name == "command":
         hardware_backend = CommandSequencerBackend(
             Path(state_dir),
@@ -158,17 +187,18 @@ def run_server(
         fire_callback = hardware_backend.fire
         wait_done_callback = hardware_backend.wait_done
         safe_state_callback = hardware_backend.safe_state
+        scan_progress_callback = None        # the command backend has no live scan cursor
     else:
-        raise ValueError("backend must be 'vivado-session' or 'command'.")
+        raise ValueError("backend must be 'jtag-axi' or 'command'.")
     cache_prepared = _env_bool("ZLC_SEQUENCER_CACHE_PREPARED", False)
     service = SequencerService(
         channels=channels,
         clock_hz=clock_hz,
-        trigger_channels=trigger_channels,
         prepare_callback=prepare_callback,
         fire_callback=fire_callback,
         wait_done_callback=wait_done_callback,
         safe_state_callback=safe_state_callback,
+        scan_progress_callback=scan_progress_callback,
         cache_prepared=cache_prepared,
     )
     print("Zou_lab_control sequencer service")
@@ -253,7 +283,6 @@ def build_arg_parser() -> ArgumentParser:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=18861)
     parser.add_argument("--channels", nargs="+", required=True, help="Sequencer channels, e.g. ch00 ch01 ... inferred from the selected XDC.")
-    parser.add_argument("--trigger-channels", nargs="+", default=list(DEFAULT_CAMERA_TRIGGER_CHANNELS))
     parser.add_argument("--clock-hz", type=float, default=DEFAULT_RUNTIME_CLOCK_HZ)
     parser.add_argument("--state-dir", default="zlc_sequencer_state")
     parser.add_argument("--prepare-command", default=None)
@@ -263,14 +292,15 @@ def build_arg_parser() -> ArgumentParser:
     parser.add_argument("--command-timeout", type=float, default=None)
     parser.add_argument(
         "--backend",
-        default="command",
-        choices=["command", "vivado-session"],
-        help="Hardware backend. vivado-session keeps one Vivado Tcl process alive for lower runtime latency.",
+        default="jtag-axi",
+        choices=["jtag-axi", "command"],
+        help="Hardware backend. jtag-axi drives the final edge-table streamer over a "
+        "persistent Vivado hw_axi (JTAG-to-AXI) session; command shells out per action.",
     )
     parser.add_argument(
         "--no-warm-start",
         action="store_true",
-        help="For vivado-session, delay Vivado startup until the first prepare call.",
+        help="For session backends, delay Vivado startup until the first prepare call.",
     )
     return parser
 
@@ -279,7 +309,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     run_server(
         channels=_split_channels(args.channels),
-        trigger_channels=_split_channels(args.trigger_channels),
         host=args.host,
         port=args.port,
         clock_hz=args.clock_hz,

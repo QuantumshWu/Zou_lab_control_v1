@@ -15,10 +15,14 @@ from .sequencer import (
     compile_pulse_table_scan_runtime_program,
     compile_runtime_program,
     compile_runtime_program_for_payload,
-    finite_frame_sequence,
     serve_runtime_sequencer,
 )
-from .virtual import DEFAULT_CHANNELS, VirtualCamera, VirtualSequencer, VirtualTrapArray, virtual_config
+from .virtual import DEFAULT_CHANNELS, VirtualCamera, VirtualSequencer, VirtualTrapArray, virtual_config, write_virtual_run
+
+_DISCOVERY_EXPORTS = {
+    "DiscoveredDevice",
+    "discover_devices",
+}
 
 _REGISTRY_EXPORTS = {
     "DEVICE_CLASSES",
@@ -31,6 +35,7 @@ _REGISTRY_EXPORTS = {
     "read_config",
     "register_device_class",
     "resolve_class",
+    "resolve_connect_config",
 }
 
 _PULSE_STREAMER_EXPORTS = {
@@ -38,12 +43,7 @@ _PULSE_STREAMER_EXPORTS = {
     "DEFAULT_MAX_SCAN_POINTS",
     "DEFAULT_SCAN_COEFF_FRAC_BITS",
     "DEFAULT_SCAN_COEFF_WIDTH",
-    "PulseStreamerHDLFiles",
-    "PulseStreamerProbeNames",
-    "VivadoPulseStreamerSession",
     "capacity_estimate_text",
-    "generate_pulse_streamer_core",
-    "generate_pulse_streamer_top_example",
     "hardware_channel_names",
     "infer_xdc_channel_count",
     "infer_xdc_channel_labels",
@@ -51,8 +51,6 @@ _PULSE_STREAMER_EXPORTS = {
     "infer_xdc_channels",
     "infer_xdc_trigger_channels",
     "validate_pulse_streamer_program",
-    "write_pulse_streamer_hdl_bundle",
-    "write_vivado_pulse_streamer_tcl",
 }
 
 
@@ -69,6 +67,10 @@ def __getattr__(name: str):
         from .sequencer_server import build_arg_parser
 
         return build_arg_parser
+    if name in _DISCOVERY_EXPORTS:
+        from . import discovery
+
+        return getattr(discovery, name)
     if name in _REGISTRY_EXPORTS:
         from . import registry
 
@@ -88,11 +90,10 @@ __all__ = [
     "DEFAULT_FPGA_CHANNEL_COUNT",
     "DEVICE_CLASSES",
     "DeviceSet",
+    "DiscoveredDevice",
+    "discover_devices",
     "ManualSequencer",
     "PulseController",
-    "PulseStreamerHDLFiles",
-    "PulseStreamerProbeNames",
-    "VivadoPulseStreamerSession",
     "QCMOSCamera",
     "QCMOSConfig",
     "RemoteSequencer",
@@ -111,8 +112,6 @@ __all__ = [
     "build_sequencer_server_arg_parser",
     "device_class_registry",
     "device_config_dir",
-    "generate_pulse_streamer_core",
-    "generate_pulse_streamer_top_example",
     "hardware_channel_names",
     "infer_xdc_channel_count",
     "infer_xdc_channel_labels",
@@ -127,12 +126,10 @@ __all__ = [
     "validate_pulse_streamer_program",
     "validate_device_contract",
     "virtual_config",
+    "write_virtual_run",
     "compile_runtime_program",
     "compile_pulse_table_runtime_program",
     "compile_pulse_table_scan_runtime_program",
     "compile_runtime_program_for_payload",
-    "finite_frame_sequence",
     "serve_runtime_sequencer",
-    "write_pulse_streamer_hdl_bundle",
-    "write_vivado_pulse_streamer_tcl",
 ]

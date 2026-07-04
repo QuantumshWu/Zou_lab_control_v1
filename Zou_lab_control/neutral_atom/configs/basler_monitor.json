@@ -1,0 +1,11 @@
+{
+  "monitor_camera": {
+    "type": "PylonCamera",
+    "params": {
+      "serial": "",
+      "trigger_source": "Software",
+      "pixel_format": "Mono8",
+      "exposure": 0.005
+    }
+  }
+}

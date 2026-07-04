@@ -1,101 +1,70 @@
 # FPGA Submodule
 
-`fpga/` is the standalone hardware side of the ZLC pulse-streamer path.  It can
+`fpga/` is the standalone hardware side of the ZLC pulse-streamer path. It can
 be copied to the Vivado computer with the Python package and run without an
 experiment configuration.
 
+For the full hardware tutorial (the edge-table RTL, the 1-tick FIFO prefetch
+pipeline, the 2-bank streaming scan window, the affine N-slot scan engine, the
+analog-bus DAC engine, resource budgets, and the JTAG-to-AXI build/program
+workflow), see the **FPGA manual** in `docs/fpga_manual/`. For capacity
+invariants and architecture notes, see `docs/MAINTAINER_NOTES.md`.
+
 ## Layout
 
-- `build_and_program.bat`: user entry point for building and programming the
-  address-switch pulse-streamer bitstream.
-- `run_server.bat`: user entry point for the RPyC sequencer server.  It starts
-  a persistent Vivado/VIO session before accepting GUI or notebook clients.
-- `pulse_streamer/`: HDL, Vivado Tcl, and the pulse-streamer design note.
-- Generated Vivado projects and server state default to `fpga\build`.  The
-  default project directory is `fpga\build\address_switch`, and the default
-  server state directory is `fpga\build\state_address_switch`.
+- `build_and_program.bat`: build/check/diagnose/program the pulse-streamer
+  bitstream (`create_project.tcl` -> `program_fpga.tcl`).
+- `run_server.bat`: start the RPyC sequencer server. It opens a persistent
+  Vivado `hw_axi` (JTAG-to-AXI) session before accepting GUI or notebook clients.
+- `pulse_streamer/`: HDL (`zlc_edge_streamer.v`, `zlc_pulse_streamer_top.v`),
+  Vivado Tcl, and the `host/` Python image packer + behavioral engine model.
+- Generated Vivado projects and server state default to `fpga\build`. The
+  default project is `fpga\build\ps`; the short name `ps` (-> `ps.runs`) keeps
+  Vivado's deep run/.Xil temp path under the Windows MAX_PATH limit while the
+  build stays in-repo. The default server state dir is `fpga\build\state`.
 
-The root-level `pulse_gui.bat` is the frontend entry point.  The FPGA batch
-files stay here so hardware setup remains separate from the GUI.
+The root-level `pulse_gui.bat` is the frontend entry point; the FPGA batch files
+stay here so hardware setup is separate from the GUI.
 
 ## Runtime Chain
 
 ```text
 Pulse GUI / notebook
   -> RemoteSequencer.prepare/fire/wait_done
-  -> sequencer_server on the Vivado computer
-  -> VivadoPulseStreamerSession
-  -> Vivado Hardware Manager + VIO probes
-  -> zlc_pulse_streamer_top_address_switch.bit on the FPGA
+  -> sequencer_server on the Vivado computer (jtag-axi backend)
+  -> VivadoAxiStreamerSession (persistent Vivado hw_axi session)
+  -> zlc_pulse_streamer_top.bit on the FPGA
 ```
 
-The GUI may show only a few logical rows.  The server still compiles against
-the full hardware channel list inferred from
-`references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc`.
-The current default XDC has 62 controllable outputs.  Missing or hidden GUI
-channels are uploaded as zero bits.
-
-The checked-in address-switch XDC labels `ch11` as the physical `emCCD` output
-and `ch06` as the physical `trig` output.  The camera-imaging preset and default
-trigger inference use `ch11/emCCD/M13` for the qCMOS/external camera trigger.
-`ch06/trig/R17` remains a separate output and should only be used when the pulse
-JSON or lab wiring explicitly selects it.
-
-## Path Rules
-
-Vivado 2019 debug cores fail when the project path is too long.  The batch
-files print `ZLC build root: ...` and `ZLC project dir: ...`; those printed
-paths are the source of truth for the generated `.xpr/.bit/.ltx`.
-
-If the repository path is too long and Vivado's debug path guard stops the
-build, move the repo to a shorter folder such as `D:\ZLC`, or set:
-
-```powershell
-$env:ZLC_PS_PROJECT_DIR = "D:\ZLC\fpga\build\address_switch"
-```
-
-If a stale terminal environment points `ZLC_PS_PROJECT_DIR`,
-`ZLC_PS_CHECK_PROJECT_DIR`, `ZLC_PS_VIVADO_BIT`, or `ZLC_PS_VIVADO_LTX` inside
-the old `fpga\pulse_streamer\build` folder, the batch files ignore it and fall
-back to `fpga\build`.  This prevents loading stale probes from an old build.
-
-`install_requirements.bat` writes the installed Python path to the ignored
-repository-local `.zlc_python_path`.  `run_server.bat` uses that interpreter
-before falling back to PATH, so the server imports the same editable checkout
-and dependencies as the GUI.  For a one-terminal override, set
-`ZLC_FPGA_SERVER_PYTHON`.
+The host packs the compiled program into a BRAM image and writes it over
+JTAG-to-AXI (`axi_bram_ctrl`), then drives the CTRL register-file mailbox
+(`COMMAND`/`STATUS` + the streaming-scan `BANK_READY`/`BANK*_CHUNK` handshake).
+The server compiles against the full hardware channel list inferred from the
+board XDC (62 controllable outputs; missing/hidden GUI channels are zero bits).
+The camera-imaging preset and default trigger inference use `ch11/emCCD/M13`;
+`ch06/trig/R17` is a separate output.
 
 ## Normal Use
 
 ```powershell
-.\fpga\build_and_program.bat
-.\fpga\run_server.bat --check-config
-.\fpga\run_server.bat
+.\fpga\build_and_program.bat --check    # no-board HDL + capacity self-check
+.\fpga\build_and_program.bat            # build + program (create_project.tcl -> program_fpga.tcl)
+.\fpga\run_server.bat --check-config    # print resolved project/bit/ltx/xdc/channels/clock/capacity
+.\fpga\run_server.bat                    # start the persistent server (host 0.0.0.0, port 18861)
 ```
 
-`build_and_program.bat --check` runs a no-output-pin synthesis self-check.  A
-real build uses the original address-switch XDC by default.  For a different
-board/cable map, set `ZLC_PS_XDC` to a completed board XDC.
+Default clock is 50 MHz (20 ns tick); the minimal pulse width and resolution are
+1 tick. On the 35T part the engine resolves to 4096 edge rows + a 2-bank scan
+window of `bank_size` 2048 (4096 resident points) backed by UNBOUNDED host
+streaming. Capacity is fixed in `fpga.pulse_streamer.host.image.solve_capacity`
+(no per-build override). Configure the build with `ZLC_PS_XDC`,
+`ZLC_PS_VIVADO_BIN`, and `ZLC_PS_CLOCK_HZ`.
 
-`run_server.bat --check-config` prints the resolved project, `.bit`, `.ltx`,
-full XDC-inferred channel list, default trigger channel, 50 MHz clock, and scan
-capacity, then exits without opening a long-lived server.
+## Path Rules
 
-Set `ZLC_NO_PAUSE=1` for automation.  Without it, the outer batch wrapper keeps
-double-clicked windows readable after success or failure.
-
-## Runtime Notes
-
-The server starts Vivado once and keeps that session alive.  The slow
-hardware-target setup therefore happens at server startup, not at the first GUI
-`On Pulse`.
-
-After the first successful prepare, the persistent session keeps a Python copy
-of the uploaded edge table.  A later prepare with the same channel order and
-clock rewrites only changed edge rows plus the shadow-critical rows
-`0`, `loop_start_index`, and the final row.
-
-With `repeat_forever=True`, the full uploaded table restarts forever.  A finite
-repeat bracket inside that table is finite; after it finishes, any post-loop
-rows run, then the full table starts again.  For camera acquisition or API
-single shots, call the pulse controller with `repeat_forever=False`.
+Vivado 2019 debug cores are path-length sensitive. Keep the checkout short
+(`D:\ZLC`). The batch files print `ZLC build root` / `ZLC project dir`; those
+printed paths are the source of truth for the generated
+`impl_1\zlc_pulse_streamer_top.{bit,ltx}`. `run_server.bat` uses the interpreter
+in `.zlc_python_path` before falling back to PATH; override with
+`ZLC_FPGA_SERVER_PYTHON`. Set `ZLC_NO_PAUSE=1` for automation.

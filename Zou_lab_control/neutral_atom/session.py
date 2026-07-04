@@ -13,13 +13,9 @@ import json
 
 import numpy as np
 
-from .core.analysis import (
-    estimate_threshold_fidelity,
-    grid_shape_tuple,
-    otsu_threshold,
-    positive_int,
-    roi_counts,
-)
+from Zou_lab_control._paths import GENERATED_SEQUENCES_DIR
+from Zou_lab_control._clock import DEFAULT_CLOCK_HZ
+from .core.analysis import grid_shape_tuple
 from .core.calibration import TrapCalibration
 from .core.results import (
     CaptureResult,
@@ -31,13 +27,11 @@ from .core.results import (
     SitemapResult,
     ThresholdResult,
 )
-from .core.utils import html_summary, json_ready, site_index
-from .devices import CameraDevice, DeviceSet, SequencerDevice, load_devices
-from .devices.virtual import VirtualTrapArray, virtual_config
+from .core.utils import html_summary, json_ready
+from .devices import CameraDevice, DeviceSet, SequencerDevice, load_devices, resolve_connect_config
 from .operations import calibrate_sitemap_from_images, calibrate_threshold_from_images, detect_image
-from .timing import PulseSequence, imaging_sequence
+from .timing import PulseSequence, imaging_channel_kwargs, imaging_sequence
 from .timing.verilog import generate_verilog, write_verilog_bundle
-from .views.plots import plot_detection_scan
 from .subsystems import ExperimentSubsystem, ReadoutSubsystem, TimingSubsystem
 
 
@@ -57,7 +51,9 @@ class NeutralAtomSession:
         self.sequence = self._imaging_sequence(exposure=self._camera_exposure(), load=True)
         self._calibration: TrapCalibration | None = None
         self.history: list[Any] = []
-        self.devices.camera.bind_experiment(self)
+        # Devices stay session-blind: a camera is a pure grabber and a sequencer a pure
+        # streamer; ALL cross-device orchestration (capture / readout / scans) lives on the
+        # session + subsystems, which reach devices only through their contracts.
         self._readout_subsystem = ReadoutSubsystem(self)
         self._timing_subsystem = TimingSubsystem(self)
 
@@ -85,9 +81,90 @@ class NeutralAtomSession:
             self._timing_subsystem = TimingSubsystem(self)
         return self._timing_subsystem
 
+    # ---- GUI launchers (confocal-style ``exp.task_console()`` / ``exp.pulse_gui()``) --------
+    # The windows live in the frontend; these are thin sugar reached LAZILY through the
+    # GUI-action module ``_gui`` (which imports the frontend only when a window is opened), so
+    # the analysis path (connect / sitemap / thresholds / detect) never pulls the frontend and
+    # virtual==real stays headless.  ``session.py`` references only ``_gui`` -- never the
+    # frontend itself -- keeping the one-directional neutral_atom -> frontend seal.
+    def task_console(self, *, task: str | None = None, **kwargs):
+        """Open the Task console GUI bound to this session.
+
+        Sugar over ``frontend.show_task_console``: fills the hub + the auto-discovered
+        measurement / processor / task catalogs from this session.  ``task`` loads a saved
+        layout (``tasks/<name>.json``)."""
+        from ._gui import open_task_console
+        return open_task_console(self, task=task, **kwargs)
+
+    def pulse_gui(self, *, state=None, **kwargs):
+        """Open the pulse-sequence editor GUI bound to this session, so a measurement can read
+        the edited program back.  To run the editor WITHOUT a session (it picks its own server
+        connection, needing no experiment) call ``Zou_lab_control.frontend.show_pulse_gui()``
+        directly."""
+        from ._gui import open_pulse_gui
+        return open_pulse_gui(self, state=state, **kwargs)
+
+    def figure_viewer(self, path=None, **kwargs):
+        """Open the saved-figure viewer GUI (reopen a ``.npz`` written by a panel / notebook Save).
+
+        A PURE VIEWER -- no hardware, no acquisition: pick a saved figure (or a folder of them, e.g. a
+        calibration run) and re-view / relim / fit / re-save it through the same DataFigure stack.  A
+        ONE-per-session singleton (a later call reshows the same window).  To open a viewer WITHOUT a
+        session call ``Zou_lab_control.frontend.show_figure_viewer()`` directly."""
+        from ._gui import open_figure_viewer
+        return open_figure_viewer(self, path=path, **kwargs)
+
+    def device_manager(self, **kwargs):
+        """Open the device-manager GUI bound to this session: see every device the config loaded,
+        grouped by device DOMAIN (Camera / Sequencer / Trap array / a future RF source -- the SAME
+        registry the per-measurement device dropdowns read), and a "Scan hardware" button that probes
+        the buses.  The GUI face of ``na.load_devices`` / ``na.discover_devices``; a ONE-per-session
+        window."""
+        from ._gui import open_device_manager
+        return open_device_manager(self, **kwargs)
+
+    def capture(self, frames: int = 1, *, camera: str | None = None, exposure: float | None = None,
+                display: bool = True) -> CaptureResult:
+        """Grab raw frames from a named camera and return a notebook-friendly ``CaptureResult``.
+
+        SESSION-level orchestration of the one-off snapshot: the session picks the sensor
+        (``camera`` names any camera in the device config; None = the conventional readout
+        role), optionally writes ``exposure`` to THAT camera and refreshes the imaging
+        sequence, then runs the standard arm-before-fire shot (``triggered_frames``: arm the
+        camera, fire the session sequencer, read the frames back).  The camera itself stays a
+        pure grabber -- it knows nothing about the session.  ``capture`` always shows raw
+        camera data; site overlays belong to calibrated readout/detection, not to capture."""
+        from .operations.measurement import triggered_frames
+        from .views.plots import plot_image
+
+        name = str(camera) if camera else self.devices.default_camera_name()
+        cam = self.devices[name]
+        if exposure is not None:
+            cam.configure(exposure=float(exposure))
+            self.sequence = self._imaging_sequence(exposure=float(exposure), load=True)
+        sequence = self.sequence
+        images = triggered_frames(cam, getattr(self.devices, "sequencer", None), sequence, int(frames))
+        if not images:
+            # No edge on this camera's trigger line -> no frame (the pure-grabber contract).  The
+            # readout imaging sequence gates the READOUT camera's trigger; a camera wired to another
+            # line (e.g. the MOT monitor on ``mot_trigger``) is snapshotted through ITS own template,
+            # not this convenience.  Fail with an actionable message, never an IndexError on ``[-1]``.
+            trig = tuple(getattr(cam, "capture_trigger_channels", ()) or ())
+            raise RuntimeError(
+                f"camera {name!r} captured no frames: the imaging sequence gates the readout "
+                f"camera's trigger, but {name!r} is triggered on {trig or '(unknown line)'}.  "
+                f"Snapshot a non-readout camera (e.g. the MOT monitor) through its OWN pulse "
+                f"template -- run a Pulse-scan measurement or the Optimize-MOT-field task with "
+                f"camera={name!r} (they fire the coil template that pulses its trigger).")
+        plot = plot_image(images[-1], display=display)      # display=False builds the figure, doesn't show it
+        result = CaptureResult(images=images, sequence=sequence, plot=plot)
+        self.history.append(result)
+        return result
+
     def _configure_imaging(self, *, exposure: float | None = None, load: bool = True, trigger_width: float = 20e-6, pre_trigger: float = 100e-6) -> PulseSequence:
-        if exposure is not None and hasattr(self.devices.camera, "configure"):
-            self.devices.camera.configure(exposure=exposure)
+        camera = getattr(self.devices, "camera", None)
+        if exposure is not None and hasattr(camera, "configure"):
+            camera.configure(exposure=exposure)
         self.sequence = self._imaging_sequence(
             exposure=self._camera_exposure() if exposure is None else exposure,
             trigger_width=trigger_width,
@@ -100,219 +177,19 @@ class NeutralAtomSession:
         return imaging_sequence(**kwargs, **self._imaging_channel_kwargs())
 
     def _imaging_channel_kwargs(self) -> dict[str, str]:
-        sequencer = getattr(self.devices, "sequencer", None)
-        channels = list(getattr(sequencer, "channels", ()))
-        trigger_channels = list(getattr(sequencer, "trigger_channels", ()))
-        if all(channel in channels for channel in ("ch00", "ch03", "ch09")) and trigger_channels and trigger_channels[0] in channels:
-            return {
-                "trap_channel": "ch09",
-                "cooling_channel": "ch00",
-                "probe_channel": "ch03",
-                "trigger_channel": trigger_channels[0],
-            }
-        if all(channel in channels for channel in ("trap", "cooling", "probe", "emCCD")):
-            return {
-                "trap_channel": "trap",
-                "cooling_channel": "cooling",
-                "probe_channel": "probe",
-                "trigger_channel": "emCCD",
-            }
-        return {}
-
-    def _calibrate_sitemap(
-        self,
-        *,
-        frames: int = 20,
-        grid_shape: Sequence[int] | None = None,
-        ordering: str = "row-major",
-        roi_radius: int | None = None,
-        reducer: str = "mean",
-        display: bool = True,
-    ) -> SitemapResult:
-        grid_shape = self._grid_shape(grid_shape)
-        roi_radius = int(self.defaults.get("roi_radius", 1) if roi_radius is None else roi_radius)
-        exposure = self.defaults.get("sitemap_exposure", self._camera_exposure())
-        sequence = self._imaging_sequence(exposure=exposure, load=True, name="sitemap")
-        images = self.devices.camera.acquire(positive_int(frames, "frames"), sequence=sequence, sequencer=getattr(self.devices, "sequencer", None))
-        result = calibrate_sitemap_from_images(
-            images,
-            grid_shape=grid_shape,
-            ordering=ordering,
-            roi_radius=roi_radius,
-            reducer=reducer,
-            display=display,
-        )
-        self._calibration = result.calibration
-        self.history.append(result)
-        return result
-
-    def _calibrate_threshold(
-        self,
-        *,
-        frames: int = 100,
-        site: int = 0,
-        exposure: float | None = None,
-        display: bool = True,
-    ) -> ThresholdResult:
-        calibration = self.require_calibration(require_thresholds=False)
-        sequence = self._imaging_sequence(exposure=self._camera_exposure() if exposure is None else exposure, load=True, name="threshold")
-        images = self.devices.camera.acquire(positive_int(frames, "frames"), sequence=sequence, sequencer=getattr(self.devices, "sequencer", None))
-        result = calibrate_threshold_from_images(images, calibration, site=site, display=display)
-        self._calibration = result.calibration
-        self.history.append(result)
-        return result
-
-    def _detect(self, *, exposure: float | None = None, display: bool = True, what: str = "occupancy") -> DetectionResult:
-        calibration = self.require_calibration(require_thresholds=True)
-        sequence = self._imaging_sequence(exposure=self._camera_exposure() if exposure is None else exposure, load=True, name="detect")
-        images = self.devices.camera.acquire(1, sequence=sequence, sequencer=getattr(self.devices, "sequencer", None))
-        result = detect_image(images[-1], calibration, sequence=sequence, display=display, what=what)
-        self.history.append(result)
-        return result
-
-    def _scan_detection_time(
-        self,
-        times: Sequence[float],
-        *,
-        shots: int = 60,
-        site: int | None = None,
-        reference_exposure: float | None = None,
-        reference_shots: int = 30,
-        live: bool = True,
-        update_time: float = 0.05,
-        display: bool = True,
-        pulse: Any | None = None,
-        pulse_parameter: str | None = None,
-    ) -> DetectionTimeScanResult:
-        calibration = self.require_calibration(require_thresholds=False)
-        times = np.asarray(times, dtype=float).reshape(-1)
-        if times.size == 0 or not np.all(np.isfinite(times)) or np.any(times <= 0):
-            raise ValueError("times must contain positive finite detection times.")
-        shots = positive_int(shots, "shots")
-        reference_shots = positive_int(reference_shots, "reference_shots")
-        data_y = np.full((len(times), 1), np.nan, dtype=float)
-        reference_exposure = float(max(np.nanmax(times) * 3.0, self._camera_exposure()) if reference_exposure is None else reference_exposure)
-        if not np.isfinite(reference_exposure) or reference_exposure <= 0:
-            raise ValueError("reference_exposure must be positive and finite.")
-
-        if pulse is None:
-            reference_sequence = self._imaging_sequence(exposure=reference_exposure, load=True, name="reference_threshold")
-            reference_sequencer = getattr(self.devices, "sequencer", None)
-        else:
-            time_parameter = self._detection_time_pulse_parameter(pulse, pulse_parameter)
-            reference_time_ns = float(reference_exposure) * 1e9
-            set_variable = getattr(pulse, "set_variable", None)
-            if callable(set_variable):
-                set_variable(time_parameter, reference_time_ns)
-            configure = getattr(self.devices.camera, "configure", None)
-            if callable(configure):
-                configure(exposure=float(reference_exposure))
-            frame_sequence = getattr(pulse, "frame_sequence", None)
-            if not callable(frame_sequence):
-                raise TypeError("pulse must be a PulseController returned by exp.timing.bind_pulse(...) or na.bind_pulse(...).")
-            reference_sequence = frame_sequence(reference_shots, variables={time_parameter: reference_time_ns})
-            reference_sequencer = getattr(pulse, "sequencer", getattr(self.devices, "sequencer", None))
-        reference_images = self.devices.camera.acquire(
-            reference_shots,
-            sequence=reference_sequence,
-            sequencer=reference_sequencer,
-        )
-        reference_counts = np.vstack(
-            [roi_counts(image, calibration.centers, radius=calibration.roi_radius, reducer=calibration.reducer) for image in reference_images]
-        )
-        if site is None:
-            reference_values = reference_counts.reshape(-1)
-        else:
-            site_idx_ref = site_index(site, reference_counts.shape[1])
-            reference_values = reference_counts[:, site_idx_ref]
-        reference_threshold = otsu_threshold(reference_values)
-        reference_fidelity = estimate_threshold_fidelity(reference_values, reference_threshold)
-        result = DetectionTimeScanResult(
-            times=times,
-            data_y=data_y,
-            reference_exposure=reference_exposure,
-            reference_threshold=float(reference_threshold),
-            reference_fidelity=None if not np.isfinite(reference_fidelity.fidelity) else float(reference_fidelity.fidelity),
-            reference_counts=reference_counts,
-        )
-
-        def measure(time_s: float, index: int | None = None) -> float:
-            if pulse is None:
-                sequence = self._imaging_sequence(exposure=float(time_s), load=True, name="detect_time_scan")
-                sequencer = getattr(self.devices, "sequencer", None)
-            else:
-                time_parameter = self._detection_time_pulse_parameter(pulse, pulse_parameter)
-                time_ns = float(time_s) * 1e9
-                set_variable = getattr(pulse, "set_variable", None)
-                if callable(set_variable):
-                    set_variable(time_parameter, time_ns)
-                configure = getattr(self.devices.camera, "configure", None)
-                if callable(configure):
-                    configure(exposure=float(time_s))
-                frame_sequence = getattr(pulse, "frame_sequence", None)
-                if not callable(frame_sequence):
-                    raise TypeError("pulse must be a PulseController returned by exp.timing.bind_pulse(...) or na.bind_pulse(...).")
-                sequence = frame_sequence(shots, variables={time_parameter: time_ns})
-                sequencer = getattr(pulse, "sequencer", getattr(self.devices, "sequencer", None))
-            images = self.devices.camera.acquire(shots, sequence=sequence, sequencer=sequencer)
-            counts = np.vstack(
-                [roi_counts(image, calibration.centers, radius=calibration.roi_radius, reducer=calibration.reducer) for image in images]
-            )
-            if site is None:
-                values = counts.reshape(-1)
-            else:
-                site_idx = site_index(site, counts.shape[1])
-                values = counts[:, site_idx]
-            threshold = otsu_threshold(values)
-            model = estimate_threshold_fidelity(values, threshold)
-            fidelity = float(model.fidelity)
-            if not np.isfinite(fidelity):
-                fidelity = 0.5
-            result.thresholds.append(float(threshold))
-            result.model_fidelities.append(fidelity)
-            return fidelity
-
-        if live:
-            from Zou_lab_control import frontend as zf
-
-            result.measurement = zf.run(
-                times.reshape(-1, 1),
-                measure,
-                data_y=data_y,
-                labels=("Detection time (s)", "Fidelity", "Fidelity"),
-                update_time=update_time,
-                display=display,
-                stop_hint="Live measurement started. Call scan.stop() to stop measurement and plot.",
-            )
-            result.plot = result.measurement.plot
-        else:
-            for index, time_s in enumerate(times):
-                data_y[index, 0] = measure(float(time_s), index)
-            result.plot = plot_detection_scan(times, data_y[:, 0], display=display)
-        self.history.append(result)
-        return result
-
-    @staticmethod
-    def _detection_time_pulse_parameter(pulse: Any, preferred: str | None = None) -> str:
-        if preferred:
-            return str(preferred)
-        payload = getattr(pulse, "pulse", None)
-        active: list[str] = []
-        if hasattr(payload, "active_scan_parameters"):
-            active = list(payload.active_scan_parameters())
-        variables = dict(getattr(pulse, "variables", {}) or {})
-        if "detection_time_ns" in active or "detection_time_ns" in variables:
-            return "detection_time_ns"
-        if len(active) == 1:
-            return active[0]
-        return "detection_time_ns"
+        # Single source of truth lives in timing.imaging_channel_kwargs so the
+        # session and the loading readout map channels identically (see M4 / logic nodes).
+        # The CAMERA owns which line gates a frame, so the imaging pulse triggers THAT channel.
+        cam_trig = getattr(getattr(self.devices, "camera", None), "capture_trigger_channels", None)
+        return imaging_channel_kwargs(getattr(self.devices, "sequencer", None),
+                                      trigger_channel=(cam_trig[0] if cam_trig else None))
 
     def _preflight(self, *, sequence: PulseSequence | None = None, verilog: bool = True) -> PreflightReport:
         sequence = sequence or self.sequence
         errors: list[str] = []
         warnings: list[str] = []
         sequencer = getattr(self.devices, "sequencer", None)
-        clock = getattr(sequencer, "clock_hz", 50_000_000.0)
+        clock = getattr(sequencer, "clock_hz", DEFAULT_CLOCK_HZ)
         channels = getattr(sequencer, "channels", None)
         pulse_report = sequence.validate(clock_hz=clock, channels=channels)
         errors.extend(pulse_report.errors)
@@ -332,11 +209,11 @@ class NeutralAtomSession:
             verilog=build,
         )
 
-    def _write_verilog(self, output_dir: str | Path = "generated_sequences", *, sequence: PulseSequence | None = None) -> Path:
+    def _write_verilog(self, output_dir: str | Path = GENERATED_SEQUENCES_DIR, *, sequence: PulseSequence | None = None) -> Path:
         sequence = sequence or self.sequence
         sequencer = getattr(self.devices, "sequencer", None)
         channels = getattr(sequencer, "channels", sequence.channels)
-        clock = getattr(sequencer, "clock_hz", 50_000_000.0)
+        clock = getattr(sequencer, "clock_hz", DEFAULT_CLOCK_HZ)
         pin_map = getattr(sequencer, "pin_map", None)
         build = generate_verilog(sequence, channels=channels, clock_hz=clock, module_name="neutral_atom_sequence")
         files = write_verilog_bundle(build, output_dir, pin_map=pin_map)
@@ -389,7 +266,12 @@ class NeutralAtomSession:
         self.devices.close()
 
     def _camera_exposure(self) -> float:
-        return float(getattr(self.devices.camera, "exposure", getattr(getattr(self.devices.camera, "config", None), "exposure", 20e-3)))
+        # The READOUT camera's exposure when that role exists; a camera-less config still
+        # composes imaging sequences with the stock default (no fabricated device needed).
+        camera = getattr(self.devices, "camera", None)
+        if camera is None:
+            return 20e-3
+        return float(getattr(camera, "exposure", getattr(getattr(camera, "config", None), "exposure", 20e-3)))
 
     def _grid_shape(self, grid_shape: Sequence[int] | None) -> tuple[int, int]:
         if grid_shape is not None:
@@ -414,85 +296,23 @@ def connect(
     """Load devices and return a notebook-facing neutral-atom session."""
 
     default_values = dict(defaults or {})
-    device_config = config
-    device_overrides: dict[str, dict[str, Any]] = {}
-    if _is_virtual_config(config):
-        device_config, inferred_defaults = _virtual_config_with_overrides(
-            trap_array=trap_array,
-            sitemap=sitemap,
-            camera=camera,
-            sequencer=sequencer,
-            params=virtual_params,
-        )
-        default_values.update(inferred_defaults)
-    else:
-        if sitemap or virtual_params:
-            raise ValueError("sitemap and virtual shortcut parameters are only supported with config='virtual'.")
-        for device_name, params in (("trap_array", trap_array), ("camera", camera), ("sequencer", sequencer)):
-            if params:
-                device_overrides[device_name] = dict(params)
+    # The device layer (registry) owns backend dispatch + any backend-specific
+    # config shortcuts; the session never imports a concrete backend or reads its
+    # internal fields, so virtual <-> real is a one-line `config` change.
+    device_config, device_overrides, inferred_defaults = resolve_connect_config(
+        config,
+        trap_array=trap_array,
+        sitemap=sitemap,
+        camera=camera,
+        sequencer=sequencer,
+        params=virtual_params,
+    )
+    default_values.update(inferred_defaults)
     return NeutralAtomSession(
-        load_devices(device_config, overrides=device_overrides or None, open_devices=open_devices),
+        load_devices(device_config, overrides=device_overrides, open_devices=open_devices),
         name=name,
         defaults=default_values,
     )
-
-
-def _is_virtual_config(config) -> bool:
-    return isinstance(config, str) and config.lower() == "virtual"
-
-
-def _virtual_config_with_overrides(
-    *,
-    trap_array: dict[str, Any] | None = None,
-    sitemap: dict[str, Any] | None = None,
-    camera: dict[str, Any] | None = None,
-    sequencer: dict[str, Any] | None = None,
-    params: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    cfg = virtual_config()
-    trap_params = dict(trap_array or {})
-    sitemap_params = dict(sitemap or {})
-    camera_params = dict(camera or {})
-    sequencer_params = dict(sequencer or {})
-    defaults: dict[str, Any] = {}
-    trap_fields = set(VirtualTrapArray.__dataclass_fields__)
-    aliases = {
-        "bright_count_rate": "atom_rate",
-        "atom_bright_rate": "atom_rate",
-        "background_count_rate": "background_rate",
-        "load_probability": "loading_probability",
-    }
-    for key, value in sitemap_params.items():
-        target = aliases.get(key, key)
-        if target in trap_fields:
-            trap_params[target] = value
-        elif key in {"roi_radius", "sitemap_exposure", "detection_times"}:
-            defaults[key] = value
-        else:
-            raise TypeError(f"unknown sitemap configuration parameter {key!r}.")
-    for key, value in dict(params or {}).items():
-        if key == "loss_rate":
-            loss_rate = float(value)
-            if not np.isfinite(loss_rate) or loss_rate <= 0:
-                raise ValueError("loss_rate must be positive and finite.")
-            trap_params["detection_lifetime"] = 1.0 / loss_rate
-        elif key in {"sitemap_exposure", "detection_times", "roi_radius"}:
-            defaults[key] = value
-        else:
-            target = aliases.get(key, key)
-            if target in trap_fields:
-                trap_params[target] = value
-            elif key in {"exposure", "timeout"}:
-                camera_params[key] = value
-            elif key in {"clock_hz", "sleep_scale", "channels"}:
-                sequencer_params[key] = value
-            else:
-                raise TypeError(f"unknown virtual configuration parameter {key!r}.")
-    cfg["trap_array"].setdefault("params", {}).update(trap_params)
-    cfg["camera"].setdefault("params", {}).update(camera_params)
-    cfg["sequencer"].setdefault("params", {}).update(sequencer_params)
-    return cfg, defaults
 
 
 __all__ = [

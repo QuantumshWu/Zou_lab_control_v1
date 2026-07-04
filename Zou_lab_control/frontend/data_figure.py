@@ -16,6 +16,17 @@ from scipy.optimize import OptimizeWarning, curve_fit
 from scipy.signal import find_peaks
 import warnings
 
+from .style import PALETTE, small_fontsize
+
+# 2D "center" fit overlay sizing (a centre DOT + the fitted-radius RING -- the pairing is fixed).  The
+# dot is an ABSOLUTE-size locator (scatter ``s`` is points^2, independent of the axes scale), so it must
+# be SMALL or it blots the atom out on a ~100px grid thumbnail; the ring's radius is in DATA coords (it
+# shrinks with the cell), so it must be BOLD + OPAQUE to stay the readable element.  Tuned once here so a
+# tiny thumbnail and the full focus view share one primitive (data_figure fit is the single source).
+_CENTER_DOT_SIZE = 8       # scatter ``s`` (points^2): a small centre locator, never a signal-blotting blob
+_CENTER_RING_LW = 1.8      # ring linewidth: bold enough to read the fitted radius over noise / the spot
+_CENTER_RING_ALPHA = 0.9   # ring opacity: the ring is the PRIMARY readable overlay, so nearly solid
+
 
 VALID_FIT_FUNCS = ["lorent", "lorent_zeeman", "rabi", "decay", "center", "gaussian"]
 
@@ -37,11 +48,33 @@ def _as_2d_y(data_y) -> np.ndarray:
     return y
 
 
+def resolve_save_base(path, stem: str) -> Path:
+    """Turn a save ``path`` + ``stem`` into the extension-less base path, and mkdir its parent --
+    the ONE place a figure+npz pair's location is resolved (DataFigure.save and the grid save both
+    call it).  Empty / ``"."`` -> the bare ``stem``; a directory or trailing-separator path -> the
+    stem inside it; a path that already has a suffix -> that path sans suffix; anything else ->
+    ``<path>_<stem>`` (#C4)."""
+    p = Path(path)
+    if str(p) in ("", "."):
+        base = Path(stem)
+    elif str(p).endswith(("/", "\\")) or p.is_dir():
+        base = p / stem
+    elif p.suffix:
+        base = p.with_suffix("")
+    else:
+        base = Path(f"{p}_{stem}")
+    base.parent.mkdir(parents=True, exist_ok=True)
+    return base
+
+
 class DataFigure:
     """Data and post-processing handle for a front-end figure.
 
     A DataFigure can be created from a ``Live1D``/``Live2DDis``/``HistogramFigure``
-    object, or from explicit ``fig``, ``data_x`` and ``data_y`` handles.
+    object, or from explicit ``fig``, ``data_x`` and ``data_y`` handles.  Pass an
+    explicit ``ax`` to bind the fitting/post-processing to ONE axes of a
+    multi-axes figure (e.g. a single cell of a site-histogram grid), so the same
+    reusable stack works per cell instead of only on ``fig.axes[0]``.
     """
 
     def __init__(
@@ -49,6 +82,7 @@ class DataFigure:
         live_plot=None,
         *,
         fig: plt.Figure | None = None,
+        ax: plt.Axes | None = None,
         data_x=None,
         data_y=None,
         labels: Sequence[str] | None = None,
@@ -72,6 +106,10 @@ class DataFigure:
             raise ValueError("DataFigure needs either live_plot or fig/data_x/data_y.")
 
         self.fig = fig
+        # The single axes this DataFigure draws on / reads limits from.  Defaults
+        # to the figure's first axes (single-axes plots); an explicit ``ax`` binds
+        # it to one cell of a multi-axes figure so the stack is reusable per cell.
+        self._ax = ax if ax is not None else self.fig.axes[0]
         self.data_x = np.asarray(data_x, dtype=float)
         if self.data_x.ndim == 1:
             self.data_x = self.data_x[:, None]
@@ -89,8 +127,17 @@ class DataFigure:
             self.zoom = getattr(live_plot, "zoom", self.zoom)
             self.cross = getattr(live_plot, "cross", self.cross)
 
-        first_ax = self.fig.axes[0]
-        self.plot_type = "2D" if first_ax.images else "1D"
+        first_ax = self._ax
+        # The fitting FAMILY ("1D" / "2D") comes from the plot's DECLARED
+        # ``render_family`` (the single-source PLOT_KINDS table in live.py), not
+        # re-derived from matplotlib artists.  Fall back to the legacy artist
+        # heuristic (an image axes => 2D) when there is nothing to ask -- no
+        # live_plot (a GridPlot per-cell DataFigure built with ``fig=``/``ax=``, or
+        # a bare externally-constructed DataFigure) OR a plot that declares the
+        # ``"auto"`` sentinel (the site map, whose family is image-only when a
+        # background frame is supplied, so it stays artist-derived per figure).
+        declared = getattr(live_plot, "render_family", None) if live_plot is not None else None
+        self.plot_type = declared if declared in ("1D", "2D") else ("2D" if first_ax.images else "1D")
         self.ylabel_original = self.labels[1] if len(self.labels) > 1 else first_ax.get_ylabel()
         self.unit = unit or self._infer_unit(first_ax.get_xlabel())
         self.unit_original = self.info.get("unit", self.unit)
@@ -102,6 +149,11 @@ class DataFigure:
         self.fit_func = None
         self.text = None
         self._scatter_list = []
+        # The SOURCE binding (hub + producing node + wired inputs), copied from the live plot when this
+        # DataFigure wraps one, so ``save`` can write the RICH npz (``info['signals']`` +
+        # ``info['provenance']``) through the ONE core capture -- the SAME logic the console panel uses.
+        # ``None`` (a bare array DataFigure) => ``save`` writes the basic figure+npz (old behaviour).
+        self._figure_source = getattr(live_plot, "_figure_source", None)
         warnings.filterwarnings("ignore", category=OptimizeWarning)
 
     @staticmethod
@@ -129,13 +181,69 @@ class DataFigure:
             self.unit_original = self.unit
         self._update_transform_back()
 
+    def fit_targets(self):
+        """The per-axes fit handles this figure represents.  A plain :class:`DataFigure` IS one target
+        (itself), so the Edit-tab fit / clear stack loops UNIFORMLY over ``fit_targets()`` regardless of
+        whether the panel is a single plot or a grid.  :class:`~.live._GridData` overrides this to yield
+        its N per-cell DataFigures, so a grid fit fans out over EVERY subplot through this identical
+        DataFigure primitive -- one fit conception, the multiplicity owned by the grid handle."""
+        return (self,)
+
     def xlim(self, x_min: float, x_max: float) -> None:
-        self.fig.axes[0].set_xlim(x_min, x_max)
+        self._ax.set_xlim(x_min, x_max)
         self.fig.canvas.draw_idle()
 
     def ylim(self, y_min: float, y_max: float) -> None:
-        self.fig.axes[0].set_ylim(y_min, y_max)
+        self._ax.set_ylim(y_min, y_max)
         self.fig.canvas.draw_idle()
+
+    def bind_source(self, hub, node, *, inputs, resolve_node=None, session=None):
+        """Stamp WHERE this figure's data came from so :meth:`save` writes the RICH npz -- the DataFigure
+        counterpart of :meth:`live.BaseLivePlot.bind_source`, for when a caller holds the DataFigure
+        directly.  Returns ``self`` for chaining."""
+        self._figure_source = {"hub": hub, "node": node, "inputs": list(inputs or []),
+                               "resolve_node": resolve_node, "session": session}
+        return self
+
+    def _rich_capture(self) -> dict[str, Any]:
+        """The ``signals`` + ``provenance`` blocks a RICH save folds into ``info``, captured through the
+        ONE frontend-neutral core (``operations.figure_capture``) -- the SAME logic the console panel's
+        Save uses, so a notebook ``.save()`` and a GUI panel Save write byte-identical rich npz.  For a
+        BARE array plot (no source binding) the ``signals`` / device ``provenance`` are empty, but the save
+        STILL folds a minimal ``provenance['flow_graph']`` (``raw data -> plot``), so the Flow tab of even a
+        plain ``plot(arr).save()`` has a tree to draw.  Never raises -- a capture that fails for one block
+        simply omits it."""
+        src = self._figure_source or {}
+        from Zou_lab_control.neutral_atom.operations.figure_capture import (
+            capture_figure_signals, capture_figure_provenance, capture_flow_graph, raw_data_flow_graph)
+        out: dict[str, Any] = {}
+        try:
+            signals = capture_figure_signals(src.get("hub"), src.get("node"), src.get("inputs"))
+        except Exception:
+            signals = {}
+        if signals:
+            out["signals"] = signals
+        try:
+            prov = capture_figure_provenance(src.get("node"), resolve_node=src.get("resolve_node"),
+                                             session=src.get("session"))
+        except Exception:
+            prov = None
+        # The SYSTEMATIC upstream DAG of how the data was produced (raw / measurement / processor chain,
+        # BRANCHING upward) -- captured through the SAME core and folded into ``provenance['flow_graph']``
+        # (an append-only key: it never disturbs the existing flat ``provenance`` / ``signals`` structure).
+        try:
+            flow = capture_flow_graph(src.get("hub"), src.get("node"), src.get("inputs"),
+                                      resolve_node=src.get("resolve_node"))
+        except Exception:
+            flow = None
+        if not flow:                          # a capture that failed / returned nothing STILL saves raw->plot,
+            flow = raw_data_flow_graph()      # so the Flow tab of every saved figure has a tree (never "no data")
+        if prov is None:
+            prov = {}
+        prov["flow_graph"] = flow
+        if prov is not None:
+            out["provenance"] = prov
+        return out
 
     def save(
         self,
@@ -144,34 +252,105 @@ class DataFigure:
         extra_info: Mapping[str, Any] | None = None,
         image_ext: str = "png",
     ) -> dict[str, Path]:
-        """Save the figure image and a matching ``.npz`` payload."""
+        """Save the figure image and a matching ``.npz`` payload.
+
+        When this figure carries a SOURCE binding (``bind_source`` / a plot created from live signals),
+        the save is RICH: it folds ``info['signals']`` (raw hub blocks + roles, so a site map's underlay
+        frame + centres round-trip) and ``info['provenance']`` (the device state the data was taken under)
+        captured through the ONE frontend-neutral core -- identical to the console panel's Save.  An
+        explicit ``extra_info`` key WINS over the auto-capture (the GUI passes its own richer blocks), and
+        a bare array figure (no binding) writes just the basic figure+npz."""
         current_time = time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime())
         stem = "_".join(p for p in (self.name, current_time) if p)
-        path = Path(path)
-        if str(path) in ("", "."):
-            base = Path(stem)
-        elif str(path).endswith(("/", "\\")) or path.is_dir():
-            base = path / stem
-        elif path.suffix:
-            base = path.with_suffix("")
-        else:
-            base = Path(f"{path}_{stem}")
-        base.parent.mkdir(parents=True, exist_ok=True)
-
+        base = resolve_save_base(path, stem)
         image_path = base.with_suffix(f".{image_ext}")
         data_path = base.with_suffix(".npz")
         info = {
             **self.info,
-            **dict(extra_info or {}),
+            **self._rich_capture(),          # auto signals/provenance (bound figure); {} for a bare plot
+            **dict(extra_info or {}),         # an explicit caller block WINS over the auto-capture
             "labels": self.labels,
             "name": self.name,
             "unit": self.unit_original,
             "points_done": getattr(self.live_plot, "points_done", len(self.data_x)),
             "repeat_cur": getattr(self.live_plot, "repeat_cur", 1),
         }
+        # Fold the CURRENT view unit + any applied fit into ``info`` so a reload
+        # reproduces "the figure as saved" (not just the raw arrays): ``unit`` is
+        # the display unit, and a fit -- if one has been drawn -- carries its
+        # function name, coefficients and parameter names so a reader can see /
+        # re-apply it.  These only APPEND keys; the data_x/data_y/info structure
+        # is unchanged, so an older reader still reads the file.
+        fit_info = self._saved_fit_info()
+        if fit_info is not None:
+            info.setdefault("fit", fit_info)
+        # Stamp the plotter's OWN kind (reverse-looked-up from the ONE PLOT_KINDS table) so a bare
+        # ``plot.save()`` round-trips ``SavedFigure.kind`` to the SAME kind that drew it -- a
+        # HistogramFigure save reopens as ``hist`` (not a fallback 1-D line), a LiveSiteMap save as
+        # ``sites`` (rings, not a 2-D image), a grid as ``grid``.  Only when NEITHER ``self.info`` nor an
+        # explicit ``extra_info`` already carries a kind (those WIN -- e.g. the GUI panel stamps its own),
+        # and only when there IS a bound plotter to ask (a bare array DataFigure has nothing to stamp).
+        if "kind" not in info and self.live_plot is not None:
+            from .live import kind_for_plotter
+            auto_kind = kind_for_plotter(self.live_plot)
+            if auto_kind is not None:
+                info["kind"] = auto_kind
+        # SELF-CONTAINED site map: a bare LiveSiteMap save (no hub binding -- the calibration report, a
+        # notebook site map) has no ``info['signals']`` from the rich capture, so a reopen would show
+        # rings on an EMPTY board (the underlay camera frame was never stored -- the reported bug where
+        # site_map.npz was ~1 KB).  Fold the plot's OWN centres + background frame into ``info['signals']``
+        # (the SAME faithful-path blocks a rich save writes), so the figure's data is self-contained: the
+        # reopen rebuilds the rings AND the template underlay without any device provenance.  Only when no
+        # signals block already exists (a rich save's WINS).
+        if info.get("kind") == "sites" and not info.get("signals"):
+            underlay = self._sites_underlay_signals()
+            if underlay:
+                info["signals"] = underlay
         self.fig.savefig(image_path, bbox_inches="tight")
         np.savez(data_path, data_x=self.data_x_original, data_y=self.data_y, info=info)
         return {"figure": image_path, "data": data_path}
+
+    def _sites_underlay_signals(self) -> dict[str, Any]:
+        """The self-contained ``info['signals']`` blocks a bare SITE-MAP save folds in so a reopen rebuilds
+        the rings AND the background camera frame WITHOUT any device provenance -- the ``value`` occupancy,
+        the ``(N, 2)`` centres and (crucially) the underlay ``frame`` -- in the SAME schema the rich
+        capture (``operations.figure_capture``) writes.  Empty when there is nothing to store (no bound
+        site-map plotter / no background frame), so a save is never blocked.  The blocks carry the native
+        ``(repeat, *points, *data)`` axes (occupancy ``(1, 1, N)``, frame ``(1, 1, H, W)``) so the reloader
+        declares the SAME shape contract a live producer did."""
+        lp = self.live_plot
+        centers = getattr(lp, "data_x", None)
+        background = getattr(lp, "background", None)
+        if lp is None or centers is None:
+            return {}
+        centers = np.asarray(centers, dtype=float)[:, :2]
+        n = centers.shape[0]
+        occ = np.asarray(getattr(lp, "data_y", self.data_y), dtype=float).reshape(-1)[:n].reshape(1, 1, n)
+        ylabel = self.labels[1] if len(self.labels) > 1 else "occupancy"
+        signals: dict[str, Any] = {
+            "occupied": {"block": occ, "points_shape": [1], "data_shape": [n],
+                         "label": str(ylabel), "unit": "", "role": "value"},
+            "centers": {"block": centers, "points_shape": None, "data_shape": None,
+                        "label": "site centre", "unit": "px", "role": "centers"},
+        }
+        if background is not None:
+            frame = np.asarray(background, dtype=float)
+            h, w = frame.shape
+            signals["frame_judged"] = {"block": frame.reshape(1, 1, h, w), "points_shape": [1],
+                                       "data_shape": [h, w], "label": "camera image", "unit": "counts",
+                                       "role": "frame"}
+        return signals
+
+    def _saved_fit_info(self) -> dict[str, Any] | None:
+        """The applied fit as a JSON-friendly dict (``func`` + ``names`` + ``popt``) for the
+        saved ``info``, or ``None`` when no fit has been drawn.  ``popt`` becomes a plain list
+        (never a raw ndarray) so ``np.savez`` round-trips it cleanly and a reader can read it
+        without unpacking an object array."""
+        if not self.fit_func or self.popt is None:
+            return None
+        names = list(getattr(self, "popt_str", []) or [])
+        return {"func": str(self.fit_func), "names": names,
+                "popt": [float(v) for v in np.asarray(self.popt, dtype=float).ravel()]}
 
     def _align_to_grid(self, value: float, axis: str) -> float:
         if self.plot_type != "2D" or self.live_plot is None:
@@ -199,7 +378,7 @@ class DataFigure:
             y = self.data_y[valid_index, 0]
             area = getattr(self.area, "range", [None, None, None, None])
             if area[0] is None:
-                xlim = self.fig.axes[0].get_xlim()
+                xlim = self._ax.get_xlim()
                 xl, xh = sorted(xlim)
             else:
                 xl, xh = sorted(area[:2])
@@ -213,8 +392,8 @@ class DataFigure:
         z_all = self.data_y[valid_index, 0]
         area = getattr(self.area, "range", [None, None, None, None])
         if area[0] is None:
-            xl, xh = sorted(self.fig.axes[0].get_xlim())
-            yl, yh = sorted(self.fig.axes[0].get_ylim())
+            xl, xh = sorted(self._ax.get_xlim())
+            yl, yh = sorted(self._ax.get_ylim())
         else:
             xl, xh, yl, yh = area
             xl, xh = sorted([xl, xh])
@@ -277,24 +456,24 @@ class DataFigure:
 
         if is_display:
             if self.text is None:
-                self.text = self.fig.axes[0].text(
+                self.text = self._ax.text(
                     0.5,
                     0.5,
                     result,
-                    transform=self.fig.axes[0].transAxes,
-                    color="blue",
+                    transform=self._ax.transAxes,
+                    color=PALETTE["fit_text"],
                     ha="center",
                     va="center",
-                    fontsize=matplotlib.rcParams["legend.fontsize"],
+                    fontsize=small_fontsize(),
                 )
             else:
                 self.text.set_text(result)
-            self._place_text(self.fig.axes[0], self.text)
+            self._place_text(self._ax, self.text)
         elif self.text is not None:
             self.text.remove()
             self.text = None
 
-        lines = getattr(self.live_plot, "lines", None) if self.live_plot is not None else self.fig.axes[0].lines
+        lines = getattr(self.live_plot, "lines", None) if self.live_plot is not None else self._ax.lines
         for line in lines:
             if hasattr(line, "set_alpha"):
                 line.set_alpha(0.5)
@@ -340,23 +519,30 @@ class DataFigure:
 
         self.popt = popt
         self._display_popt(popt, self.popt_str, is_display)
-        ax = self.fig.axes[0]
+        ax = self._ax
         if self.plot_type == "1D":
             yfit = self._fit_func(self.data_x[:, 0], *popt)
             if self.fit is None:
-                self.fit = ax.plot(self.data_x[:, 0], yfit, color="orange", linestyle="-", linewidth=2, alpha=0.5)
+                self.fit = ax.plot(self.data_x[:, 0], yfit, color=PALETTE["fit_right"], linestyle="-", linewidth=2, alpha=0.5)
             else:
                 self.fit[0].set_data(self.data_x[:, 0], yfit)
         else:
             if self.fit is None:
-                self.fit = [ax.scatter(popt[-2], popt[-1], color="orange", s=50)]
+                # SAME style as always -- a centre DOT + the fitted-radius CIRCLE (that pairing is fixed).
+                # The DOT is a small LOCATOR (scatter ``s`` is absolute points^2, so a big dot blots the
+                # atom out on a 100px grid thumbnail); the RING is the READABLE element (its radius is data
+                # coords, so it shrinks with the cell -- it must be bold + opaque to stay legible over the
+                # noise/spot).  ``s`` small + ``lw``/``alpha`` up rebalances the two so both read on a tiny
+                # thumbnail AND the full focus view -- one primitive, no per-scale special case.
+                self.fit = [ax.scatter(popt[-2], popt[-1], color=PALETTE["fit_right"],
+                                       s=_CENTER_DOT_SIZE)]
                 circle = matplotlib.patches.Circle(
                     (popt[-2], popt[-1]),
                     radius=abs(popt[-3]),
-                    edgecolor="orange",
+                    edgecolor=PALETTE["fit_right"],
                     facecolor="none",
-                    linewidth=2,
-                    alpha=0.5,
+                    linewidth=_CENTER_RING_LW,
+                    alpha=_CENTER_RING_ALPHA,
                 )
                 self.fit.append(circle)
                 ax.add_patch(circle)
@@ -398,6 +584,12 @@ class DataFigure:
         return FitResult(self.popt_str, popt, pcov, self.fit_func), popt
 
     def gaussian(self, p0=None, is_display: bool = True, is_fit: bool = True, **kwargs):
+        # NOTE (DRY boundary, #H3w-5): this is the INTERACTIVE CURVE-FIT model for a 1-D plot -- a peak
+        # on a BACKGROUND, so it carries an ``offset`` (B) term and amplitude may be negative (a dip).
+        # It is deliberately DISTINCT from ``_readout_math.gaussian`` (a normalised, offset-free PEAK
+        # used by the per-site readout fidelity math).  Different models for different jobs -- do NOT
+        # "unify" them; the offset here would corrupt the readout overlap integral, and removing it
+        # would break fitting a peak that sits on a pedestal.
         if self.plot_type == "2D":
             return FitResult(["A", "B", "sigma", "x_0"], None, None, "gaussian"), None
         self.data_x_p, self.data_y_p = self._select_fit(min_num=4)
@@ -568,7 +760,7 @@ class DataFigure:
                     pass
             self.fit = None
         self._scatter_to_line()
-        lines = getattr(self.live_plot, "lines", None) if self.live_plot is not None else self.fig.axes[0].lines
+        lines = getattr(self.live_plot, "lines", None) if self.live_plot is not None else self._ax.lines
         for line in lines:
             if hasattr(line, "set_alpha"):
                 line.set_alpha(1)
@@ -577,13 +769,13 @@ class DataFigure:
     def _line_to_scatter(self) -> None:
         if self.plot_type != "1D" or self._scatter_list:
             return
-        ax = self.fig.axes[0]
-        line = self.fig.axes[0].lines[0] if self.fig.axes[0].lines else None
+        ax = self._ax
+        line = self._ax.lines[0] if self._ax.lines else None
         if line is None:
             return
         x = np.asarray(line.get_xdata())
         y = np.asarray(line.get_ydata())
-        sc = ax.scatter(x, y, s=20, color="lightgrey", edgecolors="none")
+        sc = ax.scatter(x, y, s=20, color=PALETTE["data_scatter"], edgecolors="none")
         self._scatter_list.append(sc)
         line.set_visible(False)
 
@@ -594,8 +786,8 @@ class DataFigure:
             except Exception:
                 pass
         self._scatter_list = []
-        if self.fig.axes and self.fig.axes[0].lines:
-            self.fig.axes[0].lines[0].set_visible(True)
+        if self.fig.axes and self._ax.lines:
+            self._ax.lines[0].set_visible(True)
 
     def _update_transform_back(self) -> None:
         transforms: list[Callable[[Any], Any]] = []
@@ -620,7 +812,7 @@ class DataFigure:
         self.transform_back = _composed if transforms else _identity
 
     def _update_unit(self, transform: Callable[[Any], Any]) -> None:
-        ax = self.fig.axes[0]
+        ax = self._ax
         for line in ax.lines:
             data_x = np.asarray(line.get_xdata())
             if data_x.size == 2 and np.array_equal(data_x, np.array([0, 1])):
@@ -659,7 +851,7 @@ class DataFigure:
         if self.plot_type == "2D" or self.conversion_map is None:
             return
         new_unit, conversion_func = self.conversion_map[self.unit]
-        ax = self.fig.axes[0]
+        ax = self._ax
         old_xlabel = ax.get_xlabel()
         if re.search(r"\((.+)\)$", old_xlabel):
             ax.set_xlabel(re.sub(r"\((.+)\)$", f"({new_unit})", old_xlabel))
@@ -682,7 +874,7 @@ class DataFigure:
         bad_color = getattr(self.live_plot, "bad_color", "white")
         new_cmap.set_bad(bad_color)
 
-        ax0 = self.fig.axes[0]
+        ax0 = self._ax
         if not ax0.images:
             return
         mappable = ax0.images[0]
@@ -697,5 +889,336 @@ class DataFigure:
         self.fig.canvas.draw_idle()
 
 
-__all__ = ["DataFigure", "FitResult", "VALID_FIT_FUNCS"]
+# ---------------------------------------------------------------------------
+# Reopening a saved figure (the read-back counterpart of ``DataFigure.save``).
+# ---------------------------------------------------------------------------
+
+#: The view-state keys ``SavedFigure`` restores and that ``plot()`` accepts as DATA options.
+#: An override only reaches ``plot()`` when it is in THIS set (a saved layout may carry a
+#: knob that a re-interpreted kind does not take, e.g. ``cmap`` on a 1-D plot -- it is simply
+#: dropped rather than raising).  Geometry / dpi / typography are NOT here: they are frontend-
+#: owned (the sealed-API contract), so a saved figure can never smuggle them back in.
+_VIEW_PLOT_KWARGS: tuple[str, ...] = (
+    "relim_mode", "fixed_lo", "fixed_hi", "cmap", "bins", "thresholds", "labels",
+)
+
+#: ``PanelEditor`` stores its Setting/Edit view knobs under this sub-dict of ``info`` (so the
+#: raw payload stays tidy); ``relim`` there is confocal naming for ``plot()``'s ``relim_mode``.
+_VIEW_INFO_KEY = "view"
+
+
+def _view_to_plot_kwargs(view: Mapping[str, Any]) -> dict[str, Any]:
+    """Translate a saved ``info['view']`` dict into the DATA kwargs ``plot()`` accepts.
+
+    The stored ``relim`` (confocal naming) maps to ``plot()``'s ``relim_mode``, and ``fixed_lo``/
+    ``fixed_hi`` are only forwarded when the mode is actually ``fixed`` (mirroring the live panel
+    builder, which omits them otherwise so the plotter keeps its autoscale).  ``unit`` / ``size`` /
+    ``repeat_mode`` live in ``info`` (not ``plot()`` kwargs) and are handled by the caller."""
+    out: dict[str, Any] = {}
+    relim = view.get("relim", view.get("relim_mode"))
+    if relim:
+        out["relim_mode"] = str(relim)
+    if str(relim) == "fixed":
+        for k in ("fixed_lo", "fixed_hi"):
+            if view.get(k) is not None:
+                out[k] = float(view[k])
+    cmap = view.get("cmap")
+    if cmap:
+        out["cmap"] = str(cmap)
+    return out
+
+
+class SavedFigure:
+    """A lightweight, hardware-free handle for a ``.npz`` written by :meth:`DataFigure.save`.
+
+    It answers "what was saved" (:meth:`info_summary`), lists the plot kinds the saved data can
+    be viewed as (:meth:`compatible_kinds`), and re-renders it (:meth:`plot`) through the SAME
+    :func:`~.live.plot` factory the live figure used -- so the saved kind reproduces the original
+    figure and any other compatible kind re-interprets the SAME ``data_x`` / ``data_y`` with a
+    different plotter.  Build one with :func:`load_figure`."""
+
+    def __init__(self, *, data_x, data_y, info: Mapping[str, Any], path=None):
+        self.path = Path(path) if path is not None else None
+        self.data_x = np.asarray(data_x)
+        self.data_y = np.asarray(data_y)
+        self.info = dict(info or {})
+        self.view = dict(self.info.get(_VIEW_INFO_KEY) or {})
+
+    # -- provenance accessors (all read from ``info``, with sane defaults for old npz) ---------
+    @property
+    def kind(self) -> str | None:
+        return self.info.get("kind")
+
+    @property
+    def figure_recipe(self) -> Mapping[str, Any] | None:
+        """The REPLAY RECIPE a structured figure stores so it can be re-rendered FAITHFULLY (not from
+        ``data_x`` / ``data_y``, which for a structured figure are only a lossy fallback).  A recipe is
+        ``{"kind": <family>, ...}`` -- e.g. a pulse figure stores ``{"kind": "pulse", "pulse_state":
+        <PulseTableState.to_dict()>, "include_always_off": ...}``.  ``None`` for an ordinary array figure
+        (a scan / hist / site map), whose ``data_x`` / ``data_y`` ARE the faithful source.  The dispatch
+        is by ``recipe['kind']``, so a new structured-figure family plugs in without touching this seam."""
+        recipe = self.info.get("figure_recipe")
+        return recipe if isinstance(recipe, Mapping) and recipe.get("kind") else None
+
+    @property
+    def name(self) -> str | None:
+        return self.info.get("name")
+
+    @property
+    def labels(self) -> list[str] | None:
+        labels = self.info.get("labels")
+        return list(labels) if labels is not None else None
+
+    @property
+    def unit(self) -> str | None:
+        return self.info.get("unit") or self.view.get("unit")
+
+    @property
+    def shape(self) -> dict[str, tuple[int, ...]]:
+        return {"data_x": tuple(self.data_x.shape), "data_y": tuple(self.data_y.shape)}
+
+    @property
+    def saved_at(self) -> str | None:
+        """The save timestamp, recovered from the ``<name>_<YYYY_MM_DD_HH_MM_SS>`` file name
+        (the format :meth:`DataFigure.save` writes) or ``None`` if the name does not carry one."""
+        if self.path is None:
+            return None
+        m = re.search(r"(\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2})", self.path.stem)
+        return m.group(1) if m else None
+
+    def compatible_kinds(self) -> list[str]:
+        """The panel plot kinds this saved data can be viewed as, derived from the data SHAPE and
+        the ``PLOT_KINDS`` ``render_family`` (never a hard-coded list): a 2-column ``data_x`` (a 2-D
+        scan) offers the ``"2D"`` families (image / site map); a 1-column ``data_x`` offers the
+        ``"1D"`` families (line / rolling trace / distribution).  The saved kind is always first so
+        it reproduces the original figure.
+
+        A STRUCTURED figure (one carrying a ``figure_recipe``) offers ONLY its recipe kind: its
+        ``data_x`` / ``data_y`` are a lossy fallback, so re-interpreting them as a line / hist would
+        NOT be a faithful view -- the recipe kind is the one true way to draw it."""
+        from .live import PLOT_KINDS
+
+        recipe = self.figure_recipe
+        if recipe is not None:
+            return [str(recipe.get("kind"))]
+
+        is_2d = self.data_x.ndim == 2 and self.data_x.shape[1] >= 2
+        want = "2D" if is_2d else "1D"
+        kinds: list[str] = []
+        for pk in PLOT_KINDS:
+            if not pk.panel:
+                continue
+            # The site map declares ``render_family="auto"`` (image-only when it has a frame), but it
+            # is a 2-D VIEW -- it needs (N, 2) centres as data_x -- so it belongs with the 2-D family.
+            fam = "2D" if pk.render_family == "auto" else pk.render_family
+            if fam == want:
+                kinds.append(pk.key)
+        saved = self.kind
+        if saved in kinds:                       # saved kind FIRST (reproduces the original figure)
+            kinds = [saved] + [k for k in kinds if k != saved]
+        elif saved:
+            kinds = [saved] + kinds
+        return kinds
+
+    def info_summary(self) -> str:
+        """A human-readable multi-line answer to "what is in this file": name, source, kind, labels,
+        unit, array shapes, points/repeat progress, the saved view state and any applied fit."""
+        rows: list[tuple[str, Any]] = [
+            ("name", self.name),
+            ("source", self.info.get("source")),
+            ("kind", self.kind),
+            ("labels", self.labels),
+            ("unit", self.unit),
+            ("data_x shape", tuple(self.data_x.shape)),
+            ("data_y shape", tuple(self.data_y.shape)),
+            ("points_done", self.info.get("points_done")),
+            ("repeat_cur", self.info.get("repeat_cur")),
+            ("saved_at", self.saved_at),
+        ]
+        if self.info.get("size"):
+            rows.append(("size", self.info.get("size")))
+        if self.view:
+            view_bits = ", ".join(f"{k}={v}" for k, v in self.view.items() if v is not None)
+            rows.append(("view", view_bits or "(defaults)"))
+        fit = self.info.get("fit")
+        if isinstance(fit, Mapping) and fit.get("func"):
+            pairs = ", ".join(f"{n}={float(v):.5g}"
+                              for n, v in zip(fit.get("names", []), fit.get("popt", [])))
+            rows.append(("fit", f"{fit['func']}: {pairs}" if pairs else str(fit["func"])))
+        width = max((len(k) for k, _ in rows), default=0)
+        header = f"SavedFigure({self.path.name})" if self.path is not None else "SavedFigure"
+        lines = [header] + [f"  {k.ljust(width)} : {v}" for k, v in rows if v is not None]
+        return "\n".join(lines)
+
+    def plot(self, kind: str | None = None, size: str | None = None, **overrides):
+        """Re-render this saved figure as a :class:`DataFigure` -- DATA-viewing semantics: the SAME
+        ``data_x`` / ``data_y`` are handed to :func:`~.live.plot` under ``kind`` (the saved kind by
+        default, which reproduces the original figure; any :meth:`compatible_kinds` value instead
+        re-interprets the data with a different plotter).  The saved view state (relim / fixed lo-hi /
+        cmap / labels) seeds the plotter and ``overrides`` win over it.  Only DATA kwargs
+        (:data:`_VIEW_PLOT_KWARGS`) reach ``plot()`` -- geometry / dpi / typography stay frontend-owned,
+        and a saved knob a re-interpreted kind does not accept is dropped, never raised.
+
+        When this figure carries a ``figure_recipe`` (a STRUCTURED figure such as a pulse timeline),
+        the reproduction goes through :meth:`_replay_recipe` instead: it re-renders from the recipe's
+        own source (e.g. rebuilds the ``PulseTableState`` and re-draws the pulse figure), so the reopened
+        figure is FAITHFUL (all channels / analog traces / brackets), not a flattened line off the
+        fallback arrays.  ``kind`` / ``size`` / ``overrides`` are ignored for a recipe figure -- the
+        recipe is self-describing."""
+        recipe = self.figure_recipe
+        if recipe is not None:
+            return self._replay_recipe(recipe)
+        return self._plot_from_arrays(kind, size, **overrides)
+
+    def _replay_recipe(self, recipe: Mapping[str, Any]):
+        """Re-render a STRUCTURED figure from its ``figure_recipe`` -- a faithful reproduction from the
+        recipe's OWN source, not the fallback ``data_x`` / ``data_y``.  Dispatch is by ``recipe['kind']``,
+        so each structured-figure family owns its rebuild here (and a new family adds a branch); an
+        unknown recipe kind falls back to the ordinary array ``plot`` so nothing crashes.  Returns the
+        family's figure handle (a single-axes :class:`DataFigure` for pulse; a composite grid handle for
+        grid), each carrying ``.fig`` + ``.save``.
+
+        ``pulse`` -> rebuild the ``PulseTableState`` and re-draw the pulse figure through the SAME
+        :func:`~.live.build_pulse_preview_plot` the plot layer owns, so every digital channel / analog
+        bus trace / repeat bracket comes back exactly as saved.  The rebuild imports ``pulse_gui`` LAZILY
+        (only when a pulse recipe is actually reopened) so the ordinary array-figure reload path stays
+        free of the pulse-editor / PyQt import."""
+        rkind = str(recipe.get("kind") or "")
+        if rkind == "pulse":
+            return self._replay_pulse(recipe)
+        if rkind == "grid":
+            return self._replay_grid(recipe)
+        # Unknown structured kind: fall back to the ordinary array reproduction (never crash on reopen).
+        return self._plot_from_arrays()
+
+    def _pulse_state_dict(self, recipe: Mapping[str, Any]) -> dict:
+        """The ``PulseTableState.to_dict()`` payload to rebuild the pulse figure from -- resolved from ONE
+        serialization format (``PulseTableState.to_dict``) with provenance PREFERRED over the recipe copy.
+
+        A fired pulse's provenance already carries the applied state: the sequencer's ``.snapshot()``
+        records ``last_payload_json = json.dumps(PulseTableState.to_dict())`` (the exact same format), and
+        the rich save folds that under ``info['provenance']['devices']['sequencer']``.  So when the save
+        HAS provenance with a sequencer payload, THAT is the reproduction source (single source with the
+        device state the run was taken under -- no second copy needed); the recipe's own ``pulse_state``
+        is the FALLBACK for a pure preview that was never fired (the standalone editor has no device, so
+        the editor's current ``PulseTableState`` is the only truth for what the preview drew)."""
+        prov = self.info.get("provenance")
+        devices = prov.get("devices") if isinstance(prov, Mapping) else None
+        seq = devices.get("sequencer") if isinstance(devices, Mapping) else None
+        payload = seq.get("last_payload_json") if isinstance(seq, Mapping) else None
+        if payload:
+            import json
+            try:
+                data = json.loads(payload) if isinstance(payload, str) else dict(payload)
+                if isinstance(data, Mapping) and "periods" in data:
+                    return dict(data)                        # the device-applied state (provenance-sourced)
+            except Exception:
+                pass
+        return dict(recipe.get("pulse_state") or {})         # preview fallback (editor state, never fired)
+
+    def pulse_state(self):
+        """The reproduced pulse ``(PulseTableState, include_always_off)`` for a ``kind="pulse"`` save --
+        the single object the WHOLE reproduction uses: the notebook ``.plot()`` builds its figure from it,
+        AND the Task console seeds a pulse PANEL bound to it (published as ``fig_value``), so both draw the
+        SAME faithful timeline through the ONE renderer.  Provenance (a fired pulse) is preferred over the
+        recipe's own copy (see :meth:`_pulse_state_dict`).  ``None`` when this is not a pulse figure."""
+        recipe = self.figure_recipe
+        if recipe is None or str(recipe.get("kind") or "") != "pulse":
+            return None
+        from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+
+        state = PulseTableState.from_dict(self._pulse_state_dict(recipe))
+        return state, bool(recipe.get("include_always_off", True))
+
+    def _replay_pulse(self, recipe: Mapping[str, Any]) -> "DataFigure":
+        """Rebuild the pulse figure: :meth:`pulse_state` (provenance-preferred source) ->
+        :func:`~.live.build_pulse_preview_plot` -> its :class:`DataFigure`.  The pulse RENDER lives in the
+        PLOT LAYER (live.py), never the pulse_gui app -- so notebook replay, the editor preview and a
+        seeded console panel all draw through the ONE renderer, identical code."""
+        state, include_always_off = self.pulse_state()
+        from .live import build_pulse_preview_plot, default_pulse_size
+
+        # The reproduction opens at the size it was SAVED at (recipe['panel_size']), else the SAME optimal
+        # default the preview / the console seed use -- so notebook replay matches the reopened panel.
+        recorded = recipe.get("panel_size")
+        size = str(recorded) if recorded else default_pulse_size(state, include_always_off=include_always_off)
+        plotter, _channels, _repeat = build_pulse_preview_plot(
+            state, include_always_off=include_always_off, size=size)
+        df = plotter.to_data_figure()
+        df.info = {**df.info, **{k: v for k, v in self.info.items() if k != "labels"}}
+        df.name = self.name or df.name
+        return df
+
+    def grid_recipe(self) -> Mapping[str, Any] | None:
+        """The per-site GRID replay recipe for a ``kind="grid"`` save -- the single object the WHOLE grid
+        reproduction uses (the notebook ``.plot()`` rebuilds its figure from it, AND the Task console seeds
+        a ``kind="grid"`` PANEL bound to it, published as ``fig_value``), so both redraw the SAME faithful
+        grid through the ONE :func:`~.live.build_grid_figure` builder.  This is the grid counterpart of
+        :meth:`pulse_state`.  ``None`` when this is not a grid figure."""
+        recipe = self.figure_recipe
+        if recipe is None or str(recipe.get("kind") or "") != "grid":
+            return None
+        return recipe
+
+    def _replay_grid(self, recipe: Mapping[str, Any]):
+        """Rebuild the per-site grid figure: the stored recipe -> :func:`~.live.build_grid_figure` -> its
+        composite grid ``DataFigure`` (a :class:`~.live._GridData`).  The grid RENDER lives in the PLOT
+        LAYER (live.py), so notebook replay and a seeded console panel both draw through the ONE builder,
+        identical code (the grid counterpart of :meth:`_replay_pulse`).
+
+        Returns the grid's composite handle (it carries the whole-grid ``.fig`` for display + a per-cell
+        :class:`DataFigure` via ``.cell(k)`` + its own recipe-aware ``.save``), not a single-axes
+        ``DataFigure`` -- a grid is intrinsically multi-axes, so there is nothing to flatten to one axes."""
+        from .live import build_grid_figure
+
+        # Open at the saved size if the recipe recorded one, else the stock default -- matching the panel seed.
+        recorded = recipe.get("panel_size")
+        size = str(recorded) if recorded else "2x2"
+        plotter = build_grid_figure(recipe, size=size, display=False)
+        return plotter.to_data_figure()
+
+    def _plot_from_arrays(self, kind: str | None = None, size: str | None = None, **overrides):
+        """The ordinary array-figure reproduction (``data_x`` / ``data_y`` -> :func:`~.live.plot`) -- the
+        ONE array path, used by :meth:`plot` for a non-recipe figure AND as the fallback when a recipe's
+        kind is unknown (so there is a single array-reproduction implementation, not two copies)."""
+        from .live import panel_plot_spec, plot as _plot
+
+        use_kind = kind or self.kind or "auto"
+        use_size = size or self.info.get("size", "2x2")
+        kwargs = _view_to_plot_kwargs(self.view)
+        if self.labels is not None:
+            kwargs.setdefault("labels", self.labels)
+        kwargs.update(overrides)
+        kwargs = {k: v for k, v in kwargs.items() if k in _VIEW_PLOT_KWARGS}
+        try:
+            spec = panel_plot_spec(use_size)
+        except Exception:
+            spec = None
+        plotter = _plot(self.data_x, self.data_y, kind=use_kind, _spec=spec,
+                        display=False, data_figure=True, update=False, **kwargs)
+        df = getattr(plotter, "data_figure", None) or plotter.to_data_figure()
+        df.info = {**df.info, **{k: v for k, v in self.info.items() if k != "labels"}}
+        if self.name:
+            df.name = self.name
+        return df
+
+
+def load_figure(path) -> SavedFigure:
+    """Load a ``.npz`` saved by :meth:`DataFigure.save` into a :class:`SavedFigure`.
+
+    The read-back counterpart of save: with no hardware or session, reopen an overnight scan /
+    a saved panel to inspect what it holds (``.info_summary()``), list how it can be viewed
+    (``.compatible_kinds()``) or re-render it (``.plot()`` / ``.plot(kind=...)``).  Robust to old
+    payloads that carry only ``data_x`` / ``data_y`` and a minimal ``info``."""
+    path = Path(path)
+    data = np.load(str(path), allow_pickle=True)
+    if "data_x" not in data.files or "data_y" not in data.files:
+        raise ValueError(f"{path} is not a DataFigure save (missing data_x/data_y).")
+    info = data["info"].item() if "info" in data.files else {}
+    if not isinstance(info, Mapping):
+        info = {}
+    return SavedFigure(data_x=data["data_x"], data_y=data["data_y"], info=info, path=path)
+
+
+__all__ = ["DataFigure", "FitResult", "SavedFigure", "VALID_FIT_FUNCS", "load_figure"]
 

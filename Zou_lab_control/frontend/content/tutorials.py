@@ -64,10 +64,15 @@ def neutral_atom_fpga_server_cells() -> list[dict]:
     return _load_cells("neutral_atom_fpga_server")
 
 
+def neutral_atom_qcmos_live_cells() -> list[dict]:
+    return _load_cells("neutral_atom_qcmos_live")
+
+
 __all__ = [
     "BOOTSTRAP_CELL",
     "frontend_tutorial_cells",
     "neutral_atom_fpga_server_cells",
+    "neutral_atom_qcmos_live_cells",
     "neutral_atom_hardware_tutorial_cells",
     "neutral_atom_tutorial_cells",
 ]

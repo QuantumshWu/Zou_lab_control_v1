@@ -6,31 +6,7 @@ from typing import Callable
 
 import numpy as np
 
-
-def _strict_bool(value, name: str) -> bool:
-    if isinstance(value, (bool, np.bool_)):
-        return bool(value)
-    raise TypeError(f"{name} must be a boolean.")
-
-
-def _positive_float(value, name: str) -> float:
-    if isinstance(value, (bool, np.bool_)):
-        raise TypeError(f"{name} must be finite, not a boolean.")
-    result = float(value)
-    if not np.isfinite(result) or result <= 0:
-        raise ValueError(f"{name} must be finite and > 0.")
-    return result
-
-
-def _non_negative_int(value, name: str) -> int:
-    if isinstance(value, (bool, np.bool_)):
-        raise TypeError(f"{name} must be a non-negative integer, not a boolean.")
-    if not isinstance(value, (int, np.integer)):
-        raise TypeError(f"{name} must be a non-negative integer.")
-    result = int(value)
-    if result < 0:
-        raise ValueError(f"{name} must be a non-negative integer.")
-    return result
+from ._validate import _non_negative_int, _positive_float, _strict_bool
 
 
 class ArrayWatcher:

@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Windows batch files MUST be CRLF in the working tree, otherwise cmd.exe fails
+# to seek :labels ("The system cannot find the batch label specified ...").
+*.bat text eol=crlf
+*.cmd text eol=crlf

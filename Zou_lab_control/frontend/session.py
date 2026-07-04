@@ -10,37 +10,12 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 
-from .live import _as_data_x, _as_data_y, plot
+from ._validate import _positive_float, _positive_int, _strict_bool
+from .live import _as_data_x, _as_data_y, _normalize_kind, plot
 
 
 def _is_integer_scalar(value) -> bool:
     return isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_))
-
-
-def _strict_bool(value, name: str) -> bool:
-    if isinstance(value, (bool, np.bool_)):
-        return bool(value)
-    raise TypeError(f"{name} must be a boolean.")
-
-
-def _positive_float(value, name: str) -> float:
-    if isinstance(value, (bool, np.bool_)):
-        raise TypeError(f"{name} must be finite, not a boolean.")
-    result = float(value)
-    if not np.isfinite(result) or result <= 0:
-        raise ValueError(f"{name} must be finite and > 0.")
-    return result
-
-
-def _positive_int(value, name: str) -> int:
-    if isinstance(value, (bool, np.bool_)):
-        raise TypeError(f"{name} must be a positive integer, not a boolean.")
-    if not isinstance(value, (int, np.integer)):
-        raise TypeError(f"{name} must be a positive integer.")
-    result = int(value)
-    if result <= 0:
-        raise ValueError(f"{name} must be a positive integer.")
-    return result
 
 
 def _call_accepts(func: Callable, args: tuple[Any, ...]) -> bool:
@@ -97,7 +72,10 @@ class RunSession:
     ):
         self.source = source
         self.kind = "hist" if kind is None and _is_integer_scalar(data_x) else (kind or "auto")
-        self.mode = mode or ("roll" if self.kind in {"monitor", "rolling", "live-distribution"} else "append")
+        # Rolling kinds default to roll, fixed kinds to append.  The rolling trace is ONE kind
+        # ("monitor"); the side distribution is a show_dist toggle, so every rolling alias
+        # (loading-rate, rolling, live, live-distribution, ...) collapses to "monitor".
+        self.mode = mode or ("roll" if _normalize_kind(self.kind) == "monitor" else "append")
         self.labels = labels
         self.update_time = _positive_float(update_time, "update_time")
         self.max_points = None if max_points is None else _positive_int(max_points, "max_points")
@@ -149,8 +127,8 @@ class RunSession:
             self._print_stop_hint()
 
     def _prepare_arrays(self, data_x, data_y) -> None:
-        normalized_kind = str(self.kind).lower().replace("_", "-")
-        if normalized_kind in {"hist", "histogram", "distribution"}:
+        normalized_kind = _normalize_kind(self.kind)   # collapses all aliases (hist/monitor/...)
+        if normalized_kind == "hist":
             if _is_integer_scalar(data_x) or isinstance(data_x, (bool, np.bool_)):
                 count = _positive_int(data_x, "histogram count")
                 self.data_y = np.full((count, 1), np.nan, dtype=float)
@@ -161,6 +139,20 @@ class RunSession:
             self._plot_x = self.data_y[:, 0]
             self._plot_y = None
             self.kind = "hist"
+            return
+
+        # A ROLLING trace ("monitor") is sized by its WINDOW: a notebook user passes the
+        # history length as a scalar (``run(300, source, kind="monitor")``) exactly like
+        # ``hist`` takes a count, instead of pre-building an x array.  Make a window of NaN
+        # that fills as shots arrive (the source callable yields one scalar per shot); a
+        # real x array still works (the branch below).
+        if normalized_kind == "monitor" and (
+                _is_integer_scalar(data_x) or isinstance(data_x, (bool, np.bool_))):
+            count = _positive_int(data_x, "rolling window")
+            self.data_x = _as_data_x(np.arange(count))
+            self.data_y = np.full((count, 1), np.nan, dtype=float)
+            self._plot_x = self.data_x
+            self._plot_y = self.data_y
             return
 
         self.data_x = _as_data_x(data_x)

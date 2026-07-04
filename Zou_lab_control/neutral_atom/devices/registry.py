@@ -9,21 +9,64 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from .virtual import virtual_config
-from .base import CameraDevice, SequencerDevice, TrapArrayDevice, validate_device_contract
+from .virtual import virtual_config, virtual_config_with_overrides
+from .base import BaseDevice, CameraDevice, SequencerDevice, TrapArrayDevice, validate_device_contract
 
 
 BUILTIN_DEVICE_CLASS_PATHS = {
+    "PylonCamera": "Zou_lab_control.neutral_atom.devices.pylon.PylonCamera",
     "QCMOSCamera": "Zou_lab_control.neutral_atom.devices.qcmos.QCMOSCamera",
     "ManualSequencer": "Zou_lab_control.neutral_atom.devices.sequencer.ManualSequencer",
     "RemoteSequencer": "Zou_lab_control.neutral_atom.devices.sequencer.RemoteSequencer",
     "RuntimeSequencer": "Zou_lab_control.neutral_atom.devices.sequencer.RuntimeSequencer",
     "VerilogSequencer": "Zou_lab_control.neutral_atom.devices.sequencer.VerilogSequencer",
     "VirtualCamera": "Zou_lab_control.neutral_atom.devices.virtual.VirtualCamera",
+    "VirtualMotCamera": "Zou_lab_control.neutral_atom.devices.virtual.VirtualMotCamera",
     "VirtualSequencer": "Zou_lab_control.neutral_atom.devices.virtual.VirtualSequencer",
     "VirtualTrapArray": "Zou_lab_control.neutral_atom.devices.virtual.VirtualTrapArray",
 }
 DEVICE_CLASSES: dict[str, type | str] = dict(BUILTIN_DEVICE_CLASS_PATHS)
+
+
+@dataclass(frozen=True)
+class DeviceDomain:
+    """One ROLE-TYPE of device (camera, sequencer, trap array, and future RF source / DAQ / ...).
+
+    The single source that makes device SELECTION and the device-manager GUI fully type-generic:
+    nothing names a concrete type like ``"camera"`` -- every measurement/task role and every GUI
+    section iterates :data:`DEVICE_DOMAINS`, so adding an RF source is ONE
+    :func:`register_device_domain` call and every selection dropdown + the device manager pick it
+    up with no edits to specs or the GUI."""
+
+    key: str            # the conventional config role name ("camera", "sequencer")
+    base_type: type     # the domain base class every device of this role subclasses
+    label: str          # human label for a GUI section ("Camera", "Sequencer")
+
+
+#: The registered device role-types -- the ONE list device selection + the device manager read.
+DEVICE_DOMAINS: dict[str, DeviceDomain] = {}
+
+
+def register_device_domain(key: str, base_type: type, label: str | None = None) -> None:
+    """Register a device ROLE-TYPE so selection dropdowns + the device manager list it.  Built-ins
+    are camera / sequencer / trap_array; a lab adding an RF source registers ``RFSourceDevice`` here
+    and every measurement/GUI picks it up automatically (no camera-special code anywhere)."""
+    if not str(key).strip():
+        raise ValueError("device domain key must not be empty.")
+    if not isinstance(base_type, type):
+        raise TypeError("device domain base_type must be a class.")
+    DEVICE_DOMAINS[str(key)] = DeviceDomain(
+        str(key), base_type, str(label or str(key).replace("_", " ").title()))
+
+
+def device_domains() -> tuple["DeviceDomain", ...]:
+    """The registered device role-types, sorted by key -- the ONE sequence the GUI + specs iterate."""
+    return tuple(DEVICE_DOMAINS[k] for k in sorted(DEVICE_DOMAINS))
+
+
+register_device_domain("camera", CameraDevice, "Camera")
+register_device_domain("sequencer", SequencerDevice, "Sequencer")
+register_device_domain("trap_array", TrapArrayDevice, "Trap array")
 
 
 @dataclass
@@ -56,6 +99,36 @@ class DeviceSet:
 
     def __getitem__(self, name: str):
         return self.devices[name]
+
+    def device_names(self, base_type: type) -> tuple[str, ...]:
+        """Every device of a given ROLE TYPE in the set, sorted by name -- THE source for any
+        "which <role>?" choice (a measurement's ``camera`` / ``sequencer`` ParamDecl).  One
+        role-agnostic reader so camera, sequencer, trap-array (and any future role) answer the
+        same way.  Empty when the config has no such device -- callers decide what that means
+        (hide the panel / raise with guidance), never a fabricated placeholder name."""
+        return tuple(sorted(name for name, dev in self.devices.items()
+                            if isinstance(dev, base_type)))
+
+    def default_device_name(self, base_type: type, conventional: str | None = None) -> str:
+        """The device a spec binds to a role when the operator names none: the CONVENTIONAL role
+        name (e.g. ``"camera"`` / ``"sequencer"``) when present, else the only/first device of that
+        type.  Raises with guidance when the config has no device of the role at all."""
+        names = self.device_names(base_type)
+        if not names:
+            role = conventional or base_type.__name__      # the human role word ("camera") if known
+            raise AttributeError(
+                f"this device config has no {role} -- add one (e.g. via na.discover_devices(); "
+                "each found device's row carries a ready config entry).")
+        return conventional if (conventional and conventional in names) else names[0]
+
+    def camera_names(self) -> tuple[str, ...]:
+        """Every camera in the set (thin wrapper over :meth:`device_names` -- ONE role-agnostic core)."""
+        return self.device_names(CameraDevice)
+
+    def default_camera_name(self) -> str:
+        """The default readout camera (``"camera"`` role, else the first) -- thin wrapper over
+        :meth:`default_device_name`."""
+        return self.default_device_name(CameraDevice, conventional="camera")
 
     def require(self, name: str, expected_type: type | tuple[type, ...] | None = None):
         if name not in self.devices:
@@ -107,8 +180,12 @@ class DeviceSet:
         return out
 
     def _open_order(self) -> list[str]:
+        # Cameras open LAST (they may bind to an already-open sequencer/trigger source) --
+        # decided by TYPE, not by a hardcoded device name, so a monitor_camera or any other
+        # camera role gets the same treatment.
         names = list(self.devices)
-        return [name for name in names if name != "camera"] + [name for name in names if name == "camera"]
+        return ([name for name in names if not isinstance(self.devices[name], CameraDevice)]
+                + [name for name in names if isinstance(self.devices[name], CameraDevice)])
 
 
 def device_config_dir() -> Path:
@@ -120,8 +197,14 @@ def load_devices(
     *,
     overrides: Mapping[str, Mapping[str, Any]] | None = None,
     open_devices: bool = False,
+    lookup: Mapping[str, Any] | None = None,
 ) -> DeviceSet:
-    """Load a device graph from ``virtual``, JSON, or a Python dict."""
+    """Load a device graph from ``virtual``, JSON, or a Python dict.
+
+    ``lookup`` (optional) is a caller namespace consulted FIRST when resolving each
+    entry's ``"type"`` -- pass ``globals()`` and any device class defined in the calling
+    notebook is usable in a config without registration (the confocal lookup_dict
+    pattern).  See :func:`resolve_class` for the full resolution order."""
 
     cfg = read_config(config)
     apply_device_overrides(cfg, overrides)
@@ -146,7 +229,7 @@ def load_devices(
             raise KeyError(f"device {name!r} is not present in config.")
         visiting.add(name)
         entry = cfg[name]
-        cls = resolve_class(str(entry["type"]))
+        cls = resolve_class(str(entry["type"]), lookup=lookup)
         params = resolve(dict(entry.get("params", {})))
         devices[name] = cls(**params)
         validate_device_contract(name, devices[name])
@@ -165,14 +248,61 @@ def load_devices(
     return device_set
 
 
+def resolve_connect_config(
+    config: str | Path | Mapping[str, Any],
+    *,
+    trap_array: Mapping[str, Any] | None = None,
+    sitemap: Mapping[str, Any] | None = None,
+    camera: Mapping[str, Any] | None = None,
+    sequencer: Mapping[str, Any] | None = None,
+    params: Mapping[str, Any] | None = None,
+) -> tuple[Any, dict[str, dict[str, Any]] | None, dict[str, Any]]:
+    """Resolve a ``connect()`` request into ``(device_config, overrides, defaults)``.
+
+    Backend-specific config shortcuts live with the BACKEND (the device layer),
+    not the orchestration facade: the virtual backend owns its ``sitemap`` /
+    ``loss_rate`` / alias translation.  A real config (named JSON / path / dict)
+    takes only per-device override mappings and rejects the virtual-only
+    shortcuts.  ``session.connect`` calls this so it never imports a concrete
+    backend or reads a backend's internal fields (keeps virtual == real)."""
+
+    params = dict(params or {})
+    if isinstance(config, str) and config.lower() == "virtual":
+        cfg, defaults = virtual_config_with_overrides(
+            trap_array=dict(trap_array) if trap_array else None,
+            sitemap=dict(sitemap) if sitemap else None,
+            camera=dict(camera) if camera else None,
+            sequencer=dict(sequencer) if sequencer else None,
+            params=params,
+        )
+        return cfg, None, defaults
+    if sitemap or params:
+        raise ValueError("sitemap and virtual shortcut parameters are only supported with config='virtual'.")
+    overrides: dict[str, dict[str, Any]] = {}
+    for name, device_params in (("trap_array", trap_array), ("camera", camera), ("sequencer", sequencer)):
+        if device_params:
+            overrides[name] = dict(device_params)
+    return config, (overrides or None), {}
+
+
 def read_config(config: str | Path | Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(config, Mapping):
         return deepcopy(dict(config))
     if str(config).lower() == "virtual":
         return virtual_config()
     path = Path(config)
-    if not path.exists() and path.suffix == "":
-        path = device_config_dir() / f"{config}.json"
+    if not path.exists():
+        name = str(config)
+        # A BARE config name (no directory component) resolves from the bundled
+        # configs/ dir, WITH or WITHOUT an explicit .json suffix -- so both
+        # ``remote_template`` and ``remote_template.json`` find the bundled file
+        # (a natural thing to type that would otherwise be a FileNotFoundError).
+        # A real path (absolute or with a directory) is used verbatim.
+        if Path(name).parent == Path("."):
+            for candidate in (device_config_dir() / name, device_config_dir() / f"{name}.json"):
+                if candidate.exists():
+                    path = candidate
+                    break
     if not path.exists():
         raise FileNotFoundError(f"device config not found: {config}")
     return json.loads(path.read_text(encoding="utf-8"))
@@ -202,7 +332,20 @@ def deep_update(target: dict[str, Any], source: Mapping[str, Any]) -> None:
             target[key] = deepcopy(value)
 
 
-def resolve_class(name: str) -> type:
+def resolve_class(name: str, lookup: Mapping[str, Any] | None = None) -> type:
+    """Resolve a config ``"type"`` name to a device class.
+
+    Resolution order: the caller's ``lookup`` namespace first (only entries that ARE
+    ``BaseDevice`` subclasses count, so ``globals()`` passes verbatim -- helpers, modules,
+    and constants in the namespace are ignored), then the registry (built-ins plus
+    :func:`register_device_class`), then a fully-qualified import path.  A ``lookup`` hit
+    is per-call: it never writes into the shared registry."""
+
+    if lookup is not None:
+        candidate = lookup.get(str(name))
+        if isinstance(candidate, type) and issubclass(candidate, BaseDevice):
+            return candidate
+    registered = name in DEVICE_CLASSES
     target = DEVICE_CLASSES.get(name, name)
     if isinstance(target, type):
         return target
@@ -212,7 +355,15 @@ def resolve_class(name: str) -> type:
     cls = getattr(importlib.import_module(module_name), class_name)
     if not isinstance(cls, type):
         raise TypeError(f"resolved device class {name!r} is not a class.")
-    DEVICE_CLASSES[name] = cls
+    # Cache back ONLY when ``name`` is a REGISTERED key whose value is a lazy import-path string
+    # (the built-ins, or a ``register_device_class(name, "pkg.Cls")`` entry): materialising it to
+    # the class is a pure cache hit.  A fully-qualified path typed straight into a config
+    # (``{"type": "my_lab.SerialCam"}``) is NOT a registry key -- writing it back would silently
+    # pin an arbitrary class (even a non-device one) into the shared registry forever, so every
+    # later ``discover_devices`` would scan it.  ``importlib`` already caches the module, so the
+    # per-call re-resolve is free; the registry stays exactly what was registered.
+    if registered:
+        DEVICE_CLASSES[name] = cls
     return cls
 
 
@@ -247,7 +398,11 @@ def available_device_configs() -> list[str]:
 
 __all__ = [
     "DEVICE_CLASSES",
+    "DEVICE_DOMAINS",
+    "DeviceDomain",
     "DeviceSet",
+    "device_domains",
+    "register_device_domain",
     "apply_device_overrides",
     "available_device_configs",
     "device_class_registry",
@@ -256,4 +411,5 @@ __all__ = [
     "read_config",
     "register_device_class",
     "resolve_class",
+    "resolve_connect_config",
 ]

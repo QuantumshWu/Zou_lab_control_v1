@@ -1,0 +1,344 @@
+\chapter{写给新读者}
+
+\section{这块硬件是什么}
+pulse-streamer 是一个\tfocus{固定 bitstream + 运行时表}的脉冲序列器。烧一次 bitstream 就得到时钟状态机、板上输出引脚、\pyapi{jtag_axi} + \pyapi{axi_bram_ctrl} 数据通路和片上 BRAM；它\tfocus{不}把某个具体实验脉冲写死进 Verilog。之后每次 \pyapi{On Pulse}，主机都把当前的 \pyapi{PulseTableState}/\pyapi{PulseSequence} 编译成一张紧凑的程序映像，经 \tfocus{JTAG-to-AXI} 写进 FPGA 的 BRAM，再用一个 CTRL 寄存器邮箱（COMMAND/STATUS）控制引擎运行。
+
+这是\tfocus{唯一}一套设计：没有变体、没有向后兼容、没有探针控制面、没有逐通道游程引擎、没有加载器 FSM。整条路径就是"主机打包 BRAM 映像 $\rightarrow$ AXI 写入 $\rightarrow$ CTRL 邮箱命令 $\rightarrow$ 边沿表引擎播放"。
+
+\begin{notebox}[目标器件]
+本设计面向 \tfocus{Xilinx Artix-7 35T（xc7a35tfgg484-2）}，FGG484 封装。这是一颗 LUT/BRAM 资源有限的小器件，所以所有容量参数都按它来权衡。
+\end{notebox}
+
+近似资源类别：
+
+\begin{codeblock}[xc7a35tfgg484-2]
+logic cells: 33,280     CLB LUTs: 20,800     CLB FFs: 41,600
+BRAM:        1,800 Kb (50 x 36 Kb RAMB36)   DSP: 90
+\end{codeblock}
+
+\section{两句话能力总结}
+\begin{itemize}
+  \item \tfocus{最小脉冲宽度与分辨率 = 1 个 tick（20 ns）}。背靠背的 1-tick 边沿能逐周期、一拍一个地打出来——靠的是一条连续预取流水线把 BRAM 读延迟藏掉（见第三章）。
+  \item \tfocus{扫描点数无上限}。常驻一个 2-bank ping-pong 窗口（4096 点），主机在游标后面把空出来的 bank 流式回填下一段（见第五章）。配合 N-slot 仿射扫描，\tfocus{duration 与 DAC 值}（仅这两类可扫）可以\tfocus{在一次连续运行里任意组合地无缝扫描}；channel 延时\tfocus{不是}扫描量，它是加在输出上的逐信号\tfocus{事件调度延时}（每条 channel / 每条 DAC 总线一个固定值，正/负/零；TTL 与 DAC \tfocus{同源同范围}，上限均由 32 位字段决定，约 $\pm 42.9$ s——毫秒级 emCCD 延时直接可用，见第六章）。
+\end{itemize}
+
+\section{文件}
+\begin{description}
+  \item[\filepath{fpga/pulse_streamer/zlc_edge_streamer.v}] 引擎。全局边沿表（三块并行 BRAM：tick 32b / coeff 64b / mask 62b，强制 \pyapi{READ_LATENCY_B=2}）、深度 \pyapi{FIFO_DEPTH}(=\pyapi{RD_LAT}+2=4) 的连续边沿预取、2-bank ping-pong 扫描窗口、仿射有效 tick MAC、模拟总线 DAC 引擎。
+  \item[\filepath{fpga/pulse_streamer/zlc_pulse_streamer_top.v}] 顶层。\pyapi{jtag_axi} $\rightarrow$ \pyapi{axi_bram_ctrl} $\rightarrow$ 区段译码的 BRAM（三块并行边沿 + 扫描窗口 + 总线映像）+ CTRL 寄存器邮箱，驱动引擎与板上 62 路输出 + 4x10b DAC 总线。
+  \item[\filepath{fpga/pulse_streamer/host/image.py}] 主机$\leftrightarrow$FPGA AXI 写契约 + 容量求解器的\tfocus{单一真相源}。\pyapi{pack_program}/\pyapi{unpack_program} 打包/解码 BRAM 映像，\pyapi{solve_capacity} 从器件 RAMB36/LUT 预算推导几何。RTL localparam 与 create-project Tcl 都从它派生。
+  \item[\filepath{fpga/pulse_streamer/host/engine_model.py}] 逐周期行为模型——硬件前正确性证明的第一层；第二层是 \filepath{fpga/pulse_streamer/sim/} 里跑\tfocus{真实 RTL}（关键处还接真实 BRAM IP 网表）的 xsim 测试台。
+  \item[\filepath{Zou_lab_control/neutral_atom/devices/axi_session.py}] 主机会话 \pyapi{VivadoAxiStreamerSession}：常驻 Vivado \pyapi{hw_axi}，打包上传 + 驱动 CTRL 邮箱 + 流式回填。
+\end{description}
+
+\chapter{架构总览}
+
+\section{从主机到引脚的一条链}
+真实路径是双电脑结构。控制电脑通过 RPyC 把命令发到 FPGA 电脑上的 server；server 持有一个常驻 Vivado \pyapi{hw_axi} 会话，用 JTAG-to-AXI 把程序映像写进 FPGA 的 BRAM，再写 CTRL 寄存器命令引擎运行。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+      node distance=5mm,
+      box/.style={draw=StarkGray, rounded corners=2pt, fill=StarkPale, align=center, inner sep=4pt, font=\scriptsize, minimum height=9mm, text width=26mm},
+      hw/.style={box, fill=StarkTint},
+      eng/.style={box, fill=StarkCodeBack, draw=StarkTeal, text width=30mm},
+      arr/.style={-{Latex[length=2mm]}, StarkTeal, thick}]
+    \node[box] (host) {主机 \pyapi{axi_session}\\pack BRAM image};
+    \node[box, right=10mm of host] (jtag) {\pyapi{jtag_axi}\\(hw\_axi)};
+    \node[box, right=8mm of jtag] (bram) {\pyapi{axi_bram_ctrl}};
+    \node[hw, below=8mm of bram] (regions) {区段译码 BRAM\\TICK / COEFF / MASK\\SCAN(2-bank) / BUS};
+    \node[hw, left=8mm of regions] (ctrl) {CTRL 邮箱\\COMMAND / STATUS\\CURSOR / BANK\_*};
+    \node[eng, below=8mm of ctrl] (engine) {\pyapi{zlc_edge_streamer}\\预取 + 仿射 MAC\\+ 总线 DAC};
+    \node[hw, right=8mm of engine] (out) {62 路 TTL\\+ 4x10b DAC};
+    \draw[arr] (host) -- (jtag);
+    \draw[arr] (jtag) -- (bram);
+    \draw[arr] (bram) -- (regions);
+    \draw[arr] (bram) -- (ctrl);
+    \draw[arr] (regions) -- (engine);
+    \draw[arr] (ctrl) -- (engine);
+    \draw[arr] (engine) -- (out);
+    \draw[arr, StarkBlue, dashed] (engine.north west) to[bend left=20] node[midway, left, font=\tiny]{CURSOR/STATUS} (ctrl.south west);
+  \end{tikzpicture}
+  \caption{数据通路：主机经 JTAG-to-AXI 写区段译码的 BRAM 与 CTRL 邮箱；引擎从 BRAM 播放，并把 STATUS/CURSOR 回写邮箱供主机轮询/流式回填。}
+  \label{fig:fpga-arch}
+\end{figure}
+
+\section{CTRL 寄存器邮箱}
+主机不碰任何探针；它只读写一小块 CTRL 寄存器文件（来自 \pyapi{host.image.CtrlWords}）：
+
+\begin{codeblock}[CTRL mailbox]
+COMMAND     主机->top   上升沿  LOAD(1) / FIRE(2) / RESET(4) / SAFE(8)
+STATUS      top->主机   LOADED(1)/RUNNING(2)/DONE(4)/ERROR(8)/UNDERFLOW(16)
+PROG_COUNT             边沿行数
+SCAN_COUNT            扫描点总数 N (可超过常驻窗口)
+SCAN_ENABLE / REPEAT_FOREVER
+LOOP_START / LOOP_COUNT / LOOP_END_TICK / LOOP_END_LO / LOOP_END_HI
+BUS_COUNTS / BANK_SIZE / SLOT_COUNT
+CURSOR      top->主机   已消费的扫描点数 (驱动流式回填)
+BANK_READY  主机->top   bit b = bank b 已装好
+BANK0_CHUNK / BANK1_CHUNK 主机->top  各 bank 当前装的是哪一段 chunk
+\end{codeblock}
+
+生命周期：\pyapi{prepare}（SAFE、上传映像、arm bank、LOAD）/ \pyapi{fire}（FIRE）/ \pyapi{wait_done}（轮询 STATUS、跟随 CURSOR 流式回填）/ \pyapi{safe_state}（SAFE）。COMMAND 字在每个命令前先清 0，制造干净的上升沿。
+
+\section{一行边沿的含义}
+引擎里保存一张全局边沿表，每行三个字段，分别存在三块\tfocus{并行}的 BRAM 里：
+
+\begin{codeblock}[每行边沿]
+tick[i]  : 该边沿的基准 FPGA tick (32 bit)            -- TICK BRAM
+coeff[i] : NUM_SLOTS 个定点扫描系数 (NUM_SLOTS*16 bit) -- COEFF BRAM
+mask[i]  : 该 tick 上完整的输出状态 (62 bit)          -- MASK BRAM
+\end{codeblock}
+
+bit 0 对应 \pyapi{channels[0]}。一行的含义是：\tfocus{在这个有效 tick，把所有输出切换成这个 mask}——不是逐 channel 命令。三块 BRAM 并行读，所以一次访问拿到一整行边沿，无需位宽填充；\pyapi{max_edges} 因此可以做大（35T 上 4096 行）。
+
+\section{时钟与对齐}
+真实硬件默认 50 MHz，一个 tick 是 20 ns。主机在上传前校验所有 period 持续时间、channel 延时、扫描点都对齐到这个 tick 网格（\pyapi{1e9 / clock_hz}）。32 位 tick 计数器在 50 MHz 下覆盖约 85.9 秒。同步后的 FIRE 路径会引入一个固定的小启动延迟，但那是常数偏移，不是比例因子；脉冲宽度和延时由 tick 计数决定。
+
+\chapter{1-tick 预取流水线}
+
+\section{为什么需要预取}
+边沿表放在 block RAM 里，而 block RAM 是\tfocus{同步读}：发出读地址后，数据要 \pyapi{RD_LAT} 个周期后才到。build tcl 用 \pyapi{zlc_force_latency2} 把边沿 BRAM 强制成 \pyapi{READ_LATENCY_B=2}，所以 \pyapi{RD_LAT=2} 是确定的。如果天真地"到点了才去读下一行"，每条边沿之间就至少要空 2 个周期——背靠背的 1-tick 边沿根本打不出来。
+
+\section{解法：深度 FIFO\_DEPTH 的连续预取 + 影子}
+引擎维护一个深度 \pyapi{FIFO_DEPTH}(=\pyapi{RD_LAT}+2=4) 的"arm" FIFO，里面装着\tfocus{接下来要打的几条边沿}。它\tfocus{每个周期发一次 BRAM 读}，把读回的边沿压进 FIFO 尾；当 \pyapi{time_count} 追上 FIFO 头那条边沿的有效 tick 时，就在\tfocus{同一周期}把它的 mask 打到输出、并把它弹出。因为 FIFO 深度比\tfocus{流水线延迟}（发地址$	o$数据有效 $=$ \pyapi{RD_LAT}$+1$，含寄存的 \pyapi{edge_raddr} 一拍）多 1，FIFO 永远不空，背靠背的 1-tick 边沿就能一拍一个地连续命中。
+
+\begin{notebox}[SEED 不变式（行为模型逼出来的关键）]
+在每个边界，从"第一条还没输出的边沿"开始\tfocus{播种 \pyapi{FIFO_DEPTH} 条影子}，并且边界当拍\tfocus{不发新读}（占用 == 影子数 $\le$ 深度）。4 条影子刚好够给紧跟着的 1-tick 后继留出时间；3 条影子会少一拍而丢边沿（这正是真机 emCCD 第二脉冲 40\,ms / e7 丢失的根因——\pyapi{edge_raddr} 是寄存器，发地址到数据有效是 \pyapi{RD_LAT}$+1$ 拍）。这条不变式是逐 tick 镜像仿真"逼"出来的。
+\end{notebox}
+
+\section{背靠背 1-tick 边沿:前端脉冲实绘}
+边沿表放在 block RAM(同步读,\pyapi{RD_LAT}=2),引擎用一条深度 \pyapi{FIFO_DEPTH}=\pyapi{RD_LAT}+2=4 的连续预取流水线把读延迟藏掉:它\tfocus{每周期发一次}BRAM 读(周期 $T$ 发出的读,地址在 $T{+}1$ 才到 BRAM 地址口——\pyapi{edge_raddr} 是寄存器,数据在 $T+$\pyapi{RD_LAT}$+1$ 落地),读回的边沿压进 arm FIFO 尾;当 \pyapi{time_count} 追上 FIFO 头那条边沿的有效 tick 时,在\tfocus{同一周期}把它的 mask 打到输出并弹出。因为 FIFO 深度比流水线延迟(=\pyapi{RD_LAT}$+1$)多 1,弹出与补充始终咬合、FIFO 不空。下图是\tfocus{前端脉冲绘图器实绘}的引擎输出:三路通道在相邻 20\,ns tick 上背靠背切换,每个 1-tick 边沿逐拍打出、中间无空拍——这正是 20\,ns 的最小脉宽与分辨率。
+
+__FPGA_FIG_TICK__
+
+\begin{itemize}
+  \item 周期 $-2,-1$ 是\tfocus{arm 阶段}（reset/LOAD 期间）：连发读把前几条边沿的影子预取进 FIFO，使 \pyapi{time_count} 从 0 开始时 FIFO 已经有货。
+  \item tick 0：FIFO 头是 A 且 \pyapi{time_count==tick[A]==0}，\tfocus{当拍}输出 A 并弹出；同一拍 C 的数据正好落地补进 FIFO。
+  \item 由于 FIFO 深度 4 $>$ 流水线延迟 3（$=$\pyapi{RD_LAT}$+1$，含 \pyapi{edge_raddr} 寄存器一拍），弹出与补充永远咬合，tick 连续命中 B/C/D，\tfocus{无空拍}。
+\end{itemize}
+
+\begin{notebox}[这条等价是被证明的]
+\pyapi{host.engine_model.rtl_mirror_play} 在读延迟 1/2/3 下逐 tick 等于组合参考播放器 \pyapi{reference_play}，并跑了 200 个 fuzz 程序（含背靠背 1-tick、扫描 1-tick、loop 1-tick）。在此之上，\filepath{fpga/pulse_streamer/sim/} 的 xsim 测试台直接跑\tfocus{真实 RTL}（预取流水、无缝扫描回绕、事件调度延时、ramp 扫描、DA 时钟相位、全链首帧回归），关键测试台还挂真实 BRAM IP 网表——两层证据互为印证。
+\end{notebox}
+
+\chapter{无缝边界：四个 gapless 重装点}
+
+\section{边界为什么不留缝}
+引擎只有\tfocus{一个}全局边沿指针，所以一次 repeat / loop-rewind / scan-advance / start 只是\tfocus{单周期}的指针 + 影子重装。四个 gapless 重装点（start / loop-rewind / scan-advance / repeat）在边界用上一节的 SEED 不变式重新播种 \pyapi{FIFO_DEPTH} 条影子，于是\tfocus{点 k 的最后一条边沿与点 k+1 的第一条边沿在时间上紧挨着，中间没有缝}。
+
+\section{扫描点 k -> k+1 跨界无缝:前端脉冲实绘}
+仿射扫描把 duration/DAC 值绑到 slot \pyapi{s0..sN}(channel 延时不是扫描量);每个扫描点用新的 slot 向量,边沿的有效 tick = \pyapi{base + (sum coeff*slot) >>> FRAC} 随之平移。下图是\tfocus{前端实绘}的同一脉冲在两个扫描点的输出——被扫的中间周期把后面的边沿在硬件里 lockstep 平移。引擎在播放点 k 末尾的同一拍,就已按 k+1 的新 slot 向量把首批影子重新播种好,所以\tfocus{点 k 的末边沿与点 k+1 的首边沿在时间上紧挨着、无 gap}。
+
+__FPGA_FIG_SCAN__
+
+\begin{itemize}
+  \item 边界处引擎\tfocus{不发新读},只用已经播种好的影子。新 slot 向量在边界当拍生效,所以下一点首条边沿的有效 tick 已按 k+1 的扫描值算好。
+  \item loop-rewind(repeat bracket)走同一套机制:指针跳回 \pyapi{loop_start_addr},影子按 loop 起点重新播种,循环接缝同样无缝。下图是前端实绘的硬件重复 loop 循环体(不展开),重复之间无缝回绕。
+\end{itemize}
+
+__FPGA_FIG_REPEAT__
+
+\pyapi{host.engine_model} 用 \pyapi{streaming_scan_play} 与 1-tick 边界 fuzz 证明了这一点：跨扫描点 / 跨 loop 的边沿与不分段的参考播放逐 tick 相同。
+
+\chapter{无限流式扫描：2-bank ping-pong}
+
+\section{窗口 + 流式回填}
+扫描窗口在硬件里是一个 \tfocus{2-bank ping-pong}（\pyapi{BANK_SIZE}=2048，是 2 的幂；两 bank 共 4096 个常驻扫描点），放在一块 BRAM 里。引擎依次播放点 \pyapi{0..N-1}，用 \pyapi{((idx/BANK_SIZE) mod 2) XOR scan_bank_base} 选 bank（\pyapi{scan_bank_base} 实现连续循环 ping-pong，见下"无缝重复扫描"），并把已消费点数写进 \pyapi{CURSOR}。主机读 \pyapi{CURSOR}，把游标已经走过的那个 bank 回填\tfocus{下一段 chunk}，并更新 \pyapi{BANK_READY}/\pyapi{BANK*_CHUNK}。这样扫描点文件虽然有限，但\tfocus{大小无上限}。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+      bank/.style={draw=StarkGray, rounded corners=2pt, align=center, font=\scriptsize, minimum height=8mm, minimum width=22mm},
+      live/.style={bank, fill=StarkTint, draw=StarkTeal},
+      refill/.style={bank, fill=StarkCodeBack},
+      arr/.style={-{Latex[length=1.8mm]}, thick},
+      lbl/.style={font=\tiny, StarkGray}]
+    \node[live] (b0) {bank0\\chunk 0};
+    \node[refill, right=14mm of b0] (b1) {bank1\\chunk 1};
+    \node[lbl, below=1mm of b0] {引擎正在播放};
+    \node[lbl, below=1mm of b1] {下一段待播};
+    \draw[arr, StarkTeal] ([yshift=2mm]b0.east) -- node[above, lbl]{CURSOR 推进} ([yshift=2mm]b1.west);
+    \draw[arr, StarkBlue, dashed] ([yshift=-3mm]b1.east) to[bend right=40] node[below, lbl]{主机回填 chunk 2}([yshift=-3mm]b0.east);
+    \node[refill, right=20mm of b1] (note) {游标走出 bank0 后\\bank0 空闲\\回填 chunk 2};
+  \end{tikzpicture}
+  \caption{2-bank ping-pong：引擎播放当前 bank、推进 CURSOR；主机在游标背后把空出来的 bank 回填下一段 chunk。}
+  \label{fig:fpga-pingpong}
+\end{figure}
+
+\section{bank\_chunk 握手与晚到 STALL}
+引擎只在 \pyapi{BANK_READY} 为真\tfocus{且}该 bank 装的是\tfocus{正确 chunk}（\pyapi{BANK*_CHUNK} 与引擎期望的段号一致）时才推进。如果回填来晚了，引擎\tfocus{停住}（hold 在当前点，置 \pyapi{STATUS_UNDERFLOW}），\tfocus{绝不}播放错误或过期的点；主机回填到位后它再继续。这把"晚到"变成一次安全的 hold，而不是数据损坏。
+
+\begin{codeblock}[streaming refill timeline + late-refill STALL]
+CURSOR (pts done):  0 ........ 2047 | 2048 ...... 4095 | 4096 .....
+engine plays bank:  bank0          | bank1           | bank0(chunk2)
+BANK_READY        :  b0,b1 ready    | b0 freed        | refill in flight
+BANK0_CHUNK       :  0              | (host -> 2)     | 2
+host refill bank0 :       [.... writing chunk 2 ....]
+                                          ^
+case A 及时:  chunk2 在游标到 4096 前写好 -> BANK0_CHUNK=2 ready -> 无缝继续
+case B 晚到:  游标到 4096 但 bank0 还不是 chunk2
+              -> 引擎 STALL (hold 当前点, STATUS_UNDERFLOW=1)
+              -> 主机写完 chunk2 + BANK0_CHUNK=2 + BANK_READY
+              -> 引擎自动继续, 不丢点/不串点
+\end{codeblock}
+
+\section{repeat\_forever 流式重扫}
+\pyapi{repeat_forever} 对一个有限（但很大）的流式扫描做反复扫掠：\pyapi{fire} 时启动一个主机\tfocus{后台回填线程}，循环把下一段填进空出的 bank。bank 选择是\tfocus{连续循环 ping-pong}（$\text{bank}=(\text{chunk}\bmod 2)\oplus\text{base}$，base 在每次回绕时按 chunk 数的奇偶翻转），所以扫掠回绕只是又一个普通的 chunk 边界——\tfocus{扫掠之内与扫掠之间都无缝}，任意点数 $N$ 成立。\pyapi{host.engine_model.streaming_scan_play} 证明了播放序列、CURSOR 推进、以及晚到 STALL 行为；\filepath{sim/tb\_scan\_wrap.v} 在真实 RTL 上跑了 $K=3$、9 次扫掠的无缝回绕（SEAMLESS-OK）。
+
+\chapter{N-slot 仿射扫描引擎}
+
+\section{核心公式}
+每行边沿存一个 base tick 加 \pyapi{NUM_SLOTS} 个定点系数；运行时 FPGA 对每个扫描点计算：
+
+\begin{codeblock}[effective tick]
+effective_tick = base_tick + (sum_j coeff_j * slot_j) >>> COEFF_FRAC_BITS
+\end{codeblock}
+
+其中 \pyapi{slot_j} 是当前扫描点第 $j$ 个 slot 的值（来自扫描点表那一行），\pyapi{COEFF_FRAC_BITS=8} 是定点小数位数。\tfocus{已经没有 x/y}——slot 是任意多个命名维度 \pyapi{s0,s1,...}，每个绑定一个 duration 或 DAC 值字段（\pyapi{SCAN_SLOT_KINDS=("duration","dac")}；channel 延时是固定值，不是扫描量）。这同一个 \pyapi{effective_tick} 表达式被边沿 tick、loop 终点 tick、以及总线段起止 tick \tfocus{复用}——这正是为什么 duration 与 DAC 值能任意组合地同时扫描，且只花一条 MAC 的 LUT。
+
+\section{为什么这是对的取舍}
+spec 最初设想的是逐通道游程编码（per-channel）+ 双 bank 全新存储。我们改成把仿射引擎\tfocus{泛化}成 N 个 slot 的流式扫描点表，原因围绕 35T 的现实：
+\begin{itemize}
+  \item 存储复杂度 O(edges) + O(points $\times$ slots) 已达成 spec 的核心存储目标，但不需要每通道游程的状态机与地址逻辑。
+  \item LUT 最省：一条比较器 + 一条仿射 MAC，而不是 62 个通道 player。
+  \item 可验证：在无 Verilog 仿真器的前提下，仿射方案能被纯 Python 的逐周期行为模型忠实复刻。
+\end{itemize}
+
+\chapter{模拟总线 DAC 引擎}
+
+\section{段表编码}
+每条 10-bit DAC 总线有一张小的 LUTRAM 段表（每 tick 组合读），每段编码：
+
+\begin{codeblock}[bus segment]
+start_tick / stop_tick : 段的起止 tick (仿射, 带 NUM_SLOTS 个系数, 同 effective_tick)
+start_value / stop_value: 段起止 DAC 码 (10 bit)
+mode                    : edge/hold 或 ramp
+value_select (dual)     : start 与 stop 各一个选择子
+\end{codeblock}
+
+总线码是\tfocus{offset-binary}：码 0 = 负满幅、码 512 = 真零点 0 V、码 1023 = 正满幅；用户层（GUI/API/扫描表）一律用带符号值 -512..+511（0 = 0 V），编译器在生成段/扫描点时自动 +512。引擎的空闲/复位/上电值是 \pyapi{BUS_SAFE_VALUE}（= 中点码 512，即 0 V），所以未驱动的总线始终输出 0 V 而不是负满幅。\pyapi{edge/hold} 段把输出保持在某个值；\pyapi{ramp} 段在 start 到 stop 之间\tfocus{线性插值}：引擎用 Bresenham 整数插值逐 tick 输出 $v(k)=v_{start}\pm\lfloor k\cdot|\Delta|/T\rfloor$（陡 ramp 每 tick 走多个码），任意陡度都尽量贴合理想直线并在 stop tick \tfocus{精确到达目标}（不额外占边沿行）。段 apply 时一个小型组合除法器算出每 tick 基础步长与余数（仅陡时启用，缓 ramp 仍是历史的进位 0/1 步进）。\tfocus{dual value\_select} 让 start 与 stop 各自可以指向一个扫描 slot——于是一条 ramp 能\tfocus{同时扫两个端点}（扫描-A $\rightarrow$ 扫描-B），一条 edge/hold 段能跟随一个扫描的 DAC 码。
+
+\section{模拟 DAC ramp 与扫描端点:前端脉冲实绘}
+每条模拟总线是一张小 LUTRAM 段表(组合读),段含 start/stop tick(仿射系数)+ start/stop 值 + mode(edge/ramp)+ \tfocus{双 value\_select}(start 和 stop 各一个)。ramp 段由引擎在本地按 tick 用 Bresenham 整数插值生成 10-bit 阶梯(陡 ramp 每 tick 走多个码、精确落在目标上, 不占数字边沿行);双 value\_select 让一条 ramp 的\tfocus{两个端点各跟一个 scan slot}(scanned-A $\to$ scanned-B),edge/hold 段则跟单个被扫 DAC 码。下图是\tfocus{前端脉冲绘图器实绘}的 DAC 波形。
+
+__FPGA_FIG_DAC__
+
+\pyapi{host.engine_model.bus_play} 逐 tick 证明了总线/ramp 引擎，包含被扫描的 ramp 端点。
+
+\chapter{三个子系统的深入讨论}
+
+本章把两个互相支撑的子系统讲透：\tfocus{AXI4 突发上传}（怎么把程序映像快速写进 FPGA），以及\tfocus{逐信号输出延时（事件调度器）}（一个 channel / DAC 总线被延时后到底输出什么）。延时\tfocus{独立于}仿射扫描引擎：边沿表始终按无延时的标称位置生成，延时只是加在引擎输出上的逐信号事件调度器，把那条 channel / 总线的输出整体往后推 $d$ 个 tick。
+
+\section{AXI4 突发上传}
+主机到 FPGA 的传输是 JTAG-to-AXI：\pyapi{jtag_axi_0}（一个由 Vivado Tcl 经 JTAG 线驱动的 AXI 主机）$\rightarrow$ \pyapi{axi_bram_ctrl_0} $\rightarrow$ 顶层后面区段译码的 BRAM 映像。架构上的关键事实是：这两个 IP 都配成\tfocus{完整 AXI4，而不是 AXI4-Lite}。
+
+\textbf{为什么这很重要。} 在 JTAG-to-AXI 上，一次单拍写大约要 10\,ms（开销在 JTAG 往返，不在数据量）。AXI4-Lite 没有突发，所以每个 32-bit 字都是一次事务；一张 4096 边沿的程序有几千个字，于是\tfocus{每次 On Pulse 都是数秒级的上传}。完整 AXI4 允许主机每次事务发一个最多 256 拍（AWLEN 上限）的 INCR 突发，于是一段地址连续的字一个往返就写完，整张 4096 边沿映像因此降到约 \tfocus{100\,ms}。
+
+配置的单一真相源在 \filepath{fpga/pulse_streamer/create_project.tcl}：\pyapi{jtag_axi_0} 与 \pyapi{axi_bram_ctrl_0} 都设 \pyapi{CONFIG.PROTOCOL {AXI4}}，并把 \pyapi{M_AXI_ID_WIDTH=1} / \pyapi{ID_WIDTH=1} 对齐，32-bit 数据/地址，\pyapi{SUPPORTS_NARROW_BURST=0}。顶层 \filepath{zlc_pulse_streamer_top.v} 把主从 1:1 接线，\tfocus{包含突发旁带}（\pyapi{awlen}/\pyapi{awsize}/\pyapi{awburst}/\pyapi{wlast} 等及读通道镜像）。
+
+\begin{notebox}[一个静默退化点]
+若漂回 \pyapi{AXI4LITE}（或丢掉突发旁带），综合仍然成功，但 \pyapi{-len N} 被忽略，上传又变回数秒级——\tfocus{不会报错}。契约测试因此断言 \pyapi{CONFIG.PROTOCOL {AXI4}} 存在、\pyapi{{AXI4LITE}} 不存在，且主机侧 \pyapi{m_axi_awlen}/\pyapi{m_axi_awburst}/\pyapi{m_axi_wlast} 与从机端口映射 \pyapi{.s_axi_awlen(}/\pyapi{.s_axi_awburst(}/\pyapi{.s_axi_wlast(} 都已接线。
+\end{notebox}
+
+\textbf{主机侧}（\filepath{Zou_lab_control/neutral_atom/devices/axi_session.py}，\pyapi{VivadoAxiStreamerSession}）。字写入先排成 \pyapi{(byte_addr, value)} 队列，在 flush 时合并成突发：
+
+\begin{itemize}
+  \item \pyapi{_burst_runs} 按\tfocus{插入顺序}（绝不全局排序）扫描待写队列，只合并严格地址连续（步长 4）的项，上限 \pyapi{burst_max}（默认 256，夹到 $[1,256]$）。\tfocus{顺序是有载荷的}：COMMAND 上升沿是对\tfocus{同一}地址的两次写（先 0 后 cmd），\pyapi{BANK_READY} 的撤销/重置也是对同一地址的两次写；这些都必须保持有序的单拍写，所以不会被合并或重排。
+  \item \pyapi{_write_burst_tcl} 发一条 \pyapi{create_hw_axi_txn ... -len N -type write -burst INCR}。\pyapi{-burst INCR} 是显式写的：Vivado 默认突发类型跨版本不保证是 INCR，而 FIXED 会把每拍都写到基地址（静默损坏）。对多字突发，\pyapi{-data} 是\tfocus{一个拼接的十六进制大数，其最低位（最右）的字落在基地址}——所以逐拍的字是高地址在前发出的，即连续值要\tfocus{逆序拼接}。这个字节序是唯一一个容易静默出错的点。
+  \item \pyapi{_flush} 每个 Vivado 往返里发多个突发（\pyapi{write_batch} 限的是突发数，不是字数），摊薄主机$\leftrightarrow$Tcl 的往返延迟。
+  \item \pyapi{axi_self_test} 是 warm-start 上电自检：突发写一段已知 ramp 进扫描 BRAM 区，再单拍读回比对，不一致就抛错。它正好抓住两类静默故障——突发 \pyapi{-data} 字节序错、或仍是 Lite 的 bitstream 忽略了 \pyapi{-len}——\tfocus{在任何真实脉冲上传之前}。
+\end{itemize}
+
+\textbf{上传不会随扫描点无界增长。} 点数超过 \pyapi{2*bank_size} 的扫描，引擎播 2-bank ping-pong 窗口、主机\tfocus{流式}回填（见前面"无限流式扫描"一章）：在游标 \pyapi{CURSOR} 之后把空出的 bank 填上下一段并重置 \pyapi{BANK_READY}。总扫描点数只受主机内存限制，晚到的回填只会 STALL（\pyapi{STATUS_UNDERFLOW}），\tfocus{绝不}给出错误点。
+
+\section{逐通道输出延时（事件调度器 event scheduler）}
+channel 延时是一条加在引擎\tfocus{输出}上的延时，而\tfocus{不是}烤进边沿表里的平移。定义极其简单：被延时 $d$ 个 tick 的 channel，其延时后输出 \pyapi{output_delayed[t] = output_undelayed[t-d]}，\pyapi{t < d} 之前恒为 0（fire 之前为 0）。硬件是一个\tfocus{逐信号的事件调度器（event scheduler）}：当引擎那条 channel 的\tfocus{无延时输出翻转}时，把 $(\text{翻转时刻}+d,\ \text{新电平})$ 排进该 channel 的一个小事件 FIFO，一个自由运行的全局 tick 计数器到时把它弹出到输出寄存器——于是输出整体延后 $d$。它只是把那条 channel 的输出整体延后，因此对\tfocus{任意}信号都正确——周期的、非周期的、被 duration 扫描平移过的——都一样。这里\tfocus{没有任何周期性假设}，\tfocus{不}"跳整周期"，\tfocus{没有}移位相位/成员关系，\tfocus{也没有}逐扫描点的延时。一个 channel 的延时\tfocus{绝不}改变另一个 channel 的时序（合并是不相交的直通 \pyapi{out = (state_mask & ~delayed_mask) | delayed_out}）。延时\tfocus{均匀地}与 duration 扫描、DAC 扫描、内层 repeat bracket 组合——"延时后的序列"恒等于"把那条 channel 延时 $d$ 的无延时序列"。它\tfocus{不是扫描量}：延时是每条 channel 的一个固定值，由主机作为常数携带（\pyapi{channel_delays}）。编译它的是 \pyapi{compile_pulse_table_runtime_program} $\rightarrow$ \pyapi{_pulse_table_edge_table}（\filepath{sequencer.py}）。
+
+\textbf{为什么是真实延时，不是循环。} 循环视角（GUI \tfocus{预览}显示的就是它）会在 $t=0$ 伪造一段"绕回来的尾巴"，于是 fire 之后的头几个脉冲变成序列尾部的幻影，\tfocus{破坏真实的实验起始}。事件调度器在 fire 时被清零，所以它让这头几个真实脉冲正确——\tfocus{第一帧是真实的}（在 $t=d$ 之前那条 channel 安静、保持 0，不是循环 \%$T$ 的预览样子）。延一个 channel 不会改变任何其它 channel 的周期，所以 $T$ 保持不变。
+
+\begin{codeblock}[output delay（延时 d）]
+cyclic (预览, 仅显示):     [尾巴绕回][.....原信号右移.....]   <- t=0 处有幻影
+event scheduler (硬件, 真相): [.....0.....][原信号右移 d.....]   <- fire 前恒 0，第一帧真实
+\end{codeblock}
+
+机理要点（\tfocus{排翻转事件、到时弹出}；TTL 与 DAC 同源）：
+\begin{itemize}
+  \item \tfocus{TTL：62 路全部可独立延时——事件调度器（event scheduler）。} TTL 波形是\tfocus{翻转稀疏}的，所以不每拍存一位，而是存\tfocus{翻转事件}：无延时位在 tick $t$ 翻转时，向该 channel 的小事件 FIFO（深 \pyapi{EVT_DEPTH}，默认 128，每项 49 bit）推入 $(t+d-1,\ \text{新电平})$；一个自由运行的 48 位全局计数器 \pyapi{g_time} 等值弹出到输出寄存器——于是 \pyapi{out[t]=in[t-d]} 精确成立（首个事件前为 0；$d=1$ 走一级寄存器；$d=0$ 直通）。存储随\tfocus{在途翻转数}而非延时长度增长：62 路共 $\sim$2k LUT，TTL 延时上限是 32 位字段（$\sim$42.9 s——毫秒级 emCCD 延时直接可用）。每通道 32 位延时值经独立的 DELAY 寄存器区（\pyapi{R_DELAY_BASE}，每 channel 一个 32 位字）上传。合并仍是不相交直通：被延时位用调度结果，其余位原样——延时\tfocus{绝不}打扰别的 channel。
+  \item \tfocus{容量契约：在途翻转数 $\le$ \pyapi{EVT_DEPTH}（默认 128，可配置）。} 在 tick $t$ 推入的事件在 FIFO 里停留到 $t+d-1$，所以 FIFO 占用 = 该通道\tfocus{自己的 $d$ 窗口}内的翻转数。主机校验器对\tfocus{完整日程}做精确计数——每个扫描点按各自的仿射平移后的边沿时刻、bracket 循环、\pyapi{repeat_forever} 的回绕缝、以及\tfocus{跨多帧}的长窗口全部计入（早期版本只查单帧、漏掉了扫描缝和 $d>$ 帧长的情况）；超限在上硬件前清晰报错。深度可整体重建调整：\filepath{streamer_config.json} 的 \pyapi{evt_fifo_depth} + 顶层参数 \pyapi{EVT_FIFO_DEPTH} 保持一致即可。
+  \item \tfocus{延时是物理的。} 写进寄存器的就是用户的原始 $d$（\pyapi{repeat_forever} 也一样），所以\tfocus{第一帧永远真实}：被延时通道在 fire 后安静整整 $d$ 个 tick 才开始输出，绝不"提前几个扫掠"。代价是无限循环下长延时的在途翻转数按 $\sim$每扫掠翻转数 $\times d/S$ 增长（$S$ = 一次完整扫掠的 tick 数）——这正是下面容量契约要对完整日程精确计数、超限即报错的原因。
+  \item \tfocus{DAC：4 条总线各自可延时，一条总线的 10 位共享一个延时——与 TTL 同源。} 每条 10-bit 总线的\tfocus{每一个 bit}都是它自己的 1 位事件调度器（\pyapi{g_busdly}，每 bit 深 \pyapi{BUS_EVT_DEPTH}，默认 64），机制与 TTL 完全相同：值变化时排进事件、$d$ 个 tick 后弹出。一条总线的 10 个 bit\tfocus{共享同一个}逐总线延时（\pyapi{del_bus_ticks}），所以整条总线（固定值、被扫值、或 ramp）被同一个 $d$ 整体延后，而不是每 bit 各延各的。延时值与 TTL 一样是一个 32 位字、走同一个 \pyapi{R_DELAY} 寄存器区——所以 DAC 与 TTL 的延时\tfocus{范围相同}（都 $\sim$42.9 s）。
+  \item \tfocus{负延时 = 全局平移 $G$。} 一条 channel 的 $-d$ 等价于其它\tfocus{所有} channel 都 $+|d|$。主机把全局平移 $G=\max(0,-\min(\text{delays}))$ 折进每条 channel 与每条总线的有效延时（TTL 与 DAC 共享\tfocus{同一个} $G$），使最早的那条信号落在 0、调度器只会看到 $\ge 0$ 的延时。零延时即直通。因为 TTL 与 DAC 用同一个 32 位范围、同一套事件调度器，负延时的全局平移在两者之间\tfocus{一致}，绝不会出现"某条信号超范围被拒、另一条没事"的不匹配。
+  \item \tfocus{DAC 容量契约：在途值变化数 $\le$ \pyapi{BUS_EVT_DEPTH}（默认 64，可配置 \pyapi{bus_evt_fifo_depth}）。} 与 TTL 完全同型：占用 = 该 bit\tfocus{自己的 $d$ 窗口}内的值变化数，随\tfocus{在途事件数}而非延时长度增长，所以大 $d$ 不再受限。唯一现实压力源是一条\tfocus{被延时的密集 ramp}（每 tick 都变）；超限在 validate 与映像打包时\tfocus{被清晰报错拒绝}（在上硬件之前，绝不静默）。
+  \item \pyapi{repeat_forever} 倒回\tfocus{边沿 0}、重放\tfocus{整张帧}——因为延时是加在输出上的逐通道延时线（不烘进边沿），没有需要跳过的"加性延时前导帧"。编译器恒发 \pyapi{repeat_from_index}=0；RTL（\filepath{zlc_edge_streamer.v} 与顶层）仍保留 \pyapi{repeat_from_loop_start} 倒回稳态帧的分支，但对当前实发的程序而言是死路径。
+\end{itemize}
+
+\begin{notebox}[如何证明]
+预览保持循环（只为显示）。硬件/编译路径由一个延时真值预言 \pyapi{delay_line_reference}（\pyapi{output_delayed[t]=output_undelayed[t-d]}，fire 前为 0）加上 \filepath{host/engine_model.py} 的事件调度器寄存器镜像（\pyapi{rtl_delay_line_mirror} / \pyapi{rtl_bus_delay_line_mirror}）逐周期模型证明：编译出的程序过这些周期模型后，与延时真值\tfocus{逐 tick 相同}（覆盖 TTL 多 channel、DAC 逐总线、负延时折 $G$、与 duration 扫描组合）。容量契约由三层证据锁定：（1）随机化测试证明解析的在途计数 = 逐拍 push/pop 占用的暴力模拟；（2）只要解析说"装得下深度 $K$"，$K$ 深 FIFO 镜像就逐 tick 复现理想延时；（3）xsim 测试台 \filepath{sim/tb_evt_depth.v} 在\tfocus{真 RTL 引擎}上验证边界：恰好 $K$ 个在途翻转 = tick 级精确，$K{+}2$ 个 = 只丢弃多余的 2 个翻转（输出只缺那一个脉冲，绝无污染）。在途事件数超过 \pyapi{EVT_DEPTH}（TTL）/ \pyapi{BUS_EVT_DEPTH}（DAC）的延时在 \pyapi{validate_pulse_streamer_program} 与 \pyapi{pack_program} 处都被清晰拒绝。
+\end{notebox}
+
+\section{DAC 总线延时与 TTL 完全同源}
+模拟总线（DAC）的延时机制和 TTL\tfocus{完全相同}：每条总线的\tfocus{每一个 bit}是它自己的 1 位事件调度器（\pyapi{g_busdly}），值变化时排进事件、$d$ 个 tick 后弹出。一条总线的\tfocus{10 个 bit 共享一个}逐总线延时（\pyapi{del_bus_ticks}），所以无论这个 DAC 值是\tfocus{固定}值、\tfocus{被扫}值，还是\tfocus{斜坡（ramp）}，整条总线都被同一个 $d$ 整体延后；在 $t < d$ 之前总线保持其安全码（\pyapi{BUS_SAFE_VALUE}，中点码 = 0\,V）。逐总线延时与 TTL 共享\tfocus{同一个}全局平移 $G$、\tfocus{同一个} 32 位范围（$\sim$42.9 s）、\tfocus{同一型}容量契约（在途值变化数 $\le$ \pyapi{BUS_EVT_DEPTH}，超过即清晰拒绝）。主机把每条总线的延时 tick 数作为常数携带（\pyapi{bus_delays}）。
+
+\textbf{成本小结。} TTL 每条 channel、DAC 每个 bit 各一个事件 FIFO；这些 FIFO 都是\tfocus{分布式 RAM（LUTRAM / distributed）}，\tfocus{不占额外 BRAM}（\pyapi{ram_style="distributed"}）。每个信号的 32 位延时值走 \pyapi{R_DELAY} 寄存器区下发，\tfocus{没有}延时上传映像、\tfocus{没有}延时 CTRL 字、\tfocus{没有}迷你装载器。在 35T（\pyapi{xc7a35t}）上整套延时落地后仍有余量：LUT 约 59\%、BRAM 39/50、DSP 约 58\%。
+
+\section{逐通道 clk 输出（把某通道直接接到时钟）}
+有时需要某个 TTL 引脚直接输出 FPGA 的 \pyapi{clk}（例如给外部 DAC 喂时钟），而引擎按 tick 寄存的输出本身\tfocus{产生不出}一个时钟方波。为此顶层在引脚映射上加了一层\tfocus{运行时可选的 clk 复用}：一个 \pyapi{CHANNEL_COUNT} 位的 \pyapi{clk\_enable} 掩码（CTRL 字 \pyapi{C_CLK_ENABLE}，紧接 20 个命令字之后 = 字 20，62 位占 2 个字；CTRL 块里\tfocus{没有任何延时字}，延时都在 \pyapi{R_DELAY} 寄存器区）随程序映像下发，顶层据此把每个引脚选成
+\begin{codeblock}[逐通道 clk 复用（zlc\_pulse\_streamer\_top.v）]
+assign out_final[n] = clk_en[n] ? ~clk : out[n];  // n: 0..CHANNEL_COUNT-1（strobe = 反相 clk）
+// 引脚映射改为驱动 out_final（不是 out）：assign trig = out_final[6]; assign da_clk0 = out_final[28]; ...
+\end{codeblock}
+所以被标记为 clk 的通道，其引脚输出\tfocus{反相的 clk}（即 clk 的\tfocus{下降沿}对应选通上升沿），与引擎完全无关。\tfocus{为什么是反相而不是直接 clk}：DAC 的 40 个并行数据位（\pyapi{da\_bias\_*}/\pyapi{da\_dipole}）由引擎在 \pyapi{posedge clk} 寄存——也就是\tfocus{在上升沿改变}。若选通就是 \pyapi{clk}，DAC 会在\tfocus{同一个上升沿}锁存正在跳变的数据（而且 period 边界上还叠加几十路 TTL 同时翻转的开关噪声），把一次跳变锁成\tfocus{半新半旧的第三个码}——这正是\tfocus{“两个 edge period 之间偶发出现第三种 DA 值”}的根因（当年靠在两段之间塞一段 $\sim$200\,ms 的 hold 把 DAC 跳变挪离这个忙沿，只是治标）。用\tfocus{反相 clk}做选通，DAC 改在 clk 下降沿锁存 = 数据眼图\tfocus{正中}（50\,MHz 下两侧各 $\sim$10\,ns 已稳定）、且是没有任何东西翻转的\tfocus{安静半周期}，于是\tfocus{永远}锁到干净稳定的码。证据见 \filepath{sim/tb\_da\_clk\_phase.v}（引擎段跳变逐 tick 干净无中间值；同沿锁存在真实偏斜下会锁进第三个码，眼图正中锁存\tfocus{从不}）。配套地，主机编译时把该通道的 mask 位\tfocus{强制清 0}（\pyapi{masks[i] &= ~clk_enable}），引擎\tfocus{绝不驱动}它、也就\tfocus{不会覆盖}clk 行为；\pyapi{clk\_enable} 掩码由 \pyapi{PulseTableState.clk\_channels} 经 \pyapi{clk\_enable\_mask()} 算出，随 \pyapi{RuntimeSequenceProgram.clk\_enable} 打包进 CTRL 字（\pyapi{host.image.CtrlWords.CLK_ENABLE}）。换哪条通道做 clk\tfocus{只是改这份运行时掩码、不需要重新综合}；但首次引入这套 mux 需要重新构建一次 bitstream。DAC 总线成员位不允许设成 clk（会破坏 DAC，GUI 已禁用）。这套 mux 是纯组合逻辑、几乎不占资源。
+
+\section{两件没有下放进 sequencer 的事}
+两条边界澄清，免得把架构搞混：
+\begin{itemize}
+  \item \tfocus{解耦。} sequencer / 边沿流送器\tfocus{不含}任何相机/触发判断。引擎只播放数字边沿、模拟总线段、和逐通道输出延时线；引擎 HDL（\filepath{zlc_edge_streamer.v}）里\tfocus{没有}相机/采集/读出/判定逻辑。触发通道只是引擎驱动的又一路数字输出——\tfocus{何时}计数或阈值判定的决定，住在采集/反馈子系统（\pyapi{subsystems} / readout），不在 timing 里。
+  \item \tfocus{对齐到 tick（单一来源）。} 时钟只能落在整 tick（$\ge 20$\,ns），所以字面时间值会被对齐到网格，且只有\tfocus{一个}对齐来源 \pyapi{PulseTableState.snapped()}（\filepath{timing/pulse_table.py}）：period 持续时间\tfocus{向下取整到 $\ge 1$ tick}（绝不塌到 0，例如 5\,ns $\rightarrow$ 20\,ns）；channel 延时与扫描点值\tfocus{四舍五入到最近 tick}（半值远离零、保号）；DAC 扫描点取最近整数码；而 slot \tfocus{表达式}（\pyapi{s0}、\pyapi{20+s0} 等非数字）\tfocus{原样保留}——编译器改为对它的仿射 base 取整，所以绑定永不被破坏。它\tfocus{永不报错}（自动对齐），对应共聚焦的 \pyapi{align_to_resolution}。脉冲传输 API 在 \pyapi{sequencer.timing_payload_to_dict} 里用 \pyapi{snapped()} 一次性对齐整个状态，GUI 则通过 \pyapi{align_to_resolution} 背书的分辨率控件逐字段套同一规则——两端共享 \filepath{timing/pulse_table.py} 的同一套取整逻辑，所以\tfocus{所见即所跑}。
+\end{itemize}
+
+\chapter{容量与资源预算}
+
+\section{35T 上解出的容量}
+容量由 \pyapi{host.image.solve_capacity(part, channel_count)} 求解（单一真相源），目标 \tfocus{$\le$90\%} RAMB36。35T 上解出：
+
+\begin{codeblock}[solve\_capacity('xc7a35tfgg484-2')]
+4096 edges + bank_size 2048 (4096 resident) + UNBOUNDED streaming
+RAMB36: 39/50 = 78%      LUT: 26%   FF: 12%   DSP: 9%
+\end{codeblock}
+
+三块并行边沿 BRAM（tick/coeff/mask）+ 扫描窗口 BRAM 占了 RAMB36 预算的大头；\tfocus{总线段表是 LUTRAM（distributed），不占 RAMB36}——因为总线/ramp 引擎每 tick 组合读它们，搬进 BRAM 会破坏组合读。\tfocus{延时事件调度器}（TTL 每条 channel 一个深 \pyapi{EVT_DEPTH} 的事件 FIFO + 每个 DAC bit 一个深 \pyapi{BUS_EVT_DEPTH} 的事件 FIFO）同样是分布式 RAM，\tfocus{不占额外 BRAM}——这正是它能放进 35T 的原因：每个 FIFO 只存\tfocus{在途翻转事件}（而非整张序列、也非每拍一格），所以很小。把延时一并算进去后，35T 的整体落地约为 LUT 59\%、BRAM 39/50、DSP 58\%。Vivado \pyapi{report_utilization} / \pyapi{report_timing_summary} 是最终权威，Python 估算只是预算指引。
+
+\section{64 位 tick 架构评估（何时需要、怎么改、资源够不够）}
+当前 32 位 tick（20 ns）封顶的是\tfocus{单个帧}的时长 $\sim$85.9 s——不是总运行时长（repeat forever 无限跑、扫掠点数无上限、实验循环不受限），TTL 延时另有 32 位字段（$\sim$42.9 s，且 repeat forever 下更长的延时自动按周期取模）。真正的长期隐患只有一个：调度器的自由运行计数器 \pyapi{g_time} 是 48 位，连续运行 $\sim$65 天后回绕。
+
+若将来确有 $>$85.9 s 的单帧需求，可行方案是\tfocus{只加宽基准时间轴}：边沿基准 tick、帧计数器 \pyapi{tc}、\pyapi{loop_end} 与各比较器升到 64 位，而\tfocus{扫描点 slot 值与系数保持 32/16 位}（每个扫描点的仿射\tfocus{偏移}量 $\pm 42.9$ s 足够）——这样 \pyapi{coeff$\times$slot} 乘积和全部 52 个 DSP 映射\tfocus{原样不动}，只有末级累加/加法变宽（进位链，不吃 DSP）。代价：tick BRAM $4096\times 32 \to 4096\times 64$ 即 $+4$ 块 RAMB36（27$\to$31）、比较器/影子寄存器约 $+1$k LUT、$+1.5$k FF；64 位进位链 $\sim$4 ns，远小于 20 ns 周期，1-tick 播放契约不受影响。CTRL 布局上 \pyapi{LOOP_END_TICK} 变 LO/HI 两字、映像 tick 字加倍（pack/unpack/回读校验同步改，一次重建即可，无需兼容）。预计落地：RAMB36 31/50、LUT $\sim$64\%、DSP 不变——\tfocus{35T 上可行但目前不需要}。顺手项：下次重建时把 \pyapi{g_time} 48$\to$64 位（每通道只多十几个触发器与比较位），即可消除 65 天回绕。详细论证见 \filepath{docs/MAINTAINER_NOTES.md} §14。
+
+\chapter{编译与上传流程}
+
+\section{build / program / run}
+FPGA 侧只有一个入口 \filepath{fpga\textbackslash build\_and\_program.bat}（内部跑 \filepath{create_project.tcl} $\rightarrow$ \filepath{program_fpga.tcl}），server 入口是 \filepath{fpga\textbackslash run\_server.bat}（jtag-axi 后端）：
+
+\begin{codeblock}[PowerShell]
+.\fpga\build_and_program.bat --check    # 不连板的 HDL 综合 + 容量自查
+.\fpga\build_and_program.bat            # build + program
+.\fpga\run_server.bat --check-config    # 打印 project/bit/ltx/xdc/channels/clock/capacity
+.\fpga\run_server.bat                    # 启动常驻 hw_axi server (host 0.0.0.0, port 18861)
+\end{codeblock}
+
+\pyapi{create_project.tcl} 生成 \pyapi{jtag_axi} + \pyapi{axi_bram_ctrl} + 5 块 BRAM（三块并行边沿 tick/coeff/mask + 扫描窗口 + 总线映像），并用 \pyapi{zlc_force_latency2} 把边沿 BRAM 强制成 \pyapi{READ_LATENCY_B=2}。逐通道/逐总线的输出延时事件调度器是\tfocus{分布式 RAM（LUTRAM）}事件 FIFO，\tfocus{不占额外 BRAM}、也没有延时上传映像。产物 \filepath{zlc_pulse_streamer_top.\{bit,ltx\}} 落在 \filepath{fpga\textbackslash build\textbackslash ps\textbackslash ps.runs\textbackslash impl_1}（工程用短名 \pyapi{ps} 是为了让 Vivado 深层的 run / \filepath{.Xil} 临时路径不超过 Windows MAX\_PATH 限制，同时构建仍然留在仓库内的 \filepath{fpga\textbackslash build}，不挪到别处）。server 加载 \filepath{.ltx} 是为了在比特流里定位 \pyapi{jtag_axi} 核（即 \pyapi{hw_axi}），所以 bit 与 ltx 必须来自\tfocus{同一次编译}。
+
+\section{一次上传里发生了什么}
+\begin{enumerate}
+  \item 主机校验程序：\pyapi{validate_pulse_streamer_program} 检查边沿/扫描点/位宽/通道不越界，并校验\tfocus{全局有效 tick 单调}（扫描不会把合并后的边沿顺序打乱；会打乱顺序的扫描被拒绝，而不是悄悄丢点）。
+  \item \pyapi{host.image.pack_program} 把整张程序打包成 32-bit BRAM 映像：CTRL 标量 + 三块并行边沿表 + 2-bank 扫描窗口 + 总线段映像。
+  \item \tfocus{寄存器布局握手}：在写任何寄存器之前，主机读 CTRL 字 63——顶层把它\tfocus{硬连线}成布局版本号 \pyapi{ZLC_LAYOUT_ID}（写进去的值永远读不回来）。它必须等于主机的 \pyapi{image.REGISTER_LAYOUT_ID}，否则 prepare 立刻报错"重建 bitstream 并重启 server"。这一步杜绝\tfocus{主机与 bitstream 寄存器布局不匹配的静默混跑}——例如 \pyapi{CLK_ENABLE} 从字 46 移到字 20 的那次变更：不匹配时 clk 掩码写进死字、真正的掩码残留旧值，\pyapi{da_clk} 选通失控、DAC 输出第一帧错乱。旧 bitstream 在字 63 返回上电值 0，必然触发清晰报错。\tfocus{任何改 CtrlWords/寄存器区布局的提交必须同时 bump 两边的 ID。}server 启动的 \pyapi{axi_self_test} 也先做同样的校验。
+  \item \pyapi{prepare}：发 SAFE $\rightarrow$ AXI 写映像 $\rightarrow$ arm 两个扫描 bank（写 \pyapi{BANK_READY}/\pyapi{BANK*_CHUNK}）$\rightarrow$ 发 LOAD（等 \pyapi{STATUS_LOADED}）。
+  \item \pyapi{fire}：发 FIRE；对流式/重复扫描，启动后台回填线程。
+  \item \pyapi{wait_done}：轮询 STATUS（DONE 位），并跟随 CURSOR 回填空出来的 bank。\pyapi{repeat_forever} 永不置 DONE，所以必须给 timeout 或主动 stop。
+\end{enumerate}
+
+\begin{notebox}[全部在硬件前被 Python 验证]
+\pyapi{pack_program}$\leftrightarrow$\pyapi{unpack_program} 往返、\pyapi{engine_model} 的逐周期等价（1-tick 预取 / 边界无缝 / 流式 ping-pong / 总线 ramp）、以及 \pyapi{VivadoAxiStreamerSession} 的 pack$\rightarrow$upload$\rightarrow$LOAD$\rightarrow$fire 流程（Tcl 执行器可注入，无需 Vivado）都有契约测试覆盖。仓库没有 Verilog 仿真器，这套 Python 证据是硬件 bring-up 前的正确性保证。
+\end{notebox}

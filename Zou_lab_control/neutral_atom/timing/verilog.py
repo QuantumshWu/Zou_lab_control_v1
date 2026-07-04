@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from ..core.analysis import positive_int
-from .sequence import PulseSequence, channel_names, positive_float
+from .sequence import DEFAULT_CLOCK_HZ, PulseSequence, channel_names, positive_float
 
 
 CONTROL_PORTS = ("clk", "reset", "start", "running", "done")
@@ -37,7 +37,7 @@ def generate_verilog(
     sequence: PulseSequence,
     *,
     channels: Sequence[str] | None = None,
-    clock_hz: float = 50_000_000.0,
+    clock_hz: float = DEFAULT_CLOCK_HZ,
     module_name: str = "zlc_sequence",
 ) -> VerilogBuild:
     """Generate a small start/done edge-table sequencer module."""

@@ -1,8 +1,3 @@
-﻿<!-- cell:markdown -->
-# Zou_lab_control.frontend tutorial
-
-这个 notebook 展示统一的 Jupyter 画图接口。第一格直接把 `..` 加入 `sys.path` / `PYTHONPATH`，然后导入 `Zou_lab_control.frontend`，不需要先安装本仓库。
-
 <!-- cell:code -->
 {{BOOTSTRAP_CELL}}
 
@@ -83,16 +78,18 @@ pulse_plot = zf.plot(
 <!-- cell:markdown -->
 ## Pulse table model and PyQt pulse GUI
 
-`PulseTableState` 是 pulse GUI 和 notebook 共用的 period-card 模型。GUI 是可选前端；不打开 GUI 时，也可以直接用这个模型生成 `PulseSequence`。新建 pulse 默认名是 `pulse_YYYYMMDD_HHMMSS`。`channels` 是硬件 channel 名和 FPGA bit order，例如 `ch00/ch01/...`；display label 只是前端名字。standalone `pulse_gui.bat` 会从 address-switch XDC 推断完整 channel list、display label 和 package pin；JSON 里保存过的 `channel_labels` 优先。`time_step_ns` 是 minimal time，连接默认 FPGA server 时是 20 ns。所有 duration、delay 和 scan table 里的 timing 参数都要是它的整数倍。GUI 默认只显示常用子集，其它 channel 可以在 GUI 里临时添加或隐藏；隐藏不改变上传宽度，compile/upload 会自动补齐完整硬件 channel order。Preview 页自动调用 `zf.plot(..., kind="pulse")`，默认隐藏 off-only channel，并保留 named scan expression 标记，不把 scan table 展开成大量 period columns。
+`PulseTableState` 是 pulse GUI 和 notebook 共用的 period-card 模型。GUI 是可选前端；不打开 GUI 时，也可以直接用这个模型生成 `PulseSequence`。新建 pulse 默认名是 `pulse_YYYYMMDD_HHMMSS`。`channels` 是硬件 channel 名和 FPGA bit order，例如 `ch00/ch01/...`；display label 只是前端名字。standalone `pulse_gui.bat` 会从 address-switch XDC 推断完整 channel list、display label 和 package pin；JSON 里保存过的 `channel_labels` 优先。`time_step_ns` 是 minimal time，连接默认 FPGA server 时是 20 ns。所有 duration、delay 和 scan array 的值都要是它的整数倍。扫描用命名 slot：给任意 duration 或 DAC 字段绑定一个 slot(`s0, s1, ...`)，再提供一张 `N_points x N_slots` 的 `scan_table`（channel delay 是固定的每通道值，不能扫描）。GUI 默认只显示常用子集，其它 channel 可以在 GUI 里临时添加或隐藏；隐藏不改变上传宽度，compile/upload 会自动补齐完整硬件 channel order。Preview 页自动调用 `zf.plot(..., kind="pulse")`，默认隐藏 off-only channel，并保留 symbolic slot 标记，不把 scan array 展开成大量 period columns。
 
 Pulse GUI 的 Edit 页可以按这个顺序读：
 
 ```text
-Channel Names and Duration: pulse 名字、总时长、可见 channel 的 display name。
-Delay and Scan:             Step、active params、scan file、每个 channel delay。
-Period cards:               每个 period 的 duration/unit 和 channel on/off。
-Control Buttons:            Stop Pulse、On Pulse、Add/Remove Column、Add Bracket、Save/Load。
-Channel View:               Add Channel、Hide Off、Show All 和 visible/hidden 计数。
+Channel Names:   pulse 名字、总时长、可见 channel 的 display name。
+Delay / Scan:    FPGA clock(只读显示)、每通道 delay(ns/us)+X 清除按钮+clk 按钮。
+Period cards:    每个 period 的 duration/unit + scan 圆点(绑定 s0..)、
+                 DAC bus 行(Edge/Ramp/Hold + 值 + scan 圆点)、channel on/off。
+Control:         Stop Pulse、On Pulse、Add/Del Column、Add/Del Bracket、Save/Load。
+Channels:        Add Channel、Hide Off、Show All 和 visible/hidden 计数。
+Scan tab:        已绑定 slot 列表、代码生成/Load Array 两种 scan_table 来源、Run。
 ```
 
 Name 面板左侧 raw column 在 standalone address-switch 路线下显示 XDC package pin，
@@ -114,7 +111,6 @@ pulse_state = na.PulseTableState(
     channels=[f"ch{i:02d}" for i in range(62)],
     visible_channels=["ch09", "ch00", "ch03", "ch11"],
     channel_labels={"ch09": "trap", "ch00": "cooling", "ch03": "probe", "ch11": "emCCD"},
-    scan_variables={"pulse_width_ns": 60},
     time_step_ns=20,
 )
 pulse_state.set_period_state(0, "ch09", 1)
@@ -132,26 +128,32 @@ api_pulse_plot = zf.plot(
 # pulse_gui = zf.show_pulse_gui(state=pulse_state, scale=0.82, window_ratio=0.90)
 
 <!-- cell:markdown -->
-命名 scan variable 可以临时覆盖，用来扫某个 duration 或 delay。下面这个例子不打开 GUI，只用 API 生成四个不同宽度的 sequence，并编译成 50 MHz FPGA 的 integer tick edge table。GUI 里的同一件事是：点 duration 旁边的 `.`，把它绑定成 `pulse_width_ns`，再链接一个以 `# vars: pulse_width_ns(ns)` 开头的 scan table。scan 数值会用和 duration/delay 一样的 resolution 逻辑对齐到 active step。
+扫描用**命名 scan slot**（`s0, s1, ...`）。`bind_field(kind, target)` 把一个字段绑定成下一个 slot：`kind="duration"` 时 `target` 是 period 序号，`kind="dac"` 时是 `"bus@period"`（channel delay 是固定量，不能绑定）。绑定后该字段的值变成 slot 表达式（如 `"s0"`），再用 `set_scan_table` 提供一张 `N_points x N_slots` 的表；`compile_scan` 把整张表编译成**一个**硬件 program——FPGA 在扫描点之间无缝切换（affine tick：`effective_tick = base + (coeff*s0)>>8`），不需要逐点重新上传。GUI 里的同一件事是：点 duration/DAC 输入框右侧的圆点（变橙色、显示 slot 号），再到 Scan 页生成或 Load Array 一张 scan table。下面这个例子不打开 GUI，只用 API 扫 `image` period 的宽度。
 
 <!-- cell:code -->
-x_scan_state = na.PulseTableState(
+scan_state = na.PulseTableState(
     channels=["ch09", "ch03", "ch11"],
     channel_labels={"ch09": "trap", "ch03": "probe", "ch11": "emCCD"},
     time_step_ns=20,
     periods=[
         na.PulsePeriod(1000, (1, 0, 0), unit="ns", name="pre"),
-        na.PulsePeriod("pulse_width_ns", (1, 1, 1), unit="str (ns)", name="image"),
+        na.PulsePeriod(240, (1, 1, 1), unit="ns", name="image"),
         na.PulsePeriod(1000, (0, 0, 0), unit="ns", name="idle"),
     ],
-    scan_variables={"pulse_width_ns": 240},
-    scan_bindings={"period:1:duration": "pulse_width_ns"},
 )
+scan_state.bind_field("duration", "1", label="image width")   # period 1 duration -> s0
+scan_state = scan_state.set_scan_table([[240], [500], [1000], [2000]])  # N_points x N_slots, ns
 
-x_widths_ns = [240, 500, 1000, 2000]
-x_sequences = [x_scan_state.to_sequence(variables={"pulse_width_ns": width}, time_step_ns=20) for width in x_widths_ns]
-x_programs = [x_scan_state.compile(clock_hz=50_000_000, variables={"pulse_width_ns": width}) for width in x_widths_ns]
-[(x_scan_state.total_duration_steps(variables={"pulse_width_ns": width}, time_step_ns=20), program.ticks[-1]) for width, program in zip(x_widths_ns, x_programs)]
+scan_program = scan_state.compile_scan(clock_hz=50_000_000)
+scan_program.scan_points, scan_program.ticks  # 一个 program 携带全部扫描点(tick 单位)
+
+<!-- cell:code -->
+# 单点检查：with_slots_resolved 把 s0 换成一个具体值(其余 slot 保持 nominal)，
+# 得到一张普通的静态表；compile(slots=...) 等价。
+single = scan_state.with_slots_resolved({"s0": 500})
+single_program = single.compile(clock_hz=50_000_000)
+[(width, scan_state.total_duration_steps(slots={"s0": width}, time_step_ns=20))
+ for width in [240, 500, 1000, 2000]], single_program.ticks
 
 <!-- cell:markdown -->
 For real hardware, do not let the GUI invent hardware. Start the server on the
@@ -159,12 +161,13 @@ FPGA/Vivado computer, then attach the same `RemoteSequencer` from GUI or API:
 
 ```python
 sequencer = na.RemoteSequencer(
-    host="192.168.0.20",
+    host="FPGA_SERVER_IP",   # 改成你 FPGA/Vivado 电脑的 IP
     port=18861,
     channels=[f"ch{i:02d}" for i in range(62)],
     clock_hz=50_000_000,
-    trigger_channels=["ch11"],  # emCCD/M13 in the checked-in address-switch XDC
 )
+# 哪条线触发相机（emCCD/M13）是相机的属性（camera.capture_trigger_channels），
+# 不是序列器的——序列器是纯脉冲流送器，不感知谁被它触发。
 gui = zf.show_pulse_gui(
     state=na.PulseTableState.load("pulses/camera_imaging_address_switch.json"),
     sequencer=sequencer,
@@ -175,7 +178,7 @@ The API equivalent of pressing `On Pulse` is:
 
 ```python
 state = na.PulseTableState.load("pulses/camera_imaging_address_switch.json")
-program = state.compile(clock_hz=50_000_000, trigger_channels=["ch11"])
+program = state.compile(clock_hz=50_000_000)
 sequencer.prepare(program)
 sequencer.fire()
 ```
@@ -185,7 +188,7 @@ arms qCMOS first and then fires a finite trigger sequence. Free-running
 `repeat_forever=True` is useful for scope checks, not for a finite camera stack.
 
 Analog bus rows such as `da_dipole` or `da_bias_x/y/z` are folded views of
-10-bit TTL groups. Their GUI value field is a line edit clamped to `0..1023`.
+10-bit TTL groups. Their GUI value field is a line edit clamped to the SIGNED range `-512..+511` (0 = true 0 V; the offset-binary wire code = value + 512 is produced by the compiler).
 Preview draws one hollow stair-step analog trace. The runtime uploads these rows
 through the FPGA analog-bus segment table, so a long bus ramp costs one bus
 segment instead of one ordinary TTL `prog_mask` edge per stair step.
@@ -267,3 +270,8 @@ for name in ["live_scan", "continuous_monitor"]:
     obj = globals().get(name)
     if obj is not None and hasattr(obj, "stop"):
         obj.stop()
+
+<!-- cell:markdown -->
+## 把这些组件接成一台实验:Task 控制台
+
+上面是 frontend 的各个**单件**(plot / pulse GUI / live scan)。把它们按 device → measurement → processor → task → plot 五层接成一台跑读出实验的 GUI,看 **`task_console_tutorial.ipynb`**——`zf.show_task_console(...)` 一行打开,Add Panel 搭出相机活图 + 校准 + 判 occupancy + site map,虚拟和真机用同一套调用。

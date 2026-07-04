@@ -10,7 +10,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import Divider, Size
 
-from .style import apply_style
+from .style import DESIGN_DPI, STOCK_DATA_PX, STOCK_MARGINS_PX, apply_style
 
 try:
     from IPython import get_ipython
@@ -22,11 +22,15 @@ except Exception:  # pragma: no cover - only absent outside IPython.
 
 @dataclass(frozen=True)
 class FigureSpec:
-    """Fixed logical-pixel layout for a notebook figure."""
+    """Fixed logical-pixel layout for a notebook figure.
 
-    data_px: tuple[int, int] = (480, 360)
-    margins_px: tuple[int, int, int, int] = (110, 110, 100, 40)
-    dpi: int = 300
+    The defaults ARE the stock confocal single-axes region; they read the geometry
+    tokens in ``style.py`` (the single source) so this and ``style.figure.figsize``
+    can never drift apart."""
+
+    data_px: tuple[int, int] = STOCK_DATA_PX
+    margins_px: tuple[int, int, int, int] = STOCK_MARGINS_PX
+    dpi: int = DESIGN_DPI
 
 
 _CELL_FIGS: dict[str, list[int]] = {}
@@ -56,18 +60,28 @@ def _get_notebook_context() -> tuple[Optional[str], Optional[str]]:
 
 
 def _destroy_frontend_tools(fig: plt.Figure) -> None:
-    for attr in ("_zlc_tools", "_npt_tools"):
-        tools = getattr(fig, attr, None)
-        if tools is None:
-            continue
+    def _destroy_bundle(bundle) -> None:
         for name in ("area", "cross", "zoom", "drag"):
-            handler = getattr(tools, name, None)
+            handler = getattr(bundle, name, None)
             if handler is not None and hasattr(handler, "destroy"):
                 try:
                     handler.destroy()
                 except Exception:
                     pass
+
+    for attr in ("_zlc_tools", "_npt_tools"):
+        tools = getattr(fig, attr, None)
+        if tools is None:
+            continue
+        _destroy_bundle(tools)
         setattr(fig, attr, None)
+    # Multi-axes plots (the site-histogram grid) keep one selector bundle PER
+    # cell on the figure; destroy them all so a cell rerun does not leak them.
+    grid_tools = getattr(fig, "_zlc_grid_tools", None)
+    if grid_tools:
+        for bundle in grid_tools:
+            _destroy_bundle(bundle)
+        fig._zlc_grid_tools = None
 
 
 def _close_fig_num(fig_num: int) -> None:
@@ -118,6 +132,19 @@ def new_figure(*, spec: FigureSpec | None = None, track_cell: bool = True) -> pl
     global _FIG_COUNTER
 
     apply_style({"figure.dpi": spec.dpi} if spec is not None else None)
+    # OFF the GUI/main thread (e.g. a Calibrate-readout task rendering its report PNGs on
+    # its acquisition worker), build a MANAGER-LESS Agg figure: ``plt.figure`` registers
+    # with pyplot's GUI figure manager, which warns ("Starting a Matplotlib GUI outside of
+    # the main thread...") and is unsafe off-main-thread.  Such figures are saved to disk,
+    # never shown live, so they need no pyplot manager or cell tracking.
+    import threading
+    if threading.current_thread() is not threading.main_thread():
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+        fig = Figure(dpi=(spec.dpi if spec is not None else None))
+        FigureCanvasAgg(fig)
+        configure_canvas(fig)
+        return fig
     cell_id, run_id = _get_notebook_context()
 
     if track_cell and cell_id is not None and run_id is not None:
@@ -242,20 +269,127 @@ def split_axes_horizontally(
     return axes
 
 
+def create_axes_grid(
+    fig: plt.Figure,
+    nrows: int,
+    ncols: int,
+    *,
+    cell_px: tuple[int, int] = (170, 130),
+    col_gap_px: int = 30,
+    row_gap_px: int = 40,
+    margins_px: tuple[int, int, int, int] = (78, 34, 60, 54),
+    data_px: tuple[int, int] | None = None,
+) -> list[plt.Axes]:
+    """Create ``nrows*ncols`` fixed-pixel cells in row-major (top-left first) order.
+
+    Every cell is the same fixed logical-pixel size and the gaps between them are
+    explicit, so cells never overlap; the figure is sized to fit all cells plus
+    margins, so nothing is cut off; and the shared fixed grid keeps every cell
+    aligned.  ``cell_px`` is ``(width, height)`` of one cell's full box (axes +
+    its own ticks); ``margins_px`` is ``(left, right, bottom, top)`` around the
+    whole grid (top leaves room for a suptitle).
+
+    ``data_px`` (``(width, height)``) makes the grid fill a TOTAL data region of that
+    size -- the SAME data region every other panel kind uses (``panel_plot_spec(size).data_px``)
+    -- by SUBDIVIDING it into ``ncols`` x ``nrows`` cells with the given inter-cell gaps
+    (``cell_px`` is then derived to fill ``data_px``, not read).  When given, the whole
+    cell block is the fixed data box, so ``fig._zlc_fixed_box_in`` is recorded EXACTLY as
+    ``create_axes_fixed`` does -- a grid figure's data region then equals a single-axes
+    panel's of the same size, and a size change truly rescales the cells (not just the
+    padding).  Omit it for the legacy fixed-``cell_px`` mode (cells drive the figure size).
+    """
+
+    nrows, ncols = max(1, int(nrows)), max(1, int(ncols))
+    dpi = design_dpi(fig)
+    cgap, rgap = col_gap_px / dpi, row_gap_px / dpi
+    L, R, B, T = [m / dpi for m in margins_px]
+    if data_px is not None:
+        # Fill a FIXED total data region (== panel_plot_spec(size).data_px): the cells + gaps
+        # exactly span ``data_px``, so a grid's data box matches a single-axes panel's of the
+        # same size.  cell_px is DERIVED to fill it (the remaining width/height after gaps,
+        # split evenly), never read from the argument.
+        dw_in, dh_in = data_px[0] / dpi, data_px[1] / dpi
+        cw_in = max((dw_in - (ncols - 1) * cgap) / ncols, 1.0 / dpi)
+        ch_in = max((dh_in - (nrows - 1) * rgap) / nrows, 1.0 / dpi)
+    else:
+        cw_in, ch_in = cell_px[0] / dpi, cell_px[1] / dpi
+
+    block_w = ncols * cw_in + (ncols - 1) * cgap
+    block_h = nrows * ch_in + (nrows - 1) * rgap
+    fig_w = L + block_w + R
+    fig_h = B + block_h + T
+    fig.set_size_inches(fig_w, fig_h, forward=True)
+
+    horiz: list[Any] = [Size.Fixed(L)]
+    for c in range(ncols):
+        horiz.append(Size.Fixed(cw_in))
+        if c < ncols - 1:
+            horiz.append(Size.Fixed(cgap))
+    horiz.append(Size.Fixed(R))
+    vert: list[Any] = [Size.Fixed(B)]
+    for r in range(nrows):
+        vert.append(Size.Fixed(ch_in))
+        if r < nrows - 1:
+            vert.append(Size.Fixed(rgap))
+    vert.append(Size.Fixed(T))
+
+    divider = Divider(fig, (0, 0, 1, 1), horizontal=horiz, vertical=vert)
+    axes: list[plt.Axes] = []
+    for r in range(nrows):  # row 0 = TOP
+        for c in range(ncols):
+            ax = fig.add_axes([0, 0, 1, 1])
+            ax.set_axes_locator(divider.new_locator(nx=1 + 2 * c, ny=1 + 2 * (nrows - 1 - r)))
+            axes.append(ax)
+    fig._zlc_grid = (nrows, ncols)
+    # Record the WHOLE cell block as the fixed data box (like create_axes_fixed) so the grid's
+    # data region equals panel_plot_spec(size).data_px and a focused single cell / contract test
+    # can read it back.  Only in data_px mode -- the legacy cell_px mode has no single data box.
+    if data_px is not None:
+        fig._zlc_fixed_box_in = (block_w, block_h)
+        fig._zlc_fixed_bounds_frac = (L / fig_w, B / fig_h, block_w / fig_w, block_h / fig_h)
+    return axes
+
+
+def grid_shape_for(n: int, *, max_cols: int = 8, prefer: tuple[int, int] | None = None) -> tuple[int, int]:
+    """Choose ``(nrows, ncols)`` for ``n`` panels: an explicit ``prefer`` if it
+    fits, else a near-square layout capped at ``max_cols`` columns."""
+
+    n = max(1, int(n))
+    if prefer is not None:
+        pr, pc = int(prefer[0]), int(prefer[1])
+        if pr > 0 and pc > 0 and pr * pc >= n:
+            return pr, pc
+    import math
+
+    ncols = min(int(max_cols), int(math.ceil(math.sqrt(n))))
+    ncols = max(1, ncols)
+    nrows = int(math.ceil(n / ncols))
+    return nrows, ncols
+
+
+# Growth steps for auto_data_size_px (notebook multi-panel auto-sizing): the data
+# box grows one step per extra column / row, capped.  Named so the numbers live in
+# one place rather than inline in the expression.
+_AUTO_COL_STEP_PX = 80       # extra data width per column beyond the first
+_AUTO_ROW_STEP_PX = 90       # extra data height per row beyond the first
+_AUTO_MULTI_BASE_W_PX = 420  # base width when ncols > 1 (before adding column steps)
+_AUTO_MAX_H_PX = 620         # cap on the grown height
+
+
 def auto_data_size_px(
     ncols: int = 1,
     nrows: int = 1,
     aspect: float | None = None,
-    min_w: int = 420,
+    min_w: int = _AUTO_MULTI_BASE_W_PX,
     max_w: int = 760,
-    base_h: int = 360,
+    base_h: int = STOCK_DATA_PX[1],
 ) -> tuple[int, int]:
     """Choose a conservative fixed data-box size for notebook plots."""
     ncols = max(1, int(ncols))
     nrows = max(1, int(nrows))
     if aspect is None:
-        width = 480 if ncols == 1 else min(max_w, 420 + 80 * (ncols - 1))
-        height = base_h if nrows == 1 else min(620, base_h + 90 * (nrows - 1))
+        width = STOCK_DATA_PX[0] if ncols == 1 else min(max_w, _AUTO_MULTI_BASE_W_PX + _AUTO_COL_STEP_PX * (ncols - 1))
+        height = base_h if nrows == 1 else min(_AUTO_MAX_H_PX, base_h + _AUTO_ROW_STEP_PX * (nrows - 1))
         return int(width), int(height)
     width = int(np_clip(base_h * float(aspect), min_w, max_w))
     return width, int(base_h)
@@ -300,8 +434,10 @@ __all__ = [
     "close_all",
     "configure_canvas",
     "create_axes_fixed",
+    "create_axes_grid",
     "design_dpi",
     "display_figure",
+    "grid_shape_for",
     "new_figure",
     "save_figure_data",
     "split_axes_horizontally",

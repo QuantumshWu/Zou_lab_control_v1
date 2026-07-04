@@ -14,6 +14,7 @@ from .content.tutorials import (
     frontend_tutorial_cells,
     neutral_atom_fpga_server_cells,
     neutral_atom_hardware_tutorial_cells,
+    neutral_atom_qcmos_live_cells,
     neutral_atom_tutorial_cells,
 )
 
@@ -152,6 +153,12 @@ def write_neutral_atom_fpga_server_tutorial(path: str | Path = "tutorials/neutra
     return write_notebook(path, neutral_atom_fpga_server_cells(), title="Zou_lab_control.neutral_atom FPGA sequencer server")
 
 
+def write_neutral_atom_qcmos_live_tutorial(path: str | Path = "tutorials/qcmos_live_2d.ipynb") -> NotebookBuildResult:
+    """Generate the camera-only qCMOS live-2D notebook (no sequencer)."""
+
+    return write_notebook(path, neutral_atom_qcmos_live_cells(), title="Zou_lab_control qCMOS live 2D")
+
+
 
 
 __all__ = [
@@ -164,6 +171,7 @@ __all__ = [
     "write_frontend_tutorial",
     "write_neutral_atom_fpga_server_tutorial",
     "write_neutral_atom_hardware_tutorial",
+    "write_neutral_atom_qcmos_live_tutorial",
     "write_neutral_atom_tutorial",
     "write_notebook",
 ]

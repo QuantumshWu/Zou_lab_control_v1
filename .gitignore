@@ -33,11 +33,27 @@ ENV/
 tutorials/_executed_check/
 **/_executed_check/
 
-# Generated local outputs
+# Generated local outputs -- ALL run output now lives under ONE root (_output/: calibrations data +
+# reports, generated Verilog, saved results), single-sourced in Zou_lab_control/_paths.py so it never
+# scatters loose folders across the repo root.  Legacy top-level names kept ignored for any explicit override.
+/_output/
+**/_output/
 /generated_sequences/
 /results/
 **/generated_sequences/
 **/results/
+
+# Figures + data dumps are NEVER committed: panel "Save Fig" (tasks/<name>.png + .npz),
+# calibration reports, scan exports, scratch captures.  The ONLY images that belong in git
+# are the deliverable manual figures under docs/**/assets/ (rebuilt by the doc build
+# scripts) -- re-allow exactly those; every other .png / .npz / .npy is local output.
+# (Saved task LAYOUTS tasks/*.json are not data, so they stay committable.)
+*.png
+*.npz
+*.npy
+!docs/**/assets/*.png
+_shots/
+**/_shots/
 
 # Root-level source archives kept locally outside git history
 /*.zip
@@ -78,7 +94,13 @@ desktop.ini
 *.run.xml
 *.synctex.gz
 *.toc
+*.build.log
 docs/**/*_zh.txt
+# Manual sources are build intermediates: only the PDF (+ assets/) belongs in
+# docs/.  The real source is the .texbody templates + the build_* functions;
+# render_notes_pdf compiles in a temp dir and copies back ONLY the .pdf.
+docs/**/*.tex
+docs/**/*.sty
 
 # Vivado / FPGA generated working files
 .Xil/
@@ -92,3 +114,14 @@ docs/**/*_zh.txt
 *.cache/
 *.hw/
 *.sim/
+
+# Scratch GUI verification screenshots (devtools output, not deliverables)
+/_gui_shots/
+pulses/
+
+# xsim litter (simulation runs anywhere in the tree)
+xsim.dir/
+*.pb
+calibrations/
+
+.claude/worktrees/

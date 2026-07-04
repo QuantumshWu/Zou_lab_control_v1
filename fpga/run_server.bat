@@ -2,7 +2,7 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 if /I not "%~1"=="--inner" (
-  set "ZLC_ACTION=server"
+  set "ZLC_ACTION=pulse streamer server"
   if /I "%~1"=="--check-config" set "ZLC_ACTION=server config check"
   call "%~f0" --inner %*
   set "ZLC_STATUS=!ERRORLEVEL!"
@@ -47,7 +47,7 @@ if errorlevel 1 exit /b 1
 call :zlc_find_vivado
 if errorlevel 1 exit /b 1
 call :zlc_default_paths
-call :zlc_verify_address_switch_sources
+call :zlc_verify_sources
 if errorlevel 1 exit /b 1
 
 pushd "%REPO_ROOT%"
@@ -55,18 +55,15 @@ set "PYTHONPATH=%CD%;%PYTHONPATH%"
 
 if "%ZLC_PS_HOST%"=="" set "ZLC_PS_HOST=0.0.0.0"
 if "%ZLC_PS_PORT%"=="" set "ZLC_PS_PORT=18861"
-if "%ZLC_PS_SERVER_BACKEND%"=="" set "ZLC_PS_SERVER_BACKEND=vivado-session"
+if "%ZLC_PS_SERVER_BACKEND%"=="" set "ZLC_PS_SERVER_BACKEND=jtag-axi"
 if "%ZLC_PS_VIVADO_PROGRAM_ON_RUN%"=="" set "ZLC_PS_VIVADO_PROGRAM_ON_RUN=0"
-if "%ZLC_PS_MAX_EDGES%"=="" set "ZLC_PS_MAX_EDGES=512"
-if "%ZLC_PS_MAX_SCAN_POINTS%"=="" set "ZLC_PS_MAX_SCAN_POINTS=256"
-if "%ZLC_PS_TICK_WIDTH%"=="" set "ZLC_PS_TICK_WIDTH=32"
 if "%ZLC_PS_CLOCK_HZ%"=="" set "ZLC_PS_CLOCK_HZ=50000000"
 if "%ZLC_PS_MAX_CHANNEL_COUNT%"=="" (
   set "ZLC_PS_MAX_CHANNEL_COUNT_ARG="
 ) else (
   set "ZLC_PS_MAX_CHANNEL_COUNT_ARG=--max-channel-count %ZLC_PS_MAX_CHANNEL_COUNT%"
 )
-if "%ZLC_PS_XDC%"=="" if exist "%CD%\references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc" set "ZLC_PS_XDC=%CD%\references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc"
+if "%ZLC_PS_XDC%"=="" if exist "%CD%\fpga\board_config\board.xdc" set "ZLC_PS_XDC=%CD%\fpga\board_config\board.xdc"
 if "%ZLC_PS_CHANNEL_COUNT%"=="" (
   for /f "delims=" %%I in ('%ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer infer_channel_count --xdc "%ZLC_PS_XDC%" --default-count 62 %ZLC_PS_MAX_CHANNEL_COUNT_ARG% 2^>nul') do if "!ZLC_PS_CHANNEL_COUNT!"=="" set "ZLC_PS_CHANNEL_COUNT=%%I"
 )
@@ -77,60 +74,47 @@ if "%ZLC_PS_CHANNELS%"=="" (
 if "%ZLC_PS_CHANNELS%"=="" (
   for /f "delims=" %%I in ('%ZLC_PY_CMD% -c "print(' '.join(f'ch{i:02d}' for i in range(62)))" 2^>nul') do if "!ZLC_PS_CHANNELS!"=="" set "ZLC_PS_CHANNELS=%%I"
 )
-if "%ZLC_PS_TRIGGER_CHANNELS%"=="" (
-  for /f "delims=" %%I in ('%ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer infer_trigger_channels --xdc "%ZLC_PS_XDC%" --default-count %ZLC_PS_CHANNEL_COUNT% %ZLC_PS_MAX_CHANNEL_COUNT_ARG% 2^>nul') do if "!ZLC_PS_TRIGGER_CHANNELS!"=="" set "ZLC_PS_TRIGGER_CHANNELS=%%I"
-)
-if "%ZLC_PS_TRIGGER_CHANNELS%"=="" (
-  echo ERROR: could not infer the emCCD camera trigger channel from the selected XDC.
-  echo.
-  echo The default camera trigger must be the XDC output labelled emCCD. Check ZLC_PS_XDC,
-  echo or set ZLC_PS_TRIGGER_CHANNELS explicitly only after confirming the camera trigger line.
-  exit /b 1
-)
+rem The sequencer is a PURE streamer: it streams pulses on its named channels and NEVER
+rem needs to know which line gates a camera.  Which channel is a camera capture trigger is
+rem the CAMERA device's property (its config's capture_trigger_channels), read by the
+rem control-computer measurement layer -- not the server.  So the server infers no camera
+rem trigger here and its launch line below passes only channels, never a trigger flag.
 
+rem Default the bitstream + JTAG-to-AXI probes from the in-repo build (build\ps).
 if not "%ZLC_PS_PROJECT_DIR%"=="" (
-  if "%ZLC_PS_VIVADO_PROJECT%"=="" set "ZLC_PS_VIVADO_PROJECT=%ZLC_PS_PROJECT_DIR%\address_switch.xpr"
-  if "%ZLC_PS_VIVADO_BIT%"=="" set "ZLC_PS_VIVADO_BIT=%ZLC_PS_PROJECT_DIR%\address_switch.runs\impl_1\zlc_pulse_streamer_top_address_switch.bit"
-  if "%ZLC_PS_VIVADO_LTX%"=="" set "ZLC_PS_VIVADO_LTX=%ZLC_PS_PROJECT_DIR%\address_switch.runs\impl_1\zlc_pulse_streamer_top_address_switch.ltx"
+  if "%ZLC_PS_VIVADO_BIT%"=="" set "ZLC_PS_VIVADO_BIT=%ZLC_PS_PROJECT_DIR%\ps.runs\impl_1\zlc_pulse_streamer_top.bit"
+  if "%ZLC_PS_VIVADO_LTX%"=="" set "ZLC_PS_VIVADO_LTX=%ZLC_PS_PROJECT_DIR%\ps.runs\impl_1\zlc_pulse_streamer_top.ltx"
 )
 if "%ZLC_PS_VIVADO_LTX%"=="" (
-  echo ERROR: no Vivado .ltx probe file was found.
+  echo ERROR: no Vivado .ltx probes file was found.
   echo.
-  echo The address-switch server controls the FPGA through Vivado VIO, so it must load
-  echo the same .ltx Probes file used when the FPGA was programmed.
+  echo The server drives the FPGA over JTAG-to-AXI ^(hw_axi^); it loads the
+  echo .ltx so Vivado can find the jtag_axi core in the programmed bitstream.
   echo.
-  echo Fix one of these:
-  echo   1. Check the address-switch XDC pin map, then run fpga\build_and_program.bat.
-  echo   2. Or set ZLC_PS_VIVADO_LTX to the .ltx from Vivado Program Device.
-  echo.
-  echo Example:
-  echo   set ZLC_PS_VIVADO_LTX=D:\path\zlc_pulse_streamer_top_address_switch.ltx
-  echo   fpga\run_server.bat
-  echo.
+  echo Fix: build + program the bitstream first:
+  echo   fpga\build_and_program.bat
+  echo Or set ZLC_PS_VIVADO_LTX to the .ltx from the build.
   popd
   exit /b 2
 )
 if not exist "%ZLC_PS_VIVADO_LTX%" (
-  echo ERROR: Vivado .ltx probe file does not exist:
+  echo ERROR: Vivado .ltx probes file does not exist:
   echo   %ZLC_PS_VIVADO_LTX%
   echo.
-  echo Build/program the address-switch bitstream first:
+  echo Build + program the bitstream first:
   echo   fpga\build_and_program.bat
-  echo.
-  echo Or set ZLC_PS_VIVADO_LTX to the exact Probes file used in Vivado Program Device.
   popd
   exit /b 2
 )
 
-echo ZLC FPGA pulse-streamer server: %ZLC_PS_CHANNEL_COUNT%ch
+echo ZLC FPGA pulse streamer server: %ZLC_PS_CHANNEL_COUNT%ch ^(JTAG-to-AXI, 1-tick + streaming^)
 echo Host:    %ZLC_PS_HOST%:%ZLC_PS_PORT%
 echo Backend: %ZLC_PS_SERVER_BACKEND%
-echo Project: %ZLC_PS_VIVADO_PROJECT%
 echo Bit:     %ZLC_PS_VIVADO_BIT%
 echo LTX:     %ZLC_PS_VIVADO_LTX%
 echo Channels: %ZLC_PS_CHANNELS%
 echo Clock:   %ZLC_PS_CLOCK_HZ% Hz
-echo Capacity: max_edges=%ZLC_PS_MAX_EDGES% scan_rows=%ZLC_PS_MAX_SCAN_POINTS% scan_bus_values=4x10 bus_segments=4x64
+echo Program-on-start: %ZLC_PS_VIVADO_PROGRAM_ON_RUN% ^(0 = assume build_and_program already loaded the FPGA^)
 
 if "%ZLC_RUN_SERVER_CHECK%"=="1" (
   echo ZLC server config check complete.
@@ -138,39 +122,20 @@ if "%ZLC_RUN_SERVER_CHECK%"=="1" (
   endlocal & exit /b 0
 )
 
-if /I "%ZLC_PS_SERVER_BACKEND%"=="command" goto zlc_run_command_backend
-
 %ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.sequencer_server ^
   --backend %ZLC_PS_SERVER_BACKEND% ^
   --host %ZLC_PS_HOST% ^
   --port %ZLC_PS_PORT% ^
   --channels %ZLC_PS_CHANNELS% ^
-  --trigger-channels %ZLC_PS_TRIGGER_CHANNELS% ^
   --clock-hz %ZLC_PS_CLOCK_HZ% ^
   --state-dir "%ZLC_PS_STATE_DIR%"
 set "ZLC_STATUS=%ERRORLEVEL%"
 popd
 endlocal & exit /b %ZLC_STATUS%
 
-:zlc_run_command_backend
-%ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.sequencer_server ^
-  --backend command ^
-  --host %ZLC_PS_HOST% ^
-  --port %ZLC_PS_PORT% ^
-  --channels %ZLC_PS_CHANNELS% ^
-  --trigger-channels %ZLC_PS_TRIGGER_CHANNELS% ^
-  --clock-hz %ZLC_PS_CLOCK_HZ% ^
-  --state-dir "%ZLC_PS_STATE_DIR%" ^
-  --prepare-command "%ZLC_PY_ARG% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer prepare" ^
-  --fire-command "%ZLC_PY_ARG% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer fire" ^
-  --wait-done-command "%ZLC_PY_ARG% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer wait_done" ^
-  --safe-state-command "%ZLC_PY_ARG% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer safe_state"
-set "ZLC_STATUS=%ERRORLEVEL%"
-popd
-endlocal & exit /b %ZLC_STATUS%
-
 :zlc_help
-echo Start the XDC-inferred ZLC FPGA pulse-streamer server.
+echo Start the FINAL ZLC FPGA pulse-streamer server ^(JTAG-to-AXI / hw_axi^).
+echo Engine: 1-tick ^(20 ns^) FIFO prefetch + unbounded 2-bank streaming scan.
 echo.
 echo Usage:
 echo   fpga\run_server.bat
@@ -178,96 +143,47 @@ echo   fpga\run_server.bat --check-config
 echo.
 echo Defaults:
 echo   host/port: 0.0.0.0:18861
-echo   backend:   vivado-session
+echo   backend:   jtag-axi  ^(persistent Vivado hw_axi session^)
 echo   channels:  inferred from ZLC_PS_XDC, fallback ch00 ... ch61
 echo   clock:     50000000 Hz ^(override with ZLC_PS_CLOCK_HZ^)
+echo   bit/ltx:   fpga\build\ps\ps.runs\impl_1\zlc_pulse_streamer_top.{bit,ltx}
+echo.
+echo Run fpga\build_and_program.bat first ^(it builds AND programs the FPGA^).
 echo.
 echo Optional:
 echo   set ZLC_FPGA_SERVER_PYTHON=C:\path\to\python.exe
 echo   set ZLC_PS_HOST=0.0.0.0
 echo   set ZLC_PS_PORT=18861
-echo   set ZLC_PS_VIVADO_BIN=C:\Xilinx\Vivado\2019.2\bin\vivado.bat
-echo   set ZLC_PS_SERVER_BACKEND=vivado-session
-  echo   set ZLC_PS_PROJECT_DIR=%%CD%%\fpga\build\address_switch
+echo   set ZLC_PS_VIVADO_BIN=C:\Xilinx\Vivado\2019.1\bin\vivado.bat
+echo   set ZLC_PS_VIVADO_PROGRAM_ON_RUN=1   ^(re-program the FPGA when the server starts^)
+echo   set ZLC_PS_HW_SERVER_URL=localhost:3121
+echo   set ZLC_PS_PROJECT_DIR=%%CD%%\fpga\build\ps
 exit /b 0
 
-:zlc_verify_address_switch_sources
-set "ZLC_DEFAULT_XDC=%REPO_ROOT%\references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc"
+:zlc_verify_sources
+set "ZLC_DEFAULT_XDC=%REPO_ROOT%\fpga\board_config\board.xdc"
 if not defined ZLC_PS_XDC set "ZLC_PS_XDC=%ZLC_DEFAULT_XDC%"
-set "ZLC_SELECTED_XDC=%ZLC_PS_XDC%"
-if not defined ZLC_SELECTED_XDC set "ZLC_SELECTED_XDC=%ZLC_PS_XDC%"
-if not defined ZLC_PS_XDC set "ZLC_PS_XDC=%ZLC_SELECTED_XDC%"
-if not exist "%STREAMER_DIR%\zlc_pulse_streamer_top_address_switch.v" (
-  echo ERROR: missing address-switch top HDL: %STREAMER_DIR%\zlc_pulse_streamer_top_address_switch.v
+if not exist "%STREAMER_DIR%\zlc_edge_streamer.v" (
+  echo ERROR: missing FINAL engine HDL: %STREAMER_DIR%\zlc_edge_streamer.v
   exit /b 2
 )
-if not exist "%STREAMER_DIR%\create_project_address_switch.tcl" (
-  echo ERROR: missing address-switch build Tcl: %STREAMER_DIR%\create_project_address_switch.tcl
+if not exist "%STREAMER_DIR%\zlc_pulse_streamer_top.v" (
+  echo ERROR: missing FINAL top HDL: %STREAMER_DIR%\zlc_pulse_streamer_top.v
   exit /b 2
 )
-findstr /C:".EDGE_ADDR_WIDTH(9)" "%STREAMER_DIR%\zlc_pulse_streamer_top_address_switch.v" >nul || (
-  echo ERROR: address-switch top is not the 512-edge build. Expected .EDGE_ADDR_WIDTH^(9^).
+if not exist "%STREAMER_DIR%\create_project.tcl" (
+  echo ERROR: missing FINAL build Tcl: %STREAMER_DIR%\create_project.tcl
   exit /b 2
 )
-findstr /C:".SCAN_ADDR_WIDTH(8)" "%STREAMER_DIR%\zlc_pulse_streamer_top_address_switch.v" >nul || (
-  echo ERROR: address-switch top is not the 256-scan-row build. Expected .SCAN_ADDR_WIDTH^(8^).
+findstr /C:"module zlc_pulse_streamer_top" "%STREAMER_DIR%\zlc_pulse_streamer_top.v" >nul || (
+  echo ERROR: FINAL top module name is wrong.
   exit /b 2
 )
-findstr /C:"localparam integer CHANNEL_COUNT = 62" "%STREAMER_DIR%\zlc_pulse_streamer_top_address_switch.v" >nul || (
-  echo ERROR: pulse-streamer top is not the 62-output address-switch wrapper.
+findstr /C:"module zlc_edge_streamer" "%STREAMER_DIR%\zlc_edge_streamer.v" >nul || (
+  echo ERROR: FINAL engine module name is wrong.
   exit /b 2
 )
-findstr /C:"CONFIG.C_PROBE_OUT3_WIDTH {9}" "%STREAMER_DIR%\create_project_address_switch.tcl" >nul || (
-  echo ERROR: create_project_address_switch.tcl has stale prog_addr width. Expected VIO probe_out3 width 9.
-  exit /b 2
-)
-findstr /C:"CONFIG.C_PROBE_OUT5_WIDTH {62}" "%STREAMER_DIR%\create_project_address_switch.tcl" >nul || (
-  echo ERROR: create_project_address_switch.tcl has stale mask width. Expected VIO probe_out5 width 62.
-  exit /b 2
-)
-findstr /C:"CONFIG.C_PROBE_OUT6_WIDTH {10}" "%STREAMER_DIR%\create_project_address_switch.tcl" >nul || (
-  echo ERROR: create_project_address_switch.tcl has stale prog_count width. Expected VIO probe_out6 width 10.
-  exit /b 2
-)
-findstr /C:"CONFIG.C_PROBE_OUT8_WIDTH {9}" "%STREAMER_DIR%\create_project_address_switch.tcl" >nul || (
-  echo ERROR: create_project_address_switch.tcl has stale loop_start_addr width. Expected VIO probe_out8 width 9.
-  exit /b 2
-)
-findstr /C:"CONFIG.C_NUM_PROBE_OUT {31}" "%STREAMER_DIR%\create_project_address_switch.tcl" >nul || (
-  echo ERROR: create_project_address_switch.tcl has stale VIO probe count. Expected 31 output probes for scan and analog bus support.
-  exit /b 2
-)
-findstr /C:"CONFIG.C_PROBE_OUT15_WIDTH {8}" "%STREAMER_DIR%\create_project_address_switch.tcl" >nul || (
-  echo ERROR: create_project_address_switch.tcl has stale scan_prog_addr width. Expected VIO probe_out15 width 8.
-  exit /b 2
-)
-findstr /C:"CONFIG.C_PROBE_OUT18_WIDTH {9}" "%STREAMER_DIR%\create_project_address_switch.tcl" >nul || (
-  echo ERROR: create_project_address_switch.tcl has stale scan_count width. Expected VIO probe_out18 width 9.
-  exit /b 2
-)
-findstr /C:"CONFIG.C_PROBE_OUT29_WIDTH {28}" "%STREAMER_DIR%\create_project_address_switch.tcl" >nul || (
-  echo ERROR: create_project_address_switch.tcl has stale bus_counts width. Expected VIO probe_out29 width 28.
-  exit /b 2
-)
-findstr /C:"CONFIG.C_PROBE_OUT30_WIDTH {40}" "%STREAMER_DIR%\create_project_address_switch.tcl" >nul || (
-  echo ERROR: create_project_address_switch.tcl has stale scan bus value width. Expected VIO probe_out30 width 40.
-  exit /b 2
-)
-if not exist "!ZLC_SELECTED_XDC!" (
-  echo ERROR: missing address-switch XDC: !ZLC_SELECTED_XDC!
-  echo Restore references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc or set ZLC_PS_XDC.
-  exit /b 2
-)
-findstr /C:"[get_ports trig]" "!ZLC_SELECTED_XDC!" >nul || (
-  echo ERROR: selected XDC does not define the address_switch trig output.
-  exit /b 2
-)
-findstr /C:"<PIN_CH" "!ZLC_SELECTED_XDC!" >nul && (
-  echo ERROR: selected XDC still contains PIN_CH placeholders: !ZLC_SELECTED_XDC!
-  exit /b 2
-)
-echo ZLC address-switch source contract: channels=62 max_edges=512 scan_rows=256 scan_bus_values=4x10 bus_segments=4x64 vio_outputs=31 edge_addr_width=9 scan_addr_width=8 bus_seg_addr_width=6 prog_count_width=10
-echo ZLC address-switch XDC: !ZLC_SELECTED_XDC!
+echo ZLC FINAL source contract: channels=62 num_slots=4 control=JTAG-to-AXI
 exit /b 0
 
 :zlc_default_paths
@@ -276,31 +192,11 @@ if defined ZLC_PS_PROJECT_DIR if "!ZLC_PS_PROJECT_DIR: =!"=="" set "ZLC_PS_PROJE
 if defined ZLC_PS_STATE_DIR if "!ZLC_PS_STATE_DIR: =!"=="" set "ZLC_PS_STATE_DIR="
 if not defined ZLC_PS_BUILD_ROOT set "ZLC_PS_BUILD_ROOT=%FPGA_DIR%build"
 if not exist "!ZLC_PS_BUILD_ROOT!\" mkdir "!ZLC_PS_BUILD_ROOT!" >nul 2>nul
-
-:zlc_have_build_root
-if not defined ZLC_PS_PROJECT_DIR set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\address_switch"
-if not defined ZLC_PS_STATE_DIR set "ZLC_PS_STATE_DIR=%ZLC_PS_BUILD_ROOT%\state_address_switch"
+rem In-repo build (fpga\build\ps); the SHORT "ps" subdir matches build_and_program
+rem so the server finds the bitstream under ps.runs\impl_1.
+if not defined ZLC_PS_PROJECT_DIR set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\ps"
+if not defined ZLC_PS_STATE_DIR set "ZLC_PS_STATE_DIR=%ZLC_PS_BUILD_ROOT%\state"
 echo ZLC build root: %ZLC_PS_BUILD_ROOT%
-if defined ZLC_PS_PROJECT_DIR if /I not "!ZLC_PS_PROJECT_DIR:pulse_streamer\build=!"=="!ZLC_PS_PROJECT_DIR!" (
-  echo Ignoring old pulse_streamer build-local ZLC_PS_PROJECT_DIR: !ZLC_PS_PROJECT_DIR!
-  set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\address_switch"
-)
-call :zlc_clear_unsafe_artifact ZLC_PS_VIVADO_PROJECT
-call :zlc_clear_unsafe_artifact ZLC_PS_VIVADO_BIT
-call :zlc_clear_unsafe_artifact ZLC_PS_VIVADO_LTX
-call :zlc_clear_unsafe_artifact ZLC_VIVADO_PROJECT
-call :zlc_clear_unsafe_artifact ZLC_VIVADO_BIT
-call :zlc_clear_unsafe_artifact ZLC_VIVADO_LTX
-exit /b 0
-
-:zlc_clear_unsafe_artifact
-set "ZLC_ARTIFACT_VAR=%~1"
-set "ZLC_ARTIFACT_VALUE=!%~1!"
-if not defined ZLC_ARTIFACT_VALUE exit /b 0
-if /I not "!ZLC_ARTIFACT_VALUE:pulse_streamer\build=!"=="!ZLC_ARTIFACT_VALUE!" (
-  echo Ignoring old pulse_streamer build-local %~1: !ZLC_ARTIFACT_VALUE!
-  set "%~1="
-)
 exit /b 0
 
 :zlc_find_python
@@ -349,6 +245,11 @@ if not "%ZLC_PS_VIVADO_BIN%"=="" goto zlc_vivado_found
 for %%V in (2019.1 2019.2 2020.1 2020.2 2021.1 2021.2 2022.1 2022.2 2023.1 2023.2 2024.1 2024.2 2025.1 2025.2) do (
   if exist "C:\Xilinx\Vivado\%%V\bin\vivado.bat" set "ZLC_PS_VIVADO_BIN=C:\Xilinx\Vivado\%%V\bin\vivado.bat"
   if exist "D:\Xilinx\Vivado\%%V\bin\vivado.bat" set "ZLC_PS_VIVADO_BIN=D:\Xilinx\Vivado\%%V\bin\vivado.bat"
+)
+rem Future-proof: also glob any Vivado version directory in the default install roots
+rem (so a newer release than the list above is still auto-found); last match wins (newest).
+for /d %%V in ("C:\Xilinx\Vivado\*" "D:\Xilinx\Vivado\*") do (
+  if exist "%%~V\bin\vivado.bat" set "ZLC_PS_VIVADO_BIN=%%~V\bin\vivado.bat"
 )
 if not "%ZLC_PS_VIVADO_BIN%"=="" goto zlc_vivado_found
 for /f "delims=" %%I in ('where vivado.bat 2^>nul') do if "%ZLC_PS_VIVADO_BIN%"=="" set "ZLC_PS_VIVADO_BIN=%%I"

@@ -1,6 +1,6 @@
 {
   "schema": "Zou_lab_control.neutral_atom.PulseTableState",
-  "version": 2,
+  "version": 3,
   "name": "camera_imaging_address_switch",
   "channels": [
     "ch00",
@@ -66,16 +66,6 @@
     "ch60",
     "ch61"
   ],
-  "x_ns": 0.0,
-  "y_ns": 0.0,
-  "scan_points": [],
-  "scan_variables": {
-    "camera_exposure_ns": 19980000.0
-  },
-  "scan_bindings": {
-    "period:3:duration": "camera_exposure_ns"
-  },
-  "scan_table_path": "",
   "time_step_ns": 20.0,
   "periods": [
     {
@@ -286,7 +276,7 @@
       ]
     },
     {
-      "duration": "camera_exposure_ns",
+      "duration": "s0",
       "unit": "str (ns)",
       "name": "camera_exposure",
       "states": [
@@ -550,5 +540,15 @@
   "repeat_start": null,
   "repeat_end": null,
   "repeat_count": 1,
-  "repeat_forever": true
+  "repeat_forever": true,
+  "scan_slots": [
+    {
+      "kind": "duration",
+      "target": "3",
+      "label": "exposure",
+      "unit": "ns",
+      "nominal": 19980000.0
+    }
+  ],
+  "scan_table": []
 }

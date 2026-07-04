@@ -12,14 +12,17 @@
           64
         ],
         "device_index": 0,
-        "timeout_ms": 10000
+        "timeout_ms": 10000,
+        "capture_trigger_channels": [
+          "ch11"
+        ]
       }
     }
   },
   "sequencer": {
     "type": "RemoteSequencer",
     "params": {
-      "host": "192.168.0.20",
+      "host": "FPGA_SERVER_IP",
       "port": 18861,
       "channels": [
         "ch00",
@@ -86,9 +89,6 @@
         "ch61"
       ],
       "clock_hz": 50000000.0,
-      "trigger_channels": [
-        "ch11"
-      ],
       "connect_on_init": false
     }
   }

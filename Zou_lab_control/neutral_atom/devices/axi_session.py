@@ -1,0 +1,1039 @@
+"""Persistent Vivado JTAG-to-AXI runtime session for the FINAL pulse streamer.
+
+Drives ``zlc_pulse_streamer_top`` + ``zlc_edge_streamer`` (1-tick FIFO prefetch +
+2-bank streaming scan) over the JTAG-to-AXI master.  It holds one persistent
+``vivado -mode tcl`` process, connects to the programmed FPGA, and:
+
+  * packs the compiled program into the BRAM image (:mod:`fpga.pulse_streamer.host.image`):
+    edges -> the 3 parallel TICK/COEFF/MASK BRAMs, the first two scan chunks ->
+    the ping-pong banks, the bus segments -> the bus-image BRAM, scalars -> CTRL,
+  * writes that image over AXI (``create_hw_axi_txn`` / ``run_hw_axi``),
+  * drives the CTRL COMMAND/STATUS mailbox (LOAD -> the top's mini-loader copies
+    the bus image into the engine + asserts LOADED; FIRE -> release reset + pulse
+    start; SAFE -> halt + reset),
+  * for an UNBOUNDED scan (N > 2*bank_size points) STREAMS: it polls the engine's
+    CURSOR, and as each ping-pong bank is freed behind the cursor it rewrites that
+    bank with the next chunk and re-arms its BANK_READY bit, so the scan-point
+    count is limited only by host memory.  A late refill makes the engine STALL
+    (STATUS underflow) -- it never emits a wrong point.
+
+There is NO min-edge-spacing constraint: the engine is 1-tick seamless.
+
+The Tcl execution is injectable (``tcl_executor``) so the whole
+prepare/fire/stream/wait_done/safe_state flow is tested without Vivado or
+hardware.  ``wait_done`` always bounds its poll, so the server can never busy-poll
+forever.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import queue
+import re
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import Callable, Sequence
+
+from .fpga_pulse_streamer import validate_pulse_streamer_program
+from fpga.pulse_streamer.host.image import (
+    StreamerParams,
+    CtrlWords,
+    CTRL_WORDS,
+    pack_program,
+    scan_bank_words,
+    region_bases,
+    default_params as _default_streamer_params,
+    CMD_LOAD,
+    CMD_FIRE,
+    CMD_SAFE,
+    STATUS_LOADED,
+    STATUS_RUNNING,
+    STATUS_DONE,
+    STATUS_ERROR,
+    REGISTER_LAYOUT_ID,
+)
+
+# Runtime clock + geometry default come from the single config file
+# (fpga/board_config/streamer_config.json via host.image).  The clock default has
+# ONE definition (sequencer.DEFAULT_RUNTIME_CLOCK_HZ, itself derived from that
+# config); we import it so the compile clock and this AXI runtime clock can never
+# diverge.  Importing it module-level is cycle-free: sequencer never imports this
+# module (its one back-reference at scan_progress_fields is a lazy in-function import).
+from .sequencer import DEFAULT_RUNTIME_CLOCK_HZ
+
+
+class _AxiAborted(Exception):
+    """Raised when an in-flight hw_axi read is interrupted by a stop request (the
+    streaming-refill thread being torn down on Off/prepare).  Distinct from
+    TimeoutError, which signals a real hardware fault."""
+
+
+# The default host geometry MUST match the built bitstream (create_project.tcl /
+# host.image.solve_capacity for the 35T): 4096 edges + bank_size 2048.  Sourced from
+# fpga/board_config/streamer_config.json so a geometry change is edited in ONE place.
+DEFAULT_PARAMS = _default_streamer_params()
+
+
+def _default_vivado() -> str:
+    for name in ("ZLC_PS_VIVADO_BIN", "ZLC_VIVADO_BIN"):
+        value = os.environ.get(name)
+        if value:
+            return value
+    return "vivado"
+
+
+def _default_artifact(suffix: str) -> str | None:
+    """Default bit/ltx path from the in-repo final build (fpga/build/ps)."""
+
+    env = {
+        ".bit": ("ZLC_PS_VIVADO_BIT", "ZLC_PS_BIT"),
+        ".ltx": ("ZLC_PS_VIVADO_LTX", "ZLC_PS_LTX"),
+    }.get(suffix, ())
+    for name in env:
+        value = os.environ.get(name)
+        if value:
+            return value
+    root = os.environ.get("ZLC_PS_PROJECT_DIR")
+    if not root:
+        return None
+    candidate = Path(root) / "ps.runs" / "impl_1" / f"zlc_pulse_streamer_top{suffix}"
+    return str(candidate) if candidate.exists() else None
+
+
+class VivadoAxiStreamerSession:
+    """Persistent Vivado hw_axi transport for the final pulse streamer."""
+
+    def __init__(
+        self,
+        *,
+        state_dir: str | Path,
+        vivado: str | None = None,
+        bitstream: str | None = None,
+        probes: str | None = None,
+        hw_server_url: str | None = None,
+        program_on_start: bool = False,
+        clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
+        params: StreamerParams | None = None,
+        startup_timeout: float = 180.0,
+        # Per-transaction ceiling.  Generous on purpose: JTAG ops normally finish in
+        # well under a second, but ONE transient slow transaction (USB hiccup, busy
+        # hw_server) must not tear the whole persistent session down -- a timeout here
+        # closes the session and forces a restart cycle.
+        action_timeout: float | None = 120.0,
+        load_timeout: float = 5.0,
+        write_batch: int = 200,
+        stream_poll_interval: float = 0.005,
+        burst_max: int = 256,
+        tcl_executor: Callable[[Sequence[str], str, float | None], str] | None = None,
+    ):
+        self.state_dir = Path(state_dir)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.vivado = vivado or _default_vivado()
+        self.bitstream = bitstream if bitstream is not None else _default_artifact(".bit")
+        self.probes = probes if probes is not None else _default_artifact(".ltx")
+        self.hw_server_url = hw_server_url or os.environ.get("ZLC_PS_HW_SERVER_URL") or os.environ.get("ZLC_HW_SERVER_URL") or ""
+        self.program_on_start = bool(program_on_start)
+        self.clock_hz = float(clock_hz)
+        self.params = params or DEFAULT_PARAMS
+        self.startup_timeout = float(startup_timeout)
+        self.action_timeout = action_timeout
+        self.load_timeout = float(load_timeout)
+        self.write_batch = max(1, int(write_batch))
+        # AXI4 INCR burst beats per transaction (AWLEN max => 256).  Address-contiguous
+        # queued words are coalesced into bursts so one ``run_hw_axi`` moves up to 256
+        # words instead of one -- the difference between a multi-second upload and a
+        # ~100 ms one over JTAG-to-AXI.  Requires the AXI4 (not AXI4-Lite) bitstream.
+        self.burst_max = max(1, min(256, int(burst_max)))
+        self.stream_poll_interval = float(stream_poll_interval)
+
+        self._pending: list[tuple[int, int]] = []  # (byte_addr, value) queued writes
+        # DELAY-TAIL DRAIN accounting.  The engine raises DONE the instant the UNDELAYED
+        # stream ends; the event schedulers then keep EMITTING the queued tail for up to
+        # max(delay) more ticks (out[t] = in[t-d] must hold for the WHOLE stream).  The
+        # host owns that tail: wait_done() waits it out after DONE, and prepare()/fire()
+        # refuse to reset/restart the engine before the previous run's drain deadline
+        # (an EXPLICIT safe_state()/off_pulse stays immediate by design).
+        self._tail_seconds: float = 0.0      # max(channel+bus delay) of the prepared program
+        self._drain_until: float = 0.0       # monotonic deadline of the previous finite run
+        self._repeat_forever = False
+        self._program = None          # last prepared program (for streaming refills)
+        self._total_points = 0
+        self._total_chunks = 1
+        self._scan_repeats = 0        # 0 = sweep forever; K>=1 = stop after K whole sweeps
+        self._scan_point = 0          # current scan point within the sweep (mirror for scan_progress)
+        self._scan_sweep = 0          # current 0-based sweep index
+        self._scan_finished = False   # latched once a finite scan has played its K sweeps
+        self._next_chunk = 2          # finite-streaming cursor (instance state -> re-entrant)
+        self._bank_ready = 0b11
+        # RLock (not Lock): a transaction runs under this lock, and if the persistent
+        # Vivado was torn down (a prior action timeout / broken pipe), the NEXT _execute
+        # auto-restarts via start() -> _run_tcl, which RE-acquires this lock on the SAME
+        # thread.  A plain Lock would deadlock there (the restart would hang forever and
+        # force a server restart); RLock lets the same thread re-enter while still
+        # excluding the streaming-refill thread.
+        self._io_lock = threading.RLock()   # serialise AXI access (main + stream thread)
+        self._stream_thread: threading.Thread | None = None
+        self._stream_stop: threading.Event | None = None
+
+        self._process: subprocess.Popen | None = None
+        self._reader: threading.Thread | None = None
+        self._queue: "queue.Queue[str | None]" = queue.Queue()
+        self._counter = 0
+        self._closed = False
+        self._log_path = self.state_dir / "vivado_axi_session.log"
+        self._external_executor = tcl_executor
+
+    # ------------------------------------------------------------------ lifecycle
+    def start(self) -> "VivadoAxiStreamerSession":
+        if self._external_executor is not None or self._process is not None:
+            return self
+        # (Re)opening: clear the closed flag so a later close() actually tears the new
+        # process down (otherwise a session that was close()d once then restarted would
+        # never close again -- the double-close guard would short-circuit it).
+        self._closed = False
+        # A fresh session is a CLEAN SLATE: words queued by a transaction that died with
+        # the previous process must not be flushed into the new one (they belong to an
+        # upload that will be re-packed from scratch by the next prepare()).
+        self._pending = []
+        try:
+            process = subprocess.Popen(
+                [self.vivado, "-mode", "tcl", "-nolog", "-nojournal"],
+                cwd=self.state_dir,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError as exc:
+            message = (
+                f"Vivado executable was not found: {self.vivado!r}.\n"
+                "Set ZLC_PS_VIVADO_BIN or ZLC_VIVADO_BIN to the full Vivado executable path."
+            )
+            self._write_action_log("vivado_axi_session_start", message)
+            raise RuntimeError(
+                f"pulse-streamer session could not start persistent Vivado. See {self.state_dir / 'vivado_axi_session_start.log'}."
+            ) from exc
+        self._process = process
+        # Each process GENERATION gets its OWN stdout queue, and the reader thread is
+        # bound to (process, queue) ARGUMENTS -- never to self.  The old generation's
+        # reader pushes its EOF sentinel (None) into the OLD queue only.  With a single
+        # shared queue, that stale sentinel POISONED every restart: the next transaction
+        # read it and raised "process exited unexpectedly", the retry killed its fresh
+        # process (whose reader enqueued the next sentinel), and so on forever -- the
+        # session could never self-heal and the whole server had to be restarted.
+        generation_queue: "queue.Queue[str | None]" = queue.Queue()
+        self._queue = generation_queue
+        self._reader = threading.Thread(
+            target=self._read_stdout, args=(process, generation_queue),
+            name="zlc-vivado-axi-reader", daemon=True)
+        self._reader.start()
+        self._run_tcl(self._init_tcl(), action="vivado_axi_session_start", timeout=self.startup_timeout)
+        return self
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        # SHORT join only: close() often runs on a failure path while THIS thread holds
+        # _io_lock (e.g. the transaction-timeout path inside _read_until_marker), and the
+        # stream thread may be blocked waiting for that very lock -- it cannot exit until
+        # we release it, so a long join here just stalls the teardown.  A still-alive
+        # thread keeps its handle and is reaped by the next prepare()/safe_state().
+        self._stop_stream_thread(join_timeout=2.0)
+        process = self._process
+        if process is None:
+            return
+        try:
+            if process.stdin is not None:
+                # Release the JTAG / dbg_hub lock on the hw_server BEFORE the Tcl process exits.
+                # Vivado's hw_server keeps the target OPEN when the client merely exits, so a REOPEN
+                # ("close the pulse GUI, open it again") then finds the target still held and
+                # get_hw_axis comes back empty -> "No JTAG-to-AXI (hw_axi) core found" until the whole
+                # server is rebooted.  A clean close_hw_target + disconnect_hw_server hands the lock
+                # back deterministically; both are catch-wrapped so a wedged session still exits (#5b-B).
+                process.stdin.write("catch {close_hw_target}\ncatch {disconnect_hw_server}\nexit\n")
+                process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=3)        # let SIGTERM/teardown land...
+            except subprocess.TimeoutExpired:
+                process.kill()                 # ...else force-reap so it can't linger holding the lock
+        self._process = None
+
+    def _ensure_process(self) -> None:
+        """(Re)start the persistent Vivado for the NEXT transaction, retrying the
+        hardware/debug-core reconnect a few times.  After a close() (an action timeout or
+        broken pipe replaced a wedged Vivado), the freshly spawned process can briefly
+        fail ``get_hw_axis`` with a 'debug core' / 'No JTAG-to-AXI core' error because the
+        previous process has not yet released the JTAG / dbg_hub lock.  A short backoff
+        lets the lock release so the session SELF-HEALS instead of forcing the user to
+        restart the whole server.  No-op (and zero risk) on the happy path: returns
+        immediately while the process is already running."""
+        if self._external_executor is not None or self._process is not None:
+            return
+        attempts = max(1, int(getattr(self, "restart_attempts", 3)))
+        last_exc: "Exception | None" = None
+        for i in range(attempts):
+            try:
+                self.start()
+                return
+            except Exception as exc:           # bring-up / reconnect failed -> drop + retry
+                last_exc = exc
+                self._kill_process()
+                if i + 1 < attempts:
+                    time.sleep(min(5.0, 1.0 * (i + 1)))
+        if last_exc is not None:
+            raise last_exc
+
+    def _kill_process(self) -> None:
+        """Force-kill the persistent Vivado WITHOUT close()'s stream-thread join: this
+        runs from _ensure_process while the caller may hold _io_lock, and joining the
+        refill thread (which itself can want _io_lock) there could deadlock."""
+        proc = self._process
+        self._process = None
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------ Tcl build
+    def _init_tcl(self) -> list[str]:
+        lines = [
+            "if {[llength [info commands load_features]]} { catch {load_features labtools} }",
+            "if {[llength [info commands open_hw_manager]]} { open_hw_manager } elseif {[llength [info commands open_hw]]} { open_hw }",
+        ]
+        if self.hw_server_url:
+            lines.append(f"connect_hw_server -url {self.hw_server_url}")
+        else:
+            lines.append("if {[catch {connect_hw_server}]} { connect_hw_server }")
+        lines += [
+            "catch {refresh_hw_server}",
+            "set zlc_targets [get_hw_targets]",
+            'if {$zlc_targets eq ""} { error "No Vivado hardware target. Check the JTAG cable and board power." }',
+            "current_hw_target [lindex $zlc_targets 0]",
+            # Retry a failed open PLAINLY after a short settle (the previous -- killed --
+            # process may not have released the target yet).  NEVER fall back to
+            # `open_hw_target -jtag_mode on`: raw JTAG mode does not enumerate debug
+            # cores, so get_hw_axis comes back empty and every restart attempt then
+            # fails with a "no debug core" error until the whole server is rebooted.
+            "if {[catch {open_hw_target}]} { catch {close_hw_target}; after 2000; open_hw_target }",
+            "current_hw_device [lindex [get_hw_devices] 0]",
+        ]
+        if self.probes:
+            lines.append(f'set_property PROBES.FILE {{{self.probes}}} [current_hw_device]')
+            lines.append(f'set_property FULL_PROBES.FILE {{{self.probes}}} [current_hw_device]')
+        if self.program_on_start and self.bitstream:
+            lines.append(f'set_property PROGRAM.FILE {{{self.bitstream}}} [current_hw_device]')
+            lines.append("program_hw_devices [current_hw_device]")
+        lines.append("refresh_hw_device [current_hw_device]")
+        lines += [
+            "set zlc_axi [get_hw_axis]",
+            'if {$zlc_axi eq ""} { error "No JTAG-to-AXI (hw_axi) core found. Program the bitstream first (build_and_program.bat), and check the .ltx probes file." }',
+            'puts "ZLC hw_axi cores: $zlc_axi"',
+        ]
+        return lines
+
+    @staticmethod
+    def _write_burst_tcl(byte_addr: int, values: Sequence[int]) -> list[str]:
+        """One AXI write transaction for ``values`` at consecutive word addresses
+        starting at ``byte_addr``.  For len > 1 this is a single INCR burst (needs the
+        AXI4 bitstream).  Vivado ``create_hw_axi_txn -data`` for a burst is ONE
+        concatenated hex value whose LEAST-significant (rightmost) word goes to the
+        BASE address, so the per-beat words are emitted high-address-first."""
+
+        addr = f"{byte_addr & 0xFFFFFFFF:08X}"
+        n = len(values)
+        if n == 1:
+            data = f"{int(values[0]) & 0xFFFFFFFF:08X}"
+        else:
+            data = "".join(f"{int(v) & 0xFFFFFFFF:08X}" for v in reversed(values))
+        # -burst INCR is explicit: the default burst type is not guaranteed INCR across
+        # Vivado versions, and FIXED would write every beat to the BASE address (silent
+        # corruption).  -size is omitted (defaults to the 32-bit bus width).
+        return [
+            f"create_hw_axi_txn zlc_w [get_hw_axis] -address {addr} -data {data} -len {n} -type write -burst INCR",
+            "run_hw_axi zlc_w",
+            "delete_hw_axi_txn zlc_w",
+        ]
+
+    def _burst_runs(self, pending: Sequence[tuple[int, int]]) -> list[tuple[int, list[int]]]:
+        """Coalesce queued (byte_addr, value) writes into ``(base, [values])`` bursts.
+
+        Runs are built in INSERTION ORDER -- never globally sorted -- so an
+        order-dependent command sequence (e.g. COMMAND 0 then COMMAND cmd, or
+        BANK_READY de-arm then re-arm at the SAME address) keeps its order and stays a
+        sequence of len-1 writes.  Only consecutive, strictly address-contiguous
+        (stride 4) entries merge, capped at ``burst_max`` beats."""
+
+        runs: list[tuple[int, list[int]]] = []
+        i = 0
+        n = len(pending)
+        while i < n:
+            base, val = pending[i]
+            vals = [val]
+            j = i + 1
+            while (
+                j < n
+                and len(vals) < self.burst_max
+                and pending[j][0] == base + 4 * len(vals)
+            ):
+                vals.append(pending[j][1])
+                j += 1
+            runs.append((base, vals))
+            i = j
+        return runs
+
+    @staticmethod
+    def _read_txn_tcl(byte_addr: int, marker: str) -> list[str]:
+        addr = f"{byte_addr & 0xFFFFFFFF:08X}"
+        return [
+            f"create_hw_axi_txn zlc_r [get_hw_axis] -address {addr} -len 1 -type read",
+            "run_hw_axi zlc_r",
+            f'puts "{marker} [get_property DATA [get_hw_axi_txns zlc_r]]"',
+            "delete_hw_axi_txn zlc_r",
+        ]
+
+    # ------------------------------------------------------------- word I/O
+    def _queue_word(self, word_offset: int, value: int) -> None:
+        self._pending.append((int(word_offset) * 4, int(value) & 0xFFFFFFFF))
+
+    def _read_word(self, word_offset: int, *, stop: "threading.Event | None" = None) -> int:
+        self._flush(stop=stop)
+        marker = "ZLCDATA"
+        out = self._run_tcl(self._read_txn_tcl(int(word_offset) * 4, marker), action="axi_read", timeout=self.action_timeout, stop=stop)
+        return self._parse_read(out, marker)
+
+    @staticmethod
+    def _parse_read(output: str, marker: str) -> int:
+        match = None
+        for line in output.splitlines():
+            if marker in line:
+                match = line.split(marker, 1)[1].strip()
+        if not match:
+            raise RuntimeError("hw_axi read returned no DATA.")
+        token = match.split()[-1].replace("0x", "").replace("0X", "")
+        token = re.sub(r"[^0-9a-fA-F]", "", token) or "0"
+        return int(token, 16) & 0xFFFFFFFF
+
+    def _flush(self, *, stop: "threading.Event | None" = None) -> None:
+        if not self._pending:
+            return
+        pending = self._pending
+        self._pending = []
+        runs = self._burst_runs(pending)
+        # Send several bursts per Vivado round-trip (amortise the host<->Tcl latency);
+        # write_batch bounds the bursts-per-round-trip, not the words.
+        lines: list[str] = []
+        bursts = 0
+        for base, values in runs:
+            lines.extend(self._write_burst_tcl(base, values))
+            bursts += 1
+            if bursts >= self.write_batch:
+                self._run_tcl(lines, action="axi_write", timeout=self.action_timeout, stop=stop)
+                lines = []
+                bursts = 0
+        if lines:
+            self._run_tcl(lines, action="axi_write", timeout=self.action_timeout, stop=stop)
+
+    # --------------------------------------------------------------- sequencer API
+    def check_register_layout(self) -> None:
+        """Verify the bitstream's hardwired register-layout id matches this host.
+
+        The top returns ``ZLC_LAYOUT_ID`` on every AXI read of CTRL word 63
+        (``CtrlWords.LAYOUT_ID``); it must equal ``image.REGISTER_LAYOUT_ID``.  A mismatch
+        means the programmed bitstream was built for a DIFFERENT CtrlWords layout than this
+        host -- every layout-dependent write (the clk mask, the scratch/self-test range,
+        future moves) would silently land in the wrong registers.  That EXACTLY happened
+        when CLK_ENABLE moved 46->20 without a rebuild: the mask went to dead words, the
+        real clk mask kept a stale value, and the DAC strobes ran uncontrolled (garbled
+        first-frame DA output on real hardware).  Fail FAST and tell the user to rebuild."""
+
+        got = self._read_word(CtrlWords.LAYOUT_ID)
+        if got != REGISTER_LAYOUT_ID:
+            raise RuntimeError(
+                f"register-layout mismatch: bitstream reports 0x{got & 0xFFFFFFFF:08X} at CTRL "
+                f"word {CtrlWords.LAYOUT_ID} but this host expects 0x{REGISTER_LAYOUT_ID:08X}. "
+                "The programmed bitstream was built for a different register layout than this "
+                "host software (an old .bit returns 0 here).  Rebuild the bitstream "
+                "(fpga/build_and_program.bat) and restart the server TOGETHER -- running a "
+                "mismatched pair silently writes the wrong registers (e.g. the DAC clk mask)."
+            )
+
+    def prepare(self, program) -> None:
+        """Pack the program into the BRAM image, upload it over AXI, then command
+        the top's mini-loader to copy the bus image into the engine (LOAD)."""
+
+        self._stop_stream_thread()             # any prior streaming refill must end first
+        p = self.params
+        points = list(getattr(program, "scan_points", []) or [])
+        self._program = program
+        self._total_points = len(points)
+        self._total_chunks = max(1, math.ceil(self._total_points / p.bank_size)) if self._total_points else 1
+        self._repeat_forever = bool(getattr(program, "repeat_forever", False))
+        # Finite scan-repeat (0 = sweep forever): the streaming refill thread counts CURSOR wraps
+        # and stops the engine after K whole sweeps.  _scan_point / _scan_sweep mirror where the
+        # engine is for scan_progress(); _scan_finished latches the finite stop so a blocking
+        # wait_done returns done.
+        self._scan_repeats = max(0, int(getattr(program, "scan_repeats", 0)))
+        self._scan_point = 0
+        self._scan_sweep = 0
+        self._scan_finished = False
+        # Independently validate before upload (defence in depth -- a non-monotonic
+        # effective-tick program would silently drop edges on hardware).  Allow the
+        # full scan-point count (streaming is unbounded) by raising the cap to N.
+        validate_pulse_streamer_program(
+            program,
+            max_edges=p.max_edges,
+            max_scan_points=max(1, self._total_points),
+            max_bus_segments=p.max_bus_segments,
+            tick_width=p.tick_width,
+            channel_count=len(program.channels),
+            coeff_width=p.coeff_width,
+            num_slots=p.num_slots,
+            bus_count=p.bus_count,
+            bus_width=p.bus_width,
+            # bound the monotonicity sweep so a million-point streamed scan does not
+            # hang prepare(); the per-slot extreme points are always included.
+            max_validated_scan_points=max(4096, 2 * p.bank_size),
+        )
+        image = pack_program(program, p)
+        # Before the FIRST hardware write: refuse a bitstream built for another register
+        # layout (validation above is pure software, so a bad program errors without
+        # touching hardware; a mismatched bitstream errors before any register changes).
+        self.check_register_layout()
+        # DELAY-TAIL DRAIN: if the PREVIOUS finite run had delayed signals, its event
+        # schedulers are still emitting the queued tail after DONE (out[t] = in[t-d]
+        # holds for the whole stream).  CMD_SAFE would chop that tail, so wait out the
+        # remainder -- but ONLY when the undelayed stream has already ENDED
+        # (STATUS_DONE).  Preparing over a still-RUNNING program is an explicit
+        # program switch and keeps the abort-immediately semantics; an explicit
+        # safe_state()/off_pulse does not wait either -- stopping at once is its job.
+        if self._drain_until > 0.0:
+            remaining = self._drain_until - time.monotonic()
+            if remaining > 0:
+                try:
+                    st = int(self._read_word(CtrlWords.STATUS))
+                except Exception:
+                    st = 0
+                if st & STATUS_DONE:
+                    # wait_done() re-anchors _drain_until at the OBSERVED done instant,
+                    # so `remaining` is exact in the normal prepare->fire->wait_done
+                    # flow; without a wait_done the fire-time estimate applies, capped
+                    # at one full tail (the 32-bit delay field, <= ~42.9 s).
+                    # _tail_seconds still holds the PREVIOUS program's tail here -- it
+                    # is recomputed for the new program below.
+                    time.sleep(min(remaining, self._tail_seconds))
+            self._drain_until = 0.0
+        # this program's own tail (max channel/bus delay), used by fire()/wait_done()
+        clock = float(getattr(program, "clock_hz", 0.0) or DEFAULT_RUNTIME_CLOCK_HZ)
+        tail_ticks = [int(d) for d in (getattr(program, "channel_delays", None) or [])]
+        tail_ticks += [int(getattr(bd, "delay", 0)) for bd in (getattr(program, "bus_delays", None) or [])]
+        self._tail_seconds = (max(tail_ticks) / clock) if tail_ticks else 0.0
+        # Halt + reset first so a prior run cannot drive outputs while we rewrite BRAM.
+        self._command(CMD_SAFE)
+        for word_offset in sorted(image):
+            self._queue_word(word_offset, image[word_offset])
+        # banks 0 and 1 are resident after pack_program (bank_chunk 0/1 set in the
+        # image) -> arm both ready bits.
+        self._queue_word(CtrlWords.BANK_READY, 0b11)
+        self._flush()
+        # The mini-loader asserts LOADED within microseconds of CMD_LOAD on real
+        # hardware, so wait only a few seconds: a missing LOADED means a wedged
+        # bring-up (bad .bit/.ltx, JTAG, or AXI), which should surface as a prompt
+        # error -- not a 120 s freeze.
+        if not self._command(CMD_LOAD, wait_mask=STATUS_LOADED, timeout=self.load_timeout):
+            status = self._read_word(CtrlWords.STATUS)
+            raise RuntimeError(
+                "pulse streamer did not report LOADED after the program upload "
+                f"(STATUS=0x{status:08X}; check the .bit/.ltx, the JTAG cable, and that "
+                "run_server programmed the current bitstream)."
+            )
+
+    def axi_self_test(self, *, count: int = 16) -> bool:
+        """Bring-up check for the AXI4 burst path: burst-write a known ramp into a SCRATCH
+        range of the CTRL register file, read it back single-beat, and confirm it matches.
+
+        The CTRL register file is the ONLY AXI-READABLE region -- the image BRAMs (tick /
+        coeff / mask / scan / bus) are write-only from the AXI side (their port-A
+        ``douta`` is unconnected; the engine reads them via port B), so an AXI read-back of
+        any BRAM region always returns 0 and cannot verify anything.  CTRL goes through the
+        SAME ``axi_bram_ctrl`` -> external-BMG native port as the BRAM regions, so a burst
+        to CTRL exercises the identical INCR address/data path and still catches the one
+        silent failure mode -- a wrong ``create_hw_axi_txn -data`` burst byte order (or a
+        still-AXI4-Lite bitstream that ignores ``-len``) -- BEFORE any real pulse upload.
+
+        The scratch words sit ABOVE every defined CTRL word -- the highest is the top
+        CLK_ENABLE word (params.ctrl_scratch_base - 1; commands 0..19, then the CLK_ENABLE
+        mask -- there are no delay-tick CTRL words) -- so writing them has NO side effect:
+        no COMMAND, and critically no CLK_ENABLE bit is touched (a clk_en bit set here
+        would drive that channel's pin at 50 MHz until the next prepare).  HARDWARE
+        REGRESSION GUARD: a stale hard-coded scratch=32 used to land inside CTRL words
+        and clk-enabled random channels at server bring-up.  The scratch is zeroed
+        afterwards.  Returns True on success; raises on mismatch."""
+
+        from fpga.pulse_streamer.host.image import CTRL_WORDS
+
+        # FIRST: refuse a bitstream built for a different register layout -- writing the
+        # scratch ramp (or anything else) into a mismatched layout scribbles real registers.
+        self.check_register_layout()
+
+        ctrl_base = region_bases(self.params)["ctrl"]
+        scratch = self.params.ctrl_scratch_base   # first word above ALL defined CtrlWords
+        n = max(2, min(int(count), CTRL_WORDS - scratch))
+        base = ctrl_base + scratch
+        pattern = [(0xC0DE0000 + i) & 0xFFFFFFFF for i in range(n)]
+        self._stop_stream_thread()
+        for offset, value in enumerate(pattern):
+            self._queue_word(base + offset, value)
+        self._flush()                      # one contiguous INCR burst
+        read = [self._read_word(base + offset) for offset in range(n)]
+        if read != pattern:
+            raise RuntimeError(
+                "AXI burst self-test FAILED -- the uploaded ramp read back scrambled or "
+                "empty, so the burst -data byte order is wrong or the bitstream is not the "
+                "current AXI4 build (an AXI4-Lite or stale bitstream ignores -len / the new "
+                f"address map).  wrote={[hex(v) for v in pattern[:4]]}... "
+                f"read={[hex(v) for v in read[:4]]}...  If read is all-zero, re-run "
+                "build_and_program to load the CURRENT bitstream, then restart the server."
+            )
+        # leave the register file as we found it (all-zero scratch)
+        for offset in range(n):
+            self._queue_word(base + offset, 0)
+        self._flush()
+        return True
+
+    def clear_host_config(self) -> None:
+        """Zero every host-owned CONFIG register -- LAYOUT-AGNOSTICALLY -- then halt the
+        engine (CMD_SAFE).
+
+        Run at server bring-up so a restart ALWAYS lands in a clean, silent state.
+
+        The sweep deliberately does NOT derive its range from the CURRENT CtrlWords map:
+        that was a real bug.  The old loop cleared only the words this host's map called
+        config (CLK_ENABLE..scratch_base = words 20..21 on layout v2), so on a bitstream
+        built for ANOTHER layout the stale registers it actually mattered to clear -- the
+        v1 clk mask at words 46/47 -- stayed live, and the uncontrolled da_clk strobes
+        garbled the DAC output.  In EVERY layout version, CTRL words 0..19 are the
+        command/status/streaming mailbox (never written blind) and words 20..63 have only
+        ever held host-owned config (dense delay words / clk mask / scratch / reserved;
+        word 63's readback is the hardwired layout id, so writing it is a no-op on v2),
+        so zeroing the WHOLE 20..63 span is always safe and clears the stale config of
+        whatever layout the bitstream was built for.  The R_DELAY register region is
+        host-owned config too: zero its full reserved span (delay_region_words), not just
+        the words the current geometry uses.  prepare() rewrites everything it needs from
+        the program image; this only guarantees the idle state."""
+
+        bases = region_bases(self.params)
+        for word in range(20, CTRL_WORDS):
+            self._queue_word(bases["ctrl"] + word, 0)
+        for word in range(self.params.delay_region_words):
+            self._queue_word(bases["delay"] + word, 0)
+        self._flush()
+        self._command(CMD_SAFE)
+
+    def fire(self, program=None) -> None:
+        if program is not None:
+            self.prepare(program)
+        # finite-streaming cursor state lives on the instance so wait_done is
+        # re-entrant (a second call resumes the refill instead of reloading chunk 2
+        # over whatever the freed bank now holds).
+        self._next_chunk = 2          # chunks 0,1 resident after prepare
+        self._bank_ready = 0b11
+        # Re-arm BOTH ping-pong banks on the FPGA before firing.  prepare() already
+        # set this, but a standalone fire() (program=None, e.g. re-fire after a prior
+        # repeat_forever STREAMED run that left BANK_READY de-armed mid-refill) must
+        # not start the engine against a stale, half-armed bank mask.
+        self._queue_word(CtrlWords.BANK_READY, 0b11)
+        self._flush()
+        # DIAGNOSTIC (re-fire "no output"): report engine STATUS just before + after FIRE so a
+        # failed re-arm is localized.  STATUS bits: 0=LOADED 1=RUNNING 2=DONE 4=UNDERFLOW.
+        # Expect: before=LOADED(0x1) -> after=RUNNING(0x2).  Stuck at 0x1/0x0 => FIRE did not
+        # start the engine (top FIRE-gate / start pulse); RUNNING but no pulses => output path.
+        # NOTE: do NOT sleep here -- a STREAMED scan must start its refill thread the instant
+        # the engine starts, or the FPGA drains both ping-pong banks before the host refills.
+        try:
+            st_before = self._read_word(CtrlWords.STATUS)
+        except Exception:
+            st_before = -1
+        self._command(CMD_FIRE)
+        (self.state_dir / "fire_time.txt").write_text(str(time.monotonic()), encoding="utf-8")
+        # finite run with delayed signals: record the drain deadline (fire + undelayed
+        # duration + tail) so a back-to-back prepare() cannot chop the delayed tail.
+        # repeat_forever has no natural end -- switching programs is an explicit stop.
+        if not self._repeat_forever and self._tail_seconds > 0:
+            dur_s = float(getattr(self._program, "duration", 0.0) or 0.0) * 1e-9
+            self._drain_until = time.monotonic() + dur_s + self._tail_seconds
+        # a repeat_forever STREAMED scan (> 2 banks) must be fed continuously while it
+        # re-sweeps; a background thread keeps the ping-pong banks loaded.  Start it FIRST,
+        # then read STATUS (a plain read, no sleep) so the diagnostic never delays streaming.
+        self._start_stream_thread()
+        try:
+            st_after = self._read_word(CtrlWords.STATUS)
+            print(f"ZLC FIRE diag: STATUS before=0x{st_before & 0xffffffff:X} "
+                  f"after=0x{st_after & 0xffffffff:X} (bit0=LOADED 1=RUNNING 2=DONE 4=UNDERFLOW)",
+                  flush=True)
+        except Exception as exc:
+            print(f"ZLC FIRE diag: STATUS read failed: {exc}", flush=True)
+
+    # --- streaming refill primitive -----------------------------------------
+    def _load_chunk(self, mono: int, bank_ready: int, *, stop: "threading.Event | None" = None) -> int:
+        """Load MONOTONIC chunk position ``mono`` into its ping-pong bank and return the
+        new BANK_READY mask.  CONTINUOUS CYCLIC PING-PONG: the data chunk is ``mono % K``
+        and the bank is ``mono % 2`` -- so the host streams chunks 0,1,..,K-1,0,1,.. into
+        the ALTERNATING bank forever, matching the engine's scan_bank_base parity.  The
+        bank_chunk handshake records the DATA chunk (what the engine's resident check
+        compares).  De-arm, write, record chunk, re-arm -- the engine STALLS on a bank
+        mid-rewrite and only accepts it once it truly holds the right chunk.  (For a finite
+        single sweep mono < K so mono%K == mono and mono%2 == mono%2 -- identical to before.)"""
+
+        p = self.params
+        k = max(1, self._total_chunks)
+        bank = mono % 2
+        data_chunk = mono % k
+        refill = scan_bank_words(self._program, p, data_chunk, target_bank=bank)
+        bank_ready &= ~(1 << bank)
+        self._queue_word(CtrlWords.BANK_READY, bank_ready)        # de-arm during rewrite
+        for off in sorted(refill):
+            self._queue_word(off, refill[off])
+        self._queue_word(CtrlWords.BANK0_CHUNK if bank == 0 else CtrlWords.BANK1_CHUNK, data_chunk)
+        bank_ready |= (1 << bank)
+        self._queue_word(CtrlWords.BANK_READY, bank_ready)        # re-arm
+        self._flush(stop=stop)
+        return bank_ready
+
+    def wait_done(self, program=None, timeout: float | None = None) -> bool:
+        """Poll to completion.  A finite scan with N > 2*bank_size STREAMS here:
+        each ping-pong bank is refilled as the cursor frees it (with the bank_chunk
+        handshake) so the whole N-point sweep plays gaplessly.  A repeat_forever
+        streamed scan is fed by a background thread (started at fire); this returns
+        once RUNNING is observed (DONE never asserts for repeat_forever)."""
+
+        effective = float(timeout) if timeout is not None else float(self.action_timeout or 600.0)
+        deadline = time.monotonic() + max(0.0, effective)
+        p = self.params
+        bank_size = p.bank_size
+        total_chunks = self._total_chunks
+
+        while True:
+            # A FINITE scan-repeat (scan_repeats=K>0) is driven by the streaming thread, which
+            # halts the engine after K whole sweeps and latches _scan_finished; a blocking
+            # wait_done returns the instant that happens (DONE is not asserted by CMD_SAFE).
+            if self._scan_finished:
+                return True
+            status = self._read_word(CtrlWords.STATUS)
+            if status & STATUS_DONE:
+                # DONE means the UNDELAYED stream ended; delayed signals keep emitting
+                # their queued tail for up to max(delay) more.  Re-anchor the drain
+                # deadline at the OBSERVED done instant (the fire-time estimate cannot
+                # see streaming stalls), wait it out within the caller's budget, and
+                # clear it ONLY once fully drained -- if the budget runs out first the
+                # deadline stays armed so the next prepare() still cannot chop the
+                # remaining tail.
+                if self._tail_seconds > 0:
+                    self._drain_until = time.monotonic() + self._tail_seconds
+                    time.sleep(max(0.0, min(self._tail_seconds, deadline - time.monotonic())))
+                if time.monotonic() >= self._drain_until:
+                    self._drain_until = 0.0
+                return True
+            if self._repeat_forever and (status & STATUS_RUNNING):
+                return True            # background thread keeps a streamed re-sweep fed
+            if status & STATUS_ERROR:
+                raise RuntimeError("pulse streamer reported STATUS_ERROR (bad image magic?).")
+            # STATUS_UNDERFLOW is a TRANSIENT streaming stall (the engine reached a
+            # bank not yet refilled), NOT a fatal error -- a distinct bit from
+            # STATUS_ERROR on purpose; keep polling/refilling and it resumes the
+            # instant the bank is armed.  (Guarded by test_final_status_bits_match_host.)
+
+            # --- finite streaming refill: load the next chunk into the freed bank ---
+            # (next_chunk / bank_ready live on the instance so this is re-entrant.)
+            if self._next_chunk < total_chunks:
+                cursor = self._read_word(CtrlWords.CURSOR)
+                # chunk (next_chunk-2) lives in bank next_chunk%2; it is fully
+                # consumed once cursor >= (next_chunk-1)*bank_size, freeing that bank.
+                if cursor >= (self._next_chunk - 1) * bank_size:
+                    self._bank_ready = self._load_chunk(self._next_chunk, self._bank_ready)
+                    self._next_chunk += 1
+                    continue           # re-check status/cursor promptly while streaming
+
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(self.stream_poll_interval if self._next_chunk < total_chunks else 0.01)
+
+    # --- repeat_forever streamed re-sweep: background CONTINUOUS CYCLIC refill ----
+    def _stream_refill_loop(self) -> None:
+        """Keep a repeat_forever STREAMED scan fed forever with CONTINUOUS CYCLIC
+        ping-pong: stream MONOTONIC chunk positions 2,3,4,.. (data chunk = mono % K,
+        bank = mono % 2) one-ahead of the engine, FOREVER.  The sweep WRAP is just
+        another chunk boundary -- chunk 0 is fed into the alternating bank one-ahead
+        like every other chunk, so the re-sweep is SEAMLESS (no special reload, no
+        inter-sweep hold).  Matches the engine's scan_bank_base parity (toggles by
+        K&1 each wrap).  The engine's monotonic position is reconstructed from the
+        CURSOR plus wrap detection.  Runs until _stop_stream_thread()."""
+
+        p = self.params
+        bank_size = p.bank_size
+        K = max(1, self._total_chunks)
+        N = self._total_points
+        next_mono = 2                 # chunks 0,1 were preloaded at mono 0,1 by pack_program
+        bank_ready = 0b11
+        sweeps = 0
+        prev_cursor = 0
+        stop = self._stream_stop
+        # A FINITE single-pass scan (repeat_forever=False) is refilled SYNCHRONOUSLY by wait_done's
+        # finite-streaming-refill path and stops itself at STATUS_DONE -- this thread then only MONITORS
+        # the cursor to advance the scan_progress() mirror (no chunk refill, no sweep stop) so it can
+        # never collide with wait_done's refills.  A CYCLIC scan (repeat_forever=True) owns the refill +
+        # the K-sweep stop here, because wait_done returns the instant RUNNING is seen for it.
+        monitor_only = not self._repeat_forever
+        needs_refill = (not monitor_only) and self._total_chunks > 2   # <=2 chunks preloaded; just monitor wraps
+        try:
+            while not stop.is_set():
+                cursor = self._read_word(CtrlWords.CURSOR, stop=stop)
+                # reconstruct the engine's MONOTONIC chunk position: each wrap (cursor
+                # decreased, or the engine published cursor==N at a stalled seam) is +K.
+                if cursor < prev_cursor:
+                    sweeps += 1
+                prev_cursor = cursor
+                # progress mirror for scan_progress(): where the engine is right now.
+                self._scan_point = min(cursor, N - 1) if N > 0 else 0
+                self._scan_sweep = sweeps
+                # FINITE scan: once K whole sweeps have wrapped, halt the engine (REUSE the safe
+                # state command -- the same primitive Stop/off_pulse uses) and latch done so a
+                # blocking wait_done returns.  (At most one extra point of sweep K+1 may emit before
+                # CMD_SAFE lands; the scan stopped at the K-th sweep boundary.)
+                if self._scan_repeats > 0 and sweeps >= self._scan_repeats:
+                    self._command(CMD_SAFE)
+                    self._scan_point = (N - 1) if N > 0 else 0
+                    self._scan_sweep = self._scan_repeats - 1
+                    self._scan_finished = True
+                    return
+                if needs_refill:
+                    eng_mono = sweeps * K + (min(cursor, N - 1) // bank_size)
+                    # one-ahead: load the next monotonic chunk as soon as the engine has
+                    # freed its bank (eng_mono >= next_mono - 1).  Unbounded: next_mono just
+                    # keeps counting; _load_chunk maps it to (data=next_mono%K, bank=next_mono%2).
+                    if eng_mono >= next_mono - 1:
+                        bank_ready = self._load_chunk(next_mono, bank_ready, stop=stop)
+                        next_mono += 1
+                        continue
+                time.sleep(self.stream_poll_interval)
+        except _AxiAborted:             # Off/prepare tore us down mid-read: clean exit
+            pass
+        except Exception as exc:        # never let the daemon die silently
+            self._write_action_log("stream_refill", f"streaming refill thread stopped: {exc!r}")
+
+    def scan_progress(self) -> dict:
+        """Where the streamed scan is now -- mirrors the virtual backend (virtual==real).  The
+        refill thread updates ``_scan_point`` (CURSOR) and ``_scan_sweep`` (wrap count) as it runs;
+        this turns the monotonic played-point count into the shared {scanning, point, n_points,
+        sweep, n_repeats} reading.  Idle when no scan is loaded / running."""
+        from .sequencer import SCAN_PROGRESS_IDLE, scan_progress_fields
+        n = int(self._total_points)
+        # ANY streamed scan reports progress -- a FINITE single-pass scan (repeat_forever=False) and a
+        # CYCLIC one (repeat_forever=True, 0=inf / K-sweep) both stream points, so the gate is "is this
+        # a streamed scan" = scan_points present, NOT the cyclic flag.  (Keying off _repeat_forever was
+        # the real != virtual bug: a single-pass scan showed point 1/0 forever even while it streamed.)
+        if n <= 0:
+            return dict(SCAN_PROGRESS_IDLE)
+        if self._scan_finished:
+            return scan_progress_fields(max(1, self._scan_repeats) * n, n, self._scan_repeats)
+        point_total = int(self._scan_sweep) * n + int(self._scan_point)
+        return scan_progress_fields(point_total, n, self._scan_repeats)
+
+    def _start_stream_thread(self) -> None:
+        # Start the background monitor for ANY streamed scan (scan_points present).  Its job depends on
+        # the cyclic flag (see _stream_refill_loop): a CYCLIC scan (repeat_forever) needs continuous
+        # refill + the K-sweep stop; a FINITE single-pass scan needs only the cursor-mirror so
+        # scan_progress() advances while wait_done refills it synchronously.  Either way the gate is
+        # "this is a streamed scan", NOT the cyclic flag -- that is what fixes a single-pass / real scan
+        # showing point 1/0 forever (the mirror never advanced because no thread ran).  A non-scan
+        # repeat_forever pulse (_total_points==0) never starts a thread.
+        if self._total_points > 0:
+            self._stop_stream_thread()
+            self._stream_stop = threading.Event()
+            self._stream_thread = threading.Thread(
+                target=self._stream_refill_loop, name="zlc-scan-stream", daemon=True)
+            self._stream_thread.start()
+
+    def _stop_stream_thread(self, *, join_timeout: float | None = None) -> None:
+        if self._stream_stop is not None:
+            self._stream_stop.set()
+        thread = self._stream_thread
+        if thread is not None and thread is threading.current_thread():
+            # close() reached from INSIDE the stream thread (its own transaction timed
+            # out): a thread can never join itself.  The stop event is set, so the
+            # thread exits at its next abort point; the owner thread reaps the handle.
+            return
+        if thread is not None and thread.is_alive():
+            # The refill thread can be mid-AXI-read holding _io_lock; that read is
+            # itself bounded by action_timeout and then self-clears.  Wait long
+            # enough that the thread is truly dead before reusing the session --
+            # if it is still alive, KEEP the handle so a later stop retries the
+            # join instead of orphaning a thread that still holds _io_lock (which
+            # would make the NEXT prepare/safe_state block on the lock).
+            effective = (float(self.action_timeout or 120.0) + 5.0
+                         if join_timeout is None else float(join_timeout))
+            thread.join(timeout=effective)
+            if thread.is_alive():
+                return
+        self._stream_thread = None
+        self._stream_stop = None
+
+    def safe_state(self) -> None:
+        # Stop the ENGINE first so the outputs go safe immediately, THEN reap the streaming
+        # refill thread.  Old order (join-then-CMD_SAFE) made "Stop" wait out the refill
+        # thread's join (up to action_timeout+5 s) before the engine was even told to stop,
+        # so stopping a STREAMED scan felt very slow.  Signalling _stream_stop before CMD_SAFE
+        # means the refill loop is already exiting by the time we join, and CMD_SAFE itself
+        # only waits for at most one in-flight refill AXI transaction (they share _io_lock).
+        # A non-streamed pulse has no thread, so this is identical to before (just CMD_SAFE).
+        if self._stream_stop is not None:
+            self._stream_stop.set()
+        self._command(CMD_SAFE)
+        self._stop_stream_thread()
+        # an EXPLICIT stop abandons any delayed tail on purpose -- the next prepare()
+        # must not wait out a drain deadline the user just cancelled.
+        self._drain_until = 0.0
+
+    # ------------------------------------------------------------------ mailbox
+    def _command(self, command: int, *, wait_mask: int | None = None,
+                 timeout: float | None = None) -> bool:
+        """Drive a rising edge on the COMMAND word, optionally waiting for a STATUS
+        mask.  The top edge-detects commands, so write 0 first to guarantee a clean
+        0->cmd transition even if the same command was issued before."""
+
+        self._queue_word(CtrlWords.COMMAND, 0)
+        self._queue_word(CtrlWords.COMMAND, int(command) & 0xF)
+        self._flush()
+        if wait_mask is None:
+            return True
+        effective = float(timeout) if timeout is not None else float(self.action_timeout or 30.0)
+        deadline = time.monotonic() + max(0.0, effective)
+        while True:
+            status = self._read_word(CtrlWords.STATUS)
+            if status & STATUS_ERROR:
+                raise RuntimeError("pulse streamer reported STATUS_ERROR (bad image magic?).")
+            if (status & wait_mask) == wait_mask:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
+    # ------------------------------------------------------------------ Tcl plumbing
+    def _run_tcl(self, lines: Sequence[str], *, action: str, timeout: float | None,
+                 stop: "threading.Event | None" = None) -> str:
+        # One AXI transaction at a time: the main thread and the streaming-refill
+        # thread share the single Vivado Tcl process / marker stream.
+        with self._io_lock:
+            if self._external_executor is not None:
+                return self._external_executor(list(lines), action, timeout)
+            return self._execute(lines, action=action, timeout=timeout, stop=stop)
+
+    def _execute(self, lines: Sequence[str], *, action: str, timeout: float | None,
+                 stop: "threading.Event | None" = None) -> str:
+        # A transaction whose owner is being torn down (the streaming-refill thread
+        # after Off/prepare set its stop event) must abort BEFORE touching the process:
+        # otherwise a dying stream thread could trigger the restart machinery below and
+        # spawn a competing Vivado that fights the main thread over the JTAG target.
+        if stop is not None and stop.is_set():
+            raise _AxiAborted(f"hw_axi {action} aborted before issue (stop requested).")
+        self._ensure_process()             # restart + retry the reconnect if a prior op closed us
+        process = self._process
+        if process is None or process.stdin is None:
+            raise RuntimeError("persistent Vivado hw_axi session is not running.")
+        self._counter += 1
+        marker = f"ZLC_AXI_{self._counter:06d}"
+        script = self._wrap_tcl(lines, marker)
+        try:
+            process.stdin.write(script)
+            process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            self.close()
+            message = f"persistent Vivado hw_axi session stopped before {action}. See {self._log_path}."
+            self._write_action_log(action, message)
+            raise RuntimeError(message) from exc
+        output = self._read_until_marker(marker, timeout=timeout, stop=stop)
+        self._write_action_log(action, output)
+        if f"{marker}_ERROR" in output:
+            tail = "\n".join(output.splitlines()[-25:])
+            raise RuntimeError(f"persistent Vivado hw_axi {action} failed. See {self.state_dir / (action + '.log')}.\n\n{tail}")
+        return output
+
+    @staticmethod
+    def _wrap_tcl(lines: Sequence[str], marker: str) -> str:
+        body = "\n".join(lines)
+        return (
+            f'puts "{marker}_BEGIN"\n'
+            "if {[catch {\n"
+            f"{body}\n"
+            "} zlc_axi_result zlc_axi_options]} {\n"
+            f'    puts "{marker}_ERROR $zlc_axi_result"\n'
+            "    if {[dict exists $zlc_axi_options -errorinfo]} { puts [dict get $zlc_axi_options -errorinfo] }\n"
+            "} else {\n"
+            f'    puts "{marker}_OK"\n'
+            "}\n"
+            f'puts "{marker}_END"\n'
+            "flush stdout\n"
+        )
+
+    def _read_until_marker(self, marker: str, *, timeout: float | None,
+                           stop: "threading.Event | None" = None) -> str:
+        # Poll the queue in short slices so a ``stop`` request (from the streaming
+        # refill thread being torn down on Off/prepare) is honoured PROMPTLY instead
+        # of blocking for the full action_timeout.  Aborting mid-read is safe: each
+        # Tcl command carries a UNIQUE marker, so any stale response is harmlessly
+        # accumulated-and-skipped by the next read (which matches on its own marker).
+        deadline = None if timeout is None else time.monotonic() + max(0.1, float(timeout))
+        lines: list[str] = []
+        while True:
+            if stop is not None and stop.is_set():
+                raise _AxiAborted(f"hw_axi read aborted (stop requested) waiting for {marker}.")
+            if deadline is None:
+                slice_s = 0.2
+            else:
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining == 0.0:
+                    self.close()
+                    raise TimeoutError(f"persistent Vivado hw_axi action timed out waiting for {marker}.")
+                slice_s = min(remaining, 0.2)   # wake at least every 0.2 s to re-check stop/deadline
+            try:
+                item = self._queue.get(timeout=slice_s)
+            except queue.Empty:
+                continue                        # re-check stop / deadline, then keep waiting
+            if item is None:
+                raise RuntimeError("persistent Vivado hw_axi process exited unexpectedly.")
+            lines.append(item)
+            if f"{marker}_END" in item:
+                return "".join(lines)
+
+    def _read_stdout(self, process, generation_queue) -> None:
+        # Bound to ONE process generation: reads that process's stdout into that
+        # generation's queue.  Never touches self._process/self._queue -- after a
+        # restart this thread (still draining the dead process) must not be able to
+        # poison the new generation's queue with stale lines or its EOF sentinel.
+        stdout = process.stdout
+        if stdout is None:
+            generation_queue.put(None)
+            return
+        with self._log_path.open("a", encoding="utf-8", errors="replace") as log:
+            for line in stdout:
+                log.write(line)
+                log.flush()
+                generation_queue.put(line)
+        generation_queue.put(None)
+
+    def _write_action_log(self, action: str, text: str) -> None:
+        (self.state_dir / f"{action}.log").write_text(text, encoding="utf-8", errors="replace")
+
+
+__all__ = ["VivadoAxiStreamerSession", "DEFAULT_RUNTIME_CLOCK_HZ", "DEFAULT_PARAMS"]

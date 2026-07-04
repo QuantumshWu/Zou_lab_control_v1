@@ -68,7 +68,7 @@ def test_frontend_2d_and_histogram():
     assert "fit cut=" in hist.stats_text.get_text()
 
 
-def test_render_latex_pdf_clean_copies_only_final_pdf(tmp_path, monkeypatch):
+def test_render_tex_pdf_copies_only_final_pdf(tmp_path, monkeypatch):
     import Zou_lab_control.frontend.notes as notes
 
     calls = []
@@ -87,7 +87,7 @@ def test_render_latex_pdf_clean_copies_only_final_pdf(tmp_path, monkeypatch):
     monkeypatch.setattr(notes.subprocess, "run", fake_run)
     out = tmp_path / "manual.pdf"
 
-    pdf = zf.render_latex_pdf_clean(
+    pdf = zf.render_tex_pdf(
         r"\documentclass{article}\begin{document}hello\end{document}",
         out,
         xelatex="fake-xelatex",
@@ -111,19 +111,27 @@ def test_render_latex_pdf_clean_copies_only_final_pdf(tmp_path, monkeypatch):
     assert out2.read_bytes().startswith(b"%PDF")
     assert not (tmp_path / "manual2.aux").exists()
 
+    # the DEFAULT manual build leaves ONLY the .pdf in the output dir -- no
+    # .tex/.sty/.aux is written there (the document is assembled in memory and
+    # compiled in a temp dir).  This is the "zero junk in docs/" contract.
+    notes_dir = tmp_path / "notes"
     result = zf.render_notes_pdf(
-        tmp_path / "notes",
+        notes_dir,
         filename="quick_note.tex",
         title="Quick Note",
         body="hello",
         xelatex="fake-xelatex",
         runs=1,
     )
+    assert result.pdf_path == (notes_dir / "quick_note.pdf").resolve()
     assert result.pdf_path.read_bytes().startswith(b"%PDF")
-    assert result.tex_path.name == "quick_note.tex"
-    assert not (result.tex_path.parent / "quick_note.aux").exists()
+    assert sorted(p.name for p in notes_dir.iterdir()) == ["quick_note.pdf"]
+    assert not (notes_dir / "quick_note.tex").exists()
+    assert not (notes_dir / "quick_note.aux").exists()
+    assert not (notes_dir / "zlc_frontend_notes.sty").exists()
     assert result.log_path is None
 
+    # compile_pdf=False is the explicit inspection mode that DOES write the .tex
     draft = zf.render_notes_pdf(
         tmp_path / "draft",
         filename="draft_note.tex",
@@ -357,6 +365,18 @@ def test_frontend_title_pulse_and_public_2d_square_guard():
     assert any(label for label in x_tick_labels)
     assert pulse.ax.get_xlabel() == "Time (us)"
     assert all("e" not in label.lower() for label in x_tick_labels if label)
+    # Non-bracket timeline: the display window is a touch wider than the data on
+    # BOTH sides, so a first edge at t=0 gets breathing room instead of sitting
+    # flush on the spine (the left used to be clamped to 0). Margins are
+    # symmetric, and the negative-time headroom is never given a tick label.
+    pulse_xlim = pulse.ax.get_xlim()
+    pulse_stop = max(row.start + row.duration for row in Seq().effective_pulses())
+    left_margin = 0.0 - pulse_xlim[0]
+    right_margin = pulse_xlim[1] - pulse_stop
+    assert pulse_xlim[0] < 0.0
+    assert left_margin > 0.0 and right_margin > 0.0
+    assert abs(left_margin - right_margin) < 1e-6 * left_margin
+    assert all(not label.startswith("-") for label in x_tick_labels if label)
 
     ns_pulse = zf.plot([{"channel": "gate", "start": 0.0, "duration": 30e-9, "value": 1}], kind="pulse", display=False)
     ns_pulse.fig.canvas.draw()
@@ -381,7 +401,6 @@ def test_frontend_title_pulse_and_public_2d_square_guard():
     assert all_rows.spec.data_px[1] >= 4 * 360
     assert zf.pulse_repeat_notation() == "repeat ∞"
     assert zf.pulse_repeat_notation(0, 2, 4) == "repeat P1-P3 x4"
-    assert zf.pulse_repeat_marker(total_duration_s=3e-6) == (0.0, 3e-6, "×∞")
     repeat_state = na.PulseTableState(
         channels=["ch00", "ch01"],
         periods=[
@@ -799,6 +818,1658 @@ def test_frontend_generates_utf8_tutorial_notebooks(tmp_path):
     assert "write_neutral_atom_tutorial" in zf.__all__
 
 
+def test_pulse_gui_layout_geometry_contract(monkeypatch):
+    """Geometric layout self-check (the 'GUI test interface' the user asked for).
+
+    Measures actual widget geometry instead of eyeballing screenshots:
+    - the scan dot is EMBEDDED in its line edit (parent is the field) and
+      vertically CENTERED, sitting on the right edge like a spinbox spin button;
+    - the Delay/Scan panel's 'Load Array' button, file-path label and the
+      generated/loaded source toggle are present and aligned in the row;
+    - no Control/Channels button has its text clipped.
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtGui
+    from Zou_lab_control.frontend import devtools as dt
+
+    editor = dt.demo_editor(size=(1480, 900))
+    dt.settle(editor, 300)
+
+    # --- scan dot: embedded + centered + right-edge ---
+    field = editor.drag_container.pulse_cards()[0].duration_edit
+    dot = field.dot
+    assert dot.parent() is field  # the dot lives INSIDE the line edit
+    dr, fr = dot.geometry(), field.rect()
+    assert abs((dr.y() + dr.height() / 2) - fr.height() / 2) <= 1.5  # vertically centred
+    assert 0 <= fr.right() - dr.right() <= 8  # hugs the right edge (spinbox-spin style)
+
+    # --- Load Array button + file-path label + source toggle ---
+    la = editor.channel_panel.load_button
+    fl = editor.channel_panel.scan_file_label
+    tg = editor.channel_panel.scan_source_toggle
+    assert la.text() == "Load Array"
+    # button and the path label share the same row (same top within a pixel)
+    assert abs(la.mapTo(editor, la.rect().topLeft()).y() - fl.mapTo(editor, fl.rect().topLeft()).y()) <= 1
+    # the source toggle starts OFF (use the generated table) and sits below the row
+    assert not tg.isChecked()
+    assert tg.mapTo(editor, tg.rect().topLeft()).y() > la.mapTo(editor, la.rect().topLeft()).y()
+
+    # --- no control/channel button text clipped ---
+    buttons = [
+        editor.safe_button, editor.fire_button, editor.remove_button, editor.add_button,
+        editor.bracket_button, editor.collapse_button, editor.save_button, editor.load_button,
+        editor.add_channel_button, editor.hide_off_button, editor.show_all_button,
+    ]
+    from Zou_lab_control.frontend.qt_fluent import fluent_text_width
+    for b in buttons:
+        metrics = QtGui.QFontMetrics(b.font())
+        text_w = fluent_text_width(metrics, b.text().replace("\n", " "))
+        assert text_w <= b.width() - 8, (b.text(), text_w, b.width())
+
+
+def test_pulse_gui_preview_robust_across_states(monkeypatch):
+    """The preview must render (never blank/crash) across many edge-case states,
+    and the Show-off-rows toggle must be stable (OFF->ON->OFF is reproducible).
+
+    This guards the user's '#3' reports: 'preview sometimes shows no image' and
+    'show-off toggle breaks the display'.
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+    from Zou_lab_control.frontend.qt_fluent import fluent_text_width, ensure_qt_app
+
+    ensure_qt_app()
+
+    def all_off():
+        return na.PulseTableState(
+            channels=["ch00", "ch01", "ch02"], visible_channels=["ch00", "ch01", "ch02"],
+            periods=[na.PulsePeriod(100, (0, 0, 0), unit="ns"), na.PulsePeriod(200, (0, 0, 0), unit="ns")],
+            time_step_ns=20,
+        )
+
+    def one_min():
+        return na.PulseTableState(channels=["ch00"], visible_channels=["ch00"],
+                                  periods=[na.PulsePeriod(100, (1,), unit="ns")], time_step_ns=20)
+
+    def scanned():
+        st = dt.demo_state()
+        for p, v in enumerate([0, 300, 500, 300, 0]):
+            st.set_bus_value(p, "da_dipole", v)
+        return st
+
+    def ramped():
+        st = dt.demo_state()
+        st.set_analog_bus_mode(0, "da_dipole", "edge", value=0)
+        st.set_analog_bus_mode(1, "da_dipole", "ramp", value=500)
+        st.apply_analog_bus_modes_to_period_states()
+        return st
+
+    builders = {"all_off": all_off, "one_min": one_min, "scanned": scanned, "ramped": ramped}
+    for name, build in builders.items():
+        editor = PulseSequenceEditor(state=build())
+        if name == "scanned":
+            editor._toggle_duration_scan(editor.drag_container.pulse_cards()[3])
+            editor._toggle_dac_scan(editor.drag_container.pulse_cards()[2], "da_dipole")
+        # both toggle states must produce a real figure with at least one axis line/patch
+        for include_off in (False, True, False):  # OFF -> ON -> OFF reproducible
+            plotter, channels, _repeat = editor._create_preview_plot(editor.read_state(), include_always_off=include_off)
+            assert plotter is not None and plotter.fig is not None, name
+            # the axes must have drawn *something* (a baseline line or a pulse patch),
+            # i.e. it is never a truly blank canvas.
+            ax = plotter.ax
+            assert (len(ax.lines) + len(ax.patches) + len(ax.collections)) > 0, (name, include_off)
+
+
+def test_pulse_gui_row_alignment_contract(monkeypatch):
+    """Each channel's raw label, delay box and first checkbox must share a row.
+
+    This is the visible "对齐契约": the three columns scroll together and a
+    given channel's controls line up.  Asserting the vertical centre coincide
+    catches layout drift that screenshots would only show subtly.
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    editor = dt.demo_editor(size=(1480, 900))
+
+    def centre_y(widget):
+        return widget.mapTo(editor, widget.rect().center()).y()
+
+    def check_alignment(label):
+        names = editor.names_panel
+        delays = editor.channel_panel
+        first_card = editor.drag_container.pulse_cards()[0]
+        checked = 0
+        for channel in editor.state.visible_channels[:8]:
+            raw = names.raw_label_widgets.get(channel)
+            delay = delays.delay_edits.get(channel)
+            check = first_card.checks.get(channel)
+            ys = [centre_y(w) for w in (raw, delay, check) if w is not None]
+            if len(ys) >= 2:
+                assert max(ys) - min(ys) <= 1, (label, channel, ys)
+                checked += 1
+        assert checked >= 4, label
+        # The analog-bus (DAC) row must line up too -- its period-card row used to
+        # be inflated to 30 px while the Names/Delay panels kept it at the
+        # compressed 26 px, knocking every row below it out of alignment.
+        for bus in first_card.bus_value_edits:
+            raw = names.raw_label_widgets.get(f"bus:{bus}")
+            delay = delays.delay_edits.get(f"bus:{bus}")
+            period = first_card.bus_value_edits.get(bus)
+            ys = [centre_y(w) for w in (raw, delay, period) if w is not None]
+            assert len(ys) == 3, (label, bus, "missing bus row widget")
+            assert max(ys) - min(ys) <= 1, (label, bus, ys)
+
+    dt.settle(editor, 300)
+    check_alignment("default")
+
+    # Now reveal every hardware channel (62 -> 26 px compressed rows) and re-check:
+    # this is the regression scenario where the DAC row height diverged.
+    editor.show_all_channels()
+    dt.settle(editor, 300)
+    check_alignment("show-all")
+
+
+def test_pulse_gui_channel_display_order_is_fixed_hardware_order(monkeypatch):
+    """Edit (and preview) channel rows must ALWAYS render in the fixed hardware
+    channel order, no matter how show/hide/hide-off scrambled visible_channels.
+
+    This is the user's "通道显示固定排序不被打乱": _display_rows now walks
+    state.channels (hardware order) filtered by visibility, so the order cannot
+    depend on the order entries happen to sit in visible_channels.
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.frontend.pulse_gui import _display_rows
+
+    # --- data-model: a deliberately scrambled visible_channels still displays
+    #     in hardware order, visible-filtered.
+    channels = [f"ch{i:02d}" for i in range(10)]
+    state = na.PulseTableState(
+        channels=channels,
+        periods=[na.PulsePeriod(100, tuple(1 for _ in channels), unit="ns")],
+        time_step_ns=20,
+        visible_channels=channels,
+    )
+    state.visible_channels = ["ch05", "ch01", "ch09", "ch00", "ch03"]  # scrambled
+    keys = [row["key"] for row in _display_rows(state)]
+    assert keys == ["ch00", "ch01", "ch03", "ch05", "ch09"], keys
+
+    # --- editor path: show-all then hide-off must leave visible_channels in
+    #     hardware order AND render the panel rows top-to-bottom in that order.
+    from Zou_lab_control.frontend import devtools as dt
+
+    editor = dt.demo_editor(size=(1480, 900))
+    editor.show_all_channels()
+    dt.settle(editor, 200)
+    editor.hide_off_channels()
+    dt.settle(editor, 200)
+
+    vis = list(editor.state.visible_channels)
+    assert vis == sorted(vis, key=editor.state.channel_index), vis
+
+    rows = _display_rows(editor.state)
+    names = editor.names_panel
+    ys = []
+    for row in rows:
+        widget = names.raw_label_widgets.get(row["key"])
+        if widget is not None:
+            ys.append(widget.mapTo(editor, widget.rect().center()).y())
+    assert len(ys) >= 3, "names panel should expose the visible row labels"
+    assert ys == sorted(ys), ("panel rows must render top-to-bottom in hardware order", ys)
+
+
+def test_pulse_gui_scan_dot_retoggle_preserves_values(monkeypatch):
+    """Toggling a scan dot OFF then ON restores the typed scan column.
+
+    The user's "#3": re-clicking a scan dot must not wipe the values that were
+    already entered for that field.
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+
+    ensure_qt_app()
+    editor = PulseSequenceEditor(state=dt.demo_state())
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1])
+    editor.state.set_scan_table([[100], [200], [300]])
+    editor.load_state(editor.state)
+    assert editor.state.scan_table == [[100.0], [200.0], [300.0]]
+
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1])  # SCAN -> API (no scan slot bound)
+    assert len(editor.state.scan_slots) == 0
+
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1])  # API -> none (column cleared)
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1])  # none -> SCAN: values restored, not reset to nominal
+    assert editor.state.scan_table == [[100.0], [200.0], [300.0]]
+
+
+def test_panel_plot_spec_is_the_confocal_modular_region():
+    """frontend.panel_plot_spec contract (the confocal rule): ONE plot region and
+    ONE margin set for EVERY kind, "2x2" IS the stock 480x360 frontend region,
+    "RxC" spans height/width halves of it, dpi never changes, and the geometry
+    is not configurable from outside (size is the only knob)."""
+
+    import inspect
+
+    from Zou_lab_control.frontend.live import (
+        PANEL_DISPLAY_SCALE, PANEL_MARGINS_PX, PANEL_SIZES, TITLE_SLOT_PX,
+        _IMAGE_SPLIT, panel_display_size, panel_plot_spec, panel_size_cells)
+    from Zou_lab_control.frontend.canvas import FigureSpec
+    from Zou_lab_control.frontend.style import DESIGN_DPI
+
+    # NOTE: this test DERIVES every expectation from the owned constants -- it never
+    # re-types a margin/size/scale literal.  A value change (e.g. tightening a
+    # margin) therefore propagates here automatically and can never leave a stale
+    # green assertion (the drift that once asserted (110,110,100,70) long after the
+    # code had moved on).
+    assert PANEL_SIZES == ("1x2", "2x2", "4x2", "1x4", "2x4", "4x4", "4x8", "8x4", "8x8")
+    assert panel_size_cells("1x4") == (1, 4)
+    stock = panel_plot_spec("2x2")
+    assert stock.data_px == FigureSpec().data_px        # "2x2" IS the stock frontend region
+    assert stock.dpi == DESIGN_DPI                      # dpi never changes with size
+    half = panel_plot_spec("1x2")
+    assert half.data_px == (stock.data_px[0], stock.data_px[1] // 2)   # half height, same width
+    wide = panel_plot_spec("2x4")
+    assert wide.data_px == (stock.data_px[0] * 2, stock.data_px[1])    # double width, same height
+    big = panel_plot_spec("4x4")
+    assert big.data_px == (stock.data_px[0] * 2, stock.data_px[1] * 2)  # double width AND height
+    # every panel shares ONE margin set, and it is the owned constant
+    assert half.margins_px == stock.margins_px == PANEL_MARGINS_PX
+    # the un-clip invariant: the panel's LEFT margin equals the stock confocal left
+    # (the minimum that holds a 4-5 digit y-tick + the rotated y-title), so a panel
+    # can never clip the y-title where the stock plot does not.
+    assert PANEL_MARGINS_PX[0] == FigureSpec().margins_px[0]
+    # the TOP margin IS the always-reserved title slot (= _with_title_margin's floor),
+    # so panel_display_size matches the real titled figure instead of under-reporting it.
+    assert PANEL_MARGINS_PX[3] == TITLE_SLOT_PX
+    # the 2D internal split's image fraction makes the stock image axes square
+    assert round(stock.data_px[0] * _IMAGE_SPLIT[0][0]) == stock.data_px[1]
+    # the public surface takes ONLY the size preset + the default/pulse KIND variant (channel-name
+    # room) -- no geometry knobs (no data_px / margins_px / dpi), the F2 sealed-surface rule.
+    assert list(inspect.signature(panel_plot_spec).parameters) == ["size", "kind"]
+    assert 0 < PANEL_DISPLAY_SCALE < 1
+    # the on-screen size is EXACTLY the scaled figure (data + margins) -- derived,
+    # so it tracks any margin change with no hand-edited number here.
+    left, right, bottom, top = stock.margins_px
+    assert panel_display_size("2x2") == (
+        round((stock.data_px[0] + left + right) * PANEL_DISPLAY_SCALE),
+        round((stock.data_px[1] + bottom + top) * PANEL_DISPLAY_SCALE))
+    with pytest.raises(ValueError):
+        panel_size_cells("5x5")
+
+
+def test_fit_analytic_jacobian_matches_finite_difference():
+    """PERF (appearance/logic-neutral): the analytic Jacobians supplied to the
+    histogram bimodal fit and the monitor Gaussian fit must converge to the SAME
+    parameters as scipy's finite-difference Jacobian -- they only make the fit
+    cheaper (this is what cut the task-console refresh ~14.5ms -> ~9.6ms)."""
+
+    import numpy as np
+    from scipy.optimize import curve_fit
+    # The Gaussian/bimodal model + analytic Jacobians now live in the shared,
+    # single-source _readout_math module (both the histogram bimodal fit and the
+    # monitor Gaussian fit import them).
+    from Zou_lab_control._readout_math import bimodal_jacobian, bimodal_model, gaussian, gaussian_jacobian
+
+    rng = np.random.default_rng(0)
+    x = np.linspace(180, 700, 80)
+    y = bimodal_model(x, 60, 230, 12, 90, 600, 18) + rng.normal(0, 0.5, x.size)
+    p0 = [80, 235, 15, 80, 590, 20]
+    bounds = ([0, 180, 1, 0, 180, 1], [400, 700, 200, 400, 700, 200])
+    pj, _ = curve_fit(bimodal_model, x, y, p0=p0, bounds=bounds, jac=bimodal_jacobian, maxfev=20000)
+    pn, _ = curve_fit(bimodal_model, x, y, p0=p0, bounds=bounds, maxfev=20000)
+    assert np.allclose(pj, pn, rtol=1e-6, atol=1e-6)
+
+    xg = np.linspace(0, 20, 12)
+    yg = gaussian(xg, 30, 10, 3) + rng.normal(0, 0.3, 12)
+    gb = ([0, 0, 0.2], [200, 20, 30])
+    gj, _ = curve_fit(gaussian, xg, yg, p0=[30, 10, 3], bounds=gb, jac=gaussian_jacobian)
+    gn, _ = curve_fit(gaussian, xg, yg, p0=[30, 10, 3], bounds=gb)
+    assert np.allclose(gj, gn, rtol=1e-6, atol=1e-6)
+
+
+def test_frontend_public_api_seals_art_and_geometry():
+    """The sealed-API design contract (frontend/__init__.py rules 1-3): external
+    callers pass DATA, never ART/GEOMETRY/dpi/typography.  plot()/panel_plot()
+    reject geometry+colour kwargs, and DEFAULT_STYLE is read-only -- this is the
+    enforcement that stops a notebook from breaking the visual design."""
+
+    import numpy as np
+    import Zou_lab_control.frontend as zf
+
+    x = np.arange(6, dtype=float).reshape(-1, 1)
+    y = np.arange(6, dtype=float).reshape(-1, 1)
+    # rule 1: figure geometry / dpi / NaN colour are owned, not per-call knobs
+    for leaked in ("data_px", "margins_px", "dpi", "spec", "bad_color", "colors"):
+        with pytest.raises(TypeError):
+            zf.plot(x, y, kind="1d", display=False, data_figure=False, **{leaked: object()})
+        with pytest.raises(TypeError):
+            zf.panel_plot(x, y, kind="1d", size="1x2", **{leaked: object()})
+    # internal geometry still flows: panel_plot sizes correctly via the size preset
+    panel = zf.panel_plot(x, y, kind="1d", size="1x2")
+    assert panel.spec.data_px == (480, 180)
+    # legitimate DATA options still pass (labels/title/relim_mode)
+    ok = zf.plot(x, y, kind="1d", labels=("t", "v", "z"), title="ok",
+                 relim_mode="tight", display=False, data_figure=False)
+    assert ok.title == "ok"
+    # rule 3: the one typography system is read-only
+    with pytest.raises(TypeError):
+        zf.DEFAULT_STYLE["axes.labelsize"] = 99
+    # pulse_plot_spec owns margins/dpi (no per-call geometry knobs left)
+    import inspect
+    params = set(inspect.signature(zf.pulse_plot_spec).parameters)
+    assert not ({"margins_px", "dpi"} & params), params
+
+
+@pytest.mark.parametrize("scale_factor", ["1.0", "1.25", "1.5"])
+def test_embedded_canvas_invariants_across_screen_scales(scale_factor):
+    """EmbeddedFigureCanvas geometry invariants at every Windows display scale
+    (the bug class: the stock backend re-derived the figure FROM the widget on
+    ratio syncs, warping the fixed-inches axes on scaled screens -- panels
+    collapsed into a corner on the user's real machine while DPR=1 offscreen
+    looked perfect).  Each scale runs in a SUBPROCESS because QT_SCALE_FACTOR
+    is read once at QApplication creation."""
+
+    import subprocess
+    import sys
+
+    code = (
+        "import numpy as np\n"
+        "from Zou_lab_control.frontend.qt_fluent import ensure_qt_app\n"
+        "ensure_qt_app()\n"
+        "from Zou_lab_control.frontend.live import panel_plot, panel_display_size, PANEL_DISPLAY_SCALE\n"
+        "from Zou_lab_control.frontend.style import DESIGN_DPI\n"
+        "from Zou_lab_control.frontend.qt_canvas import EmbeddedFigureCanvas\n"
+        "p = panel_plot(np.arange(50.0), np.random.rand(50), kind='1d', size='2x2')\n"
+        "fig = p.fig\n"
+        "design_inches = tuple(round(float(v), 4) for v in fig.get_size_inches())\n"
+        "c = EmbeddedFigureCanvas(fig, display_scale=PANEL_DISPLAY_SCALE)\n"
+        "c.setFixedSize(c.sizeHint())\n"
+        "real = float(__import__('os').environ.get('QT_SCALE_FACTOR', '1.0'))\n"
+        "# invariant 1: design inches never change\n"
+        "assert tuple(round(float(v), 4) for v in fig.get_size_inches()) == design_inches\n"
+        "# invariant 2: dpi = design dpi x REAL screen ratio (retina supersampling)\n"
+        "assert abs(fig.dpi - DESIGN_DPI * real) < 1e-6, fig.dpi\n"
+        "# invariant 3: the LOGICAL widget size is scale-independent (+-1 px) and EQUALS\n"
+        "# panel_display_size -- DERIVED from the owned geometry, so it tracks margin changes.\n"
+        "exp_w, exp_h = panel_display_size('2x2')\n"
+        "assert abs(c.width() - exp_w) <= 1 and abs(c.height() - exp_h) <= 1, (c.width(), c.height())\n"
+        "print('DPR-INVARIANTS-OK')\n"
+    )
+    env = dict(__import__("os").environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    env["QT_SCALE_FACTOR"] = scale_factor
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                            env=env, timeout=180)
+    assert "DPR-INVARIANTS-OK" in result.stdout, result.stdout + result.stderr
+
+
+def test_task_console_drag_records_drop_then_gravity_packs(monkeypatch):
+    """Dropping a card records its raw pixel drop point into the config and ``_compact`` gravity-packs
+    it top-left (no column grid).  Dropping it low-right snaps it back UP-LEFT into a clean slot, and
+    a moved panel is an unsaved edit (so the layout JSON round-trips the resulting placement)."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtCore
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.task_console import GAP
+
+    console = dt.demo_console(shots=3)
+    card = console.cards[1]                       # the 1x2 distribution panel
+    # Drag it far to the LOW-RIGHT; on release the board gravity-packs every card up + left.
+    card.move(900, 700)
+    card._drag_offset = QtCore.QPoint(1, 1)       # as if a drag was in flight
+    class _Ev:                                    # minimal release-event stand-in
+        def button(self): return QtCore.Qt.LeftButton
+        def pos(self): return QtCore.QPoint(1, 1)
+    try:
+        card.mouseReleaseEvent(_Ev())
+    except TypeError:                             # super() needs a real QEvent; the re-pack already ran
+        pass
+    # GRAVITY: every card sits at >= GAP from the origin and the board packed top-left (no card is
+    # left stranded at the low-right drop point).
+    for c in console.cards:
+        assert c.config.col >= GAP and c.config.row >= GAP
+    assert min(c.config.row for c in console.cards) == GAP        # something rose to the top margin
+    assert console.save_button.is_dirty()         # a moved panel is an unsaved edit
+    console.shutdown()
+
+
+def test_fluent_auto_scale_is_shared_between_guis(monkeypatch):
+    """REGRESSION: with scale=None the pulse editor used a screen-fit rule while
+    the task console silently fell back to 1.0 -- on small screens the two GUIs
+    rendered different control sizes (the user saw mismatched lineedits).  Both
+    must resolve through qt_fluent.resolve_fluent_auto_scale."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend.qt_fluent import (
+        FLUENT_SCALE_MAX, FLUENT_SCALE_MIN, ensure_qt_app, fluent_scale,
+        resolve_fluent_auto_scale, set_fluent_scale)
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+
+    app = ensure_qt_app()
+    try:
+        console_path = set_fluent_scale(None)         # the task-console call
+        pulse_path = PulseSequenceEditor._resolve_scale(None, app=app)
+        assert console_path == pulse_path
+        # and both equal the one shared rule, after the owned clamp band (imported,
+        # not re-typed -- so the test tracks the band instead of going stale).
+        assert console_path == max(FLUENT_SCALE_MIN, min(FLUENT_SCALE_MAX, resolve_fluent_auto_scale(app)))
+        assert fluent_scale() == pulse_path
+    finally:
+        set_fluent_scale(1.0)
+
+
+def test_task_console_layout_is_top_left_gravity():
+    """The board auto-layout is TOP-LEFT GRAVITY (``_compact``, #H3s-F8): every card floats UP then
+    LEFT until blocked, separated from neighbours and the origin by a uniform ``GAP`` on all four
+    sides.  A card dropped low-right snaps up-left; the dropped (``active``) card wins a contested
+    slot and the others reflow; a settled board is a fixed point.
+
+    Pure-function contract (PanelConfig has no Qt), so it does NOT pull in the flaky
+    demo_console GUI fixture."""
+
+    from Zou_lab_control.frontend.task_console import (
+        GAP, PanelConfig, _aabb, _board_width, _card_size, _compact, _first_free_slot)
+
+    def no_overlap(cfgs):
+        for i, a in enumerate(cfgs):
+            for b in cfgs[i + 1:]:
+                ax0, ay0, ax1, ay1 = _aabb(a)
+                bx0, by0, bx1, by1 = _aabb(b)
+                assert not (ax0 < bx1 and bx0 < ax1 and ay0 < by1 and by0 < ay1), (a.title, b.title)
+
+    g = GAP
+    # (1) a card dropped LOW-RIGHT snaps UP-LEFT to the origin (gravity); on an empty board -> (g, g).
+    a = PanelConfig(kind="2d", title="A", row=700, col=900, size="2x2")
+    assert _compact([a], active=a) is True
+    assert (a.col, a.row) == (g, g)
+
+    # (2) drop a second card ONTO the first's slot: the active card WINS it, the other reflows below
+    #     by exactly one GAP past the active card's ACTUAL height; no overlap.
+    a = PanelConfig(kind="2d", title="A", row=g, col=g, size="2x2")
+    b = PanelConfig(kind="2d", title="B", row=g, col=g, size="2x2")   # dropped onto A
+    _compact([a, b], active=b)
+    assert (b.col, b.row) == (g, g)             # the dragged card wins the contested slot
+    assert a.row == b.row + _card_size(b.size)[1] + g   # other pushed one GAP below B's real height
+    no_overlap([a, b])
+
+    # (3) a settled board is a FIXED POINT: re-packing moves nothing.
+    cfgs = [PanelConfig(kind="1d", title=t, row=r, col=c, size="2x2")
+            for t, r, c in (("P", 5, 300), ("Q", 260, 20), ("R", 88, 640), ("S", 500, 120))]
+    _compact(cfgs)
+    no_overlap(cfgs)
+    assert _compact(cfgs) is False
+
+    # (4) two narrow cards freshly ADDED tile SIDE BY SIDE one GAP apart on the top row (the user's
+    #     horizontal gap).  A fresh Add seeds its position with `_first_free_slot` (NW tiling: fill the
+    #     top row left-to-right), NOT `_compact`'s anchored gravity (which only floats a card up/left
+    #     from where it already is and never teleports it to an empty slot on the right).
+    left = PanelConfig(kind="1d", title="L", size="1x2")
+    right = PanelConfig(kind="1d", title="R", size="1x2")
+    board_w = _board_width([left, right])
+    placed = []
+    for cfg in (left, right):
+        cfg.col, cfg.row = _first_free_slot(cfg, placed, board_w)
+        placed.append(cfg)
+    left, right = sorted([left, right], key=lambda c: c.col)
+    assert left.row == right.row == g
+    assert right.col - (left.col + _card_size(left.size)[0]) == g
+    no_overlap([left, right])
+
+
+def test_task_console_cards_have_fluent_shadow(monkeypatch):
+    """Panel cards reuse the fluent card design: the CachedDropShadow effect
+    must be attached (the flat 1px-border look was a regression)."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console(shots=3)
+    for card in console.cards:
+        assert card.graphicsEffect() is not None, card.config.title
+    console.shutdown()
+
+
+def test_task_console_cards_are_modular(monkeypatch):
+    """Card size = the frontend panel's on-screen canvas + the card chrome; every
+    kind shares one plot region per size (the confocal rule), so same-size cards
+    are identical and the canvas always fits its card."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.live import panel_display_size, panel_size_cells
+    from Zou_lab_control.frontend.style import DESIGN_DPI
+    # The card's FORMAT (chrome + content padding) is owned by the component library (qt_fluent);
+    # the console only sizes the cards.
+    from Zou_lab_control.frontend.task_console import GAP, _card_size, _cell_size
+
+    # Card WIDTH tiles on the base 1x2 width (cols//2 base widths joined by one GAP), so same-size
+    # cards are identical and the card always holds the design-size canvas.  HEIGHT HUGS the plot
+    # (no cell-multiple), so it is just tall enough for the figure + chrome (no blank padding).
+    cw_cell, _ch_cell = _cell_size()
+    for size in ("1x2", "2x2", "1x4", "2x4", "4x4"):
+        cw, ch = _card_size(size)
+        pw, ph = panel_display_size(size)
+        cols = panel_size_cells(size)[1]
+        w_units = max(1, cols // 2)
+        assert cw == w_units * cw_cell + (w_units - 1) * GAP        # whole base widths + gaps
+        assert cw >= pw and ch >= ph                                # card always holds the plot
+
+    console = dt.demo_console(shots=3)
+    for card in console.cards:
+        assert (card.width(), card.height()) == _card_size(card.config.size), card.config.size
+        canvas_w, canvas_h = panel_display_size(card.config.size)
+        assert card.width() >= canvas_w and card.height() >= canvas_h
+        if card.canvas is not None:               # the canvas must FIT inside its card
+            assert abs(card.canvas.width() - canvas_w) <= 1
+            assert abs(card.canvas.height() - canvas_h) <= 1
+            # the figure carries the ONE design dpi in _original_dpi; the live canvas
+            # renders the Agg buffer at EXACTLY the widget's on-screen device pixels
+            # (render_scale == display_scale in panel_canvas: a 1:1 blit, never rendered
+            # small and stretched up), so buffer px == widget logical px x the screen ratio.
+            from PyQt5 import QtWidgets
+            fig = card.plotter.fig
+            assert getattr(fig, "_original_dpi", fig.dpi) == DESIGN_DPI
+            real = QtWidgets.QWidget.devicePixelRatioF(card.canvas) or 1.0
+            assert abs(fig.get_size_inches()[0] * fig.dpi - card.canvas.width() * real) <= 1.0
+    # same size -> identical card (the hist and monitor 1x2 cards)
+    sizes = {}
+    for card in console.cards:
+        sizes.setdefault(card.config.size, set()).add((card.width(), card.height()))
+    for size, dims in sizes.items():
+        assert len(dims) == 1, (size, dims)
+    console.shutdown()
+
+
+def test_task_console_panels_render_and_update(monkeypatch):
+    """The demo board builds EVERY panel kind against the virtual node -- both
+    rolling-trace variants included -- and keeps updating them on later shots.
+
+    The rolling trace is ONE kind ("monitor"); the side distribution is a
+    ``show_dist`` toggle, NOT a separate kind.  ``show_dist=True`` builds
+    ``LiveLiveDis`` (the side histogram) and ``show_dist=False`` builds the bare
+    ``LiveLive`` -- so the same kind maps to two classes via the one toggle.
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console(shots=25)
+    kinds = {card.config.kind: card for card in console.cards}
+    assert set(kinds) == {"2d", "sites", "1d", "monitor", "hist"}
+    for card in console.cards:
+        assert card.plotter is not None, card.config.kind
+        assert card.status.text().startswith("shot "), (card.config.kind, card.status.text())
+    assert type(kinds["2d"].plotter).__name__ == "Live2DDis"
+    assert type(kinds["sites"].plotter).__name__ == "LiveSiteMap"
+    assert type(kinds["hist"].plotter).__name__ == "HistogramFigure"
+    assert type(kinds["1d"].plotter).__name__ == "Live1D"
+    # the ONE "monitor" kind -> two classes via show_dist (the demo board has both)
+    monitors = [c for c in console.cards if c.config.kind == "monitor"]
+    by_dist = {bool(c.config.params.get("show_dist", True)): c for c in monitors}
+    assert set(by_dist) == {True, False}, "demo board should exercise both show_dist variants"
+    assert type(by_dist[True].plotter).__name__ == "LiveLiveDis"
+    assert by_dist[True].plotter.plot_type == "live-distribution"
+    assert type(by_dist[False].plotter).__name__ == "LiveLive"
+    assert by_dist[False].plotter.plot_type == "live"
+
+    # more shots -> the monitor's rolling history grows; the 2d image refreshes
+    before = kinds["monitor"].plotter.points_done
+    image_before = np.array(kinds["2d"].plotter.grid, copy=True)
+    for node in console.running_nodes:
+        node.step()
+    console.refresh_once()
+    assert kinds["monitor"].plotter.points_done == before + 1
+    assert not np.array_equal(np.array(kinds["2d"].plotter.grid), image_before)
+    console.shutdown()
+
+
+def test_task_console_saved_layout_resolves_and_roundtrips(tmp_path, monkeypatch):
+    """There are NO presets.  The only reusable layout is one the USER saved to a
+    file; ``resolve_task_state`` loads it back by saved name (tasks/<name>.json) or
+    by path, and an unknown name raises.  (The default console opens EMPTY.)"""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("ZLC_TASK_DIR", str(tmp_path))
+    from Zou_lab_control.frontend.task_console import (
+        PanelConfig, TaskConsoleState, default_console_state, resolve_task_state)
+
+    # the default opens empty -- no presets, no canned dashboard
+    assert default_console_state().panels == []
+
+    # a user-saved layout reloads by name and by path
+    mine = TaskConsoleState(name="my_layout",
+                            panels=[PanelConfig(kind="1d", title="r", source="value = rate")])
+    mine.save(tmp_path / "my_layout.json")
+    assert resolve_task_state("my_layout").name == "my_layout"
+    assert resolve_task_state(str(tmp_path / "my_layout.json")).name == "my_layout"
+    with pytest.raises(ValueError, match="unknown task"):
+        resolve_task_state("nonexistent_layout")
+
+
+def test_default_console_state_opens_empty(monkeypatch):
+    """The console opens EMPTY -- no presets, no canned panel.  The user builds the
+    dashboard themselves (Add Panel) and Saves/Loads it as a file."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend.task_console import TaskConsoleState, default_console_state
+
+    state = default_console_state()
+    assert state.panels == []
+    # round-trips like any layout (the default is a normal saveable state)
+    again = TaskConsoleState.from_dict(state.to_dict())
+    assert again.panels == []
+
+
+def test_task_console_signal_picker_and_declarative_params(monkeypatch):
+    """The Setting popup works the way an experimenter expects: the signal
+    picker lists the hub's live signals and picking one rewires the panel
+    instantly; declarative ParamSpec edits apply instantly too."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    from PyQt5 import QtCore
+
+    console = dt.demo_console(shots=10)
+    card = next(c for c in console.cards if c.config.kind == "2d")
+    card._refresh_signal_combo()
+    combo = card.signal_combo                              # now a FluentTreeComboBox (G2)
+    model = combo._model
+    # walk the COLLAPSIBLE tree: producer parents at top level (one is the "(none)" row),
+    # signals are their leaves -- the bare signal name is each leaf's UserRole data.
+    assert model.item(0).text() == "(none)"               # blank = turn the slot off
+
+    def _leaf_datas():
+        out = []
+        for r in range(model.rowCount()):
+            parent = model.item(r)
+            for cr in range(parent.rowCount()):
+                out.append(parent.child(cr).data(QtCore.Qt.UserRole))
+        return out
+
+    def _pick(name):
+        for r in range(model.rowCount()):
+            parent = model.item(r)
+            for cr in range(parent.rowCount()):
+                child = parent.child(cr)
+                if child.data(QtCore.Qt.UserRole) == name:
+                    combo._on_tree_clicked(child.index())
+                    return True
+        return False
+
+    datas = _leaf_datas()
+    assert "counts" in datas and "frame_0" in datas
+    # the demo 2d card is the synced readout image -> its input is the judged frame (#5)
+    assert combo.current_signal() == "frame_judged"
+
+    assert _pick("frame_0")                                # pick a 2-D signal valid for a 2d panel
+    card._on_slot_pick(0)
+    assert card.config.inputs[0] == "frame_0"              # input now names frame_0
+    assert card.config.source == "value = signal"          # the picked signal IS `signal`
+    console.refresh_once()
+    assert card.status.text().startswith("shot ")           # applied instantly + healthy
+
+    # declarative param: one _set_param call -> stored + plot rebuilt
+    plot_before = card.plotter
+    card._set_param("cmap", "gray")
+    assert card.config.params["cmap"] == "gray"
+    console.refresh_once()
+    assert card.plotter is not plot_before
+    console.shutdown()
+
+
+def test_task_console_panel_editor_tab(monkeypatch, tmp_path):
+    """A card's Edit... opens its OWN closable tab (a PanelEditor) bound to a
+    frozen snapshot, where command-line fit, x/y limits and Save Fig work; the
+    tab's X tears it down.  These heavy controls are kept off the Setting popup,
+    and each panel gets its own editor (re-clicking Edit focuses, not dupes)."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("ZLC_TASK_DIR", str(tmp_path))
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console(shots=20)
+    # Monitor is the ONLY permanent tab (no global Control); Edit tabs open to its right
+    titles = [console.tabs.tabText(i) for i in range(console.tabs.count())]
+    assert titles[0] == "Monitor" and "Control" not in titles
+
+    card = next(c for c in console.cards if c.config.kind == "1d")
+    n_tabs = console.tabs.count()
+    console._edit_card(card)
+    editor = console._panel_editors[id(card)]
+    assert editor._plotter is not None
+    assert console.tabs.count() == n_tabs + 1                 # a new closable tab opened
+    assert console.tabs.currentWidget() is editor
+    assert editor.xmin.text() and editor.xmax.text()          # limits prefilled from the axes
+    # the Edit tab carries a (custom, subtle) close button; Monitor has none
+    from PyQt5 import QtWidgets as _qtw
+    _bar = console.tabs.tabBar()
+    assert _bar.tabButton(console.tabs.indexOf(editor), _qtw.QTabBar.RightSide) is not None
+    assert _bar.tabButton(0, _qtw.QTabBar.RightSide) is None
+
+    # re-clicking Edit focuses the SAME tab (no duplicate)
+    console._edit_card(card)
+    assert console.tabs.count() == n_tabs + 1
+
+    # command-line fit (preset model + free-text args) draws an overlay
+    editor.fit_combo.setCurrentText("Gaussian")
+    editor.fit_cmd.setText("")
+    editor.do_fit()
+    assert editor._df is not None and editor._df.fit is not None
+
+    # x/y limits apply to the editor axes
+    editor.xmin.setText("0"); editor.xmax.setText("9")
+    editor.ymin.setText("0"); editor.ymax.setText("2")
+    editor.apply_limits()
+    assert editor._plotter.ax.get_xlim() == (0.0, 9.0)
+
+    # Save Fig writes png + npz into the task dir
+    editor.save()
+    saved = sorted(p.suffix for p in tmp_path.iterdir())
+    assert ".png" in saved and ".npz" in saved
+
+    editor.clear_fit()
+    assert editor._df is None
+
+    # the X on the tab tears the editor down and drops it from the registry
+    console._on_editor_tab_closed(editor)
+    assert id(card) not in console._panel_editors
+    assert console.tabs.count() == n_tabs
+    console.shutdown()
+
+
+def test_task_console_setting_popup_border_does_not_cascade(monkeypatch):
+    """The Setting popup's border must NOT cascade onto its child widgets.
+
+    The original regression was a bare ``QFrame { border }`` stylesheet rule that
+    leaked onto every QFrame-derived child (QLabel/QComboBox internals are QFrames)
+    and drew stray lines inside.  The redesign solves it structurally: the popup is
+    a :class:`FluentPopup` that PAINTS its rounded card (fill + 1px border) in
+    ``paintEvent`` -- so there is NO border STYLESHEET rule on the popup at all, and
+    nothing can cascade.  This asserts that surviving guarantee (the same intent as
+    before: no border bleed onto children)."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.qt_fluent import FluentPopup
+
+    console = dt.demo_console(shots=3)
+    card = console.cards[0]
+    popup = card.settings_popup
+    # the popup paints its card itself (no stylesheet border that could cascade)
+    assert isinstance(popup, FluentPopup)
+    assert "border" not in popup.styleSheet().lower()
+    # and no child carries a border-DRAWING rule (only the benign `border: none`)
+    for child in popup.findChildren(QtWidgets.QFrame):
+        sheet = child.styleSheet().lower()
+        if "border" in sheet:
+            assert "border: none" in sheet or "border:none" in sheet, (type(child).__name__, sheet)
+    console.shutdown()
+
+
+def test_task_console_panel_editor_fit_and_setting_relim(monkeypatch):
+    """Curve fit lives in the per-panel Edit tab (PanelEditor); a line panel's
+    Edit fit overlays the snapshot curve and Clear removes it.  relim lives in
+    the SETTING popup (tight/normal) and persists onto config.params, so the
+    live card picks it up on its next rebuild."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    import numpy as np
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.task_console import (
+        FIT_MODELS, PanelCard, PanelConfig, _fit_labels_for_kind)
+
+    # The fit model set is DEFINED in full (incl. the 2D-Gaussian "2D center"), but the Edit tab OFFERS
+    # only the models matching the panel's plot FAMILY: a 1d/monitor trace gets the curve models, a 2d
+    # image gets "2D center", and a hist (its own bimodal fit) gets NO general fit.
+    assert set(FIT_MODELS) >= {"Lorentzian", "Gaussian", "Lorentzian (Zeeman)",
+                               "Rabi", "Exp decay", "2D center"}
+    assert _fit_labels_for_kind("1d") == ["Lorentzian", "Gaussian", "Lorentzian (Zeeman)", "Rabi", "Exp decay"]
+    assert _fit_labels_for_kind("2d") == ["2D center"]
+    assert _fit_labels_for_kind("hist") == []            # a hist carries its OWN bimodal fit
+    console = dt.demo_console(shots=5)
+    card = PanelCard(PanelConfig(kind="1d", title="bump", row=0, col=0, size="2x2",
+                                 source="value = bump"), parent=console.board)
+    console._attach_card(card)
+    x = np.linspace(-5, 5, 60)
+    card.refresh({"bump": 3.0 * np.exp(-(x ** 2) / (2 * 1.2 ** 2)) + 0.1, "shot": 1})
+
+    # the Setting popup has NO popup-fit handles (fit is in the per-panel Edit)
+    assert not hasattr(card, "fit_combo") and not hasattr(card, "_do_fit")
+
+    # per-panel Edit tab: fit a Gaussian -> applied as a STORED display knob to the live card + its
+    # snapshot (the ONE _edit_param path, not a throwaway _df mutation), so a fit curve draws on the
+    # snapshot and Clear removes it.
+    console._edit_card(card)
+    editor = console._panel_editors[id(card)]
+    base = len(editor._plotter.ax.lines)
+    editor.fit_combo.setCurrentText("Gaussian")
+    editor.fit_cmd.setText("")
+    editor.do_fit()
+    assert card.config.params.get("fit_model") == "gaussian"
+    assert len(editor._plotter.ax.lines) == base + 1
+    editor.clear_fit()
+    assert card.config.params.get("fit_model", "none") == "none"
+    assert len(editor._plotter.ax.lines) == base
+
+    # relim is owned by the SETTING popup now (tight/normal), persisted on the
+    # card config; the live card picks it up on its next rebuild.
+    card.lim_combo.setCurrentText("normal")
+    card._on_relim_mode("normal")
+    assert card.config.params["relim"] == "normal"
+    card._reset_plot()                                       # force a fresh build
+    card.refresh({"bump": np.ones(60), "shot": 2})
+    assert card.plotter.relim_mode == "normal"
+    console.shutdown()
+
+
+def test_task_console_edit_fits_2d_with_center_model(monkeypatch):
+    """The Edit tab exposes the FULL DataFigure fit set for EVERY kind -- a 2D
+    image fits the 2D-Gaussian "2D center" model (the fit was previously gated
+    out for 2d/sites/hist)."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console(shots=30)
+    try:
+        card = next(c for c in console.cards if c.config.kind == "2d")
+        console._edit_card(card)
+        editor = console._panel_editors[id(card)]
+        models = [editor.fit_combo.itemText(i) for i in range(editor.fit_combo.count())]
+        assert "2D center" in models
+        editor.fit_combo.setCurrentText("2D center")
+        editor.do_fit()
+        assert editor._df is not None and editor._df.fit is not None
+    finally:
+        console.shutdown()
+
+
+def test_pulse_gui_tabs_have_no_close_button(monkeypatch):
+    """The pulse editor's Edit / Preview / Scan tabs must ALWAYS exist -- a plain
+    ``addTab`` carries NO close affordance (only ``add_closable_tab`` does), so
+    none of the three views can be closed."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend import devtools as dt
+
+    ed = dt.demo_editor(size=(1200, 800))
+    try:
+        bar = ed.tabs.tabBar()
+        assert [ed.tabs.tabText(i) for i in range(ed.tabs.count())] == ["Edit", "Preview", "Scan"]
+        for i in range(ed.tabs.count()):
+            assert bar.tabButton(i, QtWidgets.QTabBar.RightSide) is None, ed.tabs.tabText(i)
+    finally:
+        ed.close()
+
+
+def test_monitor_panels_have_no_selectors_and_wheel_scrolls(monkeypatch):
+    """Monitor cards are display-only: NO interactive selectors (so a drag /
+    right-click never starts a zoom/area/cross) and the canvas lets the wheel
+    bubble up (isolate_wheel=False) so the board scrolls under the cursor.  The
+    interactive selectors live in the Edit tab instead."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console(shots=20)
+    try:
+        for card in console.cards:
+            assert card.plotter is not None, card.config.kind
+            assert card.plotter.interactions is False, card.config.kind
+            assert card.plotter.tools.area is None and card.plotter.tools.zoom is None
+            assert card.canvas._zlc_isolate_wheel is False, card.config.kind
+        # the Edit snapshot, by contrast, IS interactive (selectors attached)
+        card = console.cards[0]
+        console._edit_card(card)
+        editor = console._panel_editors[id(card)]
+        assert editor._plotter.interactions is True
+        assert editor._plotter.tools.area is not None
+        # and it MIRRORS the Monitor frame size (never a forced 2x4)
+        assert editor._plotter.spec.data_px == card.plotter.spec.data_px
+    finally:
+        console.shutdown()
+
+
+def test_edit_exposes_producing_node_acquisition_params(monkeypatch):
+    """A plain panel's Edit auto-discovers the parameters of the NODE that
+    produces its data (a loading-image panel is produced by the camera Measurement ->
+    exposure / region / frames_per_cycle), each prefilled with the
+    CURRENT running value and shown as a 'now: X' reference; Restart rebuilds the
+    node.  (This is the fix for the loading-image Edit showing zero params.)"""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.task_console import PanelConfig, TaskConsoleState
+
+    # a 2-D raw-frame view (reads `frame`) -- built inline (there are no presets)
+    state = TaskConsoleState(name="raw_image",
+                             panels=[PanelConfig(kind="2d", title="Loading image", source="value = frame_0")])
+    console = dt.demo_console(shots=20, state=state)
+    try:
+        img = next(c for c in console.cards if c.config.kind == "2d")   # "Loading image"
+        console._edit_card(img)
+        editor = console._panel_editors[id(img)]
+        # the raw-frame ("Loading image") panel reads `frame`, produced by the camera
+        # MEASUREMENT (CameraMeasurement) -- so its Edit exposes the camera's params.
+        assert type(editor._node).__name__ == "CameraMeasurement"
+        assert {"exposure", "frames_per_cycle"} <= set(editor._node_widgets)
+        # fields PREFILLED with current running values + a "now:" reference
+        assert float(editor._node_widgets["exposure"].text()) == editor._node.camera.exposure
+        assert "now:" in editor._node_now_labels["exposure"].text()
+        # editing + Restart reconfigures the camera with the new exposure
+        editor._node_widgets["exposure"].setText("0.05")
+        editor._restart_node()
+        assert editor._node.camera.exposure == 0.05
+        assert editor._node in console.running_nodes
+    finally:
+        console.shutdown()
+
+
+def test_edit_area_select_fills_measurement_scan_range(monkeypatch):
+    """Confocal auto-range: a marked region becomes the NEXT scan's x-range.
+
+    A measurement is now a LOGIC NODE (Logic tab); its Edit is a LogicNodeEditor
+    whose ``.form`` is the auto-generated, single-spec MeasurementPanel.  The
+    surviving confocal ``_read_range`` writeback is ``MeasurementPanel.set_axis_range``:
+    a region selected on a plot of that signal fills the first ``axis_range``
+    param's Min/Max (here the temperature scan's ``t_off``).  The plot-side
+    selector callback that drives it lives on a PLOT panel pointed at the signal
+    (a logic node never plots), so the architectural unit under test is the
+    measurement form's range writeback itself."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console_measurements()
+    try:
+        # the measurement opens with its Logic-tab Edit (LogicNodeEditor) showing
+        # its param form -- the form that carries the scan x-range.
+        editor = next(iter(console._logic_editors.values()))
+        form = editor.form
+        ax = form._widgets["t_off"]; lo, hi, pts = ax.min_spin, ax.max_spin, ax.pts_spin
+        lo.setValue(0.0); hi.setValue(120.0); pts.setValue(5)
+        # a marked region [18, 91] (what a real drag-select on a plot of this
+        # signal yields) becomes the next scan's x-range via set_axis_range.
+        assert form.set_axis_range(18.0, 91.0) is True
+        assert lo.value() == 18.0 and hi.value() == 91.0
+        # order-insensitive: a backwards drag is normalised to Min < Max.
+        assert form.set_axis_range(73.0, 22.0) is True
+        assert lo.value() == 22.0 and hi.value() == 73.0
+    finally:
+        console.shutdown()
+
+
+def test_task_console_sites_panel_bad_centers_isolated(monkeypatch):
+    """A site-map panel whose ONE occupancy signal has NO producing node that supplies centres
+    (so the centres + frame underlay cannot be auto-resolved) reports the error on ITS
+    status line; the other panels keep refreshing."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console(shots=10)
+    sites = next(c for c in console.cards if c.config.kind == "sites")
+    # point the site map at a signal whose producing node publishes NO centres (the camera's
+    # raw ``frame``) -> the panel cannot resolve centres/underlay from that node + errors.
+    sites.config.inputs[0] = "frame_0"
+    sites.config.source = "value = signal"
+    console.refresh_once()
+    assert "frame_0" in sites.status.text()
+    healthy = [c for c in console.cards if c is not sites]
+    assert all(c.status.text().startswith("shot ") for c in healthy)
+    console.shutdown()
+
+
+def test_task_console_cross_signal_expression_and_error_isolation(monkeypatch):
+    """A panel source may combine signals arbitrarily (the A-B loading-rate map);
+    a broken expression lands in that panel's status line and never disturbs the
+    other panels or the console loop."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+
+    console = dt.demo_console(shots=20, dual=True)
+    diff = PanelCard(
+        PanelConfig(kind="1d", title="A-B occupancy", row=4, col=0, size="2x2",
+                    source="value = occupied - b_occupied"))
+    console._attach_card(diff)
+    console._arrange()
+    console.refresh_once()
+    assert diff.plotter is not None and diff.status.text().startswith("shot ")
+    n_sites = np.asarray(console.hub.latest("occupied")).shape[-1]
+    assert int(diff.plotter.data_y.shape[0]) == n_sites          # one A-B value per site
+
+    # break ONE panel: it reports, the siblings keep updating
+    victim = next(card for card in console.cards if card.config.kind == "monitor")
+    victim.source_edit.setText("value = this_signal_does_not_exist")
+    victim._apply_source()
+    for node in console.running_nodes:
+        node.step()
+    console.refresh_once()
+    assert "this_signal_does_not_exist" in victim.status.text()
+    healthy = next(card for card in console.cards if card.config.kind == "2d")
+    assert healthy.status.text().startswith("shot ")
+    console.shutdown()
+
+
+def test_task_console_state_roundtrip(tmp_path, monkeypatch):
+    """Layout JSON: read_state -> save -> load reproduces every panel."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.task_console import TaskConsoleState
+
+    console = dt.demo_console(shots=3)
+    state = console.read_state()
+    path = state.save(tmp_path / "layout.json")
+    loaded = TaskConsoleState.load(path)
+    assert loaded.to_dict() == state.to_dict()
+    console.load_state(loaded)
+    console.refresh_once()
+    assert len(console.cards) == len(loaded.panels)
+    console.shutdown()
+
+
+def test_task_console_add_remove_and_dirty_star(tmp_path, monkeypatch):
+    """Add Panel/remove mark the Save button dirty (confocal star); saving through
+    the stubbed file dialog clears it."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console(shots=3)
+    assert not console.save_button.is_dirty()
+    n_before = len(console.cards)
+    console._add_panel()
+    assert len(console.cards) == n_before + 1
+    assert console.save_button.is_dirty()
+
+    console._remove_panel(console.cards[-1])
+    assert len(console.cards) == n_before
+
+    target = tmp_path / "console.json"
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(target), "")))
+    console.save_to_file()
+    assert target.exists()
+    assert not console.save_button.is_dirty()
+    console.shutdown()
+
+
+def test_pulse_gui_clear_all_resets_to_single_blank_1us_period(monkeypatch):
+    """The header Clear All button wipes the SCHEDULE (periods, delays, DA plans,
+    scan bindings, repeat bracket) down to one blank 1 us period with no channel on,
+    while keeping the hardware hookup (channel names/labels, visibility, bus wiring,
+    clk assignments)."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    editor = dt.demo_editor(size=(1480, 900))
+    before = editor.read_state()
+    assert len(before.periods) > 1 and before.scan_slots   # demo has real content to clear
+
+    editor.clear_all_button.click()
+    dt.settle(editor, 200)
+    state = editor.read_state()
+
+    assert len(state.periods) == 1
+    assert float(state.periods[0].duration) == 1.0 and state.periods[0].unit == "us"
+    assert not any(state.periods[0].states)
+    assert not any(float(v or 0) for v in state.delays.values())
+    assert not state.scan_slots and not state.scan_table
+    assert state.repeat_start is None and state.repeat_end is None
+    for bus, plan in state.analog_bus_modes.items():
+        for entry in plan:                                   # all-hold/None == not driven
+            assert (entry or {}).get("mode", "hold") == "hold", (bus, entry)
+            assert (entry or {}).get("value") is None, (bus, entry)
+    # hookup preserved
+    assert state.channels == before.channels
+    assert state.visible_channels == before.visible_channels
+    assert state.channel_labels == before.channel_labels
+    assert state.analog_buses == before.analog_buses
+    assert state.clk_channels == before.clk_channels
+
+
+def test_pulse_gui_selection_outlines_the_card_edge_not_child_widgets(monkeypatch):
+    """Click-to-select draws ONE rounded outline on the card's outer edge (painted in
+    FluentGroupBox.set_outline), never a stylesheet border -- an unscoped `border:`
+    appended to the card's styleSheet cascades to every child, boxing each inner
+    checkbox/lineedit (the 'ugly selection' report)."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.qt_fluent import ACCENT
+
+    editor = dt.demo_editor(size=(1480, 900))
+    container = editor.drag_container
+    cards = container.pulse_cards()
+
+    container.show_selection(card=1)
+    assert getattr(cards[1], "_zlc_outline", None) == ACCENT
+    assert all(getattr(c, "_zlc_outline", None) is None for i, c in enumerate(cards) if i != 1)
+    # no stylesheet border on the card (it would cascade to all children)
+    assert "border: 2px" not in cards[1].styleSheet()
+
+    container.show_selection(card=None)
+    assert all(getattr(c, "_zlc_outline", None) is None for c in cards)
+
+
+def test_pulse_gui_differing_bus_member_delays_survive_read_state(monkeypatch):
+    """Per-member DAC-bus delays (set from the notebook API, valid in saved JSON)
+    must NOT be silently flattened by the GUI's first read_state.
+
+    The bus row shows ONE delay box for the whole bus.  When the members' delays
+    differ, the box shows a "(mixed)" placeholder and read_values() skips it, so
+    an untouched mixed field never overwrites the per-member state.  Typing in
+    the box clears the protection and applies one delay to all members as before.
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod, PulseTableState
+
+    editor = dt.demo_editor(size=(1480, 900), bind_scans=False)
+    state = PulseTableState(
+        name="mix",
+        channels=["b0", "b1", "t"],
+        channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"},
+        visible_channels=["b0", "b1", "t"],
+        time_step_ns=20.0,
+        periods=[PulsePeriod(200, (0, 0, 1), unit="ns")],
+        analog_bus_modes={"da_x": [{"mode": "edge", "value": 1}]},
+        delays={"b0": 100.0, "b1": 300.0},
+        delay_units={"b0": "ns", "b1": "ns"},
+    )
+    editor.load_state(state)
+    dt.settle(editor, 100)
+
+    out = editor.read_state()
+    assert out.delays.get("b0") == 100.0, out.delays
+    assert out.delays.get("b1") == 300.0, out.delays
+
+    # A second round-trip must be just as safe (the box is rebuilt as "(mixed)").
+    editor.load_state(out)
+    dt.settle(editor, 100)
+    again = editor.read_state()
+    assert again.delays.get("b0") == 100.0 and again.delays.get("b1") == 300.0, again.delays
+
+
+def test_pulse_gui_scan_tab_columns_bottom_aligned(monkeypatch):
+    """The Scan tab's code box and table box must share a bottom edge.
+
+    The user's "#5": the right (table) box used to hang ~one row lower than the
+    left (code) box -- which has the Run/Load/Save buttons beneath it -- so its
+    grey border read as a stray "extra grey edge" protruding past the left box.
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    editor = dt.demo_editor(size=(1480, 900))
+    editor.tabs.setCurrentWidget(editor.scan_tab)
+    dt.settle(editor, 300)
+
+    code_bottom = editor.scan_code.mapTo(editor.scan_tab, editor.scan_code.rect().bottomLeft()).y()
+    table_bottom = editor.scan_table_view.mapTo(
+        editor.scan_tab, editor.scan_table_view.rect().bottomLeft()
+    ).y()
+    assert abs(code_bottom - table_bottom) <= 1, (code_bottom, table_bottom)
+    # And the two boxes' right edges line up with the info banner above them.
+    info = editor.scan_slots_label.parentWidget()
+    info_right = info.mapTo(editor.scan_tab, info.rect().topRight()).x()
+    table_right = editor.scan_table_view.parentWidget().mapTo(
+        editor.scan_tab, editor.scan_table_view.parentWidget().rect().topRight()
+    ).x()
+    assert abs(info_right - table_right) <= 1, (info_right, table_right)
+
+
+def test_pulse_gui_inplace_scan_refresh_matches_rebuild(monkeypatch):
+    """The fast in-place scan refresh must be pixel-faithful to a full rebuild.
+
+    Toggling a scan dot updates the existing widgets in place (the perf fix for
+    the ~400 ms 'Show All' lag) instead of recreating them.  After a sequence of
+    binds/unbinds, forcing a full load_state must reproduce exactly the same
+    widget state -- otherwise the fast path has drifted from the source of truth.
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+
+    app = ensure_qt_app()
+    editor = PulseSequenceEditor(state=dt.demo_state())
+    editor.show()
+    editor.show_all_channels()
+    app.processEvents()
+
+    def snapshot():
+        fields = []
+        for i, card in enumerate(editor.drag_container.pulse_cards()):
+            d = card.duration_edit
+            fields.append(("dur", i, d.text(), d._bound, d.dot.number(), card.unit_combo.currentText()))
+            for bus, e in card.bus_value_edits.items():
+                fields.append(("dac", i, bus, e.text(), e._bound, e.dot.number(),
+                               card.bus_mode_combos[bus].currentText()))
+        for k, e in editor.channel_panel.delay_edits.items():
+            # delay is a fixed per-channel value -- a plain line edit, never scannable
+            fields.append(("del", k, e.text(), editor.channel_panel.delay_units[k].currentText()))
+        return editor.read_state().to_dict(), fields
+
+    bus = list(editor.state.bus_channels())[0]
+    editor.drag_container.pulse_cards()[0].bus_mode_combos[bus].setCurrentText("Edge")
+    app.processEvents()
+    # A mix of binds and unbinds across duration + DAC kinds, all via the in-place path.
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[2]); app.processEvents()
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1]); app.processEvents()
+    editor.drag_container.pulse_cards()[0].bus_dots[bus].clicked.emit(); app.processEvents()
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[3]); app.processEvents()
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[2]); app.processEvents()  # unbind -> renumbers later slots
+
+    state_fast, fields_fast = snapshot()
+    # Force the slow path: a full rebuild from the read-back state.
+    editor.load_state(editor.read_state())
+    app.processEvents()
+    state_slow, fields_slow = snapshot()
+
+    assert fields_fast == fields_slow
+    assert state_fast == state_slow
+
+
+def test_pulse_gui_save_button_keeps_width_on_state_change(monkeypatch):
+    """The Save button must not collapse when its colour changes (e.g. on load).
+
+    set_color() used to reset the size policy to Fixed, so the bottom-bar Save
+    button (opted into Expanding) shrank to its text width the first time its
+    colour flipped -- which happens on load (dirty yellow -> clean blue).
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend import devtools as dt
+
+    editor = dt.demo_editor(size=(1480, 900))
+    dt.settle(editor, 200)
+    width0 = editor.save_button.width()
+    assert editor.save_button.sizePolicy().horizontalPolicy() == QtWidgets.QSizePolicy.Expanding
+    FileState = type(editor.stateui_manager).FileState
+    editor.stateui_manager.filestate = FileState.UNSAVED  # -> yellow
+    dt.settle(editor, 40)
+    editor.stateui_manager.filestate = FileState.LOAD  # -> blue (colour change)
+    dt.settle(editor, 40)
+    assert editor.save_button.sizePolicy().horizontalPolicy() == QtWidgets.QSizePolicy.Expanding
+    assert abs(editor.save_button.width() - width0) <= 1, (width0, editor.save_button.width())
+
+
+def test_pulse_gui_confocal_star_state_semantics(monkeypatch):
+    """State indication follows confocal: stars + status dot, NEVER base colours.
+
+    The user's complaints this guards:
+    * an orange UNSYNCED On Pulse was indistinguishable from the permanently
+      orange Remove/Load/Sync buttons ("你根本就不知道哪个是高亮的");
+    * Add Bracket was permanently yellow, colliding with Save's dirty yellow;
+    * the confocal '*' suffix was missing, and only Save reflected state while
+      On Pulse did not.
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtGui
+
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.qt_fluent import ACCENT, GREEN, ORANGE, RED, YELLOW
+
+    def bg(button):
+        return button._current_bg
+
+    editor = dt.demo_editor(size=(1480, 900))
+    try:
+        dt.settle(editor, 100)
+        manager = editor.stateui_manager
+        RunState = type(manager).RunState
+        FileState = type(manager).FileState
+        green = QtGui.QColor(GREEN).name(QtGui.QColor.HexRgb)
+        yellow = QtGui.QColor(YELLOW).name(QtGui.QColor.HexRgb)
+        accent = QtGui.QColor(ACCENT).name(QtGui.QColor.HexRgb)
+
+        # Base palette must not reuse the state colours: Add Bracket is accent
+        # (yellow is reserved for Save-dirty).
+        assert bg(editor.bracket_button) == accent
+
+        # INIT: editor not applied anywhere -> star, GREEN (colour fixed).
+        assert editor.fire_button.text() == "On Pulse*"
+        assert bg(editor.fire_button) == green
+
+        # RUNNING and in sync: the ONLY state without the star.
+        manager.runstate = RunState.RUNNING
+        assert editor.fire_button.text() == "On Pulse"
+        assert bg(editor.fire_button) == green
+
+        # An edit while running -> UNSYNCED: star comes back, colour STAYS green
+        # (the orange is on the status dot, not the button).
+        editor._mark_dirty()
+        assert manager.runstate == RunState.UNSYNCED
+        assert editor.fire_button.text() == "On Pulse*"
+        assert bg(editor.fire_button) == green
+        dot_style = editor.status_dot.styleSheet().lower()
+        assert ORANGE.lower() in dot_style
+
+        # Every other run state keeps the star and the green colour.
+        for state in (RunState.PREPARED, RunState.STOP, RunState.SAFE, RunState.ERROR):
+            manager.runstate = state
+            assert editor.fire_button.text() == "On Pulse*", state
+            assert bg(editor.fire_button) == green, state
+
+        # Save: confocal FileState semantics -- star+yellow dirty, plain+accent clean.
+        manager.filestate = FileState.UNSAVED
+        assert editor.save_button.text() == "Save*"
+        assert bg(editor.save_button) == yellow
+        manager.filestate = FileState.LOAD
+        assert editor.save_button.text() == "Save"
+        assert bg(editor.save_button) == accent
+        manager.filestate = FileState.UNTITLED
+        assert editor.save_button.text() == "Save*"
+        assert bg(editor.save_button) == yellow
+
+        # The stars must not change button geometry (equal-stretch grid columns).
+        manager.runstate = RunState.RUNNING
+        dt.settle(editor, 40)
+        width_clean = editor.fire_button.width()
+        manager.runstate = RunState.UNSYNCED
+        dt.settle(editor, 40)
+        assert abs(editor.fire_button.width() - width_clean) <= 1
+    finally:
+        editor.close()
+
+
+def test_pulse_gui_scan_unbind_restores_field_state(monkeypatch):
+    """Unbinding a scan slot must restore the field's ORIGINAL value/mode.
+
+    The user's bug: a DAC that was "edge / 500" came back as "hold" after a
+    bind/unbind round-trip.  The same hard-default reset hit duration (-> 1000).
+    Verify both return to exactly what they were.
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+
+    app = ensure_qt_app()
+    editor = PulseSequenceEditor(state=dt.demo_state())
+    editor.show()
+    app.processEvents()
+
+    # --- DAC: edge / 500 -> bind -> unbind -> edge / 500 ---
+    bus = list(editor.state.bus_channels())[0]
+    plan = editor.state.analog_bus_plan(bus)
+    plan[0] = {"mode": "edge", "value": 500}
+    editor.state.analog_bus_modes[bus] = plan
+    editor.load_state(editor.state)
+    app.processEvents()
+    editor.drag_container.pulse_cards()[0].bus_dots[bus].clicked.emit()
+    app.processEvents()
+    editor.drag_container.pulse_cards()[0].bus_dots[bus].clicked.emit()
+    app.processEvents()
+    assert editor.state.analog_bus_plan(bus)[0] == {"mode": "edge", "value": 500}
+
+    # --- duration: keep its original ns value across bind/unbind ---
+    original = editor.state.periods[1].duration
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1])
+    app.processEvents()
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1])
+    app.processEvents()
+    assert str(editor.state.periods[1].duration) == str(original)
+
+
+def test_pulse_gui_scan_dots_clickable_bind_and_unbind(monkeypatch):
+    """Clicking a scan dot must bind AND later unbind -- for duration and DAC.
+
+    The user's bug: "DA dot can't be clicked back".  Root cause was the DAC
+    value field being *disabled* when bound, which also disabled its embedded
+    dot, so the second click never reached the toggle.  This exercises the real
+    signal path (dot.clicked -> scanClicked -> toggle) and asserts the dot stays
+    enabled the whole time.  (A per-channel delay is a fixed value and has no
+    scan dot.)
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+
+    app = ensure_qt_app()
+    editor = PulseSequenceEditor(state=dt.demo_state())
+    editor.show()
+    app.processEvents()
+
+    # --- duration dot (period card) ---
+    dur_dot = editor.drag_container.pulse_cards()[1].duration_edit.dot
+    assert dur_dot.isEnabled()
+    dur_dot.clicked.emit()
+    app.processEvents()
+    assert any(s.kind == "duration" and s.target == "1" for s in editor.state.scan_slots)
+    dur_dot = editor.drag_container.pulse_cards()[1].duration_edit.dot  # rebuilt
+    assert dur_dot.isEnabled()
+    dur_dot.clicked.emit()
+    app.processEvents()
+    assert not any(s.kind == "duration" and s.target == "1" for s in editor.state.scan_slots)
+
+    # --- DAC value dot (force Edge mode so the value is scannable) ---
+    bus = list(editor.state.bus_channels())[0]
+    card = editor.drag_container.pulse_cards()[0]
+    card.bus_mode_combos[bus].setCurrentText("Edge")
+    app.processEvents()
+    dac_dot = editor.drag_container.pulse_cards()[0].bus_dots[bus]
+    assert dac_dot.isEnabled()
+    dac_dot.clicked.emit()
+    app.processEvents()
+    assert any(s.kind == "dac" for s in editor.state.scan_slots)
+    dac_dot = editor.drag_container.pulse_cards()[0].bus_dots[bus]  # rebuilt, now bound
+    assert dac_dot.isEnabled(), "bound DAC dot must stay clickable so it can be unbound"
+    dac_dot.clicked.emit()
+    app.processEvents()
+    assert not any(s.kind == "dac" for s in editor.state.scan_slots)
+
+
+def test_zoompan_scroll_down_zooms_in():
+    """Scroll DOWN must zoom in (smaller view range), scroll UP zoom out."""
+
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from Zou_lab_control.frontend.selectors import ZoomPan
+
+    fig, ax = plt.subplots()
+    ax.set_xlim(0, 10)
+    zoom = ZoomPan(ax)
+
+    class _Event:
+        inaxes = ax
+        xdata = 5.0
+        ydata = 5.0
+        button = "down"
+
+    zoom.on_scroll(_Event())
+    assert (ax.get_xlim()[1] - ax.get_xlim()[0]) < 10, "scroll down should zoom in"
+    ax.set_xlim(0, 10)
+    _Event.button = "up"
+    zoom.on_scroll(_Event())
+    assert (ax.get_xlim()[1] - ax.get_xlim()[0]) > 10, "scroll up should zoom out"
+    plt.close(fig)
+
+
+def test_pulse_preview_has_area_selector(monkeypatch):
+    """The pulse preview must expose a left-drag area selector (was disabled)."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    editor = dt.demo_editor(size=(1200, 800))
+    editor.tabs.setCurrentWidget(editor.preview_tab)
+    dt.settle(editor, 200)
+    assert getattr(editor._preview_plot, "area", None) is not None
+
+
+def test_pulse_save_bundles_artifacts(monkeypatch, tmp_path):
+    """Saving a scanned pulse must bundle pulse + preview + scan data together."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend import devtools as dt
+
+    editor = dt.demo_editor(size=(1200, 800))
+    dt.settle(editor, 150)
+    target = tmp_path / "mypulse.json"
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getSaveFileName",
+        staticmethod(lambda *a, **k: (str(target), "ZLC pulse (*.json)")),
+    )
+    editor.save_to_file()
+    names = {p.name for p in tmp_path.iterdir()}
+    assert "mypulse.json" in names
+    assert "mypulse.png" in names  # preview figure
+    assert "mypulse_scan.npy" in names  # raw scan data
+    # The compiled scan program is attempted too; if it cannot compile the status
+    # surfaces it rather than failing silently.
+    assert "Saved:" in editor.preview_status.text()
+
+
+def test_fluent_button_dirty_semantics(monkeypatch):
+    """Reusable confocal dirty state on FluentButton (the 'On Pulse*' convention):
+    a trailing '*' toggles width-stably; by default the base colour is untouched
+    (action-button rule), and an optional dirty_color reverts to the clean base."""
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtGui
+    from Zou_lab_control.frontend.qt_fluent import ACCENT, GREEN, YELLOW, FluentButton, ensure_qt_app
+
+    ensure_qt_app()
+    # action-button rule: star only, colour unchanged, idempotent
+    run = FluentButton("Run", color=GREEN)
+    base = run._base_color
+    run.set_dirty(True)
+    assert run.text() == "Run*" and run._current_bg == base and run.is_dirty()
+    run.set_dirty(True)
+    assert run.text() == "Run*"          # no accumulated stars
+    run.set_dirty(False)
+    assert run.text() == "Run" and run._current_bg == base and not run.is_dirty()
+    # save-button rule: dirty_color while dirty, reverts to the clean base when clean
+    save = FluentButton("Save", color=ACCENT)
+    clean = save._base_color
+    save.set_dirty(True, dirty_color=YELLOW)
+    assert save.text() == "Save*" and save._current_bg == QtGui.QColor(YELLOW).name(QtGui.QColor.HexRgb)
+    save.set_dirty(False)
+    assert save.text() == "Save" and save._current_bg == clean
+
+
+def test_scan_run_button_dirty_on_code_edit(monkeypatch):
+    """#5: editing the Scan-tab code marks Run dirty (Run*); a successful Run clears it."""
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+
+    ensure_qt_app()
+    editor = PulseSequenceEditor(state=na.PulseTableState(
+        channels=["ch0", "ch1"], channel_labels={"ch0": "cooling", "ch1": "da_dipole[0]"},
+        visible_channels=["ch0", "ch1"], time_step_ns=20.0,
+        periods=[na.PulsePeriod(100, (1, 0), unit="ns")]))
+    assert hasattr(editor, "scan_run_button")
+    editor.scan_run_button.set_dirty(False)        # baseline clean
+    editor.scan_code.setPlainText("scan_table = [[1.0]]")   # edit -> dirty
+    assert editor.scan_run_button.is_dirty() and editor.scan_run_button.text() == "Run*"
+
+
+def test_fluent_combo_popup_fits_widest_item(monkeypatch):
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend.qt_fluent import (
+        COMBO_WIDTH,
+        EDIT_PADDING_H,
+        FluentComboBox,
+        ensure_qt_app,
+        scaled_px,
+    )
+
+    app = ensure_qt_app()
+    combo = FluentComboBox()
+    combo.addItems(["Edge", "Ramp", "Hold"])
+    combo.setFixedWidth(60)  # deliberately narrow, like the DAC mode combo
+    combo.show()
+    app.processEvents()
+    combo.showPopup()
+    app.processEvents()
+    # The popup is sized to its widest item plus the dropdown + padding so options
+    # are never clipped.  Verify that exact relationship (font-independent) rather
+    # than a fixed pixel threshold that drifts with the ambient font.
+    view = combo.view()
+    metrics = view.fontMetrics()
+    try:
+        widest = max(metrics.horizontalAdvance(combo.itemText(i)) for i in range(combo.count()))
+    except AttributeError:  # pragma: no cover - very old Qt
+        widest = max(metrics.width(combo.itemText(i)) for i in range(combo.count()))
+    assert view.minimumWidth() == widest + scaled_px(COMBO_WIDTH) + scaled_px(EDIT_PADDING_H) * 2
+    assert view.minimumWidth() >= widest  # never clips the widest item
+    combo.hidePopup()
+
+
 def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -835,30 +2506,63 @@ def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
         assert not hasattr(editor.channel_panel, "y_edit")
         assert not hasattr(editor.channel_panel, "scan_y_switch")
         assert not hasattr(editor.channel_panel, "scan_edit")
-        assert editor.channel_panel.top_labels["params"].text() == "Params:"
-        assert editor.channel_panel.top_labels["file"].text() == "File:"
-        assert editor.channel_panel.scan_params_edit.text() == ""
-        assert editor.channel_panel.scan_file_edit.text() == ""
+        # The single named-slot scan summary replaces the old Use-Y / Scan X UI.
+        assert editor.channel_panel.scan_summary.metaObject().className() == "FluentLineEdit"
+        assert editor.channel_panel.scan_summary.isEnabled() is False
+        assert editor.channel_panel.scan_summary.text() == "no scan slots"
+        assert editor.channel_panel.load_button.text() == "Load Array"
         first_card = editor.drag_container.pulse_cards()[0]
         assert first_card.checks["ch00"].text() == "ch00"
         assert editor.channel_panel.channel_labels["ch00"].text() == "ch00"
         assert hasattr(first_card, "unit_combo")
-        assert not hasattr(first_card, "name_edit")
+        # The period card has an editable NAME field (the index stays in the title).
+        assert hasattr(first_card, "name_edit")
+        assert first_card.name_edit.placeholderText() != ""
         assert first_card.duration_edit.geometry().right() <= first_card.width()
         assert first_card.unit_combo.geometry().right() <= first_card.width()
         assert editor.tabs.graphicsEffect() is not None
         assert editor.names_panel.graphicsEffect() is not None
         assert editor.channel_panel.graphicsEffect() is not None
         assert first_card.graphicsEffect() is not None
-        assert editor.button_frame.graphicsEffect() is not None
-        assert editor.button_frame.metaObject().className() == "FluentGroupBox"
-        assert editor.button_frame.title() == "Control Buttons"
-        assert editor.channel_view.graphicsEffect() is not None
-        assert editor.channel_view.title() == "Channel View"
-        assert editor.channel_view.parent() is editor.button_frame
-        assert editor.button_frame.minimumHeight() >= editor.channel_view.minimumHeight()
-        assert editor.channel_view.layout().contentsMargins().top() > editor.channel_view.layout().contentsMargins().left()
-        assert editor.load_button.text() == "Load\nFile"
+        assert editor.button_frame.metaObject().className() == "FluentFrame"
+
+        def _has_ancestor(widget, frame):
+            node = widget
+            while node is not None:
+                if node is frame:
+                    return True
+                node = node.parent()
+            return False
+
+        def _group_box_ancestor(widget):
+            node = widget.parent()
+            while node is not None:
+                if node.metaObject().className() == "FluentGroupBox":
+                    return node
+                node = node.parent()
+            return None
+
+        # The bottom bar holds the controls in two titled Fluent cards (Control /
+        # Channels), consistent with the other panels' group-box-with-title style.
+        assert _has_ancestor(editor.safe_button, editor.button_frame)
+        assert _has_ancestor(editor.add_channel_combo, editor.button_frame)
+        assert _has_ancestor(editor.hide_off_button, editor.button_frame)
+        assert _has_ancestor(editor.show_all_button, editor.button_frame)
+        control_box = _group_box_ancestor(editor.safe_button)
+        channels_box = _group_box_ancestor(editor.add_channel_combo)
+        assert control_box is not None and control_box.title() == "Control"
+        assert channels_box is not None and channels_box.title() == "Channels"
+        # The titled cards carry the Fluent shadow (the container itself is flat).
+        assert control_box.graphicsEffect() is not None
+        assert channels_box.graphicsEffect() is not None
+        assert editor.load_button.text() == "Load"
+        # The control bar is compact: every button is single-line (no wrapped
+        # "Stop\nPulse" art) so the bar stays short and the editor area expands.
+        for _button in (
+            editor.safe_button, editor.fire_button, editor.remove_button, editor.add_button,
+            editor.bracket_button, editor.collapse_button, editor.save_button, editor.load_button,
+        ):
+            assert "\n" not in _button.text(), _button.text()
         assert editor.names_panel_layout.contentsMargins().top() == editor.drag_container.layout_main.contentsMargins().top()
         assert editor.names_panel_layout.contentsMargins().top() > 0
         def y_in_editor(widget):
@@ -867,35 +2571,32 @@ def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
         def x_in_editor(widget):
             return widget.mapTo(editor, QtCore.QPoint(0, 0)).x()
 
-        assert editor.channel_panel.top_labels["params"].alignment() == QtCore.Qt.AlignCenter
-        assert editor.channel_panel.top_labels["file"].alignment() == QtCore.Qt.AlignCenter
+        assert editor.channel_panel.top_labels["scan"].alignment() == QtCore.Qt.AlignCenter
         assert editor.channel_panel.top_labels["step"].alignment() == QtCore.Qt.AlignCenter
-        assert x_in_editor(editor.channel_panel.top_labels["step"]) == x_in_editor(editor.channel_panel.top_labels["params"])
-        assert x_in_editor(editor.channel_panel.top_labels["params"]) == x_in_editor(editor.channel_panel.top_labels["file"])
-        assert x_in_editor(editor.channel_panel.step_edit) == x_in_editor(editor.channel_panel.scan_params_edit)
-        assert x_in_editor(editor.channel_panel.scan_params_edit) == x_in_editor(editor.channel_panel.scan_file_edit)
-        assert abs(y_in_editor(editor.channel_panel.top_labels["params"]) - y_in_editor(editor.channel_panel.scan_params_edit)) <= 1
-        assert editor.channel_panel.top_labels["params"].height() == editor.channel_panel.scan_params_edit.height()
-        assert abs(y_in_editor(editor.channel_panel.top_labels["file"]) - y_in_editor(editor.channel_panel.scan_file_edit)) <= 1
-        assert editor.channel_panel.top_labels["file"].height() == editor.channel_panel.scan_file_edit.height()
-        assert abs(y_in_editor(editor.channel_panel.top_labels["step"]) - y_in_editor(editor.channel_panel.step_edit)) <= 1
-        assert editor.channel_panel.top_labels["step"].height() == editor.channel_panel.step_edit.height()
+        assert x_in_editor(editor.channel_panel.top_labels["step"]) == x_in_editor(editor.channel_panel.top_labels["scan"])
+        assert x_in_editor(editor.channel_panel.step_display) == x_in_editor(editor.channel_panel.scan_summary)
+        assert abs(y_in_editor(editor.channel_panel.top_labels["scan"]) - y_in_editor(editor.channel_panel.scan_summary)) <= 1
+        assert editor.channel_panel.top_labels["scan"].height() == editor.channel_panel.scan_summary.height()
+        assert abs(y_in_editor(editor.channel_panel.top_labels["step"]) - y_in_editor(editor.channel_panel.step_display)) <= 1
+        assert editor.channel_panel.top_labels["step"].height() == editor.channel_panel.step_display.height()
+        # The clock step is read-only (fixed by the FPGA clock), shown as MHz · ns/tick.
+        assert editor.channel_panel.step_display.isEnabled() is False
+        assert "MHz" in editor.channel_panel.step_display.text()
         assert abs(y_in_editor(editor.names_panel.raw_label_widgets["ch00"]) - y_in_editor(editor.channel_panel.delay_edits["ch00"])) <= 1
         assert abs(y_in_editor(editor.channel_panel.delay_edits["ch00"]) - y_in_editor(first_card.checks["ch00"])) <= 1
-        assert abs(y_in_editor(editor.channel_panel.scan_params_edit) - y_in_editor(editor.names_panel.total_label)) <= 1
-        assert abs(y_in_editor(editor.channel_panel.scan_file_edit) - y_in_editor(editor.names_panel.periods_label)) <= 1
         margins = editor.edit_tab.layout().contentsMargins()
         assert margins.left() > 0 and margins.top() > 0
-        controls = [
-            editor.add_channel_combo,
-            editor.add_channel_button,
-            editor.hide_off_button,
-            editor.show_all_button,
-        ]
-        assert {control.width() for control in controls} == {editor.add_channel_combo.width()}
-        assert {control.height() for control in controls} == {editor.add_channel_combo.height()}
-        assert editor.add_channel_combo.geometry().x() == editor.hide_off_button.geometry().x()
-        assert editor.add_channel_button.geometry().x() == editor.show_all_button.geometry().x()
+        # Compact channel-view layout: a full-width combo above a left-to-right
+        # row of three equal-height buttons (Add / Hide Off / Show All).
+        row_buttons = [editor.add_channel_button, editor.hide_off_button, editor.show_all_button]
+        assert {button.height() for button in row_buttons} == {editor.add_channel_button.height()}
+        assert editor.add_channel_combo.height() == editor.add_channel_button.height()
+        assert (
+            editor.add_channel_button.geometry().x()
+            < editor.hide_off_button.geometry().x()
+            < editor.show_all_button.geometry().x()
+        )
+        assert editor.add_channel_combo.width() >= editor.show_all_button.width()
         assert editor.preview_include_off.metaObject().className() == "FluentSwitch"
         assert editor.preview_include_off.text() == "Show off rows"
         assert not hasattr(editor, "preview_refresh_button")
@@ -907,12 +2608,16 @@ def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
         app.processEvents()
         assert editor.names_panel_holder.isHidden()
         assert editor.channel_panel_holder.isHidden()
+        # the collapsed stub lives in a shadow-pad holder (so its drop shadow renders); the
+        # holder is the toggle, the stub follows its parent's visibility.
+        assert not editor.left_panel_stub_holder.isHidden()
         assert editor.left_panel_stub.isVisible()
         editor.show_left_panels()
         app.processEvents()
         assert not editor.names_panel_holder.isHidden()
         assert not editor.channel_panel_holder.isHidden()
-        assert editor.left_panel_stub.isHidden()
+        assert editor.left_panel_stub_holder.isHidden()
+        assert not editor.left_panel_stub.isVisible()
         assert editor.tabs.currentWidget() is editor.edit_tab
         editor.tabs.setCurrentWidget(editor.preview_tab)
         app.processEvents()
@@ -948,7 +2653,10 @@ def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
         app.processEvents()
         assert editor.channel_panel.channel_labels["ch01"].text() == "cooling_laser"
         current_first_card = editor.drag_container.pulse_cards()[0]
-        assert current_first_card.checks["ch01"].text() == "cooling_laser"
+        # Period-card checkboxes elide long labels (with the full name in the
+        # tooltip + tracked in check_full_labels) so they never spill the card.
+        assert current_first_card.check_full_labels["ch01"] == "cooling_laser"
+        assert "cooling_laser" in current_first_card.checks["ch01"].toolTip()
         editor.clear_channel("ch01")
         app.processEvents()
         assert editor.state.visible_channels == ["ch00", "ch01", "ch02", "ch03"]
@@ -1016,7 +2724,10 @@ def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
         editor.save_to_file()
         assert "pulse_custom.json" in captured["defaults"][0].replace("\\", "/")
         assert (tmp_path / "pulse_custom.json").exists()
-        assert not (tmp_path / "pulse_custom.png").exists()
+        # Saving a pulse bundles the preview figure next to the JSON; an explicit
+        # Save Figure export then re-writes the same PNG.
+        assert (tmp_path / "pulse_custom.png").exists()
+        (tmp_path / "pulse_custom.png").unlink()
         editor.save_figure()
         assert (tmp_path / "pulse_custom.png").exists()
 
@@ -1038,10 +2749,10 @@ def test_standalone_pulse_gui_defaults_use_hardware_channel_names():
     channels = launcher._default_channels(5)
     assert channels == ["ch00", "ch01", "ch02", "ch03", "ch04"]
     assert not hasattr(launcher, "DEFAULT_CHANNEL_LABELS")
-    args = SimpleNamespace(trigger_channels=None)
-    with pytest.raises(ValueError, match="emCCD"):
-        launcher._resolve_trigger_channels(args, [f"ch{i:02d}" for i in range(62)])
-    assert launcher._resolve_trigger_channels(args, [f"ch{i:02d}" for i in range(62)], {"ch11": "emCCD"}) == ["ch11"]
+    # The sequencer is a pure streamer: which line gates a camera is the CAMERA's property, so the
+    # standalone pulse editor no longer resolves a trigger channel or accepts --trigger-channels.
+    assert not hasattr(launcher, "_resolve_trigger_channels")
+    assert "--trigger-channels" not in launcher._build_parser().format_help()
     assert launcher._build_parser().parse_args([]).clock_hz == 50_000_000
 
 
@@ -1056,7 +2767,6 @@ def test_pulse_gui_controls_call_attached_address_switch_sequencer(monkeypatch):
 
     class RecordingSequencer:
         clock_hz = 50e6
-        trigger_channels = ["ch11"]
 
         def __init__(self):
             self.channels = channels
@@ -1066,7 +2776,7 @@ def test_pulse_gui_controls_call_attached_address_switch_sequencer(monkeypatch):
         def prepare(self, sequence):
             self.prepared = sequence
             self.events.append(("prepare", sequence.name, list(sequence.channels)))
-            return na.compile_runtime_program_for_payload(sequence, channels=self.channels, clock_hz=self.clock_hz, trigger_channels=self.trigger_channels)
+            return na.compile_runtime_program_for_payload(sequence, channels=self.channels, clock_hz=self.clock_hz)
 
         def fire(self):
             self.events.append(("fire",))
@@ -1088,8 +2798,9 @@ def test_pulse_gui_controls_call_attached_address_switch_sequencer(monkeypatch):
         editor.show()
         app.processEvents()
 
-        assert editor.fire_button.text() == "On\nPulse"
-        assert editor.safe_button.text() == "Stop\nPulse"
+        # INIT: nothing applied yet -> confocal star ("pressing would apply").
+        assert editor.fire_button.text() == "On Pulse*"
+        assert editor.safe_button.text() == "Stop Pulse"
         assert editor.names_panel.raw_label_widgets["ch00"].text() == "F15"
         assert editor.names_panel.raw_label_widgets["ch11"].text() == "M13"
         assert not hasattr(editor, "prepare_button")
@@ -1103,10 +2814,55 @@ def test_pulse_gui_controls_call_attached_address_switch_sequencer(monkeypatch):
         assert sequencer.events[0][0] == "prepare"
         assert [event[0] for event in sequencer.events] == ["prepare", "fire", "safe"]
         assert editor.last_program.channels == channels
-        assert editor.last_program.trigger_count == 1
         assert isinstance(sequencer.prepared, na.PulseTableState)
         assert sequencer.prepared.to_sequence(expand_repeat=False).validate(clock_hz=50e6, channels=channels).ok
         assert editor.last_program.repeat_forever is True
+    finally:
+        editor.close()
+
+
+def test_pulse_gui_runtime_connection_control(monkeypatch):
+    """The Connection control lets the user pick the sequencer backend AFTER
+    opening (Virtual / Remote / Offline), instead of fixing it on the command
+    line.  Virtual swaps in a RuntimeSequencer built with the editor's OWN
+    channels; Offline detaches (the editor stays usable); a failed Remote
+    connect is reported and leaves the current connection untouched."""
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor, ensure_qt_app
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequencer
+
+    ensure_qt_app()
+    channels = [f"ch{i:02d}" for i in range(12)]
+    seq = RuntimeSequencer(channels=channels)
+    editor = PulseSequenceEditor(channels=channels, sequencer=seq)
+    try:
+        # opens reflecting the launch (virtual) sequencer; host:port disabled
+        items = [editor.conn_target_combo.itemData(i) for i in range(editor.conn_target_combo.count())]
+        assert items == ["virtual", "remote", "offline"]
+        assert editor.conn_target_combo.currentData() == "virtual"
+        assert editor.conn_addr_edit.isEnabled() is False
+        assert editor.conn_status.text() == "Virtual (sim)"
+
+        # Offline -> detaches (None); a prepare still validates without a backend
+        editor.conn_target_combo.setCurrentIndex(editor.conn_target_combo.findData("offline"))
+        editor._apply_connection()
+        assert editor.sequencer is None
+        assert editor.conn_status.text() == "Offline (edit only)"
+        editor.prepare()  # must not raise with no sequencer attached
+
+        # Virtual -> swaps in a fresh RuntimeSequencer with the editor's channels
+        editor.conn_target_combo.setCurrentIndex(editor.conn_target_combo.findData("virtual"))
+        editor._apply_connection()
+        assert type(editor.sequencer).__name__ == "RuntimeSequencer"
+        assert list(editor.sequencer.channels) == channels
+
+        # Remote to a dead address -> reported, connection unchanged (stays virtual)
+        editor.conn_target_combo.setCurrentIndex(editor.conn_target_combo.findData("remote"))
+        assert editor.conn_addr_edit.isEnabled() is True
+        editor.conn_addr_edit.setText("127.0.0.1:1")
+        editor._apply_connection()
+        assert type(editor.sequencer).__name__ == "RuntimeSequencer"
     finally:
         editor.close()
 
@@ -1181,15 +2937,215 @@ def test_pulse_gui_repeat_preview_uses_unexpanded_periods(monkeypatch):
         editor.close()
 
 
-def test_pulse_gui_named_scan_bindings_list_file_and_mark_symbolic_regions(monkeypatch, tmp_path):
+def test_pulse_gui_preview_refresh_skips_rebuild_when_unchanged(monkeypatch):
+    """Revisiting the Preview tab with an UNCHANGED state must not rebuild the
+    ~130 ms figure+canvas -- but must look exactly like a rebuild: the view
+    returns to the home zoom and any selection rectangle is cleared.  A real
+    edit or the Show-off-rows toggle still rebuilds."""
+
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.pulse_gui import FigureCanvas
+
+    if FigureCanvas is None:
+        pytest.skip("Matplotlib Qt canvas is unavailable")
+
+    editor = dt.demo_editor(size=(1480, 900))
+    try:
+        editor.tabs.setCurrentWidget(editor.preview_tab)
+        dt.settle(editor, 200)
+        canvas = editor._preview_canvas
+        assert canvas is not None
+
+        # unchanged state -> the canvas object survives (no rebuild)
+        editor.refresh_preview()
+        assert editor._preview_canvas is canvas
+
+        # ...but a zoomed view returns to home (identical to the old rebuild)
+        zoom = editor._preview_plot.tools.zoom
+        home = tuple(zoom.ax.get_xlim())
+        zoom.ax.set_xlim(home[0], home[1] * 0.5)
+        editor.refresh_preview()
+        assert tuple(zoom.ax.get_xlim()) == home
+        assert editor._preview_canvas is canvas
+
+        # ...and an auxiliary status message (Save-figure / sync / scan-load) left
+        # on the shared status label must NOT linger across an unchanged re-entry;
+        # the skip-path restores the "N/M plotted" line a rebuild would have shown.
+        plotted = editor.preview_status.text()
+        assert "plotted" in plotted
+        editor.preview_status.setText("Saved figure: foo.png")
+        editor.refresh_preview()
+        assert editor._preview_canvas is canvas          # still skipped (no rebuild)
+        assert editor.preview_status.text() == plotted    # status restored
+
+        # a real edit rebuilds
+        editor.drag_container.pulse_cards()[0].duration_edit.setText("1234567")
+        dt.settle(editor, 50)
+        editor.refresh_preview()
+        assert editor._preview_canvas is not canvas
+
+        # the Show-off-rows toggle rebuilds too
+        canvas = editor._preview_canvas
+        editor.preview_include_off.setChecked(True)
+        dt.settle(editor, 400)
+        assert editor._preview_canvas is not canvas
+    finally:
+        editor.close()
+
+
+def test_pulse_gui_shadows_pixel_match_stock_effect(monkeypatch):
+    """CachedDropShadow must render the editor pixel-identical to the stock
+    QGraphicsDropShadowEffect (the look is mandatory; only the implementation
+    may differ).
+
+    Guards two real regressions the user caught on screen:
+    * drawSource()-based effects silently break NESTED effects (every card
+      shadow inside the shadowed tab widget vanished);
+    * a rounded-rect silhouette bake painted a white band over the transparent
+      strip right of the tabs (the tab widget is not an opaque rounded rect).
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from PyQt5 import QtGui, QtWidgets
+
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend import qt_fluent as qf
+
+    def grab_editor() -> np.ndarray:
+        editor = dt.demo_editor(size=(1480, 900))
+        dt.settle(editor)
+        image = editor.grab().toImage().convertToFormat(QtGui.QImage.Format_ARGB32)
+        w, h = image.width(), image.height()
+        ptr = image.bits()
+        ptr.setsize(h * image.bytesPerLine())
+        arr = np.frombuffer(ptr, np.uint8).reshape(h, image.bytesPerLine() // 4, 4)[:, :w, :3].copy()
+        editor.close()
+        return arr.astype(int)
+
+    cached = grab_editor()
+
+    def add_stock_shadow(widget, *, blur=20, alpha=50, offset=0, **_ignored):
+        effect = QtWidgets.QGraphicsDropShadowEffect(widget)
+        effect.setBlurRadius(qf.scaled_px(blur))
+        effect.setColor(QtGui.QColor(0, 0, 0, alpha))
+        effect.setOffset(0, qf.scaled_px(offset, minimum=0))
+        widget.setGraphicsEffect(effect)
+
+    monkeypatch.setattr(qf, "add_fluent_shadow", add_stock_shadow)
+    stock = grab_editor()
+
+    diff = np.abs(stock - cached).max(axis=2)
+    # CachedDropShadow bakes the shadow from the source's OWN alpha (white-filled), so it matches
+    # the stock effect for ANY widget shape -- including the tab widget whose UNSELECTED tabs are
+    # transparent (a hand-built silhouette baked a white BAND over them: ~50 000 px, max ~30).  The
+    # residual here is sub-perceptible penumbra antialiasing between a CACHED blur (baked once into a
+    # pixmap) and the stock DIRECT blur -- a few hundred px that differ by AT MOST a handful of grey
+    # levels (measured ~250 px, max ~8, across the tab widget + every nested card shadow).  The two
+    # real regressions this guards still fail by orders of magnitude: a white band / missing shadow
+    # is tens of thousands of px (count guard), and any VISIBLE mismatch blows the max-diff guard.
+    assert int((diff > 4).sum()) < 400, (int(diff.max()), int((diff > 4).sum()))
+    assert int(diff.max()) <= 16   # tightened from 40: the alpha-mask floor is max ~8; a band was ~30
+
+    # ... and the shadows must actually exist (compare against no effect at all):
+    monkeypatch.setattr(qf, "add_fluent_shadow", lambda widget, **kw: None)
+    none = grab_editor()
+    presence = np.abs(stock - none).max(axis=2)
+    presence_cached = np.abs(cached - none).max(axis=2)
+    assert int((presence > 10).sum()) > 10_000          # stock shadows touch many px
+    assert int((presence_cached > 10).sum()) > 10_000   # ours must too
+
+
+def test_pulse_gui_preview_wheel_over_plot_never_scrolls_page(monkeypatch):
+    """A wheel over the pulse plot must zoom the plot ONLY -- the preview page
+    must not scroll underneath it, no matter how Qt delivers the wheel.
+
+    Guards the user report: "在preview的pulse plot区滚滚轮，整个preview页面的
+    scroll还是会响应".  Accepting on the canvas is NOT enough: Qt can deliver
+    the wheel straight to the scroll-area viewport, which is why the editor
+    installs a viewport event filter.  This test injects the wheel on the
+    VIEWPORT (the previously-broken delivery path) and on the canvas, and also
+    checks that off-canvas wheels still scroll the page.
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from PyQt5 import QtCore, QtGui, QtWidgets
+
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.pulse_gui import FigureCanvas
+
+    if FigureCanvas is None:
+        pytest.skip("Matplotlib Qt canvas is unavailable")
+
+    editor = dt.demo_editor(size=(1200, 800))
+    try:
+        editor.tabs.setCurrentWidget(editor.preview_tab)
+        dt.settle(editor)
+        canvas = editor._preview_canvas
+        assert canvas is not None
+        scroll = editor.preview_scroll
+        vp = scroll.viewport()
+        vbar = scroll.verticalScrollBar()
+        # Make the page genuinely scrollable (same situation as a many-channel
+        # preview taller than the window).
+        editor.preview_body.setFixedHeight(vp.height() + 600)
+        dt.settle(editor)
+        assert vbar.maximum() > 0
+
+        def wheel(target, pos_local, delta=-120):
+            event = QtGui.QWheelEvent(
+                QtCore.QPointF(pos_local),
+                QtCore.QPointF(target.mapToGlobal(pos_local)),
+                QtCore.QPoint(0, 0), QtCore.QPoint(0, delta),
+                QtCore.Qt.NoButton, QtCore.Qt.NoModifier,
+                QtCore.Qt.NoScrollPhase, False)
+            QtWidgets.QApplication.sendEvent(target, event)
+
+        # 1) the broken path: wheel delivered to the viewport at a point over
+        #    the canvas -> must be consumed (page does not move)...
+        over_canvas = vp.mapFromGlobal(canvas.mapToGlobal(canvas.rect().center()))
+        vbar.setValue(0)
+        ax = canvas.figure.axes[0]
+        xlim_before = ax.get_xlim()
+        wheel(vp, over_canvas, delta=120)   # zoom IN (zoom-out is clamped at full view)
+        dt.settle(editor)
+        assert vbar.value() == 0
+        # ...and the plot itself must have responded (zoom changed the x-range).
+        assert ax.get_xlim() != xlim_before
+
+        # 2) wheel delivered directly to the canvas -> also no page scroll.
+        vbar.setValue(0)
+        wheel(canvas, canvas.rect().center())
+        dt.settle(editor)
+        assert vbar.value() == 0
+
+        # 3) wheel on the viewport OFF the canvas -> normal page scrolling.
+        canvas_in_vp = QtCore.QRect(
+            vp.mapFromGlobal(canvas.mapToGlobal(canvas.rect().topLeft())), canvas.size())
+        off_canvas = QtCore.QPoint(vp.width() - 4, vp.height() - 4)
+        if not canvas_in_vp.contains(off_canvas):
+            vbar.setValue(0)
+            wheel(vp, off_canvas)
+            dt.settle(editor)
+            assert vbar.value() > 0
+    finally:
+        editor.close()
+
+
+def test_pulse_gui_scan_array_toggle_validates_and_marks_symbolic_regions(monkeypatch):
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from PyQt5 import QtCore
 
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor, ensure_qt_app
 
     app = ensure_qt_app()
-    scan_file = tmp_path / "scan_points.txt"
-    scan_file.write_text("# vars: p1_duration(ns), trig_delay(ns)\n20 0\n40 20\n", encoding="utf-8")
     state = na.PulseTableState(
         channels=["ch00", "ch03"],
         periods=[
@@ -1205,57 +3161,52 @@ def test_pulse_gui_named_scan_bindings_list_file_and_mark_symbolic_regions(monke
         editor.show()
         app.processEvents()
 
+        # The old x/y scan widgets are gone; scanning is now per-field named slots.
         assert not hasattr(editor.channel_panel, "x_edit")
         assert not hasattr(editor.channel_panel, "y_edit")
         assert not hasattr(editor.channel_panel, "scan_y_switch")
         assert not hasattr(editor.channel_panel, "scan_edit")
-        first_card, second_card = editor.drag_container.pulse_cards()
-        first_card.duration_scan_button.click()
-        app.processEvents()
-        assert first_card.duration_edit.text() == "p1_duration"
-        assert first_card.duration_edit.isReadOnly()
-        assert first_card.duration_edit.property("zlcScanBound") == "true"
-        assert not first_card.unit_combo.isEnabled()
-        first_card.duration_scan_button.click()
-        app.processEvents()
-        assert first_card.duration_edit.text() == "20"
-        assert not first_card.duration_edit.isReadOnly()
-        assert first_card.duration_edit.property("zlcScanBound") == "false"
-        assert first_card.unit_combo.isEnabled()
-        assert "period:0:duration" not in editor.read_state().scan_bindings
-        first_card.duration_scan_button.click()
-        second_card.duration_edit.setText("100-p1_duration")
-        editor.channel_panel._bind_delay_scan("ch03")
-        app.processEvents()
-        assert editor.channel_panel.delay_edits["ch03"].text() == "trig_delay"
-        assert editor.channel_panel.delay_edits["ch03"].isReadOnly()
-        assert editor.channel_panel.delay_edits["ch03"].property("zlcScanBound") == "true"
-        assert not editor.channel_panel.delay_units["ch03"].isEnabled()
-        editor.channel_panel._bind_delay_scan("ch03")
-        app.processEvents()
-        assert editor.channel_panel.delay_edits["ch03"].text() == "0"
-        assert not editor.channel_panel.delay_edits["ch03"].isReadOnly()
-        assert editor.channel_panel.delay_edits["ch03"].property("zlcScanBound") == "false"
-        assert editor.channel_panel.delay_units["ch03"].isEnabled()
-        editor.channel_panel._bind_delay_scan("ch03")
-        editor.channel_panel.scan_file_edit.setText(str(scan_file))
-        app.processEvents()
+        assert editor.channel_panel.scan_summary.text() == "no scan slots"
+        assert editor.read_state().scan_slots == []
 
+        # Bind the first period's duration to a scan slot via its dot.
+        first_card = editor.drag_container.pulse_cards()[0]
+        editor._toggle_duration_scan(first_card)
+        app.processEvents()
+        assert editor.state.slot_index_for("duration", "0") == 0
+        assert editor.drag_container.pulse_cards()[0].duration_dot.isChecked()
+
+        # A one-slot scan table drives the seamless hardware scan compiler.
+        editor.state.set_scan_table([[20.0], [40.0]])
+        editor.load_state(editor.state)
+        app.processEvents()
+        assert editor.channel_panel.scan_summary.text() == "1 slot · 2 pts"
+        scan_program = editor.read_state().compile_scan(clock_hz=50_000_000)
+        assert scan_program.scan_enabled is True
+        assert scan_program.slot_count == 1
+        assert scan_program.scan_points == [[1], [2]]
+
+        # Bind a second slot (the second period's duration) so the preview shades
+        # two regions.  (A per-channel delay is a fixed value and is not scannable.)
+        editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1])
+        app.processEvents()
+        assert [slot.kind for slot in editor.state.scan_slots] == ["duration", "duration"]
+        assert editor.state.slot_index_for("duration", "1") == 1
+        assert editor.drag_container.pulse_cards()[1].duration_dot.isChecked()
+        editor.state.set_scan_table([[20.0, 80.0], [40.0, 120.0]])
+        editor.load_state(editor.state)
+        app.processEvents()
+        assert editor.channel_panel.scan_summary.text() == "2 slots · 2 pts"
         restored = editor.read_state()
-        assert restored.scan_points == []
-        assert restored.scan_table_path.endswith("scan_points.txt")
-        assert restored.scan_variables["p1_duration"] == 20
-        assert restored.scan_variables["trig_delay"] == 0
-        assert restored.scan_bindings["period:0:duration"] == "p1_duration"
-        assert restored.scan_bindings["delay:ch03"] == "trig_delay"
-        assert restored.active_scan_parameters() == ["p1_duration", "trig_delay"]
-        assert "p1_duration" in editor.channel_panel.scan_params_edit.text()
+        assert restored.slot_count == 2
+        assert restored.scan_table == [[20.0, 80.0], [40.0, 120.0]]
+        assert restored.n_points == 2
 
-        plotter, _channels, _repeat = editor._create_preview_plot(editor.read_state(), include_always_off=True)
+        # The preview shades each scanned span with the slot's 1-based number.
+        plotter, _channels, _repeat = editor._create_preview_plot(restored, include_always_off=True)
         labels = [text.get_text() for text in plotter.variable_region_labels]
-        assert "p1_duration" in labels
-        assert "100-p1_duration" in labels
-        assert len({round(text.get_position()[1], 6) for text in plotter.variable_region_labels}) == 1
+        assert "1" in labels
+        assert "2" in labels
         assert len(plotter.variable_region_artists) >= 2
         for patch in plotter.variable_region_artists:
             y_values = [round(float(point[1]), 6) for point in patch.get_path().vertices]
@@ -1263,62 +3214,13 @@ def test_pulse_gui_named_scan_bindings_list_file_and_mark_symbolic_regions(monke
             assert max(y_values) == 1.0
         if hasattr(plotter, "fig") and plotter.fig is not None:
             plotter.fig.canvas.draw()
-    finally:
-        editor.close()
 
-
-def test_pulse_gui_fluent_window_wrapper_renders_named_scan_rows(monkeypatch, tmp_path):
-    pytest.importorskip("PyQt5")
-    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-
-    from PyQt5 import QtCore, QtTest
-
-    from Zou_lab_control.frontend.pulse_gui import ensure_qt_app, show_pulse_gui
-
-    app = ensure_qt_app()
-    scan_file = tmp_path / "scan_points.txt"
-    scan_file.write_text("# vars: exposure_ns(ns)\n20\n40\n", encoding="utf-8")
-    state = na.PulseTableState(
-        channels=["ch00", "ch03"],
-        periods=[
-            na.PulsePeriod("exposure_ns", (1, 0), unit="str (ns)", name="expose"),
-            na.PulsePeriod(20, (0, 1), unit="ns", name="trigger"),
-        ],
-        time_step_ns=20,
-        visible_channels=["ch00", "ch03"],
-        channel_labels={"ch00": "trap", "ch03": "trig"},
-        scan_variables={"exposure_ns": 20},
-        scan_bindings={"period:0:duration": "exposure_ns"},
-        scan_table_path=scan_file,
-    )
-    editor = show_pulse_gui(state=state, scale=0.86, window_ratio=0.65)
-    window = editor.window()
-    try:
+        # Toggling a dot off unbinds its slot and renumbers the rest.
+        editor._toggle_duration_scan(editor.drag_container.pulse_cards()[0])
         app.processEvents()
-        QtTest.QTest.qWait(1000)
-        app.processEvents()
-
-        assert window is not editor
-        assert editor.parent() is window
-        assert window.windowTitle() == editor.windowTitle()
-        assert editor.channel_panel.top_labels["params"].text() == "Params:"
-        assert editor.channel_panel.top_labels["file"].text() == "File:"
-        assert "exposure_ns" in editor.channel_panel.scan_params_edit.text()
-        assert editor.channel_panel.scan_file_edit.text().endswith("scan_points.txt")
-        assert not hasattr(editor.channel_panel, "scan_y_switch")
-        assert not hasattr(editor.channel_panel, "scan_edit")
-
-        pixmap = window.grab()
-        assert not pixmap.isNull()
-        image = pixmap.toImage()
-        colors = set()
-        for x in range(0, image.width(), max(1, image.width() // 6)):
-            for y in range(0, image.height(), max(1, image.height() // 6)):
-                colors.add(image.pixelColor(x, y).rgba())
-        assert len(colors) > 3
-        assert editor.channel_panel.scan_params_edit.mapTo(editor, QtCore.QPoint(0, 0)).y() == editor.channel_panel.top_labels["params"].mapTo(editor, QtCore.QPoint(0, 0)).y()
+        assert [slot.kind for slot in editor.state.scan_slots] == ["duration"]
+        assert editor.state.slot_index_for("duration", "1") == 0
     finally:
-        window.close()
         editor.close()
 
 
@@ -1341,7 +3243,7 @@ def test_pulse_gui_analog_bus_uses_line_edit_and_hollow_preview(monkeypatch):
         time_step_ns=20,
     )
     state.set_analog_bus_mode(0, "da_test", "edge", value=0)
-    state.set_analog_bus_mode(1, "da_test", "ramp", value=7)
+    state.set_analog_bus_mode(1, "da_test", "ramp", value=3)   # 3-bit bus: signed -4..+3
     state.apply_analog_bus_modes_to_period_states()
     editor = PulseSequenceEditor(state=state, scale=0.86)
     try:
@@ -1349,12 +3251,14 @@ def test_pulse_gui_analog_bus_uses_line_edit_and_hollow_preview(monkeypatch):
         app.processEvents()
         first_card, second_card = editor.drag_container.pulse_cards()
 
-        assert first_card.bus_value_edits["da_test"].metaObject().className() == "FluentLineEdit"
+        # The DAC value is a (scan-dot) line edit, not a spinbox; FluentScanLineEdit
+        # is a FluentLineEdit subclass with an embedded scan toggle.
+        assert first_card.bus_value_edits["da_test"].metaObject().className() in ("FluentLineEdit", "FluentScanLineEdit")
         assert not hasattr(first_card, "bus_spins")
         second_card.bus_value_edits["da_test"].setText("2048")
         restored = editor.read_state()
-        assert editor.drag_container.pulse_cards()[1].bus_value_edits["da_test"].text() == "7"
-        assert restored.analog_bus_modes["da_test"][1] == {"mode": "ramp", "value": 7}
+        assert editor.drag_container.pulse_cards()[1].bus_value_edits["da_test"].text() == "3"
+        assert restored.analog_bus_modes["da_test"][1] == {"mode": "ramp", "value": 3}
         editor.add_period()
         app.processEvents()
         added = editor.read_state()
@@ -1370,10 +3274,29 @@ def test_pulse_gui_analog_bus_uses_line_edit_and_hollow_preview(monkeypatch):
         plotter, channels, _repeat = editor._create_preview_plot(restored, include_always_off=True)
         assert channels == []
         assert len(plotter.analog_traces) == 1
+        # One solid value-following line per analog row, matching the digital
+        # channel lines' weight + opacity (0.65 / 1.0).  A separate dashed,
+        # half-transparent "0" reference baseline is drawn too but is NOT counted
+        # as a value trace.
         assert len(plotter.analog_trace_artists) == 1
-        assert plotter.analog_trace_artists[0].get_linewidth() == 0.65
+        value_line = plotter.analog_trace_artists[0]
+        assert value_line.get_linewidth() == 0.65
+        assert value_line.get_alpha() == 1.0
+        assert value_line.get_linestyle() in ("solid", "-")
+        # The dashed reference baseline shares the trace colour but is dashed +
+        # more transparent.
+        baseline_dashes = [
+            ln for ln in plotter.ax.get_lines()
+            if ln is not value_line and ln.get_alpha() == 0.5 and ln.get_linestyle() != "solid"
+            and tuple(ln.get_color()) == tuple(value_line.get_color())
+        ]
+        assert baseline_dashes, "expected a dashed reference baseline for the analog row"
+        assert plotter._analog_baseline_y  # plotter exposes analog row geometry for annotations
         assert plotter.analog_trace_labels == []
-        assert [tick.get_text() for tick in plotter.ax.get_yticklabels()] == ["da test"]
+        labels = plotter.ax.get_yticklabels()
+        assert [tick.get_text() for tick in labels] == ["da test"]
+        # The analog row label is tinted to its trace colour, like digital rows.
+        assert tuple(labels[0].get_color()) == tuple(value_line.get_color())
     finally:
         editor.close()
 
@@ -1436,6 +3359,7 @@ def test_fluent_combo_box_wheel_ignores_closed_popup(monkeypatch):
 
 
 def test_fluent_text_width_supports_old_qfontmetrics():
+    pytest.importorskip("PyQt5")   # qt_fluent imports PyQt5 at module top
     from Zou_lab_control.frontend.qt_fluent import fluent_text_width
 
     class OldMetrics:
@@ -1450,3 +3374,540 @@ def test_checked_in_tutorial_notebooks_are_utf8():
         text = path.read_text(encoding="utf-8")
         assert "???" not in text, path
         assert "\ufffd" not in text, path
+
+
+def test_preview_hides_idle_dac_when_off_rows_off(monkeypatch):
+    """#5: with 'Show off rows' OFF an idle (all-zero) DAC bus is hidden, just like an
+    always-off TTL channel; a DAC carrying a real value (or scanned) still shows."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend import pulse_gui
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod, PulseTableState
+
+    ensure_qt_app()
+    ch = [f"da[{i}]" for i in range(10)] + ["trig"]
+    labels = {f"da[{i}]": f"da[{i}]" for i in range(10)}
+    state = PulseTableState(
+        channels=ch,
+        visible_channels=ch,
+        periods=[PulsePeriod(1000, tuple([0] * 11), unit="ns")],  # DAC = 0 in every period (idle)
+        channel_labels=labels,
+        time_step_ns=20.0,
+    )
+    off, _ = pulse_gui._analog_bus_traces(state, include_always_off=False)
+    on, _ = pulse_gui._analog_bus_traces(state, include_always_off=True)
+    assert off == []          # idle DAC hidden when off-rows are hidden
+    assert len(on) == 1       # but shown when off-rows are shown
+
+    state.set_bus_value(0, "da", 200)   # now it carries a real value
+    off2, _ = pulse_gui._analog_bus_traces(state, include_always_off=False)
+    assert len(off2) == 1     # an active DAC is shown even with off-rows hidden
+
+
+def test_scan_source_toggle_switches_generated_and_loaded(monkeypatch):
+    """#4: the Delay/Scan toggle picks the active scan table -- off = generated (Run),
+    on = the array loaded from a file -- without re-running anything."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    ed = dt.demo_editor(size=(1400, 880))
+    dt.settle(ed, 200)
+    ed._scan_tables["generated"] = [[10000.0, 100.0], [20000.0, 200.0]]
+    ed._scan_tables["loaded"] = [[30000.0, 300.0]]
+    ed._scan_use_loaded = False
+    ed._apply_scan_source()
+    assert len(ed.state.scan_table) == 2          # generated source active
+
+    ed.channel_panel.scan_source_toggle.setChecked(True)   # -> loaded
+    dt.settle(ed, 100)
+    assert ed.channel_panel.scan_source_toggle.isChecked()
+    assert len(ed.state.scan_table) == 1
+
+    ed.channel_panel.scan_source_toggle.setChecked(False)  # -> generated
+    dt.settle(ed, 100)
+    assert len(ed.state.scan_table) == 2
+
+
+def test_scan_default_template_adapts_to_slot_count(monkeypatch):
+    """#6: the default Scan-tab code is the column_stack template, regenerated to match
+    the bound slot count until the user edits it."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    ed = dt.demo_editor(size=(1400, 880))   # binds 2 scan slots (s0 duration, s1 dac)
+    dt.settle(ed, 150)
+    ed._refresh_scan_tab()
+    code = ed.scan_code.toPlainText()
+    assert "column_stack([s0, s1])" in code      # adapted to the 2 bound slots
+    assert "2 bound slot(s)" in code
+
+
+def test_delay_edit_caps_at_field_max(monkeypatch):
+    """#1: a delay larger than the 32-bit field max is clamped on the field."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.neutral_atom.timing.pulse_table import DELAY_MAX_TICKS
+
+    ed = dt.demo_editor(size=(1400, 880))
+    dt.settle(ed, 120)
+    panel = ed.channel_panel
+    channel = next(iter(panel.delay_edits))
+    edit = panel.delay_edits[channel]
+    panel.delay_units[channel].setCurrentText("us")
+    edit.setText("999")                  # 999 us: inside the new ~42.9 s TTL bound -> UNCHANGED
+    panel._clamp_delay_edit(channel, edit)
+    assert abs(float(edit.text()) - 999.0) < 1e-6
+    edit.setText(str(10 ** 9))           # 1e9 us = 1000 s: beyond the 32-bit field -> clamped
+    panel._clamp_delay_edit(channel, edit)
+    capped_us = DELAY_MAX_TICKS * ed.state.time_step_ns / 1000.0
+    assert abs(float(edit.text()) - capped_us) <= max(1e-6, capped_us * 1e-9)
+
+
+def test_delay_unit_combo_offers_ns_us_ms_s(monkeypatch):
+    """The per-channel delay unit combo offers ns/us/ms/s -- the TTL delay is now a true
+    physical delay bounded by the 32-bit field (~42.9 s), not the old ~41 us ring, so
+    ms/s are valid. ('str (ns)' stays excluded: a fixed delay is not scannable.)"""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    ed = dt.demo_editor(size=(1400, 880))
+    dt.settle(ed, 120)
+    for combo in ed.channel_panel.delay_units.values():
+        items = [combo.itemText(i) for i in range(combo.count())]
+        assert items == ["ns", "us", "ms", "s"], items
+
+
+def test_dac_value_field_and_dot_stay_inside_card(monkeypatch):
+    """The DAC value field (and its embedded scan dot) must never spill past the period
+    card's right border -- the '右边缘 cutoff' the user reported.  Sizing the value field
+    to the card's remaining width guarantees this regardless of the rendering font."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    ed = dt.demo_editor(size=(1480, 900))
+    st = ed.state
+    st.set_bus_value(0, "da_dipole", -512)   # widest signed value: the widest content
+    ed.load_state(st)
+    dt.settle(ed, 200)
+    card = ed.drag_container.pulse_cards()[0]
+    value_edit = list(card.bus_value_edits.values())[0]
+    dot = value_edit.dot
+    card_right = card.width()
+    # both the value field and the dot end at or before the card's right edge
+    assert value_edit.mapTo(card, value_edit.rect().topRight()).x() <= card_right
+    assert dot.mapTo(card, dot.rect().topRight()).x() <= card_right
+
+
+def test_clk_button_marks_channel_disables_delay_and_hides_from_preview(monkeypatch):
+    """The per-channel 'clk' toggle: pressing it wires the channel to the FPGA clk -> it
+    enters state.clk_channels, its delay/unit fields grey out, and it drops from the
+    preview (it is no longer engine-driven).  Pressing again restores it."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    ed = dt.demo_editor(size=(1500, 920))
+    dt.settle(ed, 200)
+    ch = "ch00"
+    assert ch in ed.channel_panel.clk_buttons
+    assert ed.channel_panel.delay_edits[ch].isEnabled()
+    ed.channel_panel.clk_buttons[ch].click()
+    dt.settle(ed, 150)
+    assert ed.state.clk_channels == [ch]
+    assert not ed.channel_panel.delay_edits[ch].isEnabled()      # delay greyed out
+    assert not ed.channel_panel.delay_units[ch].isEnabled()
+    _plotter, channels, _repeat = ed._create_preview_plot(ed.read_state(), include_always_off=True)
+    assert ch not in channels                                    # excluded from preview
+    ed.channel_panel.clk_buttons[ch].click()                     # toggle off
+    dt.settle(ed, 150)
+    assert ed.state.clk_channels == []
+    assert ed.channel_panel.delay_edits[ch].isEnabled()
+
+
+def test_duration_unit_dropdown_excludes_str_ns_until_scanned(monkeypatch):
+    """#4 residue: a normal duration's unit dropdown is ns/us/ms/s only; the internal
+    'str (ns)' expression unit appears only for a scan-bound duration (auto, disabled)."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    ed = dt.demo_editor(size=(1480, 900))   # binds period-4 duration to s0
+    dt.settle(ed, 150)
+    cards = ed.drag_container.pulse_cards()
+    unbound = cards[0].unit_combo
+    assert [unbound.itemText(i) for i in range(unbound.count())] == ["ns", "us", "ms", "s"]
+    bound = cards[3].unit_combo                      # period 4 is bound to s0
+    assert bound.currentText() == "str (ns)" and not bound.isEnabled()
+
+
+def test_clk_channel_disables_period_checkboxes(monkeypatch):
+    """#2: marking a channel as clk locks (disables) its checkbox in every period card."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    ed = dt.demo_editor(size=(1480, 900))
+    dt.settle(ed, 120)
+    ed._toggle_clk_channel("ch01")
+    dt.settle(ed, 150)
+    assert "ch01" in ed.state.clk_channels
+    for card in ed.drag_container.pulse_cards():
+        if "ch01" in card.checks:
+            assert not card.checks["ch01"].isEnabled()
+
+
+def test_floatorx_lineedit_residue_removed():
+    """#4 residue: the dead x/y FloatOrXLineEdit (and its regexes) are gone."""
+
+    pytest.importorskip("PyQt5")   # qt_fluent imports PyQt5 at module top
+    from Zou_lab_control.frontend import qt_fluent as qf
+
+    assert not hasattr(qf, "FloatOrXLineEdit")
+    assert not hasattr(qf, "_FLOAT_OR_X_RE")
+    assert not hasattr(qf, "_OLD_FLOAT_OR_X_RE")
+    assert not hasattr(qf, "_VARIABLE_TOKEN_RE")
+
+
+def test_bus_mode_combo_fits_ramp(monkeypatch):
+    """#3: the Edge/Ramp/Hold combo is wide enough to show 'Ramp' without eliding."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtGui
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.qt_fluent import COMBO_WIDTH, EDIT_PADDING_H, scaled_px
+
+    ed = dt.demo_editor(size=(1480, 900))
+    dt.settle(ed, 120)
+    combo = next(iter(ed.drag_container.pulse_cards()[0].bus_mode_combos.values()))
+    from Zou_lab_control.frontend.qt_fluent import fluent_text_width
+    metrics = QtGui.QFontMetrics(QtGui.QFont(combo.font()))
+    ramp_w = fluent_text_width(metrics, "Ramp")
+    # paintEvent reserves drop arrow + insets (~drop + 2*pad + 2); the combo must leave at
+    # least the "Ramp" text width after that reserve.
+    reserve = scaled_px(COMBO_WIDTH) + scaled_px(EDIT_PADDING_H) * 2 + scaled_px(2)
+    assert combo.width() - reserve >= ramp_w
+
+
+def test_hold_field_tracks_upstream_edge_change(monkeypatch):
+    """#1 (the user's explicit worry): a HOLD period shows the value carried in from the
+    preceding edge/ramp, and that shown value UPDATES reactively when the upstream value
+    is edited (via busChanged -> _refresh_bus_displays), with no full rebuild."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod, PulseTableState
+
+    ch = [f"da[{i}]" for i in range(10)] + ["trig"]
+    labels = {f"da[{i}]": f"da[{i}]" for i in range(10)}
+    state = PulseTableState(
+        channels=ch, visible_channels=ch,
+        periods=[PulsePeriod(1000, tuple([0] * 11), unit="ns") for _ in range(3)],
+        channel_labels=labels, time_step_ns=20.0,
+    )
+    state.set_analog_bus_mode(0, "da", "edge", value=100)
+    state.set_analog_bus_mode(1, "da", "hold")
+    state.set_analog_bus_mode(2, "da", "hold")
+
+    ed = dt.demo_editor(size=(1200, 820))
+    ed.load_state(state)
+    dt.settle(ed, 150)
+    cards = ed.drag_container.pulse_cards()
+    # both hold periods initially show the carried 100
+    assert cards[1].bus_value_edits["da"].text() == "100"
+    assert cards[2].bus_value_edits["da"].text() == "100"
+    # edit the upstream edge (period 0) to 500 and commit -> the reactive refresh runs
+    cards[0].bus_value_edits["da"].setText("500")
+    ed._refresh_bus_displays()
+    dt.settle(ed, 60)
+    # the downstream hold fields now track the new upstream value (no rebuild)
+    assert cards[1].bus_value_edits["da"].text() == "500"
+    assert cards[2].bus_value_edits["da"].text() == "500"
+
+
+def test_pulse_gui_clear_bus_clears_analog_bus_modes(monkeypatch):
+    """BUG 1.3: clearing a DAC bus only cleared the member TTL bits; analog_bus_modes
+    re-projected the stale edge/ramp value back.  Clearing must zero the LOGICAL bus too."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+
+    app = ensure_qt_app()
+    editor = PulseSequenceEditor(state=dt.demo_state())
+    editor.show(); editor.show_all_channels(); app.processEvents()
+
+    bus = list(editor.state.bus_channels())[0]
+    card0 = editor.drag_container.pulse_cards()[0]
+    card0.bus_mode_combos[bus].setCurrentText("Edge")
+    card0.bus_value_edits[bus].setText("500")
+    app.processEvents()
+    assert editor.read_state().analog_bus_modes[bus][0]["mode"] == "edge"
+
+    editor.clear_channel(f"bus:{bus}")
+    app.processEvents()
+    after = editor.read_state()
+    assert all(str(e.get("mode", "hold")).lower() == "hold" for e in after.analog_bus_modes.get(bus, []))
+    assert after.bus_value(0, bus) == 0   # the clear actually sticks now
+
+
+def test_pulse_gui_dac_scan_target_follows_period_reorder(monkeypatch):
+    """BUG 1.2: _reconcile_scan_slots only remapped duration targets; a DAC slot's
+    bus@period_index went stale when periods were reordered.  It must follow the move."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor, PeriodCard
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+
+    app = ensure_qt_app()
+    editor = PulseSequenceEditor(state=dt.demo_state())
+    editor.show(); editor.show_all_channels(); app.processEvents()
+    if editor.state.repeat_start is not None:
+        pytest.skip("reorder test assumes no repeat bracket")
+
+    bus = list(editor.state.bus_channels())[0]
+    cards = editor.drag_container.pulse_cards()
+    cards[1].bus_mode_combos[bus].setCurrentText("Edge")
+    cards[1].bus_value_edits[bus].setText("300")
+    app.processEvents()
+    editor._toggle_dac_scan(cards[1], bus); app.processEvents()
+    dac_slot = next(s for s in editor.read_state().scan_slots if s.kind == "dac")
+    assert dac_slot.target == f"{bus}@1"
+
+    # Move the period-1 card to index 0 (reorder the drag items, then refresh + read).
+    dc = editor.drag_container
+    moved = next(it for it in dc.items if it.widget is cards[1])
+    dc.items.remove(moved)
+    dc.items.insert(0, moved)
+    dc.refresh_layout()
+    app.processEvents()
+    dac_slot2 = next(s for s in editor.read_state().scan_slots if s.kind == "dac")
+    assert dac_slot2.target == f"{bus}@0"   # target followed the reorder
+
+
+def test_pulse_gui_period_name_edit_round_trips(monkeypatch):
+    """#1 (period names): each card has an editable name field; the typed name lands in
+    read_state().periods[i].name, survives load_state, and the index title stays."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    editor = dt.demo_editor(size=(1400, 860), bind_scans=False)
+    cards = editor.drag_container.pulse_cards()
+    assert cards[0].title().startswith("Period 1/")        # the i/N index display stays
+    cards[0].name_edit.setText("load")
+    cards[2].name_edit.setText("image")
+    state = editor.read_state()
+    assert state.periods[0].name == "load"
+    assert state.periods[2].name == "image"
+    assert state.periods[1].name == ""
+    editor.load_state(state)                               # rebuild restores the names
+    cards2 = editor.drag_container.pulse_cards()
+    assert cards2[0].name_edit.text() == "load"
+    assert cards2[2].name_edit.text() == "image"
+    assert cards2[0].title().startswith("Period 1/")
+
+
+def _scanable_state():
+    """A small, COMPILABLE pulse: 2 channels, 2 periods, duration of P0 bound to s0."""
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod, PulseTableState, ScanSlot
+
+    return PulseTableState(
+        name="bundle_test",
+        channels=["ch0", "ch1"],
+        visible_channels=["ch0", "ch1"],
+        time_step_ns=20.0,
+        periods=[PulsePeriod("s0", (1, 0), unit="ns", name="A"),
+                 PulsePeriod(400, (0, 1), unit="ns", name="B")],
+        scan_slots=[ScanSlot(kind="duration", target=0, unit="ns", nominal=200.0)],
+        scan_table=[[200.0], [400.0]],
+    )
+
+
+def test_pulse_gui_save_bundle_always_includes_program(monkeypatch, tmp_path):
+    """Save writes the WHOLE bundle: pulse.json + preview.png + the compiled FPGA-ready
+    _program.json -- for a NON-scan pulse too (it used to skip the program without scan
+    slots), plus _scan.npy when a scan table exists."""
+
+    import json
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod, PulseTableState
+
+    editor = dt.demo_editor(size=(1480, 900), bind_scans=False)
+    dt.settle(editor, 200)
+
+    # --- non-scan pulse: program STILL saved ---
+    plain = PulseTableState(
+        name="plain", channels=["ch0", "ch1"], visible_channels=["ch0", "ch1"],
+        time_step_ns=20.0,
+        periods=[PulsePeriod(200, (1, 0), unit="ns"), PulsePeriod(400, (0, 1), unit="ns")])
+    editor.load_state(plain)
+    dt.settle(editor, 100)
+    target = tmp_path / "plain.json"
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(target), "")))
+    editor.save_to_file()
+    assert target.exists()
+    prog_path = tmp_path / "plain_program.json"
+    assert prog_path.exists(), "non-scan save must still write the compiled program"
+    prog = json.loads(prog_path.read_text(encoding="utf-8"))
+    assert prog.get("ticks") and prog.get("masks")
+    assert (tmp_path / "plain.png").exists()
+    assert not (tmp_path / "plain_scan.npy").exists()
+
+    # --- scan pulse: full 4-piece bundle ---
+    editor.load_state(_scanable_state())
+    dt.settle(editor, 100)
+    target2 = tmp_path / "scan.json"
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(target2), "")))
+    editor.save_to_file()
+    for name in ("scan.json", "scan.png", "scan_scan.npy", "scan_program.json"):
+        assert (tmp_path / name).exists(), name
+    prog2 = json.loads((tmp_path / "scan_program.json").read_text(encoding="utf-8"))
+    assert prog2.get("scan_points"), "scan save embeds the compiled scan points"
+
+
+def test_pulse_gui_load_restores_bundle_and_redirects_artifacts(monkeypatch, tmp_path):
+    """Load round-trips the bundle: the sibling _scan.npy is re-attached as the
+    loaded-file source, and picking _program.json by mistake redirects to the pulse."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend import devtools as dt
+
+    editor = dt.demo_editor(size=(1480, 900), bind_scans=False)
+    dt.settle(editor, 200)
+    editor.load_state(_scanable_state())
+    dt.settle(editor, 100)
+    target = tmp_path / "bundle.json"
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(target), "")))
+    editor.save_to_file()
+    assert (tmp_path / "bundle_scan.npy").exists()
+
+    # load the pulse -> the sibling scan array re-attaches as the loaded source
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName",
+                        staticmethod(lambda *a, **k: (str(target), "")))
+    editor.load_from_file()
+    assert editor._scan_loaded_path.endswith("bundle_scan.npy")
+    assert editor._scan_tables["loaded"], "sibling _scan.npy restored as the loaded source"
+    assert not editor._scan_use_loaded  # the embedded table stays the active source
+
+    # picking the saved program by mistake -> redirected to the pulse json
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName",
+                        staticmethod(lambda *a, **k: (str(tmp_path / "bundle_program.json"), "")))
+    editor.load_from_file()
+    assert editor.address_str.endswith("bundle.json")
+
+
+def test_scan_tab_ingests_py_npy_pulse_and_program(monkeypatch, tmp_path):
+    """The Scan tab's Load Program accepts every format Save/notebooks produce:
+    .py -> code editor; .npy -> loaded array; saved pulse .json -> its embedded table;
+    compiled _program.json -> wire-domain scan_points converted BACK to user units
+    (duration ticks*step -> ns, DAC offset-binary code-512 -> signed)."""
+
+    import json
+    import numpy as np
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from pathlib import Path
+    from Zou_lab_control.frontend import devtools as dt
+
+    editor = dt.demo_editor(size=(1480, 900), bind_scans=False)
+    dt.settle(editor, 200)
+    editor.load_state(_scanable_state())
+    dt.settle(editor, 100)
+
+    py = tmp_path / "gen.py"
+    py.write_text("import numpy as np\nscan_table = np.linspace(100, 500, 5)\n", encoding="utf-8")
+    editor._ingest_scan_program_file(Path(py))
+    assert "linspace" in editor.scan_code.toPlainText()
+
+    npy = tmp_path / "arr.npy"
+    np.save(npy, np.asarray([[120.0], [240.0], [360.0]]))
+    editor._ingest_scan_program_file(Path(npy))
+    assert len(editor._scan_tables["loaded"]) == 3 and editor._scan_use_loaded
+
+    pulse_json = tmp_path / "other.json"
+    pulse_json.write_text(json.dumps({"periods": [], "scan_table": [[111.0], [222.0]]}), encoding="utf-8")
+    editor._ingest_scan_program_file(Path(pulse_json))
+    assert [row[0] for row in editor._scan_tables["loaded"]] == [120.0, 220.0]  # snapped to 20 ns
+
+    prog_json = tmp_path / "other_program.json"
+    # wire domain: duration slot -> ticks (50 ticks * 20 ns = 1000 ns)
+    prog_json.write_text(json.dumps({"ticks": [0, 10], "masks": [1, 0],
+                                     "slot_kinds": ["duration"],
+                                     "scan_points": [[50], [100]]}), encoding="utf-8")
+    editor._ingest_scan_program_file(Path(prog_json))
+    assert [row[0] for row in editor._scan_tables["loaded"]] == [1000.0, 2000.0]
+
+
+def test_pulse_gui_dac_dot_on_ramp_period_scans_the_ramp(monkeypatch):
+    """Clicking the DAC scan dot on a RAMP period must keep the period a RAMP (scanning
+    its stop endpoint), show s0 in the locked value box, and unbinding must restore the
+    ramp with its original value.  Regression guard for the real GUI bug: binding used
+    to flip the mode combo to Edge, so a ramp could never be scanned from the GUI."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod, PulseTableState
+
+    editor = dt.demo_editor(size=(1480, 900), bind_scans=False)
+    dt.settle(editor, 200)
+    state = PulseTableState(
+        name="rampgui", channels=["b0", "b1", "t"],
+        channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"},
+        visible_channels=["b0", "b1", "t"], time_step_ns=20.0,
+        periods=[PulsePeriod(200, (0, 0, 1), unit="ns"), PulsePeriod(400, (0, 0, 0), unit="ns")],
+        analog_bus_modes={"da_x": [{"mode": "edge", "value": 1}, {"mode": "ramp", "value": -2}]})
+    editor.load_state(state)
+    dt.settle(editor, 150)
+
+    card = editor.drag_container.pulse_cards()[1]
+    combo, edit = card.bus_mode_combos["da_x"], card.bus_value_edits["da_x"]
+    assert "ramp" in combo.currentText().lower()
+
+    editor._toggle_dac_scan(card, "da_x")          # bind: the dot click
+    dt.settle(editor, 100)
+    card = editor.drag_container.pulse_cards()[1]
+    combo, edit = card.bus_mode_combos["da_x"], card.bus_value_edits["da_x"]
+    assert "ramp" in combo.currentText().lower(), "binding must NOT flip the ramp to edge"
+    assert edit.text().startswith("s"), "the bound ramp endpoint shows its slot variable"
+    st = editor.read_state()
+    assert st.analog_bus_plan("da_x")[1]["mode"] == "ramp"
+    assert st.scan_slots and st.scan_slots[0].kind == "dac"
+
+    editor._toggle_dac_scan(card, "da_x")          # unbind: second click restores
+    dt.settle(editor, 100)
+    card = editor.drag_container.pulse_cards()[1]
+    combo, edit = card.bus_mode_combos["da_x"], card.bus_value_edits["da_x"]
+    assert "ramp" in combo.currentText().lower()
+    assert edit.text() == "-2", "unbind restores the original ramp target"
+    assert not editor.read_state().scan_slots

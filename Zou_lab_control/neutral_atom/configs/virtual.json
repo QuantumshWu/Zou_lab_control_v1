@@ -25,7 +25,11 @@
     "type": "VirtualCamera",
     "params": {
       "trap_array": "$device:trap_array",
-      "exposure": 0.02
+      "sequencer": "$device:sequencer",
+      "exposure": 0.02,
+      "capture_trigger_channels": [
+        "emCCD"
+      ]
     }
   },
   "sequencer": {
@@ -39,9 +43,6 @@
         "cooling",
         "pushout",
         "microwave"
-      ],
-      "trigger_channels": [
-        "emCCD"
       ]
     }
   }

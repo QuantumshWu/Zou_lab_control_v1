@@ -3,6 +3,8 @@
 
 这个 notebook 展示第一版轻量中性原子实验线路：连接 device，配置 pulse sequence，拍 camera 图，校准 sitemap，校准 threshold，探测 occupancy，最后得到 detection time 和 fidelity 曲线。
 
+> **虚拟 == 实机（核心准则）。** 下面**每一步都是真机上要跑的完整流程**：从相机图像**提取**每个 site 的位置、从数据**拟合** PSF、从计数分布**学习**每个 site 的阈值、从 reference 帧**推**保真度。**唯一虚拟的是相机数据**——它由一个实现了和真机相机相同 `CameraDevice` 契约的 `VirtualCamera` fake 出来。换到真机时**只改第一格的 `na.connect("virtual", ...)` → `na.connect("qcmos", ...)`**(连一个 JSON 设备图),下面的分析代码一行都不用动。所以在虚拟上跑通 = 在真机上跑通。
+
 第一格直接把 `..` 加入 `sys.path` / `PYTHONPATH`，然后导入 `Zou_lab_control.frontend`，不需要先安装本仓库。
 
 <!-- cell:code -->
@@ -28,9 +30,12 @@ zf.apply_style()
 
 推荐调用边界：
 
-- `na.BaseDevice` / `na.CameraDevice` / `na.SequencerDevice` / `na.TrapArrayDevice`：硬件契约。真实 camera 至少要满足 `exposure`、`configure(...)`、`acquire(frames, sequence=..., sequencer=...)`。
-- `na.load_devices(...)`：按 JSON/dict 构造 device graph，合并本次运行的 device 参数，并要求每个 device 继承对应 base class；需要时也可以统一 open。
-- `exp.camera`：真实 camera device 本体，`capture()` 是 camera device 方法。
+- `na.BaseDevice` / `na.CameraDevice` / `na.SequencerDevice` / `na.TrapArrayDevice`：硬件契约。真实 camera 至少要满足 `exposure`、`configure(...)` 和纯 grabber 三原语 `arm(frames)`（返回即硬件就绪等触发）/ `read_frames(n)`（从设备自有缓冲取帧，武装期间不丢帧）/ `disarm()`；`acquire(frames)` 是三者的免触发便捷组合。相机不感知时序——arm 之后到达的触发边沿产生帧，仅此而已。
+- `na.triggered_frames(camera, sequencer, sequence, frames)`：测量层**唯一**的 arm-before-fire 编排（arm 相机 → prepare+fire 序列 → 读回帧）。需要 sequencer 的是测量层，从来不是相机。
+- `na.load_devices(...)`：按 JSON/dict 构造 device graph，合并本次运行的 device 参数，并要求每个 device 继承对应 base class；需要时也可以统一 open。**接自己的硬件**：写一个继承 `CameraDevice` / `SequencerDevice` / `TrapArrayDevice` 的类，`na.register_device_class(名, 类)` 注册后按短名引用（或 `load_devices(..., lookup=globals())` 零注册直接用），可选给它一个 `discover()` 让 `na.discover_devices()` 扫到它——完整示例见 hardware quickstart 与 device manual。
+- `exp.camera`：默认（读出角色）camera device 本体；一键快照是会话级编排 `exp.capture()`（`exp.capture(camera="名")` 指定某台相机；非读出相机如 MOT 监视相机走它自己的 coil 模板/measurement，不是这个便捷接口）。
+- `exp.device_manager()`：**设备管理 GUI**——按角色类型（Camera / Sequencer / Trap array / 未来的 RF …）列出当前配置载入的每台设备，并有 “Scan hardware” 扫总线；task console 顶栏也有个 “Devices” 按钮开它。它是 `na.load_devices` / `na.discover_devices` 的图形面。
+- **按测量选设备**：凡用到相机的 measurement / task（*Pulse scan*、*Camera (live frames)*、*Optimize MOT field*）表单里都自动带一个 **Camera 下拉**——它的 spec 声明了 `devices=["camera"]`，基类就自动追加下拉并把**你选中**的设备注入进去（单相机用默认；双相机时在这里挑 `monitor_camera` 还是读出相机）。加一台新设备域（RF…）无需改任何 spec。读出/存活/保真类测量**故意**锁定读出科学相机（MOT 监视相机无法成像单原子）所以不给下拉。
 - `exp.readout`：camera readout subsystem，包含 sitemap、threshold、detect、detection-time fidelity calibration。
 - `exp.timing.*`：pulse sequence、preflight、Verilog 生成。
 
@@ -77,28 +82,31 @@ preflight.summary()
 <!-- cell:markdown -->
 ## Capture a camera image
 
-`capture` 是 camera device 的方法，所以调用是 `exp.camera.capture()`。它永远只显示 raw camera frame，不自动叠加 sitemap 圈；site overlay 只属于 calibration/readout/detect 图。virtual camera 参考 C15550-22UP 的量级：约 200 counts offset、0.107 electrons/count、0.43 electrons RMS readout noise。
+`capture` 是会话级编排（相机本身不感知会话），所以调用是 `exp.capture()`；`camera=` 可指名任意一台相机。它永远只显示 raw camera frame，不自动叠加 sitemap 圈；site overlay 只属于 calibration/readout/detect 图。virtual camera 参考 C15550-22UP 的量级：约 200 counts offset、0.107 electrons/count、0.43 electrons RMS readout noise。
 
 <!-- cell:code -->
-capture = exp.camera.capture(display=True)
+capture = exp.capture(display=True)
 capture.summary()
 
 <!-- cell:markdown -->
-## Calibrate sitemap
+## Calibrate sitemap（从图像**提取**每个 site 的位置）
 
-`sitemap` 只回答“每个 trap site 在 camera 上在哪里”。输出包含 `centers`、`calibration`、`average_image` 和 frontend plot handle。
+`sitemap` 回答“每个 trap site 在 camera 上在哪里”。这就是实机第一步:**它没有任何 site 坐标的先验**——它拍一组全亮模板帧,在平均图上用 `core.analysis.find_site_centers`(高斯平滑 + 找局部极大 + 按 trap 网格排序)**从图像里检测**出中心。换真机时这一格不变:真机相机拍的全亮帧(满载模板)走的是同一段检测代码。输出含 `centers`、`calibration`、`average_image` 和 plot handle。
 
 <!-- cell:code -->
 sitemap = exp.readout.sitemap(frames=12, display=True)
+# centers 是从图像检测出来的(不是设备给的);打印头几个确认它确实定位到了亮斑:
+print("detected centers (from the image):", sitemap.calibration.centers[:3].round(1).tolist(), "...")
 sitemap.summary()
 
 <!-- cell:markdown -->
-## Calibrate thresholds
+## Calibrate thresholds（从计数分布**学习**阈值）
 
-这个步骤依赖 sitemap。histogram 里的 threshold 线可拖动；右上角显示当前 threshold、左右比例、双峰 Gaussian fidelity 和模型交点 `fit cut`。
+这个步骤依赖 sitemap。它拍一批随机装载帧,用标定的方式逐 site 提取计数,然后**从这堆实验计数的分布里**定阈值(Otsu / 双高斯)——阈值不是手填的常数,而是从数据学出来的,真机同样如此。histogram 里的 threshold 线可拖动;右上角显示当前 threshold、左右比例、双峰 Gaussian fidelity 和模型交点 `fit cut`。
 
 <!-- cell:code -->
 threshold = exp.readout.thresholds(frames=80, site=0, display=True)
+print("thresholds learned from the count distribution:", threshold.calibration.thresholds[:3].round(1).tolist(), "...")
 threshold.summary()
 
 <!-- cell:code -->
@@ -108,7 +116,7 @@ threshold.summary()
 <!-- cell:markdown -->
 ## Detect one shot
 
-detect 图显示 raw camera data：所有 sitemap site 有很浅的背景圆圈，只有判断为 occupied 的 site 画较细的橙色圆圈。`DetectionResult.occupied` 是后续 rearrangement 或 statistics 可以直接使用的 boolean array。
+detect 图显示 raw camera data：所有 sitemap site 有很浅的背景圆圈，只有判断为 occupied 的 site 画较细的橙色圆圈。`DetectionResult.occupied` 是后续 statistics 可以直接使用的 boolean array。
 
 <!-- cell:code -->
 shot = exp.readout.detect(display=True)
@@ -122,14 +130,15 @@ occupancy_grid
 
 <!-- cell:code -->
 standalone_sequence = na.imaging_sequence(exposure=exp.camera.exposure, load=True, name="sitemap")
-standalone_images = exp.camera.acquire(4, sequence=standalone_sequence)
+standalone_images = na.triggered_frames(
+    exp.devices.camera, exp.devices.sequencer, standalone_sequence, 4)
 standalone_sitemap = na.calibrate_sitemap_from_images(
     standalone_images,
     grid_shape=exp.devices.trap_array.grid_shape,
     display=False,
 )
 standalone_threshold = na.calibrate_threshold_from_images(
-    exp.camera.capture(frames=12, display=False).images,
+    exp.capture(frames=12, display=False).images,
     standalone_sitemap.calibration,
     display=False,
 )
@@ -137,40 +146,188 @@ standalone_shot = na.detect_image(capture.image, standalone_threshold.calibratio
 standalone_shot.occupied.shape
 
 <!-- cell:markdown -->
+## Rb87 读出：PSF 匹配滤波 + 双高斯（完整实机流程）
+
+这一节就是 **Rb87 的真实读出流程**:位点密集、PSF 边缘交叠、光子数少时,方框计数会糊在一起,换成匹配滤波读出。整条链路全部**从实验数据来**(真机一模一样,只有相机是虚拟的):
+
+1. **从全亮模板图像提取 PSF**(`method="psf"`):`core.psf.fit_site_psfs` 对每个检测到的 site 裁框、扣环形背景、拟合 2D 高斯,得到**逐站点归一化 PSF 权重**;逐发提取改成 PSF 加权点积(已知形状 + 加性噪声下信噪比最优)。权重是**拟合出来的**,不是预设的——下面 `psf_cal.psf_weights.shape` 就是它。
+2. **从计数分布定阈值**(`method="bimodal"`):拟合暗/亮双高斯峰核,阈值放在两高斯总错判率最小处,并给出模型保真度。
+
+二者都接在同一套 `TrapCalibration.detect` 契约后面(box/otsu 仍是默认)。下面用 standalone 路径演示,不改动上面 session 的 box 标定。`psf_template_images` 这里由 `na.triggered_frames(...)` 拿到(armed 相机 + fired 成像序列,虚拟相机经触发线产帧);真机上同一行换成真相机即可,`calibrate_sitemap_from_images`/`calibrate_threshold_from_images` 一字不改。
+
+<!-- cell:code -->
+psf_template_images = na.triggered_frames(
+    exp.devices.camera, exp.devices.sequencer,
+    na.imaging_sequence(exposure=exp.camera.exposure, load=True, name="sitemap"), 8)
+psf_sitemap = na.calibrate_sitemap_from_images(
+    psf_template_images,
+    grid_shape=exp.devices.trap_array.grid_shape,
+    method="psf",
+    display=False,
+)
+psf_threshold = na.calibrate_threshold_from_images(
+    exp.capture(frames=120, display=False).images,
+    psf_sitemap.calibration,
+    method="bimodal",
+    display=False,
+)
+psf_cal = psf_threshold.calibration
+print("method:", psf_cal.method, "| psf weights:", psf_cal.psf_weights.shape)
+na.detect_image(exp.capture(display=False).image, psf_cal, display=True).occupied.sum()
+
+<!-- cell:markdown -->
+## Per-site readout fidelity from data — Rb87 文件夹工作流(与真机完全一致)
+
+这是 **Rb87 真机读出流程**,和 `references/rb87_readout_v16` 一样是**文件夹式**:实验把相机原始帧逐张存到**一个数据文件夹**,命名 `PREFIX<n>`;分析**指向那个文件夹**,把帧按 `shots_per_group` 一组(每次装载成像几张,同一批原子)索引,`short_shot` 是待表征的短读出帧、`ref_shots` 是高 SNR 参考帧:
+
+1. 平均参考帧得到全亮模板 → **从模板图像检测站点** + 拟合 PSF;
+2. reference 帧双高斯**严格共识**给出每个 `(group, site)` 的真值亮/暗标签;
+3. 随机 **train** 划分上**逐站点**训练阈值,**held-out test** 上诚实报告保真度;
+4. 全局单阈值对比 + drop-worst-site 消融;结果写到 `<data_dir>_results/`。
+
+**唯一虚拟之处:数据文件夹由 `na.write_virtual_run` 写假帧填充**(真机上这一格删掉——你的实验/相机已经把帧写进文件夹了)。下面**分析两行真机一字不改**,只把第一格的 `na.connect("virtual",...)` 换成 `na.connect("qcmos", <设备配置>)`。
+
+<!-- cell:code -->
+# 数据文件夹(真机:相机/DAQ 把 PREFIX<n> 原始帧写到这里)。改成你的实验路径即可。
+data_dir = "results/rb87_run01"
+# 【仅虚拟】用 *同一台* 虚拟相机(trap_array=exp.devices.trap_array)渲染假原始帧,
+# 这样存盘数据与 live 会话的几何/信号完全一致(真机里本就是同一台相机在写盘)。真机:删除这一格。
+# 每次装载成像 shots_per_group=4 张:short_shot=3 是短读出,ref_shots=(1,2,4) 是高 SNR 参考。
+na.write_virtual_run(
+    data_dir, prefix="img", groups=150, shots_per_group=4, short_shot=3, ref_shots=(1, 2, 4),
+    short_exposure=3e-3, reference_exposure=20e-3,
+    trap_array=exp.devices.trap_array, seed=1,
+)
+
+<!-- cell:code -->
+# 【真机一字不变】从文件夹读图 → 检测站点+PSF(method="psf") → 逐站点定阈值+保真度。
+exp.readout.sitemap_from_dir(data_dir, prefix="img", method="psf")
+report = exp.readout.characterize_from_dir(data_dir, prefix="img", train_fraction=0.9, seed=1)
+report.summary()
+
+<!-- cell:markdown -->
+## The per-site readout grid（`zf.grid(sub_plot_kind=…)`，通用 N，这里 35 站）
+
+所有逐站点网格都走**同一个** `zf.grid(...)`，用 `sub_plot_kind` 声明每格是哪种 plot kind：`"hist"` = 每格一张读出分布直方图，`"2d"` = 每格一张图像（如 PSF 核）。这一个声明同时驱动缩略图、双击放大成该 kind 的标准单图、以及 `exp.figure_viewer()` 里 Setting 显示该 kind 的参数。每格：暗=灰、亮=蓝、橙线=该站**训练出的**阈值，**站号（+保真度）画在每格小标题里、不占图内**；按 trap 网格 `(rows, cols)` 排布，布局由 frontend 拥有（**不重叠、不裁切、对齐**，通用任意站点数）。`zf.site_histogram_grid` / `zf.site_psf_grid` 只是 `sub_plot_kind="hist"` / `"2d"` 的薄壳预设。
+
+<!-- cell:code -->
+values, occupied = report.per_site_arrays()
+hist_grid = zf.grid(
+    values, sub_plot_kind="hist",
+    occupied=occupied, thresholds=report.thresholds,
+    site_fidelities=report.site_fidelities, grid_shape=exp.devices.trap_array.grid_shape,
+    labels=("PSF signal (counts)", "Shots"),
+    title=f"Per-site readout histograms (held-out F={report.aggregate_fidelity:.3f})",
+)
+
+<!-- cell:markdown -->
+## Global vs per-site threshold, and the drop-worst-site ablation
+
+逐站点阈值通常优于一个全局阈值；drop-worst-site 消融显示忽略最差的 K 个站点后，held-out 保真度如何回升。
+
+<!-- cell:code -->
+print(f"global one-threshold held-out fidelity: {report.global_fidelity:.4f}")
+print(f"per-site             held-out fidelity: {report.aggregate_fidelity:.4f}")
+for row in report.ablation:
+    print(f"  drop worst {row['drop_worst_k']}: F={row['fidelity']:.4f}  kept={row['kept_sites']}  errors={row['errors']}")
+
+<!-- cell:markdown -->
 ## Scan detection time and fidelity
 
-`detection_time` 不使用 virtual ground truth。它先拍 long-exposure reference images，然后对每个 detection time 的 ROI count distribution 做 threshold 和 Gaussian split fidelity 估计。接口默认 `live=True`；这里保留 live scan，cell 返回后 acquisition worker 和 frontend plot 会继续更新。等图跑完或想提前停止时，运行下一格 `scan.stop()`，再在后面的 cell 里做 decay fit。
+`detection_time` 不使用 virtual ground truth：它先拍 long-exposure reference 帧，再对每个 detection time 的 ROI 计数分布做阈值 + 双高斯保真度估计。下面用 `live=False` **一次跑完整条扫描**（确定、可复现），结果里 `scan.times` / `scan.fidelities` 是曲线，`summary()['best']` 给出保真度最高的读出时长。
+
+> 想交互观察：`detection_time(..., live=True)` 会后台采集并实时刷新前端图，`scan.stop()` 提前停止；停止后 `scan.fidelities` 里已采到的数据仍然可用。
 
 <!-- cell:code -->
 clock_hz = exp.devices.sequencer.clock_hz
-time_ticks = np.linspace(int(round(0.2e-3 * clock_hz)), int(round(10e-3 * clock_hz)), 100, dtype=int)
+time_ticks = np.linspace(int(round(0.2e-3 * clock_hz)), int(round(10e-3 * clock_hz)), 30, dtype=int)
 times = time_ticks / clock_hz
-scan = exp.readout.detection_time(times, shots=30, live=True, display=True)
+# live=False：一次跑完整条扫描，确定且可复现（live=True 则后台跑、前端实时刷新、scan.stop() 提前停）。
+scan = exp.readout.detection_time(times, shots=20, live=False, display=True)
+print("times (ms):", np.round(scan.times * 1e3, 2).tolist())
+print("fidelity  :", np.round(scan.fidelities, 3).tolist())
 
 <!-- cell:markdown -->
-## Stop the live scan
+## 读出时长的选择
 
-对 notebook 和未来 GUI 来说，外部只需要一个 stop：`scan.stop()`。它转发到 frontend `RunSession.stop()`，这个 session 会请求 acquisition worker/source 停止，并停止 attached plot refresh timer。已经采到的数据仍然留在 `scan.fidelities` 里，可以继续保存、显示 summary，或在下一格做 fit。
-
-内部仍然保留 `scan.measurement`、`scan.plot`、`scan.data_figure` 这三个部件，方便 debug 或 GUI 接管；但普通实验流程不要把 stop 拆成两套 API。
+保真度随读出时长先升后饱和：太短信噪比不够，太长则散射加热、原子丢失、占空比下降。`summary()['best']` 直接给出曲线上保真度最高的那个读出时长——这就是要选的正式成像时间。
 
 <!-- cell:code -->
-scan.stop()
-scan.summary()
+scan.summary()   # {'best': {'time': ..., 'fidelity': ...}, 'finished': True, ...}
 
 <!-- cell:markdown -->
-## Fit the stopped scan
+## 取最优读出时长
 
-拟合前要保证 live scan 已经结束或已经运行过 `scan.stop()`。decay fit 直接使用 frontend 的 `DataFigure` fitting 栈。
+`scan.summary()['best']` = `{'time': 秒, 'fidelity': 保真度}`。取拐点附近（略偏右留余量）作为正式成像时间；比它更长只是浪费占空比、徒增加热。
 
 <!-- cell:code -->
-fit_result, popt = scan.data_figure.decay()
-scan.summary(), fit_result, popt
+best = scan.summary()["best"]
+print(f"建议读出时长 = {best['time'] * 1e3:.2f} ms，保真度 ≈ {best['fidelity']:.4f}")
+best
+
+<!-- cell:markdown -->
+## 一键测温：release-recapture（弹道重捕）
+
+测温与上面的读出时长扫描**是同一台通用扫描引擎**的另一个实例——只换扫描轴 / 每点采帧方式 / 约简器：两次成像之间把 trap 关掉 `t_off`，原子按热速度自由飞，再开 trap，看还有多少能被重捕。越热飞得越远，存活随 `t_off` 衰减越快——**survival-vs-`t_off` 曲线编码了温度**。曲线只定 `r_c/sqrt(T)`，所以**必须**从阱几何给出捕获半径 `capture_radius`（米）才能定出 T。
+
+下面的配方在实机上**基本一字不变**（唯一虚拟之处仍是相机）——只是 `build_release_recapture_pulse` 默认按 `trap`/`probe`/`emCCD` 三个**角色通道名**建序列;实机通道名不同就把角色名作参数传进去（`build_release_recapture_pulse(channels=..., trap_channel="chNN", probe_channel=..., trigger_channel=...)`）。它建一个 6 周期双触发序列，trap-off 周期的 duration 绑到 scan slot `s0`=`t_off`（与扫描读出时长同一种可扫量）；`exp.readout.temperature` 每点采两帧、按 `calibration.detect` 算逐点存活；`fit_temperature` 是纯后处理。
+
+> **一键 GUI 路径**：同一测量在 Task 控制台里走 `zf.show_task_console(hub=SignalHub(), session=exp, measurements=exp.readout.measurement_specs())`——头部 **Add Panel** 选 `Temperature`，它作为一个 Logic 节点加入，在自己的 **Edit** 页填范围 `t_off`/`shots`/`per_site`、点 **Start**，再加一个 Monitor 面板指向 survival 信号看曲线。`capture_radius` **不在采集表单里**——它是把 survival 曲线变成温度的**后处理 fit 入参**（一个已知的阱几何，不改变发什么/读什么），所以拿到 survival 后用下面的 `fit_temperature(..., capture_radius=...)` 定 T。GUI 的 Start 与下面这行 API 调**同一个建器**，不会漂移。完整的控制台跑实验流程见 `task_console_tutorial.ipynb`。
+
+<!-- cell:code -->
+# 6 周期双触发序列：trap_off 周期的 duration 绑到 scan slot s0(= t_off)。
+rr_state = na.build_release_recapture_pulse(channels=list(exp.devices.sequencer.channels))
+rr_pulse = na.bind_pulse(exp.devices.sequencer, rr_state)
+
+# 扫 t_off(0..300us, 13 点),每点 shots=16 次装载求均存活。live=False 直接跑完。
+t_off_s = np.linspace(0, 300e-6, 13)
+temp_scan = exp.readout.temperature(t_off_s, pulse=rr_pulse, shots=16, live=False, display=True)
+print("t_off (us):", np.round(temp_scan.x * 1e6, 1).tolist())
+print("survival  :", np.round(temp_scan.y, 3).tolist())
+
+<!-- cell:code -->
+# 纯后处理拟合温度(capture_radius 必填,米;这里 ~6um 量级的子阱)。
+temp_fit = na.fit_temperature(temp_scan.x, temp_scan.y, capture_radius=6e-6)
+temp_fit.summary()   # {'temperature_uK': ~44..50, 'capture_radius_m': 6e-06, 'success': True}
+
+<!-- cell:markdown -->
+## Task 控制台：从零搭建实时监控（loading rate / 占据 / 站点）
+
+task_console 的设计原则是**自由搭建**——看板开出来是空的，你从 **Add Panel** 一路自己搭。把 `session=exp` 传进去（让看板能用相机建连续生产者）+ `measurements` / `processors`，Add Panel 就分成清晰的几类：
+
+- **Measurement: Camera (live frames)**：连续出帧的相机测量，只发一个信号 `frame`。这是整条 loading 读出链的源头——相机出帧、真流程检测，再没有别的隐藏环节。
+- **Processor: Judge occupancy**（判占据，reactive）：消费 `frame`、跑**真** `calibration.detect`，逐 repeat 切片判，流式发布 `occupied` / `counts`（`(repeat, n_sites)` 块，`repeat_mode=average` 即逐站装载概率）/ `rate`（本块装载率标量）/ `centers` / `thresholds` / `frame_judged`。参数是**从哪载入标定**（`calibration`：site/PSF/阈值，默认就是 Calibrate 任务写的 `calibrations/calibration.json`，该文件出现前回退到 `session` 当前标定）+ `source`（要判的 `frame` 信号）+ `method`（box / per-site PSF / uniform PSF）。
+- **Task: Calibrate readout**（一次性工作流）：在**自己的线程**里跑标定、不卡界面；它**不往 hub 发任何信号**——结果落在 `task.result`，中途帧/进度写进它自己的 `TaskOutput` 缓冲。运行时它占一张**固定 Monitor 面板**看中途模板帧、并锁定其它操作只留 **Stop task**（confocal task 式）。
+- 然后**自由加视图**读 measurement / processor 发的信号：Add Panel → `Plot: Site map`，在 Setting 里把 source 写 `value = occupied`（占据图：圈画在相机帧上，centers 自动取 `centers` 信号）；`Plot: 2D` + `value = frame_0`（原始图）；`Plot: Site map` + `value = occupied` 设 `repeat_mode=average`（逐站点装载概率）。
+- **Measurement: …**（扫描）：温度 / 读出时长，默认绑曲线图。
+
+每张面板底部都列出它**读 / 发**了哪些信号（重名会标 ⚠），所以不用猜 hub 里有什么名字（hub 里只有 measurement + processor 的输出，没有 task）。要调相机/判占据的 `grid_shape` / `exposure` / `roi_radius` / `method`，在那个节点**自己**的 Edit 标签里改 + **Apply**（两帧之间应用，不中断采集）；plot 面板的 Edit 直接给产它信号的那个 measurement/processor 的参数表单。换实机只改 `na.connect("virtual"→"qcmos")`，这一节一字不变。
+
+<!-- cell:code -->
+# 一键打开 Task 控制台:`exp.task_console()` 自动把本 session 的 hub + 自动发现的
+# measurement / processor / task 目录都接好(等价于手写 zf.show_task_console(hub=..., session=exp,
+# measurements=..., processors=...),但一行搞定)。看板开出来是空的,从 Add Panel 自己搭
+# Camera(发 frame) -> Processor: Judge occupancy(真 detect) -> Plot: Site map (value = occupied) /
+# Plot: 2D (value = frame_0)。`exp.task_console(task="<名字>")` 还能直接载入 tasks/<名字>.json 的存盘布局。
+# 注意:Qt 实时窗口与本 notebook 上面的 ipympl 内联图是两套事件循环——建议重启 kernel 后,只跑
+# 上面那格 `exp = na.connect("virtual", ...)` + 本格(完整的从零搭建流程见 task_console_tutorial.ipynb)。
+console = exp.task_console()
+console
+
+<!-- cell:markdown -->
+## 一键打开 pulse GUI(编辑 / 扫描脉冲)
+
+`exp.pulse_gui()` 打开绑定到本 session 的脉冲编辑器(等价于不带 session 的 `zf.show_pulse_gui()`,但绑了 session 后测量端能读回编辑后的程序)。在 period 卡里改 duration / DAC / delay;给任意 duration / DAC / delay 字段点那个圆点,绑成 **API slot**(`aN`,紫色,按名设值——普通通道 delay 和 **DAC-bus delay 一样能绑**)或 **scan slot**(`sN`,可流式扫描);**Scan** 页给所有 scan slot 写一张 `N×n_slots` 的 `scan_table`(delay 只有 API slot、没有 scan slot)。换实机只改 `na.connect`,这一格不变。
+
+<!-- cell:code -->
+# 一键打开脉冲编辑器(绑定本 session,所以 exp.readout.* 测量能读回编辑后的时序):
+pulse_win = exp.pulse_gui()
+pulse_win
 
 <!-- cell:markdown -->
 ## Save calibration, status, and Verilog
 
-当前 Verilog 生成的是轻量 edge-table module。它已经足够检查 timing/channel/tick，但还不是完整 address_switch register/VIO 体系。
+`write_verilog` 导出的是一个轻量 edge-table 片段，便于离线检查 timing/channel/tick。真实硬件上传走的是 host 把程序打包成 BRAM image、经 JTAG-to-AXI 写进 `zlc_pulse_streamer_top` 的路径(见 FPGA manual)。
 
 <!-- cell:code -->
 Path("results").mkdir(exist_ok=True)

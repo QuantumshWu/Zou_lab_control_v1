@@ -215,16 +215,21 @@ class SmartOffsetFormatter(ticker.Formatter):
         return "".join(parts)
 
 
-def apply_smart_ticks(ax, axis: str = "both") -> None:
-    """Apply smart offset ticks to one or both axes."""
+def apply_smart_ticks(ax, axis: str = "both", *, max_ticks_x: int | None = None,
+                      max_ticks_y: int | None = None) -> None:
+    """Apply smart offset ticks to one or both axes.
+
+    ``max_ticks_x``/``max_ticks_y`` cap the tick count per axis (default 8);
+    small axes (dashboard panels) pass a lower cap so the labels never crowd."""
+
     if axis in ("x", "both"):
-        xloc = SmartOffsetLocator()
+        xloc = SmartOffsetLocator(max_ticks=int(max_ticks_x) if max_ticks_x else 8)
         ax.xaxis.set_major_locator(xloc)
         ax.xaxis.set_major_formatter(
             SmartOffsetFormatter(xloc, axis_type="x", offset_xy=(0.9, -0.1), offset_ha="left", offset_va="top")
         )
     if axis in ("y", "both"):
-        yloc = SmartOffsetLocator()
+        yloc = SmartOffsetLocator(max_ticks=int(max_ticks_y) if max_ticks_y else 8)
         ax.yaxis.set_major_locator(yloc)
         ax.yaxis.set_major_formatter(
             SmartOffsetFormatter(yloc, axis_type="y", offset_xy=(0.0, 1.005), offset_ha="left", offset_va="bottom")

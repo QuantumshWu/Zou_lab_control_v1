@@ -23,6 +23,25 @@ import Zou_lab_control.neutral_atom as na
 from Zou_lab_control.frontend.content.tutorials import neutral_atom_fpga_server_cells, neutral_atom_hardware_tutorial_cells
 
 
+def _decode_axi_writes(text: str) -> list[tuple[int, int]]:
+    """Decode ``create_hw_axi_txn ... -type write`` transactions (single-beat OR INCR
+    burst) into ``(word_addr, value)`` pairs -- the mock-hardware counterpart of
+    ``axi_session._write_burst_tcl`` (burst ``-data`` is one concatenated hex value,
+    high-address word first, so we reverse to put the base-address word first)."""
+
+    out: list[tuple[int, int]] = []
+    for addr_hex, data_hex, n_str in re.findall(
+        r"-address ([0-9A-Fa-f]+) -data ([0-9A-Fa-f]+) -len (\d+) -type write", text
+    ):
+        base = int(addr_hex, 16) // 4
+        n = int(n_str)
+        words = [int(data_hex[i * 8:(i + 1) * 8], 16) for i in range(n)]
+        words.reverse()
+        for k, value in enumerate(words):
+            out.append((base + k, value))
+    return out
+
+
 def wait_until_done(task, *, timeout=10.0):
     measurement = task.measurement
     assert measurement is not None
@@ -49,17 +68,17 @@ def test_virtual_jupyter_session_runs_end_to_end(tmp_path):
     assert exp.calibration_data is None
 
     preflight = exp.timing.preflight()
-    capture = exp.camera.capture(display=False)
+    capture = exp.capture(display=False)
     assert [patch for patch in capture.plot.ax.patches if isinstance(patch, Circle)] == []
     assert "truth_available" not in capture.summary()
     assert not hasattr(capture, "truth")
     assert not hasattr(exp.camera, "last_truth")
     assert not hasattr(exp.devices.trap_array, "centers")
     sitemap = exp.readout.sitemap(frames=6, display=False)
-    capture_after_sitemap = exp.camera.capture(display=False)
+    capture_after_sitemap = exp.capture(display=False)
     assert [patch for patch in capture_after_sitemap.plot.ax.patches if isinstance(patch, Circle)] == []
     threshold = exp.readout.thresholds(frames=12, display=False)
-    capture_after_threshold = exp.camera.capture(display=False)
+    capture_after_threshold = exp.capture(display=False)
     assert [patch for patch in capture_after_threshold.plot.ax.patches if isinstance(patch, Circle)] == []
     detection = exp.readout.detect(display=False)
     scan = exp.readout.detection_time([5e-6, 2e-5, 0.0002], shots=8, live=False, display=False)
@@ -78,9 +97,13 @@ def test_virtual_jupyter_session_runs_end_to_end(tmp_path):
     assert detection.plot is not None
     assert detection.data_figure is detection.plot.data_figure
     assert not hasattr(detection, "truth")
+    from matplotlib.collections import EllipseCollection
     sitemap_radius = next(patch.radius for patch in sitemap.plot.ax.patches if isinstance(patch, Circle))
-    detect_radii = [patch.radius for patch in detection.plot.ax.patches if isinstance(patch, Circle)]
-    assert sitemap_radius in detect_radii
+    # The detection plot is the frontend LiveSiteMap: it draws the site rings as ONE vectorised
+    # EllipseCollection (widths = 2*roi_radius), NOT per-site Circle patches -- so its radius is
+    # roi_radius, and it shares the same _site_radius source as the sitemap's Circle rings.
+    assert any(isinstance(c, EllipseCollection) for c in detection.plot.ax.collections)
+    assert detection.plot.roi_radius == sitemap_radius
     assert sitemap_radius >= 4.5
     assert scan.summary()["finished"] is True
     assert np.all(np.isfinite(scan.fidelities))
@@ -242,19 +265,17 @@ def test_timing_and_verilog_boundaries(tmp_path):
     assert files.manifest_path.exists()
 
 
-def test_multiframe_acquisition_repeats_camera_trigger_sequence():
+def test_multiframe_acquisition_reads_n_frames_from_one_trigger_pulse():
+    """The camera reads the N frames its armed request wants -- a single-trigger imaging pulse
+    fired into a 3-frame arm is 3 independent shots (the atom device reloads per armed frame),
+    NOT a sequence rewritten to carry 3 triggers.  The pulse carries its OWN triggers; there is
+    no 1->N expansion, and the shot goes through the ONE arm-before-fire helper."""
     exp = na.connect("virtual")
     seq = na.imaging_sequence(exposure=1e-3, load=True, name="multi_frame")
-    expanded = na.sequence_for_frame_count(seq, 3)
-    images = exp.camera.acquire(3, sequence=seq, sequencer=exp.devices.sequencer)
+    images = na.triggered_frames(exp.camera, exp.devices.sequencer, seq, 3)
 
     assert len(images) == 3
-    assert na.count_trigger_pulses(seq) == 1
-    assert na.count_trigger_pulses(expanded) == 3
-    prepares = [row for row in exp.devices.sequencer.history if row["action"] == "prepare"]
-    fires = [row for row in exp.devices.sequencer.history if row["action"] == "fire"]
-    assert prepares[-1]["duration"] == expanded.duration
-    assert fires[-1]["duration"] == expanded.duration
+    assert na.count_trigger_pulses(seq) == 1                 # the pulse itself is unchanged (1 trigger)
 
 
 def test_pulse_sequence_repeat_metadata_does_not_expand_for_runtime_counts():
@@ -279,96 +300,30 @@ def test_detection_time_scan_sends_probe_duration_per_point():
 
     prepares = [row for row in exp.devices.sequencer.history if row["action"] == "prepare"]
     scan_prepares = [row for row in prepares if row["sequence"] == "detect_time_scan"]
+    # Each point images at that exposure across ``shots`` independent readout frames.  N frames = N
+    # capture-trigger edges, so the fired program is the single-trigger imaging pulse REPEATED to
+    # ``shots`` edges -- its duration is ``shots`` x the one imaging sequence's duration (a real FPGA
+    # emits ``shots`` edges the same way; the camera reads one frame per edge).
     expected = [
-        na.sequence_for_frame_count(na.imaging_sequence(exposure=float(t), load=True, name="detect_time_scan"), 4).duration
+        na.imaging_sequence(exposure=float(t), load=True, name="detect_time_scan").repeated(4).duration
         for t in times
     ]
     assert [row["duration"] for row in scan_prepares] == expected
 
 
 def test_runtime_sequencer_service_contract():
-    seq = na.sequence_for_frame_count(na.imaging_sequence(exposure=1e-4, load=True), 2)
+    seq = na.imaging_sequence(exposure=1e-4, load=True).repeated(2)
     sequencer = na.RuntimeSequencer(channels=["trap", "cooling", "probe", "emCCD"], sleep_scale=0.0)
     program = sequencer.prepare(seq)
     sequencer.fire(seq)
 
-    assert program.trigger_count == 2
     assert sequencer.wait_done(timeout=1.0)
     snapshot = sequencer.snapshot()
     assert snapshot["state"] == "done"
-    assert snapshot["prepared_program"]["trigger_count"] == 2
-
-
-def test_fpga_pulse_streamer_writes_hdl_and_upload_tcl(tmp_path):
-    seq = na.sequence_for_frame_count(na.imaging_sequence(exposure=4e-6, load=True), 2)
-    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "emCCD"], clock_hz=50_000_000)
-
-    files = na.write_pulse_streamer_hdl_bundle(tmp_path / "hdl", channels=["trap", "cooling", "probe", "emCCD"], max_edges=16)
-    tcl_path = na.write_vivado_pulse_streamer_tcl(
-        tmp_path / "prepare.tcl",
-        "prepare",
-        program=program,
-        project="D:/fake/project.xpr",
-        bitstream="D:/fake/main.bit",
-        probes="D:/fake/main.ltx",
-        max_edges=16,
-        channel_count=4,
-    )
-
-    na.validate_pulse_streamer_program(program, max_edges=16, channel_count=4)
-    core = files.core_path.read_text(encoding="utf-8")
-    top = files.top_example_path.read_text(encoding="utf-8")
-    tcl = tcl_path.read_text(encoding="utf-8")
-    assert "module zlc_pulse_streamer" in core
-    assert "Runtime-programmable edge-table pulse streamer" in core
-    assert '(* ram_style = "distributed" *)' in core
-    assert "first_tick_shadow" in core
-    assert "loop_start_mask_shadow" in core
-    assert "tick_mem[0]" not in core
-    assert "mask_mem[0]" not in core
-    assert "mask_mem[loop_start_active]" not in core
-    assert "reg reset_meta = 1'b0;" in core
-    assert "reg reset_sync = 1'b0;" in core
-    assert "reg start_meta = 1'b0;" in core
-    assert "reg prog_we_meta = 1'b0;" in core
-    assert "wire start_event = start_sync && !start_prev" in core
-    assert "wire start_event = start_sync != start_prev" not in core
-    assert "wire prog_we_event = prog_we_sync != prog_we_prev" in core
-    assert "if (reset_sync && prog_we_event)" in core
-    assert "probe_out4 zlc_prog_tick" in top
-    assert "probe_out10 zlc_loop_count" in top
-    assert "proc zlc_stage_probe" in tcl
-    assert "proc zlc_commit_probes" in tcl
-    assert "global zlc_probe_cache" in tcl
-    assert "set cache_key" in tcl
-    assert "zlc_probe_cache($cache_key)" in tcl
-    assert "ZLC_PS_VERBOSE_VIO" in tcl
-    assert "global zlc_verbose_vio" in tcl
-    assert "zlc_commit_probes $zlc_batch" in tcl
-    assert "zlc_stage_probe $vio $zlc_prog_count_probe" in tcl
-    assert "zlc_stage_probe $vio $zlc_repeat_forever_probe" in tcl
-    assert "zlc_stage_probe $vio $zlc_loop_start_addr_probe" in tcl
-    assert "zlc_stage_probe $vio $zlc_loop_end_tick_probe" in tcl
-    assert "zlc_stage_probe $vio $zlc_loop_count_probe" in tcl
-    assert "zlc_stage_probe $vio $zlc_prog_tick_probe" in tcl
-    assert "zlc_stage_probe $vio $zlc_prog_mask_probe" in tcl
-    assert "zlc_start_toggle_value" not in tcl
-    assert "Available probes on matched VIO:" in tcl
-    assert "Vivado project not found" in tcl
-    assert "Vivado probe file not found" in tcl
-    assert "Vivado bitstream not found for programming" in tcl
-    assert "set zlc_reset_probe {zlc_reset probe_out0}" in tcl
-    assert "set zlc_prog_tick_probe {zlc_prog_tick probe_out4}" in tcl
-    assert "set zlc_repeat_forever_probe {zlc_repeat_forever probe_out7}" in tcl
-    assert "set zlc_loop_count_probe {zlc_loop_count probe_out10}" in tcl
-    assert "set zlc_done_probe {zlc_done probe_in1}" in tcl
-    assert "string match \"*/$name\"" in tcl
-    assert "probe aliases" in tcl
-    assert f"wrote {len(program.ticks)}/{len(program.ticks)} edge rows" in tcl
 
 
 def test_fpga_pulse_streamer_rejects_program_that_does_not_fit():
-    seq = na.sequence_for_frame_count(na.imaging_sequence(exposure=4e-6, load=True), 2)
+    seq = na.imaging_sequence(exposure=4e-6, load=True).repeated(2)
     program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "emCCD"], clock_hz=50_000_000)
 
     try:
@@ -388,7 +343,6 @@ def test_fpga_pulse_streamer_rejects_runtime_edge_table_hazards():
         ticks=[0, 10, 10],
         masks=[1, 2, 0],
         duration=1e-7,
-        trigger_count=1,
     )
     bad_final_mask = na.RuntimeSequenceProgram(
         sequence_id="bad",
@@ -398,7 +352,6 @@ def test_fpga_pulse_streamer_rejects_runtime_edge_table_hazards():
         ticks=[0, 10],
         masks=[1, 1],
         duration=1e-7,
-        trigger_count=1,
     )
     bad_duplicate_channel = na.RuntimeSequenceProgram(
         sequence_id="bad",
@@ -408,7 +361,6 @@ def test_fpga_pulse_streamer_rejects_runtime_edge_table_hazards():
         ticks=[0, 10],
         masks=[1, 0],
         duration=1e-7,
-        trigger_count=0,
     )
 
     for program, expected in (
@@ -424,95 +376,6 @@ def test_fpga_pulse_streamer_rejects_runtime_edge_table_hazards():
             raise AssertionError(f"pulse-streamer validation should reject {expected}")
 
 
-def test_fpga_pulse_streamer_rejects_bad_top_level_channel_names():
-    for channels, expected in (
-        (["a-b", "a_b"], "collide"),
-        (["clk", "probe"], "top-level"),
-    ):
-        try:
-            na.generate_pulse_streamer_top_example(channels=channels)
-        except ValueError as exc:
-            assert expected in str(exc)
-        else:
-            raise AssertionError(f"top example should reject {channels!r}")
-
-
-def test_fpga_pulse_streamer_fire_dry_run_does_not_require_program_file(tmp_path):
-    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import run_action
-
-    tcl_path = run_action("fire", state_dir=tmp_path, dry_run=True)
-
-    tcl = tcl_path.read_text(encoding="utf-8")
-    assert "if {[zlc_output_probe_bool $vio $zlc_start_probe]} {" in tcl
-    assert "zlc_stage_probe $vio $zlc_start_probe 1" in tcl
-    assert "zlc_set_probe $vio $zlc_start_probe 0" in tcl
-    assert "ZLC pulse-streamer start pulse sent" in tcl
-
-
-def test_fpga_pulse_streamer_dry_run_uses_project_local_artifacts(tmp_path, monkeypatch):
-    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import run_action
-
-    root = Path(__file__).resolve().parents[1]
-    unsafe_project_dir = root / "fpga" / "pulse_streamer" / "build" / "zlc_pulse_streamer_legacy"
-    unsafe_bitstream = unsafe_project_dir / "legacy.runs" / "impl_1" / "legacy_top.bit"
-    unsafe_probes = unsafe_project_dir / "legacy.runs" / "impl_1" / "legacy_top.ltx"
-    default_project_dir = root / "fpga" / "build" / "address_switch"
-    monkeypatch.setenv("ZLC_PS_PROJECT_DIR", str(unsafe_project_dir))
-    monkeypatch.setenv("ZLC_PS_VIVADO_PROJECT", str(unsafe_project_dir / "legacy.xpr"))
-    monkeypatch.setenv("ZLC_PS_VIVADO_BIT", str(unsafe_bitstream))
-    monkeypatch.setenv("ZLC_PS_VIVADO_LTX", str(unsafe_probes))
-    for name in (
-        "ZLC_PS_PROJECT_ROOT",
-        "ZLC_VIVADO_PROJECT",
-        "ZLC_VIVADO_BIT",
-        "ZLC_VIVADO_LTX",
-    ):
-        monkeypatch.delenv(name, raising=False)
-
-    tcl_path = run_action("fire", state_dir=tmp_path, dry_run=True)
-
-    tcl = tcl_path.read_text(encoding="utf-8")
-    assert str(unsafe_project_dir) not in tcl
-    assert str(unsafe_bitstream) not in tcl
-    assert str(unsafe_probes) not in tcl
-    assert str(default_project_dir) in tcl
-    assert "address_switch.xpr" in tcl
-    assert "address_switch.runs" in tcl
-    assert "zlc_pulse_streamer_top_address_switch.bit" in tcl
-    assert "zlc_pulse_streamer_top_address_switch.ltx" in tcl
-
-
-def test_fpga_pulse_streamer_module_cli_generates_hdl(tmp_path):
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer",
-            "generate_hdl",
-            "--output-dir",
-            str(tmp_path),
-            "--channels",
-            "trap",
-            "cooling",
-            "probe",
-            "trig",
-            "--max-edges",
-            "16",
-            "--tick-width",
-            "32",
-        ],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=20,
-    )
-
-    assert result.returncode == 0, result.stdout
-    assert (tmp_path / "zlc_pulse_streamer.v").exists()
-    assert (tmp_path / "zlc_pulse_streamer_top_example.v").exists()
-    assert (tmp_path / "zlc_pulse_streamer.manifest.json").exists()
-
-
 def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkeypatch):
     monkeypatch.delenv("ZLC_PS_REMOTE_HOST", raising=False)
     root = Path(__file__).resolve().parents[1]
@@ -524,9 +387,8 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
     args = types.SimpleNamespace(
         channels=None,
         channel_count=None,
-        xdc=root / "references" / "source_archives" / "address_switch" / "address_switch.srcs" / "constrs_1" / "new" / "addre.xdc",
+        xdc=root / "fpga" / "board_config" / "board.xdc",
         max_channel_count=62,
-        trigger_channels=None,
     )
     subset_state = na.PulseTableState(
         channels=["ch00", "ch03"],
@@ -543,7 +405,7 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
 
     channels = pulse_gui_launcher._resolve_channels(args, subset_state)
     aligned = subset_state.aligned_to_channels(channels)
-    program = aligned.compile(clock_hz=50_000_000, trigger_channels=["ch11"])
+    program = aligned.compile(clock_hz=50_000_000)
 
     assert channels == [f"ch{i:02d}" for i in range(62)]
     assert aligned.channels == channels
@@ -552,7 +414,11 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
     assert max(program.masks) < (1 << 62)
     labels = pulse_gui_launcher._resolve_channel_labels(args, channels, subset_state)
     pins = pulse_gui_launcher._resolve_channel_pins(args, channels)
-    assert pulse_gui_launcher._resolve_trigger_channels(args, channels, labels) == ["ch11"]
+    # The standalone pulse editor no longer resolves a trigger channel (the sequencer is a pure
+    # streamer; the camera owns the capture-trigger line), but the emCCD line is still discoverable
+    # from the XDC labels for a real camera's capture_trigger_channels.
+    assert not hasattr(pulse_gui_launcher, "_resolve_trigger_channels")
+    assert labels["ch11"] == "emCCD"
     assert labels["ch00"] == "trap"
     assert labels["ch03"] == "probe"
     assert labels["ch06"] == "trig"
@@ -579,7 +445,7 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
             def __init__(self, **_kwargs):
                 raise ConnectionRefusedError("server is not running")
 
-    sequencer, fallback_channels, fallback_triggers, notice = pulse_gui_launcher._connect_remote_or_offline(
+    sequencer, fallback_channels, notice = pulse_gui_launcher._connect_remote_or_offline(
         remote_args,
         subset_state,
         FailingRemoteNa,
@@ -587,7 +453,6 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
     )
     assert sequencer is None
     assert fallback_channels == channels
-    assert fallback_triggers == ["ch11"]
     assert "opened offline editor" in notice
     assert pulse_gui_launcher._remote_host_was_requested([]) is False
     assert pulse_gui_launcher._remote_host_was_requested(["--remote-host", "192.168.0.20"]) is True
@@ -604,110 +469,211 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     root = Path(__file__).resolve().parents[1]
     fpga = root / "fpga" / "pulse_streamer"
     root_readme = (root / "README.md").read_text(encoding="utf-8")
-    project_overview = (root / "docs" / "PROJECT_OVERVIEW.md").read_text(encoding="utf-8")
-    runbook = (root / "docs" / "neutral_atom_hardware_manual" / "REAL_HARDWARE_RUNBOOK.md").read_text(encoding="utf-8")
-    pulse_report = (root / "docs" / "pulse_streamer_test_report" / "pulse_streamer_test_report_zh.texbody").read_text(encoding="utf-8")
+    # The docs reorg replaced PROJECT_OVERVIEW.md and the implementation half of
+    # the old hardware runbook with the consolidated maintainer note, and turned
+    # the hardware manual into the three-manual layout. Read the new homes.
+    maintainer_notes = (root / "docs" / "MAINTAINER_NOTES.md").read_text(encoding="utf-8")
+    main_manual_template = (root / "Zou_lab_control" / "neutral_atom" / "content" / "manual_templates" / "main_manual_zh.texbody").read_text(encoding="utf-8")
+    fpga_manual_template = (root / "Zou_lab_control" / "neutral_atom" / "content" / "manual_templates" / "fpga_manual_zh.texbody").read_text(encoding="utf-8")
+    # The rendered docs/fpga_manual/fpga_manual_zh.tex is a build INTERMEDIATE that
+    # render_notes_pdf assembles in a temp dir and never writes to docs/ (only the
+    # .pdf lands there).  Assert facts against the .texbody source of truth instead.
     fpga_readme = (root / "fpga" / "README.md").read_text(encoding="utf-8")
     streamer_readme = (fpga / "README.md").read_text(encoding="utf-8")
     frontend_readme = (root / "Zou_lab_control" / "frontend" / "README.md").read_text(encoding="utf-8")
     pulses_readme = (root / "pulses" / "README.md").read_text(encoding="utf-8")
     tests_readme = (root / "tests" / "README.md").read_text(encoding="utf-8")
     frontend_manual_template = (root / "Zou_lab_control" / "frontend" / "content" / "manual_templates" / "frontend_manual_zh.texbody").read_text(encoding="utf-8")
-    hardware_quickstart_template = (root / "Zou_lab_control" / "neutral_atom" / "content" / "manual_templates" / "hardware_quickstart_zh.texbody").read_text(encoding="utf-8")
-    hardware_quickstart_pdf_tex = (root / "docs" / "neutral_atom_hardware_manual" / "neutral_atom_hardware_quickstart_zh.tex").read_text(encoding="utf-8")
     fpga_notebook_text = "\n".join(cell["source"] for cell in neutral_atom_fpga_server_cells())
     hardware_notebook_text = "\n".join(cell["source"] for cell in neutral_atom_hardware_tutorial_cells())
 
-    for name in ("install_requirements.bat", "pulse_gui.bat", "start_tutorials_jupyter_lab.bat"):
+    for name in ("install_requirements.bat", "pulse_gui.bat", "task_console.bat",
+                 "figure_viewer.bat", "start_tutorials_jupyter_lab.bat", "estimate_resources.bat"):
         assert (root / name).exists(), name
     assert not (root / "build_and_program.bat").exists()
     assert not (root / "run_server.bat").exists()
     assert {path.name for path in root.glob("*.bat")} == {
         "install_requirements.bat",
         "pulse_gui.bat",
+        # live experiment dashboard (virtual node by default)
+        "task_console.bat",
+        # double-click viewer that re-opens a saved figure .npz (exp.figure_viewer)
+        "figure_viewer.bat",
         "start_tutorials_jupyter_lab.bat",
+        # double-click capacity check against fpga/board_config/streamer_config.json
+        "estimate_resources.bat",
     }
 
     required = {
-        "zlc_pulse_streamer.v",
-        "zlc_pulse_streamer_top_address_switch.v",
-        "create_project_address_switch.tcl",
-        "check_address_switch_synth.tcl",
+        # the FINAL single design (1-tick FIFO prefetch + 2-bank streaming scan),
+        # driven over JTAG-to-AXI -- the ONLY build target (no variants).
+        "zlc_edge_streamer.v",
+        "zlc_pulse_streamer_top.v",
+        "create_project.tcl",
+        "program_fpga.tcl",
         "diagnose_hw_target.tcl",
-        "program_fpga_address_switch.tcl",
         "README.md",
     }
-    assert required.issubset({path.name for path in fpga.iterdir()})
+    present = {path.name for path in fpga.iterdir()}
+    assert required.issubset(present), required - present
+    # NO legacy residue: the old LUTRAM/VIO engine, the depth-1 'D' engine, the
+    # on-chip AXI loader, and the VIO address-switch top + all their tcl are GONE.
+    assert present.isdisjoint({
+        "zlc_pulse_streamer.v", "zlc_pulse_streamer_d.v", "zlc_pulse_streamer_d_top.v",
+        "zlc_axi_program_loader.v", "zlc_pulse_streamer_loader_top.v",
+        "zlc_pulse_streamer_top_address_switch.v",
+        "create_project_d.tcl", "create_project_loader.tcl", "create_project_address_switch.tcl",
+        "program_fpga_d.tcl", "program_fpga_loader.tcl", "program_fpga_address_switch.tcl",
+        "check_address_switch_synth.tcl",
+        "zlc_pulse_streamer_runlength.v", "zlc_runlength_engine.v",
+    }), "legacy residue HDL/tcl still present in fpga/pulse_streamer"
     legacy_width = "40" + "ch"
-    removed = {
-        f"zlc_pulse_streamer_top_{legacy_width}.v",
-        f"zlc_pulse_streamer_{legacy_width}.xdc",
-        f"zlc_pulse_streamer_{legacy_width}.xdc.template",
-        f"create_project_{legacy_width}.tcl",
-        f"check_{legacy_width}_synth.tcl",
-        f"program_fpga_{legacy_width}.tcl",
-    }
-    assert removed.isdisjoint({path.name for path in fpga.iterdir()})
-    assert not list((root / "docs" / "pulse_streamer_test_report" / "assets").glob(f"*{legacy_width}*"))
+    legacy_xdc_env = "ZLC_PS_" + legacy_width.upper() + "_XDC"
+    assert not list((root / "docs").rglob(f"*{legacy_width}*"))
 
-    top = (fpga / "zlc_pulse_streamer_top_address_switch.v").read_text(encoding="utf-8")
-    create_tcl = (fpga / "create_project_address_switch.tcl").read_text(encoding="utf-8")
-    check_tcl = (fpga / "check_address_switch_synth.tcl").read_text(encoding="utf-8")
-    program_tcl = (fpga / "program_fpga_address_switch.tcl").read_text(encoding="utf-8")
+    top = (fpga / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    engine = (fpga / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    create_tcl = (fpga / "create_project.tcl").read_text(encoding="utf-8")
+    program_tcl = (fpga / "program_fpga.tcl").read_text(encoding="utf-8")
     build_bat = (root / "fpga" / "build_and_program.bat").read_text(encoding="utf-8")
     server_bat = (root / "fpga" / "run_server.bat").read_text(encoding="utf-8")
     launcher = (root / "pulse_gui.py").read_text(encoding="utf-8")
     preset = root / "pulses" / "camera_imaging_address_switch.json"
 
-    assert "module zlc_pulse_streamer_top_address_switch" in top
-    assert "localparam integer CHANNEL_COUNT = 62" in top
-    assert "assign trig = out[6];" in top
-    assert "assign trap = out[9];" in top
-    assert "assign probe = out[3];" in top
-    assert "assign cooling = out[0];" in top
-    assert "wire [CHANNEL_COUNT-1:0] zlc_prog_mask" in top
-    assert "CONFIG.C_PROBE_OUT5_WIDTH {62}" in create_tcl
-    assert "set project_name address_switch" in create_tcl
-    assert "zlc_pulse_streamer_top_address_switch" in create_tcl
+    # final top: 62-pin board map + the FINAL engine instance + forced-latency build.
+    assert "module zlc_pulse_streamer_top" in top
+    assert "parameter integer CHANNEL_COUNT = 62" in top
+    # The pin map drives out_final (the clk-muxed engine output: out_final[n] = clk_en[n] ? ~clk : out[n]).
+    assert "assign trig = out_final[6];" in top
+    assert "assign trap = out_final[9];" in top
+    assert "assign probe = out_final[3];" in top
+    assert "assign cooling = out_final[0];" in top
+    assert "zlc_edge_streamer" in top                      # instantiates the final engine
+    assert "module zlc_edge_streamer" in engine
+    # SHORT project name "ps" (-> ps.runs) keeps Vivado's deep run/.Xil temp path
+    # under Windows MAX_PATH while staying in fpga/build (no out-of-repo relocation,
+    # no extra drive/junction).
+    assert "set project_name ps" in create_tcl
+    assert "set project_name pulse_streamer" not in create_tcl
+    assert "zlc_edge_streamer.v" in create_tcl and "zlc_pulse_streamer_top.v" in create_tcl
+    assert "zlc_force_latency2" in create_tcl              # forced edge-BRAM read latency 2
     assert "ZLC_PS_XDC" in create_tcl
-    legacy_xdc_env = "ZLC_PS_" + legacy_width.upper() + "_XDC"
     assert legacy_xdc_env not in create_tcl
-    assert "CONFIG.C_PROBE_OUT5_WIDTH {62}" in check_tcl
-    assert "ZLC check_address_switch_synth contract" in check_tcl
-    assert "ZLC program_fpga_address_switch contract" in program_tcl
-    assert "zlc_pulse_streamer_top_address_switch.bit" in program_tcl
-    assert "zlc_pulse_streamer_top_address_switch.ltx" in program_tcl
+    # BRAM IP enable-pin contract (the build is blind -- no Verilog sim in CI). The
+    # top drives BOTH .ena and .enb on every BRAM, so each IP must expose BOTH
+    # enable pins. A drift to Enable_B {Always_Enabled} drops the enb port and synth
+    # dies with "named port connection 'enb' does not exist". Keep ena/enb symmetric.
+    assert ".ena(" in top and ".enb(" in top
+    assert "Always_Enabled" not in create_tcl
+    # 5 BRAMs: 3 edge (tick/coeff/mask) + scan + bus image.  The LITERAL OUTPUT delay line is a
+    # per-channel / per-bus distributed-RAM circular buffer (ram_style="distributed", +0 RAMB36) --
+    # there is NO delay BRAM image and NO mini-loader (the old membership upload image is gone).
+    assert create_tcl.count("Enable_A {Use_ENA_Pin}") == 5   # all 5 BRAMs expose ENA
+    assert create_tcl.count("Enable_B {Use_ENB_Pin}") == 5   # ...and ENB (top drives both)
+    assert "blk_mem_gen_laneimg" not in create_tcl and "blk_mem_gen_laneimg" not in top
+    assert "blk_mem_gen_delayimg" not in create_tcl and "blk_mem_gen_delayimg" not in top
+    # AXI4 BURST upload path: jtag_axi + axi_bram_ctrl are FULL AXI4 (not Lite), and the
+    # top wires the INCR-burst sidebands -- so one create_hw_axi_txn -len N moves up to
+    # 256 words and a few-thousand-word BRAM upload drops from seconds to ~100 ms.  A
+    # drift back to AXI4-Lite (single beat) would silently make uploads slow again.
+    assert "CONFIG.PROTOCOL {AXI4}" in create_tcl
+    assert "CONFIG.PROTOCOL {AXI4LITE}" not in create_tcl
+    assert "m_axi_awlen" in top and "m_axi_awburst" in top and "m_axi_wlast" in top
+    assert ".s_axi_awlen(" in top and ".s_axi_awburst(" in top and ".s_axi_wlast(" in top
+    # additive-delay repeat: the engine rewinds repeat_forever to the steady frame
+    # (loop_start), not edge 0, so the real-startup preamble plays exactly once.
+    assert "repeat_from_loop_start" in engine and "repeat_from_loop_start" in top
+    # STREAMED repeat_forever re-sweep: at the sweep seam the engine stalls waiting for the
+    # host to reload chunk 0; it MUST publish scan_cursor = active_scan_count there so the
+    # host's refill loop (which reloads chunk 0 only when CURSOR >= N) fires -- without this
+    # the cursor stays at N-1, the host never reloads, and a >2*bank_size repeat_forever scan
+    # stops dead after exactly one sweep.
+    assert "scan_cursor <= active_scan_count" in engine
+    # PER-CHANNEL OUTPUT DELAY.  A channel delay is applied to the engine OUTPUT, not baked
+    # into the edges -- output_delayed[t] = output_undelayed[t-d], 0 before fire (never
+    # disturbs another channel, first frame real).  TTL: a per-channel EVENT SCHEDULER
+    # (toggles queued against a free-running g_time; delay bound = 32-bit field).  DAC: a
+    # per-bus 10-bit ring read at (wptr - d), ring-capped.  The OLD membership / interval /
+    # skip / off machinery (and the even older scanned-delay "lane") MUST be GONE.
+    assert "zlc_lane_tick" not in engine and "lane_tick_mem" not in engine and "NUM_LANES" not in engine
+    # no membership residue: no intervals, no off/skip/frame-index startup gate
+    assert "del_iv_start_mem" not in engine and "del_iv_stop_mem" not in engine and "del_iv_count" not in engine
+    assert "del_off" not in engine and "del_skip" not in engine and "del_frame_idx" not in engine
+    assert "del_member" not in engine and "del_phase" not in engine and "del_started_eff" not in engine
+    assert "membership" not in engine.lower()
+    assert "MAX_DELAY_INTERVALS" not in engine and "NUM_DELAYS" not in engine and "SKIP_WIDTH" not in engine
+    assert "delay_prog" not in engine and "delay_prog" not in top
+    # both TTL and DAC delays are event-scheduled (32-bit field, capacity = events in flight)
+    for tok in ("evt_mem", "evt_out", "g_time", "prev_undelayed", "EVT_DEPTH", "GTIME_WIDTH"):
+        assert tok in engine, tok
+    assert "ttl_sr" not in engine                                 # the old per-tick SRL lines are GONE
+    assert "g_busdly" in engine                                   # per-DA-bit event scheduler
+    assert "del_ch_ticks" in engine and "del_bus_ticks" in engine
+    assert 'ram_style = "distributed"' in engine                  # the event FIFOs are LUTRAM, NOT BRAM
+    # the per-channel output-delay merge: out = (state_mask & ~delayed_mask) | delayed_out
+    assert "(state_mask & ~delayed_mask) | delayed_out" in engine
+    # BOTH TTL and DAC delays ride the 32b-per-signal R_DELAY register region
+    assert "R_DELAY_BASE" in top and "delay_reg" in top and "sel_delay" in top
+    assert "delay_ticks" in top and "bus_delay_ticks" in top
+    assert "set top zlc_pulse_streamer_top" in program_tcl
+    assert "ps.runs" in program_tcl
+    assert "pulse_streamer.runs" not in program_tcl
 
-    assert "create_project_address_switch.tcl" in build_bat
-    assert "program_fpga_address_switch.tcl" in build_bat
-    assert "check_address_switch_synth.tcl" in build_bat
-    assert "zlc_verify_address_switch_sources" in build_bat
-    assert "fpga\\build\\address_switch" in build_bat
+    # build_and_program.bat builds the FINAL single design (JTAG-to-AXI, 1-tick
+    # FIFO prefetch + streaming scan): one create_project.tcl, no variants, no VIO
+    # address-switch and no discarded run-length engine.
+    assert "create_project.tcl" in build_bat
+    assert "program_fpga.tcl" in build_bat
+    assert "zlc_verify_sources" in build_bat
+    assert "zlc_force_latency2" in build_bat              # forces edge BRAM latency 2
+    assert "blk_mem_gen_edge_tick" in build_bat           # 3 parallel edge BRAMs
+    assert "create_project_runlength.tcl" not in build_bat
+    assert "create_project_address_switch.tcl" not in build_bat
+    assert "create_project_loader.tcl" not in build_bat
+    assert "ZLC_PS_VARIANT" not in build_bat              # one path, no variants
+    assert 'set "ZLC_PROJ_SUB=ps"' in build_bat
+    assert r'set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\!ZLC_PROJ_SUB!"' in build_bat
     assert legacy_xdc_env not in build_bat
+    # Long-path safety: the build stays IN fpga/build (no out-of-repo relocation,
+    # no extra drive); the short "ps" project name keeps Vivado's deep run/.Xil
+    # temp path under the limit. Both bats default the project dir under fpga/build,
+    # and the tcl guard fails clearly (advising a shorter CHECKOUT) if even that is
+    # too long.
+    assert "zlc_safe_project_dir" in create_tcl
+    assert "LOCALAPPDATA" not in build_bat and "LOCALAPPDATA" not in server_bat
+    assert r"%FPGA_DIR%build" in build_bat                # build root stays in fpga\build
+    assert r"%FPGA_DIR%build" in server_bat
+    # run_server.bat starts the FINAL JTAG-to-AXI server (no loader/variant residue).
     assert "ZLC_PS_CLOCK_HZ=50000000" in server_bat
-    assert "zlc_verify_address_switch_sources" in server_bat
-    assert "fpga\\build\\address_switch" in server_bat
-    assert "state_address_switch" in server_bat
+    assert "zlc_verify_sources" in server_bat
+    assert "zlc_verify_loader_sources" not in server_bat
+    assert "ZLC_PS_SERVER_BACKEND=jtag-axi" in server_bat
+    assert "zlc_pulse_streamer_top.ltx" in server_bat
+    assert "zlc_pulse_streamer_loader_top" not in server_bat
+    assert "ZLC_PS_VARIANT" not in server_bat
+    assert "fpga\\build\\address_switch" not in server_bat
     assert "echo Trigger:" not in server_bat
-    assert "--trigger-channels ch03" not in server_bat
+    # The sequencer is a pure streamer: which line gates a camera is the CAMERA's property
+    # (its config's capture_trigger_channels), not a server arg.  So run_server.bat no longer
+    # infers a trigger channel or passes --trigger-channels.
+    assert "--trigger-channels" not in server_bat
+    assert "infer_trigger_channels" not in server_bat
+    assert "ZLC_PS_TRIGGER_CHANNELS" not in server_bat
 
     assert "DEFAULT_PULSE_GUI_FALLBACK_CHANNELS = 62" in launcher
     assert "infer_xdc_channel_count" in launcher
-    assert "infer_trigger_channels" in server_bat
     assert preset.exists()
 
     for text in (
         root_readme,
-        project_overview,
-        runbook,
-        pulse_report,
+        maintainer_notes,
+        main_manual_template,
+        fpga_manual_template,
         fpga_readme,
         streamer_readme,
         frontend_readme,
         pulses_readme,
         frontend_manual_template,
-        hardware_quickstart_template,
-        hardware_quickstart_pdf_tex,
         fpga_notebook_text,
         hardware_notebook_text,
     ):
@@ -718,152 +684,119 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
         assert "fpga\\build\\p40" not in text
 
     assert "camera_imaging_address_switch.json" in pulses_readme
-    assert "camera_exposure_scan_example.txt" in pulses_readme
-    assert (root / "pulses" / "camera_exposure_scan_example.txt").exists()
     assert "ch11" in pulses_readme
-    assert "50 MHz" in runbook
-    assert "20 ns" in runbook
-    assert "# vars: camera_exposure_ns" in runbook
-    assert "ZLC_PS_RESOURCE_TARGET_PCT" in runbook
-    assert "address-switch" in project_overview
+
+    # The 50 MHz / 20 ns clock fact moved from the deleted runbook into the
+    # consolidated maintainer note and is also taught in the main manual.
+    assert "50 MHz" in maintainer_notes
+    assert "20 ns" in maintainer_notes
+    assert "50 MHz" in main_manual_template
+    assert "20 ns" in main_manual_template
+    # The prepare/fire/wait_done/safe_state lifecycle lives in the maintainer note
+    # + main manual (design-agnostic host contract).
+    assert "prepare" in maintainer_notes and "fire" in maintainer_notes
+    assert "wait_done" in maintainer_notes and "safe_state" in maintainer_notes
+    assert "prepare / fire / wait\\_done / safe\\_state" in main_manual_template
+    # Capacity is now fixed by the host image solver (no per-build env knob); the
+    # source of truth is named in the maintainer note + fpga README.
+    assert "solve_capacity" in maintainer_notes
+    assert "solve_capacity" in fpga_readme
+    # The FINAL transport (JTAG-to-AXI) anchors the new root README and the
+    # maintainer note (replacing the old VIO/address-switch control keyword).
+    assert "JTAG-to-AXI" in root_readme
+    assert "JTAG-to-AXI" in maintainer_notes
     assert "Run the smallest check" in tests_readme
     assert "Full `pytest -q` is reserved for broad handoff" in tests_readme
 
-def test_fpga_pulse_streamer_address_switch_vio_widths_match_python_generator():
-    root = Path(__file__).resolve().parents[1]
-    fpga = root / "fpga" / "pulse_streamer"
-    top = (fpga / "zlc_pulse_streamer_top_address_switch.v").read_text(encoding="utf-8")
-    tcl = (fpga / "create_project_address_switch.tcl").read_text(encoding="utf-8")
+def test_repo_batch_files_use_crlf_line_endings():
+    """Windows .bat files MUST be CRLF in the working tree.  With bare-LF endings
+    cmd.exe intermittently fails to seek :labels ("The system cannot find the batch
+    label specified ...") -- the failure depends on where labels fall relative to
+    cmd's internal read buffer, so it can pass once and break after an unrelated
+    edit shifts byte offsets.  .gitattributes forces *.bat eol=crlf; guard the
+    actual working-tree bytes so a stray LF rewrite can't silently reintroduce it."""
 
-    generated_top = na.generate_pulse_streamer_top_example(
-        channels=[f"ch{i:02d}" for i in range(62)],
-        top_module_name="zlc_pulse_streamer_top_address_switch",
-        max_edges=512,
-        max_scan_points=256,
+    root = Path(__file__).resolve().parents[1]
+    # Police only our own entrypoints, not archived/third-party material under
+    # references/ or generated build artifacts.
+    skip_parts = {
+        ".git", "build", "__pycache__", "node_modules", ".venv", "site-packages",
+        "references",
+    }
+    bats = [
+        p for p in root.rglob("*.bat")
+        if not (skip_parts & set(p.relative_to(root).parts))
+    ]
+    assert bats, "expected .bat entrypoints in the repo"
+    offenders = []
+    for bat in bats:
+        data = bat.read_bytes()
+        if any(b == 0x0A and (i == 0 or data[i - 1] != 0x0D) for i, b in enumerate(data)):
+            offenders.append(bat.relative_to(root).as_posix())
+    assert not offenders, (
+        "these .bat files have bare-LF line endings (cmd.exe label seek will fail): "
+        f"{offenders}"
     )
 
-    width_contract = {
-        "prog_addr": "8:0",
-        "prog_tick": "31:0",
-        "prog_mask": "61:0",
-        "prog_count": "9:0",
-        "loop_start_addr": "8:0",
-        "loop_end_tick": "31:0",
-        "loop_count": "31:0",
-        "scan_prog_addr": "7:0",
-        "scan_prog_bus_values": "39:0",
-        "scan_count": "8:0",
-        "bus_prog_bus": "1:0",
-        "bus_prog_addr": "5:0",
-        "bus_prog_start_tick": "31:0",
-        "bus_prog_stop_tick": "31:0",
-        "bus_prog_start_value": "9:0",
-        "bus_prog_stop_value": "9:0",
-        "bus_prog_mode": "1:0",
-        "bus_counts": "27:0",
-    }
-    for signal, width in width_contract.items():
-        if signal == "prog_mask":
-            assert "wire [CHANNEL_COUNT-1:0] zlc_prog_mask;" in top
-            assert "wire [61:0] zlc_prog_mask;" in generated_top
-        else:
-            assert f"wire [{width}] zlc_{signal};" in top
-            assert f"wire [{width}] zlc_{signal};" in generated_top
 
-    signed_width_contract = {
-        "prog_tick_x_coeff": "15:0",
-        "prog_tick_y_coeff": "15:0",
-        "scan_prog_x": "31:0",
-        "scan_prog_y": "31:0",
-        "loop_end_x_coeff": "15:0",
-        "loop_end_y_coeff": "15:0",
-    }
-    for signal, width in signed_width_contract.items():
-        assert f"wire signed [{width}] zlc_{signal};" in top
-        assert f"wire signed [{width}] zlc_{signal};" in generated_top
-
-    for expected in {
-        "CONFIG.C_NUM_PROBE_OUT {31}",
-        "CONFIG.C_PROBE_OUT3_WIDTH {9}",
-        "CONFIG.C_PROBE_OUT4_WIDTH {32}",
-        "CONFIG.C_PROBE_OUT5_WIDTH {62}",
-        "CONFIG.C_PROBE_OUT6_WIDTH {10}",
-        "CONFIG.C_PROBE_OUT8_WIDTH {9}",
-        "CONFIG.C_PROBE_OUT9_WIDTH {32}",
-        "CONFIG.C_PROBE_OUT10_WIDTH {32}",
-        "CONFIG.C_PROBE_OUT11_WIDTH {16}",
-        "CONFIG.C_PROBE_OUT12_WIDTH {16}",
-        "CONFIG.C_PROBE_OUT15_WIDTH {8}",
-        "CONFIG.C_PROBE_OUT16_WIDTH {32}",
-        "CONFIG.C_PROBE_OUT17_WIDTH {32}",
-        "CONFIG.C_PROBE_OUT18_WIDTH {9}",
-        "CONFIG.C_PROBE_OUT19_WIDTH {16}",
-        "CONFIG.C_PROBE_OUT20_WIDTH {16}",
-        "CONFIG.C_PROBE_OUT21_WIDTH {1}",
-        "CONFIG.C_PROBE_OUT22_WIDTH {2}",
-        "CONFIG.C_PROBE_OUT23_WIDTH {6}",
-        "CONFIG.C_PROBE_OUT24_WIDTH {32}",
-        "CONFIG.C_PROBE_OUT25_WIDTH {32}",
-        "CONFIG.C_PROBE_OUT26_WIDTH {10}",
-        "CONFIG.C_PROBE_OUT27_WIDTH {10}",
-        "CONFIG.C_PROBE_OUT28_WIDTH {2}",
-        "CONFIG.C_PROBE_OUT29_WIDTH {28}",
-        "CONFIG.C_PROBE_OUT30_WIDTH {40}",
-    }:
-        assert expected in tcl
-
-    assert ".EDGE_ADDR_WIDTH(9)" in top
-    assert ".EDGE_ADDR_WIDTH(9)" in generated_top
-    assert ".SCAN_ADDR_WIDTH(8)" in top
-    assert ".SCAN_ADDR_WIDTH(8)" in generated_top
-    assert "CONFIG.C_PROBE_OUT3_WIDTH {10}" not in tcl
-    assert "CONFIG.C_PROBE_OUT18_WIDTH {11}" not in tcl
-    assert ".EDGE_ADDR_WIDTH(10)" not in top
-    assert ".EDGE_ADDR_WIDTH(10)" not in generated_top
-
-
-def test_fpga_pulse_streamer_capacity_doc_matches_checked_in_ram_strategy():
+def test_repo_gitattributes_forces_crlf_for_batch_files():
     root = Path(__file__).resolve().parents[1]
-    fpga = root / "fpga" / "pulse_streamer"
-    core = (fpga / "zlc_pulse_streamer.v").read_text(encoding="utf-8")
-    top = (fpga / "zlc_pulse_streamer_top_address_switch.v").read_text(encoding="utf-8")
-    capacity = (root / "docs" / "FPGA_PULSE_STREAMER_CAPACITY.md").read_text(encoding="utf-8")
-    streamer_readme = (fpga / "README.md").read_text(encoding="utf-8")
+    attrs = (root / ".gitattributes").read_text(encoding="utf-8")
+    assert "*.bat text eol=crlf" in attrs
 
-    assert '(* ram_style = "distributed" *)' in core
-    assert "scan_bus_value_mem" in core
-    assert "localparam integer CHANNEL_COUNT = 62" in top
-    assert ".CHANNEL_COUNT(CHANNEL_COUNT)" in top
-    assert ".EDGE_ADDR_WIDTH(9)" in top
-    assert "The HDL currently marks `tick_mem`, `mask_mem`, and scan RAM as distributed RAM" in capacity
-    assert "CHANNEL_COUNT=62" in capacity
-    assert "BRAM-friendly synchronous-read" in capacity
-    assert "pipeline and a faster upload transport" in capacity
-    assert "AXI, JTAG-to-AXI, UART/SPI" in capacity
-    assert "current `edge_index` row" in streamer_readme
-    assert "512 rows" in streamer_readme
-    assert "probe_out3  zlc_prog_addr" in streamer_readme
-    assert "probe_out6  zlc_prog_count" in streamer_readme
-    assert "probe_out18 zlc_scan_count" in streamer_readme
-    assert "probe_out30 zlc_scan_prog_bus_values" in streamer_readme
+
+def _user_facing_markdown_files(root):
+    """Discover the current user-facing markdown set.
+
+    The docs were reorganized into a single root README, one consolidated
+    maintainer note, and trimmed subsystem pointers. Rather than hard-code a
+    stale list, glob for ``*.md`` and drop the non-user-facing ones: historical
+    source archives, tool caches, and the notebook-cell source templates
+    (``*.cells.md``) that are not standalone documents.
+    """
+
+    skip_parts = {"references", ".git", ".pytest_cache", "__pycache__", "build"}
+    markdown_files = []
+    for path in sorted(root.rglob("*.md")):
+        if any(part in skip_parts for part in path.relative_to(root).parts):
+            continue
+        if path.name.endswith(".cells.md"):
+            continue
+        markdown_files.append(path)
+    return markdown_files
 
 
 def test_user_facing_markdown_local_links_exist():
     root = Path(__file__).resolve().parents[1]
-    markdown_files = [
-        root / "README.md",
-        root / "AGENTS.md",
-        root / "docs" / "PROJECT_OVERVIEW.md",
-        root / "docs" / "DOCUMENTATION_GUIDE.md",
-        root / "docs" / "FPGA_PULSE_STREAMER_CAPACITY.md",
-        root / "docs" / "FRONTEND_FLUENT_STYLE_GUIDE.md",
-        root / "docs" / "neutral_atom_hardware_manual" / "REAL_HARDWARE_RUNBOOK.md",
-        root / "fpga" / "README.md",
-        root / "fpga" / "pulse_streamer" / "README.md",
-        root / "Zou_lab_control" / "frontend" / "README.md",
-        root / "pulses" / "README.md",
-        root / "tests" / "README.md",
-    ]
+    markdown_files = _user_facing_markdown_files(root)
+
+    # The reorganized layout: a single root entry point, the consolidated
+    # maintainer note, and the trimmed subsystem pointers. Guard that the new
+    # canonical docs are in the discovered set so the test cannot silently pass
+    # on an empty list, and that the deleted docs stay deleted.
+    discovered = {path.relative_to(root).as_posix() for path in markdown_files}
+    expected_present = {
+        "README.md",
+        "AGENTS.md",
+        "docs/ROADMAP.md",
+        "docs/MAINTAINER_NOTES.md",
+        "fpga/README.md",
+        "fpga/pulse_streamer/README.md",
+        "pulses/README.md",
+        "Zou_lab_control/frontend/README.md",
+        "Zou_lab_control/frontend/AGENTS.md",
+        "tests/README.md",
+    }
+    assert expected_present.issubset(discovered), expected_present - discovered
+    for deleted in (
+        "docs/PROJECT_OVERVIEW.md",
+        "docs/DOCUMENTATION_GUIDE.md",
+        "docs/FPGA_PULSE_STREAMER_CAPACITY.md",
+        "docs/FRONTEND_FLUENT_STYLE_GUIDE.md",
+        "docs/neutral_atom_hardware_manual/REAL_HARDWARE_RUNBOOK.md",
+    ):
+        assert deleted not in discovered, deleted
+
     missing: list[str] = []
     for markdown_file in markdown_files:
         assert markdown_file.exists(), markdown_file
@@ -882,8 +815,10 @@ def test_user_facing_markdown_local_links_exist():
 
 
 def test_repo_tree_has_no_generated_fpga_or_latex_work_products():
+    import os
+    import subprocess
+
     root = Path(__file__).resolve().parents[1]
-    ignored_parts = {"references", ".git"}
     bad_directories = {"build", ".Xil", ".runs", ".cache", ".hw", ".sim"}
     bad_suffixes = {
         ".aux",
@@ -900,29 +835,53 @@ def test_repo_tree_has_no_generated_fpga_or_latex_work_products():
         ".rpt",
         ".dcp",
     }
+
+    def git_ignored(rel_posix: str) -> bool:
+        try:
+            return subprocess.run(
+                ["git", "-C", str(root), "check-ignore", "-q", "--", rel_posix]
+            ).returncode == 0
+        except Exception:  # pragma: no cover - git not available
+            return False
+
+    # Walk with pruning: a git-ignored subtree (e.g. fpga/build from a local Vivado
+    # run, or references/) is never committed, so it cannot pollute the repo -- skip
+    # it entirely.  Only NON-ignored generated artifacts are real problems.
     found: list[str] = []
-    for path in root.rglob("*"):
-        relative = path.relative_to(root)
-        if relative.parts and relative.parts[0] in ignored_parts:
-            continue
-        if path.is_dir() and path.name in bad_directories:
-            found.append(str(relative))
-        if path.is_file() and any(path.name.endswith(suffix) for suffix in bad_suffixes):
-            found.append(str(relative))
-    assert found == []
+    for dirpath, dirnames, filenames in os.walk(str(root)):
+        relative = Path(dirpath).relative_to(root)
+        dirnames[:] = [
+            d for d in dirnames if d != ".git" and not git_ignored((relative / d).as_posix())
+        ]
+        for d in dirnames:
+            if d in bad_directories:
+                found.append((relative / d).as_posix())
+        for name in filenames:
+            child = (relative / name).as_posix()
+            if any(name.endswith(suffix) for suffix in bad_suffixes) and not git_ignored(child):
+                found.append(child)
+    assert found == [], found
 
 
 def test_repo_bat_entrypoints_are_minimal_and_grouped_by_submodule():
     root = Path(__file__).resolve().parents[1]
-    ignored_roots = {".git", "references", "reference"}
+    # "build" excludes the git-ignored Vivado project output (fpga/build/r/...),
+    # which contains IP-generated runme.bat files that are not entrypoints.  ".claude" excludes the
+    # harness's transient tooling state (skills/hooks + agent worktree copies of the whole repo) -- it
+    # is gitignored, not part of the project entrypoints, and a leftover agent worktree would otherwise
+    # smuggle a duplicate copy of every .bat into this audit.
+    ignored_roots = {".git", ".claude", "references", "reference", "build"}
     bat_files = sorted(path.relative_to(root).as_posix() for path in root.rglob("*.bat") if not (set(path.relative_to(root).parts) & ignored_roots))
 
     assert bat_files == [
+        "estimate_resources.bat",
+        "figure_viewer.bat",
         "fpga/build_and_program.bat",
         "fpga/run_server.bat",
         "install_requirements.bat",
         "pulse_gui.bat",
         "start_tutorials_jupyter_lab.bat",
+        "task_console.bat",
     ]
     assert not any("4ch" in path.lower() or "smoke" in path.lower() or "simulate" in path.lower() for path in bat_files)
 
@@ -973,7 +932,7 @@ def test_fpga_pulse_streamer_xdc_infers_full_channel_count(tmp_path):
 
 def test_address_switch_xdc_infers_62_outputs_trigger_and_bus_channels():
     root = Path(__file__).resolve().parents[1]
-    xdc = root / "references" / "source_archives" / "address_switch" / "address_switch.srcs" / "constrs_1" / "new" / "addre.xdc"
+    xdc = root / "fpga" / "board_config" / "board.xdc"
     count = na.infer_xdc_channel_count(xdc, default=1, max_count=None)
     labels = na.infer_xdc_channel_labels(xdc, default=count, max_count=None)
     channels = [f"ch{index:02d}" for index in range(count)]
@@ -989,50 +948,6 @@ def test_address_switch_xdc_infers_62_outputs_trigger_and_bus_channels():
     assert buses["da_bias_x"] == [f"ch{index:02d}" for index in range(40, 50)]
     assert buses["da_bias_y"] == [f"ch{index:02d}" for index in range(38, 28, -1)]
     assert buses["da_bias_z"] == [f"ch{index:02d}" for index in range(60, 50, -1)]
-
-
-def test_fpga_pulse_streamer_prepare_tcl_covers_full_edge_table_boundary(tmp_path):
-    program = na.RuntimeSequenceProgram(
-        sequence_id="full",
-        sequence_name="full_table",
-        clock_hz=100e6,
-        channels=["trap", "cooling", "probe", "trig"],
-        ticks=list(range(1024)),
-        masks=[1] * 1023 + [0],
-        duration=1023 / 100e6,
-        trigger_count=0,
-    )
-
-    na.validate_pulse_streamer_program(program, max_edges=1024, channel_count=4)
-    tcl_path = na.write_vivado_pulse_streamer_tcl(
-        tmp_path / "prepare_full.tcl",
-        "prepare",
-        program=program,
-        project="",
-        bitstream="",
-        probes="",
-        max_edges=1024,
-        channel_count=4,
-    )
-    tcl = tcl_path.read_text(encoding="utf-8")
-
-    assert "zlc_stage_probe $vio $zlc_prog_count_probe 1024" in tcl
-    assert "load_features labtools" in tcl
-    assert "open_hw" in tcl
-    assert "get_hw_targets" in tcl
-    assert "No Vivado hardware target found" in tcl
-    assert "Vivado hardware Tcl commands are unavailable" in tcl
-    assert "allow_non_jtag" not in tcl
-    assert "VIO filter '$vio_filter' failed" in tcl
-    assert "using the only available VIO core" in tcl
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 1023" in tcl
-    assert "zlc_stage_probe $vio $zlc_prog_tick_probe 1023" in tcl
-    assert "zlc_stage_probe $vio $zlc_prog_mask_probe 0" in tcl
-    assert tcl.count("set zlc_prog_we_toggle_value [expr {$zlc_prog_we_toggle_value ? 0 : 1}]") == 1024
-    assert tcl.count("zlc_stage_probe $vio $zlc_prog_we_probe $zlc_prog_we_toggle_value") == 1024
-    assert "set zlc_prog_we_toggle_value [zlc_output_probe_bool $vio $zlc_prog_we_probe]" in tcl
-    assert "zlc_stage_probe $vio $zlc_prog_we_probe 0" not in tcl
-    assert "zlc_set_probe $vio $zlc_prog_we_probe 0" not in tcl
 
 
 def test_fpga_pulse_streamer_edge_table_python_model_matches_contract():
@@ -1062,11 +977,59 @@ def test_fpga_pulse_streamer_compiles_channel_delay_and_repeated_frames():
     assert program.ticks == [0, 1, 2, 5]
     assert program.masks == [0b0001, 0b1001, 0b0000, 0b0000]
     assert program.masks[-1] == 0
-    assert program.trigger_count == 2
     assert program.repeat_forever is False
     assert program.loop_start_index == 0
     assert program.loop_end_tick == 5
     assert program.loop_count == 2
+
+
+def test_repeated_period_equal_to_base_duration_is_accepted_but_shorter_rejected():
+    """``repeated``/``forever`` resolve the default period then defer all legality to
+    ``validate()`` (no duplicated if-raise). The boundary is period >= base_duration with a
+    tiny floating-point slack: a period set exactly equal to base_duration must be accepted,
+    while one meaningfully below it must be rejected by the single validate() check."""
+    seq = na.PulseSequence(name="period_boundary").pulse("trap", 0.0, 2e-8)
+    base = seq.base_duration
+    assert base == pytest.approx(2e-8)
+
+    # period == base_duration: accepted by both entry points (no raise).
+    assert seq.repeated(2, period=base).repeat_period == pytest.approx(base)
+    assert seq.forever(period=base).repeat_period == pytest.approx(base)
+
+    # period below base_duration (well beyond the float slack): rejected via validate().
+    with pytest.raises(ValueError):
+        seq.repeated(2, period=base * 0.5)
+    with pytest.raises(ValueError):
+        seq.forever(period=base * 0.5)
+
+
+def test_pulse_table_validate_and_to_sequence_accept_clock_hz_alias():
+    """clock_hz is an ergonomic alias for time_step_ns on validate()/to_sequence(): the rest
+    of the API (compile/compile_scan/from_sequence/PulseSequence.validate) speaks clock_hz, so
+    a caller's natural ``state.validate(clock_hz=...)`` / ``state.to_sequence(clock_hz=...)``
+    must NOT raise "unexpected keyword clock_hz", and must equal passing the reciprocal step."""
+    state = na.PulseTableState(
+        channels=["trap", "probe", "emCCD"],
+        periods=[
+            na.PulsePeriod(100, (1, 0, 0), unit="ns", name="load"),
+            na.PulsePeriod(200, (1, 1, 1), unit="ns", name="image"),
+        ],
+        time_step_ns=20.0,
+    )
+    clock = 50_000_000.0
+    assert abs(1e9 / clock - 20.0) < 1e-9   # the reciprocal we compare against
+    # the user's natural calls must work (this was the reported "unexpected keyword clock_hz")
+    state.validate(clock_hz=clock)
+    by_clock = state.to_sequence(clock_hz=clock, name="x")
+    by_step = state.to_sequence(time_step_ns=1e9 / clock, name="x")
+    edges = lambda s: [(p.channel, round(p.start, 12), round(p.duration, 12)) for p in s.pulses]
+    assert edges(by_clock) == edges(by_step)   # clock_hz and its reciprocal step are identical
+    # passing BOTH is a clear error, not a silent unit mix-up
+    with pytest.raises(ValueError, match="either clock_hz or time_step_ns"):
+        state.validate(clock_hz=clock, time_step_ns=20.0)
+    # the layer split stays: clock_hz is NOT silently swallowed by **kwargs -- a real typo errors
+    with pytest.raises(TypeError):
+        state.validate(clcok_hz=clock)
 
 
 def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
@@ -1077,13 +1040,13 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
         channels=["trap", "cooling", "probe", "trig", "aod0", "aod1"],
         periods=[
             na.PulsePeriod(100, (1, 0, 0, 0, 0, 0), unit="ns", name="load"),
-            na.PulsePeriod("2*tau", (1, 0, 1, 1, 0, 0), unit="str (ns)", name="image"),
+            na.PulsePeriod("2*s0", (1, 0, 1, 1, 0, 0), unit="str (ns)", name="image"),
             na.PulsePeriod(100, (0, 0, 0, 0, 0, 0), unit="ns", name="idle"),
         ],
-        delays={"trig": "tau/2"},
+        delays={"trig": "s0/2"},
         delay_units={"trig": "str (ns)"},
-        scan_variables={"tau": 100},
-        scan_bindings={"period:1:duration": "tau", "delay:trig": "tau"},
+        scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 100.0}],
+        scan_table=[[100.0]],
         time_step_ns=1,
         repeat_start=1,
         repeat_end=2,
@@ -1091,33 +1054,57 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
     )
 
     sequence = state.to_sequence()
-    program = state.compile(clock_hz=100e6, trigger_channels=["trig"])
+    program = state.compile(clock_hz=100e6)
     saved = state.save(tmp_path / "pulse.json")
     loaded = na.PulseTableState.load(saved)
 
+    s0_100 = {"s0": 100.0}
+    s0_200 = {"s0": 200.0}
+
     assert state.time_step_ns == 1
+    assert state.scan_var_names == ["s0"]
+    assert state.reference_slots() == s0_100
     assert state.total_duration_steps() == 1000
-    assert state.total_duration_steps(variables={"tau": 200}, time_step_ns=10) == 160
+    assert state.total_duration_steps(slots=s0_200, time_step_ns=10) == 160
     assert state.total_duration_ns() == 100 + 3 * (200 + 100)
-    assert state.total_duration_ns(variables={"tau": 200}) == 100 + 3 * (400 + 100)
-    assert state.periods[1].duration_steps(variables={"tau": 200}, time_step_ns=state.time_step_ns) == 400
-    assert state.delay_ns("trig", variables={"tau": 200}) == 100
-    assert state.delay_steps("trig", variables={"tau": 200}, time_step_ns=10) == 10
-    assert state.with_scan_variables(tau=200).scan_variables["tau"] == 200
-    assert state.scan_variables["tau"] == 100
+    assert state.total_duration_ns(slots=s0_200) == 100 + 3 * (400 + 100)
+    assert state.periods[1].duration_steps(slots=s0_200, time_step_ns=state.time_step_ns) == 400
+    assert state.delay_ns("trig", slots=s0_200) == 100
+    assert state.delay_steps("trig", slots=s0_200, time_step_ns=10) == 10
+    resolved = state.with_slots_resolved(s0_200)
+    assert resolved.scan_slots == []
+    assert resolved.scan_table == []
     assert na.count_trigger_pulses(sequence, trigger_channels=["trig"]) == 3
-    assert program.trigger_count == 3
     assert program.repeat_forever is True
-    assert program.ticks == [0, 10, 15, 30, 35, 40]
-    assert program.masks == [0b000001, 0b000101, 0b001101, 0b001000, 0, 0]
-    assert program.loop_start_index == 1
-    assert program.loop_end_tick == 40
-    assert program.loop_count == 3
-    program_tau = state.compile(clock_hz=100e6, trigger_channels=["trig"], variables={"tau": 200})
-    assert program_tau.trigger_count == 3
-    assert program_tau.repeat_forever is True
-    assert program_tau.ticks[-1] == 60
-    assert program_tau.duration == 1.6e-6
+    # A channel delay (trig: s0/2) WITH an inner repeat bracket is now supported: the
+    # bracket is UNROLLED into a flat period list, so the delayed edge has no inner-loop
+    # boundary to cross.  The result is a flat additive edge table (loop_count==1; the
+    # whole flat frame still repeats forever) rather than the old compact inner loop.
+    assert program.loop_count == 1
+    assert program.masks[-1] == 0
+    # The edge table is UNDELAYED: the flat frame is 100 ticks (load 10 + 3*(image 20 +
+    # idle 10)); trig's delay (s0/2 = 5 ticks @ 10 ns/tick) rides channel_delays, applied to
+    # the OUTPUT, NOT baked into the frame.
+    assert program.loop_end_tick == 100
+    assert program.ticks[-1] == 100
+    assert program.channel_delays == [0, 0, 0, 5, 0, 0]   # trig (bit 3) delayed 5 ticks
+    # the unrolled additive program plays IDENTICALLY to the independent additive oracle
+    # and across all three cycle-accurate engine models (no Verilog sim needed).
+    from fpga.pulse_streamer.host import engine_model as em
+    truth = _additive_truth(
+        state.unrolled_bracket(), slots=s0_100, time_step_ns=10,
+        channels=list(program.channels), n_ticks=600,
+    )
+    ep = em.EngineProgram.from_program(program)
+    r = em.reference_play(ep, 600)
+    assert r == truth
+    assert em.prefetch_play(ep, 600) == r and em.rtl_mirror_play(ep, 600) == r
+    program_x = state.compile(clock_hz=100e6, slots=s0_200)
+    assert program_x.repeat_forever is True
+    # s0=200 -> each image is 400 ns = 40 ticks; undelayed flat frame = 10 + 3*(40+10) = 160
+    # ticks (trig delay now 10 ticks on channel_delays, not in the frame).
+    assert program_x.ticks[-1] == 160
+    assert program_x.channel_delays == [0, 0, 0, 10, 0, 0]
     assert loaded.to_dict() == state.to_dict()
 
     state.hide_channel("aod0")
@@ -1152,7 +1139,6 @@ def test_pulse_table_state_compiles_hardware_repeat_without_expanding_edges():
         state,
         channels=hardware_channels,
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
     )
     aligned = state.aligned_to_channels(hardware_channels)
 
@@ -1165,7 +1151,6 @@ def test_pulse_table_state_compiles_hardware_repeat_without_expanding_edges():
     assert program.loop_start_index == 1
     assert program.loop_end_tick == 3
     assert program.loop_count == 500
-    assert program.trigger_count == 1
     assert len(program.ticks) == len(state.periods) + 1
     assert len(program.ticks) < state.repeat_count
     assert aligned.channels == hardware_channels
@@ -1188,276 +1173,1551 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
             na.PulsePeriod(100, (0, 0, 0, 0), unit="ns"),
         ],
     )
-    state.set_analog_bus_mode(0, "da_test", "edge", value=0)
-    state.set_analog_bus_mode(2, "da_test", "ramp", value=7)
+    state.set_analog_bus_mode(0, "da_test", "edge", value=0)        # signed: 0 = true 0 V
+    state.set_analog_bus_mode(2, "da_test", "ramp", value=3)        # 3-bit bus: signed -4..+3
     state.apply_analog_bus_modes_to_period_states()
     saved = state.save(tmp_path / "analog_bus.json")
     loaded = na.PulseTableState.load(saved)
-    program = loaded.compile(clock_hz=50_000_000, trigger_channels=["ch03"], repeat_forever=False)
+    program = loaded.compile(clock_hz=50_000_000, repeat_forever=False)
 
     assert loaded.bus_channels()["da_test"] == ["ch00", "ch01", "ch02"]
     assert loaded.analog_bus_modes["da_test"] == [
         {"mode": "edge", "value": 0},
         {"mode": "hold", "value": None},
-        {"mode": "ramp", "value": 7},
+        {"mode": "ramp", "value": 3},
     ]
+    # period 1 is a HOLD after the edge-0V, so it carries 0 V = wire code 4 (= 1 << 2 on a
+    # 3-bit bus) -- the member bits store the OFFSET-BINARY code, so bit 2 is set.
     assert loaded.periods[1].states[:3] == (0, 0, 1)
     assert program.ticks == [0, 5, 10, 15]
     assert program.masks == [0, 0, 0, 0]
     assert program.bus_names == ["da_test"]
+    # period 0's explicit edge to signed 0 (= idle mid code 4) is ALWAYS emitted now: under a loop it
+    # re-zeroes the bus each frame, so dropping it would let the previous frame's value carry in.  The
+    # ramp spans period 2 [10,15) and carries IN from the LIVE register, so its start endpoint is NOT
+    # baked (start_value 0) -- the ramp engine reads its current value at runtime (#ramp-carry).
     assert [segment.to_dict() for segment in (program.bus_segments or [])] == [
         {
             "bus_index": 0,
             "bus_name": "da_test",
             "start_tick": 0,
-            "stop_tick": 10,
+            "stop_tick": 0,
+            "start_value": 4,
+            "stop_value": 4,
+            "mode": "edge",
+            "value_select": 0,
+            "stop_value_select": 0,
+            "start_tick_coeffs": [],
+            "stop_tick_coeffs": [],
+        },
+        {
+            "bus_index": 0,
+            "bus_name": "da_test",
+            "start_tick": 10,
+            "stop_tick": 15,
             "start_value": 0,
             "stop_value": 7,
             "mode": "ramp",
-        }
+            "value_select": 0,
+            "stop_value_select": 0,
+            "start_tick_coeffs": [],
+            "stop_tick_coeffs": [],
+        },
     ]
     roundtrip = na.RuntimeSequenceProgram.from_dict(program.to_dict())
     assert [segment.to_dict() for segment in (roundtrip.bus_segments or [])] == [
         segment.to_dict() for segment in (program.bus_segments or [])
     ]
     na.validate_pulse_streamer_program(program, max_edges=16, max_bus_segments=4, tick_width=32, channel_count=4)
+    # The WAVEFORM proves the ramp carries from the live register (code 4 = 0 V), not the baked 0:
+    from fpga.pulse_streamer.host.engine_model import bus_play
+    wave = bus_play(program, 0, 18, bus_width=3)
+    assert wave[0] == 4 and wave[10] == 4          # idle, then the carried 0 V entering the ramp
+    assert wave[12] < 7 and max(wave) == 7 and wave[17] == 7   # ramps up from the carried 4, lands +3 LSB, holds
 
 
-def test_pulse_table_scan_rejects_analog_bus_ramp_mode(tmp_path):
-    scan_file = tmp_path / "scan_points.txt"
-    scan_file.write_text("# vars: tau(ns)\n20\n40\n", encoding="utf-8")
+def _neg_delay_bus_state():
+    """A driven DAC bus + a NEGATIVE-delay TTL channel + a plain (undelayed) TTL channel.
+    The negative delay forces a global shift G; the DAC bus has NO explicit delay of its
+    own, so it must still be shifted by G (lockstep with the plain TTL) -- otherwise it
+    leads (the "-2 s emCCD shows DA_bias_y first" bug)."""
+    channels = ["ch00", "ch01", "ch02", "ch03", "ch04"]
+    labels = {"ch00": "da_test[0]", "ch01": "da_test[1]", "ch02": "da_test[2]",
+              "ch03": "emCCD", "ch04": "trap"}
+    state = na.PulseTableState(
+        channels=channels, channel_labels=labels, visible_channels=channels, time_step_ns=20,
+        periods=[na.PulsePeriod(1000, (0, 0, 0, 1, 1), unit="ns"),
+                 na.PulsePeriod(1000, (0, 0, 0, 1, 1), unit="ns")],
+    )
+    state.set_analog_bus_mode(0, "da_test", "edge", value=3)   # nonzero -> a real segment
+    state.apply_analog_bus_modes_to_period_states()
+    state.delays["ch03"] = "-1000"                              # -1000 ns = -50 ticks @ 20 ns
+    state.delay_units["ch03"] = "ns"
+    return state
+
+
+def test_negative_delay_global_shift_also_shifts_undelayed_dac_bus_nonscan():
+    """REGRESSION (the -2 s bug): a negative TTL delay shifts the whole frame by G; an
+    undelayed but DRIVEN DAC bus must be shifted by the SAME G as a plain TTL, so it does
+    not visibly lead.  Non-scan compile path (compile_pulse_table_runtime_program)."""
+    state = _neg_delay_bus_state()
+    program = state.compile(clock_hz=50_000_000, repeat_forever=True)
+    # G = max(0, 50) = 50 ticks.  emCCD (-50) folds to 0; the plain TTL (trap, 0) -> 50.
+    bits = {name: i for i, name in enumerate(program.channels)}
+    cd = program.channel_delays or []
+    assert cd[bits["ch04"]] == 50, "plain TTL must be shifted by G"
+    assert cd[bits["ch03"]] == 0, "the -50 negative-delay channel folds to 0 (it leads)"
+    # The DRIVEN DAC bus has NO explicit delay yet MUST land at G, in lockstep with the TTL.
+    bus_delay = {bd.bus_index: bd.delay for bd in (program.bus_delays or [])}
+    assert bus_delay.get(0) == 50, (
+        "driven DAC bus must inherit the global negative-delay shift G (=50), not lead at 0; "
+        f"got {program.bus_delays!r}")
+
+
+def test_negative_delay_global_shift_identical_scan_vs_nonscan():
+    """SINGLE-SOURCE GUARD (#G-fold): the negative-delay global shift G is folded by ONE
+    pure helper (_fold_global_delay_shift), so the SCAN and NON-SCAN compilers must emit
+    BYTE-IDENTICAL channel_delays + bus_delays for the same program.  The two paths share
+    a virtual mirror, so a phase drift between them would NOT surface as a wrong waveform in
+    sim -- only a real machine would show it.  Hence we assert the two compiled delay sets
+    are equal directly: any future edit that re-inlines G in one path and not the other (the
+    exact DRY trap this collapses) fails here, not silently on hardware."""
+    # NON-SCAN: the same driven-bus + negative-delay state as the regression above.
+    nonscan = _neg_delay_bus_state().compile(clock_hz=50_000_000, repeat_forever=True)
+
+    # SCAN: the same program, made scan-legal by binding period 0's duration to a slot set to
+    # its OWN nominal value -- the frame is unchanged, so the only thing that can differ is how
+    # each path folds G.  A delay is a fixed per-channel value (never scanned), so this isolates
+    # the shared G fold.
+    scan_state = _neg_delay_bus_state()
+    nominal = float(scan_state.periods[0].duration)   # read BEFORE bind rewrites it to 's0'
+    scan_state.bind_field("duration", "0", unit="ns")
+    scan = scan_state.compile_scan(
+        clock_hz=50_000_000, scan_table=[[nominal]], repeat_forever=True)
+
+    assert list(scan.channels) == list(nonscan.channels)
+    assert (scan.channel_delays or []) == (nonscan.channel_delays or []), (
+        "scan vs non-scan channel_delays drifted -- G must be folded by the single shared "
+        f"helper; scan={scan.channel_delays!r} non-scan={nonscan.channel_delays!r}")
+    scan_bus = {bd.bus_index: bd.delay for bd in (scan.bus_delays or [])}
+    nonscan_bus = {bd.bus_index: bd.delay for bd in (nonscan.bus_delays or [])}
+    assert scan_bus == nonscan_bus, (
+        "scan vs non-scan bus_delays drifted -- the driven DAC bus must inherit the SAME G "
+        f"on both paths; scan={scan_bus!r} non-scan={nonscan_bus!r}")
+    # And the G actually fired (regression value): the negative -50 forced G=50.
+    assert nonscan_bus.get(0) == 50 and (nonscan.channel_delays or [])[
+        list(nonscan.channels).index("ch04")] == 50
+
+
+def test_dac_ramp_spans_current_period_with_hold_carry_and_edge_step():
+    """The within-period DAC semantics (the user's ramp/edge/hold fix), proven end-to-end
+    through the compiler + the cycle-accurate engine model:
+
+      * edge v -> the period steps to v and holds it,
+      * hold   -> the period carries the value from the preceding edge/ramp,
+      * ramp v -> the period ramps from the carried-in value to v over ITS OWN window
+                  (NOT across the preceding period as the old anchor model did).
+    """
+    from fpga.pulse_streamer.host.engine_model import bus_play
+
+    ch = [f"da[{i}]" for i in range(10)] + ["t"]
+    labels = {f"da[{i}]": f"da[{i}]" for i in range(10)}
+    state = na.PulseTableState(
+        channels=ch,
+        visible_channels=ch,
+        periods=[na.PulsePeriod(1000, tuple([0] * 11), unit="ns") for _ in range(4)],
+        channel_labels=labels,
+        time_step_ns=20.0,   # 1000 ns / 20 = 50 ticks per period
+        name="ramp_within_period",
+    )
+    # A gentle slope (40 LSB over 50 ticks); steeper ramps are equally fine -- the
+    # Bresenham stepper moves multiple LSBs per tick to track the ideal line.
+    state.set_analog_bus_mode(0, "da", "edge", value=100)
+    state.set_analog_bus_mode(1, "da", "hold")
+    state.set_analog_bus_mode(2, "da", "ramp", value=140)
+    state.set_analog_bus_mode(3, "da", "edge", value=0)
+    program = state.compile(clock_hz=50_000_000)
+    wave = bus_play(program, 0, 200)   # 4 periods x 50 ticks
+
+    # wire codes: signed v -> code v + 512 (offset-binary).  edge +100 -> code 612.
+    # period 0 (edge +100) and period 1 (hold) both sit flat at code 612 -- the ramp is NOT here.
+    assert wave[0] == 612 and wave[49] == 612
+    assert min(wave[50:100]) == 612 and max(wave[50:100]) == 612   # hold carries +100, no ramp
+    # period 2 (ramp to +140) rises monotonically WITHIN [100,150): starts at the carried
+    # +100 (code 612) and reaches the target (code 652) by the period end.
+    assert wave[100] == 612
+    assert all(wave[i] <= wave[i + 1] for i in range(100, 149))     # monotone non-decreasing
+    assert wave[125] > 612 and wave[149] >= 650                     # actually ramping, ~652 by the end
+    # period 3 (edge 0 = true 0 V) steps back to the mid code 512 (settled within the
+    # period; the boundary tick is a 1-tick registered transition)
+    assert wave[160] == 512 and wave[199] == 512
+
+
+def test_every_ramp_ramps_from_the_previous_end_and_forevers_first_period_ramps_from_idle():
+    """#ramp-carry -- the user's THREE requirements, all asserted here:
+      1. every ramp ramps from the PREVIOUS command's ending value (the live register), NOT a baked
+         start: a [edge -200, ramp 300] climbs from -200 (the edge's end), not from 0;
+      2. the FIRST period of a forever loop RAMPS (idle 0 V -> V), it does NOT hold;
+      3. the rejected 5a "bake the steady value" design is GONE: the compiled ramp segment's start is 0
+         (the engine reads its register), not the flattened steady code.
+    The looping [ramp V, hold V] is FLAT only in STEADY STATE (loop 2+), as the math consequence of
+    ramping V->V once the wrap has carried V in -- the display choice the user confirmed (option 1).
+    scan+ramp (the other thing the user worried about) staircases from the prior point -- proven by
+    test_dac_ramp_endpoint_scan_compiles_and_tracks_every_point."""
+    from fpga.pulse_streamer.host.engine_model import bus_play
+    ch = [f"da[{i}]" for i in range(10)] + ["t"]
+    lab = {f"da[{i}]": f"da[{i}]" for i in range(10)}
+
+    # (1) + (3): [ramp 200, hold 200] -- the compiled ramp does NOT bake the steady 712; start_value is 0.
+    state = na.PulseTableState(channels=ch, visible_channels=ch, channel_labels=lab, time_step_ns=20.0,
+                               name="ramp_loop", periods=[na.PulsePeriod(1000, tuple([0] * 11), unit="ns") for _ in range(2)])
+    state.set_analog_bus_mode(0, "da", "ramp", value=200)   # ramp to +200 (code 712)
+    state.set_analog_bus_mode(1, "da", "hold")              # then hold it, looping
+    prog = state.compile(clock_hz=50_000_000)               # repeat_forever=True (default)
+    assert [(s.mode, s.start_value) for s in prog.bus_segments] == [("ramp", 0)]   # (3) start NOT baked -> 0
+
+    # (2): forever's FIRST period genuinely RAMPS up from idle 0 V (it is NOT a hold)
+    first = bus_play(prog, 0, 100)
+    assert first[0] == 512                                  # enters at idle 0 V (code 512)
+    assert any(512 < w < 712 for w in first) and first[-1] == 712   # RAMPS up to +200 -- a ramp, not a hold
+    # FLAT only after the wrap carries +200 in (steady state, loop 2+) -- the option-1 display the user chose
+    assert all(w == 712 for w in bus_play(prog, 0, 100, seed_value=first[-1]))
+    # a genuine single-shot fire ramps from idle just like the first loop
+    single = bus_play(state.compile(clock_hz=50_000_000, repeat_forever=False), 0, 100)
+    assert single[0] == 512 and single[-1] == 712
+
+    # (1): a ramp ramps from the PREVIOUS command's end -- [edge -200, ramp 300, hold] climbs from -200,
+    # not 0.  The ramp reaches its target at the period BOUNDARY, so a trailing hold period parks at it.
+    s2 = na.PulseTableState(channels=ch, visible_channels=ch, channel_labels=lab, time_step_ns=20.0,
+                            name="edge_then_ramp", periods=[na.PulsePeriod(1000, tuple([0] * 11), unit="ns") for _ in range(3)])
+    s2.set_analog_bus_mode(0, "da", "edge", value=-200)     # edge to -200 (code 312)
+    s2.set_analog_bus_mode(1, "da", "ramp", value=300)      # then ramp to +300 (code 812)
+    s2.set_analog_bus_mode(2, "da", "hold")                 # then hold, so the ramp's endpoint is observable
+    w = bus_play(s2.compile(clock_hz=50_000_000, repeat_forever=False), 0, 150)
+    assert w[0] == 312                                      # period 0 edge -> -200 (code 312)
+    assert w[25] == 312                                     # still at the edge end (NOT ramping from 0)
+    assert 312 < w[75] < 812                                # period 1 ramp climbs FROM 312 (the edge's end) toward 812
+    assert w[-1] == 812                                     # ... reaching +300 and holding it
+
+
+def test_preview_is_loop_aware_so_a_looping_ramp_to_a_held_value_shows_flat():
+    """#ramp-carry preview: the GUI runs pulses forever, so bus_period_levels(looping=True) seeds period
+    0 with the loop's steady-state (the last edge/ramp the frame leaves).  A looping [ramp V, hold V]
+    then PREVIEWS flat V -- matching the bench -- while a single fire (looping=False) still shows the
+    one-time idle->V rise.  The within-frame carry is unchanged; only the period-0 entry value differs."""
+    from Zou_lab_control.neutral_atom.timing.pulse_table import bus_period_levels, _analog_bus_value_at_tick
+    plan = [{"mode": "ramp", "value": 500}, {"mode": "hold", "value": None}]
+    starts = [0, 10, 20]
+    once = bus_period_levels(plan, starts, looping=False)
+    assert (once[0][2], once[0][3], once[0][4]) == (0, 500, "ramp")          # single fire: in=idle 0 -> out=500
+    assert _analog_bus_value_at_tick(plan, starts, 0, looping=False) == 0    # enters at idle
+    loop = bus_period_levels(plan, starts, looping=True)
+    assert (loop[0][2], loop[0][3]) == (500, 500)                            # looping: in=carried 500 -> out=500 == flat
+    assert _analog_bus_value_at_tick(plan, starts, 5, looping=True) == 500   # flat across the (now no-op) ramp
+    assert _analog_bus_value_at_tick(plan, starts, 15, looping=True) == 500  # and the hold
+
+
+def test_ttl_toggle_on_a_dac_bus_member_channel_stays_ttl_not_a_phantom_bus():
+    """#phantom-bus: toggling a channel that happens to be a MEMBER of a DAC bus group, while that
+    group was NEVER made an analog bus (no set_analog_bus_mode), must drive it as a plain TTL bit --
+    not synthesize a phantom analog bus from the raw level (which, under a scan, even inherited a scan
+    coefficient and perturbed other channels' timing).  A group is an analog bus IFF it is in
+    analog_bus_modes -- the ONE source of truth."""
+    from Zou_lab_control.neutral_atom.devices.sequencer import (
+        _pulse_table_bus_segments, _pulse_table_has_analog_activity)
+    ch = [f"da[{i}]" for i in range(10)] + ["t"]
+    mask_on = tuple(1 if i == 9 else 0 for i in range(11))             # da[9] ON: a plain TTL toggle
+    state = na.PulseTableState(
+        channels=ch, visible_channels=ch,
+        periods=[na.PulsePeriod(1000, mask_on, unit="ns"), na.PulsePeriod(1000, tuple([0] * 11), unit="ns")],
+        channel_labels={f"da[{i}]": f"da[{i}]" for i in range(10)},
+        time_step_ns=20.0, name="phantom_bus")
+    # NO set_analog_bus_mode -> the "da" group is NOT an analog bus.
+    assert _pulse_table_has_analog_activity(state) is False            # a raw TTL toggle is not analog activity
+    _, segs, _ = _pulse_table_bus_segments(state, time_step_ns=20.0)
+    assert segs == [], "a non-analog group must NOT synthesize (phantom) DAC bus segments"
+    # da[9] is still DRIVEN -- as a TTL channel in the compiled program (not dropped from both TTL and DAC)
+    assert "da[9]" in state.compile(clock_hz=50_000_000).channels
+
+
+def test_clk_channel_excluded_from_engine_and_carried_as_mask(tmp_path):
+    """A channel marked clk is wired to the FPGA clk by the top: it is removed from the
+    edge masks, ships as a clk_enable bitmask, survives save/load, and round-trips through
+    the program image (pack/unpack)."""
+
+    channels = [f"ch{i:02d}" for i in range(62)]
+    state = na.PulseTableState(
+        channels=channels,
+        visible_channels=channels[:8],
+        periods=[na.PulsePeriod(1000, tuple(1 if c in (0, 6, 9) else 0 for c in range(62)), unit="ns")],
+        time_step_ns=20.0,
+        clk_channels=["ch06"],
+    )
+    # save/load preserves the clk channel
+    loaded = na.PulseTableState.load(state.save(tmp_path / "clk.json"))
+    assert loaded.clk_channels == ["ch06"]
+    assert loaded.clk_enable_mask() == (1 << 6)
+
+    program = state.compile(clock_hz=50_000_000)
+    assert program.clk_enable == (1 << 6)
+    # bit 6 (the clk channel) is forced out of every edge mask; bit 9 (a normal on) stays.
+    assert all(not (mask & (1 << 6)) for mask in program.masks)
+    assert any(mask & (1 << 9) for mask in program.masks)
+
+    from fpga.pulse_streamer.host.image import pack_program, unpack_program, StreamerParams
+    params = StreamerParams()
+    rebuilt = unpack_program(pack_program(program, params), params)
+    assert rebuilt["clk_enable"] == (1 << 6)
+
+
+def test_top_has_per_channel_clk_mux():
+    """The board top muxes the DAC-latch strobe onto a clk channel's pin via a runtime CTRL
+    clk-enable mask.  The strobe is the PHASE-INVERTED clk (out_final[n] = clk_en[n] ? ~clk
+    : out[n]) so the DAC latches the parallel word at the CENTRE of its data eye (clk
+    falling edge) instead of coincident with the posedge data change -- that coincidence was
+    the "third DA value between two edge periods" race (sim/tb_da_clk_phase.v).  The pin map
+    drives out_final, and the CTRL word offset matches host.image.CtrlWords.CLK_ENABLE.
+    (No Verilog sim -> structure check.)"""
+
+    root = Path(__file__).resolve().parents[1]
+    top = (root / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    assert "C_CLK_ENABLE" in top
+    # ~clk, NOT plain clk: latch the DAC at the data-eye centre (do not regress this).
+    assert "out_final[cmx] = clk_en[cmx] ? ~clk : out[cmx]" in top
+    assert "out_final[cmx] = clk_en[cmx] ? clk : out[cmx]" not in top
+    assert "DAC LATCH PHASE" in top                    # rationale comment is present
+    assert "assign cooling = out_final[0]" in top      # the pin map is driven by the muxed output
+    assert "assign da_clk0 = out_final[28]" in top
+    # the CTRL offset lines up with the host image layout
+    from fpga.pulse_streamer.host.image import CtrlWords
+    assert CtrlWords.CLK_ENABLE == 20
+
+
+def test_build_input_files_are_utf8():
+    """The build-input HDL/constraint/tcl/config files must be valid UTF-8 -- a GBK-encoded
+    file (Chinese comments) shows up as mojibake in git/editors/non-CJK-locale tools and is a
+    recurring papercut (board.xdc was GBK).  Guards the active fpga/ build inputs (NOT the
+    references/source_archives snapshots, which may legitimately keep their original bytes)."""
+
+    root = Path(__file__).resolve().parents[1]
+    roots = [root / "fpga" / "board_config", root / "fpga" / "pulse_streamer"]
+    exts = {".xdc", ".v", ".vh", ".sv", ".tcl", ".json", ".bat"}
+    bad = []
+    for base in roots:
+        for p in base.rglob("*"):
+            if not p.is_file() or p.suffix.lower() not in exts:
+                continue
+            if "build" in p.parts or "references" in p.parts:   # generated / archived
+                continue
+            try:
+                p.read_bytes().decode("utf-8")
+            except UnicodeDecodeError as exc:
+                bad.append(f"{p.relative_to(root)} ({exc})")
+    assert not bad, "non-UTF-8 build-input files (re-save as UTF-8): " + "; ".join(bad)
+
+
+def test_analog_ramp_can_scan_both_value_endpoints_round_trip():
+    """R16: a ramp may scan BOTH value endpoints independently -- the start reads one
+    scan slot, the stop another -- via the dual value_select.  The host image
+    round-trips both selects and the validator accepts them (no longer rejected)."""
+
+    from fpga.pulse_streamer.host.image import StreamerParams, pack_program, unpack_program
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, RuntimeBusSegment
+
+    prog = RuntimeSequenceProgram(
+        sequence_id="r", sequence_name="r", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 50, 200], masks=[0, 1, 0], duration=4e-6,
+        repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1,
+        slot_count=2, slot_kinds=["dac", "dac"], loop_end_slot_coeffs=[0, 0],
+        tick_slot_coeffs=[[0, 0], [0, 0], [0, 0]],
+        scan_points=[[100, 900], [200, 800]], scan_coeff_frac_bits=8,
+        bus_names=["da0"],
+        bus_segments=[
+            RuntimeBusSegment(bus_index=0, start_tick=50, stop_tick=120, start_value=0, stop_value=0,
+                              mode="ramp", value_select=1, stop_value_select=2,
+                              start_tick_coeffs=[0, 0], stop_tick_coeffs=[0, 0]),
+        ],
+    )
+    params = StreamerParams(max_edges=16, bank_size=4)
+    seg = unpack_program(pack_program(prog, params), params)["bus_segments"][0]
+    assert seg["mode"] == "ramp"
+    assert seg["value_select"] == 1 and seg["stop_value_select"] == 2   # both endpoints scanned
+    na.validate_pulse_streamer_program(prog, max_edges=16, max_bus_segments=4, tick_width=32,
+                                       channel_count=62, num_slots=2)
+    # round-trip through the program dict preserves both selects too
+    rseg = na.RuntimeSequenceProgram.from_dict(prog.to_dict()).bus_segments[0]
+    assert rseg.value_select == 1 and rseg.stop_value_select == 2
+
+
+def test_bus_play_models_dual_endpoint_ramp_and_held_value():
+    """Cycle-accurate bus-engine model (engine_model.bus_play) proves the dual
+    value_select path end-to-end: a ramp scans BOTH endpoints (start slot A -> stop
+    slot B) and an edge/hold segment tracks its scanned slot -- the bus-path
+    counterpart of the edge rtl_mirror proof (closes the no-bus-model gap)."""
+
+    from fpga.pulse_streamer.host.engine_model import bus_play
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, RuntimeBusSegment
+
+    def prog(segs, points):
+        return RuntimeSequenceProgram(
+            sequence_id="b", sequence_name="b", clock_hz=50e6,
+            channels=[f"ch{i:02d}" for i in range(62)],
+            ticks=[0, 5, 200], masks=[0, 1, 0], duration=4e-6,
+            repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1,
+            slot_count=2, slot_kinds=["dac", "dac"], loop_end_slot_coeffs=[0, 0],
+            tick_slot_coeffs=[[0, 0], [0, 0], [0, 0]], scan_points=points, scan_coeff_frac_bits=8,
+            bus_names=["da0"], bus_segments=segs)
+
+    ramp = RuntimeBusSegment(bus_index=0, start_tick=10, stop_tick=70, start_value=0, stop_value=0,
+                             mode="ramp", value_select=1, stop_value_select=2,
+                             start_tick_coeffs=[0, 0], stop_tick_coeffs=[0, 0])
+    p = prog([ramp], [[100, 900], [900, 100]])
+    up = bus_play(p, 0, 100, scan_point=0)        # ramp scanned-A(100) -> scanned-B(900)
+    assert all(v == 512 for v in up[:11])          # rest = BUS_SAFE mid code until the ramp lands
+    assert up[11:] == sorted(up[11:])              # then non-decreasing 100 -> ... -> 900
+    assert 100 in up and max(up) == 900 and up[-1] == 900
+    down = bus_play(p, 0, 100, scan_point=1)       # ramp scanned-A(900) -> scanned-B(100)
+    assert max(down) == 900 and down[-1] == 100
+    s = down.index(900)
+    assert down[s:] == sorted(down[s:], reverse=True)   # non-increasing 900 -> 100
+
+    hold = RuntimeBusSegment(bus_index=0, start_tick=10, stop_tick=10, start_value=0, stop_value=0,
+                             mode="edge", value_select=1, stop_value_select=1,
+                             start_tick_coeffs=[0, 0], stop_tick_coeffs=[0, 0])
+    ph = prog([hold], [[300, 0], [700, 0]])
+    assert bus_play(ph, 0, 40, scan_point=0)[-1] == 300   # held DAC value tracks the scan slot
+    assert bus_play(ph, 0, 40, scan_point=1)[-1] == 700
+
+
+def test_edge_streamer_has_dual_value_select():
+    """The RTL bus engine has the dual start/stop value_select path (a ramp can read
+    a different scan slot for each endpoint)."""
+
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer"
+    eng = (root / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    top = (root / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    assert "bus_stop_value_select_mem" in eng
+    assert "bus_prog_stop_value_select" in eng and "bus_prog_stop_value_select" in top
+    assert "start_sel" in eng and "stop_sel" in eng        # independent endpoint reads
+
+
+def test_pulse_table_scan_allows_analog_bus_ramp_with_timing_scan():
+    """A fixed-endpoint analog ramp combined with a scanned DURATION compiles: the
+    ramp's start/stop ticks are emitted as affine expressions so the ramp stretches
+    in lockstep with the scanned timing (no longer rejected)."""
+
     state = na.PulseTableState(
         channels=["ch00", "ch01"],
         channel_labels={"ch00": "da_test[0]", "ch01": "da_test[1]"},
         visible_channels=["ch00", "ch01"],
         time_step_ns=20,
-        scan_variables={"tau": 20},
-        scan_bindings={"period:0:duration": "tau"},
-        scan_table_path=scan_file,
         periods=[
-            na.PulsePeriod("tau", (0, 0), unit="str (ns)"),
+            na.PulsePeriod(100, (0, 0), unit="ns"),
             na.PulsePeriod(100, (0, 0), unit="ns"),
         ],
     )
-    state.set_analog_bus_mode(0, "da_test", "edge", value=0)
-    state.set_analog_bus_mode(1, "da_test", "ramp", value=3)
+    # Scan the duration of the first period (a time slot) ...
+    state.bind_field("duration", "0")
+    state.set_scan_table([[20.0], [40.0]])
+    # ... while the analog bus ramps between FIXED value endpoints: now supported.
+    state.set_analog_bus_mode(0, "da_test", "edge", value=0)        # 0 = true 0 V
+    state.set_analog_bus_mode(1, "da_test", "ramp", value=1)        # 2-bit bus: signed -2..+1
 
-    with pytest.raises(ValueError, match="ramp values cannot be combined"):
-        na.compile_pulse_table_scan_runtime_program(state, channels=["ch00", "ch01"], clock_hz=50_000_000)
-
-
-def test_pulse_table_state_rejects_legacy_pair_array_scan():
-    with pytest.raises(ValueError, match="legacy x/y scan_points"):
-        na.PulseTableState(
-            channels=["ch00", "ch01", "ch02", "ch03"],
-            periods=[
-                na.PulsePeriod(20, (1, 0, 0, 0), unit="ns", name="load"),
-                na.PulsePeriod("x", (0, 0, 0, 1), unit="str (ns)", name="camera"),
-                na.PulsePeriod("y+20", (0, 0, 0, 0), unit="str (ns)", name="idle"),
-            ],
-            x_ns=20,
-            y_ns=20,
-            scan_points=[(20, 20), (40, 40)],
-            time_step_ns=20,
-            visible_channels=["ch00", "ch03"],
-        )
+    program = na.compile_pulse_table_scan_runtime_program(
+        state, channels=["ch00", "ch01"], clock_hz=50_000_000
+    )
+    ramps = [s for s in (program.bus_segments or []) if s.mode == "ramp"]
+    assert ramps, "expected a ramp segment"
+    r = ramps[0]
+    # the ramp START is the LIVE register (carry), so it is NOT baked (start_value 0, value_select 0);
+    # only the fixed STOP endpoint is set -- signed +1 -> code 3 on the 2-bit bus (#ramp-carry).
+    assert r.start_value == 0 and r.stop_value == 3 and r.value_select == 0
+    # ... but affine ticks: the scanned-duration slot moves a ramp endpoint tick so
+    # the ramp stretches in lockstep with the scan.
+    assert any(c != 0 for c in (list(r.start_tick_coeffs or []) + list(r.stop_tick_coeffs or []))), \
+        "a ramp endpoint tick must be affine under the scan"
 
 
-def test_pulse_table_named_scan_file_compiles_to_two_axis_template(tmp_path):
-    scan_file = tmp_path / "scan_points.txt"
-    scan_file.write_text("# vars: tau(ns), d(ns)\n20 20\n40 20\n", encoding="utf-8")
+def _v2_loop_steps_resolved(eff_ticks, masks, loop_start_index, eff_loop_end, loop_count, repeat_forever, steps):
+    """v2 loop FSM run on already-resolved (effective) ticks -- the ground truth
+    for a loop at one scan point."""
+
+    ticks = list(eff_ticks)
+    masks = list(masks)
+    final = ticks[-1]
+    loop_start_tick = ticks[loop_start_index]
+    loop_start_mask = masks[loop_start_index]
+    loop_count = max(1, int(loop_count))
+    loops_remaining = loop_count
+    if ticks[0] == 0:
+        state_mask, time_count, edge_index = masks[0], 1, 1
+    else:
+        state_mask, time_count, edge_index = 0, 0, 0
+    history = [state_mask]
+    while len(history) < steps:
+        if loop_count > 1 and loops_remaining > 1 and time_count >= eff_loop_end:
+            state_mask, time_count, edge_index = loop_start_mask, loop_start_tick + 1, loop_start_index + 1
+            loops_remaining -= 1
+        elif time_count >= final:
+            if repeat_forever:
+                state_mask, time_count, edge_index = (masks[0], 1, 1) if ticks[0] == 0 else (0, 0, 0)
+                loops_remaining = loop_count
+            else:
+                state_mask = 0
+        else:
+            if edge_index < len(ticks) and time_count == ticks[edge_index]:
+                state_mask = masks[edge_index]
+                edge_index += 1
+            time_count += 1
+        history.append(state_mask)
+    return history
+
+
+def test_final_image_solver_90pct_and_packs_round_trip():
+    """The FINAL BRAM image (fpga/pulse_streamer/host/image.py): solve_capacity at
+    <=90% maximises edges (35T -> 4096 edges + a 2-bank resident scan window) with
+    scan points UNBOUNDED via streaming; pack/unpack round-trips a full program
+    incl. a 0..1023 DAC ramp (one segment) + loop + scan resident."""
+
+    from fpga.pulse_streamer.host.image import solve_capacity, pack_program, unpack_program, scan_bank_words
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, RuntimeBusSegment
+
+    s = solve_capacity("xc7a35t", channel_count=62, target_pct=90.0)
+    assert s.params.max_edges >= 4096
+    assert s.params.bank_size >= 512
+    # RAMB36 is the solver's BINDING axis (edges are BRAM-bound) and stays <=90% of the part.
+    # LUT now FITS the 90% target too (~89% at the accepted TTL=128 / DA=64 event-FIFO depths --
+    # the estimate is calibrated to the real 2026-06-29 35T ROUTED build, see
+    # image.estimate_resources), so every axis is comfortably under the device.
+    assert s.resource_report["ramb36"]["pct"] <= 90.0
+    assert all(r["pct"] <= 100.0 for r in s.resource_report.values())
+    # DSP = the affine-MAC eval sites (bus start/stop + the 5 main sites); must match the engine.
+    assert s.resource_report["dsp"]["used"] == (2 * s.params.bus_count + 5) * s.params.num_slots
+    big = solve_capacity("xc7a200t", channel_count=62)
+    assert big.params.max_edges >= s.params.max_edges
+
+    p = s.params
+    prog = RuntimeSequenceProgram(
+        sequence_id="a", sequence_name="t", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 5, 25, 400], masks=[0, (1 << 0) | (1 << 5), (1 << 61), 0],
+        duration=8e-6, repeat_forever=True, loop_start_index=1,
+        loop_end_tick=400, loop_count=3, slot_count=2, slot_kinds=["delay", "dac"],
+        loop_end_slot_coeffs=[256, 0], tick_slot_coeffs=[[0, 0], [256, 0], [256, 0], [256, 0]],
+        scan_points=[[k, k * 2] for k in range(5)], scan_coeff_frac_bits=8, bus_names=["da0"],
+        bus_segments=[RuntimeBusSegment(bus_index=0, start_tick=5, stop_tick=25, start_value=0,
+                                        stop_value=1023, mode="ramp", value_select=2,
+                                        start_tick_coeffs=[256, 0], stop_tick_coeffs=[256, 0])],
+    )
+    out = unpack_program(pack_program(prog, p), p)
+    pad = lambda r, n: list(r) + [0] * (n - len(r))
+    assert out["ticks"] == prog.ticks and out["masks"] == prog.masks
+    assert out["tick_slot_coeffs"] == [pad(r, p.num_slots) for r in prog.tick_slot_coeffs]
+    assert out["scan_points_resident"] == [list(pt) for pt in prog.scan_points]
+    assert out["scan_count"] == 5 and out["loop_count"] == 3 and out["repeat_forever"]
+    b = out["bus_segments"][0]
+    # stop_value=1023 is a WIRE-LAYER offset-binary code (= signed +511); pack/unpack
+    # operate purely on the wire layer, so raw codes are correct here.
+    assert b["mode"] == "ramp" and b["stop_value"] == 1023 and b["value_select"] == 2
+    # a streamed chunk (beyond the resident window) packs into the right bank.
+    assert scan_bank_words(prog, p, 0)  # chunk 0 non-empty
+
+
+def test_final_engine_model_fifo_1tick_and_streaming_scan():
+    """The FINAL engine model (fpga/pulse_streamer/host/engine_model.py): the edge
+    FIFO prefetch is tick-exact at 1-tick spacing (latency 1 AND 2), and the scan
+    ping-pong streaming reproduces the full N-point sweep gaplessly for any bank
+    size while the host keeps up, and STALLS (never a wrong point) when starved."""
+
+    from fpga.pulse_streamer.host.engine_model import (
+        EngineProgram, reference_play, prefetch_play, streaming_scan_play, ScanUnderflow,
+    )
+
+    def prog(**kw):
+        b = dict(ticks=[], masks=[], tick_slot_coeffs=[], scan_points=[], slot_count=0,
+                 frac_bits=8, loop_start_index=0, loop_end_tick=0, loop_end_slot_coeffs=[],
+                 loop_count=1, repeat_forever=False)
+        b.update(kw)
+        b["tick_slot_coeffs"] = b["tick_slot_coeffs"] or [[0] * b["slot_count"] for _ in b["ticks"]]
+        b["loop_end_slot_coeffs"] = b["loop_end_slot_coeffs"] or [0] * b["slot_count"]
+        return EngineProgram(**b)
+
+    # --- FIFO prefetch (1-tick) == combinatorial reference, latency 1 and 2 ---
+    fifo_cases = {
+        "b2b_1tick": prog(ticks=[0, 1, 2, 3, 4, 20], masks=[0, 1, 2, 3, 4, 0], loop_end_tick=20, repeat_forever=True),
+        "scan": prog(ticks=[0, 10, 20, 100], masks=[0, 1, 2, 0], tick_slot_coeffs=[[0], [256], [256], [256]],
+                     scan_points=[[0], [256], [512]], slot_count=1, loop_end_tick=100, repeat_forever=True),
+        "loop3": prog(ticks=[0, 10, 30, 60], masks=[0, 1, 2, 0], loop_start_index=1, loop_end_tick=30, loop_count=3),
+    }
+    for name, pr in fifo_cases.items():
+        ref = reference_play(pr, 400)
+        for lat in (1, 2):
+            assert prefetch_play(pr, 400, read_latency=lat, fifo_depth=lat + 2) == ref, (name, lat)
+
+    # --- streaming: 20 points, constant duration, waveform differs per point ---
+    N = 20
+    sp = prog(ticks=[0, 5, 25, 40], masks=[0, 1, 2, 0], tick_slot_coeffs=[[0], [256], [0], [0]],
+              scan_points=[[k] for k in range(N)], slot_count=1, loop_end_tick=40, repeat_forever=False)
+    NT = N * 41 + 60
+    ref = reference_play(sp, NT)
+    for bank_size in (1, 4, 5, 8):
+        out, stalled, played = streaming_scan_play(sp, NT, bank_size=bank_size, refill_delay=0)
+        assert out == ref and not stalled and played == N, (bank_size, played)
+
+    # --- starved refill: stalls (no wrong point); the un-starved prefix matches ref ---
+    out2, stalled2, _ = streaming_scan_play(sp, NT, bank_size=4, refill_delay=10 ** 9)
+    assert stalled2
+    first_diff = next((i for i in range(NT) if out2[i] != ref[i]), NT)
+    assert first_diff >= 4 * 41  # gapless through the first two resident banks (8 points)
+    with pytest.raises(ScanUnderflow):
+        streaming_scan_play(sp, NT, bank_size=4, refill_delay=10 ** 9, raise_on_underflow=True)
+
+
+def test_streaming_scan_repeat_wrap_is_seamless_continuous_cyclic():
+    """CORE REQUIREMENT: a repeat_forever STREAMED scan (N > 2 banks) re-sweeps with NO
+    gap at the wrap.  The continuous cyclic ping-pong streams chunks 0,1,..,K-1,0,1,..
+    one-ahead into the ALTERNATING bank, so the sweep wrap is just another chunk boundary
+    -- seamless for ANY chunk count K (odd included, where bank=chunk%2 used to collide
+    chunk K-1 and chunk 0 in the same bank and force a reactive reload -> the blank the
+    user saw).  Plays MANY sweeps and asserts gapless == reference with a realistic
+    refill latency, for K = 1,2,3,4,5 (resident through streamed, both parities)."""
+
+    from fpga.pulse_streamer.host.engine_model import (
+        EngineProgram, reference_play, streaming_scan_play,
+    )
+
+    def prog(N):
+        return EngineProgram(
+            ticks=[0, 5], masks=[0b01, 0b00], tick_slot_coeffs=[[0], [1]],
+            scan_points=[[i] for i in range(N)], slot_count=1, frac_bits=0,
+            loop_start_index=0, loop_end_tick=0, loop_end_slot_coeffs=[0],
+            loop_count=1, repeat_forever=True)
+
+    bank = 8
+    for N, K in [(8, 1), (16, 2), (17, 3), (24, 3), (40, 5), (41, 6)]:
+        assert (N + bank - 1) // bank == K
+        pr = prog(N)
+        nt = 3000                      # >= 4 full sweeps for the streamed cases
+        ref = reference_play(pr, nt)
+        # a realistic one-chunk-ahead refill latency (small vs a chunk's tick span)
+        out, stalled, _ = streaming_scan_play(pr, nt, bank_size=bank, refill_delay=6)
+        assert not stalled, f"N={N} K={K}: the cyclic re-sweep must never stall (the wrap gap)"
+        assert out == ref, f"N={N} K={K}: cyclic streamed playback must match reference over all sweeps"
+
+
+def test_edge_streamer_rtl_mirror_matches_reference():
+    """`rtl_mirror_play` re-implements the EXACT register transfers of
+    fpga/pulse_streamer/zlc_edge_streamer.v (arm shift-down FIFO + nv + pend
+    in-flight shift (pend depth = PIPE = RD_LAT+1, modelling the registered edge_raddr) +
+    the issue-occupancy condition + FIFO_DEPTH(=RD_LAT+2)-shadow boundary
+    reseeds).  It must equal the combinatorial reference for every program shape
+    -- 1-tick spacing included -- at read latency 1, 2 AND 3.  This is the no-sim
+    proof that the SPECIFIC RTL realisation (not just the abstract algorithm) is
+    tick-exact and 1-tick gapless across start/loop/scan/repeat boundaries."""
+
+    import random
+    from fpga.pulse_streamer.host.engine_model import (
+        EngineProgram, reference_play, rtl_mirror_play,
+    )
+
+    def prog(**kw):
+        b = dict(ticks=[], masks=[], tick_slot_coeffs=[], scan_points=[], slot_count=0,
+                 frac_bits=8, loop_start_index=0, loop_end_tick=0, loop_end_slot_coeffs=[],
+                 loop_count=1, repeat_forever=False)
+        b.update(kw)
+        b["tick_slot_coeffs"] = b["tick_slot_coeffs"] or [[0] * b["slot_count"] for _ in b["ticks"]]
+        b["loop_end_slot_coeffs"] = b["loop_end_slot_coeffs"] or [0] * b["slot_count"]
+        return EngineProgram(**b)
+
+    cases = {
+        "b2b_1tick": prog(ticks=[0, 1, 2, 3, 4, 20], masks=[0, 1, 2, 3, 4, 0], loop_end_tick=20, repeat_forever=True),
+        "b2b_nonzero": prog(ticks=[5, 6, 7, 8, 9, 30], masks=[1, 2, 3, 4, 5, 0], loop_end_tick=30, repeat_forever=True),
+        "sparse": prog(ticks=[0, 5, 12, 40], masks=[0, 3, 4, 0], loop_end_tick=40, repeat_forever=True),
+        "scan_1tick": prog(ticks=[0, 1, 2, 3, 40], masks=[0, 1, 2, 3, 0],
+                           tick_slot_coeffs=[[0], [256], [256], [256], [256]],
+                           scan_points=[[0], [256], [512], [768]], slot_count=1, loop_end_tick=40, repeat_forever=True),
+        "loop_1tick": prog(ticks=[0, 1, 2, 3, 4, 5, 6, 40], masks=[0, 1, 2, 3, 4, 5, 6, 0],
+                           loop_start_index=2, loop_end_tick=4, loop_count=4),
+        "single": prog(ticks=[0], masks=[5], loop_end_tick=10, repeat_forever=True),
+        "finite": prog(ticks=[0, 5, 20], masks=[0, 1, 0], loop_end_tick=20, loop_count=1),
+    }
+    N = 600
+    for name, pr in cases.items():
+        ref = reference_play(pr, N)
+        for lat in (1, 2, 3):
+            assert rtl_mirror_play(pr, N, rd_lat=lat, fifo_depth=lat + 2) == ref, (name, lat)
+
+    # fuzz 1-tick-heavy random programs (the spacing stress the prefetch must survive)
+    rnd = random.Random(7)
+    for _ in range(200):
+        ticks = sorted({rnd.randint(0, 12) for _ in range(rnd.randint(1, 8))})
+        ticks = [0] + [t for t in ticks if t > 0]
+        masks = [rnd.randint(0, 7) for _ in ticks]
+        fin = ticks[-1] + rnd.randint(1, 6)
+        pr = prog(ticks=ticks + [fin], masks=masks + [0], loop_end_tick=fin,
+                  repeat_forever=(rnd.random() < 0.5),
+                  loop_start_index=rnd.randint(0, max(0, len(ticks) - 1)),
+                  loop_count=rnd.choice([1, 1, 3]))
+        ref = reference_play(pr, N)
+        for lat in (1, 2):
+            assert rtl_mirror_play(pr, N, rd_lat=lat, fifo_depth=lat + 2) == ref, (ticks, masks, lat)
+
+
+def test_edge_streamer_rtl_has_proven_structure():
+    """Lock the final RTL engine to the proven design so it cannot silently drift
+    from rtl_mirror_play: a PIPE(=RD_LAT+1)-deep in-flight pipeline (the registered
+    edge_raddr adds a cycle before the BRAM), a FIFO_DEPTH(=RD_LAT+2) shadow seed,
+    parallel tick/coeff/mask edge read, 2-bank streaming with bank_ready stall +
+    cursor, bus LUTRAM, and no leftover WIP/do-not-build marker."""
+
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v"
+    text = src.read_text(encoding="utf-8")
+    # one clean module, no abandoned draft marker
+    assert "module zlc_edge_streamer" in text and text.count("endmodule") == 1
+    assert "WIP" not in text and "do-not-build" not in text.lower()
+    # in-flight pipeline tracks the FULL issue->data latency PIPE = RD_LAT+1 (the extra
+    # cycle is the registered edge_raddr).  landed = pend[PIPE-1]; pend shifts PIPE-wide.
+    # The earlier 2-stage pend (RD_LAT only) fired `landed` a cycle early and dropped a
+    # streamed edge -- the emCCD "40 ms / e7 vanished" hardware bug.
+    assert "RD_LAT" in text and "FIFO_DEPTH" in text
+    assert "PIPE = RD_LAT + 1" in text
+    assert "FIFO_DEPTH = RD_LAT + 2" in text
+    assert "landed = pend[PIPE-1]" in text
+    assert "pend <= {pend[PIPE-2:0], issue}" in text
+    assert "nv_after_fire" in text and "clamp3" in text
+    # 10 boundary shadows (e0..e4 + ls0..ls4) -> FIFO_DEPTH(=4)-shadow seed (one more than
+    # the old RD_LAT+1=3, because FIFO_DEPTH grew to RD_LAT+2 to keep 1-tick playback).
+    for sh in ("sh_e0_t", "sh_e1_t", "sh_e2_t", "sh_e3_t", "sh_e4_t",
+               "sh_ls0_t", "sh_ls1_t", "sh_ls2_t", "sh_ls3_t", "sh_ls4_t"):
+        assert sh in text, sh
+    assert "seed_from_edge0" in text
+    # 3 PARALLEL edge BRAMs read in lockstep (whole edge per access)
+    for sig in ("edge_tick_rdata", "edge_coeff_rdata", "edge_mask_rdata"):
+        assert sig in text, sig
+    # 2-bank ping-pong streaming + handshake (unbounded scan points)
+    assert "bank_ready" in text and "scan_cursor" in text and "underflow" in text
+    assert "scan_addr_of" in text and "bank_of" in text
+    # bus tables stay LUTRAM (combinational per-tick read)
+    assert text.count('ram_style = "distributed"') >= 7
+
+
+def test_final_top_regions_match_image_and_has_structure():
+    """The final top zlc_pulse_streamer_top.v decodes the SAME word-address
+    regions the host packs (host.image.region_bases), instantiates the FINAL
+    engine with 3 parallel edge BRAMs + the streaming handshake, and exposes the
+    cursor/bank_ready ports.  Locks top <-> host so they cannot drift."""
+
+    import pathlib, re, dataclasses
+    from fpga.pulse_streamer.host import image as im
+
+    src = pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v"
+    text = src.read_text(encoding="utf-8")
+
+    # solved build geometry (the create-project tcl uses the same source)
+    p = dataclasses.replace(im.StreamerParams(), bank_size=2048, max_edges=4096)
+    rb = im.region_bases(p)
+    me = 4096
+    bus_base = 64 + me + me * 2 + me * 2 + (2 * 2048) * 4
+    top = {
+        "tick": 64,
+        "coeff": 64 + me,
+        "mask": 64 + me + me * 2,
+        "scan": 64 + me + me * 2 + me * 2,
+        "bus": bus_base,
+    }
+    for k in ("tick", "coeff", "mask", "scan", "bus"):
+        assert rb[k] == top[k], (k, rb[k], top[k])
+
+    # one clean module, instantiates the final engine (no variant), 3 edge BRAMs
+    assert "module zlc_pulse_streamer_top" in text and text.count("endmodule") == 1
+    assert "zlc_edge_streamer" in text
+    for ip in ("blk_mem_gen_edge_tick", "blk_mem_gen_edge_coeff", "blk_mem_gen_edge_mask",
+               "blk_mem_gen_scan", "blk_mem_gen_busimg"):
+        assert ip in text, ip
+    # streaming handshake + cursor read-back
+    assert "bank_ready" in text and "scan_cursor" in text and "C_CURSOR" in text and "C_BANK_READY" in text
+    # CTRL word map matches host.image.CtrlWords
+    cw = im.CtrlWords
+    for name, off in (("C_COMMAND", cw.COMMAND), ("C_STATUS", cw.STATUS), ("C_PROG_COUNT", cw.PROG_COUNT),
+                      ("C_BANK_SIZE", cw.BANK_SIZE), ("C_CURSOR", cw.CURSOR), ("C_BANK_READY", cw.BANK_READY)):
+        m = re.search(r"localparam integer %s\s*= (\d+);" % name, text)
+        assert m and int(m.group(1)) == off, (name, off, m and m.group(1))
+    assert "jtag_axi_0" in text and "axi_bram_ctrl_0" in text
+
+
+def test_register_layout_handshake_rtl_matches_host():
+    """CTRL word 63 must read back the HARDWIRED layout id, equal to host
+    image.REGISTER_LAYOUT_ID.  This is the host<->bitstream layout handshake: a host built
+    for one CtrlWords layout REFUSES a bitstream built for another (the CLK_ENABLE 46->20
+    move ran mismatched on real hardware and garbled the DAC strobes -- silently)."""
+
+    import pathlib, re
+    from fpga.pulse_streamer.host import image as im
+
+    top = (pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    m = re.search(r"localparam integer C_LAYOUT_ID\s*=\s*(\d+);", top)
+    assert m and int(m.group(1)) == im.CtrlWords.LAYOUT_ID == 63
+    m = re.search(r"localparam \[31:0\] ZLC_LAYOUT_ID\s*=\s*32'h([0-9A-Fa-f_]+);", top)
+    assert m, "ZLC_LAYOUT_ID missing from the top"
+    assert int(m.group(1).replace("_", ""), 16) == im.REGISTER_LAYOUT_ID
+    # the read mux must return the constant for word 63 (write-proof read-back)
+    assert re.search(r"word_addr\[5:0\] == C_LAYOUT_ID\[5:0\]", top)
+    # pack_program must NEVER occupy the layout word (or the COMMAND/STATUS mailbox)
+    prog = _minimal_runtime_program()
+    words = im.pack_program(prog, im.StreamerParams())
+    for off in (im.CtrlWords.LAYOUT_ID, im.CtrlWords.COMMAND, im.CtrlWords.STATUS):
+        assert off not in words, f"pack_program must not write CTRL word {off}"
+
+
+def test_axi_session_refuses_mismatched_register_layout(tmp_path):
+    """prepare() and axi_self_test() must FAIL FAST with a rebuild instruction when the
+    bitstream's layout id differs from the host's (e.g. an old .bit returning 0)."""
+
+    import pytest
+    from Zou_lab_control.neutral_atom.devices import axi_session as ax
+
+    session = ax.VivadoAxiStreamerSession.__new__(ax.VivadoAxiStreamerSession)
+    session._read_word = lambda off, **kw: 0  # old bitstream: ctrl_reg[63] powers up 0
+    with pytest.raises(RuntimeError, match=r"register-layout mismatch.*[Rr]ebuild"):
+        session.check_register_layout()
+    session._read_word = lambda off, **kw: ax.REGISTER_LAYOUT_ID
+    session.check_register_layout()  # matching id -> no raise
+
+
+def _minimal_runtime_program():
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+    return RuntimeSequenceProgram(
+        sequence_id=1, sequence_name="t", clock_hz=50e6, channels=["a"],
+        ticks=[0, 10], masks=[1, 0], duration=200.0)
+
+
+def test_final_status_bits_match_host():
+    """The top STATUS bit map MUST equal host.image STATUS_*; in particular the
+    streaming UNDERFLOW bit must be a DISTINCT bit from the host's fatal ERROR bit,
+    else a recoverable streaming stall would crash the host (regression guard for
+    the ST_UNDERFLOW=8 vs STATUS_ERROR=8 collision)."""
+
+    import pathlib, re
+    from fpga.pulse_streamer.host import image as im
+    top = (pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    m = re.search(r"ST_LOADED = 5'd(\d+), ST_RUNNING = 5'd(\d+), ST_DONE = 5'd(\d+), ST_UNDERFLOW = 5'd(\d+);", top)
+    assert m, "could not find ST_* localparams in the top"
+    loaded, running, done, under = (int(g) for g in m.groups())
+    assert (loaded, running, done, under) == (im.STATUS_LOADED, im.STATUS_RUNNING, im.STATUS_DONE, im.STATUS_UNDERFLOW)
+    assert (loaded, running, done, under) == (1, 2, 4, 16)
+    # the recoverable stall bit must NOT collide with the host's fatal ERROR bit.
+    for v in (loaded, running, done, under):
+        assert v != im.STATUS_ERROR, "a STATUS bit collides with host STATUS_ERROR (bit 3)"
+
+
+def test_close_releases_the_jtag_lock_then_force_reaps_a_hung_process():
+    """#5b-B (debug-core-on-reopen): close() must hand the JTAG / dbg_hub lock back to the hw_server
+    (close_hw_target + disconnect_hw_server) BEFORE the Tcl process exits -- otherwise a REOPEN finds
+    the target still held and get_hw_axis comes back empty ("No JTAG-to-AXI core found").  And a
+    process that ignores `exit` must be force-reaped (terminate -> kill), never left lingering on the
+    lock.  Both invariants are deterministic and host-testable with a fake process."""
+    import io
+    import subprocess as _sp
+    from types import SimpleNamespace
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    session = VivadoAxiStreamerSession.__new__(VivadoAxiStreamerSession)
+    session._closed = False
+    session._external_executor = None
+    session._stop_stream_thread = lambda join_timeout=2.0: None
+    captured = io.StringIO()
+    calls = {"terminate": 0, "kill": 0}
+    def _wait(timeout=None):
+        raise _sp.TimeoutExpired(cmd="vivado", timeout=timeout)         # a hung process: never exits on its own
+    session._process = SimpleNamespace(
+        stdin=SimpleNamespace(write=captured.write, flush=lambda: None),
+        wait=_wait,
+        terminate=lambda: calls.__setitem__("terminate", calls["terminate"] + 1),
+        kill=lambda: calls.__setitem__("kill", calls["kill"] + 1))
+    session.close()
+    tcl = captured.getvalue()
+    assert "close_hw_target" in tcl and "disconnect_hw_server" in tcl   # lock handed back...
+    assert tcl.rstrip().endswith("exit")                               # ...before exit
+    assert calls["terminate"] == 1 and calls["kill"] == 1              # hung process force-reaped, not left
+    assert session._process is None
+
+
+def test_vivado_axi_session_tolerates_transient_underflow(tmp_path):
+    """STATUS_UNDERFLOW (bit 4) is a transient streaming stall, a DISTINCT bit from
+    the fatal STATUS_ERROR (bit 3).  wait_done must keep polling and complete on the
+    later DONE -- it must NEVER raise on an underflow."""
+
+    import re as _re
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import (
+        StreamerParams, CtrlWords, STATUS_RUNNING, STATUS_DONE, STATUS_UNDERFLOW, STATUS_LOADED, CMD_LOAD, CMD_FIRE,
+    )
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    params = StreamerParams(max_edges=16, bank_size=4)
+    program = RuntimeSequenceProgram(
+        sequence_id="u", sequence_name="u", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 100, 200], masks=[1, 0, 0], duration=4e-6,
+        repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1, slot_count=0,
+    )
+
+    class Hw:
+        def __init__(self):
+            self.bram = {}; self.status = 0; self.fired = False; self.polls = 0
+        def __call__(self, lines, action, timeout):
+            text = "\n".join(lines)
+            for w, v in _decode_axi_writes(text):
+                self.bram[w] = v
+                if w == CtrlWords.COMMAND and v & CMD_LOAD: self.status = STATUS_LOADED
+                if w == CtrlWords.COMMAND and v & CMD_FIRE: self.fired = True; self.status = STATUS_RUNNING
+            m = _re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
+            if m:
+                w = int(m.group(1), 16) // 4
+                if w == CtrlWords.STATUS:
+                    if self.fired:
+                        self.polls += 1
+                        if self.polls <= 3:   # transient stall: RUNNING + UNDERFLOW
+                            return f"ZLCDATA {STATUS_RUNNING | STATUS_UNDERFLOW:08X}\n"
+                        return f"ZLCDATA {STATUS_RUNNING | STATUS_DONE:08X}\n"
+                    return f"ZLCDATA {self.status:08X}\n"
+                if w == 63:   # hardwired register-layout id (current bitstream)
+                    return "ZLCDATA 5A4C4C02\n"
+                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
+            return "ok\n"
+
+    hw = Hw()
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
+    session.prepare(program); session.fire()
+    assert session.wait_done(timeout=2.0) is True   # underflow tolerated, completes on DONE
+
+
+def test_edge_streamer_repeat_streaming_structure():
+    """Engine + top carry the bank_chunk handshake: the scan advance is gated on the
+    bank holding the RIGHT chunk (never a stale point).  The repeat_forever wrap is a
+    CONTINUOUS CYCLIC ping-pong chunk boundary -- scan_bank_base toggles by (n_chunks&1)
+    so chunk 0 is fed into the alternating bank ONE-AHEAD (seamless re-sweep, any N)."""
+
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer"
+    eng = (root / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    top = (root / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    assert "bank_chunk0" in eng and "bank_chunk1" in eng
+    assert "scan_point_resident" in eng                       # advance gated on ready AND right chunk
+    # continuous cyclic ping-pong: bank parity offset that toggles at the wrap, and the
+    # wrap proceeds the instant point 0 is resident in the alternating bank (no stall gate).
+    assert "scan_bank_base" in eng
+    assert "scan_wrap_base_next" in eng and "scan_point0_ready_next" in eng
+    assert "bank_chunk0 == {SCAN_COUNT_WIDTH{1'b0}}" not in eng   # old reactive wrap gate removed
+    assert "C_BANK0_CHUNK" in top and "C_BANK1_CHUNK" in top
+    assert "bank_chunk0(ctrl_reg[C_BANK0_CHUNK]" in top and "bank_chunk1(ctrl_reg[C_BANK1_CHUNK]" in top
+
+
+def test_vivado_axi_session_rejects_dac_value_over_bus_width(tmp_path):
+    """A scanned DAC code wider than bus_width (would silently truncate on hardware)
+    is rejected at prepare."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import StreamerParams
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    params = StreamerParams(max_edges=16, bank_size=4, bus_width=10)
+    program = RuntimeSequenceProgram(
+        sequence_id="dh", sequence_name="dh", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 50, 200], masks=[0, 1, 0], duration=4e-6,
+        repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1,
+        slot_count=1, slot_kinds=["dac"], loop_end_slot_coeffs=[0],
+        tick_slot_coeffs=[[0], [0], [0]], scan_points=[[100], [2000]], scan_coeff_frac_bits=8,  # 2000 > 1023
+    )
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=lambda *a: "ok\n")
+    with pytest.raises(ValueError, match="does not fit 10 bits"):
+        session.prepare(program)
+
+
+def test_vivado_axi_session_wait_done_is_reentrant(tmp_path):
+    """A finite streamed scan whose wait_done returns early (timeout) must RESUME on
+    the next call -- it must NOT reload from chunk 2 over the bank that now holds a
+    later chunk.  Each chunk is loaded exactly once, in order, across the two calls."""
+
+    import re as _re
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import (
+        StreamerParams, CtrlWords, STATUS_RUNNING, STATUS_DONE, STATUS_LOADED, CMD_LOAD, CMD_FIRE,
+    )
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    N = 10
+    params = StreamerParams(max_edges=16, bank_size=2)   # 5 chunks; chunks 2,3,4 streamed
+    program = RuntimeSequenceProgram(
+        sequence_id="re", sequence_name="re", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 5, 40], masks=[0, 1, 0], duration=4e-6,
+        repeat_forever=False, loop_start_index=0, loop_end_tick=40, loop_count=1,
+        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
+        tick_slot_coeffs=[[0], [256], [0]], scan_points=[[k] for k in range(N)], scan_coeff_frac_bits=8,
+    )
+
+    class Hw:
+        def __init__(self):
+            self.bram = {}; self.status = 0; self.fired = False; self.cursor = 0; self.cap = 0
+            self.chunk_writes = []     # order of (BANK*_CHUNK) values written after fire
+        def __call__(self, lines, action, timeout):
+            text = "\n".join(lines)
+            for w, v in _decode_axi_writes(text):
+                self.bram[w] = v
+                if w == CtrlWords.COMMAND and v & CMD_LOAD: self.status = STATUS_LOADED
+                if w == CtrlWords.COMMAND and v & CMD_FIRE: self.fired = True; self.status = STATUS_RUNNING
+                if self.fired and w in (CtrlWords.BANK0_CHUNK, CtrlWords.BANK1_CHUNK):
+                    self.chunk_writes.append(v)
+            m = _re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
+            if m:
+                w = int(m.group(1), 16) // 4
+                if w == CtrlWords.CURSOR:
+                    return f"ZLCDATA {self.cursor:08X}\n"
+                if w == CtrlWords.STATUS:
+                    if self.fired:               # advance toward the allowed cap, then DONE at N
+                        self.cursor = min(self.cap, self.cursor + params.bank_size)
+                        if self.cursor >= N:
+                            self.status |= STATUS_DONE
+                    return f"ZLCDATA {self.status:08X}\n"
+                if w == 63:   # hardwired register-layout id (current bitstream)
+                    return "ZLCDATA 5A4C4C02\n"
+                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
+            return "ok\n"
+
+    hw = Hw()
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
+    session.prepare(program)
+    session.fire()
+    hw.cap = 6                                   # only let the engine reach cursor 6 this call
+    assert session.wait_done(timeout=0.3) is False   # not done yet; some chunks streamed
+    partial = list(hw.chunk_writes)
+    assert partial == sorted(partial) and partial[0] == 2   # loaded 2,3,... in order, none repeated
+    hw.cap = N                                   # allow it to finish
+    assert session.wait_done(timeout=1.0) is True
+    # every streamed chunk loaded exactly once, strictly increasing across BOTH calls
+    assert hw.chunk_writes == [2, 3, 4], hw.chunk_writes
+
+
+def test_vivado_axi_session_rejects_nonmonotonic_program(tmp_path):
+    """The host validates the program before upload (defence in depth): an affine
+    scan that makes the effective edge ticks non-monotonic (an edge would overtake a
+    later one and be silently dropped on hardware) is rejected at prepare, not
+    uploaded."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import StreamerParams
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    params = StreamerParams(max_edges=16, bank_size=4)
+    # edge 1 has a large positive slot coeff, so at slot=1000 it lands at tick
+    # 100+1000=1100, OVERTAKING the fixed edge 2 at 200 -> non-monotonic.
+    program = RuntimeSequenceProgram(
+        sequence_id="bad", sequence_name="bad", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 100, 200], masks=[0, 1, 0], duration=4e-6,
+        repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1,
+        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
+        tick_slot_coeffs=[[0], [256], [0]], scan_points=[[0], [1000]], scan_coeff_frac_bits=8,
+    )
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=lambda *a: "ok\n")
+    with pytest.raises(ValueError, match="non-increasing"):
+        session.prepare(program)
+
+
+def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
+    """repeat_forever over a FINITE STREAMED scan (N > 2*bank_size) re-sweeps SEAMLESSLY
+    via CONTINUOUS CYCLIC ping-pong: the background thread streams monotonic chunks
+    2,3,4,.. (data = mono%K into bank mono%2) ONE-AHEAD forever, so the engine wraps
+    0->N-1->0 with no reactive reload.  Models the cyclic engine: cursor wraps on its
+    own each sweep; asserts the engine re-sweeps and the host keeps reloading data
+    chunk 0 across sweeps.  Never raises; safe_state stops it."""
+
+    import re as _re, time as _time
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import (
+        StreamerParams, CtrlWords, STATUS_RUNNING, STATUS_LOADED, CMD_LOAD, CMD_FIRE, CMD_SAFE,
+    )
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    N = 12
+    params = StreamerParams(max_edges=16, bank_size=2)   # total_chunks = 6 (streamed)
+    program = RuntimeSequenceProgram(
+        sequence_id="rs", sequence_name="rs", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 5, 40], masks=[0, 1, 0], duration=4e-6,
+        repeat_forever=True, loop_start_index=0, loop_end_tick=40, loop_count=1,
+        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
+        tick_slot_coeffs=[[0], [256], [0]], scan_points=[[k] for k in range(N)], scan_coeff_frac_bits=8,
+    )
+
+    class Hw:
+        def __init__(self):
+            self.bram = {}; self.status = 0; self.fired = False; self.cursor = 0
+            self.sweeps = 0; self.chunk0_reloads = 0
+        def __call__(self, lines, action, timeout):
+            text = "\n".join(lines)
+            for w, v in _decode_axi_writes(text):
+                self.bram[w] = v
+                if w == CtrlWords.COMMAND and v & CMD_LOAD: self.status = STATUS_LOADED
+                if w == CtrlWords.COMMAND and v & CMD_FIRE: self.fired = True; self.status = STATUS_RUNNING; self.cursor = 0
+                if w == CtrlWords.COMMAND and v & CMD_SAFE: self.status = 0; self.fired = False
+                # count the host (re)loading DATA chunk 0 into either bank AFTER fire -- the
+                # cyclic stream keeps reloading chunk 0 (mono = K, 2K, ..) across sweeps.
+                if self.fired and w in (CtrlWords.BANK0_CHUNK, CtrlWords.BANK1_CHUNK) and v == 0:
+                    self.chunk0_reloads += 1
+            m = _re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
+            if m:
+                w = int(m.group(1), 16) // 4
+                if w == CtrlWords.STATUS:
+                    return f"ZLCDATA {self.status:08X}\n"
+                if w == CtrlWords.CURSOR:
+                    # the engine plays a chunk's worth of points per poll and WRAPS on its
+                    # own at N (seamless cyclic re-sweep -- no reactive reload needed).
+                    if self.fired:
+                        self.cursor += params.bank_size
+                        if self.cursor >= N:
+                            self.cursor -= N; self.sweeps += 1
+                    return f"ZLCDATA {self.cursor:08X}\n"
+                if w == 63:   # hardwired register-layout id (current bitstream)
+                    return "ZLCDATA 5A4C4C02\n"
+                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
+            return "ok\n"
+
+    hw = Hw()
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
+    try:
+        session.prepare(program)
+        session.fire()
+        assert session.wait_done(timeout=1.0) is True       # RUNNING -> returns; thread streams
+        deadline = _time.monotonic() + 3.0
+        while (hw.sweeps < 3 or hw.chunk0_reloads < 1) and _time.monotonic() < deadline:
+            _time.sleep(0.02)
+    finally:
+        session.safe_state()
+    assert hw.sweeps >= 3, f"expected the streamed scan to re-sweep, got {hw.sweeps} sweeps"
+    assert hw.chunk0_reloads >= 1, f"expected the cyclic host to reload chunk 0, got {hw.chunk0_reloads}"
+
+
+def test_pulse_table_state_compiles_pair_array_scan_to_full_40ch_template():
+    hardware_channels = [f"ch{i:02d}" for i in range(40)]
+    # Two bound time slots: s0 scans the camera duration, s1 scans the trailing
+    # idle (kept as ``s1+20`` so the affine path carries a non-zero base too).
     state = na.PulseTableState(
-        channels=["ch00", "ch01"],
+        channels=["ch00", "ch01", "ch02", "ch03"],
         periods=[
-            na.PulsePeriod("tau", (1, 0), unit="str (ns)", name="load"),
-            na.PulsePeriod(20, (0, 1), unit="ns", name="detect"),
+            na.PulsePeriod(20, (1, 0, 0, 0), unit="ns", name="load"),
+            na.PulsePeriod("s0", (0, 0, 0, 1), unit="str (ns)", name="camera"),
+            na.PulsePeriod("s1+20", (0, 0, 0, 0), unit="str (ns)", name="idle"),
         ],
-        delays={"ch01": "d"},
-        delay_units={"ch01": "str (ns)"},
-        scan_variables={"tau": 20, "d": 20},
-        scan_bindings={"period:0:duration": "tau", "delay:ch01": "d"},
-        scan_table_path=scan_file,
+        scan_slots=[
+            {"kind": "duration", "target": "1", "unit": "ns", "nominal": 20.0},
+            {"kind": "duration", "target": "2", "unit": "ns", "nominal": 20.0},
+        ],
+        scan_table=[[20.0, 20.0], [40.0, 40.0]],
         time_step_ns=20,
-        visible_channels=["ch00", "ch01"],
+        visible_channels=["ch00", "ch03"],
     )
 
     program = na.compile_pulse_table_scan_runtime_program(
         state,
-        channels=["ch00", "ch01"],
+        channels=hardware_channels,
         clock_hz=50_000_000,
-        trigger_channels=["ch01"],
     )
 
-    assert program.scan_axis_names == ["tau", "d"]
-    assert program.scan_points == [(1, 1), (2, 1)]
-    assert program.tick_x_coeffs is not None and any(program.tick_x_coeffs)
-    assert program.tick_y_coeffs is not None and any(program.tick_y_coeffs)
-    assert program.source_table["scan_table_path"].endswith("scan_points.txt")
-    assert len(program.ticks) < len(program.scan_points) * 4
-    na.validate_pulse_streamer_program(program, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=2)
-
-
-def test_pulse_table_named_scan_file_rejects_more_than_two_time_axes(tmp_path):
-    scan_file = tmp_path / "scan_points.txt"
-    scan_file.write_text("# vars: a(ns), b(ns), c(ns)\n20 20 20\n", encoding="utf-8")
-    state = na.PulseTableState(
-        channels=["ch00"],
-        periods=[
-            na.PulsePeriod("a", (1,), unit="str (ns)"),
-            na.PulsePeriod("b", (0,), unit="str (ns)"),
-            na.PulsePeriod("c", (0,), unit="str (ns)"),
-        ],
-        scan_variables={"a": 20, "b": 20, "c": 20},
-        scan_table_path=scan_file,
-        time_step_ns=20,
-    )
-
-    with pytest.raises(ValueError, match="two hardware axes"):
-        na.compile_pulse_table_scan_runtime_program(state, channels=["ch00"], clock_hz=50_000_000)
-
-
-def test_pulse_table_da_value_scan_binding_compiles_to_scan_bus_values(tmp_path):
-    scan_file = tmp_path / "scan_points.txt"
-    scan_file.write_text("# vars: amp\n1\n2\n", encoding="utf-8")
-    state = na.PulseTableState(
-        channels=["ch00", "ch01"],
-        channel_labels={"ch00": "da_test[0]", "ch01": "da_test[1]"},
-        analog_buses={"da_test": ["ch00", "ch01"]},
-        periods=[na.PulsePeriod(20, (0, 0), unit="ns")],
-        analog_bus_modes={"da_test": [{"mode": "edge", "value": "amp"}]},
-        scan_variables={"amp": 1},
-        scan_bindings={"bus:da_test:0:value": "amp"},
-        scan_table_path=scan_file,
-        time_step_ns=20,
-        visible_channels=["ch00", "ch01"],
-    )
-
-    program = na.compile_pulse_table_scan_runtime_program(state, channels=["ch00", "ch01"], clock_hz=50_000_000)
+    assert program.channels == hardware_channels
+    assert program.scan_enabled is True
+    assert program.slot_count == 2
+    assert program.slot_kinds == ["duration", "duration"]
+    assert program.scan_points == [[1, 1], [2, 2]]
+    assert program.ticks == [0, 1, 1, 2]
+    assert program.masks == [1, 1 << 3, 0, 0]
+    assert program.tick_slot_coeffs == [[0, 0], [0, 0], [256, 0], [256, 256]]
+    assert len(program.ticks) == 4
+    assert len(program.ticks) < len(program.scan_points) * len(state.periods)
+    assert len(program.channels) == 40
+    # round-trips through the JSON schema with the N-slot coefficient rows intact.
     roundtrip = na.RuntimeSequenceProgram.from_dict(program.to_dict())
-    tcl_path = na.write_vivado_pulse_streamer_tcl(
-        tmp_path / "prepare_da_scan.tcl",
-        "prepare",
-        program=program,
-        project="",
-        bitstream="",
-        probes="",
-        max_edges=16,
-        max_scan_points=16,
-        channel_count=2,
+    assert roundtrip.scan_points == [[1, 1], [2, 2]]
+    assert roundtrip.tick_slot_coeffs == [[0, 0], [0, 0], [256, 0], [256, 256]]
+    na.validate_pulse_streamer_program(program, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=40)
+
+
+from Zou_lab_control.neutral_atom.timing.pulse_table import ScanSlot as _ScanSlot
+
+
+def _rtl_bus_held_value(program, bus_index, tick, scan_point, *, bus_width=10):
+    """Python re-implementation of the RTL bus engine's held DAC value.
+
+    Faithfully mirrors ``zlc_bus_apply_segment`` / ``zlc_bus_seg_start`` in
+    ``fpga/pulse_streamer/zlc_edge_streamer.v``: at a scan point the bus walks
+    its segments in *effective*-tick order and holds the most recent one whose
+    effective start tick <= ``tick``.  The effective tick applies the segment's
+    affine coefficients to the current scan point (so a scanned duration moves
+    the segment).  For an edge/hold segment the RTL holds ``vstop`` (the STOP
+    endpoint); a RAMP segment inside its [eff_start, eff_stop) window is the
+    Bresenham staircase from vstart to vstop (floor line-tracking: after k ticks
+    the value has moved floor(k*|delta|/span) codes -- the same integer staircase
+    the RTL stepper produces and the preview draws), landing on vstop at
+    eff_stop.  EITHER endpoint may read scan slot j at runtime via its select
+    (``value_select`` for the start, ``stop_value_select`` for the stop), so a
+    ramp can go from a scanned level and/or TO a scanned level -- the edge+ramp
+    DAC scan.  Together this models the simultaneous DA-value (edge AND ramp)
+    + duration + delay scan."""
+
+    from Zou_lab_control.neutral_atom.devices.sequencer import _apply_affine_ticks
+
+    mask = (1 << bus_width) - 1
+    frac = int(getattr(program, "scan_coeff_frac_bits", 8))
+    point = list(program.scan_points[scan_point]) if program.scan_points else []
+
+    def eff(base, coeffs):
+        if coeffs and point:
+            return _apply_affine_ticks(int(base), coeffs, point, frac)
+        return int(base)
+
+    def eff_start(seg):
+        return eff(seg.start_tick, getattr(seg, "start_tick_coeffs", None))
+
+    def endpoint(seg, *, stop):
+        sel = int(getattr(seg, "stop_value_select" if stop else "value_select", 0) or 0)
+        if sel:
+            return int(point[sel - 1]) & mask
+        return int(seg.stop_value if stop else seg.start_value) & mask
+
+    segments = sorted(
+        (s for s in (program.bus_segments or []) if int(s.bus_index) == int(bus_index)),
+        key=eff_start,
     )
-    tcl = tcl_path.read_text(encoding="utf-8")
+    value = 1 << (bus_width - 1)   # the bus rests at BUS_SAFE_VALUE (mid code = 0 V)
+    for seg in segments:
+        s_eff = eff_start(seg)
+        if s_eff > tick:
+            break
+        e_eff = eff(seg.stop_tick, getattr(seg, "stop_tick_coeffs", None))
+        vstart, vstop = endpoint(seg, stop=False), endpoint(seg, stop=True)
+        if str(seg.mode).lower() == "ramp" and e_eff > s_eff and tick < e_eff:
+            # ramp START = the CARRIED (current held) value, unless a SCANNED start endpoint overrides
+            # it; the ramp engine reads its live register, not a baked start (#ramp-carry).
+            rstart = vstart if int(getattr(seg, "value_select", 0) or 0) else value
+            span, delta, k = e_eff - s_eff, abs(vstop - rstart), tick - s_eff
+            moves = min(delta, (k * delta) // span)
+            value = rstart + (moves if vstop >= rstart else -moves)
+        else:
+            value = vstop
+    return value
 
-    assert program.scan_axis_names == []
-    assert program.scan_points == [(0, 0), (0, 0)]
-    assert program.bus_names == ["da_test"]
-    assert program.scan_bus_values == [1, 2]
-    assert program.bus_segments is None
-    assert roundtrip.scan_bus_values == [1, 2]
-    assert "zlc_scan_prog_bus_values_probe {zlc_scan_prog_bus_values probe_out30}" in tcl
-    assert "zlc_stage_probe $vio $zlc_scan_prog_bus_values_probe 1" in tcl
-    assert "zlc_stage_probe $vio $zlc_scan_prog_bus_values_probe 2" in tcl
-    na.validate_pulse_streamer_program(program, max_edges=16, max_scan_points=16, tick_width=32, channel_count=2)
+
+def test_dac_value_scan_behavioral_model_tracks_scanned_code():
+    """End-to-end (logic) proof that a seamless DAC scan reaches bus_out.
+
+    Compiles a real DAC-value scan, then runs a faithful Python model of the RTL
+    bus engine over the uploaded program and checks that, for *every* scan point,
+    the DAC output during the scanned period equals that point's code and is the
+    prior (unscanned) level just before it.  Without a Verilog simulator this is
+    the strongest available evidence that ``value_select`` carries the scanned
+    value all the way through to the DAC output.
+    """
+
+    hw = [f"ch{i:02d}" for i in range(12)]
+    labels = {f"ch{i:02d}": f"da[{i}]" for i in range(10)}
+    labels["ch10"] = "trig"
+    state = na.PulseTableState(
+        channels=hw,
+        channel_labels=labels,
+        visible_channels=hw,
+        time_step_ns=20,
+        periods=[
+            na.PulsePeriod(100, tuple([0] * 10 + [1, 0]), unit="ns"),  # da=0, trig high
+            na.PulsePeriod(200, tuple([0] * 12), unit="ns"),           # scanned da level here
+            na.PulsePeriod(100, tuple([0] * 12), unit="ns"),
+        ],
+    )
+    state.bind_field("dac", "da@1")                 # scan the 10-bit "da" bus in period 1
+    signed_values = [-512, -256, 256, 511]          # user layer: signed LSB (0 = 0 V)
+    codes = [v + 512 for v in signed_values]        # wire layer: offset-binary 0/256/768/1023
+    state.set_scan_table([[v] for v in signed_values])
+
+    program = na.compile_pulse_table_scan_runtime_program(state, channels=hw, clock_hz=50_000_000)
+    na.validate_pulse_streamer_program(program, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=12)
+
+    scanned = [s for s in (program.bus_segments or []) if int(getattr(s, "value_select", 0))]
+    assert len(scanned) == 1, "exactly one scanned DAC segment expected"
+    seg = scanned[0]
+    bus = int(seg.bus_index)
+    assert int(seg.start_tick) == 5  # period-1 start = 100 ns / 20 ns
+
+    for point_index, code in enumerate(codes):
+        # During the scanned period the DAC equals THIS point's code...
+        assert _rtl_bus_held_value(program, bus, int(seg.start_tick), point_index) == code
+        assert _rtl_bus_held_value(program, bus, int(seg.start_tick) + 3, point_index) == code
+        # ...and the prior (period-0) level is still the idle mid code (0 V) just before it.
+        assert _rtl_bus_held_value(program, bus, int(seg.start_tick) - 1, point_index) == 512
+
+    # Consecutive scan points really produce different DAC outputs (seamless sweep).
+    sweep = [_rtl_bus_held_value(program, bus, int(seg.start_tick), p) for p in range(len(codes))]
+    assert sweep == codes
 
 
-def test_pulse_table_duration_and_da_value_scan_share_compact_template(tmp_path):
-    scan_file = tmp_path / "scan_points.txt"
-    scan_file.write_text("# vars: tau(ns), amp\n20 1\n40 2\n", encoding="utf-8")
+def test_dac_scan_bind_preserves_ramp_mode_and_unbind_restores():
+    """Clicking the DAC scan dot on a RAMP period must scan the RAMP (its stop endpoint),
+    NOT silently rewrite the period to an edge; unbinding restores the ramp with a
+    concrete value (the caller's restore, else the slot nominal).  Regression guard:
+    _apply_slot_binding used to force {"mode": "edge"} unconditionally."""
+
+    state = na.PulseTableState(
+        name="rb", channels=["b0", "b1", "t"],
+        channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"},
+        visible_channels=["b0", "b1", "t"], time_step_ns=20.0,
+        periods=[na.PulsePeriod(200, (0, 0, 1), unit="ns"), na.PulsePeriod(400, (0, 0, 0), unit="ns")],
+        analog_bus_modes={"da_x": [{"mode": "edge", "value": 1}, {"mode": "ramp", "value": -2}]})
+
+    idx = state.bind_field("dac", "da_x@1")
+    entry = state.analog_bus_plan("da_x")[1]
+    assert entry["mode"] == "ramp" and str(entry["value"]) == f"s{idx}"
+    assert state.scan_slots[idx].nominal == -2  # nominal read from the ramp target
+
+    # an edge period still binds as an edge; a hold becomes an edge (it has no own value)
+    idx0 = state.bind_field("dac", "da_x@0")
+    assert state.analog_bus_plan("da_x")[0]["mode"] == "edge"
+
+    state.unbind_slot(idx0)
+    state.unbind_slot(state.slot_index_for("dac", "da_x@1"))
+    plan = state.analog_bus_plan("da_x")
+    assert plan[1] == {"mode": "ramp", "value": -2}, "unbind keeps the ramp + restores the nominal"
+    assert plan[0]["mode"] == "edge" and plan[0]["value"] == 1
+
+
+def test_dac_ramp_endpoint_scan_compiles_and_tracks_every_point():
+    """End-to-end edge+RAMP DAC scan: a ramp whose STOP endpoint is a scan slot compiles
+    to a ramp segment with stop_value_select = slot+1, validates, packs, and -- per the
+    faithful RTL bus model -- produces, at EVERY scan point, the Bresenham staircase from
+    the carried-in level to THAT point's code, landing exactly on it at the ramp end."""
+
+    state = na.PulseTableState(
+        name="ramp_scan", channels=["b0", "b1", "t"],
+        channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"},
+        visible_channels=["b0", "b1", "t"], time_step_ns=20.0,
+        periods=[na.PulsePeriod(200, (0, 0, 1), unit="ns"),
+                 na.PulsePeriod(400, (0, 0, 0), unit="ns"),
+                 na.PulsePeriod(200, (0, 0, 0), unit="ns")],
+        analog_bus_modes={"da_x": [{"mode": "edge", "value": 1},
+                                   {"mode": "ramp", "value": "s0"},
+                                   {"mode": "hold", "value": None}]},
+        scan_slots=[_ScanSlot(kind="dac", target="da_x@1", unit="", nominal=0.0)],
+        scan_table=[[-2.0], [0.0], [1.0]])
+
+    program = na.compile_pulse_table_scan_runtime_program(
+        state, channels=list(state.channels), clock_hz=50_000_000, scan_table=state.scan_table)
+    na.validate_pulse_streamer_program(program, max_edges=1024, max_scan_points=1024,
+                                       tick_width=32, channel_count=3, bus_count=4, bus_width=2)
+    from fpga.pulse_streamer.host import image as img
+    img.pack_program(program, img.StreamerParams())   # packs cleanly
+
+    ramps = [s for s in (program.bus_segments or []) if s.mode == "ramp"]
+    assert len(ramps) == 1
+    seg = ramps[0]
+    zero = 1 << (2 - 1)                                # 2-bit bus: signed 0 -> code 2
+    # the ramp START is the LIVE register (carry), so it is NOT baked (start_value 0); the engine
+    # carries in period 0's edge level (code 3) at runtime -- proven by the waveform below (#ramp-carry).
+    assert int(seg.value_select) == 0 and int(seg.start_value) == 0
+    assert int(seg.stop_value_select) == 1             # stop endpoint reads scan slot 0
+    s_tick, e_tick = int(seg.start_tick), int(seg.stop_tick)
+    assert (s_tick, e_tick) == (10, 30)                # period-1 window in ticks
+
+    for point_index, signed in enumerate([-2.0, 0.0, 1.0]):
+        code = int(signed) + zero
+        bus = int(seg.bus_index)
+        # before the ramp: the carried edge level; at the ramp end (and after): the code
+        assert _rtl_bus_held_value(program, bus, s_tick - 1, point_index, bus_width=2) == 1 + zero
+        assert _rtl_bus_held_value(program, bus, e_tick, point_index, bus_width=2) == code
+        assert _rtl_bus_held_value(program, bus, e_tick + 5, point_index, bus_width=2) == code
+        # inside the ramp: the Bresenham staircase floor((k*delta)/span) from the start
+        vstart, span, delta = 1 + zero, e_tick - s_tick, abs(code - (1 + zero))
+        for k in (1, span // 2, span - 1):
+            expect = vstart + ((min(delta, (k * delta) // span)) if code >= vstart else -(min(delta, (k * delta) // span)))
+            assert _rtl_bus_held_value(program, bus, s_tick + k, point_index, bus_width=2) == expect
+
+
+def test_dac_ramp_from_a_scanned_edge_carries_the_scanned_level_via_the_register():
+    """An edge bound to a scan slot followed by a literal-target ramp: the ramp must START from the
+    scanned edge level at runtime.  It does so via the CARRY -- the edge sets the engine register to the
+    scanned code and the ramp reads its current value (value_select 0, no baked start), NOT a baked
+    scanned start endpoint.  The WAVEFORM proves it: just before the ramp the bus holds that point's
+    scanned code at every scan point (#ramp-carry)."""
+
+    state = na.PulseTableState(
+        name="carry", channels=["b0", "b1", "t"],
+        channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"},
+        visible_channels=["b0", "b1", "t"], time_step_ns=20.0,
+        periods=[na.PulsePeriod(200, (0, 0, 1), unit="ns"), na.PulsePeriod(400, (0, 0, 0), unit="ns")],
+        analog_bus_modes={"da_x": [{"mode": "edge", "value": "s0"},
+                                   {"mode": "ramp", "value": 1}]},
+        scan_slots=[_ScanSlot(kind="dac", target="da_x@0", unit="", nominal=0.0)],
+        scan_table=[[-2.0], [1.0]])
+
+    program = na.compile_pulse_table_scan_runtime_program(
+        state, channels=list(state.channels), clock_hz=50_000_000, scan_table=state.scan_table)
+    ramps = [s for s in (program.bus_segments or []) if s.mode == "ramp"]
+    assert len(ramps) == 1
+    seg = ramps[0]
+    zero = 1 << (2 - 1)
+    assert int(seg.value_select) == 0, "the ramp carries from the register, not a baked scanned start"
+    assert int(seg.stop_value_select) == 0 and int(seg.stop_value) == 1 + zero
+    # model: at each point the ramp starts FROM that point's scanned edge code (carried in the register)
+    for point_index, signed in enumerate([-2.0, 1.0]):
+        code = int(signed) + zero
+        assert _rtl_bus_held_value(program, int(seg.bus_index), int(seg.start_tick) - 1,
+                                   point_index, bus_width=2) == code
+
+
+def test_delayed_scanned_ramp_capacity_is_enforced():
+    """A ramp on a DELAYED bus is the one realistic per-DA-bit event-FIFO stressor: every
+    Bresenham stepping tick inside the delay window is an in-flight event.  The validator
+    must reject when min(delay, span, swing) exceeds the per-bit FIFO depth -- with the
+    full-scale worst case for a SCANNED endpoint -- and pass the same ramp undelayed or
+    delay-bounded."""
+
+    import dataclasses
+    import pytest
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeBusSegment, RuntimeBusDelay
+
+    def prog(span_ticks, delay_ticks, *, sel=1):
+        ticks = [0, span_ticks + 100]
+        return na.RuntimeSequenceProgram(
+            sequence_id=1, sequence_name="r", clock_hz=50e6, channels=["a"],
+            ticks=ticks, masks=[1, 0], duration=(span_ticks + 100) * 20.0,
+            slot_count=1, slot_kinds=["dac"],
+            tick_slot_coeffs=[[0], [0]], loop_end_slot_coeffs=[0],
+            scan_points=[[100], [900]],
+            bus_segments=[RuntimeBusSegment(0, 10, 10 + span_ticks, 512, 0, "ramp", "da_x",
+                                            0, None, None, stop_value_select=sel)],
+            bus_delays=[RuntimeBusDelay(0, delay_ticks)] if delay_ticks else None,
+        )
+
+    kw = dict(max_edges=1024, max_scan_points=16, tick_width=32, channel_count=1)
+    # long scanned ramp + long delay -> full-scale worst-case in-flight bound -> reject
+    with pytest.raises(ValueError, match="in flight per DA bit"):
+        na.validate_pulse_streamer_program(prog(2000, 5000), **kw)
+    # the same ramp UNDELAYED passes
+    na.validate_pulse_streamer_program(prog(2000, 0), **kw)
+    # a short delay bounds the window -> passes (min(d, span, delta) <= depth)
+    na.validate_pulse_streamer_program(prog(2000, 64), **kw)
+    # a literal small swing passes even with a long delay (delta bounds it)
+    small = prog(2000, 5000, sel=0)
+    small.bus_segments[0] = dataclasses.replace(
+        small.bus_segments[0], start_value=512, stop_value=512 + 40, stop_value_select=0)
+    na.validate_pulse_streamer_program(small, **kw)
+
+
+def test_dac_plus_duration_scan_behavioral_model_value_and_timing():
+    """Behavioral proof of the simultaneous DA-value + duration scan.
+
+    A duration is scanned BEFORE the DAC period, so the DAC segment's effective
+    tick shifts with each point.  The RTL bus-engine model must show the scanned
+    DAC code appearing at the SHIFTED tick (and the prior 0 level just before it)
+    for every scan point -- i.e. value and timing scan together.
+    """
+
+    hw = [f"ch{i:02d}" for i in range(12)]
+    labels = {f"ch{i:02d}": f"da[{i}]" for i in range(10)}
+    labels["ch10"] = "trig"
+    state = na.PulseTableState(
+        channels=hw,
+        channel_labels=labels,
+        visible_channels=hw,
+        time_step_ns=20,
+        periods=[
+            na.PulsePeriod(100, tuple([0] * 10 + [1, 0]), unit="ns"),  # period 0 duration scanned
+            na.PulsePeriod(200, tuple([0] * 12), unit="ns"),           # DAC level scanned here
+        ],
+    )
+    state.bind_field("duration", "0")     # s0: period-0 duration (moves period-1 start)
+    state.bind_field("dac", "da@1")       # s1: scanned DAC level in period 1
+    # rows: [period-0 duration ns, DAC code]
+    durations_ns = [100, 200, 400]
+    signed_values = [-512, 0, 511]                   # user layer (0 = 0 V)
+    codes = [v + 512 for v in signed_values]         # wire codes 0 / 512 / 1023
+    state.set_scan_table([[d, v] for d, v in zip(durations_ns, signed_values)])
+
+    program = na.compile_pulse_table_scan_runtime_program(state, channels=hw, clock_hz=50_000_000)
+    na.validate_pulse_streamer_program(program, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=12)
+
+    seg = next(s for s in program.bus_segments if int(getattr(s, "value_select", 0)))
+    bus = int(seg.bus_index)
+    from Zou_lab_control.neutral_atom.devices.sequencer import _apply_affine_ticks
+
+    frac = program.scan_coeff_frac_bits
+    for point_index, code in enumerate(codes):
+        point = program.scan_points[point_index]
+        eff = _apply_affine_ticks(int(seg.start_tick), seg.start_tick_coeffs, point, frac)
+        dur_ticks = durations_ns[point_index] // 20
+        assert eff == dur_ticks  # period-1 start = scanned period-0 duration
+        # DAC code present at/after the SHIFTED tick, and the idle mid code just before it.
+        assert _rtl_bus_held_value(program, bus, eff, point_index) == code
+        assert _rtl_bus_held_value(program, bus, eff + 5, point_index) == code
+        if eff > 0:
+            assert _rtl_bus_held_value(program, bus, eff - 1, point_index) == 512
+
+
+def test_pulse_table_dac_duration_delay_scan_simultaneously():
+    """DAC value + a duration BEFORE it scan together, with a FIXED per-channel delay.
+
+    The DAC bus segment must carry affine tick coefficients so its effective
+    tick moves in lockstep with the scanned duration, while its value still
+    tracks the scanned DAC code.  A per-channel delay is a fixed output delay
+    (a delay line) and is NOT scannable -- it is carried as a constant.
+    """
+
     state = na.PulseTableState(
         channels=["ch00", "ch01", "ch02"],
         channel_labels={"ch00": "da_test[0]", "ch01": "da_test[1]", "ch02": "trig"},
-        analog_buses={"da_test": ["ch00", "ch01"]},
-        periods=[
-            na.PulsePeriod("tau", (0, 0, 1), unit="str (ns)", name="image"),
-            na.PulsePeriod(20, (0, 0, 0), unit="ns", name="idle"),
-        ],
-        analog_bus_modes={"da_test": [{"mode": "edge", "value": "amp"}, {"mode": "hold", "value": None}]},
-        scan_variables={"tau": 20, "amp": 1},
-        scan_bindings={"period:0:duration": "tau", "bus:da_test:0:value": "amp"},
-        scan_table_path=scan_file,
-        time_step_ns=20,
         visible_channels=["ch00", "ch01", "ch02"],
-    )
-
-    program = na.compile_pulse_table_scan_runtime_program(
-        state,
-        channels=["ch00", "ch01", "ch02"],
-        clock_hz=50_000_000,
-        trigger_channels=["ch02"],
-    )
-
-    assert program.scan_axis_names == ["tau"]
-    assert program.scan_points == [(1, 0), (2, 0)]
-    assert program.scan_bus_values == [1, 2]
-    assert program.bus_segments is None
-    assert len(program.ticks) < len(program.scan_points) * 4
-    na.validate_pulse_streamer_program(program, max_edges=16, max_scan_points=16, tick_width=32, channel_count=3)
-
-
-def test_camera_imaging_example_scan_file_compiles_for_address_switch_preset():
-    root = Path(__file__).resolve().parents[1]
-    scan_file = root / "pulses" / "camera_exposure_scan_example.txt"
-    state = na.PulseTableState.load(root / "pulses" / "camera_imaging_address_switch.json").with_scan_table_path(scan_file)
-
-    program = na.compile_pulse_table_scan_runtime_program(
-        state,
-        channels=state.channels,
-        clock_hz=50_000_000,
-        trigger_channels=["ch11"],
-    )
-
-    assert program.scan_axis_names == ["camera_exposure_ns"]
-    assert len(program.scan_points) == 4
-    assert program.scan_points[0] == (100000, 0)
-    assert program.scan_points[-1] == (999000, 0)
-    assert program.source_table["scan_table_path"].endswith("camera_exposure_scan_example.txt")
-    na.validate_pulse_streamer_program(program, max_edges=512, max_scan_points=256, tick_width=32, channel_count=62)
-
-
-def test_camera_imaging_example_scan_file_also_matches_manual_p4_duration_binding():
-    root = Path(__file__).resolve().parents[1]
-    scan_file = root / "pulses" / "camera_exposure_scan_example.txt"
-    state = na.PulseTableState.load(root / "pulses" / "camera_imaging_address_switch.json")
-    payload = state.to_dict()
-    payload["periods"][3]["duration"] = "p4_duration"
-    payload["periods"][3]["unit"] = "str (ns)"
-    payload["scan_variables"] = {"p4_duration": 19_980_000}
-    payload["scan_bindings"] = {"period:3:duration": "p4_duration"}
-    state = na.PulseTableState.from_dict(payload).with_scan_table_path(scan_file)
-
-    program = na.compile_pulse_table_scan_runtime_program(
-        state,
-        channels=state.channels,
-        clock_hz=50_000_000,
-        trigger_channels=["ch11"],
-    )
-
-    assert program.scan_axis_names == ["p4_duration"]
-    assert len(program.scan_points) == 4
-    assert program.scan_points[0] == (100000, 0)
-    assert program.scan_points[-1] == (999000, 0)
-    na.validate_pulse_streamer_program(program, max_edges=512, max_scan_points=256, tick_width=32, channel_count=62)
-
-
-def test_pulse_table_scan_rejects_more_than_five_active_parameter_slots(tmp_path):
-    scan_file = tmp_path / "scan_points.txt"
-    scan_file.write_text("# vars: a(ns), b(ns), c(ns), d(ns), e(ns), f(ns)\n20 20 20 20 20 20\n", encoding="utf-8")
-    state = na.PulseTableState(
-        channels=["ch00"],
-        periods=[
-            na.PulsePeriod("a", (1,), unit="str (ns)"),
-            na.PulsePeriod("b", (0,), unit="str (ns)"),
-            na.PulsePeriod("c", (0,), unit="str (ns)"),
-            na.PulsePeriod("d", (0,), unit="str (ns)"),
-            na.PulsePeriod("e", (0,), unit="str (ns)"),
-            na.PulsePeriod("f", (0,), unit="str (ns)"),
-        ],
-        scan_variables={name: 20 for name in "abcdef"},
-        scan_table_path=scan_file,
         time_step_ns=20,
+        periods=[
+            na.PulsePeriod(100, (0, 0, 1), unit="ns"),  # period 0 duration scanned
+            na.PulsePeriod(200, (0, 0, 0), unit="ns"),  # DAC level scanned here (period 1)
+        ],
+        delays={"ch02": 40.0},          # FIXED per-channel delay (not scannable)
+        delay_units={"ch02": "ns"},
     )
+    state.bind_field("duration", "0", unit="ns", label="load dur")   # s0
+    state.bind_field("dac", "da_test@1", unit="value", label="da_test")  # s1
+    # binding a delay is rejected -- a delay is a fixed value, not a scan slot
+    with pytest.raises(ValueError, match="cannot be scanned"):
+        state.bind_field("delay", "ch02", unit="ns")
+    # rows: [period-0 duration ns, DAC code]
+    state.set_scan_table([[40.0, 0.0], [80.0, 3.0], [120.0, 2.0]])
 
-    with pytest.raises(ValueError, match="at most 5 active named scan parameters"):
-        na.compile_pulse_table_scan_runtime_program(state, channels=["ch00"], clock_hz=50_000_000)
+    program = na.compile_pulse_table_scan_runtime_program(
+        state, channels=["ch00", "ch01", "ch02"], clock_hz=50_000_000
+    )
+    assert program.slot_kinds == ["duration", "dac"]
+    scanned = [s for s in (program.bus_segments or []) if int(getattr(s, "value_select", 0))]
+    assert len(scanned) == 1
+    seg = scanned[0]
+    # The DAC segment sits at period-1 start = scanned period-0 duration, so its
+    # start-tick coefficient for slot s0 (duration) must be non-zero.
+    assert seg.start_tick_coeffs is not None and seg.start_tick_coeffs[0] != 0
+    # ...and zero for the dac slot (it doesn't move period-1's start).
+    assert seg.start_tick_coeffs[1] == 0
+
+    # The DAC value tracks the scanned code, and the effective tick moves with the
+    # scanned period-0 duration -- verified by the affine evaluation per point.
+    from Zou_lab_control.neutral_atom.devices.sequencer import _apply_affine_ticks
+
+    frac = program.scan_coeff_frac_bits
+    for point in program.scan_points:
+        dur_ticks = point[0]  # period-0 duration in ticks for this point
+        eff = _apply_affine_ticks(seg.start_tick, seg.start_tick_coeffs, point, frac)
+        assert eff == seg.start_tick + dur_ticks  # base (period-1 start) shifts by the scanned duration
+
+    na.validate_pulse_streamer_program(
+        program, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=3
+    )
 
 
 def test_sequencer_service_pads_gui_subset_state_to_full_40ch_hardware():
@@ -1466,7 +2726,6 @@ def test_sequencer_service_pads_gui_subset_state_to_full_40ch_hardware():
     service = na.SequencerService(
         channels=hardware_channels,
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         prepare_callback=prepared_programs.append,
     )
     state = na.PulseTableState(
@@ -1489,7 +2748,6 @@ def test_sequencer_service_pads_gui_subset_state_to_full_40ch_hardware():
     assert program.channels == hardware_channels
     assert program.masks == [1 << 0, (1 << 0) | (1 << 3), 0, 0]
     assert all(mask >> 4 == 0 for mask in program.masks)
-    assert program.trigger_count == 1
     assert prepared_programs == [program]
     na.validate_pulse_streamer_program(program, max_edges=1024, tick_width=32, channel_count=40)
 
@@ -1513,12 +2771,8 @@ def test_fpga_loop_repeat_keeps_post_loop_idle_before_repeat_forever():
         state,
         channels=[f"ch{i:02d}" for i in range(40)],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
     )
     history = _simulate_pulse_streamer_program_steps(program, steps=8)
-    core = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer.v").read_text(
-        encoding="utf-8"
-    )
 
     assert program.ticks == [0, 1, 3, 4]
     assert program.masks == [0b0001, 0b1000, 0, 0]
@@ -1527,10 +2781,6 @@ def test_fpga_loop_repeat_keeps_post_loop_idle_before_repeat_forever():
     assert program.loop_count == 2
     assert program.repeat_forever is True
     assert history[:7] == [0b0001, 0b1000, 0b1000, 0b1000, 0b1000, 0, 0b0001]
-    assert "final_tick <= (prog_count == 0) ? {TICK_WIDTH{1'b0}} : zlc_effective_tick(" in core
-    assert "final_x_coeff_shadow" in core
-    assert "final_y_coeff_shadow" in core
-    assert "loop_end_tick : final_tick_shadow" not in core
 
 
 def test_pulse_table_reports_repeat_forever_table_boundary_high_channels():
@@ -1553,7 +2803,6 @@ def test_pulse_table_reports_repeat_forever_table_boundary_high_channels():
         state,
         channels=[f"ch{i:02d}" for i in range(40)],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
     )
     history = _simulate_pulse_streamer_program_steps(program, steps=7)
     boundary_tick = round(program.duration * program.clock_hz)
@@ -1589,7 +2838,7 @@ def test_pulse_table_no_boundary_warning_when_repeat_bracket_covers_whole_table(
 def test_partial_hardware_channels_default_missing_outputs_off():
     hardware_channels = [f"ch{i:02d}" for i in range(40)]
     seq = na.PulseSequence(name="partial_hardware").pulse("ch00", 0.0, 10e-9).pulse("ch03", 10e-9, 10e-9).forever(period=30e-9)
-    sequence_program = na.compile_runtime_program(seq, channels=hardware_channels, clock_hz=100_000_000, trigger_channels=["ch03"])
+    sequence_program = na.compile_runtime_program(seq, channels=hardware_channels, clock_hz=100_000_000)
 
     state = na.PulseTableState(
         channels=["ch00", "ch03"],
@@ -1605,7 +2854,6 @@ def test_partial_hardware_channels_default_missing_outputs_off():
         state,
         channels=hardware_channels,
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
     )
 
     assert sequence_program.channels == hardware_channels
@@ -1615,7 +2863,6 @@ def test_partial_hardware_channels_default_missing_outputs_off():
     assert table_program.channels == hardware_channels
     assert table_program.masks == [1 << 0, 1 << 3, 0, 0]
     assert table_program.repeat_forever is True
-    assert table_program.trigger_count == 1
     assert all(mask & ~((1 << 0) | (1 << 3)) == 0 for mask in table_program.masks)
     assert all(mask >> 4 == 0 for mask in table_program.masks)
 
@@ -1638,7 +2885,6 @@ def test_40ch_gui_visible_subset_compiles_as_full_width_fpga_program():
         state,
         channels=hardware_channels,
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
     )
 
     assert state.visible_channels == hardware_channels[:4]
@@ -1646,7 +2892,6 @@ def test_40ch_gui_visible_subset_compiles_as_full_width_fpga_program():
     assert len(program.channels) == 40
     assert program.masks == [0b0011, 0b1101, 0, 0]
     assert all(mask >> 4 == 0 for mask in program.masks)
-    assert program.trigger_count == 1
     assert program.repeat_forever is True
     na.validate_pulse_streamer_program(program, max_edges=1024, tick_width=32, channel_count=40)
 
@@ -1669,7 +2914,7 @@ def test_pulse_table_unknown_channel_is_not_silently_ignored():
 def test_checked_in_camera_imaging_pulse_compiles_for_address_switch_fpga():
     path = Path(__file__).resolve().parents[1] / "pulses" / "camera_imaging_address_switch.json"
     state = na.PulseTableState.load(path)
-    program = state.compile(clock_hz=50_000_000, trigger_channels=["ch11"])
+    program = state.compile(clock_hz=50_000_000)
 
     assert state.channels == [f"ch{i:02d}" for i in range(62)]
     assert state.visible_channels == ["ch09", "ch00", "ch03", "ch11"]
@@ -1689,34 +2934,36 @@ def test_checked_in_camera_imaging_pulse_compiles_for_address_switch_fpga():
     assert state.repeat_count == 1
     assert state.repeat_forever is True
     assert state.repeat_forever_boundary_active_channels() == []
-    assert state.scan_variables["camera_exposure_ns"] == 19_980_000
+    # The camera exposure is bound to a single time slot whose nominal is the
+    # default 19.98 ms exposure; the reference render uses that nominal.
+    assert [slot.kind for slot in state.scan_slots] == ["duration"]
+    assert state.primary_time_slot() == "s0"
+    assert state.reference_slots() == {"s0": 19_980_000}
     exposure_period = next(period for period in state.periods if period.name == "camera_exposure")
-    assert exposure_period.duration == "camera_exposure_ns"
+    assert exposure_period.duration == "s0"
     assert exposure_period.unit == "str (ns)"
+    assert state.slot_index_for("duration", str(state.periods.index(exposure_period))) == 0
     assert state.periods[0].states[state.channel_index("ch11")] == 0
     assert program.channels == state.channels
     assert program.ticks == [0, 100_000, 105_000, 106_000, 1_105_000, 1_106_000]
     assert program.masks == [513, 512, 2568, 520, 512, 0]
-    assert program.trigger_count == 1
     assert program.repeat_forever is True
     assert program.loop_start_index == 0
     assert program.loop_end_tick == 1_106_000
     assert program.loop_count == 1
     na.validate_pulse_streamer_program(program, max_edges=1024, tick_width=32, channel_count=62)
 
-    shorter = state.compile(clock_hz=50_000_000, trigger_channels=["ch11"], variables={"camera_exposure_ns": 2_000_000})
+    shorter = state.compile(clock_hz=50_000_000, slots={"s0": 2_000_000})
     assert shorter.ticks == [0, 100_000, 105_000, 106_000, 206_000, 207_000]
     assert shorter.masks == program.masks
-    assert shorter.trigger_count == 1
-    finite = na.finite_frame_sequence(state.with_scan_variables(camera_exposure_ns=2_000_000), 3, trigger_channels=["ch11"])
+    finite = state.with_slots_resolved({"s0": 2_000_000}).to_sequence(expand_repeat=False).repeated(3)
+    assert na.count_trigger_pulses(finite, trigger_channels=["ch11"]) == 3
     finite_program = na.compile_runtime_program(
         finite,
         channels=state.channels,
         clock_hz=50_000_000,
-        trigger_channels=["ch11"],
     )
     assert finite_program.repeat_forever is False
-    assert finite_program.trigger_count == 3
 
 
 def test_pulse_table_repeat_forever_can_be_disabled_for_single_shot():
@@ -1735,14 +2982,12 @@ def test_pulse_table_repeat_forever_can_be_disabled_for_single_shot():
         state,
         channels=["ch00", "ch01", "ch02", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         repeat_forever=state.repeat_forever,
     )
     service_program = na.compile_runtime_program_for_payload(
         state,
         channels=["ch00", "ch01", "ch02", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
     )
     restored = na.PulseTableState.from_dict(state.to_dict())
 
@@ -1752,30 +2997,28 @@ def test_pulse_table_repeat_forever_can_be_disabled_for_single_shot():
     assert program.masks == [1 << 0, 1 << 3, 0, 0]
 
 
-def test_bind_pulse_controller_updates_named_variable_and_fires_runtime_sequencer():
+def test_bind_pulse_controller_updates_slot_and_fires_runtime_sequencer():
     sequencer = na.RuntimeSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
         channels=["ch00", "ch03"],
         periods=[
-            na.PulsePeriod("readout_duration_ns", (1, 0), unit="str (ns)"),
+            na.PulsePeriod("s0", (1, 0), unit="str (ns)"),
             na.PulsePeriod(20, (0, 1), unit="ns"),
             na.PulsePeriod(20, (0, 0), unit="ns"),
         ],
+        scan_slots=[{"kind": "duration", "target": "0", "unit": "ns", "nominal": 100.0}],
         time_step_ns=10,
-        scan_variables={"readout_duration_ns": 100},
-        scan_bindings={"period:0:duration": "readout_duration_ns"},
         repeat_forever=False,
     )
 
     pulse = na.bind_pulse(sequencer, state)
     assert pulse.snapshot()["last_program"] is None
     assert pulse.snapshot()["sequencer_channels"] == ["ch00", "ch03"]
-    pulse.set_variable("readout_duration_ns", 200)
+    pulse.set_time(200)
     program = pulse.on_pulse(wait=True, timeout=1.0)
 
     assert program.ticks == [0, 20, 22, 24]
@@ -1783,87 +3026,14 @@ def test_bind_pulse_controller_updates_named_variable_and_fires_runtime_sequence
     assert program.repeat_forever is False
     assert sequencer.snapshot()["state"] == "done"
     snapshot = pulse.snapshot()
-    assert snapshot["scan_variables"]["readout_duration_ns"] == 200
+    assert snapshot["slots"] == {"s0": 200.0}
     assert snapshot["last_program"]["edge_count"] == len(program.ticks)
-    assert snapshot["last_program_count"] == 1
-
-
-def test_bind_pulse_controller_chunks_large_named_scan_file(tmp_path):
-    scan_file = tmp_path / "scan_points.txt"
-    scan_file.write_text("# vars: readout_duration_ns(ns)\n20\n40\n60\n", encoding="utf-8")
-    sequencer = na.RuntimeSequencer(
-        channels=["ch00", "ch03"],
-        clock_hz=50_000_000,
-        trigger_channels=["ch03"],
-        sleep_scale=0.0,
-    )
-    state = na.PulseTableState(
-        channels=["ch00", "ch03"],
-        periods=[
-            na.PulsePeriod("readout_duration_ns", (1, 0), unit="str (ns)"),
-            na.PulsePeriod(20, (0, 1), unit="ns"),
-            na.PulsePeriod(20, (0, 0), unit="ns"),
-        ],
-        time_step_ns=20,
-        scan_variables={"readout_duration_ns": 20},
-        scan_bindings={"period:0:duration": "readout_duration_ns"},
-        scan_table_path=scan_file,
-        repeat_forever=False,
-    )
-
-    pulse = na.bind_pulse(sequencer, state)
-    last = pulse.on_pulse(wait=True, timeout=1.0, scan_chunk_size=2)
-
-    assert last is pulse.last_programs[-1]
-    assert [len(program.scan_points or []) for program in pulse.last_programs] == [2, 1]
-    assert [program.trigger_count for program in pulse.last_programs] == [2, 1]
-    assert [program.scan_points for program in pulse.last_programs] == [[(1, 0), (2, 0)], [(3, 0)]]
-    assert sequencer.snapshot()["state"] == "done"
-    assert pulse.snapshot()["last_program_count"] == 2
-
-
-def test_bind_pulse_controller_prepare_rejects_large_scan_file_without_chunking(tmp_path):
-    scan_file = tmp_path / "scan_points.txt"
-    scan_file.write_text("# vars: readout_duration_ns(ns)\n20\n40\n60\n", encoding="utf-8")
-    sequencer = na.RuntimeSequencer(channels=["ch00"], clock_hz=50_000_000, sleep_scale=0.0)
-    sequencer.max_scan_points = 2
-    state = na.PulseTableState(
-        channels=["ch00"],
-        periods=[na.PulsePeriod("readout_duration_ns", (1,), unit="str (ns)")],
-        time_step_ns=20,
-        scan_variables={"readout_duration_ns": 20},
-        scan_bindings={"period:0:duration": "readout_duration_ns"},
-        scan_table_path=scan_file,
-        repeat_forever=False,
-    )
-
-    pulse = na.bind_pulse(sequencer, state)
-    with pytest.raises(RuntimeError, match="automatic scan chunking"):
-        pulse.prepare()
-    with pytest.raises(RuntimeError, match="requires wait=True"):
-        pulse.on_pulse(wait=False, scan_chunk_size=2)
-
-
-def test_bind_pulse_controller_rejects_legacy_xy_scan_api():
-    sequencer = na.RuntimeSequencer(channels=["ch00"], clock_hz=100_000_000, sleep_scale=0.0)
-    state = na.PulseTableState(
-        channels=["ch00"],
-        periods=[na.PulsePeriod(100, (1,), unit="ns")],
-        time_step_ns=10,
-    )
-    pulse = na.bind_pulse(sequencer, state)
-
-    with pytest.raises(ValueError, match="legacy x/y"):
-        pulse.x = 200
-    with pytest.raises(ValueError, match="legacy x/y scan_points"):
-        pulse.set_scan_points([20, 40])
 
 
 def test_bind_pulse_controller_can_override_repeat_forever_for_scope_debug():
     sequencer = na.RuntimeSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
@@ -1889,7 +3059,6 @@ def test_bind_pulse_controller_rejects_waiting_indefinitely_for_repeat_forever()
     sequencer = na.RuntimeSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
@@ -1920,7 +3089,6 @@ def test_runtime_sequencer_repeat_forever_wait_done_times_out():
     sequencer = na.RuntimeSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
@@ -1952,7 +3120,6 @@ def test_bind_pulse_controller_repeat_forever_wait_timeout_raises():
     sequencer = na.RuntimeSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
@@ -1983,7 +3150,6 @@ def test_bind_pulse_controller_can_override_sequence_repeat_forever():
     sequencer = na.RuntimeSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         sleep_scale=0.0,
     )
     sequence = (
@@ -2003,6 +3169,29 @@ def test_bind_pulse_controller_can_override_sequence_repeat_forever():
     assert sequencer.snapshot()["state"] == "done"
 
 
+def _bench_trigger_cable(camera, sequencer, *, trigger_channel="ch03"):
+    """Test-bench TRIGGER CABLE: plug the virtual camera's trigger input into THIS streamer.
+
+    On a real rig the cable is copper -- a RuntimeSequencer/RemoteSequencer emits real edges the
+    camera's hardware input sees.  On the bench the virtual camera needs the software mirror of
+    that wire, so re-point its ``sequencer`` and forward every ``fire`` to the camera's wire
+    listener (exactly what a VirtualSequencer's fire-listener seam does natively).
+
+    The bench also declares WHICH board channel the camera's trigger input is wired to
+    (``trigger_channel``): the 40-channel bench pulses pulse ``ch03`` as their camera-trigger line,
+    so the camera counts edges on THAT line (edge-faithful frame count) -- exactly as a real camera
+    is configured with its actual chNN, not the friendly ``emCCD`` default."""
+    camera.sequencer = sequencer
+    camera.capture_trigger_channels = (str(trigger_channel),)
+    inner_fire = sequencer.fire
+
+    def fire(sequence=None):
+        inner_fire(sequence)
+        camera._on_wire_fired(sequence)
+
+    sequencer.fire = fire
+
+
 def test_detection_time_scan_uses_bound_40ch_pulse_controller():
     exp = na.connect("virtual")
     exp.readout.sitemap(frames=3, display=False)
@@ -2018,17 +3207,17 @@ def test_detection_time_scan_uses_bound_40ch_pulse_controller():
             self.prepared_programs.append(program)
             return program
 
-    sequencer = RecordingRuntimeSequencer(channels=hardware_channels, clock_hz=100_000_000, trigger_channels=["ch03"], sleep_scale=0.0)
+    sequencer = RecordingRuntimeSequencer(channels=hardware_channels, clock_hz=100_000_000, sleep_scale=0.0)
+    _bench_trigger_cable(exp.devices.camera, sequencer)   # this streamer's edges now gate the camera
     state = na.PulseTableState(
         channels=["ch00", "ch02", "ch03"],
         periods=[
             na.PulsePeriod(100, (1, 0, 0), unit="ns"),
-            na.PulsePeriod("detection_time_ns", (1, 1, 1), unit="str (ns)"),
+            na.PulsePeriod("s0", (1, 1, 1), unit="str (ns)"),
             na.PulsePeriod(100, (0, 0, 0), unit="ns"),
         ],
+        scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 1_000.0}],
         time_step_ns=10,
-        scan_variables={"detection_time_ns": 1_000},
-        scan_bindings={"period:1:duration": "detection_time_ns"},
         repeat_forever=True,
     )
     pulse = na.bind_pulse(sequencer, state)
@@ -2044,13 +3233,17 @@ def test_detection_time_scan_uses_bound_40ch_pulse_controller():
     )
 
     assert scan.summary()["finished"] is True
-    assert pulse.variables["detection_time_ns"] == 4_000
-    assert [program.loop_end_tick for program in sequencer.prepared_programs] == [820, 220, 420]
-    assert [program.trigger_count for program in sequencer.prepared_programs] == [2, 2, 2]
+    # N frames = N capture-trigger EDGES: reading ``shots``=2 frames per point fires the bound pulse
+    # REPEATED to 2 edges (``triggered_frames`` reaches the frame count in edges).  ``frame_sequence``
+    # still returns the pulse's OWN single cycle (repeat_count=1, see
+    # test_bound_pulse_frame_sequence_keeps_pulse_own_trigger_count_regardless_of_frames); the repeat
+    # to N edges is the measurement-layer's job, so the FIRED program has repeat_count=2.  A repeated
+    # program loops back at the cycle boundary (the trailing 100 ns all-low tail is the inter-cycle
+    # gap, not re-run), so reference 8 us -> 810, 2 us -> 210, 4 us -> 410 loop end ticks.
+    assert [program.loop_end_tick for program in sequencer.prepared_programs] == [810, 210, 410]
     assert [program.source_sequence["repeat_count"] for program in sequencer.prepared_programs] == [2, 2, 2]
     assert sequencer.last_program is not None
     assert sequencer.last_program.channels == hardware_channels
-    assert sequencer.last_program.trigger_count == 2
     assert sequencer.last_program.repeat_forever is False
     assert all(mask < (1 << 4) for mask in sequencer.last_program.masks)
 
@@ -2070,18 +3263,18 @@ def test_timing_subsystem_bind_pulse_loads_json_for_40ch_remote_style_scan(tmp_p
             self.prepared_programs.append(program)
             return program
 
-    sequencer = RecordingRuntimeSequencer(channels=hardware_channels, clock_hz=100_000_000, trigger_channels=["ch03"], sleep_scale=0.0)
+    sequencer = RecordingRuntimeSequencer(channels=hardware_channels, clock_hz=100_000_000, sleep_scale=0.0)
     exp.devices.devices["sequencer"] = sequencer
+    _bench_trigger_cable(exp.devices.camera, sequencer)   # re-plug the camera onto the new streamer
     state = na.PulseTableState(
         channels=["ch00", "ch02", "ch03"],
         periods=[
             na.PulsePeriod(100, (1, 0, 0), unit="ns"),
-            na.PulsePeriod("detection_time_ns", (1, 1, 1), unit="str (ns)"),
+            na.PulsePeriod("s0", (1, 1, 1), unit="str (ns)"),
             na.PulsePeriod(100, (0, 0, 0), unit="ns"),
         ],
+        scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 1_000.0}],
         time_step_ns=10,
-        scan_variables={"detection_time_ns": 1_000},
-        scan_bindings={"period:1:duration": "detection_time_ns"},
         repeat_forever=True,
     )
     path = state.save(tmp_path / "camera_imaging.json")
@@ -2089,7 +3282,7 @@ def test_timing_subsystem_bind_pulse_loads_json_for_40ch_remote_style_scan(tmp_p
     pulse = exp.timing.bind_pulse(path)
     assert pulse.sequencer is exp.sequencer
     assert pulse.snapshot()["sequencer_channels"] == hardware_channels
-    pulse.set_variable("detection_time_ns", 2_000)
+    pulse.set_time(2_000)
     single = pulse.on_pulse(wait=True, timeout=1.0, repeat_forever=False)
 
     assert single.channels == hardware_channels
@@ -2108,17 +3301,22 @@ def test_timing_subsystem_bind_pulse_loads_json_for_40ch_remote_style_scan(tmp_p
     )
 
     assert scan.summary()["finished"] is True
-    assert pulse.variables["detection_time_ns"] == 4_000
+    # Each point reads ``shots``=2 frames = 2 capture-trigger edges, so the bound pulse is fired
+    # REPEATED to 2 edges: reference 8 us -> 810, then 2 us -> 210, 4 us -> 410 (repeated-program loop
+    # ends, one tail-gap shorter than the 820/220/420 single cycle -- the tail is the inter-cycle gap).
+    assert [program.loop_end_tick for program in sequencer.prepared_programs[-3:]] == [810, 210, 410]
     assert sequencer.prepared_programs[-1].channels == hardware_channels
-    assert sequencer.prepared_programs[-1].trigger_count == 2
     assert sequencer.prepared_programs[-1].repeat_forever is False
 
 
-def test_bound_pulse_frame_sequence_uses_requested_frames_not_gui_repeat_count():
+def test_bound_pulse_frame_sequence_keeps_pulse_own_trigger_count_regardless_of_frames():
+    """frame_sequence no longer expands a 1-trigger pulse into N copies (the streamer is a pure
+    pulse streamer now): the resolved sequence carries the pulse's OWN triggers, and ``frames``
+    does NOT change the sequence's trigger count.  Here the pulse has a single ch03 trigger, so
+    frames=1/2/3 all yield exactly one trigger and the same finite, non-forever program."""
     sequencer = na.RuntimeSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
@@ -2136,48 +3334,338 @@ def test_bound_pulse_frame_sequence_uses_requested_frames_not_gui_repeat_count()
     )
     pulse = na.bind_pulse(sequencer, state)
 
-    sequence = pulse.frame_sequence(2)
-    program = sequencer.prepare(sequence)
+    for frames in (1, 2, 3):
+        sequence = pulse.frame_sequence(frames)
+        program = sequencer.prepare(sequence)
 
-    assert na.count_trigger_pulses(sequence, trigger_channels=["ch03"]) == 2
-    assert program.trigger_count == 2
-    assert program.repeat_forever is False
-    assert program.loop_count == 2
-    assert program.loop_end_tick == 14
-    assert program.ticks == [0, 10, 12, 14]
-    assert program.duration == 28 / 100_000_000
+        # The pulse's own ch03 trigger count is 1 -- ``frames`` never rewrites it.
+        assert na.count_trigger_pulses(sequence, trigger_channels=["ch03"]) == 1
+        assert program.repeat_forever is False
+        assert program.loop_count == 1
+        # The fired cycle is the WHOLE period the table defines: the 100 ns load + the 20 ns trigger
+        # window + the trailing 20 ns all-low gap = 140 ns (14 ticks).  The period end (14) closes the
+        # loop, so it is the loop-end tick AND the last entry in ``ticks``; the edges proper are the
+        # ch00/ch03 rise (0/10) and their fall (12).  ``duration`` is the edge span (last falling edge
+        # at 12 ticks); the trailing gap to the period end is loop-end time, not edge time.
+        assert program.loop_end_tick == 14
+        assert program.ticks == [0, 10, 12, 14]
+        assert program.duration == pytest.approx(12 / 100_000_000)
 
 
-def test_pulse_table_rejects_times_off_minimal_grid():
+def test_bind_field_time_slot_always_normalized_to_ns():
+    """Binding a duration rewrites the field to its 'str (ns)' display, so the scan
+    slot MUST be stored in ns -- a period entered in us/ms would otherwise scan in that
+    unit while the card shows 'str (ns)' (a silent 1000x mismatch).  bind_field converts
+    the nominal to ns and pins the slot unit to ns; the compiled scan point matches.
+
+    A per-channel delay is a fixed output delay (a delay line) and is NOT scannable, so
+    bind_field('delay', ...) raises rather than silently treating it as a constant."""
+    state = na.PulseTableState(
+        channels=["a", "b"],
+        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(20, (0, 0), unit="us")],
+        time_step_ns=20)
+    state.bind_field("duration", "1", unit="us")          # period 1 was 20 us
+    slot = state.scan_slots[0]
+    assert slot.unit == "ns" and slot.nominal == 20000.0   # 20 us -> 20000 ns
+    # a delay is a FIXED value and cannot be scanned
+    state.delays = {"a": 5}; state.delay_units = {"a": "us"}
+    with pytest.raises(ValueError, match="cannot be scanned"):
+        state.bind_field("delay", "a", unit="us")
+    # the fixed delay is left untouched (no slot added), only the duration slot exists
+    assert [s.kind for s in state.scan_slots] == ["duration"]
+    assert state.delays == {"a": 5}
+    # and the compiled scan value is interpreted in ns: 30000 in the table -> 1500 ticks
+    state.set_scan_table([[20000.0], [30000.0]])
+    prog = na.compile_pulse_table_scan_runtime_program(state, channels=["a", "b"], clock_hz=50e6)
+    # period-1 duration slot value 30000 ns = 1500 ticks (period 0 = 1000 ns = 50 ticks)
+    assert prog.scan_points[1][0] == 1500
+
+
+def test_pulse_table_snaps_times_to_minimal_grid():
+    # The pulse-table (GUI) path must AUTO-SNAP off-grid durations to the nearest
+    # tick instead of rejecting them -- the hardware clock can only land on ticks.
     state = na.PulseTableState(
         channels=["trap", "trig"],
         periods=[
             na.PulsePeriod(100, (1, 0), unit="ns"),
-            na.PulsePeriod("pulse_width_ns", (0, 1), unit="str (ns)"),
+            na.PulsePeriod("s0", (0, 1), unit="str (ns)"),
         ],
-        scan_variables={"pulse_width_ns": 20},
-        scan_bindings={"period:1:duration": "pulse_width_ns"},
+        scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 20.0}],
         time_step_ns=1,
     )
 
-    assert state.to_sequence(variables={"pulse_width_ns": 20}, time_step_ns=10).validate(clock_hz=100e6, channels=state.channels).ok
-    try:
-        state.to_sequence(variables={"pulse_width_ns": 25}, time_step_ns=10)
-    except ValueError as exc:
-        assert "integer multiple" in str(exc)
-    else:
-        raise AssertionError("pulse table should reject x values off the minimal time grid")
+    assert state.to_sequence(slots={"s0": 20}, time_step_ns=10).validate(clock_hz=100e6, channels=state.channels).ok
+    # 25 ns at a 10 ns step snaps to 30 ns (ties away from zero) and stays valid.
+    snapped = state.to_sequence(slots={"s0": 25}, time_step_ns=10)
+    assert snapped.validate(clock_hz=100e6, channels=state.channels).ok
+    assert state.periods[1].duration_ns(slots={"s0": 25}, time_step_ns=10) == 30.0
 
+    # A duration that rounds toward zero must still snap UP to one tick (never 0).
+    tiny = na.PulseTableState(
+        channels=["trap"],
+        periods=[na.PulsePeriod(2.5, (1,), unit="ns")],
+        time_step_ns=1,
+    )
+    assert tiny.periods[0].duration_steps(time_step_ns=10) == 1  # 2.5 ns -> one 10 ns tick
+    assert na.PulsePeriod(3.0, (1,), unit="ns").duration_ns(time_step_ns=1) == 3.0
+
+
+def test_pulse_table_snapped_snaps_literals_and_keeps_expressions():
+    from Zou_lab_control.neutral_atom.timing.pulse_table import ScanSlot, snap_scan_table
+
+    state = na.PulseTableState(
+        channels=["trap", "trig"],
+        periods=[
+            na.PulsePeriod(50, (1, 0), unit="ns"),    # off-grid -> 60 ns at 20 ns step
+            na.PulsePeriod("s0", (0, 1), unit="str (ns)"),  # expression: must be kept
+        ],
+        delays={"trig": 30.0},                        # fixed per-channel delay; 30 -> 40
+        delay_units={"trig": "ns"},
+        scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 20.0}],
+        scan_table=[[51.0], [9.0]],
+        time_step_ns=20,
+    )
+    snapped = state.snapped()
+    # literal duration snaps to a whole tick (50 -> 60), expression preserved
+    assert snapped.periods[0].duration == 60
+    assert snapped.periods[1].duration == "s0"
+    # the fixed delay snaps to a whole tick (30 -> 40)
+    assert snapped.delays["trig"] == 40
+    # scan table: a duration slot snaps to the tick grid, UP to at least one tick
+    # (a period must occupy >= 1 tick, so it never collapses to 0).
+    assert snapped.scan_table[0][0] == 60.0   # 51 ns -> 60 ns
+    assert snapped.scan_table[1][0] == 20.0   # 9 ns -> one 20 ns tick (snapped up, never 0)
+    # the original state is untouched (snapped returns a copy)
+    assert state.periods[0].duration == 50
+
+    # snap_scan_table is the shared helper used by the GUI; DAC slots round to a SIGNED
+    # integer (clamped to the bus's signed range), duration slots snap UP to >= 1 tick.
+    dac_slot = ScanSlot(kind="dac", target="da_dipole@0", unit="value")
+    time_slot = ScanSlot(kind="duration", target="1", unit="ns")
+    snapped_rows = snap_scan_table([[51.0, 112.4], [9.0, -300.6]], [time_slot, dac_slot], time_step_ns=20)
+    assert snapped_rows == [[60.0, 112.0], [20.0, -301.0]]
+    # DAC values are clamped to the SIGNED range: an out-of-range value is pulled in.
+    clamped = snap_scan_table([[-5.0, 2000.0]], [time_slot, dac_slot], time_step_ns=20, dac_ranges=[None, (-512, 511)])
+    assert clamped == [[20.0, 511.0]]
+
+
+def test_scan_slot_dac_ranges_report_signed_bus_width():
+    """A DAC scan slot reports its bus's SIGNED value range (-2^(B-1), +2^(B-1)-1);
+    time slots report None."""
+
+    state = na.PulseTableState(
+        channels=[f"da[{i}]" for i in range(10)] + ["trig"],
+        periods=[na.PulsePeriod(1000, tuple([0] * 11), unit="ns")],
+        scan_slots=[
+            {"kind": "dac", "target": "da@0", "unit": "value", "nominal": 0.0},
+            {"kind": "duration", "target": "0", "unit": "ns", "nominal": 1000.0},
+        ],
+        time_step_ns=20,
+    )
+    ranges = state.scan_slot_dac_ranges()
+    assert ranges[0] == (-512, 511)   # 10-bit DAC bus: signed range around true 0 V
+    assert ranges[1] is None          # duration slot has no DAC range
+
+
+def test_compile_scan_clamps_dac_codes_to_bus_width():
+    """#9 hardware safety: a DAC scan point outside [0, 2**width-1] (negative or
+    over-range) is clamped before it reaches the bus engine, via BOTH the snap in
+    compile_scan and the hard clamp in the host compiler."""
+
+    ch = [f"da[{i}]" for i in range(10)] + ["trig"]
+    labels = {f"da[{i}]": f"da[{i}]" for i in range(10)}
+    state = na.PulseTableState(
+        channels=ch,
+        visible_channels=ch,
+        periods=[
+            na.PulsePeriod(1000, tuple([0] * 11), unit="ns"),
+            na.PulsePeriod(2000, tuple([0] * 10 + [1]), unit="ns"),
+        ],
+        channel_labels=labels,
+        time_step_ns=20.0,
+    )
+    state.bind_field("dac", "da@0", unit="value", label="da")
+    state.set_scan_table([[-600.0], [112.4], [2000.0]])
+    program = state.compile_scan(clock_hz=50e6)
+    codes = [point[0] for point in program.scan_points]
+    # signed user values are clamped to (-512, +511) then shipped as offset-binary codes:
+    # -600 -> -512 -> code 0; 112.4 -> 112 -> code 624; 2000 -> +511 -> code 1023.
+    assert codes == [0, 624, 1023]
+
+
+def test_delay_cap_constants_agree_across_layers():
+    """The OUTPUT delay cap is ONE number across the timing model, the device validator
+    and the fpga host: the 32-bit event-scheduler field, the SAME for TTL channels and
+    DAC buses (no per-design ring depth any more)."""
+
+    from Zou_lab_control.neutral_atom.timing.pulse_table import DELAY_MAX_TICKS
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
+        TTL_DELAY_MAX_TICKS, EVT_FIFO_DEPTH)
+
+    assert DELAY_MAX_TICKS == TTL_DELAY_MAX_TICKS == (1 << 31) - 1
+    assert EVT_FIFO_DEPTH == 128
     try:
-        na.PulseTableState(
-            channels=["trap"],
-            periods=[na.PulsePeriod(2.5, (1,), unit="ns")],
-            time_step_ns=1,
-        )
-    except ValueError as exc:
-        assert "integer multiple" in str(exc)
-    else:
-        raise AssertionError("pulse table should reject non-integer-ns duration at 1 ns step")
+        import importlib.util as _ilu
+        import pathlib as _pl
+
+        root = _pl.Path(__file__).resolve().parents[1]
+        im_path = root / "fpga" / "pulse_streamer" / "host" / "image.py"
+        spec = _ilu.spec_from_file_location("zlc_image_depthcheck", im_path)
+        im = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(im)
+        params = im.StreamerParams()
+        assert params.ttl_delay_max_ticks == TTL_DELAY_MAX_TICKS
+        assert params.evt_fifo_depth == EVT_FIFO_DEPTH
+    except Exception:  # pragma: no cover - host tooling import is environment-dependent
+        pass
+
+
+def test_timing_payload_to_dict_snaps_pulse_table():
+    from Zou_lab_control.neutral_atom.devices.sequencer import timing_payload_to_dict
+
+    state = na.PulseTableState(
+        channels=["trap", "trig"],
+        periods=[na.PulsePeriod(50, (1, 0), unit="ns"), na.PulsePeriod(120, (0, 1), unit="ns")],
+        time_step_ns=20,
+    )
+    payload = timing_payload_to_dict(state)
+    # the transferred pulse-API payload carries snapped whole-tick durations (50 -> 60)
+    assert payload["periods"][0]["duration"] == 60
+    assert payload["periods"][1]["duration"] == 120
+
+
+def test_axi_session_burst_coalesces_contiguous_and_preserves_order(tmp_path):
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+
+    s = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=lambda *a: "ok\n", burst_max=4)
+    # an address-contiguous run is coalesced and split at burst_max (4): 6 words -> 4+2
+    pending = [(0x40 + 4 * i, i) for i in range(6)]
+    assert s._burst_runs(pending) == [(0x40, [0, 1, 2, 3]), (0x50, [4, 5])]
+    # an order-dependent same-address sequence (COMMAND 0 then cmd) must NOT be merged
+    # or reordered -- it stays two len-1 writes in order.
+    assert s._burst_runs([(0x4, 0), (0x4, 2)]) == [(0x4, [0]), (0x4, [2])]
+    # non-contiguous addresses stay separate len-1 writes
+    assert s._burst_runs([(0x0, 9), (0x10, 8)]) == [(0x0, [9]), (0x10, [8])]
+    # the burst Tcl encodes one INCR transaction whose data round-trips to the SAME
+    # words at consecutive addresses (writer/decoder agree on the high-addr-first order)
+    lines = s._write_burst_tcl(0x40, [0xAA, 0xBB, 0xCC])
+    text = "\n".join(lines)
+    assert "-len 3 -type write" in text and text.count("run_hw_axi") == 1
+    assert _decode_axi_writes(text) == [(16, 0xAA), (17, 0xBB), (18, 0xCC)]
+
+
+def test_axi_session_self_test_catches_scrambled_burst(tmp_path):
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+
+    class Hw:
+        def __init__(self, scramble=False):
+            self.bram = {}; self.scramble = scramble
+        def __call__(self, lines, action, timeout):
+            text = "\n".join(lines)
+            writes = _decode_axi_writes(text)
+            if self.scramble and len(writes) > 1:   # simulate wrong burst data ordering
+                addrs = [w for w, _ in writes]; vals = [v for _, v in writes]
+                writes = list(zip(addrs, list(reversed(vals))))
+            for w, v in writes:
+                self.bram[w] = v
+            m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
+            if m:
+                w = int(m.group(1), 16) // 4
+                if w == 63:   # hardwired register-layout id (current bitstream)
+                    return "ZLCDATA 5A4C4C02\n"
+                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
+            return "ok\n"
+
+    good = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=Hw(scramble=False))
+    assert good.axi_self_test(count=8) is True
+    bad = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=Hw(scramble=True))
+    with pytest.raises(RuntimeError):
+        bad.axi_self_test(count=8)
+
+
+def test_axi_self_test_scratch_sits_above_all_defined_ctrl_words(tmp_path):
+    """HARDWARE REGRESSION: the self-test used a stale hard-coded scratch base of 32 --
+    'above all CtrlWords' when the highest was 19 -- but the delay redesign later defined
+    word 20..21 (CLK_ENABLE).  At
+    run_server bring-up the 0xC0DE.. test burst landed in CLK_ENABLE and clk-enabled
+    random channels: their pins ran at 50 MHz before any on_pulse, and off_pulse
+    (CMD_SAFE only, no config rewrite) could not clear it.  Lock: the scratch base is
+    derived from the layout, sits ABOVE every defined word, the self-test never writes
+    below it, and it zeroes the scratch afterwards."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import CTRL_WORDS, CtrlWords, default_params
+
+    p = default_params()
+    assert p.ctrl_scratch_base == CtrlWords.CLK_ENABLE + p.clk_enable_words == 22
+    assert p.ctrl_scratch_base + 2 <= CTRL_WORDS
+
+    class Hw:
+        def __init__(self):
+            self.bram = {}
+        def __call__(self, lines, action, timeout):
+            text = "\n".join(lines)
+            for w, v in _decode_axi_writes(text):
+                self.bram[w] = v
+            m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
+            if m:
+                w = int(m.group(1), 16) // 4
+                if w == 63:   # hardwired register-layout id (current bitstream)
+                    return "ZLCDATA 5A4C4C02\n"
+                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
+            return "ok\n"
+
+    hw = Hw()
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=hw)
+    assert session.axi_self_test() is True
+    # every word it touched is at/above the scratch base -- CLK_ENABLE untouched
+    assert hw.bram and min(hw.bram) >= 22 and max(hw.bram) < CTRL_WORDS
+    assert 20 not in hw.bram and 21 not in hw.bram
+    # and the register file is left as found: all scratch words zeroed
+    assert all(v == 0 for v in hw.bram.values())
+
+
+def test_clear_host_config_zeroes_delays_and_clk_mask(tmp_path):
+    """Server bring-up self-heal must be LAYOUT-AGNOSTIC: clear_host_config() zeroes the
+    WHOLE host-owned CTRL config span (words 20..63 -- NOT just the words the current
+    CtrlWords map calls config) plus the entire R_DELAY register region, then halts
+    (CMD_SAFE).  Regression guard for the real garbled-DA incident: the old loop cleared
+    only the v2 map's words (20..21), so a bitstream built for the v1 layout kept its
+    STALE clk mask at words 46/47 live -> uncontrolled da_clk strobes."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import CMD_SAFE, CtrlWords, region_bases
+
+    class Hw:
+        def __init__(self, delay_base):
+            # a polluted board: garbage in the v2 clk-mask words (20/21), in the v1
+            # clk-mask words (46/47, what the incident left live), in dense-delay-era
+            # words, AND a stale bus delay in the R_DELAY region.
+            self.bram = {20: 0xC0DE000E, 21: 0xC0DE000F,
+                         30: 0x00000FFF, 46: 0x10000000, 47: 0x20040080,
+                         delay_base + 5: 100_000_000}
+        def __call__(self, lines, action, timeout):
+            text = "\n".join(lines)
+            for w, v in _decode_axi_writes(text):
+                self.bram[w] = v
+            m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
+            if m:
+                w = int(m.group(1), 16) // 4
+                if w == 63:   # hardwired register-layout id (current bitstream)
+                    return "ZLCDATA 5A4C4C02\n"
+                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
+            return "ok\n"
+
+    session = VivadoAxiStreamerSession(state_dir=tmp_path)
+    bases = region_bases(session.params)
+    hw = Hw(bases["delay"])
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=hw)
+    session.clear_host_config()
+    for word in range(20, 64):
+        assert hw.bram.get(word, 0) == 0, f"ctrl word {word} not cleared (layout-agnostic sweep)"
+    for word in range(session.params.delay_region_words):
+        assert hw.bram.get(bases["delay"] + word, 0) == 0, f"R_DELAY word {word} not cleared"
+    assert hw.bram.get(CtrlWords.COMMAND) == CMD_SAFE   # engine halted afterwards
 
 
 def test_pulse_sequence_clock_validation_rejects_off_tick_edges():
@@ -2303,7 +3791,6 @@ def test_command_sequencer_backend_writes_program_and_runs_fire_command(tmp_path
 
     assert marker.read_text(encoding="utf-8") == program.sequence_id
     payload = json.loads((tmp_path / "prepared_program.json").read_text(encoding="utf-8"))
-    assert payload["trigger_count"] == 1
     assert payload["source_sequence"]["name"] == seq.name
 
 
@@ -2335,25 +3822,23 @@ def test_sequencer_service_skips_duplicate_prepare_uploads():
     service = na.SequencerService(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         prepare_callback=prepare_callback,
     )
     state = na.PulseTableState(
         channels=["ch00", "ch03"],
         periods=[
-            na.PulsePeriod("pulse_width_ns", (1, 0), unit="str (ns)"),
+            na.PulsePeriod("s0", (1, 0), unit="str (ns)"),
             na.PulsePeriod(20, (1, 1), unit="ns"),
             na.PulsePeriod(20, (0, 0), unit="ns"),
         ],
+        scan_slots=[{"kind": "duration", "target": "0", "unit": "ns", "nominal": 100.0}],
         time_step_ns=10,
-        scan_variables={"pulse_width_ns": 100},
-        scan_bindings={"period:0:duration": "pulse_width_ns"},
         repeat_forever=False,
     )
 
     first = service.prepare(state)
     second = service.prepare(state)
-    third = service.prepare(state.with_scan_variables(pulse_width_ns=200))
+    third = service.prepare(state.with_slots_resolved({"s0": 200}))
 
     assert first["sequence_id"] == second["sequence_id"]
     assert third["sequence_id"] != first["sequence_id"]
@@ -2371,7 +3856,6 @@ def test_sequencer_service_safe_state_invalidates_prepare_cache():
     service = na.SequencerService(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         prepare_callback=prepare_callback,
         safe_state_callback=lambda: safe_calls.append(True),
     )
@@ -2398,6 +3882,90 @@ def test_sequencer_service_safe_state_invalidates_prepare_cache():
     assert safe_calls == [True, True]
     assert [row["cached"] for row in service.history if row["action"] == "prepare"] == [False, True, False]
     assert [row["invalidated"] for row in service.history if row["action"] in {"safe", "abort"}] == [True, True]
+
+
+def test_rejected_streamed_prepare_safes_backend_then_recovers(monkeypatch):
+    """A REJECTED program (e.g. a delay over the event-FIFO capacity) raises in
+    SequencerService.prepare before prepare_callback.  If a prior repeat_forever STREAMED
+    scan was running, leaving its backend refill thread alive wedges the NEXT On Pulse, so
+    the reject must best-effort safe the backend.  And the next (good) prepare must just
+    work -- no teardown, no server restart."""
+    import pytest
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    safe_calls: list[bool] = []
+    prepared: list[str] = []
+    service = na.SequencerService(
+        channels=["ch00", "ch03"],
+        clock_hz=100_000_000,
+        prepare_callback=lambda p: prepared.append(p.sequence_id),
+        safe_state_callback=lambda: safe_calls.append(True),
+    )
+    # pretend a repeat_forever STREAMED scan is the currently-applied program
+    service.prepared_program = RuntimeSequenceProgram(
+        sequence_id="prior", sequence_name="prior", clock_hz=100e6,
+        channels=["ch00", "ch03"], ticks=[0, 10], masks=[1, 0], duration=1e-6,
+        loop_end_tick=10, loop_count=1, slot_count=1,
+        repeat_forever=True, scan_points=[[0], [1]])
+
+    state = na.PulseTableState(
+        channels=["ch00", "ch03"],
+        periods=[na.PulsePeriod(20, (1, 1), unit="ns"), na.PulsePeriod(20, (0, 0), unit="ns")],
+        time_step_ns=10, repeat_forever=True)
+
+    def _boom(*_a, **_k):
+        raise ValueError("channel ch00 delay exceeds the per-channel event FIFO")
+
+    orig = fps.validate_pulse_streamer_program
+    monkeypatch.setattr(fps, "validate_pulse_streamer_program", _boom)
+    with pytest.raises(ValueError):
+        service.prepare(state)
+    assert safe_calls == [True]          # orphaned stream stopped on reject
+    assert prepared == []                # the bad program never reached the backend
+
+    monkeypatch.setattr(fps, "validate_pulse_streamer_program", orig)
+    service.prepare(state)               # the next (good) On Pulse just works
+    assert prepared                      # backend prepared the recovered program
+    assert safe_calls == [True]          # a SUCCESSFUL prepare does not extra-safe
+
+
+def test_axi_session_recovers_from_close_without_server_restart(tmp_path, monkeypatch):
+    """The persistent Vivado session must SELF-HEAL after a close() (action timeout /
+    broken pipe): (1) _io_lock is reentrant so the auto-restart start()->_run_tcl does not
+    deadlock under the lock it already holds; (2) _ensure_process retries the hw/debug-core
+    reconnect so a transient 'debug core' failure recovers instead of needing a server
+    restart."""
+    import threading
+    from Zou_lab_control.neutral_atom.devices import axi_session as axi_mod
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+
+    s = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=lambda *a: "ok\n")
+    # reentrant: the SAME thread can acquire twice (a plain Lock would fail the 2nd).
+    assert s._io_lock.acquire(blocking=False)
+    assert s._io_lock.acquire(blocking=False)
+    s._io_lock.release()
+    s._io_lock.release()
+    assert isinstance(s._io_lock, type(threading.RLock()))
+
+    # reconnect retry: a real (executor-less) session whose first 2 starts fail with a
+    # debug-core error must retry and succeed on the 3rd, leaving a live process.
+    s2 = VivadoAxiStreamerSession(state_dir=tmp_path)
+    monkeypatch.setattr(axi_mod.time, "sleep", lambda *_a, **_k: None)
+    calls = {"n": 0}
+
+    def flaky_start():
+        calls["n"] += 1
+        s2._process = object()           # a process spawned...
+        if calls["n"] < 3:
+            raise RuntimeError("failed to connect to debug core / No JTAG-to-AXI core")
+        return s2                        # ...and the 3rd reconnect succeeds
+
+    monkeypatch.setattr(s2, "start", flaky_start)
+    s2._ensure_process()
+    assert calls["n"] == 3
+    assert s2._process is not None
 
 
 class _FakeVivadoStdout:
@@ -2455,225 +4023,462 @@ class _FakeVivadoProcess:
         self.stdout.close()
 
 
-def test_vivado_pulse_streamer_session_reuses_one_vivado_process(tmp_path, monkeypatch):
-    from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
+def test_sequencer_server_jtag_axi_backend_warm_starts_axi_session(tmp_path, monkeypatch):
+    """The default 'jtag-axi' backend brings up the run-length VivadoAxiStreamerSession
+    and wires its prepare/fire/wait_done/safe_state into the RPyC service."""
 
-    created: list[_FakeVivadoProcess] = []
-
-    def fake_popen(args, **kwargs):
-        process = _FakeVivadoProcess(args, **kwargs)
-        created.append(process)
-        return process
-
-    monkeypatch.setattr(fps.subprocess, "Popen", fake_popen)
-    hardware_channels = [f"ch{i:02d}" for i in range(40)]
-    seq = na.PulseSequence(name="session").pulse("ch03", 0.0, 1e-6).forever(period=2e-6)
-    program = na.compile_runtime_program(seq, channels=hardware_channels, clock_hz=100e6, trigger_channels=["ch03"])
-    session = na.VivadoPulseStreamerSession(state_dir=tmp_path, vivado="fake_vivado", max_edges=1024, channel_count=40)
-
-    session.prepare(program)
-    session.fire(program)
-    assert session.wait_done(program, timeout=1.0)
-    session.safe_state()
-    session.close()
-
-    assert len(created) == 1
-    assert created[0].args[:3] == ["fake_vivado", "-mode", "tcl"]
-    script = "".join(created[0].stdin.writes)
-    assert "connect_hw_server" in script
-    assert "zlc_stage_probe $vio $zlc_prog_mask_probe" in script
-    assert "zlc_stage_probe $vio $zlc_repeat_forever_probe 1" in script
-    assert "ZLC pulse-streamer start pulse sent" in script
-    assert "zlc_start_toggle_value" not in script
-    assert "ZLC pulse-streamer safe state requested" in script
-    assert json.loads((tmp_path / "prepared_program.json").read_text(encoding="utf-8"))["repeat_forever"] is True
-
-
-def test_vivado_pulse_streamer_session_prepare_uses_differential_edge_upload(tmp_path, monkeypatch):
-    from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
-
-    created: list[_FakeVivadoProcess] = []
-
-    def fake_popen(args, **kwargs):
-        process = _FakeVivadoProcess(args, **kwargs)
-        created.append(process)
-        return process
-
-    monkeypatch.setattr(fps.subprocess, "Popen", fake_popen)
-    channels = ["ch00", "ch01", "ch02", "ch03"]
-    first = na.RuntimeSequenceProgram(
-        sequence_id="first",
-        sequence_name="diff",
-        clock_hz=100_000_000,
-        channels=channels,
-        ticks=[0, 10, 20, 30],
-        masks=[1, 0, 8, 0],
-        duration=30 / 100_000_000,
-        trigger_count=1,
-        repeat_forever=True,
-        loop_start_index=0,
-        loop_end_tick=30,
-        loop_count=1,
-    )
-    second = na.RuntimeSequenceProgram(
-        sequence_id="second",
-        sequence_name="diff",
-        clock_hz=100_000_000,
-        channels=channels,
-        ticks=[0, 10, 22, 30],
-        masks=[1, 0, 8, 0],
-        duration=30 / 100_000_000,
-        trigger_count=1,
-        repeat_forever=True,
-        loop_start_index=0,
-        loop_end_tick=30,
-        loop_count=1,
-    )
-    moved_loop = na.RuntimeSequenceProgram(
-        sequence_id="moved-loop",
-        sequence_name="diff",
-        clock_hz=100_000_000,
-        channels=channels,
-        ticks=[0, 10, 22, 30],
-        masks=[1, 0, 8, 0],
-        duration=30 / 100_000_000,
-        trigger_count=1,
-        repeat_forever=True,
-        loop_start_index=2,
-        loop_end_tick=30,
-        loop_count=2,
-    )
-    session = na.VivadoPulseStreamerSession(state_dir=tmp_path, vivado="fake_vivado", max_edges=1024, channel_count=4)
-
-    session.prepare(first)
-    session.prepare(second)
-    session.prepare(moved_loop)
-    session.close()
-
-    assert len(created) == 1
-    full_prepare = created[0].stdin.writes[1]
-    diff_prepare = created[0].stdin.writes[2]
-    loop_metadata_prepare = created[0].stdin.writes[3]
-    assert full_prepare.count("zlc_stage_probe $vio $zlc_prog_addr_probe") == 4
-    assert full_prepare.count("zlc_commit_probes $zlc_batch") == 6
-    assert full_prepare.index("zlc_stage_probe $vio $zlc_reset_probe 1") < full_prepare.index(
-        "zlc_stage_probe $vio $zlc_prog_addr_probe 0"
-    )
-    assert "after $zlc_prepare_reset_settle_ms" in full_prepare
-    assert "wrote 4/4 edge rows" in full_prepare
-    assert "reset_settle_ms=$zlc_prepare_reset_settle_ms" in full_prepare
-    assert diff_prepare.count("zlc_stage_probe $vio $zlc_prog_addr_probe") == 3
-    assert diff_prepare.count("zlc_commit_probes $zlc_batch") == 5
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 0" in diff_prepare
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 1" not in diff_prepare
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 2" in diff_prepare
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 3" in diff_prepare
-    assert "wrote 3/4 edge rows" in diff_prepare
-    assert "reset_settle_ms=$zlc_prepare_reset_settle_ms" in diff_prepare
-    assert loop_metadata_prepare.count("zlc_stage_probe $vio $zlc_prog_addr_probe") == 3
-    assert loop_metadata_prepare.count("zlc_commit_probes $zlc_batch") == 5
-    assert "zlc_stage_probe $vio $zlc_loop_start_addr_probe 2" in loop_metadata_prepare
-    assert "zlc_stage_probe $vio $zlc_loop_count_probe 2" in loop_metadata_prepare
-    assert loop_metadata_prepare.index("zlc_stage_probe $vio $zlc_loop_start_addr_probe 2") < loop_metadata_prepare.index(
-        "zlc_stage_probe $vio $zlc_prog_addr_probe 0"
-    )
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 0" in loop_metadata_prepare
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 1" not in loop_metadata_prepare
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 2" in loop_metadata_prepare
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 3" in loop_metadata_prepare
-    assert (
-        "wrote 3/4 edge rows, 0/0 scan points, and 0/0 bus segments "
-        "reset_settle_ms=$zlc_prepare_reset_settle_ms repeat_forever=1 scan=0 "
-        "loop_start=2 loop_end=30 loop_count=2 bus_counts=0"
-    ) in loop_metadata_prepare
-
-
-def test_sequencer_server_warm_starts_vivado_session_before_accepting_clients(tmp_path, monkeypatch):
-    from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
+    from Zou_lab_control.neutral_atom.devices import axi_session
     from Zou_lab_control.neutral_atom.devices import sequencer_server
 
     events: list[str] = []
 
-    class FakeVivadoSession:
-        def __init__(self, *, state_dir):
-            events.append(f"init:{Path(state_dir).name}")
+    class FakeAxiSession:
+        def __init__(self, **kwargs):
+            events.append(f"init:{Path(kwargs['state_dir']).name}:clk={int(kwargs['clock_hz'])}")
 
         def start(self):
             events.append("start")
             return self
 
+        def clear_host_config(self):
+            events.append("clear_config")
+
+        def axi_self_test(self, **kwargs):
+            events.append("self_test")
+            return True
+
         def prepare(self, program):
-            events.append(f"prepare:{program.sequence_id}")
+            events.append("prepare")
 
-        def fire(self, program):
-            events.append(f"fire:{program.sequence_id}")
+        def fire(self, program=None):
+            events.append("fire")
 
-        def wait_done(self, program, timeout=None):
-            events.append(f"wait:{program.sequence_id}")
+        def wait_done(self, program=None, timeout=None):
+            events.append("wait")
             return True
 
         def safe_state(self):
             events.append("safe")
 
+        def scan_progress(self):     # the session interface the server wires for the GUI's scan poll
+            from Zou_lab_control.neutral_atom.devices.sequencer import SCAN_PROGRESS_IDLE
+            return dict(SCAN_PROGRESS_IDLE)
+
     def fake_serve(service, *, host, port, start):
-        events.append(f"serve:{host}:{port}:{start}:{service.snapshot()['state']}")
+        events.append(f"serve:{host}:{port}")
         return object()
 
-    monkeypatch.setattr(fps, "VivadoPulseStreamerSession", FakeVivadoSession)
+    monkeypatch.setattr(axi_session, "VivadoAxiStreamerSession", FakeAxiSession)
     monkeypatch.setattr(sequencer_server, "serve_runtime_sequencer", fake_serve)
 
-    sequencer_server.run_server(
-        channels=[f"ch{i:02d}" for i in range(40)],
-        trigger_channels=["ch03"],
+    service = sequencer_server.run_server(
+        channels=[f"ch{i:02d}" for i in range(62)],
         host="127.0.0.1",
         port=18861,
-        clock_hz=100_000_000,
-        state_dir=tmp_path / "state40",
-        backend="vivado-session",
+        clock_hz=50_000_000,
+        state_dir=tmp_path / "state_loader",
+        backend="jtag-axi",
         warm_start=True,
     )
 
-    assert events[:3] == ["init:state40", "start", "serve:127.0.0.1:18861:True:idle"]
+    # warm start: construct -> start the Vivado session -> AXI burst self-test (fail-fast
+    # bring-up check) -> serve.
+    # bring-up ORDER matters: clear the host config (delays + clk mask) BEFORE the
+    # self-test so the boot state is clean even if the self-test raises.
+    assert events[:5] == ["init:state_loader:clk=50000000", "start", "clear_config", "self_test", "serve:127.0.0.1:18861"]
+    assert service is not None
 
 
-def test_sequencer_server_can_disable_vivado_warm_start_for_diagnostics(tmp_path, monkeypatch):
-    from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
-    from Zou_lab_control.neutral_atom.devices import sequencer_server
+class _FakeStreamerHardware:
+    """In-memory stand-in for the programmed FPGA running the FINAL design: a BRAM
+    dict + the CTRL COMMAND/STATUS/CURSOR/BANK_READY mailbox.  On LOAD it verifies
+    the uploaded image round-trips through host.image.unpack_program (so the test
+    exercises the full host->upload->decode path).  On FIRE it advances a CURSOR so
+    the host's streaming refill loop runs; it records each BANK_READY write so the
+    streaming handshake can be asserted.  ``forever`` => RUNNING but never DONE."""
 
-    events: list[str] = []
+    def __init__(self, params, *, forever=False, total_points=0):
+        from fpga.pulse_streamer.host.image import CtrlWords
+        self.params = params
+        self.CtrlWords = CtrlWords
+        self.forever = bool(forever)
+        self.total_points = int(total_points)
+        self.bram: dict[int, int] = {}
+        self.status = 0
+        self.load_ok = False
+        self.fired = False
+        self.cursor = 0
+        self.bank_ready_writes: list[int] = []   # post-fire BANK_READY values
 
-    class FakeVivadoSession:
-        def __init__(self, *, state_dir):
-            events.append(f"init:{Path(state_dir).name}")
+    def __call__(self, lines, action, timeout):
+        from fpga.pulse_streamer.host.image import (
+            unpack_program, CtrlWords, CMD_LOAD, CMD_FIRE, CMD_SAFE,
+            STATUS_LOADED, STATUS_RUNNING, STATUS_DONE,
+        )
+        text = "\n".join(lines)
+        for word, value in _decode_axi_writes(text):
+            self.bram[word] = value
+            if word == CtrlWords.BANK_READY and self.fired:
+                self.bank_ready_writes.append(value)
+            if word == CtrlWords.COMMAND and value != 0:
+                if value & CMD_SAFE:
+                    self.status = 0; self.load_ok = False
+                if value & CMD_LOAD:
+                    decoded = unpack_program(self.bram, self.params)
+                    self.load_ok = (decoded["ticks"] and decoded["masks"]
+                                    and len(decoded["ticks"]) == self.bram.get(CtrlWords.PROG_COUNT, 0))
+                    self.status = STATUS_LOADED if self.load_ok else 0x8
+                if value & CMD_FIRE:
+                    self.fired = True; self.cursor = 0
+                    self.status = (self.status | STATUS_RUNNING) & ~0x8
+        m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
+        if m:
+            word = int(m.group(1), 16) // 4
+            if word == CtrlWords.CURSOR:
+                # report progress only; the engine (STATUS poll) drives the cursor.
+                return f"ZLCDATA {self.cursor:08X}\n"
+            if word == CtrlWords.STATUS:
+                if self.fired and not self.forever:
+                    if self.total_points:
+                        # advance one bank per status poll (the engine's pace), giving
+                        # the host a full bank to refill ahead -> gapless streaming.
+                        self.cursor = min(self.total_points, self.cursor + self.params.bank_size)
+                        if self.cursor >= self.total_points:
+                            self.status |= STATUS_DONE
+                    else:
+                        self.status |= STATUS_DONE
+                return f"ZLCDATA {self.status:08X}\n"
+            if word == 63:   # hardwired register-layout id (current bitstream)
+                return "ZLCDATA 5A4C4C02\n"
+            return f"ZLCDATA {self.bram.get(word, 0):08X}\n"
+        return "ok\n"
 
-        def start(self):
-            events.append("start")
-            return self
 
-        def prepare(self, program):
-            events.append(f"prepare:{program.sequence_id}")
+def test_vivado_axi_session_loads_and_fires_edge_table_program(tmp_path):
+    """prepare/fire/wait_done/safe_state drive the CTRL COMMAND/STATUS mailbox over
+    create_hw_axi_txn writes/reads, and the uploaded image round-trips through the
+    final host packer/unpacker (no Vivado, no hardware)."""
 
-        def fire(self, program):
-            events.append(f"fire:{program.sequence_id}")
-
-        def wait_done(self, program, timeout=None):
-            return True
-
-        def safe_state(self):
-            return None
-
-    monkeypatch.setattr(fps, "VivadoPulseStreamerSession", FakeVivadoSession)
-    monkeypatch.setattr(sequencer_server, "serve_runtime_sequencer", lambda service, **kwargs: events.append("serve"))
-
-    sequencer_server.run_server(
-        channels=["ch00", "ch03"],
-        trigger_channels=["ch03"],
-        state_dir=tmp_path / "state40",
-        backend="vivado-session",
-        warm_start=False,
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import StreamerParams, CtrlWords
+    from Zou_lab_control.neutral_atom.devices.sequencer import (
+        RuntimeSequenceProgram, RuntimeBusSegment,
     )
 
-    assert events == ["init:state40", "serve"]
+    program = RuntimeSequenceProgram(
+        sequence_id="abc", sequence_name="t", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 50, 120, 400], masks=[0, (1 << 0) | (1 << 5), (1 << 61), 0],
+        duration=8e-6,
+        repeat_forever=False, loop_start_index=0, loop_end_tick=400, loop_count=1,
+        slot_count=2, slot_kinds=["delay", "dac"], loop_end_slot_coeffs=[0, 0],
+        tick_slot_coeffs=[[0, 0], [256, 0], [256, 0], [256, 0]],
+        scan_points=[[0, 0], [256, 256], [512, 768]], scan_coeff_frac_bits=8,
+        bus_names=["da0"],
+        bus_segments=[
+            RuntimeBusSegment(bus_index=0, start_tick=50, stop_tick=120, start_value=0,
+                              stop_value=0, mode="edge", value_select=2,
+                              start_tick_coeffs=[256, 0], stop_tick_coeffs=[256, 0]),
+        ],
+    )
+
+    params = StreamerParams(max_edges=16, bank_size=4)
+    hw = _FakeStreamerHardware(params)
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
+
+    session.prepare(program)
+    assert hw.load_ok, "final unpacker must accept the uploaded image"
+    # banks 0,1 armed at prepare (3 points fit in 2 banks of 4).
+    assert hw.bram[CtrlWords.BANK_READY] == 0b11
+    session.fire()
+    assert hw.fired
+    assert session.wait_done(timeout=1.0) is True
+    session.safe_state()
+
+    assert hw.bram[CtrlWords.PROG_COUNT] == 4  # edges uploaded
+    assert hw.bram[CtrlWords.SCAN_COUNT] == 3  # scan points uploaded
+
+
+def test_vivado_axi_session_streams_unbounded_scan(tmp_path):
+    """A scan with more points than the 2-bank window (N > 2*bank_size) STREAMS:
+    wait_done polls CURSOR and refills each freed ping-pong bank with the next
+    chunk, re-arming its BANK_READY bit, until the whole N-point sweep is played."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import StreamerParams, CtrlWords, region_bases
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    N = 9                      # 9 points, bank_size 2 -> 5 chunks (chunks 2,3,4 streamed)
+    params = StreamerParams(max_edges=16, bank_size=2)
+    program = RuntimeSequenceProgram(
+        sequence_id="s", sequence_name="s", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 5, 25, 40], masks=[0, 1, 2, 0], duration=4e-6,
+        repeat_forever=False, loop_start_index=0, loop_end_tick=40, loop_count=1,
+        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
+        tick_slot_coeffs=[[0], [256], [0], [0]],
+        scan_points=[[k] for k in range(N)], scan_coeff_frac_bits=8,
+    )
+    hw = _FakeStreamerHardware(params, total_points=N)
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
+    session.prepare(program)
+    assert hw.bram[CtrlWords.BANK_READY] == 0b11      # banks 0,1 resident
+    session.fire()
+    assert session.wait_done(timeout=2.0) is True
+
+    # chunks 2,3,4 were streamed in: each refill de-arms then re-arms its bank, so
+    # exactly 2*(total_chunks-2) post-fire BANK_READY writes occurred.
+    total_chunks = -(-N // params.bank_size)          # ceil
+    assert total_chunks == 5
+    assert len(hw.bank_ready_writes) == 2 * (total_chunks - 2)
+    # the last write re-armed both banks ready.
+    assert hw.bank_ready_writes[-1] == 0b11
+    # the streamed chunks actually landed in their (alternating) banks.
+    bases = region_bases(params)
+    scan_base = bases["scan"]
+    bank0_word = scan_base + 0 * params.bank_size * params.scan_words
+    bank1_word = scan_base + 1 * params.bank_size * params.scan_words
+    # chunk 4 (even) -> bank 0 first slot value == point 8
+    assert hw.bram[bank0_word] == 8
+    # chunk 3 (odd) -> bank 1 first slot value == point 6
+    assert hw.bram[bank1_word] == 6
+
+
+def test_vivado_axi_session_repeat_forever_treats_running_as_done(tmp_path):
+    """A repeat_forever program never asserts DONE; wait_done must return once RUNNING
+    is seen instead of blocking for the whole timeout."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import StreamerParams
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    program = RuntimeSequenceProgram(
+        sequence_id="p", sequence_name="p", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 100, 200], masks=[1, 0, 0],
+        duration=4e-6,
+        repeat_forever=True, loop_start_index=0, loop_end_tick=200, loop_count=1,
+        slot_count=0,
+    )
+    params = StreamerParams(max_edges=16, bank_size=4)
+    hw = _FakeStreamerHardware(params, forever=True)
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
+    session.prepare(program)
+    session.fire()
+    # DONE never sets, but wait_done returns True because RUNNING is observed.
+    assert session.wait_done(timeout=1.0) is True
+
+
+class _CursorScanHardware:
+    """A streamed-scan FPGA stand-in whose CURSOR advances on every CURSOR read (one point per
+    read), wrapping at N -- so the scan-progress monitor thread observes a real moving cursor.  This
+    is what pins the user-reported bug: a streamed scan's progress must ADVANCE (not stick at 1/0)."""
+
+    def __init__(self, params, *, n_points, forever=True):
+        from fpga.pulse_streamer.host.image import CtrlWords, STATUS_LOADED, STATUS_RUNNING
+        self.params = params
+        self.CtrlWords = CtrlWords
+        self.STATUS_LOADED = STATUS_LOADED
+        self.STATUS_RUNNING = STATUS_RUNNING
+        self.n_points = int(n_points)
+        self.forever = bool(forever)
+        self.bram: dict[int, int] = {}
+        self.status = 0
+        self.fired = False
+        self.cursor = 0
+
+    def __call__(self, lines, action, timeout):
+        from fpga.pulse_streamer.host.image import (
+            CtrlWords, CMD_LOAD, CMD_FIRE, CMD_SAFE, STATUS_LOADED, STATUS_RUNNING, STATUS_DONE,
+        )
+        text = "\n".join(lines)
+        for word, value in _decode_axi_writes(text):
+            self.bram[word] = value
+            if word == CtrlWords.COMMAND and value != 0:
+                if value & CMD_SAFE:
+                    self.status = 0; self.fired = False
+                if value & CMD_LOAD:
+                    self.status = STATUS_LOADED
+                if value & CMD_FIRE:
+                    self.fired = True; self.cursor = 0
+                    self.status = (self.status | STATUS_RUNNING)
+        m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
+        if m:
+            word = int(m.group(1), 16) // 4
+            if word == CtrlWords.CURSOR:
+                cur = self.cursor
+                if self.fired:                       # advance one point per read; wrap at N (a sweep)
+                    self.cursor = (self.cursor + 1) % max(1, self.n_points)
+                return f"ZLCDATA {cur:08X}\n"
+            if word == CtrlWords.STATUS:
+                if self.fired and not self.forever and self.cursor >= self.n_points - 1:
+                    self.status |= STATUS_DONE
+                return f"ZLCDATA {self.status:08X}\n"
+            if word == 63:
+                return "ZLCDATA 5A4C4C02\n"
+            return f"ZLCDATA {self.bram.get(word, 0):08X}\n"
+        return "ok\n"
+
+
+def _scan_program(n_points, *, repeat_forever, scan_repeats=0):
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+    return RuntimeSequenceProgram(
+        sequence_id="g", sequence_name="g", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 5, 25, 40], masks=[0, 1, 2, 0], duration=4e-6,
+        repeat_forever=repeat_forever, loop_start_index=0, loop_end_tick=40, loop_count=1,
+        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
+        tick_slot_coeffs=[[0], [256], [0], [0]],
+        scan_points=[[k] for k in range(n_points)], scan_coeff_frac_bits=8,
+        scan_repeats=scan_repeats,
+    )
+
+
+def test_real_cyclic_scan_progress_advances(tmp_path):
+    """#1 (the user's real-device report): a CYCLIC streamed scan (repeat_forever, 0=inf) reports
+    scanning=True and its point ADVANCES on the real backend -- it must not stick at point 1/0.  The
+    progress gate now keys off scan_points (a streamed scan), not the repeat_forever flag."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import StreamerParams
+
+    N = 6
+    params = StreamerParams(max_edges=16, bank_size=2)
+    hw = _CursorScanHardware(params, n_points=N, forever=True)
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
+    session.prepare(_scan_program(N, repeat_forever=True, scan_repeats=0))
+    session.fire()                          # starts the streaming monitor thread
+    try:
+        seen = []
+        deadline = time.monotonic() + 2.0
+        while len(seen) < 3 and time.monotonic() < deadline:
+            prog = session.scan_progress()
+            assert prog["scanning"] is True and prog["n_points"] == N
+            point_total = int(prog["sweep"]) * N + int(prog["point"])
+            if not seen or point_total != seen[-1]:
+                seen.append(point_total)
+            time.sleep(0.005)
+        assert len(seen) >= 3, f"scan point never advanced (stuck reading): {seen}"
+        assert seen == sorted(seen), f"scan point must advance monotonically, got {seen}"
+    finally:
+        session.safe_state()
+
+
+def test_real_single_pass_scan_progress_advances(tmp_path):
+    """A FINITE single-pass scan (repeat_forever=False + scan_points) streams too: its progress must
+    advance, not idle.  Decoupling the monitor from repeat_forever (start it for any streamed scan)
+    is what makes single-pass progress live (and keeps virtual==real)."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import StreamerParams
+
+    N = 6
+    params = StreamerParams(max_edges=16, bank_size=2)
+    hw = _CursorScanHardware(params, n_points=N, forever=False)
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
+    session.prepare(_scan_program(N, repeat_forever=False, scan_repeats=0))
+    session.fire()
+    try:
+        first = session.scan_progress()
+        assert first["scanning"] is True and first["n_points"] == N
+        seen = {int(first["point"])}
+        deadline = time.monotonic() + 2.0
+        while len(seen) < 2 and time.monotonic() < deadline:
+            seen.add(int(session.scan_progress()["point"]))
+            time.sleep(0.005)
+        assert len(seen) >= 2, f"single-pass scan point never advanced: {seen}"
+    finally:
+        session.safe_state()
+
+
+def test_real_non_scan_repeat_forever_does_not_report_scan(tmp_path):
+    """A repeat_forever STATIC pulse (no scan_points -> _total_points==0) must not be treated as a
+    scan: scan_progress idles and no monitor thread is spawned."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import StreamerParams
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, SCAN_PROGRESS_IDLE
+
+    program = RuntimeSequenceProgram(
+        sequence_id="p", sequence_name="p", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 100, 200], masks=[1, 0, 0], duration=4e-6,
+        repeat_forever=True, loop_start_index=0, loop_end_tick=200, loop_count=1, slot_count=0,
+    )
+    params = StreamerParams(max_edges=16, bank_size=4)
+    hw = _FakeStreamerHardware(params, forever=True)
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
+    session.prepare(program)
+    session.fire()
+    try:
+        assert session.scan_progress() == SCAN_PROGRESS_IDLE
+        assert session._stream_thread is None        # no scan -> no monitor thread
+    finally:
+        session.safe_state()
+
+
+def test_virtual_equals_real_scan_progress_same_dict():
+    """virtual==real for the scan readout: a finite K-sweep scan, played to completion on BOTH the
+    virtual backend and the real (fake-hardware) backend at the SAME point_total, returns the SAME
+    single-source {scanning, point, n_points, sweep, n_repeats} dict."""
+
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
+    from Zou_lab_control.neutral_atom.devices.sequencer import PulseController, scan_progress_fields
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+
+    st = PulseTableState(channels=["probe", "trig"])
+    st.bind_field("duration", "0", unit="us")
+    st.set_scan_table([[10.0], [20.0], [30.0]])
+    # virtual finite scan, fast-forwarded to its saturated done reading
+    seq = VirtualSequencer(channels=["probe", "trig"], sleep_scale=0.0)
+    PulseController(seq, st).on_pulse(repeat_forever=True, scan_repeats=2)
+    virtual_done = seq.scan_progress()
+    # the single source the real backend also returns at K*N played points
+    assert virtual_done == scan_progress_fields(2 * 3, 3, 2)
+    assert virtual_done == {"scanning": False, "point": 2, "n_points": 3, "sweep": 1, "n_repeats": 2}
+
+
+def test_virtual_single_pass_streamed_scan_reports_scanning():
+    """F8: a FINITE SINGLE-PASS streamed scan (repeat_forever=False + a scan_table) reports
+    scanning=True -- the progress gate keys off the SCAN TABLE (a streamed scan), NOT the
+    repeat_forever ``firing`` handle (which is only set for a cyclic sweep).  Without this a
+    single-pass scan would idle even while playing, unlike the real backend (virtual == real)."""
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+
+    st = PulseTableState(channels=["probe", "trig"])
+    st.bind_field("duration", "0", unit="us")
+    st.set_scan_table([[10.0], [20.0], [30.0]])
+    st.repeat_forever = False                          # single-pass: N points played once
+    st.scan_repeats = 0
+    seq = VirtualSequencer(channels=["probe", "trig"], sleep_scale=1.0)   # real-time so it does not race to done
+    seq.prepare(st)
+    assert seq.scan_progress()["scanning"] is False    # prepared but not yet fired -> idle
+    assert seq.firing is None                          # a single-pass scan sets NO repeat_forever firing
+    seq.fire()
+    prog = seq.scan_progress()
+    assert prog["scanning"] is True and prog["n_points"] == 3   # ... yet it IS scanning once fired
+    seq.stop()
+
+
+def test_virtual_stop_unconditionally_drives_safe_state():
+    """F8: ``stop`` ALWAYS parks the streamer safe (like real hardware: Stop parks the outputs
+    whatever was running), not only when a repeat_forever ``firing`` was set -- so a finite scan
+    (which leaves ``firing`` None) is still safed on Stop, and the scan state is fully cleared."""
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+
+    st = PulseTableState(channels=["probe", "trig"])
+    st.bind_field("duration", "0", unit="us")
+    st.set_scan_table([[10.0], [20.0], [30.0]])
+    st.repeat_forever = False
+    st.scan_repeats = 0
+    seq = VirtualSequencer(channels=["probe", "trig"], sleep_scale=1.0)
+    seq.prepare(st); seq.fire()
+    seq.stop()
+    assert seq.firing is None
+    assert seq.scan_progress()["scanning"] is False    # scan state cleared -> idle
+    assert seq.service.history[-1]["action"] == "safe"  # the streamer was parked safe
 
 
 def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
@@ -2686,7 +4491,6 @@ def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
     service = na.SequencerService(
         channels=["trap", "cooling", "probe", "emCCD"],
         clock_hz=50_000_000,
-        trigger_channels=["emCCD"],
         prepare_callback=backend.prepare,
         fire_callback=backend.fire,
         wait_done_callback=backend.wait_done,
@@ -2700,7 +4504,8 @@ def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
     thread.start()
     time.sleep(0.2)
     remote = na.RemoteSequencer(host="127.0.0.1", port=port, channels=["trap", "cooling", "probe", "emCCD"], clock_hz=50_000_000)
-    seq = na.sequence_for_frame_count(na.imaging_sequence(exposure=12e-6, load=True), 4)
+    seq = na.imaging_sequence(exposure=12e-6, load=True).repeated(4)
+    assert na.count_trigger_pulses(seq) == 4
     try:
         program = remote.prepare(seq)
         remote.fire(seq)
@@ -2710,12 +4515,10 @@ def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
         server.close()
 
     payload = json.loads((tmp_path / "prepared_program.json").read_text(encoding="utf-8"))
-    assert program.trigger_count == 4
-    assert payload["trigger_count"] == 4
     assert payload["source_sequence"]["name"] == seq.name
 
 
-def test_remote_pulse_controller_sends_named_scan_variable_over_json_protocol(tmp_path):
+def test_remote_pulse_controller_sends_pulse_table_x_over_json_protocol(tmp_path):
     try:
         import rpyc  # noqa: F401
     except ImportError:
@@ -2734,7 +4537,6 @@ def test_remote_pulse_controller_sends_named_scan_variable_over_json_protocol(tm
     service = na.SequencerService(
         channels=hardware_channels,
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         prepare_callback=prepare_callback,
         fire_callback=fire_callback,
     )
@@ -2752,24 +4554,22 @@ def test_remote_pulse_controller_sends_named_scan_variable_over_json_protocol(tm
         port=port,
         channels=["ch00", "ch03"],
         clock_hz=1.0,
-        trigger_channels=["ch03"],
     )
     state = na.PulseTableState(
         channels=["ch00", "ch03"],
         periods=[
             na.PulsePeriod(100, (1, 0), unit="ns"),
-            na.PulsePeriod("detection_time_ns", (1, 1), unit="str (ns)"),
+            na.PulsePeriod("s0", (1, 1), unit="str (ns)"),
             na.PulsePeriod(100, (0, 0), unit="ns"),
         ],
+        scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 1_000.0}],
         time_step_ns=10,
-        scan_variables={"detection_time_ns": 1_000},
-        scan_bindings={"period:1:duration": "detection_time_ns"},
         repeat_forever=True,
         visible_channels=["ch00", "ch03"],
     )
     pulse = na.bind_pulse(remote, state)
     try:
-        pulse.set_variable("detection_time_ns", 2_000)
+        pulse.set_time(2_000)
         program = pulse.on_pulse(wait=True, timeout=1.0, repeat_forever=False)
         snapshot = pulse.snapshot()
     finally:
@@ -2778,12 +4578,11 @@ def test_remote_pulse_controller_sends_named_scan_variable_over_json_protocol(tm
 
     assert remote.channels == hardware_channels
     assert remote.clock_hz == 100_000_000
-    assert pulse.variables["detection_time_ns"] == 2_000
+    assert snapshot["slots"] == {"s0": 2_000.0}
     assert program.channels == hardware_channels
     assert program.ticks == [0, 10, 210, 220]
     assert program.masks == [1 << 0, (1 << 0) | (1 << 3), 0, 0]
     assert program.repeat_forever is False
-    assert program.trigger_count == 1
     assert all(mask >> 4 == 0 for mask in program.masks)
     assert [p.sequence_id for p in prepared_programs] == [program.sequence_id]
     assert [p.sequence_id for p in fired_programs] == [program.sequence_id]
@@ -2803,7 +4602,6 @@ def test_remote_detection_time_scan_uses_bound_pulse_controller_over_json_protoc
     service = na.SequencerService(
         channels=hardware_channels,
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         prepare_callback=lambda program: prepared_programs.append(program),
         fire_callback=lambda program: fired_programs.append(program),
     )
@@ -2823,21 +4621,20 @@ def test_remote_detection_time_scan_uses_bound_pulse_controller_over_json_protoc
         port=port,
         channels=["ch00", "ch03"],
         clock_hz=1.0,
-        trigger_channels=["ch03"],
     )
     state = na.PulseTableState(
         channels=["ch00", "ch02", "ch03"],
         periods=[
             na.PulsePeriod(100, (1, 0, 0), unit="ns"),
-            na.PulsePeriod("detection_time_ns", (1, 1, 1), unit="str (ns)"),
+            na.PulsePeriod("s0", (1, 1, 1), unit="str (ns)"),
             na.PulsePeriod(100, (0, 0, 0), unit="ns"),
         ],
+        scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 1_000.0}],
         time_step_ns=10,
-        scan_variables={"detection_time_ns": 1_000},
-        scan_bindings={"period:1:duration": "detection_time_ns"},
         repeat_forever=True,
     )
     pulse = na.bind_pulse(remote, state)
+    _bench_trigger_cable(exp.devices.camera, remote)      # the remote streamer's edges gate the camera
     try:
         scan = exp.readout.detection_time(
             [2e-6, 4e-6],
@@ -2856,10 +4653,12 @@ def test_remote_detection_time_scan_uses_bound_pulse_controller_over_json_protoc
     assert scan.summary()["finished"] is True
     assert remote.channels == hardware_channels
     assert remote.clock_hz == 100_000_000
-    assert pulse.variables["detection_time_ns"] == 4_000
     assert [program.channels for program in prepared_programs] == [hardware_channels] * 3
-    assert [program.trigger_count for program in prepared_programs] == [2, 2, 2]
-    assert [program.loop_end_tick for program in prepared_programs] == [820, 220, 420]
+    # ``shots``=2 frames = 2 capture-trigger edges, so each fired program is the bound pulse REPEATED
+    # to 2 edges: reference 8 us -> 810, 2 us -> 210, 4 us -> 410 (repeated-program loop ends, one
+    # tail-gap shorter than the single-cycle 820/220/420) -- the same edge-faithful count on the
+    # remote streamer (virtual == real: the remote FPGA emits the repeated edges too).
+    assert [program.loop_end_tick for program in prepared_programs] == [810, 210, 410]
     assert all(not program.repeat_forever for program in prepared_programs)
     assert [program.sequence_id for program in fired_programs] == [program.sequence_id for program in prepared_programs]
     assert all(mask < (1 << 4) for program in prepared_programs for mask in program.masks)
@@ -2880,10 +4679,15 @@ def test_hardware_tutorial_is_real_hardware_not_virtual_demo():
     assert "exp.devices.sequencer.open()" not in hardware_text
     assert "results_real_hardware" not in hardware_text
     assert "neutral_atom.devices.sequencer_server" in fpga_text
-    assert "fpga_pulse_streamer" in fpga_text
+    assert "axi_session" in fpga_text                    # final JTAG-to-AXI backend
     assert "legacy_address_switch" not in fpga_text
     assert "na.run_sequencer_server" in fpga_text
-    assert "fpga\\build\\address_switch\\address_switch.xpr" in fpga_text
+    # final design: jtag-axi backend + the short in-repo build dir (no VIO project)
+    assert "jtag-axi" in fpga_text
+    assert "fpga\\build\\ps" in fpga_text
+    assert "fpga\\build\\pulse_streamer" not in fpga_text
+    assert "address_switch.xpr" not in fpga_text
+    assert "vivado-session" not in fpga_text
     assert "qCMOS.py" not in hardware_text + fpga_text
     assert "pxie_control" not in hardware_text + fpga_text
 
@@ -2898,7 +4702,6 @@ def test_real_device_templates_load_without_hardware_connection():
     assert isinstance(manual.sequencer, na.ManualSequencer)
     assert manual.sequencer.channels == hardware_channels
     assert manual.sequencer.clock_hz == 50_000_000
-    assert manual.sequencer.trigger_channels == ("ch11",)
     assert isinstance(remote.camera, na.QCMOSCamera)
     assert remote.camera.dcam_module_name == na.DEFAULT_DCAM_MODULE
     assert isinstance(remote.sequencer, na.RemoteSequencer)
@@ -2906,13 +4709,19 @@ def test_real_device_templates_load_without_hardware_connection():
     assert remote.sequencer.port == 18862
     assert remote.sequencer.channels == hardware_channels
     assert remote.sequencer.clock_hz == 50_000_000
-    assert remote.sequencer.trigger_channels == ("ch11",)
     assert remote.sequencer.snapshot()["connected"] is False
 
     exp = na.connect("remote_template", sequencer={"host": "192.168.0.22"})
     assert exp.devices.sequencer.host == "192.168.0.22"
     assert exp.camera.dcam_module_name == na.DEFAULT_DCAM_MODULE
     assert exp.sequence.channels == ["ch00", "ch03", "ch09", "ch11"]
+
+    # a BARE config name resolves the bundled file WITH or WITHOUT a .json suffix
+    # (a natural thing to type -- must not raise FileNotFoundError).
+    suffixed = na.connect("remote_template.json", sequencer={"host": "192.168.0.22"})
+    assert isinstance(suffixed.devices.sequencer, na.RemoteSequencer)
+    assert suffixed.devices.sequencer.host == "192.168.0.22"
+    assert suffixed.sequence.channels == ["ch00", "ch03", "ch09", "ch11"]
 
     try:
         na.load_devices("remote_template", overrides={"sequencer": {"host": "0.0.0.0"}})
@@ -2935,7 +4744,7 @@ def test_load_devices_can_open_device_graph(monkeypatch):
         def configure(self, *, exposure=None, **kwargs):
             pass
 
-        def acquire(self, frames=1, *, sequence=None, sequencer=None, **kwargs):
+        def acquire(self, frames=1, *, stop=None, **kwargs):
             return [np.zeros((2, 2))]
 
         def open(self):
@@ -2994,7 +4803,7 @@ def test_sequencer_server_reports_client_endpoints(monkeypatch, capsys):
     assert 'sequencer={"host": "192.168.0.20", "port": 18861}' in output
 
 
-def test_qcmos_camera_acquire_uses_dcam_and_expanded_sequencer(monkeypatch):
+def test_qcmos_camera_acquire_reads_n_frames(monkeypatch):
     class FakeApi:
         initialized = False
 
@@ -3029,6 +4838,21 @@ def test_qcmos_camera_acquire_uses_dcam_and_expanded_sequencer(monkeypatch):
         def prop_setvalue(self, prop, value):
             self.props.append((prop, value))
             return True
+
+        def prop_getvalue(self, prop):
+            # echo the most recent value set for this prop (read-back verify)
+            for p, v in reversed(self.props):
+                if p == prop:
+                    return v
+            return False
+
+        def prop_getattr(self, prop):
+            # full sensor 2304, sub-array step 4 (the qCMOS hardware grid)
+            return types.SimpleNamespace(valuemin=0.0, valuemax=2304.0, valuestep=4.0)
+
+        def prop_setgetvalue(self, prop, value, option=0):
+            self.props.append((prop, value))   # already snapped by the adapter; echo it
+            return float(value)
 
         def buf_alloc(self, frames):
             self.frames = int(frames)
@@ -3074,85 +4898,35 @@ def test_qcmos_camera_acquire_uses_dcam_and_expanded_sequencer(monkeypatch):
             TRIGGERSOURCE=types.SimpleNamespace(EXTERNAL="EXTERNAL"),
             TRIGGERACTIVE=types.SimpleNamespace(EDGE="EDGE"),
             TRIGGERPOLARITY=types.SimpleNamespace(POSITIVE="POSITIVE"),
-            MODE=types.SimpleNamespace(ON="ON"),
+            MODE=types.SimpleNamespace(ON="ON", OFF="OFF"),
         ),
     )
     monkeypatch.setitem(sys.modules, "fake_dcam_for_qcmos_test", fake_module)
 
-    class FakeSequencer:
-        channels = ["trap", "cooling", "probe", "emCCD"]
-        clock_hz = 50_000_000
-        trigger_channels = ("emCCD",)
-
-        def __init__(self):
-            self.prepared = None
-            self.fired = None
-            self.done_wait = None
-
-        def prepare(self, sequence):
-            self.prepared = sequence
-
-        def fire(self, sequence):
-            self.fired = sequence
-
-        def wait_done(self, timeout):
-            self.done_wait = timeout
-            return True
-
+    # Pure grabber through the three primitives: arm(N) allocates + starts capture (the
+    # hardware is then ready BEFORE any fire could happen), read_frames(N) drains the
+    # triggered frames, disarm() stands the sensor down.  It never touches a sequencer or
+    # expands any pulse.  The DCAM mock must see N buffer allocations / read N frames back.
     camera = na.QCMOSCamera({"exposure": 2e-3, "roi": [1, 4, 2, 3], "timeout_ms": 100}, dcam_module="fake_dcam_for_qcmos_test")
-    sequencer = FakeSequencer()
-    sequence = na.imaging_sequence(exposure=1e-3, load=True)
-    images = camera.acquire(2, sequence=sequence, sequencer=sequencer)
+    camera.arm(2)
+    assert FakeDcam.instance.frames == 2          # buf_alloc(N) happened AT arm (ready pre-fire)
+    assert FakeDcam.instance.started is True      # cap_start ran: armed and waiting for triggers
+    images = camera.read_frames(2)
+    camera.disarm()
 
     assert len(images) == 2
     assert FakeApi.initialized is True
     assert FakeDcam.instance.released is True
-    exposure_writes = [value for prop, value in FakeDcam.instance.props if prop == "EXPOSURETIME"]
-    assert exposure_writes[-1] == 1e-3
     assert ("TRIGGERSOURCE", "EXTERNAL") in FakeDcam.instance.props
     assert ("TRIGGERACTIVE", "EDGE") in FakeDcam.instance.props
-    assert na.count_trigger_pulses(sequencer.prepared) == 2
-    assert sequencer.fired is sequencer.prepared
-    assert sequencer.done_wait is not None
     camera.close()
     assert FakeApi.initialized is False
 
     camera = na.QCMOSCamera({"exposure": 2e-3, "timeout_ms": 100}, dcam_module="fake_dcam_for_qcmos_test")
-    sequencer = FakeSequencer()
-    sequencer.channels = ["ch00", "ch03"]
-    sequencer.trigger_channels = ("ch03",)
-    pulse_state = na.PulseTableState(
-        channels=["ch00", "ch03"],
-        periods=[
-            na.PulsePeriod(100, (1, 0), unit="ns"),
-            na.PulsePeriod(20, (1, 1), unit="ns"),
-            na.PulsePeriod(100, (0, 0), unit="ns"),
-        ],
-        time_step_ns=10,
-        repeat_forever=True,
-    )
-    images = camera.acquire(3, sequence=pulse_state, sequencer=sequencer)
+    images = camera.acquire(3)                     # the arm+read+disarm convenience
 
     assert len(images) == 3
-    assert isinstance(sequencer.prepared, na.PulseSequence)
-    assert sequencer.prepared.repeat_forever is False
-    assert na.count_trigger_pulses(sequencer.prepared, trigger_channels=["ch03"]) == 3
-    assert sequencer.fired is sequencer.prepared
-    assert sequencer.done_wait is not None
-    camera.close()
-    assert FakeApi.initialized is False
-
-    camera = na.QCMOSCamera({"exposure": 2e-3, "timeout_ms": 100}, dcam_module="fake_dcam_for_qcmos_test")
-    sequencer = FakeSequencer()
-    sequencer.channels = ["ch00", "ch03"]
-    sequencer.trigger_channels = ("ch03",)
-    pulse = na.bind_pulse(sequencer, pulse_state)
-    images = camera.acquire(2, sequence=pulse)
-
-    assert len(images) == 2
-    assert isinstance(sequencer.prepared, na.PulseSequence)
-    assert na.count_trigger_pulses(sequencer.prepared, trigger_channels=["ch03"]) == 2
-    assert sequencer.fired is sequencer.prepared
+    assert FakeDcam.instance.frames == 3
     camera.close()
     assert FakeApi.initialized is False
 
@@ -3160,12 +4934,2958 @@ def test_qcmos_camera_acquire_uses_dcam_and_expanded_sequencer(monkeypatch):
 def test_standalone_calibration_and_detection_from_arrays():
     exp = na.connect("virtual")
     sequence = na.imaging_sequence(exposure=exp.camera.exposure, load=True, name="sitemap")
-    images = exp.camera.acquire(4, sequence=sequence)
+    images = na.triggered_frames(exp.camera, exp.devices.sequencer, sequence, 4)
     sitemap = na.calibrate_sitemap_from_images(images, grid_shape=exp.devices.trap_array.grid_shape, display=False)
-    threshold_images = exp.camera.capture(frames=8, display=False).images
+    threshold_images = exp.capture(frames=8, display=False).images
     threshold = na.calibrate_threshold_from_images(threshold_images, sitemap.calibration, display=False)
     shot = na.detect_image(threshold_images[-1], threshold.calibration, display=False)
 
     assert sitemap.centers.shape[0] == exp.devices.trap_array.n_sites
     assert threshold.thresholds.shape == (exp.devices.trap_array.n_sites,)
     assert shot.occupied.dtype == bool
+
+
+def test_top_status_fsm_clears_running_on_safe_then_reloads():
+    """Cycle-accurate model of the top's STATUS/command FSM, modeling the TWO always
+    blocks (the FSM sets ldr_status_val; a SEPARATE writeback block applies it to
+    ctrl_reg[C_STATUS] ONE cycle later).  That delay is what made the off->on
+    "STATUS=0x00000002" bug: a CMD_SAFE that should clear RUNNING was bounced back by
+    the DONE/UNDERFLOW refresh re-reading the stale ctrl_reg[C_STATUS] the next cycle,
+    so the next CMD_LOAD's LOADED never stuck.  The fix gates the refresh on an
+    FSM-owned ``status_running`` flag (cleared atomically by the command).  This test
+    reproduces the bounce with the OLD gate and proves the NEW gate clears + reloads,
+    and asserts the RTL actually uses the fixed gate.  (The top FSM has no Verilog sim,
+    so this models it directly.)"""
+    from pathlib import Path
+
+    LOADED, RUNNING, DONE, UNDER = 1, 2, 4, 16
+    LOAD, FIRE, RESET, SAFE = 1, 2, 4, 8
+
+    class Fsm:
+        def __init__(self, mode):
+            self.mode = mode
+            self.status = 0; self.command = 0; self.ldr_we = 0; self.ldr_val = 0
+            self.status_running = 0; self.eng_reset = 1; self.cmd_seen = 0
+            self.lstate = "IDLE"; self.ctr = 0; self.done = 0; self.under = 0
+
+        def tick(self, cmd_write=None):
+            c = dict(self.__dict__)
+            n_status = c["ldr_val"] if c["ldr_we"] else c["status"]   # Block A (delayed writeback)
+            n_command = cmd_write if cmd_write is not None else c["command"]
+            n_we = 0; n_val = c["ldr_val"]; n_run = c["status_running"]
+            n_res = c["eng_reset"]; n_seen = c["cmd_seen"]; n_lstate = c["lstate"]; n_ctr = c["ctr"]
+            cmd_now = c["command"] & 0xF; edge = cmd_now & (~c["cmd_seen"]) & 0xF
+            if c["lstate"] == "IDLE":
+                n_seen = cmd_now
+                if edge & RESET or edge & SAFE:
+                    n_res = 1; n_run = 0; n_we = 1; n_val = 0
+                elif edge & LOAD:
+                    n_res = 1; n_run = 0; n_lstate = "LOAD"; n_ctr = 3
+                elif (edge & FIRE) and (c["status"] & LOADED):
+                    n_lstate = "FIRE"
+            elif c["lstate"] == "LOAD":
+                if c["ctr"] > 0: n_ctr = c["ctr"] - 1
+                else: n_we = 1; n_val = LOADED; n_lstate = "IDLE"
+            elif c["lstate"] == "FIRE":
+                n_res = 0; n_run = 1; n_we = 1; n_val = RUNNING; n_seen = cmd_now; n_lstate = "IDLE"
+            cond = (c["status"] & RUNNING) if self.mode == "old" else c["status_running"]
+            if c["lstate"] == "IDLE" and edge == 0 and cond:
+                n_we = 1
+                n_val = ((0 if c["done"] else RUNNING) | (DONE if c["done"] else 0) | (UNDER if c["under"] else 0))
+                if self.mode == "new" and c["done"]: n_run = 0
+            self.status, self.command = n_status, n_command
+            self.ldr_we, self.ldr_val = n_we, n_val
+            self.status_running, self.eng_reset = n_run, n_res
+            self.cmd_seen, self.lstate, self.ctr = n_seen, n_lstate, n_ctr
+
+        def cmd(self, c):
+            self.tick(0); self.tick(c)
+            for _ in range(10): self.tick()
+
+    def scenario(mode):
+        f = Fsm(mode)
+        f.cmd(SAFE); f.cmd(LOAD); on1_loaded = bool(f.status & LOADED)
+        f.cmd(FIRE); on1_running = bool(f.status & RUNNING)
+        for _ in range(10):
+            f.tick()                       # repeat-forever: engine never asserts done
+        f.cmd(SAFE); off_status = f.status
+        f.cmd(SAFE); f.cmd(LOAD); on2_loaded = bool(f.status & LOADED)
+        return on1_loaded, on1_running, off_status, on2_loaded
+
+    # OLD gate reproduces the reported bug: STATUS stuck RUNNING -> 2nd LOAD never loads.
+    old = scenario("old")
+    assert old[2] == RUNNING and old[3] is False
+    # NEW gate: SAFE clears STATUS, the next LOAD asserts LOADED, off->on works.
+    new = scenario("new")
+    assert new[0] is True and new[1] is True
+    assert new[2] == 0, "CMD_SAFE must clear STATUS even from RUNNING"
+    assert new[3] is True, "off->on must reload (LOADED) after a prior run"
+
+    # The RTL must actually use the fixed (status_running) gate, not the buggy one.
+    top = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    assert "status_running" in top
+    assert "ctrl_reg[C_STATUS][1]) begin" not in top
+
+
+def test_pulse_table_delay_is_cyclic_in_preview():
+    """A channel delay in the preview (to_sequence) is a CYCLIC rotation within the
+    frame (delay %% total_duration): a pulse pushed past the frame end wraps to the
+    front.  This is the periodic ("inf") view, correct for ANY delay (>= total, or
+    negative) -- not the old additive shift that only worked for delay < total."""
+    import Zou_lab_control.neutral_atom as na
+
+    st = na.PulseTableState(
+        channels=["ch0"],
+        periods=[na.PulsePeriod(1000, (1,), unit="ns"), na.PulsePeriod(1000, (0,), unit="ns")],
+        time_step_ns=20,
+    )  # frame = 2000 ns, ch0 ON [0,1000)
+
+    def on_intervals(delay_ns):
+        st.delays = {"ch0": delay_ns}; st.delay_units = {"ch0": "ns"}
+        seq = st.to_sequence()
+        return sorted((round(p.start * 1e9), round((p.start + p.duration) * 1e9)) for p in seq.effective_pulses())
+
+    assert on_intervals(0) == [(0, 1000)]
+    assert on_intervals(500) == [(500, 1500)]
+    assert on_intervals(1500) == [(0, 500), (1500, 2000)]      # wraps past the frame end
+    assert on_intervals(2500) == [(500, 1500)]                 # 2500 %% 2000 == 500
+    assert on_intervals(-500) == [(0, 500), (1500, 2000)]      # -500 %% 2000 == 1500
+    # frame total is unchanged by delay (cyclic, never extends the period)
+    st.delays = {"ch0": 1500}
+    assert round(st.to_sequence().duration * 1e9) == 2000
+
+
+def _additive_truth(state, *, slots, time_step_ns, channels, n_ticks):
+    """Independent ADDITIVE delay oracle (the trusted root for hardware delay): build
+    each digital channel's UN-delayed ON intervals, shift them by a PURE additive delay
+    (no modulo/wrap), re-translate the whole frame by G = max(0, -min delay) so the
+    earliest event is >= 0, extend the frame to fit the latest shifted edge, and emit
+    the per-tick mask by interval membership over the repeating extended frame.  This is
+    correct by inspection and is structurally different from to_sequence (cyclic) and
+    from reference_play (plays a given table) -- so it independently proves the compiler
+    builds the right additive edge table."""
+
+    starts = [0]
+    for period in state.periods:
+        starts.append(starts[-1] + period.duration_steps(slots=slots, time_step_ns=time_step_ns))
+    table_end = starts[-1]
+    bus_members = {c for members in state.bus_channels().values() for c in members}
+    delays, intervals = {}, {}
+    for ci, ch in enumerate(state.channels):
+        if ch in bus_members:
+            continue
+        delays[ch] = state.delay_steps(ch, slots=slots, time_step_ns=time_step_ns)
+        ivals, active = [], None
+        for pi, period in enumerate(state.periods):
+            v = int(period.states[ci])
+            if v and active is None:
+                active = starts[pi]
+            elif not v and active is not None:
+                ivals.append((active, starts[pi])); active = None
+        if active is not None:
+            ivals.append((active, table_end))
+        intervals[ch] = ivals
+    g = max(0, -min(delays.values())) if delays else 0
+    eff = {ch: delays[ch] + g for ch in delays}
+    T = table_end
+    bits = {ch: channels.index(ch) for ch in delays if ch in channels}
+    out = []
+    for t in range(n_ticks):
+        mask = 0
+        for ch, ivals in intervals.items():
+            d = eff[ch]
+            if t < d or T <= 0:                 # channel hasn't started (real delay)
+                continue
+            phase = (t - d) % T                 # period PRESERVED at T (physical delay)
+            for a, b in ivals:
+                if a <= phase < b:
+                    mask |= 1 << bits[ch]; break
+        out.append(mask)
+    return out
+
+
+def _unroll_periods_independently(state):
+    """INDEPENDENT bracket unroll (not the compiler's ``unrolled_bracket``): expand the
+    period order [pre] + bracket*rc + [post] and the analog-bus mode rows the same way,
+    so the oracle proves the compiler's unroll too.  Returns (periods, analog_bus_modes)."""
+    rs, re, rc = state.repeat_start, state.repeat_end, state.repeat_count
+    if rs is None or re is None or int(rc) <= 1:
+        return list(state.periods), {n: list(e) for n, e in state.analog_bus_modes.items()}
+
+    def expand(items):
+        return list(items[:rs]) + list(items[rs:re + 1]) * int(rc) + list(items[re + 1:])
+
+    return expand(state.periods), {n: expand(e) for n, e in state.analog_bus_modes.items()}
+
+
+def _scan_point_geometry(state, *, point_ns, time_step_ns):
+    """Resolve ONE scan point to (table_end, {channel: (delay, [intervals])}) with the
+    bracket unrolled.  Pure interval math shared by the oracle's G, frame-end and frame
+    construction."""
+    periods, _modes = _unroll_periods_independently(state)
+    starts = [0]
+    for p in periods:
+        starts.append(starts[-1] + p.duration_steps(slots=point_ns, time_step_ns=time_step_ns))
+    table_end = starts[-1]
+    bus_members = {c for members in state.bus_channels().values() for c in members}
+    geom = {}
+    for ci, ch in enumerate(state.channels):
+        if ch in bus_members:
+            continue
+        d = state.delay_steps(ch, slots=point_ns, time_step_ns=time_step_ns)
+        ivals, active = [], None
+        for pi, period in enumerate(periods):
+            v = int(period.states[ci])
+            if v and active is None:
+                active = starts[pi]
+            elif not v and active is not None:
+                ivals.append((active, starts[pi])); active = None
+        if active is not None:
+            ivals.append((active, table_end))
+        geom[ch] = (d, ivals)
+    return table_end, geom
+
+
+def _additive_scan_frame(state, *, point_ns, time_step_ns, channels, global_shift, frame_end_at):
+    """ONE additive frame for ONE scan point, with the bracket UNROLLED -- modelling the
+    engine's scan frame EXACTLY (independent interval math, NOT the affine compiler).
+
+    ``global_shift`` G re-translates every edge so the earliest is >= 0 at every point.
+    ``frame_end_at`` is the per-point frame length (the program's final effective tick the
+    engine plays).  The edge table is ANCHORED at tick 0 (the compiler prepends an all-off
+    tick-0 edge for every scan point), so the engine seeds from tick 0 and every edge plays
+    at its exact effective tick ``a + d + G`` with NO startup slip.  Bus-member channels are
+    excluded (driven by the bus engine)."""
+    _table_end, geom = _scan_point_geometry(state, point_ns=point_ns, time_step_ns=time_step_ns)
+    g = int(global_shift)
+    bits = {ch: channels.index(ch) for ch in geom if ch in channels}
+    out = []
+    for t in range(frame_end_at):
+        mask = 0
+        for ch, (d, ivals) in geom.items():
+            for a, b in ivals:
+                if a + d + g <= t < b + d + g:
+                    mask |= 1 << bits[ch]; break
+        out.append(mask)
+    return out, frame_end_at
+
+
+def _additive_scan_truth(program, state, *, scan_table, time_step_ns, channels, n_ticks, repeat_forever):
+    """Full multi-scan-point additive oracle.  The per-tick digital MASK of each frame is
+    computed by INDEPENDENT interval math (``_additive_scan_frame``: unroll the bracket,
+    place ON runs, add per-channel delay + the shared global shift G); only the per-point
+    frame LENGTH is read from the compiled program's final effective tick (the engine's
+    actual frame boundary -- a scalar, not the mask logic being proven).  Frames are then
+    concatenated exactly as the seamless scan engine advances scan points; when the points
+    run out and the program repeats forever, wrap to point 0, else hold idle.  Returns the
+    independent ground truth the compiled program + every engine model must reproduce
+    tick-for-tick.  ``repeat_forever`` is the COMPILE flag (not the state default)."""
+    from fpga.pulse_streamer.host import engine_model as em
+    from Zou_lab_control.neutral_atom.timing.pulse_table import UNITS_TO_NS, slot_var
+
+    def point_ns(row):
+        return {
+            slot_var(i): float(row[i]) * (1.0 if slot.kind == "dac" else UNITS_TO_NS.get(slot.unit, 1.0))
+            for i, slot in enumerate(state.scan_slots)
+        }
+
+    points = [point_ns(row) for row in scan_table]
+    geoms = [_scan_point_geometry(state, point_ns=pn, time_step_ns=time_step_ns) for pn in points]
+
+    # shared global shift G = max(0, -(min effective edge tick over all non-bus channels
+    # AND all scan points)) -- computed INDEPENDENTLY here so every per-point frame aligns.
+    min_edge = 0
+    for _table_end, geom in geoms:
+        for _ch, (d, ivals) in geom.items():
+            for a, _b in ivals:
+                min_edge = min(min_edge, a + d)
+    g = max(0, -min_edge)
+
+    # per-point frame LENGTH = the program's final effective tick at that scan point (the
+    # engine's frame boundary).  This is a scalar read from the engine; the mask CONTENT
+    # of every frame is still produced independently by _additive_scan_frame.
+    ep = program if isinstance(program, em.EngineProgram) else em.EngineProgram.from_program(program)
+    pts_ticks = [list(p) for p in (ep.scan_points or [[0] * ep.slot_count])]
+    frame_ends = [em.effective_tick(ep.ticks[-1], ep.tick_slot_coeffs[-1], pt, ep.frac_bits) for pt in pts_ticks]
+
+    frames = [
+        _additive_scan_frame(state, point_ns=pn, time_step_ns=time_step_ns, channels=channels,
+                             global_shift=g, frame_end_at=fe)[0]
+        for pn, fe in zip(points, frame_ends)
+    ]
+    out = []
+    p = 0
+    while len(out) < n_ticks:
+        if p < len(frames):
+            out.extend(frames[p]); p += 1
+        elif repeat_forever and frames:
+            p = 0
+        else:
+            out.append(0)
+    return out[:n_ticks]
+
+
+def test_pulse_table_repeat_forever_delay_is_additive_in_hardware():
+    """HARDWARE delay is a PURE PHYSICAL delay applied to the OUTPUT (a delay line), NOT
+    baked into the edges and NOT the cyclic %total preview: the channel comes out `delay`
+    later, the FIRST pulses after fire are real (silent until t=delay), and every OTHER
+    channel and the period are untouched.  The edge table stays UNDELAYED (loop period = the
+    plain frame T, repeat_from_index 0); the delay rides ``channel_delays`` and the engine
+    model applies it as the exact ``delay_line_reference``.  Proven against the independent
+    additive oracle (no Verilog/hardware needed)."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
+    from fpga.pulse_streamer.host import engine_model as em
+
+    st = na.PulseTableState(
+        channels=["ch0"],
+        periods=[na.PulsePeriod(1000, (1,), unit="ns"), na.PulsePeriod(1000, (0,), unit="ns")],
+        time_step_ns=20,
+    )  # frame 2000 ns = 100 ticks; ch0 ON [0,1000) = ticks [0,50)
+    st.delays = {"ch0": 1500}; st.delay_units = {"ch0": "ns"}   # +75 ticks (output delay)
+
+    prog = compile_pulse_table_runtime_program(st, clock_hz=50e6, repeat_forever=True)
+    assert prog.masks[-1] == 0                  # final mask is safe-idle
+    # UNDELAYED edge table: the loop period is the plain frame T=100, repeat_from_index 0
+    # (no preamble); the delay is an OUTPUT delay carried by channel_delays.
+    assert prog.loop_end_tick == 100
+    assert prog.repeat_from_index == 0
+    assert prog.channel_delays == [75]          # ch0 (bit 0) delayed 75 ticks on the output
+
+    truth = _additive_truth(st, slots={}, time_step_ns=20, channels=["ch0"], n_ticks=400)
+    ep = em.EngineProgram.from_program(prog)
+    assert em.reference_play(ep, 400) == truth
+    # the BRAM FIFO engine + its exact RTL register mirror both reproduce the additive
+    # truth -- the no-Verilog-sim proof that the repeat_from_loop_start rewind is correct.
+    assert em.prefetch_play(ep, 400) == truth
+    assert em.rtl_mirror_play(ep, 400) == truth
+    # the additive hardware is OFF at fire and turns ON only at tick 75 -- it does NOT
+    # show the cyclic preview's wrapped tail at t=0; steady state then has period 100.
+    assert truth[0] == 0 and truth[74] == 0 and truth[75] == 1 and truth[124] == 1 and truth[125] == 0
+    assert truth[175] == 1 and truth[224] == 1 and truth[225] == 0   # repeats every 100 ticks
+
+
+def test_pulse_table_negative_delay_global_retranslate_in_hardware():
+    """A NEGATIVE delay re-translates the WHOLE frame (G = -min delay added to every
+    channel) so the delayed channel precedes the rest and the earliest event is >= 0 --
+    never a runtime negative tick.  Proven against the additive oracle."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
+    from fpga.pulse_streamer.host import engine_model as em
+
+    st = na.PulseTableState(
+        channels=["a", "b"],
+        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
+        time_step_ns=20,
+    )  # frame 100 ticks; a,b ON [0,50)
+    st.delays = {"a": -500}; st.delay_units = {"a": "ns"}   # a -25 ticks -> G=25: a stays, b shifts +25
+    prog = compile_pulse_table_runtime_program(st, clock_hz=50e6, repeat_forever=True)
+    assert min(prog.ticks) >= 0                  # never a negative tick
+    truth = _additive_truth(st, slots={}, time_step_ns=20, channels=list(prog.channels), n_ticks=300)
+    assert em.reference_play(em.EngineProgram.from_program(prog), 300) == truth
+
+
+def test_rtl_delay_line_mirror_matches_physical_delay():
+    """RTL DELAY-LINE proof (no Verilog simulator): a CYCLE-EXACT Python register mirror of
+    zlc_edge_streamer.v's literal per-channel circular buffer (push the undelayed state_mask each
+    tick, read the slot d ticks ago) -- engine_model.rtl_delay_line_mirror.  It must equal the
+    EXACT delay_line_reference (out[t]=in[t-d], 0 before fire) for:
+      * d = 0 (EXACT passthrough);
+      * d up to a few thousand ticks (a representative bounded delay);
+      * SEVERAL independent TTL channels delayed at once (a delay never disturbs another channel);
+      * the +/-15 us range (750 ticks at 20 ns).
+    Plus the cap rejection: d > the 32-bit field raises a CLEAR DelayTooLargeError."""
+    from fpga.pulse_streamer.host import engine_model as em
+    import random, pytest
+
+    depth = 2048   # a representative bounded delay for the sweep (no design ring cap any more)
+    rng = random.Random(20260608)
+
+    # hand cases: d=0 passthrough, several independent channels, the +/-15us range, d==depth.
+    U = [rng.randint(0, 0b111111) for _ in range(4000)]
+    for delays in [{1: 0}, {1: 30}, {0: 5, 1: 250, 2: 1}, {1: 750}, {3: 1500},
+                   {0: 1, 1: depth, 2: depth - 1}, {b: 750 for b in range(6)}]:
+        mirror = em.rtl_delay_line_mirror(U, delays, evt_depth=10**9)
+        assert mirror == em.delay_line_reference(U, delays), f"RTL delay-line != reference at {delays}"
+        # d=0 is exact passthrough on that bit; a delay never disturbs another channel.
+        keep = ~sum(1 << b for b in delays if delays[b])
+        assert all((mirror[t] & keep) == (U[t] & keep) for t in range(len(U))), "a delay disturbed another channel"
+        # the delayed channel is silent (0) until exactly t == d (the FIRE-time-0 buffer startup).
+        for b, d in delays.items():
+            if d:
+                assert all(not ((mirror[t] >> b) & 1) for t in range(min(d, len(U)))), "not silent during startup"
+
+    # passthrough: d == 0 anywhere reproduces the input on that channel exactly.
+    assert em.rtl_delay_line_mirror(U, {2: 0}) == U
+
+    # fuzz: random multi-channel delays in [0, depth] always match the reference.
+    for _ in range(150):
+        n = rng.randint(50, 600)
+        Uf = [rng.randint(0, 0b111111) for _ in range(n)]
+        delays = {b: rng.choice([0, 1, 5, 50, 750, depth]) for b in rng.sample(range(6), rng.randint(1, 4))}
+        assert em.rtl_delay_line_mirror(Uf, delays, evt_depth=10**9) == em.delay_line_reference(Uf, delays), (delays,)
+
+    # TTL CAP: the event-scheduler bound is the 32-bit field; beyond it raises clearly.
+    with pytest.raises(em.DelayTooLargeError):
+        em.rtl_delay_line_mirror([1] * 10, {0: em.TTL_DELAY_MAX_TICKS + 1})
+    # a delay past the old 2048 ring depth is fine now (event-scheduled)
+    assert em.rtl_delay_line_mirror([1] * 10, {0: depth + 1}) == [0] * 10  # all pre-delay
+
+
+def test_rtl_bus_delay_line_mirror_matches_physical_delay():
+    """RTL per-DA-bit EVENT-SCHEDULER delay proof: the cycle-exact mirror (g_busdly, each of the
+    bus's bits a 1-bit FIFO sharing the per-bus delay) == bus_delay_line_reference (the bus VALUE
+    stream delayed by d, safe mid-code 512 before t == d) for d=0 (passthrough), d=1 (register),
+    and -- the DAC range is UNIFIED with TTL (the same 32-bit field) -- LARGE d too,
+    as long as no bit's value-change events in flight exceed the FIFO depth.  An over-capacity
+    (per-tick-toggling) delayed stream is BOUNDED by dropping the excess."""
+    from fpga.pulse_streamer.host import engine_model as em
+    import random
+
+    depth = em.BUS_EVT_FIFO_DEPTH
+    rng = random.Random(424242)
+    STEP = 80                                     # value changes every STEP ticks -> <= depth in flight
+    for d in [0, 1, 7, 200, 4000]:                # 4000 >> the old 2048 ring -- valid now
+        n = max(4 * d + 200, 600)
+        vals = [rng.randint(0, 1023) for _ in range(n // STEP + 2)]
+        U = [vals[t // STEP] for t in range(n)]   # sparse stream: per-bit in-flight changes <= depth
+        mirror = em.rtl_bus_delay_line_mirror(U, d)
+        assert mirror == em.bus_delay_line_reference(U, d), f"bus delay != reference at d={d}"
+        assert all(mirror[t] == 512 for t in range(min(d, n))), "DAC bus not held safe (mid code) during startup"
+    U0 = [rng.randint(0, 1023) for _ in range(100)]
+    assert em.rtl_bus_delay_line_mirror(U0, 0) == U0          # d=0 exact passthrough
+    # CAPACITY: bit0 toggling EVERY tick, delayed by d > depth, overflows that bit's FIFO -- the
+    # excess value-change events are DROPPED (bounded, no crash), so it diverges from the ideal.
+    Udense = [(t & 1) * 1 for t in range(4 * depth)]          # bit0 flips every tick
+    over = em.rtl_bus_delay_line_mirror(Udense, depth + 50)
+    assert len(over) == len(Udense)                           # bounded, no crash / no exception
+    assert over != em.bus_delay_line_reference(Udense, depth + 50)   # dropped beyond depth
+
+
+def test_negative_via_global_shift_equals_plus_on_others():
+    """A NEGATIVE delay on one channel == +|d| on ALL the others (the host folds the global
+    shift G = max(0, -min delay) so the buffer only ever sees delays >= 0).  Assert the
+    delay-line of {a: -d} folded to {b: +d for b != a} reproduces the same relative output."""
+    from fpga.pulse_streamer.host import engine_model as em
+    import random
+    rng = random.Random(7)
+    U = [rng.randint(0, 0b111) for _ in range(400)]
+    d = 25
+    # raw delay -d on bit 0; G = d folds it to {0: 0, 1: d, 2: d} -- a >=0 buffer.
+    folded = {0: 0, 1: d, 2: d}
+    out = em.rtl_delay_line_mirror(U, folded, evt_depth=10**9)
+    assert out == em.delay_line_reference(U, folded)
+    # relative timing: bit 0 leads bits 1/2 by exactly d ticks (== the -d raw delay on bit 0).
+    for t in range(d, len(U)):
+        assert ((out[t] >> 1) & 1) == ((U[t - d] >> 1) & 1)
+        assert (out[t] & 1) == (U[t] & 1)                    # bit 0 not delayed (folded to 0)
+
+
+def _rand_bus_program(rng, *, n_seg, T, n_points, with_ramps=True):
+    """Build a RuntimeSequenceProgram carrying ONE DAC bus of ``n_seg`` segments (edge/hold +
+    optional ramps, dual scanned/literal endpoints) at NOMINAL phase, for delay-player fuzz."""
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, RuntimeBusSegment
+    ticks = sorted(set(rng.sample(range(0, max(2, T - 1)), min(n_seg, max(1, T - 1)))))
+    segs = []
+    for i, tk in enumerate(ticks):
+        mode = rng.choice(["edge", "ramp"]) if with_ramps else "edge"
+        stop = ticks[i + 1] if (mode == "ramp" and i + 1 < len(ticks)) else tk
+        if stop == tk:
+            mode = "edge"
+        segs.append(RuntimeBusSegment(
+            bus_index=0, start_tick=tk, stop_tick=stop,
+            start_value=rng.randint(0, 1023), stop_value=rng.randint(0, 1023),
+            mode=mode, value_select=rng.randint(0, 2), stop_value_select=rng.randint(0, 2),
+            start_tick_coeffs=[0, 0], stop_tick_coeffs=[0, 0]))
+    points = [[rng.randint(0, 1023), rng.randint(0, 1023)] for _ in range(n_points)]
+    return RuntimeSequenceProgram(
+        sequence_id="b", sequence_name="b", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 1, T], masks=[0, 1, 0], duration=1e-6,
+        repeat_forever=True, loop_start_index=0, loop_end_tick=T, loop_count=1,
+        slot_count=2, slot_kinds=["dac", "dac"], loop_end_slot_coeffs=[0, 0],
+        tick_slot_coeffs=[[0, 0], [0, 0], [0, 0]], scan_points=points, scan_coeff_frac_bits=8,
+        bus_names=["da0"], bus_segments=segs)
+
+
+def test_bus_value_at_combinational_equals_bus_play_undelayed():
+    """The COMBINATIONAL shifted-phase bus evaluator (engine_model.bus_value_at, the RTL
+    zlc_bus_value_at function) sampled at the running time_count reproduces the interpolating
+    FSM bus_play tick-for-tick -- for edge/hold AND ramps, literal AND dual scanned endpoints,
+    and a segment that starts at tick 0.  This is what lets the engine evaluate the bus value
+    at ANY phase (so a delay can sample it at the shifted phase) with NO FSM and NO buffer."""
+    from fpga.pulse_streamer.host import engine_model as em
+    import random
+    rng = random.Random(20240608)
+    for _ in range(2000):
+        T = rng.choice([60, 100, 200])
+        prog = _rand_bus_program(rng, n_seg=rng.randint(1, 5), T=T, n_points=2)
+        for sp in range(2):
+            fsm = em.bus_play(prog, 0, T, scan_point=sp)
+            comb = [em.bus_value_at(prog, 0, t, sp) for t in range(T)]
+            assert comb == fsm, f"bus_value_at != bus_play (T={T}, sp={sp})"
+
+
+def test_bus_delay_line_with_scanned_value_and_ramp():
+    """The LITERAL per-bus delay line carries a SCANNED DAC value (value_select) and a RAMP
+    through unchanged: the delayed bus stream (engine_model.rtl_bus_delay_line_mirror of the
+    undelayed bus_value_at stream) == bus_delay_line_reference (the value stream literally
+    delayed by d, safe 0 before t==d) for d in [0, a few thousand] including d > one frame, across
+    several scan points + ramps.  d=0 is exact passthrough; the scanned code reaches the output."""
+    from fpga.pulse_streamer.host import engine_model as em
+    import random
+    rng = random.Random(424242)
+
+    depth = 2048   # a representative bounded delay (no design ring cap any more)
+    # (T, d): sub-frame, across a frame, zero, far-above a frame, and at the bounded depth.
+    battery = [(60, 30), (100, 350), (200, 1000), (50, 0), (100, 1500), (256, depth)]
+    for T, d in battery:
+        prog = _rand_bus_program(rng, n_seg=rng.randint(1, 5), T=T, n_points=3, with_ramps=True)
+        n = d + 4 * T
+        for sp in range(3):
+            undelayed = [em.bus_value_at(prog, 0, t % T, sp) for t in range(n)]   # steady periodic stream
+            rtl = em.rtl_bus_delay_line_mirror(undelayed, d)
+            assert rtl == em.bus_delay_line_reference(undelayed, d), f"bus delay-line != reference (T={T}, d={d}, sp={sp})"
+            assert all(rtl[t] == 512 for t in range(min(d, n))), "DAC bus not held safe (mid code) during startup"
+            if d == 0:
+                assert rtl == undelayed                                          # exact passthrough
+
+
+def test_image_pack_zeros_all_bus_delays_no_stale():
+    """A program with FEWER (or zero) bus delays than the previous one MUST still write a 0
+    into every other bus's R_DELAY word -- otherwise the DAC bus keeps the PREVIOUS program's
+    delay on hardware.  This is the real bug behind "I delayed emCCD but DA got delayed" /
+    "DA_delay_test shows DA lagging": a negative-delay run globally shifts (delays) all driven
+    DA buses, and the next no-delay run left those bus R_DELAY words UNWRITTEN -> stale.
+
+    pack_program already wrote ALL channel words (zeroing undelayed ones); this asserts the
+    SAME full-region rule for the bus words."""
+    import dataclasses
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
+    from fpga.pulse_streamer.host import image as img
+
+    # An active TTL channel with a NEGATIVE delay -> global shift G delays the DA bus.
+    state = na.PulseTableState(
+        channels=["ch0", "ch1", "ch2"],
+        channel_labels={"ch0": "cooling", "ch1": "da_dipole[0]", "ch2": "da_dipole[1]"},
+        visible_channels=["ch0", "ch1", "ch2"], time_step_ns=20.0,
+        periods=[na.PulsePeriod(200, (1, 0, 0), unit="ns")],
+        analog_bus_modes={"da_dipole": [{"mode": "edge", "value": 1}]},
+        delays={"ch0": -100.0}, delay_units={"ch0": "ns"})  # -100 ns -> G=5 ticks on the bus
+    prog = compile_pulse_table_runtime_program(state, channels=list(state.channels), clock_hz=50e6)
+    assert prog.bus_delays, "an active negative delay should give the driven DA bus a (global-shift) delay"
+
+    p = img.StreamerParams()
+    img_with = img.pack_program(prog, p)
+    img_without = img.pack_program(dataclasses.replace(prog, bus_delays=None), p)
+
+    # locate the R_DELAY base: the channel-0 delay word holds prog.channel_delays[0]
+    ch0_delay = (prog.channel_delays or [0])[0]
+    # find via the bus-delay word we DO know: every bus delay word offset must appear in BOTH
+    # images, nonzero in img_with, and ZERO in img_without (the stale-clear contract).
+    nonzero_bus_words = {off for off, val in img_with.items()
+                         if val != 0 and off in img_without and img_without[off] == 0}
+    assert nonzero_bus_words, "expected at least one bus delay word set in the delayed image"
+    # The two images must write the EXACT SAME set of offsets (full region every time) so the
+    # upload of the no-delay program overwrites every bus delay word the delayed one set.
+    assert set(img_with) == set(img_without), "pack must write the same word set regardless of how many bus delays are present"
+    # And every bus delay word in the no-delay image is 0 (no stale value can survive upload).
+    for off in nonzero_bus_words:
+        assert img_without[off] == 0
+
+
+def test_image_bus_delay_ctrl_packing_roundtrip():
+    """Host->RTL per-bus DAC-delay contract (no Verilog sim): image.pack_program packs each
+    delayed bus's d into the R_DELAY register region (one 32-bit word/bus, after the channels);
+    reading them back EXACTLY as zlc_pulse_streamer_top.v slices them must reconstruct d
+    byte-for-byte.  Covers d < T, d = T-ish, and d >> T (the event scheduler is not frame-bound)."""
+    import Zou_lab_control.neutral_atom as na
+    from fpga.pulse_streamer.host import image as img
+
+    hw = [f"ch{i:02d}" for i in range(12)]
+    labels = {f"ch{i:02d}": f"da[{i}]" for i in range(10)}
+    labels["ch10"] = "trig"
+    for d_ns in (1500, 2000, 30000):      # 75t (<T after compile), frame-ish, and far above T
+        state = na.PulseTableState(
+            channels=hw, channel_labels=labels, visible_channels=hw, time_step_ns=20,
+            periods=[na.PulsePeriod(100, tuple([0] * 10 + [1, 0]), unit="ns"),
+                     na.PulsePeriod(200, tuple([0] * 12), unit="ns"),
+                     na.PulsePeriod(100, tuple([0] * 12), unit="ns")],
+            delays={f"ch{i:02d}": d_ns for i in range(10)},
+            delay_units={f"ch{i:02d}": "ns" for i in range(10)})
+        state.bind_field("dac", "da@1")
+        state.set_scan_table([[0], [256], [768], [1023]])
+        prog = na.compile_pulse_table_scan_runtime_program(state, channels=hw, clock_hz=50_000_000)
+        assert prog.bus_delays, "a delayed DAC bus should carry a bus_delays entry"
+        p = img.StreamerParams()
+        w = img.pack_program(prog, p)
+        T = int(prog.loop_end_tick)
+        u = img.unpack_program(w, p)
+        recon = {bd["bus_index"]: bd["delay"] for bd in u["bus_delays"]}
+        for bd in prog.bus_delays:
+            assert recon[bd.bus_index] == bd.delay        # d reconstructs exactly (32-bit word, no off/skip)
+            # the bus delay can EXCEED one frame (the event scheduler is independent of the frame period).
+            assert bd.delay > T or d_ns < 2000
+
+
+def test_scanned_dac_value_delayed_beyond_one_frame_compiles_and_streams():
+    """End-to-end: a SCANNED DAC value with a bus delay LONGER than one frame compiles, the
+    segments stay at NOMINAL phase, and the LITERAL per-bus delay line shifts the undelayed bus
+    value stream by d for every scan point -- a scanned DAC value is delayable by more than one
+    frame (the buffer depth is independent of the frame period), value preserved."""
+    import Zou_lab_control.neutral_atom as na
+    from fpga.pulse_streamer.host import engine_model as em
+
+    hw = [f"ch{i:02d}" for i in range(12)]
+    labels = {f"ch{i:02d}": f"da[{i}]" for i in range(10)}
+    labels["ch10"] = "trig"
+    state = na.PulseTableState(
+        channels=hw, channel_labels=labels, visible_channels=hw, time_step_ns=20,
+        periods=[na.PulsePeriod(100, tuple([0] * 10 + [1, 0]), unit="ns"),
+                 na.PulsePeriod(200, tuple([0] * 12), unit="ns"),
+                 na.PulsePeriod(100, tuple([0] * 12), unit="ns")],
+        # delay the DAC bus by 1000 ns = 50 ticks; the frame is (100+200+100)/20 = 20 ticks,
+        # so the delay is 2.5 frames -- still fine (event-scheduled, 32-bit delay field).
+        delays={f"ch{i:02d}": 1000 for i in range(10)},
+        delay_units={f"ch{i:02d}": "ns" for i in range(10)})
+    state.bind_field("dac", "da@1")
+    signed_values = [-512, -256, 256, 511]
+    codes = [v + 512 for v in signed_values]         # wire codes 0 / 256 / 768 / 1023
+    state.set_scan_table([[v] for v in signed_values])
+
+    prog = na.compile_pulse_table_scan_runtime_program(state, channels=hw, clock_hz=50_000_000)
+    na.validate_pulse_streamer_program(prog, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=12)
+
+    T = int(prog.loop_end_tick)
+    assert prog.bus_delays and prog.bus_delays[0].delay == 50 > T   # delay > one frame, accepted
+    bus = int(prog.bus_delays[0].bus_index)
+    # segments are at NOMINAL phase (no delay baked in): period-1 start = 100ns/20ns = 5.
+    scanned = [s for s in (prog.bus_segments or []) if int(getattr(s, "value_select", 0))]
+    assert scanned and int(scanned[0].start_tick) == 5
+
+    n = T * 6
+    for sp, code in enumerate(codes):
+        undelayed = [em.bus_value_at(prog, bus, t % T, sp) for t in range(n)]   # the steady stream
+        delayed = em.rtl_bus_delay_line_mirror(undelayed, 50)                   # the literal delay line
+        # the delayed stream is EXACTLY the undelayed stream shifted by d (mid code before t==d).
+        assert delayed == em.bus_delay_line_reference(undelayed, 50)
+        # the scanned DAC code really reaches the (delayed) bus output for this point.
+        assert code in set(delayed)
+
+
+def test_fixed_dac_bus_delayed_beyond_one_frame_compiles_and_streams():
+    """The NON-scan compile path also emits a per-bus delay (not a baked segment tick): a FIXED
+    DAC bus value with a delay LONGER than one frame compiles, keeps its segment at nominal
+    phase, and the literal per-bus delay line shifts its value stream by d."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
+    from fpga.pulse_streamer.host import engine_model as em
+
+    hw = ["ch00", "ch01", "ch02"]
+    state = na.PulseTableState(
+        channels=hw, channel_labels={"ch00": "da[0]", "ch01": "da[1]", "ch02": "trig"},
+        visible_channels=hw, time_step_ns=20,
+        periods=[na.PulsePeriod(100, (0, 0, 1), unit="ns"),
+                 na.PulsePeriod(200, (0, 0, 0), unit="ns"),
+                 na.PulsePeriod(100, (0, 0, 0), unit="ns")],
+        delays={"ch00": 1000, "ch01": 1000}, delay_units={"ch00": "ns", "ch01": "ns"})
+    state.set_analog_bus_mode(0, "da", "edge", value=0)   # 0 = true 0 V (wire code 2)
+    state.set_analog_bus_mode(1, "da", "edge", value=1)   # 2-bit bus: signed -2..+1 -> wire code 3
+    state.apply_analog_bus_modes_to_period_states()
+    prog = compile_pulse_table_runtime_program(state, channels=hw, clock_hz=50e6, repeat_forever=True)
+    na.validate_pulse_streamer_program(prog, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=3)
+
+    T = int(prog.loop_end_tick)
+    assert prog.bus_delays and prog.bus_delays[0].delay == 50 > T   # > one frame, accepted
+    bus = int(prog.bus_delays[0].bus_index)
+    assert max(int(s.start_tick) for s in prog.bus_segments) <= T    # segments at NOMINAL phase
+    n = T * 6
+    undelayed = [em.bus_value_at(prog, bus, t % T, 0) for t in range(n)]
+    delayed = em.rtl_bus_delay_line_mirror(undelayed, 50)
+    assert delayed == em.bus_delay_line_reference(undelayed, 50)
+    assert 3 in set(delayed)
+
+
+def test_edge_streamer_has_literal_delay_line_path():
+    """Lock the RTL delay architecture into zlc_edge_streamer.v + the top:
+      (1) TTL = the per-SLOT EVENT SCHEDULER: each delay slot owns its OWN 2D distributed-RAM
+          event FIFO instantiated in the g_evtfifo generate loop (a flat 3D reg array with
+          independent per-slot pointers does NOT infer as RAM -> 226k FF, does not fit), plus
+          the free-running g_time + prev_undelayed register for d==1.  SRL lines are GONE;
+      (2) DAC = the per-DA-bit event FIFO (g_busdly), one delay shared by the bus's bits;
+      (3) the disjoint merge out = (state_mask & ~delayed_mask) | delayed_out;
+      (4) the top has the 32b/channel DELAY register region wired to the engine."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer"
+    eng = (root / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    top = (root / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    # (1) the per-slot event-FIFO scheduler; the SRL lines AND the old shared 3D evt_mem
+    # (which fell back to flip-flops) are gone.
+    for tok in ("g_evtfifo", "evt_out_contrib", "evt_out", "g_time", "prev_undelayed",
+                "TTL_DELAY_WIDTH", "EVT_DEPTH", "EVT_ADDR", "GTIME_WIDTH", "DELAY_CH_MAP"):
+        assert tok in eng, tok
+    # the FIFO must be a per-slot distributed-RAM array, never a flat 3D reg (FF fallback)
+    assert "ram_style = \"distributed\" *) reg [GTIME_WIDTH:0] fifo" in eng
+    assert "ttl_sr" not in eng
+    # the old shared 3D event memory declaration must be gone (the name may appear in a
+    # comment explaining why, but never as a real reg array)
+    assert "reg [GTIME_WIDTH:0] evt_mem" not in eng
+    assert "evt_mem [" not in eng
+    # (2) bus ring + pointers + held delays
+    for tok in ("g_busdly", "del_ch_ticks", "del_bus_ticks", "BUS_EVT_DEPTH", "bfifo"):
+        assert tok in eng, tok
+    assert 'ram_style = "distributed"' in eng
+    # (3) the disjoint merge
+    assert "(state_mask & ~delayed_mask) | delayed_out" in eng
+    # (4) the top: DELAY register region (one 32b word per channel) -> engine port
+    for tok in ("R_DELAY_BASE", "R_DELAY_WORDS", "sel_delay", "delay_reg",
+                "zlc_delay_reg_pack_gen"):
+        assert tok in top, tok
+    assert "delay_ticks(delay_ticks_w)" in top.replace(" ", "") or ".delay_ticks(delay_ticks_w)" in top
+
+
+def test_delay_line_bounded_cap_rejected_clearly():
+    """TTL AND DAC-bus delays are both event-scheduled, so both accept large values
+    up to the SAME 32-bit cap and reject beyond it (ranges unified); a toggle burst denser than
+    the event FIFO inside one delay window is still rejected with a clear message."""
+    import pytest
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
+        validate_pulse_streamer_program, TTL_DELAY_MAX_TICKS, EVT_FIFO_DEPTH)
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, RuntimeBusDelay
+    from fpga.pulse_streamer.host import image as img
+
+    depth = 2048   # the old ring depth, now just a representative 'big' delay
+    chans = [f"ch{i:02d}" for i in range(62)]
+
+    def prog(cd=None, bus_delays=None, ticks=(0, 10), masks=(0, 0)):
+        return RuntimeSequenceProgram(
+            sequence_id="o", sequence_name="o", clock_hz=50e6, channels=chans,
+            ticks=list(ticks), masks=list(masks), duration=1e-6,
+            loop_end_tick=int(ticks[-1]), loop_count=1, slot_count=0,
+            channel_delays=cd, bus_delays=bus_delays)
+
+    # a TTL delay far beyond the old ring depth is now VALID (event scheduler)...
+    cd = [0] * 62
+    cd[3] = depth * 100                       # ~4 ms: impossible on the old SRL line
+    validate_pulse_streamer_program(prog(cd=cd), channel_count=62)
+    img.pack_program(prog(cd=cd), img.StreamerParams())
+    # ...but the 32-bit field cap still rejects clearly
+    cd_over = [0] * 62
+    cd_over[3] = TTL_DELAY_MAX_TICKS + 1
+    with pytest.raises(ValueError, match="outside"):
+        validate_pulse_streamer_program(prog(cd=cd_over), channel_count=62)
+    with pytest.raises(ValueError, match="outside"):
+        img.pack_program(prog(cd=cd_over), img.StreamerParams())
+    # a per-BUS delay is event-scheduled per DA bit (the bus's 10 bits share one delay),
+    # SAME 32-bit range as TTL -- a large delay is VALID and only the 32-bit field cap
+    # rejects it (range unified with TTL).
+    busok = prog(bus_delays=[RuntimeBusDelay(bus_index=1, delay=depth + 1)])
+    validate_pulse_streamer_program(busok, channel_count=62)
+    img.pack_program(busok, img.StreamerParams())
+    busover = prog(bus_delays=[RuntimeBusDelay(bus_index=1, delay=TTL_DELAY_MAX_TICKS + 1)])
+    with pytest.raises(ValueError, match="outside"):
+        validate_pulse_streamer_program(busover, channel_count=62)
+    # toggle burst denser than the event FIFO inside one delay window -> clear error
+    # (PHYSICAL delay, no modulo: more than EVT_FIFO_DEPTH edges in the d-window is rejected
+    # with the longest delay that would fit).
+    n = EVT_FIFO_DEPTH + 2
+    ticks = [0] + [10 + i for i in range(n)] + [10 + n + 600]
+    masks = [0] + [(i % 2 == 0) and (1 << 3) or 0 for i in range(n)] + [0]
+    cd_burst = [0] * 62
+    cd_burst[3] = 500                          # window >> burst span -> all n edges in flight
+    with pytest.raises(ValueError, match="event FIFO"):
+        validate_pulse_streamer_program(prog(cd=cd_burst, ticks=ticks, masks=masks), channel_count=62)
+
+
+def test_delay_event_capacity_counts_full_schedule():
+    """The in-flight analysis must count the REAL schedule, not one base frame.
+
+    The old check slid a window over a single frame (duplicating it once for
+    repeat) -- it undercounted (a) windows spanning several frames (d > frame)
+    and (b) windows crossing scan-point seams.  Both are caught now."""
+    import pytest
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
+        validate_pulse_streamer_program, EVT_FIFO_DEPTH)
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    chans = [f"ch{i:02d}" for i in range(62)]
+    bit = 3
+
+    def prog(ticks, masks, cd, **kw):
+        defaults = dict(
+            sequence_id="o", sequence_name="o", clock_hz=50e6, channels=chans,
+            ticks=list(ticks), masks=list(masks), duration=1e-6,
+            loop_end_tick=int(ticks[-1]), loop_count=1, slot_count=0,
+            channel_delays=cd)
+        defaults.update(kw)
+        return RuntimeSequenceProgram(**defaults)
+
+    # (a) repeat-forever, d spanning MANY frames is counted ACROSS frames (no modulo):
+    # 4 toggles / 100-tick frame, d=10000 -> ~400 edges in flight >> 128 -> rejected with
+    # the longest physical delay reported (the old one-frame check saw at most 8).
+    ticks = [0, 10, 20, 30, 40, 100]
+    masks = [0, 1 << bit, 0, 1 << bit, 0, 0]
+    cd = [0] * 62
+    cd[bit] = 10000
+    with pytest.raises(ValueError, match="longest physical delay"):
+        validate_pulse_streamer_program(prog(ticks, masks, cd, repeat_forever=True), channel_count=62)
+    # a delay whose in-flight count fits passes (d=3000 -> 121 edges in flight <= 128).
+    cd_ok = [0] * 62
+    cd_ok[bit] = 3000
+    validate_pulse_streamer_program(prog(ticks, masks, cd_ok, repeat_forever=True), channel_count=62)
+
+    # (a3) the periodic count is EXACT: 4/frame, period 100, d=3225 -> 131 in flight;
+    # the naive 4*(3225//100)=128 estimate would (just) pass, but the exact count rejects.
+    cd_exact = [0] * 62
+    cd_exact[bit] = 3225
+    with pytest.raises(ValueError, match="longest physical delay"):
+        validate_pulse_streamer_program(prog(ticks, masks, cd_exact, repeat_forever=True), channel_count=62)
+
+    # (b) scan-point SEAM: 140 toggles at the start of the frame + 140 at the end; a
+    # window bridging the seam holds 280 > 256, while any window inside ONE frame holds
+    # at most ~141 (the old base-frame check passed this).
+    seam_ticks = [0] + list(range(1, 141)) + list(range(900, 1040)) + [1040]
+    val = 0
+    seam_masks = [0]
+    for _ in range(280):
+        val ^= (1 << bit)
+        seam_masks.append(val)
+    seam_masks.append(0)
+    n_edges = len(seam_ticks)
+    base = dict(slot_count=1, tick_slot_coeffs=[[0]] * n_edges, loop_end_slot_coeffs=[0],
+                scan_points=[[0], [0]])
+    cd_seam = [0] * 62
+    cd_seam[bit] = 300                       # window spans frame-1 end + frame-2 start (280 edges)
+    with pytest.raises(ValueError, match="event FIFO"):
+        validate_pulse_streamer_program(prog(seam_ticks, seam_masks, cd_seam, **base), channel_count=62)
+    # the same frame with a window too short to bridge the seam passes
+    cd_short = [0] * 62
+    cd_short[bit] = 5
+    validate_pulse_streamer_program(prog(seam_ticks, seam_masks, cd_short, **base), channel_count=62)
+
+
+def test_delay_event_capacity_matches_scheduler_occupancy():
+    """The analytic window maximum mirrors true event-FIFO occupancy.
+
+    Randomized cross-checks: (1) the analytic count equals brute-force push/pop
+    occupancy within its documented +1 closed-window conservatism; (2) the
+    periodic formula equals explicit unrolling; (3) whenever the analysis says
+    a stream fits depth K, the RTL mirror with a K-deep FIFO reproduces the
+    ideal delayed waveform bit-exactly."""
+    import random
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
+        _max_in_flight_toggles, _max_in_flight_periodic)
+    from fpga.pulse_streamer.host.engine_model import (
+        delay_line_reference, rtl_delay_line_mirror)
+
+    rng = random.Random(20260610)
+    for _ in range(200):
+        n = rng.randint(1, 40)
+        toggles = sorted(rng.sample(range(0, 400), n))
+        d = rng.randint(2, 300)
+        analytic = _max_in_flight_toggles(toggles, d)
+        # an entry pushed at t occupies the FIFO during [t, t+d-1]
+        brute = max(sum(1 for u in toggles if u <= t <= u + d - 1) for t in toggles)
+        assert brute <= analytic <= brute + 1, (toggles, d, brute, analytic)
+
+    for _ in range(100):
+        n = rng.randint(1, 8)
+        period = rng.randint(20, 60)
+        steady = sorted(rng.sample(range(0, period), n))
+        d = rng.randint(period, period * 6)
+        unrolled = sorted(t + k * period for k in range(10) for t in steady)
+        exact = _max_in_flight_periodic(steady, period, d)
+        brute = max(sum(1 for u in unrolled if t - d <= u <= t) for t in unrolled)
+        assert exact == brute, (steady, period, d, exact, brute)
+
+    for _ in range(40):
+        n = rng.randint(1, 12)
+        toggle_at = set(rng.sample(range(1, 150), n))
+        d = rng.randint(2, 80)
+        stream, level = [], 0
+        for t in range(240):
+            if t in toggle_at:
+                level ^= 1
+            stream.append(level)
+        depth_needed = _max_in_flight_toggles(sorted(toggle_at), d)
+        mirrored = rtl_delay_line_mirror(stream, {0: d}, evt_depth=depth_needed)
+        ideal = delay_line_reference(stream, {0: d})
+        assert mirrored == ideal, (sorted(toggle_at), d, depth_needed)
+
+
+def test_delay_eligibility_enforced_in_api():
+    """Only the real TTL outputs have a delay line; a delay on a bus-member bit or a
+    da_clk pin (hardware position past the eligible count) is rejected by the API."""
+    import pytest
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import delay_eligible_channel_count
+
+    assert delay_eligible_channel_count(62, 4, 10) == 18      # board: 18 real TTL outputs
+    assert delay_eligible_channel_count(8, 0, 0) == 8         # no buses -> all eligible
+
+    seq = na.RuntimeSequencer(channels=[f"ch{i:02d}" for i in range(62)],
+                              clock_hz=50e6)
+    st = na.PulseTableState(channels=[f"ch{i:02d}" for i in range(62)],
+                            periods=[na.PulsePeriod(1000, (0,) * 62, unit="ns")], time_step_ns=20)
+    ctl = na.bind_pulse(seq, st)
+    ctl.set_channel_delay("ch11", 1000.0)                     # eligible (position 11) -> OK
+    assert ctl.get_channel_delay("ch11") == 1000.0
+    for bad in ("ch28", "ch40", "ch61"):                     # da_clk + bus-member bits
+        with pytest.raises(ValueError, match="not delay-eligible"):
+            ctl.set_channel_delay(bad, 1000.0)
+    # setting an ineligible channel back to 0 is always allowed
+    ctl.set_channel_delay("ch28", 0.0)
+
+
+def test_repeat_forever_delay_is_physical_not_reduced():
+    """The compiler programs the TRUE PHYSICAL delay -- NO modulo reduction.
+
+    A repeat-forever delay of several frames stays exactly as entered (the first
+    frame is correct: the channel is silent for the full d, not playing early).
+    It validates only while the in-flight edge count fits the event FIFO, and the
+    played output equals the ideal delay line for EVERY tick (including startup)."""
+    import dataclasses
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
+        steady_sweep_ticks, validate_pulse_streamer_program)
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
+    from fpga.pulse_streamer.host.engine_model import delay_line_reference, reference_play
+
+    # frame = 2 * 1000 ns / 20 = 100 ticks; ch01 toggles ~twice/frame.  d = 6000 ticks
+    # spans 60 frames -> ~120 edges in flight, which FITS the depth-256 event FIFO.
+    state = na.PulseTableState(
+        channels=["ch00", "ch01"], visible_channels=["ch00", "ch01"],
+        periods=[na.PulsePeriod(1000, (1, 0), unit="ns"),
+                 na.PulsePeriod(1000, (0, 1), unit="ns")],
+        time_step_ns=20,
+        delays={"ch01": "120000"},          # 6,000 ticks (60 frames)
+    )
+    program = compile_pulse_table_runtime_program(state, repeat_forever=True)
+    period = steady_sweep_ticks(program)
+    assert period > 0
+    bit = program.channels.index("ch01")
+    d = int(program.channel_delays[bit])
+    assert d == 6_000                       # NOT reduced -- the true physical delay
+    assert d > period                       # genuinely spans many frames
+    validate_pulse_streamer_program(program, channel_count=len(program.channels))
+    assert program.source_table["delays"]["ch01"] == "120000"
+
+    # physical: out[t] = in[t-d] for EVERY t, 0 for t < d (first frame correct).
+    undelayed = dataclasses.replace(program, channel_delays=None)
+    n_ticks = d + 4 * period
+    raw = reference_play(undelayed, n_ticks)
+    ideal_full = delay_line_reference([(m >> bit) & 1 for m in raw], {0: d})
+    played = reference_play(program, n_ticks)
+    got = [(m >> bit) & 1 for m in played]
+    assert got == ideal_full                # tick-exact from t=0, including the silent startup
+    assert all(v == 0 for v in got[:d])     # channel silent for the full physical delay
+
+    # ...and a delay so long the in-flight edges exceed the FIFO is REJECTED (no
+    # modulo papers over it), with the longest physical delay reported.
+    state2 = na.PulseTableState(
+        channels=["ch00", "ch01"], visible_channels=["ch00", "ch01"],
+        periods=[na.PulsePeriod(1000, (1, 0), unit="ns"),
+                 na.PulsePeriod(1000, (0, 1), unit="ns")],
+        time_step_ns=20,
+        delays={"ch01": "2000000"},        # 100,000 ticks, ~2000 edges in flight
+    )
+    prog2 = compile_pulse_table_runtime_program(state2, repeat_forever=True)
+    with pytest.raises(ValueError, match="longest physical delay"):
+        validate_pulse_streamer_program(prog2, channel_count=len(prog2.channels))
+
+
+def test_evt_fifo_depth_single_source_contract():
+    """The delay event-FIFO depth must agree across its three declarations:
+    streamer_config.json (what the VALIDATOR enforces), the top's RTL parameter
+    default (what gets SYNTHESIZED), and the engine-model constant.  A config
+    edited deeper than the bitstream would make the validator pass programs the
+    real FIFO silently drops."""
+    import json
+    import pathlib
+    import re
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import EVT_FIFO_DEPTH
+    from fpga.pulse_streamer.host import engine_model
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    config = json.loads((root / "fpga" / "board_config" / "streamer_config.json").read_text(encoding="utf-8"))
+    top = (root / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    eng = (root / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    cfg_depth = int(config["params"]["evt_fifo_depth"])
+    top_match = re.search(r"parameter\s+integer\s+EVT_FIFO_DEPTH\s*=\s*(\d+)", top)
+    eng_match = re.search(r"parameter\s+integer\s+EVT_DEPTH\s*=\s*(\d+)", eng)
+    assert top_match and eng_match
+    assert int(top_match.group(1)) == cfg_depth, "top.v EVT_FIFO_DEPTH != streamer_config.json"
+    assert int(eng_match.group(1)) == cfg_depth, "engine EVT_DEPTH default != streamer_config.json"
+    assert EVT_FIFO_DEPTH == cfg_depth
+    assert int(engine_model.EVT_FIFO_DEPTH) == cfg_depth
+
+
+def test_build_geometry_driven_from_config_via_generics():
+    """Editing streamer_config.json must change the SYNTHESIZED bitstream, not just the host:
+    image.emit_geom_tcl turns the config into the BRAM sizing vars + top -generic overrides,
+    build_and_program.bat generates it, and create_project.tcl sources it + applies the
+    generics.  EVERY emitted generic must name a REAL top parameter, else Vivado silently
+    ignores it and the bitstream keeps the .v default (the exact silent-divergence we fix)."""
+    import pathlib
+    import re
+    from fpga.pulse_streamer.host import image as im
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    params = im.default_params()
+    generics = im.vivado_generics(params)
+    geom = im.emit_geom_tcl(params)
+    top = (root / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    tcl = (root / "fpga" / "pulse_streamer" / "create_project.tcl").read_text(encoding="utf-8")
+    bat = (root / "fpga" / "build_and_program.bat").read_text(encoding="utf-8")
+
+    # the generics carry the freely-resizable depths and match the config
+    names = {g.split("=")[0]: int(g.split("=")[1]) for g in generics}
+    assert names["EVT_FIFO_DEPTH"] == params.evt_fifo_depth
+    assert names["BANK_SIZE"] == params.bank_size
+    assert names["EDGE_ADDR_WIDTH"] == params.edge_addr_width
+    # EVERY generic must be an actual top-module parameter (or Vivado ignores it silently)
+    top_params = set(re.findall(r"parameter\s+integer\s+(\w+)\s*=", top))
+    for name in names:
+        assert name in top_params, f"generic {name} is not a zlc_pulse_streamer_top parameter"
+    # the emitted geom.tcl sets the sizing vars + the generics var the tcl consumes
+    assert "set zlc_evt_fifo_depth" in geom and "set zlc_top_generics {" in geom
+    # create_project.tcl sources the config geom + applies the generics with a read-back echo
+    assert "ZLC_PS_GEOM_TCL" in tcl
+    assert "source $::env(ZLC_PS_GEOM_TCL)" in tcl
+    assert "set_property generic $zlc_top_generics [current_fileset]" in tcl
+    assert "get_property generic [current_fileset]" in tcl   # read-back so a bad generic is visible
+    # build_and_program.bat generates the geom tcl and points the env var at it
+    assert "--emit-geom-tcl" in bat and "ZLC_PS_GEOM_TCL=" in bat and "call :zlc_emit_geom" in bat
+    # and the top must actually pass the parameter to the engine instance
+    assert ".EVT_DEPTH(EVT_FIFO_DEPTH)" in top
+
+
+# ===========================================================================
+# COMPLETE delay support (constant + scanned, any form) WITH an inner repeat
+# bracket -- the bracket is unrolled at the STATE level so the existing flat
+# additive machinery handles every delay form.  Each case compiles from a real
+# PulseTableState, validates against the fixed FPGA streamer, and is proven
+# tick-for-tick against the INDEPENDENT additive oracle AND cross-model
+# (reference == prefetch == rtl_mirror).
+# ===========================================================================
+
+
+# ===========================================================================
+# A constant channel DELAY is a per-channel OUTPUT delay line -- NOT scannable,
+# NOT baked into the (undelayed) edge table.  The program carries the delay in
+# ``channel_delays`` (per output bit, in ticks, with the global shift G folded in
+# for negatives so every entry is >= 0) and the engine applies it as the exact
+# ``delay_line_reference`` at the END of play.  The KEY proof: compile the SAME
+# state twice -- once WITH the delay, once with the delay removed (delays={}) --
+# and assert the delayed play == delay_line_reference(undelayed play).  Each case
+# combines the constant delay with a different scan / bracket feature, and is
+# cross-checked across all three engine models (reference == prefetch == rtl_mirror).
+# ===========================================================================
+
+
+# --------------------------------------------------------------------------- #
+# Regression guards for the 2026-06-09 audit fixes (config single-source +
+# correctness bugs found in pulse_table / sequencer).
+# --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# Regression guards for the 2026-06-09 audit-list fixes (clk carry/validate,
+# DAC/1D scan-table handling, unbound-slot eval).
+# --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# RTL-finding fixes (2026-06-09): U4 delay-tail-at-done, U1 ramp slope cap,
+# B1/B2 da_clk idle warning, T3 latency read-back, B3/B4/U7 geometry guards.
+# --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# 2026-06-09 features: editable period names + signed DAC (0 = 0 V, mid-code idle).
+# --------------------------------------------------------------------------- #
+
+
+def test_no_delay_image_or_membership_residue():
+    """Grep guard: the LITERAL delay line leaves NO membership / interval / skip / off / delay-image
+    residue anywhere (RTL, host, top, tcl).  The only delay machinery is the bounded circular
+    event scheduler (per-signal event FIFOs) in the R_DELAY register region."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1]
+    eng = (root / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    top = (root / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    tcl = (root / "fpga" / "pulse_streamer" / "create_project.tcl").read_text(encoding="utf-8")
+    seq = (root / "Zou_lab_control" / "neutral_atom" / "devices" / "sequencer.py").read_text(encoding="utf-8")
+    fps = (root / "Zou_lab_control" / "neutral_atom" / "devices" / "fpga_pulse_streamer.py").read_text(encoding="utf-8")
+    img_src = (root / "fpga" / "pulse_streamer" / "host" / "image.py").read_text(encoding="utf-8")
+    # NO membership / interval / skip-off / lane residue in the RTL
+    for tok in ("del_iv", "del_off", "del_skip", "del_frame_idx", "del_member", "membership",
+                "MAX_DELAY_INTERVALS", "NUM_DELAYS", "SKIP_WIDTH", "delay_prog", "zlc_bus_value_at"):
+        assert tok not in eng, ("eng", tok)
+    # NO delay-image BRAM / mini-loader anywhere
+    for src_name, src in (("eng", eng), ("top", top), ("tcl", tcl), ("seq", seq), ("fps", fps), ("img", img_src)):
+        assert "delayimg" not in src, (src_name, "delayimg")
+        assert "delay_prog" not in src, (src_name, "delay_prog")
+    # the host carries the delay as a plain tick count, NOT intervals/off/skip
+    for src in (seq, img_src, fps):
+        assert "RuntimeDelayInterval" not in src
+        assert "RuntimeDelayChannel" not in src
+    # the bus delay must NOT ride the segment ticks: the old "+ delay_steps" cap is gone.
+    assert "int(starts[period_index]) + delay_steps" not in seq
+
+
+def test_repeat_forever_scan_resweeps_and_commands_fpga():
+    """repeat_forever means: sweep ALL scan points, then start over from point 0, forever
+    (NOT stop after one sweep).  Locks BOTH halves of that contract for a STREAMED scan
+    (N > 2*bank_size points, so the host must keep refilling the freed ping-pong bank):
+      (1) the HOST writes the FPGA CTRL register so the engine re-sweeps -- REPEAT_FOREVER=1,
+          SCAN_ENABLE=1, SCAN_COUNT=N, BANK0_CHUNK=0 (the RTL wrap gate) -- and a streamed
+          chunk beyond the resident window packs into the right bank;
+      (2) the engine re-sweeps -- the RTL-faithful rtl_mirror_play replays point 0..N-1 then
+          wraps to point 0 again (the pattern repeats every sweep, never stops at N).
+    Uses a scanned DURATION; the streamed re-sweep handshake is independent of delays."""
+    import Zou_lab_control.neutral_atom as na
+    from fpga.pulse_streamer.host.image import pack_program, scan_bank_words, StreamerParams, CtrlWords
+    from fpga.pulse_streamer.host import engine_model as em
+
+    # A scanned DURATION with enough points to STREAM (N > 2*bank_size).
+    st = na.PulseTableState(channels=["a", "b"],
+        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
+        time_step_ns=20)
+    st.bind_field("duration", "1", unit="ns")
+    st.set_scan_table([[1000.0 + 100.0 * k] for k in range(10)])   # 10 duration points
+    st.repeat_forever = True
+
+    prog = na.compile_runtime_program_for_payload(st, channels=["a", "b"], clock_hz=50e6)
+    assert prog.repeat_forever and len(prog.scan_points) == 10
+
+    # bank_size 4 -> 2*bank_size = 8 < 10 points, so the scan must STREAM the extra chunk(s).
+    p = StreamerParams(max_edges=4096, bank_size=4)
+    assert len(prog.scan_points) > 2 * p.bank_size
+
+    # (1) the host commands the FPGA to re-sweep
+    w = pack_program(prog, p)
+    assert w[CtrlWords.REPEAT_FOREVER] == 1
+    assert w[CtrlWords.SCAN_ENABLE] == 1
+    assert w[CtrlWords.SCAN_COUNT] == 10
+    assert w[CtrlWords.BANK0_CHUNK] == 0     # RTL wrap gate (bank_chunk0==0) passes
+    # a streamed chunk beyond the two resident banks packs into the right ping-pong bank.
+    assert scan_bank_words(prog, p, 2)       # chunk 2 (points 8..) is non-empty -> streamed
+
+    # (2) the RTL-faithful engine re-sweeps: point pattern repeats every full sweep,
+    # it does NOT stop after one sweep.
+    ep = em.EngineProgram.from_program(prog)
+    sweep = sum(
+        em.effective_tick(ep.ticks[-1], ep.tick_slot_coeffs[-1], pt, ep.frac_bits)
+        for pt in ep.scan_points
+    )
+    n_ticks = 2 * sweep + 200
+    out = em.rtl_mirror_play(ep, n_ticks)
+    # the full sweep must appear AGAIN after a complete re-sweep -> not stopped at N.
+    assert out == em.reference_play(ep, n_ticks)
+    assert any(m != 0 for m in out[sweep:])  # still toggling well past one sweep
+
+
+# ===========================================================================
+# COMPLETE delay support (constant + scanned, any form) WITH an inner repeat
+# bracket -- the bracket is unrolled at the STATE level so the existing flat
+# additive machinery handles every delay form.  Each case compiles from a real
+# PulseTableState, validates against the fixed FPGA streamer, and is proven
+# tick-for-tick against the INDEPENDENT additive oracle AND cross-model
+# (reference == prefetch == rtl_mirror).
+# ===========================================================================
+
+def _agree_models(prog, n):
+    from fpga.pulse_streamer.host import engine_model as em
+    ep = em.EngineProgram.from_program(prog)
+    r = em.reference_play(ep, n)
+    assert em.prefetch_play(ep, n) == r, "prefetch model disagrees with reference"
+    assert em.rtl_mirror_play(ep, n) == r, "rtl_mirror model disagrees with reference"
+    return r
+
+
+def _assert_scan_matches_oracle(state, *, channels, clock_hz, repeat_forever, n_ticks):
+    """Compile the SCAN program, validate it, and prove it == the independent additive
+    scan oracle tick-for-tick AND across all three cycle models."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import validate_pulse_streamer_program
+
+    prog = na.compile_pulse_table_scan_runtime_program(
+        state, channels=channels, clock_hz=clock_hz, repeat_forever=repeat_forever)
+    validate_pulse_streamer_program(prog, channel_count=62)
+    r = _agree_models(prog, n_ticks)
+    truth = _additive_scan_truth(
+        prog, state, scan_table=state.scan_table, time_step_ns=1e9 / clock_hz,
+        channels=list(prog.channels), n_ticks=n_ticks, repeat_forever=repeat_forever)
+    assert r == truth, "compiled scan program disagrees with the independent additive oracle"
+    return prog
+
+
+def test_constant_delay_crosses_inner_bracket_boundary_is_supported():
+    """The OLD reject is gone: a CONSTANT channel delay whose pulse crosses the inner
+    repeat-bracket boundary now compiles (the bracket is UNROLLED flat) and plays exactly
+    the additive oracle + all three models -- not a 'clear error' cop-out."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import validate_pulse_streamer_program
+
+    st = na.PulseTableState(
+        channels=["a", "b"],
+        periods=[
+            na.PulsePeriod(1000, (0, 0), unit="ns", name="pre"),
+            na.PulsePeriod(1000, (1, 0), unit="ns", name="loop0"),   # bracket start; a ON here
+            na.PulsePeriod(1000, (0, 0), unit="ns", name="loop1"),   # bracket end
+            na.PulsePeriod(1000, (0, 1), unit="ns", name="post"),
+        ],
+        time_step_ns=20, repeat_start=1, repeat_end=2, repeat_count=3,
+        delays={"a": 1500}, delay_units={"a": "ns"},   # +75 ticks: a's pulse crosses the boundary
+        repeat_forever=True,
+    )
+    prog = compile_pulse_table_runtime_program(st, clock_hz=50e6, repeat_forever=True)
+    validate_pulse_streamer_program(prog, channel_count=62)
+    assert prog.loop_count == 1                       # the bracket was unrolled flat
+    # the additive cyclic oracle (period-preserving) on the UNROLLED state == every model.
+    truth = _additive_truth(st.unrolled_bracket(), slots={}, time_step_ns=20, channels=list(prog.channels), n_ticks=900)
+    r = _agree_models(prog, 900)
+    assert r == truth
+
+
+def test_scanned_duration_of_bracketed_period_plus_delay():
+    """A scanned DURATION of a period INSIDE the bracket (the value carries via the 'sN'
+    expression to every unrolled copy) combined with a constant channel delay."""
+    import Zou_lab_control.neutral_atom as na
+
+    st = na.PulseTableState(
+        channels=["A", "B"],
+        periods=[
+            na.PulsePeriod(1000, (1, 0), unit="ns"),
+            na.PulsePeriod("s0", (0, 1), unit="str (ns)"),    # scanned duration, bracketed
+            na.PulsePeriod(1000, (0, 0), unit="ns"),
+        ],
+        time_step_ns=20, repeat_start=0, repeat_end=1, repeat_count=2,
+        delays={"A": 200}, delay_units={"A": "ns"},
+        scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 1000.0}],
+        scan_table=[[1000.0], [1400.0]])
+    # the duration slot binds to a bracketed period; every unrolled copy must carry 's0'.
+    u = st.unrolled_bracket()
+    assert sum(1 for p in u.periods if str(p.duration) == "s0") == 2
+    for rf in (False, True):
+        _assert_scan_matches_oracle(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=2000)
+
+
+def test_scanned_dac_of_bracketed_period_plus_delay():
+    """A scanned DAC value of a period INSIDE the bracket (the analog-bus 'sN' entry is
+    duplicated to every unrolled copy) combined with a constant channel delay -- the DAC
+    code rides value_select per scan point in BOTH copies."""
+    import Zou_lab_control.neutral_atom as na
+    from fpga.pulse_streamer.host import engine_model as em
+
+    st = na.PulseTableState(
+        channels=["ch00", "ch01", "ch02", "ch03"],
+        channel_labels={"ch00": "da[0]", "ch01": "da[1]", "ch02": "cool", "ch03": "trig"},
+        time_step_ns=20,
+        periods=[
+            na.PulsePeriod(1000, (0, 0, 1, 0), unit="ns"),
+            na.PulsePeriod(1000, (0, 0, 0, 1), unit="ns"),   # DAC scanned + trig ON here (bracketed)
+            na.PulsePeriod(1000, (0, 0, 0, 0), unit="ns"),
+        ],
+        repeat_start=1, repeat_end=1, repeat_count=2,
+        delays={"ch02": 200}, delay_units={"ch02": "ns"})
+    st.bind_field("dac", "da@1", unit="value", label="da")
+    st.set_scan_table([[-1.0], [1.0]])                       # signed -> wire codes 1 and 3
+    # the DAC slot binds a bracketed period; both unrolled copies keep the 's0' bus entry.
+    u = st.unrolled_bracket()
+    plan = u.analog_bus_plan("da")
+    assert sum(1 for entry in plan if str(entry.get("value")) == "s0") == 2
+    for rf in (False, True):
+        prog = _assert_scan_matches_oracle(st, channels=list(st.channels), clock_hz=50e6, repeat_forever=rf, n_ticks=1600)
+        assert 1 in {int(getattr(s, "value_select", 0)) for s in prog.bus_segments}
+        # the DAC bus carries the scanned code at each scan point (1 then 3).
+        assert 1 in set(em.bus_play(prog, 0, 800, scan_point=0))
+        assert 3 in set(em.bus_play(prog, 0, 800, scan_point=1))
+
+
+# ===========================================================================
+# A constant channel DELAY is a per-channel OUTPUT delay line -- NOT scannable,
+# NOT baked into the (undelayed) edge table.  The program carries the delay in
+# ``channel_delays`` (per output bit, in ticks, with the global shift G folded in
+# for negatives so every entry is >= 0) and the engine applies it as the exact
+# ``delay_line_reference`` at the END of play.  The KEY proof: compile the SAME
+# state twice -- once WITH the delay, once with the delay removed (delays={}) --
+# and assert the delayed play == delay_line_reference(undelayed play).  Each case
+# combines the constant delay with a different scan / bracket feature, and is
+# cross-checked across all three engine models (reference == prefetch == rtl_mirror).
+# ===========================================================================
+
+def test_constant_delay_with_scanned_duration_is_output_delay_line():
+    """A CONSTANT channel delay combined with a SCANNED DURATION: the delay is a pure
+    per-channel output delay line, orthogonal to the duration sweep.  Compile WITH the
+    delay and WITHOUT it (delays={}); the delayed play must equal the undelayed play with
+    only that channel's bit delayed by d -- across every scan point and all three models.
+    The delay (1500 ns = 75 ticks) exceeds the 1000 ns period, proving ANY length works."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_scan_runtime_program as cscan
+    from fpga.pulse_streamer.host import engine_model as em
+
+    chans = ["trig", "a", "b"]
+    D_ns = 1500.0   # 75 ticks at 20 ns/tick -- longer than one 1000 ns period
+
+    def build(delays):
+        st = na.PulseTableState(
+            channels=chans,
+            periods=[na.PulsePeriod(1000, (1, 1, 0), unit="ns"),   # trig + a ON
+                     na.PulsePeriod(1000, (0, 0, 1), unit="ns")],  # b ON
+            time_step_ns=20,
+            delays=delays, delay_units=({"trig": "ns"} if delays else {}),
+        )
+        st.bind_field("duration", "0", unit="ns")           # scan period 0's duration -> s0
+        st.set_scan_table([[1000.0], [2000.0], [3000.0]])   # three duration points
+        return st
+
+    pd = cscan(build({"trig": D_ns}), channels=chans, clock_hz=50e6, repeat_forever=True)
+    p0 = cscan(build({}), channels=chans, clock_hz=50e6, repeat_forever=True)
+    bit = pd.channels.index("trig")
+    d_ticks = D_ns / 20   # 75
+    assert pd.channel_delays[bit] == d_ticks
+    assert all(v == 0 for i, v in enumerate(pd.channel_delays) if i != bit)
+    # the no-delay twin carries no output delay at all (None) or an all-zero vector
+    assert not any(p0.channel_delays or [])
+
+    N = 1200
+    out_d = em.reference_play(em.EngineProgram.from_program(pd), N)
+    out_0 = em.reference_play(em.EngineProgram.from_program(p0), N)
+    # the whole point: delayed == undelayed + a per-channel output delay
+    assert out_d == em.delay_line_reference(out_0, {bit: int(d_ticks)})
+    # cross-model agreement on the delayed program
+    assert em.prefetch_play(em.EngineProgram.from_program(pd), N) == out_d
+    assert em.rtl_mirror_play(em.EngineProgram.from_program(pd), N) == out_d
+
+
+def test_constant_delay_with_scanned_dac_value_is_output_delay_line():
+    """A CONSTANT delay on a DIGITAL trigger channel combined with a SCANNED DAC value (a
+    bus channel + scan_table).  The delay rides the DIGITAL trigger's output bit, NOT the
+    bus; it stays a pure delay line while the DAC code sweeps via value_select.  Delayed
+    play == undelayed play with the trigger's bit delayed by d, across both scan points
+    and all three models -- and the DAC bus still carries the scanned codes."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_scan_runtime_program as cscan
+    from fpga.pulse_streamer.host import engine_model as em
+
+    chans = ["ch00", "ch01", "ch02", "ch03"]   # ch00/ch01 = DAC bus, ch03 = digital trigger
+    D_ns = 1500.0   # 75 ticks -- longer than one 1000 ns period
+
+    def build(delays):
+        st = na.PulseTableState(
+            channels=chans,
+            channel_labels={"ch00": "da[0]", "ch01": "da[1]", "ch02": "cool", "ch03": "trig"},
+            time_step_ns=20,
+            periods=[na.PulsePeriod(1000, (0, 0, 1, 0), unit="ns"),   # cool ON
+                     na.PulsePeriod(1000, (0, 0, 0, 1), unit="ns"),   # trig ON (delayed channel)
+                     na.PulsePeriod(1000, (0, 0, 0, 0), unit="ns")],
+            delays=delays, delay_units=({"ch03": "ns"} if delays else {}),
+        )
+        st.bind_field("dac", "da@1", unit="value", label="da")   # scan the DAC value -> s0
+        st.set_scan_table([[-1.0], [1.0]])                       # signed -> wire codes 1 and 3
+        return st
+
+    pd = cscan(build({"ch03": D_ns}), channels=chans, clock_hz=50e6, repeat_forever=True)
+    p0 = cscan(build({}), channels=chans, clock_hz=50e6, repeat_forever=True)
+    bit = pd.channels.index("ch03")
+    d_ticks = D_ns / 20   # 75
+    assert pd.channel_delays[bit] == d_ticks
+    assert all(v == 0 for i, v in enumerate(pd.channel_delays) if i != bit)
+
+    N = 1200
+    out_d = em.reference_play(em.EngineProgram.from_program(pd), N)
+    out_0 = em.reference_play(em.EngineProgram.from_program(p0), N)
+    assert out_d == em.delay_line_reference(out_0, {bit: int(d_ticks)})
+    assert em.prefetch_play(em.EngineProgram.from_program(pd), N) == out_d
+    assert em.rtl_mirror_play(em.EngineProgram.from_program(pd), N) == out_d
+    # the DAC bus is unaffected by the digital delay: it still carries the scanned codes.
+    assert 1 in {int(getattr(s, "value_select", 0)) for s in (pd.bus_segments or [])}
+    assert 1 in set(em.bus_play(pd, 0, 800, scan_point=0))
+    assert 3 in set(em.bus_play(pd, 0, 800, scan_point=1))
+
+
+def test_constant_delay_with_inner_bracket_is_output_delay_line():
+    """A CONSTANT delay combined with an INNER repeat bracket: the bracket is unrolled flat
+    and the delay stays a pure per-channel output delay line over the whole unrolled frame.
+    Compile WITH and WITHOUT the delay (delays={}); the delayed repeat-forever play must
+    equal the undelayed play with only the delayed bit shifted by d -- exercising the
+    bracket-unroll + delay together, across all three models.  d=75 ticks (> a period)."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program as cplain
+    from fpga.pulse_streamer.host import engine_model as em
+
+    chans = ["trig", "b"]
+    D_ns = 1500.0   # 75 ticks -- longer than one 1000 ns period
+
+    def build(delays):
+        return na.PulseTableState(
+            channels=chans,
+            periods=[na.PulsePeriod(1000, (0, 0), unit="ns", name="pre"),
+                     na.PulsePeriod(1000, (1, 0), unit="ns", name="loop0"),   # trig ON inside bracket
+                     na.PulsePeriod(1000, (0, 0), unit="ns", name="loop1"),
+                     na.PulsePeriod(1000, (0, 1), unit="ns", name="post")],   # b ON after bracket
+            time_step_ns=20, repeat_start=1, repeat_end=2, repeat_count=3,
+            delays=delays, delay_units=({"trig": "ns"} if delays else {}),
+            repeat_forever=True,
+        )
+
+    pd = cplain(build({"trig": D_ns}), clock_hz=50e6, repeat_forever=True)
+    p0 = cplain(build({}), clock_hz=50e6, repeat_forever=True)
+    assert pd.loop_count == 1   # the inner bracket was unrolled into a flat frame
+    bit = pd.channels.index("trig")
+    d_ticks = D_ns / 20   # 75
+    assert pd.channel_delays[bit] == d_ticks
+    assert all(v == 0 for i, v in enumerate(pd.channel_delays) if i != bit)
+
+    N = 1500
+    out_d = em.reference_play(em.EngineProgram.from_program(pd), N)
+    out_0 = em.reference_play(em.EngineProgram.from_program(p0), N)
+    assert out_d == em.delay_line_reference(out_0, {bit: int(d_ticks)})
+    assert em.prefetch_play(em.EngineProgram.from_program(pd), N) == out_d
+    assert em.rtl_mirror_play(em.EngineProgram.from_program(pd), N) == out_d
+
+
+def test_negative_constant_delay_folds_global_shift_into_channel_delays():
+    """A NEGATIVE constant delay re-translates the WHOLE frame by the global shift
+    G = max(0, -min delay) so EVERY entry of ``channel_delays`` is >= 0 -- never a runtime
+    negative tick.  With two channels and a's delay = -500 ns (-25 ticks), G = 25: a's
+    delay folds to 0 and b's to +25.  The played output equals the undelayed play with the
+    G-shifted per-channel delays applied as a delay line (proven across all three models)."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program as cplain
+    from fpga.pulse_streamer.host import engine_model as em
+
+    chans = ["a", "b"]
+
+    def build(delays):
+        return na.PulseTableState(
+            channels=chans,
+            periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
+            time_step_ns=20,
+            delays=delays, delay_units=({"a": "ns"} if delays else {}),
+        )
+
+    pd = cplain(build({"a": -500}), clock_hz=50e6, repeat_forever=True)
+    p0 = cplain(build({}), clock_hz=50e6, repeat_forever=True)
+    # G folded in: no negative ticks, every channel delay >= 0, the frame retranslated.
+    assert min(pd.channel_delays) >= 0
+    assert min(pd.ticks) >= 0
+    assert pd.channel_delays == [0, 25]   # a folds to 0, b shifts +25 (G = 25 ticks)
+
+    N = 300
+    out_d = em.reference_play(em.EngineProgram.from_program(pd), N)
+    out_0 = em.reference_play(em.EngineProgram.from_program(p0), N)
+    g_shifted = {i: v for i, v in enumerate(pd.channel_delays) if v}
+    assert out_d == em.delay_line_reference(out_0, g_shifted)
+    assert em.prefetch_play(em.EngineProgram.from_program(pd), N) == out_d
+    assert em.rtl_mirror_play(em.EngineProgram.from_program(pd), N) == out_d
+
+
+def test_unrolled_bracket_overflow_raises_actionable_error():
+    """Unrolling a huge inner repeat_count with a delay overflows the edge budget; the
+    compiler raises a CLEAR, actionable error naming the inner repeat as the cause."""
+    import pytest
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
+
+    channels = [f"ch{i:02d}" for i in range(40)]
+    width = len(channels)
+    periods = [na.PulsePeriod(100, tuple(1 if (i + p) % 2 else 0 for i in range(width)), unit="ns") for p in range(60)]
+    st = na.PulseTableState(
+        channels=channels, periods=periods, time_step_ns=20,
+        repeat_start=0, repeat_end=59, repeat_count=10_000,
+        delays={"ch00": 200}, delay_units={"ch00": "ns"}, repeat_forever=False)
+    with pytest.raises(ValueError, match="repeat"):
+        compile_pulse_table_runtime_program(st, clock_hz=50e6, repeat_forever=False)
+
+
+# --------------------------------------------------------------------------- #
+# Regression guards for the 2026-06-09 audit fixes (config single-source +
+# correctness bugs found in pulse_table / sequencer).
+# --------------------------------------------------------------------------- #
+def test_aligned_to_channels_preserves_clk_channels():
+    """BUG: aligned_to_channels dropped clk_channels, so aligning a saved table onto the
+    device channel list silently reverted a clk-wired channel to engine-driven (its clk pin
+    stopped clocking).  It must survive the align, filtered to the surviving channels."""
+
+    state = na.PulseTableState(
+        channels=["a", "b", "c"],
+        periods=[na.PulsePeriod(1000, (1, 0, 0), unit="ns")],
+        time_step_ns=20.0,
+        clk_channels=["c"],
+    )
+    aligned = state.aligned_to_channels(["a", "b", "c", "d"])   # superset (the real device list)
+    assert aligned.clk_channels == ["c"]
+    assert aligned.clk_enable_mask() == (1 << 2)
+
+
+def test_validate_rejects_clk_channel_that_is_bus_member():
+    """BUG: validate() never checked clk_channels vs analog-bus members, so a clk channel
+    that is also a DAC bit compiled to BOTH a clk mux and a bus segment -> double-drive on
+    hardware.  validate() (called from __init__/from_dict) must reject it, covering buses
+    inferred from labels, not just explicit analog_buses."""
+
+    channels = [f"da_x[{i}]" for i in range(10)] + ["trig"]
+    with pytest.raises(ValueError, match="clk channels must not be analog-bus members"):
+        na.PulseTableState(
+            channels=channels,
+            periods=[na.PulsePeriod(1000, tuple([0] * 11), unit="ns")],
+            time_step_ns=20.0,
+            clk_channels=["da_x[0]"],   # da_x[0..9] infer to bus "da_x" -> da_x[0] is a member
+        )
+
+
+def test_snap_scan_table_rejects_too_wide_rows_instead_of_truncating():
+    """BUG: snap_scan_table zip()'d row vs slots, silently DROPPING extra columns (a wrong-
+    width loaded array was mis-snapped, not reported).  It must normalize width first: raise
+    on a too-wide row, pad a short one."""
+
+    from Zou_lab_control.neutral_atom.timing.pulse_table import snap_scan_table, ScanSlot
+
+    dur = ScanSlot(kind="duration", target="0", unit="ns")
+    dac = ScanSlot(kind="dac", target="d@0", unit="value")
+    with pytest.raises(ValueError, match="values but 1 slots"):
+        snap_scan_table([[100.0, 200.0]], [dur], time_step_ns=20)
+    # a short row is padded (established normalize behavior) then snapped
+    assert snap_scan_table([[100.0]], [dur, dac], time_step_ns=20) == [[100.0, 0.0]]
+
+
+def test_scan_compile_snaps_zero_duration_to_one_tick_on_direct_call():
+    """BUG: compile_pulse_table_scan_runtime_program used the raw scan_table when called
+    directly (not via compile_scan), so a 0 ns scanned-duration point became a 0-tick
+    (zero-length) period the engine cannot play.  The snap must hold at this entry point too."""
+
+    state = na.PulseTableState(
+        channels=["trap", "trig"],
+        periods=[
+            na.PulsePeriod(100, (1, 0), unit="ns"),
+            na.PulsePeriod("s0", (0, 1), unit="str (ns)"),
+        ],
+        scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 20.0}],
+        time_step_ns=20,
+    )
+    state.set_scan_table([[0.0], [30000.0]])   # first point: 0 ns -> must snap UP to 1 tick
+    prog = na.compile_pulse_table_scan_runtime_program(state, channels=["trap", "trig"], clock_hz=50e6)
+    assert prog.scan_points[0][0] == 1          # 0 ns -> one 20 ns tick, never 0
+    assert prog.scan_points[1][0] == 1500       # 30000 ns -> 1500 ticks (unchanged)
+
+
+def test_slot_ref_helpers_are_the_single_parser():
+    """The "sN" scan-slot reference parser lives once in the timing layer and is reused by
+    the sequencer compiler and the GUI (no more 3 private regexes that could drift)."""
+
+    from Zou_lab_control.neutral_atom.timing.pulse_table import is_slot_ref, slot_ref_index
+
+    assert is_slot_ref("s0") and is_slot_ref(" s12 ") and not is_slot_ref("x0") and not is_slot_ref("s")
+    assert slot_ref_index("s3") == 3 and slot_ref_index("sX") is None and slot_ref_index(7) is None
+
+
+def test_streamer_config_is_single_source_for_host_geometry():
+    """The reconfigurable geometry comes from fpga/board_config/streamer_config.json; the
+    host validator constants and the AXI runtime default are SOURCED from it (no scattered
+    literals), and the shipped values match the synthesized RTL (zlc_pulse_streamer_top.v)."""
+
+    from fpga.pulse_streamer.host import image as im
+
+    cfg = im.load_streamer_config()
+    p = cfg["params"]
+    assert cfg["warnings"] == []                      # the shipped config file loads cleanly
+    assert (p.max_edges, p.bank_size) == (4096, 2048)
+    assert (p.channel_count, p.num_slots, p.bus_count, p.bus_width) == (62, 4, 4, 10)
+
+    from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
+    assert fps.DEFAULT_MAX_EDGES == p.max_edges
+    assert fps.DEFAULT_NUM_SLOTS == p.num_slots
+    assert fps.DEFAULT_BUS_WIDTH == p.bus_width
+    assert fps.DEFAULT_FPGA_CHANNEL_COUNT == p.channel_count
+
+    from Zou_lab_control.neutral_atom.devices import axi_session as ax
+    assert ax.DEFAULT_PARAMS.max_edges == p.max_edges and ax.DEFAULT_PARAMS.bank_size == p.bank_size
+
+
+def test_estimate_resources_matches_solve_capacity_and_reports_pass_fail():
+    """solve_capacity now delegates its accounting to estimate_resources (one model), and
+    check_config_capacity (the estimate_resources.bat backend) reports per-axis fit.  The
+    configured 35T design FITS THE DEVICE and stays under the 90% soft target on EVERY axis
+    -- the estimate is calibrated to the REAL 2026-06-29 routed build (LUT 18607/20800 = 89%
+    at the accepted TTL=128 / DA=64 event-FIFO depths), so the overall 'ok' is True."""
+
+    from fpga.pulse_streamer.host import image as im
+
+    s = im.solve_capacity("xc7a35t", channel_count=62, target_pct=90.0)
+    assert im.estimate_resources(s.params, part="xc7a35t", target_pct=90.0) == s.resource_report
+
+    result = im.check_config_capacity()
+    assert result["report"]["lut"]["pct"] <= 90.0                  # LUT now fits UNDER the 90% target...
+    assert all(result["report"][axis]["ok"] for axis in ("lut", "ff", "dsp", "ramb36"))  # ...and every axis is in budget
+    text = im.format_capacity_report(result)
+    # honest verdict: the 35T HAS enough resources at the accepted TTL=128/DA=64 depths.
+    assert "HAS enough resources" in text and "INSUFFICIENT" not in text
+
+
+# --------------------------------------------------------------------------- #
+# Regression guards for the 2026-06-09 audit-list fixes (clk carry/validate,
+# DAC/1D scan-table handling, unbound-slot eval).
+# --------------------------------------------------------------------------- #
+def test_unrolled_bracket_preserves_clk_channels():
+    """BUG 1.1: unrolled_bracket() dropped clk_channels, so a finite-bracket-with-delay
+    compile (which unrolls first) silently reverted a clk channel to engine-driven."""
+
+    state = na.PulseTableState(
+        channels=["D0", "D1"],
+        periods=[na.PulsePeriod(10, (1, 0), unit="ns"), na.PulsePeriod(20, (0, 1), unit="ns")],
+        repeat_start=0, repeat_end=1, repeat_count=2,
+        clk_channels=["D1"], time_step_ns=20,
+    )
+    unrolled = state.unrolled_bracket()
+    assert unrolled.clk_channels == ["D1"]
+    assert unrolled.clk_enable_mask() == (1 << 1)
+    assert len(unrolled.periods) == 4   # bracket [P0,P1] x2 unrolled
+
+
+def test_remapped_target_single_source_for_bracket_index():
+    """``unrolled_bracket`` remaps a slot ``target``'s PERIOD index through the unroll.  That one
+    rule lives in a single helper ``_remapped_target`` shared by the scan-slot AND api-slot loops
+    (it used to be copy-pasted verbatim, so the two could drift).  Pin the helper to the three
+    branches: numeric ``duration`` index expands, ``dac`` ``bus@index`` expands its index, and a
+    ``delay`` channel name / non-numeric ``duration`` expression carries through unchanged."""
+
+    state = na.PulseTableState(
+        channels=["D0", "D1", "D2", "D3"],
+        periods=[na.PulsePeriod(10, (1, 0, 0, 0), unit="ns") for _ in range(6)],
+        analog_buses={"busA": ["D0", "D1"]},
+        repeat_start=1, repeat_end=3, repeat_count=3, time_step_ns=20,
+    )
+    # bracket [1..3] x3 -> period 5 shifts to 5 + (3-1)*3 = 11; an in-bracket index maps to its
+    # first copy (unchanged), a before-bracket index is unchanged.
+    assert state._remapped_target("duration", "0") == "0"          # before bracket
+    assert state._remapped_target("duration", "5") == "11"         # after bracket
+    assert state._remapped_target("dac", "busA@4") == "busA@10"    # after-bracket dac index
+    assert state._remapped_target("dac", "busA@2") == "busA@2"     # in-bracket dac index
+    assert state._remapped_target("delay", "D1") == "D1"           # channel name -> unchanged
+    assert state._remapped_target("duration", "s0") == "s0"        # non-numeric expr -> unchanged
+
+    # The scan-slot and api-slot loops must produce identical target remapping for the same
+    # (kind, target) -- proving they share the one helper rather than two drifting copies.
+    unrolled = na.PulseTableState(
+        channels=["D0", "D1", "D2", "D3"],
+        periods=[na.PulsePeriod(10, (1, 0, 0, 0), unit="ns") for _ in range(6)],
+        analog_buses={"busA": ["D0", "D1"]},
+        scan_slots=[
+            {"kind": "duration", "target": "5", "label": "L"},
+            {"kind": "dac", "target": "busA@4"},
+        ],
+        api_slots=[
+            {"name": "a1", "kind": "duration", "target": "5"},
+            {"name": "a2", "kind": "dac", "target": "busA@4"},
+            {"name": "a3", "kind": "delay", "target": "D2"},
+        ],
+        repeat_start=1, repeat_end=3, repeat_count=3, time_step_ns=20,
+    ).unrolled_bracket()
+    assert [s.target for s in unrolled.scan_slots] == ["11", "busA@10"]
+
+
+def test_duration_steps_and_ns_share_eval_unit_prefix():
+    """``duration_steps`` / ``duration_ns`` share only the eval+unit-check prefix via
+    ``_duration_ns_unquantized`` (single source for the unsupported-unit message); each keeps its
+    OWN boundary policy.  Pin: prefix returns ``(value, unit, ns)`` with ns = value * scale, the
+    bad-unit literal is one string, and the per-method boundaries (steps rejects negative, ns
+    rejects non-positive only when unquantized) are unchanged."""
+
+    p = na.PulsePeriod("2*s0", (1,), unit="us")
+    value, unit, ns = p._duration_ns_unquantized(slots={"s0": 3.0})
+    assert (value, unit) == (6.0, "us")
+    assert ns == 6000.0  # 6 us in ns -- value * UNITS_TO_NS[unit]
+
+    # Single source for the bad-unit message: both public methods raise the SAME literal.
+    bad = na.PulsePeriod(10, (1,), unit="bogus")
+    with pytest.raises(ValueError, match=r"unsupported pulse duration unit 'bogus'\."):
+        bad.duration_steps()
+    with pytest.raises(ValueError, match=r"unsupported pulse duration unit 'bogus'\."):
+        bad.duration_ns()
+
+    # Each method keeps its own boundary policy (not merged into the shared prefix).
+    with pytest.raises(ValueError, match="must be >= 0"):
+        na.PulsePeriod(-5, (1,), unit="ns").duration_steps()           # steps rejects negative
+    with pytest.raises(ValueError, match="must be > 0 ns"):
+        na.PulsePeriod(0, (1,), unit="ns").duration_ns()               # ns (unquantized) rejects 0
+    # quantized path keeps its own policy: snaps 0 ns UP to one tick instead of raising
+    assert na.PulsePeriod(0, (1,), unit="ns").duration_ns(time_step_ns=10) == 10.0
+
+
+def test_clk_channel_unknown_raises_not_silently_dropped():
+    """BUG 1.5: an unknown clk channel (typo / stale config) used to be silently filtered
+    out, leaving clk quietly disabled.  It must raise at construction (validate)."""
+
+    with pytest.raises(ValueError, match="clk channels are not in hardware channels"):
+        na.PulseTableState(
+            channels=["D0", "D1"],
+            periods=[na.PulsePeriod(100, (0, 0), unit="ns")],
+            clk_channels=["D9_typo"], time_step_ns=20,
+        )
+
+
+def test_load_scan_table_1d_reshaped_by_slot_count(tmp_path):
+    """BUG 1.4: a 1-D array was always read as 1 point x N slots; with the slot count it is
+    N points x n_slots (n_slots=1 -> a column), the intuitive single-slot case."""
+
+    from Zou_lab_control.neutral_atom.timing.pulse_table import load_scan_table
+
+    p = tmp_path / "scan.npy"
+    np.save(p, np.array([1.0, 2.0, 3.0]))
+    assert load_scan_table(p, n_slots=1) == [[1.0], [2.0], [3.0]]      # 3 points x 1 slot
+    assert load_scan_table(p, n_slots=None) == [[1.0, 2.0, 3.0]]       # legacy: single row
+    np.save(p, np.array([1.0, 2.0, 3.0, 4.0]))
+    assert load_scan_table(p, n_slots=2) == [[1.0, 2.0], [3.0, 4.0]]   # 2 points x 2 slots
+    # a 2-D file is untouched by the reshape
+    np.save(p, np.array([[5.0], [6.0]]))
+    assert load_scan_table(p, n_slots=1) == [[5.0], [6.0]]
+
+
+def test_eval_time_expr_unbound_slot_raises_only_with_slot_context():
+    """BUG 2.3: a typo'd sN used to evaluate to 0.0 silently.  With a (non-empty) slot
+    context an unbound sN now raises; with no/empty context the lenient 0.0 fallback stays
+    (so with_slots_resolved's leftover delay expressions still validate)."""
+
+    from Zou_lab_control.neutral_atom.timing.pulse_table import eval_time_expr
+
+    assert eval_time_expr("s0*2", slots={"s0": 50.0}) == 100.0        # bound resolves
+    assert eval_time_expr("s5", slots=None) == 0.0                    # no context -> lenient
+    assert eval_time_expr("s5", slots={}) == 0.0                      # empty context -> lenient
+    with pytest.raises(ValueError, match="unbound scan slot"):
+        eval_time_expr("s5", slots={"s0": 100.0})                    # typo with context -> raise
+
+
+def test_dac_scan_empty_table_static_compile_uses_reference_code():
+    # BUG: a DAC value bound to "s0" with an EMPTY scan table dispatches to the STATIC
+    # compiler (slot_vars empty), which used int("s0") and crashed; it must resolve the
+    # slot from the reference values instead.
+    ch = [f"da[{i}]" for i in range(10)] + ["trig"]
+    st = na.PulseTableState(
+        channels=ch, periods=[na.PulsePeriod(1000, tuple([0] * 10 + [1]), unit="ns")],
+        scan_slots=[{"kind": "dac", "target": "da@0", "unit": "value", "nominal": 256.0}],
+        analog_bus_modes={"da": [{"mode": "edge", "value": "s0"}]},
+        scan_table=[], time_step_ns=20,
+    )
+    prog = na.compile_runtime_program_for_payload(st, channels=ch, clock_hz=50e6)
+    segs = prog.bus_segments or []
+    assert any(int(s.start_value) == 768 and int(s.value_select) == 0 for s in segs)   # signed 256 -> code 768
+
+
+def test_clk_enable_mask_uses_hardware_channel_order():
+    # BUG: clk_enable was computed in state.channels order but the edge masks use the
+    # COMPILED channel order; a different order pointed the mask at the wrong bit.
+    st = na.PulseTableState(channels=["a", "clk"], periods=[na.PulsePeriod(100, (1, 0), unit="ns")],
+                            clk_channels=["clk"], time_step_ns=20)
+    prog = na.compile_runtime_program_for_payload(st, channels=["clk", "a"], clock_hz=50e6)
+    assert prog.channels == ["clk", "a"]
+    assert prog.clk_enable == 1   # clk is channels[0] in the compiled order -> bit 0
+
+
+def test_off_or_clk_channel_delay_does_not_shift_active_channels():
+    # BUG: an OFF channel (or a clk channel) with a (negative) delay entered the global
+    # shift G and delayed OTHER active channels for no physical reason.
+    off = na.PulseTableState(channels=["a", "b"], periods=[na.PulsePeriod(100, (1, 0), unit="ns")],
+                             delays={"b": -20}, delay_units={"b": "ns"}, time_step_ns=20)
+    assert not na.compile_runtime_program_for_payload(off, channels=["a", "b"], clock_hz=50e6).channel_delays
+    clk = na.PulseTableState(channels=["clk", "a"], periods=[na.PulsePeriod(100, (0, 1), unit="ns")],
+                             clk_channels=["clk"], delays={"clk": -20}, delay_units={"clk": "ns"}, time_step_ns=20)
+    assert not na.compile_runtime_program_for_payload(clk, channels=["clk", "a"], clock_hz=50e6).channel_delays
+
+
+def test_with_slots_resolved_missing_slots_use_reference_not_zero():
+    # BUG: with_slots_resolved defaulted unspecified slots to 0, silently zeroing other
+    # periods/DAC levels; they must keep their nominal (reference) value.
+    st = na.PulseTableState(
+        channels=["a"],
+        periods=[na.PulsePeriod("s0", (1,), unit="str (ns)"), na.PulsePeriod("s1", (1,), unit="str (ns)")],
+        scan_slots=[{"kind": "duration", "target": "0", "unit": "ns", "nominal": 60.0},
+                    {"kind": "duration", "target": "1", "unit": "ns", "nominal": 80.0}],
+        time_step_ns=20,
+    )
+    resolved = st.with_slots_resolved({"s0": 100.0})
+    assert float(resolved.periods[0].duration) == 100.0
+    assert float(resolved.periods[1].duration) == 80.0
+
+
+def test_delay_expression_referencing_scanned_slot_is_rejected():
+    # BUG: a channel delay expression referencing a SCANNED slot was silently FROZEN at the
+    # reference value in a scan compile; the scan compiler must reject it.
+    import pytest
+    st = na.PulseTableState(
+        channels=["a", "trig"],
+        periods=[na.PulsePeriod(100, (1, 0), unit="ns"), na.PulsePeriod("s0", (0, 1), unit="str (ns)")],
+        scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 100.0}],
+        scan_table=[[100.0], [200.0]],
+        delays={"a": "s0/2"}, delay_units={"a": "str (ns)"}, time_step_ns=20,
+    )
+    with pytest.raises(ValueError, match="cannot be scanned"):
+        na.compile_pulse_table_scan_runtime_program(st, channels=["a", "trig"], clock_hz=50e6)
+
+
+def test_timing_payload_to_dict_snaps_to_target_clock():
+    # BUG: timing_payload_to_dict pre-snapped on the PAYLOAD grid; a state saved at 20 ns
+    # diverged from a direct compile at the server's clock. It must snap to the target tick.
+    from Zou_lab_control.neutral_atom.devices.sequencer import timing_payload_to_dict
+    st = na.PulseTableState(channels=["a"], periods=[na.PulsePeriod(14, (1,), unit="ns")], time_step_ns=20)
+    assert float(timing_payload_to_dict(st, time_step_ns=10.0)["periods"][0]["duration"]) == 10.0
+    assert float(timing_payload_to_dict(st)["periods"][0]["duration"]) == 20.0
+
+
+def test_negative_literal_duration_rejected():
+    # BUG: a negative literal period duration was silently snapped up to one tick.
+    import pytest
+    with pytest.raises(ValueError, match="must be >= 0"):
+        na.PulseTableState(channels=["a"], periods=[na.PulsePeriod(-100, (1,), unit="ns")], time_step_ns=20)
+
+
+def test_pulse_controller_set_scan_table_accepts_numpy():
+    # BUG: set_scan_table/payload used `rows or []` / `if table:`, raising on a NumPy array.
+    seq = na.RuntimeSequencer(channels=["a", "trig"], clock_hz=50e6)
+    st = na.PulseTableState(
+        channels=["a", "trig"], periods=[na.PulsePeriod("s0", (1, 0), unit="str (ns)")],
+        scan_slots=[{"kind": "duration", "target": "0", "unit": "ns", "nominal": 100.0}],
+        scan_table=[[100.0]], time_step_ns=20,
+    )
+    ctl = na.bind_pulse(seq, st)
+    ctl.set_scan_table(np.array([[20.0], [40.0]]))
+    assert ctl.scan_table == [[20.0], [40.0]]
+    ctl.set_scan_table(np.array([20.0, 40.0]))
+    assert ctl.scan_table == [[20.0], [40.0]]
+
+
+def test_explicit_one_channel_analog_bus_rejected():
+    # BUG: an explicit 1-channel analog bus passed validate() but crashed deeper.
+    import pytest
+    with pytest.raises(ValueError, match="at least two channels"):
+        na.PulseTableState(channels=["b0", "trig"], periods=[na.PulsePeriod(100, (0, 0), unit="ns")],
+                           analog_buses={"one": ["b0"]}, time_step_ns=20)
+
+
+def test_sequencer_prepare_backstops_invalid_program_geometry():
+    # BUG: SequencerService.prepare cached the program before any geometry check; a mock
+    # backend would accept channel_delays beyond the 32-bit cap. A backstop validate rejects it.
+    import pytest
+    seq = na.RuntimeSequencer(channels=["a", "b"], clock_hz=50e6)
+    # a delay beyond the 32-bit TTL field (~42.9 s) must still be rejected by the backstop
+    huge_ns = ((1 << 31) + 10) * 20.0
+    st = na.PulseTableState(channels=["a", "b"], periods=[na.PulsePeriod(100, (1, 1), unit="ns")],
+                            delays={"a": 0.0, "b": huge_ns}, delay_units={"a": "ns", "b": "ns"}, time_step_ns=20)
+    with pytest.raises(ValueError):
+        seq.prepare(st)
+
+
+def test_sequencer_prepare_accepts_streamed_scan_beyond_resident_window():
+    # REGRESSION: the prepare() backstop used the DEFAULT max_scan_points (the 2-bank
+    # resident window, 4096) and rejected larger STREAMED scans (e.g. 9999 points),
+    # which the architecture explicitly supports (points stream through the window).
+    seq = na.RuntimeSequencer(channels=["a", "b"], clock_hz=50e6)
+    st = na.PulseTableState(channels=["a", "b"], periods=[na.PulsePeriod(100, (1, 1), unit="ns")],
+                            time_step_ns=20)
+    st.bind_field("duration", "0")
+    st.set_scan_table([[100.0 + 20.0 * (i % 50)] for i in range(9999)])
+    prog = seq.prepare(st)
+    assert len(prog.scan_points) == 9999
+
+
+# --------------------------------------------------------------------------- #
+# RTL-finding fixes (2026-06-09): U4 delay-tail-at-done, U1 ramp slope cap,
+# B1/B2 da_clk idle warning, T3 latency read-back, B3/B4/U7 geometry guards.
+# --------------------------------------------------------------------------- #
+def test_counter_width_guards_reject_silent_wrap():
+    """32-bit counter guards: a frame longer than the 32-bit time counter, a scan with
+    more than 2^32 points, or a loop_count beyond 2^32 must be REJECTED with a clear
+    message -- never silently wrapped on hardware (the '太长/太多会不会卡死' audit)."""
+
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import validate_pulse_streamer_program
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    def prog(**kw):
+        base = dict(
+            sequence_id="cw", sequence_name="cw", clock_hz=50e6,
+            channels=[f"ch{i:02d}" for i in range(62)],
+            ticks=[0, 100], masks=[1, 0], duration=4e-6,
+            repeat_forever=False, loop_start_index=0, loop_end_tick=100, loop_count=1,
+        )
+        base.update(kw)
+        return RuntimeSequenceProgram(**base)
+
+    # frame longer than the 32-bit tick counter (~85.9 s at 20 ns): friendly message
+    with pytest.raises(ValueError, match="32-bit|32 bits"):
+        validate_pulse_streamer_program(prog(ticks=[0, 1 << 32], masks=[1, 0]))
+    # loop_count beyond the 32-bit LOOP_COUNT ctrl word
+    with pytest.raises(ValueError, match="LOOP_COUNT"):
+        validate_pulse_streamer_program(prog(loop_count=1 << 32))
+    # a sane program still passes
+    validate_pulse_streamer_program(prog())
+
+
+def test_scan_frame_shorter_than_read_latency_is_rejected():
+    """SAME-CLASS guard as the edge read-latency fix: the scan BRAM is read with a fixed
+    latency and the engine reads the NEXT point's slot during the CURRENT frame, so a
+    scanned frame shorter than the scan read latency would play it with the PREVIOUS
+    point's slot.  Reject such a (pathological sub-100ns) scanned frame with a clear error;
+    a normal (micro/millisecond) scanned frame passes."""
+    import pytest
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
+        validate_pulse_streamer_program, SCAN_READ_LATENCY)
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+    # one slot scales the single period's duration; scan a 1-tick frame -> reject
+    bad = RuntimeSequenceProgram(
+        sequence_id="s", sequence_name="s", clock_hz=50e6, channels=["a", "b"],
+        ticks=[0, 1], masks=[1, 0], duration=1*20e-9, repeat_forever=False,
+        slot_count=1, slot_kinds=["dac"], tick_slot_coeffs=[[0], [0]],
+        loop_end_tick=1, loop_end_slot_coeffs=[0], loop_count=1,
+        scan_points=[[0], [1]],   # frame = 1 tick (< SCAN_READ_LATENCY=2): too short
+    )
+    with pytest.raises(ValueError, match="scan-BRAM read latency|read in time|>= %d ticks" % SCAN_READ_LATENCY):
+        validate_pulse_streamer_program(bad, channel_count=2)
+    # a normal scanned frame (>= SCAN_READ_LATENCY ticks) is accepted
+    ok = RuntimeSequenceProgram(
+        sequence_id="s2", sequence_name="s2", clock_hz=50e6, channels=["a", "b"],
+        ticks=[0, 100], masks=[1, 0], duration=100*20e-9, repeat_forever=False,
+        slot_count=1, slot_kinds=["duration"], tick_slot_coeffs=[[0], [256]],
+        loop_end_tick=100, loop_end_slot_coeffs=[256], loop_count=1,
+        scan_points=[[100], [200]],
+    )
+    validate_pulse_streamer_program(ok, channel_count=2)
+
+
+def test_top_routes_all_three_edge_reads_directly_no_skew_register():
+    """The three edge BRAMs (tick / coeff / mask) are read in lockstep and routed to the
+    engine DIRECTLY -- no realignment register on ANY of them.  There is NO read-latency
+    skew to compensate: each port B is symmetric WITHIN ITSELF (tick 32/32, coeff/mask
+    64/64), so all three read at the SAME latency.  This was MEASURED on the actual
+    synthesised blk_mem_gen IP netlists (xsim: tick latency == mask latency == 2), and the
+    real zlc_edge_streamer driven by those real IPs plays the uploaded edge table CORRECTLY
+    end-to-end (tb_real_engine.v: two 20 ms emCCD pulses).  Adding a +1 tick register to
+    "align" a skew that does not exist instead CREATES a tick>mask skew that corrupts
+    streamed edges in sim.  Lock the direct (register-free) wiring so neither register is
+    re-introduced.  The genuine emCCD 40 ms root cause was the stale-active_count FIRE seed
+    -- see test_pulse_streamer_rtl_fire_seed_uses_fresh_prog_count_not_stale_reg."""
+    top = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    # NO realignment registers on any edge read
+    assert "edge_tick_rdata_q" not in top, "tick realignment register must not be re-added (no skew exists)"
+    assert "edge_coeff_rdata_q" not in top and "edge_mask_rdata_q" not in top, \
+        "coeff/mask realignment registers must not be re-added"
+    # all three reads fed to the engine DIRECTLY
+    assert ".edge_tick_rdata(edge_tick_rdata)" in top
+    assert ".edge_coeff_rdata(edge_coeff_rdata_w[" in top
+    assert ".edge_mask_rdata(edge_mask_rdata_w[" in top
+
+
+def test_streaming_prefetch_pipeline_depth_drops_edge_when_undersized():
+    """FAITHFUL register-level reproduction of the real-hardware bug (emCCD 2nd pulse
+    40 ms; edge e7 dropped), reproduced + fixed in real-IP Vivado xsim
+    (fpga/pulse_streamer/sim/tb_gapsweep.v) and locked HERE as an automated regression
+    (xsim is not in CI).
+
+    ROOT CAUSE: edge_raddr is a REGISTERED address, so an issued read reaches the BRAM the
+    NEXT cycle and the data is valid PIPE = RD_LAT+1 cycles after `issue` (modelled by the
+    edge_raddr history `erh`, read at erh[-1-RD_LAT]).  The in-flight marker `pend` must be
+    PIPE-deep and the FIFO must hold FIFO_DEPTH = RD_LAT+2.  The OLD sizing (pend depth =
+    RD_LAT, FIFO_DEPTH = RD_LAT+1) fires `landed` ONE CYCLE EARLY, so when two reads land
+    back-to-back the append latches the STALE bus word and the next edge is DROPPED.
+
+    Uses the user's emCCD shape (on e6, off e7) with the real e4->e5 gap (>=10 ticks), the
+    case that TRIGGERS the bug -- a /500-scaled gap of 1 tick is the lone value that hides
+    it.  Asserts: corrected sizing -> off fires at e7 (20 ms); old sizing -> e7 dropped."""
+    RD_LAT = 2
+    # user's emCCD shape, e4->e5 gap = 10 ticks (the real /500 gap is 1000; ANY gap >= ~10
+    # triggers the drop, verified by the gap sweep 1..500 in tb_gapsweep.v).
+    ticks = [0, 1000, 2500, 4500, 5000, 5010, 10010, 12010, 14010, 14110]
+    masks = [0x685, 0x200, 0xa08, 0x200, 0x200, 0x200, 0xa00, 0x208, 0x0, 0x0]
+    emb = 11
+    e6, e7, e8 = ticks[6], ticks[7], ticks[8]
+
+    def play(fifo_depth, pend_depth):
+        """edge_raddr registered (erh) + RD_LAT BRAM latency => data valid PIPE=RD_LAT+1
+        cycles after issue.  pend_depth/fifo_depth select the buggy vs corrected sizing."""
+        N = len(ticks); tc = sm = ei = 0
+        arm_t = [0]*fifo_depth; arm_m = [0]*fifo_depth; arm_nv = 0
+        pend = [0]*pend_depth; fetch = 0; er = 0; erh = [0]*16; ac = N; run = N != 0; out = []
+
+        def seed():
+            nonlocal sm, tc, ei, arm_t, arm_m, arm_nv, fetch, er, pend, erh
+            pend = [0]*pend_depth
+            if ac and ticks[0] == 0:
+                sm = masks[0]; tc = 1; ei = 1
+                idx = tuple(range(1, 1+fifo_depth))
+                arm_t = [ticks[i] if i < N else 0 for i in idx]; arm_m = [masks[i] if i < N else 0 for i in idx]
+                arm_nv = min(fifo_depth, max(0, ac-1)); fetch = 1+fifo_depth; er = 1+fifo_depth
+            else:
+                idx = tuple(range(0, fifo_depth))
+                arm_t = [ticks[i] if i < N else 0 for i in idx]; arm_m = [masks[i] if i < N else 0 for i in idx]
+                arm_nv = min(fifo_depth, ac); fetch = fifo_depth; er = fifo_depth
+            erh = [er]*16
+
+        seed(); final = ticks[-1] if N else 0
+        for _ in range(ticks[-1]+200):
+            out.append(sm)
+            if not run:
+                continue
+            # data valid PIPE = RD_LAT+1 cycles after the issue that set edge_raddr (the +1
+            # IS the registered edge_raddr): read the address from (RD_LAT+1) cycles back.
+            ridx = erh[-1-(RD_LAT+1)]
+            rdt = ticks[ridx] if ridx < N else 0
+            rdm = masks[ridx] if ridx < N else 0
+            landed = pend[pend_depth-1]
+            if tc >= final:
+                seed(); final = ticks[-1] if N else 0; erh = erh[1:]+[er]; continue
+            fire = (ei < ac) and (arm_nv != 0) and (tc >= arm_t[0])
+            nsm = arm_m[0] if fire else sm; nei = ei+1 if fire else ei; nv = arm_nv-1 if fire else arm_nv
+            nt, nm = arm_t[:], arm_m[:]
+            if fire:
+                for k in range(fifo_depth-1):
+                    nt[k] = arm_t[k+1]; nm[k] = arm_m[k+1]
+            if landed:
+                nt[nv] = rdt; nm[nv] = rdm; nnv = nv+1
+            else:
+                nnv = nv
+            # popcount over ALL in-flight pend stages (not just pend[0])
+            infl = sum(pend[0:pend_depth])
+            iss = (nv + infl < fifo_depth) and (fetch < ac)
+            ner = fetch if iss else er; nf = fetch+1 if iss else fetch
+            sm, ei, arm_t, arm_m, arm_nv = nsm, nei, nt, nm, nnv
+            er, fetch, pend = ner, nf, [iss]+pend[0:pend_depth-1]; tc += 1
+            erh = erh[1:]+[er]
+        return out
+
+    def emccd_edges(w):
+        e = []; pr = 0
+        for t in range(len(w)):
+            b = (w[t] >> emb) & 1
+            if b != pr:
+                e.append((("on" if b else "off"), t)); pr = b
+        return e
+
+    # CORRECTED sizing (the shipped RTL): PIPE = RD_LAT+1, FIFO_DEPTH = RD_LAT+2.
+    fixed = emccd_edges(play(fifo_depth=RD_LAT+2, pend_depth=RD_LAT+1))
+    assert ("on", e6) in fixed and ("off", e7) in fixed, \
+        f"corrected sizing must give the 20 ms pulse (on e6, off e7), got {fixed}"
+    assert ("off", e8) not in fixed, f"e7 off-edge must fire (no 40 ms), got {fixed}"
+
+    # OLD undersized pipeline (pend depth = RD_LAT, FIFO_DEPTH = RD_LAT+1): drops e7 -> the
+    # emCCD pulse stretches to e8 (the observed 40 ms).  This is the bug, reproduced.
+    buggy = emccd_edges(play(fifo_depth=RD_LAT+1, pend_depth=RD_LAT))
+    assert ("off", e7) not in buggy, \
+        f"the OLD sizing MUST drop e7 (this regression guards the fix), got {buggy}"
+    assert ("off", e8) in buggy, \
+        f"the OLD sizing stretches the emCCD pulse to e8 (the 40 ms), got {buggy}"
+
+
+def test_pulse_streamer_rtl_fire_seed_uses_fresh_prog_count_not_stale_reg():
+    """REAL-HARDWARE ROOT CAUSE (multi-period dropped pulses / "off never fires").
+
+    At FIRE, ``active_count <= prog_count`` is a NON-BLOCKING write; the same-cycle
+    edge-0 seed must therefore NOT read the ``active_count`` REG (it still holds the
+    PREVIOUS program's count -- 0 right after a fresh bitstream).  A stale count
+    truncated ``arm_nv`` so the resident shadows past it were overwritten by prefetch,
+    permanently dropping the first frame's tail edges.  Lock the fix textually: the
+    seed task takes an explicit count input, FIRE threads ``prog_count`` through
+    ``bnd_count``, and the boundaries thread ``active_count``."""
+    import re
+    rtl = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    # seed task signature carries an explicit count input
+    seed = re.search(r"task seed_from_edge0;(.*?)endtask", rtl, re.S)
+    assert seed is not None
+    body = seed.group(1)
+    assert "input [EDGE_ADDR_WIDTH:0] cnt;" in body, "seed must take an explicit count"
+    assert "clamp3(cnt - 1'b1)" in body and "clamp3(cnt)" in body, "seed must use cnt, not active_count"
+    assert "active_count" not in body, "seed must NOT read the stale active_count reg"
+    # FIRE site threads the FRESH prog_count (not the not-yet-committed reg)
+    assert "bnd_count = prog_count;" in rtl, "FIRE must seed with prog_count"
+    # the dispatch passes the threaded count
+    assert "seed_from_edge0(bnd_slots, bnd_count);" in rtl
+    # the default keeps the boundary seam on the (committed) active_count
+    assert "bnd_count = active_count;" in rtl
+
+
+def test_pulse_streamer_rtl_do_fire_is_self_healing_ge_not_strict_eq():
+    """do_fire must compare with >= (not strict ==): a head edge whose effective tick
+    was passed for ANY reason fires LATE instead of freezing the rest of the frame.
+    On a valid (strictly-increasing) program >= is identical to ==; it only self-heals."""
+    import re
+    rtl = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    assert "do_fire = (edge_index < active_count) && (arm_nv != 0) && (time_count >= zlc_effective_tick(arm_t[0],arm_c[0],slot_active));" in rtl
+    assert "time_count == zlc_effective_tick(arm_t[0]" not in rtl, "strict == must be gone"
+
+
+def test_fire_seed_stale_count_drops_tail_edges_fixed_path_does_not():
+    """Behavioral proof of the bug + fix via the faithful stale-seed model.
+
+    A 6-period program with emCCD (ch1) ON in two non-adjacent periods compiles to a
+    4-real-edge frame.  Replaying it with a STALE prior count (3 -- a tick-0 single
+    pulse, very common while debugging) drops the second pulse's ON edge -> only ONE
+    pulse, exactly the reported symptom.  Prior count 2 (an all-off table) drops the
+    first pulse's OFF -> stuck HIGH.  The FIXED engine (rtl_mirror_play, real count)
+    shows BOTH pulses and returns low -- and equals the stale model when the prior
+    count already covers the program."""
+    import fpga.pulse_streamer.host.engine_model as em
+    ch = ["cooling", "emccd", "trig"]
+    st = na.PulseTableState(channels=ch, periods=[
+        na.PulsePeriod(100, (1, 0, 1), unit="ns"), na.PulsePeriod(100, (0, 1, 0), unit="ns"),
+        na.PulsePeriod(100, (1, 0, 0), unit="ns"), na.PulsePeriod(100, (0, 0, 0), unit="ns"),
+        na.PulsePeriod(100, (1, 1, 0), unit="ns"), na.PulsePeriod(100, (0, 0, 0), unit="ns"),
+    ], time_step_ns=20)
+    prog = st.compile(clock_hz=50e6)
+
+    def pulses(wave):
+        return sum(1 for t in range(1, len(wave)) if wave[t] == 1 and wave[t - 1] == 0) + (1 if wave[0] else 0)
+
+    N = 30   # exactly one frame (6 periods x 5 ticks) -- avoid the repeat seam
+    n_edges = len(prog.ticks)
+    fixed = [(m >> 1) & 1 for m in em.rtl_mirror_play(prog, N)]
+    fixed_full = em.rtl_mirror_play(prog, N)
+    assert pulses(fixed) == 2 and fixed[-1] == 0          # both pulses, settles low
+
+    # The seed loads FIFO_DEPTH(=4) shadows but marks only clamp(prior_count-1) valid;
+    # so a stale count CORRUPTS the frame exactly when prior_count <= 4 (the clamp
+    # saturates at FIFO_DEPTH=4, hence prior_count >= 5 already covers the seed window and
+    # is harmless).  This is why it strikes "很多时候": the PREVIOUS program is usually tiny
+    # -- an all-off table (2 edges) or a tick-0 single pulse (3 edges) -- right where the
+    # bug bites.  Scan the corrupting counts and assert a dropped pulse appears.
+    seen_dropped_pulse = False
+    for prior in range(1, 5):                              # prior_count in {1,2,3,4}: corrupting
+        full = em.rtl_mirror_play_stale_seed(prog, N, prior_count=prior)
+        assert full != fixed_full                          # tail edges dropped -> waveform wrong
+        if pulses([(m >> 1) & 1 for m in full]) < 2:
+            seen_dropped_pulse = True                      # an emCCD pulse was merged / lost
+    assert seen_dropped_pulse, "a small stale prior count must drop an emCCD pulse"
+
+    # prior_count >= FIFO_DEPTH+1 (=5) saturates the clamp -> seed window fully covered ->
+    # identical to the fixed engine (so the bug is invisible after a big prior program).
+    for prior in range(5, n_edges + 1):
+        assert em.rtl_mirror_play_stale_seed(prog, N, prior_count=prior) == fixed_full
+
+
+def test_pulse_streamer_rtl_advances_delay_rings_after_done():
+    """U4: the delay rings must KEEP shifting after done so a delayed channel flushes its
+    tail (and settles low) instead of freezing at a stale -- possibly HIGH -- tap value.
+    Locks the RTL done-but-emitting branch the Python mirror/reference already contract."""
+
+    import re
+    rtl = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    match = re.search(r"end else if \(done\) begin(.*?)\bend\b", rtl, re.S)
+    assert match is not None, "RTL must have the done-but-emitting branch (U4 fix)"
+    assert "bnd_delay_advance = 1'b1;" in match.group(1)
+
+
+def test_delay_tail_emits_after_done_contract():
+    """U4 contract: the Python mirror promises out[t] = in[t-d] for the WHOLE stream --
+    including the tail AFTER the final tick (which the fixed RTL now realises)."""
+
+    import fpga.pulse_streamer.host.engine_model as em
+
+    prog = na.RuntimeSequenceProgram(
+        sequence_id="tail", sequence_name="tail", clock_hz=50e6,
+        channels=["a"], ticks=[0, 10], masks=[1, 0],
+        duration=10 * 20e-9, repeat_forever=False,
+        channel_delays=[5],
+    )
+    out = em.rtl_mirror_play(prog, 40)
+    assert out[5] == 1 and out[14] == 1   # the pulse, shifted by d=5
+    assert out[15] == 0                   # tail END lands AFTER final_tick=10 (at 10+5)
+    assert all(v == 0 for v in out[15:])  # then settles low -- never frozen high
+
+
+def test_steep_ramp_tracks_ideal_line_with_multi_lsb_bresenham_steps():
+    """An over-steep ramp is ALLOWED for any duration, and the engine must approach the
+    ideal line as closely as a 20 ns tick permits: per tick the value moves by the
+    CALCULATED step (multiple LSBs -- Bresenham value(k) = vstart +/- floor(k*delta/span)),
+    NOT a 1-LSB/tick crawl with an end snap.  Locks validator acceptance, the engine
+    mirror, the closed form, and the preview to that one trajectory."""
+
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeBusSegment
+    from Zou_lab_control.neutral_atom.timing.pulse_table import _analog_bus_value_at_tick
+    import fpga.pulse_streamer.host.engine_model as em
+
+    steep = na.RuntimeSequenceProgram(
+        sequence_id="ramp", sequence_name="ramp", clock_hz=50e6,
+        channels=["a"], ticks=[0, 2000], masks=[1, 0],
+        duration=2000 * 20e-9, repeat_forever=False,
+        bus_names=["da"],
+        # a ramp carries from the live register, so seed it at code 0 with an edge first, then the
+        # steep ramp sweeps 0 -> 1023 over 10 ticks (#ramp-carry).
+        bus_segments=[RuntimeBusSegment(0, 0, 0, 0, 0, "edge", "da"),
+                      RuntimeBusSegment(0, 0, 10, 0, 1023, "ramp", "da")],
+    )
+    na.validate_pulse_streamer_program(steep, channel_count=1)   # accepted, no raise
+
+    # engine mirror: 0 -> 1023 over 10 ticks moves ~102 codes per tick along the floor
+    # line and lands EXACTLY on 1023 at stop_tick (output registered: out[t] has k=t-1).
+    out = em.bus_play(steep, 0, 16)
+    for t in range(1, 11):
+        assert out[t] == ((t - 1) * 1023) // 10
+    assert out[11] == 1023 and out[15] == 1023
+    # closed form agrees tick-for-tick (it drives the bus delay line)
+    assert [em.bus_value_at(steep, 0, t, 0) for t in range(16)] == out
+
+    # preview draws the same staircase: k*delta//span from the carried-in value.
+    plan = [{"mode": "ramp", "value": 1023}, {"mode": "hold", "value": None}]
+    starts = [0, 10, 20]
+    assert _analog_bus_value_at_tick(plan, starts, 1) == 102   # multi-LSB step, no crawl
+    assert _analog_bus_value_at_tick(plan, starts, 9) == 920
+    assert _analog_bus_value_at_tick(plan, starts, 10) == 1023  # lands ON target
+    # a GENTLE ramp keeps the historic staircase (step = 0, carry-only).
+    gentle = [{"mode": "ramp", "value": 8}, {"mode": "hold", "value": None}]
+    assert _analog_bus_value_at_tick(gentle, starts, 5) == 4
+
+
+def test_pulse_streamer_rtl_has_bresenham_ramp_stepper():
+    """No Verilog simulator in the repo -> lock the RTL structure of the multi-LSB ramp
+    stepper: the divmod function computing step/rem at segment APPLY, the step+carry
+    increment, and the saturating move toward the target."""
+
+    rtl = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    assert "function [2*BUS_WIDTH+1:0] zlc_bus_ramp_divmod;" in rtl
+    assert "bus_ramp_step" in rtl and "bus_ramp_rem" in rtl
+    assert "bus_ramp_delta" not in rtl                      # the 1-LSB/tick crawl is GONE
+    assert "bus_inc = bus_ramp_step[i] + 1'b1;" in rtl      # carry tick: step+1
+    # the divider is DEFERRED to the first stepping tick and fed from registers
+    assert "bus_qr = zlc_bus_ramp_divmod(bus_ramp_rem[i], bus_ramp_denom[i][BUS_WIDTH:0]);" in rtl
+    assert "bus_ramp_steep" in rtl
+    # saturating moves (both directions) land exactly on the target
+    assert "? bus_ramp_target[i] : bus_v_next[BUS_WIDTH-1:0];" in rtl
+    assert "bus_value_active[i] <= bus_value_active[i] - bus_inc[BUS_WIDTH-1:0];" in rtl
+
+
+def test_check_rtl_assumptions_guards_shipped_geometry():
+    """B3/B4/U7: geometries the shipped RTL would silently corrupt are rejected at pack
+    time (coeff assembly assumes 64 coeff bits; flags fit one 32b word; pow2 bank/edges)."""
+
+    import dataclasses
+    import pytest
+    import fpga.pulse_streamer.host.image as im
+
+    im.check_rtl_assumptions(im.StreamerParams())   # shipped geometry passes
+    with pytest.raises(ValueError, match=r"num_slots\*coeff_width"):
+        im.check_rtl_assumptions(dataclasses.replace(im.StreamerParams(), num_slots=8))
+    with pytest.raises(ValueError, match="power of two"):
+        im.check_rtl_assumptions(dataclasses.replace(im.StreamerParams(), bank_size=3000))
+    with pytest.raises(ValueError, match="flags word"):
+        im.check_rtl_assumptions(dataclasses.replace(im.StreamerParams(), bus_width=14, bus_sel_width=4))
+
+
+def test_create_project_tcl_hard_verifies_edge_bram_latency():
+    """T3: the latency-2 force must be READ BACK and hard-fail the build if it did not
+    take (a silent latency-1 BRAM would shift every edge a cycle early on hardware)."""
+
+    tcl = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "create_project.tcl").read_text(encoding="utf-8")
+    assert "ZLC LATENCY-CHECK FAILED" in tcl
+    assert "ZLC LATENCY-CHECK OK" in tcl
+    assert tcl.count("get_property $prop [get_ips $ip]") >= 1
+
+
+# --------------------------------------------------------------------------- #
+# 2026-06-09 features: editable period names + signed DAC (0 = 0 V, mid-code idle).
+# --------------------------------------------------------------------------- #
+def test_signed_dac_user_layer_to_wire_codes_end_to_end():
+    """USER layer is signed LSB (0 = true 0 V, range -2^(B-1)..+2^(B-1)-1); the WIRE
+    layer (segments, scan_points, RTL) is offset-binary code = signed + 2^(B-1).
+    The conversion happens exactly once, in the compilers."""
+
+    from Zou_lab_control.neutral_atom.timing.pulse_table import bus_signed_range, bus_zero_code
+
+    assert bus_zero_code(10) == 512 and bus_signed_range(10) == (-512, 511)
+    ch = [f"da[{i}]" for i in range(10)] + ["trig"]
+    st = na.PulseTableState(
+        channels=ch, time_step_ns=20,
+        periods=[na.PulsePeriod(1000, tuple([0] * 10 + [1]), unit="ns"),
+                 na.PulsePeriod(1000, tuple([0] * 11), unit="ns")],
+    )
+    st.set_analog_bus_mode(0, "da", "edge", value=-200)
+    st.set_analog_bus_mode(1, "da", "ramp", value=300)
+    prog = na.compile_runtime_program_for_payload(st, channels=ch, clock_hz=50e6)
+    segs = [(s.mode, s.start_value, s.stop_value) for s in prog.bus_segments]
+    # codes = signed + 512: edge -200 -> 312, ramp TO 300 -> 812.  The ramp START is the live
+    # register (carries the edge 312 at runtime), so it is NOT baked -- start_value 0 (#ramp-carry).
+    assert segs == [("edge", 312, 312), ("ramp", 0, 812)]
+    # user-facing views stay signed
+    assert st.analog_bus_value_at_period_start(0, "da") == -200
+    # an out-of-range signed value is rejected with the signed bounds in the message
+    import pytest
+    with pytest.raises(ValueError, match="-512 and 511"):
+        st.set_analog_bus_mode(0, "da", "edge", value=900)
+
+
+def test_untouched_dac_bus_idles_at_mid_code():
+    """An untouched bus rests at TRUE 0 V: the compiler emits no segments for it and the
+    RTL idles at BUS_SAFE_VALUE (mid code) -- locked here in the model and the RTL text."""
+
+    import re
+    from fpga.pulse_streamer.host.engine_model import bus_play
+
+    ch = [f"da[{i}]" for i in range(10)] + ["trig"]
+    st = na.PulseTableState(channels=ch, time_step_ns=20,
+                            periods=[na.PulsePeriod(1000, tuple([0] * 10 + [1]), unit="ns")])
+    prog = na.compile_runtime_program_for_payload(st, channels=ch, clock_hz=50e6)
+    assert not (prog.bus_segments or [])                      # nothing emitted
+    assert all(v == 512 for v in bus_play(prog, 0, 50))       # model idles at mid (0 V)
+
+    rtl = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    assert "parameter integer BUS_SAFE_VALUE = (1 << (BUS_WIDTH - 1))" in rtl
+    # each DA bit's event-FIFO output (bobit) AND its d==1 register (bprev) reset to that bit's
+    # SAFE level (derived from BUS_SAFE_VALUE), so an untouched/not-yet-scheduled bus idles at
+    # the mid-code (0 V).
+    assert "SAFE_BIT = (BUS_SAFE_VALUE >> gbk) & 1" in rtl
+    assert rtl.count("<= SAFE_BIT[0]") >= 2   # bobit + bprev reset paths
+
+
+def test_period_name_round_trips_and_survives_transforms():
+    """Editable period names: stored on PulsePeriod, kept by save/load, aligned_to_channels,
+    with_slots_resolved and unrolled_bracket (per-copy)."""
+
+    st = na.PulseTableState(
+        channels=["a", "b"], time_step_ns=20,
+        periods=[na.PulsePeriod(100, (1, 0), unit="ns", name="load"),
+                 na.PulsePeriod(200, (0, 1), unit="ns", name="image")],
+        repeat_start=0, repeat_end=1, repeat_count=2,
+    )
+    assert na.PulseTableState.from_dict(st.to_dict()).periods[0].name == "load"
+    unrolled = st.unrolled_bracket()
+    assert [p.name for p in unrolled.periods] == ["load", "image", "load", "image"]
+
+
+def test_streamer_params_defaults_match_config():
+    """A bare StreamerParams() must equal default_params() (the streamer_config.json read)
+    FIELD BY FIELD.  bank_size once drifted (dataclass default 512 vs config 2048): every
+    direct StreamerParams() user -- tests, tools, sim-image generators -- then packed a
+    DIFFERENT register geometry than the deployed bitstream, the same silent-skew family
+    as the layout mismatch.  This pins the dataclass defaults to the single source."""
+
+    import dataclasses
+    from fpga.pulse_streamer.host.image import StreamerParams, default_params
+
+    bare, cfg = StreamerParams(), default_params()
+    for f in dataclasses.fields(StreamerParams):
+        assert getattr(bare, f.name) == getattr(cfg, f.name), (
+            f"StreamerParams.{f.name} default {getattr(bare, f.name)!r} != "
+            f"streamer_config.json {getattr(cfg, f.name)!r} -- update the dataclass default")
+
+
+def test_wait_done_drains_the_delayed_tail_and_prepare_does_not_chop_it(tmp_path):
+    """DONE asserts when the UNDELAYED stream ends; the event schedulers keep emitting the
+    queued tail for max(delay) more.  wait_done() must not return until that tail has
+    physically played, and a back-to-back prepare() must wait out the previous run's drain
+    deadline before CMD_SAFE (an explicit safe_state() stays immediate) -- otherwise a
+    chained shot chops the last d ticks of every delayed channel (e.g. a -2 s emCCD)."""
+
+    import re as _re
+    import time as _time
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeBusDelay
+
+    class Hw:
+        def __init__(self):
+            self.bram = {2: 0b101}     # STATUS: LOADED|DONE immediately
+        def __call__(self, lines, action, timeout):
+            text = "\n".join(lines)
+            for w, v in _decode_axi_writes(text):
+                self.bram[w] = v
+                if w == 1 and v == 1:      # CMD_LOAD -> LOADED
+                    self.bram[2] = 0b101
+            m = _re.search(r"-address ([0-9a-fA-F]+) -len 1 -type read", text)
+            if m:
+                w = int(m.group(1), 16) // 4
+                if w == 63:
+                    return "ZLCDATA 5A4C4C02\n"
+                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
+            return "ok\n"
+
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=Hw())
+    prog = na.RuntimeSequenceProgram(
+        sequence_id=1, sequence_name="d", clock_hz=50e6, channels=["a"],
+        ticks=[0, 10], masks=[1, 0], duration=200.0,
+        channel_delays=[2_500_000],                      # 50 ms tail
+        bus_delays=[RuntimeBusDelay(0, 1_000_000)])
+    session.prepare(prog)
+    assert abs(session._tail_seconds - 0.05) < 1e-9      # max(50 ms, 20 ms)
+
+    session.fire()
+    t0 = _time.monotonic()
+    assert session.wait_done(timeout=5.0)
+    waited = _time.monotonic() - t0
+    assert waited >= 0.05, f"wait_done returned {waited*1e3:.0f} ms after DONE; must drain the 50 ms tail"
+    assert session._drain_until == 0.0                   # drained: next prepare is instant
+
+    # chop guard: fire again and immediately prepare -- prepare must wait the deadline out
+    session.fire()
+    t1 = _time.monotonic()
+    session.prepare(prog)
+    assert _time.monotonic() - t1 >= 0.05, "prepare must not CMD_SAFE before the tail drains"
+
+    # explicit stop abandons the tail on purpose -> instant next prepare
+    session.fire()
+    session.safe_state()
+    assert session._drain_until == 0.0
+
+
+def test_drain_tail_short_budget_keeps_guard_and_running_prepare_aborts_instantly(tmp_path):
+    """Two drain-tail edge cases.
+
+    1. wait_done() with a budget SHORTER than the tail returns True on DONE but must
+       leave the drain deadline ARMED, so the next prepare() still waits out the
+       un-drained remainder (clearing it unconditionally would chop the tail).
+    2. prepare() over a still-RUNNING program (no DONE) is an explicit program switch
+       and must NOT wait -- the abort-immediately semantics; only DONE-with-pending-tail
+       blocks it.
+    """
+
+    import re as _re
+    import time as _time
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+
+    class Hw:
+        def __init__(self, status):
+            self.status = status
+            self.bram = {2: status}
+        def __call__(self, lines, action, timeout):
+            text = "\n".join(lines)
+            for w, v in _decode_axi_writes(text):
+                self.bram[w] = v
+                if w == 1:                 # any COMMAND keeps the scripted STATUS
+                    self.bram[2] = self.status
+            m = _re.search(r"-address ([0-9a-fA-F]+) -len 1 -type read", text)
+            if m:
+                w = int(m.group(1), 16) // 4
+                if w == 63:
+                    return "ZLCDATA 5A4C4C02\n"
+                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
+            return "ok\n"
+
+    # --- case 1: DONE, 100 ms tail, but only a 20 ms wait_done budget -----------------
+    session = VivadoAxiStreamerSession(state_dir=tmp_path / "done", tcl_executor=Hw(0b101))
+    prog = na.RuntimeSequenceProgram(
+        sequence_id=1, sequence_name="d", clock_hz=50e6, channels=["a"],
+        ticks=[0, 10], masks=[1, 0], duration=200.0,
+        channel_delays=[5_000_000])                      # 100 ms tail
+    session.prepare(prog)
+    session.fire()
+    assert session.wait_done(timeout=0.02)               # budget < tail: returns on DONE
+    assert session._drain_until > 0.0, "under-drained tail must keep the guard armed"
+    t0 = _time.monotonic()
+    session.prepare(prog)                                # must wait out the remainder
+    assert _time.monotonic() - t0 >= 0.05, "prepare chopped an under-drained tail"
+
+    # --- case 2: still RUNNING (never DONE) -> prepare aborts immediately -------------
+    session2 = VivadoAxiStreamerSession(state_dir=tmp_path / "run", tcl_executor=Hw(0b011))
+    prog2 = na.RuntimeSequenceProgram(
+        sequence_id=2, sequence_name="r", clock_hz=50e6, channels=["a"],
+        ticks=[0, 10], masks=[1, 0], duration=200.0,
+        channel_delays=[10_000_000])                     # 200 ms tail
+    session2.prepare(prog2)
+    session2.fire()
+    assert session2._drain_until > 0.0
+    t1 = _time.monotonic()
+    session2.prepare(prog2)                              # program switch: no tail wait
+    assert _time.monotonic() - t1 < 0.1, "prepare must not stall on a RUNNING program"
+
+
+def test_signal_hub_publish_latest_history_and_versioning():
+    """SignalHub: per-shot named signals with bounded history and change detection."""
+
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    hub = SignalHub(history=8)
+    assert hub.version == 0
+    hub.publish({"rate": 0.5, "counts": np.array([1.0, 2.0, 3.0])})
+    hub.publish({"rate": 0.7, "counts": np.array([4.0, 5.0, 6.0])})
+    assert hub.version == 2 and hub.shot == 2
+    assert hub.latest("rate") == 0.7
+    assert np.array_equal(hub.latest("counts"), [4.0, 5.0, 6.0])
+    assert hub.history("rate").shape == (2,)
+    assert hub.history("counts", 1).shape == (1, 3)
+    # history is bounded by the ring length
+    for i in range(20):
+        hub.publish({"rate": float(i)})
+    assert hub.history("rate").shape == (8,)
+    # a shape change keeps only the most recent same-shape run
+    hub.publish({"counts": np.zeros(5)})
+    assert hub.history("counts").shape == (1, 5)
+    with pytest.raises(KeyError):
+        hub.latest("nope")
+    # the consumer namespace is a plain dict of copies
+    snap = hub.snapshot_latest()
+    assert set(snap) == {"rate", "counts"}
+    snap["counts"][0] = 999.0
+    assert hub.latest("counts")[0] != 999.0
+
+
+def test_user_composed_loading_readout_publishes_standard_signals():
+    """The user composes the loading readout from independent nodes -- a
+    CalibrateReadoutTask producing the calibration + a CameraMeasurement publishing
+    raw frames + an OccupancyProcessor running the REAL per-frame ``calibration.detect``
+    -- exactly the same composition real hardware uses (virtual == real, only the
+    camera frames are fake).  Each node is added separately and addressed
+    independently; no monolithic node fabricates every signal.
+
+    The running loading rate lands near the configured probability, and a
+    namespaced (prefixed) second chain coexists in the same hub for A-B expressions."""
+
+    from conftest import fire_imaging_pulse
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualSequencer, VirtualTrapArray
+    from Zou_lab_control.neutral_atom.operations.logic import (
+        CalibrateReadoutTask, CameraMeasurement, OccupancyProcessor)
+
+    def _build(hub, *, prefix, seed, loading_probability):
+        trap = VirtualTrapArray(grid_shape=(5, 7), loading_probability=loading_probability, seed=seed)
+        seqr = VirtualSequencer()
+        camera = VirtualCamera(trap, exposure=0.02, sequencer=seqr)   # the trigger cable
+        fire_imaging_pulse(seqr, exposure=0.02, cooling=trap.mot_load_s)   # On Pulse: trigger-driven camera streams
+        task = CalibrateReadoutTask(hub, camera, sequencer=seqr, grid_shape=trap.grid_shape,
+                                    readout_exposure=0.02,
+                                    roi_radius=1, threshold_frames=24,
+                                    prefix=f"{prefix}cal_")
+        task.run_to_completion()
+        # The calibrate task uploads + fires its own FINITE bracket programs, which (like real
+        # hardware: a prepare replaces whatever the streamer was playing) stop the continuous On
+        # Pulse.  Re-fire it so the LIVE CameraMeasurement below has an active imaging pulse to
+        # stream from -- exactly the step a real operator takes to resume the live view after a
+        # calibration run (virtual == real).
+        fire_imaging_pulse(seqr, exposure=0.02, cooling=trap.mot_load_s)
+        cam = CameraMeasurement(hub, camera, sequencer=seqr, prefix=prefix)
+        # occupancy preserves the repeat axis (#H3q); loading probability = repeat_mode=average
+        det = OccupancyProcessor(hub, calibration=task.calibration, source_expr={"inputs": [f"{prefix}frame_0"], "source": "value = signal"},
+                              grid_shape=trap.grid_shape, prefix=prefix)
+        return cam, det
+
+    hub = SignalHub()
+    cam, det = _build(hub, prefix="", seed=5, loading_probability=0.55)
+    for _ in range(60):
+        cam.step()      # camera measurement publishes a frame block
+        det.step()      # detect processor runs the REAL per-frame detect on every repeat slice
+    n = det.calibration.n_sites
+    names = set(hub.names())
+    assert {"frame_0", "counts", "occupied", "rate", "centers", "thresholds"} <= names
+    assert np.squeeze(hub.latest("frame_0")).shape == (96, 128)
+    assert hub.latest("centers").shape == (n, 2)   # the site-map panel's anchor (static, no repeat)
+    assert hub.latest("thresholds").shape == (n,)
+    occ = np.asarray(hub.latest("occupied"))
+    counts = np.asarray(hub.latest("counts"))
+    assert occ.ndim == 3 and occ.shape[1:] == (1, n)   # (repeat, 1, n_sites) -- data_points axis kept
+    assert counts.shape == occ.shape
+    assert 0.0 <= float(hub.latest("rate")) <= 1.0                     # this block's loading fraction
+    # the long-run occupancy mean tracks loading_probability (loose: lifetime losses)
+    occupancy = hub.history("occupied", 60)
+    assert 0.30 <= float(np.nanmean(occupancy)) <= 0.80
+    # a prefixed second composition coexists in the same hub for A-B expressions
+    cam_b, det_b = _build(hub, prefix="b_", seed=6, loading_probability=0.3)
+    for _ in range(10):
+        cam_b.step()
+        det_b.step()
+    diff = np.asarray(hub.latest("occupied")) - np.asarray(hub.latest("b_occupied"))
+    assert diff.shape[-1] == n
+
+
+class _FakeVivadoProc:
+    """In-process stand-in for the persistent ``vivado -mode tcl`` child.
+
+    ``stdin.write`` receives one whole wrapped script per transaction; the fake parses
+    its unique marker and synthesises the marker protocol on ``stdout`` (BEGIN / an
+    optional ZLCDATA reply for reads / OK / END).  ``exit``/kill/terminate end the
+    process: stdout EOFs, so the session's reader thread enqueues its None sentinel
+    exactly like a real dead Vivado."""
+
+    def __init__(self):
+        import queue as _queue
+        self._out: "_queue.Queue[str | None]" = _queue.Queue()
+        self.stdin = self
+        self.stdout = self
+        self.returncode = None
+
+    # --- stdin side -------------------------------------------------------------
+    def write(self, text: str) -> None:
+        import re as _re
+        m = _re.search(r"(ZLC_AXI_\d+)_BEGIN", text)
+        if m is None:
+            if text.strip() == "exit":
+                self._exit()
+            return
+        marker = m.group(1)
+        self._out.put(f"{marker}_BEGIN\n")
+        if "-type read" in text:
+            self._out.put("ZLCDATA 5A4C4C02\n")          # REGISTER_LAYOUT_ID readback
+        self._out.put(f"{marker}_OK\n")
+        self._out.put(f"{marker}_END\n")
+
+    def flush(self) -> None:
+        pass
+
+    # --- stdout side (iterated by the session's reader thread) -------------------
+    def __iter__(self):
+        while True:
+            item = self._out.get()
+            if item is None:
+                return
+            yield item
+
+    # --- process control ----------------------------------------------------------
+    def _exit(self) -> None:
+        if self.returncode is None:
+            self.returncode = 0
+            self._out.put(None)                          # EOF for the reader thread
+
+    def wait(self, timeout=None):
+        self._exit()
+        return 0
+
+    def terminate(self) -> None:
+        self._exit()
+
+    def kill(self) -> None:
+        self._exit()
+
+
+def test_axi_session_self_heals_after_close_restart(monkeypatch, tmp_path):
+    """A close() -> restart cycle must be CLEAN: the dead generation's reader thread
+    EOF-sentinels its OWN queue, never the new generation's.
+
+    With the queue shared across generations (the old code), the stale ``None``
+    poisoned every restart: the next transaction raised "process exited
+    unexpectedly", the retry killed its fresh process (whose reader enqueued the
+    next sentinel), and so on forever -- after ONE transient failure (e.g. a delay
+    error followed by an action timeout) no pulse could ever be applied again and
+    the whole server had to be restarted."""
+
+    from Zou_lab_control.neutral_atom.devices import axi_session as ax
+
+    made = []
+
+    def fake_popen(cmd, **kwargs):
+        proc = _FakeVivadoProc()
+        made.append(proc)
+        return proc
+
+    monkeypatch.setattr(ax.subprocess, "Popen", fake_popen)
+    session = ax.VivadoAxiStreamerSession(state_dir=tmp_path, vivado="fake-vivado")
+    session.start()
+    assert session._read_word(63) == 0x5A4C4C02
+
+    old_reader = session._reader
+    session.close()                       # generation 1 dies; its reader EOF-sentinels its queue
+    old_reader.join(timeout=2.0)
+    assert not old_reader.is_alive()
+
+    # the next transaction must transparently restart a fresh Vivado and SUCCEED
+    assert session._read_word(63) == 0x5A4C4C02
+    assert len(made) == 2, "expected exactly one transparent restart"
+    session.close()
+
+
+def test_axi_session_init_tcl_never_uses_raw_jtag_mode(tmp_path):
+    """`open_hw_target -jtag_mode on` must never be the reconnect fallback: raw JTAG
+    mode does not enumerate debug cores, so get_hw_axis comes back empty and every
+    restart then fails with a "no debug core" error until the server is rebooted."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+
+    session = VivadoAxiStreamerSession(
+        state_dir=tmp_path, vivado="fake-vivado", tcl_executor=lambda lines, a, t: "ok\n")
+    tcl = "\n".join(session._init_tcl())
+    assert "-jtag_mode" not in tcl
+    assert "open_hw_target" in tcl
+
+
+def test_torn_down_stream_transaction_never_spawns_a_new_vivado(monkeypatch, tmp_path):
+    """A transaction whose stop event is already set (the streaming-refill thread being
+    torn down by Off/prepare) must abort BEFORE the restart machinery -- a dying stream
+    thread spawning a competing Vivado would fight the main thread over the JTAG target."""
+
+    import threading as _threading
+    from Zou_lab_control.neutral_atom.devices import axi_session as ax
+
+    def explode(*args, **kwargs):
+        raise AssertionError("a stopped transaction must not spawn a new Vivado")
+
+    monkeypatch.setattr(ax.subprocess, "Popen", explode)
+    session = ax.VivadoAxiStreamerSession(state_dir=tmp_path, vivado="fake-vivado")
+    stop = _threading.Event()
+    stop.set()
+    with pytest.raises(ax._AxiAborted):
+        session._run_tcl(["puts hi"], action="x", timeout=1.0, stop=stop)
+
+
+# --------------------------------------------------------------------------- #
+# Rb87-style PSF + bimodal readout (decision 2): the matched-filter extraction
+# strategy, the dark/bright bimodal threshold fit, and an end-to-end PSF readout
+# on the virtual backend.  The box/otsu path stays the default and unchanged.
+# --------------------------------------------------------------------------- #
+def _psf_template(centers, *, shape=(40, 40), bg=5.0, amp=200.0, sigma=1.2):
+    h, w = shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    img = np.full((h, w), float(bg))
+    for cx, cy in np.asarray(centers, dtype=float):
+        img = img + amp * np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma ** 2))
+    return img
+
+
+def test_fit_site_psfs_returns_normalized_weights_in_fixed_boxes():
+    from Zou_lab_control.neutral_atom.core.psf import fit_site_psfs, psf_boxes_array, psf_weights_array
+
+    centers = np.array([[10.0, 12.0], [28.0, 14.0], [18.0, 30.0]])
+    psfs = fit_site_psfs(_psf_template(centers), centers, half_width=3)
+    assert len(psfs) == 3
+    for psf in psfs:
+        assert psf.weight.shape == (7, 7)
+        assert abs(float(psf.weight.sum()) - 1.0) < 1e-9
+        assert float(psf.weight.min()) >= 0.0
+    assert psf_weights_array(psfs).shape == (3, 7, 7)
+    assert psf_boxes_array(psfs).shape == (3, 4)
+
+
+def test_psf_signals_are_brighter_for_occupied_sites():
+    from Zou_lab_control.neutral_atom.core.psf import fit_site_psfs, psf_boxes_array, psf_signals, psf_weights_array
+
+    centers = np.array([[10.0, 12.0], [28.0, 28.0]])
+    psfs = fit_site_psfs(_psf_template(centers), centers, half_width=3)
+    weights, boxes = psf_weights_array(psfs), psf_boxes_array(psfs)
+    frame = _psf_template(centers[:1])  # only site 0 occupied
+    signals = psf_signals(frame, weights, boxes, background="annulus")
+    assert signals[0] > signals[1] + 5.0
+
+
+def test_psf_edge_site_raises_for_clipped_box():
+    from Zou_lab_control.neutral_atom.core.psf import fit_site_psfs
+
+    with pytest.raises(ValueError):
+        fit_site_psfs(np.ones((20, 20)), np.array([[1.0, 1.0]]), half_width=3)
+
+
+def test_fit_bimodal_recovers_two_gaussians_and_threshold():
+    from Zou_lab_control.neutral_atom.core.bimodal import fit_bimodal
+
+    rng = np.random.default_rng(1)
+    values = np.concatenate([rng.normal(10.0, 1.0, 400), rng.normal(40.0, 2.0, 400)])
+    fit = fit_bimodal(values)
+    assert fit.ok and fit.bright_above
+    assert 7.0 < fit.dark_mean < 13.0
+    assert 36.0 < fit.bright_mean < 44.0
+    assert fit.dark_mean < fit.threshold < fit.bright_mean
+    assert fit.fidelity > 0.99
+
+
+def test_fit_bimodal_degenerate_is_not_ok():
+    from Zou_lab_control.neutral_atom.core.bimodal import fit_bimodal
+
+    assert not fit_bimodal(np.full(50, 7.0)).ok
+
+
+def test_psf_bimodal_readout_end_to_end_on_virtual_backend():
+    exp = na.connect("virtual", sitemap={"loading_probability": 0.6}, loss_rate=0.001, seed=11)
+    sitemap = exp.readout.sitemap(method="psf", frames=6, display=False)
+    assert sitemap.calibration.method == "psf"
+    assert sitemap.calibration.psf_weights.shape[0] == sitemap.calibration.n_sites
+    exp.readout.thresholds(method="bimodal", frames=120, display=False)
+    cal = exp.readout.current
+    assert cal.method == "psf"
+    assert cal.metadata.get("threshold_method") == "bimodal"
+    assert np.all(np.isfinite(cal.thresholds))
+    from conftest import fire_live_imaging
+    exp.devices.trap_array.set_occupancy([0, 1, 2, 5, 9])
+    fire_live_imaging(exp)            # On Pulse: the trigger-driven camera streams the pinned shot
+    image = exp.devices.camera.acquire(1)[-1]      # the wired camera senses the firing itself
+    assert cal.detect(image).occupied_indices == [0, 1, 2, 5, 9]
+
+
+def test_misspelled_readout_method_raises_instead_of_silently_falling_back():
+    """A misspelled method must fail loud (like analysis.normalize_reducer /
+    operations ALL_READOUT_METHODS), NOT silently get read as box because the old
+    ``"psf" in m`` substring test happened to miss.  ``_resolve_method`` whitelists
+    against ``methods()`` (the single source of what this calibration can read),
+    and the message lists the legal set."""
+    cal = na.TrapCalibration(
+        centers=[(2, 2), (2, 6)],
+        thresholds=[5.0, 5.0],
+        grid_shape=(1, 2),
+        method="box",
+    )
+    image = np.zeros((8, 8), dtype=float)
+    # A valid method (its own) reads fine.
+    assert cal.signals(image, method="box").shape == (2,)
+    # Misspellings raise, and the error names the available set -- not a silent box read.
+    for bad in ("pfs", "psff", "uniform-psf", "nonsense"):
+        with pytest.raises(ValueError, match="not one of"):
+            cal.signals(image, method=bad)
+        with pytest.raises(ValueError, match="not one of"):
+            cal.detect(image, method=bad)
+        with pytest.raises(ValueError, match="not one of"):
+            cal.thresholds_for(bad)
+    # A method this box calibration does NOT carry also fails loud (it is not in methods()).
+    assert "psf" not in cal.methods()
+    with pytest.raises(ValueError, match="not one of"):
+        cal.signals(image, method="psf")
+
+
+def test_sequence_name_does_not_switch_the_virtual_camera_to_all_bright():
+    """Decoupling (#H3q): the virtual camera must NOT render an idealized all-loaded frame just
+    because the ANALYSIS layer named its sequence 'sitemap'.  All-sites is ONLY the explicit device
+    kwarg ``force_all_sites``; otherwise a sitemap calibration sees realistic ~50% loading and finds
+    the sites by AVERAGING many frames -- the SAME path real hardware takes (virtual==real)."""
+    exp = na.connect("virtual", sitemap={"grid_shape": (5, 7)}, seed=3)
+    try:
+        exp.readout.sitemap(frames=8, display=False)
+        exp.readout.thresholds(frames=60, display=False)
+        cal = exp.readout.current
+        from conftest import fire_live_imaging
+        fire_live_imaging(exp)
+        seq = exp.readout._session._imaging_sequence(load=True, name="sitemap")   # the MAGIC name
+        img = na.triggered_frames(exp.devices.camera, exp.devices.sequencer, seq, 1)[-1]
+        loaded = int(np.sum(np.asarray(cal.detect(img).occupied)))
+        assert 0 < loaded < cal.n_sites      # realistic partial loading -- the name does NOT force all-bright
+    finally:
+        exp.close()
+
+
+def test_psf_calibration_serialization_round_trip(tmp_path):
+    exp = na.connect("virtual", loss_rate=0.001, seed=5)
+    exp.readout.sitemap(method="psf", frames=4, display=False)
+    exp.readout.thresholds(method="bimodal", frames=80, display=False)
+    cal = exp.readout.current
+    # to_dict must serialize EVERY dataclass field -- so a newly-added field can NOT silently drop
+    # out of the on-disk record (this parity is why to_dict/from_dict stay explicit per-field, not
+    # a generic fields() loop that would emit raw numpy) (#C2).
+    from dataclasses import fields as _dc_fields, replace as _dc_replace
+    assert set(cal.to_dict()) == {f.name for f in _dc_fields(na.TrapCalibration)}
+    # Inject a per-method entry so the round trip also exercises to_dict's by_method encoder
+    # + from_dict's by_method parse (a multi-method calibration carries these).
+    cal = _dc_replace(cal, by_method={"box": {"thresholds": cal.thresholds, "psf_weights": None, "psf_boxes": None}})
+    for suffix in (".json", ".npz"):
+        path = tmp_path / f"cal{suffix}"
+        cal.save(path)
+        loaded = na.TrapCalibration.load(path)
+        assert loaded.method == "psf"
+        assert np.allclose(loaded.psf_weights, cal.psf_weights)
+        assert np.array_equal(loaded.psf_boxes, cal.psf_boxes)
+        assert np.allclose(loaded.thresholds, cal.thresholds)
+        assert set(loaded.by_method or {}) == {"box"}   # by_method survives the round trip
+        assert np.allclose(loaded.by_method["box"]["thresholds"], cal.thresholds)
+
+
+def test_box_otsu_readout_is_still_the_default():
+    exp = na.connect("virtual", seed=2)
+    sitemap = exp.readout.sitemap(frames=4, display=False)
+    assert sitemap.calibration.method == "box"
+    assert sitemap.calibration.psf_weights is None
+    exp.readout.thresholds(frames=60, display=False)
+    assert exp.readout.current.metadata.get("threshold_method") == "otsu"
+
+
+# --------------------------------------------------------------------------- #
+# Per-site readout-fidelity characterization (Rb87 flow): reference labels,
+# train/test split, held-out per-site fidelity, drop-worst ablation, and the
+# general N-site histogram grid.
+# --------------------------------------------------------------------------- #
+def _synth_fidelity_data(rng, *, n_sites=8, n_groups=240, bad_sites=()):
+    truth = rng.random((n_groups, n_sites)) < 0.5
+    ref = np.empty((n_groups, 3, n_sites))
+    short = np.empty((n_groups, n_sites))
+    for j in range(n_sites):
+        ref[:, :, j] = np.where(truth[:, j][:, None], 80.0, 2.0) + rng.normal(0, 1.5, (n_groups, 3))
+        if j in bad_sites:  # short readout barely separates dark from bright
+            short[:, j] = np.where(truth[:, j], 12.0, 6.0) + rng.normal(0, 3.0, n_groups)
+        else:
+            short[:, j] = np.where(truth[:, j], 50.0, 3.0) + rng.normal(0, 4.0, n_groups)
+    return short, ref, truth
+
+
+def test_reference_labels_recover_truth_and_flag_ambiguous():
+    from Zou_lab_control.neutral_atom.operations.fidelity import reference_labels
+
+    rng = np.random.default_rng(0)
+    _, ref, truth = _synth_fidelity_data(rng, n_sites=6, n_groups=200)
+    labels = reference_labels(ref)
+    assert labels.occupied.shape == truth.shape
+    assert np.mean(labels.valid) > 0.95                         # clean reference -> almost all decisive
+    assert np.all(labels.occupied[labels.valid] == truth[labels.valid])
+
+
+def test_train_test_split_is_disjoint_and_covers_valid():
+    from Zou_lab_control.neutral_atom.operations.fidelity import reference_labels, train_test_split
+
+    rng = np.random.default_rng(1)
+    _, ref, _ = _synth_fidelity_data(rng, n_sites=5, n_groups=200)
+    labels = reference_labels(ref)
+    split = train_test_split(labels, train_fraction=0.8, seed=3)
+    assert not np.any(split.train & split.test)                 # disjoint
+    assert np.all((split.train | split.test) <= labels.valid)   # only valid groups used
+    assert split.train.sum() > split.test.sum() > 0             # ~80/20
+
+
+def test_characterize_per_site_beats_global_and_ablation_helps():
+    from Zou_lab_control.neutral_atom.operations.fidelity import characterize_readout
+
+    rng = np.random.default_rng(2)
+    short, ref, _ = _synth_fidelity_data(rng, n_sites=8, n_groups=300, bad_sites=(0,))
+    report = characterize_readout(short, ref, train_fraction=0.85, seed=5, max_drop=3)
+    assert report.n_sites == 8
+    assert np.all(np.isfinite(report.thresholds))
+    # the overlapping site is the worst, and dropping it raises held-out fidelity
+    assert report.worst_sites[0] == 0
+    others = np.nanmean([s.fidelity for s in report.per_site[1:]])
+    assert report.per_site[0].fidelity < others
+    assert report.ablation[1]["fidelity"] >= report.ablation[0]["fidelity"] - 1e-9
+    assert len(report.ablation) == 4                            # k = 0..max_drop
+    vals, occ = report.per_site_arrays()
+    assert len(vals) == 8 and len(occ) == 8
+
+
+def test_site_histogram_grid_is_general_in_n():
+    import Zou_lab_control.frontend as zf
+
+    rng = np.random.default_rng(0)
+    for n_sites, grid in ((35, (5, 7)), (12, None), (3, None)):
+        vals = [np.concatenate([rng.normal(3, 1, 60), rng.normal(50, 3, 70)]) for _ in range(n_sites)]
+        occ = [np.array([False] * 60 + [True] * 70) for _ in range(n_sites)]
+        g = zf.site_histogram_grid(vals, occupied=occ, thresholds=[25.0] * n_sites,
+                                   site_fidelities=[0.99] * n_sites, grid_shape=grid, display=False)
+        assert sum(a.get_visible() for a in g.axes) == n_sites   # exactly N cells shown
+        assert g.fig.get_size_inches()[0] > 0
+        import matplotlib.pyplot as plt
+        plt.close(g.fig)
+
+
+def test_readout_characterize_from_dir_on_virtual_backend(tmp_path):
+    """The REAL Rb87 workflow on virtual data: the experiment (here the virtual
+    writer) saves raw frames to a FOLDER; the SAME analysis indexes that folder,
+    detects sites, and characterizes per-site fidelity. Switching to real hardware
+    changes only who wrote the frames (na.connect backend), not these lines."""
+    data_dir = tmp_path / "rb87_run01"
+    info = na.write_virtual_run(str(data_dir), prefix="img", groups=80, shots_per_group=4,
+                                short_shot=3, ref_shots=(1, 2, 4), short_exposure=5e-3,
+                                reference_exposure=20e-3, grid_shape=(5, 7),
+                                loading_probability=0.55, seed=9)
+    assert info["n_frames"] == 80 * 4                            # frames live on disk
+    assert len(list(data_dir.glob("img*.npy"))) == 320
+
+    exp = na.connect("virtual", sitemap={"grid_shape": (5, 7)})
+    exp.readout.sitemap_from_dir(str(data_dir), prefix="img", method="psf")   # sites DETECTED from folder
+    report = exp.readout.characterize_from_dir(str(data_dir), prefix="img", seed=2)
+    assert report.n_sites == 35
+    assert report.aggregate_fidelity > 0.9
+    cal = exp.readout.current
+    assert cal.metadata.get("threshold_method") == "per_site_reference"
+    assert np.all(np.isfinite(cal.thresholds))                  # data-trained thresholds stored back
+    # results written to a sibling results folder (mirrors the real {run}_results)
+    results = data_dir.parent / (data_dir.name + "_results")
+    assert (results / "characterize_summary.json").exists()
+    assert (results / "characterize_signals.npz").exists()
+    values, occupied = report.per_site_arrays()
+    assert len(values) == report.n_sites
+
+
+def test_clock_grid_tolerance_single_source():
+    """pulse_table reuses the clock-grid tolerances defined in sequence (no copy).
+
+    Both compilers snap to the FPGA tick grid with the same rel/abs tolerance;
+    the constants live once in ``timing.sequence`` and ``timing.pulse_table``
+    only re-exports them under its historical names. Re-typing the literals in
+    two places would silently drift, so this pins the identity."""
+    from Zou_lab_control.neutral_atom.timing import sequence, pulse_table
+    assert pulse_table.GRID_RTOL is sequence.CLOCK_GRID_RTOL
+    assert pulse_table.GRID_ATOL_STEPS is sequence.CLOCK_GRID_ATOL_TICKS

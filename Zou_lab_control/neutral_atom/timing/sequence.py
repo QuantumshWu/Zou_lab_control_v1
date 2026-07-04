@@ -10,11 +10,17 @@ import math
 
 import numpy as np
 
-from ..core.analysis import finite_float, positive_int
+from Zou_lab_control._clock import DEFAULT_CLOCK_HZ  # absolute: dependency-free clock seam (config single source)
+from ..core.analysis import finite_float, positive_float, positive_int
 
 
 CLOCK_GRID_RTOL = 1e-12
 CLOCK_GRID_ATOL_TICKS = 1e-9
+
+# Floating-point slack when comparing a repeat period against the base sequence
+# duration: period >= base_duration is the physical requirement, but a period set
+# exactly equal to base_duration can land a few ULP below it after arithmetic.
+_PERIOD_DURATION_SLACK = 1e-15
 
 
 @dataclass(frozen=True)
@@ -112,20 +118,12 @@ class PulseSequence:
     def repeated(self, repeats: int, *, period: float | None = None) -> "PulseSequence":
         repeats = positive_int(repeats, "repeats")
         period = self.base_duration if period is None else finite_float(period, "period")
-        if period <= 0:
-            raise ValueError("period must be > 0.")
-        if period + 1e-15 < self.base_duration:
-            raise ValueError("period must be at least the base sequence duration.")
         out = PulseSequence(self.pulses, name=self.name, delays=self.delays, repeat_count=repeats, repeat_period=period)
         out.validate().raise_if_failed()
         return out
 
     def forever(self, *, period: float | None = None) -> "PulseSequence":
         period = self.base_duration if period is None else finite_float(period, "period")
-        if period <= 0:
-            raise ValueError("period must be > 0.")
-        if period + 1e-15 < self.base_duration:
-            raise ValueError("period must be at least the base sequence duration.")
         out = PulseSequence(self.pulses, name=self.name, delays=self.delays, repeat_count=1, repeat_period=period, repeat_forever=True)
         out.validate().raise_if_failed()
         return out
@@ -185,7 +183,7 @@ class PulseSequence:
             period = self.repeat_period or base_duration
             if period <= 0:
                 errors.append("repeat period must be > 0.")
-            elif period + 1e-15 < base_duration:
+            elif period + _PERIOD_DURATION_SLACK < base_duration:
                 errors.append("repeat period must be at least the base sequence duration.")
             if clock is not None and period > 0 and _time_to_clock_tick(period, clock) is None:
                 errors.append(f"repeat period={period:g} s is not on the {clock:g} Hz clock grid.")
@@ -222,7 +220,7 @@ class PulseSequence:
                     active_index = index
         return PulseReport(not errors, self.name, len(self.pulses), clock, tuple(errors), tuple(warnings))
 
-    def edges(self, *, clock_hz: float = 50_000_000.0, channels: Sequence[str] | None = None) -> tuple[list[int], list[int], list[str]]:
+    def edges(self, *, clock_hz: float = DEFAULT_CLOCK_HZ, channels: Sequence[str] | None = None) -> tuple[list[int], list[int], list[str]]:
         channels = list(self.channels if channels is None else channel_names(channels, "channels", allow_empty=True))
         if not channels:
             raise ValueError("channels must contain at least one channel.")
@@ -293,6 +291,14 @@ class PulseReport:
             raise ValueError("Pulse sequence validation failed: " + "; ".join(self.errors))
 
 
+# The trap-held gap between consecutive emCCD frames of a long-short-long reference bracket.
+# The camera trigger drops during this gap so the next exposure registers as a DISTINCT trigger.
+# Single source for the gap: ``reference_bracket_sequence`` builds a bracket from scratch, and the
+# shipped imaging template (``default_imaging_template`` / ``pulses/imaging_template.json``) puts a
+# trap-held gap of this length between its image frames.
+READOUT_GAP_SECONDS = 100e-6
+
+
 def imaging_sequence(
     *,
     exposure: float = 20e-3,
@@ -332,43 +338,105 @@ def imaging_sequence(
     return seq
 
 
-DEFAULT_CAMERA_TRIGGER_CHANNELS = ("emCCD",)
-
-
-def count_trigger_pulses(sequence: PulseSequence, *, trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS) -> int:
-    """Count rising camera-trigger pulses in a sequence."""
-
-    channels = set(channel_names(trigger_channels, "trigger_channels"))
-    base_count = sum(1 for pulse in sequence.base_pulses() if pulse.value and pulse.channel in channels)
-    if sequence.repeat_forever:
-        return base_count
-    return base_count * int(sequence.repeat_count)
-
-
-def sequence_for_frame_count(
-    sequence: PulseSequence,
-    frames: int,
+def reference_bracket_sequence(
     *,
-    trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
+    ref_exposure: float = 20e-3,
+    readout_exposure: float = 5e-3,
+    n_ref: int = 2,
+    trigger_width: float = 20e-6,
+    pre_trigger: float = 100e-6,
+    gap: float = READOUT_GAP_SECONDS,
+    cooling: float = 2e-3,
+    name: str = "reference_bracket",
+    trap_channel: str = "trap",
+    cooling_channel: str = "cooling",
+    probe_channel: str = "probe",
+    trigger_channel: str = "emCCD",
 ) -> PulseSequence:
-    """Return a sequence whose camera-trigger count matches ``frames``.
+    """The Rb87 readout-fidelity bracket: ONE cooling load, then ``n_ref`` LONG reference
+    images interleaved with ONE short readout (e.g. long-short-long), all imaging the SAME
+    atoms (the trap is held on and there is NO re-cooling between triggers, so a following
+    frame sees the previous frame's survivors).  Comparing the long reference frames tells
+    whether the atom survived; when they agree they vote the GROUND-TRUTH occupancy that the
+    middle readout frame is scored against.  The readout is placed in the MIDDLE (index
+    ``n_ref // 2``); the others are references.  ``n_ref + 1`` camera triggers total."""
 
-    Single-shot imaging sequences are common in notebooks.  Real qCMOS
-    multi-frame acquisitions still need one hardware trigger per frame, so a
-    one-trigger sequence is repeated automatically.  Ambiguous sequences fail
-    early instead of timing out after the camera is armed.
-    """
+    ref_exposure = positive_float(ref_exposure, "ref_exposure")
+    readout_exposure = positive_float(readout_exposure, "readout_exposure")
+    n_ref = positive_int(n_ref, "n_ref")
+    trigger_width = positive_float(trigger_width, "trigger_width")
+    for value, label in ((pre_trigger, "pre_trigger"), (gap, "gap"), (cooling, "cooling")):
+        if finite_float(value, label) < 0:
+            raise ValueError(f"{label} must be >= 0.")
+    trap_channel = channel_name(trap_channel)
+    cooling_channel = channel_name(cooling_channel)
+    probe_channel = channel_name(probe_channel)
+    trigger_channel = channel_name(trigger_channel)
 
-    frames = positive_int(frames, "frames")
-    triggers = count_trigger_pulses(sequence, trigger_channels=trigger_channels)
-    if triggers == frames:
-        return sequence
-    if triggers == 1 and frames > 1:
-        return sequence.repeated(frames)
-    raise ValueError(
-        f"sequence {sequence.name!r} has {triggers} camera trigger pulses, "
-        f"but acquisition requested {frames} frame(s)."
-    )
+    readout_index = n_ref // 2
+    exposures = [readout_exposure if i == readout_index else ref_exposure for i in range(n_ref + 1)]
+
+    cursor = cooling + pre_trigger
+    starts: list[float] = []
+    for exposure in exposures:
+        starts.append(cursor)
+        cursor += exposure + gap
+    total = cursor
+    seq = PulseSequence(name=name).pulse(trap_channel, 0.0, total, name="trap_hold")
+    if cooling > 0:
+        seq = seq.pulse(cooling_channel, 0.0, cooling, name="load")
+    for i, (start, exposure) in enumerate(zip(starts, exposures)):
+        seq = seq.pulse(probe_channel, start, exposure, name=f"probe_{i}")
+        seq = seq.pulse(trigger_channel, start, trigger_width, name=f"camera_trigger_{i}")
+    return seq
+
+
+def imaging_channel_kwargs(sequencer: object, *, trigger_channel: str | None = None) -> dict[str, str]:
+    """Channel kwargs for :func:`imaging_sequence`, derived from a bound sequencer.
+
+    Single source of truth shared by the session and the loading readout: a real
+    streamer config names channels ``ch00..chNN`` (the imaging sequence must
+    target THOSE, not the ``trap``/``cooling``/``probe``/``emCCD`` placeholder
+    names, or every pulse references a channel the device does not have).  Maps
+    the conventional roles onto whatever the sequencer actually exposes; returns
+    ``{}`` when neither convention is present so the caller falls back to
+    :func:`imaging_sequence`'s own placeholder defaults (virtual / notebook use).
+
+    ``trigger_channel`` is the CAMERA's capture-trigger channel: the camera device owns
+    "which line triggers me" (the sequencer does NOT), so a caller building an imaging
+    pulse for a real chNN streamer passes its camera's ``capture_trigger_channels[0]`` --
+    that selects which chNN the imaging pulse pulses to trigger the camera.  The placeholder
+    (virtual) convention names the trigger ``emCCD`` directly, so the virtual path needs no
+    explicit trigger channel."""
+
+    channels = list(getattr(sequencer, "channels", ()) or ())
+    if all(ch in channels for ch in ("ch00", "ch03", "ch09")) and trigger_channel and trigger_channel in channels:
+        return {
+            "trap_channel": "ch09",
+            "cooling_channel": "ch00",
+            "probe_channel": "ch03",
+            "trigger_channel": trigger_channel,
+        }
+    if all(ch in channels for ch in ("trap", "cooling", "probe", "emCCD")):
+        return {
+            "trap_channel": "trap",
+            "cooling_channel": "cooling",
+            "probe_channel": "probe",
+            "trigger_channel": "emCCD",
+        }
+    return {}
+
+
+def probe_channel_set(channel: str) -> list[str]:
+    """The set of pulse-channel names that count as the probe for ``channel`` -- the SINGLE
+    source of the probe->channel alias.  When the caller hands the placeholder name ``probe``
+    (no chNN config resolved it yet) we ALSO match the legacy ``ch02`` it historically mapped to,
+    so an exposure inferred from a placeholder-named sequence still finds its probe pulses.  A
+    resolved chNN (e.g. ``ch03``) matches only itself.  Every site that expands a probe channel
+    (exposure inference, the qCMOS + virtual camera bracket exposure) routes through HERE so the
+    alias is defined once and cannot drift (#5.15)."""
+    channel = channel_name(channel)
+    return [channel, "ch02"] if channel == "probe" else [channel]
 
 
 def exposure_from_sequence(sequence: PulseSequence | None, *, default: float, channel: str = "probe") -> float:
@@ -385,9 +453,7 @@ def exposure_from_sequence(sequence: PulseSequence | None, *, default: float, ch
     if not hasattr(sequence, "base_pulses"):
         return default
     channel = channel_name(channel)
-    probe_candidates = [channel]
-    if channel == "probe":
-        probe_candidates.append("ch02")
+    probe_candidates = probe_channel_set(channel)
     durations = [
         int(round(pulse.duration * 1e15))
         for pulse in sequence.base_pulses()
@@ -401,13 +467,16 @@ def exposure_from_sequence(sequence: PulseSequence | None, *, default: float, ch
     return positive_float(unique[0] / 1e15, f"{channel} exposure")
 
 
-def plot_sequence(sequence: PulseSequence, *, clock_hz: float = 50_000_000.0, display: bool = True):
-    """Plot a pulse timeline with ``Zou_lab_control.frontend``."""
+def plot_sequence(sequence: PulseSequence, *, clock_hz: float = DEFAULT_CLOCK_HZ, display: bool = True):
+    """Plot a pulse timeline through the registered viewer (``None`` if headless)."""
 
-    from Zou_lab_control import frontend as zf
+    from Zou_lab_control._viewer_registry import active_plotter
 
+    plotter = active_plotter()
+    if plotter is None:
+        return None
     channels = sequence.edges(clock_hz=clock_hz)[2]
-    return zf.plot(sequence, kind="pulse", channels=channels, labels=("Time (s)", "", "State"), title=sequence.name, display=display)
+    return plotter.plot(sequence, kind="pulse", channels=channels, labels=("Time (s)", "", "State"), title=sequence.name, display=display)
 
 
 def state_to_mask(state: dict[str, int], channels: Sequence[str]) -> int:
@@ -448,13 +517,6 @@ def digital_value(value) -> int:
     return int(out)
 
 
-def positive_float(value, name: str) -> float:
-    out = finite_float(value, name)
-    if out <= 0:
-        raise ValueError(f"{name} must be > 0.")
-    return out
-
-
 def _time_to_clock_tick(time_s: float, clock_hz: float) -> int | None:
     raw_tick = time_s * clock_hz
     tick = int(round(raw_tick))
@@ -463,14 +525,50 @@ def _time_to_clock_tick(time_s: float, clock_hz: float) -> int | None:
     return tick
 
 
+def snap_seconds_to_clock(time_s: float, clock_hz: float, *, min_ticks: int = 1) -> float:
+    """Snap a continuous time (seconds) to the nearest whole clock tick.
+
+    The hardware can only land on integer ticks (``validate`` rejects off-grid times,
+    ``edges`` rounds to them), so any CONTINUOUS user duration -- a linspace sweep point
+    (readout-duration -> fidelity), a release-recapture hold, a typed exposure -- is
+    quantized HERE, the single seconds-domain snap source.  ``min_ticks`` (>=1) clamps a
+    sub-tick request up to a realizable duration rather than to zero."""
+    clock = positive_float(clock_hz, "clock_hz")
+    tick = int(round(finite_float(time_s, "time_s") * clock))
+    return max(int(min_ticks), tick) / clock
+
+
 __all__ = [
     "Pulse",
     "PulseReport",
     "PulseSequence",
-    "DEFAULT_CAMERA_TRIGGER_CHANNELS",
-    "count_trigger_pulses",
+    "READOUT_GAP_SECONDS",
     "exposure_from_sequence",
+    "imaging_channel_kwargs",
     "imaging_sequence",
     "plot_sequence",
-    "sequence_for_frame_count",
+    "probe_channel_set",
+    "reference_bracket_sequence",
+    "snap_seconds_to_clock",
 ]
+
+
+def decode_analog_bus(sequence: "PulseSequence", members, at_time: float) -> int:
+    """Reconstruct a DAC bus's SIGNED level at ``at_time`` from the compiled bit-channel pulses --
+    the INVERSE of the offset-binary encoding ``apply_analog_bus_modes_to_period_states`` bakes into
+    the period states (signed value + 2^(n-1) -> per-bit digital pulses, ``members`` ordered
+    LSB..MSB).  The virtual backend's analog-aware devices (e.g. the MOT monitor camera reading the
+    coil DACs) use this to SENSE what the fired sequence actually drives -- never the task's own
+    set-points -- so virtual sensing goes through the same compiled artefact the hardware plays.
+    A round-trip contract test pins this against ``set_api`` (encoder and decoder cannot drift)."""
+    members = [str(m) for m in members]
+    if not members:
+        raise ValueError("decode_analog_bus needs the bus's member bit channels (LSB..MSB).")
+    t = float(at_time)
+    word = 0
+    for bit, channel in enumerate(members):
+        for p in sequence.pulses:
+            if p.channel == channel and p.start <= t < p.start + p.duration and p.value:
+                word |= 1 << bit
+                break
+    return word - (1 << (len(members) - 1))
