@@ -1129,20 +1129,42 @@ def _resolved_cmap(kind: str, params: Mapping[str, object]) -> str:
     default = _panel_param_default(kind, "cmap")
     return str(default) if default else ""
 
-# Curve fits a panel's Edit tab can run on its frozen snapshot -- the FULL
-# DataFigure model set (confocal's combo_fit plus gaussian), available for EVERY
-# plot kind (DataFigure picks the 1D or 2D path from the snapshot, so a 2D image
-# fits the 2D-Gaussian ``center`` model).  label -> DataFigure method name.  The
-# Setting popup carries NO fit controls (basic display only); fitting lives in
-# each panel's own Edit tab.
-FIT_MODELS: dict[str, str] = {
-    "Lorentzian": "lorent",
-    "Gaussian": "gaussian",
-    "Lorentzian (Zeeman)": "lorent_zeeman",
-    "Rabi": "rabi",
-    "Exp decay": "decay",
-    "2D center": "center",
+# Curve fits a panel's Edit tab can run on its frozen snapshot.  label -> (DataFigure method name,
+# render family).  The family ("1D" curve models vs the "2D" centroid) is the SAME "1D"/"2D" vocabulary
+# ``PLOT_KINDS.render_family`` uses, so the Edit tab offers ONLY the fits that match the panel's plot family
+# (a 2d image gets the 2D-Gaussian ``center``; a 1d/monitor trace gets the curve models) instead of listing
+# dead options a mismatched DataFigure method silently no-ops.  A kind that carries its OWN built-in fit (a
+# hist's bimodal ``fit`` PANEL_PARAM) offers NO general fit at all -- see :func:`_kind_offers_general_fit`.
+# The Setting popup carries NO fit controls (basic display only); fitting lives in each panel's Edit tab.
+FIT_MODELS: dict[str, tuple[str, str]] = {
+    "Lorentzian": ("lorent", "1D"),
+    "Gaussian": ("gaussian", "1D"),
+    "Lorentzian (Zeeman)": ("lorent_zeeman", "1D"),
+    "Rabi": ("rabi", "1D"),
+    "Exp decay": ("decay", "1D"),
+    "2D center": ("center", "2D"),
 }
+
+
+def _kind_offers_general_fit(kind: str) -> bool:
+    """A plot kind gets the Edit-tab general curve fit UNLESS it declares its OWN built-in fit -- a
+    histogram carries a bimodal ``fit`` PANEL_PARAM (none/single/double), which IS its fit, so stacking a
+    1-D peak model on top of it fits the counts array with an absurd curve and dims the bimodal (#dis-fit
+    mess).  Derived from the ONE PANEL_PARAMS spec (does the kind declare a ``fit`` knob?), so there is no
+    second per-kind list to drift."""
+    return not any(getattr(d, "key", "") == "fit" for d in PANEL_PARAMS.get(str(kind), ()))
+
+
+def _fit_labels_for_kind(kind: str) -> list[str]:
+    """The fit-model labels a panel of ``kind`` offers: none if it has a built-in fit (hist), else the
+    models whose render family matches the kind's (:data:`FIT_MODELS`) -- 2d -> just ``2D center``,
+    a 1d/monitor trace -> the curve models.  ONE place the Edit tab's fit chooser is populated from."""
+    from .live import PLOT_KIND_BY_KEY
+    if not _kind_offers_general_fit(kind):
+        return []
+    pk = PLOT_KIND_BY_KEY.get(str(kind))
+    fam = pk.render_family if pk is not None else None
+    return [lbl for lbl, (_method, mf) in FIT_MODELS.items() if fam in (None, "auto") or mf == fam]
 
 
 def _py_to_text(value) -> str:
@@ -1564,8 +1586,11 @@ class PanelConfig:
         # A source written as a bare ``value = <hub signal>`` (a saved layout or a direct
         # pick) NAMES the input, so reflect it in the input slot -- the picker and the source
         # must never disagree.  The canonical ``value = signal`` and an expression
-        # (``value = np.log(f)``) do NOT match this and leave the input alone.
-        m = re.fullmatch(r"value\s*=\s*([A-Za-z_]\w*)", self.source.strip())
+        # (``value = np.log(f)``) do NOT match this and leave the input alone.  ONE pattern with
+        # :func:`is_identity_source` (which reads the same "just names a signal" fact), so the input
+        # reflection here and the structure-passthrough gate there never disagree.
+        from ..neutral_atom.operations.signal_expr import IDENTITY_SOURCE_RE
+        m = IDENTITY_SOURCE_RE.fullmatch(self.source.strip())
         if m and m.group(1) != "signal" and self.inputs:
             self.inputs[0] = m.group(1)
         self.params = dict(params or {})
@@ -2739,7 +2764,22 @@ class PanelCard(FluentGroupBox):
         # ``facet_cell_labels`` source -- so a repeat / scan / site grid's cells read 'rep k' / a scan
         # coordinate / 's k' instead of a hardcoded site tag, from the same source the notebook path uses.
         pts, _ = self._facet_value_shapes()
-        cell_labels = facet_cell_labels(self._facet(), len(cells), points_shape=pts)
+        # For a POINTS (scan-axis) facet, hand the label source the producing scan node's param NAMES + the
+        # faceted axis's coordinate array, so each cell reads the REAL scan value (``delay=1.0``) not a bare
+        # ``pt k`` -- but only when the coords line up 1:1 with the cells (a plain 1-D scan); otherwise the
+        # label source falls back safely.  (Structure carries these via :meth:`_signal_structure`.)
+        from .live import normalize_facet
+        coords = names = None
+        st = self._bound_structure()
+        spec = normalize_facet(self._facet())
+        if st and spec and spec[0] == "points":
+            names = st.get("param_names")
+            all_coords = st.get("points_coords") or []
+            axis = int(spec[1])
+            if axis < len(all_coords) and len(all_coords[axis]) == len(cells):
+                coords = all_coords[axis]
+        cell_labels = facet_cell_labels(self._facet(), len(cells), points_shape=pts,
+                                        coords=coords, param_names=names)
         plotter = build_facet_grid(
             cells, sub_plot_kind=sub, size=self.config.size, cell_labels=cell_labels,
             display=False, interactions=interactions, title=self.config.title or "")
@@ -3290,11 +3330,15 @@ class PanelCard(FluentGroupBox):
 
     def _bound_structure(self):
         """The producing node's ``{points_shape, data_shape, grid_shape}`` for this panel's bound
-        signal -- authoritative ONLY for the DEFAULT identity source (``value = signal``), because a
-        custom expression rewrites the core's shape so the node's declared structure no longer
-        describes it (#H3o).  ``None`` -> the reshape falls back to shape inference."""
-        from ..neutral_atom.operations.signal_expr import DEFAULT_SOURCE
-        if str(self._compiled_source).strip() != DEFAULT_SOURCE:
+        signal -- authoritative for any IDENTITY source: the canonical ``value = signal`` OR a bare
+        ``value = <the one input's name>`` (:func:`is_identity_source`), because naming the signal
+        passes it through unchanged so the node's declared structure still describes it.  A transforming
+        expression (``value = signal[0]-signal[1]``, ``value = np.log(f)``) rewrites the core shape (#H3o),
+        so it returns ``None`` -> the reshape falls back to shape inference.  (The old gate compared only
+        against ``value = signal``, so a named frame/scan binding like ``value = frame_judged`` lost its
+        structure -> a 2-D frame grid collapsed to a histogram and facet axes vanished.)"""
+        from ..neutral_atom.operations.signal_expr import is_identity_source
+        if not is_identity_source(self._compiled_source, self.config.inputs):
             return None
         if not (self.config.inputs and callable(self.structure_provider)):
             return None
@@ -4719,31 +4763,39 @@ class PanelEditor(QtWidgets.QWidget):
                     row.addWidget(trailing, 0)
                 return host
 
-            section("Fit")
-            self.fit_combo = FluentComboBox()
-            self.fit_combo.addItems(list(FIT_MODELS))
-            self.fit_combo.setFixedWidth(scaled_px(150, minimum=120))
-            self.fit_combo.setToolTip(
-                "Curve-fit model (the full DataFigure set).  '2D center' fits a 2D image\n"
-                "(2D Gaussian); the others fit the 1D trace.")
-            fit_btn = FluentButton("Fit", color=ACCENT)
-            fit_btn.clicked.connect(self.do_fit)
-            clear_btn = FluentButton("Clear", color=GREY)
-            clear_btn.clicked.connect(self.clear_fit)
-            # model row: the picker on the left, the Fit / Clear actions on the right.
-            model_row = _inline(self.fit_combo, trailing=fit_btn)
-            model_row.layout().addWidget(clear_btn, 0)
-            col.addWidget(FluentSettingRow("model", model_row, label_width=proc_lw))
-            # args on its OWN full-width row (it needs the room; jamming it next to
-            # the combo squeezed both).
-            self.fit_cmd = FluentLineEdit("")
-            self.fit_cmd.setPlaceholderText("p0=[1,0,1,0], B=0.1, is_fit=False")
-            self.fit_cmd.setStyleSheet(self.fit_cmd.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
-            self.fit_cmd.setToolTip(
-                "Optional fit arguments injected into the call (trusted local code):\n"
-                "p0=[...] initial guess; NAME=value fixes a named parameter; is_fit=False just overlays p0.")
-            self.fit_cmd.returnPressed.connect(self.do_fit)
-            col.addWidget(FluentSettingRow("args", self.fit_cmd, label_width=proc_lw))
+            # The general curve fit lists ONLY the models that match this panel's plot family, and appears
+            # NOT AT ALL for a kind with its OWN built-in fit (a hist's bimodal): stacking a 1-D peak on a
+            # histogram fit the counts with an absurd curve and dimmed the bimodal (#dis-fit mess).  ONE
+            # source (:func:`_fit_labels_for_kind`) drives BOTH whether the section shows and which models it
+            # lists; ``fit_combo``/``fit_cmd`` stay ``None`` (initialised above) when it does not -- ``do_fit``
+            # already no-ops on a ``None`` combo.
+            fit_labels = _fit_labels_for_kind(self.card._param_kind() if self.card is not None else self.config.kind)
+            if fit_labels:
+                section("Fit")
+                self.fit_combo = FluentComboBox()
+                self.fit_combo.addItems(fit_labels)
+                self.fit_combo.setFixedWidth(scaled_px(150, minimum=120))
+                self.fit_combo.setToolTip(
+                    "Curve-fit model for this panel's plot family.  A 2d image offers the 2D-Gaussian\n"
+                    "'2D center'; a 1d / monitor trace offers the curve models.")
+                fit_btn = FluentButton("Fit", color=ACCENT)
+                fit_btn.clicked.connect(self.do_fit)
+                clear_btn = FluentButton("Clear", color=GREY)
+                clear_btn.clicked.connect(self.clear_fit)
+                # model row: the picker on the left, the Fit / Clear actions on the right.
+                model_row = _inline(self.fit_combo, trailing=fit_btn)
+                model_row.layout().addWidget(clear_btn, 0)
+                col.addWidget(FluentSettingRow("model", model_row, label_width=proc_lw))
+                # args on its OWN full-width row (it needs the room; jamming it next to
+                # the combo squeezed both).
+                self.fit_cmd = FluentLineEdit("")
+                self.fit_cmd.setPlaceholderText("p0=[1,0,1,0], B=0.1, is_fit=False")
+                self.fit_cmd.setStyleSheet(self.fit_cmd.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
+                self.fit_cmd.setToolTip(
+                    "Optional fit arguments injected into the call (trusted local code):\n"
+                    "p0=[...] initial guess; NAME=value fixes a named parameter; is_fit=False just overlays p0.")
+                self.fit_cmd.returnPressed.connect(self.do_fit)
+                col.addWidget(FluentSettingRow("args", self.fit_cmd, label_width=proc_lw))
 
             # x-range pin (#3): ONE domain (x) range, applied to the LIVE panel AND every grid cell (global,
             # not the snapshot only), a live VIEW of the panel's current x-window that a zoom/pan reflects.
@@ -5274,9 +5326,10 @@ class PanelEditor(QtWidgets.QWidget):
     def do_fit(self) -> None:
         if self.fit_combo is None:
             return
-        method = FIT_MODELS.get(self.fit_combo.currentText())
-        if method is None:
+        entry = FIT_MODELS.get(self.fit_combo.currentText())      # (DataFigure method, render family)
+        if entry is None:
             return
+        method = entry[0]
         # Fit = two ORDINARY display knobs (the model name + its typed-arg string) applied through the SAME
         # ``_edit_param`` entry every other knob uses -> the LIVE card (whose ``apply_param`` fans the fit to
         # every subplot via :func:`live.apply_fit_to_figure` -- a grid re-fits each cell, a flat panel fits
@@ -6579,9 +6632,18 @@ class TaskConsole(QtWidgets.QWidget):
         # fed to reduce_repeat) so camera / scan paths stay byte-identical.
         ps = tuple(getattr(node, "points_shape", ()) or ())
         ds = tuple(getattr(node, "data_shape", ()) or ())
-        return {"points_shape": ps, "data_shape": ds,
-                "grid_shape": _grid_for(ps),
-                "core_ndim": len(ps) + len(ds), "per_signal": False}
+        result = {"points_shape": ps, "data_shape": ds,
+                  "grid_shape": _grid_for(ps),
+                  "core_ndim": len(ps) + len(ds), "per_signal": False}
+        # A SCAN node carries its swept param NAMES + per-axis coordinate arrays -- carry them so a
+        # ``facet="points:i"`` grid labels each cell with the REAL scan coordinate (``delay=1.0``) instead of
+        # a bare ``pt k`` (the facet-label source already renders ``{name}={value}`` when given these).
+        names = getattr(node, "scan_names", None)
+        arrays = getattr(node, "scan_arrays", None)
+        if names and arrays is not None:
+            result["param_names"] = [str(n) for n in names]
+            result["points_coords"] = [np.asarray(a, dtype=float).reshape(-1).tolist() for a in arrays]
+        return result
 
     def _refresh_signal_info(self) -> None:
         """Give every panel a legend (shown in its frame TITLE -- the grey strip, the old footer

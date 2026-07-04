@@ -217,6 +217,16 @@ def _cell_font_scale(size: str, recommended: str) -> float:
     return 0.5 if (rows < rec_rows or cols < rec_cols) else 1.0
 
 
+def _cell_title_pt(font_scale: float) -> float:
+    """The grid cell TITLE point size: the SAME size the cell's xy TICK labels render at
+    (:func:`tick_fontsize` scaled by the cell's ``font_scale``), so on a squeezed grid the title
+    shrinks WITH the tick labels instead of towering over them at the big unscaled size (the operator's
+    rule: the cell title tracks the smallest xy-label size).  Read by BOTH :meth:`GridCell.title_size_pt`
+    (the drawn title) and :func:`_site_grid_geometry` (the corridor that must clear it), so the title and
+    its corridor share ONE size and never drift."""
+    return tick_fontsize() * float(font_scale)
+
+
 def _as_data_x(data_x) -> np.ndarray:
     x = np.asarray(data_x, dtype=float)
     if x.ndim == 1:
@@ -1765,12 +1775,11 @@ def _site_grid_geometry(size: str, recommended: str) -> tuple[tuple[int, int], i
     # budget is the title's own height (~= its point size, probe-pinned) + a few px of air.
     # Tighter clips the title into the cell above; looser only steals area from the cells.
     px_per_pt = DESIGN_DPI / 72.0
-    # The cell TITLE font is now FIXED at ``small_fontsize()`` (a settable interface, no longer halved on a
-    # squeezed grid -- #5), so the corridor that must clear it is sized for that FIXED height at EVERY grid
-    # size (not scaled by ``font_scale``, which would clip the now-larger title on a squeezed grid into the
-    # cell above).  The corridor's job is "fit exactly one title line + a few px of air", and the title
-    # line is one constant height.
-    row_gap = round(small_fontsize() * px_per_pt) + 4
+    # The cell TITLE font tracks the cell's xy tick labels (:func:`_cell_title_pt` = tick size * font_scale),
+    # so the corridor that must clear it reads the SAME size and shrinks WITH the title on a squeezed grid --
+    # the title no longer towers over the halved tick labels, and its corridor no longer wastes area on a
+    # now-tiny title.  Budget: exactly one title line + a few px of air.
+    row_gap = round(_cell_title_pt(font_scale) * px_per_pt) + 4
     # the column corridor carries NO text at all (the centered-single-tick policy keeps x labels
     # inside their cell -- zero spill, probe-verified -- and y labels live in the L margin): it
     # is a pure visual separator.
@@ -3565,8 +3574,9 @@ class GridCell:
     #:    is set falls back to the site tag.
     #:  * ``title_template`` = part 2, the user template rendered with a ``{id, k, popt, fid}`` context so a
     #:    user can add e.g. ``"{id}  F={popt[2]:.2f}"``; default ``"{id}"`` shows just the identifier.
-    #:  * ``title_size`` = the fixed cell-title point size as a settable INTERFACE; ``0`` = derive the
-    #:    two-tier default from ``small_fontsize() * font_scale`` (never a raw literal).
+    #:  * ``title_size`` = the cell-title point size as a settable INTERFACE; ``0`` = derive the default from
+    #:    :func:`_cell_title_pt` (``tick_fontsize() * font_scale`` -- the SAME size the xy tick labels use,
+    #:    so the title tracks them and shrinks on a squeezed grid), never a raw literal.
     labels_per_cell: "Sequence[str] | None" = None
     title_template: str = "{id}"
     title_size: float = 0.0
@@ -3582,6 +3592,13 @@ class GridCell:
     view_xlim: "tuple[float, float] | None" = None
     fit_model: str = "none"
     fit_cmd: str = ""
+    #: Does this cell family accept the general Edit-tab curve fit (``fit_model``)?  A family with its OWN
+    #: built-in fit sets this ``False`` so the general fit is a NO-OP on it -- a histogram cell has the
+    #: bimodal readout fit, and stacking a 1-D peak model on the counts array fit it with an absurd curve
+    #: and dimmed the bimodal (#dis-fit mess).  The x-window pin (``view_xlim``) is unaffected (it is not a
+    #: fit).  Mirrors the console's :func:`task_console._kind_offers_general_fit` (which hides the fit UI for
+    #: the same families), so a stale ``fit_model`` from an old recipe / a notebook poke is ALSO inert here.
+    supports_general_fit: bool = True
 
     def thumb_lims(self, auto_lo: float, auto_hi: float) -> tuple[float, float]:
         """The thumbnail's dependent-axis range: the operator's pinned lo/hi in ``fixed`` mode, else the
@@ -3632,14 +3649,14 @@ class GridCell:
             return ident
 
     def title_size_pt(self) -> float:
-        """The cell title point size: the operator's :data:`title_size` when set (>0), else a FIXED
-        default -- :func:`small_fontsize` (the below-optimal-size small tier), the SAME size at every grid
-        size (#5).  Deliberately NOT scaled by ``font_scale`` (which still halves the in-plot TICK text on
-        a squeezed grid): a per-cell identifier that shrank with the grid became unreadable and made
-        equal-content grids look different, so the title font is one constant, a settable INTERFACE via
-        ``title_size`` with a single-source default."""
+        """The cell title point size: the operator's :data:`title_size` when set (>0), else the SAME size
+        the cell's xy TICK labels render at -- :func:`_cell_title_pt` (:func:`tick_fontsize` * ``font_scale``).
+        So the title tracks the smallest xy-label size and, on a grid squeezed below its recommended size,
+        shrinks WITH the tick labels (``font_scale`` 0.5) instead of towering over them at the big unscaled
+        size.  A settable INTERFACE via ``title_size`` with a single-source default (:func:`_cell_title_pt`,
+        shared with the row corridor so title and corridor never drift)."""
         size = float(self.title_size or 0.0)
-        return size if size > 0 else small_fontsize()
+        return size if size > 0 else _cell_title_pt(self.font_scale)
 
     def consume_param(self, key: str, value) -> bool:
         """Land a DISPLAY knob on this cell family's state and return True when the THUMBNAILS are now
@@ -3743,6 +3760,7 @@ class HistogramCell(GridCell):
     ``site_fidelities`` annotates each cell."""
 
     sub_plot_kind = "hist"       # each cell is a ``hist`` per-site plot (enlarged -> a standalone HistogramFigure)
+    supports_general_fit = False  # the hist cell has its OWN bimodal readout fit; the general curve fit is a no-op
 
     def __init__(self, per_site_values, *, occupied=None, thresholds=None,
                  site_fidelities=None, bins: int = 36, labels: Sequence[str] = ("Signal", "Shots")):
@@ -3824,12 +3842,11 @@ class HistogramCell(GridCell):
         return float(fids[k]) if fids is not None and k < len(fids) and np.isfinite(fids[k]) else float("nan")
 
     def _cell_popt(self, k: int):
-        """The cell's fit popt for the title ``{popt}`` context: the general Edit-tab fit's popt when a
-        ``fit_model`` is active (via the base store), else this hist cell's own bimodal fit popt (6-tuple
-        bimodal / 3-tuple single); empty until fitted (a ``{popt}`` template then falls back to the
-        identifier)."""
-        if self.fit_model != "none":
-            return super()._cell_popt(k)
+        """The cell's fit popt for the title ``{popt}`` context: ALWAYS this hist cell's own bimodal fit popt
+        (6-tuple bimodal / 3-tuple single); empty until fitted (a ``{popt}`` template then falls back to the
+        identifier).  Single source -- the hist family does not accept the general Edit-tab fit
+        (``supports_general_fit=False``), so there is no general popt to prefer, and a stale ``fit_model``
+        never hijacks the title's parameters from the bimodal fit."""
         return self._cell_popt_store.get(int(k), ())
 
     def _apply_fit_lines(self, ax, k: int, counts) -> None:
@@ -3933,7 +3950,7 @@ class HistogramCell(GridCell):
         # enlarged view honours, so a lim edit changes thumbnails AND zoom together, like cmap/bins do)
         self._apply_count_ylim(ax, counts_all)
         # The site index (+ fidelity) is the cell's small TITLE, ABOVE the axes -- NOT text inside the data
-        # area (#5) -- through the ONE title mechanism (apply_title), just at small_fontsize().
+        # area (#5) -- through the ONE title mechanism (apply_title), at :meth:`title_size_pt` (the xy-tick size).
         apply_title(ax, self.cell_title(k), size=self.title_size_pt(), pad=1.5)
         self.threshold_lines[k] = line           # grid line, kept for per-cell drag
         return line
@@ -4134,13 +4151,25 @@ class ImageCell(GridCell):
     def focus_update(self, focus_plotter, k: int) -> None:
         focus_plotter.update(self.images[k].reshape(-1))     # the standalone 2d consumes the flat frame
 
+    def _pixel_coords(self, k: int):
+        """The image cell's pixel grid as the ``(N, 2)`` coordinate scatter + value column the 2d plot-kind
+        (:class:`Live2DDis` / :func:`DataFigure.center`) consumes.  The ONE coordinate construction shared by
+        :meth:`data_figure` (thumbnail + save + the general ``center`` fit) and :meth:`focus_data` (the
+        enlarged view), so the two never feed the SAME cell different shapes -- the 2D-Gaussian ``center`` fit
+        used to crash on the thumbnail's 1-D coords while working on the enlarged view's (N, 2)."""
+        im = self.images[k]
+        ny, nx = im.shape
+        xx, yy = np.meshgrid(np.arange(nx, dtype=float), np.arange(ny, dtype=float))
+        return np.column_stack([xx.ravel(), yy.ravel()]), im.ravel()
+
     def data_figure(self, fig, ax, k: int):
         from .data_figure import DataFigure
-        # The grid's ``.npz`` (the save contract) carries each site's PSF kernel as a
-        # 1D series (square-recoverable); the canonical 2D weights live in calibration.npz.
-        flat = self.images[k].reshape(-1)
-        return DataFigure(fig=fig, ax=ax, data_x=np.arange(flat.size, dtype=float),
-                          data_y=flat, labels=self.labels, name=f"site{k}_psf")
+        # The image cell represents itself as the SAME (N,2) pixel-scatter + value column the enlarged view
+        # feeds (:meth:`_pixel_coords`), so the general ``2D center`` fit runs on a thumbnail exactly as on
+        # the double-click focus (a 1-D flat crashed the 2D-Gaussian centroid).  The faithful per-site images
+        # are saved through ``grid_recipe_from_cells``' ``per_cell``, not this top-level fallback.
+        data_x, data_y = self._pixel_coords(k)
+        return DataFigure(fig=fig, ax=ax, data_x=data_x, data_y=data_y, labels=self.labels, name=f"site{k}_psf")
 
     def focus_data(self, k: int, *, display_params: Mapping[str, Any] | None = None) -> dict:
         """The ``panel_plot(kind="2d")`` args for the STANDALONE enlarged view of kernel cell ``k`` -- the SAME
@@ -4151,10 +4180,7 @@ class ImageCell(GridCell):
         overridden by the grid's ``cmap`` / ``colorset`` display param.  :meth:`GridPlot.build_focus_plotter`
         merges this into ``panel_plot``."""
         params = dict(display_params or {})
-        im = self.images[k]
-        ny, nx = im.shape
-        xx, yy = np.meshgrid(np.arange(nx, dtype=float), np.arange(ny, dtype=float))
-        data_x = np.column_stack([xx.ravel(), yy.ravel()])
+        data_x, data_y = self._pixel_coords(k)           # SAME (N,2) coords the thumbnail/fit path feeds
         cmap = str(params.get("cmap") or params.get("colorset") or self.cmap)
         if not hasattr(self, "vmin"):
             self.prepare()
@@ -4164,7 +4190,7 @@ class ImageCell(GridCell):
         # the title is the ONE cell_title (so the focus reads exactly like the thumbnail).
         return {
             "data_x": data_x,
-            "data_y": im.ravel(),
+            "data_y": data_y,
             "cmap": cmap,
             # Seed the enlarged cell with the range the THUMBNAIL shows now (``thumb_lims``: the operator's
             # pinned lo/hi in fixed mode, else the shared auto range) so double-click reads on the SAME
@@ -4382,6 +4408,12 @@ class GridPlot(BaseLivePlot):
         # enlarged cell) -- tracked so each re-fit REMOVES the previous curve first, keeping exactly one
         # fit line per surface across live ticks (the general-fit counterpart of a hist cell's _fit_lines).
         self._general_fit_artists: dict = {}
+        # The grid's ONE figure-level x-label / y-label / main-title Text, reused across re-titles so a
+        # Setting/Edit title edit UPDATES the same artist in place (the figure counterpart of an Axes
+        # ``set_title``, which matplotlib reuses) instead of stacking a new Text on the old -> no ghosting.
+        self._xlabel_text = None
+        self._ylabel_text = None
+        self._title_text = None
 
     def _create_axes(self):
         # The grid FILLS a total data region == panel_plot_spec(size).data_px (the SAME data box every
@@ -4494,11 +4526,31 @@ class GridPlot(BaseLivePlot):
             self.draw()
 
     def _apply_title(self) -> None:
+        """Draw the grid's figure-level x-label / y-label / main title, reusing ONE Text per slot so a
+        RE-title (the Setting/Edit title edit re-runs this on the SAME already-drawn figure) updates in
+        place instead of stacking a fresh Text over the old one -- the figure counterpart of an Axes
+        ``set_title`` (which matplotlib reuses).  A handle no longer in ``fig.texts`` (``_rebuild_grid``'s
+        ``fig.clear()`` dropped it) is treated as gone and re-created, so the return leg is clean too."""
         labels = self.labels
-        self.fig.text(0.5, 0.012, str(labels[0]), ha="center", va="bottom", fontsize=axis_label_fontsize())
-        self.fig.text(0.008, 0.5, str(labels[1]) if len(labels) > 1 else "Shots", ha="left", va="center",
-                      rotation="vertical", fontsize=axis_label_fontsize())
-        apply_title(self.fig, self.title)
+        ylabel = str(labels[1]) if len(labels) > 1 else "Shots"
+        self._xlabel_text = self._reuse_fig_text(self._xlabel_text, 0.5, 0.012, str(labels[0]),
+                                                 dict(ha="center", va="bottom", fontsize=axis_label_fontsize()))
+        self._ylabel_text = self._reuse_fig_text(self._ylabel_text, 0.008, 0.5, ylabel,
+                                                 dict(ha="left", va="center", rotation="vertical",
+                                                      fontsize=axis_label_fontsize()))
+        if self._title_text is not None and self._title_text in self.fig.texts:
+            self._title_text.set_text(str(self.title or ""))          # reuse the one title artist -> no ghost
+            self._title_text.set_visible(bool(self.title))
+        else:
+            self._title_text = apply_title(self.fig, self.title)      # first draw (or after a fig.clear())
+
+    def _reuse_fig_text(self, handle, x: float, y: float, text: str, kw: dict):
+        """Update ``handle``'s text if it is still on this figure, else create a fresh ``fig.text`` -- the
+        one-Text-per-slot rule the grid's outer labels share with the title, so a re-title never stacks."""
+        if handle is not None and handle in self.fig.texts:
+            handle.set_text(str(text))
+            return handle
+        return self.fig.text(x, y, str(text), **kw)
 
     def _install_state(self) -> None:
         self.fig._zlc_state = PlotState(plot_type=self.plot_type)
@@ -4770,8 +4822,16 @@ class GridPlot(BaseLivePlot):
         (a grid handles its display knobs itself, so the console never falls back to a full
         teardown/rebuild)."""
         thumb_dirty = self.store_display_param(key, value)
-        if thumb_dirty and self._focused is None:        # only redraw thumbnails when not zoomed in
-            self._redraw_thumbnails()
+        if thumb_dirty and self._focused is None:        # only refresh thumbnails when not zoomed in
+            # Refresh ONLY what this knob changed (the operator's "update what I edit, not the whole plot"):
+            # a TITLE knob re-titles the existing axes (a cheap set_title per cell), a DATA knob moves /
+            # rebuilds the data artists.  Redrawing all N cells' DATA for a title-only edit recomputed every
+            # histogram (35 cells ~190 ms) AND never re-titled (update_cell moves data, not text), so the
+            # subplot-title edit was both slow AND ineffective -- the ONE targeted-refresh rule fixes both.
+            if str(key) in ("title_template", "title_size"):
+                self._retitle_cells()
+            else:
+                self._redraw_thumbnails()
         # Apply to the focused STANDALONE figure in place (HistogramFigure / Live2DDis / the base
         # relim family).  A key the enlarged view has NO in-place use for (e.g. ``repeat_mode``) was
         # STORED above and simply does not touch the view -- NEVER an unfocus/refocus rebuild: every
@@ -4802,7 +4862,11 @@ class GridPlot(BaseLivePlot):
         :meth:`update_cells` uses, so the grid's own and the host's enlarged cell are one path."""
         cell = self.cell_renderer
         vx = cell.view_xlim
-        model, cmd = cell.fit_model, cell.fit_cmd
+        # A family with its own built-in fit (a hist cell's bimodal) does NOT accept the general curve fit --
+        # force ``model`` to "none" so a stale ``fit_model`` (an old recipe / notebook poke) is inert and never
+        # stacks an absurd 1-D peak on the bimodal; the x-window pin (``view_xlim``) still applies (not a fit).
+        model = cell.fit_model if getattr(cell, "supports_general_fit", True) else "none"
+        cmd = cell.fit_cmd
         # Fast path: nothing pinned, no fit, no leftover fit artists to clear -> no per-tick work (this
         # method runs every live tick, so it must cost nothing when the grid carries no view knobs -- never
         # build an N-cell _GridData for a no-op).
@@ -4875,6 +4939,15 @@ class GridPlot(BaseLivePlot):
                 # An in-place knob (ylog's set_yscale) may have rebuilt the axis locators --
                 # re-assert the ONE tick policy so the edge-label rule never silently decays.
                 self._style_cell_ticks(ax, k)
+
+    def _retitle_cells(self) -> None:
+        """Re-apply every cell's title in place -- a cheap :func:`apply_title` (set_title) on the EXISTING
+        axes, no data redraw.  The minimal refresh for a ``title_template`` / ``title_size`` edit, so
+        changing the subplot title updates ONLY the title text and never recomputes the N cells' data
+        artists (the "editing the subplot title is slow" fix); the ONE title mechanism the draw path uses."""
+        cell = self.cell_renderer
+        for k, ax in enumerate(self.site_axes):
+            apply_title(ax, cell.cell_title(k), size=cell.title_size_pt(), pad=1.5)
 
     def to_data_figure(self):
         self.data_figure = _GridData(self)

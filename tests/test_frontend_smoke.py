@@ -1644,12 +1644,16 @@ def test_task_console_panel_editor_fit_and_setting_relim(monkeypatch):
     import numpy as np
     from Zou_lab_control.frontend import devtools as dt
     from Zou_lab_control.frontend.task_console import (
-        FIT_MODELS, PanelCard, PanelConfig)
+        FIT_MODELS, PanelCard, PanelConfig, _fit_labels_for_kind)
 
-    # the FULL DataFigure model set is offered, including the 2D-Gaussian
-    # "2D center" fit -- and it is NOT gated by plot kind (fit on every kind).
+    # The fit model set is DEFINED in full (incl. the 2D-Gaussian "2D center"), but the Edit tab OFFERS
+    # only the models matching the panel's plot FAMILY: a 1d/monitor trace gets the curve models, a 2d
+    # image gets "2D center", and a hist (its own bimodal fit) gets NO general fit.
     assert set(FIT_MODELS) >= {"Lorentzian", "Gaussian", "Lorentzian (Zeeman)",
                                "Rabi", "Exp decay", "2D center"}
+    assert _fit_labels_for_kind("1d") == ["Lorentzian", "Gaussian", "Lorentzian (Zeeman)", "Rabi", "Exp decay"]
+    assert _fit_labels_for_kind("2d") == ["2D center"]
+    assert _fit_labels_for_kind("hist") == []            # a hist carries its OWN bimodal fit
     console = dt.demo_console(shots=5)
     card = PanelCard(PanelConfig(kind="1d", title="bump", row=0, col=0, size="2x2",
                                  source="value = bump"), parent=console.board)
@@ -1660,17 +1664,20 @@ def test_task_console_panel_editor_fit_and_setting_relim(monkeypatch):
     # the Setting popup has NO popup-fit handles (fit is in the per-panel Edit)
     assert not hasattr(card, "fit_combo") and not hasattr(card, "_do_fit")
 
-    # per-panel Edit tab: fit a Gaussian on the frozen snapshot
+    # per-panel Edit tab: fit a Gaussian -> applied as a STORED display knob to the live card + its
+    # snapshot (the ONE _edit_param path, not a throwaway _df mutation), so a fit curve draws on the
+    # snapshot and Clear removes it.
     console._edit_card(card)
     editor = console._panel_editors[id(card)]
     base = len(editor._plotter.ax.lines)
     editor.fit_combo.setCurrentText("Gaussian")
     editor.fit_cmd.setText("")
     editor.do_fit()
-    assert editor._df is not None and editor._df.fit is not None
+    assert card.config.params.get("fit_model") == "gaussian"
     assert len(editor._plotter.ax.lines) == base + 1
     editor.clear_fit()
-    assert editor._df is None
+    assert card.config.params.get("fit_model", "none") == "none"
+    assert len(editor._plotter.ax.lines) == base
 
     # relim is owned by the SETTING popup now (tight/normal), persisted on the
     # card config; the live card picks it up on its next rebuild.

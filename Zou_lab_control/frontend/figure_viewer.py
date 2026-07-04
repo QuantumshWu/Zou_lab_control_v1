@@ -428,6 +428,15 @@ def _seed_state(saved: SavedFigure) -> TaskConsoleState:
             size = optimal_grid_size(int(shape[0]), int(shape[1]))
         for key, val in dict(recipe.get("display_params") or {}).items():
             view.setdefault(str(key), val)               # saved display knobs seed the panel params
+        # cmap (a 2d cell) / bins (a hist cell) are display knobs that are ALSO construction params, so the
+        # recipe records them at TOP level (grid_recipe_from_cells), NOT in display_params -- seed those into
+        # the panel params too, or the Setting combo falls back to the kind DEFAULT while build_grid_figure
+        # renders the recorded value (UI != actual on load).  Which top-level keys count is the resolved
+        # kind's declared PANEL_PARAMS (the ONE param spec), so this never hard-codes ``cmap``/``bins``.
+        from .task_console import PANEL_PARAMS
+        for decl in PANEL_PARAMS.get(str(recipe.get("sub_plot_kind") or ""), ()):
+            if decl.key in recipe:
+                view.setdefault(str(decl.key), recipe[decl.key])
     panel = PanelConfig(
         kind=kind,
         title=str(saved.name or "figure"),

@@ -16,6 +16,7 @@ and the measurement param form) import this one definition.
 from __future__ import annotations
 
 import math
+import re
 from functools import lru_cache
 from typing import Callable, Mapping
 
@@ -33,6 +34,27 @@ SIGNAL_EXPR_HELP = (
 
 #: The canonical source for a single picked signal: the picked signal IS ``signal``.
 DEFAULT_SOURCE = "value = signal"
+
+#: A bare ``value = <hub signal name>`` source: the picked signal named DIRECTLY instead of via the
+#: pseudo ``signal``.  ONE pattern, shared by :func:`is_identity_source` (does this source pass the
+#: signal through unchanged?) and the panel-config input reflection (a bare name IS the input slot),
+#: so those two never disagree on what "just names a signal" means.
+IDENTITY_SOURCE_RE = re.compile(r"\s*value\s*=\s*([A-Za-z_]\w*)\s*")
+
+
+def is_identity_source(source, inputs=()) -> bool:
+    """True when ``source`` is a pure PASS-THROUGH of a single picked signal -- the canonical
+    ``value = signal`` OR ``value = <the one input's name>`` (naming the slot directly).  Such a
+    binding does NOT rewrite the core shape, so a producing node's DECLARED structure still describes
+    the value (the reshape / facet layer relies on this to keep a 2-D frame a 2-D frame, a scan grid a
+    scan grid).  A multi-slot or transforming expression (``value = signal[0] - signal[1]``,
+    ``value = np.log(f)``) returns ``False`` -- there the declared structure no longer applies."""
+    src = str(source or "").strip()
+    if src == DEFAULT_SOURCE:
+        return True
+    m = IDENTITY_SOURCE_RE.fullmatch(src)
+    names = [str(n) for n in (inputs or []) if str(n).strip()]
+    return bool(m and m.group(1) != "signal" and len(names) == 1 and m.group(1) == names[0])
 
 
 @lru_cache(maxsize=512)
