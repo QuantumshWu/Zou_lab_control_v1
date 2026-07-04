@@ -6230,6 +6230,17 @@ class TaskConsole(QtWidgets.QWidget):
         self._recompute_tick_interval()    # the loaded panels' rates set the timer base
         self._update_summary()
 
+    def reseed(self, state: TaskConsoleState, *, running_nodes: Sequence[object] = ()) -> None:
+        """Reload the board to a NEW state IN PLACE: reuse this console's WHOLE widget tree (tabs, board,
+        header, hub, refresh timer) and rebuild only its PANELS (:meth:`load_state`), swapping the
+        producing-node set.  The single reseed entry for a host that shows one console and re-points it
+        at different data -- the figure_viewer's Browse re-load: swapping the seeded panel must NOT tear
+        the console down and construct a fresh one, which re-realizes the entire Qt widget tree (~0.35 s
+        of the perceived load).  The caller owns STOPPING the previous nodes (the console only reads the
+        hub); a reused hub's stale signals are overwritten by same-named republishes or GC'd as orphans."""
+        self.running_nodes = list(running_nodes)
+        self.load_state(state)
+
     def _new_panel_card(self, config: PanelConfig) -> PanelCard:
         """Build a PanelCard wired to the console's signal providers -- the ONE place the
         provider block lives, so adding/renaming a provider is a single edit here instead of three

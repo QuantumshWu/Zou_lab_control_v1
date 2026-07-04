@@ -839,32 +839,47 @@ class FigureViewer(QtWidgets.QWidget):
         ``PanelCard`` reproduces it by its kind (a 2-D image, a site map, a histogram, a 1-D curve, a PULSE
         timeline -- the pulse panel's value is a ``PulseTableState`` object, published + rendered by the
         same node / seed / PanelCard machinery).  ``None`` (nothing loaded yet) is an EMPTY board, so the
-        window ALWAYS shows a real console beside the Info column and Browse simply reseeds it."""
-        self._teardown_console()
-        self.hub = SignalHub()
+        window ALWAYS shows a real console beside the Info column and Browse simply RESEEDS it (in
+        place -- the console widget tree is built ONCE and only its seeded panel is swapped per load)."""
+        # Stop the previous loaded-figure node.  The hub is created ONCE (``__init__``) and REUSED for
+        # every load: a fresh hub per load would strand the console (bound to the old hub).  The reused
+        # hub's stale signals are overwritten by the new node's same-named republishes, or GC'd as
+        # orphans when the console reseeds.
+        if self.node is not None:
+            try:
+                self.node.stop()
+            except Exception:
+                pass
+            self.node = None
         if saved is not None:
             self.node = LoadedFigureNode(self.hub, saved)
             self.node.step()                   # publish once so the signal is on the hub immediately
             state = _seed_state(saved)
-            running = [self.node]
+            running: list = [self.node]
         else:
-            self.node = None
             state = TaskConsoleState(name="figure", panels=[])
             running = []
-        # EMBEDDED console: it is size-Expanding, so the stretching holder makes it FILL the right pane
-        # and its gravity board reads the real viewport width -> reflows into 2+ columns.  ``window_px``
-        # is only its MINIMUM (embedded mode setMinimumSize's it): the budget BESIDE the Info column
-        # (window minus the fixed Info column and the 3 horizontal gaps = 2 root margins + 1 spacing;
-        # height = window minus the 2 vertical root margins), so it never starts smaller than that but
-        # grows with the window.
-        fit = screen_fit_window_size(self.window_ratio)
-        m = self._root_margin
-        console_w = max(scaled_px(520, minimum=380), fit.width() - self._info_col_w - 3 * m)
-        console_h = max(scaled_px(360, minimum=280), fit.height() - 2 * m)
-        self.console = TaskConsole(hub=self.hub, state=state, running_nodes=running,
-                                   session=None, scale=self._scale,
-                                   window_px=(console_w, console_h), embedded=True)
-        self._console_holder.addWidget(self.console)
+        if self.console is None:
+            # FIRST build only: construct the embedded console once.  It is size-Expanding, so the
+            # stretching holder makes it FILL the right pane and its gravity board reflows into 2+
+            # columns.  ``window_px`` is only its MINIMUM (embedded mode setMinimumSize's it): the
+            # budget BESIDE the Info column (window minus the fixed Info column and the 3 horizontal
+            # gaps; height minus the 2 vertical root margins), so it never starts smaller but grows.
+            fit = screen_fit_window_size(self.window_ratio)
+            m = self._root_margin
+            console_w = max(scaled_px(520, minimum=380), fit.width() - self._info_col_w - 3 * m)
+            console_h = max(scaled_px(360, minimum=280), fit.height() - 2 * m)
+            self.console = TaskConsole(hub=self.hub, state=state, running_nodes=running,
+                                       session=None, scale=self._scale,
+                                       window_px=(console_w, console_h), embedded=True)
+            self._console_holder.addWidget(self.console)
+        else:
+            # RESEED in place: reuse the WHOLE console widget tree (chrome / board / hub / refresh
+            # timer) and rebuild only the seeded panel.  Browse-reloading used to tear the console down
+            # and construct a fresh one every load -- re-realizing the entire Qt widget tree (~0.35 s of
+            # the perceived load) despite this docstring always claiming it "reseeds".  This IS that
+            # reseed, so a re-load only pays for the ONE panel changing, not the console chrome.
+            self.console.reseed(state, running_nodes=running)
         if saved is not None:
             # A LOADED figure is STATIC: render its seeded panel NOW (synchronously) rather than waiting
             # for the console's first refresh-timer beat (~DEFAULT_UPDATE_MS) to first-draw it -- that
