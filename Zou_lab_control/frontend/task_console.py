@@ -1767,6 +1767,10 @@ class _GridFocus:
         self.k = int(k)
         self.click_cid = None
         self.key_cid = None
+        #: A Setting edit was persisted onto the (parked) grid while it was zoomed -> its buffer is stale,
+        #: so unfocus must re-render.  Left False the common "just look and go back" case keeps the grid's
+        #: already-rendered buffer (fit + thumbnails) and unfocus is an instant re-blit, never a re-render.
+        self.dirty = False
 
 
 class PanelCard(FluentGroupBox):
@@ -3968,7 +3972,8 @@ class PanelCard(FluentGroupBox):
         # repainted here -- _unfocus_grid_cell redraws them on return, so a Setting edit while zoomed costs
         # only the enlarged view's own in-place apply, never an N-cell repaint stall.
         try:
-            parked.grid.store_display_param(str(key), value)
+            if parked.grid.store_display_param(str(key), value):
+                parked.dirty = True         # a thumbnail-affecting knob changed -> unfocus must repaint the grid
         except Exception:
             pass
         # Apply to the enlarged view in place.  A knob it can't apply live re-focuses the same cell ONLY
@@ -4029,13 +4034,21 @@ class PanelCard(FluentGroupBox):
             return
         grid, grid_canvas, k = parked.grid, parked.grid_canvas, parked.k
         focus, focus_canvas = self.plotter, self.canvas
-        # copy an enlarged-view threshold cut back onto the grid cell (the grid thumbnail + save recipe read it)
+        # copy an enlarged-view threshold cut back onto the grid cell (the grid thumbnail + save recipe read
+        # it), noting whether it ACTUALLY changed -- an unfocus that edited nothing needs no repaint.
         cell = getattr(grid, "cell_renderer", None)
+        threshold_changed = False
         if cell is not None and hasattr(cell, "sync_threshold_from_focus"):
             try:
-                cell.sync_threshold_from_focus(k, focus)
+                threshold_changed = bool(cell.sync_threshold_from_focus(k, focus))
             except Exception:
                 pass
+        # The parked grid kept its FULLY-RENDERED buffer (fit + x-window + thumbnails) untouched while zoomed,
+        # so swapping it back shows it AS IT WAS.  Re-render ONLY when the zoom changed something the grid
+        # shows -- a Setting edit persisted onto it (parked.dirty) or a threshold dragged in the focus view.
+        # Otherwise just re-blit the valid buffer: the fit STAYS (fixing the "fit vanished after zoom-in-and-
+        # back" bug the old unconditional redraw caused) AND unfocus is instant, never an N-cell re-render.
+        needs_redraw = bool(parked.dirty) or threshold_changed
         self._grid_focus = None
         self._remove_focus_stretch()
         # swap the grid canvas back in FIRST (never a blank holder), then retire the focus canvas + figure
@@ -4049,14 +4062,17 @@ class PanelCard(FluentGroupBox):
             focus_canvas.deleteLater()
         if focus is not None and plt is not None and focus.fig is not None:
             plt.close(focus.fig)
-        # the grid thumbnails may have picked up a new threshold -> redraw them, then show
-        if hasattr(grid, "_redraw_thumbnails"):
-            try:
-                grid._redraw_thumbnails()
-            except Exception:
-                pass
+        if hasattr(grid, "discard_focus_fit"):
+            grid.discard_focus_fit()        # release the (now-closed) enlarged cell's fit tracker entry
         if grid_canvas is not None:
-            grid_canvas.draw()
+            if needs_redraw and hasattr(grid, "_redraw_thumbnails"):
+                try:
+                    grid._redraw_thumbnails()       # self-contained: re-applies the fit / x-window too
+                except Exception:
+                    pass
+                grid_canvas.draw()
+            else:
+                grid_canvas.update()                # valid buffer -> re-blit only (fit preserved, instant)
         self._place_setting_button()
 
     def _reset_plot(self) -> None:

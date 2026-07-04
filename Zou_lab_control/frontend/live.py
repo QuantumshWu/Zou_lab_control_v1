@@ -4068,20 +4068,25 @@ class HistogramCell(GridCell):
             "title": self.cell_title(k),
         }
 
-    def sync_threshold_from_focus(self, k: int, focus_plotter) -> None:
+    def sync_threshold_from_focus(self, k: int, focus_plotter) -> bool:
         """After the operator dragged the FOCUS view's threshold, copy the resulting cut back onto cell
         ``k`` (the single source the grid thumbnail + the save recipe read) so an enlarged-view drag is not
         lost when the grid returns.  Called by :meth:`GridPlot.unfocus`; a no-op for a cell / plotter without
-        a meaningful threshold."""
+        a meaningful threshold.  Returns True IFF the cell's threshold actually changed -- so the caller
+        repaints the grid only when the zoom edited something, never for a plain look-and-return."""
         thr = getattr(focus_plotter, "thresholds", None)
         if not thr or not np.isfinite(thr[0]):
-            return
+            return False
         if self.thresholds is None:
             self.thresholds = [float("nan")] * self.n_cells
-        self.thresholds[k] = float(thr[0])
+        new = float(thr[0])
+        if float(self.thresholds[k]) == new:
+            return False
+        self.thresholds[k] = new
         grid_line = self.threshold_lines[k]
         if grid_line is not None:
-            grid_line.set_xdata([thr[0], thr[0]])
+            grid_line.set_xdata([new, new])
+        return True
 
 
 class ImageCell(GridCell):
@@ -4725,6 +4730,7 @@ class GridPlot(BaseLivePlot):
         for handler in self.interaction_handles_of(self._focus_plotter):
             if hasattr(handler, "destroy"):
                 handler.destroy()
+        self.discard_focus_fit()                        # forget the enlarged cell's fit (its axes is cleared next)
         self._focus_plotter = None
         self._focused = None
         self._rebuild_grid()                            # redraw the grid onto the same figure
@@ -4845,6 +4851,7 @@ class GridPlot(BaseLivePlot):
         (a grid handles its display knobs itself, so the console never falls back to a full
         teardown/rebuild)."""
         thumb_dirty = self.store_display_param(key, value)
+        redrew_cells = False
         if thumb_dirty and self._focused is None:        # only refresh thumbnails when not zoomed in
             # Refresh ONLY what this knob changed (the operator's "update what I edit, not the whole plot"):
             # a TITLE knob re-titles the existing axes (a cheap set_title per cell), a DATA knob moves /
@@ -4854,7 +4861,8 @@ class GridPlot(BaseLivePlot):
             if str(key) == "title_template":
                 self._retitle_cells()
             else:
-                self._redraw_thumbnails()
+                self._redraw_thumbnails()                # self-contained: re-applies the view knobs itself
+                redrew_cells = True
         # Apply to the focused STANDALONE figure in place (HistogramFigure / Live2DDis / the base
         # relim family).  A key the enlarged view has NO in-place use for (e.g. ``repeat_mode``) was
         # STORED above and simply does not touch the view -- NEVER an unfocus/refocus rebuild: every
@@ -4868,7 +4876,8 @@ class GridPlot(BaseLivePlot):
         # curve fit) on whatever is drawn now -- the ONE method both the thumbnails and the enlarged cell
         # go through, so an Apply-limits / Fit from the Edit tab reaches every subplot AND the focus view
         # through the identical path (never a per-surface special case).
-        self._apply_view_knobs()
+        if not redrew_cells:        # a thumbnail redraw already re-applied the view knobs -- no 2nd curve-fit
+            self._apply_view_knobs()
         self.draw()
         return True
 
@@ -4942,6 +4951,20 @@ class GridPlot(BaseLivePlot):
         popt = getattr(res, "popt", None)
         return tuple(popt) if popt is not None else ()
 
+    def discard_focus_fit(self) -> None:
+        """Release the ENLARGED cell's tracked general-fit artists (the ``"focus"`` tracker key) as the
+        focus view is retired on unfocus.  Those Line2D / Text live on the focus figure that unfocus is
+        about to clear (notebook) or close (console), so the tracker entry must be dropped or it lingers
+        pointing at a dead surface until the next focus -- and on a STATIC loaded grid (no live ticks) it
+        would never be reclaimed.  The grid's OWN per-cell fits (integer keys 0..N) are untouched, so the
+        thumbnails keep their fit across the return.  The ONE place both unfocus paths call to forget the
+        enlarged surface's fit -- never a bare reach into the private tracker dict."""
+        for art in self._general_fit_artists.pop("focus", []):
+            try:
+                art.remove()
+            except Exception:
+                pass                       # already gone (fig.clear / plt.close wiped it) -- fine
+
     def _redraw_thumbnail(self, k: int, ax) -> None:
         """Fully re-draw ONE cell thumbnail (axes cleared) -- the fallback when an in-place move cannot
         represent the change.  Mirrors the :meth:`init_core` cell step (draw + the one tick policy)."""
@@ -4954,7 +4977,13 @@ class GridPlot(BaseLivePlot):
         rebuilds only the data artists -- ticks, title and threshold stay), a full axes-clear redraw
         only when the cell family says the change cannot be represented in place.  Clearing all N
         axes re-ran the whole per-cell text/tick build and made every Setting edit cost a rebuild
-        (#perf: 35 cells ~420 ms -> in-place ~tens of ms)."""
+        (#perf: 35 cells ~420 ms -> in-place ~tens of ms).
+
+        SELF-CONTAINED: ends by re-applying the stored view knobs (the general curve fit + pinned
+        x-window), because rebuilding a cell's data artists drops any fit curve on it.  So EVERY
+        thumbnail redraw -- a Setting edit, a live tick, an unfocus return -- keeps the fit BY
+        CONSTRUCTION; no caller can redraw the thumbnails and silently lose the fit (the bug where
+        the fit vanished after zooming into a cell and back)."""
         for k, ax in enumerate(self.site_axes):
             if not self.cell_renderer.update_cell(ax, k):
                 self._redraw_thumbnail(k, ax)
@@ -4962,6 +4991,7 @@ class GridPlot(BaseLivePlot):
                 # An in-place knob (ylog's set_yscale) may have rebuilt the axis locators --
                 # re-assert the ONE tick policy so the edge-label rule never silently decays.
                 self._style_cell_ticks(ax, k)
+        self._apply_view_knobs()        # re-assert the fit / x-window on the freshly-drawn cells
 
     def _retitle_cells(self) -> None:
         """Re-apply every cell's title in place -- a cheap :func:`apply_title` (set_title) on the EXISTING
