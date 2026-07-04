@@ -330,20 +330,27 @@ def status_dot_stylesheet(color: str, *, radius: int = 8) -> str:
 _SHADOW_PIXMAP_CACHE: dict[tuple, QtGui.QPixmap] = {}
 
 
-def _baked_shadow_from_silhouette_pixmap(key: tuple, silhouette: QtGui.QPixmap,
-                                         blur: int, alpha: int, offset: int, dpr: float) -> QtGui.QPixmap:
+def _baked_shadow_from_silhouette_pixmap(key: tuple, make_silhouette, blur: int, alpha: int,
+                                         offset: int, dpr: float) -> QtGui.QPixmap:
     """Shadow baked from a WHITE-filled silhouette PIXMAP (the source's own alpha), cached by ``key``.
 
     Unlike the path bake, the silhouette keeps the source's antialiased alpha edge, so the cast
     shadow matches the stock ``QGraphicsDropShadowEffect`` exactly for ANY widget shape -- the
     baked white body sits precisely where the source is opaque (so the live source covers it and
-    NOTHING bleeds through the transparent regions).  ``silhouette`` is a dpr-tagged device pixmap
-    the same padded size as the source; the returned pixmap is the same size, blitted 1:1."""
+    NOTHING bleeds through the transparent regions).  The returned pixmap is the source's padded
+    size, blitted 1:1.
+
+    ``make_silhouette`` is a FACTORY, not a built pixmap: the silhouette is the ONLY input the bake
+    consumes, so building it (a full-size white-fill of the freshly-rasterised source) is deferred to
+    a cache MISS.  On a HIT -- every repaint of an unchanged shape -- the factory is never called, so
+    a shadowed panel's repaint skips the white-fill entirely (measured ~64 ms/load of pure waste on a
+    3x screen: the composited output is byte-identical, only the redundant silhouette build is gone)."""
     cached = _SHADOW_PIXMAP_CACHE.get(key)
     if cached is not None:
         return cached
     if len(_SHADOW_PIXMAP_CACHE) > 256:
         _SHADOW_PIXMAP_CACHE.clear()
+    silhouette = make_silhouette()          # built ONLY on a cache miss (the bake's sole input)
     scene = QtWidgets.QGraphicsScene()
     item = scene.addPixmap(silhouette)
     effect = QtWidgets.QGraphicsDropShadowEffect()
@@ -418,27 +425,31 @@ class CachedDropShadow(QtWidgets.QGraphicsEffect):
         # device pixels (the painter keeps the dpr device transform).  The bake
         # mirrors that: device-resolution pixels, logical geometry.
         dpr = float(src.devicePixelRatioF() or 1.0)
-        margin = self._blur + abs(self._offset)
-        # The silhouette is the source's OWN opaque alpha -- whatever shape the widget really
-        # paints (a rounded card, or the tab strip whose UNSELECTED tabs are transparent, ...).
-        # White-fill the live source (keeping its antialiased alpha) and bake the shadow from THAT,
-        # so the baked white body sits exactly where the source is opaque (nothing bleeds through
-        # transparent regions) and the shadow matches the stock effect for ANY shape -- no hand-built
-        # per-widget silhouette to drift as the UI evolves.
-        silhouette = QtGui.QPixmap(src.size())
-        silhouette.setDevicePixelRatio(dpr)
-        silhouette.fill(QtCore.Qt.transparent)
-        sp = QtGui.QPainter(silhouette)
-        sp.drawPixmap(0, 0, src)
-        sp.setCompositionMode(QtGui.QPainter.CompositionMode_SourceIn)   # keep src's alpha, force RGB white
-        sp.fillRect(silhouette.rect(), QtCore.Qt.white)
-        sp.end()
-        # cache by size + a cheap opaque-region signature (bbox + rect count) so two same-size
-        # widgets of DIFFERENT shape don't collide, while a repaint of the same shape hits the cache.
+        # Cache key first (size + a cheap opaque-region signature so two same-size widgets of DIFFERENT
+        # shape don't collide, while a repaint of the same shape hits the cache).  The bake's ONLY input
+        # -- the white-filled silhouette -- is built LAZILY (below), so a cache hit skips it entirely.
         rb = QtGui.QRegion(src.mask()).boundingRect()
         key = ("alpha", src.width(), src.height(), rb.x(), rb.y(), rb.width(), rb.height(),
                self._blur, self._alpha, self._offset, round(dpr, 2))
-        shadow = _baked_shadow_from_silhouette_pixmap(key, silhouette, self._blur, self._alpha,
+
+        def _make_silhouette() -> QtGui.QPixmap:
+            # The silhouette is the source's OWN opaque alpha -- whatever shape the widget really paints
+            # (a rounded card, or the tab strip whose UNSELECTED tabs are transparent, ...).  White-fill
+            # the live source (keeping its antialiased alpha) and bake from THAT, so the baked white body
+            # sits exactly where the source is opaque (nothing bleeds through transparent regions) and the
+            # shadow matches the stock effect for ANY shape -- no hand-built per-widget silhouette to
+            # drift.  Built ONLY on a cache miss: a repaint of an unchanged shape never runs this.
+            silhouette = QtGui.QPixmap(src.size())
+            silhouette.setDevicePixelRatio(dpr)
+            silhouette.fill(QtCore.Qt.transparent)
+            sp = QtGui.QPainter(silhouette)
+            sp.drawPixmap(0, 0, src)
+            sp.setCompositionMode(QtGui.QPainter.CompositionMode_SourceIn)   # keep src's alpha, force RGB white
+            sp.fillRect(silhouette.rect(), QtCore.Qt.white)
+            sp.end()
+            return silhouette
+
+        shadow = _baked_shadow_from_silhouette_pixmap(key, _make_silhouette, self._blur, self._alpha,
                                                       self._offset, dpr)
         restore = painter.worldTransform()
         painter.setWorldTransform(QtGui.QTransform())
