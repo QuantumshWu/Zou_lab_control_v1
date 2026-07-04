@@ -865,6 +865,11 @@ class FigureViewer(QtWidgets.QWidget):
                                    session=None, scale=self._scale,
                                    window_px=(console_w, console_h), embedded=True)
         self._console_holder.addWidget(self.console)
+        if saved is not None:
+            # A LOADED figure is STATIC: render its seeded panel NOW (synchronously) rather than waiting
+            # for the console's first refresh-timer beat (~DEFAULT_UPDATE_MS) to first-draw it -- that
+            # dead wait is why the panel sat BLANK for ~0.4 s after Load before the figure appeared.
+            self.console.refresh_once()
 
     def _teardown_console(self) -> None:
         if self.console is not None:

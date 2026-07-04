@@ -3860,7 +3860,11 @@ class PanelCard(FluentGroupBox):
         # re-apply persisted Setting toggles (unit + manual x/y limits) to the
         # FRESH plotter every rebuild -- the panel rebuilds whenever its data
         # shape changes, so without this the toggle would silently revert.
-        self._apply_display_params()
+        # Apply unit + limits + x-window in ONE render pass: each apply_param would otherwise redraw the
+        # whole (heavy, e.g. 36-cell grid) figure, so a build applied ~4 knobs = ~4 full re-renders on top
+        # of the build.  Suspend the plotter's draws; the single self.canvas.draw() below renders once.
+        with self.plotter.suspend_draws():
+            self._apply_display_params()
         # park (or arm) the fresh plotter's selector layer to the header's "Selectors" switch --
         # a rebuild must inherit the current state, never come up with live selectors while OFF.
         self._apply_selectors_state()

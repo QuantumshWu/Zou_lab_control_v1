@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from math import ceil
 from typing import Any, Mapping, Sequence
@@ -346,6 +347,10 @@ class BaseLivePlot:
     """
 
     plot_type = "base"
+    #: Draw-coalescing depth (see :meth:`suspend_draws`): while > 0, ``draw()`` is a no-op so a batch
+    #: build / param-apply renders the (heavy) figure ONCE at the end, not once per mutation.  Class
+    #: default 0 so every plotter has it without touching each __init__.
+    _draw_suspended = 0
     #: The DataFigure fitting FAMILY -- "1D" (line/hist fits) or "2D" (image
     #: clim/centroid).  Declared ONCE per plot class (the single-source plot-kind
     #: table ``PLOT_KINDS`` mirrors it) so ``DataFigure`` reads it instead of
@@ -655,11 +660,29 @@ class BaseLivePlot:
         return self
 
     def draw(self) -> None:
+        # A build / batch param-apply mutates the figure MANY times; each draw() below is a full
+        # SYNCHRONOUS render (draw_idle + flush_events), so a 36-cell 300-dpi grid re-rendered once per
+        # mutation cost ~7x per build.  Inside suspend_draws() the draw is skipped -- the caller renders
+        # ONCE afterwards (via the canvas, or the explicit draw at the block's end).
+        if self._draw_suspended:
+            return
         self.fig.canvas.draw_idle()
         try:
             self.fig.canvas.flush_events()
         except Exception:
             pass
+
+    @contextmanager
+    def suspend_draws(self):
+        """Coalesce every :meth:`draw` inside the block: while suspended ``draw()`` is a no-op, so a
+        batch build / display-param apply redraws the whole (heavy) figure ONCE afterwards instead of
+        once per mutation.  The caller renders after the block (its canvas.draw or an explicit draw).
+        Nestable and exception-safe."""
+        self._draw_suspended += 1
+        try:
+            yield
+        finally:
+            self._draw_suspended -= 1
 
     def update_point(self, index: int, value, *, mode: str = "replace", repeat_cur: int | None = None, draw: bool = True):
         """Update one point using a measurement-like update mode."""
@@ -5356,10 +5379,17 @@ def build_grid_figure(recipe: Mapping[str, Any], *, fig: plt.Figure | None = Non
             occupied=None if occupied is None else [np.asarray(o, dtype=float).reshape(-1) for o in occupied],
             grid_shape=grid_shape, bins=int(recipe.get("bins", 36)), labels=labels, title=title,
             fig=fig, interactions=interactions, size=size).show(display=display)
-    for key, value in display_params.items():          # restore saved display knobs (bins / fit / ylog ...)
-        plotter.apply_param(key, value)
-    if focused is not None and 0 <= int(focused) < plotter.n_cells:
-        plotter.focus(int(focused))                    # reopen already zoomed into the cell it was saved on
+    # Restore the saved display knobs in ONE render pass: each apply_param would otherwise redraw the
+    # whole (e.g. 36-cell) figure, so N knobs = N full re-renders during a single build.  Suspend, then
+    # draw once -- only when this factory OWNS the display (display=True, a notebook figure); an embedded
+    # console passes display=False and renders via its own canvas after wrapping this figure.
+    with plotter.suspend_draws():
+        for key, value in display_params.items():      # restore saved display knobs (bins / fit / ylog ...)
+            plotter.apply_param(key, value)
+        if focused is not None and 0 <= int(focused) < plotter.n_cells:
+            plotter.focus(int(focused))                # reopen already zoomed into the cell it was saved on
+    if display:
+        plotter.draw()
     return plotter
 
 
