@@ -1584,12 +1584,15 @@ class PanelConfig:
         # A source written as a bare ``value = <hub signal>`` (a saved layout or a direct
         # pick) NAMES the input, so reflect it in the input slot -- the picker and the source
         # must never disagree.  The canonical ``value = signal`` and an expression
-        # (``value = np.log(f)``) do NOT match this and leave the input alone.  ONE pattern with
-        # :func:`is_identity_source` (which reads the same "just names a signal" fact), so the input
-        # reflection here and the structure-passthrough gate there never disagree.
+        # (``value = np.log(f)``) do NOT match this and leave the input alone.  The ``len == 1``
+        # guard mirrors :func:`is_identity_source`'s SAME guard (a bare name only names the input
+        # when there is exactly ONE slot -- a 2-slot ``value = counts`` is a custom expression, not a
+        # naming): so once this backfill runs the two agree BY CONSTRUCTION, and the structure-
+        # passthrough gate (:meth:`_bound_structure`, which calls is_identity_source) never disagrees
+        # with the picker on what "just names a signal" means.
         from ..neutral_atom.operations.signal_expr import IDENTITY_SOURCE_RE
         m = IDENTITY_SOURCE_RE.fullmatch(self.source.strip())
-        if m and m.group(1) != "signal" and self.inputs:
+        if m and m.group(1) != "signal" and len(self.inputs) == 1:
             self.inputs[0] = m.group(1)
         self.params = dict(params or {})
         self.role = str(role)
@@ -2691,6 +2694,13 @@ class PanelCard(FluentGroupBox):
         operator's live pick is the source of truth); ``bins`` also overrides the recipe's top-level ``bins`` so
         the thumbnails re-bin.  A copy -- the node's recipe is untouched."""
         out = dict(recipe)
+        # The panel's CURRENT title wins over the recipe's saved one -- same "live pick beats stored
+        # default" rule as the display knobs below.  build_grid_figure reads recipe['title'], so without
+        # this an Edit-tab title edit on a RECIPE grid (a loaded figure) rebuilt the snapshot from the
+        # stale saved title and never followed the edit (the facet branch already passes config.title to
+        # _build_facet_plotter; this makes the recipe branch agree).  ONE injection point -> both the live
+        # card's recipe rebuild and the Edit snapshot rebuild pick up the edited title.
+        out["title"] = self.config.title or out.get("title") or ""
         display = dict(out.get("display_params") or {})
         for decl in _panel_display_decls(self.config.kind, self._param_kind()):   # sub-kind knobs + grid title (#5)
             if decl.key in self.config.params:
@@ -3032,16 +3042,31 @@ class PanelCard(FluentGroupBox):
 
     def _on_size(self, size: str) -> None:
         self.config.size = str(size)
-        self._reset_plot()
-        self._apply_fixed_size()
-        # If the Setting frame is open, GROW it immediately to match the new (taller) panel -- but
-        # the high-water mark means a SMALLER size never snaps it shorter (#H3i-2).
-        if getattr(self, "settings_popup", None) is not None and self.settings_popup.isVisible():
-            self._size_settings_popup()
-        self._rerender_last()   # re-draw at the new size NOW, even if the source is stopped (else the
-                                # torn-down panel stays blank until the next hub tick -- same as _set_param)
-        self.changed.emit()
-        self.layout_changed.emit()
+        # ATOMIC relayout transaction.  A size change is THREE synchronous steps: _reset_plot tears the
+        # plotter down (canvas -> None, the holder goes momentarily EMPTY), _apply_fixed_size grows the
+        # card to the new preset, _rerender_last rebuilds the canvas.  If ANY event-loop slice runs
+        # between the grow and the rebuild -- a closing size-combo popup, matplotlib's own draw() -- the
+        # user sees one frame of a BIG EMPTY card before the image lands = the "resize jump" (reproduced:
+        # a 994x653 card with only the title strip painted, canvas still None).  Freezing THIS card's
+        # repaints for the whole mutation (updates disabled -> the Agg buffer still renders, only the Qt
+        # blit defers) makes the paint system composite one clean final frame: card at the new size WITH
+        # the new-size canvas in place (verified: zero intermediate paintEvents).  The layout_changed
+        # emit -- and so the sibling gravity repack it drives -- runs INSIDE the freeze, so this card's
+        # final POSITION + size + image all land together; finally re-enables even if a rebuild raises.
+        self.setUpdatesEnabled(False)
+        try:
+            self._reset_plot()
+            self._apply_fixed_size()
+            # If the Setting frame is open, GROW it immediately to match the new (taller) panel -- but
+            # the high-water mark means a SMALLER size never snaps it shorter (#H3i-2).
+            if getattr(self, "settings_popup", None) is not None and self.settings_popup.isVisible():
+                self._size_settings_popup()
+            self._rerender_last()   # re-draw at the new size NOW, even if the source is stopped (else the
+                                    # torn-down panel stays blank until the next hub tick -- same as _set_param)
+            self.changed.emit()
+            self.layout_changed.emit()
+        finally:
+            self.setUpdatesEnabled(True)
 
     def _set_param(self, key: str, value) -> None:
         """A declarative parameter edit: store, apply, mark dirty.
@@ -4808,7 +4833,14 @@ class PanelEditor(QtWidgets.QWidget):
                 w.returnPressed.connect(self.apply_limits)
             apply_btn = FluentButton("Apply lim", color=ACCENT)
             apply_btn.clicked.connect(self.apply_limits)
-            col.addWidget(FluentSettingRow("x range", _inline(self.xmin, self.xmax, trailing=apply_btn), label_width=proc_lw))
+            # Clear releases the x-window pin back to autoscale -- the Limits counterpart of the Fit/Clear
+            # pair above (without it a pinned x-window could never be undone: clearing the boxes + Apply
+            # only errored 'bad limits', so the operator was stuck at whatever range they once set).
+            clear_lim_btn = FluentButton("Clear", color=GREY)
+            clear_lim_btn.clicked.connect(self.clear_limits)
+            lim_row = _inline(self.xmin, self.xmax, trailing=apply_btn)
+            lim_row.layout().addWidget(clear_lim_btn, 0)
+            col.addWidget(FluentSettingRow("x range", lim_row, label_width=proc_lw))
 
             # ---- Command: a one-line REPL on the panel's DataFigure (confocal runs the same
             # `data_figure.<fn>(...)` form).  Type e.g. `data_figure.xlim(0, 10)`,
@@ -5413,6 +5445,9 @@ class PanelEditor(QtWidgets.QWidget):
     def apply_limits(self) -> None:
         if self.xmin is None:
             return
+        if not self.xmin.text().strip() and not self.xmax.text().strip():
+            self.clear_limits()          # both boxes empty = release the pin (the natural 'clear then Apply')
+            return
         try:
             lo, hi = float(self.xmin.text()), float(self.xmax.text())
         except ValueError as exc:
@@ -5425,6 +5460,18 @@ class PanelEditor(QtWidgets.QWidget):
         # ``_GridData`` the next redraw autoscaled away.
         self._edit_param("view_xlim", (lo, hi))
         self.status.setText("x range applied (all subplots)")
+
+    def clear_limits(self) -> None:
+        """Release the x-window pin -> autoscale.  ``view_xlim=None`` is the SAME stored display knob
+        ``apply_limits`` writes, routed through the ONE ``_edit_param`` entry: BaseLivePlot.apply_param /
+        GridCell.consume_param already read ``None`` as 'no pin', so the live card, the snapshot, and the
+        save all drop the pin.  Re-fills the boxes with the now-auto range so they mirror what is shown --
+        the Limits counterpart of :meth:`clear_fit`."""
+        if self.xmin is None:
+            return
+        self._edit_param("view_xlim", None)
+        self.fill_limits()
+        self.status.setText("x range cleared (auto)")
 
     def _save_stem(self, timestamp: str | None) -> Path:
         """The output file stem (no extension) the Save section resolves to.
@@ -6854,7 +6901,15 @@ class TaskConsole(QtWidgets.QWidget):
         board_w = self._pack_width([c.config for c in self.cards])
         if _compact([c.config for c in self.cards], active_cfg, board_w=board_w):
             self._mark_dirty()
-        self.board.arrange(self.cards)
+        # Repack as one atomic frame: board.arrange moves EVERY card (card.move) + resizes the board,
+        # so without a freeze each card's move paints on its own and a multi-card gravity reflow reads
+        # as a cascade of little jumps.  The SAME updates-disabled primitive the resized card uses in
+        # _on_size, applied one level up so the whole reflow composites in a single flush.
+        self.board.setUpdatesEnabled(False)
+        try:
+            self.board.arrange(self.cards)
+        finally:
+            self.board.setUpdatesEnabled(True)
         self._update_summary()
 
     def _pack_width(self, configs: Sequence["PanelConfig"]) -> int:

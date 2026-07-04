@@ -4761,6 +4761,15 @@ class GridPlot(BaseLivePlot):
         thumbnails are now STALE (the caller decides when to redraw them -- :meth:`apply_param` redraws at
         once when the grid is showing; the console's focused path defers to unfocus, so a Setting edit on an
         ENLARGED cell never synchronously repaints N invisible cells)."""
+        # A family with its OWN built-in fit (a hist cell's bimodal) does not accept the general curve
+        # fit, and ``_apply_view_knobs`` already forces ``model='none'`` at RENDER for it -- so honouring
+        # a general-fit knob HERE would only leak an inert value into ``_display_params`` and thus into
+        # the saved recipe (``grid_recipe_from_cells`` reads it).  Gate at the store on the SAME
+        # ``supports_general_fit`` fact the renderer uses, so store and render never disagree and a hist
+        # grid's .npz never carries a phantom ``fit_model``.
+        if str(key) in ("fit_model", "fit_cmd") and not getattr(
+                self.cell_renderer, "supports_general_fit", True):
+            return False
         self._display_params[str(key)] = value
         # The relim family updates the CELL state exactly like bins/cmap (GridCell.relim_mode /
         # fixed_lo / fixed_hi -- every thumbnail's draw consumes it via thumb_lims), so a lim edit

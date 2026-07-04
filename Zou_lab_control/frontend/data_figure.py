@@ -18,6 +18,15 @@ import warnings
 
 from .style import PALETTE, small_fontsize
 
+# 2D "center" fit overlay sizing (a centre DOT + the fitted-radius RING -- the pairing is fixed).  The
+# dot is an ABSOLUTE-size locator (scatter ``s`` is points^2, independent of the axes scale), so it must
+# be SMALL or it blots the atom out on a ~100px grid thumbnail; the ring's radius is in DATA coords (it
+# shrinks with the cell), so it must be BOLD + OPAQUE to stay the readable element.  Tuned once here so a
+# tiny thumbnail and the full focus view share one primitive (data_figure fit is the single source).
+_CENTER_DOT_SIZE = 8       # scatter ``s`` (points^2): a small centre locator, never a signal-blotting blob
+_CENTER_RING_LW = 1.8      # ring linewidth: bold enough to read the fitted radius over noise / the spot
+_CENTER_RING_ALPHA = 0.9   # ring opacity: the ring is the PRIMARY readable overlay, so nearly solid
+
 
 VALID_FIT_FUNCS = ["lorent", "lorent_zeeman", "rabi", "decay", "center", "gaussian"]
 
@@ -520,16 +529,20 @@ class DataFigure:
         else:
             if self.fit is None:
                 # SAME style as always -- a centre DOT + the fitted-radius CIRCLE (that pairing is fixed).
-                # Only the SIZES shrink so the overlay fits the view instead of blotting it out ("the centre
-                # fit is so big I can't see anything"): a smaller dot + a thinner circle line.
-                self.fit = [ax.scatter(popt[-2], popt[-1], color=PALETTE["fit_right"], s=25)]
+                # The DOT is a small LOCATOR (scatter ``s`` is absolute points^2, so a big dot blots the
+                # atom out on a 100px grid thumbnail); the RING is the READABLE element (its radius is data
+                # coords, so it shrinks with the cell -- it must be bold + opaque to stay legible over the
+                # noise/spot).  ``s`` small + ``lw``/``alpha`` up rebalances the two so both read on a tiny
+                # thumbnail AND the full focus view -- one primitive, no per-scale special case.
+                self.fit = [ax.scatter(popt[-2], popt[-1], color=PALETTE["fit_right"],
+                                       s=_CENTER_DOT_SIZE)]
                 circle = matplotlib.patches.Circle(
                     (popt[-2], popt[-1]),
                     radius=abs(popt[-3]),
                     edgecolor=PALETTE["fit_right"],
                     facecolor="none",
-                    linewidth=1.0,
-                    alpha=0.5,
+                    linewidth=_CENTER_RING_LW,
+                    alpha=_CENTER_RING_ALPHA,
                 )
                 self.fit.append(circle)
                 ax.add_patch(circle)
