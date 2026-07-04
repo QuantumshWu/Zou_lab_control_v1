@@ -96,6 +96,7 @@ from .qt_fluent import (
     fluent_text_width,
     fluent_widget_stylesheet,
     scaled_px,
+    window_pad,
     screen_fit_window_size,
     set_fluent_scale,
     signals_blocked as _signals_blocked,
@@ -5951,21 +5952,27 @@ class TaskConsole(QtWidgets.QWidget):
         else:
             self.setFixedSize(self._target_console_size())
         root = QtWidgets.QVBoxLayout(self)
-        margin = scaled_px(14)
+        # SINGLE SOURCE for every window-edge inset: ``window_pad(1)`` (== ``scaled_px(WINDOW_PAD)``).
+        # The window title (qt_fluent draws it at ``scaled_px(TITLE_LEFT_INSET)`` == ``scaled_px(WINDOW_PAD)``)
+        # pins to this SAME left column, so the body's left edge lines up under the "task_console@zoulab"
+        # title text -- one shared left edge.
+        margin = window_pad(1)
         # EMBEDDED: no top/bottom inset -- the host (the figure viewer) already frames the console with
         # its own root margin, so the console's FIRST card (the header) sits flush at the pane top and its
-        # visible top/bottom edges line up with the Info card beside it.  Standalone keeps the 8 px inset
-        # off the window chrome.
-        v_margin = 0 if self.embedded else scaled_px(8)
+        # visible top/bottom edges line up with the Info card beside it.  STANDALONE: the top AND bottom
+        # insets are the SAME ``window_pad(1)`` as left/right, so the padding to all four window edges is
+        # identical (the bottom gap now matches the sides).
+        v_margin = 0 if self.embedded else window_pad(1)
         # The tab card carries a flat 1 px border (no drop shadow), so no bottom-bleed headroom is
         # reserved -- top and bottom insets are both the plain ``v_margin`` (0 embedded, so the header
         # lines up flush with the Info card beside it).
         root.setContentsMargins(margin, v_margin, margin, v_margin)
         # A clear GAP separates the three rows -- the header card, the (hidden) task banner and
         # the tab card -- so they read as DISTINCT rounded cards on the grey window background.
-        # The header is flat (no drop shadow) and the tab bar draws no top base line, so this
-        # gap reads as clean card separation rather than a hard line.
-        root.setSpacing(scaled_px(10, minimum=7))
+        # The gap is HALF the window pad (``window_pad(0.5)``), so every spacing on screen is a clean
+        # multiple of the ONE ``WINDOW_PAD`` unit.  The header is flat (no drop shadow) and the tab bar
+        # draws no top base line, so this gap reads as clean card separation rather than a hard line.
+        root.setSpacing(window_pad(0.5))
 
         # FLAT header (no drop shadow): the shadow's soft bottom edge cast a thin grey line
         # into the gap right above the tab strip (the "line above the tabs").  The tab widget

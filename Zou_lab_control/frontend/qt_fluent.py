@@ -69,10 +69,22 @@ FONT_SIZE = 12
 PADDING_V = 1
 PADDING_H = 1
 EDIT_PADDING_H = 4
-# Left column of the window body content (the standard 14 px content margin).
-# FluentWindow pins the title bar's title to THIS column (see _position_window_title),
-# so the title text shares one left edge with the body cards/tabs.
-TITLE_LEFT_INSET = 14
+# WINDOW_PAD: the ONE window content-padding / spacing unit.  EVERY GUI insets its window body by
+# ``window_pad(1)`` on all FOUR sides (so the padding to every window edge is identical and equal
+# left/right/top/bottom), and inter-card gaps are ``window_pad`` multiples (0.5x / 1x / 2x) -- so all
+# GUIs share one rhythm.  A card's left edge therefore lines up with the window-title text, because
+# FluentWindow pins the title to this same column (see ``_position_window_title``).  Change the rhythm
+# in ONE place here; never hand-pick a window margin or a top-level card gap in a GUI module.
+WINDOW_PAD = 14
+
+
+def window_pad(mult: float = 1.0) -> int:
+    """The window padding / card-gap at ``mult`` x the single :data:`WINDOW_PAD` unit, display-scaled."""
+    return scaled_px(round(WINDOW_PAD * mult))
+
+
+# The window title pins to the same left column as the body content (one shared left edge).
+TITLE_LEFT_INSET = WINDOW_PAD
 COMBO_WIDTH = 16
 COMBO_TRI_SIZE = 8
 STEP_WIDTH = 6
@@ -318,13 +330,14 @@ def status_dot_stylesheet(color: str, *, radius: int = 8) -> str:
     return f"background:{color}; border-radius:{scaled_px(radius)}px;"
 
 
-# Fluent cards are delineated by a flat 1 px ``DIVIDER`` border (the same edge as the combobox / Setting
-# popup), NOT a drop shadow.  A ``QGraphicsDropShadowEffect`` re-rasterises the whole widget subtree and
-# re-runs a Gaussian blur on EVERY paint (measured ~250 ms of a 35-site grid card's cold load at 3x dpr);
-# a 1 px border costs nothing and reads the same "raised card" boundary.  ``QGroupBox`` cards carry the
-# border in their stylesheet (a ``QGroupBox`` selector cannot cascade onto a QFrame child); ``FluentFrame``
-# and ``FluentTabWidget`` -- which nest their own type -- PAINT the border (a ``QFrame`` stylesheet border
-# WOULD cascade to child QFrames), via this one helper, exactly like ``FluentPopup`` strokes its own edge.
+# Fluent cards are delineated by a flat 1 px ``DIVIDER`` border, NOT a drop shadow.  A
+# ``QGraphicsDropShadowEffect`` re-rasterised the whole widget subtree + re-ran a Gaussian blur on EVERY
+# paint (~250 ms of a 35-site grid card's cold load at 3x dpr); a 1 px border costs nothing and reads the
+# same "raised card" boundary.  Each card owns its edge: ``FluentGroupBox`` paints a CONTINUOUS border
+# UNDER its title pill (so the pill never notches it); ``FluentTabWidget`` has NO border at all -- a plain
+# white rounded card (any border read as boxing the pivot tabs, or as a line between the tabs and the
+# content below); ``FluentFrame`` paints its edge via this one helper (a ``QFrame`` stylesheet border
+# would cascade onto child QFrames -- painting does not), exactly like ``FluentPopup`` strokes its own edge.
 def stroke_card_border(widget: QtWidgets.QWidget, *, radius: int | None = None) -> None:
     """Stroke a 1 px antialiased ``DIVIDER`` rounded border hugging ``widget``'s edge, in a paintEvent.
 
@@ -528,15 +541,17 @@ class FluentPopup(QtWidgets.QFrame):
 class FluentGroupBox(QtWidgets.QGroupBox):
     def __init__(self, title: str = "", parent=None):
         super().__init__(title, parent)
-        # Flat card: a light 1 px DIVIDER border delineates it (no drop shadow -- that re-rasterised +
-        # blurred the whole widget on every paint, stuttering tall scrolled panels).  The ``QGroupBox``
-        # selector scopes the border to this card only (it cannot cascade onto a QFrame child).
-        # CARD_TITLE_PX of top padding reserves the ``QGroupBox::title`` strip.
+        # Flat card delineated by a CONTINUOUS 1 px DIVIDER border painted in ``paintEvent`` (below) --
+        # NOT Qt's own ``QGroupBox`` frame, which cuts a NOTCH in the top border where the title sits
+        # (the "border broken at the rounded title corner" look).  The stylesheet keeps ONLY a
+        # transparent body + the grey title pill; the white body and the unbroken border are painted
+        # UNDER the pill, so the pill draws on top and covers only its own segment of the full border.
+        # ``padding-top`` still reserves the title strip for child layout.
         self.setStyleSheet(
             f"""
             QGroupBox {{
-                background: white;
-                border: 1px solid {DIVIDER};
+                background: transparent;
+                border: none;
                 border-radius: {_radius()}px;
                 margin-top: 0px;
                 padding-top: {scaled_px(CARD_TITLE_PX)}px;
@@ -556,29 +571,35 @@ class FluentGroupBox(QtWidgets.QGroupBox):
         )
 
     def set_outline(self, color: str | None) -> None:
-        """Draw (color) or clear (None) a 2 px rounded outline on THIS card's outer
-        edge, painted in paintEvent.  Never do this via stylesheet: an unscoped
-        ``border:`` declaration appended to the widget's styleSheet cascades to every
-        CHILD widget, so each inner checkbox/lineedit grew its own box."""
+        """Select (color) or clear (None) this card: its continuous edge border switches to a 2 px
+        accent (from the resting 1 px DIVIDER), painted in paintEvent.  Never via stylesheet -- an
+        unscoped ``border:`` cascades to every CHILD widget, so each inner checkbox/lineedit grew its
+        own box."""
         value = str(color) if color else None
         if getattr(self, "_zlc_outline", None) != value:
             self._zlc_outline = value
             self.update()
 
     def paintEvent(self, event) -> None:
+        # Paint the white body + a CONTINUOUS rounded border, THEN let Qt draw the grey title pill +
+        # text on top (super) -- so the pill covers its segment of the border, never the reverse, and
+        # the border is unbroken all the way round.  1 px DIVIDER at rest; 2 px accent when selected.
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        radius = float(_radius())
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(QtGui.QColor("white"))
+        painter.drawRoundedRect(QtCore.QRectF(self.rect()), radius, radius)
+        outline = getattr(self, "_zlc_outline", None)
+        width = 2.0 if outline else 1.0
+        pen = QtGui.QPen(QtGui.QColor(outline or DIVIDER))
+        pen.setWidthF(width)
+        painter.setPen(pen)
+        painter.setBrush(QtCore.Qt.NoBrush)
+        half = width / 2.0
+        painter.drawRoundedRect(QtCore.QRectF(self.rect()).adjusted(half, half, -half, -half), radius, radius)
+        painter.end()
         super().paintEvent(event)
-        color = getattr(self, "_zlc_outline", None)
-        if color:
-            painter = QtGui.QPainter(self)
-            painter.setRenderHint(QtGui.QPainter.Antialiasing)
-            pen = QtGui.QPen(QtGui.QColor(color))
-            pen.setWidthF(2.0)
-            painter.setPen(pen)
-            painter.setBrush(QtCore.Qt.NoBrush)
-            radius = float(_radius())
-            # inset by the half pen width so the stroke hugs the card edge unclipped
-            rect = QtCore.QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
-            painter.drawRoundedRect(rect, radius, radius)
 
 
 class FluentButton(QtWidgets.QPushButton):
@@ -1893,26 +1914,23 @@ class FluentTabWidget(QtWidgets.QTabWidget):
         self.setStyleSheet(
             f"""
             QTabWidget {{
-                background: white;
+                background: transparent;
                 margin: 0px;
                 padding: 0px;
-                border-radius: {_radius()}px;
             }}
             QTabWidget::pane {{
                 background: white;
                 margin: 0px;
                 padding: 0px;
                 border: none;
-                border-bottom-left-radius: {_radius()}px;
-                border-bottom-right-radius: {_radius()}px;
+                border-radius: {_radius()}px;
             }}
             QTabWidget QStackedWidget {{
                 background: white;
                 border: none;
                 margin: 0px;
                 padding: 0px;
-                border-bottom-left-radius: {_radius()}px;
-                border-bottom-right-radius: {_radius()}px;
+                border-radius: {_radius()}px;
             }}
             QTabWidget::tab-bar {{
                 margin: 0px;
@@ -1956,22 +1974,17 @@ class FluentTabWidget(QtWidgets.QTabWidget):
         self.currentChanged.connect(lambda _i: self._update_overflow())
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        # The white card is the WIDGET's own paint.  The ``::pane`` stylesheet fills only the page
-        # below the tab bar white, and ``QTabBar { background: transparent }`` leaves the strip
-        # see-through -- so the whole widget reads as one rounded white card ONLY if it paints that
-        # card itself (same principle as FluentFrame / FluentPopup, which paint their own white body).
-        # A flat 1 px DIVIDER border is then STROKED on top (after the tab content) to delineate the
-        # card -- painted here, NOT via a ``QTabBar::tab`` stylesheet border, so the flat edge hugs
-        # the whole card and never cascades onto each individual tab.
+        # The tab widget is a plain WHITE rounded card with NO border line ANYWHERE -- the pivot tabs sit
+        # on the white top, the content flows straight below, and the card is delineated only by its white
+        # body against the grey window.  (Any border here read as boxing the tabs at the top, or as a line
+        # between the tabs and the content below -- neither is wanted; the tabs + content are ONE surface.)
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
         painter.setPen(QtCore.Qt.NoPen)
         painter.setBrush(QtGui.QColor("white"))
-        radius = _radius()
-        painter.drawRoundedRect(QtCore.QRectF(self.rect()), radius, radius)
+        painter.drawRoundedRect(QtCore.QRectF(self.rect()), float(_radius()), float(_radius()))
         painter.end()
         super().paintEvent(event)
-        stroke_card_border(self)
 
     def _build_overflow_button(self) -> QtWidgets.QToolButton:
         """The Fluent overflow affordance: a subtle ``...`` button (top-right corner) that
@@ -3083,6 +3096,8 @@ __all__ = [
     "run_fluent_window",
     "resolve_fluent_auto_scale",
     "scaled_px",
+    "window_pad",
+    "WINDOW_PAD",
     "set_fluent_scale",
     "status_dot_stylesheet",
     "Metrics",

@@ -84,6 +84,7 @@ from .qt_fluent import (
     center_window_on_primary_screen,
     ensure_qt_app,
     scaled_px,
+    window_pad,
     screen_fit_window_size,
     set_fluent_scale,
     setting_label_width,
@@ -487,15 +488,21 @@ class FigureViewer(QtWidgets.QWidget):
         # column is WIDER than a single-row form (the tabbed facts + multi-line raw dict need room to
         # breathe) so a long label/value is not crushed into an ellipsis.
         self._info_col_w = self._label_w + scaled_px(320, minimum=240)
-        self._root_margin = scaled_px(10, minimum=6)
+        # WINDOW PADDING single source: each PANE (the Info column and the embedded console) frames its
+        # own L/R with ``window_pad(1)`` internally, so their card edges sit exactly ``window_pad(1)`` from
+        # the window sides -- lined up under the title text, the SAME window pad as every other GUI.  The
+        # root therefore adds NO L/R inset (that would double it); it supplies only the top/bottom window
+        # pad and the divider between the two panes (HALF a unit, ``window_pad(0.5)``), so every gap on
+        # screen is a clean multiple of the ONE WINDOW_PAD unit.
+        self._pane_pad = window_pad(1)
+        self._pane_gap = window_pad(0.5)
 
-        # ONE root QHBoxLayout holding the Info card and the console holder with the SAME contents
-        # margins + spacing, so the two frames' outer edges (top / bottom / sides) line up exactly --
-        # the core alignment rule (no per-frame margin fudging).
+        # ONE root QHBoxLayout holding the Info card and the console holder.  Both panes carry the SAME
+        # internal L/R pad and 0 top/bottom (the root's top/bottom pad frames them), so the two frames'
+        # outer edges (top / bottom / sides) line up exactly -- the core alignment rule.
         root = QtWidgets.QHBoxLayout(self)
-        m = self._root_margin
-        root.setContentsMargins(m, m, m, m)
-        root.setSpacing(self._root_margin)
+        root.setContentsMargins(0, self._pane_pad, 0, self._pane_pad)
+        root.setSpacing(self._pane_gap)
         root.addWidget(self._build_info_column(), 0)
         # The console holder STRETCHES (stretch = 1): the embedded TaskConsole is size-Expanding, so it
         # fills the whole right pane and its gravity board reads the real viewport width -> reflows into
@@ -523,14 +530,15 @@ class FigureViewer(QtWidgets.QWidget):
         # The Info column MIRRORS the console beside it: a plain header bar (the path picker) ABOVE a
         # flat-bordered tab card -- TWO separate SIBLING fluent cards, NOT a tab card nested inside an
         # outer frame (nesting a bordered card inside another bordered card would double the edge).  The
-        # column's margins / header height / header<->tab gap match the console's (scaled_px 14 / 48 /
-        # 10) so the two header bars and the two tab cards line up row-for-row across the divider.
+        # column's margins / header height / header<->tab gap match the console's (window_pad(1) / 48 /
+        # window_pad(0.5)) so the two header bars and the two tab cards line up row-for-row across the
+        # divider -- and the column's L/R window pad matches every other GUI's, title-aligned.
         col = QtWidgets.QWidget()
         col.setStyleSheet("background: transparent;")
         col.setFixedWidth(self._info_col_w)
         lay = QtWidgets.QVBoxLayout(col)
-        lay.setContentsMargins(scaled_px(14), 0, scaled_px(14), 0)   # == console root margins -> aligned
-        lay.setSpacing(scaled_px(10, minimum=7))                     # == console header<->tab gap
+        lay.setContentsMargins(window_pad(1), 0, window_pad(1), 0)   # == console root margins -> aligned
+        lay.setSpacing(window_pad(0.5))                              # == console header<->tab gap
 
         # --- File header card: FLAT (like the console header), a single bar "File" + path picker --------
         # Browse (or typing a valid .npz) AUTO-LOADS -- no separate Load button: FluentPathEdit.changed
@@ -858,12 +866,12 @@ class FigureViewer(QtWidgets.QWidget):
             # FIRST build only: construct the embedded console once.  It is size-Expanding, so the
             # stretching holder makes it FILL the right pane and its gravity board reflows into 2+
             # columns.  ``window_px`` is only its MINIMUM (embedded mode setMinimumSize's it): the
-            # budget BESIDE the Info column (window minus the fixed Info column and the 3 horizontal
-            # gaps; height minus the 2 vertical root margins), so it never starts smaller but grows.
+            # budget BESIDE the Info column (window minus the fixed Info column and the ONE inter-pane
+            # divider gap; height minus the top+bottom window pad), so it never starts smaller but grows.
             fit = screen_fit_window_size(self.window_ratio)
-            m = self._root_margin
-            console_w = max(scaled_px(520, minimum=380), fit.width() - self._info_col_w - 3 * m)
-            console_h = max(scaled_px(360, minimum=280), fit.height() - 2 * m)
+            console_w = max(scaled_px(520, minimum=380),
+                            fit.width() - self._info_col_w - self._pane_gap)
+            console_h = max(scaled_px(360, minimum=280), fit.height() - 2 * self._pane_pad)
             self.console = TaskConsole(hub=self.hub, state=state, running_nodes=running,
                                        session=None, scale=self._scale,
                                        window_px=(console_w, console_h), embedded=True)

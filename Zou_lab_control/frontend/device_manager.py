@@ -28,6 +28,7 @@ from .qt_fluent import (
     fluent_font_size,
     scaled_px,
     setting_label_width,
+    window_pad,
 )
 
 
@@ -40,8 +41,10 @@ class DeviceManagerPanel(QtWidgets.QWidget):
         self._device_set = device_set
         self._discover = discover
         outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(*(scaled_px(10),) * 4)
-        outer.setSpacing(scaled_px(8, minimum=4))
+        # SAME window-edge inset as every other GUI: ``window_pad(1)`` all four sides (title-aligned),
+        # header<->body and card<->card gaps are HALF that unit (``window_pad(0.5)``).
+        outer.setContentsMargins(*(window_pad(1),) * 4)
+        outer.setSpacing(window_pad(0.5))
 
         header = QtWidgets.QHBoxLayout()
         header.setSpacing(scaled_px(8, minimum=4))

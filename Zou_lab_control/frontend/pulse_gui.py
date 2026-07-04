@@ -89,6 +89,7 @@ from .qt_fluent import (
     mark_scan_field,
     measure_text_width,
     scaled_px,
+    window_pad,
     screen_fit_window_size,
     set_fluent_scale,
     align_to_resolution,
@@ -1731,8 +1732,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.setStyleSheet(fluent_widget_stylesheet())
 
         root = QtWidgets.QVBoxLayout(self)
-        root.setContentsMargins(_px(18), _px(8), _px(18), _px(8))
-        root.setSpacing(_px(8, minimum=5))
+        # SAME window-edge inset as every other GUI: ``window_pad(1)`` on all four sides (the ONE
+        # WINDOW_PAD unit).  The window title draws at ``scaled_px(TITLE_LEFT_INSET)`` == ``window_pad(1)``,
+        # so the body's left edge lines up under the "PulseGUI@Zou lab" title text.  Inter-card gaps are
+        # HALF that unit (``window_pad(0.5)``), keeping every spacing a clean multiple of the base.
+        root.setContentsMargins(window_pad(1), window_pad(1), window_pad(1), window_pad(1))
+        root.setSpacing(window_pad(0.5))
 
         header_frame = FluentFrame()
         header_frame.setFixedHeight(_px(48, minimum=38))
