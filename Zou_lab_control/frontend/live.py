@@ -16,7 +16,7 @@ import numpy as np
 from scipy.optimize import curve_fit
 
 from ._validate import _positive_float
-from .canvas import FigureSpec, configure_canvas, create_axes_fixed, create_axes_grid, display_figure, grid_shape_for, new_figure, split_axes_horizontally
+from .canvas import FigureSpec, configure_canvas, create_axes_fixed, create_axes_grid, display_figure, fit_grid_shape_for_aspect, grid_shape_for, new_figure, split_axes_horizontally
 from .selectors import AreaSelector, CrossSelector, DragHLine, DragVLine, InteractionBundle, PlotState, ZoomPan, attach_interaction
 from Zou_lab_control._readout_math import (
     bimodal_jacobian,
@@ -2967,7 +2967,15 @@ class HistogramFigure(BaseLivePlot):
         self._refresh_overlays()
         self._apply_value_xlim()
         self._apply_count_yscale()
-        self._fit_bimodal()
+        # Skip the bimodal curve_fit when its inputs are byte-identical to the last fit: re-fitting the
+        # SAME histogram yields the SAME popt but costs ~10 ms of scipy ``curve_fit`` per tick on the GUI
+        # thread (profiled -- a live dis panel re-fit unchanged data every tick, starving the event loop).
+        # A new shot re-bins ``self.n`` and a Setting change re-strings ``self._fit`` -- both miss the
+        # cache and re-fit.  Performance-only, appearance-neutral (AGENTS §3 skip-if-unchanged).
+        fit_key = (self.n.tobytes(), self.bins.tobytes(), self._fit)
+        if fit_key != getattr(self, "_fit_cache_key", None):
+            self._fit_cache_key = fit_key
+            self._fit_bimodal()
         while len(self.threshold_lines) < len(self.thresholds):
             line = self.ax.axvline(self.thresholds[len(self.threshold_lines)], **threshold_line_kwargs())
             self.threshold_lines.append(line)
@@ -3636,6 +3644,13 @@ class GridCell:
         flips relim to ``fixed`` without an enlarged cell (fixed freezes what you see, never 0..1)."""
         raise NotImplementedError
 
+    def cell_aspect(self) -> float | None:
+        """The FIXED image ratio (width / height) the cells keep, or ``None`` when the cells STRETCH to
+        fill any box (1D / hist).  ``GridPlot`` feeds a fixed aspect to :func:`canvas.fit_grid_shape_for_aspect`
+        to pick the ``(rows, cols)`` that PACKS the panel, instead of the near-square count that
+        letterboxes a 2D image grid; a stretchable cell keeps the near-square count.  Base = stretchable."""
+        return None
+
     def _cell_identifier(self, k: int) -> str:
         """Title part 1: the cell's facet-aware IDENTIFIER (``labels_per_cell[k]`` from
         :func:`facet_cell_labels`), falling back to the site tag before the labels are threaded in.  A
@@ -4122,6 +4137,15 @@ class ImageCell(GridCell):
             return True
         return super().consume_param(key, value)   # generic title_template knob
 
+    def cell_aspect(self) -> float | None:
+        """The image ratio (width / height) the cells keep (``imshow(aspect='equal')``), so ``GridPlot``
+        packs the panel with these fixed-aspect images.  All facet cells are same-shape slices, so cell 0
+        is representative; a degenerate (empty / 1-D) image falls back to 1.0 (square)."""
+        for im in self.images:
+            if im.ndim >= 2 and im.shape[0] > 0 and im.shape[1] > 0:
+                return float(im.shape[1]) / float(im.shape[0])
+        return 1.0
+
     def prepare(self) -> None:
         finite = [im[np.isfinite(im)] for im in self.images if im.size]
         pooled = np.concatenate(finite) if finite else np.array([0.0, 1.0])
@@ -4400,7 +4424,9 @@ class GridPlot(BaseLivePlot):
         if self.n_cells == 0:
             raise ValueError("a GridPlot needs at least one cell.")
         cell.prepare()
-        self.nrows, self.ncols = grid_shape_for(self.n_cells, prefer=grid_shape, max_cols=_SITE_MAX_COLS)
+        # Provisional near-square shape -> the default size PRESET.  The FINAL shape may then repack the
+        # cells for a fixed-aspect (2D image) grid (below), but the size still follows the cell COUNT.
+        prov_rows, prov_cols = grid_shape_for(self.n_cells, prefer=grid_shape, max_cols=_SITE_MAX_COLS)
         # The grid's data region scales with the size PRESET like every other kind: the cells / gaps
         # grow via _site_grid_geometry, and a FOCUSED cell fills a data box IDENTICAL to a same-size
         # single-axes panel (panel_plot_spec) so its x label never clips.  ``size=None`` picks the default
@@ -4409,9 +4435,19 @@ class GridPlot(BaseLivePlot):
         # reopen agree; an explicit ``size`` (a Setting pick) overrides it.  The recommendation is KEPT
         # (not consumed only by the default): the cell-text rule (_cell_font_scale) compares the current
         # size against it -- a grid squeezed below its recommended preset halves the cell text.
-        self._recommended_size = optimal_grid_size(self.nrows, self.ncols)
+        self._recommended_size = optimal_grid_size(prov_rows, prov_cols)
         self._size = self._recommended_size if size is None else str(size)
         panel_size_cells(self._size)                     # validate against PANEL_SIZES (raises otherwise)
+        # FINAL shape: fixed-aspect cells (a 2D imshow grid) keep their image ratio, so a near-square cell
+        # COUNT letterboxes them; repack to the (rows, cols) that best FILLS this size's data region with
+        # those images (:func:`canvas.fit_grid_shape_for_aspect`).  Stretchable cells (1D / hist -> aspect
+        # None) and an explicit ``grid_shape`` override keep the near-square count.
+        cell_aspect = cell.cell_aspect()
+        if grid_shape is None and cell_aspect is not None:
+            self.nrows, self.ncols = fit_grid_shape_for_aspect(
+                self.n_cells, cell_aspect, panel_plot_spec(self._size).data_px, max_cols=_SITE_MAX_COLS)
+        else:
+            self.nrows, self.ncols = prov_rows, prov_cols
         # cells set their own ticks; the base single-axes smart-tick pass would
         # only touch cell 0 and make it differ from the rest.
         super().__init__(np.arange(self.n_cells), labels=labels, smart_ticks=False, **kwargs)

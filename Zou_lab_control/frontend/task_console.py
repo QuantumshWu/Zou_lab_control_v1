@@ -2782,36 +2782,49 @@ class PanelCard(FluentGroupBox):
         # ``facet_cell_labels`` source -- so a repeat / scan / site grid's cells read 'rep k' / a scan
         # coordinate / 's k' instead of a hardcoded site tag, from the same source the notebook path uses.
         pts, _ = self._facet_value_shapes()
-        # For a POINTS (scan-axis) facet, hand the label source the producing scan node's param NAMES + the
-        # faceted axis's coordinate array, so each cell reads the REAL scan value (``delay=1.0``) not a bare
-        # ``pt k`` -- but only when the coords line up 1:1 with the cells (a plain 1-D scan); otherwise the
-        # label source falls back safely.  (Structure carries these via :meth:`_signal_structure`.)
+        # For a POINTS (scan-axis) facet, label each cell with the REAL scan coordinate (``Bz=1.2``) not a
+        # bare ``pt k``.  The faceted axis's NAME + per-cell COORDINATE are metadata of the producing SCAN
+        # NODE and the facet spec -- NOT of the value expression -- so they are fetched UNGATED: even a
+        # transforming value (``np.log(f)``, ``a-b``) still faceted on scan axis i, so cell k is still
+        # scan point k of axis i and its coordinate is known.  (``_bound_structure`` is identity-gated
+        # because it drives the value's SHAPE reshape, a DIFFERENT concern; the scan coordinates never
+        # change under a value transform -- gating them there was the root cause of the ``pt k`` fallback.)
         from .live import normalize_facet
         coords = names = None
-        st = self._bound_structure()
         spec = normalize_facet(self._facet())
-        if st and spec and spec[0] == "points":
-            names = st.get("param_names")
-            all_coords = st.get("points_coords") or []
-            axis = int(spec[1])
-            if axis < len(all_coords) and len(all_coords[axis]) == len(cells):
-                coords = all_coords[axis]
+        if spec and spec[0] == "points" and self.config.inputs and callable(self.structure_provider):
+            try:
+                raw = self.structure_provider(self.config.inputs[0])
+            except Exception:
+                raw = None
+            if raw:
+                names = raw.get("param_names")
+                all_coords = raw.get("points_coords") or []
+                axis = int(spec[1])
+                if axis < len(all_coords) and len(all_coords[axis]) == len(cells):
+                    coords = all_coords[axis]
         cell_labels = facet_cell_labels(self._facet(), len(cells), points_shape=pts,
                                         coords=coords, param_names=names)
         plotter = build_facet_grid(
             cells, sub_plot_kind=sub, size=self.config.size, cell_labels=cell_labels,
             display=False, interactions=interactions, title=self.config.title or "")
-        for key in ([d.key for d in _panel_display_decls("grid", sub)]
-                    + ["relim", "fixed_lo", "fixed_hi", "view_xlim", "fit_model", "fit_cmd"]):
-            if key == "cmap":
-                # Inject the RESOLVED cmap (operator's pick ELSE the sub-kind's declared PANEL_PARAMS
-                # default) through the ONE ``_resolved_cmap`` resolver -- the SAME source the Setting
-                # popup shows.  Without this a grid whose params carry no explicit cmap fell through to
-                # ImageCell's own default (grey), so the live grid drew grey while the Setting said the
-                # default: render == Setting now, one source, no silent divergence.
-                plotter.apply_param("cmap", _resolved_cmap(sub, self.config.params))
-            elif key in self.config.params:
-                plotter.apply_param(key, self.config.params[key])
+        # Fold the persisted display knobs in with the draws SUSPENDED.  Each ``apply_param`` otherwise
+        # forces a synchronous N-cell repaint, so ~10 keys = up to 10 full grid ``draw()``s per build --
+        # the draw-per-mutation anti-pattern, byte-identical to the loop in ``build_grid_figure`` above
+        # (which already suspends).  The ONE first render happens via the caller's ``canvas.draw`` (the
+        # plotter is built ``display=False``), exactly as the non-facet grid path.
+        with plotter.suspend_draws():
+            for key in ([d.key for d in _panel_display_decls("grid", sub)]
+                        + ["relim", "fixed_lo", "fixed_hi", "view_xlim", "fit_model", "fit_cmd"]):
+                if key == "cmap":
+                    # Inject the RESOLVED cmap (operator's pick ELSE the sub-kind's declared PANEL_PARAMS
+                    # default) through the ONE ``_resolved_cmap`` resolver -- the SAME source the Setting
+                    # popup shows.  Without this a grid whose params carry no explicit cmap fell through to
+                    # ImageCell's own default (grey), so the live grid drew grey while the Setting said the
+                    # default: render == Setting now, one source, no silent divergence.
+                    plotter.apply_param("cmap", _resolved_cmap(sub, self.config.params))
+                elif key in self.config.params:
+                    plotter.apply_param(key, self.config.params[key])
         return plotter
 
     def _facet_choices(self) -> list[tuple[str, str, bool]]:
@@ -4849,10 +4862,13 @@ class PanelEditor(QtWidgets.QWidget):
                 col.addWidget(FluentSettingRow("args", self.fit_cmd, label_width=proc_lw))
 
             # x-range pin (#3): ONE domain (x) range, applied to the LIVE panel AND every grid cell (global,
-            # not the snapshot only), a live VIEW of the panel's current x-window that a zoom/pan reflects.
-            # There is NO y-range input: the VALUE axis is already owned by the relim family (tight/normal/
-            # fixed + fixed lo/hi in the Display section), and the perpendicular axis (a hist's count, a 2d/
-            # sites image extent) is intrinsically auto -- a manual y just fought the autoscaler.
+            # not the snapshot only).  The boxes EDIT THE STORED PIN (``view_xlim``), NOT the live range --
+            # they hold the pin value (or are empty = autoscale) and are only re-seeded on build / tab-show
+            # / Clear, so typing is NEVER clobbered by the refresh tick.  The live x-window is shown as the
+            # grey PLACEHOLDER (``refresh_limit_hints``), a non-destructive hint Qt draws only while a box
+            # is empty.  There is NO y-range input: the VALUE axis is already owned by the relim family
+            # (tight/normal/fixed + fixed lo/hi in the Display section), and the perpendicular axis (a
+            # hist's count, a 2d/sites image extent) is intrinsically auto -- a manual y fights the autoscaler.
             section("Limits")
             self.xmin = FluentLineEdit(""); self.xmax = FluentLineEdit("")
             self.ymin = self.ymax = None                     # no y input -- the value axis is relim-owned (#3)
@@ -5089,7 +5105,8 @@ class PanelEditor(QtWidgets.QWidget):
         # carry the persisted x-axis unit cycle onto the fresh snapshot (relim + cmap are
         # already baked into panel_plot above; unit is applied post-build, like the live card).
         self._apply_snapshot_unit()
-        self.fill_limits()
+        self._seed_limit_boxes()        # boxes = the stored pin (or empty=auto); grey hint = live range
+        self.refresh_limit_hints()
         # confocal-style auto-range: interacting with this (interactive) Edit plot
         # writes the region the user marked back to the source's parameters.  The
         # selector / zoom is a GENERIC interface -- it only ever yields the
@@ -5417,7 +5434,8 @@ class PanelEditor(QtWidgets.QWidget):
             self.console._refresh_panel_editor(card)
             return
         self._refresh_display_params()
-        self.fill_limits()
+        self._seed_limit_boxes()        # re-seed the pin from config.params (may have changed in Setting)
+        self.refresh_limit_hints()
         self.refresh_node_now_labels()
         hook = getattr(getattr(self, "source_form", None), "refresh_on_show", None)
         if callable(hook):
@@ -5460,15 +5478,38 @@ class PanelEditor(QtWidgets.QWidget):
                 return ax
         return None
 
-    def fill_limits(self) -> None:
+    def _seed_limit_boxes(self) -> None:
+        """Put the STORED x-window pin (``view_xlim`` in ``config.params``) into the boxes.  The boxes
+        EDIT THE PIN, never the live autoscaled range, so their text never wanders on its own: empty
+        boxes mean 'no pin' (autoscale), a value means 'pinned there'.  Called on build / tab-show /
+        after Clear -- NEVER on the refresh tick (the root cause of the old 'I type and it rewrites'
+        bug was ``fill_limits`` doing ``setText`` every tick).  The live range is shown separately as a
+        non-destructive grey hint (:meth:`refresh_limit_hints`)."""
+        if self.xmin is None:
+            return                          # no Limits section (a non-"plot" role)
+        pin = self.card.config.params.get("view_xlim") if self.card is not None else None
+        lo = hi = ""
+        if pin is not None:
+            try:
+                lo, hi = f"{float(pin[0]):.6g}", f"{float(pin[1]):.6g}"
+            except (TypeError, ValueError, IndexError):
+                lo = hi = ""
+        with _signals_blocked(self.xmin, self.xmax):
+            self.xmin.setText(lo); self.xmax.setText(hi)
+
+    def refresh_limit_hints(self) -> None:
+        """Refresh ONLY the grey PLACEHOLDER of the x-range boxes to the panel's current x-window -- a
+        non-destructive live reference.  Qt shows a placeholder ONLY while the box is empty, so this can
+        never overwrite a pinned value or the operator's in-progress typing.  This is the tick-safe
+        successor of the old ``fill_limits`` (whose per-tick ``setText`` clobbered input): the tick calls
+        THIS, so the boxes stay a live VIEW of the x-window (unpinned) while remaining freely editable."""
         if self.xmin is None:
             return                          # no Limits section (a non-"plot" role)
         ax = self._limits_ax()
         if ax is None:
             return
         xlo, xhi = ax.get_xlim()            # x only -- the value (y) axis is relim-owned (#3)
-        with _signals_blocked(self.xmin, self.xmax):
-            self.xmin.setText(f"{xlo:.6g}"); self.xmax.setText(f"{xhi:.6g}")
+        self.xmin.setPlaceholderText(f"{xlo:.6g}"); self.xmax.setPlaceholderText(f"{xhi:.6g}")
 
     def apply_limits(self) -> None:
         if self.xmin is None:
@@ -5493,12 +5534,14 @@ class PanelEditor(QtWidgets.QWidget):
         """Release the x-window pin -> autoscale.  ``view_xlim=None`` is the SAME stored display knob
         ``apply_limits`` writes, routed through the ONE ``_edit_param`` entry: BaseLivePlot.apply_param /
         GridCell.consume_param already read ``None`` as 'no pin', so the live card, the snapshot, and the
-        save all drop the pin.  Re-fills the boxes with the now-auto range so they mirror what is shown --
-        the Limits counterpart of :meth:`clear_fit`."""
+        save all drop the pin.  EMPTIES the boxes (empty = no pin) so the grey placeholder hint takes
+        over showing the now-auto range -- the Limits counterpart of :meth:`clear_fit`."""
         if self.xmin is None:
             return
         self._edit_param("view_xlim", None)
-        self.fill_limits()
+        with _signals_blocked(self.xmin, self.xmax):
+            self.xmin.setText(""); self.xmax.setText("")
+        self.refresh_limit_hints()
         self.status.setText("x range cleared (auto)")
 
     def _save_stem(self, timestamp: str | None) -> Path:
@@ -7671,6 +7714,19 @@ class TaskConsole(QtWidgets.QWidget):
         self._last_save_dir = str(Path(path).parent)
         self._update_summary()
 
+    def _card_render_key(self, card, sigvers: Mapping[str, int]):
+        """The render key for THIS card: a tuple of the publish counters of ITS OWN bound signals
+        (``config.inputs``), so the tick redraws the panel ONLY when one of those signals produced a new
+        sample -- NOT on every OTHER node's publish.  The old gate compared the GLOBAL ``hub.version``,
+        which bumps on ANY publish, so a fast node + a slow node (or an A/B camera pair) repainted EVERY
+        panel on the fast node's beat -- wasted GUI-thread draws.  ``sigvers`` is one shared
+        ``hub.signal_versions()`` snapshot.  A card with no bound signals keeps the global version (it has
+        no per-signal key, so the old redraw-on-any behaviour is preserved rather than freezing it)."""
+        inputs = card.config.inputs or ()
+        if not inputs:
+            return self.hub.version
+        return tuple(sigvers.get(str(n), 0) for n in inputs)
+
     def _tick(self) -> None:
         # poll the logic nodes EVERY base tick (even when no new signal arrived) so a
         # one-shot node's run-complete / error transition is never missed if the node
@@ -7681,13 +7737,14 @@ class TaskConsole(QtWidgets.QWidget):
         # hub version -- refresh its dedicated panel here every tick.
         self._refresh_task_panel()
         # PAUSE = freeze EVERY plot's display: skip the per-card render below (so no card advances
-        # its _render_version) while keeping node polling / banners alive.  On Resume, hub.version
-        # has moved on but the cards' _render_version did not, so the version gate redraws them all.
+        # its _render_version) while keeping node polling / banners alive.  On Resume, each card whose
+        # OWN signals published during the pause has a changed render key, so the gate redraws exactly
+        # those (a card whose signals never moved needs no redraw -- nothing changed).
         if self._paused:
             self._update_summary()
             return
         self._tick_count += 1
-        version = self.hub.version
+        sigvers = self.hub.signal_versions()   # ONE per-signal-counter snapshot for this whole tick
         elapsed = self._tick_count * self._base_interval_ms
         namespace = None
         for card in self.cards:
@@ -7695,18 +7752,19 @@ class TaskConsole(QtWidgets.QWidget):
             # SAME tick -> they read the SAME namespace below (one snapshot, mutually consistent).
             if elapsed % card.config.update_ms != 0:
                 continue
-            if version == card._render_version:   # no new publish since this panel last drew -> nothing to do
-                continue
+            rkey = self._card_render_key(card, sigvers)
+            if rkey == card._render_version:      # none of THIS panel's OWN signals published since it drew
+                continue                          # (a global-version gate would redraw it on ANY node's publish)
             if namespace is None:                 # built ONCE per tick -> one snapshot (each signal latest)
                 namespace = self._expression_namespace()
             card.refresh(namespace)
-            card._render_version = version
+            card._render_version = rkey
         # keep the visible Edit tab's 'now:' acquisition references live, so a queued
         # parameter edit shows as applied once the loop picks it up.
         editor = self.tabs.currentWidget()
         if isinstance(editor, PanelEditor):
             editor.refresh_node_now_labels()
-            editor.fill_limits()          # #3a: the Limits box is a LIVE view of the plot's x-window
+            editor.refresh_limit_hints()  # #3a: tick updates only the grey placeholder hint, never the text
         self._update_summary()
 
     def refresh_once(self) -> None:
@@ -7715,16 +7773,16 @@ class TaskConsole(QtWidgets.QWidget):
         self._poll_logic_nodes()
         self._refresh_signal_info()
         self._refresh_task_panel()
-        version = self.hub.version
+        sigvers = self.hub.signal_versions()
         # render EVERY card now at each signal's latest value (tests / notebooks / Resume catch-up).
         namespace = self._expression_namespace()
         for card in self.cards:
             card.refresh(namespace)
-            card._render_version = version
+            card._render_version = self._card_render_key(card, sigvers)
         editor = self.tabs.currentWidget()
         if isinstance(editor, PanelEditor):
             editor.refresh_node_now_labels()
-            editor.fill_limits()          # #3a: the Limits box is a LIVE view of the plot's x-window
+            editor.refresh_limit_hints()  # #3a: tick updates only the grey placeholder hint, never the text
         self._update_summary()
 
     def _update_summary(self) -> None:

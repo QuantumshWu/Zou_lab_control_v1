@@ -352,6 +352,39 @@ def grid_shape_for(n: int, *, max_cols: int = 8, prefer: tuple[int, int] | None 
     return nrows, ncols
 
 
+def fit_grid_shape_for_aspect(
+    n: int, cell_aspect: float, region_px: tuple[int, int], *, max_cols: int = 8
+) -> tuple[int, int]:
+    """``(nrows, ncols)`` that MAXIMISES the displayed size of ``n`` FIXED-ASPECT cells tiled to fill a
+    ``region_px`` ``(W, H)`` data region -- for a 2D image grid, whose cells keep their pixel ratio
+    (``imshow(aspect='equal')``), so a near-square cell COUNT leaves the letterbox gaps the user sees
+    (a square image dropped in a 4:3 cell wastes the sides).
+
+    ``cell_aspect`` is the image WIDTH / HEIGHT.  For a candidate ``(rows, cols)`` the per-cell box is
+    ``(W/cols, H/rows)`` and the image, keeping its ratio, renders at height ``min(H/rows, (W/cols)/a)``;
+    since every cell is identical the utilised area is ``n * a * height**2``, so the shape with the
+    largest per-cell image height fills the panel best.  Ties break toward fewer EMPTY cells, then a
+    more-square layout -- so this collapses to the near-square shape when the image ratio already
+    matches the region, and only departs from it to pack fixed-aspect images.  ``cols`` is capped at
+    ``max_cols`` (the shared column cap); ``rows = ceil(n / cols)``."""
+
+    import math
+
+    n = max(1, int(n))
+    a = float(cell_aspect) if cell_aspect and cell_aspect > 0 else 1.0
+    W, H = float(region_px[0]), float(region_px[1])
+    best_key: tuple | None = None
+    best = (1, n)
+    for ncols in range(1, min(int(max_cols), n) + 1):
+        nrows = int(math.ceil(n / ncols))
+        cw, ch = W / ncols, H / nrows
+        img_h = min(ch, cw / a)                       # rendered image height, ratio preserved
+        key = (img_h, -(nrows * ncols), -abs(nrows - ncols))
+        if best_key is None or key > best_key:
+            best_key, best = key, (nrows, ncols)
+    return best
+
+
 __all__ = [
     "FigureSpec",
     "close_all",
