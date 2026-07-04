@@ -256,7 +256,7 @@ def test_grid_panel_exposes_editable_cell_title_template_and_size():
         # editing the template (the ONE set_param path) re-titles EVERY cell.
         card._set_param("title_template", "{id}  n={k}"); card._run_pending_rebuild(); con._tick()
         assert [card.plotter.cell_renderer.cell_title(k) for k in range(4)] == \
-            ["rep 0  n=0", "rep 1  n=1", "rep 2  n=2", "rep 3  n=3"]
+            ["repeat 0  n=0", "repeat 1  n=1", "repeat 2  n=2", "repeat 3  n=3"]
         card._set_param("title_size", 7); card._run_pending_rebuild()
         assert card.plotter.cell_renderer.title_size_pt() == 7.0
         # both round-trip through the saved view.

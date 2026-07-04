@@ -2743,7 +2743,8 @@ class PanelCard(FluentGroupBox):
         plotter = build_facet_grid(
             cells, sub_plot_kind=sub, size=self.config.size, cell_labels=cell_labels,
             display=False, interactions=interactions, title=self.config.title or "")
-        for key in [d.key for d in _panel_display_decls("grid", sub)] + ["relim", "fixed_lo", "fixed_hi"]:
+        for key in ([d.key for d in _panel_display_decls("grid", sub)]
+                    + ["relim", "fixed_lo", "fixed_hi", "view_xlim", "fit_model", "fit_cmd"]):
             if key == "cmap":
                 # Inject the RESOLVED cmap (operator's pick ELSE the sub-kind's declared PANEL_PARAMS
                 # default) through the ONE ``_resolved_cmap`` resolver -- the SAME source the Setting
@@ -2858,14 +2859,17 @@ class PanelCard(FluentGroupBox):
         self._apply_view_xlim()
 
     def _apply_view_xlim(self) -> None:
-        """Re-apply the persisted x-range pin (#3) to the LIVE plotter -- a grid fans out to EVERY cell
-        (``_GridData.xlim``), a flat panel is its one axes -- so the operator's Apply survives a rebuild /
-        reopen.  Absent (the default) leaves the plot's own autoscale untouched."""
+        """Re-apply the persisted x-range pin (#3) to the LIVE plotter through the SAME ``apply_param``
+        entry every display knob uses -- a grid stores it and re-asserts it on every cell after each tick
+        (:meth:`GridPlot._apply_view_knobs`), a flat panel sets its one axes -- so the operator's Apply
+        survives a rebuild / reopen AND sticks across the live autoscale (never the old one-shot
+        ``to_data_figure().xlim`` the next redraw wiped).  Absent (the default) leaves the plot's own
+        autoscale untouched."""
         pin = self.config.params.get("view_xlim")
         if not pin or self.plotter is None:
             return
         try:
-            self.plotter.to_data_figure().xlim(float(pin[0]), float(pin[1]))
+            self.plotter.apply_param("view_xlim", (float(pin[0]), float(pin[1])))
         except Exception:
             pass                                          # a stale pin from a re-interpreted kind: ignore
 
@@ -5268,55 +5272,24 @@ class PanelEditor(QtWidgets.QWidget):
         return self._df
 
     def do_fit(self) -> None:
-        if self._plotter is None or self.fit_combo is None:
+        if self.fit_combo is None:
             return
         method = FIT_MODELS.get(self.fit_combo.currentText())
         if method is None:
             return
-        cmd = self.fit_cmd.text().strip()
-        try:
-            # Fan the SAME fit call over every target: a flat panel is ONE target (itself), a grid is its
-            # N per-cell DataFigures (fit_targets()).  Each cell fits INDEPENDENTLY through the identical
-            # DataFigure primitive on its own bin-centres/counts + its own axes, so every subplot gets its
-            # curve + popt -- the "apply to all subplots" behaviour every other display knob has.
-            targets = list(self._df_for().fit_targets())
-            converged: list = []
-            for target in targets:
-                if getattr(target, "fit", None) is not None:
-                    target.clear()
-                # trusted-local-tool posture: the typed args are injected into the fit call (p0 / fixed
-                # params / is_fit).  ``_df`` is rebound per target so the same command fits each cell.
-                call = f"_df.{method}({cmd})" if cmd else f"_df.{method}(is_display=True)"
-                try:
-                    result, _ = eval(call, {"_df": target, "np": np})  # noqa: S307 - local experiment tool
-                except Exception:
-                    result = None            # this cell did not converge -- leave it unfitted, keep going
-                if getattr(result, "popt", None) is not None:
-                    converged.append(result)
-            self._canvas.draw_idle()
-            label = self.fit_combo.currentText()
-            if not converged:
-                self.status.setText(f"fit {label}: did not converge")
-            elif len(targets) == 1:
-                names = getattr(converged[0], "names", None) or []
-                self.status.setText(f"fit {label}: "
-                                    + ", ".join(f"{n}={v:.4g}" for n, v in zip(names, converged[0].popt)))
-            else:
-                self.status.setText(f"fit {label}: {len(converged)}/{len(targets)} cells converged")
-        except Exception as exc:
-            self.status.setText(f"fit failed: {str(exc).splitlines()[0][:140]}")
+        # Fit = two ORDINARY display knobs (the model name + its typed-arg string) applied through the SAME
+        # ``_edit_param`` entry every other knob uses -> the LIVE card (whose ``apply_param`` fans the fit to
+        # every subplot via :func:`live.apply_fit_to_figure` -- a grid re-fits each cell, a flat panel fits
+        # itself) + the snapshot + ``config.params`` + save.  So a grid fit now TAKES EFFECT, STICKS across
+        # ticks, matches the double-click focus, and reopens with the figure (#4) -- no throwaway-snapshot
+        # DataFigure mutation the live grid never saw, no per-kind fanning code here.
+        self._edit_param("fit_cmd", self.fit_cmd.text().strip())
+        self._edit_param("fit_model", method)
+        self.status.setText(f"fit {self.fit_combo.currentText()}: applied to all subplots")
 
     def clear_fit(self) -> None:
-        if self._df is not None:
-            try:
-                for target in self._df.fit_targets():   # clear EVERY cell (grid) / the one plot (flat)
-                    target.clear()
-            except Exception:
-                pass
-            self._df = None
-            if self._canvas is not None:
-                self._canvas.draw_idle()
-            self.status.setText("fit cleared")
+        self._edit_param("fit_model", "none")
+        self.status.setText("fit cleared")
 
     def refresh_on_show(self) -> None:
         """When this panel's Edit tab becomes visible, refresh anything that may have changed
@@ -5391,21 +5364,16 @@ class PanelEditor(QtWidgets.QWidget):
             return
         try:
             lo, hi = float(self.xmin.text()), float(self.xmax.text())
-            # GLOBAL + LIVE (#3): pin the x-window on the LIVE card through its OWN to_data_figure() -- a
-            # grid fans out to EVERY cell (_GridData.xlim), a flat panel is its one axes -- so Apply reaches
-            # the running panel, not just the Edit preview.  Persist it in config.params so it survives a
-            # rebuild and the save (view round-trip), then mirror it onto the snapshot so the preview agrees.
-            self.card.config.params["view_xlim"] = (lo, hi)
-            live = getattr(self.card, "plotter", None)
-            if live is not None:
-                live.to_data_figure().xlim(lo, hi)
-            if self._plotter is not None:
-                self._df_for().xlim(lo, hi)
-            if self._canvas is not None:
-                self._canvas.draw_idle()
-            self.status.setText("x range applied (all cells)")
-        except Exception as exc:
+        except ValueError as exc:
             self.status.setText(f"bad limits: {str(exc).splitlines()[0][:100]}")
+            return
+        # The x-window pin is an ORDINARY display knob (``view_xlim``) applied through the SAME
+        # ``_edit_param`` entry as bins / fit / relim -> the LIVE card (whose ``apply_param`` fans it to
+        # EVERY cell and re-asserts it after each tick's autoscale) + the snapshot + ``config.params`` +
+        # save.  So Apply reaches the RUNNING grid and STICKS (#3), not a one-shot on a throwaway
+        # ``_GridData`` the next redraw autoscaled away.
+        self._edit_param("view_xlim", (lo, hi))
+        self.status.setText("x range applied (all subplots)")
 
     def _save_stem(self, timestamp: str | None) -> Path:
         """The output file stem (no extension) the Save section resolves to.
@@ -5480,6 +5448,11 @@ class PanelEditor(QtWidgets.QWidget):
         pin = params.get("view_xlim")
         if pin:
             view["view_xlim"] = [float(pin[0]), float(pin[1])]
+        # the general curve fit (#4) is a cross-kind view knob too: persist the model + its arg string so a
+        # reopened figure redraws the SAME fit on every subplot (omitted while unset, staying unfitted).
+        if str(params.get("fit_model") or "none") != "none":
+            view["fit_model"] = str(params["fit_model"])
+            view["fit_cmd"] = str(params.get("fit_cmd") or "")
         for decl in _panel_display_decls(self.card.config.kind, self.card._param_kind()):
             view[decl.key] = params.get(decl.key, decl.default)
         return view
@@ -7585,6 +7558,7 @@ class TaskConsole(QtWidgets.QWidget):
         editor = self.tabs.currentWidget()
         if isinstance(editor, PanelEditor):
             editor.refresh_node_now_labels()
+            editor.fill_limits()          # #3a: the Limits box is a LIVE view of the plot's x-window
         self._update_summary()
 
     def refresh_once(self) -> None:
@@ -7602,6 +7576,7 @@ class TaskConsole(QtWidgets.QWidget):
         editor = self.tabs.currentWidget()
         if isinstance(editor, PanelEditor):
             editor.refresh_node_now_labels()
+            editor.fill_limits()          # #3a: the Limits box is a LIVE view of the plot's x-window
         self._update_summary()
 
     def _update_summary(self) -> None:

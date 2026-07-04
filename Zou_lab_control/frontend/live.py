@@ -783,7 +783,49 @@ class BaseLivePlot:
                 self.apply_relim_now()
                 self.draw()
             return True
+        # The x-window pin + general curve fit are ordinary display knobs on EVERY kind (the Edit tab's
+        # Apply-limits / Fit): landed here so a flat panel and a grid go through the identical
+        # ``card._set_param -> apply_param`` entry (a grid's :class:`GridPlot` override lands them on its
+        # cells instead).  The fit runs through the ONE :func:`apply_fit_to_figure` primitive the grid also
+        # uses, tracked so a re-fit removes the previous curve -- no per-surface special case.
+        if str(key) == "view_xlim":
+            self._view_xlim = None if value in (None, "", "none") else (float(value[0]), float(value[1]))
+            ax = getattr(self, "ax", None)
+            if ax is not None and self._view_xlim is not None:
+                ax.set_xlim(*self._view_xlim)
+                self.draw()
+            return True
+        if str(key) in ("fit_model", "fit_cmd"):
+            if str(key) == "fit_model":
+                self._fit_model = str(value or "none")
+            else:
+                self._fit_cmd = str(value or "")
+            self._reapply_general_fit()
+            self.draw()
+            return True
         return False
+
+    def _reapply_general_fit(self) -> None:
+        """Remove this plot's previous general-fit curve and, if a ``_fit_model`` is set, run it on
+        ``self`` via the ONE :func:`apply_fit_to_figure` primitive -- the flat-panel counterpart of the
+        grid's :meth:`GridPlot._refit_axes`, so both surfaces fit through identical code.  Tracks the drawn
+        artists so the next re-fit removes exactly one curve."""
+        for art in getattr(self, "_general_fit_artists", []):
+            try:
+                art.remove()
+            except Exception:
+                pass
+        self._general_fit_artists = []
+        model = getattr(self, "_fit_model", "none")
+        ax = getattr(self, "ax", None)
+        if not model or model == "none" or ax is None:
+            return
+        # A flat panel is a FULL plot, so its fit shows the curve + the formula/parameter annotation
+        # (is_display defaults True in apply_fit_to_figure); track EVERY child the fit added (curve + text)
+        # so a re-fit removes it all -- the flat counterpart of the grid's :meth:`GridPlot._refit_axes`.
+        before = set(id(c) for c in ax.get_children())
+        apply_fit_to_figure(self.to_data_figure(), model, getattr(self, "_fit_cmd", ""))
+        self._general_fit_artists = [c for c in ax.get_children() if id(c) not in before]
 
     def after_plot(self):
         """Create and attach a DataFigure handle."""
@@ -1192,10 +1234,11 @@ class Live2DDis(BaseLivePlot):
         # SAME relim_mode via the shared _mode_target: "normal" anchors the colorbar
         # at 0 (counts read against zero), "tight" brackets the data.  (Previously
         # this was hard-coded tight, so the Setting's normal/tight did nothing.)
-        # A grid-supplied ``clim`` seed (the enlarged-cell case, #2) pins the INITIAL scale to the
-        # thumbnail's SHARED pooled range EXACTLY (like the thumbnail's ``thumb_lims``, no _mode_target
-        # padding), so double-click reads on the same scale; ``fixed`` still honours the pinned lo/hi.
-        if self._seed_clim is not None and self.relim_mode != "fixed":
+        # A grid-supplied ``clim`` seed (the enlarged-cell case, #2) pins the INITIAL scale to EXACTLY the
+        # range the thumbnail is showing NOW -- the cell hands its ``thumb_lims`` value (fixed-aware) as the
+        # seed, so the enlarged cell reads on the SAME scale in EVERY relim mode (this dropped the old
+        # ``relim_mode != "fixed"`` guard that made a fixed 2d grid recompute a different scale on focus).
+        if self._seed_clim is not None:
             self.ylim_min, self.ylim_max = self._seed_clim
         else:
             self.ylim_min, self.ylim_max = self._mode_target(y_min, y_max)
@@ -1705,7 +1748,12 @@ def _site_grid_geometry(size: str, recommended: str) -> tuple[tuple[int, int], i
     # budget is the title's own height (~= its point size, probe-pinned) + a few px of air.
     # Tighter clips the title into the cell above; looser only steals area from the cells.
     px_per_pt = DESIGN_DPI / 72.0
-    row_gap = round(small_fontsize() * font_scale * px_per_pt) + 4
+    # The cell TITLE font is now FIXED at ``small_fontsize()`` (a settable interface, no longer halved on a
+    # squeezed grid -- #5), so the corridor that must clear it is sized for that FIXED height at EVERY grid
+    # size (not scaled by ``font_scale``, which would clip the now-larger title on a squeezed grid into the
+    # cell above).  The corridor's job is "fit exactly one title line + a few px of air", and the title
+    # line is one constant height.
+    row_gap = round(small_fontsize() * px_per_pt) + 4
     # the column corridor carries NO text at all (the centered-single-tick policy keeps x labels
     # inside their cell -- zero spill, probe-verified -- and y labels live in the L margin): it
     # is a pure visual separator.
@@ -3326,10 +3374,10 @@ def facet_cell_labels(facet, n_cells, *, points_shape=(), coords=None, param_nam
     spec = normalize_facet(facet)
     n = int(n_cells)
     if spec is None or spec[0] == "dim":
-        return [f"s{k}" for k in range(n)]
+        return [f"site {k}" for k in range(n)]
     group, index = spec
     if group == "repeat":
-        return [f"rep {k}" for k in range(n)]
+        return [f"repeat {k}" for k in range(n)]
     name = str(param_names[index]) if param_names is not None and index < len(param_names) else ""
     out = []
     for k in range(n):
@@ -3505,6 +3553,18 @@ class GridCell:
     labels_per_cell: "Sequence[str] | None" = None
     title_template: str = "{id}"
     title_size: float = 0.0
+    #: The three EDIT-TAB display knobs that were historically a dead-end DataFigure mutation on a
+    #: throwaway snapshot (so they never reached the live grid, never persisted, never seeded the
+    #: focus view, and crashed the save).  They are now ORDINARY stored display params, landed on the
+    #: cell here via :meth:`consume_param` and RE-APPLIED to every cell (and the enlarged cell) by the
+    #: grid's single :meth:`GridPlot._apply_view_knobs` after each draw -- so an x-window pin and a
+    #: curve fit STICK across live ticks, fan to every subplot, match the double-click focus, and save:
+    #:  * ``view_xlim`` = a pinned (lo, hi) x-window (``None`` = autoscale), applied to every cell's axes;
+    #:  * ``fit_model`` = a :data:`data_figure` fit method name ('gaussian'/'decay'/...) or ``"none"``;
+    #:  * ``fit_cmd`` = the optional argument string for that fit call (``p0=...`` etc).
+    view_xlim: "tuple[float, float] | None" = None
+    fit_model: str = "none"
+    fit_cmd: str = ""
 
     def thumb_lims(self, auto_lo: float, auto_hi: float) -> tuple[float, float]:
         """The thumbnail's dependent-axis range: the operator's pinned lo/hi in ``fixed`` mode, else the
@@ -3527,12 +3587,15 @@ class GridCell:
         labels = self.labels_per_cell
         if labels is not None and k < len(labels):
             return str(labels[k])
-        return f"s{k}"
+        return f"site {k}"
 
     def _cell_popt(self, k: int):
-        """The cell's fitted parameters for the title template's ``{popt}`` -- empty on families / cells
-        with no fit (a template referencing ``popt`` then degrades to the identifier)."""
-        return ()
+        """The cell's fitted parameters for the title template's ``{popt}`` -- the general Edit-tab fit's
+        popt (populated by :meth:`GridPlot._apply_view_knobs` when a ``fit_model`` is active), so ANY cell
+        kind's title can reference ``{popt[i]}``; empty until the cell has been fitted (a template
+        referencing ``popt`` then degrades to the identifier).  A family with its OWN fit (a hist cell's
+        bimodal) overrides this to prefer that when no general fit is active."""
+        return getattr(self, "_general_popt_store", {}).get(int(k), ())
 
     def _cell_fid(self, k: int) -> float:
         """The cell's readout fidelity for the title context's ``{fid}`` -- NaN when none."""
@@ -3552,11 +3615,14 @@ class GridCell:
             return ident
 
     def title_size_pt(self) -> float:
-        """The cell title point size: the operator's :data:`title_size` when set (>0), else the fixed
-        two-tier default ``small_fontsize() * font_scale`` -- never a raw literal, so the size is a
-        settable INTERFACE with a single-source default (#5)."""
+        """The cell title point size: the operator's :data:`title_size` when set (>0), else a FIXED
+        default -- :func:`small_fontsize` (the below-optimal-size small tier), the SAME size at every grid
+        size (#5).  Deliberately NOT scaled by ``font_scale`` (which still halves the in-plot TICK text on
+        a squeezed grid): a per-cell identifier that shrank with the grid became unreadable and made
+        equal-content grids look different, so the title font is one constant, a settable INTERFACE via
+        ``title_size`` with a single-source default."""
         size = float(self.title_size or 0.0)
-        return size if size > 0 else small_fontsize() * self.font_scale
+        return size if size > 0 else small_fontsize()
 
     def consume_param(self, key: str, value) -> bool:
         """Land a DISPLAY knob on this cell family's state and return True when the THUMBNAILS are now
@@ -3576,6 +3642,27 @@ class GridCell:
             if self.title_size == v:
                 return False
             self.title_size = v
+            return True
+        # The three EDIT-TAB view knobs, landed as ORDINARY per-cell state so the grid's
+        # ``_apply_view_knobs`` re-applies them to every cell (and the enlarged cell) each draw -- so a
+        # pinned x-window and a curve fit STICK across live ticks and match the focus view.
+        if str(key) == "view_xlim":
+            new = None if value in (None, "", "none") else (float(value[0]), float(value[1]))
+            if self.view_xlim == new:
+                return False
+            self.view_xlim = new
+            return True
+        if str(key) == "fit_model":
+            new = str(value or "none")
+            if self.fit_model == new:
+                return False
+            self.fit_model = new
+            return True
+        if str(key) == "fit_cmd":
+            new = str(value or "")
+            if self.fit_cmd == new:
+                return False
+            self.fit_cmd = new
             return True
         return False
 
@@ -3720,8 +3807,12 @@ class HistogramCell(GridCell):
         return float(fids[k]) if fids is not None and k < len(fids) and np.isfinite(fids[k]) else float("nan")
 
     def _cell_popt(self, k: int):
-        """The cell's last fit popt (bimodal 6-tuple or single 3-tuple) for the title ``{popt}`` context;
-        empty until the cell has been fitted (a ``{popt}`` template then falls back to the identifier)."""
+        """The cell's fit popt for the title ``{popt}`` context: the general Edit-tab fit's popt when a
+        ``fit_model`` is active (via the base store), else this hist cell's own bimodal fit popt (6-tuple
+        bimodal / 3-tuple single); empty until fitted (a ``{popt}`` template then falls back to the
+        identifier)."""
+        if self.fit_model != "none":
+            return super()._cell_popt(k)
         return self._cell_popt_store.get(int(k), ())
 
     def _apply_fit_lines(self, ax, k: int, counts) -> None:
@@ -4058,21 +4149,59 @@ class ImageCell(GridCell):
             "data_x": data_x,
             "data_y": im.ravel(),
             "cmap": cmap,
-            "clim": (float(self.vmin), float(self.vmax)),
+            # Seed the enlarged cell with the range the THUMBNAIL shows now (``thumb_lims``: the operator's
+            # pinned lo/hi in fixed mode, else the shared auto range) so double-click reads on the SAME
+            # colour scale in every relim mode (#2) -- the same fixed-aware source the thumbnail's draw uses.
+            "clim": self.thumb_lims(float(self.vmin), float(self.vmax)),
             "labels": (self.labels[0], self.labels[1] if len(self.labels) > 1 else "y (px)", "weight"),
             "title": self.cell_title(k),
         }
 
 
+def apply_fit_to_figure(df, model: str, cmd: str = "", *, is_display: bool = True):
+    """Run a :class:`DataFigure` fit ``model`` (a data_figure method name -- ``"gaussian"`` / ``"decay"`` /
+    ``"lorentzian"`` / ... ) on ``df`` with the optional ``cmd`` argument string (``"p0=..."`` etc), returning
+    its ``FitResult`` (or ``None``).  ``model`` of ``"none"`` / ``""`` just CLEARS any fit ``df`` drew.  The
+    ONE fit-application primitive both the console Edit tab and the grid's per-cell general fit call, so a
+    grid subplot and a flat panel fit through identical code (the same trusted-local-tool ``eval`` of the
+    typed args the operator's fit box holds).  ``is_display`` picks the render depth: ``True`` draws the fit
+    CURVE + the formula/parameter annotation (a full standalone plot / a focused cell), ``False`` draws the
+    CURVE ONLY (a tiny grid THUMBNAIL, where the equation text would overflow the cell) -- the SAME curve
+    either way, so the popt returned for the title is identical.  An explicit ``cmd`` may override it."""
+    if getattr(df, "fit", None) is not None:
+        try:
+            df.clear()
+        except Exception:
+            pass
+    if not model or str(model) == "none":
+        return None
+    call = f"_df.{model}({cmd})" if cmd else f"_df.{model}(is_display={bool(is_display)})"
+    try:
+        result, _ = eval(call, {"_df": df, "np": np})   # noqa: S307 - local experiment tool (typed fit args)
+    except Exception:
+        return None
+    return result
+
+
 class _GridData:
     """Composite ``DataFigure`` handle for a :class:`GridPlot`: one per-cell
     :class:`DataFigure` (each panel fits with the SAME stack as any plot) + a
-    whole-grid ``save``."""
+    whole-grid ``save`` + the same ``bind_source`` provenance stamp a flat DataFigure carries."""
 
     def __init__(self, grid: "GridPlot"):
         self.grid = grid
         self.fig = grid.fig
         self.cells = [grid.cell_renderer.data_figure(grid.fig, ax, k) for k, ax in enumerate(grid.site_axes)]
+        self._figure_source: dict | None = None
+
+    def bind_source(self, hub, node, *, inputs, resolve_node=None, session=None):
+        """Stamp WHERE this grid's data came from so :meth:`save` writes the RICH npz -- the grid
+        counterpart of :meth:`DataFigure.bind_source`, so a console panel Save on a GRID captures the same
+        ``signals`` / ``provenance`` blocks a flat panel Save does (before this a grid Save crashed on the
+        missing method).  Returns ``self`` for chaining."""
+        self._figure_source = {"hub": hub, "node": node, "inputs": list(inputs or []),
+                               "resolve_node": resolve_node, "session": session}
+        return self
 
     def cell(self, k: int):
         return self.cells[k]
@@ -4144,10 +4273,44 @@ class _GridData:
         if recipe is not None:
             info["kind"] = "grid"
             info["figure_recipe"] = recipe
+        # The RICH signals / provenance blocks (bound via :meth:`bind_source`) -- captured through the SAME
+        # frontend-neutral core a flat DataFigure.save uses, so a grid panel Save writes the same rich npz
+        # (the Flow tab has a tree, the signals are recorded); never raises the save.
+        info.update(self._rich_capture())
         if extra_info is not None:    # mirror DataFigure.save: caller metadata WINS over the auto keys
             info.update(dict(extra_info))
         np.savez(data_path, data_x=data_x, data_y=data_y, info=info)
         return {"figure": image_path, "data": data_path}
+
+    def _rich_capture(self) -> dict:
+        """The ``signals`` + ``provenance`` blocks a rich save folds into ``info`` -- the grid counterpart
+        of :meth:`DataFigure._rich_capture`, through the ONE frontend-neutral core, so a notebook grid
+        ``.save()`` and a console panel Save write byte-identical rich npz.  Never raises."""
+        src = self._figure_source or {}
+        from Zou_lab_control.neutral_atom.operations.figure_capture import (
+            capture_figure_provenance, capture_figure_signals, capture_flow_graph, raw_data_flow_graph)
+        out: dict = {}
+        try:
+            signals = capture_figure_signals(src.get("hub"), src.get("node"), src.get("inputs"))
+        except Exception:
+            signals = {}
+        if signals:
+            out["signals"] = signals
+        try:
+            prov = capture_figure_provenance(src.get("node"), resolve_node=src.get("resolve_node"),
+                                              session=src.get("session"))
+        except Exception:
+            prov = {}
+        try:
+            flow = capture_flow_graph(src.get("node"), resolve_node=src.get("resolve_node")) \
+                if src.get("node") is not None else raw_data_flow_graph()
+        except Exception:
+            flow = None
+        if flow:
+            prov = dict(prov or {}); prov["flow_graph"] = flow
+        if prov:
+            out["provenance"] = prov
+        return out
 
 
 class GridPlot(BaseLivePlot):
@@ -4198,6 +4361,10 @@ class GridPlot(BaseLivePlot):
         # plot-kind figure and re-drawn onto the thumbnails.  Empty = the per-cell defaults.  A saved grid
         # records these (part C) so a reopen restores them.
         self._display_params: dict[str, Any] = {}
+        # The general-fit curve artists ``_apply_view_knobs`` drew, keyed by cell index (and "focus" for the
+        # enlarged cell) -- tracked so each re-fit REMOVES the previous curve first, keeping exactly one
+        # fit line per surface across live ticks (the general-fit counterpart of a hist cell's _fit_lines).
+        self._general_fit_artists: dict = {}
 
     def _create_axes(self):
         # The grid FILLS a total data region == panel_plot_spec(size).data_px (the SAME data box every
@@ -4302,6 +4469,10 @@ class GridPlot(BaseLivePlot):
                     self._redraw_thumbnail(k, ax)        # artist structure changed -> one full redraw
                 else:
                     self._style_cell_ticks(ax, k)        # the centre tick tracks the moved lims
+        # Re-assert the stored VIEW knobs after the per-tick data move (which re-autoscaled x + wiped the
+        # fit) so a pinned x-window and a curve fit STICK live -- the SAME method the Setting/Edit apply
+        # path calls, passed the same focus so the host's enlarged cell is one path with the thumbnails.
+        self._apply_view_knobs(focus=focus)
         if draw:
             self.draw()
 
@@ -4412,8 +4583,26 @@ class GridPlot(BaseLivePlot):
         data = dict(self.cell_renderer.focus_data(int(k), display_params=self._display_params))
         data_x = data.pop("data_x")
         data_y = data.pop("data_y", None)
-        return panel_plot(data_x, data_y, kind=pk.key, size=size, interactions=interactions,
-                          fig=fig, **view, **data)
+        p = panel_plot(data_x, data_y, kind=pk.key, size=size, interactions=interactions,
+                       fig=fig, **view, **data)
+        # Seed the enlarged cell with the SAME stored VIEW knobs the thumbnails carry -- the pinned
+        # x-window + general fit -- so a double-click focus shows the identical x-range and fit curve (the
+        # #2 alignment), applied here through the SAME primitives (:meth:`_refit_axes` tracks the fit under
+        # the "focus" key so the live re-fit removes it cleanly, never an orphan curve).  Both focus paths
+        # (this grid's :meth:`focus` and the console host's builder) run through here, so neither special-
+        # cases it.
+        cell = self.cell_renderer
+        ax = getattr(p, "ax", None)
+        if ax is not None:
+            if cell.view_xlim is not None:
+                ax.set_xlim(float(cell.view_xlim[0]), float(cell.view_xlim[1]))
+            # is_display=True: the enlarged cell is a FULL standalone plot, so it shows the fit equation +
+            # parameters (unlike the tiny thumbnail, which draws the curve only).
+            popt = self._refit_axes(ax, p.to_data_figure(), cell.fit_model, cell.fit_cmd,
+                                    key="focus", is_display=True)
+            if popt:
+                cell._general_popt_store = {**getattr(cell, "_general_popt_store", {}), int(k): popt}
+        return p
 
     def focus(self, k: int) -> None:
         """Enlarge cell ``k`` to a FULL standalone plot-kind figure ON THE GRID'S OWN CANVAS (part B) -- call
@@ -4575,8 +4764,79 @@ class GridPlot(BaseLivePlot):
         # next build_focus_plotter, so nothing is lost.
         if self._focused is not None and self._focus_plotter is not None:
             self._focus_plotter.apply_param(str(key), value)
+        # After the store + thumbnail/focus redraw, re-assert the VIEW knobs (pinned x-window + general
+        # curve fit) on whatever is drawn now -- the ONE method both the thumbnails and the enlarged cell
+        # go through, so an Apply-limits / Fit from the Edit tab reaches every subplot AND the focus view
+        # through the identical path (never a per-surface special case).
+        self._apply_view_knobs()
         self.draw()
         return True
+
+    def _apply_view_knobs(self, focus=None) -> None:
+        """Re-apply the grid's stored VIEW knobs -- the pinned x-window (:attr:`GridCell.view_xlim`) and the
+        general curve fit (:attr:`GridCell.fit_model` / :attr:`GridCell.fit_cmd`) -- to whatever surface is
+        drawn NOW: the enlarged cell when zoomed (this grid's own focus, or the console HOST's
+        ``focus=(plotter, k)``), else every thumbnail.  Called after EVERY thumbnail redraw, live tick and
+        focus build, so a pinned x-window and a fit STICK across the per-tick autoscale + fan to every cell
+        + match the double-click focus BY CONSTRUCTION (the same knobs, the same :func:`apply_fit_to_figure`
+        primitive, one code path -- this is the fix for the old two-mechanism drift where the Edit tab
+        mutated a throwaway snapshot the live grid never saw).  The fit curve is tracked per surface
+        (:meth:`_refit_axes`) so each re-fit removes the previous one -- the SAME focus resolution
+        :meth:`update_cells` uses, so the grid's own and the host's enlarged cell are one path."""
+        cell = self.cell_renderer
+        vx = cell.view_xlim
+        model, cmd = cell.fit_model, cell.fit_cmd
+        # Fast path: nothing pinned, no fit, no leftover fit artists to clear -> no per-tick work (this
+        # method runs every live tick, so it must cost nothing when the grid carries no view knobs -- never
+        # build an N-cell _GridData for a no-op).
+        if vx is None and (not model or model == "none") and not self._general_fit_artists:
+            return
+        store: dict = {}
+        fp, fk = ((self._focus_plotter, self._focused) if self._focused is not None
+                  else (focus if focus else (None, None)))
+        if fp is not None:
+            ax = getattr(fp, "ax", None)
+            if ax is not None:
+                if vx is not None:
+                    ax.set_xlim(float(vx[0]), float(vx[1]))
+                popt = self._refit_axes(ax, fp.to_data_figure(), model, cmd, key="focus", is_display=True)
+                if popt:
+                    store[int(fk)] = popt
+        else:
+            df = self.to_data_figure()
+            for k, (ax, cdf) in enumerate(zip(self.site_axes, df.cells)):
+                if vx is not None:
+                    ax.set_xlim(float(vx[0]), float(vx[1]))
+                popt = self._refit_axes(ax, cdf, model, cmd, key=k)
+                if popt:
+                    store[k] = popt
+            # popt drives the title's ``{popt}`` context -- refresh titles so a template referencing it
+            # shows the fresh values (a no-op relative to the identifier when no template uses popt).
+            if model != "none":
+                for k, ax in enumerate(self.site_axes):
+                    apply_title(ax, cell.cell_title(k), size=cell.title_size_pt(), pad=1.5)
+        cell._general_popt_store = store
+
+    def _refit_axes(self, ax, df, model: str, cmd: str, *, key, is_display: bool = False) -> tuple:
+        """Remove ``key``'s previously-drawn general-fit artists, then (if ``model`` is set) run it on ``df``
+        via the ONE :func:`apply_fit_to_figure` primitive and track the new artists so the next re-fit can
+        remove them -- keeping exactly one general-fit curve per cell across live ticks.  ``is_display``
+        chooses curve-only (a THUMBNAIL, default) vs curve+annotation (the enlarged cell).  Tracks the FULL
+        set of children the fit added (the curve Line2D AND any formula/param Text), so removal is complete
+        and the enlarged cell's annotation never stacks up across ticks.  Returns the fit popt (empty if
+        none / did not converge)."""
+        for art in self._general_fit_artists.pop(key, []):
+            try:
+                art.remove()
+            except Exception:
+                pass                       # already gone (an axes-clear redraw wiped it) -- fine
+        if not model or str(model) == "none":
+            return ()
+        before = set(id(c) for c in ax.get_children())
+        res = apply_fit_to_figure(df, model, cmd, is_display=is_display)
+        self._general_fit_artists[key] = [c for c in ax.get_children() if id(c) not in before]
+        popt = getattr(res, "popt", None)
+        return tuple(popt) if popt is not None else ()
 
     def _redraw_thumbnail(self, k: int, ax) -> None:
         """Fully re-draw ONE cell thumbnail (axes cleared) -- the fallback when an in-place move cannot
