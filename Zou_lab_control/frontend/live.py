@@ -638,6 +638,7 @@ class BaseLivePlot:
         self.repeat_cur = self.repeat_cur if repeat_cur is None else int(repeat_cur)
         self.update_core()
         self._install_state()
+        self._reapply_view_knobs()   # stored x-window + general fit re-applied each tick, so an Edit pin/fit sticks
         if draw:
             self.draw()
         return self
@@ -826,6 +827,22 @@ class BaseLivePlot:
         before = set(id(c) for c in ax.get_children())
         apply_fit_to_figure(self.to_data_figure(), model, getattr(self, "_fit_cmd", ""))
         self._general_fit_artists = [c for c in ax.get_children() if id(c) not in before]
+
+    def _reapply_view_knobs(self) -> None:
+        """Re-apply this plot's stored VIEW knobs after each live tick -- the general curve fit (re-fit to the
+        fresh data) then the pinned x-window (``_view_xlim``) -- so an Edit-tab Fit / Apply-limits STICKS
+        instead of being wiped by the tick's re-autoscale.  This is the flat-panel counterpart of a grid's
+        :meth:`GridPlot._apply_view_knobs` (which re-applies the SAME knobs per cell inside
+        :meth:`update_cells`): the ONE physical rule -- a display knob only persists if ``draw`` re-applies it
+        every tick -- now holds on both surfaces.  A no-op unless a knob is set, so a plain plot and a grid
+        (which stores its knobs per cell, never here) pay nothing."""
+        ax = getattr(self, "ax", None)
+        if ax is None:
+            return
+        if getattr(self, "_fit_model", "none") not in (None, "none", ""):
+            self._reapply_general_fit()
+        if getattr(self, "_view_xlim", None) is not None:
+            ax.set_xlim(*self._view_xlim)
 
     def after_plot(self):
         """Create and attach a DataFigure handle."""
