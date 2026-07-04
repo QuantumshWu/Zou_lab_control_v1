@@ -1082,19 +1082,17 @@ PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
 }
 
 
-# Grid-ONLY per-cell title knobs (#5): a grid panel ADDS these to its sub_plot_kind's ``PANEL_PARAMS`` so
-# the operator can edit the per-cell title TEMPLATE + fix its font SIZE from the Edit tab.  ``display=False``
-# => the Edit tab (a functional knob), not the lightweight Setting popup.  They flow through the SAME
-# ``store_display_param`` -> ``GridCell.consume_param`` path every grid display knob uses, and round-trip
-# through the saved view -- so ``{id}`` (the facet-aware identifier), ``{popt[i]}`` (a fit param), ``{fid}``
-# (readout fidelity) are all reachable, and the fixed title size is a real interface (0 = auto default).
+# Grid-ONLY per-cell title knob (#5): a grid panel ADDS this to its sub_plot_kind's ``PANEL_PARAMS`` so the
+# operator can edit the per-cell title TEMPLATE from the Edit tab.  ``display=False`` => the Edit tab (a
+# functional knob), not the lightweight Setting popup.  It flows through the SAME ``store_display_param`` ->
+# ``GridCell.consume_param`` path every grid display knob uses, and round-trips through the saved view -- so
+# ``{id}`` (the facet-aware identifier), ``{popt[i]}`` (a fit param), ``{fid}`` (readout fidelity) are all
+# reachable.  (There is no font-SIZE knob: the cell title auto-tracks the xy tick-label size -- _cell_title_pt.)
 GRID_TITLE_PARAMS: tuple[ParamDecl, ...] = (
     ParamDecl(key="title_template", label="cell title", kind="text", default="{id}", display=False,
               tooltip="Per-cell title template.  {id}=facet identifier (site / repeat / scan value); "
                       "{k}=cell index; {popt[i]}=a fit parameter; {fid}=readout fidelity.  "
                       "e.g. '{id}  F={popt[2]:.2f}'"),
-    ParamDecl(key="title_size", label="title size", kind="int", default=0, lo=0, hi=40, display=False,
-              tooltip="Cell-title font size in points; 0 = the automatic two-tier default"),
 )
 
 

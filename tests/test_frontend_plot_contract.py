@@ -186,8 +186,9 @@ def test_grid_cell_title_is_facet_aware_and_templated_from_one_source():
     """#5: a grid cell's title comes from the ONE :meth:`GridCell.cell_title` hook (no per-family
     ``f"s{k}"`` literal), with part 1 = the facet-aware identifier from the ONE :func:`facet_cell_labels`
     source and part 2 = a user ``title_template`` that can reference the fit ``{popt}``; the cell-title
-    point size is a settable interface with a single-source default."""
+    point size is NOT a knob -- it auto-tracks the xy tick-label size from a single source."""
     from Zou_lab_control.frontend.live import GridCell, HistogramCell, facet_cell_labels, grid
+    from Zou_lab_control.frontend.style import tick_fontsize
 
     # (1) facet_cell_labels is the ONE identifier source, facet-aware per group -- each facet dimension
     #     reads DIFFERENTLY (#5): a site/dim grid -> "site k", a repeat grid -> "repeat k", a scan grid ->
@@ -214,10 +215,9 @@ def test_grid_cell_title_is_facet_aware_and_templated_from_one_source():
         cell.consume_param("title_template", "{id} n={k}")
         assert cell.cell_title(2) == "repeat 2 n=2"
         assert cell._cell_popt(0)                                   # popt exposed for a {popt} template
-        # (4) title_size is a settable interface; 0 -> the single-source default (>0), never a literal.
-        assert cell.consume_param("title_size", 8.5) and cell.title_size_pt() == 8.5
-        cell.consume_param("title_size", 0)
-        assert cell.title_size_pt() > 0
+        # (4) the title font size is NOT a knob -- it auto-tracks the xy tick-label size (never a literal).
+        assert cell.consume_param("title_size", 8.5) is False       # a removed knob is not consumed
+        assert cell.title_size_pt() == tick_fontsize() * cell.font_scale
     finally:
         plt.close(g.fig)
 

@@ -229,9 +229,10 @@ def test_grid_panel_exposes_editable_cell_title_template_and_size():
         GRID_TITLE_PARAMS, PanelConfig, TaskConsole, _panel_display_decls, default_console_state)
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
-    # grid folds the title knobs into its enumeration; a flat panel does NOT.
+    # grid folds the title-template knob into its enumeration; a flat panel does NOT.  (There is no
+    # title-SIZE knob: the cell title auto-tracks the xy tick-label size.)
     grid_keys = [d.key for d in _panel_display_decls("grid", "hist")]
-    assert grid_keys[-2:] == [d.key for d in GRID_TITLE_PARAMS] == ["title_template", "title_size"]
+    assert grid_keys[-1:] == [d.key for d in GRID_TITLE_PARAMS] == ["title_template"]
     assert "title_template" not in [d.key for d in _panel_display_decls("hist", "hist")]
 
     ensure_qt_app()
@@ -257,11 +258,9 @@ def test_grid_panel_exposes_editable_cell_title_template_and_size():
         card._set_param("title_template", "{id}  n={k}"); card._run_pending_rebuild(); con._tick()
         assert [card.plotter.cell_renderer.cell_title(k) for k in range(4)] == \
             ["repeat 0  n=0", "repeat 1  n=1", "repeat 2  n=2", "repeat 3  n=3"]
-        card._set_param("title_size", 7); card._run_pending_rebuild()
-        assert card.plotter.cell_renderer.title_size_pt() == 7.0
-        # both round-trip through the saved view.
+        # the template round-trips through the saved view (the title SIZE is not a knob -- auto-tracks ticks).
         view = ed._save_view_state()
-        assert view.get("title_template") == "{id}  n={k}" and view.get("title_size") == 7
+        assert view.get("title_template") == "{id}  n={k}"
     finally:
         con.shutdown()
         exp.close()

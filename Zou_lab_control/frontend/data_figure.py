@@ -519,19 +519,17 @@ class DataFigure:
                 self.fit[0].set_data(self.data_x[:, 0], yfit)
         else:
             if self.fit is None:
-                # The CENTRE is the meaningful result (where the spot sits): pinpoint it with a small
-                # cross, not a filled blob, and draw the fitted-radius circle THIN + translucent so the
-                # image reads THROUGH it -- a wide fit radius must not paint over the whole frame ("the
-                # centre fit is so big I can't see anything").
-                self.fit = [ax.scatter(popt[-2], popt[-1], color=PALETTE["fit_right"],
-                                       s=40, marker="+", linewidths=1.2)]
+                # SAME style as always -- a centre DOT + the fitted-radius CIRCLE (that pairing is fixed).
+                # Only the SIZES shrink so the overlay fits the view instead of blotting it out ("the centre
+                # fit is so big I can't see anything"): a smaller dot + a thinner circle line.
+                self.fit = [ax.scatter(popt[-2], popt[-1], color=PALETTE["fit_right"], s=25)]
                 circle = matplotlib.patches.Circle(
                     (popt[-2], popt[-1]),
                     radius=abs(popt[-3]),
                     edgecolor=PALETTE["fit_right"],
                     facecolor="none",
                     linewidth=1.0,
-                    alpha=0.35,
+                    alpha=0.5,
                 )
                 self.fit.append(circle)
                 ax.add_patch(circle)

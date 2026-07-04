@@ -3574,12 +3574,9 @@ class GridCell:
     #:    is set falls back to the site tag.
     #:  * ``title_template`` = part 2, the user template rendered with a ``{id, k, popt, fid}`` context so a
     #:    user can add e.g. ``"{id}  F={popt[2]:.2f}"``; default ``"{id}"`` shows just the identifier.
-    #:  * ``title_size`` = the cell-title point size as a settable INTERFACE; ``0`` = derive the default from
-    #:    :func:`_cell_title_pt` (``tick_fontsize() * font_scale`` -- the SAME size the xy tick labels use,
-    #:    so the title tracks them and shrinks on a squeezed grid), never a raw literal.
+    #: The title's font SIZE is NOT a knob -- it auto-tracks the xy tick-label size (:func:`_cell_title_pt`).
     labels_per_cell: "Sequence[str] | None" = None
     title_template: str = "{id}"
-    title_size: float = 0.0
     #: The three EDIT-TAB display knobs that were historically a dead-end DataFigure mutation on a
     #: throwaway snapshot (so they never reached the live grid, never persisted, never seeded the
     #: focus view, and crashed the save).  They are now ORDINARY stored display params, landed on the
@@ -3649,33 +3646,26 @@ class GridCell:
             return ident
 
     def title_size_pt(self) -> float:
-        """The cell title point size: the operator's :data:`title_size` when set (>0), else the SAME size
-        the cell's xy TICK labels render at -- :func:`_cell_title_pt` (:func:`tick_fontsize` * ``font_scale``).
-        So the title tracks the smallest xy-label size and, on a grid squeezed below its recommended size,
-        shrinks WITH the tick labels (``font_scale`` 0.5) instead of towering over them at the big unscaled
-        size.  A settable INTERFACE via ``title_size`` with a single-source default (:func:`_cell_title_pt`,
-        shared with the row corridor so title and corridor never drift)."""
-        size = float(self.title_size or 0.0)
-        return size if size > 0 else _cell_title_pt(self.font_scale)
+        """The cell title point size: the SAME size the cell's xy TICK labels render at --
+        :func:`_cell_title_pt` (:func:`tick_fontsize` * ``font_scale``).  So the title tracks the xy-label
+        size and, on a grid squeezed below its recommended size, shrinks WITH the tick labels
+        (``font_scale`` 0.5) instead of towering over them at the big unscaled size.  Not a settable knob
+        (a manual override read as noise); one single-source rule shared with the row corridor so title and
+        corridor never drift."""
+        return _cell_title_pt(self.font_scale)
 
     def consume_param(self, key: str, value) -> bool:
         """Land a DISPLAY knob on this cell family's state and return True when the THUMBNAILS are now
         stale.  The single param fan-out: ``GridPlot.store_display_param`` owns only the generic relim
-        family and hands every other key HERE.  The BASE owns the generic per-cell TITLE knobs
-        (``title_template`` / ``title_size``, common to every family); a family override handles its own
-        kind's ``PANEL_PARAMS`` (bins / fit / ylog / cmap) and CHAINS to ``super().consume_param`` for
-        anything it does not own, so a new generic knob is one branch HERE, never per family."""
+        family and hands every other key HERE.  The BASE owns the generic per-cell TITLE knob
+        (``title_template``, common to every family); a family override handles its own kind's
+        ``PANEL_PARAMS`` (bins / fit / ylog / cmap) and CHAINS to ``super().consume_param`` for anything it
+        does not own, so a new generic knob is one branch HERE, never per family."""
         if str(key) == "title_template":
             new = "{id}" if value in (None, "") else str(value)
             if self.title_template == new:
                 return False
             self.title_template = new
-            return True
-        if str(key) == "title_size":
-            v = 0.0 if str(value).strip() in ("", "None") else float(value)
-            if self.title_size == v:
-                return False
-            self.title_size = v
             return True
         # The three EDIT-TAB view knobs, landed as ORDINARY per-cell state so the grid's
         # ``_apply_view_knobs`` re-applies them to every cell (and the enlarged cell) each draw -- so a
@@ -3806,7 +3796,7 @@ class HistogramCell(GridCell):
                 return False
             self.ylog = bool(value)
             return True
-        return super().consume_param(key, value)   # generic title_template / title_size knobs
+        return super().consume_param(key, value)   # generic title_template knob
 
     def prepare(self) -> None:
         vals = self.values
@@ -4099,7 +4089,7 @@ class ImageCell(GridCell):
         if str(key) in ("cmap", "colorset"):
             self.cmap = str(value)
             return True
-        return super().consume_param(key, value)   # generic title_template / title_size knobs
+        return super().consume_param(key, value)   # generic title_template knob
 
     def prepare(self) -> None:
         finite = [im[np.isfinite(im)] for im in self.images if im.size]
@@ -4828,7 +4818,7 @@ class GridPlot(BaseLivePlot):
             # rebuilds the data artists.  Redrawing all N cells' DATA for a title-only edit recomputed every
             # histogram (35 cells ~190 ms) AND never re-titled (update_cell moves data, not text), so the
             # subplot-title edit was both slow AND ineffective -- the ONE targeted-refresh rule fixes both.
-            if str(key) in ("title_template", "title_size"):
+            if str(key) == "title_template":
                 self._retitle_cells()
             else:
                 self._redraw_thumbnails()
@@ -4942,8 +4932,8 @@ class GridPlot(BaseLivePlot):
 
     def _retitle_cells(self) -> None:
         """Re-apply every cell's title in place -- a cheap :func:`apply_title` (set_title) on the EXISTING
-        axes, no data redraw.  The minimal refresh for a ``title_template`` / ``title_size`` edit, so
-        changing the subplot title updates ONLY the title text and never recomputes the N cells' data
+        axes, no data redraw.  The minimal refresh for a ``title_template`` edit, so changing the subplot
+        title updates ONLY the title text and never recomputes the N cells' data
         artists (the "editing the subplot title is slow" fix); the ONE title mechanism the draw path uses."""
         cell = self.cell_renderer
         for k, ax in enumerate(self.site_axes):
