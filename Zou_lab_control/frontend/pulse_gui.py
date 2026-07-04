@@ -134,10 +134,13 @@ def _delay_eligible_position(channel_key: str) -> int | None:
 
 try:  # the eligible-channel count is a fixed hardware fact (board layout)
     from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
-        DEFAULT_FPGA_CHANNEL_COUNT as _FPGA_CH, delay_eligible_channel_count as _elig_count)
+        DEFAULT_FPGA_CHANNEL_COUNT as _FPGA_CH, delay_eligible_channel_count as _elig_count,
+        hardware_channel_names as _hw_channel_names)
     NUM_DELAY_CHANNELS = _elig_count(_FPGA_CH)
+    DEFAULT_CHANNEL_NAMES = _hw_channel_names(_FPGA_CH)  # ["ch00", ...] for the board's channel count
 except Exception:  # pragma: no cover - host tooling optional
     NUM_DELAY_CHANNELS = 10 ** 9   # unknown -> allow everything (host/RTL still gate)
+    DEFAULT_CHANNEL_NAMES = []      # unknown board -> caller must supply channels explicitly
 
 try:  # the configured event-FIFO depths (changes-in-flight caps); shown in delay tips
     from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
@@ -1661,7 +1664,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             if channels is None and experiment is not None and hasattr(experiment, "devices"):
                 sequencer = getattr(experiment.devices, "sequencer", sequencer)
                 channels = getattr(sequencer, "channels", channels)
-            channels = list(channels or [f"ch{index:02d}" for index in range(62)])
+            channels = list(channels or DEFAULT_CHANNEL_NAMES)
             labels = {str(k): str(v) for k, v in dict(channel_labels or {}).items()}
             state = PulseTableState(
                 channels=channels,

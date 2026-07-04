@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import cos, erf, radians, sin, sqrt
+from math import cos, radians, sin, sqrt
 from pathlib import Path
 from typing import Mapping, Sequence
 import time
@@ -13,6 +13,13 @@ import numpy as np
 from ..core.analysis import (
     finite_float, grid_shape_tuple, nonnegative_float, point_tuple, positive_float, positive_int, probability)
 from Zou_lab_control._clock import DEFAULT_CLOCK_HZ
+# The device fabricates its release-recapture "truth" through the SAME error-function law the
+# analysis layer FITS (operations.temperature.release_recapture_survival), so editing the law in
+# ONE place keeps the sim and the fitter in agreement.  ``normal_cdf`` is the single source for that
+# CDF/erf kernel (Zou_lab_control/_readout_math.py, a dependency-free leaf like ``_clock``); the
+# physical constants K_B / RB87_MASS have their single source in operations.temperature and are
+# imported lazily where used (keeping devices->operations off the import graph, as elsewhere here).
+from Zou_lab_control._readout_math import normal_cdf
 from ..core.utils import site_index
 from .base import CameraDevice, SequencerDevice, TrapArrayDevice, snap_subarray
 from .camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS, count_trigger_pulses
@@ -21,14 +28,6 @@ from ..timing import (
     PulseTableState,
     probe_channel_set,
 )
-
-
-# Boltzmann constant, atomic mass unit, and the Rb87 mass (SI).  Used ONLY by the
-# virtual data source's release-recapture loss model (below); the analysis layer
-# never sees these -- it only receives the resulting camera frames.
-_K_B = 1.380649e-23
-_AMU = 1.66053906660e-27
-_RB87_MASS = 86.909180527 * _AMU
 
 
 DEFAULT_CHANNELS = (
@@ -200,7 +199,11 @@ class VirtualTrapArray(TrapArrayDevice):
     # curve over ~0..300 us: survival is ~1 near t_off=0 and falls smoothly through
     # ~0.5 around 75 us to a few % by 300 us (half-survival scale = r_c / sqrt(2) sigma_v).
     capture_radius_m: float = 6.0e-6
-    recapture_mass_kg: float = _RB87_MASS
+    # Recaptured-atom mass (kg).  ``None`` -> the Rb87 mass from the analysis layer's single source
+    # (operations.temperature.RB87_MASS), resolved in __post_init__ via a lazy import so a dataclass
+    # field default never re-types the physical constant AND devices->operations stays off the
+    # import graph (that top-level dependency would cycle -- see the module-level import note).
+    recapture_mass_kg: float | None = None
     seed: int | None = 7
     occupancy: np.ndarray | None = None
     rng: np.random.Generator = field(init=False, repr=False)
@@ -236,6 +239,9 @@ class VirtualTrapArray(TrapArrayDevice):
         self.probe_heating_K_per_s = nonnegative_float(self.probe_heating_K_per_s, "probe_heating_K_per_s")
         self.pgc_cool_tau_s = positive_float(self.pgc_cool_tau_s, "pgc_cool_tau_s")
         self.capture_radius_m = positive_float(self.capture_radius_m, "capture_radius_m")
+        if self.recapture_mass_kg is None:
+            from ..operations.temperature import RB87_MASS  # lazy: keep devices->operations off the import graph
+            self.recapture_mass_kg = RB87_MASS
         self.recapture_mass_kg = positive_float(self.recapture_mass_kg, "recapture_mass_kg")
         self.rng = np.random.default_rng(self.seed)
         if self.origin_px is None:
@@ -453,13 +459,22 @@ class VirtualTrapArray(TrapArrayDevice):
         using EACH atom's current temperature (a hotter atom is lost more readily).
 
         Mutates ``self.occupancy`` in place (the same atom loading is imaged again
-        afterward) and returns the new occupancy."""
+        afterward) and returns the new occupancy.
+
+        The per-axis recaptured fraction is the SAME error-function law the analysis layer FITS
+        (operations.temperature.release_recapture_survival): ``erf(arg)`` written through the shared
+        ``normal_cdf`` single source as ``2*Phi(arg) - 1`` with a sqrt(2)-scaled standard normal
+        (``normal_cdf(arg, 0, 1/sqrt2) == 0.5 (1 + erf(arg))``).  So this device fabricates its
+        "truth" through the identical kernel the fitter uses -- edit the law once, sim and fit agree."""
+        from ..operations.temperature import K_B  # lazy: keep devices->operations off the import graph
+
         t = float(t_off)
         if not np.isfinite(t) or t <= 0.0:
             return self.occupancy.copy()
-        sigma_v = np.sqrt(_K_B * np.maximum(self.temperature_K, 1e-12) / self.recapture_mass_kg)
+        sigma_v = np.sqrt(K_B * np.maximum(self.temperature_K, 1e-12) / self.recapture_mass_kg)
         arg = self.capture_radius_m / (sqrt(2.0) * sigma_v * t)
-        p_survive = np.array([erf(a) for a in arg], dtype=float) ** 3
+        p_axis = 2.0 * np.asarray(normal_cdf(arg, 0.0, 1.0 / sqrt(2.0))) - 1.0  # == erf(arg), shared kernel
+        p_survive = p_axis ** 3
         survive = self.rng.random(self.n_sites) < p_survive
         self.occupancy = self.occupancy & survive
         return self.occupancy.copy()
@@ -648,6 +663,13 @@ class _TriggerWiredCamera(CameraDevice):
     def _pace(self, sequence, stop) -> None:
         """Optional per-frame wall-clock pacing for a continuous firing (subclass hook)."""
 
+    def _arm(self, frames: int | None) -> None:
+        # Fresh armed session: forget any finite fire recorded under a previous arm, so the
+        # loud-fault check in read_frames only ever sees THIS session's trigger edges.
+        state = self._recent_state()
+        with state["cond"]:
+            state["_finite_fire_seen"] = False
+
     def _on_wire_fired(self, sequence) -> None:
         # A FINITE fire = the burst of trigger edges this camera's wire carries.  A continuous
         # (repeat_forever) program is instead pulled on demand in _grab, paced per frame.
@@ -658,6 +680,11 @@ class _TriggerWiredCamera(CameraDevice):
             if not state["armed"]:
                 return              # an unarmed camera misses the trigger, exactly like hardware
             armed_frames = state["armed_frames"]
+            # Mark that a FINITE fire reached this armed session: read_frames uses this to tell a
+            # genuine trigger DEFICIT (a finite program that under-delivered its edges -> raise,
+            # like the real qCMOS) apart from the frozen live monitor (a continuous/idle wire that
+            # legitimately produced no frame -> return [] and hold the last image).
+            state["_finite_fire_seen"] = True
         # EDGE-FAITHFUL: the number of frames this fire delivers is the number of camera-trigger
         # EDGES the fired program carries on THIS camera's own trigger line -- exactly what a real
         # sensor reads out (one frame per rising edge), never the count the consumer happened to arm
@@ -708,15 +735,43 @@ class _TriggerWiredCamera(CameraDevice):
         read consume ``duration * sleep_scale``, so a longer pulse template really slows each shot
         (virtual == real).  ``sleep_scale=0`` (pytest) stamps no deadline, so tests stay instant;
         ``stop`` cancels the wall-clock wait cooperatively.  The continuous live path sets no
-        deadline (repeat_forever is paced per frame in :meth:`_grab`), so it is untouched."""
+        deadline (repeat_forever is paced per frame in :meth:`_grab`), so it is untouched.
+
+        LOUD FAULT MODEL (mirrors the real qCMOS): a FINITE armed read that ends with FEWER than
+        ``n`` frames raises :class:`TimeoutError` instead of returning short.  On real hardware
+        ``read_frames(n)`` waits for ``n`` trigger edges and the qCMOS raises ``TimeoutError`` when
+        an edge never comes (``qcmos.py``: "qCMOS timed out ... waiting for frame N"); a virtual
+        camera that quietly returned a short list would let a trigger/edge DEFICIT pass in
+        simulation that aborts the whole chain on the real sensor.  The armed session's budget is
+        the camera's own ``timeout`` (the L6 knob), scaled by ``sleep_scale`` so a finite deficit is
+        surfaced without a real wall-clock wait under the pytest fast-forward.  A CONTINUOUS live
+        read (``armed_frames is None``) is unbounded and never raises -- it legitimately returns
+        whatever the still-firing wire produced this poll."""
         out = super().read_frames(n, timeout=timeout, stop=stop, **kwargs)
         state = self._recent_state()
         with state["cond"]:
             until = state.pop("_finite_pace_until", None)   # pop unconditionally: never leak a stale deadline
+            armed_frames = state["armed_frames"]
+            finite_fire_seen = bool(state.get("_finite_fire_seen", False))
         if out and until is not None:
             wall = until - time.monotonic()
             if wall > 0.0:
                 stop.wait(wall) if stop is not None else time.sleep(wall)
+        # A FINITE armed read (armed_frames is not None) whose wire ALREADY carried a finite fire this
+        # session, yet delivered fewer than ``n`` frames, is a genuine trigger/edge DEFICIT: the fired
+        # program under-delivered its camera-trigger edges, so the sensor is still waiting for an edge
+        # that never comes -- exactly the condition the real qCMOS raises TimeoutError for.  Fail LOUD
+        # (never a silent short list) so a deficit that aborts a real run is caught the same way in
+        # simulation.  The ``_finite_fire_seen`` gate is what separates this from the PASSIVE live
+        # monitor, whose continuous/idle wire legitimately produces no frame (it never fires a finite
+        # program) and must keep returning [] to hold its last image and freeze -- never raise.  The
+        # wait budget is the camera's own ``timeout`` (the one L6 knob), reported in ms like the qCMOS
+        # message; scaled by ``sleep_scale`` so the pytest fast-forward (sleep_scale=0) is instant.
+        if armed_frames is not None and finite_fire_seen and len(out) < n:
+            budget_s = float(getattr(self, "timeout", 0.0)) * self.sleep_scale
+            raise TimeoutError(
+                f"virtual camera timed out after {budget_s * 1000.0:.0f} ms waiting for frame "
+                f"{len(out)} of {n} (only {len(out)} trigger edge(s) arrived).")
         return out
 
 

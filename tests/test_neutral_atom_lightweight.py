@@ -98,13 +98,16 @@ def test_virtual_jupyter_session_runs_end_to_end(tmp_path):
     assert detection.data_figure is detection.plot.data_figure
     assert not hasattr(detection, "truth")
     from matplotlib.collections import EllipseCollection
-    sitemap_radius = next(patch.radius for patch in sitemap.plot.ax.patches if isinstance(patch, Circle))
-    # The detection plot is the frontend LiveSiteMap: it draws the site rings as ONE vectorised
-    # EllipseCollection (widths = 2*roi_radius), NOT per-site Circle patches -- so its radius is
-    # roi_radius, and it shares the same _site_radius source as the sitemap's Circle rings.
+    # Both the sitemap calibration figure AND the detection figure are the frontend LiveSiteMap now:
+    # the site ROI rings come from the ONE sealed SITE_OCCUPANCY_STYLE source as a vectorised
+    # EllipseCollection (widths = 2*roi_radius), NOT the per-site Circle patches the sitemap USED to bake
+    # in the neutral layer (M6 routed plot_image's overlay through the same sealed site_map seam
+    # plot_detection_image uses -- one ring source, no colour/geometry duplicated).  Both plots therefore
+    # carry the same _site_radius via ``.roi_radius``.
+    assert any(isinstance(c, EllipseCollection) for c in sitemap.plot.ax.collections)
     assert any(isinstance(c, EllipseCollection) for c in detection.plot.ax.collections)
-    assert detection.plot.roi_radius == sitemap_radius
-    assert sitemap_radius >= 4.5
+    assert detection.plot.roi_radius == sitemap.plot.roi_radius
+    assert sitemap.plot.roi_radius >= 4.5
     assert scan.summary()["finished"] is True
     assert np.all(np.isfinite(scan.fidelities))
     assert scan.reference_threshold is not None

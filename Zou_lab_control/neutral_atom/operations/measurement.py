@@ -75,6 +75,17 @@ def triggered_frames(camera, sequencer, sequence, frames: int = 1, *, stop=None)
         sequencer.prepare(program)
         sequencer.fire(program)
         return camera.read_frames(frames, stop=stop)
+    except BaseException:
+        # A prepare / fire / read fault (an RPyC EOF mid-fire, a STATUS_UNDERFLOW stall, a cancel) must
+        # NOT leave the FPGA armed / loaded / firing -- drive the sequencer SAFE before re-raising, so a
+        # failed shot can never strand outputs high.  (The camera is stood down by the finally below.)
+        # On the SUCCESS path the sequencer is left as the caller set it -- a finite program has run to
+        # completion -- so this touches only the error path.
+        try:
+            sequencer.set_safe_state()
+        except Exception:
+            pass
+        raise
     finally:
         camera.disarm()
 

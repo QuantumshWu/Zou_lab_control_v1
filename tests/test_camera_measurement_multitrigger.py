@@ -317,12 +317,14 @@ def test_armed_buffer_is_lossless_for_late_consumption():
         exp.close()
 
 
-def test_single_trigger_fired_once_delivers_exactly_one_frame_edge_faithful():
-    """F1(a) EDGE FIDELITY: a SINGLE-trigger imaging pulse fired ONCE delivers exactly ONE frame,
-    even when the camera is armed for many more -- the frame count is the number of capture-trigger
-    EDGES the fired program carries, NOT the count the consumer armed for.  (The old virtual camera
-    fabricated ``armed_frames`` frames from one edge -- a fiction a real sensor, which reads one
-    frame per edge and would time out waiting for edge 2, could never produce.)"""
+def test_single_trigger_armed_for_more_raises_timeout_edge_faithful():
+    """F1(a) EDGE FIDELITY + LOUD FAULT (H3): a SINGLE-trigger imaging pulse fired ONCE, while the camera
+    was armed for MANY more, RAISES ``TimeoutError`` -- the frame count is the number of capture-trigger
+    EDGES the fired program carries, and a real sensor (one frame per edge) TIMES OUT waiting for edge 2
+    rather than fabricating OR silently swallowing the deficit.  (The old virtual camera FABRICATED the
+    missing frames; the interim virtual SWALLOWED the deficit and returned the one frame it had -- a
+    silent short read a real qCMOS never does.  H3 makes the virtual surface the SAME loud fault the real
+    path raises, so a mis-built pulse fails identically on sim and hardware.)"""
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     try:
         cam, seqr = exp.devices.camera, exp.devices.sequencer
@@ -331,10 +333,10 @@ def test_single_trigger_fired_once_delivers_exactly_one_frame_edge_faithful():
         try:
             seqr.prepare(seq)
             seqr.fire(seq)                           # ... but fire only ONE edge
-            frames = cam.read_frames(20, timeout=0.1)
+            with pytest.raises(TimeoutError):        # 1 edge for 20 armed -> loud timeout, never a short read
+                cam.read_frames(20, timeout=0.1)
         finally:
             cam.disarm()
-        assert len(frames) == 1                      # one edge -> one frame (not 20 fabricated)
     finally:
         exp.close()
 

@@ -35,18 +35,39 @@ _ANALYSIS_DIRS = [_NA / "core", _NA / "operations", _NA / "subsystems"]
 # registry but must not import a concrete backend or read its internal fields.
 _ANALYSIS_FILES = [_NA / "session.py"]
 
-# Concrete camera backends the analysis must NOT import (frames arrive via the
-# CameraDevice contract). devices/base.py (the abstract contract) is allowed;
-# the sequencer concrete modules are not named virtual/qcmos so are unaffected.
-_BACKEND_IMPORT = re.compile(r"^\s*(?:from|import)\b.*\b(?:virtual|qcmos)\b", re.M)
-# Simulation ground-truth the analysis must NOT read. Attribute-access / kwarg
-# forms only, so a docstring word like "occupancy/counts" never false-positives.
-_GROUND_TRUTH = re.compile(r"\.(?:occupancy|render_image|_site_centers)\b|\bforce_all_sites\b")
+# Backends / rendering the analysis must NOT import.  Frames arrive via the
+# CameraDevice contract, so a concrete camera backend (``virtual`` / ``qcmos`` /
+# the ``pylon`` Basler SDK) is forbidden; devices/base.py (the abstract contract)
+# is allowed.  The analysis layer must ALSO never import the GUI backend
+# (``frontend`` / ``PyQt5``) or ``matplotlib`` -- all plotting is routed through
+# the dependency-free ``_viewer_registry`` seam (``neutral_atom/views`` is the ONE
+# adapter layer where matplotlib lives, and it is not scanned here).  A concrete
+# backend named ``virtual``/``qcmos`` or a ``pylon``/``frontend``/``PyQt5``/
+# ``matplotlib`` import anywhere in the analysis tree means virtual<->real is no
+# longer a drop-in swap (or the analysis grew a rendering dependency it must not
+# own).  The sequencer concrete modules are not named any of these so are
+# unaffected.
+_BACKEND_IMPORT = re.compile(
+    r"^\s*(?:from|import)\b.*\b(?:virtual|qcmos|pylon|frontend|PyQt5|matplotlib)\b", re.M)
+# Simulation ground-truth the analysis must NOT read: the sim's known occupancy /
+# per-atom brightness+lifetime knobs / the all-sites render + known site centers /
+# the manual-occupancy mutator.  Attribute-access / call forms only (a leading
+# ``.`` or a bare ``force_all_sites`` flag), so a docstring word like
+# "occupancy/counts" never false-positives AND the legitimate DETECTION function
+# ``find_site_centers`` (a bare name, no leading ``.``) is never caught -- centers
+# are DETECTED from images, not read from the sim's ``._site_centers``/``site_centers``.
+_GROUND_TRUTH = re.compile(
+    r"\.(?:occupancy|render_image|_site_centers|site_centers"
+    r"|detection_lifetime|atom_rate|set_occupancy)\b"
+    r"|\bforce_all_sites\b")
 
 
 def _analysis_files():
     for d in _ANALYSIS_DIRS:
-        yield from sorted(d.glob("*.py"))
+        # rglob (RECURSIVE): the fast-growing operations/tasks, operations/processors
+        # and operations/measurements subpackages are analysis too -- a non-recursive
+        # glob would silently skip them and let a backend/matplotlib import slip in.
+        yield from sorted(d.rglob("*.py"))
     for f in _ANALYSIS_FILES:
         if f.exists():
             yield f

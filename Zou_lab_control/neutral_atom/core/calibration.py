@@ -21,8 +21,6 @@ import numpy as np
 from .analysis import AtomDetection, centers_array, grid_shape_tuple, nonnegative_int, roi_counts, threshold_array
 from .psf import psf_signals
 
-SUPPORTED_METHODS = ("box", "psf")
-
 #: Readout-KIND for every readout method, the EXPLICIT dispatch table that decides how
 #: ``signals()`` extracts a method's per-site scalar.  ``"box"`` reduces a square ROI;
 #: ``"kernel"`` does matched-filter (PSF) extraction.  This is the single source for the
@@ -79,8 +77,8 @@ class TrapCalibration:
                 raise ValueError("grid_shape product must match number of centers.")
             object.__setattr__(self, "grid_shape", shape)
         method = str(self.method).lower()
-        if method not in SUPPORTED_METHODS:
-            raise ValueError(f"method must be one of {SUPPORTED_METHODS}.")
+        if method not in READOUT_KINDS:                  # the ONE method registry (box / psf / uniform_psf)
+            raise ValueError(f"method must be one of {tuple(READOUT_KINDS)}.")
         object.__setattr__(self, "method", method)
         # roi_radius / reducer are box-only extraction geometry: validate + keep them for a box
         # calibration, but a PSF (kernel) calibration reads through the kernels and ignores them,
@@ -353,4 +351,4 @@ class TrapCalibration:
         return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
 
-__all__ = ["TrapCalibration", "SUPPORTED_METHODS"]
+__all__ = ["TrapCalibration", "READOUT_KINDS", "readout_kind"]

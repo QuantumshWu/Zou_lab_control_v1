@@ -440,7 +440,7 @@ register_device_class("MyCamera", "my_pkg.cameras:MyCamera")
 
 \subsection{\pyapi{available\_device\_configs} 与 \pyapi{read\_config}}
 
-\pyapi{available_device_configs()} 列出 \filepath{neutral_atom/configs/} 目录下随仓库附带的配置文件，目前包括 \filepath{virtual.json}、\filepath{manual_template.json}、\filepath{remote_template.json}。它返回这些可用配置，方便你在不记路径的情况下选用模板。
+\pyapi{available_device_configs()} 列出 \filepath{neutral_atom/configs/} 目录下随仓库附带的配置文件，外加内置字符串快捷方式 \pyapi{"virtual"}，目前包括 \pyapi{"virtual"}、\filepath{manual_template.json}、\filepath{remote_template.json}、\filepath{basler_monitor.json}。它返回这些可用配置，方便你在不记路径的情况下选用模板。注意 \pyapi{"virtual"} 是\tfocus{程序内置}的全虚拟配置（直接由 \pyapi{VirtualTrapArray} 等设备类的默认参数构造），不是磁盘上的 JSON 文件；\pyapi{load_devices("virtual")} 永远走这条内置路径。
 
 \pyapi{read_config} 负责把"三种形态之一"的输入\tfocus{归一化}成那个统一的顶层字典：传 \pyapi{"virtual"} 时返回内置虚拟配置，传路径时读盘解析 JSON，传 dict 时原样（校验后）返回。\pyapi{load_devices} 内部就先经过它。
 
@@ -899,8 +899,8 @@ close()     # 关闭设备，释放句柄
 
 \begin{description}
 \item[装载（loading）] 每个光阱独立按伯努利装载，概率 \pyapi{p = loading_probability * (1 - exp(-t_cool / load_time_constant_s))}：冷却/MOT 时间越长越饱和。\pyapi{loading_probability=0.5}（光助碰撞单原子装载上限）、\pyapi{load_time_constant_s=0.5\,ms}、\pyapi{mot_load_s=0.30\,s}（一发虚拟 shot 代表一个真实量级的 MOT/PGC 循环）。所以\tfocus{编辑脉冲里的冷却时长会真实改变图像里的装载}。
-\item[PSF 与信号] 每个被占据站点画成各向同性高斯，\pyapi{atom_sigma_px=0.7\,px}（v16 逐站点 PSF 拟合 $\sigma_x{\sim}0.61$ / $\sigma_y{\sim}0.76$，几何均值 ${\sim}0.68$）；峰值幅度 = \pyapi{atom_rate} $\times$ 散射时间，\pyapi{atom_rate=2150\,ph/s}（调到 v16 在 3\,ms 参考读出下亮点 3$\times$3-box 35 站均值 ${\sim}18.7$ 光子）；站距 \pyapi{spacing_px=9.0\,px}（v16 ${\sim}9.2$）。
-\item[背景] 杂散光 + 散射底噪 \pyapi{background_rate=600\,ph/s/px}（v16 3\,ms 角落中值在 200-count offset 之上 ${\sim}1.8$ 光子/px），故暗站点也有真实散粒底噪而非近零；\pyapi{dark_current_e_per_s=0.006}。
+\item[PSF 与信号] 每个被占据站点画成各向同性高斯，\pyapi{atom_sigma_px=0.7\,px}（v16 逐站点 PSF 拟合 $\sigma_x{\sim}0.61$ / $\sigma_y{\sim}0.76$，几何均值 ${\sim}0.68$）；峰值幅度 = \pyapi{atom_rate} $\times$ 散射时间，\pyapi{atom_rate=1100\,ph/s}（对标 v16 亮原子在 2\,ms 参考读出下的探测光子率 ${\sim}4.6$/4.0\,kph/s，使每原子光子数在同曝光下与 v16 一致而不过亮——过亮会让直方图过分分离、读出显得比真实 Rb87 容易）；站距 \pyapi{spacing_px=9.0\,px}（v16 ${\sim}9.2$）。
+\item[背景] 杂散光 + 散射底噪 \pyapi{background_rate=300\,ph/s/px}（对标 v16：2\,ms box 在 49\,px（7$\times$7）上约 29 个探测光子，即 ${\sim}0.6$ 光子/px/2\,ms $\to$ ${\sim}300$\,ph/s/px），故暗站点也有真实散粒底噪而非近零；太高的底噪（旧的 600）会加背景噪声、封住可达保真度天花板；\pyapi{dark_current_e_per_s=0.006}。
 \item[相机噪声] 先对期望光电子取泊松，再 \pyapi{counts = pe / conversion_e_per_count + offset_counts + N(0, read_noise_e / conversion)}。\pyapi{conversion_e_per_count=0.107}、\pyapi{read_noise_e=0.43}、\pyapi{offset_counts=200} —— 与真实 v16 \pyapi{CameraConfig} 逐字一致。
 \item[读出损耗 / 寿命] 每个原子在 probe 下寿命 ${\sim}\mathrm{Exp}(\pyapi{detection_lifetime}=2.0\,s)$：曝光越长散射光子越多（SNR 越高）但中途丢失越多——中途丢失的原子从\tfocus{同一装载的下一帧}占据里掉出。这正是 detection-time 扫描测的 SNR-vs-存活权衡。
 \item[温度状态] 每个原子带一个\tfocus{逐站点温度}，由脉冲逐帧演化：装载/再冷却把它压向 PGC 底，probe 把它抬高，release-recapture 按它判存活。新装载起始于 \pyapi{cooled_temperature_K=50\,\textmu K}。

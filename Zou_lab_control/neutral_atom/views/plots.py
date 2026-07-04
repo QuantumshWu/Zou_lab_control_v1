@@ -13,7 +13,6 @@ from __future__ import annotations
 from math import ceil, sqrt
 from typing import Sequence
 
-from matplotlib.patches import Circle
 import numpy as np
 
 from Zou_lab_control._viewer_registry import active_plotter
@@ -51,20 +50,29 @@ def _site_radius(roi_radius: int | float = 1) -> float:
 
 
 def plot_image(image, *, centers=None, roi_radius: int = 1, labels=("Camera x (px)", "Camera y (px)", "Counts"), display: bool = True, **kwargs):
-    """Plot a qCMOS image with optional site-center overlay (``None`` if headless)."""
+    """Plot a qCMOS image with optional site-center overlay (``None`` if headless).
+
+    The site-center overlay is NOT hard-coded here: when ``centers`` are given this routes them
+    through the SAME sealed ``site_map`` view :func:`plot_detection_image` uses (all sites drawn
+    "empty"), so the ring art comes from the single ``SITE_OCCUPANCY_STYLE`` source rather than a
+    colour baked into this layer.  A bare image (no ``centers``) is a plain point-table plot."""
 
     plotter = active_plotter()
     if plotter is None:
         return None
 
-    data_x, data_y = image_to_points(image, max_points=kwargs.pop("max_points", 120_000))
-    plot = plotter.plot(data_x, data_y, labels=labels, display=False, **kwargs)
     if centers is not None:
         centers = np.asarray(centers, dtype=float)
         if centers.size:
-            radius = _site_radius(roi_radius)
-            for x, y in centers[:, :2]:
-                plot.ax.add_patch(Circle((x, y), radius, facecolor="none", edgecolor="#C37D5A", linewidth=0.65, alpha=0.9, zorder=5))
+            # Route the overlay through the ONE sealed ring source: draw every detected site "empty"
+            # (occupied=all-False) on top of the frame -- identical seam to plot_detection_image, so
+            # neither the ring colour nor its geometry is duplicated in the neutral layer.
+            return plot_detection_image(
+                image, centers[:, :2], np.zeros(len(centers), dtype=bool),
+                roi_radius=roi_radius, labels=labels, display=display, **kwargs)
+
+    data_x, data_y = image_to_points(image, max_points=kwargs.pop("max_points", 120_000))
+    plot = plotter.plot(data_x, data_y, labels=labels, display=False, **kwargs)
     if display:
         plotter.display_figure(plot.fig)
     else:

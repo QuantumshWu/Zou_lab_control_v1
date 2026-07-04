@@ -48,10 +48,11 @@ RB87_MASS = 86.909180527 * AMU
 
 def build_release_recapture_pulse(
     *,
-    channels=("trap", "probe", "emCCD"),
-    trap_channel: str = "trap",
-    probe_channel: str = "probe",
-    trigger_channel: str = "emCCD",
+    sequencer=None,
+    channels=None,
+    trap_channel: str | None = None,
+    probe_channel: str | None = None,
+    trigger_channel: str | None = None,
     exposure: float = 20e-3,
     settle: float = 1e-3,
     recapture: float = 1e-3,
@@ -82,12 +83,39 @@ def build_release_recapture_pulse(
     so the two images would be different loadings with no trap-off between them.
     Release-recapture survival requires the SAME atoms imaged before and after one
     trap-off, which only the explicit trap-off period provides.
+
+    CHANNEL ROLES resolve through the SAME role->channel single source the imaging path uses
+    (``imaging_channel_kwargs``), so this PUBLIC builder fires on a real ``ch00..`` streamer, not
+    only on the virtual ``trap/probe/emCCD`` placeholders (§5 #15: only imaging was fixed, not every
+    builder).  ``channels`` is the target channel set; pass a ``sequencer`` to take its channels and
+    let its camera's ``trigger_channel`` select the real trigger line.  When a role is left ``None``
+    it is filled from ``imaging_channel_kwargs`` for those channels, falling back to the conventional
+    ``trap``/``probe``/``emCCD`` placeholder (the virtual/notebook convention).  A real ``chNN`` set
+    with no resolvable trigger still fails LOUD at the membership check below -- the trigger line is
+    the camera's to name, never guessable from the channel list alone.
     """
 
-    from ..timing import PulseTableState
+    from types import SimpleNamespace
+
+    from ..timing import PulseTableState, imaging_channel_kwargs
     from ..timing.pulse_table import PulsePeriod
 
+    # The channel set to build on: an explicit ``channels``, else the sequencer's, else the
+    # placeholder convention (virtual / notebook default).
+    if channels is None:
+        channels = list(getattr(sequencer, "channels", ()) or ()) or ["trap", "probe", "emCCD"]
     channels = list(channels)
+    # Resolve any role left None from the SAME single source the imaging sequence uses (maps the
+    # conventional roles onto whatever these channels actually expose: ch09/ch03/<trigger> on a real
+    # streamer, or the trap/probe/emCCD placeholders on the virtual set).  ``{}`` (an unrecognised
+    # chNN set with no trigger) leaves the placeholders, so the membership check below still fails
+    # LOUD -- matching the real streamer, which cannot image on channels it does not have.
+    roles = imaging_channel_kwargs(sequencer or SimpleNamespace(channels=channels),
+                                   trigger_channel=trigger_channel)
+    trap_channel = trap_channel if trap_channel is not None else roles.get("trap_channel", "trap")
+    probe_channel = probe_channel if probe_channel is not None else roles.get("probe_channel", "probe")
+    trigger_channel = trigger_channel if trigger_channel is not None else roles.get("trigger_channel", "emCCD")
+
     for required in (trap_channel, probe_channel, trigger_channel):
         if required not in channels:
             raise ValueError(f"channel {required!r} must be in channels {channels}.")

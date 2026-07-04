@@ -4,8 +4,9 @@ Each file here is a named device config `na.connect("<name>")` / `na.load_device
 (bare name resolves from this folder, with or without `.json`). One JSON object, one entry per device
 **role**; each entry is `{"type": "<DeviceClass>", "params": {…}}`. The role name (`camera`,
 `sequencer`, `trap_array`, `monitor_camera`, a future `rf`, …) is what measurements/tasks select from
-in their **Camera dropdown** and what `exp.device_manager()` groups by. `"virtual"` is built
-programmatically (not from `virtual.json`) and needs no hardware.
+in their **Camera dropdown** and what `exp.device_manager()` groups by. `"virtual"` is a built-in
+string shortcut built **programmatically** from the device-class defaults (there is no `virtual.json`
+on disk) and needs no hardware — `load_devices("virtual")` always takes that in-code path.
 
 Point `na.discover_devices()` at your hardware to get a ready `{role: {type, params}}` fragment to
 paste here, and open `exp.device_manager()` (or `na.<session>.device_manager()`) to see what a config

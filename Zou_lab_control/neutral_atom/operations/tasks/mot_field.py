@@ -166,14 +166,16 @@ class OptimizeMotFieldTask(Task):
         plotter = active_plotter()
         if plotter is not None and hasattr(plotter, "grid"):
             try:
-                import matplotlib.pyplot as plt
                 # facet the Bz axis: one (Bx, By) intensity map per plane -- the SAME grid facet
                 # (frontend.grid) a console panel shows live during the scan (block is (bx, by, bz)).
                 g = plotter.grid([block[:, :, k].T for k in range(block.shape[2])],
                                  sub_plot_kind="2d", display=False,
                                  title="MOT intensity vs coil field (one Bz plane per cell)")
-                g.fig.savefig(folder / "mot_field_planes.png", dpi=200)
-                plt.close(g.fig)
+                # Save through the grid's OWN sealed save (frontend-owned savefig + matching .npz) --
+                # this layer imports no matplotlib and touches no figure/canvas itself.  Passing the
+                # .png path lets resolve_save_base keep the exact stem, so mot_field_planes.png (and a
+                # faithful-reload mot_field_planes.npz) land beside the raw block.
+                g.save(str(folder / "mot_field_planes.png"), dpi=200)
             except Exception as exc:              # a plotter-less run keeps the npz, but a REAL figure
                 import warnings                    # break must SURFACE (it was silently swallowed before,
                 warnings.warn(                     # which hid a wrong plotter.plot(kind="grid") call).
