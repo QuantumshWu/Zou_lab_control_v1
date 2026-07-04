@@ -98,13 +98,16 @@ from .qt_fluent import (
 
 try:  # Matplotlib is already a frontend dependency, but keep import errors tidy.
     import matplotlib.pyplot as plt
-    # The ONE figure-in-Qt wrapper (wheel isolation + optional display scale);
-    # the preview shows 1:1, so the default display_scale=1.0 applies.
-    from .qt_canvas import EmbeddedFigureCanvas as FigureCanvas
+    # The preview embeds its figure through the SAME port as task_console / figure_viewer:
+    # qt_canvas.panel_canvas (wheel isolation + the ONE panel display scale, style.PANEL_DISPLAY_SCALE) --
+    # the pulse preview is NOT special-cased at 1:1 any more.  FigureCanvas is only the availability
+    # sentinel (None when matplotlib-qt is missing); construction goes through panel_canvas.
+    from .qt_canvas import EmbeddedFigureCanvas as FigureCanvas, panel_canvas
     if FigureCanvas is None:
         raise ImportError("matplotlib qt canvas unavailable")
 except Exception:  # pragma: no cover - depends on the local desktop environment.
     FigureCanvas = None
+    panel_canvas = None
     plt = None
 
 
@@ -4460,15 +4463,15 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 plt.close(old_plot.fig)
             except Exception:
                 pass
-        canvas = FigureCanvas(plotter.fig)
-        canvas.draw()
-        hint = canvas.sizeHint()
-        canvas.setFixedSize(hint)
+        # The ONE embed port: panel_canvas draws + fixes its own design size (inches x DESIGN_DPI x
+        # PANEL_DISPLAY_SCALE), exactly like task_console -- no bespoke setFixedSize(sizeHint()) dance.
+        canvas = panel_canvas(plotter.fig)
         self.preview_body_layout.addWidget(canvas)
+        size = canvas.size()
         margins = self.preview_body_layout.contentsMargins()
         self.preview_body.setFixedSize(
-            hint.width() + margins.left() + margins.right(),
-            hint.height() + margins.top() + margins.bottom(),
+            size.width() + margins.left() + margins.right(),
+            size.height() + margins.top() + margins.bottom(),
         )
         self._preview_plot = plotter
         self._preview_canvas = canvas
