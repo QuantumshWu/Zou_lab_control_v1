@@ -2,7 +2,7 @@
 
 A full camera frame (1920x1200+) fed to a 2D live panel used to be resampled by
 matplotlib on EVERY draw (~90 ms) through a render buffer SMALLER than the screen
-area it was stretched onto (render_scale 0.5 vs display_scale 0.7) with unfiltered
+area it was stretched onto (a coarser render than the display) with unfiltered
 "none" interpolation -- three independent resolution losses.  The contracts here pin
 the redesign:
 
@@ -11,7 +11,7 @@ the redesign:
 2. zooming re-slices from the full array, so detail returns progressively until the
    view fits the budget 1:1 (exact values, a no-copy slice);
 3. the live render buffer matches the on-screen device pixels EXACTLY
-   (render_scale == display_scale in panel_canvas) -- one resample end to end;
+   (the ONE panel display scale drives figure.dpi in panel_canvas) -- one resample end to end;
 4. small scan grids pass through untouched (crisp nearest pixels, zero change).
 """
 
@@ -179,21 +179,22 @@ def test_sitemap_background_uses_the_same_display_policy():
 
 # ------------------------------------------------------- canvas: one resample
 def test_panel_canvas_buffer_matches_the_screen_exactly():
-    """render_scale == display_scale: the Agg buffer is byte-for-byte the size the
-    screen shows, so the blit is 1:1 and the ONLY resample in the whole chain is
-    the budgeted decimation above.  (The old 0.5-render/0.7-display mismatch blit
-    every live panel through a permanent 1.4x upscale.)"""
+    """The ONE panel display scale drives figure.dpi, so the Agg buffer is byte-for-byte the
+    size the screen shows: the blit is 1:1 and the ONLY resample in the whole chain is the
+    budgeted decimation above.  (There is no separate render-scale that could blit every live
+    panel through a permanent upscale.)"""
     pytest.importorskip("PyQt5")
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt5 import QtWidgets
     from Zou_lab_control.frontend.qt_canvas import panel_canvas
+    from Zou_lab_control.frontend.style import PANEL_DISPLAY_SCALE
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     del app
     p = _camera_panel(_camera_frame(h=120, w=192, seed=5))
     cv = panel_canvas(p.fig)
-    assert abs(cv._zlc_render_scale - (1.0 / cv._zlc_ratio)) < 1e-9
+    assert cv._zlc_display_scale == PANEL_DISPLAY_SCALE       # the ONE display knob drives the buffer
     cv.draw()
     real = QtWidgets.QWidget.devicePixelRatioF(cv) or 1.0     # the true screen ratio
     size = cv._zlc_design_size()

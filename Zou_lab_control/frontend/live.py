@@ -29,6 +29,7 @@ from .style import (
     DESIGN_DPI,
     HIST_FILL_ALPHA,
     PALETTE,
+    PANEL_DISPLAY_SCALE,
     SITE_OCCUPANCY_STYLE,
     STOCK_MARGINS_PX,
     apply_style,
@@ -1702,10 +1703,10 @@ PANEL_MARGINS_PX = (STOCK_MARGINS_PX[0], 86, 80, TITLE_SLOT_PX)   # stock margin
                                          # tick labels + z-label, B the x-label+ticks) and
                                          # keep the data area dense (~71% wide).
 # Panels are DISPLAYED scaled through the standard high-DPI canvas path
-# (qt_canvas.panel_canvas), so on screen their text sits at ~70% of a
-# notebook/pulse-preview figure while the figure stays an ordinary 300 dpi
-# frontend figure.
-PANEL_DISPLAY_SCALE = 0.7
+# (qt_canvas.panel_canvas): on screen their text sits at PANEL_DISPLAY_SCALE (~70%) of a
+# notebook/pulse-preview figure while the figure stays an ordinary 300 dpi frontend figure.
+# PANEL_DISPLAY_SCALE is the frontend's ONE display-scale source of truth in style.py (imported
+# at the top of this module, re-exported below); panel_display_size reads it -- never re-typed here.
 
 
 def panel_size_cells(size: str) -> tuple[int, int]:

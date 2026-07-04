@@ -1201,8 +1201,8 @@ def test_embedded_canvas_invariants_across_screen_scales(scale_factor):
         "real = float(__import__('os').environ.get('QT_SCALE_FACTOR', '1.0'))\n"
         "# invariant 1: design inches never change\n"
         "assert tuple(round(float(v), 4) for v in fig.get_size_inches()) == design_inches\n"
-        "# invariant 2: dpi = design dpi x REAL screen ratio (retina supersampling)\n"
-        "assert abs(fig.dpi - DESIGN_DPI * real) < 1e-6, fig.dpi\n"
+        "# invariant 2: dpi = design dpi x REAL screen ratio (retina) x display_scale (buffer == on-screen px)\n"
+        "assert abs(fig.dpi - DESIGN_DPI * real * PANEL_DISPLAY_SCALE) < 1e-6, fig.dpi\n"
         "# invariant 3: the LOGICAL widget size is scale-independent (+-1 px) and EQUALS\n"
         "# panel_display_size -- DERIVED from the owned geometry, so it tracks margin changes.\n"
         "exp_w, exp_h = panel_display_size('2x2')\n"
@@ -1383,8 +1383,8 @@ def test_task_console_cards_are_modular(monkeypatch):
             assert abs(card.canvas.height() - canvas_h) <= 1
             # the figure carries the ONE design dpi in _original_dpi; the live canvas
             # renders the Agg buffer at EXACTLY the widget's on-screen device pixels
-            # (render_scale == display_scale in panel_canvas: a 1:1 blit, never rendered
-            # small and stretched up), so buffer px == widget logical px x the screen ratio.
+            # (the ONE panel display scale drives figure.dpi in panel_canvas: a 1:1 blit,
+            # never rendered small and stretched up), so buffer px == widget logical px x screen ratio.
             from PyQt5 import QtWidgets
             fig = card.plotter.fig
             assert getattr(fig, "_original_dpi", fig.dpi) == DESIGN_DPI

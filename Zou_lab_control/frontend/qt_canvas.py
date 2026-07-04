@@ -44,16 +44,15 @@ else:
     class EmbeddedFigureCanvas(_FigureCanvasQTAgg):
         """Matplotlib Qt canvas with a display scale and wheel isolation."""
 
-        def __init__(self, figure, *, display_scale: float = 1.0, isolate_wheel: bool = True,
-                     render_scale: float = 1.0):
-            # both must exist BEFORE super().__init__: the base class reads
-            # devicePixelRatioF() (overridden below) during construction.
-            self._zlc_ratio = 1.0 / max(0.1, float(display_scale))
-            # render_scale < 1 renders the Agg buffer at a LOWER dpi (cheaper text raster)
-            # and Qt scales it up to the SAME widget size -- it is factored into BOTH
-            # figure.dpi and the device-pixel-ratio so they cancel and the display size /
-            # fixed-inches axes layout are byte-identical (only slightly softer).
-            self._zlc_render_scale = max(0.05, float(render_scale))
+        def __init__(self, figure, *, display_scale: float = 1.0, isolate_wheel: bool = True):
+            # Must exist BEFORE super().__init__: the base class reads devicePixelRatioF()
+            # (overridden below) during construction.  ``display_scale`` is the ONE display
+            # knob -- the on-screen zoom on top of the design size.  The Agg buffer is ALWAYS
+            # rendered at the matching resolution (figure.dpi = design_dpi x real screen ratio
+            # x display_scale), so the blit onto the widget is 1:1 crisp: nothing is ever
+            # rendered small and stretched up.  (There is deliberately NO separate render-scale:
+            # a coarser buffer would only ever be a permanent softness, so display == render.)
+            self._zlc_display_scale = max(0.05, float(display_scale))
             self._zlc_inches = tuple(float(v) for v in figure.get_size_inches())
             # isolate_wheel=True: in-plot wheel zoom never leaks to a surrounding
             # scroll area (interactive plots).  False: the wheel PROPAGATES, so a
@@ -103,7 +102,7 @@ else:
             a monitor move) they desync and sizeHint balloons.  This product is invariant, so pinning the
             canvas min==max to it is race-free.  (DPR still scales the render BUFFER via figure.dpi.)"""
             w_in, h_in = self._zlc_inches
-            scale = 1.0 / self._zlc_ratio                      # display_scale (render_scale cancels out)
+            scale = self._zlc_display_scale
             return QtCore.QSize(max(1, round(w_in * self._zlc_design_dpi * scale)),
                                 max(1, round(h_in * self._zlc_design_dpi * scale)))
 
@@ -152,11 +151,11 @@ else:
 
         # ------------------------------------------------------------- ratio math
         def devicePixelRatioF(self):  # noqa: N802 - Qt naming
-            # The backend derives the render-buffer size, sizeHint, mouse-event
-            # coordinates and the painter's image scaling from this one ratio.  The
-            # render_scale rides in here too: figure.dpi carries the SAME factor, so the
-            # buffer shrinks (cheaper raster) while widget size = buffer / this is unchanged.
-            return (super().devicePixelRatioF() or 1.0) * self._zlc_ratio * self._zlc_render_scale
+            # The backend derives the render-buffer size, sizeHint, mouse-event coordinates and
+            # the painter's image scaling from this one ratio.  figure.dpi already carries
+            # display_scale (see _zlc_sync), so the buffer is exactly the widget's on-screen
+            # device pixels and this is just the REAL screen ratio -- a 1:1 crisp blit.
+            return super().devicePixelRatioF() or 1.0
 
         def _set_device_pixel_ratio(self, ratio):
             # Reroute every stock sync (showEvent, screen/dpi-change signals)
@@ -170,14 +169,15 @@ else:
 
         def _zlc_sync(self) -> None:
             real = super().devicePixelRatioF() or 1.0
-            rs = self._zlc_render_scale
+            ds = self._zlc_display_scale
             figure = self.figure
             # invariant 1: the design inches NEVER change (fixed-inches axes)
             figure.set_size_inches(*self._zlc_inches, forward=False)
-            # invariant 2: retina supersampling by the REAL screen ratio, times the live
-            # render_scale (rs<1 -> smaller/cheaper buffer; rs cancels in the widget size).
-            figure._set_dpi(self._zlc_design_dpi * real * rs, forward=False)
-            self._device_pixel_ratio = real * self._zlc_ratio * rs
+            # invariant 2: the buffer dpi = design dpi x REAL screen ratio (retina supersampling)
+            # x display_scale, so the Agg buffer is EXACTLY the widget's on-screen device pixels
+            # (a 1:1 crisp blit -- never rendered small and stretched up).
+            figure._set_dpi(self._zlc_design_dpi * real * ds, forward=False)
+            self._device_pixel_ratio = real
             # invariant 3: logical widget size = design px x display_scale -- the DPR-FREE constant
             # (NOT figure.bbox / device_pixel_ratio, which desyncs when the screen ratio changes
             # mid-sync and balloons the size).  After construction the canvas is setFixedSize to this
@@ -186,11 +186,10 @@ else:
 
         def paintEvent(self, event):  # noqa: N802 - Qt naming
             # EXPLICIT stretch-blit of the rendered Agg buffer over the ENTIRE fixed widget rect.
-            # The stock backend paints the buffer as a QImage whose devicePixelRatio is our combined
-            # ratio (screen x 1/display_scale x render_scale) -- but Qt's image-DPR semantics are only
-            # defined for ratios >= 1, and ours drops BELOW 1 (0.7 display scale x 0.5 render scale),
-            # where Qt blits the buffer 1:1 into the TOP-LEFT corner and leaves the right/bottom of the
-            # widget blank (the "enlarged view is not centred in its display region" bug -- the content
+            # The stock backend paints the buffer as a QImage tagged with a devicePixelRatio and lets
+            # Qt scale it -- but Qt's image-DPR semantics are only well-defined for ratios >= 1, and a
+            # display_scale below 1 (0.7) once left the buffer blitted 1:1 into the TOP-LEFT corner with
+            # the right/bottom of the widget blank (the "enlarged view is not centred" bug -- content
             # occupied ~71% of the canvas).  Drawing it ourselves over ``rect()`` needs no image-DPR at
             # all: the widget size is the DPR-invariant design constant, the buffer is whatever dpi the
             # sync chose, and the smooth-transform scale maps one onto the other exactly.
@@ -228,19 +227,18 @@ else:
 
 def panel_canvas(figure, *, isolate_wheel: bool = True):
     """The canvas for a dashboard panel figure: the panel display scale is a
-    frontend design constant, not a host knob.  ``isolate_wheel=False`` lets a
-    display-only (Monitor) panel's wheel scroll the board instead of being
-    swallowed; interactive (Edit) panels keep the default isolation."""
+    frontend design constant (``style.PANEL_DISPLAY_SCALE``), not a host knob.
+    ``isolate_wheel=False`` lets a display-only (Monitor) panel's wheel scroll the
+    board instead of being swallowed; interactive (Edit) panels keep the default."""
 
     if EmbeddedFigureCanvas is None:  # pragma: no cover - matplotlib-qt missing
         raise RuntimeError("matplotlib Qt canvas is not available")
-    from .live import PANEL_DISPLAY_SCALE
-    # render_scale == display_scale: the Agg buffer matches the widget's on-screen device
-    # pixels EXACTLY (the two factors cancel in devicePixelRatioF, which then reads the real
-    # screen ratio).  Anything lower renders a smaller buffer that paintEvent must stretch
-    # up -- a permanent softness on every live panel.  Saved figures use savefig.dpi.
+    from .style import PANEL_DISPLAY_SCALE
+    # The ONE display knob: the Agg buffer is rendered at exactly the widget's on-screen
+    # device pixels (figure.dpi carries display_scale), so the blit is 1:1 -- no softness.
+    # Saved figures use savefig.dpi, independently of this.
     return EmbeddedFigureCanvas(figure, display_scale=PANEL_DISPLAY_SCALE,
-                                isolate_wheel=isolate_wheel, render_scale=PANEL_DISPLAY_SCALE)
+                                isolate_wheel=isolate_wheel)
 
 
 __all__ = ["EmbeddedFigureCanvas", "panel_canvas"]

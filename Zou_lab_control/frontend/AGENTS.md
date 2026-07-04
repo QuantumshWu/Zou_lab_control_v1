@@ -25,8 +25,10 @@ the rules don't get re-broken.
    (`MappingProxyType` over the private `_DEFAULT_STYLE`). No public font-size,
    colour or dpi override.
 4. **One display-scale rule.** On-screen scale comes only from
-   `qt_fluent.resolve_fluent_auto_scale` (GUI controls) and
-   `qt_canvas.panel_canvas` / `PANEL_DISPLAY_SCALE` (embedded figures). Public
+   `qt_fluent.resolve_fluent_auto_scale` (GUI controls) and the ONE
+   `style.PANEL_DISPLAY_SCALE` — the single frontend source of truth — which
+   `qt_canvas.panel_canvas` feeds as `EmbeddedFigureCanvas`'s **only** display knob
+   (`live` re-exports the same name). There is NO separate render-scale. Public
    `show_pulse_gui` / `show_task_console` default to `scale=None` (auto).
 5. **Art-bearing fluent widgets stay internal.** `qt_fluent.*` and `qt_canvas.*`
    (including `FluentGroupBox(shadow=)`, `FluentFrame(shadow=)`,
@@ -70,9 +72,10 @@ the rules don't get re-broken.
 ## The patterns that already seal correctly (copy these)
 
 - `panel_plot_spec` / `panel_size_cells` own panel geometry; size is the only knob.
-- `qt_canvas.panel_canvas` owns display scale (`PANEL_DISPLAY_SCALE`);
-  `EmbeddedFigureCanvas` keeps the three invariants (fixed inches, retina-only
-  dpi, logical = design_px × display_scale).
+- `style.PANEL_DISPLAY_SCALE` is the ONE display-scale constant; `qt_canvas.panel_canvas`
+  feeds it as `EmbeddedFigureCanvas`'s single `display_scale` (no render-scale twin).
+  `EmbeddedFigureCanvas` keeps the three invariants (fixed inches, retina-only dpi,
+  logical = design_px × display_scale; the Agg buffer = design_dpi × real × display_scale).
 - `qt_fluent.resolve_fluent_auto_scale` is the single GUI-scale owner.
 - `notes.render_tex_pdf` owns the temp-dir/2-pass/aux-skip compile; callers only
   hand it a tex string (or path) and an output pdf path — nothing is left behind.

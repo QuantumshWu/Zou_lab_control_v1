@@ -40,9 +40,14 @@ SANS_SERIF = ([_FONT_NAME] if _FONT_NAME else []) + ["Arial"]
 # These are OWNED constants of the frontend visual system, NOT per-call knobs.
 # --------------------------------------------------------------------------- #
 DESIGN_DPI = 300                          # the one DESIGN dpi; layout geometry + saved figures use it
-# (Live panels render their Agg buffer at exactly the widget's on-screen device pixels --
-# render_scale == display_scale in qt_canvas.panel_canvas -- so the blit is 1:1 and nothing
-# is ever rendered small and stretched up.  SAVED figures use savefig.dpi below.)
+# The ONE panel display scale: how large an embedded live panel APPEARS on screen, as a fraction of
+# its DESIGN_DPI size (widget logical px = inches x DESIGN_DPI x PANEL_DISPLAY_SCALE).  It is the
+# single knob qt_canvas.EmbeddedFigureCanvas takes -- the Agg buffer is ALWAYS rendered at the
+# matching resolution (figure.dpi = DESIGN_DPI x real screen ratio x this), so the on-screen blit is
+# 1:1 crisp, never rendered small and stretched up.  SAVED figures use savefig.dpi, independent of
+# this.  (Lives HERE, the frontend's single source of truth -- NOT scattered across live.py /
+# qt_canvas as a display_scale/render_scale pair -- a value written ONCE so display size can't drift.)
+PANEL_DISPLAY_SCALE = 0.7
 STOCK_DATA_PX = (480, 360)                # the stock single-axes data region (confocal)
 STOCK_MARGINS_PX = (110, 110, 100, 40)    # confocal stock margins (L, R, B, T)
 
@@ -286,6 +291,7 @@ __all__ = [
     "FONT_PATH",
     "NEW_BLACK",
     "PALETTE",
+    "PANEL_DISPLAY_SCALE",
     "SANS_SERIF",
     "SITE_OCCUPANCY_STYLE",
     "STOCK_DATA_PX",
