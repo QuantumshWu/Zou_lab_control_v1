@@ -386,6 +386,36 @@ def test_grid_hist_fit_draws_the_standard_curves_on_the_thumbnails():
         plt.close("all")
 
 
+def test_grid_general_fit_survives_notebook_focus_unfocus():
+    """A general curve fit on the grid MUST survive a focus->unfocus round trip.  The notebook /
+    Edit-tab enlarge path is ``GridPlot.focus`` / ``unfocus``; unfocus rebuilds the cells via
+    ``_rebuild_grid`` -> ``init_core``, which re-asserts the stored VIEW knobs (the general fit) BY
+    CONSTRUCTION.  Guards the ONE invariant 'a from-scratch cell draw re-applies the view knobs' so no
+    rebuild path can silently wipe the grid's fit (the 'double-click a cell and return kills the fit'
+    bug, reproducible in the Edit tab)."""
+    cells = facet_cells(BLOCK, "points:0", sub_plot_kind="2d", points_shape=PTS)   # 3 image cells
+    g = grid(cells, sub_plot_kind="2d", display=False)
+    try:
+        g.apply_param("fit_model", "center")                # the 2d family's general fit (ImageCell)
+
+        def live_fit_artists() -> int:
+            drawn = set()
+            for ax in g.site_axes:
+                drawn |= {id(c) for c in ax.get_children()}
+            return sum(1 for arts in g._general_fit_artists.values()
+                       for a in arts if id(a) in drawn)      # count ARTISTS still on a CURRENT axes
+
+        before = live_fit_artists()
+        assert before > 0, "the center fit must draw artists on the grid cells"
+        g.focus(0)                                          # notebook focus (the Edit-tab enlarge path)
+        g.unfocus()                                         # -> _rebuild_grid -> init_core -> _apply_view_knobs
+        assert live_fit_artists() == before, \
+            "the general fit was LOST across notebook focus/unfocus -- a rebuild path dropped the view knobs"
+    finally:
+        plt.close(g.fig)
+        plt.close("all")
+
+
 def test_grid_edge_label_policy_survives_every_display_toggle():
     """The shared-axes tick policy (round U): y tick labels ONLY on each row's leftmost cell, x tick
     labels ONLY on each column's lowest cell (including a ragged column's mid-grid bottom), nothing

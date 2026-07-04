@@ -4502,6 +4502,14 @@ class GridPlot(BaseLivePlot):
             self.site_axes.append(ax)
             self.cell_renderer.draw(ax, k)
             self._style_cell_ticks(ax, k)
+        # SINGLE SOURCE: every FROM-SCRATCH cell draw ends by re-asserting the stored VIEW knobs (the
+        # general curve fit + pinned x-window).  Both full-rebuild entry points funnel through here --
+        # the initial ``show`` AND ``_rebuild_grid`` (the return leg of the notebook / Edit-tab
+        # ``unfocus``) -- so a fit STICKS across a zoom-in-and-back and shows on first load of a recipe
+        # that carries one, BY CONSTRUCTION.  No rebuild path can silently drop the fit (the bug where
+        # double-clicking a cell and returning wiped the grid's fit).  Idempotent + a cheap no-op when
+        # the grid carries no view knobs (:meth:`_apply_view_knobs` early-returns).
+        self._apply_view_knobs()
 
     def update_core(self) -> None:
         # A recipe (non-faceted) grid is a snapshot; the LIVE facet feed arrives via update_cells.
