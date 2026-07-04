@@ -31,15 +31,15 @@ the rules don't get re-broken.
    (`live` re-exports the same name). There is NO separate render-scale. Public
    `show_pulse_gui` / `show_task_console` default to `scale=None` (auto).
 5. **Art-bearing fluent widgets stay internal.** `qt_fluent.*` and `qt_canvas.*`
-   (including `FluentGroupBox(shadow=)`, `FluentFrame(shadow=)`,
-   `add_fluent_shadow`, `EmbeddedFigureCanvas`) are **not** re-exported from
-   `frontend/__init__.py`. Shadows / borders / corner radii are construction
+   (including `FluentGroupBox`, `FluentFrame(bordered=)`, `stroke_card_border`,
+   `EmbeddedFigureCanvas`) are **not** re-exported from
+   `frontend/__init__.py`. Card borders / corner radii are construction
    details, never public knobs. Do not promote them to the package surface.
 6. **Adding a public parameter requires classifying it.** Before adding a
    parameter to a `__all__` callable, classify it: **DATA** (labels, title,
    bins, thresholds, relim_mode, cmap-from-a-list, channels, roi_radius) is
    allowed on the public surface; **ART / GEOMETRY / TYPOGRAPHY** (margins, dpi,
-   colours, sizes, shadow, fonts, bad_color) lives on **internal classes only**.
+   colours, sizes, borders, fonts, bad_color) lives on **internal classes only**.
 7. **Every plot IS a `BaseLivePlot` — the reusable layer is not optional.** The
    reason this package exists is that every plot reuses ONE layer: the selectors
    (`selectors.py`: zoom/pan, area, cross, draggable lines) and the `DataFigure`
@@ -98,8 +98,16 @@ the rules don't get re-broken.
   lineedits on small screens. → rule 4 (one scale rule).
 - **High-DPI figure warp** (commit 82f941a): stock Qt synced figure size from the
   widget, breaking fixed-inch axes. → `EmbeddedFigureCanvas` invariants, rule 4.
-- **Panel cards lost their shadow** when a `shadow=False` toggle was reachable
-  during construction → the visual-design regression that motivated rule 5/6.
+- **Fluent cards are FLAT** — a 1 px `DIVIDER` border, no drop shadow. The soft
+  `QGraphicsDropShadowEffect` re-rasterised + blurred the whole card on EVERY
+  paint (~250 ms of a 35-site grid card's cold load at 3× dpr); it was removed
+  for a painted border that costs nothing and reads the same "raised card"
+  boundary. `FluentGroupBox`/`FluentFrame(bordered)` carry it, `FluentTabWidget`
+  strokes it in its `paintEvent` (a `QTabBar::tab` stylesheet border would
+  cascade onto each tab). The card edge stays a sealed construction detail
+  (rule 5/6): never a per-call knob. (History: an earlier `shadow=False` toggle
+  reachable during construction was itself the regression that first motivated
+  the sealing — the sealing lesson outlived the shadow.)
 - **PDF builds littered docs/** with `.tex/.sty/.aux/.log/.toc` because the build
   wrote intermediates in place → `render_notes_pdf` now assembles the tex in
   memory and compiles via `render_tex_pdf` in a temp dir (only the `.pdf` lands

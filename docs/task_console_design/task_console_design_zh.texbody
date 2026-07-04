@@ -293,7 +293,7 @@ value = occupied - b_occupied          # 两个实验相减 -> 1D
 \chapter{卡片与布局}
 
 \section{卡片=带标题的 Fluent 卡}
-\pyapi{PanelCard} 继承 \pyapi{FluentGroupBox}，卡框标题=面板类型（2D image / Site map / …），带 fluent 阴影（\pyapi{CachedDropShadow}，按 silhouette 缓存、move 时不重新模糊）。画布下方、卡片底部一行灰色状态行（当前 shot + 来源表达式回显）。标题行右端一个 \pyapi{Setting} 文字按钮（出错变红、错误进 tooltip）。
+\pyapi{PanelCard} 继承 \pyapi{FluentGroupBox}，卡框标题=面板类型（2D image / Site map / …），用一条 1 px \pyapi{DIVIDER} 扁平边框勾勒（不是软阴影——软阴影每帧要把整张卡重栅格化再高斯模糊，35 站点大网格卡冷载入多花 ~250 ms，已移除）。画布下方、卡片底部一行灰色状态行（当前 shot + 来源表达式回显）。标题行右端一个 \pyapi{Setting} 文字按钮（出错变红、错误进 tooltip）。
 
 \section{模数闭合:footer 吸收差额}
 图本身=plot 区域+边距，边距不随数据区折半，所以\tfocus{光靠 canvas 永远对不齐网格}。卡框的状态行区按行数\tfocus{吸收这点差额}：\pyapi{\_card\_size(size) = rows$\times$pitch\_y - gap}，使得\tfocus{一张 2x2 卡严格等于两张 1x2 卡叠起来加一道间隙}（竖直 pitch 323、水平 259，契约测试锁定 \pyapi{2$\times$315+8 == 638}）。任意尺寸混排严丝合缝。

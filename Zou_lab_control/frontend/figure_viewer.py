@@ -83,7 +83,6 @@ from .qt_fluent import (
     WINDOW_SCREEN_FRACTION,
     center_window_on_primary_screen,
     ensure_qt_app,
-    fluent_tab_shadow_margin,
     scaled_px,
     screen_fit_window_size,
     set_fluent_scale,
@@ -521,13 +520,11 @@ class FigureViewer(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------ layout
     def _build_info_column(self) -> QtWidgets.QWidget:
-        # The Info column MIRRORS the console beside it: a FLAT header card (the path picker) ABOVE a
-        # SHADOWED tab card -- TWO separate fluent cards, NOT a tab card nested inside an outer frame.
-        # The old nesting (an outer FluentFrame wrapping the tab widget, which carries its OWN drop
-        # shadow) let the outer card clip the inner tab's upward shadow bleed, so the tab bar's top read
-        # as CUT OFF.  Two sibling cards each keep their own elevation and nothing clips.  The column's
-        # margins / header height / header<->tab gap match the console's (scaled_px 14 / 48 / 10) so the
-        # two header cards and the two tab cards line up row-for-row across the divider.
+        # The Info column MIRRORS the console beside it: a plain header bar (the path picker) ABOVE a
+        # flat-bordered tab card -- TWO separate SIBLING fluent cards, NOT a tab card nested inside an
+        # outer frame (nesting a bordered card inside another bordered card would double the edge).  The
+        # column's margins / header height / header<->tab gap match the console's (scaled_px 14 / 48 /
+        # 10) so the two header bars and the two tab cards line up row-for-row across the divider.
         col = QtWidgets.QWidget()
         col.setStyleSheet("background: transparent;")
         col.setFixedWidth(self._info_col_w)
@@ -542,7 +539,7 @@ class FigureViewer(QtWidgets.QWidget):
         # picking the image loads its SIBLING ``<image>.with_suffix('.npz')`` data (the save writes the
         # pair).  A FLAT header (no shadow) mirrors the console header, which is flat so its shadow's soft
         # bottom edge never draws a thin line into the gap above the tab strip.
-        header_frame = FluentFrame(shadow=False)
+        header_frame = FluentFrame(bordered=False)
         header_frame.setFixedHeight(scaled_px(48, minimum=38))
         header = QtWidgets.QHBoxLayout(header_frame)
         header.setContentsMargins(scaled_px(12), scaled_px(6), scaled_px(12), scaled_px(6))
@@ -557,12 +554,10 @@ class FigureViewer(QtWidgets.QWidget):
         header.addWidget(self.path_edit, 1)
         lay.addWidget(header_frame)
 
-        # --- Info tabs card: its OWN shadowed card (no outer frame to clip its top shadow) ---------------
+        # --- Info tabs card: its OWN flat-bordered card --------------------------------------------------
         # Plot (how it draws) | Measurement (data shapes / source) | Device (run provenance) | Flow (the
-        # upstream DAG of how the data was produced) | Raw (the whole dict).  Reserve the tab shadow's top
-        # bleed above the card EXACTLY like the console does (gap = spacing + this = fluent_tab_shadow_margin)
-        # so the strip's top shadow is fully visible at every scale.
-        lay.addSpacing(max(0, fluent_tab_shadow_margin() - lay.spacing()))
+        # upstream DAG of how the data was produced) | Raw (the whole dict).  The tab card carries a flat
+        # 1 px border (no drop shadow), so no top-bleed headroom is reserved -- the row spacing is the gap.
         self.info_tabs = FluentTabWidget()
         self.info_tabs.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.plot_layout = self._add_rows_tab("Plot")

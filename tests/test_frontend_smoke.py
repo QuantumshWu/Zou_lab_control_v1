@@ -1333,9 +1333,10 @@ def test_task_console_layout_is_top_left_gravity():
     no_overlap([left, right])
 
 
-def test_task_console_cards_have_fluent_shadow(monkeypatch):
-    """Panel cards reuse the fluent card design: the CachedDropShadow effect
-    must be attached (the flat 1px-border look was a regression)."""
+def test_task_console_cards_are_flat_bordered(monkeypatch):
+    """Panel cards are FLAT cards: a 1 px DIVIDER border delineates each one, with NO QGraphicsEffect
+    drop shadow (the soft shadow re-rasterised + blurred the whole card on every paint -- ~250 ms of a
+    35-site grid card's cold load at 3x dpr).  Mechanically enforces the flat-card design."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -1343,7 +1344,7 @@ def test_task_console_cards_have_fluent_shadow(monkeypatch):
 
     console = dt.demo_console(shots=3)
     for card in console.cards:
-        assert card.graphicsEffect() is not None, card.config.title
+        assert card.graphicsEffect() is None, card.config.title
     console.shutdown()
 
 
@@ -2520,10 +2521,11 @@ def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
         assert first_card.name_edit.placeholderText() != ""
         assert first_card.duration_edit.geometry().right() <= first_card.width()
         assert first_card.unit_combo.geometry().right() <= first_card.width()
-        assert editor.tabs.graphicsEffect() is not None
-        assert editor.names_panel.graphicsEffect() is not None
-        assert editor.channel_panel.graphicsEffect() is not None
-        assert first_card.graphicsEffect() is not None
+        # Flat cards: no QGraphicsEffect drop shadow anywhere (a 1 px border delineates each card).
+        assert editor.tabs.graphicsEffect() is None
+        assert editor.names_panel.graphicsEffect() is None
+        assert editor.channel_panel.graphicsEffect() is None
+        assert first_card.graphicsEffect() is None
         assert editor.button_frame.metaObject().className() == "FluentFrame"
 
         def _has_ancestor(widget, frame):
@@ -2552,9 +2554,9 @@ def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
         channels_box = _group_box_ancestor(editor.add_channel_combo)
         assert control_box is not None and control_box.title() == "Control"
         assert channels_box is not None and channels_box.title() == "Channels"
-        # The titled cards carry the Fluent shadow (the container itself is flat).
-        assert control_box.graphicsEffect() is not None
-        assert channels_box.graphicsEffect() is not None
+        # The titled cards are flat (a 1 px border delineates them, no drop-shadow effect).
+        assert control_box.graphicsEffect() is None
+        assert channels_box.graphicsEffect() is None
         assert editor.load_button.text() == "Load"
         # The control bar is compact: every button is single-line (no wrapped
         # "Stop\nPulse" art) so the bar stays short and the editor area expands.
@@ -2993,70 +2995,6 @@ def test_pulse_gui_preview_refresh_skips_rebuild_when_unchanged(monkeypatch):
         assert editor._preview_canvas is not canvas
     finally:
         editor.close()
-
-
-def test_pulse_gui_shadows_pixel_match_stock_effect(monkeypatch):
-    """CachedDropShadow must render the editor pixel-identical to the stock
-    QGraphicsDropShadowEffect (the look is mandatory; only the implementation
-    may differ).
-
-    Guards two real regressions the user caught on screen:
-    * drawSource()-based effects silently break NESTED effects (every card
-      shadow inside the shadowed tab widget vanished);
-    * a rounded-rect silhouette bake painted a white band over the transparent
-      strip right of the tabs (the tab widget is not an opaque rounded rect).
-    """
-
-    pytest.importorskip("PyQt5")
-    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-
-    from PyQt5 import QtGui, QtWidgets
-
-    from Zou_lab_control.frontend import devtools as dt
-    from Zou_lab_control.frontend import qt_fluent as qf
-
-    def grab_editor() -> np.ndarray:
-        editor = dt.demo_editor(size=(1480, 900))
-        dt.settle(editor)
-        image = editor.grab().toImage().convertToFormat(QtGui.QImage.Format_ARGB32)
-        w, h = image.width(), image.height()
-        ptr = image.bits()
-        ptr.setsize(h * image.bytesPerLine())
-        arr = np.frombuffer(ptr, np.uint8).reshape(h, image.bytesPerLine() // 4, 4)[:, :w, :3].copy()
-        editor.close()
-        return arr.astype(int)
-
-    cached = grab_editor()
-
-    def add_stock_shadow(widget, *, blur=20, alpha=50, offset=0, **_ignored):
-        effect = QtWidgets.QGraphicsDropShadowEffect(widget)
-        effect.setBlurRadius(qf.scaled_px(blur))
-        effect.setColor(QtGui.QColor(0, 0, 0, alpha))
-        effect.setOffset(0, qf.scaled_px(offset, minimum=0))
-        widget.setGraphicsEffect(effect)
-
-    monkeypatch.setattr(qf, "add_fluent_shadow", add_stock_shadow)
-    stock = grab_editor()
-
-    diff = np.abs(stock - cached).max(axis=2)
-    # CachedDropShadow bakes the shadow from the source's OWN alpha (white-filled), so it matches
-    # the stock effect for ANY widget shape -- including the tab widget whose UNSELECTED tabs are
-    # transparent (a hand-built silhouette baked a white BAND over them: ~50 000 px, max ~30).  The
-    # residual here is sub-perceptible penumbra antialiasing between a CACHED blur (baked once into a
-    # pixmap) and the stock DIRECT blur -- a few hundred px that differ by AT MOST a handful of grey
-    # levels (measured ~250 px, max ~8, across the tab widget + every nested card shadow).  The two
-    # real regressions this guards still fail by orders of magnitude: a white band / missing shadow
-    # is tens of thousands of px (count guard), and any VISIBLE mismatch blows the max-diff guard.
-    assert int((diff > 4).sum()) < 400, (int(diff.max()), int((diff > 4).sum()))
-    assert int(diff.max()) <= 16   # tightened from 40: the alpha-mask floor is max ~8; a band was ~30
-
-    # ... and the shadows must actually exist (compare against no effect at all):
-    monkeypatch.setattr(qf, "add_fluent_shadow", lambda widget, **kw: None)
-    none = grab_editor()
-    presence = np.abs(stock - none).max(axis=2)
-    presence_cached = np.abs(cached - none).max(axis=2)
-    assert int((presence > 10).sum()) > 10_000          # stock shadows touch many px
-    assert int((presence_cached > 10).sum()) > 10_000   # ours must too
 
 
 def test_pulse_gui_preview_wheel_over_plot_never_scrolls_page(monkeypatch):

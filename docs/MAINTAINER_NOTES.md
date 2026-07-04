@@ -300,9 +300,11 @@ popups, counters, and thin scrollbars share styling. Closed combo boxes ignore
 wheel events.
 
 Visual rules: Segoe UI 12pt, background `#F3F3F3`, text `#323130`, accent
-`#77AADD`, radius 4px, soft card shadows. `FluentGroupBox` is the white card with
-grey title pill — keep the no-border soft-shadow frame; do not add hard outlines
-or replace the editor with plain tables.
+`#77AADD`, radius 4px, flat 1px `DIVIDER` card borders. `FluentGroupBox` is the
+white card with grey title pill — delineated by a painted 1px border, NOT a drop
+shadow (the soft shadow re-rasterised + blurred the whole card on every paint —
+~250ms of a 35-site grid card's cold load at 3× dpr — so it was removed). Keep the
+flat card border a sealed construction detail; do not replace the editor with plain tables.
 
 ### Pulse GUI Layout Contract
 

@@ -93,7 +93,6 @@ from .qt_fluent import (
     FluentWindow,
     center_window_on_primary_screen,
     ensure_qt_app,
-    fluent_tab_shadow_margin,
     fluent_text_width,
     fluent_widget_stylesheet,
     scaled_px,
@@ -1796,7 +1795,7 @@ class PanelCard(FluentGroupBox):
                  grid_recipe_provider=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
-        super().__init__(PANEL_KINDS[config.kind], parent, shadow=True)
+        super().__init__(PANEL_KINDS[config.kind], parent)
         self.config = config
         self.names_provider = names_provider   # callable -> live signal names (Setting combo)
         # callable -> {signal name: [source node labels]}, so the picker can show
@@ -5659,7 +5658,7 @@ class LogicNodeRow(FluentFrame):
     STATE_COLORS = {"stopped": GREY, "running": GREEN, "error": RED}
 
     def __init__(self, node: LogicNodeConfig, parent=None):
-        super().__init__(parent, shadow=True)
+        super().__init__(parent)
         self.node = node
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(scaled_px(12), scaled_px(8), scaled_px(12), scaled_px(8))
@@ -5958,16 +5957,10 @@ class TaskConsole(QtWidgets.QWidget):
         # visible top/bottom edges line up with the Info card beside it.  Standalone keeps the 8 px inset
         # off the window chrome.
         v_margin = 0 if self.embedded else scaled_px(8)
-        # The tab card is the LAST child of this root layout, and its soft drop shadow bleeds
-        # ``fluent_tab_shadow_margin`` px BELOW its geometry.  Reserve that bleed at the BOTTOM of the
-        # console's OWN layout so the shadow is not clipped by the console's bottom edge.  (An EMBEDDED host
-        # margin -- the figure viewer's console holder -- sits OUTSIDE the console widget and therefore
-        # cannot un-clip a shadow that is already clipped INSIDE the console's tree: this is the real root
-        # cause of the "bottom shadow cut off" the outer holder margin never fixed.)  The TOP inset stays
-        # ``v_margin`` (0 embedded) so the header still lines up flush with the Info card beside it; the top
-        # shadow bleed is topped up separately just above the tab widget (see ``root.addSpacing`` below).
-        bottom_margin = max(v_margin, fluent_tab_shadow_margin())
-        root.setContentsMargins(margin, v_margin, margin, bottom_margin)
+        # The tab card carries a flat 1 px border (no drop shadow), so no bottom-bleed headroom is
+        # reserved -- top and bottom insets are both the plain ``v_margin`` (0 embedded, so the header
+        # lines up flush with the Info card beside it).
+        root.setContentsMargins(margin, v_margin, margin, v_margin)
         # A clear GAP separates the three rows -- the header card, the (hidden) task banner and
         # the tab card -- so they read as DISTINCT rounded cards on the grey window background.
         # The header is flat (no drop shadow) and the tab bar draws no top base line, so this
@@ -5977,7 +5970,7 @@ class TaskConsole(QtWidgets.QWidget):
         # FLAT header (no drop shadow): the shadow's soft bottom edge cast a thin grey line
         # into the gap right above the tab strip (the "line above the tabs").  The tab widget
         # below carries its own card, so the header needs no elevation -- it is a plain top bar.
-        header_frame = FluentFrame(shadow=False)
+        header_frame = FluentFrame(bordered=False)
         header_frame.setFixedHeight(scaled_px(48, minimum=38))
         header = QtWidgets.QHBoxLayout(header_frame)
         header.setContentsMargins(scaled_px(12), scaled_px(6), scaled_px(12), scaled_px(6))
@@ -6174,14 +6167,8 @@ class TaskConsole(QtWidgets.QWidget):
 
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.tab_close_requested.connect(self._on_editor_tab_closed)
-        # The tab card (Monitor / Logic / Edit) carries a soft drop shadow whose blur+offset bleeds
-        # ``fluent_tab_shadow_margin`` past its TOP edge.  The generic row spacing above it is smaller than
-        # that bleed, so the tab strip's top read as CUT OFF -- most visibly in the EMBEDDED figure viewer,
-        # whose top inset is 0.  Top up the gap above the tabs to EXACTLY the shadow bleed (the ONE source
-        # shared with the shadow itself and with the Info column's own tab-gap), so the whole top shadow is
-        # visible at every display scale.  (Only the shortfall is added, so a standalone console's existing
-        # gap is unchanged where it already suffices.)
-        root.addSpacing(max(0, fluent_tab_shadow_margin() - root.spacing()))
+        # The tab card (Monitor / Logic / Edit) carries a flat 1 px border (no drop shadow), so the row
+        # spacing above it is the whole gap -- no extra top-bleed headroom is topped up.
         root.addWidget(self.tabs, 1)
 
     # ------------------------------------------------------------------ state

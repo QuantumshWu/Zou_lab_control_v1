@@ -1083,11 +1083,10 @@ def test_flow_tab_always_shows_at_least_raw_to_plot(tmp_path):
         plt.close("all")
 
 
-def test_embedded_console_reserves_tab_shadow_bleed(tmp_path):
-    """#2: the embedded TaskConsole reserves its own tab-card drop-shadow bleed at the BOTTOM of its root
-    layout (a host margin sits OUTSIDE the console and cannot un-clip a shadow clipped inside its tree --
-    the real 'bottom shadow cut off' root cause).  The bottom content margin must be >= the shadow bleed."""
-    from Zou_lab_control.frontend.qt_fluent import fluent_tab_shadow_margin
+def test_embedded_console_tab_card_is_flat(tmp_path):
+    """The embedded TaskConsole's tab card is a FLAT card: a 1 px border delineates it, with NO drop
+    shadow -- so the console reserves NO bleed headroom and its bottom content margin is just the plain
+    embedded inset (0).  (Was: a soft shadow whose bottom bleed had to be reserved inside the tree.)"""
     npz = tmp_path / "bare.npz"
     p = plot(np.linspace(0, 1, 20), np.random.default_rng(0).normal(size=20), display=False)
     out = p.save(str(npz))
@@ -1095,9 +1094,8 @@ def test_embedded_console_reserves_tab_shadow_bleed(tmp_path):
     try:
         con = v.console                                  # the real EMBEDDED TaskConsole the viewer hosts
         assert con.embedded
-        bottom = con.layout().contentsMargins().bottom()
-        assert bottom >= fluent_tab_shadow_margin(), \
-            f"embedded console bottom margin {bottom} must reserve the tab shadow bleed {fluent_tab_shadow_margin()}"
+        assert con.tabs.graphicsEffect() is None         # flat tab card -- no QGraphicsEffect drop shadow
+        assert con.layout().contentsMargins().bottom() == 0   # no bleed reserved (embedded inset is 0)
     finally:
         win = v.window()
         if win is not None:

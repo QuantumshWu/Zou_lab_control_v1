@@ -2,7 +2,7 @@
 
 The visual constants and widget shapes follow the original Confocal_GUIv2
 Fluent layer: pale blue accent, Segoe UI text, white cards, small radii, and
-soft shadows.
+flat 1 px DIVIDER card borders (no drop shadows -- see ``stroke_card_border``).
 """
 
 from __future__ import annotations
@@ -40,8 +40,8 @@ BG = "#F3F3F3"
 TEXT = "#323130"
 HINT = "#F0a150"
 PLACEHOLDER = "#A19F9D"
-# Light neutral hairline used to delineate cards that opt out of a drop shadow
-# (shadows are costly to repaint while scrolling).
+# Light neutral hairline that delineates every flat fluent card (a painted 1 px border, no drop
+# shadow -- shadows were costly to re-rasterise + blur on every repaint; see stroke_card_border).
 DIVIDER = "#E1DFDD"
 GREEN = "#7FC2AD"
 RED = "#CD7380"
@@ -318,170 +318,29 @@ def status_dot_stylesheet(color: str, *, radius: int = 8) -> str:
     return f"background:{color}; border-radius:{scaled_px(radius)}px;"
 
 
-# CachedDropShadow caches BAKED SHADOWS keyed by the source widget's OWN opaque
-# alpha (its rendered silhouette) -- so the expensive Gaussian blur runs once per
-# shape, not on every repaint.  The live widget content is rasterised fresh each
-# paint (via Qt's own sourcePixmap machinery, which also keeps NESTED effects
-# working), and the shadow is baked from a white-filled copy of that same
-# rasterised source.  This works for ANY widget shape with no per-widget
-# silhouette description to maintain: the baked white body lands exactly where the
-# source is opaque, so the live source covers it and nothing bleeds through the
-# transparent regions.
-_SHADOW_PIXMAP_CACHE: dict[tuple, QtGui.QPixmap] = {}
+# Fluent cards are delineated by a flat 1 px ``DIVIDER`` border (the same edge as the combobox / Setting
+# popup), NOT a drop shadow.  A ``QGraphicsDropShadowEffect`` re-rasterises the whole widget subtree and
+# re-runs a Gaussian blur on EVERY paint (measured ~250 ms of a 35-site grid card's cold load at 3x dpr);
+# a 1 px border costs nothing and reads the same "raised card" boundary.  ``QGroupBox`` cards carry the
+# border in their stylesheet (a ``QGroupBox`` selector cannot cascade onto a QFrame child); ``FluentFrame``
+# and ``FluentTabWidget`` -- which nest their own type -- PAINT the border (a ``QFrame`` stylesheet border
+# WOULD cascade to child QFrames), via this one helper, exactly like ``FluentPopup`` strokes its own edge.
+def stroke_card_border(widget: QtWidgets.QWidget, *, radius: int | None = None) -> None:
+    """Stroke a 1 px antialiased ``DIVIDER`` rounded border hugging ``widget``'s edge, in a paintEvent.
 
-
-def _baked_shadow_from_silhouette_pixmap(key: tuple, make_silhouette, blur: int, alpha: int,
-                                         offset: int, dpr: float) -> QtGui.QPixmap:
-    """Shadow baked from a WHITE-filled silhouette PIXMAP (the source's own alpha), cached by ``key``.
-
-    Unlike the path bake, the silhouette keeps the source's antialiased alpha edge, so the cast
-    shadow matches the stock ``QGraphicsDropShadowEffect`` exactly for ANY widget shape -- the
-    baked white body sits precisely where the source is opaque (so the live source covers it and
-    NOTHING bleeds through the transparent regions).  The returned pixmap is the source's padded
-    size, blitted 1:1.
-
-    ``make_silhouette`` is a FACTORY, not a built pixmap: the silhouette is the ONLY input the bake
-    consumes, so building it (a full-size white-fill of the freshly-rasterised source) is deferred to
-    a cache MISS.  On a HIT -- every repaint of an unchanged shape -- the factory is never called, so
-    a shadowed panel's repaint skips the white-fill entirely (measured ~64 ms/load of pure waste on a
-    3x screen: the composited output is byte-identical, only the redundant silhouette build is gone)."""
-    cached = _SHADOW_PIXMAP_CACHE.get(key)
-    if cached is not None:
-        return cached
-    if len(_SHADOW_PIXMAP_CACHE) > 256:
-        _SHADOW_PIXMAP_CACHE.clear()
-    silhouette = make_silhouette()          # built ONLY on a cache miss (the bake's sole input)
-    scene = QtWidgets.QGraphicsScene()
-    item = scene.addPixmap(silhouette)
-    effect = QtWidgets.QGraphicsDropShadowEffect()
-    effect.setBlurRadius(blur)
-    effect.setColor(QtGui.QColor(0, 0, 0, alpha))
-    effect.setOffset(0, offset)
-    item.setGraphicsEffect(effect)
-    out = QtGui.QPixmap(silhouette.width(), silhouette.height())
-    out.setDevicePixelRatio(dpr)
-    out.fill(QtCore.Qt.transparent)
-    painter = QtGui.QPainter(out)
+    Cascade-proof (painted, not a stylesheet rule) so a container that nests its own widget type does
+    not border every child.  Call from the widget's ``paintEvent`` AFTER its body is painted."""
+    r = float(_radius() if radius is None else radius)
+    painter = QtGui.QPainter(widget)
     painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-    log_w, log_h = silhouette.width() / dpr, silhouette.height() / dpr
-    scene.render(painter, QtCore.QRectF(0, 0, log_w, log_h), QtCore.QRectF(0, 0, log_w, log_h))
+    pen = QtGui.QPen(QtGui.QColor(DIVIDER))
+    pen.setWidthF(1.0)
+    painter.setPen(pen)
+    painter.setBrush(QtCore.Qt.NoBrush)
+    # inset by half the pen width so the 1 px stroke sits fully inside the widget, unclipped
+    rect = QtCore.QRectF(widget.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+    painter.drawRoundedRect(rect, r, r)
     painter.end()
-    _SHADOW_PIXMAP_CACHE[key] = out
-    return out
-
-
-class CachedDropShadow(QtWidgets.QGraphicsEffect):
-    """Drop shadow with a silhouette-cached blur + live source painting.
-
-    A stock ``QGraphicsDropShadowEffect`` re-rasterises the source widget and
-    re-runs the Gaussian blur on EVERY paint -- scrolling a panel of shadowed
-    cards spent ~90% of each frame in the blur.  Here the blurred shadow is
-    baked once per shape by the real stock effect and blitted, while the live
-    widget is rasterised through Qt's own ``sourcePixmap`` machinery and drawn
-    on top (fresh content every paint -> no ghosting).
-
-    Two hard-won correctness points (do not "simplify" these away):
-
-    * ``draw`` must follow the stock structure -- ``sourcePixmap`` in DEVICE
-      coordinates, paint under an identity world transform at the returned
-      offset.  Calling ``drawSource`` instead breaks the paint context of any
-      NESTED graphics effect (children render with a (0,0)/identity painter
-      and their shadows disappear), which blanked every card shadow inside
-      the shadowed tab widget.
-    * The shadow is baked from the SOURCE's own opaque alpha -- a white-filled
-      copy of the freshly rasterised source -- so it matches the widget's TRUE
-      opaque outline for any shape (a rounded card, or the tab strip whose
-      unselected tabs are transparent) with no per-widget silhouette to
-      maintain.  The baked white body lands exactly where the source is opaque,
-      so the live source covers it and nothing bleeds through transparent
-      regions.
-    """
-
-    def __init__(self, parent=None, *, radius: int, blur: int, alpha: int, offset: int):
-        super().__init__(parent)
-        self._radius = int(radius)
-        self._blur = int(blur)
-        self._alpha = int(alpha)
-        self._offset = int(offset)
-
-    def boundingRectFor(self, rect: QtCore.QRectF) -> QtCore.QRectF:  # noqa: N802
-        margin = float(self._blur + abs(self._offset))
-        return rect.adjusted(-margin, -margin, margin, margin)
-
-    def draw(self, painter: QtGui.QPainter) -> None:  # noqa: N802
-        if self._blur <= 0 and self._offset == 0:
-            self.drawSource(painter)
-            return
-        # Stock-effect structure: sourcePixmap() triggers Qt's proper
-        # (nested-safe) source rendering and yields the device-coordinate
-        # offset to paint at.
-        src, off = self.sourcePixmap(QtCore.Qt.DeviceCoordinates,
-                                     QtWidgets.QGraphicsEffect.PadToEffectiveBoundingRect)
-        if src.isNull():
-            return
-        # `src` is a device-resolution pixmap tagged with the screen dpr; the
-        # returned offset is LOGICAL, and under the identity world transform a
-        # dpr-tagged pixmap drawn at a logical position lands exactly on its
-        # device pixels (the painter keeps the dpr device transform).  The bake
-        # mirrors that: device-resolution pixels, logical geometry.
-        dpr = float(src.devicePixelRatioF() or 1.0)
-        # Cache key first (size + a cheap opaque-region signature so two same-size widgets of DIFFERENT
-        # shape don't collide, while a repaint of the same shape hits the cache).  The bake's ONLY input
-        # -- the white-filled silhouette -- is built LAZILY (below), so a cache hit skips it entirely.
-        rb = QtGui.QRegion(src.mask()).boundingRect()
-        key = ("alpha", src.width(), src.height(), rb.x(), rb.y(), rb.width(), rb.height(),
-               self._blur, self._alpha, self._offset, round(dpr, 2))
-
-        def _make_silhouette() -> QtGui.QPixmap:
-            # The silhouette is the source's OWN opaque alpha -- whatever shape the widget really paints
-            # (a rounded card, or the tab strip whose UNSELECTED tabs are transparent, ...).  White-fill
-            # the live source (keeping its antialiased alpha) and bake from THAT, so the baked white body
-            # sits exactly where the source is opaque (nothing bleeds through transparent regions) and the
-            # shadow matches the stock effect for ANY shape -- no hand-built per-widget silhouette to
-            # drift.  Built ONLY on a cache miss: a repaint of an unchanged shape never runs this.
-            silhouette = QtGui.QPixmap(src.size())
-            silhouette.setDevicePixelRatio(dpr)
-            silhouette.fill(QtCore.Qt.transparent)
-            sp = QtGui.QPainter(silhouette)
-            sp.drawPixmap(0, 0, src)
-            sp.setCompositionMode(QtGui.QPainter.CompositionMode_SourceIn)   # keep src's alpha, force RGB white
-            sp.fillRect(silhouette.rect(), QtCore.Qt.white)
-            sp.end()
-            return silhouette
-
-        shadow = _baked_shadow_from_silhouette_pixmap(key, _make_silhouette, self._blur, self._alpha,
-                                                      self._offset, dpr)
-        restore = painter.worldTransform()
-        painter.setWorldTransform(QtGui.QTransform())
-        painter.drawPixmap(off, shadow)
-        painter.drawPixmap(off, src)
-        painter.setWorldTransform(restore)
-
-
-def add_fluent_shadow(widget: QtWidgets.QWidget, *, blur: int = 20, alpha: int = 50, offset: int = 0) -> None:
-    shadow = CachedDropShadow(
-        widget, radius=_radius(), blur=scaled_px(blur), alpha=alpha,
-        offset=scaled_px(offset, minimum=0))
-    widget.setGraphicsEffect(shadow)
-
-
-# The FluentTabWidget drop-shadow parameters -- ONE source, so both the shadow itself and any layout
-# that must leave clearance for it (a tab card placed under another row) read the SAME numbers.  A soft
-# blur with a small downward offset; the shadow bleeds ``blur + offset`` (scaled) past every edge,
-# INCLUDING the top, so a host that stacks a tab card below another widget must reserve that much
-# headroom above it or the top shadow reads as clipped.
-_TAB_SHADOW_BLUR = 10
-_TAB_SHADOW_ALPHA = 50
-_TAB_SHADOW_OFFSET = 2
-
-
-def fluent_tab_shadow_margin() -> int:
-    """The pixel headroom a :class:`FluentTabWidget`'s drop shadow bleeds past its TOP edge -- the
-    ``blur + offset`` extent of :data:`_TAB_SHADOW_*`, at the current display scale.  A layout that
-    stacks a tab card under another row must add EXACTLY this much spacing above the card so the soft
-    top shadow is fully visible (never clipped by the row above).  ONE source with the shadow itself,
-    so the two can never drift out of step."""
-    return scaled_px(_TAB_SHADOW_BLUR) + scaled_px(_TAB_SHADOW_OFFSET, minimum=0)
 
 
 @contextlib.contextmanager
@@ -589,8 +448,12 @@ class FluentLabel(QtWidgets.QLabel):
 
 
 class FluentFrame(QtWidgets.QFrame):
-    def __init__(self, parent=None, *, shadow: bool = True, round: tuple[str, ...] = ("NW", "NE", "SE", "SW")):
+    def __init__(self, parent=None, *, bordered: bool = True, round: tuple[str, ...] = ("NW", "NE", "SE", "SW")):
         super().__init__(parent)
+        # ``bordered`` = a delineated flat card (1 px DIVIDER edge); False = a plain, edgeless region
+        # (a header / button strip that must not read as a boxed card).  The edge is PAINTED, never a
+        # stylesheet ``QFrame { border }`` rule -- that would cascade onto every child QFrame.
+        self._bordered = bool(bordered)
         corners = {corner.upper() for corner in round}
         top_left = _radius() if "NW" in corners else 0
         top_right = _radius() if "NE" in corners else 0
@@ -608,8 +471,11 @@ class FluentFrame(QtWidgets.QFrame):
             }}
             """
         )
-        if shadow:
-            add_fluent_shadow(self)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().paintEvent(event)
+        if self._bordered:
+            stroke_card_border(self)
 
 
 class FluentPopup(QtWidgets.QFrame):
@@ -660,19 +526,17 @@ class FluentPopup(QtWidgets.QFrame):
 
 
 class FluentGroupBox(QtWidgets.QGroupBox):
-    def __init__(self, title: str = "", parent=None, *, shadow: bool = True):
+    def __init__(self, title: str = "", parent=None):
         super().__init__(title, parent)
-        # A soft drop shadow (QGraphicsDropShadowEffect) is expensive to repaint
-        # -- it rasterises + blurs the whole widget every frame, which makes a
-        # tall, scrolled panel stutter.  When shadow is off we draw a light 1px
-        # border instead so the card is still delineated, for a fraction of the
-        # paint cost.  CARD_TITLE_PX of top padding reserves the ``QGroupBox::title`` strip.
-        border = "none" if shadow else f"1px solid {DIVIDER}"
+        # Flat card: a light 1 px DIVIDER border delineates it (no drop shadow -- that re-rasterised +
+        # blurred the whole widget on every paint, stuttering tall scrolled panels).  The ``QGroupBox``
+        # selector scopes the border to this card only (it cannot cascade onto a QFrame child).
+        # CARD_TITLE_PX of top padding reserves the ``QGroupBox::title`` strip.
         self.setStyleSheet(
             f"""
             QGroupBox {{
                 background: white;
-                border: {border};
+                border: 1px solid {DIVIDER};
                 border-radius: {_radius()}px;
                 margin-top: 0px;
                 padding-top: {scaled_px(CARD_TITLE_PX)}px;
@@ -690,8 +554,6 @@ class FluentGroupBox(QtWidgets.QGroupBox):
             }}
             """
         )
-        if shadow:
-            add_fluent_shadow(self)
 
     def set_outline(self, color: str | None) -> None:
         """Draw (color) or clear (None) a 2 px rounded outline on THIS card's outer
@@ -2078,7 +1940,6 @@ class FluentTabWidget(QtWidgets.QTabWidget):
             }}
             """
         )
-        add_fluent_shadow(self, blur=_TAB_SHADOW_BLUR, alpha=_TAB_SHADOW_ALPHA, offset=_TAB_SHADOW_OFFSET)
         self._overflow_btn = self._build_overflow_button()
         # The corner widget sits FLUSH at the widget's right edge, so the button's rounded hover
         # background used to be CLIPPED on the right.  Wrap it in a transparent holder whose right
@@ -2095,14 +1956,13 @@ class FluentTabWidget(QtWidgets.QTabWidget):
         self.currentChanged.connect(lambda _i: self._update_overflow())
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        # The white card is the WIDGET's own paint, not a by-product of the shadow.
-        # The ``::pane`` stylesheet fills only the page below the tab bar white, and
-        # ``QTabBar { background: transparent }`` leaves the strip see-through -- so the
-        # whole widget reads as one rounded white card ONLY if it paints that card itself
-        # (same principle as FluentFrame / FluentPopup, which paint their own white body).
-        # Painting it here also gives the baked shadow (`CachedDropShadow.draw`, which bakes
-        # from the source's own alpha) an opaque body across the FULL rect -- so the strip
-        # is backed and the shadow hugs the whole card, with no transparent strip-band.
+        # The white card is the WIDGET's own paint.  The ``::pane`` stylesheet fills only the page
+        # below the tab bar white, and ``QTabBar { background: transparent }`` leaves the strip
+        # see-through -- so the whole widget reads as one rounded white card ONLY if it paints that
+        # card itself (same principle as FluentFrame / FluentPopup, which paint their own white body).
+        # A flat 1 px DIVIDER border is then STROKED on top (after the tab content) to delineate the
+        # card -- painted here, NOT via a ``QTabBar::tab`` stylesheet border, so the flat edge hugs
+        # the whole card and never cascades onto each individual tab.
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
         painter.setPen(QtCore.Qt.NoPen)
@@ -2111,6 +1971,7 @@ class FluentTabWidget(QtWidgets.QTabWidget):
         painter.drawRoundedRect(QtCore.QRectF(self.rect()), radius, radius)
         painter.end()
         super().paintEvent(event)
+        stroke_card_border(self)
 
     def _build_overflow_button(self) -> QtWidgets.QToolButton:
         """The Fluent overflow affordance: a subtle ``...`` button (top-right corner) that
@@ -3209,7 +3070,6 @@ __all__ = [
     "FluentScrollArea",
     "FluentStatusDot",
     "FluentWindow",
-    "add_fluent_shadow",
     "align_to_resolution",
     "ensure_qt_app",
     "fluent_font_size",

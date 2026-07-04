@@ -204,7 +204,10 @@ def _panel_top_height() -> int:
     return _px(PANEL_TOP_HEIGHT, minimum=138)
 
 
-def _shadow_pad() -> int:
+def _card_gutter() -> int:
+    # The gutter (px) around/between flat fluent cards so their 1 px DIVIDER borders sit apart and
+    # don't touch or merge.  (Formerly _shadow_pad, which reserved the old drop shadow's outward
+    # bleed; flat cards have no bleed, so the SAME value is now simply the inter-card gutter.)
     return _px(5, minimum=4)
 
 
@@ -944,7 +947,7 @@ class PulseDragContainer(QtWidgets.QWidget):
         self.drag_start_pos = None
         self.dragging_index = None
         self.layout_main = QtWidgets.QHBoxLayout(self)
-        pad = _shadow_pad()
+        pad = _card_gutter()
         self.layout_main.setContentsMargins(pad, pad, pad, pad)
         self.layout_main.setSpacing(_px(5, minimum=3))
         self.layout_main.setAlignment(QtCore.Qt.AlignLeft)
@@ -1130,7 +1133,7 @@ class PulseDragContainer(QtWidgets.QWidget):
     def _indicator_x_for_items_pos(self, items_pos: int) -> int:
         spacing = self.layout_main.spacing()
         if not self.items:
-            return _shadow_pad()
+            return _card_gutter()
         if items_pos >= len(self.items):
             geo = self.items[-1].widget.geometry()
             return geo.x() + geo.width() + max(1, spacing // 2) - _px(1)
@@ -1140,7 +1143,7 @@ class PulseDragContainer(QtWidgets.QWidget):
     def _show_insert_indicator(self, items_pos: int) -> None:
         # OVERLAY positioning: geometry only, no layout mutation (a layout insert
         # per dragMove re-laid-out all later cards -> jitter during the drag).
-        pad = _shadow_pad()
+        pad = _card_gutter()
         self.insert_indicator.setGeometry(
             self._indicator_x_for_items_pos(items_pos), pad,
             self.insert_indicator.width(), max(_px(40), self.height() - 2 * pad))
@@ -1768,27 +1771,27 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.dataset_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.dataset_body = QtWidgets.QWidget()
         dataset = QtWidgets.QHBoxLayout(self.dataset_body)
-        shadow_pad = _shadow_pad()
+        gutter = _card_gutter()
         dataset.setContentsMargins(0, 0, 0, 0)
         dataset.setSpacing(0)
         self.names_panel_holder = QtWidgets.QWidget()
         self.names_panel_layout = QtWidgets.QVBoxLayout(self.names_panel_holder)
-        self.names_panel_layout.setContentsMargins(shadow_pad, shadow_pad, shadow_pad, shadow_pad)
+        self.names_panel_layout.setContentsMargins(gutter, gutter, gutter, gutter)
         self.names_panel_layout.setSpacing(0)
         dataset.addWidget(self.names_panel_holder)
 
         self.channel_panel_holder = QtWidgets.QWidget()
         self.channel_panel_layout = QtWidgets.QVBoxLayout(self.channel_panel_holder)
-        self.channel_panel_layout.setContentsMargins(shadow_pad, shadow_pad, shadow_pad, shadow_pad)
+        self.channel_panel_layout.setContentsMargins(gutter, gutter, gutter, gutter)
         self.channel_panel_layout.setSpacing(0)
         dataset.addWidget(self.channel_panel_holder)
 
-        # The collapsed stub gets the SAME shadow-pad holder as the panels above so its
-        # drop shadow has room to render -- without it the stub's edge shadow is clipped
-        # flush against the layout (the "no shadow after collapse" report).
+        # The collapsed stub gets the SAME gutter holder as the panels above so its flat 1 px border
+        # is inset consistently and lines up with the panels' -- the left column stays tidy whether a
+        # panel or its collapsed stub is shown.
         self.left_panel_stub_holder = QtWidgets.QWidget()
         stub_holder_layout = QtWidgets.QVBoxLayout(self.left_panel_stub_holder)
-        stub_holder_layout.setContentsMargins(shadow_pad, shadow_pad, shadow_pad, shadow_pad)
+        stub_holder_layout.setContentsMargins(gutter, gutter, gutter, gutter)
         stub_holder_layout.setSpacing(0)
         self.left_panel_stub = FluentFrame()
         self.left_panel_stub.setFixedWidth(_px(82, minimum=68))
@@ -1844,17 +1847,16 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         # using the same group-box-with-title style as the other panels for
         # visual consistency.  Kept compact (single-line buttons, tight 2x4 grid,
         # small margins) so the name/delay/period area keeps its vertical room. ---
-        self.button_frame = FluentFrame(shadow=False)
+        self.button_frame = FluentFrame(bordered=False)
         # Scope the reset to THIS frame via an ID selector: a bare `QFrame { ... }`
         # cascades `border: none` onto the titled Control/Channels cards nested
         # inside it and strips their group-box borders (root AGENTS §5.1).
         self.button_frame.setObjectName("zlcPulseButtonBar")
         self.button_frame.setStyleSheet("QFrame#zlcPulseButtonBar { background: transparent; border: none; }")
         bar = QtWidgets.QHBoxLayout(self.button_frame)
-        # Inset the Control / Channels group boxes by the shadow pad on every side
-        # so their drop shadows have room to render inside the frame instead of
-        # being clipped flush against its left / right / bottom edges.
-        _sp = _shadow_pad()
+        # Inset the Control / Channels group boxes by the card gutter on every side so their flat
+        # 1 px borders sit a hair inside the button bar instead of flush against its edges.
+        _sp = _card_gutter()
         bar.setContentsMargins(_sp, _sp + _px(2), _sp, _sp)
         bar.setSpacing(_px(10, minimum=8))
         cb_h = _px(30, minimum=26)

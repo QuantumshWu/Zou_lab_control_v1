@@ -78,7 +78,7 @@ class DeviceManagerPanel(QtWidgets.QWidget):
         devices = getattr(self._device_set, "devices", {}) or {}
         for domain in device_domains():
             names = self._device_set.device_names(domain.base_type)
-            card = FluentGroupBox(domain.label, shadow=False)
+            card = FluentGroupBox(domain.label)
             v = QtWidgets.QVBoxLayout(card)
             v.setContentsMargins(*(scaled_px(10),) * 2, scaled_px(10), scaled_px(10))
             v.setSpacing(scaled_px(4, minimum=2))
@@ -115,7 +115,7 @@ class DeviceManagerPanel(QtWidgets.QWidget):
 
         if self._scan_card is not None:
             self._scan_card.deleteLater()
-        card = FluentGroupBox(f"Discovered ({note})", shadow=False)
+        card = FluentGroupBox(f"Discovered ({note})")
         v = QtWidgets.QVBoxLayout(card)
         v.setContentsMargins(*(scaled_px(10),) * 2, scaled_px(10), scaled_px(10))
         v.setSpacing(scaled_px(4, minimum=2))

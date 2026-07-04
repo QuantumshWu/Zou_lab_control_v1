@@ -814,37 +814,6 @@ def test_preview_size_pin_is_transient_and_auto_recomputes():
         plt.close("all")
 
 
-# --------------------------------------------------------------------------- 5. embedded console tab shadow
-def test_embedded_console_reserves_tab_shadow_headroom():
-    """The embedded TaskConsole leaves at least the tab drop-shadow's top bleed
-    (``fluent_tab_shadow_margin``) above its tab strip, so the Monitor tab's top is not cut off (the
-    figure-viewer regression).  Asserted on the real widget geometry."""
-    from PyQt5 import QtCore, QtWidgets
-    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app, fluent_tab_shadow_margin
-    from Zou_lab_control.frontend.task_console import TaskConsole, TaskConsoleState
-    from Zou_lab_control.neutral_atom.core.signals import SignalHub
-
-    ensure_qt_app()
-    con = TaskConsole(hub=SignalHub(), state=TaskConsoleState(name="t", panels=[]),
-                      running_nodes=[], session=None, window_px=(900, 600), embedded=True)
-    try:
-        con.resize(900, 600)
-        con.show()
-        QtWidgets.QApplication.processEvents()
-        tabs = con.tabs
-        tab_top = tabs.mapTo(con, QtCore.QPoint(0, 0)).y()
-        # the widget directly above the tabs is the header card; the gap between them must hold the bleed
-        above_bottom = 0
-        for child in con.findChildren(QtWidgets.QWidget):
-            if child is tabs or not child.isVisible():
-                continue
-            geo_bottom = child.mapTo(con, QtCore.QPoint(0, child.height())).y()
-            if geo_bottom <= tab_top and geo_bottom > above_bottom and child.parent() is con:
-                above_bottom = geo_bottom
-        gap = tab_top - above_bottom
-        assert gap >= fluent_tab_shadow_margin(), \
-            f"gap above tabs {gap} < shadow bleed {fluent_tab_shadow_margin()} (Monitor tab top clipped)"
-    finally:
-        con.shutdown()
-        con.deleteLater()
-        plt.close("all")
+# (The embedded-console "reserve tab-shadow headroom" geometry test was removed with the flat-card
+# redesign: the tab card now carries a flat 1 px border with NO drop shadow, so there is no bleed to
+# reserve.  test_figure_viewer.test_embedded_console_tab_card_is_flat asserts the flat tab card.)
