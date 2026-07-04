@@ -29,6 +29,7 @@ from Zou_lab_control._readout_math import (
 from .style import (
     DESIGN_DPI,
     HIST_FILL_ALPHA,
+    bimodal_fit_line_specs,
     PALETTE,
     PANEL_DISPLAY_SCALE,
     SITE_OCCUPANCY_STYLE,
@@ -1302,7 +1303,7 @@ class Live2DDis(BaseLivePlot):
                                       guide_minmax=(y_min, y_max))
 
     def _attach_interactions(self) -> None:
-        self.tools = attach_interaction(self.ax, drag=self.drag, axdis=self.axdis, cax=self.cax)
+        self.tools = attach_interaction(self.ax, drag=self.drag, axdis=self.axdis)
         self.area, self.cross, self.zoom, self.drag = self.tools.area, self.tools.cross, self.tools.zoom, self.tools.drag
 
     def _refresh_display_image(self) -> None:
@@ -1379,7 +1380,6 @@ class Live2DDis(BaseLivePlot):
             y_array=self.y_array,
             grid=self.grid,
             axdis=self.axdis,
-            cax=self.cax,
             extents_square=self.extents_square,
             bad_color=self.bad_color,
         )
@@ -1533,7 +1533,7 @@ class LiveSiteMap(BaseLivePlot):
 
     def _attach_interactions(self) -> None:
         drag = getattr(self, "drag", None)
-        self.tools = attach_interaction(self.ax, drag=drag, axdis=self.axdis, cax=self.cax)
+        self.tools = attach_interaction(self.ax, drag=drag, axdis=self.axdis)
         self.area, self.cross, self.zoom, self.drag = self.tools.area, self.tools.cross, self.tools.zoom, self.tools.drag
 
     def update_clim(self) -> None:
@@ -1579,7 +1579,7 @@ class LiveSiteMap(BaseLivePlot):
 
     def _install_state(self) -> None:
         self.fig._zlc_state = PlotState(plot_type="SITES", x_array=self.data_x[:, 0], y_array=self.data_y,
-                                        axdis=self.axdis, cax=self.cax)
+                                        axdis=self.axdis)
 
 
 def _pulse_attr(row, name: str, default=None):
@@ -2913,9 +2913,10 @@ class HistogramFigure(BaseLivePlot):
         # threshold/fit lines read through the bars -- never an opaque block beside translucent ones.
         self.poly = PolyCollection(self.verts, facecolors=PALETTE["hist_fill"], alpha=HIST_FILL_ALPHA)
         self.ax.add_collection(self.poly)
-        (self.fit_line_left,) = self.ax.plot([], [], color=PALETTE["fit_left"], linewidth=1, alpha=0.8)
-        (self.fit_line_right,) = self.ax.plot([], [], color=PALETTE["fit_right"], linewidth=1, alpha=0.8)
-        (self.fit_line_total,) = self.ax.plot([], [], color=PALETTE["fit_total"], linewidth=1, alpha=0.35)
+        _spec_l, _spec_r, _spec_t = bimodal_fit_line_specs()   # ONE owned fit-line style (shared with the grid cell)
+        (self.fit_line_left,) = self.ax.plot([], [], **_spec_l)
+        (self.fit_line_right,) = self.ax.plot([], [], **_spec_r)
+        (self.fit_line_total,) = self.ax.plot([], [], **_spec_t)
         self.bimodal_popt = None
         self.fit_threshold = None
         self._fit_bimodal()
@@ -3871,9 +3872,10 @@ class HistogramCell(GridCell):
         if self.fit == "none" and lines is None:
             return                              # never fitted on this cell -> nothing to build/clear
         if lines is None:                       # lazily build the same 3-line set the standalone dis owns
-            lines = (ax.plot([], [], color=PALETTE["fit_left"], linewidth=1, alpha=0.8)[0],
-                     ax.plot([], [], color=PALETTE["fit_right"], linewidth=1, alpha=0.8)[0],
-                     ax.plot([], [], color=PALETTE["fit_total"], linewidth=1, alpha=0.35)[0])
+            _spec_l, _spec_r, _spec_t = bimodal_fit_line_specs()   # SAME owned style as HistogramFigure
+            lines = (ax.plot([], [], **_spec_l)[0],
+                     ax.plot([], [], **_spec_r)[0],
+                     ax.plot([], [], **_spec_t)[0])
             self._fit_lines[k] = lines
         for ln in lines:
             ln.set_data([], [])
@@ -4285,7 +4287,7 @@ class _GridData:
         for c in self.cells:
             c.ylim(y_min, y_max)
 
-    def save(self, path: str = "", *, extra_info=None, image_ext: str = ".png", **kwargs):
+    def save(self, path: str = "", *, extra_info=None, image_ext: str = "png", **kwargs):
         """Save the whole grid the SAME way DataFigure saves a single plot: ONE png AND ONE matching
         ``.npz`` that ``load_figure`` reopens FAITHFULLY.  A grid is a first-class LOADABLE kind (like the
         pulse figure): the ``.npz`` carries the standard ``data_x`` / ``data_y`` / ``info`` triple with
@@ -4302,7 +4304,7 @@ class _GridData:
         import time
         from .data_figure import resolve_save_base
         base = resolve_save_base(path, time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime()))   # shared path stem (#C4)
-        image_path = base.with_suffix(image_ext if str(image_ext).startswith(".") else f".{image_ext}")
+        image_path = base.with_suffix(f".{image_ext}")   # dotless ext, same as DataFigure.save
         data_path = base.with_suffix(".npz")
         self.fig.savefig(image_path, **kwargs)
         # The faithful reproduction source: the grid's replay recipe (per-cell distributions / kernels +
@@ -4925,9 +4927,10 @@ class GridPlot(BaseLivePlot):
                     store[k] = popt
             # popt drives the title's ``{popt}`` context -- refresh titles so a template referencing it
             # shows the fresh values (a no-op relative to the identifier when no template uses popt).
+            # Go through the ONE re-title primitive so the per-cell title rule (size / pad / cell_title)
+            # lives in a single place and the fit-refresh path can never drift from a title-only edit.
             if model != "none":
-                for k, ax in enumerate(self.site_axes):
-                    apply_title(ax, cell.cell_title(k), size=cell.title_size_pt(), pad=1.5)
+                self._retitle_cells()
         cell._general_popt_store = store
 
     def _refit_axes(self, ax, df, model: str, cmd: str, *, key, is_display: bool = False) -> tuple:

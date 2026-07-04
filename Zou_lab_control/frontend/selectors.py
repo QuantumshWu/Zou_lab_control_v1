@@ -30,7 +30,6 @@ class PlotState:
     y_array: np.ndarray | None = None
     grid: np.ndarray | None = None
     axdis: plt.Axes | None = None
-    cax: plt.Axes | None = None
     extents_square: list[float] | None = None
     bad_color: str = "white"
 
@@ -42,7 +41,6 @@ class InteractionBundle:
     zoom: Optional["ZoomPan"] = None
     drag: Optional["DragHLine | DragVLine"] = None   # 2-D clim drag is DragHLine; 1-D threshold drag is DragVLine
     axdis: Optional[plt.Axes] = None
-    cax: Optional[plt.Axes] = None
 
 
 def _format_xy_precision(ax: plt.Axes) -> tuple[int, int]:
@@ -537,13 +535,12 @@ def attach_interaction(
     zoompan: bool = True,
     drag: DragHLine | None = None,
     axdis: plt.Axes | None = None,
-    cax: plt.Axes | None = None,
 ) -> InteractionBundle:
     """Attach selector tools and keep strong references on the figure."""
     area_sel = AreaSelector(ax) if area else None
     cross_sel = CrossSelector(ax) if cross else None
     zoom_sel = ZoomPan(ax, area_selector=area_sel) if zoompan else None
-    tools = InteractionBundle(area=area_sel, cross=cross_sel, zoom=zoom_sel, drag=drag, axdis=axdis, cax=cax)
+    tools = InteractionBundle(area=area_sel, cross=cross_sel, zoom=zoom_sel, drag=drag, axdis=axdis)
     ax.figure._zlc_tools = tools
     return tools
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import matplotlib
@@ -213,10 +212,11 @@ def design_dpi(fig: plt.Figure) -> float:
 
 def create_axes_fixed(
     fig: plt.Figure,
-    data_px: tuple[int, int] = (480, 360),
-    margins_px: tuple[int, int, int, int] = (110, 110, 100, 40),
+    data_px: tuple[int, int] = STOCK_DATA_PX,
+    margins_px: tuple[int, int, int, int] = STOCK_MARGINS_PX,
 ) -> plt.Axes:
-    """Create one axes with a fixed logical-pixel data box and margins."""
+    """Create one axes with a fixed logical-pixel data box and margins (the stock confocal
+    single-axes geometry -- the SAME style.py tokens FigureSpec reads, never a hand-typed copy)."""
     dpi = design_dpi(fig)
     w_in = data_px[0] / dpi
     h_in = data_px[1] / dpi
@@ -274,45 +274,31 @@ def create_axes_grid(
     nrows: int,
     ncols: int,
     *,
-    cell_px: tuple[int, int] = (170, 130),
-    col_gap_px: int = 30,
-    row_gap_px: int = 40,
-    margins_px: tuple[int, int, int, int] = (78, 34, 60, 54),
-    data_px: tuple[int, int] | None = None,
+    col_gap_px: int,
+    row_gap_px: int,
+    margins_px: tuple[int, int, int, int],
+    data_px: tuple[int, int],
 ) -> list[plt.Axes]:
-    """Create ``nrows*ncols`` fixed-pixel cells in row-major (top-left first) order.
-
-    Every cell is the same fixed logical-pixel size and the gaps between them are
-    explicit, so cells never overlap; the figure is sized to fit all cells plus
-    margins, so nothing is cut off; and the shared fixed grid keeps every cell
-    aligned.  ``cell_px`` is ``(width, height)`` of one cell's full box (axes +
-    its own ticks); ``margins_px`` is ``(left, right, bottom, top)`` around the
-    whole grid (top leaves room for a suptitle).
-
-    ``data_px`` (``(width, height)``) makes the grid fill a TOTAL data region of that
-    size -- the SAME data region every other panel kind uses (``panel_plot_spec(size).data_px``)
-    -- by SUBDIVIDING it into ``ncols`` x ``nrows`` cells with the given inter-cell gaps
-    (``cell_px`` is then derived to fill ``data_px``, not read).  When given, the whole
-    cell block is the fixed data box, so ``fig._zlc_fixed_box_in`` is recorded EXACTLY as
-    ``create_axes_fixed`` does -- a grid figure's data region then equals a single-axes
-    panel's of the same size, and a size change truly rescales the cells (not just the
-    padding).  Omit it for the legacy fixed-``cell_px`` mode (cells drive the figure size).
-    """
+    """Create ``nrows*ncols`` fixed-pixel cells in row-major (top-left first) order that FILL a total
+    data region of ``data_px`` -- the SAME data region every other panel kind uses
+    (``panel_plot_spec(size).data_px``) -- by SUBDIVIDING it into ``ncols`` x ``nrows`` cells with the
+    given inter-cell gaps (each cell's size is DERIVED to fill the region after the gaps).  Cells never
+    overlap and the figure is sized to fit them plus ``margins_px`` (``(left, right, bottom, top)``, the
+    top leaves room for a suptitle), so nothing is cut off.  The whole cell block is recorded as the
+    fixed data box (``fig._zlc_fixed_box_in``) EXACTLY as :func:`create_axes_fixed` does, so a grid
+    figure's data region equals a single-axes panel's of the same size and a size change truly rescales
+    the cells (not just the padding)."""
 
     nrows, ncols = max(1, int(nrows)), max(1, int(ncols))
     dpi = design_dpi(fig)
     cgap, rgap = col_gap_px / dpi, row_gap_px / dpi
     L, R, B, T = [m / dpi for m in margins_px]
-    if data_px is not None:
-        # Fill a FIXED total data region (== panel_plot_spec(size).data_px): the cells + gaps
-        # exactly span ``data_px``, so a grid's data box matches a single-axes panel's of the
-        # same size.  cell_px is DERIVED to fill it (the remaining width/height after gaps,
-        # split evenly), never read from the argument.
-        dw_in, dh_in = data_px[0] / dpi, data_px[1] / dpi
-        cw_in = max((dw_in - (ncols - 1) * cgap) / ncols, 1.0 / dpi)
-        ch_in = max((dh_in - (nrows - 1) * rgap) / nrows, 1.0 / dpi)
-    else:
-        cw_in, ch_in = cell_px[0] / dpi, cell_px[1] / dpi
+    # The cells + gaps exactly span ``data_px``, so a grid's data box matches a single-axes panel's
+    # of the same size.  Each cell's size is DERIVED to fill it (remaining width/height after the
+    # gaps, split evenly).
+    dw_in, dh_in = data_px[0] / dpi, data_px[1] / dpi
+    cw_in = max((dw_in - (ncols - 1) * cgap) / ncols, 1.0 / dpi)
+    ch_in = max((dh_in - (nrows - 1) * rgap) / nrows, 1.0 / dpi)
 
     block_w = ncols * cw_in + (ncols - 1) * cgap
     block_h = nrows * ch_in + (nrows - 1) * rgap
@@ -343,10 +329,9 @@ def create_axes_grid(
     fig._zlc_grid = (nrows, ncols)
     # Record the WHOLE cell block as the fixed data box (like create_axes_fixed) so the grid's
     # data region equals panel_plot_spec(size).data_px and a focused single cell / contract test
-    # can read it back.  Only in data_px mode -- the legacy cell_px mode has no single data box.
-    if data_px is not None:
-        fig._zlc_fixed_box_in = (block_w, block_h)
-        fig._zlc_fixed_bounds_frac = (L / fig_w, B / fig_h, block_w / fig_w, block_h / fig_h)
+    # can read it back.
+    fig._zlc_fixed_box_in = (block_w, block_h)
+    fig._zlc_fixed_bounds_frac = (L / fig_w, B / fig_h, block_w / fig_w, block_h / fig_h)
     return axes
 
 
@@ -367,70 +352,8 @@ def grid_shape_for(n: int, *, max_cols: int = 8, prefer: tuple[int, int] | None 
     return nrows, ncols
 
 
-# Growth steps for auto_data_size_px (notebook multi-panel auto-sizing): the data
-# box grows one step per extra column / row, capped.  Named so the numbers live in
-# one place rather than inline in the expression.
-_AUTO_COL_STEP_PX = 80       # extra data width per column beyond the first
-_AUTO_ROW_STEP_PX = 90       # extra data height per row beyond the first
-_AUTO_MULTI_BASE_W_PX = 420  # base width when ncols > 1 (before adding column steps)
-_AUTO_MAX_H_PX = 620         # cap on the grown height
-
-
-def auto_data_size_px(
-    ncols: int = 1,
-    nrows: int = 1,
-    aspect: float | None = None,
-    min_w: int = _AUTO_MULTI_BASE_W_PX,
-    max_w: int = 760,
-    base_h: int = STOCK_DATA_PX[1],
-) -> tuple[int, int]:
-    """Choose a conservative fixed data-box size for notebook plots."""
-    ncols = max(1, int(ncols))
-    nrows = max(1, int(nrows))
-    if aspect is None:
-        width = STOCK_DATA_PX[0] if ncols == 1 else min(max_w, _AUTO_MULTI_BASE_W_PX + _AUTO_COL_STEP_PX * (ncols - 1))
-        height = base_h if nrows == 1 else min(_AUTO_MAX_H_PX, base_h + _AUTO_ROW_STEP_PX * (nrows - 1))
-        return int(width), int(height)
-    width = int(np_clip(base_h * float(aspect), min_w, max_w))
-    return width, int(base_h)
-
-
-def np_clip(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
-
-
-def save_figure_data(
-    fig: plt.Figure,
-    *,
-    data: dict[str, Any] | None = None,
-    path: str | Path = "figure",
-    image_ext: str = "png",
-    extra: dict[str, Any] | None = None,
-) -> dict[str, Path]:
-    """Save a figure plus an optional NumPy-friendly payload."""
-    path = Path(path)
-    base = path.with_suffix("") if path.suffix else path
-    base.parent.mkdir(parents=True, exist_ok=True)
-
-    image_path = base.with_suffix(f".{image_ext}")
-    fig.savefig(image_path, bbox_inches="tight")
-    out = {"figure": image_path}
-
-    if data is not None:
-        import numpy as np
-
-        payload = dict(data)
-        if extra:
-            payload["info"] = extra
-        data_path = base.with_suffix(".npz")
-        np.savez(data_path, **payload)
-        out["data"] = data_path
-    return out
-
-
 __all__ = [
     "FigureSpec",
-    "auto_data_size_px",
     "close_all",
     "configure_canvas",
     "create_axes_fixed",
@@ -439,6 +362,5 @@ __all__ = [
     "display_figure",
     "grid_shape_for",
     "new_figure",
-    "save_figure_data",
     "split_axes_horizontally",
 ]

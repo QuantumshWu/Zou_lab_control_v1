@@ -1080,9 +1080,11 @@ class SavedFigure:
 
         ``pulse`` -> rebuild the ``PulseTableState`` and re-draw the pulse figure through the SAME
         :func:`~.live.build_pulse_preview_plot` the plot layer owns, so every digital channel / analog
-        bus trace / repeat bracket comes back exactly as saved.  The rebuild imports ``pulse_gui`` LAZILY
-        (only when a pulse recipe is actually reopened) so the ordinary array-figure reload path stays
-        free of the pulse-editor / PyQt import."""
+        bus trace / repeat bracket comes back exactly as saved.  The renderer lives in the PLOT LAYER
+        (``live.build_pulse_preview_plot`` / ``default_pulse_size``), NOT the pulse_gui app -- ``_replay_pulse``
+        imports it LAZILY from ``.live`` (only when a pulse recipe is actually reopened) so the ordinary
+        array-figure reload path stays free of that import.  The data layer never imports pulse_gui (a
+        contract test forbids it)."""
         rkind = str(recipe.get("kind") or "")
         if rkind == "pulse":
             return self._replay_pulse(recipe)

@@ -284,7 +284,21 @@ def threshold_line_kwargs(linewidth: float = 1.9) -> dict[str, Any]:
 HIST_FILL_ALPHA = 0.4
 
 
+def bimodal_fit_line_specs() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """``ax.plot`` style kwargs for the THREE bimodal fit curves (left / right / total), in that
+    order.  ONE owned source of the fit-line COLOUR (from PALETTE) plus its linewidth/alpha, so the
+    standalone :class:`HistogramFigure` and the grid hist thumbnail draw the SAME fit lines and can
+    never drift to two different weights/opacities the way a re-typed triple could."""
+
+    return (
+        {"color": _PALETTE["fit_left"], "linewidth": 1, "alpha": 0.8},
+        {"color": _PALETTE["fit_right"], "linewidth": 1, "alpha": 0.8},
+        {"color": _PALETTE["fit_total"], "linewidth": 1, "alpha": 0.35},
+    )
+
+
 __all__ = [
+    "bimodal_fit_line_specs",
     "DEFAULT_STYLE",
     "DESIGN_DPI",
     "HIST_FILL_ALPHA",

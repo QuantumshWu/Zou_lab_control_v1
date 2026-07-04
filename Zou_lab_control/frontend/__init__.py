@@ -21,14 +21,12 @@ from importlib import import_module
 
 from .canvas import (
     FigureSpec,
-    auto_data_size_px,
     close_all,
     configure_canvas,
     create_axes_fixed,
     design_dpi,
     display_figure,
     new_figure,
-    save_figure_data,
     split_axes_horizontally,
 )
 from .data_figure import DataFigure, FitResult, SavedFigure, load_figure
@@ -205,7 +203,6 @@ __all__ = [
     "apply_smart_ticks",
     "apply_style",
     "attach_interaction",
-    "auto_data_size_px",
     "build_frontend_manual",
     "close_all",
     "compile_notes_pdf",
@@ -234,7 +231,6 @@ __all__ = [
     "render_notes_pdf",
     "render_tex_pdf",
     "run",
-    "save_figure_data",
     "show_figure_viewer",
     "show_pulse_gui",
     "show_task_console",

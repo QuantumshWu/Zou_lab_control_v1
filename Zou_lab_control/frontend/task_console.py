@@ -2339,9 +2339,14 @@ class PanelCard(FluentGroupBox):
         relim edit (_set_param) and the rebuild-time re-apply (_apply_display_params)."""
         if self.plotter is None:
             return
-        self.plotter.apply_param("relim", self._relim())
-        self.plotter.apply_param("fixed_lo", float(self.config.params.get("fixed_lo", 0.0)))
-        self.plotter.apply_param("fixed_hi", float(self.config.params.get("fixed_hi", 1.0)))
+        # Coalesce: each apply_param ends in BaseLivePlot.draw() (a SYNCHRONOUS draw_idle+flush_events, and
+        # for a grid a whole-N-cell thumbnail rebuild), so three back-to-back applies did three full renders
+        # of the same final state.  suspend_draws makes those inner draws no-ops; the ONE trailing
+        # canvas.draw_idle() below paints the final result once (identical pixels, ~3x fewer renders).
+        with self.plotter.suspend_draws():
+            self.plotter.apply_param("relim", self._relim())
+            self.plotter.apply_param("fixed_lo", float(self.config.params.get("fixed_lo", 0.0)))
+            self.plotter.apply_param("fixed_hi", float(self.config.params.get("fixed_hi", 1.0)))
         if self.canvas is not None:
             self.canvas.draw_idle()
 
@@ -2636,8 +2641,9 @@ class PanelCard(FluentGroupBox):
             self._set_focused_grid_param("fixed_lo", float(lo))
             self._set_focused_grid_param("fixed_hi", float(hi))
         elif self.plotter is not None:
-            self.plotter.apply_param("fixed_lo", float(lo))
-            self.plotter.apply_param("fixed_hi", float(hi))
+            with self.plotter.suspend_draws():   # both applies paint the SAME final state -> one render below
+                self.plotter.apply_param("fixed_lo", float(lo))
+                self.plotter.apply_param("fixed_hi", float(hi))
         if self.canvas is not None:
             self.canvas.draw_idle()
         self.changed.emit()
