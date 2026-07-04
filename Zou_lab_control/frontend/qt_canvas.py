@@ -86,7 +86,7 @@ else:
             # Render the Agg buffer NOW (synchronously): the canvas is never blank in the window between
             # insertion and a deferred first paint (draw_idle leaves the buffer unrendered -- #5 "图偶尔
             # 消失").  A freshly-built canvas swapped into the holder already carries a painted frame.
-            self.draw()
+            self._zlc_draw_if_needed()
             # ...and AGAIN on the next event-loop tick.  The construction sync above runs before this
             # canvas has been inserted into its parent layout, so the screen ratio it reads can be the
             # pre-layout value; the FIRST task-takeover panel of a just-opened console is built straight
@@ -119,7 +119,7 @@ else:
                 return
             self.setFixedSize(self._zlc_design_size())  # idempotent (a monitor move only shifts display_scale)
             self.updateGeometry()                       # let the parent CARD re-measure us
-            self.draw()                                 # SYNCHRONOUS: a resync never leaves a blank frame
+            self._zlc_draw_if_needed()                  # re-render ONLY if the dpi/content actually changed
 
         def pin_size(self) -> None:
             """Lock the canvas to its design size.  Now equivalent to the default -- the canvas is already
@@ -167,16 +167,40 @@ else:
             self._zlc_sync()
             return True
 
+        def draw(self):  # noqa: N802 - overrides FigureCanvasQTAgg.draw
+            # Every real Agg render funnels through here: record the dpi it rendered at + that the buffer
+            # is now valid, so :meth:`_zlc_draw_if_needed` can SKIP the redundant lifecycle re-renders.
+            super().draw()
+            self._zlc_drawn_dpi = self.figure.dpi
+            self._zlc_painted_once = True
+
+        def _zlc_draw_if_needed(self) -> None:
+            # Render the Agg buffer ONLY when it is genuinely out of date: never rendered, the figure
+            # CONTENT changed (matplotlib's figure.stale), or the buffer dpi changed (a real screen-ratio
+            # change).  The construct -> singleShot resync -> showEvent resync -> paint lifecycle otherwise
+            # each did a full SYNCHRONOUS render of the SAME content at the SAME dpi -- ~6 pixel-identical
+            # re-renders of a 36-cell grid (~125 ms each at a 3x screen).  Renders synchronously when it
+            # IS due, so paintEvent always blits a valid buffer (no deferred-draw blank frame).
+            if (getattr(self, "renderer", None) is None or self.figure.stale
+                    or self.figure.dpi != getattr(self, "_zlc_drawn_dpi", None)):
+                self.draw()
+
         def _zlc_sync(self) -> None:
             real = super().devicePixelRatioF() or 1.0
             ds = self._zlc_display_scale
             figure = self.figure
+            # IDEMPOTENT: only mutate the figure when a value actually changes, so a repeated resync at
+            # the SAME screen ratio (construct + singleShot + showEvent all fire post-layout) leaves
+            # figure.stale untouched and _zlc_draw_if_needed can skip the pixel-identical re-render.
             # invariant 1: the design inches NEVER change (fixed-inches axes)
-            figure.set_size_inches(*self._zlc_inches, forward=False)
+            if tuple(figure.get_size_inches()) != self._zlc_inches:
+                figure.set_size_inches(*self._zlc_inches, forward=False)
             # invariant 2: the buffer dpi = design dpi x REAL screen ratio (retina supersampling)
             # x display_scale, so the Agg buffer is EXACTLY the widget's on-screen device pixels
             # (a 1:1 crisp blit -- never rendered small and stretched up).
-            figure._set_dpi(self._zlc_design_dpi * real * ds, forward=False)
+            new_dpi = self._zlc_design_dpi * real * ds
+            if figure.dpi != new_dpi:
+                figure._set_dpi(new_dpi, forward=False)
             self._device_pixel_ratio = real
             # invariant 3: logical widget size = design px x display_scale -- the DPR-FREE constant
             # (NOT figure.bbox / device_pixel_ratio, which desyncs when the screen ratio changes
@@ -194,11 +218,8 @@ else:
             # all: the widget size is the DPR-invariant design constant, the buffer is whatever dpi the
             # sync chose, and the smooth-transform scale maps one onto the other exactly.
             del event
-            renderer = getattr(self, "renderer", None)
-            if renderer is None or not getattr(self, "_zlc_painted_once", False):
-                self.draw()                     # ensure a rendered buffer before the first blit
-                self._zlc_painted_once = True
-                renderer = self.renderer
+            self._zlc_draw_if_needed()          # render the buffer only if it is out of date (else reuse)
+            renderer = self.renderer
             w, h = int(renderer.width), int(renderer.height)
             image = QtGui.QImage(self.buffer_rgba(), w, h, QtGui.QImage.Format_RGBA8888)
             painter = QtGui.QPainter(self)

@@ -3832,6 +3832,13 @@ class PanelCard(FluentGroupBox):
         # swap cannot reflow its geometry -- the plot never visibly resizes/jumps either (#5 "图变大").
         old_canvas, old_plotter = self.canvas, self.plotter
         self.plotter = plotter
+        # Re-apply the persisted Setting toggles (unit + x/y limits + x-window) to the FRESH plotter NOW
+        # -- BEFORE wrapping it in the canvas -- so the canvas's construction render draws the FINAL
+        # content ONCE.  Applying them AFTER the canvas (as it used to) rendered pre-knob content, then
+        # re-rendered: 2+ full re-renders of a heavy 36-cell grid.  Each apply_param itself redraws the
+        # whole figure, so suspend the plotter's per-knob draws; the canvas's own render is the single one.
+        with self.plotter.suspend_draws():
+            self._apply_display_params()
         # Monitor cards default to display-only: the selector layer is built but PARKED
         # inactive (see _apply_selectors_state below, gated by the header's "Selectors"
         # switch) and the wheel scrolls the board (isolate_wheel=False) instead of being
@@ -3857,18 +3864,13 @@ class PanelCard(FluentGroupBox):
             old_canvas.deleteLater()
         if old_plotter is not None and plt is not None and old_plotter.fig is not None:
             plt.close(old_plotter.fig)
-        # re-apply persisted Setting toggles (unit + manual x/y limits) to the
-        # FRESH plotter every rebuild -- the panel rebuilds whenever its data
-        # shape changes, so without this the toggle would silently revert.
-        # Apply unit + limits + x-window in ONE render pass: each apply_param would otherwise redraw the
-        # whole (heavy, e.g. 36-cell grid) figure, so a build applied ~4 knobs = ~4 full re-renders on top
-        # of the build.  Suspend the plotter's draws; the single self.canvas.draw() below renders once.
-        with self.plotter.suspend_draws():
-            self._apply_display_params()
         # park (or arm) the fresh plotter's selector layer to the header's "Selectors" switch --
         # a rebuild must inherit the current state, never come up with live selectors while OFF.
         self._apply_selectors_state()
-        self.canvas.draw()          # SYNCHRONOUS: the swapped-in canvas shows its FINAL frame at once
+        # The canvas already rendered the FINAL content at construction (the display knobs were applied to
+        # the plotter ABOVE, before it was wrapped).  Re-render only if the selector-state pass dirtied the
+        # figure -- otherwise a no-op, not a second full render of the heavy grid.
+        self.canvas._zlc_draw_if_needed()
         self._place_setting_button()
         # A GRID panel is display-only, so its own focus-zoom is dormant -- THIS card catches the double-click
         # on the grid canvas and swaps to the clicked cell's standalone plot-kind figure (build_focus_plotter).
