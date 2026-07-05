@@ -65,6 +65,13 @@ class OptimizeMotFieldTask(Task):
         # integer DAC codes), so the console can lay out the live facet grid the moment the task starts,
         # BEFORE run() fires a point.  Same rule run() uses (``_axis_codes``), so panel shape == data shape.
         self.grid_shape = tuple(len(self._axis_codes(c)) for c in self.centers)
+        # Self-describe the scan axes (the SAME contract PulseScanMeasurement exposes: ``scan_names`` +
+        # ``scan_arrays``) so the console's facet grid titles each cell with its real coil coordinate
+        # (``Bz=<code>``) instead of ``pt k``.  The axis NAME + per-cell COORDINATE are metadata of this
+        # scan node -- independent of the panel's value expression -- and are DETERMINISTIC from the sweep
+        # params, so they are available BEFORE ``run()`` fires a point (when the console lays out the grid).
+        self.scan_names = ["Bx", "By", "Bz"]
+        self.scan_arrays = [self._axis_codes(c) for c in self.centers]
 
     # ------------------------------------------------------------------ pieces
     def _coil_slots(self, state) -> list[str]:

@@ -698,11 +698,18 @@ class BaseLivePlot:
         # headless canvases have no such background op, so they keep the full synchronous render.
         if self._blit_draw():
             return
-        self.fig.canvas.draw_idle()
-        try:
-            self.fig.canvas.flush_events()
-        except Exception:
-            pass
+        canvas = self.fig.canvas
+        canvas.draw_idle()
+        # A SYNCHRONOUS flush forces the paint NOW.  The notebook (ipympl) needs it to push the frame to
+        # the browser; the embedded Qt canvas must NOT do it -- flush_events re-enters the event loop per
+        # panel per tick, so with several panels the console tick blocks button / combobox input behind
+        # the render burst.  For the Qt canvas ``draw_idle`` already scheduled an update(); letting the
+        # event loop service that paint TOGETHER with pending input keeps the controls responsive.
+        if type(canvas).__name__ != "EmbeddedFigureCanvas":
+            try:
+                canvas.flush_events()
+            except Exception:
+                pass
 
     def _blit_data_artists(self) -> list:
         """Every per-tick DATA / overlay artist across the figure, z-sorted -- the ONE generic rule
@@ -784,11 +791,10 @@ class BaseLivePlot:
             # The Agg buffer now holds chrome + current data; tell the canvas it is current so its
             # paintEvent stretch-blits it as-is instead of triggering a full re-render on ``stale``.
             self.fig.stale = False
+            # blit() schedules the widget paint via update(); do NOT flush_events synchronously here (the
+            # embedded canvas is Qt-only) -- the event loop services this paint together with pending user
+            # input, so a multi-panel tick never blocks a button / combobox click (see draw()).
             canvas.blit(self.fig.bbox)
-            try:
-                canvas.flush_events()
-            except Exception:
-                pass
             return True
         except Exception:
             # Any blit failure (an odd artist, a torn-down canvas) degrades to the full render -- never

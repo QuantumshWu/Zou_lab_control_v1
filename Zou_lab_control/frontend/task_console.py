@@ -3539,8 +3539,8 @@ class PanelCard(FluentGroupBox):
                     # a hist focus feed can grow NEW threshold draggers inside update_core --
                     # re-park them to the switch (idempotent, cheap) so OFF stays display-only.
                     self._apply_selectors_state()
-                    if self.canvas is not None:
-                        self.canvas.draw_idle()
+                    if self.plotter is not None:
+                        self.plotter.draw()
             return
         value = self._coerce(value)
         kind = self.config.kind
@@ -3574,7 +3574,7 @@ class PanelCard(FluentGroupBox):
                     return
                 self.plotter.update_cells(per_cell)
                 if self.canvas is not None:
-                    self.canvas.draw_idle()
+                    self.plotter.draw()
                 return
             # a RECIPE grid is a SNAPSHOT built from its recipe: (re)build only on the FIRST show or
             # when a display knob marked a rebuild -- NEVER a per-tick redraw (#3).
@@ -3634,8 +3634,12 @@ class PanelCard(FluentGroupBox):
         # rebuilds its draggers inside update_core) -- re-park them to the switch state.  Idempotent
         # and cheap (a few attribute checks), so it never weighs on the live tick.
         self._apply_selectors_state()
+        # Render through the PLOTTER's blit-aware draw (NOT canvas.draw_idle, which defers a full 300-dpi
+        # re-render to the paint pass and blocks input): a stable panel updates its Agg buffer in ~0.6 ms
+        # here + schedules a cheap stretch-blit paint, so a multi-panel tick stays light and the event loop
+        # services user input promptly.  A chrome change falls back to the deferred full draw inside draw().
         if self.canvas is not None:
-            self.canvas.draw_idle()
+            self.plotter.draw()
 
     def _source_axis_label(self) -> str | None:
         """The y-axis label for this panel's sourced signal, taken from the PRODUCING
@@ -4773,15 +4777,24 @@ class PanelEditor(QtWidgets.QWidget):
             self.ed_cmap = self.ed_params.get("cmap")        # named back-refs (kept for tests / clarity)
             self.ed_relim = self.ed_params.get("relim")
             # fixed lo/hi: the IDENTICAL bespoke [lo | hi] row the Setting popup builds (shared helper),
-            # shown only when relim == "fixed"; _edit_param toggles it when relim changes.
-            self.ed_fixed_row, self.ed_fixed_lo, self.ed_fixed_hi = \
-                card._make_fixed_lim_row(self._edit_fixed_lim, disp_lw)
-            col.addWidget(self.ed_fixed_row)
-            # The lo/hi row stays PERMANENTLY in the layout; only its inputs enable when relim ==
-            # "fixed".  A setVisible toggle on a row that sits ABOVE the snapshot canvas in this shared
-            # scroll page reflowed the unit row + the whole canvas DOWN by the row's height on every
-            # relim change -- the reported Edit-tab jump.  Greying in place leaves every widget put.
-            self._sync_fixed_lim_enabled(card._relim())
+            # shown only when relim == "fixed"; _edit_param toggles it when relim changes.  EXCEPTION --
+            # a 2d/sites panel's value axis IS the COLOUR limit (clim), not a y-axis: its manual pin
+            # belongs with the ranges in the Limits section as an always-editable "colour range" row
+            # (built below), NOT here.  Building it in BOTH places would put two inputs on the ONE
+            # fixed_lo/hi source = exactly the drift the single-source rule forbids, so for an image kind
+            # the Display fixed row is absent and self.ed_fixed_* stay None (every reader is None-guarded);
+            # the relim chooser (tight/normal/fixed clim MODE) still lives here.
+            if card.config.kind in ("2d", "sites"):
+                self.ed_fixed_row = self.ed_fixed_lo = self.ed_fixed_hi = None
+            else:
+                self.ed_fixed_row, self.ed_fixed_lo, self.ed_fixed_hi = \
+                    card._make_fixed_lim_row(self._edit_fixed_lim, disp_lw)
+                col.addWidget(self.ed_fixed_row)
+                # The lo/hi row stays PERMANENTLY in the layout; only its inputs enable when relim ==
+                # "fixed".  A setVisible toggle on a row that sits ABOVE the snapshot canvas in this shared
+                # scroll page reflowed the unit row + the whole canvas DOWN by the row's height on every
+                # relim change -- the reported Edit-tab jump.  Greying in place leaves every widget put.
+                self._sync_fixed_lim_enabled(card._relim())
             # x-axis unit cycle -- the IDENTICAL row the Setting popup builds (shared helper), minus the
             # Setting-only current-unit label; the callback re-routes through the card's _on_unit_cycle.
             ed_unit_row, self.ed_unit_button, _ = \
@@ -4866,12 +4879,19 @@ class PanelEditor(QtWidgets.QWidget):
             # they hold the pin value (or are empty = autoscale) and are only re-seeded on build / tab-show
             # / Clear, so typing is NEVER clobbered by the refresh tick.  The live x-window is shown as the
             # grey PLACEHOLDER (``refresh_limit_hints``), a non-destructive hint Qt draws only while a box
-            # is empty.  There is NO y-range input: the VALUE axis is already owned by the relim family
-            # (tight/normal/fixed + fixed lo/hi in the Display section), and the perpendicular axis (a
-            # hist's count, a 2d/sites image extent) is intrinsically auto -- a manual y fights the autoscaler.
+            # is empty.  There is NO y-range input: for a 1d/dis panel the VALUE axis is already owned by
+            # the relim family (tight/normal/fixed + fixed lo/hi in the Display section), so a manual y
+            # would just duplicate it.  A 2d/sites IMAGE is the exception -- its value axis is the COLOUR
+            # limit, a genuinely distinct quantity from the (auto) pixel extent -- so it gets its OWN
+            # "colour range" clim pin below, next to the x-range where an operator looks for it.
             section("Limits")
             self.xmin = FluentLineEdit(""); self.xmax = FluentLineEdit("")
             self.ymin = self.ymax = None                     # no y input -- the value axis is relim-owned (#3)
+            # an image's value axis IS the colour limit: give 2d/sites an always-editable clim pin (built
+            # into the Limits row below); every other kind has none (its value axis = the relim y).
+            self.clo = self.chi = None
+            if card.config.kind in ("2d", "sites"):
+                self.clo = FluentLineEdit(""); self.chi = FluentLineEdit("")
             for w in (self.xmin, self.xmax):
                 w.setFixedWidth(scaled_px(88, minimum=68))   # wide enough not to clip "-0.4960"
                 w.returnPressed.connect(self.apply_limits)
@@ -4885,6 +4905,23 @@ class PanelEditor(QtWidgets.QWidget):
             lim_row = _inline(self.xmin, self.xmax, trailing=apply_btn)
             lim_row.layout().addWidget(clear_lim_btn, 0)
             col.addWidget(FluentSettingRow("x range", lim_row, label_width=proc_lw))
+
+            # colour range (2d/sites only): an image's value axis is its COLOUR limit, so it gets an
+            # always-editable clim pin here, mirroring the x-range row.  Apply writes the ONE clim source
+            # (relim="fixed" + the card's apply_fixed_lims -> live card + snapshot + save); Auto releases
+            # it to the autoscaled clim (relim="normal").  So this row and the Display relim chooser never
+            # hold two copies of the pin -- they are two faces of the same fixed_lo/hi source.
+            if self.clo is not None:
+                for w in (self.clo, self.chi):
+                    w.setFixedWidth(scaled_px(88, minimum=68))
+                    w.returnPressed.connect(self.apply_clim)
+                clim_apply = FluentButton("Apply", color=ACCENT)
+                clim_apply.clicked.connect(self.apply_clim)
+                clim_auto = FluentButton("Auto", color=GREY)
+                clim_auto.clicked.connect(self.clear_clim)
+                clim_row = _inline(self.clo, self.chi, trailing=clim_apply)
+                clim_row.layout().addWidget(clim_auto, 0)
+                col.addWidget(FluentSettingRow("colour range", clim_row, label_width=proc_lw))
 
             # ---- Command: a one-line REPL on the panel's DataFigure (confocal runs the same
             # `data_figure.<fn>(...)` form).  Type e.g. `data_figure.xlim(0, 10)`,
@@ -5149,6 +5186,11 @@ class PanelEditor(QtWidgets.QWidget):
                 for edit, pkey in ((self.ed_fixed_lo, "fixed_lo"), (self.ed_fixed_hi, "fixed_hi")):
                     if edit is not None and pkey in self.card.config.params:
                         edit.setText(f"{float(self.card.config.params[pkey]):g}")
+        if key == "relim":
+            # a 2d/sites image has no Display fixed row (its clim lives in the Limits colour-range row):
+            # re-seed THOSE boxes here so picking relim in the chooser fills/empties them to match the
+            # pin -- runs even when ed_fixed_row is None, unlike the block above (#2 colour range).
+            self._seed_clim_boxes()
         # EVERY knob first tries the snapshot's own in-place apply (BaseLivePlot.apply_param handles
         # the relim family for every kind; a GridPlot stores + forwards to its focused cell and NEVER
         # asks for a rebuild) -- rebuild() is only the fallback for a knob the snapshot truly cannot
@@ -5496,6 +5538,7 @@ class PanelEditor(QtWidgets.QWidget):
                 lo = hi = ""
         with _signals_blocked(self.xmin, self.xmax):
             self.xmin.setText(lo); self.xmax.setText(hi)
+        self._seed_clim_boxes()          # keep the 2d/sites colour-range boxes in step with the clim pin
 
     def refresh_limit_hints(self) -> None:
         """Refresh ONLY the grey PLACEHOLDER of the x-range boxes to the panel's current x-window -- a
@@ -5505,6 +5548,17 @@ class PanelEditor(QtWidgets.QWidget):
         THIS, so the boxes stay a live VIEW of the x-window (unpinned) while remaining freely editable."""
         if self.xmin is None:
             return                          # no Limits section (a non-"plot" role)
+        # colour-range (2d/sites) live hint: show the current clim as the grey PLACEHOLDER so an empty
+        # box (= Auto) still tells the operator what range the image is using -- the clim counterpart of
+        # the x-window hint below.  Non-destructive: Qt draws a placeholder only while the box is empty,
+        # so a pinned/typed value is never overwritten.
+        if getattr(self, "clo", None) is not None and self.card is not None \
+                and self.card.plotter is not None and hasattr(self.card.plotter, "current_lims"):
+            try:
+                clo, chi = self.card.plotter.current_lims()
+                self.clo.setPlaceholderText(f"{clo:.6g}"); self.chi.setPlaceholderText(f"{chi:.6g}")
+            except Exception:
+                pass
         ax = self._limits_ax()
         if ax is None:
             return
@@ -5543,6 +5597,76 @@ class PanelEditor(QtWidgets.QWidget):
             self.xmin.setText(""); self.xmax.setText("")
         self.refresh_limit_hints()
         self.status.setText("x range cleared (auto)")
+
+    def _sync_relim_combo(self, value: str) -> None:
+        """Reflect a PROGRAMMATIC relim change (the colour-range Apply/Auto) in the Display relim combo
+        WITHOUT re-firing its handler, so the chooser and the colour-range row always agree on whether
+        the clim is pinned.  No-op when the combo is absent (a non-image Edit that has no relim row)."""
+        combo = self.ed_params.get("relim") if getattr(self, "ed_params", None) else None
+        if combo is None:
+            return
+        idx = combo.findText(value)
+        if idx >= 0:
+            with _signals_blocked(combo):
+                combo.setCurrentIndex(idx)
+
+    def apply_clim(self) -> None:
+        """Pin a 2d/sites panel's COLOUR limit to the typed lo/hi.  Routes through the ONE clim source the
+        relim family owns (relim="fixed" + the card's ``apply_fixed_lims``), so the live card (every cell,
+        re-asserted each tick), this tab's snapshot, ``config.params`` and Save all move together -- there
+        is no second hand-copied clim path.  Both boxes empty = Auto (release the pin)."""
+        if self.clo is None:
+            return
+        if not self.clo.text().strip() and not self.chi.text().strip():
+            self.clear_clim()
+            return
+        try:
+            lo, hi = float(self.clo.text()), float(self.chi.text())
+        except ValueError as exc:
+            self.status.setText(f"bad colour range: {str(exc).splitlines()[0][:80]}")
+            return
+        self._edit_param("relim", "fixed")          # make the fixed clim take effect (seeds from view) ...
+        if self.card is not None:
+            self.card.apply_fixed_lims(lo, hi)      # ... then overwrite with the typed lo/hi (final state)
+        snap = getattr(self, "_plotter", None)      # push onto THIS tab's snapshot too (as _edit_fixed_lim)
+        if snap is not None:
+            snap.apply_param("fixed_lo", lo); snap.apply_param("fixed_hi", hi)
+            if getattr(self, "_canvas", None) is not None:
+                self._canvas.draw_idle()
+        self._sync_relim_combo("fixed")
+        # _edit_param("relim","fixed") re-seeded the boxes from the FROZEN current view; re-seed now that
+        # apply_fixed_lims has written the TYPED lo/hi so the boxes show what was actually pinned.
+        self._seed_clim_boxes()
+        self.status.setText("colour range applied")
+
+    def clear_clim(self) -> None:
+        """Release the colour-limit pin back to the autoscaled clim (relim="normal") -- the image
+        counterpart of :meth:`clear_limits`.  Empties the boxes so the grey placeholder hint takes over
+        showing the now-auto clim."""
+        if self.clo is None:
+            return
+        self._edit_param("relim", "normal")
+        with _signals_blocked(self.clo, self.chi):
+            self.clo.setText(""); self.chi.setText("")
+        self._sync_relim_combo("normal")
+        self.refresh_limit_hints()
+        self.status.setText("colour range cleared (auto)")
+
+    def _seed_clim_boxes(self) -> None:
+        """Put the STORED clim pin (``fixed_lo/hi``, in force only while relim=="fixed") into the
+        colour-range boxes.  Like :meth:`_seed_limit_boxes` for x: the boxes edit the PIN, so empty = Auto
+        and a value = pinned; re-seeded on build / tab-show / relim change, NEVER on the tick."""
+        if getattr(self, "clo", None) is None:
+            return
+        p = self.card.config.params if self.card is not None else {}
+        lo = hi = ""
+        if str(p.get("relim")) == "fixed":
+            try:
+                lo, hi = f"{float(p.get('fixed_lo')):.6g}", f"{float(p.get('fixed_hi')):.6g}"
+            except (TypeError, ValueError):
+                lo = hi = ""
+        with _signals_blocked(self.clo, self.chi):
+            self.clo.setText(lo); self.chi.setText(hi)
 
     def _save_stem(self, timestamp: str | None) -> Path:
         """The output file stem (no extension) the Save section resolves to.
@@ -6721,6 +6845,13 @@ class TaskConsole(QtWidgets.QWidget):
         fall back to the node-level triple (so other nodes are unaffected).  ``None`` when no producing
         node is found (a derived expression / a raw array): the consumer then uses shape heuristics."""
         node = self._node_for_signal(str(name or ""))
+        if node is None and str(name) == "__task_frame__":
+            # A task mid-run panel binds the reserved ``__task_frame__`` (task output is OFF the hub, #6),
+            # so ``_node_for_signal`` (which only knows hub producers) can't resolve it.  Its producer IS
+            # the RUNNING TASK node -- resolve it directly so a scan task's ``scan_names``/``scan_arrays``
+            # reach the facet-grid title (``Bz=<code>`` instead of ``pt k``), exactly like a hub scan node.
+            row = self._running_task_row
+            node = self._logic_nodes.get(id(row)) if row is not None else None
         if node is None:
             return None
         node_grid = tuple(int(n) for n in (getattr(node, "grid_shape", ()) or ()))
@@ -7662,10 +7793,17 @@ class TaskConsole(QtWidgets.QWidget):
         self._paused = not self._paused
         self.pause_button.setText("Resume" if self._paused else "Pause")
         self.pause_button.set_color(GREEN if self._paused else ORANGE)
-        # A paused display freezes every panel: _tick returns early while paused (no card advances its
-        # _render_version), and Resume redraws them all -- hub.version has moved on, so the version gate fires.
-        if not self._paused:
-            self._tick()                          # immediate catch-up redraw of every panel
+        # Pause/Resume are DISCRETE actions (not the hot tick), so do a COHERENT full refresh at BOTH edges:
+        # ``refresh_once`` renders EVERY panel from ONE ``snapshot_at(_display_shot())`` (bypassing the beat
+        # + version gate that would leave some panels a shot behind), then a single ``processEvents`` forces
+        # the scheduled paints NOW so the FROZEN screen actually shows that one consistent shot -- the three
+        # emCCD frames of a pulse must agree.  (The live tick keeps its async paints for responsiveness;
+        # this one-off synchronous flush on a user action is fine.)
+        self.refresh_once()
+        try:
+            QtWidgets.QApplication.processEvents()
+        except Exception:
+            pass
 
     def _toggle_selectors(self, on: bool) -> None:
         """Header "Selectors" switch: arm (ON) or park (OFF) the selector layer of EVERY dashboard
