@@ -434,6 +434,27 @@ def test_generic_scanned_measurement_drives_detection_axis_directly():
     assert np.all((result.y >= 0.0) & (result.y <= 1.0))
 
 
+def test_otsu_fidelity_reduce_degrades_a_frameless_point_instead_of_crashing():
+    """``triggered_frames`` is documented to return whatever arrived -- possibly an EMPTY list (a pulse
+    that never triggered the camera, a cancelled / short read, a self-triggering sensor that yielded
+    nothing).  The ONE shared reduce pipeline (``otsu_fidelity_from_frames``, used by BOTH the live
+    scan and the held-out reference characterization) must not ``np.vstack`` an empty list and crash the
+    whole scan: a frameless point returns empty counts + a NaN-fidelity estimate, which the single-shot
+    reducer maps to its 0.5 no-discrimination fallback."""
+    from Zou_lab_control.neutral_atom.operations.measurement import (
+        otsu_fidelity_from_frames, OtsuFidelityReducer)
+
+    exp = na.connect("virtual")
+    try:
+        exp.readout.sitemap(frames=4, display=False)
+        cal = exp.readout.current
+        counts, _threshold, model = otsu_fidelity_from_frames([], cal, None)
+        assert counts.size == 0 and not np.isfinite(model.fidelity)     # no readout -> undefined
+        assert OtsuFidelityReducer(site=None).reduce([], cal) == 0.5     # ...degrades, never crashes
+    finally:
+        exp.close()
+
+
 def test_readout_duration_fidelity_is_detection_time_alias():
     exp = na.connect("virtual")
     exp.readout.sitemap(frames=4, display=False)

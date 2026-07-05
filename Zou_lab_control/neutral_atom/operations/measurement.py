@@ -462,7 +462,17 @@ def otsu_fidelity_from_frames(frames, calibration: TrapCalibration, site: int | 
     ``signals -> (counts, threshold, FidelityEstimate)`` pipeline, shared by the live
     :class:`OtsuFidelityReducer` and the held-out reference path in the readout subsystem so the
     detection-time scan's y and its reference fidelity are computed identically (#C3).  Returns the
-    stacked per-site ``counts`` too (the reference path records them)."""
+    stacked per-site ``counts`` too (the reference path records them).
+
+    A point that produced NO frames -- a pulse that never triggered the camera, a cancelled / short
+    read, or a self-triggering sensor that yielded nothing (``triggered_frames`` is documented to
+    return whatever arrived) -- has no readout to threshold: it returns empty counts + a NaN-fidelity
+    estimate.  The single-shot reducer's existing 'non-finite fidelity -> 0.5 (no discrimination)'
+    fallback then fills that scan point, so a frameless point can never ``np.vstack`` an empty list and
+    crash the whole scan / reference characterization (both funnel through here)."""
+    frames = list(frames)
+    if not frames:
+        return np.empty((0, 0), dtype=float), float("nan"), estimate_threshold_fidelity(np.empty(0), 0.0)
     counts = np.vstack([calibration.signals(image) for image in frames])
     values = counts.reshape(-1) if site is None else counts[:, site_index(site, counts.shape[1])]
     threshold = otsu_threshold(values)
