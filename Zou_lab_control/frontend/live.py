@@ -371,7 +371,7 @@ class BaseLivePlot:
         _update_verts(self.bins, self.n, self.verts, mode="horizontal")
         self.poly = PolyCollection(self.verts, facecolors=PALETTE["hist_fill"])
         self.axdis.add_collection(self.poly)
-        self.axdis.set_xlim(0, _dist_count_xlim(self.n))
+        self.axdis.set_xlim(0, self._count_axis_limit(self.n))
         self.axdis.xaxis.set_major_locator(MaxNLocator(nbins=1, prune="lower"))
         self.axdis.xaxis.set_major_formatter(ScalarFormatter())
         self.axdis.tick_params(axis="x", which="both", bottom=True, top=False, labelbottom=True, labeltop=False)
@@ -384,6 +384,19 @@ class BaseLivePlot:
         self.line_l = self.axdis.axhline(self.ylim_min, color=cmap(0.0), linewidth=small_fontsize() / 2)
         self.line_h = self.axdis.axhline(self.ylim_max, color=cmap(0.95), linewidth=small_fontsize() / 2)
         self.drag = DragHLine(self.line_l, self.line_h, self.update_clim, self.axdis)
+
+    def _count_axis_limit(self, n) -> float:
+        """Dead-banded upper limit for a side-distribution COUNT(x)-axis, from the per-bin counts ``n``.
+        The raw target (:func:`_dist_count_xlim`) tracks the tallest bar, which a noisy histogram jitters
+        every tick -- that would flicker the count-axis ticks AND defeat the blit background cache (a
+        moved tick is a chrome change -> recapture).  So COMMIT a new ceiling only when the target would
+        clip a bar (grow now) or has dropped well below it (shrink at 60%); small per-tick wobble keeps
+        the committed value, the SAME anti-jitter hysteresis the main y-axis relim already applies."""
+        want = float(_dist_count_xlim(n))
+        cur = self._count_ceiling
+        if cur <= 0 or want > cur or want < 0.6 * cur:
+            self._count_ceiling = want
+        return self._count_ceiling
 
     def __init__(
         self,
@@ -456,6 +469,17 @@ class BaseLivePlot:
         # with no producing node) => ``.save()`` degrades to the basic figure+npz save.  The binding is a
         # DATA fact (WHERE the data came from), not art/geometry, so it lives here, off the sealed set.
         self._figure_source = None
+        # Blit cache (see :meth:`draw`): a per-tick data update redraws ONLY the data artists over a
+        # cached chrome background instead of re-rasterising the whole 300-dpi figure (the ~12 ms text
+        # cost).  ``_blit_bg`` is the captured chrome region; ``_blit_sig`` is the chrome signature it was
+        # captured at -- any chrome change (limits/ticks/title/dpi/size/clim/cmap) makes them mismatch and
+        # forces one recapture.  Both None => capture on the next blit.  Reset here so every plotter has it.
+        self._blit_bg = None
+        self._blit_sig = None
+        # Committed side-distribution count(x)-axis ceiling (see :meth:`_count_axis_limit`): dead-banded
+        # so a noisy per-tick histogram peak doesn't jitter the count-axis ticks (and force a blit
+        # recapture) every frame -- the same anti-jitter rule the main y-axis relim uses.
+        self._count_ceiling = 0.0
 
     def _infer_points_done(self) -> int:
         finite = np.isfinite(self.data_y[:, 0])
@@ -667,11 +691,111 @@ class BaseLivePlot:
         # ONCE afterwards (via the canvas, or the explicit draw at the block's end).
         if self._draw_suspended:
             return
+        # On the embedded Qt canvas a live data tick BLITS: restore the cached chrome background + redraw
+        # ONLY the data artists (~0.6 ms) instead of re-rasterising the whole 300-dpi figure (~12 ms of
+        # tick/label text), a ~20x win that lets many panels refresh at 100 ms without lag.  Any chrome
+        # change re-captures the background exactly once (see _blit_draw).  The notebook (ipympl) and
+        # headless canvases have no such background op, so they keep the full synchronous render.
+        if self._blit_draw():
+            return
         self.fig.canvas.draw_idle()
         try:
             self.fig.canvas.flush_events()
         except Exception:
             pass
+
+    def _blit_data_artists(self) -> list:
+        """Every per-tick DATA / overlay artist across the figure, z-sorted -- the ONE generic rule
+        (no per-plot list to keep in sync): a data artist is anything an axes holds in ``lines`` /
+        ``images`` / ``collections`` / ``patches`` / ``texts`` (the readout + fit texts live here).
+        The STATIC chrome -- spines, ticks, tick labels, axis labels, offset text, title, legend and
+        the axes background patch -- is NOT in those lists, so it stays baked in the cached background.
+        Covers every plot type, GridPlot cells included (their artists live on the cell axes)."""
+        arts = []
+        for ax in self.fig.axes:
+            arts.extend(ax.lines)
+            arts.extend(ax.images)
+            arts.extend(ax.collections)
+            arts.extend(ax.patches)
+            arts.extend(ax.texts)
+        arts.sort(key=lambda a: a.get_zorder())        # match a monolithic draw's paint order
+        return arts
+
+    def _blit_signature(self):
+        """A cheap fingerprint of the STATIC chrome -- the cached background is valid iff this is
+        unchanged.  Covers everything that alters chrome pixels: figure dpi/size, the title, and per
+        axes the position, x/y limits, tick locations and (for images) the colour limit + colormap.
+        A mismatch (a relim, a title/cmap/limit edit, a screen-ratio change) recaptures the bg once;
+        the dead-banded relim keeps recaptures rare, so streaming stays a pure blit."""
+        parts = [round(float(self.fig.dpi), 3),
+                 tuple(round(float(v), 4) for v in self.fig.get_size_inches()),
+                 str(self.title)]
+        for ax in self.fig.axes:
+            parts.append(tuple(round(float(v), 5) for v in ax.get_position().bounds))
+            parts.append(tuple(round(float(v), 6) for v in ax.get_xlim()))
+            parts.append(tuple(round(float(v), 6) for v in ax.get_ylim()))
+            parts.append(tuple(round(float(v), 6) for v in ax.get_xticks()))
+            parts.append(tuple(round(float(v), 6) for v in ax.get_yticks()))
+            for im in ax.images:
+                parts.append(tuple(round(float(v), 6) for v in im.get_clim()))
+                parts.append(im.get_cmap().name)
+        return tuple(parts)
+
+    def _blit_draw(self) -> bool:
+        """Try to render this tick as a blit.  Returns True if it did (caller skips the full draw),
+        False to fall back.  Only the embedded Qt canvas has the Agg region ops AND our stretch-blit
+        paintEvent, so blit is confined to it; a figure with no data artists falls back honestly.
+
+        NON-REGRESSIVE by design: a tick whose CHROME changed (a relim, first frame) does NOT blit --
+        it returns False for a plain full render, exactly the old cost, and defers the background
+        capture.  Only when the chrome is stable for two consecutive ticks is the chrome-only bg
+        captured ONCE and every subsequent tick blits.  So a plot whose chrome jitters every frame
+        never pays a recapture penalty (it just full-draws as before); a stable plot blits at ~20x."""
+        canvas = getattr(self.fig, "canvas", None)
+        if (canvas is None or type(canvas).__name__ != "EmbeddedFigureCanvas"
+                or not hasattr(canvas, "copy_from_bbox") or not hasattr(canvas, "restore_region")):
+            return False
+        arts = self._blit_data_artists()
+        if not arts:
+            return False
+        try:
+            sig = self._blit_signature()
+            if sig != self._blit_sig:
+                # Chrome moved (or first tick): a plain full render this tick, and drop any stale bg --
+                # do NOT recapture from a figure whose chrome is still settling.  The caller's
+                # draw_idle+flush does the real render.
+                self._blit_sig = sig
+                self._blit_bg = None
+                return False
+            if self._blit_bg is None:
+                # Chrome has held for two ticks: capture the chrome-only bg ONCE (data hidden so no
+                # ghost lingers under a later restore), then blit this and every steady tick after.
+                vis = [(a, a.get_visible()) for a in arts]
+                for a, _ in vis:
+                    a.set_visible(False)
+                canvas.draw()
+                for a, was in vis:
+                    a.set_visible(was)
+                self._blit_bg = canvas.copy_from_bbox(self.fig.bbox)
+            canvas.restore_region(self._blit_bg)
+            for a in arts:
+                if a.get_visible():
+                    a.axes.draw_artist(a)
+            # The Agg buffer now holds chrome + current data; tell the canvas it is current so its
+            # paintEvent stretch-blits it as-is instead of triggering a full re-render on ``stale``.
+            self.fig.stale = False
+            canvas.blit(self.fig.bbox)
+            try:
+                canvas.flush_events()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            # Any blit failure (an odd artist, a torn-down canvas) degrades to the full render -- never
+            # a blank panel.  Drop the cache so the next tick starts clean.
+            self._blit_bg = None
+            self._blit_sig = None
+            return False
 
     @contextmanager
     def suspend_draws(self):
@@ -1047,7 +1171,7 @@ class LiveLiveDis(LiveLive):
         _update_verts(self.bins, self.n, self.verts, mode="horizontal")
         self.poly = PolyCollection(self.verts, facecolors=PALETTE["hist_fill"])
         self.axdis.add_collection(self.poly)
-        self.axdis.set_xlim(0, _dist_count_xlim(self.n))
+        self.axdis.set_xlim(0, self._count_axis_limit(self.n))
         (self.gauss_line,) = self.axdis.plot([], [], color=PALETTE["fit_right"], alpha=1)
 
     def _hist(self):
@@ -1102,7 +1226,7 @@ class LiveLiveDis(LiveLive):
         self.n, self.bins = self._hist()
         _update_verts(self.bins, self.n, self.verts, mode="horizontal")
         self.poly.set_verts(self.verts)
-        self.axdis.set_xlim(0, _dist_count_xlim(self.n))
+        self.axdis.set_xlim(0, self._count_axis_limit(self.n))
         self._update_gauss_fit()
 
     def _install_state(self) -> None:
@@ -1358,20 +1482,25 @@ class Live2DDis(BaseLivePlot):
         if vals.size:
             y_min = float(np.nanmin(vals))
             y_max = float(np.nanmax(vals))
-            self.ylim_min, self.ylim_max = self._mode_target(y_min, y_max)   # normal=from 0, tight=bracket
+            # DEAD-BANDED colour limit: the colorbar range obeys the SAME hysteresis as the 1D y-axis
+            # (relim) instead of recomputing every tick -- so a live camera frame does not flicker its
+            # colorbar / dist axis (and force a blit-background recapture) on per-frame brightness noise.
+            self.relim(vals)
             self.axdis.set_ylim(self.ylim_min, self.ylim_max)
             self.n, self.bins = np.histogram(vals, bins=self.n_bins, range=(self.ylim_min, self.ylim_max))
             _update_verts(self.bins, self.n, self.verts, mode="horizontal")
             self.poly.set_verts(self.verts)
-            self.axdis.set_xlim(0, _dist_count_xlim(self.n))
-            self.line_min.set_ydata([y_min, y_min])
+            self.axdis.set_xlim(0, self._count_axis_limit(self.n))
+            self.line_min.set_ydata([y_min, y_min])          # faint guides still show the RAW data range
             self.line_max.set_ydata([y_max, y_max])
             if float(self.line_l.get_ydata()[0]) > y_min or float(self.line_h.get_ydata()[0]) < y_max:
                 self.line_l.set_ydata([self.ylim_min, self.ylim_min])
                 self.line_h.set_ydata([self.ylim_max, self.ylim_max])
                 self.update_clim()
-            self.cax.set_yticks([y_min, y_max])
-            self.cax.set_yticklabels([_float2str_eng(v, length=5) for v in [y_min, y_max]])
+            # Colorbar end ticks at the committed (dead-banded) COLOUR range -- the range the image is
+            # actually mapped to -- so they too stay put frame-to-frame (the data min/max is on the guides).
+            self.cax.set_yticks([self.ylim_min, self.ylim_max])
+            self.cax.set_yticklabels([_float2str_eng(v, length=5) for v in [self.ylim_min, self.ylim_max]])
 
     def _install_state(self) -> None:
         self.fig._zlc_state = PlotState(
@@ -1565,7 +1694,7 @@ class LiveSiteMap(BaseLivePlot):
         self.n, self.bins = np.histogram(vals, bins=self.n_bins, range=(self.ylim_min, self.ylim_max))
         _update_verts(self.bins, self.n, self.verts, mode="horizontal")
         self.poly.set_verts(self.verts)
-        self.axdis.set_xlim(0, _dist_count_xlim(self.n))
+        self.axdis.set_xlim(0, self._count_axis_limit(self.n))
         # keep the draggable clim lines at the (re)computed limits unless the user dragged inside
         if getattr(self, "line_l", None) is not None:
             self.line_l.set_ydata([self.ylim_min, self.ylim_min])
@@ -3016,7 +3145,7 @@ class HistogramFigure(BaseLivePlot):
         """A histogram's relim controls the COUNT (y) axis -- the measured quantity, like a 1D plot's
         signal axis, NOT the value/binning axis: re-apply the tight/normal/fixed count range NOW (the
         Setting/Edit relim toggle), bypassing any dead-band."""
-        self._apply_count_yscale()
+        self._apply_count_yscale(force=True)
         self.draw()
 
     def apply_param(self, key: str, value) -> bool:
@@ -3047,13 +3176,18 @@ class HistogramFigure(BaseLivePlot):
             return {}
         return {int(state): float(np.mean(states == state)) for state in np.unique(states)}
 
-    def _apply_count_yscale(self) -> None:
+    def _apply_count_yscale(self, *, force: bool = False) -> None:
         """Set the count (y) axis scale + limits -- the MEASURED axis a histogram's relim acts on
         (the dependent quantity, like a 1D plot's signal axis).  ``fixed`` pins the operator's lo/hi;
         ``normal``/``tight`` both anchor at 0 (counts are non-negative) and differ only in headroom
         above the peak -- the single-source normal-vs-tight rule (:meth:`_mode_target`), clamped to 0
         for the count axis.  Log mode floors at 0.5 so 0-count bars sit BELOW the axis (no
-        0 -> -inf on the filled poly) and a sparse bright tail becomes visible."""
+        0 -> -inf on the filled poly) and a sparse bright tail becomes visible.
+
+        DEAD-BANDED (``force`` bypasses): under normal/tight the committed count range is kept unless
+        the peak would clip it or has dropped well below -- so a streaming histogram does not rescale
+        (and force a blit-background recapture) on per-tick count noise, the SAME hysteresis the 1D
+        y-axis and the 2D colour limit use.  A relim/scale toggle passes ``force=True``."""
         peak = float(np.max(self.n))
         for counts in self._overlay_counts:           # include the 'create' overlay histograms' peak
             if len(counts):
@@ -3066,6 +3200,11 @@ class HistogramFigure(BaseLivePlot):
             lo, hi = self._mode_target(0.0, max(peak, 1.0))   # ONE tight/normal rule, shared with 1D/2D
             lo = max(0.0, lo)                          # counts never read below 0 (tight's -10% -> 0)
         hi = max(hi, lo + 1.0)
+        want_scale = "log" if self.ylog else "linear"
+        if not force and getattr(self, "relim_mode", "normal") in ("normal", "tight"):
+            cur_lo, cur_hi = self.ax.get_ylim()
+            if self.ax.get_yscale() == want_scale and cur_hi > 0 and 0.6 * cur_hi <= hi <= cur_hi:
+                return                                 # within the dead-band -> keep the committed range
         if self.ylog:
             self.ax.set_yscale("log")
             self.ax.set_ylim(max(0.5, lo), max(hi, peak * 3.0 if peak else 1.0))
