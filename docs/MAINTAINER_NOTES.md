@@ -1374,33 +1374,49 @@ survival decays ~0.97 → ~0.06 over 0..300 µs and `fit_temperature` recovers ~
 (injected 50 µK). This is "fake only the lowest data source" in action — the same
 discipline as the loading model.
 
-### task_console live-refresh performance floor (honest verdict)
+### task_console live-refresh: BLIT (the full-draw floor was NOT intrinsic)
 
-Source: `_redesign/03b_perf_conclusion.md`; memory note `task-console-live-perf-floor`.
-demo_console = 5 panels, offscreen: compute/tick ≈ 13 ms (small); **draw/tick ≈ 72–75 ms**
-and steady-draw (no new data) ≈ 72 ms ⇒ **the redraw cost is intrinsic, independent of
-whether limits change.** cProfile top: `draw_text` (glyph rasterization across ~10 axes
-@300 dpi) — the bottleneck, independent of margin/limit/blit.
+Source: memory note `task-console-live-perf-floor`; blit landed 2026-07 (`BaseLivePlot._blit_draw`).
+The old cost: `BaseLivePlot.draw()` re-rasterised the WHOLE 300-dpi figure every tick
+(`canvas.draw_idle()+flush_events()`, cProfile top = `draw_text` glyph rasterisation across all
+axes), ~12 ms per 2x2 panel — 5-6 panels at 100 ms saturated the budget. Confocal-GUIv2 (the
+reference) always blitted; this reimplementation had never ported it.
 
-Two main speed-ups were **measured and rejected**:
-- **blit incremental redraw — 152 ms/tick (60% SLOWER than full draw).** Live autoscale
-  changes limits almost every tick so the fast-path rarely fires; and on a 300 dpi
-  buffer `copy_from_bbox`/`blit` themselves cost ~11 ms/panel. blit only wins when
-  limits are stable, which live autoscale breaks.
-- **Freezing title/xlabel positions — violates DPR neutrality.** draw −19% but sf1.5
-  flips 4845 px (freeze-vs-freeze self-diff = 0 confirms it's freeze-introduced):
-  `show()`'s first draw freezes the position at the wrong dpr; sf1.5 rounding flips.
+**Now the live tick BLITS** (single-sourced in `BaseLivePlot`): restore a cached chrome-only
+background + `draw_artist()` only the data artists (a generic `ax.lines/images/collections/
+patches/texts` enumerator, z-sorted) + `canvas.blit()` — ~0.6 ms. The chrome signature
+(dpi/size/title/per-axes pos+lims+ticks/image clim+cmap) gates the cache; a tick whose chrome
+moved does a plain full draw and DEFERS the capture, so a jittery panel never pays a recapture
+penalty (non-regressive) and only a stable panel blits. Deviation from confocal (which marks
+artists `animated`): the bg is captured with the data artists momentarily HIDDEN, so save/inline/
+snapshot full renders need zero special-casing. Notebook (ipympl) / headless keep the full draw.
 
-Compliant speed-up that landed = **tightening figure margins**. `PANEL_MARGINS_PX`
+The blocker the OLD attempt hit ("live autoscale changes limits every tick so the fast-path never
+fires") is real but was solved by **dead-banding EVERY autoscale limit**, not by giving up: the 1D
+y-axis relim already had hysteresis; the side-distribution count axis (`_count_axis_limit`), the 2D
+colour limit (routed through `relim`), and the histogram count-y axis (`_apply_count_yscale(force=)`)
+did NOT — those were the axes whose ticks moved every frame. With them dead-banded the chrome holds
+and blit engages. Colorbar ticks now sit at the committed clim ends (guides still show the raw
+min/max). **Iron law: blit engages only if ALL of a panel's autoscale axes have a dead-band; a new
+plot with an autoscaling secondary axis must wire it in or it silently falls back to full draw.**
+Measured (2x2, offscreen, update() end-to-end): 1d 13→0.9 ms, 2d 20→2.3 ms, monitor 18→6.9 ms
+(monitor residual = the per-tick σ curve_fit + mathtext in `update_core`, not the draw). Guarded by
+`tests/test_frontend_blit_render.py` (engages + equals full draw + no ghosting + recapture-on-relim).
+
+A separately-rejected speed-up (still off the table): **freezing title/xlabel positions** — draw
+−19% but sf1.5 flips 4845 px (`show()`'s first draw freezes the position at the wrong dpr), violating
+DPR neutrality.
+
+An earlier compliant speed-up that also landed = **tightening figure margins**. `PANEL_MARGINS_PX`
 is `(110, 86, 80, 70)` (L, R, B, T): R/B/T are pulled in from confocal's stock
 `(110,110,100,40)` so the data area fills ~50% of the figure (a smaller agg buffer makes
 the ~30–40% of draw cost that scales with area faster; `draw_text` unchanged). The LEFT
 stays at the confocal `110` — it is `STOCK_MARGINS_PX[0]`, the minimum that holds a 4–5
 digit y-tick label (e.g. a qCMOS ROI pixel like `1180`) PLUS the rotated y-title; tighter
 clips the y-title past the figure's left edge (true for every panel kind). T `70` is the
-always-reserved title slot (`TITLE_SLOT_PX`). More aggressive options (hysteretic
-autoscale, staggered redraw, low-dpi panel mode) change visible behavior/visuals and are
-**left for the user to authorize** — not done unilaterally.
+always-reserved title slot (`TITLE_SLOT_PX`). (Hysteretic autoscale is now done — it is what
+makes blit engage, above; staggered redraw and low-dpi panel mode remain unused and would change
+visible behavior.)
 
 **Frontend geometry tokens have ONE source each (no inline magic, no re-typed test
 literals).** The visual design is owned by the frontend, never a per-call/host knob; but a
