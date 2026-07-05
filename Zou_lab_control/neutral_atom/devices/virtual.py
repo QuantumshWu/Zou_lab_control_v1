@@ -22,7 +22,11 @@ from Zou_lab_control._clock import DEFAULT_CLOCK_HZ
 from Zou_lab_control._readout_math import normal_cdf
 from ..core.utils import site_index
 from .base import CameraDevice, SequencerDevice, TrapArrayDevice, snap_subarray
-from .camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS, count_trigger_pulses
+from .camera_trigger import (
+    DEFAULT_CAMERA_TRIGGER_CHANNELS,
+    base_cycle_trigger_pulses,
+    count_trigger_pulses,
+)
 from ..timing import (
     PulseSequence,
     PulseTableState,
@@ -526,17 +530,22 @@ class VirtualTrapArray(TrapArrayDevice):
         cooling_durations = cooling_durations_per_frame(sequence, frames, trigger_channels=trig)
         trap_off_per_frame = trap_off_durations_per_frame(sequence, frames, trigger_channels=trig)
         trap_hold_per_frame = trap_hold_durations_per_frame(sequence, frames, trigger_channels=trig)
-        # A SINGLE cycle (repeat_count == 1) holds ONE atom loading across every camera-trigger
-        # window its ONE base cycle carries -- a release-recapture bracket (2 triggers) or a
-        # long-short-long imaging bracket (3 triggers) -- so a mid-cycle cooling phase RE-COOLS the
-        # held atoms and the frames are comparable (the same atoms imaged twice).  A REPEATED program
-        # (repeat_count > 1: the measurement layer fired ``sequence.repeated(N)`` so the streamer emits
-        # N independent camera-trigger edges -- sitemap / threshold / detect / detection-time scan)
-        # is a FRESH shot per repeat, so every frame RELOADS.  The criterion is repeat_count, NOT the
-        # raw trigger count: a repeated single-trigger program ALSO has N triggers (== frames), so
-        # "base_triggers >= frames" cannot tell it apart from a held N-trigger bracket -- only
-        # repeat_count distinguishes "N copies of one shot" from "one shot with N windows".
-        single_cycle = not (getattr(sequence, "repeat_count", 1) > 1 or getattr(sequence, "repeat_forever", False))
+        # Does ONE BASE CYCLE carry a camera-trigger window for EVERY frame?  If so this shot is a
+        # single-loading BRACKET -- a release-recapture bracket (2 windows around a readout) or a
+        # long-short-long imaging bracket (3 windows) -- and the SAME atoms are imaged through each
+        # window (a mid-cycle cooling phase RE-COOLS the held atoms), so every frame uses ITS OWN
+        # window's exposure / cooling.  Otherwise the frames come from REPEATS of a SHORTER base cycle:
+        # a ``.repeated(N)`` single-window sitemap / threshold / detect, or a continuous single-window
+        # live monitor -- each frame a FRESH independent loading through the base window.
+        #
+        # The criterion is the BASE-CYCLE window count vs frames -- NOT repeat_count / repeat_forever.
+        # A ``repeat_forever`` imaging bracket (a long-short-long On-Pulse looped live) is STILL a
+        # bracket per cycle, so keying off ``repeat_forever`` collapsed frames 1..n onto window 0 and
+        # EVERY emCCD frame came out at the FIRST window's (long) exposure -- the reported "看不到
+        # long-short-long exposure" bug.  (The raw FIRED trigger total cannot distinguish a repeated
+        # single-trigger from an N-window bracket -- both total N -- but the per-BASE-CYCLE count can:
+        # 1 for the repeated single-trigger, N for the bracket.)
+        single_cycle = base_cycle_trigger_pulses(sequence, trigger_channels=trig) >= frames
         # A repeated SINGLE-trigger sequence images a fresh independent loading every frame; each
         # repeat is one base cycle, so every frame's cooling window equals the base cooling
         # (``cooling_durations[0]``; None when the pulse has no cooling phase -> saturated load).

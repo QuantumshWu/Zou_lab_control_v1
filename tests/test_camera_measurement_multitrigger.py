@@ -55,6 +55,33 @@ def test_default_is_single_event_frame_0_only():
     assert set(cam_node.published_signals()) == {"frame_0"}      # one event -> just frame_0; no lumped frame
 
 
+def test_long_short_long_imaging_bracket_shows_distinct_per_window_exposures():
+    """A long-short-long imaging bracket (``imaging_template``) fired as a live On Pulse (repeat_forever)
+    is ONE atom loading imaged through THREE distinct camera windows -- so the three emCCD frames must
+    each integrate their OWN window's exposure (long, short, long), leaving the SHORT middle frame
+    visibly dimmer than both long frames.
+
+    Regression (the '看不到 long-short-long exposure' bug): the render keyed 'one loading, N windows'
+    off ``repeat_forever``, so a continuously-looped bracket was mistaken for repeated single-window
+    shots and EVERY frame collapsed onto window 0's (long) exposure -- all three frames came out equally
+    bright.  The criterion is the BASE-CYCLE window count (a bracket carries >= frames per cycle)."""
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+    from Zou_lab_control.neutral_atom.devices.camera_trigger import base_cycle_trigger_pulses
+
+    exp = na.connect("virtual")
+    try:
+        atoms = exp.devices.trap_array
+        seq = PulseTableState.load(str(REPO_ROOT / "pulses" / "imaging_template.json")).to_sequence().forever()
+        assert seq.repeat_forever and base_cycle_trigger_pulses(seq) == 3   # ONE cycle, 3 emCCD windows
+        imgs = atoms.image_frames(seq, 3, capture_trigger_channels=("emCCD",),
+                                  exposure=exp.devices.camera.exposure)
+        bright = [float(np.mean(im)) for im in imgs]
+        # long, SHORT, long -> the short middle frame is dimmer than BOTH long frames (not all equal).
+        assert bright[1] < bright[0] and bright[1] < bright[2], bright
+    finally:
+        exp.close()
+
+
 def test_camera_frame_keys_is_the_single_source_for_published_and_declared_names():
     """The console's declared-signal picker (a not-yet-started camera row) and the running camera's
     ``published_signals`` must offer the EXACT same ``frame_i`` set -- so a 'waiting' name in the picker
