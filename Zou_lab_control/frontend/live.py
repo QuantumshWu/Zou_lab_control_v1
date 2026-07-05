@@ -684,32 +684,53 @@ class BaseLivePlot:
             self.draw()
         return self
 
-    def draw(self) -> None:
-        # A build / batch param-apply mutates the figure MANY times; each draw() below is a full
-        # SYNCHRONOUS render (draw_idle + flush_events), so a 36-cell 300-dpi grid re-rendered once per
-        # mutation cost ~7x per build.  Inside suspend_draws() the draw is skipped -- the caller renders
-        # ONCE afterwards (via the canvas, or the explicit draw at the block's end).
+    def compose(self) -> None:
+        """Phase 1 of the board's two-phase render: bring this figure's OFFSCREEN Agg buffer up to date
+        with the current data WITHOUT presenting it to the screen.  On the embedded Qt canvas a steady
+        tick BLITS -- restore the cached chrome background + redraw ONLY the data artists (~0.6 ms) --
+        instead of re-rasterising the whole 300-dpi figure (~12 ms of tick/label text); a chrome change
+        / first frame full-renders into the buffer.  NO Qt paint is scheduled here: the board schedules
+        every panel's paint TOGETHER in :meth:`present`, so the screen only ever shows ONE coherent frame
+        (never frame_0 at shot S beside frame_2 at S-1).  Inside suspend_draws() this is a no-op (a batch
+        build renders once afterwards).  Any chrome change re-captures the background once (_compose_blit).
+        """
         if self._draw_suspended:
             return
-        # On the embedded Qt canvas a live data tick BLITS: restore the cached chrome background + redraw
-        # ONLY the data artists (~0.6 ms) instead of re-rasterising the whole 300-dpi figure (~12 ms of
-        # tick/label text), a ~20x win that lets many panels refresh at 100 ms without lag.  Any chrome
-        # change re-captures the background exactly once (see _blit_draw).  The notebook (ipympl) and
-        # headless canvases have no such background op, so they keep the full synchronous render.
-        if self._blit_draw():
+        if self._compose_blit():
             return
-        canvas = self.fig.canvas
+        canvas = getattr(self.fig, "canvas", None)
+        # A chrome change / first frame / no data artists: render the WHOLE figure into the Agg buffer.
+        # The embedded canvas' draw() renders SYNCHRONOUSLY without scheduling a Qt paint (present() owns
+        # that), so the buffer is ready for the batched present.  A notebook (ipympl) / headless canvas
+        # has no offscreen-buffer split -- it renders + pushes in present() (draw_idle), as before.
+        if canvas is not None and type(canvas).__name__ == "EmbeddedFigureCanvas":
+            canvas.draw()
+
+    def present(self) -> None:
+        """Phase 2 of the board's two-phase render: flush the composed buffer to the screen.  On the
+        embedded canvas this SCHEDULES the Qt paintEvent (which stretch-blits the current buffer) via
+        update() -- scheduling, NOT a synchronous flush_events, so Qt paints every panel's buffer in ONE
+        frame and pending button / combobox input is serviced promptly (a per-panel flush would block
+        input behind the render burst).  A notebook (ipympl) / headless canvas renders + pushes now."""
+        canvas = getattr(self.fig, "canvas", None)
+        if canvas is None:
+            return
+        if type(canvas).__name__ == "EmbeddedFigureCanvas":
+            canvas.update()
+            return
         canvas.draw_idle()
-        # A SYNCHRONOUS flush forces the paint NOW.  The notebook (ipympl) needs it to push the frame to
-        # the browser; the embedded Qt canvas must NOT do it -- flush_events re-enters the event loop per
-        # panel per tick, so with several panels the console tick blocks button / combobox input behind
-        # the render burst.  For the Qt canvas ``draw_idle`` already scheduled an update(); letting the
-        # event loop service that paint TOGETHER with pending input keeps the controls responsive.
-        if type(canvas).__name__ != "EmbeddedFigureCanvas":
-            try:
-                canvas.flush_events()
-            except Exception:
-                pass
+        try:
+            canvas.flush_events()
+        except Exception:
+            pass
+
+    def draw(self) -> None:
+        """Compose + present this figure in one call -- the SINGLE-figure path (figure_viewer, the
+        notebook, tests, any caller that owns one figure).  The board (TaskConsole) instead splits these
+        into two phases ACROSS all its panels for cross-panel shot coherence; every other caller renders
+        one figure, so compose-then-present here is exactly the old one-shot draw."""
+        self.compose()
+        self.present()
 
     def _blit_data_artists(self) -> list:
         """Every per-tick DATA / overlay artist across the figure, z-sorted -- the ONE generic rule
@@ -748,10 +769,11 @@ class BaseLivePlot:
                 parts.append(im.get_cmap().name)
         return tuple(parts)
 
-    def _blit_draw(self) -> bool:
-        """Try to render this tick as a blit.  Returns True if it did (caller skips the full draw),
-        False to fall back.  Only the embedded Qt canvas has the Agg region ops AND our stretch-blit
-        paintEvent, so blit is confined to it; a figure with no data artists falls back honestly.
+    def _compose_blit(self) -> bool:
+        """Compose this tick as a BLIT into the offscreen buffer (no present).  Returns True if it did
+        (caller skips the full render), False to fall back.  Only the embedded Qt canvas has the Agg
+        region ops AND our stretch-blit paintEvent, so blit is confined to it; a figure with no data
+        artists falls back honestly.
 
         NON-REGRESSIVE by design: a tick whose CHROME changed (a relim, first frame) does NOT blit --
         it returns False for a plain full render, exactly the old cost, and defers the background
@@ -789,12 +811,10 @@ class BaseLivePlot:
                 if a.get_visible():
                     a.axes.draw_artist(a)
             # The Agg buffer now holds chrome + current data; tell the canvas it is current so its
-            # paintEvent stretch-blits it as-is instead of triggering a full re-render on ``stale``.
+            # paintEvent stretch-blits it as-is instead of triggering a full re-render on ``stale``.  Do
+            # NOT present here (no canvas.blit()/update): present() schedules every panel's paint together
+            # so the board flips ONE coherent frame -- never a torn mix of shots (see compose()/present()).
             self.fig.stale = False
-            # blit() schedules the widget paint via update(); do NOT flush_events synchronously here (the
-            # embedded canvas is Qt-only) -- the event loop services this paint together with pending user
-            # input, so a multi-panel tick never blocks a button / combobox click (see draw()).
-            canvas.blit(self.fig.bbox)
             return True
         except Exception:
             # Any blit failure (an odd artist, a torn-down canvas) degrades to the full render -- never

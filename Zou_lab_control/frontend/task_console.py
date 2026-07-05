@@ -3233,10 +3233,12 @@ class PanelCard(FluentGroupBox):
             self.refresh(self._last_namespace)
 
     # ------------------------------------------------------------- data path
-    def refresh(self, namespace: dict[str, object]) -> None:
-        """Evaluate this panel's source against ``namespace`` and render the plot.
-        Every failure lands on the gear/status -- a bad expression in one panel
-        must never break the console or its siblings."""
+    def compose(self, namespace: dict[str, object]) -> None:
+        """Evaluate this panel's source against ``namespace`` and render the plot INTO ITS OFFSCREEN
+        BUFFER -- phase 1 of the board's two-phase render: nothing is pushed to the screen here; the
+        board presents every composed panel together in phase 2 so the whole board only ever shows ONE
+        coherent shot.  Every failure lands on the gear/status -- a bad expression in one panel must
+        never break the console or its siblings."""
 
         # A BLANK panel (a freshly added pure view, source not yet wired) sits
         # quietly with a hint -- it is decoupled, so it shows nothing until the
@@ -3265,6 +3267,20 @@ class PanelCard(FluentGroupBox):
         self._last_namespace = namespace
         shot = namespace.get("shot")
         self.set_status(f"shot {int(shot)}" if isinstance(shot, (int, float)) else "ok", error=False)
+
+    def present(self) -> None:
+        """Phase 2 of the board's two-phase render: flush this panel's composed buffer to the screen
+        (schedule its Qt paint).  The board calls this for every panel it composed THIS tick, so they
+        all repaint in ONE frame -- the board never shows a torn mix of shots."""
+        if self.plotter is not None and self.canvas is not None:
+            self.plotter.present()
+
+    def refresh(self, namespace: dict[str, object]) -> None:
+        """Compose + present this ONE panel now -- a single-card refresh (a source re-pick, the running
+        task's mid-run panel).  The board (TaskConsole tick) instead splits these two phases across ALL
+        its panels for cross-panel shot coherence; a lone card just composes then presents itself."""
+        self.compose(namespace)
+        self.present()
 
     def _signal_expr(self):
         """This panel's source as the ONE reusable :class:`SignalExpr` (the slot rule + the
@@ -3540,7 +3556,7 @@ class PanelCard(FluentGroupBox):
                     # re-park them to the switch (idempotent, cheap) so OFF stays display-only.
                     self._apply_selectors_state()
                     if self.plotter is not None:
-                        self.plotter.draw()
+                        self.plotter.compose()
             return
         value = self._coerce(value)
         kind = self.config.kind
@@ -3574,7 +3590,7 @@ class PanelCard(FluentGroupBox):
                     return
                 self.plotter.update_cells(per_cell)
                 if self.canvas is not None:
-                    self.plotter.draw()
+                    self.plotter.compose()
                 return
             # a RECIPE grid is a SNAPSHOT built from its recipe: (re)build only on the FIRST show or
             # when a display knob marked a rebuild -- NEVER a per-tick redraw (#3).
@@ -3634,12 +3650,12 @@ class PanelCard(FluentGroupBox):
         # rebuilds its draggers inside update_core) -- re-park them to the switch state.  Idempotent
         # and cheap (a few attribute checks), so it never weighs on the live tick.
         self._apply_selectors_state()
-        # Render through the PLOTTER's blit-aware draw (NOT canvas.draw_idle, which defers a full 300-dpi
-        # re-render to the paint pass and blocks input): a stable panel updates its Agg buffer in ~0.6 ms
-        # here + schedules a cheap stretch-blit paint, so a multi-panel tick stays light and the event loop
-        # services user input promptly.  A chrome change falls back to the deferred full draw inside draw().
+        # COMPOSE this panel's buffer (blit: ~0.6 ms restore chrome bg + redraw data artists); nothing is
+        # pushed to the screen here.  The board PRESENTS every composed buffer TOGETHER in phase 2 so the
+        # whole board flips ONE coherent shot; a lone single-card refresh() presents right after.  A chrome
+        # change full-renders into the buffer inside compose().
         if self.canvas is not None:
-            self.plotter.draw()
+            self.plotter.compose()
 
     def _source_axis_label(self) -> str | None:
         """The y-axis label for this panel's sourced signal, taken from the PRODUCING
@@ -7793,17 +7809,13 @@ class TaskConsole(QtWidgets.QWidget):
         self._paused = not self._paused
         self.pause_button.setText("Resume" if self._paused else "Pause")
         self.pause_button.set_color(GREEN if self._paused else ORANGE)
-        # Pause/Resume are DISCRETE actions (not the hot tick), so do a COHERENT full refresh at BOTH edges:
-        # ``refresh_once`` renders EVERY panel from ONE ``snapshot_at(_display_shot())`` (bypassing the beat
-        # + version gate that would leave some panels a shot behind), then a single ``processEvents`` forces
-        # the scheduled paints NOW so the FROZEN screen actually shows that one consistent shot -- the three
-        # emCCD frames of a pulse must agree.  (The live tick keeps its async paints for responsiveness;
-        # this one-off synchronous flush on a user action is fine.)
-        self.refresh_once()
-        try:
-            QtWidgets.QApplication.processEvents()
-        except Exception:
-            pass
+        # A paused display freezes every panel: _tick returns early while paused (no card advances its
+        # _render_version), and the LAST live tick already presented ONE coherent shot (the two-phase
+        # compose-all-then-present-all render), so the frozen board is a single consistent shot.  Resume
+        # runs one _tick: ``disp`` has moved on, so every stale panel's frame key differs and the
+        # disp-advance override recomposes + presents them TOGETHER -- an immediate coherent catch-up.
+        if not self._paused:
+            self._tick()
 
     def _toggle_selectors(self, on: bool) -> None:
         """Header "Selectors" switch: arm (ON) or park (OFF) the selector layer of EVERY dashboard
@@ -7852,18 +7864,25 @@ class TaskConsole(QtWidgets.QWidget):
         self._last_save_dir = str(Path(path).parent)
         self._update_summary()
 
-    def _card_render_key(self, card, sigvers: Mapping[str, int]):
-        """The render key for THIS card: a tuple of the publish counters of ITS OWN bound signals
-        (``config.inputs``), so the tick redraws the panel ONLY when one of those signals produced a new
-        sample -- NOT on every OTHER node's publish.  The old gate compared the GLOBAL ``hub.version``,
-        which bumps on ANY publish, so a fast node + a slow node (or an A/B camera pair) repainted EVERY
-        panel on the fast node's beat -- wasted GUI-thread draws.  ``sigvers`` is one shared
-        ``hub.signal_versions()`` snapshot.  A card with no bound signals keeps the global version (it has
-        no per-signal key, so the old redraw-on-any behaviour is preserved rather than freezing it)."""
+    def _panel_frame_key(self, card, disp, sigvers: Mapping[str, int]):
+        """The identity of the COHERENT FRAME this panel would draw right now.  It is the board display
+        shot ``disp`` -- which pins EVERY lineage / shot-clock signal (that signal's value AT that shot is
+        fixed) -- plus the publish counters of the panel's FREE-RUNNING (no-lineage) inputs (a loading
+        rate, which ``disp`` does not constrain).  The panel's buffer is stale exactly when this changes:
+        when the coherent clock ADVANCES -- so ALL panels go stale together and recompose from the ONE
+        shared snapshot, and the three emCCD frames of a pulse can NEVER freeze on different shots -- or
+        when one of the panel's own free-running scalars ticks.  ``sigvers`` is one shared
+        ``hub.signal_versions()`` snapshot.
+
+        (Successor of the per-signal gate, whose flaw was ignoring ``disp``: a panel whose OWN signal had
+        already published stayed frozen a shot behind while a slower co-displayed producer advanced the
+        clock -> the reported "the three frames are not one shot" desync.  Blit makes recomposing every
+        panel on a clock tick cheap, so coherence costs nothing.)"""
+        from ..neutral_atom.core.signals import NO_LINEAGE     # single source of the sentinel (lazy)
         inputs = card.config.inputs or ()
-        if not inputs:
-            return self.hub.version
-        return tuple(sigvers.get(str(n), 0) for n in inputs)
+        free = tuple((str(n), sigvers.get(str(n), 0)) for n in inputs
+                     if self.hub.latest_provenance(str(n)) == NO_LINEAGE)
+        return (disp, free)
 
     def _tick(self) -> None:
         # poll the logic nodes EVERY base tick (even when no new signal arrived) so a
@@ -7874,29 +7893,42 @@ class TaskConsole(QtWidgets.QWidget):
         # A running task's mid-run output is OFF the hub (#6), so it does NOT bump the
         # hub version -- refresh its dedicated panel here every tick.
         self._refresh_task_panel()
-        # PAUSE = freeze EVERY plot's display: skip the per-card render below (so no card advances
-        # its _render_version) while keeping node polling / banners alive.  On Resume, each card whose
-        # OWN signals published during the pause has a changed render key, so the gate redraws exactly
-        # those (a card whose signals never moved needs no redraw -- nothing changed).
+        # PAUSE = freeze the board: skip the render below (no card advances its _render_version) while
+        # node polling / banners stay alive.  On Resume the coherent clock has moved on, so every stale
+        # panel's frame key differs from what it drew and the gate below recomposes them together.
         if self._paused:
             self._update_summary()
             return
         self._tick_count += 1
-        sigvers = self.hub.signal_versions()   # ONE per-signal-counter snapshot for this whole tick
+        disp = self._display_shot()            # the ONE coherent display shot for the whole board this tick
+        sigvers = self.hub.signal_versions()   # ONE per-signal-counter snapshot for the whole tick
         elapsed = self._tick_count * self._base_interval_ms
         namespace = None
+        # PHASE 1 -- COMPOSE every panel whose coherent frame changed into its OWN offscreen buffer
+        # (nothing reaches the screen yet).  Each compose reads the ONE shared snapshot at ``disp``, so
+        # the panels are mutually consistent BY CONSTRUCTION.
+        dirty = []
         for card in self.cards:
-            # this panel's beat?  update_ms is a multiple of the base, so cards that share a beat fire on the
-            # SAME tick -> they read the SAME namespace below (one snapshot, mutually consistent).
-            if elapsed % card.config.update_ms != 0:
+            key = self._panel_frame_key(card, disp, sigvers)
+            if key == card._render_version:
+                continue                          # nothing this panel shows changed
+            # Coherence beats the throttle: if the DISPLAY SHOT advanced, recompose NOW regardless of this
+            # panel's own beat, so every co-displayed panel flips to the new shot in the SAME tick (the
+            # three emCCD frames of a pulse never split).  A change of only a free-running scalar (disp
+            # unchanged) honours the panel's update_ms beat.
+            disp_moved = (not isinstance(card._render_version, tuple)
+                          or card._render_version[0] != disp)
+            if not disp_moved and elapsed % card.config.update_ms != 0:
                 continue
-            rkey = self._card_render_key(card, sigvers)
-            if rkey == card._render_version:      # none of THIS panel's OWN signals published since it drew
-                continue                          # (a global-version gate would redraw it on ANY node's publish)
-            if namespace is None:                 # built ONCE per tick -> one snapshot (each signal latest)
+            if namespace is None:                 # built ONCE per tick -> the shared snapshot at ``disp``
                 namespace = self._expression_namespace()
-            card.refresh(namespace)
-            card._render_version = rkey
+            card.compose(namespace)
+            card._render_version = key
+            dirty.append(card)
+        # PHASE 2 -- PRESENT every composed buffer TOGETHER: Qt paints them in one frame, so the board
+        # only ever shows ONE coherent shot (never frame_0 at shot S beside frame_2 at S-1).
+        for card in dirty:
+            card.present()
         # keep the visible Edit tab's 'now:' acquisition references live, so a queued
         # parameter edit shows as applied once the loop picks it up.
         editor = self.tabs.currentWidget()
@@ -7906,17 +7938,22 @@ class TaskConsole(QtWidgets.QWidget):
         self._update_summary()
 
     def refresh_once(self) -> None:
-        """Synchronous FULL refresh (tests / notebooks): render every card now, regardless of
-        its per-panel beat or the version gate."""
+        """Synchronous FULL refresh (tests / notebooks / Resume catch-up): COMPOSE every card from the
+        ONE coherent snapshot, then PRESENT them all together -- the same two-phase coherence as the live
+        tick, just unconditional (ignores per-panel beat and the frame-key gate)."""
         self._poll_logic_nodes()
         self._refresh_signal_info()
         self._refresh_task_panel()
+        disp = self._display_shot()
         sigvers = self.hub.signal_versions()
-        # render EVERY card now at each signal's latest value (tests / notebooks / Resume catch-up).
+        # compose EVERY card at the one coherent snapshot, THEN present them together (tests / notebooks /
+        # Resume catch-up) so a frozen board is a single consistent shot, never a torn mix.
         namespace = self._expression_namespace()
         for card in self.cards:
-            card.refresh(namespace)
-            card._render_version = self._card_render_key(card, sigvers)
+            card.compose(namespace)
+            card._render_version = self._panel_frame_key(card, disp, sigvers)
+        for card in self.cards:
+            card.present()
         editor = self.tabs.currentWidget()
         if isinstance(editor, PanelEditor):
             editor.refresh_node_now_labels()

@@ -1,4 +1,4 @@
-"""MECHANICAL guard for the live-plot BLIT render path (``BaseLivePlot._blit_draw``).
+"""MECHANICAL guard for the live-plot BLIT render path (``BaseLivePlot._compose_blit``).
 
 A live data tick on the embedded Qt canvas must NOT re-rasterise the whole 300-dpi figure; once the
 chrome is stable it restores a cached chrome background and redraws only the data artists (~20x). The

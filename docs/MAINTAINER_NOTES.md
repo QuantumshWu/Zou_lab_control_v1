@@ -1376,7 +1376,9 @@ discipline as the loading model.
 
 ### task_console live-refresh: BLIT (the full-draw floor was NOT intrinsic)
 
-Source: memory note `task-console-live-perf-floor`; blit landed 2026-07 (`BaseLivePlot._blit_draw`).
+Source: memory note `task-console-live-perf-floor`; blit landed 2026-07 (`BaseLivePlot._compose_blit`,
+split into a two-phase `compose()`/`present()` so the board composes every panel's buffer then presents
+them together in one coherent frame).
 The old cost: `BaseLivePlot.draw()` re-rasterised the WHOLE 300-dpi figure every tick
 (`canvas.draw_idle()+flush_events()`, cProfile top = `draw_text` glyph rasterisation across all
 axes), ~12 ms per 2x2 panel — 5-6 panels at 100 ms saturated the budget. Confocal-GUIv2 (the
