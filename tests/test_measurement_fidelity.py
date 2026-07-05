@@ -63,16 +63,24 @@ def test_fidelity_and_temperature_share_the_coupled_template_scan_shape():
 def test_fidelity_template_scan_rises_with_readout_duration():
     """Building the fidelity spec from its imaging template + running it in virtual yields a finite
     fidelity curve in [0,1] that is HIGHER at a long readout than at a short one (more collected
-    fluorescence -> the bright/dark counts separate -> higher single-shot fidelity)."""
+    fluorescence -> the bright/dark counts separate -> higher single-shot fidelity).
+
+    The sweep runs up to the ~20 ms qCMOS working point (the science camera's default exposure): at
+    50 us a readout collects too few photons to tell bright from dark (~0.5), and at 20 ms the
+    bright/dark counts fully separate (near the fidelity ceiling).  The long-end FLOOR is a real guard
+    on the virtual model's SNR -- it is why the v16 photon-rate retune (``atom_rate`` 2150 -> 1100, so
+    the model no longer over-separated) has to keep a 20 ms readout genuinely high-fidelity, not merely
+    'climbing a little' by the old 5 ms (which the retune left marginal at ~0.55)."""
     exp = _calibrated_exp()
     try:
         fid = _spec(exp, "readout")
-        scan = fid.build(duration=(50.0, 5000.0, 5), shots=24)
+        scan = fid.build(duration=(50.0, 20000.0, 5), shots=24)
         res = scan.run(live=False, display=False)
         x, y = np.asarray(res.x), np.asarray(res.y)
         assert x.shape == y.shape and x.size == 5
         assert np.all(np.isfinite(y)) and np.all((y >= 0.0) & (y <= 1.0))
         assert y[-1] >= y[0] + 0.05, f"fidelity should climb with readout duration, got {np.round(y,3)}"
         assert y[0] <= 0.65, f"a 50 us readout should be near-indistinguishable (~0.5), got {y[0]:.3f}"
+        assert y[-1] >= 0.8, f"a 20 ms readout (qCMOS working point) should be high-fidelity, got {y[-1]:.3f}"
     finally:
         exp.close()

@@ -59,7 +59,7 @@ def _resolve_imaging_template(template: str, sequencer, *, trigger_channel: str 
 def readout_duration_fidelity(readout) -> MeasurementSpec:
     s = readout.session
 
-    def build(*, template=DEFAULT_IMAGING_TEMPLATE, duration=(2.0, 5000.0, 11), shots=60, site=None, **_ignored):
+    def build(*, template=DEFAULT_IMAGING_TEMPLATE, duration=(2.0, 20000.0, 11), shots=60, site=None, **_ignored):
         d_min_us, d_max_us, points = axis_range_tuple(duration, "duration")
         times = np.linspace(float(d_min_us) * 1e-6, float(d_max_us) * 1e-6, int(points))
         site_val = None if site in (None, "", -1) else int(site)
@@ -91,9 +91,11 @@ def readout_duration_fidelity(readout) -> MeasurementSpec:
                           "'Detection time'.  This is the COUPLED pulse-scan special case -- each point's "
                           "frame set is otsu-split into a single-shot fidelity inline, not read from a "
                           "separate node."),
-        ParamDecl("duration", "Detection time", "axis_range", default=(2.0, 5000.0, 11), unit="us",
+        ParamDecl("duration", "Detection time", "axis_range", default=(2.0, 20000.0, 11), unit="us",
                   lo=1e-3, hi=1e6, tooltip="Readout-duration sweep min/max (us) and number of points -- "
-                          "the camera gate-open window the imaging template is read at."),
+                          "the camera gate-open window the imaging template is read at.  The default sweeps up "
+                          "to the ~20 ms qCMOS working point, where single-shot fidelity rises from ~0.5 (too "
+                          "short to tell bright from dark) to near its ceiling (bright/dark counts fully separate)."),
         ParamDecl("shots", "Shots / point", "int", default=60, lo=1, hi=100_000,
                   tooltip="Frames pooled per point for the Otsu fidelity estimate."),
         ParamDecl("site", "Site (optional)", "int", default=None, lo=0, hi=100_000,
