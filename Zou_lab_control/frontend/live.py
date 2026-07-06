@@ -1159,23 +1159,55 @@ class BaseLivePlot:
         """Remove this plot's previous general-fit curve and, if a ``_fit_model`` is set, run it on
         ``self`` via the ONE :func:`apply_fit_to_figure` primitive -- the flat-panel counterpart of the
         grid's :meth:`GridPlot._refit_axes`, so both surfaces fit through identical code.  Tracks the drawn
-        artists so the next re-fit removes exactly one curve."""
-        for art in getattr(self, "_general_fit_artists", []):
+        artists so the next re-fit removes exactly one curve.
+
+        Guarded by a data+command fingerprint (the flat-panel counterpart of
+        :class:`HistogramFigure`'s ``_fit_cache_key``): a live tick that did not move the data re-runs
+        NOTHING -- no ``curve_fit``, no annotation repaint -- so a pinned live fit costs one fingerprint
+        per tick instead of a fresh fit + 6-candidate bbox search every frame."""
+        model = getattr(self, "_fit_model", "none")
+        ax = getattr(self, "ax", None)
+        if not model or model == "none" or ax is None:
+            # fit cleared / never set: drop any stale curve + cache key (so a re-enable always re-fits).
+            for art in getattr(self, "_general_fit_artists", []):
+                try:
+                    art.remove()
+                except Exception:
+                    pass
+            self._general_fit_artists = []
+            self._general_fit_key = None
+            return
+        cmd = getattr(self, "_fit_cmd", "")
+        key = (self._fit_data_fingerprint(), str(model), str(cmd))
+        arts = getattr(self, "_general_fit_artists", [])
+        # Skip only when nothing moved AND the drawn curve is still attached: a focus swap / axes
+        # rebuild that wiped the artists must re-fit even on identical data.
+        if key == getattr(self, "_general_fit_key", None) and arts and all(a in ax.get_children() for a in arts):
+            return
+        self._general_fit_key = key
+        for art in arts:
             try:
                 art.remove()
             except Exception:
                 pass
         self._general_fit_artists = []
-        model = getattr(self, "_fit_model", "none")
-        ax = getattr(self, "ax", None)
-        if not model or model == "none" or ax is None:
-            return
         # A flat panel is a FULL plot, so its fit shows the curve + the formula/parameter annotation
         # (is_display defaults True in apply_fit_to_figure); track EVERY child the fit added (curve + text)
         # so a re-fit removes it all -- the flat counterpart of the grid's :meth:`GridPlot._refit_axes`.
         before = set(id(c) for c in ax.get_children())
-        apply_fit_to_figure(self.to_data_figure(), model, getattr(self, "_fit_cmd", ""))
+        apply_fit_to_figure(self.to_data_figure(), model, cmd)
         self._general_fit_artists = [c for c in ax.get_children() if id(c) not in before]
+
+    def _fit_data_fingerprint(self):
+        """Cheap identity of the data the general fit runs on -- the same ``data_x``/``data_y``
+        ``apply_fit_to_figure`` reads via ``to_data_figure`` -- so ``_reapply_general_fit`` can skip a
+        re-fit when nothing moved.  Shapes + dtype + bytes of both arrays, exactly how
+        :class:`HistogramFigure` keys its fit cache on the counts."""
+        parts = []
+        for arr in (getattr(self, "data_x", None), getattr(self, "data_y", None)):
+            a = np.asarray(arr)
+            parts.append((a.shape, a.dtype.str, a.tobytes()))
+        return tuple(parts)
 
     def _reapply_view_knobs(self) -> None:
         """Re-apply this plot's stored VIEW knobs after each live tick -- the general curve fit (re-fit to the

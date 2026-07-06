@@ -404,7 +404,11 @@ class DataFigure:
             text.set_position(cand[:2])
             text.set_ha(cand[2])
             text.set_va(cand[3])
-            ax.figure.canvas.draw()
+            # Measure the candidate off the already-fetched ``renderer``: ``set_position`` marks the
+            # text stale so ``get_window_extent`` recomputes its layout on the next call.  A full
+            # ``canvas.draw()`` per candidate (6x 300dpi rasters just to size a text box, on the
+            # every-tick live-fit path) was pure waste -- the renderer + transAxes already carry
+            # everything the bbox needs.
             bbox = text.get_window_extent(renderer).expanded(1.05, 1.1)
             if len(pts_disp) == 0:
                 overlap = 0
@@ -455,7 +459,9 @@ class DataFigure:
                 line.set_alpha(0.5)
         if self.plot_type == "1D" and len(self.data_y) < 2000:
             self._line_to_scatter()
-        self.fig.canvas.draw_idle()
+        # No draw here: this method's ONE caller (_fit_and_draw) places the fit CURVE right after and
+        # issues the single terminal draw_idle.  Drawing here too was a premature + redundant full
+        # repaint -- it painted the annotation BEFORE the curve existed, then the whole figure again.
 
     @staticmethod
     def _clean_param_name(name: str) -> str:
