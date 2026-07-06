@@ -223,6 +223,7 @@ __all__ = [
     "panel_size_cells",
     "plot",
     "site_histogram_grid",
+    "site_psf_grid",
     "pulse_plot_channels",
     "pulse_plot_spec",
     "pulse_repeat_markers",

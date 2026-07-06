@@ -61,7 +61,8 @@ _ROLE_STYLE: Mapping[str, tuple[str, str]] = {
     "plot": ("#5B5B5B", "#3A3A3A"),
     "raw data": (GREY, "#7C7C7C"),
 }
-_DEFAULT_STYLE = ("#5B5B5B", "#3A3A3A")
+#: unknown-role fallback == the neutral plot style (single source: never a re-typed copy of the pair)
+_DEFAULT_STYLE = _ROLE_STYLE["plot"]
 
 
 def _role_style(role: str) -> tuple[str, str]:
