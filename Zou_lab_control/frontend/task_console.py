@@ -6192,14 +6192,15 @@ class TaskConsole(QtWidgets.QWidget):
             self.pause_button.clicked.connect(self._toggle_pause)
             self.save_image_button = FluentButton("Save image", color=ACCENT)
             self.save_image_button.clicked.connect(self._save_board_image)
-            # The device manager: see every device the config loaded (by role-type) + Scan hardware --
-            # the GUI face of na.load_devices/discover_devices, and the SAME device registry the per-
-            # measurement Camera dropdowns read.  A launcher (like Selectors/Pause), OUT of the running-
-            # task lockout: inspecting devices is read-only.
+            # The READ-ONLY device viewer: one tab per loaded device (its snapshot + live runtime
+            # read-backs), NO config editor / add / remove -- the console must not let an operator
+            # mutate the running device set (the full editor is the notebook's exp.device_manager()).
+            # A launcher (like Selectors/Pause), OUT of the running-task lockout: viewing is read-only.
             self.devices_button = FluentButton("Devices", color=GREY)
-            self.devices_button.setToolTip("Open the device manager: every loaded device grouped by "
-                                           "role-type (Camera / Sequencer / …) + a Scan-hardware button.")
-            self.devices_button.clicked.connect(self._open_device_manager)
+            self.devices_button.setToolTip("Open the read-only device viewer: each loaded device's "
+                                           "snapshot + live state (no editing -- use the notebook's "
+                                           "device manager to change devices).")
+            self.devices_button.clicked.connect(self._open_device_viewer)
 
         for widget in (self.status_dot, self.name_edit):
             header.addWidget(widget)
@@ -7856,13 +7857,15 @@ class TaskConsole(QtWidgets.QWidget):
         for card in self.cards:
             card.set_selectors_enabled(bool(on))
 
-    def _open_device_manager(self) -> None:
-        """Header "Devices" button: open the device-manager window (every loaded device by role-type
-        + Scan hardware).  Routes through the session's ONE-per-session ``device_manager()`` facade
-        (``na._gui.open_device_manager`` -> ``show_device_manager``) so it reuses the same singleton
-        the notebook opens -- the console never builds the window itself."""
+    def _open_device_viewer(self) -> None:
+        """Header "Devices" button: open the READ-ONLY device viewer (one tab per loaded device --
+        its snapshot + live runtime read-backs, NO config editing / add / remove).  Routes through
+        the session's ONE-per-session ``device_viewer()`` facade (``na._gui.open_device_viewer`` ->
+        ``show_device_viewer``): the console offers only a safe look at the running device set, never
+        the full config editor (that is the notebook's ``exp.device_manager()`` entry) -- so a
+        running experiment's devices can never be mutated from here."""
         session = getattr(self, "session", None)
-        opener = getattr(session, "device_manager", None)
+        opener = getattr(session, "device_viewer", None)
         if callable(opener):
             opener()
 

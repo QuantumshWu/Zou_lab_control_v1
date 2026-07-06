@@ -182,6 +182,31 @@ def open_device_manager(session: Any, **kwargs):
     return window
 
 
+def open_device_viewer(session: Any, **kwargs):
+    """Open the READ-ONLY device viewer bound to ``session`` -- ONE per session (confocal-style
+    singleton), the task console's safe "Devices" peek.
+
+    A read-only window: one tab per loaded device showing its snapshot + live runtime read-backs,
+    with NO config editor and NO way to add / remove / mutate devices -- so an operator can look
+    at a device's state while an experiment runs without the risk of editing the running set.  The
+    FULL config editor stays the separate ``exp.device_manager()`` / ``na.device_manager()``
+    entry.  A later call RESHOWS the same window (never a duplicate)."""
+
+    from Zou_lab_control.frontend.device_manager import show_device_viewer
+
+    existing = getattr(session, "_zlc_device_viewer", None)
+    if existing is not None and _alive(existing):
+        _reshow(existing)
+        return existing
+
+    # a PROVIDER (not a snapshot of the set) so a re-open re-reads the session's CURRENT devices --
+    # load_config replaces session.devices, and the viewer must never hold a stale set.
+    window = show_device_viewer(devices_provider=lambda: session.devices, **kwargs)
+    window.session = session
+    session._zlc_device_viewer = window
+    return window
+
+
 def device_manager(config: Any = None, **kwargs):
     """Open the device manager WITHOUT a session (``na.device_manager()``) -- the
     device-INIT entry point.
@@ -237,4 +262,4 @@ def load_figure(path):
 
 
 __all__ = ["open_task_console", "open_pulse_gui", "open_figure_viewer",
-           "open_device_manager", "device_manager", "load_figure"]
+           "open_device_manager", "open_device_viewer", "device_manager", "load_figure"]
