@@ -25,29 +25,12 @@ if sys.path[0] != str(REPO_ROOT):
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import Zou_lab_control.neutral_atom as na
-from Zou_lab_control.neutral_atom.core.signals import SignalHub
-
-
-def _console(exp, running_nodes=None):
-    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
-    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
-
-    ensure_qt_app()
-    return TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
-                       measurements=exp.readout.measurement_specs(),
-                       processors=exp.readout.processor_specs(),
-                       tasks=exp.readout.task_specs(), window_px=(900, 600),
-                       running_nodes=list(running_nodes or ()))
+from conftest import add_logic_row, make_console
 
 
 def _camera_row(con):
-    """Add a camera logic row through the REAL Add-Panel path (same as the startstop tests)."""
-    kc = con.kind_combo
-    i = next(j for j in range(kc.count()) if kc.itemData(j) == ("camera", "live"))
-    kc.setCurrentIndex(i)
-    con._add_panel()
-    con._timer.stop()                                    # deterministic: no background ticks
-    return con.logic_nodes[-1]
+    """A camera logic row through the REAL Add-Panel path (the shared conftest helper)."""
+    return add_logic_row(con, ("camera", "live"))
 
 
 class _FakeInjected:
@@ -69,7 +52,7 @@ class _FakeInjected:
 
 def test_failed_build_leaves_the_running_node_untouched():
     exp = na.connect("virtual")
-    con = _console(exp)
+    con = make_console(exp)
     try:
         row = _camera_row(con)
         con._start_logic_node(row)
@@ -92,7 +75,7 @@ def test_failed_start_registers_nothing_and_keeps_old_signals():
     from conftest import fire_live_imaging
 
     exp = na.connect("virtual")
-    con = _console(exp)
+    con = make_console(exp)
     try:
         row = _camera_row(con)
         con._start_logic_node(row)
@@ -123,7 +106,7 @@ def test_failed_start_registers_nothing_and_keeps_old_signals():
 def test_injected_device_driver_obeys_the_same_exclusion():
     exp = na.connect("virtual")
     injected = _FakeInjected()
-    con = _console(exp, running_nodes=[injected])
+    con = make_console(exp, running_nodes=[injected])
     try:
         assert injected in con.running_nodes
         row = _camera_row(con)
@@ -145,7 +128,7 @@ def test_reactive_processor_keeps_running_across_a_driver_start():
 
     exp = na.connect("virtual")
     proc = _FakeProcessor()
-    con = _console(exp, running_nodes=[proc])
+    con = make_console(exp, running_nodes=[proc])
     try:
         con._start_logic_node(_camera_row(con))
         assert not proc.stopped and proc in con.running_nodes

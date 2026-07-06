@@ -71,6 +71,37 @@ def test_closed_qcmos_and_pylon_accept_full_frame():
     assert basler.roi is None
 
 
+def test_frame_shape_derives_from_roi_else_sensor():
+    """``frame_shape`` is DERIVED, never stored: the ROI window's (height, width) when a
+    sub-array is set, else the full sensor.  It is the BUILD-time fact a CameraMeasurement
+    seeds its ``data_shape`` from -- so a panel can render a lingering hub block the moment
+    the measurement (re)starts, before any trigger fires."""
+    cam = load_devices("virtual", open_devices=False).devices["camera"]
+    assert cam.frame_shape == cam.sensor_shape          # no ROI -> the full sensor (H, W)
+    cam.configure(roi=(4, 16, 8, 32))                   # (x, width, y, height)
+    _x, w, _y, h = cam.roi                              # the SNAPPED window the camera reports
+    assert cam.frame_shape == (h, w)
+    cam.configure(roi=FULL_FRAME)
+    assert cam.frame_shape == cam.sensor_shape
+
+
+def test_camera_measurement_declares_data_shape_at_build():
+    """The node's structure contract is TRUE the moment it is built (no first-frame wait):
+    ``data_shape`` seeds from the camera's own ``frame_shape``.  A restarted measurement
+    whose trigger is not firing yet used to declare data_shape=() -- and every 2-D panel
+    bound to frame_0 refused the hub's lingering block."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
+
+    exp = na.connect("virtual")
+    try:
+        node = CameraMeasurement(SignalHub(), exp.devices.camera)
+        assert node.data_shape == exp.devices.camera.frame_shape   # declared BEFORE any frame
+    finally:
+        exp.close()
+
+
 def test_measurement_layer_blank_region_clears_the_roi_end_to_end():
     """#B1 end-to-end: the GUI/measurement path -- ``CameraMeasurement.set_acquisition_parameters``
     with a BLANK region -- must actually clear the camera ROI back to the full sensor.  The old

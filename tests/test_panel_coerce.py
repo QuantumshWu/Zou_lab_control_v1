@@ -52,6 +52,17 @@ def test_coerce_rejects_a_non_image_2d_value():
         coerce_panel_value("2d", np.arange(10.0), structure={"data_shape": (10,), "grid_shape": ()})  # 1-D, no map
 
 
+def test_coerce_2d_undeclared_data_shape_falls_back_to_the_value():
+    """UNDECLARED is not DECLARED-non-image: a producer that honestly does not know its frame
+    size yet (a camera backend without ``frame_shape``, before its first frame) carries
+    ``data_shape=()`` -- the panel then reads the (repeat-reduced) block's own 2-D core, the
+    same fallback a structure-less custom expression gets.  The reject above stays reserved
+    for a REAL contradiction (a declared non-2-D data core on an image panel)."""
+    block = np.arange(96 * 128, dtype=float).reshape(1, 96, 128)
+    img = coerce_panel_value("2d", block, structure={"data_shape": (), "grid_shape": ()})
+    assert img.shape == (96, 128) and np.array_equal(img, block[0])
+
+
 def test_console_coerce_is_a_thin_dispatcher_no_per_kind_logic():
     """PanelCard._coerce holds ZERO per-kind reshape logic -- it dispatches to the plot layer.
     Re-adding a per-kind branch (an ``if kind == ...`` reshape) to the console would resurrect the

@@ -1558,7 +1558,14 @@ class CameraMeasurement(Measurement):
         self.frames_per_cycle = max(1, int(frames_per_cycle))
         self.points_shape: tuple = (1,)                  # one frame = one data point (no swept param)
         self.primary_signal = "frame_0"                  # event 0's (repeat,1,H,W) block (#H3r-F4)
-        self.data_shape: tuple = ()                      # set to (H, W) on the first frame
+        # Declare (H, W) at BUILD time from the camera's own contract (``frame_shape`` = ROI else full
+        # sensor): the node's structure must be TRUE the moment it is built, not after the first frame
+        # -- a restarted measurement whose trigger is not firing yet (e.g. right after a calibration
+        # task parked the sequencer on a finished finite program) would otherwise declare data_shape=()
+        # and every 2-D panel bound to frame_0 would refuse the hub's perfectly good lingering block.
+        # A backend that honestly does not know its shape yet gives None -> () -> the first frame still
+        # teaches it (the ROI-change correction in shot() below stays the one re-learn path).
+        self.data_shape: tuple = tuple(camera.frame_shape or ())
         self._rings = None                               # list of N (ring,1,H,W) blocks; None until 1st frame
         self.set_repeat(repeat)
 

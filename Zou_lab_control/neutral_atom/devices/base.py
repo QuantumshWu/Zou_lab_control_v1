@@ -128,6 +128,23 @@ class CameraDevice(BaseDevice):
         qCMOS) overrides this."""
         return None
 
+    @property
+    def frame_shape(self) -> tuple[int, int] | None:
+        """The ``(height, width)`` of the NEXT frame this camera will deliver -- DERIVED
+        (never stored) from the two contract facts above: the sub-array window when an
+        ROI is set, else the full :attr:`sensor_shape`; ``None`` when the backend knows
+        neither yet (shape is then learnt from the first frame).
+
+        This is what lets a consumer DECLARE its output structure at BUILD time instead
+        of waiting for a frame: a ``CameraMeasurement`` seeds its ``data_shape`` from
+        here, so a panel bound to ``frame_0`` can render the hub's lingering block the
+        moment the measurement (re)starts -- even while no trigger is firing yet."""
+        r = self.roi
+        if r is not None:
+            _x, width, _y, height = (int(v) for v in r)   # ROI contract order: (x, width, y, height)
+            return (height, width)
+        return self.sensor_shape
+
     @abstractmethod
     def configure(self, *, exposure: float | None = None, **kwargs) -> None:
         """Configure camera settings that are stable across an acquisition.

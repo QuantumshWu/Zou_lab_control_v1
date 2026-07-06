@@ -2123,7 +2123,12 @@ def coerce_panel_value(kind, value, *, structure=None, params=None, repeat_mode=
                 img = img.reshape(img.shape[0], img.shape[1], -1)[:, :, 0]
         elif gs and int(np.prod(gs)) == int(a.size):
             img = a.reshape(tuple(int(n) for n in gs))
-        elif st is None and np.squeeze(a).ndim == 2:
+        elif not ds and np.squeeze(a).ndim == 2:
+            # NO declared data shape (no structure at all, OR a producer that honestly does not
+            # know its frame size yet -- e.g. a camera backend without frame_shape, before its
+            # first frame): "undeclared" is NOT "declared non-image", so fall back to the value's
+            # own shape.  The error below is reserved for a REAL contradiction: a producer that
+            # DECLARES a non-2-D data core (a scan's (1,)) bound to an image panel.
             img = np.squeeze(a)
         else:
             raise ValueError(

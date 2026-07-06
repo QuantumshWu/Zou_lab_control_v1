@@ -69,3 +69,32 @@ def fire_live_imaging(exp, *, exposure=None):
     if exposure is None:
         exposure = devs.camera.exposure
     return fire_imaging_pulse(devs.sequencer, exposure=exposure, **kw)
+
+
+def make_console(exp, *, running_nodes=None, window_px=(900, 600)):
+    """A real offscreen TaskConsole wired exactly like ``exp.task_console()`` -- the ONE
+    console factory for lifecycle tests (build / start / stop / task flows), so every test
+    drives the same specs + hub wiring the GUI entry point does.  The background tick timer
+    is stopped for determinism: tests call ``con._tick()`` themselves."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    ensure_qt_app()
+    con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
+                      measurements=exp.readout.measurement_specs(),
+                      processors=exp.readout.processor_specs(),
+                      tasks=exp.readout.task_specs(), window_px=window_px,
+                      running_nodes=list(running_nodes or ()))
+    con._timer.stop()
+    return con
+
+
+def add_logic_row(con, data):
+    """Add a logic row through the REAL Add-Panel path (kind combo -> ``_add_panel``) and
+    return it -- e.g. ``add_logic_row(con, ("camera", "live"))``."""
+    kc = con.kind_combo
+    i = next(j for j in range(kc.count()) if kc.itemData(j) == data)
+    kc.setCurrentIndex(i)
+    con._add_panel()
+    return con.logic_nodes[-1]

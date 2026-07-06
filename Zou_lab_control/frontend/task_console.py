@@ -7766,13 +7766,16 @@ class TaskConsole(QtWidgets.QWidget):
                 # (The "xN" repeat tag is computed by each plot panel itself while it reduces the raw
                 # (repeat, points, dim) block per its repeat_mode -- the console no longer pushes a
                 # repeat counter onto plotters, since the panel is decoupled and owns the reduction.)
-            # A one-shot TASK that ENDS on its own -- finishing normally OR raising (which
-            # sets finished=True in a finally) -- must release the console lockout here, the
-            # SAME path the Stop button takes.  Finish == error == Stop: otherwise a task that
-            # completes (or fails) leaves the dashboard locked forever (only a manual Stop
-            # would reach _clear_task_running).
-            if terminated and row is self._running_task_row:
-                self._clear_task_running()                        # release lock + remove the task panel (#C)
+            # A node that ENDS ON ITS OWN -- a task finishing / erroring, a finite measurement
+            # taking its last repeat -- must reach the SAME terminal state the Stop button
+            # produces: ``_stop_logic_node`` is the ONE lifecycle endpoint (drop from
+            # ``running_nodes`` + null the live ref + release the task lock).  Leaving the dead
+            # node in ``running_nodes`` breaks the documented shot-clock invariant ("a lingering
+            # signal of a STOPPED node is excluded" -- _display_shot) and lets a finished node
+            # keep winning provider/structure resolution over live ones.  ``_silent`` keeps the
+            # row/editor text set above (done / error), which is richer than Stop's "stopped".
+            if terminated:
+                self._stop_logic_node(row, _silent=True)
 
     def _mark_dirty(self, *_args) -> None:
         if self._building:
