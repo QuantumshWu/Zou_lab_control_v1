@@ -30,7 +30,13 @@ SIGNAL_EXPR_HELP = (
     "Assign the result to `value`.  `signal` is the picked signal (one slot); with more\n"
     "than one slot it is a list, so `value = signal[0] - signal[1]` combines them.\n"
     "Namespace: every signal name (latest value), history(name, n), latest(name),\n"
-    "names(), shot, np, math.")
+    "names(), shot, np (alias numpy), math.")
+
+#: The helper names EVERY expression namespace injects -- the SINGLE spelling.  The GUI's
+#: reference-exclusion set (which identifiers in a source are NOT hub signals) and the help
+#: text above derive from this, and :func:`namespace_helpers` binds exactly these names, so a
+#: helper added in one place can never silently miss the others (contract-tested).
+NAMESPACE_HELPERS: tuple[str, ...] = ("history", "latest", "names", "shot", "np", "numpy", "math")
 
 #: The canonical source for a single picked signal: the picked signal IS ``signal``.
 DEFAULT_SOURCE = "value = signal"
@@ -153,19 +159,35 @@ class SignalExpr:
         return self.exec_in(ns)
 
 
-def hub_namespace(hub) -> dict:
-    """The expression namespace for a :class:`~..core.signals.SignalHub`: every latest signal
-    value plus the helpers (``history``/``latest``/``names``/``shot``/``np``/``math``).  The
-    node-side single source -- the console's GUI namespace layers its view-only keys on top."""
+def namespace_helpers(hub) -> dict:
+    """The helper bindings (:data:`NAMESPACE_HELPERS` name -> value) every expression namespace
+    carries for ``hub``.  The ONE builder: the console panel, the pulse-scan y, and a reactive
+    processor's source all inject exactly this set, so an expression has the SAME capabilities
+    everywhere (``numpy`` is a plain alias of ``np`` -- the same alias the pulse-table scan
+    namespace ships)."""
 
-    ns = dict(hub.snapshot_latest())
-    ns["history"] = lambda name, n=None: hub.history(name, n)
-    ns["latest"] = lambda name: hub.latest(name)
-    ns["names"] = lambda: hub.names()
-    ns["shot"] = hub.shot
-    ns["np"] = np
-    ns["math"] = math
+    return {
+        "history": lambda name, n=None: hub.history(name, n),
+        "latest": lambda name: hub.latest(name),
+        "names": lambda: hub.names(),
+        "shot": hub.shot,
+        "np": np,
+        "numpy": np,
+        "math": math,
+    }
+
+
+def hub_namespace(hub, snapshot: Mapping[str, object] | None = None) -> dict:
+    """The expression namespace for a :class:`~..core.signals.SignalHub`: a signal snapshot
+    (``snapshot`` if given -- e.g. the console's shot-coherent ``snapshot_at`` view or a
+    processor's coherent inputs -- else every latest value) with the shared helpers
+    (:func:`namespace_helpers`) layered ON TOP.  The single source -- the console's GUI
+    namespace only adds its view-only reserved keys on top of this."""
+
+    ns = dict(hub.snapshot_latest() if snapshot is None else snapshot)
+    ns.update(namespace_helpers(hub))
     return ns
 
 
-__all__ = ["SignalExpr", "SIGNAL_EXPR_HELP", "DEFAULT_SOURCE", "seed_source_for_slots", "hub_namespace"]
+__all__ = ["SignalExpr", "SIGNAL_EXPR_HELP", "DEFAULT_SOURCE", "NAMESPACE_HELPERS",
+           "seed_source_for_slots", "namespace_helpers", "hub_namespace"]

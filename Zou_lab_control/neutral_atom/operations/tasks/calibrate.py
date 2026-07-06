@@ -14,6 +14,7 @@ ground truth -- a virtual run traverses the identical contract path a real run d
 from __future__ import annotations
 
 from Zou_lab_control._paths import CALIBRATION_DIR
+from ..calibration import SUPPORTED_THRESHOLD_METHODS
 from ..logic import CalibrateReadoutTask
 from ..measurement import ParamDecl
 from ..task import TaskSpec
@@ -34,6 +35,11 @@ DEFAULT_DATA_DIR = CALIBRATION_DIR         # the one data + report folder (under
 # project-relative ``pulses/imaging_template.json`` the GUI field shows in full -- not a bare
 # name the path widget would anchor to the project root and display as a non-existent file.
 DEFAULT_PULSE_TEMPLATE = CalibrateReadoutTask.DEFAULT_PULSE_TEMPLATE
+
+#: The task's ONE hub-namespace token: the ``build`` closure default, the :class:`TaskSpec`
+#: and the notebook funnel (``ReadoutSubsystem.calibrate_task``) all reference THIS, so the
+#: discovery collision guard always checks the prefix the built node actually carries.
+CAL_TASK_PREFIX = "cal_"
 
 CALIBRATE_PARAMS = (
     ParamDecl("source", "source", "choice", default="live",
@@ -66,7 +72,10 @@ CALIBRATE_PARAMS = (
                       "[reference exposure, readout exposure, reference exposure] (the two exposures "
                       "below) -- three consecutive emCCD triggers on the SAME atoms in that one cooling "
                       "cycle.  Defaults to the shipped imaging template -- Browse to load your own."),
-    ParamDecl("threshold_method", "threshold", "choice", default="otsu", choices=("otsu", "bimodal"),
+    # ``choices`` IS the validator's allowlist (calibration.SUPPORTED_THRESHOLD_METHODS) --
+    # never a retyped literal, so the GUI dropdown and calibrate_threshold_from_images
+    # cannot drift when a method is added.
+    ParamDecl("threshold_method", "threshold", "choice", default="otsu", choices=SUPPORTED_THRESHOLD_METHODS,
               tooltip="otsu = single split; bimodal = dark/bright Gaussian-core fit per site.  (The "
                       "READOUT method box / per-site PSF / uniform PSF is chosen on the OccupancyProcessor "
                       "-- the cali computes all of them.)"),
@@ -107,8 +116,8 @@ def calibrate_readout(readout) -> TaskSpec:
     :class:`~..logic.CalibrateReadoutTask`; mid-run it streams the template frame to its
     dedicated panel under the ``cal_`` namespace (``cal_frame``)."""
 
-    def build(hub, *, prefix: str = "cal_", camera=None, **param_values):
+    def build(hub, *, prefix: str = CAL_TASK_PREFIX, camera=None, **param_values):
         return readout.calibrate_task(hub, prefix=prefix, camera=camera, **param_values)
 
     return TaskSpec(name="Calibrate readout", build=build, params=CALIBRATE_PARAMS,
-                    mid_run_key="frame", default_kind="2d", prefix="cal_")
+                    mid_run_key="frame", default_kind="2d", prefix=CAL_TASK_PREFIX)

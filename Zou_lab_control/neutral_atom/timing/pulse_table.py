@@ -32,7 +32,7 @@ from typing import Iterable, Mapping, Sequence
 from .sequence import (CLOCK_GRID_ATOL_TICKS as GRID_ATOL_STEPS,
                        CLOCK_GRID_RTOL as GRID_RTOL, DEFAULT_CLOCK_HZ,
                        READOUT_GAP_SECONDS,
-                       PulseSequence, channel_names, positive_float)
+                       PulseSequence, channel_names, positive_float, round_ticks)
 
 
 UNITS_TO_NS = {"ns": 1.0, "us": 1_000.0, "ms": 1_000_000.0, "s": 1_000_000_000.0, "str (ns)": 1.0}
@@ -1872,6 +1872,16 @@ def default_imaging_template(
     return state
 
 
+#: The shipped single-image probe program's project-relative path -- the ONE place the
+#: file name is typed.  This is the on-disk twin of :func:`single_imaging_template`
+#: (the in-memory factory below, whose state is likewise named ``probe_template``):
+#: every measurement that defaults to the single-image probe pulse (the generic
+#: Pulse-scan, the readout-duration fidelity scan) references THIS constant, so a
+#: rename of the shipped file can never silently strand one consumer on a fabricated
+#: default while the other still loads the tuned template.
+PROBE_TEMPLATE_PATH = "pulses/probe_template.json"
+
+
 def single_imaging_template(
     channels: Sequence[str] | None = None,
     *,
@@ -1919,6 +1929,39 @@ def resolve_pulse_template(template, *, default_name: str, default_factory) -> "
         if shipped.is_file():
             return PulseTableState.load(shipped)
     return default_factory()
+
+
+def hardware_tick_ns(sequencer=None) -> float:
+    """The ONE hardware tick (ns) a fireable template must author on -- read FROM THE CONNECTED
+    sequencer device (``sequencer.clock_hz``, a device property carried by both the real
+    ``RemoteSequencer`` -- which reads it back from the FPGA on connect -- and the ``VirtualSequencer``),
+    exactly as confocal reads a device's resolution off the device rather than a hard constant.  Only
+    when no device is in scope (a GUI template preview) does it fall back to the streamer-config default
+    clock (``DEFAULT_CLOCK_HZ``, single-sourced from ``streamer_config.json``)."""
+    clock_hz = float(getattr(sequencer, "clock_hz", 0.0) or 0.0) if sequencer is not None else 0.0
+    if clock_hz <= 0.0:
+        clock_hz = float(DEFAULT_CLOCK_HZ)
+    return 1_000_000_000.0 / clock_hz
+
+
+def resolve_fireable_template(template, *, default_name: str, default_factory, sequencer=None) -> "PulseTableState":
+    """Load a pulse template that is about to be FIRED: :func:`resolve_pulse_template` plus the
+    mandatory hardware-tick snap -- the SINGLE loader every fire path shares (the generic
+    Pulse-scan, the MOT-field task, the GUI slot preview).
+
+    A template loaded to fire must author on the HARDWARE clock grid: its ``time_step_ns`` is
+    forced to the one hardware tick (:func:`hardware_tick_ns`), taken FROM the connected
+    ``sequencer`` device when one is given -- NOT whatever a saved file happened to carry, and NOT
+    a constant baked into a caller.  A finer authoring grid (an old save with ``time_step_ns = 1``,
+    or a factory-built default) would let an api/scan DURATION sweep produce sub-tick durations
+    that fail the clock-grid validation and cannot fire ("api slot does not work"); snapping the
+    grid here makes author == snap == fire for every template, including a user-local one under
+    ``pulses/``, on whatever clock the connected board reports."""
+    state = resolve_pulse_template(template, default_name=default_name, default_factory=default_factory)
+    tick_ns = hardware_tick_ns(sequencer)
+    if state.time_step_ns != tick_ns:
+        state.time_step_ns = tick_ns
+    return state
 
 
 def default_visible_channels(channels: Sequence[str]) -> list[str]:
@@ -2221,10 +2264,12 @@ def quantized_time_steps(
     value = eval_time_expr(value_ns, slots=None)
     step = positive_time_step_ns(time_step_ns)
     raw_steps = value / step
-    # Snap to the nearest tick (ties away from zero), mirroring the confocal
-    # align_to_resolution semantics.  An off-grid value is NEVER rejected -- the
-    # hardware clock can only land on whole ticks, so we quietly round.
-    steps = int(math.floor(raw_steps + 0.5)) if raw_steps >= 0 else int(math.ceil(raw_steps - 0.5))
+    # Snap to the nearest tick through the ONE shared tie rule (``sequence.round_ticks``:
+    # ties away from zero, the confocal align_to_resolution semantics) -- the same rule
+    # the seconds-domain ``snap_seconds_to_clock`` uses, so the two entry paths cannot
+    # diverge on a .5-tick tie.  An off-grid value is NEVER rejected -- the hardware
+    # clock can only land on whole ticks, so we quietly round.
+    steps = round_ticks(raw_steps)
     if steps < 0 and not allow_negative:
         steps = 0
     if steps == 0 and not allow_zero:
@@ -2730,12 +2775,14 @@ def enumerate_pulse_params(state: "PulseTableState") -> list[tuple[str, str, str
 
 __all__ = [
     "ANALOG_BUS_MODES",
+    "PROBE_TEMPLATE_PATH",
     "SCAN_SLOT_KINDS",
     "PulseParam",
     "PulsePeriod",
     "PulseTableState",
     "ScanSlot",
     "enumerate_pulse_params",
+    "hardware_tick_ns",
     "period_index_by_name",
     "affine_coeffs",
     "default_pulse_name",
@@ -2748,6 +2795,7 @@ __all__ = [
     "positive_time_step_ns",
     "quantized_time_ns",
     "quantized_time_steps",
+    "resolve_fireable_template",
     "scan_table_template",
     "scan_target_label",
     "slot_var",

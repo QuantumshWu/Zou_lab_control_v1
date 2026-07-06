@@ -46,9 +46,9 @@ def resolve_coupled_template(
 
     ``default_factory`` builds the standard program when the template must be (re)built on the
     sequencer's channels; ``role_keys`` selects which ``imaging_channel_kwargs`` role channels to
-    pass to it.  ``trigger_channel`` is the CAMERA's ``capture_trigger_channels[0]`` (the sequencer
-    no longer owns the capture line) -- threaded into the rebuild so a real ``chNN`` streamer maps
-    the camera trigger onto a real channel.
+    pass to it.  ``trigger_channel`` is the CAMERA's ``primary_trigger_channel`` (the camera owns
+    the capture line, the sequencer never does) -- threaded into the rebuild so a real ``chNN``
+    streamer maps the camera trigger onto a real channel.
 
     ``missing_policy`` makes the (previously drifted) missing-file behaviour EXPLICIT:
       * ``"raise"``     -- an operator-NAMED template that resolves to no file fails LOUD

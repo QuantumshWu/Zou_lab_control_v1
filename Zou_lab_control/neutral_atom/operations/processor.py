@@ -84,6 +84,16 @@ class ProcessorSpec(CatalogSpec):
     SCALAR results worth showing in a panel's numeric pane (the rest are per-site
     arrays).
 
+    ``devices`` declares the :class:`ProcessorContext` device ROLES a ONE-SHOT ``run``
+    actually drives -- the same role vocabulary the registry's ``devices=[...]``
+    declaration uses (``"camera"`` / ``"sequencer"``, the ctx fields).  The spec OWNS
+    this fact: the console injects hardware into a :class:`~.logic.ProcessorRun` only
+    for the declared roles, so a saved-data action (``devices=()``, e.g. a folder
+    characterization) receives ``None`` for both, occupies no device, and can never
+    stop an unrelated live node through the device-occupancy exclusion.  A REACTIVE
+    spec reads only hub signals and must declare none (its device selection, if any,
+    flows through the registry's ``devices=[...]`` -> ``make_node`` kwargs instead).
+
     The OPTIONAL default-view binding mirrors a measurement's (and confocal's
     ``plotter`` class attribute): ``default_kind`` is the plot kind the console
     auto-builds for this processor (e.g. ``"sites"`` for a per-site map) and
@@ -98,9 +108,14 @@ class ProcessorSpec(CatalogSpec):
     summary_keys: tuple[str, ...] = ()
     default_kind: str = ""
     default_value_key: str = ""
+    devices: tuple[str, ...] = ()
 
     collision_advice: ClassVar[str] = (
         "give each processor unique result_keys (e.g. a per-processor prefix).")
+
+    #: The ctx device roles a one-shot ``run`` may declare -- exactly the
+    #: :class:`ProcessorContext` device fields (single vocabulary, validated below).
+    CTX_DEVICE_ROLES: ClassVar[tuple[str, ...]] = ("camera", "sequencer")
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -110,6 +125,18 @@ class ProcessorSpec(CatalogSpec):
             raise ValueError(
                 f"ProcessorSpec {self.name!r} must set EXACTLY ONE of run (one-shot) "
                 "or make_node (reactive).")
+        # An honest hardware declaration or none: roles must be real ctx fields, and a
+        # reactive spec (hub-signals only) may not claim ctx hardware it never receives.
+        bad = [r for r in self.devices if r not in self.CTX_DEVICE_ROLES]
+        if bad:
+            raise ValueError(
+                f"ProcessorSpec {self.name!r}: unknown ctx device role(s) {bad}; "
+                f"choose from {list(self.CTX_DEVICE_ROLES)}.")
+        if self.devices and self.run is None:
+            raise ValueError(
+                f"ProcessorSpec {self.name!r}: devices declares the ONE-SHOT ctx roles; a "
+                "reactive spec consumes hub signals only (wire devices via the registry's "
+                "devices=[...] -> make_node kwargs instead).")
 
     @property
     def reactive(self) -> bool:

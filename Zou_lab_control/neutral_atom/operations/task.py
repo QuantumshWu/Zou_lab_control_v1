@@ -29,6 +29,11 @@ from typing import Any, Callable, ClassVar
 from .measurement import ParamDecl
 from ._spec import REQUIRED, CatalogSpec
 
+#: The default mid-run buffer key a task streams (``TaskSpec.mid_run_key``'s default) -- the ONE
+#: spelling of ``"frame"``.  A consumer that must fall back without a spec in hand (the console's
+#: spec-less paths) imports this instead of re-typing the literal.
+DEFAULT_MID_RUN_KEY = "frame"
+
 
 @dataclass(frozen=True)
 class TaskSpec(CatalogSpec):
@@ -49,7 +54,7 @@ class TaskSpec(CatalogSpec):
 
     build: Callable[..., Any] = REQUIRED   # build(hub, *, prefix=..., **param_values) -> Task
     prefix: str = REQUIRED
-    mid_run_key: str = "frame"
+    mid_run_key: str = DEFAULT_MID_RUN_KEY
     default_kind: str = "2d"
 
     collision_advice: ClassVar[str] = (
@@ -67,4 +72,4 @@ class TaskSpec(CatalogSpec):
         return (self.prefix,)
 
 
-__all__ = ["TaskSpec", "ParamDecl"]
+__all__ = ["DEFAULT_MID_RUN_KEY", "TaskSpec", "ParamDecl"]

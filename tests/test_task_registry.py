@@ -79,3 +79,36 @@ def test_two_tasks_sharing_a_prefix_fail_loud():
             reg.discovered_task_specs(_virtual_readout())
     finally:
         reg.unregister_task(clasher)
+
+
+def test_built_node_prefix_matches_spec_prefix_for_every_task():
+    """TaskSpec.prefix is the ONE namespace source: a BARE ``spec.build(hub)`` (the console's
+    task branch passes no prefix) must yield a node carrying exactly ``spec.prefix``, for EVERY
+    discovered task -- so the discovery collision guard (``collision_key``) always checks the
+    token the built node actually carries.  A build-closure / ctor default drifting away from
+    the spec's prefix fails here."""
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    readout = _virtual_readout()
+    specs = readout.task_specs()
+    assert specs, "no task specs discovered"
+    for spec in specs:
+        node = spec.build(SignalHub())
+        assert node.prefix == spec.prefix, (
+            f"task {spec.name!r}: bare build() produced prefix {node.prefix!r} but the spec "
+            f"declares {spec.prefix!r} -- the closure/ctor default drifted from TaskSpec.prefix.")
+
+
+def test_notebook_funnel_prefix_default_is_the_spec_constant():
+    """The notebook funnel (``ReadoutSubsystem.calibrate_task``) defaults its ``prefix`` to the
+    SAME constant object the Calibrate TaskSpec carries (``CAL_TASK_PREFIX``) -- one token,
+    never a retyped literal in the subsystem layer."""
+    import inspect
+
+    from Zou_lab_control.neutral_atom.operations.tasks.calibrate import CAL_TASK_PREFIX
+    from Zou_lab_control.neutral_atom.subsystems.readout import ReadoutSubsystem
+
+    default = inspect.signature(ReadoutSubsystem.calibrate_task).parameters["prefix"].default
+    assert default is CAL_TASK_PREFIX
+    spec = next(s for s in _virtual_readout().task_specs() if s.name == "Calibrate readout")
+    assert spec.prefix is CAL_TASK_PREFIX

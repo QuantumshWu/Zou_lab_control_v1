@@ -24,12 +24,14 @@ from __future__ import annotations
 import numpy as np
 
 from ...core.analysis import positive_int
-from ...timing import PulseTableState, single_imaging_template
+from ...timing import PROBE_TEMPLATE_PATH, PulseTableState, single_imaging_template
 from ..measurement import MeasurementSpec, ParamDecl, axis_range_tuple
 from ..measurement_registry import measurement
 from ._coupled_template import resolve_coupled_template
 
-DEFAULT_IMAGING_TEMPLATE = "pulses/probe_template.json"
+# The SAME shipped single-image probe program the generic Pulse-scan defaults to -- its
+# path is typed ONCE, in the timing layer beside the in-memory factory (single source).
+DEFAULT_IMAGING_TEMPLATE = PROBE_TEMPLATE_PATH
 
 
 def _resolve_imaging_template(template: str, sequencer, *, trigger_channel: str | None = None) -> PulseTableState:
@@ -38,7 +40,7 @@ def _resolve_imaging_template(template: str, sequencer, *, trigger_channel: str 
     whose channels already match the sequencer is honoured as-is (tuned durations kept); otherwise (a
     role-named template on a real ``ch00..`` streamer, or no file) the standard single-image template is
     rebuilt on this sequencer's channels via ``imaging_channel_kwargs``.  ``trigger_channel`` is the
-    CAMERA's ``capture_trigger_channels[0]``.  ``missing_policy="fabricate"``: a missing/unnamed template
+    CAMERA's ``primary_trigger_channel``.  ``missing_policy="fabricate"``: a missing/unnamed template
     falls back to the standard single-image program.  The resolver binds a duration SCAN slot on the IMAGE
     period -- the readout window the scan sweeps (the fidelity analogue of temperature's trap-off slot
     ``s0``)."""
@@ -72,9 +74,9 @@ def readout_duration_fidelity(readout) -> MeasurementSpec:
         # science sensor, not a MOT monitor -- so it declares NO ``devices=[...]`` role (a dropdown
         # would offer a camera it cannot run on).  pulse_scan, being device-agnostic, DOES declare it.
         cam = getattr(s.devices, "camera", None)
-        cam_trig = getattr(cam, "capture_trigger_channels", None)
         state = _resolve_imaging_template(
-            template, s.devices.sequencer, trigger_channel=(cam_trig[0] if cam_trig else None),
+            template, s.devices.sequencer,
+            trigger_channel=getattr(cam, "primary_trigger_channel", None),
         )
         from ...devices import bind_pulse  # lazy: keep operations->devices off the import-time graph
 

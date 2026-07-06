@@ -25,14 +25,28 @@ from ..operations.measurement import (
     ScanResult,
     ScannedMeasurement,
     otsu_fidelity_from_frames,
+    require_pulse_controller,
     triggered_frames,
 )
+from ..operations.tasks.calibrate import CAL_TASK_PREFIX
 from ..operations.temperature import ReleaseRecapturePlan, SurvivalReducer
 from ..timing import PulseTableState
 from .base import ExperimentSubsystem
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..session import NeutralAtomSession
+
+
+def _positive_detection_times(times) -> np.ndarray:
+    """Normalise + validate a detection-time axis (the ONE spelling of the rule):
+    a flat float array of strictly positive, finite exposure times.  Owned here so
+    ``build_detection_scan`` (the single scan builder) and ``_scan_detection_time``
+    (which must fail BEFORE its expensive reference acquisition) validate through
+    the same helper instead of re-typing the predicate."""
+    times = np.asarray(times, dtype=float).reshape(-1)
+    if times.size == 0 or not np.all(np.isfinite(times)) or np.any(times <= 0):
+        raise ValueError("times must contain positive finite detection times.")
+    return times
 
 
 class ReadoutSubsystem(ExperimentSubsystem):
@@ -312,9 +326,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         Readout-duration measurement spec / logic node call this same builder."""
 
         s = self._session
-        times = np.asarray(times, dtype=float).reshape(-1)
-        if times.size == 0 or not np.all(np.isfinite(times)) or np.any(times <= 0):
-            raise ValueError("times must contain positive finite detection times.")
+        times = _positive_detection_times(times)
         calibration = s.require_calibration(require_thresholds=False)
         controller = self._scan_pulse(pulse, name="detect_time_scan")
         reducer = OtsuFidelityReducer(site=site)
@@ -342,9 +354,10 @@ class ReadoutSubsystem(ExperimentSubsystem):
     ) -> DetectionTimeScanResult:
         s = self._session
         calibration = s.require_calibration(require_thresholds=False)
-        times = np.asarray(times, dtype=float).reshape(-1)
-        if times.size == 0 or not np.all(np.isfinite(times)) or np.any(times <= 0):
-            raise ValueError("times must contain positive finite detection times.")
+        # Validated HERE too (the one shared rule), BEFORE the expensive reference-threshold
+        # acquisition below -- build_detection_scan re-applies the same helper, but failing
+        # only there would first burn a real 30-shot hardware acquisition on a bad axis.
+        times = _positive_detection_times(times)
         shots = positive_int(shots, "shots")
         reference_shots = positive_int(reference_shots, "reference_shots")
         reference_exposure = float(max(np.nanmax(times) * 3.0, s._camera_exposure()) if reference_exposure is None else reference_exposure)
@@ -402,9 +415,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         so the engine has a single code path."""
 
         if pulse is not None:
-            if not callable(getattr(pulse, "frame_sequence", None)):
-                raise TypeError("pulse must be a PulseController returned by exp.timing.bind_pulse(...) or na.bind_pulse(...).")
-            return pulse
+            return require_pulse_controller(pulse)   # the ONE fireable-pulse gate (shared text)
         return _SessionImagingController(self._session, name=name)
 
     def _build_slot_scan(
@@ -464,8 +475,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         if t_off.size == 0 or not np.all(np.isfinite(t_off)) or np.any(t_off < 0):
             raise ValueError("t_off_s must contain non-negative finite trap-off times.")
         calibration = s.require_calibration(require_thresholds=True)
-        if not callable(getattr(pulse, "frame_sequence", None)):
-            raise TypeError("pulse must be a PulseController returned by exp.timing.bind_pulse(...) or na.bind_pulse(...).")
+        require_pulse_controller(pulse)               # the ONE fireable-pulse gate (shared text)
         if isinstance(getattr(pulse, "pulse", None), PulseTableState) and pulse.pulse.primary_time_slot() is None:
             raise ValueError(
                 "release-recapture pulse has no duration scan slot for t_off; bind the trap-off "
@@ -696,7 +706,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
                                     "listed; a free-running sensor shows an image with no pulse "
                                     "wiring at all)."})])
 
-    def calibrate_task(self, hub, *, prefix: str = "cal_", camera=None, **params):
+    def calibrate_task(self, hub, *, prefix: str = CAL_TASK_PREFIX, camera=None, **params):
         """Build the calibrate-readout TASK over the session camera (the sitemap +
         per-site threshold calibration as a first-class one-shot
         :class:`~..operations.logic.CalibrateReadoutTask`).

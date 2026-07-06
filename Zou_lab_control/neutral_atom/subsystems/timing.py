@@ -53,9 +53,11 @@ class TimingSubsystem(ExperimentSubsystem):
         path = Path(pulse)
         payload = json.loads(path.read_text(encoding="utf-8"))
         schema = payload.get("schema", "")
+        # BOTH payload kinds dispatch on their class-owned ``schema`` attribute (the single
+        # source each class also writes in ``to_dict``) -- never a retyped literal here.
         if schema == PulseTableState.schema:
             return PulseTableState.from_dict(payload)
-        if schema == "Zou_lab_control.neutral_atom.PulseSequence":
+        if schema == PulseSequence.schema:
             return PulseSequence.from_dict(payload)
         raise ValueError(f"unsupported pulse JSON schema in {path}: {schema!r}")
 

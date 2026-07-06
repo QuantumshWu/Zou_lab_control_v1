@@ -26,14 +26,19 @@ from Zou_lab_control._paths import resolve_under_project
 from Zou_lab_control._viewer_registry import active_plotter
 
 from ...devices.base import CameraDevice
+from ...timing import resolve_fireable_template, single_imaging_template
 from ..logic import Task, TaskOutput
 from ..measurement import ParamDecl, triggered_frames
 from ..task import TaskSpec
-from ..task_registry import task
-from ..measurements.pulse_scan import _resolve_probe_template
 from ..processors.mot_intensity import mot_roi_intensity
+from ..task_registry import task
 
 DEFAULT_MOT_TEMPLATE = "pulses/mot_field_template.json"
+
+#: The task's ONE hub-namespace token: the ctor default, the ``build`` closure default and
+#: the :class:`TaskSpec` all reference THIS, so the discovery collision guard
+#: (``TaskSpec.collision_key``) always checks the prefix the built node actually carries.
+MOT_TASK_PREFIX = "mot_"
 
 
 class OptimizeMotFieldTask(Task):
@@ -51,7 +56,7 @@ class OptimizeMotFieldTask(Task):
                  center_x: float = 0.0, center_y: float = 0.0, center_z: float = 0.0,
                  span: float = 12.0, points: int = 7,
                  roi_cx: float = 0.0, roi_cy: float = 0.0, roi_radius: float = 8.0,
-                 folder: str = "mot_field", prefix: str = "mot_"):
+                 folder: str = "mot_field", prefix: str = MOT_TASK_PREFIX):
         super().__init__(hub, prefix=prefix)
         self.camera = camera
         self.sequencer = sequencer
@@ -113,7 +118,11 @@ class OptimizeMotFieldTask(Task):
 
     # ------------------------------------------------------------------ the flow
     def run(self, out: TaskOutput) -> dict:
-        state = _resolve_probe_template(self.template, sequencer=self.sequencer)
+        # The ONE fireable-template loader (resolve + snap to the connected board's tick);
+        # the fallback default is the same single-image probe program the pulse scan uses.
+        state = resolve_fireable_template(self.template, default_name=DEFAULT_MOT_TEMPLATE,
+                                          default_factory=single_imaging_template,
+                                          sequencer=self.sequencer)
         slots = self._coil_slots(state)
         axes = [self._axis_codes(c) for c in self.centers]
         nx, ny, nz = (len(a) for a in axes)
@@ -233,8 +242,8 @@ def optimize_mot_field(readout) -> TaskSpec:
 
     s = readout.session
 
-    def build(hub, *, prefix: str = "mot_", camera=None, **values):
+    def build(hub, *, prefix: str = MOT_TASK_PREFIX, camera=None, **values):
         return OptimizeMotFieldTask(hub, camera, s.devices.sequencer, prefix=prefix, **values)
 
     return TaskSpec(name="Optimize MOT field", build=build, params=MOT_FIELD_PARAMS,
-                    mid_run_key="grid", default_kind="grid", prefix="mot_")
+                    mid_run_key="grid", default_kind="grid", prefix=MOT_TASK_PREFIX)

@@ -20,8 +20,11 @@ if sys.path[0] != str(REPO_ROOT):
 
 from Zou_lab_control.neutral_atom.operations.signal_expr import (
     DEFAULT_SOURCE,
+    NAMESPACE_HELPERS,
+    SIGNAL_EXPR_HELP,
     SignalExpr,
     hub_namespace,
+    namespace_helpers,
     seed_source_for_slots,
 )
 
@@ -75,8 +78,52 @@ def test_hub_namespace_exposes_signals_and_helpers():
     hub.publish({"rate": 0.5})
     ns = hub_namespace(hub)
     assert ns["rate"] == pytest.approx(0.5)
-    for key in ("history", "latest", "names", "shot", "np", "math"):
+    # DERIVED from the one declaration, never a re-typed helper list.
+    for key in NAMESPACE_HELPERS:
         assert key in ns
+    assert ns["numpy"] is ns["np"] is np                 # the alias is the same module
+
+
+def test_namespace_helpers_bind_exactly_the_declared_names():
+    """NAMESPACE_HELPERS is the single spelling: the builder binds exactly that set, so the GUI's
+    reference-exclusion set (derived from the constant) can never miss/over-exclude a helper."""
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    assert set(namespace_helpers(SignalHub())) == set(NAMESPACE_HELPERS)
+
+
+def test_help_text_names_every_helper():
+    """SIGNAL_EXPR_HELP (the one tooltip every source field shows) must mention every helper it
+    promises -- a helper added to the namespace without updating the help fails here."""
+    for key in NAMESPACE_HELPERS:
+        assert key in SIGNAL_EXPR_HELP, f"SIGNAL_EXPR_HELP does not mention helper {key!r}"
+
+
+def test_hub_namespace_layers_helpers_on_a_given_snapshot():
+    """The console's shot-coherent view / a processor's coherent inputs pass a snapshot dict;
+    the helpers layer ON TOP of it (one builder, GUI == node)."""
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    hub = SignalHub()
+    hub.publish({"rate": 9.0})                            # the hub has advanced past the snapshot...
+    ns = hub_namespace(hub, {"rate": 1.0})
+    assert ns["rate"] == pytest.approx(1.0)               # ...but the given snapshot's value wins
+    for key in NAMESPACE_HELPERS:
+        assert key in ns
+
+
+def test_processor_source_expression_gets_the_shared_helpers():
+    """A reactive processor's source expression evaluates in the SAME helper namespace the help
+    text promises (np/numpy/...): a numpy-using source works, it is not a silent no-op."""
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.processors.mot_intensity import MotIntensityProcessor
+
+    hub = SignalHub()
+    frame = np.zeros((24, 24), dtype=float)
+    frame[10:14, 10:14] = 50.0                            # a bright square the ROI mean picks up
+    hub.publish({"f": frame})
+    proc = MotIntensityProcessor(
+        hub, source_expr={"inputs": ["f"], "source": "value = numpy.asarray(np.abs(signal))"})
+    out = proc.step()
+    assert "mot_intensity" in out                         # np AND the numpy alias both resolved
 
 
 def test_occupancy_source_default_signal_expr_equals_single_frame_path():

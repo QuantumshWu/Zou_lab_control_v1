@@ -94,5 +94,9 @@ def readout_fidelity(readout) -> ProcessorSpec:
         summary_keys=summary_keys,
         default_kind="sites",            # per-site fidelity map (the existing atom kind)
         default_value_key="fidelity_site",
+        # Its ONLY data source is the saved frames folder (data_dir): it drives no ctx
+        # hardware, so it declares no device roles -- the console hands it None for
+        # camera/sequencer, it occupies nothing, and starting it never stops a live node.
+        devices=(),
         metadata={"reads_frames": "saved_dir"},
     )

@@ -19,7 +19,8 @@ only the camera frames differ; no simulation ground truth is read).
 from __future__ import annotations
 
 from Zou_lab_control._paths import CALIBRATION_DIR, DEFAULT_CALIBRATION_FILE
-from ..logic import OccupancyProcessor
+from ..calibration import ALL_READOUT_METHODS
+from ..logic import FRAME_0, OccupancyProcessor
 from ..processor import ParamDecl, ProcessorSpec
 from ..processor_registry import processor
 
@@ -28,6 +29,20 @@ from ..processor_registry import processor
 # use is always explicitly named (never a blank "current" mystery).  Single-sourced in _paths
 # (DEFAULT_CALIBRATION_FILE under _output/calibrations/) so the WRITE side (calibrate task) and this
 # READ side cannot drift.
+
+# User-facing readout-method names -> the calibration's method keys.  ONE calibration
+# carries all methods (box / per-site PSF / uniform PSF); the READOUT method is chosen
+# HERE, at the processor, not when the calibration was made (cali once, read many ways).
+# The human LABELS are a GUI concern (hand-written); the method KEYS they map to are the
+# calibration layer's -- guarded below against the ONE allowlist (ALL_READOUT_METHODS),
+# ORDER INCLUDED (dict order is the dropdown order), so a method added to the cali either
+# appears in this dropdown or fails at import, never drifts silently.
+METHOD_LABELS = {"box": "box", "per-site PSF": "psf", "uniform PSF": "uniform_psf"}
+if tuple(METHOD_LABELS.values()) != tuple(ALL_READOUT_METHODS):
+    raise RuntimeError(
+        f"judge_occupancy METHOD_LABELS maps {tuple(METHOD_LABELS.values())} but the one "
+        f"readout-method allowlist (calibration.ALL_READOUT_METHODS) is {ALL_READOUT_METHODS} -- "
+        "give every method a label here, in the same order.")
 
 
 @processor(order=5)   # occupancy is the primary live-readout processor
@@ -43,11 +58,6 @@ def judge_occupancy(readout) -> ProcessorSpec:
     atom map coloured by occupancy; set its ``repeat_mode=average`` to colour by the per-site
     LOADING PROBABILITY (averaging the camera's ``repeat`` shots recovers every site)."""
 
-    # User-facing readout-method names -> the calibration's method keys.  ONE calibration
-    # carries all methods (box / per-site PSF / uniform PSF); the READOUT method is chosen
-    # HERE, at the processor, not when the calibration was made (cali once, read many ways).
-    method_labels = {"box": "box", "per-site PSF": "psf", "uniform PSF": "uniform_psf"}
-
     params = (
         ParamDecl("calibration", "Calibration file", "path", default=DEFAULT_CALIBRATION_FILE,
                   path_mode="file", file_filter="Calibration (*.json *.npz);;All files (*)",
@@ -58,13 +68,13 @@ def judge_occupancy(readout) -> ProcessorSpec:
                           "calibrate-then-judge needs no path typed; Browse to use another.  Until "
                           "this file exists the detector uses the current session calibration."),
         ParamDecl("source", "Frame source", "signal_expr",
-                  default={"inputs": ["frame_0"], "source": "value = signal"},
+                  default={"inputs": [FRAME_0], "source": "value = signal"},
                   tooltip="The camera frame to judge: pick one emCCD event's signal (`frame_0`, "
                           "`frame_1`, … one per trigger of the cycle) and optionally combine via "
                           "value = ... (default = `frame_0`, the cycle's first emCCD event; the value "
                           "must be ONE (H×W) frame -- e.g. `value = (signal[0]+signal[1])/2` averages two)."),
         ParamDecl("method", "Readout method", "choice", default="box",
-                  choices=tuple(method_labels),
+                  choices=tuple(METHOD_LABELS),
                   tooltip="How to turn each frame into per-site signal: box = square ROI; "
                           "per-site PSF = one matched filter per site; uniform PSF = one shared "
                           "kernel.  The calibration must carry this method (the Calibrate task "
@@ -100,7 +110,7 @@ def judge_occupancy(readout) -> ProcessorSpec:
             grid = readout._session._grid_shape(None)
         except Exception:
             grid = None
-        method = method_labels.get(str(values.get("method", "box")), "box")
+        method = METHOD_LABELS.get(str(values.get("method", "box")), "box")
         # ``source`` is a signal_expr value ({"inputs": [...], "source": "value = ..."}) -- the
         # same universal multi-source picker every source field uses; the node builds the shared
         # SignalExpr and judges the resulting (H×W) frame.  ``session_calibration`` is the live

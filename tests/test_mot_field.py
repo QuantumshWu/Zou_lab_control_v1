@@ -36,20 +36,22 @@ if sys.path[0] != str(REPO_ROOT):
 
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
 from Zou_lab_control.neutral_atom.devices.registry import load_devices
-from Zou_lab_control.neutral_atom.operations.measurements.pulse_scan import _resolve_probe_template
 from Zou_lab_control.neutral_atom.operations.processors.mot_intensity import (
     MotIntensityProcessor, mot_roi_intensity)
 from Zou_lab_control.neutral_atom.operations.measurement import triggered_frames
 from Zou_lab_control.neutral_atom.operations.tasks.mot_field import (
     DEFAULT_MOT_TEMPLATE, OptimizeMotFieldTask)
 from Zou_lab_control._clock import DEFAULT_CLOCK_HZ
+from Zou_lab_control.neutral_atom.timing import resolve_fireable_template, single_imaging_template
 from Zou_lab_control.neutral_atom.timing.sequence import decode_analog_bus
 
 MOT_TEMPLATE = str(REPO_ROOT / DEFAULT_MOT_TEMPLATE)
 
 
 def _mot_state():
-    return _resolve_probe_template(MOT_TEMPLATE)
+    # The ONE timing-layer fireable loader the MOT task itself uses (resolve + hardware tick).
+    return resolve_fireable_template(MOT_TEMPLATE, default_name=DEFAULT_MOT_TEMPLATE,
+                                     default_factory=single_imaging_template)
 
 
 def _mid_frame_time(sequence) -> float:

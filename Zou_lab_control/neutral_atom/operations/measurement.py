@@ -113,20 +113,21 @@ def _program_for_frames(camera, sequence, frames: int):
     """Repeat ``sequence``'s base cycle just enough to emit ``frames`` camera-trigger edges.
 
     ``base_triggers`` = how many capture edges the ONE base cycle carries on the camera's own
-    trigger line (via ``count_trigger_pulses`` and the camera's ``capture_trigger_channels``).
+    counting line (``count_camera_trigger_pulses``: the camera's ``effective_trigger_channels``,
+    ``()`` -> 0 edges for a free-running sensor, whose frames come off its own clock -- the
+    program is then fired as-is, never repeated for it).
     ``repeats = ceil(frames / base_triggers)`` reaches ``frames`` edges: a single-trigger imaging
     pulse (base_triggers=1) becomes ``repeated(frames)`` (N independent shots); a bracket already
     carrying >= ``frames`` edges (base_triggers >= frames) fires once, untouched.  A sequence that
     carries NO camera trigger, or one that is already a repeat program / lacks ``repeated`` (a raw
     device payload), is fired as-is -- the edge-faithful count then flows from what actually fires."""
-    from ..devices.camera_trigger import count_trigger_pulses
+    from ..devices.camera_trigger import count_camera_trigger_pulses
 
     if frames <= 1 or not hasattr(sequence, "repeated"):
         return sequence
     if getattr(sequence, "repeat_forever", False) or int(getattr(sequence, "repeat_count", 1)) > 1:
         return sequence                      # already a multi-cycle / continuous program
-    trig = getattr(camera, "capture_trigger_channels", None)
-    base_triggers = count_trigger_pulses(sequence, **({"trigger_channels": trig} if trig else {}))
+    base_triggers = count_camera_trigger_pulses(camera, sequence)
     if base_triggers <= 0 or base_triggers >= frames:
         return sequence                      # no camera trigger, or the base already carries enough edges
     repeats = -(-frames // base_triggers)    # ceil: reach at least `frames` edges
@@ -572,6 +573,22 @@ class ScanResult(MeasurementTaskResult):
         }
 
 
+def require_pulse_controller(pulse):
+    """The ONE "is this a fireable pulse handle" gate: anything a scan is about to FIRE must
+    be a ``PulseController`` (it exposes a callable ``frame_sequence``) -- the object
+    ``exp.timing.bind_pulse(...)`` / ``na.bind_pulse(...)`` returns.  Every entry point that
+    accepts an operator-supplied ``pulse`` (the scan builders in ``subsystems.readout`` and
+    :class:`ScannedMeasurement` itself) calls THIS, so the predicate and its user guidance
+    are typed exactly once and a raw sequence/path always fails with the same clear text.
+    Returns ``pulse`` so call sites can gate-and-use in one expression."""
+    if not callable(getattr(pulse, "frame_sequence", None)):
+        raise TypeError(
+            "pulse must be a PulseController returned by exp.timing.bind_pulse(...) "
+            "or na.bind_pulse(...)."
+        )
+    return pulse
+
+
 @dataclass
 class ScannedMeasurement:
     """One swept measurement: ``axis`` x ``plan`` x ``reducer`` over an engine.
@@ -595,11 +612,7 @@ class ScannedMeasurement:
 
     def __post_init__(self) -> None:
         self.shots_per_point = positive_int(self.shots_per_point, "shots_per_point")
-        if not callable(getattr(self.pulse, "frame_sequence", None)):
-            raise TypeError(
-                "pulse must be a PulseController returned by exp.timing.bind_pulse(...) "
-                "or na.bind_pulse(...)."
-            )
+        require_pulse_controller(self.pulse)
         # Fail early on a DAC axis whose slot the bound pulse doesn't have: a bad
         # slot key is otherwise silently stored by set_slot and never applied, so
         # the scan runs but moves nothing -- a wrong experiment with no error.
@@ -694,5 +707,6 @@ __all__ = [
     "ScanResult",
     "ScannedMeasurement",
     "ShotPlan",
+    "require_pulse_controller",
     "triggered_frames",
 ]

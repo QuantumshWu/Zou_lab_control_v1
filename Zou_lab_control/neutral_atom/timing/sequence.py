@@ -61,6 +61,13 @@ class Pulse:
 class PulseSequence:
     """Physical-time pulse table with simple per-channel delay support."""
 
+    # The JSON payload identity, single-sourced as class attributes (the same shape the
+    # sister ``PulseTableState`` carries): every writer (``to_dict``), reader
+    # (``from_dict``) and payload dispatcher (subsystems / devices) references THESE --
+    # the schema string is an on-disk persistence contract, never a retyped literal.
+    schema = "Zou_lab_control.neutral_atom.PulseSequence"
+    version = 2
+
     def __init__(
         self,
         pulses: Iterable[Pulse] | None = None,
@@ -247,8 +254,8 @@ class PulseSequence:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "schema": "Zou_lab_control.neutral_atom.PulseSequence",
-            "version": 2,
+            "schema": self.schema,
+            "version": self.version,
             "name": self.name,
             "delays": dict(self.delays),
             "repeat_count": self.repeat_count,
@@ -259,7 +266,7 @@ class PulseSequence:
 
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> "PulseSequence":
-        if payload.get("schema", "Zou_lab_control.neutral_atom.PulseSequence") != "Zou_lab_control.neutral_atom.PulseSequence":
+        if payload.get("schema", cls.schema) != cls.schema:
             raise ValueError("unsupported PulseSequence schema.")
         return cls(
             [Pulse.from_dict(item) for item in payload.get("pulses", [])],
@@ -524,16 +531,34 @@ def _time_to_clock_tick(time_s: float, clock_hz: float) -> int | None:
     return tick
 
 
+def round_ticks(raw_ticks: float) -> int:
+    """Round a tick count to the nearest integer, ties AWAY FROM ZERO -- the ONE tie
+    rule for putting a continuous time onto the hardware clock grid (2.5 ticks -> 3,
+    -2.5 -> -3; the confocal ``align_to_resolution`` semantics MAINTAINER_NOTES §4
+    documents).  Both the seconds-domain snap (:func:`snap_seconds_to_clock`) and the
+    ns-domain quantizer (``pulse_table.quantized_time_steps``) delegate here, so the
+    SAME user duration lands on the SAME tick whether it enters through a notebook
+    scan axis or the GUI / scan-table path.  (Python's built-in ``round`` is
+    ties-to-even -- 2.5 -> 2 -- which is why this primitive exists: two independent
+    spellings of the tie rule once sent 50 ns to 40 ns on one path and 60 ns on the
+    other.)  Callers keep their own CLAMP policy (min-1-tick vs allow-zero) -- this
+    helper only owns the tie rounding."""
+    value = float(raw_ticks)
+    return int(math.floor(value + 0.5)) if value >= 0 else int(math.ceil(value - 0.5))
+
+
 def snap_seconds_to_clock(time_s: float, clock_hz: float, *, min_ticks: int = 1) -> float:
     """Snap a continuous time (seconds) to the nearest whole clock tick.
 
     The hardware can only land on integer ticks (``validate`` rejects off-grid times,
     ``edges`` rounds to them), so any CONTINUOUS user duration -- a linspace sweep point
     (readout-duration -> fidelity), a release-recapture hold, a typed exposure -- is
-    quantized HERE, the single seconds-domain snap source.  ``min_ticks`` (>=1) clamps a
-    sub-tick request up to a realizable duration rather than to zero."""
+    quantized HERE, the single seconds-domain snap source.  Tie rounding is the shared
+    :func:`round_ticks` rule (ties away from zero -- identical to the ns-domain
+    ``quantized_time_steps`` path).  ``min_ticks`` (>=1) clamps a sub-tick request up
+    to a realizable duration rather than to zero."""
     clock = positive_float(clock_hz, "clock_hz")
-    tick = int(round(finite_float(time_s, "time_s") * clock))
+    tick = round_ticks(finite_float(time_s, "time_s") * clock)
     return max(int(min_ticks), tick) / clock
 
 
@@ -548,6 +573,7 @@ __all__ = [
     "plot_sequence",
     "probe_channel_set",
     "reference_bracket_sequence",
+    "round_ticks",
     "snap_seconds_to_clock",
 ]
 

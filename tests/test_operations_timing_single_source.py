@@ -1,0 +1,194 @@
+"""MECHANICAL guards for single-source contracts across operations / timing / subsystems
+(AGENTS.md §2: the same fact is typed exactly once; a second spelling drifts into a bug).
+
+Each test pins one rule:
+
+* a consumer's default camera-frame input derives from the ONE camera signal-naming
+  source (``camera_frame_keys`` -> ``FRAME_0``), never a producer-prefixed guess;
+* the readout / threshold method allowlists (``operations.calibration``) flow into every
+  GUI declaration, so a dropdown can never miss a method the cali computes;
+* the shipped probe-template path is typed once, in the timing layer beside its factory;
+* tick tie-rounding has ONE rule (ties away from zero, ``sequence.round_ticks``) shared
+  by the seconds-domain and ns-domain snap paths -- the same user duration lands on the
+  same hardware tick whichever way it enters;
+* ``PulseSequence``'s JSON schema identity lives on the class (like its sister
+  ``PulseTableState``) and payload dispatch reads it from there;
+* the "pulse must be a PulseController" gate and the detection-times rule each have
+  exactly one spelling.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import sys
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if sys.path[0] != str(REPO_ROOT):
+    sys.path.insert(0, str(REPO_ROOT))
+
+import Zou_lab_control
+
+_NA_PKG = Path(Zou_lab_control.__file__).resolve().parent / "neutral_atom"
+
+
+# ------------------------------------------------------------------ default frame input
+def test_default_frame_input_derives_from_camera_frame_keys():
+    """The bare default frame name is DERIVED (``FRAME_0 = camera_frame_keys(1)[0]``) and
+    every consumer default references it: a single camera instance publishes the bare
+    ``frame_0`` (the signal namespace is the instance; a device identity is never baked
+    into a name), so a consumer default assuming a producer prefix would wait forever."""
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.logic import FRAME_0, camera_frame_keys
+    from Zou_lab_control.neutral_atom.operations.processors.mot_intensity import (
+        MotIntensityProcessor, mot_intensity)
+    from Zou_lab_control.neutral_atom.operations.processors.occupancy import judge_occupancy
+
+    assert FRAME_0 == camera_frame_keys(1)[0]          # derived, not a retyped literal
+    # empty pick -> the node falls back to the ONE bare name (a publishable signal)
+    node = MotIntensityProcessor(SignalHub())
+    assert tuple(node.consumes) == (FRAME_0,)
+    # both reactive processors' declared GUI defaults reference the same source
+    for factory in (mot_intensity, judge_occupancy):
+        spec = factory(object())                        # params need no live readout
+        decl = next(p for p in spec.params if p.key == "source")
+        assert decl.default["inputs"] == [FRAME_0], (
+            f"{spec.name}: the default frame input must be the ONE bare name {FRAME_0!r}")
+
+
+# ------------------------------------------------------------------ method allowlists
+def test_method_allowlists_flow_into_gui_declarations():
+    """occupancy's method dropdown and the calibrate task's threshold dropdown derive from
+    the ONE allowlists in ``operations.calibration`` -- a method added there either shows
+    up in the GUI or fails at import (occupancy's module guard), never drifts silently."""
+    from Zou_lab_control.neutral_atom.operations.calibration import (
+        ALL_READOUT_METHODS, SUPPORTED_THRESHOLD_METHODS)
+    from Zou_lab_control.neutral_atom.operations.processors.occupancy import (
+        METHOD_LABELS, judge_occupancy)
+    from Zou_lab_control.neutral_atom.operations.tasks.calibrate import CALIBRATE_PARAMS
+
+    # order included: dict order IS the dropdown order
+    assert tuple(METHOD_LABELS.values()) == tuple(ALL_READOUT_METHODS)
+    method = next(p for p in judge_occupancy(object()).params if p.key == "method")
+    assert method.choices == tuple(METHOD_LABELS)
+    assert METHOD_LABELS[method.default] in ALL_READOUT_METHODS
+    threshold = next(p for p in CALIBRATE_PARAMS if p.key == "threshold_method")
+    assert threshold.choices is SUPPORTED_THRESHOLD_METHODS   # the validator's own tuple
+    assert threshold.default in threshold.choices
+
+
+# ------------------------------------------------------------------ probe-template path
+def test_probe_template_path_is_typed_once_in_timing():
+    """The shipped single-image probe program's path lives ONCE, in the timing layer
+    beside its in-memory factory; both defaulting measurements alias that object."""
+    from Zou_lab_control.neutral_atom.operations.measurements import pulse_scan, readout_duration
+    from Zou_lab_control.neutral_atom.timing import PROBE_TEMPLATE_PATH
+
+    assert pulse_scan.DEFAULT_PROBE_TEMPLATE is PROBE_TEMPLATE_PATH
+    assert readout_duration.DEFAULT_IMAGING_TEMPLATE is PROBE_TEMPLATE_PATH
+    # the quoted literal itself appears only beside the factory (docstrings use ``..``)
+    needle = '"' + PROBE_TEMPLATE_PATH + '"'
+    offenders = sorted(
+        str(f.relative_to(_NA_PKG))
+        for f in _NA_PKG.rglob("*.py")
+        if "__pycache__" not in f.parts and needle in f.read_text(encoding="utf-8"))
+    assert offenders == [str(Path("timing") / "pulse_table.py")], offenders
+
+
+# ------------------------------------------------------------------ tick tie rounding
+def test_tick_tie_rounding_is_one_rule_on_both_snap_paths():
+    """Exact .5-tick ties land on the SAME hardware tick whether the duration enters via
+    the seconds-domain snap (a notebook scan axis, ``snap_seconds_to_clock``) or the
+    ns-domain quantizer (GUI / scan table, ``quantized_time_steps``): ties away from zero
+    (50 ns on the 20 ns grid -> 60 ns, never 40 ns) -- the MAINTAINER_NOTES §4 rule,
+    owned by the shared ``round_ticks`` primitive."""
+    from Zou_lab_control.neutral_atom.timing.pulse_table import quantized_time_steps
+    from Zou_lab_control.neutral_atom.timing.sequence import round_ticks, snap_seconds_to_clock
+
+    clock = 50e6                       # 20 ns tick
+    step_ns = 1e9 / clock
+    for ns, want_ticks in ((50.0, 3), (130.0, 7), (10.0, 1), (40.0, 2)):
+        assert ns * 1e-9 * clock == ns / step_ns          # same raw tick count both paths
+        assert quantized_time_steps(ns, time_step_ns=step_ns, allow_zero=True) == want_ticks
+        assert snap_seconds_to_clock(ns * 1e-9, clock) * clock == pytest.approx(want_ticks)
+    # the ONE tie rule: away from zero, both signs
+    assert round_ticks(2.5) == 3 and round_ticks(-2.5) == -3 and round_ticks(0.5) == 1
+    assert quantized_time_steps(-50.0, time_step_ns=step_ns,
+                                allow_zero=True, allow_negative=True) == -3
+    # clamp policies stay CALLER-side (only the tie rule is shared): a sub-tick duration
+    # snaps UP to one tick (seconds path, min_ticks=1); an allow-zero quantize keeps 0
+    assert snap_seconds_to_clock(1e-12, clock) == pytest.approx(1.0 / clock)
+    assert quantized_time_steps(0.4 * step_ns, time_step_ns=step_ns, allow_zero=True) == 0
+
+
+# ------------------------------------------------------------------ PulseSequence schema
+def test_pulse_sequence_schema_identity_lives_on_the_class(tmp_path):
+    """``PulseSequence`` carries ``schema`` / ``version`` as class attributes (same shape as
+    its sister ``PulseTableState``); writer, reader and the subsystem payload dispatcher all
+    read THEM -- the on-disk schema string is a persistence contract with one home."""
+    from Zou_lab_control.neutral_atom.subsystems.timing import TimingSubsystem
+    from Zou_lab_control.neutral_atom.timing import PulseSequence, PulseTableState, single_imaging_template
+
+    assert isinstance(PulseSequence.schema, str) and PulseSequence.schema
+    assert isinstance(PulseSequence.version, int)
+    seq = PulseSequence([], name="probe")
+    payload = seq.to_dict()
+    assert payload["schema"] == PulseSequence.schema
+    assert payload["version"] == PulseSequence.version
+    assert PulseSequence.from_dict(payload).name == "probe"
+    with pytest.raises(ValueError):
+        PulseSequence.from_dict({**payload, "schema": "nope"})
+
+    # the loader dispatches BOTH sister payloads by their class-owned schema
+    sub = object.__new__(TimingSubsystem)               # path payloads never touch the session
+    seq_path = tmp_path / "seq.json"
+    seq_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert isinstance(TimingSubsystem._load_pulse_payload(sub, seq_path), PulseSequence)
+    table_path = tmp_path / "table.json"
+    table_path.write_text(json.dumps(single_imaging_template().to_dict()), encoding="utf-8")
+    assert isinstance(TimingSubsystem._load_pulse_payload(sub, table_path), PulseTableState)
+
+
+# ------------------------------------------------------------------ pulse gate + times rule
+def test_pulse_controller_gate_and_times_rule_have_one_spelling():
+    """The 'pulse must be a PulseController' predicate + guidance text lives ONCE
+    (``operations.measurement.require_pulse_controller``), and the detection-times rule
+    lives once in the readout subsystem -- the source scan fails on any re-spelling."""
+    gate_hits = sorted(
+        str(f.relative_to(_NA_PKG))
+        for f in _NA_PKG.rglob("*.py")
+        if "__pycache__" not in f.parts
+        and "PulseController returned by" in f.read_text(encoding="utf-8"))
+    assert gate_hits == [str(Path("operations") / "measurement.py")], gate_hits
+    times_hits = sorted(
+        str(f.relative_to(_NA_PKG))
+        for f in _NA_PKG.rglob("*.py")
+        if "__pycache__" not in f.parts
+        and "positive finite detection times" in f.read_text(encoding="utf-8"))
+    assert times_hits == [str(Path("subsystems") / "readout.py")], times_hits
+
+
+def test_pulse_gate_fires_identically_at_every_entry_point():
+    """The engine (``ScannedMeasurement``) and the readout scan builders reject a
+    non-controller with the SAME TypeError text -- one helper, one message."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.operations.measurement import (
+        ScannedMeasurement, require_pulse_controller)
+
+    with pytest.raises(TypeError) as helper_err:
+        require_pulse_controller(object())
+    msg = str(helper_err.value)
+
+    with pytest.raises(TypeError) as engine_err:        # gate fires before axis/calibration use
+        ScannedMeasurement(object(), None, None, None, None, None, None)
+    assert str(engine_err.value) == msg
+
+    exp = na.connect("virtual", sitemap={"grid_shape": (2, 3)})
+    with pytest.raises(ValueError, match="positive finite detection times"):
+        exp.readout.build_detection_scan([])            # the ONE times rule, fail-fast
+    exp.readout.sitemap(display=False)                  # same contract path real hardware runs
+    with pytest.raises(TypeError) as builder_err:
+        exp.readout.build_detection_scan([0.005], pulse=object())
+    assert str(builder_err.value) == msg

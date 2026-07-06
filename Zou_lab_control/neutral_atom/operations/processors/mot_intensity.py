@@ -15,9 +15,16 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..logic import Processor, SignalExpr, DEFAULT_SOURCE
+# FRAME_0 -- the ONE bare default frame name (derived in logic from camera_frame_keys):
+# a single camera measurement instance publishes the BARE ``frame_0`` (the signal
+# namespace is the INSTANCE; a device identity is never baked into a name), so a consumer
+# default must never assume a producer prefix.  In the documented single-monitor-camera
+# flow this makes the processor work out of the box; a second camera instance's slugged
+# frame name is picked in the form.
+from ..logic import FRAME_0, Processor, SignalExpr, DEFAULT_SOURCE
 from ..processor import ParamDecl, ProcessorSpec
 from ..processor_registry import processor
+from ..signal_expr import hub_namespace
 
 
 def mot_roi_intensity(frame, cx: float, cy: float, radius: float) -> float:
@@ -53,7 +60,7 @@ class MotIntensityProcessor(Processor):
                  roi_radius: float = 8.0, prefix: str = ""):
         expr = source_expr if isinstance(source_expr, SignalExpr) else SignalExpr.from_value(source_expr)
         if not expr.inputs:
-            expr = SignalExpr(["mot_frame_0"], DEFAULT_SOURCE)
+            expr = SignalExpr([FRAME_0], DEFAULT_SOURCE)
         super().__init__(hub, consumes=tuple(expr.inputs), prefix=prefix)
         self.source_expr = expr
         # ROI centre: 0 = the frame centre (the virtual MOT spot sits there; a real setup types
@@ -63,7 +70,10 @@ class MotIntensityProcessor(Processor):
         self.roi_radius = float(roi_radius)
 
     def transform(self, inputs: dict[str, object]) -> dict[str, object]:
-        value = np.asarray(self.source_expr.evaluate(inputs), dtype=float)
+        # Coherent inputs + the SHARED expression helpers (np/numpy/math/history/...): the one
+        # hub_namespace builder, so this source field honours the same SIGNAL_EXPR_HELP contract
+        # every other source (panel / pulse-scan y / occupancy) does.
+        value = np.asarray(self.source_expr.evaluate(hub_namespace(self.hub, inputs)), dtype=float)
         # Accept the camera's uniform (repeat, 1, H, W) block OR one bare (H, W) frame; measure
         # each repeat slice through the ONE primitive, then reduce (the declared contract).
         if value.ndim == 2:
@@ -90,7 +100,7 @@ def mot_intensity(readout) -> ProcessorSpec:
 
     params = (
         ParamDecl("source", "Frame source", "signal_expr",
-                  default={"inputs": ["mot_frame_0"], "source": "value = signal"},
+                  default={"inputs": [FRAME_0], "source": "value = signal"},
                   tooltip="The monitor-camera frame to measure (pick the monitor camera "
                           "measurement's frame signal; the value must be ONE (H, W) frame or the "
                           "camera's (repeat, 1, H, W) block)."),

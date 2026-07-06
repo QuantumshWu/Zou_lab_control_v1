@@ -1158,19 +1158,25 @@ Both are pinned by `tests/test_scan_slot_and_manual_parity.py`.
   scan point NaN → an empty grid on Start (looked like an async/daemon race; it was the picker dropping the
   input). One rule for both branches — the flat branch's old special-case is gone.
 - **A fireable pulse template authors on the connected board's clock grid (resolution comes FROM the
-  device).** `_resolve_probe_template(template, sequencer=...)` forces `time_step_ns = _hardware_tick_ns(seqr)`
-  after loading — the tick is read off the CONNECTED sequencer's `clock_hz` (a `SequencerDevice` property the
-  real `RemoteSequencer` reads back from the FPGA on connect, and the `VirtualSequencer` carries), exactly as
-  confocal reads a device's resolution off the device, NOT a constant baked into this module and NOT whatever
-  a saved file under the (gitignored) `pulses/` folder carried. Only when NO device is in scope (a GUI template
-  preview) does it fall back to the streamer-config default `DEFAULT_CLOCK_HZ`. A finer authoring grid (an old
-  save with `time_step_ns = 1`) lets an api/scan DURATION sweep produce sub-tick durations (`np.linspace` →
-  5.95 ns …) that `set_api` snaps to the template grid but that still fail the clock-grid validation → the
-  sweep cannot fire ("api slot does not work"). Snapping to the board's tick at load makes **author == snap ==
-  fire** for every template on whatever clock the connected board reports, so both the software api sweep
-  (`SCAN_MODE_API`) and the hardware scan table (`SCAN_MODE_SCAN`) of a duration slot always fire.
-  Callers with a device in scope (`pulse_scan.build` → `s.devices.sequencer`, `mot_field.run` →
-  `self.sequencer`) pass it; the tick is pinned by `tests/test_scan_slot_and_manual_parity.py`.
+  device).** The ONE loader for a template that is about to fire is the timing layer's
+  `resolve_fireable_template(template, default_name=..., default_factory=..., sequencer=...)`
+  (`timing/pulse_table.py`, beside `resolve_pulse_template`): it resolves the file and then forces
+  `time_step_ns = hardware_tick_ns(seqr)` — the tick is read off the CONNECTED sequencer's `clock_hz` (a
+  `SequencerDevice` property the real `RemoteSequencer` reads back from the FPGA on connect, and the
+  `VirtualSequencer` carries), exactly as confocal reads a device's resolution off the device, NOT a constant
+  baked into a caller and NOT whatever a saved file under the (gitignored) `pulses/` folder carried. Only when
+  NO device is in scope (a GUI template preview) does it fall back to the streamer-config default
+  `DEFAULT_CLOCK_HZ`. A finer authoring grid (an old save with `time_step_ns = 1`) lets an api/scan DURATION
+  sweep produce sub-tick durations (`np.linspace` → 5.95 ns …) that `set_api` snaps to the template grid but
+  that still fail the clock-grid validation → the sweep cannot fire ("api slot does not work"). Snapping to
+  the board's tick at load makes **author == snap == fire** for every template on whatever clock the connected
+  board reports, so both the software api sweep (`SCAN_MODE_API`) and the hardware scan table
+  (`SCAN_MODE_SCAN`) of a duration slot always fire. Callers with a device in scope pass it:
+  `pulse_scan.build` → `s.devices.sequencer` (via `_resolve_probe_template`, the probe-flavoured binding of
+  the same helper, which the GUI slot preview also imports), `mot_field.run` → `self.sequencer`, and the
+  Calibrate task's `_resolve_template` (logic.py) → `self.sequencer` (its GUI slot preview calls the same
+  classmethod without a device and falls back to the config-default grid, like every other preview). The
+  tick is pinned by `tests/test_scan_slot_and_manual_parity.py`.
 
 ### A task's mid-run panel is DECLARED, sized and coloured from single sources (no console special-case)
 
@@ -1455,10 +1461,16 @@ pulse-scan's y — is the SAME object: a list of picked hub-signal names (the *s
 slot-packing rule (scalar for one input, list for many), the `value` contract, `co_names()`
 (names referenced + picked slots, for version-gating), an optional `resolve` hook (the
 frame-coherence rewrite, injected by the frontend, never baked into the analysis layer), and
-`hub_namespace(hub)` (latest signals + history/latest/names/shot/np/math). Dependency-free, so
-the analysis layer and the GUI share ONE definition. `PanelCard._with_signal_slots` /
-`_evaluate` / `_co_names` delegate to it; `task_console.SOURCE_EXPR_HELP()` is a lazy getter of
-`signal_expr.SIGNAL_EXPR_HELP` (one help text). `tests/test_signal_expr.py` guards it.
+the ONE namespace: `NAMESPACE_HELPERS` names the helper set
+(history/latest/names/shot/np/numpy/math), `namespace_helpers(hub)` binds it, and
+`hub_namespace(hub, snapshot=None)` layers those helpers on a signal snapshot (latest by
+default; the console passes its shot-coherent `snapshot_at` view + its reserved view keys,
+a reactive processor its coherent inputs) — so a panel, a pulse-scan y and a processor
+source have identical expression capabilities, and the GUI's reference-exclusion set
+derives from the same constant. Dependency-free, so the analysis layer and the GUI share
+ONE definition. `PanelCard._with_signal_slots` / `_evaluate` / `_co_names` delegate to it;
+`task_console.SOURCE_EXPR_HELP()` is a lazy getter of `signal_expr.SIGNAL_EXPR_HELP` (one
+help text). `tests/test_signal_expr.py` guards it.
 
 ### Pulse-scan is a device-driving `PulseScanNode`, with a DECOUPLED y
 `PulseScanNode` (`operations/logic.py`) replaces the old frame-reducing measurement. **x** = the
@@ -1818,10 +1830,14 @@ Behaviour-neutral throughout. The single sources added/relocated, by layer:
   the ONE place the notebook-facing scalars (a refresh interval, a flag, a count) are rejected the same
   way across `plot()` / `ArrayWatcher` / the acquisition `Session`. The analysis layer keeps its OWN
   validators in `core/analysis.py`; this seam never crosses the sealed boundary.
-- `task_console.coerce_short_labels(provider)` — the ONE `{full -> short}` label-map normaliser
+- `param_widgets.coerce_short_labels(provider)` — the ONE `{full -> short}` label-map normaliser
   (callable-guard, `str()` both ends, drop empties, swallow provider errors to `{}`) every grouped
   signal picker feeds `fill_grouped_signal_combo`, so the signal_expr / plot-Setting-slot / form
-  pickers render identically.
+  pickers render identically.  The whole grouped-picker cluster (`signal_state` /
+  `grouped_signal_items` / `signal_tree_groups` / `fill_grouped_signal_combo` /
+  `read_editable_combo` / `coerce_short_labels`) lives in `param_widgets` — the LEAF the console
+  imports — so the leaf never lazy back-imports `task_console` (the old cycle);
+  `task_console` forward-imports the three it uses.
 - `task_console._make_unit_cycle_row(on_click, label_w, *, with_label)` — the ONE x-axis unit-cycle
   row, so the Setting popup and the Edit tab get the identical button width / flush-left idiom / single
   tooltip (`with_label=True` also builds the live current-unit label).

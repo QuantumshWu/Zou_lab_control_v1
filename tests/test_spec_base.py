@@ -123,3 +123,19 @@ def test_a_subclass_that_forgets_collision_key_fails_at_import():
 def test_params_must_be_paramdecls():
     with pytest.raises(TypeError):
         _measurement(params=("not-a-decl",))
+
+
+def test_processor_devices_declares_only_ctx_roles():
+    """ProcessorSpec.devices is the ONE-SHOT ctx hardware declaration: role names must be real
+    ProcessorContext device fields, so the console's injection can never key on a typo."""
+    spec = _processor(devices=("camera", "sequencer"))
+    assert spec.devices == ("camera", "sequencer")
+    with pytest.raises(ValueError, match="ctx device role"):
+        _processor(devices=("laser",))
+
+
+def test_reactive_processor_may_not_claim_ctx_devices():
+    """A reactive spec consumes hub signals only -- claiming ctx hardware it never receives
+    would be a dishonest declaration (its device selection flows via devices=[...] instead)."""
+    with pytest.raises(ValueError, match="reactive"):
+        _processor(run=None, make_node=lambda hub, **k: None, devices=("camera",))

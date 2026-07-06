@@ -42,7 +42,7 @@ def _resolve_release_recapture_template(template: str, sequencer, *, trigger_cha
     THIS sequencer exposes (the shared coupled-template resolver).  A template whose channels already
     match the sequencer is honoured AS-IS (tuned durations kept); otherwise (a role-named template on a
     real ``ch00..`` streamer) the standard release-recapture is rebuilt on the session channels via
-    ``imaging_channel_kwargs``.  ``trigger_channel`` is the CAMERA's ``capture_trigger_channels[0]``.  The
+    ``imaging_channel_kwargs``.  ``trigger_channel`` is the CAMERA's ``primary_trigger_channel``.  The
     result keeps the trap-off duration scan slot ``build_temperature_scan`` requires.  ``missing_policy=
     "raise"``: a template the operator NAMED but that resolves to no file fails LOUD (the selection step
     is real, never a silent fall-back)."""
@@ -73,9 +73,9 @@ def temperature_release_recapture(readout) -> MeasurementSpec:
         # role (a camera dropdown would offer a sensor it cannot run on).  Contrast pulse_scan, which
         # is device-agnostic and DOES declare the role.
         cam = getattr(s.devices, "camera", None)
-        cam_trig = getattr(cam, "capture_trigger_channels", None)
         state = _resolve_release_recapture_template(
-            template, s.devices.sequencer, trigger_channel=(cam_trig[0] if cam_trig else None),
+            template, s.devices.sequencer,
+            trigger_channel=getattr(cam, "primary_trigger_channel", None),
         )
         # Image the survival frames at the SAME exposure the thresholds were calibrated at (recorded on
         # the calibration metadata): a threshold is exposure-specific, so a mismatch floors the survival
