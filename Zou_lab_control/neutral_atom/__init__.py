@@ -177,6 +177,13 @@ def __getattr__(name: str):
         from ._gui import open_figure_viewer
 
         return open_figure_viewer
+    if name == "device_manager":
+        # Open the device manager WITHOUT a session (``na.device_manager()``): the device-INIT
+        # entry -- edit/create a config, press "Init devices" to connect it.  Reached LAZILY
+        # through the GUI-action module so the frontend stays off the analysis import path.
+        from ._gui import device_manager
+
+        return device_manager
     if name in _PULSE_STREAMER_EXPORTS:
         from .devices import fpga_pulse_streamer
 
@@ -261,6 +268,7 @@ __all__ = [
     "detect_image",
     "device_class_registry",
     "device_config_dir",
+    "device_manager",
     "estimate_threshold_fidelity",
     "exposure_from_sequence",
     "figure_viewer",

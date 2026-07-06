@@ -1,6 +1,6 @@
-"""The device-manager panel is type-generic: a section per REGISTERED device domain, driven by
-device_domains() -- never a camera-special list.  Registering a new domain adds a section with
-zero panel edits.  These contracts pin that + the launcher export."""
+"""The device-manager panel is type-generic: the config EDITOR has a section per REGISTERED
+device domain, driven by device_domains() -- never a camera-special list.  Registering a new
+domain adds a section with zero panel edits.  These contracts pin that + the entry points."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -31,42 +31,39 @@ def _app():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
-def _cards(panel):
-    return [panel._body.itemAt(i).widget() for i in range(panel._body.count())
-            if isinstance(panel._body.itemAt(i).widget(), FluentGroupBox)]
+def _editor_cards(panel):
+    return [panel._editor_body.itemAt(i).widget() for i in range(panel._editor_body.count())
+            if isinstance(panel._editor_body.itemAt(i).widget(), FluentGroupBox)]
 
 
-def test_panel_has_one_section_per_registered_domain():
+def test_editor_has_one_section_per_registered_domain():
     devices = na.load_devices("virtual")
     panel = DeviceManagerPanel(devices)
-    titles = [c.title() for c in _cards(panel)]
-    # ONE card per domain -- type-generic, driven by the registry (add a domain -> a card appears)
+    titles = [c.title() for c in _editor_cards(panel)]
+    # ONE editor card per domain -- type-generic, driven by the registry (add a domain -> a card)
     assert titles == [d.label for d in device_domains()]
     assert panel.grab().width() > 0                       # renders
+    # every virtual entry landed in a domain section (no "Other devices" card needed)
+    assert "Other devices" not in titles
 
 
-def test_scan_adds_a_discovered_card_without_crashing():
+def test_scan_populates_the_discovered_card_without_crashing():
     devices = na.load_devices("virtual")
     panel = DeviceManagerPanel(devices)
-    before = len(_cards(panel))
-    panel._scan()                                          # virtual set: scans real buses, must not raise
-    after = _cards(panel)
-    assert len(after) == before + 1 and after[-1].title().startswith("Discovered")
+    panel._scan()                                          # scans real buses, must not raise
+    assert panel._discovered_body.count() >= 1             # rows or the "nothing found" note
 
 
-def test_device_manager_is_session_bound_not_a_public_zf_launcher():
-    """The device manager's ONE public entry is the SESSION facade ``exp.device_manager()`` -- NOT a
-    ``zf.show_device_manager(device_set)`` module function.  Unlike the other three GUIs (which run
-    session-less), it displays the devices ``na`` loaded, and ``frontend`` is sealed from ``na``, so its
-    factory can only take a ``DeviceSet`` na hands it: exposing it on ``zf`` was a leak that made callers
-    reach for ``zf.show_device_manager()`` (which then TypeErrors on the missing ``device_set``).  So:
-      * it is NOT on the public ``zf`` surface (``__all__`` nor a lazy attribute), and
-      * ``exp.device_manager()`` opens it (na owns the DeviceSet), while the internal factory stays
-        reachable from the submodule for ``na._gui`` to call."""
+def test_device_manager_entry_points():
+    """TWO public entries, one window per session: ``exp.device_manager()`` (bound) and the
+    module-level ``na.device_manager()`` (device-INIT, no session yet).  The widget factory
+    itself stays OFF the public ``zf`` surface -- it is inherently coupled to na's device
+    registry, so na's two wrappers are the only doors."""
     assert "show_device_manager" not in zf.__all__
     for gone in ("show_device_manager", "DeviceManagerPanel"):
-        assert not hasattr(zf, gone), f"{gone} must not be a public zf attribute (use exp.device_manager())"
-    # the SESSION facade is the public entry, and it opens the manager without any device_set argument.
+        assert not hasattr(zf, gone), f"{gone} must not be a public zf attribute"
+    assert callable(na.device_manager)                     # the module-level init entry
+    assert "device_manager" in na.__all__
     exp = na.connect("virtual")
     try:
         assert callable(exp.device_manager)
@@ -74,6 +71,6 @@ def test_device_manager_is_session_bound_not_a_public_zf_launcher():
         assert window is not None and exp.device_manager() is window   # one-per-session singleton
     finally:
         exp.close()
-    # the internal factory is still importable from the submodule (the ONE caller, na._gui, uses this path)
+    # the internal factory is still importable from the submodule (na._gui is its caller)
     from Zou_lab_control.frontend.device_manager import show_device_manager
     assert callable(show_device_manager)

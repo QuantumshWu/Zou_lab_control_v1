@@ -132,18 +132,35 @@ def open_figure_viewer(session: Any = None, *, path=None, **kwargs):
     return viewer
 
 
+def _session_device_binding(session: Any) -> dict:
+    """Bundle a session's device actions into the plain-callback dict the device-manager
+    panel consumes (the panel stays session-agnostic; it never imports the session).  The
+    ``devices`` GETTER matters: ``load_config`` REPLACES ``session.devices``, so the panel
+    must re-read it after every apply rather than hold a stale set."""
+
+    def _apply(cfg):
+        session.load_config(cfg)     # builds the NEW set first: a bad config is a no-op
+        return session.devices
+
+    def _open():
+        session.open_devices()
+        return session.devices
+
+    return {"devices": lambda: session.devices, "apply_config": _apply, "open_devices": _open}
+
+
 def open_device_manager(session: Any, **kwargs):
     """Open the device manager bound to ``session`` -- ONE per session (confocal-style singleton).
 
-    Shows every device the session's config loaded, grouped by device DOMAIN (Camera / Sequencer /
-    Trap array / a future RF source -- the same registry the per-measurement device dropdowns read),
-    plus a "Scan hardware" button that probes the buses.  It is the GUI face of ``na.load_devices`` /
-    ``na.discover_devices``.  A later call RESHOWS the same window (rebuilt from the live DeviceSet if
-    it was closed) -- so a notebook never accumulates duplicates."""
+    The session's DEVICE-INIT entry: a config EDITOR over the round-trippable ``{role:
+    {"type", "params"}}`` dict (typed per-class forms, New/Load/Save/Apply) plus the
+    hardware panel (bus scan with add-to-config, the loaded instances with snapshots).
+    The GUI face of ``na.load_devices`` / ``na.discover_devices``; a later call RESHOWS
+    the same window -- so a notebook never accumulates duplicates."""
 
-    # Import the INTERNAL factory directly from the submodule: the device manager is not a public ``zf``
-    # export (unlike the other GUIs it is inherently coupled to na's DeviceSet), so ``exp.device_manager()``
-    # is the ONE public entry and this is the sole caller of the widget factory.
+    # Import the INTERNAL factory directly from the submodule: the widget factory is not a public
+    # ``zf`` export (it is inherently coupled to na's device registry); ``exp.device_manager()``
+    # and the module-level ``na.device_manager()`` are the two public entries.
     from Zou_lab_control.frontend.device_manager import show_device_manager
 
     from .devices.registry import device_config_dir
@@ -153,21 +170,45 @@ def open_device_manager(session: Any, **kwargs):
         _reshow(existing)
         return existing
 
-    # Wire the session's config actions as plain callbacks (the panel stays session-agnostic, like
-    # ``discover``): load a new config, save the current one, or open (initialise) the hardware.  Load /
-    # open return the session's (now current) DeviceSet so the panel re-lists it.
-    def _load(path):
-        session.load_config(path)
-        return session.devices
+    window = show_device_manager(
+        session.devices, session_binding=_session_device_binding(session),
+        config_dir=str(device_config_dir()), **kwargs)
+    session._zlc_device_manager = window
+    return window
 
-    def _open():
-        session.open_devices()
-        return session.devices
+
+def device_manager(config: Any = None, **kwargs):
+    """Open the device manager WITHOUT a session (``na.device_manager()``) -- the
+    device-INIT entry point.
+
+    Starts as a pure config editor: empty, or seeded from ``config`` (a template name such
+    as ``"virtual"`` / ``"remote_template"``, a JSON path, or a config dict -- the same
+    forms ``na.connect`` takes).  Its green button reads "Init devices": pressing it
+    ``na.connect``\\ s the working config, and on success THIS window upgrades in place to
+    the new session's manager (the Loaded card activates, the button becomes Apply, and a
+    later ``exp.device_manager()`` reuses this same window)."""
+
+    from Zou_lab_control.frontend.device_manager import show_device_manager
+
+    from .devices.registry import device_config_dir, read_config
+
+    initial = dict(read_config(config)) if config is not None else {}
+    state: dict = {}
+
+    def _init(cfg_dict):
+        from .session import connect
+
+        session = connect(cfg_dict)
+        window = state.get("window")
+        if window is not None:
+            # register the upgraded window as the new session's one-per-session manager
+            session._zlc_device_manager = window
+        return _session_device_binding(session)
 
     window = show_device_manager(
-        session.devices, on_load_config=_load, on_save_config=session.save_config,
-        on_open_devices=_open, config_dir=str(device_config_dir()), **kwargs)
-    session._zlc_device_manager = window
+        None, initial_config=initial, on_init_session=_init,
+        config_dir=str(device_config_dir()), **kwargs)
+    state["window"] = window
     return window
 
 
@@ -183,4 +224,4 @@ def load_figure(path):
 
 
 __all__ = ["open_task_console", "open_pulse_gui", "open_figure_viewer",
-           "open_device_manager", "load_figure"]
+           "open_device_manager", "device_manager", "load_figure"]

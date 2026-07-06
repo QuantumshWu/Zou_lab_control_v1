@@ -289,20 +289,14 @@ def _render_device_manager_shot(path: Path) -> Path:
         install_screenshot_font()
         exp = na.connect("virtual")
         try:
-            # Wire the SAME config callbacks exp.device_manager() does, so the figure shows the real
-            # Load / Save / Open toolbar (not a bare view-only panel).
-            def _load(p):
-                exp.load_config(p)
-                return exp.devices
-
-            def _open():
-                exp.open_devices()
-                return exp.devices
+            # Wire the SAME session binding exp.device_manager() does, so the figure shows the
+            # real editor + Loaded card (not a bare session-less editor).
+            from Zou_lab_control.neutral_atom._gui import _session_device_binding
 
             panel = DeviceManagerPanel(
-                exp.devices, on_load_config=_load, on_save_config=exp.save_config,
-                on_open_devices=_open, config_dir=str(device_config_dir()))
-            panel.resize(440, 520)
+                exp.devices, session_binding=_session_device_binding(exp),
+                config_dir=str(device_config_dir()))
+            panel.resize(960, 660)
             panel.show()
             dt.settle(panel, 500)
             panel.grab().save(str(path))
