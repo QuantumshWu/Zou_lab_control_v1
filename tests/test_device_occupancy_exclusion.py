@@ -191,3 +191,63 @@ def test_hardware_declaring_one_shot_borrows_only_drivable_devices():
     finally:
         con.shutdown()
         exp.close()
+
+
+def test_referenced_devices_covers_observe_records_unwrapped():
+    """``referenced_devices`` is the SUPERSET of ``occupied_devices``: it names the OBSERVE
+    records too, unwrapped to real identity.  A passive CameraMeasurement OCCUPIES only its
+    camera (EXCLUSIVE), but REFERENCES both the camera and the sequencer it observes -- so the
+    sequencer being reinitialised must be able to find and stop it."""
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
+
+    exp = na.connect("virtual")
+    try:
+        node = CameraMeasurement(SignalHub(), exp.devices.camera, sequencer=exp.devices.sequencer)
+        assert set(node.occupied_devices()) == {exp.devices.camera}              # EXCLUSIVE only
+        assert set(node.referenced_devices()) == {exp.devices.camera, exp.devices.sequencer}
+    finally:
+        exp.close()
+
+
+def test_swapping_one_device_stops_only_its_nodes_exclusive_and_observe():
+    """THE user requirement: reinitialising a device (``load_config`` swap) stops EVERY running
+    node that references it -- EXCLUSIVE drivers AND OBSERVE observers -- while nodes on the
+    UNTOUCHED devices keep running.  Here a monitor-camera view and the main camera's view both
+    OBSERVE the shared sequencer; swapping only the main camera stops the main view (drives it)
+    but leaves the monitor view running (disjoint camera), even though both observe the sequencer
+    that did NOT change."""
+    exp = na.connect("virtual")
+    con = make_console(exp)
+    try:
+        _, mon = _start_camera_row(con, camera_name="monitor_camera")
+        _, main = _start_camera_row(con)
+        assert mon.running and main.running
+        seq_before = exp.devices["sequencer"]
+
+        # the change-hook path the session drives when ONLY the main camera is swapped
+        con.stop_nodes_using({id(exp.devices["camera"])})
+
+        assert not main.running and main not in con.running_nodes   # references the swapped camera
+        assert mon.running and mon in con.running_nodes             # disjoint camera -> survives
+        assert exp.devices["sequencer"] is seq_before               # (nothing actually swapped here)
+    finally:
+        con.shutdown()
+        exp.close()
+
+
+def test_load_config_swap_stops_referencing_console_nodes_end_to_end():
+    """End-to-end through the REAL session seam: a running camera view is stopped when
+    ``load_config`` rebuilds the devices (the device manager's Apply path), because the console
+    registered ``stop_nodes_using`` as the session's device-change hook."""
+    exp = na.connect("virtual")
+    con = make_console(exp)
+    try:
+        exp.add_device_change_hook(con.stop_nodes_using)   # what open_task_console wires
+        _, cam = _start_camera_row(con)
+        assert cam.running
+        exp.load_config("virtual")                         # full rebuild -> every device swapped
+        assert not cam.running and cam not in con.running_nodes
+    finally:
+        con.shutdown()
+        exp.close()

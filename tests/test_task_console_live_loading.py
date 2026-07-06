@@ -651,9 +651,10 @@ def test_session_gui_launchers_delegate_and_pulse_runs_standalone(monkeypatch):
     from types import SimpleNamespace
 
     calls: dict = {}
-    # The launcher registers ``console.stop_all_nodes`` as a device-teardown hook, so the fake
-    # must expose that callable (a bare string would die with AttributeError).
-    fake_console = SimpleNamespace(stop_all_nodes=lambda: None)
+    # The launcher registers TWO device seams -- ``stop_all_nodes`` (full teardown, close) and
+    # ``stop_nodes_using`` (fine-grained device-change, load_config) -- so the fake must expose
+    # both callables (a bare string would die with AttributeError).
+    fake_console = SimpleNamespace(stop_all_nodes=lambda: None, stop_nodes_using=lambda affected: None)
     monkeypatch.setattr(tcmod, "show_task_console", lambda **kw: (calls.__setitem__("tc", kw), fake_console)[1])
     monkeypatch.setattr(pgmod, "show_pulse_gui", lambda **kw: (calls.setdefault("pg", []).append(kw), "EDITOR")[1])
 
@@ -663,9 +664,11 @@ def test_session_gui_launchers_delegate_and_pulse_runs_standalone(monkeypatch):
         tc = calls["tc"]
         assert tc["session"] is exp and tc["task"] == "foo"
         assert {"hub", "measurements", "processors", "tasks"} <= set(tc)   # catalogs filled from session
-        # #A1: opening the console registers its stop with the session's teardown seam, so
-        # exp.close()/load_config() stop running nodes BEFORE the devices go away.
+        # #A1: opening the console registers its stops with the session seams, so exp.close()
+        # (full teardown) and load_config() (fine-grained device change) stop running nodes BEFORE
+        # the devices go away.
         assert fake_console.stop_all_nodes in exp._device_teardown_hooks
+        assert fake_console.stop_nodes_using in exp._device_change_hooks
 
         assert exp.pulse_gui() == "EDITOR"
         assert calls["pg"][-1]["experiment"] is exp                        # bound to the session

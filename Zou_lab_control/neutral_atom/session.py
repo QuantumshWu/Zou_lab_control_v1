@@ -56,6 +56,12 @@ class NeutralAtomSession:
         # ``console.stop_all_nodes`` here without the session ever importing the frontend
         # (the one-way na -> frontend boundary stays intact).
         self._device_teardown_hooks: list[Any] = []
+        # A FINER seam than the full teardown above: hooks here are told exactly which device
+        # INSTANCES are being replaced/closed (their ``id()`` set), so a consumer stops only the
+        # work that rides the affected hardware -- swapping the camera leaves a scan on the
+        # untouched sequencer running.  ``load_config`` (a per-role instance swap) notifies here;
+        # ``close`` still runs the full-teardown hooks (everything goes).
+        self._device_change_hooks: list[Any] = []
         # Devices stay session-blind: a camera is a pure grabber and a sequencer a pure
         # streamer; ALL cross-device orchestration (capture / readout / scans) lives on the
         # session + subsystems, which reach devices only through their contracts.
@@ -158,12 +164,21 @@ class NeutralAtomSession:
         from .devices import load_devices, read_config
 
         new_devices = load_devices(read_config(config), open_devices=open_devices)
-        # The new set built OK -- NOW stop every registered device consumer (running GUI logic
-        # nodes whose worker threads hold the OLD camera / sequencer) before the swap, so nothing
-        # keeps driving hardware that is about to be closed.  Ordered after the build on purpose:
-        # a bad config leaves the whole session -- including its running nodes -- untouched.
-        self._release_device_consumers()
+        # The new set built OK -- NOW stop the consumers that ride the devices ABOUT TO BE
+        # REPLACED, before the swap, so nothing keeps driving hardware that is about to be closed.
+        # Ordered after the build on purpose: a bad config leaves the whole session -- including
+        # its running nodes -- untouched.  ``affected`` = every OLD device whose role now maps to a
+        # DIFFERENT instance (``load_devices`` builds fresh, so a full-config swap replaces every
+        # role; a future single-role reinit would flag only that one) -- so a swap of just the
+        # camera leaves a scan running on the untouched sequencer.
         old_devices = getattr(self, "devices", None)
+        affected: set[int] = set()
+        if old_devices is not None:
+            new_by_role = dict(getattr(new_devices, "devices", {}) or {})
+            for role, old_dev in dict(getattr(old_devices, "devices", {}) or {}).items():
+                if old_dev is not None and new_by_role.get(role) is not old_dev:
+                    affected.add(id(old_dev))
+        self._notify_device_change(affected)
         self.devices = new_devices
         self.sequence = self._imaging_sequence(exposure=self._camera_exposure(), load=True)
         self._calibration = None                          # the old calibration was for the old camera
@@ -302,6 +317,28 @@ class NeutralAtomSession:
             except Exception:
                 logging.getLogger(__name__).warning(
                     "device teardown hook %r failed; continuing teardown", hook, exc_info=True)
+
+    def add_device_change_hook(self, hook) -> None:
+        """Register a callable ``hook(affected_ids: set[int])`` run BEFORE specific device
+        INSTANCES are replaced (:meth:`load_config`) -- the fine-grained sibling of
+        :meth:`add_device_teardown_hook`.  ``affected_ids`` is the ``id()`` set of the devices
+        being swapped out, so a consumer stops only the work riding THOSE devices (the console
+        registers ``stop_nodes_using`` here: swapping the camera stops camera nodes, but a scan
+        on the untouched sequencer keeps running).  Idempotent."""
+        if hook not in self._device_change_hooks:
+            self._device_change_hooks.append(hook)
+
+    def _notify_device_change(self, affected_ids: set) -> None:
+        """Tell every change hook which device instances are going away -- a broken hook never
+        blocks the swap."""
+        import logging
+
+        for hook in tuple(self._device_change_hooks):
+            try:
+                hook(set(affected_ids))
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "device change hook %r failed; continuing swap", hook, exc_info=True)
 
     def close(self) -> None:
         self._release_device_consumers()   # stop consumers (running GUI nodes) BEFORE the devices go

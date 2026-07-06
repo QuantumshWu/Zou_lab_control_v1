@@ -390,6 +390,24 @@ class LogicNode:
                                  for name, mode in self._devices.items() if mode == EXCLUSIVE)
                      if d is not None)
 
+    def referenced_devices(self) -> tuple:
+        """EVERY real device instance this node touches -- ``EXCLUSIVE`` drivers AND ``OBSERVE``
+        records -- with each OBSERVE proxy unwrapped back to its underlying hardware identity.
+        This is the SUPERSET of :meth:`occupied_devices` (which is only the mutual-exclusion
+        set): it answers "if THIS device is swapped or closed, is this node now running on dead
+        hardware?".  A node that merely OBSERVES a sequencer (e.g. a passive camera view reading
+        its scan progress) must ALSO stop when that sequencer is reinitialised, so the device
+        lifecycle drives the node lifecycle for every reference, not just the driving one."""
+        from ..devices.base import underlying_device
+        out: list = []
+        seen: set[int] = set()
+        for name in self._devices:
+            dev = underlying_device(getattr(self, name, None))
+            if dev is not None and id(dev) not in seen:
+                seen.add(id(dev))
+                out.append(dev)
+        return tuple(out)
+
     def _bare_published_signals(self) -> frozenset:
         """The SHORT (un-prefixed) signal names this node emits -- exactly the keys its
         :meth:`shot` returns.  Subclasses declare THEIR bare names here and nowhere else:
@@ -1995,14 +2013,22 @@ class ScannedMeasurementNode(_SweptBlockMeasurement):
         self._init_swept_block(values=measurement.axis.values, data_shape=(n_series,), repeat=repeat)
         self.primary_signal = self.y_key                       # the (repeat,n_points,dim) block (#H3r-F4)
 
-    def occupied_devices(self) -> tuple:
-        """This node is a WRAPPER: it touches only ``measurement.measure`` (class docstring), so
-        the hardware claim lives on the wrapped :class:`ScannedMeasurement` -- delegate to the
-        owner of the device refs (its per-point shot arms that camera and fires that sequencer)
-        instead of mirroring them onto the wrapper as a second copy."""
+    def _wrapped_devices(self) -> tuple:
+        """The hardware the wrapped :class:`ScannedMeasurement` drives -- this node is a WRAPPER
+        (it touches only ``measurement.measure``), so both the occupancy claim and the reference
+        set live on the measurement, never mirrored onto the wrapper as a second copy."""
         m = self.measurement
-        return tuple(d for d in (getattr(m, "camera", None), getattr(m, "sequencer", None))
+        from ..devices.base import underlying_device
+        return tuple(d for d in (underlying_device(getattr(m, "camera", None)),
+                                 underlying_device(getattr(m, "sequencer", None)))
                      if d is not None)
+
+    def occupied_devices(self) -> tuple:
+        return self._wrapped_devices()
+
+    def referenced_devices(self) -> tuple:
+        # A scan drives both wrapped devices, so its referenced set == its occupied set.
+        return self._wrapped_devices()
 
     def shot(self) -> dict[str, object]:
         """Measure ONE scan point and FILL it into the raw ``(repeat, points, dim)`` block at

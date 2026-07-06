@@ -137,6 +137,18 @@ def read_only(device):
     return ReadOnlyDevice(device, allowed)
 
 
+def underlying_device(device):
+    """The REAL device instance behind a possibly read-only view -- THE single source for
+    recovering a device's identity through the OBSERVE proxy.  ``ReadOnlyDevice`` narrows a
+    device's callable surface but is a DIFFERENT object, so ``id(proxy) != id(device)``; any
+    code comparing "does this node reference that hardware instance" (the device-swap / close
+    invalidation, #2) must unwrap through here first, never reach into ``_device`` by hand.
+    A plain device passes through unchanged."""
+    if isinstance(device, ReadOnlyDevice):
+        return object.__getattribute__(device, "_device")
+    return device
+
+
 # --------------------------------------------------------------------- config-form reflection
 # The DEFAULT ``BaseDevice.config_params()``: turn a constructor signature into typed
 # ParamDecl rows.  Shared module-level helpers (not hidden inside the classmethod) so a
@@ -786,5 +798,6 @@ __all__ = [
     "TrapArrayDevice",
     "is_software_trigger",
     "read_only",
+    "underlying_device",
     "snap_subarray",
 ]

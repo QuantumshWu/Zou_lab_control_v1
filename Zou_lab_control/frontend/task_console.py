@@ -8079,6 +8079,37 @@ class TaskConsole(QtWidgets.QWidget):
             if node in self.running_nodes:
                 self.running_nodes.remove(node)
 
+    def stop_nodes_using(self, affected_ids) -> None:
+        """Stop exactly the running nodes that reference one of the ``affected_ids`` devices --
+        the session's fine-grained device-change hook (``load_config`` swapping specific device
+        INSTANCES).  A node is affected iff its :meth:`~LogicNode.referenced_devices` (EXCLUSIVE
+        drivers AND OBSERVE records, unwrapped to real identity) intersect the swapped set, so
+        reinitialising the camera stops every camera view / occupancy path riding it while a scan
+        on the untouched sequencer keeps running.  Goes through the SAME ``_stop_logic_node``
+        endpoint as every other stop (no zombie left to freeze the shot clock, #close-reopen)."""
+        affected = {int(i) for i in affected_ids}
+        if not affected:
+            return
+
+        def _touches(node) -> bool:
+            try:
+                return any(id(d) in affected for d in node.referenced_devices())
+            except Exception:
+                return False
+
+        for row in list(self.logic_nodes):
+            node = self._logic_nodes.get(id(row))
+            if node is not None and _touches(node):
+                self._stop_logic_node(row)
+        for node in list(self.running_nodes):        # row-less injected nodes
+            if _touches(node):
+                try:
+                    node.stop()
+                except Exception:
+                    pass
+                if node in self.running_nodes:
+                    self.running_nodes.remove(node)
+
     def shutdown(self) -> None:
         """Stop the refresh timer and every running node's owner thread, then release
         the editors/cards.  IDEMPOTENT -- it is reached from both the window close
