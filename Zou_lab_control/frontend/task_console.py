@@ -126,10 +126,10 @@ from .param_widgets import (
 )
 
 # ParamDecl is the ONE declarative param record both the measurement form and the plot
-# panels use (PANEL_PARAMS).  Importing it here (frontend -> operations is allowed; the
+# panels use (PANEL_PARAMS).  Importing it here (frontend -> neutral_atom is allowed; the
 # reverse is not) lets the panel params be real ParamDecls validated by the kind whitelist,
 # instead of a parallel ParamSpec class with its own smaller ladder.
-from Zou_lab_control.neutral_atom.operations.measurement import ParamDecl
+from Zou_lab_control.neutral_atom.core.params import ParamDecl
 
 # The default mid-run buffer key -- the spec layer's ONE spelling (TaskSpec.mid_run_key's
 # default), imported so the console's spec-less fallbacks can never drift from it.
@@ -4067,7 +4067,7 @@ def _acquisition_param_decls(repeat_default: int = 0) -> tuple:
     is 0 for a CAMERA (a live monitor streams forever by default -- set Repeat=N to take exactly N
     photos) and 1 for a scan (run the sweep once; set 0 to keep re-running it live).  A real ``ParamDecl``
     so it auto-renders through the SAME form path as every measurement param."""
-    from ..neutral_atom.operations.measurement import ParamDecl
+    from ..neutral_atom.core.params import ParamDecl
     return (
         ParamDecl(key="repeat", label="Repeat (0 = ∞)", kind="int", default=max(0, int(repeat_default)),
                   lo=0, hi=100000,
