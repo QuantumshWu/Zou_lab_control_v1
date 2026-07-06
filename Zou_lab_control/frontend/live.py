@@ -1406,6 +1406,15 @@ class LiveLiveDis(LiveLive):
         return np.histogram(vals, bins=self.n_bins, range=(self.ylim_min, self.ylim_max))
 
     def _update_gauss_fit(self):
+        # Skip the per-tick curve_fit when the distribution counts have not changed since the last fit
+        # -- the rolling-monitor counterpart of HistogramFigure's ``_fit_cache_key``.  ``monitor`` is the
+        # console's DEFAULT panel and the most frequently refreshed; a tick that did not move the data
+        # keeps the drawn gaussian + sigma label instead of re-running scipy curve_fit (~ms) on the GUI
+        # thread every frame.
+        key = (self.n.tobytes(), self.bins.tobytes())
+        if key == getattr(self, "_gauss_fit_key", None):
+            return
+        self._gauss_fit_key = key
         mask = self.n > 0
         centers = (self.bins[:-1] + self.bins[1:]) / 2
         x = centers[mask]

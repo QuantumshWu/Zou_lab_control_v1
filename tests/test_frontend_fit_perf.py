@@ -116,6 +116,38 @@ def test_general_fit_is_cached_by_data_fingerprint(monkeypatch):
         plt.close(plot.fig)
 
 
+def test_monitor_gauss_fit_is_cached_across_unchanged_ticks(monkeypatch):
+    """The rolling ``monitor`` panel (console default) does not re-run ``curve_fit`` every tick when
+    its distribution counts are unchanged -- the counterpart of the histogram's ``_fit_cache_key``.
+    A moved distribution re-fits."""
+    from Zou_lab_control.frontend.live import LiveLiveDis
+
+    plot = LiveLiveDis(np.arange(30.0).reshape(-1, 1))
+    plot.show(display=False)
+    plot.ylim_min, plot.ylim_max = 0.0, 10.0
+    plot.n = np.array([1.0, 3.0, 6.0, 3.0, 1.0])          # a fittable side distribution
+    plot.bins = np.linspace(0.0, 10.0, 6)
+
+    calls = {"n": 0}
+    real = live_mod.curve_fit
+
+    def spy(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(live_mod, "curve_fit", spy)
+    try:
+        plot._update_gauss_fit()
+        assert calls["n"] == 1
+        plot._update_gauss_fit()                          # identical counts -> cache hit
+        assert calls["n"] == 1, "unchanged distribution must not re-run curve_fit every tick"
+        plot.n = np.array([1.0, 2.0, 8.0, 2.0, 1.0])      # the distribution moved -> re-fit
+        plot._update_gauss_fit()
+        assert calls["n"] == 2
+    finally:
+        plt.close(plot.fig)
+
+
 def test_a_wiped_curve_refits_even_on_identical_data():
     """The cache trusts a hit ONLY while the drawn curve is still attached: a focus swap / axes
     rebuild that removed the artists must re-fit even though the data did not change (else the
