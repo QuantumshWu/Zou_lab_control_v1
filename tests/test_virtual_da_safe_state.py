@@ -14,6 +14,11 @@ DACs to 0 rendered the correct spot.  The single source is now
   UN-DECODABLE corner (a bus driven to the full-negative code everywhere is bit-identical to an
   undriven bus) unifies to the same safe level, while an EXPLICIT signed 0 (MSB pulse present)
   still round-trips exactly through the driven path;
+* delayed window: a DRIVEN bus carrying a bus delay rests at the SAME safe level BEFORE its
+  delayed window -- the RTL's per-DA-bit delay scheduler idles each bit at ``SAFE_BIT`` (the
+  mid-code bits) until the first scheduled change, ``out[t] = in[t-d]`` holding safe before
+  ``t == d`` -- pinned against the exact hardware shift semantics
+  ``engine_model.bus_delay_line_reference`` (itself proven == the RTL register mirror);
 * end to end: a TTL-only fire and an explicit all-zero-DA fire sense the SAME levels and render
   statistically identical frames (the regression scene);
 * no regression: an explicit NONZERO drive (the coil optimum) still senses exactly and hits the
@@ -92,6 +97,44 @@ def test_explicit_zero_and_full_negative_corner():
         assert not any(p.channel in members for p in negfull.base_pulses())   # nothing projected
         assert decode_analog_bus(negfull, members, 0.5 * negfull.base_duration) \
             == BUS_SAFE_SIGNED_LEVEL
+
+
+def test_delayed_driven_bus_rests_at_the_safe_level_before_its_window():
+    """A DRIVEN bus with a bus delay rests at the SAFE level BEFORE its delayed window: the
+    hardware's per-DA-bit delay scheduler idles each bit at its ``SAFE_BIT`` -- the bits of the
+    mid-scale ``BUS_SAFE_VALUE`` code -- until the first scheduled change, i.e.
+    ``out[t] = in[t-d]`` holding safe before ``t == d``.  The exact shift semantics is
+    ``engine_model.bus_delay_line_reference`` (proven == the RTL register mirror in
+    test_neutral_atom_lightweight), so decoding the DELAYED sequence on a uniform sample grid
+    must equal that reference applied to the decode of the UNDELAYED sequence: the safe hold
+    before the window (never the all-bits-low full-negative word), the programmed levels shifted
+    after it."""
+    from fpga.pulse_streamer.host.engine_model import bus_delay_line_reference
+    from Zou_lab_control.neutral_atom.timing.pulse_table import bus_zero_code
+
+    state = _mot_state()
+    n_slots = sum(1 for s in state.api_slots if s.kind == "dac")
+    values = tuple(range(3, 3 + n_slots))              # nonzero driven levels (inputs, in range)
+    seq = _sequence_at(state, values)
+
+    n_samples = 16
+    step = seq.base_duration / n_samples
+    d_steps = n_samples // 4
+    delayed = seq
+    for members in state.analog_buses.values():
+        for channel in members:
+            delayed = delayed.delay(channel, d_steps * step)
+
+    times = [(k + 0.5) * step for k in range(n_samples)]   # mid-step samples, whole base cycle
+    for members in state.analog_buses.values():
+        zero = bus_zero_code(len(members))                 # wire mid code = the safe rest value
+        undelayed = [decode_analog_bus(seq, members, t) + zero for t in times]
+        expected = bus_delay_line_reference(undelayed, d_steps, safe_value=zero)
+        got = [decode_analog_bus(delayed, members, t) + zero for t in times]
+        assert got == expected
+        # the pre-window region really is exercised: it holds the mid code, i.e. signed safe 0
+        assert got[:d_steps] == [zero] * d_steps
+        assert decode_analog_bus(delayed, members, 0.5 * d_steps * step) == BUS_SAFE_SIGNED_LEVEL
 
 
 # --------------------------------------------------------------------------- end to end (virtual)

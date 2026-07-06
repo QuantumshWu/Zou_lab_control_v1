@@ -599,25 +599,37 @@ def decode_analog_bus(sequence: "PulseSequence", members, at_time: float) -> int
     idle, 0 V), NOT the all-bits-low word (offset-binary code 0 = negative full scale).  Every other
     layer already speaks this convention (RTL reset/idle, engine_model rest, the encoder's unused
     marker); before this branch a TTL-only fire made the virtual MOT camera sense every coil at
-    -2^(B-1) and the spot vanished.  Known un-decodable corner: the bit projection cannot tell
-    "driven to the full-negative code (all bits low everywhere)" from "never driven" -- BOTH decode
-    as the safe level, matching the hardware whose unused buses genuinely rest at 0 V."""
+    -2^(B-1) and the spot vanished.
+
+    A DRIVEN bus sampled BEFORE its delayed window decodes to the SAME safe level: the hardware's
+    per-DA-bit delay scheduler idles each bit at its ``SAFE_BIT`` -- the bits of the mid-scale
+    ``BUS_SAFE_VALUE`` code -- until the first scheduled change emerges at ``t == d``, i.e.
+    ``out[t] = in[t-d]`` holding safe before the window (``engine_model.bus_delay_line_reference``
+    and its RTL register mirror; ``zlc_edge_streamer.v`` ``g_busdly``).  The window start needs no
+    ``bus_delays`` plumbing: a touched bus projects bits for EVERY period (leading holds carry the
+    mid code, whose MSB is high), so the earliest member pulse on the delayed timeline IS the
+    delay-window start.
+
+    Known un-decodable corners (the projection erases full-negative-code periods -- no bits
+    anywhere): a bus driven to the full-negative code EVERYWHERE, or over its LEADING periods, is
+    bit-identical to "never driven" / "not yet driven" and unifies to the safe level; a
+    full-negative period INSIDE the driven window still decodes exactly."""
     members = [str(m) for m in members]
     if not members:
         raise ValueError("decode_analog_bus needs the bus's member bit channels (LSB..MSB).")
     t = float(at_time)
-    pulses = sequence.base_pulses()
+    bit_of = {channel: bit for bit, channel in enumerate(members)}
     word = 0
-    driven = False
-    for bit, channel in enumerate(members):
-        for p in pulses:
-            if p.channel != channel:
-                continue
-            driven = True                     # any pulse on a member marks the bus as driven
-            if p.start <= t < p.start + p.duration and p.value:
-                word |= 1 << bit
-                break
-    if not driven:
+    driven_start = None    # earliest member pulse on the delayed timeline = the delay-window start
+    for p in sequence.base_pulses():
+        bit = bit_of.get(p.channel)
+        if bit is None:
+            continue
+        if driven_start is None or p.start < driven_start:
+            driven_start = p.start
+        if p.start <= t < p.start + p.duration and p.value:
+            word |= 1 << bit
+    if driven_start is None or t < driven_start:
         # Lazy import: pulse_table imports from this module at load time (the constant lives
         # beside its wire-layer siblings bus_zero_code/bus_signed_range -- the one safe-state source).
         from .pulse_table import BUS_SAFE_SIGNED_LEVEL
