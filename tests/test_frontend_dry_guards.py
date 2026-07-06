@@ -117,3 +117,34 @@ def test_pulse_gui_layout_orphans_removed():
     src = (_FRONTEND / "pulse_gui.py").read_text(encoding="utf-8")
     for dead in ("_bar_title", "_delay_edit_width", "_period_top_label_width"):
         assert f"def {dead}" not in src, f"{dead} is a retired orphan and must be deleted"
+
+
+# ------------------------------------------------------- suspend_draws silences present
+def test_suspend_draws_silences_present_and_compose():
+    """suspend_draws == the WHOLE draw is silent, present() included.  present() escaping
+    through flush_events()->processEvents() ran a slice of the Qt event loop inside the
+    "atomic" panel-resize transaction; on a SHRINK Qt had already invalidated the old card
+    area on the unfrozen parent board, so that pump painted board background over the panel
+    -- the "panel vanishes then rebuilds" flash (a GROW leaves no board dirt, hence only
+    shrinking flashed).  Pin: inside the block draw() must not touch the canvas at all;
+    after the block the same draw() really presents."""
+    from Zou_lab_control.frontend.live import Live1D
+
+    plot = Live1D(np.arange(8.0).reshape(-1, 1))
+    plot.show(display=False)                 # build the figure (undisplayed), as panel hosts do
+    canvas = plot.fig.canvas
+    calls: list[str] = []
+    orig = {n: getattr(canvas, n) for n in ("flush_events", "draw_idle")}
+    try:
+        for name in orig:
+            setattr(canvas, name, lambda *a, _n=name, **k: calls.append(_n))
+        with plot.suspend_draws():
+            plot.draw()
+        assert calls == [], f"draw() escaped suspend_draws via {calls}"
+        plot.draw()
+        assert calls, "after the block the same draw() must actually present"
+    finally:
+        for name, fn in orig.items():
+            setattr(canvas, name, fn)
+        import matplotlib.pyplot as plt
+        plt.close(plot.fig)

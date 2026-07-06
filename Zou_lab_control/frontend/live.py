@@ -718,7 +718,17 @@ class BaseLivePlot:
         embedded canvas this SCHEDULES the Qt paintEvent (which stretch-blits the current buffer) via
         update() -- scheduling, NOT a synchronous flush_events, so Qt paints every panel's buffer in ONE
         frame and pending button / combobox input is serviced promptly (a per-panel flush would block
-        input behind the render burst).  A notebook (ipympl) / headless canvas renders + pushes now."""
+        input behind the render burst).  A notebook (ipympl) / headless canvas renders + pushes now.
+
+        Inside suspend_draws() this is a no-op, exactly like :meth:`compose` -- suspend means the WHOLE
+        draw is silent, including the screen flush.  Without this gate a batch apply_param inside an
+        "atomic" GUI transaction escaped through draw()->present()->flush_events()->processEvents(),
+        running a slice of the Qt event loop mid-transaction; on a panel SHRINK Qt had already invalidated
+        the old card area on the (unfrozen) parent board, so that pump painted board background over the
+        whole panel -> the "panel vanishes then rebuilds" resize flash (grow leaves no board dirt, which
+        is why only shrinking flashed)."""
+        if self._draw_suspended:
+            return
         canvas = getattr(self.fig, "canvas", None)
         if canvas is None:
             return
