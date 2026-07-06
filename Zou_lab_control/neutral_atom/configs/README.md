@@ -28,7 +28,11 @@ holding the `QCMOSConfig` fields:
 
 **`PylonCamera`** (`basler_monitor.json`) — `serial: ""` = first Basler found (ambiguous with two on
 the bench; pin the serial from `na.discover_devices()`). `trigger_source: "Software"` = free-running
-grab (no pulse needed), the natural mode for a MOT monitor viewer.
+grab (no pulse needed), the natural mode for a MOT monitor viewer; any other value is the Basler
+hardware trigger line name (e.g. `"Line1"`). `capture_trigger_channels` — as for the qCMOS above:
+the sequencer line the camera's trigger input is physically wired to. Inert in `"Software"` mode
+(nothing counts edges for a free-running grab); **required to match the real cable in a
+hardware-trigger config**, or multi-frame acquisitions count edges on the wrong line.
 
 **`RemoteSequencer`** (`remote_template.json`) — set `host` to your FPGA/Vivado server's address
 (the placeholder `"FPGA_SERVER_IP"` fails clearly until replaced); `port` must match `run_server`.

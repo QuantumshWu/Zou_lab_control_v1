@@ -567,7 +567,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
         return discovered_task_specs(self)
 
-    def camera_measurement(self, hub, *, camera=None, prefix: str = "",
+    def camera_measurement(self, hub, *, camera=None, prefix: str | None = None,
                            frames_per_cycle: int = 1, repeat: int = 0):
         """Build a CONTINUOUS camera Measurement over a session camera (a
         :class:`~..operations.logic.CameraMeasurement` publishing raw ``frame``s).
@@ -576,6 +576,13 @@ class ReadoutSubsystem(ExperimentSubsystem):
         qCMOS, ``"monitor_camera"`` = the MOT viewer, the notebook's convenience) -- ONE
         resolution rule here so both entry points share a path; the node is identical
         either way (the pure-grabber contract).
+
+        ``prefix=None`` (the default) DERIVES the frame-signal prefix from the DEVICE-owned
+        naming rule (:meth:`~..devices.registry.DeviceSet.camera_signal_prefix`): the default
+        camera publishes the bare conventional ``frame_i``; any other camera publishes
+        ``<device>_frame_i`` (e.g. ``monitor_camera_frame_0``), so the name states its sensor
+        and two cameras never impersonate each other on the hub.  An EXPLICIT ``prefix``
+        (``""`` included) always wins -- the notebook keeps naming authority.
 
         This is the standalone live-image logic node -- one of the primitives a
         notebook or the task console composes the loading readout from by wiring
@@ -600,6 +607,12 @@ class ReadoutSubsystem(ExperimentSubsystem):
         else:
             name = str(camera) if camera else s.devices.default_camera_name()
             device = s.devices[name]                           # a name (notebook convenience)
+        if prefix is None:
+            # The DEVICE-owned naming rule (one source, DeviceSet.camera_signal_prefix): the
+            # default camera keeps the bare ``frame_i``; any other camera gets ``<device>_``.
+            # The console's declared-signal legend reads the SAME rule, so declared == published
+            # for every camera choice (#prebind).
+            prefix = s.devices.camera_signal_prefix(device)
         return CameraMeasurement(hub, device,
                                  sequencer=getattr(s.devices, "sequencer", None),
                                  frames_per_cycle=frames_per_cycle, prefix=prefix, repeat=repeat)

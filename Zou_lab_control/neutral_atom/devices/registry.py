@@ -147,6 +147,31 @@ class DeviceSet:
         :meth:`default_device_name`."""
         return self.default_device_name(CameraDevice, conventional="camera")
 
+    def camera_signal_prefix(self, camera=None) -> str:
+        """THE single naming rule for camera frame signals: the hub-signal prefix a camera's
+        published frames carry.  The DEFAULT camera (:meth:`default_camera_name`) publishes the
+        BARE conventional names (``frame_0`` -- what occupancy judging, pulse-scan and the default
+        2-D panel bind), so its prefix is ``""``; every OTHER camera publishes DEVICE-PREFIXED
+        names (``monitor_camera_frame_0``), so the name states its sensor and two cameras can
+        never impersonate each other on the hub.
+
+        ``camera`` is a device NAME or an already-resolved :class:`CameraDevice` (reverse-looked-up
+        by identity); ``None`` / blank means the default camera.  An instance NOT in this set (a
+        hand-built notebook camera) has no set name to prefix with and keeps the bare names.
+        Both frame-naming consumers read THIS rule -- ``readout.camera_measurement`` derives the
+        prefix it builds with, and the console's declared-signal legend derives the same one --
+        so a declared name always equals the published name."""
+        names = self.camera_names()
+        if isinstance(camera, CameraDevice):
+            name = next((n for n in names if self.devices[n] is camera), None)
+        elif camera in (None, ""):
+            name = None
+        else:
+            name = str(camera) if str(camera) in names else None
+        if name is None:
+            return ""                    # default / outside-the-set -> the conventional bare names
+        return "" if name == self.default_camera_name() else f"{name}_"
+
     def require(self, name: str, expected_type: type | tuple[type, ...] | None = None):
         if name not in self.devices:
             raise AttributeError(name)

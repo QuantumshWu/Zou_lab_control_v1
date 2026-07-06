@@ -23,10 +23,12 @@ import the package, run the virtual backend and the full test suite.
 from __future__ import annotations
 
 import time
+from typing import Sequence
 
 import numpy as np
 
-from .base import ROI_CLEAR_SENTINELS, CameraDevice, snap_subarray
+from .base import ROI_CLEAR_SENTINELS, SOFTWARE_TRIGGER, CameraDevice, snap_subarray
+from .camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS
 
 
 def _snap_to_inc(value: int, lo: int, hi: int, inc: int) -> int:
@@ -47,14 +49,24 @@ class PylonCamera(CameraDevice):
     (free-run: no trigger wiring needed, every ``acquire``/``capture`` just grabs frames --
     the out-of-the-box mode for an acA1920-155um on USB3);
     ``pixel_format`` is the Basler pixel format name (``"Mono8"`` / ``"Mono12"`` on the
-    acA1920-155um; ``Mono12`` for photon-counting-ish dynamic range, ``Mono8`` for speed)."""
+    acA1920-155um; ``Mono12`` for photon-counting-ish dynamic range, ``Mono8`` for speed);
+    ``capture_trigger_channels`` is which SEQUENCER line the camera's hardware trigger input is
+    physically wired to -- the passive wiring fact the measurement layer counts trigger edges on
+    (``triggered_frames``/``_program_for_frames``).  In ``Software`` free-run the declaration is
+    inert (no edge gates a frame), so the conservative base default is fine; in a HARDWARE-triggered
+    session it MUST name the real cable's sequencer channel (e.g. ``("ch05",)``), or the edge count
+    reads the wrong line and a multi-frame acquisition mis-repeats its program.  Note the two
+    namespaces: ``trigger_source`` is the Basler-side GenICam line name (``"Line1"``),
+    ``capture_trigger_channels`` the FPGA-side channel driving that line."""
 
     def __init__(self, *, exposure: float = 5e-3, serial: str = "",
                  trigger_source: str = "Line1", pixel_format: str = "Mono8",
-                 timeout: float = 2.0, subarray_step: int = 2):
+                 timeout: float = 2.0, subarray_step: int = 2,
+                 capture_trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS):
         self._exposure = float(exposure)
         self.serial = str(serial)
         self.trigger_source = str(trigger_source)
+        self.capture_trigger_channels = tuple(str(c) for c in capture_trigger_channels)
         self.pixel_format = str(pixel_format)
         self.timeout = float(timeout)
         # Fallback ROI grid when the camera is not open yet; once open, the camera's OWN GenICam
@@ -96,7 +108,11 @@ class PylonCamera(CameraDevice):
         return [DiscoveredDevice(
             kind="basler", ident=str(i.GetSerialNumber()), label=str(i.GetModelName()),
             config={"type": cls.__name__,
-                    "params": {"serial": str(i.GetSerialNumber()), "trigger_source": "Software"}})
+                    "params": {"serial": str(i.GetSerialNumber()),
+                               "trigger_source": SOFTWARE_TRIGGER,
+                               # Inert in Software free-run; switching trigger_source to a hardware
+                               # line means setting this to the sequencer channel wired to it.
+                               "capture_trigger_channels": list(DEFAULT_CAMERA_TRIGGER_CHANNELS)}})
             for i in infos]
 
     # ------------------------------------------------------------------ lifecycle
@@ -194,7 +210,7 @@ class PylonCamera(CameraDevice):
     def _apply_trigger(self) -> None:
         cam = self._camera
         cam.TriggerSelector.SetValue("FrameStart")
-        if self.trigger_source.lower() == "software":
+        if self._free_run:
             cam.TriggerMode.SetValue("Off")     # free-run: each RetrieveResult grabs the next frame
         else:
             cam.TriggerMode.SetValue("On")
@@ -233,7 +249,7 @@ class PylonCamera(CameraDevice):
 
     @property
     def _free_run(self) -> bool:
-        return self.trigger_source.lower() == "software"
+        return self.trigger_source.lower() == SOFTWARE_TRIGGER.lower()
 
     def _arm(self, frames: int | None) -> None:
         """Start the grab session for an armed request.  Two modes, each with the strategy its
@@ -338,5 +354,6 @@ class PylonCamera(CameraDevice):
             "roi": self._roi,
             "serial": self.serial,
             "trigger_source": self.trigger_source,
+            "capture_trigger_channels": list(self.capture_trigger_channels),
             "pixel_format": self.pixel_format,
         }

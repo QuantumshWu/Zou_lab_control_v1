@@ -56,6 +56,15 @@ FULL_FRAME = "full"
 #: the measurement layer mapped a blank region to None, which means "leave unchanged").
 ROI_CLEAR_SENTINELS = (FULL_FRAME, "", "None")
 
+#: The ONE ``trigger_source`` value meaning "software-trigger / free-run" -- the industry-standard
+#: GenICam spelling (Basler: ``TriggerMode Off``): the sensor exposes on its OWN clock and every
+#: ``acquire`` yields frames with NO trigger wiring at all.  Any other ``trigger_source`` value is
+#: a hardware trigger line: one frame per external edge, the externally-triggered contract.
+#: Single vocabulary shared by the real ``PylonCamera`` and the virtual ``VirtualMotCamera`` so the
+#: two modes can never be spelled differently between backends (virtual == real).  The user-facing
+#: config value stays the plain string ``"Software"`` (compared case-insensitively).
+SOFTWARE_TRIGGER = "Software"
+
 
 class CameraDevice(BaseDevice):
     """Required contract for a camera used by ``NeutralAtomSession``.
@@ -515,6 +524,7 @@ __all__ = [
     "CameraDevice",
     "FULL_FRAME",
     "ROI_CLEAR_SENTINELS",
+    "SOFTWARE_TRIGGER",
     "SequencerDevice",
     "TrapArrayDevice",
     "snap_subarray",

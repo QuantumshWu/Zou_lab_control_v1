@@ -99,12 +99,19 @@ def test_pylon_discovery_rows_yield_ready_configs_for_the_class_itself():
     """The DEVICE CLASS owns its discovery: every enumerated Basler camera becomes a row whose
     config is a READY entry for PylonCamera itself (serial-pinned, free-running) -- the class
     name comes from the class, never a hand-written mapping in the aggregator."""
+    from Zou_lab_control.neutral_atom.devices.base import SOFTWARE_TRIGGER
+    from Zou_lab_control.neutral_atom.devices.camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS
+
     rows = PylonCamera.discovery_rows([_FakeInfo("acA1920-155um", "24012345"),
                                        _FakeInfo("acA2440-20gm", "40098765")])
     assert [r.ident for r in rows] == ["24012345", "40098765"]
     assert rows[0].label == "acA1920-155um"
+    # capture_trigger_channels is spelled out in the ready config (inert while free-running, but
+    # the knob the operator MUST retarget when switching trigger_source to a hardware line).
     assert rows[0].config == {"type": PylonCamera.__name__,
-                              "params": {"serial": "24012345", "trigger_source": "Software"}}
+                              "params": {"serial": "24012345",
+                                         "trigger_source": SOFTWARE_TRIGGER,
+                                         "capture_trigger_channels": list(DEFAULT_CAMERA_TRIGGER_CHANNELS)}}
 
 
 def test_discovery_aggregates_registered_self_describing_classes():

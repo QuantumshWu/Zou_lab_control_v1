@@ -11,8 +11,9 @@ can never silently rot:
   ``_set_api_field`` dac fix: set_api must bake the plan into period states, else the sequence a
   virtual/real machine plays would ignore software-set DAC values entirely), and it reads the
   DELAYED base-cycle timeline -- the one ``edges()`` actually streams -- never the raw pulse list;
-* the virtual monitor camera is a PURE triggered grabber sensing only the sequence FIRED over
-  its trigger wire (the ``sequencer`` construction parameter -- the simulated trigger cable);
+* the virtual monitor camera senses ONLY the sequence FIRED over its wired streamer (the
+  ``sequencer`` construction parameter -- the simulated trigger cable); free-running (its
+  ``Software`` default) it images the held/safe output state, never anyone's set-points;
 * the intensity primitive + processor shapes;
 * the api sweep carries its declared scan_shape (grid facet parity with the hardware scan);
 * the task converges on the SAME model the frames obey (no ground-truth peeking: the test talks
@@ -119,16 +120,21 @@ def test_decode_analog_bus_reads_the_delayed_timeline():
 
 # --------------------------------------------------------------------------- virtual sensing
 def test_virtual_mot_camera_senses_only_the_fired_sequence():
-    """The virtual monitor camera is a PURE triggered grabber: nothing fired -> no frame; a
-    sequence FIRED on its wired streamer reconstructs each coil level from the compiled
-    bit-channel pulses (never from anyone's set-points), and the frame brightness follows its
-    own public MOT model."""
+    """The virtual monitor camera senses ONLY what the wired streamer drives: free-running
+    (``Software``, the real monitor's discovery default) it images the SAFE state before anything
+    fires -- one dark frame at all-zero coil levels, never a fabricated bright MOT; a sequence
+    FIRED on its wired streamer reconstructs each coil level from the compiled bit-channel pulses
+    (never from anyone's set-points), and the frame brightness follows its own public MOT model."""
     ds = load_devices("virtual", open_devices=False)
     cam, seqr = ds.devices["monitor_camera"], ds.devices["sequencer"]
     state = _mot_state()
     slots = [s.name for s in state.api_slots if s.kind == "dac"]
 
-    assert cam.acquire(1) == []                        # nothing fired -> no trigger -> no frame
+    # Nothing fired: the free-running sensor still delivers a frame (a real Software Basler never
+    # freezes), imaging the SAFE state -- every coil DAC parked at signed level 0.
+    idle = cam.acquire(1)
+    assert len(idle) == 1 and idle[0].shape == tuple(cam.sensor_shape)
+    assert cam.last_levels == {bus: 0.0 for bus in cam.coil_buses}
 
     at_peak = {name: int(cam.b0[bus]) for name, bus in zip(slots, cam.coil_buses)}
     seq = state.with_api_resolved(at_peak).to_sequence()

@@ -4,6 +4,7 @@
     "params": {
       "serial": "",
       "trigger_source": "Software",
+      "capture_trigger_channels": ["mot_trigger"],
       "pixel_format": "Mono8",
       "exposure": 0.005
     }

@@ -22,7 +22,8 @@ from Zou_lab_control._clock import DEFAULT_CLOCK_HZ
 from Zou_lab_control._readout_math import normal_cdf
 from ..core.utils import site_index
 from .base import (
-    ROI_CLEAR_SENTINELS, CameraDevice, SequencerDevice, TrapArrayDevice, snap_subarray)
+    ROI_CLEAR_SENTINELS, SOFTWARE_TRIGGER, CameraDevice, SequencerDevice, TrapArrayDevice,
+    snap_subarray)
 from .camera_trigger import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
     base_cycle_trigger_pulses,
@@ -925,7 +926,20 @@ class VirtualMotCamera(_TriggerWiredCamera):
     the virtual trigger wire (the ``sequencer`` constructor parameter -- see
     :class:`_TriggerWiredCamera`).  The frame is a Gaussian fluorescence spot at the sensor centre
     with Poisson photon noise + Gaussian read noise on a constant offset, mirroring the qCMOS noise
-    chain."""
+    chain.
+
+    ``trigger_source`` selects the SAME two acquisition modes the real :class:`~.pylon.PylonCamera`
+    keeps (one shared vocabulary, :data:`~.base.SOFTWARE_TRIGGER`):
+
+    * ``"Software"`` (the default -- matching the real monitor camera's discovery config): FREE-RUN.
+      The sensor exposes on its own clock and EVERY ``acquire`` yields a frame with no pulse wiring
+      at all; the trigger wire's edges are ignored (Basler ``TriggerMode Off``).  It images whatever
+      the streamer's outputs drive right now: the continuously firing program, else the steady state
+      the last finite fire left latched on the DACs, else the safe state (all-zero levels -> the dim
+      background MOT) -- a free-running sensor delivers dark frames, it never freezes.
+    * a sequencer channel name (e.g. ``"mot_trigger"``): HARDWARE trigger.  One frame per capture
+      edge on THAT line, the pure externally-triggered grabber -- an idle wire yields no frame and
+      the live view freezes (``capture_trigger_channels`` is then ``(trigger_source,)``)."""
 
     def __init__(self, *, width: int = 64, height: int = 64, exposure: float = 5e-3,
                  coil_buses: Mapping[str, Sequence[str]] | None = None,
@@ -934,17 +948,18 @@ class VirtualMotCamera(_TriggerWiredCamera):
                  peak_rate: float = 4.0e5, background_rate: float = 2.0e3,
                  offset_counts: float = 100.0, read_noise: float = 2.0,
                  spot_sigma_px: float = 6.0, timeout: float = 2.0, seed: int | None = None,
-                 capture_trigger_channels: Sequence[str] = ("mot_trigger",),
+                 trigger_source: str = SOFTWARE_TRIGGER,
                  sequencer=None):
         self.width, self.height = int(width), int(height)
         self._exposure = positive_float(exposure, "exposure")
         self.timeout = positive_float(timeout, "timeout")
-        # Which sequencer line the MOT monitor camera's external trigger is wired to -- its OWN
-        # capture-trigger channel (the coil/probe template pulses ``mot_trigger`` once per cycle),
-        # NOT the readout qCMOS's ``emCCD``.  A PASSIVE device property (the camera owns the wiring
-        # fact): the edge-faithful frame count reads THIS line, so a MOT probe fired once delivers
-        # one monitor frame.  A real MOT camera is configured with its actual chNN here.
-        self.capture_trigger_channels = tuple(str(c) for c in capture_trigger_channels)
+        self.trigger_source = str(trigger_source)
+        # Which sequencer line the camera's external trigger input is wired to -- DERIVED from
+        # ``trigger_source`` (one knob, never two spellings of the wiring): a concrete line name is
+        # the wire the edge-faithful frame count reads (a MOT probe pulsing ``mot_trigger`` once per
+        # cycle delivers one monitor frame); ``Software`` mode never consults its trigger input at
+        # all, so it honestly declares NO counting line (empty tuple).
+        self.capture_trigger_channels = () if self._free_run else (self.trigger_source,)
         # The coil DAC buses this camera's MOT responds to: {bus name: member bit channels LSB..MSB}.
         # Defaults mirror pulses/mot_field_template.json (three 6-bit buses) so the virtual demo is
         # zero-config; a real setup names its own buses in the device config.
@@ -999,20 +1014,32 @@ class VirtualMotCamera(_TriggerWiredCamera):
             z += ((float(levels.get(bus, 0.0)) - b0) / self.b_sigma[bus]) ** 2
         return float(np.exp(-0.5 * z))
 
-    def _render_frames(self, sequence: PulseSequence | None, frames: int) -> list[np.ndarray]:
-        # A pure externally-triggered sensor: image what the FIRED sequence (arriving over the
-        # trigger wire) actually drives -- no fired pulses -> no frame, exactly like real hardware.
-        frames = positive_int(frames, "frames")
+    @property
+    def _free_run(self) -> bool:
+        # The same case-insensitive rule PylonCamera._free_run applies (one shared vocabulary).
+        return self.trigger_source.lower() == SOFTWARE_TRIGGER.lower()
+
+    def _sense_levels(self, sequence: PulseSequence | None) -> dict[str, float]:
+        """The coil levels the sensor sees -- THE one sense rule for both acquisition modes.
+
+        A DRIVEN sequence is decoded from its compiled bit-channel pulses at the steady mid-point
+        of the DELAYED base-cycle timeline (base_duration is delay-inclusive) -- the same timeline
+        ``decode_analog_bus`` reads and ``edges()`` plays, so a ``.delay()`` on the coil bit
+        channels moves the sensed window WITH the hardware output (the raw max(p.start+p.duration)
+        put the sense time on the pre-delay timeline).  NO driven program (None / no pulses) senses
+        the SAFE state: every DAC parked at signed level 0 (the hardware mid-code = 0 V)."""
         if sequence is None or not getattr(sequence, "pulses", None):
-            return []
+            return {bus: 0.0 for bus in self.coil_buses}
         from ..timing.sequence import decode_analog_bus
-        # Sense at the steady mid-point of the DELAYED base-cycle timeline (base_duration is
-        # delay-inclusive) -- the same timeline decode_analog_bus reads and edges() plays, so a
-        # .delay() on the coil bit channels moves the sensed window WITH the hardware output
-        # (the raw max(p.start + p.duration) put the sense time on the pre-delay timeline).
         t_sense = 0.5 * sequence.base_duration
-        levels = {bus: decode_analog_bus(sequence, members, t_sense)
-                  for bus, members in self.coil_buses.items()}
+        return {bus: decode_analog_bus(sequence, members, t_sense)
+                for bus, members in self.coil_buses.items()}
+
+    def _render_at_levels(self, levels: Mapping[str, float], frames: int) -> list[np.ndarray]:
+        """THE one rendering core (levels -> efficiency -> spot + noise) BOTH acquisition modes
+        share -- free-run and hardware trigger differ only in where ``levels`` come from, never in
+        how a frame is made (no forked physics)."""
+        frames = positive_int(frames, "frames")
         self.last_levels = dict(levels)
         eff = self.mot_efficiency(levels)
         yy, xx = np.mgrid[0:self.height, 0:self.width]
@@ -1030,11 +1057,57 @@ class VirtualMotCamera(_TriggerWiredCamera):
             out.append(frame)
         return out
 
+    def _render_frames(self, sequence: PulseSequence | None, frames: int) -> list[np.ndarray]:
+        # The HARDWARE-TRIGGER path (edge-gated frames over the wire): a trigger edge exists only
+        # when a sequence actually fired pulses -- no fired pulses -> no edge -> no frame, exactly
+        # like a real externally-triggered sensor.  (Free-run never gates on this: its frames come
+        # from the exposure clock in _grab, through the same _render_at_levels core.)
+        frames = positive_int(frames, "frames")
+        if sequence is None or not getattr(sequence, "pulses", None):
+            return []
+        return self._render_at_levels(self._sense_levels(sequence), frames)
+
+    def _on_wire_fired(self, sequence) -> None:
+        # ``Software`` mode ignores its trigger input entirely (the real Basler sets TriggerMode
+        # Off): a fire's edges push no frames -- the free-running exposure clock in _grab is the
+        # only frame source.  Hardware trigger keeps the edge-faithful push path.
+        if self._free_run:
+            return
+        super()._on_wire_fired(sequence)
+
+    def _grab(self, n: int, *, timeout: float | None = None, stop=None) -> bool:
+        if not self._free_run:
+            return super()._grab(n, timeout=timeout, stop=stop)
+        # FREE-RUN (Software): the sensor exposes on its own clock and reads out ONE frame per
+        # exposure, whatever the trigger wire does.  It images the scene the streamer's outputs
+        # DRIVE right now: the continuously firing program if there is one, else the STEADY state
+        # the last finite fire left latched on the DAC pins (``last_fired`` -- outputs hold their
+        # word until the safe state parks them), else the safe state itself, which _sense_levels
+        # maps to all-zero levels -> the dim background MOT + noise.  A real free-running sensor
+        # delivers dark frames when there is no light; it never freezes.
+        if stop is not None and stop.is_set():
+            return False
+        wire = getattr(self, "sequencer", None)
+        source = None
+        if wire is not None:
+            source = wire.firing
+            if source is None:
+                source = getattr(wire, "last_fired", None)
+        self._deliver(self._render_at_levels(self._sense_levels(source), 1))
+        # Frame pacing == the exposure clock (a free-running sensor's frame rate is ~its exposure),
+        # scaled by the wire's sleep_scale like every virtual time (0 under pytest -> instant);
+        # ``stop`` interrupts the wait so teardown never blocks a full frame period.
+        pace = float(self.exposure) * self.sleep_scale
+        if pace > 0.0:
+            stop.wait(pace) if stop is not None else time.sleep(pace)
+        return True
+
     def snapshot(self) -> dict[str, object]:
         return {
             "type": type(self).__name__,
             "exposure": self.exposure,
             "roi": self._roi,
+            "trigger_source": self.trigger_source,
             "coil_buses": {k: list(v) for k, v in self.coil_buses.items()},
             "last_levels": self.last_levels,
         }
@@ -1096,6 +1169,9 @@ class VirtualSequencer(SequencerDevice):
         # The program the streamer is CONTINUOUSLY firing (a repeat_forever pulse), or None when
         # idle/safe -- the virtual camera's gate; see the class docstring.
         self._firing: PulseSequence | None = None
+        # The most recently FIRED program, whatever its kind -- the model of "what word the output
+        # pins still HOLD" (see the ``last_fired`` property).  Cleared only by stop()/safe state.
+        self._last_fired: PulseSequence | None = None
         # Per-point wall-clock pacing of the firing streamed scan (None when no scan is firing):
         # {"n_points": N, "scan_repeats": K, "base_dt": per-point seconds}.  ``_scan_progress``
         # derives the current (point, sweep) from the wall clock; a finite scan (K>0) stops once
@@ -1135,6 +1211,18 @@ class VirtualSequencer(SequencerDevice):
         when idle/safe -- the override of :attr:`SequencerDevice.firing` (which defaults None for a
         real/remote streamer with no host-side firing flag)."""
         return self._firing
+
+    @property
+    def last_fired(self) -> PulseSequence | None:
+        """The most recently FIRED program whose outputs the hardware still HOLDS, or None when
+        the streamer sits in its safe state.  Physics: after a finite program finishes playing, the
+        DAC/TTL words it drove stay LATCHED on the output pins -- nothing re-drives them until the
+        next fire or until ``set_safe_state`` parks them (DAC mid-code = signed level 0).  A
+        free-running (``Software``) monitor camera images exactly that steady state between fires.
+        Distinct from :attr:`firing` (a repeat_forever program still PLAYING now) and from the
+        merely-prepared program (uploaded, driving nothing yet): prepare does NOT clear this -- an
+        upload replaces the next program but leaves the pins holding the last fired word."""
+        return self._last_fired
 
     def prepare(self, sequence: PulseSequence | PulseTableState):
         # Uploading a new program REPLACES whatever the streamer was playing: on real hardware a
@@ -1208,6 +1296,9 @@ class VirtualSequencer(SequencerDevice):
         # set_safe_state.  A finite program plays ONCE -- the measurement arms the camera, fires
         # here, then reads the frames back -- so it does NOT leave the streamer continuously
         # firing (and must not make a later live read see a stale finite shot).
+        # Whatever fired now owns the output pins: record it as the held steady state a
+        # free-running monitor images between fires (see ``last_fired``).
+        self._last_fired = self._prepared
         if bool(getattr(self._prepared, "repeat_forever", False)):
             self._firing = self._prepared
         else:
@@ -1347,6 +1438,9 @@ class VirtualSequencer(SequencerDevice):
         on Stop, and a redundant safe-state on an already-idle streamer is a harmless no-op."""
         self.service.set_safe_state()
         self._firing = None
+        # Safe state PARKS the output pins (DAC mid-code = signed 0): the held word of the last
+        # fire is gone, so a free-running monitor now images the safe-state (all-zero) levels.
+        self._last_fired = None
         self._scan_info = None
         self._scan_done = False
         self._scan_fire_time = 0.0

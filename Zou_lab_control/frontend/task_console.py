@@ -6812,8 +6812,9 @@ class TaskConsole(QtWidgets.QWidget):
             return rows
         # published_signals() are HUB names (incl. the node's disambiguating prefix when two
         # nodes would collide).  Show the SHORT natural name (strip the prefix) -- "rate", not
-        # "judge_occupancy_rate" -- because the Logic row is already titled by the node; the
-        # short name is also what output_specs (and so ``desc``) is keyed by.
+        # "judge_occupancy_rate" -- because the Logic row is already titled by the node.  NOTE
+        # output_specs (and so ``desc``) is keyed by the FULL published name (occupancy's
+        # ``p + "occupied"``, the camera's prefixed frame_i): look descriptions up by ``full``.
         pfx = str(getattr(node, "prefix", "") or "")
         for full in sorted(node.published_signals()):
             short = strip_node_prefix(full, pfx)             # ONE rule, shared with the picker nest
@@ -6835,7 +6836,7 @@ class TaskConsole(QtWidgets.QWidget):
                 shape = describe_shape(self.hub.latest(full), points_shape=ps, data_shape=ds, grid_shape=gs)
             except Exception:
                 shape = "—"
-            rows.append((short, shape, desc(short)))
+            rows.append((short, shape, desc(full)))
         return rows
 
     def _update_row_publishes(self, row: "LogicNodeRow") -> None:
@@ -6859,13 +6860,26 @@ class TaskConsole(QtWidgets.QWidget):
         build path uses, so a declared name == the published name (a binding made before Start, or
         restored from a saved layout, re-attaches the instant the producer starts, #prebind).
         Measurement: the slug ``f"{spec.key}_"`` (what ScannedMeasurementNode/PulseScanNode get at
-        build); processor: the per-instance ``_logic_node_prefix``; camera/task: ``""`` (a camera
-        publishes ``frame_i`` bare, a task's mid-run entry is a synthetic display tag, not a hub name)."""
+        build); processor: the per-instance ``_logic_node_prefix``; camera: the DEVICE-owned rule
+        ``DeviceSet.camera_signal_prefix`` (the default camera publishes ``frame_i`` bare, any other
+        camera ``<device>_frame_i`` -- what ``readout.camera_measurement`` builds with); task: ``""``
+        (its mid-run entry is a synthetic display tag, not a hub name)."""
         node = row.node
         if node.kind == "measurement":
             return f"{self._spec_for_logic(node).key}_"
         if node.kind == "processor":
             return self._logic_node_prefix(node)
+        if node.kind == "camera":
+            # READ (never re-spell) the one naming rule on the device layer, keyed by the row's
+            # camera choice (blank/None = the default camera).  A session without a device set
+            # (the embedded figure viewer) has no rule to consult -> bare names.
+            devices = getattr(self.session, "devices", None)
+            if devices is None or not hasattr(devices, "camera_signal_prefix"):
+                return ""
+            try:
+                return str(devices.camera_signal_prefix((node.values or {}).get("camera")))
+            except Exception:
+                return ""
         return ""
 
     def _declared_signal_keys(self, row: "LogicNodeRow") -> list[str]:
@@ -7390,9 +7404,10 @@ class TaskConsole(QtWidgets.QWidget):
             return
         row.node.values = dict(values)            # remember for the next Edit reopen + save
         # Label the built node with its ROW TITLE so its provider label MATCHES the declared row's
-        # (the camera has prefix="" -> display_label would otherwise fall back to node_label="camera",
-        # which differs from the row title "Camera (live frames)", listing `frame` under TWO sources
-        # = the "two cameras" bug).  One label per node => one entry in the signal picker (#H3n).
+        # (the DEFAULT camera has prefix="" -> display_label would otherwise fall back to
+        # node_label="camera", which differs from the row title "Camera (live frames)", listing
+        # `frame` under TWO sources = the "two cameras" bug).  One label per node => one entry in
+        # the signal picker (#H3n).
         node.instance_label = str(getattr(row.node, "title", "") or getattr(node, "instance_label", ""))
         # Capture THIS row's PREVIOUS published signals so a source/param change that drops some of
         # them (fewer emCCD events -> fewer frame_i, a different processor source, ...) UNLINKS the now
