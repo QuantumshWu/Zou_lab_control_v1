@@ -51,6 +51,19 @@ MOT_COIL_BUSES: dict[str, tuple[str, ...]] = {
     "da_z": tuple(f"dz{i}" for i in range(6)),
 }
 
+# Display LABELS for the coil bits -- ``dx0 -> "da_x[0]"`` -- so the GUI folds the 18 coil channels
+# into three ``da_x``/``da_y``/``da_z`` bus rows exactly the way the real rig does: the streamer
+# carries CHANNEL names (``dx0`` here, ``chNN`` on hardware) plus a LABEL per channel written in
+# ``base[bit]`` syntax; ``infer_bus_channels`` folds on the label regex.  Derived from
+# MOT_COIL_BUSES (never a second hand-typed table) so name<->label stay in lockstep, and put on the
+# VirtualSequencer (not the template) so a freshly-started editor -- no template loaded -- already
+# shows bus rows, matching real == virtual (real labels come off the board XDC the same way).
+MOT_COIL_LABELS: dict[str, str] = {
+    channel: f"{bus}[{bit}]"
+    for bus, members in MOT_COIL_BUSES.items()
+    for bit, channel in enumerate(members)
+}
+
 # The virtual device's FULL channel catalog -- every simulated signal the fake rig owns, exactly
 # like the real catalog is the FULL board.xdc pin list (62 channels), not whatever subset one
 # saved template happens to drive.  A pulse template must be a SUBSET of this (virtual == real:
@@ -1168,9 +1181,16 @@ class VirtualSequencer(SequencerDevice):
       slows the live image and the pytest suite's ``sleep_scale=0`` fast-forwards.
     """
 
-    def __init__(self, channels: Sequence[str] = DEFAULT_CHANNELS, clock_hz: float = DEFAULT_CLOCK_HZ, sleep_scale: float | None = None):
+    def __init__(self, channels: Sequence[str] = DEFAULT_CHANNELS, clock_hz: float = DEFAULT_CLOCK_HZ,
+                 sleep_scale: float | None = None, channel_labels: dict | None = None):
         from .sequencer import SequencerService
         self.channels = tuple(str(channel) for channel in channels)
+        # Display labels (channel -> ``base[bit]``) so the pulse GUI folds the coil bits into bus
+        # rows -- the virtual analogue of the real sequencer reading its labels off the board XDC.
+        # Restricted to the channels this instance actually carries (a custom channel list drops the
+        # coil labels it does not use), so it never advertises a bus whose members are absent.
+        labels = MOT_COIL_LABELS if channel_labels is None else dict(channel_labels)
+        self.channel_labels = {ch: str(labels[ch]) for ch in self.channels if ch in labels}
         self.clock_hz = positive_float(clock_hz, "clock_hz")
         # REAL-TIME by default (DEFAULT_SLEEP_SCALE=1.0): a fired program takes its real
         # duration, so the live camera paces with the pulse.  ``None`` -> the module default

@@ -1663,6 +1663,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             if channels is None and experiment is not None and hasattr(experiment, "devices"):
                 sequencer = getattr(experiment.devices, "sequencer", sequencer)
                 channels = getattr(sequencer, "channels", channels)
+            # Pick the display LABELS off the sequencer too (symmetric with channels): a device
+            # names its DAC bits ``dx0`` and labels them ``da_x[0]``, so a fresh editor started from
+            # the device folds the 18 coil channels into three bus rows -- the real rig does exactly
+            # this from the board XDC labels (real == virtual), no template needed.
+            if channel_labels is None and sequencer is not None:
+                channel_labels = getattr(sequencer, "channel_labels", None)
             channels = list(channels or DEFAULT_CHANNEL_NAMES)
             labels = {str(k): str(v) for k, v in dict(channel_labels or {}).items()}
             state = PulseTableState(
