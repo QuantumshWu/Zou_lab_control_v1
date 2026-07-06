@@ -39,6 +39,25 @@ from ..timing import (
 )
 
 
+# The MOT coil DAC buses -- {bus name: bit channels LSB..MSB} -- THE single source both the
+# virtual channel catalog (DEFAULT_CHANNELS below) and the monitor camera's default coil wiring
+# (VirtualMotCamera.coil_buses) derive from, mirroring pulses/mot_field_template.json (three
+# 6-bit buses).  Keeping the bit names in ONE place is what lets the shipped MOT template load
+# onto a stock VirtualSequencer as a SUBSET of the device catalog (the same direction the real
+# rig enforces: board.xdc defines the catalog, a template may only use part of it).
+MOT_COIL_BUSES: dict[str, tuple[str, ...]] = {
+    "da_x": tuple(f"dx{i}" for i in range(6)),
+    "da_y": tuple(f"dy{i}" for i in range(6)),
+    "da_z": tuple(f"dz{i}" for i in range(6)),
+}
+
+# The virtual device's FULL channel catalog -- every simulated signal the fake rig owns, exactly
+# like the real catalog is the FULL board.xdc pin list (62 channels), not whatever subset one
+# saved template happens to drive.  A pulse template must be a SUBSET of this (virtual == real:
+# the real service.prepare raises on unknown channels), and the GUI's "Show All" can only show
+# rows that exist in the loaded state -- so the catalog carries ALL the roles the virtual
+# physics understands: the atom-array imaging lines, the MOT monitor trigger, and the three
+# coil DAC buses (derived from MOT_COIL_BUSES, never a second hand-typed copy).
 DEFAULT_CHANNELS = (
     "trap",
     "cooling",
@@ -46,6 +65,8 @@ DEFAULT_CHANNELS = (
     "emCCD",
     "pushout",
     "microwave",
+    "mot_trigger",
+    *(channel for members in MOT_COIL_BUSES.values() for channel in members),
 )
 
 # The virtual backend is a REAL-TIME hardware simulator: firing a pulse program TAKES its
@@ -964,12 +985,12 @@ class VirtualMotCamera(_TriggerWiredCamera):
         self.capture_trigger_channels = (
             DEFAULT_CAMERA_TRIGGER_CHANNELS if self._free_run else (self.trigger_source,))
         # The coil DAC buses this camera's MOT responds to: {bus name: member bit channels LSB..MSB}.
-        # Defaults mirror pulses/mot_field_template.json (three 6-bit buses) so the virtual demo is
-        # zero-config; a real setup names its own buses in the device config.
-        self.coil_buses = {str(k): tuple(str(c) for c in v) for k, v in dict(
-            coil_buses or {"da_x": [f"dx{i}" for i in range(6)],
-                           "da_y": [f"dy{i}" for i in range(6)],
-                           "da_z": [f"dz{i}" for i in range(6)]}).items()}
+        # The default is MOT_COIL_BUSES -- the ONE module-level source the virtual channel catalog
+        # (DEFAULT_CHANNELS) also derives from, so the sensor's wiring and the streamer's catalog
+        # can never drift apart (they used to be two hand-typed mirror copies).  A real setup
+        # names its own buses in the device config.
+        self.coil_buses = {str(k): tuple(str(c) for c in v)
+                           for k, v in dict(coil_buses or MOT_COIL_BUSES).items()}
         self.b0 = {str(k): float(v) for k, v in dict(b0 or {"da_x": 7.0, "da_y": -5.0, "da_z": 11.0}).items()}
         self.b_sigma = {str(k): positive_float(v, "b_sigma") for k, v in dict(
             b_sigma or {"da_x": 6.0, "da_y": 6.0, "da_z": 6.0}).items()}
@@ -1282,6 +1303,14 @@ class VirtualSequencer(SequencerDevice):
         # syncable last_payload_json, and advances to "prepared" -- exactly the seam the GUI's Sync
         # and the real SequencerService share, with no virtual copy.  The channel set is intrinsic
         # to the program (a saved table's chNN, the imaging names), so point the service at it.
+        # KNOWN DIRECTION FORK vs the real backend (kept for now, converge in its own round): the
+        # REAL service owns the catalog (board.xdc; ``service.prepare`` raises on channels outside
+        # it), while this line makes the virtual service ADOPT whatever channels the program uses.
+        # The load-side fix (``resolve_fireable_template`` / the GUI load align a SUBSET template
+        # onto the device catalog) means every catalog-respecting caller no longer relies on this
+        # accommodation; it still papers over a template with channels OUTSIDE ``self.channels``,
+        # which the real rig would reject.  Converge by validating against ``self.channels`` here
+        # (subset -> keep the device catalog, non-subset -> raise like the real service).
         from .sequencer import RuntimeSequenceProgram
         self.service.channels = list(channels)
         self.last_program = RuntimeSequenceProgram.from_dict(self.service.prepare(sequence))
@@ -1817,6 +1846,7 @@ __all__ = [
     "COOLING_CHANNELS",
     "DEFAULT_CHANNELS",
     "DEFAULT_TRAP_CHANNELS",
+    "MOT_COIL_BUSES",
     "VirtualCamera",
     "VirtualSequencer",
     "VirtualTrapArray",

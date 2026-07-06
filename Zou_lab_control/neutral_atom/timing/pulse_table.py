@@ -1058,11 +1058,18 @@ class PulseTableState:
             name=self.name,
             scan_slots=[slot.to_dict() for slot in self.scan_slots],
             scan_table=[list(row) for row in self.scan_table],
+            # API slots survive the align UNCHANGED (the same built-but-not-passed bug class as
+            # clk_channels below and unrolled_bracket's api_slots): every target kind is stable
+            # under a superset re-order -- ``duration`` targets a period INDEX (periods keep their
+            # order), ``delay`` targets a channel NAME (guaranteed present: non-subset raises
+            # above), ``dac`` targets ``bus@period`` (buses are filtered to surviving channels).
+            api_slots=[slot.to_dict() for slot in self.api_slots],
             time_step_ns=self.time_step_ns,
             repeat_start=self.repeat_start,
             repeat_end=self.repeat_end,
             repeat_count=self.repeat_count,
             repeat_forever=self.repeat_forever,
+            scan_repeats=self.scan_repeats,
             visible_channels=visible,
             channel_labels={channel: value for channel, value in self.channel_labels.items() if channel in channels},
             analog_buses={
@@ -1959,21 +1966,34 @@ def hardware_tick_ns(sequencer=None) -> float:
 
 def resolve_fireable_template(template, *, default_name: str, default_factory, sequencer=None) -> "PulseTableState":
     """Load a pulse template that is about to be FIRED: :func:`resolve_pulse_template` plus the
-    mandatory hardware-tick snap -- the SINGLE loader every fire path shares (the generic
-    Pulse-scan, the MOT-field task, the GUI slot preview).
+    mandatory hardware-tick snap and the device-catalog expansion -- the SINGLE loader every fire
+    path shares (the generic Pulse-scan, the MOT-field task, the GUI slot preview).
 
-    A template loaded to fire must author on the HARDWARE clock grid: its ``time_step_ns`` is
-    forced to the one hardware tick (:func:`hardware_tick_ns`), taken FROM the connected
-    ``sequencer`` device when one is given -- NOT whatever a saved file happened to carry, and NOT
-    a constant baked into a caller.  A finer authoring grid (an old save with ``time_step_ns = 1``,
-    or a factory-built default) would let an api/scan DURATION sweep produce sub-tick durations
-    that fail the clock-grid validation and cannot fire ("api slot does not work"); snapping the
-    grid here makes author == snap == fire for every template, including a user-local one under
-    ``pulses/``, on whatever clock the connected board reports."""
+    Fireable = the HARDWARE tick grid + the DEVICE channel catalog, both read off the connected
+    ``sequencer`` when one is given, never off whatever a saved file happened to carry:
+
+    * the ``time_step_ns`` is forced to the one hardware tick (:func:`hardware_tick_ns`).  A finer
+      authoring grid (an old save with ``time_step_ns = 1``, or a factory-built default) would let
+      an api/scan DURATION sweep produce sub-tick durations that fail the clock-grid validation
+      and cannot fire ("api slot does not work"); snapping the grid here makes author == snap ==
+      fire for every template, including a user-local one under ``pulses/``, on whatever clock the
+      connected board reports.
+    * a template whose channels are a SUBSET of the device catalog is expanded onto the FULL
+      catalog (:meth:`PulseTableState.aligned_to_channels`: device order, missing channels as off
+      rows -- no pulses added, the compiled program is identical).  A template is a saved SUBSET
+      of the board's channels, not the catalog itself; without the expansion the GUI's "Show All"
+      (and any per-channel edit) could only ever reach the rows the file happened to save.
+      A NON-subset template is returned untouched: the prepare layer rejects unknown channels
+      explicitly, and the coupled-template resolver (``resolve_coupled_template``) owns the
+      role-name -> device-name universe translation -- this loader never guesses a remap."""
     state = resolve_pulse_template(template, default_name=default_name, default_factory=default_factory)
     tick_ns = hardware_tick_ns(sequencer)
     if state.time_step_ns != tick_ns:
         state.time_step_ns = tick_ns
+    device_channels = [str(c) for c in (getattr(sequencer, "channels", None) or ())]
+    if (device_channels and list(state.channels) != device_channels
+            and all(channel in device_channels for channel in state.channels)):
+        state = state.aligned_to_channels(device_channels)
     return state
 
 

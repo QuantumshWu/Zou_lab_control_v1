@@ -1176,7 +1176,15 @@ Both are pinned by `tests/test_scan_slot_and_manual_parity.py`.
   the same helper, which the GUI slot preview also imports), `mot_field.run` → `self.sequencer`, and the
   Calibrate task's `_resolve_template` (logic.py) → `self.sequencer` (its GUI slot preview calls the same
   classmethod without a device and falls back to the config-default grid, like every other preview). The
-  tick is pinned by `tests/test_scan_slot_and_manual_parity.py`.
+  tick is pinned by `tests/test_scan_slot_and_manual_parity.py`. The CHANNEL CATALOG follows the same
+  device-owned rule: a saved template is a SUBSET of the board's channels, so the loader (and the pulse
+  GUI's Load) expands a subset template onto the connected device's full channel list via
+  `aligned_to_channels` (catalog order, missing channels as off rows — the compiled program is identical,
+  and "Show All" then really lists every device channel); a NON-subset template is left untouched (the
+  prepare layer rejects unknown channels, `resolve_coupled_template` owns role→device remapping). The
+  virtual catalog (`devices/virtual.DEFAULT_CHANNELS`, 25 channels) and `VirtualMotCamera.coil_buses`
+  both derive from the one `MOT_COIL_BUSES` source; the shipped `pulses/*.json` templates are regenerated
+  onto that full catalog. Pinned by `tests/test_pulse_template_channel_catalog.py`.
 
 ### A task's mid-run panel is DECLARED, sized and coloured from single sources (no console special-case)
 

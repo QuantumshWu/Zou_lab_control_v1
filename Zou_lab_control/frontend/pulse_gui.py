@@ -4063,6 +4063,25 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                         break
                 path = str(path_obj)
                 state = PulseTableState.load(path)
+                # LOAD == ALIGN onto the editor's channel catalog (the device's channel list the
+                # editor was opened on): a saved pulse is a SUBSET of the board's channels, not
+                # the catalog itself, so a subset file is expanded via aligned_to_channels
+                # (catalog order, missing channels as off rows -- Show All then really shows
+                # every device channel, not just the rows the file happened to save).  A file
+                # whose channels are NOT all in the catalog is rejected here (aligned_to_channels
+                # raises on a superset), with the same wording the root launcher uses -- the
+                # editor never silently swaps its channel universe to a foreign file's.
+                catalog = [str(c) for c in self.state.channels]
+                if list(state.channels) != catalog:
+                    if all(channel in catalog for channel in state.channels):
+                        state = state.aligned_to_channels(catalog)
+                    else:
+                        self._message(
+                            "loaded pulse state channels do not match the sequencer channels: "
+                            f"state={list(state.channels)!r}, sequencer={catalog!r}. "
+                            "Load a matching pulse JSON or use hardware channel names with display labels."
+                        )
+                        return
                 self.address_str = path
                 self._last_load_state = state.to_dict()
                 self._last_save_state = None
