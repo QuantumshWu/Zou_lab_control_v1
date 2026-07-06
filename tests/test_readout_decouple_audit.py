@@ -147,6 +147,46 @@ def test_psf_and_box_signals_dispatch_correctly():
     assert box.signals(img).shape == (2,)
 
 
+# ------------------------------------------------------------- D4: uniform_psf stored verbatim
+def test_single_method_uniform_psf_is_stored_verbatim():
+    """A single-method uniform_psf calibration keeps ``method='uniform_psf'`` (no collapse to
+    'psf'): methods() offers it, signals()/detect() resolve it, and the threshold path is
+    unchanged.  The old collapse stored method='psf' plus a write-only ``psf_mode`` metadata
+    key, so ``signals(method='uniform_psf')`` raised on the very calibration that computed it
+    -- while the multi-method path stored 'uniform_psf' first-class (two naming mechanisms)."""
+    import Zou_lab_control.neutral_atom as na
+
+    exp = na.connect("virtual", sitemap={"grid_shape": (2, 3), "image_shape": (48, 64)})
+    try:
+        exp.readout.sitemap(method="uniform_psf", frames=4, display=False)
+        cal = exp.readout.current
+        assert cal.method == "uniform_psf"
+        assert "uniform_psf" in cal.methods()
+        assert cal.metadata["method"] == "uniform_psf"      # metadata mirrors the field verbatim
+        assert "psf_mode" not in cal.metadata               # the write-only key is gone
+        assert readout_kind(cal.method) == "kernel"         # dispatches through the ONE kind table
+        assert cal.psf_weights is not None and cal.psf_boxes is not None
+
+        # thresholds path unaffected: learns on the SAME signals detect() will compare against
+        exp.readout.thresholds(frames=16, exposure=0.004, display=False)
+        cal = exp.readout.current
+        assert cal.method == "uniform_psf"
+        image = np.zeros((48, 64), dtype=float)
+        explicit = cal.signals(image, method="uniform_psf")  # the old collapse made this raise
+        assert explicit.shape == (6,)
+        assert np.allclose(explicit, cal.signals(image))     # default = the calibration's own method
+        assert exp.readout.detect(display=False).occupied.shape == (6,)
+
+        # box / psf single-method behavior unchanged (still stored verbatim, no psf_mode)
+        exp.readout.sitemap(method="psf", frames=4, display=False)
+        assert exp.readout.current.method == "psf"
+        assert "psf_mode" not in exp.readout.current.metadata
+        exp.readout.sitemap(method="box", frames=4, display=False)
+        assert exp.readout.current.method == "box"
+    finally:
+        exp.close()
+
+
 # ------------------------------------------------------------------ F3: no box-only residue on PSF
 def test_psf_calibration_drops_box_only_geometry():
     """A PSF calibration carries no dead roi_radius/reducer; a box calibration keeps them."""

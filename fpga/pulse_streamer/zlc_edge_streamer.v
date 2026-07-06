@@ -46,8 +46,10 @@
 //   when the undelayed level toggles at tick t the engine pushes {t + d - 1, level} into that
 //   signal's small event FIFO and pops it against a free-running global counter, so
 //   out_delayed[t] = out_undelayed[t-d].  Storage scales with TOGGLES IN FLIGHT (TTL <= EVT_DEPTH,
-//   each DA bit <= BUS_EVT_DEPTH; host-validated), NOT with delay length: a delay can be up to
-//   the 32-bit TTL_DELAY_WIDTH field (~85.9 s).  d=0 is exact passthrough; d=1 is one register.
+//   each DA bit <= BUS_EVT_DEPTH; host-validated), NOT with delay length: the register field is
+//   32-bit (TTL_DELAY_WIDTH); the HOST enforces a conservative default cap of (1<<31)-1 ticks
+//   (~42.9 s at 20 ns), configurable via streamer_config.json ttl_delay_max_ticks.  d=0 is exact
+//   passthrough; d=1 is one register.
 //   Proven cycle-exact by engine_model.rtl_delay_line_mirror / rtl_bus_delay_line_mirror.
 // =============================================================================
 
@@ -85,8 +87,10 @@ module zlc_edge_streamer #(
     // TTL channel delays are NOT bounded by a fixed delay-line depth: each channel schedules its
     // output TOGGLES (time + level) in a small event FIFO against a free-running global
     // tick counter, so the storage scales with the number of IN-FLIGHT TOGGLES (validated
-    // <= EVT_DEPTH by the host), not with the delay length.  TTL_DELAY_WIDTH bounds one
-    // delay (32b = ~85.9 s at 20 ns); GTIME_WIDTH bounds one RUN (48b = ~65 days).
+    // <= EVT_DEPTH by the host), not with the delay length.  TTL_DELAY_WIDTH is the 32b
+    // register field; the HOST caps one delay at a conservative default of (1<<31)-1 ticks
+    // (~42.9 s at 20 ns; streamer_config.json ttl_delay_max_ticks).  GTIME_WIDTH bounds one
+    // RUN (48b = ~65 days).
     parameter integer TTL_DELAY_WIDTH = 32,
     parameter integer EVT_DEPTH = 128,
     // DAC delay FIFO depth: each DA bit is its OWN event-scheduler channel, but there are
@@ -178,8 +182,10 @@ module zlc_edge_streamer #(
     // EVT_DEPTH-deep event FIFO; the free-running g_time pops it so the level appears exactly at
     // t + d_ch.  All 62 channels are independently delayable.  d=0 is exact passthrough; before
     // the first event the gated output holds its FIRE-time 0 -> silent until t>=d, for free.
-    // Storage scales with TOGGLES IN FLIGHT (host-validated <= EVT_DEPTH), NOT with d, so the
-    // bound is TTL_DELAY_WIDTH (32b = ~85.9 s).  Proven == engine_model.rtl_delay_line_mirror ==
+    // Storage scales with TOGGLES IN FLIGHT (host-validated <= EVT_DEPTH), NOT with d; the
+    // register field is TTL_DELAY_WIDTH (32b), and the HOST enforces a conservative default cap
+    // of (1<<31)-1 ticks (~42.9 s; streamer_config.json ttl_delay_max_ticks).
+    // Proven == engine_model.rtl_delay_line_mirror ==
     // delay_line_reference for ANY d (zero, positive, and -- via the host's folded global shift
     // G -- negative).
     //   * delay_ticks : per-channel delay d in ticks (0 = no delay), one TTL_DELAY_WIDTH (32b)
@@ -301,8 +307,9 @@ module zlc_edge_streamer #(
 
     // ----- delay runtime (per-channel TTL EVENT SCHEDULER + per-bus DAC ring) -----------------
     // TTL: see the EVENT SCHEDULER declarations below -- toggles are queued against a global
-    // counter instead of shifting one bit per tick, so the TTL delay bound is TTL_DELAY_WIDTH
-    // (~85.9 s) at a fraction of the old SRL cost.
+    // counter instead of shifting one bit per tick, so the TTL delay range is the 32b
+    // TTL_DELAY_WIDTH register field (host-capped at a conservative default of (1<<31)-1 ticks
+    // ~ 42.9 s, streamer_config.json ttl_delay_max_ticks) at a fraction of the old SRL cost.
     // DAC: each DA BIT is now its OWN 1-bit EVENT-SCHEDULER channel, exactly like a TTL output
     // (the earlier per-tick delay buffer is gone -- it capped d at a fixed ring depth and could
     // not match the TTL 32-bit range, so a negative TTL delay's global shift G could push a bus
@@ -324,8 +331,10 @@ module zlc_edge_streamer #(
     // d == 1 cannot use the queue (the entry would have to pop the cycle it is pushed),
     // so it is served by the prev_undelayed register (a 1-tick delay IS one register).
     // Cost ~ EVT_DEPTH x (GTIME_WIDTH+1)b LUTRAM + one GTIME_WIDTH comparator per channel
-    // (~2k LUTs total) and the delay bound becomes TTL_DELAY_WIDTH (32b = ~85.9 s) -- the
-    // host validates <= EVT_DEPTH toggles in flight per channel inside any d-window.
+    // (~2k LUTs total) and the delay range becomes the 32b TTL_DELAY_WIDTH register field
+    // (host-capped at a conservative default of (1<<31)-1 ticks ~ 42.9 s, streamer_config.json
+    // ttl_delay_max_ticks) -- the host validates <= EVT_DEPTH toggles in flight per channel
+    // inside any d-window.
     reg [GTIME_WIDTH-1:0] g_time = {GTIME_WIDTH{1'b0}};         // free-running ticks since FIRE
     reg [CHANNEL_COUNT-1:0] prev_undelayed = {CHANNEL_COUNT{1'b0}};
     // Event FIFOs are stored by DELAY SLOT (0..NUM_DELAY_CH-1), not by channel: slot s

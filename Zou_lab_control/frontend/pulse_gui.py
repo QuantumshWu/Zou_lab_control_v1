@@ -81,6 +81,7 @@ from .qt_fluent import (
     Metrics,
     center_window_on_primary_screen,
     ensure_qt_app,
+    retain_window,
     fluent_font_size,
     fluent_scrollbar_stylesheet,
     fluent_text_width,
@@ -4599,9 +4600,9 @@ def show_pulse_gui(
     center_window_on_primary_screen(window, app)   # shared with show_task_console (qt_fluent single source)
     window.show()
     editor._zlc_window = window
-    if not hasattr(app, "_zlc_pulse_windows"):
-        app._zlc_pulse_windows = []
-    app._zlc_pulse_windows.extend([window, editor])
+    # The window owns the editor (FluentWindow re-parents its widget), so retaining the
+    # window alone keeps both alive -- and the ONE registry prunes them when it dies.
+    retain_window(window)
     return editor
 
 

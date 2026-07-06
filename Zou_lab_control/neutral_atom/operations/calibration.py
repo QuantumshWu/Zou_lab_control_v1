@@ -4,7 +4,9 @@ These build a :class:`~..core.calibration.TrapCalibration` from image stacks
 without a session.  ``method`` selects the readout the calibration will carry:
 
 * sitemap  ``method='box'`` (default) stores square-ROI readout; ``'psf'`` fits a
-  per-site PSF weight from the all-sites average and stores matched-filter readout.
+  per-site PSF weight from the all-sites average and stores matched-filter readout;
+  ``'uniform_psf'`` fits ONE shared kernel reused by every site (stored verbatim --
+  the calibration's ``method`` names exactly what was calibrated).
 * threshold ``method='otsu'`` (default) is the single-split threshold; ``'bimodal'``
   fits dark/bright Gaussian cores per site (the Rb87 readout).  Either way the
   per-site signal is extracted with ``calibration.signals`` so the threshold is
@@ -24,7 +26,7 @@ from ..core.analysis import (
     otsu_threshold,
 )
 from ..core.bimodal import fit_bimodal_per_site
-from ..core.calibration import READOUT_KINDS, TrapCalibration
+from ..core.calibration import READOUT_KINDS, TrapCalibration, readout_kind
 from ..core.psf import fit_site_psfs, fit_uniform_psf, psf_boxes_array, psf_weights_array
 from ..core.results import SitemapResult, ThresholdResult
 from ..core.utils import site_index
@@ -81,11 +83,12 @@ def calibrate_sitemap_from_images(
     # silently extracting the wrong pixels.
     image_shape = [int(average.shape[0]), int(average.shape[1])]
 
-    if method in ("psf", "uniform_psf"):
+    if readout_kind(method) == "kernel":
         # Per-site fits one independent kernel per spot; uniform fits ONE shared
-        # kernel reused by every site (right when the spots share one shape).  Both
-        # store method='psf' on the calibration (the same matched-filter readout
-        # path) -- the psf_mode metadata records which kernel model produced it.
+        # kernel reused by every site (right when the spots share one shape).  The
+        # calibration stores the method VERBATIM ('psf' / 'uniform_psf'), so
+        # methods() offers it and signals(method=...) resolves it -- exactly like
+        # the multi-method path's by_method keys (one naming, no collapse).
         uniform = method == "uniform_psf"
         psfs = (fit_uniform_psf if uniform else fit_site_psfs)(average, centers, half_width=psf_half_width)
         # roi_radius / reducer are the BOX extraction geometry; a PSF readout reads through its
@@ -95,12 +98,11 @@ def calibrate_sitemap_from_images(
             centers,
             thresholds,
             grid_shape=grid_shape,
-            method="psf",
+            method=method,
             psf_weights=psf_weights_array(psfs),
             psf_boxes=psf_boxes_array(psfs),
             background=background,
-            metadata={"stage": "sitemap", "thresholds_calibrated": False, "method": "psf",
-                      "psf_mode": "uniform" if uniform else "per_site",
+            metadata={"stage": "sitemap", "thresholds_calibrated": False, "method": method,
                       "psf_half_width": int(psf_half_width), "image_shape": image_shape},
         )
     else:

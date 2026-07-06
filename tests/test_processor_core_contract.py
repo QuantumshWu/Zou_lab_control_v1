@@ -115,6 +115,28 @@ def test_readout_fidelity_summary_keys_are_single_sourced():
     assert set(FidelityReport.SUMMARY_KEYS) <= set(spec.result_keys)
 
 
+def test_short_shot_form_bounds_sit_inside_index_run_domain():
+    """CONTRACT (#C5): the readout-fidelity form's ``short_shot`` bounds derive from the ONE
+    imageio contract -- ``index_run`` coerces shot indices via ``positive_int`` (so the minimum
+    is ``SHOT_INDEX_MIN``, imported, never re-typed) and requires short_shot <= shots_per_group
+    (so the form's two upper bounds share one constant).  A form that accepted 0 was a
+    guaranteed runtime ValueError."""
+    from Zou_lab_control.neutral_atom.core.analysis import positive_int
+    from Zou_lab_control.neutral_atom.operations.imageio import SHOT_INDEX_MIN
+    from Zou_lab_control.neutral_atom.operations.processors.readout_fidelity import readout_fidelity
+
+    spec = readout_fidelity(readout=None)
+    decls = {p.key: p for p in spec.params}
+    short, group = decls["short_shot"], decls["shots_per_group"]
+    assert short.lo == SHOT_INDEX_MIN                      # the imported contract minimum...
+    positive_int(int(short.lo), "short_shot")              # ...is accepted by index_run's coercion
+    with pytest.raises(ValueError):
+        positive_int(int(short.lo) - 1, "short_shot")      # ...and is the SMALLEST accepted value
+    assert short.hi == group.hi                            # short_shot <= shots_per_group: one shared hi
+    assert short.lo <= short.default <= short.hi
+    assert group.lo <= group.default <= group.hi
+
+
 def test_processor_registry_rejects_duplicate_result_keys():
     a = lambda readout: ProcessorSpec(name="A", params=(), run=lambda c: {}, result_keys=("dup",))
     b = lambda readout: ProcessorSpec(name="B", params=(), run=lambda c: {}, result_keys=("dup",))

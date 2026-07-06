@@ -43,10 +43,10 @@ cd D:\ZLC
 .\fpga\build_and_program.bat
 ```
 
-默认 XDC 是板级 pin map：
+默认 XDC 是板级 pin map(仓内平台配置副本,见 `fpga/board_config/README.md`)：
 
 ```text
-references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc
+fpga\board_config\board.xdc
 ```
 
 如果 Vivado 不在默认路径：
@@ -76,7 +76,7 @@ Auto Connect。
 <!-- cell:code -->
 PROJECT_ROOT = Path("..").resolve()
 FPGA_DIR = PROJECT_ROOT / "fpga" / "pulse_streamer"
-XDC = PROJECT_ROOT / "references" / "source_archives" / "address_switch" / "address_switch.srcs" / "constrs_1" / "new" / "addre.xdc"
+XDC = PROJECT_ROOT / "fpga" / "board_config" / "board.xdc"   # the na-layer default (infer_xdc_* with no path resolves to it)
 
 CHANNELS = na.infer_xdc_channels(XDC)
 CHANNEL_LABELS = na.infer_xdc_channel_labels(XDC)
@@ -292,11 +292,13 @@ One edge row is a complete state mask at a time point. If trap and emCCD change
 at the same tick, that is still one row, not two. GUI hidden channels do not
 change row width; they simply have zero bits in the uploaded masks.
 
-A hardware scan binds duration / delay / DAC-value fields to slots `s0..sN`; the
+A hardware scan binds duration / DAC-value fields to slots `s0..sN`; the
 scan table is one row per scan point. Because the edge ticks are affine in the
-slots, a scanned duration/delay moves the edges (and any analog ramp) in lockstep.
-The compiler/host reject a scan only when it would make the merged edge order
-non-monotonic at some scan point (split the scan or simplify timing).
+slots, a scanned duration moves the edges (and any analog ramp) in lockstep.
+A channel delay is a fixed per-channel output delay set through the API; it is
+never scanned. The compiler/host reject a scan only when it would make the
+merged edge order non-monotonic at some scan point (split the scan or simplify
+timing).
 
 Analog buses are compiled into a separate bus-segment memory with
 `bus_id / start_tick / stop_tick / start_value / stop_value / mode / value_select /

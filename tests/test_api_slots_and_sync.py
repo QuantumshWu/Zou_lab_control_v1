@@ -32,6 +32,40 @@ from Zou_lab_control.neutral_atom.timing import (
 from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod
 
 
+def test_dac_api_slot_unit_is_normalized_to_value():
+    """CONTRACT (#E3): a DAC value is a signed code, not a time -- ApiSlot construction (the
+    ONE choke point every slot passes: GUI bind, from_dict, JSON load) forces unit='value'
+    for kind='dac', so a legacy file that saved unit='ns' auto-corrects on load."""
+    from Zou_lab_control.neutral_atom.timing.pulse_table import ApiSlot
+
+    legacy = ApiSlot.from_dict({"name": "a1", "kind": "dac", "target": "da_x@0", "unit": "ns"})
+    assert legacy.unit == "value"
+    assert ApiSlot(name="a2", kind="dac", target="da_y@0", unit="ns").unit == "value"
+    assert ApiSlot(name="a3", kind="dac", target="da_z@0").unit == "value"       # default path too
+    # non-dac kinds keep their declared unit untouched
+    assert ApiSlot(name="a4", kind="duration", target="0", unit="us").unit == "us"
+
+
+def test_shipped_pulse_tables_carry_value_unit_on_every_dac_api_slot():
+    """Every shipped ``pulses/*.json`` pulse TABLE loads with unit='value' on each DAC api slot
+    (the mot_field template's a1/a2/a3 carried 'ns' -- a time unit displayed on a DAC code)."""
+    pulses = REPO_ROOT / "pulses"
+    dac_slots = 0
+    for path in sorted(pulses.glob("*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("schema") != PulseTableState.schema:
+            continue                                    # runtime-program snapshots are not tables
+        state = PulseTableState.load(path)
+        for slot in state.api_slots:
+            if slot.kind == "dac":
+                dac_slots += 1
+                assert slot.unit == "value", f"{path.name}: dac api slot {slot.name} unit={slot.unit!r}"
+    # the sweep must not be vacuous: the mot_field template alone contributes a1/a2/a3
+    mot = PulseTableState.load(pulses / "mot_field_template.json")
+    assert {s.name for s in mot.api_slots if s.kind == "dac"} == {"a1", "a2", "a3"}
+    assert dac_slots >= 3
+
+
 def test_unrolled_bracket_preserves_api_slots_with_remapped_targets():
     """A finite-bracket compile unrolls the table first; api-slot bindings must carry through that
     unroll (with their period targets remapped), exactly like scan_slots and clk_channels.  The

@@ -161,7 +161,9 @@ The FPGA side infers the full hardware contract from the board XDC
 (`fpga\board_config\board.xdc` — see that folder's README; override with `ZLC_PS_XDC`;
 62 controllable outputs, fallback `ch00..ch61`). GUI visibility is a view
 operation only; the server always pads to full hardware width and zeros
-hidden/unconfigured channels.
+hidden/unconfigured channels. The RPyC server binds `0.0.0.0` with pickle
+enabled by design for the isolated lab network — the declared trust posture is
+AGENTS.md §2「信任边界」.
 
 Key fixed facts:
 
@@ -228,10 +230,13 @@ sweep wrap is just another chunk boundary, so the re-sweep is SEAMLESS for any N
 Scans bind named slots `s0, s1, ...` in bind order. **There is no `x`/`y` axis concept** — any
 per-field value is bound to a slot, never to a fixed `x`/`y` channel.
 
-- Any per-field value (period duration, channel delay, analog-bus DAC value) can
+- Any scannable per-field value (period duration, analog-bus DAC value) can
   be bound to a named scan **slot** `s0, s1, ...` in bind order, via the GUI
   scan dot or `state.bind_field(kind, target)` where `kind in
-  {"duration","delay","dac"}`.
+  {"duration","dac"}`. A channel delay is a FIXED per-channel output delay
+  line: it takes an API slot (`aN`) but never a scan slot (`FIELD_KINDS` in
+  `timing/pulse_table.py` is the single source; `bind_field("delay", ...)`
+  raises).
 - `scan_table` is an `N_points x N_slots` array, loadable from `.npy/.csv/.txt`
   (`load_scan_table`) or built in the GUI Scan tab. Row = one scan point, column
   `j` = slot `s{j}` in that slot's display unit (ns for time slots, integer DAC
@@ -242,9 +247,9 @@ per-field value is bound to a slot, never to a fixed `x`/`y` channel.
   iterates scan points seamlessly. `RuntimeSequenceProgram` schema carries
   `slot_count/slot_kinds/tick_slot_coeffs/loop_end_slot_coeffs/scan_points/
   scan_coeff_frac_bits` plus ticks/masks/bus_segments.
-- Time expressions in durations/delays may only be affine in slots (numbers,
+- Time expressions in durations may only be affine in slots (numbers,
   `s0..`, `+ - * /`, parentheses); the compiler rejects non-affine scan timing.
-- Duration, delay, and DAC value can scan in any combination and seamlessly: the
+- Duration and DAC value can scan in any combination and seamlessly: the
   analog-bus segments carry affine start/stop ticks (same `effective_tick`) and a
   dual `value_select` so a ramp can scan BOTH endpoints (scanned-A -> scanned-B)
   and an edge/hold segment can track a scanned DAC code.
@@ -483,7 +488,8 @@ chunk boundary, so the WHOLE re-sweep is gapless (no inter-sweep hold).
 
 **Capacity (35T `xc7a35tfgg484-2`, target `<=90%`):** 62 digital + 4x10-bit DAC;
 20 ns tick (1-tick min width AND resolution); `NUM_SLOTS=4` affine slots
-(delay/duration/DAC value, any combination, seamless); **4096 edges + 4096
+(duration/DAC value, any combination, seamless; channel delays are fixed
+API-set values, never scanned); **4096 edges + 4096
 resident scan points + UNBOUNDED streaming**; RAMB36 78% (LUT 26%, FF 12%, DSP
 9%) from `solve_capacity`. The bus segment tables are LUTRAM (distributed), not
 RAMB36, because the bus/ramp engine reads them combinationally each tick.
@@ -702,7 +708,7 @@ What is sound and should NOT be churned:
   the JSON+`$device:` registry, and the `DeviceSet` container.
 - `PulseSequence` (time truth) vs `PulseTableState` (GUI compile model) split.
 - The N-slot affine scan engine (now also drives affine analog-bus ticks, so
-  DAC value + duration + delay scan together — see §4).
+  DAC value + duration scan together — see §4).
 
 Targeted improvement backlog (priority order; none blocking):
 1. **Sequencer class roles.** Five classes (`Virtual/Runtime/Manual/Remote/
@@ -892,8 +898,9 @@ RAMB36 27/50 (54%), LUT 12,246/20,800 (58.9%), FF ~9,000 (21.6%), DSP 52/90 (57.
 **What 32 bits caps today.**  A 32-bit tick at 20 ns is ~85.9 s.  That bounds ONE frame
 (a single scan point's duration), NOT total runtime: repeat_forever runs indefinitely,
 sweeps can hold millions of points, and the experiment loop is unbounded.  The TTL delay
-field is likewise 32-bit (~42.9 s), and with repeat_forever a longer delay is reduced
-modulo the sweep period anyway (§8).  Separately, the scheduler's free-running `g_time`
+register field is likewise 32-bit; the host enforces a conservative default cap of
+`(1<<31)-1` ticks (~42.9 s, `streamer_config.json` `ttl_delay_max_ticks`), and with
+repeat_forever a longer delay is reduced modulo the sweep period anyway (§8).  Separately, the scheduler's free-running `g_time`
 is 48-bit: it wraps after ~65 days of continuous uptime -- the one true long-run hazard.
 
 **Design if needed (the key trick: split base from offsets).**

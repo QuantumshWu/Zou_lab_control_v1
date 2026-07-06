@@ -30,19 +30,19 @@
       "name": "a1",
       "kind": "dac",
       "target": "da_x@0",
-      "unit": "ns"
+      "unit": "value"
     },
     {
       "name": "a2",
       "kind": "dac",
       "target": "da_y@0",
-      "unit": "ns"
+      "unit": "value"
     },
     {
       "name": "a3",
       "kind": "dac",
       "target": "da_z@0",
-      "unit": "ns"
+      "unit": "value"
     }
   ],
   "time_step_ns": 20.0,

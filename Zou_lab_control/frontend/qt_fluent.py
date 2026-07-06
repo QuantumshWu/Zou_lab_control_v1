@@ -8,6 +8,7 @@ flat 1 px DIVIDER card borders (no drop shadows -- see ``stroke_card_border``).
 from __future__ import annotations
 
 import contextlib
+import logging
 import math
 import os
 import re
@@ -153,17 +154,35 @@ def resolve_fluent_auto_scale(app: QtWidgets.QApplication | None = None) -> floa
 
 
 def set_fluent_scale(scale: float | None = None) -> float:
-    """Set the scale used by subsequently created Fluent widgets.
+    """Set the PROCESS-GLOBAL scale used by subsequently created Fluent widgets.
 
     ``None`` means AUTOMATIC: resolve from the primary screen via
     :func:`resolve_fluent_auto_scale` (never a silent 1.0 -- a fixed fallback
-    is how two GUIs ended up with different control sizes on the same screen)."""
+    is how two GUIs ended up with different control sizes on the same screen).
+
+    The fluent scale is ONE process-wide value BY DESIGN: every GUI window on a
+    screen must agree on control sizes (the scale-sharing contract), so the
+    per-window ``scale=`` parameters of the ``show_*`` launchers all write THIS
+    value -- there is no per-window scale.  Changing it while FluentWindows are
+    already open therefore also retunes the app font and every widget those
+    windows create from now on; that conflict is logged as a warning.  Requesting
+    the value already in force (e.g. the automatic ``scale=None`` path resolving
+    to the same screen fit) stays silent."""
 
     global _FLUENT_SCALE
     if scale is None:
         scale = resolve_fluent_auto_scale()
-    _FLUENT_SCALE = max(FLUENT_SCALE_MIN, min(FLUENT_SCALE_MAX, float(scale)))
+    new_scale = max(FLUENT_SCALE_MIN, min(FLUENT_SCALE_MAX, float(scale)))
     app = QtWidgets.QApplication.instance()
+    if new_scale != _FLUENT_SCALE and app is not None:
+        live_windows = [w for w in app.topLevelWidgets() if isinstance(w, FluentWindow)]
+        if live_windows:
+            logging.getLogger(__name__).warning(
+                "set_fluent_scale(%.3g): the fluent scale is process-global; changing it from %.3g "
+                "with %d FluentWindow(s) open also resizes the app font and every widget those "
+                "windows create from now on.",
+                new_scale, _FLUENT_SCALE, len(live_windows))
+    _FLUENT_SCALE = new_scale
     if app is not None:
         app.setFont(QtGui.QFont(FONT, fluent_font_size()))
     return _FLUENT_SCALE
@@ -216,6 +235,49 @@ def center_window_on_primary_screen(window: QtWidgets.QWidget, app: QtWidgets.QA
     frame = window.frameGeometry()
     frame.moveCenter(available.center())
     window.move(frame.topLeft())
+
+
+def retain_window(window: QtWidgets.QWidget, *extras) -> None:
+    """Keep a launched top-level GUI ``window`` alive on the QApplication, pruned when it dies.
+
+    The ``show_*`` launchers (task console / pulse editor / figure viewer) must hold a Python
+    reference to the window they open -- a notebook cell often drops the return value, and with
+    no reference the window would be garbage-collected mid-display.  Each launcher used to
+    append to its OWN app-level list and never remove anything, so every reopened standalone
+    window (with its canvases and figures) was retained forever.  This is the ONE registry
+    (``app._zlc_retained_windows``) with the ONE pruning rule (the destroyed-connect pattern of
+    Confocal-GUIv2's ``_on_child_closed``):
+
+    * ``window.destroyed`` always removes the entry;
+    * a genuine close (the ``closed`` signal, when the window has one) also removes it -- but
+      ONLY for windows that really close on X.  ``hide_on_close`` windows hide instead and MUST
+      stay retained, so a later session call restores the SAME interface.
+
+    ``extras`` are for objects the caller needs kept alive that the window does NOT own; they
+    ride the window's lifetime.  A widget the window parents (``FluentWindow(widget=...)``
+    re-parents it) needs no extra retention -- do not double-retain children."""
+
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        raise RuntimeError("retain_window needs a QApplication (call ensure_qt_app first).")
+    registry = getattr(app, "_zlc_retained_windows", None)
+    if registry is None:
+        registry = []
+        app._zlc_retained_windows = registry
+    if extras:
+        window._zlc_retained_extras = tuple(extras)   # live and die with the window
+    registry.append(window)
+
+    def _prune(*_args) -> None:
+        try:
+            registry.remove(window)
+        except ValueError:
+            pass  # already pruned (e.g. destroyed after a genuine close)
+
+    window.destroyed.connect(_prune)
+    closed = getattr(window, "closed", None)
+    if closed is not None and not getattr(window, "_hide_on_close", False):
+        closed.connect(_prune)
 
 
 def fluent_font_size() -> int:
@@ -3093,6 +3155,7 @@ __all__ = [
     "fluent_text_width",
     "fluent_widget_stylesheet",
     "format_compact_number",
+    "retain_window",
     "run_fluent_window",
     "resolve_fluent_auto_scale",
     "scaled_px",

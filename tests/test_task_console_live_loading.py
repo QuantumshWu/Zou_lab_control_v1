@@ -620,15 +620,15 @@ def test_session_gui_is_a_singleton_that_reopens_the_same_window():
     app = ensure_qt_app()
     exp = _calibrated_virtual_session()
     try:
-        before = len(getattr(app, "_zlc_task_windows", []))
+        before = len(getattr(app, "_zlc_retained_windows", []))
         c1 = exp.task_console()
         c2 = exp.task_console()
         assert c1 is c2                                          # singleton: the SAME console
-        assert len(app._zlc_task_windows) == before + 1         # exactly ONE window created
+        assert len(app._zlc_retained_windows) == before + 1     # exactly ONE window created
         c1.window().close()                                     # X -> hide (hide_on_close), not destroy
         c3 = exp.task_console()
         assert c3 is c1                                         # reopen reuses + restores it
-        assert len(app._zlc_task_windows) == before + 1         # still no duplicate window
+        assert len(app._zlc_retained_windows) == before + 1     # still no duplicate window
 
         e1 = exp.pulse_gui()
         e2 = exp.pulse_gui()
@@ -648,16 +648,24 @@ def test_session_gui_launchers_delegate_and_pulse_runs_standalone(monkeypatch):
     import Zou_lab_control.frontend.task_console as tcmod
     import Zou_lab_control.neutral_atom._gui as gui
 
+    from types import SimpleNamespace
+
     calls: dict = {}
-    monkeypatch.setattr(tcmod, "show_task_console", lambda **kw: (calls.__setitem__("tc", kw), "CONSOLE")[1])
+    # The launcher registers ``console.stop_all_nodes`` as a device-teardown hook, so the fake
+    # must expose that callable (a bare string would die with AttributeError).
+    fake_console = SimpleNamespace(stop_all_nodes=lambda: None)
+    monkeypatch.setattr(tcmod, "show_task_console", lambda **kw: (calls.__setitem__("tc", kw), fake_console)[1])
     monkeypatch.setattr(pgmod, "show_pulse_gui", lambda **kw: (calls.setdefault("pg", []).append(kw), "EDITOR")[1])
 
     exp = _calibrated_virtual_session()
     try:
-        assert exp.task_console(task="foo") == "CONSOLE"
+        assert exp.task_console(task="foo") is fake_console
         tc = calls["tc"]
         assert tc["session"] is exp and tc["task"] == "foo"
         assert {"hub", "measurements", "processors", "tasks"} <= set(tc)   # catalogs filled from session
+        # #A1: opening the console registers its stop with the session's teardown seam, so
+        # exp.close()/load_config() stop running nodes BEFORE the devices go away.
+        assert fake_console.stop_all_nodes in exp._device_teardown_hooks
 
         assert exp.pulse_gui() == "EDITOR"
         assert calls["pg"][-1]["experiment"] is exp                        # bound to the session

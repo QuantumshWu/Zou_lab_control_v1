@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .virtual import virtual_config, virtual_config_with_overrides
-from .base import BaseDevice, CameraDevice, SequencerDevice, TrapArrayDevice, validate_device_contract
+from .base import BaseDevice, CameraDevice, SequencerDevice, TrapArrayDevice
 
 
 BUILTIN_DEVICE_CLASS_PATHS = {
@@ -67,6 +67,23 @@ def device_domains() -> tuple["DeviceDomain", ...]:
 register_device_domain("camera", CameraDevice, "Camera")
 register_device_domain("sequencer", SequencerDevice, "Sequencer")
 register_device_domain("trap_array", TrapArrayDevice, "Trap array")
+
+
+def validate_device_contract(name: str, device: Any) -> None:
+    """Raise if a configured device does not inherit its role's required base class.
+
+    The role->base relation is :data:`DEVICE_DOMAINS` -- the SAME table
+    :func:`register_device_domain` extends -- so a lab-registered domain (RF source,
+    DAQ, ...) is contract-checked at load time exactly like the built-ins.  A name
+    with no registered domain need only be a :class:`BaseDevice`."""
+
+    domain = DEVICE_DOMAINS.get(str(name))
+    expected = domain.base_type if domain is not None else BaseDevice
+    if not isinstance(device, expected):
+        raise TypeError(
+            f"device {name!r} ({type(device).__name__}) must inherit {expected.__name__}. "
+            "Implement the appropriate BaseDevice subclass instead of relying on duck typing."
+        )
 
 
 @dataclass
@@ -422,4 +439,5 @@ __all__ = [
     "register_device_class",
     "resolve_class",
     "resolve_connect_config",
+    "validate_device_contract",
 ]

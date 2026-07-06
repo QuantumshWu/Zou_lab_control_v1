@@ -226,7 +226,10 @@ class ApiSlot:
             raise ValueError(f"api slot kind must be one of {API_SLOT_KINDS}, got {self.kind!r}.")
         object.__setattr__(self, "name", str(self.name))
         object.__setattr__(self, "target", str(self.target))
-        object.__setattr__(self, "unit", str(self.unit))
+        # A DAC slot's value is a signed DAC code, not a time: the unit is 'value' by
+        # definition of the kind, forced HERE (the one construction choke point every slot
+        # passes -- GUI bind, from_dict, a legacy JSON that saved 'ns' auto-corrects on load).
+        object.__setattr__(self, "unit", "value" if self.kind == "dac" else str(self.unit))
 
     def to_dict(self) -> dict[str, object]:
         return {"name": self.name, "kind": self.kind, "target": self.target, "unit": self.unit}

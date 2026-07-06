@@ -80,19 +80,22 @@ class TrapCalibration:
         if method not in READOUT_KINDS:                  # the ONE method registry (box / psf / uniform_psf)
             raise ValueError(f"method must be one of {tuple(READOUT_KINDS)}.")
         object.__setattr__(self, "method", method)
+        # Normalization dispatches on the method's declared KIND (READOUT_KINDS), never on the
+        # method NAME -- 'psf' and 'uniform_psf' are both kernel readouts and normalize the same.
+        kind = readout_kind(method)
         # roi_radius / reducer are box-only extraction geometry: validate + keep them for a box
         # calibration, but a PSF (kernel) calibration reads through the kernels and ignores them,
         # so drop both to None there rather than carry meaningless box state (#historical-residue).
-        if method == "box":
+        if kind == "box":
             object.__setattr__(self, "roi_radius", nonnegative_int(self.roi_radius, "roi_radius"))
             object.__setattr__(self, "reducer", str(self.reducer))
         else:
             object.__setattr__(self, "roi_radius", None)
             object.__setattr__(self, "reducer", None)
         object.__setattr__(self, "background", str(self.background).lower())
-        if method == "psf":
+        if kind == "kernel":
             if self.psf_weights is None or self.psf_boxes is None:
-                raise ValueError("method='psf' requires psf_weights and psf_boxes.")
+                raise ValueError(f"method={method!r} (kernel readout) requires psf_weights and psf_boxes.")
             weights = np.ascontiguousarray(self.psf_weights, dtype=float)
             boxes = np.ascontiguousarray(self.psf_boxes, dtype=int)
             if weights.ndim != 3 or len(weights) != len(centers):

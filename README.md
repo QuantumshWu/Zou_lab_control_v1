@@ -128,9 +128,10 @@ generated `impl_1\zlc_pulse_streamer_top.{bit,ltx}`. The full runbook is in the
 
 The pulse GUI edits a `PulseTableState` and drives a supplied sequencer; it is a
 frontend only, not a separate hardware-control layer. Scanning uses named slots
-`s0, s1, ...`: bind any duration/delay/DAC field (a scan dot in the GUI, or
+`s0, s1, ...`: bind any duration/DAC field (a scan dot in the GUI, or
 `state.bind_field(kind, target)`), then provide an `N_points x N_slots`
-`scan_table`. The **frontend manual** covers the widget library, the
+`scan_table`. A channel delay is a fixed per-channel output delay set through
+the API; it is never scanned. The **frontend manual** covers the widget library, the
 Edit/Preview/Scan tabs, the scan-dot workflow, and the plotting/PDF API. Open
 the editor remotely or offline:
 

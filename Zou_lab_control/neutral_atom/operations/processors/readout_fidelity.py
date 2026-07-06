@@ -17,9 +17,14 @@ from __future__ import annotations
 import numpy as np
 
 from ..fidelity import FidelityReport
-from ..imageio import DEFAULT_SHORT_SHOT, DEFAULT_SHOTS_PER_GROUP
+from ..imageio import DEFAULT_SHORT_SHOT, DEFAULT_SHOTS_PER_GROUP, SHOT_INDEX_MIN
 from ..processor import ParamDecl, ProcessorContext, ProcessorSpec
 from ..processor_registry import processor
+
+# The form's upper bound on the group size.  ``short_shot`` must land in
+# SHOT_INDEX_MIN..shots_per_group (imageio.index_run's contract), so its hi is THIS
+# same bound -- one constant for both decls, never a re-typed near-miss like 63/64.
+_MAX_SHOTS_PER_GROUP = 64
 
 
 @processor(order=10)
@@ -35,8 +40,11 @@ def readout_fidelity(readout) -> ProcessorSpec:
         ParamDecl("data_dir", "Frames folder", "path", default="", path_mode="dir",
                   required=True, tooltip="Folder of saved frames (na.write_virtual_run output, or a real run)."),
         ParamDecl("prefix", "Frame prefix", "text", default="img"),
-        ParamDecl("shots_per_group", "Shots/group", "int", default=DEFAULT_SHOTS_PER_GROUP, lo=2, hi=64),
-        ParamDecl("short_shot", "Short-shot index", "int", default=DEFAULT_SHORT_SHOT, lo=0, hi=63),
+        ParamDecl("shots_per_group", "Shots/group", "int", default=DEFAULT_SHOTS_PER_GROUP, lo=2,
+                  hi=_MAX_SHOTS_PER_GROUP),
+        ParamDecl("short_shot", "Short-shot index", "int", default=DEFAULT_SHORT_SHOT,
+                  lo=SHOT_INDEX_MIN, hi=_MAX_SHOTS_PER_GROUP,
+                  tooltip="1-based index of the short readout within each group (1..shots_per_group)."),
         ParamDecl("train_fraction", "Train fraction", "float", default=0.9, lo=0.5, hi=0.99),
         ParamDecl("seed", "Seed", "int", default=0, lo=0, hi=1_000_000),
         ParamDecl("store_thresholds", "Write thresholds back", "bool", default=True),

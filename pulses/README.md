@@ -35,8 +35,9 @@ finite debugging keep `repeat_forever=False` so the sequencer can report done.
 ## Scanning (named slots)
 
 Scanning uses named slots `s0, s1, ...`, not an `x`/`y` array. Bind any period
-duration, channel delay, or analog-bus DAC value to a slot, then provide an
-`N_points x N_slots` scan table:
+duration or analog-bus DAC value to a slot, then provide an
+`N_points x N_slots` scan table. A channel delay is a fixed per-channel output
+delay set through the API; it is never scanned:
 
 ```python
 state = na.PulseTableState.load("pulses/camera_imaging_address_switch.json")

@@ -1,6 +1,6 @@
 """Device contracts, virtual devices, and hardware adapters."""
 
-from .base import BaseDevice, CameraDevice, SequencerDevice, TrapArrayDevice, validate_device_contract
+from .base import BaseDevice, CameraDevice, SequencerDevice, TrapArrayDevice
 from .qcmos import DEFAULT_DCAM_MODULE, QCMOSCamera, QCMOSConfig
 from .sequencer import (
     PulseController,
@@ -36,6 +36,7 @@ _REGISTRY_EXPORTS = {
     "register_device_class",
     "resolve_class",
     "resolve_connect_config",
+    "validate_device_contract",
 }
 
 _PULSE_STREAMER_EXPORTS = {

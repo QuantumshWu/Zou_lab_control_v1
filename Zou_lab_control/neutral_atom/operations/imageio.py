@@ -115,6 +115,9 @@ def frame_files(folder: str | Path, prefix: str) -> dict[int, Path]:
 DEFAULT_SHOTS_PER_GROUP = 4
 DEFAULT_SHORT_SHOT = 3
 DEFAULT_REF_SHOTS = (1, 2, 4)
+# Shot indices are 1-based: ``index_run`` coerces ``short_shot`` via ``positive_int`` (>= 1),
+# so any form offering a shot index must bound it from HERE, never a re-typed 0/1.
+SHOT_INDEX_MIN = 1
 
 
 @dataclass
@@ -198,4 +201,4 @@ def index_run(
     )
 
 
-__all__ = ["RunIndex", "frame_files", "index_run", "load_frame", "save_frame"]
+__all__ = ["RunIndex", "SHOT_INDEX_MIN", "frame_files", "index_run", "load_frame", "save_frame"]

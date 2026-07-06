@@ -64,13 +64,17 @@ def _clk_enable_mask_for_channels(channels: Sequence[str], clk_channels: Sequenc
 
 @dataclass(frozen=True)
 class RuntimeBusDelay:
-    """One delayed analog DAC bus for the LITERAL per-bus delay line.
+    """One delayed analog DAC bus for the per-bus EVENT-SCHEDULED output delay.
 
     ``bus_index`` is the hardware bus; ``delay`` is the physical delay ``d`` in ticks
-    (>= 0 after the host folds the global negative-delay shift G, and bounded to the
-    delay-line depth).  The bus's UNDELAYED value stream is pushed into a 10-bit circular
-    buffer each tick and read ``d`` ticks ago (one delay shared by all 10 bits) -- the
-    DAC-value counterpart of a per-channel ``channel_delays`` entry."""
+    (>= 0 after the host folds the global negative-delay shift G, capped by the host's
+    ``TTL_DELAY_MAX_TICKS`` default -- the same 32-bit-field range as TTL delays).  Each
+    DA bit is its own 1-bit event-scheduler channel: when the UNDELAYED bus value changes,
+    each bit's new level is queued in that bit's event FIFO and pops exactly ``d`` ticks
+    later (``bus_out[t] = bus_undelayed[t - d]``); the 10 bits of a bus share one ``d`` so
+    the DAC value shifts coherently.  Storage scales with value-change events IN FLIGHT
+    (host-validated <= the per-bit FIFO depth), not with ``d`` -- the DAC-value counterpart
+    of a per-channel ``channel_delays`` entry."""
 
     bus_index: int
     delay: int

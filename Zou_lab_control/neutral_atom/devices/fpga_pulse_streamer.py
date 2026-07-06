@@ -303,7 +303,9 @@ def validate_pulse_streamer_program(
     if len(program.channels) > channel_count:
         raise ValueError(f"program uses {len(program.channels)} channels, but the FPGA streamer has {channel_count}.")
     # PER-CHANNEL TTL OUTPUT DELAY -- the EVENT SCHEDULER.  A delay is constant (never
-    # scanned), bounded only by its 32-bit field (TTL_DELAY_MAX_TICKS ~ 42.9 s) -- e.g.
+    # scanned); the register field is 32-bit, and the HOST enforces a conservative default
+    # cap of TTL_DELAY_MAX_TICKS = (1<<31)-1 ticks (~42.9 s at 20 ns, configurable via
+    # streamer_config.json ttl_delay_max_ticks) -- e.g.
     # millisecond emCCD delays.  The hardware constraint moves from delay LENGTH to
     # toggles IN FLIGHT: a channel may have at most EVT_FIFO_DEPTH toggles inside any
     # window of its own delay length (each in-flight toggle holds one event-FIFO slot).

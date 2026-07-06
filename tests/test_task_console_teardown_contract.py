@@ -68,7 +68,7 @@ def _open(on_close=None):
 
     node = _FakeNode()
     console = show_task_console(hub=SignalHub(), running_nodes=[node], on_close=on_close)
-    window = ensure_qt_app()._zlc_task_windows[-1]
+    window = ensure_qt_app()._zlc_retained_windows[-1]   # the ONE retain_window registry
     return console, window, node
 
 

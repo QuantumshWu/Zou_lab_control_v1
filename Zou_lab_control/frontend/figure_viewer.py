@@ -83,6 +83,7 @@ from .qt_fluent import (
     WINDOW_SCREEN_FRACTION,
     center_window_on_primary_screen,
     ensure_qt_app,
+    retain_window,
     scaled_px,
     window_pad,
     screen_fit_window_size,
@@ -945,9 +946,9 @@ def show_figure_viewer(path: str | Path | None = None, *, scale: float | None = 
     if viewer.console is not None:
         viewer.console._arrange_if_cards()
     viewer._zlc_window = window
-    if not hasattr(app, "_zlc_figure_windows"):
-        app._zlc_figure_windows = []
-    app._zlc_figure_windows.extend([window, viewer])
+    # The window owns the viewer (FluentWindow re-parents its widget), so retaining the
+    # window alone keeps both alive -- and the ONE registry prunes them when it dies.
+    retain_window(window)
     return viewer
 
 

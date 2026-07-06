@@ -87,7 +87,8 @@ Channel Names:   pulse 名字、总时长、可见 channel 的 display name。
 Delay / Scan:    FPGA clock(只读显示)、每通道 delay(ns/us)+X 清除按钮+clk 按钮。
 Period cards:    每个 period 的 duration/unit + scan 圆点(绑定 s0..)、
                  DAC bus 行(Edge/Ramp/Hold + 值 + scan 圆点)、channel on/off。
-Control:         Stop Pulse、On Pulse、Add/Del Column、Add/Del Bracket、Save/Load。
+Control:         On Pulse/Stop Pulse、Sync、Add Period/Remove、Add Bracket、
+                 Save/Load、Collapse。
 Channels:        Add Channel、Hide Off、Show All 和 visible/hidden 计数。
 Scan tab:        已绑定 slot 列表、代码生成/Load Array 两种 scan_table 来源、Run。
 ```
@@ -101,8 +102,11 @@ Preview y 轴显示 display label，例如 `trap/cooling/probe/emCCD`；如果�
 `On Pulse` 的语义和 API 一样：先读取当前 GUI state，按 attached sequencer 的
 clock/channel list 编译成 full-width edge table，`prepare` 上传，再 `fire`。如果
 GUI 只显示四路，上传仍然是完整 address-switch channel 宽度；没显示、没配置或被
-隐藏的 channel mask bit 都是 0。`Stop Pulse` 调用 sequencer safe/reset。GUI 没有
-独立 sync 按钮；等待 finite acquisition 完成属于 notebook/camera API。
+隐藏的 channel mask bit 都是 0。`Stop Pulse` 调用 sequencer safe/reset。`Sync`
+把设备上实际生效的脉冲程序拉回编辑器（sequencer 会记录每次成功 prepare 的
+PulseTableState 来源，无论它来自这个 GUI 还是 notebook/raw API 调用，比如
+`PulseController.on_pulse`）——在 GUI 之外改了设备后点它，GUI 就重新反映设备
+状态。等待 finite acquisition 完成属于 notebook/camera API。
 
 <!-- cell:code -->
 import Zou_lab_control.neutral_atom as na

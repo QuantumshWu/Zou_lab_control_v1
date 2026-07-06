@@ -55,6 +55,10 @@
 - **能机械强制的设计准则,必须写成测试,不能只留在文档里**(架构契约测试 / fitness function)。只写在 `.md` 里的准则会被(包括我自己,尤其长会话里局部模式匹配时)悄悄违背且无人报错——这正是整理这些 `.md` 却仍被违背的根因。所以:每立一条"所有 X 都必须 Y"的结构性准则(例:**所有 plot 都必须继承 `BaseLivePlot`** 才能复用 selectors/data_figure),就同时写一个会在违背时**失败**的测试(例:`tests/test_frontend_plot_contract.py`),并在准则旁注明强制它的测试。文档讲"为什么",测试保证"不退化"。
 - **借鉴参考实现:取原则,不照搬具体设计**。`references/` 里的实现(confocal GUI、rb87 readout 等)是灵感来源,要遵守的是上面这些**设计原则**,不是它们的具体形态/代码结构;有更干净的思路就用自己的,别为"照着参考写"而牺牲解耦或引入残留。
 - **前端密封 API**:几何/dpi/字号/配色/阴影/缩放**由 frontend 拥有**,外部只传数据。完整规则见 `frontend/AGENTS.md`(单一权威)——加任何前端公共参数前先读它,并把参数分类为 DATA(允许)还是 ART/几何(禁止)。
+- **信任边界:全部输入都是受信任的本地实验代码**(安全姿态只在这里声明一次)。
+  - 所有 exec/eval(pulse GUI Scan tab、pulse_table scan program、`signal_expr`、live fit 表达式、task_console 面板表达式)、pickle 载入(`np.load(allow_pickle=True)` 读保存图 .npz)、RPyC 序列器链路的输入,一律视为**受信任的本地实验代码**——GUI/notebook 是实验工具,不是沙箱,不做防御性输入校验;只运行/打开你自己或实验室写的东西。
+  - RPyC sequencer server 默认绑定 `0.0.0.0` 且开启 pickle,是**为隔离的实验室内网有意设计**的(`serve_runtime_sequencer`,sequencer.py);**绝不能暴露在共享/公共网络**——需要收紧时用 `--host` 绑定内网地址或防火墙隔离,不改协议。
+  - 新增 exec/eval/pickle 站点必须带标准行内注释标明受信任输入(现有样式:`# noqa: S102/S301/S307 - local experiment tool, trusted input`),让姿态在代码现场可见。
 - **改寄存器映射必带版本握手**:改 host↔RTL 的寄存器布局必须 bump 两边的 LAYOUT_ID 并在 prepare 时校验,不匹配明确报"重建+重启"(否则新主机配旧 bitstream 会踩进死字)。
 
 ---

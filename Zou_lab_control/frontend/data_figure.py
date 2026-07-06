@@ -1177,6 +1177,23 @@ class SavedFigure:
         return df
 
 
+def _load_saved_npz(path) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Read a ``DataFigure.save`` npz -- the ONE loader every saved-figure reopen path goes
+    through (:func:`load_figure` here and the static ``frontend.load`` in ``live``), so the
+    ``data_x`` / ``data_y`` / ``info`` triple is parsed in exactly one place.  ``info`` is
+    normalised to a plain dict (old payloads may carry none).
+
+    SECURITY: ``allow_pickle=True`` unpickles the ``info`` dict on read.  Saved-figure npz
+    are trusted local artifacts -- only open files you or your lab wrote."""
+    data = np.load(str(path), allow_pickle=True)  # noqa: S301 - local experiment tool, trusted input only
+    if "data_x" not in data.files or "data_y" not in data.files:
+        raise ValueError(f"{path} is not a DataFigure save (missing data_x/data_y).")
+    info = data["info"].item() if "info" in data.files else {}
+    if not isinstance(info, Mapping):
+        info = {}
+    return data["data_x"], data["data_y"], dict(info)
+
+
 def load_figure(path) -> SavedFigure:
     """Load a ``.npz`` saved by :meth:`DataFigure.save` into a :class:`SavedFigure`.
 
@@ -1185,13 +1202,8 @@ def load_figure(path) -> SavedFigure:
     (``.compatible_kinds()``) or re-render it (``.plot()`` / ``.plot(kind=...)``).  Robust to old
     payloads that carry only ``data_x`` / ``data_y`` and a minimal ``info``."""
     path = Path(path)
-    data = np.load(str(path), allow_pickle=True)
-    if "data_x" not in data.files or "data_y" not in data.files:
-        raise ValueError(f"{path} is not a DataFigure save (missing data_x/data_y).")
-    info = data["info"].item() if "info" in data.files else {}
-    if not isinstance(info, Mapping):
-        info = {}
-    return SavedFigure(data_x=data["data_x"], data_y=data["data_y"], info=info, path=path)
+    data_x, data_y, info = _load_saved_npz(path)
+    return SavedFigure(data_x=data_x, data_y=data_y, info=info, path=path)
 
 
 __all__ = ["DataFigure", "FitResult", "SavedFigure", "VALID_FIT_FUNCS", "load_figure"]

@@ -133,26 +133,31 @@ def _scan_dot_figure(path: Path) -> Path:
         from PyQt5 import QtWidgets
 
         from .. import devtools as dt
-        from ..qt_fluent import FluentScanLineEdit, Metrics, ensure_qt_app, set_fluent_scale
+        from ..qt_fluent import FluentScanLineEdit, Metrics, ensure_qt_app, fluent_scale, set_fluent_scale
 
         ensure_qt_app()
         dt.install_screenshot_font()
+        # The fluent scale is process-global: zoom for the print close-up, then ALWAYS
+        # restore the prior value (not a hard-coded 1.0) even if the render fails.
+        prior_scale = fluent_scale()
         set_fluent_scale(3.0)  # zoom so the dot geometry reads clearly in print
-        holder = QtWidgets.QWidget()
-        lay = QtWidgets.QVBoxLayout(holder)
-        lay.setContentsMargins(24, 20, 24, 20)
-        lay.setSpacing(20)
-        unbound = FluentScanLineEdit("20000")
-        bound = FluentScanLineEdit("20000")
-        bound.set_scan_bound(True, 2)
-        for widget in (unbound, bound):
-            widget.setFixedSize(440, Metrics.row_h())
-            lay.addWidget(widget)
-        holder.show()
-        dt.settle(holder, 600)
-        holder.grab().save(str(path))
-        set_fluent_scale(1.0)
-        return path
+        try:
+            holder = QtWidgets.QWidget()
+            lay = QtWidgets.QVBoxLayout(holder)
+            lay.setContentsMargins(24, 20, 24, 20)
+            lay.setSpacing(20)
+            unbound = FluentScanLineEdit("20000")
+            bound = FluentScanLineEdit("20000")
+            bound.set_scan_bound(True, 2)
+            for widget in (unbound, bound):
+                widget.setFixedSize(440, Metrics.row_h())
+                lay.addWidget(widget)
+            holder.show()
+            dt.settle(holder, 600)
+            holder.grab().save(str(path))
+            return path
+        finally:
+            set_fluent_scale(prior_scale)
     except Exception:
         return _placeholder_image(path, "扫描圆点：未绑定（空心）/ 已绑定（橙点+编号）")
 

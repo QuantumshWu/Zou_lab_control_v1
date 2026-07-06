@@ -229,3 +229,85 @@ def test_no_tab_is_clipped_at_any_realistic_width():
         assert all(bar.tabRect(i).right() <= right + 1 for i in range(bar.count())), \
             f"a tab is clipped past the bar edge at width {width} (close 'x' would be cut off)"
     w.deleteLater()
+
+
+def _flush_deferred_delete(app):
+    """Actually run pending ``deleteLater`` deletions: Qt5's ``processEvents()`` skips
+    DeferredDelete events, so they must be flushed explicitly for ``destroyed`` to fire."""
+    app.processEvents()
+    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    app.processEvents()
+
+
+@pytest.mark.skipif(QtWidgets is None, reason="PyQt5 not available")
+def test_retain_window_registry_prunes_dead_windows():
+    """``retain_window`` keeps every launched top-level GUI in the ONE app registry
+    (``app._zlc_retained_windows``) and PRUNES the entry when the window dies -- the three
+    launchers used to append to three separate app-level lists and never remove anything, so
+    repeated standalone opens retained closed windows (and their figures) forever."""
+    app = qf.ensure_qt_app()
+    w1 = qf.FluentWindow(widget=QtWidgets.QLabel("a"), title="retain-1")
+    w2 = qf.FluentWindow(widget=QtWidgets.QLabel("b"), title="retain-2")
+    w1.show(); w2.show(); _settle(app, 60)
+    qf.retain_window(w1)
+    qf.retain_window(w2)
+    registry = app._zlc_retained_windows
+    assert w1 in registry and w2 in registry
+    # destroying one window prunes ITS entry only
+    w1.deleteLater()
+    _flush_deferred_delete(app)
+    assert w1 not in registry, "a destroyed window must be pruned from the registry"
+    assert w2 in registry, "the live window stays retained"
+    # a genuine close of a non-hide-on-close window also prunes (the standalone-reopen leak)
+    w2.close()
+    _settle(app, 60)
+    assert w2 not in registry, "a genuinely closed window must be pruned"
+    w2.deleteLater()
+    _flush_deferred_delete(app)
+
+
+@pytest.mark.skipif(QtWidgets is None, reason="PyQt5 not available")
+def test_retain_window_keeps_hide_on_close_windows_retained():
+    """A ``hide_on_close`` window hides on X (the session-bound console/editor contract: a later
+    ``exp.task_console()`` restores the SAME interface), so its registry entry must SURVIVE the
+    close -- only genuine destruction prunes it."""
+    app = qf.ensure_qt_app()
+    win = qf.FluentWindow(widget=QtWidgets.QLabel("s"), title="retain-hide", hide_on_close=True)
+    win.show(); _settle(app, 60)
+    qf.retain_window(win)
+    registry = app._zlc_retained_windows
+    win.close()                                       # X -> hide, NOT a genuine close
+    _settle(app, 60)
+    assert win in registry, "a hide-on-close window stays retained across the X"
+    win.deleteLater()
+    _flush_deferred_delete(app)
+    assert win not in registry
+
+
+@pytest.mark.skipif(QtWidgets is None, reason="PyQt5 not available")
+def test_set_fluent_scale_warns_when_changed_under_live_windows(caplog):
+    """The fluent scale is PROCESS-GLOBAL by design (every window on a screen must agree on
+    control sizes), so the per-window ``scale=`` promise of the show_* launchers cannot hold:
+    changing the value while a FluentWindow is open logs a warning naming the conflict, while
+    requesting the value already in force (e.g. the automatic ``scale=None`` path resolving to
+    the same screen fit) stays SILENT."""
+    import logging
+
+    app = qf.ensure_qt_app()
+    win = qf.FluentWindow(widget=QtWidgets.QLabel("s"), title="scale-probe")
+    prior = qf.fluent_scale()
+    try:
+        different = 0.8 if abs(prior - 0.8) > 1e-9 else 0.9
+        with caplog.at_level(logging.WARNING, logger="Zou_lab_control.frontend.qt_fluent"):
+            caplog.clear()
+            qf.set_fluent_scale(prior)                # the value already in force -> silent
+            assert not [r for r in caplog.records if "process-global" in r.getMessage()], \
+                "re-setting the same scale must stay silent (the auto scale=None path)"
+            qf.set_fluent_scale(different)            # a DIFFERENT value under a live window -> warn
+            assert [r for r in caplog.records if "process-global" in r.getMessage()], \
+                "changing the process-global scale under a live window must log a warning"
+    finally:
+        caplog.clear()
+        qf.set_fluent_scale(prior)                    # restore for the other tests
+        win.deleteLater()
+        _settle(app, 60)

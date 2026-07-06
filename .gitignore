@@ -117,7 +117,19 @@ docs/**/*.sty
 
 # Scratch GUI verification screenshots (devtools output, not deliverables)
 /_gui_shots/
-pulses/
+
+# Pulse presets (pulses/): checked-in PulseTableState template .json ARE committable --
+# a new template needs no -f.  Only RUNTIME outputs are ignored: the GUI save bundle's
+# figure/data/scan sidecars (*.png/*.npz/*.npy hit the global rules above), its compiled
+# runtime program (<stem>_program.json), tests' scratch pulse files (pulses/_test_*),
+# unnamed timestamp saves (default pulse name pulse_YYYYMMDD_HHMMSS), and local
+# real-machine debug programs (T.json / T2.json / pulse_test.json).
+pulses/*_program.json
+pulses/_test_*
+pulses/pulse_[0-9]*.json
+pulses/T.json
+pulses/T2.json
+pulses/pulse_test.json
 
 # xsim litter (simulation runs anywhere in the tree)
 xsim.dir/

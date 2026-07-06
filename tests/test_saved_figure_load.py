@@ -159,6 +159,38 @@ def test_fit_is_stored_in_saved_info(tmp_path):
         plt.close("all")
 
 
+def test_saved_npz_has_one_loader_shared_by_both_public_paths():
+    """The saved-figure npz TRUST BOUNDARY is ONE function: ``data_figure._load_saved_npz`` holds
+    the only ``np.load(allow_pickle=True)`` in the frontend, and both public reopen paths
+    (``load_figure`` and the static ``frontend.load``) parse the ``data_x``/``data_y``/``info``
+    triple through it.  A static AST scan (mirroring ``test_save_capture_single_source``'s
+    guard), so even a lazily imported second copy is caught."""
+    import ast
+    import Zou_lab_control.frontend as frontend_pkg
+
+    pkg_dir = Path(frontend_pkg.__file__).resolve().parent
+    np_load_calls: dict[str, list[int]] = {}
+    for py in sorted(pkg_dir.rglob("*.py")):
+        tree = ast.parse(py.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "load" and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in ("np", "numpy")):
+                np_load_calls.setdefault(py.name, []).append(node.lineno)
+    assert set(np_load_calls) == {"data_figure.py"}, \
+        f"np.load outside the ONE saved-npz loader: {np_load_calls}"
+    # ... and every occurrence sits INSIDE _load_saved_npz (the single trust boundary)
+    df_tree = ast.parse((pkg_dir / "data_figure.py").read_text(encoding="utf-8"))
+    loader = next(n for n in ast.walk(df_tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "_load_saved_npz")
+    assert all(loader.lineno <= line <= loader.end_lineno for line in np_load_calls["data_figure.py"])
+    # live.load delegates to the SAME loader (the import is the delegation seam)
+    live_tree = ast.parse((pkg_dir / "live.py").read_text(encoding="utf-8"))
+    imported = [alias.name for node in ast.walk(live_tree) if isinstance(node, ast.ImportFrom)
+                and (node.module or "").endswith("data_figure") for alias in node.names]
+    assert "_load_saved_npz" in imported, "frontend.load must go through data_figure._load_saved_npz"
+
+
 def test_na_facade_exposes_load_figure(tmp_path):
     """``na.load_figure`` reaches the frontend LAZILY (the notebook one-liner
     ``na.load_figure('x.npz').info_summary()``) and returns the same SavedFigure."""

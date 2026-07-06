@@ -460,24 +460,6 @@ class TrapArrayDevice(BaseDevice):
         """Number of trap sites."""
 
 
-ROLE_BASES = {
-    "camera": CameraDevice,
-    "sequencer": SequencerDevice,
-    "trap_array": TrapArrayDevice,
-}
-
-
-def validate_device_contract(name: str, device: Any) -> None:
-    """Raise if a configured device does not inherit its required base class."""
-
-    expected = ROLE_BASES.get(name, BaseDevice)
-    if not isinstance(device, expected):
-        raise TypeError(
-            f"device {name!r} ({type(device).__name__}) must inherit {expected.__name__}. "
-            "Implement the appropriate BaseDevice subclass instead of relying on duck typing."
-        )
-
-
 def snap_subarray(roi, *, step: int, max_w: int, max_h: int):
     """Snap a REQUESTED sub-array window to a camera's valid sub-array grid.
 
@@ -519,5 +501,4 @@ __all__ = [
     "SequencerDevice",
     "TrapArrayDevice",
     "snap_subarray",
-    "validate_device_contract",
 ]

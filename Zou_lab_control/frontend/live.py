@@ -5771,12 +5771,9 @@ def load(path, *, kind: str | None = "auto", display: bool = True):
     ``kind`` defaults to ``"auto"`` (1d/2d inferred from ``data_x`` shape, the
     usual scan case); pass an explicit kind to reopen a ``hist``/``sites`` save.
     """
-    data = np.load(str(path), allow_pickle=True)
-    if "data_x" not in data.files or "data_y" not in data.files:
-        raise ValueError(f"{path} is not a DataFigure save (missing data_x/data_y).")
-    data_x = data["data_x"]
-    data_y = data["data_y"]
-    info = data["info"].item() if "info" in data.files else {}
+    from .data_figure import _load_saved_npz   # the ONE saved-npz loader (trust boundary lives there)
+
+    data_x, data_y, info = _load_saved_npz(path)
     labels = info.get("labels")
     plotter = plot(data_x, data_y, kind=kind, labels=labels, update=False,
                    display=display, data_figure=True)

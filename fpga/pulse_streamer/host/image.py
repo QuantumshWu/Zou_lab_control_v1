@@ -125,8 +125,9 @@ class StreamerParams:
     bus_seg_addr_width: int = 6
     bus_sel_width: int = 3
     # EVENT SCHEDULER (TTL channels AND DAC buses): a delay is queued TOGGLES against a free-running
-    # global counter, so a TTL delay is bounded only by its 32-bit field
-    # (ttl_delay_max_ticks ~ 42.9 s at 20 ns) -- e.g. millisecond emCCD delays.  The
+    # global counter.  The register field is 32-bit; the HOST enforces a conservative default
+    # cap of ttl_delay_max_ticks = (1<<31)-1 ticks (~42.9 s at 20 ns, configurable via
+    # streamer_config.json) -- e.g. millisecond emCCD delays.  The
     # constraint moves from delay LENGTH to toggles IN FLIGHT: at most evt_fifo_depth
     # toggles of one channel may fall inside any window of that channel's delay length
     # (validated at compile/pack time; sparse experiment triggers are far below this).
@@ -452,8 +453,9 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
     w[CtrlWords.BUS_COUNTS] = bus_counts
 
     # PER-CHANNEL TTL OUTPUT DELAY -- the EVENT SCHEDULER.  One 32-bit word per channel in
-    # the DELAY register region (0 = passthrough).  A delay is bounded by ttl_delay_max_ticks
-    # (32-bit field, ~42.9 s), NOT by the bus-ring depth; pack always writes ALL channel
+    # the DELAY register region (0 = passthrough).  A delay is bounded by the host's
+    # ttl_delay_max_ticks (conservative default (1<<31)-1 ticks ~ 42.9 s inside the 32-bit
+    # register field), NOT by the bus-ring depth; pack always writes ALL channel
     # words so stale delays from a previous program can never linger.
     channel_delays = [int(d) for d in (getattr(program, "channel_delays", None) or [])]
     for ch, d in enumerate(channel_delays):

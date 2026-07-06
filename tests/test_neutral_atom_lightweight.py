@@ -748,6 +748,61 @@ def test_repo_gitattributes_forces_crlf_for_batch_files():
     assert "*.bat text eol=crlf" in attrs
 
 
+def test_docs_delay_is_api_only_and_templates_use_repo_xdc():
+    """Doc-fact guard: a channel delay is a FIXED per-channel output delay -- API-set
+    only, never bound to a scan slot (single source: ``FIELD_KINDS`` in
+    ``timing/pulse_table.py``; ``bind_field("delay", ...)`` raises).  The docs must not
+    re-claim the old "duration/delay/DAC all scan" contract, and the notebook templates
+    must point at the in-repo default XDC (``fpga/board_config/board.xdc``), never the
+    archived ``references/source_archives`` copy."""
+
+    from Zou_lab_control.neutral_atom.timing.pulse_table import FIELD_KINDS
+
+    # Pin the implementation fact the docs must agree with (renames/changes turn this red).
+    assert FIELD_KINDS["delay"].scan is False and FIELD_KINDS["delay"].api is True
+    assert FIELD_KINDS["duration"].scan is True and FIELD_KINDS["dac"].scan is True
+
+    root = Path(__file__).resolve().parents[1]
+    docs = {
+        "README.md": (root / "README.md").read_text(encoding="utf-8"),
+        "pulses/README.md": (root / "pulses" / "README.md").read_text(encoding="utf-8"),
+        "docs/MAINTAINER_NOTES.md": (root / "docs" / "MAINTAINER_NOTES.md").read_text(encoding="utf-8"),
+        "neutral_atom_fpga_server notebook": "\n".join(
+            cell["source"] for cell in neutral_atom_fpga_server_cells()
+        ),
+    }
+    # The stale claim shapes: "delay" listed among the slot-bindable/scannable kinds.
+    # NOTE the duration/delay/DAC trigram is ONLY stale in a scan/slot clause -- an API
+    # slot legitimately binds all three kinds ("every API binding (a duration/delay/DAC
+    # handle)"), so the trigram is checked per line WITH scan/slot context.
+    stale_delay_scan = re.compile(
+        r"channel delay, or analog-bus DAC"
+        r"|period duration, channel delay, analog-bus DAC"
+        r"|[Dd]uration, delay, and DAC value can scan"
+        r"|DAC value \+ duration \+ delay scan"
+        r'|\{\s*"duration"\s*,\s*"delay"\s*,\s*"dac"\s*\}'
+    )
+    trigram = re.compile(r"duration\s*/\s*delay\s*/\s*DAC|delay\s*/\s*duration\s*/\s*DAC", re.I)
+    for name, text in docs.items():
+        match = stale_delay_scan.search(text)
+        assert match is None, f"{name} still claims delay is scannable: {match.group(0)!r}"
+        for line in text.splitlines():
+            if trigram.search(line) and re.search(r"scan|slot", line, re.I):
+                raise AssertionError(f"{name} still lists delay among the scan-bindable kinds: {line.strip()!r}")
+    # ... and the corrected contract is stated where the scan workflow is taught.
+    assert "never scanned" in docs["pulses/README.md"]
+
+    # Notebook templates must reference the shipped board XDC, not the archived copy.
+    templates_dir = root / "Zou_lab_control" / "frontend" / "content" / "notebook_templates"
+    offenders = [
+        path.name
+        for path in sorted(templates_dir.glob("*.cells.md"))
+        if "source_archives" in path.read_text(encoding="utf-8")
+    ]
+    assert offenders == [], f"notebook templates still reference the archived XDC: {offenders}"
+    assert "board_config" in docs["neutral_atom_fpga_server notebook"]
+
+
 def _user_facing_markdown_files(root):
     """Discover the current user-facing markdown set.
 

@@ -93,6 +93,7 @@ from .qt_fluent import (
     FluentWindow,
     center_window_on_primary_screen,
     ensure_qt_app,
+    retain_window,
     fluent_text_width,
     fluent_widget_stylesheet,
     scaled_px,
@@ -8229,9 +8230,7 @@ def show_task_console(
     window.setFixedSize(window.size())
     center_window_on_primary_screen(window, app)   # open centred, exactly like show_pulse_gui (consistency)
     window.show()
-    if not hasattr(app, "_zlc_task_windows"):
-        app._zlc_task_windows = []
-    app._zlc_task_windows.append(window)
+    retain_window(window)   # the ONE app-level registry; pruned when the window dies
     return console
 
 
