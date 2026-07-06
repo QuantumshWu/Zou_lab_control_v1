@@ -37,6 +37,7 @@ GUI-side consumer that interprets a declaration, exactly as the docstring of
 
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -356,6 +357,66 @@ class TextHandler(_StaticMixin, ParamWidgetHandler):
 
     def is_empty(self, widget) -> bool:
         return not widget.text().strip()
+
+
+class JsonHandler(ParamWidgetHandler):
+    """A JSON literal in a line edit -- a list / mapping / number (e.g. a device config's
+    channel list ``["ch00", "ch01"]``).  Typed: parsed with ``json.loads``, NEVER ``eval``'d;
+    blank = ``None`` (the consumer's own default applies).  The instant-apply path only
+    forwards a value while the text PARSES (mid-edit garbage keeps the last good value);
+    the explicit :meth:`read` raises ``ValueError`` so a form's gather can report the field
+    by name and block its Apply."""
+
+    @staticmethod
+    def _dumps(value) -> str:
+        return "" if value is None else json.dumps(value)
+
+    def build(self, decl, value, ctx):
+        seed = value if value is not None else decl.default
+        edit = FluentLineEdit(self._dumps(seed))
+        edit.setMinimumWidth(scaled_px(160, minimum=120))
+        edit.setPlaceholderText('JSON, e.g. ["ch11"] / {"x": 1}')
+        edit.setToolTip(decl.tooltip)
+
+        def _on(*_a):
+            if ctx.instant_apply is not None:
+                try:
+                    ctx.instant_apply(decl.key, self.read(edit))
+                except ValueError:
+                    pass                       # unparseable mid-edit: hold the last good value
+            ctx.on_change()
+
+        edit.textChanged.connect(_on)
+        return edit
+
+    def read(self, widget):
+        text = widget.text().strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid JSON ({exc.msg})") from exc
+
+    def write(self, widget, value):
+        widget.setText(self._dumps(value))
+
+    def is_empty(self, widget) -> bool:
+        return not widget.text().strip()
+
+    def refresh(self, widget, providers: RefreshProviders) -> None:
+        return None
+
+
+class DeviceRefHandler(ChoiceHandler):
+    """A ``$device:<entry>`` cross-reference to another entry of the SAME device config (a
+    constructor arg that takes a built device).  Same combo semantics as ``choice`` -- the
+    CONFIG EDITOR fills ``choices`` from the working config's other entry names (the decl
+    itself may carry none; only the editor knows the live config) -- but an unset required
+    reference counts as MISSING (a choice is never empty)."""
+
+    def is_empty(self, widget) -> bool:
+        return not str(widget.currentText()).strip()
 
 
 class PathHandler(_StaticMixin, ParamWidgetHandler):
@@ -761,6 +822,8 @@ PARAM_WIDGETS: dict[str, ParamWidgetHandler] = {
     "bool": BoolHandler(),
     "choice": ChoiceHandler(),
     "text": TextHandler(),
+    "json": JsonHandler(),
+    "device": DeviceRefHandler(),
     "path": PathHandler(),
     "signal": SignalHandler(),
     "signal_expr": SignalExprHandler(),

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+import re
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -49,6 +51,39 @@ class BaseDevice(ABC):
 
     def snapshot(self) -> dict[str, Any]:
         return {"type": type(self).__name__}
+
+    # ------------------------------------------------------------- config schema
+    # A device class DESCRIBES ITS OWN config form: the three hooks below are what a
+    # config editor (the device manager) renders and round-trips -- it never names a
+    # concrete class.  A new device gets a usable form for free (reflection over its
+    # ``__init__``); a class wanting better controls overrides ``config_params`` (e.g. a
+    # ``choice`` for a trigger line), and one whose constructor NESTS its options (the
+    # qCMOS config dataclass) also overrides the ``config_to_form`` / ``form_to_config``
+    # pair.  Values flow ``{"type", "params"}`` -> ``config_to_form`` -> form widgets ->
+    # ``form_to_config`` -> ``{"type", "params"}``; nothing here is ever ``eval``'d.
+
+    @classmethod
+    def config_params(cls) -> tuple:
+        """The :class:`~..core.params.ParamDecl` rows describing this class's config-entry
+        ``params`` -- the SINGLE declaration a device-manager form renders.  Default:
+        reflect ``cls.__init__`` (:func:`config_params_from_signature`): the keyword
+        parameters become typed rows (float/int/bool -> spin/switch, str -> text,
+        tuple/list/dict -> a JSON literal, a device-typed / domain-named arg -> a
+        ``$device:`` cross-reference choice)."""
+        return config_params_from_signature(cls)
+
+    @classmethod
+    def config_to_form(cls, params) -> dict:
+        """Map a config entry's ``params`` dict to the FLAT ``{key: value}`` the form
+        seeds its widgets from.  Identity for most classes; a class whose constructor
+        nests options (the qCMOS ``config`` dataclass) flattens them here."""
+        return dict(params or {})
+
+    @classmethod
+    def form_to_config(cls, values) -> dict:
+        """Map the flat form values back to the constructor ``params`` dict written into
+        the config entry -- the exact inverse of :meth:`config_to_form`."""
+        return dict(values or {})
 
 
 #: Device ACCESS MODES a logic node declares per device (its ``_devices`` mapping).
@@ -100,6 +135,110 @@ def read_only(device):
     for cls in type(device).__mro__:
         allowed.update(getattr(cls, "OBSERVE_API", ()))
     return ReadOnlyDevice(device, allowed)
+
+
+# --------------------------------------------------------------------- config-form reflection
+# The DEFAULT ``BaseDevice.config_params()``: turn a constructor signature into typed
+# ParamDecl rows.  Shared module-level helpers (not hidden inside the classmethod) so a
+# class overriding ``config_params`` can still reflect MOST of its signature and replace
+# just the rows it wants richer controls for (see ``PylonCamera.config_params``).
+
+
+def _json_ready_value(value):
+    """A signature default made JSON-round-trippable (tuples -> lists, keys -> str) so a
+    ``json``-kind row seeds with exactly what ``json.loads`` of its text would return."""
+    if isinstance(value, (tuple, list)):
+        return [_json_ready_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _json_ready_value(v) for k, v in value.items()}
+    return value
+
+
+def _annotation_param_kind(annotation, owner_module) -> str | None:
+    """Best-effort ParamDecl kind for an ``__init__`` annotation.  Under ``from __future__
+    import annotations`` the annotation is a STRING -- it is TOKEN-matched (never eval'd,
+    the trust posture of every form value): container tokens -> ``json``, scalar tokens ->
+    their kind, and a bare class name resolving (via the owner module's namespace, a plain
+    ``getattr``) to a :class:`BaseDevice` subclass -> a ``$device:`` reference."""
+    if annotation is inspect.Parameter.empty or annotation is None:
+        return None
+    if isinstance(annotation, type):
+        if issubclass(annotation, BaseDevice):
+            return "device"
+        return {bool: "bool", int: "int", float: "float", str: "text",
+                tuple: "json", list: "json", dict: "json"}.get(annotation)
+    text = str(annotation)
+    if re.search(r"\b(Sequence|Mapping|List|Tuple|Dict|list|tuple|dict)\b", text):
+        return "json"
+    for token, kind in (("bool", "bool"), ("int", "int"), ("float", "float"), ("str", "text")):
+        if re.search(rf"\b{token}\b", text):
+            return kind
+    bare = text.strip()
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", bare) and owner_module is not None:
+        target = getattr(owner_module, bare, None)
+        if isinstance(target, type) and issubclass(target, BaseDevice):
+            return "device"
+    return None
+
+
+def config_param_decl(name, *, default=inspect.Parameter.empty,
+                      annotation=inspect.Parameter.empty, owner_module=None, tooltip=""):
+    """ONE constructor parameter -> its typed :class:`~..core.params.ParamDecl` row.
+
+    Kind resolution order (first hit wins):
+
+    1. the param is NAMED after a registered device DOMAIN (``camera`` / ``sequencer`` /
+       ``trap_array`` / a lab-registered role) -> a ``device`` cross-reference (its value
+       is ``"$device:<entry>"``; the editor fills the choices from the working config);
+    2. a concrete default value declares its own kind (bool/int/float -> spin/switch,
+       str -> text, tuple/list/dict -> a JSON literal);
+    3. the annotation (:func:`_annotation_param_kind`);
+    4. free text.
+
+    A parameter with NO default is ``required`` (the form highlights it empty)."""
+    from ..core.params import ParamDecl
+
+    required = default is inspect.Parameter.empty
+    value = None if required else default
+    kind = None
+    from .registry import DEVICE_DOMAINS   # lazy: registry imports this module
+    if str(name) in DEVICE_DOMAINS:
+        kind = "device"
+    if kind is None and value is not None:
+        if isinstance(value, bool):
+            kind = "bool"
+        elif isinstance(value, int):
+            kind = "int"
+        elif isinstance(value, float):
+            kind = "float"
+        elif isinstance(value, str):
+            kind = "text"
+        elif isinstance(value, (tuple, list, dict)):
+            kind = "json"
+    if kind is None:
+        kind = _annotation_param_kind(annotation, owner_module) or "text"
+    if kind == "json":
+        value = _json_ready_value(value)
+    return ParamDecl(key=str(name), label=str(name).replace("_", " "), kind=kind,
+                     default=value, required=required, lo=-1e12, hi=1e12, tooltip=str(tooltip))
+
+
+def config_params_from_signature(cls) -> tuple:
+    """Reflect ``cls.__init__`` into the default config form (the base
+    :meth:`BaseDevice.config_params`): every keyword-assignable parameter becomes one
+    :func:`config_param_decl` row, in signature order (``self`` / ``*args`` / ``**kwargs``
+    skipped)."""
+    import sys
+
+    module = sys.modules.get(getattr(cls, "__module__", ""), None)
+    decls = []
+    for name, param in inspect.signature(cls.__init__).parameters.items():
+        if name == "self" or param.kind in (inspect.Parameter.VAR_POSITIONAL,
+                                            inspect.Parameter.VAR_KEYWORD):
+            continue
+        decls.append(config_param_decl(name, default=param.default,
+                                       annotation=param.annotation, owner_module=module))
+    return tuple(decls)
 
 
 #: The ONE "clear the ROI back to the full sensor" sentinel every camera ``configure(roi=...)``

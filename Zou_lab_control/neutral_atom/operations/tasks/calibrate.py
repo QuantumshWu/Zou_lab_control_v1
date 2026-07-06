@@ -15,8 +15,8 @@ from __future__ import annotations
 
 from Zou_lab_control._paths import CALIBRATION_DIR
 from ..calibration import SUPPORTED_THRESHOLD_METHODS
+from ...core.params import ParamDecl
 from ..logic import CalibrateReadoutTask
-from ..measurement import ParamDecl
 from ..task import TaskSpec
 from ..task_registry import task
 

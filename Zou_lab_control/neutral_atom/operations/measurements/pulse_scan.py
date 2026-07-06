@@ -43,7 +43,8 @@ from ...timing import (
     single_imaging_template,
     snap_scan_table,
 )
-from ..measurement import MeasurementSpec, ParamDecl
+from ...core.params import ParamDecl
+from ..measurement import MeasurementSpec
 from ..measurement_registry import measurement
 from ..signal_expr import SignalExpr
 

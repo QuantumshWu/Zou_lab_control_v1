@@ -1313,6 +1313,37 @@ class RemoteSequencer(SequencerDevice):
         if connect_on_init:
             self.open()
 
+    # ------------------------------------------------------------------ config schema (self-describing)
+    @classmethod
+    def config_params(cls):
+        """The remote-streamer form with USABLE prefills the bare reflection cannot know:
+        ``port`` defaults to the server's own serve default (read from
+        ``serve_runtime_sequencer``'s signature -- one source, never a re-typed magic
+        number) and ``channels`` to the FPGA bit-order names (``hardware_channel_names``,
+        the same list the bundled remote template carries).  ``host`` stays required --
+        only the lab knows its FPGA computer's address."""
+        import inspect as _inspect
+        from dataclasses import replace
+
+        from .base import config_params_from_signature
+        from .fpga_pulse_streamer import hardware_channel_names
+
+        serve_port = int(_inspect.signature(serve_runtime_sequencer).parameters["port"].default)
+        rows = []
+        for decl in config_params_from_signature(cls):
+            if decl.key == "host":
+                decl = replace(decl, tooltip="FPGA/Vivado computer address reachable from this "
+                                             "control computer (never 0.0.0.0).")
+            elif decl.key == "port":
+                decl = replace(decl, default=serve_port, required=False)
+            elif decl.key == "channels":
+                decl = replace(decl, kind="json", default=list(hardware_channel_names()),
+                               required=False,
+                               tooltip="Channel names in FPGA bit order (the server snapshot "
+                                       "overwrites these on connect).")
+            rows.append(decl)
+        return tuple(rows)
+
     def open(self) -> "RemoteSequencer":
         if self._conn is not None:
             if not getattr(self._conn, "closed", False):

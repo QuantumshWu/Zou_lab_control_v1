@@ -38,7 +38,7 @@ from typing import Any, Callable, ClassVar
 
 # Reuse the ONE declarative parameter type: same kind->widget mapping and the same
 # no-eval coercion the measurement form already uses (single source of truth).
-from .measurement import ParamDecl
+from ..core.params import ParamDecl
 from ._spec import REQUIRED, CatalogSpec
 
 

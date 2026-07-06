@@ -20,8 +20,9 @@ from __future__ import annotations
 
 from Zou_lab_control._paths import CALIBRATION_DIR, DEFAULT_CALIBRATION_FILE
 from ..calibration import ALL_READOUT_METHODS
+from ...core.params import ParamDecl
 from ..logic import FRAME_0, OccupancyProcessor
-from ..processor import ParamDecl, ProcessorSpec
+from ..processor import ProcessorSpec
 from ..processor_registry import processor
 
 # The canonical calibration file the Calibrate-readout task writes (its latest result), and the

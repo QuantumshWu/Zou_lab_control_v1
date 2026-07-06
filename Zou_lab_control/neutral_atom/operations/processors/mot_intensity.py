@@ -21,8 +21,9 @@ import numpy as np
 # default must never assume a producer prefix.  In the documented single-monitor-camera
 # flow this makes the processor work out of the box; a second camera instance's slugged
 # frame name is picked in the form.
+from ...core.params import ParamDecl
 from ..logic import FRAME_0, Processor, SignalExpr, DEFAULT_SOURCE
-from ..processor import ParamDecl, ProcessorSpec
+from ..processor import ProcessorSpec
 from ..processor_registry import processor
 from ..signal_expr import hub_namespace
 

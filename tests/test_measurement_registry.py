@@ -91,7 +91,8 @@ def test_dropping_a_module_in_the_package_is_autodiscovered(exp):
     new_file = pkg_dir / "zz_dropped_for_test.py"
     mod_name = "Zou_lab_control.neutral_atom.operations.measurements.zz_dropped_for_test"
     new_file.write_text(
-        "from ..measurement import MeasurementSpec, ParamDecl\n"
+        "from ...core.params import ParamDecl\n"
+        "from ..measurement import MeasurementSpec\n"
         "from ..measurement_registry import measurement\n"
         "@measurement\n"
         "def dropped_measurement(readout):\n"

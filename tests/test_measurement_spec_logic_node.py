@@ -23,9 +23,9 @@ if sys.path[0] != str(REPO_ROOT):
 
 import Zou_lab_control.neutral_atom as na
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
+from Zou_lab_control.neutral_atom.core.params import ParamDecl
 from Zou_lab_control.neutral_atom.operations.measurement import (
     MeasurementSpec,
-    ParamDecl,
     ScannedMeasurement,
 )
 from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode

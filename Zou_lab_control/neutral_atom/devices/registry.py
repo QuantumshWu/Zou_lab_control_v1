@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+from ..core.params import DEVICE_REF_PREFIX, is_device_ref
 from .virtual import virtual_config, virtual_config_with_overrides
 from .base import BaseDevice, CameraDevice, SequencerDevice, TrapArrayDevice
 
@@ -239,8 +240,8 @@ def load_devices(
     visiting: set[str] = set()
 
     def resolve(value):
-        if isinstance(value, str) and value.startswith("$device:"):
-            return build(value.split(":", 1)[1])
+        if is_device_ref(value):                       # "$device:<entry>" -- ONE prefix source
+            return build(value[len(DEVICE_REF_PREFIX):])
         if isinstance(value, list):
             return [resolve(item) for item in value]
         if isinstance(value, dict):

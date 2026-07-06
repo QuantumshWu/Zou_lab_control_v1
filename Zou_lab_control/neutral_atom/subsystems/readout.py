@@ -16,11 +16,11 @@ from ..core.utils import json_ready
 from ..operations import calibrate_sitemap_from_images, calibrate_threshold_from_images, detect_image
 from ..operations.fidelity import FidelityReport, characterize_readout
 from ..operations.imageio import DEFAULT_REF_SHOTS, DEFAULT_SHORT_SHOT, DEFAULT_SHOTS_PER_GROUP, index_run
+from ..core.params import ParamDecl
 from ..operations.measurement import (
     MeasurementSpec,
     NFramePlan,
     OtsuFidelityReducer,
-    ParamDecl,
     ScanAxis,
     ScanResult,
     ScannedMeasurement,

@@ -25,10 +25,11 @@ import numpy as np
 from Zou_lab_control._paths import resolve_under_project
 from Zou_lab_control._viewer_registry import active_plotter
 
+from ...core.params import ParamDecl
 from ...devices.base import CameraDevice
 from ...timing import resolve_fireable_template, single_imaging_template
 from ..logic import Task, TaskOutput
-from ..measurement import ParamDecl, triggered_frames
+from ..measurement import triggered_frames
 from ..task import TaskSpec
 from ..processors.mot_intensity import mot_roi_intensity
 from ..task_registry import task

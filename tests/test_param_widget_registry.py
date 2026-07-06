@@ -34,12 +34,12 @@ if sys.path[0] != str(REPO_ROOT):
 def _whitelisted_kinds() -> set[str]:
     """The set of kinds ParamDecl accepts -- read by probing its ``__post_init__``
     validator (the single source), not by re-typing the list."""
-    from Zou_lab_control.neutral_atom.operations.measurement import ParamDecl
+    from Zou_lab_control.neutral_atom.core.params import ParamDecl
     kinds: set[str] = set()
     # The known token universe to probe; ParamDecl raises on anything outside its
     # whitelist, so a kind survives this loop iff ParamDecl accepts it.
     candidates = [
-        "float", "int", "axis_range", "bool", "choice", "text", "path",
+        "float", "int", "axis_range", "bool", "choice", "text", "json", "device", "path",
         "signal", "signal_expr", "pulse_param", "pulse_slots",
         # decoys that must NOT be accepted (guards the probe itself)
         "bogus", "image", "spinbox",
@@ -111,7 +111,7 @@ def test_every_panel_param_kind_is_registry_handled():
     pytest.importorskip("PyQt5")
     from Zou_lab_control.frontend.param_widgets import PARAM_WIDGETS
     from Zou_lab_control.frontend.task_console import PANEL_PARAMS
-    from Zou_lab_control.neutral_atom.operations.measurement import ParamDecl
+    from Zou_lab_control.neutral_atom.core.params import ParamDecl
 
     for plot_kind, decls in PANEL_PARAMS.items():
         for decl in decls:

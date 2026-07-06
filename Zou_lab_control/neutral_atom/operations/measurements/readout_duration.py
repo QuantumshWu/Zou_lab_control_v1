@@ -24,8 +24,9 @@ from __future__ import annotations
 import numpy as np
 
 from ...core.analysis import positive_int
+from ...core.params import ParamDecl
 from ...timing import PROBE_TEMPLATE_PATH, PulseTableState, single_imaging_template
-from ..measurement import MeasurementSpec, ParamDecl, axis_range_tuple
+from ..measurement import MeasurementSpec, axis_range_tuple
 from ..measurement_registry import measurement
 from ._coupled_template import resolve_coupled_template
 

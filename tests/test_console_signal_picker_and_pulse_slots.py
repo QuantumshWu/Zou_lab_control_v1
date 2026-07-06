@@ -94,7 +94,7 @@ def test_logic_node_source_picker_groups_by_producer_with_human_labels_and_bare_
     (`signal_tree_groups`) the widget is built from, + that the panel reads a pick back by bare name."""
     from Zou_lab_control.frontend.task_console import MeasurementPanel
     from Zou_lab_control.frontend.param_widgets import signal_tree_groups, read_editable_combo
-    from Zou_lab_control.neutral_atom.operations.measurement import ParamDecl
+    from Zou_lab_control.neutral_atom.core.params import ParamDecl
     from Zou_lab_control.frontend.qt_fluent import FluentTreeComboBox
 
     names = ["occupancy_occupied", "occupancy_rate"]

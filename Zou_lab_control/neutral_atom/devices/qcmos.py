@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 import importlib
 import threading
 import time
@@ -11,7 +11,13 @@ from typing import Any, Sequence
 import numpy as np
 
 from ..core.analysis import nonnegative_int, positive_float, positive_int
-from .base import ROI_CLEAR_SENTINELS, AcquisitionCancelled, CameraDevice, snap_subarray
+from .base import (
+    ROI_CLEAR_SENTINELS,
+    AcquisitionCancelled,
+    CameraDevice,
+    config_param_decl,
+    snap_subarray,
+)
 from .camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS
 
 
@@ -146,6 +152,38 @@ class QCMOSCamera(CameraDevice):
         # the DCAM buffer depth of the current session + the next frame index to transfer.
         self._buf_alloc = 0
         self._next_frame = 0
+
+    # ------------------------------------------------------------------ config schema (self-describing)
+    @classmethod
+    def config_params(cls):
+        """The qCMOS config form: the :class:`QCMOSConfig` dataclass FIELDS flattened into
+        rows (the constructor nests them under ``params["config"]``; the editor should not
+        show one opaque JSON blob) plus the ``dcam_module`` driver path.  The
+        :meth:`config_to_form` / :meth:`form_to_config` pair does the flatten/regroup, so
+        the entry on disk keeps the exact nested shape ``QCMOSCamera(**params)`` consumes."""
+        rows = [config_param_decl(f.name, default=f.default, annotation=f.type,
+                                  owner_module=None)
+                for f in fields(QCMOSConfig)]
+        rows.append(config_param_decl("dcam_module", default=DEFAULT_DCAM_MODULE,
+                                      tooltip="DCAM driver module path (leave as shipped)."))
+        return tuple(rows)
+
+    @classmethod
+    def config_to_form(cls, params) -> dict:
+        params = dict(params or {})
+        form = dict(params.get("config") or {})
+        if "dcam_module" in params:
+            form["dcam_module"] = params["dcam_module"]
+        return form
+
+    @classmethod
+    def form_to_config(cls, values) -> dict:
+        values = dict(values or {})
+        dcam = values.pop("dcam_module", None)
+        out: dict[str, Any] = {"config": values}
+        if dcam not in (None, "", DEFAULT_DCAM_MODULE):
+            out["dcam_module"] = dcam
+        return out
 
     # ------------------------------------------------------------------ discovery (self-describing)
     @classmethod

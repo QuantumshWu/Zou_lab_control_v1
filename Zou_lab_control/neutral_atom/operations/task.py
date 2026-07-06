@@ -26,7 +26,7 @@ from typing import Any, Callable, ClassVar
 # coercion the measurement / processor forms use): a task declares its tunable
 # parameters as ParamDecls so the GUI auto-generates the SAME form, and build()
 # receives the validated values.
-from .measurement import ParamDecl
+from ..core.params import ParamDecl
 from ._spec import REQUIRED, CatalogSpec
 
 #: The default mid-run buffer key a task streams (``TaskSpec.mid_run_key``'s default) -- the ONE

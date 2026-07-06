@@ -17,8 +17,9 @@ from __future__ import annotations
 import numpy as np
 
 from ..fidelity import FidelityReport
+from ...core.params import ParamDecl
 from ..imageio import DEFAULT_SHORT_SHOT, DEFAULT_SHOTS_PER_GROUP, SHOT_INDEX_MIN
-from ..processor import ParamDecl, ProcessorContext, ProcessorSpec
+from ..processor import ProcessorContext, ProcessorSpec
 from ..processor_registry import processor
 
 # The form's upper bound on the group size.  ``short_shot`` must land in

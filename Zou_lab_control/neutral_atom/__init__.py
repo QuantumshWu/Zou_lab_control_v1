@@ -20,6 +20,7 @@ from .core.analysis import (
 )
 from .core.bimodal import BimodalFit, fit_bimodal, fit_bimodal_per_site, gaussian_fidelity
 from .core.calibration import TrapCalibration
+from .core.params import ParamDecl
 from .core.psf import SitePSF, fit_site_psfs, psf_signals
 from .devices import DEFAULT_DCAM_MODULE, QCMOSCamera, QCMOSConfig
 from .devices import (
@@ -82,7 +83,6 @@ from .operations import (
     MeasurementSpec,
     NFramePlan,
     OtsuFidelityReducer,
-    ParamDecl,
     LogicNode,
     ProcessorSpec,
     ReleaseRecapturePlan,

@@ -28,7 +28,14 @@ from typing import Sequence
 import numpy as np
 
 from ..core.analysis import positive_float
-from .base import ROI_CLEAR_SENTINELS, SOFTWARE_TRIGGER, CameraDevice, is_software_trigger, snap_subarray
+from .base import (
+    ROI_CLEAR_SENTINELS,
+    SOFTWARE_TRIGGER,
+    CameraDevice,
+    config_params_from_signature,
+    is_software_trigger,
+    snap_subarray,
+)
 from .camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS
 
 
@@ -81,6 +88,31 @@ class PylonCamera(CameraDevice):
         # awaited (the qCMOS message style); reset per arm, meaningless in free-run.
         self._armed_total: int | None = None
         self._grabbed = 0
+
+    # ------------------------------------------------------------------ config schema (self-describing)
+    @classmethod
+    def config_params(cls):
+        """The reflected form with the two GenICam ENUM knobs upgraded to ``choice`` rows:
+        ``trigger_source`` (``Software`` free-run or a hardware ``LineN``) and
+        ``pixel_format`` (the acA1920-155um's mono formats) -- typed picks instead of a
+        free string a typo would break at open()."""
+        from dataclasses import replace
+
+        rows = []
+        for decl in config_params_from_signature(cls):
+            if decl.key == "trigger_source":
+                decl = replace(decl, kind="choice",
+                               choices=(SOFTWARE_TRIGGER, "Line1", "Line2", "Line3", "Line4"),
+                               tooltip="Software = free-run (no wiring); a LineN is the Basler "
+                                       "hardware trigger input the FPGA edge drives.")
+            elif decl.key == "pixel_format":
+                decl = replace(decl, kind="choice", choices=("Mono8", "Mono12"),
+                               tooltip="Mono12 for dynamic range, Mono8 for speed.")
+            elif decl.key == "capture_trigger_channels":
+                decl = replace(decl, tooltip="Which SEQUENCER line the camera's hardware trigger "
+                                             "input is wired to (inert in Software free-run).")
+            rows.append(decl)
+        return tuple(rows)
 
     # ------------------------------------------------------------------ discovery (self-describing)
     @classmethod
