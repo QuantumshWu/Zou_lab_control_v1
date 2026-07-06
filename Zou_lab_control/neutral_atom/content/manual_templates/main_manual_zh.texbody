@@ -557,9 +557,8 @@ import Zou_lab_control.neutral_atom as na
 
 session = na.connect(config)          # config 决定虚拟 / 本地 / 远程
 
-session.timing.prepare(session.sequence)   # 把时间真相写进（虚拟或真实的）序列器
-result = session.readout.run()             # 触发开火 + 读出 + 检测
-session.history.append(result)             # 记入账本
+session.devices.sequencer.prepare(session.sequence)  # 把时间真相写进（虚拟或真实的）序列器
+result = session.readout.detect()   # 触发开火 + 读出 + 检测；结果自动记入 session.history 账本
 \end{codeblock}
 
 \section{走通一次真实实验：完整生命周期}
@@ -569,7 +568,7 @@ session.history.append(result)             # 记入账本
 \begin{enumerate}
 \item \tfocus{连接}：\pyapi{na.connect(config)} 创建会话，连上设备（\pyapi{session.devices}），初始化空历史、空校准、读出与时序子系统。
 \item \tfocus{定义时间}：构造或修改 \pyapi{session.sequence}（一个 \pyapi{PulseSequence}）。这是 timing 层的事，纯数据、无副作用。
-\item \tfocus{准备序列}：\pyapi{session.timing.prepare(...)} 把时间真相编译成 \pyapi{RuntimeSequenceProgram} 并写入序列器硬件（本地或远程）。从这一步起才真正"碰硬件"。
+\item \tfocus{准备序列}：\pyapi{session.devices.sequencer.prepare(...)} 把时间真相编译成 \pyapi{RuntimeSequenceProgram} 并写入序列器硬件（本地或远程）。从这一步起才真正"碰硬件"。
 \item \tfocus{校准（按需）}：若还没有校准，先做一次得到 \pyapi{TrapCalibration}，让会话持有它。读出要靠它把格点编号映射到相机像素几何。
 \item \tfocus{读出}：\pyapi{session.readout} 触发开火、采集\tfocus{原始图}、调用 operations 的检测算法、结合校准产出每个格点的占据判定。
 \item \tfocus{记账}：把本次结果追加进 \pyapi{session.history}。
@@ -589,13 +588,14 @@ seq = session.sequence
 # ……在此用 PulseSequence 的接口编辑周期 / 通道 / 扫描槽……
 
 # 3) 准备：把时间真相编译并写入序列器
-session.timing.prepare(seq)
+session.devices.sequencer.prepare(seq)
 
-# 4) 读出：开火 + 采原始图 + 检测 + 结合校准判定占据
-result = session.readout.run()
+# 4) 校准（按需）：检测站点几何、学习每站阈值，会话随即持有 TrapCalibration
+session.readout.sitemap()
+session.readout.thresholds()
 
-# 5) 记账
-session.history.append(result)
+# 5) 读出：开火 + 采原始图 + 检测 + 结合校准判定占据；结果自动记账进 history
+result = session.readout.detect()
 
 # 6) 离线分析历史（纯算法，无副作用，可复现）
 #    用 operations/ 与 core/analysis.py 处理 session.history
@@ -625,7 +625,7 @@ session.history.append(result)
 
 \begin{description}
 \item[我要改脉冲时长 / 通道延迟 / 扫描] 改 \pyapi{session.sequence}（timing 层，\filepath{sequence.py} / \filepath{pulse_table.py}）。
-\item[我要把序列送上硬件] 用 \pyapi{session.timing.prepare(...)}（subsystems 编排 → devices 上传，本地 \pyapi{RuntimeSequencer} 或远程 \pyapi{RemoteSequencer}）。
+\item[我要把序列送上硬件] 用 \pyapi{session.devices.sequencer.prepare(...)}（devices 上传，本地 \pyapi{RuntimeSequencer} 或远程 \pyapi{RemoteSequencer}）；要把 GUI 脉冲 / 扫描表绑上序列器反复 fire，用 \pyapi{session.timing.bind_pulse(...)} 拿一个 \pyapi{PulseController}。
 \item[我要拍一张原始图] 找相机 \pyapi{capture()}（devices/\filepath{qcmos.py}）——只会拿到原始像素，没有圈。
 \item[我要知道某格点在图上哪个像素] 问 \pyapi{TrapCalibration}（core/\filepath{calibration.py}），不要去问 \pyapi{TrapArrayDevice}。
 \item[我要从图里找原子 / 拟合 / 判定占据] 用 operations/ 的纯算法；在实验流程里由 \pyapi{session.readout} 编排调用。

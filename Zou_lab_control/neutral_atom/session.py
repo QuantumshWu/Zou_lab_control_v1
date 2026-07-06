@@ -13,8 +13,6 @@ import json
 
 import numpy as np
 
-from Zou_lab_control._paths import GENERATED_SEQUENCES_DIR
-from Zou_lab_control._clock import DEFAULT_CLOCK_HZ
 from .core.analysis import grid_shape_tuple
 from .core.calibration import TrapCalibration
 from .core.results import (
@@ -31,7 +29,6 @@ from .core.utils import html_summary, json_ready
 from .devices import CameraDevice, DeviceSet, SequencerDevice, load_devices, resolve_connect_config
 from .operations import calibrate_sitemap_from_images, calibrate_threshold_from_images, detect_image
 from .timing import PulseSequence, imaging_channel_kwargs, imaging_sequence
-from .timing.verilog import generate_verilog, write_verilog_bundle
 from .subsystems import ExperimentSubsystem, ReadoutSubsystem, TimingSubsystem
 
 
@@ -204,8 +201,9 @@ class NeutralAtomSession:
         name = str(camera) if camera else self.devices.default_camera_name()
         cam = self.devices[name]
         if exposure is not None:
-            cam.configure(exposure=float(exposure))
-            self.sequence = self._imaging_sequence(exposure=float(exposure), load=True)
+            # The ONE configure-imaging path (owned by the timing subsystem): write the
+            # exposure to THIS camera and rebuild the imaging sequence -- never hand-rolled.
+            self.timing.configure_imaging(exposure=float(exposure), camera=cam)
         sequence = self.sequence
         images = triggered_frames(cam, getattr(self.devices, "sequencer", None), sequence, int(frames))
         if not images:
@@ -226,18 +224,6 @@ class NeutralAtomSession:
         self.history.append(result)
         return result
 
-    def _configure_imaging(self, *, exposure: float | None = None, load: bool = True, trigger_width: float = 20e-6, pre_trigger: float = 100e-6) -> PulseSequence:
-        camera = getattr(self.devices, "camera", None)
-        if exposure is not None and hasattr(camera, "configure"):
-            camera.configure(exposure=exposure)
-        self.sequence = self._imaging_sequence(
-            exposure=self._camera_exposure() if exposure is None else exposure,
-            trigger_width=trigger_width,
-            pre_trigger=pre_trigger,
-            load=load,
-        )
-        return self.sequence
-
     def _imaging_sequence(self, **kwargs) -> PulseSequence:
         return imaging_sequence(**kwargs, **self._imaging_channel_kwargs())
 
@@ -250,41 +236,6 @@ class NeutralAtomSession:
         cam = getattr(self.devices, "camera", None)
         return imaging_channel_kwargs(getattr(self.devices, "sequencer", None),
                                       trigger_channel=getattr(cam, "primary_trigger_channel", None))
-
-    def _preflight(self, *, sequence: PulseSequence | None = None, verilog: bool = True) -> PreflightReport:
-        sequence = sequence or self.sequence
-        errors: list[str] = []
-        warnings: list[str] = []
-        sequencer = getattr(self.devices, "sequencer", None)
-        clock = getattr(sequencer, "clock_hz", DEFAULT_CLOCK_HZ)
-        channels = getattr(sequencer, "channels", None)
-        pulse_report = sequence.validate(clock_hz=clock, channels=channels)
-        errors.extend(pulse_report.errors)
-        warnings.extend(pulse_report.warnings)
-        build = None
-        if verilog and channels is not None:
-            try:
-                build = generate_verilog(sequence, channels=channels, clock_hz=clock, module_name="preflight_sequence")
-            except Exception as exc:
-                errors.append(str(exc))
-        return PreflightReport(
-            ok=not errors,
-            errors=errors,
-            warnings=warnings,
-            sequence_table=sequence.table(),
-            device_snapshot=self.devices.snapshot(),
-            verilog=build,
-        )
-
-    def _write_verilog(self, output_dir: str | Path = GENERATED_SEQUENCES_DIR, *, sequence: PulseSequence | None = None) -> Path:
-        sequence = sequence or self.sequence
-        sequencer = getattr(self.devices, "sequencer", None)
-        channels = getattr(sequencer, "channels", sequence.channels)
-        clock = getattr(sequencer, "clock_hz", DEFAULT_CLOCK_HZ)
-        pin_map = getattr(sequencer, "pin_map", None)
-        build = generate_verilog(sequence, channels=channels, clock_hz=clock, module_name="neutral_atom_sequence")
-        files = write_verilog_bundle(build, output_dir, pin_map=pin_map)
-        return files.verilog_path
 
     def load_calibration(self, path: str | Path) -> TrapCalibration:
         self._calibration = TrapCalibration.load(path)

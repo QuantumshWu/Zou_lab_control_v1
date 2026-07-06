@@ -126,10 +126,10 @@ def test_tick_tie_rounding_is_one_rule_on_both_snap_paths():
 # ------------------------------------------------------------------ PulseSequence schema
 def test_pulse_sequence_schema_identity_lives_on_the_class(tmp_path):
     """``PulseSequence`` carries ``schema`` / ``version`` as class attributes (same shape as
-    its sister ``PulseTableState``); writer, reader and the subsystem payload dispatcher all
+    its sister ``PulseTableState``); writer, reader and the timing-layer payload loader all
     read THEM -- the on-disk schema string is a persistence contract with one home."""
-    from Zou_lab_control.neutral_atom.subsystems.timing import TimingSubsystem
-    from Zou_lab_control.neutral_atom.timing import PulseSequence, PulseTableState, single_imaging_template
+    from Zou_lab_control.neutral_atom.timing import (
+        PulseSequence, PulseTableState, load_pulse_payload, single_imaging_template)
 
     assert isinstance(PulseSequence.schema, str) and PulseSequence.schema
     assert isinstance(PulseSequence.version, int)
@@ -141,14 +141,14 @@ def test_pulse_sequence_schema_identity_lives_on_the_class(tmp_path):
     with pytest.raises(ValueError):
         PulseSequence.from_dict({**payload, "schema": "nope"})
 
-    # the loader dispatches BOTH sister payloads by their class-owned schema
-    sub = object.__new__(TimingSubsystem)               # path payloads never touch the session
+    # the loader (owned by the DATA layer, beside the two classes) dispatches BOTH sister
+    # payloads by their class-owned schema
     seq_path = tmp_path / "seq.json"
     seq_path.write_text(json.dumps(payload), encoding="utf-8")
-    assert isinstance(TimingSubsystem._load_pulse_payload(sub, seq_path), PulseSequence)
+    assert isinstance(load_pulse_payload(seq_path), PulseSequence)
     table_path = tmp_path / "table.json"
     table_path.write_text(json.dumps(single_imaging_template().to_dict()), encoding="utf-8")
-    assert isinstance(TimingSubsystem._load_pulse_payload(sub, table_path), PulseTableState)
+    assert isinstance(load_pulse_payload(table_path), PulseTableState)
 
 
 # ------------------------------------------------------------------ pulse gate + times rule
@@ -192,3 +192,42 @@ def test_pulse_gate_fires_identically_at_every_entry_point():
     with pytest.raises(TypeError) as builder_err:
         exp.readout.build_detection_scan([0.005], pulse=object())
     assert str(builder_err.value) == msg
+
+
+# ------------------------------------------------------------ timing subsystem ownership
+def test_timing_orchestration_lives_on_the_subsystem_not_the_session():
+    """``exp.timing`` OWNS its orchestration bodies (the subsystems/base contract); the
+    session facade hosts NO shadow copies -- a forwarding shell whose logic lives on the
+    session is two homes for one capability and drifts (AGENTS §2 single source)."""
+    from Zou_lab_control.neutral_atom.session import NeutralAtomSession
+    from Zou_lab_control.neutral_atom.subsystems.timing import TimingSubsystem
+
+    for name in ("_configure_imaging", "_preflight", "_write_verilog", "_load_pulse_payload"):
+        assert not hasattr(NeutralAtomSession, name), (
+            f"session must not own {name}: the logic body belongs to TimingSubsystem")
+    for name in ("configure_imaging", "preflight", "write_verilog", "bind_pulse"):
+        assert callable(getattr(TimingSubsystem, name))
+
+
+def test_capture_routes_exposure_through_the_one_configure_imaging_path(monkeypatch):
+    """``capture(exposure=...)`` shares the ONE configure-imaging path (timing subsystem):
+    the named camera gets the exposure AND the session sequence is rebuilt around it --
+    never a hand-copied ``cam.configure`` + sequence rebuild inside capture."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.subsystems.timing import TimingSubsystem
+
+    exp = na.connect("virtual", sitemap={"grid_shape": (2, 3)})
+    calls: list[dict] = []
+    orig = TimingSubsystem.configure_imaging
+
+    def spy(self, **kwargs):
+        calls.append(kwargs)
+        return orig(self, **kwargs)
+
+    monkeypatch.setattr(TimingSubsystem, "configure_imaging", spy)
+    seq_before = exp.sequence
+    exp.capture(exposure=2e-3, display=False)
+    assert calls and calls[0]["exposure"] == pytest.approx(2e-3)
+    assert calls[0]["camera"] is exp.camera             # default capture camera == readout camera
+    assert exp._camera_exposure() == pytest.approx(2e-3)   # the camera really got it
+    assert exp.sequence is not seq_before               # and the imaging sequence was rebuilt
