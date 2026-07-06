@@ -74,13 +74,32 @@ def triggered_frames(camera, sequencer, sequence, frames: int = 1, *, stop=None)
     try:
         sequencer.prepare(program)
         sequencer.fire(program)
-        return camera.read_frames(frames, stop=stop)
+        out = camera.read_frames(frames, stop=stop)
+        # The camera has its frames, but a FINITE program may still be PLAYING past its last
+        # camera window (post-imaging reload / repump / reset segments carry no trigger edge).
+        # Returning here would let the caller's next prepare land on a still-RUNNING program --
+        # the AXI session treats that as an explicit switch and aborts it, silently truncating
+        # the tail on real hardware.  So wait for the program to actually finish: wait_done is
+        # fire-anchored, so the frame readout above already consumed most of the play time and
+        # this costs only the remainder.  The budget derives from the program's own duration
+        # (plus slack for readout/transport); a finite program that STILL is not done then is a
+        # wedged streamer -- fail LOUD, never quietly truncate the next shot instead.
+        if not getattr(program, "repeat_forever", False):
+            waiter = getattr(sequencer, "wait_done", None)
+            if callable(waiter):
+                budget = 2.0 * float(getattr(program, "duration", 0.0) or 0.0) + 5.0
+                if not waiter(timeout=budget):
+                    raise TimeoutError(
+                        f"sequencer did not finish the fired finite program within {budget:.1f} s "
+                        "after its frames were read -- the streamer is wedged (a truncated fire "
+                        "would silently cut the program's tail on the next prepare).")
+        return out
     except BaseException:
-        # A prepare / fire / read fault (an RPyC EOF mid-fire, a STATUS_UNDERFLOW stall, a cancel) must
-        # NOT leave the FPGA armed / loaded / firing -- drive the sequencer SAFE before re-raising, so a
-        # failed shot can never strand outputs high.  (The camera is stood down by the finally below.)
-        # On the SUCCESS path the sequencer is left as the caller set it -- a finite program has run to
-        # completion -- so this touches only the error path.
+        # A prepare / fire / read / wait fault (an RPyC EOF mid-fire, a STATUS_UNDERFLOW stall, a
+        # cancel, a wedged finite program) must NOT leave the FPGA armed / loaded / firing -- drive
+        # the sequencer SAFE before re-raising, so a failed shot can never strand outputs high.
+        # (The camera is stood down by the finally below.)  On the SUCCESS path the sequencer is
+        # left as the caller set it -- wait_done above has proven the finite program completed.
         try:
             sequencer.set_safe_state()
         except Exception:

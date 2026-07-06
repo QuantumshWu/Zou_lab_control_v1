@@ -1101,6 +1101,12 @@ class VirtualSequencer(SequencerDevice):
         # Latched once a finite scan has played its K sweeps: the scan reading then keeps returning
         # the SATURATED done value (not idle) until the next prepare/stop -- == the real backend.
         self._scan_done: bool = False
+        # When the FIRED finite program's playback completes on the wall clock (monotonic seconds),
+        # stamped at fire().  The ONE anchor every waiter converges to: the wired camera's finite
+        # read pacing (_finite_pace_until) and wait_done both wait to this same absolute instant,
+        # so read_frames + wait_done back to back cost the play time ONCE, never twice.  None =
+        # not fired yet (wait_done then anchors at its own call, the bare prepare+wait semantics).
+        self._finite_play_deadline: float | None = None
         # The virtual TRIGGER CABLES plugged into this streamer's output lines: each wired
         # camera registers a callback (see _TriggerWiredCamera._wire_to) that fire() invokes
         # with the fired program -- the software mirror of the electrical trigger edges the
@@ -1170,6 +1176,7 @@ class VirtualSequencer(SequencerDevice):
         # (the program's one-frame duration) so the scan reading reports "point K / N · sweep r".
         self._scan_done = False          # a fresh prepare clears any prior finite-scan done latch
         self._scan_fire_time = 0.0       # prepared but not yet fired -> scan_progress idles until fire()
+        self._finite_play_deadline = None  # fresh program: no playback in flight
         rows = list(getattr(sequence, "scan_table", None) or []) if isinstance(sequence, PulseTableState) else []
         if rows:
             self._scan_info = {
@@ -1199,6 +1206,14 @@ class VirtualSequencer(SequencerDevice):
         # firing (and must not make a later live read see a stale finite shot).
         if bool(getattr(self._prepared, "repeat_forever", False)):
             self._firing = self._prepared
+        else:
+            # Anchor the finite program's play deadline AT FIRE: every waiter (the wired camera's
+            # finite read pacing and wait_done below) waits to this same absolute instant, so a
+            # measurement that reads its frames and THEN waits for program completion pays the
+            # play time once -- exactly like real hardware, where the program ends when it ends,
+            # not "duration after whoever happens to ask".
+            self._finite_play_deadline = (
+                time.monotonic() + float(self._prepared.duration) * self.sleep_scale)
         # Stamp the wall-clock fire time for ANY streamed scan (a prepared scan_table), whether it is
         # a cyclic repeat_forever sweep OR a finite single-pass one (repeat_forever=False + scan_points):
         # ``_scan_progress`` derives the played-point count from this timestamp, so single-pass progress
@@ -1294,7 +1309,14 @@ class VirtualSequencer(SequencerDevice):
                 return True
             self.service.history.append({"action": "wait_done", "ok": False})
             return False
-        delay = float(self._prepared.duration) * self.sleep_scale
+        # Wait to the fire-anchored deadline, not "duration from now": read_frames' finite pacing
+        # already consumed the play time up to the SAME absolute instant, so a shot that reads its
+        # frames and then wait_done()s pays the remainder (≈0), never the duration twice.  A
+        # prepared-but-never-fired program keeps the bare prepare+wait semantics (full duration
+        # from this call).
+        if self._finite_play_deadline is None:
+            self._finite_play_deadline = time.monotonic() + float(self._prepared.duration) * self.sleep_scale
+        delay = max(0.0, self._finite_play_deadline - time.monotonic())
         if timeout is not None and delay > float(timeout):
             self.service.history.append({"action": "wait_done", "ok": False})
             return False

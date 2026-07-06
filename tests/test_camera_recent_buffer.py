@@ -93,3 +93,29 @@ def test_lazy_state_and_lock_are_created_once_atomically():
     cam = VirtualCamera(VirtualTrapArray(grid_shape=(2, 2), image_shape=(16, 16), seed=1), exposure=1e-3)
     assert cam._recent_state() is cam._recent_state()          # one buffer, never two
     assert cam._acquire_lock() is cam._acquire_lock()          # one lock, never two
+
+
+def test_triggered_frames_waits_for_the_finite_program_before_returning():
+    """B2: reading the frames back is NOT the end of a finite program -- the sequence may keep
+    playing past its last camera window (post-imaging reload / repump / reset segments carry no
+    trigger edge).  ``triggered_frames`` must therefore ``wait_done`` the fired finite program
+    BEFORE returning, so the caller's next ``prepare`` can never land on a still-RUNNING program
+    (the AXI session treats that as an explicit switch and aborts it -- silently truncating the
+    tail on real hardware).  Pinned on the call ORDER: every prepare after the first is preceded
+    by a wait_done for the previous shot."""
+    cam, seqr = _rig()
+    calls: list[str] = []
+    for name in ("prepare", "fire", "wait_done"):
+        real = getattr(seqr, name)
+        def _recorded(*a, _real=real, _name=name, **kw):
+            calls.append(_name)
+            return _real(*a, **kw)
+        setattr(seqr, name, _recorded)
+
+    _acquire(cam, seqr, 1)                            # two back-to-back finite shots
+    _acquire(cam, seqr, 1)
+    assert calls.count("wait_done") == 2, calls       # every finite shot waits its program out
+    # ORDER: ... fire -> wait_done -> (next) prepare -- the wait separates consecutive programs.
+    second_prepare = [i for i, c in enumerate(calls) if c == "prepare"][1]
+    first_wait = calls.index("wait_done")
+    assert first_wait < second_prepare, calls
