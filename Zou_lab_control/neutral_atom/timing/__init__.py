@@ -17,6 +17,7 @@ from .sequence import (
 from .pulse_table import (
     ANALOG_BUS_MODES,
     API_SLOT_KINDS,
+    BUS_SAFE_SIGNED_LEVEL,
     DELAY_MAX_TICKS,
     PROBE_TEMPLATE_PATH,
     SCAN_SLOT_KINDS,
@@ -58,6 +59,7 @@ __all__ = [
     "CONTROL_PORTS",
     "ANALOG_BUS_MODES",
     "API_SLOT_KINDS",
+    "BUS_SAFE_SIGNED_LEVEL",
     "DELAY_MAX_TICKS",
     "PROBE_TEMPLATE_PATH",
     "SCAN_SLOT_KINDS",
