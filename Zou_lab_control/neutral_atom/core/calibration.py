@@ -19,6 +19,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from .analysis import AtomDetection, centers_array, grid_shape_tuple, nonnegative_int, roi_counts, threshold_array
+from .bimodal import classify_threshold
 from .psf import psf_signals
 
 #: Readout-KIND for every readout method, the EXPLICIT dispatch table that decides how
@@ -223,7 +224,14 @@ class TrapCalibration:
 
         counts = np.asarray(self.signals(image, method=method), dtype=float)
         thresholds = self.thresholds_for(method)
-        occupied = counts > thresholds
+        # Occupancy classification is the ONE primitive ``bimodal.classify_threshold`` -- shared with
+        # the fidelity path -- not a re-inlined ``counts > thresholds`` here.  ``bright_above=True`` is
+        # the ENFORCED physical invariant of this fluorescence readout: a loaded site scatters photons
+        # and reads HIGHER, so occupancy is always "above threshold".  The training fit's per-site
+        # ``bright_above`` is therefore NOT stored as calibration state -- a site fitting bright_above=
+        # False means its two Gaussians are degenerate/mislabelled (a dead or contaminated site), a
+        # data-quality flag the fidelity report surfaces, never a per-site readout polarity to honour.
+        occupied = classify_threshold(counts, thresholds, bright_above=True)
         return AtomDetection(
             counts=counts,
             occupied=occupied,

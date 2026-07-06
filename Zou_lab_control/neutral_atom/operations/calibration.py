@@ -20,6 +20,7 @@ from typing import Sequence
 import numpy as np
 
 from ..core.analysis import (
+    centers_array,
     estimate_threshold_fidelity,
     find_site_centers,
     grid_shape_tuple,
@@ -63,8 +64,14 @@ def calibrate_sitemap_from_images(
     psf_half_width: int = 3,
     background: str = "annulus",
     display: bool = True,
+    centers=None,
 ) -> SitemapResult:
-    """Calibrate site centers (and, for ``method='psf'``, per-site PSF weights)."""
+    """Calibrate site centers (and, for ``method='psf'``, per-site PSF weights).
+
+    ``centers`` optionally reuses a site map ALREADY detected on the same reference frames (see
+    :func:`calibrate_all_methods_from_images`): centers are a property of the atom lattice, not the
+    readout method, so the expensive :func:`find_site_centers` runs once and is shared across the
+    box/psf/uniform readouts instead of re-detecting the same spots per method."""
 
     stack = [np.asarray(image, dtype=float) for image in images]
     if not stack:
@@ -76,7 +83,15 @@ def calibrate_sitemap_from_images(
     if method not in ALL_READOUT_METHODS:
         raise ValueError("method must be 'box', 'psf' (per-site) or 'uniform_psf' (one shared kernel).")
     average = np.mean(np.stack(stack, axis=0), axis=0)
-    centers = find_site_centers(average, grid_shape, ordering=ordering)
+    if centers is None:
+        centers = find_site_centers(average, grid_shape, ordering=ordering)
+    else:
+        # Reuse a site map detected on the SAME frames -- a property of the lattice, not the readout,
+        # so re-detecting per method would be wasted work AND a latent single-source risk (three
+        # "independent" detections that only happen to agree).  Count-checked against grid_shape.
+        centers = centers_array(centers)
+        if len(centers) != int(np.prod(grid_shape)):
+            raise ValueError("provided centers count must match the grid_shape product.")
     thresholds = np.zeros(len(centers), dtype=float)
     # Fingerprint the frame geometry the centers were detected on, so a later
     # ROI change is caught at readout (TrapCalibration.signals) instead of
@@ -201,12 +216,20 @@ def calibrate_all_methods_from_images(
     downstream :class:`~..logic.OccupancyProcessor` chooses box / per-site PSF / uniform
     PSF at read time -- the method is a READOUT choice, not a calibration choice."""
 
+    # Detect the site map ONCE on the reference average and SHARE it across all three methods -- the
+    # box sitemap finds the centers, psf/uniform_psf reuse those exact ones (find_site_centers, the
+    # per-site 2D-Gaussian refine, is the most expensive calibration step; re-running it identically
+    # per method was wasted work and let three "independent" detections drift instead of one source).
+    box_sitemap = calibrate_sitemap_from_images(
+        reference_images, grid_shape=grid_shape, ordering=ordering, roi_radius=roi_radius,
+        reducer=reducer, method="box", psf_half_width=psf_half_width, background=background, display=False)
+    shared_centers = box_sitemap.calibration.centers
     cals = {}
     for method in ALL_READOUT_METHODS:
-        sitemap = calibrate_sitemap_from_images(
+        sitemap = box_sitemap if method == "box" else calibrate_sitemap_from_images(
             reference_images, grid_shape=grid_shape, ordering=ordering, roi_radius=roi_radius,
             reducer=reducer, method=method, psf_half_width=psf_half_width,
-            background=background, display=False)
+            background=background, display=False, centers=shared_centers)
         result = calibrate_threshold_from_images(
             readout_images, sitemap.calibration, method=threshold_method, exposure=exposure, display=False)
         cals[method] = result.calibration
