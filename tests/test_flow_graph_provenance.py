@@ -113,10 +113,13 @@ def test_multi_input_figure_captures_a_branching_graph():
         # the processor node has TWO parents (the two cameras) -- the branch
         proc_id = next(nid for nid, n in by_id.items() if n["role"] == "processor")
         assert len(_parents(graph, proc_id)) == 2, "the fusing processor forks up to BOTH cameras"
-        # one edge per consumed signal, each labelled with the bare signal name it carries
+        # one edge per consumed signal -- BOTH cameras' edges are present (not folded into one by the
+        # shared bare name), each labelled with the bare signal name it carries.  Assert the EDGE COUNT
+        # directly: the previous ``{signal}`` set assertion deduped "frame_0"+"frame_0" to one element
+        # and so could not tell a fused single edge from the correct two.
         into_proc = [e for e in graph["edges"] if str(e["to"]) == proc_id]
-        assert {e.get("signal") for e in into_proc} == {"frame_0", "frame_0"} or \
-            {e.get("signal") for e in into_proc} == {"frame_0"}
+        assert len(into_proc) == 2, f"the fusing processor keeps ONE edge per camera, got {len(into_proc)}"
+        assert all(e.get("signal") == "frame_0" for e in into_proc), "each edge carries its bare signal name"
         assert all(e.get("shape") for e in into_proc), "each upstream edge carries the block shape"
     finally:
         exp.close()
