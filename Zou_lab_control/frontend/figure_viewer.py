@@ -247,7 +247,7 @@ class LoadedFigureNode(LogicNode):
             ps = _as_tuple_or_none(entry.get("points_shape"))
             ds = _as_tuple_or_none(entry.get("data_shape"))
             self._blocks[bare] = block
-            self._specs[bare] = SignalSpec(self.prefix + bare, label, unit,
+            self._specs[bare] = SignalSpec(bare, label, unit,
                                            f"the saved figure's {role} block ({name})",
                                            points_shape=ps, data_shape=ds)
             self._role_key[role] = bare
@@ -264,7 +264,7 @@ class LoadedFigureNode(LogicNode):
         plots it verbatim.  A site map here has NO frame (none was stored) -- rings + occupancy only."""
         def add(bare: str, block: np.ndarray, label: str, unit: str, desc: str, role: str) -> None:
             self._blocks[bare] = np.asarray(block, dtype=float)
-            self._specs[bare] = SignalSpec(self.prefix + bare, label, unit, desc)
+            self._specs[bare] = SignalSpec(bare, label, unit, desc)
             self._role_key[role] = bare
 
         if kind in ("2d",):
@@ -296,7 +296,7 @@ class LoadedFigureNode(LogicNode):
         n_periods = float(len(self.pulse_state.periods)) if self.pulse_state is not None else 0.0
         self._blocks[FIG_VALUE_KEY] = np.array([n_periods], dtype=float)   # numeric placeholder for the hub
         self._specs[FIG_VALUE_KEY] = SignalSpec(
-            self.prefix + FIG_VALUE_KEY, str(saved.name or "pulse"), "",
+            FIG_VALUE_KEY, str(saved.name or "pulse"), "",
             "the saved pulse figure (its PulseTableState is carried on the node, read via the provider)")
         self._role_key["value"] = FIG_VALUE_KEY
 
@@ -311,7 +311,7 @@ class LoadedFigureNode(LogicNode):
         n_cells = float(len(self.grid_recipe.get("per_cell", []))) if self.grid_recipe is not None else 0.0
         self._blocks[FIG_VALUE_KEY] = np.array([n_cells], dtype=float)    # numeric placeholder for the hub
         self._specs[FIG_VALUE_KEY] = SignalSpec(
-            self.prefix + FIG_VALUE_KEY, str(saved.name or "grid"), "",
+            FIG_VALUE_KEY, str(saved.name or "grid"), "",
             "the saved grid figure (its replay recipe is carried on the node, read via the provider)")
         self._role_key["value"] = FIG_VALUE_KEY
 
@@ -368,10 +368,13 @@ class LoadedFigureNode(LogicNode):
         return self.prefix + self._role_key.get("value", FIG_VALUE_KEY)
 
     # ------------------------------------------------------------- hub contract
-    def published_signals(self) -> frozenset:
-        return frozenset(self.prefix + bare for bare in self._blocks)
+    def _bare_published_signals(self) -> frozenset:
+        return frozenset(self._blocks)
 
-    def output_specs(self) -> tuple[SignalSpec, ...]:
+    def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
+        # BARE-name specs; the base's output_specs re-keys them by the one prefix rule, so a
+        # consumer's signal_spec(full fig_* name) lookup matches (the old override returned the
+        # bare-name specs unprefixed -- a full-name lookup could never hit them).
         return tuple(self._specs[bare] for bare in self._blocks)
 
     def shot(self) -> dict[str, object]:

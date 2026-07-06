@@ -351,25 +351,53 @@ class LogicNode:
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def published_signals(self) -> frozenset:
-        """The signal names this logic node publishes (behind ``prefix``).  Lets a
-        consumer (e.g. the task console) map a panel back to the node that
-        produces its data, then expose THAT node's parameters.  Subclasses with
-        a fixed signal set override this; the base publishes nothing structured."""
+    def _bare_published_signals(self) -> frozenset:
+        """The SHORT (un-prefixed) signal names this node emits -- exactly the keys its
+        :meth:`shot` returns.  Subclasses declare THEIR bare names here and nowhere else:
+        the base owns the ONE prefix rule (:meth:`published_signals` == ``prefix + bare``),
+        the same joining :meth:`step` applies at publish time -- so a node's declaration and
+        its publication can never drift, and no subclass ever hand-spells the prefix."""
         return frozenset()
 
+    def _unprefixed_published_signals(self) -> frozenset:
+        """Signals this node RELAYS under their canonical bare names, prefix NOT applied --
+        an explicit, documented adapter, never a default.  The one user is the pulse scan
+        republishing the camera's ``frame_i`` (#E1): the scan REPLACES the camera as the
+        device driver, so a frame consumer (the occupancy judge) keeps its binding whichever
+        one drives.  Empty everywhere else."""
+        return frozenset()
+
+    def published_signals(self) -> frozenset:
+        """The FULL hub names this node publishes: the bare declaration behind ``prefix``
+        (the base's one joining rule, mirroring :meth:`step`'s publish-time join) plus any
+        declared unprefixed relays.  FINAL by convention -- subclasses declare bare names via
+        :meth:`_bare_published_signals`, they never re-spell the join (contract-tested)."""
+        names = {self.prefix + str(n) for n in self._bare_published_signals()}
+        names.update(str(n) for n in self._unprefixed_published_signals())
+        return frozenset(names)
+
+    def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
+        """One :class:`SignalSpec` per BARE output name -- the LABEL / unit / one-line meaning
+        the GUI shows.  The base derives a plain spec (label = name) for every declared bare
+        name; a measurement/processor overrides this to give each output a real label, unit
+        and description -- spelled on the SHORT name, the prefix join stays the base's."""
+        return tuple(SignalSpec(str(name), str(name))
+                     for name in sorted({*self._bare_published_signals(),
+                                         *self._unprefixed_published_signals()}))
+
     def output_specs(self) -> tuple[SignalSpec, ...]:
-        """One :class:`SignalSpec` per published signal -- the LABEL / unit / one-line
-        meaning the GUI shows (plot axis label, the "publishes" legend).  The base
-        derives a bare spec (label = name) for every :meth:`published_signals` entry;
-        a measurement/processor OVERRIDES this to give each output a real label, unit
-        and description so a plot reads its axis from the producing node, not a
-        hard-coded per-kind string.  Single source -- the node owns what its outputs
-        mean."""
-        return tuple(SignalSpec(str(name), str(name)) for name in sorted(self.published_signals()))
+        """The published-name specs: each bare spec re-keyed by the SAME prefix rule
+        :meth:`published_signals` uses (an unprefixed relay keeps its bare name), so a
+        consumer's ``signal_spec(full_hub_name)`` lookup always matches.  FINAL by
+        convention -- subclasses override :meth:`_bare_output_specs` only."""
+        from dataclasses import replace as _dc_replace
+        unprefixed = {str(n) for n in self._unprefixed_published_signals()}
+        return tuple(spec if str(spec.name) in unprefixed
+                     else _dc_replace(spec, name=self.prefix + str(spec.name))
+                     for spec in self._bare_output_specs())
 
     def signal_spec(self, name: str) -> SignalSpec | None:
-        """The :class:`SignalSpec` for one published signal name, or ``None``."""
+        """The :class:`SignalSpec` for one published (FULL) signal name, or ``None``."""
         for spec in self.output_specs():
             if spec.name == str(name):
                 return spec
@@ -723,8 +751,8 @@ class Processor(LogicNode):
         out = self.transform(inputs)
         return self._assert_declared(out, self.output_keys())
 
-    def published_signals(self) -> frozenset:
-        return frozenset(self.prefix + key for key in self.output_keys())
+    def _bare_published_signals(self) -> frozenset:
+        return frozenset(str(key) for key in self.output_keys())
 
 
 class OccupancyProcessor(Processor):
@@ -896,7 +924,7 @@ class OccupancyProcessor(Processor):
             "frame_judged": block,                          # (repeat, 1, H, W) -- the SAME single-point frame
         }
 
-    def output_specs(self) -> tuple[SignalSpec, ...]:
+    def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
         """Label + meaning of each detection signal (the readout pipeline's outputs), each with its
         OWN repeat-contract structure (#H3s-F3) -- so a consumer reads each signal's points/data slot,
         not one node-level triple that can only be right for one of them:
@@ -909,21 +937,21 @@ class OccupancyProcessor(Processor):
             NOT a per-shot block: points/data ``None`` (no repeat contract), consumed by a rolling monitor.
           * ``centers`` / ``thresholds`` -- STATIC geometry with NO repeat axis: they leave points/data
             ``None`` (no contract slot), so a consumer prints their raw shape ``(N, 2)`` / ``(N,)``."""
-        p = self.prefix
         # (n_sites,) / (H, W) once judged, else None -- BEFORE the first judge the data width is unknown,
         # so the signal declares NO contract slot yet (None, not the illegal empty ()); once judged it is
         # the uniform (repeat, 1, *data) block.  points_shape pairs with data_shape: both known or both None.
+        # BARE names throughout -- the base's output_specs applies the one prefix rule.
         sites = tuple(self.data_shape) if self.data_shape else None
         frame = tuple(self.frame_shape) if self.frame_shape else None
         return (
-            SignalSpec(p + "occupied", "occupancy", "", "per-site per-shot occupancy (0 / 1); average = loading probability",
+            SignalSpec("occupied", "occupancy", "", "per-site per-shot occupancy (0 / 1); average = loading probability",
                        points_shape=((1,) if sites else None), data_shape=sites),
-            SignalSpec(p + "counts", "readout counts", "", "per-site per-shot integrated readout signal",
+            SignalSpec("counts", "readout counts", "", "per-site per-shot integrated readout signal",
                        points_shape=((1,) if sites else None), data_shape=sites),
-            SignalSpec(p + "rate", "loading rate", "", "loading fraction of this block (scalar) -> rolling-trace monitor / scan y"),
-            SignalSpec(p + "centers", "site centre", "px", "site centres in camera pixels (N, 2)"),
-            SignalSpec(p + "thresholds", "threshold", "counts", "per-site bright/dark count threshold"),
-            SignalSpec(p + "frame_judged", "camera image", "counts",
+            SignalSpec("rate", "loading rate", "", "loading fraction of this block (scalar) -> rolling-trace monitor / scan y"),
+            SignalSpec("centers", "site centre", "px", "site centres in camera pixels (N, 2)"),
+            SignalSpec("thresholds", "threshold", "counts", "per-site bright/dark count threshold"),
+            SignalSpec("frame_judged", "camera image", "counts",
                        "the EXACT frame this occupancy was judged from -- shot-locked to occupied/centers "
                        "(one atomic publish).  Use THIS for a 2D readout image that matches the site map "
                        "(same shot); the camera's live `frame` advances independently and is NOT shot-locked.",
@@ -1023,12 +1051,12 @@ class Task(LogicNode):
             self.step()
         return self
 
-    def published_signals(self) -> frozenset:
-        # A task publishes nothing to the hub (its result lives on the instance, its
-        # mid-run output in self.output) -- so it provides no hub signal name.  What it
-        # PRODUCES (``provides`` result keys + ``mid_run`` stream keys) is documented by
-        # the console from those public attrs, with shapes read off real values.
-        return frozenset()
+    def output_specs(self) -> tuple[SignalSpec, ...]:
+        # A task publishes nothing to the hub (its result lives on the instance, its mid-run
+        # output in self.output), so the base's hub-prefix join does not apply: its output
+        # specs stay keyed by the BARE ``provides`` / ``mid_run`` names the console documents
+        # them under.  (published_signals is the base's empty bare set -- no hub names.)
+        return self._bare_output_specs()
 
 
 class CalibrateReadoutTask(Task):
@@ -1069,7 +1097,7 @@ class CalibrateReadoutTask(Task):
         return resolve_pulse_template(pulse_template, default_name=cls.DEFAULT_PULSE_TEMPLATE,
                                       default_factory=default_imaging_template)
 
-    def output_specs(self) -> tuple[SignalSpec, ...]:
+    def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
         """What the calibration PRODUCES (off the hub) + streams mid-run -- keyed by the
         bare ``provides`` / ``mid_run`` names so the console legend reads e.g.
         ``centers (result)  (35, 2)  fitted site coordinates``."""
@@ -1631,22 +1659,21 @@ class CameraMeasurement(Measurement):
             self._stop.set()
         return self._assert_primary_shape(out)           # frame_0 == (repeat, 1, H, W) -- contract guard
 
-    def published_signals(self) -> frozenset:
+    def _bare_published_signals(self) -> frozenset:
         # ONE block per emCCD event; no lumped `frame`.  Same source as the console's declared picker.
-        return frozenset(camera_frame_keys(self.frames_per_cycle, self.prefix))
+        return frozenset(camera_frame_keys(self.frames_per_cycle))
 
-    def output_specs(self) -> tuple[SignalSpec, ...]:
+    def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
         """Camera outputs: ONE ``frame_i`` per emCCD event of the cycle, each a ``(repeat, 1, H, W)``
         block (repeat × ONE point × the H×W image) -- a panel reduces ITS repeat axis (repeat_mode:
         average = the long exposure of THAT specific emCCD event).  There is NO lumped ``frame``."""
         specs = []
-        for name in sorted(self.published_signals()):
-            bare = name[len(self.prefix):] if self.prefix and name.startswith(self.prefix) else name
+        for bare in sorted(self._bare_published_signals()):
             i = bare.split("_")[-1]
             desc = (f"emCCD event {i} of the cycle: (repeat, 1, H, W) block -- plot reduces repeats "
                     f"(average = long exposure of event {i}).  LIVE camera, advances independently of the "
                     "readout: for a 2D image shot-locked to the site map, bind Judge-occupancy `frame_judged`.")
-            specs.append(SignalSpec(name, "camera image", "counts", desc))
+            specs.append(SignalSpec(bare, "camera image", "counts", desc))
         return tuple(specs)
 
     def acquisition_parameters(self) -> dict[str, object]:
@@ -1888,23 +1915,22 @@ class ScannedMeasurementNode(_SweptBlockMeasurement):
             "scan_done": 1.0 if self.finished else 0.0,
         })
 
-    def published_signals(self) -> frozenset:
-        return frozenset(self.prefix + key for key in (self.x_key, self.y_key, "scan_done"))
+    def _bare_published_signals(self) -> frozenset:
+        return frozenset((self.x_key, self.y_key, "scan_done"))
 
-    def output_specs(self) -> tuple[SignalSpec, ...]:
+    def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
         """x / y axis labels + units come from the swept measurement itself (the scan AXIS for x,
         the REDUCER labels for the curve).  ``y_key`` is the RAW ``(repeat, points, dim)`` block --
         a plot reduces its repeat axis per ``repeat_mode``."""
-        p = self.prefix
         axis = self.measurement.axis
         rlabels = tuple(self.measurement.reducer.labels)          # (xlabel, ylabel, zlabel)
         ylabel = rlabels[1] if len(rlabels) > 1 else self.y_key
         xlabel = str(getattr(axis, "label", "x"))
         xunit = str(getattr(axis, "unit", ""))
         return (
-            SignalSpec(p + self.x_key, xlabel, xunit, "scan x axis (the swept parameter)"),
-            SignalSpec(p + self.y_key, ylabel, "", "raw (repeat, points, dim) block; plot reduces repeats"),
-            SignalSpec(p + "scan_done", "scan complete", "", "1 once the final point is measured"),
+            SignalSpec(self.x_key, xlabel, xunit, "scan x axis (the swept parameter)"),
+            SignalSpec(self.y_key, ylabel, "", "raw (repeat, points, dim) block; plot reduces repeats"),
+            SignalSpec("scan_done", "scan complete", "", "1 once the final point is measured"),
         )
 
 
@@ -2009,33 +2035,36 @@ class PulseScanNode(_SweptBlockMeasurement):
         dims = tuple(int(n) for n in self.scan_shape)
         return self._publish_raw()[:, :, 0].reshape(self._ring, *dims)
 
-    def published_signals(self) -> frozenset:
-        """The signals this scan publishes (behind ``prefix``): the swept x axis, the RAW y block,
-        the scan-done flag, the frame it fires, plus (2-D scan) the raw block reshaped into the grid.
-        Declaring them lets the console map a panel back to THIS node (so the 1-D frame-title reads
-        ``<y> <- pulse_scan``) and resolve x.  Both y signals are RAW (repeat-axis kept) -- the PLOT
+    def _bare_published_signals(self) -> frozenset:
+        """The scan's OWN outputs (behind ``prefix``): the swept x axis, the RAW y block, the
+        scan-done flag, plus (2-D scan) the raw block reshaped into the grid.  Declaring them lets
+        the console map a panel back to THIS node (so the 1-D frame-title reads ``<y> <-
+        pulse_scan``) and resolve x.  Both y signals are RAW (repeat-axis kept) -- the PLOT
         reduces them; the node never combines repeats."""
-        p = self.prefix
-        # ONE source of the camera-frame names (no lumped ``frame``): pulse-scan fires ONE trigger per
-        # point, so it publishes the same ``frame_0`` a single-cycle CameraMeasurement does (#E1).
-        keys = [p + self.x_key, p + self.y_key, p + "scan_done", *camera_frame_keys(1)]
+        keys = [self.x_key, self.y_key, "scan_done"]
         if self.scan_shape is not None:
-            keys.append(p + self.y_key + "_grid")
+            keys.append(self.y_key + "_grid")
         return frozenset(keys)
 
-    def output_specs(self) -> tuple[SignalSpec, ...]:
+    def _unprefixed_published_signals(self) -> frozenset:
+        # The RELAY exception (#E1): pulse-scan fires ONE trigger per point and republishes the
+        # camera frame under the SAME bare ``frame_0`` a single-cycle CameraMeasurement emits --
+        # the scan REPLACES the camera as the device driver, so a frame consumer (the occupancy
+        # judge) keeps its binding whichever one drives.  ONE name source (no lumped ``frame``).
+        return frozenset(camera_frame_keys(1))
+
+    def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
         """LABEL / unit / meaning per published signal -- so a 1-D panel wired to the y curve reads
         its x-axis label+unit (the swept parameter) and y label from THIS node.  ``y_key`` is the RAW
         ``(repeat, points, 1)`` block; ``<y>_grid`` the RAW ``(repeat, n0, n1)`` block -- a plot
         reduces the repeat axis per ``repeat_mode``."""
-        p = self.prefix
         specs = [
-            SignalSpec(p + self.x_key, self._axis_label, self._axis_unit, "scan x axis (the swept parameter)"),
-            SignalSpec(p + self.y_key, self.y_key, "", "raw (repeat, points, 1) block; plot reduces repeats"),
-            SignalSpec(p + "scan_done", "scan done", "", "1.0 when the finite scan has completed"),
+            SignalSpec(self.x_key, self._axis_label, self._axis_unit, "scan x axis (the swept parameter)"),
+            SignalSpec(self.y_key, self.y_key, "", "raw (repeat, points, 1) block; plot reduces repeats"),
+            SignalSpec("scan_done", "scan done", "", "1.0 when the finite scan has completed"),
         ]
         if self.scan_shape is not None:
-            specs.append(SignalSpec(p + self.y_key + "_grid", self.y_key, "",
+            specs.append(SignalSpec(self.y_key + "_grid", self.y_key, "",
                                     "raw (repeat, n0, n1) block; plot reduces repeats then shows the map"))
         return tuple(specs)
 
@@ -2202,9 +2231,8 @@ class ProcessorRun(LogicNode):
             self.step()
         return self
 
-    def published_signals(self) -> frozenset:
-        keys = tuple(self.spec.result_keys) + ("processor_done",)
-        return frozenset(self.prefix + key for key in keys)
+    def _bare_published_signals(self) -> frozenset:
+        return frozenset(tuple(self.spec.result_keys) + ("processor_done",))
 
 
 __all__ = [

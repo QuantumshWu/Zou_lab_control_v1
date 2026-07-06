@@ -120,3 +120,27 @@ def test_second_measurement_row_of_the_same_spec_is_disambiguated():
     finally:
         con.shutdown()
         exp.close()
+
+
+def test_prefix_join_is_owned_by_the_base_class():
+    """DRY guard: the prefix join lives ONCE, on LogicNode -- ``step()`` joins at publish time,
+    ``published_signals``/``output_specs`` join the declaration, all three from the same
+    ``self.prefix``.  A subclass declares BARE names via ``_bare_published_signals`` /
+    ``_bare_output_specs`` and never re-spells the join; overriding the final joiners is the
+    five-copies drift this pins.  The ONE declared exception is ``Task``: it is off the hub, so
+    its output_specs stays keyed by the bare provides/mid_run names (no hub prefix exists)."""
+    import inspect
+
+    from Zou_lab_control.frontend.figure_viewer import LoadedFigureNode
+    from Zou_lab_control.neutral_atom.operations import logic as L
+    from Zou_lab_control.neutral_atom.operations.tasks.mot_field import OptimizeMotFieldTask
+
+    subclasses = [obj for obj in vars(L).values()
+                  if inspect.isclass(obj) and issubclass(obj, L.LogicNode) and obj is not L.LogicNode]
+    subclasses += [LoadedFigureNode, OptimizeMotFieldTask]
+    assert len(subclasses) >= 8                      # the family is really being swept
+    for cls in subclasses:
+        assert cls.published_signals is L.LogicNode.published_signals, \
+            f"{cls.__name__} re-spells the published_signals join"
+        expected = L.Task.output_specs if issubclass(cls, L.Task) else L.LogicNode.output_specs
+        assert cls.output_specs is expected, f"{cls.__name__} re-spells the output_specs join"
