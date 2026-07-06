@@ -62,6 +62,19 @@ def bus_signed_range(n_bits: int) -> tuple[int, int]:
     half = bus_zero_code(n_bits)
     return (-half, half - 1)
 
+
+#: SIGNED user-layer level of an UNDRIVEN DAC bus: true 0 V.  This is the ONE safe-state
+#: constant every layer shares.  Wire layer: the RTL parks every bus at the mid-scale code
+#: ``BUS_SAFE_VALUE = bus_zero_code`` (zlc_edge_streamer.v -- power-up, reset/CMD_SAFE, FIRE
+#: re-init, and each DA-bit delay FIFO's idle ``SAFE_BIT``); the host engine model rests an
+#: un-segmented bus at the same mid code (engine_model.py ``rest = BUS_SAFE_VALUE``).  Encoder:
+#: an untouched bus keeps its member bits all-0 -- the "unused" marker -- and NEVER projects the
+#: mid code into TTL bits (``apply_analog_bus_modes_to_period_states``).  So every DECODER of
+#: "this bus is not driven" must return THIS signed level (``timing.sequence.decode_analog_bus``'s
+#: unused branch, the virtual monitor camera's no-program sense) -- never the all-bits-low word
+#: (offset-binary code 0 = NEGATIVE full scale).
+BUS_SAFE_SIGNED_LEVEL = 0
+
 #: OUTPUT delay magnitude cap, in clock ticks.  A per-channel (TTL) OR per-bus (DAC) delay
 #: ``d`` is realized as ``output[t] = undelayed[t-d]`` by a per-signal EVENT SCHEDULER; the
 #: cap is the 32-bit delay field (~42.9 s at 20 ns), the SAME for channels and buses.  The

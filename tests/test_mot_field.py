@@ -79,12 +79,15 @@ def _edges_level(sequence, members, at_time: float) -> int:
 
 
 # --------------------------------------------------------------------------- encode <-> decode
-@pytest.mark.parametrize("values", [(7, -5, 11), (0, 0, 0), (-32, 31, 1)])
+@pytest.mark.parametrize("values", [(7, -5, 11), (0, 0, 0), (-31, 31, 1)])
 def test_decode_analog_bus_inverts_set_api_through_compiled_sequence(values):
     """set_api(dac) -> to_sequence -> decode_analog_bus round-trips EXACTLY (incl. the signed
-    range edges of the template's 6-bit buses).  This pins BOTH directions: the encoder must bake
-    api-set DAC values into the compiled artefact (the _set_api_field fix -- before it, a software
-    set_api was silently absent from the sequence), and the decoder must be its exact inverse."""
+    range edges of the template's 6-bit buses -- except the full-negative code -2^(B-1), whose
+    all-bits-low projection is bit-identical to an UNDRIVEN bus and so decodes as the safe level;
+    that corner is pinned in test_virtual_da_safe_state.py).  This pins BOTH directions: the
+    encoder must bake api-set DAC values into the compiled artefact (the _set_api_field fix --
+    before it, a software set_api was silently absent from the sequence), and the decoder must be
+    its exact inverse."""
     state = _mot_state()
     slots = [s.name for s in state.api_slots if s.kind == "dac"]
     resolved = state.with_api_resolved(dict(zip(slots, values)))

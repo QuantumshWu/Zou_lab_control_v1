@@ -51,6 +51,7 @@ from .pulse_table import (
     slot_var,
     snap_scan_table,
 )
+from .persistence import load_pulse_payload
 from .verilog import CONTROL_PORTS, VerilogBuild, VerilogFiles, generate_verilog, generate_xdc, write_verilog_bundle
 
 __all__ = [
@@ -91,6 +92,7 @@ __all__ = [
     "imaging_sequence",
     "reference_bracket_sequence",
     "infer_bus_channels",
+    "load_pulse_payload",
     "load_scan_table",
     "plot_sequence",
     "positive_float",

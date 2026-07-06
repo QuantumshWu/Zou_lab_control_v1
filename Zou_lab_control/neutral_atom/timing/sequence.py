@@ -591,16 +591,35 @@ def decode_analog_bus(sequence: "PulseSequence", members, at_time: float) -> int
     camera reading the coil DACs) use this to SENSE what the fired sequence actually drives -- never
     the task's own set-points -- so virtual sensing goes through the same compiled artefact the
     hardware plays.  Contract tests pin this against ``set_api`` (encoder and decoder cannot drift)
-    and against the ``edges()`` timeline under a delayed bus (decoder and streamer cannot drift)."""
+    and against the ``edges()`` timeline under a delayed bus (decoder and streamer cannot drift).
+
+    An UNDRIVEN bus -- no pulse at all on ANY member channel (the encoder's "unused" marker:
+    ``apply_analog_bus_modes_to_period_states`` never projects bits for an untouched bus) -- decodes
+    to the SAFE level ``BUS_SAFE_SIGNED_LEVEL`` (signed 0 = the hardware's mid-scale ``BUS_SAFE_VALUE``
+    idle, 0 V), NOT the all-bits-low word (offset-binary code 0 = negative full scale).  Every other
+    layer already speaks this convention (RTL reset/idle, engine_model rest, the encoder's unused
+    marker); before this branch a TTL-only fire made the virtual MOT camera sense every coil at
+    -2^(B-1) and the spot vanished.  Known un-decodable corner: the bit projection cannot tell
+    "driven to the full-negative code (all bits low everywhere)" from "never driven" -- BOTH decode
+    as the safe level, matching the hardware whose unused buses genuinely rest at 0 V."""
     members = [str(m) for m in members]
     if not members:
         raise ValueError("decode_analog_bus needs the bus's member bit channels (LSB..MSB).")
     t = float(at_time)
     pulses = sequence.base_pulses()
     word = 0
+    driven = False
     for bit, channel in enumerate(members):
         for p in pulses:
-            if p.channel == channel and p.start <= t < p.start + p.duration and p.value:
+            if p.channel != channel:
+                continue
+            driven = True                     # any pulse on a member marks the bus as driven
+            if p.start <= t < p.start + p.duration and p.value:
                 word |= 1 << bit
                 break
+    if not driven:
+        # Lazy import: pulse_table imports from this module at load time (the constant lives
+        # beside its wire-layer siblings bus_zero_code/bus_signed_range -- the one safe-state source).
+        from .pulse_table import BUS_SAFE_SIGNED_LEVEL
+        return BUS_SAFE_SIGNED_LEVEL
     return word - (1 << (len(members) - 1))

@@ -48,7 +48,7 @@
   "time_step_ns": 20.0,
   "periods": [
     {
-      "duration": "1000000000",
+      "duration": "100000000",
       "unit": "ns",
       "name": "settle",
       "states": [
@@ -100,7 +100,7 @@
       ]
     },
     {
-      "duration": "500000000",
+      "duration": "50000000",
       "unit": "ns",
       "name": "expose",
       "states": [

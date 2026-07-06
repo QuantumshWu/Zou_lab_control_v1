@@ -32,6 +32,7 @@ from .camera_trigger import (
     normalize_trigger_channels,
 )
 from ..timing import (
+    BUS_SAFE_SIGNED_LEVEL,
     PulseSequence,
     PulseTableState,
     probe_channel_set,
@@ -1029,10 +1030,14 @@ class VirtualMotCamera(_TriggerWiredCamera):
         of the DELAYED base-cycle timeline (base_duration is delay-inclusive) -- the same timeline
         ``decode_analog_bus`` reads and ``edges()`` plays, so a ``.delay()`` on the coil bit
         channels moves the sensed window WITH the hardware output (the raw max(p.start+p.duration)
-        put the sense time on the pre-delay timeline).  NO driven program (None / no pulses) senses
-        the SAFE state: every DAC parked at signed level 0 (the hardware mid-code = 0 V)."""
-        if sequence is None or not getattr(sequence, "pulses", None):
-            return {bus: 0.0 for bus in self.coil_buses}
+        put the sense time on the pre-delay timeline).  NO program at all (None) senses the SAFE
+        state: every DAC parked at ``BUS_SAFE_SIGNED_LEVEL`` (the hardware mid-code = 0 V).  A
+        program that never touches a coil bus needs NO special case here: ``decode_analog_bus``
+        itself returns the safe level for an undriven bus -- the one safe-state rule lives there,
+        never as a second copy in this gate (a TTL-only fire used to fall through to the decoder's
+        old all-bits-low word and the MOT spot vanished)."""
+        if sequence is None:
+            return {bus: float(BUS_SAFE_SIGNED_LEVEL) for bus in self.coil_buses}
         from ..timing.sequence import decode_analog_bus
         t_sense = 0.5 * sequence.base_duration
         return {bus: decode_analog_bus(sequence, members, t_sense)
