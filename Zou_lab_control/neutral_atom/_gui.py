@@ -69,6 +69,11 @@ def open_task_console(session: Any, *, task: str | None = None, **kwargs):
         **kwargs,
     )
     session._zlc_task_console = console
+    # The console's running logic nodes are device CONSUMERS (worker threads blocking inside
+    # camera.acquire): register their stop with the session's teardown seam so ``exp.close()``
+    # and the device manager's "Load config" stop them BEFORE closing / swapping the devices --
+    # otherwise the threads keep old camera / RPyC handles alive and drive closed hardware.
+    session.add_device_teardown_hook(console.stop_all_nodes)
     return console
 
 

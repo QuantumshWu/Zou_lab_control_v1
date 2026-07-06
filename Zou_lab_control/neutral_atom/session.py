@@ -51,6 +51,14 @@ class NeutralAtomSession:
         self.sequence = self._imaging_sequence(exposure=self._camera_exposure(), load=True)
         self._calibration: TrapCalibration | None = None
         self.history: list[Any] = []
+        # Device CONSUMER teardown hooks: callables invoked BEFORE this session's devices are
+        # closed (:meth:`close`) or swapped (:meth:`load_config`), so long-lived consumers --
+        # the task console's running logic nodes, whose worker threads block inside
+        # ``camera.acquire`` and hold camera / RPyC handles -- are stopped FIRST and can never
+        # keep a closed/replaced device alive.  Duck-typed callables so the frontend registers
+        # ``console.stop_all_nodes`` here without the session ever importing the frontend
+        # (the one-way na -> frontend boundary stays intact).
+        self._device_teardown_hooks: list[Any] = []
         # Devices stay session-blind: a camera is a pure grabber and a sequencer a pure
         # streamer; ALL cross-device orchestration (capture / readout / scans) lives on the
         # session + subsystems, which reach devices only through their contracts.
@@ -153,6 +161,11 @@ class NeutralAtomSession:
         from .devices import load_devices, read_config
 
         new_devices = load_devices(read_config(config), open_devices=open_devices)
+        # The new set built OK -- NOW stop every registered device consumer (running GUI logic
+        # nodes whose worker threads hold the OLD camera / sequencer) before the swap, so nothing
+        # keeps driving hardware that is about to be closed.  Ordered after the build on purpose:
+        # a bad config leaves the whole session -- including its running nodes -- untouched.
+        self._release_device_consumers()
         old_devices = getattr(self, "devices", None)
         self.devices = new_devices
         self.sequence = self._imaging_sequence(exposure=self._camera_exposure(), load=True)
@@ -313,7 +326,31 @@ class NeutralAtomSession:
         path.write_text(json.dumps(json_ready(self.status()), indent=2, ensure_ascii=False), encoding="utf-8")
         return path
 
+    def add_device_teardown_hook(self, hook) -> None:
+        """Register a callable run BEFORE this session's devices are closed (:meth:`close`) or
+        swapped (:meth:`load_config`) -- the seam a long-lived device CONSUMER uses to be stopped
+        first.  The task console registers its ``stop_all_nodes`` here when it opens, so a
+        notebook's ``exp.close()`` / device-manager "Load config" can never pull devices out from
+        under running acquisition threads (which would otherwise keep old camera / RPyC handles
+        alive and keep driving closed hardware).  Idempotent: re-registering the same callable is
+        a no-op (the singleton console re-opens without stacking duplicates)."""
+        if hook not in self._device_teardown_hooks:
+            self._device_teardown_hooks.append(hook)
+
+    def _release_device_consumers(self) -> None:
+        """Run every registered teardown hook (stop running consumers), never letting one broken
+        hook block the device close/swap itself -- teardown must always complete."""
+        import logging
+
+        for hook in tuple(self._device_teardown_hooks):
+            try:
+                hook()
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "device teardown hook %r failed; continuing teardown", hook, exc_info=True)
+
     def close(self) -> None:
+        self._release_device_consumers()   # stop consumers (running GUI nodes) BEFORE the devices go
         self.devices.close()
 
     def _camera_exposure(self) -> float:
