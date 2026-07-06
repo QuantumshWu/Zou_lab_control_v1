@@ -216,6 +216,14 @@ class SurvivalReducer:
         occ2 = np.asarray(calibration.detect(frames[1]).occupied, dtype=bool)
         survived = occ1 & occ2
         if self.per_site:
+            # The block was pre-allocated to ``n_series == _n_sites`` (from bind_calibration); a reduce
+            # here must return exactly that width.  Fail LOUD if the reduce-time calibration detects a
+            # different site count rather than emit a wrong-width row that silently overflows / NaN-pads
+            # the swept block (shape iron-law: a declared shape stays true from build).
+            if self._n_sites is not None and occ1.size != self._n_sites:
+                raise ValueError(
+                    f"SurvivalReducer was bound to {self._n_sites} sites but the calibration passed to "
+                    f"reduce detects {occ1.size} -- reduce-time and bind_calibration must be the same map.")
             out = np.full(occ1.shape, np.nan, dtype=float)
             out[occ1] = survived[occ1].astype(float)
             return out
