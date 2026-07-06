@@ -1153,6 +1153,26 @@ def _kind_offers_general_fit(kind: str) -> bool:
     return not any(getattr(d, "key", "") == "fit" for d in PANEL_PARAMS.get(str(kind), ()))
 
 
+def _card_y_is_view_axis(card) -> bool:
+    """Does THIS panel's y axis take a view-window pin -- an image, where x AND y are spatial
+    (pixel) coordinates and the value lives on the colour limit?  Reads the LIVE object's own
+    ``y_is_view_axis`` flag -- the plot class's for a flat panel, the CELL family's for a grid
+    (so a grid of image cells offers the pin and a hist/1d grid does not) -- falling back to the
+    kind's plot class in ``PLOT_KIND_BY_KEY`` before a plotter exists.  The ONE resolver every
+    Edit surface keys the "y range" row off, mirroring how the plot side gates ``view_ylim`` in
+    ``apply_param`` / ``consume_param`` on the same flag: UI and apply can never disagree."""
+    from .live import PLOT_KIND_BY_KEY
+
+    plotter = getattr(card, "plotter", None)
+    cell = getattr(plotter, "cell_renderer", None)
+    if cell is not None:
+        return bool(getattr(cell, "y_is_view_axis", False))
+    if plotter is not None:
+        return bool(getattr(plotter, "y_is_view_axis", False))
+    pk = PLOT_KIND_BY_KEY.get(str(getattr(card.config, "kind", "")))
+    return bool(getattr(pk.cls, "y_is_view_axis", False)) if pk is not None else False
+
+
 def _fit_labels_for_kind(kind: str) -> list[str]:
     """The fit-model labels a panel of ``kind`` offers: none if it has a built-in fit (hist), else the
     models whose render family matches the kind's (:data:`FIT_MODELS`) -- 2d -> just ``2D center``,
@@ -2815,7 +2835,7 @@ class PanelCard(FluentGroupBox):
         # plotter is built ``display=False``), exactly as the non-facet grid path.
         with plotter.suspend_draws():
             for key in ([d.key for d in _panel_display_decls("grid", sub)]
-                        + ["relim", "fixed_lo", "fixed_hi", "view_xlim", "fit_model", "fit_cmd"]):
+                        + ["relim", "fixed_lo", "fixed_hi", "view_xlim", "view_ylim", "fit_model", "fit_cmd"]):
                 if key == "cmap":
                     # Inject the RESOLVED cmap (operator's pick ELSE the sub-kind's declared PANEL_PARAMS
                     # default) through the ONE ``_resolved_cmap`` resolver -- the SAME source the Setting
@@ -2917,32 +2937,37 @@ class PanelCard(FluentGroupBox):
         """Apply the persisted Setting toggles (relim mode + unit cycle) to
         the current plotter -- called after every rebuild and on each edit.
 
-        Three persisted knobs: ``config.params["relim"]`` (confocal naming:
+        The persisted knobs: ``config.params["relim"]`` (confocal naming:
         ``tight`` / ``normal``), ``config.params["unit_index"]`` (the x-axis unit
-        cycle count), and ``config.params["view_xlim"]`` (the Edit tab's x-range
-        pin, #3) -- re-applied here so a rebuild / reopen keeps the operator's
-        x-window instead of snapping back to autoscale.  (No manual y path: the
-        VALUE axis is relim-owned; the colormap chooser IS the colorset chooser.)"""
+        cycle count), and the view-window pins ``view_xlim`` / ``view_ylim`` (the
+        Edit tab's range rows, #3) -- re-applied here so a rebuild / reopen keeps
+        the operator's window instead of snapping back to autoscale.  (The y VALUE
+        axis of a 1d panel is relim-owned; ``view_ylim`` exists only on the image
+        family, whose ``apply_param`` gates it on ``y_is_view_axis``.)"""
         if self.plotter is None:
             return
         self._apply_lim_to_plotter()                     # relim family via the ONE in-place entry
         self._apply_unit()
-        self._apply_view_xlim()
+        self._apply_view_lims()
 
-    def _apply_view_xlim(self) -> None:
-        """Re-apply the persisted x-range pin (#3) to the LIVE plotter through the SAME ``apply_param``
-        entry every display knob uses -- a grid stores it and re-asserts it on every cell after each tick
-        (:meth:`GridPlot._apply_view_knobs`), a flat panel sets its one axes -- so the operator's Apply
-        survives a rebuild / reopen AND sticks across the live autoscale (never the old one-shot
-        ``to_data_figure().xlim`` the next redraw wiped).  Absent (the default) leaves the plot's own
-        autoscale untouched."""
-        pin = self.config.params.get("view_xlim")
-        if not pin or self.plotter is None:
+    def _apply_view_lims(self) -> None:
+        """Re-apply the persisted view-window pins (#3) to the LIVE plotter through the SAME
+        ``apply_param`` entry every display knob uses -- a grid stores them and re-asserts them on every
+        cell after each tick (:meth:`GridPlot._apply_view_knobs`), a flat panel sets its one axes -- so
+        the operator's Apply survives a rebuild / reopen AND sticks across the live autoscale (never the
+        old one-shot ``to_data_figure().xlim`` the next redraw wiped).  Absent (the default) leaves the
+        plot's own autoscale untouched; a ``view_ylim`` on a non-image kind (a stale recipe) is refused
+        by the plot's own ``y_is_view_axis`` gate."""
+        if self.plotter is None:
             return
-        try:
-            self.plotter.apply_param("view_xlim", (float(pin[0]), float(pin[1])))
-        except Exception:
-            pass                                          # a stale pin from a re-interpreted kind: ignore
+        for key in ("view_xlim", "view_ylim"):
+            pin = self.config.params.get(key)
+            if not pin:
+                continue
+            try:
+                self.plotter.apply_param(key, (float(pin[0]), float(pin[1])))
+            except Exception:
+                pass                                      # a stale pin from a re-interpreted kind: ignore
 
     def _unit_df(self):
         """A DataFigure bound to the live card's figure/axes for the x-axis unit cycle
@@ -4890,37 +4915,43 @@ class PanelEditor(QtWidgets.QWidget):
                 self.fit_cmd.returnPressed.connect(self.do_fit)
                 col.addWidget(FluentSettingRow("args", self.fit_cmd, label_width=proc_lw))
 
-            # x-range pin (#3): ONE domain (x) range, applied to the LIVE panel AND every grid cell (global,
-            # not the snapshot only).  The boxes EDIT THE STORED PIN (``view_xlim``), NOT the live range --
-            # they hold the pin value (or are empty = autoscale) and are only re-seeded on build / tab-show
-            # / Clear, so typing is NEVER clobbered by the refresh tick.  The live x-window is shown as the
-            # grey PLACEHOLDER (``refresh_limit_hints``), a non-destructive hint Qt draws only while a box
-            # is empty.  There is NO y-range input: for a 1d/dis panel the VALUE axis is already owned by
-            # the relim family (tight/normal/fixed + fixed lo/hi in the Display section), so a manual y
-            # would just duplicate it.  A 2d/sites IMAGE is the exception -- its value axis is the COLOUR
-            # limit, a genuinely distinct quantity from the (auto) pixel extent -- so it gets its OWN
-            # "colour range" clim pin below, next to the x-range where an operator looks for it.
+            # x/y-range pins (#3): the VIEW window, applied to the LIVE panel AND every grid cell (global,
+            # not the snapshot only).  The boxes EDIT THE STORED PIN (``view_xlim``/``view_ylim``), NOT the
+            # live range -- they hold the pin value (or are empty = autoscale) and are only re-seeded on
+            # build / tab-show / Clear, so typing is NEVER clobbered by the refresh tick.  The live window
+            # is shown as the grey PLACEHOLDER (``refresh_limit_hints``), a non-destructive hint Qt draws
+            # only while a box is empty.  A y-range row exists ONLY where y is a VIEW axis
+            # (``_card_y_is_view_axis``: an image, whose x AND y are pixel coordinates -- pinning both is
+            # what makes an ROI crop real, since the image keeps aspect='equal' and an x-only pin would
+            # letterbox).  On a 1d/dis panel the y VALUE axis is already owned by the relim family
+            # (tight/normal/fixed in the Display section), so it gets no y row.  An image's VALUE axis is
+            # the COLOUR limit -- a genuinely distinct quantity -- pinned by its own "colour range" row.
             section("Limits")
             self.xmin = FluentLineEdit(""); self.xmax = FluentLineEdit("")
-            self.ymin = self.ymax = None                     # no y input -- the value axis is relim-owned (#3)
+            self.ymin = self.ymax = None
+            if _card_y_is_view_axis(card):
+                self.ymin = FluentLineEdit(""); self.ymax = FluentLineEdit("")
             # an image's value axis IS the colour limit: give 2d/sites an always-editable clim pin (built
             # into the Limits row below); every other kind has none (its value axis = the relim y).
             self.clo = self.chi = None
             if card.config.kind in ("2d", "sites"):
                 self.clo = FluentLineEdit(""); self.chi = FluentLineEdit("")
-            for w in (self.xmin, self.xmax):
+            for w in (self.xmin, self.xmax) + ((self.ymin, self.ymax) if self.ymin is not None else ()):
                 w.setFixedWidth(scaled_px(88, minimum=68))   # wide enough not to clip "-0.4960"
                 w.returnPressed.connect(self.apply_limits)
             apply_btn = FluentButton("Apply lim", color=ACCENT)
             apply_btn.clicked.connect(self.apply_limits)
-            # Clear releases the x-window pin back to autoscale -- the Limits counterpart of the Fit/Clear
-            # pair above (without it a pinned x-window could never be undone: clearing the boxes + Apply
+            # Clear releases the window pins back to autoscale -- the Limits counterpart of the Fit/Clear
+            # pair above (without it a pinned window could never be undone: clearing the boxes + Apply
             # only errored 'bad limits', so the operator was stuck at whatever range they once set).
             clear_lim_btn = FluentButton("Clear", color=GREY)
             clear_lim_btn.clicked.connect(self.clear_limits)
             lim_row = _inline(self.xmin, self.xmax, trailing=apply_btn)
             lim_row.layout().addWidget(clear_lim_btn, 0)
             col.addWidget(FluentSettingRow("x range", lim_row, label_width=proc_lw))
+            if self.ymin is not None:
+                # ONE Apply/Clear pair drives BOTH rows (x + y are one view window, applied together).
+                col.addWidget(FluentSettingRow("y range", _inline(self.ymin, self.ymax), label_width=proc_lw))
 
             # colour range (2d/sites only): an image's value axis is its COLOUR limit, so it gets an
             # always-editable clim pin here, mirroring the x-range row.  Apply writes the ONE clim source
@@ -5545,15 +5576,16 @@ class PanelEditor(QtWidgets.QWidget):
         non-destructive grey hint (:meth:`refresh_limit_hints`)."""
         if self.xmin is None:
             return                          # no Limits section (a non-"plot" role)
-        pin = self.card.config.params.get("view_xlim") if self.card is not None else None
-        lo = hi = ""
-        if pin is not None:
-            try:
-                lo, hi = f"{float(pin[0]):.6g}", f"{float(pin[1]):.6g}"
-            except (TypeError, ValueError, IndexError):
-                lo = hi = ""
-        with _signals_blocked(self.xmin, self.xmax):
-            self.xmin.setText(lo); self.xmax.setText(hi)
+        for key, lo_box, hi_box in self._limit_axes():
+            pin = self.card.config.params.get(key) if self.card is not None else None
+            lo = hi = ""
+            if pin is not None:
+                try:
+                    lo, hi = f"{float(pin[0]):.6g}", f"{float(pin[1]):.6g}"
+                except (TypeError, ValueError, IndexError):
+                    lo = hi = ""
+            with _signals_blocked(lo_box, hi_box):
+                lo_box.setText(lo); hi_box.setText(hi)
         self._seed_clim_boxes()          # keep the 2d/sites colour-range boxes in step with the clim pin
 
     def refresh_limit_hints(self) -> None:
@@ -5578,41 +5610,63 @@ class PanelEditor(QtWidgets.QWidget):
         ax = self._limits_ax()
         if ax is None:
             return
-        xlo, xhi = ax.get_xlim()            # x only -- the value (y) axis is relim-owned (#3)
+        xlo, xhi = ax.get_xlim()
         self.xmin.setPlaceholderText(f"{xlo:.6g}"); self.xmax.setPlaceholderText(f"{xhi:.6g}")
+        if self.ymin is not None:           # y hint only where y is a view axis (an image family)
+            ylo, yhi = ax.get_ylim()
+            self.ymin.setPlaceholderText(f"{ylo:.6g}"); self.ymax.setPlaceholderText(f"{yhi:.6g}")
+
+    def _limit_axes(self) -> list[tuple[str, object, object]]:
+        """The (param key, lo box, hi box) rows this Edit's Limits section carries -- x always, y only
+        on an image family (the y row exists iff ``_card_y_is_view_axis`` at build).  The ONE list
+        apply/clear/seed/hints iterate, so adding an axis row can never miss a handler."""
+        axes = [("view_xlim", self.xmin, self.xmax)]
+        if self.ymin is not None:
+            axes.append(("view_ylim", self.ymin, self.ymax))
+        return axes
 
     def apply_limits(self) -> None:
+        """Apply the typed view-window pins -- PER AXIS: a filled pair pins that axis, an empty pair
+        releases it (so 'clear the y boxes + Apply' un-pins y while keeping x).  Each pin is an ORDINARY
+        display knob (``view_xlim``/``view_ylim``) applied through the SAME ``_edit_param`` entry as
+        bins / fit / relim -> the LIVE card (whose ``apply_param`` fans it to EVERY cell and re-asserts
+        it after each tick's autoscale) + the snapshot + ``config.params`` + save.  So Apply reaches the
+        RUNNING grid and STICKS (#3), not a one-shot on a throwaway ``_GridData`` the next redraw
+        autoscaled away."""
         if self.xmin is None:
             return
-        if not self.xmin.text().strip() and not self.xmax.text().strip():
-            self.clear_limits()          # both boxes empty = release the pin (the natural 'clear then Apply')
-            return
-        try:
-            lo, hi = float(self.xmin.text()), float(self.xmax.text())
-        except ValueError as exc:
-            self.status.setText(f"bad limits: {str(exc).splitlines()[0][:100]}")
-            return
-        # The x-window pin is an ORDINARY display knob (``view_xlim``) applied through the SAME
-        # ``_edit_param`` entry as bins / fit / relim -> the LIVE card (whose ``apply_param`` fans it to
-        # EVERY cell and re-asserts it after each tick's autoscale) + the snapshot + ``config.params`` +
-        # save.  So Apply reaches the RUNNING grid and STICKS (#3), not a one-shot on a throwaway
-        # ``_GridData`` the next redraw autoscaled away.
-        self._edit_param("view_xlim", (lo, hi))
-        self.status.setText("x range applied (all subplots)")
+        applied, cleared = [], []
+        for key, lo_box, hi_box in self._limit_axes():
+            lo_text, hi_text = lo_box.text().strip(), hi_box.text().strip()
+            if not lo_text and not hi_text:
+                self._edit_param(key, None)          # empty pair = release THIS axis's pin
+                cleared.append(key[5])               # 'x' / 'y'
+                continue
+            try:
+                lo, hi = float(lo_text), float(hi_text)
+            except ValueError as exc:
+                self.status.setText(f"bad limits: {str(exc).splitlines()[0][:100]}")
+                return
+            self._edit_param(key, (lo, hi))
+            applied.append(key[5])
+        parts = ([f"{'/'.join(applied)} range applied"] if applied else []) + \
+                ([f"{'/'.join(cleared)} range cleared"] if cleared else [])
+        self.status.setText("; ".join(parts) + " (all subplots)")
 
     def clear_limits(self) -> None:
-        """Release the x-window pin -> autoscale.  ``view_xlim=None`` is the SAME stored display knob
+        """Release EVERY view-window pin -> autoscale.  ``None`` is the SAME stored display knob
         ``apply_limits`` writes, routed through the ONE ``_edit_param`` entry: BaseLivePlot.apply_param /
         GridCell.consume_param already read ``None`` as 'no pin', so the live card, the snapshot, and the
         save all drop the pin.  EMPTIES the boxes (empty = no pin) so the grey placeholder hint takes
         over showing the now-auto range -- the Limits counterpart of :meth:`clear_fit`."""
         if self.xmin is None:
             return
-        self._edit_param("view_xlim", None)
-        with _signals_blocked(self.xmin, self.xmax):
-            self.xmin.setText(""); self.xmax.setText("")
+        for key, lo_box, hi_box in self._limit_axes():
+            self._edit_param(key, None)
+            with _signals_blocked(lo_box, hi_box):
+                lo_box.setText(""); hi_box.setText("")
         self.refresh_limit_hints()
-        self.status.setText("x range cleared (auto)")
+        self.status.setText("view range cleared (auto)")
 
     def _sync_relim_combo(self, value: str) -> None:
         """Reflect a PROGRAMMATIC relim change (the colour-range Apply/Auto) in the Display relim combo
@@ -5752,11 +5806,13 @@ class PanelEditor(QtWidgets.QWidget):
             "unit_index": int(params.get("unit_index", 0) or 0),
             "repeat_mode": self.card._repeat_mode_value(),
         }
-        # the x-range pin (#3) is a cross-kind view knob too: persist it so a reopened figure keeps the
-        # operator's x-window (only when actually set -- a never-pinned panel omits it, staying autoscale).
-        pin = params.get("view_xlim")
-        if pin:
-            view["view_xlim"] = [float(pin[0]), float(pin[1])]
+        # the view-window pins (#3) are cross-kind view knobs too: persist them so a reopened figure keeps
+        # the operator's window (only when actually set -- a never-pinned panel omits them, staying
+        # autoscale; view_ylim only ever exists on the image family, whose store gate wrote it).
+        for key in ("view_xlim", "view_ylim"):
+            pin = params.get(key)
+            if pin:
+                view[key] = [float(pin[0]), float(pin[1])]
         # the general curve fit (#4) is a cross-kind view knob too: persist the model + its arg string so a
         # reopened figure redraws the SAME fit on every subplot (omitted while unset, staying unfitted).
         if str(params.get("fit_model") or "none") != "none":

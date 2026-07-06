@@ -357,6 +357,13 @@ class BaseLivePlot:
     #: table ``PLOT_KINDS`` mirrors it) so ``DataFigure`` reads it instead of
     #: re-deriving the family from matplotlib artists.  Default "1D".
     render_family = "1D"
+    #: Is this plot's y axis a VIEW (spatial) axis the user may pin -- an image, where x AND y
+    #: are pixel coordinates and the VALUE lives on the colormap (clim)?  Declared ONCE per plot
+    #: class: True on the image family (Live2DDis / LiveSiteMap), False on 1d/hist plots whose y
+    #: is the DATA axis owned by the relim family (relim/fixed).  Every surface that offers or
+    #: applies a ``view_ylim`` (the Edit tab's "y range" row, ``apply_param``, a grid's image
+    #: cells) keys off THIS flag -- one rule, never a per-UI kind tuple.
+    y_is_view_axis = False
 
     def _build_distribution_band(self, image_artist, values, *, n_bins, guide_minmax=None):
         """Build the side clim-distribution band on ``self.axdis`` (which assumes ``self.ylim_min`` /
@@ -981,6 +988,19 @@ class BaseLivePlot:
                 ax.set_xlim(*self._view_xlim)
                 self.draw()
             return True
+        # The y-window pin exists ONLY where y is a VIEW (spatial) axis -- the image family
+        # (``y_is_view_axis``): on a 1d/hist plot y is the DATA axis owned by the relim family
+        # above, and accepting a pin there would fight relim's per-tick set_ylim.  Refusing the
+        # key (False) also shields a 1d panel from a stale image recipe.
+        if str(key) == "view_ylim":
+            if not self.y_is_view_axis:
+                return False
+            self._view_ylim = None if value in (None, "", "none") else (float(value[0]), float(value[1]))
+            ax = getattr(self, "ax", None)
+            if ax is not None and self._view_ylim is not None:
+                ax.set_ylim(*self._view_ylim)
+                self.draw()
+            return True
         if str(key) in ("fit_model", "fit_cmd"):
             if str(key) == "fit_model":
                 self._fit_model = str(value or "none")
@@ -1028,6 +1048,8 @@ class BaseLivePlot:
             self._reapply_general_fit()
         if getattr(self, "_view_xlim", None) is not None:
             ax.set_xlim(*self._view_xlim)
+        if getattr(self, "_view_ylim", None) is not None:
+            ax.set_ylim(*self._view_ylim)
 
     def after_plot(self):
         """Create and attach a DataFigure handle."""
@@ -1323,6 +1345,7 @@ class Live2DDis(BaseLivePlot):
 
     plot_type = "2D"
     render_family = "2D"
+    y_is_view_axis = True   # x AND y are pixel coordinates; the value axis is the clim
 
     def __init__(self, *args, cmap: str = PALETTE["cmap_scan"], bad_color: str = PALETTE["bad"], square: bool = True,
                  clim: "tuple[float, float] | None" = None, **kwargs):
@@ -1560,6 +1583,7 @@ class LiveSiteMap(BaseLivePlot):
     # legacy fitting family was "1D".  A static declared family would change that conditional
     # behaviour, so the site map opts OUT of the declared override (behaviour-preserving).
     render_family = "auto"
+    y_is_view_axis = True   # site centers live in camera pixels: x AND y are spatial view axes
 
     def __init__(self, *args, image=None, roi_radius: float = 3.0, cmap: str = PALETTE["cmap_camera"], **kwargs):
         super().__init__(*args, **kwargs)
@@ -3782,9 +3806,15 @@ class GridCell:
     #: grid's single :meth:`GridPlot._apply_view_knobs` after each draw -- so an x-window pin and a
     #: curve fit STICK across live ticks, fan to every subplot, match the double-click focus, and save:
     #:  * ``view_xlim`` = a pinned (lo, hi) x-window (``None`` = autoscale), applied to every cell's axes;
+    #:  * ``view_ylim`` = the y sibling, accepted ONLY by an image family (``y_is_view_axis``: x AND y
+    #:    are pixel coordinates there; on a 1d/hist cell y is the DATA axis owned by relim);
     #:  * ``fit_model`` = a :data:`data_figure` fit method name ('gaussian'/'decay'/...) or ``"none"``;
     #:  * ``fit_cmd`` = the optional argument string for that fit call (``p0=...`` etc).
     view_xlim: "tuple[float, float] | None" = None
+    view_ylim: "tuple[float, float] | None" = None
+    #: Same flag, same rule as :attr:`BaseLivePlot.y_is_view_axis` -- the ONE gate every surface
+    #: (Edit row, consume_param, _apply_view_knobs) keys the y-window pin off.
+    y_is_view_axis: bool = False
     fit_model: str = "none"
     fit_cmd: str = ""
     #: Does this cell family accept the general Edit-tab curve fit (``fit_model``)?  A family with its OWN
@@ -3880,6 +3910,14 @@ class GridCell:
             if self.view_xlim == new:
                 return False
             self.view_xlim = new
+            return True
+        if str(key) == "view_ylim":
+            if not self.y_is_view_axis:
+                return False                 # y is the DATA axis here (relim-owned) -- refuse the pin
+            new = None if value in (None, "", "none") else (float(value[0]), float(value[1]))
+            if self.view_ylim == new:
+                return False
+            self.view_ylim = new
             return True
         if str(key) == "fit_model":
             new = str(value or "none")
@@ -4282,6 +4320,7 @@ class ImageCell(GridCell):
     line -- exactly the ``Image2DCell`` the :class:`GridCell` docstring reserves."""
 
     sub_plot_kind = "2d"         # each cell is a ``2d`` per-site plot (enlarged -> a standalone Live2DDis)
+    y_is_view_axis = True        # x AND y are pixel coordinates; the value axis is the shared clim
 
     def __init__(self, images, *, labels: Sequence[str] = ("x (px)", "y (px)"), cmap: str | None = None):
         self.images = [np.asarray(im, dtype=float) for im in images]
@@ -4895,6 +4934,8 @@ class GridPlot(BaseLivePlot):
         if ax is not None:
             if cell.view_xlim is not None:
                 ax.set_xlim(float(cell.view_xlim[0]), float(cell.view_xlim[1]))
+            if cell.y_is_view_axis and cell.view_ylim is not None:
+                ax.set_ylim(float(cell.view_ylim[0]), float(cell.view_ylim[1]))
             # is_display=True: the enlarged cell is a FULL standalone plot, so it shows the fit equation +
             # parameters (unlike the tiny thumbnail, which draws the curve only).
             popt = self._refit_axes(ax, p.to_data_figure(), cell.fit_model, cell.fit_cmd,
@@ -5011,6 +5052,10 @@ class GridPlot(BaseLivePlot):
         if str(key) in ("fit_model", "fit_cmd") and not getattr(
                 self.cell_renderer, "supports_general_fit", True):
             return False
+        # Same store-gate for the y-window pin: only an image family (``y_is_view_axis``) accepts it,
+        # so a non-image grid's recipe never carries a phantom ``view_ylim`` (mirrors the fit gate).
+        if str(key) == "view_ylim" and not getattr(self.cell_renderer, "y_is_view_axis", False):
+            return False
         self._display_params[str(key)] = value
         # The relim family updates the CELL state exactly like bins/cmap (GridCell.relim_mode /
         # fixed_lo / fixed_hi -- every thumbnail's draw consumes it via thumb_lims), so a lim edit
@@ -5105,6 +5150,7 @@ class GridPlot(BaseLivePlot):
         :meth:`update_cells` uses, so the grid's own and the host's enlarged cell are one path."""
         cell = self.cell_renderer
         vx = cell.view_xlim
+        vy = cell.view_ylim if cell.y_is_view_axis else None   # y pin exists only on the image family
         # A family with its own built-in fit (a hist cell's bimodal) does NOT accept the general curve fit --
         # force ``model`` to "none" so a stale ``fit_model`` (an old recipe / notebook poke) is inert and never
         # stacks an absurd 1-D peak on the bimodal; the x-window pin (``view_xlim``) still applies (not a fit).
@@ -5113,7 +5159,7 @@ class GridPlot(BaseLivePlot):
         # Fast path: nothing pinned, no fit, no leftover fit artists to clear -> no per-tick work (this
         # method runs every live tick, so it must cost nothing when the grid carries no view knobs -- never
         # build an N-cell _GridData for a no-op).
-        if vx is None and (not model or model == "none") and not self._general_fit_artists:
+        if vx is None and vy is None and (not model or model == "none") and not self._general_fit_artists:
             return
         store: dict = {}
         fp, fk = ((self._focus_plotter, self._focused) if self._focused is not None
@@ -5123,6 +5169,8 @@ class GridPlot(BaseLivePlot):
             if ax is not None:
                 if vx is not None:
                     ax.set_xlim(float(vx[0]), float(vx[1]))
+                if vy is not None:
+                    ax.set_ylim(float(vy[0]), float(vy[1]))
                 popt = self._refit_axes(ax, fp.to_data_figure(), model, cmd, key="focus", is_display=True)
                 if popt:
                     store[int(fk)] = popt
@@ -5131,6 +5179,8 @@ class GridPlot(BaseLivePlot):
             for k, (ax, cdf) in enumerate(zip(self.site_axes, df.cells)):
                 if vx is not None:
                     ax.set_xlim(float(vx[0]), float(vx[1]))
+                if vy is not None:
+                    ax.set_ylim(float(vy[0]), float(vy[1]))
                 popt = self._refit_axes(ax, cdf, model, cmd, key=k)
                 if popt:
                     store[k] = popt

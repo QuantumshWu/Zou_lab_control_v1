@@ -313,6 +313,69 @@ def test_edit_x_range_pin_is_global_live_and_persisted():
         exp.close()
 
 
+def test_edit_y_range_pin_exists_only_on_the_image_family_and_round_trips():
+    """The 2d/sites IMAGE family's y axis is a VIEW (spatial) axis -- so its Edit Limits section
+    carries a "y range" row (``view_ylim``) exactly mirroring the x row: Apply reaches the LIVE
+    panel, persists in ``config.params`` (a rebuild keeps it), and round-trips through the saved
+    ``info['view']``.  A 1d panel's y is the DATA axis owned by relim -- it gets NO y row, and its
+    plot REFUSES a stale ``view_ylim`` (``y_is_view_axis`` gates every surface off one flag)."""
+    import numpy as np
+
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import (
+        PanelConfig, TaskConsole, default_console_state)
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    ensure_qt_app()
+    exp = na.connect("virtual")
+    con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
+                      measurements=exp.readout.measurement_specs(),
+                      processors=exp.readout.processor_specs(),
+                      tasks=exp.readout.task_specs(), window_px=(900, 600))
+    try:
+        frame = np.random.default_rng(0).normal(200, 5, (1, 48, 64))
+        card = con._new_panel_card(PanelConfig(kind="2d", title="IMG", size="4x4",
+                                               source="value = __probe__", params={}))
+        con._attach_card(card)
+        card._render(frame, {})
+        con._tick()
+        con._edit_card(card)
+        ed = con._panel_editors[id(card)]
+        assert ed.ymin is not None and ed.ymax is not None, "an image Edit carries the y range row"
+
+        ed.xmin.setText("10"); ed.xmax.setText("40")
+        ed.ymin.setText("5"); ed.ymax.setText("35")
+        ed.apply_limits()
+        # LIVE: both spatial axes pinned on the panel's own axes (aspect-equal ROI crop is real).
+        assert tuple(card.plotter.ax.get_xlim()) == (10.0, 40.0)
+        assert tuple(card.plotter.ax.get_ylim()) == (5.0, 35.0)
+        # persisted -> survives a rebuild (re-applied in _apply_display_params / _apply_view_lims).
+        assert card.config.params.get("view_ylim") == (5.0, 35.0)
+        card._apply_display_params()
+        assert tuple(card.plotter.ax.get_ylim()) == (5.0, 35.0)
+        # round-trips through the saved view (a reopened figure keeps the full window).
+        view = ed._save_view_state()
+        assert view.get("view_xlim") == [10.0, 40.0] and view.get("view_ylim") == [5.0, 35.0]
+        # per-axis release: empty y boxes + Apply un-pins y while keeping x.
+        ed.ymin.setText(""); ed.ymax.setText(""); ed.apply_limits()
+        assert card.config.params.get("view_ylim") is None
+        assert card.config.params.get("view_xlim") == (10.0, 40.0)
+
+        # the 1d family refuses the pin: y is the DATA axis (relim-owned), a stale recipe is inert.
+        import matplotlib.pyplot as plt
+
+        from Zou_lab_control.frontend.live import Live1D
+        one_d = Live1D(np.arange(8.0).reshape(-1, 1))
+        try:
+            assert one_d.apply_param("view_ylim", (0.0, 1.0)) is False
+        finally:
+            plt.close(one_d.fig)
+    finally:
+        con.shutdown()
+        exp.close()
+
+
 def test_window_opens_at_screen_fit_not_content_width(tmp_path):
     """The viewer opens at the shared screen-fraction size (the task console / pulse editor both return
     ``screen_fit_window_size`` verbatim from ``sizeHint``), NEVER collapsed to the bare Info-column
