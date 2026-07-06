@@ -9,7 +9,8 @@ can never silently rot:
 
 * decode_analog_bus really is set_api's inverse THROUGH the compiled artefact (this also pins the
   ``_set_api_field`` dac fix: set_api must bake the plan into period states, else the sequence a
-  virtual/real machine plays would ignore software-set DAC values entirely);
+  virtual/real machine plays would ignore software-set DAC values entirely), and it reads the
+  DELAYED base-cycle timeline -- the one ``edges()`` actually streams -- never the raw pulse list;
 * the virtual monitor camera is a PURE triggered grabber sensing only the sequence FIRED over
   its trigger wire (the ``sequencer`` construction parameter -- the simulated trigger cable);
 * the intensity primitive + processor shapes;
@@ -40,6 +41,7 @@ from Zou_lab_control.neutral_atom.operations.processors.mot_intensity import (
 from Zou_lab_control.neutral_atom.operations.measurement import triggered_frames
 from Zou_lab_control.neutral_atom.operations.tasks.mot_field import (
     DEFAULT_MOT_TEMPLATE, OptimizeMotFieldTask)
+from Zou_lab_control._clock import DEFAULT_CLOCK_HZ
 from Zou_lab_control.neutral_atom.timing.sequence import decode_analog_bus
 
 MOT_TEMPLATE = str(REPO_ROOT / DEFAULT_MOT_TEMPLATE)
@@ -50,8 +52,27 @@ def _mot_state():
 
 
 def _mid_frame_time(sequence) -> float:
-    t_end = max(p.start + p.duration for p in sequence.pulses)
-    return 0.5 * t_end
+    # Mid of the DELAYED base-cycle timeline (base_duration is delay-inclusive) -- the same
+    # sense-time rule VirtualMotCamera._render_frames applies, so a .delay() on the coil bit
+    # channels moves this sense point with the hardware output.
+    return 0.5 * sequence.base_duration
+
+
+def _edges_level(sequence, members, at_time: float) -> int:
+    """Read a bus level straight off the streamed ``edges()`` timeline -- the independent ground
+    truth for what the hardware plays at ``at_time`` (decoder and streamer cannot drift)."""
+    ticks, masks, channels = sequence.edges()
+    tick = at_time * DEFAULT_CLOCK_HZ
+    mask = 0
+    for t, m in zip(ticks, masks):
+        if t > tick:
+            break
+        mask = m
+    # a member with no pulses at all (an un-set bit -- the encoder emits no pulse for it) never
+    # appears in the edge channel list: it is low for the whole sequence
+    word = sum(1 << bit for bit, ch in enumerate(members)
+               if ch in channels and (mask >> channels.index(ch)) & 1)
+    return word - (1 << (len(members) - 1))
 
 
 # --------------------------------------------------------------------------- encode <-> decode
@@ -69,6 +90,31 @@ def test_decode_analog_bus_inverts_set_api_through_compiled_sequence(values):
     decoded = [decode_analog_bus(sequence, members, t)
                for members in state.analog_buses.values()]
     assert decoded == list(values)
+
+
+def test_decode_analog_bus_reads_the_delayed_timeline():
+    """``.delay()`` on the bus bit channels shifts the window the hardware DRIVES (``edges()``
+    streams the shifted pulses), so the decoder must read the SAME delayed base-cycle timeline:
+    BEFORE the delay the bits are still un-driven (the all-low word), AFTER it the programmed
+    level appears -- both cross-checked against ``edges()`` itself.  (Regression: decode used to
+    read the RAW pulse list, so with a delayed coil bus it returned the programmed level at a
+    time the hardware output had not started driving yet.)"""
+    state = _mot_state()
+    slots = [s.name for s in state.api_slots if s.kind == "dac"]
+    values = (7, -5, 11)
+    sequence = state.with_api_resolved(dict(zip(slots, values))).to_sequence()
+    dt = 20e-6
+    for members in state.analog_buses.values():
+        for channel in members:
+            sequence = sequence.delay(channel, dt)
+    t_after = _mid_frame_time(sequence)                # mid of the DELAYED base cycle
+    t_before = 0.25 * dt                               # the delayed bits have not started driving
+    for members, value in zip(state.analog_buses.values(), values):
+        assert decode_analog_bus(sequence, members, t_after) == value \
+            == _edges_level(sequence, members, t_after)
+        undriven = -(1 << (len(members) - 1))          # all bits low -> the signed minimum word
+        assert decode_analog_bus(sequence, members, t_before) == undriven \
+            == _edges_level(sequence, members, t_before)
 
 
 # --------------------------------------------------------------------------- virtual sensing
@@ -94,6 +140,39 @@ def test_virtual_mot_camera_senses_only_the_fired_sequence():
     # brightness ratio follows the SAME public model the optimum test uses
     assert cam.mot_efficiency(cam.last_levels) < 1e-3
     assert float(frame_peak.mean()) > float(frame_far.mean()) + 10
+
+
+def test_virtual_mot_camera_senses_the_delayed_coil_timeline():
+    """The monitor camera's sense time and decode live on the SAME delayed timeline the hardware
+    plays: a moderately delayed coil bus still senses the programmed levels (the mid-cycle point
+    sits inside the shifted driven window), and a bus delayed beyond the un-delayed span senses
+    the un-driven word (mid of the DELAYED cycle precedes the driven window) -- never the raw
+    view's set-points.  (Regression: the raw-pulse t_end + raw-pulse decode sensed the pre-delay
+    levels no matter what delay the fired sequence carried.)"""
+    ds = load_devices("virtual", open_devices=False)
+    cam, seqr = ds.devices["monitor_camera"], ds.devices["sequencer"]
+    state = _mot_state()
+    slots = [s.name for s in state.api_slots if s.kind == "dac"]
+    at_peak = {name: int(cam.b0[bus]) for name, bus in zip(slots, cam.coil_buses)}
+    seq = state.with_api_resolved(at_peak).to_sequence()
+
+    def with_coil_delay(dt: float):
+        out = seq
+        for members in cam.coil_buses.values():
+            for channel in members:
+                out = out.delay(channel, dt)
+        return out
+
+    # moderate delay: the mid-cycle sense point sits inside the shifted driven window
+    triggered_frames(cam, seqr, with_coil_delay(20e-6), 1)
+    assert cam.last_levels == {bus: int(cam.b0[bus]) for bus in cam.coil_buses}
+
+    # delay beyond the un-delayed span (derived, never a re-typed template length): mid of the
+    # DELAYED cycle now precedes the driven window, so the hardware plays nothing there yet --
+    # the camera must sense exactly that, not the raw view's programmed set-points
+    triggered_frames(cam, seqr, with_coil_delay(2.0 * seq.base_duration), 1)
+    assert cam.last_levels == {bus: -(1 << (len(members) - 1))
+                               for bus, members in cam.coil_buses.items()}
 
 
 # --------------------------------------------------------------------------- intensity primitive

@@ -714,3 +714,19 @@ def test_delay_capacity_rejects_rewind_and_has_no_dead_start_index_pipeline():
     prog.repeat_from_index = 2
     with pytest.raises(ValueError, match="repeat_from_index"):
         fps._check_delay_event_capacity(prog, evt_depth=256, frac_bits=16)
+
+
+def test_reference_bracket_accepts_stringlike_timing_like_its_sibling():
+    """#C4: reference_bracket_sequence VALIDATED string-like timing inputs but never assigned the
+    coerced floats back, so an input its sibling imaging_sequence accepts crashed the cursor
+    arithmetic with a bare TypeError.  Both now coerce through the ONE nonnegative_float helper."""
+    from Zou_lab_control.neutral_atom.timing.sequence import (
+        imaging_sequence, reference_bracket_sequence)
+
+    seq = reference_bracket_sequence(pre_trigger="0.0001", gap="0.0001", cooling="0.002")
+    assert len(seq.pulses) > 0
+    img = imaging_sequence(exposure=0.01, pre_trigger="0.0001", cooling="0.002", load=True)
+    assert len(img.pulses) > 0
+    import pytest
+    with pytest.raises(ValueError):
+        reference_bracket_sequence(gap=-1.0)          # the >=0 rule still enforced

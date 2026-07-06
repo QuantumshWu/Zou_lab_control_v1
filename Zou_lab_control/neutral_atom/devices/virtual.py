@@ -1006,8 +1006,11 @@ class VirtualMotCamera(_TriggerWiredCamera):
         if sequence is None or not getattr(sequence, "pulses", None):
             return []
         from ..timing.sequence import decode_analog_bus
-        t_end = max(p.start + p.duration for p in sequence.pulses)
-        t_sense = 0.5 * t_end                       # the steady mid-frame level (edges settle at t=0)
+        # Sense at the steady mid-point of the DELAYED base-cycle timeline (base_duration is
+        # delay-inclusive) -- the same timeline decode_analog_bus reads and edges() plays, so a
+        # .delay() on the coil bit channels moves the sensed window WITH the hardware output
+        # (the raw max(p.start + p.duration) put the sense time on the pre-delay timeline).
+        t_sense = 0.5 * sequence.base_duration
         levels = {bus: decode_analog_bus(sequence, members, t_sense)
                   for bus, members in self.coil_buses.items()}
         self.last_levels = dict(levels)

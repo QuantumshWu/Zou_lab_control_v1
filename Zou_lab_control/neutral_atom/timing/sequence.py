@@ -11,7 +11,7 @@ import math
 import numpy as np
 
 from Zou_lab_control._clock import DEFAULT_CLOCK_HZ  # absolute: dependency-free clock seam (config single source)
-from ..core.analysis import finite_float, positive_float, positive_int
+from ..core.analysis import finite_float, nonnegative_float, positive_float, positive_int
 
 
 CLOCK_GRID_RTOL = 1e-12
@@ -316,12 +316,8 @@ def imaging_sequence(
 
     exposure = positive_float(exposure, "exposure")
     trigger_width = positive_float(trigger_width, "trigger_width")
-    pre_trigger = finite_float(pre_trigger, "pre_trigger")
-    if pre_trigger < 0:
-        raise ValueError("pre_trigger must be >= 0.")
-    cooling = finite_float(cooling, "cooling")
-    if cooling < 0:
-        raise ValueError("cooling must be >= 0.")
+    pre_trigger = nonnegative_float(pre_trigger, "pre_trigger")
+    cooling = nonnegative_float(cooling, "cooling")
 
     offset = cooling + pre_trigger if load else pre_trigger
     total = offset + exposure + trigger_width
@@ -365,9 +361,12 @@ def reference_bracket_sequence(
     readout_exposure = positive_float(readout_exposure, "readout_exposure")
     n_ref = positive_int(n_ref, "n_ref")
     trigger_width = positive_float(trigger_width, "trigger_width")
-    for value, label in ((pre_trigger, "pre_trigger"), (gap, "gap"), (cooling, "cooling")):
-        if finite_float(value, label) < 0:
-            raise ValueError(f"{label} must be >= 0.")
+    # Coerce AND assign back (#C4): the old loop validated the values but threw the coerced
+    # floats away, so a string-like input that its sibling imaging_sequence accepts reached
+    # the cursor arithmetic below as a str and crashed with a bare TypeError.
+    pre_trigger = nonnegative_float(pre_trigger, "pre_trigger")
+    gap = nonnegative_float(gap, "gap")
+    cooling = nonnegative_float(cooling, "cooling")
     trap_channel = channel_name(trap_channel)
     cooling_channel = channel_name(cooling_channel)
     probe_channel = channel_name(probe_channel)
@@ -557,17 +556,24 @@ def decode_analog_bus(sequence: "PulseSequence", members, at_time: float) -> int
     """Reconstruct a DAC bus's SIGNED level at ``at_time`` from the compiled bit-channel pulses --
     the INVERSE of the offset-binary encoding ``apply_analog_bus_modes_to_period_states`` bakes into
     the period states (signed value + 2^(n-1) -> per-bit digital pulses, ``members`` ordered
-    LSB..MSB).  The virtual backend's analog-aware devices (e.g. the MOT monitor camera reading the
-    coil DACs) use this to SENSE what the fired sequence actually drives -- never the task's own
-    set-points -- so virtual sensing goes through the same compiled artefact the hardware plays.
-    A round-trip contract test pins this against ``set_api`` (encoder and decoder cannot drift)."""
+    LSB..MSB).  The bits are read off the DELAYED base-cycle timeline (``base_pulses()`` -- the same
+    vocabulary the camera-trigger/exposure helpers use), because that is what the hardware actually
+    PLAYS: a ``.delay()`` on the bit channels shifts the driven window, and ``edges()`` streams the
+    shifted pulses.  Reading the raw ``sequence.pulses`` list here decoded the PRE-delay level -- a
+    level the fired sequence never drives at that time.  A sense time falls inside the base cycle,
+    so repeats need no expansion.  The virtual backend's analog-aware devices (e.g. the MOT monitor
+    camera reading the coil DACs) use this to SENSE what the fired sequence actually drives -- never
+    the task's own set-points -- so virtual sensing goes through the same compiled artefact the
+    hardware plays.  Contract tests pin this against ``set_api`` (encoder and decoder cannot drift)
+    and against the ``edges()`` timeline under a delayed bus (decoder and streamer cannot drift)."""
     members = [str(m) for m in members]
     if not members:
         raise ValueError("decode_analog_bus needs the bus's member bit channels (LSB..MSB).")
     t = float(at_time)
+    pulses = sequence.base_pulses()
     word = 0
     for bit, channel in enumerate(members):
-        for p in sequence.pulses:
+        for p in pulses:
             if p.channel == channel and p.start <= t < p.start + p.duration and p.value:
                 word |= 1 << bit
                 break
