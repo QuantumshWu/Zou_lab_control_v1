@@ -232,6 +232,9 @@ def test_occupancy_nodes_publish_short_names_and_disambiguate_on_collision():
     # _logic_node_prefix checks collisions against EVERY live hub signal (#2) -> the mock console needs a
     # hub; an empty one suffices here (the running node `a` below is detected via running_nodes).
     console = SimpleNamespace(logic_nodes=[], running_nodes=[], hub=SignalHub(), _spec_for_logic=lambda n: spec)
+    # the bare-keys / base-prefix helpers are the REAL implementations, bound onto the mock
+    console._node_bare_keys = lambda n: TaskConsole._node_bare_keys(console, n)
+    console._logic_node_base_prefix = lambda n: TaskConsole._logic_node_base_prefix(console, n)
 
     t1 = TaskConsole._unique_logic_title(console, "Judge occupancy")
     cfg1 = LogicNodeConfig(kind="processor", name="Judge occupancy", title=t1)

@@ -567,7 +567,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
         return discovered_task_specs(self)
 
-    def camera_measurement(self, hub, *, camera=None, prefix: str | None = None,
+    def camera_measurement(self, hub, *, camera=None, prefix: str = "",
                            frames_per_cycle: int = 1, repeat: int = 0):
         """Build a CONTINUOUS camera Measurement over a session camera (a
         :class:`~..operations.logic.CameraMeasurement` publishing raw ``frame``s).
@@ -577,12 +577,12 @@ class ReadoutSubsystem(ExperimentSubsystem):
         resolution rule here so both entry points share a path; the node is identical
         either way (the pure-grabber contract).
 
-        ``prefix=None`` (the default) DERIVES the frame-signal prefix from the DEVICE-owned
-        naming rule (:meth:`~..devices.registry.DeviceSet.camera_signal_prefix`): the default
-        camera publishes the bare conventional ``frame_i``; any other camera publishes
-        ``<device>_frame_i`` (e.g. ``monitor_camera_frame_0``), so the name states its sensor
-        and two cameras never impersonate each other on the hub.  An EXPLICIT ``prefix``
-        (``""`` included) always wins -- the notebook keeps naming authority.
+        ``prefix`` namespaces the frame signals PER MEASUREMENT INSTANCE, exactly like every
+        other logic node's prefix: the console passes its per-instance rule
+        (``_logic_node_prefix`` -- bare ``frame_i`` for a lone row, a row-title slug only on a
+        collision); a notebook with one camera node keeps the default bare names.  WHICH device
+        the instance images is a build parameter, never part of the signal name -- a consumer
+        binds a measurement's output, not a sensor.
 
         This is the standalone live-image logic node -- one of the primitives a
         notebook or the task console composes the loading readout from by wiring
@@ -607,12 +607,6 @@ class ReadoutSubsystem(ExperimentSubsystem):
         else:
             name = str(camera) if camera else s.devices.default_camera_name()
             device = s.devices[name]                           # a name (notebook convenience)
-        if prefix is None:
-            # The DEVICE-owned naming rule (one source, DeviceSet.camera_signal_prefix): the
-            # default camera keeps the bare ``frame_i``; any other camera gets ``<device>_``.
-            # The console's declared-signal legend reads the SAME rule, so declared == published
-            # for every camera choice (#prebind).
-            prefix = s.devices.camera_signal_prefix(device)
         return CameraMeasurement(hub, device,
                                  sequencer=getattr(s.devices, "sequencer", None),
                                  frames_per_cycle=frames_per_cycle, prefix=prefix, repeat=repeat)
@@ -647,11 +641,13 @@ class ReadoutSubsystem(ExperimentSubsystem):
                 raise ValueError("region must be 'x0, x1, y0, y1' (4 numbers) or blank for full sensor.")
             return [float(p) for p in parts]
 
-        def _build(hub, *, camera=None, frames_per_cycle: int = 1,
+        def _build(hub, *, camera=None, prefix: str = "", frames_per_cycle: int = 1,
                    exposure: float | None = None, region: str = "", repeat: int = 0, **_ignored):
             # ``camera`` is the RESOLVED device the base injected from the dropdown choice (or a
-            # name, on the notebook path -- camera_measurement resolves either).
-            node = self.camera_measurement(hub, camera=camera,
+            # name, on the notebook path -- camera_measurement resolves either).  ``prefix`` is the
+            # caller's per-instance signal namespace (the console's _logic_node_prefix; a notebook
+            # defaults to the bare frame_i) -- passed through, never derived from the device.
+            node = self.camera_measurement(hub, camera=camera, prefix=prefix,
                                            frames_per_cycle=int(frames_per_cycle),
                                            repeat=max(0, int(repeat)))
             apply: dict[str, object] = {}

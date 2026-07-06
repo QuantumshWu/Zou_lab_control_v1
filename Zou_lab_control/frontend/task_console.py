@@ -6856,31 +6856,23 @@ class TaskConsole(QtWidgets.QWidget):
         row.set_publishes([(strip_node_prefix(k, pfx), "—", "") for k in self._declared_signal_keys(row)])
 
     def _declared_node_prefix(self, row: "LogicNodeRow") -> str:
-        """The hub-signal PREFIX the row's node will publish under once started -- the SAME prefix the
-        build path uses, so a declared name == the published name (a binding made before Start, or
-        restored from a saved layout, re-attaches the instant the producer starts, #prebind).
-        Measurement: the slug ``f"{spec.key}_"`` (what ScannedMeasurementNode/PulseScanNode get at
-        build); processor: the per-instance ``_logic_node_prefix``; camera: the DEVICE-owned rule
-        ``DeviceSet.camera_signal_prefix`` (the default camera publishes ``frame_i`` bare, any other
-        camera ``<device>_frame_i`` -- what ``readout.camera_measurement`` builds with); task: ``""``
-        (its mid-run entry is a synthetic display tag, not a hub name)."""
-        node = row.node
-        if node.kind == "measurement":
-            return f"{self._spec_for_logic(node).key}_"
-        if node.kind == "processor":
-            return self._logic_node_prefix(node)
-        if node.kind == "camera":
-            # READ (never re-spell) the one naming rule on the device layer, keyed by the row's
-            # camera choice (blank/None = the default camera).  A session without a device set
-            # (the embedded figure viewer) has no rule to consult -> bare names.
-            devices = getattr(self.session, "devices", None)
-            if devices is None or not hasattr(devices, "camera_signal_prefix"):
-                return ""
-            try:
-                return str(devices.camera_signal_prefix((node.values or {}).get("camera")))
-            except Exception:
-                return ""
-        return ""
+        """The hub-signal PREFIX the row's node publishes under -- so a declared name == the
+        published name (a binding made before Start, or restored from a saved layout, re-attaches
+        the instant the producer starts, #prebind).
+
+        The prefix is allocated ONCE, at Start, by the shared per-instance rule
+        (``_logic_node_prefix``) and then STICKS as the instance's identity: a row that has (ever)
+        been built reads its node's own ``prefix`` back -- re-running the collision rule later
+        would drift with hub state (a sibling stopped by the device exclusion before it ever
+        published leaves no trace, so a recomputation would 'un-collide' a name that IS published).
+        Only a never-started row PREDICTS with the same rule.  A task is off the hub (its mid-run
+        entry is a synthetic display tag, not a hub name) -> ``""``."""
+        if row.node.kind == "task":
+            return ""
+        built = self._logic_nodes.get(id(row)) or (getattr(self, "_last_node", {}) or {}).get(id(row))
+        if built is not None and hasattr(built, "prefix"):
+            return str(built.prefix or "")
+        return self._logic_node_prefix(row.node)
 
     def _declared_signal_keys(self, row: "LogicNodeRow") -> list[str]:
         """The FULL hub names a STOPPED Logic-tab node WILL publish once started -- IDENTICAL to the
@@ -7293,17 +7285,43 @@ class TaskConsole(QtWidgets.QWidget):
         a loaded title's root, so an already-clean saved layout round-trips."""
         return indexed_unique_name(title, {str(r.node.title) for r in self.logic_nodes})
 
-    def _logic_node_prefix(self, node: LogicNodeConfig) -> str:
-        """The hub-signal prefix for a logic node -- EMPTY by default, so a node publishes its
-        SHORT natural signal names (``occupied`` / ``rate`` / ``frame`` ...), NOT a verbose
-        ``judge_occupancy_rate``.  The producing node is shown by the signal-flow grouping +
-        the frame-title legend, so the producer name need not be baked into every signal.
-
-        Only a SECOND node whose OWN output keys would COLLIDE with signals an already-running
-        node publishes gets a disambiguating slug prefix (``occupancy_2_occupied``), so the two
-        never overwrite each other on the hub; the common single-instance case stays short."""
+    def _node_bare_keys(self, node: LogicNodeConfig) -> list[str]:
+        """The SHORT (un-prefixed) output names a logic node emits -- the ONE derivation shared by
+        the prefix collision check (:meth:`_logic_node_prefix`) and the declared picker names
+        (:meth:`_declared_signal_keys`), so what is checked for collision is exactly what will be
+        published.  Processor: the spec's ``result_keys``; measurement: its x/y curve keys; camera:
+        ``frame_i`` per emCCD event (``frames_per_cycle``, the same helper
+        ``CameraMeasurement.published_signals`` uses so they can never drift)."""
         spec = self._spec_for_logic(node)
-        keys = {str(k) for k in (getattr(spec, "result_keys", ()) or ())}
+        keys = [str(k) for k in (getattr(spec, "result_keys", ()) or [])]
+        if not keys and node.kind == "measurement":
+            keys = [k for k in (getattr(spec, "x_key", ""), getattr(spec, "y_key", "")) if k]
+        if not keys and node.kind == "camera":
+            from Zou_lab_control.neutral_atom.operations.logic import camera_frame_keys
+            keys = camera_frame_keys((node.values or {}).get("frames_per_cycle", 1))
+        return keys
+
+    def _logic_node_base_prefix(self, node: LogicNodeConfig) -> str:
+        """The KIND-semantic default prefix a logic node publishes under when nothing collides.
+        Measurement: ``f"{spec.key}_"`` so every signal self-describes its quantity
+        (``temperature_t_off`` -- one name, derived, #H3r).  Camera / processor: ``""`` -- the short
+        natural names (``frame_0`` / ``occupied``); the PRODUCER is shown by the signal-flow legend
+        and never baked into the signal (which camera INSTANCE, let alone which DEVICE, is not the
+        signal's business -- a consumer binds an instance's output, not a piece of hardware)."""
+        if node.kind == "measurement":
+            spec = self._spec_for_logic(node)
+            return f"{spec.key}_" if spec is not None else ""
+        return ""
+
+    def _logic_node_prefix(self, node: LogicNodeConfig) -> str:
+        """The hub-signal prefix for a logic node -- the ONE rule for EVERY kind (camera /
+        measurement / processor): the kind-semantic base prefix (:meth:`_logic_node_base_prefix`)
+        by default, upgraded to a per-INSTANCE slug (from the row's unique title, ``occupancy_2_``)
+        only when the base-prefixed names would COLLIDE with another node's signals.  A signal's
+        namespace is the logic-node INSTANCE that produces it: two rows of the same kind can never
+        overwrite each other, and no device / backend identity ever leaks into a signal name."""
+        keys = self._node_bare_keys(node)
+        base = self._logic_node_base_prefix(node)
         # Collision is checked against EVERY signal live in the hub -- running nodes AND a STOPPED
         # node's lingering signals -- not just running_nodes (#2): otherwise a new same-kind node added
         # after an earlier one STOPPED (its signals deliberately linger) would see no running collision,
@@ -7318,20 +7336,22 @@ class TaskConsole(QtWidgets.QWidget):
         # this, restarting the only occupancy node sees its own STOPPED 'occupied' still in the hub, takes
         # a fresh 'judge_occupancy_2_' prefix, and every panel bound to 'occupied' goes UNBOUND.  Its
         # prior built node survives Stop in _last_node tagged with instance_label == this node's title.
+        # (The same rule is what lets a row SWITCH its camera device and restart: the row keeps its
+        # signal names, the new device's frames simply flow under them -- panels follow seamlessly.)
         for prev in (getattr(self, "_last_node", {}) or {}).values():
             if prev is not None and str(getattr(prev, "instance_label", "")) == str(node.title):
                 try:
                     running.difference_update(str(s) for s in prev.published_signals())
                 except Exception:
                     pass
-        if not keys or not (keys & running):
-            return ""                                # no collision (incl. own restart) -> short names
+        if not keys or not any((base + key) in running for key in keys):
+            return base                              # no collision (incl. own restart) -> the base names
         from Zou_lab_control.neutral_atom.operations.measurement import measurement_slug
-        base = measurement_slug(node.title or node.name) or str(node.kind) or "node"
-        prefix, k = f"{base}_", 2
+        slug = measurement_slug(node.title or node.name) or str(node.kind) or "node"
+        prefix, k = f"{slug}_", 2
         while prefix in {getattr(n, "prefix", "") for n in self.running_nodes} \
                 or any((prefix + key) in running for key in keys):
-            prefix = f"{base}_{k}_"
+            prefix = f"{slug}_{k}_"
             k += 1
         return prefix
 
@@ -7624,8 +7644,12 @@ class TaskConsole(QtWidgets.QWidget):
             # reduces the block via repeat_mode.  Pass ``repeat`` straight INTO build (its ``_build``
             # forwards it to CameraMeasurement, whose ctor set_repeat is the single source) -- the same
             # ONE path the notebook takes, instead of building then re-setting it from a second code path.
+            # The signal prefix is the ONE per-instance rule every kind shares (_logic_node_prefix):
+            # a lone camera row publishes the short ``frame_i``; a second row that would collide gets
+            # its row-title slug.  Which DEVICE the row images is a build parameter (``values``), never
+            # part of the signal name -- a consumer binds this instance's output, not a sensor.
             repeat = self._repeat_value(values)                     # pops "repeat" off ``values``
-            return spec.build(self.hub, repeat=repeat, **values)
+            return spec.build(self.hub, prefix=self._logic_node_prefix(node), repeat=repeat, **values)
         spec = self._spec_for_logic(node)
         if spec is None:
             raise RuntimeError(f"no catalog spec named {node.name!r} for a {kind} node")
@@ -7633,18 +7657,17 @@ class TaskConsole(QtWidgets.QWidget):
             # The SPEC owns the assembly (its ProcessorSpec.make_node counterpart): ask it for the live
             # node.  ``repeat`` (re-run the whole scan N times, 0 = ∞) is the MEASUREMENT knob -- pop it
             # and hand the count to make_node; the node only FILLS its raw ``(ring, points, dim)`` block,
-            # HOW the repeats are displayed is the PLOT's ``repeat_mode`` (#H3l).  WHICH concrete node
-            # (decoupled PulseScanNode vs frame-reducing ScannedMeasurementNode) is the spec's scan TIER,
-            # not a string the GUI parses; the node publishes under the measurement's slug (spec.key) so
-            # every signal is ``<slug>_<quantity>`` (e.g. temperature_t_off) -- one name, derived.
+            # HOW the repeats are displayed is the PLOT's ``repeat_mode`` (#H3l).  The signal prefix is
+            # the shared per-instance rule: normally the measurement's slug (spec.key) so every signal
+            # is ``<slug>_<quantity>`` (temperature_t_off -- one name, derived), upgraded to the row
+            # title's slug only when a SECOND row of the same measurement would collide.
             repeat = self._repeat_value(values)
-            return spec.make_node(self.hub, prefix=f"{spec.key}_", repeat=repeat, **values)
+            return spec.make_node(self.hub, prefix=self._logic_node_prefix(node), repeat=repeat, **values)
         if kind == "processor":
             # REACTIVE processor (the "func" layer): a live node consuming hub signals
             # and republishing derived ones -- e.g. judging occupancy from each frame.
             if getattr(spec, "reactive", False):
-                # Per-INSTANCE prefix + label so multiple same-kind processors (two occupancy
-                # judges) publish DISTINCT signals and are told apart everywhere (#2).
+                # The SAME per-instance prefix rule (two occupancy judges publish DISTINCT signals, #2).
                 built = spec.make_node(self.hub, prefix=self._logic_node_prefix(node), **values)
                 built.instance_label = node.title
                 return built
