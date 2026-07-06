@@ -1218,3 +1218,67 @@ def test_edit_tab_param_edits_keep_the_snapshots_enlarged_cell(tmp_path, cell):
             win.close(); win.deleteLater()
         v.teardown()
         plt.close("all")
+
+
+def test_seed_panel_binds_the_nodes_value_signal_on_promote_fallback(tmp_path):
+    """#27: a save whose ``info['signals']`` carries NO value-role entry (``figure_capture`` skips a
+    role it cannot resolve) promotes the first stored block to the value role -- WITHOUT moving it to
+    the ``value`` key.  The seeded panel's source/inputs must therefore come from the NODE's
+    ``y_signal`` (the single owner of "which key the value landed on"): the old hand-built
+    ``fig_value`` binding named a signal the node never publishes, so exactly the fallback that
+    promised "the window still opens with a reproduction" opened an EMPTY board."""
+    from Zou_lab_control.frontend.data_figure import load_figure
+    from Zou_lab_control.frontend.figure_viewer import _seed_state
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    y = np.linspace(0.0, 1.0, 16)
+    info = {"kind": "1d",
+            "signals": {"sweep": {"block": y.reshape(1, 1, 16), "points_shape": [1],
+                                  "data_shape": [16], "label": "sweep", "unit": "", "role": "x"}}}
+    npz = tmp_path / "no_value_role.npz"
+    np.savez(npz, data_x=np.arange(16.0), data_y=y, info=info)
+
+    saved = load_figure(npz)
+    hub = SignalHub()
+    node = LoadedFigureNode(hub, saved)
+    node.step()
+    published = set(hub.names())
+    assert FIG_SIGNAL not in published, "precondition: the promote fallback really engaged"
+
+    state = _seed_state(saved, node)
+    panel = state.panels[0]
+    assert panel.inputs == [node.y_signal]
+    assert panel.source == f"value = {node.y_signal}"
+    assert node.y_signal in published, "the seeded panel binds a signal the node ACTUALLY publishes"
+
+
+def test_bare_sitemap_save_uses_neutral_role_keys_and_binds_fully(tmp_path):
+    """#28: a bare LiveSiteMap save's self-contained ``info['signals']`` keys every entry by the
+    NEUTRAL role vocabulary (value / centers / frame) -- never a live processor's private output
+    names ('occupied' / 'frame_judged'): the loader binds by ROLE, and a processor rename must not
+    silently drift the npz.  And every stored entry must be fully bindable by LoadedFigureNode."""
+    from Zou_lab_control.frontend.data_figure import load_figure
+    from Zou_lab_control.frontend.live import LiveSiteMap
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    rng = np.random.default_rng(3)
+    frame = rng.normal(600.0, 30.0, size=(20, 20))
+    centers = np.array([[5.0, 5.0], [15.0, 15.0]])
+    p = LiveSiteMap(centers, np.array([1.0, 0.0]), image=frame,
+                    labels=("x", "y", "counts")).show(display=False)
+    df = p.to_data_figure()
+    out = df.save(str(tmp_path / "bare_sites"))
+    plt.close(p.fig)
+
+    saved = load_figure(out["data"])
+    signals = saved.info["signals"]
+    assert set(signals) == {"value", "centers", "frame"},         "bare-save keys are the neutral role vocabulary, not a processor's private names"
+    for key, entry in signals.items():
+        assert entry["role"] == key, "each neutral key IS its role (loader binds by role)"
+
+    hub = SignalHub()
+    node = LoadedFigureNode(hub, saved)
+    node.step()
+    assert len(node._blocks) == len(signals), "every stored entry must bind (none dropped)"
+    assert set(node._role_key) == {"value", "centers", "frame"}
+    assert node.sitemap_centers_key and node.sitemap_image_key,         "the reopened site map resolves rings AND its background underlay"

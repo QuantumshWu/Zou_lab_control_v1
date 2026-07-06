@@ -148,3 +148,124 @@ def test_suspend_draws_silences_present_and_compose():
             setattr(canvas, name, fn)
         import matplotlib.pyplot as plt
         plt.close(plot.fig)
+# ------------------------------------------------- image family band update single-source (#25)
+def _class_method_names(path: Path, class_name: str) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return {n.name for n in node.body if isinstance(n, ast.FunctionDef)}
+    raise AssertionError(f"class {class_name} not found in {path.name}")
+
+
+def test_image_family_band_and_display_update_single_source():
+    """The image family's per-tick behaviour (side-band update, clim drag, decimated display
+    refresh + its imshow/callback wiring) is ONE implementation on BaseLivePlot -- Live2DDis and
+    LiveSiteMap may only supply the two hooks (``_band_image`` / ``_display_source``) and thin
+    ``apply_relim_now`` delegators, never a second method body (the site map's hand copies had
+    already drifted: no dead-band, dragged clim lines cleared every tick, 'off' re-autoscaled)."""
+    live_py = _FRONTEND / "live.py"
+    shared = {"update_clim", "_refresh_display_image", "_init_display_image",
+              "_update_distribution_band", "_band_apply_relim_now"}
+    base = _class_method_names(live_py, "BaseLivePlot")
+    assert shared <= base, f"BaseLivePlot must own the shared image-family layer, missing {shared - base}"
+    for cls in ("Live2DDis", "LiveSiteMap"):
+        dup = _class_method_names(live_py, cls) & (shared | {"_update_distribution"})
+        assert not dup, f"{cls} re-defines shared image-family methods {dup} -- ONE implementation only"
+    # and the shared method bodies exist exactly ONCE in the file (no third copy anywhere)
+    tree = ast.parse(live_py.read_text(encoding="utf-8"))
+    counts = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in shared:
+            counts[node.name] = counts.get(node.name, 0) + 1
+    assert all(v == 1 for v in counts.values()), f"duplicated shared methods: {counts}"
+
+
+def test_sitemap_band_inherits_deadband_and_drag_preservation(monkeypatch):
+    """Behavioural pin of the single-source band update on the SITE MAP (the drifted copy):
+    (1) DEAD-BAND -- an in-band frame wobble commits NO new colour limit (no per-tick clim/tick
+    flicker, the blit floor survives); (2) drag PRESERVATION -- clim lines dragged OUTSIDE the
+    data range survive an update (the old copy reset them unconditionally every tick);
+    (3) a line left INSIDE the data range (it would clip data) is still reset, like Live2DDis."""
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    import matplotlib.pyplot as plt
+    from Zou_lab_control.frontend.live import LiveSiteMap
+
+    rng = np.random.RandomState(0)
+    frame = rng.normal(600.0, 30.0, size=(24, 24))
+    centers = np.array([[6.0, 6.0], [18.0, 18.0]])
+    p = LiveSiteMap(centers, np.array([1.0, 0.0]), image=frame,
+                    labels=("x", "y", "counts")).show(display=False)
+    try:
+        p.update(draw=False)                              # settle the committed limits once
+        committed = (p.ylim_min, p.ylim_max)
+        # (1) dead-band: a small in-band wobble keeps the committed colour limit
+        p.set_background(frame + rng.normal(0.0, 1.0, frame.shape))
+        p.update(draw=False)
+        assert (p.ylim_min, p.ylim_max) == committed, "in-band frame noise must NOT recompute the clim"
+        assert p._band_image().get_clim() == committed, "the frame clim must stay the committed range"
+        # (2) drag preservation: lines dragged OUTSIDE the data range survive the next update
+        lo = float(np.nanmin(p._frame_values())) - 50.0
+        hi = float(np.nanmax(p._frame_values())) + 50.0
+        p.line_l.set_ydata([lo, lo]); p.line_h.set_ydata([hi, hi]); p.update_clim()
+        p.update(draw=False)
+        assert float(p.line_l.get_ydata()[0]) == lo and float(p.line_h.get_ydata()[0]) == hi,             "a dragged-out clim line must survive a steady update (was: cleared every tick)"
+        # (3) a line INSIDE the data range would clip data -> reset to the committed limits
+        mid = float(np.nanmean(p._frame_values()))
+        p.line_l.set_ydata([mid, mid]); p.update_clim()
+        p.update(draw=False)
+        assert float(p.line_l.get_ydata()[0]) == p.ylim_min, "a clipping clim line is reset (2D parity)"
+    finally:
+        plt.close(p.fig)
+
+
+# --------------------------------------------- embedded-canvas identity predicate (#29)
+def test_embedded_canvas_identity_predicate_single_source():
+    """The "is this the embedded Qt canvas" fact is ONE predicate (``live._is_embedded_canvas``
+    reading the ``_zlc_embedded`` marker) -- live.py must not re-spell a class-name string compare
+    (the old three copies had already drifted), and the predicate must hold for SUBCLASSES (the
+    string test silently dropped them back to the notebook draw_idle path)."""
+    src = (_FRONTEND / "live.py").read_text(encoding="utf-8")
+    assert src.count('"EmbeddedFigureCanvas"') == 0,         "live.py must test canvas identity ONLY via _is_embedded_canvas (marker), never the class name"
+    from Zou_lab_control.frontend.live import _is_embedded_canvas
+
+    assert not _is_embedded_canvas(None)
+    assert not _is_embedded_canvas(object())
+    pytest.importorskip("PyQt5")
+    from Zou_lab_control.frontend.qt_canvas import EmbeddedFigureCanvas
+    if EmbeddedFigureCanvas is None:
+        pytest.skip("matplotlib-qt missing")
+    assert EmbeddedFigureCanvas._zlc_embedded is True     # the marker rides the class
+    class _Sub(EmbeddedFigureCanvas):                      # a subclass keeps the blit path
+        pass
+    assert _is_embedded_canvas.__doc__ and "_zlc_embedded" in _is_embedded_canvas.__doc__
+    assert bool(getattr(_Sub, "_zlc_embedded", False)), "subclasses must inherit the marker"
+
+
+# ------------------------------------------------------- param_widgets stays a leaf (#30)
+def test_param_widgets_is_a_leaf_no_task_console_back_edge():
+    """param_widgets is the LEAF the console depends on -- it must never import task_console,
+    not even lazily inside a function body (the old lazy back-imports made a cycle that
+    contradicted its own docstring).  AST-scanned so a docstring MENTION stays legal."""
+    tree = ast.parse((_FRONTEND / "param_widgets.py").read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            assert "task_console" not in str(node.module or ""), \
+                f"param_widgets imports task_console at line {node.lineno} -- the leaf grew a back-edge"
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert "task_console" not in alias.name, \
+                    f"param_widgets imports task_console at line {node.lineno} -- the leaf grew a back-edge"
+
+
+def test_grouped_picker_helpers_single_source_in_param_widgets():
+    """The grouped-signal-picker cluster is defined ONCE, in param_widgets (task_console
+    forward-imports it) -- so the console cannot regrow a private copy."""
+    targets = {"coerce_short_labels", "fill_grouped_signal_combo", "read_editable_combo",
+               "grouped_signal_items", "signal_tree_groups", "signal_state"}
+    hits = {}
+    for py in _FRONTEND.glob("*.py"):
+        for name in _defs_named(py, targets):
+            hits.setdefault(name, []).append(py.name)
+    for name in sorted(targets):
+        assert hits.get(name) == ["param_widgets.py"],             f"{name} defined in {hits.get(name)}, must be ONLY param_widgets.py"

@@ -340,6 +340,17 @@ def _dist_count_xlim(n) -> int:
     return max(10, int(max(peak + 5, peak * 1.5)))
 
 
+def _is_embedded_canvas(canvas) -> bool:
+    """The ONE identity test for the GUI's embedded Qt canvas (``qt_canvas.EmbeddedFigureCanvas``) --
+    the only canvas with the offscreen-Agg/stretch-blit split that ``compose()`` / ``present()`` /
+    ``_compose_blit()`` key off.  Checked via its ``_zlc_embedded`` marker attribute ON PURPOSE:
+    live.py must stay importable without Qt/matplotlib-qt (headless + notebook paths; see
+    tests/conftest.py's Agg pinning history), so never "normalise" this into ``import qt_canvas``
+    + ``isinstance``.  Subclasses inherit the marker, so a subclassed canvas keeps the blit path
+    (the old per-call-site ``type(canvas).__name__`` string test silently dropped it)."""
+    return canvas is not None and bool(getattr(canvas, "_zlc_embedded", False))
+
+
 class BaseLivePlot:
     """Base class shared by notebook live plotters.
 
@@ -404,6 +415,121 @@ class BaseLivePlot:
         if cur <= 0 or want > cur or want < 0.6 * cur:
             self._count_ceiling = want
         return self._count_ceiling
+
+    # ------------------------------------------------------------------ image family (shared layer)
+    # Live2DDis + LiveSiteMap share ONE "full-resolution array + image artist" model: a decimated
+    # display view re-sliced on zoom, and a side clim-band updated per tick.  The whole behaviour
+    # lives on the shared methods below; the ONLY per-class facts are two hooks -- which artist the
+    # band drives (``_band_image``) and which array/artist pair the display shows (``_display_source``).
+    # The VALUE source deliberately stays two hooks too (Live2DDis samples ``data_y`` via
+    # ``_distribution_values`` with its cap; LiveSiteMap ravels the camera frame via
+    # ``_frame_values``) -- callers pass their own values in, the functions are never merged.
+
+    #: Guard: a display-image refresh must not recurse through the xlim/ylim callbacks that
+    #: triggered it.  A class default so the flag exists before any image-family init runs.
+    _in_display_refresh = False
+
+    def _display_source(self):
+        """Hook -- the ``(full-resolution array, image artist)`` pair the decimated display view
+        shows, or ``None`` when there is nothing to refresh (a 1d plot; a site map before its
+        first camera frame).  Keyed off by the ONE :meth:`_refresh_display_image`."""
+        return None
+
+    def _init_display_image(self, array, extent, cmap):
+        """imshow ``array`` as its decimated view + wire the xlim/ylim callbacks that re-slice it
+        on zoom -- the ONE display-policy wiring for the image family, paired with
+        :meth:`_refresh_display_image` (the budget is read per refresh; see Live2DDis.init_core)."""
+        small, small_ext = _decimate_image_view(array, extent, (extent[0], extent[1]),
+                                                (extent[2], extent[3]), _image_axes_px_budget(self.ax))
+        artist = self.ax.imshow(small, cmap=cmap, extent=small_ext, interpolation="antialiased")
+        self.ax.callbacks.connect("xlim_changed", lambda _ax: self._refresh_display_image())
+        self.ax.callbacks.connect("ylim_changed", lambda _ax: self._refresh_display_image())
+        return artist
+
+    def _refresh_display_image(self) -> None:
+        """Re-slice + re-decimate the displayed view from the full-resolution array -- on every
+        new frame and every xlim/ylim change (zooming back INTO the full array is what brings the
+        detail back).  The ONE implementation for the image family (the array/artist pair comes
+        from the :meth:`_display_source` hook).  Guarded: set_extent inside the refresh must not
+        recurse through the lim callbacks that triggered it."""
+        src = self._display_source()
+        if src is None or self._in_display_refresh:
+            return
+        array, artist = src
+        self._in_display_refresh = True
+        try:
+            small, small_ext = _decimate_image_view(array, self.extent, self.ax.get_xlim(),
+                                                    self.ax.get_ylim(), _image_axes_px_budget(self.ax))
+            artist.set_array(small)
+            artist.set_extent(small_ext)
+        finally:
+            self._in_display_refresh = False
+
+    def _band_image(self):
+        """Hook -- the image artist the side clim-band controls (``None`` = no band: a 1d plot, a
+        site map with no camera frame).  The ONE hook :meth:`update_clim` /
+        :meth:`_band_apply_relim_now` / :meth:`_update_distribution_band` key off."""
+        return None
+
+    def update_clim(self) -> None:
+        """Push the two dragged clim lines into the band's image -- the DragHLine callback wired
+        by :meth:`_build_distribution_band` (#C1), single-sourced for the image family."""
+        image = self._band_image()
+        if image is not None and getattr(self, "line_l", None) is not None:
+            image.set_clim(float(self.line_l.get_ydata()[0]), float(self.line_h.get_ydata()[0]))
+
+    def _band_apply_relim_now(self, values) -> None:
+        """Mode-switch rescale for the image family's colour limit (the 2D analogue of the base
+        class's y-axis :meth:`apply_relim_now`): recompute the (lo, hi) for the current
+        ``relim_mode`` and re-apply image clim + band y-range + BOTH draggable clim lines NOW, so
+        a normal<->tight switch in Setting visibly re-maps the colorbar.  Tolerates the degenerate
+        site map (no frame -> no band -> no-op)."""
+        image = self._band_image()
+        values = np.asarray(values, dtype=float).reshape(-1)
+        if image is None or getattr(self, "poly", None) is None or not values.size:
+            return
+        y_min = float(np.nanmin(values))
+        y_max = float(np.nanmax(values))
+        self.ylim_min, self.ylim_max = self._mode_target(y_min, y_max)
+        image.set_clim(self.ylim_min, self.ylim_max)
+        self.axdis.set_ylim(self.ylim_min, self.ylim_max)
+        self.line_l.set_ydata([self.ylim_min, self.ylim_min])
+        self.line_h.set_ydata([self.ylim_max, self.ylim_max])
+
+    def _update_distribution_band(self, values) -> bool:
+        """The ONE per-tick side-band update -- the UPDATE-side counterpart of
+        :meth:`_build_distribution_band` (#C1), shared by the image family so the behaviour cannot
+        drift again (the site map's hand copy had lost the dead-band, cleared dragged clim lines
+        every tick, and re-autoscaled on relim_mode='off').  DEAD-BANDED colour limit: the
+        committed (lo, hi) obeys the SAME :meth:`relim` hysteresis as the 1D y-axis instead of a
+        raw per-tick recompute, so a live camera frame does not flicker its colorbar / dist axis
+        (and force a blit-background recapture) on per-frame brightness noise.  Refreshes the
+        histogram + dead-banded count axis, keeps the faint min/max guide lines on the RAW data
+        range (when this band has them), and resets the draggable clim lines ONLY when a line
+        would clip the data -- a user's dragged clim survives steady frames.  Returns True when
+        the band updated (False = degenerate: no band / no data)."""
+        image = self._band_image()
+        if image is None or getattr(self, "poly", None) is None:
+            return False
+        values = np.asarray(values, dtype=float).reshape(-1)
+        if not values.size:
+            return False
+        y_min = float(np.nanmin(values))
+        y_max = float(np.nanmax(values))
+        self.relim(values)
+        self.axdis.set_ylim(self.ylim_min, self.ylim_max)
+        self.n, self.bins = np.histogram(values, bins=self.n_bins, range=(self.ylim_min, self.ylim_max))
+        _update_verts(self.bins, self.n, self.verts, mode="horizontal")
+        self.poly.set_verts(self.verts)
+        self.axdis.set_xlim(0, self._count_axis_limit(self.n))
+        if getattr(self, "line_min", None) is not None:
+            self.line_min.set_ydata([y_min, y_min])          # faint guides still show the RAW data range
+            self.line_max.set_ydata([y_max, y_max])
+        if float(self.line_l.get_ydata()[0]) > y_min or float(self.line_h.get_ydata()[0]) < y_max:
+            self.line_l.set_ydata([self.ylim_min, self.ylim_min])
+            self.line_h.set_ydata([self.ylim_max, self.ylim_max])
+            self.update_clim()
+        return True
 
     def __init__(
         self,
@@ -710,7 +836,7 @@ class BaseLivePlot:
         # The embedded canvas' draw() renders SYNCHRONOUSLY without scheduling a Qt paint (present() owns
         # that), so the buffer is ready for the batched present.  A notebook (ipympl) / headless canvas
         # has no offscreen-buffer split -- it renders + pushes in present() (draw_idle), as before.
-        if canvas is not None and type(canvas).__name__ == "EmbeddedFigureCanvas":
+        if _is_embedded_canvas(canvas):
             canvas.draw()
 
     def present(self) -> None:
@@ -732,7 +858,7 @@ class BaseLivePlot:
         canvas = getattr(self.fig, "canvas", None)
         if canvas is None:
             return
-        if type(canvas).__name__ == "EmbeddedFigureCanvas":
+        if _is_embedded_canvas(canvas):
             canvas.update()
             return
         canvas.draw_idle()
@@ -798,7 +924,9 @@ class BaseLivePlot:
         captured ONCE and every subsequent tick blits.  So a plot whose chrome jitters every frame
         never pays a recapture penalty (it just full-draws as before); a stable plot blits at ~20x."""
         canvas = getattr(self.fig, "canvas", None)
-        if (canvas is None or type(canvas).__name__ != "EmbeddedFigureCanvas"
+        # blit is the ONLY user of the Agg region ops, so their belt-and-braces guard stays at
+        # THIS call site (compose/present need only the identity predicate).
+        if (not _is_embedded_canvas(canvas)
                 or not hasattr(canvas, "copy_from_bbox") or not hasattr(canvas, "restore_region")):
             return False
         arts = self._blit_data_artists()
@@ -1417,14 +1545,7 @@ class Live2DDis(BaseLivePlot):
         # crisp pixels), filtered when larger (a decimated camera frame never shows aliasing).
         # The budget is read PER REFRESH: the split axes reach their final position only at the
         # first layout pass, so a cached value would freeze the pre-layout (full-figure) size.
-        small, small_ext = _decimate_image_view(self.grid, self.extent,
-                                                (self.extent[0], self.extent[1]),
-                                                (self.extent[2], self.extent[3]),
-                                                _image_axes_px_budget(self.ax))
-        self.image = self.ax.imshow(small, cmap=cmap, extent=small_ext, interpolation="antialiased")
-        self._in_display_refresh = False
-        self.ax.callbacks.connect("xlim_changed", lambda _ax: self._refresh_display_image())
-        self.ax.callbacks.connect("ylim_changed", lambda _ax: self._refresh_display_image())
+        self.image = self._init_display_image(self.grid, self.extent, cmap)
         self.lines = [self.image]
         self.ax.set_anchor("W")
         self.ax.set_aspect("equal", adjustable="box")
@@ -1489,39 +1610,17 @@ class Live2DDis(BaseLivePlot):
         self.tools = attach_interaction(self.ax, drag=self.drag, axdis=self.axdis)
         self.area, self.cross, self.zoom, self.drag = self.tools.area, self.tools.cross, self.tools.zoom, self.tools.drag
 
-    def _refresh_display_image(self) -> None:
-        """Re-slice + re-decimate the displayed view from the full-resolution grid -- on every
-        new frame and every xlim/ylim change (zooming back INTO the full array is what brings
-        the detail back).  Guarded: set_extent inside the refresh must not recurse through the
-        lim callbacks that triggered it."""
-        if self._in_display_refresh:
-            return
-        self._in_display_refresh = True
-        try:
-            small, small_ext = _decimate_image_view(self.grid, self.extent, self.ax.get_xlim(),
-                                                    self.ax.get_ylim(), _image_axes_px_budget(self.ax))
-            self.image.set_array(small)
-            self.image.set_extent(small_ext)
-        finally:
-            self._in_display_refresh = False
+    def _display_source(self):
+        # the full-resolution scan grid + its imshow artist (shared refresh: BaseLivePlot)
+        return self.grid, self.image
 
-    def update_clim(self) -> None:
-        self.image.set_clim(float(self.line_l.get_ydata()[0]), float(self.line_h.get_ydata()[0]))
+    def _band_image(self):
+        return getattr(self, "image", None)
 
     def apply_relim_now(self) -> None:
-        # 2D analogue of the y-axis rescale: recompute the colour limit for the
-        # current relim_mode and re-apply it + the draggable clim lines now, so a
-        # normal<->tight switch in Setting visibly re-maps the colorbar.
-        vals = self._distribution_values()
-        if not vals.size:
-            return
-        y_min = float(np.nanmin(vals))
-        y_max = float(np.nanmax(vals))
-        self.ylim_min, self.ylim_max = self._mode_target(y_min, y_max)
-        self.image.set_clim(self.ylim_min, self.ylim_max)
-        self.axdis.set_ylim(self.ylim_min, self.ylim_max)
-        self.line_l.set_ydata([self.ylim_min, self.ylim_min])
-        self.line_h.set_ydata([self.ylim_max, self.ylim_max])
+        # 2D analogue of the y-axis rescale, via the SHARED image-family band helper; this class's
+        # value source is the (capped) data_y sample, never the sitemap's frame ravel.
+        self._band_apply_relim_now(self._distribution_values())
 
     def apply_param(self, key: str, value) -> bool:
         """The colormap is DISPLAY-ONLY: swap it on the EXISTING image in place (the colorbar hangs off
@@ -1537,27 +1636,13 @@ class Live2DDis(BaseLivePlot):
     def update_core(self) -> None:
         self.grid = self.fill_grid()
         self._refresh_display_image()
-        vals = self._distribution_values()
-        if vals.size:
-            y_min = float(np.nanmin(vals))
-            y_max = float(np.nanmax(vals))
-            # DEAD-BANDED colour limit: the colorbar range obeys the SAME hysteresis as the 1D y-axis
-            # (relim) instead of recomputing every tick -- so a live camera frame does not flicker its
-            # colorbar / dist axis (and force a blit-background recapture) on per-frame brightness noise.
-            self.relim(vals)
-            self.axdis.set_ylim(self.ylim_min, self.ylim_max)
-            self.n, self.bins = np.histogram(vals, bins=self.n_bins, range=(self.ylim_min, self.ylim_max))
-            _update_verts(self.bins, self.n, self.verts, mode="horizontal")
-            self.poly.set_verts(self.verts)
-            self.axdis.set_xlim(0, self._count_axis_limit(self.n))
-            self.line_min.set_ydata([y_min, y_min])          # faint guides still show the RAW data range
-            self.line_max.set_ydata([y_max, y_max])
-            if float(self.line_l.get_ydata()[0]) > y_min or float(self.line_h.get_ydata()[0]) < y_max:
-                self.line_l.set_ydata([self.ylim_min, self.ylim_min])
-                self.line_h.set_ydata([self.ylim_max, self.ylim_max])
-                self.update_clim()
+        # Dead-banded colour limit + histogram + guide/clim lines: the SHARED image-family band
+        # update (BaseLivePlot._update_distribution_band, #C1).
+        if self._update_distribution_band(self._distribution_values()):
             # Colorbar end ticks at the committed (dead-banded) COLOUR range -- the range the image is
-            # actually mapped to -- so they too stay put frame-to-frame (the data min/max is on the guides).
+            # actually mapped to -- so they too stay put frame-to-frame (the data min/max is on the
+            # guides).  2D-ONLY chrome: the site map's colorbar keeps stock ticks (and may not exist
+            # at all), so this stays OUT of the shared band update on purpose.
             self.cax.set_yticks([self.ylim_min, self.ylim_max])
             self.cax.set_yticklabels([_float2str_eng(v, length=5) for v in [self.ylim_min, self.ylim_max]])
 
@@ -1619,19 +1704,14 @@ class LiveSiteMap(BaseLivePlot):
         else:
             self.background = arr               # shape changed: rebuilt by the host
 
-    def _refresh_display_image(self) -> None:
-        """Same display refresh as :meth:`Live2DDis._refresh_display_image`, over the sitemap's
-        full-resolution camera frame (``self.background``)."""
-        if self._bg_image is None or self._in_display_refresh:
-            return
-        self._in_display_refresh = True
-        try:
-            small, small_ext = _decimate_image_view(self.background, self.extent, self.ax.get_xlim(),
-                                                    self.ax.get_ylim(), _image_axes_px_budget(self.ax))
-            self._bg_image.set_array(small)
-            self._bg_image.set_extent(small_ext)
-        finally:
-            self._in_display_refresh = False
+    def _display_source(self):
+        # the full-resolution camera frame + its underlay artist; None before the first frame
+        # (rings only), so the SHARED refresh (BaseLivePlot._refresh_display_image) no-ops.
+        img = getattr(self, "_bg_image", None)
+        return None if img is None else (self.background, img)
+
+    def _band_image(self):
+        return getattr(self, "_bg_image", None)
 
     def _ring_styles(self, values: np.ndarray):
         """Per-site (edge RGBA, linewidth) from occupancy: value >= 0.5 -> occupied
@@ -1660,16 +1740,10 @@ class LiveSiteMap(BaseLivePlot):
                       float(centers[:, 1].max()) + pad, float(centers[:, 1].min()) - pad]
         self.extent = extent
         if self.background is not None:
-            # same display policy as Live2DDis: the FULL frame stays in self.background, the
-            # artist shows a block-mean view within the axes' pixel budget, re-sliced on zoom
-            # (budget read per refresh -- see Live2DDis.init_core).
-            small, small_ext = _decimate_image_view(self.background, extent,
-                                                    (extent[0], extent[1]), (extent[2], extent[3]),
-                                                    _image_axes_px_budget(self.ax))
-            self._bg_image = self.ax.imshow(small, cmap=self.cmap, extent=small_ext, interpolation="antialiased")
-            self._in_display_refresh = False
-            self.ax.callbacks.connect("xlim_changed", lambda _ax: self._refresh_display_image())
-            self.ax.callbacks.connect("ylim_changed", lambda _ax: self._refresh_display_image())
+            # SAME display policy as Live2DDis -- the shared _init_display_image/_refresh_display_image
+            # pair: the FULL frame stays in self.background, the artist shows a block-mean view within
+            # the axes' pixel budget, re-sliced on zoom (budget read per refresh).
+            self._bg_image = self._init_display_image(self.background, extent, self.cmap)
         else:
             self._bg_image = None
         diameter = 2.0 * self.roi_radius
@@ -1725,46 +1799,20 @@ class LiveSiteMap(BaseLivePlot):
         self.tools = attach_interaction(self.ax, drag=drag, axdis=self.axdis)
         self.area, self.cross, self.zoom, self.drag = self.tools.area, self.tools.cross, self.tools.zoom, self.tools.drag
 
-    def update_clim(self) -> None:
-        if self._bg_image is not None and getattr(self, "line_l", None) is not None:
-            self._bg_image.set_clim(float(self.line_l.get_ydata()[0]), float(self.line_h.get_ydata()[0]))
-
     def apply_relim_now(self) -> None:
-        vals = self._frame_values()
-        if self._bg_image is None or getattr(self, "poly", None) is None or not vals.size:
-            return
-        y_min, y_max = float(np.nanmin(vals)), float(np.nanmax(vals))
-        self.ylim_min, self.ylim_max = self._mode_target(y_min, y_max)
-        self._bg_image.set_clim(self.ylim_min, self.ylim_max)
-        self.axdis.set_ylim(self.ylim_min, self.ylim_max)
-        self.line_l.set_ydata([self.ylim_min, self.ylim_min])
-        self.line_h.set_ydata([self.ylim_max, self.ylim_max])
-
-    def _update_distribution(self) -> None:
-        # Recompute the frame colour-limit for the current lim-mode (normal=from 0, tight=bracket,
-        # fixed=pinned via _mode_target) + refresh the side histogram, like Live2DDis.update_core.
-        vals = self._frame_values()
-        if getattr(self, "poly", None) is None or not vals.size:
-            return
-        y_min, y_max = float(np.nanmin(vals)), float(np.nanmax(vals))
-        self.ylim_min, self.ylim_max = self._mode_target(y_min, y_max)
-        if self._bg_image is not None:
-            self._bg_image.set_clim(self.ylim_min, self.ylim_max)
-        self.axdis.set_ylim(self.ylim_min, self.ylim_max)
-        self.n, self.bins = np.histogram(vals, bins=self.n_bins, range=(self.ylim_min, self.ylim_max))
-        _update_verts(self.bins, self.n, self.verts, mode="horizontal")
-        self.poly.set_verts(self.verts)
-        self.axdis.set_xlim(0, self._count_axis_limit(self.n))
-        # keep the draggable clim lines at the (re)computed limits unless the user dragged inside
-        if getattr(self, "line_l", None) is not None:
-            self.line_l.set_ydata([self.ylim_min, self.ylim_min])
-            self.line_h.set_ydata([self.ylim_max, self.ylim_max])
+        # the SHARED image-family band helper; this class's value source is the frame ravel.
+        self._band_apply_relim_now(self._frame_values())
 
     def update_core(self) -> None:
         edge, widths = self._ring_styles(self.data_y[:, 0])
         self.sites.set_edgecolors(edge)
         self.sites.set_linewidths(widths)
-        self._update_distribution()              # refresh the frame-intensity histogram + clim
+        # Frame-intensity histogram + colour limit through the SHARED image-family band update
+        # (BaseLivePlot._update_distribution_band): the dead-banded relim hysteresis + the
+        # drag-line preservation rule now come from the ONE implementation the 2D image already
+        # had (this class's hand copy had drifted -- no hysteresis, dragged clim lines cleared
+        # every tick, relim_mode='off' re-autoscaled).
+        self._update_distribution_band(self._frame_values())
 
     def _install_state(self) -> None:
         self.fig._zlc_state = PlotState(plot_type="SITES", x_array=self.data_x[:, 0], y_array=self.data_y,

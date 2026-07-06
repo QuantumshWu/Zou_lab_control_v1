@@ -286,10 +286,14 @@ class DataFigure:
         """The self-contained ``info['signals']`` blocks a bare SITE-MAP save folds in so a reopen rebuilds
         the rings AND the background camera frame WITHOUT any device provenance -- the ``value`` occupancy,
         the ``(N, 2)`` centres and (crucially) the underlay ``frame`` -- in the SAME schema the rich
-        capture (``operations.figure_capture``) writes.  Empty when there is nothing to store (no bound
-        site-map plotter / no background frame), so a save is never blocked.  The blocks carry the native
-        ``(repeat, *points, *data)`` axes (occupancy ``(1, 1, N)``, frame ``(1, 1, H, W)``) so the reloader
-        declares the SAME shape contract a live producer did."""
+        capture (``operations.figure_capture``) writes.  The entry KEYS are the NEUTRAL role vocabulary
+        (``value`` / ``centers`` / ``frame`` -- the loader binds by each entry's ``role``, never by key):
+        a rich save's keys are its producer's own bare signal names, but a bare save has NO producer, so
+        it must not hand-copy some live processor's private output names (the old ``occupied`` /
+        ``frame_judged`` literals silently drifted from ``OccupancyProcessor.provides``).  Empty when
+        there is nothing to store (no bound site-map plotter / no background frame), so a save is never
+        blocked.  The blocks carry the native ``(repeat, *points, *data)`` axes (occupancy ``(1, 1, N)``,
+        frame ``(1, 1, H, W)``) so the reloader declares the SAME shape contract a live producer did."""
         lp = self.live_plot
         centers = getattr(lp, "data_x", None)
         background = getattr(lp, "background", None)
@@ -300,17 +304,17 @@ class DataFigure:
         occ = np.asarray(getattr(lp, "data_y", self.data_y), dtype=float).reshape(-1)[:n].reshape(1, 1, n)
         ylabel = self.labels[1] if len(self.labels) > 1 else "occupancy"
         signals: dict[str, Any] = {
-            "occupied": {"block": occ, "points_shape": [1], "data_shape": [n],
-                         "label": str(ylabel), "unit": "", "role": "value"},
+            "value": {"block": occ, "points_shape": [1], "data_shape": [n],
+                      "label": str(ylabel), "unit": "", "role": "value"},
             "centers": {"block": centers, "points_shape": None, "data_shape": None,
                         "label": "site centre", "unit": "px", "role": "centers"},
         }
         if background is not None:
             frame = np.asarray(background, dtype=float)
             h, w = frame.shape
-            signals["frame_judged"] = {"block": frame.reshape(1, 1, h, w), "points_shape": [1],
-                                       "data_shape": [h, w], "label": "camera image", "unit": "counts",
-                                       "role": "frame"}
+            signals["frame"] = {"block": frame.reshape(1, 1, h, w), "points_shape": [1],
+                                "data_shape": [h, w], "label": "camera image", "unit": "counts",
+                                "role": "frame"}
         return signals
 
     def _saved_fit_info(self) -> dict[str, Any] | None:

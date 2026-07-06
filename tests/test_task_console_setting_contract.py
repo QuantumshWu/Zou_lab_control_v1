@@ -406,7 +406,7 @@ def test_signal_combo_groups_signals_under_their_producer():
     """#5b: the signal picker is a TWO-LEVEL list -- a non-selectable header per producing node,
     its signals indented beneath -- so the producer is named ONCE (the group) instead of being
     repeated in every signal label (which made the labels too long)."""
-    from Zou_lab_control.frontend.task_console import grouped_signal_items
+    from Zou_lab_control.frontend.param_widgets import grouped_signal_items
 
     # the SINGLE shared builder every signal picker uses (plot panels AND the logic-node source)
     items = grouped_signal_items(

@@ -90,10 +90,8 @@ from .qt_fluent import (
     FluentSwitch,
     FluentTabWidget,
     FluentFloatingEditor,
-    FluentWindow,
-    center_window_on_primary_screen,
     ensure_qt_app,
-    retain_window,
+    launch_fluent_window,
     fluent_text_width,
     fluent_widget_stylesheet,
     scaled_px,
@@ -119,6 +117,13 @@ from Zou_lab_control._paths import display_path
 # ParamDecl of kind K is built / read / seeded / validated / refreshed by PARAM_WIDGETS[K].
 # Adding a kind is one handler there + one whitelist entry on ParamDecl, not 5-7 ladders here.
 from .param_widgets import PARAM_WIDGETS, SPAN_KINDS, ParamWidgetContext, RefreshProviders
+# The grouped-signal-picker cluster lives in param_widgets (the leaf; see the note above
+# strip_node_prefix) -- forward imports only, so the leaf never back-imports this module.
+from .param_widgets import (
+    coerce_short_labels,
+    fill_grouped_signal_combo,
+    read_editable_combo,
+)
 
 # ParamDecl is the ONE declarative param record both the measurement form and the plot
 # panels use (PANEL_PARAMS).  Importing it here (frontend -> operations is allowed; the
@@ -126,8 +131,27 @@ from .param_widgets import PARAM_WIDGETS, SPAN_KINDS, ParamWidgetContext, Refres
 # instead of a parallel ParamSpec class with its own smaller ladder.
 from Zou_lab_control.neutral_atom.operations.measurement import ParamDecl
 
+# The default mid-run buffer key -- the spec layer's ONE spelling (TaskSpec.mid_run_key's
+# default), imported so the console's spec-less fallbacks can never drift from it.
+from Zou_lab_control.neutral_atom.operations.task import DEFAULT_MID_RUN_KEY
+
 
 TASK_FILES_ENV = "ZLC_TASK_DIR"
+
+# ---- RESERVED expression-namespace keys (each spelled ONCE; every writer/reader shares these).
+#: The running task's mid-run frame: injected off-hub by the console each tick, read by the
+#: task's dedicated panel (its source is ``value = {TASK_FRAME_KEY}``) -- never a hub signal.
+TASK_FRAME_KEY = "__task_frame__"
+#: Per-signal publish counters ({name: version}) so a rolling monitor tells a new sample of
+#: its OWN source from an unrelated node's version bump.
+SIG_VERSIONS_KEY = "__sig_versions__"
+#: Coordinate frames ({signal_name: [x0, x1, y0, y1]}) from any node whose acquisition source
+#: declares a ROI -- a 2D panel puts its axes in real camera pixels.
+COORD_FRAMES_KEY = "__coord_frames__"
+
+#: The display suffix marking a task's SYNTHETIC mid-run entry in the picker / Logic legend
+#: (never part of a hub name) -- one spelling shared by the declared and the running paths.
+MID_RUN_TAG = " (mid-run)"
 
 # WHICH hardware a logic node drives is the NODE's own ``occupied_devices()`` declaration
 # (operations/logic.py LogicNode, from its ``_occupies`` attribute names) -- the console's
@@ -226,26 +250,11 @@ def panel_allows_multi_slot(kind: str) -> bool:
     return str(kind) not in PANEL_SINGLE_SLOT_KINDS
 
 
-def _common_token_prefix(names) -> str:
-    """The longest common UNDERSCORE-token prefix of ``names`` -- e.g. both
-    ``judge_occupancy_rate`` and ``judge_occupancy_occupied`` share ``judge_occupancy_``.
-    Empty for fewer than two names or no shared leading token.  Used to strip the producer
-    prefix the hub prepends from a grouped signal picker's labels (the producer is the group
-    header, so its name need not repeat in every signal)."""
-    import os.path as _op
-    names = [str(n) for n in names]
-    if len(names) < 2:
-        return ""
-    common = _op.commonprefix(names)
-    cut = common.rfind("_")
-    return common[: cut + 1] if cut >= 0 else ""
-
-
-def signal_state(name, formats) -> str:
-    """A signal has exactly TWO states (G3): "ready" when it is PUBLISHED on the hub right now
-    (so it has a live shape in ``formats``), else "waiting" -- it is declared by a node that has
-    not started / not produced yet.  No more none/unbound/error/mid-run/unpublished clutter."""
-    return "ready" if formats.get(str(name)) else "waiting"
+# The grouped-signal-picker helper cluster (signal_state / grouped_signal_items /
+# signal_tree_groups / fill_grouped_signal_combo / read_editable_combo / coerce_short_labels,
+# #combo-parity) moved DOWN to param_widgets.py -- the leaf this module already imports -- so the
+# leaf's old lazy back-imports of it are gone (no frontend cycle).  strip_node_prefix stays here:
+# it is the Logic tab's rule (shared vocabulary, not a picker widget helper).
 
 
 def strip_node_prefix(full: str, prefix: str) -> str:
@@ -256,160 +265,6 @@ def strip_node_prefix(full: str, prefix: str) -> str:
     full = str(full)
     prefix = str(prefix or "")
     return full[len(prefix):] if (prefix and full.startswith(prefix) and len(full) > len(prefix)) else full
-
-
-def _signal_short_label(name, group, labels) -> str:
-    """The leaf label for ``name`` under its producer node in the picker nest: the SHORT signal name --
-    the producing node's prefix stripped (``temperature_survival`` -> ``survival``, ``frame`` ->
-    ``frame``), passed in via ``labels`` (the ``short_names_provider`` map, built from each running
-    node's prefix; #design: the nest already names the producer, so the leaf is the short NAME, NOT the
-    verbose SignalSpec axis label like ``camera image``).  For a signal with no mapped short name (a
-    declared-but-not-running node), fall back to the shared-token prefix stripped from the group, else
-    the bare name."""
-    short = (labels or {}).get(str(name))
-    if short:
-        return str(short)
-    strip = _common_token_prefix(group)
-    if strip and name.startswith(strip) and len(name) > len(strip):
-        return name[len(strip):]
-    return str(name)
-
-
-def grouped_signal_items(names, sources, formats, labels=None) -> list:
-    """``[(display, bare_name | None)]`` for a signal picker, GROUPED by producing node: a
-    non-selectable bold header per node (``bare_name`` is ``None``), then that node's signals
-    indented beneath it -- shown by their HUMAN label (the SignalSpec the producing node declares),
-    with the SHAPE and the two-state tag (``    Loading rate  [(35,)] ready`` / ``    Survival
-    waiting``).  ``data`` stays the BARE signal name (the binding key); only the DISPLAY is humanised.
-    The ONE source every signal picker shares (plot panel AND logic-node source)."""
-    names = sorted(str(n) for n in (names or []))
-    sources = dict(sources or {})
-    formats = dict(formats or {})
-    labels = dict(labels or {})
-    by_producer: dict[str, list[str]] = {}
-    for name in names:
-        for p in ([str(p) for p in (sources.get(name) or [])] or ["(unbound)"]):
-            by_producer.setdefault(p, []).append(name)
-    items: list[tuple[str, str | None]] = []
-    for producer in sorted(by_producer, key=lambda p: (p == "(unbound)", p.lower())):
-        group = by_producer[producer]
-        items.append((producer, None))            # group header (rendered disabled + bold)
-        for name in group:
-            short = _signal_short_label(name, group, labels)
-            fmt = formats.get(name)
-            state = signal_state(name, formats)
-            shape = f"  [{fmt}]" if fmt else ""
-            items.append((f"    {short}{shape}  {state}", name))
-    return items
-
-
-def signal_tree_groups(names, sources, formats, labels=None) -> list:
-    """``[(producer, [(leaf_label, bare_name, full_label)])]`` for the COLLAPSIBLE tree picker
-    (G2): one expandable group per producing node; each leaf's ``leaf_label`` shows the HUMAN signal
-    label + shape + ready/waiting state (in the tree), and its ``full_label`` is the producer-
-    qualified ``"<producer> · <label>"`` painted when the combo is COLLAPSED (frame-title aligned,
-    G3).  Built from the same producer grouping + ``_signal_short_label`` as
-    :func:`grouped_signal_items` -- ONE source, so neither ever shows a raw ``temperature_survival``."""
-    names = sorted(str(n) for n in (names or []))
-    sources = dict(sources or {})
-    formats = dict(formats or {})
-    labels = dict(labels or {})
-    by_producer: dict[str, list[str]] = {}
-    for name in names:
-        for p in ([str(p) for p in (sources.get(name) or [])] or ["(unbound)"]):
-            by_producer.setdefault(p, []).append(name)
-    groups: list = []
-    for producer in sorted(by_producer, key=lambda p: (p == "(unbound)", p.lower())):
-        group = by_producer[producer]
-        leaves = []
-        for name in group:
-            short = _signal_short_label(name, group, labels)
-            fmt = formats.get(name)
-            shape = f"  [{fmt}]" if fmt else ""
-            leaf_label = f"{short}{shape}  {signal_state(name, formats)}"
-            leaves.append((leaf_label, name, f"{producer} · {short}"))
-        groups.append((producer, leaves))
-    return groups
-
-
-def fill_grouped_signal_combo(combo, *, names, sources, formats, current, none_label=None, labels=None) -> None:
-    """Populate ``combo`` with every live hub signal GROUPED by producing node (via
-    :func:`grouped_signal_items`): bold non-selectable headers, indented signals (data = the
-    BARE name).  ``none_label`` adds a leading empty choice; a not-yet-published ``current``
-    is kept selectable.  Read the pick back with ``currentData()`` (the bare name) -- the
-    visible label is indented.  Shared by the plot panel's slot picker and the logic-node
-    source field, so the nested picker is identical everywhere."""
-    cur = str(current or "")
-    # A configured input may NAME a signal that is declared but not published yet -- a node's own future
-    # output (a pulse-scan reading its own ``frame_0``), or a not-yet-started producer's signal.  The
-    # binding is by NAME, resolved at RUN time, so keep such a name in the pool: BOTH the tree and the
-    # flat picker then render it as a "waiting" leaf AND read it back.  Single-sources the docstring's
-    # "kept selectable" promise across both branches -- the tree branch used to drop a not-listed name,
-    # so ``read_editable_combo`` returned '' and the configured input vanished (e.g. a Start that then
-    # built the node with an empty y-expression input -> every point NaN).  ``signal_state`` renders the
-    # added name honestly as "waiting" (it has no live shape in ``formats``).
-    names = list(names or [])
-    if cur and cur not in {str(n) for n in names}:
-        names = [*names, cur]
-    if isinstance(combo, FluentTreeComboBox):
-        # The collapsible-tree picker (G2): one expandable producer group, leaves = signals.
-        with _signals_blocked(combo):
-            combo.set_signal_tree(signal_tree_groups(names, sources, formats, labels),
-                                  current=cur, none_label=none_label)
-        return
-    with _signals_blocked(combo):
-        combo.clear()
-        if none_label is not None:
-            combo.addItem(none_label, "")
-        items = grouped_signal_items(names, sources, formats, labels)
-        for label, name in items:
-            if name is None:                      # group header: visible but not selectable
-                combo.addItem(label, None)
-                item = combo.model().item(combo.count() - 1)
-                if item is not None:
-                    item.setEnabled(False)
-                    font = item.font(); font.setBold(True); item.setFont(font)
-                continue
-            combo.addItem(label, name)            # indented signal; data is the bare name
-        idx = combo.findData(cur)
-        # No match: select the leading none-row if there is one, else leave it BLANK (index -1)
-        # -- never auto-land on a disabled group HEADER (data None), whose label would otherwise
-        # read back as if it were the chosen signal.
-        if idx < 0 and none_label is not None:
-            idx = 0
-        combo.setCurrentIndex(idx)
-
-
-def read_editable_combo(combo) -> str:
-    """Read an EDITABLE combo that pairs a display LABEL with a bare-value ``data`` (the grouped
-    signal picker, the pulse-param picker).  Returns the selected item's data when the visible
-    text still matches that item (a real pick) -- else the typed text (a not-yet-published custom
-    name).  A plain ``currentData()`` would return the STALE previously-selected data after the
-    user types a new name into the line edit (Qt does not move currentIndex on free text), so the
-    fresh name would be silently dropped; a disabled header (data ``None``) falls through to ''."""
-    if isinstance(combo, FluentTreeComboBox):
-        return combo.current_signal()             # the tree picker stores the bare name on the leaf
-    idx = combo.currentIndex()
-    text = combo.currentText()
-    if idx >= 0 and text == combo.itemText(idx):
-        data = combo.itemData(idx)
-        if data is not None:
-            return str(data).strip()
-    return text.strip()
-
-
-def coerce_short_labels(provider) -> dict:
-    """Normalise a ``{full hub name -> short name}`` callback into the ``labels`` map every grouped
-    signal picker feeds ``fill_grouped_signal_combo``: callable-guard, ``str()`` both ends, drop empty
-    short names, swallow any provider exception to ``{}``.  The ONE source the signal_expr / plot
-    Setting slot / form signal pickers share so they render IDENTICALLY (#combo-parity) instead of four
-    hand-copied dict comprehensions (the 4th of which had already dropped the try/except)."""
-    if not callable(provider):
-        return {}
-    try:
-        return {str(n): str(s) for n, s in dict(provider()).items() if s}
-    except Exception:
-        return {}
 
 
 def _scan_modes() -> tuple[str, str, str]:
@@ -1115,6 +970,17 @@ def _panel_param_default(kind: str, key: str) -> object:
     return None
 
 
+def _resolved_param(kind: str, params: Mapping[str, object], key: str) -> object:
+    """The value a panel of ``kind`` actually renders for ``key``: the operator's stored
+    ``params[key]`` when PRESENT, else the kind's declared default from ``PANEL_PARAMS``
+    (:func:`_panel_param_default`) -- so a consume site (plot build / Edit snapshot) never
+    hand-types a declared default, and changing a declaration changes the render AND the
+    Setting/Edit UI together (they read the same decl).  Presence is ``key in params``,
+    never a truthiness test: ``False`` / ``0`` are legal stored values for a bool/int knob."""
+    store = params or {}
+    return store[key] if key in store else _panel_param_default(kind, key)
+
+
 def _resolved_cmap(kind: str, params: Mapping[str, object]) -> str:
     """The colormap a panel of ``kind`` actually draws with: the operator's picked ``params['cmap']``
     if set, else the kind's declared default from ``PANEL_PARAMS`` (``_panel_param_default``).  Returns
@@ -1661,10 +1527,11 @@ class LogicNodeConfig:
 
     A logic node lives on the Logic tab, NOT the Monitor board, and is the thing
     that PRODUCES data.  ``kind`` is one of :data:`LOGIC_KINDS` (camera /
-    measurement / processor / task); ``name`` is the catalog spec's name (or
-    ``"Camera (live frames)"`` for the camera).  ``values`` is the last param-form
-    ``{key: value}`` it was built / run with, so reopening its Edit restores them.
-    A node is always added STOPPED -- nothing runs until Start in its Edit."""
+    measurement / processor / task); ``name`` is the catalog spec's name (the
+    camera's is ``"live"``; its display TITLE comes from ``readout.camera_spec().name``).
+    ``values`` is the last param-form ``{key: value}`` it was built / run with, so
+    reopening its Edit restores them.  A node is always added STOPPED -- nothing
+    runs until Start in its Edit."""
 
     def __init__(self, *, kind: str, name: str, title: str = "",
                  values: Mapping[str, object] | None = None):
@@ -3510,7 +3377,7 @@ class PanelCard(FluentGroupBox):
     def _source_coord_frame(self, namespace: Mapping[str, object] | None):
         """The ROI ([x, w, y, h]) of the camera signal this 2D panel's source
         reads, or None -- so the image axes can be real pixel coordinates."""
-        frames = (namespace or {}).get("__coord_frames__")
+        frames = (namespace or {}).get(COORD_FRAMES_KEY)
         if not isinstance(frames, dict) or not frames:
             return None
         for name in self._co_names():
@@ -3521,7 +3388,7 @@ class PanelCard(FluentGroupBox):
     def _monitor_source_key(self, namespace: Mapping[str, object] | None):
         """Version key of the signals this panel's source reads, or None when
         none are detectable.  None => caller rolls every tick (safe fallback)."""
-        versions = (namespace or {}).get("__sig_versions__")
+        versions = (namespace or {}).get(SIG_VERSIONS_KEY)
         if not isinstance(versions, dict) or not versions:
             return None
         refs = [n for n in self._co_names() if n in versions]
@@ -3831,11 +3698,13 @@ class PanelCard(FluentGroupBox):
                 **self._view_kwargs("2d"),
                 labels=(xlabel, ylabel, ""), title=self.config.title or None)
         elif kind == "monitor":
-            length = max(20, int(self.config.params.get("length", 300)))
+            # Declared PANEL_PARAMS defaults via the ONE _resolved_param resolver (never a
+            # re-typed consume-site literal); the >=20 floor mirrors the decl's lo bound.
+            length = max(20, int(_resolved_param(kind, self.config.params, "length")))
             history = np.full(length, np.nan)
             plotter = panel_plot(
                 np.arange(length, dtype=float), history, kind="monitor", size=size, interactions=True,
-                show_dist=bool(self.config.params.get("show_dist", True)),
+                show_dist=bool(_resolved_param(kind, self.config.params, "show_dist")),
                 labels=("Shots ago", self._source_axis_label() or label, "Z"),
                 **self._view_kwargs("monitor"),
                 title=self.config.title or None)
@@ -3843,8 +3712,9 @@ class PanelCard(FluentGroupBox):
         elif kind == "hist":
             plotter = panel_plot(
                 np.asarray(value, dtype=float), kind="hist", size=size, interactions=True,
-                bins=int(self.config.params.get("bins", 60)), ylog=bool(self.config.params.get("ylog", False)),
-                fit=str(self.config.params.get("fit", "double")),
+                bins=int(_resolved_param(kind, self.config.params, "bins")),
+                ylog=bool(_resolved_param(kind, self.config.params, "ylog")),
+                fit=str(_resolved_param(kind, self.config.params, "fit")),
                 **self._view_kwargs("hist"),                # relim/fixed pins the VALUE (x) axis (#3)
                 labels=("Value", "Shots", "Population"), title=self.config.title or None)
         else:  # 1d
@@ -5148,13 +5018,16 @@ class PanelEditor(QtWidgets.QWidget):
                                          roi_radius=getattr(src, "roi_radius", 3.0), cmap=cmap, **view,
                                          labels=tuple(src.labels), title=title)
             elif kind == "hist":
+                # Same declared-default resolver as the live build (_resolved_param) -- the Edit
+                # snapshot can never render a different default than the Monitor card.
                 new_plotter = panel_plot(np.array(src.values, dtype=float), kind="hist", size=size,
-                                         bins=int(card.config.params.get("bins", 60)),
-                                         fit=str(card.config.params.get("fit", "double")),
-                                         ylog=bool(card.config.params.get("ylog", False)), **view,
+                                         bins=int(_resolved_param(kind, card.config.params, "bins")),
+                                         fit=str(_resolved_param(kind, card.config.params, "fit")),
+                                         ylog=bool(_resolved_param(kind, card.config.params, "ylog")), **view,
                                          labels=tuple(src.labels), title=title)
             else:  # 1d / monitor -> a line snapshot (monitor honours its show_dist toggle)
-                extra = {"show_dist": bool(card.config.params.get("show_dist", True))} if kind == "monitor" else {}
+                extra = ({"show_dist": bool(_resolved_param(kind, card.config.params, "show_dist"))}
+                         if kind == "monitor" else {})
                 # Pass the live plotter's FULL data_y (all columns), not just column 0: a 1d ``create``
                 # repeat_mode collapses to a ``(points, R)`` array = one line per repeat, and the snapshot
                 # must draw EVERY column exactly like the live card (Live1D plots one line per column) --
@@ -6111,6 +5984,9 @@ class TaskConsole(QtWidgets.QWidget):
         # The connected experiment session (optional): with it, the camera live
         # Measurement is offered too (readout.camera_measurement).
         self.session = session
+        # The camera row's display name, read ONCE from readout.camera_spec().name when the
+        # Add-Panel dropdown is populated (the spec owns it; "" until/without a session camera).
+        self._camera_title = ""
         self.state = state or default_console_state()
         self.window_ratio = float(window_ratio)
         self._window_px = window_px
@@ -6147,7 +6023,7 @@ class TaskConsole(QtWidgets.QWidget):
         # ``_task_card`` is its dedicated mid-run Monitor panel.
         self._running_task_row: "LogicNodeRow | None" = None
         self._task_card: "PanelCard | None" = None
-        self._task_mid_key = "frame"           # which output-buffer key the task panel shows
+        self._task_mid_key = DEFAULT_MID_RUN_KEY   # which output-buffer key the task panel shows
         self._task_card_frame = None           # last mid-run frame (kept frozen after the task ends)
         self._task_locked = False              # True while a task runs -> all other actions blocked
 
@@ -6255,8 +6131,13 @@ class TaskConsole(QtWidgets.QWidget):
             self.kind_combo.addItem(f"Plot: {label}", key)
         # MEASUREMENT layer: the continuous camera (a live frame stream) first, then
         # the swept measurements from the catalog.
-        if readout is not None and hasattr(readout, "camera_measurement"):
-            self.kind_combo.addItem("Measurement: Camera (live frames)", ("camera", "live"))
+        if readout is not None and hasattr(readout, "camera_measurement") and hasattr(readout, "camera_spec"):
+            # The camera row's DISPLAY name is the authoritative spec's own name
+            # (readout.camera_spec().name) -- never a re-typed literal, so a spec rename
+            # reaches the dropdown AND the row title (_add_panel) automatically.  Resolved
+            # ONCE here (camera_spec() re-enumerates devices; keep it out of hot paths).
+            self._camera_title = str(readout.camera_spec().name)
+            self.kind_combo.addItem(f"Measurement: {self._camera_title}", ("camera", "live"))
         for spec in self.measurements:
             self.kind_combo.addItem(f"Measurement: {spec.name}", ("measurement", spec.name))
         # PROCESSOR layer (the "func" nodes).
@@ -6515,14 +6396,20 @@ class TaskConsole(QtWidgets.QWidget):
     @staticmethod
     def _referenced_signals(source: str) -> set:
         """The hub signal names a panel's source expression reads (AST Name nodes
-        minus the namespace builtins) -- used to map the panel to its node."""
+        minus the namespace builtins) -- used to map the panel to its node.  The
+        helper names come from the ONE signal_expr declaration (NAMESPACE_HELPERS),
+        so a helper added there can never surface here as a phantom hub signal;
+        ``value``/``signal`` are the expression-contract tokens (DEFAULT_SOURCE),
+        not namespace helpers, and are excluded separately."""
         import ast
+
+        from Zou_lab_control.neutral_atom.operations.signal_expr import NAMESPACE_HELPERS
         try:
             tree = ast.parse(str(source or ""), mode="exec")
         except SyntaxError:
             return set()
         names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-        return names - {"np", "numpy", "math", "history", "latest", "names", "shot", "value", "signal"}
+        return names - set(NAMESPACE_HELPERS) - {"value", "signal"}
 
     def _card_reads(self, card: "PanelCard") -> set:
         """The REAL hub signal names a panel reads: its picked input(s) (``config.inputs``)
@@ -6805,7 +6692,7 @@ class TaskConsole(QtWidgets.QWidget):
             for key in getattr(node, "mid_run", ()):
                 if key in ("progress", "stage"):          # progress %/text live on the banner
                     continue
-                rows.append((f"{key} (mid-run)", describe_shape(buf.latest(key) if buf else None), desc(key)))
+                rows.append((f"{key}{MID_RUN_TAG}", describe_shape(buf.latest(key) if buf else None), desc(key)))
             result = getattr(node, "result", None) or {}
             for key in getattr(node, "provides", ()):
                 value = result.get(key) if isinstance(result, dict) else None
@@ -6880,23 +6767,15 @@ class TaskConsole(QtWidgets.QWidget):
         running node's ``published_signals()`` (same node prefix, #prebind), so the picker offers, and
         a Monitor binding stores, the SAME name the node later emits.  That makes a "connect first,
         start later" binding (and a save->load of one) re-attach automatically when the producer
-        publishes that exact name.  A processor publishes its ``result_keys``; a camera one ``frame_i``
-        PER emCCD event (``frames_per_cycle``); a measurement its ``x_key``/``y_key`` curve; a task
-        streams a (synthetic, off-hub) mid-run key."""
-        spec = self._spec_for_logic(row.node)
-        keys = list(getattr(spec, "result_keys", ()) or [])
-        if not keys and row.node.kind == "measurement":
-            keys = [k for k in (getattr(spec, "x_key", ""), getattr(spec, "y_key", "")) if k]
-        if not keys and row.node.kind == "camera":
-            # ONE frame_i per emCCD event -- the SAME names CameraMeasurement.published_signals() will
-            # publish once started (shared helper so they can NEVER drift; NOT the lumped "frame" the old
-            # design had, which left a phantom "frame waiting" while the camera emits frame_0/1/2, #residue).
-            from Zou_lab_control.neutral_atom.operations.logic import camera_frame_keys
-            keys = camera_frame_keys(row.node.values.get("frames_per_cycle", 1))
-        if not keys and row.node.kind == "task":          # off-hub one-shot, SYNTHETIC mid-run tag (never a hub signal)
-            return [f"{getattr(spec, 'mid_run_key', 'frame')} (mid-run)"]
+        publishes that exact name.  The bare keys come from the ONE kind ladder
+        (:meth:`_node_bare_keys` -- shared with the prefix collision check, so what the picker
+        declares is exactly what is checked and published); a task is off the hub and instead
+        shows a SYNTHETIC mid-run tag."""
+        if row.node.kind == "task":                        # off-hub one-shot (never a hub signal)
+            spec = self._spec_for_logic(row.node)
+            return [f"{getattr(spec, 'mid_run_key', DEFAULT_MID_RUN_KEY)}{MID_RUN_TAG}"]
         pfx = self._declared_node_prefix(row)              # prepend the node prefix -> == published_signals()
-        return [f"{pfx}{k}" for k in keys]
+        return [f"{pfx}{k}" for k in self._node_bare_keys(row.node)]
 
     def _node_for_signal(self, name: str):
         """The producing node for signal ``name``: a RUNNING node first, else the last build of a
@@ -6923,7 +6802,7 @@ class TaskConsole(QtWidgets.QWidget):
         fall back to the node-level triple (so other nodes are unaffected).  ``None`` when no producing
         node is found (a derived expression / a raw array): the consumer then uses shape heuristics."""
         node = self._node_for_signal(str(name or ""))
-        if node is None and str(name) == "__task_frame__":
+        if node is None and str(name) == TASK_FRAME_KEY:
             # A task mid-run panel binds the reserved ``__task_frame__`` (task output is OFF the hub, #6),
             # so ``_node_for_signal`` (which only knows hub producers) can't resolve it.  Its producer IS
             # the RUNNING TASK node -- resolve it directly so a scan task's ``scan_names``/``scan_arrays``
@@ -7017,9 +6896,8 @@ class TaskConsole(QtWidgets.QWidget):
                     note = "  ⚠ also from another node" if len(providers.get(name, [])) > 1 else ""
                     # The producing node is named to the RIGHT of the arrow, so the signal need
                     # not repeat its prefix: show "rate ← occupancy", not "judge_occupancy_rate ←
-                    # occupancy" (same brevity the nested combo uses).
-                    pfx = str(getattr(src, "prefix", "") or "")
-                    short = name[len(pfx):] if (pfx and name.startswith(pfx) and len(name) > len(pfx)) else name
+                    # occupancy" -- the ONE strip_node_prefix rule the nested combo uses.
+                    short = strip_node_prefix(name, getattr(src, "prefix", ""))
                     parts.append(f"{short} ← {tag}{note}")
                 else:
                     parts.append(f"{name} ← (no running source)")
@@ -7218,7 +7096,10 @@ class TaskConsole(QtWidgets.QWidget):
         # measurement / processor / task).  It publishes nothing until Started.
         if isinstance(data, tuple) and len(data) == 2 and data[0] in LOGIC_KINDS:
             kind, name = data
-            title = "Camera (live frames)" if kind == "camera" else str(name)
+            # The camera's row title = the spec's display name resolved at populate time
+            # (readout.camera_spec().name -- ONE source); every other kind's name IS its
+            # catalog spec's name already.
+            title = self._camera_title if kind == "camera" else str(name)
             self._add_logic_node(LogicNodeConfig(kind=kind, name=name, title=title), focus=True)
             return
         # Otherwise a PLOT kind -> a BLANK pure-view panel on the Monitor board
@@ -7533,7 +7414,7 @@ class TaskConsole(QtWidgets.QWidget):
         output buffer (off the hub, #6); its ``points_shape`` reaches ``_facet_value_shapes`` through the
         panel params (a task panel binds no producing hub node to read a declared structure from)."""
         kind = str(getattr(spec, "default_kind", "2d") or "2d")
-        source = "value = __task_frame__"
+        source = f"value = {TASK_FRAME_KEY}"    # the reserved off-hub key (one spelling, TASK_FRAME_KEY)
         gshape = tuple(int(n) for n in (getattr(node, "grid_shape", ()) or ()))
         if kind == "grid" and len(gshape) >= 2:
             facet_axis = len(gshape) - 1                 # facet the LAST scan axis -> one plane per cell
@@ -7549,7 +7430,7 @@ class TaskConsole(QtWidgets.QWidget):
         :meth:`_task_mid_run_config`, built through the generic panel path) and LOCK all other
         controls so the only actions are Stop / wait (#5, confocal task semantics)."""
         spec = self._spec_for_logic(row.node)
-        self._task_mid_key = str(getattr(spec, "mid_run_key", "frame"))
+        self._task_mid_key = str(getattr(spec, "mid_run_key", DEFAULT_MID_RUN_KEY))
         self._task_card_frame = None
         config = self._task_mid_run_config(spec, node, title=f"Task: {row.node.title}")
         card = self._new_panel_card(config)
@@ -7680,14 +7561,32 @@ class TaskConsole(QtWidgets.QWidget):
                 built.instance_label = node.title
                 return built
             # ONE-SHOT processor: runs once over saved/grabbed frames and self-stops.
+            # Hardware goes in ONLY for the ctx device roles the SPEC declares
+            # (ProcessorSpec.devices -- the spec owns whether its run drives hardware):
+            # a live-grab action borrows the running nodes' device instances; a
+            # saved-data action (devices=(), e.g. Readout fidelity over a folder)
+            # receives None for both, so it occupies nothing and starting it can never
+            # stop an unrelated live node through the device-occupancy exclusion.
+            from Zou_lab_control.neutral_atom.devices.base import ReadOnlyDevice
             from Zou_lab_control.neutral_atom.operations.logic import ProcessorRun
-            camera = next((getattr(n, "camera", None) for n in self.running_nodes
-                           if getattr(n, "camera", None) is not None), None)
-            sequencer = next((getattr(n, "sequencer", None) for n in self.running_nodes
-                              if getattr(n, "sequencer", None) is not None), None)
+
+            def _borrow(role: str):
+                # A ProcessorRun DRIVES its declared roles (EXCLUSIVE), so only a DRIVABLE
+                # instance qualifies: an OBSERVE record on a running node (e.g. a camera
+                # measurement's read-only sequencer proxy) would PermissionError on the
+                # first prepare/fire -- skip those, never unwrap them.
+                for n in self.running_nodes:
+                    dev = getattr(n, role, None)
+                    if dev is not None and not isinstance(dev, ReadOnlyDevice):
+                        return dev
+                return None
+
+            roles = {str(r) for r in (getattr(spec, "devices", ()) or ())}
             readout = getattr(self.session, "readout", None)
-            return ProcessorRun(self.hub, spec, readout=readout, camera=camera,
-                                 sequencer=sequencer, params=values)
+            return ProcessorRun(self.hub, spec, readout=readout,
+                                 camera=_borrow("camera") if "camera" in roles else None,
+                                 sequencer=_borrow("sequencer") if "sequencer" in roles else None,
+                                 params=values)
         if kind == "task":
             return spec.build(self.hub, **values)
         raise RuntimeError(f"unknown logic kind {kind!r}")
@@ -7867,31 +7766,30 @@ class TaskConsole(QtWidgets.QWidget):
         return min(shots) if shots else None
 
     def _expression_namespace(self) -> dict[str, object]:
-        namespace: dict[str, object] = {"np": np, "numpy": np, "math": _math}
         # Shot-COHERENT read at the board's global display shot (#shot-clock): every signal resolves to its
         # value AT that shot, so a frame_0 2-D, a frame_2 2-D and a frame_1->occupancy sitemap can never show
         # different shots -- the faster camera is held back to the slower co-displayed producer.  A signal
         # with no sample at that shot (a free-running scalar, or a producer not yet there) falls back to its
         # latest, never blanking a panel.  display_shot None -> latest of each (snapshot_latest).  A LONE
         # fast panel is NOT held back: its own signal is the min (see _display_shot).  (Task mid-run output
-        # is intentionally absent here: it is off-hub via __task_frame__.)
-        namespace.update(self.hub.snapshot_at(self._display_shot()))
-        namespace["history"] = self.hub.history
-        namespace["latest"] = self.hub.latest
-        namespace["names"] = self.hub.names
-        namespace["shot"] = self.hub.shot                # the hub's latest publish counter (for rolling monitors)
+        # is intentionally absent here: it is off-hub via TASK_FRAME_KEY.)
+        # The helpers (np/numpy/math/history/latest/names/shot) come from the ONE signal_expr builder
+        # layered on this view's snapshot -- a panel expression and a node-side expression (pulse-scan
+        # y, processor source) can never diverge in capability (GUI == node).
+        from Zou_lab_control.neutral_atom.operations.signal_expr import hub_namespace
+        namespace = hub_namespace(self.hub, self.hub.snapshot_at(self._display_shot()))
         # Per-signal publish counters (reserved key) so a rolling monitor can tell
         # a new sample of its own source from an unrelated node's version bump.
-        namespace["__sig_versions__"] = self.hub.signal_versions()
+        namespace[SIG_VERSIONS_KEY] = self.hub.signal_versions()
         # Coordinate frames (reserved key): {signal_name: [x, w, y, h]} from any
         # node whose acquisition source declares a ROI.  A 2D panel reads its
         # source signal's frame so the image axes are the REAL camera pixel
         # coordinates (ROI), not 0..N -- and an area-select maps back to the ROI.
-        namespace["__coord_frames__"] = self._coord_frames()
+        namespace[COORD_FRAMES_KEY] = self._coord_frames()
         # Reserved key for the running task's dedicated mid-run panel: the latest frame
         # from the task's OWN output buffer (NOT the hub -- #6), kept frozen after the
         # task ends until its transient panel is dropped.
-        namespace["__task_frame__"] = self._task_card_frame
+        namespace[TASK_FRAME_KEY] = self._task_card_frame
         return namespace
 
     def _coord_frames(self) -> dict[str, list]:
@@ -8246,7 +8144,7 @@ def show_task_console(
     (``with show_task_console(...) as console:``) and exposes ``console.shutdown()``
     for deterministic teardown on a cell re-run."""
 
-    app = ensure_qt_app()
+    ensure_qt_app()          # the console is a QWidget: the app must exist BEFORE its ctor
     if state is None and task is not None:
         state = resolve_task_state(task)
     console = TaskConsole(hub=hub, state=state, running_nodes=running_nodes, measurements=measurements,
@@ -8262,24 +8160,22 @@ def show_task_console(
     for node in running_nodes:
         if not getattr(node, "running", False) and hasattr(node, "start"):
             node.start(rate_hz=getattr(node, "rate_hz", 5.0))
-    window = FluentWindow(widget=console, title=title, hide_on_close=hide_on_close)
     # Closing the window must stop the node owner threads (else they keep running, blocked in
     # camera.acquire holding the camera / RPyC link, wedging the kernel).  The console is a CHILD
     # of the window so its own closeEvent never fires on a window close -- we wire the window's
     # signals instead.  Minimising NEVER stops the nodes (only the X / a genuine close does).
-    if hide_on_close:
-        # Session-bound (notebook) console: the X HIDES the window (keeps the panel layout so a
-        # later exp.task_console() restores the SAME interface) and stops every running node so
-        # the devices are released.  close_requested fires on the X, not on minimize.
-        window.close_requested.connect(console.stop_all_nodes)
-    else:
-        # Standalone window (.bat / explicit): the X fully tears the console down.
-        window.closed.connect(console.shutdown)
-    window.adjustSize()
-    window.setFixedSize(window.size())
-    center_window_on_primary_screen(window, app)   # open centred, exactly like show_pulse_gui (consistency)
-    window.show()
-    retain_window(window)   # the ONE app-level registry; pruned when the window dies
+    def _wire_close(window) -> None:
+        if hide_on_close:
+            # Session-bound (notebook) console: the X HIDES the window (keeps the panel layout so a
+            # later exp.task_console() restores the SAME interface) and stops every running node so
+            # the devices are released.  close_requested fires on the X, not on minimize.
+            window.close_requested.connect(console.stop_all_nodes)
+        else:
+            # Standalone window (.bat / explicit): the X fully tears the console down.
+            window.closed.connect(console.shutdown)
+    # ONE launcher sequence (launch_fluent_window: wrap -> wire -> size -> centre -> show ->
+    # retain), shared with every other show_* GUI so the steps cannot drift per-launcher.
+    launch_fluent_window(console, title=title, hide_on_close=hide_on_close, wire=_wire_close)
     return console
 
 

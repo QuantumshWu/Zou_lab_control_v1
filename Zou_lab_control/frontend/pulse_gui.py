@@ -77,11 +77,9 @@ from .qt_fluent import (
     FluentStatusDot,
     FluentSwitch,
     FluentTabWidget,
-    FluentWindow,
     Metrics,
-    center_window_on_primary_screen,
     ensure_qt_app,
-    retain_window,
+    launch_fluent_window,
     fluent_font_size,
     fluent_scrollbar_stylesheet,
     fluent_text_width,
@@ -4579,7 +4577,7 @@ def show_pulse_gui(
     window_ratio: float = DEFAULT_WINDOW_RATIO,
     hide_on_close: bool = False,
 ) -> PulseSequenceEditor:
-    app = ensure_qt_app()
+    ensure_qt_app()          # the editor is a QWidget: the app must exist BEFORE its ctor
     editor = PulseSequenceEditor(
         state=state,
         channels=channels,
@@ -4593,16 +4591,13 @@ def show_pulse_gui(
     # hide_on_close=True (the session-bound notebook editor): the X HIDES the window so a later
     # exp.pulse_gui() restores the SAME editor (its loaded program + edits) instead of a blank
     # new one.  The standalone .bat keeps the default destroy-on-close.
-    window = FluentWindow(widget=editor, title="PulseGUI@Zou lab", hide_on_close=hide_on_close)
-    editor._set_gui_title(editor.windowTitle())
-    window.adjustSize()
-    window.setFixedSize(window.size())
-    center_window_on_primary_screen(window, app)   # shared with show_task_console (qt_fluent single source)
-    window.show()
+    # ONE launcher sequence (launch_fluent_window: wrap -> wire -> size -> centre -> show ->
+    # retain), shared with every other show_* GUI so the steps cannot drift per-launcher.
+    window = launch_fluent_window(
+        editor, title="PulseGUI@Zou lab", hide_on_close=hide_on_close,
+        # FluentWindow owns the title rendering; propagate it into the editor's own title row.
+        wire=lambda _w: editor._set_gui_title(editor.windowTitle()))
     editor._zlc_window = window
-    # The window owns the editor (FluentWindow re-parents its widget), so retaining the
-    # window alone keeps both alive -- and the ONE registry prunes them when it dies.
-    retain_window(window)
     return editor
 
 

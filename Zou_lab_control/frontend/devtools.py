@@ -296,7 +296,9 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=Non
     # `running_nodes` BEFORE the detector so one step() publishes the frame the
     # detector then consumes.
     camera_row = console._add_logic_node(
-        LogicNodeConfig(kind="camera", name="live", title="Camera (live frames)"), focus=False)
+        # Row title = the authoritative camera spec's display name (ONE source,
+        # readout.camera_spec().name) -- the demo can never drift from the real dropdown.
+        LogicNodeConfig(kind="camera", name="live", title=exp.readout.camera_spec().name), focus=False)
     camera = console._build_logic_node(camera_row.node, dict(camera_row.node.values))
     console._logic_nodes[id(camera_row)] = camera
     console.running_nodes.append(camera)             # stepped manually below, no thread

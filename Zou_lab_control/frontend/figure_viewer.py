@@ -79,11 +79,9 @@ from .qt_fluent import (
     FluentSectionLabel,
     FluentSettingRow,
     FluentTabWidget,
-    FluentWindow,
     WINDOW_SCREEN_FRACTION,
-    center_window_on_primary_screen,
     ensure_qt_app,
-    retain_window,
+    launch_fluent_window,
     scaled_px,
     window_pad,
     screen_fit_window_size,
@@ -385,14 +383,18 @@ class LoadedFigureNode(LogicNode):
         return {bare: np.array(block) for bare, block in self._blocks.items()}
 
 
-def _seed_state(saved: SavedFigure) -> TaskConsoleState:
+def _seed_state(saved: SavedFigure, node: LoadedFigureNode) -> TaskConsoleState:
     """The console layout that REPRODUCES the saved figure: ONE panel of the saved ``kind`` wired to
-    ``fig_value`` (``value = fig_value``) with the saved ``info['view']`` restored as its params, so it
-    opens exactly as saved.  EVERY kind takes this ONE path -- a pulse figure seeds a ``kind="pulse"``
-    panel exactly as a hist figure seeds a ``kind="hist"`` panel (``PanelCard`` then renders each by its
-    kind).  ``pulse`` is ``panel=False`` (not offered in the live Add-Panel dropdown) but it IS a real
-    panel kind on this SEED path, so it is NOT downgraded.  Only a genuinely UNKNOWN kind (not in the
-    plot-kind table) falls back to shape inference so the window still opens with a reproduction."""
+    ``node.y_signal`` (``fig_value`` normally; the promoted key when the save carried no value-role
+    block) with the saved ``info['view']`` restored as its params, so it opens exactly as saved.  The
+    NODE is the single owner of "which key the value landed on" -- seeding from ``node.y_signal``
+    instead of a hand-built ``FIG_PREFIX + FIG_VALUE_KEY`` keeps the panel bound to a signal the node
+    actually publishes even on the promote fallback (the hand copy opened an EMPTY board there).
+    EVERY kind takes this ONE path -- a pulse figure seeds a ``kind="pulse"`` panel exactly as a hist
+    figure seeds a ``kind="hist"`` panel (``PanelCard`` then renders each by its kind).  ``pulse`` is
+    ``panel=False`` (not offered in the live Add-Panel dropdown) but it IS a real panel kind on this
+    SEED path, so it is NOT downgraded.  Only a genuinely UNKNOWN kind (not in the plot-kind table)
+    falls back to shape inference so the window still opens with a reproduction."""
     from .live import PLOT_KIND_BY_KEY, default_pulse_size
 
     kind = str(saved.kind or "")
@@ -441,12 +443,14 @@ def _seed_state(saved: SavedFigure) -> TaskConsoleState:
         for decl in PANEL_PARAMS.get(str(recipe.get("sub_plot_kind") or ""), ()):
             if decl.key in recipe:
                 view.setdefault(str(decl.key), recipe[decl.key])
+    # An identity source expression (a bare signal name) -- signal_expr.is_identity_source keeps the
+    # block's structure through the panel's short-circuit, exactly as the fig_value literal did.
     panel = PanelConfig(
         kind=kind,
         title=str(saved.name or "figure"),
         size=size,
-        source=f"value = {FIG_PREFIX}{FIG_VALUE_KEY}",
-        inputs=[FIG_PREFIX + FIG_VALUE_KEY],
+        source=f"value = {node.y_signal}",
+        inputs=[node.y_signal],
         params=view,
     )
     return TaskConsoleState(name=str(saved.name or "figure"), panels=[panel])
@@ -861,7 +865,7 @@ class FigureViewer(QtWidgets.QWidget):
         if saved is not None:
             self.node = LoadedFigureNode(self.hub, saved)
             self.node.step()                   # publish once so the signal is on the hub immediately
-            state = _seed_state(saved)
+            state = _seed_state(saved, self.node)
             running: list = [self.node]
         else:
             state = TaskConsoleState(name="figure", panels=[])
@@ -935,23 +939,20 @@ def show_figure_viewer(path: str | Path | None = None, *, scale: float | None = 
     becomes the ``fig_value`` hub signal and a panel of the saved kind opens reproducing it on a real
     Task console board; omit it to open empty and Browse from inside.  Closing the window tears the
     embedded console down (its refresh timer + the loaded-figure node)."""
-    app = ensure_qt_app()
+    ensure_qt_app()          # the viewer is a QWidget: the app must exist BEFORE its ctor
     viewer = FigureViewer(path, scale=scale, window_ratio=window_ratio)
-    window = FluentWindow(widget=viewer, title="FigureViewer@Zou lab", hide_on_close=hide_on_close)
-    window.closed.connect(viewer.teardown)
-    window.adjustSize()
-    window.setFixedSize(window.size())
-    center_window_on_primary_screen(window, app)
-    window.show()
+    # ONE launcher sequence (launch_fluent_window: wrap -> wire -> size -> centre -> show ->
+    # retain), shared with every other show_* GUI so the steps cannot drift per-launcher.
+    window = launch_fluent_window(
+        viewer, title="FigureViewer@Zou lab", hide_on_close=hide_on_close,
+        # a genuine close tears the embedded console down (refresh timer + loaded-figure node)
+        wire=lambda w: w.closed.connect(viewer.teardown))
     # The embedded console's scroll viewport only has its REAL width AFTER the window is shown (0 during
     # construction).  Re-pack its board now so it lays out against the true pane width immediately,
     # rather than waiting for the first resize event.
     if viewer.console is not None:
         viewer.console._arrange_if_cards()
     viewer._zlc_window = window
-    # The window owns the viewer (FluentWindow re-parents its widget), so retaining the
-    # window alone keeps both alive -- and the ONE registry prunes them when it dies.
-    retain_window(window)
     return viewer
 
 

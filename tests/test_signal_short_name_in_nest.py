@@ -36,7 +36,8 @@ def test_camera_nest_leaf_is_short_name_not_axis_label():
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
     from Zou_lab_control.neutral_atom.timing import imaging_sequence
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
-    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state, signal_tree_groups
+    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
+    from Zou_lab_control.frontend.param_widgets import signal_tree_groups
     ensure_qt_app()
 
     exp = na.connect("virtual")

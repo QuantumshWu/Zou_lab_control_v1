@@ -26,9 +26,11 @@ from .qt_fluent import (
     FluentScrollArea,
     FluentSectionLabel,
     FluentSettingRow,
-    FluentWindow,
+    ensure_qt_app,
     fluent_font_size,
+    launch_fluent_window,
     scaled_px,
+    set_fluent_scale,
     setting_label_width,
     window_pad,
 )
@@ -228,10 +230,18 @@ def show_device_manager(device_set, *, discover=None, on_load_config=None, on_sa
     ``on_load_config`` / ``on_save_config`` / ``on_open_devices`` (wired by the session through
     ``exp.device_manager()``) enable the Load config / Save config + Open-devices toolbar; omit them
     (a bare ``device_set``) and the window is view-only (device list + Scan hardware)."""
+    # The app + the shared fluent scale must exist BEFORE the panel ctor (a QWidget needs the
+    # QApplication; scaled_px reads the process-global scale at construction).  This launcher used
+    # to hand-copy the sequence and had silently dropped both -- exp.device_manager() as a session's
+    # FIRST GUI was a Qt fatal, and its controls sized at the silent 1.0 fallback.
+    ensure_qt_app()
+    set_fluent_scale(None)   # the ONE shared GUI-scale rule (auto from the primary screen)
     panel = DeviceManagerPanel(device_set, discover=discover, on_load_config=on_load_config,
                                on_save_config=on_save_config, on_open_devices=on_open_devices,
                                config_dir=config_dir)
-    window = FluentWindow(widget=panel, title="Devices@Zou lab")
-    window.resize(scaled_px(460), scaled_px(560))
-    window.show()
-    return window
+    # ONE launcher sequence (launch_fluent_window: wrap -> size -> centre -> show -> retain).
+    # destroy-on-close (hide_on_close=False) is deliberate: exp.device_manager() rebuilds a fresh
+    # panel per open (CC round).  The explicit size replaces fixed_size -- the device list is a
+    # scroll area whose content hint would collapse the window.
+    return launch_fluent_window(panel, title="Devices@Zou lab", fixed_size=False,
+                                size=(scaled_px(460), scaled_px(560)))

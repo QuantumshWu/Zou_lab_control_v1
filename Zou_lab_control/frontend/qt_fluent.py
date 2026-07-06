@@ -2613,9 +2613,7 @@ class FluentWindow(FramelessWindow):
     def __init__(
         self,
         *,
-        widget: QtWidgets.QWidget | None = None,
-        widget_class: type | None = None,
-        widget_kwargs: dict | None = None,
+        widget: QtWidgets.QWidget,
         title: str = "",
         hide_on_close: bool = False,
         parent=None,
@@ -2661,15 +2659,10 @@ class FluentWindow(FramelessWindow):
             self.setWindowTitle(title)
             top_margin = 0
 
-        if widget is not None:
-            self.loaded = widget
-            self.loaded.setParent(self)
-        elif widget_class is not None:
-            kwargs = dict(widget_kwargs or {})
-            kwargs.setdefault("parent", self)
-            self.loaded = widget_class(**kwargs)
-        else:
-            raise ValueError("FluentWindow needs widget or widget_class.")
+        if widget is None:
+            raise ValueError("FluentWindow needs a constructed widget.")
+        self.loaded = widget
+        self.loaded.setParent(self)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, top_margin, 0, 0)
@@ -2730,35 +2723,44 @@ class FluentWindow(FramelessWindow):
         super().hideEvent(event)
 
 
-def run_fluent_window(
+def launch_fluent_window(
+    widget: QtWidgets.QWidget,
     *,
-    widget_class: type | None = None,
-    widget_kwargs: dict | None = None,
-    widget: QtWidgets.QWidget | None = None,
-    title: str = "",
-    in_GUI: bool = False,
-    window_handle: FluentWindow | None = None,
+    title: str,
+    hide_on_close: bool = False,
+    fixed_size: bool = True,
+    size: tuple | None = None,
+    wire=None,
 ) -> FluentWindow:
-    """Open a Confocal-style Fluent window and keep the QApplication alive."""
+    """The ONE top-level-GUI launcher sequence: wrap ``widget`` in a :class:`FluentWindow`, run the
+    caller's ``wire(window)`` (per-GUI signal wiring between construction and show: close ->
+    teardown, title propagation), size it, centre it on the primary screen, show it, and retain it
+    on the ONE app registry (:func:`retain_window`).
 
+    EVERY ``show_*`` entry point (pulse editor / task console / figure viewer / device manager)
+    routes through here -- the fourth hand-copied launcher (the device manager) had silently
+    dropped ensure_qt_app / the shared scale / centring / retention, exactly the drift class this
+    helper removes (same failure family as the duplicated scale rule, commit 57a1d25).
+
+    ``fixed_size=True`` locks the window to its content hint (these GUIs size their own body from
+    the screen, so the window must not be user-resizable past it); ``size=(w, h)`` (with
+    ``fixed_size=False``) is the explicit-size path for a body whose hint would collapse (the
+    device manager's scrolling list).  The caller must still :func:`ensure_qt_app` BEFORE
+    constructing ``widget`` (a QWidget needs the QApplication; the widget ctor also resolves the
+    shared fluent scale) -- it is re-asserted here so the sequence stays safe for a caller that
+    forgot."""
     app = ensure_qt_app()
-    window = window_handle or FluentWindow(
-        widget=widget,
-        widget_class=widget_class,
-        widget_kwargs=widget_kwargs,
-        title=title,
-        hide_on_close=not in_GUI,
-    )
-
+    window = FluentWindow(widget=widget, title=title, hide_on_close=hide_on_close)
+    if wire is not None:
+        wire(window)
+    if fixed_size:
+        window.adjustSize()
+        window.setFixedSize(window.size())
+    elif size is not None:
+        window.resize(int(size[0]), int(size[1]))
     center_window_on_primary_screen(window, app)
     window.show()
-
-    if in_GUI:
-        return window
-
-    loop = QtCore.QEventLoop()
-    window.hidden.connect(loop.quit)
-    loop.exec_()
+    retain_window(window)   # the ONE app-level registry; pruned when the window dies
     return window
 
 
@@ -3155,8 +3157,8 @@ __all__ = [
     "fluent_text_width",
     "fluent_widget_stylesheet",
     "format_compact_number",
+    "launch_fluent_window",
     "retain_window",
-    "run_fluent_window",
     "resolve_fluent_auto_scale",
     "scaled_px",
     "window_pad",

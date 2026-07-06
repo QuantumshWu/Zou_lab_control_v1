@@ -44,6 +44,12 @@ else:
     class EmbeddedFigureCanvas(_FigureCanvasQTAgg):
         """Matplotlib Qt canvas with a display scale and wheel isolation."""
 
+        #: Identity marker for ``live._is_embedded_canvas`` -- the ONE predicate the two-phase
+        #: compose()/present()/blit render paths key off.  A duck-checked class attribute (not an
+        #: isinstance) because live.py deliberately never imports Qt; inherited by subclasses, so
+        #: a subclassed canvas keeps the blit path.
+        _zlc_embedded = True
+
         def __init__(self, figure, *, display_scale: float = 1.0, isolate_wheel: bool = True):
             # Must exist BEFORE super().__init__: the base class reads devicePixelRatioF()
             # (overridden below) during construction.  ``display_scale`` is the ONE display
