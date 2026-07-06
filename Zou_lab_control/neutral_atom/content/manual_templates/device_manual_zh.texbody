@@ -89,16 +89,28 @@ na.register_device_class("MyCamera", "mypkg.devices:MyCamera")
 \section{探测总线：discover\_devices}
 \pyapi{na.discover_devices()}（\filepath{registry.py}）主动\tfocus{探测总线}——枚举在线相机（DCAM / Pylon / VISA 等）与序列器连接，返回一份"发现清单"。它\tfocus{不}构造设备、也不改会话；只回答"这台机器上现在插着什么"。缺库或空总线时它\tfocus{记一条 note 而非 raise}（与 confocal 同款容错），所以在没有硬件的开发机上调用也安全。它是"我该往配置里写哪些 \pyapi{type}"的侦察工具，和 \pyapi{load_devices}（据配置\tfocus{构造}设备）互补。
 
-\section{设备管理器 GUI：\pyapi{exp.device\_manager()}}
-把上面这些——配置里加载出的 \pyapi{DeviceSet}、以及 \pyapi{discover_devices} 的总线探测——摆到一个窗口里看，就是\tfocus{设备管理器}。它的\tfocus{唯一公开入口是会话门面 \pyapi{exp.device\_manager()}}（监控台顶栏也有一个 \pyapi{Devices} 按钮走同一入口）：
+\section{设备管理器 GUI：\pyapi{na.device\_manager()} / \pyapi{exp.device\_manager()}}
+把上面这些——配置里加载出的 \pyapi{DeviceSet}、以及 \pyapi{discover_devices} 的总线探测——摆到一个窗口里看，就是\tfocus{设备管理器}。它有\tfocus{两个入口}，对应"还没连"与"已经连上"两种时机：
+
+\begin{description}
+  \item[\pyapi{na.device\_manager(config)}——设备初始化入口（还没有 session）] 从 notebook 里\tfocus{一开始就想用 GUI 建/编辑配置再连接硬件}时用它。它\tfocus{返回管理器窗口}；窗口起步是一个\tfocus{纯配置编辑器}（空白，或用 \pyapi{config} 播种——模板名如 \pyapi{"virtual"}/\pyapi{"remote\_template"}、一个 JSON 路径、或一个 config dict，与 \pyapi{na.connect} 吃的形态一样）。窗口的绿色按钮写着 \tfocus{Init devices}：按下即用当前配置 \pyapi{na.connect}，成功后\tfocus{这个窗口原地升级}成新会话的管理器（Loaded 卡激活、按钮变成 Apply）。连出的 session \tfocus{通过 \pyapi{window.session} 交回 notebook}——Init 之前是 \pyapi{None}，成功后就是活 session。
+  \item[\pyapi{exp.device\_manager()}——会话绑定入口（已经有 session）] 已经 \pyapi{exp = na.connect(...)} 之后，用它打开\tfocus{当前会话}的设备管理器（监控台顶栏的 \pyapi{Devices} 按钮打开的是\tfocus{只读}查看器，不是这个完整编辑器——见下节）。每会话单例，重复调用复用同一窗口。
+\end{description}
 
 \begin{codeblock}[Python]
-exp = na.connect("virtual")     # 或某份 .json 配置
-exp.device_manager()            # 打开设备管理器；每会话单例，重复调用复用同一窗口
+import Zou_lab_control.neutral_atom as na
+
+# 入口一：GUI 初始化设备。返回窗口，编辑配置 + 按 "Init devices" 后取回 session：
+mgr = na.device_manager("virtual")   # 或空 na.device_manager() 从零搭配置
+# ……在窗口里编辑配置、按 "Init devices"……
+exp = mgr.session                    # Init 前为 None，成功后即活 session
+
+# 入口二：已有 session 时打开它的设备管理器（每会话单例）
+exp.device_manager()
 \end{codeblock}
 
-\begin{notebox}[为什么挂在 exp 上、而不是 zf 模块函数]
-另外三个 GUI（task console / 脉冲编辑器 / 图查看器）都能\tfocus{脱离会话}独立运行，所以它们是 \pyapi{zf.*} 模块级函数。设备管理器不同：它展示的正是 \pyapi{neutral_atom} 设备层\tfocus{已经加载好的那套 \pyapi{DeviceSet}}，而 \pyapi{frontend} 对 \pyapi{neutral_atom} 是\tfocus{单向密封}的（前端不 import na）——它的窗口工厂只能接一个"na 递进来的 \pyapi{DeviceSet}"，无法自己去发现设备。所以设备管理器\tfocus{天然与会话绑定}，唯一正确入口就是 \pyapi{exp.device\_manager()}（\pyapi{na} 持有 \pyapi{DeviceSet}）；它\tfocus{不是} \pyapi{zf} 上的函数。
+\begin{notebox}[两个入口，一套窗口；纯 \pyapi{connect} 仍是一行捷径]
+不想要编辑器时，\pyapi{exp = na.connect(config)} 依旧是一行连接的捷径；\pyapi{na.device\_manager} 是它的\tfocus{可视化初始化面}——想先在 GUI 里核对/微调配置再连时才用。两个入口打开的是\tfocus{同一种窗口}：\pyapi{na.device\_manager()} 在 Init 成功那一刻把升级后的窗口\tfocus{登记成该 session 的单例管理器}，所以之后 \pyapi{exp.device\_manager()} 复用的就是它。设备管理器\tfocus{不是} \pyapi{zf} 上的模块函数：它展示 / 编辑的正是 \pyapi{neutral_atom} 设备层的 \pyapi{DeviceSet}，而 \pyapi{frontend} 对 \pyapi{neutral_atom} 是\tfocus{单向密封}的（前端不 import na），窗口工厂只能接 na 递进来的 \pyapi{DeviceSet} 或 na 提供的 Init 回调——所以它由 \pyapi{na} 拥有，而另外三个 GUI（task console / 脉冲编辑器 / 图查看器）能脱离会话独立跑，才是 \pyapi{zf.*} 模块函数。
 \end{notebox}
 
 窗口\tfocus{按设备域分区}（相机 / 序列器 / 阱阵列 / 未来的射频源……）——每个域一张卡，列出该域下每台设备的类型与状态。分区不是相机专属硬清单，而是\tfocus{读注册表的设备域}（与各测量的设备下拉框同一个源）：注册一个新域，管理器自动多出一张卡，无需改面板代码。顶部的\tfocus{Scan hardware}按钮就地调用 \pyapi{discover_devices} 探测总线，把发现到的设备并成一张"Discovered"卡。
@@ -126,6 +138,34 @@ exp.open_devices()
 
 \begin{notebox}[round-trip 契约]
 \pyapi{save\_config} 写出的文件，\pyapi{na.connect(那个文件)} / \pyapi{load\_config} 必须\tfocus{重建出同一套 \pyapi{DeviceSet}}——一份调好的配置是可复用资产，而不是每次重打。这条由契约测试 \filepath{tests/test\_device\_config\_io.py} 机械守卫。工具栏只在会话把这三个回调接进来时才出现（\pyapi{exp.device\_manager()} 会接）；\pyapi{show\_device\_manager(device\_set)} 裸开一个 \pyapi{DeviceSet} 时没有可存取的会话，面板退化为\tfocus{只读}（设备列表 + Scan hardware）。
+\end{notebox}
+
+\section{运行时控制 tab：\pyapi{runtime\_controls()}}
+设备管理器的窗体是一个双 tab：\tfocus{Config} tab 就是上面讲的配置编辑器（写进 JSON 的构造期参数），\tfocus{Control} tab 则是每台设备\tfocus{正在运行时可看可调}的属性目录。二者是\tfocus{不同的层}：Config 决定"用什么参数把设备造出来"，Control 决定"设备跑起来之后哪些旋钮还能现场拧"。Loaded 卡上每台设备行都有一个 \pyapi{Control} 按钮，点开就是这台设备的 Control 页（一设备一 tab，重开只聚焦不重复）。
+
+这份目录由设备类的 \pyapi{runtime_controls()} 声明（\filepath{devices/base.py}）：每一项是一个 \pyapi{RuntimeControl}，绑定一个 \pyapi{ParamDecl}（所以控件走\tfocus{与配置表单同一个} \pyapi{PARAM_WIDGETS} 注册表按类型生成，\tfocus{绝不 eval 自由文本}）+ 一个 \pyapi{getter}（读回当前值）+ 一个可选的 \pyapi{setter}（写回；没有 setter 的项是\tfocus{只读读回}，控件禁用）。Control 页每 200 ms 轮询 getter 刷新读回值；可写项另有一个 Set 控件 + Apply 按钮，点 Apply 把编辑值经\tfocus{设备自己的 setter} 写回——\tfocus{值校验在设备边界做，不在 GUI}。
+
+\begin{description}
+  \item[相机（\pyapi{CameraDevice}）] 可写 \pyapi{exposure}（经相机 \pyapi{exposure} setter，非正值被设备拒），加只读读回 \pyapi{roi} / \pyapi{sensor} / \pyapi{frame}（下一帧形状） / \pyapi{trigger}（它数触发边沿的序列器线）。
+  \item[序列器（\pyapi{SequencerDevice}）] 只读读回 \pyapi{firing}（此刻是否在连续发程序） / \pyapi{last fired} / \pyapi{scan}（扫描到第几点/第几轮，或 idle） / \pyapi{channels}；\pyapi{sleep\_scale}（虚拟发间快进倍数）\tfocus{仅当后端真带一个可写属性时}才作为可写项出现——真实/远程序列器没有这个旋钮，就退化成只读读回，绝不给一个写了会失败的 setter。
+\end{description}
+
+\begin{notebox}[声明即控件，虚拟 == 真机]
+运行时控制目录由\tfocus{契约基类}声明，所以每种后端（虚拟 / qCMOS / 远程）继承即得\tfocus{同一套控件}——一台相机的 Control 页在虚拟和真机上长得一样，换真机不用改 GUI。某后端多一个 live 旋钮就在自己的 \pyapi{runtime_controls()} 里\tfocus{扩展}这份目录。所有项的 \pyapi{decl.kind} 都在 \pyapi{PARAM_WIDGETS} 覆盖内、值校验都在设备 setter——由契约测试 \filepath{tests/test\_device\_runtime\_controls.py} 守卫（kind$\in$注册表、只读项无 setter、越界值被设备拒）。
+\end{notebox}
+
+\section{换 / 停设备时，引用它的逻辑节点会被停}
+设备管理器的 \pyapi{Load config} / \pyapi{Apply}（换一套设备）与 \pyapi{exp.close()}（拆整个会话）会\tfocus{联动停止逻辑节点}——因为一个正在跑的监控台节点（相机 measurement、扫描 measurement、占据 processor……）是在\tfocus{后台线程里持有设备句柄}的消费者：设备一旦被换掉 / 关掉，这些线程若不先停，就会攥着旧句柄继续驱动一台已经不在的硬件。规则是\tfocus{按设备身份精确停}，而不是无脑全停：
+
+\begin{description}
+  \item[\pyapi{load\_config} / device manager 的 \pyapi{Load}·\pyapi{Apply}——只停"引用了被换设备"的节点] 会话先\tfocus{构造好新 \pyapi{DeviceSet}}（坏配置不动老会话），再按 role 比对新旧实例算出\tfocus{被换掉的那些设备}，只停\tfocus{引用了它们}的运行节点。所以\tfocus{只换相机}时，一个跑在\tfocus{没动的序列器}上的扫描\tfocus{继续跑}——不误伤无关工作。
+  \item[\pyapi{exp.close()}——停全部] 整个会话（连同监控台）都要拆，于是走\tfocus{全量} teardown：停掉每一个节点，再关设备。
+\end{description}
+
+"节点引用了哪些设备"由 \pyapi{LogicNode.referenced_devices()} 回答，它是\tfocus{占用集的超集}：既收\tfocus{独占驱动}（EXCLUSIVE，如相机 measurement 独占相机）、也收\tfocus{只读观察}（OBSERVE，节点只读某设备状态）——两类都得停，因为无论驱动还是观察，设备没了这个节点就在对着空气跑。观察态设备被包成 \pyapi{ReadOnlyDevice} 代理（与裸设备不是同一对象），判定"是否引用这台硬件"时先经 \pyapi{underlying_device()} 反查真身，绝不因代理身份漏判。
+
+\begin{notebox}[为什么不"随便改设备"就行]
+不允许在有节点在跑时静默换掉它脚下的设备——那会让后台线程驱动死硬件。所以换设备是一个\tfocus{显式的、会先停相关节点}的动作：换完设备后，被停的节点在监控台里回到"停"态，你确认新设备就绪再重新 Start。这条由契约测试 \filepath{tests/test\_device\_occupancy\_exclusion.py} / \filepath{test\_session\_device\_lifecycle.py} 守卫（换单设备只停引用它的、不动 disjoint 节点；close 停全部）。
 \end{notebox}
 
 \section{设备契约（四种类型）}

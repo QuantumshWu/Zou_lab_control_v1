@@ -316,9 +316,13 @@ def _device_manager_figure_tex(fig_path: str) -> str:
         "现场探一遍总线并把发现的设备补一张卡。顶部的\\tfocus{配置工具栏}——绿色 \\pyapi{Open devices}（初始化硬件）、"
         "\\pyapi{Load config\\ldots} / \\pyapi{Save config\\ldots}——就是会话 \\pyapi{exp.open\\_devices()} / "
         "\\pyapi{exp.load\\_config()} / \\pyapi{exp.save\\_config()} 的图形面（存一份配置、下次一行连回来）。它是 "
-        "\\pyapi{load\\_devices} / \\pyapi{discover\\_devices} 的\\tfocus{GUI 面孔}，\\tfocus{与会话绑定}——唯一入口是 "
-        "\\pyapi{exp.device\\_manager()}（监控台顶栏的 \\pyapi{Devices} 按钮走同一个每会话单例）。它天生依赖会话的 "
-        "\\pyapi{DeviceSet}（frontend 被密封、拿不到设备），所以\\tfocus{不}是一个 \\pyapi{zf} 模块级函数。"
+        "\\pyapi{load\\_devices} / \\pyapi{discover\\_devices} 的\\tfocus{GUI 面孔}。两个入口："
+        "\\pyapi{exp.device\\_manager()}（\\tfocus{会话绑定}，编辑与换设备）和 \\pyapi{na.device\\_manager(config)}"
+        "（还没有 session 时的\\tfocus{初始化}入口：按 \\pyapi{Init devices} 即 \\pyapi{connect}，\\pyapi{window.session} "
+        "把新会话交回 notebook）。监控台顶栏的 \\pyapi{Devices} 按钮开的是\\tfocus{只读查看器}"
+        "（\\pyapi{exp.device\\_viewer()}，快照 + 运行时读回，\\tfocus{不}编辑、\\tfocus{不}换设备），而非本编辑器——"
+        "运行中改设备是危险的。本编辑器天生依赖会话的 \\pyapi{DeviceSet}（frontend 被密封、拿不到设备），"
+        "所以它\\tfocus{不}是 \\pyapi{zf} 模块级函数；建 session 的模块级入口是 \\pyapi{na.device\\_manager}。"
     )
     return (
         "\\begin{figure}[h]\n\\centering\n"

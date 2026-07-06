@@ -415,7 +415,11 @@ Duration 输入框旁边有一个\tfocus{单位下拉框（combo）}。
 
 \subsection{DAC（模拟总线）行 — mode 下拉}
 
-卡片下部，\tfocus{每一条模拟总线（DAC）}各占一行，例如 \pyapi{da_dipole}。每行由两个控件组成：一个 mode 下拉 + 一个 value 输入框。先看 mode 下拉。
+卡片下部，\tfocus{每一条模拟总线（DAC）}各占一行，例如 \pyapi{da_dipole} 或线圈的 \pyapi{da_x}/\pyapi{da_y}/\pyapi{da_z}。每行由两个控件组成：一个 mode 下拉 + 一个 value 输入框。先看 mode 下拉。
+
+\begin{notebox}[总线行从哪来：设备自带的通道标签]
+一条模拟总线是由若干\tfocus{位通道}拼出来的（例如三路线圈各占一段 6 bit）。编辑器把这些位通道\tfocus{折叠}成一条总线行，依据的是\tfocus{设备自带的通道标签}——真机的标签来自板卡 XDC（如 \pyapi{da_dipole[0]}），虚拟序列器同样自带一份对齐的标签。所以\tfocus{从会话打开的编辑器}（\pyapi{exp.pulse\_gui()}）\tfocus{一开始、还没载入任何模板}时就已经把线圈显示成 \pyapi{da_x}/\pyapi{da_y}/\pyapi{da_z} 三条总线行，和真机同构——不是要先载一个模板才折叠。标签只标注设备\tfocus{真正携带}的那些通道，绝不广告一条成员缺席的空总线。
+\end{notebox}
 
 \begin{description}
 \item[作用] mode 下拉决定「这一段时间里，这条 DAC 的值如何变化」。
@@ -974,6 +978,9 @@ measurement / processor / task 三份目录都是\tfocus{自动发现的}:往 \p
 \end{itemize}
 配置一套新监控台的完整流程：开一个空控制台 → 从 Add Panel 加 Logic 节点（相机 measurement / 扫描测量 / processor / task）并 Start、加 Plot 面板把 Source 指到它们发布的信号 → 改任务名 → \pyapi{Save}。以后一条命令整套载回——实验室里每类日常实验配一套自己的监控台。
 
+\section{Devices 按钮：只读查看当前设备}
+标题栏的 \pyapi{Devices} 按钮打开一个\tfocus{只读}的设备查看器：每台已加载设备一个 tab，显示它的 snapshot + live 运行时读回（就是设备管理器 Control tab 那份 \pyapi{runtime\_controls()} 目录的只读形态），\tfocus{没有配置编辑、没有增删设备、没有 Apply 写}。这样操作者能在实验\tfocus{正跑着}时安全地瞄一眼某台设备的状态（曝光、扫描进度、firing……），而\tfocus{不会误改跑在其上的设备}。要真正编辑 / 换设备，走\tfocus{完整}的设备管理器 \pyapi{exp.device\_manager()} / \pyapi{na.device\_manager()}（它才有 Config 编辑器与 Load / Apply；换设备会先停引用被换设备的节点——详见设备手册）。查看器每会话单例，重开复用同一窗口并\tfocus{每次重读当前设备}（\pyapi{load\_config} 换过设备后也能看到新的那套）。
+
 \section{启动与接线}
 双击 \filepath{task\_console.bat}（或 \pyapi{python task\_console.py}）即以\tfocus{虚拟实验}启动：走\tfocus{与真机同一个 \pyapi{connect()} 契约}连一个虚拟实验（只有相机帧是仿真的），\pyapi{sitemap}/\pyapi{thresholds} 自标定让目录里的 measurement / processor / task 能跑，再把\tfocus{自动发现的三份目录接进 Add Panel}——但控制台开局 \tfocus{空 hub、全停}，\tfocus{不自动建/启任何读出}（解耦的 VIEW / LOGIC 模型）。看 loading 你自己从 Logic tab 加 \pyapi{Measurement: Camera (live frames)} + \pyapi{Processor: Judge occupancy} + \pyapi{Task: Calibrate readout} 并 Start，再加 Plot 面板连它们的信号。常用参数：\pyapi{--config remote\_template}（\tfocus{真机直跑}：连真实设备、同一 \pyapi{connect()} 契约——首光站点/阈值标定仍在 notebook 做，见 \filepath{docs/REAL\_HARDWARE\_BRINGUP\_zh.md}）、\pyapi{--grid 5x7}（阵列形状，虚拟与 \pyapi{--config} 通用）、\pyapi{--task 名字}（载入你存的命名布局）、\pyapi{--state xxx.json}（按路径载入布局）、\pyapi{--scale}（UI 缩放，默认 auto）、\pyapi{--no-connect}（不连任何会话，自己接 hub）。
 
@@ -1204,7 +1211,8 @@ zf.render_tex_pdf("notes/manual.tex", "notes/manual.pdf")
 做仪表盘面板（嵌进宿主） & \pyapi{zf.panel_plot(x, y, kind=, size=)} \\
 打开脉冲编辑器 GUI & \pyapi{zf.show_pulse_gui(sequencer=)} \\
 打开实时监控台 & \pyapi{zf.show_task_console(hub=, task=)} \\
-打开设备管理器 GUI & \pyapi{exp.device_manager()}（会话绑定，唯一入口；监控台顶栏也有 \pyapi{Devices} 按钮） \\
+打开设备管理器 GUI（编辑/换设备） & \pyapi{exp.device_manager()}（会话绑定）或 \pyapi{na.device_manager(config)}（先建配置再 Init） \\
+只读查看设备状态 & \pyapi{exp.device_viewer()}（监控台顶栏 \pyapi{Devices} 按钮即此） \\
 推送一个 shot 给监控台 & \pyapi{hub.publish(...)} \\
 TeX/字符串 -> PDF & \pyapi{zf.render_tex_pdf(tex, out)} \\
 \bottomrule
