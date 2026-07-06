@@ -1747,7 +1747,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         root.setContentsMargins(window_pad(1), window_pad(1), window_pad(1), window_pad(1))
         root.setSpacing(window_pad(0.5))
 
-        header_frame = FluentFrame()
+        # A top STRIP, not a boxed card: borderless like the button bar below (bordered=False), so it
+        # does not read as an outer frame drawn around the header row (the residual 1 px box).
+        header_frame = FluentFrame(bordered=False)
         header_frame.setFixedHeight(_px(48, minimum=38))
         header = QtWidgets.QHBoxLayout(header_frame)
         header.setContentsMargins(_px(12), _px(6), _px(12), _px(6))
