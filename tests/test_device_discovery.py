@@ -106,8 +106,11 @@ def test_pylon_discovery_rows_yield_ready_configs_for_the_class_itself():
                                        _FakeInfo("acA2440-20gm", "40098765")])
     assert [r.ident for r in rows] == ["24012345", "40098765"]
     assert rows[0].label == "acA1920-155um"
-    # capture_trigger_channels is spelled out in the ready config (inert while free-running, but
-    # the knob the operator MUST retarget when switching trigger_source to a hardware line).
+    # capture_trigger_channels is spelled out in the ready config (inert while free-running --
+    # effective_trigger_channels is then () and edge counts are zero -- but the knob the operator
+    # MUST retarget when switching trigger_source to a hardware line).  The virtual monitor camera
+    # declares the SAME inert default in Software mode (virtual == real, see
+    # test_monitor_camera_free_run.test_free_run_counting_line_declaration_is_identical_on_both_backends).
     assert rows[0].config == {"type": PylonCamera.__name__,
                               "params": {"serial": "24012345",
                                          "trigger_source": SOFTWARE_TRIGGER,

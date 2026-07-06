@@ -188,6 +188,12 @@ _RUNTIME_PROGRAM_VERSION = 3
 class RuntimeSequenceProgram:
     """Runtime edge-table program uploaded to a pulse-streamer-like FPGA."""
 
+    # The on-disk/wire identity of this payload -- the CLASS owns it (same pattern as
+    # PulseSequence.schema / PulseTableState.schema): to_dict writes it, from_dict checks it,
+    # and the timing_from_payload dispatcher compares against it, so the string has exactly
+    # one spelling.  (No type annotation: a dataclass must not treat it as a field.)
+    schema = "Zou_lab_control.neutral_atom.RuntimeSequenceProgram"
+
     sequence_id: str
     sequence_name: str
     clock_hz: float
@@ -256,7 +262,7 @@ class RuntimeSequenceProgram:
 
     def to_dict(self) -> dict[str, object]:
         payload = {
-            "schema": "Zou_lab_control.neutral_atom.RuntimeSequenceProgram",
+            "schema": self.schema,
             "version": _RUNTIME_PROGRAM_VERSION,
             "sequence_id": self.sequence_id,
             "sequence_name": self.sequence_name,
@@ -292,7 +298,7 @@ class RuntimeSequenceProgram:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "RuntimeSequenceProgram":
-        if payload.get("schema") != "Zou_lab_control.neutral_atom.RuntimeSequenceProgram":
+        if payload.get("schema") != cls.schema:
             raise ValueError("unsupported runtime sequence program schema.")
         # ``version`` is load-bearing, not a written-but-unread field (#G4): a future schema bump
         # fails fast here with a clear rebuild message instead of silently mis-decoding an old payload.
@@ -1069,6 +1075,15 @@ class SequencerService:
             self.history.append({"action": "wait_done", "sequence_id": program.sequence_id, "ok": ok})
         return ok
 
+    def settle(self, seconds: float, *, stop=None) -> None:
+        """Idle ``seconds`` between software-stepped fires, scaled by THIS service's
+        ``sleep_scale`` -- the ONE home of the "a virtual settle fast-forwards with
+        sleep_scale" rule (``sleep_scale=0`` under pytest -> instant), which both composing
+        backends (``VirtualSequencer``, ``RuntimeSequencer``) delegate to.  ``stop`` keeps
+        the wait cooperatively cancellable via the shared interruptible sleep
+        (``SequencerDevice._sleep_interruptible`` -- not a second sleep loop)."""
+        SequencerDevice._sleep_interruptible(float(seconds) * float(self.sleep_scale), stop)
+
     def abort(self) -> None:
         with self._lock:
             self.prepared_program = None
@@ -1186,9 +1201,9 @@ class RuntimeSequencer(SequencerDevice):
         return self.service.scan_progress()
 
     def settle(self, seconds: float, *, stop=None) -> None:
-        # Scale the inter-shot wait by the service's sleep_scale, so it fast-forwards under the
-        # SAME knob as wait_done (else a sleep_scale=0 RuntimeSequencer would real-time-sleep here).
-        self._sleep_interruptible(float(seconds) * float(self.service.sleep_scale), stop)
+        # Delegated to the composed service, which owns sleep_scale and therefore the one
+        # "settle fast-forwards with sleep_scale" rule (SequencerService.settle).
+        self.service.settle(seconds, stop=stop)
 
     def abort(self) -> None:
         self.service.abort()
@@ -1197,9 +1212,10 @@ class RuntimeSequencer(SequencerDevice):
         self.service.set_safe_state()
 
     def snapshot(self) -> dict[str, object]:
-        out = self.service.snapshot()
-        out["type"] = type(self).__name__
-        return out
+        # The composed service's snapshot carries ITS identity ("SequencerService"); merging the
+        # base snapshot LAST restores this adapter's own -- the ``type`` key still has ONE
+        # producer per class (BaseDevice.snapshot), never a re-typed literal here.
+        return {**self.service.snapshot(), **super().snapshot()}
 
 
 class ManualSequencer(SequencerDevice):
@@ -1259,14 +1275,15 @@ class ManualSequencer(SequencerDevice):
         self.history.append({"action": "safe"})
 
     def snapshot(self) -> dict[str, object]:
-        return {
-            "type": type(self).__name__,
+        out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot
+        out.update({
             "channels": list(self.channels),
             "clock_hz": self.clock_hz,
             "state": self.state,
             "prepared": self.prepared_sequence is not None,
             "history_length": len(self.history),
-        }
+        })
+        return out
 
 
 class RemoteSequencer(SequencerDevice):
@@ -1366,15 +1383,15 @@ class RemoteSequencer(SequencerDevice):
         self._conn.root.set_safe_state()
 
     def snapshot(self) -> dict[str, object]:
-        out = {
-            "type": type(self).__name__,
+        out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot
+        out.update({
             "host": self.host,
             "port": self.port,
             "channels": list(self.channels),
             "clock_hz": self.clock_hz,
             "connected": self._conn is not None,
             "last_program": None if self._last_program is None else self._last_program.to_dict(),
-        }
+        })
         if self._conn is not None:
             try:
                 remote = dict(self._conn.root.snapshot())
@@ -1751,8 +1768,8 @@ class VerilogSequencer(SequencerDevice):
         self.fire_callback(self.last_build)
 
     def snapshot(self) -> dict[str, object]:
-        return {
-            "type": type(self).__name__,
+        out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot
+        out.update({
             "channels": self.channels,
             "clock_hz": self.clock_hz,
             "output_dir": str(self.output_dir),
@@ -1760,7 +1777,8 @@ class VerilogSequencer(SequencerDevice):
             "last_verilog": None if self.last_files is None else str(self.last_files.verilog_path),
             "last_manifest": None if self.last_files is None else str(self.last_files.manifest_path),
             "prepared": self.prepared_sequence is not None,
-        }
+        })
+        return out
 
     def close(self) -> None:
         pass
@@ -1800,10 +1818,10 @@ def timing_from_payload(payload) -> PulseSequence | PulseTableState:
         return timing_from_payload(json.loads(payload))
     if isinstance(payload, Mapping):
         data = dict(payload)
-        schema = data.get("schema", "Zou_lab_control.neutral_atom.PulseSequence")
-        if schema == "Zou_lab_control.neutral_atom.PulseTableState":
+        schema = data.get("schema", PulseSequence.schema)
+        if schema == PulseTableState.schema:
             return PulseTableState.from_dict(data)
-        if schema == "Zou_lab_control.neutral_atom.PulseSequence":
+        if schema == PulseSequence.schema:
             return PulseSequence.from_dict(data)
         raise ValueError(f"unsupported timing payload schema {schema!r}.")
     if hasattr(payload, "items"):

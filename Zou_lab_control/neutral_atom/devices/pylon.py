@@ -27,7 +27,8 @@ from typing import Sequence
 
 import numpy as np
 
-from .base import ROI_CLEAR_SENTINELS, SOFTWARE_TRIGGER, CameraDevice, snap_subarray
+from ..core.analysis import positive_float
+from .base import ROI_CLEAR_SENTINELS, SOFTWARE_TRIGGER, CameraDevice, is_software_trigger, snap_subarray
 from .camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS
 
 
@@ -52,23 +53,25 @@ class PylonCamera(CameraDevice):
     acA1920-155um; ``Mono12`` for photon-counting-ish dynamic range, ``Mono8`` for speed);
     ``capture_trigger_channels`` is which SEQUENCER line the camera's hardware trigger input is
     physically wired to -- the passive wiring fact the measurement layer counts trigger edges on
-    (``triggered_frames``/``_program_for_frames``).  In ``Software`` free-run the declaration is
-    inert (no edge gates a frame), so the conservative base default is fine; in a HARDWARE-triggered
-    session it MUST name the real cable's sequencer channel (e.g. ``("ch05",)``), or the edge count
-    reads the wrong line and a multi-frame acquisition mis-repeats its program.  Note the two
-    namespaces: ``trigger_source`` is the Basler-side GenICam line name (``"Line1"``),
+    (``triggered_frames``/``_program_for_frames``, via the base-class
+    ``effective_trigger_channels``, which reports ``()`` while free-running: a ``Software``
+    sensor consults no trigger line, so its edge counts are honestly zero).  In ``Software``
+    free-run the declaration is therefore inert, and the conservative base default is fine; in a
+    HARDWARE-triggered session it MUST name the real cable's sequencer channel (e.g. ``("ch05",)``),
+    or the edge count reads the wrong line and a multi-frame acquisition mis-repeats its program.
+    Note the two namespaces: ``trigger_source`` is the Basler-side GenICam line name (``"Line1"``),
     ``capture_trigger_channels`` the FPGA-side channel driving that line."""
 
     def __init__(self, *, exposure: float = 5e-3, serial: str = "",
                  trigger_source: str = "Line1", pixel_format: str = "Mono8",
                  timeout: float = 2.0, subarray_step: int = 2,
                  capture_trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS):
-        self._exposure = float(exposure)
+        self._exposure = self._validated_exposure(exposure)
         self.serial = str(serial)
         self.trigger_source = str(trigger_source)
         self.capture_trigger_channels = tuple(str(c) for c in capture_trigger_channels)
         self.pixel_format = str(pixel_format)
-        self.timeout = float(timeout)
+        self.timeout = positive_float(timeout, "timeout")
         # Fallback ROI grid when the camera is not open yet; once open, the camera's OWN GenICam
         # increments (Width.Inc / OffsetX.Inc) own the legal grid -- never a hardcoded step.
         self.subarray_step = int(subarray_step)
@@ -110,7 +113,8 @@ class PylonCamera(CameraDevice):
             config={"type": cls.__name__,
                     "params": {"serial": str(i.GetSerialNumber()),
                                "trigger_source": SOFTWARE_TRIGGER,
-                               # Inert in Software free-run; switching trigger_source to a hardware
+                               # Inert in Software free-run (effective_trigger_channels is then
+                               # () -- no counting line); switching trigger_source to a hardware
                                # line means setting this to the sequencer channel wired to it.
                                "capture_trigger_channels": list(DEFAULT_CAMERA_TRIGGER_CHANNELS)}})
             for i in infos]
@@ -176,7 +180,7 @@ class PylonCamera(CameraDevice):
 
     @exposure.setter
     def exposure(self, value: float) -> None:
-        self._exposure = float(value)
+        self._exposure = self._validated_exposure(value)
         if self._camera is not None:
             self._apply_exposure()
 
@@ -185,22 +189,33 @@ class PylonCamera(CameraDevice):
         return self._roi
 
     @property
-    def sensor_shape(self) -> tuple[int, int]:
+    def sensor_shape(self) -> tuple[int, int] | None:
+        # None before open: the honest "unknown until opened" of the base contract (same as the
+        # qCMOS) -- never a fabricated (0, 0) a consumer would read as a KNOWN zero-size sensor.
         if self._camera is None:
-            return (0, 0)
+            return None
         return (int(self._camera.HeightMax.GetValue()), int(self._camera.WidthMax.GetValue()))
 
     def configure(self, *, exposure: float | None = None, roi: object = None, **kwargs) -> None:
         self._reject_unknown_configure_keys({"exposure", "roi"}, kwargs)
         if exposure is not None:
-            self.exposure = float(exposure)
+            self.exposure = exposure             # the setter validates (_validated_exposure)
         if roi is not None:
             if roi in ROI_CLEAR_SENTINELS:       # FULL_FRAME (or a blank box) -> the full sensor
                 self._roi = None
             else:
-                h, w = self.sensor_shape
-                self._roi = snap_subarray(tuple(roi), step=self.subarray_step,
-                                          max_w=w or 10**6, max_h=h or 10**6)
+                shape = self.sensor_shape
+                if shape is None:
+                    # Closed camera (configure-before-open is normal: the device set opens
+                    # cameras last): no sensor to clamp against yet -- snap to the fallback
+                    # grid only; open() re-applies the ROI against the live GenICam
+                    # Min/Max/Inc (_apply_roi), where the hardware owns the legal window.
+                    self._roi = snap_subarray(tuple(roi), step=self.subarray_step,
+                                              max_w=10**6, max_h=10**6)
+                else:
+                    h, w = shape
+                    self._roi = snap_subarray(tuple(roi), step=self.subarray_step,
+                                              max_w=w, max_h=h)
             self._apply_roi()
 
     def _apply_exposure(self) -> None:
@@ -249,7 +264,9 @@ class PylonCamera(CameraDevice):
 
     @property
     def _free_run(self) -> bool:
-        return self.trigger_source.lower() == SOFTWARE_TRIGGER.lower()
+        # THE shared predicate (devices.base.is_software_trigger) -- the same rule the virtual
+        # monitor camera reads, so the two backends can never drift.
+        return is_software_trigger(self.trigger_source)
 
     def _arm(self, frames: int | None) -> None:
         """Start the grab session for an armed request.  Two modes, each with the strategy its
@@ -348,12 +365,13 @@ class PylonCamera(CameraDevice):
             self._camera.StopGrabbing()
 
     def snapshot(self) -> dict[str, object]:
-        return {
-            "type": type(self).__name__,
+        out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot
+        out.update({
             "exposure": self.exposure,
             "roi": self._roi,
             "serial": self.serial,
             "trigger_source": self.trigger_source,
             "capture_trigger_channels": list(self.capture_trigger_channels),
             "pixel_format": self.pixel_format,
-        }
+        })
+        return out

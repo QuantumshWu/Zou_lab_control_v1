@@ -213,7 +213,8 @@ class NeutralAtomSession:
             # readout imaging sequence gates the READOUT camera's trigger; a camera wired to another
             # line (e.g. the MOT monitor on ``mot_trigger``) is snapshotted through ITS own template,
             # not this convenience.  Fail with an actionable message, never an IndexError on ``[-1]``.
-            trig = tuple(getattr(cam, "capture_trigger_channels", ()) or ())
+            from .devices.camera_trigger import resolve_camera_trigger_channels
+            trig = resolve_camera_trigger_channels(cam)
             raise RuntimeError(
                 f"camera {name!r} captured no frames: the imaging sequence gates the readout "
                 f"camera's trigger, but {name!r} is triggered on {trig or '(unknown line)'}.  "
@@ -243,10 +244,12 @@ class NeutralAtomSession:
     def _imaging_channel_kwargs(self) -> dict[str, str]:
         # Single source of truth lives in timing.imaging_channel_kwargs so the
         # session and the loading readout map channels identically (see M4 / logic nodes).
-        # The CAMERA owns which line gates a frame, so the imaging pulse triggers THAT channel.
-        cam_trig = getattr(getattr(self.devices, "camera", None), "capture_trigger_channels", None)
+        # The CAMERA owns which line gates a frame, so the imaging pulse triggers THAT channel --
+        # read through the one derived fact (CameraDevice.primary_trigger_channel: the first
+        # active counting line, None for a free-running sensor / no camera in the config).
+        cam = getattr(self.devices, "camera", None)
         return imaging_channel_kwargs(getattr(self.devices, "sequencer", None),
-                                      trigger_channel=(cam_trig[0] if cam_trig else None))
+                                      trigger_channel=getattr(cam, "primary_trigger_channel", None))
 
     def _preflight(self, *, sequence: PulseSequence | None = None, verilog: bool = True) -> PreflightReport:
         sequence = sequence or self.sequence

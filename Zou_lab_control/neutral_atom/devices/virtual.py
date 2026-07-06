@@ -23,11 +23,13 @@ from Zou_lab_control._readout_math import normal_cdf
 from ..core.utils import site_index
 from .base import (
     ROI_CLEAR_SENTINELS, SOFTWARE_TRIGGER, CameraDevice, SequencerDevice, TrapArrayDevice,
-    snap_subarray)
+    is_software_trigger, snap_subarray)
 from .camera_trigger import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
+    base_cycle_camera_trigger_pulses,
     base_cycle_trigger_pulses,
-    count_trigger_pulses,
+    count_camera_trigger_pulses,
+    normalize_trigger_channels,
 )
 from ..timing import (
     PulseSequence,
@@ -513,18 +515,24 @@ class VirtualTrapArray(TrapArrayDevice):
         frame (the live image freezes), exactly like an externally-triggered sensor.  The analysis
         layer never sees any of this -- it only receives the rendered frames."""
         frames = positive_int(frames, "frames")
-        trig = capture_trigger_channels or DEFAULT_CAMERA_TRIGGER_CHANNELS
+        trig = normalize_trigger_channels(capture_trigger_channels)
         if sequence is None:
             return []
+        # How many camera-trigger windows does ONE base cycle carry on this camera's line?  The
+        # ONE authoritative "does/how much does this pulse trigger the camera" reading
+        # (camera_trigger.base_cycle_trigger_pulses: rising edges only -- ``pulse.value`` -- on
+        # the delivered base cycle), shared by the live gate below AND the bracket criterion.
+        base_windows = base_cycle_trigger_pulses(sequence, trigger_channels=trig)
         # The camera-trigger gate is a LIVE-monitor concept: a CONTINUOUS (``repeat_forever``)
-        # firing renders only while it pulses a camera-trigger line, and FREEZES the moment it
-        # does not (Stop Pulse -> a non-imaging safe state), exactly like a real externally-
-        # triggered sensor.  A FINITE measurement sequence (sitemap / threshold / detect /
-        # detection-time scan / reference bracket) is one the measurement deliberately fired to
-        # read ``frames`` windows, so it is rendered UNCONDITIONALLY -- its per-frame physics
-        # (cooling/trap-off/trap-hold) is parsed against the camera's trigger line, defaulting
-        # to independent re-loads when the bound pulse carries no trigger of its own.
-        if getattr(sequence, "repeat_forever", False) and not _sequence_triggers_camera(sequence, trig):
+        # firing renders only while it pulses a camera-trigger line (a RISING edge -- an
+        # explicit value=0 entry drives the line LOW and gates nothing, exactly like hardware),
+        # and FREEZES the moment it does not (Stop Pulse -> a non-imaging safe state).  A FINITE
+        # measurement sequence (sitemap / threshold / detect / detection-time scan / reference
+        # bracket) is one the measurement deliberately fired to read ``frames`` windows, so it
+        # is rendered UNCONDITIONALLY -- its per-frame physics (cooling/trap-off/trap-hold) is
+        # parsed against the camera's trigger line, defaulting to independent re-loads when the
+        # bound pulse carries no trigger of its own.
+        if getattr(sequence, "repeat_forever", False) and base_windows <= 0:
             return []
         probe_set = probe_channel_set("probe")
         exposures = exposures_per_frame(sequence, frames, default=exposure,
@@ -547,7 +555,7 @@ class VirtualTrapArray(TrapArrayDevice):
         # long-short-long exposure" bug.  (The raw FIRED trigger total cannot distinguish a repeated
         # single-trigger from an N-window bracket -- both total N -- but the per-BASE-CYCLE count can:
         # 1 for the repeated single-trigger, N for the bracket.)
-        single_cycle = base_cycle_trigger_pulses(sequence, trigger_channels=trig) >= frames
+        single_cycle = base_windows >= frames
         # A repeated SINGLE-trigger sequence images a fresh independent loading every frame; each
         # repeat is one base cycle, so every frame's cooling window equals the base cooling
         # (``cooling_durations[0]``; None when the pulse has no cooling phase -> saturated load).
@@ -589,8 +597,8 @@ class VirtualTrapArray(TrapArrayDevice):
         return images
 
     def snapshot(self) -> dict[str, object]:
-        return {
-            "type": type(self).__name__,
+        out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot
+        out.update({
             "grid_shape": self.grid_shape,
             "image_shape": self.image_shape,
             "offset_counts": self.offset_counts,
@@ -601,18 +609,11 @@ class VirtualTrapArray(TrapArrayDevice):
             "pgc_cool_tau_s": self.pgc_cool_tau_s,
             "trap_lifetime_s": self.trap_lifetime_s,
             "capture_radius_m": self.capture_radius_m,
-        }
+        })
+        return out
 
     def close(self) -> None:
         pass
-
-
-def _sequence_triggers_camera(sequence, trigger_channels) -> bool:
-    """True if ``sequence`` pulses a camera-trigger (emCCD) channel -- i.e. firing it would
-    actually trigger the camera and produce a frame.  A pulse with NO camera trigger leaves
-    the camera dark, exactly as on hardware (the camera only reads out on a trigger edge)."""
-    trig = {str(c) for c in (DEFAULT_CAMERA_TRIGGER_CHANNELS if trigger_channels is None else trigger_channels)}
-    return any(getattr(p, "channel", None) in trig for p in getattr(sequence, "pulses", ()))
 
 
 class _TriggerWiredCamera(CameraDevice):
@@ -704,8 +705,7 @@ class _TriggerWiredCamera(CameraDevice):
         # -- the measurement layer that wants N frames fires N edges (``triggered_frames`` repeats a
         # single-trigger sequence to N triggers; a real FPGA emits N edges the same way).  Zero edges
         # -> zero frames delivered (nothing rendered), like a fire on a line this camera isn't wired to.
-        trig = getattr(self, "capture_trigger_channels", None)
-        edges = count_trigger_pulses(sequence, **({"trigger_channels": trig} if trig else {}))
+        edges = count_camera_trigger_pulses(self, sequence)
         wanted = edges if armed_frames is None else min(int(armed_frames), edges)
         if wanted <= 0:
             return
@@ -742,8 +742,7 @@ class _TriggerWiredCamera(CameraDevice):
         # firing whose base cycle carries no edge on THIS camera's line falls back to one frame
         # per grab (the MOT monitor's sequence-driven sensing; the atom camera's image_frames
         # gates that case to [] itself and the read stays frozen).
-        trig = getattr(self, "capture_trigger_channels", None)
-        cycle = base_cycle_trigger_pulses(firing, **({"trigger_channels": trig} if trig else {}))
+        cycle = base_cycle_camera_trigger_pulses(self, firing)
         frames = self._render_frames(firing, max(1, cycle))
         if not frames:
             return False            # the firing pulse carries no camera trigger -> dark
@@ -806,7 +805,7 @@ class VirtualCamera(_TriggerWiredCamera):
                  subarray_step: int = 4, capture_trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
                  sequencer=None):
         self.trap_array = trap_array
-        self._exposure = positive_float(exposure, "exposure")
+        self._exposure = self._validated_exposure(exposure)
         self.timeout = positive_float(timeout, "timeout")
         # Which line the camera's trigger is wired to -- a PASSIVE device property the camera owns
         # and exposes; it images the atoms the FPGA drives, never touching the sequencer (virtual==real).
@@ -837,7 +836,7 @@ class VirtualCamera(_TriggerWiredCamera):
 
     @exposure.setter
     def exposure(self, value: float) -> None:
-        self._exposure = positive_float(value, "exposure")
+        self._exposure = self._validated_exposure(value)
 
     @property
     def roi(self) -> tuple[int, int, int, int] | None:
@@ -853,7 +852,7 @@ class VirtualCamera(_TriggerWiredCamera):
     def configure(self, *, exposure: float | None = None, roi: object = None, **kwargs) -> None:
         self._reject_unknown_configure_keys({"exposure", "roi"}, kwargs)
         if exposure is not None:
-            self.exposure = positive_float(exposure, "exposure")
+            self.exposure = exposure          # the setter validates (_validated_exposure)
         if roi is not None:
             if roi in ROI_CLEAR_SENTINELS:
                 self._roi = None
@@ -871,7 +870,7 @@ class VirtualCamera(_TriggerWiredCamera):
         frames = positive_int(frames, "frames")
         images = self.trap_array.image_frames(
             sequence, frames,
-            capture_trigger_channels=self.capture_trigger_channels,
+            capture_trigger_channels=self.effective_trigger_channels,
             exposure=self.exposure,
             all_sites=bool(self.force_all_sites),
         )
@@ -897,13 +896,14 @@ class VirtualCamera(_TriggerWiredCamera):
                 stop.wait(wall) if stop is not None else time.sleep(wall)
 
     def snapshot(self) -> dict[str, object]:
-        return {
-            "type": type(self).__name__,
+        out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot
+        out.update({
             "exposure": self.exposure,
             "roi": self._roi,
             "timeout": self.timeout,
             "last_sequence": self.last_sequence,
-        }
+        })
+        return out
 
     def close(self) -> None:
         super().close()          # unplug the trigger cable (stop rendering on the streamer's fires)
@@ -951,15 +951,17 @@ class VirtualMotCamera(_TriggerWiredCamera):
                  trigger_source: str = SOFTWARE_TRIGGER,
                  sequencer=None):
         self.width, self.height = int(width), int(height)
-        self._exposure = positive_float(exposure, "exposure")
+        self._exposure = self._validated_exposure(exposure)
         self.timeout = positive_float(timeout, "timeout")
         self.trigger_source = str(trigger_source)
-        # Which sequencer line the camera's external trigger input is wired to -- DERIVED from
-        # ``trigger_source`` (one knob, never two spellings of the wiring): a concrete line name is
-        # the wire the edge-faithful frame count reads (a MOT probe pulsing ``mot_trigger`` once per
-        # cycle delivers one monitor frame); ``Software`` mode never consults its trigger input at
-        # all, so it honestly declares NO counting line (empty tuple).
-        self.capture_trigger_channels = () if self._free_run else (self.trigger_source,)
+        # The WIRING declaration mirrors the real PylonCamera exactly (virtual == real): a concrete
+        # line name IS the wire the edge-faithful frame count reads (a MOT probe pulsing
+        # ``mot_trigger`` once per cycle delivers one monitor frame); in ``Software`` free-run the
+        # declaration is the same inert conservative default the real discovery config carries.
+        # The ACTIVE counting line is the base-class ``effective_trigger_channels`` -- ``()`` while
+        # free-running (the sensor never consults its trigger input), derived ONCE in devices.base.
+        self.capture_trigger_channels = (
+            DEFAULT_CAMERA_TRIGGER_CHANNELS if self._free_run else (self.trigger_source,))
         # The coil DAC buses this camera's MOT responds to: {bus name: member bit channels LSB..MSB}.
         # Defaults mirror pulses/mot_field_template.json (three 6-bit buses) so the virtual demo is
         # zero-config; a real setup names its own buses in the device config.
@@ -988,7 +990,7 @@ class VirtualMotCamera(_TriggerWiredCamera):
 
     @exposure.setter
     def exposure(self, value: float) -> None:
-        self._exposure = positive_float(value, "exposure")
+        self._exposure = self._validated_exposure(value)
 
     @property
     def roi(self) -> tuple[int, int, int, int] | None:
@@ -1001,7 +1003,7 @@ class VirtualMotCamera(_TriggerWiredCamera):
     def configure(self, *, exposure: float | None = None, roi: object = None, **kwargs) -> None:
         self._reject_unknown_configure_keys({"exposure", "roi"}, kwargs)
         if exposure is not None:
-            self.exposure = positive_float(exposure, "exposure")
+            self.exposure = exposure          # the setter validates (_validated_exposure)
         if roi is not None:
             self._roi = None if roi in ROI_CLEAR_SENTINELS else snap_subarray(
                 tuple(roi), step=1, max_w=self.width, max_h=self.height)
@@ -1016,8 +1018,9 @@ class VirtualMotCamera(_TriggerWiredCamera):
 
     @property
     def _free_run(self) -> bool:
-        # The same case-insensitive rule PylonCamera._free_run applies (one shared vocabulary).
-        return self.trigger_source.lower() == SOFTWARE_TRIGGER.lower()
+        # THE shared predicate (devices.base.is_software_trigger) -- the same rule
+        # PylonCamera._free_run reads, so the two backends can never drift.
+        return is_software_trigger(self.trigger_source)
 
     def _sense_levels(self, sequence: PulseSequence | None) -> dict[str, float]:
         """The coil levels the sensor sees -- THE one sense rule for both acquisition modes.
@@ -1103,14 +1106,15 @@ class VirtualMotCamera(_TriggerWiredCamera):
         return True
 
     def snapshot(self) -> dict[str, object]:
-        return {
-            "type": type(self).__name__,
+        out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot
+        out.update({
             "exposure": self.exposure,
             "roi": self._roi,
             "trigger_source": self.trigger_source,
             "coil_buses": {k: list(v) for k, v in self.coil_buses.items()},
             "last_levels": self.last_levels,
-        }
+        })
+        return out
 
     def close(self) -> None:
         super().close()          # unplug the trigger cable (stop rendering on the streamer's fires)
@@ -1147,16 +1151,18 @@ class VirtualSequencer(SequencerDevice):
         # (the pytest suite flips that default to 0 to fast-forward; see conftest).
         if sleep_scale is None:
             sleep_scale = DEFAULT_SLEEP_SCALE
-        self.sleep_scale = nonnegative_float(sleep_scale, "sleep_scale")
         # The shared software state machine: prepare (with the FPGA-geometry backstop), fire,
         # source-payload recording and last_payload_json all live HERE, one copy.  Its built-in
         # pure-software wall-clock scan-progress is BYPASSED by wiring our real-time-paced
         # ``_scan_progress`` as the scan_progress_callback (the same callback seam the real AXI
         # backend uses for its hardware cursor) -- so the live-scan reading is single-sourced too.
+        # ``sleep_scale`` is handed to the service and OWNED there (this adapter's ``sleep_scale``
+        # is a delegating property) -- one copy, so settle / wait_done pacing / the wired cameras
+        # all read the same value even when a caller flips it mid-session.
         self.service = SequencerService(
             channels=self.channels,
             clock_hz=self.clock_hz,
-            sleep_scale=self.sleep_scale,
+            sleep_scale=nonnegative_float(sleep_scale, "sleep_scale"),
             scan_progress_callback=self._scan_progress,
         )
         # The compiled program of the last prepare() the camera reads as ``firing`` -- a
@@ -1192,6 +1198,18 @@ class VirtualSequencer(SequencerDevice):
         # with the fired program -- the software mirror of the electrical trigger edges the
         # FPGA would emit.  Purely a device-layer artefact (the one legal lowest-layer fake).
         self._fire_listeners: list = []
+
+    @property
+    def sleep_scale(self) -> float:
+        """The virtual time scale, OWNED by the composed service (the ONE copy every consumer
+        reads: ``settle``/``wait_done`` pacing, the scan ``base_dt``, and the wired cameras
+        through :attr:`_TriggerWiredCamera.sleep_scale`) -- a delegating view, so flipping it
+        mid-session reaches every timing path at once, never a stale adapter-side mirror."""
+        return float(self.service.sleep_scale)
+
+    @sleep_scale.setter
+    def sleep_scale(self, value) -> None:
+        self.service.sleep_scale = nonnegative_float(value, "sleep_scale")
 
     @property
     def history(self) -> list[dict[str, object]]:
@@ -1421,11 +1439,10 @@ class VirtualSequencer(SequencerDevice):
         return True
 
     def settle(self, seconds: float, *, stop=None) -> None:
-        """Idle ``seconds`` between software-stepped fires, scaled by ``sleep_scale`` like
-        :meth:`wait_done` -- so the virtual backend takes the same proportional wall-clock as the
-        rest of its timing (and the test suite's ``sleep_scale=0`` fast-forwards it to nothing).
-        ``stop`` makes the wait cooperatively cancellable (same contract as the base)."""
-        self._sleep_interruptible(float(seconds) * self.sleep_scale, stop)
+        """Idle ``seconds`` between software-stepped fires -- DELEGATED to the composed service,
+        which owns ``sleep_scale`` and therefore the one "settle fast-forwards with sleep_scale"
+        rule (``SequencerService.settle``); ``stop`` stays cooperatively cancellable."""
+        self.service.settle(seconds, stop=stop)
 
     def stop(self) -> None:
         """Drive the streamer to a safe idle state -- it stops firing, so the camera sees no
@@ -1446,8 +1463,8 @@ class VirtualSequencer(SequencerDevice):
         self._scan_fire_time = 0.0
 
     def snapshot(self) -> dict[str, object]:
-        return {
-            "type": type(self).__name__,
+        out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot
+        out.update({
             "channels": list(self.channels),
             "clock_hz": self.clock_hz,
             "sleep_scale": self.sleep_scale,
@@ -1456,7 +1473,8 @@ class VirtualSequencer(SequencerDevice):
             # the sync-to-device handle: the GUI's "Sync" reconstructs the editor state from
             # this (PulseTableState JSON of the last prepare), same as the real sequencer.
             "last_payload_json": self.last_payload_json,
-        }
+        })
+        return out
 
     def close(self) -> None:
         pass
@@ -1629,7 +1647,7 @@ def cooling_durations_per_frame(
     out = [0.0] * int(frames)
     if sequence is None or not hasattr(sequence, "effective_pulses"):
         return out
-    trig_set = {str(c) for c in (DEFAULT_CAMERA_TRIGGER_CHANNELS if trigger_channels is None else trigger_channels)}
+    trig_set = set(normalize_trigger_channels(trigger_channels))
     cool_set = {str(c) for c in cooling_channels}
     pulses = sequence.effective_pulses()
     trigger_starts = sorted(p.start for p in pulses if p.value and p.channel in trig_set)
@@ -1675,7 +1693,7 @@ def trap_off_durations_per_frame(
     if sequence is None or frames < 2 or not hasattr(sequence, "effective_pulses"):
         return out
 
-    trig_set = {str(c) for c in (DEFAULT_CAMERA_TRIGGER_CHANNELS if trigger_channels is None else trigger_channels)}
+    trig_set = set(normalize_trigger_channels(trigger_channels))
     trap_set = {str(c) for c in trap_channels}
     pulses = sequence.effective_pulses()
 
@@ -1728,7 +1746,7 @@ def trap_hold_durations_per_frame(
     out = [0.0] * int(frames)
     if sequence is None or not hasattr(sequence, "effective_pulses"):
         return out
-    trig_set = {str(c) for c in (DEFAULT_CAMERA_TRIGGER_CHANNELS if trigger_channels is None else trigger_channels)}
+    trig_set = set(normalize_trigger_channels(trigger_channels))
     trap_set = {str(c) for c in trap_channels}
     probe_set = {str(c) for c in probe_channels}
     pulses = sequence.effective_pulses()
@@ -1772,7 +1790,7 @@ def exposures_per_frame(
     out = [float(default)] * int(frames)
     if sequence is None or not hasattr(sequence, "effective_pulses"):
         return out
-    trig_set = {str(c) for c in (DEFAULT_CAMERA_TRIGGER_CHANNELS if trigger_channels is None else trigger_channels)}
+    trig_set = set(normalize_trigger_channels(trigger_channels))
     probe_set = {str(c) for c in probe_channels}
     pulses = sequence.effective_pulses()
     trigger_starts = sorted(p.start for p in pulses if p.value and p.channel in trig_set)

@@ -40,8 +40,8 @@ from Zou_lab_control.neutral_atom.devices.camera_trigger import DEFAULT_CAMERA_T
 from Zou_lab_control.neutral_atom.devices.registry import load_devices
 from Zou_lab_control.neutral_atom.devices.virtual import VirtualMotCamera, VirtualSequencer
 from Zou_lab_control.neutral_atom.operations.measurement import triggered_frames
-from Zou_lab_control.neutral_atom.operations.measurements.pulse_scan import _resolve_probe_template
 from Zou_lab_control.neutral_atom.operations.tasks.mot_field import DEFAULT_MOT_TEMPLATE
+from Zou_lab_control.neutral_atom.timing import resolve_fireable_template, single_imaging_template
 
 MOT_TEMPLATE = str(REPO_ROOT / DEFAULT_MOT_TEMPLATE)
 
@@ -49,7 +49,8 @@ MOT_TEMPLATE = str(REPO_ROOT / DEFAULT_MOT_TEMPLATE)
 def _mot_sequence_at(cam, values_fn):
     """The MOT coil template compiled at per-bus levels chosen by ``values_fn(bus)`` -- levels
     always derive from the device's own public model (``cam.b0``), never re-typed constants."""
-    state = _resolve_probe_template(MOT_TEMPLATE)
+    state = resolve_fireable_template(MOT_TEMPLATE, default_name=DEFAULT_MOT_TEMPLATE,
+                                      default_factory=single_imaging_template)
     slots = [s.name for s in state.api_slots if s.kind == "dac"]
     values = {name: int(values_fn(bus)) for name, bus in zip(slots, cam.coil_buses)}
     return state.with_api_resolved(values).to_sequence()
@@ -129,6 +130,30 @@ def test_pylon_capture_trigger_channels_is_configurable_closed():
     wired = PylonCamera(trigger_source="Line1", capture_trigger_channels=("ch05",))
     assert wired.capture_trigger_channels == ("ch05",)
     assert wired.snapshot()["capture_trigger_channels"] == ["ch05"]
+
+
+def test_free_run_counting_line_declaration_is_identical_on_both_backends():
+    """The machine-readable "which line does a FREE-RUN camera count on" fact has ONE answer on
+    both backends (virtual == real): the WIRING declaration (``capture_trigger_channels``) is the
+    same inert conservative default the real discovery config carries, and the ACTIVE counting
+    line (the base-class ``effective_trigger_channels``) is ``()`` -- a free-running sensor never
+    consults its trigger input, so its edge counts are honestly zero.  Hardware-trigger mode keeps
+    the wiring as the counting line on both."""
+    from Zou_lab_control.neutral_atom.devices.pylon import PylonCamera
+
+    v_free = VirtualMotCamera(trigger_source=SOFTWARE_TRIGGER)
+    r_free = PylonCamera(trigger_source=SOFTWARE_TRIGGER)
+    assert v_free.capture_trigger_channels == r_free.capture_trigger_channels \
+        == tuple(DEFAULT_CAMERA_TRIGGER_CHANNELS)
+    assert v_free.effective_trigger_channels == r_free.effective_trigger_channels == ()
+    assert v_free.primary_trigger_channel is None and r_free.primary_trigger_channel is None
+
+    v_wired = VirtualMotCamera(trigger_source="mot_trigger")
+    r_wired = PylonCamera(trigger_source="Line1", capture_trigger_channels=("ch05",))
+    assert v_wired.effective_trigger_channels == ("mot_trigger",)
+    assert r_wired.effective_trigger_channels == ("ch05",)
+    assert v_wired.primary_trigger_channel == "mot_trigger"
+    assert r_wired.primary_trigger_channel == "ch05"
 
 
 # --------------------------------------------------------------------------- end-to-end (console)

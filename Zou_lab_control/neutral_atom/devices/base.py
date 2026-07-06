@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 
-from ..core.analysis import positive_int
+from ..core.analysis import positive_float, positive_int
 from .camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS
 
 
@@ -31,6 +31,13 @@ class BaseDevice(ABC):
     long experiment.
     """
 
+    #: The device's SIDE-EFFECT-FREE surface -- the names an OBSERVE-mode consumer (a logic
+    #: node that reads but never drives, see :func:`read_only`) may touch.  Each contract
+    #: class extends this with its own read-only facts; drive verbs (open/close/configure/
+    #: arm/prepare/fire/...) are never listed.  The device OWNS this fact: consumers narrow
+    #: through it instead of each maintaining a private notion of "what is safe to read".
+    OBSERVE_API: frozenset = frozenset({"snapshot"})
+
     def open(self):
         return self
 
@@ -42,6 +49,57 @@ class BaseDevice(ABC):
 
     def snapshot(self) -> dict[str, Any]:
         return {"type": type(self).__name__}
+
+
+#: Device ACCESS MODES a logic node declares per device (its ``_devices`` mapping).
+#: ``EXCLUSIVE`` -- the node DRIVES the hardware (arms the camera / prepares+fires the
+#: streamer): at most one exclusive holder per device instance at a time, the fact the
+#: console's mutual exclusion intersects.  ``OBSERVE`` -- the node only READS state: it is
+#: handed a capability-narrowed :class:`ReadOnlyDevice` view (the device's own
+#: ``OBSERVE_API`` whitelist), so a later edit that tries to drive an observed device fails
+#: loudly instead of silently fighting the exclusive owner -- the declaration IS the
+#: capability, never just metadata that code can drift from.
+EXCLUSIVE = "exclusive"
+OBSERVE = "observe"
+
+
+class ReadOnlyDevice:
+    """A capability-narrowed view of a device: forwards ONLY the names in the device's own
+    ``OBSERVE_API`` (each contract class declares its side-effect-free surface); anything
+    else -- prepare/fire/arm/configure/... -- raises ``PermissionError`` naming the
+    violation.  Handed to a logic node for every device it declared ``OBSERVE``, so
+    "recorded but never driven" is machine-enforced rather than a comment."""
+
+    __slots__ = ("_device", "_allowed")
+
+    def __init__(self, device, allowed):
+        object.__setattr__(self, "_device", device)
+        object.__setattr__(self, "_allowed", frozenset(str(n) for n in allowed))
+
+    def __getattr__(self, name):
+        if name in self._allowed:
+            return getattr(self._device, name)
+        raise PermissionError(
+            f"{type(self._device).__name__}.{name} drives the device, but this node declared "
+            f"the device OBSERVE (read-only).  Declare it EXCLUSIVE in the node's _devices "
+            f"mapping if it really must drive it; observable names: {sorted(self._allowed)}.")
+
+    def __setattr__(self, name, value):
+        raise PermissionError(
+            f"cannot set {type(self._device).__name__}.{name}: this node observes the device "
+            "read-only (declared OBSERVE in its _devices mapping).")
+
+    def __repr__(self):
+        return f"<read-only {type(self._device).__name__}>"
+
+
+def read_only(device):
+    """The observe-mode view of ``device``: narrowed to its class's ``OBSERVE_API`` (walked
+    over the MRO so a contract subclass extends, never re-lists, its parent's surface)."""
+    allowed: set = set()
+    for cls in type(device).__mro__:
+        allowed.update(getattr(cls, "OBSERVE_API", ()))
+    return ReadOnlyDevice(device, allowed)
 
 
 #: The ONE "clear the ROI back to the full sensor" sentinel every camera ``configure(roi=...)``
@@ -64,6 +122,14 @@ ROI_CLEAR_SENTINELS = (FULL_FRAME, "", "None")
 #: two modes can never be spelled differently between backends (virtual == real).  The user-facing
 #: config value stays the plain string ``"Software"`` (compared case-insensitively).
 SOFTWARE_TRIGGER = "Software"
+
+
+def is_software_trigger(value) -> bool:
+    """True when ``value`` names the software-trigger / free-run mode -- THE case-insensitive
+    comparison against :data:`SOFTWARE_TRIGGER` (declared right above), so the rule can never
+    be spelled differently between backends (virtual == real): every ``_free_run`` predicate
+    calls this instead of re-typing ``.lower() ==``."""
+    return str(value).lower() == SOFTWARE_TRIGGER.lower()
 
 
 class CameraDevice(BaseDevice):
@@ -100,6 +166,48 @@ class CameraDevice(BaseDevice):
     #: ``emCCD`` line; a real camera is configured with its actual chNN at construction.
     capture_trigger_channels: tuple[str, ...] = DEFAULT_CAMERA_TRIGGER_CHANNELS
 
+    #: Read-only facts an OBSERVE-mode consumer may touch (see :class:`ReadOnlyDevice`):
+    #: the imaging geometry/exposure read-backs and the lossy live-view taps -- never
+    #: arm/read_frames/acquire/configure (those drive the exclusive acquisition path).
+    OBSERVE_API = BaseDevice.OBSERVE_API | frozenset(
+        {"exposure", "roi", "sensor_shape", "frame_shape", "capture_trigger_channels",
+         "effective_trigger_channels", "primary_trigger_channel", "latest", "drain"})
+
+    @property
+    def effective_trigger_channels(self) -> tuple[str, ...]:
+        """The line(s) this camera ACTIVELY counts capture edges on -- the machine-readable
+        "which channel gates my frames" fact every consumer reads (via
+        ``camera_trigger.resolve_camera_trigger_channels``), derived ONCE here:
+
+        * a FREE-RUNNING sensor (``trigger_source`` is the software-trigger mode,
+          :func:`is_software_trigger`) exposes on its own clock and never consults its trigger
+          input, so it counts on NO line -> ``()`` (edge counts are honestly zero) -- identical
+          for the real Basler and the virtual monitor camera (virtual == real);
+        * otherwise the declared :attr:`capture_trigger_channels` wiring.  A camera with no
+          ``trigger_source`` knob (the qCMOS, the virtual readout camera) is always
+          hardware-triggered, so its wiring IS its counting line."""
+        source = getattr(self, "trigger_source", None)
+        if source is not None and is_software_trigger(source):
+            return ()
+        return tuple(str(c) for c in self.capture_trigger_channels)
+
+    @property
+    def primary_trigger_channel(self) -> "str | None":
+        """The FIRST active counting line, or None when there is none (a free-running sensor) --
+        THE spelling every "which single channel should the imaging pulse trigger" consumer
+        reads (the session's imaging kwargs, the coupled measurement templates), so the
+        ``channels[0] if channels else None`` fallback is never re-typed at call sites."""
+        channels = self.effective_trigger_channels
+        return channels[0] if channels else None
+
+    @staticmethod
+    def _validated_exposure(value) -> float:
+        """THE one exposure validation every write path shares (this base setter, each
+        backend's re-declared setter/constructor/configure): a camera exposure is a positive
+        finite float -- identical on every backend (virtual == real), so an illegal value
+        fails loudly at the API boundary instead of reaching the hardware layer."""
+        return positive_float(value, "exposure")
+
     @property
     @abstractmethod
     def exposure(self) -> float:
@@ -113,8 +221,9 @@ class CameraDevice(BaseDevice):
         setting the exposure.  Multi-field / ROI changes still go through ``configure(...)``
         directly (an ROI snap / multi-subsystem write must not hide behind ``=``).  A backend
         that overrides the ``exposure`` getter must re-declare this setter (it would otherwise be
-        shadowed); the concrete cameras (VirtualCamera, QCMOSCamera) do."""
-        self.configure(exposure=float(value))
+        shadowed); the concrete cameras (VirtualCamera, QCMOSCamera) do -- and every setter
+        validates through :meth:`_validated_exposure` (the single validation source)."""
+        self.configure(exposure=self._validated_exposure(value))
 
     @property
     def roi(self) -> tuple[int, int, int, int] | None:
@@ -395,6 +504,12 @@ class SequencerDevice(BaseDevice):
     channels: list[str] | tuple[str, ...]
     clock_hz: float
 
+    #: Read-only facts an OBSERVE-mode consumer may touch (see :class:`ReadOnlyDevice`):
+    #: the live firing/progress state and static geometry -- never prepare/fire/
+    #: set_safe_state/settle (those drive the one shared streamer).
+    OBSERVE_API = BaseDevice.OBSERVE_API | frozenset(
+        {"firing", "last_fired", "scan_progress", "channels", "clock_hz", "sleep_scale"})
+
     @abstractmethod
     def prepare(self, sequence) -> Any:
         """Validate/compile/arm a pulse sequence."""
@@ -522,10 +637,15 @@ def snap_subarray(roi, *, step: int, max_w: int, max_h: int):
 __all__ = [
     "BaseDevice",
     "CameraDevice",
+    "EXCLUSIVE",
     "FULL_FRAME",
+    "OBSERVE",
     "ROI_CLEAR_SENTINELS",
+    "ReadOnlyDevice",
     "SOFTWARE_TRIGGER",
     "SequencerDevice",
     "TrapArrayDevice",
+    "is_software_trigger",
+    "read_only",
     "snap_subarray",
 ]

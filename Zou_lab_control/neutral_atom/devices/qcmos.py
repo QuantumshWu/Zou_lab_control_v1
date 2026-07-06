@@ -103,7 +103,8 @@ class QCMOSConfig:
 
     def __post_init__(self) -> None:
         self.capture_trigger_channels = tuple(str(c) for c in self.capture_trigger_channels)
-        self.exposure = positive_float(self.exposure, "exposure")
+        # The ONE exposure validation every camera write path shares (devices.base).
+        self.exposure = CameraDevice._validated_exposure(self.exposure)
         self.readout_speed = nonnegative_int(self.readout_speed, "readout_speed")
         self.device_index = nonnegative_int(self.device_index, "device_index")
         self.timeout_ms = positive_int(self.timeout_ms, "timeout_ms")
@@ -232,7 +233,7 @@ class QCMOSCamera(CameraDevice):
     def configure(self, *, exposure: float | None = None, readout_speed: int | None = None, roi: Sequence[int] | None | object = None, **kwargs) -> None:
         self._reject_unknown_configure_keys({"exposure", "readout_speed", "roi"}, kwargs)
         if exposure is not None:
-            self.config.exposure = positive_float(exposure, "exposure")
+            self.config.exposure = self._validated_exposure(exposure)
         if readout_speed is not None:
             self.config.readout_speed = nonnegative_int(readout_speed, "readout_speed")
         if roi is not None:
@@ -481,15 +482,16 @@ class QCMOSCamera(CameraDevice):
                 pass
 
     def snapshot(self) -> dict[str, object]:
-        return {
-            "type": type(self).__name__,
+        out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot
+        out.update({
             "exposure": self.config.exposure,
             "readout_speed": self.config.readout_speed,
             "roi": self.roi,          # the region truly being imaged (hardware-snapped when open)
             "device_index": self.config.device_index,
             "timeout_ms": self.config.timeout_ms,
             "open": self._dcam is not None,
-        }
+        })
+        return out
 
 
 def normalize_roi(roi: Sequence[int]) -> tuple[int, int, int, int]:
