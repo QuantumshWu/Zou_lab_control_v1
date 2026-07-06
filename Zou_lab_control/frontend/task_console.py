@@ -129,10 +129,11 @@ from Zou_lab_control.neutral_atom.operations.measurement import ParamDecl
 
 TASK_FILES_ENV = "ZLC_TASK_DIR"
 
-# "Does a logic node DRIVE the shared device (camera + sequencer)?" is the NODE's own
-# ``drives_devices`` declaration (operations/logic.py LogicNode) -- the console's device-driver
-# mutual exclusion in ``_start_logic_node`` reads it off every running node, GUI rows and
-# notebook-injected ``running_nodes=`` alike, so there is no second kind-string table here.
+# WHICH hardware a logic node drives is the NODE's own ``occupied_devices()`` declaration
+# (operations/logic.py LogicNode, from its ``_occupies`` attribute names) -- the console's
+# device-occupancy mutual exclusion in ``_start_logic_node`` intersects it across every running
+# node, GUI rows and notebook-injected ``running_nodes=`` alike; nodes on disjoint hardware
+# coexist, so there is no second kind-string table here and no global "stop everything" rule.
 
 # Console PANEL kinds.  EVERY plot kind in the ONE table ``live.PLOT_KINDS`` is a console panel
 # kind -- it renders through the SAME ``PanelCard`` (``_build_plot`` dispatches on the kind: a 2D
@@ -7440,16 +7441,23 @@ class TaskConsole(QtWidgets.QWidget):
             except Exception:
                 old_sigs = set()
         # The build is good -- NOW stand the previous run of THIS node down (never pile up), and
-        # apply the device-driver mutual exclusion over ALL running nodes (#A3): the fact "does
-        # this node drive the shared camera / streamer" is the NODE's own ``drives_devices``
-        # declaration, so a notebook-injected ``running_nodes=`` node (which has no row) obeys the
-        # SAME rule as a GUI row -- one exclusion source, never a rows-only second set.  Reactive
-        # processors read only hub signals (drives_devices=False) and keep running (#6).
+        # apply the device-OCCUPANCY mutual exclusion over ALL running nodes (#A3): each node
+        # declares the hardware INSTANCES it drives (``occupied_devices``, from its own
+        # ``_occupies`` attribute names), and two nodes conflict iff those sets intersect by
+        # identity.  Only the conflicting nodes stop; everyone on disjoint hardware keeps
+        # running -- the monitor camera's live view stays up while the main camera's
+        # calibration or measurement starts.  Declared on the NODE, so a notebook-injected
+        # ``running_nodes=`` node (which has no row) obeys the SAME rule as a GUI row; a
+        # reactive processor occupies nothing and is never stopped.
         self._stop_logic_node(row, _silent=True)
-        if getattr(node, "drives_devices", False):
+        claimed = {id(d) for d in getattr(node, "occupied_devices", lambda: ())()}
+        if claimed:
             for other in list(self.running_nodes):
-                if other is node or not getattr(other, "drives_devices", False):
+                if other is node:
                     continue
+                theirs = {id(d) for d in getattr(other, "occupied_devices", lambda: ())()}
+                if not (claimed & theirs):
+                    continue                             # disjoint hardware -> coexist
                 other_row = next((r for r in self.logic_nodes
                                   if self._logic_nodes.get(id(r)) is other), None)
                 if other_row is not None:

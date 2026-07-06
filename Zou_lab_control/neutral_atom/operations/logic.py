@@ -177,13 +177,17 @@ class LogicNode:
 
     layer = "node"
     node_label = "node"
-    # Does this node DRIVE shared hardware (camera / pulse streamer)?  The node's OWN declaration --
-    # the single fact the console's device-driver mutual exclusion reads (starting one device driver
-    # stops every other, or two fight over the sequencer and deadlock real hardware).  Declared on the
-    # NODE (not a GUI kind-string table) so a notebook-injected ``running_nodes=`` node obeys the SAME
-    # exclusion as a GUI row.  Acquiring nodes (Measurement) and orchestrations (Task) drive devices;
-    # a reactive Processor reads only hub signals and overrides this False.
-    drives_devices = True
+    # WHICH device attributes this node DRIVES (arms the camera / prepares+fires the streamer) --
+    # the node's OWN declaration, as ATTRIBUTE NAMES; the collection mechanics live once on the
+    # base (:meth:`occupied_devices`).  Holding a reference is NOT occupying: the passive
+    # CameraMeasurement records its ``sequencer`` but never drives it, so it declares only
+    # ``("camera",)``.  The console's mutual exclusion stops exactly the nodes whose occupied
+    # device INSTANCES intersect the new node's -- nodes on disjoint hardware coexist (the
+    # monitor camera's live view keeps running while the main camera's calibration starts).
+    # Declared on the NODE (not a GUI kind-string table) so a notebook-injected
+    # ``running_nodes=`` node obeys the SAME exclusion as a GUI row.  Empty for a reactive
+    # Processor (reads only hub signals).
+    _occupies: tuple = ()
     # UNIFORM measurement output contract (#H3n): an ACQUIRING node publishes its primary data block
     # with shape ``(repeat, *points_shape, *data_shape)`` -- ``points_shape`` is the swept parameter
     # space (a camera = ``(1,)``, a 1-D scan = ``(n_points,)``, a 2-D scan = ``(n0*n1,)``) and
@@ -350,6 +354,16 @@ class LogicNode:
     @property
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    def occupied_devices(self) -> tuple:
+        """The hardware device INSTANCES this node drives while running -- resolved from the
+        node's ``_occupies`` attribute-name declaration, in ONE place (a declared name whose
+        attribute is missing or ``None`` simply contributes nothing, so a sequencer-less scan
+        or a saved-frames processor run occupies only what it really holds).  Two nodes
+        CONFLICT iff these sets intersect by identity; the console's mutual exclusion stops
+        exactly the conflicting nodes and leaves everyone on disjoint hardware running."""
+        return tuple(d for d in (getattr(self, name, None) for name in self._occupies)
+                     if d is not None)
 
     def _bare_published_signals(self) -> frozenset:
         """The SHORT (un-prefixed) signal names this node emits -- exactly the keys its
@@ -689,9 +703,6 @@ class Processor(LogicNode):
 
     layer = "processor"
     node_label = "processor"
-    # A processor reads only hub signals -- it touches no camera / sequencer, so the console's
-    # device-driver mutual exclusion leaves it running while measurements/tasks swap (#6).
-    drives_devices = False
     provides: tuple[str, ...] = ()
     repeat_contract = "reduce"   # see class docstring; static, never a user knob
     # Provenance inheritance (#shot-clock): a single-input processor inherits its input's source-shot id so
@@ -1010,6 +1021,10 @@ class Task(LogicNode):
 
     layer = "task"
     node_label = "task"
+    # A task orchestrates the full shot flow (arm the camera, fire the sequencer) -- both
+    # shipped tasks (calibrate readout, MOT-field optimize) drive both.  A future task that
+    # merely RECORDS a device without driving it overrides this (holding is not occupying).
+    _occupies = ("camera", "sequencer")
     provides: tuple[str, ...] = ()
     # Signals the task streams to its dedicated MID-RUN output panel (via TaskOutput)
     # while it runs -- listed here so the console maps that panel back to this task.
@@ -1567,6 +1582,10 @@ class CameraMeasurement(Measurement):
     drives or reads it."""
 
     node_label = "camera"
+    # Drives ONLY its sensor: the node arms the camera (exclusive acquire lock) but never
+    # prepares/fires the streamer -- ``sequencer`` is a passive record (see class docstring),
+    # so a camera view and a sequencer-driving scan on DIFFERENT sensors coexist.
+    _occupies = ("camera",)
 
     def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
                  frames_per_cycle: int = 1, prefix: str = "", repeat: int = 0):
@@ -1895,6 +1914,15 @@ class ScannedMeasurementNode(_SweptBlockMeasurement):
         self._init_swept_block(values=measurement.axis.values, data_shape=(n_series,), repeat=repeat)
         self.primary_signal = self.y_key                       # the (repeat,n_points,dim) block (#H3r-F4)
 
+    def occupied_devices(self) -> tuple:
+        """This node is a WRAPPER: it touches only ``measurement.measure`` (class docstring), so
+        the hardware claim lives on the wrapped :class:`ScannedMeasurement` -- delegate to the
+        owner of the device refs (its per-point shot arms that camera and fires that sequencer)
+        instead of mirroring them onto the wrapper as a second copy."""
+        m = self.measurement
+        return tuple(d for d in (getattr(m, "camera", None), getattr(m, "sequencer", None))
+                     if d is not None)
+
     def shot(self) -> dict[str, object]:
         """Measure ONE scan point and FILL it into the raw ``(repeat, points, dim)`` block at
         ``(pass, point)`` -- the node only fills, it does NOT combine the repeats (the PLOT's
@@ -1964,6 +1992,10 @@ class PulseScanNode(_SweptBlockMeasurement):
     ground truth and imports no concrete backend -- guarded by
     ``tests/test_virtual_equals_real_contract.py`` like the rest of the analysis layer.
     """
+
+    # Runs the full shot orchestration per point (arm its camera, fire its sequencer, read
+    # back) and holds both as top-level attributes -- the base collection reads them here.
+    _occupies = ("camera", "sequencer")
 
     node_label = "pulse_scan"
     #: How long (s) to wait for the subscribed y signals to refresh for THIS point before
@@ -2185,6 +2217,10 @@ class ProcessorRun(LogicNode):
     The cooperative-stop event is shared with the run via the context, so a long
     camera grab inside ``run`` cancels cleanly on ``stop()`` (the SOLE-camera-owner
     invariant: the run executes on this node's own thread, never a second acquire)."""
+
+    # One-shot over live-grabbed frames: drives the camera (and fires the sequencer when
+    # one is bound); a saved-frames run holds None for both -> occupies nothing.
+    _occupies = ("camera", "sequencer")
 
     layer = "processor"
     node_label = "processor"

@@ -7,9 +7,9 @@ registries clean (no half-started ghost in running_nodes / _logic_nodes, and the
 previous build's hub signals are NOT unlinked).
 
 A3: the exclusion's single source is ``running_nodes`` + each node's own
-``drives_devices`` declaration -- a notebook-injected node (no GUI row) is stopped by
-a GUI Start exactly like a row-owned driver, and a reactive processor
-(drives_devices=False) keeps running.
+``occupied_devices()`` declaration -- a notebook-injected node (no GUI row) claiming the
+SAME device is stopped by a GUI Start exactly like a row-owned driver, and a reactive
+processor (occupies nothing) keeps running.
 """
 
 from __future__ import annotations
@@ -34,13 +34,16 @@ def _camera_row(con):
 
 
 class _FakeInjected:
-    """A notebook-injected device driver: no GUI row, only the node contract."""
+    """A notebook-injected device driver: no GUI row, only the node contract.  It declares
+    the device instances it drives (``occupied_devices``), exactly like a real node."""
 
-    drives_devices = True
-
-    def __init__(self):
+    def __init__(self, *devices):
+        self._devices = tuple(devices)
         self.stopped = False
         self.running = True
+
+    def occupied_devices(self):
+        return self._devices
 
     def published_signals(self):
         return frozenset()
@@ -92,7 +95,7 @@ def test_failed_start_registers_nothing_and_keeps_old_signals():
             def start(self, **k):
                 raise RuntimeError("wedged device")
 
-        con._build_logic_node = lambda *a, **k: _DeadNode()
+        con._build_logic_node = lambda *a, **k: _DeadNode(exp.devices["camera"])
         con._start_logic_node(row)
         dead = [n for n in con.running_nodes if isinstance(n, _DeadNode)]
         assert not dead                                      # no half-started ghost (#A2 commit point)
@@ -105,7 +108,7 @@ def test_failed_start_registers_nothing_and_keeps_old_signals():
 
 def test_injected_device_driver_obeys_the_same_exclusion():
     exp = na.connect("virtual")
-    injected = _FakeInjected()
+    injected = _FakeInjected(exp.devices["camera"])      # claims the SAME sensor the row drives
     con = make_console(exp, running_nodes=[injected])
     try:
         assert injected in con.running_nodes
@@ -119,15 +122,12 @@ def test_injected_device_driver_obeys_the_same_exclusion():
 
 
 def test_reactive_processor_keeps_running_across_a_driver_start():
-    from Zou_lab_control.neutral_atom.operations.logic import Processor
+    from Zou_lab_control.neutral_atom.operations.logic import LogicNode, Processor
 
-    assert Processor.drives_devices is False                 # the node's own declaration (#6)
-
-    class _FakeProcessor(_FakeInjected):
-        drives_devices = False
+    assert LogicNode._occupies == () and Processor._occupies == ()   # reads only hub signals (#6)
 
     exp = na.connect("virtual")
-    proc = _FakeProcessor()
+    proc = _FakeInjected()                                   # occupies nothing -> never stopped
     con = make_console(exp, running_nodes=[proc])
     try:
         con._start_logic_node(_camera_row(con))
