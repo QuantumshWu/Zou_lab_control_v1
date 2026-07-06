@@ -137,7 +137,11 @@ class OptimizeMotFieldTask(Task):
                     sequence = resolved.to_sequence()
                     frames = triggered_frames(self.camera, self.sequencer, sequence, 1, stop=self._stop)
                     if not frames:
-                        continue                      # stopped mid-wait / no trigger
+                        # Only a cooperative Stop leaves an empty read: a hardware trigger that
+                        # never comes now RAISES in the camera (TimeoutError -- virtual and pylon
+                        # alike), so a trigger deficit can no longer silently punch NaN holes in
+                        # the grid and skew the argmax.
+                        continue
                     frame = frames[0]
                     h, w = frame.shape[-2:]
                     cx = self.roi_cx if self.roi_cx > 0 else w / 2.0

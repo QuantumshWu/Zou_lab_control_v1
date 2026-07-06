@@ -207,43 +207,15 @@ class DataFigure:
 
     def _rich_capture(self) -> dict[str, Any]:
         """The ``signals`` + ``provenance`` blocks a RICH save folds into ``info``, captured through the
-        ONE frontend-neutral core (``operations.figure_capture``) -- the SAME logic the console panel's
-        Save uses, so a notebook ``.save()`` and a GUI panel Save write byte-identical rich npz.  For a
-        BARE array plot (no source binding) the ``signals`` / device ``provenance`` are empty, but the save
-        STILL folds a minimal ``provenance['flow_graph']`` (``raw data -> plot``), so the Flow tab of even a
-        plain ``plot(arr).save()`` has a tree to draw.  Never raises -- a capture that fails for one block
-        simply omits it."""
-        src = self._figure_source or {}
-        from Zou_lab_control.neutral_atom.operations.figure_capture import (
-            capture_figure_signals, capture_figure_provenance, capture_flow_graph, raw_data_flow_graph)
-        out: dict[str, Any] = {}
-        try:
-            signals = capture_figure_signals(src.get("hub"), src.get("node"), src.get("inputs"))
-        except Exception:
-            signals = {}
-        if signals:
-            out["signals"] = signals
-        try:
-            prov = capture_figure_provenance(src.get("node"), resolve_node=src.get("resolve_node"),
-                                             session=src.get("session"))
-        except Exception:
-            prov = None
-        # The SYSTEMATIC upstream DAG of how the data was produced (raw / measurement / processor chain,
-        # BRANCHING upward) -- captured through the SAME core and folded into ``provenance['flow_graph']``
-        # (an append-only key: it never disturbs the existing flat ``provenance`` / ``signals`` structure).
-        try:
-            flow = capture_flow_graph(src.get("hub"), src.get("node"), src.get("inputs"),
-                                      resolve_node=src.get("resolve_node"))
-        except Exception:
-            flow = None
-        if not flow:                          # a capture that failed / returned nothing STILL saves raw->plot,
-            flow = raw_data_flow_graph()      # so the Flow tab of every saved figure has a tree (never "no data")
-        if prov is None:
-            prov = {}
-        prov["flow_graph"] = flow
-        if prov is not None:
-            out["provenance"] = prov
-        return out
+        ONE frontend-neutral composition point (``figure_capture.capture_rich_info``) -- the SAME call the
+        grid's save and the console panel's Save route through, so every surface writes byte-identical
+        rich npz.  For a BARE array plot (no source binding) the ``signals`` / device ``provenance`` are
+        empty, but the save STILL folds a minimal ``provenance['flow_graph']`` (``raw data -> plot``), so
+        the Flow tab of even a plain ``plot(arr).save()`` has a tree to draw.  No blanket ``except`` here:
+        soft-fail is each capture's own documented contract, so a raising capture is contract drift that
+        must surface (a swallowed one once saved every grid npz with NO flow graph)."""
+        from Zou_lab_control.neutral_atom.operations.figure_capture import capture_rich_info
+        return capture_rich_info(self._figure_source)
 
     def save(
         self,

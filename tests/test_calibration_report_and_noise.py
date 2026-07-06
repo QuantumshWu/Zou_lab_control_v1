@@ -199,3 +199,69 @@ def test_overlapping_readout_reports_sub_unity_fidelity_and_per_method_summary(t
         assert finite and not any(v > 0.999 for v in finite)   # nothing pinned at 100%
     finally:
         exp.close()
+
+
+# ------------------------------------------------- figure-rendering failure contract (fast)
+# No calibration run: a real two-site TrapCalibration + a handful of noise frames is the
+# whole input write_calibration_report needs, so these run in milliseconds.
+
+def _tiny_report_inputs():
+    from Zou_lab_control.neutral_atom.core.calibration import TrapCalibration
+
+    rng = np.random.default_rng(3)
+    cal = TrapCalibration(centers=[[3.0, 3.0], [11.0, 3.0]], thresholds=[5.0, 5.0])
+    frames = [rng.normal(4.0, 1.0, size=(8, 16)) for _ in range(6)]
+    return cal, frames
+
+
+def test_report_registered_plotter_bug_raises_no_silent_numbers_only_report(tmp_path, monkeypatch):
+    """A REGISTERED plotter whose rendering raises is a real bug (plot-contract drift) and
+    must propagate -- regression for the blanket ``except Exception: return {}`` that wrote
+    a numbers-only report with no hint the figures failed."""
+    from Zou_lab_control.neutral_atom.operations import calibration_report as cr
+
+    class _BuggyPlotter:
+        def save_calibration_report(self, folder, **kwargs):
+            raise TypeError("plot contract drift")
+
+    monkeypatch.setattr(cr, "active_plotter", lambda: _BuggyPlotter())
+    cal, frames = _tiny_report_inputs()
+    with pytest.raises(TypeError, match="plot contract drift"):
+        cr.write_calibration_report(tmp_path / "rep", calibration=cal, readout_frames=frames)
+    assert not (tmp_path / "rep" / "summary.json").exists()   # no silent numbers-only report
+
+
+def test_report_headless_fallback_still_writes_numbers(tmp_path, monkeypatch):
+    """No viewer registered (or one without the report hook) is the DOCUMENTED headless
+    fallback: the numeric bundle is complete, the PNGs simply skipped -- no error recorded."""
+    from Zou_lab_control.neutral_atom.operations import calibration_report as cr
+
+    cal, frames = _tiny_report_inputs()
+    for plotter in (None, object()):                      # absent / missing the report hook
+        monkeypatch.setattr(cr, "active_plotter", lambda p=plotter: p)
+        folder = tmp_path / ("none" if plotter is None else "hookless")
+        summary = cr.write_calibration_report(folder, calibration=cal, readout_frames=frames)
+        assert (folder / "summary.json").exists() and (folder / "calibration.npz").exists()
+        assert "figure_error" not in summary              # headless is a fallback, not a failure
+        assert set(summary["files"]) == {"npz", "calibration"}   # numbers only, by design
+
+
+def test_report_figure_write_oserror_tolerated_and_self_described(tmp_path, monkeypatch):
+    """An ENVIRONMENTAL write failure (disk full / permission) must not lose the numbers,
+    but the summary self-describes why the figures are missing (never a bare numbers-only
+    report), and a warning surfaces at write time."""
+    import json
+    from Zou_lab_control.neutral_atom.operations import calibration_report as cr
+
+    class _DiskFullPlotter:
+        def save_calibration_report(self, folder, **kwargs):
+            raise OSError("disk full")
+
+    monkeypatch.setattr(cr, "active_plotter", lambda: _DiskFullPlotter())
+    cal, frames = _tiny_report_inputs()
+    folder = tmp_path / "rep"
+    with pytest.warns(UserWarning, match="disk full"):
+        summary = cr.write_calibration_report(folder, calibration=cal, readout_frames=frames)
+    assert "disk full" in summary["figure_error"]
+    on_disk = json.loads((folder / "summary.json").read_text(encoding="utf-8"))
+    assert "disk full" in on_disk["figure_error"]         # the folder self-describes offline too

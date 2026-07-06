@@ -174,6 +174,22 @@ def test_raw_data_figure_degrades_to_raw_leaf():
     assert _parents(graph, "__plot__") == {"__raw__"}
 
 
+def test_capture_rich_info_without_node_falls_back_to_raw_graph():
+    """The ONE composition point every save routes through (``capture_rich_info``), given a source with
+    NO producing node (an unbound / bare-array figure -- or no source at all), degrades exactly as the
+    individual captures document: no ``signals`` block, and ``provenance`` reduced to the
+    ``raw data -> plot`` flow graph (built by ``capture_flow_graph``'s own ``node=None`` path)."""
+    from Zou_lab_control.neutral_atom.operations.figure_capture import (
+        capture_rich_info, raw_data_flow_graph)
+
+    for source in (None, {}, {"hub": SignalHub(), "node": None, "inputs": ["mystery"],
+                              "resolve_node": lambda name: None, "session": None}):
+        out = capture_rich_info(source)
+        assert "signals" not in out, f"no producing node -> no signals block (source={source!r})"
+        assert out["provenance"] == {"flow_graph": raw_data_flow_graph()}, \
+            "provenance degrades to exactly the raw data -> plot fallback"
+
+
 def test_bare_plot_save_folds_a_raw_flow_graph(tmp_path):
     """#4: a plain ``plot(arr).save()`` (no ``bind_source``) still writes ``provenance['flow_graph']`` with
     a ``raw data -> plot`` tree, so the reopened figure's Flow tab is NOT blank -- reproduced end-to-end
@@ -404,6 +420,53 @@ def test_flow_graph_round_trips_through_the_console_save(tmp_path):
     finally:
         if console is not None:
             console.shutdown()
+        exp.close()
+        plt.close("all")
+
+
+def test_grid_save_folds_the_flow_graph_like_a_single_panel(tmp_path):
+    """D1 parity: a GRID save bound to a REAL producing node folds the SAME ``provenance['flow_graph']``
+    a single-panel save of the identical source folds -- the full measurement -> processor -> plot chain,
+    not the raw fallback and not nothing.  The grid's hand-rolled capture once mis-called
+    ``capture_flow_graph`` (wrong signature), the TypeError was swallowed by a blanket ``except``, and
+    every grid npz silently saved with NO flow graph; both saves now route through the one
+    ``capture_rich_info`` composition point, so the graphs are exactly equal."""
+    from Zou_lab_control.frontend import panel_plot
+    from Zou_lab_control.frontend.live import site_histogram_grid
+
+    exp = na.connect("virtual")
+    try:
+        hub = SignalHub()
+        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+                                prefix="cam_", repeat=1)
+        proc = OccupancyProcessor(hub, source_expr=SignalExpr(["cam_frame_0"], DEFAULT_SOURCE),
+                                  prefix="occ_")
+        fire_live_imaging(exp)
+        for _ in range(2):
+            cam.step()
+        cam.refresh_provenance()
+        resolve = _resolver([cam, proc])
+        rng = np.random.default_rng(11)
+
+        # GRID save, bound to the processor exactly as the console panel Save binds (bind_source rides
+        # from the plotter onto _GridData through BaseLivePlot.save).
+        grid = site_histogram_grid([rng.normal(0.5, 0.1, 60) for _ in range(4)], display=False)
+        grid.bind_source(hub, proc, inputs=["occ_occupied"], resolve_node=resolve, session=exp)
+        grid_npz = grid.save(str(tmp_path / "grid_flow"))["data"]
+
+        # Single-panel save of the SAME source binding -- the parity reference.
+        flat = panel_plot(rng.normal(0.5, 0.1, 200), kind="hist", size="2x4", bins=20, title="occ")
+        flat.bind_source(hub, proc, inputs=["occ_occupied"], resolve_node=resolve, session=exp)
+        flat_npz = flat.save(str(tmp_path / "flat_flow"))["data"]
+
+        grid_flow = load_figure(grid_npz).info["provenance"]["flow_graph"]
+        flat_flow = load_figure(flat_npz).info["provenance"]["flow_graph"]
+        # The grid's graph is the REAL upstream chain (not the raw fallback the bug degraded to) ...
+        roles = sorted(n["role"] for n in grid_flow["nodes"] if n["role"] != "device")
+        assert roles == ["measurement", "plot", "processor"], roles
+        # ... and EXACTLY the graph a single-panel figure of the same source saves.
+        assert grid_flow == flat_flow, "grid and single-panel saves must fold the identical flow graph"
+    finally:
         exp.close()
         plt.close("all")
 

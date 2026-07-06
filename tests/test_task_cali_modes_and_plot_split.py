@@ -131,6 +131,59 @@ def test_calibrate_task_pins_live_camera_exposure_to_the_readout_gate():
         exp.close()
 
 
+def test_calibration_adoption_survives_exposure_pin_rejection_but_warns(caplog):
+    """A real camera can REJECT the pinned exposure (out-of-range gate, driver error).
+    The adoption must still install the calibration (it IS valid; only the live pin
+    failed) -- but NEVER silently: the exact consequence (live imaging at the wrong gate
+    judges every atom dark) must be visible as a logged warning.  A coding bug in the
+    setter is NOT a device rejection and propagates."""
+    import logging
+
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.core.calibration import TrapCalibration
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    class _RejectingCamera:
+        """Device whose exposure setter refuses the value (the real-hardware failure)."""
+        @property
+        def exposure(self):
+            return 0.020
+
+        @exposure.setter
+        def exposure(self, value):
+            raise RuntimeError("exposure rejected by driver")
+
+    class _BuggyCamera:
+        """Setter with a CODING bug -- not a plausible device rejection."""
+        @property
+        def exposure(self):
+            return 0.020
+
+        @exposure.setter
+        def exposure(self, value):
+            raise ZeroDivisionError("a bug, not a device error")
+
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (48, 60)})
+    try:
+        # a stamped calibration (threshold_exposure) so the sink attempts the pin
+        cal = TrapCalibration(centers=[[3.0, 3.0], [9.0, 3.0]], thresholds=[5.0, 5.0],
+                              metadata={"threshold_exposure": 0.004})
+        task = exp.readout.calibrate_task(SignalHub(), camera=_RejectingCamera())
+        with caplog.at_level(logging.WARNING,
+                             logger="Zou_lab_control.neutral_atom.subsystems.readout"):
+            task.calibration_sink(cal)                    # must NOT raise (adoption survives)...
+        assert exp.readout.current is cal                 # ...the calibration IS installed
+        assert "pinning the readout exposure failed" in caplog.text   # ...and NEVER silent
+        assert "exposure rejected by driver" in caplog.text
+
+        # truly unexpected exceptions are bugs and must propagate, not be tolerated
+        buggy = exp.readout.calibrate_task(SignalHub(), camera=_BuggyCamera())
+        with pytest.raises(ZeroDivisionError):
+            buggy.calibration_sink(cal)
+    finally:
+        exp.close()
+
+
 def test_calibrate_task_live_writes_canonical_calibration_json_for_the_detector(tmp_path):
     """A live calibration writes the CANONICAL ``folder/calibration.json`` -- the stable,
     named file the Judge-occupancy detector loads -- plus the report artifacts, ALL directly

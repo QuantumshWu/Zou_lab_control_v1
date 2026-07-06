@@ -596,3 +596,38 @@ def test_pulse_scan_3_level_grid_publishes_the_nested_block_for_a_facet_grid():
     finally:
         _safe_unlink(probe)
         exp.close()
+
+
+def test_pulse_scan_stale_y_inputs_record_nan_not_the_previous_shot(monkeypatch, caplog):
+    """#C1: a y input that never refreshes within the settle window (its producer is NOT running)
+    must be recorded as NaN -- never the hub's PREVIOUS-shot value.  The old behaviour read
+    whatever was in the hub after the timeout, silently filling the whole curve with one stale
+    number (plus a 5 s stall per point).  The never-wedge contract stays: the scan completes."""
+    import logging
+
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.logic import PulseScanNode
+
+    exp = _calibrated()
+    probe = _bound_probe_with_scan(exp)
+    try:
+        spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
+        plan = spec.build(template=probe,
+                          pulse_slots={"api": {}, "scan_mode": "table",
+                                       "scan_code": "import numpy as np\n"
+                                       "scan_table = np.linspace(2.0, 8.0, 3).reshape(-1, 1)"},
+                          y={"inputs": ["rate"], "source": "value = signal"})
+        hub = SignalHub()
+        hub.publish({"rate": 0.73})                      # a STALE value from a previous run
+        plan.settle = None                               # no inline consumer -- nothing refreshes 'rate'
+        monkeypatch.setattr(PulseScanNode, "SETTLE_TIMEOUT_S", 0.05)   # fast timeout for the test
+        node = PulseScanNode(hub, plan, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_")
+        with caplog.at_level(logging.WARNING):
+            node.run_to_completion()
+        block = np.asarray(hub.latest(node.y_signal), dtype=float)
+        assert np.all(np.isnan(block)), block            # every stale point is NaN, never 0.73
+        assert any("did not refresh" in r.message for r in caplog.records)   # visible, once
+        assert sum("did not refresh" in r.message for r in caplog.records) == 1
+    finally:
+        _safe_unlink(probe)
+        exp.close()

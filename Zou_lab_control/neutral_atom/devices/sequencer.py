@@ -627,8 +627,8 @@ def compile_pulse_table_scan_runtime_program(
     # Snap + clamp every scan point the SAME way PulseTableState.compile_scan / the GUI /
     # the server do, so the uploaded program matches the hardware REGARDLESS of entry point
     # (a scanned duration of 0 ns becomes >= 1 tick, DAC codes clamp to the bus width).  This
-    # also normalizes the column count to the slot count -- raising on a too-wide table and
-    # padding a too-short one -- instead of the old zip() silently truncating.  Previously the
+    # also validates the column count against the slot count -- a width mismatch in EITHER
+    # direction raises (#C3) -- instead of the old zip() silently truncating.  Previously the
     # snap invariant held only via compile_scan; a direct call (e.g. compile_runtime_program_
     # _for_payload) used the raw table and could emit a zero-length period.
     table = _snap_scan_table(

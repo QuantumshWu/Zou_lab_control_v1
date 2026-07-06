@@ -21,6 +21,7 @@ Split by layer, no drift:
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -73,18 +74,17 @@ def _render_figures(folder, *, counts, thresholds, fidelity, centers, template,
                     threshold_method, timestamp, by_method=None,
                     psf_weights=None, psf_boxes=None) -> dict:
     """Draw the report PNGs through the registered FRONTEND viewer; ``{}`` when headless
-    (no viewer registered) -- the data bundle below is still written either way."""
+    (no viewer registered) -- the data bundle below is still written either way.  A
+    REGISTERED plotter that fails to render is a real bug and propagates (#F4): swallowing
+    it here used to write a numbers-only report with no hint the figures were lost."""
     plotter = active_plotter()
     if plotter is None or not hasattr(plotter, "save_calibration_report"):
         return {}
-    try:
-        return dict(plotter.save_calibration_report(
-            folder, counts=counts, thresholds=thresholds, fidelity=fidelity,
-            centers=centers, template=template, by_method=by_method,
-            psf_weights=psf_weights, psf_boxes=psf_boxes,
-            threshold_method=str(threshold_method), timestamp=str(timestamp)) or {})
-    except Exception:
-        return {}
+    return dict(plotter.save_calibration_report(
+        folder, counts=counts, thresholds=thresholds, fidelity=fidelity,
+        centers=centers, template=template, by_method=by_method,
+        psf_weights=psf_weights, psf_boxes=psf_boxes,
+        threshold_method=str(threshold_method), timestamp=str(timestamp)) or {})
 
 
 def _psf_weights_boxes(calibration):
@@ -282,10 +282,16 @@ def write_calibration_report(folder, *, calibration, readout_frames, template=No
     if psf_weights is not None and psf_boxes is not None:
         _write_psf_table(folder / "psf_table.csv", psf_weights, psf_boxes, centers)
 
-    paths = _render_figures(
-        folder, counts=counts, thresholds=thresholds, fidelity=fidelity, centers=centers,
-        template=template, threshold_method=threshold_method, timestamp=timestamp,
-        by_method=by_method, psf_weights=psf_weights, psf_boxes=psf_boxes)
+    figure_error = None
+    try:
+        paths = _render_figures(
+            folder, counts=counts, thresholds=thresholds, fidelity=fidelity, centers=centers,
+            template=template, threshold_method=threshold_method, timestamp=timestamp,
+            by_method=by_method, psf_weights=psf_weights, psf_boxes=psf_boxes)
+    except OSError as exc:            # disk/permission only -> the numeric report still lands
+        paths = {}                    # and the summary SELF-DESCRIBES why the figures are
+        figure_error = str(exc)       # missing; a plotter rendering bug surfaces (#F4)
+        warnings.warn(f"calibration report figures failed to write: {exc}")
 
     npz_path = folder / "calibration.npz"
     npz_extra = {} if psf_weights is None else {"psf_weights": psf_weights, "psf_boxes": psf_boxes}
@@ -340,6 +346,8 @@ def write_calibration_report(folder, *, calibration, readout_frames, template=No
         "timestamp": str(timestamp),
         "files": paths,
     }
+    if figure_error is not None:      # figures lost to an environmental write failure -- say so
+        summary["figure_error"] = figure_error
     (folder / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     summary["folder"] = str(folder)
     return summary

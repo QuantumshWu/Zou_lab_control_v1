@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
@@ -722,10 +723,21 @@ class ReadoutSubsystem(ExperimentSubsystem):
             # fallback=None: an UNstamped calibration does not force a re-pin (leave the camera as-is).
             expo = calibration.readout_exposure(fallback=None)
             if expo:
+                # A real camera can REJECT the exposure (out-of-range gate, driver error) -- that
+                # is exactly the wrong-exposure failure described above, so it must be VISIBLE,
+                # never silent.  The adoption itself still succeeds (the calibration is valid;
+                # only the live pin failed), and the sink is called with ONLY the calibration
+                # (CalibrateReadoutTask._adopt passes no output handle), so a logged warning is
+                # the failure channel -- re-plumbing the task API just for this would couple the
+                # sink to the task's mid-run output.  Only plausible device rejections are
+                # tolerated; a coding bug propagates.
                 try:
                     cam.exposure = float(expo)
-                except Exception:
-                    pass
+                except (ValueError, TypeError, RuntimeError, OSError) as exc:
+                    logging.getLogger(__name__).warning(
+                        "calibration adopted but pinning the readout exposure failed: %s "
+                        "-- live readout exposure no longer matches the calibration gate "
+                        "(occupancy will read low)", exc)
 
         return CalibrateReadoutTask(hub, cam,
                                     sequencer=getattr(s.devices, "sequencer", None),

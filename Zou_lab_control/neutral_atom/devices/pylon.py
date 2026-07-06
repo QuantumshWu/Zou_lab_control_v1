@@ -26,7 +26,7 @@ import time
 
 import numpy as np
 
-from .base import CameraDevice, snap_subarray
+from .base import ROI_CLEAR_SENTINELS, CameraDevice, snap_subarray
 
 
 def _snap_to_inc(value: int, lo: int, hi: int, inc: int) -> int:
@@ -62,6 +62,10 @@ class PylonCamera(CameraDevice):
         self.subarray_step = int(subarray_step)
         self._camera = None                     # the pypylon InstantCamera, created in open()
         self._roi: tuple[int, int, int, int] | None = None
+        # Armed-session bookkeeping so a triggered-mode fault names WHICH frame of HOW MANY was
+        # awaited (the qCMOS message style); reset per arm, meaningless in free-run.
+        self._armed_total: int | None = None
+        self._grabbed = 0
 
     # ------------------------------------------------------------------ discovery (self-describing)
     @classmethod
@@ -175,7 +179,7 @@ class PylonCamera(CameraDevice):
         if exposure is not None:
             self.exposure = float(exposure)
         if roi is not None:
-            if roi in ("", "None"):
+            if roi in ROI_CLEAR_SENTINELS:       # FULL_FRAME (or a blank box) -> the full sensor
                 self._roi = None
             else:
                 h, w = self.sensor_shape
@@ -260,26 +264,40 @@ class PylonCamera(CameraDevice):
                 cam.StartGrabbing(pylon.GrabStrategy_OneByOne)
             else:
                 cam.StartGrabbingMax(int(frames), pylon.GrabStrategy_OneByOne)
+        self._armed_total = None if frames is None else int(frames)
+        self._grabbed = 0
 
     def _grab(self, n: int, *, timeout: float | None = None, stop=None) -> bool:
         """Retrieve ONE frame from the running grab session into the base frame queue.
-        No trigger within the timeout -> False (the live view freezes; a partial read is
-        the pylon fault model, matching a monitor sensor that just sees no edges).
+        Fault LOUDNESS follows the trigger mode (this is the single source for both):
 
-        When a stop event is passed the wait is SLICED (``min(timeout, 200 ms)`` per
-        ``RetrieveResult``) with the event re-checked between slices, so a Stop pressed mid-wait
-        interrupts within ~one slice instead of sitting inside RetrieveResult for the full timeout
-        (the same cooperative-cancel granularity the qCMOS grab uses).  The TOTAL timeout budget is
-        unchanged -- only a genuinely absent trigger for the whole timeout freezes the view."""
+        * ``Software`` (free-run, the live MOT monitor): no frame within the timeout, or a
+          failed grab, returns False -- ``read_frames`` returns short and the live view simply
+          FREEZES, the right behaviour for a passive viewer that just sees no light;
+        * hardware trigger (e.g. ``Line1``, a finite point-by-point acquisition): a trigger
+          that never comes raises ``TimeoutError`` and a failed grab raises ``RuntimeError`` --
+          the same loud fault model the qCMOS keeps, so a missing trigger can never silently
+          leave a hole in a scan grid (the MOT-field optimiser would argmax a partial block).
+
+        A cooperative Stop keeps its cancel semantics in BOTH modes (return False -> a clean
+        short read, never a fault).  When a stop event is passed the wait is SLICED
+        (``min(timeout, 200 ms)`` per ``RetrieveResult``) with the event re-checked between
+        slices, so a Stop pressed mid-wait interrupts within ~one slice instead of sitting
+        inside RetrieveResult for the full timeout (the same cooperative-cancel granularity the
+        qCMOS grab uses).  The TOTAL timeout budget is unchanged -- only a genuinely absent
+        trigger for the whole timeout faults/freezes."""
         from pypylon import pylon
 
         cam = self._camera
         timeout_ms = int((self.timeout if timeout is None else float(timeout)) * 1000)
         slice_ms = min(timeout_ms, 200) if stop is not None else timeout_ms
         deadline = time.monotonic() + timeout_ms / 1000.0
+        # Which frame of how many this armed session is waiting for (the qCMOS message style).
+        which = (f"frame {self._grabbed}" if self._armed_total is None
+                 else f"frame {self._grabbed} of {self._armed_total}")
         while True:
             if stop is not None and stop.is_set():
-                return False
+                return False                    # cooperative Stop: clean cancel, never a fault
             wait_ms = slice_ms
             if stop is not None:
                 wait_ms = max(1, min(slice_ms, int((deadline - time.monotonic()) * 1000)))
@@ -288,12 +306,23 @@ class PylonCamera(CameraDevice):
                 # This slice saw no frame: keep polling until stopped or the total timeout expires.
                 if stop is not None and not stop.is_set() and time.monotonic() < deadline:
                     continue
-                return False                    # no trigger within the full timeout -> freeze
+                if stop is not None and stop.is_set():
+                    return False                # cooperative Stop: clean cancel, never a fault
+                if self._free_run:
+                    return False                # free-run: no light is normal -> the view freezes
+                raise TimeoutError(
+                    f"pylon timed out after {timeout_ms} ms waiting for {which} "
+                    f"(no edge on trigger {self.trigger_source!r}).")
             if not result.GrabSucceeded():
                 result.Release()
-                return False                    # a real grab failure -> freeze (partial ok)
+                if self._free_run:
+                    return False                # free-run: a bad grab freezes the view (partial ok)
+                raise RuntimeError(
+                    f"pylon grab failed for {which} "
+                    f"(GrabSucceeded() is False on trigger {self.trigger_source!r}).")
             self._deliver([np.array(result.Array, copy=True)])
             result.Release()
+            self._grabbed += 1
             return True
 
     def _disarm(self) -> None:

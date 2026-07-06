@@ -248,7 +248,7 @@ def _signal_shape(hub, node, full: str) -> Optional[list]:
         return None
 
 
-def capture_flow_graph(hub, node, inputs, *, resolve_node: ResolveNode | None = None) -> Optional[dict]:
+def capture_flow_graph(hub, node, inputs, *, resolve_node: ResolveNode | None = None) -> dict:
     """The SYSTEMATIC upstream DAG of how a figure's data was produced -- ``{"nodes": [...], "edges": [...]}``
     -- so a reopened figure can DRAW "where did this data come from": raw data? a measurement signal? through
     which processor(s)?  and, crucially, the tree BRANCHES UPWARD (a site map consumes occupancy + centres +
@@ -411,4 +411,47 @@ def capture_figure_provenance(node, *, resolve_node: ResolveNode | None = None,
     return None
 
 
-__all__ = ["capture_figure_signals", "capture_figure_provenance", "capture_flow_graph", "ResolveNode"]
+def capture_rich_info(source: Optional[Mapping]) -> dict:
+    """The COMPLETE rich blocks a figure save folds into ``info`` -- ``signals`` + ``provenance``
+    (the latter always carrying ``provenance['flow_graph']``) -- captured from the ONE unified
+    figure-source mapping every save surface stamps (``BaseLivePlot.bind_source`` /
+    ``DataFigure.bind_source`` / the grid's ``_GridData.bind_source``):
+
+      * ``hub``          -- the :class:`SignalHub` the data was published to;
+      * ``node``         -- the producing logic node of the figure's first input;
+      * ``inputs``       -- the figure's wired signal names;
+      * ``resolve_node`` -- the ``signal name -> producing node`` resolver for the upstream walk;
+      * ``session``      -- the fallback device-snapshot source when no node produced the data.
+
+    Missing keys (and ``source=None`` -- an unbound bare-array figure) degrade exactly as each
+    capture documents: no ``signals`` block, no device ``provenance``, and the flow graph reduced to
+    the ``raw data -> plot`` fallback (:func:`capture_flow_graph` builds it itself when ``node`` is
+    ``None``), so even a plain ``plot(arr).save()`` gives the Flow tab a tree to draw.
+
+    This is the SINGLE composition point: the flat ``DataFigure._rich_capture`` and the grid's
+    ``_GridData._rich_capture`` both delegate here, so the three captures are never hand-wired twice
+    (a second hand-rolled copy once mis-called :func:`capture_flow_graph` and -- behind a blanket
+    ``except`` -- silently saved every grid npz with NO flow graph).  There is deliberately NO
+    blanket ``except`` around the captures: each one soft-fails INTERNALLY by its own documented
+    contract (an unresolvable role is skipped, provenance degrades to ``None``, the flow graph
+    always returns at least ``raw data -> plot``), so an exception escaping is a CONTRACT DRIFT
+    that must surface, not be swallowed into a silently poorer save."""
+    src = dict(source) if source else {}
+    hub = src.get("hub")
+    node = src.get("node")
+    inputs = src.get("inputs")
+    resolve_node = src.get("resolve_node")
+
+    out: dict = {}
+    signals = capture_figure_signals(hub, node, inputs)
+    if signals:
+        out["signals"] = signals
+    prov = capture_figure_provenance(node, resolve_node=resolve_node, session=src.get("session"))
+    prov = dict(prov) if prov else {}
+    prov["flow_graph"] = capture_flow_graph(hub, node, inputs, resolve_node=resolve_node)
+    out["provenance"] = prov
+    return out
+
+
+__all__ = ["capture_figure_signals", "capture_figure_provenance", "capture_flow_graph",
+           "capture_rich_info", "raw_data_flow_graph", "ResolveNode"]

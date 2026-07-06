@@ -29,6 +29,7 @@ or in a background thread (``start(rate_hz)``); the hub is the only shared state
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -176,6 +177,13 @@ class LogicNode:
 
     layer = "node"
     node_label = "node"
+    # Does this node DRIVE shared hardware (camera / pulse streamer)?  The node's OWN declaration --
+    # the single fact the console's device-driver mutual exclusion reads (starting one device driver
+    # stops every other, or two fight over the sequencer and deadlock real hardware).  Declared on the
+    # NODE (not a GUI kind-string table) so a notebook-injected ``running_nodes=`` node obeys the SAME
+    # exclusion as a GUI row.  Acquiring nodes (Measurement) and orchestrations (Task) drive devices;
+    # a reactive Processor reads only hub signals and overrides this False.
+    drives_devices = True
     # UNIFORM measurement output contract (#H3n): an ACQUIRING node publishes its primary data block
     # with shape ``(repeat, *points_shape, *data_shape)`` -- ``points_shape`` is the swept parameter
     # space (a camera = ``(1,)``, a 1-D scan = ``(n_points,)``, a 2-D scan = ``(n0*n1,)``) and
@@ -653,6 +661,9 @@ class Processor(LogicNode):
 
     layer = "processor"
     node_label = "processor"
+    # A processor reads only hub signals -- it touches no camera / sequencer, so the console's
+    # device-driver mutual exclusion leaves it running while measurements/tasks swap (#6).
+    drives_devices = False
     provides: tuple[str, ...] = ()
     repeat_contract = "reduce"   # see class docstring; static, never a user knob
     # Provenance inheritance (#shot-clock): a single-input processor inherits its input's source-shot id so
@@ -1667,7 +1678,12 @@ class CameraMeasurement(Measurement):
         if "region" in values:
             region = values["region"]
             if region in (None, "", "None"):
-                kw["roi"] = None
+                # A cleared region box means "back to the FULL sensor" -- send the one FULL_FRAME
+                # sentinel every camera configure() accepts.  Passing None here meant "leave the ROI
+                # unchanged" at the backend gate, so clearing the ROI from the GUI was impossible (#B1).
+                from ..devices.base import FULL_FRAME
+
+                kw["roi"] = FULL_FRAME
             else:
                 # endpoints (plot coords) -> the camera's device ROI rect; the
                 # camera then snaps to its sub-array grid.  This is the ONLY place
@@ -1947,6 +1963,9 @@ class PulseScanNode(_SweptBlockMeasurement):
         # Optional inline settle (headless single-threaded determinism); None in the GUI, where
         # the node instead waits for the consumer's own thread to republish the y signals.
         self.settle = getattr(plan, "settle", None)
+        # Warn ONCE per scan when the y inputs never refresh (the consumer is not running):
+        # every stale point is recorded as NaN, not the hub's previous-shot value (#C1).
+        self._stale_y_warned = False
         self.x_key = str(x_key)
         # The OUTPUT signal name (user-set #7) comes from the plan; the constructor default is the
         # fallback for callers that don't carry it.
@@ -2052,8 +2071,20 @@ class PulseScanNode(_SweptBlockMeasurement):
         self.hub.publish(frame_pub, provenance=sid)
         self._current_source_shot = sid                  # the y-block (base step()) carries the same id
         # 2) make the y signals FRESH for this frame, then 3) read y from the source expression.
-        self._await_y_inputs(before)
-        y = self._read_y()
+        # A consumer that never refreshed within the settle window (its producer is not running,
+        # or one recompute genuinely takes longer than SETTLE_TIMEOUT_S) must NOT be read anyway:
+        # the hub still holds the PREVIOUS shot's value, and silently recording it would fill the
+        # curve with one stale number per point (5 s stall each) -- wrong data with no error.  The
+        # never-wedge contract stays (the wait still times out); staleness is mechanically
+        # excluded by recording NaN for the point and warning ONCE per scan.
+        fresh = self._await_y_inputs(before)
+        y = self._read_y() if fresh else float("nan")
+        if not fresh and not self._stale_y_warned:
+            self._stale_y_warned = True
+            logging.getLogger(__name__).warning(
+                "pulse scan y inputs %s did not refresh within %.1f s -- is the consumer "
+                "(e.g. the occupancy processor) running?  Stale points are recorded as NaN.",
+                [n for n in self.y_expr.inputs if n], self.SETTLE_TIMEOUT_S)
         # 4) device-owned inter-point settle: load -> fire -> read the point's frame -> settle
         #    (extra_delay_s) -> next.  The sequencer owns the wait (the caller just sets the
         #    adjustable extra delay); honours Stop so a long settle does not wedge teardown.
@@ -2071,29 +2102,33 @@ class PulseScanNode(_SweptBlockMeasurement):
             out[self.y_key + "_grid"] = self._publish_grid()   # RAW (repeat, n0, n1) -- plot reduces it
         return self._assert_primary_shape(out)
 
-    def _await_y_inputs(self, before: dict) -> None:
+    def _await_y_inputs(self, before: dict) -> bool:
         """Block until the picked y signals have advanced past ``before`` (a per-signal version
         bump = the consumer republished them from the frame just published), honouring Stop.
+        Returns True when the inputs are FRESH for this point (advanced / no inputs / inline
+        settle), False on a timeout or Stop -- the caller records the point as NaN instead of
+        reading the hub's PREVIOUS-shot value (never wedge, never silently stale).
 
         Inline ``settle`` (headless) short-circuits this: it steps the consumer once, single-
         threaded, so the version is fresh immediately."""
         names = [n for n in self.y_expr.inputs if n]
         if not names:
-            return
+            return True
         if self.settle is not None:
             try:
                 self.settle()
             except Exception:
                 pass
-            return
+            return True
         deadline = time.monotonic() + self.SETTLE_TIMEOUT_S
         while not self._stop.is_set():
             now = self.hub.signal_versions()
             if all(now.get(n, 0) > before.get(n, 0) for n in names):
-                return
+                return True
             if time.monotonic() >= deadline:
-                return                                       # timeout: read what is there, never wedge
+                return False                                 # timeout: never wedge -- caller NaNs the point
             self._stop.wait(0.01)
+        return False
 
     def _read_y(self) -> float:
         """y = the source expression over the live hub (the decoupled subscription)."""

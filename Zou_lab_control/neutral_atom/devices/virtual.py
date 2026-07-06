@@ -21,7 +21,8 @@ from Zou_lab_control._clock import DEFAULT_CLOCK_HZ
 # imported lazily where used (keeping devices->operations off the import graph, as elsewhere here).
 from Zou_lab_control._readout_math import normal_cdf
 from ..core.utils import site_index
-from .base import CameraDevice, SequencerDevice, TrapArrayDevice, snap_subarray
+from .base import (
+    ROI_CLEAR_SENTINELS, CameraDevice, SequencerDevice, TrapArrayDevice, snap_subarray)
 from .camera_trigger import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
     base_cycle_trigger_pulses,
@@ -853,7 +854,7 @@ class VirtualCamera(_TriggerWiredCamera):
         if exposure is not None:
             self.exposure = positive_float(exposure, "exposure")
         if roi is not None:
-            if roi in ("", "None"):
+            if roi in ROI_CLEAR_SENTINELS:
                 self._roi = None
             else:
                 h, w = self.trap_array.image_shape
@@ -987,7 +988,7 @@ class VirtualMotCamera(_TriggerWiredCamera):
         if exposure is not None:
             self.exposure = positive_float(exposure, "exposure")
         if roi is not None:
-            self._roi = None if roi in ("", "None") else snap_subarray(
+            self._roi = None if roi in ROI_CLEAR_SENTINELS else snap_subarray(
                 tuple(roi), step=1, max_w=self.width, max_h=self.height)
 
     def mot_efficiency(self, levels: Mapping[str, float]) -> float:

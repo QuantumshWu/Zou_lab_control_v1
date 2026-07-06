@@ -4566,8 +4566,8 @@ class _GridData:
             info["kind"] = "grid"
             info["figure_recipe"] = recipe
         # The RICH signals / provenance blocks (bound via :meth:`bind_source`) -- captured through the SAME
-        # frontend-neutral core a flat DataFigure.save uses, so a grid panel Save writes the same rich npz
-        # (the Flow tab has a tree, the signals are recorded); never raises the save.
+        # frontend-neutral composition point a flat DataFigure.save uses (capture_rich_info), so a grid
+        # panel Save writes the same rich npz: the Flow tab has a tree, the signals are recorded.
         info.update(self._rich_capture())
         if extra_info is not None:    # mirror DataFigure.save: caller metadata WINS over the auto keys
             info.update(dict(extra_info))
@@ -4576,33 +4576,13 @@ class _GridData:
 
     def _rich_capture(self) -> dict:
         """The ``signals`` + ``provenance`` blocks a rich save folds into ``info`` -- the grid counterpart
-        of :meth:`DataFigure._rich_capture`, through the ONE frontend-neutral core, so a notebook grid
-        ``.save()`` and a console panel Save write byte-identical rich npz.  Never raises."""
-        src = self._figure_source or {}
-        from Zou_lab_control.neutral_atom.operations.figure_capture import (
-            capture_figure_provenance, capture_figure_signals, capture_flow_graph, raw_data_flow_graph)
-        out: dict = {}
-        try:
-            signals = capture_figure_signals(src.get("hub"), src.get("node"), src.get("inputs"))
-        except Exception:
-            signals = {}
-        if signals:
-            out["signals"] = signals
-        try:
-            prov = capture_figure_provenance(src.get("node"), resolve_node=src.get("resolve_node"),
-                                              session=src.get("session"))
-        except Exception:
-            prov = {}
-        try:
-            flow = capture_flow_graph(src.get("node"), resolve_node=src.get("resolve_node")) \
-                if src.get("node") is not None else raw_data_flow_graph()
-        except Exception:
-            flow = None
-        if flow:
-            prov = dict(prov or {}); prov["flow_graph"] = flow
-        if prov:
-            out["provenance"] = prov
-        return out
+        of :meth:`DataFigure._rich_capture`, delegating to the ONE frontend-neutral composition point
+        (``figure_capture.capture_rich_info``), so a grid Save and a flat panel Save write byte-identical
+        rich blocks.  A hand-rolled second copy here once mis-called ``capture_flow_graph`` and -- behind
+        a blanket ``except`` -- silently saved every grid npz with NO flow graph; the delegation (plus the
+        no-direct-import contract test) makes that divergence impossible."""
+        from Zou_lab_control.neutral_atom.operations.figure_capture import capture_rich_info
+        return capture_rich_info(self._figure_source)
 
 
 class GridPlot(BaseLivePlot):

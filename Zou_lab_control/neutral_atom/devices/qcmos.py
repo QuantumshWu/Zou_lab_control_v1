@@ -11,7 +11,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from ..core.analysis import nonnegative_int, positive_float, positive_int
-from .base import AcquisitionCancelled, CameraDevice, snap_subarray
+from .base import ROI_CLEAR_SENTINELS, AcquisitionCancelled, CameraDevice, snap_subarray
 from .camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS
 
 
@@ -24,7 +24,11 @@ from .camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS
 # count the driver lacks: every ``open`` / ``discover`` that needs the runtime ACQUIRES it, every
 # ``close`` / end-of-enumeration RELEASES it, and only the LAST release actually calls ``uninit``.
 _DCAM_API_LOCK = threading.Lock()
-_DCAM_API_REFCOUNT: dict[int, list] = {}   # id(api) -> [refcount, api]
+# id(api) -> [refcount, api, owned].  ``owned`` records WHO started the runtime: True when our
+# init() brought it up (we own the matching uninit), False when we merely ADOPTED an
+# ALREADYINITIALIZED runtime someone outside this counter started (an external script / a prior
+# session) -- releasing to zero must then just drop the entry, never uninit a runtime we do not own.
+_DCAM_API_REFCOUNT: dict[int, list] = {}
 
 
 def _dcam_acquire(api) -> None:
@@ -46,15 +50,18 @@ def _dcam_acquire(api) -> None:
             from .drivers.dcam.dcamapi4 import DCAMERR
             if int(api.lasterr()) != int(DCAMERR.ALREADYINITIALIZED):
                 raise RuntimeError(f"DCAM init failed: {api.lasterr()}")
-            # Runtime already up (initialised outside this counter): adopt it -- take the first
-            # reference WITHOUT calling uninit on release-to-zero, since we did not init it.
-            _DCAM_API_REFCOUNT[id(api)] = [1, api]
+            # Runtime already up (initialised outside this counter): ADOPT it -- take the first
+            # reference but mark it not-owned, so release-to-zero never uninits a runtime an
+            # external owner is still using.
+            _DCAM_API_REFCOUNT[id(api)] = [1, api, False]
             return
-        _DCAM_API_REFCOUNT[id(api)] = [1, api]
+        _DCAM_API_REFCOUNT[id(api)] = [1, api, True]
 
 
 def _dcam_release(api) -> None:
-    """Drop a reference taken by :func:`_dcam_acquire`; only the LAST holder calls ``uninit``.
+    """Drop a reference taken by :func:`_dcam_acquire`; the LAST holder calls ``uninit`` ONLY
+    when this counter's own ``init`` started the runtime (``owned``) -- an adopted runtime
+    (ALREADYINITIALIZED, started by an external owner) just loses our bookkeeping entry.
 
     Releasing an untracked api (double release / never acquired) is a defensive no-op -- it must
     never reach through to ``uninit`` and tear the runtime out from under another live camera."""
@@ -65,10 +72,11 @@ def _dcam_release(api) -> None:
         entry[0] -= 1
         if entry[0] <= 0:
             _DCAM_API_REFCOUNT.pop(id(api), None)
-            try:
-                api.uninit()
-            except Exception:
-                pass
+            if entry[2]:
+                try:
+                    api.uninit()
+                except Exception:
+                    pass
 
 
 @dataclass
@@ -228,9 +236,10 @@ class QCMOSCamera(CameraDevice):
         if readout_speed is not None:
             self.config.readout_speed = nonnegative_int(readout_speed, "readout_speed")
         if roi is not None:
-            # honour the same clear-sentinel the VirtualCamera does: "" / "None" -> full frame
-            # (roi is None means "leave unchanged"), so configure(roi=...) is backend-agnostic.
-            self.config.roi = None if roi in ("", "None") else normalize_roi(roi)
+            # FULL_FRAME (and its blank-box equivalents) clears back to the full sensor -- the
+            # ONE sentinel set in devices.base (roi is None means "leave unchanged"), so
+            # configure(roi=...) is backend-agnostic.
+            self.config.roi = None if roi in ROI_CLEAR_SENTINELS else normalize_roi(roi)
         if self._dcam is not None:
             self._write_settings()
 

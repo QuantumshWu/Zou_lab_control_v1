@@ -6442,19 +6442,83 @@ def test_validate_rejects_clk_channel_that_is_bus_member():
         )
 
 
-def test_snap_scan_table_rejects_too_wide_rows_instead_of_truncating():
-    """BUG: snap_scan_table zip()'d row vs slots, silently DROPPING extra columns (a wrong-
-    width loaded array was mis-snapped, not reported).  It must normalize width first: raise
-    on a too-wide row, pad a short one."""
+def test_snap_scan_table_rejects_width_mismatch_in_both_directions():
+    """BUG (C3): snap_scan_table zip()'d row vs slots, silently DROPPING extra columns, and the
+    width normalizer PADDED a short row with 0.0 -- so a user who bound 2 slots but loaded a
+    1-column array silently scanned 0.0 on the second slot (a wrong experiment, no error).
+    The fire path must reject a width mismatch in BOTH directions with the offending row named."""
 
     from Zou_lab_control.neutral_atom.timing.pulse_table import snap_scan_table, ScanSlot
 
     dur = ScanSlot(kind="duration", target="0", unit="ns")
     dac = ScanSlot(kind="dac", target="d@0", unit="value")
-    with pytest.raises(ValueError, match="values but 1 slots"):
+    with pytest.raises(ValueError, match=r"row 0 has 2 values but only 1 scan slot"):
         snap_scan_table([[100.0, 200.0]], [dur], time_step_ns=20)
-    # a short row is padded (established normalize behavior) then snapped
-    assert snap_scan_table([[100.0]], [dur, dac], time_step_ns=20) == [[100.0, 0.0]]
+    with pytest.raises(ValueError, match=r"row 0 has 1 values but 2 scan slot"):
+        snap_scan_table([[100.0]], [dur, dac], time_step_ns=20)
+
+
+def _two_slot_scan_state() -> "na.PulseTableState":
+    """A 2-slot pulse table (both durations, distinct nominals) for width-contract tests."""
+    return na.PulseTableState(
+        channels=["trap", "trig"],
+        periods=[
+            na.PulsePeriod("s0", (1, 0), unit="str (ns)"),
+            na.PulsePeriod("s1", (0, 1), unit="str (ns)"),
+        ],
+        scan_slots=[
+            {"kind": "duration", "target": "0", "unit": "ns", "nominal": 100.0},
+            {"kind": "duration", "target": "1", "unit": "ns", "nominal": 200.0},
+        ],
+        time_step_ns=20,
+    )
+
+
+def test_set_scan_table_rejects_short_rows_with_actionable_message():
+    """BUG (C3): set_scan_table (notebook API / PulseController / GUI Load Array) padded a short
+    row with 0.0 -- binding 2 slots and loading a 1-column array silently scanned 0.0 on the
+    second slot.  It must raise, naming the row, the widths, and the bound slots."""
+
+    state = _two_slot_scan_state()
+    with pytest.raises(ValueError, match=r"row 1 has 1 values but 2 scan slot\(s\) are bound "
+                                         r"\(s0=duration:0, s1=duration:1\)"):
+        state.set_scan_table([[20.0, 40.0], [60.0]])
+    # The programmatic constructor is equally strict (same experiment-input path).
+    with pytest.raises(ValueError, match=r"row 0 has 1 values but 2 scan slot"):
+        na.PulseTableState(
+            channels=["trap", "trig"],
+            periods=[
+                na.PulsePeriod("s0", (1, 0), unit="str (ns)"),
+                na.PulsePeriod("s1", (0, 1), unit="str (ns)"),
+            ],
+            scan_slots=[
+                {"kind": "duration", "target": "0", "unit": "ns", "nominal": 100.0},
+                {"kind": "duration", "target": "1", "unit": "ns", "nominal": 200.0},
+            ],
+            scan_table=[[20.0]],
+            time_step_ns=20,
+        )
+
+
+def test_from_dict_pads_legacy_short_scan_rows_with_nominal_and_warns(caplog):
+    """The ONE tolerated short-row source: a PERSISTED payload (an old save written before a
+    second slot was bound).  from_dict pads the missing column with the bound slot's NOMINAL
+    (bind_field's rule -- never 0.0) and logs a warning naming the payload and the slots."""
+    import logging
+
+    state = _two_slot_scan_state()
+    state.set_scan_table([[20.0, 40.0], [60.0, 80.0]])
+    payload = state.to_dict()
+    payload["scan_table"] = [[20.0], [60.0]]   # legacy save: rows predate the s1 binding
+    with caplog.at_level(logging.WARNING, logger="Zou_lab_control.neutral_atom.timing.pulse_table"):
+        loaded = na.PulseTableState.from_dict(payload)
+    assert loaded.scan_table == [[20.0, 200.0], [60.0, 200.0]]   # s1's nominal, NOT 0.0
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(str(payload["name"]) in message and "nominal" in message for message in messages)
+    # A too-wide persisted row is still an error (silent column drop = data loss).
+    payload["scan_table"] = [[20.0, 40.0, 60.0]]
+    with pytest.raises(ValueError, match=r"row 0 has 3 values but only 2 scan slot"):
+        na.PulseTableState.from_dict(payload)
 
 
 def test_scan_compile_snaps_zero_duration_to_one_tick_on_direct_call():

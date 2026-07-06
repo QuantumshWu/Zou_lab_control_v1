@@ -199,9 +199,11 @@ def test_discover_while_camera_open_keeps_camera_alive():
 
 
 def test_discover_adopts_already_initialised_runtime_without_uninit():
-    """An ALREADYINITIALIZED runtime (initialised outside this counter) is ADOPTED, not reported
-    as a failure -- discovery enumerates, and on release it does NOT uninit a runtime it did not
-    itself start."""
+    """An ALREADYINITIALIZED runtime (initialised outside this counter -- an external script that
+    owns it) is ADOPTED, not reported as a failure: discovery enumerates, and its release-to-zero
+    must NOT ``uninit`` a runtime we did not start (the refcount entry carries ownership).  The
+    owned direction is pinned right beside it: a runtime OUR ``init`` started IS uninited by the
+    last release -- so the ownership flag flips the tear-down, never suppresses it."""
     _fresh_refcount()
     api = _FakeApi(already_initialised=True)
     fake_module = types.SimpleNamespace(
@@ -216,6 +218,19 @@ def test_discover_adopts_already_initialised_runtime_without_uninit():
     finally:
         importlib.import_module = real_import
     assert rows and all(r.kind != "note" or "init failed" not in r.label for r in rows)
+    # The adopt+release cycle is complete (discover released its reference): the externally-owned
+    # runtime was NEVER uninited and stays live for its real owner.
+    assert api.uninit_calls == 0
+    assert api.initialised
+    assert id(api) not in qcmos_mod._DCAM_API_REFCOUNT   # our bookkeeping entry is gone, though
+
+    # And the owned direction: a runtime WE init on acquire is uninited exactly once on the
+    # last release (adoption must not have castrated the normal tear-down).
+    owned_api = _FakeApi()
+    _dcam_acquire(owned_api)
+    assert owned_api.init_calls == 1 and owned_api.initialised
+    _dcam_release(owned_api)
+    assert owned_api.uninit_calls == 1 and not owned_api.initialised
 
 
 def _bind_minimal_open(cam, fake_module, api, dcam):

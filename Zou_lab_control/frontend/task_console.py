@@ -128,12 +128,10 @@ from Zou_lab_control.neutral_atom.operations.measurement import ParamDecl
 
 TASK_FILES_ENV = "ZLC_TASK_DIR"
 
-# Logic-node kinds that DRIVE THE DEVICE (camera + sequencer): a camera live stream, a
-# scanned measurement, or a one-shot task.  Starting any one of them first stops every
-# OTHER running device-driver, so two never fight over the shared camera / pulse streamer
-# (which deadlocks real hardware).  A reactive PROCESSOR (e.g. judge-occupancy) only reads
-# hub signals -- it touches no device, so it is NOT in this set and keeps running.
-DEVICE_DRIVING_KINDS: frozenset = frozenset({"camera", "measurement", "task"})
+# "Does a logic node DRIVE the shared device (camera + sequencer)?" is the NODE's own
+# ``drives_devices`` declaration (operations/logic.py LogicNode) -- the console's device-driver
+# mutual exclusion in ``_start_logic_node`` reads it off every running node, GUI rows and
+# notebook-injected ``running_nodes=`` alike, so there is no second kind-string table here.
 
 # Console PANEL kinds.  EVERY plot kind in the ONE table ``live.PLOT_KINDS`` is a console panel
 # kind -- it renders through the SAME ``PanelCard`` (``_build_plot`` dispatches on the kind: a 2D
@@ -7378,28 +7376,10 @@ class TaskConsole(QtWidgets.QWidget):
             values = editor.collect_values() if editor is not None else dict(row.node.values)
         except Exception:
             values = dict(row.node.values)
-        # Capture THIS row's PREVIOUS published signals so a source/param change that drops some of
-        # them (fewer emCCD events -> fewer frame_i, a different processor source, ...) UNLINKS the now
-        # orphan signals from the hub instead of leaving them as stale "(unbound)" picker entries (#5).
-        _prev = self._logic_nodes.get(id(row)) or self._last_node.get(id(row))
-        old_sigs = set()
-        if _prev is not None and hasattr(_prev, "published_signals"):
-            try:
-                old_sigs = {str(s) for s in _prev.published_signals()}
-            except Exception:
-                old_sigs = set()
-        # stop a previous run of THIS node so running nodes don't pile up
-        self._stop_logic_node(row, _silent=True)
-        # Starting ANY device-driving node (camera / measurement / task) first STOPS every
-        # OTHER running device-driver, so two never fight over the shared camera + pulse
-        # streamer (which deadlocks real hardware).  Reactive processors (judge-occupancy)
-        # read only hub signals -- they touch no device, so they keep running (#6).
-        if row.node.kind in DEVICE_DRIVING_KINDS:
-            for other in list(self.logic_nodes):
-                if other is row or self._logic_nodes.get(id(other)) is None:
-                    continue
-                if other.node.kind in DEVICE_DRIVING_KINDS:
-                    self._stop_logic_node(other)
+        # BUILD-VALIDATE-COMMIT (#A2): build the NEW node FIRST -- a bad param edit must never
+        # kill the run that is already going (the old order stopped the running node, then failed
+        # the build, leaving nothing running); and nothing is registered until start() succeeds,
+        # so a failed start can never leave a half-started ghost in running_nodes / the hub.
         try:
             node = self._build_logic_node(row.node, values)
         except Exception as exc:
@@ -7413,6 +7393,54 @@ class TaskConsole(QtWidgets.QWidget):
         # which differs from the row title "Camera (live frames)", listing `frame` under TWO sources
         # = the "two cameras" bug).  One label per node => one entry in the signal picker (#H3n).
         node.instance_label = str(getattr(row.node, "title", "") or getattr(node, "instance_label", ""))
+        # Capture THIS row's PREVIOUS published signals so a source/param change that drops some of
+        # them (fewer emCCD events -> fewer frame_i, a different processor source, ...) UNLINKS the now
+        # orphan signals from the hub instead of leaving them as stale "(unbound)" picker entries (#5).
+        _prev = self._logic_nodes.get(id(row)) or self._last_node.get(id(row))
+        old_sigs = set()
+        if _prev is not None and hasattr(_prev, "published_signals"):
+            try:
+                old_sigs = {str(s) for s in _prev.published_signals()}
+            except Exception:
+                old_sigs = set()
+        # The build is good -- NOW stand the previous run of THIS node down (never pile up), and
+        # apply the device-driver mutual exclusion over ALL running nodes (#A3): the fact "does
+        # this node drive the shared camera / streamer" is the NODE's own ``drives_devices``
+        # declaration, so a notebook-injected ``running_nodes=`` node (which has no row) obeys the
+        # SAME rule as a GUI row -- one exclusion source, never a rows-only second set.  Reactive
+        # processors read only hub signals (drives_devices=False) and keep running (#6).
+        self._stop_logic_node(row, _silent=True)
+        if getattr(node, "drives_devices", False):
+            for other in list(self.running_nodes):
+                if other is node or not getattr(other, "drives_devices", False):
+                    continue
+                other_row = next((r for r in self.logic_nodes
+                                  if self._logic_nodes.get(id(r)) is other), None)
+                if other_row is not None:
+                    self._stop_logic_node(other_row)     # full UI path: dot / editor / registry
+                else:
+                    # a row-less injected node: stop it directly and drop it from the registry
+                    try:
+                        other.stop()
+                    except Exception:
+                        pass
+                    try:
+                        self.running_nodes.remove(other)
+                    except ValueError:
+                        pass
+        if not self._timer.isActive():
+            self._timer.start()
+        try:
+            node.start(rate_hz=getattr(node, "rate_hz", 5.0))
+        except Exception as exc:
+            row.set_state("error", status=f"start failed: {str(exc).splitlines()[0][:80]}")
+            if editor is not None:
+                editor.set_running(False)
+                editor.set_status(f"start failed: {str(exc).splitlines()[0][:140]}", error=True)
+            return
+        # COMMIT: the node is genuinely running -- only now does it enter the registries, and only
+        # now are the previous build's orphan signals unlinked (a failed start leaves the old
+        # signals in the hub untouched, exactly like a plain Stop, so nothing is lost).
         self._logic_nodes[id(row)] = node
         self._last_node[id(row)] = node           # survives Stop, for signal-source labelling
         if node not in self.running_nodes:
@@ -7433,16 +7461,6 @@ class TaskConsole(QtWidgets.QWidget):
         orphan = old_sigs - keep
         if orphan:
             self.hub.remove_signals(orphan)
-        if not self._timer.isActive():
-            self._timer.start()
-        try:
-            node.start(rate_hz=getattr(node, "rate_hz", 5.0))
-        except Exception as exc:
-            row.set_state("error", status=f"start failed: {str(exc).splitlines()[0][:80]}")
-            if editor is not None:
-                editor.set_running(False)
-                editor.set_status(f"start failed: {str(exc).splitlines()[0][:140]}", error=True)
-            return
         row.set_state("running", status="running")
         self._update_row_publishes(row)            # now show the LIVE node's published shapes
         if editor is not None:

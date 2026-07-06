@@ -9,7 +9,11 @@ findings are pinned:
       not silently image the full frame while ``cam.roi`` reports the window;
 * B5  a Stop during a blocking ``RetrieveResult`` is honoured within ONE poll slice, not after
       the full timeout: the retrieve is sliced (min(timeout, 200 ms)) with the stop re-checked
-      between slices.
+      between slices;
+* B6  fault loudness follows the TRIGGER MODE: a hardware-triggered session (``Line1``) raises
+      ``TimeoutError`` on a missing trigger and ``RuntimeError`` on a failed grab (the qCMOS
+      fault model -- a scan point can never silently vanish), while ``Software`` free-run keeps
+      the soft freeze (a live monitor that just sees no light returns short, never raises).
 """
 
 from __future__ import annotations
@@ -230,6 +234,55 @@ def test_grab_honours_stop_within_one_slice(fake_pylon):
 
     assert not worker.is_alive(), "read_frames sat inside RetrieveResult past the stop"
     assert result["elapsed"] < 2.0, f"Stop took {result['elapsed']:.2f}s (should be ~one slice)"
-    assert result["frames"] == []                 # no frame -> partial read (pylon soft fault)
+    assert result["frames"] == []                 # cooperative Stop -> clean partial read, no fault
     # Each slice was bounded (never the full 30 s), which is what makes the stop responsive.
     assert slice_calls and all(ms <= 200 for ms in slice_calls)
+
+
+# --------------------------------------------------------------------------- B6
+def test_hardware_trigger_timeout_raises_loud(fake_pylon):
+    """B6: in a HARDWARE-triggered session a trigger that never comes raises TimeoutError (which
+    frame of how many, ms budget -- the qCMOS message style), so a finite acquisition can never
+    silently drop a scan point the way the free-run soft freeze would."""
+    camera = _FakeCamera(retrieve=lambda timeout_ms: None)   # no edge ever arrives
+    fake_pylon(camera)
+    cam = PylonCamera(trigger_source="Line1", timeout=0.05)
+    cam.open()
+    cam.arm(1)
+    try:
+        with pytest.raises(TimeoutError, match=r"frame 0 of 1"):
+            cam.read_frames(1, timeout=0.05)
+    finally:
+        cam.disarm()
+
+
+def test_hardware_trigger_failed_grab_raises_loud(fake_pylon):
+    """B6: a GrabSucceeded() == False in a hardware-triggered session is a real device fault --
+    RuntimeError, never a silent short read."""
+    class _BadResult:
+        def GrabSucceeded(self):
+            return False
+
+        def Release(self):
+            pass
+
+    camera = _FakeCamera(retrieve=lambda timeout_ms: _BadResult())
+    fake_pylon(camera)
+    cam = PylonCamera(trigger_source="Line1", timeout=0.05)
+    cam.open()
+    cam.arm(1)
+    try:
+        with pytest.raises(RuntimeError, match=r"GrabSucceeded"):
+            cam.read_frames(1, timeout=0.05)
+    finally:
+        cam.disarm()
+
+
+def test_software_free_run_keeps_the_soft_freeze(fake_pylon):
+    """B6 counterpart: the Software free-run monitor keeps its soft fault model -- no frame within
+    the timeout returns SHORT (the live view freezes), never a raise."""
+    camera = _FakeCamera(retrieve=lambda timeout_ms: None)   # a dark monitor: no frame
+    fake_pylon(camera)
+    cam = PylonCamera(trigger_source="Software", timeout=0.05)
+    cam.open()
+    assert cam.acquire(1) == []                   # short read, no exception

@@ -3248,13 +3248,19 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         n = len(state.scan_slots)
         source = self._scan_tables.get("loaded" if self._scan_use_loaded else "generated") or []
         rows = source if source else [list(row) for row in state.scan_table]
-        if rows:
+        # Reconcile FIRST, snap SECOND: ``snap_scan_table`` is strict on row width (#C3 -- the
+        # experiment-input seams fail loud on a mismatched table), so the documented GUI tolerance
+        # for a mid-edit slot move (short cached rows pad with the slot NOMINAL, extra columns
+        # drop -- the same rule ``_apply_scan_source`` uses) must run BEFORE the snap sees the
+        # rows.  This UI-cache reconcile is the one deliberate tolerance point.
+        slot_defaults = [float(slot.nominal) for slot in state.scan_slots]
+        rows = [list(row)[:n] + slot_defaults[len(row):n] for row in rows]
+        if rows and n:
             rows = snap_scan_table(
                 rows, state.scan_slots,
                 time_step_ns=state.time_step_ns, dac_ranges=state.scan_slot_dac_ranges(),
             )
-        slot_defaults = [float(slot.nominal) for slot in state.scan_slots]
-        return [list(row)[:n] + slot_defaults[len(row):n] for row in rows]
+        return [list(row) for row in rows]
 
     @staticmethod
     def _scan_slot_signature(state: PulseTableState) -> tuple:

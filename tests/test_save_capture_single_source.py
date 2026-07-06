@@ -151,12 +151,39 @@ def test_notebook_save_and_gui_save_capture_identically(tmp_path):
 
 
 def test_unbound_plot_save_degrades_to_basic(tmp_path):
-    """A plot with NO source binding writes just the basic figure + npz (no ``signals`` / ``provenance``)
-    -- the old behaviour, preserved for a plain array figure."""
+    """A plot with NO source binding writes the basic figure + npz: no ``signals`` block, no device
+    ``provenance`` -- ONLY the minimal ``provenance['flow_graph']`` (``raw data -> plot``) every save
+    folds so the Flow tab always has a tree (the bare-plot contract of
+    ``test_flow_graph_provenance.test_bare_plot_save_folds_a_raw_flow_graph``)."""
     from Zou_lab_control.frontend import load_figure, panel_plot
 
     p = panel_plot(np.arange(50.0), kind="hist", size="2x4", bins=10, title="bare")
     p.save(str(tmp_path / "bare.png"))
     info = load_figure(next(tmp_path.glob("bare*.npz"))).info
-    assert "signals" not in info and "provenance" not in info
+    assert "signals" not in info, "no source binding -> no signals block"
+    assert info["provenance"] == {"flow_graph": figure_capture.raw_data_flow_graph()}, \
+        "an unbound save carries ONLY the raw data -> plot flow graph, no device provenance"
     plt.close("all")
+
+
+def test_frontend_captures_only_through_the_one_composition_point():
+    """The three capture primitives (signals / provenance / flow graph) are COMPOSED in one place --
+    ``figure_capture.capture_rich_info`` -- and no frontend module may import them directly: a second
+    hand-wired copy in the grid save once mis-called ``capture_flow_graph`` (wrong signature) and, behind
+    a blanket ``except``, silently saved every grid npz with NO flow graph.  Frontend may import only the
+    composition point and the ``raw_data_flow_graph`` fallback (the viewer's load-time synthesis).  A
+    static AST scan, like the frontend-neutral guard above, so even a lazily imported path is caught."""
+    import Zou_lab_control.frontend as frontend
+
+    allowed = {"capture_rich_info", "raw_data_flow_graph"}
+    offenders: list[str] = []
+    for py in sorted(Path(frontend.__file__).resolve().parent.glob("*.py")):
+        tree = ast.parse(py.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and "figure_capture" in (node.module or ""):
+                offenders += [f"{py.name}: {a.name}" for a in node.names if a.name not in allowed]
+            elif isinstance(node, ast.Import):
+                offenders += [f"{py.name}: import {a.name}" for a in node.names
+                              if "figure_capture" in a.name]
+    assert offenders == [], \
+        f"frontend must capture ONLY through capture_rich_info / raw_data_flow_graph: {offenders}"

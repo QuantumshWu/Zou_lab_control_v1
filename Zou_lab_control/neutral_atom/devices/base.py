@@ -44,6 +44,19 @@ class BaseDevice(ABC):
         return {"type": type(self).__name__}
 
 
+#: The ONE "clear the ROI back to the full sensor" sentinel every camera ``configure(roi=...)``
+#: accepts.  ``roi=None`` means "leave unchanged" (so a multi-field configure can skip it), which
+#: is why clearing needs an explicit value: the measurement layer sends this canonical spelling.
+FULL_FRAME = "full"
+
+#: Every spelling ``configure(roi=...)`` treats as "clear to full frame": the canonical
+#: ``FULL_FRAME`` plus ``""`` / ``"None"`` (what a GUI's blank text box naturally produces).
+#: Single source -- each backend tests membership HERE, so the accepted spellings can never
+#: drift between cameras (the old per-backend ("", "None") tuples were an unreachable chain:
+#: the measurement layer mapped a blank region to None, which means "leave unchanged").
+ROI_CLEAR_SENTINELS = (FULL_FRAME, "", "None")
+
+
 class CameraDevice(BaseDevice):
     """Required contract for a camera used by ``NeutralAtomSession``.
 
@@ -501,6 +514,8 @@ def snap_subarray(roi, *, step: int, max_w: int, max_h: int):
 __all__ = [
     "BaseDevice",
     "CameraDevice",
+    "FULL_FRAME",
+    "ROI_CLEAR_SENTINELS",
     "SequencerDevice",
     "TrapArrayDevice",
     "snap_subarray",

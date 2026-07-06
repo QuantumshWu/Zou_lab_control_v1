@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 import ast
 import json
+import logging
 import math
 from numbers import Number
 import re
@@ -332,7 +333,9 @@ class PulseTableState:
         self.name = str(name) if name is not None else default_pulse_name()
         self.time_step_ns = positive_time_step_ns(time_step_ns)
         self.scan_slots = [slot if isinstance(slot, ScanSlot) else ScanSlot.from_dict(slot) for slot in (scan_slots or [])]
-        self.scan_table = _normalize_scan_table(scan_table, n_slots=len(self.scan_slots))
+        # STRICT width check: a programmatic build must supply one column per bound slot.
+        # Legacy short rows are tolerated only at the from_dict deserialization seam.
+        self.scan_table = _normalize_scan_table(scan_table, slots=self.scan_slots)
         # API slots: named handles (a1/a2...) the API/Task set by name (set_api / state.aN).
         # Set EARLY so the ``state.aN = value`` attribute sugar (__setattr__) can find them.
         self.api_slots = [slot if isinstance(slot, ApiSlot) else ApiSlot.from_dict(slot) for slot in (api_slots or [])]
@@ -703,7 +706,7 @@ class PulseTableState:
         raise AttributeError(name)
 
     def set_scan_table(self, rows: Sequence[Sequence[float]]) -> "PulseTableState":
-        self.scan_table = _normalize_scan_table(rows, n_slots=len(self.scan_slots))
+        self.scan_table = _normalize_scan_table(rows, slots=self.scan_slots)
         self.validate()
         return self
 
@@ -1729,11 +1732,28 @@ class PulseTableState:
     def from_dict(cls, payload: Mapping[str, object]) -> "PulseTableState":
         if payload.get("schema", cls.schema) != cls.schema:
             raise ValueError("unsupported pulse table schema.")
+        # The ONE legacy-tolerance seam for short scan-table rows.  from_dict is where every
+        # PERSISTED payload re-enters the object model (load()ed .json pulse files, saved-figure
+        # recipes, server pulse transfers), and only an old save written before another slot was
+        # bound legitimately carries short rows.  Bare __init__ cannot tell a saved payload from
+        # a programmatic build, so __init__/set_scan_table stay strict and the pad lives here:
+        # missing columns take the bound slot's NOMINAL (bind_field's rule, never 0.0) and a
+        # warning names the payload.  In-process to_dict() round-trips (snapped(), with_*_resolved)
+        # always carry full-width rows, so the pad never fires for them.
+        scan_slots = [
+            slot if isinstance(slot, ScanSlot) else ScanSlot.from_dict(slot)
+            for slot in payload.get("scan_slots", ())
+        ]
+        scan_table = _normalize_scan_table(
+            payload.get("scan_table", ()),
+            slots=scan_slots,
+            pad_legacy_source=str(payload.get("name", "")) or "<unnamed>",
+        )
         return cls(
             name=str(payload["name"]) if "name" in payload else None,
             channels=payload["channels"],
-            scan_slots=payload.get("scan_slots", ()),
-            scan_table=payload.get("scan_table", ()),
+            scan_slots=scan_slots,
+            scan_table=scan_table,
             api_slots=payload.get("api_slots", ()),
             time_step_ns=float(payload.get("time_step_ns", 1.0)),
             periods=[PulsePeriod.from_dict(item) for item in payload.get("periods", [])],
@@ -2065,21 +2085,61 @@ def _coerce_bus_value(value: object) -> object:
     return int(value)
 
 
-def _normalize_scan_table(rows: Sequence[Sequence[float]] | None, *, n_slots: int) -> list[list[float]]:
+def _normalize_scan_table(
+    rows: Sequence[Sequence[float]] | None,
+    *,
+    slots: Sequence["ScanSlot"],
+    pad_legacy_source: str | None = None,
+) -> list[list[float]]:
+    """Coerce ``rows`` to floats and REJECT any width mismatch against the bound ``slots``.
+
+    Strict in BOTH directions by default: a too-wide row would silently drop a column, and
+    a too-short row would silently scan a wrong value for the unfilled slot(s) -- either way
+    the hardware runs a different experiment than the user asked for, so both are hard errors
+    with the offending row named.
+
+    ``pad_legacy_source`` is the ONE deliberate tolerance, reserved for deserializing
+    PERSISTED payloads (:meth:`PulseTableState.from_dict`): a save written before another
+    slot was bound legitimately carries short rows.  When set (to a human-readable payload
+    name for the warning), short rows are padded with each missing slot's NOMINAL value --
+    the same "a new scan dimension starts at the field's current value" rule
+    :meth:`PulseTableState.bind_field` uses, never 0.0 -- and a warning is logged.  Too-wide
+    rows still raise even then (there is no legacy writer of wide rows; that is data loss).
+    """
     if rows is None:
         return []
+    n_slots = len(slots)
+    slot_names = ", ".join(
+        f"{slot_var(i)}={slot.label or f'{slot.kind}:{slot.target}'}" for i, slot in enumerate(slots)
+    )
     out: list[list[float]] = []
+    padded_rows: list[int] = []
     for index, row in enumerate(rows):
         if isinstance(row, Number):
             values = [float(row)]
         else:
             values = [float(value) for value in row]
         if n_slots and len(values) != n_slots:
-            if len(values) < n_slots:
-                values = values + [0.0] * (n_slots - len(values))
-            else:
-                raise ValueError(f"scan table row {index} has {len(values)} values but {n_slots} slots.")
+            if len(values) > n_slots:
+                raise ValueError(
+                    f"scan table row {index} has {len(values)} values but only {n_slots} scan "
+                    f"slot(s) are bound ({slot_names}); give exactly one column per bound slot."
+                )
+            if pad_legacy_source is None:
+                raise ValueError(
+                    f"scan table row {index} has {len(values)} values but {n_slots} scan slot(s) "
+                    f"are bound ({slot_names}); a short row would silently scan a wrong value for "
+                    f"the missing slot(s) -- give exactly one column per bound slot."
+                )
+            values = values + [float(slot.nominal) for slot in slots[len(values):]]
+            padded_rows.append(index)
         out.append(values)
+    if padded_rows:
+        logging.getLogger(__name__).warning(
+            "pulse table %r: scan table row(s) %s are narrower than the %d bound scan slot(s) "
+            "(%s); padded the missing column(s) with each slot's nominal value (legacy save).",
+            pad_legacy_source, padded_rows, n_slots, slot_names,
+        )
     return out
 
 
@@ -2231,11 +2291,12 @@ def snap_scan_table(
 
     step = positive_time_step_ns(time_step_ns)
     default_range = bus_signed_range(DEFAULT_DAC_BITS)
-    # Normalize the column count to the slot count FIRST (pads a short row with 0.0,
-    # RAISES on a too-wide row) -- otherwise a mismatched loaded array would be silently
-    # truncated/under-snapped by the zip() below (a column would be dropped or a slot left
-    # un-clamped).  This makes "loading the wrong-width array" a clear error, not silent data loss.
-    normalized = _normalize_scan_table(scan_table, n_slots=len(scan_slots))
+    # Check the column count against the slot count FIRST (a mismatch in EITHER direction
+    # raises) -- otherwise a mismatched loaded array would be silently truncated/under-snapped
+    # by the zip() below (a column dropped, or a slot left un-clamped).  This is the
+    # on-hardware fire path, so "loading the wrong-width array" must be a clear error, never
+    # a silently different experiment.
+    normalized = _normalize_scan_table(scan_table, slots=list(scan_slots))
     out: list[list[float]] = []
     for row in normalized:
         new_row: list[float] = []
