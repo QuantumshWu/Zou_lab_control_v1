@@ -129,3 +129,31 @@ def test_no_session_entry_inits_and_upgrades_in_place():
     finally:
         for session in inited:
             session.close()
+
+
+def test_na_device_manager_hands_the_created_session_back_via_window():
+    """#1: ``na.device_manager()`` returns the manager window, whose ``.session`` is None until
+    "Init devices" and the live session afterwards -- so the notebook can do
+    ``mgr = na.device_manager("virtual"); ...Init...; exp = mgr.session`` (the created session is
+    no longer stuck inside the launcher's closure)."""
+    window = na.device_manager("virtual")
+    try:
+        assert window.session is None                  # editor open, nothing connected yet
+        panel = window.loaded                          # the DeviceManagerPanel inside the window
+        panel._apply()                                 # press "Init devices"
+        exp = window.session
+        assert exp is not None                         # the session is handed back on the window
+        assert exp.devices["camera"] is not None and hasattr(exp, "readout")
+        exp.close()
+    finally:
+        window.close()
+
+
+def test_exp_device_manager_window_exposes_the_bound_session(exp):
+    """The session-bound entry (``exp.device_manager()``) exposes the SAME session on the
+    window from the start -- symmetric with the no-session entry."""
+    window = exp.device_manager()
+    try:
+        assert window.session is exp
+    finally:
+        window.close()

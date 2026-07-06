@@ -177,6 +177,7 @@ def open_device_manager(session: Any, **kwargs):
     window = show_device_manager(
         session.devices, session_binding=_session_device_binding(session),
         config_dir=str(device_config_dir()), **kwargs)
+    window.session = session          # the notebook can read back the bound session off the window
     session._zlc_device_manager = window
     return window
 
@@ -190,7 +191,12 @@ def device_manager(config: Any = None, **kwargs):
     forms ``na.connect`` takes).  Its green button reads "Init devices": pressing it
     ``na.connect``\\ s the working config, and on success THIS window upgrades in place to
     the new session's manager (the Loaded card activates, the button becomes Apply, and a
-    later ``exp.device_manager()`` reuses this same window)."""
+    later ``exp.device_manager()`` reuses this same window).
+
+    RETURNS the manager window, whose ``.session`` is ``None`` until Init and the live
+    session afterwards -- so the notebook flow is ``mgr = na.device_manager("virtual")``,
+    edit + press "Init devices", then ``exp = mgr.session``.  (A pure ``na.connect(config)``
+    stays the one-liner when no editor is wanted; the manager is the visual init path.)"""
 
     from Zou_lab_control.frontend.device_manager import show_device_manager
 
@@ -205,13 +211,16 @@ def device_manager(config: Any = None, **kwargs):
         session = connect(cfg_dict)
         window = state.get("window")
         if window is not None:
-            # register the upgraded window as the new session's one-per-session manager
+            # register the upgraded window as the new session's one-per-session manager AND
+            # hand the fresh session back to the notebook via the window it already holds.
             session._zlc_device_manager = window
+            window.session = session
         return _session_device_binding(session)
 
     window = show_device_manager(
         None, initial_config=initial, on_init_session=_init,
         config_dir=str(device_config_dir()), **kwargs)
+    window.session = None            # populated by _init the moment "Init devices" succeeds
     state["window"] = window
     return window
 
