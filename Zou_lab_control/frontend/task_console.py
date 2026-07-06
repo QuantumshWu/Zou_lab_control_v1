@@ -4216,21 +4216,6 @@ class MeasurementPanel(QtWidgets.QWidget):
         header spans the full width -- no outer row label (its header IS the label)."""
         self.form.addWidget(widget)
 
-    def _spin(self, decl, *, integer: bool, value=None):
-        """A bounded spin box for a float/int param (range + unit from the decl)."""
-        digits = max(5, len(str(int(abs(decl.hi) + 1))) + (0 if integer else 4))
-        spin = FluentDoubleSpinBox(length=digits, allow_minus=float(decl.lo) < 0)
-        if integer:
-            spin.setDecimals(0)
-        spin.setRange(float(decl.lo), float(decl.hi))
-        if value is None:
-            value = decl.default
-        if value is not None:
-            spin.setValue(int(value) if integer else float(value))
-        spin.setToolTip(decl.tooltip)
-        spin.valueChanged.connect(self._refresh_start_enabled)
-        return spin
-
     def _param_context(self) -> ParamWidgetContext:
         """The bundle every PARAM_WIDGETS handler builds against: re-validation on edit
         + the signal providers + factories for the two composite widgets that live in
@@ -6503,6 +6488,14 @@ class TaskConsole(QtWidgets.QWidget):
             return str(label)
         return str(getattr(node, "prefix", "") or type(node).__name__)
 
+    def _provider_nodes(self) -> list:
+        """Every node that can PROVIDE data or signals to a panel -- the RUNNING nodes plus the last
+        build of each Logic-tab node (``_last_node``), kept past Stop.  The ONE source of "which nodes
+        count": signal resolution (:meth:`_node_for_signal`), the picker (:meth:`_signal_providers`),
+        AND the pulse/grid/sitemap/curve auxiliary-data providers all read this, so a stopped node's
+        panel keeps rendering its lingering state instead of erroring "needs a producing node"."""
+        return [*self.running_nodes, *self._last_node.values()]
+
     def _signal_providers(self) -> dict:
         """``name -> [node labels]`` for every signal a node produces, so the picker shows
         WHICH measurement / processor / camera each signal comes from.
@@ -6514,7 +6507,7 @@ class TaskConsole(QtWidgets.QWidget):
         than one node lists every source node (so an ambiguous pick can be flagged)."""
         providers: dict[str, list] = {}
         seen: set[int] = set()
-        for node in [*self.running_nodes, *self._last_node.values()]:
+        for node in self._provider_nodes():
             if node is None or id(node) in seen or not hasattr(node, "published_signals"):
                 continue
             seen.add(id(node))
@@ -6607,8 +6600,9 @@ class TaskConsole(QtWidgets.QWidget):
         occ = str(occ_signal or "")
         if not occ:
             return (None, None)
-        # 1) the running producing node (ground truth: whatever publishes this signal now)
-        for node in self.running_nodes:
+        # 1) the producing node (ground truth: whatever publishes this signal) -- running OR kept
+        # past Stop, so a stopped site-map panel still resolves its centres/underlay.
+        for node in self._provider_nodes():
             ck = getattr(node, "sitemap_centers_key", "")
             if not ck:
                 continue
@@ -6643,7 +6637,7 @@ class TaskConsole(QtWidgets.QWidget):
         y = str(y_signal or "")
         if not y:
             return None
-        for node in self.running_nodes:
+        for node in self._provider_nodes():
             if getattr(node, "y_signal", None) == y:
                 return getattr(node, "x_signal", None)
         return None
@@ -6657,7 +6651,7 @@ class TaskConsole(QtWidgets.QWidget):
         name = str(value_signal or "")
         if not name:
             return None
-        for node in self.running_nodes:
+        for node in self._provider_nodes():
             try:
                 published = set(node.published_signals())
             except Exception:
@@ -6674,7 +6668,7 @@ class TaskConsole(QtWidgets.QWidget):
         name = str(value_signal or "")
         if not name:
             return None
-        for node in self.running_nodes:
+        for node in self._provider_nodes():
             try:
                 published = set(node.published_signals())
             except Exception:
@@ -6792,7 +6786,7 @@ class TaskConsole(QtWidgets.QWidget):
         """The producing node for signal ``name``: a RUNNING node first, else the last build of a
         Logic-tab node (``_last_node``, kept past Stop) so a stopped node's lingering signal still
         resolves.  None if none publishes it."""
-        for node in [*self.running_nodes, *self._last_node.values()]:
+        for node in self._provider_nodes():
             if node is not None and hasattr(node, "published_signals"):
                 try:
                     if name in node.published_signals():
