@@ -2661,39 +2661,49 @@ class PanelCard(FluentGroupBox):
         display knobs (bins / fit / ylog / cmap) AND the relim family (BaseLivePlot.apply_param owns
         them all).  The ONE builder the live card (display-only) and the Edit-tab snapshot
         (interactive) share -- so the two can never drift."""
-        from .live import facet_cell_labels, grid as build_facet_grid
+        from .live import facet_axis_labels, facet_cell_labels, grid as build_facet_grid
         sub = self._resolved_sub_kind()
         cells = self._facet_cells(value)
         # Per-cell TITLE identifiers (#5): the console pre-slices (facet=None to the factory), so it hands
         # the labels EXPLICITLY, derived from the bound facet + its points shape through the ONE
         # ``facet_cell_labels`` source -- so a repeat / scan / site grid's cells read 'rep k' / a scan
         # coordinate / 's k' instead of a hardcoded site tag, from the same source the notebook path uses.
-        pts, _ = self._facet_value_shapes()
-        # For a POINTS (scan-axis) facet, label each cell with the REAL scan coordinate (``Bz=1.2``) not a
-        # bare ``pt k``.  The faceted axis's NAME + per-cell COORDINATE are metadata of the producing SCAN
-        # NODE and the facet spec -- NOT of the value expression -- so they are fetched UNGATED: even a
-        # transforming value (``np.log(f)``, ``a-b``) still faceted on scan axis i, so cell k is still
-        # scan point k of axis i and its coordinate is known.  (``_bound_structure`` is identity-gated
-        # because it drives the value's SHAPE reshape, a DIFFERENT concern; the scan coordinates never
-        # change under a value transform -- gating them there was the root cause of the ``pt k`` fallback.)
+        pts, dim = self._facet_value_shapes()
+        # The swept axis NAMES + per-cell COORDINATES are metadata of the producing SCAN NODE and the
+        # facet spec -- NOT of the value expression -- so they are fetched UNGATED: even a transforming
+        # value (``np.log(f)``, ``a-b``) still faceted on scan axis i, so cell k is still scan point k
+        # of axis i and its coordinate is known.  (``_bound_structure`` is identity-gated because it
+        # drives the value's SHAPE reshape, a DIFFERENT concern; the scan names/coordinates never
+        # change under a value transform -- gating them there was the root cause of the ``pt k``
+        # fallback.)  ``param_names`` are needed for EVERY facet group -- a repeat / dim facet's cells
+        # keep the scan axes as their remaining x/y (#6) -- while the per-cell COORDS label only a
+        # POINTS facet's cells (``Bz=1.2`` instead of a bare ``pt k``).
         from .live import normalize_facet
         coords = names = None
         spec = normalize_facet(self._facet())
-        if spec and spec[0] == "points" and self.config.inputs and callable(self.structure_provider):
+        if self.config.inputs and callable(self.structure_provider):
             try:
                 raw = self.structure_provider(self.config.inputs[0])
             except Exception:
                 raw = None
             if raw:
                 names = raw.get("param_names")
-                all_coords = raw.get("points_coords") or []
-                axis = int(spec[1])
-                if axis < len(all_coords) and len(all_coords[axis]) == len(cells):
-                    coords = all_coords[axis]
+                if spec and spec[0] == "points":
+                    all_coords = raw.get("points_coords") or []
+                    axis = int(spec[1])
+                    if axis < len(all_coords) and len(all_coords[axis]) == len(cells):
+                        coords = all_coords[axis]
         cell_labels = facet_cell_labels(self._facet(), len(cells), points_shape=pts,
                                         coords=coords, param_names=names)
         plotter = build_facet_grid(
             cells, sub_plot_kind=sub, size=self.config.size, cell_labels=cell_labels,
+            # figure-level x/y axis names FOLLOW the facet (#6): the ONE facet_axis_labels rule maps
+            # the REMAINING axes to a cell's x/y (scan param names / the value's declared axis
+            # label), degrading to the kind's stock defaults when the metadata is unknown.  The
+            # console pre-slices (facet=None to the factory), so it hands the labels explicitly --
+            # the same derivation the notebook ``grid(value, facet=...)`` path runs inside.
+            labels=facet_axis_labels(self._facet(), sub, points_shape=pts, data_shape=dim,
+                                     param_names=names, value_label=self._source_axis_label()),
             display=False, interactions=interactions, title=self.config.title or "")
         # Fold the persisted display knobs in with the draws SUSPENDED.  Each ``apply_param`` otherwise
         # forces a synchronous N-cell repaint, so ~10 keys = up to 10 full grid ``draw()``s per build --

@@ -1045,8 +1045,14 @@ class BaseLivePlot:
             return False
         max_y = float(np.nanmax(vals))
         min_y = float(np.nanmin(vals))
-        if min_y < 0:
-            self.relim_mode = "tight"
+        # Negative data cannot read against "normal"'s 0-anchor -- treat THIS frame as tight, as a
+        # PURE per-frame derivation (the band branch below; :meth:`_mode_target` already falls
+        # through to the tight formula for ``min_y < 0``), NEVER by rewriting ``self.relim_mode``:
+        # the mode is the OPERATOR's setting (shown in Setting, persisted in the panel params), and
+        # a background-subtracted frame with a few negative pixels must not make that displayed
+        # state silently self-drift 'normal' -> 'tight' (the sitemap regression after d16d93a routed
+        # its side band through relim).  Shared by all three relim families (1D / 2D / sitemap).
+        mode = "tight" if (self.relim_mode == "normal" and min_y < 0) else self.relim_mode
         old = (self.ylim_min, self.ylim_max)
         lo, hi = self.ylim_min, self.ylim_max
         # Dead-band hysteresis: only rescale when the data leaves a band inside the
@@ -1055,7 +1061,7 @@ class BaseLivePlot:
         # view, freeze the limits and return False -- the unconditional
         # set_ylim(ylim_min, ylim_max) in update_core is then a no-op.  Rescaling
         # always happens when data would clip, so a point is never hidden.
-        if self.relim_mode == "normal":
+        if mode == "normal":
             if not force and hi > 0 and (0.7 * hi) <= max_y <= hi:
                 return False                          # within band -> no rescale
             self.ylim_min, self.ylim_max = self._mode_target(min_y, max_y)
@@ -3703,6 +3709,73 @@ def facet_cell_labels(facet, n_cells, *, points_shape=(), coords=None, param_nam
     return out
 
 
+#: The per-kind STOCK figure-level ``(xlabel, ylabel)`` a grid falls back to when nothing better is
+#: known -- ONE table shared by the :func:`grid` factory default and :func:`facet_axis_labels`'
+#: graceful degradation, so the two can never drift.
+_GRID_DEFAULT_LABELS = {"hist": ("Signal", "Shots"), "1d": ("X", "Y")}
+
+
+def _grid_default_labels(sub_plot_kind: str) -> tuple[str, str]:
+    return _GRID_DEFAULT_LABELS.get(str(sub_plot_kind), ("x (px)", "y (px)"))
+
+
+def facet_axis_labels(facet, sub_plot_kind, *, points_shape=(), data_shape=(),
+                      param_names=None, value_label=None) -> tuple[str, str]:
+    """The grid's figure-level ``(xlabel, ylabel)`` DERIVED from what each cell has LEFT after the
+    facet slice -- the axis-name counterpart of :func:`facet_cell_labels` (which names the CELLS) and
+    the ONE place "which remaining axis is a cell's x / y" is written down.  It mirrors
+    :func:`facet_cells`' slicing (``pts_rest`` / ``dim_rest``) and the cell renderers' orientation:
+
+    * ``2d`` cell of a remaining 2-D POINTS grid (``core.reshape(pts_rest)`` + ``imshow(origin=
+      'lower')``): row axis ``pts_rest[0]`` runs along y, column axis ``pts_rest[1]`` along x ->
+      the labels are those scan axes' ``param_names``;
+    * ``2d`` cell of a remaining 2-D DATA_DIM (a camera frame): pixel coordinates stay
+      ``("x (px)", "y (px)")``;
+    * ``1d`` cell whose single non-trivial remaining axis is a POINTS axis: x = that axis's param
+      name, y = ``value_label`` (the produced quantity's declared axis name);
+    * ``hist`` cell: x = ``value_label`` (the pooled samples ARE the value), y = "Shots".
+
+    ``param_names`` are the producing scan's swept axis names (indexed by ORIGINAL points-axis
+    position, like ``facet_cell_labels``); missing / too-short names and a missing ``value_label``
+    degrade PER SLOT to the kind's stock defaults (:data:`_GRID_DEFAULT_LABELS`) -- never raise,
+    never a blank label."""
+    kind = str(sub_plot_kind)
+    default_x, default_y = _grid_default_labels(kind)
+    names = ["" if n is None else str(n) for n in (param_names or ())]
+    value_text = str(value_label) if value_label else ""
+
+    if kind == "hist":
+        return (value_text or default_x, default_y)
+
+    spec = normalize_facet(facet)
+    pts_axes = list(enumerate(int(n) for n in (points_shape or ())))   # (original axis index, length)
+    dim_rest = tuple(int(n) for n in (data_shape or ()))
+    if spec is not None:
+        group, index = spec
+        if group == "points":
+            pts_axes = [(i, n) for i, n in pts_axes if i != index]
+        elif group == "dim":
+            dim_rest = tuple(n for i, n in enumerate(dim_rest) if i != index)
+    dim_trivial = int(np.prod(dim_rest or (1,), dtype=np.int64)) == 1
+
+    def _name(axis_index: int) -> str:
+        return names[axis_index] if axis_index < len(names) else ""
+
+    if kind == "2d":
+        if len(pts_axes) == 2 and dim_trivial:
+            # the frame is the remaining 2-D points grid (facet_cells' core.reshape(pts_rest));
+            # origin="lower" imshow puts rows (pts_rest[0]) on y and columns (pts_rest[1]) on x
+            xlabel, ylabel = _name(pts_axes[1][0]), _name(pts_axes[0][0])
+            return (xlabel or default_x, ylabel or default_y)
+        return (default_x, default_y)              # a camera-frame cell keeps its pixel axes
+
+    # "1d": the remaining axes flatten to a curve; its x axis is MEANINGFUL (a named scan
+    # coordinate) only when exactly one non-trivial points axis remains and data_dim is trivial.
+    nontrivial = [i for i, n in pts_axes if n > 1]
+    xlabel = _name(nontrivial[0]) if len(nontrivial) == 1 and dim_trivial else ""
+    return (xlabel or default_x, value_text or default_y)
+
+
 def _collapse_repeat(sliced, repeat_mode: str):
     """Collapse the leading REPEAT axis of a per-cell slice for an image/line cell -- the same display
     verbs the standalone kinds use (``average`` mean / ``add`` sum / ``replace`` latest).  A histogram
@@ -5497,6 +5570,8 @@ def grid(
     size: str | None = None,
     labels: Sequence[str] | None = None,
     cell_labels: "Sequence[str] | None" = None,
+    param_names: "Sequence[str] | None" = None,
+    value_label: str | None = None,
     title: str = "",
     display: bool = True,
     fig: "plt.Figure | None" = None,
@@ -5512,6 +5587,11 @@ def grid(
     ``**cell_kwargs`` are that kind's own cell arguments (a ``hist`` grid takes ``thresholds`` / ``occupied`` /
     ``bins`` / ``site_fidelities``; a ``2d`` grid takes ``cmap``).
 
+    ``param_names`` / ``value_label`` are OPTIONAL axis metadata of the producing scan (the swept
+    axis names, the produced quantity's axis name): a FACETED grid with no explicit ``labels``
+    derives its figure-level x/y axis names from them through the ONE :func:`facet_axis_labels`
+    rule, so the outer labels FOLLOW the facet (the remaining axes) instead of a stock default.
+
     EVERY grid is built through THIS entry -- the calibration report, the notebook helpers
     (:func:`site_histogram_grid` / :func:`site_psf_grid` are one-line ``sub_plot_kind`` presets over it), and
     the reopened-recipe path (:func:`build_grid_figure`) -- so a grid is created the SAME way everywhere:
@@ -5524,14 +5604,23 @@ def grid(
     if facet is not None:
         # the grid as an AXIS-EXPANDER: hand ONE (repeat, points, *data_dim) block + the axis to
         # expand, and the single slicing rule (facet_cells) produces the per-cell inputs
-        per_cell = facet_cells(per_cell, facet, sub_plot_kind=kind,
+        block = np.asarray(per_cell, dtype=float)
+        per_cell = facet_cells(block, facet, sub_plot_kind=kind,
                                points_shape=points_shape, repeat_mode=repeat_mode)
+        if labels is None:
+            # figure-level axis names FOLLOW the facet: derive them from the REMAINING axes through
+            # the ONE facet_axis_labels rule (missing param_names / value_label degrade to the kind
+            # defaults inside -- so a caller with no scan metadata keeps the stock labels).
+            labels = facet_axis_labels(
+                facet, kind,
+                points_shape=(tuple(int(n) for n in (points_shape or ())) or block.shape[1:2]),
+                data_shape=block.shape[2:], param_names=param_names, value_label=value_label)
     if len(per_cell) > MAX_GRID_CELLS:
         raise ValueError(
             f"a grid of {len(per_cell)} cells would freeze the UI (limit {MAX_GRID_CELLS}); "
             "pick a shorter facet axis, or collapse that axis via repeat_mode / an expression instead.")
     if labels is None:
-        labels = {"hist": ("Signal", "Shots"), "1d": ("X", "Y")}.get(kind, ("x (px)", "y (px)"))
+        labels = _grid_default_labels(kind)
     # Per-cell TITLE identifiers (#5): use the caller's ``cell_labels`` (the console, which pre-slices and
     # knows the facet + scan coords) else DERIVE them from the facet through the ONE ``facet_cell_labels``
     # source -- so a repeat / scan / site grid labels its cells by what the axis MEANS, and the derivation

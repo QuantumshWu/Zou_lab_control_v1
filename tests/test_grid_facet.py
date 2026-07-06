@@ -26,6 +26,7 @@ from Zou_lab_control.frontend.live import (
     Live2DDis,
     build_grid_figure,
     default_sub_plot_kind,
+    facet_axis_labels,
     facet_cells,
     grid,
     grid_recipe_from_cells,
@@ -95,6 +96,58 @@ def test_default_sub_plot_kind_follows_what_each_cell_has_left():
     assert default_sub_plot_kind("repeat", points_shape=(90,)) == "1d"
     assert default_sub_plot_kind("points:0", points_shape=(4, 7)) == "1d"
     assert default_sub_plot_kind("dim:0", points_shape=(1,), data_shape=(35,)) == "hist"
+
+
+# --------------------------------------------------- figure-level axis labels follow the facet (#6)
+def test_facet_axis_labels_map_the_remaining_axes_to_the_cell_x_y():
+    """The ONE remaining-axis -> (xlabel, ylabel) rule, mirroring facet_cells' slicing and the cell
+    renderers' orientation: a 2d cell's frame is core.reshape(pts_rest) drawn origin='lower', so
+    rows (pts_rest[0]) run along y and columns (pts_rest[1]) along x; a 1d cell's single remaining
+    points axis is its x; a hist cell's samples ARE the value; a camera frame keeps pixel axes."""
+    names = ["Bx", "By", "Bz"]
+    # 3-D scan, 2d cells: each facet pick leaves a DIFFERENT pair of scan axes as the frame
+    assert facet_axis_labels("points:0", "2d", points_shape=PTS, data_shape=(1,),
+                             param_names=names) == ("Bz", "By")
+    assert facet_axis_labels("points:1", "2d", points_shape=PTS, data_shape=(1,),
+                             param_names=names) == ("Bz", "Bx")
+    assert facet_axis_labels("points:2", "2d", points_shape=PTS, data_shape=(1,),
+                             param_names=names) == ("By", "Bx")
+    # repeat facet of a 1-D scan -> a 1d cell: x IS the swept axis, y the produced quantity
+    assert facet_axis_labels("repeat", "1d", points_shape=(41,), data_shape=(1,),
+                             param_names=["delay"], value_label="atom rate") == ("delay", "atom rate")
+    # a remaining 2-D data_dim (a camera frame) keeps its pixel axes -- never a scan name
+    assert facet_axis_labels("repeat", "2d", points_shape=(1,), data_shape=(20, 24),
+                             param_names=names) == ("x (px)", "y (px)")
+    # hist pools samples of the VALUE: x = the value's axis name, y = shot count
+    assert facet_axis_labels("repeat", "hist", points_shape=PTS, data_shape=(1,),
+                             value_label="signal (counts)") == ("signal (counts)", "Shots")
+    # missing / too-short metadata degrades to the kind's stock defaults -- never raises
+    assert facet_axis_labels("points:0", "2d", points_shape=PTS, data_shape=(1,)) == ("x (px)", "y (px)")
+    assert facet_axis_labels("repeat", "1d", points_shape=(41,), data_shape=(1,)) == ("X", "Y")
+    assert facet_axis_labels("repeat", "hist", points_shape=PTS, data_shape=(1,)) == ("Signal", "Shots")
+
+
+def test_grid_factory_derives_axis_labels_from_the_facet():
+    """grid(value, facet=..., param_names=..., value_label=...) with no explicit labels derives the
+    figure-level x/y names through the ONE facet_axis_labels rule, threads them to the fig.text
+    slots AND the cell renderer (whose data_figure/focus_data read self.labels -- so the enlarged
+    view and the saved npz carry the same names).  An explicit ``labels=`` still wins."""
+    names = ["Bx", "By", "Bz"]
+    g = grid(BLOCK, sub_plot_kind="2d", facet="points:0", points_shape=PTS,
+             param_names=names, display=False)
+    try:
+        assert (g.labels[0], g.labels[1]) == ("Bz", "By")
+        assert g._xlabel_text.get_text() == "Bz" and g._ylabel_text.get_text() == "By"
+        assert tuple(g.cell_renderer.labels[:2]) == ("Bz", "By")   # focus/npz read the same labels
+    finally:
+        plt.close(g.fig)
+    explicit = grid(BLOCK, sub_plot_kind="2d", facet="points:0", points_shape=PTS,
+                    labels=("custom x", "custom y"), param_names=names, display=False)
+    try:
+        assert (explicit.labels[0], explicit.labels[1]) == ("custom x", "custom y")
+    finally:
+        plt.close(explicit.fig)
+    plt.close("all")
 
 
 # ------------------------------------------------------------------- live update: artists move
@@ -174,13 +227,13 @@ def test_line_grid_recipe_roundtrip():
 STRUCT = {"points_shape": (90,), "data_shape": (1,), "grid_shape": PTS, "core_ndim": 2, "per_signal": False}
 
 
-def _facet_card(params):
+def _facet_card(params, struct=STRUCT):
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
     ensure_qt_app()
     cfg = PanelConfig(kind="grid", row=0, col=0, size="2x2", inputs=["scan_y"],
                       source="value = signal", params=dict(params))
-    return PanelCard(cfg, structure_provider=lambda _name: dict(STRUCT))
+    return PanelCard(cfg, structure_provider=lambda _name: dict(struct))
 
 
 def test_console_facet_panel_builds_updates_and_stays_enlarged():
@@ -240,6 +293,34 @@ def test_console_facet_change_rebuilds_to_the_new_structure():
         plt.close("all")
 
 
+def test_console_facet_switch_relabels_the_figure_axes():
+    """End-to-end #6: a mot_field-style structure_provider (3-D scan with self-described
+    param_names) bound to a console grid panel -- the figure-level x/y axis labels FOLLOW the
+    facet pick through the SAME Setting path the operator uses (_on_facet_changed), because
+    _build_facet_plotter hands facet_axis_labels' derivation to the ONE grid factory."""
+    mot_struct = dict(STRUCT, param_names=["Bx", "By", "Bz"],
+                      points_coords=[list(np.linspace(-12, 12, n)) for n in PTS])
+    card = _facet_card({"facet": "points:2"}, struct=mot_struct)
+    try:
+        card._render(card._coerce(BLOCK), {})
+        p = card.plotter
+        assert (p._xlabel_text.get_text(), p._ylabel_text.get_text()) == ("By", "Bx")
+        index = next(i for i in range(card.facet_combo.count())
+                     if card.facet_combo.itemData(i) == "points:0")
+        card.facet_combo.setCurrentIndex(index)
+        card._on_facet_changed(index)          # the Setting path: persist + reset + rebuild
+        card._render(card._coerce(BLOCK), {})
+        p = card.plotter
+        assert (p._xlabel_text.get_text(), p._ylabel_text.get_text()) == ("Bz", "By")
+        # the Edit-tab snapshot shares the ONE builder -> same labels, no drift
+        snap = card._build_facet_plotter(card._coerce(BLOCK), interactions=True)
+        assert (snap._xlabel_text.get_text(), snap._ylabel_text.get_text()) == ("Bz", "By")
+        plt.close(snap.fig)
+    finally:
+        card.shutdown()
+        plt.close("all")
+
+
 # --------------------------------------------------------- the camera-frame rules (user round R)
 def test_camera_frame_facet_resolves_to_an_image_cell_per_repeat():
     """A camera block (repeat, 1, H, W) faceted on repeat leaves ONE 2-D frame per cell -> the auto
@@ -268,6 +349,9 @@ def _camera_console(repeat=4):
         _exposure, _roi = 3.0, (0, 24, 0, 20)
         exposure = property(lambda s: s._exposure)
         roi = property(lambda s: s._roi)
+        # the device contract's DERIVED (height, width) -- CameraMeasurement seeds its
+        # data_shape from it at BUILD time (ROI order: (x, width, y, height))
+        frame_shape = property(lambda s: (int(s._roi[3]), int(s._roi[1])))
 
         def configure(self, **kw):
             pass

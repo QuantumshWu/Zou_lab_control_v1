@@ -253,6 +253,44 @@ def test_2d_relim_toggle_remaps_colorbar_both_ways():
         card.shutdown()
 
 
+def test_negative_frame_keeps_the_operator_relim_mode():
+    """A frame containing NEGATIVE values (a background-subtracted judged image is the common
+    case) renders THAT frame tight -- the 0-anchor would hide the data -- but must NEVER rewrite
+    the plotter's ``relim_mode``: the mode is the OPERATOR's setting, shown in Setting and
+    persisted in the panel params, so a stray negative frame silently flipping it 'normal' ->
+    'tight' is a display-state self-drift (the sitemap hit it after its side band was routed
+    through the shared ``relim``).  The auto-switch is a PURE per-frame derivation, like
+    ``_mode_target``.  Pins all three relim families: 1D y-axis, 2D colour limit, sitemap band."""
+    from Zou_lab_control.frontend.live import panel_plot
+
+    # 1D: the y-axis family (update_core -> relim)
+    p1 = panel_plot(np.arange(10.0), np.zeros(10), kind="1d", relim_mode="normal")
+    p1.update(np.linspace(-5.0, 5.0, 10), draw=False)
+    assert p1.relim_mode == "normal"                  # the operator's mode is untouched
+    assert p1.ylim_min < -5.0                         # ... yet THIS frame brackets the negatives
+
+    # 2D: the colour-limit family (update_core -> _update_distribution_band -> relim)
+    xy = np.stack(np.meshgrid(np.arange(8.0), np.arange(8.0)), -1).reshape(-1, 2)
+    p2 = panel_plot(xy, np.zeros(len(xy)), kind="2d", relim_mode="normal")
+    p2.update(np.linspace(-50.0, 200.0, len(xy)), draw=False)
+    assert p2.relim_mode == "normal"
+    assert p2.ylim_min < -50.0
+
+    # sites: the sitemap's frame band shares the SAME relim path (the d16d93a unification)
+    frame = np.full((16, 16), 30.0)
+    frame[4:6, 4:6] = -20.0
+    centers = np.array([[4.0, 4.0], [10.0, 10.0]])
+    p3 = panel_plot(centers, np.array([1.0, 0.0]), kind="sites", image=frame,
+                    relim_mode="normal")
+    p3.update(np.array([0.0, 1.0]), draw=False)
+    assert p3.relim_mode == "normal"
+    assert p3.ylim_min < -20.0
+
+    import matplotlib.pyplot as plt
+    for p in (p1, p2, p3):
+        plt.close(p.fig)
+
+
 def test_panel_title_edit_goes_through_frontend_apply_title():
     """Setting's title edit must update the title via ``BaseLivePlot._apply_title``
     (which routes through ``style.apply_title`` and the design-token
