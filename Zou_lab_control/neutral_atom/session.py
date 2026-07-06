@@ -197,7 +197,12 @@ class NeutralAtomSession:
             try:
                 old_devices.close()
             except Exception:
-                pass
+                # A failed close (dead RPyC / camera handle -- common on real hardware) must be
+                # SURFACED, not silently swallowed: an un-closed device lingers on the hardware.
+                # Log it like every other teardown path here, never a bare ``pass``.
+                import logging
+                logging.getLogger(__name__).warning(
+                    "closing the previous device set after load_config failed", exc_info=True)
         return self
 
     def open_devices(self):
