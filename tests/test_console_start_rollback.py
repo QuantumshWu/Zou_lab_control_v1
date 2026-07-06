@@ -124,7 +124,7 @@ def test_injected_device_driver_obeys_the_same_exclusion():
 def test_reactive_processor_keeps_running_across_a_driver_start():
     from Zou_lab_control.neutral_atom.operations.logic import LogicNode, Processor
 
-    assert LogicNode._occupies == () and Processor._occupies == ()   # reads only hub signals (#6)
+    assert LogicNode._devices == {} and Processor._devices == {}     # reads only hub signals (#6)
 
     exp = na.connect("virtual")
     proc = _FakeInjected()                                   # occupies nothing -> never stopped

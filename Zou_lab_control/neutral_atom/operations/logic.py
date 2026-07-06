@@ -38,6 +38,7 @@ from pathlib import Path
 import numpy as np
 
 from Zou_lab_control._paths import CALIBRATION_DIR
+from ..devices.base import EXCLUSIVE, OBSERVE
 from ..core.analysis import grid_shape_tuple
 from ..core.signals import NO_LINEAGE, SignalHub
 from ..devices.base import CameraDevice
@@ -177,17 +178,20 @@ class LogicNode:
 
     layer = "node"
     node_label = "node"
-    # WHICH device attributes this node DRIVES (arms the camera / prepares+fires the streamer) --
-    # the node's OWN declaration, as ATTRIBUTE NAMES; the collection mechanics live once on the
-    # base (:meth:`occupied_devices`).  Holding a reference is NOT occupying: the passive
-    # CameraMeasurement records its ``sequencer`` but never drives it, so it declares only
-    # ``("camera",)``.  The console's mutual exclusion stops exactly the nodes whose occupied
-    # device INSTANCES intersect the new node's -- nodes on disjoint hardware coexist (the
-    # monitor camera's live view keeps running while the main camera's calibration starts).
-    # Declared on the NODE (not a GUI kind-string table) so a notebook-injected
-    # ``running_nodes=`` node obeys the SAME exclusion as a GUI row.  Empty for a reactive
-    # Processor (reads only hub signals).
-    _occupies: tuple = ()
+    # The node's device-ACCESS declaration: ``{attribute name: EXCLUSIVE | OBSERVE}``.
+    # EXCLUSIVE = the node DRIVES that hardware (arms the camera / prepares+fires the
+    # streamer): these instances are what the console's mutual exclusion intersects -- nodes
+    # on disjoint hardware coexist (the monitor camera's live view keeps running while the
+    # main camera's calibration starts).  OBSERVE = the node only READS state: the base's
+    # ``__setattr__`` narrows the assigned device to its read-only view
+    # (:func:`devices.base.read_only`), so the declaration IS the capability -- a later edit
+    # that tries to drive an observed device raises instead of silently fighting the
+    # exclusive owner.  Declared on the NODE (not a GUI kind-string table) so a
+    # notebook-injected ``running_nodes=`` node obeys the SAME rules as a GUI row.  Empty
+    # for a reactive Processor (reads only hub signals).  ``start()`` verifies every
+    # declared name is a real attribute, so a declaration can never silently point at
+    # nothing (the drift a private-name rename once caused).
+    _devices: dict = {}
     # UNIFORM measurement output contract (#H3n): an ACQUIRING node publishes its primary data block
     # with shape ``(repeat, *points_shape, *data_shape)`` -- ``points_shape`` is the swept parameter
     # space (a camera = ``(1,)``, a 1-D scan = ``(n_points,)``, a 2-D scan = ``(n0*n1,)``) and
@@ -300,6 +304,14 @@ class LogicNode:
         """Publish shots from a daemon thread at ``rate_hz`` until ``stop()``."""
         if self._thread is not None and self._thread.is_alive():
             return self
+        # The _devices declaration must point at REAL attributes: a declared name that does
+        # not exist (e.g. after a rename to a private name) would silently drop the device
+        # from the occupancy exclusion / the observe narrowing -- fail loud instead.
+        missing = [n for n in self._devices if not hasattr(self, n)]
+        if missing:
+            raise AttributeError(
+                f"{type(self).__name__}._devices declares {missing} but the attribute(s) do "
+                "not exist -- the declaration must name the node's real device attributes.")
         self.rate_hz = float(rate_hz)   # remembered so a paused node can resume at the same rate
         # Capture the run's provenance ONCE, at the moment this run begins -- the device base-state a
         # saved figure records.  Re-captured on every ``start()`` (a fresh run = a fresh base state),
@@ -355,14 +367,27 @@ class LogicNode:
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    def __setattr__(self, name, value):
+        # The one enforcement point of the OBSERVE capability: a device assigned to an
+        # attribute the class declared OBSERVE is stored as its read-only view, so the code
+        # that "only records" a device physically cannot drive it.  Everything else passes
+        # straight through (the ``_devices`` lookup is a class-dict read -- negligible).
+        if value is not None and self._devices.get(name) == OBSERVE:
+            from ..devices.base import ReadOnlyDevice, read_only
+            if not isinstance(value, ReadOnlyDevice):
+                value = read_only(value)
+        object.__setattr__(self, name, value)
+
     def occupied_devices(self) -> tuple:
-        """The hardware device INSTANCES this node drives while running -- resolved from the
-        node's ``_occupies`` attribute-name declaration, in ONE place (a declared name whose
-        attribute is missing or ``None`` simply contributes nothing, so a sequencer-less scan
-        or a saved-frames processor run occupies only what it really holds).  Two nodes
-        CONFLICT iff these sets intersect by identity; the console's mutual exclusion stops
-        exactly the conflicting nodes and leaves everyone on disjoint hardware running."""
-        return tuple(d for d in (getattr(self, name, None) for name in self._occupies)
+        """The hardware device INSTANCES this node DRIVES while running -- the ``EXCLUSIVE``
+        entries of the node's ``_devices`` declaration, resolved in ONE place (a declared
+        name whose attribute is ``None`` simply contributes nothing, so a sequencer-less
+        scan occupies only what it really holds; OBSERVE entries never occupy -- any number
+        of observers coexist with the one driver).  Two nodes CONFLICT iff these sets
+        intersect by identity; the console's mutual exclusion stops exactly the conflicting
+        nodes and leaves everyone on disjoint hardware running."""
+        return tuple(d for d in (getattr(self, name, None)
+                                 for name, mode in self._devices.items() if mode == EXCLUSIVE)
                      if d is not None)
 
     def _bare_published_signals(self) -> frozenset:
@@ -639,6 +664,13 @@ class Measurement(LogicNode):
 
     layer = "measurement"
     node_label = "measurement"
+
+    def _set_repeat_ring(self, repeat: int) -> None:
+        """The ONE (repeat -> ring depth) law: ``repeat`` 0 = INFINITE (roll a 1-deep ring
+        forever, a live view) / K = keep a K-deep block then stop.  Every measurement's ring
+        depth derives here -- camera and swept twins once retyped these two lines each."""
+        self.repeat = max(0, int(repeat))
+        self._ring = max(1, self.repeat)
     # The published key that carries the (repeat,*points_shape,*data_shape) CONTRACT block.  Each
     # concrete measurement sets it (camera -> "frame_0"; a scan -> its y_key) so the base can verify the
     # block shape at publish time and the output-contract test can find it generically.
@@ -823,7 +855,7 @@ class OccupancyProcessor(Processor):
         # ONE (H×W) frame; an empty pick falls back to ``frame_0``.
         expr = source_expr if isinstance(source_expr, SignalExpr) else SignalExpr.from_value(source_expr)
         if not expr.inputs:
-            expr = SignalExpr(["frame_0"], DEFAULT_SOURCE)
+            expr = SignalExpr([FRAME_0], DEFAULT_SOURCE)
         super().__init__(hub, consumes=tuple(expr.inputs), prefix=prefix)
         self.source_expr = expr
         self.calibration = calibration
@@ -862,8 +894,11 @@ class OccupancyProcessor(Processor):
         # The frame to judge = the source expression over the consumed signals (default
         # ``value = signal`` on one input IS that frame; an expression may combine several,
         # e.g. ``value = (signal[0] + signal[1]) / 2``).  The value must be ONE (H×W) frame.
+        # The namespace = this tick's COHERENT inputs + the shared helpers (hub_namespace layers
+        # np/numpy/math/history/... on the snapshot), so a processor source expression has the
+        # SAME capabilities SIGNAL_EXPR_HELP promises every source field (panel == node).
         try:
-            value = np.asarray(self.source_expr.evaluate(inputs), dtype=float)
+            value = np.asarray(self.source_expr.evaluate(hub_namespace(self.hub, inputs)), dtype=float)
         except Exception:
             return {}                                       # malformed expression -> no-op (don't wedge)
         # Normalize whatever the source expression yields to a (repeat, 1, H, W) BLOCK -- the camera's
@@ -1009,22 +1044,71 @@ class TaskOutput:
         return self._version
 
 
-class Task(LogicNode):
+class OneShotNode(LogicNode):
+    """A logic node whose action runs exactly ONCE, then the node self-stops.
+
+    The one-shot law lives HERE, not retyped per subclass (Task and ProcessorRun once
+    each carried their own copy and drifted on the stop semantics):
+
+    * ``_run_once()`` (the subclass body) executes with the stop event CLEAR, so the
+      run can poll ``self._stop`` (and hand it to ``camera.acquire``) as a cooperative
+      CANCEL -- pressing Stop interrupts a long acquisition mid-run.
+    * ``finished`` means "this one-shot has RUN ONCE and will not retry" -- success OR
+      failure terminates it -- so it and the stop event are BOTH set in ``finally``.
+      Keeping them together is what releases the console's lock on either outcome
+      (a body that raises would otherwise leave finished=False forever, finding 7);
+      the exception still propagates (finally does not swallow), so a headless
+      ``step()`` caller sees it, and failure is expressed by ``result`` staying empty.
+    * ``_publish_result()`` (success only -- an exception propagates past it) says what
+      the node hands the hub; the default publishes NOTHING.
+    """
+
+    def __init__(self, hub: SignalHub, *, prefix: str = ""):
+        super().__init__(hub, prefix=prefix)
+        self.finished = False
+        self.result: dict = {}
+
+    def _run_once(self) -> dict:  # pragma: no cover - abstract
+        """The node's single action; its dict return value becomes ``self.result``."""
+        raise NotImplementedError
+
+    def _publish_result(self) -> dict[str, object]:
+        """Hub signals to publish after a SUCCESSFUL run (default: nothing)."""
+        return {}
+
+    def shot(self) -> dict[str, object]:
+        try:
+            self.result = {str(key): value for key, value in dict(self._run_once()).items()}
+        finally:
+            self.finished = True
+            self._stop.set()
+        return self._publish_result()
+
+    def run_to_completion(self):
+        """Run the action once synchronously (tests / headless / notebook)."""
+        if not self.finished:
+            self.step()
+        return self
+
+
+class Task(OneShotNode):
     """A logic node that ORCHESTRATES devices/measurements/processors over a multi-step
     flow and may emit MID-RUN output to a dedicated panel (confocal-style).
 
-    One-shot: ``step()`` runs the whole ``run(out)`` flow once, then self-stops.  A
-    task publishes NOTHING to the hub: its result lives on ``self.result`` and its
-    heavy artifact (e.g. a calibration object, saved files) on the task instance,
-    while ``run`` writes intermediate frames/progress to its own :class:`TaskOutput`
-    buffer (``self.output``, NOT the hub) for the dedicated mid-run panel."""
+    One-shot (see :class:`OneShotNode`): ``step()`` runs the whole ``run(out)`` flow
+    once, then self-stops.  A task publishes NOTHING to the hub: its result lives on
+    ``self.result`` and its heavy artifact (e.g. a calibration object, saved files) on
+    the task instance, while ``run`` writes intermediate frames/progress to its own
+    :class:`TaskOutput` buffer (``self.output``, NOT the hub) for the dedicated
+    mid-run panel."""
 
     layer = "task"
     node_label = "task"
     # A task orchestrates the full shot flow (arm the camera, fire the sequencer) -- both
     # shipped tasks (calibrate readout, MOT-field optimize) drive both.  A future task that
-    # merely RECORDS a device without driving it overrides this (holding is not occupying).
-    _occupies = ("camera", "sequencer")
+    # merely RECORDS a device declares it OBSERVE instead (holding is not occupying, and
+    # the base then narrows it to the read-only view).
+    _devices = {"camera": EXCLUSIVE, "sequencer": EXCLUSIVE}
     provides: tuple[str, ...] = ()
     # Signals the task streams to its dedicated MID-RUN output panel (via TaskOutput)
     # while it runs -- listed here so the console maps that panel back to this task.
@@ -1032,8 +1116,6 @@ class Task(LogicNode):
 
     def __init__(self, hub: SignalHub, *, prefix: str = ""):
         super().__init__(hub, prefix=prefix)
-        self.finished = False
-        self.result: dict = {}
         # Mid-run output is a per-task BUFFER (NOT the hub) -- created up front so the
         # console can bind the task's dedicated panel to it before/while it runs.
         self.output = TaskOutput(prefix=self.prefix)
@@ -1041,30 +1123,11 @@ class Task(LogicNode):
     def run(self, out: "TaskOutput") -> dict:  # pragma: no cover - abstract
         raise NotImplementedError
 
-    def shot(self) -> dict[str, object]:
-        # One-shot: stop the loop AFTER this run (a run() that raises is NOT retried),
-        # exactly like a finite scan / processor.  ``finished`` means "this one-shot has
-        # RUN ONCE and will not retry" -- success OR failure terminates it -- so BOTH it
-        # and the stop event are set in ``finally``.  Keeping them together is what lets
-        # the console release its lock on either outcome (a run() that raises otherwise
-        # leaves finished=False forever -> dashboard locked, finding 7).  During the run
-        # the stop event stays clear and means "cancel": ``run`` can poll ``self._stop``
-        # (and pass it to ``camera.acquire``) to interrupt a long acquisition the moment
-        # Stop is pressed.  The exception still propagates (finally does not swallow), so a
-        # headless step() caller sees it; failure is expressed by ``result`` staying empty.
+    def _run_once(self) -> dict:
         # The result + mid-run output stay on the INSTANCE (self.result / self.output); a
-        # task publishes NOTHING to the hub -- the hub is measurements + processors only.
-        try:
-            self.result = {str(key): value for key, value in dict(self.run(self.output)).items()}
-        finally:
-            self.finished = True
-            self._stop.set()
-        return {}
-
-    def run_to_completion(self) -> "Task":
-        if not self.finished:
-            self.step()
-        return self
+        # task publishes NOTHING to the hub -- the hub is measurements + processors only
+        # (the base's default _publish_result already returns {}).
+        return self.run(self.output)
 
     def output_specs(self) -> tuple[SignalSpec, ...]:
         # A task publishes nothing to the hub (its result lives on the instance, its mid-run
@@ -1103,14 +1166,18 @@ class CalibrateReadoutTask(Task):
     DEFAULT_PULSE_TEMPLATE = "pulses/imaging_template.json"
 
     @classmethod
-    def _resolve_template(cls, pulse_template):
-        """Load the imaging template via the ONE shared resolver (the given path if real, else the
-        same-named file shipped under the project ``pulses/`` folder -- where the pulse GUI saves and
-        the Browse dialog opens, so the default ``pulses/imaging_template.json`` is a REAL inspectable
-        file -- else the in-memory long-short-long default)."""
-        from ..timing import default_imaging_template, resolve_pulse_template
-        return resolve_pulse_template(pulse_template, default_name=cls.DEFAULT_PULSE_TEMPLATE,
-                                      default_factory=default_imaging_template)
+    def _resolve_template(cls, pulse_template, sequencer=None):
+        """Load the imaging template via the ONE shared FIREABLE resolver (the given path if real,
+        else the same-named file shipped under the project ``pulses/`` folder -- where the pulse GUI
+        saves and the Browse dialog opens, so the default ``pulses/imaging_template.json`` is a REAL
+        inspectable file -- else the in-memory long-short-long default).  Fireable = the authoring
+        grid is snapped to the HARDWARE tick, read from the connected ``sequencer`` when given (the
+        cali run passes its own) -- an old save with a finer ``time_step_ns`` would otherwise fail
+        the clock-grid validation the moment the exposures are set.  The GUI slot preview passes no
+        sequencer and gets the streamer-config default grid, same as every other fire path."""
+        from ..timing import default_imaging_template, resolve_fireable_template
+        return resolve_fireable_template(pulse_template, default_name=cls.DEFAULT_PULSE_TEMPLATE,
+                                         default_factory=default_imaging_template, sequencer=sequencer)
 
     def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
         """What the calibration PRODUCES (off the hub) + streams mid-run -- keyed by the
@@ -1352,10 +1419,10 @@ class CalibrateReadoutTask(Task):
         INTERPRETATION of its template; it does NOT tell the camera how many frames to take (the
         camera captures one per trigger).  The cali images exactly the long-short-long the FILE
         defines -- it does not invent a bracket."""
-        from ..devices.camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS
-        # WHICH line gates a frame is the CAMERA's knowledge (it is wired to it), not the sequencer's.
-        trig = [c for c in (getattr(self.camera, "capture_trigger_channels", None) or DEFAULT_CAMERA_TRIGGER_CHANNELS)
-                if c in state.channels]
+        from ..devices.camera_trigger import resolve_camera_trigger_channels
+        # WHICH line gates a frame is the CAMERA's knowledge (it is wired to it), not the sequencer's
+        # -- resolved through the one camera->channels rule (never a re-spelled fallback).
+        trig = [c for c in resolve_camera_trigger_channels(self.camera) if c in state.channels]
         bits = [state.channels.index(c) for c in trig]
         frame_periods = [i for i, p in enumerate(state.periods) if any(p.states[b] for b in bits)]
         if len(frame_periods) < 2:
@@ -1381,7 +1448,7 @@ class CalibrateReadoutTask(Task):
         # BY NAME -- api slot a1 = the long reference frame(s), a2 = the short readout -- so
         # editing reference_exposure/readout_exposure changes those durations and NOTHING else.
         # What is fired == the template the operator chose: file == fired.
-        template = self._resolve_template(self.pulse_template)
+        template = self._resolve_template(self.pulse_template, self.sequencer)
         try:
             # Each exposure cell carries its OWN api handle (names are unique, like the GUI
             # allocates a fresh a<N> per click): a1 = first long, a2 = short readout, a3 =
@@ -1397,9 +1464,8 @@ class CalibrateReadoutTask(Task):
         readout_index = self._imaging_layout(template)        # WHICH frame is the short readout (a2)
         self._readout_index = readout_index                    # shared with _save_live_frames
         bracket = template.to_sequence(name="reference_bracket")
-        from ..devices.camera_trigger import count_trigger_pulses
-        cam_trig = getattr(self.camera, "capture_trigger_channels", None)
-        n_frames = max(1, count_trigger_pulses(bracket, **({"trigger_channels": cam_trig} if cam_trig else {})))
+        from ..devices.camera_trigger import count_camera_trigger_pulses
+        n_frames = max(1, count_camera_trigger_pulses(self.camera, bracket))
         n_groups = max(2, int(self.threshold_frames))
         reference_groups: list = []
         readout_per_group: list = []
@@ -1557,6 +1623,11 @@ def camera_frame_keys(frames_per_cycle, prefix=""):
     return [f"{prefix}frame_{i}" for i in range(n)]
 
 
+#: The camera's FIRST emCCD event signal -- the default frame every consumer binds.  Derived
+#: from :func:`camera_frame_keys` so the name has exactly one spelling in the project.
+FRAME_0 = camera_frame_keys(1)[0]
+
+
 class CameraMeasurement(Measurement):
     """Stream RAW camera frames into the hub, no site analysis.  The data SOURCE is
     the camera itself, so the editable acquisition parameters ARE the camera's own
@@ -1582,10 +1653,11 @@ class CameraMeasurement(Measurement):
     drives or reads it."""
 
     node_label = "camera"
-    # Drives ONLY its sensor: the node arms the camera (exclusive acquire lock) but never
-    # prepares/fires the streamer -- ``sequencer`` is a passive record (see class docstring),
-    # so a camera view and a sequencer-driving scan on DIFFERENT sensors coexist.
-    _occupies = ("camera",)
+    # Drives ONLY its sensor: the node arms the camera (exclusive acquire lock).  The
+    # sequencer is OBSERVE -- a passive record (see class docstring) that the base narrows
+    # to its read-only view, so this node PHYSICALLY cannot prepare/fire it: a camera view
+    # and a sequencer-driving scan on DIFFERENT sensors coexist, machine-enforced.
+    _devices = {"camera": EXCLUSIVE, "sequencer": OBSERVE}
 
     def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
                  frames_per_cycle: int = 1, prefix: str = "", repeat: int = 0):
@@ -1604,7 +1676,7 @@ class CameraMeasurement(Measurement):
         self.sequencer = sequencer
         self.frames_per_cycle = max(1, int(frames_per_cycle))
         self.points_shape: tuple = (1,)                  # one frame = one data point (no swept param)
-        self.primary_signal = "frame_0"                  # event 0's (repeat,1,H,W) block (#H3r-F4)
+        self.primary_signal = FRAME_0                    # event 0's (repeat,1,H,W) block (#H3r-F4)
         # Declare (H, W) at BUILD time from the camera's own contract (``frame_shape`` = ROI else full
         # sensor): the node's structure must be TRUE the moment it is built, not after the first frame
         # -- a restarted measurement whose trigger is not firing yet (e.g. right after a calibration
@@ -1621,8 +1693,7 @@ class CameraMeasurement(Measurement):
         showing the latest frame).  ONE knob, 0 = infinite -- there is NO separate free-run toggle:
         repeat=K fills a K-deep block once and stops; repeat=0 rolls a 1-deep ring forever.  Resets
         the (partly filled) block."""
-        self.repeat = max(0, int(repeat))
-        self._ring = max(1, self.repeat)                 # block depth: K for finite, 1 for the rolling live view
+        self._set_repeat_ring(repeat)                    # block depth: K for finite, 1 for the rolling live view
         self._rings = None
         self._filled = 0
 
@@ -1664,6 +1735,7 @@ class CameraMeasurement(Measurement):
                            for _ in range(n)]            # ONE repeat block per emCCD event of the cycle
             self._filled = 0
         out: dict[str, object] = {}
+        keys = camera_frame_keys(n)                      # the single source of the per-event names
         for i, fi in enumerate(frames):                  # fill EACH event's own ring, publish its block
             if self.repeat <= 0:                         # ∞: roll the newest in at the end (live monitor)
                 self._rings[i] = np.roll(self._rings[i], -1, axis=0)
@@ -1672,7 +1744,7 @@ class CameraMeasurement(Measurement):
                 self._rings[i][min(self._filled, self._ring - 1), 0] = fi
             # ``frame_i`` IS event i's (repeat, 1, H, W) block (NaN = not-yet-taken) -- a panel reduces
             # its repeat axis (average = long exposure of THAT emCCD event).  No lumped ``frame``.
-            out[f"frame_{i}"] = self._rings[i].copy()
+            out[keys[i]] = self._rings[i].copy()
         self._filled = (self._filled + 1) if self.repeat <= 0 else min(self._filled + 1, self.repeat)
         if self.finished:                                # take exactly K cycles, then stop
             self._stop.set()
@@ -1771,12 +1843,24 @@ class _SweptBlockMeasurement(Measurement):
     :class:`PulseScanNode`) can drift the contract: the law lives on the common ancestor, not retyped
     per node."""
 
+    @property
+    def x_signal(self) -> str:
+        """Full hub name of the swept x axis -- ALWAYS ``prefix + x_key``, derived live so it can
+        never drift from the prefix the node runs under (a stored copy once did)."""
+        return self.prefix + self.x_key
+
+    @property
+    def y_signal(self) -> str:
+        """Full hub name of the swept y block -- ALWAYS ``prefix + y_key`` (see ``x_signal``)."""
+        return self.prefix + self.y_key
+
     def _init_swept_block(self, *, values, data_shape: tuple, repeat: int) -> None:
         """Set up the swept x values + the pre-allocated RAW block.  ``repeat`` (0 = ∞) fixes the ring
         depth; ``data_shape`` is the per-point data (``(n_series,)`` for a reducer curve, ``(1,)`` for
-        a scalar)."""
-        self.repeat = max(0, int(repeat))
-        self._ring = max(1, self.repeat)              # block depth: K passes for finite, 1 (rolling) for ∞
+        a scalar).  Requires ``x_key``/``y_key`` already set: the node's short label derives here
+        (the instance prefix stem, else the y key) so neither twin retypes the fallback."""
+        self.node_label = str(self.prefix).rstrip("_") or str(self.y_key)
+        self._set_repeat_ring(repeat)                 # block depth: K passes for finite, 1 (rolling) for INF
         self._index = 0                               # within-pass point index (0..n_points-1)
         self._pass = 0                                # 0-based pass currently being filled
         self._values = np.asarray(values, dtype=float).reshape(-1)
@@ -1903,9 +1987,6 @@ class ScannedMeasurementNode(_SweptBlockMeasurement):
             pass
         self.x_key = str(x_key)
         self.y_key = str(y_key)
-        self.node_label = str(prefix).rstrip("_") or str(y_key)
-        self.x_signal = self.prefix + self.x_key
-        self.y_signal = self.prefix + self.y_key
         # The swept-block contract (ring depth, RAW (repeat, n_points, dim) buffer, progress
         # properties, finite-scan stop) is owned by _SweptBlockMeasurement; we supply the swept x
         # values (the measurement's axis = the single source of truth) and the per-point data width
@@ -1995,9 +2076,8 @@ class PulseScanNode(_SweptBlockMeasurement):
 
     # Runs the full shot orchestration per point (arm its camera, fire its sequencer, read
     # back) and holds both as top-level attributes -- the base collection reads them here.
-    _occupies = ("camera", "sequencer")
+    _devices = {"camera": EXCLUSIVE, "sequencer": EXCLUSIVE}
 
-    node_label = "pulse_scan"
     #: How long (s) to wait for the subscribed y signals to refresh for THIS point before
     #: reading them anyway (so a mis-wired y never wedges the scan; a real consumer ticks well
     #: under this).
@@ -2038,9 +2118,6 @@ class PulseScanNode(_SweptBlockMeasurement):
         # Optional (n0, n1) grid shape for a 2-D scan: a 2-D panel reduces the raw y block's repeat
         # axis then reshapes the (points,) curve into this map (the node itself never reshapes).
         self.scan_shape = getattr(plan, "scan_shape", None)
-        self.node_label = str(prefix).rstrip("_") or str(y_key)
-        self.x_signal = self.prefix + self.x_key
-        self.y_signal = self.prefix + self.y_key
         # The x dimension is the hardware scan slots if any, else the software api sweep; the base
         # pre-allocates the RAW (repeat, n_points, 1) NaN block + ring/progress state from it (a stable
         # x axis from shot 1).  One scalar per point (data_shape=(1,)); a 2-D scan flattens its n0*n1
@@ -2135,7 +2212,8 @@ class PulseScanNode(_SweptBlockMeasurement):
         # frame publish (with sid) must precede the consumer recompute (_await_y_inputs) so it inherits sid
         # before _read_y -- a reorder would break lineage coherence (#shot-clock).
         sid = self.hub.next_source_shot()
-        frame_pub = {f"frame_{k}": np.asarray(f, dtype=float) for k, f in enumerate(frames)}
+        frame_pub = {key: np.asarray(f, dtype=float)
+                     for key, f in zip(camera_frame_keys(len(frames)), frames)}
         self.hub.publish(frame_pub, provenance=sid)
         self._current_source_shot = sid                  # the y-block (base step()) carries the same id
         # 2) make the y signals FRESH for this frame, then 3) read y from the source expression.
@@ -2208,11 +2286,11 @@ class PulseScanNode(_SweptBlockMeasurement):
             return float("nan")
 
 
-class ProcessorRun(LogicNode):
-    """One-shot DATA-PROCESSING logic node: runs a :class:`ProcessorSpec` ONCE,
-    publishes its result dict to the hub, and self-stops -- the discrete sibling of
-    :class:`ScannedMeasurementNode` (a finite scan).  It DRIVES the spec's
-    ``run(ctx)`` and owns no analysis itself.
+class ProcessorRun(OneShotNode):
+    """One-shot DATA-PROCESSING logic node (see :class:`OneShotNode`): runs a
+    :class:`ProcessorSpec` ONCE, publishes its result dict to the hub, and self-stops --
+    the discrete sibling of :class:`ScannedMeasurementNode` (a finite scan).  It DRIVES
+    the spec's ``run(ctx)`` and owns no analysis itself.
 
     The cooperative-stop event is shared with the run via the context, so a long
     camera grab inside ``run`` cancels cleanly on ``stop()`` (the SOLE-camera-owner
@@ -2220,7 +2298,7 @@ class ProcessorRun(LogicNode):
 
     # One-shot over live-grabbed frames: drives the camera (and fires the sequencer when
     # one is bound); a saved-frames run holds None for both -> occupies nothing.
-    _occupies = ("camera", "sequencer")
+    _devices = {"camera": EXCLUSIVE, "sequencer": EXCLUSIVE}
 
     layer = "processor"
     node_label = "processor"
@@ -2231,41 +2309,27 @@ class ProcessorRun(LogicNode):
         self.spec = spec
         self.node_label = getattr(spec, "name", "processor")
         self._readout = readout
-        self._camera = camera
-        self._sequencer = sequencer
+        self.camera = camera
+        self.sequencer = sequencer
         self._params = dict(params or {})
-        self.finished = False
-        self.result: dict = {}
 
-    def shot(self) -> dict[str, object]:
+    def _run_once(self) -> dict:
         from .processor import ProcessorContext
 
-        # One-shot: stop the loop after THIS publish no matter what.  Setting the
-        # stop up front means a run() that raises is NOT retried -- a deterministic
-        # processing action runs once.  ``finished`` means "this one-shot has RUN ONCE"
-        # (success OR failure), so it is set in ``finally`` alongside the stop event --
-        # otherwise a spec.run() that raises leaves finished=False forever (mirrors the
-        # Task fix, finding 7).  The publish below runs only on success (after run returns).
-        self._stop.set()
+        # The base keeps the stop event CLEAR during the run and hands it to the context,
+        # so a long camera grab inside ``spec.run`` cancels cleanly the moment Stop is
+        # pressed (setting it up front, as this node once did, would make any run that
+        # polls the stop cancel itself instantly).
         ctx = ProcessorContext(
             readout=self._readout, params=self._params,
-            camera=self._camera, sequencer=self._sequencer, stop=self._stop)
-        try:
-            result = self.spec.run(ctx)
-        finally:
-            self.finished = True
-        self.result = {str(key): value for key, value in dict(result).items()}
+            camera=self.camera, sequencer=self.sequencer, stop=self._stop)
+        return self.spec.run(ctx)
+
+    def _publish_result(self) -> dict[str, object]:
         out = dict(self.result)
         out["processor_done"] = 1.0
         self._current_source_shot = self.hub.next_source_shot()   # one SOURCE-shot for this discrete result (#shot-clock)
         return self._assert_declared(out, tuple(self.spec.result_keys) + ("processor_done",))
-
-    def run_to_completion(self) -> "ProcessorRun":
-        """Run the action once synchronously and publish its result (test/headless)."""
-
-        if not self.finished:
-            self.step()
-        return self
 
     def _bare_published_signals(self) -> frozenset:
         return frozenset(tuple(self.spec.result_keys) + ("processor_done",))
@@ -2273,6 +2337,8 @@ class ProcessorRun(LogicNode):
 
 __all__ = [
     "describe_shape",
+    "FRAME_0",
+    "OneShotNode",
     "grid_for_points",
     "SignalSpec",
     "CalibrateReadoutTask",

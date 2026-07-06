@@ -92,7 +92,8 @@ def test_logic_node_source_picker_groups_by_producer_with_human_labels_and_bare_
     one producer GROUP, each leaf shown by its HUMAN label (never the raw ``judge_occupancy_rate`` key,
     #H3w-4) but carrying the BARE signal name as its bind data.  Asserted on the single-source grouping
     (`signal_tree_groups`) the widget is built from, + that the panel reads a pick back by bare name."""
-    from Zou_lab_control.frontend.task_console import (MeasurementPanel, signal_tree_groups, read_editable_combo)
+    from Zou_lab_control.frontend.task_console import MeasurementPanel
+    from Zou_lab_control.frontend.param_widgets import signal_tree_groups, read_editable_combo
     from Zou_lab_control.neutral_atom.operations.measurement import ParamDecl
     from Zou_lab_control.frontend.qt_fluent import FluentTreeComboBox
 
@@ -159,7 +160,7 @@ def test_signal_picker_can_select_a_declared_not_yet_published_signal():
     """A signal a node DECLARES but has not published yet (waiting) is still listed in the tree -- via
     the providers -- and reads back by its bare name, so you can wire a panel to a node before it runs
     (no 'must publish first' dead-end).  Read via ``read_editable_combo`` (the tree's documented path)."""
-    from Zou_lab_control.frontend.task_console import signal_tree_groups, read_editable_combo
+    from Zou_lab_control.frontend.param_widgets import signal_tree_groups, read_editable_combo
     from Zou_lab_control.frontend.qt_fluent import FluentTreeComboBox, ensure_qt_app
     ensure_qt_app()
     # 'rate' is declared (in names) but waiting (no live format) -- it must still be pickable
@@ -177,7 +178,7 @@ def test_empty_signal_pick_never_reads_back_a_group_header():
     """With signals present, no leading none-row and an empty current, the picker must NOT land on
     a disabled producer HEADER (whose label would otherwise read back as if it were a chosen
     signal); an empty pick reads back as ''."""
-    from Zou_lab_control.frontend.task_console import fill_grouped_signal_combo, read_editable_combo
+    from Zou_lab_control.frontend.param_widgets import fill_grouped_signal_combo, read_editable_combo
     from Zou_lab_control.frontend.qt_fluent import FluentComboBox
 
     combo = FluentComboBox()
@@ -207,15 +208,18 @@ def test_plot_panel_has_floating_expression_editor():
 def test_logic_tab_shows_short_signal_names():
     """``_live_node_formats`` strips the node's disambiguating prefix so the Logic row legend
     shows "rate"/"occupied", never "judge_occupancy_rate"; the meaning still resolves because
-    output_specs are keyed by the short name."""
+    output_specs are keyed by the FULL published name (the base class's prefix-join contract:
+    published_signals and output_specs carry the SAME hub names), so the legend looks the
+    description up by the full name and shortens only the displayed label."""
     from Zou_lab_control.frontend.task_console import TaskConsole
 
     node = SimpleNamespace(
         layer="processor",
         prefix="judge_occupancy_",
         published_signals=lambda: ["judge_occupancy_rate", "judge_occupancy_occupied"],
-        output_specs=lambda: [SimpleNamespace(name="rate", description="cumulative loading"),
-                              SimpleNamespace(name="occupied", description="per-site occupancy")])
+        output_specs=lambda: [
+            SimpleNamespace(name="judge_occupancy_rate", description="cumulative loading"),
+            SimpleNamespace(name="judge_occupancy_occupied", description="per-site occupancy")])
     stub = SimpleNamespace(hub=SimpleNamespace(latest=lambda name: None))
     rows = TaskConsole._live_node_formats(stub, node)
     names = [r[0] for r in rows]

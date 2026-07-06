@@ -1,15 +1,21 @@
-"""Contract: mutual exclusion is DEVICE OCCUPANCY, not a global "one driver at a time".
+"""Contract: mutual exclusion is DEVICE OCCUPANCY, and access is DECLARATION-AS-CAPABILITY.
 
-Each logic node declares the hardware instances it DRIVES (``LogicNode.occupied_devices``,
-from its ``_occupies`` attribute names); starting a node stops exactly the running nodes
-whose occupied devices intersect the new node's -- nodes on disjoint hardware coexist.
+Each logic node declares its devices with an access mode (``LogicNode._devices``:
+attribute name -> EXCLUSIVE | OBSERVE).  Starting a node stops exactly the running nodes
+whose EXCLUSIVE devices intersect the new node's -- nodes on disjoint hardware coexist.
+The declaration is machine-enforced, not documentation:
 
-* The monitor camera's live view keeps running while the MAIN camera's measurement or
-  calibration task starts (the user's case: nothing they use overlaps).
-* Two rows driving the SAME sensor still exclude each other (a camera cannot be armed twice).
-* Holding a reference is not occupying: the passive CameraMeasurement records its
-  ``sequencer`` but declares only ``("camera",)``, so it coexists with a sequencer driver
-  on a different sensor.
+* EXCLUSIVE -- the node DRIVES the hardware; the attribute is the raw device and is what
+  the console's mutual exclusion intersects (``occupied_devices``).
+* OBSERVE -- the node only READS state; the base narrows the attribute to the device's
+  ``ReadOnlyDevice`` view (its class's ``OBSERVE_API`` whitelist), so a later edit that
+  tries to drive an observed device raises ``PermissionError`` instead of racing the owner.
+* A declared name that is not a real attribute fails loud at ``start()`` (a silent rename
+  once dropped a device from the exclusion).
+
+User-visible law: the monitor camera's live view keeps running while the MAIN camera's
+measurement or calibration task starts; two rows driving the SAME sensor still exclude
+each other (a camera cannot be armed twice).
 """
 
 from __future__ import annotations
@@ -88,16 +94,100 @@ def test_calibration_task_stops_only_the_conflicting_camera():
         exp.close()
 
 
-def test_passive_camera_records_but_does_not_occupy_the_sequencer():
-    """Holding is not occupying: the passive CameraMeasurement carries ``sequencer`` as a
-    record (it never prepares/fires), so its claim is the sensor alone."""
+def test_observe_declaration_narrows_to_a_read_only_view():
+    """Declaration-as-capability: CameraMeasurement declares ``sequencer`` OBSERVE, so the
+    attribute IS the read-only view -- whitelisted reads pass through, driving or mutating
+    raises PermissionError -- while the EXCLUSIVE ``camera`` stays the raw device (the node
+    must drive it) and is the node's sole occupancy claim."""
+    import pytest
+
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.devices.base import ReadOnlyDevice
     from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
 
     exp = na.connect("virtual")
     try:
         node = CameraMeasurement(SignalHub(), exp.devices.camera, sequencer=exp.devices.sequencer)
-        assert node.sequencer is exp.devices.sequencer           # the record is there...
-        assert set(node.occupied_devices()) == {exp.devices.camera}   # ...but not claimed
+        assert isinstance(node.sequencer, ReadOnlyDevice)             # narrowed, not the raw device
+        assert node.sequencer.firing == exp.devices.sequencer.firing  # whitelisted read passes through
+        with pytest.raises(PermissionError):
+            node.sequencer.fire()                                     # driving an observed device
+        with pytest.raises(PermissionError):
+            node.sequencer.sleep_scale = 0.0                          # mutating an observed device
+        assert node.camera is exp.devices.camera                      # EXCLUSIVE = the raw device...
+        assert set(node.occupied_devices()) == {exp.devices.camera}   # ...and the only claim
     finally:
+        exp.close()
+
+
+def test_devices_declaration_must_name_real_attributes():
+    """Fail loud at start(): a declared name with no matching attribute would silently drop
+    the device from the exclusion / the observe narrowing (the drift a private-name rename
+    once caused)."""
+    import pytest
+
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.devices.base import EXCLUSIVE
+    from Zou_lab_control.neutral_atom.operations.logic import LogicNode
+
+    class GhostNode(LogicNode):
+        _devices = {"ghost": EXCLUSIVE}
+
+        def shot(self):
+            return {}
+
+    node = GhostNode(SignalHub())
+    with pytest.raises(AttributeError, match="ghost"):
+        node.start()
+
+
+def test_saved_dir_one_shot_neither_borrows_devices_nor_stops_live_nodes():
+    """A one-shot processor gets hardware ONLY for the ctx roles its SPEC declares
+    (``ProcessorSpec.devices``).  'Readout fidelity' reads a saved folder and declares none,
+    so the console hands it None for camera AND sequencer: it occupies nothing, and starting
+    it leaves an unrelated live camera view running (a pure folder characterization must
+    never stop the live stream)."""
+    exp = na.connect("virtual")
+    con = make_console(exp)
+    try:
+        _, cam = _start_camera_row(con)
+        row = add_logic_row(con, ("processor", "Readout fidelity"))
+        built = con._build_logic_node(row.node, dict(row.node.values))
+        assert built.camera is None and built.sequencer is None   # spec declares no ctx roles
+        assert set(built.occupied_devices()) == set()             # -> claims no hardware
+        con._start_logic_node(row)                                # the REAL Start path
+        assert cam.running and cam in con.running_nodes           # the live view survived
+        con._stop_logic_node(row)
+    finally:
+        con.shutdown()
+        exp.close()
+
+
+def test_hardware_declaring_one_shot_borrows_only_drivable_devices():
+    """A one-shot spec that DOES declare ctx roles receives the running nodes' device
+    instances -- but only DRIVABLE ones: a running CameraMeasurement records its sequencer
+    as an OBSERVE read-only proxy, which a ProcessorRun (EXCLUSIVE driver) must never be
+    handed (the first prepare/fire would PermissionError).  The read-only record is skipped,
+    never unwrapped."""
+    from Zou_lab_control.frontend.task_console import LogicNodeConfig
+    from Zou_lab_control.neutral_atom.devices.base import ReadOnlyDevice
+    from Zou_lab_control.neutral_atom.operations.processor import ProcessorSpec
+
+    exp = na.connect("virtual")
+    con = make_console(exp)
+    try:
+        _, cam = _start_camera_row(con)
+        assert isinstance(cam.sequencer, ReadOnlyDevice)          # the OBSERVE record (precondition)
+        live_spec = ProcessorSpec(name="Live grab probe", params=(), run=lambda ctx: {"ok": 1.0},
+                                  result_keys=("ok",), devices=("camera", "sequencer"))
+        con.processors.append(live_spec)
+        row = con._add_logic_node(LogicNodeConfig(kind="processor", name="Live grab probe"),
+                                  focus=False)
+        built = con._build_logic_node(row.node, {})
+        assert built.camera is exp.devices["camera"]              # declared role -> the drivable instance
+        assert built.sequencer is None                            # the read-only proxy was skipped,
+        assert not isinstance(built.sequencer, ReadOnlyDevice)    # never passed through
+        assert set(built.occupied_devices()) == {exp.devices["camera"]}   # honest claim = what it holds
+    finally:
+        con.shutdown()
         exp.close()
