@@ -729,10 +729,25 @@ class _TriggerWiredCamera(CameraDevice):
         firing = None if wire is None else wire.firing
         if firing is None:
             return False
-        frames = self._render_frames(firing, 1)
+        # EDGE-FAITHFUL in whole cycles: a continuous firing delivers its trigger train one BASE
+        # CYCLE at a time, so render the cycle's WHOLE block -- the same block path a finite fire
+        # takes (_on_wire_fired) and the one place the per-window physics lives (image_frames: a
+        # long-short-long bracket is ONE loading imaged through its 3 windows at 3 exposures).
+        # Rendering frame-by-frame here is what LOST the window phase (every grab re-parsed the
+        # sequence from window 0, so a live 3-window bracket came out as 3 identical long frames
+        # from 3 independent loadings).  read_frames drains the delivered block at the consumer's
+        # own cadence, so a frames_per_cycle=N reader stays phase-aligned window-for-window.  A
+        # firing whose base cycle carries no edge on THIS camera's line falls back to one frame
+        # per grab (the MOT monitor's sequence-driven sensing; the atom camera's image_frames
+        # gates that case to [] itself and the read stays frozen).
+        trig = getattr(self, "capture_trigger_channels", None)
+        cycle = base_cycle_trigger_pulses(firing, **({"trigger_channels": trig} if trig else {}))
+        frames = self._render_frames(firing, max(1, cycle))
         if not frames:
             return False            # the firing pulse carries no camera trigger -> dark
         self._deliver(frames)
+        # One pace per CYCLE (the block IS one cycle): the previous per-frame pace slept a full
+        # cycle for every frame, so a 3-window live bracket ran 3x slower than the pulse it rode.
         self._pace(firing, stop)
         return True
 

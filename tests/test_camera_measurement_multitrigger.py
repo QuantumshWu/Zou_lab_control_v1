@@ -82,6 +82,37 @@ def test_long_short_long_imaging_bracket_shows_distinct_per_window_exposures():
         exp.close()
 
 
+def test_live_camera_measurement_shows_the_bracket_exposures_window_for_window():
+    """The LIVE console path -- ``CameraMeasurement(frames_per_cycle=3).shot()`` over a continuously
+    firing long-short-long bracket -- must show each emCCD window at ITS OWN exposure, exactly like
+    the finite block path a calibration takes.
+
+    Regression (the second half of the '看不到 long-short-long exposure' bug): the sibling test below
+    pins ``image_frames`` called DIRECTLY with the whole block, but the live path reaches it through
+    ``camera.acquire`` -> ``_grab``, which rendered ONE frame per grab -- every grab re-parsed the
+    firing from window 0, so all three live frames came out at the long exposure (and each was a
+    fresh loading: the bracket physics was lost too).  ``_grab`` now renders one whole BASE CYCLE
+    per grab (the same block path), so the consumer stays phase-aligned window-for-window.  This
+    test pins the REAL call side (shot() -> acquire), not the mechanism layer."""
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+
+    exp = na.connect("virtual")
+    try:
+        seqr = exp.devices.sequencer
+        seq = PulseTableState.load(str(REPO_ROOT / "pulses" / "imaging_template.json")).to_sequence().forever()
+        seqr.prepare(seq)
+        seqr.fire()                                   # the pulse GUI's "On Pulse"
+        node = CameraMeasurement(SignalHub(), exp.devices.camera, sequencer=seqr, frames_per_cycle=3)
+        for _ in range(2):                            # TWO cycles: brightness AND phase stability
+            out = node.shot()
+            assert set(out) == {"frame_0", "frame_1", "frame_2"}
+            bright = [float(np.nanmean(np.asarray(out[f"frame_{i}"])[-1, 0])) for i in range(3)]
+            # long, SHORT, long -- window 1 dimmer than both long windows, every cycle.
+            assert bright[1] < bright[0] and bright[1] < bright[2], bright
+    finally:
+        exp.close()
+
+
 def test_camera_frame_keys_is_the_single_source_for_published_and_declared_names():
     """The console's declared-signal picker (a not-yet-started camera row) and the running camera's
     ``published_signals`` must offer the EXACT same ``frame_i`` set -- so a 'waiting' name in the picker
