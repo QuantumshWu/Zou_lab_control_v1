@@ -1169,6 +1169,12 @@ class CalibrateReadoutTask(Task):
     provides = ("centers", "thresholds", "n_sites")
     mid_run = ("frame", "progress", "stage")   # streamed to the dedicated mid-run panel + banner
 
+    # The imaging bracket's three exposure cells, tagged by API slot -- the ONE source for the
+    # role<->slot-name convention.  BOTH the exposure WRITER (_collect_bracket_groups sets each cell
+    # by name) and the short-readout-frame FINDER (_imaging_layout) read it, so renaming a slot can
+    # never desync the two sides (was: "a1"/"a2"/"a3" hand-typed on both sides + in the error text).
+    _EXPOSURE_SLOTS = {"reference_1": "a1", "readout": "a2", "reference_2": "a3"}
+
     # The imaging pulse TEMPLATE the cali loads -- a REAL, inspectable program that IS the
     # long-short-long bracket (3 emCCD frames in one cooling cycle), not a single window the
     # task secretly unrolls.  A bare name resolves to the shipped ``pulses/`` template; an
@@ -1448,7 +1454,8 @@ class CalibrateReadoutTask(Task):
                 "the imaging template must trigger the camera at least twice (>=1 long reference "
                 "frame + 1 short readout) -- a long-short-long bracket. Open the template in the "
                 "pulse GUI and add the camera-trigger frames.")
-        a2 = {int(s.target) for s in state.api_slots if s.name == "a2" and s.kind == "duration"}
+        readout_slot = self._EXPOSURE_SLOTS["readout"]
+        a2 = {int(s.target) for s in state.api_slots if s.name == readout_slot and s.kind == "duration"}
         return next((frame_periods.index(i) for i in frame_periods if i in a2), len(frame_periods) // 2)
 
     def _collect_bracket_groups(self, out: "TaskOutput", *, progress_lo: float, progress_hi: float):
@@ -1471,9 +1478,9 @@ class CalibrateReadoutTask(Task):
             # Each exposure cell carries its OWN api handle (names are unique, like the GUI
             # allocates a fresh a<N> per click): a1 = first long, a2 = short readout, a3 =
             # second long.  Cali sets all three by name; structure stays as loaded.
-            template.set_api("a1", self.reference_exposure)
-            template.set_api("a2", self.readout_exposure)
-            template.set_api("a3", self.reference_exposure)
+            template.set_api(self._EXPOSURE_SLOTS["reference_1"], self.reference_exposure)
+            template.set_api(self._EXPOSURE_SLOTS["readout"], self.readout_exposure)
+            template.set_api(self._EXPOSURE_SLOTS["reference_2"], self.reference_exposure)
         except ValueError as exc:
             raise ValueError(
                 f"{exc}  The Calibrate task sets the imaging template's exposures by API slot: tag "
