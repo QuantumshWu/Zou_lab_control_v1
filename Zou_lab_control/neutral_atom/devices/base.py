@@ -8,12 +8,36 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import deque
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
 
 import numpy as np
 
 from ..core.analysis import positive_float, positive_int
 from .camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS
+
+
+@dataclass(frozen=True)
+class RuntimeControl:
+    """ONE live, tunable-at-runtime device attribute (see :meth:`BaseDevice.runtime_controls`).
+
+    ``decl`` is the :class:`~..core.params.ParamDecl` the shared ``PARAM_WIDGETS`` registry
+    builds the control widget from (so a runtime control renders / validates through the
+    exact same typed-widget path as a config form -- never an ``eval`` of free text).
+    ``getter`` reads the live value off the device (``(device) -> value``); it is polled to
+    show the current value.  ``setter`` writes an edited value back (``(device, value) ->
+    None``) with the value validated in the DEVICE'S OWN setter, or is ``None`` for a
+    read-only read-back (the panel disables the control's editor)."""
+
+    decl: Any                                        # a core.params.ParamDecl
+    getter: Callable[[Any], Any]
+    setter: Optional[Callable[[Any, Any], None]] = None
+
+    @property
+    def writable(self) -> bool:
+        """True when this control can be WRITTEN (has a setter) -- the read-only-vs-editable
+        fact a panel reads once, instead of re-testing ``setter is None`` at each call site."""
+        return self.setter is not None
 
 
 class AcquisitionCancelled(Exception):
@@ -85,6 +109,23 @@ class BaseDevice(ABC):
         the config entry -- the exact inverse of :meth:`config_to_form`."""
         return dict(values or {})
 
+    # ------------------------------------------------------------- runtime controls
+    def runtime_controls(self) -> tuple["RuntimeControl", ...]:
+        """The device's LIVE, tunable-at-runtime attributes -- a distinct layer from the
+        construction-time ``config_params`` (what the config editor writes into a JSON
+        entry), the read-only ``OBSERVE_API`` whitelist (what an observe-mode node may
+        touch), and the ``snapshot`` blob (a frozen read-only dump).  This is the catalog a
+        device CONTROL panel renders: each :class:`RuntimeControl` pairs a
+        :class:`~..core.params.ParamDecl` (so the SAME ``PARAM_WIDGETS`` registry builds /
+        validates the widget -- never an ``eval`` of typed text) with a ``getter``
+        (``(device) -> value``, polled to show the current value) and a ``setter``
+        (``(device, value) -> None``, or ``None`` for a read-only read-back).  Value
+        validation lives in the device's OWN setter (e.g. a camera's ``exposure`` setter
+        rejects a non-positive value), never in the GUI.  Default: nothing tunable at
+        runtime (an empty catalog); a contract class declares the standard controls for its
+        role and a backend may extend them."""
+        return ()
+
 
 #: Device ACCESS MODES a logic node declares per device (its ``_devices`` mapping).
 #: ``EXCLUSIVE`` -- the node DRIVES the hardware (arms the camera / prepares+fires the
@@ -147,6 +188,23 @@ def underlying_device(device):
     if isinstance(device, ReadOnlyDevice):
         return object.__getattribute__(device, "_device")
     return device
+
+
+def _is_settable_attr(obj, name: str) -> bool:
+    """True when ``obj.name`` can be WRITTEN: a plain instance attribute, OR a class
+    descriptor with a setter (a ``property`` whose ``fset`` is not None, or any descriptor
+    exposing ``__set__``).  A ``property`` whose getter alone is defined is READ-ONLY -- so
+    a runtime-control catalog only offers a setter where a write would actually take, never
+    one that raises ``AttributeError: can't set attribute``.  The same "can I write this?"
+    probe the device manager makes before wiring an editable control."""
+    attr = inspect.getattr_static(type(obj), name, None)
+    if isinstance(attr, property):
+        return attr.fset is not None
+    if attr is not None and hasattr(attr, "__set__"):
+        return getattr(attr, "fset", True) is not None
+    # not a class descriptor: a plain instance attribute is settable (its presence is the
+    # writability), but a bound method / classmethod is not a value to overwrite.
+    return name in getattr(obj, "__dict__", {})
 
 
 # --------------------------------------------------------------------- config-form reflection
@@ -413,6 +471,48 @@ class CameraDevice(BaseDevice):
             _x, width, _y, height = (int(v) for v in r)   # ROI contract order: (x, width, y, height)
             return (height, width)
         return self.sensor_shape
+
+    def runtime_controls(self) -> tuple["RuntimeControl", ...]:
+        """The camera's live control catalog (see :meth:`BaseDevice.runtime_controls`): the
+        WRITABLE ``exposure`` (through the contract's own ``exposure`` setter, which validates
+        via ``_validated_exposure`` -- an illegal value is rejected at the device boundary, not
+        the GUI) plus the read-only geometry / wiring read-backs (``roi`` / ``sensor_shape`` /
+        ``frame_shape`` / trigger channels).  Every backend (virtual == real) inherits the SAME
+        set, so a camera control panel is identical across cameras; a backend with an extra live
+        knob extends this."""
+        from ..core.params import ParamDecl
+
+        def _fmt_shape(value) -> str:
+            return "" if value is None else str(tuple(int(v) for v in value))
+
+        def _fmt_channels(value) -> str:
+            return ", ".join(str(c) for c in (value or ())) or "(none)"
+
+        return (
+            RuntimeControl(
+                ParamDecl(key="exposure", label="exposure", kind="float", unit="s",
+                          lo=0.0, hi=1e6, required=True,
+                          tooltip="Frame exposure time in seconds (a positive value; the "
+                                  "device setter rejects anything else)."),
+                getter=lambda dev: float(dev.exposure),
+                setter=lambda dev, value: setattr(dev, "exposure", float(value))),
+            RuntimeControl(
+                ParamDecl(key="roi", label="ROI", kind="text",
+                          tooltip="Sub-array readout window (x, width, y, height), or full frame."),
+                getter=lambda dev: "full frame" if dev.roi is None else str(tuple(int(v) for v in dev.roi))),
+            RuntimeControl(
+                ParamDecl(key="sensor_shape", label="sensor", kind="text",
+                          tooltip="Full sensor size (height, width) in pixels."),
+                getter=lambda dev: _fmt_shape(dev.sensor_shape)),
+            RuntimeControl(
+                ParamDecl(key="frame_shape", label="frame", kind="text",
+                          tooltip="Shape (height, width) of the next frame delivered."),
+                getter=lambda dev: _fmt_shape(dev.frame_shape)),
+            RuntimeControl(
+                ParamDecl(key="trigger_channels", label="trigger", kind="text",
+                          tooltip="Sequencer line(s) this camera counts capture edges on."),
+                getter=lambda dev: _fmt_channels(dev.effective_trigger_channels)),
+        )
 
     @abstractmethod
     def configure(self, *, exposure: float | None = None, **kwargs) -> None:
@@ -698,6 +798,60 @@ class SequencerDevice(BaseDevice):
         from .sequencer import SCAN_PROGRESS_IDLE
         return dict(SCAN_PROGRESS_IDLE)
 
+    def runtime_controls(self) -> tuple["RuntimeControl", ...]:
+        """The sequencer's live control catalog (see :meth:`BaseDevice.runtime_controls`): the
+        read-only firing / progress / geometry read-backs a monitor shows, plus the WRITABLE
+        ``sleep_scale`` (the virtual inter-shot fast-forward factor) WHEN the backend carries a
+        writable ``sleep_scale`` attribute -- a real streamer has no such knob, so the control is
+        offered only where the attribute exists (a read-back otherwise, never a write that would
+        fail).  The read-back getters use ``getattr`` fallbacks so a backend lacking ``last_fired``
+        / ``sleep_scale`` still renders an honest '(none)' rather than raising."""
+        from ..core.params import ParamDecl
+
+        def _fmt_progress(dev) -> str:
+            prog = dev.scan_progress()
+            if not prog.get("scanning"):
+                return "idle"
+            return (f"point {prog.get('point', 0)}/{prog.get('n_points', 0)} · "
+                    f"sweep {prog.get('sweep', 0)}/{prog.get('n_repeats', 0)}")
+
+        controls = [
+            RuntimeControl(
+                ParamDecl(key="firing", label="firing", kind="text",
+                          tooltip="Whether the streamer is continuously emitting a program right now."),
+                getter=lambda dev: "yes" if dev.firing is not None else "idle"),
+            RuntimeControl(
+                ParamDecl(key="last_fired", label="last fired", kind="text",
+                          tooltip="The most recently fired program, when the backend tracks it."),
+                getter=lambda dev: str(getattr(dev, "last_fired", None) or "(none)")),
+            RuntimeControl(
+                ParamDecl(key="scan_progress", label="scan", kind="text",
+                          tooltip="Where a running scan is now (point K/N · sweep r/R), or idle."),
+                getter=_fmt_progress),
+            RuntimeControl(
+                ParamDecl(key="channels", label="channels", kind="text",
+                          tooltip="The sequencer's output channel names."),
+                getter=lambda dev: str(len(getattr(dev, "channels", ()) or ())) + " channels"),
+        ]
+        # ``sleep_scale`` is a WRITABLE knob only where the backend actually carries a settable
+        # attribute (the virtual sequencer's plain instance field); a real/remote streamer has
+        # none, so it is offered as a read-back only (or skipped) rather than a setter that would
+        # fail on write.  ``_is_settable_attr`` probes for a plain instance attribute OR a property
+        # with an fset -- the same "can I write this" test the config editor makes.
+        if _is_settable_attr(self, "sleep_scale"):
+            controls.append(RuntimeControl(
+                ParamDecl(key="sleep_scale", label="sleep scale", kind="float",
+                          lo=0.0, hi=1e6, default=0.0,
+                          tooltip="Virtual inter-shot delay multiplier (0 = instant, for tests)."),
+                getter=lambda dev: float(getattr(dev, "sleep_scale", 0.0)),
+                setter=lambda dev, value: setattr(dev, "sleep_scale", float(value))))
+        elif hasattr(self, "sleep_scale"):
+            controls.append(RuntimeControl(
+                ParamDecl(key="sleep_scale", label="sleep scale", kind="text",
+                          tooltip="Inter-shot delay multiplier (read-only on this backend)."),
+                getter=lambda dev: str(getattr(dev, "sleep_scale", "(none)"))))
+        return tuple(controls)
+
     def settle(self, seconds: float, *, stop: "threading.Event | None" = None) -> None:
         """Idle for ``seconds`` after a finite pulse before the next load+fire.
 
@@ -793,6 +947,7 @@ __all__ = [
     "OBSERVE",
     "ROI_CLEAR_SENTINELS",
     "ReadOnlyDevice",
+    "RuntimeControl",
     "SOFTWARE_TRIGGER",
     "SequencerDevice",
     "TrapArrayDevice",

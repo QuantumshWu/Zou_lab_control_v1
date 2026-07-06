@@ -38,6 +38,7 @@ from PyQt5 import QtCore, QtWidgets
 from ..neutral_atom.core.params import DEVICE_REF_PREFIX
 from .param_widgets import PARAM_WIDGETS, ParamWidgetContext
 from .qt_fluent import (
+    ACCENT,
     GREEN,
     GREY,
     ORANGE,
@@ -51,11 +52,13 @@ from .qt_fluent import (
     FluentLabel,
     FluentLineEdit,
     FluentPopup,
+    FluentReadoutEdit,
     FluentReadoutMultiline,
     FluentScrollArea,
     FluentSectionLabel,
     FluentSettingRow,
     FluentStatusDot,
+    FluentTabWidget,
     batched_updates,
     ensure_qt_app,
     fluent_font_size,
@@ -205,6 +208,174 @@ class _DeviceEntryCard(FluentFrame):
         self._panel._set_expanded(self.entry_name, expanded)
 
 
+class _DeviceControlPage(QtWidgets.QWidget):
+    """A LIVE control page for ONE device instance (confocal's ``DeviceGUI``, on the house
+    Fluent primitives).  It renders the device's OWN ``runtime_controls()`` catalog: one
+    :class:`FluentGroupBox` per control holding a ``[Current | read-back]`` row plus, for a
+    WRITABLE control, a ``[Set | widget]`` editable row (built by the shared
+    ``PARAM_WIDGETS`` registry -- typed, never ``eval``'d) and an Apply button that reads the
+    widget and calls the control's SETTER (value validation lives in the device's setter; a
+    rejected write shows on the status line).  A 200 ms QTimer polls each control's getter to
+    keep the Current read-back live; the timer stops while the page is hidden / its tab is
+    closed (confocal ``hideEvent``) so a closed page never keeps polling a device.
+
+    ``read_only=True`` (the task-console viewer, #6) drops the Set rows / Apply entirely: the
+    page is a device SNAPSHOT + the live read-backs, with no way to write -- so the same
+    widget serves both the full manager's editable control tab and the console's read-only
+    peek, and there is exactly ONE device-control renderer."""
+
+    def __init__(self, device, *, role: str = "", read_only: bool = False,
+                 on_status=None, parent=None):
+        super().__init__(parent)
+        self.device = device
+        self._role = str(role)
+        self._read_only = bool(read_only)
+        self._on_status = on_status
+        self._getters: list = []                 # (control, current_edit) polled each tick
+        self._editors: dict = {}                 # control key -> (widget, handler) for Apply
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(*(window_pad(1),) * 4)
+        outer.setSpacing(window_pad(0.5))
+
+        scroll = FluentScrollArea()
+        host = QtWidgets.QWidget()
+        host.setStyleSheet("background: transparent;")
+        body = QtWidgets.QVBoxLayout(host)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(scaled_px(8, minimum=4))
+
+        # A titled header pill + a Snapshot group so the page names its device and shows the
+        # frozen read-only dump beneath the live controls -- both nested in a white frame so the
+        # group-box title pills read against white (never the grey window底; #5).
+        title = type(device).__name__ + (f"  ({self._role})" if self._role else "")
+        header = FluentSectionLabel(title)
+        body.addWidget(header)
+
+        try:
+            controls = list(device.runtime_controls())
+        except Exception as exc:                 # a device that errors listing controls must not crash the tab
+            controls = []
+            body.addWidget(self._muted(f"runtime controls unavailable: {exc}"))
+        for control in controls:
+            body.addWidget(self._control_card(control))
+        body.addWidget(self._snapshot_card(device))
+        body.addStretch(1)
+
+        scroll.setWidget(host)
+        scroll.setWidgetResizable(True)
+        outer.addWidget(scroll, 1)
+
+        # confocal's per-device poll: refresh the Current read-backs on a slow timer, paused
+        # while the page is hidden (its tab closed / another tab shown).  Interval scales gently
+        # with the control count so a huge catalog does not thrash the event loop.
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(200 * (len(self._getters) // 6 + 1))
+        self._timer.timeout.connect(self._refresh_readbacks)
+        self._refresh_readbacks()
+        self._timer.start()
+
+    @staticmethod
+    def _muted(text: str) -> QtWidgets.QLabel:
+        lbl = FluentLabel(text)
+        lbl.setStyleSheet(f"color: {GREY}; background: transparent; border: none; "
+                          f'font: {fluent_font_size()}pt "Segoe UI";')
+        return lbl
+
+    def _set_status(self, text: str) -> None:
+        if callable(self._on_status):
+            self._on_status(str(text))
+
+    def _control_card(self, control) -> FluentGroupBox:
+        decl = control.decl
+        writable = control.writable and not self._read_only
+        title = decl.label or decl.key
+        if decl.unit:
+            title += f" ({decl.unit})"
+        card = FluentGroupBox(title)
+        v = QtWidgets.QVBoxLayout(card)
+        v.setContentsMargins(*(scaled_px(10),) * 2, scaled_px(10), scaled_px(10))
+        v.setSpacing(scaled_px(6, minimum=3))
+        labels = ["Current"] + (["Set"] if writable else [])
+        width = setting_label_width(labels)
+
+        current = FluentReadoutEdit("")
+        current.setToolTip(decl.tooltip)
+        v.addWidget(FluentSettingRow("Current", current, label_width=width))
+        self._getters.append((control, current))
+
+        if writable:
+            # A single-purpose form: ctx.on_change is a no-op (nothing to re-validate live) and
+            # there is NO instant_apply -- the value is read back only when Apply is pressed, so a
+            # mistyped value never dribbles into the device mid-edit (it is validated on Apply).
+            handler = PARAM_WIDGETS[decl.kind]
+            widget = handler.build(decl, control.getter(self.device), ParamWidgetContext())
+            edit_row = QtWidgets.QHBoxLayout()
+            edit_row.setSpacing(scaled_px(6, minimum=4))
+            edit_row.addWidget(FluentSettingRow("Set", widget, label_width=width), 1)
+            apply_btn = FluentButton("Apply", color=GREEN)
+            apply_btn.clicked.connect(lambda _c=False, c=control, w=widget, h=handler:
+                                      self._apply_control(c, w, h))
+            edit_row.addWidget(apply_btn)
+            edit_host = QtWidgets.QWidget()
+            edit_host.setStyleSheet("background: transparent;")
+            edit_host.setLayout(edit_row)
+            v.addWidget(edit_host)
+            self._editors[decl.key] = (widget, handler)
+        return card
+
+    def _snapshot_card(self, device) -> FluentGroupBox:
+        card = FluentGroupBox("Snapshot")
+        v = QtWidgets.QVBoxLayout(card)
+        v.setContentsMargins(*(scaled_px(10),) * 2, scaled_px(10), scaled_px(10))
+        v.setSpacing(scaled_px(6, minimum=3))
+        try:
+            snapshot = device.snapshot()
+            text = json.dumps(snapshot, indent=2, default=str)
+        except Exception as exc:
+            text = f"snapshot failed: {exc}"
+        v.addWidget(FluentReadoutMultiline(text))
+        return card
+
+    def _apply_control(self, control, widget, handler) -> None:
+        """Read the editor by KIND (never eval), then call the control's SETTER -- value
+        validation lives in the DEVICE'S setter, so an illegal value fails there and the
+        message shows on the status line (the panel's, or the tab-owner's)."""
+        try:
+            value = handler.read(widget)
+        except ValueError as exc:
+            self._set_status(f"{control.decl.key}: {exc}")
+            return
+        try:
+            control.setter(self.device, value)
+        except Exception as exc:                 # the device setter rejected it (e.g. exposure <= 0)
+            self._set_status(f"{control.decl.key}: {str(exc).splitlines()[0]}")
+            return
+        self._set_status(f"{control.decl.key} set to {control.getter(self.device)}")
+        self._refresh_readbacks()
+
+    def _refresh_readbacks(self) -> None:
+        for control, current in self._getters:
+            try:
+                value = control.getter(self.device)
+            except Exception as exc:             # a read-back that raises shows the reason, never crashes the poll
+                value = f"(error: {str(exc).splitlines()[0]})"
+            current.setText(str(value))
+
+    def hideEvent(self, event):  # noqa: N802 - Qt naming
+        # Pause polling while the page is not shown (its tab closed / a sibling tab active) --
+        # confocal's DeviceGUI idiom, so a closed control page never keeps hitting the device.
+        if self._timer.isActive():
+            self._timer.stop()
+        super().hideEvent(event)
+
+    def showEvent(self, event):  # noqa: N802 - Qt naming
+        self._refresh_readbacks()
+        if not self._timer.isActive():
+            self._timer.start()
+        super().showEvent(event)
+
+
 class DeviceManagerPanel(QtWidgets.QWidget):
     """The device-manager body (see the module docstring for the full design).
 
@@ -249,6 +420,21 @@ class DeviceManagerPanel(QtWidgets.QWidget):
         outer.setContentsMargins(*(window_pad(1),) * 4)
         outer.setSpacing(window_pad(0.5))
 
+        # The body lives in a Fluent tab widget: a PERMANENT "Config" tab (the two-column config
+        # editor + hardware panel) and on-demand CLOSABLE per-device "Control" tabs (the live
+        # ``_DeviceControlPage``).  The tab widget IS the window's one white surface, so its group
+        # boxes read against white (never the grey window底; #5).
+        self._tabs = FluentTabWidget()
+        self._tabs.tab_close_requested.connect(self._close_control_tab)
+        self._control_tabs: dict = {}            # device id -> _DeviceControlPage (one tab per device)
+        outer.addWidget(self._tabs, 1)
+
+        config_page = QtWidgets.QWidget()
+        config_page.setStyleSheet("background: transparent;")
+        page = QtWidgets.QVBoxLayout(config_page)
+        page.setContentsMargins(*(window_pad(1),) * 4)
+        page.setSpacing(window_pad(0.5))
+
         header = QtWidgets.QHBoxLayout()
         header.setSpacing(scaled_px(8, minimum=4))
         header.addWidget(FluentSectionLabel("Devices"))
@@ -258,31 +444,39 @@ class DeviceManagerPanel(QtWidgets.QWidget):
         header.addWidget(self._dot)
         self._name_label = FluentLabel("")
         header.addWidget(self._name_label)
-        outer.addLayout(header)
+        page.addLayout(header)
 
         body = QtWidgets.QHBoxLayout()
         body.setSpacing(window_pad(0.5))
 
+        # Each column's group boxes are nested inside a WHITE FluentFrame (borderless -- the tab
+        # pane already IS the white card, so an inner border would double the edge): the grey
+        # title pill of a FluentGroupBox is only legible on white, so a section card placed
+        # straight on the window/tab background loses its title (#5).
         editor_scroll = FluentScrollArea()
-        editor_host = QtWidgets.QWidget()
-        self._editor_body = QtWidgets.QVBoxLayout(editor_host)
-        self._editor_body.setContentsMargins(0, 0, 0, 0)
+        editor_frame = FluentFrame(bordered=False)
+        self._editor_body = QtWidgets.QVBoxLayout(editor_frame)
+        self._editor_body.setContentsMargins(*(scaled_px(8, minimum=4),) * 4)
         self._editor_body.setSpacing(scaled_px(8, minimum=4))
-        editor_scroll.setWidget(editor_host)
+        editor_scroll.setWidget(editor_frame)
         editor_scroll.setWidgetResizable(True)
         body.addWidget(editor_scroll, 3)
 
         right_scroll = FluentScrollArea()
-        right_host = QtWidgets.QWidget()
-        self._right_body = QtWidgets.QVBoxLayout(right_host)
-        self._right_body.setContentsMargins(0, 0, 0, 0)
+        right_frame = FluentFrame(bordered=False)
+        self._right_body = QtWidgets.QVBoxLayout(right_frame)
+        self._right_body.setContentsMargins(*(scaled_px(8, minimum=4),) * 4)
         self._right_body.setSpacing(scaled_px(8, minimum=4))
-        right_scroll.setWidget(right_host)
+        right_scroll.setWidget(right_frame)
         right_scroll.setWidgetResizable(True)
         body.addWidget(right_scroll, 2)
-        outer.addLayout(body, 1)
+        page.addLayout(body, 1)
 
-        tools = QtWidgets.QHBoxLayout()
+        # The bottom action strip is wrapped in a borderless FluentFrame so New/Load ... Apply read
+        # as ONE grouped control cluster (confocal's button frame), not buttons floating on the tab.
+        tools_frame = FluentFrame(bordered=False)
+        tools = QtWidgets.QHBoxLayout(tools_frame)
+        tools.setContentsMargins(*(scaled_px(6, minimum=4),) * 4)
         tools.setSpacing(scaled_px(8, minimum=4))
         self._new_combo = FluentComboBox()
         self._new_combo.setToolTip("Start a fresh working config from a template "
@@ -305,10 +499,12 @@ class DeviceManagerPanel(QtWidgets.QWidget):
             ("Init devices" if self._on_init_session is not None else "Apply"), color=GREEN)
         self._apply_btn.clicked.connect(self._apply)
         tools.addWidget(self._apply_btn)
-        outer.addLayout(tools)
+        page.addWidget(tools_frame)
 
         self._status = self._muted("")           # one-line result of the last action
-        outer.addWidget(self._status)
+        page.addWidget(self._status)
+
+        self._tabs.add_permanent_tab(config_page, "Config")
 
         self._discovered_card = None
         self._discovered_body = None
@@ -627,6 +823,10 @@ class DeviceManagerPanel(QtWidgets.QWidget):
             # elides (full name in the tooltip) so the row can never widen the column into
             # a horizontal scroll of the whole right panel
             line.addWidget(ElidedLabel(type(device).__name__), 1)
+            ctrl_btn = FluentButton("Control", color=ACCENT)
+            ctrl_btn.setToolTip("Open a live control tab: this device's runtime knobs + snapshot.")
+            ctrl_btn.clicked.connect(lambda _c=False, n=name, d=device: self._open_control_tab(n, d))
+            line.addWidget(ctrl_btn)
             snap_btn = FluentButton("Snapshot")
             snap_btn.clicked.connect(
                 lambda _c=False, n=name, d=device, b=snap_btn: self._show_snapshot(n, d, b))
@@ -635,16 +835,52 @@ class DeviceManagerPanel(QtWidgets.QWidget):
         if not devices:
             self._loaded_body.addWidget(self._muted("no device loaded"))
 
+    def _open_control_tab(self, name: str, device) -> None:
+        """Open (or re-focus) a live control tab for ``device`` -- ONE tab per device instance
+        (a second click on the same device re-focuses its existing tab, never stacks a duplicate).
+        Its status line routes back to the panel's own status label."""
+        key = id(device)
+        existing = self._control_tabs.get(key)
+        if existing is not None:
+            index = self._tabs.indexOf(existing)
+            if index >= 0:
+                self._tabs.setCurrentIndex(index)
+                return
+            self._control_tabs.pop(key, None)     # stale (its tab was closed) -- fall through to rebuild
+        page = _DeviceControlPage(device, role=name, on_status=self._set_status)
+        self._control_tabs[key] = page
+        self._tabs.add_closable_tab(page, name)
+        self._set_status(f"opened control tab for {name}")
+
+    def _close_control_tab(self, widget: QtWidgets.QWidget) -> None:
+        """Tear down a closable control tab (its X was clicked): drop it from the registry and the
+        tab bar so its poll timer stops (hideEvent) and it is not re-focused as a live tab."""
+        for key, page in list(self._control_tabs.items()):
+            if page is widget:
+                self._control_tabs.pop(key, None)
+                break
+        index = self._tabs.indexOf(widget)
+        if index >= 0:
+            self._tabs.removeTab(index)
+        widget.deleteLater()
+
     def _open_devices(self) -> None:
         if self._binding is None:
             return
         try:
-            self._binding["open_devices"]()
+            device_set = self._binding["open_devices"]()
         except Exception as exc:                 # a hardware open must never crash the panel
             self._set_status(f"open failed: {exc}")
             return
         self._rebuild_loaded()
-        self._set_status("devices opened")
+        # Report the COUNT so the action has visible feedback even where an open is a virtual
+        # no-op (the user's "Open devices does nothing" report): the binding returns the live
+        # DeviceSet, so a successful open shows "opened N device(s)".
+        try:
+            count = len(dict(getattr(device_set, "devices", {}) or {}))
+        except Exception:
+            count = 0
+        self._set_status(f"opened {count} device(s)" if count else "devices opened")
 
     def _show_snapshot(self, name: str, device, anchor: QtWidgets.QWidget) -> None:
         """A read-only ``device.snapshot()`` tree in a FluentPopup (indentation = nesting;
@@ -827,4 +1063,66 @@ def show_device_manager(device_set=None, *, initial_config=None, session_binding
     # fresh panel per open (CC round).  The explicit size replaces fixed_size -- the editor
     # is a scroll area whose content hint would collapse the window.
     return launch_fluent_window(panel, title="Devices@Zou lab", fixed_size=False,
+                                size=(scaled_px(WINDOW_SIZE[0]), scaled_px(WINDOW_SIZE[1])))
+
+
+class DeviceViewerPanel(QtWidgets.QWidget):
+    """A READ-ONLY device viewer: one tab per loaded device, each a read-only
+    ``_DeviceControlPage`` (snapshot + live runtime read-backs, NO config editor, NO
+    add/remove, NO writes).  This is the safe device view the task console offers -- an
+    operator can SEE a device's exposure / firing state / snapshot while an experiment runs,
+    but cannot mutate ``session.devices`` from here (the full config editor stays the
+    ``exp.device_manager()`` / ``na.device_manager()`` entry).  Built from the SAME
+    ``_DeviceControlPage`` as the manager's Control tab, in its ``read_only`` form -- one
+    device-view renderer, two entry points."""
+
+    def __init__(self, device_set=None, *, devices_provider=None, parent=None):
+        super().__init__(parent)
+        # ``devices_provider`` (a callable -> DeviceSet) is preferred so a re-open re-reads the
+        # session's CURRENT set (load_config replaces it); a bare device_set is the static fallback.
+        self._devices_provider = devices_provider
+        self._device_set = device_set
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(*(window_pad(1),) * 4)
+        outer.setSpacing(window_pad(0.5))
+        self._tabs = FluentTabWidget()
+        outer.addWidget(self._tabs, 1)
+        self._build_tabs()
+
+    def _devices(self) -> dict:
+        try:
+            device_set = (self._devices_provider() if callable(self._devices_provider)
+                          else self._device_set)
+            return dict(getattr(device_set, "devices", {}) or {})
+        except Exception:
+            return {}
+
+    def _build_tabs(self) -> None:
+        devices = self._devices()
+        if not devices:
+            placeholder = QtWidgets.QWidget()
+            placeholder.setStyleSheet("background: transparent;")
+            lay = QtWidgets.QVBoxLayout(placeholder)
+            lay.setContentsMargins(*(window_pad(1),) * 4)
+            note = FluentLabel("no device loaded")
+            note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            lay.addWidget(note)
+            lay.addStretch(1)
+            self._tabs.add_permanent_tab(placeholder, "Devices")
+            return
+        for name in sorted(devices):
+            page = _DeviceControlPage(devices[name], role=name, read_only=True)
+            self._tabs.add_permanent_tab(page, name)
+
+
+def show_device_viewer(device_set=None, *, devices_provider=None):
+    """Open the READ-ONLY device viewer in a standalone Fluent window -- the task console's
+    "Devices" peek (one read-only tab per loaded device: snapshot + live read-backs, no
+    editing).  Distinct from ``show_device_manager`` (the full config editor); this window can
+    never mutate the session's devices."""
+    ensure_qt_app()
+    set_fluent_scale(None)   # the ONE shared GUI-scale rule (auto from the primary screen)
+    panel = DeviceViewerPanel(device_set, devices_provider=devices_provider)
+    return launch_fluent_window(panel, title="Device viewer@Zou lab", fixed_size=False,
                                 size=(scaled_px(WINDOW_SIZE[0]), scaled_px(WINDOW_SIZE[1])))
