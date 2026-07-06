@@ -1,7 +1,7 @@
 <!-- cell:markdown -->
 # Neutral atom quickstart
 
-这个 notebook 展示第一版轻量中性原子实验线路：连接 device，配置 pulse sequence，拍 camera 图，校准 sitemap，校准 threshold，探测 occupancy，最后得到 detection time 和 fidelity 曲线。
+这个 notebook 展示中性原子实验的核心线路：连接 device，配置 pulse sequence，拍 camera 图，校准 sitemap，校准 threshold，探测 occupancy，最后得到 detection time 和 fidelity 曲线。
 
 > **虚拟 == 实机（核心准则）。** 下面**每一步都是真机上要跑的完整流程**：从相机图像**提取**每个 site 的位置、从数据**拟合** PSF、从计数分布**学习**每个 site 的阈值、从 reference 帧**推**保真度。**唯一虚拟的是相机数据**——它由一个实现了和真机相机相同 `CameraDevice` 契约的 `VirtualCamera` fake 出来。换到真机时**只改第一格的 `na.connect("virtual", ...)` → `na.connect("qcmos", ...)`**(连一个 JSON 设备图),下面的分析代码一行都不用动。所以在虚拟上跑通 = 在真机上跑通。
 
