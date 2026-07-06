@@ -493,8 +493,13 @@ def test_pulse_scan_api_sweep_software_drives_each_point():
             pulse_slots={"api": {}, "scan_mode": "api", "scan_code": "import numpy as np\n"
                          "scan_table = np.linspace(2.0, 8.0, 4).reshape(-1, 1)"},
             y={"inputs": ["rate"], "source": "value = signal"})
-        assert node.scan_names == []                       # no hardware scan slot
-        assert node.api_names == ["a1"]                    # the api slot is the swept dimension
+        assert node._hw_slot_names == []                   # no hardware scan slot to resolve at fire
+        assert node.api_names == ["a1"]                    # the api slot drives the fire side
+        # SELF-DESCRIPTION is mechanism-agnostic: an api sweep IS a swept axis, so the node
+        # exposes it through the same scan_names/scan_arrays contract a hardware scan (and a
+        # task) uses -- facet titles / axis labels read one fact, never the fire mechanism.
+        assert node.scan_names == ["a1"]
+        assert [list(a) for a in node.scan_arrays] == [[2.0, 4.0, 6.0, 8.0]]
         assert x.shape == (4,) and y.shape == (4,)
         assert np.allclose(x, [2.0, 4.0, 6.0, 8.0])        # x = the api sweep points
         assert np.isfinite(y).all() and np.all((y >= 0.0) & (y <= 1.0))

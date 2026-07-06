@@ -8045,21 +8045,29 @@ class TaskConsole(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------ teardown
     def stop_all_nodes(self) -> None:
-        """Stop every running node's owner thread (so the camera / sequencer are released) but
-        KEEP the panels + editors intact.  This is the notebook close = "hide" path: closing the
-        window halts all running processes, yet the layout is preserved so reopening the
-        session-bound console (``exp.task_console()``) restores the SAME interface rather than a
-        blank new one.  Distinct from :meth:`shutdown`, which also tears the cards/editors down
-        (the standalone-window / explicit-teardown path)."""
+        """Stop every running node through THE lifecycle endpoint (``_stop_logic_node``) but KEEP
+        the panels + editors intact.  This is the notebook close = "hide" path: closing the window
+        halts all running processes, yet the layout is preserved so reopening the session-bound
+        console (``exp.task_console()``) restores the SAME interface rather than a blank new one.
+        Distinct from :meth:`shutdown`, which also tears the cards/editors down.
+
+        Going row-by-row through ``_stop_logic_node`` (never bare ``node.stop()``) is load-bearing:
+        a bare stop leaves the dead node in ``running_nodes`` and the row painted "running" -- the
+        zombie then freezes the WHOLE board's shot clock (``_display_shot`` takes the min over
+        bound-and-live signals, and a dead node's provenance never advances) and the reopened
+        window shows live-looking rows whose images never update."""
+        for row in list(self.logic_nodes):
+            if self._logic_nodes.get(id(row)) is not None:
+                self._stop_logic_node(row)
+        # Row-less injected nodes (show_task_console(running_nodes=[...])) have no row to
+        # repaint but must leave the shot clock's live set all the same.
         for node in list(self.running_nodes):
             try:
                 node.stop()
             except Exception:
                 pass
-        try:
-            self._tick()   # one refresh so the stopped nodes' rows repaint with grey dots
-        except Exception:
-            pass
+            if node in self.running_nodes:
+                self.running_nodes.remove(node)
 
     def shutdown(self) -> None:
         """Stop the refresh timer and every running node's owner thread, then release

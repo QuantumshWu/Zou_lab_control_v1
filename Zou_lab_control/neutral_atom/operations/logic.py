@@ -2094,13 +2094,21 @@ class PulseScanNode(_SweptBlockMeasurement):
         # repeat=0 rolls a 1-deep ring forever); the PLOT combines the repeats + (2-D) reshapes by
         # ``scan_shape``.
         self.base_state = plan.base_state
-        self.scan_names = list(plan.scan_names)
-        self.scan_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in plan.scan_arrays]
-        # SOFTWARE api-slot sweep (the analogue of the hardware scan table): per point we set_api
-        # each api column on a deep copy, fire, then wait extra_delay_s -- the device-owned
-        # inter-point settle (load -> on_pulse -> wait pulse done -> settle -> next).
+        # FIRE-side columns, kept verbatim per mechanism: hardware named-slot rows resolve
+        # through with_slots_resolved, SOFTWARE api-slot rows through set_api (the analogue of
+        # the hardware scan table: per point set each api column on a deep copy, fire, then
+        # wait extra_delay_s -- the device-owned inter-point settle).
+        self._hw_slot_names = list(plan.scan_names)
+        self._hw_slot_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in plan.scan_arrays]
         self.api_names = list(getattr(plan, "api_names", ()))
         self.api_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in getattr(plan, "api_arrays", ())]
+        # SELF-DESCRIPTION (the console's structure contract, same fields a task exposes):
+        # ``scan_names``/``scan_arrays`` are the SWEPT PARAMETER AXES regardless of the fire
+        # mechanism -- a hardware slot scan and a software api sweep are the same experiment
+        # shape, so facet titles / axis labels read one fact instead of guessing which
+        # mechanism drove the sweep (an api-only sweep once self-described as axis-less).
+        self.scan_names = list(self._hw_slot_names) or list(self.api_names)
+        self.scan_arrays = list(self._hw_slot_arrays) or list(self.api_arrays)
         self.extra_delay_s = max(0.0, float(getattr(plan, "extra_delay_s", 0.0)))
         self.camera = plan.camera
         self.sequencer = plan.sequencer
@@ -2122,10 +2130,8 @@ class PulseScanNode(_SweptBlockMeasurement):
         # pre-allocates the RAW (repeat, n_points, 1) NaN block + ring/progress state from it (a stable
         # x axis from shot 1).  One scalar per point (data_shape=(1,)); a 2-D scan flattens its n0*n1
         # grid into n_points here and the 2-D panel reshapes by scan_shape.
-        if self.scan_arrays:
+        if self.scan_arrays:                             # the unified swept axes (hw slots, else api)
             swept_values = self.scan_arrays[0].astype(float)
-        elif self.api_arrays:
-            swept_values = self.api_arrays[0].astype(float)
         else:
             swept_values = np.array([0.0])
         self._init_swept_block(values=swept_values, data_shape=(1,), repeat=repeat)
@@ -2185,8 +2191,9 @@ class PulseScanNode(_SweptBlockMeasurement):
         # (software) any swept API slots through set_api on the deep copy.  Either or both may be
         # present; an api-only sweep has no scan slots.
         resolved = self.base_state
-        if self.scan_names:
-            slots = {name: float(arr[index]) for name, arr in zip(self.scan_names, self.scan_arrays)}
+        if self._hw_slot_names:
+            slots = {name: float(arr[index])
+                     for name, arr in zip(self._hw_slot_names, self._hw_slot_arrays)}
             resolved = resolved.with_slots_resolved(slots)
         if self.api_names:
             api_row = {name: float(arr[index]) for name, arr in zip(self.api_names, self.api_arrays)}
