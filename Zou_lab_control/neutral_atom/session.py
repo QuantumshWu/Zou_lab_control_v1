@@ -45,7 +45,7 @@ class NeutralAtomSession:
         self.devices = devices
         self.name = str(name)
         self.defaults = dict(defaults or {})
-        self.sequence = self._imaging_sequence(exposure=self._camera_exposure(), load=True)
+        self.sequence = self.build_imaging_sequence(exposure=self.camera_exposure(), load=True)
         self._calibration: TrapCalibration | None = None
         self.history: list[Any] = []
         # Device CONSUMER teardown hooks: callables invoked BEFORE this session's devices are
@@ -85,6 +85,17 @@ class NeutralAtomSession:
     @property
     def calibration_data(self) -> TrapCalibration | None:
         return self._calibration
+
+    @calibration_data.setter
+    def calibration_data(self, calibration: TrapCalibration | None) -> None:
+        """The PUBLIC write seam for the current calibration state.
+
+        The readout subsystem OWNS calibration operations (sitemap / thresholds /
+        characterize) but the calibration is SESSION state (shared with detect, the
+        GUI, ``load_config`` reset), so it lives here and the subsystem stores its
+        result through this setter instead of reaching into ``session._calibration``.
+        The one place ``None`` clears it back to "no calibration"."""
+        self._calibration = None if calibration is None else calibration
 
     @property
     def timing(self) -> TimingSubsystem:
@@ -189,7 +200,7 @@ class NeutralAtomSession:
                     affected.add(id(old_dev))
         self._notify_device_change(affected)
         self.devices = new_devices
-        self.sequence = self._imaging_sequence(exposure=self._camera_exposure(), load=True)
+        self.sequence = self.build_imaging_sequence(exposure=self.camera_exposure(), load=True)
         self._calibration = None                          # the old calibration was for the old camera
         self._readout_subsystem = ReadoutSubsystem(self)  # subsystems read devices through the session
         self._timing_subsystem = TimingSubsystem(self)
@@ -253,7 +264,14 @@ class NeutralAtomSession:
         self.history.append(result)
         return result
 
-    def _imaging_sequence(self, **kwargs) -> PulseSequence:
+    def build_imaging_sequence(self, **kwargs) -> PulseSequence:
+        """Build a readout imaging pulse sequence for the current devices.
+
+        The PUBLIC seam the readout / timing subsystems use to compose an imaging
+        sequence (``exposure`` / ``load`` / ``name`` / ``trigger_width`` /
+        ``pre_trigger``): the channel wiring (which line gates the frame) is filled
+        in from the ONE source ``_imaging_channel_kwargs`` so every imaging path --
+        sitemap, thresholds, detect, ``capture`` -- gates identically."""
         return imaging_sequence(**kwargs, **self._imaging_channel_kwargs())
 
     def _imaging_channel_kwargs(self) -> dict[str, str]:
@@ -358,15 +376,19 @@ class NeutralAtomSession:
         self._release_device_consumers()   # stop consumers (running GUI nodes) BEFORE the devices go
         self.devices.close()
 
-    def _camera_exposure(self) -> float:
-        # The READOUT camera's exposure when that role exists; a camera-less config still
-        # composes imaging sequences with the stock default (no fabricated device needed).
+    def camera_exposure(self) -> float:
+        """The readout camera's current exposure (seconds) -- the PUBLIC seam the
+        readout / timing subsystems read to gate a frame.  A camera-less config still
+        composes imaging sequences with the stock default (no fabricated device needed)."""
         camera = getattr(self.devices, "camera", None)
         if camera is None:
             return 20e-3
         return float(getattr(camera, "exposure", getattr(getattr(camera, "config", None), "exposure", 20e-3)))
 
-    def _grid_shape(self, grid_shape: Sequence[int] | None) -> tuple[int, int]:
+    def resolve_grid_shape(self, grid_shape: Sequence[int] | None) -> tuple[int, int]:
+        """Resolve a tweezer grid shape -- the explicit ``grid_shape`` if given, else the
+        loaded ``trap_array``'s.  The PUBLIC seam the readout subsystem / occupancy processor
+        use so grid-shape resolution has ONE source (raises when neither is available)."""
         if grid_shape is not None:
             return grid_shape_tuple(grid_shape)
         trap_array = getattr(self.devices, "trap_array", None)

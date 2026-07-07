@@ -229,5 +229,5 @@ def test_capture_routes_exposure_through_the_one_configure_imaging_path(monkeypa
     exp.capture(exposure=2e-3, display=False)
     assert calls and calls[0]["exposure"] == pytest.approx(2e-3)
     assert calls[0]["camera"] is exp.camera             # default capture camera == readout camera
-    assert exp._camera_exposure() == pytest.approx(2e-3)   # the camera really got it
+    assert exp.camera_exposure() == pytest.approx(2e-3)   # the camera really got it
     assert exp.sequence is not seq_before               # and the imaging sequence was rebuilt

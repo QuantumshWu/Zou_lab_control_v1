@@ -7856,7 +7856,7 @@ def test_sequence_name_does_not_switch_the_virtual_camera_to_all_bright():
         cal = exp.readout.current
         from conftest import fire_live_imaging
         fire_live_imaging(exp)
-        seq = exp.readout._session._imaging_sequence(load=True, name="sitemap")   # the MAGIC name
+        seq = exp.readout._session.build_imaging_sequence(load=True, name="sitemap")   # the MAGIC name
         img = na.triggered_frames(exp.devices.camera, exp.devices.sequencer, seq, 1)[-1]
         loaded = int(np.sum(np.asarray(cal.detect(img).occupied)))
         assert 0 < loaded < cal.n_sites      # realistic partial loading -- the name does NOT force all-bright

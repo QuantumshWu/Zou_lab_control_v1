@@ -108,7 +108,7 @@ def judge_occupancy(readout) -> ProcessorSpec:
         calibration = _load_calibration()
         calibration_source = None if calibration is not None else _load_calibration
         try:
-            grid = readout._session._grid_shape(None)
+            grid = readout._session.resolve_grid_shape(None)
         except Exception:
             grid = None
         method = METHOD_LABELS.get(str(values.get("method", "box")), "box")

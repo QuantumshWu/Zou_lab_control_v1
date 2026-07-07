@@ -63,7 +63,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
     @property
     def current(self) -> TrapCalibration | None:
-        return self._session._calibration
+        return self._session.calibration_data
 
     def require(self, *, thresholds: bool = True) -> TrapCalibration:
         return self._session.require_calibration(require_thresholds=thresholds)
@@ -89,24 +89,24 @@ class ReadoutSubsystem(ExperimentSubsystem):
         """
 
         s = self._session
-        grid_shape = s._grid_shape(grid_shape)
+        grid_shape = s.resolve_grid_shape(grid_shape)
         roi_radius = int(s.defaults.get("roi_radius", 1) if roi_radius is None else roi_radius)
-        exposure = s.defaults.get("sitemap_exposure", s._camera_exposure())
-        sequence = s._imaging_sequence(exposure=exposure, load=True, name="sitemap")
+        exposure = s.defaults.get("sitemap_exposure", s.camera_exposure())
+        sequence = s.build_imaging_sequence(exposure=exposure, load=True, name="sitemap")
         seq_dev = getattr(s.devices, "sequencer", None)
         images = triggered_frames(s.devices.camera, seq_dev, sequence, positive_int(frames, "frames"))
         result = calibrate_sitemap_from_images(
             images, grid_shape=grid_shape, ordering=ordering, roi_radius=roi_radius, reducer=reducer,
             method=method, psf_half_width=psf_half_width, display=display,
         )
-        s._calibration = result.calibration
+        s.calibration_data = result.calibration
         s.history.append(result)
         return result
 
     def sitemap_from_images(self, images, *, grid_shape: Sequence[int] | None = None, **kwargs) -> SitemapResult:
         s = self._session
-        result = calibrate_sitemap_from_images(images, grid_shape=s._grid_shape(grid_shape), **kwargs)
-        s._calibration = result.calibration
+        result = calibrate_sitemap_from_images(images, grid_shape=s.resolve_grid_shape(grid_shape), **kwargs)
+        s.calibration_data = result.calibration
         s.history.append(result)
         return result
 
@@ -119,8 +119,8 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
         s = self._session
         calibration = s.require_calibration(require_thresholds=False)
-        expo = s._camera_exposure() if exposure is None else float(exposure)
-        sequence = s._imaging_sequence(exposure=expo, load=True, name="threshold")
+        expo = s.camera_exposure() if exposure is None else float(exposure)
+        sequence = s.build_imaging_sequence(exposure=expo, load=True, name="threshold")
         seq_dev = getattr(s.devices, "sequencer", None)
         images = triggered_frames(s.devices.camera, seq_dev, sequence, positive_int(frames, "frames"))
         # The exposure these thresholds are learnt at is stamped INSIDE calibrate_threshold_from_images
@@ -128,7 +128,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         # release-recapture survival frames -- self-matches it and never floors/sticks (#H3v-2).
         result = calibrate_threshold_from_images(
             images, calibration, site=site, method=method, exposure=expo, display=display)
-        s._calibration = result.calibration
+        s.calibration_data = result.calibration
         s.history.append(result)
         return result
 
@@ -136,7 +136,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         s = self._session
         calibration = s.require_calibration(require_thresholds=False) if calibration is None else calibration
         result = calibrate_threshold_from_images(images, calibration, **kwargs)
-        s._calibration = result.calibration
+        s.calibration_data = result.calibration
         s.history.append(result)
         return result
 
@@ -156,8 +156,8 @@ class ReadoutSubsystem(ExperimentSubsystem):
         if exposure is None:
             # The authoritative reader of the calibration's threshold_exposure (the gate the
             # thresholds were learnt at); fall back to the camera's current exposure when unstamped.
-            exposure = calibration.readout_exposure(fallback=s._camera_exposure())
-        sequence = s._imaging_sequence(exposure=float(exposure), load=True, name="detect")
+            exposure = calibration.readout_exposure(fallback=s.camera_exposure())
+        sequence = s.build_imaging_sequence(exposure=float(exposure), load=True, name="detect")
         seq_dev = getattr(s.devices, "sequencer", None)
         images = triggered_frames(s.devices.camera, seq_dev, sequence, 1)
         result = detect_image(images[-1], calibration, sequence=sequence, display=display, what=what)
@@ -196,7 +196,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         folder differs (see ``na.write_virtual_run`` for the virtual writer)."""
 
         s = self._session
-        grid_shape = s._grid_shape(grid_shape)
+        grid_shape = s.resolve_grid_shape(grid_shape)
         roi_radius = int(s.defaults.get("roi_radius", 1) if roi_radius is None else roi_radius)
         run = index_run(data_dir, prefix, shots_per_group=shots_per_group, short_shot=short_shot,
                         ref_shots=ref_shots, max_groups=max_groups)
@@ -205,7 +205,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
             template_frames, grid_shape=grid_shape, ordering=ordering, roi_radius=roi_radius,
             reducer=reducer, method=method, psf_half_width=psf_half_width, display=display,
         )
-        s._calibration = result.calibration
+        s.calibration_data = result.calibration
         s.history.append(result)
         return result
 
@@ -261,7 +261,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
                     finite = thresholds[~bad]
                     fallback = float(np.median(finite)) if finite.size else 0.0
                 thresholds[bad] = fallback
-            s._calibration = cal.with_thresholds(
+            s.calibration_data = cal.with_thresholds(
                 thresholds, stage="characterized", thresholds_calibrated=True, threshold_method="per_site_reference"
             )
         if save:
@@ -360,7 +360,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         times = _positive_detection_times(times)
         shots = positive_int(shots, "shots")
         reference_shots = positive_int(reference_shots, "reference_shots")
-        reference_exposure = float(max(np.nanmax(times) * 3.0, s._camera_exposure()) if reference_exposure is None else reference_exposure)
+        reference_exposure = float(max(np.nanmax(times) * 3.0, s.camera_exposure()) if reference_exposure is None else reference_exposure)
         if not np.isfinite(reference_exposure) or reference_exposure <= 0:
             raise ValueError("reference_exposure must be positive and finite.")
 
@@ -721,7 +721,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         from ..operations.logic import CalibrateReadoutTask
 
         s = self._session
-        params["grid_shape"] = s._grid_shape(params.get("grid_shape"))
+        params["grid_shape"] = s.resolve_grid_shape(params.get("grid_shape"))
         # ``camera`` is the RESOLVED device the calibrate-readout task's device-role injection
         # passes (the operator's dropdown choice); the notebook path calls with camera=None and
         # gets the conventional readout camera.  ONE camera drives the whole calibration.
@@ -731,7 +731,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
             # The finished calibration BECOMES the session calibration (``readout.current``),
             # so a decoupled live OccupancyProcessor begins judging sites the moment this
             # task completes -- no path to type, the cali->occupancy connection.
-            s._calibration = calibration
+            s.calibration_data = calibration
             # Pin the LIVE readout exposure to the gate the thresholds were learnt at
             # (``threshold_exposure``): the live OccupancyProcessor judges the RUNNING pulse's frames,
             # and a per-site threshold is exposure-specific -- calibrating at the short readout gate but
@@ -770,7 +770,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         return self._session.save_calibration(path)
 
     def clear(self) -> None:
-        self._session._calibration = None
+        self._session.calibration_data = None
 
 
 class _SessionImagingController:
@@ -795,8 +795,8 @@ class _SessionImagingController:
         return self
 
     def frame_sequence(self, frames: int, *, time_ns: float | None = None, slots=None, trigger_channels=None):
-        exposure = self._session._camera_exposure() if time_ns is None else float(time_ns) * 1e-9
-        return self._session._imaging_sequence(exposure=exposure, load=True, name=self._name)
+        exposure = self._session.camera_exposure() if time_ns is None else float(time_ns) * 1e-9
+        return self._session.build_imaging_sequence(exposure=exposure, load=True, name=self._name)
 
 
 class _ExposureConfiguringPlan:

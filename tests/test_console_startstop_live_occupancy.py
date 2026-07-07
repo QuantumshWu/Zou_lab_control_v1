@@ -39,7 +39,7 @@ def test_console_three_startstop_cycles_stable_name_and_live_accuracy():
         task = exp.readout.calibrate_task(SignalHub(), threshold_method="otsu",
                                           threshold_frames=200, readout_exposure=0.002)
         task.run_to_completion()
-        exp.readout._session._calibration = task.calibration
+        exp.readout._session.calibration_data = task.calibration
         assert exp.devices.camera.exposure == pytest.approx(0.002)   # #2 pin: live readout self-matches cal
 
         con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,

@@ -50,8 +50,8 @@ class TimingSubsystem(ExperimentSubsystem):
         cam = getattr(s.devices, "camera", None) if camera is None else camera
         if exposure is not None and hasattr(cam, "configure"):
             cam.configure(exposure=exposure)
-        s.sequence = s._imaging_sequence(
-            exposure=s._camera_exposure() if exposure is None else exposure,
+        s.sequence = s.build_imaging_sequence(
+            exposure=s.camera_exposure() if exposure is None else exposure,
             trigger_width=trigger_width,
             pre_trigger=pre_trigger,
             load=load,
