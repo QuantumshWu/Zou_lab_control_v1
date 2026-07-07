@@ -6574,11 +6574,14 @@ class TaskConsole(QtWidgets.QWidget):
         return out
 
     def _signal_axes(self) -> dict:
-        """``{signal name: (axis_label, unit)}`` from each RUNNING node's
-        ``output_specs`` -- so a plot reads its y-axis label/unit from the producing
-        measurement (the SignalSpec it declares), not a hard-coded per-kind string."""
+        """``{signal name: (axis_label, unit)}`` from each PROVIDER node's ``output_specs`` -- so a plot
+        reads its y-axis label/unit from the producing measurement (the SignalSpec it declares), not a
+        hard-coded per-kind string.  Reads the SAME ``_provider_nodes()`` source as every other signal-
+        resolution site (running nodes + the last build kept past Stop), so a stopped node's panel keeps
+        its declared axis label/unit instead of falling back to a default -- its signal still lingers in
+        the hub, so its axis metadata must linger with it."""
         out: dict[str, tuple[str, str]] = {}
-        for node in self.running_nodes:
+        for node in self._provider_nodes():
             if not hasattr(node, "output_specs"):
                 continue
             try:
@@ -6589,12 +6592,14 @@ class TaskConsole(QtWidgets.QWidget):
         return out
 
     def _signal_short_names(self) -> dict:
-        """``{full hub signal: SHORT name}`` = each RUNNING node's published signals with that node's
+        """``{full hub signal: SHORT name}`` = each PROVIDER node's published signals with that node's
         prefix stripped (``temperature_survival`` -> ``survival``, ``frame`` -> ``frame``).  The picker
         nest binds this so the leaf shows the short name -- the SAME rule the Logic tab uses
-        (``strip_node_prefix``), never the verbose SignalSpec axis label."""
+        (``strip_node_prefix``), never the verbose SignalSpec axis label.  Reads the SAME
+        ``_provider_nodes()`` source as every other signal-resolution site so a stopped node's lingering
+        signal keeps its short name instead of showing the verbose full name."""
         out: dict[str, str] = {}
-        for node in self.running_nodes:
+        for node in self._provider_nodes():
             pfx = str(getattr(node, "prefix", "") or "")
             try:
                 for full in node.published_signals():
