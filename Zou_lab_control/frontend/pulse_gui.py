@@ -1656,9 +1656,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 sequencer = getattr(experiment.devices, "sequencer", sequencer)
                 channels = getattr(sequencer, "channels", channels)
             # Pick the display LABELS off the sequencer too (symmetric with channels): a device
-            # names its DAC bits ``dx0`` and labels them ``da_x[0]``, so a fresh editor started from
-            # the device folds the 18 coil channels into three bus rows -- the real rig does exactly
-            # this from the board XDC labels (real == virtual), no template needed.
+            # names its DAC bits ``dx0`` and labels them ``da_x[0]``, so an editor started from the
+            # device folds the 18 coil channels into three bus rows WHENEVER they are shown -- with NO
+            # template loaded (the default visible set below is the first four channels, so the coil
+            # buses appear once the coils are made visible).  The real rig does exactly this from the
+            # board XDC labels (real == virtual).
             if channel_labels is None and sequencer is not None:
                 channel_labels = getattr(sequencer, "channel_labels", None)
             channels = list(channels or DEFAULT_CHANNEL_NAMES)

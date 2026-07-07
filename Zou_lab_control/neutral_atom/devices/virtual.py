@@ -56,8 +56,9 @@ MOT_COIL_BUSES: dict[str, tuple[str, ...]] = {
 # carries CHANNEL names (``dx0`` here, ``chNN`` on hardware) plus a LABEL per channel written in
 # ``base[bit]`` syntax; ``infer_bus_channels`` folds on the label regex.  Derived from
 # MOT_COIL_BUSES (never a second hand-typed table) so name<->label stay in lockstep, and put on the
-# VirtualSequencer (not the template) so a freshly-started editor -- no template loaded -- already
-# shows bus rows, matching real == virtual (real labels come off the board XDC the same way).
+# VirtualSequencer (not the template) so the fold works straight off the DEVICE with NO template
+# loaded: whenever the coil bits are SHOWN (they are not in the editor's first-four default visible
+# set), they draw as three bus rows, matching real == virtual (real labels come off the board XDC).
 MOT_COIL_LABELS: dict[str, str] = {
     channel: f"{bus}[{bit}]"
     for bus, members in MOT_COIL_BUSES.items()

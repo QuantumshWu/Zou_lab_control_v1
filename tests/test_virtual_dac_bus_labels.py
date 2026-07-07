@@ -3,10 +3,14 @@
 
 A device names its coil bits ``dx0..dz5`` (real hardware: ``chNN``) and LABELS each in
 ``base[bit]`` syntax (``dx0 -> "da_x[0]"``; real: ``da_dipole[0]`` off the board XDC).
-``infer_bus_channels`` folds on the label regex, so a fresh pulse editor started from a stock
-``VirtualSequencer`` -- no template loaded -- already shows three bus rows, not 18 single
-channel rows.  The labels are DERIVED from ``MOT_COIL_BUSES`` (one source), so name<->label
-never drift.
+``infer_bus_channels`` folds on the label regex -- from the DEVICE's own labels, with NO template
+loaded -- so WHEN the coil bits are shown (they are not in a fresh editor's first-four default
+visible set) the editor draws three bus rows, not 18 single channel rows.  The labels are DERIVED
+from ``MOT_COIL_BUSES`` (one source), so name<->label never drift.
+
+The folding is checked on the REAL display path (``pulse_gui._display_rows``, the function the
+editor renders from), not just the ``bus_channels()`` data -- so a claim about what the editor draws
+is proven against what it actually draws.
 """
 
 from __future__ import annotations
@@ -46,14 +50,42 @@ def test_virtual_sequencer_advertises_coil_labels():
 
 def test_state_from_virtual_sequencer_folds_the_three_buses():
     """A PulseTableState built from a stock virtual sequencer's channels + labels folds the 18
-    coil bits into exactly the three coil buses (members == the single-source table), so the GUI
-    draws three bus rows -- no template needed."""
+    coil bits into exactly the three coil buses (members == the single-source table) -- no template
+    needed."""
     seq = VirtualSequencer()
     state = PulseTableState(channels=list(seq.channels), channel_labels=dict(seq.channel_labels))
     buses = state.bus_channels()
     for bus, members in MOT_COIL_BUSES.items():
         assert bus in buses, f"{bus} should fold from labels"
         assert tuple(buses[bus]) == tuple(members)
+
+
+def test_display_rows_fold_the_coils_only_when_shown():
+    """What the editor DRAWS (``pulse_gui._display_rows``, the real render source), not just the
+    ``bus_channels()`` data: a FRESH editor's default visible set is the first four channels (no coil
+    bits), so it draws ZERO bus rows; once the coils are shown they fold into EXACTLY the three
+    ``da_*`` bus rows (and none of the 18 single coil rows) -- the device labels alone drive the fold,
+    with no template loaded."""
+    from Zou_lab_control.frontend.pulse_gui import _display_rows
+
+    seq = VirtualSequencer()
+    channels = list(seq.channels)
+    labels = dict(seq.channel_labels)
+    coil_bits = {ch for members in MOT_COIL_BUSES.values() for ch in members}
+
+    # Fresh editor default: only the first four channels are visible (pulse_gui seeds
+    # visible_channels=channels[:4]); none are coil bits, so NO bus row is drawn.
+    fresh = PulseTableState(channels=channels, channel_labels=labels,
+                            visible_channels=channels[: min(4, len(channels))])
+    assert not [r for r in _display_rows(fresh) if r["kind"] == "bus"]
+
+    # Show-all: every coil bit visible -> exactly the three da_* bus rows, zero single coil rows.
+    shown = PulseTableState(channels=channels, channel_labels=labels, visible_channels=channels)
+    rows = _display_rows(shown)
+    bus_rows = {str(r["name"]): tuple(r["channels"]) for r in rows if r["kind"] == "bus"}
+    assert bus_rows == {bus: tuple(members) for bus, members in MOT_COIL_BUSES.items()}
+    drawn_channels = {str(r["name"]) for r in rows if r["kind"] == "channel"}
+    assert not (drawn_channels & coil_bits), "a folded coil bit must never also draw as a single row"
 
 
 def test_custom_channel_list_drops_unused_coil_labels():
