@@ -202,6 +202,11 @@ _IMAGE_SPLIT = ([0.75, 0.1, 0.1], [0.025, 0.025])  # 2D image | side dist | colo
 #: bottom) rendered every 2d facet VERTICALLY FLIPPED vs its focus -- the two update orders diverged.
 _IMAGE_ORIGIN = "upper"
 
+#: Log-scale y-axis floor for a count histogram -- the ONE value both log-histogram families read
+#: (the standalone bimodal ``Live1DDis`` and the grid/thumbnail ``HistogramFigure``), so 0-count bars
+#: sit just BELOW the axis identically.  Declared once here so the floor can never drift between them.
+_LOG_YLIM_FLOOR = 0.5
+
 # Owned geometry for the per-site histogram grid (site_histogram_grid).  The grid fills the SAME total
 # data region every other panel kind uses (``panel_plot_spec(size).data_px``) and SUBDIVIDES it into
 # cells with these inter-cell gaps -- so a grid's data box equals a single-axes panel's of the same size
@@ -3375,7 +3380,7 @@ class HistogramFigure(BaseLivePlot):
                 return                                 # within the dead-band -> keep the committed range
         if self.ylog:
             self.ax.set_yscale("log")
-            self.ax.set_ylim(max(0.5, lo), max(hi, peak * 3.0 if peak else 1.0))
+            self.ax.set_ylim(max(_LOG_YLIM_FLOOR, lo), max(hi, peak * 3.0 if peak else 1.0))
         else:
             self.ax.set_yscale("linear")
             self.ax.set_ylim(lo, hi)
@@ -4310,7 +4315,7 @@ class HistogramCell(GridCell):
         if ax.get_yscale() != target:
             ax.set_yscale(target)
         if self.ylog:
-            ax.set_ylim(max(0.5, lo), max(hi, 1.0))
+            ax.set_ylim(max(_LOG_YLIM_FLOOR, lo), max(hi, 1.0))
         else:
             ax.set_ylim(lo, hi)
 

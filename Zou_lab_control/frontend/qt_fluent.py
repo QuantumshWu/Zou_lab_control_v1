@@ -576,6 +576,17 @@ class FluentLabel(QtWidgets.QLabel):
         self.setStyleSheet(f'QLabel {{ color: {TEXT}; font: {fluent_font_size()}pt "{FONT}"; background: transparent; }}')
 
 
+def muted_note_label(text: str) -> "QtWidgets.QLabel":
+    """A greyed, transparent, borderless note label in the fluent body font -- THE one muted-note
+    factory (a device viewer / manager 'no device' note, an inline status line, ...), so the grey-note
+    style is spelled once instead of re-typed per caller.  Art-bearing, so it stays internal (never
+    re-exported from ``frontend/__init__``)."""
+    lbl = FluentLabel(text)
+    lbl.setStyleSheet(f"color: {GREY}; background: transparent; border: none; "
+                      f'font: {fluent_font_size()}pt "{FONT}";')
+    return lbl
+
+
 class FluentFrame(QtWidgets.QFrame):
     def __init__(self, parent=None, *, bordered: bool = True, round: tuple[str, ...] = ("NW", "NE", "SE", "SW")):
         super().__init__(parent)

@@ -63,8 +63,8 @@ from .qt_fluent import (
     batched_updates,
     _popup_gap,
     ensure_qt_app,
-    fluent_font_size,
     launch_fluent_window,
+    muted_note_label,
     scaled_px,
     set_fluent_scale,
     setting_label_width,
@@ -260,7 +260,7 @@ class _DeviceControlPage(QtWidgets.QWidget):
             controls = list(device.runtime_controls())
         except Exception as exc:                 # a device that errors listing controls must not crash the tab
             controls = []
-            body.addWidget(self._muted(f"runtime controls unavailable: {exc}"))
+            body.addWidget(muted_note_label(f"runtime controls unavailable: {exc}"))
         for control in controls:
             body.addWidget(self._control_card(control))
         body.addWidget(self._snapshot_card(device))
@@ -278,13 +278,6 @@ class _DeviceControlPage(QtWidgets.QWidget):
         self._timer.timeout.connect(self._refresh_readbacks)
         self._refresh_readbacks()
         self._timer.start()
-
-    @staticmethod
-    def _muted(text: str) -> QtWidgets.QLabel:
-        lbl = FluentLabel(text)
-        lbl.setStyleSheet(f"color: {GREY}; background: transparent; border: none; "
-                          f'font: {fluent_font_size()}pt "Segoe UI";')
-        return lbl
 
     def _set_status(self, text: str) -> None:
         if callable(self._on_status):
@@ -551,7 +544,7 @@ class DeviceManagerPanel(QtWidgets.QWidget):
         tools.addWidget(self._apply_btn)
         page.addWidget(tools_frame)
 
-        self._status = self._muted("")           # one-line result of the last action
+        self._status = muted_note_label("")           # one-line result of the last action
         page.addWidget(self._status)
 
         self._tabs.add_permanent_tab(config_page, "Config")
@@ -575,12 +568,6 @@ class DeviceManagerPanel(QtWidgets.QWidget):
 
     def _set_expanded(self, name: str, expanded: bool) -> None:
         (self._expanded.add if expanded else self._expanded.discard)(name)
-
-    def _muted(self, text: str) -> QtWidgets.QLabel:
-        lbl = FluentLabel(text)
-        lbl.setStyleSheet(f"color: {GREY}; background: transparent; border: none; "
-                          f'font: {fluent_font_size()}pt "Segoe UI";')
-        return lbl
 
     # ------------------------------------------------------------------ registry views
     def _catalog(self) -> dict:
@@ -653,7 +640,7 @@ class DeviceManagerPanel(QtWidgets.QWidget):
             self._entry_cards.append(entry_card)
             v.addWidget(entry_card)
         if not names:
-            v.addWidget(self._muted("no device of this role in the config"))
+            v.addWidget(muted_note_label("no device of this role in the config"))
         if domain is not None:
             add_btn = FluentButton(f"+ Add {domain.label.lower()}")
             add_btn.clicked.connect(lambda _c=False, d=domain: self._add_entry(d))
@@ -809,7 +796,7 @@ class DeviceManagerPanel(QtWidgets.QWidget):
             ident = str(getattr(row, "ident", "?"))
             label = str(getattr(row, "label", ""))
             line.addWidget(FluentLabel(ident), 0, QtCore.Qt.AlignTop)
-            note_label = self._muted(label)
+            note_label = muted_note_label(label)
             note_label.setWordWrap(True)     # a long driver note WRAPS -- it must never widen
             line.addWidget(note_label, 1)    # the column and push controls past the viewport
             if getattr(row, "config", None) is not None:
@@ -821,7 +808,7 @@ class DeviceManagerPanel(QtWidgets.QWidget):
             host.setLayout(line)
             self._discovered_body.addWidget(host)
         if not rows:
-            self._discovered_body.addWidget(self._muted(note))
+            self._discovered_body.addWidget(muted_note_label(note))
         self._set_status(f"scan: {note}")
 
     def _add_discovered(self, row) -> None:
@@ -860,7 +847,7 @@ class DeviceManagerPanel(QtWidgets.QWidget):
             device_set = self._binding["devices"]()
             devices = dict(getattr(device_set, "devices", {}) or {})
         except Exception as exc:
-            self._loaded_body.addWidget(self._muted(f"session devices unavailable: {exc}"))
+            self._loaded_body.addWidget(muted_note_label(f"session devices unavailable: {exc}"))
             return
         for name in sorted(devices):
             device = devices[name]
@@ -889,7 +876,7 @@ class DeviceManagerPanel(QtWidgets.QWidget):
             host.setLayout(line)
             self._loaded_body.addWidget(host)
         if not devices:
-            self._loaded_body.addWidget(self._muted("no device loaded"))
+            self._loaded_body.addWidget(muted_note_label("no device loaded"))
 
     def _open_control_tab(self, name: str, device) -> None:
         """Open (or re-focus) a live control tab for ``device`` -- ONE tab per device instance
