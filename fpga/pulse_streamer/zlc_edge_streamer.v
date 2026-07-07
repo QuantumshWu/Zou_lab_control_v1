@@ -248,7 +248,7 @@ module zlc_edge_streamer #(
     reg [31:0] loops_remaining = 32'd1;
 
     // shadows latched at arm time (BRAM pre-reads while reset is asserted)
-    // FIFO_DEPTH(=4) resident shadows are seeded at every boundary, so we pre-read that
+    // FIFO_DEPTH (= RD_LAT+2) resident shadows are seeded at every boundary, so we pre-read that
     // many edges (e0..e4) and loop-start edges (ls0..ls4) -- one more than the old 4.
     reg [TICK_WIDTH-1:0]  sh_e0_t, sh_e1_t, sh_e2_t, sh_e3_t, sh_e4_t;
     reg [COEFF_BITS-1:0]  sh_e0_c, sh_e1_c, sh_e2_c, sh_e3_c, sh_e4_c;
@@ -765,7 +765,7 @@ module zlc_edge_streamer #(
 
     // ---- seed the prefetch from edge-0 shadows for slot vector sv (start/scan/repeat) ----
     // Mirrors engine_model.boundary_to: output edge0 directly iff eff(edge0)==0,
-    // then seed FIFO_DEPTH(=3) resident shadows from the first not-yet-output edge.
+    // then seed FIFO_DEPTH (= RD_LAT+2) resident shadows from the first not-yet-output edge.
     // ``cnt`` is the program's edge count, passed in EXPLICITLY (not read from the
     // active_count REG).  At FIRE, active_count <= prog_count is a non-blocking write
     // that has NOT committed when this task runs the same cycle, so reading the reg
@@ -883,7 +883,7 @@ module zlc_edge_streamer #(
             end else if (arm_wait != 0) begin
                 arm_wait <= arm_wait - 1'b1;
             end else begin
-                // Pre-read FIFO_DEPTH(=5 shadows: e0..e4) edges + the loop-start window
+                // Pre-read the 5 seed edge shadows (e0..e4) + the loop-start window
                 // (ls0..ls4) + final + scan0.  ARM_SETTLE (>= PIPE) cycles between reads, so
                 // these latch the SETTLED bus -- the streaming-prefetch off-by-one cannot
                 // touch the seed shadows.  Steps: 0-4 e0..e4, 5-9 ls0..ls4, 10 final, 11 scan0.
