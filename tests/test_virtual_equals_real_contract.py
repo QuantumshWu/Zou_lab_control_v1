@@ -25,6 +25,7 @@ import re
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 import Zou_lab_control.neutral_atom as na
 
@@ -115,3 +116,22 @@ def test_virtual_readout_runs_the_real_contract_path_end_to_end():
     shot = exp.readout.detect(display=False)                       # uses learned calibration
     assert shot.occupied.shape == (12,)
     assert np.asarray(shot.counts).shape == (12,)
+
+
+def test_virtual_sequencer_rejects_out_of_catalog_channels_like_real():
+    """virtual == real on the CHANNEL contract: ``VirtualSequencer.prepare`` compiles against its
+    FIXED device catalog and REJECTS a template using channels outside it -- exactly the rejection
+    the real ``SequencerService`` gives -- instead of the old accommodation that silently widened
+    the catalog to whatever the program used (which let a virtual run "succeed" on a template real
+    hardware would refuse).  A subset (an in-catalog channel) still prepares normally, and neither
+    prepare mutates the catalog."""
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
+    from Zou_lab_control.neutral_atom.timing import PulseSequence
+
+    seqr = VirtualSequencer(channels=["emCCD", "probe"])
+    seqr.prepare(PulseSequence(name="ok").pulse("emCCD", 0.0, 1e-3))   # subset -> prepares, no raise
+    with pytest.raises(ValueError, match="outside this sequencer's catalog"):
+        seqr.prepare(PulseSequence(name="bad").pulse("not_a_channel", 0.0, 1e-3))
+    # The catalog stayed FIXED through both prepares -- never widened to fit the program.
+    assert tuple(seqr.channels) == ("emCCD", "probe")
+    assert tuple(seqr.service.channels) == ("emCCD", "probe")

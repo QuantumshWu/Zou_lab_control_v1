@@ -1318,21 +1318,26 @@ class VirtualSequencer(SequencerDevice):
             channels = sorted({p.channel for p in program.base_pulses()}) or list(self.channels)
         # Validate the TIMING against the clock grid (the channel set is intrinsic to the program).
         program.validate(clock_hz=self.clock_hz).raise_if_failed()
-        # Delegate the state machine to the service on the per-prepare channel set: it compiles
-        # the RuntimeSequenceProgram, runs the FPGA-geometry backstop, records the SOURCE timing as
-        # syncable last_payload_json, and advances to "prepared" -- exactly the seam the GUI's Sync
-        # and the real SequencerService share, with no virtual copy.  The channel set is intrinsic
-        # to the program (a saved table's chNN, the imaging names), so point the service at it.
-        # KNOWN DIRECTION FORK vs the real backend (kept for now, converge in its own round): the
-        # REAL service owns the catalog (board.xdc; ``service.prepare`` raises on channels outside
-        # it), while this line makes the virtual service ADOPT whatever channels the program uses.
-        # The load-side fix (``resolve_fireable_template`` / the GUI load align a SUBSET template
-        # onto the device catalog) means every catalog-respecting caller no longer relies on this
-        # accommodation; it still papers over a template with channels OUTSIDE ``self.channels``,
-        # which the real rig would reject.  Converge by validating against ``self.channels`` here
-        # (subset -> keep the device catalog, non-subset -> raise like the real service).
+        # Delegate the state machine to the composed service: it compiles the RuntimeSequenceProgram,
+        # runs the FPGA-geometry backstop, records the SOURCE timing as syncable last_payload_json,
+        # and advances to "prepared" -- exactly the seam the GUI's Sync and the real SequencerService
+        # share, with no virtual copy.
+        # CONVERGED with the real backend on the channel contract (was a KNOWN DIRECTION FORK): the
+        # service keeps its FIXED device catalog (``self.channels``) and compiles against it, exactly
+        # as the real ``SequencerService`` does -- it does NOT adopt whatever channels the program
+        # uses.  A template whose channels fall OUTSIDE the catalog is REJECTED here, the SAME
+        # rejection the real rig gives, instead of the old accommodation that silently widened the
+        # catalog to the program (letting a virtual run "succeed" on a template real hardware would
+        # refuse).  Catalog-respecting callers -- the imaging sequences, a GUI/notebook load aligned
+        # through ``resolve_fireable_template`` -- present a SUBSET, so this is transparent to them;
+        # only an unaligned out-of-catalog template now fails loud (virtual == real on channels).
         from .sequencer import RuntimeSequenceProgram
-        self.service.channels = list(channels)
+        unknown = [ch for ch in channels if ch not in self.channels]
+        if unknown:
+            raise ValueError(
+                f"sequence uses channels {unknown} outside this sequencer's catalog "
+                f"{list(self.channels)}; align the template to the device channels before firing "
+                "(the real backend rejects out-of-catalog channels identically).")
         self.last_program = RuntimeSequenceProgram.from_dict(self.service.prepare(sequence))
         self._prepared = program
         # Capture scan-progress pacing from the SOURCE table (the compiled program drops the
