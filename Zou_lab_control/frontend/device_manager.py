@@ -58,6 +58,7 @@ from .qt_fluent import (
     FluentSectionLabel,
     FluentSettingRow,
     FluentStatusDot,
+    FluentSwitch,
     FluentTabWidget,
     batched_updates,
     _popup_gap,
@@ -234,6 +235,7 @@ class _DeviceControlPage(QtWidgets.QWidget):
         self._on_status = on_status
         self._getters: list = []                 # (control, current_edit) polled each tick
         self._editors: dict = {}                 # control key -> (widget, handler) for Apply
+        self._live_switches: dict = {}           # control key -> its Live (scroll-to-set) switch
 
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(*(window_pad(1),) * 4)
@@ -306,24 +308,57 @@ class _DeviceControlPage(QtWidgets.QWidget):
         self._getters.append((control, current))
 
         if writable:
-            # A single-purpose form: ctx.on_change is a no-op (nothing to re-validate live) and
-            # there is NO instant_apply -- the value is read back only when Apply is pressed, so a
-            # mistyped value never dribbles into the device mid-edit (it is validated on Apply).
+            # Two ways to write, confocal's DeviceGUI idiom (Apply mode vs a live "scroll to set"
+            # mode), toggled by the "Live" switch:
+            #   * Apply OFF (default): the editor is buffered -- edits/scroll only reach the device
+            #     when Apply is pressed (validated then), so a mistyped value never dribbles in.
+            #   * Live ON: every edit -- crucially a mouse-wheel tick on the spin box -- writes to
+            #     the device immediately (no Apply), for continuous tuning.  Same widget both ways;
+            #     the switch only flips whether the shared ``instant_apply`` path fires (the SAME
+            #     mechanism the Setting popup's apply-on-edit uses), so there is one write path.
             handler = PARAM_WIDGETS[decl.kind]
-            widget = handler.build(decl, control.getter(self.device), ParamWidgetContext())
-            edit_row = QtWidgets.QHBoxLayout()
-            edit_row.setSpacing(scaled_px(6, minimum=4))
-            edit_row.addWidget(FluentSettingRow("Set", widget, label_width=width), 1)
+            live = {"on": False}
+            ctx = ParamWidgetContext(
+                instant_apply=lambda key, value, c=control: self._write_control(c, value)
+                if live["on"] else None)
+            widget = handler.build(decl, control.getter(self.device), ctx)
+            # The Set row REUSES the Current row's geometry (same label width, control fills the
+            # rest), so the two value boxes share one right edge -- they line up exactly.  The
+            # action controls go on their OWN row below (never inline beside the editor, which is
+            # what shortened the Set box and broke the alignment), under an empty-label
+            # FluentSettingRow so Live/Apply sit under the value column too.
+            v.addWidget(FluentSettingRow("Set", widget, label_width=width))
+
+            switch = FluentSwitch("Live")
+            switch.setToolTip("Live: every edit / mouse-wheel tick writes to the device now "
+                              "(no Apply).  Off: edits apply only when you press Apply.")
             apply_btn = FluentButton("Apply", color=GREEN)
+            switch.toggled.connect(lambda on, c=control, w=widget, h=handler, a=apply_btn, s=live:
+                                   self._set_live_mode(on, c, w, h, a, s))
             apply_btn.clicked.connect(lambda _c=False, c=control, w=widget, h=handler:
                                       self._apply_control(c, w, h))
-            edit_row.addWidget(apply_btn)
-            edit_host = QtWidgets.QWidget()
-            edit_host.setStyleSheet("background: transparent;")
-            edit_host.setLayout(edit_row)
-            v.addWidget(edit_host)
+            actions = QtWidgets.QHBoxLayout()
+            actions.setContentsMargins(0, 0, 0, 0)
+            actions.setSpacing(scaled_px(6, minimum=4))
+            actions.addWidget(switch)
+            actions.addStretch(1)
+            actions.addWidget(apply_btn)
+            action_host = QtWidgets.QWidget()
+            action_host.setStyleSheet("background: transparent;")
+            action_host.setLayout(actions)
+            v.addWidget(FluentSettingRow("", action_host, label_width=width))
             self._editors[decl.key] = (widget, handler)
+            self._live_switches[decl.key] = switch
         return card
+
+    def _set_live_mode(self, on, control, widget, handler, apply_btn, live) -> None:
+        """Toggle a control between Apply mode and live "scroll to set" mode.  Engaging Live commits
+        the value currently shown (so the switch takes effect at once) and disables Apply (redundant
+        while every edit writes live); leaving Live re-enables Apply."""
+        live["on"] = bool(on)
+        apply_btn.setEnabled(not on)
+        if on:
+            self._apply_control(control, widget, handler)
 
     def _snapshot_card(self, device) -> FluentGroupBox:
         card = FluentGroupBox("Snapshot")
@@ -339,14 +374,19 @@ class _DeviceControlPage(QtWidgets.QWidget):
         return card
 
     def _apply_control(self, control, widget, handler) -> None:
-        """Read the editor by KIND (never eval), then call the control's SETTER -- value
-        validation lives in the DEVICE'S setter, so an illegal value fails there and the
-        message shows on the status line (the panel's, or the tab-owner's)."""
+        """Read the editor by KIND (never eval), then write it through the control's SETTER.  The
+        Apply button and the live "scroll to set" path share this read + :meth:`_write_control`, so
+        there is ONE write path (value validation always lives in the DEVICE'S setter)."""
         try:
             value = handler.read(widget)
         except ValueError as exc:
             self._set_status(f"{control.decl.key}: {exc}")
             return
+        self._write_control(control, value)
+
+    def _write_control(self, control, value) -> None:
+        """Call the control's SETTER with an already-read value -- validation lives in the device's
+        setter, so an illegal value fails there and its message shows on the status line."""
         try:
             control.setter(self.device, value)
         except Exception as exc:                 # the device setter rejected it (e.g. exposure <= 0)

@@ -58,6 +58,58 @@ def test_qcmos_adds_writable_readout_speed():
     assert ctrls["readout_speed"].getter(cam) == "2"
 
 
+def test_live_switch_writes_on_edit_without_apply(qt):
+    """The Live switch = confocal's scroll-to-set mode.  With Live OFF (default) an edit to the Set
+    widget is BUFFERED (only Apply writes it); with Live ON, every edit -- a mouse-wheel tick on the
+    spin box -- writes to the device immediately, and engaging Live commits the shown value.  The
+    same widget both ways, so there is one write path (the gated ``instant_apply``)."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.frontend.device_manager import _DeviceControlPage
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
+    try:
+        cam = exp.devices.camera
+        page = _DeviceControlPage(cam, role="camera")
+        widget, handler = page._editors["exposure"]
+        switch = page._live_switches["exposure"]
+
+        start = float(cam.exposure)
+        handler.write(widget, start * 2)          # edit while Live is OFF -> buffered, not written
+        assert float(cam.exposure) == start       # the device did not move
+
+        switch.setChecked(True)                   # engage Live -> commits the value shown now
+        assert float(cam.exposure) == start * 2
+        handler.write(widget, start * 3)          # now each edit (e.g. a wheel tick) writes live
+        assert float(cam.exposure) == start * 3
+
+        switch.setChecked(False)                  # leaving Live re-buffers
+        handler.write(widget, start * 4)
+        assert float(cam.exposure) == start * 3   # unchanged until Apply
+    finally:
+        exp.close()
+
+
+def test_current_and_set_rows_share_a_right_edge(qt):
+    """A control card's Current read-back and its Set editor use the SAME ``FluentSettingRow``
+    geometry, so the two value boxes line up (the alignment the inline Apply used to break -- Apply
+    now lives on its own action row below)."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.frontend.device_manager import _DeviceControlPage
+    from Zou_lab_control.frontend.qt_fluent import FluentReadoutEdit, FluentDoubleSpinBox
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
+    try:
+        page = _DeviceControlPage(exp.devices.camera, role="camera")
+        page.resize(1000, 760)
+        page.show()
+        widget, _ = page._editors["exposure"]
+        # the Current read-back for exposure is the first polled getter's edit
+        current = next(edit for control, edit in page._getters if control.decl.key == "exposure")
+        assert isinstance(current, FluentReadoutEdit) and isinstance(widget, FluentDoubleSpinBox)
+        right = lambda w: w.mapToGlobal(w.rect().topRight()).x()
+        assert right(current) == right(widget)    # one right edge -> aligned
+    finally:
+        exp.close()
+
+
 def test_device_viewer_editable_flag_toggles_write_rows(qt):
     """``DeviceViewerPanel(editable=True)`` (the default) builds editable pages + a status line for
     rejected writes; ``editable=False`` builds the read-only peek -- the ONE renderer, two modes."""
