@@ -441,11 +441,24 @@ class ReadoutSubsystem(ExperimentSubsystem):
         (a two-frame pair) and per-frame fidelity need the multi-frame PLAN structure a
         single-frame processor cannot see."""
 
-        s = self._session
         axis = ScanAxis(
             slot=slot, values=np.asarray(values, dtype=float).reshape(-1),
             label=label, unit=unit, kind=kind,
         )
+        return self._assemble_scan(controller, calibration, axis=axis, plan=plan,
+                                   reducer=reducer, shots_per_point=shots_per_point)
+
+    def _assemble_scan(
+        self, controller: Any, calibration: TrapCalibration, *,
+        axis: Any, plan: Any, reducer: Any, shots_per_point: int,
+    ) -> ScannedMeasurement:
+        """THE final assembly every scanned measurement shares: resolve the sequencer (the pulse
+        controller's own, else the session's) and wire the one :class:`ScannedMeasurement` (device
+        controller, session camera, sequencer, calibration, axis, plan, reducer).  Both the slot-sweep
+        spine (:meth:`_build_slot_scan`) and the device-control survival scan
+        (:meth:`build_device_survival_scan`) build through here, so the engine wiring + sequencer
+        fallback are spelled ONCE (the duplication the audit flagged) -- they differ only in axis/plan."""
+        s = self._session
         sequencer = getattr(controller, "sequencer", getattr(s.devices, "sequencer", None))
         return ScannedMeasurement(
             controller, s.devices.camera, sequencer, calibration,
@@ -524,12 +537,9 @@ class ReadoutSubsystem(ExperimentSubsystem):
         if per_site:
             reducer.bind_calibration(calibration)
         axis = DeviceControlAxis(values=arr, write=write, label=label, unit=unit)
-        sequencer = getattr(pulse, "sequencer", getattr(self._session.devices, "sequencer", None))
-        return ScannedMeasurement(
-            pulse, self._session.devices.camera, sequencer, calibration,
-            axis, FixedReleaseRecapturePlan(t_off_s=t_off_s), reducer,
-            shots_per_point=positive_int(shots, "shots"),
-        )
+        return self._assemble_scan(
+            pulse, calibration, axis=axis, plan=FixedReleaseRecapturePlan(t_off_s=t_off_s),
+            reducer=reducer, shots_per_point=shots)
 
     def temperature(
         self,
