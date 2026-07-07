@@ -189,6 +189,11 @@ class LoadedFigureNode(LogicNode):
         labels = saved.labels or ["X", "Y", "Z"]
         self._xlabel = str(labels[0]) if len(labels) > 0 else "X"
         self._ylabel = str(labels[1]) if len(labels) > 1 else "Y"
+        # The THIRD label is the 2D colour-bar (z) label -- the meaning of the IMAGE VALUE (e.g.
+        # "Counts").  A 2D figure's ``value`` signal carries THIS as its axis label (not ``_ylabel``,
+        # which is the pixel y-axis), so a reproduced 2D panel's colour bar shows the saved z label
+        # instead of a blank bar.  Absent (a 1-D save) -> "".
+        self._zlabel = str(labels[2]) if len(labels) > 2 else ""
 
         # bare key -> (block, SignalSpec) for every signal this node publishes, in publish order.  The
         # faithful path fills it from the stored ``info['signals']``; the fallback synthesises value/x/
@@ -240,7 +245,10 @@ class LoadedFigureNode(LogicNode):
             if bare is None or bare in self._blocks:
                 continue
             block = np.asarray(entry.get("block"))
-            label = str(entry.get("label") or (self._ylabel if role == "value" else name))
+            # A 2D figure's value = the colour-bar (z) quantity, so its fallback axis label is ``_zlabel``,
+            # NOT the pixel y-axis (matches the array-path branch above); every other kind's value axis IS y.
+            value_axis = self._zlabel if self.kind == "2d" else self._ylabel
+            label = str(entry.get("label") or (value_axis if role == "value" else name))
             unit = str(entry.get("unit") or "")
             ps = _as_tuple_or_none(entry.get("points_shape"))
             ds = _as_tuple_or_none(entry.get("data_shape"))
@@ -266,7 +274,10 @@ class LoadedFigureNode(LogicNode):
             self._role_key[role] = bare
 
         if kind in ("2d",):
-            add(FIG_VALUE_KEY, self._as_image(data_x, data_y), self._ylabel, "",
+            # A 2D image's VALUE is the colour-bar (z) quantity, so its axis label is ``_zlabel``
+            # ("Counts"), NOT the pixel y-axis ``_ylabel`` -- the reproduced panel reads it back via
+            # ``_source_axis_label`` and labels the colour bar with it (a blank z bar was the bug).
+            add(FIG_VALUE_KEY, self._as_image(data_x, data_y), self._zlabel, "",
                 "the saved figure's primary data (data_y)", "value")
         elif kind in ("sites",):
             add(FIG_VALUE_KEY, self._first_column(data_y), self._ylabel, "",

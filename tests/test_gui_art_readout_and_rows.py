@@ -45,6 +45,28 @@ def test_figure_viewer_shows_labels_per_axis_not_a_list_repr(qt, tmp_path):
     assert not any(v.startswith(("[", "(")) and "'" in v for v in values), values
 
 
+def test_figure_viewer_2d_reproduction_renders_the_colorbar_z_label(qt, tmp_path):
+    """A saved 2D figure's THIRD label is the colour-bar (z) quantity ("Counts").  The reproduced 2D
+    panel must LABEL its colour bar with it -- the figure node has to carry the z label onto the value
+    signal (not drop it / mislabel it with the pixel y-axis), and the 2D panel builder has to read it
+    onto the bar (it used to hard-code the z label to "").  A blank colour bar is the regression."""
+    from Zou_lab_control.neutral_atom.views.plots import plot_image
+    from Zou_lab_control.frontend.figure_viewer import FigureViewer
+    fig = plot_image(np.random.default_rng(1).poisson(300, size=(24, 24)).astype(float),
+                     display=False, labels=("Camera x (px)", "Camera y (px)", "Counts"))
+    out = fig.save(str(tmp_path / "shot2d"))
+    viewer = FigureViewer()
+    viewer.open_path(str(out["data"]))
+    zlabels = []
+    for card in getattr(viewer.console, "cards", []):
+        plotter = getattr(card, "_plotter", None) or getattr(card, "plotter", None)
+        cax = getattr(plotter, "cax", None)
+        if cax is not None:                       # a 2D image panel owns a colour-bar axis
+            zlabels.append(getattr(plotter, "zlabel", "") or cax.get_ylabel())
+    assert zlabels, "the reproduced figure had no 2D colour-bar panel"
+    assert "Counts" in zlabels, zlabels
+
+
 def test_device_manager_loaded_row_is_compact_and_cannot_overflow(qt):
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.frontend.device_manager import DeviceManagerPanel

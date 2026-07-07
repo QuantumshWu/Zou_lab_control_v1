@@ -3707,7 +3707,12 @@ class PanelCard(FluentGroupBox):
                 data_x, arr.ravel(), kind="2d", size=size, interactions=True,
                 cmap=_resolved_cmap("2d", self.config.params),   # operator pick, else the kind default (ONE resolver)
                 **self._view_kwargs("2d"),
-                labels=(xlabel, ylabel, ""), title=self.config.title or None)
+                # The colour-bar (z) label is the VALUE's meaning -- read from the bound signal's own axis
+                # label (the producing node's SignalSpec, the SAME single source the 1D y-axis / monitor
+                # use), so a camera frame's "Counts" (or a loaded 2D figure's saved z label) shows on the
+                # bar instead of a blank strip.  Absent -> "" (no label), the old behaviour.
+                labels=(xlabel, ylabel, self._source_axis_label() or ""),
+                title=self.config.title or None)
         elif kind == "monitor":
             # Declared PANEL_PARAMS defaults via the ONE _resolved_param resolver (never a
             # re-typed consume-site literal); the >=20 floor mirrors the decl's lo bound.
