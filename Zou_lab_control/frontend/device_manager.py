@@ -1074,28 +1074,41 @@ def show_device_manager(device_set=None, *, initial_config=None, session_binding
 
 
 class DeviceViewerPanel(QtWidgets.QWidget):
-    """A READ-ONLY device viewer: one tab per loaded device, each a read-only
-    ``_DeviceControlPage`` (snapshot + live runtime read-backs, NO config editor, NO
-    add/remove, NO writes).  This is the safe device view the task console offers -- an
-    operator can SEE a device's exposure / firing state / snapshot while an experiment runs,
-    but cannot mutate ``session.devices`` from here (the full config editor stays the
-    ``exp.device_manager()`` / ``na.device_manager()`` entry).  Built from the SAME
-    ``_DeviceControlPage`` as the manager's Control tab, in its ``read_only`` form -- one
-    device-view renderer, two entry points."""
+    """The task console's device viewer: one tab per loaded device, each a ``_DeviceControlPage``
+    (snapshot + live runtime read-backs; NO config editor, NO add/remove).  ``editable=True`` (the
+    default) also renders the Set / Apply rows for each device's WRITABLE ``runtime_controls`` -- so an
+    operator can tweak a device's basic parameters LIVE, like an API call (a camera's exposure / ROI /
+    readout speed, the sequencer's sleep scale), with the write going through the device's own setter
+    (validation stays in the device; a rejected write shows on the status line) and the 200 ms poll
+    refreshing the read-back.  Construction args (host/port/serial/channels) are NOT here -- those
+    rebuild the device and live in the full config editor (``exp.device_manager()``).  Built from the
+    SAME ``_DeviceControlPage`` as the manager's Control tab -- one device-view renderer, one entry
+    point per session; pass ``editable=False`` for a pure read-only peek."""
 
-    def __init__(self, device_set=None, *, devices_provider=None, parent=None):
+    def __init__(self, device_set=None, *, devices_provider=None, editable: bool = True, parent=None):
         super().__init__(parent)
         # ``devices_provider`` (a callable -> DeviceSet) is preferred so a re-open re-reads the
         # session's CURRENT set (load_config replaces it); a bare device_set is the static fallback.
         self._devices_provider = devices_provider
         self._device_set = device_set
+        self._editable = bool(editable)
 
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(*(window_pad(1),) * 4)
         outer.setSpacing(window_pad(0.5))
         self._tabs = FluentTabWidget()
         outer.addWidget(self._tabs, 1)
+        # ONE status line the editable pages route rejected/accepted writes to (each page's setter
+        # validates in the device; the message surfaces here) -- omitted when read-only.
+        self._status = FluentLabel("") if self._editable else None
+        if self._status is not None:
+            self._status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            outer.addWidget(self._status)
         self._build_tabs()
+
+    def _set_status(self, text: str) -> None:
+        if self._status is not None:
+            self._status.setText(str(text))
 
     def _devices(self) -> dict:
         try:
@@ -1119,17 +1132,20 @@ class DeviceViewerPanel(QtWidgets.QWidget):
             self._tabs.add_permanent_tab(placeholder, "Devices")
             return
         for name in sorted(devices):
-            page = _DeviceControlPage(devices[name], role=name, read_only=True)
+            page = _DeviceControlPage(devices[name], role=name,
+                                      read_only=not self._editable, on_status=self._set_status)
             self._tabs.add_permanent_tab(page, name)
 
 
-def show_device_viewer(device_set=None, *, devices_provider=None):
-    """Open the READ-ONLY device viewer in a standalone Fluent window -- the task console's
-    "Devices" peek (one read-only tab per loaded device: snapshot + live read-backs, no
-    editing).  Distinct from ``show_device_manager`` (the full config editor); this window can
-    never mutate the session's devices."""
+def show_device_viewer(device_set=None, *, devices_provider=None, editable: bool = True):
+    """Open the device viewer in a standalone Fluent window -- the task console's per-device tabs
+    (snapshot + live read-backs).  ``editable=True`` (default) also lets the operator EDIT each
+    device's basic runtime parameters live, like an API call (exposure / ROI / readout speed / sleep
+    scale), the write going through the device's own validated setter.  It does NOT rebuild devices or
+    edit construction args (host/port/channels) -- that stays the full config editor
+    (``show_device_manager`` / ``exp.device_manager()``).  Pass ``editable=False`` for a read-only peek."""
     ensure_qt_app()
     set_fluent_scale(None)   # the ONE shared GUI-scale rule (auto from the primary screen)
-    panel = DeviceViewerPanel(device_set, devices_provider=devices_provider)
+    panel = DeviceViewerPanel(device_set, devices_provider=devices_provider, editable=editable)
     return launch_fluent_window(panel, title="Device viewer@Zou lab", fixed_size=False,
                                 size=(scaled_px(WINDOW_SIZE[0]), scaled_px(WINDOW_SIZE[1])))

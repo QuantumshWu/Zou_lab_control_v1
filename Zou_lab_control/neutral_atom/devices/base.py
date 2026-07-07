@@ -488,6 +488,18 @@ class CameraDevice(BaseDevice):
         def _fmt_channels(value) -> str:
             return ", ".join(str(c) for c in (value or ())) or "(none)"
 
+        def _set_roi(dev, value) -> None:
+            # Route the WRITE through the one ``configure(roi=...)`` API -- the SAME call the notebook
+            # makes, so its normalize/validate (``normalize_roi`` / clear sentinels) is the single
+            # boundary.  Accept the read-back's own spelling ("full frame" / a "(x, w, y, h)" tuple) so
+            # what the field shows round-trips: blank / full -> whole sensor, else four ints.
+            text = str(value).strip().lower()
+            if text in ("", "full", "full frame", "none"):
+                dev.configure(roi=FULL_FRAME)   # the CLEAR sentinel (configure(roi=None) means "unchanged")
+                return
+            parts = [int(float(p)) for p in text.replace("(", "").replace(")", "").split(",") if p.strip()]
+            dev.configure(roi=tuple(parts))
+
         return (
             RuntimeControl(
                 ParamDecl(key="exposure", label="exposure", kind="float", unit="s",
@@ -498,8 +510,10 @@ class CameraDevice(BaseDevice):
                 setter=lambda dev, value: setattr(dev, "exposure", float(value))),
             RuntimeControl(
                 ParamDecl(key="roi", label="ROI", kind="text",
-                          tooltip="Sub-array readout window (x, width, y, height), or full frame."),
-                getter=lambda dev: "full frame" if dev.roi is None else str(tuple(int(v) for v in dev.roi))),
+                          tooltip="Sub-array readout window as x, width, y, height (or 'full' for the "
+                                  "whole sensor).  Applied via the device's own configure(roi=...)."),
+                getter=lambda dev: "full frame" if dev.roi is None else str(tuple(int(v) for v in dev.roi)),
+                setter=_set_roi),
             RuntimeControl(
                 ParamDecl(key="sensor_shape", label="sensor", kind="text",
                           tooltip="Full sensor size (height, width) in pixels."),

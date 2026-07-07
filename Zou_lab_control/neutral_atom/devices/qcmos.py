@@ -282,6 +282,23 @@ class QCMOSCamera(CameraDevice):
         if self._dcam is not None:
             self._write_settings()
 
+    def runtime_controls(self):
+        """The qCMOS live controls: the shared camera set (exposure / ROI / geometry) PLUS the WRITABLE
+        ``readout_speed`` (this backend's extra live knob) -- a backend that has more knobs than the
+        contract extends ``super().runtime_controls()`` here.  The write routes through the ONE
+        ``configure(readout_speed=...)`` (validated by ``nonnegative_int``, pushed to open hardware via
+        ``_write_settings``), so the GUI never re-implements the device's own validation."""
+        from .base import RuntimeControl
+        from ..core.params import ParamDecl
+        return super().runtime_controls() + (
+            RuntimeControl(
+                ParamDecl(key="readout_speed", label="readout speed", kind="choice",
+                          choices=("1", "2"), default="1",
+                          tooltip="qCMOS readout speed: 1 = ultra-quiet (low read noise), 2 = standard (fast)."),
+                getter=lambda dev: str(dev.config.readout_speed),
+                setter=lambda dev, value: dev.configure(readout_speed=int(value))),
+        )
+
     def open(self) -> "QCMOSCamera":
         if self._dcam is not None:
             return self
