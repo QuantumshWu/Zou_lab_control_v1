@@ -864,6 +864,26 @@ class FluentTriStateToggle(QtWidgets.QAbstractButton):
         return self._state
 
 
+def _apply_fluent_context_menu(widget, event) -> None:
+    """Pop ``widget``'s right-click menu with the Fluent rounded-card chrome instead of the platform's
+    opaque SQUARE "black box" menu.  The ONE shared context-menu builder for every editable text widget
+    (``FluentLineEdit``, ``FluentReadoutMultiline``, ``FluentCodeEdit``): it REUSES Qt's own standard
+    context menu -- so Undo / Cut / Copy / Paste / Delete / Select-All stay wired to THAT widget -- and
+    only swaps the container, re-homing the actions into a :class:`_FluentRoundedMenu` (ownership moved
+    via ``setParent`` before the throwaway standard menu is disposed, so its teardown cannot delete them
+    out from under the Fluent menu).  A read-only widget's standard menu is just Copy / Select-All; it is
+    styled identically -- no widget special-cases the menu.  ``_FluentRoundedMenu`` resolves at call time,
+    so this may sit above its definition."""
+    std = widget.createStandardContextMenu()
+    menu = _FluentRoundedMenu(widget)
+    for act in list(std.actions()):
+        act.setParent(menu)
+        menu.addAction(act)
+    std.deleteLater()
+    menu.exec_(event.globalPos())
+    event.accept()
+
+
 class FluentLineEdit(QtWidgets.QLineEdit):
     def __init__(self, text: str = "", parent=None):
         super().__init__(text, parent)
@@ -891,21 +911,7 @@ class FluentLineEdit(QtWidgets.QLineEdit):
         )
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        """Right-click menu with the Fluent rounded-card chrome instead of the platform's opaque SQUARE
-        menu (the "black box" the default QLineEdit pops).  It REUSES Qt's own standard context menu, so
-        Undo / Cut / Copy / Paste / Delete / Select-All stay wired to THIS edit -- only the container is
-        swapped: the actions are re-homed into a :class:`_FluentRoundedMenu` (the ONE Fluent menu, shared
-        with the tab-overflow list) so a right-click surface matches every other popup in the app.
-        Ownership of each action is transferred (``setParent``) before the throwaway standard menu is
-        disposed, so its teardown cannot delete them out from under the Fluent menu."""
-        std = self.createStandardContextMenu()
-        menu = _FluentRoundedMenu(self)
-        for act in list(std.actions()):
-            act.setParent(menu)
-            menu.addAction(act)
-        std.deleteLater()
-        menu.exec_(event.globalPos())
-        event.accept()
+        _apply_fluent_context_menu(self, event)
 
     def setText(self, text: str) -> None:  # noqa: N802 - Qt API name
         text = str(text)
@@ -1045,6 +1051,9 @@ class FluentReadoutMultiline(QtWidgets.QPlainTextEdit):
         self.textChanged.connect(self._adjust_height)
         self.document().documentLayout().documentSizeChanged.connect(lambda *_: self._adjust_height())
         self._adjust_height()
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        _apply_fluent_context_menu(self, event)   # Fluent right-click (Copy / Select-All), not the native menu
 
     def _apply_style(self) -> None:
         # The SAME readout chrome as FluentReadoutEdit: grey fill (not white -> not an input) + a faint
@@ -2469,6 +2478,9 @@ class FluentCodeEdit(QtWidgets.QPlainTextEdit):
             f'border-radius: {scaled_px(4)}px; font: {fluent_font_size()}pt "Consolas", "Courier New", '
             f'monospace; padding: {pad}px; }}')
         apply_fluent_scrollbars(self)
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        _apply_fluent_context_menu(self, event)   # Fluent right-click (undo/cut/copy/paste), not the native menu
 
 
 class FluentFloatingEditor(QtWidgets.QDialog):

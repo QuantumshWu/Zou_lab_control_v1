@@ -60,6 +60,7 @@ from .qt_fluent import (
     FluentStatusDot,
     FluentTabWidget,
     batched_updates,
+    _popup_gap,
     ensure_qt_app,
     fluent_font_size,
     launch_fluent_window,
@@ -907,7 +908,7 @@ class DeviceManagerPanel(QtWidgets.QWidget):
         scroll.setWidgetResizable(True)
         v.addWidget(scroll, 1)
         popup.setFixedSize(scaled_px(340), scaled_px(360))
-        popup.move(anchor.mapToGlobal(QtCore.QPoint(0, anchor.height() + scaled_px(4))))
+        popup.move(anchor.mapToGlobal(QtCore.QPoint(0, anchor.height() + _popup_gap())))
         popup.show()
 
     # ------------------------------------------------------------------ config file actions

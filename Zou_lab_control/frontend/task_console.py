@@ -70,6 +70,7 @@ from .qt_fluent import (
     TEXT,
     WINDOW_SCREEN_FRACTION,
     YELLOW,
+    _popup_gap,
     fluent_message,
     FluentButton,
     FluentCodeEdit,
@@ -2359,7 +2360,7 @@ class PanelCard(FluentGroupBox):
         self._size_settings_popup()                        # height: show-all, grow-not-shrink (#H3i-2)
         screen = QtWidgets.QApplication.primaryScreen()
         avail = screen.availableGeometry() if screen is not None else None
-        top_y = anchor.y() + scaled_px(2)
+        top_y = anchor.y() + _popup_gap()   # the ONE below-anchor Fluent popup gap (combo / overflow share it)
         x = anchor.x() - popup.width()
         if avail is not None:
             x = max(avail.left(), min(x, avail.right() - popup.width()))
@@ -2380,7 +2381,7 @@ class PanelCard(FluentGroupBox):
         screen = QtWidgets.QApplication.primaryScreen()
         avail = screen.availableGeometry() if screen is not None else None
         anchor_y = self.setting_button.mapToGlobal(QtCore.QPoint(0, self.setting_button.height())).y()
-        top_y = anchor_y + scaled_px(2)
+        top_y = anchor_y + _popup_gap()      # match the same gap the open path (above) uses to place it
         content = self._settings_scroll.widget()
         content_h = (content.sizeHint().height() if content is not None else popup.height()) + 2 * scaled_px(10)
         # The cap is the PLOT PANEL's own bottom edge (the popup opens just below the gear near the

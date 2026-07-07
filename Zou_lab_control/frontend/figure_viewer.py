@@ -774,7 +774,7 @@ class FigureViewer(QtWidgets.QWidget):
             bits = ", ".join(
                 f"{name}[{entry.get('role', '?')}]"
                 for name, entry in signals.items() if isinstance(entry, Mapping))
-            meas_rows.append(("signals", bits or str(list(signals))))
+            meas_rows.append(("signals", bits or sorted(signals)))   # a list -> _readout_field joins it (no list repr)
         if self._current_path is not None:
             meas_rows.append(("path", display_path(str(self._current_path))))
         self._fill_rows(self.meas_layout, meas_rows)
@@ -821,8 +821,21 @@ class FigureViewer(QtWidgets.QWidget):
         """The ONE read-only value control for an Info row: a :class:`FluentReadoutMultiline` that SOFT-
         WRAPS a long value (a resolved path, a device-metadata blob, a data shape) over as many lines as
         it needs instead of a single-line edit clipping it.  Ignored horizontal policy so the row/column
-        drives the width; the field auto-sizes its OWN height to the wrapped content (up to its cap)."""
-        field = FluentReadoutMultiline(str(value))
+        drives the width; the field auto-sizes its OWN height to the wrapped content (up to its cap).
+
+        A collection is rendered HUMAN-readably here (the ONE place, so no row can leak a Python repr): a
+        list -> comma-joined items, a dict -> ``k=v`` pairs, an ndarray -> ``array(shape) dtype`` -- NOT
+        ``['a', 'b']`` / ``{'a': 1}`` with quotes and braces.  A plain TUPLE stays as-is because a shape
+        (``(1920, 1080)``) already reads cleanly; a scalar is just ``str``."""
+        if isinstance(value, Mapping):
+            text = ", ".join(f"{k}={v}" for k, v in value.items())
+        elif isinstance(value, list):
+            text = ", ".join(str(v) for v in value)
+        elif isinstance(value, np.ndarray):
+            text = f"array{tuple(value.shape)} {value.dtype}"
+        else:
+            text = str(value)
+        field = FluentReadoutMultiline(text)
         field.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
         return field
 
