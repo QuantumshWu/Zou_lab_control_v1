@@ -167,11 +167,8 @@ class VirtualLaser(LaserDevice):
     def on_d1(self) -> bool:
         return abs(self.wavelength_nm - RB87_D1_WAVELENGTH_NM) <= self.D1_WINDOW_NM
 
-    def snapshot(self) -> dict[str, object]:
-        out = super().snapshot()
-        out.update({"wavelength_nm": self.wavelength_nm, "saturation": self.saturation,
-                    "beam_on": self.beam_on, "on_d1": self.on_d1})
-        return out
+    # No snapshot override: BaseDevice.snapshot auto-dumps every DeviceProperty knob above
+    # (wavelength_nm / saturation / beam_on / on_d1) -- the knob is declared once, dumped from that.
 
 
 class VirtualRF(RFSourceDevice):
@@ -221,12 +218,8 @@ class VirtualRF(RFSourceDevice):
         self.frequency_hz = frequency_hz      # through the descriptor (clamps to [0, 2e10])
         self.power_dbm = power_dbm            # clamps to [-100, 40]
 
-    def snapshot(self) -> dict[str, object]:
-        out = super().snapshot()
-        out.update({"frequency_hz": self.frequency_hz, "power_dbm": self.power_dbm,
-                    "two_photon_detuning_gamma": self.two_photon_detuning_gamma,
-                    "drive_on": self.drive_on, "waveform": self.waveform})
-        return out
+    # No snapshot override: BaseDevice.snapshot auto-dumps every DeviceProperty knob above
+    # (two_photon_detuning_gamma / frequency_hz / power_dbm / drive_on / waveform) from the one decl.
 
 
 @dataclass

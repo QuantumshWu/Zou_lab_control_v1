@@ -217,7 +217,16 @@ class BaseDevice(ABC):
         pass
 
     def snapshot(self) -> dict[str, Any]:
-        return {"type": type(self).__name__}
+        """A frozen read-only dump of the device's identity + every LIVE knob it declares.  The
+        ``type`` key leads (its single producer, see ``test_snapshot_type_key...``); then every
+        :class:`DeviceProperty` value is auto-included -- the knob is DECLARED once (the descriptor)
+        and DUMPED from that one declaration, so a backend never re-lists its knobs in a snapshot
+        override (the laser / RF used to).  A backend overrides this only to add NON-property facts
+        (a camera's exposure / roi, a sequencer's channel labels) via ``super().snapshot()``."""
+        out: dict[str, Any] = {"type": type(self).__name__}
+        for name, prop in collect_device_properties(type(self)).items():
+            out[name] = prop.__get__(self, type(self))
+        return out
 
     # ------------------------------------------------------------- config schema
     # A device class DESCRIBES ITS OWN config form: the three hooks below are what a
@@ -322,11 +331,17 @@ class ReadOnlyDevice:
 
 
 def read_only(device):
-    """The observe-mode view of ``device``: narrowed to its class's ``OBSERVE_API`` (walked
-    over the MRO so a contract subclass extends, never re-lists, its parent's surface)."""
+    """The observe-mode view of ``device``: narrowed to its side-effect-free surface -- the ONE
+    place the observe whitelist is assembled.  Two sources, both derived so a knob is declared once:
+    the explicit ``OBSERVE_API`` (walked over the MRO so a contract subclass extends, never re-lists,
+    its parent's non-property read-backs -- ``snapshot`` / a camera's ``latest`` / ``drain``), PLUS
+    every :class:`DeviceProperty` NAME the device declares (a live knob's getter is side-effect-free,
+    and the proxy blocks writes anyway).  So the laser / RF no longer hand-list their knob names in
+    OBSERVE_API -- adding a DeviceProperty auto-exposes it to observe mode."""
     allowed: set = set()
     for cls in type(device).__mro__:
         allowed.update(getattr(cls, "OBSERVE_API", ()))
+    allowed.update(collect_device_properties(type(device)))     # every declared live knob is a safe read
     return ReadOnlyDevice(device, allowed)
 
 
@@ -1095,12 +1110,11 @@ class LaserDevice(BaseDevice):
     wavemeter + AOM servo behind these; the virtual one is a pure set-point.  ``runtime_controls`` is
     the ONE editable / observed surface (virtual == real inherits the same set)."""
 
-    OBSERVE_API = BaseDevice.OBSERVE_API | frozenset(
-        {"saturation", "wavelength_nm", "beam_on", "on_d1"})
-
-    # The laser's live controls are DERIVED from the DeviceProperty knobs a concrete backend declares
-    # (:class:`~..devices.virtual.VirtualLaser` wavelength / saturation / beam_on / on_d1) -- the base
-    # ``runtime_controls`` builds the catalog from them, so this contract adds no hand-written override.
+    # The laser's live controls AND its observe surface AND its snapshot are ALL derived from the
+    # DeviceProperty knobs a concrete backend declares (:class:`~..devices.virtual.VirtualLaser`
+    # wavelength / saturation / beam_on / on_d1): ``runtime_controls`` builds the catalog, ``read_only``
+    # auto-exposes every knob name, and ``BaseDevice.snapshot`` auto-dumps every knob value.  So this
+    # contract needs no hand-written OBSERVE_API / snapshot -- declaring a knob once is enough.
 
 
 class RFSourceDevice(BaseDevice):
@@ -1115,12 +1129,11 @@ class RFSourceDevice(BaseDevice):
     also writable): setting either moves the same drive.  The device owns the δ<->frequency conversion
     (its atomic reference), so a scan just writes δ in Γ and every backend converts identically."""
 
-    OBSERVE_API = BaseDevice.OBSERVE_API | frozenset(
-        {"frequency_hz", "power_dbm", "two_photon_detuning_gamma", "drive_on", "waveform"})
-
-    # The RF source's live controls are DERIVED from the DeviceProperty knobs the concrete backend
-    # declares (:class:`~..devices.virtual.VirtualRF` two-photon δ / frequency / power / drive_on /
-    # waveform) -- the base ``runtime_controls`` builds them, so no hand-written override here.
+    # The RF source's live controls AND observe surface AND snapshot are ALL derived from the
+    # DeviceProperty knobs the concrete backend declares (:class:`~..devices.virtual.VirtualRF`
+    # two-photon δ / frequency / power / drive_on / waveform): ``runtime_controls`` builds the catalog,
+    # ``read_only`` auto-exposes every knob name, ``BaseDevice.snapshot`` auto-dumps every value -- so
+    # no hand-written OBSERVE_API / snapshot here (declaring each knob once is the single source).
 
 
 def snap_subarray(roi, *, step: int, max_w: int, max_h: int):

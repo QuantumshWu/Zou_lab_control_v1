@@ -28,7 +28,8 @@ if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
 from Zou_lab_control.neutral_atom.devices.base import (
-    BaseDevice, SOFTWARE_TRIGGER, is_software_trigger)
+    BaseDevice, DeviceProperty, LaserDevice, RFSourceDevice, SOFTWARE_TRIGGER,
+    collect_device_properties, is_software_trigger, read_only)
 from Zou_lab_control.neutral_atom.devices.camera_trigger import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS, base_cycle_camera_trigger_pulses,
     base_cycle_trigger_pulses, count_camera_trigger_pulses, count_trigger_pulses,
@@ -38,7 +39,7 @@ from Zou_lab_control.neutral_atom.devices.qcmos import QCMOSCamera, QCMOSConfig
 from Zou_lab_control.neutral_atom.devices.sequencer import (
     ManualSequencer, RemoteSequencer, RuntimeSequencer, SequencerService, VerilogSequencer)
 from Zou_lab_control.neutral_atom.devices.virtual import (
-    VirtualCamera, VirtualMotCamera, VirtualSequencer, VirtualTrapArray)
+    VirtualCamera, VirtualLaser, VirtualMotCamera, VirtualRF, VirtualSequencer, VirtualTrapArray)
 from Zou_lab_control.neutral_atom.timing import PulseSequence
 
 
@@ -194,6 +195,40 @@ def test_snapshot_type_key_is_produced_only_by_the_base_class(monkeypatch):
     for dev in devices:
         assert dev.snapshot()["type"] == f"SENTINEL:{type(dev).__name__}", (
             f"{type(dev).__name__}.snapshot() does not source its 'type' from BaseDevice.snapshot")
+
+
+# --------------------------------------------------------------- [5b] DeviceProperty is the ONE source
+def test_snapshot_and_observe_are_derived_from_device_properties():
+    """A device's LIVE knobs are declared ONCE as :class:`DeviceProperty`; both its ``snapshot`` dump
+    AND its ``read_only`` observe surface DERIVE from that one declaration -- so a NEW knob needs no
+    snapshot re-list and no OBSERVE_API entry (the duplication that used to be kept in sync by hand)."""
+    class _Probe(BaseDevice):
+        gain = DeviceProperty("float", lo=0.0, hi=10.0, default=2.5)
+        mode = DeviceProperty("choice", choices=("a", "b"), default="a")
+
+    dev = _Probe()
+    snap = dev.snapshot()
+    assert next(iter(snap)) == "type"                       # identity still leads the dump
+    assert snap["gain"] == 2.5 and snap["mode"] == "a"      # every knob auto-dumped (no override)
+    ro = read_only(dev)
+    assert ro.gain == 2.5 and ro.mode == "a"                # observe view can READ every declared knob
+    with pytest.raises(PermissionError):
+        ro.gain = 9.0                                       # ...but never WRITE (the read-only proxy)
+
+
+def test_laser_rf_do_not_re_list_their_knobs():
+    """The laser / RF no longer hand-list their DeviceProperty knob names in a snapshot override OR an
+    OBSERVE_API set -- both derive from the property declarations, so the drift trap (add a knob, forget
+    to also add it to the snapshot AND the observe whitelist) is structurally gone."""
+    assert "snapshot" not in VirtualLaser.__dict__ and "snapshot" not in VirtualRF.__dict__
+    assert "OBSERVE_API" not in LaserDevice.__dict__ and "OBSERVE_API" not in RFSourceDevice.__dict__
+    for dev in (VirtualLaser(), VirtualRF()):
+        snap, ro = dev.snapshot(), read_only(dev)
+        knobs = list(collect_device_properties(type(dev)))
+        assert knobs, f"{type(dev).__name__} should declare DeviceProperty knobs"
+        for knob in knobs:                                  # every declared knob: dumped AND observable
+            assert knob in snap, f"{type(dev).__name__}.snapshot dropped {knob}"
+            assert getattr(ro, knob) == snap[knob], f"{type(dev).__name__} observe/snapshot disagree on {knob}"
 
 
 # --------------------------------------------------------------- [6] settle scaling single home
