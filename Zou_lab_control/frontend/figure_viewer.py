@@ -489,7 +489,7 @@ class FigureViewer(QtWidgets.QWidget):
         self._current_path: Path | None = None
 
         self._label_w = setting_label_width(
-            ["name", "source", "kind", "labels", "unit", "data_x", "data_y",
+            ["name", "source", "kind", "x label", "y label", "z label", "unit", "data_x", "data_y",
              "points", "repeat", "saved", "view", "fit", "path", "signals"])
         # The fixed Info-column width; the console is sized to fill the REST of the screen budget beside
         # it (so the whole window stays within the shared screen-fraction rule, no board clipping).  The
@@ -727,7 +727,14 @@ class FigureViewer(QtWidgets.QWidget):
         plot_rows: list[tuple[str, object]] = [
             ("name", saved.name),
             ("kind", _kind_label(saved.kind) or saved.kind),
-            ("labels", saved.labels),
+        ]
+        # ``saved.labels`` is the ``(xlabel, ylabel[, zlabel])`` axis TUPLE -- show each axis on its OWN
+        # row (the real per-axis label the figure draws), NEVER the whole tuple's list repr
+        # (``['Camera x (px)', ...]``), which is not a label anything renders.  Skip empty/absent axes.
+        for axis_key, label in zip(("x label", "y label", "z label"), saved.labels or ()):
+            if str(label).strip():
+                plot_rows.append((axis_key, label))
+        plot_rows += [
             ("unit", saved.unit),
             ("saved", saved.saved_at),
         ]

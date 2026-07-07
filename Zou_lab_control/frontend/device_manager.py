@@ -812,17 +812,20 @@ class DeviceManagerPanel(QtWidgets.QWidget):
         except Exception as exc:
             self._loaded_body.addWidget(self._muted(f"session devices unavailable: {exc}"))
             return
-        width = setting_label_width(list(devices) or ["(none)"])
         for name in sorted(devices):
             device = devices[name]
+            # SAME plain-row shape the Discovered list uses (an action list, NOT a param FORM -- so it
+            # does NOT take the fixed setting_label-width column a FluentSettingRow reserves).  The row
+            # IDENTITY is the role name, ELIDED (full role + device class in the tooltip) so it can never
+            # widen the pane into a horizontal scroll of the whole right panel; the two fixed action
+            # buttons then always fit.  The device CLASS is redundant with the LEFT config editor, so it
+            # rides the tooltip instead of a middle column that only ever got squeezed to nothing.
             line = QtWidgets.QHBoxLayout()
+            line.setContentsMargins(0, 0, 0, 0)
             line.setSpacing(scaled_px(6, minimum=4))
-            control = QtWidgets.QWidget()
-            control.setStyleSheet("background: transparent;")
-            control.setLayout(line)
-            # elides (full name in the tooltip) so the row can never widen the column into
-            # a horizontal scroll of the whole right panel
-            line.addWidget(ElidedLabel(type(device).__name__), 1)
+            role = ElidedLabel(name)
+            role.setToolTip(f"{name} — {type(device).__name__}")
+            line.addWidget(role, 1)
             ctrl_btn = FluentButton("Control", color=ACCENT)
             ctrl_btn.setToolTip("Open a live control tab: this device's runtime knobs + snapshot.")
             ctrl_btn.clicked.connect(lambda _c=False, n=name, d=device: self._open_control_tab(n, d))
@@ -831,7 +834,10 @@ class DeviceManagerPanel(QtWidgets.QWidget):
             snap_btn.clicked.connect(
                 lambda _c=False, n=name, d=device, b=snap_btn: self._show_snapshot(n, d, b))
             line.addWidget(snap_btn)
-            self._loaded_body.addWidget(FluentSettingRow(name, control, label_width=width))
+            host = QtWidgets.QWidget()
+            host.setStyleSheet("background: transparent;")
+            host.setLayout(line)
+            self._loaded_body.addWidget(host)
         if not devices:
             self._loaded_body.addWidget(self._muted("no device loaded"))
 
