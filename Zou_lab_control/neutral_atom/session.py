@@ -28,7 +28,7 @@ from .core.results import (
 from .core.utils import html_summary, json_ready
 from .devices import CameraDevice, DeviceSet, SequencerDevice, load_devices, resolve_connect_config
 from .operations import calibrate_sitemap_from_images, calibrate_threshold_from_images, detect_image
-from .timing import PulseSequence, imaging_channel_kwargs, imaging_sequence
+from .timing import DEFAULT_EXPOSURE_S, PulseSequence, imaging_channel_kwargs, imaging_sequence
 from .subsystems import ExperimentSubsystem, ReadoutSubsystem, TimingSubsystem
 
 
@@ -384,8 +384,8 @@ class NeutralAtomSession:
         composes imaging sequences with the stock default (no fabricated device needed)."""
         camera = getattr(self.devices, "camera", None)
         if camera is None:
-            return 20e-3
-        return float(getattr(camera, "exposure", getattr(getattr(camera, "config", None), "exposure", 20e-3)))
+            return DEFAULT_EXPOSURE_S
+        return float(getattr(camera, "exposure", getattr(getattr(camera, "config", None), "exposure", DEFAULT_EXPOSURE_S)))
 
     def resolve_grid_shape(self, grid_shape: Sequence[int] | None) -> tuple[int, int]:
         """Resolve a tweezer grid shape -- the explicit ``grid_shape`` if given, else the

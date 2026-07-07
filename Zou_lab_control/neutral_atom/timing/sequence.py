@@ -305,10 +305,17 @@ class PulseReport:
 # trap-held gap of this length between its image frames.
 READOUT_GAP_SECONDS = 100e-6
 
+#: The default readout exposure -- the qCMOS ~20 ms working point where single-shot bright/dark counts
+#: fully separate.  THE single source for every "default exposure": the camera config defaults (qCMOS /
+#: virtual), the session's fallback when no camera exposure is known, the imaging-sequence + reference-
+#: bracket LONG exposure, and the virtual fake-data reference frame -- so moving the working point moves
+#: them all together (the short readout / calibration exposures are distinct values, left as-is).
+DEFAULT_EXPOSURE_S = 20e-3
+
 
 def imaging_sequence(
     *,
-    exposure: float = 20e-3,
+    exposure: float = DEFAULT_EXPOSURE_S,
     trigger_width: float = 20e-6,
     pre_trigger: float = 100e-6,
     load: bool = False,
@@ -343,7 +350,7 @@ def imaging_sequence(
 
 def reference_bracket_sequence(
     *,
-    ref_exposure: float = 20e-3,
+    ref_exposure: float = DEFAULT_EXPOSURE_S,
     readout_exposure: float = 5e-3,
     n_ref: int = 2,
     trigger_width: float = 20e-6,

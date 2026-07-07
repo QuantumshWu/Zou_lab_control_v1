@@ -1,6 +1,7 @@
 """Pulse-sequence and Verilog timing layer."""
 
 from .sequence import (
+    DEFAULT_EXPOSURE_S,
     Pulse,
     PulseReport,
     PulseSequence,
@@ -61,6 +62,7 @@ __all__ = [
     "ANALOG_BUS_MODES",
     "API_SLOT_KINDS",
     "BUS_SAFE_SIGNED_LEVEL",
+    "DEFAULT_EXPOSURE_S",
     "DELAY_MAX_TICKS",
     "PROBE_TEMPLATE_PATH",
     "SCAN_SLOT_KINDS",

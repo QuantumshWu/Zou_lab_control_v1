@@ -11,6 +11,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from ..core.analysis import nonnegative_int, positive_float, positive_int
+from ..timing import DEFAULT_EXPOSURE_S
 from .base import (
     ROI_CLEAR_SENTINELS,
     AcquisitionCancelled,
@@ -89,7 +90,7 @@ def _dcam_release(api) -> None:
 class QCMOSConfig:
     """Configuration for the thin real qCMOS adapter."""
 
-    exposure: float = 20e-3
+    exposure: float = DEFAULT_EXPOSURE_S
     readout_speed: int = 1
     roi: tuple[int, int, int, int] | None = None
     device_index: int = 0

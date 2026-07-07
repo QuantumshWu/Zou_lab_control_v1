@@ -33,6 +33,7 @@ from .camera_trigger import (
 )
 from ..timing import (
     BUS_SAFE_SIGNED_LEVEL,
+    DEFAULT_EXPOSURE_S,
     PulseSequence,
     PulseTableState,
     probe_channel_set,
@@ -989,7 +990,7 @@ class _TriggerWiredCamera(CameraDevice):
 
 
 class VirtualCamera(_TriggerWiredCamera):
-    def __init__(self, trap_array: VirtualTrapArray, exposure: float = 20e-3, timeout: float = 2.0,
+    def __init__(self, trap_array: VirtualTrapArray, exposure: float = DEFAULT_EXPOSURE_S, timeout: float = 2.0,
                  subarray_step: int = 4, capture_trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
                  sequencer=None):
         self.trap_array = trap_array
@@ -1698,7 +1699,7 @@ def write_virtual_run(
     short_shot: int = 3,
     ref_shots: Sequence[int] = (1, 2, 4),
     short_exposure: float = 3e-3,
-    reference_exposure: float = 20e-3,
+    reference_exposure: float = DEFAULT_EXPOSURE_S,
     grid_shape: tuple[int, int] = (5, 7),
     loading_probability: float = 0.55,
     seed: int | None = None,
