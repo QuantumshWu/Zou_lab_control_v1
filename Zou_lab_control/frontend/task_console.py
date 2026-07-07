@@ -4278,8 +4278,7 @@ class MeasurementPanel(QtWidgets.QWidget):
         # ONE label-column width for this form: fit the widest SCALAR-row label (composites carry
         # their own section header, so they are not row labels).  Single rule via setting_label_width.
         scalar_labels = [
-            (d.label or d.key) + (f" ({d.unit})" if d.unit else "") + (" *" if d.required else "")
-            for d in decls if d.kind not in SPAN_KINDS
+            d.row_label() for d in decls if d.kind not in SPAN_KINDS      # single source: label + (unit) [+ *]
         ]
         self._form_label_w = setting_label_width(scalar_labels or [""], minimum=72)
         ctx = self._param_context()
@@ -4288,9 +4287,7 @@ class MeasurementPanel(QtWidgets.QWidget):
             # Show the READABLE label ("Pulse template" / "Signal (y)" / "Output name"), not the
             # raw build-call key ("template" / "y" / "y_name") -- the key is unreadable in a form
             # an experimenter actually uses (#H3); the tooltip still carries the full meaning.
-            label_text = (decl.label or decl.key) + (f" ({decl.unit})" if decl.unit else "")
-            if decl.required:
-                label_text += " *"
+            label_text = decl.row_label()           # single source: label + (unit) [+ *]
             handler = PARAM_WIDGETS[kind]
             # build the widget seeded from the decl's default (a saved value is applied later by
             # seed_values); the handler wires ctx.on_change (re-validate) onto its change signals.
@@ -5089,17 +5086,22 @@ class PanelEditor(QtWidgets.QWidget):
         # the earlier bug -- meant zoom did nothing.)
         area = getattr(self._plotter, "area", None)
         zoom = getattr(self._plotter, "zoom", None)
-        writeback = None
-        # A plot is a pure view: the only writeback a plot Edit does is a 2D
-        # region select back to its upstream camera node's ROI (a 1D scan-range
-        # writeback belongs to the measurement's OWN Logic-tab Edit, not here).
+        # A plot is a pure view that only ever yields the marked rectangle (endpoints) in plot coords;
+        # the PRODUCING node converts that to its own parameter -- so no device/measurement shape leaks
+        # into the GUI, and the SAME rule serves every source:
+        #   * a 2D IMAGE  -> the upstream camera node's ROI (endpoints -> sub-array), on zoom AND select;
+        #   * a 1D CURVE of a scanning measurement -> that measurement's scan x-range (its axis_range
+        #     param), on a DELIBERATE drag-select only (a mere zoom must not restage the scan).
+        # The 1-D case is gated on the node DECLARING a scan range (``_node_scan_range_key``), so EVERY
+        # measurement with an axis_range param gets the linkage by construction (never wired per node).
         if kind == "2d" and self._node is not None:
-            writeback = self._read_region
-        if writeback is not None:
             if area is not None:
-                area.callback = writeback
+                area.callback = self._read_region
             if zoom is not None:
-                zoom.callback = writeback
+                zoom.callback = self._read_region
+        elif self._node is not None and self.console._node_scan_range_key(self._node) is not None:
+            if area is not None:
+                area.callback = self._read_x_range
         self.status.setText("snapshot of current data — fit / set limits / save are frozen here"
                             if self.fit_combo is not None else
                             "snapshot of current data — Save Fig is frozen here")
@@ -5278,6 +5280,24 @@ class PanelEditor(QtWidgets.QWidget):
                 filled[name] = value
         if filled:
             self.status.setText(f"region from view: {filled} — Apply to use it")
+
+    def _read_x_range(self) -> None:
+        """Confocal ``_read_range`` for a 1-D CURVE panel, GENERIC over the source.
+
+        A drag-selected x-interval on a scanning measurement's plot becomes that measurement's NEXT
+        scan x-range.  The selector knows only the endpoints (plot coords); they are staged onto the
+        PRODUCING measurement's OWN Logic-tab Edit form (its first ``axis_range`` param, via
+        ``MeasurementPanel.set_axis_range``), so ANY measurement that declares a scan range gets this by
+        construction and the plot stays a pure view with no measurement internals.  ``Start`` on that
+        form then re-runs the scan over the marked range (confocal's mark-then-rerun)."""
+        if self._node is None:                     # the plotter-dependence lives in _selected_rect (None-safe)
+            return
+        x1, x2, y1, y2 = self._selected_rect()
+        if x1 is None:
+            return
+        form = self.console._form_for_node(self._node)
+        if form is not None and form.set_axis_range(x1, x2):
+            self.status.setText(f"scan range from view: [{x1:g}, {x2:g}] — Start to use it")
 
     def refresh_node_now_labels(self) -> None:
         """Update the 'now: <value>' references beside each Acquisition field to the
@@ -6459,6 +6479,38 @@ class TaskConsole(QtWidgets.QWidget):
         for row in self.logic_nodes:
             if self._logic_nodes.get(id(row)) is node:
                 return row
+        return None
+
+    def _node_scan_range_key(self, node) -> str | None:
+        """The first ``axis_range`` param key of ``node``'s spec -- i.e. the node's swept x-axis, or
+        None when it does not scan a range.  The ONE data-driven test for "a selection on this node's
+        1-D plot can set its scan range", so the plot-selection -> scan-range linkage is enforced for
+        EVERY measurement that declares a scan range, never wired per measurement.
+
+        ``node`` is a BUILT running node, so the spec is resolved via its Logic row's config
+        (``_spec_for_logic`` reads a ``LogicNodeConfig``, not a built node)."""
+        if node is None:
+            return None
+        for row in self.logic_nodes:
+            if self._logic_nodes.get(id(row)) is node:
+                spec = self._spec_for_logic(row.node)
+                for param in getattr(spec, "params", ()) or ():
+                    if getattr(param, "kind", "") == "axis_range":
+                        return param.key
+                return None
+        return None
+
+    def _form_for_node(self, node):
+        """The producing node's OWN Logic-tab Edit FORM (the :class:`MeasurementPanel` that carries its
+        scan range), OPENING its editor if not already open so a staged range always has somewhere to
+        land.  The seam a 1-D plot selection uses to reach the measurement's scan-range param
+        (node -> row -> editor.form), keeping the plot itself decoupled from the form's internals."""
+        for row in self.logic_nodes:
+            if self._logic_nodes.get(id(row)) is node:
+                if self._logic_editors.get(id(row)) is None:
+                    self._edit_logic_node(row)          # lazily create + show the node's Edit tab
+                editor = self._logic_editors.get(id(row))
+                return editor.form if editor is not None else None
         return None
 
     def _apply_source_params(self, row: "LogicNodeRow", values: dict) -> None:

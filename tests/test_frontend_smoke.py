@@ -1834,6 +1834,72 @@ def test_edit_area_select_fills_measurement_scan_range(monkeypatch):
         console.shutdown()
 
 
+def test_1d_scan_plot_selection_stages_producing_measurement_range(monkeypatch):
+    """The measurement Edit <-> plot x-range linkage is enforced AT THE BASE, not wired per
+    measurement: a drag-select on a 1-D plot of a SCANNING measurement's signal stages that
+    measurement's next scan x-range onto its OWN Logic-tab Edit form -- for EVERY measurement that
+    declares an ``axis_range`` param, so a newly added one (e.g. gm_detuning) can never silently lose
+    the linkage the way a hand-wired one would.
+
+    The gap this pins: the plot-side selector callback was only wired for 2-D (ROI); a 1-D scan plot
+    left it unwired, so ``MeasurementPanel.set_axis_range`` (tested in isolation above) was never
+    actually reached from a real selection.  Here the plot's selector IS ``_read_x_range`` and calling
+    it fills the producing measurement's range."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.task_console import LogicNodeConfig, PanelCard, PanelConfig
+
+    console = dt.demo_console_measurements()
+    try:
+        # every scanning measurement in the catalog declares an axis_range param -- the data-driven
+        # gate the console keys the linkage off of (never a per-measurement flag).
+        scan_specs = [s for s in console.measurements
+                      if any(getattr(p, "kind", "") == "axis_range" for p in getattr(s, "params", ()))]
+        assert scan_specs, "expected at least one scanning measurement (axis_range param) in the catalog"
+
+        staged_any = False
+        for spec in scan_specs:
+            row = console._add_logic_node(
+                LogicNodeConfig(kind="measurement", name=spec.name, title=spec.name), focus=False)
+            console._start_logic_node(row)
+            node = console._logic_nodes.get(id(row))
+            if node is None:                       # a build needing a device we lack -> skip that spec
+                continue
+            # BASE seam 1: the console resolves this scanning node's scan-range key (its x-axis).
+            key = console._node_scan_range_key(node)
+            assert key is not None, f"{spec.name}: a scanning measurement must expose a scan-range key"
+            y_signal = f"{node.prefix}{node.y_key}"
+
+            # a 1-D plot of that measurement's y signal, its Edit opened (builds the snapshot + wiring)
+            card = PanelCard(PanelConfig(kind="1d", title=f"scan {spec.name}", size="2x2",
+                                         source=f"value = {y_signal}"), parent=console.board)
+            console._edit_card(card)
+            editor = console._panel_editors[id(card)]
+            assert editor._node is node, "the 1-D plot's producing node is the scanning measurement"
+
+            # THE WIRING (the gap): the plot's area selector drives the scan-range writeback (not the
+            # 2-D ROI one, and not left unwired).
+            area = getattr(editor._plotter, "area", None)
+            if area is not None:
+                assert area.callback is editor._read_x_range
+
+            # invoking it (as a real drag-select would) stages the marked x-range onto the producing
+            # measurement's OWN Edit form -- reached generically via set_axis_range.
+            monkeypatch.setattr(editor, "_selected_rect", lambda: (18.0, 91.0, 0.0, 1.0))
+            editor._read_x_range()
+            form = console._form_for_node(node)
+            ax = form._widgets[key]
+            assert ax.min_spin.value() == 18.0 and ax.max_spin.value() == 91.0
+            staged_any = True
+            break                                  # one scanning measurement proves the base rule
+
+        assert staged_any, "no scanning measurement could be started to verify the range linkage"
+    finally:
+        console.shutdown()
+
+
 def test_task_console_sites_panel_bad_centers_isolated(monkeypatch):
     """A site-map panel whose ONE occupancy signal has NO producing node that supplies centres
     (so the centres + frame underlay cannot be auto-resolved) reports the error on ITS

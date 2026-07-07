@@ -1699,6 +1699,29 @@ contract test — the single mechanical guard. Change the framework = change the
   `ParamDecl` with a `display` data flag), so a ParamDecl kind is rendered/read/seeded/validated in
   ONE place. Adding a kind = one whitelist entry + one handler. Guard:
   `tests/test_param_widget_registry.py`.
+  - **Numeric widget = spin box, decided on the declaration.** `FloatHandler`/`IntHandler` build a blank
+    line edit vs a scrollable `FluentDoubleSpinBox` from the ONE predicate `ParamDecl.blank_allowed`
+    (explicit `optional` wins; else infer "no default and not required" = an optional API arg). A device
+    knob is never blank, so `RuntimeControl.__post_init__` pins its numeric decl `optional=False` (and
+    clears `required`) — every device float/int control is a scrollable spin box BY CONSTRUCTION, an
+    author can't declare one that degrades to a line edit. Guard:
+    `test_device_runtime_controls.py::test_every_numeric_device_control_renders_a_scrollable_spinbox`.
+  - **Row label + unit are one source.** `ParamDecl.row_label()` = `"<label> (<unit>) *"` — the ONE
+    thing the config editor, device viewer, measurement Edit, Setting popup, and signal-expr title read
+    (no re-typed idiom). A live READ-BACK is engineering-scaled with its unit SI-prefixed via the ONE
+    `param_widgets.format_reading` (`6.8e9 Hz -> "6.8 GHz"`, using `qt_fluent.eng_mantissa_prefix`); the
+    editable spin box stays plain decimal (confocal never SI-scales its editor).
+  - **Wiring rule is one helper.** Every handler routes its change signal through `param_widgets._wire`
+    (re-validate + optional instant-apply); the composite `signal_expr`/`pulse_slots` handlers were the
+    two that bypassed it. Guard: `test_param_widget_registry.py::test_editable_handlers_route_edits_through_instant_apply`.
+- **Plot selection -> scan range (confocal `_read_range`), enforced at the base.** A 1-D plot of a
+  scanning measurement's signal wires its area selector to `PanelEditor._read_x_range`, gated on the
+  producing node DECLARING a scan axis (`TaskConsole._node_scan_range_key` = the node's first
+  `axis_range` param) — so EVERY measurement with a scan range gets the linkage, never wired per node
+  (the drift that left `gm_detuning` without it). The selection is staged onto the producing
+  measurement's OWN Logic-tab Edit form (`_form_for_node` -> `MeasurementPanel.set_axis_range`); a 2-D
+  image plot still routes to the camera node's ROI (`_read_region` -> `region_to_acquisition_parameters`).
+  Guard: `test_frontend_smoke.py::test_1d_scan_plot_selection_stages_producing_measurement_range`.
 - **Plot kinds** — `frontend/live.py::PLOT_KINDS` (tuple of `PlotKind`: key/cls/label/render_family/
   panel/input_format/input_slots/single_slot) is the single source; `live.plot()` looks the class up
   and task_console's `PANEL_KINDS`/`PANEL_INPUT_FORMAT`/`PANEL_INPUT_SLOTS`/`PANEL_SINGLE_SLOT_KINDS`
