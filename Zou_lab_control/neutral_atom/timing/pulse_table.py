@@ -2036,6 +2036,34 @@ def infer_bus_channels(
     return out
 
 
+def channels_as_buses(
+    channels: Sequence[str],
+    channel_labels: Mapping[str, str] | None = None,
+    *,
+    min_width: int = 2,
+) -> list[str]:
+    """The channel catalog as a USER sees a DAC device: the multi-bit coil DACs folded into their bus
+    (``dx0``..``dz5`` -> ``da_x``/``da_y``/``da_z``), every plain channel kept as-is, in hardware order.
+
+    This is the ONE fold a device SNAPSHOT / viewer uses to report channels the way the pulse editor
+    draws them -- three physical analog buses, not 18 separate bit lines.  Reads the SAME
+    :func:`infer_bus_channels` fold the editor uses (a bus needs its labels; with none, or fewer than
+    ``min_width`` contiguous bits, the raw channel list comes back unchanged, so real == virtual once the
+    real board's labels are loaded)."""
+    buses = infer_bus_channels(channels, channel_labels, min_width=min_width)
+    member_to_bus = {ch: base for base, members in buses.items() for ch in members}
+    out: list[str] = []
+    emitted: set[str] = set()
+    for channel in channel_names(channels, "channels"):
+        base = member_to_bus.get(channel)
+        if base is None:
+            out.append(channel)
+        elif base not in emitted:
+            out.append(base)
+            emitted.add(base)
+    return out
+
+
 def bus_period_levels(
     plan: Sequence[Mapping[str, object]], starts: Sequence[int], *, looping: bool = False
 ) -> list[tuple[int, int, int, int, str]]:

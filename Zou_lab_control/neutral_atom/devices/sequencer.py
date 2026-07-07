@@ -1277,7 +1277,7 @@ class ManualSequencer(SequencerDevice):
     def snapshot(self) -> dict[str, object]:
         out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot
         out.update({
-            "channels": list(self.channels),
+            "channels": self.display_channels(),   # DAC coil bits folded into buses (ONE source)
             "clock_hz": self.clock_hz,
             "state": self.state,
             "prepared": self.prepared_sequence is not None,

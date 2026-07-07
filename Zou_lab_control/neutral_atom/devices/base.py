@@ -798,6 +798,18 @@ class SequencerDevice(BaseDevice):
         from .sequencer import SCAN_PROGRESS_IDLE
         return dict(SCAN_PROGRESS_IDLE)
 
+    def display_channels(self) -> list[str]:
+        """The output channel catalog as a USER sees it: the multi-bit coil DACs folded into their bus
+        (``dx0``..``dz5`` -> ``da_x``/``da_y``/``da_z``), every plain channel as-is.  The ONE source the
+        snapshot AND the ``channels`` read-back present, so a physical DAC bus shows as ONE channel, not
+        its six separate bit lines (the "counted separately" complaint).  Reads the SAME
+        ``channels_as_buses`` fold the pulse editor draws with -- it needs the backend's
+        ``channel_labels``; with none (or non-contiguous bits) the raw catalog comes back unchanged, so
+        real == virtual once the board's labels are loaded.  The raw catalog stays on ``self.channels``
+        for the compiler; this is display only."""
+        from ..timing import channels_as_buses
+        return channels_as_buses(getattr(self, "channels", ()), getattr(self, "channel_labels", None))
+
     def runtime_controls(self) -> tuple["RuntimeControl", ...]:
         """The sequencer's live control catalog (see :meth:`BaseDevice.runtime_controls`): the
         read-only firing / progress / geometry read-backs a monitor shows, plus the WRITABLE
@@ -830,8 +842,9 @@ class SequencerDevice(BaseDevice):
                 getter=_fmt_progress),
             RuntimeControl(
                 ParamDecl(key="channels", label="channels", kind="text",
-                          tooltip="The sequencer's output channel names."),
-                getter=lambda dev: str(len(getattr(dev, "channels", ()) or ())) + " channels"),
+                          tooltip="The sequencer's output channels (multi-bit DAC coils shown as ONE bus)."),
+                getter=lambda dev: ", ".join(dev.display_channels()) if hasattr(dev, "display_channels")
+                else str(len(getattr(dev, "channels", ()) or ())) + " channels"),
         ]
         # ``sleep_scale`` is a WRITABLE knob only where the backend actually carries a settable
         # attribute (the virtual sequencer's plain instance field); a real/remote streamer has

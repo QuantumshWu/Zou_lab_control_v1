@@ -93,3 +93,31 @@ def test_custom_channel_list_drops_unused_coil_labels():
     (never a bus whose members are absent)."""
     seq = VirtualSequencer(channels=("trap", "cooling", "probe", "emCCD"))
     assert seq.channel_labels == {}
+
+
+def test_channels_as_buses_folds_the_dac_coils():
+    """``channels_as_buses`` (the ONE fold a device snapshot / viewer uses) collapses the 18 coil bit
+    lines into the three ``da_*`` buses and keeps every plain channel -- so the device presents its 3
+    physical DAC buses, not 18 separate lines."""
+    from Zou_lab_control.neutral_atom.timing import channels_as_buses
+    seq = VirtualSequencer()
+    folded = channels_as_buses(seq.channels, seq.channel_labels)
+    assert {"da_x", "da_y", "da_z"} <= set(folded)
+    coils = {ch for members in MOT_COIL_BUSES.values() for ch in members}
+    assert not (set(folded) & coils), "a folded bus must not also list its raw bit lines"
+    for ch in seq.channels:                      # every non-coil channel survives, in order
+        if ch not in coils:
+            assert ch in folded
+
+
+def test_sequencer_snapshot_and_readback_report_folded_channels():
+    """The sequencer's OBSERVE surface (snapshot + the ``channels`` runtime-control read-back) presents
+    the DAC as buses, NOT 18 separately-counted bit lines -- the "counted separately" report.  Both read
+    the ONE ``display_channels`` source, and the raw catalog stays on ``self.channels`` for the compiler."""
+    seq = VirtualSequencer()
+    snap = seq.snapshot()
+    assert "da_x" in snap["channels"] and "dx0" not in snap["channels"]
+    assert seq.display_channels() == snap["channels"]            # ONE source
+    assert list(seq.channels) != snap["channels"]                # raw 25 kept for the compiler, folded for display
+    readback = {c.decl.key: c.getter(seq) for c in seq.runtime_controls()}["channels"]
+    assert "da_x" in readback and "dx0" not in readback

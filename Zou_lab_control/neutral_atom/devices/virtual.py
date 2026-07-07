@@ -1525,7 +1525,7 @@ class VirtualSequencer(SequencerDevice):
     def snapshot(self) -> dict[str, object]:
         out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot
         out.update({
-            "channels": list(self.channels),
+            "channels": self.display_channels(),   # DAC coil bits folded into da_x/da_y/da_z buses (ONE source)
             "clock_hz": self.clock_hz,
             "sleep_scale": self.sleep_scale,
             "runs": sum(1 for row in self.history if row["action"] == "fire"),
