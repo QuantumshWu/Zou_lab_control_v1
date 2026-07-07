@@ -666,7 +666,17 @@ class VivadoAxiStreamerSession:
         except Exception:
             st_before = -1
         self._command(CMD_FIRE)
-        (self.state_dir / "fire_time.txt").write_text(str(time.monotonic()), encoding="utf-8")
+        # The FPGA is now firing.  ``fire_time.txt`` is a best-effort diagnostic breadcrumb (never
+        # read back at runtime), so a disk error writing it must NOT bubble out of fire() and make
+        # the caller believe the ALREADY-SUCCESSFUL fire failed -- which would retry / safe a running
+        # engine (double-fire or an early stop).  Log and continue: the pulse has already started.
+        try:
+            (self.state_dir / "fire_time.txt").write_text(str(time.monotonic()), encoding="utf-8")
+        except OSError:
+            import logging
+            logging.getLogger(__name__).warning(
+                "fire(): could not write fire_time.txt (diagnostic only; the FPGA already fired)",
+                exc_info=True)
         # finite run with delayed signals: record the drain deadline (fire + undelayed
         # duration + tail) so a back-to-back prepare() cannot chop the delayed tail.
         # repeat_forever has no natural end -- switching programs is an explicit stop.

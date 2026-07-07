@@ -4284,6 +4284,43 @@ def test_vivado_axi_session_loads_and_fires_edge_table_program(tmp_path):
     assert hw.bram[CtrlWords.SCAN_COUNT] == 3  # scan points uploaded
 
 
+def test_fire_survives_a_fire_time_write_error(tmp_path, monkeypatch):
+    """fire() writes a diagnostic ``fire_time.txt`` AFTER ``CMD_FIRE`` has already started the FPGA;
+    a disk error on that best-effort breadcrumb must NOT bubble (which would make the caller believe
+    the already-running fire failed and retry / safe it).  The pulse is fired regardless."""
+    import pathlib
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import StreamerParams
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    params = StreamerParams(max_edges=16, bank_size=4)
+    program = RuntimeSequenceProgram(
+        sequence_id="s", sequence_name="s", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 50, 400], masks=[0, 1, 0], duration=8e-6,
+        repeat_forever=False, loop_start_index=0, loop_end_tick=400, loop_count=1,
+        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
+        tick_slot_coeffs=[[0], [256], [0]], scan_points=[[0]], scan_coeff_frac_bits=8,
+    )
+    hw = _FakeStreamerHardware(params)
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
+    session.prepare(program)
+    real_write = pathlib.Path.write_text
+
+    def boom(self, *a, **k):
+        if self.name == "fire_time.txt":
+            raise OSError("No space left on device")
+        return real_write(self, *a, **k)
+
+    monkeypatch.setattr(pathlib.Path, "write_text", boom)
+    try:
+        session.fire()                              # must NOT raise despite the breadcrumb write error
+        assert hw.fired                             # ... and the FPGA really fired
+    finally:
+        monkeypatch.undo()
+        session.safe_state()
+
+
 def test_vivado_axi_session_streams_unbounded_scan(tmp_path):
     """A scan with more points than the 2-bank window (N > 2*bank_size) STREAMS:
     wait_done polls CURSOR and refills each freed ping-pong bank with the next
