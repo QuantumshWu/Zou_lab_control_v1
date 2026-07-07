@@ -641,4 +641,7 @@ def decode_analog_bus(sequence: "PulseSequence", members, at_time: float) -> int
         # beside its wire-layer siblings bus_zero_code/bus_signed_range -- the one safe-state source).
         from .pulse_table import BUS_SAFE_SIGNED_LEVEL
         return BUS_SAFE_SIGNED_LEVEL
-    return word - (1 << (len(members) - 1))
+    # code -> signed = code - zero_code (the ONE mid-scale helper, not the re-typed 1<<(B-1));
+    # lazy import for the same load-time cycle reason as BUS_SAFE_SIGNED_LEVEL above.
+    from .pulse_table import bus_zero_code
+    return word - bus_zero_code(len(members))

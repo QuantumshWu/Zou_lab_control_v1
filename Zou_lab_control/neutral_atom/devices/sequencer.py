@@ -28,6 +28,7 @@ from ..timing.pulse_table import (
     UNITS_TO_NS,
     analog_bus_ticks as _pulse_table_analog_bus_ticks,
     _analog_bus_value_at_tick as _pulse_table_analog_bus_value_at_tick,
+    bus_zero_code,
     snap_scan_table as _snap_scan_table,
     slot_ref_index as _parse_slot_ref_index,
 )
@@ -2248,8 +2249,8 @@ def _pulse_table_edge_table(
             if all(str(entry.get("mode", "hold")).lower() == "hold" for entry in plan):
                 continue
             # plan values are SIGNED (0 = 0 V); the folded member bits carry the
-            # offset-binary CODE = signed + zero_code.
-            fold_zero_code = 1 << (len(members) - 1)
+            # offset-binary CODE = signed + zero_code (the ONE mid-scale helper, not re-typed).
+            fold_zero_code = bus_zero_code(len(members))
             bus_ticks = sorted(set(_pulse_table_analog_bus_ticks(plan, starts)) | {0})
             for tick in bus_ticks:
                 if tick < 0 or tick > table_end:
@@ -2464,7 +2465,7 @@ def _pulse_table_bus_segments(
         # fire-once (ramp from idle), loop (converge to flat) AND scan (staircase from the prior point).
         # WIRE CONVERSION: plan values are SIGNED (0 = true 0 V); segments carry the offset-binary
         # CODE = signed + zero_code.  The hardware idles at zero_code (BUS_SAFE_VALUE).
-        zero_code = 1 << (len(members) - 1)
+        zero_code = bus_zero_code(len(members))          # the ONE mid-scale helper (not re-typed)
 
         def _emit():
             """Walk this bus's periods, emitting one segment per edge/ramp period (hold emits none).
