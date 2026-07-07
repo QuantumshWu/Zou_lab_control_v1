@@ -21,7 +21,7 @@ import numpy as np
 
 from ...core.analysis import positive_int
 from ...core.params import ParamDecl
-from ..measurement import MeasurementSpec, axis_range_tuple
+from ..measurement import SCAN_TIER_COUPLED, SCAN_TIER_KEY, MeasurementSpec, axis_range_tuple
 from ..measurement_registry import measurement
 # Reuse the release-recapture template preparation the Temperature measurement already owns (channel
 # mapping onto this sequencer + exposure match to the calibration) -- same release-recapture pulse,
@@ -110,5 +110,5 @@ def grey_molasses_detuning(readout) -> MeasurementSpec:
         # survival PEAK; convert the peak survival to temperature with na.fit_temperature if wanted.
         metadata={"analysis_fit": "optimum = argmax(survival); "
                                   "operations.temperature.fit_temperature(capture_radius=...) for T",
-                  "scan_tier": "coupled"},
+                  SCAN_TIER_KEY: SCAN_TIER_COUPLED},
     )

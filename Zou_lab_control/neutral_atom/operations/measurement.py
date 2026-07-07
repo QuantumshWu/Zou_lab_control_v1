@@ -39,6 +39,21 @@ from ..timing.sequence import snap_seconds_to_clock
 from ..views.plots import plot_detection_scan
 
 
+#: Spec-metadata key + the value that routes :meth:`MeasurementSpec.make_node` to the DECOUPLED
+#: pulse-scan node (:class:`~.logic.PulseScanNode`) instead of the frame-reducing
+#: :class:`~.logic.ScannedMeasurementNode` -- the ONE source read by BOTH the spec that SETS it
+#: (``measurements/pulse_scan.py``) and ``make_node`` that DISPATCHES on it, so the tag can't drift.
+NODE_META_KEY = "node"
+PULSE_SCAN_NODE = "pulse_scan"
+
+#: The metadata marker every COUPLED-tier measurement (temperature / fidelity-vs-duration /
+#: grey-molasses-detuning -- the pulse-scan special cases whose y is reduced INLINE over a loading's
+#: frames) tags its spec with -- the ONE source (was hand-typed ``"coupled"`` in each spec), read by
+#: the docs and ``tests/test_scan_tier_boundary.py``.
+SCAN_TIER_KEY = "scan_tier"
+SCAN_TIER_COUPLED = "coupled"
+
+
 def triggered_frames(camera, sequencer, sequence, frames: int = 1, *, stop=None) -> list:
     """THE arm-before-fire shot: arm the camera, fire N trigger edges, read the frames back.
 
@@ -299,7 +314,7 @@ class MeasurementSpec(CatalogSpec):
         built = self.build(**values)
         prefix = str(prefix)
         repeat = max(0, int(repeat))
-        if self.metadata.get("node") == "pulse_scan":
+        if self.metadata.get(NODE_META_KEY) == PULSE_SCAN_NODE:
             return PulseScanNode(hub, built, x_key=self.x_key, y_key=self.y_key,
                                  prefix=prefix, repeat=repeat)
         return ScannedMeasurementNode(hub, built, x_key=self.x_key, y_key=self.y_key,

@@ -1885,6 +1885,10 @@ class _SweptBlockMeasurement(Measurement):
         a scalar).  Requires ``x_key``/``y_key`` already set: the node's short label derives here
         (the instance prefix stem, else the y key) so neither twin retypes the fallback."""
         self.node_label = str(self.prefix).rstrip("_") or str(self.y_key)
+        # The RAW y block is THE contract's primary-shape signal -- set here (not per twin) so a new
+        # swept node can never forget it and silently lose the (ring, *points, *data) publish guard
+        # (``_assert_primary_shape`` no-ops when ``primary_signal`` is falsy).
+        self.primary_signal = self.y_key
         self._set_repeat_ring(repeat)                 # block depth: K passes for finite, 1 (rolling) for INF
         self._index = 0                               # within-pass point index (0..n_points-1)
         self._pass = 0                                # 0-based pass currently being filled
@@ -1894,6 +1898,31 @@ class _SweptBlockMeasurement(Measurement):
         # RAW (repeat, *points_shape, *data_shape), NaN = not-yet-measured; filled in place by
         # (pass, point) and published whole (the plot reduces the leading repeat axis).
         self._raw = np.full((self._ring, *self.points_shape, *self.data_shape), np.nan, dtype=float)
+
+    SCAN_DONE = "scan_done"                            # the ONE finite-scan-complete sentinel key
+
+    def _swept_publish(self, extra: "dict | None" = None) -> dict[str, object]:
+        """Build + publish the standard swept-scan block: the FULL stable x axis, the RAW
+        ``(repeat, *points, *data)`` y block, and the ``scan_done`` flag, plus any per-twin ``extra``
+        (a 2-D grid block).  The ONE place the swept output dict is built, so neither twin can drift
+        the published-key set."""
+        out = {self.x_key: self._values.copy(),
+               self.y_key: self._publish_raw(),
+               self.SCAN_DONE: 1.0 if self.finished else 0.0}
+        if extra:
+            out.update(extra)
+        return self._assert_primary_shape(out)
+
+    def _bare_published_signals(self) -> frozenset:
+        """The swept node's OWN outputs (behind ``prefix``): x axis + RAW y block + scan_done.  A twin
+        with an extra output (a 2-D grid block) extends this via ``super()``."""
+        return frozenset((self.x_key, self.y_key, self.SCAN_DONE))
+
+    def _scan_done_spec(self) -> "SignalSpec":
+        """The ONE ``scan_done`` SignalSpec both twins publish -- so the sentinel's label / meaning is
+        declared once and can never drift between the scan drivers (it had already drifted)."""
+        return SignalSpec(self.SCAN_DONE, "scan complete", "",
+                          "1.0 once the finite scan has measured its final point")
 
     @property
     def n_points(self) -> int:
@@ -2018,7 +2047,6 @@ class ScannedMeasurementNode(_SweptBlockMeasurement):
         # (the reducer's series count, so a per-site reducer makes dim = n_sites).
         n_series = max(1, int(getattr(measurement.reducer, "n_series", 1)))
         self._init_swept_block(values=measurement.axis.values, data_shape=(n_series,), repeat=repeat)
-        self.primary_signal = self.y_key                       # the (repeat,n_points,dim) block (#H3r-F4)
 
     def _wrapped_devices(self) -> tuple:
         """The hardware the wrapped :class:`ScannedMeasurement` drives -- this node is a WRAPPER
@@ -2051,14 +2079,7 @@ class ScannedMeasurementNode(_SweptBlockMeasurement):
         self._fill_point(index, row)                      # base owns slot/pass-clear/advance (#E4)
 
         self._current_source_shot = self.hub.next_source_shot()   # one SOURCE-shot per scan point (#shot-clock)
-        return self._assert_primary_shape({
-            self.x_key: self._values.copy(),             # the FULL x axis, stable from shot 1
-            self.y_key: self._publish_raw(),             # RAW (repeat, points, dim) -- plot reduces it
-            "scan_done": 1.0 if self.finished else 0.0,
-        })
-
-    def _bare_published_signals(self) -> frozenset:
-        return frozenset((self.x_key, self.y_key, "scan_done"))
+        return self._swept_publish()                     # x axis + RAW y block + scan_done (base owns the dict)
 
     def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
         """x / y axis labels + units come from the swept measurement itself (the scan AXIS for x,
@@ -2072,7 +2093,7 @@ class ScannedMeasurementNode(_SweptBlockMeasurement):
         return (
             SignalSpec(self.x_key, xlabel, xunit, "scan x axis (the swept parameter)"),
             SignalSpec(self.y_key, ylabel, "", "raw (repeat, points, dim) block; plot reduces repeats"),
-            SignalSpec("scan_done", "scan complete", "", "1 once the final point is measured"),
+            self._scan_done_spec(),                      # the ONE scan_done spec (base-owned, can't drift)
         )
 
 
@@ -2168,7 +2189,6 @@ class PulseScanNode(_SweptBlockMeasurement):
         else:
             swept_values = np.array([0.0])
         self._init_swept_block(values=swept_values, data_shape=(1,), repeat=repeat)
-        self.primary_signal = self.y_key                       # the (repeat,n_points,1) block (#H3r-F4)
         # 2-D scan: the flattened points reshape to this (n0, n1) image on a 2-D panel (#H3o); the
         # data stays a scalar, so the 2-D-ness is HERE, not in data_shape.
         self.grid_shape: tuple = tuple(self.scan_shape) if self.scan_shape else ()
@@ -2189,9 +2209,9 @@ class PulseScanNode(_SweptBlockMeasurement):
         the console map a panel back to THIS node (so the 1-D frame-title reads ``<y> <-
         pulse_scan``) and resolve x.  Both y signals are RAW (repeat-axis kept) -- the PLOT
         reduces them; the node never combines repeats."""
-        keys = [self.x_key, self.y_key, "scan_done"]
+        keys = set(super()._bare_published_signals())     # x + RAW y + scan_done (base-owned)
         if self.scan_shape is not None:
-            keys.append(self.y_key + "_grid")
+            keys.add(self.y_key + "_grid")
         return frozenset(keys)
 
     def _unprefixed_published_signals(self) -> frozenset:
@@ -2209,7 +2229,7 @@ class PulseScanNode(_SweptBlockMeasurement):
         specs = [
             SignalSpec(self.x_key, self._axis_label, self._axis_unit, "scan x axis (the swept parameter)"),
             SignalSpec(self.y_key, self.y_key, "", "raw (repeat, points, 1) block; plot reduces repeats"),
-            SignalSpec("scan_done", "scan done", "", "1.0 when the finite scan has completed"),
+            self._scan_done_spec(),                       # the ONE scan_done spec (base-owned, can't drift)
         ]
         if self.scan_shape is not None:
             specs.append(SignalSpec(self.y_key + "_grid", self.y_key, "",
@@ -2281,12 +2301,9 @@ class PulseScanNode(_SweptBlockMeasurement):
         if self.extra_delay_s > 0.0 and self.sequencer is not None and not self._stop.is_set():
             self.sequencer.settle(self.extra_delay_s, stop=self._stop)
         self._fill_point(index, y)                        # base owns slot/pass-clear/advance (#E4)
-        out = {self.x_key: self._values.copy(),
-               self.y_key: self._publish_raw(),          # RAW (repeat, points, 1) -- plot reduces it
-               "scan_done": 1.0 if self.finished else 0.0}
-        if self.scan_shape is not None:
-            out[self.y_key + "_grid"] = self._publish_grid()   # RAW (repeat, n0, n1) -- plot reduces it
-        return self._assert_primary_shape(out)
+        # the 2-D scan additionally publishes the RAW grid block; the base owns x + RAW y + scan_done.
+        extra = {self.y_key + "_grid": self._publish_grid()} if self.scan_shape is not None else None
+        return self._swept_publish(extra)
 
     def _await_y_inputs(self, before: dict) -> bool:
         """Block until the picked y signals have advanced past ``before`` (a per-signal version

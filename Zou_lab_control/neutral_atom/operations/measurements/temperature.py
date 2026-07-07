@@ -18,7 +18,7 @@ import numpy as np
 from ...core.analysis import positive_int
 from ...core.params import ParamDecl
 from ...timing import PulseTableState
-from ..measurement import MeasurementSpec, axis_range_tuple
+from ..measurement import SCAN_TIER_COUPLED, SCAN_TIER_KEY, MeasurementSpec, axis_range_tuple
 from ..measurement_registry import measurement
 from ..temperature import build_release_recapture_pulse
 from ._coupled_template import resolve_coupled_template
@@ -130,5 +130,5 @@ def temperature_release_recapture(readout) -> MeasurementSpec:
         # ``PulseScanNode``), so the console builds it as a plain ScannedMeasurementNode (no "node":
         # "pulse_scan" key).  The single source the docs / boundary test read for the tier.
         metadata={"analysis_fit": "operations.temperature.fit_temperature(capture_radius=...)",
-                  "scan_tier": "coupled"},
+                  SCAN_TIER_KEY: SCAN_TIER_COUPLED},
     )

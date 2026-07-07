@@ -122,6 +122,28 @@ def test_scan_block_is_repeat_x_points_x_data():
     assert _block_matches_contract(node, block)                 # (2, 4, 2)
 
 
+def test_scan_done_spec_is_single_sourced_across_both_swept_twins():
+    """#single-source: the finite-scan ``scan_done`` sentinel (key + label + meaning) AND the swept-block
+    publish dict are declared ONCE on ``_SweptBlockMeasurement`` -- NEITHER scan driver
+    (``ScannedMeasurementNode``, ``PulseScanNode``) may redefine them.  This is the MECHANICAL guard
+    against the drift that HAD occurred: the two twins published ``scan_done`` with different SignalSpec
+    labels ("scan complete" vs "scan done") because each twin spelled the spec/publish dict itself."""
+    from Zou_lab_control.neutral_atom.operations.logic import (
+        _SweptBlockMeasurement, PulseScanNode)
+    for twin in (ScannedMeasurementNode, PulseScanNode):
+        # inherited unchanged (same function object) -> the spec label + publish dict cannot fork per twin
+        assert twin._scan_done_spec is _SweptBlockMeasurement._scan_done_spec
+        assert twin._swept_publish is _SweptBlockMeasurement._swept_publish
+    # the ONE spec carries the sentinel key both twins publish under ``prefix``; it is set on completion
+    hub = SignalHub()
+    node = ScannedMeasurementNode(hub, _StubMeasurement(), x_key="x", y_key="y", prefix="m_", repeat=1)
+    assert _SweptBlockMeasurement.SCAN_DONE in node._bare_published_signals()
+    spec = {s.name: s for s in node.output_specs()}["m_" + _SweptBlockMeasurement.SCAN_DONE]
+    assert spec.label == "scan complete"                    # the single-sourced label (not "scan done")
+    node.run_to_completion()
+    assert float(hub.latest("m_scan_done")) == 1.0          # published under the shared key on completion
+
+
 def test_base_assertion_rejects_a_wrong_shaped_primary_block():
     """The base ``Measurement._assert_primary_shape`` is the enforcement: ANY acquiring measurement
     (incl. a future one) that publishes its primary block with the wrong shape -- e.g. forgets the

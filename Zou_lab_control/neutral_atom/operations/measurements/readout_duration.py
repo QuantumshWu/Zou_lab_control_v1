@@ -26,7 +26,7 @@ import numpy as np
 from ...core.analysis import positive_int
 from ...core.params import ParamDecl
 from ...timing import PROBE_TEMPLATE_PATH, PulseTableState, single_imaging_template
-from ..measurement import MeasurementSpec, axis_range_tuple
+from ..measurement import SCAN_TIER_COUPLED, SCAN_TIER_KEY, MeasurementSpec, axis_range_tuple
 from ..measurement_registry import measurement
 from ._coupled_template import resolve_coupled_template
 
@@ -117,5 +117,5 @@ def readout_duration_fidelity(readout) -> MeasurementSpec:
         # over each point's frame set (NOT routed through a decoupled PulseScanNode).  The single source
         # the docs / boundary test read for the tier.
         metadata={"analysis_fit": "operations.fidelity.characterize_readout(...)",
-                  "scan_tier": "coupled"},
+                  SCAN_TIER_KEY: SCAN_TIER_COUPLED},
     )

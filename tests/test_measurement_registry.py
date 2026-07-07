@@ -34,10 +34,14 @@ def exp():
 
 def test_builtins_are_autodiscovered_in_order(exp):
     names = [s.name for s in exp.readout.measurement_specs()]
-    # Both built-ins come from operations/measurements/*.py (NOT a hardcoded list
-    # in readout.py); order is deterministic (built-ins use small @measurement
-    # order values, temperature before readout-duration).
-    assert names[:2] == ["Temperature", "Fidelity vs duration"]
+    # Built-ins come from operations/measurements/*.py (NOT a hardcoded list in readout.py);
+    # order is deterministic -- sorted by each @measurement's `order` value (Temperature=10,
+    # Grey molasses detuning=11, Fidelity vs duration=20).  Pin the ORDER invariant (the real
+    # contract) rather than exact adjacency, so adding another built-in does not spuriously break it.
+    assert {"Temperature", "Grey molasses detuning", "Fidelity vs duration"} <= set(names)
+    assert (names.index("Temperature")
+            < names.index("Grey molasses detuning")
+            < names.index("Fidelity vs duration"))
 
 
 def test_register_makes_a_new_measurement_appear_then_unregister_removes(exp):

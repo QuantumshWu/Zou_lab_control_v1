@@ -44,7 +44,7 @@ from ...timing import (
     snap_scan_table,
 )
 from ...core.params import ParamDecl
-from ..measurement import MeasurementSpec
+from ..measurement import NODE_META_KEY, PULSE_SCAN_NODE, MeasurementSpec
 from ..measurement_registry import measurement
 from ..signal_expr import SignalExpr
 
@@ -344,4 +344,4 @@ def pulse_scan(readout) -> MeasurementSpec:
         x_key="param", y_key="signal", build=build,
         # The console builds a device-driving PulseScanNode (not a ScannedMeasurementNode):
         # it fires + publishes a frame + reads y from a subscribed signal, per point.
-        metadata={"node": "pulse_scan"})
+        metadata={NODE_META_KEY: PULSE_SCAN_NODE})
