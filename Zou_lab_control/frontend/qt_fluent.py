@@ -296,6 +296,15 @@ def _radius() -> int:
     return scaled_px(RADIUS)
 
 
+def _popup_gap() -> int:
+    """The few-px OUTER gap a Fluent popup sits OFF the control that anchored it -- the ONE source for
+    every below-the-anchor Fluent surface: the FluentComboBox drop-down, the Setting FluentPopup, the
+    FluentTabWidget overflow menu, the FluentLineEdit context menu.  Sharing this is what makes the
+    ``...`` overflow list and a right-click menu open with the SAME breathing room as a combo drop-down,
+    instead of one flush against its anchor and another floating off it."""
+    return scaled_px(4, minimum=3)
+
+
 def _enable_ipython_qt_loop() -> None:
     """Under IPython/Jupyter, install the Qt event-loop hook (the ``%gui qt`` integration) so a
     Qt window opened from a cell keeps PROCESSING events -- it paints and stays responsive
@@ -881,6 +890,23 @@ class FluentLineEdit(QtWidgets.QLineEdit):
             """
         )
 
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        """Right-click menu with the Fluent rounded-card chrome instead of the platform's opaque SQUARE
+        menu (the "black box" the default QLineEdit pops).  It REUSES Qt's own standard context menu, so
+        Undo / Cut / Copy / Paste / Delete / Select-All stay wired to THIS edit -- only the container is
+        swapped: the actions are re-homed into a :class:`_FluentRoundedMenu` (the ONE Fluent menu, shared
+        with the tab-overflow list) so a right-click surface matches every other popup in the app.
+        Ownership of each action is transferred (``setParent``) before the throwaway standard menu is
+        disposed, so its teardown cannot delete them out from under the Fluent menu."""
+        std = self.createStandardContextMenu()
+        menu = _FluentRoundedMenu(self)
+        for act in list(std.actions()):
+            act.setParent(menu)
+            menu.addAction(act)
+        std.deleteLater()
+        menu.exec_(event.globalPos())
+        event.accept()
+
     def setText(self, text: str) -> None:  # noqa: N802 - Qt API name
         text = str(text)
         if self.text() == text:
@@ -1382,6 +1408,61 @@ class _FluentRoundedMenu(QtWidgets.QMenu):
         super().paintEvent(event)
 
 
+class _FluentMessageDialog(QtWidgets.QDialog):
+    """A modal message / warning box with the Fluent rounded-card chrome and NO native title bar -- so
+    no platform window frame and no stray Python app icon in the corner (the reason a raw ``QMessageBox``
+    reads off-brand here).  Frameless + translucent, it PAINTS the same rounded white card (fill + 1 px
+    DIVIDER border, the shared ``drawRoundedRect`` recipe) as every other Fluent surface, stacks a bold
+    title (``FluentSectionLabel``), the wrapped message (``FluentLabel``) and a single Fluent OK button,
+    and centres on its parent.  ``fluent_message`` is the ONE entry point -- use it in place of
+    ``QMessageBox.information`` / ``.warning``."""
+
+    def __init__(self, parent, title: str, text: str, *, kind: str = "info"):
+        super().__init__(parent, QtCore.Qt.FramelessWindowHint | QtCore.Qt.Dialog)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setModal(True)
+        self._radius = float(_radius())
+        pad = scaled_px(16, minimum=10)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(pad, pad, pad, pad)
+        outer.setSpacing(scaled_px(10, minimum=6))
+        outer.addWidget(FluentSectionLabel(str(title)))
+        body = FluentLabel(str(text))
+        body.setWordWrap(True)
+        body.setMaximumWidth(scaled_px(360, minimum=240))
+        outer.addWidget(body)
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        # A warning wears the ORANGE accent (the same destructive/attention hue Remove uses); a plain
+        # info uses the resting ACCENT -- the ONE palette, never a new colour.
+        ok = FluentButton("OK", color=(ORANGE if str(kind) == "warning" else ACCENT))
+        ok.clicked.connect(self.accept)
+        row.addWidget(ok)
+        outer.addLayout(row)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        pen = QtGui.QPen(QtGui.QColor(DIVIDER))
+        pen.setWidthF(1.0)
+        painter.setPen(pen)
+        painter.setBrush(QtGui.QColor("white"))
+        rect = QtCore.QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        painter.drawRoundedRect(rect, self._radius, self._radius)
+
+
+def fluent_message(parent, title: str, text: str, *, kind: str = "info") -> None:
+    """Show a modal Fluent message dialog (``kind`` = ``"info"`` | ``"warning"``) -- the ONE on-brand
+    replacement for ``QMessageBox.information`` / ``.warning`` (no native frame, no stray app icon).
+    Centres on ``parent``.  Blocks until the user clicks OK (or presses Escape)."""
+    dlg = _FluentMessageDialog(parent, title, text, kind=kind)
+    dlg.adjustSize()
+    if parent is not None:
+        centre = parent.mapToGlobal(parent.rect().center())
+        dlg.move(centre.x() - dlg.width() // 2, centre.y() - dlg.height() // 2)
+    dlg.exec_()
+
+
 #: Max rows a Fluent drop-down shows before it SCROLLS (the shared fluent scrollbar) -- one source for
 #: both the flat combo and the collapsible tree picker, so a long signal list never overflows the screen.
 _COMBO_MAX_VISIBLE_ITEMS = 12
@@ -1428,7 +1509,7 @@ class FluentComboBox(QtWidgets.QComboBox):
         view_palette.setColor(QtGui.QPalette.Window, QtCore.Qt.transparent)
         view.setPalette(view_palette)
         self.setView(view)
-        self._gap = scaled_px(4, minimum=3)
+        self._gap = _popup_gap()   # the ONE Fluent popup outer-gap (shared with the overflow menu, etc.)
         # Configure the drop-down's top-level container NOW (setView created it but it
         # is not shown yet) -- WA_TranslucentBackground only takes effect if it is set
         # BEFORE the native window is created, so this cannot wait until showPopup.
@@ -2121,10 +2202,14 @@ class FluentTabWidget(QtWidgets.QTabWidget):
 
     def _show_overflow_menu(self) -> None:
         """Pop the overflow list below the ``...`` button -- the single overflow navigation,
-        in place of left/right scroll arrows."""
+        in place of left/right scroll arrows.  It sits the SAME few-px ``_popup_gap`` off the button
+        that the combo drop-down / Setting popup use below THEIR anchor, so the overflow list reads as
+        one of the family instead of flush against the tab strip.  (A ``QMenu.exec_`` position is the
+        top-left Qt honours as-is -- unlike a combo popup, it is NOT re-flushed -- so the gap goes
+        straight into the anchor point; no Move-event filter is needed here.)"""
         menu = self._overflow_menu()
         btn = self._overflow_btn
-        menu.exec_(btn.mapToGlobal(QtCore.QPoint(0, btn.height())))
+        menu.exec_(btn.mapToGlobal(QtCore.QPoint(0, btn.height() + _popup_gap())))
 
     def resizeEvent(self, event):  # noqa: N802 - Qt naming
         super().resizeEvent(event)

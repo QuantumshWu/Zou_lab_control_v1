@@ -60,6 +60,7 @@ from .qt_fluent import (
     WINDOW_SCREEN_FRACTION,
     YELLOW,
     ElidedLabel,
+    fluent_message,
     FluentButton,
     FluentCheckBox,
     FluentCodeEdit,
@@ -4540,7 +4541,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             if hasattr(self, "preview_status"):
                 self.preview_status.setText(str(text))
             return
-        QtWidgets.QMessageBox.warning(self, "Pulse", text)
+        fluent_message(self, "Pulse", text, kind="warning")
 
     @staticmethod
     def _settle_qt_events(ms: int = 1000) -> None:

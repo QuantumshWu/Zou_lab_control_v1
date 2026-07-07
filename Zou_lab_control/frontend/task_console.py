@@ -70,6 +70,7 @@ from .qt_fluent import (
     TEXT,
     WINDOW_SCREEN_FRACTION,
     YELLOW,
+    fluent_message,
     FluentButton,
     FluentCodeEdit,
     FluentComboBox,
@@ -8058,7 +8059,7 @@ class TaskConsole(QtWidgets.QWidget):
         if os.environ.get("QT_QPA_PLATFORM", "") == "offscreen":
             self.summary.setText(str(text))
             return
-        QtWidgets.QMessageBox.information(self, "Task console", str(text))  # pragma: no cover
+        fluent_message(self, "Task console", str(text), kind="info")  # pragma: no cover
 
     # ------------------------------------------------------------------ teardown
     def stop_all_nodes(self) -> None:
