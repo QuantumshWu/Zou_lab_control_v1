@@ -127,10 +127,15 @@ class StreamerParams:
     # EVENT SCHEDULER (TTL channels AND DAC buses): a delay is queued TOGGLES against a free-running
     # global counter.  The register field is 32-bit; the HOST enforces a conservative default
     # cap of ttl_delay_max_ticks = (1<<31)-1 ticks (~42.9 s at 20 ns, configurable via
-    # streamer_config.json) -- e.g. millisecond emCCD delays.  The
-    # constraint moves from delay LENGTH to toggles IN FLIGHT: at most evt_fifo_depth
-    # toggles of one channel may fall inside any window of that channel's delay length
-    # (validated at compile/pack time; sparse experiment triggers are far below this).
+    # streamer_config.json) -- e.g. millisecond emCCD delays.  The constraint moves from delay
+    # LENGTH to toggles IN FLIGHT: at most evt_fifo_depth toggles of one channel may fall inside
+    # any window of that channel's delay length.  The two bounds are validated in DIFFERENT places:
+    # ``pack_program`` enforces the per-delay LENGTH bound (and delay-ELIGIBILITY, since only here
+    # does the channel index == the hardware position); the IN-FLIGHT toggle density is checked by
+    # ``neutral_atom.devices.fpga_pulse_streamer.validate_pulse_streamer_program`` -- the prepare-time
+    # backstop ``SequencerService.prepare`` runs before EVERY upload -- NOT here in pack, which is a
+    # pure serializer and cannot see the full (scan-expanded) toggle schedule.  Sparse experiment
+    # triggers are far below the density cap.
     ttl_delay_max_ticks: int = (1 << 31) - 1
     evt_fifo_depth: int = 128   # keep == streamer_config.json evt_fifo_depth (the synthesized depth)
     # per-DA-bit delay FIFO depth (bus_count*bus_width of them, shallower than TTL to fit LUT).
@@ -147,6 +152,20 @@ class StreamerParams:
     @property
     def bus_index_width(self) -> int:
         return _addr_width(max(2, self.bus_count))       # bits to index a DAC bus
+
+    @property
+    def num_delay_ch(self) -> int:
+        """Number of leading channels that can carry a TTL output delay -- the real TTL outputs.
+
+        A channel is delay-eligible iff its engine bit drives a real TTL pin: NOT a bus-member bit
+        (``bus_count*bus_width`` of them, pins driven by ``bus_out``) and NOT a per-bus ``da_clk``
+        pin (``bus_count`` of them).  The board lays the real TTL outputs out FIRST, so the eligible
+        set is the leading ``channel_count - bus_count*(bus_width+1)`` indices -- matching the RTL's
+        compacted event-FIFO map.  SINGLE SOURCE of that formula for pack's delay-eligibility check
+        and the LUT capacity estimate; ``neutral_atom.devices.fpga_pulse_streamer.
+        delay_eligible_channel_count`` mirrors it for the raw-int GUI/API layer (a lower layer here
+        cannot import the device layer), kept in agreement by ``test_delay_cap_constants_agree_across_layers``."""
+        return max(0, self.channel_count - self.bus_count * (self.bus_width + 1))
 
     @property
     def clk_enable_words(self) -> int:
@@ -467,6 +486,20 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
             raise ValueError(
                 f"channel bit {ch} delay {d} ticks is outside [0, {p.ttl_delay_max_ticks}] "
                 f"(~{p.ttl_delay_max_ticks * 20e-9:.1f} s at 20 ns/tick).")
+        # DELAY-ELIGIBILITY.  Only the leading ``num_delay_ch`` channels (real TTL outputs) have an
+        # event FIFO; channels num_delay_ch..channel_count-1 are DAC bus-member bits / da_clk pins
+        # whose engine ``out`` bit is always 0 and whose delay the RTL gates to PASSTHROUGH -- so a
+        # non-zero delay there silently never happens on the rig.  pack is the LAST place the index
+        # == the hardware channel position (``validate_pulse_streamer_program`` sees only the
+        # program's channel SUBSET and cannot check this), so fail loud HERE instead of letting the
+        # delay vanish on hardware.  The user-facing set_channel_delay API already rejects it; this
+        # backstops any program that reaches pack another way (a loaded pulse, a raw .delays dict).
+        if d and ch >= p.num_delay_ch:
+            raise ValueError(
+                f"channel bit {ch} has a non-zero delay ({d} ticks) but is NOT delay-eligible: "
+                f"only channels 0..{p.num_delay_ch - 1} (real TTL outputs) carry a hardware delay; "
+                f"{p.num_delay_ch}..{p.channel_count - 1} are DAC bus-member / da_clk pins the RTL "
+                "would pass through undelayed.")
     for ch in range(p.channel_count):
         d = channel_delays[ch] if ch < len(channel_delays) else 0
         w[bases["delay"] + ch] = _to_unsigned(d, 32)
@@ -665,9 +698,8 @@ def estimate_resources(params: StreamerParams, *, part, target_pct: float = 90.0
     # event RAM inside the 400 Kb distributed-RAM budget (every channel would not fit).
     evt_depth = max(1, int(getattr(params, "evt_fifo_depth", 128)))
     bus_evt_depth = max(1, int(getattr(params, "bus_evt_fifo_depth", 64)))
-    # Delay-eligible channels = real TTL outputs: not bus-member bits (bus_count*bus_width,
-    # pin driven by bus_out) and not the per-bus dedicated clk pins (bus_count, da_clk*).
-    num_delay_ch = max(0, params.channel_count - params.bus_count * (params.bus_width + 1))
+    # Delay-eligible channels = real TTL outputs (single source: StreamerParams.num_delay_ch).
+    num_delay_ch = params.num_delay_ch
     # Each slot's FIFO is a SIMPLE-DUAL-PORT distributed RAM (sync write @wr, async read @rd
     # at an INDEPENDENT address), instantiated once per slot in the g_evtfifo generate loop.
     # It MUST be RAM, not a flat 3D reg array: a 3D array with per-slot independent pointers

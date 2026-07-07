@@ -3595,6 +3595,12 @@ def test_delay_cap_constants_agree_across_layers():
         params = im.StreamerParams()
         assert params.ttl_delay_max_ticks == TTL_DELAY_MAX_TICKS
         assert params.evt_fifo_depth == EVT_FIFO_DEPTH
+        # num_delay_ch is single-sourced on StreamerParams (the fpga-host layer); the device
+        # layer's raw-int delay_eligible_channel_count MIRRORS the same formula (a lower layer
+        # cannot import the device layer), so the two must never drift.
+        from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import delay_eligible_channel_count
+        assert params.num_delay_ch == delay_eligible_channel_count(
+            params.channel_count, params.bus_count, params.bus_width)
     except Exception:  # pragma: no cover - host tooling import is environment-dependent
         pass
 
@@ -5915,6 +5921,26 @@ def test_delay_eligibility_enforced_in_api():
             ctl.set_channel_delay(bad, 1000.0)
     # setting an ineligible channel back to 0 is always allowed
     ctl.set_channel_delay("ch28", 0.0)
+
+
+def test_pack_program_rejects_delay_on_non_eligible_channel():
+    """pack is the LAST place the channel index == the HARDWARE position, so pack (not the
+    subset-only ``validate_pulse_streamer_program``) rejects a non-zero delay on a bus-member /
+    da_clk channel -- which the RTL would otherwise silently pass through UNDELAYED.  Backstops a
+    program that reaches pack past the set_channel_delay API guard (a loaded pulse, a raw .delays)."""
+    import types
+    import pytest
+    from fpga.pulse_streamer.host.image import StreamerParams, pack_program
+
+    p = StreamerParams()
+    assert p.num_delay_ch == 18                                   # board geometry: 18 real TTL outputs
+    # a delay on an ELIGIBLE channel (index < num_delay_ch) packs fine ...
+    ok = types.SimpleNamespace(ticks=[0], masks=[0], channel_delays=[0] * 17 + [1000])
+    pack_program(ok, p)
+    # ... but a delay on a NON-eligible channel (>= num_delay_ch) fails loud instead of vanishing.
+    bad = types.SimpleNamespace(ticks=[0], masks=[0], channel_delays=[0] * 20 + [1000])
+    with pytest.raises(ValueError, match="delay-eligible"):
+        pack_program(bad, p)
 
 
 def test_repeat_forever_delay_is_physical_not_reduced():
