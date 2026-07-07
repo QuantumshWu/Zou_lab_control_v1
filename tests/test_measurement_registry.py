@@ -81,16 +81,18 @@ def test_duplicate_name_last_registration_wins(exp):
         na.unregister_measurement(second)
 
 
-def test_dropping_a_module_in_the_package_is_autodiscovered(exp):
-    """The headline promise: a NEW file in operations/measurements/ is found
-    automatically -- no catalog list to edit."""
+def test_dropping_a_module_in_the_package_is_autodiscovered(exp, tmp_path):
+    """The headline promise: a NEW file in operations/measurements/ is found automatically -- no
+    catalog list to edit.  The dropped module is written to a TEMP dir and the package's ``__path__``
+    is EXTENDED to include it, so the REAL auto-discovery (``pkgutil.iter_modules(pkg.__path__)`` +
+    ``import_module``) runs exactly as on a genuinely dropped-in file -- imported as a proper submodule
+    (its relative imports resolve by dotted name, not file location) -- while NEVER writing into the
+    versioned source tree, so a crashed test can never orphan a ``.py`` that git then tracks."""
+    import importlib
 
-    # NOTE: not "_dropped..." -- the discovery deliberately skips underscore
-    # modules (so a package-local _helpers.py is never treated as a measurement).
-    pkg_dir = REPO_ROOT / "Zou_lab_control" / "neutral_atom" / "operations" / "measurements"
-    new_file = pkg_dir / "zz_dropped_for_test.py"
-    mod_name = "Zou_lab_control.neutral_atom.operations.measurements.zz_dropped_for_test"
-    new_file.write_text(
+    # NOTE: not "_dropped..." -- discovery deliberately skips underscore modules (so a package-local
+    # _helpers.py is never treated as a measurement).
+    (tmp_path / "zz_dropped_for_test.py").write_text(
         "from ...core.params import ParamDecl\n"
         "from ..measurement import MeasurementSpec\n"
         "from ..measurement_registry import measurement\n"
@@ -100,24 +102,25 @@ def test_dropping_a_module_in_the_package_is_autodiscovered(exp):
         "                           result_labels=('x','y'), x_key='drop_x', y_key='drop_y', build=lambda **kw: None)\n",
         encoding="utf-8",
     )
+    pkg = importlib.import_module("Zou_lab_control.neutral_atom.operations.measurements")
+    mod_name = f"{pkg.__name__}.zz_dropped_for_test"
+    original_path = list(pkg.__path__)
+    pkg.__path__.append(str(tmp_path))               # the package now ALSO scans the temp dir
     dropped_factory = None
     try:
-        # force a fresh discovery pass so the just-written file is imported.
-        # invalidate_caches() is a TEST artifact: the import system caches a
-        # package directory's listing per-process, but a real user drops a file
-        # and RESTARTS task_console (a fresh process), so production never needs it.
-        import importlib
+        # force a fresh discovery pass so the just-written file is imported.  invalidate_caches() is a
+        # TEST artifact: the import system caches a directory's listing per-process, but a real user
+        # drops a file and RESTARTS task_console (a fresh process), so production never needs it.
         importlib.invalidate_caches()
         mr._REGISTRY.reset_discovery()
         names = [s.name for s in exp.readout.measurement_specs()]
         assert "Dropped-in scan" in names
-        import importlib
         dropped_factory = importlib.import_module(mod_name).dropped_measurement
     finally:
         if dropped_factory is not None:
             mr.unregister_measurement(dropped_factory)
         sys.modules.pop(mod_name, None)
-        new_file.unlink(missing_ok=True)
-        mr._REGISTRY.reset_discovery()  # re-import only the surviving (real) modules next call
+        pkg.__path__[:] = original_path              # restore BEFORE the final assert: the temp dir is no longer scanned
+        mr._REGISTRY.reset_discovery()               # re-import only the surviving (real) modules next call
 
     assert "Dropped-in scan" not in [s.name for s in exp.readout.measurement_specs()]
