@@ -146,11 +146,13 @@ class NeutralAtomSession:
         return open_device_manager(self, **kwargs)
 
     def device_viewer(self, **kwargs):
-        """Open the READ-ONLY device viewer bound to this session -- one tab per loaded device
-        showing its snapshot + live runtime read-backs, with NO editing / add / remove.  The safe
-        "look at a device while an experiment runs" window (the task console's Devices button opens
-        this); the full config EDITOR is the separate :meth:`device_manager` entry.  A
-        ONE-per-session window."""
+        """Open the device viewer bound to this session -- one tab per loaded device showing its
+        snapshot + live runtime read-backs, and (``editable=True`` by default) editing each device's
+        basic runtime params LIVE like the API (exposure, ROI, RF detuning, ...): every write routes
+        through the device's OWN validated setter.  It is NOT the config editor -- no add / remove /
+        config-swap; the full config EDITOR is the separate :meth:`device_manager` entry.  Pass
+        ``editable=False`` for a pure read-only peek.  A ONE-per-session window (the task console's
+        Devices button opens this)."""
         from ._gui import open_device_viewer
         return open_device_viewer(self, **kwargs)
 

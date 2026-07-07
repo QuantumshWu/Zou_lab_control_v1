@@ -183,14 +183,15 @@ def open_device_manager(session: Any, **kwargs):
 
 
 def open_device_viewer(session: Any, **kwargs):
-    """Open the READ-ONLY device viewer bound to ``session`` -- ONE per session (confocal-style
-    singleton), the task console's safe "Devices" peek.
+    """Open the device viewer bound to ``session`` -- ONE per session (confocal-style singleton),
+    the task console's "Devices" window.
 
-    A read-only window: one tab per loaded device showing its snapshot + live runtime read-backs,
-    with NO config editor and NO way to add / remove / mutate devices -- so an operator can look
-    at a device's state while an experiment runs without the risk of editing the running set.  The
-    FULL config editor stays the separate ``exp.device_manager()`` / ``na.device_manager()``
-    entry.  A later call RESHOWS the same window (never a duplicate)."""
+    One tab per loaded device showing its snapshot + live runtime read-backs, and (``editable=True``
+    by default) editing each device's basic runtime params LIVE like the API through the device's own
+    validated setters.  It is NOT the config editor: NO add / remove / device-set swap -- so it cannot
+    change WHICH hardware the session drives; the FULL config editor stays the separate
+    ``exp.device_manager()`` / ``na.device_manager()`` entry.  Pass ``editable=False`` for a pure
+    read-only peek.  A later call RESHOWS the same window (never a duplicate)."""
 
     from Zou_lab_control.frontend.device_manager import show_device_viewer
 

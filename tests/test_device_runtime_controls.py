@@ -1,4 +1,4 @@
-"""Runtime-control catalog + read-only device viewer contracts (#4/#6).
+"""Runtime-control catalog + editable device viewer contracts (#4/#6).
 
 A device DESCRIBES ITS OWN live, tunable-at-runtime attributes through
 ``runtime_controls()`` -- a distinct layer from the construction-time ``config_params``
@@ -96,15 +96,16 @@ def test_base_default_is_empty_catalog():
 
 
 def test_camera_and_sequencer_declare_their_standard_controls(devices):
-    """The contract classes declare the standard role controls: a camera a WRITABLE exposure +
-    read-only geometry; a sequencer read-only firing/scan read-backs (+ a writable sleep_scale
-    on the virtual backend that carries the attribute)."""
+    """The contract classes declare the standard role controls: a camera a WRITABLE exposure + a
+    WRITABLE ROI (edited live like the API -- ``"full"`` clears back to the whole sensor) + a read-only
+    frame-shape read-back; a sequencer read-only firing/scan read-backs (+ a writable sleep_scale on the
+    virtual backend that carries the attribute)."""
     camera = devices["camera"]
     assert isinstance(camera, CameraDevice)
     cam_ctrls = {c.decl.key: c for c in camera.runtime_controls()}
     assert cam_ctrls["exposure"].writable and cam_ctrls["exposure"].decl.kind == "float"
-    assert not cam_ctrls["roi"].writable                       # read-only geometry read-back
-    assert not cam_ctrls["frame_shape"].writable
+    assert cam_ctrls["roi"].writable                           # ROI is editable like an API call
+    assert not cam_ctrls["frame_shape"].writable               # derived geometry read-back
 
     seq = devices["sequencer"]
     assert isinstance(seq, SequencerDevice)
@@ -141,45 +142,46 @@ def test_control_page_apply_writes_through_the_device_setter(devices):
     assert any("exposure" in s for s in statuses)              # the reason surfaced on status
 
 
-# --------------------------------------------------------------------- #6 read-only viewer
+# --------------------------------------------------------------------- #6 device viewer (editable)
 
 
 def test_readonly_control_page_has_no_editors(devices):
-    """A read-only ``_DeviceControlPage`` (the viewer form) builds NO editable controls -- so
-    the console peek can never write to a device even where a control is writable."""
+    """The read-only MODE of ``_DeviceControlPage`` (``read_only=True``) builds NO editable controls --
+    a pure peek that can never write, even where a control is writable (the viewer's ``editable=False``
+    path)."""
     from Zou_lab_control.frontend.device_manager import _DeviceControlPage
 
     page = _DeviceControlPage(devices["camera"], role="camera", read_only=True)
     assert page._editors == {}, "a read-only page must have no editable controls"
 
 
-def test_device_viewer_is_read_only_and_does_not_mutate_devices():
-    """The task-console device VIEWER shows one read-only tab per device and never touches the
-    session's device set -- the full config editor is the separate device_manager entry."""
+def test_device_viewer_is_editable_but_not_a_config_editor():
+    """The task-console device VIEWER edits each device's runtime params live (like the API) -- its
+    pages are EDITABLE (writable controls get an editor), but it is NOT the config editor: it has no
+    add / remove / working-config surface, and opening it never swaps the session's device set (the
+    full config editor is the separate device_manager entry)."""
     from Zou_lab_control.frontend.device_manager import DeviceViewerPanel, _DeviceControlPage
 
     exp = na.connect("virtual")
     try:
         before = exp.devices
-        panel = DeviceViewerPanel(devices_provider=lambda: exp.devices)
-        # one tab per loaded device, each a READ-ONLY page
+        panel = DeviceViewerPanel(devices_provider=lambda: exp.devices)   # editable=True default
         tab_pages = [panel._tabs.widget(i) for i in range(panel._tabs.count())]
         control_pages = [w for w in tab_pages if isinstance(w, _DeviceControlPage)]
         assert control_pages, "the viewer must render a device control page per device"
-        for page in control_pages:
-            assert page._read_only and page._editors == {}
-        # the viewer has no editor / apply / add / remove surface at all
+        assert all(not page._read_only for page in control_pages)        # EDITABLE like the API
+        assert any(page._editors for page in control_pages)              # writable controls got editors
+        # but it is a runtime-control view, NOT the config editor -- no add/remove/config surface
         for forbidden in ("_apply", "_add_entry", "_remove_entry", "working_config"):
-            assert not hasattr(panel, forbidden), f"viewer must not expose {forbidden}"
-        assert exp.devices is before                           # opening the viewer mutated nothing
+            assert not hasattr(panel, forbidden), f"the viewer must not expose {forbidden}"
+        assert exp.devices is before                           # opening the viewer swapped nothing
     finally:
         exp.close()
 
 
-def test_task_console_devices_button_opens_the_read_only_viewer():
-    """The console's Devices button routes to ``session.device_viewer`` (read-only), NOT the
-    full ``device_manager`` editor -- so a running experiment's devices can't be edited from
-    the console, while both notebook entries still exist."""
+def test_task_console_devices_button_opens_the_device_viewer():
+    """The console's Devices button routes to ``session.device_viewer`` (edit runtime params live),
+    a DISTINCT window from the full ``device_manager`` config editor -- both notebook entries exist."""
     exp = na.connect("virtual")
     try:
         # both facades exist and are distinct entries

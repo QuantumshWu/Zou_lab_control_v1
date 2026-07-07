@@ -79,11 +79,42 @@ def test_live_switch_writes_on_edit_without_apply(qt):
         switch.setChecked(True)                   # engage Live -> commits the value shown now
         assert float(cam.exposure) == start * 2
         handler.write(widget, start * 3)          # now each edit (e.g. a wheel tick) writes live
+        page._flush_live()                        # drain the rate limiter's trailing edge (no loop pump)
         assert float(cam.exposure) == start * 3
 
         switch.setChecked(False)                  # leaving Live re-buffers
         handler.write(widget, start * 4)
+        page._flush_live()
         assert float(cam.exposure) == start * 3   # unchanged until Apply
+    finally:
+        exp.close()
+
+
+def test_live_writes_are_rate_limited_leading_plus_trailing(qt):
+    """Live "scroll to set" writes are RATE-LIMITED so a fast mouse-wheel scroll can not flood a
+    blocking device write: many rapid edits in one window produce FAR fewer device writes than edits,
+    the FIRST edit applies immediately (leading -- responsive), and after the window flushes the device
+    holds the FINAL scrolled value (trailing -- never lost)."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.frontend.device_manager import _DeviceControlPage
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
+    try:
+        cam = exp.devices.camera
+        page = _DeviceControlPage(cam, role="camera")
+        widget, handler = page._editors["exposure"]
+        page._live_switches["exposure"].setChecked(True)      # Live ON
+
+        base = float(cam.exposure)
+        rapid = [base * (1.0 + 0.01 * i) for i in range(1, 21)]   # 20 rapid "wheel ticks" in ONE window
+        observed = []
+        for v in rapid:
+            handler.write(widget, v)                          # a wheel tick (no event-loop pump here)
+            observed.append(float(cam.exposure))
+
+        assert observed[0] == rapid[0]              # leading edge: the FIRST tick applied at once
+        assert set(observed) == {rapid[0]}          # rate-limited: every later tick was coalesced (no write)
+        page._flush_live()                          # close the window
+        assert float(cam.exposure) == rapid[-1]     # trailing edge: the FINAL scrolled value lands
     finally:
         exp.close()
 

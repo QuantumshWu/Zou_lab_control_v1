@@ -36,7 +36,7 @@ from pathlib import Path
 from PyQt5 import QtCore, QtWidgets
 
 from ..neutral_atom.core.params import DEVICE_REF_PREFIX
-from .param_widgets import PARAM_WIDGETS, ParamWidgetContext
+from .param_widgets import PARAM_WIDGETS, ParamWidgetContext, RateLimitedApply
 from .qt_fluent import (
     ACCENT,
     GREEN,
@@ -221,10 +221,10 @@ class _DeviceControlPage(QtWidgets.QWidget):
     keep the Current read-back live; the timer stops while the page is hidden / its tab is
     closed (confocal ``hideEvent``) so a closed page never keeps polling a device.
 
-    ``read_only=True`` (the task-console viewer, #6) drops the Set rows / Apply entirely: the
-    page is a device SNAPSHOT + the live read-backs, with no way to write -- so the same
-    widget serves both the full manager's editable control tab and the console's read-only
-    peek, and there is exactly ONE device-control renderer."""
+    ``read_only=True`` drops the Set rows / Apply entirely: the page is a device SNAPSHOT + the
+    live read-backs, with no way to write -- the ``editable=False`` peek.  The manager's Control
+    tab AND the console device viewer both build it editable (the default), so the same widget
+    serves every mode and there is exactly ONE device-control renderer."""
 
     def __init__(self, device, *, role: str = "", read_only: bool = False,
                  on_status=None, parent=None):
@@ -236,6 +236,12 @@ class _DeviceControlPage(QtWidgets.QWidget):
         self._getters: list = []                 # (control, current_edit) polled each tick
         self._editors: dict = {}                 # control key -> (widget, handler) for Apply
         self._live_switches: dict = {}           # control key -> its Live (scroll-to-set) switch
+        self._control_by_key: dict = {}          # control key -> RuntimeControl (for the live throttle)
+        # Live "scroll to set" writes are RATE-LIMITED (leading + trailing, per key): a fast mouse-wheel
+        # scroll would otherwise fire one blocking device write per tick and wedge the GUI.  The explicit
+        # Apply path stays synchronous (it never goes through here).
+        self._live_apply = RateLimitedApply(
+            lambda key, value: self._write_control(self._control_by_key[key], value), parent=self)
 
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(*(window_pad(1),) * 4)
@@ -318,9 +324,11 @@ class _DeviceControlPage(QtWidgets.QWidget):
             #     mechanism the Setting popup's apply-on-edit uses), so there is one write path.
             handler = PARAM_WIDGETS[decl.kind]
             live = {"on": False}
+            self._control_by_key[decl.key] = control
+            # In Live mode each edit goes through the shared rate limiter (leading + trailing) so a fast
+            # scroll can not flood the device write; in Apply mode instant_apply is None (buffered).
             ctx = ParamWidgetContext(
-                instant_apply=lambda key, value, c=control: self._write_control(c, value)
-                if live["on"] else None)
+                instant_apply=lambda key, value: self._live_apply(key, value) if live["on"] else None)
             widget = handler.build(decl, control.getter(self.device), ctx)
             # The Set row REUSES the Current row's geometry (same label width, control fills the
             # rest), so the two value boxes share one right edge -- they line up exactly.  The
@@ -395,6 +403,12 @@ class _DeviceControlPage(QtWidgets.QWidget):
         self._set_status(f"{control.decl.key} set to {control.getter(self.device)}")
         self._refresh_readbacks()
 
+    def _flush_live(self) -> None:
+        """Apply any live (scroll-to-set) write still pending in the rate limiter NOW -- so the final
+        scrolled value is never lost when the page hides / is torn down (and a test hook to observe the
+        trailing edge without pumping the event loop)."""
+        self._live_apply.flush()
+
     def _refresh_readbacks(self) -> None:
         for control, current in self._getters:
             try:
@@ -406,6 +420,8 @@ class _DeviceControlPage(QtWidgets.QWidget):
     def hideEvent(self, event):  # noqa: N802 - Qt naming
         # Pause polling while the page is not shown (its tab closed / a sibling tab active) --
         # confocal's DeviceGUI idiom, so a closed control page never keeps hitting the device.
+        # First flush any pending live write so the final scrolled value lands before we go quiet.
+        self._flush_live()
         if self._timer.isActive():
             self._timer.stop()
         super().hideEvent(event)

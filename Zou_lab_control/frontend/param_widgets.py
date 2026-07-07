@@ -42,7 +42,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from PyQt5 import QtWidgets
+from PyQt5 import QtCore, QtWidgets
 
 from Zou_lab_control._paths import display_path
 
@@ -119,6 +119,63 @@ class ParamWidgetContext:
         leaf reads "frame_0", NOT the prefix-stripped "0" -- so a ``signal``-kind picker renders the SAME
         as the plot Setting / signal_expr pickers (#combo-parity, ``coerce_short_labels`` below)."""
         return coerce_short_labels(self.labels_provider)
+
+
+#: Minimum spacing between two live "apply on edit" writes of the SAME key (ms).  200 ms = at most
+#: 5 writes/second, matching the device viewer's 200 ms read-back poll: a mouse-wheel scroll on a
+#: spin box in "Live" mode fires a valueChanged per tick, and an EXPENSIVE / blocking apply (a live
+#: device set-point) on every one of those can wedge the GUI -- this caps the rate.  A module-level
+#: constant (the repo's *_DEBOUNCE_MS convention) so it stays a single source.
+LIVE_WRITE_MIN_INTERVAL_MS = 200
+
+
+class RateLimitedApply:
+    """Rate-limit an ``(key, value) -> None`` apply-on-edit callback -- LEADING + TRAILING, per key.
+
+    A fast mouse-wheel scroll fires ``valueChanged`` per tick; routing an expensive / blocking apply
+    (a live device write, a re-render) through every one can freeze the GUI.  This wraps such a
+    callback so, PER KEY: the FIRST edit applies immediately (responsive -- you see the value move),
+    further edits within ``interval_ms`` are coalesced, and the LATEST value is applied when the
+    window elapses.  A pure trailing debounce (the repo's ``*_DEBOUNCE_MS`` timers) would give no live
+    feedback until the scroll stops; a pure leading throttle would DROP the final value.  Leading +
+    trailing gives both: at most one apply per window AND the final value always lands.
+
+    Timers are parented to ``parent`` so they die with it; :meth:`flush` applies any pending values
+    NOW (teardown / an explicit Apply / a test that must observe the trailing edge without pumping the
+    event loop).  Reusable: any apply-on-edit path can wrap its callback in this."""
+
+    def __init__(self, apply: Callable[[str, Any], None], *, parent: QtCore.QObject,
+                 interval_ms: int = LIVE_WRITE_MIN_INTERVAL_MS) -> None:
+        self._apply = apply
+        self._parent = parent
+        self._interval_ms = max(1, int(interval_ms))
+        self._pending: dict = {}        # key -> latest value awaiting the trailing edge
+        self._timers: dict = {}         # key -> its single-shot QTimer (window open while active)
+
+    def __call__(self, key, value) -> None:
+        timer = self._timers.get(key)
+        if timer is None or not timer.isActive():
+            self._apply(key, value)                      # leading edge: apply now, open the window
+            if timer is None:
+                timer = QtCore.QTimer(self._parent)
+                timer.setSingleShot(True)
+                timer.timeout.connect(lambda k=key: self._flush_key(k))
+                self._timers[key] = timer
+            self._pending.pop(key, None)
+            timer.start(self._interval_ms)
+        else:
+            self._pending[key] = value                   # inside the window: keep only the latest
+
+    def _flush_key(self, key) -> None:
+        if key in self._pending:
+            self._apply(key, self._pending.pop(key))     # trailing edge: apply the final value
+            self._timers[key].start(self._interval_ms)   # there was activity -> keep the window open
+        # else the window closes; the next edit is a fresh leading edge
+
+    def flush(self) -> None:
+        """Apply every pending trailing value immediately (teardown / explicit Apply / a test)."""
+        for key in list(self._pending):
+            self._apply(key, self._pending.pop(key))
 
 
 @dataclass
