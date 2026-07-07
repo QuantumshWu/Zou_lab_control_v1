@@ -215,6 +215,19 @@ class TrapCalibration:
         if readout_kind(m) == "kernel":
             weights, boxes = self._kernels_for(m)
             return psf_signals(image, weights, boxes, background=self._background_for(m) or "annulus")
+        # Box (square-ROI) readout.  Its extraction geometry -- roi_radius / reducer -- lives ONLY
+        # in the top-level fields and is meaningful ONLY for a box-PRIMARY calibration (a kernel
+        # calibration null's them in __post_init__).  ``by_method`` carries thresholds / PSF
+        # kernels / background, NEVER box geometry, so box is readable ONLY as this calibration's
+        # OWN method.  ``_resolve_method`` already rejects a method absent from ``methods()``; this
+        # guards the remaining trap -- a 'box' entry smuggled into a kernel-primary calibration's
+        # ``by_method`` -- which would otherwise read with the None'd top-level geometry (wrong
+        # pixels, no error).  Fail loud instead.
+        if m != self.method:
+            raise ValueError(
+                f"box readout is only available as this calibration's own method (this "
+                f"calibration is {self.method!r}); box extraction geometry (roi_radius/reducer) "
+                "is not carried per-method -- recalibrate with method='box' to read this way.")
         return roi_counts(image, self.centers, radius=self.roi_radius, reducer=self.reducer)
 
     def detect(self, image, *, method=None) -> AtomDetection:

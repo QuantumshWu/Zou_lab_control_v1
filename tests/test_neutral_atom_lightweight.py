@@ -3500,11 +3500,32 @@ def test_pulse_table_snapped_snaps_literals_and_keeps_expressions():
     # integer (clamped to the bus's signed range), duration slots snap UP to >= 1 tick.
     dac_slot = ScanSlot(kind="dac", target="da_dipole@0", unit="value")
     time_slot = ScanSlot(kind="duration", target="1", unit="ns")
-    snapped_rows = snap_scan_table([[51.0, 112.4], [9.0, -300.6]], [time_slot, dac_slot], time_step_ns=20)
+    snapped_rows = snap_scan_table([[51.0, 112.4], [9.0, -300.6]], [time_slot, dac_slot], time_step_ns=20,
+                                   dac_ranges=[None, (-512, 511)])
     assert snapped_rows == [[60.0, 112.0], [20.0, -301.0]]
     # DAC values are clamped to the SIGNED range: an out-of-range value is pulled in.
     clamped = snap_scan_table([[-5.0, 2000.0]], [time_slot, dac_slot], time_step_ns=20, dac_ranges=[None, (-512, 511)])
     assert clamped == [[20.0, 511.0]]
+
+
+def test_snap_scan_table_requires_a_real_range_for_a_dac_slot():
+    """Fire-path invariant: a DAC scan slot must carry its bus's REAL signed range -- there is
+    no assumed-10-bit fallback, so a wrong bus width can never silently mis-clamp on hardware.
+    A pure-duration table needs no dac_ranges; a DAC slot without one fails loud."""
+    from Zou_lab_control.neutral_atom.timing.pulse_table import ScanSlot, snap_scan_table
+
+    dac_slot = ScanSlot(kind="dac", target="da_dipole@0", unit="value")
+    time_slot = ScanSlot(kind="duration", target="1", unit="ns")
+    # DAC slot present but no range for it -> loud error (not a silent 10-bit clamp).
+    with pytest.raises(ValueError, match="no signed range"):
+        snap_scan_table([[51.0, 100.0]], [time_slot, dac_slot], time_step_ns=20)
+    with pytest.raises(ValueError, match="no signed range"):
+        snap_scan_table([[51.0, 100.0]], [time_slot, dac_slot], time_step_ns=20, dac_ranges=[None, None])
+    # A pure-duration table clamps fine without any dac_ranges (nothing to clamp).
+    assert snap_scan_table([[51.0]], [time_slot], time_step_ns=20) == [[60.0]]
+    # A 12-bit bus keeps values a 10-bit fallback would have wrongly squeezed to +-511.
+    wide = snap_scan_table([[9.0, 2000.0]], [time_slot, dac_slot], time_step_ns=20, dac_ranges=[None, (-2048, 2047)])
+    assert wide == [[20.0, 2000.0]]
 
 
 def test_scan_slot_dac_ranges_report_signed_bus_width():

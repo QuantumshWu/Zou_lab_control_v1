@@ -2341,8 +2341,10 @@ def _snap_literal_time_value(
     return int(out) if float(out).is_integer() else out
 
 
-#: Default DAC bus width (bits) used to clamp a DAC scan point when no per-slot
-#: maximum is supplied.  Matches the 10-bit buses in the top/XDC.
+#: Default DAC bus width (bits) for a STARTER scan/api template's DAC column range
+#: (:func:`scan_column_spec` when no explicit ``signed_range`` is given).  Matches the
+#: 10-bit buses in the top/XDC.  NOT a fire-path clamp: :func:`snap_scan_table` REQUIRES
+#: the caller's real per-slot ranges (``scan_slot_dac_ranges``) and never assumes this width.
 DEFAULT_DAC_BITS = 10
 
 
@@ -2360,18 +2362,19 @@ def snap_scan_table(
 
     * ``duration`` -> the nearest whole clock tick, snapped UP to at least one tick
       (a period must occupy >= 1 tick) and never negative.
-    * ``dac`` -> the nearest SIGNED integer (0 = true 0 V), clamped to
-      ``dac_ranges[j]`` for that slot if given, else the default 10-bit signed range
-      ``(-2^(B-1), +2^(B-1)-1)`` = (-512, +511).  The offset-binary wire code is
-      produced later, by the compiler (code = signed + 2^(B-1)).
+    * ``dac`` -> the nearest SIGNED integer (0 = true 0 V), clamped to that slot's REAL
+      signed range ``dac_ranges[j]`` = ``(-2^(B-1), +2^(B-1)-1)``.  The offset-binary wire
+      code is produced later, by the compiler (code = signed + 2^(B-1)).
 
-    ``dac_ranges`` (optional) is a per-slot sequence aligned with ``scan_slots``;
-    entries for non-DAC slots are ignored.  One shared snap source for the GUI (so the
-    displayed/saved table matches) and the server/pulse API (so the transferred pulse
-    matches the hardware)."""
+    ``dac_ranges`` is a per-slot sequence aligned with ``scan_slots`` (entries for non-DAC
+    slots are ignored / may be None).  It is REQUIRED whenever a DAC slot is present -- there
+    is NO assumed-10-bit fallback, since a wrong bus width would silently mis-clamp every DAC
+    scan point on hardware (a +-2048 12-bit sweep squeezed to +-512, no error); pass
+    ``state.scan_slot_dac_ranges()``.  One shared snap source for the GUI (so the displayed/
+    saved table matches) and the server/pulse API (so the transferred pulse matches the
+    hardware)."""
 
     step = positive_time_step_ns(time_step_ns)
-    default_range = bus_signed_range(DEFAULT_DAC_BITS)
     # Check the column count against the slot count FIRST (a mismatch in EITHER direction
     # raises) -- otherwise a mismatched loaded array would be silently truncated/under-snapped
     # by the zip() below (a column dropped, or a slot left un-clamped).  This is the
@@ -2383,10 +2386,17 @@ def snap_scan_table(
         new_row: list[float] = []
         for index, (value, slot) in enumerate(zip(row, scan_slots)):
             if slot.kind == "dac":
-                rng = None
-                if dac_ranges is not None and index < len(dac_ranges):
-                    rng = dac_ranges[index]
-                lo, hi = default_range if rng is None else (int(rng[0]), int(rng[1]))
+                # A DAC slot MUST carry its bus's real signed range: no default 10-bit
+                # fallback, because a wrong DAC width would silently mis-clamp every scan
+                # point on hardware.  Every caller passes state.scan_slot_dac_ranges(); a
+                # missing range for a DAC slot fails loud rather than assuming a width.
+                rng = dac_ranges[index] if (dac_ranges is not None and index < len(dac_ranges)) else None
+                if rng is None:
+                    raise ValueError(
+                        f"snap_scan_table: DAC scan slot {index} has no signed range in dac_ranges "
+                        f"(got {dac_ranges!r}); pass state.scan_slot_dac_ranges() so the point is "
+                        "clamped to the board's real bus width, not an assumed 10-bit range.")
+                lo, hi = int(rng[0]), int(rng[1])
                 signed = int(round(float(value)))
                 new_row.append(float(max(lo, min(hi, signed))))
             else:

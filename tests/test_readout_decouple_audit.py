@@ -147,6 +147,35 @@ def test_psf_and_box_signals_dispatch_correctly():
     assert box.signals(img).shape == (2,)
 
 
+def test_box_readout_is_only_available_as_the_calibrations_own_method():
+    """Latent readout-contract trap: box extraction geometry (roi_radius/reducer) lives ONLY in
+    the top-level fields and is valid ONLY for a box-primary calibration -- ``by_method`` never
+    carries box geometry, and a kernel calibration null's the top-level fields.  So box is
+    readable ONLY as the calibration's own method: a psf calibration with no box is rejected up
+    front by _resolve_method, and a 'box' entry smuggled into a kernel-primary calibration's
+    by_method (which passes _resolve_method) must be refused by the box branch, never read with
+    the None'd top-level geometry."""
+    img = np.zeros((10, 10), dtype=float)
+    # Own-method box reads fine.
+    box = TrapCalibration(centers=[(2, 2), (6, 2)], thresholds=[3.0, 4.0], method="box",
+                          roi_radius=1, reducer="mean")
+    assert box.signals(img, method="box").shape == (2,)
+    # A psf-primary calibration cannot read box at all (roi geometry was null'd) -- rejected up front.
+    with pytest.raises(ValueError, match="not one of"):
+        _psf_calibration().signals(img, method="box")
+    # The smuggled-box trap: 'box' in by_method of a kernel-primary calibration passes
+    # _resolve_method but must be refused by the box branch (not read with None geometry).
+    smuggled = TrapCalibration(
+        centers=[(2, 2), (6, 2)], thresholds=[1.0, 1.0], method="psf",
+        psf_weights=np.ones((2, 3, 3)) / 9.0,
+        psf_boxes=np.array([[1, 1, 3, 3], [5, 1, 3, 3]], dtype=int),
+        by_method={"box": {"thresholds": [1.0, 1.0]}},
+    )
+    assert "box" in smuggled.methods()                      # passes _resolve_method's whitelist
+    with pytest.raises(ValueError, match="own method"):
+        smuggled.signals(img, method="box")
+
+
 # ------------------------------------------------------------- D4: uniform_psf stored verbatim
 def test_single_method_uniform_psf_is_stored_verbatim():
     """A single-method uniform_psf calibration keeps ``method='uniform_psf'`` (no collapse to
