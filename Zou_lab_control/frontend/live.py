@@ -194,6 +194,13 @@ TITLE_SLOT_PX = 70                         # vertical px a centred plot title ne
 # what makes the "2x2" 2D image square (480 * 0.75 = 360).
 _DIST_SPLIT = ([0.825, 0.15], [0.025])             # 1D + side distribution (plot | dist)
 _IMAGE_SPLIT = ([0.75, 0.1, 0.1], [0.025, 0.025])  # 2D image | side dist | colorbar
+#: The ONE imshow ``origin`` for the whole image family -- the grid THUMBNAIL (``ImageCell.draw``)
+#: AND the standalone / console / double-click FOCUS view (``Live2DDis._init_display_image``) both
+#: render through it, so a facet cell and its enlarged focus can never disagree on which way is up.
+#: ``"upper"`` = array row 0 at the TOP: the standard camera-image convention (matches the Pylon
+#: viewer / every other 2d plot).  A thumbnail that hard-coded ``origin="lower"`` here (row 0 at the
+#: bottom) rendered every 2d facet VERTICALLY FLIPPED vs its focus -- the two update orders diverged.
+_IMAGE_ORIGIN = "upper"
 
 # Owned geometry for the per-site histogram grid (site_histogram_grid).  The grid fills the SAME total
 # data region every other panel kind uses (``panel_plot_spec(size).data_px``) and SUBDIVIDES it into
@@ -441,7 +448,8 @@ class BaseLivePlot:
         :meth:`_refresh_display_image` (the budget is read per refresh; see Live2DDis.init_core)."""
         small, small_ext = _decimate_image_view(array, extent, (extent[0], extent[1]),
                                                 (extent[2], extent[3]), _image_axes_px_budget(self.ax))
-        artist = self.ax.imshow(small, cmap=cmap, extent=small_ext, interpolation="antialiased")
+        artist = self.ax.imshow(small, cmap=cmap, extent=small_ext, origin=_IMAGE_ORIGIN,
+                                interpolation="antialiased")
         self.ax.callbacks.connect("xlim_changed", lambda _ax: self._refresh_display_image())
         self.ax.callbacks.connect("ylim_changed", lambda _ax: self._refresh_display_image())
         return artist
@@ -3805,7 +3813,7 @@ def facet_axis_labels(facet, sub_plot_kind, *, points_shape=(), data_shape=(),
     if kind == "2d":
         if len(pts_axes) == 2 and dim_trivial:
             # the frame is the remaining 2-D points grid (facet_cells' core.reshape(pts_rest));
-            # origin="lower" imshow puts rows (pts_rest[0]) on y and columns (pts_rest[1]) on x
+            # imshow (the shared ``_IMAGE_ORIGIN``) puts rows (pts_rest[0]) on y, columns (pts_rest[1]) on x
             xlabel, ylabel = _name(pts_axes[1][0]), _name(pts_axes[0][0])
             return (xlabel or default_x, ylabel or default_y)
         return (default_x, default_y)              # a camera-frame cell keeps its pixel axes
@@ -4551,7 +4559,7 @@ class ImageCell(GridCell):
         # one shared colour scale keeps cells comparable; in ``fixed`` mode the operator's pinned
         # lo/hi win (thumb_lims -- the SAME relim family the enlarged view honours, like cmap)
         vmin, vmax = self.thumb_lims(self.vmin, self.vmax)
-        self._image_artists[k] = ax.imshow(self.images[k], origin="lower", cmap=self.cmap,
+        self._image_artists[k] = ax.imshow(self.images[k], origin=_IMAGE_ORIGIN, cmap=self.cmap,
                                            vmin=vmin, vmax=vmax, aspect="equal")
         apply_title(ax, self.cell_title(k), size=self.title_size_pt(), pad=1.5)   # ticks are the grid's ONE policy
         return None

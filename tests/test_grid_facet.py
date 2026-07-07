@@ -22,8 +22,10 @@ import pytest
 from Zou_lab_control.frontend.live import (
     GRID_CELL_BY_KIND,
     HistogramFigure,
+    ImageCell,
     Live1D,
     Live2DDis,
+    _IMAGE_ORIGIN,
     build_grid_figure,
     default_sub_plot_kind,
     facet_axis_labels,
@@ -31,6 +33,7 @@ from Zou_lab_control.frontend.live import (
     grid,
     grid_recipe_from_cells,
     normalize_facet,
+    plot,
 )
 
 RNG = np.random.default_rng(11)
@@ -101,8 +104,8 @@ def test_default_sub_plot_kind_follows_what_each_cell_has_left():
 # --------------------------------------------------- figure-level axis labels follow the facet (#6)
 def test_facet_axis_labels_map_the_remaining_axes_to_the_cell_x_y():
     """The ONE remaining-axis -> (xlabel, ylabel) rule, mirroring facet_cells' slicing and the cell
-    renderers' orientation: a 2d cell's frame is core.reshape(pts_rest) drawn origin='lower', so
-    rows (pts_rest[0]) run along y and columns (pts_rest[1]) along x; a 1d cell's single remaining
+    renderers' orientation: a 2d cell's frame is core.reshape(pts_rest) drawn through the shared
+    _IMAGE_ORIGIN, so rows (pts_rest[0]) run along y and columns (pts_rest[1]) along x; a 1d cell's single remaining
     points axis is its x; a hist cell's samples ARE the value; a camera frame keeps pixel axes."""
     names = ["Bx", "By", "Bz"]
     # 3-D scan, 2d cells: each facet pick leaves a DIFFERENT pair of scan axes as the frame
@@ -125,6 +128,34 @@ def test_facet_axis_labels_map_the_remaining_axes_to_the_cell_x_y():
     assert facet_axis_labels("points:0", "2d", points_shape=PTS, data_shape=(1,)) == ("x (px)", "y (px)")
     assert facet_axis_labels("repeat", "1d", points_shape=(41,), data_shape=(1,)) == ("X", "Y")
     assert facet_axis_labels("repeat", "hist", points_shape=PTS, data_shape=(1,)) == ("Signal", "Shots")
+
+
+def test_2d_facet_thumbnail_and_focus_share_one_imshow_origin():
+    """Root-cause guard for the double-click FLIP: the grid THUMBNAIL (``ImageCell.draw``) and the
+    enlarged FOCUS view (the standalone ``Live2DDis`` a double-click opens) render the SAME frame
+    through ONE origin (``_IMAGE_ORIGIN``), so a 2d facet cell and its focus can never disagree on
+    which way is up.  Before, the thumbnail hard-coded ``origin='lower'`` while the focus used
+    ``'upper'`` -- so every 2d cell rendered VERTICALLY FLIPPED vs its enlarged view (their live
+    update orders diverged, top-down vs bottom-up)."""
+    from Zou_lab_control.frontend.style import style_context
+
+    frame = np.zeros((4, 5))
+    frame[0, :] = 1.0                                       # array ROW 0 (top of the ndarray) is the marker
+    cell = ImageCell([frame])
+    cell.prepare()
+    with style_context():                                  # the grid renders under the frontend style
+        fig, ax = plt.subplots()
+        cell.draw(ax, 0)
+        thumb_origin = cell._image_artists[0].origin
+        plt.close(fig)                                     # release the bare fig before the frontend builds its own
+        # the FOCUS is the standalone 2d fed the cell's OWN pixel coords -- the exact double-click path
+        data_x, data_y = cell._pixel_coords(0)
+        focus = plot(data_x, data_y, kind="2d", display=False)
+        focus_origin = focus.image.origin
+    plt.close("all")
+    assert thumb_origin == focus_origin == _IMAGE_ORIGIN == "upper", (
+        f"thumbnail origin {thumb_origin!r} != focus origin {focus_origin!r}: a 2d facet cell and "
+        "its double-click focus would render flipped")
 
 
 def test_grid_factory_derives_axis_labels_from_the_facet():
