@@ -65,11 +65,9 @@ from .qt_fluent import (
     FluentCodeEdit,
     FluentComboBox,
     FluentDoubleSpinBox,
-    FluentFormGrid,
     FluentFrame,
     FluentGroupBox,
     FluentLabel,
-    FluentLabeledField,
     FluentLineEdit,
     FluentScanDot,
     FluentScanLineEdit,
@@ -500,6 +498,21 @@ def _set_fixed_height(widget: QtWidgets.QWidget, height: int | None = None) -> Q
 def _set_form_label_geometry(label: FluentLabel) -> FluentLabel:
     label.setAlignment(QtCore.Qt.AlignCenter)
     label.setFixedSize(_channel_label_width(), _row_height())
+    return label
+
+
+def _add_labeled_widget(layout, label_text: str, widget: QtWidgets.QWidget) -> FluentLabel:
+    """Add a ``label | control-cell`` form row to ``layout`` -- the ONE shared row builder the
+    pulse-editor panels (NamePanel + ChannelPanel) use, so the two never drift on spacing / label
+    geometry.  Returns the row's label (callers stash it to restyle later)."""
+    row = QtWidgets.QHBoxLayout()
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(_px(5, minimum=3))
+    label = FluentLabel(label_text)
+    _set_form_label_geometry(label)
+    row.addWidget(label)
+    row.addWidget(_form_control_cell(widget), 1)
+    layout.addLayout(row)
     return label
 
 
@@ -1260,17 +1273,17 @@ class ChannelNamesPanel(FluentGroupBox):
         self.name_edit = FluentLineEdit(state.name)
         self.name_edit.setPlaceholderText("pulse name")
         self.name_edit.textChanged.connect(self.changed)
-        self.top_labels["name"] = self._add_labeled_widget(top_layout, "Name:", self.name_edit)
+        self.top_labels["name"] = _add_labeled_widget(top_layout, "Name:", self.name_edit)
 
         self.total_label = FluentLineEdit("")
         self.total_label.setEnabled(False)
-        self.top_labels["total"] = self._add_labeled_widget(top_layout, "Total:", self.total_label)
+        self.top_labels["total"] = _add_labeled_widget(top_layout, "Total:", self.total_label)
         self.periods_label = FluentLineEdit("")
         self.periods_label.setEnabled(False)
-        self.top_labels["periods"] = self._add_labeled_widget(top_layout, "Periods:", self.periods_label)
+        self.top_labels["periods"] = _add_labeled_widget(top_layout, "Periods:", self.periods_label)
         self.visible_label = FluentLineEdit("")
         self.visible_label.setEnabled(False)
-        self.top_labels["visible"] = self._add_labeled_widget(top_layout, "Visible:", self.visible_label)
+        self.top_labels["visible"] = _add_labeled_widget(top_layout, "Visible:", self.visible_label)
         top_layout.addStretch()
         layout.addWidget(top)
 
@@ -1305,17 +1318,6 @@ class ChannelNamesPanel(FluentGroupBox):
             row.addWidget(edit, 1)
             layout.addLayout(row)
         layout.addStretch()
-
-    def _add_labeled_widget(self, layout: QtWidgets.QVBoxLayout, label_text: str, widget: QtWidgets.QWidget) -> FluentLabel:
-        row = QtWidgets.QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(_px(5, minimum=3))
-        label = FluentLabel(label_text)
-        _set_form_label_geometry(label)
-        row.addWidget(label)
-        row.addWidget(_form_control_cell(widget), 1)
-        layout.addLayout(row)
-        return label
 
     def read_values(self, state: PulseTableState) -> None:
         for row_info in self.rows:
@@ -1376,12 +1378,12 @@ class ChannelPanel(FluentGroupBox):
         self.step_display = FluentLineEdit(_format_clock_text(state.time_step_ns))
         self.step_display.setEnabled(False)
         self.step_display.setToolTip("FPGA clock (fixed by hardware). One tick = 1 / clock; all times snap to a whole tick.")
-        self.top_labels["step"] = self._add_labeled_widget(top_layout, "Clock:", self.step_display)
+        self.top_labels["step"] = _add_labeled_widget(top_layout, "Clock:", self.step_display)
 
         self.scan_summary = FluentLineEdit("")
         self.scan_summary.setEnabled(False)
         self.scan_summary.setToolTip("Active scan slots and uploaded scan points. Click a dot to bind a field.")
-        self.top_labels["scan"] = self._add_labeled_widget(top_layout, "Scan:", self.scan_summary)
+        self.top_labels["scan"] = _add_labeled_widget(top_layout, "Scan:", self.scan_summary)
 
         # Load Array + the loaded file's tail path beside it (elide from the left so
         # the last dozen-or-so characters of the path stay visible).
@@ -1557,17 +1559,6 @@ class ChannelPanel(FluentGroupBox):
         with _signals_blocked(self.scan_source_toggle):
             self.scan_source_toggle.setChecked(bool(use_loaded))
         self.scan_file_label.setText(str(path) if path else "(no file)")
-
-    def _add_labeled_widget(self, layout: QtWidgets.QVBoxLayout, label_text: str, widget: QtWidgets.QWidget) -> FluentLabel:
-        row = QtWidgets.QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(_px(5, minimum=3))
-        label = FluentLabel(label_text)
-        _set_form_label_geometry(label)
-        row.addWidget(label)
-        row.addWidget(_form_control_cell(widget), 1)
-        layout.addLayout(row)
-        return label
 
     def _handle_delay_text(self, channel: str, text: str) -> None:
         combo = self.delay_units.get(channel)
