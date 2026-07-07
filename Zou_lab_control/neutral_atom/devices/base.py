@@ -490,6 +490,23 @@ FULL_FRAME = "full"
 #: the measurement layer mapped a blank region to None, which means "leave unchanged").
 ROI_CLEAR_SENTINELS = (FULL_FRAME, "", "None")
 
+#: The human-readable "no sub-array" label the device viewer's ROI read-back SHOWS (``roi is None``).
+#: Declared once here so the getter that displays it and the free-text setter that accepts it back
+#: read the SAME string -- a distinct concern from the canonical ``FULL_FRAME`` the API layer sends.
+FULL_FRAME_DISPLAY = "full frame"
+
+
+def is_roi_clear(value) -> bool:
+    """True when ``value`` -- FREE-FORM text typed into the device viewer's ROI box -- means "clear to
+    the full frame".  THE case-insensitive predicate the ``roi`` runtime-control setter uses: it accepts
+    every canonical :data:`ROI_CLEAR_SENTINELS` spelling PLUS the :data:`FULL_FRAME_DISPLAY` read-back
+    the getter shows, so what the box displays round-trips and the accepted spellings can never drift
+    from the sentinels.  (Backends comparing an API-supplied canonical value still use exact
+    ``roi in ROI_CLEAR_SENTINELS`` -- that layer is not free text.)"""
+    text = str(value).strip().lower()
+    return text in {s.lower() for s in (*ROI_CLEAR_SENTINELS, FULL_FRAME_DISPLAY)}
+
+
 #: The ONE ``trigger_source`` value meaning "software-trigger / free-run" -- the industry-standard
 #: GenICam spelling (Basler: ``TriggerMode Off``): the sensor exposes on its OWN clock and every
 #: ``acquire`` yields frames with NO trigger wiring at all.  Any other ``trigger_source`` value is
@@ -550,20 +567,28 @@ class CameraDevice(BaseDevice):
          "effective_trigger_channels", "primary_trigger_channel", "latest", "drain"})
 
     @property
+    def _free_run(self) -> bool:
+        """True when this camera exposes on its OWN clock (software-trigger / free-run) and so counts
+        capture edges on NO sequencer line.  THE single predicate both backends share (was an identical
+        copy on PylonCamera and VirtualMotCamera): a camera whose ``trigger_source`` knob names the
+        software-trigger mode (:func:`is_software_trigger`) is free-running; a camera with NO
+        ``trigger_source`` knob (the qCMOS, the virtual readout camera) is always hardware-triggered."""
+        source = getattr(self, "trigger_source", None)
+        return source is not None and is_software_trigger(source)
+
+    @property
     def effective_trigger_channels(self) -> tuple[str, ...]:
         """The line(s) this camera ACTIVELY counts capture edges on -- the machine-readable
         "which channel gates my frames" fact every consumer reads (via
-        ``camera_trigger.resolve_camera_trigger_channels``), derived ONCE here:
+        ``camera_trigger.resolve_camera_trigger_channels``), derived ONCE here from :attr:`_free_run`:
 
-        * a FREE-RUNNING sensor (``trigger_source`` is the software-trigger mode,
-          :func:`is_software_trigger`) exposes on its own clock and never consults its trigger
-          input, so it counts on NO line -> ``()`` (edge counts are honestly zero) -- identical
-          for the real Basler and the virtual monitor camera (virtual == real);
+        * a FREE-RUNNING sensor exposes on its own clock and never consults its trigger input, so it
+          counts on NO line -> ``()`` (edge counts are honestly zero) -- identical for the real Basler
+          and the virtual monitor camera (virtual == real);
         * otherwise the declared :attr:`capture_trigger_channels` wiring.  A camera with no
           ``trigger_source`` knob (the qCMOS, the virtual readout camera) is always
           hardware-triggered, so its wiring IS its counting line."""
-        source = getattr(self, "trigger_source", None)
-        if source is not None and is_software_trigger(source):
+        if self._free_run:
             return ()
         return tuple(str(c) for c in self.capture_trigger_channels)
 
@@ -658,12 +683,13 @@ class CameraDevice(BaseDevice):
         def _set_roi(dev, value) -> None:
             # Route the WRITE through the one ``configure(roi=...)`` API -- the SAME call the notebook
             # makes, so its normalize/validate (``normalize_roi`` / clear sentinels) is the single
-            # boundary.  Accept the read-back's own spelling ("full frame" / a "(x, w, y, h)" tuple) so
-            # what the field shows round-trips: blank / full -> whole sensor, else four ints.
-            text = str(value).strip().lower()
-            if text in ("", "full", "full frame", "none"):
+            # boundary.  ``is_roi_clear`` is the ONE free-text predicate (accepts the sentinels + the
+            # read-back's own FULL_FRAME_DISPLAY spelling), so what the field shows round-trips: blank /
+            # full -> whole sensor, else four ints.
+            if is_roi_clear(value):
                 dev.configure(roi=FULL_FRAME)   # the CLEAR sentinel (configure(roi=None) means "unchanged")
                 return
+            text = str(value).strip().lower()
             parts = [int(float(p)) for p in text.replace("(", "").replace(")", "").split(",") if p.strip()]
             dev.configure(roi=tuple(parts))
 
@@ -679,7 +705,7 @@ class CameraDevice(BaseDevice):
                 ParamDecl(key="roi", label="ROI", kind="text",
                           tooltip="Sub-array readout window as x, width, y, height (or 'full' for the "
                                   "whole sensor).  Applied via the device's own configure(roi=...)."),
-                getter=lambda dev: "full frame" if dev.roi is None else str(tuple(int(v) for v in dev.roi)),
+                getter=lambda dev: FULL_FRAME_DISPLAY if dev.roi is None else str(tuple(int(v) for v in dev.roi)),
                 setter=_set_roi),
             RuntimeControl(
                 ParamDecl(key="sensor_shape", label="sensor", kind="text",
@@ -1174,6 +1200,7 @@ __all__ = [
     "CameraDevice",
     "EXCLUSIVE",
     "FULL_FRAME",
+    "FULL_FRAME_DISPLAY",
     "LaserDevice",
     "OBSERVE",
     "RFSourceDevice",
@@ -1183,6 +1210,7 @@ __all__ = [
     "SOFTWARE_TRIGGER",
     "SequencerDevice",
     "TrapArrayDevice",
+    "is_roi_clear",
     "is_software_trigger",
     "read_only",
     "underlying_device",

@@ -127,6 +127,30 @@ def test_software_trigger_predicate_is_single_source_and_case_insensitive():
         assert not VirtualMotCamera(trigger_source=hard)._free_run
 
 
+def test_free_run_is_one_inherited_base_property():
+    """``_free_run`` lives ONCE on ``CameraDevice`` -- both backends inherit it (was a byte-identical
+    copy on each), so the "am I software-triggered?" rule cannot fork virtual vs real.  A camera with
+    NO ``trigger_source`` knob (the readout camera / qCMOS) is always hardware-triggered."""
+    from Zou_lab_control.neutral_atom.devices.base import CameraDevice
+    assert "_free_run" not in PylonCamera.__dict__ and "_free_run" not in VirtualMotCamera.__dict__
+    assert PylonCamera._free_run is CameraDevice._free_run          # the ONE property object, inherited
+    assert VirtualMotCamera._free_run is CameraDevice._free_run
+    assert VirtualCamera(_trap(), exposure=1e-3)._free_run is False  # no trigger_source knob -> never free-run
+
+
+def test_roi_clear_predicate_is_single_source():
+    """``is_roi_clear`` -- the ONE free-text ROI predicate the device viewer's setter uses -- accepts
+    every canonical ``ROI_CLEAR_SENTINELS`` spelling PLUS the ``FULL_FRAME_DISPLAY`` read-back the
+    getter shows, case-insensitively, so what the field displays round-trips.  A real (x,w,y,h) window
+    is NOT a clear."""
+    from Zou_lab_control.neutral_atom.devices.base import (
+        FULL_FRAME_DISPLAY, ROI_CLEAR_SENTINELS, is_roi_clear)
+    for spelling in (*ROI_CLEAR_SENTINELS, FULL_FRAME_DISPLAY, "FULL", "Full Frame", "  none  "):
+        assert is_roi_clear(spelling), spelling
+    for window in ("(0, 64, 0, 64)", "10,20,30,40"):
+        assert not is_roi_clear(window), window
+
+
 # --------------------------------------------------------------- [3] exposure validation
 def test_invalid_exposure_raises_identically_on_every_backend():
     """cam.exposure = -1 (or an illegal constructor/configure value) raises ValueError on EVERY

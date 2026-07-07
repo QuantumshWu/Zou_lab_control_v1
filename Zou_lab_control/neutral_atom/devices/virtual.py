@@ -23,7 +23,7 @@ from Zou_lab_control._readout_math import normal_cdf
 from ..core.utils import site_index
 from .base import (
     ROI_CLEAR_SENTINELS, SOFTWARE_TRIGGER, CameraDevice, DeviceProperty, LaserDevice, RFSourceDevice,
-    SequencerDevice, TrapArrayDevice, is_software_trigger, snap_subarray)
+    SequencerDevice, TrapArrayDevice, snap_subarray)
 from .camera_trigger import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
     base_cycle_camera_trigger_pulses,
@@ -1204,11 +1204,8 @@ class VirtualMotCamera(_TriggerWiredCamera):
             z += ((float(levels.get(bus, 0.0)) - b0) / self.b_sigma[bus]) ** 2
         return float(np.exp(-0.5 * z))
 
-    @property
-    def _free_run(self) -> bool:
-        # THE shared predicate (devices.base.is_software_trigger) -- the same rule
-        # PylonCamera._free_run reads, so the two backends can never drift.
-        return is_software_trigger(self.trigger_source)
+    # ``_free_run`` (software-trigger predicate) is inherited from CameraDevice -- the ONE copy both
+    # this monitor camera and the real PylonCamera share, so the two backends can never drift.
 
     def _sense_levels(self, sequence: PulseSequence | None) -> dict[str, float]:
         """The coil levels the sensor sees -- THE one sense rule for both acquisition modes.

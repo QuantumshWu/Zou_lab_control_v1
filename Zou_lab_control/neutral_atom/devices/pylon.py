@@ -33,7 +33,6 @@ from .base import (
     SOFTWARE_TRIGGER,
     CameraDevice,
     config_params_from_signature,
-    is_software_trigger,
     snap_subarray,
 )
 from .camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS
@@ -292,13 +291,8 @@ class PylonCamera(CameraDevice):
 
     # ------------------------------------------------------------------ acquisition hooks
     # The public surface (arm / read_frames / disarm / acquire) lives on the CameraDevice
-    # base; this adapter implements only the pylon-facing hooks.
-
-    @property
-    def _free_run(self) -> bool:
-        # THE shared predicate (devices.base.is_software_trigger) -- the same rule the virtual
-        # monitor camera reads, so the two backends can never drift.
-        return is_software_trigger(self.trigger_source)
+    # base; this adapter implements only the pylon-facing hooks.  ``_free_run`` (software-trigger
+    # predicate) is inherited from CameraDevice -- the ONE copy both backends share.
 
     def _arm(self, frames: int | None) -> None:
         """Start the grab session for an armed request.  Two modes, each with the strategy its
