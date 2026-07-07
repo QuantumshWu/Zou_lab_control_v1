@@ -175,6 +175,32 @@ class ReleaseRecapturePlan:
         return pulse.frame_sequence(2, time_ns=float(value) * float(axis.scale_to_ns))
 
 
+@dataclass(frozen=True)
+class FixedReleaseRecapturePlan:
+    """Release-recapture at a FIXED trap-off time -- for scans that sweep something OTHER than ``t_off``.
+
+    A grey-molasses detuning scan writes the RF two-photon detuning each point (a
+    :class:`~..operations.measurement.DeviceControlAxis`) and release-recaptures at ONE fixed trap-off,
+    so survival vs detuning peaks at the coldest tuning.  Like :class:`ReleaseRecapturePlan` but
+    ``sequence_for`` IGNORES the scanned ``value`` (it went to the device, not the pulse) and always
+    fires the two-trigger sequence at ``t_off_s``.  ``t_off_s`` must be long enough that survival is
+    sensitive to temperature (a few tens of us) yet short enough that even the coldest cloud still loses
+    a measurable fraction -- otherwise the curve is flat and the optimum is invisible."""
+
+    t_off_s: float = 20e-6
+    n_frames: int = 2
+
+    def __post_init__(self) -> None:
+        if int(self.n_frames) != 2:
+            raise ValueError("release-recapture acquires exactly 2 frames (image1, image2).")
+        if not np.isfinite(self.t_off_s) or float(self.t_off_s) < 0.0:
+            raise ValueError("FixedReleaseRecapturePlan.t_off_s must be a non-negative finite time (s).")
+
+    def sequence_for(self, pulse, axis, value: float):
+        del axis, value                                   # the swept value drove the DEVICE, not the pulse
+        return pulse.frame_sequence(2, time_ns=float(self.t_off_s) * 1e9)
+
+
 # ------------------------------------------------------------------------ reducer
 
 

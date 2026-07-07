@@ -21,6 +21,7 @@ from ..operations.measurement import (
     MeasurementSpec,
     NFramePlan,
     OtsuFidelityReducer,
+    DeviceControlAxis,
     ScanAxis,
     ScanResult,
     ScannedMeasurement,
@@ -29,7 +30,7 @@ from ..operations.measurement import (
     triggered_frames,
 )
 from ..operations.tasks.calibrate import CAL_TASK_PREFIX
-from ..operations.temperature import ReleaseRecapturePlan, SurvivalReducer
+from ..operations.temperature import FixedReleaseRecapturePlan, ReleaseRecapturePlan, SurvivalReducer
 from ..timing import PulseTableState
 from .base import ExperimentSubsystem
 
@@ -487,6 +488,47 @@ class ReadoutSubsystem(ExperimentSubsystem):
         return self._build_slot_scan(
             pulse, calibration, slot="s0", values=t_off, label="Trap-off time",
             plan=ReleaseRecapturePlan(), reducer=reducer, shots_per_point=positive_int(shots, "shots"),
+        )
+
+    def build_device_survival_scan(
+        self,
+        values: Sequence[float],
+        write,
+        *,
+        pulse: Any,
+        t_off_s: float,
+        label: str,
+        unit: str = "",
+        y_label: str = "Survival",
+        shots: int = 1,
+        per_site: bool = False,
+    ) -> ScannedMeasurement:
+        """Build (but do not run) a release-recapture survival scan over a DEVICE control.
+
+        The DEVICE-knob sibling of :meth:`build_temperature_scan`: instead of sweeping the trap-off
+        pulse slot, it writes ``write(value)`` to a device at each point (a
+        :class:`~..operations.measurement.DeviceControlAxis` -- e.g. an RF source's two-photon detuning
+        for a grey-molasses scan) and release-recaptures at a FIXED ``t_off_s``, reducing the two frames
+        to survival with the SAME :class:`SurvivalReducer`.  So survival-vs-detuning and
+        survival-vs-t_off share one acquisition engine, one reducer, and the ONE
+        ``calibration.detect``-only survival path (identical for virtual and real hardware); the optimum
+        (coldest cloud) is the survival PEAK.  Requires a thresholded calibration (survival is a binary
+        occupancy comparison) and a fireable release-recapture pulse."""
+
+        calibration = self._session.require_calibration(require_thresholds=True)
+        require_pulse_controller(pulse)               # the ONE fireable-pulse gate (shared text)
+        arr = np.asarray(values, dtype=float).reshape(-1)
+        if arr.size == 0 or not np.all(np.isfinite(arr)):
+            raise ValueError(f"{label} scan values must be a non-empty finite 1-D array.")
+        reducer = SurvivalReducer(per_site=per_site, labels=(label, y_label, y_label))
+        if per_site:
+            reducer.bind_calibration(calibration)
+        axis = DeviceControlAxis(values=arr, write=write, label=label, unit=unit)
+        sequencer = getattr(pulse, "sequencer", getattr(self._session.devices, "sequencer", None))
+        return ScannedMeasurement(
+            pulse, self._session.devices.camera, sequencer, calibration,
+            axis, FixedReleaseRecapturePlan(t_off_s=t_off_s), reducer,
+            shots_per_point=positive_int(shots, "shots"),
         )
 
     def temperature(

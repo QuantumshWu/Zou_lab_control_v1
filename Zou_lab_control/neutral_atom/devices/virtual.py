@@ -95,54 +95,50 @@ DEFAULT_SLEEP_SCALE = 1.0
 # --- Grey-molasses (Lambda-enhanced sub-Doppler) cooling of Rb87, on the D1 line -------------------
 # Physical anchors (Steck, Rb87 D line data; Rosi et al. Sci. Rep. 2018): the D1 line is 794.98 nm with
 # natural linewidth Gamma/2pi = 5.746 MHz; the ground-state hyperfine splitting is 6.834682 GHz (the RF
-# sideband that makes the repumper, i.e. the two-photon / Raman reference).  Grey molasses cools when the
-# light is BLUE-detuned ~+3..+10 Gamma on the D1 line AND the two-photon detuning delta = 0 (a coherent
-# dark state).  We model the RESULT as a multiplier on the cooling floor: 1.0 at that optimum, rising as
-# the tuning degrades -- so the calibrated ``cooled_temperature_K`` is preserved at the optimum and a
-# wrong RF frequency (delta != 0) or a wrong laser wavelength (off D1) makes the atoms warmer / lost.
+# sideband that makes the repumper, i.e. the two-photon / Raman reference).  The cooling light is a
+# single beam LOCKED blue on D1 -- there is no separately-tunable laser "detuning"; the detuning that
+# matters is the TWO-PHOTON (Raman) detuning delta between the cooling and repump beams, which the RF
+# sideband produces.  Grey molasses cools strongest at delta = 0 (a coherent dark state) on the D1 line.
+# We model the RESULT as a multiplier on the cooling floor: 1.0 at that optimum, rising as delta departs
+# from 0 -- so the calibrated ``cooled_temperature_K`` is preserved at delta = 0 and a wrong RF detuning
+# (delta != 0) or a wrong laser wavelength (off D1) makes the atoms warmer / lost.
 RB87_D1_WAVELENGTH_NM = 794.98
 RB87_D1_LINEWIDTH_HZ = 5.746e6
 RB87_HYPERFINE_HZ = 6.834682610e9
-GM_DETUNING_OPTIMUM_GAMMA = 6.0        # blue single-photon detuning where cooling is best
-GM_HOT_FACTOR = 6.0                    # floor multiplier for "no cooling" (off D1 / red / far mis-tuned)
+GM_HOT_FACTOR = 6.0                    # floor multiplier for "no cooling" (off D1 / far mis-tuned delta)
 
 
-def grey_molasses_cooling_factor(detuning_gamma: float, two_photon_detuning_gamma: float,
-                                 saturation: float, on_d1: bool = True) -> float:
-    """The multiplier on the sub-Doppler cooling floor from the laser + RF tuning -- ``1.0`` at the
-    grey-molasses optimum (blue detuning ~+6 Gamma on the D1 line, two-photon delta = 0), growing as the
-    tuning degrades (warmer atoms), up to :data:`GM_HOT_FACTOR` (effectively no cooling -> atoms hot /
-    lost).  The single source the virtual atom array multiplies its ``cooled_temperature_K`` by.
+def grey_molasses_cooling_factor(two_photon_detuning_gamma: float, saturation: float,
+                                 on_d1: bool = True) -> float:
+    """The multiplier on the sub-Doppler cooling floor from the grey-molasses tuning -- ``1.0`` at the
+    optimum (on the D1 line, two-photon delta = 0), growing as delta departs from 0 (warmer atoms), up to
+    :data:`GM_HOT_FACTOR` (effectively no cooling -> atoms hot / lost).  The single source the virtual
+    atom array multiplies its ``cooled_temperature_K`` by.
 
-    Failure modes the user asked for: OFF the D1 line -> no cooling (large); RED / far-off single-photon
-    detuning -> no cooling; wrong RF (delta != 0) -> a Fano feature: a SHARP heating rise for delta > 0
-    and a GENTLE warming for delta < 0 (the coherent dark state is spoiled asymmetrically)."""
+    The ONLY detuning knob is the RF-produced two-photon detuning ``delta`` (the laser has none -- it is
+    locked blue on D1).  Failure modes: OFF the D1 line (wrong wavelength) -> no cooling; wrong RF
+    (delta != 0) -> a Fano feature about delta = 0: a SHARP heating rise for delta > 0 and a GENTLE
+    warming for delta < 0 (the coherent dark state is spoiled asymmetrically).  Higher ``saturation``
+    power-broadens the dark resonance (a wider delta window still cools)."""
     if not on_d1:
         return GM_HOT_FACTOR
-    delta_sp = float(detuning_gamma)
-    if delta_sp <= 0.0:                                    # red / on-resonance: grey molasses does not cool
-        return GM_HOT_FACTOR
-    # Single-photon band: 1.0 at the +6 Gamma optimum, growing away from it (Gaussian in Delta).
-    band = float(np.exp(((delta_sp - GM_DETUNING_OPTIMUM_GAMMA) ** 2) / (2.0 * 3.0 ** 2)))
-    # Two-photon Fano about delta = 0: cold (1.0) on resonance, steep for delta > 0, gentle for delta < 0.
     delta_2p = float(two_photon_detuning_gamma)
     half_width = 0.05 + 0.02 * max(float(saturation), 0.0)  # power-broadened dark-state half-width (Gamma)
     wing = 3.0 if delta_2p >= 0.0 else 0.3                  # heating (>0) vs weak-cooling (<0) asymmetry
     fano = 1.0 + wing * (delta_2p / half_width) ** 2
-    return float(min(GM_HOT_FACTOR, max(1.0, band * fano)))
+    return float(min(GM_HOT_FACTOR, max(1.0, fano)))
 
 
 class VirtualLaser(LaserDevice):
-    """A pure set-point cooling/repump laser for the virtual rig -- it just HOLDS its detuning /
-    wavelength / saturation (no hardware), which :class:`VirtualTrapArray` reads to compute the
-    grey-molasses cooling floor.  Defaults are the Rb87 D1 grey-molasses optimum (794.98 nm, +6 Gamma
-    blue, s ~ 3), so a fresh virtual rig cools well and the DEVIATIONS an operator dials in degrade it."""
+    """A pure set-point grey-molasses cooling laser for the virtual rig -- a beam locked blue on the Rb87
+    D1 line, so it just HOLDS its wavelength + saturation (no hardware), which :class:`VirtualTrapArray`
+    reads.  It has no "detuning" knob (the D1 lock is fixed; the grey-molasses detuning is the RF two-
+    photon delta).  Defaults are the D1 optimum (794.98 nm, s ~ 3), so a fresh rig cools well and a wrong
+    wavelength an operator dials in takes it off the line (no cooling)."""
 
     D1_WINDOW_NM = 0.02        # within this of the D1 line -> "on the line" (cools); beyond -> no GM
 
-    def __init__(self, *, detuning_gamma: float = GM_DETUNING_OPTIMUM_GAMMA,
-                 wavelength_nm: float = RB87_D1_WAVELENGTH_NM, saturation: float = 3.0):
-        self.detuning_gamma = finite_float(detuning_gamma, "detuning_gamma")
+    def __init__(self, *, wavelength_nm: float = RB87_D1_WAVELENGTH_NM, saturation: float = 3.0):
         self.wavelength_nm = positive_float(wavelength_nm, "wavelength_nm")
         self.saturation = nonnegative_float(saturation, "saturation")
 
@@ -152,17 +148,18 @@ class VirtualLaser(LaserDevice):
 
     def snapshot(self) -> dict[str, object]:
         out = super().snapshot()
-        out.update({"detuning_gamma": self.detuning_gamma, "wavelength_nm": self.wavelength_nm,
-                    "saturation": self.saturation, "on_d1": self.on_d1})
+        out.update({"wavelength_nm": self.wavelength_nm, "saturation": self.saturation,
+                    "on_d1": self.on_d1})
         return out
 
 
 class VirtualRF(RFSourceDevice):
-    """A pure set-point RF/EOM source for the virtual rig -- it HOLDS its drive frequency (which sets the
-    two-photon Raman detuning delta for grey molasses) and power.  ``two_photon_detuning_gamma`` is delta
-    in linewidths, derived from the frequency relative to the Rb87 ground hyperfine splitting; the default
-    is exactly on the splitting (delta = 0, the dark-state resonance), so a fresh rig cools well and a
-    wrong frequency the operator dials in heats."""
+    """A pure set-point RF/EOM source for the virtual rig -- it PRODUCES the two-photon Raman detuning
+    for grey molasses.  ``two_photon_detuning_gamma`` (delta in linewidths) is the primary knob and is
+    read/write: the getter derives it from ``frequency_hz`` relative to the Rb87 ground hyperfine
+    splitting, the setter moves ``frequency_hz`` to realise a requested delta (so a detuning scan just
+    writes delta in Gamma).  The default is exactly on the splitting (delta = 0, the dark-state
+    resonance), so a fresh rig cools well and a wrong detuning heats."""
 
     def __init__(self, *, frequency_hz: float = RB87_HYPERFINE_HZ, power_dbm: float = 0.0):
         self.frequency_hz = nonnegative_float(frequency_hz, "frequency_hz")
@@ -171,6 +168,13 @@ class VirtualRF(RFSourceDevice):
     @property
     def two_photon_detuning_gamma(self) -> float:
         return (self.frequency_hz - RB87_HYPERFINE_HZ) / RB87_D1_LINEWIDTH_HZ
+
+    @two_photon_detuning_gamma.setter
+    def two_photon_detuning_gamma(self, delta_gamma: float) -> None:
+        # delta is realised by moving the drive frequency off the hyperfine splitting by delta linewidths.
+        self.frequency_hz = nonnegative_float(
+            RB87_HYPERFINE_HZ + finite_float(delta_gamma, "two_photon_detuning_gamma") * RB87_D1_LINEWIDTH_HZ,
+            "frequency_hz")
 
     def snapshot(self) -> dict[str, object]:
         out = super().snapshot()
@@ -465,7 +469,6 @@ class VirtualTrapArray(TrapArrayDevice):
         if laser is None or rf is None:
             return self.cooled_temperature_K
         factor = grey_molasses_cooling_factor(
-            getattr(laser, "detuning_gamma", GM_DETUNING_OPTIMUM_GAMMA),
             getattr(rf, "two_photon_detuning_gamma", 0.0),
             getattr(laser, "saturation", 3.0),
             bool(getattr(laser, "on_d1", True)))
@@ -1989,7 +1992,6 @@ __all__ = [
     "COOLING_CHANNELS",
     "DEFAULT_CHANNELS",
     "DEFAULT_TRAP_CHANNELS",
-    "GM_DETUNING_OPTIMUM_GAMMA",
     "GM_HOT_FACTOR",
     "MOT_COIL_BUSES",
     "RB87_D1_LINEWIDTH_HZ",

@@ -934,26 +934,21 @@ class TrapArrayDevice(BaseDevice):
 
 
 class LaserDevice(BaseDevice):
-    """Contract for a cooling / repump LASER set-point source -- the knobs a sub-Doppler (grey-molasses /
-    PGC) stage depends on: the single-photon DETUNING from the Rb87 D1 F=2->F'=2 line in linewidths Γ
-    (blue = positive; grey molasses wants ~+3..+10 Γ), whether the WAVELENGTH is on the D1 line at all
-    (794.98 nm -- off it there is NO cooling), and the beam SATURATION I/I_sat.  A real laser wraps a
-    wavemeter + AOM servo behind these; the virtual one is a pure set-point.  ``runtime_controls`` is the
-    ONE editable / observed surface -- the device viewer edits them and the virtual atom model reads them.
-    Every backend (virtual == real) inherits the same control set."""
+    """Contract for the grey-molasses / PGC cooling LASER -- a single beam LOCKED blue on the Rb87 D1
+    line.  A laser has no scannable "detuning" of its own here: the D1 lock point is fixed, and the
+    detuning that matters for grey molasses is the TWO-PHOTON (Raman) detuning between the cooling and
+    repump beams, which is set by the :class:`RFSourceDevice` sideband (see it).  So the laser's knobs
+    are just whether the WAVELENGTH is on the D1 line at all (794.98 nm -- off it there is NO cooling)
+    and the beam SATURATION I/I_sat (which power-broadens the dark resonance).  A real laser wraps a
+    wavemeter + AOM servo behind these; the virtual one is a pure set-point.  ``runtime_controls`` is
+    the ONE editable / observed surface (virtual == real inherits the same set)."""
 
     OBSERVE_API = BaseDevice.OBSERVE_API | frozenset(
-        {"detuning_gamma", "saturation", "wavelength_nm", "on_d1"})
+        {"saturation", "wavelength_nm", "on_d1"})
 
     def runtime_controls(self) -> tuple["RuntimeControl", ...]:
         from ..core.params import ParamDecl
         return (
-            RuntimeControl(
-                ParamDecl(key="detuning_gamma", label="detuning (Γ)", kind="float", lo=-50.0, hi=50.0,
-                          tooltip="Single-photon detuning from the Rb87 D1 F=2->F'=2 line in linewidths Γ "
-                                  "(blue = positive; grey molasses cools best near +3..+10 Γ)."),
-                getter=lambda d: float(d.detuning_gamma),
-                setter=lambda d, v: setattr(d, "detuning_gamma", float(v))),
             RuntimeControl(
                 ParamDecl(key="wavelength_nm", label="wavelength (nm)", kind="float", lo=700.0, hi=900.0,
                           tooltip="Laser wavelength; the Rb87 D1 line is 794.98 nm.  Off the line the grey "
@@ -962,7 +957,8 @@ class LaserDevice(BaseDevice):
                 setter=lambda d, v: setattr(d, "wavelength_nm", float(v))),
             RuntimeControl(
                 ParamDecl(key="saturation", label="saturation I/Isat", kind="float", lo=0.0, hi=100.0,
-                          tooltip="Total beam saturation parameter I/I_sat (~1..10 for grey molasses)."),
+                          tooltip="Total beam saturation parameter I/I_sat (~1..10 for grey molasses); "
+                                  "higher power broadens the two-photon dark resonance."),
                 getter=lambda d: float(d.saturation),
                 setter=lambda d, v: setattr(d, "saturation", float(v))),
             RuntimeControl(
@@ -973,12 +969,16 @@ class LaserDevice(BaseDevice):
 
 
 class RFSourceDevice(BaseDevice):
-    """Contract for an RF / microwave source that generates the grey-molasses REPUMPER sideband at the
-    Rb87 ground-state hyperfine splitting (6.834682 GHz).  Its FREQUENCY sets the two-photon (Raman)
-    detuning δ: δ = 0 (RF exactly on the splitting) is the coherent-dark-state resonance where cooling is
-    strongest; a wrong RF frequency (δ != 0) spoils the dark state and heats (a Fano feature).
-    ``two_photon_detuning_gamma`` reports δ in linewidths, derived from the frequency -- the ONE observed
-    quantity the atom model reads."""
+    """Contract for the RF / microwave source that makes the grey-molasses REPUMPER sideband near the
+    Rb87 ground-state hyperfine splitting (6.834682 GHz).  It is what PRODUCES the two-photon (Raman)
+    detuning δ between the cooling and repump beams -- the detuning a laser lock cannot set.  δ = 0 (RF
+    exactly on the splitting) is the coherent-dark-state resonance where grey molasses cools strongest;
+    a wrong RF frequency (δ != 0) spoils the dark state and heats (a Fano feature).
+
+    So ``two_photon_detuning_gamma`` (δ in linewidths) is a WRITABLE control -- the grey-molasses knob
+    an operator tunes / a detuning scan sweeps -- backed by ``frequency_hz`` (the raw hardware set-point,
+    also writable): setting either moves the same drive.  The device owns the δ<->frequency conversion
+    (its atomic reference), so a scan just writes δ in Γ and every backend converts identically."""
 
     OBSERVE_API = BaseDevice.OBSERVE_API | frozenset(
         {"frequency_hz", "power_dbm", "two_photon_detuning_gamma"})
@@ -987,9 +987,17 @@ class RFSourceDevice(BaseDevice):
         from ..core.params import ParamDecl
         return (
             RuntimeControl(
+                ParamDecl(key="two_photon_detuning_gamma", label="two-photon δ (Γ)", kind="float",
+                          lo=-50.0, hi=50.0,
+                          tooltip="Two-photon (Raman) detuning δ in linewidths Γ -- the grey-molasses knob; "
+                                  "δ = 0 (RF on the 6.834682 GHz hyperfine line) is the dark-state resonance "
+                                  "(best cooling).  Setting it moves the RF frequency."),
+                getter=lambda d: float(d.two_photon_detuning_gamma),
+                setter=lambda d, v: setattr(d, "two_photon_detuning_gamma", float(v))),
+            RuntimeControl(
                 ParamDecl(key="frequency_hz", label="frequency (Hz)", kind="float", lo=0.0, hi=2e10,
                           tooltip="RF/EOM drive frequency generating the repump sideband; the Rb87 ground "
-                                  "hyperfine splitting is 6.834682 GHz (the two-photon resonance, δ = 0)."),
+                                  "hyperfine splitting is 6.834682 GHz (δ = 0).  The raw set-point behind δ."),
                 getter=lambda d: float(d.frequency_hz),
                 setter=lambda d, v: setattr(d, "frequency_hz", float(v))),
             RuntimeControl(
@@ -997,11 +1005,6 @@ class RFSourceDevice(BaseDevice):
                           tooltip="RF drive power."),
                 getter=lambda d: float(d.power_dbm),
                 setter=lambda d, v: setattr(d, "power_dbm", float(v))),
-            RuntimeControl(
-                ParamDecl(key="two_photon_detuning_gamma", label="two-photon δ (Γ)", kind="text",
-                          tooltip="The two-photon (Raman) detuning δ in linewidths, from the RF frequency; "
-                                  "δ = 0 is the dark-state resonance (best cooling)."),
-                getter=lambda d: f"{float(d.two_photon_detuning_gamma):+.3f}"),
         )
 
 

@@ -1854,34 +1854,57 @@ Behaviour-neutral throughout. The single sources added/relocated, by layer:
   `LiveLiveDis`, init and update alike), so the bar column never touches the right edge and the five
   call sites cannot drift into two headroom rules. Appearance-neutral.
 
-## 23. Grey-molasses cooling: virtual `laser` + `rf` devices drive the PGC floor (2026-07-07)
+## 23. Grey-molasses cooling: virtual `laser` + `rf` + a detuning scan (2026-07-07)
 
-The virtual config now has two more devices so an operator can *simulate grey molasses*: a
-`VirtualLaser` (the D1 cooling light) and a `VirtualRF` (the F=1↔F=2 microwave that closes the
-Raman/dark-state condition). They are ordinary registry devices (domains `laser` / `rf`, contracts
-`LaserDevice` / `RFSourceDevice` in `devices/base.py`), wired into the trap array by
-`virtual_config()`: `"trap_array": {"params": {"laser": "$device:laser", "rf": "$device:rf"}}`. Both
-expose **writable** `runtime_controls`, so the device viewer edits them like an API (detuning, wavelength,
-saturation; RF frequency, power).
+The virtual config has two more devices so an operator can *simulate grey molasses*: a `VirtualLaser`
+(a beam LOCKED blue on the Rb87 D1 line) and a `VirtualRF` (the microwave/EOM sideband). Ordinary
+registry devices (domains `laser` / `rf`, contracts `LaserDevice` / `RFSourceDevice` in
+`devices/base.py`), wired into the trap array by `virtual_config()`:
+`"trap_array": {"params": {"laser": "$device:laser", "rf": "$device:rf"}}`.
 
-**One physics source** — `grey_molasses_cooling_factor(detuning_gamma, two_photon_detuning_gamma,
-saturation, on_d1)` returns a *multiplier on the cooling floor* (`VirtualTrapArray._cooling_floor_K()`
-multiplies `cooled_temperature_K` by it; `reload`/`set_occupancy`/`cool` all seed temperature from that
-one method). Design choices and why:
-- **Relative, not absolute.** The factor is exactly `1.0` at the grey-molasses optimum, so the
-  *default* rig (laser +6 Γ blue on D1, RF exactly on the 6.834 GHz hyperfine line) preserves the
-  calibrated 50 µK floor — `test_virtual_atom_physics` / `test_calibration_report_and_noise` do **not**
-  move. Mis-tuning only ever makes atoms warmer (lower release-recapture survival), never magically
-  colder. A rig with no laser/RF bound keeps its plain floor (`_cooling_floor_K` early-returns).
-- **The failure modes the user asked for.** Off the D1 line (`on_d1` false, wavelength >0.02 nm off) →
-  no cooling (`GM_HOT_FACTOR`, ×6). Red / on-resonance single-photon detuning → no cooling. Blue
-  detuning away from +6 Γ → Gaussian penalty (σ=3 Γ). Two-photon RF detuning δ≠0 → a **Fano** feature:
-  steep heating for δ>0, gentle for δ<0, with a power-broadened half-width `0.05 + 0.02·s` Γ, so a
-  *fine* RF-frequency scan resolves the narrow dark-resonance dip (a user can optimize it).
-- Rb87 anchors are single-source constants in `virtual.py`: `RB87_D1_WAVELENGTH_NM = 794.98`,
-  `RB87_D1_LINEWIDTH_HZ = 5.746e6`, `RB87_HYPERFINE_HZ = 6.834682610e9`. `VirtualRF`'s derived
-  `two_photon_detuning_gamma = (frequency_hz − HFS)/Γ` is a **read-only** control (a derived read-back).
+**The detuning is the RF's, not the laser's.** A laser here has NO tunable detuning — the D1 lock is
+fixed. The detuning that matters for grey molasses is the TWO-PHOTON (Raman) detuning δ between the
+cooling and repump beams, which the RF sideband PRODUCES. So:
+- `LaserDevice` controls = `wavelength_nm` (on-D1?) + `saturation` (power-broadens the dark resonance).
+  NO `detuning_gamma`.
+- `RFSourceDevice`'s **`two_photon_detuning_gamma` is the primary writable control** (the grey-molasses
+  knob): a two-way property whose getter derives δ from `frequency_hz` and whose setter moves
+  `frequency_hz` to realise δ. The device owns the δ↔Hz conversion (its Rb87 reference), so a scan just
+  writes δ in Γ. `frequency_hz` / `power_dbm` are also writable (raw set-points).
 
-Guarded by `tests/test_grey_molasses_cooling.py` (factor optimum=1.0 / red-detuned / off-D1 / RF-detuned
-/ trap-floor-follows-laser+RF / connect-wires-them). Adding two devices bumps the virtual roster, so
-`test_device_config_io.py`'s expected name list now includes `laser` / `rf`.
+**One physics source** — `grey_molasses_cooling_factor(two_photon_detuning_gamma, saturation, on_d1)` is
+a *multiplier on the cooling floor* (`VirtualTrapArray._cooling_floor_K()` multiplies
+`cooled_temperature_K` by it; `reload`/`set_occupancy`/`cool` seed temperature from that one method):
+- **Relative, not absolute** — factor is exactly `1.0` at the optimum (δ = 0 on D1), so the *default*
+  rig (RF on the 6.834 GHz hyperfine line, laser on D1) preserves the calibrated 50 µK floor;
+  `test_virtual_atom_physics` / `test_calibration_report_and_noise` do **not** move. Mis-tuning only
+  warms. A rig with no laser/RF keeps its plain floor (`_cooling_floor_K` early-returns).
+- **Failure modes** — off D1 (`on_d1` false) → no cooling (`GM_HOT_FACTOR`, ×6). δ ≠ 0 → a **Fano**
+  feature about δ = 0: steep heating for δ > 0, gentle for δ < 0, power-broadened half-width
+  `0.05 + 0.02·s` Γ, so a *fine* δ scan resolves the narrow dark-resonance dip.
+- Rb87 anchors are single-source constants in `virtual.py` (`RB87_D1_WAVELENGTH_NM = 794.98`,
+  `RB87_D1_LINEWIDTH_HZ = 5.746e6`, `RB87_HYPERFINE_HZ = 6.834682610e9`).
+
+**Scanning a DEVICE control (the real architectural gap this filled).** The scan engine could only
+sweep a PULSE slot (`ScanAxis` → `pulse.set_time` / `set_slot`). Grey-molasses detuning is a *device*
+knob, so the framework gained a general **`DeviceControlAxis`** (`operations/measurement.py`): it
+carries a `write(value)` callable and its `apply` writes the DEVICE (leaving the pulse fixed);
+`kind="device"` / `is_time=False` make `ScannedMeasurement` skip the pulse-slot validation + clock snap.
+It pairs with **`FixedReleaseRecapturePlan`** (`operations/temperature.py`) — release-recapture at a
+FIXED `t_off` (the swept value went to the device, not the pulse). The assembly spine is
+**`ReadoutSubsystem.build_device_survival_scan(values, write, *, pulse, t_off_s, label, y_label, …)`** —
+the device-knob sibling of `build_temperature_scan`, reusing the SAME `SurvivalReducer` +
+`calibration.detect`-only survival path (identical virtual/real). This is now the way to scan ANY device
+control against release-recapture, not just detuning.
+
+**The measurement** — `operations/measurements/grey_molasses_detuning.py` (`@measurement(devices=["rf"])`,
+auto-discovered; key `gm_detuning`, x=`detuning`, **y=`recapture`** so it does not collide with
+Temperature's `survival`). It sweeps the RF's `two_photon_detuning_gamma` (routed through the device's
+own validated setter) and release-recaptures at a fixed `t_off`; the recapture rate PEAKS at the optimum
+δ (the coldest cloud). Reuses the Temperature measurement's release-recapture template prep
+(`_resolve_release_recapture_template` / `_match_imaging_exposure`) so the two cannot drift.
+
+Guarded by `tests/test_grey_molasses_cooling.py` (factor optimum=1.0 / off-D1 / Fano asymmetry /
+saturation-broadening / laser-has-no-detuning + RF-owns-it / trap-floor-follows-δ / connect-wires-them /
+the detuning-scan recapture-rate peaks at δ=0 end-to-end). Adding two devices bumps the virtual roster,
+so `test_device_config_io.py`'s expected name list includes `laser` / `rf`.

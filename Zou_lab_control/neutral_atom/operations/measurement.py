@@ -350,6 +350,47 @@ class ScanAxis:
             pulse.set_slot(self.slot, float(value))
 
 
+@dataclass(frozen=True)
+class DeviceControlAxis:
+    """Declares a swept DEVICE runtime control (not a pulse slot).
+
+    ``ScanAxis`` writes the bound PULSE each point; a great many experiments instead sweep a device
+    SET-POINT -- an RF source's two-photon detuning for a grey-molasses scan, a laser's saturation, a
+    field.  This axis carries a ``write(value)`` callable (a device control's setter, bound to the
+    device) and its ``apply`` writes THAT, leaving the pulse fixed; the ``ShotPlan`` then fires a
+    constant sequence and the reducer reads the frames.  It DUCK-TYPES the surface the scan engine uses
+    (``values`` / ``label`` / ``unit`` / ``apply``), so :class:`ScannedMeasurement` sweeps a device knob
+    with no change; ``kind='device'`` and ``is_time=False`` make the engine skip the pulse-slot
+    validation and the clock-grid snap that only pulse axes need.  Pairs with a fixed-sequence plan
+    (e.g. :class:`~..operations.temperature.FixedReleaseRecapturePlan`)."""
+
+    values: np.ndarray
+    write: Callable[[float], None]
+    label: str = "x"
+    unit: str = ""
+    kind: str = "device"
+    scale_to_ns: float = 1.0        # unused (no pulse write); present so the ScanAxis surface matches
+
+    def __post_init__(self) -> None:
+        values = np.asarray(self.values, dtype=float).reshape(-1)
+        if values.size == 0 or not np.all(np.isfinite(values)):
+            raise ValueError("DeviceControlAxis.values must be a non-empty finite 1-D array.")
+        if not callable(self.write):
+            raise TypeError("DeviceControlAxis.write must be a callable (value) -> None.")
+        object.__setattr__(self, "values", values)
+        object.__setattr__(self, "kind", "device")
+
+    @property
+    def is_time(self) -> bool:
+        return False
+
+    def apply(self, pulse, value: float) -> None:
+        """Write one scan value to the DEVICE control; the bound pulse is untouched."""
+
+        del pulse
+        self.write(float(value))
+
+
 @runtime_checkable
 class ShotPlan(Protocol):
     """How many frames a point acquires and how its sequence is built.
@@ -618,6 +659,7 @@ class ScannedMeasurement:
 
 
 __all__ = [
+    "DeviceControlAxis",
     "MeasurementSpec",
     "NFramePlan",
     "OtsuFidelityReducer",
