@@ -1699,6 +1699,19 @@ contract test — the single mechanical guard. Change the framework = change the
   `ParamDecl` with a `display` data flag), so a ParamDecl kind is rendered/read/seeded/validated in
   ONE place. Adding a kind = one whitelist entry + one handler. Guard:
   `tests/test_param_widget_registry.py`.
+  - **Device param declared ONCE — `DeviceProperty` (confocal `ManagedProperty`).** A concrete device
+    declares each tunable knob as a `devices/base.py::DeviceProperty` class attribute: the descriptor IS
+    the Python property (validated get/set — `float`/`int` clamp to bounds, `bool` coerces, `choice`
+    rejects a value outside `choices`, a getter-only prop is read-only) AND auto-registers into the
+    device's runtime-control catalog. `BaseDevice.runtime_controls()` DERIVES the whole catalog from the
+    MRO-merged `DeviceProperty` descriptors (`collect_device_properties`), so `runtime_controls` is never
+    hand-typed and the property + its GUI can't drift. Three kinds -> three widgets:
+    `float`->spin box, `bool`->switch, `choice`->combo (see `VirtualRF`: δ/freq/power floats, `drive_on`
+    bool, `waveform` choice; `VirtualLaser`: wavelength/saturation floats, `beam_on` bool, `on_d1`
+    read-back). A device whose control routes through a backend-specific path (a camera's `exposure`
+    setter -> `configure`, its abstract per-backend getter) overrides `runtime_controls` instead — the
+    documented escape hatch. Guards: `test_device_runtime_controls.py::test_runtime_controls_are_derived_from_device_properties`
+    / `test_device_property_covers_the_three_param_kinds` / `test_device_property_is_the_property_and_validates`.
   - **Numeric widget = spin box, decided on the declaration.** `FloatHandler`/`IntHandler` build a blank
     line edit vs a scrollable `FluentDoubleSpinBox` from the ONE predicate `ParamDecl.blank_allowed`
     (explicit `optional` wins; else infer "no default and not required" = an optional API arg). A device

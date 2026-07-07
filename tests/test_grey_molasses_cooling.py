@@ -83,7 +83,9 @@ def test_virtual_laser_has_no_detuning_and_the_rf_owns_it():
     laser = VirtualLaser()
     laser_keys = {c.decl.key for c in laser.runtime_controls()}
     assert "detuning_gamma" not in laser_keys and not hasattr(laser, "detuning_gamma")
-    assert laser_keys == {"wavelength_nm", "saturation", "on_d1"}
+    # the grey-molasses knobs (no detuning): wavelength / saturation floats + a beam-on switch + the
+    # derived on-D1 read-back -- all auto-injected from the laser's DeviceProperty declarations.
+    assert laser_keys == {"wavelength_nm", "saturation", "beam_on", "on_d1"}
     assert laser.on_d1 is True
     laser.wavelength_nm = RB87_D1_WAVELENGTH_NM + 5.0
     assert laser.on_d1 is False

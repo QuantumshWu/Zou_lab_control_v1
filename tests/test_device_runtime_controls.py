@@ -157,6 +157,58 @@ def test_numeric_device_read_back_engineering_scales_its_unit(devices):
     assert text.endswith("GHz") and "6.83" in text and "6800000000" not in text, text
 
 
+# ---------------------------------------------- DeviceProperty auto-injection (confocal ManagedProperty)
+
+
+def test_runtime_controls_are_derived_from_device_properties(devices):
+    """``runtime_controls`` is DERIVED from the :class:`DeviceProperty` a device declares (confocal
+    ``ManagedProperty`` -> ``gui_dict``), never hand-typed: the catalog for the RF / laser is exactly
+    the DeviceProperty descriptors on their class (MRO-merged), in declaration order.  So a device
+    author declares a knob ONCE -- the property + its metadata -- and its control auto-injects."""
+    from Zou_lab_control.neutral_atom.devices.base import collect_device_properties
+
+    for name in ("rf", "laser"):
+        device = devices[name]
+        derived = [c.decl.key for c in device.runtime_controls()]
+        declared = list(collect_device_properties(type(device)))
+        assert derived == declared, (
+            f"{name}: runtime_controls {derived} must be derived from its DeviceProperty declarations "
+            f"{declared} -- not hand-written")
+        assert declared, f"{name}: expected the concrete device to declare DeviceProperty knobs"
+
+
+def test_device_property_covers_the_three_param_kinds(devices):
+    """The three device-param kinds all auto-inject their control from a DeviceProperty declaration:
+    FLOAT (a scrollable spin box), BOOL (a switch) and CHOICE (a combo).  Shown on the RF source -- a
+    δ / frequency / power float, a ``drive_on`` bool, a ``waveform`` choice -- so every kind is exercised
+    end to end through the ONE declare-once path (not just supported in the abstract)."""
+    controls = {c.decl.key: c for c in devices["rf"].runtime_controls()}
+    assert controls["two_photon_detuning_gamma"].decl.kind == "float" and controls["two_photon_detuning_gamma"].writable
+    assert controls["drive_on"].decl.kind == "bool" and controls["drive_on"].writable
+    wf = controls["waveform"]
+    assert wf.decl.kind == "choice" and wf.decl.choices == ("sine", "square", "triangle")
+    laser = {c.decl.key: c for c in devices["laser"].runtime_controls()}
+    assert laser["beam_on"].decl.kind == "bool" and laser["beam_on"].writable       # a writable bool
+    assert laser["on_d1"].decl.kind == "bool" and not laser["on_d1"].writable        # a derived read-back bool
+
+
+def test_device_property_is_the_property_and_validates(devices):
+    """A DeviceProperty IS the Python property (the descriptor unifies the two): reading / writing the
+    attribute goes through it, a float clamps to its bounds, a choice rejects a value outside its
+    options, and a derived read-back (no setter) refuses assignment -- so the property behaviour and its
+    GUI can never drift apart."""
+    rf = devices["rf"]
+    rf.two_photon_detuning_gamma = -0.4                       # the bidirectional setter moves frequency
+    assert abs(rf.two_photon_detuning_gamma - (-0.4)) < 1e-9
+    rf.power_dbm = 999.0                                      # float clamps to its declared upper bound
+    assert rf.power_dbm == 40.0
+    with pytest.raises(ValueError):
+        rf.waveform = "noise"                                # not one of the declared choices
+    laser = devices["laser"]
+    with pytest.raises(AttributeError):
+        laser.on_d1 = True                                   # a derived read-back is read-only
+
+
 # --------------------------------------------------------------------- #2 write-through
 
 

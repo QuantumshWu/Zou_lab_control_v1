@@ -57,6 +57,132 @@ class RuntimeControl:
         return self.setter is not None
 
 
+class DeviceProperty:
+    """ONE declaration of a live, tunable device attribute -- our confocal ``ManagedProperty``.
+
+    The descriptor IS the Python property (validated get / set) AND auto-registers into the device's
+    runtime-control catalog, so the device viewer builds the widget with NO hand-written
+    :class:`RuntimeControl`.  A device author declares the metadata ONCE -- the ``kind`` plus
+    label / unit / bounds / choices -- and either lets the value AUTO-STORE in ``_<name>`` (seeded to
+    ``default``) or attaches a getter / setter for a derived or routed value.  The base
+    :meth:`BaseDevice.runtime_controls` DERIVES the whole catalog from every DeviceProperty on the
+    class (MRO-merged, nearest class wins, declaration order), so ``runtime_controls`` is never
+    hand-typed and the property + its GUI can never drift apart.
+
+    ``kind`` selects the shared ``PARAM_WIDGETS`` widget: ``float`` / ``int`` -> a scrollable spin box
+    (bounded by ``lo`` / ``hi``), ``bool`` -> a switch, ``choice`` -> a combo (of ``choices``),
+    ``text`` -> a read-only display.  A property with NO setter -- a getter-only derived read-back
+    (``on_d1``, ``frame_shape``) or an explicit ``read_only=True`` -- is a read-only control (the panel
+    shows its Current line and no editor).  Validation lives here (``float`` / ``int`` clamp to the
+    bounds like confocal; ``bool`` coerces; ``choice`` rejects a value outside ``choices``); a custom
+    setter body may add stricter checks (a camera's ``exposure`` rejects a non-positive value).
+
+    Usage (confocal ``@ManagedProperty`` style)::
+
+        exposure = DeviceProperty("float", unit="s", lo=0.0, hi=1e6, tooltip="Frame exposure (s).")
+        @exposure.getter
+        def exposure(self): return float(self._exposure)
+        @exposure.setter
+        def exposure(self, value): self.configure(exposure=self._validated_exposure(value))
+
+    or, for a plain stored knob, just a default and no getter / setter (auto-stored in ``_<name>``)::
+
+        saturation = DeviceProperty("float", label="saturation I/Isat", lo=0.0, hi=100.0, default=3.0)
+    """
+
+    def __init__(self, kind, *, label=None, unit="", lo=0.0, hi=1e12, choices=(), default=None,
+                 tooltip="", segmented=False, read_only=False):
+        self._decl_kw = dict(label=label, kind=str(kind), unit=unit, lo=lo, hi=hi,
+                             choices=tuple(choices), tooltip=tooltip, segmented=segmented)
+        self.kind = str(kind)
+        self.lo = lo
+        self.hi = hi
+        self.choices = tuple(choices)
+        self.default = default
+        self.read_only = bool(read_only)
+        self.name: str | None = None
+        self.fget: Optional[Callable[[Any], Any]] = None
+        self.fset: Optional[Callable[[Any, Any], None]] = None
+
+    # -- authoring: decorate the getter (confocal), or attach getter / setter explicitly --
+    def __call__(self, fget):
+        return self.getter(fget)
+
+    def getter(self, fget):
+        self.fget = fget
+        return self
+
+    def setter(self, fset):
+        self.fset = fset
+        self.read_only = False
+        return self
+
+    def __set_name__(self, owner, name):
+        self.name = name
+        if self._decl_kw["label"] is None:
+            self._decl_kw["label"] = name
+        own = owner.__dict__.get("_own_device_properties")
+        if own is None:
+            own = {}
+            owner._own_device_properties = own
+        own[name] = self          # dict preserves declaration order; runtime_controls MRO-merges
+
+    # -- the property itself --
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            return self
+        if self.fget is not None:
+            return self.fget(instance)
+        return getattr(instance, f"_{self.name}", self.default)   # auto-storage, seeded to default
+
+    def __set__(self, instance, value):
+        if not self.writable:
+            raise AttributeError(f"{self.name} is read-only")
+        value = self._coerce(value)
+        if self.fset is not None:
+            self.fset(instance, value)
+        else:
+            object.__setattr__(instance, f"_{self.name}", value)
+
+    def _coerce(self, value):
+        if self.kind == "float":
+            return min(max(float(value), float(self.lo)), float(self.hi))   # clamp to bounds (confocal)
+        if self.kind == "int":
+            return int(min(max(int(value), int(self.lo)), int(self.hi)))
+        if self.kind == "bool":
+            return bool(value)
+        if self.kind == "choice":
+            s = str(value)
+            allowed = [str(c) for c in self.choices]
+            if allowed and s not in allowed:
+                raise ValueError(f"{self.name} must be one of {allowed}")
+            return s
+        return value
+
+    @property
+    def writable(self) -> bool:
+        """A control is writable unless it is explicitly ``read_only`` or a getter-only derived
+        read-back (a getter but no setter)."""
+        return not self.read_only and not (self.fget is not None and self.fset is None)
+
+    def build_decl(self):
+        """The :class:`~..core.params.ParamDecl` the shared registry builds the widget from."""
+        from ..core.params import ParamDecl
+        return ParamDecl(key=self.name, **self._decl_kw)
+
+
+def collect_device_properties(cls) -> "dict[str, DeviceProperty]":
+    """Every :class:`DeviceProperty` on ``cls``, MRO-merged base-first so a subclass's declaration
+    overrides a base's of the same name (keeping the base's display position) and new subclass knobs
+    append after the inherited ones -- the single derivation :meth:`BaseDevice.runtime_controls` uses."""
+    merged: "dict[str, DeviceProperty]" = {}
+    for base in reversed(cls.__mro__):
+        own = base.__dict__.get("_own_device_properties")
+        if own:
+            merged.update(own)
+    return merged
+
+
 class AcquisitionCancelled(Exception):
     """Raised by ``acquire`` when its optional ``stop`` event fires mid-wait.
 
@@ -138,10 +264,19 @@ class BaseDevice(ABC):
         (``(device) -> value``, polled to show the current value) and a ``setter``
         (``(device, value) -> None``, or ``None`` for a read-only read-back).  Value
         validation lives in the device's OWN setter (e.g. a camera's ``exposure`` setter
-        rejects a non-positive value), never in the GUI.  Default: nothing tunable at
-        runtime (an empty catalog); a contract class declares the standard controls for its
-        role and a backend may extend them."""
-        return ()
+        rejects a non-positive value), never in the GUI.
+
+        DERIVED, never hand-typed: the catalog is built from every :class:`DeviceProperty` the
+        device declares (MRO-merged), so declaring a knob once -- the property + its metadata --
+        auto-injects its control (confocal ``ManagedProperty`` -> ``gui_dict``).  A device with no
+        DeviceProperty has an empty catalog; a backend that needs a dynamic control can still
+        override this and extend ``super().runtime_controls()``."""
+        controls = []
+        for prop in collect_device_properties(type(self)).values():
+            getter = (lambda p: (lambda dev: p.__get__(dev, type(dev))))(prop)
+            setter = (lambda p: (lambda dev, value: p.__set__(dev, value)))(prop) if prop.writable else None
+            controls.append(RuntimeControl(decl=prop.build_decl(), getter=getter, setter=setter))
+        return tuple(controls)
 
 
 #: Device ACCESS MODES a logic node declares per device (its ``_devices`` mapping).
@@ -961,28 +1096,11 @@ class LaserDevice(BaseDevice):
     the ONE editable / observed surface (virtual == real inherits the same set)."""
 
     OBSERVE_API = BaseDevice.OBSERVE_API | frozenset(
-        {"saturation", "wavelength_nm", "on_d1"})
+        {"saturation", "wavelength_nm", "beam_on", "on_d1"})
 
-    def runtime_controls(self) -> tuple["RuntimeControl", ...]:
-        from ..core.params import ParamDecl
-        return (
-            RuntimeControl(
-                ParamDecl(key="wavelength_nm", label="wavelength", kind="float", unit="nm", lo=700.0, hi=900.0,
-                          tooltip="Laser wavelength; the Rb87 D1 line is 794.98 nm.  Off the line the grey "
-                                  "molasses does not cool (atoms stay hot / are lost)."),
-                getter=lambda d: float(d.wavelength_nm),
-                setter=lambda d, v: setattr(d, "wavelength_nm", float(v))),
-            RuntimeControl(
-                ParamDecl(key="saturation", label="saturation I/Isat", kind="float", lo=0.0, hi=100.0,
-                          tooltip="Total beam saturation parameter I/I_sat (~1..10 for grey molasses); "
-                                  "higher power broadens the two-photon dark resonance."),
-                getter=lambda d: float(d.saturation),
-                setter=lambda d, v: setattr(d, "saturation", float(v))),
-            RuntimeControl(
-                ParamDecl(key="on_d1", label="on D1 line", kind="text",
-                          tooltip="Whether the wavelength is close enough to the Rb87 D1 line to cool."),
-                getter=lambda d: "yes" if d.on_d1 else "no"),
-        )
+    # The laser's live controls are DERIVED from the DeviceProperty knobs a concrete backend declares
+    # (:class:`~..devices.virtual.VirtualLaser` wavelength / saturation / beam_on / on_d1) -- the base
+    # ``runtime_controls`` builds the catalog from them, so this contract adds no hand-written override.
 
 
 class RFSourceDevice(BaseDevice):
@@ -998,31 +1116,11 @@ class RFSourceDevice(BaseDevice):
     (its atomic reference), so a scan just writes δ in Γ and every backend converts identically."""
 
     OBSERVE_API = BaseDevice.OBSERVE_API | frozenset(
-        {"frequency_hz", "power_dbm", "two_photon_detuning_gamma"})
+        {"frequency_hz", "power_dbm", "two_photon_detuning_gamma", "drive_on", "waveform"})
 
-    def runtime_controls(self) -> tuple["RuntimeControl", ...]:
-        from ..core.params import ParamDecl
-        return (
-            RuntimeControl(
-                ParamDecl(key="two_photon_detuning_gamma", label="two-photon δ", kind="float", unit="Γ",
-                          lo=-50.0, hi=50.0,
-                          tooltip="Two-photon (Raman) detuning δ in linewidths Γ -- the grey-molasses knob; "
-                                  "δ = 0 (RF on the 6.834682 GHz hyperfine line) is the dark-state resonance "
-                                  "(best cooling).  Setting it moves the RF frequency."),
-                getter=lambda d: float(d.two_photon_detuning_gamma),
-                setter=lambda d, v: setattr(d, "two_photon_detuning_gamma", float(v))),
-            RuntimeControl(
-                ParamDecl(key="frequency_hz", label="frequency", kind="float", unit="Hz", lo=0.0, hi=2e10,
-                          tooltip="RF/EOM drive frequency generating the repump sideband; the Rb87 ground "
-                                  "hyperfine splitting is 6.834682 GHz (δ = 0).  The raw set-point behind δ."),
-                getter=lambda d: float(d.frequency_hz),
-                setter=lambda d, v: setattr(d, "frequency_hz", float(v))),
-            RuntimeControl(
-                ParamDecl(key="power_dbm", label="power", kind="float", unit="dBm", lo=-100.0, hi=40.0,
-                          tooltip="RF drive power."),
-                getter=lambda d: float(d.power_dbm),
-                setter=lambda d, v: setattr(d, "power_dbm", float(v))),
-        )
+    # The RF source's live controls are DERIVED from the DeviceProperty knobs the concrete backend
+    # declares (:class:`~..devices.virtual.VirtualRF` two-photon δ / frequency / power / drive_on /
+    # waveform) -- the base ``runtime_controls`` builds them, so no hand-written override here.
 
 
 def snap_subarray(roi, *, step: int, max_w: int, max_h: int):

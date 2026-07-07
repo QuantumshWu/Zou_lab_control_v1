@@ -22,8 +22,8 @@ from Zou_lab_control._clock import DEFAULT_CLOCK_HZ
 from Zou_lab_control._readout_math import normal_cdf
 from ..core.utils import site_index
 from .base import (
-    ROI_CLEAR_SENTINELS, SOFTWARE_TRIGGER, CameraDevice, LaserDevice, RFSourceDevice, SequencerDevice,
-    TrapArrayDevice, is_software_trigger, snap_subarray)
+    ROI_CLEAR_SENTINELS, SOFTWARE_TRIGGER, CameraDevice, DeviceProperty, LaserDevice, RFSourceDevice,
+    SequencerDevice, TrapArrayDevice, is_software_trigger, snap_subarray)
 from .camera_trigger import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
     base_cycle_camera_trigger_pulses,
@@ -138,18 +138,39 @@ class VirtualLaser(LaserDevice):
 
     D1_WINDOW_NM = 0.02        # within this of the D1 line -> "on the line" (cools); beyond -> no GM
 
-    def __init__(self, *, wavelength_nm: float = RB87_D1_WAVELENGTH_NM, saturation: float = 3.0):
-        self.wavelength_nm = positive_float(wavelength_nm, "wavelength_nm")
-        self.saturation = nonnegative_float(saturation, "saturation")
+    # Each live knob is declared ONCE as a DeviceProperty: the descriptor IS the property AND
+    # auto-injects its device-viewer control (confocal ``ManagedProperty`` -> ``gui_dict``), so
+    # ``runtime_controls`` is derived, never hand-typed.  Two of the three device-param kinds show here
+    # -- FLOAT (wavelength / saturation, scrollable spin boxes) and BOOL (``beam_on`` writable switch,
+    # ``on_d1`` a read-only derived read-back).
+    wavelength_nm = DeviceProperty(
+        "float", label="wavelength", unit="nm", lo=700.0, hi=900.0, default=RB87_D1_WAVELENGTH_NM,
+        tooltip="Laser wavelength; the Rb87 D1 line is 794.98 nm.  Off the line the grey molasses does "
+                "not cool (atoms stay hot / are lost).")
+    saturation = DeviceProperty(
+        "float", label="saturation I/Isat", lo=0.0, hi=100.0, default=3.0,
+        tooltip="Total beam saturation parameter I/I_sat (~1..10 for grey molasses); higher power "
+                "broadens the two-photon dark resonance.")
+    beam_on = DeviceProperty(
+        "bool", label="beam on", default=True,
+        tooltip="Whether the cooling beam is on -- a pure on/off state flag.")
 
-    @property
+    def __init__(self, *, wavelength_nm: float = RB87_D1_WAVELENGTH_NM, saturation: float = 3.0):
+        self.wavelength_nm = wavelength_nm    # through the descriptor (validates: clamps to [700, 900])
+        self.saturation = saturation          # clamps to [0, 100]
+
+    on_d1 = DeviceProperty(
+        "bool", label="on D1 line",
+        tooltip="Whether the wavelength is close enough to the Rb87 D1 line to cool (a derived read-back).")
+
+    @on_d1.getter
     def on_d1(self) -> bool:
         return abs(self.wavelength_nm - RB87_D1_WAVELENGTH_NM) <= self.D1_WINDOW_NM
 
     def snapshot(self) -> dict[str, object]:
         out = super().snapshot()
         out.update({"wavelength_nm": self.wavelength_nm, "saturation": self.saturation,
-                    "on_d1": self.on_d1})
+                    "beam_on": self.beam_on, "on_d1": self.on_d1})
         return out
 
 
@@ -161,25 +182,50 @@ class VirtualRF(RFSourceDevice):
     writes delta in Gamma).  The default is exactly on the splitting (delta = 0, the dark-state
     resonance), so a fresh rig cools well and a wrong detuning heats."""
 
-    def __init__(self, *, frequency_hz: float = RB87_HYPERFINE_HZ, power_dbm: float = 0.0):
-        self.frequency_hz = nonnegative_float(frequency_hz, "frequency_hz")
-        self.power_dbm = finite_float(power_dbm, "power_dbm")
+    # Each live knob is declared ONCE as a DeviceProperty (confocal ``ManagedProperty``): the
+    # descriptor IS the property AND auto-injects its control, so ``runtime_controls`` is derived.
+    # ALL THREE device-param kinds show here -- FLOAT (delta / frequency / power spin boxes), BOOL
+    # (``drive_on`` switch) and CHOICE (``waveform`` combo).  ``two_photon_detuning_gamma`` is declared
+    # FIRST so the grey-molasses knob leads the catalog; its getter / setter derive it from
+    # ``frequency_hz`` (bidirectional), the rest auto-store.
+    two_photon_detuning_gamma = DeviceProperty(
+        "float", label="two-photon δ", unit="Γ", lo=-50.0, hi=50.0,
+        tooltip="Two-photon (Raman) detuning δ in linewidths Γ -- the grey-molasses knob; δ = 0 (RF on "
+                "the 6.834682 GHz hyperfine line) is the dark-state resonance (best cooling).  Setting it "
+                "moves the RF frequency.")
 
-    @property
+    @two_photon_detuning_gamma.getter
     def two_photon_detuning_gamma(self) -> float:
         return (self.frequency_hz - RB87_HYPERFINE_HZ) / RB87_D1_LINEWIDTH_HZ
 
     @two_photon_detuning_gamma.setter
     def two_photon_detuning_gamma(self, delta_gamma: float) -> None:
         # delta is realised by moving the drive frequency off the hyperfine splitting by delta linewidths.
-        self.frequency_hz = nonnegative_float(
-            RB87_HYPERFINE_HZ + finite_float(delta_gamma, "two_photon_detuning_gamma") * RB87_D1_LINEWIDTH_HZ,
-            "frequency_hz")
+        self.frequency_hz = RB87_HYPERFINE_HZ + float(delta_gamma) * RB87_D1_LINEWIDTH_HZ
+
+    frequency_hz = DeviceProperty(
+        "float", label="frequency", unit="Hz", lo=0.0, hi=2e10, default=RB87_HYPERFINE_HZ,
+        tooltip="RF/EOM drive frequency generating the repump sideband; the Rb87 ground hyperfine "
+                "splitting is 6.834682 GHz (δ = 0).  The raw set-point behind δ.")
+    power_dbm = DeviceProperty(
+        "float", label="power", unit="dBm", lo=-100.0, hi=40.0, default=0.0,
+        tooltip="RF drive power.")
+    drive_on = DeviceProperty(
+        "bool", label="drive on", default=True,
+        tooltip="Whether the RF drive is on -- a pure on/off state flag.")
+    waveform = DeviceProperty(
+        "choice", label="waveform", choices=("sine", "square", "triangle"), default="sine",
+        tooltip="RF drive waveform.")
+
+    def __init__(self, *, frequency_hz: float = RB87_HYPERFINE_HZ, power_dbm: float = 0.0):
+        self.frequency_hz = frequency_hz      # through the descriptor (clamps to [0, 2e10])
+        self.power_dbm = power_dbm            # clamps to [-100, 40]
 
     def snapshot(self) -> dict[str, object]:
         out = super().snapshot()
         out.update({"frequency_hz": self.frequency_hz, "power_dbm": self.power_dbm,
-                    "two_photon_detuning_gamma": self.two_photon_detuning_gamma})
+                    "two_photon_detuning_gamma": self.two_photon_detuning_gamma,
+                    "drive_on": self.drive_on, "waveform": self.waveform})
         return out
 
 
