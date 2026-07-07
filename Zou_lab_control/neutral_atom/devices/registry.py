@@ -11,7 +11,8 @@ from typing import Any, Mapping
 
 from ..core.params import DEVICE_REF_PREFIX, is_device_ref
 from .virtual import virtual_config, virtual_config_with_overrides
-from .base import BaseDevice, CameraDevice, SequencerDevice, TrapArrayDevice
+from .base import (
+    BaseDevice, CameraDevice, LaserDevice, RFSourceDevice, SequencerDevice, TrapArrayDevice)
 
 
 BUILTIN_DEVICE_CLASS_PATHS = {
@@ -25,6 +26,8 @@ BUILTIN_DEVICE_CLASS_PATHS = {
     "VirtualMotCamera": "Zou_lab_control.neutral_atom.devices.virtual.VirtualMotCamera",
     "VirtualSequencer": "Zou_lab_control.neutral_atom.devices.virtual.VirtualSequencer",
     "VirtualTrapArray": "Zou_lab_control.neutral_atom.devices.virtual.VirtualTrapArray",
+    "VirtualLaser": "Zou_lab_control.neutral_atom.devices.virtual.VirtualLaser",
+    "VirtualRF": "Zou_lab_control.neutral_atom.devices.virtual.VirtualRF",
 }
 DEVICE_CLASSES: dict[str, type | str] = dict(BUILTIN_DEVICE_CLASS_PATHS)
 
@@ -68,6 +71,8 @@ def device_domains() -> tuple["DeviceDomain", ...]:
 register_device_domain("camera", CameraDevice, "Camera")
 register_device_domain("sequencer", SequencerDevice, "Sequencer")
 register_device_domain("trap_array", TrapArrayDevice, "Trap array")
+register_device_domain("laser", LaserDevice, "Laser")
+register_device_domain("rf", RFSourceDevice, "RF source")
 
 
 def validate_device_contract(name: str, device: Any) -> None:

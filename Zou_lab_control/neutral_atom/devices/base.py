@@ -933,6 +933,78 @@ class TrapArrayDevice(BaseDevice):
         """Number of trap sites."""
 
 
+class LaserDevice(BaseDevice):
+    """Contract for a cooling / repump LASER set-point source -- the knobs a sub-Doppler (grey-molasses /
+    PGC) stage depends on: the single-photon DETUNING from the Rb87 D1 F=2->F'=2 line in linewidths Γ
+    (blue = positive; grey molasses wants ~+3..+10 Γ), whether the WAVELENGTH is on the D1 line at all
+    (794.98 nm -- off it there is NO cooling), and the beam SATURATION I/I_sat.  A real laser wraps a
+    wavemeter + AOM servo behind these; the virtual one is a pure set-point.  ``runtime_controls`` is the
+    ONE editable / observed surface -- the device viewer edits them and the virtual atom model reads them.
+    Every backend (virtual == real) inherits the same control set."""
+
+    OBSERVE_API = BaseDevice.OBSERVE_API | frozenset(
+        {"detuning_gamma", "saturation", "wavelength_nm", "on_d1"})
+
+    def runtime_controls(self) -> tuple["RuntimeControl", ...]:
+        from ..core.params import ParamDecl
+        return (
+            RuntimeControl(
+                ParamDecl(key="detuning_gamma", label="detuning (Γ)", kind="float", lo=-50.0, hi=50.0,
+                          tooltip="Single-photon detuning from the Rb87 D1 F=2->F'=2 line in linewidths Γ "
+                                  "(blue = positive; grey molasses cools best near +3..+10 Γ)."),
+                getter=lambda d: float(d.detuning_gamma),
+                setter=lambda d, v: setattr(d, "detuning_gamma", float(v))),
+            RuntimeControl(
+                ParamDecl(key="wavelength_nm", label="wavelength (nm)", kind="float", lo=700.0, hi=900.0,
+                          tooltip="Laser wavelength; the Rb87 D1 line is 794.98 nm.  Off the line the grey "
+                                  "molasses does not cool (atoms stay hot / are lost)."),
+                getter=lambda d: float(d.wavelength_nm),
+                setter=lambda d, v: setattr(d, "wavelength_nm", float(v))),
+            RuntimeControl(
+                ParamDecl(key="saturation", label="saturation I/Isat", kind="float", lo=0.0, hi=100.0,
+                          tooltip="Total beam saturation parameter I/I_sat (~1..10 for grey molasses)."),
+                getter=lambda d: float(d.saturation),
+                setter=lambda d, v: setattr(d, "saturation", float(v))),
+            RuntimeControl(
+                ParamDecl(key="on_d1", label="on D1 line", kind="text",
+                          tooltip="Whether the wavelength is close enough to the Rb87 D1 line to cool."),
+                getter=lambda d: "yes" if d.on_d1 else "no"),
+        )
+
+
+class RFSourceDevice(BaseDevice):
+    """Contract for an RF / microwave source that generates the grey-molasses REPUMPER sideband at the
+    Rb87 ground-state hyperfine splitting (6.834682 GHz).  Its FREQUENCY sets the two-photon (Raman)
+    detuning δ: δ = 0 (RF exactly on the splitting) is the coherent-dark-state resonance where cooling is
+    strongest; a wrong RF frequency (δ != 0) spoils the dark state and heats (a Fano feature).
+    ``two_photon_detuning_gamma`` reports δ in linewidths, derived from the frequency -- the ONE observed
+    quantity the atom model reads."""
+
+    OBSERVE_API = BaseDevice.OBSERVE_API | frozenset(
+        {"frequency_hz", "power_dbm", "two_photon_detuning_gamma"})
+
+    def runtime_controls(self) -> tuple["RuntimeControl", ...]:
+        from ..core.params import ParamDecl
+        return (
+            RuntimeControl(
+                ParamDecl(key="frequency_hz", label="frequency (Hz)", kind="float", lo=0.0, hi=2e10,
+                          tooltip="RF/EOM drive frequency generating the repump sideband; the Rb87 ground "
+                                  "hyperfine splitting is 6.834682 GHz (the two-photon resonance, δ = 0)."),
+                getter=lambda d: float(d.frequency_hz),
+                setter=lambda d, v: setattr(d, "frequency_hz", float(v))),
+            RuntimeControl(
+                ParamDecl(key="power_dbm", label="power (dBm)", kind="float", lo=-100.0, hi=40.0,
+                          tooltip="RF drive power."),
+                getter=lambda d: float(d.power_dbm),
+                setter=lambda d, v: setattr(d, "power_dbm", float(v))),
+            RuntimeControl(
+                ParamDecl(key="two_photon_detuning_gamma", label="two-photon δ (Γ)", kind="text",
+                          tooltip="The two-photon (Raman) detuning δ in linewidths, from the RF frequency; "
+                                  "δ = 0 is the dark-state resonance (best cooling)."),
+                getter=lambda d: f"{float(d.two_photon_detuning_gamma):+.3f}"),
+        )
+
+
 def snap_subarray(roi, *, step: int, max_w: int, max_h: int):
     """Snap a REQUESTED sub-array window to a camera's valid sub-array grid.
 
@@ -971,7 +1043,9 @@ __all__ = [
     "CameraDevice",
     "EXCLUSIVE",
     "FULL_FRAME",
+    "LaserDevice",
     "OBSERVE",
+    "RFSourceDevice",
     "ROI_CLEAR_SENTINELS",
     "ReadOnlyDevice",
     "RuntimeControl",

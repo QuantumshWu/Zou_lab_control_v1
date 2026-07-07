@@ -63,7 +63,7 @@ def test_load_config_swaps_devices_and_rederives_state(tmp_path):
         returned = exp.load_config(str(path))
         assert returned is exp                            # returns self
         assert id(exp.devices) != before                 # a NEW device set
-        assert _names(exp) == ["camera", "monitor_camera", "sequencer", "trap_array"]
+        assert _names(exp) == ["camera", "laser", "monitor_camera", "rf", "sequencer", "trap_array"]
         assert exp.sequence is not None                   # imaging sequence re-derived
         assert exp.calibration_data is None               # stale calibration dropped
     finally:

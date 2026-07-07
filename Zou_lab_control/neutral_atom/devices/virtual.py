@@ -22,8 +22,8 @@ from Zou_lab_control._clock import DEFAULT_CLOCK_HZ
 from Zou_lab_control._readout_math import normal_cdf
 from ..core.utils import site_index
 from .base import (
-    ROI_CLEAR_SENTINELS, SOFTWARE_TRIGGER, CameraDevice, SequencerDevice, TrapArrayDevice,
-    is_software_trigger, snap_subarray)
+    ROI_CLEAR_SENTINELS, SOFTWARE_TRIGGER, CameraDevice, LaserDevice, RFSourceDevice, SequencerDevice,
+    TrapArrayDevice, is_software_trigger, snap_subarray)
 from .camera_trigger import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
     base_cycle_camera_trigger_pulses,
@@ -90,6 +90,93 @@ DEFAULT_CHANNELS = (
 # suite fast-forwards this (conftest sets ``DEFAULT_SLEEP_SCALE = 0.0``) so the SAME data path
 # runs without the wall-clock waits; only the time pacing is skipped, never the physics/data.
 DEFAULT_SLEEP_SCALE = 1.0
+
+
+# --- Grey-molasses (Lambda-enhanced sub-Doppler) cooling of Rb87, on the D1 line -------------------
+# Physical anchors (Steck, Rb87 D line data; Rosi et al. Sci. Rep. 2018): the D1 line is 794.98 nm with
+# natural linewidth Gamma/2pi = 5.746 MHz; the ground-state hyperfine splitting is 6.834682 GHz (the RF
+# sideband that makes the repumper, i.e. the two-photon / Raman reference).  Grey molasses cools when the
+# light is BLUE-detuned ~+3..+10 Gamma on the D1 line AND the two-photon detuning delta = 0 (a coherent
+# dark state).  We model the RESULT as a multiplier on the cooling floor: 1.0 at that optimum, rising as
+# the tuning degrades -- so the calibrated ``cooled_temperature_K`` is preserved at the optimum and a
+# wrong RF frequency (delta != 0) or a wrong laser wavelength (off D1) makes the atoms warmer / lost.
+RB87_D1_WAVELENGTH_NM = 794.98
+RB87_D1_LINEWIDTH_HZ = 5.746e6
+RB87_HYPERFINE_HZ = 6.834682610e9
+GM_DETUNING_OPTIMUM_GAMMA = 6.0        # blue single-photon detuning where cooling is best
+GM_HOT_FACTOR = 6.0                    # floor multiplier for "no cooling" (off D1 / red / far mis-tuned)
+
+
+def grey_molasses_cooling_factor(detuning_gamma: float, two_photon_detuning_gamma: float,
+                                 saturation: float, on_d1: bool = True) -> float:
+    """The multiplier on the sub-Doppler cooling floor from the laser + RF tuning -- ``1.0`` at the
+    grey-molasses optimum (blue detuning ~+6 Gamma on the D1 line, two-photon delta = 0), growing as the
+    tuning degrades (warmer atoms), up to :data:`GM_HOT_FACTOR` (effectively no cooling -> atoms hot /
+    lost).  The single source the virtual atom array multiplies its ``cooled_temperature_K`` by.
+
+    Failure modes the user asked for: OFF the D1 line -> no cooling (large); RED / far-off single-photon
+    detuning -> no cooling; wrong RF (delta != 0) -> a Fano feature: a SHARP heating rise for delta > 0
+    and a GENTLE warming for delta < 0 (the coherent dark state is spoiled asymmetrically)."""
+    if not on_d1:
+        return GM_HOT_FACTOR
+    delta_sp = float(detuning_gamma)
+    if delta_sp <= 0.0:                                    # red / on-resonance: grey molasses does not cool
+        return GM_HOT_FACTOR
+    # Single-photon band: 1.0 at the +6 Gamma optimum, growing away from it (Gaussian in Delta).
+    band = float(np.exp(((delta_sp - GM_DETUNING_OPTIMUM_GAMMA) ** 2) / (2.0 * 3.0 ** 2)))
+    # Two-photon Fano about delta = 0: cold (1.0) on resonance, steep for delta > 0, gentle for delta < 0.
+    delta_2p = float(two_photon_detuning_gamma)
+    half_width = 0.05 + 0.02 * max(float(saturation), 0.0)  # power-broadened dark-state half-width (Gamma)
+    wing = 3.0 if delta_2p >= 0.0 else 0.3                  # heating (>0) vs weak-cooling (<0) asymmetry
+    fano = 1.0 + wing * (delta_2p / half_width) ** 2
+    return float(min(GM_HOT_FACTOR, max(1.0, band * fano)))
+
+
+class VirtualLaser(LaserDevice):
+    """A pure set-point cooling/repump laser for the virtual rig -- it just HOLDS its detuning /
+    wavelength / saturation (no hardware), which :class:`VirtualTrapArray` reads to compute the
+    grey-molasses cooling floor.  Defaults are the Rb87 D1 grey-molasses optimum (794.98 nm, +6 Gamma
+    blue, s ~ 3), so a fresh virtual rig cools well and the DEVIATIONS an operator dials in degrade it."""
+
+    D1_WINDOW_NM = 0.02        # within this of the D1 line -> "on the line" (cools); beyond -> no GM
+
+    def __init__(self, *, detuning_gamma: float = GM_DETUNING_OPTIMUM_GAMMA,
+                 wavelength_nm: float = RB87_D1_WAVELENGTH_NM, saturation: float = 3.0):
+        self.detuning_gamma = finite_float(detuning_gamma, "detuning_gamma")
+        self.wavelength_nm = positive_float(wavelength_nm, "wavelength_nm")
+        self.saturation = nonnegative_float(saturation, "saturation")
+
+    @property
+    def on_d1(self) -> bool:
+        return abs(self.wavelength_nm - RB87_D1_WAVELENGTH_NM) <= self.D1_WINDOW_NM
+
+    def snapshot(self) -> dict[str, object]:
+        out = super().snapshot()
+        out.update({"detuning_gamma": self.detuning_gamma, "wavelength_nm": self.wavelength_nm,
+                    "saturation": self.saturation, "on_d1": self.on_d1})
+        return out
+
+
+class VirtualRF(RFSourceDevice):
+    """A pure set-point RF/EOM source for the virtual rig -- it HOLDS its drive frequency (which sets the
+    two-photon Raman detuning delta for grey molasses) and power.  ``two_photon_detuning_gamma`` is delta
+    in linewidths, derived from the frequency relative to the Rb87 ground hyperfine splitting; the default
+    is exactly on the splitting (delta = 0, the dark-state resonance), so a fresh rig cools well and a
+    wrong frequency the operator dials in heats."""
+
+    def __init__(self, *, frequency_hz: float = RB87_HYPERFINE_HZ, power_dbm: float = 0.0):
+        self.frequency_hz = nonnegative_float(frequency_hz, "frequency_hz")
+        self.power_dbm = finite_float(power_dbm, "power_dbm")
+
+    @property
+    def two_photon_detuning_gamma(self) -> float:
+        return (self.frequency_hz - RB87_HYPERFINE_HZ) / RB87_D1_LINEWIDTH_HZ
+
+    def snapshot(self) -> dict[str, object]:
+        out = super().snapshot()
+        out.update({"frequency_hz": self.frequency_hz, "power_dbm": self.power_dbm,
+                    "two_photon_detuning_gamma": self.two_photon_detuning_gamma})
+        return out
 
 
 @dataclass
@@ -248,6 +335,13 @@ class VirtualTrapArray(TrapArrayDevice):
     # field default never re-types the physical constant AND devices->operations stays off the
     # import graph (that top-level dependency would cycle -- see the module-level import note).
     recapture_mass_kg: float | None = None
+    # Optional grey-molasses cooling devices (wired via ``$device:laser`` / ``$device:rf`` in the config).
+    # When BOTH are bound, the cooling floor becomes ``cooled_temperature_K`` scaled by the laser + RF
+    # tuning (``_cooling_floor_K``): at the D1 grey-molasses optimum the factor is 1 (floor unchanged), and
+    # a wrong RF two-photon detuning / a laser off the D1 line warms or loses the atoms.  ``None`` (no such
+    # devices) keeps the fixed floor, so a rig without a laser/RF behaves exactly as before.
+    laser: "LaserDevice | None" = None
+    rf: "RFSourceDevice | None" = None
     seed: int | None = 7
     occupancy: np.ndarray | None = None
     rng: np.random.Generator = field(init=False, repr=False)
@@ -361,13 +455,29 @@ class VirtualTrapArray(TrapArrayDevice):
         t = max(0.0, float(cooling_duration))
         return self.loading_probability * (1.0 - float(np.exp(-t / self.load_time_constant_s)))
 
+    def _cooling_floor_K(self) -> float:
+        """The sub-Doppler cooling floor the atoms relax toward: ``cooled_temperature_K`` at the optimum,
+        scaled by the grey-molasses tuning of the BOUND laser + RF (both must be present).  With no such
+        devices it is the fixed floor, so a rig without a laser/RF is unchanged.  A wrong RF two-photon
+        detuning (delta != 0) or a laser off the D1 line raises the floor -- warmer atoms, then lower
+        release-recapture survival -- via :func:`grey_molasses_cooling_factor` (the ONE physics source)."""
+        laser, rf = self.laser, self.rf
+        if laser is None or rf is None:
+            return self.cooled_temperature_K
+        factor = grey_molasses_cooling_factor(
+            getattr(laser, "detuning_gamma", GM_DETUNING_OPTIMUM_GAMMA),
+            getattr(rf, "two_photon_detuning_gamma", 0.0),
+            getattr(laser, "saturation", 3.0),
+            bool(getattr(laser, "on_d1", True)))
+        return float(self.cooled_temperature_K) * factor
+
     def reload(self, *, cooling_duration: float | None = None) -> np.ndarray:
         """Load a FRESH atom array -- the cooling/MOT light + PGC at the start of a
         shot.  Each tweezer independently captures a single atom with probability
         :meth:`loading_fraction` (which grows with ``cooling_duration``), and every
-        loaded atom starts PGC-cooled to ``cooled_temperature_K``."""
+        loaded atom starts cooled to the grey-molasses / PGC floor (:meth:`_cooling_floor_K`)."""
         self.occupancy = self.rng.random(self.n_sites) < self.loading_fraction(cooling_duration)
-        self.temperature_K = np.full(self.n_sites, self.cooled_temperature_K, dtype=float)
+        self.temperature_K = np.full(self.n_sites, self._cooling_floor_K(), dtype=float)
         self._pinned = False                   # a fresh stochastic loading clears any manual pin
         return self.occupancy.copy()
 
@@ -387,7 +497,7 @@ class VirtualTrapArray(TrapArrayDevice):
                 index = site_index(value, self.n_sites)
                 out[index] = True
             self.occupancy = out
-        self.temperature_K = np.full(self.n_sites, self.cooled_temperature_K, dtype=float)
+        self.temperature_K = np.full(self.n_sites, self._cooling_floor_K(), dtype=float)
         self._pinned = True                    # image THIS loading on the next shot, then resume
 
     def consume_pin(self) -> bool:
@@ -416,7 +526,7 @@ class VirtualTrapArray(TrapArrayDevice):
         dt = float(duration)
         if dt <= 0.0:
             return
-        floor = self.cooled_temperature_K
+        floor = self._cooling_floor_K()
         decay = float(np.exp(-dt / self.pgc_cool_tau_s))
         self.temperature_K = floor + (self.temperature_K - floor) * decay
 
@@ -1597,8 +1707,15 @@ def virtual_config() -> dict[str, object]:
     # Both cameras are WIRED to the streamer ("$device:sequencer" = the virtual trigger
     # cable): fired programs reach a camera only over that wire, exactly like the physical
     # trigger line on the real rig (see _TriggerWiredCamera).
+    # The grey-molasses cooling light (D1) and the F=1<->F=2 microwave source are WIRED
+    # into the trap array: its cooled (PGC) temperature floor is set by how well those two
+    # are tuned (laser detuning + two-photon RF resonance), exactly like the real bench where
+    # a mis-set detuning or off-resonant RF warms the cloud (see _cooling_floor_K).
     return {
-        "trap_array": {"type": "VirtualTrapArray"},
+        "laser": {"type": "VirtualLaser"},
+        "rf": {"type": "VirtualRF"},
+        "trap_array": {"type": "VirtualTrapArray",
+                       "params": {"laser": "$device:laser", "rf": "$device:rf"}},
         "camera": {"type": "VirtualCamera",
                    "params": {"trap_array": "$device:trap_array", "sequencer": "$device:sequencer"}},
         "monitor_camera": {"type": "VirtualMotCamera", "params": {"sequencer": "$device:sequencer"}},
@@ -1872,12 +1989,21 @@ __all__ = [
     "COOLING_CHANNELS",
     "DEFAULT_CHANNELS",
     "DEFAULT_TRAP_CHANNELS",
+    "GM_DETUNING_OPTIMUM_GAMMA",
+    "GM_HOT_FACTOR",
     "MOT_COIL_BUSES",
+    "RB87_D1_LINEWIDTH_HZ",
+    "RB87_D1_WAVELENGTH_NM",
+    "RB87_HYPERFINE_HZ",
     "VirtualCamera",
+    "VirtualLaser",
+    "VirtualMotCamera",
+    "VirtualRF",
     "VirtualSequencer",
     "VirtualTrapArray",
     "cooling_durations_per_frame",
     "exposures_per_frame",
+    "grey_molasses_cooling_factor",
     "trap_off_durations_per_frame",
     "virtual_config",
     "virtual_config_with_overrides",

@@ -1,6 +1,7 @@
 """Device contracts, virtual devices, and hardware adapters."""
 
-from .base import BaseDevice, CameraDevice, SequencerDevice, TrapArrayDevice
+from .base import (
+    BaseDevice, CameraDevice, LaserDevice, RFSourceDevice, SequencerDevice, TrapArrayDevice)
 from .qcmos import DEFAULT_DCAM_MODULE, QCMOSCamera, QCMOSConfig
 from .sequencer import (
     PulseController,
@@ -17,7 +18,9 @@ from .sequencer import (
     compile_runtime_program_for_payload,
     serve_runtime_sequencer,
 )
-from .virtual import DEFAULT_CHANNELS, VirtualCamera, VirtualSequencer, VirtualTrapArray, virtual_config, write_virtual_run
+from .virtual import (
+    DEFAULT_CHANNELS, VirtualCamera, VirtualLaser, VirtualRF, VirtualSequencer, VirtualTrapArray,
+    virtual_config, write_virtual_run)
 
 _DISCOVERY_EXPORTS = {
     "DiscoveredDevice",
@@ -26,14 +29,17 @@ _DISCOVERY_EXPORTS = {
 
 _REGISTRY_EXPORTS = {
     "DEVICE_CLASSES",
+    "DEVICE_DOMAINS",
     "DeviceSet",
     "apply_device_overrides",
     "available_device_configs",
     "device_class_registry",
     "device_config_dir",
+    "device_domains",
     "load_devices",
     "read_config",
     "register_device_class",
+    "register_device_domain",
     "resolve_class",
     "resolve_connect_config",
     "validate_device_contract",
@@ -90,13 +96,16 @@ __all__ = [
     "DEFAULT_DCAM_MODULE",
     "DEFAULT_FPGA_CHANNEL_COUNT",
     "DEVICE_CLASSES",
+    "DEVICE_DOMAINS",
     "DeviceSet",
     "DiscoveredDevice",
     "discover_devices",
+    "LaserDevice",
     "ManualSequencer",
     "PulseController",
     "QCMOSCamera",
     "QCMOSConfig",
+    "RFSourceDevice",
     "RemoteSequencer",
     "RuntimeSequenceProgram",
     "RuntimeSequencer",
@@ -105,6 +114,8 @@ __all__ = [
     "TrapArrayDevice",
     "VerilogSequencer",
     "VirtualCamera",
+    "VirtualLaser",
+    "VirtualRF",
     "VirtualSequencer",
     "VirtualTrapArray",
     "apply_device_overrides",
@@ -113,6 +124,8 @@ __all__ = [
     "build_sequencer_server_arg_parser",
     "device_class_registry",
     "device_config_dir",
+    "device_domains",
+    "register_device_domain",
     "hardware_channel_names",
     "infer_xdc_channel_count",
     "infer_xdc_channel_labels",

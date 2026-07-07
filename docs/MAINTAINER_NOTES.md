@@ -1853,3 +1853,35 @@ Behaviour-neutral throughout. The single sources added/relocated, by layer:
   `peak*1.5`, floored to `peak+5`, never below 10) shared by every band (`Live2DDis` / `LiveSiteMap` /
   `LiveLiveDis`, init and update alike), so the bar column never touches the right edge and the five
   call sites cannot drift into two headroom rules. Appearance-neutral.
+
+## 23. Grey-molasses cooling: virtual `laser` + `rf` devices drive the PGC floor (2026-07-07)
+
+The virtual config now has two more devices so an operator can *simulate grey molasses*: a
+`VirtualLaser` (the D1 cooling light) and a `VirtualRF` (the F=1↔F=2 microwave that closes the
+Raman/dark-state condition). They are ordinary registry devices (domains `laser` / `rf`, contracts
+`LaserDevice` / `RFSourceDevice` in `devices/base.py`), wired into the trap array by
+`virtual_config()`: `"trap_array": {"params": {"laser": "$device:laser", "rf": "$device:rf"}}`. Both
+expose **writable** `runtime_controls`, so the device viewer edits them like an API (detuning, wavelength,
+saturation; RF frequency, power).
+
+**One physics source** — `grey_molasses_cooling_factor(detuning_gamma, two_photon_detuning_gamma,
+saturation, on_d1)` returns a *multiplier on the cooling floor* (`VirtualTrapArray._cooling_floor_K()`
+multiplies `cooled_temperature_K` by it; `reload`/`set_occupancy`/`cool` all seed temperature from that
+one method). Design choices and why:
+- **Relative, not absolute.** The factor is exactly `1.0` at the grey-molasses optimum, so the
+  *default* rig (laser +6 Γ blue on D1, RF exactly on the 6.834 GHz hyperfine line) preserves the
+  calibrated 50 µK floor — `test_virtual_atom_physics` / `test_calibration_report_and_noise` do **not**
+  move. Mis-tuning only ever makes atoms warmer (lower release-recapture survival), never magically
+  colder. A rig with no laser/RF bound keeps its plain floor (`_cooling_floor_K` early-returns).
+- **The failure modes the user asked for.** Off the D1 line (`on_d1` false, wavelength >0.02 nm off) →
+  no cooling (`GM_HOT_FACTOR`, ×6). Red / on-resonance single-photon detuning → no cooling. Blue
+  detuning away from +6 Γ → Gaussian penalty (σ=3 Γ). Two-photon RF detuning δ≠0 → a **Fano** feature:
+  steep heating for δ>0, gentle for δ<0, with a power-broadened half-width `0.05 + 0.02·s` Γ, so a
+  *fine* RF-frequency scan resolves the narrow dark-resonance dip (a user can optimize it).
+- Rb87 anchors are single-source constants in `virtual.py`: `RB87_D1_WAVELENGTH_NM = 794.98`,
+  `RB87_D1_LINEWIDTH_HZ = 5.746e6`, `RB87_HYPERFINE_HZ = 6.834682610e9`. `VirtualRF`'s derived
+  `two_photon_detuning_gamma = (frequency_hz − HFS)/Γ` is a **read-only** control (a derived read-back).
+
+Guarded by `tests/test_grey_molasses_cooling.py` (factor optimum=1.0 / red-detuned / off-D1 / RF-detuned
+/ trap-floor-follows-laser+RF / connect-wires-them). Adding two devices bumps the virtual roster, so
+`test_device_config_io.py`'s expected name list now includes `laser` / `rf`.
