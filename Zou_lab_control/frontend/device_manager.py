@@ -64,6 +64,7 @@ from .qt_fluent import (
     _popup_gap,
     ensure_qt_app,
     launch_fluent_window,
+    MUTED_LABEL_STYLE,
     muted_note_label,
     scaled_px,
     set_fluent_scale,
@@ -176,7 +177,7 @@ class _DeviceEntryCard(FluentFrame):
         if cls is None:
             self.values = dict(entry.get("params") or {})   # raw params kept verbatim
             note = FluentLabel(f"class not importable: {err}" if err else "unknown device class")
-            note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            note.setStyleSheet(MUTED_LABEL_STYLE)
             body.addWidget(note)
             return
         self.values = dict(cls.config_to_form(dict(entry.get("params") or {})))
@@ -1138,7 +1139,7 @@ class DeviceViewerPanel(QtWidgets.QWidget):
         # validates in the device; the message surfaces here) -- omitted when read-only.
         self._status = FluentLabel("") if self._editable else None
         if self._status is not None:
-            self._status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            self._status.setStyleSheet(MUTED_LABEL_STYLE)
             outer.addWidget(self._status)
         self._build_tabs()
 
@@ -1162,7 +1163,7 @@ class DeviceViewerPanel(QtWidgets.QWidget):
             lay = QtWidgets.QVBoxLayout(placeholder)
             lay.setContentsMargins(*(window_pad(1),) * 4)
             note = FluentLabel("no device loaded")
-            note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            note.setStyleSheet(MUTED_LABEL_STYLE)
             lay.addWidget(note)
             lay.addStretch(1)
             self._tabs.add_permanent_tab(placeholder, "Devices")

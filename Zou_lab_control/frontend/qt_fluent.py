@@ -58,6 +58,10 @@ API_VIOLET = "#9B86C9"
 API_VIOLET_DARK = "#5A4A8A"
 YELLOW = "#E5C85B"
 GREY = "#A2A2A2"
+#: The muted-note stylesheet fragment (grey text, no fill, no border) shared by every greyed status /
+#: note label -- the ONE spelling so the muted look can never drift.  ``muted_note_label`` extends it
+#: with the body font; a font-less status line applies it bare.
+MUTED_LABEL_STYLE = f"color: {GREY}; background: transparent; border: none;"
 RADIUS = 4
 # A "card" = FluentGroupBox: it reserves a CARD_TITLE_PX-tall strip at the top for the grey
 # QGroupBox::title chip, and insets its content by CARD_PAD on the L / R / bottom edges.  These
@@ -582,8 +586,7 @@ def muted_note_label(text: str) -> "QtWidgets.QLabel":
     style is spelled once instead of re-typed per caller.  Art-bearing, so it stays internal (never
     re-exported from ``frontend/__init__``)."""
     lbl = FluentLabel(text)
-    lbl.setStyleSheet(f"color: {GREY}; background: transparent; border: none; "
-                      f'font: {fluent_font_size()}pt "{FONT}";')
+    lbl.setStyleSheet(f'{MUTED_LABEL_STYLE} font: {fluent_font_size()}pt "{FONT}";')
     return lbl
 
 
@@ -1350,7 +1353,7 @@ class FluentSettingRow(QtWidgets.QWidget):
         lbl = QtWidgets.QLabel(label)
         lbl.setFixedWidth(int(label_width) if label_width is not None else scaled_px(60, minimum=48))
         lbl.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        lbl.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+        lbl.setStyleSheet(MUTED_LABEL_STYLE)
         self._label = lbl                       # introspected by the layout-uniformity contract test
         h.addWidget(lbl)
         # A control that FILLS the cell (a combo / line-edit / spin / switch -- Expanding/Preferred
