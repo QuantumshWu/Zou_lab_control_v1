@@ -8001,14 +8001,24 @@ class TaskConsole(QtWidgets.QWidget):
             node = faulted[0]
             who = (getattr(node, "prefix", "") or self._node_label(node) or "node").rstrip("_:")
             n = int(getattr(node, "consecutive_errors", 1))
-            self.summary.setStyleSheet(_SUMMARY_STYLE_DANGER)
-            self.summary.setText(f"⚠ NODE ERROR ({who}, ×{n}): {node.last_error}"[:200])
+            style = _SUMMARY_STYLE_DANGER
+            text = f"⚠ NODE ERROR ({who}, ×{n}): {node.last_error}"[:200]
         else:
-            self.summary.setStyleSheet(_SUMMARY_STYLE)
+            style = _SUMMARY_STYLE
             # No single global refresh rate any more -- each panel sets its OWN update interval
             # (see UPDATE_INTERVALS), so the header no longer claims one "every N ms".
-            self.summary.setText(
-                f"{len(self.cards)} panels | {n_signals} signals | shot {self.hub.shot}")
+            text = f"{len(self.cards)} panels | {n_signals} signals | shot {self.hub.shot}"
+        # This runs EVERY tick.  The stylesheet is a constant that only flips on the normal<->danger
+        # transition, so re-applying it every tick is a semantically-identical no-op that still walks
+        # Qt's style-repolish path; gate it on an actual change (same fingerprint guard as
+        # ``_refresh_signal_info``'s ``_signal_info_sig``).  The text genuinely changes each shot, so
+        # it is likewise only re-set when its content moves.
+        if style != getattr(self, "_summary_style", None):
+            self._summary_style = style
+            self.summary.setStyleSheet(style)
+        if text != getattr(self, "_summary_text", None):
+            self._summary_text = text
+            self.summary.setText(text)
 
     # ------------------------------------------------------------------ files
     def save_to_file(self) -> None:
