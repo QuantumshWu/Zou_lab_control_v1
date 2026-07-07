@@ -36,7 +36,7 @@ from pathlib import Path
 from PyQt5 import QtCore, QtWidgets
 
 from ..neutral_atom.core.params import DEVICE_REF_PREFIX
-from .param_widgets import PARAM_WIDGETS, ParamWidgetContext, RateLimitedApply
+from .param_widgets import PARAM_WIDGETS, ParamWidgetContext, RateLimitedApply, format_reading
 from .qt_fluent import (
     ACCENT,
     GREEN,
@@ -196,12 +196,7 @@ class _DeviceEntryCard(FluentFrame):
 
     @staticmethod
     def _row_label(decl) -> str:
-        text = decl.label or decl.key
-        if decl.unit:
-            text += f" ({decl.unit})"
-        if decl.required:
-            text += " *"
-        return text
+        return decl.row_label()          # single source: label + (unit) + required * (ParamDecl.row_label)
 
     def _on_toggle(self) -> None:
         expanded = not self._body.isVisible()
@@ -298,10 +293,7 @@ class _DeviceControlPage(QtWidgets.QWidget):
     def _control_card(self, control) -> FluentGroupBox:
         decl = control.decl
         writable = control.writable and not self._read_only
-        title = decl.label or decl.key
-        if decl.unit:
-            title += f" ({decl.unit})"
-        card = FluentGroupBox(title)
+        card = FluentGroupBox(decl.row_label())      # single source: label + (unit) [+ *]
         v = QtWidgets.QVBoxLayout(card)
         v.setContentsMargins(*(scaled_px(10),) * 2, scaled_px(10), scaled_px(10))
         v.setSpacing(scaled_px(6, minimum=3))
@@ -412,10 +404,11 @@ class _DeviceControlPage(QtWidgets.QWidget):
     def _refresh_readbacks(self) -> None:
         for control, current in self._getters:
             try:
-                value = control.getter(self.device)
+                # confocal-style read-out: a numeric value is engineering-scaled with its unit
+                # SI-prefixed (6.83e9 Hz -> "6.83 GHz"), via the ONE ``format_reading`` formatter.
+                current.setText(format_reading(control.decl, control.getter(self.device)))
             except Exception as exc:             # a read-back that raises shows the reason, never crashes the poll
-                value = f"(error: {str(exc).splitlines()[0]})"
-            current.setText(str(value))
+                current.setText(f"(error: {str(exc).splitlines()[0]})")
 
     def hideEvent(self, event):  # noqa: N802 - Qt naming
         # Pause polling while the page is not shown (its tab closed / a sibling tab active) --

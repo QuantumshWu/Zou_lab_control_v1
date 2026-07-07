@@ -116,6 +116,47 @@ def test_camera_and_sequencer_declare_their_standard_controls(devices):
     assert seq_ctrls["sleep_scale"].writable and seq_ctrls["sleep_scale"].decl.kind == "float"
 
 
+# -------------------------------------------------- numeric control = scrollable spin box (base rule)
+
+
+def test_every_numeric_device_control_renders_a_scrollable_spinbox(devices):
+    """A DEVICE runtime control that is a NUMBER always renders as a scrollable spin box, never the
+    blank "leave empty = default" line edit -- enforced AT THE BASE (``RuntimeControl`` pins its decl
+    ``optional=False``), so a device author can never declare a numeric knob that degrades to a line
+    edit and misses the mouse-wheel adjust (the confocal "every numeric is a spin box" rule).  A unit
+    rides the spin box's read-back, not the label, so this is also where "µ/m/k/M/G" substitution lands."""
+    from Zou_lab_control.frontend.param_widgets import PARAM_WIDGETS, ParamWidgetContext
+    from Zou_lab_control.frontend.qt_fluent import FluentDoubleSpinBox
+
+    ctx = ParamWidgetContext()
+    checked = 0
+    for name, device in devices.devices.items():
+        for control in device.runtime_controls():
+            if control.decl.kind not in ("float", "int"):
+                continue
+            assert control.decl.blank_allowed is False, (
+                f"{name}.{control.decl.key}: a numeric device control must be non-blank (a spin box), "
+                "not the optional line edit")
+            widget = PARAM_WIDGETS[control.decl.kind].build(control.decl, control.getter(device), ctx)
+            assert isinstance(widget, FluentDoubleSpinBox), (
+                f"{name}.{control.decl.key}: a numeric control built a {type(widget).__name__}, not a spin box")
+            checked += 1
+    assert checked, "expected at least one numeric device control to verify"
+
+
+def test_numeric_device_read_back_engineering_scales_its_unit(devices):
+    """The device viewer's live read-back is engineering-scaled with its unit SI-prefixed (the ONE
+    ``format_reading`` formatter): an RF drive of 6.8e9 Hz reads "6.8... GHz", not a raw "6800000000",
+    so the "common unit substitution" is done at the base, not per read-back."""
+    from Zou_lab_control.frontend.param_widgets import format_reading
+
+    rf = devices["rf"]
+    freq_ctrl = next(c for c in rf.runtime_controls() if c.decl.key == "frequency_hz")
+    rf.frequency_hz = 6.834682e9
+    text = format_reading(freq_ctrl.decl, freq_ctrl.getter(rf))
+    assert text.endswith("GHz") and "6.83" in text and "6800000000" not in text, text
+
+
 # --------------------------------------------------------------------- #2 write-through
 
 

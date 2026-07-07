@@ -56,9 +56,28 @@ from .qt_fluent import (
     FluentSwitch,
     FluentTreeComboBox,
     FluentTriStateToggle,
+    eng_mantissa_prefix,
     scaled_px,
     signals_blocked as _signals_blocked,
 )
+
+
+def format_reading(decl, value) -> str:
+    """The ONE way a live read-back value is rendered for display (a device viewer's "Current" line,
+    a latest-value meter), so every read-out reads the same and the unit substitution is never
+    re-implemented per call site.
+
+    A numeric quantity is engineering-scaled with its unit SI-prefixed -- ``6.83e9`` Hz -> ``"6.83 GHz"``,
+    ``5e-3`` s -> ``"5 ms"`` (confocal ``float2str_eng``, the prefix riding the unit); anything else is
+    ``str``'d.  The declared ``unit`` (if any) is appended.  The editable spin box stays plain decimal
+    (confocal does not SI-scale its editor) -- this is the read-out side only."""
+    if getattr(decl, "is_numeric", False) and isinstance(value, (int, float)) and not isinstance(value, bool):
+        mantissa, prefix = eng_mantissa_prefix(float(value))
+        unit = getattr(decl, "unit", "") or ""
+        return f"{mantissa} {prefix}{unit}".rstrip() if unit else f"{mantissa}{prefix}"
+    text = str(value)
+    unit = getattr(decl, "unit", "") or ""
+    return f"{text} {unit}" if unit else text
 
 
 def _noop() -> None:
@@ -266,17 +285,15 @@ def _make_spin(decl, *, integer: bool, value=None) -> FluentDoubleSpinBox:
 
 
 class FloatHandler(_StaticMixin, ParamWidgetHandler):
-    """A bounded float.  An OPTIONAL float (``default is None and not required``) renders as a
-    line edit so "leave blank = use the library / device default" stays expressible (mirrors
-    :class:`IntHandler`); a defaulted / required float uses a spin box.  ``read`` / ``write`` /
-    ``is_empty`` branch on which one was built (the line edit can be blank -> ``None``)."""
-
-    @staticmethod
-    def _is_optional(decl) -> bool:
-        return decl.default is None and not decl.required
+    """A bounded float.  A BLANK-ABLE float (``decl.blank_allowed``) renders as a line edit so
+    "leave blank = use the library / device default" stays expressible (mirrors :class:`IntHandler`);
+    otherwise -- a defaulted / required param, and EVERY device runtime control (pinned
+    ``optional=False``) -- it uses a scrollable spin box.  ``read`` / ``write`` / ``is_empty`` branch
+    on which one was built (the line edit can be blank -> ``None``).  The blank-vs-spin decision is the
+    declaration's (``ParamDecl.blank_allowed``), never hard-coded here."""
 
     def build(self, decl, value, ctx):
-        if self._is_optional(decl):
+        if decl.blank_allowed:
             edit = FluentLineEdit("" if value is None else f"{float(value):g}")
             edit.setMinimumWidth(scaled_px(96, minimum=80))
             edit.setPlaceholderText("(default)")
@@ -310,17 +327,14 @@ class FloatHandler(_StaticMixin, ParamWidgetHandler):
 
 
 class IntHandler(_StaticMixin, ParamWidgetHandler):
-    """A bounded int.  An OPTIONAL int (``default is None and not required``) renders as
-    a line edit so "leave blank = all" stays expressible; a defaulted / required int
-    uses a spin box.  ``read`` / ``write`` / ``is_empty`` branch on which one was built
-    (the line edit can be blank; the spin box always holds a number)."""
-
-    @staticmethod
-    def _is_optional(decl) -> bool:
-        return decl.default is None and not decl.required
+    """A bounded int.  A BLANK-ABLE int (``decl.blank_allowed``) renders as a line edit so "leave
+    blank = all" stays expressible; otherwise -- a defaulted / required param, and every device
+    runtime control -- it uses a scrollable spin box.  ``read`` / ``write`` / ``is_empty`` branch on
+    which one was built (the line edit can be blank; the spin box always holds a number).  The
+    blank-vs-spin decision is the declaration's (``ParamDecl.blank_allowed``), never hard-coded here."""
 
     def build(self, decl, value, ctx):
-        if self._is_optional(decl):
+        if decl.blank_allowed:
             edit = FluentLineEdit("" if value is None else str(int(value)))
             edit.setMinimumWidth(scaled_px(96, minimum=80))
             edit.setPlaceholderText("(all)")
@@ -812,12 +826,13 @@ class SignalExprHandler(ParamWidgetHandler):
     def build(self, decl, value, ctx):
         if ctx.signal_expr_factory is None:
             raise RuntimeError("signal_expr kind needs ctx.signal_expr_factory")
-        title = (decl.label or decl.key) + (f" ({decl.unit})" if decl.unit else "")
-        widget = ctx.signal_expr_factory(title)
+        widget = ctx.signal_expr_factory(decl.row_label())      # single source: label + (unit) [+ *]
         seed = value if value is not None else (decl.default if decl.default is not None else {})
         widget.set_value(seed)
         widget.setToolTip(decl.tooltip)
-        widget.changed.connect(ctx.on_change)
+        # route through the ONE wiring rule (re-validate AND, where a form enables it, instant-apply),
+        # so a composite widget never silently misses the apply-on-edit path a scalar has
+        _wire(widget.changed, ctx, decl, lambda: self.read(widget))
         return widget
 
     def read(self, widget):
@@ -847,7 +862,8 @@ class PulseSlotsHandler(ParamWidgetHandler):
             raise RuntimeError("pulse_slots kind needs ctx.pulse_slots_factory")
         widget = ctx.pulse_slots_factory()
         widget.setToolTip(decl.tooltip)
-        widget.changed.connect(ctx.on_change)
+        # the ONE wiring rule (re-validate + optional instant-apply), like every scalar handler
+        _wire(widget.changed, ctx, decl, lambda: self.read(widget))
         return widget
 
     def read(self, widget):

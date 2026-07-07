@@ -107,6 +107,67 @@ def test_handler_is_abstract_over_all_five_ops():
             f"{set(type(handler).__abstractmethods__)}.")
 
 
+@pytest.fixture(scope="module")
+def _app():
+    pytest.importorskip("PyQt5")
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+
+    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+def test_editable_handlers_route_edits_through_instant_apply(_app):
+    """The ONE wiring rule (``_wire``): every editable handler forwards an on-edit value to the form's
+    ``instant_apply`` (the apply-on-edit path the Setting popup / device viewer live-write use), so a
+    new handler can never silently skip it -- the drift that once left the composite widgets
+    unconnected.  Checked for a representative scalar of each widget shape that emits on a programmatic
+    edit (a combo's ``activated`` is user-only, so it is excluded here)."""
+    from Zou_lab_control.frontend.param_widgets import PARAM_WIDGETS, ParamWidgetContext
+    from Zou_lab_control.neutral_atom.core.params import ParamDecl
+
+    cases = [
+        (ParamDecl(key="f", label="F", kind="float", default=1.0, lo=0.0, hi=10.0), lambda w: w.setValue(3.0)),
+        (ParamDecl(key="i", label="I", kind="int", default=1, lo=0, hi=10), lambda w: w.setValue(4)),
+        (ParamDecl(key="t", label="T", kind="text"), lambda w: w.setText("hi")),
+        (ParamDecl(key="b", label="B", kind="bool"), lambda w: w.setChecked(True)),
+        (ParamDecl(key="j", label="J", kind="json"), lambda w: w.setText("[1, 2]")),
+    ]
+    for decl, edit in cases:
+        applied: list = []
+        ctx = ParamWidgetContext(instant_apply=lambda k, v: applied.append((k, v)))
+        widget = PARAM_WIDGETS[decl.kind].build(decl, None, ctx)
+        edit(widget)
+        assert applied and applied[-1][0] == decl.key, (
+            f"{decl.kind}: an edit did not reach instant_apply -- the handler bypassed the _wire rule")
+
+
+def test_row_label_is_the_single_form_label_source():
+    """``ParamDecl.row_label`` composes the ONE ``"<label> (<unit>) *"`` a form row shows, so every
+    surface (config editor, device viewer, measurement Edit, signal-expr title) reads it instead of
+    re-typing the idiom (the copies that let the unit / required marker drift)."""
+    from Zou_lab_control.neutral_atom.core.params import ParamDecl
+
+    assert ParamDecl(key="e", label="exposure", kind="float", unit="s", required=True).row_label() == "exposure (s) *"
+    assert ParamDecl(key="x", label="", kind="text").row_label() == "x"            # falls back to the key
+    assert ParamDecl(key="n", label="name", kind="text").row_label() == "name"     # no unit, not required
+
+
+def test_blank_allowed_is_the_single_spin_vs_lineedit_decision():
+    """``ParamDecl.blank_allowed`` is the ONE predicate deciding a numeric control's widget: an optional
+    API arg (no default, not required) is a blank-able line edit; everything else -- a default, a
+    required field, or an explicit ``optional=False`` (what a device runtime control pins) -- is a spin
+    box.  So the blank-vs-spin rule lives on the declaration, never hard-coded in a widget handler."""
+    from Zou_lab_control.neutral_atom.core.params import ParamDecl
+
+    assert ParamDecl(key="a", label="A", kind="float").blank_allowed is True            # optional arg
+    assert ParamDecl(key="b", label="B", kind="float", default=1.0).blank_allowed is False
+    assert ParamDecl(key="c", label="C", kind="float", required=True).blank_allowed is False
+    assert ParamDecl(key="d", label="D", kind="float", optional=False).blank_allowed is False  # device knob
+    assert ParamDecl(key="e", label="E", kind="float", optional=True).blank_allowed is True
+
+
 def test_every_panel_param_kind_is_registry_handled():
     pytest.importorskip("PyQt5")
     from Zou_lab_control.frontend.param_widgets import PARAM_WIDGETS

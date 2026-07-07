@@ -109,6 +109,12 @@ class ParamDecl:
     segmented: bool = False          # kind="choice" RENDER hint (DATA, not art): True = a capsule
                                      # tri/multi-state toggle (confocal TriStateToggleSwitch) instead of
                                      # a combo box; same value semantics (one of ``choices``).
+    optional: Any = None             # kind="float"/"int" render intent (tri-state): True = a blank-able
+                                     # line edit ("leave blank = use the library / device default");
+                                     # False = ALWAYS a scrollable spin box (never blank); None = infer
+                                     # (blank-able exactly when there is no default and it isn't required
+                                     # -- an optional API arg).  A device runtime control pins False so a
+                                     # live knob is a spin box by construction (see ``blank_allowed``).
 
     def __post_init__(self) -> None:
         kind = str(self.kind).lower()
@@ -122,6 +128,40 @@ class ParamDecl:
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "key", str(self.key))
         object.__setattr__(self, "choices", tuple(self.choices))
+
+    @property
+    def is_numeric(self) -> bool:
+        """A scalar/range the GUI renders as a spin box (float / int / axis_range) -- so a read-back
+        display knows to engineering-scale its value (``float2str_eng``), unlike a text/choice/bool."""
+        return self.kind in ("float", "int", "axis_range")
+
+    @property
+    def blank_allowed(self) -> bool:
+        """kind ``float`` / ``int``: does this control offer a BLANK "use the default" state (a line
+        edit) instead of a spin box?  The ONE predicate ``FloatHandler`` / ``IntHandler`` read, so the
+        blank-vs-spin decision lives on the declaration (not hard-coded in a widget handler).
+
+        Explicit ``optional`` wins (a device runtime control pins it ``False`` -> always a spin box);
+        otherwise infer: an optional API arg (no default, not required) is blank-able, everything else
+        is a spin box."""
+        if self.optional is not None:
+            return bool(self.optional)
+        return self.default is None and not self.required
+
+    def row_label(self) -> str:
+        """The ONE label a form row / control title shows -- the single source EVERY form reads
+        (the config editor, the device viewer, the measurement Edit, the Setting popup, the
+        signal-expr title) instead of re-typing the ``"<label> (<unit>) *"`` idiom, so a new form
+        can never drift or forget a piece.
+
+        ``label`` (or ``key``) + ``(unit)`` when a unit is declared + a trailing ``*`` when
+        ``required`` (the marker a form highlights when the field is missing)."""
+        text = self.label or self.key
+        if self.unit:
+            text += f" ({self.unit})"
+        if self.required:
+            text += " *"
+        return text
 
 
 __all__ = ["DEVICE_REF_PREFIX", "ParamDecl", "is_device_ref"]

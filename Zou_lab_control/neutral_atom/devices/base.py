@@ -8,7 +8,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -32,6 +32,23 @@ class RuntimeControl:
     decl: Any                                        # a core.params.ParamDecl
     getter: Callable[[Any], Any]
     setter: Optional[Callable[[Any, Any], None]] = None
+
+    def __post_init__(self) -> None:
+        # A live device knob ALWAYS has a value (the getter seeds it) -- it is never the blank
+        # "leave empty = use the default" state a measurement's optional arg offers, nor is it ever
+        # the "missing required" a form marks with ``*``.  So normalise the decl HERE, at the base,
+        # so a device author can never forget it and need not re-state it on each ParamDecl:
+        #   * a numeric control renders as a scrollable spin box (``optional=False``, never a line edit);
+        #   * ``required`` is cleared (no ``*`` on a control that is always populated).
+        # An explicit ``optional`` on the decl is honoured (only the ``None`` = infer case is pinned).
+        decl = self.decl
+        patch = {}
+        if getattr(decl, "kind", None) in ("float", "int") and getattr(decl, "optional", None) is None:
+            patch["optional"] = False
+        if getattr(decl, "required", False):
+            patch["required"] = False
+        if patch:
+            object.__setattr__(self, "decl", replace(decl, **patch))
 
     @property
     def writable(self) -> bool:
@@ -950,7 +967,7 @@ class LaserDevice(BaseDevice):
         from ..core.params import ParamDecl
         return (
             RuntimeControl(
-                ParamDecl(key="wavelength_nm", label="wavelength (nm)", kind="float", lo=700.0, hi=900.0,
+                ParamDecl(key="wavelength_nm", label="wavelength", kind="float", unit="nm", lo=700.0, hi=900.0,
                           tooltip="Laser wavelength; the Rb87 D1 line is 794.98 nm.  Off the line the grey "
                                   "molasses does not cool (atoms stay hot / are lost)."),
                 getter=lambda d: float(d.wavelength_nm),
@@ -987,7 +1004,7 @@ class RFSourceDevice(BaseDevice):
         from ..core.params import ParamDecl
         return (
             RuntimeControl(
-                ParamDecl(key="two_photon_detuning_gamma", label="two-photon δ (Γ)", kind="float",
+                ParamDecl(key="two_photon_detuning_gamma", label="two-photon δ", kind="float", unit="Γ",
                           lo=-50.0, hi=50.0,
                           tooltip="Two-photon (Raman) detuning δ in linewidths Γ -- the grey-molasses knob; "
                                   "δ = 0 (RF on the 6.834682 GHz hyperfine line) is the dark-state resonance "
@@ -995,13 +1012,13 @@ class RFSourceDevice(BaseDevice):
                 getter=lambda d: float(d.two_photon_detuning_gamma),
                 setter=lambda d, v: setattr(d, "two_photon_detuning_gamma", float(v))),
             RuntimeControl(
-                ParamDecl(key="frequency_hz", label="frequency (Hz)", kind="float", lo=0.0, hi=2e10,
+                ParamDecl(key="frequency_hz", label="frequency", kind="float", unit="Hz", lo=0.0, hi=2e10,
                           tooltip="RF/EOM drive frequency generating the repump sideband; the Rb87 ground "
                                   "hyperfine splitting is 6.834682 GHz (δ = 0).  The raw set-point behind δ."),
                 getter=lambda d: float(d.frequency_hz),
                 setter=lambda d, v: setattr(d, "frequency_hz", float(v))),
             RuntimeControl(
-                ParamDecl(key="power_dbm", label="power (dBm)", kind="float", lo=-100.0, hi=40.0,
+                ParamDecl(key="power_dbm", label="power", kind="float", unit="dBm", lo=-100.0, hi=40.0,
                           tooltip="RF drive power."),
                 getter=lambda d: float(d.power_dbm),
                 setter=lambda d, v: setattr(d, "power_dbm", float(v))),

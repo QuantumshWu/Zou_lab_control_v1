@@ -489,6 +489,51 @@ def _confocal_float2str(value: float, *, length: int | None = None) -> str:
     return str(value)
 
 
+#: SI engineering prefixes, matching Confocal_GUIv2.helper.float2str_eng's ``si_map`` (one source of
+#: the n/µ/m/k/M/G/T substitution).  Read-only value DISPLAYS (a device read-back, a range label)
+#: engineering-scale through :func:`eng_mantissa_prefix`; the editable spin box stays plain decimal
+#: (confocal does NOT SI-scale its editor -- so does ``FluentDoubleSpinBox``).
+_SI_PREFIX = {-9: "n", -6: "µ", -3: "m", 0: "", 3: "k", 6: "M", 9: "G", 12: "T"}
+
+
+def eng_mantissa_prefix(value: float, *, length: int = 6) -> tuple[str, str]:
+    """Split ``value`` into ``(mantissa_string, si_prefix)`` for a READ-ONLY engineering display,
+    matching Confocal_GUIv2's ``float2str_eng``: a plain decimal when ``0.001 < |x| < 1000`` (prefix
+    ``""``), otherwise the mantissa in ``[1, 1000)`` times an SI prefix (``6.83e9 -> ("6.83", "G")``,
+    ``5e-3 -> ("5", "m")``).  Returned split (not glued) so a caller can attach the prefix to the UNIT
+    -- ``f"{mant} {prefix}{unit}"`` reads ``"6.83 GHz"``.  ``length`` caps the mantissa width."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value), ""
+    if not math.isfinite(v):
+        return ("nan" if math.isnan(v) else ("inf" if v > 0 else "-inf")), ""
+    if v == 0.0:
+        return "0", ""
+    length = max(int(length), 5)
+    sign = "-" if v < 0 else ""
+    a = abs(v)
+    if 0.001 < a < 1000.0:                       # the human-comfortable band: plain decimal, no prefix
+        mant, exp = a, 0
+    else:
+        exp = int(math.floor(math.log10(a) / 3.0) * 3)
+        exp = max(-9, min(12, exp))              # clamp to the prefixes we actually have
+        mant = a / (10.0 ** exp)
+    dec = max(0, length - len(sign) - len(str(int(mant))) - 1)   # room for sign + int part + '.'
+    text = f"{mant:.{dec}f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return f"{sign}{text}", _SI_PREFIX[exp]
+
+
+def float2str_eng(value: float, *, length: int = 6) -> str:
+    """Engineering-scaled string (mantissa glued to its SI prefix): ``6.83e9 -> "6.83G"`` -- the
+    prefix-attached-to-number form for a range label; :func:`eng_mantissa_prefix` keeps them split
+    when the prefix must ride the unit instead."""
+    mant, prefix = eng_mantissa_prefix(value, length=length)
+    return f"{mant}{prefix}"
+
+
 def align_to_resolution(value: str | float, resolution: float, *, allow_any: bool = True) -> str:
     """Snap the numeric part of a simple value/x expression to ``resolution``."""
 
