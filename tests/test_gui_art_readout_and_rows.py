@@ -67,6 +67,55 @@ def test_figure_viewer_2d_reproduction_renders_the_colorbar_z_label(qt, tmp_path
     assert "Counts" in zlabels, zlabels
 
 
+def test_saved_figure_axis_labels_are_kind_aware(qt, tmp_path):
+    """``SavedFigure.axis_labels()`` is the ONE source the info tab + the reproduction read: a
+    DISTRIBUTION (hist) draws only x and y -- its stored 3rd label ("Population") is the dormant
+    ``labels[-1]`` and must NOT surface as a phantom "z"/"colour bar"; a 2D image / site map DOES draw a
+    colour bar (labels[2]); a grid carries its axes in the recipe, not the top-level labels."""
+    from Zou_lab_control.frontend.data_figure import load_figure
+
+    def craft(name, info, data_x, data_y):
+        p = tmp_path / name
+        np.savez(p, data_x=np.asarray(data_x, float), data_y=np.asarray(data_y, float),
+                 info=np.array(info, dtype=object))
+        return load_figure(str(p))
+
+    hist = craft("h.npz", {"kind": "hist", "labels": ["ROI counts", "Shots", "Population"], "name": "h"},
+                 np.arange(50.0), np.random.default_rng(0).normal(300, 30, 50))
+    assert [n for n, _ in hist.axis_labels()] == ["x label", "y label"]   # NO colour bar; 3rd label dropped
+    assert all(lab != "Population" for _, lab in hist.axis_labels())
+
+    sites = craft("s.npz", {"kind": "sites", "labels": ["Camera x (px)", "Camera y (px)", "Counts"], "name": "s"},
+                  np.zeros((9, 2)), np.zeros(9))
+    assert sites.axis_labels() == [("x label", "Camera x (px)"), ("y label", "Camera y (px)"),
+                                   ("colour bar", "Counts")]
+
+    grid = craft("g.npz", {"kind": "grid", "name": "g",
+                           "figure_recipe": {"kind": "grid", "labels": ["Trap-off (s)", "Survival"],
+                                             "per_cell": [{}]}},
+                 np.zeros(1), np.zeros(1))
+    assert grid.axis_labels() == [("x label", "Trap-off (s)"), ("y label", "Survival")]
+
+
+def test_reproduced_figure_renders_the_saved_x_y_labels(qt, tmp_path):
+    """A reopened figure draws the axis labels stored in its DATA -- not a kind's live default (a 2D
+    panel's ROI-derived "X (px)", a hist's hard-coded "Value").  The saved labels are seeded into the
+    panel params (``_seed_state``) and PanelCard._panel_labels renders them, so the rendered x / y /
+    colour bar MATCH ``saved.labels``.  A rendered label != the saved one is the regression."""
+    from Zou_lab_control.neutral_atom.views.plots import plot_image
+    from Zou_lab_control.frontend.figure_viewer import FigureViewer
+    fig = plot_image(np.random.default_rng(3).poisson(300, size=(20, 20)).astype(float),
+                     display=False, labels=("Camera x (px)", "Camera y (px)", "Counts"))
+    out = fig.save(str(tmp_path / "shot2d"))
+    viewer = FigureViewer()
+    viewer.open_path(str(out["data"]))
+    card = viewer.console.cards[0]
+    plotter = getattr(card, "plotter", None) or getattr(card, "_plotter", None)
+    assert plotter.ax.get_xlabel() == "Camera x (px)", plotter.ax.get_xlabel()   # NOT "X (px)"
+    assert plotter.ax.get_ylabel() == "Camera y (px)", plotter.ax.get_ylabel()
+    assert plotter.cax.get_ylabel() == "Counts", plotter.cax.get_ylabel()
+
+
 def test_device_manager_loaded_row_is_compact_and_cannot_overflow(qt):
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.frontend.device_manager import DeviceManagerPanel

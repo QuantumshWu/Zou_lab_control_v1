@@ -1002,6 +1002,27 @@ class SavedFigure:
             kinds = [saved] + kinds
         return kinds
 
+    def axis_labels(self) -> list[tuple[str, str]]:
+        """The per-axis labels THIS figure actually DRAWS, kind-aware -- ``[(axis_name, label), ...]``.
+
+        A 2D image / site map draws x, y AND a colour bar (its z quantity = ``labels[2]``); every
+        1D-family kind (line / rolling trace / DISTRIBUTION) draws only x and y -- a stored 3rd label is
+        the dormant ``BaseLivePlot`` ``("X","Y","Z")`` default (or a distribution's redundant "Population"),
+        never rendered, so it is dropped.  A grid carries its axis labels in the replay recipe
+        (``build_grid_figure`` reads them), NOT the top-level ``labels``.  The colour-bar test reads the
+        ONE ``PLOT_KINDS`` ``render_family`` source (``"2D"`` / ``"auto"``), never a hard-coded kind list --
+        so a hist never shows a phantom "z" and a grid shows its recipe's axes instead of nothing."""
+        from .live import PLOT_KIND_BY_KEY
+
+        recipe = self.figure_recipe
+        source = (recipe.get("labels") if recipe is not None else self.labels) or ()
+        labels = [str(x) for x in source]
+        names = ["x label", "y label"]
+        pk = PLOT_KIND_BY_KEY.get(str(self.kind or ""))
+        if pk is not None and pk.render_family in ("2D", "auto"):
+            names.append("colour bar")
+        return [(n, labels[i]) for i, n in enumerate(names) if i < len(labels) and labels[i].strip()]
+
     def info_summary(self) -> str:
         """A human-readable multi-line answer to "what is in this file": name, source, kind, labels,
         unit, array shapes, points/repeat progress, the saved view state and any applied fit."""

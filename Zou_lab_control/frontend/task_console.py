@@ -3589,6 +3589,17 @@ class PanelCard(FluentGroupBox):
         entry = axes.get(str(name))
         return entry[0] if entry else None
 
+    def _panel_labels(self, xlabel: str, ylabel: str, zlabel: str = "") -> tuple[str, str, str]:
+        """The (x, y, z) axis labels this panel draws.  A REPRODUCED figure seeds the SAVED labels as
+        ``xlabel`` / ``ylabel`` / ``zlabel`` panel params (figure_viewer._seed_state, from the ONE
+        ``SavedFigure.axis_labels`` source) so a reopened panel draws the SAME axes it was saved with --
+        the params are then the single source; a LIVE panel carries no such params and keeps the kind's
+        reconstructed defaults passed in here.  A NON-EMPTY override wins (``axis_labels`` only ever seeds
+        non-empty labels); an absent OR empty param falls back to the default, so this never blanks a live
+        axis (matching the xy-curve branch's own ``params.get('ylabel', '') or label``)."""
+        p = self.config.params
+        return (str(p.get("xlabel") or xlabel), str(p.get("ylabel") or ylabel), str(p.get("zlabel") or zlabel))
+
     # ------------------------------------------------------------- plot lifecycle
     def _fixed_lim_kwargs(self) -> dict:
         """``fixed_lo``/``fixed_hi`` kwargs for the plotter, ONLY when the lim mode is
@@ -3684,7 +3695,7 @@ class PanelCard(FluentGroupBox):
                 image=image, roi_radius=site_ring_radius(centers),
                 cmap=_resolved_cmap("sites", self.config.params),   # operator pick, else the kind default (ONE resolver)
                 **self._view_kwargs("sites"),
-                labels=("Camera x (px)", "Camera y (px)", label),
+                labels=self._panel_labels("Camera x (px)", "Camera y (px)", label),
                 title=self.config.title or None)
         elif kind == "2d":
             arr = np.asarray(value, dtype=float)
@@ -3708,11 +3719,11 @@ class PanelCard(FluentGroupBox):
                 data_x, arr.ravel(), kind="2d", size=size, interactions=True,
                 cmap=_resolved_cmap("2d", self.config.params),   # operator pick, else the kind default (ONE resolver)
                 **self._view_kwargs("2d"),
-                # The colour-bar (z) label is the VALUE's meaning -- read from the bound signal's own axis
-                # label (the producing node's SignalSpec, the SAME single source the 1D y-axis / monitor
-                # use), so a camera frame's "Counts" (or a loaded 2D figure's saved z label) shows on the
-                # bar instead of a blank strip.  Absent -> "" (no label), the old behaviour.
-                labels=(xlabel, ylabel, self._source_axis_label() or ""),
+                # x / y / colour-bar all via the ONE _panel_labels source: a LIVE 2D panel labels its
+                # colour bar with the bound signal's own axis label (a camera frame's "Counts"); a
+                # REPRODUCED 2D figure overrides x / y / colour bar with the SAVED labels seeded into the
+                # panel params (_seed_state), so the reopened image draws the axes it was saved with.
+                labels=self._panel_labels(xlabel, ylabel, self._source_axis_label() or ""),
                 title=self.config.title or None)
         elif kind == "monitor":
             # Declared PANEL_PARAMS defaults via the ONE _resolved_param resolver (never a
@@ -3722,7 +3733,7 @@ class PanelCard(FluentGroupBox):
             plotter = panel_plot(
                 np.arange(length, dtype=float), history, kind="monitor", size=size, interactions=True,
                 show_dist=bool(_resolved_param(kind, self.config.params, "show_dist")),
-                labels=("Shots ago", self._source_axis_label() or label, "Z"),
+                labels=self._panel_labels("Shots ago", self._source_axis_label() or label),
                 **self._view_kwargs("monitor"),
                 title=self.config.title or None)
             plotter.roll(float(value), draw=False)
@@ -3733,7 +3744,7 @@ class PanelCard(FluentGroupBox):
                 ylog=bool(_resolved_param(kind, self.config.params, "ylog")),
                 fit=str(_resolved_param(kind, self.config.params, "fit")),
                 **self._view_kwargs("hist"),                # relim/fixed pins the VALUE (x) axis (#3)
-                labels=("Value", "Shots", "Population"), title=self.config.title or None)
+                labels=self._panel_labels("Value", "Shots"), title=self.config.title or None)
         else:  # 1d
             arr = np.asarray(value, dtype=float)
             if self.config.params.get("xy") and arr.ndim == 2 and arr.shape[1] == 2:
@@ -3768,7 +3779,7 @@ class PanelCard(FluentGroupBox):
                     data_x, xlabel = np.arange(npts, dtype=float), "Site"
             plotter = panel_plot(
                 data_x, vec, kind="1d", size=size, interactions=True,
-                labels=(xlabel, ylabel, "Z"),
+                labels=self._panel_labels(xlabel, ylabel),
                 **self._view_kwargs("1d"),
                 title=self.config.title or None)
             # Colours cycle by column index inside Live1D (confocal-exact: grey, skyblue, ...; a lone

@@ -186,14 +186,13 @@ class LoadedFigureNode(LogicNode):
         # The saved ``labels`` are the FULL matplotlib axis labels (the unit is baked in-line, e.g.
         # "Detuning (GHz)"), so the SignalSpec keeps unit="" -- appending saved.unit again would double
         # the "(unit)" suffix.  The display unit is carried on the panel's view / DataFigure separately.
+        # ``_xlabel`` / ``_ylabel`` are the x / value signal specs' declared axis labels (legend / picker
+        # text, and the 1-D panel's fallback axes).  The panel's RENDERED axes -- x, y and a 2-D colour
+        # bar -- come from the saved labels seeded into the panel params (``_seed_state`` reads the ONE
+        # ``saved.axis_labels()`` source), so there is no separate z field to carry here.
         labels = saved.labels or ["X", "Y", "Z"]
         self._xlabel = str(labels[0]) if len(labels) > 0 else "X"
         self._ylabel = str(labels[1]) if len(labels) > 1 else "Y"
-        # The THIRD label is the 2D colour-bar (z) label -- the meaning of the IMAGE VALUE (e.g.
-        # "Counts").  A 2D figure's ``value`` signal carries THIS as its axis label (not ``_ylabel``,
-        # which is the pixel y-axis), so a reproduced 2D panel's colour bar shows the saved z label
-        # instead of a blank bar.  Absent (a 1-D save) -> "".
-        self._zlabel = str(labels[2]) if len(labels) > 2 else ""
 
         # bare key -> (block, SignalSpec) for every signal this node publishes, in publish order.  The
         # faithful path fills it from the stored ``info['signals']``; the fallback synthesises value/x/
@@ -245,10 +244,11 @@ class LoadedFigureNode(LogicNode):
             if bare is None or bare in self._blocks:
                 continue
             block = np.asarray(entry.get("block"))
-            # A 2D figure's value = the colour-bar (z) quantity, so its fallback axis label is ``_zlabel``,
-            # NOT the pixel y-axis (matches the array-path branch above); every other kind's value axis IS y.
-            value_axis = self._zlabel if self.kind == "2d" else self._ylabel
-            label = str(entry.get("label") or (value_axis if role == "value" else name))
+            # The value block's declared axis label (legend / picker) falls back to ``_ylabel``; the panel's
+            # RENDERED axes -- incl. a 2D colour bar -- come from the saved labels seeded into the panel
+            # params (see _seed_state -> PanelCard._panel_labels), so this per-signal label is never the
+            # colour-bar source and needs no 2D special case.
+            label = str(entry.get("label") or (self._ylabel if role == "value" else name))
             unit = str(entry.get("unit") or "")
             ps = _as_tuple_or_none(entry.get("points_shape"))
             ds = _as_tuple_or_none(entry.get("data_shape"))
@@ -274,10 +274,7 @@ class LoadedFigureNode(LogicNode):
             self._role_key[role] = bare
 
         if kind in ("2d",):
-            # A 2D image's VALUE is the colour-bar (z) quantity, so its axis label is ``_zlabel``
-            # ("Counts"), NOT the pixel y-axis ``_ylabel`` -- the reproduced panel reads it back via
-            # ``_source_axis_label`` and labels the colour bar with it (a blank z bar was the bug).
-            add(FIG_VALUE_KEY, self._as_image(data_x, data_y), self._zlabel, "",
+            add(FIG_VALUE_KEY, self._as_image(data_x, data_y), self._ylabel, "",
                 "the saved figure's primary data (data_y)", "value")
         elif kind in ("sites",):
             add(FIG_VALUE_KEY, self._first_column(data_y), self._ylabel, "",
@@ -454,6 +451,15 @@ def _seed_state(saved: SavedFigure, node: LoadedFigureNode) -> TaskConsoleState:
         for decl in PANEL_PARAMS.get(str(recipe.get("sub_plot_kind") or ""), ()):
             if decl.key in recipe:
                 view.setdefault(str(decl.key), recipe[decl.key])
+    # A reproduced panel draws the SAVED axes: seed the stored labels as the panel's xlabel / ylabel
+    # (and, for a colour-bar kind, zlabel) so PanelCard._panel_labels renders them instead of the kind's
+    # LIVE defaults (a hist's hard-coded "Value"/"Shots", a 2D panel's ROI-derived "X (px)") -- the
+    # reopened figure's axes then MATCH the data it was saved from.  ``saved.axis_labels()`` is the ONE
+    # kind-aware source (drops a hist's phantom z, reads a grid's recipe axes), and its ("x label",
+    # "y label", "colour bar") names map to the panel param keys.  ``setdefault`` so a saved ``view`` that
+    # already pinned a label wins.
+    for axis_name, label in saved.axis_labels():
+        view.setdefault({"x label": "xlabel", "y label": "ylabel", "colour bar": "zlabel"}[axis_name], label)
     # An identity source expression (a bare signal name) -- signal_expr.is_identity_source keeps the
     # block's structure through the panel's short-circuit, exactly as the fig_value literal did.
     panel = PanelConfig(
@@ -739,12 +745,12 @@ class FigureViewer(QtWidgets.QWidget):
             ("name", saved.name),
             ("kind", _kind_label(saved.kind) or saved.kind),
         ]
-        # ``saved.labels`` is the ``(xlabel, ylabel[, zlabel])`` axis TUPLE -- show each axis on its OWN
-        # row (the real per-axis label the figure draws), NEVER the whole tuple's list repr
-        # (``['Camera x (px)', ...]``), which is not a label anything renders.  Skip empty/absent axes.
-        for axis_key, label in zip(("x label", "y label", "z label"), saved.labels or ()):
-            if str(label).strip():
-                plot_rows.append((axis_key, label))
+        # Show each axis the figure ACTUALLY draws on its own row (never the whole tuple's list repr,
+        # which is not a label anything renders).  ``saved.axis_labels()`` is the ONE kind-aware source:
+        # a 2D image / site map yields x, y AND a colour bar; a 1D-family kind (incl. the DISTRIBUTION)
+        # yields only x, y (no phantom z); a grid yields its recipe's axes -- so the info tab matches the
+        # rendered figure for every kind.
+        plot_rows.extend(saved.axis_labels())
         plot_rows += [
             ("unit", saved.unit),
             ("saved", saved.saved_at),
