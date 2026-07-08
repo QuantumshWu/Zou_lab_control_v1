@@ -150,6 +150,14 @@ class SignalHub:
         with self._lock:
             return self._shot
 
+    @property
+    def history_len(self) -> int:
+        """Ring depth per signal: a consumer that reads less often than the producer publishes loses any
+        shot older than this (the bounded deque silently drops it).  A display can compare its own
+        last-read :attr:`shot` against the current one and, if they differ by more than this, know that
+        acquisition outran it by more than the ring can hold -- i.e. some shots were dropped for display."""
+        return self._history_len
+
     def names(self) -> list[str]:
         with self._lock:
             return sorted(self._signals)

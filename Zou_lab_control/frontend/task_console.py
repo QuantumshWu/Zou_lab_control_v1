@@ -1100,6 +1100,10 @@ GAP = GRID_UNIT
 # which as a line-edit drew a grey line across the header bottom above the tabs).
 _SUMMARY_STYLE = f"color: {GREY}; background: transparent; border: none;"
 _SUMMARY_STYLE_DANGER = f"color: {RED}; background: transparent; border: none;"
+# Amber: an ADVISORY heads-up that does NOT affect the run (acquisition is unthrottled and always shown
+# latest) -- e.g. the display fell behind a fast producer and the hub's bounded ring dropped shots it
+# never rendered.  Less severe than the red node-error banner; same borderless label, colour = the cue.
+_SUMMARY_STYLE_WARNING = f"color: {ORANGE}; background: transparent; border: none;"
 
 
 def _cell_size() -> tuple[int, int]:
@@ -8064,11 +8068,30 @@ class TaskConsole(QtWidgets.QWidget):
             editor.refresh_limit_hints()  # #3a: tick updates only the grey placeholder hint, never the text
         self._update_summary()
 
+    def _note_display_drops(self) -> int:
+        """Shots the hub's bounded ring dropped since the last banner refresh because acquisition -- which
+        is deliberately never rate-capped -- outran the display.  Returns the count dropped THIS refresh
+        (0 = the display is keeping up).  Acquisition is never throttled or affected; this only reports lost
+        DISPLAY frames, for the amber heads-up.
+
+        Measured CONSUMER-side, which is the only sound place: the hub silently rotates its ring on every
+        long run, so a hub-side drop counter would fire constantly and mean nothing.  What matters is how
+        many shots were published SINCE THIS display last read, versus the ring depth -- if that exceeds the
+        ring, the oldest of them rolled off before any rolling-history panel could read them."""
+        shot = self.hub.shot
+        last = getattr(self, "_last_seen_shot", None)
+        self._last_seen_shot = shot
+        if last is None:                       # first call: establish the baseline, report nothing
+            return 0
+        overrun = (shot - last) - self.hub.history_len
+        return overrun if overrun > 0 else 0
+
     def _update_summary(self) -> None:
         try:
             n_signals = len(self.hub.names())
         except Exception:
             n_signals = 0
+        dropped = self._note_display_drops()
         # A wedged node must not fail silently: if any running node recorded an error,
         # raise a red banner naming it instead of just showing frozen data.
         faulted = [n for n in self.running_nodes if getattr(n, "last_error", None)]
@@ -8078,6 +8101,15 @@ class TaskConsole(QtWidgets.QWidget):
             n = int(getattr(node, "consecutive_errors", 1))
             style = _SUMMARY_STYLE_DANGER
             text = f"⚠ NODE ERROR ({who}, ×{n}): {node.last_error}"[:200]
+        elif dropped:
+            # Acquisition is unthrottled (data-paced), so a fast producer can publish more shots between two
+            # GUI refreshes than the hub's bounded ring holds -- those roll off before a rolling panel reads
+            # them.  The RUN is unaffected (data still acquired, latest always shown); this only flags that
+            # the DISPLAY could not keep up.  Amber, on this same banner (never a modal) -- reuse the one
+            # non-intrusive channel node errors already use, a severity below the red node error.
+            style = _SUMMARY_STYLE_WARNING
+            text = (f"⚠ display behind: dropped {dropped} shot(s) faster than the "
+                    f"{self.hub.history_len}-deep buffer -- acquisition unaffected")[:200]
         else:
             style = _SUMMARY_STYLE
             # No single global refresh rate any more -- each panel sets its OWN update interval
