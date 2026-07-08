@@ -683,10 +683,11 @@ def compile_pulse_table_scan_runtime_program(
             ns[slot_var(slot_index)], clock_step_ns, f"scan point {point_index} slot {slot_index}", allow_negative=True
         )
 
-    # Validate the slot bindings + the full scan TABLE once (slot-independent), then each
-    # scan point only re-checks its RESOLVED state (durations/DAC/delays at that point) with
-    # validate_scan_slots=False.  Validating the whole table per point was O(N^2) and made
-    # on_pulse very slow for thousands of points.
+    # Validate the whole table's STRUCTURE once (slot-independent: channels/buses/api slots/period
+    # widths), then each scan point re-resolves ONLY its slot-DEPENDENT timing (period durations +
+    # channel delays at that point) via _validate_slot_timing.  Re-running the full structural
+    # validate per point was the compile hot spot -- ~2000 redundant channel/bus/api passes over a
+    # 2000-point scan; the structure cannot change between points, so it is proven exactly once.
     state.validate(slots=state.reference_slots(), time_step_ns=clock_step_ns)
     points_ticks: list[list[int]] = []
     for point_index, row in enumerate(table):
@@ -694,7 +695,7 @@ def compile_pulse_table_scan_runtime_program(
         points_ticks.append([
             point_slot_value(point_index, index, ns) for index in range(len(state.scan_slots))
         ])
-        state.validate(slots=ns, time_step_ns=clock_step_ns, validate_scan_slots=False)
+        state._validate_slot_timing(ns, clock_step_ns)
 
     # Analog buses are driven by the hardware bus engine, not the TTL edge table.
     # A scanned DAC value becomes a bus segment whose value_select reads the slot

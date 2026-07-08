@@ -923,7 +923,6 @@ class PulseTableState:
             for value in period.states:
                 if int(value) not in (0, 1):
                     raise ValueError("period states must be 0 or 1.")
-            period.duration_steps(slots=slots, time_step_ns=step_ns)
         for bus_name, entries in self.analog_bus_modes.items():
             members = known_buses[bus_name]
             if len(entries) != len(self.periods):
@@ -954,14 +953,32 @@ class PulseTableState:
         if self.repeat_start is not None and self.repeat_end is not None:
             if self.repeat_start < 0 or self.repeat_end < self.repeat_start or self.repeat_end >= len(self.periods):
                 raise ValueError("repeat bracket must select an existing period range.")
-        for channel, delay in self.delays.items():
+        for channel in self.delays:
             if channel not in self.channels:
                 raise ValueError(f"delay channel {channel!r} is not in channels.")
-            self.delay_steps(channel, slots=slots, time_step_ns=step_ns)
+        # Slot-DEPENDENT resolution (period durations + channel delays) is the ONLY part of
+        # validate that varies per scan point; everything above is slot-invariant structure.  A
+        # per-scan-point revalidation calls _validate_slot_timing directly (see
+        # compile_pulse_table_scan_runtime_program) instead of re-running this whole method.
+        self._validate_slot_timing(slots, step_ns)
         if validate_scan_slots:
             self._validate_scan_slots()
         self._validate_api_slots()
         return self
+
+    def _validate_slot_timing(self, slots: Mapping[str, float], time_step_ns: float) -> None:
+        """Resolve every slot-DEPENDENT timing -- each period duration and each channel delay --
+        for ONE slot assignment, raising on any illegal resolved value (a duration/delay that goes
+        negative or quantizes below one tick).  This is the ONLY part of validate() that changes
+        with the slot values; the structural checks (channels/buses/api slots/period widths) are
+        slot-INVARIANT and proven ONCE by a full validate().  A scan compile validates the
+        reference slots in full, then runs JUST this per scan point -- turning the old per-point
+        structural re-check (which dominated compile at thousands of points) into a pure timing
+        resolution.  Membership of every delay channel is proven by the caller's full validate."""
+        for period in self.periods:
+            period.duration_steps(slots=slots, time_step_ns=time_step_ns)
+        for channel in self.delays:
+            self.delay_steps(channel, slots=slots, time_step_ns=time_step_ns)
 
     def is_delay_target(self, target: str) -> bool:
         """True if ``target`` names a valid DELAY field: a single channel OR a DAC bus (a bus owns
@@ -2700,6 +2717,16 @@ def affine_coeffs(
     return base_ticks, coeffs
 
 
+@functools.lru_cache(maxsize=1024)
+def _parse_time_expr_ast(text: str):
+    """Cached AST of a time expression (``ast.parse`` + the implicit-mul rewrite).  The expression TEXT
+    is INVARIANT across a scan's per-point evaluations -- only the slot VALUES change -- so parsing it
+    once per distinct text (instead of once per scan point) removes tens of thousands of ``compile()``
+    calls from a 2000-point scan compile.  The returned AST is only ever READ (``_visit`` /
+    ``_affine_visit`` never mutate nodes), so sharing the cached tree across calls is safe."""
+    return ast.parse(_insert_implicit_mul(text), mode="eval").body
+
+
 class _SafeEval:
     _binops = {
         ast.Add: lambda a, b: a + b,
@@ -2720,7 +2747,7 @@ class _SafeEval:
         self._has_context = bool(self.values)
 
     def eval(self, text: str) -> float:
-        return float(self._visit(ast.parse(_insert_implicit_mul(text), mode="eval").body))
+        return float(self._visit(_parse_time_expr_ast(text)))
 
     def _visit(self, node):
         if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
@@ -2744,7 +2771,7 @@ class _SafeEval:
         text = str(value).strip()
         if not text:
             raise ValueError("time expression must not be empty.")
-        return self._affine_visit(ast.parse(_insert_implicit_mul(text), mode="eval").body)
+        return self._affine_visit(_parse_time_expr_ast(text))
 
     def _affine_visit(self, node) -> tuple[float, dict[str, float]]:
         if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
