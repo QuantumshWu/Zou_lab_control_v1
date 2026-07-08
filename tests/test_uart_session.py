@@ -113,3 +113,41 @@ def test_writes_are_word_addressed_not_byte():
     sess._queue_word(scan_base, 0x1234)
     sess._flush()
     assert fake.writes.get(scan_base) == 0x1234 and fake.writes.get(scan_base * 4) is None
+
+
+def test_pyserial_exchange_reads_incrementally_never_a_fixed_oversized_read():
+    """PERF REGRESSION: PySerialTransport.exchange must read only what is AVAILABLE (in_waiting),
+    NEVER a fixed large count.  pyserial's read(n) on a total-timeout port blocks the WHOLE timeout
+    whenever fewer than n bytes arrive, and a reply is only 9-13 bytes -- so the old `read(64)` stalled
+    the full ~50 ms on EVERY transaction (~30 round-trips per pulse apply => ~1.5 s, SLOWER than JTAG).
+    A FakeSerial mimicking that timeout semantics proves the fix incurs ZERO such stall."""
+    from Zou_lab_control.neutral_atom.devices.uart_session import PySerialTransport
+    from fpga.pulse_streamer.host.uart_bridge_model import UartBridgeModel
+    from fpga.pulse_streamer.host import uart_frame as uf
+
+    req = bytes(uf.encode_read(im.CtrlWords.LAYOUT_ID, 1, seq=1))
+    reply = [e.reply for e in UartBridgeModel().feed(req) if e.op == "read"][-1]
+
+    class FakeSerial:
+        def __init__(self, reply):
+            self.timeout = 0.05; self._buf = b""; self._reply = bytes(reply)
+            self.stalled = 0.0; self.max_read = 0
+        def reset_input_buffer(self): pass
+        def write(self, data): self._buf = self._reply     # the bridge's reply is now buffered to read
+        def flush(self): pass
+        @property
+        def in_waiting(self): return len(self._buf)
+        def read(self, size):
+            self.max_read = max(self.max_read, int(size))
+            n = min(int(size), len(self._buf))
+            if n < int(size):                              # pyserial: waits the FULL timeout for the rest
+                self.stalled += self.timeout
+            out, self._buf = self._buf[:n], self._buf[n:]
+            return out
+
+    link = PySerialTransport("COM_TEST")
+    link._ser = FakeSerial(reply)
+    got = link.exchange(req, timeout=1.0)
+    assert got == bytes(reply)
+    assert link._ser.stalled == 0.0, "exchange stalled on a fixed oversized read (the read(64) 50 ms bug)"
+    assert link._ser.max_read <= len(reply), "exchange must not request more bytes than a reply can hold"

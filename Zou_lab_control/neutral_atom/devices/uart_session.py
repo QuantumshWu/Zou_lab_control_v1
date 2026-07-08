@@ -49,19 +49,20 @@ class PySerialTransport:
     """Real serial link to the bridge.  8N1 at ``baud``; a request gets exactly one reply frame
     (WRITE ack or READ data).  Resynchronises on the SYNC pair and honours ``stop`` in short slices."""
 
-    def __init__(self, port: str | None, baud: int = 3_000_000, *, latency_ms: int = 1):
+    def __init__(self, port: str | None, baud: int = 3_000_000):
         self.name = str(port or "")
         self.baud = int(baud)
-        self._latency_ms = int(latency_ms)
         self._ser = None
 
     def open(self) -> None:
         import serial   # pyserial; only needed on the real control computer
+        # ``timeout`` is only the OUTER read cap; exchange() reads in_waiting-sized slices so it never
+        # blocks the whole timeout (that fixed-count read was the ~50 ms/transaction stall).  A USB
+        # latency-timer knob is FTDI-only and out-of-band (Device Manager > Port Settings > Advanced,
+        # or the FTDIBUS LatencyTimer registry value) -- there is no pyserial call for it (the old
+        # self._ser.set_latency_timer() did not exist on pyserial and silently raised every time), and
+        # a CH340 has no equivalent register, so we do not attempt it here.
         self._ser = serial.Serial(self.name, self.baud, timeout=0.05, write_timeout=1.0)
-        try:                      # best-effort: 1 ms FT2232 latency timer (else every poll caps at 16 ms)
-            self._ser.set_latency_timer(self._latency_ms)
-        except Exception:
-            pass
 
     def close(self) -> None:
         if self._ser is not None:
@@ -79,10 +80,21 @@ class PySerialTransport:
         while time.monotonic() < deadline:
             if stop is not None and stop.is_set():
                 raise UartError("uart exchange aborted (stop requested).")
-            buf += self._ser.read(64)
-            frame = _extract_reply(buf)
-            if frame is not None:
-                return frame
+            # Read only the bytes ALREADY buffered (in_waiting), NEVER a fixed count.  pyserial's
+            # read(n) on a total-timeout port blocks the WHOLE timeout whenever fewer than n bytes
+            # arrive, and a reply is only 9-13 bytes, so the old `read(64)` stalled the full ~50 ms on
+            # EVERY transaction -> ~30 round-trips per pulse apply x 50 ms ~= 1.5 s, SLOWER than JTAG.
+            # read(in_waiting) is satisfied instantly, so each exchange costs ~one reply transit
+            # (sub-ms at 3 Mbaud + USB latency) and a whole apply drops to ~80 ms.  The 0.5 ms poll
+            # slice keeps `stop` responsive (a blocking read would ignore it for up to the timeout).
+            n = self._ser.in_waiting
+            if n:
+                buf += self._ser.read(n)
+                frame = _extract_reply(buf)
+                if frame is not None:
+                    return frame
+            else:
+                time.sleep(0.0005)
         raise TimeoutError("uart reply timed out.")
 
 

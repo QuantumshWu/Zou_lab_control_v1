@@ -49,8 +49,9 @@ MASK32 = 0xFFFFFFFF
 
 # Max data words in ONE WRITE frame.  == the RTL bridge's frame buffer depth: the bridge buffers a
 # whole frame, verifies CRC, and ONLY THEN commits (so a corrupt frame commits NOTHING -- RTL matches
-# the Python model exactly).  The host splits a program upload into runs of <= this; at 3 Mbaud a
-# 256-word frame is ~1 KB ~0.34 ms, so a 24 KB program is ~24 frames ~82 ms (framing overhead tiny).
+# the Python model exactly).  The host splits a program upload into runs of <= this; at 3 Mbaud 8N1
+# (10 bits/byte = 300 KB/s) a 256-word frame is ~1 KB ~3.4 ms, so a 24 KB program is ~24 frames ~82 ms
+# (framing overhead tiny).
 MAX_FRAME_WORDS = 256
 
 
