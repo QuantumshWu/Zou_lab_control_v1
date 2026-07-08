@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
@@ -685,19 +686,29 @@ def compile_pulse_table_scan_runtime_program(
             ns[slot_var(slot_index)], clock_step_ns, f"scan point {point_index} slot {slot_index}", allow_negative=True
         )
 
-    # Validate the whole table's STRUCTURE once (slot-independent: channels/buses/api slots/period
-    # widths), then each scan point re-resolves ONLY its slot-DEPENDENT timing (period durations +
-    # channel delays at that point) via _validate_slot_timing.  Re-running the full structural
-    # validate per point was the compile hot spot -- ~2000 redundant channel/bus/api passes over a
-    # 2000-point scan; the structure cannot change between points, so it is proven exactly once.
+    # Validate the whole state ONCE at the reference slots (structure + every period duration and
+    # channel delay).  Per scan point, re-validate ONLY the timing that can actually VARY point to
+    # point: a period whose duration EXPRESSION references a scan slot (``sN``).  A constant-duration
+    # period is slot-invariant, and a channel delay can NEVER reference a scan slot (delays are fixed
+    # -- a slot-referencing delay is rejected up front), so both are already proven by the reference
+    # validate; re-resolving all periods + delays at every point (the old per-point
+    # _validate_slot_timing) was pure O(N) waste.  ``_validate_slot_timing`` remains the single
+    # source the reference validate uses.  (Empty ``scan_dep_*`` -> the per-point body is a no-op,
+    # exactly matching a scan whose only slots are DAC values.)
     state.validate(slots=state.reference_slots(), time_step_ns=clock_step_ns)
+    _refs_slot = re.compile(r"s\d").search
+    scan_dep_periods = [period for period in state.periods if _refs_slot(str(period.duration))]
+    scan_dep_delays = [channel for channel, value in state.delays.items() if _refs_slot(str(value))]
     points_ticks: list[list[int]] = []
     for point_index, row in enumerate(table):
         ns = point_slots_ns(row)
         points_ticks.append([
             point_slot_value(point_index, index, ns) for index in range(len(state.scan_slots))
         ])
-        state._validate_slot_timing(ns, clock_step_ns)
+        for period in scan_dep_periods:
+            period.duration_steps(slots=ns, time_step_ns=clock_step_ns)   # raises on a <0 duration here
+        for channel in scan_dep_delays:
+            state.delay_steps(channel, slots=ns, time_step_ns=clock_step_ns)
 
     # Analog buses are driven by the hardware bus engine, not the TTL edge table.
     # A scanned DAC value becomes a bus segment whose value_select reads the slot
