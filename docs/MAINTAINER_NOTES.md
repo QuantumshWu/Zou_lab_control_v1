@@ -566,6 +566,48 @@ refills the bank behind the consumed `CURSOR` with the next chunk and re-arms
 `BANK_READY` (see section 3 and 6). Total scan points are limited only by host memory, and
 a late refill STALLs (`STATUS_UNDERFLOW`, hold), never a wrong point.
 
+## 7b. UART Fast-Control Side-Channel (root fix for the ~1 s apply latency)
+
+Vivado hw_axi over JTAG is a **debug** path: each register word / command / STATUS-poll is a
+separate synchronous Python↔Vivado-Tcl↔JTAG round-trip (~10–20 ms of interpreter + JTAG-scan
+overhead each), so one pulse apply is ~7–10 round-trips ≈ ~1 s — the cost is the **number of
+transactions**, not the tiny JTAG payload. The UART side-channel removes Vivado + per-transaction
+JTAG entirely: a whole ~24 KB program uploads in **~82 ms** at 3 Mbaud, a scan-point step in
+**~sub-ms**. It is a **byte-identical transport swap** — it writes the SAME `region_bases` word map
+from `image.pack_program`, so the engine + readout are untouched (safe to ship after sim, unlike a
+calibration change).
+
+Pieces (all share the ONE register map + `image.pack_program`):
+- **Wire protocol** `fpga/pulse_streamer/host/uart_frame.py` — single source: SYNC `5A A5`, two
+  opcodes only (WRITE run-of-words / READ), LE word address, CRC-16/CCITT-FALSE. COMMAND / scan-step
+  / PING are **composed by the host** from WRITE/READ, so `image.py` stays the register-map source.
+  `MAX_FRAME_WORDS=256` = the RTL frame-buffer depth.
+- **RTL** `fpga/pulse_streamer/zlc_uart_bridge.v` — baud NCO, 8N1 RX, a decoder that BUFFERS a whole
+  WRITE frame and verifies CRC BEFORE any write fires (a corrupt frame commits NOTHING), auto-increment
+  word writes, a CTRL READ tap, and an 8N1 reply serializer (WRITE→ACK, READ→data). `zlc_pulse_streamer_top`
+  MUXes its `(u_word_addr/u_wdata/u_we)` against the axi_bram_ctrl side BEFORE the region decode
+  (`uart_sel = u_active`, priority mux — UART and JTAG never used together), so a UART write is
+  byte-for-byte a JTAG write. The AXI/JTAG stack stays wired (bring-up/ILA/fallback).
+- **Host** `devices/uart_session.py::UartStreamerSession` **subclasses** `VivadoAxiStreamerSession` and
+  inherits the ENTIRE protocol (prepare/fire/wait_done/_command/_load_chunk/streaming/scan_progress);
+  only `_queue_word`/`_flush`/`_read_word`/`start`/`close` change (frame `uart_frame` packets over an
+  injectable serial transport — real `PySerialTransport` or `FakeUartTransport` backed by the RTL model).
+- **Behavioural model** `host/uart_bridge_model.py` — the Python decoder oracle the RTL mirrors (the
+  `engine_model.py` role for the bridge). **Primary, always-run verification** is
+  `tests/test_uart_bridge_equivalence.py` + `test_uart_session.py`: `pack_program` → host UART encode →
+  model decode == `pack_program` (byte-identical), and the real prepare/fire runs over `FakeUartTransport`.
+- **Server** `sequencer_server.py --backend uart --uart-port COM3 [--uart-baud 3000000]` wires the same
+  5 callbacks to a `UartStreamerSession` (virtual==real; transport swap is server-side only).
+
+RTL is verified on the rig, not here (no Verilog sim in this repo — same as the AXI integration).
+**Rig checklist (USER runs; we never run Vivado build):** (1) find the UART carrier — is the board's
+FT2232 **channel-B** TXD/RXD routed to 2 FPGA pins? yes → reuse the existing USB cable; no → external
+USB-UART on 2 spare LVCMOS33 pins. (2) fill `uart_rx`/`uart_tx` in `board.xdc` (commented placeholders).
+(3) build + program (first bring-up at `BAUD=115200` to isolate wiring from baud-lock, then 3 Mbaud).
+(4) `link_self_test` (scratch write+read-back over UART) + `READ(LAYOUT_ID)==0x5A4C4C02`. (5) time a
+full apply (~<100 ms) and a step (~sub-ms); if apply >100 ms set the FT2232 latency-timer to 1 ms —
+look at USB buffering, not the RTL (sim already proved the byte count is small).
+
 ## 8. Per-Channel OUTPUT Delay (TTL + DAC event schedulers)
 
 A channel delay is a **physical OUTPUT delay**, not baked into the edge ticks:
