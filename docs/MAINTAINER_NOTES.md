@@ -529,6 +529,23 @@ at flush:
   writes to the *same* address (0 then cmd), and a `BANK_READY` de-arm/re-arm pair is two
   writes to the same address; both must stay ordered single-beat writes, so they are
   never merged or reordered.
+- **4 KB boundary split (AXI4 IHI0022 A3.4.1).** A single AXI burst must NOT cross a
+  4 KB (4096-byte) address boundary, and `create_hw_axi_txn -burst INCR` does NOT
+  auto-split, so `_burst_runs` ALSO stops a run at every 4 KB boundary
+  (`_AXI_BURST_BOUNDARY_BYTES`) — a run's beats all stay in one 4 KB page. This was a
+  **real-hardware scan glitch**: the dense scan region (4 words/point, points adjacent)
+  base sits 256 B into a 4 KB page, so an un-split 2000-point bank upload emitted 7
+  boundary-crossing bursts; the swept value jumped at scan point **240** then every
+  **+256** (`4096 / (4 * num_slots)` points — the only 256-scan-point period in the
+  system; bank_size=2048 pts and burst_max=64 pts do not match). Because a page is a
+  multiple of `burst_max` beats the split self-realigns, so it costs ~0 extra
+  transactions. The split is byte- and order-preserving (same words, same addresses,
+  only transaction grouping changes); `test_axi_burst_4kb_boundary.py` guards it (real
+  scan geometry: 7 crossings before, 0 after). Topology note: the on-chip path is a
+  *single* `axi_bram_ctrl` with no interconnect, whose flat BRAM address counter would
+  carry linearly across a 4 KB boundary — so if the glitch ever survives this fix on
+  real hardware, suspect the `jtag_axi` master / `create_hw_axi_txn` burst framing, not
+  the fabric.
 - `_write_burst_tcl` emits one `create_hw_axi_txn ... -len N -type write -burst INCR`. The
   `-burst INCR` is explicit because the Vivado default burst type is not guaranteed INCR
   across versions and FIXED would write every beat to the base address (silent

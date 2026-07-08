@@ -76,6 +76,14 @@ class _AxiAborted(Exception):
 # fpga/board_config/streamer_config.json so a geometry change is edited in ONE place.
 DEFAULT_PARAMS = _default_streamer_params()
 
+# AXI4 (IHI0022, A3.4.1): a single burst MUST NOT cross a 4 KB (4096-byte) address
+# boundary.  Vivado ``create_hw_axi_txn ... -burst INCR`` issues ONE transaction per
+# coalesced run and does NOT auto-split, so a run that straddles a 4 KB boundary is an
+# illegal burst whose beats past the boundary are misaligned by the master/interconnect
+# on real hardware.  This is a byte-address rule, independent of AXI data width; the
+# split is orthogonal to (and stricter near boundaries than) the burst_max beat cap.
+_AXI_BURST_BOUNDARY_BYTES = 4096
+
 
 def _default_vivado() -> str:
     for name in ("ZLC_PS_VIVADO_BIN", "ZLC_VIVADO_BIN"):
@@ -146,6 +154,8 @@ class VivadoAxiStreamerSession:
         # queued words are coalesced into bursts so one ``run_hw_axi`` moves up to 256
         # words instead of one -- the difference between a multi-second upload and a
         # ~100 ms one over JTAG-to-AXI.  Requires the AXI4 (not AXI4-Lite) bitstream.
+        # _burst_runs additionally splits every run at 4 KB boundaries (see
+        # _AXI_BURST_BOUNDARY_BYTES) so no burst is AXI4-illegal.
         self.burst_max = max(1, min(256, int(burst_max)))
         self.stream_poll_interval = float(stream_poll_interval)
 
@@ -373,7 +383,15 @@ class VivadoAxiStreamerSession:
         order-dependent command sequence (e.g. COMMAND 0 then COMMAND cmd, or
         BANK_READY de-arm then re-arm at the SAME address) keeps its order and stays a
         sequence of len-1 writes.  Only consecutive, strictly address-contiguous
-        (stride 4) entries merge, capped at ``burst_max`` beats."""
+        (stride 4) entries merge, capped at ``burst_max`` beats AND split so no burst
+        crosses a 4 KB address boundary (AXI4 IHI0022 A3.4.1 -- ``create_hw_axi_txn``
+        does not auto-split, so an un-split crossing run misaligns its post-boundary
+        beats on hardware).  The dense scan region (num_slots words per point, points
+        adjacent) is where this shows: its base sits mid-4 KB-page, so an un-split bank
+        upload straddled boundaries and the swept value jumped at the first crossing
+        point, recurring every 4 KB (= 4096 / (4*num_slots) scan points).  A 4-byte
+        beat is 4-aligned and 4096 % 4 == 0, so no single beat straddles a boundary --
+        gating on the NEXT beat's page is sufficient."""
 
         runs: list[tuple[int, list[int]]] = []
         i = 0
@@ -386,6 +404,8 @@ class VivadoAxiStreamerSession:
                 j < n
                 and len(vals) < self.burst_max
                 and pending[j][0] == base + 4 * len(vals)
+                and (base + 4 * len(vals)) // _AXI_BURST_BOUNDARY_BYTES
+                == base // _AXI_BURST_BOUNDARY_BYTES
             ):
                 vals.append(pending[j][1])
                 j += 1
