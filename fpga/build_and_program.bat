@@ -290,6 +290,11 @@ if defined ZLC_PS_PROJECT_DIR if "!ZLC_PS_PROJECT_DIR: =!"=="" set "ZLC_PS_PROJE
 if defined ZLC_PS_LOG_DIR if "!ZLC_PS_LOG_DIR: =!"=="" set "ZLC_PS_LOG_DIR="
 if not defined ZLC_PS_BUILD_ROOT set "ZLC_PS_BUILD_ROOT=%FPGA_DIR%build"
 if not exist "!ZLC_PS_BUILD_ROOT!\" mkdir "!ZLC_PS_BUILD_ROOT!" >nul 2>nul
+rem Stop cloud-sync (Dropbox) from syncing -- and thus file-locking -- the Vivado build artifacts:
+rem a held IP-cache handle makes create_project's project-dir delete fail with "permission denied".
+rem Best-effort NTFS "com.dropbox.ignored" stream on the build root; harmless when the tree is not
+rem synced.  This is why you never need to set ZLC_PS_BUILD_ROOT to dodge the lock -- just run this bat.
+>"!ZLC_PS_BUILD_ROOT!:com.dropbox.ignored" echo 1 2>nul
 rem In-repo build (fpga\build\ps).  The SHORT subdir "ps" keeps Vivado's deep
 rem run/.Xil temp path under the Windows MAX_PATH limit without leaving fpga/.
 if not defined ZLC_PS_PROJECT_DIR set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\!ZLC_PROJ_SUB!"
