@@ -68,10 +68,11 @@ def test_show_device_manager_runs_the_shared_launcher_sequence(monkeypatch):
         assert window.isVisible()
         assert window in getattr(app, "_zlc_retained_windows", []), \
             "the device-manager window must be retained like every other GUI"
-        # the explicit-size path (its scrolling editor has no usable content hint); the size
-        # is the module's ONE design constant, never re-typed here
-        assert (window.width(), window.height()) == (
-            qf.scaled_px(dm.WINDOW_SIZE[0]), qf.scaled_px(dm.WINDOW_SIZE[1]))
+        # the explicit-size path (its scrolling editor has no usable content hint); the size is the
+        # ONE shared screen-fit rule (qf.screen_fit_window_size at the module's WINDOW_RATIO), the
+        # same the pulse editor / task console use -- never re-typed here
+        expect = qf.screen_fit_window_size(dm.WINDOW_RATIO)
+        assert (window.width(), window.height()) == (expect.width(), expect.height())
         # centred on the primary screen's available area, like every other GUI
         avail = app.primaryScreen().availableGeometry()
         centre = window.frameGeometry().center()

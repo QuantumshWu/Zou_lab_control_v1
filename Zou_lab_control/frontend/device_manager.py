@@ -67,15 +67,27 @@ from .qt_fluent import (
     MUTED_LABEL_STYLE,
     muted_note_label,
     scaled_px,
+    screen_fit_window_size,
     set_fluent_scale,
+    WINDOW_SCREEN_FRACTION,
     setting_label_width,
     signals_blocked,
     window_pad,
 )
 
-#: Window size in DESIGN px (scaled by the shared fluent scale at launch) -- the single
-#: source the launcher and its contract test read.
-WINDOW_SIZE = (960, 660)
+#: The device manager + viewer open at the SAME screen fraction as the pulse editor and task
+#: console (``qt_fluent.WINDOW_SCREEN_FRACTION``) -- one shared screen-fit rule, not a cramped
+#: fixed box.  ``_fluent_window_size()`` resolves it to a (w, h) tuple for ``launch_fluent_window``.
+WINDOW_RATIO = WINDOW_SCREEN_FRACTION
+
+
+def _fluent_window_size() -> tuple:
+    """Screen-fit initial size for the manager + viewer windows, via the ONE shared
+    ``qt_fluent.screen_fit_window_size`` rule (the pulse editor / task console use the same), so
+    the config editor opens as large as those GUIs.  Returned as a (w, h) tuple because
+    ``launch_fluent_window(size=...)`` indexes it."""
+    size = screen_fit_window_size(WINDOW_RATIO)
+    return (size.width(), size.height())
 
 _OTHER_SECTION = "Other devices"
 
@@ -1107,7 +1119,7 @@ def show_device_manager(device_set=None, *, initial_config=None, session_binding
     # fresh panel per open (CC round).  The explicit size replaces fixed_size -- the editor
     # is a scroll area whose content hint would collapse the window.
     return launch_fluent_window(panel, title="Devices@Zou lab", fixed_size=False,
-                                size=(scaled_px(WINDOW_SIZE[0]), scaled_px(WINDOW_SIZE[1])))
+                                size=_fluent_window_size())
 
 
 class DeviceViewerPanel(QtWidgets.QWidget):
@@ -1185,4 +1197,4 @@ def show_device_viewer(device_set=None, *, devices_provider=None, editable: bool
     set_fluent_scale(None)   # the ONE shared GUI-scale rule (auto from the primary screen)
     panel = DeviceViewerPanel(device_set, devices_provider=devices_provider, editable=editable)
     return launch_fluent_window(panel, title="Device viewer@Zou lab", fixed_size=False,
-                                size=(scaled_px(WINDOW_SIZE[0]), scaled_px(WINDOW_SIZE[1])))
+                                size=_fluent_window_size())
