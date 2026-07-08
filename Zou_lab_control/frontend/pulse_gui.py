@@ -2137,6 +2137,22 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         if getattr(self, "scan_repeats_spin", None) is not None:
             with _signals_blocked(self.scan_repeats_spin):
                 self.scan_repeats_spin.setValue(int(getattr(state, "scan_repeats", 0)))
+        # Restore the Scan-tab editor's SOURCE code from the loaded state so a Save/Load round-trips
+        # the editable program (not just the frozen scan_table).  This is IDEMPOTENT for in-session
+        # mutations (add/remove period, clk toggle): read_state carried the current editor text, so
+        # state.scan_code already equals the editor and the ``!=`` guard skips.  It only fires for a
+        # FILE/DEVICE load or Clear All, where it must match the editor to the loaded program and mark
+        # Run NOT dirty (code + table came from the same source -> the on-screen table is not stale).
+        # Signals blocked so this does not read as a user edit; an empty saved code falls through to
+        # _refresh_scan_tab's default-template auto-fill (a brand-new pulse), a non-empty one is left
+        # verbatim (it is not the auto template, so the auto-fill guard leaves it).
+        if getattr(self, "scan_code", None) is not None:
+            saved_code = getattr(state, "scan_code", "") or ""
+            if self.scan_code.toPlainText() != saved_code:
+                with _signals_blocked(self.scan_code):
+                    self.scan_code.setPlainText(saved_code)
+                if getattr(self, "scan_run_button", None) is not None:
+                    self.scan_run_button.set_dirty(False)
         # Suspend painting while we tear down and rebuild every channel panel and
         # period card (up to 5 periods x 62 channels = hundreds of widgets).  Each
         # addWidget on a *visible* tree would otherwise trigger an immediate
@@ -2440,6 +2456,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             name=self.name_edit.text().strip() or self.state.name or _default_pulse_name(),
             scan_slots=scan_slots,
             scan_table=scan_table,
+            # The Scan-tab editor's SOURCE code rides on the state so Save/Load round-trips the
+            # editable program, not just the frozen scan_table numbers.  Falls back to the current
+            # state's value for a headless read_state before _build_scan_tab wires the editor.
+            scan_code=(self.scan_code.toPlainText()
+                       if getattr(self, "scan_code", None) is not None
+                       else getattr(self.state, "scan_code", "")),
             api_slots=api_slots,
             time_step_ns=time_step_ns,
             channel_labels=dict(self.state.channel_labels),

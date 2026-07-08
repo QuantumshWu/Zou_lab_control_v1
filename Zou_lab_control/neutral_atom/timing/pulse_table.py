@@ -329,6 +329,7 @@ class PulseTableState:
         name: str | None = None,
         scan_slots: Sequence[ScanSlot | Mapping[str, object]] | None = None,
         scan_table: Sequence[Sequence[float]] | None = None,
+        scan_code: str = "",
         api_slots: Sequence[ApiSlot | Mapping[str, object]] | None = None,
         time_step_ns: float = 1.0,
         repeat_start: int | None = None,
@@ -352,6 +353,11 @@ class PulseTableState:
         # STRICT width check: a programmatic build must supply one column per bound slot.
         # Legacy short rows are tolerated only at the from_dict deserialization seam.
         self.scan_table = _normalize_scan_table(scan_table, slots=self.scan_slots)
+        # The Scan-tab code editor's SOURCE text: the Python snippet that GENERATES scan_table.
+        # scan_table is the derived result the hardware plays; scan_code is how the user made it,
+        # persisted alongside so a Save/Load round-trips the editable program (not just the frozen
+        # numbers).  Empty for notebook-built / template states -- they set the table directly.
+        self.scan_code = str(scan_code or "")
         # API slots: named handles (a1/a2...) the API/Task set by name (set_api / state.aN).
         # Set EARLY so the ``state.aN = value`` attribute sugar (__setattr__) can find them.
         self.api_slots = [slot if isinstance(slot, ApiSlot) else ApiSlot.from_dict(slot) for slot in (api_slots or [])]
@@ -1058,6 +1064,11 @@ class PulseTableState:
             name=self.name,
             scan_slots=[slot.to_dict() for slot in self.scan_slots],
             scan_table=[list(row) for row in self.scan_table],
+            # The editor SOURCE code is channel-independent, so it survives the align verbatim --
+            # else a subset-channel file load (load_from_file -> aligned_to_channels) would drop
+            # the user's scan program while keeping the table (the same built-but-not-passed bug
+            # class as clk_channels below).
+            scan_code=self.scan_code,
             # API slots survive the align UNCHANGED (the same built-but-not-passed bug class as
             # clk_channels below and unrolled_bracket's api_slots): every target kind is stable
             # under a superset re-order -- ``duration`` targets a period INDEX (periods keep their
@@ -1696,6 +1707,7 @@ class PulseTableState:
             "channels": list(self.channels),
             "scan_slots": [slot.to_dict() for slot in self.scan_slots],
             "scan_table": [list(row) for row in self.scan_table],
+            "scan_code": self.scan_code,
             "api_slots": [slot.to_dict() for slot in self.api_slots],
             "time_step_ns": self.time_step_ns,
             "periods": [period.to_dict() for period in self.periods],
@@ -1777,6 +1789,7 @@ class PulseTableState:
             channels=payload["channels"],
             scan_slots=scan_slots,
             scan_table=scan_table,
+            scan_code=str(payload.get("scan_code", "")),
             api_slots=payload.get("api_slots", ()),
             time_step_ns=float(payload.get("time_step_ns", 1.0)),
             periods=[PulsePeriod.from_dict(item) for item in payload.get("periods", [])],
