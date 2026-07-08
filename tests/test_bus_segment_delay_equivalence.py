@@ -98,6 +98,34 @@ def test_scan_cycle_stays_correct(d):
     assert got == ref
 
 
+@pytest.mark.parametrize("d", [1, 2, 50, 137, FRAME + 3, 3 * FRAME + 70])
+def test_ramp_reaching_loop_end_no_tick0_segment(d):
+    """FRAME-BOUNDARY case: a repeat_forever bus that idles in period 0 (NO tick-0 segment) and ramps
+    to stop_tick == loop_end_tick.  The live engine TRUNCATES the ramp at the wrap (holds the carried
+    value, never snaps to target); the delayed re-player must FREEZE at the boundary, not ramp on into
+    the next frame's idle window.  (Regression for the delay-P1 frame-boundary bug.)"""
+    p = _prog([_seg(0, 30, 100, 0, 900, mode="ramp")])   # no tick-0 edge; ramp rstop == FRAME=...
+    p.loop_end_tick = 100
+    p.ticks = [100]
+    n = d + 5 * 100
+    undelayed, _ = em.bus_undelayed_and_log(p, 0, n, bus_width=BW)
+    ref = em.bus_delay_line_reference(undelayed, d, safe_value=SAFE)
+    assert em.rtl_bus_segment_delay_mirror(p, 0, d, n, bus_width=BW) == ref
+
+
+@pytest.mark.parametrize("d", [1, 2, 50, 137, 250])
+def test_segment_applies_on_final_frame_tick(d):
+    """FRAME-BOUNDARY case: a segment whose effective start is the frame's LAST tick applies after
+    that tick's output, so the carry into the next frame is the value REGISTER, not the last output
+    sample.  (Regression for the seed-carry bug.)"""
+    fr = 100
+    p = _prog([_seg(0, 0, 0, 0, 200, mode="edge"), _seg(0, fr - 1, fr - 1, 0, 700, mode="edge")], frame=fr)
+    n = d + 5 * fr
+    undelayed, _ = em.bus_undelayed_and_log(p, 0, n, bus_width=BW)
+    ref = em.bus_delay_line_reference(undelayed, d, safe_value=SAFE)
+    assert em.rtl_bus_segment_delay_mirror(p, 0, d, n, bus_width=BW) == ref
+
+
 def test_overflow_drops_shallow_matches_deep():
     """A too-shallow segment FIFO diverges (the RTL overflow-drop guard); a deep-enough one matches."""
     d, n = 50 * FRAME, 60 * FRAME

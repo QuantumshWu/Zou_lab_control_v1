@@ -855,7 +855,8 @@ def rtl_mirror_play_stale_seed(program, n_ticks: int, prior_count: int, *,
 
 def bus_play(program, bus_index: int, n_ticks: int, scan_point: int = 0, *,
              bus_width: int = 10, frac_bits: int | None = None,
-             seed_value: int | None = None, apply_log: list | None = None) -> list[int]:
+             seed_value: int | None = None, apply_log: list | None = None,
+             carry_out: list | None = None) -> list[int]:
     """Cycle-accurate mirror of zlc_edge_streamer.v's per-bus DAC engine
     (zlc_bus_start_table + zlc_bus_step + zlc_bus_apply_segment): the interpolating
     ramp and the affine segment ticks.  Returns bus_out at each tick for one scan point
@@ -949,6 +950,10 @@ def bus_play(program, bus_index: int, n_ticks: int, scan_point: int = 0, *,
                         st["value"] = max(st["target"], st["value"] - inc)
         elif st["idx"] < len(segs) and t >= eff(segs[st["idx"]].start_tick, segs[st["idx"]].start_tick_coeffs):
             apply(segs[st["idx"]], t); st["idx"] += 1
+    if carry_out is not None:
+        # The engine's VALUE REGISTER after the last tick's transition -- the #ramp-carry value the
+        # NEXT frame's ramp starts from (NOT out[-1], which is the pre-transition output sample).
+        carry_out.append(st["value"])
     return out
 
 
@@ -998,17 +1003,28 @@ def bus_undelayed_and_log(program, bus_index: int, n_ticks: int, scan_point: int
     while len(stream) < n_ticks:
         flen = min(frame, n_ticks - len(stream))
         flog: list = []
+        carry: list = []
         pt = scan_point_seq[fk % len(scan_point_seq)] if scan_point_seq else scan_point
         fstream = bus_play(program, bus_index, flen, pt, bus_width=bus_width,
-                           frac_bits=frac_bits, seed_value=seed, apply_log=flog)
+                           frac_bits=frac_bits, seed_value=seed, apply_log=flog, carry_out=carry)
         fk += 1
         stream.extend(fstream)
+        frame_end = origin + flen
         for (ta, snap) in flog:                       # offset this frame's apply ticks to absolute time
             s2 = dict(snap)
             s2["rstart"] = int(snap["rstart"]) + origin
             s2["rstop"] = int(snap["rstop"]) + origin
+            # The live engine plays only ticks [origin, frame_end); at the wrap it re-inits (stops
+            # any active ramp, HOLDS the carried value).  Record the frame boundary so the delayed
+            # re-player FREEZES this descriptor there instead of ramping to its own rstop into the
+            # next frame's idle window (a ramp with rstop == loop_end_tick is truncated, never snaps
+            # to target).
+            s2["frame_end"] = frame_end
             log.append((int(ta) + origin, s2))
-        seed = fstream[-1] if fstream else seed
+        # The carry into the next frame is the engine's VALUE REGISTER after the frame's last tick
+        # (bus_play's carry_out), NOT the last OUTPUT sample (fstream[-1] drops a final-tick apply) and
+        # NOT bus_value_at (which recomputes from SAFE, ignoring this cross-frame #ramp-carry seed).
+        seed = carry[0] if carry else seed
         origin += flen
     return stream[:n_ticks], log
 
@@ -1061,10 +1077,15 @@ def rtl_bus_segment_delay_mirror(program, bus_index: int, delay: int, n_ticks: i
         shifted = dict(snap)
         shifted["rstart"] = int(snap["rstart"]) + d
         shifted["rstop"] = int(snap["rstop"]) + d
+        # Frame boundary (shifted by d): past it the delayed ramp FREEZES (holds), matching the live
+        # engine's per-frame truncation.  A finite / single-frame descriptor has no boundary -> never
+        # freeze (a huge sentinel).
+        shifted["frame_end"] = (int(snap["frame_end"]) + d) if "frame_end" in snap else (1 << 62)
         emits.setdefault(t_apply + d, []).append(shifted)
 
     player = {"value": safe, "ramp": False, "rstart": 0, "rstop": 0, "target": 0,
-              "denom": 0, "accum": 0, "up": True, "step": 0, "rem": 0, "started": False, "t": 0}
+              "denom": 0, "accum": 0, "up": True, "step": 0, "rem": 0, "started": False,
+              "t": 0, "frame_end": 1 << 62}
     out = []
     for t in range(n_ticks):
         # Output the REGISTERED value first, then transition -- exactly the live engine's
@@ -1075,10 +1096,10 @@ def rtl_bus_segment_delay_mirror(program, bus_index: int, delay: int, n_ticks: i
         pending = emits.get(t)
         if pending:                                   # apply descriptor(s) scheduled at this tick
             for shifted in pending:
-                for k in ("value", "ramp", "rstart", "rstop", "target", "denom", "accum", "up", "step", "rem"):
+                for k in ("value", "ramp", "rstart", "rstop", "target", "denom", "accum", "up", "step", "rem", "frame_end"):
                     player[k] = shifted[k]
                 player["started"] = True
-        elif player["started"]:                       # else advance the current segment's staircase
+        elif player["started"] and t < player["frame_end"]:  # advance the staircase, FROZEN at the wrap
             _segment_replay_step(player)
     return (out, peak) if return_occupancy else out
 
