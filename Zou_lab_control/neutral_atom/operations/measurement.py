@@ -35,6 +35,7 @@ from ..core.params import ParamDecl
 from ..core.calibration import TrapCalibration
 from ..core.results import MeasurementTaskResult
 from ..core.utils import site_index
+from ..devices.base import AcquisitionCancelled
 from ..timing.sequence import snap_seconds_to_clock
 from ..views.plots import plot_detection_scan
 
@@ -104,7 +105,14 @@ def triggered_frames(camera, sequencer, sequence, frames: int = 1, *, stop=None)
             waiter = getattr(sequencer, "wait_done", None)
             if callable(waiter):
                 budget = 2.0 * float(getattr(program, "duration", 0.0) or 0.0) + 5.0
-                if not waiter(timeout=budget):
+                # Thread ``stop`` so this program-tail wait is cooperatively cancellable like the frame read
+                # above: without it a Stop pressed here blocks up to ``2*duration+5`` s while the node still
+                # reports "running" and holds the camera armed -- the double-acquire wedge the sole-owner
+                # invariant exists to prevent.
+                if not waiter(timeout=budget, stop=stop):
+                    if stop is not None and stop.is_set():
+                        raise AcquisitionCancelled(     # a Stop mid-tail is a clean cancel, NOT a wedged streamer
+                            "cancelled while waiting for the fired program to finish.")
                     raise TimeoutError(
                         f"sequencer did not finish the fired finite program within {budget:.1f} s "
                         "after its frames were read -- the streamer is wedged (a truncated fire "

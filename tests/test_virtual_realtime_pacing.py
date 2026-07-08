@@ -97,6 +97,25 @@ def test_finite_wait_done_blocks_for_the_program_duration():
     assert ok and time.monotonic() - t0 == pytest.approx(seq.duration, abs=0.10)
 
 
+def test_finite_wait_done_is_cancellable_by_stop():
+    """A Stop during the finite program-tail wait returns PROMPTLY (not after the whole duration) and
+    reports NOT done.  This is what lets a stopped node's worker exit fast instead of holding the camera
+    armed for the full ``2*duration+5`` s budget -- the orphaned-armed-camera / double-acquire window the
+    sole-owner invariant exists to prevent (the wait was an UNCANCELLABLE ``time.sleep`` before)."""
+    import threading
+    seqr = virtual.VirtualSequencer(sleep_scale=1.0)
+    seq = na.imaging_sequence(exposure=0.60, load=True, name="readout")   # a genuinely long finite program
+    seqr.prepare(seq)
+    seqr.fire(seq)
+    stop = threading.Event()
+    threading.Timer(0.05, stop.set).start()          # Stop shortly after the wait begins
+    t0 = time.monotonic()
+    ok = seqr.wait_done(timeout=5.0, stop=stop)
+    elapsed = time.monotonic() - t0
+    assert ok is False                               # cancelled mid-wait -> reports NOT done
+    assert elapsed < 0.25, f"wait_done ignored Stop -- blocked {elapsed:.2f}s of the {seq.duration:.2f}s program"
+
+
 def test_default_sleep_scale_is_real_time():
     """The PRODUCT default is real-time (DEFAULT_SLEEP_SCALE=1.0); a VirtualSequencer built with
     no explicit sleep_scale takes that default.  (conftest fast-forwards the suite, so restore

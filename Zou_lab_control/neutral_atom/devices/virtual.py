@@ -1603,7 +1603,7 @@ class VirtualSequencer(SequencerDevice):
         ``_scan_progress`` callback), so virtual and real expose the one ``scan_progress`` seam."""
         return self.service.scan_progress()
 
-    def wait_done(self, timeout: float | None = None) -> bool:
+    def wait_done(self, timeout: float | None = None, *, stop=None) -> bool:
         """Block until the prepared FINITE program finishes on the wall clock
         (``duration x sleep_scale``) -- this IS the real time a measurement's ``on_pulse(wait=True)``
         takes (real-time by default; the test suite sets sleep_scale=0 to fast-forward).
@@ -1625,7 +1625,10 @@ class VirtualSequencer(SequencerDevice):
                 if timeout is not None and delay > float(timeout):
                     return False
                 if delay > 0:
-                    time.sleep(delay)
+                    self._sleep_interruptible(delay, stop)          # cooperatively cancellable, like settle
+                if stop is not None and stop.is_set():
+                    self.service.history.append({"action": "wait_done", "ok": False})
+                    return False                                    # cancelled mid-sweep -> not done, do NOT latch
                 self._scan_done = True       # latch the saturated done reading (matches the real backend)
                 self._firing = None
                 self.service.history.append({"action": "wait_done", "ok": True})
@@ -1644,9 +1647,10 @@ class VirtualSequencer(SequencerDevice):
             self.service.history.append({"action": "wait_done", "ok": False})
             return False
         if delay > 0:
-            time.sleep(delay)
-        self.service.history.append({"action": "wait_done", "ok": True})
-        return True
+            self._sleep_interruptible(delay, stop)                 # cooperatively cancellable, like settle
+        ok = not (stop is not None and stop.is_set())             # cancelled mid-play -> not done
+        self.service.history.append({"action": "wait_done", "ok": ok})
+        return ok
 
     def settle(self, seconds: float, *, stop=None) -> None:
         """Idle ``seconds`` between software-stepped fires -- DELEGATED to the composed service,

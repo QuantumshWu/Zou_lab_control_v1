@@ -1054,7 +1054,7 @@ class SequencerService:
             self.history.append({"action": "fire", "sequence_id": program.sequence_id, "sequence": program.sequence_name})
             return program.to_dict()
 
-    def wait_done(self, timeout: float | None = None) -> bool:
+    def wait_done(self, timeout: float | None = None, *, stop=None) -> bool:
         with self._lock:
             program = self._require_prepared()
         if program.repeat_forever and timeout is None:
@@ -1069,8 +1069,8 @@ class SequencerService:
                 ok = False
             else:
                 if delay > 0:
-                    time.sleep(delay)
-                ok = True
+                    SequencerDevice._sleep_interruptible(delay, stop)   # cooperatively cancellable, like settle
+                ok = not (stop is not None and stop.is_set())           # cancelled mid-wait -> not done
         with self._lock:
             self.state = "done" if ok else "timeout"
             self.history.append({"action": "wait_done", "sequence_id": program.sequence_id, "ok": ok})
@@ -1195,8 +1195,8 @@ class RuntimeSequencer(SequencerDevice):
         step = 1e9 / float(self.clock_hz)
         self.service.fire(None if sequence is None else timing_payload_to_dict(sequence, time_step_ns=step))
 
-    def wait_done(self, timeout: float | None = None) -> bool:
-        return self.service.wait_done(timeout)
+    def wait_done(self, timeout: float | None = None, *, stop=None) -> bool:
+        return self.service.wait_done(timeout, stop=stop)
 
     def scan_progress(self) -> dict:
         return self.service.scan_progress()
@@ -1262,7 +1262,7 @@ class ManualSequencer(SequencerDevice):
         self.history.append({"action": "fire_manual", "message": self.message})
         print(self.message)
 
-    def wait_done(self, timeout: float | None = None) -> bool:
+    def wait_done(self, timeout: float | None = None, *, stop=None) -> bool:
         self.state = "unknown_done"
         self.history.append({"action": "wait_done_manual", "timeout": timeout})
         return True
@@ -1388,8 +1388,11 @@ class RemoteSequencer(SequencerDevice):
         step = 1e9 / float(self.clock_hz)
         self._conn.root.fire(None if sequence is None else json.dumps(timing_payload_to_dict(sequence, time_step_ns=step)))
 
-    def wait_done(self, timeout: float | None = None) -> bool:
+    def wait_done(self, timeout: float | None = None, *, stop=None) -> bool:
         self.open()
+        # ``stop`` is accepted for the uniform sequencer contract; the actual wait is server-side (the AXI
+        # backend's wait_done_callback), bounded by ``timeout`` + the RPyC transport, so cancellation across
+        # the RPyC boundary is not threaded here -- a Stop lands when the bounded remote call returns.
         return bool(self._conn.root.wait_done(timeout))
 
     def scan_progress(self) -> dict:
@@ -1640,8 +1643,8 @@ class PulseController:
                 raise TimeoutError(f"sequencer did not report done for pulse {program.sequence_name!r}.")
         return program
 
-    def wait_done(self, timeout: float | None = None) -> bool:
-        return bool(self.sequencer.wait_done(timeout=timeout))
+    def wait_done(self, timeout: float | None = None, *, stop=None) -> bool:
+        return bool(self.sequencer.wait_done(timeout=timeout, stop=stop))
 
     def stop(self) -> None:
         if hasattr(self.sequencer, "set_safe_state"):
