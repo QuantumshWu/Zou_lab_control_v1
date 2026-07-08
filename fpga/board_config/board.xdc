@@ -1,11 +1,11 @@
  #IO 管脚约束
 set_property -dict {PACKAGE_PIN R4 IOSTANDARD LVCMOS33} [get_ports clk]
 # UART 快速控制侧信道 (fast-control link; ~82ms 程序上传 / ~sub-ms scan step vs ~1s JTAG-Tcl).
-# !!! 上机前把 <RX_PIN>/<TX_PIN> 换成真实引脚:若板子 FT2232 channel-B (BDBUS0=TXD, BDBUS1=RXD)
-#     接到了 2 个 FPGA 脚, 用那两个脚 (复用现有 USB 线); 否则外接 USB-UART 模块到 2 个空闲 LVCMOS33
-#     脚 (adapter TX->uart_rx, adapter RX<-uart_tx, 共地). 不要动 clk(R4) 与任何已用通道/DA 脚.
-#set_property -dict {PACKAGE_PIN <RX_PIN> IOSTANDARD LVCMOS33} [get_ports uart_rx]
-#set_property -dict {PACKAGE_PIN <TX_PIN> IOSTANDARD LVCMOS33} [get_ports uart_tx]
+# 正点原子达芬奇 ATK-DF7A35 板载 USB-UART (CH340C, U14, 3.3V 直连无电平转换) -> "USB_UART" 连接器.
+# 引脚来自达芬奇 IO 引脚分配表 + 原理图 POWER&UART.SchDoc: uart_rxd=U5(FPGA收<-CH340_TXD), uart_txd=T6(FPGA发->CH340_RXD).
+# 方向与 zlc_uart_bridge 一致 (uart_rx=input, uart_tx=output). 换板只改这两行.
+set_property -dict {PACKAGE_PIN U5 IOSTANDARD LVCMOS33} [get_ports uart_rx]
+set_property -dict {PACKAGE_PIN T6 IOSTANDARD LVCMOS33} [get_ports uart_tx]
 set_property -dict {PACKAGE_PIN R2 IOSTANDARD LVCMOS33} [get_ports {led[0]}]
 set_property -dict {PACKAGE_PIN R3 IOSTANDARD LVCMOS33} [get_ports {led[1]}]
 set_property -dict {PACKAGE_PIN F15 IOSTANDARD LVCMOS33} [get_ports cooling]
