@@ -36,7 +36,7 @@ from pathlib import Path
 from PyQt5 import QtCore, QtWidgets
 
 from ..neutral_atom.core.params import DEVICE_REF_PREFIX
-from .param_widgets import PARAM_WIDGETS, ParamWidgetContext, DebouncedApply, format_reading
+from .param_widgets import PARAM_WIDGETS, ParamWidgetContext, RateLimitedApply, format_reading
 from .qt_fluent import (
     ACCENT,
     GREEN,
@@ -232,12 +232,11 @@ class _DeviceControlPage(QtWidgets.QWidget):
         self._getters: list = []                 # (control, current_edit) polled each tick
         self._editors: dict = {}                 # control key -> (widget, handler) for Apply
         self._live_switches: dict = {}           # control key -> its Live (scroll-to-set) switch
-        self._control_by_key: dict = {}          # control key -> RuntimeControl (for the live debounce)
-        # Live "scroll to set" writes are DEBOUNCED at the widget layer (per key): a fast mouse-wheel scroll
-        # writes NOTHING to the device until it SETTLES, so the hardware never sweeps through the intermediate
-        # values on the way to the target set-point (滚轮停下才写).  The explicit Apply path stays synchronous
-        # (it never goes through here).
-        self._live_apply = DebouncedApply(
+        self._control_by_key: dict = {}          # control key -> RuntimeControl (for the live throttle)
+        # Live "scroll to set" writes are RATE-LIMITED (leading + trailing, per key): a fast mouse-wheel
+        # scroll would otherwise fire one blocking device write per tick and wedge the GUI.  The explicit
+        # Apply path stays synchronous (it never goes through here).
+        self._live_apply = RateLimitedApply(
             lambda key, value: self._write_control(self._control_by_key[key], value), parent=self)
 
         outer = QtWidgets.QVBoxLayout(self)
@@ -312,8 +311,8 @@ class _DeviceControlPage(QtWidgets.QWidget):
             handler = PARAM_WIDGETS[decl.kind]
             live = {"on": False}
             self._control_by_key[decl.key] = control
-            # In Live mode each edit goes through the shared debounce so the device write fires only when the
-            # scroll settles (never mid-scroll); in Apply mode instant_apply is None (buffered).
+            # In Live mode each edit goes through the shared rate limiter (leading + trailing) so a fast
+            # scroll can not flood the device write; in Apply mode instant_apply is None (buffered).
             ctx = ParamWidgetContext(
                 instant_apply=lambda key, value: self._live_apply(key, value) if live["on"] else None)
             widget = handler.build(decl, control.getter(self.device), ctx)
@@ -391,9 +390,9 @@ class _DeviceControlPage(QtWidgets.QWidget):
         self._refresh_readbacks()
 
     def _flush_live(self) -> None:
-        """Apply any live (scroll-to-set) write still pending in the debounce NOW -- so the final scrolled
-        value is never lost when the page hides / is torn down (and a test hook to observe the settled write
-        without pumping the event loop)."""
+        """Apply any live (scroll-to-set) write still pending in the rate limiter NOW -- so the final
+        scrolled value is never lost when the page hides / is torn down (and a test hook to observe the
+        trailing edge without pumping the event loop)."""
         self._live_apply.flush()
 
     def _refresh_readbacks(self) -> None:
