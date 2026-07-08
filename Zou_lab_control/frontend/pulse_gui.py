@@ -2457,9 +2457,14 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             scan_slots=scan_slots,
             scan_table=scan_table,
             # The Scan-tab editor's SOURCE code rides on the state so Save/Load round-trips the
-            # editable program, not just the frozen scan_table numbers.  Falls back to the current
-            # state's value for a headless read_state before _build_scan_tab wires the editor.
-            scan_code=(self.scan_code.toPlainText()
+            # editable program, not just the frozen scan_table numbers.  Persist only GENUINELY
+            # USER-EDITED code: while the editor still holds the auto-generated column_stack default
+            # (== _scan_auto_code, a DERIVED template) persist "" (codeless) so a reload regenerates
+            # it for the THEN-current slot count -- else a stale N-slot default would ride the state
+            # and defeat _refresh_scan_tab's slot-count auto-adapt.  Falls back to the current state's
+            # value for a headless read_state before _build_scan_tab wires the editor.
+            scan_code=(("" if self.scan_code.toPlainText() == getattr(self, "_scan_auto_code", None)
+                        else self.scan_code.toPlainText())
                        if getattr(self, "scan_code", None) is not None
                        else getattr(self.state, "scan_code", "")),
             api_slots=api_slots,
