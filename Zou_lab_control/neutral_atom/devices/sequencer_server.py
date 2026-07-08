@@ -131,6 +131,8 @@ def run_server(
     command_timeout: float | None = None,
     backend: str = "command",
     warm_start: bool = True,
+    uart_port: str | None = None,
+    uart_baud: int = 3_000_000,
 ):
     """Start the RPyC sequencer service used by ``RemoteSequencer``."""
 
@@ -174,6 +176,33 @@ def run_server(
         wait_done_callback = hardware_backend.wait_done
         safe_state_callback = hardware_backend.safe_state
         scan_progress_callback = hardware_backend.scan_progress   # live scan cursor for the GUI poll
+    elif backend_name in {"uart", "serial"}:
+        # SAME edge-table engine + register map, driven over the UART fast-control side-channel
+        # instead of Vivado-Tcl JTAG -- a byte-identical transport swap (image.solve_capacity + the
+        # whole prepare/fire/wait_done/scan_progress protocol are inherited) that makes a pulse apply
+        # ~82 ms and a scan-step ~sub-ms instead of ~1 s.
+        from .uart_session import UartStreamerSession
+        from fpga.pulse_streamer.host.image import solve_capacity
+        part = os.environ.get("ZLC_PS_FPGA_PART", "xc7a35tfgg484-2")
+        params = solve_capacity(part, channel_count=max(1, len(list(channels)))).params
+        hardware_backend = UartStreamerSession(
+            state_dir=state_dir, clock_hz=clock_hz, params=params,
+            port=uart_port or os.environ.get("ZLC_PS_UART_PORT"),
+            baud=int(uart_baud or os.environ.get("ZLC_PS_UART_BAUD", 3_000_000)),
+        )
+        if warm_start:
+            print("Opening UART fast-control link before accepting clients...")
+            hardware_backend.start()
+            hardware_backend.clear_host_config()
+            if _env_bool("ZLC_PS_UART_SELF_TEST", True):
+                print("Verifying UART link (write + read-back self-test)...")
+                hardware_backend.link_self_test()
+                print("UART link self-test OK.")
+        prepare_callback = hardware_backend.prepare
+        fire_callback = hardware_backend.fire
+        wait_done_callback = hardware_backend.wait_done
+        safe_state_callback = hardware_backend.safe_state
+        scan_progress_callback = hardware_backend.scan_progress
     elif backend_name == "command":
         hardware_backend = CommandSequencerBackend(
             Path(state_dir),
@@ -189,7 +218,7 @@ def run_server(
         safe_state_callback = hardware_backend.safe_state
         scan_progress_callback = None        # the command backend has no live scan cursor
     else:
-        raise ValueError("backend must be 'jtag-axi' or 'command'.")
+        raise ValueError("backend must be 'jtag-axi', 'uart', or 'command'.")
     cache_prepared = _env_bool("ZLC_SEQUENCER_CACHE_PREPARED", False)
     service = SequencerService(
         channels=channels,
@@ -293,10 +322,13 @@ def build_arg_parser() -> ArgumentParser:
     parser.add_argument(
         "--backend",
         default="jtag-axi",
-        choices=["jtag-axi", "command"],
-        help="Hardware backend. jtag-axi drives the final edge-table streamer over a "
-        "persistent Vivado hw_axi (JTAG-to-AXI) session; command shells out per action.",
+        choices=["jtag-axi", "uart", "command"],
+        help="Hardware backend. jtag-axi drives the edge-table streamer over a persistent Vivado "
+        "hw_axi (JTAG-to-AXI) session; uart drives the SAME engine over the fast-control serial "
+        "side-channel (~82 ms apply vs ~1 s); command shells out per action.",
     )
+    parser.add_argument("--uart-port", default=None, help="Serial port for --backend uart (e.g. COM3, /dev/ttyUSB1).")
+    parser.add_argument("--uart-baud", type=int, default=3_000_000, help="UART baud for --backend uart (default 3 Mbaud).")
     parser.add_argument(
         "--no-warm-start",
         action="store_true",
@@ -320,6 +352,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         command_timeout=args.command_timeout,
         backend=args.backend,
         warm_start=not args.no_warm_start,
+        uart_port=args.uart_port,
+        uart_baud=args.uart_baud,
     )
     return 0
 
