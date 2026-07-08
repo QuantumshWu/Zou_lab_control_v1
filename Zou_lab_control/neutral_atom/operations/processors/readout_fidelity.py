@@ -34,8 +34,11 @@ def readout_fidelity(readout) -> ProcessorSpec:
 
     Publishes per-site arrays (``fidelity_site``, ``fidelity_threshold``) for a
     ``sites`` map and the scalar summary (aggregate / mean / min fidelity, ...) for
-    the panel's numeric pane.  Writes the trained thresholds back into the session
-    calibration when ``store_thresholds`` is set."""
+    the panel's numeric pane.  This panel is a READ-ONLY CHECK by default: it must not
+    silently retrain the live readout just because you opened it to look at the numbers
+    (the live Judge-occupancy processor reads that same session calibration).  Turning
+    ``store_thresholds`` ON overwrites the session calibration's thresholds from this
+    folder -- but the deliberate threshold-storing flow is the Calibrate-readout task."""
 
     params = (
         ParamDecl("data_dir", "Frames folder", "path", default="", path_mode="dir",
@@ -48,7 +51,10 @@ def readout_fidelity(readout) -> ProcessorSpec:
                   tooltip="1-based index of the short readout within each group (1..shots_per_group)."),
         ParamDecl("train_fraction", "Train fraction", "float", default=0.9, lo=0.5, hi=0.99),
         ParamDecl("seed", "Seed", "int", default=0, lo=0, hi=1_000_000),
-        ParamDecl("store_thresholds", "Write thresholds back", "bool", default=True),
+        ParamDecl("store_thresholds", "Write thresholds back", "bool", default=False,
+                  tooltip="OFF by default: this panel is a read-only fidelity check.  Turn on ONLY to retrain "
+                          "and OVERWRITE the session calibration's thresholds from this folder -- it changes "
+                          "what the live readout uses (the Calibrate-readout task is the deliberate flow)."),
     )
 
     def run(ctx: ProcessorContext) -> dict:
