@@ -115,6 +115,24 @@ def test_writes_are_word_addressed_not_byte():
     assert fake.writes.get(scan_base) == 0x1234 and fake.writes.get(scan_base * 4) is None
 
 
+def test_fire_does_not_reupload_the_already_prepared_program():
+    """PERF REGRESSION: fire(program) must NOT re-upload a program that was JUST prepared.
+    SequencerService.fire() passes the already-prepared program to the backend's fire callback; a
+    blind ``self.prepare(program)`` there re-sent the ENTIRE BRAM image a second time on every fire
+    (~250 ms of redundant UART transport for a 2000-point scan -- HALF of fire's cost, on JTAG too).
+    Firing the resident program must be prepare-free (like ManualSequencer.fire); a DIFFERENT program
+    still (re)prepares."""
+    prog = _program()
+    sess, fake = _session()
+    sess.prepare(prog)
+    calls = []
+    orig = sess.prepare
+    sess.prepare = lambda p: (calls.append(getattr(p, "sequence_id", None)), orig(p))[1]  # spy
+    sess.fire(prog)                                    # fire the SAME prepared program (what the service does)
+    assert calls == [], "fire() re-uploaded the already-prepared program (double-upload bug)"
+    assert fake.writes.get(im.CtrlWords.COMMAND) == im.CMD_FIRE   # but it DID fire
+
+
 def test_pyserial_exchange_reads_incrementally_never_a_fixed_oversized_read():
     """PERF REGRESSION: PySerialTransport.exchange must read only what is AVAILABLE (in_waiting),
     NEVER a fixed large count.  pyserial's read(n) on a total-timeout port blocks the WHOLE timeout

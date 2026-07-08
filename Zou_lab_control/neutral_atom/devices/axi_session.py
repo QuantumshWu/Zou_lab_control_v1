@@ -662,7 +662,15 @@ class VivadoAxiStreamerSession:
         self._command(CMD_SAFE)
 
     def fire(self, program=None) -> None:
-        if program is not None:
+        # fire(program) is a prepare+fire convenience, but firing the program that was JUST prepared
+        # must NOT re-upload it.  SequencerService.fire() passes the already-prepared program down as
+        # this callback's argument, so a blind ``self.prepare(program)`` re-uploaded the ENTIRE BRAM
+        # image a SECOND time on every fire -- a full redundant program upload (~250 ms for a 2000-point
+        # scan, HALF of fire's cost, on BOTH UART and JTAG).  Only (re)prepare a program that actually
+        # DIFFERS from the resident one -- matching ManualSequencer.fire's "already-prepared -> just
+        # fire" contract; a genuine fire(new_program) still prepares.
+        prepared = getattr(self, "_program", None)
+        if program is not None and (prepared is None or program.sequence_id != prepared.sequence_id):
             self.prepare(program)
         # finite-streaming cursor state lives on the instance so wait_done is
         # re-entrant (a second call resumes the refill instead of reloading chunk 2
