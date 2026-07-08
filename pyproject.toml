@@ -18,6 +18,7 @@ dependencies = [
     "nbformat",
     "notebook",
     "numpy",
+    "pyserial",
     "PyQt5-Frameless-Window",
     "PyQt5",
     "rpyc",

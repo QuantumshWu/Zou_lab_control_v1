@@ -5,6 +5,7 @@ matplotlib
 nbconvert
 nbformat
 numpy
+pyserial   # UART fast-control side-channel transport (real-hardware --backend uart/auto)
 rpyc
 scipy
 
