@@ -157,3 +157,19 @@ def test_read_reply_parses_layout_and_status():
 def test_crc16_ccitt_known_answer():
     """CRC-16/CCITT-FALSE reference vector: '123456789' -> 0x29B1 (locks the poly/seed against drift)."""
     assert uf.crc16_ccitt(b"123456789") == 0x29B1
+
+
+def test_count_zero_frame_commits_nothing_and_acks():
+    """A protocol-legal count==0 WRITE (COUNT is a 16-bit field, 0 is representable) must commit NO
+    words and reply an ACK -- the contract the RTL bridge's D_CRC count==0 branch now matches (it
+    guards the ``w_idx==f_count-1`` underflow that would else drive 65536 spurious writes across the
+    whole register/BRAM map).  The READ count==0 replies with an empty payload."""
+    model = UartBridgeModel()
+    model.regfile[7] = 0xDEADBEEF                       # a pre-existing word must survive untouched
+    frame = uf.encode_write(0, [], seq=3)               # count == 0 WRITE at base 0
+    events = [ev for ev in model.feed(frame) if ev is not None]
+    assert model.regfile == {7: 0xDEADBEEF}             # scribbled NOTHING
+    assert events and events[-1].op == "write" and events[-1].ok and events[-1].count == 0
+    read0 = uf.encode_read(0, 0, seq=4)                 # count == 0 READ
+    revs = [ev for ev in UartBridgeModel().feed(read0) if ev is not None]
+    assert revs and revs[-1].op == "read" and revs[-1].ok and revs[-1].count == 0 and revs[-1].values == []

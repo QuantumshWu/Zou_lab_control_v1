@@ -162,7 +162,16 @@ module zlc_uart_bridge #(
                                  if (crc_bytes==2'd0) begin crc_rx[7:0]<=rx_byte; crc_bytes<=1; end
                                  else begin
                                      if ({rx_byte, crc_rx[7:0]}==crc_run) begin
-                                         if (f_op==OP_WRITE) begin w_idx<=0; dst<=D_COMMIT; end
+                                         if (f_count==16'd0) begin
+                                             // A protocol-legal count==0 frame commits / reads NOTHING and
+                                             // ACKs with count 0 (matches the Python oracle UartBridgeModel).
+                                             // No u_we is asserted, so u_active drops now.  This guards the
+                                             // `w_idx==f_count-1` / `rd_i==f_count-1` UNDERFLOW (0-1==0xFFFF)
+                                             // that would else loop D_COMMIT/D_RLAT 65536 times, scribbling
+                                             // the whole register/BRAM map.
+                                             rpl_seq<=f_seq; rpl_count<=16'd0; rpl_go<=1'b1;
+                                             dst<=D_HUNT; u_active<=1'b0;
+                                         end else if (f_op==OP_WRITE) begin w_idx<=0; dst<=D_COMMIT; end
                                          else begin rd_i<=0; dst<=D_READ; end
                                      end else begin dst<=D_HUNT; u_active<=1'b0; end   // bad CRC -> commit nothing
                                  end end
