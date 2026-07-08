@@ -140,60 +140,58 @@ class ParamWidgetContext:
         return coerce_short_labels(self.labels_provider)
 
 
-#: Minimum spacing between two live "apply on edit" writes of the SAME key (ms).  200 ms = at most
-#: 5 writes/second, matching the device viewer's 200 ms read-back poll: a mouse-wheel scroll on a
-#: spin box in "Live" mode fires a valueChanged per tick, and an EXPENSIVE / blocking apply (a live
-#: device set-point) on every one of those can wedge the GUI -- this caps the rate.  A module-level
-#: constant (the repo's *_DEBOUNCE_MS convention) so it stays a single source.
-LIVE_WRITE_MIN_INTERVAL_MS = 200
+#: Quiet window (ms) a live "apply on edit" write waits for the scroll to SETTLE before it fires.  A
+#: mouse-wheel scroll on a spin box emits a valueChanged per tick; for a DEVICE set-point each tick is a
+#: physical write, and the hardware must not sweep through every intermediate value on the way to the
+#: target -- so the write is deferred until the scroll stops.  200 ms matches the device viewer's 200 ms
+#: read-back poll.  Module-level (the repo's *_DEBOUNCE_MS convention) so it stays a single source.
+LIVE_WRITE_DEBOUNCE_MS = 200
 
 
-class RateLimitedApply:
-    """Rate-limit an ``(key, value) -> None`` apply-on-edit callback -- LEADING + TRAILING, per key.
+class DebouncedApply:
+    """Debounce an ``(key, value) -> None`` apply-on-edit callback -- TRAILING only, per key.
 
-    A fast mouse-wheel scroll fires ``valueChanged`` per tick; routing an expensive / blocking apply
-    (a live device write, a re-render) through every one can freeze the GUI.  This wraps such a
-    callback so, PER KEY: the FIRST edit applies immediately (responsive -- you see the value move),
-    further edits within ``interval_ms`` are coalesced, and the LATEST value is applied when the
-    window elapses.  A pure trailing debounce (the repo's ``*_DEBOUNCE_MS`` timers) would give no live
-    feedback until the scroll stops; a pure leading throttle would DROP the final value.  Leading +
-    trailing gives both: at most one apply per window AND the final value always lands.
+    A fast mouse-wheel scroll on a spin box fires ``valueChanged`` per tick.  For a DEVICE set-point each
+    tick is a physical write, and you do NOT want the hardware to move through every intermediate value on
+    the way to where the user is scrolling.  So this holds the write until the scroll SETTLES: each edit
+    (re)arms a per-key ``debounce_ms`` timer with the latest value, and the value reaches the device only
+    once that timer fires with no newer edit -- ``滚轮停下才写``.  The spin box still shows the value
+    moving live (its own display); only the device write waits for the user to settle.
 
-    Timers are parented to ``parent`` so they die with it; :meth:`flush` applies any pending values
-    NOW (teardown / an explicit Apply / a test that must observe the trailing edge without pumping the
-    event loop).  Reusable: any apply-on-edit path can wrap its callback in this."""
+    Timers are parented to ``parent`` so they die with it; :meth:`flush` applies any pending value NOW
+    (teardown / an explicit Apply / a test that must observe the write without pumping the event loop).
+    Reusable: any apply-on-edit path that drives an expensive / physical side effect can wrap its
+    callback in this."""
 
     def __init__(self, apply: Callable[[str, Any], None], *, parent: QtCore.QObject,
-                 interval_ms: int = LIVE_WRITE_MIN_INTERVAL_MS) -> None:
+                 debounce_ms: int = LIVE_WRITE_DEBOUNCE_MS) -> None:
         self._apply = apply
         self._parent = parent
-        self._interval_ms = max(1, int(interval_ms))
-        self._pending: dict = {}        # key -> latest value awaiting the trailing edge
-        self._timers: dict = {}         # key -> its single-shot QTimer (window open while active)
+        self._debounce_ms = max(1, int(debounce_ms))
+        self._pending: dict = {}        # key -> latest value awaiting the settle
+        self._timers: dict = {}         # key -> its single-shot QTimer (RE-ARMED on every edit)
 
     def __call__(self, key, value) -> None:
+        self._pending[key] = value                       # keep only the latest -- nothing reaches the device yet
         timer = self._timers.get(key)
-        if timer is None or not timer.isActive():
-            self._apply(key, value)                      # leading edge: apply now, open the window
-            if timer is None:
-                timer = QtCore.QTimer(self._parent)
-                timer.setSingleShot(True)
-                timer.timeout.connect(lambda k=key: self._flush_key(k))
-                self._timers[key] = timer
-            self._pending.pop(key, None)
-            timer.start(self._interval_ms)
-        else:
-            self._pending[key] = value                   # inside the window: keep only the latest
+        if timer is None:
+            timer = QtCore.QTimer(self._parent)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda k=key: self._fire(k))
+            self._timers[key] = timer
+        timer.start(self._debounce_ms)                   # (re)arm: a scroll that keeps moving keeps deferring the write
 
-    def _flush_key(self, key) -> None:
-        if key in self._pending:
-            self._apply(key, self._pending.pop(key))     # trailing edge: apply the final value
-            self._timers[key].start(self._interval_ms)   # there was activity -> keep the window open
-        # else the window closes; the next edit is a fresh leading edge
+    def _fire(self, key) -> None:
+        if key in self._pending:                         # settled -> the final value lands, exactly ONCE
+            self._apply(key, self._pending.pop(key))
 
     def flush(self) -> None:
-        """Apply every pending trailing value immediately (teardown / explicit Apply / a test)."""
+        """Apply every pending value immediately (teardown / explicit Apply / a test), stopping any armed
+        timer so a settled write cannot then fire a second time."""
         for key in list(self._pending):
+            timer = self._timers.get(key)
+            if timer is not None:
+                timer.stop()
             self._apply(key, self._pending.pop(key))
 
 

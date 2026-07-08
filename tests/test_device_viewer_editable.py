@@ -78,8 +78,8 @@ def test_live_switch_writes_on_edit_without_apply(qt):
 
         switch.setChecked(True)                   # engage Live -> commits the value shown now
         assert float(cam.exposure) == start * 2
-        handler.write(widget, start * 3)          # now each edit (e.g. a wheel tick) writes live
-        page._flush_live()                        # drain the rate limiter's trailing edge (no loop pump)
+        handler.write(widget, start * 3)          # now each edit (e.g. a wheel tick) is a live write, debounced
+        page._flush_live()                        # settle the debounce -> the value reaches the device (no loop pump)
         assert float(cam.exposure) == start * 3
 
         switch.setChecked(False)                  # leaving Live re-buffers
@@ -90,11 +90,11 @@ def test_live_switch_writes_on_edit_without_apply(qt):
         exp.close()
 
 
-def test_live_writes_are_rate_limited_leading_plus_trailing(qt):
-    """Live "scroll to set" writes are RATE-LIMITED so a fast mouse-wheel scroll can not flood a
-    blocking device write: many rapid edits in one window produce FAR fewer device writes than edits,
-    the FIRST edit applies immediately (leading -- responsive), and after the window flushes the device
-    holds the FINAL scrolled value (trailing -- never lost)."""
+def test_live_writes_debounce_until_the_scroll_settles(qt):
+    """Live "scroll to set" writes are DEBOUNCED at the widget layer: a fast mouse-wheel scroll writes
+    NOTHING to the device until it SETTLES (滚轮停下才写), so the hardware never sweeps through every
+    intermediate value on the way to the target set-point.  Only when the debounce fires (here forced via
+    flush, so the test needs no event-loop pump) does the FINAL scrolled value reach the device, once."""
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.frontend.device_manager import _DeviceControlPage
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
@@ -105,16 +105,15 @@ def test_live_writes_are_rate_limited_leading_plus_trailing(qt):
         page._live_switches["exposure"].setChecked(True)      # Live ON
 
         base = float(cam.exposure)
-        rapid = [base * (1.0 + 0.01 * i) for i in range(1, 21)]   # 20 rapid "wheel ticks" in ONE window
+        rapid = [base * (1.0 + 0.01 * i) for i in range(1, 21)]   # 20 rapid "wheel ticks" mid-scroll
         observed = []
         for v in rapid:
             handler.write(widget, v)                          # a wheel tick (no event-loop pump here)
             observed.append(float(cam.exposure))
 
-        assert observed[0] == rapid[0]              # leading edge: the FIRST tick applied at once
-        assert set(observed) == {rapid[0]}          # rate-limited: every later tick was coalesced (no write)
-        page._flush_live()                          # close the window
-        assert float(cam.exposure) == rapid[-1]     # trailing edge: the FINAL scrolled value lands
+        assert set(observed) == {base}              # debounce: NOT ONE mid-scroll tick reached the device
+        page._flush_live()                          # scroll settled -> write the final value now
+        assert float(cam.exposure) == rapid[-1]     # the FINAL scrolled value lands, exactly once
     finally:
         exp.close()
 
