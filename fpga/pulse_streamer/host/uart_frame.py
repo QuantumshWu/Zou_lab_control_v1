@@ -26,6 +26,7 @@ for that pair.
 from __future__ import annotations
 
 import binascii
+import struct
 from typing import Sequence
 
 # --------------------------------------------------------------------------- constants
@@ -93,7 +94,10 @@ def encode_write(word_addr: int, values: Sequence[int], *, seq: int = 0) -> byte
     word port one word at a time), so the old AXI 4 KB scan glitch cannot recur."""
     vals = list(values)
     body = bytes((OP_WRITE, seq & 0xFF)) + _u32(word_addr) + _u16(len(vals))
-    body += b"".join(_u32(v) for v in vals)
+    # One C-level struct.pack of all payload words instead of a per-word ``_u32`` join -- BYTE-
+    # IDENTICAL (``_u32(v)`` == little-endian ``v & MASK32``; struct '<I' takes the masked unsigned)
+    # but ~10x faster over a full 16507-word image, the last big chunk of the UART frame-build cost.
+    body += struct.pack("<%dI" % len(vals), *(v & MASK32 for v in vals))
     return _frame(body)
 
 
