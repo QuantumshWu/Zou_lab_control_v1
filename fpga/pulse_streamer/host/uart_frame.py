@@ -47,6 +47,12 @@ HDR_LEN = 10          # SYNC0 SYNC1 OP SEQ ADDR[4] COUNT[2]  (before PAYLOAD)
 CRC_LEN = 2
 MASK32 = 0xFFFFFFFF
 
+# Max data words in ONE WRITE frame.  == the RTL bridge's frame buffer depth: the bridge buffers a
+# whole frame, verifies CRC, and ONLY THEN commits (so a corrupt frame commits NOTHING -- RTL matches
+# the Python model exactly).  The host splits a program upload into runs of <= this; at 3 Mbaud a
+# 256-word frame is ~1 KB ~0.34 ms, so a 24 KB program is ~24 frames ~82 ms (framing overhead tiny).
+MAX_FRAME_WORDS = 256
+
 
 class FrameError(ValueError):
     """A malformed / CRC-failing / truncated frame."""
@@ -133,7 +139,7 @@ def reply_frame_len(count: int) -> int:
 
 
 # --------------------------------------------------------------------------- run coalescing
-def coalesce_runs(pairs: Sequence[tuple[int, int]], *, max_words: int = 4096) -> list[tuple[int, list[int]]]:
+def coalesce_runs(pairs: Sequence[tuple[int, int]], *, max_words: int = MAX_FRAME_WORDS) -> list[tuple[int, list[int]]]:
     """Merge strictly word-contiguous (stride-1) ``(word_addr, value)`` entries -- IN ORDER, never
     globally sorted -- into ``(base, [values])`` runs, capped at ``max_words`` words per run (one
     frame's payload).  The UART analogue of the AXI ``_burst_runs`` coalescer, but stride-1 words with
