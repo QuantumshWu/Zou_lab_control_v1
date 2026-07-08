@@ -55,7 +55,7 @@ zf.plot(np.column_stack([xx.ravel(), yy.ravel()]), frame.ravel(),
 
 控制台是**解耦**的：plot 面板是纯视图，只有**连了 signal 且产它的节点在跑**才显示数据。所以这张 2D 面板用 `source="value = frame_0"` 显式连到 `frame`（source 是一行赋给 `value` 的 Python，等价于在 Setting 里把 signal 槽选成 `frame_0`），并把相机 measurement 节点交给 `running_nodes=`（开窗即自动 `start`）。
 
-`%gui qt` 让 Jupyter 在 cell 之间替 Qt 窗口跑事件循环（看板的刷新 timer 才会动）；抓帧在节点的后台线程里，经线程安全的 `SignalHub` 交给看板。`rate_hz` 是抓帧节奏，真正多快还受触发频率 + 曝光限制。
+`%gui qt` 让 Jupyter 在 cell 之间替 Qt 窗口跑事件循环（看板的刷新 timer 才会动）；抓帧在节点的后台线程里，经线程安全的 `SignalHub` 交给看板。`start()` 不带速率参数——**采集按硬件全速跑**（多快由触发频率 + 曝光决定，不设人为上限）；看板多久重画一次是**另一回事**，由每个面板自己的 `update_ms` 节流，和采集环解耦。
 
 <!-- cell:code -->
 %gui qt
@@ -64,7 +64,7 @@ from Zou_lab_control.neutral_atom.core.signals import SignalHub
 from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
 
 hub = SignalHub()
-node = CameraMeasurement(hub, cam).start(rate_hz=4)
+node = CameraMeasurement(hub, cam).start()
 
 state = zf.TaskConsoleState(
     name="qcmos_live",

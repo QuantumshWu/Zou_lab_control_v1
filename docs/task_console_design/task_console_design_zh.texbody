@@ -650,7 +650,7 @@ cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer)
 # 3) detect processor：逐帧 frame -> occupied/counts/rate（跑真 calibration.detect）
 detect = OccupancyProcessor(hub, calibration=cal.calibration, grid_shape=(5, 7))
 
-cam.start(rate_hz=5.0); detect.start(rate_hz=5.0)
+cam.start(); detect.start()   # 采集按硬件全速;显示节流是看板 update_ms 的事,不在采集环
 console = zf.show_task_console(hub=hub, running_nodes=[cam, detect])
 \end{codeblock}
 \pyapi{running\_nodes=[...]} 把节点登记到控制台并在开窗时自动 \pyapi{start}（每节点自己 Logic Edit 的 Start/Stop 管理它的生命周期）。\tfocus{没有一键复合体}（没有 \pyapi{build\_loading\_readout}、没有 "Readout: Loading" 复合节点）——三个节点独立、信号显式相连。GUI 里同样：\pyapi{Measurement: Camera (live frames)} + \pyapi{Processor: Judge occupancy} + \pyapi{Task: Calibrate readout}（\pyapi{Judge occupancy} 的 \pyapi{calibration} 留空即用会话标定，或填 calibrate task 存出的路径）。\tfocus{线程安全}:\pyapi{shot()} 只产数据、\pyapi{publish} 负责拷贝,GUI 在另一线程读副本——节点可放心复用缓冲。阻塞式硬件采集放在节点线程,绝不放 UI 线程。

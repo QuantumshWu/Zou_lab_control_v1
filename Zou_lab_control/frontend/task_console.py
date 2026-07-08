@@ -7006,7 +7006,7 @@ class TaskConsole(QtWidgets.QWidget):
         # streams under the new params.  start() is idempotent, so a node that is
         # already running just keeps its loop (the edit was queued above).
         if not getattr(node, "running", False) and hasattr(node, "start"):
-            node.start(rate_hz=getattr(node, "rate_hz", 5.0))
+            node.start()
         return node
 
     def _edit_card(self, card: "PanelCard") -> None:
@@ -7363,7 +7363,7 @@ class TaskConsole(QtWidgets.QWidget):
     def _start_logic_node(self, row: "LogicNodeRow") -> None:
         """Build the node FROM the node's current param-form values with display
         SUPPRESSED (it only publishes to the hub -- never opens a matplotlib plot),
-        register it in ``self.running_nodes``, and ``node.start(rate_hz=...)``.  Sets
+        register it in ``self.running_nodes``, and ``node.start()`` (data-paced).  Sets
         the node's status dot green; on build/run error -> red + the error on the status
         line.  Reuses the SAME node-build paths the real readout / notebook use."""
         if self._task_locked:
@@ -7436,7 +7436,7 @@ class TaskConsole(QtWidgets.QWidget):
         if not self._timer.isActive():
             self._timer.start()
         try:
-            node.start(rate_hz=getattr(node, "rate_hz", 5.0))
+            node.start()
         except Exception as exc:
             row.set_state("error", status=f"start failed: {str(exc).splitlines()[0][:80]}")
             if editor is not None:
@@ -8285,12 +8285,12 @@ def show_task_console(
     # A passed-in node should stream the moment the window opens -- so the Monitor
     # is live without the caller having to remember node.start().  start() is
     # idempotent, so a node the caller already started (e.g. bring-up's
-    # readout.start(rate_hz=4)) keeps its own rate; only NON-running nodes
-    # are launched here.  (TaskConsole.__init__ deliberately does NOT do this, so
+    # readout.start()) keeps its own loop; only NON-running nodes are launched
+    # here.  (TaskConsole.__init__ deliberately does NOT do this, so
     # tests/notebooks keep deterministic manual stepping.)
     for node in running_nodes:
         if not getattr(node, "running", False) and hasattr(node, "start"):
-            node.start(rate_hz=getattr(node, "rate_hz", 5.0))
+            node.start()
     # Closing the window must stop the node owner threads (else they keep running, blocked in
     # camera.acquire holding the camera / RPyC link, wedging the kernel).  The console is a CHILD
     # of the window so its own closeEvent never fires on a window close -- we wire the window's

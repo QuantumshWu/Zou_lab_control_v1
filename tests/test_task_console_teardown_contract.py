@@ -38,14 +38,12 @@ def _offscreen(monkeypatch):
 class _FakeNode:
     """Minimal node: records start/stop the way the real owner-thread node would."""
 
-    rate_hz = 5.0
-
     def __init__(self):
         self.running = False
         self.starts = 0
         self.stops = 0
 
-    def start(self, rate_hz=5.0):
+    def start(self):
         self.running = True
         self.starts += 1
         return self

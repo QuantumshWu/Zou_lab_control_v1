@@ -41,7 +41,7 @@ class _LogicNode:
     def published_signals(self):
         return self._signals
 
-    def start(self, rate_hz=5.0):
+    def start(self):
         self.running = True
         return self
 

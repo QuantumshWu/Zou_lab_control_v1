@@ -72,7 +72,7 @@ hub = SignalHub()
 camera = exp.readout.camera_measurement(hub)          # CameraMeasurement:只发 frame
 calibration = exp.readout.require(thresholds=True)    # 上面 sitemap/thresholds 标定出的 TrapCalibration
 detect = OccupancyProcessor(hub, calibration=calibration, grid_shape=(5, 7))  # 逐帧真 detect
-camera.start(rate_hz=4); detect.start(rate_hz=4)      # 相机产 frame、detect 逐帧消费(reactive)
+camera.start(); detect.start()                       # 相机产 frame、detect 逐帧消费(reactive);采集按硬件全速,不设速率上限
 show_task_console(hub=hub, running_nodes=[camera, detect],
                   measurements=exp.readout.measurement_specs())
 ```

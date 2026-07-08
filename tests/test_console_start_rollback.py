@@ -90,7 +90,6 @@ def test_failed_start_registers_nothing_and_keeps_old_signals():
 
         class _DeadNode(_FakeInjected):
             instance_label = ""
-            rate_hz = 5.0
 
             def start(self, **k):
                 raise RuntimeError("wedged device")

@@ -55,7 +55,7 @@ def test_idle_apply_bumps_epoch_and_publishes_synchronously():
 def test_running_apply_advances_epoch_only_when_new_param_frame_is_published():
     hub = SignalHub()
     node = _EchoNode(hub)
-    node.start(rate_hz=100.0)
+    node.start()
     try:
         epoch0 = node.acquisition_epoch()
         node.apply_acquisition_parameters(v=9)    # running: QUEUED, applied between shots

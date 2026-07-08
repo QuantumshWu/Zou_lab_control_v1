@@ -24,7 +24,12 @@ run on a ``VirtualCamera`` offline and on a real qCMOS -- only the data source
 changes.  That is the "virtual == real" core principle (AGENTS.md §2).
 
 Logic nodes run either synchronously (call ``step()`` yourself: deterministic tests)
-or in a background thread (``start(rate_hz)``); the hub is the only shared state.
+or in a background thread (``start()``); the hub is the only shared state.  The
+background loop is DATA-paced, NEVER rate-capped: a shot that acquires publishes and
+loops straight into the next (a blocking device read / the hardware sets the real
+cadence), so a scan or a fast readout runs at full hardware speed.  Display refresh
+throttling belongs to the CONSUMER (the task console's per-panel ``update_ms``), not
+here -- the acquisition loop must not be slowed to a display rate.
 """
 
 from __future__ import annotations
@@ -44,6 +49,14 @@ from ..core.signals import NO_LINEAGE, SignalHub
 from ..devices.base import CameraDevice
 from .measurement import triggered_frames
 from .signal_expr import DEFAULT_SOURCE, SignalExpr, hub_namespace
+
+# The background loop's ONLY two time constants -- and NEITHER is an acquisition-rate cap.  A pass that
+# published (an acquiring measurement, a reactive processor whose input advanced) loops immediately, so
+# its cadence comes from the blocking device read / the hardware, never from a throttle here.
+_IDLE_POLL_S = 0.05     # a pass that published NOTHING (a reactive processor whose input has not advanced,
+                        # or a self-finished node) waits this before re-checking, so it does not hot-spin.
+_ERROR_BACKOFF_S = 0.2  # after a shot raises, wait this before retrying, so a wedged source does not spin
+                        # the error banner.
 
 
 @dataclass(frozen=True)
@@ -300,8 +313,14 @@ class LogicNode:
         # ``provenance_snapshot()`` (captured on first read, then cached), so this hot path stays clean.
         return named
 
-    def start(self, *, rate_hz: float = 5.0) -> "LogicNode":
-        """Publish shots from a daemon thread at ``rate_hz`` until ``stop()``."""
+    def start(self) -> "LogicNode":
+        """Publish shots from a daemon thread AS FAST AS THE HARDWARE ALLOWS until ``stop()``.
+
+        The loop is DATA-paced, never rate-capped: an acquiring shot blocks on the device read and loops
+        straight into the next, so a scan / fast readout runs at full hardware speed.  A pass that
+        publishes nothing (a reactive processor whose input has not advanced, or a self-finished node)
+        idles a short :data:`_IDLE_POLL_S` slice so it does not hot-spin.  Display-rate throttling is the
+        CONSUMER's job (the console's per-panel ``update_ms``), NOT this loop's."""
         if self._thread is not None and self._thread.is_alive():
             return self
         # The _devices declaration must point at REAL attributes: a declared name that does
@@ -312,21 +331,18 @@ class LogicNode:
             raise AttributeError(
                 f"{type(self).__name__}._devices declares {missing} but the attribute(s) do "
                 "not exist -- the declaration must name the node's real device attributes.")
-        self.rate_hz = float(rate_hz)   # remembered so a paused node can resume at the same rate
         # Capture the run's provenance ONCE, at the moment this run begins -- the device base-state a
         # saved figure records.  Re-captured on every ``start()`` (a fresh run = a fresh base state),
         # then held CONSTANT for the whole run (start -> stop), so every figure saved during the run
         # carries the same "what the apparatus was doing" record, and a stopped run keeps its last one.
         self.refresh_provenance()
         self._stop.clear()
-        period = 1.0 / max(0.1, float(rate_hz))
 
         def _loop() -> None:
             while not self._stop.is_set():
-                started = time.monotonic()
                 try:
                     applied = self._apply_pending_params()   # owner thread applies edits BETWEEN shots
-                    self.step()
+                    did_work = bool(self.step())             # {} -> reactive no-op / finished: nothing published
                     if applied:
                         # the just-published frame is the FIRST computed with the edited
                         # params -- mark the epoch so a waiting GUI re-snapshots THIS frame
@@ -342,15 +358,18 @@ class LogicNode:
                     # "(unbound)" signal in every picker, #5).
                     self.last_error = f"{type(exc).__name__}: {exc}"
                     self.consecutive_errors += 1
-                    self._stop.wait(period)
+                    self._stop.wait(_ERROR_BACKOFF_S)
                     continue
                 if self.consecutive_errors:
                     # Recovered: clear the banner so a transient hiccup doesn't stick.
                     self.last_error = None
                     self.consecutive_errors = 0
-                remaining = period - (time.monotonic() - started)
-                if remaining > 0:
-                    self._stop.wait(remaining)
+                if not did_work:
+                    # Nothing to publish this pass: a reactive processor whose input has not advanced, or a
+                    # node that has finished but not yet been reaped.  Idle a short slice so we do NOT spin
+                    # the CPU -- this is the ONLY sleep, and it fires ONLY when there is no data to move.  A
+                    # pass that DID publish never sleeps: the blocking device read paces it (hardware speed).
+                    self._stop.wait(_IDLE_POLL_S)
 
         self._thread = threading.Thread(target=_loop, name=f"zlc-node-{self.prefix or 'main'}", daemon=True)
         self._thread.start()

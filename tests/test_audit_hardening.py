@@ -56,7 +56,7 @@ def test_wedged_node_surfaces_error_not_silent():
         def shot(self):
             raise RuntimeError("trigger never arrived")
 
-    node = BoomNode(hub).start(rate_hz=50)
+    node = BoomNode(hub).start()
     try:
         deadline = time.monotonic() + 2.0
         while node.last_error is None and time.monotonic() < deadline:

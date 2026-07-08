@@ -279,7 +279,7 @@ def test_temperature_node_start_thread_auto_stops_when_scan_completes():
     hub = SignalHub()
     node, spec = _temperature_node(exp, hub, points=4, shots=2, t_max_us=80.0)
 
-    node.start(rate_hz=50.0)
+    node.start()
     deadline = time.perf_counter() + 10.0
     while node.running and time.perf_counter() < deadline:
         time.sleep(0.02)
@@ -531,7 +531,7 @@ def test_running_node_applies_params_in_owner_thread_no_concurrent_acquire():
     hub = SignalHub()
     cam = _BlockingCam()
     cam_node = na.CameraMeasurement(hub, cam)
-    cam_node.start(rate_hz=40.0)
+    cam_node.start()
     try:
         deadline = time.monotonic() + 2.0
         while cam_node.shots < 2 and time.monotonic() < deadline:
