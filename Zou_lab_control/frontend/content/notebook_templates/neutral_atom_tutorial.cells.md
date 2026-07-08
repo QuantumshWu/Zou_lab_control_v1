@@ -62,8 +62,20 @@ neutral_atom/
 
 每个 subsystem 调用都返回 result object，而不是只返回裸 array。result object 保留 raw data、plot handle 和一个小的 `summary()` dict。`summary()` 是给 notebook 快速查看、GUI 状态栏、JSON log 和测试断言用的轻量状态摘要；真正分析时仍然读 `result.images`、`result.counts`、`result.occupied` 或 `result.calibration`。
 
+<!-- cell:markdown -->
+## Init devices
+
+**默认初始化入口 = `na.device_manager("virtual")`**：打开设备管理器 GUI(config 编辑器),传 `"virtual"` **自动载入虚拟设备图**;点绿色 **Init devices** 就 `na.connect` 这份 config,连出的 session 经窗口交回 `mgr.session`。换实机时在这里把相机类型从 `virtual` 换成 `qcmos`(或 Load 一份实机 config),下面的分析代码一行都不用动。
+
+不想开 GUI 时,等价的一行 `na.connect("virtual", ...)` 直连——下面第二格就是这个回落分支,并显式带上本教程下游用到的 5×7 sitemap 参数。
+
 <!-- cell:code -->
-exp = na.connect(
+mgr = na.device_manager("virtual")
+
+<!-- cell:code -->
+# GUI 里点过 "Init devices" 后,session 经窗口交回 mgr.session;没开 GUI(或还没点 Init)
+# 时回落到等价的一行直连,并显式带上本教程下游用到的 5×7 sitemap 参数。
+exp = mgr.session or na.connect(
     "virtual",
     bright_count_rate=3000,
     loss_rate=0.1,
