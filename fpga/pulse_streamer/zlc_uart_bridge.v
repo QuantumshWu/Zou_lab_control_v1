@@ -113,7 +113,7 @@ module zlc_uart_bridge #(
 
     // ---------------------------------------------------------------- decoder FSM
     localparam D_HUNT=4'd0, D_SYNC1=4'd1, D_OP=4'd2, D_SEQ=4'd3, D_ADDR=4'd4, D_CNT=4'd5,
-               D_DATA=4'd6, D_CRC=4'd7, D_COMMIT=4'd8, D_READ=4'd9, D_RLAT=4'd10;
+               D_DATA=4'd6, D_CRC=4'd7, D_COMMIT=4'd8, D_READ=4'd9, D_RLAT=4'd10, D_WEND=4'd11;
     reg [3:0]  dst;
     reg [7:0]  f_op, f_seq;
     reg [31:0] f_addr, word_acc;
@@ -173,9 +173,14 @@ module zlc_uart_bridge #(
                                  u_we        <= 1'b1;
                                  if (w_idx==f_count-1) begin
                                      rpl_seq<=f_seq; rpl_count<=16'd0; rpl_go<=1'b1;   // ACK (count 0) -> host retries on timeout
-                                     dst<=D_HUNT; u_active<=1'b0;
+                                     dst<=D_WEND;                                      // hold u_active 1 more cycle (see D_WEND)
                                  end else w_idx<=w_idx+1'b1;
                               end
+                    // The LAST word's u_we (asserted in D_COMMIT via non-blocking) actually drives the
+                    // write THIS cycle -- so u_active MUST still be high now, or the top's uart_sel=u_active
+                    // priority mux routes the write to the idle JTAG side and DROPS it (every write frame
+                    // would lose its last word; a 1-word write loses everything).  Retire only after it lands.
+                    D_WEND:  begin dst<=D_HUNT; u_active<=1'b0; end
                     // --- READ: request word rd_i, latch it next cycle into wbuf, then reply ---
                     D_READ:  begin u_rd_word <= f_addr[5:0] + rd_i[5:0]; u_rd_req<=1'b1; dst<=D_RLAT; end
                     D_RLAT:  begin
