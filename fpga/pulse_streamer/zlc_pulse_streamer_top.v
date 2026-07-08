@@ -60,6 +60,11 @@ module zlc_pulse_streamer_top #(
                                                 // than TTL to fit LUT; = streamer_config.json bus_evt_fifo_depth)
 )(
     input  wire clk,
+    // UART fast-control side-channel (assign to FT2232 ch-B pins, or an external USB-UART on 2 spare
+    // pins, in board.xdc).  Writes the SAME region_bases map as JTAG-to-AXI -- a byte-identical
+    // transport swap for ~82 ms program apply / ~sub-ms scan-step vs ~1 s over Vivado-Tcl JTAG.
+    input  wire uart_rx,
+    output wire uart_tx,
     output wire [1:0] led,
     output wire cooling, output wire cooling_pgc, output wire repump, output wire probe,
     output wire pushout, output wire state_pre, output wire trig, output wire coil,
@@ -200,8 +205,27 @@ module zlc_pulse_streamer_top #(
     wire [31:0] bram_dina;
     reg  [31:0] bram_douta;          // read mux back to AXI
 
-    wire [29:0] word_addr = bram_addra[31:2];
-    wire        wr = |bram_wea;
+    // --- UART fast-control bridge + write-side MUX (before the region decode) ----------------
+    // The bridge decodes serial frames into (u_word_addr, u_wdata, u_we) writes to the SAME flat
+    // word map.  It and JTAG-AXI are never used simultaneously (JTAG = bring-up/ILA, UART = runtime),
+    // so a priority mux (UART wins when u_active) is correct + free; a UART write is byte-for-byte a
+    // JTAG write to the same word (only the operands are re-sourced, decode/timing unchanged).
+    wire [29:0] u_word_addr; wire [31:0] u_wdata; wire u_we, u_active;
+    wire [5:0]  u_rd_word;   wire u_rd_req; reg [31:0] u_rd_data;
+    reg  [3:0]  uart_por = 4'h0;                            // power-on reset, independent of eng_reset
+    always @(posedge clk) if (uart_por != 4'hF) uart_por <= uart_por + 1'b1;
+    wire uart_rst = (uart_por != 4'hF);
+    zlc_uart_bridge #(.CLK_HZ(50_000_000), .BAUD(3_000_000)) zlc_uart_i (
+        .clk(clk), .rst(uart_rst), .uart_rx(uart_rx), .uart_tx(uart_tx),
+        .u_word_addr(u_word_addr), .u_wdata(u_wdata), .u_we(u_we), .u_active(u_active),
+        .u_rd_word(u_rd_word), .u_rd_req(u_rd_req), .u_rd_data(u_rd_data)
+    );
+    wire        uart_sel  = u_active;
+    wire [29:0] word_addr = uart_sel ? u_word_addr : bram_addra[31:2];
+    wire [31:0] wdata_mux = uart_sel ? u_wdata     : bram_dina;
+    wire        ena_mux   = uart_sel ? u_we        : bram_ena;
+    wire [3:0]  wea_mux   = uart_sel ? (u_we ? 4'hF : 4'h0) : bram_wea;
+    wire        wr        = |wea_mux;
 
     // region selects (combinational decode of the word address)
     wire sel_ctrl  = (word_addr >= R_CTRL_BASE)  && (word_addr < R_TICK_BASE);
@@ -260,9 +284,9 @@ module zlc_pulse_streamer_top #(
     reg ldr_cmd_clear;          // loader acks a command by clearing C_COMMAND
 
     always @(posedge clk) begin
-        if (bram_ena && wr && sel_ctrl) ctrl_reg[word_addr[5:0]] <= bram_dina;
-        if (bram_ena && wr && sel_delay && (delay_word_off < DELAY_REG_COUNT))
-            delay_reg[delay_word_off[6:0]] <= bram_dina;
+        if (ena_mux && wr && sel_ctrl) ctrl_reg[word_addr[5:0]] <= wdata_mux;
+        if (ena_mux && wr && sel_delay && (delay_word_off < DELAY_REG_COUNT))
+            delay_reg[delay_word_off[6:0]] <= wdata_mux;
         if (ldr_status_we) ctrl_reg[C_STATUS] <= ldr_status_val;
         if (ldr_cmd_clear) ctrl_reg[C_COMMAND] <= 32'b0;
         ctrl_reg[C_CURSOR] <= zlc_cursor;        // engine cursor visible to host
@@ -284,6 +308,11 @@ module zlc_pulse_streamer_top #(
         else bram_douta = 32'b0;
     end
 
+    // UART read tap: the bridge reads only CTRL (STATUS/CURSOR/LAYOUT_ID); registered 1 cycle to match
+    // its u_rd_req -> latch handshake, reusing the SAME hardwired LAYOUT_ID readback as the AXI mux.
+    always @(posedge clk)
+        u_rd_data <= (u_rd_word == C_LAYOUT_ID[5:0]) ? ZLC_LAYOUT_ID : ctrl_reg[u_rd_word];
+
     // --- 3 PARALLEL edge BRAMs (tick 32b, coeff 64b, mask 62/64b) -------------
     // Forced READ_LATENCY_B = 2 by the build tcl; engine RD_LAT must match.
     wire [TICK_WIDTH-1:0]      edge_tick_rdata;
@@ -292,20 +321,20 @@ module zlc_pulse_streamer_top #(
     wire [EDGE_ADDR_WIDTH-1:0] edge_raddr;
 
     blk_mem_gen_edge_tick zlc_edge_tick_i (
-        .clka(axi_clk), .ena(bram_ena && sel_tick), .wea(bram_wea),
-        .addra(tick_word_off[EDGE_ADDR_WIDTH-1:0]), .dina(bram_dina), .douta(),
+        .clka(axi_clk), .ena(ena_mux && sel_tick), .wea(wea_mux),
+        .addra(tick_word_off[EDGE_ADDR_WIDTH-1:0]), .dina(wdata_mux), .douta(),
         .clkb(axi_clk), .enb(1'b1), .web(4'b0),
         .addrb(edge_raddr), .dinb(32'b0), .doutb(edge_tick_rdata)
     );
     blk_mem_gen_edge_coeff zlc_edge_coeff_i (
-        .clka(axi_clk), .ena(bram_ena && sel_coeff), .wea(bram_wea),
-        .addra(coeff_word_off[($clog2(MAX_EDGES*COEFF_WORDS))-1:0]), .dina(bram_dina), .douta(),
+        .clka(axi_clk), .ena(ena_mux && sel_coeff), .wea(wea_mux),
+        .addra(coeff_word_off[($clog2(MAX_EDGES*COEFF_WORDS))-1:0]), .dina(wdata_mux), .douta(),
         .clkb(axi_clk), .enb(1'b1), .web({(COEFF_PORTB_BITS/8){1'b0}}),
         .addrb(edge_raddr), .dinb({COEFF_PORTB_BITS{1'b0}}), .doutb(edge_coeff_rdata_w)
     );
     blk_mem_gen_edge_mask zlc_edge_mask_i (
-        .clka(axi_clk), .ena(bram_ena && sel_mask), .wea(bram_wea),
-        .addra(mask_word_off[($clog2(MAX_EDGES*MASK_WORDS))-1:0]), .dina(bram_dina), .douta(),
+        .clka(axi_clk), .ena(ena_mux && sel_mask), .wea(wea_mux),
+        .addra(mask_word_off[($clog2(MAX_EDGES*MASK_WORDS))-1:0]), .dina(wdata_mux), .douta(),
         .clkb(axi_clk), .enb(1'b1), .web({(MASK_PORTB_BITS/8){1'b0}}),
         .addrb(edge_raddr), .dinb({MASK_PORTB_BITS{1'b0}}), .doutb(edge_mask_rdata_w)
     );
@@ -327,8 +356,8 @@ module zlc_pulse_streamer_top #(
     wire [SCAN_PORTB_BITS-1:0] scan_rdata_w;
     wire [SCAN_ADDR_WIDTH-1:0] scan_raddr;
     blk_mem_gen_scan zlc_scan_bram_i (
-        .clka(axi_clk), .ena(bram_ena && sel_scan), .wea(bram_wea),
-        .addra(scan_word_off[($clog2(SCAN_DEPTH*SCAN_WORDS))-1:0]), .dina(bram_dina), .douta(),
+        .clka(axi_clk), .ena(ena_mux && sel_scan), .wea(wea_mux),
+        .addra(scan_word_off[($clog2(SCAN_DEPTH*SCAN_WORDS))-1:0]), .dina(wdata_mux), .douta(),
         .clkb(axi_clk), .enb(1'b1), .web({(SCAN_PORTB_BITS/8){1'b0}}),
         .addrb(scan_raddr), .dinb({SCAN_PORTB_BITS{1'b0}}), .doutb(scan_rdata_w)
     );
@@ -337,8 +366,8 @@ module zlc_pulse_streamer_top #(
     wire [31:0] bus_img_doutb;
     reg  [($clog2(BUS_ROWS*BUS_WORDS))-1:0] bus_img_raddr;
     blk_mem_gen_busimg zlc_bus_img_i (
-        .clka(axi_clk), .ena(bram_ena && sel_bus), .wea(bram_wea),
-        .addra(bus_word_off[($clog2(BUS_ROWS*BUS_WORDS))-1:0]), .dina(bram_dina), .douta(),
+        .clka(axi_clk), .ena(ena_mux && sel_bus), .wea(wea_mux),
+        .addra(bus_word_off[($clog2(BUS_ROWS*BUS_WORDS))-1:0]), .dina(wdata_mux), .douta(),
         .clkb(axi_clk), .enb(1'b1), .web(4'b0),
         .addrb(bus_img_raddr), .dinb(32'b0), .doutb(bus_img_doutb)
     );

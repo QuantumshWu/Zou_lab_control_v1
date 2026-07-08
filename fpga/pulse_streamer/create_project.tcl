@@ -193,6 +193,7 @@ create_project $project_name $project_dir -part $part -force
 set_property target_language Verilog [current_project]
 
 read_verilog [file join $script_dir zlc_edge_streamer.v]
+read_verilog [file join $script_dir zlc_uart_bridge.v]
 read_verilog [file join $script_dir zlc_pulse_streamer_top.v]
 read_xdc $xdc_path
 set_property top $top [current_fileset]
