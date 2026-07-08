@@ -11,6 +11,7 @@ returns copies/stacks, never live references.
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
 from typing import Mapping
 
@@ -51,6 +52,11 @@ class SignalHub:
         # published" -- e.g. a rolling monitor must append one point per sample
         # of its own source, not one per unrelated logic node tick.
         self._sig_version: dict[str, int] = {}
+        # Wake a WAITING consumer the instant a value is published, instead of making it poll.  A reactive
+        # processor (or a decoupled scan waiting on a downstream signal) reacts with ~zero latency rather
+        # than a fixed poll interval, so its per-point latency tracks the producer's real cadence and never
+        # a display-anti-spin sleep.  Shares ``_lock`` (an RLock), so publish already holds it when notifying.
+        self._cond = threading.Condition(self._lock)
 
     # ------------------------------------------------------------- publish side
     def publish(self, values: Mapping[str, object], *, shot: int | None = None,
@@ -80,6 +86,7 @@ class SignalHub:
                 self._src[key].append(src_id)       # lockstep with ring: value[-1] was acquired at src[-1]
                 self._sig_version[key] = self._sig_version.get(key, 0) + 1
             self._version += 1
+            self._cond.notify_all()          # wake any consumer waiting on new data (event-driven, not polled)
             return self._version
 
     def next_source_shot(self) -> int:
@@ -108,6 +115,7 @@ class SignalHub:
             self._src.clear()
             self._sig_version.clear()
             self._version += 1
+            self._cond.notify_all()          # a clear is a version bump too -- release any waiter
             self._shot = 0
 
     def remove_signals(self, names) -> list[str]:
@@ -144,6 +152,26 @@ class SignalHub:
     def version(self) -> int:
         with self._lock:
             return self._version
+
+    def wait_for_change(self, since_version: int, *, timeout: float, stop=None) -> bool:
+        """Block until the global publish version passes ``since_version`` (i.e. SOME signal was published),
+        or ``timeout`` s elapse, or ``stop`` is set.  Returns True iff a publish happened.
+
+        This is the EVENT-DRIVEN wait a reactive consumer uses INSTEAD of polling: it wakes the instant an
+        input arrives, so a processor's -- or a decoupled scan's -- per-point latency tracks the producer's
+        real cadence, never a fixed poll interval (the ``rate_hz`` lesson: no throttle on the data path).
+        ``stop`` cannot notify a ``Condition``, so the wait is sliced to honour a Stop within ~50 ms.  Pass
+        ``since_version`` = the ``version`` you last acted on, so a publish RACING this call is not missed."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._cond:
+            while self._version <= since_version:
+                if stop is not None and stop.is_set():
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(min(remaining, 0.05) if stop is not None else remaining)
+            return True
 
     @property
     def shot(self) -> int:

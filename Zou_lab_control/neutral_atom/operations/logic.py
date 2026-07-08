@@ -53,8 +53,10 @@ from .signal_expr import DEFAULT_SOURCE, SignalExpr, hub_namespace
 # The background loop's ONLY two time constants -- and NEITHER is an acquisition-rate cap.  A pass that
 # published (an acquiring measurement, a reactive processor whose input advanced) loops immediately, so
 # its cadence comes from the blocking device read / the hardware, never from a throttle here.
-_IDLE_POLL_S = 0.05     # a pass that published NOTHING (a reactive processor whose input has not advanced,
-                        # or a self-finished node) waits this before re-checking, so it does not hot-spin.
+_IDLE_POLL_S = 0.05     # FALLBACK only: a pass that published NOTHING waits on the hub EVENT (wakes the
+                        # instant any signal is published) with this as the max idle before a re-check, so a
+                        # truly-idle node does not hot-spin -- it never throttles a reactive consumer, which
+                        # wakes on its input, not on this timeout.
 _ERROR_BACKOFF_S = 0.2  # after a shot raises, wait this before retrying, so a wedged source does not spin
                         # the error banner.
 
@@ -340,6 +342,7 @@ class LogicNode:
 
         def _loop() -> None:
             while not self._stop.is_set():
+                seen = self.hub.version                       # version BEFORE this pass -> wake if ANY publish lands past it
                 try:
                     applied = self._apply_pending_params()   # owner thread applies edits BETWEEN shots
                     did_work = bool(self.step())             # {} -> reactive no-op / finished: nothing published
@@ -366,10 +369,12 @@ class LogicNode:
                     self.consecutive_errors = 0
                 if not did_work:
                     # Nothing to publish this pass: a reactive processor whose input has not advanced, or a
-                    # node that has finished but not yet been reaped.  Idle a short slice so we do NOT spin
-                    # the CPU -- this is the ONLY sleep, and it fires ONLY when there is no data to move.  A
-                    # pass that DID publish never sleeps: the blocking device read paces it (hardware speed).
-                    self._stop.wait(_IDLE_POLL_S)
+                    # node that has finished but not yet been reaped.  Wait EVENT-DRIVEN -- wake the instant
+                    # ANY signal is published (so a reactive processor reacts to its input with ~zero latency,
+                    # and a decoupled scan whose y comes from that processor is NOT throttled by this cap),
+                    # else after _IDLE_POLL_S so a truly-idle node does not hot-spin.  A pass that DID publish
+                    # never waits here: the blocking device read paces it (hardware speed).
+                    self.hub.wait_for_change(seen, timeout=_IDLE_POLL_S, stop=self._stop)
 
         self._thread = threading.Thread(target=_loop, name=f"zlc-node-{self.prefix or 'main'}", daemon=True)
         self._thread.start()
@@ -2344,12 +2349,15 @@ class PulseScanNode(_SweptBlockMeasurement):
             return True
         deadline = time.monotonic() + self.SETTLE_TIMEOUT_S
         while not self._stop.is_set():
+            seen = self.hub.version                          # capture BEFORE the check so a racing publish is not missed
             now = self.hub.signal_versions()
             if all(now.get(n, 0) > before.get(n, 0) for n in names):
                 return True
             if time.monotonic() >= deadline:
                 return False                                 # timeout: never wedge -- caller NaNs the point
-            self._stop.wait(0.01)
+            # Wake the instant the consumer republishes (event-driven), not every 10 ms -- so a decoupled
+            # scan's per-point wait tracks the consumer's real compute time, never a fixed poll interval.
+            self.hub.wait_for_change(seen, timeout=max(0.0, deadline - time.monotonic()), stop=self._stop)
         return False
 
     def _read_y(self) -> float:

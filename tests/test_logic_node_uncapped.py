@@ -70,3 +70,49 @@ def test_idle_reactive_node_publishes_nothing_and_does_not_fault():
         node.stop()
     assert hub.shot == 0                              # nothing was ever published
     assert getattr(node, "last_error", None) is None  # idling is not an error
+
+
+class _Reactor(LogicNode):
+    """A reactive processor: republishes ``out`` whenever its input signal ``in`` advances, else no-op."""
+
+    def __init__(self, hub):
+        super().__init__(hub)
+        self._seen = 0
+
+    def shot(self):
+        v = self.hub.signal_versions().get("in", 0)
+        if v <= self._seen:
+            return {}                    # input has not advanced -> idle no-op (waits on the hub event)
+        self._seen = v
+        return {"out": float(v)}
+
+
+def test_reactive_node_wakes_on_publish_not_after_the_idle_cap():
+    """The idle wait is EVENT-DRIVEN: a reactive node reacts the instant its input is published, NOT after
+    the _IDLE_POLL_S fallback.  This is what keeps a DECOUPLED pulse scan (whose y comes from a reactive
+    processor) running at the producer's cadence instead of a per-point idle-poll floor.  10 sequential
+    inputs, each reacted to before the next is sent: a poll-based loop would take ~10*_IDLE_POLL_S (~0.5 s);
+    event-driven takes tens of ms."""
+    hub = SignalHub()
+    node = _Reactor(hub)
+    node.start()
+    try:
+        time.sleep(0.02)                 # let it settle into the idle (event) wait
+        t0 = time.monotonic()
+        got = []
+        for i in range(1, 11):
+            hub.publish({"in": float(i)})
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                try:
+                    if float(hub.latest("out")) == float(i):
+                        break
+                except KeyError:
+                    pass
+                time.sleep(0.001)
+            got.append(float(hub.latest("out")))
+        elapsed = time.monotonic() - t0
+    finally:
+        node.stop()
+    assert got == [float(i) for i in range(1, 11)]        # every input was reacted to, in order
+    assert elapsed < 0.20, f"reactions took {elapsed:.3f}s -- looks poll-throttled, not event-driven"
