@@ -207,7 +207,11 @@ module zlc_uart_bridge #(
         if (t_i < 16'd7) cur_byte = hdr[t_i[2:0]];                     // SYNC0 SYNC1 RESP SEQ ST CNT[2]
         else if (t_i < t_pcut) begin
             pj = t_i - 16'd7;
-            cur_byte = wbuf[pj[FW_AW+1:2]][ (pj[1:0]<<3) +: 8 ];       // LE byte of reply word pj/4
+            // LE byte pj%4 of reply word pj/4.  Bit offset MUST be a wide expression: `pj[1:0]<<3`
+            // is self-determined to the 2-bit width of pj[1:0], so the <<3 truncates to 0 and every
+            // payload byte would come out as byte 0 (0x5A4C4C02 -> 0x02020202 on the wire).  Concatenate
+            // 3 zero bits instead ( == pj[1:0]*8, a proper 5-bit 0/8/16/24 offset).
+            cur_byte = wbuf[pj[FW_AW+1:2]][ {pj[1:0], 3'b000} +: 8 ];
         end else cur_byte = (t_i == t_pcut) ? t_crc_run[7:0] : t_crc_run[15:8];
     end
 
