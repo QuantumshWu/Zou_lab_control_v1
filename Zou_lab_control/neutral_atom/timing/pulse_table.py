@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 import ast
+import functools
 import json
 import logging
 import math
@@ -2018,18 +2019,16 @@ def default_visible_channels(channels: Sequence[str]) -> list[str]:
     return channels[: min(8, len(channels))]
 
 
-def infer_bus_channels(
-    channels: Sequence[str],
-    channel_labels: Mapping[str, str] | None = None,
-    *,
-    min_width: int = 2,
-) -> dict[str, list[str]]:
-    """Infer logical buses from labels such as ``da_dipole[0]`` ... ``[9]``."""
-
-    labels = {str(k): str(v) for k, v in dict(channel_labels or {}).items()}
+@functools.lru_cache(maxsize=64)
+def _infer_bus_channels_cached(channels: tuple, labels: tuple, min_width: int) -> tuple:
+    """Cached core of ``infer_bus_channels``: a PURE function of (channels, labels, min_width).  A
+    scan's per-point re-validation invoked this regex sweep once PER scan point (thousands of times for
+    a 2000-point scan -- ~0.7 s of the compile), even though the channel catalog never changes across
+    points.  Memoised on the immutable keys so the sweep runs once per distinct channel set."""
+    labels_map = dict(labels)
     by_base: dict[str, dict[int, str]] = {}
     for channel in channel_names(channels, "channels"):
-        label = labels.get(channel) or channel
+        label = labels_map.get(channel) or channel
         match = BUS_LABEL_RE.fullmatch(str(label).strip())
         if not match:
             continue
@@ -2038,15 +2037,33 @@ def infer_bus_channels(
         if not base:
             continue
         by_base.setdefault(base, {})[bit] = channel
-    out: dict[str, list[str]] = {}
+    out: list[tuple[str, tuple[str, ...]]] = []
     for base, members in by_base.items():
         if len(members) < int(min_width):
             continue
         bits = sorted(members)
         if bits != list(range(bits[0], bits[-1] + 1)):
             continue
-        out[base] = [members[bit] for bit in bits]
-    return out
+        out.append((base, tuple(members[bit] for bit in bits)))
+    return tuple(out)
+
+
+def infer_bus_channels(
+    channels: Sequence[str],
+    channel_labels: Mapping[str, str] | None = None,
+    *,
+    min_width: int = 2,
+) -> dict[str, list[str]]:
+    """Infer logical buses from labels such as ``da_dipole[0]`` ... ``[9]``."""
+
+    try:
+        channels_key = tuple(channels)
+    except TypeError:
+        channels_key = tuple(str(c) for c in channels)
+    labels_key = tuple(sorted((str(k), str(v)) for k, v in dict(channel_labels or {}).items()))
+    # Rebuild a FRESH mutable dict every call so callers may mutate their result without corrupting the
+    # cache (the cached value is an immutable tuple-of-tuples).
+    return {base: list(members) for base, members in _infer_bus_channels_cached(channels_key, labels_key, int(min_width))}
 
 
 def channels_as_buses(

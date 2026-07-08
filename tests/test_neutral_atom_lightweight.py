@@ -650,7 +650,8 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert "ZLC_PS_CLOCK_HZ=50000000" in server_bat
     assert "zlc_verify_sources" in server_bat
     assert "zlc_verify_loader_sources" not in server_bat
-    assert "ZLC_PS_SERVER_BACKEND=jtag-axi" in server_bat
+    # default control link is AUTO (probe fastest verified transport: uart > jtag-axi), not a fixed backend
+    assert "ZLC_PS_SERVER_BACKEND=auto" in server_bat
     assert "zlc_pulse_streamer_top.ltx" in server_bat
     assert "zlc_pulse_streamer_loader_top" not in server_bat
     assert "ZLC_PS_VARIANT" not in server_bat
