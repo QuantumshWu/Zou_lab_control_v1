@@ -308,10 +308,16 @@ module zlc_pulse_streamer_top #(
         else bram_douta = 32'b0;
     end
 
-    // UART read tap: the bridge reads only CTRL (STATUS/CURSOR/LAYOUT_ID); registered 1 cycle to match
-    // its u_rd_req -> latch handshake, reusing the SAME hardwired LAYOUT_ID readback as the AXI mux.
-    always @(posedge clk)
-        u_rd_data <= (u_rd_word == C_LAYOUT_ID[5:0]) ? ZLC_LAYOUT_ID : ctrl_reg[u_rd_word];
+    // UART read tap: COMBINATIONAL, byte-identical to the AXI read mux above (same hardwired LAYOUT_ID
+    // readback).  MUST NOT be registered: the bridge sets u_rd_word with a NON-BLOCKING assign in D_READ
+    // (so u_rd_word is valid only in the NEXT state, D_RLAT) and latches u_rd_data into wbuf THAT SAME
+    // D_RLAT cycle.  A registered tap adds a second cycle of latency, so the bridge would capture the
+    // PREVIOUS word's value -> every UART read (STATUS/CURSOR/LAYOUT_ID/self-test) returns stale data
+    // (observed on hardware: LAYOUT_ID read back 0 instead of 0x5A4C4C02, auto rejected the UART link).
+    // Combinational makes u_rd_data = f(u_rd_word) valid the moment u_rd_word is, matching the bridge's
+    // single-cycle D_READ->D_RLAT handshake.  (Latched into wbuf on the D_RLAT clock edge -> no glitch.)
+    always @(*)
+        u_rd_data = (u_rd_word == C_LAYOUT_ID[5:0]) ? ZLC_LAYOUT_ID : ctrl_reg[u_rd_word];
 
     // --- 3 PARALLEL edge BRAMs (tick 32b, coeff 64b, mask 62/64b) -------------
     // Forced READ_LATENCY_B = 2 by the build tcl; engine RD_LAT must match.
