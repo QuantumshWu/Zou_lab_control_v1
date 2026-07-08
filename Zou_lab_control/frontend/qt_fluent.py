@@ -1497,8 +1497,22 @@ class _FluentMessageDialog(QtWidgets.QDialog):
         outer.addWidget(FluentSectionLabel(str(title)))
         body = FluentLabel(str(text))
         body.setWordWrap(True)
-        body.setMaximumWidth(scaled_px(360, minimum=240))
-        outer.addWidget(body)
+        body_width = scaled_px(360, minimum=240)
+        body.setMaximumWidth(body_width)
+        # A short message hugs its content exactly as before; a LONG one (a stack of validation
+        # failures, a backend traceback) must SCROLL rather than grow the dialog past the screen, so
+        # past a height cap the label goes inside the shared Fluent scroll area (one scrollbar look).
+        cap = scaled_px(320, minimum=180)
+        natural_h = body.heightForWidth(body_width) if body.hasHeightForWidth() else body.sizeHint().height()
+        if natural_h <= cap:
+            outer.addWidget(body)
+        else:
+            scroller = FluentScrollArea()
+            scroller.setWidget(body)
+            scroller.setFixedWidth(body_width)
+            scroller.setFixedHeight(cap)
+            scroller.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            outer.addWidget(scroller)
         row = QtWidgets.QHBoxLayout()
         row.addStretch(1)
         # A warning wears the ORANGE accent (the same destructive/attention hue Remove uses); a plain
