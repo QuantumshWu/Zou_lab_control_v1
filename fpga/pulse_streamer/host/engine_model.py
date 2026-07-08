@@ -855,7 +855,7 @@ def rtl_mirror_play_stale_seed(program, n_ticks: int, prior_count: int, *,
 
 def bus_play(program, bus_index: int, n_ticks: int, scan_point: int = 0, *,
              bus_width: int = 10, frac_bits: int | None = None,
-             seed_value: int | None = None) -> list[int]:
+             seed_value: int | None = None, apply_log: list | None = None) -> list[int]:
     """Cycle-accurate mirror of zlc_edge_streamer.v's per-bus DAC engine
     (zlc_bus_start_table + zlc_bus_step + zlc_bus_apply_segment): the interpolating
     ramp and the affine segment ticks.  Returns bus_out at each tick for one scan point
@@ -893,7 +893,7 @@ def bus_play(program, bus_index: int, n_ticks: int, scan_point: int = 0, *,
           "ramp": False, "rstart": 0, "rstop": 0,
           "target": 0, "denom": 0, "accum": 0, "up": True, "step": 0, "rem": 0}
 
-    def apply(s):
+    def apply(s, t_apply):
         vs, ve = endpoints(s)         # vs = scanned/baked START endpoint; ve = TARGET (stop) value
         ts = eff(s.start_tick, s.start_tick_coeffs)
         te = eff(s.stop_tick, s.stop_tick_coeffs)
@@ -914,9 +914,19 @@ def bus_play(program, bus_index: int, n_ticks: int, scan_point: int = 0, *,
                       accum=0, up=ve >= vstart, step=step, rem=rem)
         else:
             st.update(value=ve, ramp=False, accum=0)
+        if apply_log is not None:
+            # The RESOLVED segment the SEGMENT-DELAY re-player will re-run: a snapshot of the
+            # engine state right after apply (carried/scanned start value + ramp step/rem/denom/
+            # target/up), tagged with the tick it applied at.  Delaying by d = replaying THIS same
+            # descriptor d ticks later (rstart/rstop shifted +d), so the delayed staircase is
+            # byte-identical to the undelayed one shifted -- the density-free instruction-level delay.
+            apply_log.append((int(t_apply), dict(st)))
 
     if segs and eff(segs[0].start_tick, segs[0].start_tick_coeffs) == 0:
-        apply(segs[0]); st["idx"] = 1
+        # seg@tick0 is PRE-applied before the loop, so its value is visible AT frame tick 0 (not
+        # tick+1 like a mid-frame apply); log it as applied one tick earlier so the delayed re-player
+        # shows it at emit+1 == frame-tick-0 + d.
+        apply(segs[0], -1); st["idx"] = 1
 
     out = []
     for t in range(n_ticks):
@@ -925,7 +935,7 @@ def bus_play(program, bus_index: int, n_ticks: int, scan_point: int = 0, *,
             if t >= st["rstop"]:
                 st["value"] = st["target"]; st["ramp"] = False; st["accum"] = 0
                 if st["idx"] < len(segs) and eff(segs[st["idx"]].start_tick, segs[st["idx"]].start_tick_coeffs) <= t:
-                    apply(segs[st["idx"]]); st["idx"] += 1
+                    apply(segs[st["idx"]], t); st["idx"] += 1
             elif t > st["rstart"] and st["denom"]:
                 st["accum"] += st["rem"]
                 inc = st["step"]
@@ -938,8 +948,139 @@ def bus_play(program, bus_index: int, n_ticks: int, scan_point: int = 0, *,
                     else:
                         st["value"] = max(st["target"], st["value"] - inc)
         elif st["idx"] < len(segs) and t >= eff(segs[st["idx"]].start_tick, segs[st["idx"]].start_tick_coeffs):
-            apply(segs[st["idx"]]); st["idx"] += 1
+            apply(segs[st["idx"]], t); st["idx"] += 1
     return out
+
+
+def _segment_replay_step(st: dict) -> None:
+    """Advance ONE tick of a resolved-segment descriptor's staircase, in place -- the exact
+    :func:`bus_play` stepping (Bresenham carry accumulator, saturate at target at rstop), shared by
+    the live engine and the SEGMENT-DELAY re-player so the two can never drift.  ``st`` is a live/
+    delayed engine snapshot (value/ramp/rstart/rstop/target/denom/accum/up/step/rem) and ``st['t']``
+    is the current absolute tick."""
+    t = st["t"]
+    if st["ramp"]:
+        if t >= st["rstop"]:
+            st["value"] = st["target"]; st["ramp"] = False; st["accum"] = 0
+        elif t > st["rstart"] and st["denom"]:
+            st["accum"] += st["rem"]
+            inc = st["step"]
+            if st["accum"] >= st["denom"]:
+                st["accum"] -= st["denom"]; inc += 1
+            if inc:
+                st["value"] = (min(st["target"], st["value"] + inc) if st["up"]
+                               else max(st["target"], st["value"] - inc))
+
+
+def bus_undelayed_and_log(program, bus_index: int, n_ticks: int, scan_point: int = 0, *,
+                          bus_width: int = 10, frac_bits: int | None = None,
+                          scan_point_seq: Sequence[int] | None = None):
+    """The undelayed bus value stream over ``n_ticks`` PLUS the resolved-segment apply log, chaining
+    frames with the #ramp-carry for a ``repeat_forever`` program so a delay window can span many
+    frames (the RTL re-applies the segment table at every wrap; g_time free-runs across it).  Returns
+    ``(stream, log)`` where ``log`` = ``[(apply_tick, resolved_state_snapshot), ...]``.
+
+    ``scan_point_seq`` (one scan-point index per frame, cycled) drives a repeat_forever SCAN so the
+    resolved segment values differ frame-to-frame -- the delay log captures the ALREADY-RESOLVED
+    values the live engine emitted, so replaying them delayed stays scan-correct across the sweep."""
+    repeat = bool(getattr(program, "repeat_forever", False))
+    frame = int(getattr(program, "loop_end_tick", 0) or 0) or int(program.ticks[-1])
+    if (not repeat or frame <= 0 or n_ticks <= frame) and not scan_point_seq:
+        log: list = []
+        stream = bus_play(program, bus_index, n_ticks, scan_point, bus_width=bus_width,
+                          frac_bits=frac_bits, apply_log=log)
+        return stream, log
+    stream: list = []
+    log = []
+    seed = None
+    origin = 0
+    fk = 0
+    while len(stream) < n_ticks:
+        flen = min(frame, n_ticks - len(stream))
+        flog: list = []
+        pt = scan_point_seq[fk % len(scan_point_seq)] if scan_point_seq else scan_point
+        fstream = bus_play(program, bus_index, flen, pt, bus_width=bus_width,
+                           frac_bits=frac_bits, seed_value=seed, apply_log=flog)
+        fk += 1
+        stream.extend(fstream)
+        for (ta, snap) in flog:                       # offset this frame's apply ticks to absolute time
+            s2 = dict(snap)
+            s2["rstart"] = int(snap["rstart"]) + origin
+            s2["rstop"] = int(snap["rstop"]) + origin
+            log.append((int(ta) + origin, s2))
+        seed = fstream[-1] if fstream else seed
+        origin += flen
+    return stream[:n_ticks], log
+
+
+def rtl_bus_segment_delay_mirror(program, bus_index: int, delay: int, n_ticks: int,
+                                 scan_point: int = 0, *, bus_width: int = 10,
+                                 seg_depth: int | None = None, frac_bits: int | None = None,
+                                 scan_point_seq: Sequence[int] | None = None,
+                                 return_occupancy: bool = False):
+    """Cycle-exact mirror of the NEW per-bus SEGMENT-DESCRIPTOR delay (the instruction-level DAC
+    delay that replaces the per-DA-bit value-change ``g_busdly`` FIFO).
+
+    Instead of buffering one event per per-tick value-CHANGE (a ramp = ~span events), the delay
+    captures each RESOLVED segment the live engine applies -- ``{emit = apply_tick + d, descriptor}``
+    -- into a shallow per-BUS FIFO, and a delayed re-player pops it at ``emit`` and RE-RUNS the ramp
+    (:func:`_segment_replay_step`), holding ``BUS_SAFE_VALUE`` until the first emit (first-frame
+    correct) and continuing the last d ticks past the program end (the done-tail).  Storage is
+    therefore O(segments in flight) = segments/frame x ceil(d/frame), INDEPENDENT of ramp DENSITY --
+    a dense ``0->1012 over 500 ticks`` ramp is ONE descriptor, not ~500 events.
+
+    Returns the delayed value stream, byte-identical to :func:`bus_delay_line_reference` of the
+    undelayed :func:`bus_undelayed_and_log` stream whenever no more than ``seg_depth`` descriptors
+    are ever in flight; a push into a full FIFO is DROPPED (the RTL overflow guard, which the host
+    validator prevents).  With ``return_occupancy`` also returns the peak in-flight descriptor count
+    (the depth the program actually needs)."""
+    d = int(delay)
+    undelayed, log = bus_undelayed_and_log(program, bus_index, n_ticks, scan_point,
+                                           bus_width=bus_width, frac_bits=frac_bits,
+                                           scan_point_seq=scan_point_seq)
+    if d == 0:
+        return (list(undelayed), 0) if return_occupancy else list(undelayed)
+
+    safe = 1 << (bus_width - 1)
+    cap = (1 << 62) if seg_depth is None else int(seg_depth)
+
+    # Push each captured apply at emit = apply_tick + d; a full FIFO drops (overflow guard).  A
+    # descriptor sits in flight from its apply_tick until the re-player consumes it at emit (d ticks),
+    # so peak occupancy = the most applies inside any d-window (segments/frame x ceil(d/frame)).
+    emits: dict[int, list] = {}
+    peak = 0
+    live = 0
+    window: deque = deque()             # emit ticks of descriptors still in flight
+    for (t_apply, snap) in log:
+        while window and window[0] <= t_apply:        # retire descriptors already emitted
+            window.popleft(); live -= 1
+        if live >= cap:
+            continue                    # OVERFLOW: drop this segment (diverges from reference)
+        window.append(t_apply + d); live += 1
+        peak = max(peak, live)
+        shifted = dict(snap)
+        shifted["rstart"] = int(snap["rstart"]) + d
+        shifted["rstop"] = int(snap["rstop"]) + d
+        emits.setdefault(t_apply + d, []).append(shifted)
+
+    player = {"value": safe, "ramp": False, "rstart": 0, "rstop": 0, "target": 0,
+              "denom": 0, "accum": 0, "up": True, "step": 0, "rem": 0, "started": False, "t": 0}
+    out = []
+    for t in range(n_ticks):
+        # Output the REGISTERED value first, then transition -- exactly the live engine's
+        # output-before-apply/step order, so a descriptor emitted at ``emit`` becomes visible at
+        # ``emit+1`` (== the undelayed apply showing at apply_tick+1, shifted by d).
+        out.append(player["value"] if player["started"] else safe)
+        player["t"] = t
+        pending = emits.get(t)
+        if pending:                                   # apply descriptor(s) scheduled at this tick
+            for shifted in pending:
+                for k in ("value", "ramp", "rstart", "rstop", "target", "denom", "accum", "up", "step", "rem"):
+                    player[k] = shifted[k]
+                player["started"] = True
+        elif player["started"]:                       # else advance the current segment's staircase
+            _segment_replay_step(player)
+    return (out, peak) if return_occupancy else out
 
 
 # ----------------------------------------------------------------------------
