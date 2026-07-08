@@ -43,6 +43,12 @@ class UartTransport(Protocol):
     def open(self) -> None: ...
     def close(self) -> None: ...
     def exchange(self, request: bytes, *, timeout: float, stop: "threading.Event | None" = None) -> bytes: ...
+    # Write a RUN of request frames back-to-back and collect their replies IN ORDER.  Used for the
+    # WRITE path (program upload / scan refill): streaming all frames without a per-frame ACK
+    # round-trip collapses N x USB-latency into ~one, so a whole upload is bounded by wire time
+    # (~82 ms) instead of N x ~5 ms round-trips.  Proven safe on the RTL bridge (tb_uart_pipeline.v):
+    # a 9-byte WRITE ack always finishes before the next >=16-byte frame completes, so no ack is lost.
+    def write_batch(self, requests: "Sequence[bytes]", *, timeout: float, stop: "threading.Event | None" = None) -> "list[bytes]": ...
 
 
 class PySerialTransport:
@@ -97,6 +103,37 @@ class PySerialTransport:
                 time.sleep(0.0005)
         raise TimeoutError("uart reply timed out.")
 
+    def write_batch(self, requests, *, timeout: float, stop: "threading.Event | None" = None) -> "list[bytes]":
+        if self._ser is None:
+            raise UartError("serial link not open.")
+        import time
+        want = len(requests)
+        self._ser.reset_input_buffer()
+        # INTER-FRAME GAP: the bridge decoder cannot consume RX bytes while it commits a multi-word frame
+        # (D_COMMIT loops f_count cycles, and a byte arriving then is dropped).  Committing a full 256-word
+        # frame takes ~256 clocks = ~5 us > one 3 Mbaud byte-time (~3.3 us), so a zero-gap next frame would
+        # lose its leading SYNC and never ack.  Pad each boundary with idle 0xFF bytes (ignored in D_HUNT):
+        # 8 bytes (~27 us) safely covers the worst 256-word commit while adding negligible wire time.
+        self._ser.write((b"\xff" * 8).join(requests)); self._ser.flush()
+        deadline = time.monotonic() + max(0.05, float(timeout))
+        buf = bytearray(); replies: list[bytes] = []
+        while len(replies) < want and time.monotonic() < deadline:
+            if stop is not None and stop.is_set():
+                raise UartError("uart batch aborted (stop requested).")
+            n = self._ser.in_waiting                              # in_waiting-sized reads (never a fixed count)
+            if n:
+                buf += self._ser.read(n)
+                while len(replies) < want:
+                    frame = _extract_reply(buf)
+                    if frame is None:
+                        break
+                    replies.append(frame)
+            else:
+                time.sleep(0.0005)
+        if len(replies) < want:
+            raise TimeoutError(f"uart batch timed out: {len(replies)}/{want} replies.")
+        return replies
+
 
 class FakeUartTransport:
     """Test transport: apply the request through the RTL-mirroring model, simulate the FPGA STATUS
@@ -123,6 +160,11 @@ class FakeUartTransport:
                 elif cmd == CMD_FIRE: self.model.regfile[CtrlWords.STATUS] = STATUS_LOADED | STATUS_RUNNING
                 elif cmd == CMD_SAFE: self.model.regfile[CtrlWords.STATUS] = 0
         return events[-1].reply
+
+    def write_batch(self, requests, *, timeout: float, stop=None) -> "list[bytes]":
+        # Feed each frame through the model in order -- byte-identical to N separate exchanges (the RTL
+        # commits each frame the same whether the host waited for the ack or not; tb_uart_pipeline.v).
+        return [self.exchange(req, timeout=timeout, stop=stop) for req in requests]
 
 
 def _extract_reply(buf: bytearray) -> bytes | None:
@@ -203,8 +245,19 @@ class UartStreamerSession(VivadoAxiStreamerSession):
             return
         pending, self._pending = self._pending, []
         with self._io_lock:
-            for base, vals in uf.coalesce_runs(pending, max_words=self.write_words_max):
-                self._txn(uf.encode_write(base, vals, seq=self._next_seq()), stop=stop)
+            frames = [uf.encode_write(base, vals, seq=self._next_seq())
+                      for base, vals in uf.coalesce_runs(pending, max_words=self.write_words_max)]
+            if not frames:
+                return
+            # PIPELINE the writes: stream ALL frames back-to-back and collect their acks together, instead
+            # of a blocking ACK round-trip per frame.  A whole program upload (~47 frames for a 2000-point
+            # scan) drops from N x USB-round-trip (~250 ms) to ~wire time (~80 ms).  Safe on the RTL bridge
+            # -- a 9-byte WRITE ack always clears before the next >=16-byte frame completes, so no ack is
+            # lost (tb_uart_pipeline.v).  READS stay single (a 13-byte read reply is longer than a request).
+            for reply in self._link.write_batch(frames, timeout=float(self.action_timeout or 5.0), stop=stop):
+                _, status, _ = uf.decode_reply(reply)
+                if status != uf.ST_OK:
+                    raise UartError(f"uart NAK status 0x{status:02X}")
 
     def _read_word(self, word_offset: int, *, stop=None) -> int:
         self._flush(stop=stop)

@@ -115,6 +115,35 @@ def test_writes_are_word_addressed_not_byte():
     assert fake.writes.get(scan_base) == 0x1234 and fake.writes.get(scan_base * 4) is None
 
 
+def test_pyserial_write_batch_pads_boundaries_and_collects_all_acks():
+    """PERF: the program upload PIPELINES its write frames (write all back-to-back, collect all acks)
+    instead of a blocking ACK round-trip per frame.  write_batch must (a) pad each frame boundary with
+    idle 0xFF -- the bridge decoder cannot consume RX while it commits a multi-word frame (D_COMMIT
+    loops f_count cycles), so a zero-gap next frame loses its leading SYNC and never acks (verified on
+    real hardware: 26/41 acks without the gap, 47/47 with it) -- and (b) return one reply per frame."""
+    from Zou_lab_control.neutral_atom.devices.uart_session import PySerialTransport
+    from fpga.pulse_streamer.host.uart_bridge_model import UartBridgeModel
+    from fpga.pulse_streamer.host import uart_frame as uf
+    m = UartBridgeModel()
+    frames = [bytes(uf.encode_write(40 + i, [0x100 + i], seq=i + 1)) for i in range(3)]
+    acks = [e.reply for f in frames for e in m.feed(f) if e.op == "write"]
+
+    class FakeSerial:
+        def __init__(self): self.timeout = 0.05; self._rx = bytearray(); self.written = b""
+        def reset_input_buffer(self): pass
+        def write(self, d): self.written += bytes(d); self._rx += b"".join(acks)  # bridge acks each frame
+        def flush(self): pass
+        @property
+        def in_waiting(self): return len(self._rx)
+        def read(self, n): out = bytes(self._rx[:n]); del self._rx[:n]; return out
+
+    link = PySerialTransport("COM_TEST"); link._ser = FakeSerial()
+    replies = link.write_batch(frames, timeout=1.0)
+    assert len(replies) == 3 and all(uf.decode_reply(r)[1] == uf.ST_OK for r in replies)
+    assert b"\xff" * 8 in link._ser.written, "inter-frame idle gap missing (multi-word frames would drop)"
+    assert m.regfile[40] == 0x100 and m.regfile[41] == 0x101 and m.regfile[42] == 0x102
+
+
 def test_fire_does_not_reupload_the_already_prepared_program():
     """PERF REGRESSION: fire(program) must NOT re-upload a program that was JUST prepared.
     SequencerService.fire() passes the already-prepared program to the backend's fire callback; a
