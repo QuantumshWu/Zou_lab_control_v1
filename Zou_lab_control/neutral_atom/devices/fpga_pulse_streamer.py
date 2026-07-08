@@ -104,8 +104,8 @@ def _xdc_output_port_labels(text: str) -> list[str]:
     for port in _xdc_ports(text):
         if re.fullmatch(r"ch\[\d+\]", port):
             continue
-        if port == "clk" or port.startswith("led[") or re.fullmatch(r"GND\d*", port, re.IGNORECASE):
-            continue
+        if port in {"clk", "uart_rx", "uart_tx"} or port.startswith("led[") or re.fullmatch(r"GND\d*", port, re.IGNORECASE):
+            continue   # infrastructure pins (clock / status LEDs / grounds / UART side-channel), not user channels
         if port in CONTROL_PORTS or port in {"zlc_running_led", "zlc_done_led"}:
             continue
         if port in seen:

@@ -117,6 +117,142 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+# ---------------------------------------------------------------- backend auto-selection
+# Prefer the FASTEST transport that actually VERIFIES against this host's register layout, so the
+# GUI on_pulse / API fire transparently ride the best available link with no client-side change.
+_AUTO_BACKEND_PRIORITY = ("uart", "jtag-axi")            # fastest first; "command" is never auto-selected
+_AUTO_UART_PROBE_TIMEOUT = 0.6                           # s -- an absent/dead UART must fail fast, not hang startup
+_UART_BRIDGE_VIDS = (0x1A86, 0x10C4, 0x0403, 0x067B)    # CH340, CP210x, FTDI-VCP, PL2303
+
+
+def _err_line(exc: Exception) -> str:
+    return (str(exc).strip().splitlines() or [""])[0][:200]
+
+
+def _solve_backend_params(channels):
+    from fpga.pulse_streamer.host.image import solve_capacity
+    part = os.environ.get("ZLC_PS_FPGA_PART", "xc7a35tfgg484-2")
+    return solve_capacity(part, channel_count=max(1, len(list(channels)))).params
+
+
+def _make_hardware_backend(name, *, channels, clock_hz, state_dir, uart_port, uart_baud):
+    """Construct (do NOT start) the hardware session for a concrete backend name.  Single source of the
+    session geometry (BRAM image solved from part + channel count) shared by the explicit and auto paths."""
+    params = _solve_backend_params(channels)
+    if name == "jtag-axi":
+        from .axi_session import VivadoAxiStreamerSession
+        return VivadoAxiStreamerSession(
+            state_dir=state_dir, clock_hz=clock_hz,
+            program_on_start=_env_bool("ZLC_PS_VIVADO_PROGRAM_ON_RUN", False), params=params,
+        )
+    if name == "uart":
+        from .uart_session import UartStreamerSession
+        return UartStreamerSession(
+            state_dir=state_dir, clock_hz=clock_hz, params=params,
+            port=uart_port or os.environ.get("ZLC_PS_UART_PORT"),
+            baud=int(uart_baud or os.environ.get("ZLC_PS_UART_BAUD", 3_000_000)),
+        )
+    raise ValueError(f"unknown hardware backend {name!r}")
+
+
+def _discover_uart_ports(explicit):
+    """Ordered candidate serial ports for the UART link: an explicit --uart-port / ZLC_PS_UART_PORT wins;
+    otherwise scan for a USB-UART bridge (CH340 first) so ``auto`` is plug-and-play.  Never raises."""
+    if explicit:
+        return [str(explicit)]
+    env = os.environ.get("ZLC_PS_UART_PORT")
+    if env:
+        return [env]
+    try:
+        from serial.tools import list_ports
+    except Exception:
+        return []
+    ranked = []
+    for p in list_ports.comports():
+        vid = getattr(p, "vid", None)
+        if vid in _UART_BRIDGE_VIDS:
+            ranked.append((0 if vid == 0x1A86 else 1, str(p.device)))   # CH340 (the Da Vinci USB_UART) first
+    ranked.sort()
+    return [dev for _, dev in ranked]
+
+
+def _warm_start_hardware(session, name, *, log, verify_layout=False, layout_timeout=None):
+    """Bring a hardware session up to a verified, safe-idle state: open the link, (auto only) verify the
+    programmed bitstream matches this host's register layout, zero the host-owned CTRL config, and run the
+    transport self-test.  ``verify_layout`` stays False on the EXPLICIT paths so their bring-up ORDER
+    (start -> clear -> self-test) is byte-for-byte unchanged.  Raises on any failure (caller closes)."""
+    log(f"[{name}] opening control link before accepting clients...")
+    session.start()
+    if verify_layout:
+        # reads CTRL LAYOUT_ID; an old/absent bitstream returns 0 (or the link times out) -> raises,
+        # which is exactly how ``auto`` decides this transport is not usable and falls back.
+        saved = getattr(session, "action_timeout", None)
+        if layout_timeout is not None:
+            try: session.action_timeout = layout_timeout
+            except Exception: pass
+        try:
+            session.check_register_layout()
+        finally:
+            if layout_timeout is not None:
+                try: session.action_timeout = saved
+                except Exception: pass
+    log(f"[{name}] clearing host-owned CTRL config (delays + clk mask) to a safe idle state...")
+    session.clear_host_config()
+    self_test_env = {"jtag-axi": "ZLC_PS_AXI_SELF_TEST", "uart": "ZLC_PS_UART_SELF_TEST"}[name]
+    if _env_bool(self_test_env, True):
+        log(f"[{name}] verifying link (write + read-back self-test)...")
+        (session.axi_self_test if name == "jtag-axi" else session.link_self_test)()
+        log(f"[{name}] self-test OK.")
+    return session
+
+
+def _auto_select_backend(*, channels, clock_hz, state_dir, uart_port, uart_baud, warm_start, log):
+    """Probe transports fastest-first; return (name, started_session) for the first that verifies.
+    UART is a CHEAP probe (open serial + read LAYOUT_ID); Vivado JTAG-AXI is only brought up if no UART
+    link answers.  With --no-warm-start and no UART, JTAG is selected LAZILY (no Vivado spin at startup)."""
+    tried: list[tuple[str, str]] = []
+    ports = _discover_uart_ports(uart_port)
+    if not ports:
+        reason = ("no UART serial port found (need pyserial installed + a CH340/CP210x/FTDI USB-UART "
+                  "plugged, or pass --uart-port)")
+        tried.append(("uart", reason))
+        log(f"  auto: skipping UART -- {reason}")
+    for port in ports:
+        session = _make_hardware_backend("uart", channels=channels, clock_hz=clock_hz,
+                                         state_dir=state_dir, uart_port=port, uart_baud=uart_baud)
+        try:
+            _warm_start_hardware(session, "uart", log=log, verify_layout=True,
+                                 layout_timeout=_AUTO_UART_PROBE_TIMEOUT)
+            log(f"Auto-selected backend: UART on {port} -- fastest verified link "
+                "(~82 ms apply / ~sub-ms scan step).")
+            return "uart", session
+        except Exception as exc:
+            try: session.close()
+            except Exception: pass
+            tried.append((f"uart:{port}", _err_line(exc)))
+            log(f"  auto: UART on {port} not usable -- {_err_line(exc)}")
+    # No UART link answered -> fall back to the (slower) Vivado JTAG-to-AXI path.
+    session = _make_hardware_backend("jtag-axi", channels=channels, clock_hz=clock_hz,
+                                     state_dir=state_dir, uart_port=None, uart_baud=uart_baud)
+    if not warm_start:
+        log("Auto-selected backend: jtag-axi (deferred bring-up; --no-warm-start) -- no UART link verified.")
+        return "jtag-axi", session
+    try:
+        _warm_start_hardware(session, "jtag-axi", log=log, verify_layout=True)
+        log("Auto-selected backend: jtag-axi (Vivado hw_axi, ~1 s apply) -- no faster UART link verified.")
+        return "jtag-axi", session
+    except Exception as exc:
+        try: session.close()
+        except Exception: pass
+        tried.append(("jtag-axi", _err_line(exc)))
+    raise RuntimeError(
+        "auto backend: no usable transport verified.\n  "
+        + "\n  ".join(f"{n}: {r}" for n, r in tried)
+        + "\n  Fix: program the FPGA (fpga/build_and_program.bat) and/or plug the USB_UART cable, "
+        "or choose one explicitly with --backend jtag-axi|uart."
+    )
+
+
 def run_server(
     *,
     channels: Sequence[str],
@@ -137,67 +273,43 @@ def run_server(
     """Start the RPyC sequencer service used by ``RemoteSequencer``."""
 
     backend_name = str(backend).strip().lower().replace("_", "-")
-    if backend_name in {"jtag-axi", "axi", "loader", "edge-table"}:
-        # The FINAL affine edge-table engine (1-tick FIFO prefetch + 2-bank
-        # streaming scan), driven over JTAG-to-AXI (hw_axi).  The host BRAM image
-        # geometry is solved from the part + channel count (single source of truth
-        # with the create-project tcl + the top localparams).
-        from .axi_session import VivadoAxiStreamerSession
-        from fpga.pulse_streamer.host.image import solve_capacity
-
-        program_on_start = _env_bool("ZLC_PS_VIVADO_PROGRAM_ON_RUN", False)
-        part = os.environ.get("ZLC_PS_FPGA_PART", "xc7a35tfgg484-2")
-        params = solve_capacity(part, channel_count=max(1, len(list(channels)))).params
-        hardware_backend = VivadoAxiStreamerSession(
-            state_dir=state_dir,
-            clock_hz=clock_hz,
-            program_on_start=program_on_start,
-            params=params,
+    if backend_name == "auto":
+        # Probe transports fastest-first and use the first that VERIFIES against this host's register
+        # layout, so on_pulse/fire transparently ride the best available link (UART ~82 ms > JTAG ~1 s).
+        backend_name, hardware_backend = _auto_select_backend(
+            channels=channels, clock_hz=clock_hz, state_dir=state_dir,
+            uart_port=uart_port, uart_baud=uart_baud, warm_start=warm_start, log=print,
+        )
+        prepare_callback = hardware_backend.prepare
+        fire_callback = hardware_backend.fire
+        wait_done_callback = hardware_backend.wait_done
+        safe_state_callback = hardware_backend.safe_state
+        scan_progress_callback = hardware_backend.scan_progress
+    elif backend_name in {"jtag-axi", "axi", "loader", "edge-table"}:
+        # The FINAL affine edge-table engine (1-tick FIFO prefetch + 2-bank streaming scan), driven over
+        # JTAG-to-AXI (hw_axi).  Construction geometry + bring-up (start -> clear host CTRL config ->
+        # AXI burst self-test) are shared with ``auto`` via the helpers -- single source of truth.
+        hardware_backend = _make_hardware_backend(
+            "jtag-axi", channels=channels, clock_hz=clock_hz, state_dir=state_dir,
+            uart_port=uart_port, uart_baud=uart_baud,
         )
         if warm_start:
-            print("Starting persistent Vivado JTAG-to-AXI session before accepting clients...")
-            hardware_backend.start()
-            # Always boot into a clean idle state: zero the host-owned CTRL config
-            # (per-channel/per-bus delays + the per-channel CLK mask) and halt.  Without
-            # this, leftovers on a running board (e.g. a clk_en bit) persist until the
-            # first prepare -- a channel would keep running on the FPGA clock.
-            print("Clearing host-owned CTRL config (delays + clk mask) to a safe idle state...")
-            hardware_backend.clear_host_config()
-            # Fail-fast bring-up check: a burst write + single-beat read-back proves the
-            # AXI4 INCR-burst upload path works (right -data byte order, AXI4 -- not
-            # Lite -- bitstream) BEFORE any client uploads a pulse.  Disable with
-            # ZLC_PS_AXI_SELF_TEST=0 if a flaky cable makes it spurious.
-            if _env_bool("ZLC_PS_AXI_SELF_TEST", True):
-                print("Verifying AXI burst upload path (write + read-back self-test)...")
-                hardware_backend.axi_self_test()
-                print("AXI burst self-test OK.")
+            _warm_start_hardware(hardware_backend, "jtag-axi", log=print)
         prepare_callback = hardware_backend.prepare
         fire_callback = hardware_backend.fire
         wait_done_callback = hardware_backend.wait_done
         safe_state_callback = hardware_backend.safe_state
         scan_progress_callback = hardware_backend.scan_progress   # live scan cursor for the GUI poll
     elif backend_name in {"uart", "serial"}:
-        # SAME edge-table engine + register map, driven over the UART fast-control side-channel
-        # instead of Vivado-Tcl JTAG -- a byte-identical transport swap (image.solve_capacity + the
-        # whole prepare/fire/wait_done/scan_progress protocol are inherited) that makes a pulse apply
-        # ~82 ms and a scan-step ~sub-ms instead of ~1 s.
-        from .uart_session import UartStreamerSession
-        from fpga.pulse_streamer.host.image import solve_capacity
-        part = os.environ.get("ZLC_PS_FPGA_PART", "xc7a35tfgg484-2")
-        params = solve_capacity(part, channel_count=max(1, len(list(channels)))).params
-        hardware_backend = UartStreamerSession(
-            state_dir=state_dir, clock_hz=clock_hz, params=params,
-            port=uart_port or os.environ.get("ZLC_PS_UART_PORT"),
-            baud=int(uart_baud or os.environ.get("ZLC_PS_UART_BAUD", 3_000_000)),
+        # SAME edge-table engine + register map over the UART fast-control side-channel instead of
+        # Vivado-Tcl JTAG -- a byte-identical transport swap (~82 ms apply / ~sub-ms scan step vs ~1 s).
+        # Construction + bring-up shared with ``auto`` via the helpers.
+        hardware_backend = _make_hardware_backend(
+            "uart", channels=channels, clock_hz=clock_hz, state_dir=state_dir,
+            uart_port=uart_port, uart_baud=uart_baud,
         )
         if warm_start:
-            print("Opening UART fast-control link before accepting clients...")
-            hardware_backend.start()
-            hardware_backend.clear_host_config()
-            if _env_bool("ZLC_PS_UART_SELF_TEST", True):
-                print("Verifying UART link (write + read-back self-test)...")
-                hardware_backend.link_self_test()
-                print("UART link self-test OK.")
+            _warm_start_hardware(hardware_backend, "uart", log=print)
         prepare_callback = hardware_backend.prepare
         fire_callback = hardware_backend.fire
         wait_done_callback = hardware_backend.wait_done
@@ -218,7 +330,7 @@ def run_server(
         safe_state_callback = hardware_backend.safe_state
         scan_progress_callback = None        # the command backend has no live scan cursor
     else:
-        raise ValueError("backend must be 'jtag-axi', 'uart', or 'command'.")
+        raise ValueError("backend must be 'auto', 'jtag-axi', 'uart', or 'command'.")
     cache_prepared = _env_bool("ZLC_SEQUENCER_CACHE_PREPARED", False)
     service = SequencerService(
         channels=channels,
@@ -321,11 +433,12 @@ def build_arg_parser() -> ArgumentParser:
     parser.add_argument("--command-timeout", type=float, default=None)
     parser.add_argument(
         "--backend",
-        default="jtag-axi",
-        choices=["jtag-axi", "uart", "command"],
-        help="Hardware backend. jtag-axi drives the edge-table streamer over a persistent Vivado "
-        "hw_axi (JTAG-to-AXI) session; uart drives the SAME engine over the fast-control serial "
-        "side-channel (~82 ms apply vs ~1 s); command shells out per action.",
+        default="auto",
+        choices=["auto", "jtag-axi", "uart", "command"],
+        help="Hardware backend.  auto (default) probes fastest-first and uses the first link that "
+        "VERIFIES against this host's register layout: the UART fast-control side-channel (~82 ms apply) "
+        "if a responding CH340/USB-UART is present, else JTAG-to-AXI over a persistent Vivado hw_axi "
+        "session (~1 s).  jtag-axi / uart force one; command shells out per action.",
     )
     parser.add_argument("--uart-port", default=None, help="Serial port for --backend uart (e.g. COM3, /dev/ttyUSB1).")
     parser.add_argument("--uart-baud", type=int, default=3_000_000, help="UART baud for --backend uart (default 3 Mbaud).")

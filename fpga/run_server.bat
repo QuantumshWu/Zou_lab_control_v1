@@ -55,7 +55,7 @@ set "PYTHONPATH=%CD%;%PYTHONPATH%"
 
 if "%ZLC_PS_HOST%"=="" set "ZLC_PS_HOST=0.0.0.0"
 if "%ZLC_PS_PORT%"=="" set "ZLC_PS_PORT=18861"
-if "%ZLC_PS_SERVER_BACKEND%"=="" set "ZLC_PS_SERVER_BACKEND=jtag-axi"
+if "%ZLC_PS_SERVER_BACKEND%"=="" set "ZLC_PS_SERVER_BACKEND=auto"
 if "%ZLC_PS_VIVADO_PROGRAM_ON_RUN%"=="" set "ZLC_PS_VIVADO_PROGRAM_ON_RUN=0"
 if "%ZLC_PS_CLOCK_HZ%"=="" set "ZLC_PS_CLOCK_HZ=50000000"
 if "%ZLC_PS_MAX_CHANNEL_COUNT%"=="" (
@@ -85,6 +85,9 @@ if not "%ZLC_PS_PROJECT_DIR%"=="" (
   if "%ZLC_PS_VIVADO_BIT%"=="" set "ZLC_PS_VIVADO_BIT=%ZLC_PS_PROJECT_DIR%\ps.runs\impl_1\zlc_pulse_streamer_top.bit"
   if "%ZLC_PS_VIVADO_LTX%"=="" set "ZLC_PS_VIVADO_LTX=%ZLC_PS_PROJECT_DIR%\ps.runs\impl_1\zlc_pulse_streamer_top.ltx"
 )
+rem The .ltx probes file is only needed for the Vivado JTAG-to-AXI path.  auto/uart don't require it
+rem (auto only brings Vivado up if NO UART link answers, and prints its own error in that case).
+if /I not "%ZLC_PS_SERVER_BACKEND%"=="jtag-axi" goto zlc_ltx_ok
 if "%ZLC_PS_VIVADO_LTX%"=="" (
   echo ERROR: no Vivado .ltx probes file was found.
   echo.
@@ -107,7 +110,8 @@ if not exist "%ZLC_PS_VIVADO_LTX%" (
   exit /b 2
 )
 
-echo ZLC FPGA pulse streamer server: %ZLC_PS_CHANNEL_COUNT%ch ^(JTAG-to-AXI, 1-tick + streaming^)
+:zlc_ltx_ok
+echo ZLC FPGA pulse streamer server: %ZLC_PS_CHANNEL_COUNT%ch ^(control link: %ZLC_PS_SERVER_BACKEND%^)
 echo Host:    %ZLC_PS_HOST%:%ZLC_PS_PORT%
 echo Backend: %ZLC_PS_SERVER_BACKEND%
 echo Bit:     %ZLC_PS_VIVADO_BIT%
@@ -122,8 +126,13 @@ if "%ZLC_RUN_SERVER_CHECK%"=="1" (
   endlocal & exit /b 0
 )
 
+set "ZLC_PS_UART_ARGS="
+if not "%ZLC_PS_UART_PORT%"=="" set "ZLC_PS_UART_ARGS=--uart-port %ZLC_PS_UART_PORT%"
+if not "%ZLC_PS_UART_BAUD%"=="" set "ZLC_PS_UART_ARGS=%ZLC_PS_UART_ARGS% --uart-baud %ZLC_PS_UART_BAUD%"
+
 %ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.sequencer_server ^
   --backend %ZLC_PS_SERVER_BACKEND% ^
+  %ZLC_PS_UART_ARGS% ^
   --host %ZLC_PS_HOST% ^
   --port %ZLC_PS_PORT% ^
   --channels %ZLC_PS_CHANNELS% ^
@@ -134,7 +143,7 @@ popd
 endlocal & exit /b %ZLC_STATUS%
 
 :zlc_help
-echo Start the FINAL ZLC FPGA pulse-streamer server ^(JTAG-to-AXI / hw_axi^).
+echo Start the FINAL ZLC FPGA pulse-streamer server ^(auto: UART fast-control side-channel, else JTAG-to-AXI / hw_axi^).
 echo Engine: 1-tick ^(20 ns^) FIFO prefetch + unbounded 2-bank streaming scan.
 echo.
 echo Usage:
@@ -143,7 +152,7 @@ echo   fpga\run_server.bat --check-config
 echo.
 echo Defaults:
 echo   host/port: 0.0.0.0:18861
-echo   backend:   jtag-axi  ^(persistent Vivado hw_axi session^)
+echo   backend:   auto  ^(probe UART fast-control side-channel first, else JTAG-to-AXI / hw_axi; ZLC_PS_SERVER_BACKEND to force^)
 echo   channels:  inferred from ZLC_PS_XDC, fallback ch00 ... ch61
 echo   clock:     50000000 Hz ^(override with ZLC_PS_CLOCK_HZ^)
 echo   bit/ltx:   fpga\build\ps\ps.runs\impl_1\zlc_pulse_streamer_top.{bit,ltx}
