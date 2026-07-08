@@ -12,6 +12,8 @@ import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 
+import numpy as np
+
 from Zou_lab_control._paths import GENERATED_SEQUENCES_DIR
 from Zou_lab_control._clock import default_clock_hz as _default_clock_hz
 from ..core.analysis import nonnegative_float, positive_int
@@ -2095,49 +2097,58 @@ def _stable_affine_groups(
         ordered = sorted(by_expr, key=lambda k: (not any(ch is not None for ch, _v in by_expr[k]), k))
         for key in ordered:
             grouped.append(((key[0], key[1]), by_expr[key]))
-    # Per-channel monotonicity: each channel's OWN edges must stay strictly ordered
-    # (and non-negative) at every scan point -- a channel reversing/colliding its own
-    # edges is unrepresentable.  This is NECESSARY but NOT sufficient for the FINAL
-    # design: the engine is a single GLOBAL edge-table player, so the MERGED edge list
-    # must also stay globally tick-monotone at every scan point.  That global check is
-    # enforced downstream by ``validate_pulse_streamer_program`` (host prepare), which
-    # rejects a scan that reorders edges across channels rather than dropping them.
-    for point_index, point in enumerate(scan_points):
-        per_chan_last: dict[str, int] = {}
-        for expr, items in grouped:
-            tick = _apply_affine_ticks(expr[0], expr[1], point, coeff_frac_bits)
-            if tick < 0:
-                raise ValueError(f"hardware scan produced a negative edge tick at scan point {point_index}.")
-            for channel, _value in items:
-                if channel is None:
-                    continue  # final/loop markers are not channel edges
-                previous = per_chan_last.get(channel)
-                if previous is not None and tick <= previous:
-                    raise ValueError(
-                        f"hardware scan reverses or collides channel '{channel}'s own edges at "
-                        f"scan point {point_index}; simplify that channel's delay/duration scan "
-                        "(a single channel cannot run its own pulses backwards)."
-                    )
-                per_chan_last[channel] = tick
-    # CROSS-CHANNEL reorder/collision at ANY scan point (not just the reference): the
-    # single global sorted table needs the rows STRICTLY increasing AND in a fixed order at
-    # every scan point.  If two rows that BOTH carry a real channel transition swap order or
-    # collide (same effective tick) at some point as the scanned delay sweeps, the channels
-    # reorder -- raise so the caller pulls the scanned-delay channel onto its own lane (the
-    # reference-only check above misses a reorder that only appears at a later point).
-    edge_rows = [(expr, items) for expr, items in grouped if any(ch is not None for ch, _v in items)]
-    for point_index, point in enumerate(scan_points):
-        last = None
-        for expr, _items in edge_rows:
-            tick = _apply_affine_ticks(expr[0], expr[1], point, coeff_frac_bits)
-            if last is not None and tick <= last:
-                raise ValueError(
-                    "this scan moves one channel's edges PAST another channel's edges as the "
-                    "scan slots sweep (the channels reorder), which the single global edge "
-                    "table cannot play.  Narrow the scan range so every channel stays in "
-                    "its own slot relative to the others."
-                )
-            last = tick
+    # Per-scan-point monotonicity, VECTORISED.  Every edge tick is the SAME pure-integer affine
+    # MAC ``base + (coeffs . slot_ticks) >> frac`` the scalar ``_apply_affine_ticks`` computes, so
+    # one int64 matmul over all points x rows yields tick[N, G] BIT-IDENTICAL to the per-point loop
+    # (int64 has ample headroom; numpy ``>>`` on signed ints is the same arithmetic shift toward
+    # -inf as Python ``>>``, so a negative coefficient sum floors identically).  This validation
+    # EMITS NOTHING -- it only raises on an unrepresentable scan -- so the compiled image is
+    # unchanged; it just replaces the O(N x rows) Python loop that dominated large-scan compile.
+    pts = np.asarray(scan_points, dtype=np.int64)                                  # (N, S)
+    bases = np.array([int(expr[0]) for expr, _items in grouped], dtype=np.int64)   # (G,)
+    coeffs = np.array([[int(c) for c in expr[1]] for expr, _items in grouped], dtype=np.int64)  # (G, S)
+    ticks = bases[None, :] + ((pts @ coeffs.T) >> int(coeff_frac_bits))            # (N, G)
+    # 1) Every row's tick is non-negative at every point (mirror of the scalar ``tick < 0`` guard,
+    #    raising at the FIRST offending point in scan order).
+    neg_rows = (ticks < 0).any(axis=1)
+    if neg_rows.any():
+        raise ValueError(
+            f"hardware scan produced a negative edge tick at scan point {int(np.argmax(neg_rows))}.")
+    # 2) Per-channel: each channel's OWN edges (its ordered subsequence of grouped rows) must be
+    #    strictly increasing at every point -- a channel reversing/colliding its own edges is
+    #    unrepresentable.  NECESSARY but not sufficient; the global merge is re-checked below and
+    #    downstream by ``validate_pulse_streamer_program``.
+    chan_rows: dict[str, list[int]] = {}
+    for row_index, (_expr, items) in enumerate(grouped):
+        for channel, _value in items:
+            if channel is not None:
+                chan_rows.setdefault(channel, []).append(row_index)
+    for channel, row_indices in chan_rows.items():
+        if len(row_indices) < 2:
+            continue
+        seq = ticks[:, row_indices]                                                # (N, k), grouped order
+        bad = (seq[:, 1:] <= seq[:, :-1]).any(axis=1)
+        if bad.any():
+            raise ValueError(
+                f"hardware scan reverses or collides channel '{channel}'s own edges at "
+                f"scan point {int(np.argmax(bad))}; simplify that channel's delay/duration scan "
+                "(a single channel cannot run its own pulses backwards)."
+            )
+    # 3) CROSS-CHANNEL reorder/collision at ANY scan point: the single global sorted table needs
+    #    the real-edge rows STRICTLY increasing at every point.  Two rows that both carry a channel
+    #    transition swapping/colliding as the slots sweep means the channels reorder (the
+    #    reference-only grouping above misses a reorder that only appears at a later point).
+    edge_indices = [row_index for row_index, (_e, items) in enumerate(grouped)
+                    if any(ch is not None for ch, _v in items)]
+    if len(edge_indices) >= 2:
+        seq = ticks[:, edge_indices]                                               # (N, E), grouped order
+        if bool((seq[:, 1:] <= seq[:, :-1]).any()):
+            raise ValueError(
+                "this scan moves one channel's edges PAST another channel's edges as the "
+                "scan slots sweep (the channels reorder), which the single global edge "
+                "table cannot play.  Narrow the scan range so every channel stays in "
+                "its own slot relative to the others."
+            )
     return grouped
 
 
