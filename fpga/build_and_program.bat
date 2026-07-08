@@ -243,7 +243,10 @@ where python >nul 2>nul
 if errorlevel 1 exit /b 0
 set "ZLC_HASH_GEOM="
 if defined ZLC_PS_GEOM_TCL if exist "%ZLC_PS_GEOM_TCL%" set "ZLC_HASH_GEOM=%ZLC_PS_GEOM_TCL%"
-for /f "delims=" %%H in ('python "%STREAMER_DIR%\host\src_hash.py" "%STREAMER_DIR%\zlc_edge_streamer.v" "%STREAMER_DIR%\zlc_pulse_streamer_top.v" "%STREAMER_DIR%\!ZLC_CREATE_TCL!" "%STREAMER_DIR%\!ZLC_PROGRAM_TCL!" "!ZLC_SELECTED_XDC!" "%REPO_ROOT%\fpga\board_config\streamer_config.json" "!ZLC_HASH_GEOM!" 2^>nul') do set "ZLC_SRC_HASH=%%H"
+rem Hash EVERY synthesized HDL create_project.tcl reads -- INCLUDING zlc_uart_bridge.v.  Omitting it
+rem meant a UART-bridge edit did not invalidate the build cache, so the bat "skipped build" and
+rem re-programmed a stale bitstream (the byte-mux fix silently never made it onto the board).
+for /f "delims=" %%H in ('python "%STREAMER_DIR%\host\src_hash.py" "%STREAMER_DIR%\zlc_edge_streamer.v" "%STREAMER_DIR%\zlc_uart_bridge.v" "%STREAMER_DIR%\zlc_pulse_streamer_top.v" "%STREAMER_DIR%\!ZLC_CREATE_TCL!" "%STREAMER_DIR%\!ZLC_PROGRAM_TCL!" "!ZLC_SELECTED_XDC!" "%REPO_ROOT%\fpga\board_config\streamer_config.json" "!ZLC_HASH_GEOM!" 2^>nul') do set "ZLC_SRC_HASH=%%H"
 exit /b 0
 
 :zlc_check_prebuilt
