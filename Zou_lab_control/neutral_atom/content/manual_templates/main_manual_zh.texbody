@@ -543,7 +543,7 @@ session.timing        # TimingSubsystem
 
 \begin{description}
 \item[虚拟后端（离线）] 全部用 \filepath{virtual.py} 里的假设备。没有相机、没有 Vivado、没有网络，照样能 \pyapi{na.connect}、构造序列、跑读出（用合成图）、走完整条流程。这是开发、教学、回归测试的主力。
-\item[真实 qCMOS + 本地 RuntimeSequencer] 真实 \pyapi{qcmos} 相机 + 本机的 \pyapi{RuntimeSequencer}。脉冲程序在本地编译并驱动硬件，适合相机和时序硬件都接在同一台机器上的情形。
+\item[真实 qCMOS + 本地 VirtualSequencer] 真实 \pyapi{qcmos} 相机 + 本机的 \pyapi{VirtualSequencer}。脉冲程序在本地编译并驱动硬件，适合相机和时序硬件都接在同一台机器上的情形。
 \item[真实 qCMOS + 远程 FPGA（RemoteSequencer / RPyC）] 真实相机在本地，脉冲流送给\tfocus{远程} FPGA：本地的 \pyapi{RemoteSequencer} 通过 RPyC 调到 \pyapi{sequencer_server.py} 跑的服务（\pyapi{run_server}，jtag-axi 后端），由它经 \pyapi{VivadoAxiStreamerSession} 用 JTAG-to-AXI 操作 FPGA。这是真机实验的典型部署。
 \end{description}
 
@@ -625,7 +625,7 @@ result = session.readout.detect()
 
 \begin{description}
 \item[我要改脉冲时长 / 通道延迟 / 扫描] 改 \pyapi{session.sequence}（timing 层，\filepath{sequence.py} / \filepath{pulse_table.py}）。
-\item[我要把序列送上硬件] 用 \pyapi{session.devices.sequencer.prepare(...)}（devices 上传，本地 \pyapi{RuntimeSequencer} 或远程 \pyapi{RemoteSequencer}）；要把 GUI 脉冲 / 扫描表绑上序列器反复 fire，用 \pyapi{session.timing.bind_pulse(...)} 拿一个 \pyapi{PulseController}。
+\item[我要把序列送上硬件] 用 \pyapi{session.devices.sequencer.prepare(...)}（devices 上传，本地 \pyapi{VirtualSequencer} 或远程 \pyapi{RemoteSequencer}）；要把 GUI 脉冲 / 扫描表绑上序列器反复 fire，用 \pyapi{session.timing.bind_pulse(...)} 拿一个 \pyapi{PulseController}。
 \item[我要拍一张原始图] 找相机 \pyapi{capture()}（devices/\filepath{qcmos.py}）——只会拿到原始像素，没有圈。
 \item[我要知道某格点在图上哪个像素] 问 \pyapi{TrapCalibration}（core/\filepath{calibration.py}），不要去问 \pyapi{TrapArrayDevice}。
 \item[我要从图里找原子 / 拟合 / 判定占据] 用 operations/ 的纯算法；在实验流程里由 \pyapi{session.readout} 编排调用。
@@ -1009,10 +1009,9 @@ seq.set_safe_state()                         # 远端回到安全空闲
 
 \begin{description}
 \item[\pyapi{VirtualSequencer}] 纯软件假人。无硬件，用于离线开发与单元测试，验证编译/契约而不接 FPGA。
-\item[\pyapi{RuntimeSequencer}] 本地适配器：直接内嵌一个 \pyapi{SequencerService}，在\tfocus{同一进程}里走完整的 prepare/fire/wait 协议（默认无硬件回调，用 \pyapi{sleep_scale} 模拟时长）。适合在一台机器上端到端联调协议。
+\item[\pyapi{VirtualSequencer}] 本地适配器：直接内嵌一个 \pyapi{SequencerService}，在\tfocus{同一进程}里走完整的 prepare/fire/wait 协议（无硬件回调，按程序时长 × \pyapi{sleep\_scale} 实时节拍播放）。虚拟后端与 pulse GUI 的 Virtual (sim) 共用它，适合在一台机器上端到端联调协议。
 \item[\pyapi{ManualSequencer}] 手动/逐步模式，给需要人工介入或单步推进的台架调试用。
 \item[\pyapi{RemoteSequencer}] RPyC 客户端代理，连远端真实硬件（本章主角）。
-\item[\pyapi{VerilogSequencer}] 走 \filepath{verilog.py} 那条路，把脉冲编译成边沿表/HDL 工件（\pyapi{VerilogBuild}），用于生成/检视而非实时驱动。
 \end{description}
 
 \section{repeat\_forever 的两种用法：示波器 vs. 相机}

@@ -23,7 +23,7 @@
       b/.style={draw=StarkGray, rounded corners=2pt, fill=StarkPale, align=center, inner sep=4pt, text width=34mm, minimum height=12mm},
       hw/.style={b, fill=StarkTint}]
     \node[b] (v) {\textbf{virtual}\\VirtualCamera +\\VirtualSequencer +\\VirtualTrapArray\\(完全离线)};
-    \node[hw, right=8mm of v] (q) {\textbf{qCMOS + 本地}\\QCMOSCamera +\\RuntimeSequencer\\(本地编译执行)};
+    \node[hw, right=8mm of v] (q) {\textbf{qCMOS + 本地}\\QCMOSCamera +\\VirtualSequencer\\(本地编译执行)};
     \node[hw, right=8mm of q] (r) {\textbf{qCMOS + 远程 FPGA}\\QCMOSCamera +\\RemoteSequencer\\(RPyC -> FPGA 电脑)};
   \end{tikzpicture}
   \caption{三种后端共享 \pyapi{NeutralAtomSession} 接口。教学/回归用 virtual，真实实验用 qCMOS + 本地或远程序列器。}
@@ -79,7 +79,7 @@ devices.open()        # 按依赖顺序打开（相机最后开），失败时�
 \pyapi{DeviceSet} 既是属性访问（\pyapi{.camera}）也是字典访问（\pyapi{devices["camera"]}）；\pyapi{.require(name, expected\_type)} 会校验类型契约。
 
 \section{设备注册表}
-内置设备类在 \pyapi{DEVICE_CLASSES}（\filepath{registry.py}）：\pyapi{QCMOSCamera}、\pyapi{VirtualCamera}、\pyapi{VirtualTrapArray}、\pyapi{RuntimeSequencer}、\pyapi{RemoteSequencer}、\pyapi{ManualSequencer}、\pyapi{VerilogSequencer}。自定义设备用 \pyapi{na.register_device_class(name, cls)} 注册后即可在配置里按名字引用。
+内置设备类在 \pyapi{DEVICE_CLASSES}（\filepath{registry.py}）：\pyapi{PylonCamera}、\pyapi{QCMOSCamera}、\pyapi{VirtualCamera}、\pyapi{VirtualMotCamera}、\pyapi{VirtualTrapArray}、\pyapi{VirtualSequencer}、\pyapi{RemoteSequencer}、\pyapi{ManualSequencer}、\pyapi{VirtualLaser}、\pyapi{VirtualRF}。自定义设备用 \pyapi{na.register_device_class(name, cls)} 注册后即可在配置里按名字引用。
 
 \begin{codeblock}[Python]
 na.available_device_configs()   # 列出 configs/ 下可用配置名
@@ -376,7 +376,7 @@ __CAMERA_CABLE_FIG__
 \item[\filepath{devices/registry.py}] 注册表与加载器。包含 \pyapi{load_devices}、\pyapi{DeviceSet}、\pyapi{DEVICE_CLASSES}、\pyapi{register_device_class}、\pyapi{available_device_configs}、\pyapi{read_config}。这是你与设备层打交道的主入口。
 \item[\filepath{devices/virtual.py}] 离线模拟实现：\pyapi{VirtualCamera}、\pyapi{VirtualTrapArray}、\pyapi{VirtualSequencer}。没有任何真实硬件时用它们跑通整条流程。
 \item[\filepath{devices/qcmos.py}] \pyapi{QCMOSCamera}，真实的 qCMOS 相机驱动封装。
-\item[\filepath{devices/sequencer.py}] 几个真实/半真实时序器实现（\pyapi{RuntimeSequencer}、\pyapi{RemoteSequencer}、\pyapi{ManualSequencer}、\pyapi{VerilogSequencer}）的设备层包装。
+\item[\filepath{devices/sequencer.py}] 真实/半真实时序器实现（\pyapi{RemoteSequencer}、\pyapi{ManualSequencer}）与两端共用的 \pyapi{SequencerService} 协议状态机；进程内软件时序器是 \filepath{devices/virtual.py} 的 \pyapi{VirtualSequencer}。
 \end{description}
 
 \begin{notebox}[心智模型]
@@ -474,10 +474,9 @@ config = {
 \item[\pyapi{QCMOSCamera}] 真实 qCMOS 相机（\filepath{devices/qcmos.py}）。
 \item[\pyapi{VirtualCamera}] 离线模拟相机。
 \item[\pyapi{VirtualTrapArray}] 离线模拟阱阵列。
-\item[\pyapi{RuntimeSequencer}] 本地进程内时序器，自己编译边沿表。
+\item[\pyapi{VirtualSequencer}] 本地进程内时序器（\filepath{devices/virtual.py}），自己编译边沿表并按真实时长节拍播放——虚拟后端与 pulse GUI 的 Virtual (sim) 共用同一个类。
 \item[\pyapi{RemoteSequencer}] 通过 RPyC 连到 FPGA 主机上 \pyapi{SequencerService} 的客户端代理。
 \item[\pyapi{ManualSequencer}] 手动时序器，提示"现在手动启动 FPGA"，\pyapi{fire()} 是占位空操作，用于首光调试。
-\item[\pyapi{VerilogSequencer}] 不执行而是生成 Verilog 的时序器，需要一个 \pyapi{fire\_callback}。
 \end{description}
 
 \subsection{\pyapi{register\_device\_class}：加入自定义设备}
@@ -657,21 +656,17 @@ __CAMERA_GRABBER_FIG__
 时序器是本系统最容易混淆的部分，因为有五个实现，外形相似但用途迥异。下面逐一说明各自的\tfocus{独特角色}与适用场景。
 
 \begin{description}
-\item[\pyapi{VirtualSequencer}] 离线 mock。\pyapi{prepare}/\pyapi{fire} 都是平凡（trivial）的空跑实现，不接触任何硬件。\tfocus{何时用}：写脚本、跑单测、调 GUI、CI——任何没有也不需要硬件的场合。
-\item[\pyapi{RuntimeSequencer}] 本地进程内运行一个 \pyapi{SequencerService}，会真正\tfocus{编译边沿表}。\tfocus{何时用}：在控制电脑本地就能完成编译与（模拟/本地）执行，不经过网络的场合；也适合验证编译产物。
+\item[\pyapi{VirtualSequencer}] 本地进程内运行一个 \pyapi{SequencerService}，会真正\tfocus{编译边沿表}，并按程序自身时长 × \pyapi{sleep\_scale} 的\tfocus{实时节拍}播放（扫描进度、live 相机节奏都跟着真实时长走）。\tfocus{何时用}：写脚本、跑单测、调 GUI、CI——任何没有硬件的场合；虚拟后端与 pulse GUI 的 Virtual (sim) 都用它，也适合验证编译产物。
 \item[\pyapi{ManualSequencer}] 打印"现在手动启动 FPGA"，\pyapi{fire()} 是\tfocus{占位空操作}。\tfocus{何时用}：\tfocus{首光调试}（first-light commissioning）——硬件还没接好自动触发链路，你想人工按下 FPGA 启动、用本系统准备好一切其余流程。
 \item[\pyapi{RemoteSequencer}] 通过 \tfocus{RPyC} 连到 FPGA 电脑上运行的 \pyapi{SequencerService} 的客户端代理。参数有 \pyapi{host}/\pyapi{port}/\pyapi{channels}/\pyapi{clock\_hz}/\pyapi{trigger\_channels}。\pyapi{open()} 时会从远端 snapshot \tfocus{同步}通道数与时钟；\pyapi{prepare} 把序列以 JSON 发过去，\pyapi{fire} 调用远端执行。\tfocus{何时用}：正式实验——控制电脑与 FPGA 电脑分离，跨网络驱动真实硬件。
-\item[\pyapi{VerilogSequencer}] 不执行，而是\tfocus{生成 Verilog}。需要一个 \pyapi{fire\_callback}。\tfocus{何时用}：你想把序列固化成 HDL、做综合/上板前的离线生成，而不是即时驱动。
 \end{description}
 
 \subsection{选型速查}
 
 \begin{itemize}
-\item 没有硬件、只想跑通流程 → \pyapi{VirtualSequencer}（或整套 \pyapi{"virtual"} 配置）。
-\item 本地编译、不过网络 → \pyapi{RuntimeSequencer}。
+\item 没有硬件、只想跑通流程 / 本地编译验证 → \pyapi{VirtualSequencer}（或整套 \pyapi{"virtual"} 配置）。
 \item 硬件刚接好、需人工启动 → \pyapi{ManualSequencer}。
 \item 正式跨机驱动 FPGA → \pyapi{RemoteSequencer}。
-\item 生成 HDL 而非执行 → \pyapi{VerilogSequencer}。
 \end{itemize}
 
 \subsection{\pyapi{RemoteSequencer} 的配置示例}

@@ -268,7 +268,7 @@ def test_command_backend_progress_never_fabricates_advance():
     PulseController(svc, _scan_state()).on_pulse(repeat_forever=True)
     first = svc.scan_progress()
     assert first == {"scanning": True, "point": 0, "n_points": 3, "sweep": 0, "n_repeats": 0}
-    _time.sleep(0.12)                            # >> 2 * SCAN_PROGRESS_DISPLAY_DT
+    _time.sleep(0.12)                            # give the wall clock room to (not) advance the reading
     later = svc.scan_progress()
     # The wall clock advanced but the reading did NOT: no cursor => no fabricated points.  This is
     # the guard against "progress climbs while the device is idle".

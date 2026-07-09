@@ -1630,7 +1630,7 @@ the software twin of `with_slots_resolved`. A pulse with ONLY api slots is there
 sweepable (x = the swept api slot); scan + api slots may both sweep in lockstep. The per-point loop
 is **load → on_pulse → wait the pulse done (`camera.acquire`) → settle → next**, and the settle is
 owned by the DEVICE so callers don't hand-roll timing: `SequencerDevice.settle(seconds, *, stop=)`
-idles the (adjustable) `extra_delay` between points (`VirtualSequencer`/`RuntimeSequencer` scale it
+idles the (adjustable) `extra_delay` between points (`VirtualSequencer` scales it
 by `sleep_scale` like `wait_done`; the wait is cooperatively cancellable on Stop). Guarded by
 `test_pulse_param_scan.py` (api-only sweep drives each point; settle is called once per point).
 
@@ -2034,3 +2034,59 @@ Guarded by `tests/test_grey_molasses_cooling.py` (factor optimum=1.0 / off-D1 / 
 saturation-broadening / laser-has-no-detuning + RF-owns-it / trap-floor-follows-δ / connect-wires-them /
 the detuning-scan recapture-rate peaks at δ=0 end-to-end). Adding two devices bumps the virtual roster,
 so `test_device_config_io.py`'s expected name list includes `laser` / `rf`.
+
+## 24. Live-path performance root fixes: native dtype, binned dis, tick budget, drag protocol (2026-07-09)
+
+Root cause of the real-pylon "camera measurement + 2d is very laggy / unable to allocate 18.xxM":
+a 1920x1200 float64 frame is exactly 17.58 MiB, and the live path allocated several per tick while
+the dis panel additionally ran `np.sort(2.3M)` (Otsu seed) + a raw-sample fit every tick on the GUI
+thread. Five orthogonal fixes, each at its own layer:
+
+1. **Data plane = native dtype end-to-end.** `CameraMeasurement`'s finite ring is native-dtype and
+   publishes the `(filled, 1, H, W)` slice of repeats that HOLD data — no NaN prefill, no float64
+   forcing, no publish-side copy (the hub's `_stored_array` makes the one defensive copy). The
+   output contract (`_assert_primary_shape`) now reads: leading axis = repeats holding data
+   (1..ring). Consumers (`reduce_repeat` / `facet_cells` / `coerce_panel_value` / `_as_data_y` /
+   the console identity path) pass integer blocks through NATIVE — an integer block cannot carry
+   NaN sentinels, so the isfinite machinery is skipped and pool/replace are zero-copy views; float
+   blocks (a scan's NaN-prefilled array) keep gap semantics unchanged. A `facet=repeat` grid now
+   grows cells as repeats fill (the old up-front all-NaN R-deep block was itself the blow-up).
+   `_configure_signal_storage` fails LOUD if a node's `output_specs()` raises (the silent fallback
+   used to downgrade image streams to the 2048-deep default ring).
+
+2. **dis panel is O(bins), never O(samples).** `fit_histogram_curves(edges, counts, mode)` takes
+   ONLY the binned histogram: Otsu in its classic binned form, weighted-bin seeds, bounds from the
+   edges. `histogram_binned` adds an exact bincount fast path for small-domain integer samples
+   (bin-for-bin identical to `np.histogram`, ~5x at 2.3 MP). Threshold L/R fractions interpolate
+   inside the binned counts. Measured: 2.3 MP uint8 dis update with a NEW shot per tick ≈ 29 ms
+   (was 170+ ms).
+
+3. **Console tick: per-panel beat honoured + compose time budget.** The "coherence beats the
+   throttle" override is gone (a live camera advanced `disp` every shot, so update_ms was dead for
+   camera panels); the beat gates WHEN, the coherent clock decides WHAT. The compose phase carries
+   `_TICK_BUDGET_FRACTION` of the base interval; overrun panels stay stale and retry next tick from
+   a rotating start index (fair degradation) — the Qt event loop always breathes.
+
+4. **Selector-on-live protocol** (`selectors.begin/end_figure_interaction`): every drag freezes its
+   own panel's recompose (catch-up on release via the frame key); a blitted panel
+   (`fig._zlc_blit_dirty`, maintained by `BaseLivePlot.compose`) forces ONE full draw at drag start
+   so widget useblit backgrounds are fresh (no ghost frame under the rectangle). `ZoomPan` batches
+   both axis limits per gesture (`fig._zlc_lim_batch`) and calls the figure-registered
+   `_zlc_lim_refresh` hook ONCE — half the re-decimation per zoom/pan. The image decimation layer
+   itself (`_decimate_image_view`) is load-bearing and unchanged.
+
+5. **VirtualMotCamera is a faithful pylon twin** (1920x1200 @ 0.05 s, Mono8): elliptical 40x20 px
+   FWHM spot at peak≈93 counts over offset 7 + read noise, and free-run mode runs a REAL producer
+   thread at the exposure pace with a latest-frame slot (Basler LatestImageOnly) — a slow consumer
+   genuinely drops frames, so the console's amber "display behind" advisory behaves identically on
+   virtual and real rigs. Render ≈ 35 ms/frame < the 50 ms pace.
+
+Plus two architecture items from the same round: `RoiProcessor`
+(`operations/processors/roi.py`: crop + mean/sum/max, region == the 2-D panel selector's pixel
+endpoints via `region_to_acquisition_parameters`, publishes native `roi_frame` + scalar
+`roi_value` — the stock chain for "select a region, watch its distribution / total counts"), and
+the sequencer family converged to **VirtualSequencer / RemoteSequencer (+ ManualSequencer
+first-light)** — RuntimeSequencer (a strict subset of Virtual) and VerilogSequencer (production
+dead code) are deleted, the service-level wall-clock scan-progress simulation went with them, and
+`VirtualSequencer.wait_done` enforces the same deadlock guard + protocol bookkeeping as the bare
+service (`WAIT_FOREVER_MESSAGE` single source).
