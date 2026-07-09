@@ -81,6 +81,7 @@ from .qt_fluent import (
     launch_fluent_window,
     fluent_font_size,
     fluent_scrollbar_stylesheet,
+    fluent_scrollbar_thickness,
     fluent_text_width,
     fluent_widget_stylesheet,
     format_compact_number,
@@ -1838,7 +1839,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 
         self.timeline_hbar = QtWidgets.QScrollBar(QtCore.Qt.Horizontal)
         self.timeline_hbar.setStyleSheet(fluent_scrollbar_stylesheet("QScrollBar"))
-        self.timeline_hbar.setFixedHeight(_px(12, minimum=10))
+        self.timeline_hbar.setFixedHeight(fluent_scrollbar_thickness())   # ONE source (matches the CSS)
         self.timeline_hbar.hide()
         self.timeline_hbar_spacer = QtWidgets.QWidget()
         hbar_row = QtWidgets.QHBoxLayout()

@@ -362,10 +362,21 @@ def fluent_widget_stylesheet() -> str:
     return f'QWidget {{ background: {BG}; color: {TEXT}; font: {fluent_font_size()}pt "{FONT}"; }}'
 
 
+def fluent_scrollbar_thickness() -> int:
+    """The width (vertical bar) / height (horizontal bar) a Fluent scrollbar OCCUPIES, in device px.
+
+    The ONE source for that dimension: ``fluent_scrollbar_stylesheet`` paints the bar this thick,
+    AND any layout that must RESERVE the bar's gutter (so word-wrapped content never slides UNDER a
+    vertical scrollbar -- the classic "text past the right edge" bug) reserves exactly this many px.
+    Whenever the two disagreed, content underlapped the bar; keeping them on one constant closes it."""
+
+    return scaled_px(12, minimum=10)
+
+
 def fluent_scrollbar_stylesheet(selector: str = "QScrollBar") -> str:
     """Return shared Fluent scrollbar CSS for scroll areas and popup lists."""
 
-    thickness = scaled_px(12, minimum=10)
+    thickness = fluent_scrollbar_thickness()
     return f"""
     {selector}:vertical {{
         background: transparent;
@@ -1081,8 +1092,16 @@ class FluentReadoutMultiline(QtWidgets.QPlainTextEdit):
     wrapped lines, size to fit), on the house Fluent readout chrome.  All colours / radius / font come
     from the style tokens (one source), never re-picked."""
 
-    def __init__(self, text: str = "", parent=None):
+    def __init__(self, text: str = "", parent=None, *, plain: bool = False,
+                 max_height: int | None = None):
         super().__init__(parent)
+        # plain=True -> transparent, borderless (reads as plain MESSAGE text, e.g. a warning/error
+        #   body) instead of the grey readout box; still selectable + wrap-anywhere.
+        # max_height set -> the field grows to fit its content UP TO this many px, then STOPS and
+        #   scrolls vertically (the QPlainTextEdit reserves its own scrollbar gutter and re-wraps the
+        #   text narrower, so nothing ever lands under the bar).  None -> grow unbounded (default).
+        self._plain = bool(plain)
+        self._max_height = None if max_height is None else int(max_height)
         self.setReadOnly(True)
         self.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse
                                      | QtCore.Qt.TextSelectableByKeyboard)
@@ -1091,11 +1110,13 @@ class FluentReadoutMultiline(QtWidgets.QPlainTextEdit):
         # wraps to as many lines as it needs instead of overflowing / clipping (confocal idiom).
         self.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
         self.setWordWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
-        # BOTH scrollbars OFF: width-wrapped -> never sideways, and the field auto-sizes to fit EVERY
-        # line so a vertical scrollbar would never have anything hidden to scroll to (confocal idiom).
+        # Horizontal scrollbar OFF forever: width-wrapped -> never sideways.  Vertical starts OFF and,
+        # WITHOUT a max_height, stays off (the field auto-sizes to fit EVERY line, so a vertical bar
+        # would have nothing hidden to scroll to -- confocal idiom); WITH a max_height, _adjust_height
+        # flips it to AsNeeded once the content exceeds the cap.  (The Fluent bar look is applied by
+        # _apply_style, which folds in fluent_scrollbar_stylesheet.)
         self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        apply_fluent_scrollbars(self)
         # Match the document's inner margin to the single-line edit's vertical padding (PADDING_V): the
         # default QPlainTextEdit documentMargin (4 px) makes one text row's content box TALLER than the
         # FluentReadoutEdit row, so a one-line field could not both equal that height AND fully contain
@@ -1103,6 +1124,12 @@ class FluentReadoutMultiline(QtWidgets.QPlainTextEdit):
         # height formula (single-row height + one lineSpacing per extra line) shows every line in full.
         self.document().setDocumentMargin(scaled_px(PADDING_V))
         self._apply_style()
+        if self._plain:
+            # A MESSAGE body is not an input: hide the blinking text caret and don't steal the dialog's
+            # initial focus (so it lands on the OK button -> Enter dismisses).  Mouse selection + copy
+            # still work regardless of focus policy.
+            self.setCursorWidth(0)
+            self.setFocusPolicy(QtCore.Qt.ClickFocus)
         if text:
             self.setPlainText(str(text))
         # Recompute height when the text changes AND when the wrapped layout size changes (a resize
@@ -1115,10 +1142,22 @@ class FluentReadoutMultiline(QtWidgets.QPlainTextEdit):
         _apply_fluent_context_menu(self, event)   # Fluent right-click (Copy / Select-All), not the native menu
 
     def _apply_style(self) -> None:
-        # The SAME readout chrome as FluentReadoutEdit: grey fill (not white -> not an input) + a faint
-        # border + full-contrast text; NO accent focus border, because it cannot be edited.
-        self.setStyleSheet(
-            f"""
+        if self._plain:
+            # Transparent + borderless: reads as plain MESSAGE text (a warning / error body), still
+            # selectable + wrap-anywhere -- no grey readout box, so it drops onto a white card cleanly.
+            base = f"""
+            QPlainTextEdit {{
+                background: transparent;
+                border: none;
+                padding: 0px;
+                color: {TEXT};
+                font: {fluent_font_size()}pt "{FONT}";
+            }}
+            """
+        else:
+            # The SAME readout chrome as FluentReadoutEdit: grey fill (not white -> not an input) + a
+            # faint border + full-contrast text; NO accent focus border, because it cannot be edited.
+            base = f"""
             QPlainTextEdit {{
                 background: {BG};
                 border: 1px solid {DIVIDER};
@@ -1129,7 +1168,9 @@ class FluentReadoutMultiline(QtWidgets.QPlainTextEdit):
             }}
             QPlainTextEdit:focus {{ border: 1px solid {DIVIDER}; }}
             """
-        )
+        # Fold in the shared Fluent scrollbar look: a ``max_height`` field shows a vertical bar when it
+        # overflows, and this ``setStyleSheet`` would otherwise clobber a separately-applied bar style.
+        self.setStyleSheet(base + fluent_scrollbar_stylesheet("QScrollBar"))
 
     def setText(self, text: str) -> None:  # noqa: N802 - match FluentReadoutEdit's line-edit API
         """Quack like a line edit (``setText`` / ``text``) so it drops into the same rows/fillers."""
@@ -1186,15 +1227,25 @@ class FluentReadoutMultiline(QtWidgets.QPlainTextEdit):
             line_height = self.fontMetrics().lineSpacing()
             base_row = scaled_px(30, minimum=22)    # == FluentLineEdit's single-row height (one source)
             total = base_row + (lines - 1) * line_height
-            if total != self.height():
-                self.setFixedHeight(total)
-            # Absorb any residual: if the wrapped content is still a hair taller than the anchored
-            # estimate (sub-pixel wrap rounding differs run-to-run), the scrollbar reports how many
-            # pixels are hidden -- add exactly those so the LAST line's glyphs are never clipped.  A
-            # one-line value has no residual, so it stays exactly the single-row height.
-            residual = self.verticalScrollBar().maximum()
-            if residual > 0:
-                self.setFixedHeight(total + residual)
+            cap = self._max_height
+            if cap is not None and total > cap:
+                # Too tall to fit: STOP at the cap and SCROLL the overflow.  The vertical bar shows
+                # (AsNeeded) and, being a QPlainTextEdit, RESERVES its own gutter -- the text re-wraps
+                # narrower, so nothing lands under the bar and nothing overflows sideways.
+                self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+                if self.height() != cap:
+                    self.setFixedHeight(cap)
+            else:
+                self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+                if total != self.height():
+                    self.setFixedHeight(total)
+                # Absorb any residual: if the wrapped content is still a hair taller than the anchored
+                # estimate (sub-pixel wrap rounding differs run-to-run), the scrollbar reports how many
+                # pixels are hidden -- add exactly those so the LAST line's glyphs are never clipped.  A
+                # one-line value has no residual, so it stays exactly the single-row height.
+                residual = self.verticalScrollBar().maximum()
+                if residual > 0:
+                    self.setFixedHeight(total + residual)
             self.updateGeometry()
         finally:
             self._adjusting_height = False
@@ -1495,24 +1546,16 @@ class _FluentMessageDialog(QtWidgets.QDialog):
         outer.setContentsMargins(pad, pad, pad, pad)
         outer.setSpacing(scaled_px(10, minimum=6))
         outer.addWidget(FluentSectionLabel(str(title)))
-        body = FluentLabel(str(text))
-        body.setWordWrap(True)
+        # The body is a wrap-ANYWHERE read-only text block (FluentReadoutMultiline, plain chrome): a
+        # long unbreakable token -- a Windows path, a dotted traceback frame, a fingerprint -- BREAKS
+        # mid-token instead of running past the card edge / under the scrollbar the way a QLabel's
+        # word-BOUNDARY wrap does (that clipping was the bug).  It hugs a short message and, past the
+        # height cap, stops and scrolls (the QPlainTextEdit reserves its own vertical-bar gutter, so
+        # nothing lands under the bar).  Selectable, too, so a user can copy an error / traceback.
         body_width = scaled_px(360, minimum=240)
-        body.setMaximumWidth(body_width)
-        # A short message hugs its content exactly as before; a LONG one (a stack of validation
-        # failures, a backend traceback) must SCROLL rather than grow the dialog past the screen, so
-        # past a height cap the label goes inside the shared Fluent scroll area (one scrollbar look).
-        cap = scaled_px(320, minimum=180)
-        natural_h = body.heightForWidth(body_width) if body.hasHeightForWidth() else body.sizeHint().height()
-        if natural_h <= cap:
-            outer.addWidget(body)
-        else:
-            scroller = FluentScrollArea()
-            scroller.setWidget(body)
-            scroller.setFixedWidth(body_width)
-            scroller.setFixedHeight(cap)
-            scroller.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-            outer.addWidget(scroller)
+        body = FluentReadoutMultiline(str(text), plain=True, max_height=scaled_px(320, minimum=180))
+        body.setFixedWidth(body_width)
+        outer.addWidget(body)
         row = QtWidgets.QHBoxLayout()
         row.addStretch(1)
         # A warning wears the ORANGE accent (the same destructive/attention hue Remove uses); a plain

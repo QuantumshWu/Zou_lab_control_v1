@@ -72,6 +72,7 @@ from .qt_fluent import (
     YELLOW,
     _popup_gap,
     fluent_message,
+    fluent_scrollbar_thickness,
     FluentButton,
     FluentCodeEdit,
     FluentComboBox,
@@ -1898,7 +1899,7 @@ class PanelCard(FluentGroupBox):
         # of a control (it would otherwise occlude the combo / value boxes when content scrolls).
         # The popup anchors its RIGHT edge at the gear, so this extra width grows the popup
         # LEFTWARD into the empty space there -- exactly "extend the settings frame to the left".
-        scrollbar_w = self._settings_scroll.verticalScrollBar().sizeHint().width() or scaled_px(12)
+        scrollbar_w = fluent_scrollbar_thickness()   # ONE source for the bar width (not a hand-typed 12)
         root.setContentsMargins(pad, pad, pad + scrollbar_w + scaled_px(4), pad)
         root.setSpacing(scaled_px(10, minimum=6))
 

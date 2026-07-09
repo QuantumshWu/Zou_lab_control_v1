@@ -116,6 +116,72 @@ def test_reproduced_figure_renders_the_saved_x_y_labels(qt, tmp_path):
     assert plotter.cax.get_ylabel() == "Counts", plotter.cax.get_ylabel()
 
 
+def test_fluent_message_body_wraps_anywhere_and_never_clips(qt):
+    """A warning / error message body must WRAP an unbreakable long token (a Windows path, a dotted
+    traceback frame, a long fingerprint) instead of running past the card edge / under the vertical
+    scrollbar the way a word-BOUNDARY-wrapping QLabel did (that clipping was the reported bug).  So the
+    body is a wrap-ANYWHERE ``FluentReadoutMultiline`` (WidgetWidth + WrapAtWordBoundaryOrAnywhere) and,
+    with a long unbreakable token, has ZERO horizontal scroll range (nothing overflows sideways)."""
+    from PyQt5 import QtWidgets, QtGui
+    from Zou_lab_control.frontend.qt_fluent import _FluentMessageDialog, FluentReadoutMultiline, FluentLabel
+
+    text = (
+        "RuntimeError: geometry/layout mismatch: bitstream reports 0x5A87FD36 but host fingerprint is "
+        "0x5AFC7CFB_A_VERY_LONG_UNBREAKABLE_TOKEN_WITH_NO_SPACES_AT_ALL_SO_IT_CANNOT_WORD_WRAP\n"
+        'File "C:\\Users\\eadri\\Dropbox\\WorkCode\\Github\\Zou_lab_control_v1_claude\\x.py", line 279\n'
+        + ("more text to force the vertical scrollbar. " * 40)
+    )
+    dlg = _FluentMessageDialog(None, "Connection failed", text, kind="warning")
+    dlg.adjustSize()
+    dlg.show()
+    QtWidgets.QApplication.instance().processEvents()
+    QtWidgets.QApplication.instance().processEvents()
+    try:
+        body = dlg.findChild(FluentReadoutMultiline)
+        # ROOT of the fix: the body is a wrap-anywhere text block, NOT a word-boundary QLabel.
+        assert body is not None, "the message body must be a FluentReadoutMultiline (wrap-anywhere)"
+        assert not dlg.findChildren(FluentLabel) or all(
+            not isinstance(w, FluentLabel) or w is not body for w in dlg.findChildren(FluentLabel))
+        assert body.lineWrapMode() == QtWidgets.QPlainTextEdit.WidgetWidth
+        assert body.wordWrapMode() == QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere
+        # No horizontal overflow -> no glyphs clipped at the edge / hidden under the vertical bar.
+        assert body.horizontalScrollBar().maximum() == 0, "long token overflowed sideways (clipped)"
+        # Long body is CAPPED and scrolls vertically (does not grow the dialog off-screen).
+        assert body.verticalScrollBar().maximum() > 0, "a long message must scroll, not grow unbounded"
+    finally:
+        dlg.close()
+
+
+def test_fluent_message_short_body_hugs_and_is_not_capped(qt):
+    """A SHORT message stays a plain hugging text block: it sizes to its natural height, well UNDER the
+    scroll cap (the cap only kicks in for long content), so a one-line 'Saved …' is not forced into a
+    scroll box.  (The cap is the single ``scaled_px(320, minimum=180)`` the dialog uses.)"""
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend.qt_fluent import _FluentMessageDialog, FluentReadoutMultiline, scaled_px
+
+    dlg = _FluentMessageDialog(None, "Saved", "Saved the pulse program to results/run_042.npz.", kind="info")
+    dlg.adjustSize()
+    dlg.show()
+    QtWidgets.QApplication.instance().processEvents()
+    try:
+        body = dlg.findChild(FluentReadoutMultiline)
+        assert body.height() < scaled_px(320, minimum=180), "a short message must NOT hit the scroll cap"
+        assert body.horizontalScrollBar().maximum() == 0
+    finally:
+        dlg.close()
+
+
+def test_fluent_scrollbar_thickness_is_the_single_source_of_the_bar_width(qt):
+    """The scrollbar bar width lives in ONE place: ``fluent_scrollbar_thickness()``.  The painted CSS
+    (``fluent_scrollbar_stylesheet``) and every layout that RESERVES the bar's gutter read that one
+    value, so they can never silently drift (a hand-typed ``12`` was the smell the audit found)."""
+    from Zou_lab_control.frontend.qt_fluent import fluent_scrollbar_thickness, fluent_scrollbar_stylesheet
+    t = fluent_scrollbar_thickness()
+    assert isinstance(t, int) and t > 0
+    css = fluent_scrollbar_stylesheet("QScrollBar")
+    assert f"width: {t}px" in css and f"height: {t}px" in css, "the CSS bar size must be the one thickness"
+
+
 def test_device_manager_loaded_row_is_compact_and_cannot_overflow(qt):
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.frontend.device_manager import DeviceManagerPanel
