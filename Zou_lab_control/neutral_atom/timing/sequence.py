@@ -609,10 +609,10 @@ def decode_analog_bus(sequence: "PulseSequence", members, at_time: float) -> int
     -2^(B-1) and the spot vanished.
 
     A DRIVEN bus sampled BEFORE its delayed window decodes to the SAME safe level: the hardware's
-    per-DA-bit delay scheduler idles each bit at its ``SAFE_BIT`` -- the bits of the mid-scale
-    ``BUS_SAFE_VALUE`` code -- until the first scheduled change emerges at ``t == d``, i.e.
-    ``out[t] = in[t-d]`` holding safe before the window (``engine_model.bus_delay_line_reference``
-    and its RTL register mirror; ``zlc_edge_streamer.v`` ``g_busdly``).  The window start needs no
+    instruction-level per-bus segment delay holds the whole bus at ``BUS_SAFE_VALUE`` (mid-scale
+    code) until the first captured segment descriptor emerges at ``t == d``, i.e. ``out[t] = in[t-d]``
+    holding safe before the window (``engine_model.bus_delay_line_reference`` and its RTL register
+    mirror ``rtl_bus_segment_delay_mirror``; ``zlc_edge_streamer.v`` ``g_busseg``).  The window start needs no
     ``bus_delays`` plumbing: a touched bus projects bits for EVERY period (leading holds carry the
     mid code, whose MSB is high), so the earliest member pulse on the delayed timeline IS the
     delay-window start.
