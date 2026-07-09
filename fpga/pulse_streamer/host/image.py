@@ -203,7 +203,7 @@ class StreamerParams:
     evt_fifo_depth: int = _geom("evt_fifo_depth", 64)          # power of two (event-FIFO ring)
     # per-BUS segment-descriptor FIFO depth (bus_count of them; resolved segments in flight, not
     # value-changes).  Power of two (segment-FIFO ring).
-    bus_evt_fifo_depth: int = _geom("bus_evt_fifo_depth", 32)
+    bus_evt_fifo_depth: int = _geom("bus_evt_fifo_depth", 64)
     # DELAY register region: one 32b word per delay-eligible signal -- channel_count TTL channels
     # then bus_count per-bus DAC delays (both 32b now: DAC is event-scheduled per bit, not the old
     # 12b ring, so TTL and DAC ranges match).  128 words reserved (>= channel_count + bus_count),

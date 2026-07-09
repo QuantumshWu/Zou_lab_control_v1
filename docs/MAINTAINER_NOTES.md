@@ -690,9 +690,12 @@ single 32-bit `BUS_COUNTS` word -- a fingerprint-invisible overflow), `bank_size
 **pow2 `evt_fifo_depth`/`bus_evt_fifo_depth`** (event-FIFO ring pointers), 32-bit `ttl_delay_max_ticks`,
 `channel_count+bus_count<=delay_region_words`.  `coeff_frac_bits`/`slot_mul_width` reach the timing/
 sequencer compilers + `engine_model` via the dependency-free `Zou_lab_control._streamer_geometry` seam
-(mirrors `_clock`), so a config edit changes the emitted coefficients, not just the fingerprint.
-All values equal the shipped literals, so the refactor is byte-identical for the default config (same
-`0x5A87FD36` fingerprint -- an already-running bitstream still connects; no rebuild needed).
+(mirrors `_clock`), so a config edit changes the emitted coefficients, not just the fingerprint.  The
+single-source REFACTOR itself was byte-identical (it changed no synthesized value).  A later config
+edit unified the delay depths to `evt_fifo_depth = bus_evt_fifo_depth = 64` (DAC in-flight segments
+32->64, matching TTL); that IS a geometry change -> the shipped fingerprint is now `0x5AFC7CFB` (was
+`0x5A87FD36`) and the bitstream must be rebuilt.  Each `params` field's meaning is documented in the
+config's own `_field_docs` block.
 
 Proven: `delay_line_reference` (out[t]=in[t-d]) is the unchanged ground truth;
 `engine_model.rtl_delay_line_mirror` mirrors the scheduler cycle-exactly; the REAL RTL is
