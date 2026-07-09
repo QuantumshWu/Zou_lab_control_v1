@@ -74,12 +74,19 @@ def test_first_frame_silent_until_d():
 
 @pytest.mark.parametrize("d", [1, 50, 300, 900, 1500])
 def test_finite_program_done_tail(d):
-    """A finite (non-repeat) program's delay flushes the last d ticks past the program end."""
+    """A finite (non-repeat) program's delay flushes the last d ticks past the program end AND then
+    DRAINS to BUS_SAFE -- a delayed DAC bus must NOT hold its last programmed value forever after the
+    program ends (the done-tail safing bug: a delayed coil/laser channel left energized post-run)."""
     fin = _prog([_seg(0, 0, 0, 0, 0, mode="edge"), _seg(0, 1, 501, 0, 1000, mode="ramp")], repeat=False)
     n = FRAME + 2000
     undelayed, _ = em.bus_undelayed_and_log(fin, 0, n, bus_width=BW)
     ref = em.bus_delay_line_reference(undelayed, d, safe_value=SAFE)
-    assert em.rtl_bus_segment_delay_mirror(fin, 0, d, n, bus_width=BW) == ref
+    got = em.rtl_bus_segment_delay_mirror(fin, 0, d, n, bus_width=BW)
+    assert got == ref
+    # done at final_tick == FRAME snaps the undelayed bus to SAFE; the delayed bus drains d ticks later
+    # (out[t]=in[t-d]) -> SAFE from FRAME+d+1 to the end, NOT a stuck last value.
+    assert got[-1] == SAFE and all(v == SAFE for v in got[FRAME + d + 1:])
+    assert got[FRAME + d - 1] != SAFE     # ...but the programmed value is still live JUST before drain
 
 
 @pytest.mark.parametrize("d", [1, 137, FRAME + 3, 3 * FRAME + 250, 10 * FRAME])

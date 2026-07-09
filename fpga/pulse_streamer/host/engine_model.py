@@ -964,6 +964,19 @@ def bus_undelayed_and_log(program, bus_index: int, n_ticks: int, scan_point: int
         log: list = []
         stream = bus_play(program, bus_index, n_ticks, scan_point, bus_width=bus_width,
                           frac_bits=frac_bits, apply_log=log)
+        # FINITE done tail: at done (== final_tick == frame) the engine snaps the undelayed bus to
+        # BUS_SAFE_VALUE (zlc_bus_clear_runtime), visible the next tick.  A DELAYED bus must therefore
+        # DRAIN to SAFE d ticks later (out[t]=in[t-d]), NOT hold its last programmed value forever.
+        # Model that snap: force the undelayed stream to SAFE past done, and log a SAFE-hold EDGE apply
+        # at done so the segment-delay re-player captures + drains it -- mirrors zlc_bus_capture_safe_hold
+        # in the RTL, so bus_delay_line_reference (via this stream) and rtl_bus_segment_delay_mirror
+        # (via this log) both drain in lock-step instead of both holding a stale value.
+        if not repeat and frame > 0 and n_ticks > frame:
+            safe = 1 << (bus_width - 1)
+            for t in range(frame + 1, n_ticks):
+                stream[t] = safe
+            log.append((frame, {"value": safe, "ramp": False, "rstart": frame, "rstop": frame,
+                                 "target": safe, "denom": 0, "accum": 0, "up": True, "step": 0, "rem": 0}))
         return stream, log
     stream: list = []
     log = []

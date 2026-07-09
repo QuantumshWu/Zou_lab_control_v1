@@ -674,6 +674,30 @@ module zlc_edge_streamer #(
         end
     endtask
 
+    // At DONE the undelayed bus snaps to BUS_SAFE_VALUE (zlc_bus_clear_runtime).  For a DELAYED bus
+    // that snap must reach the output d ticks LATER (out[t]=in[t-d]); the delayed re-player only sees
+    // segments the engine APPLIED during RUN, so capture the done-time SAFE transition as a SAFE-HOLD
+    // edge descriptor (emit=g_time+d, isramp=0) -> the re-player drains to SAFE d ticks after done,
+    // exactly like d==0 (bus_value_active) and d==1 (the dprev register) already do.  A bus with d<=1
+    // needs no descriptor.  Called ONLY at the finite-program done edge (NOT at FIRE, where reset_sync
+    // flushes the whole g_busseg FIFO anyway).  Mirrors engine_model.bus_undelayed_and_log's done snap.
+    task zlc_bus_capture_safe_hold;
+        integer i;
+        begin
+            for (i = 0; i < BUS_COUNT; i = i + 1) begin
+                if (del_bus_ticks[i] > {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1}) begin
+                    bus_seg_push[i]   <= 1'b1;
+                    bus_seg_emit[i]   <= g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, del_bus_ticks[i]};
+                    bus_seg_rstop[i]  <= {GTIME_WIDTH{1'b0}};   bus_seg_fend[i] <= {GTIME_WIDTH{1'b1}};
+                    bus_seg_vstart[i] <= BUS_SAFE_VALUE[BUS_WIDTH-1:0];   bus_seg_target[i] <= BUS_SAFE_VALUE[BUS_WIDTH-1:0];
+                    bus_seg_denom[i]  <= {TICK_WIDTH{1'b0}};    bus_seg_step[i] <= {(BUS_WIDTH+1){1'b0}};
+                    bus_seg_rem[i]    <= {(BUS_WIDTH+1){1'b0}}; bus_seg_steep[i] <= 1'b0;
+                    bus_seg_up[i]     <= 1'b1;     bus_seg_isramp[i] <= 1'b0;
+                end
+            end
+        end
+    endtask
+
     // Clear the per-channel + per-bus delay amounts (used on reset/FIRE).  The scheduler/re-player
     // state (TTL event FIFO wr/rd/cnt/obit; DAC segment FIFO + delayed re-player regs) is cleared
     // inside each generate's own reset_sync branch (g_evtfifo / g_busseg), nothing to reset here.
@@ -809,7 +833,6 @@ module zlc_edge_streamer #(
         reg [TICK_WIDTH-1:0] s_eff, e_eff;          // the ONLY bus affine evals: 2 per bus
         begin
             for (i = 0; i < BUS_COUNT; i = i + 1) begin
-                bus_seg_push[i] <= 1'b0;   // default: no segment-delay capture; zlc_bus_apply_segment sets it
                 idx  = reinit ? {(BUS_SEG_ADDR_WIDTH+1){1'b0}} : bus_index_active[i];
                 addr = (i * MAX_BUS_SEGMENTS) + idx[BUS_SEG_ADDR_WIDTH-1:0];
                 s_eff = zlc_effective_tick(bus_start_tick_mem[addr], bus_start_tick_coeff_mem[addr], slot_vec);
@@ -967,6 +990,13 @@ module zlc_edge_streamer #(
         reset_meta <= reset; reset_sync <= reset_meta;
         start_meta <= start; start_sync <= start_meta; start_prev <= start_sync;
         bus_prog_we_meta <= bus_prog_we; bus_prog_we_sync <= bus_prog_we_meta; bus_prog_we_prev <= bus_prog_we_sync;
+
+        // DAC segment-delay capture strobe: default LOW EVERY cycle so it is a clean 1-cycle pulse
+        // regardless of which FSM path runs (zlc_bus_apply_segment during RUN, or the done-tail SAFE
+        // hold below, both re-assert it LATER in this block -> the last NBA wins).  Previously it was
+        // only cleared inside zlc_bus_tick, so at done (tick engine idle) it latched high and re-pushed
+        // duplicate descriptors.
+        for (bus_seg_i0 = 0; bus_seg_i0 < BUS_COUNT; bus_seg_i0 = bus_seg_i0 + 1) bus_seg_push[bus_seg_i0] <= 1'b0;
 
         if (reset_sync && bus_prog_we_event && bus_prog_bus < BUS_COUNT) begin
             bus_prog_flat_addr = {bus_prog_bus, bus_prog_addr};
@@ -1129,7 +1159,9 @@ module zlc_edge_streamer #(
                         bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b1; bnd_seed = 1'b1;
                     end
                 end else begin
-                    running <= 1'b0; done <= 1'b1; state_mask <= {CHANNEL_COUNT{1'b0}}; zlc_bus_clear_runtime();
+                    running <= 1'b0; done <= 1'b1; state_mask <= {CHANNEL_COUNT{1'b0}};
+                    zlc_bus_clear_runtime();          // undelayed bus -> SAFE now
+                    zlc_bus_capture_safe_hold();       // delayed buses drain to SAFE d ticks later
                 end
             end else begin
                 bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b0; bnd_slots = slot_active;  // normal bus step
