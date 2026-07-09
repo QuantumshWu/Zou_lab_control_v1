@@ -157,3 +157,42 @@ def test_exp_device_manager_window_exposes_the_bound_session(exp):
         assert window.session is exp
     finally:
         window.close()
+
+
+def test_added_entry_does_not_bloat_the_config_with_constructor_defaults():
+    """Adding a device persists ONLY what the constructor cannot supply -- a param the constructor
+    already DEFAULTS (PylonCamera.trigger_source) stays OUT of the config, so opening the editor
+    rewrites nothing and the saved config stays minimal (the other half of the single-source fix)."""
+    panel = DeviceManagerPanel(initial_config={"cam": {"type": "PylonCamera", "params": {}}},
+                               on_init_session=lambda cfg: None)
+    params = panel.working_config()["cam"]["params"]
+    assert "trigger_source" not in params      # constructor supplies it -> not persisted (no bloat)
+
+
+def test_constructor_required_params_drive_which_prefills_persist():
+    """The core of the fix: a config param with NO constructor default (RemoteSequencer host / port /
+    channels) is a required kwarg whose prefill MUST reach the config; one the constructor DEFAULTS
+    (clock_hz / ssl) must not.  This is what makes ``RemoteSequencer(**params)`` succeed at Init."""
+    from Zou_lab_control.frontend.device_manager import _constructor_required_params
+    from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer
+    required = _constructor_required_params(RemoteSequencer)
+    assert {"host", "port", "channels"} <= required        # no signature default -> persist the prefill
+    assert "clock_hz" not in required and "ssl" not in required   # defaulted -> constructor supplies them
+
+
+def test_remote_sequencer_entry_carries_port_and_channels_into_the_config():
+    """The exact real-hardware failure: a remote sequencer with ONLY ``host`` typed still Init's,
+    because the prefilled ``port`` + ``channels`` (required-with-default kwargs) reach the config and
+    ``RemoteSequencer(**params)`` constructs with no missing-arg TypeError."""
+    from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer
+    try:
+        RemoteSequencer.config_params()                     # needs the server module importable
+    except Exception as exc:                                # pragma: no cover - depends on lab install
+        pytest.skip(f"RemoteSequencer config unavailable: {exc}")
+    panel = DeviceManagerPanel(
+        initial_config={"seq": {"type": "RemoteSequencer", "params": {"host": "10.0.0.5"}}},
+        on_init_session=lambda cfg: None)
+    params = panel.working_config()["seq"]["params"]
+    assert params["host"] == "10.0.0.5"
+    assert isinstance(params.get("port"), int) and params.get("channels")
+    RemoteSequencer(**params)                                # constructs (no 'missing port'); does not connect
