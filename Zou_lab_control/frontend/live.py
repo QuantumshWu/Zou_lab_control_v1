@@ -1029,8 +1029,20 @@ class BaseLivePlot:
         finally:
             self._draw_suspended -= 1
 
+    def _writable_data_y(self) -> np.ndarray:
+        """``data_y`` upgraded to float for the IN-PLACE point writers (update_point / roll): an
+        integer seed (``_as_data_y`` passes integer arrays through natively for the block-update
+        paths) cannot hold the NaN gap sentinel or a fractional measurement -- writing to it would
+        silently truncate, and 'create' padding with NaN would raise.  The upgrade is one-time and
+        only touches the small point-stream panels; block consumers (a camera update()) replace
+        ``data_y`` wholesale and never come through here."""
+        if self.data_y.dtype.kind in "iub":
+            self.data_y = self.data_y.astype(float)
+        return self.data_y
+
     def update_point(self, index: int, value, *, mode: str = "replace", repeat_cur: int | None = None, draw: bool = True):
         """Update one point using a measurement-like update mode."""
+        self._writable_data_y()
         if repeat_cur is not None:
             self.repeat_cur = int(repeat_cur)
         value = np.asarray(value, dtype=float).reshape(-1)
@@ -1055,6 +1067,7 @@ class BaseLivePlot:
 
     def roll(self, value, *, draw: bool = True):
         """Roll newest data to the left/front, matching the old live() mode."""
+        self._writable_data_y()
         value = np.asarray(value, dtype=float).reshape(-1)
         self.data_y[:] = np.roll(self.data_y, shift=1, axis=0)
         self.data_y[0, : len(value)] = value
