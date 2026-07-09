@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from math import cos, radians, sin, sqrt
 from pathlib import Path
 from typing import Mapping, Sequence
+import threading
 import time
 
 import numpy as np
@@ -1130,15 +1131,20 @@ class VirtualMotCamera(_TriggerWiredCamera):
       edge on THAT line, the pure externally-triggered grabber -- an idle wire yields no frame and
       the live view freezes (``capture_trigger_channels`` is then ``(trigger_source,)``)."""
 
-    def __init__(self, *, width: int = 64, height: int = 64, exposure: float = 5e-3,
+    def __init__(self, *, width: int = 1920, height: int = 1200, exposure: float = 0.05,
                  coil_buses: Mapping[str, Sequence[str]] | None = None,
                  b0: Mapping[str, float] | None = None,
                  b_sigma: Mapping[str, float] | None = None,
-                 peak_rate: float = 4.0e5, background_rate: float = 2.0e3,
-                 offset_counts: float = 100.0, read_noise: float = 2.0,
-                 spot_sigma_px: float = 6.0, timeout: float = 2.0, seed: int | None = None,
+                 peak_counts: float = 93.0, offset_counts: float = 7.0, read_noise: float = 1.5,
+                 spot_size_px: tuple[float, float] = (40.0, 20.0),
+                 timeout: float = 2.0, seed: int | None = None,
                  trigger_source: str = SOFTWARE_TRIGGER,
                  sequencer=None):
+        # FAITHFUL to the real monitor camera (Basler acA1920-155um defaults): the full 1920x1200
+        # sensor, 50 ms exposure, and 8-bit frames whose MOT is a FLAT ~40x20 px bright blob
+        # (peak ~offset+peak_counts ~= 100 counts at the capture optimum) over a 5-10 count noisy
+        # background -- so the virtual pipeline carries the SAME 2.3 MP uint8 payload per frame the
+        # real pylon stream does, and profiling/console behaviour transfer 1:1.
         self.width, self.height = int(width), int(height)
         self._exposure = self._validated_exposure(exposure)
         self.timeout = positive_float(timeout, "timeout")
@@ -1161,14 +1167,19 @@ class VirtualMotCamera(_TriggerWiredCamera):
         self.b0 = {str(k): float(v) for k, v in dict(b0 or {"da_x": 7.0, "da_y": -5.0, "da_z": 11.0}).items()}
         self.b_sigma = {str(k): positive_float(v, "b_sigma") for k, v in dict(
             b_sigma or {"da_x": 6.0, "da_y": 6.0, "da_z": 6.0}).items()}
-        self.peak_rate = nonnegative_float(peak_rate, "peak_rate")
-        self.background_rate = nonnegative_float(background_rate, "background_rate")
+        self.peak_counts = nonnegative_float(peak_counts, "peak_counts")
         self.offset_counts = nonnegative_float(offset_counts, "offset_counts")
         self.read_noise = nonnegative_float(read_noise, "read_noise")
-        self.spot_sigma_px = positive_float(spot_sigma_px, "spot_sigma_px")
+        sx, sy = spot_size_px
+        self.spot_size_px = (positive_float(sx, "spot_size_px[0]"), positive_float(sy, "spot_size_px[1]"))
         self._rng = np.random.default_rng(seed)
         self._roi: tuple[int, int, int, int] | None = None
         self.last_levels: dict[str, int] | None = None    # what the last frame sensed (snapshot/debug)
+        # FREE-RUN producer state (the faithful LatestImageOnly stream, see _arm/_producer_loop):
+        # the sensor thread exposes on its own clock into a ONE-deep latest slot; a consumer slower
+        # than the frame period simply misses the overwritten frames, exactly like the real Basler.
+        self._producer: threading.Thread | None = None
+        self._producer_stop = threading.Event()
         # The virtual TRIGGER CABLE (see _TriggerWiredCamera): fired coil sequences reach this
         # sensor only through the wired in-process streamer.  None = no cable, never a frame.
         self._wire_to(sequencer)
@@ -1231,22 +1242,36 @@ class VirtualMotCamera(_TriggerWiredCamera):
     def _render_at_levels(self, levels: Mapping[str, float], frames: int) -> list[np.ndarray]:
         """THE one rendering core (levels -> efficiency -> spot + noise) BOTH acquisition modes
         share -- free-run and hardware trigger differ only in where ``levels`` come from, never in
-        how a frame is made (no forked physics)."""
+        how a frame is made (no forked physics).
+
+        Faithful 8-BIT frames at the real pylon payload: a flat elliptical MOT blob
+        (``spot_size_px`` = FWHM ~40x20 px, peak ~``offset+peak_counts`` ~= 100 counts at the
+        capture optimum) on a 5-10 count noisy background, ``uint8`` like the Basler Mono8 stream.
+        PERFORMANCE: at 2.3 MP / 20 fps a full-frame Poisson draw (~80 ms) cannot keep the real
+        frame period, and physically the ~7-count background is READ-NOISE dominated anyway -- so
+        the background is one Gaussian field (offset + read noise) and the Poisson shot noise is
+        drawn only inside the small spot window where the signal actually lives (~120x60 px)."""
         frames = positive_int(frames, "frames")
         self.last_levels = dict(levels)
         eff = self.mot_efficiency(levels)
-        yy, xx = np.mgrid[0:self.height, 0:self.width]
-        cx, cy = self.width / 2.0, self.height / 2.0
-        spot = np.exp(-(((xx - cx) ** 2 + (yy - cy) ** 2) / (2.0 * self.spot_sigma_px ** 2)))
-        rate = self.background_rate + self.peak_rate * eff * spot
+        h, w = self.height, self.width
+        cx, cy = w / 2.0, h / 2.0
+        fwhm = 2.0 * np.sqrt(2.0 * np.log(2.0))
+        sx, sy = self.spot_size_px[0] / fwhm, self.spot_size_px[1] / fwhm
+        # The spot's local window (+-3 sigma, clamped to the sensor): the ONLY region with signal.
+        x0, x1 = max(0, int(cx - 3 * sx)), min(w, int(np.ceil(cx + 3 * sx)))
+        y0, y1 = max(0, int(cy - 3 * sy)), min(h, int(np.ceil(cy + 3 * sy)))
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        spot = np.exp(-(((xx - cx) / sx) ** 2 + ((yy - cy) / sy) ** 2) / 2.0)
+        spot_rate = self.peak_counts * eff * spot            # mean SIGNAL counts inside the window
         out: list[np.ndarray] = []
         for _k in range(frames):
-            photons = self._rng.poisson(rate * self.exposure).astype(float)
-            frame = self.offset_counts + photons + self._rng.normal(0.0, self.read_noise, size=photons.shape)
-            frame = np.clip(frame, 0, 65535).astype(np.uint16)
+            frame = self.offset_counts + self._rng.normal(0.0, self.read_noise, size=(h, w))
+            frame[y0:y1, x0:x1] += self._rng.poisson(spot_rate)
+            frame = np.clip(frame, 0, 255).astype(np.uint8)  # Mono8, exactly the real pylon dtype
             if self._roi is not None:
-                x, w, y, h = self._roi
-                frame = frame[y:y + h, x:x + w]
+                x, w_roi, y, h_roi = self._roi
+                frame = frame[y:y + h_roi, x:x + w_roi]
             out.append(frame)
         return out
 
@@ -1268,31 +1293,72 @@ class VirtualMotCamera(_TriggerWiredCamera):
             return
         super()._on_wire_fired(sequence)
 
+    def _scene_source(self):
+        """What the free-running sensor images RIGHT NOW: the continuously firing program if there
+        is one, else the STEADY state the last finite fire left latched on the DAC pins, else the
+        safe state (all-zero levels -> the dim background MOT + noise)."""
+        wire = getattr(self, "sequencer", None)
+        if wire is None:
+            return None
+        return wire.firing if wire.firing is not None else getattr(wire, "last_fired", None)
+
+    def _producer_loop(self, pace: float) -> None:
+        """The free-running SENSOR clock (its own thread), faithful to the real Basler
+        LatestImageOnly stream: expose one frame per ``exposure`` period into a ONE-deep latest
+        slot.  A consumer slower than the frame period simply never sees the overwritten frames --
+        the SAME drop semantics (and therefore the same console "display fell behind" advisory)
+        the real pylon free-run produces.  The producer runs for the armed session only."""
+        while not self._producer_stop.wait(pace):
+            frame = self._render_at_levels(self._sense_levels(self._scene_source()), 1)[0]
+            with self._latest_cond:
+                self._latest = frame
+                self._latest_seq += 1
+                self._latest_cond.notify_all()
+
+    def _arm(self, frames: int | None) -> None:
+        super()._arm(frames)
+        # FREE-RUN with real pacing: start the resident sensor stream (the virtual StartGrabbing).
+        # pace == 0 (pytest fast-forward, sleep_scale = 0) keeps the deterministic render-on-demand
+        # path in _grab -- same physics core, only WHO ticks the clock differs.
+        pace = float(self.exposure) * self.sleep_scale
+        if self._free_run and pace > 0.0 and self._producer is None:
+            self._latest, self._latest_seq, self._consumed_seq = None, 0, 0
+            self._latest_cond = threading.Condition()
+            self._producer_stop.clear()
+            self._producer = threading.Thread(
+                target=self._producer_loop, args=(pace,), name="virtual-mot-sensor", daemon=True)
+            self._producer.start()
+
+    def _disarm(self) -> None:
+        if self._producer is not None:
+            self._producer_stop.set()
+            self._producer.join(timeout=2.0)
+            self._producer = None
+        super()._disarm()
+
     def _grab(self, n: int, *, timeout: float | None = None, stop=None) -> bool:
         if not self._free_run:
             return super()._grab(n, timeout=timeout, stop=stop)
-        # FREE-RUN (Software): the sensor exposes on its own clock and reads out ONE frame per
-        # exposure, whatever the trigger wire does.  It images the scene the streamer's outputs
-        # DRIVE right now: the continuously firing program if there is one, else the STEADY state
-        # the last finite fire left latched on the DAC pins (``last_fired`` -- outputs hold their
-        # word until the safe state parks them), else the safe state itself, which _sense_levels
-        # maps to all-zero levels -> the dim background MOT + noise.  A real free-running sensor
-        # delivers dark frames when there is no light; it never freezes.
         if stop is not None and stop.is_set():
             return False
-        wire = getattr(self, "sequencer", None)
-        source = None
-        if wire is not None:
-            source = wire.firing
-            if source is None:
-                source = getattr(wire, "last_fired", None)
-        self._deliver(self._render_at_levels(self._sense_levels(source), 1))
-        # Frame pacing == the exposure clock (a free-running sensor's frame rate is ~its exposure),
-        # scaled by the wire's sleep_scale like every virtual time (0 under pytest -> instant);
-        # ``stop`` interrupts the wait so teardown never blocks a full frame period.
-        pace = float(self.exposure) * self.sleep_scale
-        if pace > 0.0:
-            stop.wait(pace) if stop is not None else time.sleep(pace)
+        if self._producer is not None:
+            # REAL pacing: consume the producer's LATEST frame (never a backlog) -- block until a
+            # frame NEWER than the last consumed one lands, exactly like RetrieveResult on a
+            # LatestImageOnly stream.  Frames the producer overwrote while we were away are LOST,
+            # which is the honest free-run behaviour the console's amber advisory reports.
+            deadline = time.monotonic() + (self.timeout if timeout is None else float(timeout))
+            with self._latest_cond:
+                while self._latest is None or self._latest_seq == self._consumed_seq:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or (stop is not None and stop.is_set()):
+                        return False
+                    self._latest_cond.wait(min(0.05, remaining))
+                self._consumed_seq = self._latest_seq
+                frame = self._latest
+            self._deliver([frame])
+            return True
+        # pace == 0 (tests): render on demand -- the exposure clock is fast-forwarded away.
+        self._deliver(self._render_at_levels(self._sense_levels(self._scene_source()), 1))
         return True
 
     def snapshot(self) -> dict[str, object]:

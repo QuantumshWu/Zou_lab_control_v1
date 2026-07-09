@@ -86,14 +86,23 @@ def test_free_run_brightness_follows_the_held_output_state():
     seqr.fire(seq)                                         # finite fire: the word stays latched
     bright = cam.acquire(1)[0]
     assert cam.last_levels == {bus: int(cam.b0[bus]) for bus in cam.coil_buses}
-    # the model itself orders the two scenes; the frames must follow it
-    assert cam.mot_efficiency(cam.last_levels) > cam.mot_efficiency({bus: 0.0 for bus in cam.coil_buses})
-    assert float(bright.mean()) > float(dark.mean()) + 10
+    # the model itself orders the two scenes; the frames must follow it.  The faithful sensor is
+    # full-frame (the spot is a tiny fraction of 2.3 MP), so brightness is read AT the spot centre
+    # and the threshold derives from the camera's own model -- never a re-typed constant.
+    safe_eff = cam.mot_efficiency({bus: 0.0 for bus in cam.coil_buses})
+    gain = cam.peak_counts * (cam.mot_efficiency(cam.last_levels) - safe_eff)
+    assert gain > 0
+    cy, cx = cam.height // 2, cam.width // 2
+
+    def spot_mean(frame):
+        return float(frame[cy - 3:cy + 4, cx - 3:cx + 4].mean())
+
+    assert spot_mean(bright) > spot_mean(dark) + 0.5 * gain
 
     seqr.set_safe_state()                                  # park the outputs -> back to background
     back = cam.acquire(1)[0]
     assert cam.last_levels == {bus: 0.0 for bus in cam.coil_buses}
-    assert float(back.mean()) < float(dark.mean()) + 10    # the bright state is gone
+    assert spot_mean(back) < spot_mean(dark) + 0.5 * gain  # the bright state is gone
 
 
 # --------------------------------------------------------------------------- (c) explicit hard trigger

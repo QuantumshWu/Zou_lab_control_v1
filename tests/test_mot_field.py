@@ -160,9 +160,14 @@ def test_virtual_mot_camera_senses_only_the_fired_sequence():
 
     far = {name: int(cam.b0[bus] - 4 * cam.b_sigma[bus]) for name, bus in zip(slots, cam.coil_buses)}
     frame_far = triggered_frames(cam, seqr, state.with_api_resolved(far).to_sequence(), 1)[0]
-    # brightness ratio follows the SAME public model the optimum test uses
+    # brightness ratio follows the SAME public model the optimum test uses.  The faithful sensor
+    # is full-frame (the spot is a tiny fraction of 2.3 MP), so brightness is read AT the spot
+    # centre and the threshold derives from the camera's own model, never a re-typed constant.
     assert cam.mot_efficiency(cam.last_levels) < 1e-3
-    assert float(frame_peak.mean()) > float(frame_far.mean()) + 10
+    cy, cx = cam.height // 2, cam.width // 2
+    peak_spot = float(frame_peak[cy - 3:cy + 4, cx - 3:cx + 4].mean())
+    far_spot = float(frame_far[cy - 3:cy + 4, cx - 3:cx + 4].mean())
+    assert peak_spot > far_spot + 0.5 * cam.peak_counts
 
 
 def test_virtual_mot_camera_senses_the_delayed_coil_timeline():

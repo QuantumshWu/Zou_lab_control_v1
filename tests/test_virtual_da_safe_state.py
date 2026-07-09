@@ -161,7 +161,7 @@ def test_ttl_only_fire_images_the_same_scene_as_explicit_zero_da():
 
     # both frames show the SAME spot: contrast (centre disc vs border) follows the model, and the
     # two frames agree within photon/read noise (identical rate maps, independent noise draws)
-    expected_extra = cam.peak_rate * cam.mot_efficiency(levels_ttl) * cam.exposure   # spot counts
+    expected_extra = cam.peak_counts * cam.mot_efficiency(levels_ttl)   # spot counts above background
     cy, cx = cam.height // 2, cam.width // 2
 
     def contrast(frame):
