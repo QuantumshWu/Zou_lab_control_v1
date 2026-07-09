@@ -1398,11 +1398,6 @@ _RELIM_PARAM = ParamDecl(
 UPDATE_INTERVALS = (100, 200, 400, 800)
 DEFAULT_UPDATE_MS = 400
 
-#: Fraction of the base tick interval the compose phase may spend before deferring the remaining
-#: panels to the next tick (see _tick's time budget).  <1 so the Qt event loop keeps a slice of every
-#: tick for input -- the board skips frames under overload instead of freezing the whole UI.
-_TICK_BUDGET_FRACTION = 0.8
-
 #: Image containers the Edit-tab Save offers, in menu order (first = default).  A DATA-layer choice of
 #: the output FILE FORMAT (not an art knob): the figure's geometry / dpi / typography are unchanged; only
 #: the container the ``DataFigure.save(image_ext=...)`` writes changes.  Lowercase to match matplotlib's
@@ -1692,7 +1687,7 @@ class PanelCard(FluentGroupBox):
                  sites_inputs_provider=None, curve_x_provider=None,
                  structure_provider=None, short_names_provider=None,
                  live_namespace_provider=None, pulse_state_provider=None,
-                 grid_recipe_provider=None):
+                 grid_recipe_provider=None, render_barrier=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
         super().__init__(PANEL_KINDS[config.kind], parent)
@@ -1738,6 +1733,12 @@ class PanelCard(FluentGroupBox):
         # producing node the SAME way a pulse panel resolves its state (a dict carried on the node, the
         # float-only hub cannot hold it).
         self.grid_recipe_provider = grid_recipe_provider
+        # callable() -> waits until the console's render worker is idle.  EVERY GUI-thread path
+        # that mutates this card's figure/plotter (a Setting edit, a source apply, the coalesced
+        # rebuild, the selectors switch, teardown) must hold this barrier first -- while a batch
+        # is in flight the render thread owns the figure (see frontend/render_loop.py).  None
+        # (a standalone/test card) makes it a no-op via _wait_render_idle.
+        self.render_barrier = render_barrier
         self.plotter = None
         self.canvas = None
         # The console header's "Selectors" switch state for THIS card (set via
@@ -2931,6 +2932,13 @@ class PanelCard(FluentGroupBox):
         # No per-shot status line in the panel any more (it needed a footer, which broke the
         # height proportion).  The status lives in the Setting popup + the Setting-button
         # tooltip; an error turns the Setting button red.  Restyle only on the ok<->error edge.
+        # THREAD-SAFE by deferral: compose() may run on the console's render thread, and Qt
+        # widget calls (setText/setStyleSheet) are GUI-thread-only -- park the newest status and
+        # let the GUI flush it when the batch is presented (flush_deferred_status).  Keeping the
+        # deferral INSIDE the one status funnel means compose never forks per thread.
+        if QtCore.QThread.currentThread() is not self.thread():
+            self._deferred_status = (str(text), bool(error))
+            return
         self._status_text = str(text)
         if hasattr(self, "status"):
             self.status.setText(str(text)[:200])
@@ -2941,6 +2949,12 @@ class PanelCard(FluentGroupBox):
             if hasattr(self, "status"):
                 self.status.setStyleSheet(f"color: {colour}; background: transparent; border: none;")
             self.setting_button.set_color(colour)
+
+    def flush_deferred_status(self) -> None:
+        """Apply the newest status a render-thread compose parked (GUI thread, present phase)."""
+        pending = self.__dict__.pop("_deferred_status", None)
+        if pending is not None:
+            self.set_status(pending[0], error=pending[1])
 
     # ------------------------------------------------------------- drag to grid
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
@@ -3034,6 +3048,7 @@ class PanelCard(FluentGroupBox):
         now reached through this one declarative path (#H3v-4b)."""
         if self.config.params.get(key) == value:
             return
+        self._wait_render_idle()
         self.config.params[key] = value
         if key == "relim":
             # Flipping INTO ``fixed`` FREEZES the current view: seed lo/hi from what the plot shows
@@ -3102,9 +3117,11 @@ class PanelCard(FluentGroupBox):
         build-then-swaps atomically, so the card never blanks even if this rebuild raises."""
         if not self._force_rebuild:
             return
+        self._wait_render_idle()
         self._rerender_last()
 
     def _apply_source(self) -> None:
+        self._wait_render_idle()
         self.config.source = self.source_edit.text()
         self._compiled_source = self.config.source
         self._reset_plot()      # output shape may change with the expression
@@ -3166,24 +3183,32 @@ class PanelCard(FluentGroupBox):
             self.refresh(self._last_namespace)
 
     # ------------------------------------------------------------- data path
-    def compose(self, namespace: dict[str, object]) -> None:
+    def compose(self, namespace: dict[str, object], *, offthread: bool = False) -> bool:
         """Evaluate this panel's source against ``namespace`` and render the plot INTO ITS OFFSCREEN
         BUFFER -- phase 1 of the board's two-phase render: nothing is pushed to the screen here; the
         board presents every composed panel together in phase 2 so the whole board only ever shows ONE
         coherent shot.  Every failure lands on the gear/status -- a bad expression in one panel must
-        never break the console or its siblings."""
+        never break the console or its siblings.
+
+        ``offthread=True`` is the render-thread entry: identical logic, but a value that needs a
+        STRUCTURAL (re)build -- a Qt-widget operation only the GUI thread may run -- is NOT rendered;
+        the call returns False and the GUI thread re-runs the full compose for this panel when the
+        batch lands.  In-place updates (the steady live stream) return True fully composed; status
+        writes defer themselves inside set_status.  Returns True on the GUI thread always."""
 
         # A BLANK panel (a freshly added pure view, source not yet wired) sits
         # quietly with a hint -- it is decoupled, so it shows nothing until the
         # user picks a signal in its Setting.  Not an error.
         if not str(self._compiled_source).strip():
             self.set_status("pick a signal in Setting", error=False)
-            return
+            return True
         try:
             # The three decoupled stages (#H3l): signal (per data_points slice) -> repeat reduce
             # (the measurement's own repeat axis, per the plot's repeat_mode) -> dim split.  The
             # measurement OWNS ``repeat``; the plot only chooses how to display it.
             value = self._signal_then_repeat(namespace)
+            if offthread and self._needs_structural_build(value, namespace):
+                return False
             self._render(value, namespace)
         except Exception as exc:
             # A failed eval (e.g. the bound signal is not in this namespace yet -- a still-WAITING
@@ -3192,7 +3217,7 @@ class PanelCard(FluentGroupBox):
             # tick re-renders the moment the signal arrives -- never "remove the panel to recover"
             # (#H3w-2).
             self.set_status(str(exc).splitlines()[0][:160] or type(exc).__name__, error=True)
-            return
+            return True
         # Remember the LAST SUCCESSFULLY-rendered namespace so a later display-only change (cmap /
         # relim / a source re-pick) can re-render immediately from it even when the producing
         # measurement is stopped (hub version frozen, no fresh tick) -- see _rerender_last.  Set ONLY
@@ -3200,6 +3225,7 @@ class PanelCard(FluentGroupBox):
         self._last_namespace = namespace
         shot = namespace.get("shot")
         self.set_status(f"shot {int(shot)}" if isinstance(shot, (int, float)) else "ok", error=False)
+        return True
 
     def present(self) -> None:
         """Phase 2 of the board's two-phase render: flush this panel's composed buffer to the screen
@@ -3444,11 +3470,19 @@ class PanelCard(FluentGroupBox):
             return None
         return tuple(sorted((n, versions[n]) for n in refs))
 
+    def _wait_render_idle(self) -> None:
+        """Hold until the console's render worker is idle -- a GUI path must OWN the figure before
+        mutating it (frontend/render_loop.py ownership protocol).  No-op on a standalone card and
+        free when the worker is idle.  Never call from the render thread itself."""
+        if callable(self.render_barrier):
+            self.render_barrier()
+
     def set_selectors_enabled(self, on: bool) -> None:
         """The console header's "Selectors" switch for THIS card: remember the desired state and
         gate the CURRENT plotter now (in place -- no rebuild, no flash).  Every later (re)build /
         focus swap re-applies it through ``_apply_selectors_state``, so a fresh figure always
         inherits the switch."""
+        self._wait_render_idle()
         self._selectors_on = bool(on)
         self._apply_selectors_state()
 
@@ -3468,6 +3502,41 @@ class PanelCard(FluentGroupBox):
         canvas = self.canvas
         if canvas is not None and hasattr(canvas, "_zlc_isolate_wheel"):
             canvas._zlc_isolate_wheel = on and bool(plotter.interaction_handles())
+        if canvas is not None:
+            # Ownership barrier for every mouse path into this canvas (press / double-click /
+            # wheel): wait for the render worker's in-flight batch before selector callbacks
+            # mutate artists.  Hung here because this is the ONE apply point every build / focus
+            # swap converges on, so a fresh or enlarged canvas always carries it (idempotent).
+            canvas._zlc_render_barrier = self.render_barrier
+
+    def _needs_structural_build(self, value, namespace: Mapping[str, object] | None) -> bool:
+        """Whether rendering ``value`` requires (re)building the plotter -- a Qt-widget operation
+        ONLY the GUI thread may run.  False -> a pure in-place artist update (thread-agnostic).
+        The ONE dirtiness rule: ``_render`` dispatches on it AND the render thread probes it
+        first (``compose(offthread=True)``) so a structural panel is handed back to the board
+        instead of touching Qt off-thread.  ``value`` is the raw ``_signal_then_repeat`` result
+        (coerced here -- idempotent and zero-copy on the live path)."""
+        if self._grid_focus is not None:
+            return False                    # an enlarged cell's feed is in-place (or a silent skip)
+        kind = self.config.kind
+        if kind == "pulse":
+            return True                     # a pulse panel rebuilds its structured figure every refresh
+        if self.plotter is None or self._force_rebuild:
+            return True
+        value = self._coerce(value)
+        if kind == "grid":
+            if self._facet():
+                # A cell-count change (the scan restructured) rebuilds through build-then-swap.
+                return len(self._facet_cells(value)) != getattr(self.plotter, "n_cells", -1)
+            return False                    # a recipe grid is a snapshot: never a per-tick rebuild
+        if kind in ("2d", "1d", "sites") and tuple(np.shape(value)) != self._value_shape:
+            return True
+        if kind == "2d":
+            # A ROI that *shifts* without resizing keeps the frame shape, but the
+            # image's pixel coordinates moved -- rebuild so the axes track the ROI.
+            roi = self._source_coord_frame(namespace)
+            return (list(roi) if roi else None) != getattr(self, "_roi_built", None)
+        return False
 
     def _render(self, value, namespace: Mapping[str, object] | None = None) -> None:
         # PERFORMANCE: push data with draw=False and queue ONE draw_idle per
@@ -3500,60 +3569,38 @@ class PanelCard(FluentGroupBox):
             return
         value = self._coerce(value)
         kind = self.config.kind
-        # A pulse panel renders a STRUCTURED figure (a whole timeline) from its sequence object; there is
-        # no in-place array ``update`` for it, so it (re)builds the PulseSequenceFigure through _build_plot
-        # every refresh -- cheap (a static, rarely-changing recipe) and always faithful.
-        if kind == "pulse":
-            self._build_plot(value, namespace)
-            self._force_rebuild = False
-            return
-        # A grid panel is either a LIVE facet grid (the bound block sliced along the declared axis,
-        # cells moved in place each tick) or a RECIPE snapshot (a loaded figure -- built once, never a
-        # per-tick redraw: re-rendering all N cells on every hub bump froze the console, #3).
-        if kind == "grid":
-            if self._facet():
-                # A LIVE facet grid: first show builds; every later tick moves the cells IN PLACE
-                # (update_cells -- the grid counterpart of a standalone kind's update).  A cell-count
-                # change (the scan restructured) rebuilds through the ordinary build-then-swap.
-                # Every (re)build is followed by the Setting-rows sync: the build is the ONE point
-                # every kind-changing path converges on (a pick, a load, an expression edit).
-                if self.plotter is None or self._force_rebuild:
-                    self._build_plot(value, namespace)
-                    self._force_rebuild = False
-                    self._sync_settings_param_rows()
-                    return
-                per_cell = self._facet_cells(value)
-                if len(per_cell) != getattr(self.plotter, "n_cells", -1):
-                    self._build_plot(value, namespace)
-                    self._force_rebuild = False
-                    self._sync_settings_param_rows()
-                    return
-                self.plotter.update_cells(per_cell)
-                if self.canvas is not None:
-                    self.plotter.compose()
-                return
-            # a RECIPE grid is a SNAPSHOT built from its recipe: (re)build only on the FIRST show or
-            # when a display knob marked a rebuild -- NEVER a per-tick redraw (#3).
-            if self.plotter is None or self._force_rebuild:
-                self._build_plot(value, namespace)
-                self._force_rebuild = False
-            return
-        rebuild = self.plotter is None or self._force_rebuild
-        if not rebuild and kind in ("2d", "1d", "sites"):
-            rebuild = tuple(np.shape(value)) != self._value_shape
-        if not rebuild and kind == "2d":
-            # A ROI that *shifts* without resizing keeps the frame shape, but the
-            # image's pixel coordinates moved -- rebuild so the axes track the ROI.
-            roi = self._source_coord_frame(namespace)
-            rebuild = (list(roi) if roi else None) != getattr(self, "_roi_built", None)
-        if rebuild:
+        if self._needs_structural_build(value, namespace):
+            # STRUCTURAL (re)build -- creates the plotter + its Qt canvas, so this branch runs on
+            # the GUI thread only (compose(offthread=True) hands such panels back to the board).
+            # A pulse panel renders a STRUCTURED figure (a whole timeline) from its sequence
+            # object; there is no in-place array ``update`` for it, so it (re)builds the
+            # PulseSequenceFigure through _build_plot every refresh -- cheap (a static,
+            # rarely-changing recipe) and always faithful.
             self._build_plot(value, namespace)             # build-then-swap: a failed build keeps the old figure
             self._force_rebuild = False                    # cleared ONLY after a clean build (else retry next tick)
-            self._value_shape = (1,) if isinstance(value, float) else tuple(np.shape(value))
+            if kind == "grid":
+                if self._facet():
+                    # Every (re)build is followed by the Setting-rows sync: the build is the ONE
+                    # point every kind-changing path converges on (a pick, a load, an expression edit).
+                    self._sync_settings_param_rows()
+                return
+            if kind != "pulse":
+                self._value_shape = (1,) if isinstance(value, float) else tuple(np.shape(value))
             if kind == "monitor":
                 # The build already plotted this value as the first point; record
                 # its source version so the next UNRELATED bump won't duplicate it.
                 self._last_monitor_key = self._monitor_source_key(namespace)
+            return
+        # IN-PLACE update -- pure numpy + matplotlib artist work into the offscreen Agg buffer,
+        # thread-agnostic (this is what the console's render thread executes every steady tick).
+        if kind == "grid":
+            if self._facet():
+                # A LIVE facet grid: every tick moves the cells IN PLACE (update_cells -- the grid
+                # counterpart of a standalone kind's update).
+                self.plotter.update_cells(self._facet_cells(value))
+                if self.canvas is not None:
+                    self.plotter.compose()
+            # a RECIPE grid is a SNAPSHOT built from its recipe: NEVER a per-tick redraw (#3).
             return
         if kind == "2d":
             self.plotter.update(np.asarray(value).ravel(), draw=False)
@@ -4108,6 +4155,7 @@ class PanelCard(FluentGroupBox):
             plt.close(plotter.fig)
 
     def shutdown(self) -> None:
+        self._wait_render_idle()            # the worker must not be composing into this figure
         self._rebuild_timer.stop()          # never fire a coalesced rebuild into a torn-down card
         self._force_rebuild = False
         self._teardown_plot()
@@ -6101,11 +6149,20 @@ class TaskConsole(QtWidgets.QWidget):
         # every update_ms // base ticks.  _tick_count counts base ticks since the last re-base.
         self._tick_count = 0
         self._base_interval_ms = int(self.state.interval_ms)
-        self._compose_rotor = 0                  # where a budget-cut compose pass resumes next tick
         # Display reads each signal at its OWN latest value (one snapshot per tick).  Cross-signal coherence
         # where it matters is FREE: a readout processor co-publishes occupied + centres + frame_judged in one
         # publish, so their latest values are always the same physical shot (sitemap rings == frame_judged
         # underlay == frame_judged 2D).  A live camera repeat block shows its newest, fullest ring -> live.
+
+        # The ONE background render thread: every steady-tick compose (numpy prep + matplotlib
+        # artist updates + Agg rasterisation) runs there; the GUI thread only schedules, presents
+        # the finished front buffers, and serves interaction -- so a slow render lowers the plot
+        # frame rate, never the UI's responsiveness (see frontend/render_loop.py for the ownership
+        # protocol).  Structural builds (Qt widgets) come back to the GUI via _on_render_batch.
+        # Created BEFORE the UI build: load_state constructs panel cards, which take the barrier.
+        from .render_loop import RenderLoop
+        self._render_loop = RenderLoop(self)
+        self._render_loop.job_done.connect(self._on_render_batch)
 
         self._build_ui()
         self.load_state(self.state)
@@ -6437,7 +6494,8 @@ class TaskConsole(QtWidgets.QWidget):
             sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x,
             structure_provider=self._signal_structure, pulse_state_provider=self._pulse_state,
             grid_recipe_provider=self._grid_recipe,
-            short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace)
+            short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace,
+            render_barrier=self._render_loop.barrier)
 
     def _attach_card(self, card: PanelCard) -> None:
         card.setParent(self.board)
@@ -7060,6 +7118,8 @@ class TaskConsole(QtWidgets.QWidget):
         produced by a Logic-tab node, not by this Edit)."""
         if card is None or self._task_locked:
             return
+        # the Edit snapshot reads the live plotter's data arrays -- own the figure first
+        self._render_loop.barrier()
         existing = self._panel_editors.get(id(card))
         if existing is not None:
             self.tabs.setCurrentWidget(existing)
@@ -7253,6 +7313,7 @@ class TaskConsole(QtWidgets.QWidget):
         # _clear_task_running drops the transient task panel, so this never blocks that).
         if self._task_locked:
             return
+        self._render_loop.barrier()   # the worker must not be composing into the card we tear down
         if card in self.cards:
             card.settings_popup.hide()
             self._close_panel_editor(card)     # drop this card's Edit tab too
@@ -7612,7 +7673,13 @@ class TaskConsole(QtWidgets.QWidget):
         if frame is not None:
             self._task_card_frame = frame
         self._update_task_banner(node)
-        self._task_card.refresh(self._expression_namespace())
+        # The mid-run panel refresh touches its figure on the GUI thread, so it may only run while
+        # the render worker is idle (the worker never composes _task_card -- it is not in
+        # self.cards -- but the full-hub snapshot + single-card render must not overlap a batch).
+        # While busy, simply skip: the task's output buffer keeps the latest frame and the very
+        # next idle tick catches up.
+        if not self._render_loop.busy:
+            self._task_card.refresh(self._expression_namespace())
         # NB: leaving task-run mode on finish is handled in ONE place -- _poll_logic_nodes
         # (the canonical node-lifecycle tick, which runs every tick regardless of whether
         # a mid-run panel exists), so a self-finishing task always releases the lock.
@@ -7886,7 +7953,15 @@ class TaskConsole(QtWidgets.QWidget):
                         shots.append(int(p))
         return min(shots) if shots else None
 
-    def _expression_namespace(self) -> dict[str, object]:
+    def _expression_namespace(self, disp="__current__") -> dict[str, object]:
+        """The board's shared shot-coherent GUI namespace.  ``disp`` pins the display shot (the
+        render thread passes the one its batch was scheduled against); by default it is computed
+        fresh (the single-card refresh / test paths)."""
+        if disp == "__current__":
+            disp = self._display_shot()
+        return self._expression_namespace_at(disp)
+
+    def _expression_namespace_at(self, disp) -> dict[str, object]:
         # Shot-COHERENT read at the board's global display shot (#shot-clock): every signal resolves to its
         # value AT that shot, so a frame_0 2-D, a frame_2 2-D and a frame_1->occupancy sitemap can never show
         # different shots -- the faster camera is held back to the slower co-displayed producer.  A signal
@@ -7898,7 +7973,7 @@ class TaskConsole(QtWidgets.QWidget):
         # layered on this view's snapshot -- a panel expression and a node-side expression (pulse-scan
         # y, processor source) can never diverge in capability (GUI == node).
         from Zou_lab_control.neutral_atom.operations.signal_expr import hub_namespace
-        namespace = hub_namespace(self.hub, self.hub.snapshot_at(self._display_shot()))
+        namespace = hub_namespace(self.hub, self.hub.snapshot_at(disp))
         # Per-signal publish counters (reserved key) so a rolling monitor can tell
         # a new sample of its own source from an unrelated node's version bump.
         namespace[SIG_VERSIONS_KEY] = self.hub.signal_versions()
@@ -8045,68 +8120,38 @@ class TaskConsole(QtWidgets.QWidget):
             self._update_summary()
             return
         self._tick_count += 1
-        disp = self._display_shot()            # the ONE coherent display shot for the whole board this tick
-        sigvers = self.hub.signal_versions()   # ONE per-signal-counter snapshot for the whole tick
-        elapsed = self._tick_count * self._base_interval_ms
-        namespace = None
-        # PHASE 1 -- COMPOSE every panel whose coherent frame changed into its OWN offscreen buffer
-        # (nothing reaches the screen yet).  Each compose reads the ONE shared snapshot at ``disp``, so
-        # the panels are mutually consistent BY CONSTRUCTION.
-        #
-        # The panel's OWN beat (update_ms) gates WHEN it recomposes; the coherent clock decides WHAT
-        # it shows (the shared snapshot at ``disp``).  Panels on the same beat flip to the same shot
-        # in the same tick (the three emCCD frames of a pulse never split); a panel on a slower beat
-        # holds its previous coherent shot until its beat comes round -- that is what choosing a
-        # slower update interval MEANS.  (The old "coherence beats the throttle" override recomposed
-        # every camera panel every base tick, because a live camera advances ``disp`` on every shot
-        # -- update_ms was silently dead for exactly the panels that needed it most.)
-        #
-        # TIME BUDGET: composing is bounded per tick.  When the panels' total compose cost exceeds
-        # the budget, finish what fits and leave the rest STALE for the next tick (their
-        # _render_version still differs, so they retry) -- the Qt event loop always breathes and the
-        # UI stays interactive: skip frames, never freeze.  The walk starts at a rotating index so a
-        # persistent overload degrades every panel's rate FAIRLY instead of starving the tail.
-        # Overrun panels may briefly show the previous shot; they catch up as soon as there is headroom.
-        dirty = []
-        n_cards = len(self.cards)
-        start = self._compose_rotor % n_cards if n_cards else 0
-        budget_s = _TICK_BUDGET_FRACTION * self._base_interval_ms / 1000.0
-        t0 = time.perf_counter()
-        # The rotor is a PRIORITY CLAIM: it points at the first panel a previous tick could not
-        # serve, and it is released ONLY once that panel is actually served (composed, or no longer
-        # dirty).  A tick where the rotor panel's beat has not come round must NOT release it --
-        # otherwise a heavy fast-beat panel ahead of a starved slow-beat one would re-earn the front
-        # of the queue on every intervening tick and exhaust the budget again on the slow panel's
-        # own beat, starving it forever.
-        rotor_next = 0
-        for i in range(n_cards):
-            idx = (start + i) % n_cards
-            card = self.cards[idx]
-            key = self._panel_frame_key(card, disp, sigvers)
-            if key == card._render_version:
-                continue                          # nothing this panel shows changed -> served
-            if elapsed % card.config.update_ms != 0 or (
-                    getattr(card.plotter, "fig", None) is not None
-                    and getattr(card.plotter.fig, "_zlc_interacting", False)):
-                # Not servable THIS tick (beat not due, or the pointer is mid-drag on it -- a live
-                # recompose under a drag re-renders the whole canvas and stomps the widget blit
-                # backgrounds).  The rotor panel keeps its claim; it catches up when servable.
-                if idx == start:
-                    rotor_next = start
-                continue
-            if dirty and (time.perf_counter() - t0) > budget_s:
-                rotor_next = idx                  # budget spent: this panel goes first next tick
-                break
-            if namespace is None:                 # built ONCE per tick -> the shared snapshot at ``disp``
-                namespace = self._expression_namespace()
-            card.compose(namespace)
-            card._render_version = key
-            dirty.append(card)
-        self._compose_rotor = rotor_next          # 0 unless someone still holds a claim
-        # PHASE 2 -- PRESENT every composed buffer TOGETHER: Qt paints them in one frame, so the board
-        # only ever shows ONE coherent shot (never frame_0 at shot S beside frame_2 at S-1).
-        for card in dirty:
-            card.present()
+        # A render batch is still in flight: skip this tick's submission entirely.  Dirtiness is
+        # version-gated (frame keys), so every skipped panel retries the moment the worker frees up
+        # -- this refusal IS the frame-skip back-pressure (no budget, no rotor: the GUI thread no
+        # longer executes any compose, so there is nothing to ration on it).
+        if not self._render_loop.busy:
+            disp = self._display_shot()            # the ONE coherent display shot for the whole board this tick
+            sigvers = self.hub.signal_versions()   # ONE per-signal-counter snapshot for the whole tick
+            elapsed = self._tick_count * self._base_interval_ms
+            # COLLECT every panel whose coherent frame changed and whose beat is due.  The panel's OWN
+            # beat (update_ms) gates WHEN it recomposes; the coherent clock decides WHAT it shows (the
+            # shared snapshot at ``disp``).  Panels on the same beat flip to the same shot in the same
+            # batch (the three emCCD frames of a pulse never split); a panel on a slower beat holds its
+            # previous coherent shot until its beat comes round -- that is what choosing a slower update
+            # interval MEANS.  A mid-drag panel is skipped whole (a live recompose under a drag stomps
+            # the widget blit backgrounds); it catches up on release.
+            batch = []
+            for card in self.cards:
+                key = self._panel_frame_key(card, disp, sigvers)
+                if key == card._render_version:
+                    continue                       # nothing this panel shows changed
+                if elapsed % card.config.update_ms != 0:
+                    continue                       # beat not due
+                fig = getattr(card.plotter, "fig", None)
+                if fig is not None and getattr(fig, "_zlc_interacting", False):
+                    continue                       # GUI-owned for the drag's duration
+                batch.append((card, key))
+            if batch:
+                # The worker builds the shared namespace ITSELF (the full-hub snapshot copy is real
+                # work -- off the GUI thread with everything else) and composes each panel in place;
+                # panels needing a STRUCTURAL build come back untouched for the GUI pass.
+                self._render_loop.submit(
+                    lambda b=batch, d=disp: self._compose_batch(b, d))
         # keep the visible Edit tab's 'now:' acquisition references live, so a queued
         # parameter edit shows as applied once the loop picks it up.
         editor = self.tabs.currentWidget()
@@ -8115,10 +8160,47 @@ class TaskConsole(QtWidgets.QWidget):
             editor.refresh_limit_hints()  # #3a: tick updates only the grey placeholder hint, never the text
         self._update_summary()
 
+    def _compose_batch(self, batch, disp):
+        """RENDER THREAD: build the ONE shared shot-coherent namespace and compose every batched
+        panel into its offscreen Agg buffer.  Returns the per-panel outcome for the GUI pass."""
+        namespace = self._expression_namespace(disp)
+        composed, structural = [], []
+        for card, key in batch:
+            try:
+                done = card.compose(namespace, offthread=True)
+            except Exception:
+                done = True            # compose() latches errors itself; never kill the batch
+            (composed if done else structural).append((card, key))
+        return {"namespace": namespace, "composed": composed, "structural": structural}
+
+    def _on_render_batch(self, result) -> None:
+        """GUI THREAD (queued from the render thread): finish the batch -- run the structural
+        builds the worker handed back, then PRESENT every panel TOGETHER so the board flips ONE
+        coherent shot (never frame_0 at shot S beside frame_2 at S-1)."""
+        if not isinstance(result, dict):
+            return                     # a job that raised whole (already latched per panel) -- drop
+        namespace = result["namespace"]
+        served = []
+        for card, key in result["structural"]:
+            try:
+                card.compose(namespace)          # the full GUI compose: builds plotter + canvas
+            except Exception:
+                pass                             # compose latches its own status
+            served.append((card, key))
+        for card, key in result["composed"]:
+            card.flush_deferred_status()
+            served.append((card, key))
+        for card, key in served:
+            if card in self.cards or card is self._task_card:
+                card._render_version = key
+                card.present()
+
     def refresh_once(self) -> None:
         """Synchronous FULL refresh (tests / notebooks / Resume catch-up): COMPOSE every card from the
         ONE coherent snapshot, then PRESENT them all together -- the same two-phase coherence as the live
-        tick, just unconditional (ignores per-panel beat and the frame-key gate)."""
+        tick, just unconditional (ignores per-panel beat and the frame-key gate).  Holds the render
+        barrier first: this GUI-thread compose must own every figure."""
+        self._render_loop.barrier()
         self._poll_logic_nodes()
         self._refresh_signal_info()
         self._refresh_task_panel()
@@ -8319,6 +8401,9 @@ class TaskConsole(QtWidgets.QWidget):
         for editor in list(self._logic_editors.values()):
             editor.teardown()
         self._logic_editors.clear()
+        # Stop the render worker BEFORE tearing panels down: any in-flight batch finishes against
+        # still-alive figures, and no further batch can start touching a torn-down card.
+        self._render_loop.stop()
         for card in self.cards:
             card.shutdown()
         on_close = getattr(self, "_on_close", None)

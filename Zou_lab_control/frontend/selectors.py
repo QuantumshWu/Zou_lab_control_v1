@@ -34,8 +34,16 @@ def begin_figure_interaction(fig) -> None:
       ``BaseLivePlot.compose``) gets ONE full ``canvas.draw()`` first: widget-cached backgrounds
       (a ``RectangleSelector``'s useblit snapshot) are only re-captured on a real draw_event, so
       without this the drag would restore a STALE frame under the rectangle (ghost image).
+
+    For the drag's duration the figure is GUI-owned: the console's render thread never composes
+    an interacting panel (the tick skips it, and every mouse path into the canvas passes its
+    ``_zlc_render_barrier`` first), so the selector blits below paint the live Agg buffer
+    directly -- the canvas' presented FRONT image is dropped here so the paintEvent follows them.
     """
     fig._zlc_interacting = True
+    canvas = getattr(fig, "canvas", None)
+    if hasattr(canvas, "_zlc_drop_front"):
+        canvas._zlc_drop_front()
     if getattr(fig, "_zlc_blit_dirty", False):
         fig._zlc_blit_dirty = False
         try:

@@ -888,11 +888,12 @@ class BaseLivePlot:
             return
         canvas = getattr(self.fig, "canvas", None)
         # A chrome change / first frame / no data artists: render the WHOLE figure into the Agg buffer.
-        # The embedded canvas' draw() renders SYNCHRONOUSLY without scheduling a Qt paint (present() owns
-        # that), so the buffer is ready for the batched present.  A notebook (ipympl) / headless canvas
-        # has no offscreen-buffer split -- it renders + pushes in present() (draw_idle), as before.
+        # Agg-ONLY on the embedded canvas: compose must never touch Qt widget state -- present() owns the
+        # screen flip, and this compose may be running on the console's render thread.  A notebook
+        # (ipympl) / headless canvas has no offscreen-buffer split -- it renders + pushes in present()
+        # (draw_idle), as before.
         if _is_embedded_canvas(canvas):
-            canvas.draw()
+            canvas._zlc_draw_agg_only()
             self.fig._zlc_blit_dirty = False   # a real draw re-snapshotted every widget background
 
     def present(self) -> None:
@@ -915,7 +916,10 @@ class BaseLivePlot:
         if canvas is None:
             return
         if _is_embedded_canvas(canvas):
-            canvas.update()
+            # Snapshot the composed Agg buffer as the canvas' FRONT image, then schedule the Qt
+            # paint.  The paintEvent blits the front image, never the live Agg buffer -- so the
+            # console's render thread can already be composing the NEXT frame into it.
+            canvas._zlc_present()
             return
         canvas.draw_idle()
         try:
@@ -1003,7 +1007,7 @@ class BaseLivePlot:
                 vis = [(a, a.get_visible()) for a in arts]
                 for a, _ in vis:
                     a.set_visible(False)
-                canvas.draw()
+                canvas._zlc_draw_agg_only()   # compose-phase render: pure Agg, render-thread safe
                 for a, was in vis:
                     a.set_visible(was)
                 self._blit_bg = canvas.copy_from_bbox(self.fig.bbox)

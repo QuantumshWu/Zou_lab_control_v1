@@ -32,6 +32,7 @@ from .style import DESIGN_DPI
 
 try:
     from PyQt5 import QtCore, QtGui, QtWidgets
+    from matplotlib.backends.backend_agg import FigureCanvasAgg as _FigureCanvasAgg
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as _FigureCanvasQTAgg
 except Exception:  # pragma: no cover - depends on the local matplotlib install
     _FigureCanvasQTAgg = None
@@ -179,6 +180,44 @@ else:
             super().draw()
             self._zlc_drawn_dpi = self.figure.dpi
             self._zlc_painted_once = True
+            # A canvas in FRONT-buffer mode (live console panel, rendered by the render thread) keeps
+            # its front image in sync with any DIRECT GUI-thread render too (a CrossSelector click's
+            # draw_idle, a Setting re-render), or the paintEvent would blit a stale frame over it.
+            if getattr(self, "_zlc_front", None) is not None:
+                self._zlc_snapshot_front()
+
+        def _zlc_draw_agg_only(self):
+            """Rasterise the figure into the Agg buffer WITHOUT the stock QtAgg ``draw()``'s
+            ``self.update()`` (a Qt widget call).  This is the compose-phase render: the two-phase
+            board flips the screen only in present(), and it is the ONLY draw the render thread may
+            use -- Qt widget state must never be touched off the GUI thread."""
+            _FigureCanvasAgg.draw(self)
+            self._zlc_drawn_dpi = self.figure.dpi
+            self._zlc_painted_once = True
+
+        # ------------------------------------------------------------- front buffer
+        # FRONT-buffer protocol (render-thread decoupling): while the render thread owns a live
+        # panel's figure, the GUI paintEvent must not read (or lazily re-render) the Agg buffer the
+        # worker is writing.  present() therefore deep-copies the finished buffer into ``_zlc_front``
+        # (a QImage -- plain data, thread-agnostic) and paintEvent blits THAT.  Interaction drags
+        # (selector blits bypass draw()/present()) drop the front first so the live Agg buffer shows
+        # again -- the figure is GUI-owned for the whole drag (see selectors.begin_figure_interaction).
+        def _zlc_snapshot_front(self) -> None:
+            renderer = getattr(self, "renderer", None)
+            if renderer is None:
+                return
+            w, h = int(renderer.width), int(renderer.height)
+            self._zlc_front = QtGui.QImage(
+                self.buffer_rgba(), w, h, QtGui.QImage.Format_RGBA8888).copy()
+
+        def _zlc_drop_front(self) -> None:
+            self._zlc_front = None
+
+        def _zlc_present(self) -> None:
+            """Publish the composed Agg buffer: snapshot it as the front image and schedule the
+            Qt paint.  GUI thread only (present phase)."""
+            self._zlc_snapshot_front()
+            self.update()
 
         def _zlc_draw_if_needed(self) -> None:
             # Render the Agg buffer ONLY when it is genuinely out of date: never rendered, the figure
@@ -224,6 +263,15 @@ else:
             # all: the widget size is the DPR-invariant design constant, the buffer is whatever dpi the
             # sync chose, and the smooth-transform scale maps one onto the other exactly.
             del event
+            front = getattr(self, "_zlc_front", None)
+            if front is not None:
+                # Front-buffer mode: blit the last PRESENTED frame.  Never touch the Agg buffer here
+                # -- the render thread may be composing the next frame into it right now.
+                painter = QtGui.QPainter(self)
+                painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+                painter.drawImage(self.rect(), front)
+                painter.end()
+                return
             self._zlc_draw_if_needed()          # render the buffer only if it is out of date (else reuse)
             renderer = self.renderer
             w, h = int(renderer.width), int(renderer.height)
@@ -243,6 +291,24 @@ else:
             self.update()
 
         # ------------------------------------------------------------- behaviour
+        def _zlc_wait_render(self) -> None:
+            # The render-thread ownership barrier: a host that composes this canvas off the GUI
+            # thread hangs its barrier here (``_zlc_render_barrier``); every mouse path into the
+            # figure (press, double-click, wheel zoom) waits for the in-flight compose FIRST, so
+            # a selector/zoom callback never mutates artists the worker is rasterising.  Free when
+            # idle; unset on GUI-thread-only hosts (pulse_gui, Edit snapshots).
+            barrier = getattr(self, "_zlc_render_barrier", None)
+            if callable(barrier):
+                barrier()
+
+        def mousePressEvent(self, event):  # noqa: N802 - Qt naming
+            self._zlc_wait_render()
+            super().mousePressEvent(event)
+
+        def mouseDoubleClickEvent(self, event):  # noqa: N802 - Qt naming
+            self._zlc_wait_render()
+            super().mouseDoubleClickEvent(event)
+
         def wheelEvent(self, event):  # noqa: N802 - Qt naming
             if not self._zlc_isolate_wheel:
                 # display-only panel: let the wheel bubble up to the scroll area
@@ -250,6 +316,7 @@ else:
                 event.ignore()
                 return
             # interactive plot: in-plot wheel zoom must never double as a page scroll
+            self._zlc_wait_render()
             super().wheelEvent(event)
             event.accept()
 
