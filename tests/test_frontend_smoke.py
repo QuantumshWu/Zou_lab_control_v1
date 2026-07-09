@@ -2898,7 +2898,7 @@ def test_pulse_gui_runtime_connection_control(monkeypatch):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor, ensure_qt_app
-    from Zou_lab_control.neutral_atom.devices.sequencer import VirtualSequencer
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
 
     ensure_qt_app()
     channels = [f"ch{i:02d}" for i in range(12)]

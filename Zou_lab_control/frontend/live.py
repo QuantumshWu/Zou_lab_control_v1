@@ -491,6 +491,15 @@ class BaseLivePlot:
         if src is None or self._in_display_refresh or getattr(self.fig, "_zlc_lim_batch", False):
             return                                       # mid lim-batch: the gesture refreshes once at the end
         array, artist = src
+        if getattr(artist, "axes", None) is None:
+            # This plotter's display artist has been detached (the figure was cleared and reused --
+            # e.g. a grid focus/unfocus rebuilt the SAME fig): this refresh, and the figure-level
+            # ``_zlc_lim_refresh`` hook if it still points at us, are dead.  Self-deregister so a
+            # later gesture on the reused figure never re-decimates for a plotter nobody shows.
+            if getattr(self.fig, "_zlc_lim_refresh", None) is not None \
+                    and getattr(self.fig._zlc_lim_refresh, "__self__", None) is self:
+                self.fig._zlc_lim_refresh = None
+            return
         self._in_display_refresh = True
         try:
             small, small_ext = _decimate_image_view(array, self.extent, self.ax.get_xlim(),
@@ -3092,7 +3101,11 @@ def fit_histogram_curves(edges, counts, mode: str):
     n_samples = float(counts.sum())
     span = float(edges[-1] - edges[0]) or 1.0
     mode = str(mode)
-    if mode == "none" or n_samples < 6 or float(edges[-1] - edges[0]) == 0:
+    # Fewer than 2 occupied bins = no spread to fit: a CONSTANT sample set lands in one bin (this is
+    # the binned form of the old ``ptp(vals) == 0`` guard -- np.histogram expands a zero range to
+    # lo±0.5, so the edge span alone can never detect it), and a single-bin histogram would also
+    # crash the Otsu split below (empty cumsum -> argmax of an empty sequence).
+    if mode == "none" or n_samples < 6 or np.count_nonzero(counts) < 2:
         return None
     x_fit = np.linspace(edges[0], edges[-1], 400)
 
@@ -3282,6 +3295,9 @@ class HistogramFigure(BaseLivePlot):
         self.ax.set_xlabel(self.xlabel)
         self.ax.set_ylabel(self.ylabel)
         vals = self._finite(self.values)
+        # Remember whether any REAL sample exists: the [0.0] placeholder below only keeps the bar
+        # geometry alive, and the binned L/R threshold statistic must never count it as data.
+        self._has_samples = vals.size > 0
         if vals.size == 0:
             vals = np.array([0.0])
         self.n, self.bins = histogram_binned(vals, self.bins_arg)
@@ -3340,6 +3356,7 @@ class HistogramFigure(BaseLivePlot):
 
     def update_core(self) -> None:
         vals = self._finite(self.values)
+        self._has_samples = vals.size > 0        # the [0.0] placeholder is geometry, never data
         if vals.size == 0:
             vals = np.array([0.0])
         self.n, self.bins = histogram_binned(vals, self.bins_arg)
@@ -3563,8 +3580,12 @@ class HistogramFigure(BaseLivePlot):
         # WITH a meaningful cut (separated fit or an explicit calibration cut): the threshold readout.
         if self._has_threshold and self.thresholds:
             threshold = float(self.thresholds[0])
-            left = self._left_fraction(threshold)
-            right = 1.0 - left
+            if getattr(self, "_has_samples", True):
+                left = self._left_fraction(threshold)
+                right = 1.0 - left
+            else:
+                left = right = 0.0               # no real samples yet -> honest 0/0, not 100/0
+                                                 # (the binned counts hold only the placeholder)
             fidelity = self._fit_fidelity(threshold)
             fidelity_text = "fit F=N/A" if fidelity is None else f"fit F={100 * fidelity:.1f}%"
             fit_threshold = "" if self.fit_threshold is None else f"\nfit cut={self.fit_threshold:.4g}"
@@ -4609,7 +4630,10 @@ class ImageCell(GridCell):
     y_is_view_axis = True        # x AND y are pixel coordinates; the value axis is the shared clim
 
     def __init__(self, images, *, labels: Sequence[str] = ("x (px)", "y (px)"), cmap: str | None = None):
-        self.images = [np.asarray(im, dtype=float) for im in images]
+        # NATIVE dtype: a uint8 camera frame stays uint8 and a NaN placeholder cell (a zero-memory
+        # broadcast view for a not-yet-taken facet=repeat slot) stays a view -- a float64 coercion
+        # here would materialise K full-size copies per grid.
+        self.images = [self._as_cell_frame(im) for im in images]
         self.n_cells = len(self.images)
         if self.n_cells == 0:
             raise ValueError("images must contain at least one cell.")
@@ -4637,10 +4661,25 @@ class ImageCell(GridCell):
         return 1.0
 
     def prepare(self) -> None:
-        finite = [im[np.isfinite(im)] for im in self.images if im.size]
-        pooled = np.concatenate(finite) if finite else np.array([0.0, 1.0])
-        lo = float(np.nanmin(pooled)) if pooled.size else 0.0
-        hi = float(np.nanmax(pooled)) if pooled.size else 1.0
+        # Pool per-cell (lo, hi) instead of concatenating K full-size frames: an integer frame has
+        # no NaN so min/max read it directly (no 2.3 MP isfinite mask + copy per cell), a float
+        # frame uses the nan-aware reduction, and an all-NaN placeholder cell contributes nothing.
+        lo = hi = None
+        for im in self.images:
+            if not im.size:
+                continue
+            if im.dtype.kind in "iub":
+                l, h = float(im.min()), float(im.max())
+            else:
+                mask = np.isfinite(im)
+                if not mask.any():
+                    continue                     # all-NaN (a not-yet-taken facet=repeat cell) --
+                fin = im[mask]                   # skipped WITHOUT nanmin's all-NaN RuntimeWarning
+                l, h = float(fin.min()), float(fin.max())
+            lo = l if lo is None else min(lo, l)
+            hi = h if hi is None else max(hi, h)
+        if lo is None:
+            lo, hi = 0.0, 1.0
         if not hi > lo:
             lo, hi = lo, lo + 1.0
         # ONE shared colour scale spanning the pooled data -> cells comparable AND contrasty: a
@@ -4665,11 +4704,18 @@ class ImageCell(GridCell):
         apply_title(ax, self.cell_title(k), size=self.title_size_pt(), pad=1.5)   # ticks are the grid's ONE policy
         return None
 
-    def set_cell_data(self, k: int, data) -> None:
-        frame = np.asarray(data, dtype=float)
+    @staticmethod
+    def _as_cell_frame(data) -> np.ndarray:
+        """One cell's 2-D frame, NATIVE dtype (see __init__); only non-numeric input normalizes."""
+        frame = np.asarray(data)
+        if frame.dtype.kind not in "iubf":
+            frame = np.asarray(data, dtype=float)
         if frame.ndim != 2:
             raise ValueError(f"an image cell takes a 2-D frame; got shape {frame.shape}.")
-        self.images[k] = frame                 # the shared colour scale re-derives in prepare()
+        return frame
+
+    def set_cell_data(self, k: int, data) -> None:
+        self.images[k] = self._as_cell_frame(data)   # the shared colour scale re-derives in prepare()
 
     def update_cell(self, ax, k: int) -> bool:
         """Move cell ``k``'s EXISTING image to the current frame (set_array + the shared/pinned colour

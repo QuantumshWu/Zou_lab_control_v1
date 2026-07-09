@@ -2656,7 +2656,7 @@ class PanelCard(FluentGroupBox):
 
     def _facet_cells(self, value):
         """Slice the bound block into the per-cell inputs through the ONE rule (live.facet_cells)."""
-        from .live import facet_cells
+        from .live import facet_cells, normalize_facet
         block = np.asarray(value)                 # NATIVE dtype (uint8 camera block stays uint8);
         if block.dtype.kind not in "iubf":        # only non-numeric results normalize to float
             block = np.asarray(block, dtype=float)
@@ -2667,8 +2667,25 @@ class PanelCard(FluentGroupBox):
         pts, _ = self._facet_value_shapes()
         if int(np.prod(pts, dtype=np.int64) if pts else 0) != int(block.shape[1]):
             pts = ()                              # declared shape does not match this block -> flat points
-        return facet_cells(block, self._facet(), sub_plot_kind=self._resolved_sub_kind(),
-                           points_shape=pts, repeat_mode=self._repeat_mode_value())
+        cells = facet_cells(block, self._facet(), sub_plot_kind=self._resolved_sub_kind(),
+                            points_shape=pts, repeat_mode=self._repeat_mode_value())
+        # A LIVE finite block carries only the repeats that HOLD data (it grows 1..ring as shots
+        # land), so a facet=repeat grid would see its cell count change every shot -- a full
+        # build-then-swap per shot for the WHOLE fill window, and a >MAX_GRID_CELLS repeat would
+        # only error at shot ring+1.  Pad to the producer's declared ring with ZERO-memory NaN
+        # placeholders (broadcast views -- never a materialised full-size frame), so the grid holds
+        # a constant ring cells from the first shot: not-yet-taken cells render blank (NaN), filled
+        # cells stream through the in-place update_cells fast path, and the cell-count cap fires
+        # immediately.  Only the repeat facet pads: a points/dim facet's cell count is a declared
+        # shape, not the fill state.
+        spec = normalize_facet(self._facet())
+        if spec is not None and spec[0] == "repeat" and cells:
+            st = self._bound_structure()
+            ring = int((st or {}).get("ring", 0) or 0)
+            if ring > len(cells):
+                blank = np.broadcast_to(np.float32(np.nan), np.shape(cells[0]))
+                cells = list(cells) + [blank] * (ring - len(cells))
+        return cells
 
     def _build_facet_plotter(self, value, *, interactions: bool):
         """Build this panel's FACET grid through the ONE factory + replay its persisted per-kind
@@ -6926,11 +6943,15 @@ class TaskConsole(QtWidgets.QWidget):
                 spec = node.signal_spec(str(name))
             except Exception:
                 spec = None
+        # The declared repeat-ring CAP (logic.LogicNode.ring_depth, the one source): a published
+        # block's leading axis grows 1..ring as shots land, so a facet=repeat grid reads THIS for
+        # its constant cell count instead of the still-filling block depth.
+        ring = int(getattr(node, "ring_depth", 1) or 1)
         if spec is not None and getattr(spec, "has_structure", False):
             ps = tuple(spec.points_shape or ())
             ds = tuple(spec.data_shape or ())
             return {"points_shape": ps, "data_shape": ds,
-                    "grid_shape": _grid_for(ps),
+                    "grid_shape": _grid_for(ps), "ring": ring,
                     "core_ndim": len(ps) + len(ds), "per_signal": True}
         # fall back to the node-level contract triple (camera / scan / a node with no per-signal spec).
         # ``per_signal`` False -> a consumer keeps the legacy ndim>=3 repeat detection (core_ndim NOT
@@ -6938,7 +6959,7 @@ class TaskConsole(QtWidgets.QWidget):
         ps = tuple(getattr(node, "points_shape", ()) or ())
         ds = tuple(getattr(node, "data_shape", ()) or ())
         result = {"points_shape": ps, "data_shape": ds,
-                  "grid_shape": _grid_for(ps),
+                  "grid_shape": _grid_for(ps), "ring": ring,
                   "core_ndim": len(ps) + len(ds), "per_signal": False}
         # A SCAN node carries its swept param NAMES + per-axis coordinate arrays -- carry them so a
         # ``facet="points:i"`` grid labels each cell with the REAL scan coordinate (``delay=1.0``) instead of
@@ -8047,28 +8068,37 @@ class TaskConsole(QtWidgets.QWidget):
         start = self._compose_rotor % n_cards if n_cards else 0
         budget_s = _TICK_BUDGET_FRACTION * self._base_interval_ms / 1000.0
         t0 = time.perf_counter()
-        self._compose_rotor = 0                   # a full pass resets the rotation
+        # The rotor is a PRIORITY CLAIM: it points at the first panel a previous tick could not
+        # serve, and it is released ONLY once that panel is actually served (composed, or no longer
+        # dirty).  A tick where the rotor panel's beat has not come round must NOT release it --
+        # otherwise a heavy fast-beat panel ahead of a starved slow-beat one would re-earn the front
+        # of the queue on every intervening tick and exhaust the budget again on the slow panel's
+        # own beat, starving it forever.
+        rotor_next = 0
         for i in range(n_cards):
-            card = self.cards[(start + i) % n_cards]
+            idx = (start + i) % n_cards
+            card = self.cards[idx]
             key = self._panel_frame_key(card, disp, sigvers)
             if key == card._render_version:
-                continue                          # nothing this panel shows changed
-            if elapsed % card.config.update_ms != 0:
-                continue                          # this panel's beat has not come round yet
-            fig = getattr(card.plotter, "fig", None)
-            if fig is not None and getattr(fig, "_zlc_interacting", False):
-                # the pointer is mid-drag on THIS panel (a selector pull / pan / line drag): a live
-                # recompose under the drag would re-render the whole canvas per shot and stomp the
-                # widget blit backgrounds -- freeze it; it catches up on release (frame key differs).
+                continue                          # nothing this panel shows changed -> served
+            if elapsed % card.config.update_ms != 0 or (
+                    getattr(card.plotter, "fig", None) is not None
+                    and getattr(card.plotter.fig, "_zlc_interacting", False)):
+                # Not servable THIS tick (beat not due, or the pointer is mid-drag on it -- a live
+                # recompose under a drag re-renders the whole canvas and stomps the widget blit
+                # backgrounds).  The rotor panel keeps its claim; it catches up when servable.
+                if idx == start:
+                    rotor_next = start
                 continue
             if dirty and (time.perf_counter() - t0) > budget_s:
-                self._compose_rotor = (start + i) % n_cards   # resume HERE next tick
+                rotor_next = idx                  # budget spent: this panel goes first next tick
                 break
             if namespace is None:                 # built ONCE per tick -> the shared snapshot at ``disp``
                 namespace = self._expression_namespace()
             card.compose(namespace)
             card._render_version = key
             dirty.append(card)
+        self._compose_rotor = rotor_next          # 0 unless someone still holds a claim
         # PHASE 2 -- PRESENT every composed buffer TOGETHER: Qt paints them in one frame, so the board
         # only ever shows ONE coherent shot (never frame_0 at shot S beside frame_2 at S-1).
         for card in dirty:

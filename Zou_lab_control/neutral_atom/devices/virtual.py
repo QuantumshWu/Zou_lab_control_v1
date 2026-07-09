@@ -1300,7 +1300,11 @@ class VirtualMotCamera(_TriggerWiredCamera):
         wire = getattr(self, "sequencer", None)
         if wire is None:
             return None
-        return wire.firing if wire.firing is not None else getattr(wire, "last_fired", None)
+        # Read ``firing`` ONCE into a local: the producer thread races Stop Pulse / prepare on the
+        # GUI thread, and a check-then-read of the property could see it non-None in the condition
+        # yet None in the result -- rendering one frame at the safe state instead of the latched word.
+        firing = wire.firing
+        return firing if firing is not None else getattr(wire, "last_fired", None)
 
     def _producer_loop(self, pace: float) -> None:
         """The free-running SENSOR clock (its own thread), faithful to the real Basler
@@ -1373,6 +1377,10 @@ class VirtualMotCamera(_TriggerWiredCamera):
         return out
 
     def close(self) -> None:
+        # A camera closed (or abandoned) while still armed must not leave the free-run producer
+        # thread rendering 2.3 MP frames at the exposure rate forever -- stop it first (idempotent:
+        # _disarm on an unarmed camera is a no-op), then unplug the trigger cable.
+        self._disarm()
         super().close()          # unplug the trigger cable (stop rendering on the streamer's fires)
 
     def stop(self) -> None:

@@ -407,8 +407,7 @@ def test_add_panel_grid_shows_every_repeat_as_a_cell_and_rows_follow_the_kind(mo
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     console, node = _camera_console(repeat=4)
     try:
-        for _ in range(4):
-            node.step()            # fill all 4 repeats: a block carries only repeats HOLDING data
+        node.step()                # ONE shot: the block carries 1 repeat, the declared ring is 4
         kc = console.kind_combo
         kc.setCurrentIndex(next(i for i in range(kc.count()) if kc.itemText(i) == "Plot: Site grid"))
         console._add_panel()
@@ -418,9 +417,17 @@ def test_add_panel_grid_shows_every_repeat_as_a_cell_and_rows_follow_the_kind(mo
         card.source_edit.setText("value = signal")
         card._apply_source()
         console.refresh_once()
+        # The declared ring (repeat=4) fixes the cell count from the FIRST shot: not-yet-taken
+        # repeats show as blank NaN placeholder cells, so the grid never rebuilds as shots fill.
         assert card.plotter is not None and card.plotter.n_cells == 4      # one cell PER REPEAT
         assert card.plotter.sub_plot_kind == "2d"                          # a frame per cell
         assert "cmap" in card.param_widgets and "bins" not in card.param_widgets
+        first_plotter = card.plotter
+        for _ in range(3):
+            node.step()                                   # fill the remaining repeats
+            console.refresh_once()
+        assert card.plotter is first_plotter              # filled IN PLACE (update_cells fast path),
+        assert card.plotter.n_cells == 4                  # never a per-shot full rebuild
         # explicit sub-plot pick -> hist cells + the hist rows replace the 2d rows
         index = next(i for i in range(card.sub_kind_combo.count())
                      if card.sub_kind_combo.itemData(i) == "hist")

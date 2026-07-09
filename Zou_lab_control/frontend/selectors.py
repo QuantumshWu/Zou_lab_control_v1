@@ -140,6 +140,11 @@ class AreaSelector:
         begin_figure_interaction(self.ax.figure)
 
     def _on_irelease(self, event) -> None:
+        # Match the button that BEGAN the interaction: a stray right-button release mid-left-drag
+        # (e.g. a crosshair click attempt) must not end the freeze early -- the left drag is still
+        # in progress and an early recompose would stomp the useblit background under it.
+        if event.button != 1:
+            return
         if self._interacting:
             self._interacting = False
             end_figure_interaction(self.ax.figure)
@@ -459,6 +464,8 @@ class ZoomPan:
         self._call()
 
     def on_release(self, event) -> None:
+        if event.button != 2:                     # only the middle button ends the pan it began
+            return
         if self.dragging:
             end_figure_interaction(self.ax.figure)
         self.dragging = False
@@ -521,6 +528,8 @@ class DragHLine:
         self.ax.figure.canvas.draw_idle()
 
     def on_release(self, event) -> None:
+        if event.button != 1:                     # only the left button ends the drag it began
+            return
         if self.dragging is not None:
             end_figure_interaction(self.ax.figure)
         self.dragging = None
@@ -591,6 +600,8 @@ class DragVLine:
         self.ax.figure.canvas.draw_idle()
 
     def on_release(self, event) -> None:
+        if event.button != 1:                     # only the left button ends the drag it began
+            return
         if self.dragging:
             self._set_area_active(True)
             end_figure_interaction(self.ax.figure)

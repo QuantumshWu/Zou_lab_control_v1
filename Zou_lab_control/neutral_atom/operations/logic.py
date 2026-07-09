@@ -747,6 +747,15 @@ class Measurement(LogicNode):
     # block shape at publish time and the output-contract test can find it generically.
     primary_signal: str = ""
 
+    @property
+    def ring_depth(self) -> int:
+        """The declared repeat-ring CAP of this node's primary block: ``max(1, repeat)`` (a finite
+        run keeps up to ``repeat`` slices; ``repeat=0`` = ∞ keeps a 1-deep rolling ring).  The
+        leading axis of a published block grows 1..ring_depth as shots land -- the ONE source the
+        publish-shape guard and the GUI's structure channel (facet=repeat cell count) both read.
+        Resolved defensively: a subclass that forgot ``_ring``/``repeat`` still gets a sane 1."""
+        return int(getattr(self, "_ring", 0)) or max(1, int(getattr(self, "repeat", 1)))
+
     def _assert_primary_shape(self, out: dict) -> dict:
         """Publish-time contract guard: the primary block MUST be ``(repeat, *points_shape, *data_shape)``.
 
@@ -770,10 +779,7 @@ class Measurement(LogicNode):
             # grows 1..ring as shots land (a producer never publishes NaN-padded not-yet-taken
             # slices, so the block stays NATIVE dtype and only as large as the data that exists).
             # ``ring`` = max(1, repeat) is the CAP (``repeat=0`` = ∞ keeps a 1-deep rolling ring).
-            # Resolve the ring depth defensively: a new measurement subclass that sets primary_signal
-            # but forgot _ring/repeat should still get this guard's CLEAR shape message, not a cryptic
-            # AttributeError from an eagerly-evaluated default (getattr's default arg always evaluates).
-            ring = int(getattr(self, "_ring", 0)) or max(1, int(getattr(self, "repeat", 1)))
+            ring = self.ring_depth
             expected_tail = (*tuple(self.points_shape), *tuple(self.data_shape))
             if block.shape[1:] != expected_tail or not 1 <= block.shape[0] <= ring:
                 raise ValueError(
