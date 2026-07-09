@@ -43,6 +43,7 @@ __all__ = [
     "IMAGE_MAGIC", "REGISTER_LAYOUT_ID", "LAYOUT_STRUCT_VERSION", "build_fingerprint",
     "DEFAULT_CONFIG_PATH", "load_streamer_config", "params_from_config", "default_params",
     "default_part", "default_target_pct", "default_clock_hz",
+    "default_coeff_frac_bits", "default_slot_mul_width",
     "check_config_capacity", "format_capacity_report",
 ]
 
@@ -1044,6 +1045,22 @@ def default_target_pct(path: str | Path | None = None) -> float:
 
 def default_clock_hz(path: str | Path | None = None) -> float:
     return load_streamer_config(path)["clock_hz"]
+
+
+def default_coeff_frac_bits(path: str | Path | None = None) -> int:
+    """The affine-scan fixed-point fraction the RTL synthesizes with (``tick = base + (sum coeff*slot)
+    >> coeff_frac_bits``).  A StreamerParams geometry field folded into the fingerprint, so the SCAN
+    COMPILER must scale coefficients by exactly this many bits or the emitted ticks disagree with the
+    bitstream -- the single source the timing/sequencer compilers read (via Zou_lab_control._streamer_geometry)
+    instead of a bare literal 8."""
+    return int(default_params(path).coeff_frac_bits)
+
+
+def default_slot_mul_width(path: str | Path | None = None) -> int:
+    """The scan slot-operand narrow width the engine (and its Python mirror) clamps a scan tick to --
+    the single source engine_model reads instead of a bare literal 25, so the model can never mirror a
+    different width than the bitstream + the config-driven validator bound."""
+    return int(load_streamer_config(path)["slot_mul_width"])
 
 
 def check_config_capacity(path: str | Path | None = None) -> dict:

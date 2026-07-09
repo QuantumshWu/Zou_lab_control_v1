@@ -6269,6 +6269,28 @@ def test_streamer_config_covers_every_fingerprint_field():
         assert int(cfg[f]) == int(getattr(p, f)), f"streamer_config.json {f}={cfg[f]} != StreamerParams {getattr(p, f)}"
 
 
+def test_coeff_frac_bits_single_source_drives_the_scan_compiler():
+    """coeff_frac_bits is a fingerprint-affecting geometry field (the RTL scales affine coefficients by
+    ``>> coeff_frac_bits``), so the host SCAN COMPILER must use exactly the config value or the emitted
+    ticks disagree with the bitstream.  Before this refactor the compilers hard-coded a literal 8 --
+    a JSON edit to coeff_frac_bits changed the fingerprint (connect would reject a rebuild) but NOT the
+    emitted coefficients.  Pin every entry default to the config single source (the _streamer_geometry
+    seam), and confirm the seam value IS the config value."""
+    import inspect
+    from fpga.pulse_streamer.host import image as im
+    from Zou_lab_control._streamer_geometry import DEFAULT_COEFF_FRAC_BITS, default_coeff_frac_bits
+    from Zou_lab_control.neutral_atom.timing.pulse_table import affine_coeffs
+    from Zou_lab_control.neutral_atom.devices.sequencer import (
+        compile_pulse_table_scan_runtime_program, RuntimeSequenceProgram)
+
+    cfg_frac = im.default_coeff_frac_bits()
+    assert cfg_frac == default_coeff_frac_bits() == DEFAULT_COEFF_FRAC_BITS == int(im.default_params().coeff_frac_bits)
+    # every scan-compiler entry point defaults coeff_frac_bits to the config value, not a literal 8.
+    assert inspect.signature(affine_coeffs).parameters["coeff_frac_bits"].default == cfg_frac
+    assert inspect.signature(compile_pulse_table_scan_runtime_program).parameters["coeff_frac_bits"].default == cfg_frac
+    assert RuntimeSequenceProgram.__dataclass_fields__["scan_coeff_frac_bits"].default == cfg_frac
+
+
 # ===========================================================================
 # COMPLETE delay support (constant + scanned, any form) WITH an inner repeat
 # bracket -- the bracket is unrolled at the STATE level so the existing flat

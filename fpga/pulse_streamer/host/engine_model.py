@@ -52,20 +52,29 @@ __all__ = [
     "bus_undelayed_and_log", "bus_value_at",
 ]
 
-# OUTPUT delay cap (in ticks): the 32-bit delay field, the SAME for TTL channels and DAC
-# buses (both event-scheduled).  A delay past it raises DelayTooLargeError; the real working
-# limit is toggles IN FLIGHT (<= the event-FIFO depths below), validated at compile time.
-TTL_DELAY_MAX_TICKS = (1 << 31) - 1
-# Event-FIFO depths: SINGLE SOURCE = fpga/board_config/streamer_config.json (same file the
-# RTL generics + validator read), so the model never drifts from the synthesized bitstream.
+# The delay cap (32-bit field), the FIFO depths, AND the affine-MAC slot-operand width all have
+# ONE SOURCE = fpga/board_config/streamer_config.json (the same file the RTL header + validator
+# read), so this cycle mirror never drifts from the synthesized bitstream.  The except-branch
+# fallbacks mirror the shipped config for the offline (import-failure) path.
 try:
     from fpga.pulse_streamer.host.image import load_streamer_config as _load_cfg
-    _CFG = _load_cfg().get("params")                          # a StreamerParams
-    EVT_FIFO_DEPTH = int(getattr(_CFG, "evt_fifo_depth", 64))       # per-channel TTL event FIFO depth
-    BUS_EVT_FIFO_DEPTH = int(getattr(_CFG, "bus_evt_fifo_depth", 32))  # per-bus segment FIFO depth
+    _CFG_RAW = _load_cfg()
+    _CFG = _CFG_RAW.get("params")                                  # a StreamerParams
+    #: OUTPUT delay cap (in ticks): the 32-bit delay field, SAME for TTL channels and DAC buses;
+    #: a delay past it raises DelayTooLargeError (working limit is toggles IN FLIGHT <= the depths).
+    TTL_DELAY_MAX_TICKS = int(_CFG.ttl_delay_max_ticks)
+    EVT_FIFO_DEPTH = int(_CFG.evt_fifo_depth)                      # per-channel TTL event FIFO depth
+    BUS_EVT_FIFO_DEPTH = int(_CFG.bus_evt_fifo_depth)              # per-bus segment FIFO depth
+    #: Affine-MAC slot operand width -- MUST match zlc_edge_streamer.v SLOT_MUL_WIDTH (config
+    #: localparam).  The per-slot scan value is multiplied by a 16-bit coeff in one DSP48E1 (25x18),
+    #: so the slot operand is the low SLOT_MUL_WIDTH bits as signed (bounds the raw scan value; the
+    #: coeff still scales it to the full 32-bit tick range).
+    SLOT_MUL_WIDTH = int(_CFG_RAW.get("slot_mul_width", 25))
 except Exception:
+    TTL_DELAY_MAX_TICKS = (1 << 31) - 1
     EVT_FIFO_DEPTH = 64
     BUS_EVT_FIFO_DEPTH = 32
+    SLOT_MUL_WIDTH = 25
 
 
 class DelayTooLargeError(ValueError):
@@ -78,14 +87,6 @@ class PrefetchStall(RuntimeError):
 
 class ScanUnderflow(RuntimeError):
     """The host did not refill the next scan bank before the engine reached it."""
-
-
-# Affine-MAC slot operand width -- MUST match zlc_edge_streamer.v SLOT_MUL_WIDTH.
-# The per-slot scan value is multiplied by a 16-bit coeff using a single DSP48E1
-# (25x18), so the slot operand is the low SLOT_MUL_WIDTH bits taken as signed.
-# This bounds the raw scan VALUE to +/-2^24 ticks (~+/-335 ms @ 20 ns); the coeff
-# still scales it, so the resulting tick offset spans the full 32-bit range.
-SLOT_MUL_WIDTH = 25
 
 
 def _narrow_slot(value: int) -> int:

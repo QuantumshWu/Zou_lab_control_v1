@@ -17,6 +17,7 @@ import numpy as np
 
 from Zou_lab_control._paths import GENERATED_SEQUENCES_DIR
 from Zou_lab_control._clock import default_clock_hz as _default_clock_hz
+from Zou_lab_control._streamer_geometry import DEFAULT_COEFF_FRAC_BITS
 from ..core.analysis import nonnegative_float, positive_int
 from .base import SequencerDevice
 from ..timing import (
@@ -218,7 +219,7 @@ class RuntimeSequenceProgram:
     tick_slot_coeffs: list[list[int]] | None = None
     scan_points: list[list[int]] | None = None
     scan_point_durations: list[float] | None = None
-    scan_coeff_frac_bits: int = 8
+    scan_coeff_frac_bits: int = DEFAULT_COEFF_FRAC_BITS   # config single source, not a bare literal 8
     # Number of FULL scan sweeps before the scan stops: 0 = sweep forever (seamless cyclic
     # streaming, the default), K>=1 = play every scan point K times then halt (the host counts
     # sweeps from the CURSOR wrap and issues the engine stop -- no RTL change).  Inert unless
@@ -336,7 +337,7 @@ class RuntimeSequenceProgram:
             tick_slot_coeffs=tick_slot_coeffs or None,
             scan_points=[[int(v) for v in item] for item in payload.get("scan_points", [])] or None,
             scan_point_durations=[float(v) for v in payload.get("scan_point_durations", [])] or None,
-            scan_coeff_frac_bits=int(payload.get("scan_coeff_frac_bits", 8)),
+            scan_coeff_frac_bits=int(payload.get("scan_coeff_frac_bits", DEFAULT_COEFF_FRAC_BITS)),
             scan_repeats=int(payload.get("scan_repeats", 0)),
             bus_names=[str(item) for item in payload.get("bus_names", [])] or None,
             bus_segments=[RuntimeBusSegment.from_dict(item) for item in payload.get("bus_segments", [])] or None,
@@ -592,7 +593,7 @@ def compile_pulse_table_scan_runtime_program(
     channels: Sequence[str] | None = None,
     clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
     repeat_forever: bool = False,
-    coeff_frac_bits: int = 8,
+    coeff_frac_bits: int = DEFAULT_COEFF_FRAC_BITS,   # config single source (bitstream-affecting)
 ) -> RuntimeSequenceProgram:
     """Compile a ``PulseTableState`` with bound scan slots into a scan program.
 
@@ -2459,7 +2460,7 @@ def _pulse_table_bus_segments(
     slots: Mapping[str, float] | None = None,
     time_step_ns: float,
     slot_vars: Sequence[str] | None = None,
-    coeff_frac_bits: int = 8,
+    coeff_frac_bits: int = DEFAULT_COEFF_FRAC_BITS,
 ) -> tuple[list[str], list[RuntimeBusSegment], dict[int, int]]:
     """Compile logical analog buses into hardware bus segments.
 

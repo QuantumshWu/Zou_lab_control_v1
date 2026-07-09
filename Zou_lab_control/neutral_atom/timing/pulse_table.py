@@ -85,6 +85,13 @@ BUS_SAFE_SIGNED_LEVEL = 0
 #: event-FIFO depth), which the compiler checks and reports.
 DELAY_MAX_TICKS = (1 << 31) - 1
 
+#: The affine fixed-point fraction the RTL synthesizes with -- the SINGLE SOURCE
+#: (fpga/board_config/streamer_config.json params.coeff_frac_bits, a fingerprint-affecting geometry
+#: field) that the scan affine-tick math must scale by, imported from the dependency-free
+#: ``_streamer_geometry`` seam instead of a bare literal 8 (absolute import to dodge the deep-relative
+#: import trap, exactly like the ``_paths`` / ``_clock`` seams this module already uses).
+from Zou_lab_control._streamer_geometry import DEFAULT_COEFF_FRAC_BITS as _DEFAULT_COEFF_FRAC_BITS
+
 @dataclass(frozen=True)
 class FieldKind:
     """What ONE bindable pulse FIELD kind supports.
@@ -2689,7 +2696,7 @@ def affine_coeffs(
     slot_vars: Sequence[str],
     unit: str = "ns",
     time_step_ns: float = 1.0,
-    coeff_frac_bits: int = 8,
+    coeff_frac_bits: int = _DEFAULT_COEFF_FRAC_BITS,   # config single source (bitstream-affecting)
 ) -> tuple[int, list[int]]:
     """Return ``(base_ticks, [coeff_fixed per slot var])`` for scan timing.
 
