@@ -210,6 +210,25 @@ class BaseDevice(ABC):
     def open(self):
         return self
 
+    @property
+    def is_open(self) -> bool:
+        """True once the device's hardware handle is live.  A backend whose ``open()`` acquires a
+        handle (a camera's grabber, an RPyC link) OVERRIDES this with that predicate; a device with a
+        no-op ``open()`` is always ready.  This is the ONE source of the "opened on first use"
+        invariant -- :meth:`ensure_open` reads it, so no backend re-decides the policy by RAISING on
+        an unopened use (the historical ``PylonCamera.arm before open()`` outlier)."""
+        return True
+
+    def ensure_open(self):
+        """Idempotently open the device on first use.  The session contract is that devices open
+        LAZILY on first use (``na.connect`` builds the set with ``open_devices=False`` -- nothing is
+        eagerly opened), so a use-method calls this before touching the hardware and NEVER has to
+        raise "used before open"; it just gets opened.  A no-op once :attr:`is_open`, so calling it
+        before every arm/read costs nothing.  ``open()`` must therefore be idempotent."""
+        if not self.is_open:
+            self.open()
+        return self
+
     def close(self) -> None:
         pass
 
@@ -757,6 +776,9 @@ class CameraDevice(BaseDevice):
         losslessly until read.  Arming also takes the camera's acquisition lock, serializing
         concurrent consumers (a live monitor polling :meth:`acquire` waits while a
         measurement holds an armed session); :meth:`disarm` releases it."""
+        self.ensure_open()          # lazy-open on first use (session contract) -- BEFORE the lock,
+                                    # so a failed open never leaves the acquire lock held; a backend
+                                    # never raises "arm before open", it just gets opened.
         if frames is not None:
             frames = positive_int(frames, "frames")
         self._acquire_lock().acquire()

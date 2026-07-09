@@ -172,6 +172,13 @@ class PylonCamera(CameraDevice):
         self._apply_trigger()
         self._apply_roi()
 
+    @property
+    def is_open(self) -> bool:
+        """Live once :meth:`open` has created the InstantCamera handle -- the predicate the base
+        ``ensure_open`` reads to lazily open the grabber on first ``arm`` (this camera is a pure
+        grabber; it no longer raises 'arm before open')."""
+        return self._camera is not None
+
     def close(self) -> None:
         if self._camera is not None:
             try:
@@ -308,9 +315,7 @@ class PylonCamera(CameraDevice):
           resident latest-only stream could hand point K+1 a late frame from point K (a
           timed-out trigger whose frame arrives after the retry fired); per-point scans are
           slow anyway, so the restart cost is irrelevant there."""
-        if self._camera is None:
-            raise RuntimeError("PylonCamera.arm before open() -- the device set opens cameras last.")
-        from pypylon import pylon
+        from pypylon import pylon                # arm() ensured the grabber is open (base ensure_open)
 
         cam = self._camera
         if self._free_run:

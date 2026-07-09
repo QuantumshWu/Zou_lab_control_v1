@@ -322,6 +322,12 @@ class QCMOSCamera(CameraDevice):
         self._write_settings()
         return self
 
+    @property
+    def is_open(self) -> bool:
+        """Live once :meth:`open` holds a DCAM handle -- the predicate the base ``ensure_open`` reads
+        to lazily open on first ``arm`` (single-sourced with the pylon / virtual camera invariant)."""
+        return self._dcam is not None
+
     # ------------------------------------------------------------------ acquisition hooks
     # The public acquisition surface (arm / read_frames / disarm / acquire) lives on the
     # CameraDevice base; this adapter only implements the DCAM-facing hooks.  A measurement
@@ -332,8 +338,7 @@ class QCMOSCamera(CameraDevice):
         """Allocate the DCAM frame buffer and start capture -- the hardware is then armed and
         waiting for FPGA trigger edges.  ``frames=None`` (continuous) allocates a
         ``recent_capacity``-deep ring the sequence capture cycles through."""
-        self.open()
-        dcam = self._dcam
+        dcam = self._dcam                        # arm() ensured the DCAM handle is open (base ensure_open)
         alloc = int(frames) if frames is not None else max(1, int(self.recent_capacity))
         if dcam.buf_alloc(alloc) is False:
             raise RuntimeError(f"qCMOS buf_alloc({alloc}) failed: {dcam.lasterr()}")

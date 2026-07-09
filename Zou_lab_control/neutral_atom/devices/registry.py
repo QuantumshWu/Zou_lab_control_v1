@@ -167,19 +167,19 @@ class DeviceSet:
         return device
 
     def open(self) -> "DeviceSet":
-        opened: list[tuple[str, Any]] = []
-        try:
-            for name in self._open_order():
-                device = self.require(name)
-                device.open()
-                opened.append((name, device))
-        except Exception:
-            for _, device in reversed(opened):
-                try:
-                    device.close()
-                except Exception:
-                    pass
-            raise
+        # Best-effort, fault-ISOLATED open (cameras last -- see _open_order).  A device whose open()
+        # fails no longer rolls back and denies the OTHERS their open: a dead remote sequencer (its
+        # server down / unreachable) must not starve an independent camera you are bringing up beside
+        # it.  Every device is attempted; the devices that DID open stay open, and the failures are
+        # raised together at the end naming the offenders (each is idempotently re-openable on next use).
+        errors: list[str] = []
+        for name in self._open_order():
+            try:
+                self.require(name).open()
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+        if errors:
+            raise RuntimeError("Device open failed: " + "; ".join(errors))
         return self
 
     def close(self) -> None:

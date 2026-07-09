@@ -394,5 +394,9 @@ def test_pylon_camera_construction_needs_no_pylon_runtime():
     snap = cam.snapshot()
     assert snap["pixel_format"] == "Mono12"
     assert snap["trigger_source"] == "Line1"
-    with pytest.raises(RuntimeError, match="before open"):
+    # acquire() now LAZILY OPENS on first use (base ensure_open -- the 'arm before open' outlier is
+    # gone); with no real camera "123" attached the OPEN fails (SDK present: 'not found'; SDK absent:
+    # a pypylon import error), but NEVER the old 'arm before open'.
+    with pytest.raises(Exception) as exc:
         cam.acquire(1)
+    assert "before open" not in str(exc.value)
