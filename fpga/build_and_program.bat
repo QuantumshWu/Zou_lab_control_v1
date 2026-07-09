@@ -218,18 +218,23 @@ if not "%ZLC_PS_FPGA_PART%"=="" echo ZLC synthesis part: %ZLC_PS_FPGA_PART% (fro
 exit /b 0
 
 :zlc_emit_geom
-rem Single source: generate the Vivado geometry tcl (BRAM sizes + top -generic overrides) from
-rem streamer_config.json so editing the config changes the SYNTHESIZED bitstream (e.g.
-rem EVT_FIFO_DEPTH 256->128).  create_project.tcl sources it via ZLC_PS_GEOM_TCL; when this step
-rem is skipped the tcl uses its literal defaults.  Pure read; never fails the build.
-if not "%ZLC_PS_GEOM_TCL%"=="" goto :zlc_emit_geom_done
+rem Single source: from streamer_config.json generate (1) the Vivado geometry tcl (BRAM-IP sizes)
+rem create_project.tcl sources via ZLC_PS_GEOM_TCL, and (2) regenerate zlc_geometry.vh (the RTL
+rem parameter defaults + LAYOUT_FINGERPRINT the .v `include) IN PLACE, so editing the config changes
+rem the SYNTHESIZED bitstream (IP depths + every RTL geometry param + the connect fingerprint) with
+rem no hand edits.  When this step is skipped the tcl literal defaults + the committed .vh are used.
+rem Pure read/regenerate; never fails the build.
 where python >nul 2>nul
 if errorlevel 1 goto :zlc_emit_geom_done
-set "ZLC_GEOM_OUT=%ZLC_PS_BUILD_ROOT%\geom.tcl"
 pushd "%REPO_ROOT%"
 set "PYTHONPATH=%CD%;%PYTHONPATH%"
-python -m fpga.pulse_streamer.host.image --emit-geom-tcl "%ZLC_GEOM_OUT%" >nul 2>nul && set "ZLC_PS_GEOM_TCL=%ZLC_GEOM_OUT%"
+python -m fpga.pulse_streamer.host.image --emit-geometry-vh "%STREAMER_DIR%\zlc_geometry.vh" >nul 2>nul
+if "%ZLC_PS_GEOM_TCL%"=="" (
+  set "ZLC_GEOM_OUT=%ZLC_PS_BUILD_ROOT%\geom.tcl"
+  python -m fpga.pulse_streamer.host.image --emit-geom-tcl "!ZLC_GEOM_OUT!" >nul 2>nul && set "ZLC_PS_GEOM_TCL=!ZLC_GEOM_OUT!"
+)
 popd
+echo ZLC RTL geometry header regenerated from config: %STREAMER_DIR%\zlc_geometry.vh
 :zlc_emit_geom_done
 if not "%ZLC_PS_GEOM_TCL%"=="" echo ZLC geometry tcl: %ZLC_PS_GEOM_TCL% (from streamer_config.json)
 exit /b 0
@@ -246,7 +251,7 @@ if defined ZLC_PS_GEOM_TCL if exist "%ZLC_PS_GEOM_TCL%" set "ZLC_HASH_GEOM=%ZLC_
 rem Hash EVERY synthesized HDL create_project.tcl reads -- INCLUDING zlc_uart_bridge.v.  Omitting it
 rem meant a UART-bridge edit did not invalidate the build cache, so the bat "skipped build" and
 rem re-programmed a stale bitstream (the byte-mux fix silently never made it onto the board).
-for /f "delims=" %%H in ('python "%STREAMER_DIR%\host\src_hash.py" "%STREAMER_DIR%\zlc_edge_streamer.v" "%STREAMER_DIR%\zlc_uart_bridge.v" "%STREAMER_DIR%\zlc_pulse_streamer_top.v" "%STREAMER_DIR%\!ZLC_CREATE_TCL!" "%STREAMER_DIR%\!ZLC_PROGRAM_TCL!" "!ZLC_SELECTED_XDC!" "%REPO_ROOT%\fpga\board_config\streamer_config.json" "!ZLC_HASH_GEOM!" 2^>nul') do set "ZLC_SRC_HASH=%%H"
+for /f "delims=" %%H in ('python "%STREAMER_DIR%\host\src_hash.py" "%STREAMER_DIR%\zlc_edge_streamer.v" "%STREAMER_DIR%\zlc_uart_bridge.v" "%STREAMER_DIR%\zlc_pulse_streamer_top.v" "%STREAMER_DIR%\zlc_geometry.vh" "%STREAMER_DIR%\!ZLC_CREATE_TCL!" "%STREAMER_DIR%\!ZLC_PROGRAM_TCL!" "!ZLC_SELECTED_XDC!" "%REPO_ROOT%\fpga\board_config\streamer_config.json" "!ZLC_HASH_GEOM!" 2^>nul') do set "ZLC_SRC_HASH=%%H"
 exit /b 0
 
 :zlc_check_prebuilt

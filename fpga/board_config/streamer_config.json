@@ -31,6 +31,8 @@
     "bus_sel_width": 3,
     "slot_mul_width": 25,
     "evt_fifo_depth": 64,
-    "bus_evt_fifo_depth": 32
+    "bus_evt_fifo_depth": 32,
+    "delay_region_words": 128,
+    "ttl_delay_max_ticks": 2147483647
   }
 }

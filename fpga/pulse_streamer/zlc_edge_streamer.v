@@ -1,4 +1,8 @@
 `timescale 1ns / 1ps
+// Geometry parameter defaults come from zlc_geometry.vh (AUTO-GENERATED from
+// fpga/board_config/streamer_config.json).  The top overrides them at the instance; these
+// defaults are for standalone / testbench elaboration and the single-source contract tests.
+`include "zlc_geometry.vh"
 // =============================================================================
 // zlc_edge_streamer -- FINAL affine edge-table pulse streamer engine.
 //
@@ -54,20 +58,22 @@
 // =============================================================================
 
 module zlc_edge_streamer #(
-    parameter integer CHANNEL_COUNT = 62,
-    parameter integer EDGE_ADDR_WIDTH = 12,
-    parameter integer SCAN_ADDR_WIDTH = 12,     // addresses 2*BANK_SIZE points
+    // Geometry defaults are macros from the generated zlc_geometry.vh (config-derived); the top
+    // overrides them at the instance.  SCAN_COUNT_WIDTH is an intrinsic 32-bit counter width.
+    parameter integer CHANNEL_COUNT = `ZLC_CHANNEL_COUNT,
+    parameter integer EDGE_ADDR_WIDTH = `ZLC_EDGE_ADDR_WIDTH,
+    parameter integer SCAN_ADDR_WIDTH = `ZLC_SCAN_ADDR_WIDTH,   // = clog2(2*BANK_SIZE)
     parameter integer SCAN_COUNT_WIDTH = 32,    // total scan points N (unbounded)
-    parameter integer BANK_SIZE = 2048,         // power of two; points per ping-pong bank
-    parameter integer TICK_WIDTH = 32,
-    parameter integer NUM_SLOTS = 4,
-    parameter integer COEFF_WIDTH = 16,
-    parameter integer COEFF_FRAC_BITS = 8,
-    parameter integer BUS_COUNT = 4,
-    parameter integer BUS_INDEX_WIDTH = 2,
-    parameter integer BUS_WIDTH = 10,
-    parameter integer BUS_SEG_ADDR_WIDTH = 6,
-    parameter integer BUS_SEL_WIDTH = 3,
+    parameter integer BANK_SIZE = `ZLC_BANK_SIZE,               // power of two; points per ping-pong bank
+    parameter integer TICK_WIDTH = `ZLC_TICK_WIDTH,
+    parameter integer NUM_SLOTS = `ZLC_NUM_SLOTS,
+    parameter integer COEFF_WIDTH = `ZLC_COEFF_WIDTH,
+    parameter integer COEFF_FRAC_BITS = `ZLC_COEFF_FRAC_BITS,
+    parameter integer BUS_COUNT = `ZLC_BUS_COUNT,
+    parameter integer BUS_INDEX_WIDTH = `ZLC_BUS_INDEX_WIDTH,   // = clog2(BUS_COUNT)
+    parameter integer BUS_WIDTH = `ZLC_BUS_WIDTH,
+    parameter integer BUS_SEG_ADDR_WIDTH = `ZLC_BUS_SEG_ADDR_WIDTH,
+    parameter integer BUS_SEL_WIDTH = `ZLC_BUS_SEL_WIDTH,
     // IDLE/SAFE DAC code.  The DAC driver is bipolar OFFSET-BINARY: code 0 = NEGATIVE full
     // scale, code 2^(B-1) (=512 for 10 bits) = true 0 V.  Every "rest" value of a bus --
     // power-up, reset/CMD_SAFE, FIRE re-init, the delayed-read gate before the ring fills,
@@ -92,11 +98,11 @@ module zlc_edge_streamer #(
     // (~42.9 s at 20 ns; streamer_config.json ttl_delay_max_ticks).  GTIME_WIDTH bounds one
     // RUN (48b = ~65 days).
     parameter integer TTL_DELAY_WIDTH = 32,
-    parameter integer EVT_DEPTH = 64,
+    parameter integer EVT_DEPTH = `ZLC_EVT_FIFO_DEPTH,
     // DAC delay SEGMENT-descriptor FIFO depth: each BUS (bus_count = 4 of them) has ONE segment
     // FIFO holding its RESOLVED edge/ramp segments in flight for the delayed re-player, so the
     // depth scales with SEGMENTS IN FLIGHT (host-validated <= BUS_EVT_DEPTH), NOT value-changes.
-    parameter integer BUS_EVT_DEPTH = 32,
+    parameter integer BUS_EVT_DEPTH = `ZLC_BUS_EVT_FIFO_DEPTH,
     parameter integer GTIME_WIDTH = 48,
     // Event-FIFO COMPACTION.  Only channels that can carry a TTL delay (the real
     // outputs -- NOT the bus-member bits, whose pins are driven by bus_out and whose

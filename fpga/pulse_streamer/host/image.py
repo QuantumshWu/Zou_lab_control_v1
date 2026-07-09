@@ -36,7 +36,8 @@ from typing import Mapping, Sequence
 __all__ = [
     "StreamerParams", "CtrlWords", "FpgaPartProfile", "FPGA_PARTS", "part_profile",
     "SolvedCapacity", "solve_capacity", "estimate_resources",
-    "pack_program", "unpack_program", "scan_bank_words", "region_bases", "check_rtl_assumptions",
+    "pack_program", "unpack_program", "scan_bank_words", "region_bases", "build_ip_sizes",
+    "check_rtl_assumptions", "emit_geometry_vh", "emit_geom_tcl", "GEOMETRY_VH_FILENAME",
     "CMD_LOAD", "CMD_FIRE", "CMD_RESET", "CMD_SAFE",
     "STATUS_LOADED", "STATUS_RUNNING", "STATUS_DONE", "STATUS_ERROR", "STATUS_UNDERFLOW",
     "IMAGE_MAGIC", "REGISTER_LAYOUT_ID", "LAYOUT_STRUCT_VERSION", "build_fingerprint",
@@ -57,10 +58,11 @@ IMAGE_MAGIC = 0x5A4C4532   # "ZLE2"
 # LOUDLY: CLK_ENABLE 46->20 (v1->v2) put the clk mask in dead words -> garbled first-frame DAC;
 # bus_seg_addr_width 6->5 shifted R_DELAY down 896 words -> every DAC-scan value + delay wrong.
 #
-# SINGLE SOURCE: the connect-check and the Vivado build generic (vivado_generics) BOTH call
-# build_fingerprint(); the RTL only carries the pre-computed value as a generic -- it never
-# re-implements the hash.  Bump LAYOUT_STRUCT_VERSION on a pure-structure change (CtrlWords order,
-# command/status bit meaning) that no geometry field captures; geometry changes fold in by hash.
+# SINGLE SOURCE: the connect-check (build_fingerprint(session.params)) and the generated Verilog
+# header (emit_geometry_vh folds build_fingerprint into the ZLC_LAYOUT_FINGERPRINT macro the RTL
+# `include) both derive from build_fingerprint() -- the RTL only CARRIES the pre-computed value, it
+# never re-implements the hash.  Bump LAYOUT_STRUCT_VERSION on a pure-structure change (CtrlWords
+# order, command/status bit meaning) that no geometry field captures; geometry changes fold in by hash.
 LAYOUT_STRUCT_VERSION = 3   # v3: word 63 is a geometry fingerprint (was static 0x5A4C4C02 = 'ZLL'+v2)
 
 # Fields NOT folded into the fingerprint: host-side validation caps that are NOT built into the
@@ -138,23 +140,52 @@ class CtrlWords:
 CTRL_WORDS = 64
 
 
+def _shipped_config_params() -> dict:
+    """The ``params`` block of the shipped streamer_config.json, read ONCE at import from the
+    canonical (module-relative) path so the StreamerParams geometry defaults ARE the config: edit
+    the JSON and a bare ``StreamerParams()`` follows, with no hand-synced second copy of the
+    numbers.  Uses the fixed ``fpga/board_config/streamer_config.json`` (NOT the cwd/env search of
+    :func:`load_streamer_config`, which is the runtime override) so class construction is
+    deterministic.  Returns ``{}`` if the file is unreadable, so the per-field literal below is the
+    offline airbag -- pinned to the JSON by ``test_streamer_params_defaults_match_config``."""
+    try:
+        raw = json.loads((Path(__file__).resolve().parents[2] / "board_config"
+                          / "streamer_config.json").read_text(encoding="utf-8"))
+        params = raw.get("params") if isinstance(raw, dict) else None
+        return params if isinstance(params, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+_SHIPPED_PARAMS = _shipped_config_params()
+
+
+def _geom(name: str, fallback: int) -> int:
+    """A StreamerParams geometry default: the shipped-config value when present, else the offline
+    fallback literal (so a missing/unreadable config never breaks import)."""
+    try:
+        return int(_SHIPPED_PARAMS[name])
+    except (KeyError, TypeError, ValueError):
+        return int(fallback)
+
+
 @dataclass(frozen=True)
 class StreamerParams:
-    channel_count: int = 62
-    num_slots: int = 4
-    coeff_width: int = 16
-    tick_width: int = 32
-    coeff_frac_bits: int = 8
-    max_edges: int = 4096
-    bank_size: int = 2048         # scan points per bank (2 banks resident).  MUST equal
-    #                               streamer_config.json -- a bare StreamerParams() with a
-    #                               drifted default packs/decodes a DIFFERENT register
-    #                               geometry than the deployed bitstream (locked by
-    #                               test_streamer_params_defaults_match_config).
-    bus_count: int = 4
-    bus_width: int = 10
-    bus_seg_addr_width: int = 6
-    bus_sel_width: int = 3
+    # EVERY geometry default is the shipped streamer_config.json value (``_geom``), so a bare
+    # StreamerParams() IS the config -- editing the JSON propagates here with no second copy to
+    # hand-sync.  The literal second arg is only the offline airbag (file missing), pinned to the
+    # JSON by test_streamer_params_defaults_match_config.
+    channel_count: int = _geom("channel_count", 62)
+    num_slots: int = _geom("num_slots", 4)
+    coeff_width: int = _geom("coeff_width", 16)
+    tick_width: int = _geom("tick_width", 32)
+    coeff_frac_bits: int = _geom("coeff_frac_bits", 8)
+    max_edges: int = _geom("max_edges", 4096)
+    bank_size: int = _geom("bank_size", 2048)
+    bus_count: int = _geom("bus_count", 4)
+    bus_width: int = _geom("bus_width", 10)
+    bus_seg_addr_width: int = _geom("bus_seg_addr_width", 6)
+    bus_sel_width: int = _geom("bus_sel_width", 3)
     # EVENT SCHEDULER (TTL channels AND DAC buses): a delay is queued TOGGLES against a free-running
     # global counter.  The register field is 32-bit; the HOST enforces a conservative default
     # cap of ttl_delay_max_ticks = (1<<31)-1 ticks (~42.9 s at 20 ns, configurable via
@@ -167,14 +198,16 @@ class StreamerParams:
     # backstop ``SequencerService.prepare`` runs before EVERY upload -- NOT here in pack, which is a
     # pure serializer and cannot see the full (scan-expanded) toggle schedule.  Sparse experiment
     # triggers are far below the density cap.
-    ttl_delay_max_ticks: int = (1 << 31) - 1
-    evt_fifo_depth: int = 64    # keep == streamer_config.json evt_fifo_depth (the synthesized depth)
-    # per-BUS segment-descriptor FIFO depth (bus_count of them; resolved segments in flight, not value-changes).
-    bus_evt_fifo_depth: int = 32
+    ttl_delay_max_ticks: int = _geom("ttl_delay_max_ticks", (1 << 31) - 1)
+    evt_fifo_depth: int = _geom("evt_fifo_depth", 64)          # power of two (event-FIFO ring)
+    # per-BUS segment-descriptor FIFO depth (bus_count of them; resolved segments in flight, not
+    # value-changes).  Power of two (segment-FIFO ring).
+    bus_evt_fifo_depth: int = _geom("bus_evt_fifo_depth", 32)
     # DELAY register region: one 32b word per delay-eligible signal -- channel_count TTL channels
     # then bus_count per-bus DAC delays (both 32b now: DAC is event-scheduled per bit, not the old
-    # 12b ring, so TTL and DAC ranges match).  128 words reserved (>= channel_count + bus_count).
-    delay_region_words: int = 128
+    # 12b ring, so TTL and DAC ranges match).  128 words reserved (>= channel_count + bus_count),
+    # driving the RTL R_DELAY_WORDS macro via the geometry header.
+    delay_region_words: int = _geom("delay_region_words", 128)
 
     @property
     def channel_bit_width(self) -> int:
@@ -295,6 +328,34 @@ def region_bases(p: StreamerParams) -> dict:
             "scan": scan, "bus": bus, "delay": delay, "total": total}
 
 
+def build_ip_sizes(p: StreamerParams) -> dict:
+    """Vivado BRAM-IP sizes DERIVED from the geometry -- the SINGLE SOURCE create_project.tcl
+    consumes (emitted by :func:`emit_geom_tcl`).  Every value the build once hard-coded as a Tcl
+    literal (busimg ``Write_Depth_A {2048}``, axi_bram ``MEM_DEPTH 65536``, the asymmetric port-B
+    widths 64/64/128) is a pure function of the config here, so a geometry change auto-resizes the
+    IPs -- a bus_seg_addr_width bump can never silently overflow a fixed 2048-deep bus BRAM, and a
+    bigger edge/scan image can never overrun a fixed 65536-word axi_bram window.  Depths are the
+    power-of-two BRAM depth that COVERS the used words (BRAM depths are powers of two)."""
+    bases = region_bases(p)
+    return {
+        # asymmetric edge/scan BRAM port-B widths: 32-bit host writes on port A, wide engine reads
+        # on port B (one whole edge / scan point per access).  == top.v COEFF/MASK/SCAN_PORTB_BITS.
+        "coeff_portb_bits": _ceil(p.coeff_bits, 32) * 32,        # 64
+        "mask_portb_bits": _ceil(p.channel_count, 32) * 32,      # 64
+        "scan_portb_bits": p.slot_bits,                          # 128
+        # bus-image BRAM must hold every bus-segment row (bus_rows*bus_words words); scan/edge port-A
+        # depths follow their region.  Power-of-two depth that covers the used words.
+        "busimg_depth": _pow2_at_least(p.bus_rows * p.bus_words),        # 2048
+        "edge_addr_width": p.edge_addr_width,
+        "bank_size": p.bank_size,
+        "coeff_porta_depth": p.max_edges * (_ceil(p.coeff_bits, 32) * 32 // 32),
+        "mask_porta_depth": p.max_edges * (_ceil(p.channel_count, 32) * 32 // 32),
+        "scan_porta_depth": (2 * p.bank_size) * (p.slot_bits // 32),
+        # the single axi_bram_ctrl window must cover the whole word-address image (region total).
+        "axi_bram_depth": _pow2_at_least(bases["total"]),               # 65536
+    }
+
+
 # --------------------------------------------------------------------------- bits
 def _to_unsigned(value: int, width: int) -> int:
     return int(value) & ((1 << width) - 1)
@@ -333,19 +394,36 @@ def _unpack_coeffs(value: int, p: StreamerParams) -> list[int]:
             for j in range(p.num_slots)]
 
 
+def _is_pow2(v: int) -> bool:
+    return int(v) > 0 and (int(v) & (int(v) - 1)) == 0
+
+
 def check_rtl_assumptions(p: StreamerParams) -> None:
-    """Reject a geometry the SHIPPED RTL cannot realise (it would synthesize but
-    silently corrupt data).  These mirror comment guards in the .v sources:
+    """Reject a geometry that would SYNTHESIZE but silently corrupt data on hardware.
 
-    * the top's bus-loader assembles the coeff words as exactly TWO 32b caps, so
-      ``num_slots * coeff_width`` must be 64 (zlc_pulse_streamer_top.v L_EMIT);
-    * the bus flags word packs ``2*bus_width + 2 + 2*bus_sel_width`` bits into ONE
-      32b cap (same place);
-    * ``scan_addr_of`` concatenates ``{bank_bit, offset}``, so ``bank_size`` must be
-      a power of two (zlc_edge_streamer.v scan_addr_of);
-    * ``MAX_EDGES = 1 << EDGE_ADDR_WIDTH`` and the tick BRAM port is 32b wide.
+    This is the SINGLE SOURCE of every host<->bitstream sizing invariant -- the one gate that
+    ``pack_program`` (hard-reject before upload), ``load_streamer_config`` (warn), and the two
+    build emitters (:func:`emit_geometry_vh` / :func:`emit_geom_tcl`, precondition) all call.  It
+    guards two failure classes:
 
-    Change the RTL first, then relax the matching check here."""
+    * PACKING OVERFLOW -- a field the host folds into ONE 32-bit word overruns it:
+        - ``num_slots*coeff_width`` must be 64 (the top's 2-word coeff assembly);
+        - the bus flags word ``2*bus_width + 2 + 2*bus_sel_width`` must be <= 32;
+        - the BUS_COUNTS ctrl word packs ``bus_count*(bus_seg_addr_width+1)`` bits into ONE 32-bit
+          word -- overflow silently truncates the high buses' segment counts (a bus_seg_addr_width
+          or bus_count bump the fingerprint could NOT catch, since host+bitstream agree on the
+          value yet the single word cannot hold it).
+    * ADDRESSING / RTL-STRUCTURE -- ``bank_size`` and ``max_edges`` power-of-two (ping-pong /
+      ``MAX_EDGES = 1<<EDGE_ADDR_WIDTH``); ``tick_width`` 32; the per-signal DELAY region holds
+      ``channel_count+bus_count`` words; the event-FIFO ring pointers wrap at ``2^clog2(depth)`` so
+      ``evt_fifo_depth`` / ``bus_evt_fifo_depth`` must be powers of two (a non-pow2 depth reaches
+      indices depth..2^k-1 = out-of-bounds LUTRAM); the delay register field is 32-bit so
+      ``ttl_delay_max_ticks`` must fit it.
+
+    (The IP-DEPTH overflows -- busimg BRAM vs ``bus_rows*bus_words``, the axi_bram window vs the
+    region total -- cannot happen: :func:`build_ip_sizes` DERIVES those depths to cover the used
+    words, so there is no fixed literal left to overrun.)  Change the RTL first, then relax the
+    matching check here."""
     if p.num_slots * p.coeff_width != 64:
         raise ValueError(
             f"num_slots*coeff_width must be 64 for the shipped RTL (got {p.num_slots}*{p.coeff_width}="
@@ -356,14 +434,31 @@ def check_rtl_assumptions(p: StreamerParams) -> None:
         raise ValueError(
             f"bus flags word needs {flags_bits} bits (> 32) at bus_width={p.bus_width}, "
             f"bus_sel_width={p.bus_sel_width}; the top packs it into ONE 32b cap word.")
+    counts_bits = p.bus_count * (p.bus_seg_addr_width + 1)
+    if counts_bits > 32:
+        raise ValueError(
+            f"the BUS_COUNTS ctrl word needs {counts_bits} bits (> 32) at bus_count={p.bus_count}, "
+            f"bus_seg_addr_width={p.bus_seg_addr_width}: it packs each bus's segment count in "
+            f"(bus_seg_addr_width+1)={p.bus_seg_addr_width + 1} bits into ONE 32b word, so the high "
+            "buses' counts would truncate/alias.  Lower bus_count or bus_seg_addr_width.")
     if p.bank_size <= 0 or (p.bank_size & (p.bank_size - 1)) != 0:
         raise ValueError(
             f"bank_size must be a power of two (got {p.bank_size}); scan_addr_of concatenates "
             "{bank_bit, offset} and would alias the two banks otherwise.")
     if p.max_edges <= 0 or (p.max_edges & (p.max_edges - 1)) != 0:
         raise ValueError(f"max_edges must be a power of two (got {p.max_edges}); MAX_EDGES = 1 << EDGE_ADDR_WIDTH.")
+    if not _is_pow2(p.evt_fifo_depth) or not _is_pow2(p.bus_evt_fifo_depth):
+        raise ValueError(
+            f"evt_fifo_depth ({p.evt_fifo_depth}) and bus_evt_fifo_depth ({p.bus_evt_fifo_depth}) must "
+            "each be a power of two: the engine's event-FIFO ring pointers wrap at 2^clog2(depth) but "
+            "the distributed-RAM array is exactly `depth` deep, so a non-pow2 depth reaches indices "
+            "depth..2^k-1 = out-of-bounds LUTRAM (silent X corruption of scheduled toggles).")
     if p.tick_width != 32:
         raise ValueError(f"tick_width must be 32 (got {p.tick_width}); the tick BRAM port and CTRL words are 32b.")
+    if p.ttl_delay_max_ticks < 0 or p.ttl_delay_max_ticks >= (1 << 32):
+        raise ValueError(
+            f"ttl_delay_max_ticks ({p.ttl_delay_max_ticks}) must fit the 32-bit R_DELAY register field "
+            "(0 <= cap < 2^32).")
     if p.channel_count + p.bus_count > p.delay_region_words:
         raise ValueError(
             f"channel_count {p.channel_count} + bus_count {p.bus_count} exceeds the DELAY register "
@@ -727,8 +822,8 @@ def estimate_resources(params: StreamerParams, *, part, target_pct: float = 90.0
     # whose engine bit drives a pin, i.e. NOT the bus-member bits (their pin is driven by
     # bus_out, their `out` bit is always 0).  At deep EVT_DEPTH this is what keeps the
     # event RAM inside the 400 Kb distributed-RAM budget (every channel would not fit).
-    evt_depth = max(1, int(getattr(params, "evt_fifo_depth", 128)))
-    bus_evt_depth = max(1, int(getattr(params, "bus_evt_fifo_depth", 64)))
+    evt_depth = max(1, int(params.evt_fifo_depth))
+    bus_evt_depth = max(1, int(params.bus_evt_fifo_depth))
     # Delay-eligible channels = real TTL outputs (single source: StreamerParams.num_delay_ch).
     num_delay_ch = params.num_delay_ch
     # Each slot's FIFO is a SIMPLE-DUAL-PORT distributed RAM (sync write @wr, async read @rd
@@ -1009,37 +1104,93 @@ def format_capacity_report(result: dict) -> str:
     return "\n".join(lines)
 
 
-def vivado_generics(params: "StreamerParams") -> "list[str]":
-    """Verilog top-module parameter overrides that make the SYNTHESIZED bitstream match
-    streamer_config.json.  Only the freely-resizable DEPTHS are emitted: the pin-map-coupled
-    geometry (channel_count, num_slots/coeff_width with COEFF_BITS==64, bus_count/bus_width)
-    is locked to the hand-written board pinout + DELAY_CH_MAP in the top, so changing it needs
-    an RTL + XDC edit, not just a generic -- a JSON-vs-.v-default contract test guards those."""
-    return [
-        f"EDGE_ADDR_WIDTH={params.edge_addr_width}",
-        f"BANK_SIZE={params.bank_size}",
-        f"EVT_FIFO_DEPTH={params.evt_fifo_depth}",
-        f"BUS_EVT_FIFO_DEPTH={params.bus_evt_fifo_depth}",
-        # The compatibility fingerprint the top exposes on CTRL word 63.  Computed from THIS config
-        # so the bitstream advertises exactly the geometry it was built with; the host connect-check
-        # rejects any pairing whose fingerprint differs (build_fingerprint is the single source).
-        f"LAYOUT_FINGERPRINT={build_fingerprint(params)}",
+# ------------------------------------------------- config -> RTL header + build Tcl emitters
+# streamer_config.json is the ONE geometry source; these two emitters PROJECT it into the two
+# forms the Vivado build needs -- a Verilog header the .v sources + testbenches `include, and a
+# Tcl snippet create_project.tcl sources for the BRAM-IP sizes.  Every value is DERIVED here
+# (StreamerParams properties / region_bases / build_ip_sizes / build_fingerprint), so no .v or
+# .tcl ever carries a hand-typed geometry literal or a hand-computed fingerprint.
+GEOMETRY_VH_FILENAME = "zlc_geometry.vh"
+
+# (Verilog macro, StreamerParams attribute) -- the geometry every RTL parameter defaults to.  Both
+# the PRIMARY config knobs and the DERIVED widths (edge/scan/bus-index, num_delay_ch) are computed
+# by the StreamerParams properties, so the RTL never re-derives a width and the two can never drift.
+_GEOMETRY_VH_MACROS = (
+    ("ZLC_CHANNEL_COUNT", "channel_count"),
+    ("ZLC_NUM_SLOTS", "num_slots"),
+    ("ZLC_COEFF_WIDTH", "coeff_width"),
+    ("ZLC_TICK_WIDTH", "tick_width"),
+    ("ZLC_COEFF_FRAC_BITS", "coeff_frac_bits"),
+    ("ZLC_EDGE_ADDR_WIDTH", "edge_addr_width"),
+    ("ZLC_BANK_SIZE", "bank_size"),
+    ("ZLC_SCAN_ADDR_WIDTH", "scan_addr_width"),
+    ("ZLC_BUS_COUNT", "bus_count"),
+    ("ZLC_BUS_INDEX_WIDTH", "bus_index_width"),
+    ("ZLC_BUS_WIDTH", "bus_width"),
+    ("ZLC_BUS_SEG_ADDR_WIDTH", "bus_seg_addr_width"),
+    ("ZLC_BUS_SEL_WIDTH", "bus_sel_width"),
+    ("ZLC_EVT_FIFO_DEPTH", "evt_fifo_depth"),
+    ("ZLC_BUS_EVT_FIFO_DEPTH", "bus_evt_fifo_depth"),
+    ("ZLC_NUM_DELAY_CH", "num_delay_ch"),
+    ("ZLC_DELAY_REG_WORDS", "delay_region_words"),
+)
+
+
+def emit_geometry_vh(params: "StreamerParams") -> str:
+    """The Verilog geometry header (`include`d by BOTH the RTL sources and the testbenches).
+
+    Carries EVERY config-derived geometry value the .v files need as a ``\\`define`` -- the primary
+    knobs, the DERIVED widths (edge/scan/bus-index/num_delay_ch, from the StreamerParams properties
+    so the RTL never re-derives them), and the LAYOUT_FINGERPRINT the host connect-check verifies.
+    Each RTL parameter DEFAULTS to its macro, so editing streamer_config.json and rebuilding
+    propagates to the bitstream + testbenches with NO hand-carried .v literal and NO hand-computed
+    fingerprint (the exact scatter that made a depth change a six-file hand-edit).
+    build_and_program.bat regenerates this from the active config before synth; the committed copy
+    (shipped-config values) is pinned to ``emit_geometry_vh(default_params())`` by
+    ``test_geometry_vh_matches_config`` so it can never silently drift."""
+    check_rtl_assumptions(params)   # never emit a header for a geometry the shipped RTL corrupts
+    width = max(len(name) for name, _ in _GEOMETRY_VH_MACROS) + 1  # +1 so LAYOUT_FINGERPRINT aligns
+    lines = [
+        "// ==========================================================================",
+        "// zlc_geometry.vh -- AUTO-GENERATED from fpga/board_config/streamer_config.json by",
+        "//   python -m fpga.pulse_streamer.host.image --emit-geometry-vh <path>",
+        "// DO NOT EDIT.  Every RTL geometry parameter (+ the LAYOUT_FINGERPRINT the host connect-",
+        "// check verifies) defaults to a macro here, so editing the config + rebuilding propagates",
+        "// to the bitstream and testbenches with no hand-carried literal.  Regenerated from the",
+        "// active config by build_and_program.bat; the committed copy is pinned to the shipped",
+        "// config by test_geometry_vh_matches_config.",
+        "// ==========================================================================",
+        "`ifndef ZLC_GEOMETRY_VH",
+        "`define ZLC_GEOMETRY_VH",
     ]
+    for name, attr in _GEOMETRY_VH_MACROS:
+        lines.append(f"`define {name:<{width}} {int(getattr(params, attr))}")
+    lines.append(f"`define {'ZLC_LAYOUT_FINGERPRINT':<{width}} 32'h{build_fingerprint(params) & 0xFFFFFFFF:08X}")
+    lines.append("`endif // ZLC_GEOMETRY_VH")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def emit_geom_tcl(params: "StreamerParams") -> str:
-    """A tiny Tcl snippet that create_project.tcl sources so the BRAM-IP sizing variables AND
-    the top-module generics come from streamer_config.json (one source of truth).  When the
-    env var pointing here is unset, create_project.tcl falls back to its in-file literals, so
-    the current build is byte-identical -- this only takes effect for a config that differs."""
-    generics = " ".join(vivado_generics(params))
+    """The Vivado geometry Tcl create_project.tcl sources (via ZLC_PS_GEOM_TCL).  Sets ONLY the
+    BRAM-IP sizing vars -- every one DERIVED from the config via :func:`build_ip_sizes`, so a
+    geometry change auto-resizes the IPs (busimg depth grows with bus_rows*bus_words; the single
+    axi_bram window grows with the region total) and can never silently overflow a hard-coded BRAM
+    depth.  The RTL PARAMETERS come from the generated ``zlc_geometry.vh`` the .v sources
+    ``\\`include`` -- NOT from ``-generic`` overrides -- so there is ONE geometry bridge and no
+    duplicated generic list to keep in sync.  When the env var is unset, create_project.tcl falls
+    back to its in-file literals, so the shipped build is byte-identical."""
+    ip = build_ip_sizes(params)
     return (
         "# AUTO-GENERATED from streamer_config.json by image.emit_geom_tcl -- do not edit.\n"
-        "# Sets the BRAM-IP sizing vars + the top-module -generic overrides for synth.\n"
+        "# BRAM-IP sizing vars for create_project.tcl (all derived from the config geometry).\n"
         f"set zlc_edge_addr_width {params.edge_addr_width}\n"
         f"set zlc_bank_size {params.bank_size}\n"
-        f"set zlc_evt_fifo_depth {params.evt_fifo_depth}\n"
-        f"set zlc_top_generics {{{generics}}}\n"
+        f"set zlc_coeff_portb_bits {ip['coeff_portb_bits']}\n"
+        f"set zlc_mask_portb_bits {ip['mask_portb_bits']}\n"
+        f"set zlc_scan_portb_bits {ip['scan_portb_bits']}\n"
+        f"set zlc_busimg_depth {ip['busimg_depth']}\n"
+        f"set zlc_axi_bram_depth {ip['axi_bram_depth']}\n"
     )
 
 
@@ -1054,15 +1205,26 @@ def _main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--config", default=None, help="Path to streamer_config.json (default: auto-detect).")
     parser.add_argument("--part", default=None, help="Override fpga_part for this report only.")
     parser.add_argument("--emit-geom-tcl", default=None, metavar="PATH",
-                        help="Write the Vivado geometry/generics Tcl (derived from the config) to "
-                             "PATH and exit -- create_project.tcl sources it so the bitstream geometry "
-                             "(EVT_FIFO_DEPTH, BUS_EVT_FIFO_DEPTH, EDGE_ADDR_WIDTH, BANK_SIZE) follows the config.")
+                        help="Write the Vivado geometry Tcl (BRAM-IP sizes derived from the config) to "
+                             "PATH and exit -- create_project.tcl sources it so the IP depths "
+                             "(busimg / axi_bram / port-B widths) follow the config.")
+    parser.add_argument("--emit-geometry-vh", default=None, metavar="PATH",
+                        help="Write the Verilog geometry header (zlc_geometry.vh) derived from the config "
+                             "to PATH and exit -- the RTL sources + testbenches `include it, so every "
+                             "geometry parameter + the LAYOUT_FINGERPRINT follow the config with no "
+                             "hand-carried .v literal.")
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.emit_geom_tcl:
         import pathlib
         params = default_params(args.config)
         pathlib.Path(args.emit_geom_tcl).write_text(emit_geom_tcl(params), encoding="utf-8")
         print(f"wrote geometry tcl -> {args.emit_geom_tcl}")
+        return 0
+    if args.emit_geometry_vh:
+        import pathlib
+        params = default_params(args.config)
+        pathlib.Path(args.emit_geometry_vh).write_text(emit_geometry_vh(params), encoding="utf-8")
+        print(f"wrote geometry header -> {args.emit_geometry_vh}")
         return 0
     result = check_config_capacity(args.config)
     if args.part:

@@ -86,32 +86,34 @@ if {[info exists ::env(ZLC_PS_FPGA_PART)] && $::env(ZLC_PS_FPGA_PART) ne ""} {
 puts "ZLC synthesis part: $part"
 
 # Geometry SINGLE SOURCE: streamer_config.json.  build_and_program.bat generates a geom.tcl
-# (python -m fpga.pulse_streamer.host.image --emit-geom-tcl) that sets the base sizing vars +
-# $zlc_top_generics, and points ZLC_PS_GEOM_TCL at it.  Sourcing it BEFORE the literal
-# defaults below lets the config win; when the env var is unset (direct tcl run / no python)
-# the in-file literals are used and the build is byte-identical to before.
+# (python -m fpga.pulse_streamer.host.image --emit-geom-tcl) that sets the BRAM-IP sizing vars,
+# regenerates zlc_geometry.vh (the RTL params `include), and points ZLC_PS_GEOM_TCL here.  Sourcing
+# it BEFORE the literal defaults below lets the config win; when the env var is unset (direct tcl
+# run / no python) the in-file literals + the committed zlc_geometry.vh are used and the build is
+# byte-identical to the shipped config.
 if {[info exists ::env(ZLC_PS_GEOM_TCL)] && $::env(ZLC_PS_GEOM_TCL) ne "" && [file exists $::env(ZLC_PS_GEOM_TCL)]} {
     puts "ZLC geometry from config: $::env(ZLC_PS_GEOM_TCL)"
     source $::env(ZLC_PS_GEOM_TCL)
 }
-# Base sizing vars: keep in sync with the top defaults + host.image.  Set ONLY if the sourced
-# geom.tcl did not already (so the config overrides, the literals are the fallback).
-if {![info exists zlc_edge_addr_width]} { set zlc_edge_addr_width 12 }
-if {![info exists zlc_bank_size]}       { set zlc_bank_size 2048 }
-if {![info exists zlc_top_generics]}    { set zlc_top_generics {} }
+# BRAM-IP sizing vars.  ALL of these come from the sourced geom.tcl (image.emit_geom_tcl, derived
+# from streamer_config.json); the literals below are used ONLY when geom.tcl was not sourced
+# (direct tcl run / no python), so the config always wins and no IP depth is a hand-typed number
+# that could silently overflow when the geometry grows.  The RTL PARAMETERS come from
+# zlc_geometry.vh (the .v `include it) -- there are no top -generic overrides any more, so the
+# geometry has ONE bridge to the build (geom.tcl for IP sizes, zlc_geometry.vh for RTL params).
+if {![info exists zlc_edge_addr_width]}  { set zlc_edge_addr_width 12 }
+if {![info exists zlc_bank_size]}        { set zlc_bank_size 2048 }
+if {![info exists zlc_coeff_portb_bits]} { set zlc_coeff_portb_bits 64 }
+if {![info exists zlc_mask_portb_bits]}  { set zlc_mask_portb_bits 64 }
+if {![info exists zlc_scan_portb_bits]}  { set zlc_scan_portb_bits 128 }
+if {![info exists zlc_busimg_depth]}     { set zlc_busimg_depth 2048 }
+if {![info exists zlc_axi_bram_depth]}   { set zlc_axi_bram_depth 65536 }
 # Derived sizes (recomputed from the base vars, whatever their source).
 set zlc_scan_depth [expr {2 * $zlc_bank_size}]
 set zlc_max_edges [expr {1 << $zlc_edge_addr_width}]
-set zlc_coeff_portb_bits 64
-set zlc_mask_portb_bits 64
-set zlc_scan_portb_bits 128
 set zlc_coeff_porta_depth [expr {$zlc_max_edges * ($zlc_coeff_portb_bits / 32)}]
 set zlc_mask_porta_depth  [expr {$zlc_max_edges * ($zlc_mask_portb_bits / 32)}]
 set zlc_scan_porta_depth  [expr {$zlc_scan_depth * ($zlc_scan_portb_bits / 32)}]
-# OUTPUT delay: a per-signal EVENT SCHEDULER -- per-channel (TTL) event FIFOs + per-bus (DAC) segment FIFOs in
-# distributed RAM, inferred inside zlc_edge_streamer (ram_style="distributed", +0 RAMB36).
-# The event-scheduler FIFO depth (EVT_FIFO_DEPTH) is a top -generic, not a BRAM size.
-set zlc_axi_bram_depth 65536
 
 puts "ZLC create_project: FINAL engine (1-tick FIFO prefetch + 2-bank streaming), 4096 edges + bank 2048"
 puts "ZLC create_project project_dir: $project_dir"
@@ -197,15 +199,11 @@ read_verilog [file join $script_dir zlc_uart_bridge.v]
 read_verilog [file join $script_dir zlc_pulse_streamer_top.v]
 read_xdc $xdc_path
 set_property top $top [current_fileset]
-# Override the top's Verilog parameter DEFAULTS with the config-derived geometry so editing
-# streamer_config.json actually changes the synthesized bitstream (e.g. EVT_FIFO_DEPTH 256->128).
-# Empty when no geom.tcl was sourced -> the .v defaults stand.  Read back + echo so a typo'd /
-# silently-ignored generic is visible in the build log (Vivado does not error on an unknown one).
-if {[info exists zlc_top_generics] && [llength $zlc_top_generics]} {
-    set_property generic $zlc_top_generics [current_fileset]
-    puts "ZLC top generics (from config): $zlc_top_generics"
-    puts "ZLC top generics (read-back):   [get_property generic [current_fileset]]"
-}
+# The top's geometry PARAMETERS default to macros in zlc_geometry.vh (the .v `include it), which
+# build_and_program.bat regenerates from streamer_config.json before this runs -- so editing the
+# config changes the synthesized bitstream + the LAYOUT_FINGERPRINT with NO -generic overrides here.
+# The .vh path is echoed for the build log so a stale-header build is visible.
+puts "ZLC RTL geometry header: [file join $script_dir zlc_geometry.vh] (config-derived; regenerated by build_and_program.bat)"
 
 # --- jtag_axi master ------------------------------------------------------
 # FULL AXI4 (not AXI4-Lite) so the host can issue INCR burst writes -- one
@@ -315,7 +313,7 @@ zlc_try "busimg TDP"    {set_property CONFIG.Memory_Type {True_Dual_Port_RAM} [g
 zlc_try "busimg ByteWE" {set_property CONFIG.Use_Byte_Write_Enable {true} [get_ips blk_mem_gen_busimg]}
 zlc_try "busimg ByteSize8" {set_property CONFIG.Byte_Size {8} [get_ips blk_mem_gen_busimg]}
 zlc_try "busimg WWA=32" {set_property CONFIG.Write_Width_A {32} [get_ips blk_mem_gen_busimg]}
-zlc_try "busimg WDA=2048" {set_property CONFIG.Write_Depth_A {2048} [get_ips blk_mem_gen_busimg]}
+zlc_try "busimg WDA" {set_property CONFIG.Write_Depth_A $zlc_busimg_depth [get_ips blk_mem_gen_busimg]}
 zlc_try "busimg ENA"    {set_property CONFIG.Enable_A {Use_ENA_Pin} [get_ips blk_mem_gen_busimg]}
 zlc_try "busimg ENB"    {set_property CONFIG.Enable_B {Use_ENB_Pin} [get_ips blk_mem_gen_busimg]}
 zlc_try "busimg noRSTA" {set_property CONFIG.Use_RSTA_Pin {false} [get_ips blk_mem_gen_busimg]}

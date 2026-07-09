@@ -551,7 +551,10 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
 
     # final top: 62-pin board map + the FINAL engine instance + forced-latency build.
     assert "module zlc_pulse_streamer_top" in top
-    assert "parameter integer CHANNEL_COUNT = 62" in top
+    # geometry params default to the generated zlc_geometry.vh macros (config single source);
+    # CHANNEL_COUNT=62 lives in the header, pinned to the config by test_all_geometry_params.
+    assert '`include "zlc_geometry.vh"' in top
+    assert "parameter integer CHANNEL_COUNT = `ZLC_CHANNEL_COUNT" in top
     # The pin map drives out_final (the clk-muxed engine output: out_final[n] = clk_en[n] ? ~clk : out[n]).
     assert "assign trig = out_final[6];" in top
     assert "assign trap = out_final[9];" in top
@@ -2044,11 +2047,16 @@ def test_register_layout_handshake_rtl_matches_host():
     top = (pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
     m = re.search(r"localparam integer C_LAYOUT_ID\s*=\s*(\d+);", top)
     assert m and int(m.group(1)) == im.CtrlWords.LAYOUT_ID == 63
-    # word 63 derives from the LAYOUT_FINGERPRINT generic; its DEFAULT must equal the shipped-config
-    # fingerprint (build_fingerprint(default_params())), which both sides compute from the same code.
+    # word 63 derives from the LAYOUT_FINGERPRINT parameter, which DEFAULTS to the
+    # ZLC_LAYOUT_FINGERPRINT macro in the generated zlc_geometry.vh; that macro value must equal the
+    # shipped-config fingerprint (build_fingerprint(default_params())), which both sides compute from
+    # the same code -- no hand-typed hex in any .v.
     assert re.search(r"ZLC_LAYOUT_ID\s*=\s*LAYOUT_FINGERPRINT", top), "word 63 must derive from LAYOUT_FINGERPRINT"
-    m = re.search(r"parameter integer LAYOUT_FINGERPRINT\s*=\s*32'h([0-9A-Fa-f_]+)", top)
-    assert m, "LAYOUT_FINGERPRINT generic missing from the top"
+    assert re.search(r"parameter integer LAYOUT_FINGERPRINT\s*=\s*`ZLC_LAYOUT_FINGERPRINT", top), \
+        "LAYOUT_FINGERPRINT must default to the `ZLC_LAYOUT_FINGERPRINT header macro, not a literal"
+    vh = (pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_geometry.vh").read_text(encoding="utf-8")
+    m = re.search(r"`define\s+ZLC_LAYOUT_FINGERPRINT\s+32'h([0-9A-Fa-f_]+)", vh)
+    assert m, "ZLC_LAYOUT_FINGERPRINT missing from zlc_geometry.vh"
     assert int(m.group(1).replace("_", ""), 16) == im.build_fingerprint(im.default_params()) == im.REGISTER_LAYOUT_ID
     # the read mux must return the constant for word 63 (write-proof read-back)
     assert re.search(r"word_addr\[5:0\] == C_LAYOUT_ID\[5:0\]", top)
@@ -6079,120 +6087,186 @@ def test_evt_fifo_depth_single_source_contract():
 
     root = pathlib.Path(__file__).resolve().parents[1]
     config = json.loads((root / "fpga" / "board_config" / "streamer_config.json").read_text(encoding="utf-8"))
+    vh = (root / "fpga" / "pulse_streamer" / "zlc_geometry.vh").read_text(encoding="utf-8")
     top = (root / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
     eng = (root / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
     cfg_depth = int(config["params"]["evt_fifo_depth"])
-    top_match = re.search(r"parameter\s+integer\s+EVT_FIFO_DEPTH\s*=\s*(\d+)", top)
-    eng_match = re.search(r"parameter\s+integer\s+EVT_DEPTH\s*=\s*(\d+)", eng)
-    assert top_match and eng_match
-    assert int(top_match.group(1)) == cfg_depth, "top.v EVT_FIFO_DEPTH != streamer_config.json"
-    assert int(eng_match.group(1)) == cfg_depth, "engine EVT_DEPTH default != streamer_config.json"
+    # RTL side: config -> the ZLC_EVT_FIFO_DEPTH macro in the generated header -> top EVT_FIFO_DEPTH /
+    # engine EVT_DEPTH both default to that macro (no literal).  So the header value is the single
+    # RTL carrier; the top + engine only reference it.
+    vh_match = re.search(r"`define\s+ZLC_EVT_FIFO_DEPTH\s+(\d+)", vh)
+    assert vh_match and int(vh_match.group(1)) == cfg_depth, "zlc_geometry.vh ZLC_EVT_FIFO_DEPTH != streamer_config.json"
+    assert re.search(r"parameter\s+integer\s+EVT_FIFO_DEPTH\s*=\s*`ZLC_EVT_FIFO_DEPTH", top), "top.v EVT_FIFO_DEPTH must default to the header macro"
+    assert re.search(r"parameter\s+integer\s+EVT_DEPTH\s*=\s*`ZLC_EVT_FIFO_DEPTH", eng), "engine EVT_DEPTH must default to the header macro"
     assert EVT_FIFO_DEPTH == cfg_depth
     assert int(engine_model.EVT_FIFO_DEPTH) == cfg_depth
 
 
 def test_all_geometry_params_config_matches_rtl_defaults():
-    """EVERY geometry parameter the bitstream SYNTHESIZES from must equal streamer_config.json, so the
-    config-derived LAYOUT_FINGERPRINT the host checks at connect ACTUALLY describes the built geometry.
+    """streamer_config.json is the ONE geometry source: image.emit_geometry_vh folds every config-
+    derived value (+ the LAYOUT_FINGERPRINT the host checks at connect) into zlc_geometry.vh, and
+    top.v / engine.v / the testbench ``\\`include`` it and DEFAULT every geometry parameter to a macro.
+    So a config edit propagates to the synthesized bitstream + testbenches with NO hand-carried .v
+    literal and NO hand-computed fingerprint.  This ONE test pins the whole chain:
 
-    Most geometry params are NOT Vivado generics (they are pin-coupled to the board XDC + DELAY_CH_MAP):
-    they synthesize from the top.v .v default, so a config edit without a matching .v edit (or vice
-    versa) would build one geometry while the config-built fingerprint advertises another -- and the
-    fingerprint could not tell (its RTL literal is hand-carried from config, not from the RTL geometry).
-    This ONE test pins top.v + engine.v defaults to the config for every geometry knob, including the
-    DERIVED widths (SCAN_ADDR_WIDTH/BUS_INDEX_WIDTH/EDGE_ADDR_WIDTH must equal the width the config
-    implies, so bumping bank_size/bus_count/max_edges without widening them fails HERE) and the
-    hardwired NUM_DELAY_CH engine-instance literal.  (test_evt_fifo_depth_single_source_contract is the
-    5-way host-side extension for the one FIFO depth.)"""
+      1. the committed zlc_geometry.vh == emit_geometry_vh(default_params()) (freshness -> the header
+         can never carry a stale/hand-typed value; regenerate it via --emit-geometry-vh);
+      2. every macro value == the config-derived StreamerParams (subsumed by (1), since the emitter
+         computes the macros from the config properties);
+      3. top.v + engine.v DEFAULT every config-coupled parameter to its ZLC_ macro, never a literal
+         (so nothing can drift from the header);
+      4. config == StreamerParams default; the pin-coupled NUM_DELAY_CH engine-instance literal ==
+         num_delay_ch == the header macro; the tb LAYOUT uses the macro."""
     import json
     import pathlib
     import re
     from fpga.pulse_streamer.host import image as im
 
     root = pathlib.Path(__file__).resolve().parents[1]
+    sd = root / "fpga" / "pulse_streamer"
     cfg = json.loads((root / "fpga" / "board_config" / "streamer_config.json").read_text(encoding="utf-8"))["params"]
-    top = (root / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
-    eng = (root / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    vh = (sd / "zlc_geometry.vh").read_text(encoding="utf-8")
+    top = (sd / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    eng = (sd / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    tb = (sd / "tb_uart_read_tap.v").read_text(encoding="utf-8")
     p = im.default_params()
 
-    def rtl_default(text, name):
-        m = re.search(r"parameter\s+integer\s+%s\s*=\s*(\d+)" % name, text)
-        assert m, f"{name} parameter default missing"
-        return int(m.group(1))
+    # (1)+(2) the committed header is EXACTLY what the emitter produces from the shipped config, so
+    # every macro value (incl. the fingerprint + derived widths) is the config value, and a config
+    # edit without a regenerated header (build_and_program.bat regenerates it) is caught right here.
+    assert vh == im.emit_geometry_vh(p), (
+        "zlc_geometry.vh is stale -- regenerate: "
+        "python -m fpga.pulse_streamer.host.image --emit-geometry-vh fpga/pulse_streamer/zlc_geometry.vh")
+    macros = {m: v for m, v in re.findall(r"`define\s+(ZLC_\w+)\s+(\S+)", vh)}
 
-    # top.v param default -> the config-derived value it MUST equal (direct config field OR a width
-    # derived from one, so a config bump that outgrows a hand-set width is caught right here).
-    top_expect = {
-        "CHANNEL_COUNT": p.channel_count, "TICK_WIDTH": p.tick_width, "NUM_SLOTS": p.num_slots,
-        "COEFF_WIDTH": p.coeff_width, "COEFF_FRAC_BITS": p.coeff_frac_bits, "BUS_COUNT": p.bus_count,
-        "BUS_WIDTH": p.bus_width, "BUS_SEG_ADDR_WIDTH": p.bus_seg_addr_width, "BUS_SEL_WIDTH": p.bus_sel_width,
-        "BANK_SIZE": p.bank_size, "EVT_FIFO_DEPTH": p.evt_fifo_depth, "BUS_EVT_FIFO_DEPTH": p.bus_evt_fifo_depth,
-        "EDGE_ADDR_WIDTH": p.edge_addr_width, "SCAN_ADDR_WIDTH": p.scan_addr_width, "BUS_INDEX_WIDTH": p.bus_index_width,
-    }
-    for name, want in top_expect.items():
-        assert rtl_default(top, name) == want, f"top.v {name} != config-derived {want}"
+    # (3) every config-coupled RTL parameter DEFAULTS to a ZLC_ macro (never a bare literal), so the
+    # header is the sole carrier.  Intrinsic architectural constants (SCAN_COUNT_WIDTH/RD_LAT/
+    # GTIME_WIDTH/TTL_DELAY_WIDTH ...) are NOT config knobs and legitimately stay literals.
+    def defaults_to_macro(text, name):
+        return re.search(r"parameter\s+integer\s+%s\s*=\s*`ZLC_\w+" % name, text) is not None
 
-    # every DIRECT config field must also equal the StreamerParams default (config == host default).
+    top_macro_params = ("CHANNEL_COUNT", "EDGE_ADDR_WIDTH", "BANK_SIZE", "SCAN_ADDR_WIDTH", "TICK_WIDTH",
+                        "NUM_SLOTS", "COEFF_WIDTH", "COEFF_FRAC_BITS", "BUS_COUNT", "BUS_INDEX_WIDTH",
+                        "BUS_WIDTH", "BUS_SEG_ADDR_WIDTH", "BUS_SEL_WIDTH", "EVT_FIFO_DEPTH",
+                        "BUS_EVT_FIFO_DEPTH", "LAYOUT_FINGERPRINT")
+    for name in top_macro_params:
+        assert defaults_to_macro(top, name), f"top.v {name} must default to a `ZLC_ macro, not a literal"
+    eng_macro_params = ("CHANNEL_COUNT", "EDGE_ADDR_WIDTH", "SCAN_ADDR_WIDTH", "BANK_SIZE", "TICK_WIDTH",
+                        "NUM_SLOTS", "COEFF_WIDTH", "COEFF_FRAC_BITS", "BUS_COUNT", "BUS_INDEX_WIDTH",
+                        "BUS_WIDTH", "BUS_SEG_ADDR_WIDTH", "BUS_SEL_WIDTH", "EVT_DEPTH", "BUS_EVT_DEPTH")
+    for name in eng_macro_params:
+        assert defaults_to_macro(eng, name), f"engine {name} must default to a `ZLC_ macro, not a literal"
+    # the R_DELAY region span is the header macro too (so it tracks delay_region_words).
+    assert re.search(r"R_DELAY_WORDS\s*=\s*`ZLC_DELAY_REG_WORDS", top), "R_DELAY_WORDS must come from the header macro"
+
+    # (4) config == StreamerParams default (belt for the offline airbag); pin-coupled NUM_DELAY_CH
+    # literal == num_delay_ch == header macro; tb uses the fingerprint macro (never a stale literal).
     direct = ("channel_count", "tick_width", "num_slots", "coeff_width", "coeff_frac_bits", "bus_count",
               "bus_width", "bus_seg_addr_width", "bus_sel_width", "bank_size", "evt_fifo_depth", "bus_evt_fifo_depth")
     for field in direct:
         assert int(cfg[field]) == getattr(p, field), f"streamer_config.json {field} != StreamerParams default"
-
-    # engine.v defaults (its EVT/BUS_EVT are named differently) must match too (standalone/xsim path).
-    eng_expect = {
-        "CHANNEL_COUNT": p.channel_count, "NUM_SLOTS": p.num_slots, "COEFF_WIDTH": p.coeff_width,
-        "COEFF_FRAC_BITS": p.coeff_frac_bits, "TICK_WIDTH": p.tick_width, "BUS_COUNT": p.bus_count,
-        "BUS_WIDTH": p.bus_width, "BUS_SEG_ADDR_WIDTH": p.bus_seg_addr_width, "BUS_SEL_WIDTH": p.bus_sel_width,
-        "BANK_SIZE": p.bank_size, "EVT_DEPTH": p.evt_fifo_depth, "BUS_EVT_DEPTH": p.bus_evt_fifo_depth,
-    }
-    for name, want in eng_expect.items():
-        assert rtl_default(eng, name) == want, f"engine {name} != config-derived {want}"
-
-    # NUM_DELAY_CH is a DERIVED host property hardwired at the engine instance in top.v; pin it so a
-    # bus_count/bus_width edit (which changes num_delay_ch) cannot leave the RTL literal stale -- the
-    # engine would then have no delay FIFO for channels the host allows delays on.
     m = re.search(r"\.NUM_DELAY_CH\((\d+)\)", top)
-    assert m and int(m.group(1)) == p.num_delay_ch, f"top.v .NUM_DELAY_CH({m and m.group(1)}) != num_delay_ch {p.num_delay_ch}"
+    assert m and int(m.group(1)) == p.num_delay_ch == int(macros["ZLC_NUM_DELAY_CH"]), (
+        f"top.v .NUM_DELAY_CH({m and m.group(1)}) must equal num_delay_ch {p.num_delay_ch} (== header macro)")
+    assert "`ZLC_LAYOUT_FINGERPRINT" in tb, "tb_uart_read_tap.v LAYOUT must use the header macro, not a literal"
 
 
-def test_build_geometry_driven_from_config_via_generics():
-    """Editing streamer_config.json must change the SYNTHESIZED bitstream, not just the host:
-    image.emit_geom_tcl turns the config into the BRAM sizing vars + top -generic overrides,
-    build_and_program.bat generates it, and create_project.tcl sources it + applies the
-    generics.  EVERY emitted generic must name a REAL top parameter, else Vivado silently
-    ignores it and the bitstream keeps the .v default (the exact silent-divergence we fix)."""
+def test_build_geometry_driven_from_config_via_header():
+    """Editing streamer_config.json must change the SYNTHESIZED bitstream, not just the host, via ONE
+    bridge each: image.emit_geometry_vh regenerates zlc_geometry.vh (the RTL parameter defaults +
+    LAYOUT_FINGERPRINT the .v ``\\`include``), and image.emit_geom_tcl regenerates the BRAM-IP sizing
+    Tcl create_project.tcl sources.  There are NO ``-generic`` overrides any more (the .vh replaced
+    them), and EVERY IP depth is DERIVED (build_ip_sizes) so a geometry bump can never overflow a
+    hard-coded BRAM depth."""
     import pathlib
-    import re
     from fpga.pulse_streamer.host import image as im
 
     root = pathlib.Path(__file__).resolve().parents[1]
     params = im.default_params()
-    generics = im.vivado_generics(params)
     geom = im.emit_geom_tcl(params)
+    ip = im.build_ip_sizes(params)
     top = (root / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    eng = (root / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
     tcl = (root / "fpga" / "pulse_streamer" / "create_project.tcl").read_text(encoding="utf-8")
     bat = (root / "fpga" / "build_and_program.bat").read_text(encoding="utf-8")
 
-    # the generics carry the freely-resizable depths and match the config
-    names = {g.split("=")[0]: int(g.split("=")[1]) for g in generics}
-    assert names["EVT_FIFO_DEPTH"] == params.evt_fifo_depth
-    assert names["BANK_SIZE"] == params.bank_size
-    assert names["EDGE_ADDR_WIDTH"] == params.edge_addr_width
-    # EVERY generic must be an actual top-module parameter (or Vivado ignores it silently)
-    top_params = set(re.findall(r"parameter\s+integer\s+(\w+)\s*=", top))
-    for name in names:
-        assert name in top_params, f"generic {name} is not a zlc_pulse_streamer_top parameter"
-    # the emitted geom.tcl sets the sizing vars + the generics var the tcl consumes
-    assert "set zlc_evt_fifo_depth" in geom and "set zlc_top_generics {" in geom
-    # create_project.tcl sources the config geom + applies the generics with a read-back echo
-    assert "ZLC_PS_GEOM_TCL" in tcl
-    assert "source $::env(ZLC_PS_GEOM_TCL)" in tcl
-    assert "set_property generic $zlc_top_generics [current_fileset]" in tcl
-    assert "get_property generic [current_fileset]" in tcl   # read-back so a bad generic is visible
-    # build_and_program.bat generates the geom tcl and points the env var at it
-    assert "--emit-geom-tcl" in bat and "ZLC_PS_GEOM_TCL=" in bat and "call :zlc_emit_geom" in bat
-    # and the top must actually pass the parameter to the engine instance
+    # the RTL sources `include the generated header (the single RTL-parameter bridge)
+    assert '`include "zlc_geometry.vh"' in top and '`include "zlc_geometry.vh"' in eng
+
+    # emit_geom_tcl sets the DERIVED BRAM-IP sizes create_project consumes (no top-generic list any more)
+    assert f"set zlc_busimg_depth {ip['busimg_depth']}" in geom
+    assert f"set zlc_axi_bram_depth {ip['axi_bram_depth']}" in geom
+    assert f"set zlc_scan_portb_bits {ip['scan_portb_bits']}" in geom
+    assert "zlc_top_generics" not in geom, "geom.tcl must not emit a generic list any more (the .vh carries params)"
+
+    # create_project.tcl consumes the derived IP sizes (busimg depth + axi_bram window) -- not literals
+    assert "CONFIG.Write_Depth_A $zlc_busimg_depth" in tcl, "busimg BRAM depth must be the derived var, not 2048"
+    assert "CONFIG.MEM_DEPTH $zlc_axi_bram_depth" in tcl, "axi_bram MEM_DEPTH must be the derived var, not 65536"
+    assert "set_property generic" not in tcl, "create_project.tcl must not apply top -generics any more"
+    assert "ZLC_PS_GEOM_TCL" in tcl and "source $::env(ZLC_PS_GEOM_TCL)" in tcl
+
+    # build_and_program.bat regenerates BOTH artifacts from the config and hashes the header
+    assert "--emit-geometry-vh" in bat and "--emit-geom-tcl" in bat
+    assert "call :zlc_emit_geom" in bat
+    assert "zlc_geometry.vh" in bat  # the header is regenerated + hashed so a config change rebuilds
+
+    # the top still passes the depth params to the engine instance (macro -> param -> instance)
     assert ".EVT_DEPTH(EVT_FIFO_DEPTH)" in top
+
+
+def test_check_rtl_assumptions_guards_packing_overflows():
+    """check_rtl_assumptions is the SINGLE runtime gate for the sizing invariants the geometry
+    fingerprint canNOT catch (host + bitstream agree on the VALUE, but a single 32-bit word or a
+    ring pointer cannot hold it).  These fired NONE before this refactor: the BUS_COUNTS word packs
+    bus_count*(bus_seg_addr_width+1) bits into ONE 32b word, and the event-FIFO ring pointers need
+    power-of-two depths.  Each bump below is a config a user could set that would SILENTLY corrupt
+    the DAC/delay path on hardware -- it must raise at pack time instead."""
+    import dataclasses
+    import pytest
+    from fpga.pulse_streamer.host import image as im
+
+    p = im.default_params()
+    im.check_rtl_assumptions(p)   # the shipped geometry is valid
+
+    # BUS_COUNTS 32-bit word: bus_seg_addr_width 6->8 makes 4*(8+1)=36 > 32 -> high buses truncate.
+    with pytest.raises(ValueError, match="BUS_COUNTS"):
+        im.check_rtl_assumptions(dataclasses.replace(p, bus_seg_addr_width=8))
+    # ... and bus_count 4->5 at width 6 makes 5*7=35 > 32.
+    with pytest.raises(ValueError, match="BUS_COUNTS"):
+        im.check_rtl_assumptions(dataclasses.replace(p, bus_count=5))
+    # bus_seg_addr_width=7 (4*8=32) is EXACTLY full and must still pass.
+    im.check_rtl_assumptions(dataclasses.replace(p, bus_seg_addr_width=7))
+
+    # event-FIFO ring pointers wrap at 2^clog2(depth): a non-power-of-two depth walks off the array.
+    for bad in (dataclasses.replace(p, evt_fifo_depth=48), dataclasses.replace(p, bus_evt_fifo_depth=100)):
+        with pytest.raises(ValueError, match="power of two"):
+            im.check_rtl_assumptions(bad)
+
+    # the delay register field is 32-bit; a cap >= 2^32 would not fit.
+    with pytest.raises(ValueError, match="ttl_delay_max_ticks"):
+        im.check_rtl_assumptions(dataclasses.replace(p, ttl_delay_max_ticks=1 << 32))
+
+
+def test_streamer_config_covers_every_fingerprint_field():
+    """Every bitstream-affecting StreamerParams field (i.e. every field folded into build_fingerprint)
+    must be a KEY in streamer_config.json params, so the single source can actually EDIT it.  Without
+    this, a newly-added geometry field defaults silently in the dataclass, changes the fingerprint,
+    yet is un-editable from the config -- the delay_region_words / ttl_delay_max_ticks gap this
+    refactor closed by adding them to the JSON."""
+    import json
+    import pathlib
+    import dataclasses
+    from fpga.pulse_streamer.host import image as im
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    cfg = json.loads((root / "fpga" / "board_config" / "streamer_config.json").read_text(encoding="utf-8"))["params"]
+    fields = {f.name for f in dataclasses.fields(im.StreamerParams)}
+    missing = sorted(f for f in fields if f not in cfg)
+    assert not missing, f"streamer_config.json params is missing editable geometry keys: {missing}"
+    # and the shipped JSON value equals the dataclass default (the offline airbag never diverges).
+    p = im.default_params()
+    for f in fields:
+        assert int(cfg[f]) == int(getattr(p, f)), f"streamer_config.json {f}={cfg[f]} != StreamerParams {getattr(p, f)}"
 
 
 # ===========================================================================

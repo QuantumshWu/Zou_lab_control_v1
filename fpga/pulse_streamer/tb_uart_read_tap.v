@@ -1,4 +1,5 @@
 `timescale 1ns/1ps
+`include "zlc_geometry.vh"   // ZLC_LAYOUT_FINGERPRINT -- config-derived, so the tb never carries a stale literal
 // End-to-end UART bring-up proof: drive real frames in on uart_rx, DECODE the serial replies on
 // uart_tx.  Covers every UART bug hardware surfaced (all invisible to the functional Python model):
 //   1. read-tap latency   -- top's u_rd_data tap must be COMBINATIONAL (registered -> stale reads).
@@ -11,7 +12,7 @@
 // The tb models the top's UART write into ctrl_reg WITH the u_active gate, so bug 3 is reproduced.
 // Compile: xvlog zlc_uart_bridge.v tb_uart_read_tap.v ; xelab tb_uart_read_tap -s t ; xsim t -R
 module tb_uart_read_tap;
-    localparam [31:0] LAYOUT = 32'h5A87FD36;   // current shipped image.build_fingerprint (word-63 readback)
+    localparam [31:0] LAYOUT = `ZLC_LAYOUT_FINGERPRINT;   // config-derived image.build_fingerprint (word-63 readback)
     real BITT = 333.333;                            // 3 Mbaud bit period (ns)
 
     reg clk = 1'b0;  always #10 clk = ~clk;         // 50 MHz

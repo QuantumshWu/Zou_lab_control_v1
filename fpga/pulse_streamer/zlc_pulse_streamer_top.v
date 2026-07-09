@@ -1,4 +1,9 @@
 `timescale 1ns / 1ps
+// SINGLE GEOMETRY SOURCE: every parameter default below comes from zlc_geometry.vh, which is
+// AUTO-GENERATED from fpga/board_config/streamer_config.json by image.emit_geometry_vh (regenerated
+// by build_and_program.bat before synth).  Edit the JSON -> the whole bitstream + testbenches follow;
+// no .v carries a hand-typed geometry literal or a hand-computed LAYOUT_FINGERPRINT.
+`include "zlc_geometry.vh"
 // =============================================================================
 // zlc_pulse_streamer_top -- FINAL board top for the affine edge-table streamer.
 //
@@ -40,29 +45,29 @@
 // =============================================================================
 
 module zlc_pulse_streamer_top #(
-    parameter integer CHANNEL_COUNT = 62,
-    parameter integer EDGE_ADDR_WIDTH = 12,     // 4096 edges
-    parameter integer BANK_SIZE = 2048,         // power of two; scan ping-pong bank
-    parameter integer SCAN_ADDR_WIDTH = 12,     // addresses 2*BANK_SIZE points
-    parameter integer SCAN_COUNT_WIDTH = 32,    // total scan points N (unbounded)
-    parameter integer TICK_WIDTH = 32,
-    parameter integer NUM_SLOTS = 4,
-    parameter integer COEFF_WIDTH = 16,
-    parameter integer COEFF_FRAC_BITS = 8,
-    parameter integer BUS_COUNT = 4,
-    parameter integer BUS_INDEX_WIDTH = 2,
-    parameter integer BUS_WIDTH = 10,
-    parameter integer BUS_SEG_ADDR_WIDTH = 6,
-    parameter integer BUS_SEL_WIDTH = 3,
-    parameter integer EVT_FIFO_DEPTH = 64,      // TTL delay event FIFO depth (in-flight edges per
-                                                // channel; keep = streamer_config.json evt_fifo_depth)
-    parameter integer BUS_EVT_FIFO_DEPTH = 32,  // per-BUS segment FIFO depth (bus_count=4 of them, resolved
-                                                // segments in flight; = streamer_config.json bus_evt_fifo_depth)
+    // Geometry defaults are macros from the generated zlc_geometry.vh (config-derived) -- see the
+    // header include above; SCAN_COUNT_WIDTH is an intrinsic 32-bit counter width, not a config knob.
+    parameter integer CHANNEL_COUNT = `ZLC_CHANNEL_COUNT,
+    parameter integer EDGE_ADDR_WIDTH = `ZLC_EDGE_ADDR_WIDTH,
+    parameter integer BANK_SIZE = `ZLC_BANK_SIZE,           // power of two; scan ping-pong bank
+    parameter integer SCAN_ADDR_WIDTH = `ZLC_SCAN_ADDR_WIDTH, // = clog2(2*BANK_SIZE), image.scan_addr_width
+    parameter integer SCAN_COUNT_WIDTH = 32,                // total scan points N (unbounded)
+    parameter integer TICK_WIDTH = `ZLC_TICK_WIDTH,
+    parameter integer NUM_SLOTS = `ZLC_NUM_SLOTS,
+    parameter integer COEFF_WIDTH = `ZLC_COEFF_WIDTH,
+    parameter integer COEFF_FRAC_BITS = `ZLC_COEFF_FRAC_BITS,
+    parameter integer BUS_COUNT = `ZLC_BUS_COUNT,
+    parameter integer BUS_INDEX_WIDTH = `ZLC_BUS_INDEX_WIDTH, // = clog2(BUS_COUNT), image.bus_index_width
+    parameter integer BUS_WIDTH = `ZLC_BUS_WIDTH,
+    parameter integer BUS_SEG_ADDR_WIDTH = `ZLC_BUS_SEG_ADDR_WIDTH,
+    parameter integer BUS_SEL_WIDTH = `ZLC_BUS_SEL_WIDTH,
+    parameter integer EVT_FIFO_DEPTH = `ZLC_EVT_FIFO_DEPTH,     // TTL delay event FIFO depth (per channel)
+    parameter integer BUS_EVT_FIFO_DEPTH = `ZLC_BUS_EVT_FIFO_DEPTH, // per-BUS segment FIFO depth
     // Host<->bitstream compatibility fingerprint exposed on CTRL word 63 -- image.build_fingerprint of
     // THIS build's geometry (all StreamerParams geometry fields folded with LAYOUT_STRUCT_VERSION).  The
-    // build passes the config's value via image.vivado_generics; the default here is the shipped-config
-    // value, pinned to image.build_fingerprint(default_params()) by a single-source contract test.
-    parameter integer LAYOUT_FINGERPRINT = 32'h5A87FD36
+    // macro carries the config-derived value; the host connect-check verifies it (build_fingerprint is
+    // the single source, folded into the header by image.emit_geometry_vh).
+    parameter integer LAYOUT_FINGERPRINT = `ZLC_LAYOUT_FINGERPRINT
 )(
     input  wire clk,
     // UART fast-control side-channel (assign to FT2232 ch-B pins, or an external USB-UART on 2 spare
@@ -87,8 +92,11 @@ module zlc_pulse_streamer_top #(
 
     localparam integer COEFF_BITS = NUM_SLOTS * COEFF_WIDTH;     // 64
     localparam integer SLOT_BITS = NUM_SLOTS * TICK_WIDTH;       // 128
-    localparam integer COEFF_PORTB_BITS = 64;                    // 4x16 exact, 2x32
-    localparam integer MASK_PORTB_BITS = 64;                     // 62 padded to 64, 2x32
+    // Port-B widths DERIVED from the geometry (== image.build_ip_sizes): coeff/mask 32b-word-padded,
+    // scan is the full slot vector.  Never a bare literal, so a num_slots/channel_count change
+    // resizes the edge-BRAM ports (and the tcl IP widths, which come from the same build_ip_sizes).
+    localparam integer COEFF_PORTB_BITS = ((COEFF_BITS + 31) / 32) * 32;   // 64
+    localparam integer MASK_PORTB_BITS = ((CHANNEL_COUNT + 31) / 32) * 32; // 64 (62 padded)
     localparam integer SCAN_PORTB_BITS = SLOT_BITS;             // 128 = 4x32
     localparam integer COEFF_WORDS = COEFF_PORTB_BITS / 32;      // 2
     localparam integer MASK_WORDS = MASK_PORTB_BITS / 32;        // 2
@@ -113,7 +121,7 @@ module zlc_pulse_streamer_top #(
     // the event-scheduler delay in ticks.  128 words of headroom regardless of channel count
     // so the layout is stable across configs.
     localparam integer R_DELAY_BASE  = R_BUS_BASE   + BUS_ROWS * BUS_WORDS;
-    localparam integer R_DELAY_WORDS = 128;   // >= CHANNEL_COUNT + BUS_COUNT, headroom; 7-bit index
+    localparam integer R_DELAY_WORDS = `ZLC_DELAY_REG_WORDS;   // = image.delay_region_words (>= CHANNEL_COUNT + BUS_COUNT)
     localparam integer R_TOTAL_WORDS = R_DELAY_BASE + R_DELAY_WORDS;
 
     // CTRL regfile word offsets (== host.image.CtrlWords).
@@ -298,8 +306,9 @@ module zlc_pulse_streamer_top #(
     end
 
     // --- read mux back to AXI -------------------------------------------------
-    // CTRL word 63 reads back the GEOMETRY FINGERPRINT (LAYOUT_FINGERPRINT generic = this build's
-    // image.build_fingerprint; writes land in ctrl_reg[63] but are never read back).  The host
+    // CTRL word 63 reads back the GEOMETRY FINGERPRINT (LAYOUT_FINGERPRINT = ZLC_LAYOUT_FINGERPRINT
+    // from the generated zlc_geometry.vh = this build's image.build_fingerprint; writes land in
+    // ctrl_reg[63] but are never read back).  The host
     // (build_fingerprint of ITS OWN config) verifies it BEFORE writing anything layout-dependent, so a
     // host packing for one geometry can NEVER silently mis-drive a bitstream built for another --
     // whether the register STRUCTURE moved (e.g. CLK_ENABLE 46->20 put the clk mask in dead words) or
