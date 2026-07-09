@@ -3043,30 +3043,59 @@ class PulseSequenceFigure(BaseLivePlot):
 DEFAULT_HIST_FIT = "double"
 
 
-def fit_histogram_curves(vals, edges, counts, mode: str):
-    """The ONE histogram-fit rule: fit ``mode`` ("none" / "single" / "double") to a binned sample set
+def histogram_binned(vals, bins):
+    """``np.histogram`` with an exact fast path for small-domain integer samples (a uint8/uint16
+    camera frame): per-value ``bincount`` (O(N), ~5x faster than histogram's sort-based path on
+    2.3 MP) then the SAME ``np.histogram`` aggregates the <=4096 distinct values into the requested
+    bins with weights -- so bin edges and assignment rules are np.histogram's own, never a re-typed
+    binning rule.  Everything else falls through to plain ``np.histogram``."""
+    v = np.asarray(vals)
+    if isinstance(bins, (int, np.integer)) and v.dtype.kind in "iu" and v.itemsize <= 2 and v.size:
+        lo, hi = int(v.min()), int(v.max())
+        if hi == lo:
+            return np.histogram(np.asarray([lo], dtype=float), bins=int(bins),
+                                weights=np.asarray([float(v.size)]))
+        if hi - lo < 4096:
+            per_value = np.bincount((v - lo).reshape(-1), minlength=hi - lo + 1)
+            values = np.arange(lo, hi + 1, dtype=float)
+            return np.histogram(values, bins=int(bins), weights=per_value.astype(float))
+    return np.histogram(v, bins=bins)
+
+
+def fit_histogram_curves(edges, counts, mode: str):
+    """The ONE histogram-fit rule: fit ``mode`` ("none" / "single" / "double") to a BINNED sample set
     and return the CURVE DATA + threshold -- consumed by :class:`HistogramFigure` (the standalone dis)
     AND by the grid's :class:`HistogramCell` thumbnails, so the two can never fit differently.
+
+    Operates ENTIRELY on (edges, counts): the Otsu seed split, the per-side mean/std seeds and the
+    fit itself are all O(bins) -- never O(samples).  (The old form sorted the raw samples for Otsu:
+    ~80 ms per tick on a 2.3 MP camera frame, on the GUI thread, for a split the classic Otsu
+    computes from the histogram anyway.)
 
     Returns ``None`` when there is nothing to draw (mode "none", too few samples, or a genuinely
     failed fit), else ``{"x", "left", "right", "total", "threshold", "separated", "bimodal_popt",
     "single_popt"}`` (``left``/``right`` are None for a single-Gaussian outcome; ``threshold`` is set
     only when the two fitted peaks separate by >= 1.5 summed widths -- the honest-threshold gate)."""
-    vals = np.asarray(vals, dtype=float).reshape(-1)
-    vals = vals[np.isfinite(vals)]
-    mode = str(mode)
-    if mode == "none" or vals.size < 6 or np.ptp(vals) == 0:
-        return None
     edges = np.asarray(edges, dtype=float)
-    centers = (edges[:-1] + edges[1:]) / 2
     counts = np.asarray(counts, dtype=float)
-    span = float(np.ptp(vals)) or 1.0
+    centers = (edges[:-1] + edges[1:]) / 2
+    n_samples = float(counts.sum())
+    span = float(edges[-1] - edges[0]) or 1.0
+    mode = str(mode)
+    if mode == "none" or n_samples < 6 or float(edges[-1] - edges[0]) == 0:
+        return None
     x_fit = np.linspace(edges[0], edges[-1], 400)
+
+    def _weighted_stats(c, w):
+        tot = float(w.sum())
+        mu = float((w * c).sum() / tot)
+        sd = float(np.sqrt(max((w * (c - mu) ** 2).sum() / tot, 0.0)))
+        return mu, sd
 
     def _single():
         try:
-            p0 = [max(float(np.max(counts)), 1.0), float(np.mean(vals)),
-                  max(float(np.std(vals)), span / 40, 1e-9)]
+            mu, sd = _weighted_stats(centers, counts)
+            p0 = [max(float(np.max(counts)), 1.0), mu, max(sd, span / 40, 1e-9)]
             popt, _ = curve_fit(gaussian, centers, counts, p0=p0, maxfev=20000)
         except Exception:
             return None
@@ -3076,21 +3105,30 @@ def fit_histogram_curves(vals, edges, counts, mode: str):
 
     if mode != "double":
         return _single()                     # "single": one Gaussian, no dark/bright split
-    # Otsu split on the sorted samples (between-class variance), NOT the median -- seeds each side.
-    xs = np.sort(vals)
-    csum = np.cumsum(xs)
-    k = np.arange(1, xs.size, dtype=float)
-    score = k * (xs.size - k) * ((csum[-1] - csum[:-1]) / (xs.size - k) - csum[:-1] / k) ** 2
-    si = int(np.argmax(score))
-    split = float(0.5 * (xs[si] + xs[si + 1]))
-    left, right = vals[vals <= split], vals[vals > split]
-    if left.size < 2 or right.size < 2:
-        left, right = vals[: vals.size // 2], vals[vals.size // 2:]
-    mu0, mu1 = float(np.mean(left)), float(np.mean(right))
+    # Otsu split (between-class variance) in its classic BINNED form -- seeds each side.
+    w0 = np.cumsum(counts)[:-1]                          # class-0 weight up to each bin boundary
+    m0 = np.cumsum(counts * centers)[:-1]                # class-0 first moment
+    w1 = n_samples - w0
+    m_total = float((counts * centers).sum())
+    with np.errstate(divide="ignore", invalid="ignore"):
+        score = np.where((w0 > 0) & (w1 > 0),
+                         w0 * w1 * (m0 / w0 - (m_total - m0) / w1) ** 2, 0.0)
+    si = int(np.argmax(score))                           # split boundary AFTER bin si
+    left_c, left_w = centers[: si + 1], counts[: si + 1]
+    right_c, right_w = centers[si + 1:], counts[si + 1:]
+    if float(left_w.sum()) < 2 or float(right_w.sum()) < 2:
+        half = np.searchsorted(np.cumsum(counts), n_samples / 2)   # fallback: split at the median bin
+        left_c, left_w = centers[: half + 1], counts[: half + 1]
+        right_c, right_w = centers[half + 1:], counts[half + 1:]
+        if float(left_w.sum()) <= 0 or float(right_w.sum()) <= 0:
+            return _single()
+    mu0, s0 = _weighted_stats(left_c, left_w)
+    mu1, s1 = _weighted_stats(right_c, right_w)
     if mu0 > mu1:
         mu0, mu1 = mu1, mu0
-    s0 = max(float(np.std(left)), span / 40, 1e-9)
-    s1 = max(float(np.std(right)), span / 40, 1e-9)
+        s0, s1 = s1, s0
+    s0 = max(s0, span / 40, 1e-9)
+    s1 = max(s1, span / 40, 1e-9)
 
     def _amp_near(mu):
         return max(float(counts[int(np.clip(np.searchsorted(centers, mu), 0, len(counts) - 1))]), 1.0)
@@ -3100,9 +3138,9 @@ def fit_histogram_curves(vals, edges, counts, mode: str):
     # failure falls back to the single Gaussian (the "toggle does nothing" bug).
     p0 = [_amp_near(mu0), mu0, s0, _amp_near(mu1), mu1, s1]
     bounds = (
-        [0, float(np.min(vals)), span / 200, 0, float(np.min(vals)), span / 200],
-        [max(_amp_near(mu0) * 5, 1), float(np.max(vals)), span * 2,
-         max(_amp_near(mu1) * 5, 1), float(np.max(vals)), span * 2],
+        [0, float(edges[0]), span / 200, 0, float(edges[0]), span / 200],
+        [max(_amp_near(mu0) * 5, 1), float(edges[-1]), span * 2,
+         max(_amp_near(mu1) * 5, 1), float(edges[-1]), span * 2],
     )
     try:
         popt, _ = curve_fit(bimodal_model, centers, counts, p0=p0, bounds=bounds,
@@ -3183,14 +3221,24 @@ class HistogramFigure(BaseLivePlot):
         kwargs.setdefault("relim_mode", "tight")
         super().__init__(np.arange(len(self.values)), self.values, labels=labels, **kwargs)
 
+    @staticmethod
+    def _finite(vals):
+        """The finite sample set: integer samples (a native camera stream) have no NaN/inf by
+        construction, so the 2.3 MP isfinite mask + fancy-index copy is skipped entirely."""
+        v = np.asarray(vals)
+        return v if v.dtype.kind in "iub" else v[np.isfinite(v)]
+
     def _split_columns(self, values):
         """Parse the bound value into (first-repeat samples, extra per-repeat columns).  A 2-D
         ``(n_samples, R>1)`` block ('create' mode) keeps each column as its own repeat -- column 0 is the
-        primary histogram, columns 1.. become outline overlays.  Anything else is one flat sample set."""
-        arr = np.asarray(values, dtype=float)
+        primary histogram, columns 1.. become outline overlays.  Anything else is one flat sample set.
+        NATIVE dtype throughout: a uint8 camera stream is binned as uint8 (bincount fast path)."""
+        arr = np.asarray(values)
+        if arr.dtype.kind not in "iubf":
+            arr = np.asarray(values, dtype=float)
         if arr.ndim == 2 and arr.shape[1] > 1:
-            self._extra_cols = [arr[:, j][np.isfinite(arr[:, j])] for j in range(1, arr.shape[1])]
-            return np.asarray(arr[:, 0], dtype=float).reshape(-1)
+            self._extra_cols = [self._finite(arr[:, j]) for j in range(1, arr.shape[1])]
+            return arr[:, 0].reshape(-1)
         self._extra_cols = []
         return arr.reshape(-1)
 
@@ -3223,10 +3271,10 @@ class HistogramFigure(BaseLivePlot):
     def init_core(self) -> None:
         self.ax.set_xlabel(self.xlabel)
         self.ax.set_ylabel(self.ylabel)
-        vals = self.values[np.isfinite(self.values)]
+        vals = self._finite(self.values)
         if vals.size == 0:
             vals = np.array([0.0])
-        self.n, self.bins = np.histogram(vals, bins=self.bins_arg)
+        self.n, self.bins = histogram_binned(vals, self.bins_arg)
         self.verts = np.empty((len(self.n), 4, 2), dtype=float)
         _update_verts(self.bins, self.n, self.verts, mode="vertical")
         # The PRIMARY (repeat=1) histogram is drawn with the SAME owned bar opacity as the 'create'
@@ -3271,16 +3319,20 @@ class HistogramFigure(BaseLivePlot):
             values = data_y
         if values is not None:
             self.values = self._split_columns(values)
-            self.data_x = _as_data_x(np.arange(len(self.values)))
+            # data_x is just the sample index (a BaseLivePlot contract field a histogram never
+            # plots): rebuild it only when the sample count changed -- a steady 2.3 MP camera
+            # stream otherwise re-allocated a 17.6 MiB float64 arange EVERY tick.
+            if len(self.data_x) != len(self.values):
+                self.data_x = _as_data_x(np.arange(len(self.values)))
             self.data_y = _as_data_y(self.values, len(self.values))
             self.points_total = len(self.values)
         return super().update(self.data_y, points_done=points_done or len(self.values), repeat_cur=repeat_cur, draw=draw)
 
     def update_core(self) -> None:
-        vals = self.values[np.isfinite(self.values)]
+        vals = self._finite(self.values)
         if vals.size == 0:
             vals = np.array([0.0])
-        self.n, self.bins = np.histogram(vals, bins=self.bins_arg)
+        self.n, self.bins = histogram_binned(vals, self.bins_arg)
         if len(self.verts) != len(self.n):
             self.verts = np.empty((len(self.n), 4, 2), dtype=float)
         _update_verts(self.bins, self.n, self.verts, mode="vertical")
@@ -3420,7 +3472,7 @@ class HistogramFigure(BaseLivePlot):
         self._has_threshold = self._explicit_thr        # no fit yet -> only an explicit cut shows
         for ln in (self.fit_line_left, self.fit_line_right, self.fit_line_total):
             ln.set_data([], [])
-        res = fit_histogram_curves(self.values, self.bins, self.n.astype(float), self._fit)
+        res = fit_histogram_curves(self.bins, self.n, self._fit)
         if res is None:
             return
         if res["left"] is not None:
@@ -3481,16 +3533,28 @@ class HistogramFigure(BaseLivePlot):
         overlap = float(np.sum(np.minimum(n.astype(float), np.clip(fitted, 0.0, None))))
         return float(max(0.0, 1.0 - overlap / float(np.sum(n))))
 
+    def _left_fraction(self, threshold: float) -> float:
+        """Fraction of samples <= threshold, from the ALREADY-BINNED counts (linear interpolation
+        inside the cut bin) -- O(bins), never a 2.3 MP comparison per tick.  Sub-bin error is below
+        one bin's mass, far under the 0.1 % display precision at the default 50 bins."""
+        n, edges = getattr(self, "n", None), getattr(self, "bins", None)
+        total = float(np.sum(n)) if n is not None else 0.0
+        if n is None or edges is None or total <= 0:
+            return 0.0
+        i = int(np.clip(np.searchsorted(edges, threshold, side="right") - 1, -1, len(n)))
+        if i < 0:
+            return 0.0
+        if i >= len(n):
+            return 1.0
+        frac_in_bin = (threshold - edges[i]) / max(float(edges[i + 1] - edges[i]), 1e-300)
+        return float((np.sum(n[:i]) + n[i] * np.clip(frac_in_bin, 0.0, 1.0)) / total)
+
     def _update_hist_stats(self) -> None:
         # WITH a meaningful cut (separated fit or an explicit calibration cut): the threshold readout.
         if self._has_threshold and self.thresholds:
             threshold = float(self.thresholds[0])
-            vals = self.values[np.isfinite(self.values)]
-            if vals.size:
-                left = float(np.mean(vals <= threshold))
-                right = 1.0 - left
-            else:
-                left = right = 0.0
+            left = self._left_fraction(threshold)
+            right = 1.0 - left
             fidelity = self._fit_fidelity(threshold)
             fidelity_text = "fit F=N/A" if fidelity is None else f"fit F={100 * fidelity:.1f}%"
             fit_threshold = "" if self.fit_threshold is None else f"\nfit cut={self.fit_threshold:.4g}"
@@ -4309,7 +4373,7 @@ class HistogramCell(GridCell):
             self._fit_lines[k] = lines
         for ln in lines:
             ln.set_data([], [])
-        res = fit_histogram_curves(self.values[k], self.edges, counts, self.fit)
+        res = fit_histogram_curves(self.edges, counts, self.fit)
         if res is None:
             self._cell_popt_store.pop(int(k), None)         # no fit on this cell -> drop stale popt
             return
