@@ -826,6 +826,19 @@ class Processor(LogicNode):
         super().__init__(hub, prefix=prefix)
         self.consumes = tuple(str(c) for c in consumes)
         self._seen_version: dict[str, int] = {}
+        # SELF-LOOP guard, at the base and at construction (the single source, covering the
+        # console AND a bare notebook node).  A processor consuming its OWN published signal is
+        # never meaningful: with no lingering value it silently starves forever (its input only
+        # advances if it publishes), and with one it becomes a full-CPU self-sustained republish
+        # loop whose inherited source-shot id never advances (the shot clock freezes).  Both are
+        # far worse to diagnose than this loud reject.  Indirect rings (A->B->A) span nodes this
+        # instance cannot see; the console's start-time graph walk catches those.
+        own = frozenset(self.published_signals()) & frozenset(self.consumes)
+        if own:
+            raise ValueError(
+                f"{type(self).__name__} would consume its own output signal(s) "
+                f"{sorted(own)} -- a self-feedback loop (silent starvation or a runaway "
+                "republish spiral).  Pick an upstream signal as the source instead.")
 
     def new_inputs(self) -> dict[str, object] | None:
         """Latest values of the consumed signals IF any advanced since last seen,

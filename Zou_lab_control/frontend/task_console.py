@@ -6017,8 +6017,18 @@ class LogicNodeEditor(QtWidgets.QWidget):
         # defaults to a single finite sweep (repeat=1).
         acquisition = (_acquisition_param_decls(repeat_default=(0 if row.node.kind == "camera" else 1))
                        if row.node.kind in ("measurement", "camera") else ())
+        names_provider = getattr(console, "_signal_names", None)
+        if row.node.kind == "processor" and callable(names_provider):
+            # A reactive processor's source picker must not offer the node's OWN outputs -- picking
+            # one is the self-feedback loop Processor.__init__ rejects loud at Start; hide it here
+            # so the misclick cannot happen (declared keys, #prebind, so it holds before the first
+            # run too).  PROCESSOR rows only: a pulse-scan's y reading its own relayed frame is a
+            # documented PULL pattern and keeps its pick (see _reactive_ring).
+            def names_provider(_base=names_provider, _console=console, _row=row):
+                own = {str(k) for k in _console._declared_signal_keys(_row)}
+                return [n for n in _base() if str(n) not in own]
         self.form = MeasurementPanel([spec] if spec is not None else [], single=True,
-                                     signals_provider=getattr(console, "_signal_names", None),
+                                     signals_provider=names_provider,
                                      sources_provider=getattr(console, "_signal_providers", None),
                                      formats_provider=getattr(console, "_signal_formats", None),
                                      short_names_provider=getattr(console, "_signal_short_names", None),
@@ -6952,6 +6962,53 @@ class TaskConsole(QtWidgets.QWidget):
         pfx = self._declared_node_prefix(row)              # prepend the node prefix -> == published_signals()
         return [f"{pfx}{k}" for k in self._node_bare_keys(row.node)]
 
+    def _reactive_ring(self, start_row: "LogicNodeRow", start_node) -> list[str] | None:
+        """The signal-name path of an INDIRECT reactive ring that starting ``start_node`` would
+        close (A consumes B's output while B consumes A's), or None.  Walked over REACTIVE edges
+        only -- ``Processor.consumes`` (the versions that WAKE a node) -- because only an all-
+        reactive ring is self-sustaining: a pulse-scan's y reading its own relayed ``frame_0`` is
+        a documented PULL (one bounded await per point), so measurement rows contribute outputs
+        but never an out-edge here and that pattern stays legal.  Declared keys (#prebind) stand
+        in for stopped producers, so a ring is caught no matter the start order.  The DIRECT
+        self-loop is rejected at the base (Processor.__init__) -- one guard per scope."""
+        from ..neutral_atom.operations.logic import Processor
+        if not isinstance(start_node, Processor) or not getattr(start_node, "consumes", ()):
+            return None
+
+        def reactive_inputs(row) -> tuple[str, ...]:
+            if row.node.kind != "processor":
+                return ()
+            running = self._logic_nodes.get(id(row))
+            if isinstance(running, Processor):
+                return tuple(str(n) for n in running.consumes)
+            # stopped row: read the picked slots straight from the stored signal_expr values
+            names = []
+            for value in dict(getattr(row.node, "values", {}) or {}).values():
+                if isinstance(value, dict) and "inputs" in value:
+                    names.extend(str(n) for n in (value.get("inputs") or ()) if n)
+            return tuple(names)
+
+        producer = {}
+        for row in self.logic_nodes:
+            if row is start_row:
+                continue
+            for key in self._declared_signal_keys(row):
+                producer.setdefault(str(key), row)
+        targets = {str(s) for s in start_node.published_signals()}
+        seen = set()
+        stack = [(str(n), (str(n),)) for n in start_node.consumes]
+        while stack:
+            name, path = stack.pop()
+            row = producer.get(name)
+            if row is None or id(row) in seen:
+                continue
+            seen.add(id(row))
+            for nxt in reactive_inputs(row):
+                if nxt in targets:
+                    return [*path, nxt]          # the ring closes on this node's own output
+                stack.append((nxt, (*path, nxt)))
+        return None
+
     def _node_for_signal(self, name: str):
         """The producing node for signal ``name``: a RUNNING node first, else the last build of a
         Logic-tab node (``_last_node``, kept past Stop) so a stopped node's lingering signal still
@@ -7485,6 +7542,20 @@ class TaskConsole(QtWidgets.QWidget):
             row.set_state("error", status=f"build failed: {str(exc).splitlines()[0][:80]}")
             if editor is not None:
                 editor.set_status(f"build failed: {str(exc).splitlines()[0][:140]}", error=True)
+            return
+        # VALIDATE: an INDIRECT reactive ring (A consumes B's output while B consumes A's) never
+        # computes anything real -- fresh it starves both nodes silently, primed it becomes a
+        # cross-thread full-speed republish ping-pong.  The DIRECT self-loop is rejected at the
+        # base (Processor.__init__, single source); the ring spans nodes only the board can see,
+        # so the graph walk lives here, before commit.
+        ring = self._reactive_ring(row, node)
+        if ring:
+            path = " -> ".join(ring)
+            row.set_state("error", status=f"signal loop: {path}"[:90])
+            if editor is not None:
+                editor.set_status(
+                    f"signal loop rejected: {path} -- a reactive ring never advances "
+                    "(each node waits on the other).  Re-pick an upstream source.", error=True)
             return
         row.node.values = dict(values)            # remember for the next Edit reopen + save
         # Label the built node with its ROW TITLE so its provider label MATCHES the declared row's
