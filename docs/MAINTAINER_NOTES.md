@@ -665,14 +665,34 @@ frames.  `bus_evt_fifo_depth` is reconfigurable from streamer_config.json; the p
 TABLE depth is `1 << bus_seg_addr_width` (`max_bus_segments`) which -- unlike `evt_fifo_depth` --
 is NOT a passed generic, so the `.v` default must equal the config (a contract test pins it).
 
-**Reconfigurable depth (single source).**  `evt_fifo_depth` lives only in
-`streamer_config.json`.  The host (validator/estimate) reads it; the BUILD reads it too --
-`image.emit_geom_tcl` turns the config into `$zlc_top_generics` (EVT_FIFO_DEPTH,
-EDGE_ADDR_WIDTH, BANK_SIZE), `build_and_program.bat --emit-geom-tcl` generates `geom.tcl`,
-and `create_project.tcl` sources it + `set_property generic ... [current_fileset]` so editing
-the JSON changes the SYNTHESIZED bitstream (exactly how the default became 128 when the
-256 build was LUT-tight, then 64 when the g_busseg segment-delay build was LUT-tight).  A
-contract test asserts every generic names a real top parameter (else Vivado ignores it).
+**streamer_config.json is the ONE geometry source (2026-07-09 refactor).**  Editing the JSON
+propagates to the host, the bitstream, and the build with NO hand-edit, and geometry that would
+overflow a fixed word/BRAM is rejected mechanically.  `fpga/pulse_streamer/host/image.py` is the ONE
+computational authority (`StreamerParams` + `region_bases` + `build_ip_sizes` + `build_fingerprint`);
+it PROJECTS the config into two derived artifacts, one per target:
+- **`zlc_geometry.vh`** (`image.emit_geometry_vh`): every RTL geometry parameter default (incl. the
+  `LAYOUT_FINGERPRINT`) as a `` `define ``.  `zlc_pulse_streamer_top.v`, `zlc_edge_streamer.v`, and the
+  testbench `` `include `` it and default every geometry parameter to a macro (`= \`ZLC_...`) -- so no
+  `.v` carries a hand-typed geometry literal or a hand-computed fingerprint.  There are **no `-generic`
+  overrides any more** (the header replaced them).  Derived widths (`SCAN_ADDR_WIDTH`/`BUS_INDEX_WIDTH`
+  come from `image` via the header; `COEFF_PORTB_BITS`/`MASK_PORTB_BITS` are `$clog2`-style localparams).
+  The committed header is pinned to `emit_geometry_vh(default_params())` by
+  `test_all_geometry_params_config_matches_rtl_defaults`; `build_and_program.bat` regenerates it in
+  place from the active config (and hashes it) before synth.
+- **`geom.tcl`** (`image.emit_geom_tcl`, via `build_ip_sizes`): the BRAM-IP sizes `create_project.tcl`
+  sources -- busimg `Write_Depth_A`, axi_bram `MEM_DEPTH`, and the port-B widths are now DERIVED
+  (power-of-two that covers the used words), never the old literals `2048`/`65536`/`64`/`128`, so a
+  `bus_seg_addr_width`/`max_edges` bump can't silently overflow a fixed BRAM.
+
+`check_rtl_assumptions(params)` is the ONE overflow gate (called at load / pack / both emitters):
+`num_slots*coeff_width==64`, bus-flags word `<=32`, **`bus_count*(bus_seg_addr_width+1)<=32`** (the
+single 32-bit `BUS_COUNTS` word -- a fingerprint-invisible overflow), `bank_size`/`max_edges` pow2,
+**pow2 `evt_fifo_depth`/`bus_evt_fifo_depth`** (event-FIFO ring pointers), 32-bit `ttl_delay_max_ticks`,
+`channel_count+bus_count<=delay_region_words`.  `coeff_frac_bits`/`slot_mul_width` reach the timing/
+sequencer compilers + `engine_model` via the dependency-free `Zou_lab_control._streamer_geometry` seam
+(mirrors `_clock`), so a config edit changes the emitted coefficients, not just the fingerprint.
+All values equal the shipped literals, so the refactor is byte-identical for the default config (same
+`0x5A87FD36` fingerprint -- an already-running bitstream still connects; no rebuild needed).
 
 Proven: `delay_line_reference` (out[t]=in[t-d]) is the unchanged ground truth;
 `engine_model.rtl_delay_line_mirror` mirrors the scheduler cycle-exactly; the REAL RTL is
