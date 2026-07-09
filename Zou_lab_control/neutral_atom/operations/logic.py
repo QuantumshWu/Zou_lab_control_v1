@@ -59,6 +59,7 @@ _IDLE_POLL_S = 0.05     # FALLBACK only: a pass that published NOTHING waits on 
                         # wakes on its input, not on this timeout.
 _ERROR_BACKOFF_S = 0.2  # after a shot raises, wait this before retrying, so a wedged source does not spin
                         # the error banner.
+IMAGE_STREAM_HISTORY = 8   # short shot-coherence buffer for full-frame image streams (producer-declared)
 
 
 @dataclass(frozen=True)
@@ -81,7 +82,13 @@ class SignalSpec:
     raw shape and falls back to the node-level points/data triple.  A signal that DOES carry
     the repeat axis declares ``points_shape``/``data_shape`` so ``core_ndim =
     len(points_shape) + len(data_shape)`` tells the plot exactly which leading axis is the
-    repeat to collapse -- structure-driven, never an ndim guess."""
+    repeat to collapse -- structure-driven, never an ndim guess.
+
+    ``history`` declares the hub storage depth for THIS signal.  ``None`` means
+    "use the hub default" (deep histories for small scalar/count streams);
+    high-throughput image streams use a compact buffer because their own repeat
+    block already carries averaging/history semantics and the hub only needs a
+    short shot-coherence backlog."""
 
     name: str               # full published signal name (incl. the node's prefix)
     label: str              # axis / legend label, e.g. "loading rate"
@@ -89,6 +96,7 @@ class SignalSpec:
     description: str = ""    # one-line human meaning for the publishes legend
     points_shape: tuple | None = None   # this signal's swept-parameter (data_points) axes (None = no contract slot)
     data_shape: tuple | None = None     # this signal's per-point data axes (None = no contract slot)
+    history: int | None = None          # per-signal hub ring depth override (None = hub default)
 
     def __post_init__(self):
         # IRON-LAW guard: a signal that follows the repeat contract is ALWAYS (repeat, data_points, *data_dim)
@@ -103,6 +111,8 @@ class SignalSpec:
                 f"NON-EMPTY tuple -- got points_shape={self.points_shape!r}, data_shape={self.data_shape!r}.  "
                 "A no-scan, single-point signal is (repeat, 1, *data) with points_shape=(1,); the empty () "
                 "drops the mandatory data_points axis (#iron-law).")
+        if self.history is not None and int(self.history) < 1:
+            raise ValueError(f"SignalSpec({self.name!r}): history must be >= 1 or None, got {self.history!r}.")
 
     @property
     def axis_label(self) -> str:
@@ -301,6 +311,7 @@ class LogicNode:
         if not values:
             return {}
         named = {self.prefix + key: value for key, value in values.items()}
+        self._configure_signal_storage(named.keys())
         # Tag every signal of this shot with the SOURCE-shot id shot() set (mint for an acquiring node,
         # inherited for a reactive processor; None -> NO_LINEAGE for a free-running publish), so a derived
         # signal and the frame it came from share ONE id and the console can show them as one shot.  Clear
@@ -314,6 +325,24 @@ class LogicNode:
         # notebook ``step()`` loop with no ``start()`` still gets provenance via the lazy fallback in
         # ``provenance_snapshot()`` (captured on first read, then cached), so this hot path stays clean.
         return named
+
+    def _configure_signal_storage(self, names) -> None:
+        """Apply per-signal hub storage declared by this node's SignalSpec.
+
+        The producer owns the data contract (including whether a signal is a
+        deep scalar history or a compact image stream).  The hub stays generic:
+        it merely enforces the requested ring depth for the names about to be
+        published.
+        """
+
+        try:
+            specs = {str(spec.name): spec for spec in self.output_specs()}
+        except Exception:
+            return
+        for name in names:
+            spec = specs.get(str(name))
+            if spec is not None:
+                self.hub.configure_signal(str(name), history=spec.history)
 
     def start(self) -> "LogicNode":
         """Publish shots from a daemon thread AS FAST AS THE HARDWARE ALLOWS until ``stop()``.
@@ -940,7 +969,7 @@ class OccupancyProcessor(Processor):
         # np/numpy/math/history/... on the snapshot), so a processor source expression has the
         # SAME capabilities SIGNAL_EXPR_HELP promises every source field (panel == node).
         try:
-            value = np.asarray(self.source_expr.evaluate(hub_namespace(self.hub, inputs)), dtype=float)
+            value = np.asarray(self.source_expr.evaluate(hub_namespace(self.hub, inputs)))
         except Exception:
             return {}                                       # malformed expression -> no-op (don't wedge)
         # Normalize whatever the source expression yields to a (repeat, 1, H, W) BLOCK -- the camera's
@@ -1043,7 +1072,8 @@ class OccupancyProcessor(Processor):
                        "the EXACT frame this occupancy was judged from -- shot-locked to occupied/centers "
                        "(one atomic publish).  Use THIS for a 2D readout image that matches the site map "
                        "(same shot); the camera's live `frame` advances independently and is NOT shot-locked.",
-                       points_shape=((1,) if frame else None), data_shape=frame),
+                       points_shape=((1,) if frame else None), data_shape=frame,
+                       history=IMAGE_STREAM_HISTORY),
         )
 
 
@@ -1718,8 +1748,9 @@ class CameraMeasurement(Measurement):
         # (repeat_mode: average = the long-exposure mean of THAT specific emCCD event) -- the only way
         # a 3-event cycle can show the repeat_mode effect for a chosen event.  ONE knob ``repeat``,
         # 0 = ∞ (no free-run toggle): repeat=K keeps each event's K-deep block then STOPS; repeat=0
-        # rolls a 1-deep ring forever (live monitor).  The camera never averages at the measurement
-        # (that was the live stutter) -- it FILLS and publishes the WHOLE per-event block every cycle.
+        # publishes the latest native frame as a 1-deep block forever (live monitor).  The camera never
+        # averages at the measurement (that was the live stutter) -- finite mode FILLS and publishes the
+        # WHOLE per-event block, live mode publishes the latest per-event block.
         super().__init__(hub, prefix=prefix)
         self.camera = camera
         self.sequencer = sequencer
@@ -1738,11 +1769,12 @@ class CameraMeasurement(Measurement):
         self.set_repeat(repeat)
 
     def set_repeat(self, repeat: int = 0) -> None:
-        """How many photos to KEEP & AVERAGE then STOP, or ``0`` = ∞ (roll forever, a live monitor
-        showing the latest frame).  ONE knob, 0 = infinite -- there is NO separate free-run toggle:
-        repeat=K fills a K-deep block once and stops; repeat=0 rolls a 1-deep ring forever.  Resets
+        """How many photos to KEEP & AVERAGE then STOP, or ``0`` = ∞ (latest-frame live monitor).
+
+        ONE knob, 0 = infinite -- there is NO separate free-run toggle: repeat=K fills a K-deep
+        block once and stops; repeat=0 publishes a native-dtype 1-deep latest block forever.  Resets
         the (partly filled) block."""
-        self._set_repeat_ring(repeat)                    # block depth: K for finite, 1 for the rolling live view
+        self._set_repeat_ring(repeat)                    # block depth: K for finite, 1 for the live view
         self._rings = None
         self._filled = 0
 
@@ -1775,8 +1807,17 @@ class CameraMeasurement(Measurement):
         # cycle carries it, and the OccupancyProcessor consuming a chosen ``frame_i`` inherits it, so the
         # judged image / occupancy group with the exact frame they came from (#shot-clock).
         self._current_source_shot = self.hub.next_source_shot()
-        frames = [np.asarray(f, dtype=float) for f in frames]
+        frames = [np.asarray(f) for f in frames]
         n = len(frames)
+        f0 = frames[0]
+        if self.repeat <= 0:
+            self.data_shape = tuple(f0.shape)            # (H, W) -- the per-point DATA shape
+            keys = camera_frame_keys(n)
+            out = {keys[i]: np.asarray(fi)[None, None] for i, fi in enumerate(frames)}
+            self._filled += 1
+            return self._assert_primary_shape(out)       # frame_0 == (1, 1, H, W) -- contract guard
+
+        frames = [np.asarray(f, dtype=float) for f in frames]
         f0 = frames[0]
         if self._rings is None or len(self._rings) != n or self.data_shape != f0.shape:
             self.data_shape = tuple(f0.shape)            # (H, W) -- the per-point DATA shape
@@ -1786,11 +1827,8 @@ class CameraMeasurement(Measurement):
         out: dict[str, object] = {}
         keys = camera_frame_keys(n)                      # the single source of the per-event names
         for i, fi in enumerate(frames):                  # fill EACH event's own ring, publish its block
-            if self.repeat <= 0:                         # ∞: roll the newest in at the end (live monitor)
-                self._rings[i] = np.roll(self._rings[i], -1, axis=0)
-                self._rings[i][-1, 0] = fi
-            else:                                        # finite: FILL the next slot of the K-deep block
-                self._rings[i][min(self._filled, self._ring - 1), 0] = fi
+            # finite: FILL the next slot of the K-deep block
+            self._rings[i][min(self._filled, self._ring - 1), 0] = fi
             # ``frame_i`` IS event i's (repeat, 1, H, W) block (NaN = not-yet-taken) -- a panel reduces
             # its repeat axis (average = long exposure of THAT emCCD event).  No lumped ``frame``.
             out[keys[i]] = self._rings[i].copy()
@@ -1813,7 +1851,8 @@ class CameraMeasurement(Measurement):
             desc = (f"emCCD event {i} of the cycle: (repeat, 1, H, W) block -- plot reduces repeats "
                     f"(average = long exposure of event {i}).  LIVE camera, advances independently of the "
                     "readout: for a 2D image shot-locked to the site map, bind Judge-occupancy `frame_judged`.")
-            specs.append(SignalSpec(bare, "camera image", "counts", desc))
+            specs.append(SignalSpec(bare, "camera image", "counts", desc,
+                                    history=IMAGE_STREAM_HISTORY))
         return tuple(specs)
 
     def acquisition_parameters(self) -> dict[str, object]:
@@ -2258,6 +2297,12 @@ class PulseScanNode(_SweptBlockMeasurement):
         if self.scan_shape is not None:
             specs.append(SignalSpec(self.y_key + "_grid", self.y_key, "",
                                     "raw (repeat, n0, n1) block; plot reduces repeats then shows the map"))
+        for key in camera_frame_keys(1):
+            specs.append(SignalSpec(
+                key, "camera image", "counts",
+                "camera frame relayed by this pulse scan point for downstream processors; compact "
+                "history is enough because the scan y-block owns the long-lived result.",
+                history=IMAGE_STREAM_HISTORY))
         return tuple(specs)
 
     def shot(self) -> dict[str, object]:
@@ -2296,8 +2341,9 @@ class PulseScanNode(_SweptBlockMeasurement):
         # frame publish (with sid) must precede the consumer recompute (_await_y_inputs) so it inherits sid
         # before _read_y -- a reorder would break lineage coherence (#shot-clock).
         sid = self.hub.next_source_shot()
-        frame_pub = {key: np.asarray(f, dtype=float)
+        frame_pub = {key: np.asarray(f)
                      for key, f in zip(camera_frame_keys(len(frames)), frames)}
+        self._configure_signal_storage(frame_pub.keys())
         self.hub.publish(frame_pub, provenance=sid)
         self._current_source_shot = sid                  # the y-block (base step()) carries the same id
         # 2) make the y signals FRESH for this frame, then 3) read y from the source expression.

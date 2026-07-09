@@ -194,10 +194,13 @@ def test_iron_law_signalspec_rejects_a_dropped_data_points_axis():
     assert SignalSpec("centers", "c").core_ndim is None                       # None/None -> no repeat contract
     assert SignalSpec("occupied", "o", points_shape=(1,), data_shape=(35,)).core_ndim == 2   # no-scan = 1 point
     assert SignalSpec("y", "y", points_shape=(8,), data_shape=(3,)).core_ndim == 2           # a scan
+    assert SignalSpec("frame_0", "image", history=8).history == 8             # producer-declared hub storage
     # ILLEGAL: the empty () drops the mandatory data_points / data axis
     for bad in ({"points_shape": ()}, {"data_shape": ()}, {"points_shape": (), "data_shape": (5,)}):
         with pytest.raises(ValueError):
             SignalSpec("bad", "b", **bad)
+    with pytest.raises(ValueError):
+        SignalSpec("bad_history", "b", history=0)
 
 
 def test_iron_law_primary_block_must_carry_data_points():

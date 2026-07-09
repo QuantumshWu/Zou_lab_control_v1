@@ -36,6 +36,27 @@ def test_hub_history_len_and_shot_delta_detect_ring_drop():
     assert (hub.shot - 0) - hub.history_len == 12       # exactly what the console's _note_display_drops computes
 
 
+def test_hub_per_signal_history_policy_preserves_native_image_dtype():
+    """Image streams are not scalar histories: a producer can declare a compact ring, and the hub stores
+    the camera's native dtype instead of inflating each frame to float64."""
+    import numpy as np
+
+    hub = SignalHub(history=16)
+    hub.configure_signal("img", history=3)
+    for i in range(5):
+        hub.publish({"img": np.full((4, 5), i, dtype=np.uint16)})
+
+    assert hub.history_limit("img") == 3
+    assert hub.history_len == 3                         # conservative minimum active ring
+    hist = hub.history("img")
+    assert hist.shape == (3, 4, 5)
+    assert hist.dtype == np.uint16
+    assert int(hist[-1, 0, 0]) == 4
+
+    hub.remove_signals(["img"])
+    assert hub.history_limit("img") == 16               # lifecycle cleanup removes the compact policy too
+
+
 @pytest.fixture
 def offscreen(monkeypatch):
     pytest.importorskip("PyQt5")

@@ -55,6 +55,47 @@ def test_default_is_single_event_frame_0_only():
     assert set(cam_node.published_signals()) == {"frame_0"}      # one event -> just frame_0; no lumped frame
 
 
+def test_live_camera_measurement_keeps_native_dtype_and_compact_history():
+    """A pylon-like large native frame must not become a 2048-deep float64 history in the hub.
+
+    The user's observed allocation size (~18 MiB) is exactly a 1920x1200 float64 frame.  Live camera
+    frames are image streams: CameraMeasurement publishes a native-dtype 1-deep block and declares a
+    compact hub history for short shot-coherence backlog, while the repeat axis remains the place for
+    intentional averaging.
+    """
+
+    class _PylonLikeCamera:
+        exposure = 0.001
+        roi = None
+        sensor_shape = (1200, 1920)
+        frame_shape = (1200, 1920)
+
+        def __init__(self):
+            self.i = 0
+
+        def acquire(self, n, stop=None):
+            self.i += 1
+            return [np.full(self.frame_shape, self.i % 255, dtype=np.uint8) for _ in range(int(n))]
+
+        def configure(self, **_kw):
+            pass
+
+    hub = SignalHub()
+    cam_node = CameraMeasurement(hub, _PylonLikeCamera(), repeat=0)
+    for _ in range(12):
+        cam_node.step()
+
+    latest = np.asarray(hub.latest("frame_0"))
+    assert latest.shape == (1, 1, 1200, 1920)
+    assert latest.dtype == np.uint8
+    assert hub.history_limit("frame_0") == 8
+    hist = hub.history("frame_0")
+    assert hist.shape == (8, 1, 1, 1200, 1920)
+    assert hist.dtype == np.uint8
+    assert hist.nbytes == 8 * latest.nbytes
+    assert latest.nbytes < np.zeros((1, 1, 1200, 1920), dtype=np.float64).nbytes
+
+
 def test_long_short_long_imaging_bracket_shows_distinct_per_window_exposures():
     """A long-short-long imaging bracket (``imaging_template``) fired as a live On Pulse (repeat_forever)
     is ONE atom loading imaged through THREE distinct camera windows -- so the three emCCD frames must

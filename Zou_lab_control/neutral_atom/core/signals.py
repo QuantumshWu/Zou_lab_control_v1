@@ -52,6 +52,10 @@ class SignalHub:
         # published" -- e.g. a rolling monitor must append one point per sample
         # of its own source, not one per unrelated logic node tick.
         self._sig_version: dict[str, int] = {}
+        # Per-signal ring depth override.  Small scalar/curve signals use the
+        # global history, while high-throughput image streams declare a compact
+        # synchronization buffer through their producer's SignalSpec.
+        self._history_limits: dict[str, int] = {}
         # Wake a WAITING consumer the instant a value is published, instead of making it poll.  A reactive
         # processor (or a decoupled scan waiting on a downstream signal) reacts with ~zero latency rather
         # than a fixed poll interval, so its per-point latency tracks the producer's real cadence and never
@@ -59,12 +63,76 @@ class SignalHub:
         self._cond = threading.Condition(self._lock)
 
     # ------------------------------------------------------------- publish side
+    @staticmethod
+    def _stored_array(value) -> np.ndarray:
+        """Copy one published value while preserving array dtype.
+
+        The hub is a transport/cache, not the analysis layer: a camera frame that
+        arrives as uint8/uint16 must not be silently expanded to float64 here.
+        Scalars still normalize to float so the longstanding scalar API stays
+        stable.
+        """
+
+        arr = np.asarray(value)
+        if arr.ndim == 0:
+            return np.array(value, dtype=float, copy=True)
+        return np.array(value, copy=True)
+
+    @staticmethod
+    def _public_value(value: np.ndarray):
+        return float(value) if value.ndim == 0 else value.copy()
+
+    def configure_signal(self, name: str, *, history: int | None = None) -> None:
+        """Set storage policy for one signal.
+
+        ``history=None`` returns the signal to the hub default.  Producers call
+        this from their declarative output spec before publishing, so the hub
+        remains a generic store and does not hard-code signal names such as
+        ``frame_0``.
+        """
+
+        key = str(name)
+        limit = None if history is None else max(1, int(history))
+        with self._lock:
+            old = self._history_limits.get(key)
+            if limit is None:
+                self._history_limits.pop(key, None)
+                limit = self._history_len
+            else:
+                self._history_limits[key] = limit
+            if old == (None if history is None else limit) and key not in self._signals:
+                return
+            ring = self._signals.get(key)
+            if ring is not None and ring.maxlen != limit:
+                self._signals[key] = deque(list(ring)[-limit:], maxlen=limit)
+                src = self._src.get(key)
+                self._src[key] = deque(list(src)[-limit:] if src is not None else (), maxlen=limit)
+
+    def _history_limit_for_locked(self, key: str) -> int:
+        return int(self._history_limits.get(str(key), self._history_len))
+
+    def history_limit(self, name: str | None = None) -> int:
+        """Configured ring depth.
+
+        With ``name`` this returns that signal's limit.  With no name it returns
+        the conservative minimum active limit, useful for display-overrun
+        warnings when a board may include compact image streams.
+        """
+
+        with self._lock:
+            if name is not None:
+                return self._history_limit_for_locked(str(name))
+            if self._history_limits:
+                return min([self._history_len, *self._history_limits.values()])
+            return self._history_len
+
     def publish(self, values: Mapping[str, object], *, shot: int | None = None,
                 provenance: int | None = None) -> int:
         """Record one shot's worth of named values; returns the new version.
 
-        Every value is coerced to a float ndarray (scalars become 0-d) and COPIED,
-        so the logic node may freely reuse its buffers.
+        Every value is stored as a copied ndarray (scalars become 0-d floats),
+        preserving array dtype so image transports do not inflate uint8/uint16
+        camera frames into float64.  The logic node may freely reuse its buffers.
 
         ``provenance`` is the SOURCE-shot id every value in this call belongs to (an acquiring node mints
         one via :meth:`next_source_shot`; a reactive processor passes the id of the input it consumed).
@@ -76,12 +144,13 @@ class SignalHub:
             src_id = int(provenance) if provenance is not None else NO_LINEAGE
             for name, value in values.items():
                 key = str(name)
-                arr = np.array(value, dtype=float, copy=True)
+                arr = self._stored_array(value)
                 ring = self._signals.get(key)
                 if ring is None:
-                    ring = deque(maxlen=self._history_len)
+                    limit = self._history_limit_for_locked(key)
+                    ring = deque(maxlen=limit)
                     self._signals[key] = ring
-                    self._src[key] = deque(maxlen=self._history_len)
+                    self._src[key] = deque(maxlen=limit)
                 ring.append(arr)
                 self._src[key].append(src_id)       # lockstep with ring: value[-1] was acquired at src[-1]
                 self._sig_version[key] = self._sig_version.get(key, 0) + 1
@@ -114,6 +183,7 @@ class SignalHub:
             self._signals.clear()
             self._src.clear()
             self._sig_version.clear()
+            self._history_limits.clear()
             self._version += 1
             self._cond.notify_all()          # a clear is a version bump too -- release any waiter
             self._shot = 0
@@ -134,6 +204,7 @@ class SignalHub:
                     del self._signals[name]
                     self._src.pop(name, None)          # lockstep: a leftover would mis-tag a future same-named signal
                     self._sig_version.pop(name, None)
+                    self._history_limits.pop(name, None)
                     removed.append(name)
             if removed:
                 self._version += 1
@@ -180,11 +251,14 @@ class SignalHub:
 
     @property
     def history_len(self) -> int:
-        """Ring depth per signal: a consumer that reads less often than the producer publishes loses any
-        shot older than this (the bounded deque silently drops it).  A display can compare its own
-        last-read :attr:`shot` against the current one and, if they differ by more than this, know that
-        acquisition outran it by more than the ring can hold -- i.e. some shots were dropped for display."""
-        return self._history_len
+        """Conservative ring depth for display-overrun detection.
+
+        Signals may declare compact storage (e.g. camera images keep a short
+        synchronization buffer while scalar histories stay deep).  The property
+        returns the minimum active limit so a consumer warning never assumes more
+        buffered shots than the smallest displayed stream can hold.
+        """
+        return self.history_limit()
 
     def names(self) -> list[str]:
         with self._lock:
@@ -198,7 +272,7 @@ class SignalHub:
             if not ring:
                 raise KeyError(f"no signal named {name!r}; available: {sorted(self._signals)}")
             value = ring[-1]
-        return float(value) if value.ndim == 0 else value.copy()
+        return self._public_value(value)
 
     def history(self, name: str, n: int | None = None) -> np.ndarray:
         """Last ``n`` shots of ``name`` stacked on axis 0 (shape ``(shots, *value_shape)``).
@@ -221,7 +295,7 @@ class SignalHub:
             usable.append(item)
         return np.stack(list(reversed(usable)), axis=0)
 
-    def snapshot_latest(self) -> dict[str, object]:
+    def snapshot_latest(self, names=None) -> dict[str, object]:
         """One consistent {name: latest value} mapping (the expression namespace).
 
         LATEST of each signal independently -- NOT coherent across producers (a derived ``frame_judged``
@@ -229,7 +303,7 @@ class SignalHub:
         for the notebook expression namespace + tests that want the rawest values."""
 
         with self._lock:
-            names = list(self._signals)
+            names = list(self._signals) if names is None else [str(n) for n in names]
         out: dict[str, object] = {}
         for name in names:
             try:
@@ -238,7 +312,7 @@ class SignalHub:
                 continue
         return out
 
-    def snapshot_at(self, target: int | None) -> dict[str, object]:
+    def snapshot_at(self, target: int | None, names=None) -> dict[str, object]:
         """One ``{name: value}`` mapping COHERENT at source-shot ``target``: each signal's value whose
         provenance == ``target``, else (signal absent at that shot, or :data:`NO_LINEAGE`) its latest value.
 
@@ -248,7 +322,7 @@ class SignalHub:
         latest of each (== :meth:`snapshot_latest`).  ONE locked read so value/id can't race a publish."""
 
         with self._lock:
-            names = list(self._signals)
+            names = list(self._signals) if names is None else [str(n) for n in names]
             out: dict[str, object] = {}
             for name in names:
                 ring = self._signals.get(name)
@@ -271,7 +345,7 @@ class SignalHub:
                             break
                         if s != NO_LINEAGE and s < target:
                             break
-                out[name] = float(value) if value.ndim == 0 else value.copy()
+                out[name] = self._public_value(value)
         return out
 
 
