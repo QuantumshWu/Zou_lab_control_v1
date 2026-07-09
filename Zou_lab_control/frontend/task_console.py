@@ -1398,6 +1398,11 @@ _RELIM_PARAM = ParamDecl(
 UPDATE_INTERVALS = (100, 200, 400, 800)
 DEFAULT_UPDATE_MS = 400
 
+#: Fraction of the base tick interval the compose phase may spend before deferring the remaining
+#: panels to the next tick (see _tick's time budget).  <1 so the Qt event loop keeps a slice of every
+#: tick for input -- the board skips frames under overload instead of freezing the whole UI.
+_TICK_BUDGET_FRACTION = 0.8
+
 #: Image containers the Edit-tab Save offers, in menu order (first = default).  A DATA-layer choice of
 #: the output FILE FORMAT (not an art knob): the figure's geometry / dpi / typography are unchanged; only
 #: the container the ``DataFigure.save(image_ext=...)`` writes changes.  Lowercase to match matplotlib's
@@ -6075,6 +6080,7 @@ class TaskConsole(QtWidgets.QWidget):
         # every update_ms // base ticks.  _tick_count counts base ticks since the last re-base.
         self._tick_count = 0
         self._base_interval_ms = int(self.state.interval_ms)
+        self._compose_rotor = 0                  # where a budget-cut compose pass resumes next tick
         # Display reads each signal at its OWN latest value (one snapshot per tick).  Cross-signal coherence
         # where it matters is FREE: a readout processor co-publishes occupied + centres + frame_judged in one
         # publish, so their latest values are always the same physical shot (sitemap rings == frame_judged
@@ -7923,9 +7929,9 @@ class TaskConsole(QtWidgets.QWidget):
         self.pause_button.set_color(GREEN if self._paused else ORANGE)
         # A paused display freezes every panel: _tick returns early while paused (no card advances its
         # _render_version), and the LAST live tick already presented ONE coherent shot (the two-phase
-        # compose-all-then-present-all render), so the frozen board is a single consistent shot.  Resume
-        # runs one _tick: ``disp`` has moved on, so every stale panel's frame key differs and the
-        # disp-advance override recomposes + presents them TOGETHER -- an immediate coherent catch-up.
+        # compose-all-then-present-all render), so the frozen board is a single consistent shot.  On
+        # Resume every stale panel's frame key differs from what it drew, so each recomposes on its
+        # next update_ms beat (same-beat panels catch up together at the shared coherent shot).
         if not self._paused:
             self._tick()
 
@@ -8021,19 +8027,37 @@ class TaskConsole(QtWidgets.QWidget):
         # PHASE 1 -- COMPOSE every panel whose coherent frame changed into its OWN offscreen buffer
         # (nothing reaches the screen yet).  Each compose reads the ONE shared snapshot at ``disp``, so
         # the panels are mutually consistent BY CONSTRUCTION.
+        #
+        # The panel's OWN beat (update_ms) gates WHEN it recomposes; the coherent clock decides WHAT
+        # it shows (the shared snapshot at ``disp``).  Panels on the same beat flip to the same shot
+        # in the same tick (the three emCCD frames of a pulse never split); a panel on a slower beat
+        # holds its previous coherent shot until its beat comes round -- that is what choosing a
+        # slower update interval MEANS.  (The old "coherence beats the throttle" override recomposed
+        # every camera panel every base tick, because a live camera advances ``disp`` on every shot
+        # -- update_ms was silently dead for exactly the panels that needed it most.)
+        #
+        # TIME BUDGET: composing is bounded per tick.  When the panels' total compose cost exceeds
+        # the budget, finish what fits and leave the rest STALE for the next tick (their
+        # _render_version still differs, so they retry) -- the Qt event loop always breathes and the
+        # UI stays interactive: skip frames, never freeze.  The walk starts at a rotating index so a
+        # persistent overload degrades every panel's rate FAIRLY instead of starving the tail.
+        # Overrun panels may briefly show the previous shot; they catch up as soon as there is headroom.
         dirty = []
-        for card in self.cards:
+        n_cards = len(self.cards)
+        start = self._compose_rotor % n_cards if n_cards else 0
+        budget_s = _TICK_BUDGET_FRACTION * self._base_interval_ms / 1000.0
+        t0 = time.perf_counter()
+        self._compose_rotor = 0                   # a full pass resets the rotation
+        for i in range(n_cards):
+            card = self.cards[(start + i) % n_cards]
             key = self._panel_frame_key(card, disp, sigvers)
             if key == card._render_version:
                 continue                          # nothing this panel shows changed
-            # Coherence beats the throttle: if the DISPLAY SHOT advanced, recompose NOW regardless of this
-            # panel's own beat, so every co-displayed panel flips to the new shot in the SAME tick (the
-            # three emCCD frames of a pulse never split).  A change of only a free-running scalar (disp
-            # unchanged) honours the panel's update_ms beat.
-            disp_moved = (not isinstance(card._render_version, tuple)
-                          or card._render_version[0] != disp)
-            if not disp_moved and elapsed % card.config.update_ms != 0:
-                continue
+            if elapsed % card.config.update_ms != 0:
+                continue                          # this panel's beat has not come round yet
+            if dirty and (time.perf_counter() - t0) > budget_s:
+                self._compose_rotor = (start + i) % n_cards   # resume HERE next tick
+                break
             if namespace is None:                 # built ONCE per tick -> the shared snapshot at ``disp``
                 namespace = self._expression_namespace()
             card.compose(namespace)
