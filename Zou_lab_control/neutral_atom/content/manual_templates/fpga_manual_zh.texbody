@@ -284,6 +284,8 @@ event scheduler (硬件, 真相): [.....0.....][原信号右移 d.....]   <- fir
 
 \textbf{帧边界冻结。} \pyapi{repeat_forever} 下帧回绕时在线引擎会截断一条尚未跑完的 ramp（保持当前值、\tfocus{不}snap 到目标），所以段重放器在延后的帧边界 \pyapi{fend} 处\tfocus{冻结}（保持、不 snap），与在线行为逐 tick 对齐；有限（fire-once）程序不回绕，ramp 正常跑到 \pyapi{rstop} 并 snap 到目标（\pyapi{fend} = 无穷哨兵）。
 
+\textbf{done-tail 排空（安全态）。} 有限程序结束（done）时在线引擎把无延时总线\tfocus{snap 到 \pyapi{BUS_SAFE_VALUE}}（\pyapi{zlc_bus_clear_runtime}，0\,V）。一条\tfocus{被延时}的总线必须在 $d$ 个 tick 后\tfocus{也排空到 SAFE}（\pyapi{out[t]=in[t-d]}），\tfocus{不能永久停在最后编程值}——否则一条延时的 DAC 通道（线圈/激光幅度）会在实验结束后\tfocus{仍带电}到下次 FIRE。段重放器只见到 RUN 中 apply 的段，所以 done 时额外\tfocus{捕获一个 SAFE-hold 边沿描述符}（\pyapi{zlc_bus_capture_safe_hold}，emit=g\_time+d）：$d{=}0$/$d{=}1$ 视图立即/一拍后到 SAFE，$d{\ge}2$ 视图在 done+$d$ 排空到 SAFE，三者一致。模型 \pyapi{bus_undelayed_and_log} 同步把 done 后的无延时流置 SAFE 并记一条 SAFE apply，使镜像与真值锁步排空（\filepath{test_bus_segment_delay_equivalence.py::test_finite_program_done_tail} 守）。
+
 \textbf{成本小结。} TTL 每条 channel 一个事件 FIFO、DAC 每条\tfocus{总线}一个段 FIFO；这些 FIFO 都是\tfocus{分布式 RAM（LUTRAM / distributed）}，\tfocus{不占额外 BRAM}（\pyapi{ram_style="distributed"}）。因为存的是\tfocus{段描述符}（每条延时总线在途至多 \pyapi{BUS_EVT_DEPTH} 个）而非每 bit 的值事件，一条被延时的密集/长 ramp 只花一个描述符，占用比旧的逐位值 FIFO\tfocus{小得多}。每个信号的 32 位延时值走 \pyapi{R_DELAY} 寄存器区下发，\tfocus{没有}延时上传映像、\tfocus{没有}延时 CTRL 字、\tfocus{没有}迷你装载器。在 35T（\pyapi{xc7a35t}）上整套延时落地后仍有余量：LUT 约 59\%、BRAM 39/50、DSP 约 58\%（段延时需比特流重建后由 Vivado \pyapi{report_utilization} 最终确认）。
 
 \section{逐通道 clk 输出（把某通道直接接到时钟）}
