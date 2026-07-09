@@ -1432,8 +1432,8 @@ class VirtualSequencer(SequencerDevice):
         # PulseSequence (not the service's compiled RuntimeSequenceProgram), because the camera
         # needs its ``base_pulses()`` to detect the capture-trigger channel + its physics.
         self._prepared: PulseSequence | None = None
-        # The compiled RuntimeSequenceProgram of the last prepare() (parity with
-        # RuntimeSequencer.prepare, which on_pulse / sync-to-device read for .sequence_name etc.).
+        # The compiled RuntimeSequenceProgram of the last prepare() (what on_pulse /
+        # sync-to-device read for .sequence_name etc.).
         self.last_program = None
         # The program the streamer is CONTINUOUSLY firing (a repeat_forever pulse), or None when
         # idle/safe -- the virtual camera's gate; see the class docstring.
@@ -1684,23 +1684,25 @@ class VirtualSequencer(SequencerDevice):
         if bool(getattr(self._prepared, "repeat_forever", False)):
             # A FINITE scan (scan_repeats=K>0) DOES finish -- after K whole sweeps the streamer
             # halts (the host stops it on the real backend).  Block the K-sweep wall-clock, then
-            # report done.  An infinite scan / continuous On Pulse never finishes -> False.
+            # report done.  An infinite scan / continuous On Pulse never finishes: the protocol's
+            # deadlock guard applies exactly as on the bare service (virtual == real) -- waiting
+            # forever raises, a bounded wait reports not-done.
             info = self._scan_info
             if info is not None and int(info["scan_repeats"]) > 0:
                 delay = int(info["scan_repeats"]) * int(info["n_points"]) * float(info["base_dt"]) * self.sleep_scale
                 if timeout is not None and delay > float(timeout):
-                    return False
+                    return self._record_wait(False)
                 if delay > 0:
                     self._sleep_interruptible(delay, stop)          # cooperatively cancellable, like settle
                 if stop is not None and stop.is_set():
-                    self.service.history.append({"action": "wait_done", "ok": False})
-                    return False                                    # cancelled mid-sweep -> not done, do NOT latch
+                    return self._record_wait(False)                 # cancelled mid-sweep -> not done, do NOT latch
                 self._scan_done = True       # latch the saturated done reading (matches the real backend)
                 self._firing = None
-                self.service.history.append({"action": "wait_done", "ok": True})
-                return True
-            self.service.history.append({"action": "wait_done", "ok": False})
-            return False
+                return self._record_wait(True)
+            if timeout is None:
+                from .sequencer import WAIT_FOREVER_MESSAGE
+                raise RuntimeError(WAIT_FOREVER_MESSAGE)
+            return self._record_wait(False)
         # Wait to the fire-anchored deadline, not "duration from now": read_frames' finite pacing
         # already consumed the play time up to the SAME absolute instant, so a shot that reads its
         # frames and then wait_done()s pays the remainder (≈0), never the duration twice.  A
@@ -1710,12 +1712,19 @@ class VirtualSequencer(SequencerDevice):
             self._finite_play_deadline = time.monotonic() + float(self._prepared.duration) * self.sleep_scale
         delay = max(0.0, self._finite_play_deadline - time.monotonic())
         if timeout is not None and delay > float(timeout):
-            self.service.history.append({"action": "wait_done", "ok": False})
-            return False
+            return self._record_wait(False)
         if delay > 0:
             self._sleep_interruptible(delay, stop)                 # cooperatively cancellable, like settle
         ok = not (stop is not None and stop.is_set())             # cancelled mid-play -> not done
-        self.service.history.append({"action": "wait_done", "ok": ok})
+        return self._record_wait(ok)
+
+    def _record_wait(self, ok: bool) -> bool:
+        """Land a wait_done outcome with the SAME protocol bookkeeping the bare service does
+        (``state`` done/timeout + a history row), so a composed virtual wait reads identically in
+        snapshots -- the real-time pacing is this backend's only divergence, never the record."""
+        with self.service._lock:
+            self.service.state = "done" if ok else "timeout"
+            self.service.history.append({"action": "wait_done", "ok": ok})
         return ok
 
     def settle(self, seconds: float, *, stop=None) -> None:
@@ -1743,16 +1752,18 @@ class VirtualSequencer(SequencerDevice):
         self._scan_fire_time = 0.0
 
     def snapshot(self) -> dict[str, object]:
-        out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot
+        # The composed service's snapshot carries the PROTOCOL state (state / cache_prepared /
+        # prepared_program / the sync-to-device ``last_payload_json``); the base snapshot merges
+        # AFTER it so the ``type`` key still has ONE producer per class (BaseDevice.snapshot),
+        # and the virtual-specific fields land last (``channels`` shows the DAC coil bits folded
+        # into da_x/da_y/da_z buses -- ONE display source).
+        out = {**self.service.snapshot(), **super().snapshot()}
         out.update({
-            "channels": self.display_channels(),   # DAC coil bits folded into da_x/da_y/da_z buses (ONE source)
+            "channels": self.display_channels(),
             "clock_hz": self.clock_hz,
             "sleep_scale": self.sleep_scale,
             "runs": sum(1 for row in self.history if row["action"] == "fire"),
             "firing": None if self._firing is None else self._firing.name,
-            # the sync-to-device handle: the GUI's "Sync" reconstructs the editor state from
-            # this (PulseTableState JSON of the last prepare), same as the real sequencer.
-            "last_payload_json": self.last_payload_json,
         })
         return out
 

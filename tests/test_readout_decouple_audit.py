@@ -273,7 +273,7 @@ def test_coupled_resolver_missing_policy_is_explicit_per_measurement():
         _resolve_imaging_template,
     )
 
-    seqr = na.RuntimeSequencer(channels=["trap", "probe", "cooling", "emCCD"])
+    seqr = na.VirtualSequencer(channels=["trap", "probe", "cooling", "emCCD"])
 
     # temperature: a NAMED missing template fails loud
     with pytest.raises(FileNotFoundError):

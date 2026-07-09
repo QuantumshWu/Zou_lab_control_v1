@@ -2892,17 +2892,17 @@ def test_pulse_gui_controls_call_attached_address_switch_sequencer(monkeypatch):
 def test_pulse_gui_runtime_connection_control(monkeypatch):
     """The Connection control lets the user pick the sequencer backend AFTER
     opening (Virtual / Remote / Offline), instead of fixing it on the command
-    line.  Virtual swaps in a RuntimeSequencer built with the editor's OWN
+    line.  Virtual swaps in a VirtualSequencer built with the editor's OWN
     channels; Offline detaches (the editor stays usable); a failed Remote
     connect is reported and leaves the current connection untouched."""
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor, ensure_qt_app
-    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequencer
+    from Zou_lab_control.neutral_atom.devices.sequencer import VirtualSequencer
 
     ensure_qt_app()
     channels = [f"ch{i:02d}" for i in range(12)]
-    seq = RuntimeSequencer(channels=channels)
+    seq = VirtualSequencer(channels=channels)
     editor = PulseSequenceEditor(channels=channels, sequencer=seq)
     try:
         # opens reflecting the launch (virtual) sequencer; host:port disabled
@@ -2919,10 +2919,10 @@ def test_pulse_gui_runtime_connection_control(monkeypatch):
         assert editor.conn_status.text() == "Offline (edit only)"
         editor.prepare()  # must not raise with no sequencer attached
 
-        # Virtual -> swaps in a fresh RuntimeSequencer with the editor's channels
+        # Virtual -> swaps in a fresh VirtualSequencer with the editor's channels
         editor.conn_target_combo.setCurrentIndex(editor.conn_target_combo.findData("virtual"))
         editor._apply_connection()
-        assert type(editor.sequencer).__name__ == "RuntimeSequencer"
+        assert type(editor.sequencer).__name__ == "VirtualSequencer"
         assert list(editor.sequencer.channels) == channels
 
         # Remote to a dead address -> reported, connection unchanged (stays virtual)
@@ -2930,7 +2930,7 @@ def test_pulse_gui_runtime_connection_control(monkeypatch):
         assert editor.conn_addr_edit.isEnabled() is True
         editor.conn_addr_edit.setText("127.0.0.1:1")
         editor._apply_connection()
-        assert type(editor.sequencer).__name__ == "RuntimeSequencer"
+        assert type(editor.sequencer).__name__ == "VirtualSequencer"
     finally:
         editor.close()
 

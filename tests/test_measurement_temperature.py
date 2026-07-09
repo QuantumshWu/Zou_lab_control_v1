@@ -233,7 +233,7 @@ def test_virtual_parses_trap_off_from_release_recapture_sequence():
     state = build_release_recapture_pulse(
         channels=["trap", "probe", "emCCD"], exposure=2e-3, settle=2e-4, recapture=2e-4
     )
-    sequencer = na.RuntimeSequencer(channels=["trap", "probe", "emCCD"])
+    sequencer = na.VirtualSequencer(channels=["trap", "probe", "emCCD"])
     pulse = bind_pulse(sequencer, state)
 
     for t_off in (0.0, 2e-5, 7.5e-5, 1.5e-4):
@@ -409,7 +409,7 @@ def test_generic_scanned_measurement_drives_detection_axis_directly():
     cal = exp.readout.current
 
     hardware_channels = [f"ch{i:02d}" for i in range(8)]
-    sequencer = na.RuntimeSequencer(channels=hardware_channels, clock_hz=100_000_000)
+    sequencer = na.VirtualSequencer(channels=hardware_channels, clock_hz=100_000_000)
     state = na.PulseTableState(
         channels=["ch00", "ch03"],
         periods=[

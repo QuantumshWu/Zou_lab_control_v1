@@ -20,8 +20,6 @@ BUILTIN_DEVICE_CLASS_PATHS = {
     "QCMOSCamera": "Zou_lab_control.neutral_atom.devices.qcmos.QCMOSCamera",
     "ManualSequencer": "Zou_lab_control.neutral_atom.devices.sequencer.ManualSequencer",
     "RemoteSequencer": "Zou_lab_control.neutral_atom.devices.sequencer.RemoteSequencer",
-    "RuntimeSequencer": "Zou_lab_control.neutral_atom.devices.sequencer.RuntimeSequencer",
-    "VerilogSequencer": "Zou_lab_control.neutral_atom.devices.sequencer.VerilogSequencer",
     "VirtualCamera": "Zou_lab_control.neutral_atom.devices.virtual.VirtualCamera",
     "VirtualMotCamera": "Zou_lab_control.neutral_atom.devices.virtual.VirtualMotCamera",
     "VirtualSequencer": "Zou_lab_control.neutral_atom.devices.virtual.VirtualSequencer",

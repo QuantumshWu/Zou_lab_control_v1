@@ -37,7 +37,7 @@ from Zou_lab_control.neutral_atom.devices.camera_trigger import (
 from Zou_lab_control.neutral_atom.devices.pylon import PylonCamera
 from Zou_lab_control.neutral_atom.devices.qcmos import QCMOSCamera, QCMOSConfig
 from Zou_lab_control.neutral_atom.devices.sequencer import (
-    ManualSequencer, RemoteSequencer, RuntimeSequencer, SequencerService, VerilogSequencer)
+    ManualSequencer, RemoteSequencer, SequencerService)
 from Zou_lab_control.neutral_atom.devices.virtual import (
     VirtualCamera, VirtualLaser, VirtualMotCamera, VirtualRF, VirtualSequencer, VirtualTrapArray)
 from Zou_lab_control.neutral_atom.timing import PulseSequence
@@ -208,8 +208,6 @@ def test_snapshot_type_key_is_produced_only_by_the_base_class(monkeypatch):
         QCMOSCamera({"exposure": 1e-3}),
         ManualSequencer(channels=["trap", "emCCD"]),
         RemoteSequencer(host="192.0.2.1", port=1, channels=["trap", "emCCD"]),
-        VerilogSequencer(channels=["trap", "emCCD"]),
-        RuntimeSequencer(channels=["trap", "emCCD"]),
     ]
     for dev in devices:                                      # the normal reading first
         snap = dev.snapshot()
@@ -262,7 +260,7 @@ def test_settle_scaling_is_owned_by_the_sequencer_service():
     flipping the VirtualSequencer's ``sleep_scale`` writes through, so settle can never read a
     stale adapter-side mirror."""
     for seqr in (VirtualSequencer(sleep_scale=0.0),
-                 RuntimeSequencer(channels=["trap", "emCCD"], sleep_scale=0.0)):
+                 VirtualSequencer(channels=["trap", "emCCD"], sleep_scale=0.0)):
         calls: list = []
         original = seqr.service.settle
         seqr.service.settle = lambda seconds, *, stop=None: calls.append((seconds, stop))

@@ -14,7 +14,7 @@ import Zou_lab_control.neutral_atom as na
 
 
 def test_runtime_sequencer_has_no_trigger_channels_attr():
-    seq = na.RuntimeSequencer(channels=["ch00", "ch11"], clock_hz=50e6)
+    seq = na.VirtualSequencer(channels=["ch00", "ch11"], clock_hz=50e6)
     assert not hasattr(seq, "trigger_channels")
 
 
@@ -49,7 +49,7 @@ def test_firing_is_a_sequencer_contract_with_real_default_none():
     from Zou_lab_control.neutral_atom.devices.base import SequencerDevice
 
     assert "firing" in vars(SequencerDevice)               # declared on the abstract contract
-    seq = na.RuntimeSequencer(channels=["ch00", "ch11"], clock_hz=50e6)
+    seq = na.VirtualSequencer(channels=["ch00", "ch11"], clock_hz=50e6)
     assert isinstance(seq, SequencerDevice)
     assert seq.firing is None                              # real backend default = correct semantics
 

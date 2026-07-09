@@ -221,7 +221,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # so the pulse editor never seeds a trigger channel.
             channels = _resolve_channels(args, state)
             channel_labels = _resolve_channel_labels(args, channels, state)
-            sequencer = na.RuntimeSequencer(
+            sequencer = na.VirtualSequencer(
                 channels=channels,
                 clock_hz=args.clock_hz,
             )

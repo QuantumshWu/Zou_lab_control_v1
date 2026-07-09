@@ -247,7 +247,7 @@ def test_virtual_terminal_reading_latches_like_real():
 # source; without one it reports the honest static reading and never advances.
 import time as _time
 
-from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequencer, SequencerService
+from Zou_lab_control.neutral_atom.devices.sequencer import SequencerService
 
 
 def _command_backed_service():
@@ -285,33 +285,11 @@ def test_command_backend_progress_idle_when_not_running():
     assert svc.scan_progress() == SCAN_PROGRESS_IDLE
 
 
-def test_simulate_flag_is_the_single_opt_in_for_wall_clock_progress():
-    # The wall-clock SIMULATION lives in exactly one place and is reachable ONLY via the explicit
-    # opt-in: a service with simulate_scan_progress=True paces the played-point count off the clock;
-    # the default (a real, un-readable device) does not.  Same service, same NoOp backend, opposite
-    # behaviour -- so a real command-backed device can never inherit the simulator's fabrication.
-    def make(simulate):
-        return SequencerService(
-            channels=["probe", "trig"],
-            prepare_callback=lambda p: None, fire_callback=lambda p: None,
-            safe_state_callback=lambda: None, scan_progress_callback=None,
-            cache_prepared=False, simulate_scan_progress=simulate,
-        )
-    sim = make(True)
-    PulseController(sim, _scan_state()).on_pulse(repeat_forever=True)
-    p0 = sim.scan_progress()["point"]
-    _time.sleep(0.12)
-    assert sim.scan_progress()["point"] >= p0 and sim.scan_progress() != {
-        "scanning": True, "point": 0, "n_points": 3, "sweep": 0, "n_repeats": 0}
+def test_virtual_sequencer_wires_its_real_time_reading_but_command_backend_has_none():
+    # Pin the wiring: the in-process VirtualSequencer reports a REAL-TIME-PACED scan position through
+    # the service's scan_progress_callback seam (the same seam the real AXI cursor uses); a
+    # command-backed service has NO source at all, so it can never fabricate an advancing count.
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
 
-    real = make(False)
-    PulseController(real, _scan_state()).on_pulse(repeat_forever=True)
-    _time.sleep(0.12)
-    assert real.scan_progress()["point"] == 0    # a real device never fabricates
-
-
-def test_runtime_sequencer_opts_into_the_simulator_but_command_backend_does_not():
-    # Pin the wiring so the opt-in cannot silently flip: the in-process "Virtual (sim)"
-    # RuntimeSequencer IS a simulator (may pace off the clock); a command-backed service is NOT.
-    assert RuntimeSequencer(channels=["probe", "trig"]).service.simulate_scan_progress is True
-    assert _command_backed_service().simulate_scan_progress is False
+    assert VirtualSequencer(channels=["probe", "trig"]).service.scan_progress_callback is not None
+    assert _command_backed_service().scan_progress_callback is None

@@ -123,25 +123,27 @@ def test_poll_scan_progress_reads_connected_sequencer(_app):
     assert ed.scan_progress_label.text() == "Scan: point 2 / 3 · sweep 1 / 2  s0 = 20"
 
 
-def test_runtime_sequencer_reports_scan_progress_for_a_software_streamed_scan(_app):
-    """virtual==real for the readout: a pure-software RuntimeSequencer (the standalone pulse GUI's
-    DEFAULT backend, no FPGA cursor callback) must STILL report "point K / N" for a fired streamed
-    scan -- so the Scan tab shows the live position on virtual, not just on real hardware.  (The old
-    SequencerService.scan_progress returned idle without a hardware callback -> the bat showed nothing.)"""
+def test_virtual_sequencer_reports_scan_progress_for_a_software_streamed_scan(_app):
+    """virtual==real for the readout: the pure-software VirtualSequencer (the standalone pulse GUI's
+    "Virtual (sim)" backend, no FPGA cursor) must STILL report "point K / N" for a fired streamed
+    scan -- so the Scan tab shows the live position on virtual, not just on real hardware.  The
+    reading is REAL-TIME PACED off the program's own per-point duration (sleep_scale=1), the same
+    pacing the live camera follows -- never a display-rate fabrication."""
     import time
-    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequencer, SCAN_PROGRESS_IDLE
+    from Zou_lab_control.neutral_atom.devices.sequencer import SCAN_PROGRESS_IDLE
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
     st = PulseTableState(channels=["probe", "trig"])
     st.bind_field("duration", "0", unit="us")
     st.set_scan_table([[10.0], [20.0], [30.0], [40.0]])   # 4 points, scan_repeats=0 -> repeat_forever
-    seq = RuntimeSequencer(channels=["probe", "trig"])
+    seq = VirtualSequencer(channels=["probe", "trig"], sleep_scale=1.0)   # real-time (conftest fast-forwards by default)
     assert seq.scan_progress() == SCAN_PROGRESS_IDLE       # nothing fired yet -> idle
     seq.prepare(st)
     seq.fire()
     p = seq.scan_progress()
     assert p["scanning"] is True and p["n_points"] == 4    # a streamed scan IS reported (not idle)
     t0 = p["point"]
-    time.sleep(0.12)                                       # > 2 * SCAN_PROGRESS_DISPLAY_DT -> the point advances
+    time.sleep(0.12)                                       # >> the us-scale per-point duration -> the point advances
     assert seq.scan_progress()["point"] >= t0
     seq.set_safe_state()                                   # Stop Pulse -> back to idle
     assert seq.scan_progress() == SCAN_PROGRESS_IDLE

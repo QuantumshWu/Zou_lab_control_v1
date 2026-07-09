@@ -130,9 +130,7 @@ def test_device_contracts_are_explicit_and_validated():
     assert issubclass(na.QCMOSCamera, na.CameraDevice)
     assert issubclass(na.ManualSequencer, na.SequencerDevice)
     assert issubclass(na.RemoteSequencer, na.SequencerDevice)
-    assert issubclass(na.RuntimeSequencer, na.SequencerDevice)
     assert issubclass(na.VirtualSequencer, na.SequencerDevice)
-    assert issubclass(na.VerilogSequencer, na.SequencerDevice)
     assert issubclass(na.VirtualTrapArray, na.TrapArrayDevice)
 
     try:
@@ -154,7 +152,7 @@ def test_device_contracts_are_explicit_and_validated():
 
 
 def test_device_registry_can_register_external_classes():
-    class RegisteredSequencer(na.RuntimeSequencer):
+    class RegisteredSequencer(na.VirtualSequencer):
         pass
 
     na.register_device_class("RegisteredSequencerForTest", RegisteredSequencer)
@@ -322,7 +320,7 @@ def test_detection_time_scan_sends_probe_duration_per_point():
 
 def test_runtime_sequencer_service_contract():
     seq = na.imaging_sequence(exposure=1e-4, load=True).repeated(2)
-    sequencer = na.RuntimeSequencer(channels=["trap", "cooling", "probe", "emCCD"], sleep_scale=0.0)
+    sequencer = na.VirtualSequencer(channels=["trap", "cooling", "probe", "emCCD"], sleep_scale=0.0)
     program = sequencer.prepare(seq)
     sequencer.fire(seq)
 
@@ -3126,7 +3124,7 @@ def test_pulse_table_repeat_forever_can_be_disabled_for_single_shot():
 
 
 def test_bind_pulse_controller_updates_slot_and_fires_runtime_sequencer():
-    sequencer = na.RuntimeSequencer(
+    sequencer = na.VirtualSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
         sleep_scale=0.0,
@@ -3159,7 +3157,7 @@ def test_bind_pulse_controller_updates_slot_and_fires_runtime_sequencer():
 
 
 def test_bind_pulse_controller_can_override_repeat_forever_for_scope_debug():
-    sequencer = na.RuntimeSequencer(
+    sequencer = na.VirtualSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
         sleep_scale=0.0,
@@ -3184,7 +3182,7 @@ def test_bind_pulse_controller_can_override_repeat_forever_for_scope_debug():
 
 
 def test_bind_pulse_controller_rejects_waiting_indefinitely_for_repeat_forever():
-    sequencer = na.RuntimeSequencer(
+    sequencer = na.VirtualSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
         sleep_scale=0.0,
@@ -3214,7 +3212,7 @@ def test_bind_pulse_controller_rejects_waiting_indefinitely_for_repeat_forever()
 
 
 def test_runtime_sequencer_repeat_forever_wait_done_times_out():
-    sequencer = na.RuntimeSequencer(
+    sequencer = na.VirtualSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
         sleep_scale=0.0,
@@ -3245,7 +3243,7 @@ def test_runtime_sequencer_repeat_forever_wait_done_times_out():
 
 
 def test_bind_pulse_controller_repeat_forever_wait_timeout_raises():
-    sequencer = na.RuntimeSequencer(
+    sequencer = na.VirtualSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
         sleep_scale=0.0,
@@ -3275,7 +3273,7 @@ def test_bind_pulse_controller_repeat_forever_wait_timeout_raises():
 
 
 def test_bind_pulse_controller_can_override_sequence_repeat_forever():
-    sequencer = na.RuntimeSequencer(
+    sequencer = na.VirtualSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
         sleep_scale=0.0,
@@ -3300,7 +3298,7 @@ def test_bind_pulse_controller_can_override_sequence_repeat_forever():
 def _bench_trigger_cable(camera, sequencer, *, trigger_channel="ch03"):
     """Test-bench TRIGGER CABLE: plug the virtual camera's trigger input into THIS streamer.
 
-    On a real rig the cable is copper -- a RuntimeSequencer/RemoteSequencer emits real edges the
+    On a real rig the cable is copper -- a VirtualSequencer/RemoteSequencer emits real edges the
     camera's hardware input sees.  On the bench the virtual camera needs the software mirror of
     that wire, so re-point its ``sequencer`` and forward every ``fire`` to the camera's wire
     listener (exactly what a VirtualSequencer's fire-listener seam does natively).
@@ -3325,7 +3323,7 @@ def test_detection_time_scan_uses_bound_40ch_pulse_controller():
     exp.readout.sitemap(frames=3, display=False)
     hardware_channels = [f"ch{i:02d}" for i in range(40)]
 
-    class RecordingRuntimeSequencer(na.RuntimeSequencer):
+    class RecordingVirtualSequencer(na.VirtualSequencer):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.prepared_programs = []
@@ -3335,7 +3333,7 @@ def test_detection_time_scan_uses_bound_40ch_pulse_controller():
             self.prepared_programs.append(program)
             return program
 
-    sequencer = RecordingRuntimeSequencer(channels=hardware_channels, clock_hz=100_000_000, sleep_scale=0.0)
+    sequencer = RecordingVirtualSequencer(channels=hardware_channels, clock_hz=100_000_000, sleep_scale=0.0)
     _bench_trigger_cable(exp.devices.camera, sequencer)   # this streamer's edges now gate the camera
     state = na.PulseTableState(
         channels=["ch00", "ch02", "ch03"],
@@ -3381,7 +3379,7 @@ def test_timing_subsystem_bind_pulse_loads_json_for_40ch_remote_style_scan(tmp_p
     exp.readout.sitemap(frames=3, display=False)
     hardware_channels = [f"ch{i:02d}" for i in range(40)]
 
-    class RecordingRuntimeSequencer(na.RuntimeSequencer):
+    class RecordingVirtualSequencer(na.VirtualSequencer):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.prepared_programs = []
@@ -3391,7 +3389,7 @@ def test_timing_subsystem_bind_pulse_loads_json_for_40ch_remote_style_scan(tmp_p
             self.prepared_programs.append(program)
             return program
 
-    sequencer = RecordingRuntimeSequencer(channels=hardware_channels, clock_hz=100_000_000, sleep_scale=0.0)
+    sequencer = RecordingVirtualSequencer(channels=hardware_channels, clock_hz=100_000_000, sleep_scale=0.0)
     exp.devices.devices["sequencer"] = sequencer
     _bench_trigger_cable(exp.devices.camera, sequencer)   # re-plug the camera onto the new streamer
     state = na.PulseTableState(
@@ -3442,7 +3440,7 @@ def test_bound_pulse_frame_sequence_keeps_pulse_own_trigger_count_regardless_of_
     pulse streamer now): the resolved sequence carries the pulse's OWN triggers, and ``frames``
     does NOT change the sequence's trigger count.  Here the pulse has a single ch03 trigger, so
     frames=1/2/3 all yield exactly one trigger and the same finite, non-forever program."""
-    sequencer = na.RuntimeSequencer(
+    sequencer = na.VirtualSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
         sleep_scale=0.0,
@@ -5978,7 +5976,7 @@ def test_delay_eligibility_enforced_in_api():
     assert delay_eligible_channel_count(62, 4, 10) == 18      # board: 18 real TTL outputs
     assert delay_eligible_channel_count(8, 0, 0) == 8         # no buses -> all eligible
 
-    seq = na.RuntimeSequencer(channels=[f"ch{i:02d}" for i in range(62)],
+    seq = na.VirtualSequencer(channels=[f"ch{i:02d}" for i in range(62)],
                               clock_hz=50e6)
     st = na.PulseTableState(channels=[f"ch{i:02d}" for i in range(62)],
                             periods=[na.PulsePeriod(1000, (0,) * 62, unit="ns")], time_step_ns=20)
@@ -7154,7 +7152,7 @@ def test_negative_literal_duration_rejected():
 
 def test_pulse_controller_set_scan_table_accepts_numpy():
     # BUG: set_scan_table/payload used `rows or []` / `if table:`, raising on a NumPy array.
-    seq = na.RuntimeSequencer(channels=["a", "trig"], clock_hz=50e6)
+    seq = na.VirtualSequencer(channels=["a", "trig"], clock_hz=50e6)
     st = na.PulseTableState(
         channels=["a", "trig"], periods=[na.PulsePeriod("s0", (1, 0), unit="str (ns)")],
         scan_slots=[{"kind": "duration", "target": "0", "unit": "ns", "nominal": 100.0}],
@@ -7179,7 +7177,7 @@ def test_sequencer_prepare_backstops_invalid_program_geometry():
     # BUG: SequencerService.prepare cached the program before any geometry check; a mock
     # backend would accept channel_delays beyond the 32-bit cap. A backstop validate rejects it.
     import pytest
-    seq = na.RuntimeSequencer(channels=["a", "b"], clock_hz=50e6)
+    seq = na.VirtualSequencer(channels=["a", "b"], clock_hz=50e6)
     # a delay beyond the 32-bit TTL field (~42.9 s) must still be rejected by the backstop
     huge_ns = ((1 << 31) + 10) * 20.0
     st = na.PulseTableState(channels=["a", "b"], periods=[na.PulsePeriod(100, (1, 1), unit="ns")],
@@ -7192,7 +7190,7 @@ def test_sequencer_prepare_accepts_streamed_scan_beyond_resident_window():
     # REGRESSION: the prepare() backstop used the DEFAULT max_scan_points (the 2-bank
     # resident window, 4096) and rejected larger STREAMED scans (e.g. 9999 points),
     # which the architecture explicitly supports (points stream through the window).
-    seq = na.RuntimeSequencer(channels=["a", "b"], clock_hz=50e6)
+    seq = na.VirtualSequencer(channels=["a", "b"], clock_hz=50e6)
     st = na.PulseTableState(channels=["a", "b"], periods=[na.PulsePeriod(100, (1, 1), unit="ns")],
                             time_step_ns=20)
     st.bind_field("duration", "0")

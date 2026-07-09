@@ -15,7 +15,6 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
-from Zou_lab_control._paths import GENERATED_SEQUENCES_DIR
 from Zou_lab_control._clock import default_clock_hz as _default_clock_hz
 from Zou_lab_control._streamer_geometry import DEFAULT_COEFF_FRAC_BITS
 from ..core.analysis import nonnegative_float, positive_int
@@ -36,7 +35,6 @@ from ..timing.pulse_table import (
     snap_scan_table as _snap_scan_table,
     slot_ref_index as _parse_slot_ref_index,
 )
-from ..timing.verilog import VerilogBuild, VerilogFiles, generate_verilog, write_verilog_bundle
 
 
 DEFAULT_RUNTIME_CLOCK_HZ = _default_clock_hz()
@@ -357,12 +355,10 @@ SCAN_PROGRESS_IDLE: dict[str, object] = {
     "scanning": False, "point": 0, "n_points": 0, "sweep": 0, "n_repeats": 0,
 }
 
-#: Per-scan-point WALL-CLOCK pacing of the PURE-SOFTWARE scan-progress readout.  The real backend
-#: wires ``scan_progress_callback`` (the FPGA scan cursor) and ignores this; a pure-software
-#: SequencerService (the standalone pulse GUI's RuntimeSequencer) has NO cursor, so it derives the
-#: played-point count from ``elapsed_since_fire / this`` -- so the GUI shows "point K / N" advancing
-#: for a virtual streamed scan too (virtual == real for the readout; the rate is a display choice).
-SCAN_PROGRESS_DISPLAY_DT: float = 0.05
+#: The ONE deadlock-guard message for "wait forever on a repeat_forever program" -- shared by the
+#: service's wait_done and the virtual backend's real-time override, so the two can never drift.
+WAIT_FOREVER_MESSAGE = ("sequencer wait_done cannot wait forever for a repeat_forever program; "
+                        "pass a timeout or stop the pulse.")
 
 
 def scan_progress_fields(point_total: int, n_points: int, scan_repeats: int) -> dict[str, object]:
@@ -921,7 +917,6 @@ class SequencerService:
         scan_progress_callback: Callable[[], dict] | None = None,
         sleep_scale: float = 0.0,
         cache_prepared: bool = True,
-        simulate_scan_progress: bool = False,
     ):
         self.channels = list(channel_names(channels, "channels"))
         self.clock_hz = positive_float(clock_hz, "clock_hz")
@@ -932,16 +927,13 @@ class SequencerService:
         self.scan_progress_callback = scan_progress_callback
         # SCAN PROGRESS IS A DEVICE-TRUTH READING, never a GUI-local timer.  A backend with a real
         # scan-point source wires ``scan_progress_callback`` -- the FPGA cursor (AXI) or the virtual
-        # backend's real-time simulator -- and the reading always comes from there.  WITHOUT such a
-        # source (the command backend on real hardware, whose fire is a fire-and-forget lab command
-        # with no cursor to read) the service does NOT know where the engine's scan is, so it reports
-        # the HONEST reading: point 0 while a scan is loaded and running, NEVER an advancing count.
-        # ``simulate_scan_progress`` is the SINGLE opt-in for the ONE case where fabricating a moving
-        # position is legitimate -- the in-process ``RuntimeSequencer`` "Virtual (sim)", which has no
-        # real device to contradict it.  Keying the wall-clock derivation off this flag (not off "no
-        # callback") is what stops a real command-backed device from showing "progress advancing" while
-        # nothing is physically streaming -- the user-reported "progress climbs but the device is idle".
-        self.simulate_scan_progress = bool(simulate_scan_progress)
+        # backend's real-time-paced reading (``VirtualSequencer._scan_progress``) -- and the reading
+        # always comes from there.  WITHOUT such a source (the command backend on real hardware,
+        # whose fire is a fire-and-forget lab command with no cursor to read) the service does NOT
+        # know where the engine's scan is, so it reports the HONEST reading: point 0 while a scan is
+        # loaded and running, NEVER an advancing count -- that is what stops a real command-backed
+        # device from showing "progress advancing" while nothing is physically streaming (the
+        # user-reported "progress climbs but the device is idle").
         self.sleep_scale = nonnegative_float(sleep_scale, "sleep_scale")
         self.cache_prepared = bool(cache_prepared)
         self._lock = threading.RLock()
@@ -1073,7 +1065,7 @@ class SequencerService:
         with self._lock:
             program = self._require_prepared()
         if program.repeat_forever and timeout is None:
-            raise RuntimeError("sequencer wait_done cannot wait forever for a repeat_forever program; pass a timeout or stop the pulse.")
+            raise RuntimeError(WAIT_FOREVER_MESSAGE)
         if self.wait_done_callback is not None:
             ok = bool(self.wait_done_callback(program, timeout))
         elif program.repeat_forever:
@@ -1095,7 +1087,7 @@ class SequencerService:
         """Idle ``seconds`` between software-stepped fires, scaled by THIS service's
         ``sleep_scale`` -- the ONE home of the "a virtual settle fast-forwards with
         sleep_scale" rule (``sleep_scale=0`` under pytest -> instant), which both composing
-        backends (``VirtualSequencer``, ``RuntimeSequencer``) delegate to.  ``stop`` keeps
+        backends (e.g. ``VirtualSequencer``) delegate to.  ``stop`` keeps
         the wait cooperatively cancellable via the shared interruptible sleep
         (``SequencerDevice._sleep_interruptible`` -- not a second sleep loop)."""
         SequencerDevice._sleep_interruptible(float(seconds) * float(self.sleep_scale), stop)
@@ -1127,11 +1119,7 @@ class SequencerService:
         with no cursor) the service CANNOT know the engine's scan position, so it reports the honest
         reading: a loaded, running scan sits at ``point 0`` and does NOT advance.  It NEVER derives a
         climbing count from the wall clock -- that would claim the device is sweeping when nothing may
-        be streaming (the reported "progress climbs but the device is idle").
-
-        The one exception is ``simulate_scan_progress`` (the in-process ``RuntimeSequencer`` "Virtual
-        (sim)"): a genuine software simulator with no real device to contradict it, so it MAY pace the
-        played-point count off the wall clock -- the single, opt-in home of that simulation."""
+        be streaming (the reported "progress climbs but the device is idle")."""
         if self.scan_progress_callback is not None:
             return dict(self.scan_progress_callback())
         program = self.prepared_program
@@ -1145,16 +1133,10 @@ class SequencerService:
         k = max(0, int(getattr(program, "scan_repeats", 0)))
         if self._scan_done:                              # finite scan already played its K sweeps -> latched done
             return scan_progress_fields(max(1, k) * n, n, k)
-        if not self.simulate_scan_progress:
-            # No real cursor and NOT a simulator: report the honest static reading (running at the
-            # start of the scan), so a real device with an un-readable position never fabricates a
-            # climbing count while nothing is confirmed streaming.
-            return scan_progress_fields(0, n, k)
-        total = int(max(0.0, time.monotonic() - self._scan_fire_time) / SCAN_PROGRESS_DISPLAY_DT)
-        fields = scan_progress_fields(total, n, k)
-        if not fields["scanning"]:                       # a finite K-sweep scan reached its end -> latch
-            self._scan_done = True
-        return fields
+        # No real cursor: report the honest static reading (running at the start of the scan), so a
+        # device with an un-readable position never fabricates a climbing count while nothing is
+        # confirmed streaming.
+        return scan_progress_fields(0, n, k)
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
@@ -1176,62 +1158,6 @@ class SequencerService:
         if self.prepared_program is None:
             raise RuntimeError("sequencer service has no prepared sequence.")
         return self.prepared_program
-
-
-class RuntimeSequencer(SequencerDevice):
-    """Local device adapter for the runtime edge-table protocol."""
-
-    def __init__(
-        self,
-        *,
-        channels: Sequence[str],
-        clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
-        sleep_scale: float = 0.0,
-    ):
-        # The in-process "Virtual (sim)" backend has NO real device, so it is the one place a
-        # wall-clock-paced scan position is an honest SIMULATION (nothing to contradict it) rather
-        # than a fabrication over a real, un-readable device -- opt into it explicitly.
-        self.service = SequencerService(
-            channels=channels,
-            clock_hz=clock_hz,
-            sleep_scale=sleep_scale,
-            simulate_scan_progress=True,
-        )
-        self.channels = self.service.channels
-        self.clock_hz = self.service.clock_hz
-        self.last_program: RuntimeSequenceProgram | None = None
-
-    def prepare(self, sequence: PulseSequence | PulseTableState) -> RuntimeSequenceProgram:
-        step = 1e9 / float(self.clock_hz)
-        self.last_program = RuntimeSequenceProgram.from_dict(self.service.prepare(timing_payload_to_dict(sequence, time_step_ns=step)))
-        return self.last_program
-
-    def fire(self, sequence: PulseSequence | PulseTableState | None = None) -> None:
-        step = 1e9 / float(self.clock_hz)
-        self.service.fire(None if sequence is None else timing_payload_to_dict(sequence, time_step_ns=step))
-
-    def wait_done(self, timeout: float | None = None, *, stop=None) -> bool:
-        return self.service.wait_done(timeout, stop=stop)
-
-    def scan_progress(self) -> dict:
-        return self.service.scan_progress()
-
-    def settle(self, seconds: float, *, stop=None) -> None:
-        # Delegated to the composed service, which owns sleep_scale and therefore the one
-        # "settle fast-forwards with sleep_scale" rule (SequencerService.settle).
-        self.service.settle(seconds, stop=stop)
-
-    def abort(self) -> None:
-        self.service.abort()
-
-    def set_safe_state(self) -> None:
-        self.service.set_safe_state()
-
-    def snapshot(self) -> dict[str, object]:
-        # The composed service's snapshot carries ITS identity ("SequencerService"); merging the
-        # base snapshot LAST restores this adapter's own -- the ``type`` key still has ONE
-        # producer per class (BaseDevice.snapshot), never a re-typed literal here.
-        return {**self.service.snapshot(), **super().snapshot()}
 
 
 class ManualSequencer(SequencerDevice):
@@ -1781,65 +1707,6 @@ def bind_pulse(sequencer: SequencerDevice, pulse: PulseSequence | PulseTableStat
     return PulseController(sequencer, pulse)
 
 
-class VerilogSequencer(SequencerDevice):
-    """Prepare writes generated Verilog; fire calls an optional hardware hook."""
-
-    def __init__(
-        self,
-        *,
-        channels: Sequence[str],
-        clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
-        output_dir: str | Path = GENERATED_SEQUENCES_DIR,
-        module_name: str = "zlc_sequence",
-        pin_map: Mapping[str, str] | None = None,
-        fire_callback: Callable[[VerilogBuild], None] | None = None,
-    ):
-        self.channels = list(channel_names(channels, "channels"))
-        self.clock_hz = positive_float(clock_hz, "clock_hz")
-        self.output_dir = Path(output_dir)
-        self.module_name = str(module_name)
-        self.pin_map = None if pin_map is None else dict(pin_map)
-        self.fire_callback = fire_callback
-        self.last_build: VerilogBuild | None = None
-        self.last_files: VerilogFiles | None = None
-        self.prepared_sequence: PulseSequence | None = None
-
-    def prepare(self, sequence: PulseSequence) -> VerilogBuild:
-        build = generate_verilog(sequence, channels=self.channels, clock_hz=self.clock_hz, module_name=self.module_name)
-        self.last_build = build
-        self.last_files = write_verilog_bundle(build, self.output_dir, pin_map=self.pin_map)
-        self.prepared_sequence = sequence
-        return build
-
-    def fire(self, sequence: PulseSequence | None = None) -> None:
-        if self.last_build is None or self.prepared_sequence is None:
-            raise RuntimeError("VerilogSequencer.fire() called before prepare().")
-        if sequence is not None and sequence is not self.prepared_sequence:
-            raise RuntimeError("VerilogSequencer.fire() received a sequence that was not prepared.")
-        if self.fire_callback is None:
-            raise RuntimeError(
-                "Verilog files were generated, but no fire_callback is configured. "
-                "For real hardware, pass a callback that starts the FPGA after the camera is armed."
-            )
-        self.fire_callback(self.last_build)
-
-    def snapshot(self) -> dict[str, object]:
-        out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot
-        out.update({
-            "channels": self.channels,
-            "clock_hz": self.clock_hz,
-            "output_dir": str(self.output_dir),
-            "module_name": self.module_name,
-            "last_verilog": None if self.last_files is None else str(self.last_files.verilog_path),
-            "last_manifest": None if self.last_files is None else str(self.last_files.manifest_path),
-            "prepared": self.prepared_sequence is not None,
-        })
-        return out
-
-    def close(self) -> None:
-        pass
-
-
 def timing_payload_to_dict(payload: PulseSequence | PulseTableState, *, time_step_ns: float | None = None) -> dict[str, object]:
     """Return the JSON-safe timing payload for a sequence or pulse table.
 
@@ -1850,7 +1717,7 @@ def timing_payload_to_dict(payload: PulseSequence | PulseTableState, *, time_ste
 
     ``time_step_ns`` MUST be the TARGET sequencer's tick (``1e9 / clock_hz``) so the
     snap lands on the grid the SERVER will compile at -- otherwise a state saved at a
-    different ``time_step_ns`` would be pre-snapped on the wrong grid and the Remote/Runtime
+    different ``time_step_ns`` would be pre-snapped on the wrong grid and the Remote/Virtual
     result would diverge from a direct local compile at the same clock.  Defaults to the
     payload's own ``time_step_ns`` only when no target is supplied."""
 
@@ -2761,9 +2628,7 @@ __all__ = [
     "RuntimeBusDelay",
     "RuntimeBusSegment",
     "RuntimeSequenceProgram",
-    "RuntimeSequencer",
     "SequencerService",
-    "VerilogSequencer",
     "bind_pulse",
     "compile_pulse_table_runtime_program",
     "compile_pulse_table_scan_runtime_program",

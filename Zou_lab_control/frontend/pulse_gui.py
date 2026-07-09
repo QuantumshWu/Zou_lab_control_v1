@@ -3948,12 +3948,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             self._set_sequencer(None, label="Offline (edit only)")
             self._message("Offline: editing only, no backend calls.")
             return
-        from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer, RuntimeSequencer
+        from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer
+        from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
 
         kwargs = {"channels": list(self.state.channels), "clock_hz": self._clock_hz}
         try:
             if target == "virtual":
-                self._set_sequencer(RuntimeSequencer(**kwargs), label="Virtual (sim)")
+                self._set_sequencer(VirtualSequencer(**kwargs), label="Virtual (sim)")
                 self._message("Connected to a virtual (in-memory) sequencer.")
             else:
                 host, port = self._parse_addr(self.conn_addr_edit.text())

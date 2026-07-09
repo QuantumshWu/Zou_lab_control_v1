@@ -5,7 +5,7 @@ because ``VirtualSequencer.prepare`` called ``sequence.validate(clock_hz=, chann
 ``.raise_if_failed()`` -- the PulseSequence contract -- on a PulseTableState (which has neither),
 and returned None (so ``on_pulse`` returned None instead of a program).  ``VirtualSequencer.prepare``
 now compiles a table to a PulseSequence and returns a RuntimeSequenceProgram, exactly like the real
-RuntimeSequencer -- so the SAME on_pulse code runs on both backends (only connect() differs).
+VirtualSequencer -- so the SAME on_pulse code runs on both backends (only connect() differs).
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ def test_on_pulse_finite_and_continuous_on_virtual():
 
 def test_virtual_sequencer_prepare_accepts_pulse_table_state_and_returns_program():
     """Lowest level: VirtualSequencer.prepare(PulseTableState) compiles to a RuntimeSequenceProgram
-    (the polymorphic prepare the real RuntimeSequencer also satisfies) -- no TypeError on the
+    (the polymorphic prepare the real VirtualSequencer also satisfies) -- no TypeError on the
     'channels' kwarg, no None return."""
     from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
 

@@ -31,7 +31,6 @@ from .devices import (
     PulseController,
     RemoteSequencer,
     RuntimeSequenceProgram,
-    RuntimeSequencer,
     SequencerDevice,
     SequencerService,
     TrapArrayDevice,
@@ -57,7 +56,6 @@ from .devices import (
 # missing library / empty bus), and a class-less bus scanner registers as a named provider.
 from .devices.discovery import DiscoveredDevice, discovery_note, register_discovery_provider
 from .views import image_to_points, plot_detection_image, plot_detection_scan, plot_image, plot_site_values, plot_threshold_hist
-from .devices import VerilogSequencer
 from .timing import (
     ANALOG_BUS_MODES,
     Pulse,
@@ -235,7 +233,6 @@ __all__ = [
     "RemoteSequencer",
     "ResultObject",
     "RuntimeSequenceProgram",
-    "RuntimeSequencer",
     "SequencerDevice",
     "SequencerService",
     "SitePSF",
@@ -246,7 +243,6 @@ __all__ = [
     "TrapCalibration",
     "VerilogBuild",
     "VerilogFiles",
-    "VerilogSequencer",
     "VirtualCamera",
     "VirtualSequencer",
     "VirtualTrapArray",
