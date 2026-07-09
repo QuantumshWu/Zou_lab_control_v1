@@ -25,6 +25,7 @@
 `define ZLC_EVT_FIFO_DEPTH      64
 `define ZLC_BUS_EVT_FIFO_DEPTH  32
 `define ZLC_NUM_DELAY_CH        18
+`define ZLC_DELAY_CH_IDX_W      6
 `define ZLC_DELAY_REG_WORDS     128
 `define ZLC_LAYOUT_FINGERPRINT  32'h5A87FD36
 `endif // ZLC_GEOMETRY_VH

@@ -199,6 +199,9 @@ read_verilog [file join $script_dir zlc_uart_bridge.v]
 read_verilog [file join $script_dir zlc_pulse_streamer_top.v]
 read_xdc $xdc_path
 set_property top $top [current_fileset]
+# The .v sources `include "zlc_geometry.vh"; add its dir to the include path explicitly so header
+# resolution never depends solely on Vivado's default (search the including file's own dir).
+set_property include_dirs $script_dir [current_fileset]
 # The top's geometry PARAMETERS default to macros in zlc_geometry.vh (the .v `include it), which
 # build_and_program.bat regenerates from streamer_config.json before this runs -- so editing the
 # config changes the synthesized bitstream + the LAYOUT_FINGERPRINT with NO -generic overrides here.

@@ -538,6 +538,27 @@ module zlc_pulse_streamer_top #(
         end
     end
 
+    // --- delay-channel map DERIVED from the config header (not a hand-written literal) --------
+    // The board lays the real TTL outputs FIRST, so the delay-eligible set is the contiguous leading
+    // NUM_DELAY_CH channels (image.num_delay_ch) and the slot->channel map is the identity.  Deriving
+    // NUM_DELAY_CH / DELAY_CH_IDX_W / the map from zlc_geometry.vh (vs the old {17..0} literal) closes
+    // a fingerprint-invisible blind spot: a channel_count/bus_count/bus_width change moves the count
+    // AND its map TOGETHER, so a rebuilt bitstream can never orphan a delay-eligible channel while the
+    // connect fingerprint reads green.  Byte-identical to the old literal at the shipped geometry
+    // (18 entries, {17..0}); pinned by test_all_geometry_params_config_matches_rtl_defaults.
+    localparam integer DLY_NUM  = `ZLC_NUM_DELAY_CH;
+    localparam integer DLY_IDXW = `ZLC_DELAY_CH_IDX_W;
+    function [DLY_NUM*DLY_IDXW-1:0] zlc_delay_identity_map;
+        input dummy;
+        integer i;
+        begin
+            zlc_delay_identity_map = {(DLY_NUM*DLY_IDXW){1'b0}};
+            for (i = 0; i < DLY_NUM; i = i + 1)
+                zlc_delay_identity_map[i*DLY_IDXW +: DLY_IDXW] = i[DLY_IDXW-1:0];
+        end
+    endfunction
+    localparam [DLY_NUM*DLY_IDXW-1:0] DLY_MAP = zlc_delay_identity_map(1'b0);
+
     // --- the FINAL edge-table engine ------------------------------------------
     zlc_edge_streamer #(
         .CHANNEL_COUNT(CHANNEL_COUNT), .EDGE_ADDR_WIDTH(EDGE_ADDR_WIDTH),
@@ -550,15 +571,14 @@ module zlc_pulse_streamer_top #(
         // validator rejects programs that would overflow this depth.
         .EVT_DEPTH(EVT_FIFO_DEPTH),
         .BUS_EVT_DEPTH(BUS_EVT_FIFO_DEPTH),
-        // Event FIFOs are COMPACTED to the delay-eligible channels (the real TTL outputs
-        // ch0..17): the 40 bus-member bits (pins driven by bus_out) and the 4 da_clk
-        // pins are NOT delay targets, so they get no FIFO -- this is what keeps the deep
-        // EVT_DEPTH event RAM inside the 400 Kb distributed-RAM budget.  For THIS board
-        // the eligible channels are the contiguous first 18, so the slot->channel map is
-        // the identity.  The host must never place a delay on channel >= 18.
-        .DELAY_COMPACT(1), .NUM_DELAY_CH(18), .DELAY_CH_IDX_W(6),
-        .DELAY_CH_MAP({6'd17,6'd16,6'd15,6'd14,6'd13,6'd12,6'd11,6'd10,6'd9,
-                       6'd8,6'd7,6'd6,6'd5,6'd4,6'd3,6'd2,6'd1,6'd0}),
+        // Event FIFOs are COMPACTED to the delay-eligible channels (the real TTL outputs): the
+        // bus-member bits (pins driven by bus_out) and the da_clk pins are NOT delay targets, so they
+        // get no FIFO -- this is what keeps the deep EVT_DEPTH event RAM inside the 400 Kb
+        // distributed-RAM budget.  The count + slot->channel map are DERIVED from the config header
+        // (identity of the leading DLY_NUM channels; see the localparams above) so they can never
+        // drift from image.num_delay_ch.  The host must never place a delay on channel >= DLY_NUM.
+        .DELAY_COMPACT(1), .NUM_DELAY_CH(DLY_NUM), .DELAY_CH_IDX_W(DLY_IDXW),
+        .DELAY_CH_MAP(DLY_MAP),
         // RD_LAT = the forced edge-BRAM read latency.  FIFO_DEPTH = RD_LAT + 2: the prefetch
         // pipeline is RD_LAT+1 deep (the registered edge_raddr adds a cycle before the BRAM),
         // so sustaining 1-tick playback needs a resident head + (RD_LAT+1) in-flight slots.

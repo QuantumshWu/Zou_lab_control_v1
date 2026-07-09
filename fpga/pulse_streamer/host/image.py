@@ -1032,7 +1032,7 @@ def default_params(path: str | Path | None = None) -> StreamerParams:
 # id of the default build" (tests, the UART/AXI bridge models) use this constant; the per-session
 # connect-check uses build_fingerprint(session.params) so a custom-geometry session is verified
 # against ITS OWN geometry, not the default.
-REGISTER_LAYOUT_ID = build_fingerprint(default_params())
+REGISTER_LAYOUT_ID = build_fingerprint(StreamerParams())
 
 
 def default_part(path: str | Path | None = None) -> str:
@@ -1149,6 +1149,7 @@ _GEOMETRY_VH_MACROS = (
     ("ZLC_EVT_FIFO_DEPTH", "evt_fifo_depth"),
     ("ZLC_BUS_EVT_FIFO_DEPTH", "bus_evt_fifo_depth"),
     ("ZLC_NUM_DELAY_CH", "num_delay_ch"),
+    ("ZLC_DELAY_CH_IDX_W", "channel_bit_width"),
     ("ZLC_DELAY_REG_WORDS", "delay_region_words"),
 )
 
@@ -1197,6 +1198,8 @@ def emit_geom_tcl(params: "StreamerParams") -> str:
     ``\\`include`` -- NOT from ``-generic`` overrides -- so there is ONE geometry bridge and no
     duplicated generic list to keep in sync.  When the env var is unset, create_project.tcl falls
     back to its in-file literals, so the shipped build is byte-identical."""
+    check_rtl_assumptions(params)   # same gate as emit_geometry_vh: an invalid config fails BOTH
+    #                                 emitters together, never writing a half-updated .vh/geom.tcl pair
     ip = build_ip_sizes(params)
     return (
         "# AUTO-GENERATED from streamer_config.json by image.emit_geom_tcl -- do not edit.\n"

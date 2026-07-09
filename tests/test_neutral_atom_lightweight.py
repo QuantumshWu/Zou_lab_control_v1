@@ -6159,15 +6159,29 @@ def test_all_geometry_params_config_matches_rtl_defaults():
     # the R_DELAY region span is the header macro too (so it tracks delay_region_words).
     assert re.search(r"R_DELAY_WORDS\s*=\s*`ZLC_DELAY_REG_WORDS", top), "R_DELAY_WORDS must come from the header macro"
 
-    # (4) config == StreamerParams default (belt for the offline airbag); pin-coupled NUM_DELAY_CH
-    # literal == num_delay_ch == header macro; tb uses the fingerprint macro (never a stale literal).
+    # (4) config == StreamerParams default (belt for the offline airbag); the delay-channel count +
+    # map are DERIVED from the header (identity of the leading num_delay_ch channels) NOT hand-written
+    # literals -- so a channel_count/bus_count/bus_width change moves the count AND its map together
+    # (closes the fingerprint-invisible num_delay_ch blind spot); tb uses the fingerprint macro.
     direct = ("channel_count", "tick_width", "num_slots", "coeff_width", "coeff_frac_bits", "bus_count",
               "bus_width", "bus_seg_addr_width", "bus_sel_width", "bank_size", "evt_fifo_depth", "bus_evt_fifo_depth")
     for field in direct:
         assert int(cfg[field]) == getattr(p, field), f"streamer_config.json {field} != StreamerParams default"
-    m = re.search(r"\.NUM_DELAY_CH\((\d+)\)", top)
-    assert m and int(m.group(1)) == p.num_delay_ch == int(macros["ZLC_NUM_DELAY_CH"]), (
-        f"top.v .NUM_DELAY_CH({m and m.group(1)}) must equal num_delay_ch {p.num_delay_ch} (== header macro)")
+    # the header macro carries num_delay_ch, and the engine instance uses the DERIVED count/idx-width/
+    # map (DLY_NUM/DLY_IDXW/DLY_MAP) -- never a bare literal like .NUM_DELAY_CH(18) / a {17..0} literal.
+    assert int(macros["ZLC_NUM_DELAY_CH"]) == p.num_delay_ch, "header ZLC_NUM_DELAY_CH != image.num_delay_ch"
+    assert int(macros["ZLC_DELAY_CH_IDX_W"]) == p.channel_bit_width, "header ZLC_DELAY_CH_IDX_W != channel_bit_width"
+    assert re.search(r"DLY_NUM\s*=\s*`ZLC_NUM_DELAY_CH", top) and re.search(r"DLY_IDXW\s*=\s*`ZLC_DELAY_CH_IDX_W", top)
+    assert ".NUM_DELAY_CH(DLY_NUM)" in top and ".DELAY_CH_IDX_W(DLY_IDXW)" in top and ".DELAY_CH_MAP(DLY_MAP)" in top, \
+        "engine instance must use the DERIVED delay-map params, not hand-written literals"
+    assert "zlc_delay_identity_map" in top and re.search(r"DLY_MAP\s*=\s*zlc_delay_identity_map", top), \
+        "top.v must build DELAY_CH_MAP as the config-derived identity map"
+    # the derived identity map (slot s -> channel s) must be BIT-IDENTICAL to the old hand-written
+    # {17..0} literal for the shipped geometry (proves the RTL refactor changed no synthesized value).
+    w = p.channel_bit_width
+    derived = sum((i & ((1 << w) - 1)) << (i * w) for i in range(p.num_delay_ch))
+    old_literal = sum((k & ((1 << w) - 1)) << (k * w) for k in range(p.num_delay_ch))  # {n-1..0}
+    assert derived == old_literal
     assert "`ZLC_LAYOUT_FINGERPRINT" in tb, "tb_uart_read_tap.v LAYOUT must use the header macro, not a literal"
 
 
