@@ -2633,43 +2633,52 @@ def test_dac_ramp_from_a_scanned_edge_carries_the_scanned_level_via_the_register
                                    point_index, bus_width=2) == code
 
 
-def test_delayed_scanned_ramp_capacity_is_enforced():
-    """A ramp on a DELAYED bus is the one realistic per-DA-bit event-FIFO stressor: every
-    Bresenham stepping tick inside the delay window is an in-flight event.  The validator
-    must reject when min(delay, span, swing) exceeds the per-bit FIFO depth -- with the
-    full-scale worst case for a SCANNED endpoint -- and pass the same ramp undelayed or
-    delay-bounded."""
+def test_delayed_bus_segment_fifo_capacity_is_enforced():
+    """The redesigned per-bus DAC delay is INSTRUCTION-LEVEL: it buffers one descriptor per
+    RESOLVED segment (edge/ramp), NOT one event per Bresenham step.  So capacity is bounded by the
+    NUMBER OF SEGMENTS in flight (density/swing-independent): a single dense/long/scanned ramp is
+    ONE descriptor and always fits, while a REPEAT_FOREVER program whose segments-per-frame times
+    the frames spanned by the delay window exceed the per-bus segment FIFO is rejected.  (A single
+    frame can never overflow: its static segment count is already bounded by max_bus_segments, so
+    only a delay window spanning many frames -- ceil(d / frame) of them -- can.)"""
 
-    import dataclasses
     import pytest
     from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeBusSegment, RuntimeBusDelay
+    from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
+    depth = fps.BUS_EVT_FIFO_DEPTH                        # single source (board config)
 
-    def prog(span_ticks, delay_ticks, *, sel=1):
-        ticks = [0, span_ticks + 100]
+    def rf_prog(n_seg, frame, delay_ticks):
+        # repeat_forever, n_seg static edge segments per frame, frame ticks long
+        segs = [RuntimeBusSegment(bus_index=0, start_tick=1 + 2 * k, stop_tick=1 + 2 * k,
+                                  start_value=(k % 400), stop_value=(k % 400), mode="edge",
+                                  value_select=0, stop_value_select=0,
+                                  start_tick_coeffs=[0], stop_tick_coeffs=[0]) for k in range(n_seg)]
         return na.RuntimeSequenceProgram(
             sequence_id=1, sequence_name="r", clock_hz=50e6, channels=["a"],
-            ticks=ticks, masks=[1, 0], duration=(span_ticks + 100) * 20.0,
-            slot_count=1, slot_kinds=["dac"],
-            tick_slot_coeffs=[[0], [0]], loop_end_slot_coeffs=[0],
-            scan_points=[[100], [900]],
-            bus_segments=[RuntimeBusSegment(0, 10, 10 + span_ticks, 512, 0, "ramp", "da_x",
-                                            0, None, None, stop_value_select=sel)],
-            bus_delays=[RuntimeBusDelay(0, delay_ticks)] if delay_ticks else None,
-        )
+            ticks=[0, frame], masks=[1, 0], duration=frame * 20.0,
+            repeat_forever=True, loop_start_index=0, loop_end_tick=frame, loop_count=1,
+            slot_count=1, slot_kinds=["dac"], tick_slot_coeffs=[[0], [0]], loop_end_slot_coeffs=[0],
+            bus_segments=segs, bus_delays=[RuntimeBusDelay(0, delay_ticks)])
 
-    kw = dict(max_edges=1024, max_scan_points=16, tick_width=32, channel_count=1)
-    # long scanned ramp + long delay -> full-scale worst-case in-flight bound -> reject
-    with pytest.raises(ValueError, match="in flight per DA bit"):
-        na.validate_pulse_streamer_program(prog(2000, 5000), **kw)
-    # the same ramp UNDELAYED passes
-    na.validate_pulse_streamer_program(prog(2000, 0), **kw)
-    # a short delay bounds the window -> passes (min(d, span, delta) <= depth)
-    na.validate_pulse_streamer_program(prog(2000, 64), **kw)
-    # a literal small swing passes even with a long delay (delta bounds it)
-    small = prog(2000, 5000, sel=0)
-    small.bus_segments[0] = dataclasses.replace(
-        small.bus_segments[0], start_value=512, stop_value=512 + 40, stop_value_select=0)
-    na.validate_pulse_streamer_program(small, **kw)
+    kw = dict(max_edges=4096, max_scan_points=16, tick_width=32, channel_count=1)
+    # 8 segments/frame, a 100000-tick delay spanning 1000 frames -> ~8000 descriptors in flight
+    # (>> the FIFO) -> reject, with the SEGMENT-count message (not a per-value-change one).
+    with pytest.raises(ValueError, match="segment descriptors sit in flight"):
+        na.validate_pulse_streamer_program(rf_prog(8, 100, 100000), **kw)
+    # the same 8 segments/frame with a SHORT delay (spans 2 frames -> 16 in flight) passes
+    na.validate_pulse_streamer_program(rf_prog(8, 100, 200), **kw)
+
+    # A single DENSE, LONG, SCANNED ramp is ONE descriptor -> passes even with a huge delay on a
+    # FINITE program (windows=1): the whole point of the redesign -- density/swing no longer matter.
+    dense = na.RuntimeSequenceProgram(
+        sequence_id=1, sequence_name="r", clock_hz=50e6, channels=["a"],
+        ticks=[0, 3000], masks=[1, 0], duration=3000 * 20.0,
+        slot_count=1, slot_kinds=["dac"], tick_slot_coeffs=[[0], [0]], loop_end_slot_coeffs=[0],
+        scan_points=[[100], [900]],
+        bus_segments=[RuntimeBusSegment(0, 10, 2510, 512, 0, "ramp", "da_x",
+                                        0, None, None, stop_value_select=1)],
+        bus_delays=[RuntimeBusDelay(0, 100000)])
+    na.validate_pulse_streamer_program(dense, **kw)
 
 
 def test_dac_plus_duration_scan_behavioral_model_value_and_timing():
@@ -5455,36 +5464,6 @@ def test_rtl_delay_line_mirror_matches_physical_delay():
     assert em.rtl_delay_line_mirror([1] * 10, {0: depth + 1}) == [0] * 10  # all pre-delay
 
 
-def test_rtl_bus_delay_line_mirror_matches_physical_delay():
-    """RTL per-DA-bit EVENT-SCHEDULER delay proof: the cycle-exact mirror (g_busdly, each of the
-    bus's bits a 1-bit FIFO sharing the per-bus delay) == bus_delay_line_reference (the bus VALUE
-    stream delayed by d, safe mid-code 512 before t == d) for d=0 (passthrough), d=1 (register),
-    and -- the DAC range is UNIFIED with TTL (the same 32-bit field) -- LARGE d too,
-    as long as no bit's value-change events in flight exceed the FIFO depth.  An over-capacity
-    (per-tick-toggling) delayed stream is BOUNDED by dropping the excess."""
-    from fpga.pulse_streamer.host import engine_model as em
-    import random
-
-    depth = em.BUS_EVT_FIFO_DEPTH
-    rng = random.Random(424242)
-    STEP = 80                                     # value changes every STEP ticks -> <= depth in flight
-    for d in [0, 1, 7, 200, 4000]:                # 4000 >> the old 2048 ring -- valid now
-        n = max(4 * d + 200, 600)
-        vals = [rng.randint(0, 1023) for _ in range(n // STEP + 2)]
-        U = [vals[t // STEP] for t in range(n)]   # sparse stream: per-bit in-flight changes <= depth
-        mirror = em.rtl_bus_delay_line_mirror(U, d)
-        assert mirror == em.bus_delay_line_reference(U, d), f"bus delay != reference at d={d}"
-        assert all(mirror[t] == 512 for t in range(min(d, n))), "DAC bus not held safe (mid code) during startup"
-    U0 = [rng.randint(0, 1023) for _ in range(100)]
-    assert em.rtl_bus_delay_line_mirror(U0, 0) == U0          # d=0 exact passthrough
-    # CAPACITY: bit0 toggling EVERY tick, delayed by d > depth, overflows that bit's FIFO -- the
-    # excess value-change events are DROPPED (bounded, no crash), so it diverges from the ideal.
-    Udense = [(t & 1) * 1 for t in range(4 * depth)]          # bit0 flips every tick
-    over = em.rtl_bus_delay_line_mirror(Udense, depth + 50)
-    assert len(over) == len(Udense)                           # bounded, no crash / no exception
-    assert over != em.bus_delay_line_reference(Udense, depth + 50)   # dropped beyond depth
-
-
 def test_negative_via_global_shift_equals_plus_on_others():
     """A NEGATIVE delay on one channel == +|d| on ALL the others (the host folds the global
     shift G = max(0, -min delay) so the buffer only ever sees delays >= 0).  Assert the
@@ -5547,31 +5526,6 @@ def test_bus_value_at_combinational_equals_bus_play_undelayed():
             fsm = em.bus_play(prog, 0, T, scan_point=sp)
             comb = [em.bus_value_at(prog, 0, t, sp) for t in range(T)]
             assert comb == fsm, f"bus_value_at != bus_play (T={T}, sp={sp})"
-
-
-def test_bus_delay_line_with_scanned_value_and_ramp():
-    """The LITERAL per-bus delay line carries a SCANNED DAC value (value_select) and a RAMP
-    through unchanged: the delayed bus stream (engine_model.rtl_bus_delay_line_mirror of the
-    undelayed bus_value_at stream) == bus_delay_line_reference (the value stream literally
-    delayed by d, safe 0 before t==d) for d in [0, a few thousand] including d > one frame, across
-    several scan points + ramps.  d=0 is exact passthrough; the scanned code reaches the output."""
-    from fpga.pulse_streamer.host import engine_model as em
-    import random
-    rng = random.Random(424242)
-
-    depth = 2048   # a representative bounded delay (no design ring cap any more)
-    # (T, d): sub-frame, across a frame, zero, far-above a frame, and at the bounded depth.
-    battery = [(60, 30), (100, 350), (200, 1000), (50, 0), (100, 1500), (256, depth)]
-    for T, d in battery:
-        prog = _rand_bus_program(rng, n_seg=rng.randint(1, 5), T=T, n_points=3, with_ramps=True)
-        n = d + 4 * T
-        for sp in range(3):
-            undelayed = [em.bus_value_at(prog, 0, t % T, sp) for t in range(n)]   # steady periodic stream
-            rtl = em.rtl_bus_delay_line_mirror(undelayed, d)
-            assert rtl == em.bus_delay_line_reference(undelayed, d), f"bus delay-line != reference (T={T}, d={d}, sp={sp})"
-            assert all(rtl[t] == 512 for t in range(min(d, n))), "DAC bus not held safe (mid code) during startup"
-            if d == 0:
-                assert rtl == undelayed                                          # exact passthrough
 
 
 def test_image_pack_zeros_all_bus_delays_no_stale():
@@ -5689,9 +5643,11 @@ def test_scanned_dac_value_delayed_beyond_one_frame_compiles_and_streams():
 
     n = T * 6
     for sp, code in enumerate(codes):
-        undelayed = [em.bus_value_at(prog, bus, t % T, sp) for t in range(n)]   # the steady stream
-        delayed = em.rtl_bus_delay_line_mirror(undelayed, 50)                   # the literal delay line
-        # the delayed stream is EXACTLY the undelayed stream shifted by d (mid code before t==d).
+        # the redesigned per-bus SEGMENT delay: bus_undelayed_and_log rebuilds the undelayed value
+        # stream from the FSM apply-log, and rtl_bus_segment_delay_mirror re-plays each captured
+        # segment d ticks later -- exactly the undelayed stream shifted by d (mid code before t==d).
+        undelayed, _ = em.bus_undelayed_and_log(prog, bus, n, sp)
+        delayed = em.rtl_bus_segment_delay_mirror(prog, bus, 50, n, scan_point=sp)
         assert delayed == em.bus_delay_line_reference(undelayed, 50)
         # the scanned DAC code really reaches the (delayed) bus output for this point.
         assert code in set(delayed)
@@ -5724,8 +5680,8 @@ def test_fixed_dac_bus_delayed_beyond_one_frame_compiles_and_streams():
     bus = int(prog.bus_delays[0].bus_index)
     assert max(int(s.start_tick) for s in prog.bus_segments) <= T    # segments at NOMINAL phase
     n = T * 6
-    undelayed = [em.bus_value_at(prog, bus, t % T, 0) for t in range(n)]
-    delayed = em.rtl_bus_delay_line_mirror(undelayed, 50)
+    undelayed, _ = em.bus_undelayed_and_log(prog, bus, n, 0)
+    delayed = em.rtl_bus_segment_delay_mirror(prog, bus, 50, n)   # instruction-level segment delay
     assert delayed == em.bus_delay_line_reference(undelayed, 50)
     assert 3 in set(delayed)
 
@@ -5736,7 +5692,10 @@ def test_edge_streamer_has_literal_delay_line_path():
           event FIFO instantiated in the g_evtfifo generate loop (a flat 3D reg array with
           independent per-slot pointers does NOT infer as RAM -> 226k FF, does not fit), plus
           the free-running g_time + prev_undelayed register for d==1.  SRL lines are GONE;
-      (2) DAC = the per-DA-bit event FIFO (g_busdly), one delay shared by the bus's bits;
+      (2) DAC = the per-bus INSTRUCTION-LEVEL segment FIFO (g_busseg): one FIFO of RESOLVED segment
+          descriptors (sfifo) shared by the bus's bits, captured at apply (bus_seg_emit = g_time+d)
+          and re-played d ticks later -- so a delayed dense ramp costs ONE descriptor, not ~span
+          events (the old per-DA-bit value FIFO g_busdly is GONE);
       (3) the disjoint merge out = (state_mask & ~delayed_mask) | delayed_out;
       (4) the top has the 32b/channel DELAY register region wired to the engine."""
     import pathlib
@@ -5755,9 +5714,13 @@ def test_edge_streamer_has_literal_delay_line_path():
     # comment explaining why, but never as a real reg array)
     assert "reg [GTIME_WIDTH:0] evt_mem" not in eng
     assert "evt_mem [" not in eng
-    # (2) bus ring + pointers + held delays
-    for tok in ("g_busdly", "del_ch_ticks", "del_bus_ticks", "BUS_EVT_DEPTH", "bfifo"):
+    # (2) per-bus segment-descriptor FIFO + re-player + held delays; the old per-DA-bit value
+    # FIFO (g_busdly / bfifo) is GONE.
+    for tok in ("g_busseg", "sfifo", "bus_seg_emit", "del_ch_ticks", "del_bus_ticks", "BUS_EVT_DEPTH"):
         assert tok in eng, tok
+    # the old per-DA-bit value-FIFO generate block + its regs are gone (the NAME may survive in a
+    # comment explaining what replaced it, but never as a real generate label / reg array).
+    assert ": g_busdly" not in eng and "bfifo" not in eng
     assert 'ram_style = "distributed"' in eng
     # (3) the disjoint merge
     assert "(state_mask & ~delayed_mask) | delayed_out" in eng
