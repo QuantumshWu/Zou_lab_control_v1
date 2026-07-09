@@ -123,6 +123,13 @@ def reduce_repeat(raw, mode: str = "average", *, core_ndim=None, hist=False):
         a = np.asarray(a, dtype=float)
     if not _has_repeat_axis(a, core_ndim):              # not a repeat block -> leave as-is (a hist with no
         return a.reshape(-1) if hist else a             # repeat axis is just ONE sample set -> flatten)
+    if a.shape[0] == 1 and a.dtype.kind in "iub" and mode != "create":
+        # ONE integer repeat slice (the live camera's ring_depth-1 stream): average / add /
+        # replace / roll / pool of a single gap-free slice ARE that slice, so return the
+        # native zero-copy view instead of materialising a float64 mean of a 2.3 MP frame
+        # every tick.  ``create`` keeps its column layout; float blocks keep NaN semantics.
+        out = a[0]
+        return out.reshape(-1) if hist else out
     if a.dtype.kind in "iub":
         idx = np.arange(a.shape[0])                     # integer block: every repeat slice holds data
     else:

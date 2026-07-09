@@ -132,14 +132,24 @@ class SignalExpr:
         resolved = [_get(n) for n in self.inputs]
         return (resolved[0] if resolved else None) if len(resolved) <= 1 else resolved
 
-    def co_names(self) -> frozenset:
-        """The hub-signal names this expression reads: the identifiers it names directly PLUS
-        the picked slot inputs (the default ``value = signal`` references the pseudo ``signal``,
-        not a real name, so the inputs must be folded in for version-gating)."""
+    def direct_names(self) -> frozenset:
+        """ONLY the identifiers the source TEXT itself names (the compiled ``co_names``,
+        no folded-in slot inputs).  This is the raw-signal detector's set: a consumer that
+        must slice per repeat exactly the blocks the expression READS BY NAME must not
+        mistake the bound slot (fed through ``signal``) for a directly-named block --
+        that mistake made the default identity source lose its zero-copy path and
+        float64-materialise every camera frame per tick (W-round regression)."""
         try:
-            names = set(_compile_source(self.source).co_names)
+            return frozenset(_compile_source(self.source).co_names)
         except Exception:
-            names = set()
+            return frozenset()
+
+    def co_names(self) -> frozenset:
+        """The hub-signal names this expression reads: the identifiers it names directly
+        (:meth:`direct_names`) PLUS the picked slot inputs (the default ``value = signal``
+        references the pseudo ``signal``, not a real name, so the inputs must be folded in
+        for version-gating)."""
+        names = set(self.direct_names())
         names.update(n for n in self.inputs if n)
         return frozenset(names)
 

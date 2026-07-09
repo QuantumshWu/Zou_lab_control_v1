@@ -3301,9 +3301,13 @@ class PanelCard(FluentGroupBox):
         # explicitly when wanted).  The site-map underlay coherence is handled separately (#_sites_aux).
         sig = expr.signal_for(namespace)
         slots = sig if isinstance(sig, list) else [sig]
-        # raw hub signals the source NAMES directly (not via ``signal``) that carry a repeat axis -- these
-        # are NOT the bound signal, so they keep the ndim>=3 rule (no per-signal core_ndim for them).
-        raw_names = [n for n in expr.co_names()
+        # raw hub signals the source TEXT names directly (not via ``signal``) that carry a repeat
+        # axis -- these are NOT the bound signal, so they keep the ndim>=3 rule (no per-signal
+        # core_ndim for them).  MUST be direct_names(), never co_names(): co_names folds the bound
+        # inputs in for version-gating, and treating the bound slot as a "raw" name here disabled
+        # the identity zero-copy path below for EVERY bound panel (a 17.6 MiB float64 stack of the
+        # camera frame per panel per tick).
+        raw_names = [n for n in expr.direct_names()
                      if n != "signal" and np.ndim(namespace.get(n)) >= 3]
         sig_rep = bool(slots) and all(_slot_has_repeat(s) for s in slots)
         if not sig_rep and not raw_names:                         # no repeat axis -> evaluate once
