@@ -335,10 +335,10 @@ class LogicNode:
         published.
         """
 
-        try:
-            specs = {str(spec.name): spec for spec in self.output_specs()}
-        except Exception:
-            return
+        # LOUD by design: a node whose own output_specs() raises is a broken declaration -- swallowing
+        # it here silently downgraded image streams to the deep default ring (8 -> 2048 frames of
+        # 2.3 MP each), a multi-GiB failure mode far worse than the traceback.
+        specs = {str(spec.name): spec for spec in self.output_specs()}
         for name in names:
             spec = specs.get(str(name))
             if spec is not None:
@@ -766,20 +766,22 @@ class Measurement(LogicNode):
                     f"{type(self).__name__} publishes primary block {key!r} but points_shape is empty: every "
                     "measurement block is (repeat, data_points, *data_dim) with the data_points axis PRESENT "
                     "-- set points_shape=(1,) for a no-scan acquisition, or (n_points,) for a scan (#iron-law).")
-            # The block's first axis is the RING DEPTH actually published = ``max(1, repeat)`` (a
-            # finite run keeps ``repeat`` slices; ``repeat=0`` = ∞ keeps a 1-deep rolling ring), NOT
-            # the raw ``repeat`` -- so 0 = ∞ does not false-trip this contract guard.
+            # The block's first axis is the number of repeat slices that HOLD DATA so far: a block
+            # grows 1..ring as shots land (a producer never publishes NaN-padded not-yet-taken
+            # slices, so the block stays NATIVE dtype and only as large as the data that exists).
+            # ``ring`` = max(1, repeat) is the CAP (``repeat=0`` = ∞ keeps a 1-deep rolling ring).
             # Resolve the ring depth defensively: a new measurement subclass that sets primary_signal
             # but forgot _ring/repeat should still get this guard's CLEAR shape message, not a cryptic
             # AttributeError from an eagerly-evaluated default (getattr's default arg always evaluates).
             ring = int(getattr(self, "_ring", 0)) or max(1, int(getattr(self, "repeat", 1)))
-            expected = (ring, *tuple(self.points_shape), *tuple(self.data_shape))
-            if block.shape != expected:
+            expected_tail = (*tuple(self.points_shape), *tuple(self.data_shape))
+            if block.shape[1:] != expected_tail or not 1 <= block.shape[0] <= ring:
                 raise ValueError(
                     f"{type(self).__name__} primary block {key!r} has shape {block.shape}, but the "
-                    f"measurement output contract requires {expected} = (ring, *points_shape, *data_shape) "
-                    "with ring = max(1, repeat); set points_shape/data_shape (and fill the ring axis) to "
-                    "match what you publish.")
+                    f"measurement output contract requires (filled, *points_shape, *data_shape) = "
+                    f"(1..{ring}, *{tuple(self.points_shape)}, *{tuple(self.data_shape)}) with the leading "
+                    "axis = repeat slices holding data (never NaN-padded); set points_shape/data_shape "
+                    "(and fill the ring axis) to match what you publish.")
         return out
 
 
@@ -1817,22 +1819,24 @@ class CameraMeasurement(Measurement):
             self._filled += 1
             return self._assert_primary_shape(out)       # frame_0 == (1, 1, H, W) -- contract guard
 
-        frames = [np.asarray(f, dtype=float) for f in frames]
-        f0 = frames[0]
-        if self._rings is None or len(self._rings) != n or self.data_shape != f0.shape:
+        if (self._rings is None or len(self._rings) != n or self.data_shape != f0.shape
+                or self._rings[0].dtype != f0.dtype):
             self.data_shape = tuple(f0.shape)            # (H, W) -- the per-point DATA shape
-            self._rings = [np.full((self._ring, 1, *self.data_shape), np.nan, dtype=float)
+            self._rings = [np.zeros((self._ring, 1, *self.data_shape), dtype=f0.dtype)
                            for _ in range(n)]            # ONE repeat block per emCCD event of the cycle
             self._filled = 0
         out: dict[str, object] = {}
         keys = camera_frame_keys(n)                      # the single source of the per-event names
+        filled_after = min(self._filled + 1, self._ring)
         for i, fi in enumerate(frames):                  # fill EACH event's own ring, publish its block
             # finite: FILL the next slot of the K-deep block
             self._rings[i][min(self._filled, self._ring - 1), 0] = fi
-            # ``frame_i`` IS event i's (repeat, 1, H, W) block (NaN = not-yet-taken) -- a panel reduces
-            # its repeat axis (average = long exposure of THAT emCCD event).  No lumped ``frame``.
-            out[keys[i]] = self._rings[i].copy()
-        self._filled = (self._filled + 1) if self.repeat <= 0 else min(self._filled + 1, self.repeat)
+            # ``frame_i`` IS event i's block SO FAR: a NATIVE-dtype (filled, 1, H, W) view -- only the
+            # repeats that exist are published (no NaN padding, no float64 expansion, no copy here:
+            # the hub's ``_stored_array`` makes the one defensive copy).  A panel reduces the repeat
+            # axis (average = long exposure of THAT emCCD event).  No lumped ``frame``.
+            out[keys[i]] = self._rings[i][:filled_after]
+        self._filled = filled_after
         if self.finished:                                # take exactly K cycles, then stop
             self._stop.set()
         return self._assert_primary_shape(out)           # frame_0 == (repeat, 1, H, W) -- contract guard

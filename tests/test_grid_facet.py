@@ -407,7 +407,8 @@ def test_add_panel_grid_shows_every_repeat_as_a_cell_and_rows_follow_the_kind(mo
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     console, node = _camera_console(repeat=4)
     try:
-        node.step()
+        for _ in range(4):
+            node.step()            # fill all 4 repeats: a block carries only repeats HOLDING data
         kc = console.kind_combo
         kc.setCurrentIndex(next(i for i in range(kc.count()) if kc.itemText(i) == "Plot: Site grid"))
         console._add_panel()

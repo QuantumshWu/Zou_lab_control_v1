@@ -38,14 +38,17 @@ def test_two_triggers_publish_frame_0_and_frame_1():
     for _ in range(2):
         cam_node.step()
 
-    # ONE signal per emCCD event, each its OWN (repeat, 1, H, W) block; NO lumped ``frame``.
+    # ONE signal per emCCD event, each its OWN (filled, 1, H, W) block; NO lumped ``frame``.
+    # The block carries exactly the repeats that HOLD DATA (2 of the 4 requested after 2 steps)
+    # in the camera's native dtype -- never NaN-padded to full ring depth.
     assert set(cam_node.published_signals()) == {"frame_0", "frame_1"}
     b0 = np.asarray(hub.latest("frame_0"))
     b1 = np.asarray(hub.latest("frame_1"))
     for b in (b0, b1):
-        assert b.shape == (4, 1, 40, 50)                       # (repeat, 1, H, W) block per event
+        assert b.shape == (2, 1, 40, 50)                       # (filled, 1, H, W) block per event
+        assert b.dtype.kind in "iu"                            # native camera dtype, no float64 balloon
     # the two emCCD events are DISTINCT images, each stacked across repeats in its own ring
-    assert not np.array_equal(np.nan_to_num(b0), np.nan_to_num(b1))
+    assert not np.array_equal(b0, b1)
 
 
 def test_default_is_single_event_frame_0_only():

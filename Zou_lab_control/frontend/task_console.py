@@ -2652,7 +2652,9 @@ class PanelCard(FluentGroupBox):
     def _facet_cells(self, value):
         """Slice the bound block into the per-cell inputs through the ONE rule (live.facet_cells)."""
         from .live import facet_cells
-        block = np.asarray(value, dtype=float)
+        block = np.asarray(value)                 # NATIVE dtype (uint8 camera block stays uint8);
+        if block.dtype.kind not in "iubf":        # only non-numeric results normalize to float
+            block = np.asarray(block, dtype=float)
         if block.ndim < 2:
             raise ValueError(
                 "a facet grid slices the bound signal's (repeat, points, *data_dim) block; got shape "
@@ -3228,7 +3230,9 @@ class PanelCard(FluentGroupBox):
         if isinstance(block, (list, tuple)):                      # a free expression returned a list
             self._repeat_cur = 1
             return np.asarray(block, dtype=float)
-        b = np.asarray(block, dtype=float)
+        b = np.asarray(block)                                     # NATIVE dtype: a uint8 camera block must
+        if b.dtype.kind not in "iubf":                            # not balloon to float64 here (17.6 MiB/frame);
+            b = np.asarray(b, dtype=float)                        # only non-numeric results normalize to float
         if had_repeat and self.config.kind == "1d" and core_ndim is None and b.ndim == 2:
             b = b[:, :, None]                                     # legacy (repeat, points) -> add dim axis
         # a repeat block (axis 0 = repeat) -- structure-driven when core_ndim is declared, else ndim>=3
@@ -3285,7 +3289,8 @@ class PanelCard(FluentGroupBox):
             return expr.exec_in(ns), False
         if sig_rep and not raw_names and len(slots) == 1 \
                 and str(self._compiled_source).strip() == DEFAULT_SOURCE:
-            return np.asarray(slots[0], dtype=float), True        # identity: the block IS the value
+            return np.asarray(slots[0]), True                     # identity: the block IS the value, NATIVE
+        # dtype (a uint8 camera block passes through untouched -- no float64 balloon per tick)
         raw = {n: np.asarray(namespace[n], dtype=float) for n in raw_names}
         sl = [np.asarray(s, dtype=float) for s in slots] if sig_rep else None
         R = int((sl[0] if sig_rep else raw[raw_names[0]]).shape[0])

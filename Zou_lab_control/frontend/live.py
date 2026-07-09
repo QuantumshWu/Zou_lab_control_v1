@@ -114,11 +114,20 @@ def reduce_repeat(raw, mode: str = "average", *, core_ndim=None, hist=False):
     (the dis bins all of it), and ``create`` keeps each repeat's WHOLE flattened core as its own column
     ``(n_samples, R)`` = one histogram per repeat.  This is why a trace and a histogram, whose blocks can
     be the SAME ndim (``(R, points, dim)`` vs ``(R, 1, n_sites)``), need the kind to pick the layout."""
-    a = np.asarray(raw, dtype=float)
+    # NATIVE dtype passthrough: an integer block (a camera's uint8/uint16 stream) cannot carry NaN
+    # sentinels, so the whole isfinite machinery is skipped and every repeat slice holds data --
+    # no float64 expansion of a 2.3 MP frame just to ask "is it finite".  Float blocks (a scan's
+    # NaN-prefilled measurement array) keep the sentinel semantics unchanged.
+    a = np.asarray(raw)
+    if a.dtype.kind not in "iub":
+        a = np.asarray(a, dtype=float)
     if not _has_repeat_axis(a, core_ndim):              # not a repeat block -> leave as-is (a hist with no
         return a.reshape(-1) if hist else a             # repeat axis is just ONE sample set -> flatten)
-    has = np.isfinite(a).any(axis=tuple(range(1, a.ndim)))   # which repeat slices hold any data
-    idx = np.flatnonzero(has)
+    if a.dtype.kind in "iub":
+        idx = np.arange(a.shape[0])                     # integer block: every repeat slice holds data
+    else:
+        has = np.isfinite(a).any(axis=tuple(range(1, a.ndim)))   # which repeat slices hold any data
+        idx = np.flatnonzero(has)
     if mode == "create":
         cols = idx if idx.size else np.array([0])
         if hist:                                              # a histogram's core is ALL samples (no x-axis):
@@ -131,24 +140,30 @@ def reduce_repeat(raw, mode: str = "average", *, core_ndim=None, hist=False):
         # flatten each repeat's core to a column so there is ONE trace per repeat (NOT per image row).
         return a[cols].reshape(len(cols), -1).T               # (prod(core), R) = x=pixel index, R lines
     if mode == "pool":                                    # histogram: flatten ALL repeats' samples (no reduce)
+        if idx.size == a.shape[0]:                        # every slice holds data -> zero-copy view
+            return a.reshape(-1)
         return (a[idx] if idx.size else a[:1]).reshape(-1)
     if mode == "add":
-        out = np.nansum(a, axis=0)
+        out = a.sum(axis=0) if a.dtype.kind in "iub" else np.nansum(a, axis=0)
         return out.reshape(-1) if hist else out
     if mode in ("replace", "roll"):
         out = a[idx[-1]] if idx.size else a[0]
         return out.reshape(-1) if hist else out
-    out = finite_mean(a, 0)            # 'average': an all-NaN (not-yet-measured) cell -> NaN gap, silently
+    # 'average': an all-NaN (not-yet-measured) cell -> NaN gap, silently; integer blocks have no
+    # gaps by construction, so the plain mean (float result, no float64 copy of the input) suffices.
+    out = a.mean(axis=0) if a.dtype.kind in "iub" else finite_mean(a, 0)
     return out.reshape(-1) if hist else out
 
 
 def repeats_with_data(raw, *, core_ndim=None) -> int:
     """How many repeat slices of a raw block currently hold data (drives the plot's ``xN`` label).
     A non-repeat-block (structure-driven when ``core_ndim`` is given, else the ndim>=3 fallback) -> 1."""
-    a = np.asarray(raw, dtype=float)
+    a = np.asarray(raw)
     if not _has_repeat_axis(a, core_ndim):
         return 1
-    return int(np.count_nonzero(np.isfinite(a).any(axis=tuple(range(1, a.ndim)))))
+    if a.dtype.kind in "iub":                           # integer block: every published slice holds data
+        return int(a.shape[0])
+    return int(np.count_nonzero(np.isfinite(np.asarray(a, dtype=float)).any(axis=tuple(range(1, a.ndim)))))
 
 
 # --- Pulse-plot display margins -------------------------------------------
@@ -254,7 +269,9 @@ def _as_data_x(data_x) -> np.ndarray:
 def _as_data_y(data_y, n: int) -> np.ndarray:
     if data_y is None:
         return np.full((n, 1), np.nan, dtype=float)
-    y = np.asarray(data_y, dtype=float)
+    y = np.asarray(data_y)                    # NATIVE dtype: a uint8 camera vector must not balloon
+    if y.dtype.kind not in "iubf":            # to float64 every tick; non-numeric normalizes to float
+        y = np.asarray(data_y, dtype=float)
     if y.ndim == 1:
         y = y[:, None]
     if y.ndim != 2:
@@ -2201,7 +2218,9 @@ def coerce_panel_value(kind, value, *, structure=None, params=None, repeat_mode=
     # A pulse panel's value is a STRUCTURED object (a sequence / PulseTableState) with no array shape.
     if kind == "pulse":
         return value
-    arr = np.asarray(value, dtype=float)
+    arr = np.asarray(value)                  # NATIVE dtype: a uint8/uint16 camera frame passes through
+    if arr.dtype.kind not in "iubf":         # untouched (no float64 balloon on the per-tick path);
+        arr = np.asarray(value, dtype=float)  # only non-numeric values normalize to float
     if kind == "grid":
         # A FACET grid consumes the bound block RAW (repeat, points, *data_dim); facet_cells slices it.
         return arr
@@ -2234,7 +2253,7 @@ def coerce_panel_value(kind, value, *, structure=None, params=None, repeat_mode=
         # Image by structure: a 2-D data core IS the image; a 2-D scan un-flattens to grid_shape; an
         # unknown-structure 2-D value is shown as-is.  NATIVE resolution -- the DISPLAY layer (Live2DDis)
         # block-means only for the screen budget, reversibly (zoom re-slices the full array to 1:1).
-        a = np.asarray(arr, dtype=float)
+        a = arr
         if len(ds) == 2:
             img = np.squeeze(a)
             if img.ndim > 2:
@@ -3835,14 +3854,15 @@ def _collapse_repeat(sliced, repeat_mode: str):
     verbs the standalone kinds use (``average`` mean / ``add`` sum / ``replace`` latest).  A histogram
     cell never calls this: a distribution POOLS every repeat's samples by definition."""
     mode = str(repeat_mode)
+    exact = np.asarray(sliced).dtype.kind in "iub"      # integer slice: no NaN sentinels possible
     if mode == "add":
-        return np.nansum(sliced, axis=0)
+        return np.asarray(sliced).sum(axis=0) if exact else np.nansum(sliced, axis=0)
     if mode == "replace":
-        return np.asarray(sliced[-1], dtype=float)
+        return np.asarray(sliced[-1])                   # NATIVE dtype passthrough (latest repeat)
     # 'average' (and the fallback for any other verb): an all-NaN cell -- the up-front EMPTY grid a
     # scanning task publishes before its first point, or a not-yet-filled facet plane -- collapses to
     # NaN (a blank cell) BY INTENT, through the ONE gap-safe mean so it never warns per empty cell.
-    return finite_mean(sliced, 0)
+    return np.asarray(sliced).mean(axis=0) if exact else finite_mean(sliced, 0)
 
 
 def default_sub_plot_kind(facet, *, points_shape=(), data_shape=()) -> str:
@@ -3886,7 +3906,9 @@ def facet_cells(value, facet, *, sub_plot_kind: str, points_shape=(), repeat_mod
     if spec is None:
         raise ValueError("facet_cells needs an explicit facet; None means a recipe (non-faceted) grid.")
     group, index = spec
-    a = np.asarray(value, dtype=float)
+    a = np.asarray(value)                     # NATIVE dtype (uint8 camera block stays uint8);
+    if a.dtype.kind not in "iubf":            # only non-numeric values normalize to float
+        a = np.asarray(a, dtype=float)
     if a.ndim < 2:
         raise ValueError(f"a facet grid slices a (repeat, points, *data_dim) block; got shape {a.shape}.")
     n_repeat, n_points = int(a.shape[0]), int(a.shape[1])
