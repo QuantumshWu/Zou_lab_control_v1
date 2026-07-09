@@ -8055,6 +8055,12 @@ class TaskConsole(QtWidgets.QWidget):
                 continue                          # nothing this panel shows changed
             if elapsed % card.config.update_ms != 0:
                 continue                          # this panel's beat has not come round yet
+            fig = getattr(card.plotter, "fig", None)
+            if fig is not None and getattr(fig, "_zlc_interacting", False):
+                # the pointer is mid-drag on THIS panel (a selector pull / pan / line drag): a live
+                # recompose under the drag would re-render the whole canvas per shot and stomp the
+                # widget blit backgrounds -- freeze it; it catches up on release (frame key differs).
+                continue
             if dirty and (time.perf_counter() - t0) > budget_s:
                 self._compose_rotor = (start + i) % n_cards   # resume HERE next tick
                 break

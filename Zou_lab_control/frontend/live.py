@@ -474,6 +474,11 @@ class BaseLivePlot:
                                 interpolation="antialiased")
         self.ax.callbacks.connect("xlim_changed", lambda _ax: self._refresh_display_image())
         self.ax.callbacks.connect("ylim_changed", lambda _ax: self._refresh_display_image())
+        # The ZoomPan selector sets BOTH limits per gesture; it batches them (fig._zlc_lim_batch
+        # suppresses the two per-axis callbacks above) and then calls this hook ONCE -- half the
+        # re-decimation cost of every zoom/pan.  Registered on the figure so the selector layer
+        # never imports the plot classes.
+        self.fig._zlc_lim_refresh = self._refresh_display_image
         return artist
 
     def _refresh_display_image(self) -> None:
@@ -483,8 +488,8 @@ class BaseLivePlot:
         from the :meth:`_display_source` hook).  Guarded: set_extent inside the refresh must not
         recurse through the lim callbacks that triggered it."""
         src = self._display_source()
-        if src is None or self._in_display_refresh:
-            return
+        if src is None or self._in_display_refresh or getattr(self.fig, "_zlc_lim_batch", False):
+            return                                       # mid lim-batch: the gesture refreshes once at the end
         array, artist = src
         self._in_display_refresh = True
         try:
@@ -860,6 +865,10 @@ class BaseLivePlot:
         if self._draw_suspended:
             return
         if self._compose_blit():
+            # Blit does NOT fire a draw_event, so widget-cached backgrounds (a RectangleSelector's
+            # useblit snapshot) are now stale; selectors check this mark on drag start and force one
+            # full draw before their first restore (see selectors.begin_figure_interaction).
+            self.fig._zlc_blit_dirty = True
             return
         canvas = getattr(self.fig, "canvas", None)
         # A chrome change / first frame / no data artists: render the WHOLE figure into the Agg buffer.
@@ -868,6 +877,7 @@ class BaseLivePlot:
         # has no offscreen-buffer split -- it renders + pushes in present() (draw_idle), as before.
         if _is_embedded_canvas(canvas):
             canvas.draw()
+            self.fig._zlc_blit_dirty = False   # a real draw re-snapshotted every widget background
 
     def present(self) -> None:
         """Phase 2 of the board's two-phase render: flush the composed buffer to the screen.  On the

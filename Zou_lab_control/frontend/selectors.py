@@ -21,6 +21,34 @@ import numpy as np
 SELECTOR_ZORDER = 50
 
 
+def begin_figure_interaction(fig) -> None:
+    """Mark ``fig`` as under a live pointer interaction (a pan drag, a selector pull, a line drag).
+
+    Two consumers, both decoupled through the figure object (selectors never import live/console):
+
+    * the console's tick SKIPS recomposing a panel whose figure is mid-interaction -- a live data
+      refresh under the pointer costs a full canvas render per shot AND invalidates every
+      widget-cached blit background, which is exactly the "selector fights the live stream" jank.
+      The panel's frame key still differs after release, so it catches up on its next beat.
+    * a panel that has BLITTED since its last full draw (``fig._zlc_blit_dirty``, maintained by
+      ``BaseLivePlot.compose``) gets ONE full ``canvas.draw()`` first: widget-cached backgrounds
+      (a ``RectangleSelector``'s useblit snapshot) are only re-captured on a real draw_event, so
+      without this the drag would restore a STALE frame under the rectangle (ghost image).
+    """
+    fig._zlc_interacting = True
+    if getattr(fig, "_zlc_blit_dirty", False):
+        fig._zlc_blit_dirty = False
+        try:
+            fig.canvas.draw()
+        except Exception:
+            pass
+
+
+def end_figure_interaction(fig) -> None:
+    """Release the live-interaction mark set by :func:`begin_figure_interaction`."""
+    fig._zlc_interacting = False
+
+
 @dataclass
 class PlotState:
     """Small metadata object shared by plots, selectors, and DataFigure."""
@@ -98,6 +126,23 @@ class AreaSelector:
                 artist.set_zorder(SELECTOR_ZORDER)
             except Exception:
                 pass
+        # RectangleSelector has no press hook, so watch the canvas ourselves: a left press inside
+        # the axes begins a live interaction (freezes this panel's recompose + refreshes the
+        # useblit background if the panel blitted since its last full draw), release ends it.
+        self._interacting = False
+        self._cid_ipress = ax.figure.canvas.mpl_connect("button_press_event", self._on_ipress)
+        self._cid_irelease = ax.figure.canvas.mpl_connect("button_release_event", self._on_irelease)
+
+    def _on_ipress(self, event) -> None:
+        if event.button != 1 or event.inaxes != self.ax or not self.selector.get_active():
+            return
+        self._interacting = True
+        begin_figure_interaction(self.ax.figure)
+
+    def _on_irelease(self, event) -> None:
+        if self._interacting:
+            self._interacting = False
+            end_figure_interaction(self.ax.figure)
 
     def _call(self) -> None:
         if self.callback is not None:
@@ -164,6 +209,15 @@ class AreaSelector:
             self.selector.disconnect_events()
         except Exception:
             pass
+        canvas = self.ax.figure.canvas
+        for cid in (self._cid_ipress, self._cid_irelease):
+            try:
+                canvas.mpl_disconnect(cid)
+            except Exception:
+                pass
+        if self._interacting:                    # never leave the panel frozen behind a dead selector
+            self._interacting = False
+            end_figure_interaction(self.ax.figure)
         if self.text is not None:
             try:
                 self.text.remove()
@@ -327,9 +381,22 @@ class ZoomPan:
             self.callback()
 
     def _set_limits(self, xlim, ylim) -> None:
-        self.ax.set_xlim(xlim)
-        if self.image_type == "2D":
-            self.ax.set_ylim(ylim)
+        # Both limits land as ONE view change: the lim-batch flag suppresses the per-axis
+        # xlim_changed/ylim_changed display refresh (each re-slices + re-decimates the full 2.3 MP
+        # array), then the figure's registered refresh hook runs ONCE -- half the decimation cost
+        # of every zoom/pan gesture.  The hook lives on the figure so this layer stays decoupled
+        # from the plot classes (live.py registers it; a plain figure simply has none).
+        fig = self.ax.figure
+        fig._zlc_lim_batch = True
+        try:
+            self.ax.set_xlim(xlim)
+            if self.image_type == "2D":
+                self.ax.set_ylim(ylim)
+        finally:
+            fig._zlc_lim_batch = False
+        refresh = getattr(fig, "_zlc_lim_refresh", None)
+        if refresh is not None:
+            refresh()
 
     def on_scroll(self, event) -> None:
         if event.inaxes != self.ax:
@@ -352,15 +419,12 @@ class ZoomPan:
         if event.dblclick:
             if self.area_selector is not None and self.area_selector.range[0] is not None:
                 xl, xh, yl, yh = self.area_selector.range
-                self.ax.set_xlim(xl, xh)
-                if self.image_type == "2D":
-                    self.ax.set_ylim(yl, yh)
+                self._set_limits((xl, xh), (yl, yh))
             else:
                 state: PlotState | None = getattr(self.ax.figure, "_zlc_state", None)
                 ext = getattr(state, "extents_square", None)
                 if self.image_type == "2D" and ext is not None:
-                    self.ax.set_xlim(ext[0], ext[1])
-                    self.ax.set_ylim(ext[2], ext[3])
+                    self._set_limits((ext[0], ext[1]), (ext[2], ext[3]))
                 else:
                     self._set_limits(self._home_xlim, self._home_ylim)
             self.ax.figure.canvas.draw_idle()
@@ -368,6 +432,7 @@ class ZoomPan:
             return
 
         self.dragging = True
+        begin_figure_interaction(self.ax.figure)   # freeze this panel's live recompose for the drag
         # Anchor the pan in PIXEL space.  event.xdata is expressed in the CURRENT
         # data frame, which the pan itself keeps moving -- mixing the press frame
         # with per-motion frames pushes the pan back into itself and produced the
@@ -388,13 +453,14 @@ class ZoomPan:
         dy_px = float(event.y) - self._press_px[1]
         dx = dx_px * (self._xlim0[1] - self._xlim0[0]) / self._bbox_wh[0]
         dy = dy_px * (self._ylim0[1] - self._ylim0[0]) / self._bbox_wh[1]
-        self.ax.set_xlim(self._xlim0[0] - dx, self._xlim0[1] - dx)
-        if self.image_type == "2D":
-            self.ax.set_ylim(self._ylim0[0] - dy, self._ylim0[1] - dy)
+        self._set_limits((self._xlim0[0] - dx, self._xlim0[1] - dx),
+                         (self._ylim0[0] - dy, self._ylim0[1] - dy))
         self.ax.figure.canvas.draw_idle()
         self._call()
 
     def on_release(self, event) -> None:
+        if self.dragging:
+            end_figure_interaction(self.ax.figure)
         self.dragging = False
         self._press_px = None
 
@@ -405,6 +471,9 @@ class ZoomPan:
                 canvas.mpl_disconnect(cid)
             except Exception:
                 pass
+        if self.dragging:                        # never leave the panel frozen behind a dead selector
+            self.dragging = False
+            end_figure_interaction(self.ax.figure)
 
 
 class DragHLine:
@@ -436,6 +505,8 @@ class DragHLine:
             self.dragging = self.line_l
         elif self._near(event, self.line_h):
             self.dragging = self.line_h
+        if self.dragging is not None:
+            begin_figure_interaction(self.ax.figure)   # freeze this panel's live recompose for the drag
 
     def on_motion(self, event) -> None:
         if self.dragging is None or event.inaxes != self.ax or event.ydata is None:
@@ -450,6 +521,8 @@ class DragHLine:
         self.ax.figure.canvas.draw_idle()
 
     def on_release(self, event) -> None:
+        if self.dragging is not None:
+            end_figure_interaction(self.ax.figure)
         self.dragging = None
 
     def destroy(self) -> None:
@@ -459,6 +532,9 @@ class DragHLine:
                 canvas.mpl_disconnect(cid)
             except Exception:
                 pass
+        if self.dragging is not None:            # never leave the panel frozen behind a dead selector
+            self.dragging = None
+            end_figure_interaction(self.ax.figure)
 
 
 class DragVLine:
@@ -503,6 +579,7 @@ class DragVLine:
             self.dragging = True
             self.ax.figure._zlc_disable_area_once = True
             self._set_area_active(False)
+            begin_figure_interaction(self.ax.figure)   # freeze this panel's live recompose for the drag
 
     def on_motion(self, event) -> None:
         if not self.dragging or event.inaxes != self.ax or event.xdata is None:
@@ -516,6 +593,7 @@ class DragVLine:
     def on_release(self, event) -> None:
         if self.dragging:
             self._set_area_active(True)
+            end_figure_interaction(self.ax.figure)
         self.dragging = False
 
     def destroy(self) -> None:
