@@ -416,12 +416,13 @@ def validate_pulse_streamer_program(
     # ramps), so ANY duration yields the closest realizable staircase to the ideal line,
     # landing exactly on the target at stop_tick.  The preview draws the same staircase
     # (pulse_table._analog_bus_value_at_tick), so what you see is what the DAC does.
-    # Per-bus DAC DELAY -- each DA bit is its OWN event-scheduler channel (the bus's 10 bits
-    # share one delay), so a bus delay has the SAME 32-bit physical range as a TTL channel.
-    # Capacity is bounded by value-change events in flight per bit
-    # (<= the event-FIFO depth), like TTL -- sparse DAC use is far below it; a delayed long ramp is
-    # the only stressor.  Here we enforce the 32-bit field bound; the per-bit in-flight count rides
-    # the same event-FIFO contract as TTL.
+    # Per-bus DAC DELAY -- INSTRUCTION-LEVEL: the delay captures each RESOLVED segment (one
+    # descriptor per edge/ramp, the bus's 10 bits share one delay) and re-plays it d ticks later,
+    # so a bus delay has the SAME 32-bit physical range as a TTL channel.  Capacity is bounded by
+    # SEGMENT descriptors in flight (<= the segment-FIFO depth) -- INDEPENDENT of ramp density or
+    # swing, so a delayed dense/long ramp (one descriptor) is no longer a stressor; only a bus with
+    # very many distinct segments is.  Here we enforce the 32-bit field bound; the in-flight segment
+    # count rides the per-bus segment-FIFO contract.
     bus_delays = list(getattr(program, "bus_delays", None) or [])
     for bd in bus_delays:
         bdi = int(getattr(bd, "bus_index", bd.get("bus_index") if isinstance(bd, Mapping) else 0))
@@ -434,31 +435,19 @@ def validate_pulse_streamer_program(
                 f"(~{TTL_DELAY_MAX_TICKS * 20e-9:.1f} s at 20 ns/tick); reduce the delay.")
         if bdd == 0:
             continue
-        # DELAYED-bus per-DA-bit event-FIFO capacity.  Every bus value change inside the
-        # delay window d is one in-flight event per changing bit, so the bound is the
-        # number of CHANGES in any d-window: an edge segment contributes 1, a ramp up to
-        # min(delta, span) (one per Bresenham stepping tick; a SCANNED endpoint --
-        # value_select != 0 -- takes its full-scale worst case), and under repeat_forever
-        # a window longer than one frame sees ceil(d / frame) frames' worth of changes.
+        # DELAYED-bus SEGMENT-FIFO capacity.  The delay is instruction-level: each RESOLVED
+        # segment the engine applies (one descriptor per edge/ramp, regardless of ramp density or
+        # swing) is captured once and re-played d ticks later, so exactly the segments whose emit
+        # tick has passed but whose (emit + d) has not are in flight.  The bound is the number of
+        # SEGMENTS in any d-window: one per edge, one per ramp -- swing/scan/steepness do NOT matter
+        # (a 25050-tick dense ramp is a single descriptor).  Under repeat_forever a window longer
+        # than one frame sees ceil(d / frame) frames' worth of segments.
         per_frame = 0
-        scanned_any = False
         for seg in (getattr(program, "bus_segments", None) or []):
             sbi = int(getattr(seg, "bus_index", seg.get("bus_index") if isinstance(seg, Mapping) else 0))
             if sbi != bdi:
                 continue
-            smode = str(getattr(seg, "mode", seg.get("mode", "edge") if isinstance(seg, Mapping) else "edge")).lower()
-            if smode != "ramp":
-                per_frame += 1
-                continue
-            s_tick = int(getattr(seg, "start_tick", seg.get("start_tick") if isinstance(seg, Mapping) else 0))
-            e_tick = int(getattr(seg, "stop_tick", seg.get("stop_tick", s_tick) if isinstance(seg, Mapping) else s_tick))
-            v0 = int(getattr(seg, "start_value", seg.get("start_value", 0) if isinstance(seg, Mapping) else 0))
-            v1 = int(getattr(seg, "stop_value", seg.get("stop_value", v0) if isinstance(seg, Mapping) else v0))
-            sel0 = int(getattr(seg, "value_select", seg.get("value_select", 0) if isinstance(seg, Mapping) else 0))
-            sel1 = int(getattr(seg, "stop_value_select", seg.get("stop_value_select", 0) if isinstance(seg, Mapping) else 0))
-            scanned_any = scanned_any or bool(sel0 or sel1)
-            delta = ((1 << bus_width) - 1) if (sel0 or sel1) else abs(v1 - v0)
-            per_frame += min(delta, max(0, e_tick - s_tick))
+            per_frame += 1
         if per_frame == 0:
             continue
         frame_ticks = max(1, int(getattr(program, "loop_end_tick", 0) or 0) or int(program.ticks[-1]))
@@ -466,11 +455,11 @@ def validate_pulse_streamer_program(
         bound = min(bdd, windows * per_frame)
         if bound > BUS_EVT_FIFO_DEPTH:
             raise ValueError(
-                f"bus {bdi}: with a {bdd}-tick delay, up to ~{bound} value-change events sit in "
-                f"flight per DA bit ({per_frame} changes/frame x {windows} frame(s) in the delay "
-                f"window{'; scanned ramp endpoints counted at full scale' if scanned_any else ''}), "
-                f"above the per-bit event FIFO depth {BUS_EVT_FIFO_DEPTH}. Shorten the ramp(s), "
-                f"reduce the bus delay, lower the swing, or raise bus_evt_fifo_depth (rebuild).")
+                f"bus {bdi}: with a {bdd}-tick delay, up to ~{bound} segment descriptors sit in "
+                f"flight ({per_frame} segment(s)/frame x {windows} frame(s) in the delay window), "
+                f"above the per-bus segment FIFO depth {BUS_EVT_FIFO_DEPTH}. Reduce the number of "
+                f"DAC segments on this bus, shorten the bus delay, or raise bus_evt_fifo_depth "
+                f"(rebuild).")
     slot_count = int(getattr(program, "slot_count", 0))
     tick_slot_coeffs = list(getattr(program, "tick_slot_coeffs", None) or [[0] * slot_count for _ in program.ticks])
     if len(tick_slot_coeffs) != len(program.ticks):

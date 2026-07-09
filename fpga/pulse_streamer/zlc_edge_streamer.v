@@ -162,16 +162,15 @@ module zlc_edge_streamer #(
     input  wire [BUS_SEL_WIDTH-1:0] bus_prog_stop_value_select,
     input  wire [BUS_COUNT*(BUS_SEG_ADDR_WIDTH+1)-1:0] bus_counts,
 
-    // PHYSICAL per-bus DAC DELAY -- EVENT-SCHEDULED (see the g_busdly generate below): each DA
-    // BIT is its own 1-bit event-scheduler channel.  The DAC value stream is NOT baked into the
-    // segment ticks; when the engine's UNDELAYED bus value (bus_value_active) changes, the new
-    // level of each bit is queued at {g_time + d_bus - 1} in that bit's event FIFO and pops into
-    // the output exactly d_bus ticks later -> bus_out[t] = bus_undelayed[t - d_bus].  The 10 bits
-    // of a bus SHARE one d (del_bus_ticks[bus]) so the DAC value shifts coherently.  d=0 is exact
-    // passthrough; before the first queued event the gated output holds its FIRE-time 0 -> the bus
-    // is silent until t>=d, for free.  Storage scales with VALUE-CHANGE EVENTS IN FLIGHT (host-
-    // validated <= BUS_EVT_DEPTH), NOT with d, so d shares the TTL TTL_DELAY_WIDTH range.
-    // Proven == engine_model.rtl_bus_delay_line_mirror == bus_delay_line_reference.
+    // PHYSICAL per-bus DAC DELAY -- INSTRUCTION-LEVEL (see the g_busseg generate below): the delay
+    // captures each RESOLVED SEGMENT the engine applies (one descriptor per ramp/edge, NOT one event
+    // per Bresenham step) and a delayed re-player re-runs it d ticks later -> bus_out[t] =
+    // bus_undelayed[t - d_bus].  The 10 bits of a bus SHARE one d (del_bus_ticks[bus]) so the DAC
+    // value shifts coherently.  d=0 is exact passthrough; d=1 is one register; before the first
+    // emitted descriptor the bus holds BUS_SAFE_VALUE (mid code = 0 V) -> silent until t>=d, for
+    // free.  Storage scales with SEGMENTS IN FLIGHT (host-validated <= BUS_EVT_DEPTH), INDEPENDENT of
+    // ramp density -- a large POSITIVE delay on a dense ramp no longer overflows.  d shares the TTL
+    // TTL_DELAY_WIDTH range.  Proven == engine_model.rtl_bus_segment_delay_mirror == bus_delay_line_reference.
     //   * bus_delay_ticks : per-bus delay d in ticks (0 = no delay = passthrough)
     input  wire [BUS_COUNT*TTL_DELAY_WIDTH-1:0] bus_delay_ticks,
 
@@ -305,7 +304,31 @@ module zlc_edge_streamer #(
     reg [TICK_WIDTH-1:0] bus_ramp_denom [0:BUS_COUNT-1];
     reg [TICK_WIDTH+BUS_WIDTH:0] bus_ramp_accum [0:BUS_COUNT-1];
 
-    // ----- delay runtime (per-channel TTL EVENT SCHEDULER + per-bus DAC ring) -----------------
+    // ----- per-bus SEGMENT-DESCRIPTOR delay capture (raised by zlc_bus_apply_segment) -------------
+    // The DAC delay is now INSTRUCTION-LEVEL: instead of the old per-DA-bit value-change FIFO
+    // (g_busdly, which buffered ~span events per delayed ramp), each RESOLVED segment the engine
+    // applies is captured as ONE descriptor and RE-RUN d ticks later by a per-bus delayed player
+    // (g_busseg below), so buffer depth = segments-in-flight, INDEPENDENT of ramp density.  The apply
+    // task pulses bus_seg_push[i] with the resolved descriptor in the DELAYED time base (emit = g_time
+    // + d = the ramp's shifted start; rstop = emit + span; fend = the shifted frame boundary, past
+    // which a truncated ramp FREEZES).  Byte-for-byte the host oracle
+    // engine_model.rtl_bus_segment_delay_mirror (out[t] = in[t-d], first-frame safe, done-tail).
+    reg                   bus_seg_push  [0:BUS_COUNT-1];   // 1-cycle strobe: bus i applied a segment
+    reg [GTIME_WIDTH-1:0] bus_seg_emit  [0:BUS_COUNT-1];   // g_time+d at apply (== rstart, delayed base)
+    reg [GTIME_WIDTH-1:0] bus_seg_rstop [0:BUS_COUNT-1];   // ramp end in the delayed base (emit + span)
+    reg [GTIME_WIDTH-1:0] bus_seg_fend  [0:BUS_COUNT-1];   // frame boundary in the delayed base (freeze)
+    reg [BUS_WIDTH-1:0]   bus_seg_vstart[0:BUS_COUNT-1];   // carried/scanned resolved start value
+    reg [BUS_WIDTH-1:0]   bus_seg_target[0:BUS_COUNT-1];   // resolved stop value
+    reg [TICK_WIDTH-1:0]  bus_seg_denom [0:BUS_COUNT-1];   // ramp span
+    reg [BUS_WIDTH:0]     bus_seg_step  [0:BUS_COUNT-1];   // Bresenham base step
+    reg [BUS_WIDTH:0]     bus_seg_rem   [0:BUS_COUNT-1];   // Bresenham remainder
+    reg                   bus_seg_up    [0:BUS_COUNT-1];   // ramp direction
+    reg                   bus_seg_steep [0:BUS_COUNT-1];   // deferred d/span divmod pending
+    reg                   bus_seg_isramp[0:BUS_COUNT-1];   // ramp vs edge/hold
+    integer bus_seg_i0;
+    initial for (bus_seg_i0 = 0; bus_seg_i0 < BUS_COUNT; bus_seg_i0 = bus_seg_i0 + 1) bus_seg_push[bus_seg_i0] = 1'b0;
+
+    // ----- delay runtime (per-channel TTL EVENT SCHEDULER + per-bus DAC segment delay) ------------
     // TTL: see the EVENT SCHEDULER declarations below -- toggles are queued against a global
     // counter instead of shifting one bit per tick, so the TTL delay range is the 32b
     // TTL_DELAY_WIDTH register field (host-capped at a conservative default of (1<<31)-1 ticks
@@ -313,9 +336,10 @@ module zlc_edge_streamer #(
     // DAC: each DA BIT is now its OWN 1-bit EVENT-SCHEDULER channel, exactly like a TTL output
     // (the earlier per-tick delay buffer is gone -- it capped d at a fixed ring depth and could
     // not match the TTL 32-bit range, so a negative TTL delay's global shift G could push a bus
-    // past that cap and get rejected).  The 40 DA bits (BUS_COUNT*BUS_WIDTH) feed a parallel per-
-    // bit event scheduler (g_busdly below), each a BUS_EVT_DEPTH-deep 49-bit LUTRAM FIFO; the 10 bits of a bus
-    // SHARE the one per-bus d (del_bus_ticks[bus]), so the whole DAC value shifts coherently.
+    // past that cap and get rejected).  The DAC delay is now INSTRUCTION-LEVEL: each bus has a
+    // per-bus SEGMENT-DESCRIPTOR FIFO (g_busseg below, BUS_EVT_DEPTH deep) + a delayed re-player;
+    // the 10 bits of a bus SHARE the one per-bus d (del_bus_ticks[bus]), so the whole DAC value
+    // shifts coherently, and buffer depth = segments-in-flight (density-independent).
     // d_ch / d_bus are held CTRL (a delay is constant, never scanned), latched at FIRE; both are
     // now TTL_DELAY_WIDTH (32b) so TTL and DAC ranges MATCH and the global negative-shift is uniform.
     reg [TTL_DELAY_WIDTH-1:0]  del_ch_ticks  [0:CHANNEL_COUNT-1];  // per-channel d (0 = passthrough)
@@ -429,60 +453,130 @@ module zlc_edge_streamer #(
     end
     assign out = (state_mask & ~delayed_mask) | delayed_out;
 
-    // ----- per-DA-BIT OUTPUT delay: each DA bit is its OWN 1-bit EVENT SCHEDULER (g_busdly) -----
-    // out_bus[t] = in_bus[t-d_bus]; before the first scheduled change the bit holds its idle level
-    // (the BUS_SAFE_VALUE mid-scale code = 0 V on the offset-binary driver), so the first frame is
-    // correct.  The 10 bits of a bus SHARE del_bus_ticks[bus], so the whole DAC value shifts
-    // coherently.  d_bus==0 -> live passthrough; d_bus==1 -> one register; d_bus>=2 -> the FIFO.
-    // Each bit gets its OWN 2D distributed-RAM FIFO (a flat 3D reg array falls to flip-flops -- see
-    // g_evtfifo).  Capacity = value-change events in flight per bit <= EVT_DEPTH (host-validated).
-    genvar gbb, gbk;
+    // ----- per-bus SEGMENT-DESCRIPTOR OUTPUT delay (g_busseg) -- INSTRUCTION LEVEL ---------------
+    // bus_out[t] = bus_value_active[t - d_bus].  Instead of the old per-DA-bit value-change FIFO
+    // (one event per Bresenham step => ~span events per delayed ramp), the engine captures each
+    // RESOLVED segment it applies (bus_seg_* above) and a DELAYED RE-PLAYER re-runs the SAME ramp
+    // stepper d ticks later.  So a delayed ramp costs ONE descriptor, not ~span events -- buffer
+    // depth = segments-in-flight, INDEPENDENT of ramp density (a large POSITIVE delay on a dense
+    // ramp no longer overflows).  The re-player's ramp math is a byte-copy of the live stepper
+    // above (deferred steep divmod + Bresenham carry + saturate), fed the same descriptor on the
+    // free-running g_time base, so its output IS the live output shifted by d, by construction.
+    // Before its first descriptor emits the bus holds BUS_SAFE_VALUE (mid code = 0 V, first frame
+    // correct); a ramp that reaches the frame boundary FREEZES (g_time >= dfend) instead of ramping
+    // into the next frame's idle window; g_time keeps advancing at done so the last d ticks drain
+    // (done-tail).  d==0 -> passthrough; d==1 -> one register; d>=2 -> the delayed player.  Matches
+    // host.engine_model.rtl_bus_segment_delay_mirror (proven == out[t]=in[t-d]).
+    localparam integer O_ISRAMP = 0;
+    localparam integer O_STEEP  = O_ISRAMP + 1;
+    localparam integer O_UP     = O_STEEP  + 1;
+    localparam integer O_REM    = O_UP     + 1;
+    localparam integer O_STEP   = O_REM    + (BUS_WIDTH + 1);
+    localparam integer O_DENOM  = O_STEP   + (BUS_WIDTH + 1);
+    localparam integer O_TGT    = O_DENOM  + TICK_WIDTH;
+    localparam integer O_VST    = O_TGT    + BUS_WIDTH;
+    localparam integer O_FEND   = O_VST    + BUS_WIDTH;
+    localparam integer O_RSTOP  = O_FEND   + GTIME_WIDTH;
+    localparam integer O_EMIT   = O_RSTOP  + GTIME_WIDTH;
+    localparam integer SEG_W    = O_EMIT   + GTIME_WIDTH;
+    genvar gbs;
     generate
-    for (gbb = 0; gbb < BUS_COUNT; gbb = gbb + 1) begin : g_busdly
-        for (gbk = 0; gbk < BUS_WIDTH; gbk = gbk + 1) begin : g_bit
-            localparam integer SAFE_BIT = (BUS_SAFE_VALUE >> gbk) & 1; // idle level of this bit
-            (* ram_style = "distributed" *) reg [GTIME_WIDTH:0] bfifo [0:BUS_EVT_DEPTH-1];
-            reg [BEVT_ADDR-1:0] bwr  = {BEVT_ADDR{1'b0}};
-            reg [BEVT_ADDR-1:0] brd  = {BEVT_ADDR{1'b0}};
-            reg [BEVT_ADDR:0]   bcnt = {(BEVT_ADDR+1){1'b0}};
-            reg                bobit = SAFE_BIT[0];   // scheduled (delayed) level (d>=2)
-            reg                bprev = SAFE_BIT[0];    // prev UNDELAYED level (for d==1)
-            reg bpushf, bpopf;
-            wire und = bus_value_active[gbb][gbk];                 // this tick's UNDELAYED bus bit
-            wire [TTL_DELAY_WIDTH-1:0] dbus = del_bus_ticks[gbb];
-            wire [GTIME_WIDTH:0] bhead = bfifo[brd];                // async-read FIFO head
-            assign bus_out[gbb*BUS_WIDTH + gbk] =
-                (dbus == {TTL_DELAY_WIDTH{1'b0}}) ? und :
-                (dbus == {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1}) ? bprev : bobit;
-            always @(posedge clk) begin
-                if (reset_sync) begin
-                    bwr   <= {BEVT_ADDR{1'b0}};
-                    brd   <= {BEVT_ADDR{1'b0}};
-                    bcnt  <= {(BEVT_ADDR+1){1'b0}};
-                    bobit <= SAFE_BIT[0];
-                    bprev <= SAFE_BIT[0];
-                end else begin
-                    bprev <= und;
-                    bpushf = (und != bprev)
-                             && (dbus > {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1})
-                             && (bcnt != BUS_EVT_DEPTH[BEVT_ADDR:0]);
-                    bpopf  = (bcnt != {(BEVT_ADDR+1){1'b0}})
-                             && (bhead[GTIME_WIDTH:1] == g_time);
-                    if (bpushf) begin
-                        bfifo[bwr] <= {
-                            g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, dbus} - 1'b1, und };
-                        bwr <= bwr + 1'b1;
-                    end
-                    if (bpopf) begin
-                        bobit <= bhead[0];
-                        brd <= brd + 1'b1;
-                    end
-                    case ({bpushf, bpopf})
-                        2'b10: bcnt <= bcnt + 1'b1;
-                        2'b01: bcnt <= bcnt - 1'b1;
-                        default: ;
-                    endcase
+    for (gbs = 0; gbs < BUS_COUNT; gbs = gbs + 1) begin : g_busseg
+        localparam [BUS_WIDTH-1:0] BSAFE = BUS_SAFE_VALUE[BUS_WIDTH-1:0];
+        (* ram_style = "distributed" *) reg [SEG_W-1:0] sfifo [0:BUS_EVT_DEPTH-1];
+        reg [BEVT_ADDR-1:0] swr = {BEVT_ADDR{1'b0}};
+        reg [BEVT_ADDR-1:0] srd = {BEVT_ADDR{1'b0}};
+        reg [BEVT_ADDR:0]   scnt = {(BEVT_ADDR+1){1'b0}};
+        // delayed re-player registers (a copy of the live bus ramp stepper, on the g_time base)
+        reg [BUS_WIDTH-1:0] dval  = BUS_SAFE_VALUE[BUS_WIDTH-1:0];   // delayed output (d>=2)
+        reg [BUS_WIDTH-1:0] dprev = BUS_SAFE_VALUE[BUS_WIDTH-1:0];   // one-tick register (d==1)
+        reg dstarted = 1'b0, dramp = 1'b0, dup = 1'b0, dsteep = 1'b0;
+        reg [GTIME_WIDTH-1:0] demit = {GTIME_WIDTH{1'b0}}, drstop = {GTIME_WIDTH{1'b0}}, dfend = {GTIME_WIDTH{1'b0}};
+        reg [BUS_WIDTH-1:0] dtarget = {BUS_WIDTH{1'b0}};
+        reg [TICK_WIDTH-1:0] ddenom = {TICK_WIDTH{1'b0}};
+        reg [BUS_WIDTH:0] dstep = {(BUS_WIDTH+1){1'b0}}, drem = {(BUS_WIDTH+1){1'b0}};
+        reg [TICK_WIDTH+BUS_WIDTH:0] daccum = {(TICK_WIDTH+BUS_WIDTH+1){1'b0}};
+        reg [TICK_WIDTH+BUS_WIDTH:0] daccum_next;
+        reg [BUS_WIDTH:0] dinc, dv_next;
+        reg [2*BUS_WIDTH+1:0] dqr;
+        reg dpushf, dpopf;
+        wire [TTL_DELAY_WIDTH-1:0] dbus = del_bus_ticks[gbs];
+        wire [SEG_W-1:0] shead = sfifo[srd];                        // async-read FIFO head (LUTRAM)
+        wire [GTIME_WIDTH-1:0] h_emit  = shead[O_EMIT  +: GTIME_WIDTH];
+        wire [GTIME_WIDTH-1:0] h_rstop = shead[O_RSTOP +: GTIME_WIDTH];
+        wire [GTIME_WIDTH-1:0] h_fend  = shead[O_FEND  +: GTIME_WIDTH];
+        wire [BUS_WIDTH-1:0]   h_vst   = shead[O_VST   +: BUS_WIDTH];
+        wire [BUS_WIDTH-1:0]   h_tgt   = shead[O_TGT   +: BUS_WIDTH];
+        wire [TICK_WIDTH-1:0]  h_denom = shead[O_DENOM +: TICK_WIDTH];
+        wire [BUS_WIDTH:0]     h_step  = shead[O_STEP  +: (BUS_WIDTH+1)];
+        wire [BUS_WIDTH:0]     h_rem   = shead[O_REM   +: (BUS_WIDTH+1)];
+        wire                   h_up    = shead[O_UP];
+        wire                   h_steep = shead[O_STEEP];
+        wire                   h_ramp  = shead[O_ISRAMP];
+        assign bus_out[gbs*BUS_WIDTH +: BUS_WIDTH] =
+            (dbus == {TTL_DELAY_WIDTH{1'b0}})                    ? bus_value_active[gbs] :   // d==0
+            (dbus == {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1})       ? dprev :                    // d==1
+            (dstarted ? dval : BSAFE);                                                       // d>=2
+        always @(posedge clk) begin
+            if (reset_sync) begin
+                swr <= {BEVT_ADDR{1'b0}}; srd <= {BEVT_ADDR{1'b0}}; scnt <= {(BEVT_ADDR+1){1'b0}};
+                dval <= BUS_SAFE_VALUE[BUS_WIDTH-1:0]; dprev <= BUS_SAFE_VALUE[BUS_WIDTH-1:0];
+                dstarted <= 1'b0; dramp <= 1'b0; daccum <= {(TICK_WIDTH+BUS_WIDTH+1){1'b0}};
+            end else begin
+                dprev <= bus_value_active[gbs];                    // one-tick register for d==1
+                // PUSH a captured descriptor (the apply strobe is from LAST cycle; emit is far
+                // enough ahead for d>=2 that it cannot race the pop below).
+                dpushf = bus_seg_push[gbs] && (scnt != BUS_EVT_DEPTH[BEVT_ADDR:0]);
+                dpopf  = (scnt != {(BEVT_ADDR+1){1'b0}}) && (h_emit == g_time);
+                if (dpushf) begin
+                    sfifo[swr] <= { bus_seg_emit[gbs], bus_seg_rstop[gbs], bus_seg_fend[gbs],
+                                    bus_seg_vstart[gbs], bus_seg_target[gbs], bus_seg_denom[gbs],
+                                    bus_seg_step[gbs], bus_seg_rem[gbs], bus_seg_up[gbs],
+                                    bus_seg_steep[gbs], bus_seg_isramp[gbs] };
+                    swr <= swr + 1'b1;
                 end
+                if (dpopf) begin
+                    // emit this descriptor: load the re-player (value shows NEXT tick => out[t]=in[t-d])
+                    dval <= h_vst; dstarted <= 1'b1; dramp <= h_ramp;
+                    demit <= h_emit; drstop <= h_rstop; dfend <= h_fend; dtarget <= h_tgt;
+                    ddenom <= h_denom; dstep <= h_step; drem <= h_rem; dup <= h_up; dsteep <= h_steep;
+                    daccum <= {(TICK_WIDTH+BUS_WIDTH+1){1'b0}};
+                    srd <= srd + 1'b1;
+                end else if (dstarted && dramp && (g_time < dfend)) begin
+                    // FROZEN past the frame boundary (g_time>=dfend); else step exactly like the live
+                    // stepper above (deferred steep divmod + Bresenham carry + saturate at target).
+                    if (g_time >= drstop) begin
+                        dval <= dtarget; dramp <= 1'b0; daccum <= {(TICK_WIDTH+BUS_WIDTH+1){1'b0}};
+                    end else if (g_time > demit && ddenom != {TICK_WIDTH{1'b0}}) begin
+                        if (dsteep) begin
+                            dqr = zlc_bus_ramp_divmod(drem, ddenom[BUS_WIDTH:0]);
+                            dstep <= dqr[2*BUS_WIDTH+1:BUS_WIDTH+1]; drem <= dqr[BUS_WIDTH:0];
+                            dsteep <= 1'b0; daccum <= {{(TICK_WIDTH){1'b0}}, dqr[BUS_WIDTH:0]};
+                            dinc = dqr[2*BUS_WIDTH+1:BUS_WIDTH+1];
+                        end else begin
+                            daccum_next = daccum + drem;
+                            if (daccum_next >= ddenom) begin
+                                daccum <= daccum_next - ddenom; dinc = dstep + 1'b1;
+                            end else begin
+                                daccum <= daccum_next; dinc = dstep;
+                            end
+                        end
+                        if (dinc != {(BUS_WIDTH+1){1'b0}}) begin
+                            if (dup) begin
+                                dv_next = {1'b0, dval} + dinc;
+                                dval <= (dv_next >= {1'b0, dtarget}) ? dtarget : dv_next[BUS_WIDTH-1:0];
+                            end else begin
+                                if ({1'b0, dval} <= {1'b0, dtarget} + dinc) dval <= dtarget;
+                                else dval <= dval - dinc[BUS_WIDTH-1:0];
+                            end
+                        end
+                    end
+                end
+                case ({dpushf, dpopf})
+                    2'b10: scnt <= scnt + 1'b1;
+                    2'b01: scnt <= scnt - 1'b1;
+                    default: ;
+                endcase
             end
         end
     end
@@ -580,9 +674,9 @@ module zlc_edge_streamer #(
         end
     endtask
 
-    // Clear the per-channel + per-bus delay amounts (used on reset/FIRE).  The event-FIFO state
-    // (wr/rd/cnt/obit) is cleared inside each scheduler's own reset_sync branch (g_evtfifo /
-    // g_busdly), so there is nothing ring-related to reset here any more.
+    // Clear the per-channel + per-bus delay amounts (used on reset/FIRE).  The scheduler/re-player
+    // state (TTL event FIFO wr/rd/cnt/obit; DAC segment FIFO + delayed re-player regs) is cleared
+    // inside each generate's own reset_sync branch (g_evtfifo / g_busseg), nothing to reset here.
     task zlc_delay_clear_runtime;
         integer i;
         begin
@@ -661,9 +755,40 @@ module zlc_edge_streamer #(
                 bus_ramp_start_tick[i] <= tkstart; bus_ramp_stop_tick[i] <= tkstop;
                 bus_ramp_target[i] <= vstop; bus_ramp_denom[i] <= span;
                 bus_ramp_accum[i] <= {(TICK_WIDTH+BUS_WIDTH+1){1'b0}};
+                if (del_bus_ticks[i] > {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1}) begin
+                    // capture the RESOLVED ramp for the delayed re-player, in the delayed g_time base:
+                    // emit = g_time + d (== rstart shifted); rstop = emit + span.  fend gates the
+                    // FREEZE: only a REPEAT_FOREVER frame wraps (re-inits at final_tick, truncating an
+                    // unfinished ramp to a HOLD -> the delayed re-player must freeze there), so fend =
+                    // emit + ticks-left-in-frame.  A FINITE (fire-once) program never wraps -- the ramp
+                    // runs to its rstop and snaps to target, exactly like engine_model's finite path
+                    // (frame_end = +inf, never freeze), so fend = all-ones sentinel.
+                    bus_seg_push[i]   <= 1'b1;
+                    bus_seg_emit[i]   <= g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, del_bus_ticks[i]};
+                    bus_seg_rstop[i]  <= g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, del_bus_ticks[i]}
+                                         + {{(GTIME_WIDTH-TICK_WIDTH){1'b0}}, span};
+                    bus_seg_fend[i]   <= repeat_forever_active
+                        ? (g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, del_bus_ticks[i]}
+                           + {{(GTIME_WIDTH-TICK_WIDTH){1'b0}}, (final_tick - time_count)})
+                        : {GTIME_WIDTH{1'b1}};
+                    bus_seg_vstart[i] <= vstart;   bus_seg_target[i] <= vstop;
+                    bus_seg_denom[i]  <= span;      bus_seg_step[i]   <= {(BUS_WIDTH+1){1'b0}};
+                    bus_seg_rem[i]    <= d;         bus_seg_steep[i]  <= (span < d);
+                    bus_seg_up[i]     <= (vstop >= vstart);   bus_seg_isramp[i] <= 1'b1;
+                end
             end else begin
                 bus_value_active[i] <= vstop; bus_ramp_active[i] <= 1'b0;
                 bus_ramp_accum[i] <= {(TICK_WIDTH+BUS_WIDTH+1){1'b0}};
+                if (del_bus_ticks[i] > {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1}) begin
+                    // capture an edge/hold: a constant value, no ramp (fend = infinity -> never freezes)
+                    bus_seg_push[i]   <= 1'b1;
+                    bus_seg_emit[i]   <= g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, del_bus_ticks[i]};
+                    bus_seg_rstop[i]  <= {GTIME_WIDTH{1'b0}};   bus_seg_fend[i] <= {GTIME_WIDTH{1'b1}};
+                    bus_seg_vstart[i] <= vstop;   bus_seg_target[i] <= vstop;
+                    bus_seg_denom[i]  <= {TICK_WIDTH{1'b0}};    bus_seg_step[i] <= {(BUS_WIDTH+1){1'b0}};
+                    bus_seg_rem[i]    <= {(BUS_WIDTH+1){1'b0}}; bus_seg_steep[i] <= 1'b0;
+                    bus_seg_up[i]     <= 1'b1;     bus_seg_isramp[i] <= 1'b0;
+                end
             end
         end
     endtask
@@ -684,6 +809,7 @@ module zlc_edge_streamer #(
         reg [TICK_WIDTH-1:0] s_eff, e_eff;          // the ONLY bus affine evals: 2 per bus
         begin
             for (i = 0; i < BUS_COUNT; i = i + 1) begin
+                bus_seg_push[i] <= 1'b0;   // default: no segment-delay capture; zlc_bus_apply_segment sets it
                 idx  = reinit ? {(BUS_SEG_ADDR_WIDTH+1){1'b0}} : bus_index_active[i];
                 addr = (i * MAX_BUS_SEGMENTS) + idx[BUS_SEG_ADDR_WIDTH-1:0];
                 s_eff = zlc_effective_tick(bus_start_tick_mem[addr], bus_start_tick_coeff_mem[addr], slot_vec);
@@ -1068,8 +1194,8 @@ module zlc_edge_streamer #(
         end
         if (bnd_bus_tick) zlc_bus_tick(bnd_bus_reinit, bnd_slots);
         if (bnd_seed) seed_from_edge0(bnd_slots, bnd_count);
-        // (The DAC delay no longer uses a per-tick ring here: each DA bit is event-scheduled in the
-        // g_busdly generate block, fed directly from bus_value_active.  bnd_delay_advance is unused.)
+        // (The DAC delay is INSTRUCTION-LEVEL: zlc_bus_apply_segment captures each resolved segment
+        // and the g_busseg generate re-runs it d ticks later.  bnd_delay_advance is unused.)
     end
 
     // ----- TTL EVENT SCHEDULER runtime -------------------------------------------------------

@@ -25,13 +25,16 @@ Three models, all walking the SAME engine FSM:
 The RTL combines the edge FIFO and the scan ping-pong; each is verified here
 independently and against the same ``reference_play`` ground truth.
 
-The per-channel / per-bus OUTPUT delay is a per-signal EVENT SCHEDULER:
-:func:`delay_line_reference` / :func:`bus_delay_line_reference` are the exact stream-shift
-ground truth (out[t]=in[t-d], 0 before fire), and :func:`rtl_delay_line_mirror` /
-:func:`rtl_bus_delay_line_mirror` are the cycle-exact register mirrors of the RTL event
-schedulers (the 32-bit delay field; a d past it raises :class:`DelayTooLargeError`).
-``reference_play`` / ``prefetch_play`` / ``rtl_mirror_play`` apply the channel delay line as a
-post-play shift via :func:`_apply_channel_delays`.
+The OUTPUT delay differs by signal kind.  A TTL channel is a per-bit EVENT SCHEDULER:
+:func:`delay_line_reference` is the exact stream-shift ground truth (out[t]=in[t-d], 0 before
+fire) and :func:`rtl_delay_line_mirror` is its cycle-exact register mirror.  A DAC bus is an
+INSTRUCTION-LEVEL SEGMENT delay: :func:`bus_delay_line_reference` is the same out[t]=in[t-d]
+ground truth (safe = BUS_SAFE_VALUE before fire), and :func:`rtl_bus_segment_delay_mirror`
+mirrors the RTL that captures each RESOLVED segment (:func:`bus_undelayed_and_log`) and re-plays
+it d ticks later -- so a delayed dense ramp costs ONE descriptor, not ~span events.  Both use the
+32-bit delay field (a d past it raises :class:`DelayTooLargeError`).  ``reference_play`` /
+``prefetch_play`` / ``rtl_mirror_play`` apply the channel delay line as a post-play shift via
+:func:`_apply_channel_delays`.
 """
 
 from __future__ import annotations
@@ -45,8 +48,8 @@ __all__ = [
     "streaming_scan_play", "rtl_mirror_play", "bus_play", "min_edge_spacing",
     "PrefetchStall", "ScanUnderflow", "DelayTooLargeError",
     "delay_line_reference", "bus_delay_line_reference",
-    "rtl_delay_line_mirror", "rtl_bus_delay_line_mirror",
-    "bus_value_at",
+    "rtl_delay_line_mirror", "rtl_bus_segment_delay_mirror",
+    "bus_undelayed_and_log", "bus_value_at",
 ]
 
 # OUTPUT delay cap (in ticks): the 32-bit delay field, the SAME for TTL channels and DAC
@@ -163,15 +166,16 @@ def bus_delay_line_reference(undelayed_bus: Sequence[int], delay: int,
 #   EVT_FIFO_DEPTH-deep FIFO; when g_time reaches the head time pop it into the output register
 #   (visible at t + d).  d==1 is served by the prev-undelayed register; d==0 bypasses.
 #
-#   DAC (rtl_bus_delay_line_mirror): each of the bus's bits is its own 1-bit event FIFO (g_busdly)
-#   sharing the per-bus delay d, so the whole DAC value shifts coherently.  Per bit, push
-#   {g_time + d - 1, level} on a change, pop by g_time equality into the output register; d==1 is
-#   the prev register; before t==d the bit holds its BUS_SAFE_VALUE level.
+#   DAC (rtl_bus_segment_delay_mirror): INSTRUCTION-LEVEL, one per-bus FIFO (g_busseg) of RESOLVED
+#   segment descriptors, NOT per-bit value events.  On each apply push {emit = g_time + d, ramp
+#   descriptor}; a delayed re-player pops it at emit and RE-RUNS the ramp stepper d ticks later, so
+#   the whole DAC value shifts coherently.  d==1 is the prev register; before the first emit the
+#   bus holds BUS_SAFE_VALUE.  Storage scales with SEGMENTS in flight (<= the FIFO depth), so a
+#   delayed dense/long ramp is ONE descriptor -- density/swing no longer overflow.
 #
-#   For BOTH, storage scales with value-change events IN FLIGHT per signal (<= the FIFO depth), not
-#   with delay length; an overflow drops the excess (a too-dense delayed ramp).  Both are
-#   out[t]=in[t-d] before any overflow, == the *_reference functions (TTL safe 0, DAC safe =
-#   BUS_SAFE_VALUE), with the in-flight-count capacity bound instead of a delay-length cap.
+#   TTL storage scales with value-change events in flight per bit; DAC with segments in flight.
+#   Both are out[t]=in[t-d] before any overflow, == the *_reference functions (TTL safe 0, DAC safe
+#   = BUS_SAFE_VALUE), with an in-flight-count capacity bound instead of a delay-length cap.
 
 
 def _check_delay_cap(d: int, cap: int, what: str) -> int:
@@ -229,40 +233,6 @@ def rtl_delay_line_mirror(undelayed: Sequence[int], channel_delays,
                     q.append((t + d - 1, (cur >> b) & 1))
         prev = cur
     return out
-
-def rtl_bus_delay_line_mirror(undelayed_bus: Sequence[int], delay: int,
-                              *, depth: int = BUS_EVT_FIFO_DEPTH, bus_width: int = 10,
-                              safe_value: int = 512) -> list[int]:
-    """Cycle-exact mirror of the RTL per-DA-bit EVENT-SCHEDULER delay (``g_busdly``).
-
-    Each of the bus's ``bus_width`` bits is its OWN 1-bit event FIFO that SHARES the per-bus
-    delay ``d`` (so the whole DAC value shifts coherently).  out[t] = in[t-d], holding that bit's
-    SAFE level (from 512 = BUS_SAFE_VALUE = 0 V) before t == d, first frame correct.  d==0 is
-    exact passthrough; d==1 is a single register.  Capacity is the number of value-change events
-    in flight PER BIT (<= ``depth``); a push when that bit's FIFO is full is DROPPED, matching the
-    RTL overflow guard (the only realistic stressor is a too-dense DELAYED ramp).  Equals
-    :func:`bus_delay_line_reference` whenever no bit exceeds ``depth`` events in flight -- a
-    large ``d`` is fine (the bound is the in-flight event count, not d)."""
-    d = int(delay)
-    n = len(undelayed_bus)
-    if d == 0:
-        return [int(v) for v in undelayed_bus]
-    out = [0] * n
-    for k in range(bus_width):
-        safe_bit = (int(safe_value) >> k) & 1
-        fifo: list[tuple[int, int]] = []           # (deadline, level), FIFO order
-        prev = safe_bit                            # prev UNDELAYED bit (the d==1 register)
-        obit = safe_bit                            # scheduled (delayed) bit (d>=2)
-        for t in range(n):
-            und = (int(undelayed_bus[t]) >> k) & 1
-            out[t] |= (prev if d == 1 else obit) << k   # output reads the registers PRE-pop
-            if d >= 2 and fifo and fifo[0][0] == t:     # pop the head whose deadline == g_time
-                obit = fifo.pop(0)[1]                    # (takes effect next tick, like the reg)
-            if und != prev and d >= 2 and len(fifo) < depth:
-                fifo.append((t + d - 1, und))            # push on change, unless the FIFO is full
-            prev = und
-    return out
-
 
 @dataclass
 class EngineProgram:
@@ -1105,16 +1075,16 @@ def rtl_bus_segment_delay_mirror(program, bus_index: int, delay: int, n_ticks: i
 
 
 # ----------------------------------------------------------------------------
-# UNDELAYED DAC-BUS VALUE evaluator (sampled, then fed to the bus event scheduler)
+# UNDELAYED DAC-BUS VALUE evaluator (closed-form combinational cross-check)
 # ----------------------------------------------------------------------------
-# A DELAYED DAC bus value is the bus's UNDELAYED value stream delayed by d (the per-DA-bit
-# event scheduler -- see bus_delay_line_reference / rtl_bus_delay_line_mirror).
-# To build that undelayed stream tick-by-tick (so the scheduler can delay it), the
-# engine reads the active bus segment combinationally at each tick:
-# :func:`bus_value_at` is the COMBINATIONAL evaluator (the RTL ``zlc_bus_value_at``
-# function); it is byte-identical to :func:`bus_play` when evaluated at the running
-# ``time_count`` (proven in the test-suite), i.e. it is the undelayed bus stream
-# re-derived combinationally.  Feed ``[bus_value_at(.., t) for t]`` into the delay line.
+# A DELAYED DAC bus value is the bus's UNDELAYED value stream delayed by d.  The INSTRUCTION-LEVEL
+# segment delay builds that undelayed stream from the interpolating FSM (:func:`bus_undelayed_and_log`
+# = :func:`bus_play` + the resolved-segment apply log), and re-plays each captured segment d ticks
+# later (:func:`rtl_bus_segment_delay_mirror`).  :func:`bus_value_at` is an INDEPENDENT closed-form
+# evaluator of the same undelayed value: it reads the active bus segment combinationally at a phase
+# and returns the accumulator staircase value there, byte-identical to :func:`bus_play` sampled at
+# the running ``time_count`` (proven in the test-suite).  It is a verification cross-check of the
+# per-tick bus value, not the delay's data path.
 
 
 def bus_value_at(program, bus_index: int, phase: int, scan_point: int = 0, *,
