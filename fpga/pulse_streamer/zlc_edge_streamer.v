@@ -749,7 +749,15 @@ module zlc_edge_streamer #(
         reg [BUS_SEL_WIDTH-1:0] start_sel, stop_sel;
         reg [BUS_WIDTH-1:0] vstart, vstop;
         reg [BUS_WIDTH:0] d;
+        reg [TTL_DELAY_WIDTH-1:0] dly_bus;
         begin
+            // FIRE-safe delay: read the STABLE held CTRL delay slice (zlc_delay_bus_at), NOT the per-run
+            // latch del_bus_ticks[i].  At FIRE del_bus_ticks is loaded by NBA in the SAME cycle this task
+            // runs (dispatch below), so a TICK-0 PRE-APPLIED segment (e.g. a period-0 ramp) would be
+            // captured with the STALE (pre-FIRE = 0) latch -> gate false -> the ramp descriptor is NEVER
+            // pushed -> the delayed bus sits at BUS_SAFE forever (the "delayed DAC = constant" bug).
+            // zlc_delay_bus_at reads the CTRL words directly (constant across a run) -> correct at FIRE too.
+            dly_bus = zlc_delay_bus_at(i);
             // Independent start/stop value selects: each endpoint either takes its
             // literal value or reads its own scan slot.  A ramp can therefore go
             // from a scanned start level to a scanned stop level; an edge/hold
@@ -779,7 +787,7 @@ module zlc_edge_streamer #(
                 bus_ramp_start_tick[i] <= tkstart; bus_ramp_stop_tick[i] <= tkstop;
                 bus_ramp_target[i] <= vstop; bus_ramp_denom[i] <= span;
                 bus_ramp_accum[i] <= {(TICK_WIDTH+BUS_WIDTH+1){1'b0}};
-                if (del_bus_ticks[i] > {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1}) begin
+                if (dly_bus > {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1}) begin
                     // capture the RESOLVED ramp for the delayed re-player, in the delayed g_time base:
                     // emit = g_time + d (== rstart shifted); rstop = emit + span.  fend gates the
                     // FREEZE: only a REPEAT_FOREVER frame wraps (re-inits at final_tick, truncating an
@@ -788,12 +796,23 @@ module zlc_edge_streamer #(
                     // runs to its rstop and snaps to target, exactly like engine_model's finite path
                     // (frame_end = +inf, never freeze), so fend = all-ones sentinel.
                     bus_seg_push[i]   <= 1'b1;
-                    bus_seg_emit[i]   <= g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, del_bus_ticks[i]};
-                    bus_seg_rstop[i]  <= g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, del_bus_ticks[i]}
+                    bus_seg_emit[i]   <= g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, dly_bus};
+                    bus_seg_rstop[i]  <= g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, dly_bus}
                                          + {{(GTIME_WIDTH-TICK_WIDTH){1'b0}}, span};
+                    // FREEZE boundary = emit + ticks-left-in-frame = emit + (frame_len - segment start).
+                    // Use FRESHLY-RESOLVED, stale-free operands: zlc_effective_tick(...,slot_vec) is the
+                    // CURRENT frame length (not the register final_tick, which is NBA-recomputed at the
+                    // wrap and reads the PREVIOUS point's length -- wrong for a scanned DURATION), and
+                    // tkstart is the segment's frame-local start (0 for the tick-0 pre-applied ramp, T for
+                    // a mid-frame apply == time_count there).  The old (final_tick - time_count) BOTH read
+                    // not-yet-committed registers at the reinit/wrap cycle where time_count==final_tick
+                    // (boundary value), collapsing to 0 -> fend==emit -> the re-player FROZE the ramp at
+                    // its start EVERY frame (the "delayed DAC = constant" bug).  Matches engine_model
+                    // frame_end = origin + flen (shifted fend = emit + flen).
                     bus_seg_fend[i]   <= repeat_forever_active
-                        ? (g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, del_bus_ticks[i]}
-                           + {{(GTIME_WIDTH-TICK_WIDTH){1'b0}}, (final_tick - time_count)})
+                        ? (g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, dly_bus}
+                           + {{(GTIME_WIDTH-TICK_WIDTH){1'b0}},
+                              (zlc_effective_tick(sh_final_t, sh_final_c, slot_vec) - tkstart)})
                         : {GTIME_WIDTH{1'b1}};
                     bus_seg_vstart[i] <= vstart;   bus_seg_target[i] <= vstop;
                     bus_seg_denom[i]  <= span;      bus_seg_step[i]   <= {(BUS_WIDTH+1){1'b0}};
@@ -803,10 +822,10 @@ module zlc_edge_streamer #(
             end else begin
                 bus_value_active[i] <= vstop; bus_ramp_active[i] <= 1'b0;
                 bus_ramp_accum[i] <= {(TICK_WIDTH+BUS_WIDTH+1){1'b0}};
-                if (del_bus_ticks[i] > {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1}) begin
+                if (dly_bus > {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1}) begin
                     // capture an edge/hold: a constant value, no ramp (fend = infinity -> never freezes)
                     bus_seg_push[i]   <= 1'b1;
-                    bus_seg_emit[i]   <= g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, del_bus_ticks[i]};
+                    bus_seg_emit[i]   <= g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, dly_bus};
                     bus_seg_rstop[i]  <= {GTIME_WIDTH{1'b0}};   bus_seg_fend[i] <= {GTIME_WIDTH{1'b1}};
                     bus_seg_vstart[i] <= vstop;   bus_seg_target[i] <= vstop;
                     bus_seg_denom[i]  <= {TICK_WIDTH{1'b0}};    bus_seg_step[i] <= {(BUS_WIDTH+1){1'b0}};
