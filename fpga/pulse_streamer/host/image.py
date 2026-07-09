@@ -27,6 +27,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import struct
+import zlib
 from dataclasses import dataclass, fields as _dataclass_fields
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -37,7 +39,7 @@ __all__ = [
     "pack_program", "unpack_program", "scan_bank_words", "region_bases", "check_rtl_assumptions",
     "CMD_LOAD", "CMD_FIRE", "CMD_RESET", "CMD_SAFE",
     "STATUS_LOADED", "STATUS_RUNNING", "STATUS_DONE", "STATUS_ERROR", "STATUS_UNDERFLOW",
-    "IMAGE_MAGIC", "REGISTER_LAYOUT_ID",
+    "IMAGE_MAGIC", "REGISTER_LAYOUT_ID", "LAYOUT_STRUCT_VERSION", "build_fingerprint",
     "DEFAULT_CONFIG_PATH", "load_streamer_config", "params_from_config", "default_params",
     "default_part", "default_target_pct", "default_clock_hz",
     "check_config_capacity", "format_capacity_report",
@@ -45,16 +47,45 @@ __all__ = [
 
 IMAGE_MAGIC = 0x5A4C4532   # "ZLE2"
 
-# REGISTER-LAYOUT HANDSHAKE.  Must equal zlc_pulse_streamer_top.v's ZLC_LAYOUT_ID, which the
-# top returns on every AXI read of CTRL word 63 (hardwired -- writes are never read back).
-# The host verifies it BEFORE writing anything layout-dependent (axi_session checks it at
-# self-test and at every prepare), so a host built for one CtrlWords layout can never silently
-# mis-drive a bitstream built for another.  BUMP BOTH on ANY CtrlWords/region change.
-# History: v2 = CLK_ENABLE@20 (dense delay words deleted).  The v1->v2 move shipped WITHOUT
-# this handshake; running the v2 host on a v1 bitstream put the clk mask in dead words and left
-# the REAL clk mask (46/47) stale -> uncontrolled da_clk strobes, garbled first-frame DAC output
-# on real hardware.  An old bitstream reads back ctrl_reg[63] (power-up 0) -> clear error.
-REGISTER_LAYOUT_ID = 0x5A4C4C02   # 'ZLL' + layout v2
+# ------------------------------------------------------------------------------------------------
+# HOST<->BITSTREAM COMPATIBILITY FINGERPRINT (CTRL word 63, image.build_fingerprint).
+#
+# The top exposes this 32-bit value on every read of CTRL word 63; axi_session verifies it at
+# connect and refuses a mismatched pair.  It folds the register-STRUCTURE version with EVERY
+# bitstream-affecting geometry field, so a host that packs for one geometry can never silently
+# mis-drive a bitstream built for another.  Two real silent-corruption failures this now catches
+# LOUDLY: CLK_ENABLE 46->20 (v1->v2) put the clk mask in dead words -> garbled first-frame DAC;
+# bus_seg_addr_width 6->5 shifted R_DELAY down 896 words -> every DAC-scan value + delay wrong.
+#
+# SINGLE SOURCE: the connect-check and the Vivado build generic (vivado_generics) BOTH call
+# build_fingerprint(); the RTL only carries the pre-computed value as a generic -- it never
+# re-implements the hash.  Bump LAYOUT_STRUCT_VERSION on a pure-structure change (CtrlWords order,
+# command/status bit meaning) that no geometry field captures; geometry changes fold in by hash.
+LAYOUT_STRUCT_VERSION = 3   # v3: word 63 is a geometry fingerprint (was static 0x5A4C4C02 = 'ZLL'+v2)
+
+# Fields NOT folded into the fingerprint: host-side validation caps that are NOT built into the
+# bitstream, so a host<->bitstream disagreement on them cannot corrupt the data path (the host is
+# merely stricter/looser at validation time).  EVERYTHING ELSE in StreamerParams is a
+# bitstream-affecting geometry field and is hashed AUTOMATICALLY -- so a NEW field is fail-safe
+# (included by default; forgetting it is impossible), and only a genuine host-only cap is excluded
+# here.  (``slot_mul_width`` is a cfg-level DSP-estimate scalar, not a StreamerParams field and not
+# a build generic, so it never reaches the wire and is out of scope by construction.)
+_FINGERPRINT_HOST_ONLY = frozenset({"ttl_delay_max_ticks"})
+
+
+def build_fingerprint(params: "StreamerParams") -> int:
+    """32-bit host<->bitstream compatibility fingerprint exposed on CTRL word 63.
+
+    Folds ``LAYOUT_STRUCT_VERSION`` with EVERY StreamerParams geometry field (all fields except the
+    host-only caps in ``_FINGERPRINT_HOST_ONLY``, name-sorted for order stability) so ANY drift --
+    register structure OR geometry -- yields a different value.  The high byte is the 'Z' (0x5A)
+    magic so it is never 0 and self-identifying: an unprogrammed board reads 0 and a foreign
+    bitstream will not match; the low 24 bits are a CRC of the field values.  Deterministic across
+    runs (``zlib.crc32``, not the salted built-in ``hash``)."""
+    names = sorted(f.name for f in _dataclass_fields(params) if f.name not in _FINGERPRINT_HOST_ONLY)
+    payload = struct.pack("<I", LAYOUT_STRUCT_VERSION) + b"".join(
+        struct.pack("<i", int(getattr(params, name))) for name in names)
+    return 0x5A000000 | (zlib.crc32(b"ZLL" + payload) & 0x00FFFFFF)
 
 CMD_LOAD = 1 << 0
 CMD_FIRE = 1 << 1
@@ -137,9 +168,9 @@ class StreamerParams:
     # pure serializer and cannot see the full (scan-expanded) toggle schedule.  Sparse experiment
     # triggers are far below the density cap.
     ttl_delay_max_ticks: int = (1 << 31) - 1
-    evt_fifo_depth: int = 128   # keep == streamer_config.json evt_fifo_depth (the synthesized depth)
-    # per-DA-bit delay FIFO depth (bus_count*bus_width of them, shallower than TTL to fit LUT).
-    bus_evt_fifo_depth: int = 64
+    evt_fifo_depth: int = 64    # keep == streamer_config.json evt_fifo_depth (the synthesized depth)
+    # per-BUS segment-descriptor FIFO depth (bus_count of them; resolved segments in flight, not value-changes).
+    bus_evt_fifo_depth: int = 32
     # DELAY register region: one 32b word per delay-eligible signal -- channel_count TTL channels
     # then bus_count per-bus DAC delays (both 32b now: DAC is event-scheduled per bit, not the old
     # 12b ring, so TTL and DAC ranges match).  128 words reserved (>= channel_count + bus_count).
@@ -900,6 +931,14 @@ def default_params(path: str | Path | None = None) -> StreamerParams:
     return load_streamer_config(path)["params"]
 
 
+# The shipped-config fingerprint: the value a bitstream built from the current streamer_config.json
+# exposes on CTRL word 63, and the RTL's LAYOUT_FINGERPRINT generic default.  Callers wanting "the
+# id of the default build" (tests, the UART/AXI bridge models) use this constant; the per-session
+# connect-check uses build_fingerprint(session.params) so a custom-geometry session is verified
+# against ITS OWN geometry, not the default.
+REGISTER_LAYOUT_ID = build_fingerprint(default_params())
+
+
 def default_part(path: str | Path | None = None) -> str:
     return load_streamer_config(path)["fpga_part"]
 
@@ -981,6 +1020,10 @@ def vivado_generics(params: "StreamerParams") -> "list[str]":
         f"BANK_SIZE={params.bank_size}",
         f"EVT_FIFO_DEPTH={params.evt_fifo_depth}",
         f"BUS_EVT_FIFO_DEPTH={params.bus_evt_fifo_depth}",
+        # The compatibility fingerprint the top exposes on CTRL word 63.  Computed from THIS config
+        # so the bitstream advertises exactly the geometry it was built with; the host connect-check
+        # rejects any pairing whose fingerprint differs (build_fingerprint is the single source).
+        f"LAYOUT_FINGERPRINT={build_fingerprint(params)}",
     ]
 
 

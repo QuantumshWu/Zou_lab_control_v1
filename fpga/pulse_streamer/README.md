@@ -18,8 +18,9 @@ upload flow, and resource budgets) see the **FPGA manual** in
   latency so back-to-back 1-tick (20 ns) edges fire one per clock, a 2-bank
   continuous cyclic ping-pong scan window (`BANK_SIZE`=2048, 4096 resident
   points) for unbounded streamed scans, the affine effective-tick MAC + analog-bus
-  DAC engine, and the per-channel/per-DA-bit event-scheduler output delays
-  (`out[t]=in[t-d]`, event FIFOs popped against a free-running 48-bit `g_time`).
+  DAC engine, and the output delays -- per-channel (TTL) event-scheduler FIFOs +
+  per-bus (DAC) segment-descriptor FIFOs (`out[t]=in[t-d]`, popped against a
+  free-running 48-bit `g_time`).
 - `zlc_pulse_streamer_top.v`: top wrapper. Region-decoded BRAMs behind an
   `axi_bram_ctrl` (edge tables + scan window + bus image) plus a CTRL
   register file (the COMMAND/STATUS mailbox, the streaming `CURSOR`/`BANK_READY`/
@@ -67,7 +68,7 @@ segment, not hundreds of TTL edge rows.
 Default profile (from `host.image.StreamerParams` / `solve_capacity` on the 35T):
 `CHANNEL_COUNT=62`, `NUM_SLOTS=4`, `MAX_EDGES=4096`, `BANK_SIZE=2048` (4096
 resident points), `TICK_WIDTH=32`, `COEFF_WIDTH=16`, `COEFF_FRAC_BITS=8`,
-`RD_LAT=2`, `FIFO_DEPTH=4`, `EVT_FIFO_DEPTH=128`, `BUS_EVT_FIFO_DEPTH=64`,
+`RD_LAT=2`, `FIFO_DEPTH=4`, `EVT_FIFO_DEPTH=64`, `BUS_EVT_FIFO_DEPTH=32`,
 `CLOCK_HZ=50 MHz` (20 ns tick). Vivado `report_utilization` is the final
 resource authority; the conservative host-side estimate (`estimate_resources.bat`)
 is RAMB36 78%, LUT ~97%, FF ~22%, DSP ~58% --- tight on LUTs but the real

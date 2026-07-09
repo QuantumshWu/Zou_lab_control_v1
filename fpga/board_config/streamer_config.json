@@ -30,7 +30,7 @@
     "bus_seg_addr_width": 6,
     "bus_sel_width": 3,
     "slot_mul_width": 25,
-    "evt_fifo_depth": 128,
-    "bus_evt_fifo_depth": 64
+    "evt_fifo_depth": 64,
+    "bus_evt_fifo_depth": 32
   }
 }

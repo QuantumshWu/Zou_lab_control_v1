@@ -21,6 +21,12 @@ import pytest
 
 import Zou_lab_control.neutral_atom as na
 from Zou_lab_control.frontend.content.tutorials import neutral_atom_fpga_server_cells, neutral_atom_hardware_tutorial_cells
+from fpga.pulse_streamer.host import image as _im
+
+# The bitstream's CTRL word-63 readback is the geometry fingerprint (image.build_fingerprint of the
+# shipped config).  Mock hardware serves it DERIVED from that single source, never a stale literal,
+# so a config change that shifts the fingerprint updates every fake in lock-step.
+_LAYOUT_HEX = f"{_im.REGISTER_LAYOUT_ID:08X}"
 
 
 def _decode_axi_writes(text: str) -> list[tuple[int, int]]:
@@ -1747,9 +1753,9 @@ def test_final_image_solver_90pct_and_packs_round_trip():
     assert s.params.max_edges >= 4096
     assert s.params.bank_size >= 512
     # RAMB36 is the solver's BINDING axis (edges are BRAM-bound) and stays <=90% of the part.
-    # LUT now FITS the 90% target too (~89% at the accepted TTL=128 / DA=64 event-FIFO depths --
-    # the estimate is calibrated to the real 2026-06-29 35T ROUTED build, see
-    # image.estimate_resources), so every axis is comfortably under the device.
+    # LUT stays within the 90% target -- the estimate is calibrated to the real 2026-06-29 35T
+    # ROUTED build (that build's TTL=128 / DA=64 event-FIFO depths; see image.estimate_resources)
+    # and the shipped config's shallower FIFOs only lower it, so every axis is under the device.
     assert s.resource_report["ramb36"]["pct"] <= 90.0
     assert all(r["pct"] <= 100.0 for r in s.resource_report.values())
     # DSP = the affine-MAC eval sites (bus start/stop + the 5 main sites); must match the engine.
@@ -1998,20 +2004,39 @@ def test_final_top_regions_match_image_and_has_structure():
         assert ip in text, ip
     # streaming handshake + cursor read-back
     assert "bank_ready" in text and "scan_cursor" in text and "C_CURSOR" in text and "C_BANK_READY" in text
-    # CTRL word map matches host.image.CtrlWords
+    # CTRL word map matches host.image.CtrlWords -- EVERY offset the top declares as a C_<NAME>
+    # localparam, not just the six that used to be pinned, so a moved word (the CLK_ENABLE 46->20
+    # garbled-strobe drift class) is caught here.  Parse+resolve the C_* block (some are literals,
+    # C_CLK_ENABLE is derived as `C_REPEAT_FROM_LOOP_START + 1` -- self-consistent, so resolve it).
     cw = im.CtrlWords
-    for name, off in (("C_COMMAND", cw.COMMAND), ("C_STATUS", cw.STATUS), ("C_PROG_COUNT", cw.PROG_COUNT),
-                      ("C_BANK_SIZE", cw.BANK_SIZE), ("C_CURSOR", cw.CURSOR), ("C_BANK_READY", cw.BANK_READY)):
-        m = re.search(r"localparam integer %s\s*= (\d+);" % name, text)
-        assert m and int(m.group(1)) == off, (name, off, m and m.group(1))
+    words = {n: getattr(cw, n) for n in vars(cw) if not n.startswith("_") and isinstance(getattr(cw, n), int)}
+    assert len(words) >= 20, "CtrlWords enumeration looks empty -- the loop below would vacuously pass"
+    decls = {n: e.strip() for n, e in re.findall(r"localparam integer (C_\w+)\s*=\s*([^;]+);", text)}
+    resolved = {}
+    for _ in range(len(decls) + 1):        # resolve literals then simple `C_X + N` references
+        for name, expr in decls.items():
+            if name in resolved:
+                continue
+            if expr.isdigit():
+                resolved[name] = int(expr)
+            else:
+                ref = re.fullmatch(r"(C_\w+)\s*\+\s*(\d+)", expr)
+                if ref and ref.group(1) in resolved:
+                    resolved[name] = resolved[ref.group(1)] + int(ref.group(2))
+    for name, off in words.items():
+        key = "C_" + name
+        assert key in resolved, f"top.v has no resolvable localparam {key} for image.CtrlWords.{name}={off}"
+        assert resolved[key] == off, f"top.v {key}={resolved[key]} != image.CtrlWords.{name}={off}"
     assert "jtag_axi_0" in text and "axi_bram_ctrl_0" in text
 
 
 def test_register_layout_handshake_rtl_matches_host():
-    """CTRL word 63 must read back the HARDWIRED layout id, equal to host
-    image.REGISTER_LAYOUT_ID.  This is the host<->bitstream layout handshake: a host built
-    for one CtrlWords layout REFUSES a bitstream built for another (the CLK_ENABLE 46->20
-    move ran mismatched on real hardware and garbled the DAC strobes -- silently)."""
+    """CTRL word 63 reads back the GEOMETRY FINGERPRINT, and the top's LAYOUT_FINGERPRINT generic
+    DEFAULT must equal host image.build_fingerprint(default_params()) -- the single source both the
+    connect-check and the Vivado build generic derive from.  This is the host<->bitstream
+    compatibility handshake: a host packing for one geometry REFUSES a bitstream built for another,
+    whether the register STRUCTURE moved (CLK_ENABLE 46->20 garbled the DAC strobes) or any GEOMETRY
+    field drifted (bus_seg_addr_width 6->5 shifted R_DELAY 896 words) -- both silent before."""
 
     import pathlib, re
     from fpga.pulse_streamer.host import image as im
@@ -2019,9 +2044,12 @@ def test_register_layout_handshake_rtl_matches_host():
     top = (pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
     m = re.search(r"localparam integer C_LAYOUT_ID\s*=\s*(\d+);", top)
     assert m and int(m.group(1)) == im.CtrlWords.LAYOUT_ID == 63
-    m = re.search(r"localparam \[31:0\] ZLC_LAYOUT_ID\s*=\s*32'h([0-9A-Fa-f_]+);", top)
-    assert m, "ZLC_LAYOUT_ID missing from the top"
-    assert int(m.group(1).replace("_", ""), 16) == im.REGISTER_LAYOUT_ID
+    # word 63 derives from the LAYOUT_FINGERPRINT generic; its DEFAULT must equal the shipped-config
+    # fingerprint (build_fingerprint(default_params())), which both sides compute from the same code.
+    assert re.search(r"ZLC_LAYOUT_ID\s*=\s*LAYOUT_FINGERPRINT", top), "word 63 must derive from LAYOUT_FINGERPRINT"
+    m = re.search(r"parameter integer LAYOUT_FINGERPRINT\s*=\s*32'h([0-9A-Fa-f_]+)", top)
+    assert m, "LAYOUT_FINGERPRINT generic missing from the top"
+    assert int(m.group(1).replace("_", ""), 16) == im.build_fingerprint(im.default_params()) == im.REGISTER_LAYOUT_ID
     # the read mux must return the constant for word 63 (write-proof read-back)
     assert re.search(r"word_addr\[5:0\] == C_LAYOUT_ID\[5:0\]", top)
     # pack_program must NEVER occupy the layout word (or the COMMAND/STATUS mailbox)
@@ -2031,19 +2059,43 @@ def test_register_layout_handshake_rtl_matches_host():
         assert off not in words, f"pack_program must not write CTRL word {off}"
 
 
+def test_build_fingerprint_covers_geometry_and_ignores_host_caps():
+    """The compatibility fingerprint MUST change when ANY bitstream-affecting geometry field drifts
+    (so a host<->bitstream mismatch is caught, not silently corrupting output) and must NOT change
+    for a host-only validation cap (so tuning a cap needs no rebuild).  Iterating EVERY StreamerParams
+    field mechanically forces build_fingerprint's coverage to match _FINGERPRINT_HOST_ONLY, so a new
+    geometry field can never be silently left out of the handshake."""
+    import dataclasses
+    from fpga.pulse_streamer.host import image as im
+
+    p = im.default_params()
+    base = im.build_fingerprint(p)
+    assert base >> 24 == 0x5A                         # 'Z' magic -> never 0, self-identifying vs a foreign/blank bitstream
+    for f in dataclasses.fields(im.StreamerParams):
+        bumped = dataclasses.replace(p, **{f.name: int(getattr(p, f.name)) + 1})
+        changed = im.build_fingerprint(bumped) != base
+        if f.name in im._FINGERPRINT_HOST_ONLY:
+            assert not changed, f"host-only cap {f.name} must NOT change the fingerprint (no rebuild needed)"
+        else:
+            assert changed, f"geometry field {f.name} MUST change the fingerprint, else its drift is silent"
+
+
 def test_axi_session_refuses_mismatched_register_layout(tmp_path):
-    """prepare() and axi_self_test() must FAIL FAST with a rebuild instruction when the
-    bitstream's layout id differs from the host's (e.g. an old .bit returning 0)."""
+    """prepare() and axi_self_test() must FAIL FAST with a rebuild instruction when the bitstream's
+    geometry fingerprint (CTRL word 63) differs from the host's build_fingerprint(self.params) --
+    e.g. an old .bit returning 0, or any geometry drift (bus_seg_addr_width, evt_fifo_depth, ...)."""
 
     import pytest
     from Zou_lab_control.neutral_atom.devices import axi_session as ax
 
     session = ax.VivadoAxiStreamerSession.__new__(ax.VivadoAxiStreamerSession)
+    session.params = ax.DEFAULT_PARAMS
     session._read_word = lambda off, **kw: 0  # old bitstream: ctrl_reg[63] powers up 0
-    with pytest.raises(RuntimeError, match=r"register-layout mismatch.*[Rr]ebuild"):
+    with pytest.raises(RuntimeError, match=r"geometry/layout mismatch.*[Rr]ebuild"):
         session.check_register_layout()
-    session._read_word = lambda off, **kw: ax.REGISTER_LAYOUT_ID
-    session.check_register_layout()  # matching id -> no raise
+    # the bitstream advertising THIS host's config fingerprint -> no raise (single source)
+    session._read_word = lambda off, **kw: _im.build_fingerprint(session.params)
+    session.check_register_layout()
 
 
 def _minimal_runtime_program():
@@ -2142,8 +2194,8 @@ def test_vivado_axi_session_tolerates_transient_underflow(tmp_path):
                             return f"ZLCDATA {STATUS_RUNNING | STATUS_UNDERFLOW:08X}\n"
                         return f"ZLCDATA {STATUS_RUNNING | STATUS_DONE:08X}\n"
                     return f"ZLCDATA {self.status:08X}\n"
-                if w == 63:   # hardwired register-layout id (current bitstream)
-                    return "ZLCDATA 5A4C4C02\n"
+                if w == 63:   # geometry fingerprint of the params this mock bitstream is built for
+                    return f"ZLCDATA {_im.build_fingerprint(params):08X}\n"
                 return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
             return "ok\n"
 
@@ -2242,8 +2294,8 @@ def test_vivado_axi_session_wait_done_is_reentrant(tmp_path):
                         if self.cursor >= N:
                             self.status |= STATUS_DONE
                     return f"ZLCDATA {self.status:08X}\n"
-                if w == 63:   # hardwired register-layout id (current bitstream)
-                    return "ZLCDATA 5A4C4C02\n"
+                if w == 63:   # geometry fingerprint of the params this mock bitstream is built for
+                    return f"ZLCDATA {_im.build_fingerprint(params):08X}\n"
                 return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
             return "ok\n"
 
@@ -2341,8 +2393,8 @@ def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
                         if self.cursor >= N:
                             self.cursor -= N; self.sweeps += 1
                     return f"ZLCDATA {self.cursor:08X}\n"
-                if w == 63:   # hardwired register-layout id (current bitstream)
-                    return "ZLCDATA 5A4C4C02\n"
+                if w == 63:   # geometry fingerprint of the params this mock bitstream is built for
+                    return f"ZLCDATA {_im.build_fingerprint(params):08X}\n"
                 return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
             return "ok\n"
 
@@ -3592,7 +3644,6 @@ def test_delay_cap_constants_agree_across_layers():
         TTL_DELAY_MAX_TICKS, EVT_FIFO_DEPTH)
 
     assert DELAY_MAX_TICKS == TTL_DELAY_MAX_TICKS == (1 << 31) - 1
-    assert EVT_FIFO_DEPTH == 128
     try:
         import importlib.util as _ilu
         import pathlib as _pl
@@ -3652,6 +3703,8 @@ def test_axi_session_burst_coalesces_contiguous_and_preserves_order(tmp_path):
 def test_axi_session_self_test_catches_scrambled_burst(tmp_path):
     from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
 
+    params = _im.default_params()   # the mock bitstream advertises the default-config fingerprint
+
     class Hw:
         def __init__(self, scramble=False):
             self.bram = {}; self.scramble = scramble
@@ -3666,8 +3719,8 @@ def test_axi_session_self_test_catches_scrambled_burst(tmp_path):
             m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
             if m:
                 w = int(m.group(1), 16) // 4
-                if w == 63:   # hardwired register-layout id (current bitstream)
-                    return "ZLCDATA 5A4C4C02\n"
+                if w == 63:   # geometry fingerprint of the params this mock bitstream is built for
+                    return f"ZLCDATA {_im.build_fingerprint(params):08X}\n"
                 return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
             return "ok\n"
 
@@ -3691,7 +3744,7 @@ def test_axi_self_test_scratch_sits_above_all_defined_ctrl_words(tmp_path):
     from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
     from fpga.pulse_streamer.host.image import CTRL_WORDS, CtrlWords, default_params
 
-    p = default_params()
+    p = params = default_params()   # the mock bitstream advertises the default-config fingerprint
     assert p.ctrl_scratch_base == CtrlWords.CLK_ENABLE + p.clk_enable_words == 22
     assert p.ctrl_scratch_base + 2 <= CTRL_WORDS
 
@@ -3705,8 +3758,8 @@ def test_axi_self_test_scratch_sits_above_all_defined_ctrl_words(tmp_path):
             m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
             if m:
                 w = int(m.group(1), 16) // 4
-                if w == 63:   # hardwired register-layout id (current bitstream)
-                    return "ZLCDATA 5A4C4C02\n"
+                if w == 63:   # geometry fingerprint of the params this mock bitstream is built for
+                    return f"ZLCDATA {_im.build_fingerprint(params):08X}\n"
                 return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
             return "ok\n"
 
@@ -3746,8 +3799,8 @@ def test_clear_host_config_zeroes_delays_and_clk_mask(tmp_path):
             m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
             if m:
                 w = int(m.group(1), 16) // 4
-                if w == 63:   # hardwired register-layout id (current bitstream)
-                    return "ZLCDATA 5A4C4C02\n"
+                if w == 63:   # geometry fingerprint of the params this mock bitstream is built for
+                    return f"ZLCDATA {_im.build_fingerprint(params):08X}\n"
                 return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
             return "ok\n"
 
@@ -4243,8 +4296,8 @@ class _FakeStreamerHardware:
                     else:
                         self.status |= STATUS_DONE
                 return f"ZLCDATA {self.status:08X}\n"
-            if word == 63:   # hardwired register-layout id (current bitstream)
-                return "ZLCDATA 5A4C4C02\n"
+            if word == 63:   # geometry fingerprint of the params this mock bitstream is built for
+                return f"ZLCDATA {_im.build_fingerprint(self.params):08X}\n"
             return f"ZLCDATA {self.bram.get(word, 0):08X}\n"
         return "ok\n"
 
@@ -4446,8 +4499,8 @@ class _CursorScanHardware:
                 if self.fired and not self.forever and self.cursor >= self.n_points - 1:
                     self.status |= STATUS_DONE
                 return f"ZLCDATA {self.status:08X}\n"
-            if word == 63:
-                return "ZLCDATA 5A4C4C02\n"
+            if word == 63:   # geometry fingerprint of the params this mock bitstream is built for
+                return f"ZLCDATA {_im.build_fingerprint(self.params):08X}\n"
             return f"ZLCDATA {self.bram.get(word, 0):08X}\n"
         return "ok\n"
 
@@ -5807,30 +5860,37 @@ def test_delay_event_capacity_counts_full_schedule():
         defaults.update(kw)
         return RuntimeSequenceProgram(**defaults)
 
-    # (a) repeat-forever, d spanning MANY frames is counted ACROSS frames (no modulo):
-    # 4 toggles / 100-tick frame, d=10000 -> ~400 edges in flight >> 128 -> rejected with
-    # the longest physical delay reported (the old one-frame check saw at most 8).
-    ticks = [0, 10, 20, 30, 40, 100]
+    # The delay examples are DERIVED from EVT_FIFO_DEPTH (frame=100 ticks, epf=4 toggles/frame) so
+    # they never need re-tuning when streamer_config.json resizes the FIFO -- verified against the
+    # real validator at the shipped depth (see scratch probe_evt in the delay-capacity work).
+    frame, epf = 100, 4
+    assert EVT_FIFO_DEPTH % epf == 0            # the exact-boundary case below needs a clean naive edge
+    ticks = [0, 10, 20, 30, 40, frame]
     masks = [0, 1 << bit, 0, 1 << bit, 0, 0]
+
+    # (a) repeat-forever, d spanning MANY frames is counted ACROSS frames (no modulo):
+    # d = frame*depth keeps ~epf*depth edges in flight (>> depth) -> rejected with the longest
+    # physical delay reported (the old one-frame check saw at most epf).
     cd = [0] * 62
-    cd[bit] = 10000
+    cd[bit] = frame * EVT_FIFO_DEPTH
     with pytest.raises(ValueError, match="longest physical delay"):
         validate_pulse_streamer_program(prog(ticks, masks, cd, repeat_forever=True), channel_count=62)
-    # a delay whose in-flight count fits passes (d=3000 -> 121 edges in flight <= 128).
+    # a delay whose in-flight count comfortably fits passes (naive ~0.6*depth).
     cd_ok = [0] * 62
-    cd_ok[bit] = 3000
+    cd_ok[bit] = frame * ((EVT_FIFO_DEPTH // epf) * 3 // 5)
     validate_pulse_streamer_program(prog(ticks, masks, cd_ok, repeat_forever=True), channel_count=62)
 
-    # (a3) the periodic count is EXACT: 4/frame, period 100, d=3225 -> 131 in flight;
-    # the naive 4*(3225//100)=128 estimate would (just) pass, but the exact count rejects.
+    # (a3) the periodic count is EXACT: at d = frame*(depth//epf) the NAIVE per-frame estimate
+    # epf*(d//frame) == depth would (just) pass, but the exact across-frame count exceeds depth,
+    # so it rejects.  (At depth=64 this is d=1600: naive 64, exact >64; the depth=128 analog is 3200.)
     cd_exact = [0] * 62
-    cd_exact[bit] = 3225
+    cd_exact[bit] = frame * (EVT_FIFO_DEPTH // epf)
     with pytest.raises(ValueError, match="longest physical delay"):
         validate_pulse_streamer_program(prog(ticks, masks, cd_exact, repeat_forever=True), channel_count=62)
 
-    # (b) scan-point SEAM: 140 toggles at the start of the frame + 140 at the end; a
-    # window bridging the seam holds 280 > 256, while any window inside ONE frame holds
-    # at most ~141 (the old base-frame check passed this).
+    # (b) scan-point SEAM: 140 toggles at the start of the frame + 140 at the end; a window
+    # bridging the seam holds 280 edges (>> the event-FIFO depth), while a window too short to
+    # bridge the seam holds only a handful (the old base-frame check missed the cross-seam pileup).
     seam_ticks = [0] + list(range(1, 141)) + list(range(900, 1040)) + [1040]
     val = 0
     seam_masks = [0]
@@ -5954,28 +6014,32 @@ def test_repeat_forever_delay_is_physical_not_reduced():
     import dataclasses
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
-        steady_sweep_ticks, validate_pulse_streamer_program)
+        steady_sweep_ticks, validate_pulse_streamer_program, EVT_FIFO_DEPTH)
     from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
     from fpga.pulse_streamer.host.engine_model import delay_line_reference, reference_play
 
-    # frame = 2 * 1000 ns / 20 = 100 ticks; ch01 toggles ~twice/frame.  d = 6000 ticks
-    # spans 60 frames -> ~120 edges in flight, which FITS the depth-256 event FIFO.
+    # frame = 2 * 1000 ns / 20 = 100 ticks; ch01 toggles ~twice/frame.  Derive d from
+    # EVT_FIFO_DEPTH so it spans many frames yet keeps the in-flight edge count comfortably under
+    # the FIFO (~2 edges/frame): d = 100 ticks * (EVT_FIFO_DEPTH // 4) frames -> ~EVT_FIFO_DEPTH/2.
+    d_frames = EVT_FIFO_DEPTH // 4
+    d_ticks = 100 * d_frames
+    d_ns = d_ticks * 20                      # 20 ns/tick
     state = na.PulseTableState(
         channels=["ch00", "ch01"], visible_channels=["ch00", "ch01"],
         periods=[na.PulsePeriod(1000, (1, 0), unit="ns"),
                  na.PulsePeriod(1000, (0, 1), unit="ns")],
         time_step_ns=20,
-        delays={"ch01": "120000"},          # 6,000 ticks (60 frames)
+        delays={"ch01": str(d_ns)},          # d_ticks ticks (d_frames frames)
     )
     program = compile_pulse_table_runtime_program(state, repeat_forever=True)
     period = steady_sweep_ticks(program)
     assert period > 0
     bit = program.channels.index("ch01")
     d = int(program.channel_delays[bit])
-    assert d == 6_000                       # NOT reduced -- the true physical delay
-    assert d > period                       # genuinely spans many frames
+    assert d == d_ticks                      # NOT reduced -- the true physical delay
+    assert d > period                        # genuinely spans many frames
     validate_pulse_streamer_program(program, channel_count=len(program.channels))
-    assert program.source_table["delays"]["ch01"] == "120000"
+    assert program.source_table["delays"]["ch01"] == str(d_ns)
 
     # physical: out[t] = in[t-d] for EVERY t, 0 for t < d (first frame correct).
     undelayed = dataclasses.replace(program, channel_delays=None)
@@ -6025,6 +6089,70 @@ def test_evt_fifo_depth_single_source_contract():
     assert int(eng_match.group(1)) == cfg_depth, "engine EVT_DEPTH default != streamer_config.json"
     assert EVT_FIFO_DEPTH == cfg_depth
     assert int(engine_model.EVT_FIFO_DEPTH) == cfg_depth
+
+
+def test_all_geometry_params_config_matches_rtl_defaults():
+    """EVERY geometry parameter the bitstream SYNTHESIZES from must equal streamer_config.json, so the
+    config-derived LAYOUT_FINGERPRINT the host checks at connect ACTUALLY describes the built geometry.
+
+    Most geometry params are NOT Vivado generics (they are pin-coupled to the board XDC + DELAY_CH_MAP):
+    they synthesize from the top.v .v default, so a config edit without a matching .v edit (or vice
+    versa) would build one geometry while the config-built fingerprint advertises another -- and the
+    fingerprint could not tell (its RTL literal is hand-carried from config, not from the RTL geometry).
+    This ONE test pins top.v + engine.v defaults to the config for every geometry knob, including the
+    DERIVED widths (SCAN_ADDR_WIDTH/BUS_INDEX_WIDTH/EDGE_ADDR_WIDTH must equal the width the config
+    implies, so bumping bank_size/bus_count/max_edges without widening them fails HERE) and the
+    hardwired NUM_DELAY_CH engine-instance literal.  (test_evt_fifo_depth_single_source_contract is the
+    5-way host-side extension for the one FIFO depth.)"""
+    import json
+    import pathlib
+    import re
+    from fpga.pulse_streamer.host import image as im
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    cfg = json.loads((root / "fpga" / "board_config" / "streamer_config.json").read_text(encoding="utf-8"))["params"]
+    top = (root / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    eng = (root / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    p = im.default_params()
+
+    def rtl_default(text, name):
+        m = re.search(r"parameter\s+integer\s+%s\s*=\s*(\d+)" % name, text)
+        assert m, f"{name} parameter default missing"
+        return int(m.group(1))
+
+    # top.v param default -> the config-derived value it MUST equal (direct config field OR a width
+    # derived from one, so a config bump that outgrows a hand-set width is caught right here).
+    top_expect = {
+        "CHANNEL_COUNT": p.channel_count, "TICK_WIDTH": p.tick_width, "NUM_SLOTS": p.num_slots,
+        "COEFF_WIDTH": p.coeff_width, "COEFF_FRAC_BITS": p.coeff_frac_bits, "BUS_COUNT": p.bus_count,
+        "BUS_WIDTH": p.bus_width, "BUS_SEG_ADDR_WIDTH": p.bus_seg_addr_width, "BUS_SEL_WIDTH": p.bus_sel_width,
+        "BANK_SIZE": p.bank_size, "EVT_FIFO_DEPTH": p.evt_fifo_depth, "BUS_EVT_FIFO_DEPTH": p.bus_evt_fifo_depth,
+        "EDGE_ADDR_WIDTH": p.edge_addr_width, "SCAN_ADDR_WIDTH": p.scan_addr_width, "BUS_INDEX_WIDTH": p.bus_index_width,
+    }
+    for name, want in top_expect.items():
+        assert rtl_default(top, name) == want, f"top.v {name} != config-derived {want}"
+
+    # every DIRECT config field must also equal the StreamerParams default (config == host default).
+    direct = ("channel_count", "tick_width", "num_slots", "coeff_width", "coeff_frac_bits", "bus_count",
+              "bus_width", "bus_seg_addr_width", "bus_sel_width", "bank_size", "evt_fifo_depth", "bus_evt_fifo_depth")
+    for field in direct:
+        assert int(cfg[field]) == getattr(p, field), f"streamer_config.json {field} != StreamerParams default"
+
+    # engine.v defaults (its EVT/BUS_EVT are named differently) must match too (standalone/xsim path).
+    eng_expect = {
+        "CHANNEL_COUNT": p.channel_count, "NUM_SLOTS": p.num_slots, "COEFF_WIDTH": p.coeff_width,
+        "COEFF_FRAC_BITS": p.coeff_frac_bits, "TICK_WIDTH": p.tick_width, "BUS_COUNT": p.bus_count,
+        "BUS_WIDTH": p.bus_width, "BUS_SEG_ADDR_WIDTH": p.bus_seg_addr_width, "BUS_SEL_WIDTH": p.bus_sel_width,
+        "BANK_SIZE": p.bank_size, "EVT_DEPTH": p.evt_fifo_depth, "BUS_EVT_DEPTH": p.bus_evt_fifo_depth,
+    }
+    for name, want in eng_expect.items():
+        assert rtl_default(eng, name) == want, f"engine {name} != config-derived {want}"
+
+    # NUM_DELAY_CH is a DERIVED host property hardwired at the engine instance in top.v; pin it so a
+    # bus_count/bus_width edit (which changes num_delay_ch) cannot leave the RTL literal stale -- the
+    # engine would then have no delay FIFO for channels the host allows delays on.
+    m = re.search(r"\.NUM_DELAY_CH\((\d+)\)", top)
+    assert m and int(m.group(1)) == p.num_delay_ch, f"top.v .NUM_DELAY_CH({m and m.group(1)}) != num_delay_ch {p.num_delay_ch}"
 
 
 def test_build_geometry_driven_from_config_via_generics():
@@ -6681,8 +6809,9 @@ def test_estimate_resources_matches_solve_capacity_and_reports_pass_fail():
     """solve_capacity now delegates its accounting to estimate_resources (one model), and
     check_config_capacity (the estimate_resources.bat backend) reports per-axis fit.  The
     configured 35T design FITS THE DEVICE and stays under the 90% soft target on EVERY axis
-    -- the estimate is calibrated to the REAL 2026-06-29 routed build (LUT 18607/20800 = 89%
-    at the accepted TTL=128 / DA=64 event-FIFO depths), so the overall 'ok' is True."""
+    -- the estimate is calibrated to the REAL 2026-06-29 routed build (LUT 18607/20800 = 89% at
+    that build's TTL=128 / DA=64 event-FIFO depths; the shipped config's shallower FIFOs only
+    lower it), so the overall 'ok' is True."""
 
     from fpga.pulse_streamer.host import image as im
 
@@ -6693,7 +6822,7 @@ def test_estimate_resources_matches_solve_capacity_and_reports_pass_fail():
     assert result["report"]["lut"]["pct"] <= 90.0                  # LUT now fits UNDER the 90% target...
     assert all(result["report"][axis]["ok"] for axis in ("lut", "ff", "dsp", "ramb36"))  # ...and every axis is in budget
     text = im.format_capacity_report(result)
-    # honest verdict: the 35T HAS enough resources at the accepted TTL=128/DA=64 depths.
+    # honest verdict: the 35T HAS enough resources (estimate calibrated at the 128/64 routed build).
     assert "HAS enough resources" in text and "INSUFFICIENT" not in text
 
 
@@ -7399,11 +7528,13 @@ def test_untouched_dac_bus_idles_at_mid_code():
 
     rtl = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
     assert "parameter integer BUS_SAFE_VALUE = (1 << (BUS_WIDTH - 1))" in rtl
-    # each DA bit's event-FIFO output (bobit) AND its d==1 register (bprev) reset to that bit's
-    # SAFE level (derived from BUS_SAFE_VALUE), so an untouched/not-yet-scheduled bus idles at
-    # the mid-code (0 V).
-    assert "SAFE_BIT = (BUS_SAFE_VALUE >> gbk) & 1" in rtl
-    assert rtl.count("<= SAFE_BIT[0]") >= 2   # bobit + bprev reset paths
+    # g_busseg segment-delay: the per-bus re-player's delayed output `dval` (d>=2) and one-tick
+    # register `dprev` (d==1) BOTH reset to BUS_SAFE_VALUE, and before the first descriptor emits
+    # the delayed view is BSAFE (`dstarted ? dval : BSAFE`); the undelayed view `bus_value_active`
+    # idles at BUS_SAFE_VALUE too -- so an untouched/not-yet-scheduled bus rests at mid-code (0 V).
+    assert "localparam [BUS_WIDTH-1:0] BSAFE = BUS_SAFE_VALUE[BUS_WIDTH-1:0]" in rtl
+    assert "dstarted ? dval : BSAFE" in rtl
+    assert rtl.count("<= BUS_SAFE_VALUE[BUS_WIDTH-1:0]") >= 2   # dval + dprev (and bus_value_active) reset paths
 
 
 def test_period_name_round_trips_and_survives_transforms():
@@ -7463,7 +7594,7 @@ def test_wait_done_drains_the_delayed_tail_and_prepare_does_not_chop_it(tmp_path
             if m:
                 w = int(m.group(1), 16) // 4
                 if w == 63:
-                    return "ZLCDATA 5A4C4C02\n"
+                    return f"ZLCDATA {_LAYOUT_HEX}\n"
                 return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
             return "ok\n"
 
@@ -7524,7 +7655,7 @@ def test_drain_tail_short_budget_keeps_guard_and_running_prepare_aborts_instantl
             if m:
                 w = int(m.group(1), 16) // 4
                 if w == 63:
-                    return "ZLCDATA 5A4C4C02\n"
+                    return f"ZLCDATA {_LAYOUT_HEX}\n"
                 return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
             return "ok\n"
 
@@ -7680,7 +7811,7 @@ class _FakeVivadoProc:
         marker = m.group(1)
         self._out.put(f"{marker}_BEGIN\n")
         if "-type read" in text:
-            self._out.put("ZLCDATA 5A4C4C02\n")          # REGISTER_LAYOUT_ID readback
+            self._out.put(f"ZLCDATA {_LAYOUT_HEX}\n")          # REGISTER_LAYOUT_ID readback
         self._out.put(f"{marker}_OK\n")
         self._out.put(f"{marker}_END\n")
 
@@ -7735,7 +7866,7 @@ def test_axi_session_self_heals_after_close_restart(monkeypatch, tmp_path):
     monkeypatch.setattr(ax.subprocess, "Popen", fake_popen)
     session = ax.VivadoAxiStreamerSession(state_dir=tmp_path, vivado="fake-vivado")
     session.start()
-    assert session._read_word(63) == 0x5A4C4C02
+    assert session._read_word(63) == _im.REGISTER_LAYOUT_ID
 
     old_reader = session._reader
     session.close()                       # generation 1 dies; its reader EOF-sentinels its queue
@@ -7743,7 +7874,7 @@ def test_axi_session_self_heals_after_close_restart(monkeypatch, tmp_path):
     assert not old_reader.is_alive()
 
     # the next transaction must transparently restart a fresh Vivado and SUCCEED
-    assert session._read_word(63) == 0x5A4C4C02
+    assert session._read_word(63) == _im.REGISTER_LAYOUT_ID
     assert len(made) == 2, "expected exactly one transparent restart"
     session.close()
 

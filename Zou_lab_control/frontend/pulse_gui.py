@@ -146,7 +146,7 @@ try:  # the configured event-FIFO depths (changes-in-flight caps); shown in dela
         BUS_EVT_FIFO_DEPTH as _BUS_EVT_DEPTH,   # per DA bus bit
     )
 except Exception:  # pragma: no cover - host tooling optional
-    _EVT_DEPTH = 256
+    _EVT_DEPTH = 64
     _BUS_EVT_DEPTH = 64
 # Unit->ns factors are owned by the timing layer (pulse_table.UNITS_TO_NS) -- import it
 # rather than keep a second near-identically-named copy that could silently drift.
@@ -1469,12 +1469,12 @@ class ChannelPanel(FluentGroupBox):
             if is_bus:
                 delay_edit.setToolTip(
                     "Physical DAC-bus output delay (may be negative): the whole bus value shifts "
-                    "by d, out[t] = in[t-d], first frame correct -- now event-scheduled per bit "
-                    "just like a TTL channel (the bus's 10 bits share this one delay), so the "
-                    f"range matches TTL: up to {_delay_cap_text(state.time_step_ns)}. The limit is "
-                    f"the number of value changes in flight per bit (<= {_BUS_EVT_DEPTH}, the DA "
-                    "per-bit event-FIFO depth), not the delay length; a long delayed ramp is the "
-                    "only thing that can exceed it."
+                    "by d, out[t] = in[t-d], first frame correct -- delayed at the SEGMENT level "
+                    "(each edge/ramp descriptor is re-played d ticks later; the bus's 10 bits share "
+                    f"this one delay), so the range matches TTL: up to {_delay_cap_text(state.time_step_ns)}. "
+                    f"The limit is the number of segments in flight per bus (<= {_BUS_EVT_DEPTH}, the DA "
+                    "per-bus segment-FIFO depth), not the delay length; only a repeat-forever delay "
+                    "spanning many frames can exceed it."
                 )
             else:
                 delay_edit.setToolTip(

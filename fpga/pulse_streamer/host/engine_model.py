@@ -61,11 +61,11 @@ TTL_DELAY_MAX_TICKS = (1 << 31) - 1
 try:
     from fpga.pulse_streamer.host.image import load_streamer_config as _load_cfg
     _CFG = _load_cfg().get("params")                          # a StreamerParams
-    EVT_FIFO_DEPTH = int(getattr(_CFG, "evt_fifo_depth", 128))      # per-channel TTL event FIFO depth
-    BUS_EVT_FIFO_DEPTH = int(getattr(_CFG, "bus_evt_fifo_depth", 64))  # per-DA-bit event FIFO depth
+    EVT_FIFO_DEPTH = int(getattr(_CFG, "evt_fifo_depth", 64))       # per-channel TTL event FIFO depth
+    BUS_EVT_FIFO_DEPTH = int(getattr(_CFG, "bus_evt_fifo_depth", 32))  # per-bus segment FIFO depth
 except Exception:
-    EVT_FIFO_DEPTH = 128
-    BUS_EVT_FIFO_DEPTH = 64
+    EVT_FIFO_DEPTH = 64
+    BUS_EVT_FIFO_DEPTH = 32
 
 
 class DelayTooLargeError(ValueError):

@@ -53,7 +53,7 @@ from fpga.pulse_streamer.host.image import (
     STATUS_RUNNING,
     STATUS_DONE,
     STATUS_ERROR,
-    REGISTER_LAYOUT_ID,
+    build_fingerprint,
 )
 
 # Runtime clock + geometry default come from the single config file
@@ -467,26 +467,30 @@ class VivadoAxiStreamerSession:
 
     # --------------------------------------------------------------- sequencer API
     def check_register_layout(self) -> None:
-        """Verify the bitstream's hardwired register-layout id matches this host.
+        """Verify the bitstream's geometry fingerprint matches what this host packs for.
 
-        The top returns ``ZLC_LAYOUT_ID`` on every AXI read of CTRL word 63
-        (``CtrlWords.LAYOUT_ID``); it must equal ``image.REGISTER_LAYOUT_ID``.  A mismatch
-        means the programmed bitstream was built for a DIFFERENT CtrlWords layout than this
-        host -- every layout-dependent write (the clk mask, the scratch/self-test range,
-        future moves) would silently land in the wrong registers.  That EXACTLY happened
-        when CLK_ENABLE moved 46->20 without a rebuild: the mask went to dead words, the
-        real clk mask kept a stale value, and the DAC strobes ran uncontrolled (garbled
-        first-frame DA output on real hardware).  Fail FAST and tell the user to rebuild."""
+        The top returns its build-time ``LAYOUT_FINGERPRINT`` on every read of CTRL word 63
+        (``CtrlWords.LAYOUT_ID``); it must equal ``image.build_fingerprint(self.params)`` --
+        the fingerprint of the config THIS host packs for.  The fingerprint folds the register
+        STRUCTURE version with EVERY geometry field, so a mismatch means the programmed bitstream
+        was built from a DIFFERENT streamer_config.json than this host: every layout-dependent
+        write would silently land in the wrong registers.  Two real silent-corruption failures
+        this catches: CLK_ENABLE 46->20 (clk mask into dead words -> garbled first-frame DA); and
+        bus_seg_addr_width 6->5 (R_DELAY region shifted down 896 words -> every DAC-scan value and
+        delay wrong even with NO delay programmed).  Fail FAST and tell the user to rebuild."""
 
+        expected = build_fingerprint(self.params)
         got = self._read_word(CtrlWords.LAYOUT_ID)
-        if got != REGISTER_LAYOUT_ID:
+        if got != expected:
             raise RuntimeError(
-                f"register-layout mismatch: bitstream reports 0x{got & 0xFFFFFFFF:08X} at CTRL "
-                f"word {CtrlWords.LAYOUT_ID} but this host expects 0x{REGISTER_LAYOUT_ID:08X}. "
-                "The programmed bitstream was built for a different register layout than this "
-                "host software (an old .bit returns 0 here).  Rebuild the bitstream "
-                "(fpga/build_and_program.bat) and restart the server TOGETHER -- running a "
-                "mismatched pair silently writes the wrong registers (e.g. the DAC clk mask)."
+                f"geometry/layout mismatch: bitstream reports 0x{got & 0xFFFFFFFF:08X} at CTRL "
+                f"word {CtrlWords.LAYOUT_ID} but this host's config fingerprint is 0x{expected:08X}. "
+                "The programmed bitstream was built from a DIFFERENT streamer_config.json geometry "
+                "than this host packs for -- register structure OR any geometry field (max_edges, "
+                "bank_size, bus_seg_addr_width, evt_fifo_depth, ...; an old .bit returns 0 here). "
+                "Rebuild the bitstream (fpga/build_and_program.bat) and restart the server TOGETHER "
+                "-- running a mismatched pair silently writes the wrong registers (e.g. shifts the "
+                "R_DELAY region or the DAC clk mask)."
             )
 
     def prepare(self, program) -> None:

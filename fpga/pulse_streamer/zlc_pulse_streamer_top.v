@@ -54,10 +54,15 @@ module zlc_pulse_streamer_top #(
     parameter integer BUS_WIDTH = 10,
     parameter integer BUS_SEG_ADDR_WIDTH = 6,
     parameter integer BUS_SEL_WIDTH = 3,
-    parameter integer EVT_FIFO_DEPTH = 128,     // TTL delay event FIFO depth (in-flight edges per
+    parameter integer EVT_FIFO_DEPTH = 64,      // TTL delay event FIFO depth (in-flight edges per
                                                 // channel; keep = streamer_config.json evt_fifo_depth)
-    parameter integer BUS_EVT_FIFO_DEPTH = 64   // per-DA-bit delay FIFO depth (40 of them, so shallower
-                                                // than TTL to fit LUT; = streamer_config.json bus_evt_fifo_depth)
+    parameter integer BUS_EVT_FIFO_DEPTH = 32,  // per-BUS segment FIFO depth (bus_count=4 of them, resolved
+                                                // segments in flight; = streamer_config.json bus_evt_fifo_depth)
+    // Host<->bitstream compatibility fingerprint exposed on CTRL word 63 -- image.build_fingerprint of
+    // THIS build's geometry (all StreamerParams geometry fields folded with LAYOUT_STRUCT_VERSION).  The
+    // build passes the config's value via image.vivado_generics; the default here is the shipped-config
+    // value, pinned to image.build_fingerprint(default_params()) by a single-source contract test.
+    parameter integer LAYOUT_FINGERPRINT = 32'h5A87FD36
 )(
     input  wire clk,
     // UART fast-control side-channel (assign to FT2232 ch-B pins, or an external USB-UART on 2 spare
@@ -293,15 +298,16 @@ module zlc_pulse_streamer_top #(
     end
 
     // --- read mux back to AXI -------------------------------------------------
-    // CTRL word 63 reads back a HARDWIRED register-layout id (writes land in ctrl_reg[63]
-    // but are never read back).  The host (image.REGISTER_LAYOUT_ID) verifies it BEFORE
-    // writing anything layout-dependent, so a host built for one CtrlWords layout can
-    // NEVER silently mis-drive a bitstream built for another (e.g. the CLK_ENABLE 46->20
-    // move: the mask landed in dead words and the real clk mask kept a stale value --
-    // uncontrolled da_clk strobes, garbled DAC output).  An OLD bitstream returns
-    // ctrl_reg[63] (power-up 0) here, so a new host refuses it with a clear error.
+    // CTRL word 63 reads back the GEOMETRY FINGERPRINT (LAYOUT_FINGERPRINT generic = this build's
+    // image.build_fingerprint; writes land in ctrl_reg[63] but are never read back).  The host
+    // (build_fingerprint of ITS OWN config) verifies it BEFORE writing anything layout-dependent, so a
+    // host packing for one geometry can NEVER silently mis-drive a bitstream built for another --
+    // whether the register STRUCTURE moved (e.g. CLK_ENABLE 46->20 put the clk mask in dead words) or
+    // any GEOMETRY field drifted (e.g. bus_seg_addr_width 6->5 shifted R_DELAY down 896 words, wrecking
+    // every DAC-scan value + delay).  An OLD bitstream returns its own (different) fingerprint or
+    // ctrl_reg[63]=0 here, so a mismatched host refuses it with a clear "rebuild" error.
     localparam integer C_LAYOUT_ID = 63;
-    localparam [31:0] ZLC_LAYOUT_ID = 32'h5A4C4C02;   // 'ZLL' + layout v2 (CLK_ENABLE@20)
+    localparam [31:0] ZLC_LAYOUT_ID = LAYOUT_FINGERPRINT[31:0];   // geometry fingerprint (image.build_fingerprint)
     always @(*) begin
         if (sel_ctrl) bram_douta = (word_addr[5:0] == C_LAYOUT_ID[5:0])
                                    ? ZLC_LAYOUT_ID : ctrl_reg[word_addr[5:0]];
@@ -313,7 +319,7 @@ module zlc_pulse_streamer_top #(
     // (so u_rd_word is valid only in the NEXT state, D_RLAT) and latches u_rd_data into wbuf THAT SAME
     // D_RLAT cycle.  A registered tap adds a second cycle of latency, so the bridge would capture the
     // PREVIOUS word's value -> every UART read (STATUS/CURSOR/LAYOUT_ID/self-test) returns stale data
-    // (observed on hardware: LAYOUT_ID read back 0 instead of 0x5A4C4C02, auto rejected the UART link).
+    // (observed on hardware: LAYOUT_ID read back 0 instead of the fingerprint, auto rejected the UART link).
     // Combinational makes u_rd_data = f(u_rd_word) valid the moment u_rd_word is, matching the bridge's
     // single-cycle D_READ->D_RLAT handshake.  (Latched into wbuf on the D_RLAT clock edge -> no glitch.)
     always @(*)

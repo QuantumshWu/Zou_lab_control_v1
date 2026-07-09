@@ -622,7 +622,7 @@ program can linger (the real-machine "DA inherits the last program's delay" bug)
 **TTL = EVENT SCHEDULER** (`zlc_edge_streamer.v`): a TTL waveform is toggle-sparse, so
 the engine queues TOGGLES instead of buffering one bit per tick.  When the undelayed bit
 flips at tick `t`, it pushes `{t + d - 1, level}` into that channel's `EVT_DEPTH`-deep
-(default 128) 49-bit LUTRAM FIFO; a free-running 48-bit `g_time` pops it by equality into
+(default 64) 49-bit LUTRAM FIFO; a free-running 48-bit `g_time` pops it by equality into
 the output register (`d == 1` is one register; `d == 0` bypasses).  This is a **TRUE
 physical delay**: `out[t] = in[t-d]` for every `t`, **silent for the first `d` ticks**
 (first frame already correct), with **NO modulo / cyclic reduction** -- the old
@@ -650,15 +650,20 @@ channel's UNDELAYED toggle stream over the WHOLE program -- every scan point at 
 affine-shifted edge times, bracket loops, the repeat-forever wrap -- and takes the exact
 maximum window count (a periodic-stream formula handles `d >= sweep period`).  A delay whose
 in-flight count exceeds `EVT_DEPTH` is REJECTED with the longest physical delay reported;
-nothing is silently dropped.  **DAC buses are UNIFIED into the same event scheduler**: each DA
-bit is its own 1-bit event FIFO (`g_busdly`, fed from `bus_value_active`, reset to that bit's
-`BUS_SAFE_VALUE` level so an untouched bus idles at 0 V), and the bus's `BUS_WIDTH` bits share one
-per-bus 32-bit delay (`del_bus_ticks`) -- so the DAC delay range MATCHES TTL and a negative TTL
-delay's global shift G can reach the buses with no mismatch.  The
-per-bit FIFO is shallower (`BUS_EVT_DEPTH`, default 64; there are bus_count*bus_width = 40 of them)
-to fit LUT -- per the conservative model per-bit @256 = 102.9% (over the device), @64 = ~81%.
-Capacity = value-change events in flight per bit <= `BUS_EVT_DEPTH`; the only stressor is a long
-DELAYED ramp (one event/step).  `bus_evt_fifo_depth` is reconfigurable from streamer_config.json.
+nothing is silently dropped.  **DAC buses delay at the SEGMENT level** (`g_busseg`, replacing the
+old per-DA-bit value FIFO): the engine captures each RESOLVED bus segment it applies -- an
+edge/ramp descriptor `{emit = g_time + d, vstart, target, span, step, mode, frame_end}` -- into a
+per-BUS FIFO (`sfifo`, `BUS_EVT_DEPTH` deep; `bus_count` of them), and a delayed re-player re-runs
+that ramp `d` ticks later on the free-running `g_time` base.  So `out[t] = bus_value[t-d]` by
+construction, and the buffer holds ONE descriptor per segment -- a dense `0->1012 over 500 ticks`
+ramp is a SINGLE entry, not ~500 value events (the density asymmetry the old per-bit FIFO had is
+gone).  The bus's `BUS_WIDTH` bits share one per-bus 32-bit delay (`del_bus_ticks`), so the DAC
+delay range MATCHES TTL and a negative TTL delay's global shift G reaches the buses with no
+mismatch.  Capacity = SEGMENTS in flight per bus <= `BUS_EVT_DEPTH` (edge/ramp = 1 each); a single
+frame can never overflow (bounded by `max_bus_segments`), only a repeat-forever `d` spanning many
+frames.  `bus_evt_fifo_depth` is reconfigurable from streamer_config.json; the per-bus segment
+TABLE depth is `1 << bus_seg_addr_width` (`max_bus_segments`) which -- unlike `evt_fifo_depth` --
+is NOT a passed generic, so the `.v` default must equal the config (a contract test pins it).
 
 **Reconfigurable depth (single source).**  `evt_fifo_depth` lives only in
 `streamer_config.json`.  The host (validator/estimate) reads it; the BUILD reads it too --
@@ -666,18 +671,21 @@ DELAYED ramp (one event/step).  `bus_evt_fifo_depth` is reconfigurable from stre
 EDGE_ADDR_WIDTH, BANK_SIZE), `build_and_program.bat --emit-geom-tcl` generates `geom.tcl`,
 and `create_project.tcl` sources it + `set_property generic ... [current_fileset]` so editing
 the JSON changes the SYNTHESIZED bitstream (exactly how the default became 128 when the
-256 build was LUT-tight).  A contract test asserts every generic names a real top
-parameter (else Vivado ignores it).
+256 build was LUT-tight, then 64 when the g_busseg segment-delay build was LUT-tight).  A
+contract test asserts every generic names a real top parameter (else Vivado ignores it).
 
 Proven: `delay_line_reference` (out[t]=in[t-d]) is the unchanged ground truth;
 `engine_model.rtl_delay_line_mirror` mirrors the scheduler cycle-exactly; the REAL RTL is
 verified in xsim -- `tb_delay_sched.v` (delays {0,1,2,7,1000}, 1-tick toggles, repeat seams:
 11,996 cycles, 0 mismatches, DELAY-SCHED-OK), `tb_delay_compact.v` (non-identity slot->channel
 map, COMPACT-MAP-OK), `tb_evt_depth.v` (FIFO-depth boundary behavior pinned at a small
-EVT_DEPTH=16 so the TB can actually hit the boundary, EVT-DEPTH-OK).  Conservative
-estimate at the current defaults (EVT=128, BUS_EVT=64): RAMB36 78% / LUT ~97% / FF ~22% /
-DSP ~58% on the 35T -- tight on LUTs but the real implementation closes (the estimate
-overcounts distributed RAM; the per-slot LUTRAM is ~0.7-1.0 LUT per 64x1 cell).
+EVT_DEPTH=16 so the TB can actually hit the boundary, EVT-DEPTH-OK).  LUT is the binding axis on
+the 35T: the g_busseg segment-delay build at EVT=128 / BUS_EVT=64 / bus_seg_addr_width=6 placed
+OVER the device (~21958 of 20800 Slice LUTs), so the shipped config drops to EVT=64 (halves the
+TTL event LUTRAM, ~-1.2k LUT) and bus_seg_addr_width=5 (halves the per-bus segment tables, ~-0.7k
+LUT), bringing it to ~20.0k -- under the part with ~0.8k margin.  (The `estimate_resources` model
+is calibrated to the OLDER 2026-06-29 routed build and does NOT yet include the g_busseg cost, so
+its LUT% reads low; the real fit is confirmed by the on-bench rebuild.)
 
 ## 9. Pulse API, sync-to-device and GUI state semantics
 

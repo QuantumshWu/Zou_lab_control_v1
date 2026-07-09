@@ -47,8 +47,8 @@ try:  # pragma: no cover - exercised whenever the fpga package is importable (th
     DEFAULT_SCAN_COEFF_FRAC_BITS = int(_CFG_PARAMS.coeff_frac_bits)
     DEFAULT_NUM_SLOTS = int(_CFG_PARAMS.num_slots)
     TTL_DELAY_MAX_TICKS = int(getattr(_CFG_PARAMS, "ttl_delay_max_ticks", (1 << 31) - 1))
-    EVT_FIFO_DEPTH = int(getattr(_CFG_PARAMS, "evt_fifo_depth", 128))
-    BUS_EVT_FIFO_DEPTH = int(getattr(_CFG_PARAMS, "bus_evt_fifo_depth", 64))
+    EVT_FIFO_DEPTH = int(getattr(_CFG_PARAMS, "evt_fifo_depth", 64))
+    BUS_EVT_FIFO_DEPTH = int(getattr(_CFG_PARAMS, "bus_evt_fifo_depth", 32))
     DEFAULT_SLOT_MUL_WIDTH = int(_STREAMER_CFG["slot_mul_width"])
     DEFAULT_BUS_COUNT = int(_CFG_PARAMS.bus_count)
     DEFAULT_BUS_WIDTH = int(_CFG_PARAMS.bus_width)
@@ -63,8 +63,8 @@ except Exception:  # pragma: no cover - fpga package not importable; use shipped
     DEFAULT_SCAN_COEFF_FRAC_BITS = 8
     DEFAULT_NUM_SLOTS = 4
     TTL_DELAY_MAX_TICKS = (1 << 31) - 1
-    EVT_FIFO_DEPTH = 128
-    BUS_EVT_FIFO_DEPTH = 64
+    EVT_FIFO_DEPTH = 64
+    BUS_EVT_FIFO_DEPTH = 32
     # Affine-MAC slot operand width -- MUST match zlc_edge_streamer.v SLOT_MUL_WIDTH and
     # engine_model.SLOT_MUL_WIDTH.  Each scan slot VALUE x a 16-bit coeff fits one DSP48E1
     # (25x18), so the slot operand is the low 25 bits as signed; the validator rejects a

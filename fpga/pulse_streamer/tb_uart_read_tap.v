@@ -3,7 +3,7 @@
 // uart_tx.  Covers every UART bug hardware surfaced (all invisible to the functional Python model):
 //   1. read-tap latency   -- top's u_rd_data tap must be COMBINATIONAL (registered -> stale reads).
 //   2. reply byte mux      -- `pj[1:0]<<3` truncates to 2 bits -> every payload byte = byte 0
-//                             (0x5A4C4C02 -> 0x02020202).  Must be {pj[1:0],3'b000}.
+//                             (0x5A87FD36 -> 0x36363636).  Must be {pj[1:0],3'b000}.
 //   3. write last-word drop -- D_COMMIT dropped u_active the SAME cycle the last u_we takes effect,
 //                             so the top's uart_sel=u_active mux routed it to idle JTAG (every write
 //                             lost its last word; a 1-word write lost everything).  Fixed by D_WEND.
@@ -11,7 +11,7 @@
 // The tb models the top's UART write into ctrl_reg WITH the u_active gate, so bug 3 is reproduced.
 // Compile: xvlog zlc_uart_bridge.v tb_uart_read_tap.v ; xelab tb_uart_read_tap -s t ; xsim t -R
 module tb_uart_read_tap;
-    localparam [31:0] LAYOUT = 32'h5A4C4C02;
+    localparam [31:0] LAYOUT = 32'h5A87FD36;   // current shipped image.build_fingerprint (word-63 readback)
     real BITT = 333.333;                            // 3 Mbaud bit period (ns)
 
     reg clk = 1'b0;  always #10 clk = ~clk;         // 50 MHz
