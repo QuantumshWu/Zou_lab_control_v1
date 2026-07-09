@@ -67,20 +67,19 @@ neutral_atom/
 
 **默认初始化入口 = `na.device_manager("virtual")`**：打开设备管理器 GUI(config 编辑器),传 `"virtual"` **自动载入虚拟设备图**;点绿色 **Init devices** 就 `na.connect` 这份 config,连出的 session 经窗口交回 `mgr.session`。换实机时在这里把相机类型从 `virtual` 换成 `qcmos`(或 Load 一份实机 config),下面的分析代码一行都不用动。
 
-不想开 GUI 时,等价的一行 `na.connect("virtual", ...)` 直连——下面第二格就是这个回落分支,并显式带上本教程下游用到的 5×7 sitemap 参数。
+两条**二选一**的入口(别混用):**A** GUI 交互 —— 开管理器、点 Init、`exp = mgr.session`;**B** 不开 GUI —— 等价的一行 `na.connect("virtual", ...)` 直连。下面用 A;想走 B 就把那一行换成注释里的 `na.connect(...)`。
 
 <!-- cell:code -->
 mgr = na.device_manager("virtual")
 
 <!-- cell:code -->
-# GUI 里点过 "Init devices" 后,session 经窗口交回 mgr.session;没开 GUI(或还没点 Init)
-# 时回落到等价的一行直连,并显式带上本教程下游用到的 5×7 sitemap 参数。
-exp = mgr.session or na.connect(
-    "virtual",
-    bright_count_rate=3000,
-    loss_rate=0.1,
-    sitemap={"grid_shape": (5, 7), "spacing_px": 12.0, "roi_radius": 1, "sitemap_exposure": 0.02},
-)
+# 路径 A:在上面的窗口里点过绿色 "Init devices" 后,运行本格 —— session 经窗口交回 mgr.session。
+# (没点 Init 时 mgr.session 就是 None,一目了然;它不会偷偷替你连一个别的 config。)
+#
+# 路径 B(二选一,不开 GUI):把下一行整格换成这一行直连,显式带上本教程下游用到的 5×7 sitemap:
+#   exp = na.connect("virtual", bright_count_rate=3000, loss_rate=0.1,
+#                    sitemap={"grid_shape": (5, 7), "spacing_px": 12.0, "roi_radius": 1, "sitemap_exposure": 0.02})
+exp = mgr.session
 exp
 
 <!-- cell:markdown -->

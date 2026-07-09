@@ -55,6 +55,20 @@ def test_shipped_notebook_matches_its_template(name, cells_fn):
         f"edit the template and regenerate with the matching zf.write_*_tutorial().")
 
 
+@pytest.mark.parametrize("name,cells_fn", CASES, ids=[c[0] for c in CASES])
+def test_no_tutorial_code_cell_fuses_two_init_paths_with_or(name, cells_fn):
+    """A GUI-lifecycle sentinel (``mgr.session`` is None until "Init devices") must NEVER be fused with
+    a fallback ``na.connect(...)`` via ``or`` in a CODE cell: on any re-eval before Init that ``or``
+    would SILENTLY connect a hardcoded config, clobbering a real-hardware session.  The two init paths
+    -- GUI-interactive (``exp = mgr.session``) and the headless one-liner (``exp = na.connect(...)``) --
+    stay separate.  Prose/comment may say "the session, or connect directly"; executable code may not."""
+    for c in cells_fn():
+        if c["kind"] == "code":
+            assert ".session or " not in str(c["source"]), (
+                f"{name}: a code cell fuses the manager session with an `or na.connect(...)` fallback -- "
+                f"split the two init paths; put the headless one-liner in prose/comment, never `or`-fused.")
+
+
 def test_writers_are_idempotent(tmp_path):
     """Each writer round-trips: regenerating a template into a fresh file reproduces the
     same cell sources (no hidden nondeterminism in the generation path)."""
