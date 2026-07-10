@@ -95,6 +95,67 @@ def test_lazy_state_and_lock_are_created_once_atomically():
     assert cam._acquire_lock() is cam._acquire_lock()          # one lock, never two
 
 
+def test_arm_is_bounded_and_cancellable_when_the_camera_is_contended():
+    """#6 (MOT-field 0% hang): arm() must NOT block forever on the acquisition lock -- a Stop has to
+    break a wait on a session another (possibly abandoned) consumer still holds, and a timeout must
+    fail loudly instead of wedging.  arm now joins read/disarm's bounded+cancellable contract:
+      * with a ``stop`` event that fires -> AcquisitionCancelled (a clean Stop, not a fault);
+      * with a ``timeout`` that expires -> TimeoutError;
+      * with neither (legacy) -> the old blocking acquire is preserved.
+    Pinned by holding the lock from a second thread and confirming arm() returns control promptly."""
+    import threading
+    import time as _time
+
+    from Zou_lab_control.neutral_atom.devices.base import AcquisitionCancelled
+    cam, _seqr = _rig()
+
+    # A rival consumer holds the acquisition lock from ANOTHER thread (the acquire lock is an RLock:
+    # holding it in the calling thread would let arm re-enter it, so the contention must be cross-thread,
+    # exactly the real case -- a live monitor's abandoned worker still holding the sensor).
+    held = threading.Event()
+    release = threading.Event()
+
+    def _holder():
+        cam._acquire_lock().acquire()
+        held.set()
+        release.wait(5.0)
+        cam._acquire_lock().release()
+
+    holder = threading.Thread(target=_holder, daemon=True)
+    holder.start()
+    assert held.wait(2.0), "rival thread failed to take the acquisition lock"
+    try:
+        # (a) stop cancels the wait cooperatively and promptly
+        stop = threading.Event()
+        threading.Timer(0.1, stop.set).start()
+        t0 = _time.monotonic()
+        try:
+            cam.arm(1, stop=stop)
+        except AcquisitionCancelled:
+            pass
+        else:
+            raise AssertionError("contended arm(stop=...) must raise AcquisitionCancelled, not wedge")
+        assert _time.monotonic() - t0 < 2.0, "cancellation must be prompt, not an unbounded wait"
+
+        # (b) timeout fails loudly rather than blocking forever
+        try:
+            cam.arm(1, timeout=0.2)
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError("contended arm(timeout=...) must raise TimeoutError")
+    finally:
+        release.set()
+        holder.join(2.0)
+
+    # (c) once free, a plain arm still works and holds the lock (legacy contract intact)
+    cam.arm(1)
+    try:
+        assert cam._recent_state()["armed"] is True
+    finally:
+        cam.disarm()
+
+
 def test_triggered_frames_waits_for_the_finite_program_before_returning():
     """B2: reading the frames back is NOT the end of a finite program -- the sequence may keep
     playing past its last camera window (post-imaging reload / repump / reset segments carry no

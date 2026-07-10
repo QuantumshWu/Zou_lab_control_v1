@@ -189,8 +189,13 @@ class OptimizeMotFieldTask(Task):
         out.publish(progress=0.0, stage=f"sweeping {nx}x{ny}x{nz} coil grid on {slots}",
                     grid=block.reshape(1, -1, 1).copy())
         done = 0
-        self.camera.arm(n_total)
+        if self._stop.is_set():
+            raise RuntimeError("MOT field scan stopped before arming the camera.")
         try:
+            # Cancellable arm INSIDE the try: a Stop while the shared monitor camera is still held
+            # by another (possibly abandoned) session raises AcquisitionCancelled instead of wedging
+            # this task at progress 0 with no way out; the finally then disarms cleanly.
+            self.camera.arm(n_total, stop=self._stop)
             program = prepare_hardware_scan(self.sequencer, state, scan_repeats=1)
             for i, bx in enumerate(axes[0]):
                 for j, by in enumerate(axes[1]):

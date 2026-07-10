@@ -163,7 +163,7 @@ def triggered_frames(camera, sequencer, sequence, frames: int = 1, *, stop=None)
     if sequencer is None:
         return camera.acquire(frames, stop=stop)
     program = _program_for_frames(camera, sequence, frames)
-    camera.arm(frames)
+    camera.arm(frames, stop=stop)          # cancellable arm-before-fire (a Stop breaks a lock wait)
     try:
         sequencer.prepare(program)
         sequencer.fire(program)

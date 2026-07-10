@@ -766,7 +766,7 @@ class CameraDevice(BaseDevice):
                 f"unknown configure option(s) {unknown}; configurable: {sorted(allowed)}")
 
     # ------------------------------------------------------------- acquisition
-    def arm(self, frames: int | None = None) -> None:
+    def arm(self, frames: int | None = None, *, timeout: float | None = None, stop=None) -> None:
         """Ready the camera for ``frames`` externally triggered frames (None = continuous).
 
         When this method RETURNS the hardware is armed and waiting for triggers, so a fire
@@ -775,13 +775,21 @@ class CameraDevice(BaseDevice):
         sequencer, then :meth:`read_frames`).  Frames arriving while armed are queued
         losslessly until read.  Arming also takes the camera's acquisition lock, serializing
         concurrent consumers (a live monitor polling :meth:`acquire` waits while a
-        measurement holds an armed session); :meth:`disarm` releases it."""
+        measurement holds an armed session); :meth:`disarm` releases it.
+
+        Taking that lock is BOUNDED + CANCELLABLE, exactly like :meth:`read_frames` /
+        :meth:`_grab`: ``timeout`` (seconds) caps the wait for the lock and raises
+        ``TimeoutError`` if another consumer still holds an armed session; ``stop`` (a
+        ``threading.Event``) cancels the wait cooperatively and raises
+        :class:`AcquisitionCancelled`.  Passing NEITHER preserves the legacy unbounded blocking
+        acquire.  This is the ONE fix that stops a contended arm from wedging a task at 0% with
+        no way for Stop to break it -- arm now joins read/disarm's cancellable contract."""
         self.ensure_open()          # lazy-open on first use (session contract) -- BEFORE the lock,
                                     # so a failed open never leaves the acquire lock held; a backend
                                     # never raises "arm before open", it just gets opened.
         if frames is not None:
             frames = positive_int(frames, "frames")
-        self._acquire_lock().acquire()
+        self._acquire_session_lock(timeout=timeout, stop=stop)
         state = self._recent_state()
         with state["cond"]:
             state["pending"].clear()
@@ -853,7 +861,7 @@ class CameraDevice(BaseDevice):
         its sequencer between arm and read: use the single measurement-layer helper
         ``operations.measurement.triggered_frames`` (never hand-roll prepare+fire)."""
         frames = positive_int(frames, "frames")
-        self.arm(frames)
+        self.arm(frames, stop=stop)          # cancellable arm too, so a Stop breaks a lock wait
         try:
             return self.read_frames(frames, stop=stop, **kwargs)
         finally:
@@ -917,6 +925,33 @@ class CameraDevice(BaseDevice):
         :meth:`_recent_state`) so concurrent first touches share ONE lock -- a check-then-set
         would let two threads build two locks and defeat the mutual exclusion."""
         return self.__dict__.setdefault("_zlc_acquire_lock", threading.RLock())
+
+    def _acquire_session_lock(self, *, timeout: float | None, stop=None) -> None:
+        """Take the acquisition lock for an armed session, BOUNDED + CANCELLABLE (the same
+        poll-with-deadline idiom :meth:`_grab` uses to await a frame).  With neither ``timeout``
+        nor ``stop`` this is the legacy blocking acquire (unbounded, uninterruptible) -- callers
+        that don't opt in keep the old behaviour.  With ``stop`` it polls so a cooperative Stop
+        breaks a wait on a lock another (possibly abandoned) consumer still holds, raising
+        :class:`AcquisitionCancelled`; with ``timeout`` it raises ``TimeoutError`` once the
+        budget is spent.  Raising here (before any ``armed`` state is set) leaves the camera
+        untouched, so no disarm is owed on the cancel/timeout path."""
+        lock = self._acquire_lock()
+        if stop is None and timeout is None:
+            lock.acquire()
+            return
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        while True:
+            if stop is not None and stop.is_set():
+                raise AcquisitionCancelled(
+                    "camera arm cancelled before the acquisition lock was free.")
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0.0:
+                raise TimeoutError(
+                    f"camera still armed by another consumer after {float(timeout):.1f}s; "
+                    "refusing to arm (another armed session has not been released).")
+            slice_ = 0.05 if remaining is None else min(0.05, remaining)
+            if lock.acquire(timeout=slice_):
+                return
 
     def _deliver(self, images) -> list[np.ndarray]:
         """Queue freshly captured frames: into the lossless armed ``pending`` queue (when
