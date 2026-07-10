@@ -66,7 +66,7 @@
   \item \tfocus{逻辑节点共享一个基类}。三类生产节点（measurement / processor / task）都继承 \pyapi{LogicNode}，共用同一套 worker-loop + 协作取消 + owner-thread 参数队列，所有节点都可同步驱动（\pyapi{step()}，测试/notebook）或后台线程（\pyapi{start(rate\_hz=)}）——不是各类节点各写一份循环。
   \item \tfocus{数据来源是表达式，不是下拉框}。面板不绑定到某个固定信号，而是跑一行 Python（\pyapi{value = ...}），所以"两个实验装载率相减"这种需求天然支持，且新增信号无需改 GUI。
   \item \tfocus{美术/几何由 frontend 拥有，对外密封}。面板尺寸只能从有限预设里选，dpi/边距/字号/阴影/缩放规则外部都改不了——这样任意类型/尺寸的面板能严丝合缝拼接，且在不同 Windows DPI 下不崩。
-  \item \tfocus{Setting 走 confocal 竖排，重处理进 Edit 标签}。Setting 放 source/display/unit/limits/panel，以及该 plot family 可用的 live fit 模型与显式 selection action；它与 Edit 都只生成同一个 \pyapi{FitRequest}。Edit 另放冻结快照、source acquisition、limits、通用 command 与 Save。逻辑节点参数 + Start/Stop 在节点自己的 Logic Edit。
+  \item \tfocus{Setting 走 confocal 竖排，重处理进 Edit 标签}。Setting 放 source/display/unit/limits/panel，外加 \tfocus{Analysis} 一节：一个 action 下拉（none / curve fit / ROI，按 render\_family 能力表出现）+ 模型下拉 + fix/seed 编辑器；它与 Edit 都只生成同一个 typed \pyapi{FitRequest}，且都从 \pyapi{config.params['fit\_request']} 是否存在这唯一状态派生（拟合开关不再有第二份），故两处永不打架。Edit 另放冻结快照、source acquisition、limits、通用 command 与 Save。逻辑节点参数 + Start/Stop 在节点自己的 Logic Edit。
   \item \tfocus{参数声明一次，API 与 GUI 同源}（借鉴 confocal 的"caller 签名=单一真相源"，但用\tfocus{显式声明}而非签名反射/AST）。measurement 用 \pyapi{MeasurementSpec}/\pyapi{ParamDecl}、processor 用 \pyapi{ProcessorSpec}、task 用 \pyapi{TaskSpec} 把它的可扫描/可调参数声明一次，API 默认值与 GUI 自动表单都从这份声明派生 → 杜绝两边漂移。
   \item \tfocus{虚拟与真机零修改通用}。逻辑节点发布的 typed 信号名（\pyapi{frame\_0}/\pyapi{counts}/\pyapi{occupied}/\pyapi{centers}/\pyapi{rate}……）就是约定；每个节点只走相机/sequencer/标定契约（不 import 具体后端、不读仿真真值）。真机沿用同名发布、同一节点，命名布局与测量在两边都能用。
 \end{enumerate}

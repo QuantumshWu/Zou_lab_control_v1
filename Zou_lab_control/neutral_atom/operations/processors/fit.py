@@ -101,12 +101,12 @@ class FitProcessor(Processor):
         array = np.asarray(value)
         if len(self._input_tensors) != 1:
             raise ValueError(
-                "Fit center requires exactly one registered canonical image source.")
+                "Frame fit requires exactly one registered canonical image source.")
         tensor = next(iter(self._input_tensors.values()))
         schema = tensor.schema
         if tuple(schema.data_shape) != tuple(array.shape[2:]) or len(schema.data_shape) != 2:
             raise ValueError(
-                "Fit center requires schema data_shape=(H,W); "
+                "Frame fit requires schema data_shape=(H,W); "
                 f"got data_shape={schema.data_shape}, evaluated shape={array.shape}.")
         if array.ndim != 4 or tuple(array.shape[:2]) != tuple(tensor.valid.shape):
             raise ValueError(

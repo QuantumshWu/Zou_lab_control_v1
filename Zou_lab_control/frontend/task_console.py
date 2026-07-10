@@ -1697,11 +1697,11 @@ class PanelCard(FluentGroupBox):
         # this panel's signal (the "draw a box -> get roi_frame/roi_value signals" gesture).
         self.area_select_sink = area_select_sink
         # callable(card, action) -> the console's ONE selection-teardown sink, symmetric for BOTH
-        # selection actions (#10): leaving/clearing an action STOPS + removes the hub node that action
-        # created for this card's signal -- a FitProcessor for "fit" (unchecking live fit), a
-        # RoiProcessor for "roi" (switching the ROI selector off).  Both have a full create-on-apply /
+        # analyses (#10): leaving/clearing an analysis STOPS + removes the hub node it created for this
+        # card's signal -- a FitProcessor for "fit" (clearing the curve fit / picking a non-fit action),
+        # a RoiProcessor for "roi" (switching the ROI action off).  Both have a full create-on-apply /
         # remove-on-clear lifecycle, so neither lingers as an orphan republishing after the operator
-        # turned its selection off.
+        # turned its analysis off.
         self.selection_clear_sink = selection_clear_sink
         # callable(card, request) -> the console's ONE fit-node sink: create OR retarget the hub
         # FitProcessor that publishes a 2-D image fit's parameters as signals (fit_x0/... ), for the

@@ -4215,8 +4215,10 @@ class GridCell:
     #: built-in fit sets this ``False`` so the general fit is a NO-OP on it -- a histogram cell has the
     #: bimodal readout fit, and stacking a 1-D peak model on the counts array fit it with an absurd curve
     #: and dimmed the bimodal (#dis-fit mess).  The x-window pin (``view_xlim``) is unaffected (it is not a
-    #: fit).  Mirrors the console's :func:`task_console._kind_offers_general_fit` (which hides the fit UI for
-    #: the same families), so an incompatible request is inert here.
+    #: fit).  This is the grid-CELL gate: a hist cell sets it False so a stored fit request never draws an
+    #: inert curve on the thumbnails (nor leaks into the saved recipe).  It is a rendering fact of the cell
+    #: family, independent of the panel-level capability table (:func:`live.general_fit_models`) that decides
+    #: which models the Setting/Edit Analysis section OFFERS -- a standalone hist still offers the general fit.
     supports_general_fit: bool = True
 
     def thumb_lims(self, auto_lo: float, auto_hi: float) -> tuple[float, float]:

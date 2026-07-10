@@ -99,7 +99,7 @@ def test_explicit_roi_action_creates_then_retargets_a_roi_node():
         # #10 SYMMETRIC TEARDOWN: leaving the ROI action STOPS + REMOVES the RoiProcessor through the
         # ONE selection-teardown seam, exactly as clearing a fit removes its FitProcessor -- no orphan
         # that keeps consuming after the operator switched the selector off.  The card wires this seam
-        # to _on_selection_action_changed (an action change from "roi") and to _clear_fit_request.
+        # to _select_analysis_action (an Analysis action change away from "roi") and to set_fit_request(None).
         assert callable(card.selection_clear_sink)
         card.selection_clear_sink(card, "roi")
         assert len(con.logic_nodes) == n_rows                           # the ROI row is gone

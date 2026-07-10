@@ -880,7 +880,7 @@ Task 控制台（\filepath{task\_console.bat} / \pyapi{frontend.show\_task\_cons
 \end{description}
 
 \section{Setting：每个面板的基本配置}
-卡片标题行右端的 \pyapi{Setting} 打开竖排设置。除 Source/Display/Unit/Limits/Panel 外，兼容的 plot family 还显示 typed Selection action 与 live fit：模型 + selection 组成 \pyapi{FitRequest}，无自由文本 fit 参数。
+卡片标题行右端的 \pyapi{Setting} 打开竖排设置。除 Source/Display/Unit/Limits/Panel 外，还有 \tfocus{Analysis} 一节：一个 action 下拉决定拖框选区做什么——\pyapi{none} / \pyapi{curve fit} / \pyapi{ROI}（按 plot family 的能力表出现）；选 \pyapi{curve fit} 时下面出现模型下拉与紧凑的 fix/seed 逐参数编辑器，组成同一个 typed \pyapi{FitRequest}（\pyapi{fixed}/\pyapi{initial}，无自由文本 fit 参数）。曲线拟合是否开启的\tfocus{唯一状态}就是 \pyapi{config.params['fit\_request']} 是否存在，Setting 与 Edit 两处控件都从它派生，永不打架。
 \begin{description}
   \item[Source（接什么数据）] \pyapi{signal} 下拉列出 hub 里\tfocus{此刻真实存在的所有信号名}——选一个，面板立即切到 \pyapi{value = 信号名}，不用打字。要做运算（差值、切片、历史堆叠）就在下面的表达式框写一行 Python 并点 \pyapi{Apply}（或回车）；下拉会自动回显纯信号表达式。命名空间：每个信号名（最新值）、\pyapi{history(name, n)}、\pyapi{latest(name)}、\pyapi{names()}、\pyapi{shot}、\pyapi{np}、\pyapi{math}。表达式出错时 \pyapi{Setting} 按钮变红，错误只落在\tfocus{该面板自己}的状态行，其余面板照常刷新。
   \item[Display（怎么显示）] \pyapi{size} 尺寸预设；2D / Site map 的 \pyapi{colormap}——\tfocus{这就是改 colorbar 配色（colorset）的地方}（没有"显隐 colorbar"开关，因为带 colorbar 的图恒显 colorbar）；以及各类型的\tfocus{声明式参数}（\pyapi{PANEL\_PARAMS} 里一行一个 \pyapi{ParamDecl}，控件由 \pyapi{param\_widgets.PARAM\_WIDGETS} 注册表按 kind 自动生成）：Site map 的 \pyapi{centers}/\pyapi{image} 信号名（\pyapi{image} 留空＝不垫相机帧）、Rolling trace 的历史长度、Distribution 的 bin 数。
