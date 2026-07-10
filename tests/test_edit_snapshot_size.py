@@ -123,6 +123,29 @@ def test_edit_snapshot_canvas_stays_fixed_after_a_resync():
         exp.close()
 
 
+def test_edit_tab_opens_even_when_snapshot_refresh_raises():
+    """#1 ('edit tab 点不开', intermittent): opening a panel's Edit tab must never depend on a clean
+    hub tick.  PanelEditor's construction snapshot calls ``console.refresh_once()``; a mid-session
+    signal with no retained state at the current display provenance raises there (SignalHistoryGap).
+    That refresh is best-effort now, so the raise no longer aborts PanelEditor construction -- the tab
+    still registers/opens, snapshotting whatever the plotter already holds."""
+    ensure_qt_app()
+    exp, console = _console()
+    try:
+        card = _hist_card(console)
+
+        def _boom():
+            raise RuntimeError("signal fit_amplitude has no retained state for provenance 10")
+
+        console.refresh_once = _boom
+        console._edit_card(card)
+        assert console._panel_editors.get(id(card)) is not None, \
+            "the Edit tab must open even when the snapshot refresh raises"
+    finally:
+        console.shutdown()
+        exp.close()
+
+
 def test_edit_sites_snapshot_honours_relim_and_fixed_lim():
     """#4 symptom 3: the Edit snapshot of a Site map must re-render when its lim mode (tight/normal) OR
     fixed lo/hi changes.  The ``sites`` branch used to OMIT relim/fixed in the snapshot builder, so a

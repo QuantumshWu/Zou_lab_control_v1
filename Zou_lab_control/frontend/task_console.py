@@ -5127,8 +5127,16 @@ class PanelEditor(QtWidgets.QWidget):
             return
         # Snapshot the MOST RECENT frame: pull the latest hub data into the Monitor
         # card first (one synchronous tick), so Refresh mirrors what the camera just
-        # produced -- not the last timer-tick render (which can lag by a beat).
-        self.console.refresh_once()
+        # produced -- not the last timer-tick render (which can lag by a beat).  This
+        # refresh is BEST-EFFORT: a mid-session signal that has no retained state at the
+        # current display provenance raises SignalHistoryGap, and that must NOT abort the
+        # Edit tab's construction -- opening the tab must never depend on a clean hub tick
+        # (#1: 'edit tab 点不开', intermittent).  On failure we snapshot whatever the
+        # plotter already holds; a later timer tick refreshes it.
+        try:
+            self.console.refresh_once()
+        except Exception:
+            pass
         if card.plotter is None:
             self.status.setText("open the panel with data first")
             return
