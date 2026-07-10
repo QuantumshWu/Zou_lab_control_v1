@@ -332,11 +332,21 @@ class ReadoutSubsystem(ExperimentSubsystem):
         controller = self._scan_pulse(pulse, name="detect_time_scan")
         reducer = OtsuFidelityReducer(site=site)
         plan: Any = NFramePlan(n_frames=positive_int(shots, "shots"))
+        slot = "exposure"
         if pulse is not None:
+            # A bound pulse sweeps its OWN duration scan slot (the readout window bound on the image
+            # period), addressed by its semantic ScanSlot name; "exposure" is only the virtual slot of
+            # the session-imaging controller (the pulse=None path).
+            underlying = getattr(controller, "pulse", None)
+            slot = underlying.primary_time_slot() if underlying is not None else None
+            if slot is None:
+                raise ValueError(
+                    "a bound detection-scan pulse must have a duration scan slot "
+                    "(bind one via the GUI scan dot or state.bind_field('duration', ...)).")
             # Configure the real camera exposure per point, matching the prior path.
             plan = _ExposureConfiguringPlan(plan, s.devices.camera)
         return self._build_slot_scan(
-            controller, calibration, slot="exposure", values=times, label="Detection time",
+            controller, calibration, slot=slot, values=times, label="Detection time",
             plan=plan, reducer=reducer, shots_per_point=1,
         )
 

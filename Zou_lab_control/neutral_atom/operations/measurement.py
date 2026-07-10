@@ -740,17 +740,21 @@ class ScannedMeasurement:
         # Validate the exact semantic field for BOTH duration and DAC axes.  A
         # duration axis must not silently mutate the first duration slot when it
         # declared another one, and an sN token is never a public identity.
+        # A DeviceControlAxis carries no pulse slot (kind='device', is_time=False -- see its
+        # docstring); only a ScanAxis names a semantic ScanSlot to validate, so skip the pulse-slot
+        # check when the axis has no `slot` rather than crashing on the missing attribute.
+        slot = getattr(self.axis, "slot", None)
         underlying = getattr(self.pulse, "pulse", None)
-        if underlying is not None and hasattr(underlying, "scan_names"):
+        if slot is not None and underlying is not None and hasattr(underlying, "scan_names"):
             known = list(underlying.scan_names)
-            if self.axis.slot not in known:
+            if slot not in known:
                 raise ValueError(
-                    f"ScanAxis.slot {self.axis.slot!r} is not a semantic scan slot of the "
+                    f"ScanAxis.slot {slot!r} is not a semantic scan slot of the "
                     f"bound pulse (known slots: {known}).")
-            actual_kind = underlying.scan_slots[known.index(self.axis.slot)].kind
+            actual_kind = underlying.scan_slots[known.index(slot)].kind
             if actual_kind != self.axis.kind:
                 raise ValueError(
-                    f"ScanAxis {self.axis.slot!r} declares kind={self.axis.kind!r}, but the "
+                    f"ScanAxis {slot!r} declares kind={self.axis.kind!r}, but the "
                     f"bound ScanSlot kind is {actual_kind!r}.")
         # Snap a DURATION axis to the sequencer clock grid: the hardware only lands on
         # whole ticks, so a continuous / linspace sweep (readout-duration -> fidelity,
