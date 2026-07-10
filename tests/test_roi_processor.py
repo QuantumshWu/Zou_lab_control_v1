@@ -40,6 +40,7 @@ def test_roi_crop_is_native_dtype_and_value_matches_reduce():
     block[0, 0, 10:20, 30:40] = 100                       # a bright patch inside the region
     hub = _hub_with_frame(block)
     node = RoiProcessor(hub, x_min=30, x_max=40, y_min=10, y_max=20, reduce="mean")
+    hub.publish({"frame_0": block})    # react to a frame published AFTER the node subscribes
     node.step()
     crop, value = hub.latest("roi_frame"), hub.latest("roi_value")
     assert crop.shape == (1, 1, 10, 10)
@@ -59,6 +60,7 @@ def test_roi_defaults_to_full_frame_and_reduces_repeats():
     block = _frame_block(repeats=3)
     hub = _hub_with_frame(block)
     node = RoiProcessor(hub)                               # all-zero region = the whole frame
+    hub.publish({"frame_0": block})    # react to a frame published AFTER the node subscribes
     node.step()
     assert np.array_equal(hub.latest("roi_frame"), block)
     expected = np.mean(block.astype(float), axis=(-2, -1))[..., None]

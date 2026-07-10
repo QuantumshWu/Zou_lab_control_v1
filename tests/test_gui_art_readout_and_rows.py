@@ -73,26 +73,40 @@ def test_saved_figure_axis_labels_are_kind_aware(qt, tmp_path):
     ``labels[-1]`` and must NOT surface as a phantom "z"/"colour bar"; a 2D image / site map DOES draw a
     colour bar (labels[2]); a grid carries its axes in the recipe, not the top-level labels."""
     from Zou_lab_control.frontend.data_figure import load_figure
+    from conftest import write_saved_npz
+
+    def _value_signal():
+        # one canonical value signal (R=1, P=1, data=[1]); axis_labels() ignores the data content.
+        # Non-structured kinds (hist/sites) require exactly one value-role signal in the new envelope.
+        return {"value": {"block": np.zeros((1, 1, 1)), "points_shape": [1],
+                          "data_shape": [1], "label": "", "unit": "", "role": "value"}}
 
     def craft(name, info, data_x, data_y):
         p = tmp_path / name
-        np.savez(p, data_x=np.asarray(data_x, float), data_y=np.asarray(data_y, float),
-                 info=np.array(info, dtype=object))
+        write_saved_npz(p, data_x=np.asarray(data_x, float),
+                        data_y=np.asarray(data_y, float), **info)
         return load_figure(str(p))
 
-    hist = craft("h.npz", {"kind": "hist", "labels": ["ROI counts", "Shots", "Population"], "name": "h"},
+    hist = craft("h.npz",
+                 {"kind": "hist", "labels": ["ROI counts", "Shots", "Population"], "name": "h",
+                  "signals": _value_signal()},
                  np.arange(50.0), np.random.default_rng(0).normal(300, 30, 50))
     assert [n for n, _ in hist.axis_labels()] == ["x label", "y label"]   # NO colour bar; 3rd label dropped
     assert all(lab != "Population" for _, lab in hist.axis_labels())
 
-    sites = craft("s.npz", {"kind": "sites", "labels": ["Camera x (px)", "Camera y (px)", "Counts"], "name": "s"},
+    sites = craft("s.npz",
+                  {"kind": "sites", "labels": ["Camera x (px)", "Camera y (px)", "Counts"], "name": "s",
+                   "signals": _value_signal()},
                   np.zeros((9, 2)), np.zeros(9))
     assert sites.axis_labels() == [("x label", "Camera x (px)"), ("y label", "Camera y (px)"),
                                    ("colour bar", "Counts")]
 
-    grid = craft("g.npz", {"kind": "grid", "name": "g",
-                           "figure_recipe": {"kind": "grid", "labels": ["Trap-off (s)", "Survival"],
-                                             "per_cell": [{}]}},
+    grid = craft("g.npz",
+                 {"kind": "grid", "name": "g",
+                  "figure_recipe": {"kind": "grid", "labels": ["Trap-off (s)", "Survival"],
+                                    "title": "g", "grid_shape": [1, 1], "panel_size": "2x2",
+                                    "focused_cell_index": None, "display_params": {},
+                                    "sub_plot_kind": "1d", "per_cell": [{}], "x": None}},
                  np.zeros(1), np.zeros(1))
     assert grid.axis_labels() == [("x label", "Trap-off (s)"), ("y label", "Survival")]
 

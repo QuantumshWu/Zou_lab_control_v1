@@ -513,8 +513,8 @@ def test_edit_save_image_format_writes_chosen_container(tmp_path):
     two in lockstep.  The matching ``.npz`` data file is format-INDEPENDENT: identical ``info`` for every
     choice (only the image container changes).  A DATA-layer choice, not an art knob, so the figure's
     geometry / dpi are untouched.  (Confocal names this the ``save_type`` = jpg / png convention.)"""
-    import numpy as np
     from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.data_figure import load_figure
     from Zou_lab_control.frontend.task_console import SAVE_IMAGE_FORMATS
 
     # png is the default (first) offering, and the picker exposes exactly these lowercase containers.
@@ -549,7 +549,7 @@ def test_edit_save_image_format_writes_chosen_container(tmp_path):
             assert img.exists() and img.stat().st_size > 0, fmt
             assert img.read_bytes()[: len(magic[fmt])] == magic[fmt], (fmt, "not a real container")
             assert npz.exists(), fmt
-            info = np.load(npz, allow_pickle=True)["info"].item()
+            info = load_figure(str(npz)).info    # 9-key envelope, read through the production loader
             infos[fmt] = {k: info.get(k) for k in ("kind", "source", "size", "name", "labels")}
 
         # the .npz payload is the SAME data regardless of the image container chosen

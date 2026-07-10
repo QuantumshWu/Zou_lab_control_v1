@@ -75,11 +75,12 @@ def test_camera_mints_and_occupancy_inherits():
         fire_live_imaging(exp, exposure=exp.devices.camera.exposure); cam.step()
         second = hub.latest_provenance("frame_0")
         assert second > first > 0
-        # the occupancy DERIVED signals inherit the SAME id as the frame they were judged from
+        # reactive replay-in-publication-order: one step judges the FIRST un-consumed frame, so the
+        # derived signals inherit THAT frame's id (`first`), deliberately lagging the live camera --
+        # each occupancy shot is provenance-tied to the exact frame it was judged from.
         occ.step()
-        fid = hub.latest_provenance("frame_0")
-        assert hub.latest_provenance("occupied") == fid
-        assert hub.latest_provenance("frame_judged") == fid
+        assert hub.latest_provenance("occupied") == first
+        assert hub.latest_provenance("frame_judged") == first
         # camera ahead -> the coherent read at the occupancy's shot holds the ahead frame back
         fire_live_imaging(exp, exposure=exp.devices.camera.exposure); cam.step()
         t = hub.latest_provenance("occupied")

@@ -119,9 +119,9 @@ def test_processor_source_expression_gets_the_shared_helpers():
     hub = SignalHub()
     frame = np.zeros((24, 24), dtype=float)
     frame[10:14, 10:14] = 50.0                            # a bright square the ROI mean picks up
-    hub.publish({"f": frame})
     proc = MotIntensityProcessor(
         hub, source_expr={"inputs": ["f"], "source": "value = numpy.asarray(np.abs(signal))"})
+    hub.publish({"f": frame})    # publish AFTER the processor subscribes at construction (reactive replay)
     out = proc.step()
     assert "mot_intensity" in out                         # np AND the numpy alias both resolved
 

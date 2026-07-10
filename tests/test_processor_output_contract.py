@@ -33,14 +33,13 @@ def test_output_keys_published_signals_derive_from_provides():
         def transform(self, inputs):  # pragma: no cover - not exercised here
             return {}
 
-    node = _P(SignalHub(), consumes=(), prefix="p_")
+    node = _P(SignalHub(), consumes=("x",), prefix="p_")   # a Processor now requires >=1 consumed signal
     assert node.output_keys() == ("a", "b")
     assert node.published_signals() == frozenset({"p_a", "p_b"})
 
 
 def test_processor_publishing_undeclared_signal_raises():
     hub = SignalHub()
-    hub.publish({"x": 1.0})
 
     class _Rogue(Processor):
         provides = ("good",)
@@ -49,13 +48,13 @@ def test_processor_publishing_undeclared_signal_raises():
             return {"good": 1.0, "rogue": 2.0}    # 'rogue' is NOT declared in provides
 
     node = _Rogue(hub, consumes=("x",))
+    hub.publish({"x": 1.0})    # publish AFTER the node subscribes at construction (reactive replay)
     with pytest.raises(ValueError, match="undeclared"):
         node.shot()
 
 
 def test_processor_publishing_only_declared_signals_is_fine():
     hub = SignalHub()
-    hub.publish({"x": 1.0})
 
     class _Good(Processor):
         provides = ("good",)
@@ -64,4 +63,5 @@ def test_processor_publishing_only_declared_signals_is_fine():
             return {"good": 42.0}
 
     node = _Good(hub, consumes=("x",))
+    hub.publish({"x": 1.0})    # publish AFTER the node subscribes at construction (reactive replay)
     assert node.shot() == {"good": 42.0}
