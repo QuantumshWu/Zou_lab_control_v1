@@ -100,8 +100,7 @@ class RoiProcessor(Processor):
         """A rectangle dragged on a panel showing this node's output IS the ROI -- the selector's
         four endpoints (already in the consumed frame's pixel coordinates) map 1:1 to the region
         params, so 'draw a box -> watch that box' needs no typing."""
-        return {"x_min": float(min(x_min, x_max)), "x_max": float(max(x_min, x_max)),
-                "y_min": float(min(y_min, y_max)), "y_max": float(max(y_min, y_max))}
+        return region_values(x_min, x_max, y_min, y_max)
 
     # ------------------------------------------------------------------ transform
     def transform(self, inputs: dict[str, object]) -> dict[str, object]:
@@ -141,6 +140,19 @@ class RoiProcessor(Processor):
         )
 
 
+#: The catalog/spec display name -- the ONE string a caller that creates a ROI row
+#: programmatically (the console's draw-a-box-on-a-live-panel gesture) resolves the spec by.
+ROI_SPEC_NAME = "ROI crop"
+
+
+def region_values(x_min, x_max, y_min, y_max) -> dict[str, float]:
+    """Selector-rectangle endpoints -> the region PARAM dict ({x_min, x_max, y_min, y_max},
+    sorted).  The ONE mapping shared by the live retarget (``region_to_acquisition_parameters``)
+    and the create-from-a-drag seed (the console fills a fresh row's values with exactly this)."""
+    return {"x_min": float(min(x_min, x_max)), "x_max": float(max(x_min, x_max)),
+            "y_min": float(min(y_min, y_max)), "y_max": float(max(y_min, y_max))}
+
+
 @processor(order=25)
 def roi(readout) -> ProcessorSpec:
     """Crop a rectangular region of a live frame + reduce it to one scalar per shot."""
@@ -176,7 +188,7 @@ def roi(readout) -> ProcessorSpec:
             prefix=prefix)
 
     return ProcessorSpec(
-        name="ROI crop",
+        name=ROI_SPEC_NAME,
         params=params,
         make_node=make_node,
         # SINGLE SOURCE: the published keys live once on the node class (its ``provides``).

@@ -1687,7 +1687,7 @@ class PanelCard(FluentGroupBox):
                  sites_inputs_provider=None, curve_x_provider=None,
                  structure_provider=None, short_names_provider=None,
                  live_namespace_provider=None, pulse_state_provider=None,
-                 grid_recipe_provider=None, render_barrier=None):
+                 grid_recipe_provider=None, render_barrier=None, area_select_sink=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
         super().__init__(PANEL_KINDS[config.kind], parent)
@@ -1739,6 +1739,10 @@ class PanelCard(FluentGroupBox):
         # is in flight the render thread owns the figure (see frontend/render_loop.py).  None
         # (a standalone/test card) makes it a no-op via _wait_render_idle.
         self.render_barrier = render_barrier
+        # callable(card, (x_min, x_max, y_min, y_max)) -> the console's ROI-chain sink: a
+        # rectangle drawn on this LIVE image panel retargets/creates a RoiProcessor consuming
+        # this panel's signal (the "draw a box -> get roi_frame/roi_value signals" gesture).
+        self.area_select_sink = area_select_sink
         self.plotter = None
         self.canvas = None
         # The console header's "Selectors" switch state for THIS card (set via
@@ -3508,6 +3512,28 @@ class PanelCard(FluentGroupBox):
             # mutate artists.  Hung here because this is the ONE apply point every build / focus
             # swap converges on, so a fresh or enlarged canvas always carries it (idempotent).
             canvas._zlc_render_barrier = self.render_barrier
+        # The LIVE-board ROI gesture: an armed area selector on an IMAGE panel forwards its
+        # released rectangle to the console's ROI-chain sink.  Wired at this same one apply
+        # point so every (re)build inherits it; OFF (or a non-image kind / an enlarged grid
+        # cell) unhooks, leaving the selector display-only exactly as before.
+        tools = getattr(getattr(plotter, "fig", None), "_zlc_tools", None)
+        area = getattr(tools, "area", None)
+        if area is not None:
+            wire = (on and self.config.kind == "2d" and self._grid_focus is None
+                    and callable(self.area_select_sink))
+            area.callback = self._forward_area_select if wire else None
+
+    def _forward_area_select(self) -> None:
+        """The armed LIVE-board area selector released on this image panel: forward the drawn
+        rectangle -- data coordinates == the panel's declared SOURCE pixels (its axes carry the
+        producing node's ``region`` frame), so the endpoints are already what a RoiProcessor's
+        region params mean -- to the console's ROI-chain sink.  A cleared/degenerate drag (range
+        None) is just a deselect: never forwarded, never resets a node."""
+        tools = getattr(getattr(self.plotter, "fig", None), "_zlc_tools", None)
+        rng = list(getattr(getattr(tools, "area", None), "range", None) or [None] * 4)
+        if any(v is None for v in rng):
+            return
+        self.area_select_sink(self, tuple(float(v) for v in rng))
 
     def _needs_structural_build(self, value, namespace: Mapping[str, object] | None) -> bool:
         """Whether rendering ``value`` requires (re)building the plotter -- a Qt-widget operation
@@ -6505,7 +6531,7 @@ class TaskConsole(QtWidgets.QWidget):
             structure_provider=self._signal_structure, pulse_state_provider=self._pulse_state,
             grid_recipe_provider=self._grid_recipe,
             short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace,
-            render_barrier=self._render_loop.barrier)
+            render_barrier=self._render_loop.barrier, area_select_sink=self._on_panel_area_select)
 
     def _attach_card(self, card: PanelCard) -> None:
         card.setParent(self.board)
@@ -7502,6 +7528,45 @@ class TaskConsole(QtWidgets.QWidget):
         row = self._attach_logic_node(node, focus=focus)
         self._mark_dirty()
         return row
+
+    # ------------------------------------------------------- selector -> ROI chain
+    def _on_panel_area_select(self, card: "PanelCard", rect: tuple) -> None:
+        """A LIVE image panel's area selector released with a drawn rectangle: wire it into the
+        ROI signal chain -- the 'select a small region -> get its distribution / total counts as
+        signals' gesture.  The selection itself NEVER enters the hub (GUI state stays out of the
+        data plane): it retargets the region params of every RUNNING processor consuming this
+        panel's signal (thread-safe, applied between shots), and when none exists it CREATES the
+        stock 'ROI crop' logic row seeded with this signal + the rectangle and STARTS it -- one
+        drag, ``roi_frame``/``roi_value`` on the hub, ready for a dis panel or a scan loss."""
+        signal = str(card.config.inputs[0]) if card.config.inputs else ""
+        if not signal or self._task_locked:
+            return
+        from ..neutral_atom.operations.processors.roi import ROI_SPEC_NAME, region_values
+        retargeted = []
+        for row in self.logic_nodes:
+            node = self._logic_nodes.get(id(row))
+            if node is None or signal not in tuple(getattr(node, "consumes", ())):
+                continue
+            params = node.region_to_acquisition_parameters(*rect)
+            if params:
+                node.apply_acquisition_parameters(**params)
+                # keep the row's stored values in sync so its Edit reopen / save shows the drag
+                row.node.values = {**dict(row.node.values or {}), **params}
+                retargeted.append(str(row.node.title))
+        if retargeted:
+            card.set_status(f"ROI -> {', '.join(retargeted)}", error=False)
+            return
+        from ..neutral_atom.operations.signal_expr import DEFAULT_SOURCE
+        cfg = LogicNodeConfig(
+            kind="processor", name=ROI_SPEC_NAME,
+            title=indexed_unique_name(ROI_SPEC_NAME, {r.node.title for r in self.logic_nodes}),
+            values={"source": {"inputs": [signal], "source": DEFAULT_SOURCE},
+                    **region_values(*rect)})
+        row = self._add_logic_node(cfg, focus=False)   # stay on the Monitor board -- no tab jump
+        self._start_logic_node(row)
+        started = self._logic_nodes.get(id(row)) is not None
+        card.set_status(f"ROI -> {cfg.title}" + ("" if started else " (start failed -- see Logic tab)"),
+                        error=not started)
 
     def _edit_logic_node(self, row: "LogicNodeRow") -> None:
         """Open (or focus) a logic node's OWN closable Edit tab (param form + Start/Stop)."""

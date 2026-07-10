@@ -704,12 +704,10 @@ class DataFigure:
             return FitResult(["A", "B", "R", "x0", "y0"], None, None, "center"), None
         self.data_x_p, self.data_y_p = self._select_fit(min_num=5)
         self.formula_str = r"$f(r)=Ae^{-(r-(x0,y0))^2/R^2}+B$"
-
-        def _center(coord, amplitude, offset, size, x0, y0):
-            x, y = np.asarray(coord[0]), np.asarray(coord[1])
-            return amplitude * np.exp(-((x - x0) ** 2 + (y - y0) ** 2) / size**2) + offset
-
-        self._fit_func = _center
+        # The ONE center-model definition (shared with the hub-side FitProcessor) lives in the
+        # dependency-free math seam, so a fitted (x0, y0) means the same thing on both sides.
+        from Zou_lab_control._readout_math import gaussian2d_center
+        self._fit_func = gaussian2d_center
         if p0 is None:
             amp = abs(np.nanmax(self.data_y_p) - np.nanmin(self.data_y_p)) or 1
             offset = np.nanmean(self.data_y_p)
