@@ -2041,9 +2041,16 @@ thread. Five orthogonal fixes, each at its own layer:
    virtual and real rigs. Render ≈ 35 ms/frame < the 50 ms pace.
 
 Plus two architecture items from the same round: `RoiProcessor`
-(`operations/processors/roi.py`: crop + mean/sum/max, region == the 2-D panel selector's pixel
-endpoints via `region_to_acquisition_parameters`, publishes native `roi_frame` + scalar
-`roi_value` — the stock chain for "select a region, watch its distribution / total counts"), and
+(`operations/processors/roi.py`: a **Selection-driven region reducer generic over EVERY plot kind** —
+it carries a plot-independent `core.selection.Selection` + a `mean/sum/max` verb, exactly as
+`FitProcessor` carries a `FitRequest`, and reduces the selected cells to a scalar `roi_value` +
+republishes the region as `roi_frame`. WHAT the consumed block's cells mean per kind — image pixels, a
+1-D index, a distribution's sample value, site centres — is frontend knowledge: `live.region_binding`
+(the inverse of `coerce_panel_value`) ships it as a serializable axis-binding on the Selection's
+metadata, so the node has ZERO per-kind branch and the sealed seam holds. A drag on a 2d / 1d / hist /
+sites panel all drive it identically via `set_selection`; the region round-trips through
+`acquisition_parameters()['selection']` (+ a source-pixel `region` for an image crop, for the ROI-of-ROI
+case) — the stock chain for "select a region, watch its distribution / total counts"), and
 the sequencer family converged to **VirtualSequencer / RemoteSequencer (+ ManualSequencer
 first-light)** — RuntimeSequencer (a strict subset of Virtual) and VerilogSequencer (production
 dead code) are deleted, the service-level wall-clock scan-progress simulation went with them, and
