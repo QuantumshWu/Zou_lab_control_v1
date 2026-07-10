@@ -818,9 +818,14 @@ class DataFigure:
             self.text.remove()
             self.text = None
 
-        self._dim_data_lines()
-        if self.plot_type == "1D" and len(self.data_y) < 2000:
-            self._line_to_scatter()
+        # DIM the data lines ONLY on the 1-D line families (the FIT_DIM_ALPHA overlay of #99a4757).
+        # An IMAGE family (2D / site map) has no data LINE to fade -- its fit is a dot/ring overlay on
+        # the frame -- so dimming there would only touch unrelated artists (a side-distribution line);
+        # gate it off so the fit-center overlay never changes the image's appearance (#11).
+        if self.plot_type not in ("2D", "SITES"):
+            self._dim_data_lines()
+            if self.plot_type == "1D" and len(self.data_y) < 2000:
+                self._line_to_scatter()
         # No draw here: the rendering adapter places the fit curve immediately after and
         # issues the single terminal draw_idle.  Drawing here too was a premature + redundant full
         # repaint -- it painted the annotation BEFORE the curve existed, then the whole figure again.
@@ -852,14 +857,28 @@ class DataFigure:
                 x[order], yfit, color=PALETTE["fit_right"], linestyle="-",
                 linewidth=2, alpha=0.5)
         else:
+            # #11: the centre dot + radius ring are a READOUT overlay on the image, NOT new data.
+            # Snapshot the view -- xlim/ylim, both autoscale flags, and the image clim -- and restore it
+            # after adding the artists, so a scatter/patch's dataLim can never expand the 2-D image's
+            # displayed range or drop its colour limit.  The artists are clipped to the axes so a ring
+            # partly outside the frame never draws beyond it.
+            xlim, ylim = ax.get_xlim(), ax.get_ylim()
+            auto_x, auto_y = ax.get_autoscalex_on(), ax.get_autoscaley_on()
+            clims = [(im, im.get_clim()) for im in ax.get_images()]
             params = result.parameter_map()
             x0, y0, radius = params["x0"], params["y0"], abs(params["radius"])
-            self._fit_artists = [ax.scatter(x0, y0, color=PALETTE["fit_right"], s=_CENTER_DOT_SIZE)]
+            dot = ax.scatter(x0, y0, color=PALETTE["fit_right"], s=_CENTER_DOT_SIZE, clip_on=True)
             circle = matplotlib.patches.Circle(
                 (x0, y0), radius=radius, edgecolor=PALETTE["fit_right"], facecolor="none",
-                linewidth=_CENTER_RING_LW, alpha=_CENTER_RING_ALPHA)
-            self._fit_artists.append(circle)
+                linewidth=_CENTER_RING_LW, alpha=_CENTER_RING_ALPHA, clip_on=True)
             ax.add_patch(circle)
+            self._fit_artists = [dot, circle]
+            ax.set_xlim(*xlim)
+            ax.set_ylim(*ylim)
+            ax.set_autoscalex_on(auto_x)
+            ax.set_autoscaley_on(auto_y)
+            for image, clim in clims:
+                image.set_clim(*clim)
         self.fig.canvas.draw_idle()
 
     def fit_model(
