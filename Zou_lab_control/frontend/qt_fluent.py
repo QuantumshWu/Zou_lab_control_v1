@@ -3112,6 +3112,13 @@ class FluentStatusStrip(FluentFrame):
         if str(text) != self.message.text():
             self.message.setText(str(text))
 
+    @property
+    def severity(self) -> str:
+        """The current line's severity key (one of :data:`SEVERITIES`) -- the DATA read-back
+        matching :meth:`text`, so a caller/test can assert the strip's state without poking
+        at colours."""
+        return self._severity
+
     def set_action_visible(self, visible: bool) -> None:
         """Show/hide the action button (a no-op when the strip was built without one)."""
         if self.action_button is not None:

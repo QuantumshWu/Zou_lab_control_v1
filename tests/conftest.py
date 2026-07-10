@@ -75,7 +75,8 @@ def make_console(exp, *, running_nodes=None, window_px=(900, 600)):
     """A real offscreen TaskConsole wired exactly like ``exp.task_console()`` -- the ONE
     console factory for lifecycle tests (build / start / stop / task flows), so every test
     drives the same specs + hub wiring the GUI entry point does.  The background tick timer
-    is stopped for determinism: tests call ``con._tick()`` themselves."""
+    is stopped for determinism: tests drive frames themselves -- use :func:`tick` when the
+    test asserts RENDERED state (``con._tick()`` alone only submits to the render worker)."""
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
@@ -88,6 +89,16 @@ def make_console(exp, *, running_nodes=None, window_px=(900, 600)):
                       running_nodes=list(running_nodes or ()))
     con._timer.stop()
     return con
+
+
+def tick(con):
+    """ONE deterministic console frame.  ``_tick()`` SUBMITS the dirty panels to the
+    background render worker; the finished batch normally comes back through the queued
+    ``job_done`` signal -- which never runs for a test that does not spin the Qt event
+    loop.  ``barrier()`` both waits out the compose and delivers the batch to the GUI
+    pass synchronously, so after this call every submitted panel is built + presented."""
+    con._tick()
+    con._render_loop.barrier()
 
 
 def add_logic_row(con, data):

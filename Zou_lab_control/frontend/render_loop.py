@@ -13,54 +13,75 @@ per-tick budget/rotor machinery re-scheduled that burst but never removed it).
 Ownership protocol (the whole thread-safety story):
 
 * The GUI thread submits at most ONE job at a time (``submit`` refuses while busy;
-  the console simply skips that tick -- dirty panels retry on the next one, which is
-  the natural frame-skip back-pressure).
+  the console simply skips that tick -- dirty panels retry, which is the natural
+  frame-skip back-pressure).
+* A job stays "busy" from ``submit`` until the GUI thread has CONSUMED its result
+  (``deliver_pending``) -- NOT merely until the worker finished computing it.  A
+  finished-but-undelivered batch still owns its figures: its present/structural
+  pass has not run, so marking the loop idle any earlier would let the next tick
+  re-submit the SAME figures while that pass is still queued (two threads on one
+  Agg buffer -- the exact race the first cut of this loop shipped with).
 * While a job is in flight the GUI thread must not touch any live figure.  Every
   GUI entry point that does (a mouse press/wheel on a canvas, a Setting edit, a
   structural rebuild, the Edit-tab snapshot, save/close) first calls
-  :meth:`barrier`, which drops nothing and simply waits for the in-flight job to
-  finish -- bounded by one batch (tens of ms), idempotent and free when idle.
-* Results come back on the GUI thread through the queued ``job_done`` signal; the
-  console presents every composed panel together there, preserving the board's
-  one-coherent-shot flip.
+  :meth:`barrier`, which waits out the compose AND delivers the finished batch to
+  the consumer itself -- so the caller returns to a settled board with nothing in
+  flight or pending.  Free when idle; bounded by one batch when busy.
+* Delivery is single-consumption: the queued ``job_done`` signal and ``barrier``
+  both land in :meth:`deliver_pending`; whichever runs first hands the result to
+  the consumer, the other finds nothing and no-ops (never a double present).
 """
 
 from __future__ import annotations
 
 import threading
+import time
 
 from PyQt5 import QtCore
 
 
 class RenderLoop(QtCore.QObject):
-    """One daemon worker executing submitted render jobs strictly one at a time."""
+    """One daemon worker executing submitted render jobs strictly one at a time.
 
-    #: Emitted from the worker thread with the job's return value (or the raised
-    #: exception object); auto-queued to the GUI thread by Qt cross-thread rules.
-    job_done = QtCore.pyqtSignal(object)
+    ``consumer`` is the GUI-side batch handler (the console's ``_on_render_batch``):
+    it receives each job's return value (or the exception the job raised) on the GUI
+    thread, exactly once per job."""
 
-    def __init__(self, parent: QtCore.QObject | None = None):
+    #: Emitted from the worker thread AFTER the job's result is published on the loop;
+    #: auto-queued to the GUI thread (this QObject lives there).  Carries nothing: the
+    #: GUI slot pulls the result through :meth:`deliver_pending`, so a barrier() that
+    #: already consumed it leaves this delivery a harmless no-op.
+    job_done = QtCore.pyqtSignal()
+
+    def __init__(self, consumer, parent: QtCore.QObject | None = None):
         super().__init__(parent)
+        self._consumer = consumer
         self._job = None
+        self._result = None
+        self._has_result = False
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._idle = threading.Event()
         self._idle.set()
+        self._published = threading.Event()   # worker finished computing; result awaits delivery
         self._stopping = False
+        self.job_done.connect(self.deliver_pending)
         self._thread = threading.Thread(target=self._loop, name="zlc-render", daemon=True)
         self._thread.start()
 
     # ------------------------------------------------------------------ GUI side
     @property
     def busy(self) -> bool:
-        """True while a job is queued or running (the console skips submitting)."""
+        """True from ``submit`` until the GUI CONSUMED the finished batch.  The console
+        skips submitting while busy -- including the window where the worker is done but
+        the batch's present/structural pass is still queued behind this tick."""
         return not self._idle.is_set()
 
     def submit(self, job) -> bool:
         """Queue ``job`` (a zero-arg callable) for the worker; False when busy/stopped.
 
         Refusing while busy IS the frame-skip policy: the caller's dirty state is
-        version-gated, so the work is simply retried next tick."""
+        version-gated, so the work is simply retried on a later tick."""
         if self._stopping:
             return False
         with self._lock:
@@ -71,19 +92,51 @@ class RenderLoop(QtCore.QObject):
         self._wake.set()
         return True
 
+    def deliver_pending(self) -> bool:
+        """GUI thread: hand the published result to the consumer and mark the loop idle
+        -- the ONE consumption point.  Both the queued ``job_done`` delivery and
+        :meth:`barrier` land here; whichever runs first wins, the other no-ops.
+        Returns True iff a result was actually delivered."""
+        with self._lock:
+            if not self._has_result:
+                return False
+            result, self._result, self._has_result = self._result, None, False
+            self._published.clear()
+        # Idle BEFORE the consumer runs: the consumer is GUI-thread code (no tick can
+        # interleave on this same thread), and any barrier() nested inside it must see
+        # the loop as free instead of waiting 5 s on its own delivery.
+        self._idle.set()
+        self._consumer(result)
+        return True
+
     def barrier(self, timeout: float = 5.0) -> bool:
-        """Wait until the worker is idle -- the GUI must hold this before touching any
-        figure the worker composes.  Idempotent and free when idle; bounded by one
-        batch when busy.  Returns False only on a pathological timeout (a wedged
-        render), in which case the caller proceeds -- a rare visual glitch beats a
-        frozen UI."""
-        return self._idle.wait(timeout)
+        """GUI thread: settle the loop -- wait out any composing job AND deliver its
+        finished batch before returning, so the caller owns every figure with nothing
+        in flight OR pending (a pending batch delivered later would stomp whatever the
+        caller is about to do to those figures).  Idempotent and free when idle.
+        Returns False only on a pathological timeout (a wedged render), in which case
+        the caller proceeds -- a rare visual glitch beats a frozen UI."""
+        deadline = time.monotonic() + timeout
+        while True:
+            self.deliver_pending()
+            if self._idle.is_set():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self._published.wait(remaining)
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Stop the worker (console shutdown).  Any in-flight job finishes first."""
+        """Stop the worker (console shutdown).  Any in-flight job finishes first; a
+        finished-but-undelivered batch is DISCARDED (its only effect would be painting
+        panels that are about to be torn down)."""
         self._stopping = True
         self._wake.set()
         self._thread.join(timeout)
+        with self._lock:
+            self._result, self._has_result = None, False
+            self._published.clear()
+        self._idle.set()
 
     # --------------------------------------------------------------- worker side
     def _loop(self) -> None:
@@ -91,21 +144,19 @@ class RenderLoop(QtCore.QObject):
             self._wake.wait()
             self._wake.clear()
             if self._stopping:
-                self._idle.set()
                 return
             with self._lock:
                 job, self._job = self._job, None
             if job is None:
-                self._idle.set()
                 continue
             try:
                 result = job()
-            except Exception as exc:  # surfaced to the GUI slot, never a dead thread
+            except Exception as exc:  # surfaced to the consumer, never a dead thread
                 result = exc
-            # Mark idle BEFORE emitting: the GUI slot presents the composed panels and
-            # may immediately barrier()/submit() -- it must see the worker as free.
-            self._idle.set()
-            self.job_done.emit(result)
+            with self._lock:
+                self._result, self._has_result = result, True
+            self._published.set()
+            self.job_done.emit()
 
 
 __all__ = ["RenderLoop"]

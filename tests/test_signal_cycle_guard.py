@@ -6,7 +6,8 @@
   is either permanent silent starvation (fresh hub) or a full-CPU self-sustained republish
   spiral whose inherited source-shot id freezes the display clock (primed hub).
 * INDIRECT ring (A consumes B's output while B consumes A's) -- rejected by the console's
-  start-time graph walk (``_reactive_ring``), the one place that sees every row.
+  start-time graph walk (``_reactive_ring``) over the RUNNING nodes (rows and notebook-
+  injected alike): the start that would close the ring is the one refused.
 * The processor's source PICKER never offers the node's own declared outputs, so the
   misclick cannot happen in the GUI at all.
 """

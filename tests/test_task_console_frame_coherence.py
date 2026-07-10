@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 import Zou_lab_control.frontend as zf
+from conftest import tick
 from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
 from Zou_lab_control.frontend.task_console import TaskConsole
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
@@ -64,7 +65,7 @@ def test_three_emccd_frames_never_split_when_clock_advances_via_a_lagging_coprod
     try:
         hub.publish({"frame_0": _img(0), "frame_1": _img(0), "frame_2": _img(0)}, provenance=0)
         hub.publish({"occupancy": 0.0}, provenance=0)
-        console._tick()
+        tick(console)
         assert all(c.plotter is not None for c in console.cards)
 
         clock_advances = 0
@@ -72,7 +73,7 @@ def test_three_emccd_frames_never_split_when_clock_advances_via_a_lagging_coprod
             # tick A: the three frames for shot S arrive together; occupancy still at S-1 -> the coherent
             # display shot is HELD BACK to S-1, so all three frame panels must show S-1 (and agree).
             hub.publish({"frame_0": _img(S), "frame_1": _img(S), "frame_2": _img(S)}, provenance=S)
-            console._tick()
+            tick(console)
             disp_a = console._display_shot()
             shots_a = [_frame_shot(console.cards[k]) for k in range(3)]
             assert len(set(shots_a)) == 1 and shots_a[0] == disp_a, (S, "A", shots_a, disp_a)
@@ -81,7 +82,7 @@ def test_three_emccd_frames_never_split_when_clock_advances_via_a_lagging_coprod
             # frame panels' OWN signal did NOT republish.  The per-signal gate skipped them here (desync);
             # the display-shot gate recomposes all three together -> still one coherent shot.
             hub.publish({"occupancy": float(S)}, provenance=S)
-            console._tick()
+            tick(console)
             disp_b = console._display_shot()
             shots_b = [_frame_shot(console.cards[k]) for k in range(3)]
             if disp_b != disp_a:

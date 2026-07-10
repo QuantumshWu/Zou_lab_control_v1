@@ -120,6 +120,7 @@ else:
             # buffer for the real screen but can NEVER re-pin a wrong size and balloon/shrink the figure
             # ("first wrong, second right" is gone).  Guarded: the deferred call may fire after the C++
             # widget was torn down (panel closed) -> skip silently.
+            self._zlc_wait_render()                    # sync mutates figure dpi/size: own the figure first
             try:
                 self._zlc_sync()                       # figure dpi -> the REAL screen ratio (crisp buffer)
             except RuntimeError:
@@ -171,12 +172,17 @@ else:
             # the figure from the widget -- both break the spec-owned geometry.
             if getattr(self, "_device_pixel_ratio", None) == ratio:
                 return False
+            self._zlc_wait_render()   # a mid-stream monitor move mutates figure dpi: own the figure first
             self._zlc_sync()
             return True
 
         def draw(self):  # noqa: N802 - overrides FigureCanvasQTAgg.draw
             # Every real Agg render funnels through here: record the dpi it rendered at + that the buffer
             # is now valid, so :meth:`_zlc_draw_if_needed` can SKIP the redundant lifecycle re-renders.
+            # Ownership barrier FIRST: this is the one funnel every GUI-thread render takes (draw_idle
+            # callbacks, tab-switch showEvent redraws, the paintEvent fallback), so it must never
+            # rasterise into an Agg buffer the render worker is composing.  Free when idle / unhooked.
+            self._zlc_wait_render()
             super().draw()
             self._zlc_drawn_dpi = self.figure.dpi
             self._zlc_painted_once = True
@@ -215,7 +221,12 @@ else:
 
         def _zlc_present(self) -> None:
             """Publish the composed Agg buffer: snapshot it as the front image and schedule the
-            Qt paint.  GUI thread only (present phase)."""
+            Qt paint.  GUI thread only (present phase).  A figure the operator is mid-drag on is
+            GUI-owned (``begin_figure_interaction`` dropped the front so paint reads the live Agg
+            blits): restoring a front image now would freeze the selector feedback for the whole
+            drag, so the present is skipped -- the panel catches up on release (owed beat)."""
+            if getattr(self.figure, "_zlc_interacting", False):
+                return
             self._zlc_snapshot_front()
             self.update()
 
@@ -272,6 +283,10 @@ else:
                 painter.drawImage(self.rect(), front)
                 painter.end()
                 return
+            # Fallback path (no front image): the Agg buffer is about to be read -- and possibly
+            # re-rendered -- on the GUI thread, so wait out any in-flight compose first (a repaint
+            # in the post-drag window otherwise reads the buffer the worker is writing).
+            self._zlc_wait_render()
             self._zlc_draw_if_needed()          # render the buffer only if it is out of date (else reuse)
             renderer = self.renderer
             w, h = int(renderer.width), int(renderer.height)

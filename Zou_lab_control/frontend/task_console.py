@@ -1790,6 +1790,11 @@ class PanelCard(FluentGroupBox):
         # (see TaskConsole._tick) skips a panel on its beat when nothing new was published
         # since, so a slow panel does not redraw stale data and a fast one only when needed.
         self._render_version = -1
+        # Fairness under overload: True when this panel's beat fell on a tick the render
+        # worker was busy (or the panel was mid-drag) -- the next idle tick serves it
+        # regardless of the beat modulo, so a slow-beat panel can never phase-lock onto
+        # busy ticks and starve behind a heavy fast-beat sibling (see TaskConsole._tick).
+        self._beat_owed = False
         self._compiled_source = config.source
         # Monitor roll-gate: remembers the per-signal version of this panel's
         # source at the last roll, so an unrelated node's version bump does not
@@ -2506,6 +2511,7 @@ class PanelCard(FluentGroupBox):
         the axis label carries no convertible unit the cycle is a no-op."""
         if self.plotter is None:
             return
+        self._wait_render_idle()       # change_unit rewrites live x data/labels: own the figure first
         df = self._unit_df()
         length = len(df.conversion_map) if getattr(df, "conversion_map", None) else 0
         if length:
@@ -2530,6 +2536,7 @@ class PanelCard(FluentGroupBox):
         (thumbnails carry it when the zoom returns); otherwise it lands on the live plotter directly
         (a GridPlot fans it out to its thumbnails itself).  The Setting popup's lo/hi inputs and the
         Edit tab's both route here -- no second hand-copied push path."""
+        self._wait_render_idle()       # relim + axis mutation on the live plotter: own the figure first
         self.config.params["fixed_lo"], self.config.params["fixed_hi"] = float(lo), float(hi)
         if self._grid_focus is not None:
             self._set_focused_grid_param("fixed_lo", float(lo))
@@ -2804,6 +2811,7 @@ class PanelCard(FluentGroupBox):
         value = str(self.facet_combo.itemData(int(index)) or "")
         if value == self._facet():
             return
+        self._wait_render_idle()   # the teardown+rebuild below must own the figure (ownership protocol)
         self.config.params["facet"] = value
         self._reset_plot()
         self._render_version = -1
@@ -2826,6 +2834,7 @@ class PanelCard(FluentGroupBox):
         value = str(self.sub_kind_combo.itemData(int(index)) or "")
         if value == str(self.config.params.get("sub_plot_kind") or ""):
             return
+        self._wait_render_idle()   # the teardown+rebuild below must own the figure (ownership protocol)
         if value:
             self.config.params["sub_plot_kind"] = value
         else:
@@ -2998,6 +3007,7 @@ class PanelCard(FluentGroupBox):
         grows after every edit.  Always go through the sealed API."""
         self.config.title = str(text)
         if self.plotter is not None and getattr(self.plotter, "ax", None) is not None:
+            self._wait_render_idle()   # in-place artist mutation: own the figure first
             self.plotter.title = self.config.title
             self.plotter._apply_title()
             if self.canvas is not None:
@@ -3005,6 +3015,7 @@ class PanelCard(FluentGroupBox):
         self.changed.emit()
 
     def _on_size(self, size: str) -> None:
+        self._wait_render_idle()   # the teardown+regrow+rebuild below must own the figure
         self.config.size = str(size)
         # ATOMIC relayout transaction.  A size change is THREE synchronous steps: _reset_plot tears the
         # plotter down (canvas -> None, the holder goes momentarily EMPTY), _apply_fixed_size grows the
@@ -3515,15 +3526,25 @@ class PanelCard(FluentGroupBox):
 
     def _forward_area_select(self) -> None:
         """The armed LIVE-board area selector released on this image panel: forward the drawn
-        rectangle -- data coordinates == the panel's declared SOURCE pixels (its axes carry the
-        producing node's ``region`` frame), so the endpoints are already what a RoiProcessor's
-        region params mean -- to the console's ROI-chain sink.  A cleared/degenerate drag (range
-        None) is just a deselect: never forwarded, never resets a node."""
+        rectangle to the console's ROI-chain sink IN THE DISPLAYED FRAME'S OWN PIXELS.  The
+        selector yields AXIS coordinates -- and this panel's axes carry the producing node's
+        declared ``region`` origin (a ROI crop's panel shows camera x 500..700, a hardware
+        sub-array camera shows sensor pixels) -- while a CONSUMING RoiProcessor's region params
+        are local frame pixels (``_bounds`` clips against 0..w).  Subtract the axis origin the
+        panel was built with (``_roi_built``, the same source ``_render`` used), so an
+        ROI-of-ROI / sub-array drag crops exactly the drawn box; an origin-(0, 0) panel is
+        unchanged.  A cleared/degenerate drag (range None) is just a deselect: never forwarded,
+        never resets a node."""
         tools = getattr(getattr(self.plotter, "fig", None), "_zlc_tools", None)
         rng = list(getattr(getattr(tools, "area", None), "range", None) or [None] * 4)
         if any(v is None for v in rng):
             return
-        self.area_select_sink(self, tuple(float(v) for v in rng))
+        x_min, x_max, y_min, y_max = (float(v) for v in rng)
+        roi = self._roi_built
+        if roi and len(roi) >= 4:
+            x0, y0 = float(roi[0]), float(roi[2])
+            x_min, x_max, y_min, y_max = x_min - x0, x_max - x0, y_min - y0, y_max - y0
+        self.area_select_sink(self, (x_min, x_max, y_min, y_max))
 
     def _needs_structural_build(self, value, namespace: Mapping[str, object] | None) -> bool:
         """Whether rendering ``value`` requires (re)building the plotter -- a Qt-widget operation
@@ -6187,8 +6208,7 @@ class TaskConsole(QtWidgets.QWidget):
         # protocol).  Structural builds (Qt widgets) come back to the GUI via _on_render_batch.
         # Created BEFORE the UI build: load_state constructs panel cards, which take the barrier.
         from .render_loop import RenderLoop
-        self._render_loop = RenderLoop(self)
-        self._render_loop.job_done.connect(self._on_render_batch)
+        self._render_loop = RenderLoop(self._on_render_batch, parent=self)
 
         self._build_ui()
         self.load_state(self.state)
@@ -6963,48 +6983,45 @@ class TaskConsole(QtWidgets.QWidget):
         pfx = self._declared_node_prefix(row)              # prepend the node prefix -> == published_signals()
         return [f"{pfx}{k}" for k in self._node_bare_keys(row.node)]
 
-    def _reactive_ring(self, start_row: "LogicNodeRow", start_node) -> list[str] | None:
+    def _reactive_ring(self, start_node) -> list[str] | None:
         """The signal-name path of an INDIRECT reactive ring that starting ``start_node`` would
         close (A consumes B's output while B consumes A's), or None.  Walked over REACTIVE edges
         only -- ``Processor.consumes`` (the versions that WAKE a node) -- because only an all-
         reactive ring is self-sustaining: a pulse-scan's y reading its own relayed ``frame_0`` is
-        a documented PULL (one bounded await per point), so measurement rows contribute outputs
-        but never an out-edge here and that pattern stays legal.  Declared keys (#prebind) stand
-        in for stopped producers, so a ring is caught no matter the start order.  The DIRECT
-        self-loop is rejected at the base (Processor.__init__) -- one guard per scope."""
+        a documented PULL (one bounded await per point), so measurements contribute outputs but
+        never an out-edge here and that pattern stays legal.
+
+        The graph is the RUNNING nodes only (``self.running_nodes`` -- GUI rows AND notebook-
+        injected ``running_nodes=`` processors alike, which have no row at all).  A runtime ring
+        can only exist between running nodes, and every candidate passes through here at ITS
+        start, so whichever start CLOSES a ring is rejected -- start order still cannot smuggle
+        one in.  Stopped rows deliberately contribute nothing: their stored values may be stale
+        against what their next Start will actually build (rejecting a legal start on stale
+        edges is worse than re-checking honestly at that later start).  The DIRECT self-loop is
+        rejected at the base (Processor.__init__) -- one guard per scope."""
         from ..neutral_atom.operations.logic import Processor
         if not isinstance(start_node, Processor) or not getattr(start_node, "consumes", ()):
             return None
-
-        def reactive_inputs(row) -> tuple[str, ...]:
-            if row.node.kind != "processor":
-                return ()
-            running = self._logic_nodes.get(id(row))
-            if isinstance(running, Processor):
-                return tuple(str(n) for n in running.consumes)
-            # stopped row: read the picked slots straight from the stored signal_expr values
-            names = []
-            for value in dict(getattr(row.node, "values", {}) or {}).values():
-                if isinstance(value, dict) and "inputs" in value:
-                    names.extend(str(n) for n in (value.get("inputs") or ()) if n)
-            return tuple(names)
-
         producer = {}
-        for row in self.logic_nodes:
-            if row is start_row:
+        for node in self.running_nodes:
+            if node is start_node or not hasattr(node, "published_signals"):
                 continue
-            for key in self._declared_signal_keys(row):
-                producer.setdefault(str(key), row)
+            try:
+                for key in node.published_signals():
+                    producer.setdefault(str(key), node)
+            except Exception:
+                continue
         targets = {str(s) for s in start_node.published_signals()}
         seen = set()
         stack = [(str(n), (str(n),)) for n in start_node.consumes]
         while stack:
             name, path = stack.pop()
-            row = producer.get(name)
-            if row is None or id(row) in seen:
+            node = producer.get(name)
+            if node is None or id(node) in seen:
                 continue
-            seen.add(id(row))
-            for nxt in reactive_inputs(row):
+            seen.add(id(node))
+            inputs = node.consumes if isinstance(node, Processor) else ()
+            for nxt in (str(n) for n in inputs):
                 if nxt in targets:
                     return [*path, nxt]          # the ring closes on this node's own output
                 stack.append((nxt, (*path, nxt)))
@@ -7527,8 +7544,14 @@ class TaskConsole(QtWidgets.QWidget):
                 node.apply_acquisition_parameters(**params)
                 # keep the row's stored values in sync so its Edit reopen / save shows the drag
                 row.node.values = {**dict(row.node.values or {}), **params}
+                # ...and an ALREADY-OPEN Edit tab too: left stale, its next Start would silently
+                # revert the drag to the pre-drag region it still displays.
+                editor = self._logic_editors.get(id(row))
+                if editor is not None and hasattr(getattr(editor, "form", None), "seed_values"):
+                    editor.form.seed_values(params)
                 retargeted.append(str(row.node.title))
         if retargeted:
+            self._mark_dirty()          # the retarget mutated persisted row values (save must see it)
             card.set_status(f"ROI -> {', '.join(retargeted)}", error=False)
             return
         from ..neutral_atom.operations.signal_expr import DEFAULT_SOURCE
@@ -7588,7 +7611,7 @@ class TaskConsole(QtWidgets.QWidget):
         # cross-thread full-speed republish ping-pong.  The DIRECT self-loop is rejected at the
         # base (Processor.__init__, single source); the ring spans nodes only the board can see,
         # so the graph walk lives here, before commit.
-        ring = self._reactive_ring(row, node)
+        ring = self._reactive_ring(node)
         if ring:
             path = " -> ".join(ring)
             row.set_state("error", status=f"signal loop: {path}"[:90])
@@ -8189,6 +8212,9 @@ class TaskConsole(QtWidgets.QWidget):
         # one GAP margin), NOT the whole board widget -- the board is sized to fill the scroll viewport
         # (setWidgetResizable), so grabbing it would bake in a big empty plot area below/right of the
         # panels.  Clamp to the board so the sub-rect is valid; empty board -> the whole (tiny) board.
+        # board.grab() forces a synchronous paint of EVERY canvas -- settle the render loop first
+        # (the file dialog above kept ticks running, so a batch may be in flight right now).
+        self._render_loop.barrier()
         cards = list(self.cards)
         if cards:
             rect = cards[0].geometry()
@@ -8239,38 +8265,43 @@ class TaskConsole(QtWidgets.QWidget):
             self._update_summary()
             return
         self._tick_count += 1
-        # A render batch is still in flight: skip this tick's submission entirely.  Dirtiness is
-        # version-gated (frame keys), so every skipped panel retries the moment the worker frees up
-        # -- this refusal IS the frame-skip back-pressure (no budget, no rotor: the GUI thread no
-        # longer executes any compose, so there is nothing to ration on it).
-        if not self._render_loop.busy:
-            disp = self._display_shot()            # the ONE coherent display shot for the whole board this tick
-            sigvers = self.hub.signal_versions()   # ONE per-signal-counter snapshot for the whole tick
-            elapsed = self._tick_count * self._base_interval_ms
-            # COLLECT every panel whose coherent frame changed and whose beat is due.  The panel's OWN
-            # beat (update_ms) gates WHEN it recomposes; the coherent clock decides WHAT it shows (the
-            # shared snapshot at ``disp``).  Panels on the same beat flip to the same shot in the same
-            # batch (the three emCCD frames of a pulse never split); a panel on a slower beat holds its
-            # previous coherent shot until its beat comes round -- that is what choosing a slower update
-            # interval MEANS.  A mid-drag panel is skipped whole (a live recompose under a drag stomps
-            # the widget blit backgrounds); it catches up on release.
-            batch = []
-            for card in self.cards:
-                key = self._panel_frame_key(card, disp, sigvers)
-                if key == card._render_version:
-                    continue                       # nothing this panel shows changed
-                if elapsed % card.config.update_ms != 0:
-                    continue                       # beat not due
-                fig = getattr(card.plotter, "fig", None)
-                if fig is not None and getattr(fig, "_zlc_interacting", False):
-                    continue                       # GUI-owned for the drag's duration
-                batch.append((card, key))
-            if batch:
-                # The worker builds the shared namespace ITSELF (the full-hub snapshot copy is real
-                # work -- off the GUI thread with everything else) and composes each panel in place;
-                # panels needing a STRUCTURAL build come back untouched for the GUI pass.
-                self._render_loop.submit(
-                    lambda b=batch, d=disp: self._compose_batch(b, d))
+        # A render batch in flight (composing, or finished but its GUI pass still queued) blocks this
+        # tick's submission -- this refusal IS the frame-skip back-pressure (no budget, no rotor: the
+        # GUI thread no longer executes any compose, so there is nothing to ration on it).  But a beat
+        # that falls on a busy tick is OWED (``card._beat_owed``): the next idle tick serves it
+        # regardless of the modulo.  Without that, submissions phase-lock -- a heavy fast-beat panel
+        # occupies exactly the ticks a slow-beat panel's beats land on, starving it FOREVER under
+        # sustained overload (the fairness the deleted rotor used to provide).
+        busy = self._render_loop.busy
+        disp = self._display_shot()            # the ONE coherent display shot for the whole board this tick
+        sigvers = self.hub.signal_versions()   # ONE per-signal-counter snapshot for the whole tick
+        elapsed = self._tick_count * self._base_interval_ms
+        # COLLECT every panel whose coherent frame changed and whose beat is due (or owed).  The panel's
+        # OWN beat (update_ms) gates WHEN it recomposes; the coherent clock decides WHAT it shows (the
+        # shared snapshot at ``disp``).  Panels on the same beat flip to the same shot in the same
+        # batch (the three emCCD frames of a pulse never split); a panel on a slower beat holds its
+        # previous coherent shot until its beat comes round -- that is what choosing a slower update
+        # interval MEANS.  A mid-drag panel is skipped whole (a live recompose under a drag stomps
+        # the widget blit backgrounds); its beat is owed too, so it catches up right on release.
+        batch = []
+        for card in self.cards:
+            key = self._panel_frame_key(card, disp, sigvers)
+            if key == card._render_version:
+                continue                       # nothing this panel shows changed
+            if elapsed % card.config.update_ms != 0 and not card._beat_owed:
+                continue                       # beat not due (and none owed)
+            fig = getattr(card.plotter, "fig", None)
+            if busy or (fig is not None and getattr(fig, "_zlc_interacting", False)):
+                card._beat_owed = True         # due but unservable this tick -> next idle tick serves it
+                continue
+            card._beat_owed = False
+            batch.append((card, key))
+        if batch:
+            # The worker builds the shared namespace ITSELF (the full-hub snapshot copy is real
+            # work -- off the GUI thread with everything else) and composes each panel in place;
+            # panels needing a STRUCTURAL build come back untouched for the GUI pass.
+            self._render_loop.submit(
+                lambda b=batch, d=disp: self._compose_batch(b, d))
         # keep the visible Edit tab's 'now:' acquisition references live, so a queued
         # parameter edit shows as applied once the loop picks it up.
         editor = self.tabs.currentWidget()
@@ -8299,20 +8330,22 @@ class TaskConsole(QtWidgets.QWidget):
         if not isinstance(result, dict):
             return                     # a job that raised whole (already latched per panel) -- drop
         namespace = result["namespace"]
-        served = []
-        for card, key in result["structural"]:
+        # Membership gate FIRST: a card removed (or shut down) while the batch was in flight must
+        # not get a structural compose / status flush either -- composing into a torn-down card
+        # resurrects Qt widgets its removal already deleted.
+        alive = lambda c: c in self.cards or c is self._task_card
+        structural = [(c, k) for c, k in result["structural"] if alive(c)]
+        composed = [(c, k) for c, k in result["composed"] if alive(c)]
+        for card, _key in structural:
             try:
                 card.compose(namespace)          # the full GUI compose: builds plotter + canvas
             except Exception:
                 pass                             # compose latches its own status
-            served.append((card, key))
-        for card, key in result["composed"]:
+        for card, _key in composed:
             card.flush_deferred_status()
-            served.append((card, key))
-        for card, key in served:
-            if card in self.cards or card is self._task_card:
-                card._render_version = key
-                card.present()
+        for card, key in structural + composed:
+            card._render_version = key
+            card.present()
 
     def refresh_once(self) -> None:
         """Synchronous FULL refresh (tests / notebooks / Resume catch-up): COMPOSE every card from the

@@ -5,8 +5,8 @@ Two halves:
 * na-side -- the SignalHub exposes the primitive a consumer needs (``history_len`` + the ``shot`` counter)
   so a display can PROVE its ring dropped shots: publishing more than the ring depth between two reads
   leaves only ``history_len`` in the ring.
-* console-side -- ``_update_summary`` turns that overrun into an amber banner (``_SUMMARY_STYLE_WARNING``)
-  and clears it once the display catches up.
+* console-side -- ``_update_summary`` turns that overrun into an amber advisory on the persistent
+  status strip (severity ``"warning"``) and clears it once the display catches up.
 """
 
 from __future__ import annotations
@@ -66,8 +66,7 @@ def offscreen(monkeypatch):
 
 
 def test_console_warns_amber_when_display_falls_behind_then_clears(offscreen):
-    from Zou_lab_control.frontend.task_console import (
-        TaskConsole, default_console_state, _SUMMARY_STYLE_WARNING)
+    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
     hub = SignalHub(history=8)
     console = TaskConsole(hub=hub, state=default_console_state(), running_nodes=[])
     console._timer.stop()
@@ -76,11 +75,11 @@ def test_console_warns_amber_when_display_falls_behind_then_clears(offscreen):
         for i in range(40):                              # a burst FAR exceeding the 8-deep ring
             hub.publish({"v": float(i)})
         console._update_summary()                        # the display "reads" again -> detects the overrun
-        assert console._summary_style == _SUMMARY_STYLE_WARNING
-        assert "display behind" in console._summary_text
-        assert "acquisition unaffected" in console._summary_text  # the run is never implicated
+        assert console.status_strip.severity == "warning"
+        assert "display behind" in console.status_strip.text()
+        assert "acquisition unaffected" in console.status_strip.text()  # the run is never implicated
 
         console._update_summary()                        # no new shots since -> display caught up -> clears
-        assert console._summary_style != _SUMMARY_STYLE_WARNING
+        assert console.status_strip.severity != "warning"
     finally:
         console.shutdown()

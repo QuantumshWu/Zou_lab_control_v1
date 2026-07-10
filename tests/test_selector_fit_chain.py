@@ -87,6 +87,57 @@ def test_area_drag_on_a_live_panel_creates_then_retargets_a_roi_node():
         exp.close()
 
 
+def test_selector_wiring_converts_axis_coords_to_the_frames_own_pixels():
+    """The REAL drag wiring, end to end: enabling selectors on a live 2d panel hooks the
+    console sink onto the area selector's callback, and a release on a panel whose axes
+    carry a nonzero region ORIGIN (an ROI crop's roi_frame) is translated into the
+    displayed frame's OWN pixels before it seeds the consumer (the ROI-of-ROI case --
+    unconverted axis pixels would clamp to a corner sliver)."""
+    import Zou_lab_control.neutral_atom as na
+    exp = na.connect("virtual")
+    con = make_console(exp)
+    try:
+        cam_row = add_logic_row(con, ("camera", "live"))
+        con._logic_editors[id(cam_row)].form.seed_values({"camera": "monitor_camera"})
+        con._start_logic_node(cam_row)
+        cam = con._logic_nodes[id(cam_row)]
+        cam.step()
+        frame_sig = sorted(cam.published_signals())[0]
+
+        roi_row = add_logic_row(con, ("processor", ROI_SPEC_NAME))
+        con._logic_editors[id(roi_row)].form.seed_values(
+            {"source": {"inputs": [frame_sig], "source": "value = signal"},
+             "x_min": 100.0, "x_max": 400.0, "y_min": 50.0, "y_max": 250.0})
+        con._start_logic_node(roi_row)
+        roi = con._logic_nodes[id(roi_row)]
+        cam.step(); roi.step()                    # roi_frame on the hub, region learned
+        crop_sig = [s for s in roi.published_signals() if s.endswith("roi_frame")][0]
+
+        from Zou_lab_control.frontend.task_console import PanelConfig
+        card = con._new_panel_card(PanelConfig(kind="2d", title="crop", size="2x2",
+                                               source=f"value = {crop_sig}", params={}))
+        con._attach_card(card)
+        con.refresh_once()
+        assert card._roi_built == [100, 400, 50, 250]        # axes carry the crop's origin
+
+        card.set_selectors_enabled(True)
+        area = card.plotter.fig._zlc_tools.area
+        assert area.callback == card._forward_area_select    # the sink IS wired on the selector
+
+        n_rows = len(con.logic_nodes)
+        area.range = [150.0, 200.0, 80.0, 120.0]             # AXIS coords on the crop's panel
+        area._call()                                          # the selector's own release dispatch
+        assert len(con.logic_nodes) == n_rows + 1
+        nested = con._logic_nodes[id(con.logic_nodes[-1])]
+        cam.step(); roi.step(); nested.step()
+        crop = con.hub.latest([s for s in nested.published_signals()
+                               if s.endswith("roi_frame")][0])
+        assert crop.shape == (40, 50)             # local (y 30..70, x 50..100), NOT a clamped sliver
+    finally:
+        con.shutdown()
+        exp.close()
+
+
 def test_fit_center_spec_is_registered():
     from Zou_lab_control.neutral_atom.operations.processor_registry import discovered_processor_specs
     import Zou_lab_control.neutral_atom as na

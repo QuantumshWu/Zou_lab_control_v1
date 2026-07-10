@@ -24,7 +24,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("ZLC_VIRTUAL_SLEEP_SCALE", "0")
 
 import Zou_lab_control.neutral_atom as na
-from conftest import add_logic_row, make_console
+from conftest import add_logic_row, make_console, tick
 
 
 def _monitor_row(con):
@@ -65,7 +65,7 @@ def test_reopen_and_restart_updates_the_image_again():
         card = con._new_panel_card(PanelConfig(kind="2d", title="MON", size="4x4",
                                                source=f"value = {sig}", params={}))
         con._attach_card(card)
-        con._tick()
+        tick(con)
         assert card._status_error is False
 
         con.stop_all_nodes()                                  # close the window...
@@ -78,12 +78,12 @@ def test_reopen_and_restart_updates_the_image_again():
             return np.asarray(imgs[0].get_array(), dtype=float).copy() if imgs else None
 
         node2.step()
-        con._tick()
+        tick(con)
         before = image()
         shot_before = con._display_shot()
         for _ in range(3):
             node2.step()
-        con._tick()
+        tick(con)
         after = image()
         shot_after = con._display_shot()
         assert shot_after is not None and (shot_before is None or shot_after > shot_before)
@@ -113,7 +113,7 @@ def test_stopping_one_camera_row_never_freezes_the_other():
         card = con._new_panel_card(PanelConfig(kind="2d", title="MON", size="4x4",
                                                source=f"value = {mon_sig}", params={}))
         con._attach_card(card)
-        con._tick()
+        tick(con)
 
         con._stop_logic_node(camrow)                          # stop the OTHER row
         assert mon.running and mon in con.running_nodes
@@ -121,7 +121,7 @@ def test_stopping_one_camera_row_never_freezes_the_other():
         before = np.asarray(imgs[0].get_array(), dtype=float).copy()
         for _ in range(3):
             mon.step()
-        con._tick()
+        tick(con)
         after = np.asarray(card.plotter.fig.axes[0].images[0].get_array(), dtype=float)
         assert not np.array_equal(before, after)              # the monitor image stays LIVE
     finally:

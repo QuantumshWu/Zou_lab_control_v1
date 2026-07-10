@@ -6,8 +6,10 @@ chain: bind ``fit_x0``/``fit_y0`` to rolling monitors to watch the MOT drift liv
 them (or ``fit_amplitude``) as a pulse-scan y / loss signal, exactly like ``roi_value``.
 
 The model is the ONE :func:`Zou_lab_control._readout_math.gaussian2d_center` definition the
-display-side ``DataFigure.center`` fit uses (popt names A/B/R/x0/y0), so a fitted centre
-means the same thing on a panel overlay and on the hub.  The frame is stride-decimated to a
+display-side ``DataFigure.center`` fit uses (popt names A/B/R/x0/y0).  Coordinates are the
+CONSUMED frame's OWN pixels (origin = the frame's corner): when the producing node declares
+a spatial ``region``, a panel overlay fit reports the shifted AXIS pixels instead -- the two
+differ by exactly that region origin.  The frame is stride-decimated to a
 small grid before ``curve_fit`` (moment-method seeds), so a 2.3 MP stream fits in ~ms on the
 node's own thread -- the GUI never runs this.
 
@@ -36,7 +38,8 @@ _FIT_GRID_MAX = 96
 
 def fit_frame_center(frame) -> dict[str, float] | None:
     """Fit the ONE shared centre model to ``frame`` -> {fit_x0, fit_y0, fit_amplitude,
-    fit_size, fit_offset} in the frame's own pixel coordinates, or None when the fit fails
+    fit_size, fit_offset} in THIS frame's own pixel coordinates (never any upstream
+    region/axis frame -- the processor only sees the array), or None when the fit fails
     (flat frame / no convergence).  Moment-method seeds + stride decimation, then
     ``scipy.optimize.curve_fit`` on :func:`gaussian2d_center`."""
     from scipy.optimize import curve_fit
