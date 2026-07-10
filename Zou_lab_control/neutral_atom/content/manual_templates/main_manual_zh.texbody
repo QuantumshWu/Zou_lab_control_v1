@@ -1003,14 +1003,13 @@ print(seq.snapshot()["remote"]["state"])   # 远端状态机当前态
 seq.set_safe_state()                         # 远端回到安全空闲
 \end{codeblock}
 
-\section{五个 Sequencer 类各司其职}
+\section{三个 Sequencer 类各司其职}
 
-仓库里有五个实现 \pyapi{SequencerDevice} 契约的 sequencer，角色互不重叠：
+仓库里有三个实现 \pyapi{SequencerDevice} 契约的 sequencer，角色互不重叠：
 
 \begin{description}
-\item[\pyapi{VirtualSequencer}] 纯软件假人。无硬件，用于离线开发与单元测试，验证编译/契约而不接 FPGA。
-\item[\pyapi{VirtualSequencer}] 本地适配器：直接内嵌一个 \pyapi{SequencerService}，在\tfocus{同一进程}里走完整的 prepare/fire/wait 协议（无硬件回调，按程序时长 × \pyapi{sleep\_scale} 实时节拍播放）。虚拟后端与 pulse GUI 的 Virtual (sim) 共用它，适合在一台机器上端到端联调协议。
-\item[\pyapi{ManualSequencer}] 手动/逐步模式，给需要人工介入或单步推进的台架调试用。
+\item[\pyapi{VirtualSequencer}] 本地仿真适配器：直接内嵌一个 \pyapi{SequencerService}，在\tfocus{同一进程}里走完整的 prepare/fire/wait 协议（无硬件回调，按程序时长 × \pyapi{sleep\_scale} 实时节拍播放）。虚拟后端与 pulse GUI 的 Virtual (sim) 共用它——离线开发、单元测试与端到端协议联调的唯一入口。
+\item[\pyapi{ManualSequencer}] 首光/外部触发模式：\pyapi{prepare} 在 host 端完整校验并编译程序，\pyapi{fire} 刻意\tfocus{不}驱动硬件，只提示操作员手动启动 FPGA（或任何第三方触发源），相机在真实硬件上等待外部触发。用于服务器/触发链尚未就绪时的相机干跑（qCMOS 首光）。
 \item[\pyapi{RemoteSequencer}] RPyC 客户端代理，连远端真实硬件（本章主角）。
 \end{description}
 

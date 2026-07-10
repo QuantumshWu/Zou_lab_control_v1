@@ -651,9 +651,9 @@ __CAMERA_GRABBER_FIG__
 \pyapi{TrapArrayDevice} \tfocus{故意不暴露}每个阱点在相机像素上的中心坐标。原因是：像素中心属于\tfocus{标定}（calibration）结果，会随光路、相机位置而变，不应硬编码在设备里。阱阵列只负责"有多少个阱点"这种内禀属性，像素映射由标定模块单独提供。这条边界划分能避免设备层和标定层耦合。
 \end{notebox}
 
-\section{五个时序器类：选型决策表}
+\section{三个时序器类：选型决策表}
 
-时序器是本系统最容易混淆的部分，因为有五个实现，外形相似但用途迥异。下面逐一说明各自的\tfocus{独特角色}与适用场景。
+时序器有三个实现，外形相似但用途迥异。下面逐一说明各自的\tfocus{独特角色}与适用场景。
 
 \begin{description}
 \item[\pyapi{VirtualSequencer}] 本地进程内运行一个 \pyapi{SequencerService}，会真正\tfocus{编译边沿表}，并按程序自身时长 × \pyapi{sleep\_scale} 的\tfocus{实时节拍}播放（扫描进度、live 相机节奏都跟着真实时长走）。\tfocus{何时用}：写脚本、跑单测、调 GUI、CI——任何没有硬件的场合；虚拟后端与 pulse GUI 的 Virtual (sim) 都用它，也适合验证编译产物。
@@ -819,7 +819,7 @@ import json
 print(json.dumps(devices.snapshot(), indent=2))   # JSON-safe 状态全景
 \end{codeblock}
 
-读到这里，你应该能够：写出三种形态的配置、理解 \pyapi{\$device:} 依赖与循环检测、用 \pyapi{load_devices} 得到 \pyapi{DeviceSet}、通过类型化属性与 \pyapi{require} 安全取设备、遵守 \pyapi{open}/\pyapi{close} 的顺序与回滚、读懂四类设备的契约，并在五个时序器之间正确选型，乃至注册并接入自己的设备。
+读到这里，你应该能够：写出三种形态的配置、理解 \pyapi{\$device:} 依赖与循环检测、用 \pyapi{load_devices} 得到 \pyapi{DeviceSet}、通过类型化属性与 \pyapi{require} 安全取设备、遵守 \pyapi{open}/\pyapi{close} 的顺序与回滚、读懂四类设备的契约，并在三个时序器之间正确选型，乃至注册并接入自己的设备。
 
 \chapter{相机采集原理（深入）}
 
