@@ -103,5 +103,9 @@ notebook-first;子模块只经接口互联(解耦);无后向兼容;前端密封;
 - ~~**pulse_table.from_dict 手搓反序列化**~~ → **已收敛(`3075075`)**:`from_dict` 复用 `_serialization.require_array/object/bool/int/number/string`;array/object/int 报错文案字节不变,name/scan_code/time_step/repeat_forever/repeat_start/end 走 helper 标准文案(无测试断言这些串);catalog/periods-nonempty/schema+version 语义校验留内联。
 - **DAC 有符号范围三源**:PortSpec.signed_range(ports.py:97)/bus_signed_range(pulse_table.py:57)/bus_signed_bounds(live.py:2509)→ 收敛到 topology 对象那一个。
 
+### B'. 交接留下的 38 个红测试(全量 sweep 发现;handoff baseline 3f2e049 即红,非本轮回归)
+> workflow 9 路根因分诊后逐簇修:**已修 ~28**(commit 序)· stale-test 簇(processor 订阅在构造期建立+replay-post-boundary、9-key 信封、frame_0 命名)· measurement code-bug(DeviceControlAxis 无 .slot 要跳过校验;build_detection_scan 用 `primary_time_slot()` 而非硬串 "exposure")· panel-reshape(我 b978467 的 1D reshape 太宽,吞了 2D 帧→加 `sum(n>1)<=1` 门)· pulse_table slot_point 空表回落 nominal(`_slot_row` 单源)· save 非结构图折自身 x/y 为 value+x typed signals· RPyC `encode_wire_payload` 空 scan 数组留 JSON head(严格 decoder 单源)· run_server.bat 纯 CRLF + 入口契约测试改单源时钟。
+- **未修:port-catalog `aligned_to_catalog` 簇(~10 测,含纠缠的 remote.channels/semantic-slot-name)**:代码 docstring(语义端口匹配、"naked raw-lane 不接受")与其自身测试(raw-lane 子集展开)**互相矛盾**,且是共享的 fire/edit 路径解析器 + 涉真机模板对齐。盲改任一方向都可能破坏真机对齐(违背"真机错先查自己代码"),故**留待专项:先与用户确认 template→hardware 对齐到底是语义匹配还是 raw-lane 子集**,再单簇重写 + 跑全量 alignment/GUI-load/remote-connect battery。
+
 ### C. 收尾
 - 上述落地后一次性更新 PDF 手册(frontend/fpga/main) + tutorial,清历史残余,补关键概念示意图。
