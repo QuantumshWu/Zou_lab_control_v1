@@ -1593,7 +1593,8 @@ class PanelCard(FluentGroupBox):
                  sites_inputs_provider=None, curve_x_provider=None,
                  structure_provider=None, short_names_provider=None,
                  live_namespace_provider=None, pulse_state_provider=None,
-                 grid_recipe_provider=None, render_barrier=None, area_select_sink=None):
+                 grid_recipe_provider=None, render_barrier=None, area_select_sink=None,
+                 fit_clear_sink=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
         super().__init__(PANEL_KINDS[config.kind], parent)
@@ -1649,6 +1650,11 @@ class PanelCard(FluentGroupBox):
         # rectangle drawn on this LIVE image panel retargets/creates a RoiProcessor consuming
         # this panel's signal (the "draw a box -> get roi_frame/roi_value signals" gesture).
         self.area_select_sink = area_select_sink
+        # callable(card) -> the console's fit-teardown sink: clearing the fit (Clear button /
+        # unchecking live fit) STOPS + removes the FitProcessor this card's fit created, so
+        # ``fit_x0``/... stop publishing (the fit node has a full create-on-apply / remove-on-clear
+        # lifecycle, unlike a one-shot curve overlay).
+        self.fit_clear_sink = fit_clear_sink
         self.plotter = None
         self.canvas = None
         # The console header's "Selectors" switch state for THIS card (set via
@@ -3098,6 +3104,10 @@ class PanelCard(FluentGroupBox):
         toggle = getattr(self, "fit_toggle", None)
         if toggle is not None and toggle.isChecked():
             toggle.blockSignals(True); toggle.setChecked(False); toggle.blockSignals(False)
+        # Tear down the hub FitProcessor this card's fit created, so ``fit_x0``/... stop publishing --
+        # clearing the overlay without stopping the node left fit_center republishing forever (#5).
+        if callable(self.fit_clear_sink):
+            self.fit_clear_sink(self)
         self._set_fit_result_text(None)
         label = getattr(self, "fit_result_label", None)
         if label is not None:
@@ -6618,7 +6628,8 @@ class TaskConsole(QtWidgets.QWidget):
             structure_provider=self._signal_structure, pulse_state_provider=self._pulse_state,
             grid_recipe_provider=self._grid_recipe,
             short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace,
-            render_barrier=self._render_loop.barrier, area_select_sink=self._on_panel_area_select)
+            render_barrier=self._render_loop.barrier, area_select_sink=self._on_panel_area_select,
+            fit_clear_sink=self._on_panel_fit_clear)
 
     def _attach_card(self, card: PanelCard) -> None:
         card.setParent(self.board)
@@ -7664,7 +7675,13 @@ class TaskConsole(QtWidgets.QWidget):
                 card.set_status(f"selection invalid: {str(exc).splitlines()[0][:100]}", error=True)
 
     def _apply_fit_selection(self, card: "PanelCard", selection) -> None:
-        """Share one FitRequest between overlay and any live image FitProcessor."""
+        """Apply a fit: draw the overlay AND -- for an image ``center`` fit -- publish the fitted
+        parameters on the hub through a FitProcessor, so ``fit_x0``/``fit_y0``/... are real signals a
+        Monitor or a scan loss can consume (the 'fit results become signals' half of the selector
+        chain, symmetric to ROI).  The overlay uses the ONE shared :class:`FitRequest`; the hub node
+        (created once, retargeted thereafter) uses the SAME request.  Turning the fit OFF
+        (:meth:`_clear_fit_request`) STOPS + removes that node so it stops publishing -- fit has a
+        full lifecycle, unlike a one-shot curve overlay."""
 
         from ..neutral_atom.core.fitting import FitRequest
 
@@ -7681,9 +7698,8 @@ class TaskConsole(QtWidgets.QWidget):
         payload = request.to_dict()
         card._set_param("fit_request", payload)
 
-        # The stock processor currently owns image-datum fitting.  Curve overlays
-        # still use the exact same core request, but are not forced through an
-        # image processor with an incompatible schema.
+        # A non-image curve fit (hist bimodal, 1-d) is a display overlay: its fitted params are not a
+        # per-shot hub tensor.  Only an image ``center`` fit becomes a hub node.
         if model != "center" or card.config.kind == "grid":
             card._set_fit_result_text()
             return
@@ -7718,6 +7734,21 @@ class TaskConsole(QtWidgets.QWidget):
         started = self._logic_nodes.get(id(row)) is not None
         card.set_status(f"fit -> {cfg.title}" + ("" if started else " (start failed — see Logic tab)"),
                         error=not started)
+
+    def _on_panel_fit_clear(self, card: "PanelCard") -> None:
+        """Clearing a panel's fit tears down the FitProcessor that panel's fit created: STOP + REMOVE
+        every FitProcessor consuming this card's signal, so ``fit_x0``/... stop publishing.  The
+        symmetric other half of :meth:`_apply_fit_selection` -- fit is a full-lifecycle hub node
+        (create on apply, remove on clear), never an orphan that keeps republishing after the
+        operator turned it off (#5)."""
+        signal = str(card.config.inputs[0]) if card.config.inputs else ""
+        if not signal:
+            return
+        from ..neutral_atom.operations.processors.fit import FitProcessor
+        for row in list(self.logic_nodes):
+            node = self._logic_nodes.get(id(row))
+            if isinstance(node, FitProcessor) and signal in tuple(node.consumes):
+                self._remove_logic_node(row)
 
     def _apply_roi_selection(self, card: "PanelCard", selection) -> None:
         """Convert an xy selection to local pixels and retarget/create ROI crop."""
