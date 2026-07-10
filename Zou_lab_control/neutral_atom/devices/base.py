@@ -939,6 +939,13 @@ class CameraDevice(BaseDevice):
         if stop is None and timeout is None:
             lock.acquire()
             return
+        # A FREE lock is taken IMMEDIATELY and arm proceeds -- ``stop``/``timeout`` only govern a wait on
+        # a CONTENDED lock.  This keeps the common (uncontended) path identical to the legacy blocking
+        # acquire: a caller passing a ``stop`` that happens to be already set (e.g. a finite node stepped
+        # one past its block) still arms and lets the read return empty, rather than raising a spurious
+        # cancellation before we ever needed to wait.
+        if lock.acquire(blocking=False):
+            return
         deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
         while True:
             if stop is not None and stop.is_set():
