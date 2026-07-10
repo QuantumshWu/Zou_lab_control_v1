@@ -90,12 +90,12 @@ notebook-first;子模块只经接口互联(解耦);无后向兼容;前端密封;
 
 > 上下文:另一 agent 的 typed signal-tensor / port-catalog / fitting 重构整体 `sound-with-cleanups`(7 子系统 + core 评审;高层设计合理不该重写)。已修并提交:#1 1D external-datum 重载根因(b978467)· 过时 info 信封夹具迁移(9ab2e49)· core 死代码 snapshot_at_version/point_data(9c87d6b)· #6 ROI 门单源化(6618caf)。#2/#5/#7-crash/#8/#9 早于本轮已在 3f2e049/741e2c5 落地。以下是**尚未落地**的,按"能否 headless 验证"排序。
 
-### A. 需真 GUI 逐帧验证(headless 已排除多路,不盲改)
-- **#4 cbar 颜色柱某些情况没填满框**:headless 四条路径(静态 / clim 拖拽 / cmap 切换 / live update)**全部 100% 填满**——`image.set_clim` 会同步 cax ylim + solids QuadMesh 几何;`DragHLine.on_motion`(selectors.py:536)走 `draw_idle()` 全画会重建 colorbar。故只可能出现在**嵌入式 Qt canvas 的 offscreen-Agg / FRONT-QImage stretch-blit 前缓冲路径**(`qt_canvas` 的 `_zlc_embedded` present/paint),需真 console 拖 clim / 切 cmap 逐帧截图定位是否 FRONT 快照漏刷 colorbar 区域。
+### A. 需真显示器 + 用户具体复现态才能定位(headless 穷尽排除,不盲改)
+- **#4 cbar 颜色柱某些情况没填满框**:**穷尽排查、无法复现**——solids 填充率在以下每条路径 + 每种模式都精确 100%:静态 / clim 拖拽(`DragHLine.on_motion` selectors.py:536 走 `draw_idle()` 全画重建 colorbar)/ cmap 切换 / 平坦帧 / live update / **真实嵌入式 `_zlc_embedded` canvas grab 的 PNG 视觉确认满填** / `seed_clim`(grid 放大格)/ `relim_mode=fixed` / 部分扫描(NaN 格)。根因:`image.set_clim` 同步 cax ylim + solids QuadMesh 几何,故 blit(solids 在 `cax.collections` 每 tick 重画)与全画都对齐。**给一个每路径都满填的视觉 bug 盲发"修复"会破坏当前正确行为**,故不改。残余可能:真显示器特定 DPR 交互 / 某个我没构造到的特定数据×模式×交互时序 / 已被更早改动修掉。下一轮需**用户提供确切复现态(哪种面板 kind、relim 模式、数据、触发的操作序列)+ 真显示器逐帧**才能钉。
 - **#6 余项 hist 无框选 fit/crop**:fit 对 1d/2d/sites/monitor/grid 已在;`_kind_offers_general_fit('hist')=False` 是**有意**(hist 的 fit=自带 bimodal 旋钮 none/single/double,不叠通用峰模型)。真缺口=`PanelCard._build_settings` 的 selection-action 组合框整段在 `if models:` 内(task_console.py:2049),hist(models=[])拿不到"框选→fit/crop"。修法:把组合框抬出 `if models:`;action=="fit" 时对 hist 路由到 bimodal 而非通用模型(`_apply_fit_selection` @7667 需按 kind 分派)。需真 hist 面板验证框选→bimodal 联动。
 
 ### B. 可 headless / 契约测试验证(下一轮硬骨头)
-- **#7-secondary scan_table 载入覆盖损坏**:pulse_gui 生成缓存空时 load 覆盖损坏;复现存档链(`_current_scan_table`/snap)后根修 + 往返契约测试。
+- ~~**#7-secondary scan_table 载入覆盖损坏**~~ → **已修(`353e985`)**:`_apply_scan_source` 空缓存时用 `[]` 覆盖 scan_table,与 display 侧 `_refresh_scan_tab` 的空源回落规则分叉;现让 apply 侧同回落 + headless 回归测试。
 - **shape 词汇双源(最大 DRY 收益)**:transport 用 `SignalSchema.point_shape`(单,signal_tensor.py:110),node/GUI 用 `SignalSpec.points_shape`(复,logic.py:113)+ stringly `structure` dict 横跨 ~199 处/27 文件;shape 派生数学在 `describe_shape`(logic.py)/`coerce_panel_value`(live.py:2311)/`SignalSchema` 各重打一遍。收敛成一套词汇 + 一个 `physical_shape` 校验,全量契约测试守。**大范围多文件,独立一轮。**
 - **canonical shape 校验四处重打**:task_console._validate_canonical_block(3378)/data_figure._validate_signals(179)/figure_viewer(258)/live.coerce grid(2322)→ 复用 core `signal_tensor.physical_shape`。
 - **schema-lifecycle 三处判定收敛**:register_signal(signals.py:267)/publish install loop(463)/logic._register_output_schemas(363),提 hub-internal `_install_schema_locked` + 把"only installer may replace"策略移进 hub(可让 node 丢掉 `_inherit_output_schema_ownership`)。
