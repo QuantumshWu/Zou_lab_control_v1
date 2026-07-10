@@ -32,7 +32,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest
-from conftest import tick  # noqa: E402
+from conftest import tick, write_saved_npz  # noqa: E402
 
 from Zou_lab_control.frontend import plot, show_figure_viewer  # noqa: E402
 from Zou_lab_control.frontend.figure_viewer import (  # noqa: E402
@@ -452,7 +452,7 @@ def _saved_sites_with_signals_npz(tmp_path) -> Path:
                 "frame_judged": sig(frame, [1], [H, W], "camera image", "counts", "frame"),
             }}
     path = tmp_path / "occ_sites.npz"
-    np.savez(path, data_x=centers, data_y=occ.mean(0).reshape(N, 1), info=info)
+    write_saved_npz(path, data_x=centers, data_y=occ.mean(0).reshape(N, 1), **info)
     return path
 
 
@@ -524,7 +524,7 @@ def _saved_1d_with_repeat_npz(tmp_path) -> Path:
             "signals": {"survival": sig(block, [P], [1], "survival", "", "value"),
                         "t": sig(x.reshape(1, 1, P), [1], [P], "t (s)", "", "x")}}
     path = tmp_path / "survival_repeat.npz"
-    np.savez(path, data_x=x.reshape(P, 1), data_y=block.mean(0).reshape(P, 1), info=info)
+    write_saved_npz(path, data_x=x.reshape(P, 1), data_y=block.mean(0).reshape(P, 1), **info)
     return path
 
 
@@ -691,7 +691,7 @@ def _saved_pulse_recipe_npz(tmp_path) -> Path:
     info = {"kind": "pulse", "name": "demo_pulse", "source": "pulse preview",
             "figure_recipe": {"kind": "pulse", "pulse_state": st.to_dict(), "include_always_off": True}}
     path = tmp_path / "demo_pulse.npz"
-    np.savez(path, data_x=np.zeros((1, 1)), data_y=np.zeros((1, 1)), info=info)
+    write_saved_npz(path, data_x=np.zeros((1, 1)), data_y=np.zeros((1, 1)), **info)
     return path
 
 
@@ -823,7 +823,7 @@ def test_pulse_panel_size_round_trips_from_recipe(tmp_path):
             "figure_recipe": {"kind": "pulse", "pulse_state": st.to_dict(),
                               "include_always_off": True, "panel_size": "4x4"}}
     npz = tmp_path / "sized_pulse.npz"
-    np.savez(npz, data_x=np.zeros((1, 1)), data_y=np.zeros((1, 1)), info=info)
+    write_saved_npz(npz, data_x=np.zeros((1, 1)), data_y=np.zeros((1, 1)), **info)
     v = show_figure_viewer(npz)
     try:
         card = v.console.cards[0]
@@ -1235,36 +1235,23 @@ def test_edit_tab_param_edits_keep_the_snapshots_enlarged_cell(tmp_path, cell):
         plt.close("all")
 
 
-def test_seed_panel_binds_the_nodes_value_signal_on_promote_fallback(tmp_path):
-    """#27: a save whose ``info['signals']`` carries NO value-role entry (``figure_capture`` skips a
-    role it cannot resolve) promotes the first stored block to the value role -- WITHOUT moving it to
-    the ``value`` key.  The seeded panel's source/inputs must therefore come from the NODE's
-    ``y_signal`` (the single owner of "which key the value landed on"): the old hand-built
-    ``fig_value`` binding named a signal the node never publishes, so exactly the fallback that
-    promised "the window still opens with a reproduction" opened an EMPTY board."""
+def test_no_value_role_save_is_rejected_at_load(tmp_path):
+    """A value role is a LOAD-time invariant, not something the node reconstructs: every real save keys
+    its ``inputs[0]`` as ``value`` (``figure_capture``), so a save with NO value-role signal is malformed
+    by construction and the loader rejects it with a clear error -- there is no silent "promote an
+    arbitrary block" fallback (that path is removed; a figure always reopens against the signal it was
+    saved from, or not at all)."""
     from Zou_lab_control.frontend.data_figure import load_figure
-    from Zou_lab_control.frontend.figure_viewer import _seed_state
-    from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
     y = np.linspace(0.0, 1.0, 16)
     info = {"kind": "1d",
             "signals": {"sweep": {"block": y.reshape(1, 1, 16), "points_shape": [1],
                                   "data_shape": [16], "label": "sweep", "unit": "", "role": "x"}}}
     npz = tmp_path / "no_value_role.npz"
-    np.savez(npz, data_x=np.arange(16.0), data_y=y, info=info)
+    write_saved_npz(npz, data_x=np.arange(16.0), data_y=y, **info)
 
-    saved = load_figure(npz)
-    hub = SignalHub()
-    node = LoadedFigureNode(hub, saved)
-    node.step()
-    published = set(hub.names())
-    assert FIG_SIGNAL not in published, "precondition: the promote fallback really engaged"
-
-    state = _seed_state(saved, node)
-    panel = state.panels[0]
-    assert panel.inputs == [node.y_signal]
-    assert panel.source == f"value = {node.y_signal}"
-    assert node.y_signal in published, "the seeded panel binds a signal the node ACTUALLY publishes"
+    with pytest.raises(ValueError, match="requires exactly one value signal"):
+        load_figure(npz)
 
 
 def test_bare_sitemap_save_uses_neutral_role_keys_and_binds_fully(tmp_path):

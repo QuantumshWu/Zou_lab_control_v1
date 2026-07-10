@@ -101,6 +101,40 @@ def tick(con):
     con._render_loop.barrier()
 
 
+def write_saved_npz(path, *, data_x, data_y, **info):
+    """Write a hand-crafted saved-figure ``.npz`` through the ONE production writer
+    (``data_figure._write_saved_npz``), filling the required-but-unspecified ``info`` records with
+    inert defaults.  A reload test that needs a bespoke payload (a site map with a stored frame, a
+    pulse recipe, a promote-fallback with no value role) builds it HERE instead of a raw
+    ``np.savez(info=...)`` -- so a test fixture can never drift from the current envelope again (the
+    old raw-``savez`` fixtures silently rotted the moment the envelope grew its typed records)."""
+    from Zou_lab_control.frontend.data_figure import _write_saved_npz
+    from Zou_lab_control.neutral_atom.operations.figure_capture import raw_data_flow_graph
+    record = {
+        "name": "fig", "kind": None, "labels": ["X", "Y", "Z"], "unit": "",
+        "points_done": 0, "repeat_cur": 1, "view": {}, "fit": None, "size": "2x2",
+        "signals": {}, "figure_recipe": None, "provenance": {},
+    }
+    record.update(info)
+    # Every current envelope carries a flow_graph inside provenance and, for a pulse recipe, a
+    # panel_size -- fill the ones a partial fixture omitted so the payload validates like a real save.
+    provenance = dict(record["provenance"] or {})
+    provenance.setdefault("flow_graph", raw_data_flow_graph())
+    record["provenance"] = provenance
+    recipe = record["figure_recipe"]
+    if isinstance(recipe, dict) and recipe.get("kind") == "pulse" and "panel_size" not in recipe:
+        # panel_size is a REQUIRED non-empty recipe key: a real pulse save stamps the OPTIMAL default
+        # size (``default_pulse_size``) when the operator has not chosen one, so a fixture that omits it
+        # gets exactly that -- the same single source the save and the viewer's fallback both use.
+        from Zou_lab_control.frontend.live import default_pulse_size
+        from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+        state = PulseTableState.from_dict(recipe["pulse_state"])
+        recipe = {**recipe, "panel_size": default_pulse_size(
+            state, include_always_off=bool(recipe.get("include_always_off", True)))}
+        record["figure_recipe"] = recipe
+    _write_saved_npz(path, data_x=data_x, data_y=data_y, info=record)
+
+
 def add_logic_row(con, data):
     """Add a logic row through the REAL Add-Panel path (kind combo -> ``_add_panel``) and
     return it -- e.g. ``add_logic_row(con, ("camera", "live"))``."""

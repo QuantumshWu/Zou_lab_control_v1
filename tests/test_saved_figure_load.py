@@ -33,7 +33,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest
-from conftest import tick  # noqa: E402
+from conftest import tick, write_saved_npz  # noqa: E402
 
 import Zou_lab_control.frontend as zf  # noqa: E402
 from Zou_lab_control.frontend import SavedFigure, load_figure, plot  # noqa: E402
@@ -121,26 +121,17 @@ def test_compatible_kinds_contains_the_saved_kind(tmp_path):
     assert "2d" not in kinds and "sites" not in kinds
 
 
-def test_old_format_npz_loads_and_view_defaults(tmp_path):
-    """An OLD payload carries only ``data_x`` / ``data_y`` + a minimal ``info`` (no ``view`` sub-dict,
-    no ``kind``).  ``load_figure`` must read it without crashing, default the view state to empty, and
-    still re-render through the shape-inferred kind."""
+def test_old_format_npz_is_rejected_with_a_clear_error(tmp_path):
+    """An OLD ``info``-blob payload is DELIBERATELY not loadable: the current envelope is a fixed set of
+    typed records (``plot`` / ``signals`` / ``recipe`` / ``provenance`` / ``metadata`` / ``schema`` /
+    ``version``), and the loader rejects anything else with an actionable message rather than silently
+    guessing at a legacy shape (no backward-compat scaffolding -- the break is intentional and pinned)."""
     x = np.linspace(0, 1, 40).reshape(-1, 1)
     y = np.sin(np.linspace(0, 6, 40)).reshape(-1, 1)
     path = tmp_path / "legacy.npz"
     np.savez(path, data_x=x, data_y=y, info={"labels": ["X", "Y", "Z"], "name": "legacy"})
-    saved = load_figure(path)
-    try:
-        assert isinstance(saved, SavedFigure)
-        assert saved.view == {}                                # no stored view -> empty (defaults)
-        assert saved.kind is None                              # old npz did not record a kind
-        assert "1d" in saved.compatible_kinds()                # 1-column data_x -> 1-D families
-        # info_summary and plot both work with the minimal payload
-        assert "legacy" in saved.info_summary()
-        df = saved.plot()                                      # kind falls back to "auto" (shape-inferred)
-        assert isinstance(df, DataFigure)
-    finally:
-        plt.close("all")
+    with pytest.raises(ValueError, match="envelope keys must be exactly"):
+        load_figure(path)
 
 
 def test_fit_is_stored_in_saved_info(tmp_path):
@@ -190,7 +181,8 @@ def test_saved_npz_has_one_loader_shared_by_both_public_paths():
     live_tree = ast.parse((pkg_dir / "live.py").read_text(encoding="utf-8"))
     imported = [alias.name for node in ast.walk(live_tree) if isinstance(node, ast.ImportFrom)
                 and (node.module or "").endswith("data_figure") for alias in node.names]
-    assert "_load_saved_npz" in imported, "frontend.load must go through data_figure._load_saved_npz"
+    assert {"load_figure", "_load_saved_npz"} & set(imported), \
+        "frontend.load must delegate to data_figure's loader (load_figure -> _load_saved_npz), not roll its own np.load"
 
 
 def test_na_facade_exposes_load_figure(tmp_path):
@@ -369,12 +361,11 @@ def test_focused_dis_grid_save_reopens_as_a_faithful_hist_grid(tmp_path):
         plt.close("all")
 
 
-def test_recipeless_grid_save_falls_back_to_arrays_not_a_crash(tmp_path, monkeypatch):
-    """A grid save whose recipe capture FAILS must NOT stamp ``kind='grid'`` (which would send the reopen
-    down ``plot(kind='grid')`` -- rejected, like pulse -- and crash).  Without a recipe the save has NO
-    ``kind`` and the ``data_x`` / ``data_y`` fallback reopens through shape inference, exactly as the save's
-    docstring promises ('degrades to the array-only fallback').  This pins the kind/recipe pairing so a
-    future GridCell family with no recipe cannot produce an unloadable npz."""
+def test_recipeless_grid_save_raises_rather_than_a_silent_array_figure(tmp_path, monkeypatch):
+    """Recipe capture is MANDATORY for a grid save: the recipe is the single reproduction source, so a
+    cell family that cannot serialize one FAILS LOUDLY at save time instead of silently writing a
+    different (array-only) figure that would reopen unfaithfully.  Pins that mandatory-recipe contract
+    (``GridPlot.save``'s own docstring) so a future GridCell family without a recipe surfaces at once."""
     from Zou_lab_control.frontend import live as live_mod
     from Zou_lab_control.frontend.live import site_histogram_grid
     # Force the recipe capture to fail (a future/custom cell family that has no recipe).
@@ -382,12 +373,8 @@ def test_recipeless_grid_save_falls_back_to_arrays_not_a_crash(tmp_path, monkeyp
                         lambda grid: (_ for _ in ()).throw(TypeError("no recipe")))
     grid = site_histogram_grid([np.random.normal(0, 1, 30) for _ in range(4)], display=False)
     try:
-        out = grid.save(str(tmp_path / "recipeless"))
-        saved = load_figure(out["data"])                    # must NOT raise (the reported latent crash)
-        assert saved.kind is None, "a recipe-less grid save carries NO grid kind (avoids plot(kind='grid'))"
-        assert saved.figure_recipe is None
-        df = saved.plot()                                   # shape-inferred array fallback -- must not raise
-        assert df.fig is not None
+        with pytest.raises(TypeError, match="no recipe"):
+            grid.save(str(tmp_path / "recipeless"))
     finally:
         plt.close("all")
 
@@ -442,9 +429,9 @@ def test_pulse_preview_save_stores_a_faithful_figure_recipe(tmp_path):
         out = df.save(str(tmp_path / "demo_pulse.png"))
         assert Path(out["figure"]).exists() and Path(out["data"]).exists()
         data = np.load(out["data"], allow_pickle=True)
-        info = data["info"].item()
-        assert info["figure_recipe"]["kind"] == "pulse"
-        assert "periods" in info["figure_recipe"]["pulse_state"]
+        recipe = data["recipe"].item()                      # the recipe record is its own envelope key now
+        assert recipe["kind"] == "pulse"
+        assert "periods" in recipe["pulse_state"]
     finally:
         plt.close("all")
 
@@ -505,7 +492,7 @@ def test_pulse_recipe_prefers_provenance_sequencer_payload(tmp_path):
         "provenance": {"devices": {"sequencer": {"last_payload_json": json.dumps(fired_state.to_dict())}}},
     }
     npz = tmp_path / "fired_pulse.npz"
-    np.savez(npz, data_x=np.zeros((1, 1)), data_y=np.zeros((1, 1)), info=info)
+    write_saved_npz(npz, data_x=np.zeros((1, 1)), data_y=np.zeros((1, 1)), **info)
 
     saved = load_figure(npz)
     try:
