@@ -3345,6 +3345,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 
         state = self.read_state()
         rows = self._scan_tables.get("loaded" if self._scan_use_loaded else "generated", [])
+        # An EMPTY source cache (the generator was never Run this session; no file loaded) must NOT
+        # wipe the active table -- a freshly LOADED pulse carries its own ``scan_table``, and clobbering
+        # it to [] is exactly the "load a pulse and its scan program vanishes" bug (#7). Fall back to the
+        # current table, the SAME rule ``_refresh_scan_tab`` uses (the display side), so the apply side
+        # and the refresh side can never drift on what "no source yet" means.
+        if not rows:
+            rows = [list(row) for row in state.scan_table]
         n = len(state.scan_slots)
         # Pad a short row with the slot's NOMINAL (reference) value, not 0 -- same rule as
         # read_state, so a newly-bound slot starts at the field's current value instead of

@@ -98,6 +98,19 @@ def test_scan_repeats_default_is_zero_forever(_app):
     assert int(ed.read_state().scan_repeats) == 0
 
 
+def test_apply_scan_source_with_empty_generated_cache_keeps_the_loaded_table(_app):
+    """#7: a pulse LOADED with its own scan_table must keep it even when the generator was never Run
+    this session (the ``generated`` cache is empty).  ``_apply_scan_source`` used to clobber the active
+    table with the empty cache -> the loaded scan program vanished; it now falls back to the current
+    ``state.scan_table`` (the SAME rule the display side ``_refresh_scan_tab`` uses), so the two paths
+    cannot drift on what 'no source generated yet' means."""
+    ed = _pulse_editor()                                  # state carries scan_table=[[10],[20],[30]]
+    assert ed._scan_tables["generated"] == []             # precondition: nothing generated this session
+    ed._scan_use_loaded = False
+    ed._apply_scan_source()                               # must NOT wipe the loaded/current table
+    assert [list(r) for r in ed.read_state().scan_table] == [[10.0], [20.0], [30.0]]
+
+
 # ---- the live progress poll is defensive (no sequencer / no method -> blank, never raises) ------
 def test_poll_scan_progress_blank_without_sequencer(_app):
     ed = _pulse_editor()
