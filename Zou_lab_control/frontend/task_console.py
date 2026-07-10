@@ -999,8 +999,8 @@ def _text_to_py(text: str):
 # grid.  WIDTH still scales with the size (``cols // 2`` base-widths so 1x4 is wider than 1x2);
 # HEIGHT HUGS the plot -- the card is exactly tall enough for its figure + chrome, with NO blank
 # padding below (every size hugs like 1x2, #H3i-3).  ``PanelConfig.col`` is the card's pixel X and
-# ``row`` is the card's pixel Y; ``_compact`` is a TOP-LEFT GRAVITY packer that floats every card
-# UP then LEFT until blocked.  The CARD'S FORMAT (rounded corners, shadow, grey title strip,
+# ``row`` is the card's pixel Y; :func:`pack` is the order-driven TOP-LEFT GRAVITY packer that places
+# every card at the first free NW slot in list order.  The CARD'S FORMAT (rounded corners, shadow, grey title strip,
 # content padding) belongs to the FluentGroupBox COMPONENT (qt_fluent.CARD_PAD / CARD_TITLE_PX,
 # the single source); this module only lays cards out.
 GRID_UNIT = 8
@@ -1074,128 +1074,24 @@ def _overlaps_with_gap(box: tuple[int, int, int, int], placed) -> bool:
     return False
 
 
-def _spans_mostly_overlap(lo_a: float, hi_a: float, lo_b: float, hi_b: float) -> bool:
-    """True when two 1-D spans ``[lo_a, hi_a]`` and ``[lo_b, hi_b]`` overlap by MORE THAN HALF of the
-    NARROWER span -- a "majority overlap", not a mere touch.  This is the robust "in the same band"
-    test the gravity packer uses: two cards count as sharing a column (or a row) only when one sits
-    mostly in front of the other, so a card dragged to sit BESIDE another with a slight edge overlap is
-    NOT judged to be stacked with it.  Adjacent (GAP-apart, zero intersection) spans return False."""
-    inter = min(hi_a, hi_b) - max(lo_a, lo_b)            # signed intersection length (negative = a gap)
-    if inter <= 0:
-        return False
-    narrower = min(hi_a - lo_a, hi_b - lo_b)
-    return inter * 2 > narrower                          # more than half the narrower span is covered
+class _GeomProxy:
+    """A throwaway geometry stand-in (size + packed pixel top-left) that :func:`pack` can place
+    WITHOUT mutating a real ``PanelConfig``.  :func:`drop_index` packs proxies to probe where a
+    trial order would put a card, so the ONE packer is also the drag oracle (no second rule)."""
 
+    __slots__ = ("size", "col", "row")
 
-def _gravity_slot(cfg, placed, board_w: int) -> tuple[int, int]:
-    """NORTH-WEST (top-left) gravity ANCHORED at the card's CURRENT ``(col, row)``: from where it is, the
-    card falls toward the top-left corner -- it rises straight UP until a card above blocks it, then slides
-    straight LEFT until a card to its left (or the boundary) blocks it -- alternating to a fixed point.  It
-    only ever moves UP and LEFT and is BLOCKED by neighbours, so it NEVER teleports over an obstacle to a
-    far free slot: a card dragged to the bottom-left, blocked above by a panel and on the left by the
-    boundary, STAYS bottom-left -- it is NOT flung to a top-right gap (#2).  ``placed`` = the already-
-    settled cards; x is clamped inside ``board_w`` so a card stays on the board.
-
-    "In my column" / "in my row" use a MAJORITY-overlap test (:func:`_spans_mostly_overlap`), not any
-    touch: a placed card blocks my RISE only when its x-span covers MORE THAN HALF of the narrower of
-    our two widths, and blocks my SLIDE-LEFT only when its y-span covers more than half the narrower
-    height.  So a card dragged to sit BESIDE another with a slight edge overlap rests at the other's
-    right edge instead of sinking beneath it (the reported "drop B to A's right -> B falls under A"
-    bug): only a card the dragged one MOSTLY covers counts as sharing its band.
-
-    Rest-up = just below the lowest placed card whose x-span mostly overlaps this card's column (else the
-    top margin); rest-left = just right of the right-most placed card whose y-span mostly overlaps this
-    card's row (else the left margin).  Sliding left changes which cards share the row and rising changes
-    the column band, so we alternate until neither moves.  (A FRESH card spawns at :func:`_first_free_slot`
-    so an Add tiles into the board; thereafter this local gravity keeps it -- and a drag -- where put.)"""
-    w, h = _card_size(cfg.size)
-    max_x = max(GAP, board_w - GAP - w)
-    x = min(max(GAP, int(round(cfg.col))), max_x)        # start from the card's CURRENT spot (clamped on-board)
-    y = max(GAP, int(round(cfg.row)))
-    for _ in range(8):                                    # alternate rise / slide-left to a fixed point
-        ny = GAP                                          # rise: rest just under any column-overlapping card
-        for p in placed:
-            px0, py0, px1, py1 = _aabb(p)
-            # p is "above me in my column" only if its width MOSTLY covers mine -- a slight edge overlap
-            # (a card sitting mostly beside me) must NOT make me sink under it.
-            if _spans_mostly_overlap(x, x + w, px0, px1):
-                ny = max(ny, py1 + GAP)
-        nx = GAP                                          # slide left: rest just right of any LEFT card in the row
-        for p in placed:
-            px0, py0, px1, py1 = _aabb(p)
-            # p is "to my left in my row" only if its height MOSTLY covers mine (majority overlap at the
-            # risen y) AND it is actually to the LEFT (px0 < x).  Only a card to the left blocks LEFTWARD
-            # travel: a card to the RIGHT that merely shares the row band (e.g. a right-column card grown
-            # TALLER on resize) must NOT shove this card right past it (the resize bug that flung every
-            # left-column card down/across when one card was enlarged); a mere slight vertical sliver of
-            # overlap must not block the slide either.
-            if px0 < x and _spans_mostly_overlap(ny, ny + h, py0, py1):
-                nx = max(nx, px1 + GAP)
-        nx = min(nx, max_x)
-        if (nx, ny) == (x, y):
-            break
-        x, y = nx, ny
-    return (x, y)
-
-
-def _snap_drop_anchor(cfg, placed, board_w: int) -> tuple[int, int]:
-    """NEAREST-ANCHOR landing rule for a DRAG-DROP: the dragged card's raw drop TOP-LEFT
-    (``cfg.col``, ``cfg.row``) competes over two candidate anchor sets and lands on the
-    closest one (squared euclidean distance).
-
-    A. CORNERS -- every OTHER placed card's top-left ``(c.col, c.row)``.  Winning means the
-       drop DISPLACES that card: the dragged card is seeded exactly on its corner, and the
-       subsequent :func:`_compact` (with the dragged card ``active``) lets it win the
-       coincident slot while NW gravity re-settles the displaced card out of the way (below).
-    B. VACANCIES -- the :func:`_first_free_slot` candidate lattice (x = GAP, each placed
-       card's right edge + GAP, and each left edge; y = GAP and each bottom edge + GAP),
-       kept only where the dragged card FITS: on the board (``GAP <= x <= max_x``, the same
-       clamp as :func:`_gravity_slot`) and clear of every placed card by GAP
-       (:func:`_overlaps_with_gap`).  Winning means the drop lands on that free anchor.
-
-    Deterministic tie-break: distance, then y, then x, then corner-over-vacancy.  Pure
-    geometry (no Qt).  Snapping only picks the SEED -- the ordinary :func:`_compact` NW
-    gravity then packs from it, so the no-teleport law still holds: the geometrically
-    NEAREST anchor wins, never a far free slot.  Applied ONLY on the drag-release path
-    (resize / reflow / Add placement never snap)."""
-    w, h = _card_size(cfg.size)
-    max_x = max(GAP, board_w - GAP - w)
-    drop_x, drop_y = int(round(cfg.col)), int(round(cfg.row))
-
-    def _key(x: int, y: int, rank: int) -> tuple[int, int, int, int]:
-        return ((x - drop_x) ** 2 + (y - drop_y) ** 2, y, x, rank)
-
-    best = None
-    for p in placed:                                     # A: corners (rank 0 wins a full tie)
-        cand = _key(int(p.col), int(p.row), 0)
-        best = cand if best is None or cand < best else best
-    xs = {GAP}
-    ys = {GAP}
-    for p in placed:                                     # B: the _first_free_slot vacancy lattice
-        px0, _py0, px1, py1 = _aabb(p)
-        xs.add(px1 + GAP)
-        xs.add(px0)                                      # align left edges (tuck under a wider card)
-        ys.add(py1 + GAP)
-    for x in xs:
-        if not (GAP <= x <= max_x):
-            continue
-        for y in ys:
-            if _overlaps_with_gap((x, y, x + w, y + h), placed):
-                continue
-            cand = _key(x, y, 1)
-            best = cand if best is None or cand < best else best
-    # ``placed`` empty -> A is empty but (GAP, GAP) is always a clear vacancy, so best is set.
-    _d2, y, x, _rank = best
-    return (x, y)
+    def __init__(self, size: str, col: int = 0, row: int = 0):
+        self.size, self.col, self.row = str(size), int(col), int(row)
 
 
 def _first_free_slot(cfg, placed, board_w: int) -> tuple[int, int]:
-    """The TOP-MOST then LEFT-MOST free ``(col, row)`` where ``cfg`` fits clear of every placed card (GAP
-    apart, inside ``board_w``).  Used ONLY to SEED where a freshly-Added panel spawns, so an Add TILES into
-    the board (fills the top row left-to-right, then wraps to the next row) instead of starting a fresh
-    column.  (Compaction + drag use :func:`_gravity_slot`'s local NW gravity, which then KEEPS a card here.)
-    Candidate points are GAP (origin) + each placed card's right/bottom edge (``+GAP``) and its left/top
-    edge (so a card can tuck under a wider one); swept by y then x, first feasible wins."""
+    """The TOP-MOST then LEFT-MOST free ``(col, row)`` where ``cfg`` fits clear of every ``placed`` card
+    (GAP apart, inside ``board_w``) -- the per-card north-west placement :func:`pack` applies to EVERY
+    card in order (so the board tiles the top row left-to-right, wraps to the next shelf, and never
+    leaves a middle hole).  Candidate points are GAP (origin) + each placed card's right/bottom edge
+    (``+GAP``) and its left/top edge (so a card can tuck under a wider one); swept by y then x, first
+    feasible wins."""
     w, _h = _card_size(cfg.size)
     xs = {GAP}
     ys = {GAP}
@@ -1229,45 +1125,63 @@ def _min_board_width(configs: Sequence["PanelConfig"]) -> int:
 def _board_width(configs: Sequence["PanelConfig"]) -> int:
     """A fallback packing width for callers without a live viewport (the pure-function tests): two
     of the WIDEST card side by side plus the GAP margins, so cards CAN pack side by side.  The real
-    GUI passes the scroll viewport width to ``_compact`` instead, so the board wraps at the edge."""
+    GUI passes the scroll viewport width to :func:`pack` instead, so the board wraps at the edge."""
     widest = max((_card_size(c.size)[0] for c in configs), default=_card_size("1x2")[0])
     return max(2 * widest + 3 * GAP, _min_board_width(configs))
 
 
-def _compact(configs: Sequence["PanelConfig"], active: "PanelConfig | None" = None,
-             board_w: int | None = None) -> bool:
-    """TOP-LEFT GRAVITY packer over pixel AABBs (#H3s-F8).  Every card floats UP then LEFT until it
-    is blocked by another card or the board edge; the clear distance to every neighbour and to the
-    top-left origin is a UNIFORM ``GAP`` on all four sides (there is NO column grid -- ``col`` is a
-    pixel x, ``row`` a pixel y).  So a card dropped low-right snaps up-left into the first free slot,
-    and cards pack side by side until the board (``board_w``, the live scroll-viewport width) is full.
+def pack(order: Sequence["PanelConfig"], board_w: int | None = None) -> bool:
+    """The ONE board packer: place each card, IN THE GIVEN LIST ORDER, at the TOP-MOST then LEFT-MOST
+    GAP-clear slot (:func:`_first_free_slot`).  Strict north-west gravity as a PURE function of the
+    ORDER (the board's single source of truth), the sizes, and ``board_w`` -- it does NOT read any
+    card's current pixel position, so it is deterministic and idempotent.
 
-    Cards are placed in READING ORDER of their CURRENT positions -- ``(row, col)``, top-to-bottom
-    then left-to-right -- with the just-moved ``active`` card winning any TIE (it sorts first when it
-    shares a row/col with another, so it claims the contested slot and the others reflow around it).
-    Placing in reading order is what makes the layout STABLE and DETERMINISTIC: the drop point only
-    sets a card's reading-order rank, so dropping a card back where it was reproduces the previous
-    packing exactly, and a settled board is a fixed point (a second pass moves nothing -> False).
-
-    For each card we take the TOP-MOST then LEFT-MOST feasible slot (see ``_gravity_slot``): a card
-    with nothing above or left of it lands at exactly ``(GAP, GAP)``.  ``board_w`` defaults to a
-    two-wide fallback for headless callers.  Returns True if any card's ``(col, row)`` changed."""
-
+    That is what fixes issue #2.  The old packer floated each card up-left from WHERE IT WAS, gated by
+    a fuzzy majority-overlap test and seeded from a pixel-sorted reading order -- so a resize/click
+    could converge to a DIFFERENT fixed point (a surprising "reflow" that read as violating top-left
+    gravity), and an Add seeded into the first middle HOLE.  Here placement depends only on order:
+    the first card lands at ``(GAP, GAP)``; every later card fills the first free NW slot clearing all
+    already-placed cards by GAP within ``board_w`` (else drops to a new shelf below).  An Add appended
+    LAST therefore always lands in the next bottom slot -- never a middle hole -- and re-packing a
+    settled board moves nothing.  A drop REORDERS the list (:func:`drop_index`); pack recomputes every
+    pixel from the new order.  ``board_w`` None -> a two-wide headless fallback; a given width is
+    honoured but clamped up to one-card-wide.  Returns True if any card's ``(col, row)`` changed."""
+    order = list(order)
+    board_w = _board_width(order) if board_w is None else max(board_w, _min_board_width(order))
+    placed: list = []
     moved = False
-    placed: list["PanelConfig"] = []
-    # No live viewport -> a two-wide fallback so cards CAN pack side by side; a given viewport width
-    # is honoured but never below one-card-wide (a too-narrow viewport must still fit the widest card).
-    board_w = _board_width(configs) if board_w is None else max(board_w, _min_board_width(configs))
-    # Reading order (row, then col); the active card wins a tie so a card dropped ONTO another's slot
-    # claims it (the other reflows) instead of yielding -- a 0 sort key only on an exact coincidence.
-    order = sorted(configs, key=lambda c: (c.row, c.col, 0 if c is active else 1))
-    for config in order:
-        col, row = _gravity_slot(config, placed, board_w)
-        if (config.col, config.row) != (col, row):
-            config.col, config.row = col, row
+    for cfg in order:
+        col, row = _first_free_slot(cfg, placed, board_w)
+        if (cfg.col, cfg.row) != (col, row):
+            cfg.col, cfg.row = col, row
             moved = True
-        placed.append(config)
+        placed.append(cfg)
     return moved
+
+
+def drop_index(cfg, others: Sequence["PanelConfig"], board_w: int | None = None) -> int:
+    """The ORDER index at which to insert a card DROPPED at its raw pixel ``(cfg.col, cfg.row)`` among
+    ``others`` (already in order), so it lands NEAREST the drop point under :func:`pack` gravity.
+
+    This is the user's Z1 rule expressed through the ONE packer instead of a separate placement math:
+    for every candidate insertion index we pack a trial order (proxies, so the real configs are never
+    mutated) and measure where the dropped card ends up; the index whose resulting top-left is closest
+    to the raw drop wins.  A drop near an existing card's slot lands ON it (index before it -> that card
+    and everything after shift DOWN the order and re-pack = "displace"); a drop past the last card lands
+    at the bottom (append).  Ties -> the earliest index, so dropping squarely onto a card displaces it.
+    Pure geometry (no Qt).  Board width None -> the same headless fallback :func:`pack` uses."""
+    board_w = _board_width(list(others) + [cfg]) if board_w is None else board_w
+    drop_x, drop_y = int(round(cfg.col)), int(round(cfg.row))
+    proxies = [_GeomProxy(o.size) for o in others]
+    best_i, best_d = 0, None
+    for k in range(len(proxies) + 1):
+        probe = _GeomProxy(cfg.size)
+        trial = proxies[:k] + [probe] + proxies[k:]
+        pack(trial, board_w)
+        d = (probe.col - drop_x) ** 2 + (probe.row - drop_y) ** 2
+        if best_d is None or d < best_d:
+            best_d, best_i = d, k
+    return best_i
 
 
 def _task_files_dir() -> Path:
@@ -2967,10 +2881,10 @@ class PanelCard(FluentGroupBox):
         if self._drag_offset is not None:
             self._drag_offset = None
             self.setCursor(QtCore.Qt.OpenHandCursor)
-            # Record the raw drop pixel as this card's (col, row) seed; the console then SNAPS the
-            # seed to the NEAREST anchor (another card's corner = displace it, or the closest free
-            # lattice point -- :func:`_snap_drop_anchor`) via ``dropped``, and _compact gravity-packs
-            # it top-left (it is the ``active`` card so it wins the anchor it snapped onto).
+            # Record the raw drop pixel as this card's (col, row); the console then REORDERS the card
+            # to the ORDER position nearest that drop (:func:`drop_index` via ``dropped`` -- a drop onto
+            # a card's slot displaces it, a drop past the last card appends to the bottom), and
+            # :func:`pack` recomputes every pixel top-left from the new order.
             col, row = max(0, self.x()), max(0, self.y())
             if (col, row) != (self.config.col, self.config.row):
                 self.config.col, self.config.row = col, row
@@ -6001,7 +5915,7 @@ class _PanelBoard(QtWidgets.QWidget):
         self.setStyleSheet("background: transparent;")
 
     def arrange(self, cards: Sequence[PanelCard]) -> None:
-        # ``col``/``row`` ARE the card's pixel top-left (gravity-packed by _compact); place verbatim
+        # ``col``/``row`` ARE the card's pixel top-left (gravity-packed by :func:`pack`); place verbatim
         # and reserve a GAP margin past the lowest-right card so the board scrolls cleanly.
         max_x = max_y = 0
         for card in cards:
@@ -7463,36 +7377,31 @@ class TaskConsole(QtWidgets.QWidget):
         return super().eventFilter(obj, event)
 
     def _snap_dropped_card(self, card: PanelCard) -> None:
-        """Snap a JUST-DROPPED card's raw pixel seed to its NEAREST anchor (:func:`_snap_drop_anchor`):
-        another card's top-left corner (= displace that card) or the closest free lattice point.
-        Connected to ``PanelCard.dropped`` -- the drag-release path ONLY, so resize / reflow / Add
-        placement stay snap-free; the ``layout_changed`` the card emits right after re-packs as usual
-        (the card is ``active`` in :func:`_compact`, so it wins the anchor it snapped onto)."""
+        """Reorder a JUST-DROPPED card to the ORDER position nearest its raw drop point
+        (:func:`drop_index`): dropping ONTO a card's slot DISPLACES it (insert before it, so it and
+        everything after shift down and re-pack), dropping past the last card appends to the bottom.
+        Connected to ``PanelCard.dropped`` -- the drag-release path ONLY; the ``layout_changed`` the
+        card emits right after re-packs the new order (:func:`pack` recomputes every pixel), so resize
+        / Add never reorder.  The ORDER (``self.cards``) is the layout's single source of truth."""
         if card not in self.cards:
             return
         others = [c.config for c in self.cards if c is not card]
-        board_w = self._pack_width([c.config for c in self.cards])
-        card.config.col, card.config.row = _snap_drop_anchor(card.config, others, board_w)
+        idx = drop_index(card.config, others, self._pack_width([c.config for c in self.cards]))
+        self.cards.remove(card)
+        self.cards.insert(idx, card)
 
     def _arrange(self) -> None:
-        # Top-left gravity pack (see _compact): every card floats UP then LEFT until blocked, with a
-        # uniform GAP on all four sides.  The just-dragged / resized card is the ``active`` one, so it
-        # wins a contested slot and the others reflow.
-        active = self.sender()
-        active_cfg = active.config if isinstance(active, PanelCard) and active in self.cards else None
-        # DEMAND-driven pack width: the viewport width, GROWN only far enough to hold the card that
-        # currently reaches furthest right (its just-dropped column pixel + width).  So a board whose
-        # cards all fit the viewport packs at the viewport width (one column when narrow, no sideways
-        # scroll); the moment a card is dragged into a column past the viewport, the board grows to fit
-        # it -- gravity then keeps it there (it no longer wraps back) and the scroll area shows a
-        # horizontal scrollbar.  Move that card back and the reach shrinks, so the board returns to the
-        # viewport width and the scrollbar disappears.
+        # ONE order-driven north-west pack (:func:`pack`): each card, IN ``self.cards`` ORDER, floats
+        # to the first free top-left slot.  A drag has already reordered ``self.cards`` (via
+        # _snap_dropped_card) so the drop is honoured, while gravity stays strictly top-left and
+        # deterministic -- a resize/click re-packs to the SAME arrangement (no surprise reflow) and an
+        # Add (appended last) lands in the next bottom slot, never a middle hole (#2).
         board_w = self._pack_width([c.config for c in self.cards])
-        if _compact([c.config for c in self.cards], active_cfg, board_w=board_w):
+        if pack([c.config for c in self.cards], board_w):
             self._mark_dirty()
         # Repack as one atomic frame: board.arrange moves EVERY card (card.move) + resizes the board,
-        # so without a freeze each card's move paints on its own and a multi-card gravity reflow reads
-        # as a cascade of little jumps.  The SAME updates-disabled primitive the resized card uses in
+        # so without a freeze each card's move paints on its own and a multi-card reflow reads as a
+        # cascade of little jumps.  The SAME updates-disabled primitive the resized card uses in
         # _on_size, applied one level up so the whole reflow composites in a single flush.
         self.board.setUpdatesEnabled(False)
         try:
@@ -7502,14 +7411,13 @@ class TaskConsole(QtWidgets.QWidget):
         self._update_summary()
 
     def _pack_width(self, configs: Sequence["PanelConfig"]) -> int:
-        """The width the gravity packer wraps at: the live scroll-viewport width GROWN to the furthest
-        right edge any card currently reaches (``col + width + GAP``).  Cards that all fit the viewport
-        pack at the viewport width (no sideways scroll); a card dropped into a column past the viewport
-        grows the board to hold it (so column 2 stays reachable + a horizontal scrollbar appears), and
-        removing/moving it back shrinks the board to the viewport again -- expansion strictly on demand."""
+        """The width :func:`pack` wraps at = the live scroll-viewport width (pack clamps it up to
+        one-card-wide for a card wider than the viewport).  Strict NW gravity means the board only ever
+        grows DOWN (vertical scroll) -- it never parks a card in an off-screen column, so there is no
+        demand-grown horizontal extent to track any more (that was the parking the user asked us to
+        stop, #2).  No viewport yet (pre-show) -> the headless two-wide fallback."""
         vw = self.scroll.viewport().width() if hasattr(self, "scroll") else 0
-        reach = max((c.col + _card_size(c.size)[0] + GAP for c in configs), default=0)
-        return max(vw, reach)
+        return vw if vw else _board_width(configs)
 
     # ------------------------------------------------------------------ actions
     def _add_panel(self) -> None:
@@ -7539,15 +7447,10 @@ class TaskConsole(QtWidgets.QWidget):
             # An Add-Panel grid IS the axis-expander: default to faceting the repeat axis so binding
             # a signal shows cells at once ("(recipe)" is only meaningful for a LOADED figure's grid).
             config.params["facet"] = "repeat"
-        # SPAWN the new card at the first free TOP-LEFT slot (tile into the board: fill the top row
-        # then wrap), NOT a fresh column -- the local NW gravity in _compact then keeps it there.  Seed
-        # against the live VIEWPORT width so Add only ever tiles WITHIN the visible pane (it never
-        # force-grows the board into an off-screen column -- that expansion is on-demand via a DRAG, see
-        # _pack_width); a fallback width covers the pre-show case where the viewport is still 0.
-        cfgs = [c.config for c in self.cards]
-        vw = self.scroll.viewport().width() if hasattr(self, "scroll") else 0
-        board_w = max(vw, _min_board_width(cfgs + [config])) if vw else _board_width(cfgs + [config])
-        config.col, config.row = _first_free_slot(config, cfgs, board_w)
+        # APPEND the new card LAST in order (``_attach_card`` adds it to the end of ``self.cards``);
+        # the order-driven :func:`pack` in ``_arrange`` then lands it in the next free BOTTOM slot,
+        # never a middle hole (#2).  No pixel seed needed -- pack recomputes every card's position from
+        # the order alone.
         card = self._new_panel_card(config)
         self._attach_card(card)
         self._arrange()

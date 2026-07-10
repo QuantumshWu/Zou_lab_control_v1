@@ -1,7 +1,7 @@
 """Contract (#H3s-F8): inter-panel spacing is a UNIFORM ``GAP`` on all four sides.
 
 The user dropped the column grid (#H3r had a column grid + a vertical-gap snap).  The board is now a
-pure pixel plane: ``_compact`` gravity-packs cards top-left and the clear distance between any two
+pure pixel plane: ``pack`` gravity-packs cards top-left and the clear distance between any two
 neighbours -- and the margin from the top-left origin -- is exactly the single ``GAP`` constant
 (which equals the horizontal inter-card gap the user liked).  This guard fails if any placement path
 leaves a ragged gap, or if the spacing stops scaling with the one ``GAP`` knob.
@@ -15,7 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import Zou_lab_control.frontend.task_console as tc
 from Zou_lab_control.frontend.task_console import (
-    GAP, PANEL_KINDS, PanelConfig, _aabb, _card_size, _compact,
+    GAP, PANEL_KINDS, PanelConfig, _aabb, _card_size, pack,
 )
 
 _KIND = sorted(PANEL_KINDS)[0]
@@ -45,7 +45,7 @@ def _stacked_gaps(cfgs):
 def test_stacked_gaps_are_exactly_one_gap():
     """Several cards on a one-card-wide board stack one ``GAP`` apart (uniform, never ragged)."""
     cfgs = _stack([5, 137, 281, 410])               # arbitrary pixel rows in one column
-    _compact(cfgs, board_w=_one_col())              # board fits one column -> they stack
+    pack(cfgs, board_w=_one_col())              # board fits one column -> they stack
     gaps = _stacked_gaps(cfgs)
     assert gaps, "expected the cards to stack in one column"
     for gap in gaps:
@@ -55,7 +55,7 @@ def test_stacked_gaps_are_exactly_one_gap():
 def test_top_left_margin_is_one_gap():
     """The top-most/left-most card sits exactly ``GAP`` from the (0, 0) origin on both axes."""
     cfgs = _stack([5, 137, 281])
-    _compact(cfgs)
+    pack(cfgs)
     top_left = min(cfgs, key=lambda c: (c.row, c.col))
     assert (top_left.col, top_left.row) == (GAP, GAP)
 
@@ -64,7 +64,7 @@ def test_changing_gap_rescales_spacing(monkeypatch):
     """GAP is the ONE knob: retune it and every margin + inter-card gap follows."""
     monkeypatch.setattr(tc, "GAP", 25)
     cfgs = _stack([7, 190, 360])
-    _compact(cfgs, board_w=_one_col())              # one column -> stacked, gaps follow the new GAP
+    pack(cfgs, board_w=_one_col())              # one column -> stacked, gaps follow the new GAP
     top_left = min(cfgs, key=lambda c: (c.row, c.col))
     assert (top_left.col, top_left.row) == (25, 25)            # margin = retuned GAP
     for gap in _stacked_gaps(cfgs):
@@ -78,7 +78,7 @@ def test_side_by_side_cards_one_gap_apart():
     w = _card_size("1x2")[0]
     cfgs = [PanelConfig(kind=_KIND, row=5 * GAP, col=GAP, size="1x2"),
             PanelConfig(kind=_KIND, row=9 * GAP, col=GAP + w + GAP, size="1x2")]   # adjacent columns
-    _compact(cfgs)
+    pack(cfgs)
     cfgs.sort(key=lambda c: c.col)
     left, right = cfgs
     assert left.row == right.row == GAP
@@ -93,7 +93,7 @@ def test_demo_board_seeds_pixel_positions_from_the_geometry_single_source():
 
     board_width = 1480
     configs = _demo_board_state(board_width=board_width).panels
-    assert _compact(configs, board_w=board_width) is False
+    assert pack(configs, board_w=board_width) is False
 
     by_title = {cfg.title: cfg for cfg in configs}
     left = by_title["Readout image"]
