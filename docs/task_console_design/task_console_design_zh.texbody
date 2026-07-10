@@ -362,7 +362,7 @@ Setting 改的每一项——\pyapi{size}、\pyapi{colormap}、声明式参数�
 \end{figure}
 
 \section{task 运行接管控制台(confocal 式)}
-Start 一个 task 时，console 在 Monitor 开一张\tfocus{固定}面板显示它的中途输出（从 \pyapi{node.output} 读，保留键 \pyapi{\_\_task\_frame\_\_}，\tfocus{不经 hub}）：\pyapi{TaskSpec.mid\_run\_key} 选缓冲键（如 \pyapi{frame}），\pyapi{\_refresh\_task\_panel} 在 \pyapi{\_tick} 的 version-gate 之前刷（因为 task 输出不 bump hub version）。同时顶部升起橙色横幅 “Task running …\%”，并\tfocus{禁用其他一切操作}（Add/Save/Load/Edit/其他节点 Start），只留 \pyapi{Stop}（\pyapi{console.\_task\_locked} 把所有入口 short-circuit 掉）。task 完成或 Stop 后\tfocus{解锁}并撤掉该瞬态面板。这样一次性标定/采集流程跑时，操作者只盯它的进度、不会误触别的节点；它的瞬态帧也永不混进 live 读出信号。
+Start 一个 task 时，console 在 Monitor 开一张\tfocus{固定}面板显示它的中途输出（从 \pyapi{node.output} 读，保留键 \pyapi{\_\_task\_frame\_\_}，\tfocus{不经 hub}）：\pyapi{TaskSpec.mid\_run\_key} 选缓冲键（如 \pyapi{frame}），\pyapi{\_refresh\_task\_panel} 在 \pyapi{\_tick} 的 version-gate 之前刷（因为 task 输出不 bump hub version）。同时\tfocus{常驻状态条}（\pyapi{qt\_fluent.FluentStatusStrip}：严重级色点 + 省略式消息行 + 右侧动作按钮）切到橙色 task 级显示 “Task running …\%” 并亮出 \pyapi{Stop task} 按钮——状态条\tfocus{始终在场}、按优先级换内容（节点错误 > 运行中 task > display-behind 提示 > 空闲摘要），不是旧的瞬态横幅那样 show/hide 抖动布局；并\tfocus{禁用其他一切操作}（Add/Save/Load/Edit/其他节点 Start），只留 Stop（\pyapi{console.\_task\_locked} 把所有入口 short-circuit 掉）。task 完成或 Stop 后\tfocus{解锁}、状态条落回空闲摘要并撤掉该瞬态面板。这样一次性标定/采集流程跑时，操作者只盯它的进度、不会误触别的节点；它的瞬态帧也永不混进 live 读出信号。
 
 \section{每面板 Edit:冻结快照模型(关键设计)}
 点面板 \pyapi{Edit…} 打开它的 Edit 标签时，\pyapi{PanelEditor} \tfocus{绑定该面板当前数据的一份快照}——用 \pyapi{panel\_plot} \tfocus{照搬 Monitor 那张卡的 size}（\pyapi{size=card.config.size}，与活面板\tfocus{同尺寸}）重建一个\tfocus{独立的 plotter}（不是 Monitor 卡那个），整页放进 \pyapi{FluentScrollArea}，所以快照再大也不会把底部控件挤出可视区，且快照与活面板尺寸一致。快照画布\tfocus{钉成固定大小}（\pyapi{EmbeddedFigureCanvas.pin\_size}：\pyapi{min==max}=图的设计尺寸，连画布自己 deferred 的 resync 也守住），所以\tfocus{改一个参数重抓快照时它既不会胀大、也不会缩没}（页面只在图比视区高时滚动）。重抓走\tfocus{先建后换}：新 plotter 建成功才拆旧装新，建图中途报错就\tfocus{保留上一张好图、绝不留空白}。\tfocus{选择器分工}：Edit 快照始终带完整选择器（缩放 / 拖阈值线 / \pyapi{AreaSelector} 框选）；Monitor 卡把选择器\tfocus{建好但默认停用}（\pyapi{BaseLivePlot.set\_selectors\_active(False)} + \pyapi{isolate\_wheel=False}，滚轮滚仪表盘、不被框选吞），表头 \tfocus{Selectors} 开关可就地武装全部卡片（零重建，滚轮随之转图内缩放）。理由：
@@ -571,7 +571,7 @@ GUI 的 Start 调的就是同一个 \pyapi{build\_temperature\_scan}（spec.buil
 \section{合规提速 + 留给用户的开关}
 \tfocus{已落地的合规提速 = 空白收紧}（上一章）：figure 像素面积下降 → agg buffer 与面积成正比的 fill/resample/draw\_path/copy-to-Qt 那约 30--40\% 变快（\pyapi{draw\_text} 本身不变）。即空白修复同时是\tfocus{合规的提速}，且正是用户想要的视觉改进。
 
-嵌入面板的低 dpi live-render 性能模式已落地（\pyapi{LIVE\_RENDER\_SCALE}：live 栅格降到约 150 dpi 提速,但显示尺寸与存图 600 dpi 不变,因此不改密封视觉契约）。其余更激进的提速会\tfocus{改变可见行为或视觉}，\tfocus{不擅自做，标记给用户拍板}：迟滞 / sticky autoscale（让 limit 稳定从而 blit 生效）、错峰重绘（不每 tick 重画全部面板）。两者都能显著提速但改 limit 跟踪 / 刷新语义，不在"不改外观不改逻辑"内。
+嵌入面板的低 dpi live-render 性能模式已落地（\pyapi{LIVE\_RENDER\_SCALE}：live 栅格降到约 150 dpi 提速,但显示尺寸与存图 600 dpi 不变,因此不改密封视觉契约）。上面标记给用户拍板的两条后续也已逐轮落地：\tfocus{迟滞 autoscale}（limit 稳定后 blit 快路径生效）与\tfocus{后台渲染线程}（\filepath{frontend/render\_loop.py}：整个 compose——numpy 显示准备 + matplotlib artist 更新 + Agg 栅格化——移出 GUI 线程,GUI 只做调度、present 完成的 front buffer 与交互；批次从提交到\tfocus{被 GUI 消费}前独占其 figure,一切 GUI 侧触图路径先过 \pyapi{barrier()};撞上忙 tick 的节拍记"欠拍"、下个空闲 tick 补上,慢拍面板永不被饿死）。渲染慢从此只降低\tfocus{图的帧率},按钮 / 下拉 / 拖拽始终流畅——权威细节见 \filepath{docs/MAINTAINER\_NOTES.md} §25。
 
 
 \chapter{frontend 密封 API 契约}

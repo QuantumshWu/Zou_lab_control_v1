@@ -2100,17 +2100,35 @@ batch at a time.  The GUI thread keeps scheduling (frame-key/beat gates), presen
 FRONT buffers together (one coherent shot per flip) and serves interaction.  Measured: GUI `_tick`
 207 ms → 1.5 ms with three 2.3 MP live panels; event-loop latency p95 0.5 ms.
 
-**Ownership protocol (the whole thread-safety story).**  Between `submit` and `job_done` the render
-thread owns every batched figure.  Every GUI path that mutates one holds `RenderLoop.barrier()`
-first — the canvas mouse/wheel entries (`EmbeddedFigureCanvas._zlc_wait_render`, hook
-`_zlc_render_barrier` hung at the ONE selector apply point), Setting edits, source apply, the
-coalesced rebuild, Edit-tab open, panel remove/teardown, `refresh_once`.  Structural (re)builds
-(Qt widget creation) are probed by the single dirtiness rule `_needs_structural_build` and handed
-back to the GUI pass in `_on_render_batch`.  `set_status` defers itself off-thread (flushed at
-present) so `compose` never forks per thread.  Compose is Agg-ONLY end to end: the stock QtAgg
-`draw()` hides a `self.update()` Qt call, bypassed via `_zlc_draw_agg_only`; `present()` snapshots
-the buffer into a FRONT QImage the paintEvent blits, so an async paint never races the worker;
-drag interactions drop the front and own the figure for the drag (V5 protocol unchanged).
+**Ownership protocol (the whole thread-safety story; hardened by the audit round `6d6fc53`).**  A
+batch owns its figures from `submit` until the GUI **consumes** it (`RenderLoop.deliver_pending`)
+— NOT merely until the worker finished computing.  The first cut marked idle before emitting
+`job_done`; the adversarial review confirmed the race (a tick could re-submit the same figures
+while the finished batch's present/structural pass was still queued — two threads on one Agg
+buffer).  Now the worker publishes the result and emits a payload-free `job_done`;
+`deliver_pending` (the queued slot AND `barrier()` both land there — whichever runs first wins,
+the other no-ops) pops it, marks idle, then runs the consumer.  `barrier()` therefore waits out
+the compose AND delivers the batch itself: its caller returns to a settled board with nothing in
+flight or pending.  Every GUI path that mutates a live figure holds the barrier first — the canvas
+mouse/wheel entries (`EmbeddedFigureCanvas._zlc_wait_render`, hook `_zlc_render_barrier` hung at
+the ONE selector apply point), the canvas lifecycle funnel (`draw()`, `_zlc_resync`, dpi-ratio
+change, the paintEvent fallback), Setting edits incl. the structure handlers (facet / sub-kind /
+size) and the in-place mutators (title / unit cycle / fixed lims), source apply, the coalesced
+rebuild, Edit-tab open, panel remove/teardown, `refresh_once`, `_save_board_image`'s
+`board.grab()`.  Structural (re)builds (Qt widget creation) are probed by the single dirtiness
+rule `_needs_structural_build` and handed back to the GUI pass in `_on_render_batch`
+(membership-gated FIRST: a card removed mid-flight is never composed into).  `set_status` defers
+itself off-thread (flushed at present) so `compose` never forks per thread.  Compose is Agg-ONLY
+end to end: the stock QtAgg `draw()` hides a `self.update()` Qt call, bypassed via
+`_zlc_draw_agg_only`; `present()` snapshots the buffer into a FRONT QImage the paintEvent blits,
+so an async paint never races the worker; drag interactions drop the front and own the figure for
+the drag (`_zlc_present` skips a mid-drag figure — it catches up on release).  **Fairness**: a
+beat falling on a busy (or mid-drag) tick is OWED (`card._beat_owed`) and served on the next idle
+tick regardless of the beat modulo — a slow-beat panel can never phase-lock onto busy ticks and
+starve behind a heavy fast-beat sibling (the deleted rotor's guarantee, without the rotor).
+Tests drive ONE deterministic frame with `conftest.tick(con)` (= `_tick()` + `barrier()`): a bare
+`_tick()` only SUBMITS, and without a Qt event loop the queued delivery never runs.  Contract:
+`tests/test_render_loop_contract.py`.
 
 **W-round data-plane regression fixed first** (`dfb5dde`): `SignalExpr.co_names()` folds the bound
 inputs in for version-gating, and the raw-signal detector used it — the identity zero-copy path
@@ -2121,18 +2139,26 @@ single integer repeat slice through as the native view.
 **Signal-loop guards** (user-reported): a processor could pick its own output as its source —
 fresh hub = silent starvation forever, primed hub = a full-CPU republish spiral with a frozen shot
 clock.  Three guards, one per scope: `Processor.__init__` rejects `consumes ∩ published_signals()`
-(base single source); `TaskConsole._reactive_ring` walks REACTIVE edges only at start time to
-reject indirect A↔B rings (a pulse-scan's y reading its own relayed frame stays legal — it is a
-bounded PULL, never self-sustaining); the processor Edit picker no longer offers the node's own
-declared outputs.
+(base single source); `TaskConsole._reactive_ring` walks REACTIVE edges over the RUNNING nodes
+only (GUI rows and notebook-injected `running_nodes=` processors alike) at each start — the start
+that would CLOSE a ring is the one refused, so start order cannot smuggle one in, and a stopped
+row's stale stored values can never false-reject a legal start (a pulse-scan's y reading its own
+relayed frame stays legal — it is a bounded PULL, never self-sustaining); the processor Edit
+picker no longer offers the node's own declared outputs.
 
 **Selector→hub chain completed** (the V6 gap): drawing an area rectangle on a LIVE image panel
 (selectors ON) now retargets every RUNNING region-capable processor consuming that signal through
 the thread-safe apply path, or — when none exists — CREATES the stock `ROI crop` row seeded with
 the signal + rectangle and STARTS it (`_on_panel_area_select`; `roi.region_values` is the one
-endpoint→params mapping).  Fit results are hub signals: `FitProcessor` ("Fit center") publishes
-`fit_x0/fit_y0/fit_amplitude/fit_size/fit_offset` scalars per shot from the ONE
-`_readout_math.gaussian2d_center` model `DataFigure.center` also uses.
+endpoint→params mapping).  **Coordinate frames** (audit fix): the selector yields AXIS
+coordinates, and a panel's axes carry the PRODUCING node's declared `region` origin — a consuming
+`RoiProcessor`'s region params are the frame's OWN pixels, so `_forward_area_select` subtracts the
+panel's `_roi_built` origin before forwarding (an ROI-of-ROI / hardware-sub-array drag crops the
+drawn box, not a clamped corner sliver).  A retarget also marks the layout dirty and reseeds an
+already-open Logic Edit tab.  Fit results are hub signals: `FitProcessor` ("Fit center") publishes
+`fit_x0/fit_y0/fit_amplitude/fit_size/fit_offset` scalars per shot — in the CONSUMED frame's own
+pixel coordinates — from the ONE `_readout_math.gaussian2d_center` model `DataFigure.center` also
+uses (an overlay fit on a region-declaring source reports axis pixels; they differ by the origin).
 
 **Persistent status strip**: `qt_fluent.FluentStatusStrip` (severity dot + eliding message +
 optional action) replaces both the header summary label an error used to overwrite and the
