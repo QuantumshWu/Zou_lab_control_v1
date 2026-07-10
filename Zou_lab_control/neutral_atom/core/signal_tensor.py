@@ -300,10 +300,6 @@ class SignalTensor:
         out = self.data.reshape(self.schema.logical_shape(self.data.shape[0]))
         return np.array(out, copy=True) if copy else out
 
-    def point_data(self, repeat: int = 0, point: int = 0, *, copy: bool = True) -> np.ndarray:
-        out = self.data[int(repeat), int(point)]
-        return np.array(out, copy=True) if copy else out
-
     def __array__(self, dtype=None, copy=None) -> np.ndarray:
         array = np.asarray(self.data, dtype=dtype)
         return np.array(array, copy=True) if copy else array
@@ -672,32 +668,6 @@ class TensorStore:
         return SignalTensor(self._data, self.schema, valid=self._valid,
                             version=self.version, provenance=self.provenance,
                             schema_version=self.schema_version)
-
-    def snapshot_at_version(self, version: int) -> SignalTensor:
-        """Reconstruct the exact retained state after one store update."""
-
-        target = int(version)
-        if not self.initialized or not self._updates:
-            raise SignalHistoryGap("signal has no retained updates.")
-        earliest = int(next(iter(self._updates.values())).version)
-        if target < earliest or target > self.version:
-            raise SignalHistoryGap(
-                f"signal version {target} is unavailable; retained range is "
-                f"[{earliest}, {self.version}].")
-        selected = self._updates.get(target)
-        if selected is None:
-            raise SignalHistoryGap(
-                f"signal version {target} is not present in the bounded journal.")
-        _, data, valid = self.seed_for_cursor(SignalCursor(self.schema_version, target))
-        assert data is not None and valid is not None
-        return SignalTensor(
-            data,
-            self.schema,
-            valid=valid,
-            version=target,
-            provenance=selected.provenance,
-            schema_version=self.schema_version,
-        )
 
     def history(self, n: int | None = None) -> TensorHistory:
         if not self.initialized or not self._updates:
