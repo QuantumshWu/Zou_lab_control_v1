@@ -1,30 +1,37 @@
-"""ROI crop + reduce -- the generic "look at a piece of the frame" func node.
+"""ROI = a Selection-driven region reducer -- the generic "look at a piece of the data" func node.
 
-Consumes a camera frame signal and republishes two DERIVED signals per shot:
+Consumes a signal block and republishes two DERIVED signals per shot, GENERIC over EVERY plot kind:
 
-* ``roi_frame`` -- the rectangular crop itself (native dtype), a live 2-D view of just the
-  region: bind it to a ``2d`` panel for a zoomed live image, or to a ``hist`` panel for the
-  distribution of exactly those pixels;
-* ``roi_value`` -- ONE scalar per acquisition (the crop reduced by ``sum`` / ``mean`` / ``max``):
-  bind it to a rolling ``monitor``, or use it as a pulse-scan y -- e.g. the MOT loss signal for a
-  coil scan -- with no bespoke task needed.
+* ``roi_value`` -- ONE scalar per acquisition (the selected cells reduced by ``mean`` / ``sum`` /
+  ``max``): an image rectangle, a 1-D x-range, a distribution's count-range, a site-centre rectangle
+  ALL collapse to this one number.  Bind it to a rolling ``monitor``, or use it as a pulse-scan y --
+  e.g. the MOT loss signal for a coil scan -- with no bespoke task needed.
+* ``roi_frame`` -- a live view of just the region: a fixed-shape native CROP for a contiguous axis
+  selection (image data axes, or a 1-D contiguous index axis), OR -- for a VALUE / scatter selection
+  that has no fixed sub-frame (a distribution's value range; scattered site centres) -- the
+  passthrough block with out-of-region cells set to NaN (a STABLE-shape signal, since the
+  SignalSchema contract forbids a variable-length republish).
 
-This is the building block that lets an operator ASSEMBLE "select a region -> watch its
-distribution / total counts" from stock parts (camera measurement -> ROI processor -> panels)
-instead of needing a dedicated task.  The region is FOUR pixel endpoints in the consumed frame's
-own pixel coordinates -- exactly what the 2-D panel's rectangle selector yields, so a drag on the
-plot writes the region straight back (``region_to_acquisition_parameters``), and the ``roi_frame``
-panel's axes show the true source pixels (``acquisition_parameters()['region']``).
+The ROI carries a :class:`~...core.selection.Selection` + a ``reduce`` verb -- exactly as a
+:class:`FitProcessor` carries a ``FitRequest`` -- so it is generic over plot kind WITHOUT any per-kind
+branch of its own.  WHAT the consumed block's cells mean (image pixels, a 1-D index, a sample value,
+site centres) is per-kind knowledge the FRONTEND owns (``live.region_binding``, the inverse of
+``coerce_panel_value``); it ships that knowledge to this node as PLAIN DATA on the Selection's
+``metadata["binding"]`` (a serializable axis-binding dict), so a drag on ANY panel kind writes the
+region straight back through :meth:`set_selection`, and ``neutral_atom`` never imports ``frontend``.
 
 Reactive and decoupled exactly like Judge occupancy / MOT intensity: it runs beside whatever
-camera measurement publishes the frame (virtual == real: only the frames differ).
+measurement publishes the block (virtual == real: only the data differ).
 """
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 from ...core.params import ParamDecl
+from ...core.selection import Selection
 from ...core.signal_tensor import SignalTensor
 from ..logic import DEFAULT_SOURCE, FRAME_0, IMAGE_STREAM_HISTORY, Processor, SignalExpr, SignalSpec
 from ..processor import ProcessorSpec
@@ -34,32 +41,39 @@ from ..signal_expr import hub_namespace
 #: The reduce verbs an ROI offers, in dropdown order -- ONE source for the node's dispatch, the
 #: ParamDecl choices and the tests, so a verb added here appears everywhere at once.
 ROI_REDUCERS = {"mean": np.mean, "sum": np.sum, "max": np.max}
+#: The NaN-aware twins used on the value-/scatter-mask path (out-of-region cells are NaN), keyed by the
+#: SAME verbs so ``ROI_REDUCERS`` stays the single source of the vocabulary.
+_ROI_NAN_REDUCERS = {"mean": np.nanmean, "sum": np.nansum, "max": np.nanmax}
 
 
 class RoiProcessor(Processor):
-    """Crop and reduce every valid cell of a canonical image tensor."""
+    """Reduce a Selection-selected region of a canonical signal block to one scalar, and republish
+    the region itself -- generic over plot kind because it carries a Selection, not pixels."""
 
     provides = ("roi_frame", "roi_value")
 
-    def __init__(self, hub, *, source_expr=None, x_min: float = 0.0, x_max: float = 0.0,
-                 y_min: float = 0.0, y_max: float = 0.0, reduce: str = "mean", prefix: str = ""):
+    def __init__(self, hub, *, source_expr=None, selection=None, reduce: str = "mean", prefix: str = ""):
         expr = source_expr if isinstance(source_expr, SignalExpr) else SignalExpr.from_value(source_expr)
         if not expr.inputs:
             expr = SignalExpr([FRAME_0], DEFAULT_SOURCE)
         super().__init__(hub, consumes=tuple(expr.inputs), prefix=prefix)
         self.source_expr = expr
-        # Region endpoints in the CONSUMED frame's pixel coordinates (the same numbers the 2-D
-        # panel's axes show).  max <= min on an axis means "to the frame edge", so the all-zero
-        # default is simply the whole frame -- a fresh node works before any region is drawn.
-        self.x_min = float(x_min)
-        self.x_max = float(x_max)
-        self.y_min = float(y_min)
-        self.y_max = float(y_max)
+        # The region is ONE Selection in the consumed block's own coordinate frame (the SAME contract
+        # fit + DataFigure.selected_data use).  An EMPTY selection (no binding) means "the whole
+        # frame" -- a fresh node reduces every valid cell before any region is drawn.
+        self.set_selection(selection)
         if str(reduce) not in ROI_REDUCERS:
             raise ValueError(f"ROI reduce must be one of {tuple(ROI_REDUCERS)}; got {reduce!r}.")
         self.reduce = str(reduce)
-        self._frame_shape: tuple[int, int] | None = None   # learned from the first frame (for region)
+        # Output shapes are learned from the first block (and re-learned on a retarget, which the hub
+        # accepts because THIS node owns the schema -- replace=True).  Seed sensible whole-frame
+        # defaults from the source schema so the output specs are valid before any frame arrives.
         self._source_schema = None
+        self._roi_frame_point: tuple[int, ...] = (1,)
+        self._roi_frame_data: tuple[int, ...] = (1,)
+        self._roi_frame_dtype = None
+        self._roi_value_point: tuple[int, ...] = (1,)
+        self._region = None
         schemas = []
         for name in self.consumes:
             try:
@@ -71,103 +85,193 @@ class RoiProcessor(Processor):
             if all(schema.point_shape == first.point_shape
                    and schema.data_shape == first.data_shape
                    and schema.repeat_capacity == first.repeat_capacity for schema in schemas):
-                self._source_schema = first
-                if len(first.data_shape) == 2:
-                    self._frame_shape = tuple(first.data_shape)
+                self._adopt_schema(first)
 
-    # ------------------------------------------------------------------ region plumbing
-    def _bounds(self, h: int, w: int) -> tuple[int, int, int, int]:
-        """The clamped integer crop window ``(x0, x1, y0, y1)`` for an ``h x w`` frame -- at least
-        one pixel on each axis, so a degenerate drag can never produce an empty crop."""
-        x0 = int(np.clip(round(self.x_min), 0, w - 1))
-        y0 = int(np.clip(round(self.y_min), 0, h - 1))
-        x1 = int(np.clip(round(self.x_max), x0 + 1, w)) if self.x_max > self.x_min else w
-        y1 = int(np.clip(round(self.y_max), y0 + 1, h)) if self.y_max > self.y_min else h
-        return x0, x1, y0, y1
+    def _adopt_schema(self, schema) -> None:
+        """Learn the source schema + seed the whole-frame default output shapes (roi_frame = the whole
+        block, roi_value = one scalar per (repeat, point) -- what the empty selection reduces to)."""
+        self._source_schema = schema
+        self._roi_frame_point = tuple(schema.point_shape)
+        self._roi_frame_data = tuple(schema.data_shape)
+        self._roi_value_point = tuple(schema.point_shape)
+
+    # ------------------------------------------------------------------ region (the ONE mutator)
+    def set_selection(self, selection) -> None:
+        """Atomically install the region as a :class:`Selection` (mirrors FitProcessor.set_fit_request):
+        a plot-independent set of bounds in the consumed block's coordinate frame, whose
+        ``metadata['binding']`` (supplied by the frontend) tells this node which block axes the
+        selection spans and how each coordinate is computed.  ``None`` / a dict / a Selection are all
+        accepted, so the console can hand it fresh from a drag OR replay it from a saved config."""
+        if selection is None:
+            self.selection = Selection()
+        elif isinstance(selection, Selection):
+            self.selection = selection
+        else:
+            self.selection = Selection.from_dict(selection)
 
     def acquisition_parameters(self) -> dict[str, object]:
-        """The editable source knobs (Edit tab) + the declared spatial ``region`` of ``roi_frame``
-        (the crop window in source pixels), so its 2-D panel draws real pixel axes and a further
-        selection on it round-trips through the same coordinates."""
-        out: dict[str, object] = {"x_min": self.x_min, "x_max": self.x_max,
-                                  "y_min": self.y_min, "y_max": self.y_max, "reduce": self.reduce}
-        if self._frame_shape is not None:
-            h, w = self._frame_shape
-            x0, x1, y0, y1 = self._bounds(h, w)
-            out["region"] = [x0, x1, y0, y1]
+        """The editable source knobs (Edit tab) -- the region as a serializable Selection + the reduce
+        verb -- plus the declared spatial ``region`` of ``roi_frame`` (its source-pixel extent, for an
+        image crop), so a roi_frame 2-D panel draws real pixel axes and a FURTHER drag on it round-trips
+        through the same coordinates (the ROI-of-ROI case)."""
+        out: dict[str, object] = {"selection": self.selection.to_dict(), "reduce": self.reduce}
+        if self._region is not None:
+            out["region"] = list(self._region)
         return out
 
     def set_acquisition_parameters(self, **values) -> None:
-        for key in ("x_min", "x_max", "y_min", "y_max"):
-            if key in values:
-                setattr(self, key, float(values[key]))
+        if "selection" in values:
+            self.set_selection(values["selection"])
         if "reduce" in values:
             reduce = str(values["reduce"])
             if reduce not in ROI_REDUCERS:
                 raise ValueError(f"ROI reduce must be one of {tuple(ROI_REDUCERS)}; got {reduce!r}.")
             self.reduce = reduce
 
-    def region_to_acquisition_parameters(self, x_min, x_max, y_min, y_max) -> dict[str, object]:
-        """A rectangle dragged on a panel showing this node's output IS the ROI -- the selector's
-        four endpoints (already in the consumed frame's pixel coordinates) map 1:1 to the region
-        params, so 'draw a box -> watch that box' needs no typing."""
-        return region_values(x_min, x_max, y_min, y_max)
-
     # ------------------------------------------------------------------ transform
     def transform(self, inputs: dict[str, object]) -> dict[str, object]:
         value = self.source_expr.evaluate(hub_namespace(self.hub, inputs))
         block = np.asarray(value)
         if not self._input_tensors:
-            raise ValueError("ROI requires a registered image signal with SignalSchema.")
+            raise ValueError("ROI requires a registered signal with a SignalSchema.")
         schemas = [tensor.schema for tensor in self._input_tensors.values()]
         schema = schemas[0]
         for other in schemas[1:]:
             schema.assert_compatible(other, check_repeat=True)
-        if len(schema.data_shape) != 2:
-            raise ValueError(
-                f"ROI requires schema data_shape=(H,W); got {schema.data_shape}.")
         expected = (block.shape[0], schema.point_count, *schema.data_shape)
-        if block.ndim != 4 or tuple(block.shape) != expected:
+        if block.ndim != 2 + len(schema.data_shape) or tuple(block.shape) != expected:
             raise ValueError(
-                "ROI expression must preserve canonical (R,P,H,W) axes; "
+                "ROI expression must preserve canonical (R,P,*data_shape) axes; "
                 f"expected {expected}, got {block.shape}.")
+        self._adopt_schema(schema)
         input_valid = self.input_validity(block.shape[:2])
-        self._source_schema = schema
-        h, w = schema.data_shape
-        self._frame_shape = (int(h), int(w))
-        x0, x1, y0, y1 = self._bounds(h, w)
-        crop = block[..., y0:y1, x0:x1]
-        reducer = ROI_REDUCERS[self.reduce]
-        reduced = reducer(np.asarray(crop, dtype=float), axis=(-2, -1))[..., None]
-        value_valid = input_valid & np.isfinite(reduced[..., 0])
+
+        frame, frame_valid, reduced, reduce_axes, region = self._reduce_region(block, input_valid)
+        r = int(block.shape[0])
+        roi_value = np.asarray(reduced, dtype=np.float64).reshape(r, -1, 1)
+        # Keep repeats separate ALWAYS; collapse the point axis only when the region reduced over it.
+        base_valid = input_valid.any(axis=1, keepdims=True) if 1 in reduce_axes else input_valid
+        value_valid = base_valid & np.isfinite(roi_value[..., 0])
+
+        # Publish-time output shapes (re-learned every shot; a retarget's new crop shape is accepted
+        # because this node owns the schema -- register_signal replace=True).
+        self._roi_frame_point = (int(frame.shape[1]),)
+        self._roi_frame_data = tuple(int(s) for s in frame.shape[2:]) or (1,)
+        self._roi_frame_dtype = frame.dtype
+        self._roi_value_point = (int(roi_value.shape[1]),)
+        self._region = region
+
         specs = {spec.name: spec for spec in self._bare_output_specs()}
         return {
             "roi_frame": SignalTensor(
-                crop, specs["roi_frame"].to_schema(dtype=crop.dtype), valid=input_valid),
+                frame, specs["roi_frame"].to_schema(dtype=frame.dtype), valid=frame_valid),
             "roi_value": SignalTensor(
-                reduced, specs["roi_value"].to_schema(dtype=reduced.dtype), valid=value_valid),
+                roi_value, specs["roi_value"].to_schema(dtype=roi_value.dtype), valid=value_valid),
         }
+
+    def _reduce_region(self, block, input_valid):
+        """Apply the carried Selection to the raw ``(R,P,*data)`` block through the ONE mode-driven
+        machinery -- returns ``(roi_frame, frame_valid, reduced, reduce_axes, region)``.  There is NO
+        per-kind branch here: the plot-side binding names WHICH axes the selection spans (``mode`` +
+        axis descriptors), so an image rectangle, a 1-D index range, a distribution value-range and a
+        site-centre rectangle all resolve identically."""
+        ndim = block.ndim
+        binding = dict(self.selection.metadata.get("binding") or {})
+        mode = str(binding.get("mode") or "axis-crop")
+        reducer = ROI_REDUCERS[self.reduce]
+        nan_reducer = _ROI_NAN_REDUCERS[self.reduce]
+
+        if mode == "value-mask":
+            # The coordinate of every sample cell IS its value: mask out-of-range cells to NaN and pool
+            # every sample per repeat.  roi_frame is the stable-shape NaN passthrough (P unchanged).
+            vb = self.selection.bounds("value")
+            work = np.asarray(block, dtype=np.float64)
+            if vb is not None:
+                keep = np.isfinite(work) & (work >= vb[0]) & (work <= vb[1])
+                work = np.where(keep, work, np.nan)
+            reduce_axes = tuple(range(1, ndim))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)   # all-NaN slice -> NaN (invalid), by design
+                reduced = nan_reducer(work, axis=reduce_axes)
+            return work, input_valid, reduced, reduce_axes, None
+
+        if mode == "scatter-mask":
+            # Explicit per-cell positions over ONE block axis (site centres; a 1-D curve's own x): mask
+            # cells outside the region to NaN.  roi_frame is the NaN passthrough (positions are not a grid).
+            axis = int(binding.get("axis", -1)) % ndim
+            n = int(block.shape[axis])
+            coords = {name: np.asarray(vals, dtype=float)
+                      for name, vals in (binding.get("coordinates") or {}).items()}
+            keep_cells = (self.selection.mask(coords, length=n) if coords
+                          else np.ones(n, dtype=bool))
+            broadcast_shape = [1] * ndim
+            broadcast_shape[axis] = n
+            keep = np.broadcast_to(keep_cells.reshape(broadcast_shape), block.shape)
+            work = np.where(keep & np.isfinite(np.asarray(block, dtype=np.float64)),
+                            np.asarray(block, dtype=np.float64), np.nan)
+            reduce_axes = (axis,)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                reduced = nan_reducer(work, axis=reduce_axes)
+            return work, input_valid, reduced, reduce_axes, None
+
+        # axis-crop (the default / whole-frame case): a CONTIGUOUS index span per axis -> a native crop.
+        entries = list(binding.get("axes") or ())
+        if not entries:
+            # No binding: reduce the WHOLE frame over its data axes (the image-crop default) -- a fresh
+            # node with an empty selection reduces every valid cell.
+            data_axes = tuple(range(2, ndim)) or (ndim - 1,)
+            entries = [{"select": None, "axis": axis, "origin": 0.0, "step": 1.0} for axis in data_axes]
+        spans: dict[int, tuple[int, int]] = {}
+        endpoints: dict[str, tuple[float, float, int, int]] = {}
+        for entry in entries:
+            axis = int(entry["axis"]) % ndim
+            size = int(block.shape[axis])
+            origin = float(entry.get("origin", 0.0))
+            step = float(entry.get("step", 1.0)) or 1.0
+            bounds = self.selection.bounds(entry.get("select")) if entry.get("select") else None
+            if bounds is None:
+                i0, i1 = 0, size
+            else:
+                lo = (bounds[0] - origin) / step
+                hi = (bounds[1] - origin) / step
+                i0 = int(np.clip(round(min(lo, hi)), 0, max(size - 1, 0)))
+                i1 = int(np.clip(round(max(lo, hi)), i0 + 1, size))
+            spans[axis] = (i0, i1)
+            if entry.get("select") in ("x", "y"):
+                endpoints[str(entry["select"])] = (origin, step, i0, i1)
+        slicer = [slice(None)] * ndim
+        for axis, (i0, i1) in spans.items():
+            slicer[axis] = slice(i0, i1)
+        crop = block[tuple(slicer)]
+        # The crop's (R,P) validity: slice the point axis by its own span iff the point axis was cropped
+        # (a 1-D point-axis ROI shrinks P), else the source mask stands (image / data-axis crop keeps P).
+        frame_valid = input_valid[:, slice(*spans[1])] if 1 in spans else input_valid
+        reduce_axes = tuple(sorted(spans))
+        reduced = reducer(np.asarray(crop, dtype=np.float64), axis=reduce_axes)
+        region = None
+        if "x" in endpoints and "y" in endpoints:
+            ox, sx, ix0, ix1 = endpoints["x"]
+            oy, sy, iy0, iy1 = endpoints["y"]
+            region = [int(round(ox + ix0 * sx)), int(round(ox + ix1 * sx)),
+                      int(round(oy + iy0 * sy)), int(round(oy + iy1 * sy))]
+        return crop, frame_valid, reduced, reduce_axes, region
 
     def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
         schema = self._source_schema
-        points = tuple(schema.point_shape) if schema is not None else (1,)
         repeat_capacity = schema.repeat_capacity if schema is not None else 1
-        if self._frame_shape is None:
-            crop_shape = (1, 1)
-        else:
-            h, w = self._frame_shape
-            x0, x1, y0, y1 = self._bounds(h, w)
-            crop_shape = (y1 - y0, x1 - x0)
         return (
-            SignalSpec("roi_frame", "ROI image", "counts",
-                       "The rectangular crop for every valid (R,P) image cell (native dtype) -- a live 2-D view "
-                       "of just the region; bind to a 2d panel (zoomed image) or a hist panel "
-                       "(distribution of exactly these pixels).",
-                       points_shape=points, data_shape=crop_shape,
+            SignalSpec("roi_frame", "ROI region", "counts",
+                       "The selected region for every valid (R,P) cell: a native fixed-shape crop for a "
+                       "contiguous axis selection (image / 1-D index), or the NaN-masked passthrough for a "
+                       "value / scatter selection (distribution / site centres) -- bind to a 2d panel "
+                       "(zoomed image) or a hist panel (distribution of exactly these cells).",
+                       points_shape=self._roi_frame_point, data_shape=self._roi_frame_data,
                        repeat_capacity=repeat_capacity, history=IMAGE_STREAM_HISTORY),
             SignalSpec("roi_value", "ROI value", "counts",
-                       "Each (R,P) crop reduced to one scalar (mean/sum/max over pixels).",
-                       points_shape=points, data_shape=(1,),
+                       "Every region reduced to one scalar per acquisition (mean/sum/max over the "
+                       "selected cells).",
+                       points_shape=self._roi_value_point, data_shape=(1,),
                        repeat_capacity=repeat_capacity, dtype=np.float64),
         )
 
@@ -177,45 +281,25 @@ class RoiProcessor(Processor):
 ROI_SPEC_NAME = "ROI crop"
 
 
-def region_values(x_min, x_max, y_min, y_max) -> dict[str, float]:
-    """Selector-rectangle endpoints -> the region PARAM dict ({x_min, x_max, y_min, y_max},
-    sorted).  The ONE mapping shared by the live retarget (``region_to_acquisition_parameters``)
-    and the create-from-a-drag seed (the console fills a fresh row's values with exactly this)."""
-    return {"x_min": float(min(x_min, x_max)), "x_max": float(max(x_min, x_max)),
-            "y_min": float(min(y_min, y_max)), "y_max": float(max(y_min, y_max))}
-
-
 @processor(order=25)
 def roi(readout) -> ProcessorSpec:
-    """Crop a rectangular region of a live frame + reduce it to one scalar per shot."""
+    """Reduce a Selection-selected region of a live block to one scalar per shot + republish the region."""
 
     params = (
-        ParamDecl("source", "Frame source", "signal_expr",
+        ParamDecl("source", "Signal source", "signal_expr",
                   default={"inputs": [FRAME_0], "source": "value = signal"},
-                  tooltip="The camera frame to crop (pick the camera measurement's frame signal; "
-                          "the value must be ONE (H, W) frame or the camera's (repeat, 1, H, W) "
-                          "block)."),
-        ParamDecl("x_min", "Region x min (px)", "float", default=0.0,
-                  tooltip="Left edge of the region, source-frame pixels.  Drawing a rectangle on "
-                          "a panel showing this node's output fills all four endpoints."),
-        ParamDecl("x_max", "Region x max (px)", "float", default=0.0,
-                  tooltip="Right edge of the region (<= x min means: to the frame edge)."),
-        ParamDecl("y_min", "Region y min (px)", "float", default=0.0,
-                  tooltip="Top edge of the region, source-frame pixels."),
-        ParamDecl("y_max", "Region y max (px)", "float", default=0.0,
-                  tooltip="Bottom edge of the region (<= y min means: to the frame edge)."),
+                  tooltip="The block to reduce a region of (a camera frame, a 1-D scan curve, a "
+                          "distribution's samples, a site-map vector).  Draw a rectangle / range on a "
+                          "panel showing this node's output to set the region."),
         ParamDecl("reduce", "Reduce", "choice", default="mean", choices=tuple(ROI_REDUCERS),
-                  tooltip="How roi_value collapses the region's pixels each shot: mean / sum "
+                  tooltip="How roi_value collapses the selected cells each shot: mean / sum "
                           "(total counts, e.g. a MOT loss signal) / max."),
     )
 
     def make_node(hub, *, prefix: str = "", **values):
         return RoiProcessor(
             hub, source_expr=values.get("source"),
-            x_min=float(values.get("x_min", 0.0) or 0.0),
-            x_max=float(values.get("x_max", 0.0) or 0.0),
-            y_min=float(values.get("y_min", 0.0) or 0.0),
-            y_max=float(values.get("y_max", 0.0) or 0.0),
+            selection=values.get("selection"),
             reduce=str(values.get("reduce", "mean") or "mean"),
             prefix=prefix)
 
@@ -225,5 +309,5 @@ def roi(readout) -> ProcessorSpec:
         make_node=make_node,
         # SINGLE SOURCE: the published keys live once on the node class (its ``provides``).
         result_keys=RoiProcessor.provides,
-        default_kind="2d",               # the crop itself is the natural first view
+        default_kind="2d",               # the region itself is the natural first view
     )

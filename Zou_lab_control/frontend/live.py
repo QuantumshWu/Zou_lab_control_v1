@@ -2405,6 +2405,83 @@ def coerce_panel_value(kind, value, *, structure=None, params=None, repeat_mode=
     return arr
 
 
+#: The panel kinds that offer the ROI selection-action -- every kind whose value is a numeric data
+#: array a Selection can reduce.  ROI is generic over plot kind (an image rectangle, a 1-D range, a
+#: distribution count-range, a site-centre rectangle all reduce to one scalar), so the ONLY exclusions
+#: are the pulse timeline (a structured object -- no data array) and the facet grid (no single frame;
+#: ROI belongs on its enlarged focus cell).  The ONE source the Setting's Analysis combo reads.
+ROI_KINDS: frozenset = frozenset({"2d", "sites", "1d", "monitor", "hist"})
+
+
+def kind_supports_roi(kind: str) -> bool:
+    """Whether a panel ``kind`` offers the ROI selection-action (see :data:`ROI_KINDS`)."""
+    return str(kind) in ROI_KINDS
+
+
+def _is_contiguous_index(values) -> bool:
+    """True when ``values`` are exactly ``0, 1, 2, ...`` -- the default index a bare 1-D panel plots
+    against -- so its ROI is a contiguous native crop; a real scan axis (arbitrary x coordinates) uses
+    a scatter mask instead (which reduces the same in-range cells, just without a fixed sub-frame)."""
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    return arr.size > 0 and np.array_equal(arr, np.arange(arr.size, dtype=float))
+
+
+def region_binding(kind, selection, *, structure=None, coordinates=None, origin=(0.0, 0.0)):
+    """Annotate a plot-coordinate ``selection`` with the block axis-binding a ``RoiProcessor`` applies
+    -- the exact INVERSE of :func:`coerce_panel_value`.
+
+    ``coerce_panel_value`` maps a canonical ``(R, P, *data_shape)`` block to the array a ``kind`` panel
+    SHOWS; this maps a selection drawn on that array back to WHICH block axes it spans and HOW each of
+    its coordinates is computed.  All the per-kind knowledge lives HERE (beside ``coerce_panel_value``,
+    so the two can never drift -- guarded by ``test_region_binding_round_trips_coerce``), and it travels
+    to the ``neutral_atom`` reducer as PLAIN DATA on ``Selection.metadata['binding']`` (a serializable
+    axis-binding dict from :mod:`...core.selection`), NEVER as a frontend object -- so the sealed seam
+    (``neutral_atom`` must not import ``frontend``) holds and a saved config replays the same region.
+
+    * ``2d``   -> a contiguous pixel crop: ``x`` = the last data axis, ``y`` = the 2nd-last, step 1,
+      ``origin`` = the panel's own source-pixel origin (0 for a raw frame; the crop's region for a
+      roi_frame panel, so a FURTHER drag round-trips into the displayed frame's own pixels).
+    * ``hist`` -> a value mask: the selection ranges the sample VALUE (no fixed sub-frame).
+    * ``sites``-> a scatter mask over the ``(N,)`` data axis, keyed on the site centres.
+    * ``1d`` / ``monitor`` -> a curve over ONE block axis (the point axis for a scan, else the data
+      axis, matching ``coerce_panel_value``): a plain integer index is a contiguous crop; an explicit
+      scan x-axis is a scatter mask on those coordinates.
+    """
+    from ..neutral_atom.core.selection import (
+        Selection, axis_crop_binding, value_mask_binding, scatter_mask_binding)
+
+    sel = selection if isinstance(selection, Selection) else Selection.from_dict(selection)
+    st = dict(structure or {})
+    ps = tuple(int(n) for n in (st.get("points_shape") or ()))
+    ds = tuple(int(n) for n in (st.get("data_shape") or ()))
+    try:
+        ox, oy = float(origin[0]), float(origin[1])
+    except (TypeError, IndexError, KeyError):
+        ox, oy = 0.0, 0.0
+    coords = {str(k): np.asarray(v, dtype=float).reshape(-1)
+              for k, v in dict(coordinates or {}).items()}
+
+    key = str(kind)
+    if key == "2d":
+        binding = axis_crop_binding([("x", -1, ox, 1.0), ("y", -2, oy, 1.0)])
+    elif key == "hist":
+        binding = value_mask_binding()
+    elif key == "sites":
+        cx, cy = coords.get("x"), coords.get("y")
+        centers = {"x": cx, "y": cy} if cx is not None and cy is not None else {}
+        binding = scatter_mask_binding(-1, centers)
+    else:  # 1d / monitor: a curve over ONE block axis
+        p = int(np.prod(ps, dtype=np.int64)) if ps else 0
+        curve_axis = -(len(ds) + 1) if p > 1 else -1
+        x = coords.get("x")
+        if key == "monitor" or x is None or _is_contiguous_index(x):
+            binding = axis_crop_binding([("x", curve_axis, 0.0, 1.0)])
+        else:
+            binding = scatter_mask_binding(curve_axis, {"x": x})
+    return Selection(sel.ranges, frame=sel.frame, scope=sel.scope,
+                     metadata={**dict(sel.metadata), "binding": binding})
+
+
 def panel_plot(data_x, data_y=None, *, kind: str, size: str = "2x2", **kwargs):
     """``plot()`` preset for dashboard panels: pick a kind and one of the
     LIMITED ``PANEL_SIZES`` and get a correctly sized, consistently styled live

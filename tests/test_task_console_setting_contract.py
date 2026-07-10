@@ -62,13 +62,16 @@ def _combo_item_sets(card):
 # ---------------------------------------------------------------- structural
 def test_setting_popup_analysis_section_offers_fit_and_roi_from_capability():
     """The Setting popup's ONE "Analysis" action combo offers 'curve fit' where the render_family has
-    general models (every kind BUT the site map) and 'ROI' where both axes are spatial (the image
-    kinds), both derived from the single-source capability table -- never a per-kind fit list.  The
-    curve fit is now a SEPARATE, parallel offering: a histogram (render_family '1d') is offered the
+    general models (every kind BUT the site map) and 'ROI' for EVERY data-array kind (issue #4 -- ROI is
+    generic over plot kind: an image rectangle, a 1-D range, a distribution count-range and a site-centre
+    rectangle all reduce to roi_value; ``kind_supports_roi`` is the single source, no longer the old
+    y=view-axis image gate).  Both are derived from single-source capability tables -- never a per-kind
+    list.  The curve fit is a SEPARATE, parallel offering: a histogram (render_family '1d') is offered the
     general 1-D family HERE (fit_model_combo present) ALONGSIDE its own bimodal ``fit`` PANEL_PARAM."""
     from Zou_lab_control.frontend.task_console import PANEL_PARAMS
     expect_fit = {"1d": True, "monitor": True, "2d": True, "sites": False, "hist": True}
-    expect_roi = {"1d": False, "monitor": False, "2d": True, "sites": True, "hist": False}
+    # ROI is now offered for EVERY panel kind whose value is a data array (all of these).
+    expect_roi = {"1d": True, "monitor": True, "2d": True, "sites": True, "hist": True}
     for kind, wants_fit in expect_fit.items():
         card = _card(kind)
         try:

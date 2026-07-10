@@ -128,8 +128,14 @@ def test_selector_wiring_converts_axis_coords_to_the_frames_own_pixels():
 
         roi_row = add_logic_row(con, ("processor", ROI_SPEC_NAME))
         con._logic_editors[id(roi_row)].form.seed_values(
-            {"source": {"inputs": [frame_sig], "source": "value = signal"},
-             "x_min": 100.0, "x_max": 400.0, "y_min": 50.0, "y_max": 250.0})
+            {"source": {"inputs": [frame_sig], "source": "value = signal"}})
+        # The region is a Selection with the 2-D image axis-binding -- exactly what the console's
+        # region_binding produces for a drag on a 2d panel.  It rides on the node values (DATA, not a
+        # form field); the _start_logic_node merge preserves it across the build.
+        from Zou_lab_control.frontend.live import region_binding
+        from Zou_lab_control.neutral_atom.core.selection import Selection
+        bound = region_binding("2d", Selection.rectangle(100.0, 400.0, 50.0, 250.0))
+        roi_row.node.values = {**dict(roi_row.node.values or {}), "selection": bound.to_dict()}
         con._start_logic_node(roi_row)
         roi = con._logic_nodes[id(roi_row)]
         cam.step(); roi.step()                    # roi_frame on the hub, region learned

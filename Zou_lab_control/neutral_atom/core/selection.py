@@ -205,4 +205,46 @@ def select_rows(
     )
 
 
-__all__ = ["AxisRange", "Selection", "SelectedData", "select_rows"]
+# --------------------------------------------------------------------------- region bindings
+# A region REDUCER (RoiProcessor) applies one Selection to a raw canonical ``(R, P, *data_shape)``
+# block with ZERO per-kind branch of its own.  What the block's cells MEAN -- image pixels, a 1-D
+# index, a distribution's sample value, trap-site centres -- is per-plot-kind knowledge the FRONTEND
+# owns (``live.region_binding``, the inverse of ``coerce_panel_value``).  It ships that knowledge to
+# the reducer as PLAIN DATA carried on ``Selection.metadata["binding"]`` (serializable, so it survives
+# save/load and never makes ``neutral_atom`` import ``frontend``).  These three constructors are the
+# ONE definition of that binding vocabulary, shared by the frontend producer, the reducer, and tests.
+
+def axis_crop_binding(axes: Sequence[tuple[str, int, float, float]]) -> dict[str, object]:
+    """Binding for a CONTIGUOUS axis crop (a fixed grid): each entry maps ONE selection-axis name to
+    ONE block axis whose per-cell coordinate is the linear ``origin + step * index`` (image pixels; a
+    1-D index/point axis).  The reducer slices those axes to the selection's index span, so ``roi_frame``
+    is a fixed-shape native sub-array.  ``axes`` items are ``(select_name, block_axis, origin, step)``
+    (``block_axis`` may be negative -- resolved against the live block's rank)."""
+    return {"mode": "axis-crop",
+            "axes": [{"select": str(select), "axis": int(axis), "origin": float(origin), "step": float(step)}
+                     for (select, axis, origin, step) in axes]}
+
+
+def value_mask_binding() -> dict[str, object]:
+    """Binding for a VALUE mask (a distribution's count-range): every sample cell's coordinate IS its
+    own value, so there is NO fixed sub-frame.  The reducer masks out-of-range cells to NaN (a stable
+    passthrough for ``roi_frame``) and reduces the rest per repeat -- ``roi_value`` is the meaningful
+    output.  The selection ranges the value axis (``Selection.value``)."""
+    return {"mode": "value-mask"}
+
+
+def scatter_mask_binding(axis: int, coordinates: Mapping[str, object]) -> dict[str, object]:
+    """Binding for a SCATTER position mask: the selection axes bind to EXPLICIT per-cell coordinate
+    arrays over ONE block axis (trap-site centres for a site map; a 1-D curve's own non-index x
+    samples).  These positions are not a contiguous grid, so ``roi_frame`` is a NaN passthrough and
+    ``roi_value`` reduces the in-region cells.  ``coordinates`` maps each selection-axis name to a
+    length-``block.shape[axis]`` array."""
+    return {"mode": "scatter-mask", "axis": int(axis),
+            "coordinates": {str(name): [float(v) for v in np.asarray(values, dtype=float).reshape(-1)]
+                            for name, values in dict(coordinates).items()}}
+
+
+__all__ = [
+    "AxisRange", "Selection", "SelectedData", "select_rows",
+    "axis_crop_binding", "value_mask_binding", "scatter_mask_binding",
+]

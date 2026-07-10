@@ -52,11 +52,13 @@ from .live import (
     PANEL_SIZES,
     PLOT_KINDS,
     coerce_panel_value,
+    kind_supports_roi,
     normalize_facet,
     panel_display_size,
     panel_plot,
     panel_size_cells,
     recommended_grid_size,
+    region_binding,
     site_ring_radius,
 )
 from .style import PALETTE          # the ONE colour source -- panel cmap DEFAULTS reference it (never a literal)
@@ -3061,6 +3063,20 @@ class PanelCard(FluentGroupBox):
             scope = (*scope, f"cell:{int(self._grid_focus.k)}")
         return Selection(selection.ranges, frame=selection.frame, scope=scope, metadata=metadata)
 
+    def _selection_coordinates_for_binding(self) -> dict:
+        """The plot's per-axis selection COORDINATES (a site map's centres, a 1-D panel's curve x) that
+        :func:`live.region_binding` needs to bind an ROI drag to the consumed block's axes -- read from
+        the SAME DataFigure adapter the selection itself comes from.  Empty when there is no plotter (a
+        2-D / hist ROI needs none: pixel index / sample value carry no extra coordinate)."""
+        if self.plotter is None:
+            return {}
+        try:
+            df = self.plotter.to_data_figure()
+        except Exception:
+            return {}
+        return {str(key): np.asarray(value)
+                for key, value in dict(getattr(df, "_selection_coordinates", {})).items()}
+
     # ---- Analysis (curve fit + ROI): ONE state, ONE mutator --------------------------------------
     def _build_analysis_section(self, section_box, label_w) -> None:
         """Build the Setting popup's "Analysis" section (the fit + ROI umbrella).  A single ``action``
@@ -3069,7 +3085,11 @@ class PanelCard(FluentGroupBox):
         result line.  Every widget DERIVES its value from state (:meth:`_refresh_analysis_controls`); no
         widget owns a private copy of "is fitting"."""
         models = _general_fit_models_for_kind(self._param_kind())
-        offers_roi = _card_y_is_view_axis(self)
+        # ROI is generic over EVERY plot kind whose value is a data array (kind_supports_roi -- the ONE
+        # source): an image rectangle, a 1-D x-range, a distribution count-range and a site-centre
+        # rectangle all reduce to roi_value + roi_frame.  (No longer gated on the y=view-axis image
+        # test, which wrongly restricted ROI to 2-D image panels.)
+        offers_roi = kind_supports_roi(self._param_kind())
         self.analysis_combo = self.fit_model_combo = self.fit_fix_seed = self.fit_result_label = None
         if not (models or offers_roi):
             return
@@ -3086,7 +3106,8 @@ class PanelCard(FluentGroupBox):
             + ("\n  curve fit = fit the chosen model to the selection (the result overlays the plot;\n"
                "              a 2-D image centre fit ALSO publishes fit_x0/fit_y0/... as hub signals)"
                if models else "")
-            + ("\n  ROI       = crop the image to the selection (publishes roi_frame / roi_value)"
+            + ("\n  ROI       = reduce the selected region to one scalar (publishes roi_value; also\n"
+               "              roi_frame -- an image crop, or a 1-D / distribution / site sub-view)"
                if offers_roi else ""))
         self.analysis_combo.currentIndexChanged.connect(self._on_analysis_action_changed)
         ana.addWidget(FluentSettingRow("action", self.analysis_combo, label_width=label_w))
@@ -7936,44 +7957,39 @@ class TaskConsole(QtWidgets.QWidget):
                 self._remove_logic_node(row)
 
     def _apply_roi_selection(self, card: "PanelCard", selection) -> None:
-        """Convert an xy selection to local pixels and retarget/create ROI crop."""
+        """Turn a drag on ANY plot kind into a Selection-driven RoiProcessor.
 
-        x_bounds, y_bounds = selection.bounds("x"), selection.bounds("y")
-        if x_bounds is None or y_bounds is None:
-            card.set_status("ROI requires an x/y selection", error=True)
-            return
-        ox, oy = selection.metadata.get("origin", (0.0, 0.0))
-        rect = (float(x_bounds[0]) - float(ox), float(x_bounds[1]) - float(ox),
-                float(y_bounds[0]) - float(oy), float(y_bounds[1]) - float(oy))
+        The region is bound to the consumed block's own axes through the ONE per-kind resolver
+        (:func:`live.region_binding`, the inverse of ``coerce_panel_value``): an image rectangle, a 1-D
+        x-range, a distribution count-range and a site-centre rectangle all become a serializable
+        Selection whose ``metadata['binding']`` says which axes it spans.  That Selection -- NEVER pixel
+        endpoints -- travels to a RoiProcessor (create OR retarget), so there is NO per-kind branch here
+        and the sealed seam holds (the node reduces ``roi_value`` + republishes ``roi_frame`` for the
+        signal, generic over kind)."""
         signal = str(card.config.inputs[0]) if card.config.inputs else ""
         if not signal or self._task_locked:
             return
         try:
-            schema = self.hub.schema(signal)
+            self.hub.schema(signal)
         except KeyError:
             card.set_status("ROI source has no registered signal schema", error=True)
             return
-        if len(schema.data_shape) != 2:
-            card.set_status(
-                f"ROI requires image data_shape=(H,W); source has {schema.data_shape}", error=True)
-            return
-        from ..neutral_atom.operations.processors.roi import ROI_SPEC_NAME, region_values
+        bound = region_binding(
+            card.config.kind, selection,
+            structure=card._bound_structure(),
+            coordinates=card._selection_coordinates_for_binding(),
+            origin=selection.metadata.get("origin", (0.0, 0.0)))
+        payload = bound.to_dict()
+        from ..neutral_atom.operations.processors.roi import ROI_SPEC_NAME, RoiProcessor
         retargeted = []
         for row in self.logic_nodes:
             node = self._logic_nodes.get(id(row))
-            if node is None or signal not in tuple(getattr(node, "consumes", ())):
+            if not isinstance(node, RoiProcessor) or signal not in tuple(getattr(node, "consumes", ())):
                 continue
-            params = node.region_to_acquisition_parameters(*rect)
-            if params:
-                node.apply_acquisition_parameters(**params)
-                # keep the row's stored values in sync so its Edit reopen / save shows the drag
-                row.node.values = {**dict(row.node.values or {}), **params}
-                # ...and an ALREADY-OPEN Edit tab too: left stale, its next Start would silently
-                # revert the drag to the pre-drag region it still displays.
-                editor = self._logic_editors.get(id(row))
-                if editor is not None and hasattr(getattr(editor, "form", None), "seed_values"):
-                    editor.form.seed_values(params)
-                retargeted.append(str(row.node.title))
+            node.apply_acquisition_parameters(selection=bound)
+            # keep the row's stored values in sync so its Edit reopen / save shows the drag
+            row.node.values = {**dict(row.node.values or {}), "selection": payload}
+            retargeted.append(str(row.node.title))
         if retargeted:
             self._mark_dirty()          # the retarget mutated persisted row values (save must see it)
             card.set_status(f"ROI -> {', '.join(retargeted)}", error=False)
@@ -7983,7 +7999,7 @@ class TaskConsole(QtWidgets.QWidget):
             kind="processor", name=ROI_SPEC_NAME,
             title=indexed_unique_name(ROI_SPEC_NAME, {r.node.title for r in self.logic_nodes}),
             values={"source": {"inputs": [signal], "source": DEFAULT_SOURCE},
-                    **region_values(*rect)})
+                    "selection": payload})
         row = self._add_logic_node(cfg, focus=False)   # stay on the Monitor board -- no tab jump
         self._start_logic_node(row)
         started = self._logic_nodes.get(id(row)) is not None
@@ -8019,6 +8035,12 @@ class TaskConsole(QtWidgets.QWidget):
             values = editor.collect_values() if editor is not None else dict(row.node.values)
         except Exception:
             values = dict(row.node.values)
+        if editor is not None:
+            # The form's collect_values returns only its DECLARED widgets, so a stored value the form
+            # does not own (a drag-set ROI ``selection`` is DATA, not a form field) would be dropped on
+            # an Edit-triggered restart.  Preserve those: form values WIN for keys it owns, stored fills
+            # the rest -- the same "don't lose a param the UI can't show" rule the retarget seam relies on.
+            values = {**dict(row.node.values or {}), **values}
         # BUILD-VALIDATE-COMMIT (#A2): build the NEW node FIRST -- a bad param edit must never
         # kill the run that is already going (the old order stopped the running node, then failed
         # the build, leaving nothing running); and nothing is registered until start() succeeds,
