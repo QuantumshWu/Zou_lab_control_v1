@@ -481,11 +481,12 @@ def test_running_task_takes_a_fixed_panel_and_locks_the_console():
         console._logic_editors[id(row)].form._widgets["save_frames"].setChecked(False)
         console._start_logic_node(row)
 
-        # LOCK engaged: dedicated task panel on the board + banner up + header disabled.
-        # (isHidden(), not isVisible(): the window isn't shown in a headless test, so
-        # isVisible() is always False -- isHidden() reflects the explicit shown flag.)
+        # LOCK engaged: dedicated task panel on the board + the persistent strip flips to the
+        # task line with its Stop action + header disabled.  (The strip itself is ALWAYS
+        # visible -- only its content/action switch, so the layout never jumps.)
         assert console._task_locked is True
-        assert console.task_banner.isHidden() is False
+        assert console.status_strip.action_button.isHidden() is False
+        assert "Task running" in console.status_strip.message.text()
         assert console._task_card is not None and console._task_card in console.cards
         assert console.kind_combo.isEnabled() is False
         # locked: Add Panel no-ops while a task owns the console (only the task panel
@@ -500,10 +501,12 @@ def test_running_task_takes_a_fixed_panel_and_locks_the_console():
         assert node.finished
         assert node.output.latest("frame") is not None       # mid-run frame buffered (off hub)
 
-        # a tick detects completion -> lock released, banner hidden, transient panel gone.
+        # a tick detects completion -> lock released, the strip's Stop action hides (the strip
+        # itself stays -- back to the idle summary), transient panel gone.
         console._tick()
         assert console._task_locked is False
-        assert console.task_banner.isHidden() is True
+        assert console.status_strip.action_button.isHidden() is True
+        assert "Task running" not in console.status_strip.message.text()
         assert console._task_card is None
         assert console.kind_combo.isEnabled() is True
         assert len(console.cards) == n_before

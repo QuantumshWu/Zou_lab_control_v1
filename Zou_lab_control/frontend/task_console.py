@@ -90,6 +90,7 @@ from .qt_fluent import (
     FluentSettingRow,
     setting_label_width,
     FluentStatusDot,
+    FluentStatusStrip,
     FluentSwitch,
     FluentTabWidget,
     FluentFloatingEditor,
@@ -1095,17 +1096,6 @@ GRID_UNIT = 8
 # public art/geom knob, per frontend/AGENTS.md F2/F3); change this one number to retune all board
 # spacing.
 GAP = GRID_UNIT
-
-# The header status readout (panel/signal counts, or a node-error banner) is a borderless
-# label: grey normally, red on a node error (the colour IS the danger cue -- no box border,
-# which as a line-edit drew a grey line across the header bottom above the tabs).
-_SUMMARY_STYLE = f"color: {GREY}; background: transparent; border: none;"
-_SUMMARY_STYLE_DANGER = f"color: {RED}; background: transparent; border: none;"
-# Amber: an ADVISORY heads-up that does NOT affect the run (acquisition is unthrottled and always shown
-# latest) -- e.g. the display fell behind a fast producer and the hub's bounded ring dropped shots it
-# never rendered.  Less severe than the red node-error banner; same borderless label, colour = the cue.
-_SUMMARY_STYLE_WARNING = f"color: {ORANGE}; background: transparent; border: none;"
-
 
 def _cell_size() -> tuple[int, int]:
     """The base CARD WIDTH unit = a 1x2 panel's card: the figure (1 row x 2 cols) plus the card
@@ -6267,13 +6257,6 @@ class TaskConsole(QtWidgets.QWidget):
         self.name_edit.setPlaceholderText("task name")
         self.name_edit.setFixedWidth(scaled_px(150, minimum=110))
         self.name_edit.textChanged.connect(self._mark_dirty)
-        # A READ-ONLY status readout (panel/signal/shot counts, or a node-error banner),
-        # not an input -- so it is a borderless label, never a bordered line-edit.  As a
-        # disabled line-edit its box border drew a long grey line across the header bottom
-        # that read as "a thin line above the tabs"; a label has no box.
-        self.summary = FluentLabel("")
-        self.summary.setStyleSheet(_SUMMARY_STYLE)
-
         self.kind_combo = FluentComboBox()
         # Add Panel offers EXACTLY the four kinds the user designs with -- nothing
         # invented, no composite:
@@ -6357,7 +6340,10 @@ class TaskConsole(QtWidgets.QWidget):
 
         for widget in (self.status_dot, self.name_edit):
             header.addWidget(widget)
-        header.addWidget(self.summary, 1)
+        # The status readout no longer squats in this stretch slot (a 200-char node error used
+        # to overwrite it and fight the header buttons for width) -- it lives on the PERSISTENT
+        # status strip below the header; the stretch just keeps the action cluster right-aligned.
+        header.addStretch(1)
         # Add Panel stays even when embedded (a loaded figure is re-wired + extra panels added), and so
         # does the Selectors switch (inspecting a loaded figure is exactly when the selectors help);
         # the four whole-console buttons only when they exist.
@@ -6374,26 +6360,15 @@ class TaskConsole(QtWidgets.QWidget):
                                       if w is not None)
         root.addWidget(header_frame)
 
-        # Running-task LOCKOUT banner (confocal-style): a prominent strip shown ONLY
-        # while a task runs.  It names the task + progress and offers the ONE allowed
-        # action (Stop); every other control is disabled meanwhile (``_set_task_running``).
-        # Hidden by default so an idle console looks unchanged.  A plain objectName-scoped
-        # QWidget (flat fill, no cascade to children, no FluentFrame self-paint to fight).
-        self.task_banner = QtWidgets.QWidget()
-        self.task_banner.setObjectName("taskBanner")
-        self.task_banner.setStyleSheet(f"#taskBanner {{ background-color: {ORANGE}; }}")
-        banner = QtWidgets.QHBoxLayout(self.task_banner)
-        banner.setContentsMargins(scaled_px(12), scaled_px(5), scaled_px(12), scaled_px(5))
-        banner.setSpacing(scaled_px(8, minimum=4))
-        self.task_banner_label = FluentLabel("")
-        self.task_banner_label.setStyleSheet(
-            "color: white; background: transparent; border: none; font-weight: bold;")
-        self.task_stop_button = FluentButton("Stop task", color=RED)
-        self.task_stop_button.clicked.connect(self._stop_running_task)
-        banner.addWidget(self.task_banner_label, 1)
-        banner.addWidget(self.task_stop_button, 0)
-        self.task_banner.setVisible(False)
-        root.addWidget(self.task_banner)
+        # PERSISTENT status strip -- the ONE always-visible line between the header and the
+        # tabs.  Its content switches by PRIORITY (node error > running task's progress >
+        # display-behind advisory > the idle summary, see _update_summary); the Stop-task
+        # action shows only while a task owns the console.  This replaces BOTH old mechanisms:
+        # the transient orange task banner (its show/hide shifted the whole layout under the
+        # pointer) and the header summary label a node error used to overwrite.
+        self.status_strip = FluentStatusStrip(action_text="Stop task")
+        self.status_strip.action_clicked.connect(self._stop_running_task)
+        root.addWidget(self.status_strip)
 
         # TWO permanent tabs:
         #   * Monitor -- the live drag-and-snap board of PLOT panels (pure views);
@@ -7756,10 +7731,14 @@ class TaskConsole(QtWidgets.QWidget):
         self._task_card = card
         self._running_task_row = row
         self._arrange()
-        self._apply_task_lock(True)
+        # Assemble the strip's task line BEFORE engaging the lock: _apply_task_lock flips the
+        # strip immediately, so the text must already be there (never one tick of stale idle text).
         self._update_task_banner(node)
+        self._apply_task_lock(True)
 
     def _update_task_banner(self, node) -> None:
+        """Assemble the running task's one-line progress text for the persistent status strip
+        (its display -- and its priority against a node error -- is _update_summary's job)."""
         row = self._running_task_row
         if row is None:
             return
@@ -7768,16 +7747,20 @@ class TaskConsole(QtWidgets.QWidget):
         # thresholds") so the operator sees what step the calibration is on, not just %.
         stage = node.output.latest("stage")
         stage_txt = f"  —  {stage}" if stage else ""
-        self.task_banner_label.setText(f"⏳  Task running: {row.node.title}  —  {pct}%{stage_txt}  "
-                                       "(all other controls locked until it finishes / you Stop it)")
+        self._task_status_text = (f"⏳  Task running: {row.node.title}  —  {pct}%{stage_txt}  "
+                                  "(all other controls locked until it finishes / you Stop it)")
 
     def _apply_task_lock(self, locked: bool) -> None:
-        """Disable / re-enable every mutating control while a task runs.  The banner's
-        Stop button stays enabled (it lives outside the locked groups)."""
+        """Disable / re-enable every mutating control while a task runs.  The strip's Stop
+        action stays enabled (it lives outside the locked groups); the strip itself is
+        PERSISTENT -- only its content/action flip, so the layout never jumps."""
         self._task_locked = bool(locked)
-        self.task_banner.setVisible(bool(locked))
+        if not locked:
+            self._task_status_text = None
+        self.status_strip.set_action_visible(bool(locked))
         for widget in self._lockable_header:
             widget.setEnabled(not locked)
+        self._update_summary()                       # flip the strip's line NOW, not next tick
 
     def _stop_running_task(self) -> None:
         """Banner 'Stop task' button: cooperatively stop the running task."""
@@ -8380,40 +8363,30 @@ class TaskConsole(QtWidgets.QWidget):
         except Exception:
             n_signals = 0
         dropped = self._note_display_drops()
-        # A wedged node must not fail silently: if any running node recorded an error,
-        # raise a red banner naming it instead of just showing frozen data.
+        # The persistent strip's ONE priority ladder (every tick): a wedged node must never fail
+        # silently, so a red node error outranks even the running task's progress line; the
+        # display-behind advisory is amber (the RUN is unaffected -- acquisition is unthrottled
+        # and always shows latest); idle shows the board summary.  The strip itself change-gates
+        # text/style, so this per-tick call never repolishes an unchanged state.
         faulted = [n for n in self.running_nodes if getattr(n, "last_error", None)]
         if faulted:
             node = faulted[0]
             who = (getattr(node, "prefix", "") or self._node_label(node) or "node").rstrip("_:")
             n = int(getattr(node, "consecutive_errors", 1))
-            style = _SUMMARY_STYLE_DANGER
-            text = f"⚠ NODE ERROR ({who}, ×{n}): {node.last_error}"[:200]
+            self.status_strip.show_message(
+                f"⚠ NODE ERROR ({who}, ×{n}): {node.last_error}"[:300], severity="error")
+        elif getattr(self, "_task_status_text", None):
+            self.status_strip.show_message(self._task_status_text, severity="task")
         elif dropped:
-            # Acquisition is unthrottled (data-paced), so a fast producer can publish more shots between two
-            # GUI refreshes than the hub's bounded ring holds -- those roll off before a rolling panel reads
-            # them.  The RUN is unaffected (data still acquired, latest always shown); this only flags that
-            # the DISPLAY could not keep up.  Amber, on this same banner (never a modal) -- reuse the one
-            # non-intrusive channel node errors already use, a severity below the red node error.
-            style = _SUMMARY_STYLE_WARNING
-            text = (f"⚠ display behind: dropped {dropped} shot(s) faster than the "
-                    f"{self.hub.history_len}-deep buffer -- acquisition unaffected")[:200]
+            self.status_strip.show_message(
+                f"⚠ display behind: dropped {dropped} shot(s) faster than the "
+                f"{self.hub.history_len}-deep buffer -- acquisition unaffected", severity="warning")
         else:
-            style = _SUMMARY_STYLE
             # No single global refresh rate any more -- each panel sets its OWN update interval
-            # (see UPDATE_INTERVALS), so the header no longer claims one "every N ms".
-            text = f"{len(self.cards)} panels | {n_signals} signals | shot {self.hub.shot}"
-        # This runs EVERY tick.  The stylesheet is a constant that only flips on the normal<->danger
-        # transition, so re-applying it every tick is a semantically-identical no-op that still walks
-        # Qt's style-repolish path; gate it on an actual change (same fingerprint guard as
-        # ``_refresh_signal_info``'s ``_signal_info_sig``).  The text genuinely changes each shot, so
-        # it is likewise only re-set when its content moves.
-        if style != getattr(self, "_summary_style", None):
-            self._summary_style = style
-            self.summary.setStyleSheet(style)
-        if text != getattr(self, "_summary_text", None):
-            self._summary_text = text
-            self.summary.setText(text)
+            # (see UPDATE_INTERVALS), so the strip never claims one "every N ms".
+            self.status_strip.show_message(
+                f"{len(self.cards)} panels | {n_signals} signals | shot {self.hub.shot}",
+                severity="info")
 
     # ------------------------------------------------------------------ files
     def save_to_file(self) -> None:
@@ -8451,7 +8424,7 @@ class TaskConsole(QtWidgets.QWidget):
 
     def _message(self, text: str) -> None:
         if os.environ.get("QT_QPA_PLATFORM", "") == "offscreen":
-            self.summary.setText(str(text))
+            self.status_strip.show_message(str(text), severity="info")
             return
         fluent_message(self, "Task console", str(text), kind="info")  # pragma: no cover
 

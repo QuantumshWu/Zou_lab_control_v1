@@ -78,6 +78,7 @@ from .qt_fluent import (
     FluentScrollArea,
     FluentSectionLabel,
     FluentSettingRow,
+    FluentStatusStrip,
     FluentTabWidget,
     WINDOW_SCREEN_FRACTION,
     ensure_qt_app,
@@ -604,10 +605,11 @@ class FigureViewer(QtWidgets.QWidget):
         self.raw_info = self._add_raw_tab("Raw")
         lay.addWidget(self.info_tabs, 1)
 
-        self.status = FluentLabel("Load a saved figure (.npz) to view it on the board.")
-        self.status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-        self.status.setWordWrap(True)
-        self.status.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        # The SAME persistent status surface the console mounts (FluentStatusStrip): one
+        # always-visible line, severity-coloured, eliding with the full text in the tooltip --
+        # a load failure turns it red instead of hiding as grey prose.
+        self.status = FluentStatusStrip()
+        self.status.show_message("Load a saved figure (.npz) to view it on the board.")
         lay.addWidget(self.status)
         return col
 
@@ -679,8 +681,8 @@ class FigureViewer(QtWidgets.QWidget):
             return
         npz = _resolve_npz(p)
         if p.suffix.lower() in FIGURE_IMAGE_SUFFIXES and not npz.is_file():
-            self.status.setText(f"no matching .npz data next to {display_path(str(p))} "
-                                f"(expected {npz.name})")
+            self.status.show_message(f"no matching .npz data next to {display_path(str(p))} "
+                                     f"(expected {npz.name})", severity="warning")
             return
         self._load_npz(npz)
 
@@ -700,8 +702,8 @@ class FigureViewer(QtWidgets.QWidget):
             return                                       # mid-type / unrelated file -- no error spam
         npz = _resolve_npz(p)
         if not npz.is_file():
-            self.status.setText(f"no matching .npz data next to {display_path(str(p))} "
-                                f"(expected {npz.name})")
+            self.status.show_message(f"no matching .npz data next to {display_path(str(p))} "
+                                     f"(expected {npz.name})", severity="warning")
             return
         if self._current_path is not None and npz == self._current_path:
             return                                       # already loaded (the setText echo below re-fires)
@@ -712,7 +714,8 @@ class FigureViewer(QtWidgets.QWidget):
         try:
             saved = load_figure(path)
         except Exception as exc:
-            self.status.setText(f"could not load: {str(exc).splitlines()[0][:160]}")
+            self.status.show_message(f"could not load: {str(exc).splitlines()[0][:160]}",
+                                     severity="error")
             return
         self.saved = saved
         self._current_path = path
@@ -723,7 +726,7 @@ class FigureViewer(QtWidgets.QWidget):
         # of the saved kind that reproduces it.  A pulse figure seeds a ``kind="pulse"`` panel exactly as
         # a hist seeds a ``kind="hist"`` panel; the console / Monitor tab are never replaced.
         self._build_console(saved)
-        self.status.setText(
+        self.status.show_message(
             f"loaded {display_path(str(path))} -> fig_value signal; the seeded {saved.kind or 'figure'} "
             "panel reproduces it -- Add Panel to view it another way.")
 

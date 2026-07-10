@@ -3058,6 +3058,70 @@ class ElidedLabel(QtWidgets.QLabel):
         super().setText(shown)
 
 
+class FluentStatusStrip(FluentFrame):
+    """The PERSISTENT one-line status surface a GUI mounts once and feeds forever.
+
+    One severity-coloured dot + one eliding message line (full text in the tooltip -- strip
+    text can carry paths/errors, so it must elide, never clip) + an optional right-side action
+    button (e.g. the console's "Stop task").  The strip is ALWAYS visible: content switches by
+    priority instead of rows appearing/disappearing (the old transient task banner shifted the
+    whole layout under the pointer every time a task started/finished).
+
+    Severity is a DATA input mapped to the one palette here: ``info`` (grey), ``task``
+    (orange -- an ongoing run's progress line), ``warning`` (amber advisory), ``error`` (red).
+    Confocal's precedent is the always-visible last-message-wins Log strip; this deviates
+    consciously by adding severity colour + the action slot, which its separate popup/timer
+    channels carried instead."""
+
+    #: severity -> (dot colour, text colour); the ONE mapping every consumer shares.
+    SEVERITIES = {"info": (GREY, GREY), "task": (ORANGE, ORANGE_DARK),
+                  "warning": (ORANGE, ORANGE_DARK), "error": (RED, RED)}
+
+    action_clicked = QtCore.pyqtSignal()
+
+    def __init__(self, parent=None, *, action_text: str = ""):
+        super().__init__(parent, bordered=False)
+        self.setFixedHeight(scaled_px(38, minimum=30))
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(scaled_px(12), scaled_px(4), scaled_px(12), scaled_px(4))
+        lay.setSpacing(scaled_px(8))
+        self.dot = FluentStatusDot(size=12)
+        self.message = ElidedLabel("")
+        lay.addWidget(self.dot)
+        lay.addWidget(self.message, 1)
+        self.action_button = None
+        if action_text:
+            self.action_button = FluentButton(str(action_text), color=RED)
+            self.action_button.clicked.connect(self.action_clicked.emit)
+            self.action_button.setVisible(False)
+            lay.addWidget(self.action_button)
+        self._severity = None
+        self.show_message("", severity="info")
+
+    def show_message(self, text: str, *, severity: str = "info") -> None:
+        """Set the strip's line.  Change-gated so the per-tick caller never repolishes Qt
+        styles for an unchanged state."""
+        if severity not in self.SEVERITIES:
+            raise ValueError(f"unknown severity {severity!r}; choose from {tuple(self.SEVERITIES)}.")
+        if severity != self._severity:
+            self._severity = severity
+            dot, colour = self.SEVERITIES[severity]
+            self.dot.set_color(dot)
+            self.message.setStyleSheet(
+                f'QLabel {{ color: {colour}; font: {fluent_font_size()}pt "{FONT}"; background: transparent; }}')
+        if str(text) != self.message.text():
+            self.message.setText(str(text))
+
+    def set_action_visible(self, visible: bool) -> None:
+        """Show/hide the action button (a no-op when the strip was built without one)."""
+        if self.action_button is not None:
+            self.action_button.setVisible(bool(visible))
+
+    def text(self) -> str:
+        """The current message's FULL text (the label elides for display only)."""
+        return self.message.text()
+
+
 class FluentScanDot(QtWidgets.QAbstractButton):
     """Small round toggle that marks a field as a scan parameter.
 
