@@ -840,19 +840,36 @@ class FigureViewer(QtWidgets.QWidget):
         same node / seed / PanelCard machinery).  ``None`` (nothing loaded yet) is an EMPTY board, so the
         window ALWAYS shows a real console beside the Info column and Browse simply RESEEDS it (in
         place -- the console widget tree is built ONCE and only its seeded panel is swapped per load)."""
-        # Stop the previous loaded-figure node.  The hub is created ONCE (``__init__``) and REUSED for
-        # every load: a fresh hub per load would strand the console (bound to the old hub).  The reused
-        # hub's stale signals are overwritten by the new node's same-named republishes, or GC'd as
-        # orphans when the console reseeds.
-        if self.node is not None:
+        # The hub is created ONCE (``__init__``) and REUSED for every load, so the loaded-figure slot is
+        # ONE logical producer that publishes the fixed ``fig_value``/... names each load -- exactly the
+        # "same signal names, new geometry" case the schema-ownership contract handles.  A reload is a
+        # producer REBIND, identical to a Task-console row restart: stop the previous instance, hand its
+        # schema-ownership proof to the replacement (so a kind/shape change -- 2-D image -> grid --> takes
+        # the legitimate ``replace=True`` schema-version path instead of being rejected as an unrelated
+        # producer clobbering ``fig_value``), then PURGE the signals the previous figure published that
+        # this one does not (a prior site-map's ``fig_centers``/``fig_frame`` must not linger on a bare
+        # 1-D curve).  The console reuses the same hub, so it follows the new schema version seamlessly.
+        prev = self.node
+        if prev is not None:
             try:
-                self.node.stop()
+                prev.stop()
             except Exception:
                 pass
-            self.node = None
+        self.node = None
         if saved is not None:
             self.node = LoadedFigureNode(self.hub, saved)
+            if prev is not None:
+                try:
+                    self.node._inherit_output_schema_ownership(prev)
+                except Exception:
+                    pass
             self.node.step()                   # publish once so the signal is on the hub immediately
+            if prev is not None and hasattr(prev, "published_signals"):
+                try:
+                    self.hub.remove_signals(
+                        set(prev.published_signals()) - set(self.node.published_signals()))
+                except Exception:
+                    pass
             state = _seed_state(saved, self.node)
             running: list = [self.node]
         else:

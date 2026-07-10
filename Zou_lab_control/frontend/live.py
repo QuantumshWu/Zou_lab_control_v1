@@ -2341,6 +2341,16 @@ def coerce_panel_value(kind, value, *, structure=None, params=None, repeat_mode=
         expected = (points, *ds)
         if tuple(arr.shape) != expected:
             raise ValueError(f"1D panel expects reduced canonical {expected}; got {arr.shape}")
+        if points == 1 and not params.get("xy"):
+            # A SINGLE point whose data blob IS the sequence -- the external-datum framing a raw curve
+            # takes on the hub (a notebook ``plot(x, y).save()`` registers its (N,1) y-vector as ONE
+            # point with ``data_shape=(N,1)``, whereas a live scan publishes it as ``point_shape=(N,)``,
+            # ``data_shape=(1,)``).  A 1-D curve is a 1-D sequence regardless of WHICH axis carries its
+            # length, so a lone point's whole data blob flattens to the curve -- the same rule the
+            # ``external`` branch above applies, here also honoured when that single-point framing is
+            # explicit in the schema.  The "pick a component" guard below stays for the genuinely
+            # ambiguous MULTI-point multi-component case (``point_shape=(40,)``, ``data_shape=(5,)``).
+            return arr.reshape(-1)
         if len(ds) != 1:
             raise ValueError(
                 "1D panel requires data_shape=(D,); select an explicit component before plotting "

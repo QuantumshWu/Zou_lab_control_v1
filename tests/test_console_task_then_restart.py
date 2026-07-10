@@ -32,7 +32,7 @@ if sys.path[0] != str(REPO_ROOT):
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import Zou_lab_control.neutral_atom as na
-from conftest import add_logic_row, fire_live_imaging, make_console
+from conftest import add_logic_row, fire_live_imaging, make_console, tick
 
 
 def _wait_terminated(node, timeout_s: float = 120.0) -> None:
@@ -58,7 +58,7 @@ def test_2d_panel_survives_calibration_task_and_camera_restart():
         card = con._new_panel_card(PanelConfig(kind="2d", title="IMG", size="4x4",
                                                source="value = frame_0", params={}))
         con._attach_card(card)
-        con._tick()
+        tick(con)
         assert card._status_error is False, card._status_text
 
         # 2) the Calibrate readout task runs to completion through the REAL console path
@@ -68,7 +68,7 @@ def test_2d_panel_survives_calibration_task_and_camera_restart():
         task_node = con._logic_nodes[id(taskrow)]
         assert task_node is not None
         _wait_terminated(task_node)
-        con._tick()                                   # the console observes the finish
+        tick(con)                                   # the console observes the finish
         # the self-finished task reached the SAME endpoint the Stop button produces:
         # out of running_nodes (shot-clock + provider resolution see only LIVE nodes).
         assert task_node not in con.running_nodes
@@ -82,14 +82,14 @@ def test_2d_panel_survives_calibration_task_and_camera_restart():
         frame_spec = next(spec for spec in cam2.output_specs() if spec.name == "frame_0")
         assert frame_spec.data_shape == exp.devices.camera.frame_shape
         card._render_version = -1                     # force a recompose this tick
-        con._tick()
+        tick(con)
         assert card._status_error is False, card._status_text
 
         # 4) the pulse comes back -- live streaming resumes seamlessly.
         fire_live_imaging(exp)
         cam2.step()
         card._render_version = -1
-        con._tick()
+        tick(con)
         assert card._status_error is False, card._status_text
     finally:
         con.shutdown()

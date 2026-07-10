@@ -32,7 +32,8 @@ import matplotlib  # noqa: E402
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
-import pytest  # noqa: E402
+import pytest
+from conftest import tick  # noqa: E402
 
 import Zou_lab_control.frontend as zf  # noqa: E402
 from Zou_lab_control.frontend import SavedFigure, load_figure, plot  # noqa: E402
@@ -548,7 +549,7 @@ def test_pulse_reopens_as_a_normal_panelcard_on_the_same_board(tmp_path):
         assert card.config.source == f"value = {FIG_PREFIX}{FIG_VALUE_KEY}"
         assert (FIG_PREFIX + FIG_VALUE_KEY) in set(viewer.hub.names()), "fig_value published like every kind"
         # (4) it BUILDS a faithful PulseSequenceFigure through the console tick (the pulse render branch)
-        con._tick()
+        tick(con)
         plotter = card.plotter
         assert type(plotter).__name__ == "PulseSequenceFigure", "PanelCard renders pulse faithfully"
         assert len(plotter.channels) > 1 and len(plotter.analog_traces) >= 1 and len(plotter.pulses) > 1

@@ -31,7 +31,8 @@ import matplotlib  # noqa: E402
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
-import pytest  # noqa: E402
+import pytest
+from conftest import tick  # noqa: E402
 
 from Zou_lab_control.frontend import plot, show_figure_viewer  # noqa: E402
 from Zou_lab_control.frontend.figure_viewer import (  # noqa: E402
@@ -143,7 +144,7 @@ def test_info_panel_exposes_every_stored_key(viewer):
 def test_seeded_panel_plotter_builds_as_saved_kind(viewer):
     v, _ = viewer
     card = v.console.cards[0]
-    v.console._tick()                      # drive one refresh, exactly like the live timer does
+    tick(v.console)                      # drive one refresh, exactly like the live timer does
     assert card.plotter is not None, "the seeded panel builds its plotter (reproduces the figure)"
     assert type(card.plotter).__name__ == "HistogramFigure", "a hist save reproduces as HistogramFigure"
 
@@ -155,7 +156,7 @@ def test_board_reuse_add_second_panel_reads_same_signal(viewer):
     con.state.panels.append(PanelConfig(kind="monitor", title="again",
                                         source=f"value = {FIG_SIGNAL}", inputs=[FIG_SIGNAL]))
     con.load_state(con.state)
-    con._tick()
+    tick(con)
     assert len(con.cards) == 2, "a second panel was added to the same board"
     assert all(c.config.inputs[0] == FIG_SIGNAL for c in con.cards), \
         "both panels read the one loaded-figure signal (board reuse)"
@@ -256,11 +257,11 @@ def test_grid_panel_exposes_editable_cell_title_template_and_size():
         con._attach_card(card)
         namespace = {"__probe__": block}
         card._render(card._signal_then_repeat(namespace), namespace)
-        con._tick()
+        tick(con)
         con._edit_card(card)
         ed = con._panel_editors[id(card)]
         # editing the template (the ONE set_param path) re-titles EVERY cell.
-        card._set_param("title_template", "{id}  n={k}"); card._run_pending_rebuild(); con._tick()
+        card._set_param("title_template", "{id}  n={k}"); card._run_pending_rebuild(); tick(con)
         assert [card.plotter.cell_renderer.cell_title(k) for k in range(4)] == \
             ["repeat 0  n=0", "repeat 1  n=1", "repeat 2  n=2", "repeat 3  n=3"]
         # the template round-trips through the saved view (the title SIZE is not a knob -- auto-tracks ticks).
@@ -303,7 +304,7 @@ def test_edit_x_range_pin_is_global_live_and_persisted():
         con._attach_card(card)
         namespace = {"__probe__": block}
         card._render(card._signal_then_repeat(namespace), namespace)
-        con._tick()
+        tick(con)
         con._edit_card(card)
         ed = con._panel_editors[id(card)]
         assert ed.ymin is None and ed.ymax is None, "the Edit Limits section has NO y input (#3)"
@@ -352,7 +353,7 @@ def test_edit_y_range_pin_exists_only_on_the_image_family_and_round_trips():
         con._attach_card(card)
         namespace = {"__probe__": frame}
         card._render(card._signal_then_repeat(namespace), namespace)
-        con._tick()
+        tick(con)
         con._edit_card(card)
         ed = con._panel_editors[id(card)]
         assert ed.ymin is not None and ed.ymax is not None, "an image Edit carries the y range row"
@@ -472,7 +473,7 @@ def test_sitemap_signals_save_reproduces_rings_and_background_frame(tmp_path):
         # the seeded sites panel BUILDS (the reported bug: it did not) and carries a background image
         card = v.console.cards[0]
         assert card.config.kind == "sites"
-        v.console._tick()
+        tick(v.console)
         assert card.plotter is not None, "the seeded sites panel builds its plotter"
         assert len(card.plotter.ax.get_images()) >= 1, \
             "the sitemap shows its stored background camera frame (an imshow underlay), not bare rings"
@@ -553,7 +554,7 @@ def test_edit_tab_repeat_mode_create_redraws_snapshot_per_repeat(tmp_path):
     try:
         con = v.console
         card = con.cards[0]
-        con._tick()
+        tick(con)
         assert card.config.kind == "1d"
         # open the panel's real Edit tab (the closable PanelEditor) exactly as the Edit… button does
         con._edit_card(card)
@@ -562,14 +563,14 @@ def test_edit_tab_repeat_mode_create_redraws_snapshot_per_repeat(tmp_path):
         assert editor._plotter is not None, "the Edit tab builds its snapshot"
 
         # create: the live card draws one line per repeat, and the snapshot must MIRROR that
-        card._set_param("repeat_mode", "create"); card._run_pending_rebuild(); con._tick()
+        card._set_param("repeat_mode", "create"); card._run_pending_rebuild(); tick(con)
         editor.rebuild()
         create_live = _line_count(card.plotter)
         create_snap = _line_count(editor._plotter)
         assert create_live == 3, "the live 1d panel draws one line per repeat in create mode"
 
         # average: a single mean line, on BOTH the live card AND the snapshot
-        card._set_param("repeat_mode", "average"); card._run_pending_rebuild(); con._tick()
+        card._set_param("repeat_mode", "average"); card._run_pending_rebuild(); tick(con)
         editor.rebuild()
         average_live = _line_count(card.plotter)
         average_snap = _line_count(editor._plotter)
@@ -618,7 +619,7 @@ def test_picking_image_loads_sibling_npz(tmp_path):
         assert v.saved is not None and v.saved.kind == "hist", "picking the .png loaded its sibling .npz"
         assert v.console is not None and len(v.console.cards) == 1, "the seeded panel built from the npz"
         assert v._current_path == npz, "the loaded path is the sibling npz, not the image"
-        v.console._tick()
+        tick(v.console)
         assert v.console.cards[0].plotter is not None, "the seeded panel builds (equivalent to loading npz)"
     finally:
         win = v.window()
@@ -666,7 +667,7 @@ def test_one_d_save_reproduces_with_saved_x_axis(tmp_path):
         card = con.cards[0]
         assert card.config.kind == "1d"
         assert (FIG_PREFIX + "x") in set(v.hub.names()), "a 1-D save also publishes its companion x"
-        con._tick()
+        tick(con)
         assert card.plotter is not None
         assert card.plotter.ax.get_xlabel() == "Trap-off time (s)", \
             "the 1d panel draws vs the saved x with the saved x-axis label"
@@ -734,7 +735,7 @@ def test_grid_reopens_as_a_normal_panelcard_on_the_same_board(tmp_path):
         assert FIG_SIGNAL in set(v.hub.names()), "fig_value is published like every other kind"
         # the producing node carries the reproduction recipe (the hub is float-only)
         assert v.node is not None and v.node.grid_recipe is not None
-        con._tick()
+        tick(con)
         plotter = card.plotter
         assert type(plotter).__name__ in ("SiteHistogramGrid", "GridPlot"), "PanelCard renders grid faithfully"
         assert plotter.n_cells == 6, "the reproduced grid has the saved site count"
@@ -759,7 +760,7 @@ def test_grid_image_cell_reopens_faithfully(tmp_path):
         assert v.saved.grid_recipe()["sub_plot_kind"] == "2d"
         card = v.console.cards[0]
         assert card.config.kind == "grid"
-        v.console._tick()
+        tick(v.console)
         assert card.plotter is not None and card.plotter.n_cells == 6
         # image cells carry an imshow per cell (no threshold lines)
         assert any(len(ax.get_images()) >= 1 for ax in card.plotter.site_axes)
@@ -791,7 +792,7 @@ def test_pulse_panel_opens_at_optimal_size_and_edit_tab_is_not_blank(tmp_path):
         assert card.config.kind == "pulse"
         assert card.config.size == expected, \
             f"a recipe with no panel_size opens at the optimal default ({expected}), not a forced 2x2"
-        con._tick()
+        tick(con)
         # open the real Edit tab and rebuild its snapshot -- it must build a PulseSequenceFigure, not blank
         con._edit_card(card)
         editor = next(con.tabs.widget(i) for i in range(con.tabs.count())
@@ -912,7 +913,7 @@ def test_pulse_seeds_a_normal_panelcard_via_the_same_load_path(tmp_path):
         assert FIG_SIGNAL in set(v.hub.names()), "fig_value is published like every other kind"
         # the producing node carries the reproduction state (the hub is float-only)
         assert v.node is not None and v.node.pulse_state is not None
-        con._tick()
+        tick(con)
         plotter = card.plotter
         assert type(plotter).__name__ == "PulseSequenceFigure", "PanelCard renders pulse faithfully"
         assert len(plotter.channels) > 1 and len(plotter.analog_traces) >= 1

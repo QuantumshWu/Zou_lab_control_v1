@@ -29,7 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
-from conftest import fire_live_imaging   # the live "On Pulse" the trigger-driven camera needs
+from conftest import fire_live_imaging, tick   # the live "On Pulse" the trigger-driven camera needs
 
 
 @pytest.fixture(autouse=True)
@@ -508,7 +508,7 @@ def test_running_task_takes_a_fixed_panel_and_locks_the_console():
 
         # a tick detects completion -> lock released, the strip's Stop action hides (the strip
         # itself stays -- back to the idle summary), transient panel gone.
-        console._tick()
+        tick(console)
         assert console._task_locked is False
         assert console.status_strip.action_button.isHidden() is True
         assert "Task running" not in console.status_strip.message.text()
