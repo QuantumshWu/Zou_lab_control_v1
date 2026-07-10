@@ -93,6 +93,51 @@ def test_api_slot_plan_uses_semantic_coordinate_but_private_api_handle(tmp_path)
         exp.close()
 
 
+def test_default_y_is_unbound_not_a_foreign_producer_signal(tmp_path):
+    """#7: the generic pulse scan must NOT default its y-input to another node's private signal.
+    Blank ``{"inputs": [], "source": "value = signal"}`` is the same 'no signal picked yet' state a
+    plot panel starts in -- the operator binds the scan y to whatever THEIR running readout publishes
+    (occupancy loading rate, ROI intensity, survival...).  A hardcoded foreign ``rate`` both couples
+    this generic measurement to one processor AND aborts the scan when no such processor runs."""
+    from Zou_lab_control.neutral_atom.operations.measurements.pulse_scan import DEFAULT_Y_SOURCE
+
+    assert dict(DEFAULT_Y_SOURCE) == {"inputs": [], "source": "value = signal"}
+    exp = _experiment()
+    try:
+        ydecl = next(p for p in _spec(exp).params if p.key == "y")
+        assert list((ydecl.default or {}).get("inputs", [])) == []   # no foreign 'rate' baked in
+    finally:
+        exp.close()
+
+
+def test_declared_output_keys_equal_what_the_running_node_publishes(tmp_path):
+    """#7 secondary (declared == published): the console names a stopped pulse-scan node's outputs
+    from ``spec.metadata['declared_keys']`` -- which must equal the FULL names the running node
+    emits (the semantic scan coordinate(s) + ``y_name``), never the placeholder ``x_key='param'``
+    the node overrides.  ONE derivation feeds both, so a self-describing Logic row can't drift."""
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.measurement import SWEEP_SCAN_SLOT
+    from Zou_lab_control.neutral_atom.operations.measurements.pulse_scan import declared_output_keys
+
+    exp = _experiment()
+    try:
+        spec = _spec(exp)
+        values = {
+            "template": _template(tmp_path / "declared.json", scan_slot=True, persisted_program=True),
+            "pulse_slots": {"api": {}, "sweep_kind": SWEEP_SCAN_SLOT,
+                            "program": "scan_table = [[10001.2], [20003.7], [30005.1]]"},
+            "y_name": "signal",
+        }
+        declared = declared_output_keys(values)
+        assert "param" not in declared and declared[-1] == "signal"
+
+        node = spec.make_node(SignalHub(), prefix="pulse_scan_", repeat=1, **values)
+        published_bare = {name[len("pulse_scan_"):] for name in node.published_signals()}
+        assert set(declared) == published_bare
+    finally:
+        exp.close()
+
+
 def test_template_selects_its_available_strategy_and_persisted_hardware_program(tmp_path):
     from Zou_lab_control.neutral_atom.operations.measurement import SWEEP_API_SLOT, SWEEP_SCAN_SLOT
 

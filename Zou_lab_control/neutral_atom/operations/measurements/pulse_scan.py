@@ -41,17 +41,20 @@ from ..measurement import (
 )
 from ..measurement import measurement_slug
 from ..measurement_registry import measurement
-from ..signal_expr import SignalExpr
+from ..signal_expr import DEFAULT_SOURCE, SignalExpr
 
 #: The generic scan needs a compact, inspectable pulse program to sweep.  The shipped probe
 #: template is that default; acquiring and reducing the external y signal remain the independent
 #: producer pipeline's responsibility.
 DEFAULT_PROBE_TEMPLATE = PROBE_TEMPLATE_PATH
 
-#: Default y source: the loading ``rate`` published by a Judge-occupancy processor (the common
-#: case -- sweep a pulse parameter, watch the loading fraction).  The operator re-picks it in
-#: the form / notebook to any running node's signal.
-DEFAULT_Y_SOURCE: Mapping[str, object] = {"inputs": ["rate"], "source": "value = signal"}
+#: Default y source: UNBOUND -- a generic pulse-scan measurement must not name another node's private
+#: signal (naming a Judge-occupancy ``rate`` couples this generic measurement to one processor's output
+#: AND aborts the scan when no such processor is running).  Blank = the same "pick a signal yet" state a
+#: plot panel starts in; the operator binds the scan y to whatever value THEIR running readout publishes
+#: (occupancy loading rate, ROI intensity, survival, ...).  The node still guards a start with no producer
+#: loudly, so blank is a valid editing state, not a valid run state.
+DEFAULT_Y_SOURCE: Mapping[str, object] = {"inputs": [], "source": DEFAULT_SOURCE}
 
 class _Axis:
     """The scan-axis the live node reads (``values`` + plot labels)."""
@@ -180,6 +183,41 @@ def _api_table_arrays(
     )
 
 
+def _resolve_sweep_kind(state: PulseTableState, spec: Mapping) -> str:
+    """Which sweep strategy a pulse-scan run WILL use for ``spec`` (the ``pulse_slots`` value):
+    the explicit ``sweep_kind`` if the operator picked one, else the template's structural default
+    (scan slots first, then API slots).  ONE rule shared by :func:`build` and
+    :func:`declared_output_keys` so the declared coordinate names equal the ones the run publishes."""
+    sweep_kind = str(spec.get("sweep_kind") or "").strip()
+    if not sweep_kind:
+        sweep_kind = SWEEP_SCAN_SLOT if state.scan_slots else (
+            SWEEP_API_SLOT if state.api_slots else "")
+    return sweep_kind
+
+
+def declared_output_keys(values: Mapping | None = None) -> list[str]:
+    """The bare (un-prefixed) hub keys a :class:`~..logic.PulseScanNode` WILL publish for these
+    form ``values`` -- the semantic scan coordinate name(s) followed by the ``y_name`` output.  This
+    is the SAME derivation :func:`build` feeds the node (:meth:`PulseScanNode._bare_output_specs`
+    publishes exactly ``[*scan_names, y_key]``), so the console's picker/legend declared names equal
+    what actually appears on the hub (declared == published).  A bad/empty template degrades to just
+    the ``y`` output identity (the node cannot start anyway, but the value signal is still nameable)."""
+    vals = dict(values or {})
+    y_key = str(vals.get("y_name") or "signal").strip() or "signal"
+    names: list[str] = []
+    try:
+        state = _resolve_probe_template(str(vals.get("template") or DEFAULT_PROBE_TEMPLATE))
+        spec = dict(vals.get("pulse_slots") or {})
+        program = str(spec.get("program") or "")
+        if _resolve_sweep_kind(state, spec) == SWEEP_SCAN_SLOT:
+            names = list(_scan_table_arrays(state, program)[0])
+        else:
+            names = list(_api_table_arrays(state, program)[0])
+    except Exception:
+        names = []
+    return [*(str(n) for n in names), y_key]
+
+
 def _label_for_first_scan_slot(state: PulseTableState) -> tuple[str, str]:
     """``(axis label, axis unit)`` for the FIRST scan slot (drives the live plot's x label).
 
@@ -277,10 +315,7 @@ def pulse_scan(readout) -> MeasurementSpec:
                 f"unsupported pulse-scan field(s) {unknown}; expected only program_id, api, "
                 "sweep_kind, program.")
         api_values: Mapping[str, float] = dict(spec.get("api") or {})
-        sweep_kind = str(spec.get("sweep_kind") or "").strip()
-        if not sweep_kind:
-            sweep_kind = SWEEP_SCAN_SLOT if state.scan_slots else (
-                SWEEP_API_SLOT if state.api_slots else "")
+        sweep_kind = _resolve_sweep_kind(state, spec)
         if sweep_kind not in PULSE_SWEEP_KINDS:
             raise ValueError(
                 f"pulse sweep kind must be one of {PULSE_SWEEP_KINDS}; got {sweep_kind!r}.")
@@ -315,10 +350,11 @@ def pulse_scan(readout) -> MeasurementSpec:
                           "execution for a single FPGA table or API-slot execution for one finite "
                           "software-submitted pulse per row; all selected columns advance together."),
         ParamDecl("y", "Signal (y)", "signal_expr", default=dict(DEFAULT_Y_SOURCE),
-                  tooltip="The y recorded per point.  Pick a signal published by ANOTHER running node "
-                          "(e.g. a Judge-occupancy processor's loading 'rate') and combine via value = ... . "
-                          "Start the selected producer/processor pipeline first; Pulse scan owns only "
-                          "the sequencer and samples each fresh lineage once."),
+                  tooltip="The y recorded per point.  Starts unbound -- pick a signal published by ANOTHER "
+                          "running node (an occupancy loading fraction, an ROI intensity, a survival "
+                          "probability, ...) and combine via value = ... . Start the selected "
+                          "producer/processor pipeline first; Pulse scan owns only the sequencer and "
+                          "samples each fresh lineage once."),
         ParamDecl("y_name", "Output name", "text", default="signal",
                   tooltip="Name of the OUTPUT signal this scan publishes (the y curve), e.g. "
                           "'loading_rate' or 'survival' -- so a plot picks a meaningful name."),
@@ -328,4 +364,7 @@ def pulse_scan(readout) -> MeasurementSpec:
         result_labels=("Pulse parameter", "Signal"),
         x_key="param", y_key="signal", build=build,
         # The console builds the dedicated sequencer-driving, signal-consuming PulseScanNode.
-        metadata={NODE_META_KEY: PULSE_SCAN_NODE})
+        # ``declared_keys`` lets the console name the node's REAL published outputs (the semantic
+        # scan coordinate(s) + y_name) before it runs -- the generic ``x_key="param"`` is a
+        # placeholder the node overrides with ``scan_names[0]`` (declared == published, #7).
+        metadata={NODE_META_KEY: PULSE_SCAN_NODE, "declared_keys": declared_output_keys})

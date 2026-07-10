@@ -7571,10 +7571,18 @@ class TaskConsole(QtWidgets.QWidget):
         """The SHORT (un-prefixed) output names a logic node emits -- the ONE derivation shared by
         the prefix collision check (:meth:`_logic_node_prefix`) and the declared picker names
         (:meth:`_declared_signal_keys`), so what is checked for collision is exactly what will be
-        published.  Processor: the spec's ``result_keys``; measurement: its x/y curve keys; camera:
-        ``frame_i`` per emCCD event (``frames_per_cycle``, the same helper
-        ``CameraMeasurement.published_signals`` uses so they can never drift)."""
+        published.  Processor: the spec's ``result_keys``; measurement: its x/y curve keys (or, when
+        the spec exposes a ``declared_keys`` deriver, the REAL published names for its form values --
+        pulse-scan overrides ``x_key="param"`` with the semantic scan coordinate, so the deriver keeps
+        declared == published); camera: ``frame_i`` per emCCD event (``frames_per_cycle``, the same
+        helper ``CameraMeasurement.published_signals`` uses so they can never drift)."""
         spec = self._spec_for_logic(node)
+        declared = (getattr(spec, "metadata", None) or {}).get("declared_keys")
+        if callable(declared):
+            try:
+                return [str(k) for k in declared(node.values or {})]
+            except Exception:
+                pass                                       # fall back to the static spec keys below
         keys = [str(k) for k in (getattr(spec, "result_keys", ()) or [])]
         if not keys and node.kind == "measurement":
             keys = [k for k in (getattr(spec, "x_key", ""), getattr(spec, "y_key", "")) if k]
