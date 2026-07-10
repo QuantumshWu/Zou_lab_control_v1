@@ -60,22 +60,30 @@ def _combo_item_sets(card):
 
 
 # ---------------------------------------------------------------- structural
-def test_setting_popup_has_live_fit_controls_from_the_core_registry():
-    """General-fit families expose the real live Apply/Clear entry; hist keeps its own fit."""
+def test_setting_popup_analysis_section_offers_fit_and_roi_from_capability():
+    """The Setting popup's ONE "Analysis" action combo offers 'curve fit' where the render_family has
+    general models (every kind BUT the site map) and 'ROI' where both axes are spatial (the image
+    kinds), both derived from the single-source capability table -- never a per-kind fit list.  The
+    curve fit is now a SEPARATE, parallel offering: a histogram (render_family '1d') is offered the
+    general 1-D family HERE (fit_model_combo present) ALONGSIDE its own bimodal ``fit`` PANEL_PARAM."""
     from Zou_lab_control.frontend.task_console import PANEL_PARAMS
-    for kind in ("1d", "monitor", "2d", "sites", "hist"):
+    expect_fit = {"1d": True, "monitor": True, "2d": True, "sites": False, "hist": True}
+    expect_roi = {"1d": False, "monitor": False, "2d": True, "sites": True, "hist": False}
+    for kind, wants_fit in expect_fit.items():
         card = _card(kind)
         try:
-            texts = _button_texts(card)
+            combo = card.analysis_combo
+            assert combo is not None, kind                          # the section always renders
+            actions = {combo.itemData(i) for i in range(combo.count())}
+            assert "none" in actions, (kind, actions)
+            assert ("fit" in actions) is wants_fit, (kind, actions)
+            assert ("roi" in actions) is expect_roi[kind], (kind, actions)
+            assert (card.fit_model_combo is not None) is wants_fit, kind
+            assert (card.fit_fix_seed is not None) is wants_fit, kind    # the fix/seed editor only when fitting
+            # the histogram STILL declares its own bimodal fit knob -- a separate, parallel fit
             if kind == "hist":
-                assert "Clear" not in texts, (kind, texts)
-                assert card.fit_model_combo is None
-            else:
-                assert "Apply" in texts and "Clear" in texts, (kind, texts)
-                assert card.fit_model_combo is not None
-            # relim is not a declarative PANEL_PARAMS spec -- it has its OWN
-            # row in the Limits section (the Limits combo).  Keep the spec set
-            # clean of any duplicate "relim" key.
+                assert any(s.key == "fit" for s in PANEL_PARAMS["hist"])
+            # relim is not a declarative PANEL_PARAMS spec -- it has its OWN row in the Display section.
             param_keys = {spec.key for spec in PANEL_PARAMS.get(kind, ())}
             assert "relim" not in param_keys, (kind, param_keys)
         finally:

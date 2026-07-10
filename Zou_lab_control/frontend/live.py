@@ -3735,6 +3735,24 @@ PLOT_KINDS: tuple[PlotKind, ...] = (
 PLOT_KIND_BY_KEY: dict[str, PlotKind] = {pk.key: pk for pk in PLOT_KINDS}
 
 
+def general_fit_models(render_family: str) -> list:
+    """The general curve-fit models offered for a plot's ``render_family`` -- the SINGLE capability
+    table, keyed off ``render_family`` (the one field that already declares each kind's fit family).
+
+    A ``1d`` family offers the 1-D peak/decay models; a ``2d`` family offers the image ``center``
+    model.  ``auto`` (the site map: occupancy rings over a frame -- neither a fittable curve nor an
+    image with per-pixel values) and any other family offer NO general fit, so a ``sites`` panel never
+    lists an un-fittable model (a curve fit there raised ``AttributeError 'LiveSiteMap' has no
+    'x_array'``).  This is INDEPENDENT of whether the kind ALSO carries a built-in domain fit: a
+    histogram declares ``render_family='1d'`` and so is offered the 1-D family HERE *alongside* its
+    own bimodal ``fit`` knob (they are two parallel fits, no longer either/or)."""
+    from ..neutral_atom.core.fitting import fit_models
+    family = str(render_family).strip().lower()
+    if family in ("1d", "2d"):
+        return list(fit_models(family=family))
+    return []
+
+
 def kind_for_plotter(plotter) -> str | None:
     """The ``PLOT_KINDS`` key a plotter object BELONGS to -- reverse-looked-up from ``type(plotter)`` in
     the ONE table (never a hand-typed name), so a bare ``plot.save()`` can stamp the correct ``kind`` into
@@ -6224,6 +6242,7 @@ __all__ = [
     "PlotKind",
     "PLOT_KINDS",
     "PLOT_KIND_BY_KEY",
+    "general_fit_models",
     "HistogramFigure",
     "Live1D",
     "Live2DDis",

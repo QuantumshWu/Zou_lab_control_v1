@@ -1654,17 +1654,20 @@ def test_task_console_panel_editor_fit_and_setting_relim(monkeypatch):
     from Zou_lab_control.frontend import devtools as dt
     from Zou_lab_control.neutral_atom.core.fitting import fit_models
     from Zou_lab_control.frontend.task_console import (
-        PanelCard, PanelConfig, _fit_models_for_kind)
+        PanelCard, PanelConfig, _general_fit_models_for_kind)
 
-    # The fit model set is defined in full, but the Edit tab offers
-    # only the models matching the panel's plot FAMILY: a 1d/monitor trace gets the curve models, a 2d
-    # image gets the center model, and a hist (its own bimodal fit) gets no general fit.
+    # The fit model set is defined in full, but the Analysis section offers only the models matching the
+    # panel's render_family (the ONE capability table): a 1d/monitor/hist trace gets the 1-D curve
+    # models, a 2d image gets the center model, and a site map gets none.  A hist now ALSO gets the
+    # general 1-D family (alongside its own bimodal knob) -- the two fits are parallel.
     assert {model.key for model in fit_models()} == {
         "lorent", "gaussian", "lorent_zeeman", "rabi", "decay", "center"}
-    assert [model.key for model in _fit_models_for_kind("1d")] \
+    assert [model.key for model in _general_fit_models_for_kind("1d")] \
         == ["lorent", "gaussian", "lorent_zeeman", "rabi", "decay"]
-    assert [model.key for model in _fit_models_for_kind("2d")] == ["center"]
-    assert _fit_models_for_kind("hist") == []            # a hist carries its OWN bimodal fit
+    assert [model.key for model in _general_fit_models_for_kind("2d")] == ["center"]
+    assert [model.key for model in _general_fit_models_for_kind("hist")] \
+        == ["lorent", "gaussian", "lorent_zeeman", "rabi", "decay"]   # parallel general fit
+    assert _general_fit_models_for_kind("sites") == []   # occupancy rings are not a fittable curve
     console = dt.demo_console(shots=5)
     card = PanelCard(PanelConfig(kind="1d", title="bump", row=0, col=0, size="2x2",
                                  source="value = bump"), parent=console.board)
@@ -1672,8 +1675,9 @@ def test_task_console_panel_editor_fit_and_setting_relim(monkeypatch):
     x = np.linspace(-5, 5, 60)
     card.refresh({"bump": 3.0 * np.exp(-(x ** 2) / (2 * 1.2 ** 2)) + 0.1, "shot": 1})
 
-    # Setting and Edit are two adapters over the same structured request.
-    assert card.fit_model_combo is not None and hasattr(card, "_apply_fit_request")
+    # Setting and Edit are two adapters over the same structured request, mutated through the ONE
+    # card seam (set_fit_request); the Setting Analysis section carries the model combo.
+    assert card.fit_model_combo is not None and hasattr(card, "set_fit_request")
 
     # per-panel Edit tab: fit a Gaussian -> applied as a STORED display knob to the live card + its
     # snapshot (the ONE _edit_param path, not a throwaway _df mutation), so a fit curve draws on the
