@@ -667,7 +667,12 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert r"%FPGA_DIR%build" in build_bat                # build root stays in fpga\build
     assert r"%FPGA_DIR%build" in server_bat
     # run_server.bat starts the FINAL JTAG-to-AXI server (no loader/variant residue).
-    assert "ZLC_PS_CLOCK_HZ=50000000" in server_bat
+    # The FPGA clock is NOT hardcoded in the bat -- it is single-sourced from
+    # fpga/board_config/streamer_config.json (the server reads it via --xdc); ZLC_PS_CLOCK_HZ stays
+    # an OPTIONAL explicit override, passed only when the operator sets it.
+    assert "ZLC_PS_CLOCK_HZ=50000000" not in server_bat
+    assert 'set "ZLC_PS_CLOCK_HZ_ARG=--clock-hz %ZLC_PS_CLOCK_HZ%"' in server_bat
+    assert "streamer_config.json" in server_bat
     assert "zlc_verify_sources" in server_bat
     assert "zlc_verify_loader_sources" not in server_bat
     # default control link is AUTO (probe fastest verified transport: uart > jtag-axi), not a fixed backend
