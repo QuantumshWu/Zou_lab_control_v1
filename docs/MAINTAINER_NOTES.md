@@ -2090,3 +2090,52 @@ first-light)** — RuntimeSequencer (a strict subset of Virtual) and VerilogSequ
 dead code) are deleted, the service-level wall-clock scan-progress simulation went with them, and
 `VirtualSequencer.wait_done` enforces the same deadlock guard + protocol bookkeeping as the bare
 service (`WAIT_FOREVER_MESSAGE` single source).
+
+## 25. The render thread: compose off the GUI thread + the selector→ROI gesture (2026-07-09, W round)
+
+The V3 tick budget/rotor only *rescheduled* the GUI-thread render burst; the W round removed it.
+`frontend/render_loop.py` is the console's ONE background worker: every steady-tick compose (the
+numpy display prep, matplotlib artist updates and the Agg rasterisation) runs there, strictly one
+batch at a time.  The GUI thread keeps scheduling (frame-key/beat gates), presents the finished
+FRONT buffers together (one coherent shot per flip) and serves interaction.  Measured: GUI `_tick`
+207 ms → 1.5 ms with three 2.3 MP live panels; event-loop latency p95 0.5 ms.
+
+**Ownership protocol (the whole thread-safety story).**  Between `submit` and `job_done` the render
+thread owns every batched figure.  Every GUI path that mutates one holds `RenderLoop.barrier()`
+first — the canvas mouse/wheel entries (`EmbeddedFigureCanvas._zlc_wait_render`, hook
+`_zlc_render_barrier` hung at the ONE selector apply point), Setting edits, source apply, the
+coalesced rebuild, Edit-tab open, panel remove/teardown, `refresh_once`.  Structural (re)builds
+(Qt widget creation) are probed by the single dirtiness rule `_needs_structural_build` and handed
+back to the GUI pass in `_on_render_batch`.  `set_status` defers itself off-thread (flushed at
+present) so `compose` never forks per thread.  Compose is Agg-ONLY end to end: the stock QtAgg
+`draw()` hides a `self.update()` Qt call, bypassed via `_zlc_draw_agg_only`; `present()` snapshots
+the buffer into a FRONT QImage the paintEvent blits, so an async paint never races the worker;
+drag interactions drop the front and own the figure for the drag (V5 protocol unchanged).
+
+**W-round data-plane regression fixed first** (`dfb5dde`): `SignalExpr.co_names()` folds the bound
+inputs in for version-gating, and the raw-signal detector used it — the identity zero-copy path
+NEVER fired and every bound panel float64-stacked the 2.3 MP frame per tick (~52 ms/panel).  The
+detector now uses `direct_names()` (the source TEXT's own identifiers); `reduce_repeat` passes a
+single integer repeat slice through as the native view.
+
+**Signal-loop guards** (user-reported): a processor could pick its own output as its source —
+fresh hub = silent starvation forever, primed hub = a full-CPU republish spiral with a frozen shot
+clock.  Three guards, one per scope: `Processor.__init__` rejects `consumes ∩ published_signals()`
+(base single source); `TaskConsole._reactive_ring` walks REACTIVE edges only at start time to
+reject indirect A↔B rings (a pulse-scan's y reading its own relayed frame stays legal — it is a
+bounded PULL, never self-sustaining); the processor Edit picker no longer offers the node's own
+declared outputs.
+
+**Selector→hub chain completed** (the V6 gap): drawing an area rectangle on a LIVE image panel
+(selectors ON) now retargets every RUNNING region-capable processor consuming that signal through
+the thread-safe apply path, or — when none exists — CREATES the stock `ROI crop` row seeded with
+the signal + rectangle and STARTS it (`_on_panel_area_select`; `roi.region_values` is the one
+endpoint→params mapping).  Fit results are hub signals: `FitProcessor` ("Fit center") publishes
+`fit_x0/fit_y0/fit_amplitude/fit_size/fit_offset` scalars per shot from the ONE
+`_readout_math.gaussian2d_center` model `DataFigure.center` also uses.
+
+**Persistent status strip**: `qt_fluent.FluentStatusStrip` (severity dot + eliding message +
+optional action) replaces both the header summary label an error used to overwrite and the
+transient orange task banner whose show/hide shifted the layout.  One priority ladder in
+`_update_summary`: node error > running task (+Stop action) > display-behind advisory > idle
+summary.  figure_viewer mounts the same strip.

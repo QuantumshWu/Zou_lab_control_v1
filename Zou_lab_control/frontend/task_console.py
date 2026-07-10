@@ -7733,10 +7733,10 @@ class TaskConsole(QtWidgets.QWidget):
         self._arrange()
         # Assemble the strip's task line BEFORE engaging the lock: _apply_task_lock flips the
         # strip immediately, so the text must already be there (never one tick of stale idle text).
-        self._update_task_banner(node)
+        self._update_task_status_text(node)
         self._apply_task_lock(True)
 
-    def _update_task_banner(self, node) -> None:
+    def _update_task_status_text(self, node) -> None:
         """Assemble the running task's one-line progress text for the persistent status strip
         (its display -- and its priority against a node error -- is _update_summary's job)."""
         row = self._running_task_row
@@ -7791,7 +7791,7 @@ class TaskConsole(QtWidgets.QWidget):
         frame = node.output.latest(self._task_mid_key)
         if frame is not None:
             self._task_card_frame = frame
-        self._update_task_banner(node)
+        self._update_task_status_text(node)
         # The mid-run panel refresh touches its figure on the GUI thread, so it may only run while
         # the render worker is idle (the worker never composes _task_card -- it is not in
         # self.cards -- but the full-hub snapshot + single-card render must not overlap a batch).
