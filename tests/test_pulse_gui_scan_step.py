@@ -70,12 +70,19 @@ class _StepSeq:
 
 
 def _scan_editor(seq):
-    """A headless PulseSequenceEditor with one scanned duration and a 4-point table (rows in µs)."""
+    """A headless PulseSequenceEditor with one scanned duration and a 4-point table.
+
+    A duration scan slot is stored in NANOSECONDS (``bind_field`` pins duration slots to ns so the
+    Scan tab, the card, and the compiler agree).  The rows must be whole device ticks: the editor
+    binds to the sequencer's clock at construction and re-snaps the state to that grid
+    (``state.snapped(device_step_ns)``), so a sub-tick value is not a legal scan point -- it would
+    snap up and silently merge with its neighbour.  ``_StepSeq`` is a 50 MHz device (20 ns tick), so
+    the table is multiples of 20 ns: point k's exposure = ``20 * (k + 1)`` ns."""
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
     st = PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"]))
     st.bind_field("duration", "0", unit="us", name="exposure")
-    st.set_scan_table([[10.0], [20.0], [30.0], [40.0]])
+    st.set_scan_table([[20.0], [40.0], [60.0], [80.0]])
     return PulseSequenceEditor(st, sequencer=seq)
 
 
@@ -96,7 +103,7 @@ def test_step_forward_from_hold_advances_and_reloads_single_point(_app):
 
     ed.scan_step_forward_button.click()                  # the REAL button wiring
     assert ed._held_scan_point[0] == 2                   # index advanced by one row
-    assert ed._held_scan_point[1] == [30.0]              # ...and remembers point 2's raw row
+    assert ed._held_scan_point[1] == [60.0]              # ...and remembers point 2's raw row (20*3 ns)
     assert len(seq.prepared) == n_prep + 1 and seq.fired == n_fire + 1   # a fresh prepare+fire
     payload = seq.prepared[-1]
     assert not payload.scan_table and not payload.scan_slots   # the reload is a STATIC single point
@@ -109,7 +116,7 @@ def test_step_back_from_hold_retreats_one_row(_app):
     ed = _scan_editor(seq)
     ed._stop_scan_to_current_point()                     # held at 2
     ed.scan_step_back_button.click()
-    assert ed._held_scan_point[0] == 1 and ed._held_scan_point[1] == [20.0]
+    assert ed._held_scan_point[0] == 1 and ed._held_scan_point[1] == [40.0]  # point 1 = 20*2 ns
 
 
 # ---- clamping at the table ends: no wrap-around AND no redundant reload --------------------------
@@ -152,7 +159,7 @@ def test_progress_label_shows_the_held_point_over_total_after_a_step(_app):
     ed.tabs.setCurrentWidget(ed.scan_tab)
     ed.scan_step_forward_button.click()                  # running -> stop+hold at point 2 (0-based)
     ed._poll_scan_progress()
-    assert ed.scan_progress_label.text() == "held at point 3/4: exposure = 30"
+    assert ed.scan_progress_label.text() == "held at point 3/4: exposure = 60"
 
 
 # ---- harmless without a sequencer / without a scan table -----------------------------------------

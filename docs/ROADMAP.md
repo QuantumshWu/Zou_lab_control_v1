@@ -96,10 +96,11 @@ notebook-first;子模块只经接口互联(解耦);无后向兼容;前端密封;
 
 ### B. 可 headless / 契约测试验证(下一轮硬骨头)
 - ~~**#7-secondary scan_table 载入覆盖损坏**~~ → **已修(`353e985`)**:`_apply_scan_source` 空缓存时用 `[]` 覆盖 scan_table,与 display 侧 `_refresh_scan_tab` 的空源回落规则分叉;现让 apply 侧同回落 + headless 回归测试。
+- ~~**#7-freeze 两 step 测试红**~~ → **非代码 bug,改测试数据**:`test_pulse_gui_scan_step` 两例在 handoff(`3f2e049`)起红、pre-handoff(`2bc6f8f`)绿。真因=handoff **正确**新增构造期硬件合法化 `state.snapped(device_step_ns)`(pulse_gui.py:1672:设备时钟≠`state.time_step_ns` 时把整个 state 重贴到设备格),而两测试用**亚 tick** 时长(10/30 ns 跑在 20 ns tick 设备上,物理不可运行)→ snap 上取整把相邻扫描点并成一个([10,20,30,40]→[20,20,40,40])。**真实 µs 扫描值(10000+ ns,皆 20 的倍数)构造期原样保留**(headless 复现证)。故代码正确=snap 是必须的整-tick 强制;测试数据历史遗留(pre-handoff 无构造期合法化才苟过),改为格对齐 [20,40,60,80] ns + 澄清注释,10 例全绿。
 - **shape 词汇双源(最大 DRY 收益)**:transport 用 `SignalSchema.point_shape`(单,signal_tensor.py:110),node/GUI 用 `SignalSpec.points_shape`(复,logic.py:113)+ stringly `structure` dict 横跨 ~199 处/27 文件;shape 派生数学在 `describe_shape`(logic.py)/`coerce_panel_value`(live.py:2311)/`SignalSchema` 各重打一遍。收敛成一套词汇 + 一个 `physical_shape` 校验,全量契约测试守。**大范围多文件,独立一轮。**
 - ~~**canonical shape 校验四处重打**~~ → **已收敛(`ac5334f`)**:提 `signal_tensor.canonical_physical_shape(r, point_shape, data_shape)`,`SignalSchema.physical_shape` + 四处 frontend 校验(live.coerce grid / data_figure._validate_signals / figure_viewer / task_console._validate_canonical_block)全走它,各留自己报错文案,93 测试守。
 - **schema-lifecycle 三处判定收敛**:register_signal(signals.py:267)/publish install loop(463)/logic._register_output_schemas(363),提 hub-internal `_install_schema_locked` + 把"only installer may replace"策略移进 hub(可让 node 丢掉 `_inherit_output_schema_ownership`)。
-- **pulse_table.from_dict 手搓反序列化**(pulse_table.py:2016-2038)→ 复用 timing/sequence.py 已用的 `require_*` helper 集。
+- ~~**pulse_table.from_dict 手搓反序列化**~~ → **已收敛(`3075075`)**:`from_dict` 复用 `_serialization.require_array/object/bool/int/number/string`;array/object/int 报错文案字节不变,name/scan_code/time_step/repeat_forever/repeat_start/end 走 helper 标准文案(无测试断言这些串);catalog/periods-nonempty/schema+version 语义校验留内联。
 - **DAC 有符号范围三源**:PortSpec.signed_range(ports.py:97)/bus_signed_range(pulse_table.py:57)/bus_signed_bounds(live.py:2509)→ 收敛到 topology 对象那一个。
 
 ### C. 收尾
