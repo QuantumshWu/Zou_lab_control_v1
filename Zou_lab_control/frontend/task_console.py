@@ -7004,17 +7004,29 @@ class TaskConsole(QtWidgets.QWidget):
             spec = specs.get(name)
             return spec.description if spec is not None else ""
 
+        def schema_of(key: str):
+            spec = specs.get(key)
+            if spec is None:
+                return None
+            try:
+                return spec.to_schema()
+            except Exception:
+                return None
+
         rows: list[tuple[str, str, str]] = []
         if getattr(node, "layer", "") == "task":
             buf = getattr(node, "output", None)
             for key in getattr(node, "mid_run", ()):
                 if key in ("progress", "stage"):          # progress %/text live on the banner
                     continue
-                rows.append((f"{key}{MID_RUN_TAG}", describe_shape(buf.latest(key) if buf else None), desc(key)))
+                value = buf.latest(key) if buf else None
+                # #12: feed the declared schema so a task signal renders the SAME `R × P × (data)`
+                # a measurement/processor signal does -- not the raw one-outer-paren fallback.
+                rows.append((f"{key}{MID_RUN_TAG}", self._describe_from_schema(value, schema_of(key)), desc(key)))
             result = getattr(node, "result", None) or {}
             for key in getattr(node, "provides", ()):
                 value = result.get(key) if isinstance(result, dict) else None
-                rows.append((f"{key} (result)", describe_shape(value), desc(key)))
+                rows.append((f"{key} (result)", self._describe_from_schema(value, schema_of(key)), desc(key)))
             return rows
         # published_signals() are HUB names (incl. the node's disambiguating prefix when two
         # nodes would collide).  Show the SHORT natural name (strip the prefix) -- "rate", not
@@ -7025,12 +7037,9 @@ class TaskConsole(QtWidgets.QWidget):
         for full in sorted(node.published_signals()):
             short = strip_node_prefix(full, pfx)             # ONE rule, shared with the picker nest
             try:
-                schema = self.hub.schema(full)
-                ps, ds = schema.point_shape, schema.data_shape
-                gs = tuple(schema.metadata.get("grid_shape", ()))
-                if not gs and len(ps) == 2:
-                    gs = tuple(ps)
-                shape = describe_shape(self.hub.latest(full), points_shape=ps, data_shape=ds, grid_shape=gs)
+                # SAME schema-driven formatter as the task branch (#12): a hub signal and a task
+                # output of the same logical shape render byte-identically -- no drift possible.
+                shape = self._describe_from_schema(self.hub.latest(full), self.hub.schema(full))
             except Exception:
                 shape = "—"
             rows.append((short, shape, desc(full)))
@@ -7160,6 +7169,24 @@ class TaskConsole(QtWidgets.QWidget):
             "ring": int(schema.repeat_capacity or 1),
             "metadata": metadata,
         }
+
+    def _describe_from_schema(self, value, schema) -> str:
+        """The ONE declared-shape string for any legend/picker row.  Projects a ``SignalSchema``
+        through :meth:`_schema_structure` (the single grid rule) and renders it in the canonical
+        ``R × P × (data)`` grammar, so a TASK output, a hub signal, a running node and a
+        not-yet-published declared signal ALL read identically -- never the raw ``(R×P×data)``
+        one-outer-paren spelling ``describe_shape`` falls back to when a caller forgets the schema
+        (issue #12: calibration / mot-field task rows).  A canonical block's leading axis is R;
+        with no value yet, R is the schema's declared repeat capacity.  No schema -> the raw
+        value-only ``describe_shape`` (a scalar result still reads ``scalar``)."""
+        from Zou_lab_control.neutral_atom.operations.logic import contract_shape_label, describe_shape
+        if schema is None:
+            return describe_shape(value)
+        st = self._schema_structure(schema)
+        ps, ds, gs = st["points_shape"], st["data_shape"], st["grid_shape"]
+        if value is not None:
+            return describe_shape(value, points_shape=ps, data_shape=ds, grid_shape=gs)
+        return contract_shape_label(int(st["ring"] or 1), ps, ds, gs)
 
     def _task_mid_run_spec(self):
         """The declared ``SignalSpec`` behind the running task panel's reserved source."""

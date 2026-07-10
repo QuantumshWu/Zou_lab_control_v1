@@ -40,6 +40,49 @@ def test_describe_shape_standardizes_straight_from_the_value():
     assert describe_shape(None) == "—"                         # no value yet
 
 
+def test_contract_shape_label_is_the_single_grammar():
+    """The canonical ``R × P × (data)`` spelling lives in ONE place (contract_shape_label), and
+    describe_shape's value-driven contract branch delegates to it -- so a value-present render and a
+    schema-only render of the same logical shape can never diverge (issue #12)."""
+    from Zou_lab_control.neutral_atom.operations.logic import contract_shape_label, describe_shape
+
+    assert contract_shape_label(1, (1,), (1200, 1920)) == "1 × 1 × (1200×1920)"
+    assert contract_shape_label(1, (5, 5, 5), (1,)) == "1 × 5×5×5 × (1)"
+    assert contract_shape_label(5, (4, 5), (1,), (4, 5)) == "5 × 4×5 × (1)"
+    # a real canonical block routes through the SAME label
+    assert describe_shape(np.zeros((1, 1, 1200, 1920)), points_shape=(1,), data_shape=(1200, 1920)) \
+        == contract_shape_label(1, (1,), (1200, 1920))
+
+
+def test_task_and_hub_signals_of_same_shape_render_identically():
+    """#12: a TASK output (calibration / mot-field) and a measurement/processor signal of the same
+    logical shape render the IDENTICAL ``R × P × (data)`` string -- never the raw one-outer-paren
+    ``(R×P×data)`` the task legend used to emit when it forgot the declared schema.  The value-less
+    declared form (before the first publish) equals the value-present form."""
+    pytest.importorskip("PyQt5")
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub, SignalSchema
+    ensure_qt_app()
+
+    console = TaskConsole(hub=SignalHub(), state=default_console_state())
+    console._timer.stop()
+    try:
+        # mot-field 3-D scan grid and cali single-shot frame, as their TaskOutput declares them
+        grid = SignalSchema(point_shape=(5, 5, 5), data_shape=(1,), dtype=np.float64, repeat_capacity=1)
+        frame = SignalSchema(point_shape=(1,), data_shape=(1200, 1920), dtype=np.float64, repeat_capacity=1)
+        assert console._describe_from_schema(None, grid) == "1 × 5×5×5 × (1)"
+        assert console._describe_from_schema(np.zeros((1, 125, 1)), grid) == "1 × 5×5×5 × (1)"
+        assert console._describe_from_schema(None, frame) == "1 × 1 × (1200×1920)"
+        assert console._describe_from_schema(np.zeros((1, 1, 1200, 1920)), frame) == "1 × 1 × (1200×1920)"
+        # a value with no schema still falls back to the raw spelling (only path that keeps outer paren)
+        assert console._describe_from_schema(np.zeros((1, 125, 1)), None) == "(1×125×1)"
+    finally:
+        console.shutdown()
+
+
 def test_console_signal_formats_are_the_real_hub_array_shapes():
     pytest.importorskip("PyQt5")
     import os

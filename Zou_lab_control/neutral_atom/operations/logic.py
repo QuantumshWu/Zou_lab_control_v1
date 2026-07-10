@@ -194,6 +194,18 @@ def format_dims(dims) -> str:
     return "×".join(parts) if parts else "1"
 
 
+def contract_shape_label(repeat, points_shape, data_shape, grid_shape=None) -> str:
+    """The ONE spelling of the canonical ``repeat × points × (data)`` contract shape.  A ``grid_shape``
+    reshapes ONLY the swept points (never the data), and only when it divides them (:func:`grid_for_points`).
+    Shared by :func:`describe_shape` (value-driven, R = the real block's leading axis) and the console's
+    schema-driven declared path (R = the schema's repeat capacity), so a signal reads IDENTICALLY whether
+    a value is buffered yet -- the grammar literal lives here alone and can never drift between surfaces."""
+    ps = tuple(int(n) for n in (points_shape or ()))
+    ds = tuple(int(n) for n in (data_shape or ()))
+    gs = grid_for_points(grid_shape, ps)
+    return f"{int(repeat)} × {format_dims(gs or ps)} × ({format_dims(ds)})"
+
+
 def describe_shape(value, *, points_shape=None, data_shape=None, grid_shape=None) -> str:
     """A standardized shape string read straight from a published VALUE -- the SINGLE
     way the GUI says what a signal looks like, AUTO-EXTRACTED from real data rather
@@ -219,8 +231,7 @@ def describe_shape(value, *, points_shape=None, data_shape=None, grid_shape=None
     if ps and dsh and len(shape) == 2 + len(dsh) \
             and shape[1] == int(np.prod(ps, dtype=np.int64)) \
             and tuple(shape[2:]) == dsh:
-        gs = grid_for_points(grid_shape, ps)   # ONE rule: a grid shows only when it divides the points
-        return f"{shape[0]} × {format_dims(gs or ps)} × ({format_dims(dsh)})"   # R × P × data_shape
+        return contract_shape_label(shape[0], ps, dsh, grid_shape)   # R × P × (data), one grammar
     # Raw shape (schema unknown): the SAME ``×`` spelling as the contract form and the flow-graph
     # labels -- never the numpy-tuple ``(96, 128)`` that made the same signal read two different ways.
     return f"({format_dims(shape)})"
