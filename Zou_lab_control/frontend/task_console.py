@@ -2075,7 +2075,11 @@ class PanelCard(FluentGroupBox):
                 self.selection_action_combo = FluentComboBox()
                 self.selection_action_combo.addItem("select only", "none")
                 self.selection_action_combo.addItem("fit", "fit")
-                if any(model.family == "2d" for model in models):
+                # ROI = a RECTANGLE crop, meaningful only where BOTH axes are spatial (an image) -- gate it
+                # on the ONE spatial predicate every Edit surface keys off (_card_y_is_view_axis), not an
+                # ad-hoc scan of the fit-model families, so an image CELL grid offers it and a 1d/hist does
+                # not, from the same single source that gates the y-range pin and the drag->ROI chain (5035).
+                if _card_y_is_view_axis(self):
                     self.selection_action_combo.addItem("ROI", "roi")
                 action = str(self.config.params.get("selection_action") or "none")
                 action_index = self.selection_action_combo.findData(action)
