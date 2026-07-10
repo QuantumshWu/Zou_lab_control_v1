@@ -1960,19 +1960,24 @@ _WIRE_ARRAY_FIELDS_PROGRAM = ("scan_points", "scan_point_durations")
 
 
 def encode_wire_payload(data: Mapping[str, object], array_fields: Sequence[str]) -> tuple[str, tuple]:
-    """Split ``array_fields`` out of a JSON-safe timing dict into raw ndarray buffers + JSON the rest.
+    """Split only NON-EMPTY ``array_fields`` out of a JSON-safe timing dict into raw ndarray buffers,
+    JSON the rest.
 
     Returns ``(head_json, blobs)`` where ``blobs`` is a TUPLE of ``(field, raw_bytes, shape, dtype)``
     -- a tuple (not a dict) so RPyC transfers it BY VALUE (brine serialises tuple/bytes/str/int; a
-    dict would netref).  An absent or empty field is simply left out (a no-scan pulse carries none)."""
-    head = {key: value for key, value in data.items() if key not in array_fields}
+    dict would netref).  An empty or absent array field STAYS in the JSON head (as ``[]``), so the
+    decoded payload is byte-for-byte the all-JSON payload -- a no-scan program/table still carries its
+    ``scan_points`` / ``scan_point_durations`` / ``scan_table`` keys and passes the strict exact-field
+    decoder, instead of being silently dropped (only large non-empty arrays take the binary fast path)."""
+    array_field_set = set(array_fields)
+    head: dict[str, object] = {}
     blobs = []
-    for field in array_fields:
-        value = data.get(field)
-        if value is None or (hasattr(value, "__len__") and len(value) == 0):
-            continue
-        arr = np.asarray(value)
-        blobs.append((field, arr.tobytes(), tuple(int(s) for s in arr.shape), arr.dtype.str))
+    for key, value in data.items():
+        if key in array_field_set and value is not None and hasattr(value, "__len__") and len(value) != 0:
+            arr = np.asarray(value)
+            blobs.append((key, arr.tobytes(), tuple(int(s) for s in arr.shape), arr.dtype.str))
+        else:
+            head[key] = value
     return json.dumps(head), tuple(blobs)
 
 
