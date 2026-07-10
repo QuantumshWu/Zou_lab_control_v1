@@ -21,6 +21,7 @@ from .canvas import FigureSpec, configure_canvas, create_axes_fixed, create_axes
 from .selectors import AreaSelector, CrossSelector, DragHLine, DragVLine, InteractionBundle, PlotState, ZoomPan, attach_interaction
 from Zou_lab_control._readout_math import confidence_weighted_fidelity, finite_mean
 from ..neutral_atom.core.fitting import fit_histogram
+from ..neutral_atom.core.signal_tensor import canonical_physical_shape
 from .style import (
     DESIGN_DPI,
     HIST_FILL_ALPHA,
@@ -2321,7 +2322,7 @@ def coerce_panel_value(kind, value, *, structure=None, params=None, repeat_mode=
         ds = tuple(int(n) for n in arr.shape) or (1,)
     points = int(np.prod(ps, dtype=np.int64))
     if kind == "grid":
-        expected = (int(arr.shape[0]), points, *ds)
+        expected = canonical_physical_shape(arr.shape[0], ps, ds)
         if external or tuple(arr.shape) != expected:
             raise ValueError(
                 "grid panels require a registered canonical (R,P,*data_shape) signal; "

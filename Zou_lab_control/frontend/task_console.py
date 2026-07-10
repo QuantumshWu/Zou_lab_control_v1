@@ -3376,11 +3376,13 @@ class PanelCard(FluentGroupBox):
 
     @staticmethod
     def _validate_canonical_block(value, structure, name="signal") -> np.ndarray:
+        from ..neutral_atom.core.signal_tensor import canonical_physical_shape
         array = np.asarray(value)
         point_shape = tuple(int(n) for n in structure["points_shape"])
         data_shape = tuple(int(n) for n in structure["data_shape"])
-        points = int(np.prod(point_shape, dtype=np.int64))
-        expected_tail = (points, *data_shape)
+        # (points, *data_shape) = the per-slice tail of the ONE canonical (R,P,*data) shape (single source).
+        expected_tail = canonical_physical_shape(1, point_shape, data_shape)[1:]
+        points = expected_tail[0]
         if array.ndim != 1 + len(expected_tail) or tuple(array.shape[1:]) != expected_tail:
             raise ValueError(
                 f"signal {name!r} violates its canonical schema: expected (R,{points},"

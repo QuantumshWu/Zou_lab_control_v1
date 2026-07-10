@@ -57,6 +57,7 @@ from PyQt5 import QtCore, QtWidgets
 
 from Zou_lab_control._paths import display_path
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
+from Zou_lab_control.neutral_atom.core.signal_tensor import canonical_physical_shape
 from Zou_lab_control.neutral_atom.operations.logic import LogicNode, SignalSpec
 
 from .data_figure import SavedFigure, load_figure
@@ -255,7 +256,7 @@ class LoadedFigureNode(LogicNode):
                 raise ValueError(
                     f"saved signal {name!r} must be a canonical (R,P,*data_shape) tensor; "
                     f"got {block.shape}.")
-            expected = (int(block.shape[0]), int(np.prod(ps, dtype=np.int64)), *ds)
+            expected = canonical_physical_shape(block.shape[0], ps, ds)
             if tuple(block.shape) != expected:
                 raise ValueError(
                     f"saved signal {name!r} must be canonical (R,P,*data_shape) {expected}; "

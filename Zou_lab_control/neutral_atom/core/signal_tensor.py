@@ -94,6 +94,19 @@ def _metadata_fingerprint(value):
     return value
 
 
+def canonical_physical_shape(repeat, point_shape, data_shape) -> tuple[int, ...]:
+    """The ONE canonical physical block shape ``(R, prod(point_shape), *data_shape)``.
+
+    A signal's stored/published array is always this rank-``2+len(data_shape)`` tensor: a repeat axis,
+    ONE flattened point axis, then the per-point data axes.  Both :meth:`SignalSchema.physical_shape`
+    (schema-side) and every frontend validator that checks ``block.shape == (R, P, *data_shape)`` derive
+    it HERE, so the formula (in particular ``prod`` over the point axes) lives in exactly one place and a
+    validator on the GUI side can never disagree with the transport on what "canonical" means."""
+    return (int(repeat),
+            int(np.prod(point_shape, dtype=np.int64)),
+            *(int(d) for d in data_shape))
+
+
 @dataclass(frozen=True)
 class SignalSchema:
     """Authoritative axes and meaning of one signal.
@@ -147,7 +160,7 @@ class SignalSchema:
         if self.repeat_capacity is not None and int(r) > self.repeat_capacity:
             raise ValueError(
                 f"repeat size {r} exceeds schema repeat_capacity {self.repeat_capacity}.")
-        return (int(r), self.point_count, *self.data_shape)
+        return canonical_physical_shape(r, self.point_shape, self.data_shape)
 
     def logical_shape(self, repeat: int) -> tuple[int, ...]:
         """Axis-aware shape: ``(R, *point_shape, *data_shape)``."""

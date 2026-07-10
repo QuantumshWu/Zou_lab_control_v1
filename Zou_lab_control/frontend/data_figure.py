@@ -20,6 +20,7 @@ from ..neutral_atom.core.fitting import (
 )
 from ..neutral_atom.core.raster import RegularRaster
 from ..neutral_atom.core.selection import Selection, SelectedData, select_rows
+from ..neutral_atom.core.signal_tensor import canonical_physical_shape
 
 from .style import PALETTE, small_fontsize
 
@@ -176,7 +177,7 @@ def _validate_signals(value: object) -> dict[str, dict[str, Any]]:
         points_shape = _strict_shape(entry["points_shape"], f"saved signal {signal_name!r}.points_shape")
         data_shape = _strict_shape(entry["data_shape"], f"saved signal {signal_name!r}.data_shape")
         block = _strict_numeric_array(entry["block"], f"saved signal {signal_name!r}.block")
-        expected = (int(block.shape[0]), int(np.prod(points_shape, dtype=np.int64)), *data_shape)
+        expected = canonical_physical_shape(block.shape[0], points_shape, data_shape)
         if tuple(block.shape) != expected:
             raise ValueError(
                 f"saved signal {signal_name!r}.block must be canonical (R,P,*data_shape) {expected}; "
