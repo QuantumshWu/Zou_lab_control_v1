@@ -283,6 +283,10 @@ def threshold_line_kwargs(linewidth: float = 1.9) -> dict[str, Any]:
 # so the two can never drift to different opacities.
 HIST_FILL_ALPHA = 0.4
 
+#: While a fit overlay is drawn the data lines dim to this so the fit curve reads clearly; clearing
+#: the fit restores each line's ORIGINAL alpha (the single source both halves of the overlay use).
+FIT_DIM_ALPHA = 0.5
+
 
 def bimodal_fit_line_specs() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """``ax.plot`` style kwargs for the THREE bimodal fit curves (left / right / total), in that

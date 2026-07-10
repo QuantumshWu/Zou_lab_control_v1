@@ -22,7 +22,7 @@ from ..neutral_atom.core.raster import RegularRaster
 from ..neutral_atom.core.selection import Selection, SelectedData, select_rows
 from ..neutral_atom.core.signal_tensor import canonical_physical_shape
 
-from .style import PALETTE, small_fontsize
+from .style import FIT_DIM_ALPHA, PALETTE, small_fontsize
 
 # 2D "center" fit overlay sizing (a centre DOT + the fitted-radius RING -- the pairing is fixed).  The
 # dot is an ABSOLUTE-size locator (scatter ``s`` is points^2, independent of the axes scale), so it must
@@ -818,10 +818,7 @@ class DataFigure:
             self.text.remove()
             self.text = None
 
-        lines = getattr(self.live_plot, "lines", None) if self.live_plot is not None else self._ax.lines
-        for line in lines:
-            if hasattr(line, "set_alpha"):
-                line.set_alpha(0.5)
+        self._dim_data_lines()
         if self.plot_type == "1D" and len(self.data_y) < 2000:
             self._line_to_scatter()
         # No draw here: the rendering adapter places the fit curve immediately after and
@@ -932,11 +929,35 @@ class DataFigure:
                     pass
             self._fit_artists = None
         self._scatter_to_line()
-        lines = getattr(self.live_plot, "lines", None) if self.live_plot is not None else self._ax.lines
-        for line in lines:
-            if hasattr(line, "set_alpha"):
-                line.set_alpha(1)
+        self._restore_data_lines()
         self.fig.canvas.draw_idle()
+
+    def _fit_overlay_lines(self):
+        """The persistent data Line2D objects the fit overlay dims/restores (the plot's live lines,
+        or this figure's own axis lines for a standalone DataFigure) -- the ONE list both halves use."""
+        return getattr(self.live_plot, "lines", None) if self.live_plot is not None else self._ax.lines
+
+    def _dim_data_lines(self) -> None:
+        """DIM half of the fit overlay: fade the data lines to ``style.FIT_DIM_ALPHA`` so the fit curve
+        reads clearly, recording each line's ORIGINAL alpha ONCE (a per-tick re-dim must not capture the
+        already-dimmed value as the 'original')."""
+        for line in self._fit_overlay_lines():
+            if not hasattr(line, "set_alpha"):
+                continue
+            if not hasattr(line, "_zlc_fit_pre_alpha"):
+                line._zlc_fit_pre_alpha = line.get_alpha()
+            line.set_alpha(FIT_DIM_ALPHA)
+
+    def _restore_data_lines(self) -> None:
+        """RESTORE half: put each data line back to the ORIGINAL alpha the dim recorded (the user's exact
+        opacity), then drop the sentinel.  Same owner as the dim, so a fit clear can never leave data dimmed."""
+        for line in self._fit_overlay_lines():
+            if not hasattr(line, "set_alpha"):
+                continue
+            original = getattr(line, "_zlc_fit_pre_alpha", None)
+            line.set_alpha(1.0 if original is None else original)
+            if hasattr(line, "_zlc_fit_pre_alpha"):
+                del line._zlc_fit_pre_alpha
 
     def _line_to_scatter(self) -> None:
         if self.plot_type != "1D" or self._scatter_list:

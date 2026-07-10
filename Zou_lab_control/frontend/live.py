@@ -1238,7 +1238,9 @@ class BaseLivePlot:
         request = getattr(self, "_fit_request", None)
         ax = getattr(self, "ax", None)
         if not request or ax is None:
-            # fit cleared / never set: drop any stale curve + cache key (so a re-enable always re-fits).
+            # fit cleared / never set: drop any stale curve + cache key (so a re-enable always re-fits)
+            # AND restore the data lines' ORIGINAL alpha through the ONE overlay owner (DataFigure.clear),
+            # so turning a fit off never leaves the data dimmed (#5).
             for art in getattr(self, "_general_fit_artists", []):
                 try:
                     art.remove()
@@ -1247,6 +1249,8 @@ class BaseLivePlot:
             self._general_fit_artists = []
             self._general_fit_key = None
             self._last_fit_result = None
+            if ax is not None:
+                self.to_data_figure().clear()
             return
         key = (self._fit_data_fingerprint(), repr(sorted(dict(request).items())))
         arts = getattr(self, "_general_fit_artists", [])
@@ -5604,6 +5608,10 @@ class GridPlot(BaseLivePlot):
             except Exception:
                 pass                       # already gone (an axes-clear redraw wiped it) -- fine
         if request is None:
+            # No fit for this cell: route the clear through the ONE primitive (apply_fit_to_figure ->
+            # df.clear) so the cell's data-line alpha is restored by the same overlay owner that dimmed
+            # it -- never an early return that removes the curve but leaves the data faded (#5).
+            apply_fit_to_figure(df, None, is_display=is_display)
             return ()
         before = set(id(c) for c in ax.get_children())
         res = apply_fit_to_figure(df, request, is_display=is_display)
