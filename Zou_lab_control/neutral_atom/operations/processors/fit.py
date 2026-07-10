@@ -5,6 +5,14 @@ The processor is an adapter only: it preserves the input tensor's physical
 and publishes complete scalar result tensors.  A failed fit publishes NaN
 parameters plus explicit validity/quality/status fields; it never leaves stale
 values on the hub.
+
+The node is model-AGNOSTIC: it fits whatever 2-D model the request names and
+publishes THAT model's own parameters (``fit_<name>``) plus a fixed
+quality/validity suffix.  The published parameter keys therefore derive from the
+solved model's ``names`` (the single source), so the node name and its signals
+never lie -- a non-centre 2-D model would publish its own parameters, not a
+hardwired ``x0/y0/size`` centre layout.  The ``fit_`` prefix only namespaces the
+keys on the hub so a fitted parameter never collides with a raw signal.
 """
 
 from __future__ import annotations
@@ -21,14 +29,31 @@ from ..processor import ProcessorSpec
 from ..processor_registry import processor
 
 
-FIT_SPEC_NAME = "Fit center"
+FIT_SPEC_NAME = "Frame fit"
 FIT_STATUS_INVALID = np.int8(0)
 FIT_STATUS_OK = np.int8(1)
+
+#: The default image model.  Only a 2-D-family fit becomes a hub node, and ``center`` is the sole
+#: image model today, so the class-level ``provides`` derives from it.  A future 2-D model would
+#: publish ITS parameters through the same single-source derivation.
+_DEFAULT_MODEL = "center"
+#: Fixed quality/validity keys every frame fit publishes alongside the model's own parameters.
+_QUALITY_KEYS: tuple[str, ...] = ("fit_valid", "fit_rmse", "fit_r2", "fit_status", "fit_points")
+
+
+def _param_keys(model) -> tuple[str, ...]:
+    """The ``fit_<name>`` hub keys for a model's parameters -- derived from ``FitModel.names``
+    (the single source), never a hand-typed centre layout."""
+    return tuple(f"fit_{name}" for name in fit_model(model).names)
+
+
+def _provided_keys(model) -> tuple[str, ...]:
+    return _param_keys(model) + _QUALITY_KEYS
 
 
 def _request(value=None) -> FitRequest:
     if value is None or value == "":
-        return FitRequest("center")
+        return FitRequest(_DEFAULT_MODEL)
     if isinstance(value, FitRequest):
         request = value
     elif isinstance(value, str):
@@ -38,18 +63,17 @@ def _request(value=None) -> FitRequest:
     else:
         raise TypeError("fit request must be FitRequest, mapping, model key, or None")
     if fit_model(request.model).family != "2d":
-        raise ValueError("Fit center consumes image data and therefore requires a 2D fit model")
+        raise ValueError("Frame fit consumes image data and therefore requires a 2D fit model")
     return request
 
 
 class FitProcessor(Processor):
     """Fit every valid image cell in a canonical ``(R,P,H,W)`` signal."""
 
-    node_label = "fit"
-    provides = (
-        "fit_x0", "fit_y0", "fit_amplitude", "fit_size", "fit_offset",
-        "fit_valid", "fit_rmse", "fit_r2", "fit_status", "fit_points",
-    )
+    node_label = "frame fit"
+    #: Class-level default (the ``center`` model); the instance derives its actual keys from the
+    #: request's model so ``transform`` / ``_bare_output_specs`` / ``provides`` are one source.
+    provides = _provided_keys(_DEFAULT_MODEL)
 
     def __init__(self, hub, *, source_expr=None, fit_request=None, prefix: str = ""):
         expr = source_expr if isinstance(source_expr, SignalExpr) else SignalExpr.from_value(source_expr)
@@ -96,17 +120,15 @@ class FitProcessor(Processor):
         value = self.source_expr.evaluate(hub_namespace(self.hub, inputs))
         block, input_valid, _point_shape, _repeat_capacity = self._input_contract(value)
         shape = (*block.shape[:2], 1)
+        request = self.fit_request
+        names = fit_model(request.model).names        # the ONE source for the published parameter keys
         outputs = {
             name: np.full(shape, np.nan, dtype=np.float64)
-            for name in (
-                "fit_x0", "fit_y0", "fit_amplitude", "fit_size", "fit_offset",
-                "fit_rmse", "fit_r2", "fit_points",
-            )
+            for name in (*_param_keys(request.model), "fit_rmse", "fit_r2", "fit_points")
         }
         outputs["fit_valid"] = np.zeros(shape, dtype=np.bool_)
         outputs["fit_status"] = np.full(shape, FIT_STATUS_INVALID, dtype=np.int8)
 
-        request = self.fit_request
         results: list[FitResult] = []
         for repeat, point in np.ndindex(block.shape[:2]):
             if input_valid[repeat, point]:
@@ -117,11 +139,8 @@ class FitProcessor(Processor):
                     coordinate_frame=request.coordinate_frame)
             results.append(result)
             params = result.parameter_map()
-            outputs["fit_x0"][repeat, point, 0] = params.get("x0", np.nan)
-            outputs["fit_y0"][repeat, point, 0] = params.get("y0", np.nan)
-            outputs["fit_amplitude"][repeat, point, 0] = params.get("amplitude", np.nan)
-            outputs["fit_size"][repeat, point, 0] = abs(params.get("radius", np.nan))
-            outputs["fit_offset"][repeat, point, 0] = params.get("offset", np.nan)
+            for name in names:                          # publish each fitted parameter under fit_<name>
+                outputs[f"fit_{name}"][repeat, point, 0] = params.get(name, np.nan)
             outputs["fit_valid"][repeat, point, 0] = result.valid
             outputs["fit_rmse"][repeat, point, 0] = result.quality.get("rmse", np.nan)
             outputs["fit_r2"][repeat, point, 0] = result.quality.get("r2", np.nan)
@@ -140,18 +159,19 @@ class FitProcessor(Processor):
         points, repeat_capacity = self._result_shape()
         common = {"points_shape": points, "data_shape": (1,),
                   "repeat_capacity": repeat_capacity}
+        model = fit_model(self.fit_request.model)
+        # One SignalSpec per fitted parameter -- name + description derive from the model (single
+        # source), so the published signals describe whatever model is fit, not a fixed centre layout.
+        param_specs = [
+            SignalSpec(f"fit_{name}", f"fit {name}", "",
+                       f"Fitted {model.formula} parameter {name}.", dtype=np.float64, **common)
+            for name in model.names
+        ]
         return (
-            SignalSpec("fit_x0", "fit x0", "px", "Fitted centre x.", dtype=np.float64, **common),
-            SignalSpec("fit_y0", "fit y0", "px", "Fitted centre y.", dtype=np.float64, **common),
-            SignalSpec("fit_amplitude", "fit amplitude", "counts", "Fitted peak height.",
-                       dtype=np.float64, **common),
-            SignalSpec("fit_size", "fit size", "px", "Fitted Gaussian radius.",
-                       dtype=np.float64, **common),
-            SignalSpec("fit_offset", "fit offset", "counts", "Fitted background.",
-                       dtype=np.float64, **common),
+            *param_specs,
             SignalSpec("fit_valid", "fit valid", "", "1 when the selected fit converged.",
                        dtype=np.bool_, **common),
-            SignalSpec("fit_rmse", "fit RMSE", "counts", "Root mean squared residual.",
+            SignalSpec("fit_rmse", "fit RMSE", "", "Root mean squared residual.",
                        dtype=np.float64, **common),
             SignalSpec("fit_r2", "fit R²", "", "Coefficient of determination.",
                        dtype=np.float64, **common),
@@ -163,10 +183,10 @@ class FitProcessor(Processor):
 
 
 @processor(order=26)
-def fit_center(readout) -> ProcessorSpec:
-    """Fit the shared 2-D Gaussian centre model to every image tensor cell."""
+def frame_fit(readout) -> ProcessorSpec:
+    """Fit the request's 2-D model (default: Gaussian centre) to every image tensor cell."""
 
-    default_request = FitRequest("center").to_dict()
+    default_request = FitRequest(_DEFAULT_MODEL).to_dict()
     params = (
         ParamDecl("source", "Frame source", "signal_expr",
                   default={"inputs": [FRAME_0], "source": "value = signal"},
@@ -185,10 +205,10 @@ def fit_center(readout) -> ProcessorSpec:
         make_node=make_node,
         result_keys=FitProcessor.provides,
         default_kind="monitor",
-        default_value_key="fit_x0",
+        default_value_key="fit_x0",   # the default ``center`` model's fitted centre x
     )
 
 
 __all__ = [
-    "FIT_SPEC_NAME", "FIT_STATUS_INVALID", "FIT_STATUS_OK", "FitProcessor", "fit_center",
+    "FIT_SPEC_NAME", "FIT_STATUS_INVALID", "FIT_STATUS_OK", "FitProcessor", "frame_fit",
 ]
