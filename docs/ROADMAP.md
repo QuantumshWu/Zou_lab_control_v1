@@ -96,7 +96,7 @@ notebook-first;子模块只经接口互联(解耦);无后向兼容;前端密封;
 
 ### A. 需真显示器 + 用户具体复现态才能定位(headless 穷尽排除,不盲改)
 - **#4 cbar 颜色柱某些情况没填满框**:**穷尽排查、无法复现**——solids 填充率在以下每条路径 + 每种模式都精确 100%:静态 / clim 拖拽(`DragHLine.on_motion` selectors.py:536 走 `draw_idle()` 全画重建 colorbar)/ cmap 切换 / 平坦帧 / live update / **真实嵌入式 `_zlc_embedded` canvas grab 的 PNG 视觉确认满填** / `seed_clim`(grid 放大格)/ `relim_mode=fixed` / 部分扫描(NaN 格)。根因:`image.set_clim` 同步 cax ylim + solids QuadMesh 几何,故 blit(solids 在 `cax.collections` 每 tick 重画)与全画都对齐。**给一个每路径都满填的视觉 bug 盲发"修复"会破坏当前正确行为**,故不改。残余可能:真显示器特定 DPR 交互 / 某个我没构造到的特定数据×模式×交互时序 / 已被更早改动修掉。下一轮需**用户提供确切复现态(哪种面板 kind、relim 模式、数据、触发的操作序列)+ 真显示器逐帧**才能钉。
-- **#6 余项 hist 无框选 fit/crop**:fit 对 1d/2d/sites/monitor/grid 已在;`_kind_offers_general_fit('hist')=False` 是**有意**(hist 的 fit=自带 bimodal 旋钮 none/single/double,不叠通用峰模型)。真缺口=`PanelCard._build_settings` 的 selection-action 组合框整段在 `if models:` 内(task_console.py:2049),hist(models=[])拿不到"框选→fit/crop"。修法:把组合框抬出 `if models:`;action=="fit" 时对 hist 路由到 bimodal 而非通用模型(`_apply_fit_selection` @7667 需按 kind 分派)。需真 hist 面板验证框选→bimodal 联动。
+- ~~**#6 余项 hist 无框选 fit/crop**~~ **已在 fit-architecture 重构里解决**:能力表 `live.general_fit_models(render_family)` 现在给 hist(render_family='1d')通用 1d 峰模型族,与其自带 bimodal 旋钮**并行**(不再 either/or);`_build_analysis_section` 的 action 组合框 `{none, curve fit, ROI}` 门槛改为 `models or _card_y_is_view_axis`(不再只 `if models:`),故任何 family 都能拿到对应的 Analysis 动作。fit 是否开启的唯一状态=`config.params['fit_request']` 是否存在;Setting/Edit 两处控件都从它派生。
 
 ### B. 可 headless / 契约测试验证(下一轮硬骨头)
 - ~~**#7-secondary scan_table 载入覆盖损坏**~~ → **已修(`353e985`)**:`_apply_scan_source` 空缓存时用 `[]` 覆盖 scan_table,与 display 侧 `_refresh_scan_tab` 的空源回落规则分叉;现让 apply 侧同回落 + headless 回归测试。
