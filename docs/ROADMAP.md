@@ -97,7 +97,7 @@ notebook-first;子模块只经接口互联(解耦);无后向兼容;前端密封;
 ### B. 可 headless / 契约测试验证(下一轮硬骨头)
 - ~~**#7-secondary scan_table 载入覆盖损坏**~~ → **已修(`353e985`)**:`_apply_scan_source` 空缓存时用 `[]` 覆盖 scan_table,与 display 侧 `_refresh_scan_tab` 的空源回落规则分叉;现让 apply 侧同回落 + headless 回归测试。
 - **shape 词汇双源(最大 DRY 收益)**:transport 用 `SignalSchema.point_shape`(单,signal_tensor.py:110),node/GUI 用 `SignalSpec.points_shape`(复,logic.py:113)+ stringly `structure` dict 横跨 ~199 处/27 文件;shape 派生数学在 `describe_shape`(logic.py)/`coerce_panel_value`(live.py:2311)/`SignalSchema` 各重打一遍。收敛成一套词汇 + 一个 `physical_shape` 校验,全量契约测试守。**大范围多文件,独立一轮。**
-- **canonical shape 校验四处重打**:task_console._validate_canonical_block(3378)/data_figure._validate_signals(179)/figure_viewer(258)/live.coerce grid(2322)→ 复用 core `signal_tensor.physical_shape`。
+- ~~**canonical shape 校验四处重打**~~ → **已收敛(`ac5334f`)**:提 `signal_tensor.canonical_physical_shape(r, point_shape, data_shape)`,`SignalSchema.physical_shape` + 四处 frontend 校验(live.coerce grid / data_figure._validate_signals / figure_viewer / task_console._validate_canonical_block)全走它,各留自己报错文案,93 测试守。
 - **schema-lifecycle 三处判定收敛**:register_signal(signals.py:267)/publish install loop(463)/logic._register_output_schemas(363),提 hub-internal `_install_schema_locked` + 把"only installer may replace"策略移进 hub(可让 node 丢掉 `_inherit_output_schema_ownership`)。
 - **pulse_table.from_dict 手搓反序列化**(pulse_table.py:2016-2038)→ 复用 timing/sequence.py 已用的 `require_*` helper 集。
 - **DAC 有符号范围三源**:PortSpec.signed_range(ports.py:97)/bus_signed_range(pulse_table.py:57)/bus_signed_bounds(live.py:2509)→ 收敛到 topology 对象那一个。
