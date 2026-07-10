@@ -36,6 +36,14 @@ from .sequence import (CLOCK_GRID_ATOL_TICKS as GRID_ATOL_STEPS,
                        READOUT_GAP_SECONDS,
                        PulseSequence, channel_names, positive_float, round_ticks)
 from .._serialization import require_exact_fields as _require_exact_fields
+from .._serialization import (
+    require_array,
+    require_bool,
+    require_int,
+    require_number,
+    require_object,
+    require_string,
+)
 from ..ports import PORT_CLOCK, PORT_DAC, PortCatalog
 
 
@@ -2016,26 +2024,20 @@ class PulseTableState:
         if not isinstance(catalog_payload, Mapping):
             raise ValueError("pulse table requires an embedded PortCatalog.")
         for key in ("scan_slots", "scan_table", "api_slots", "periods", "visible_ports"):
-            value = payload[key]
-            if not isinstance(value, (list, tuple)) or isinstance(value, (str, bytes)):
-                raise ValueError(f"pulse table {key} must be an ordered array")
+            require_array(payload[key], what=f"pulse table {key}")
         if not payload["periods"]:
             raise ValueError("pulse table periods must contain at least one period")
         for key in ("analog_bus_modes", "delays", "delay_units"):
-            if not isinstance(payload[key], Mapping):
-                raise ValueError(f"pulse table {key} must be an object")
-        if not isinstance(payload["name"], str) or not isinstance(payload["scan_code"], str):
-            raise ValueError("pulse table name and scan_code must be strings")
-        if isinstance(payload["time_step_ns"], bool) or not isinstance(payload["time_step_ns"], Number):
-            raise ValueError("pulse table time_step_ns must be numeric")
-        if type(payload["repeat_forever"]) is not bool:
-            raise ValueError("pulse table repeat_forever must be boolean")
+            require_object(payload[key], what=f"pulse table {key}")
+        require_string(payload["name"], what="pulse table name")
+        require_string(payload["scan_code"], what="pulse table scan_code")
+        require_number(payload["time_step_ns"], what="pulse table time_step_ns")
+        require_bool(payload["repeat_forever"], what="pulse table repeat_forever")
         for key in ("repeat_count", "scan_repeats"):
-            if type(payload[key]) is not int:
-                raise ValueError(f"pulse table {key} must be an integer")
+            require_int(payload[key], what=f"pulse table {key}")
         for key in ("repeat_start", "repeat_end"):
-            if payload[key] is not None and type(payload[key]) is not int:
-                raise ValueError(f"pulse table {key} must be an integer or null")
+            if payload[key] is not None:
+                require_int(payload[key], what=f"pulse table {key}")
         scan_slots = [
             slot if isinstance(slot, ScanSlot) else ScanSlot.from_dict(slot)
             for slot in payload["scan_slots"]
