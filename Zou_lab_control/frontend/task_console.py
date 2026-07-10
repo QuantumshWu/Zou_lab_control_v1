@@ -1508,7 +1508,7 @@ class PanelCard(FluentGroupBox):
                  structure_provider=None, short_names_provider=None,
                  live_namespace_provider=None, pulse_state_provider=None,
                  grid_recipe_provider=None, render_barrier=None, area_select_sink=None,
-                 fit_clear_sink=None):
+                 selection_clear_sink=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
         super().__init__(PANEL_KINDS[config.kind], parent)
@@ -1564,11 +1564,13 @@ class PanelCard(FluentGroupBox):
         # rectangle drawn on this LIVE image panel retargets/creates a RoiProcessor consuming
         # this panel's signal (the "draw a box -> get roi_frame/roi_value signals" gesture).
         self.area_select_sink = area_select_sink
-        # callable(card) -> the console's fit-teardown sink: clearing the fit (Clear button /
-        # unchecking live fit) STOPS + removes the FitProcessor this card's fit created, so
-        # ``fit_x0``/... stop publishing (the fit node has a full create-on-apply / remove-on-clear
-        # lifecycle, unlike a one-shot curve overlay).
-        self.fit_clear_sink = fit_clear_sink
+        # callable(card, action) -> the console's ONE selection-teardown sink, symmetric for BOTH
+        # selection actions (#10): leaving/clearing an action STOPS + removes the hub node that action
+        # created for this card's signal -- a FitProcessor for "fit" (unchecking live fit), a
+        # RoiProcessor for "roi" (switching the ROI selector off).  Both have a full create-on-apply /
+        # remove-on-clear lifecycle, so neither lingers as an orphan republishing after the operator
+        # turned its selection off.
+        self.selection_clear_sink = selection_clear_sink
         self.plotter = None
         self.canvas = None
         # The console header's "Selectors" switch state for THIS card (set via
@@ -3024,8 +3026,8 @@ class PanelCard(FluentGroupBox):
             toggle.blockSignals(True); toggle.setChecked(False); toggle.blockSignals(False)
         # Tear down the hub FitProcessor this card's fit created, so ``fit_x0``/... stop publishing --
         # clearing the overlay without stopping the node left fit_center republishing forever (#5).
-        if callable(self.fit_clear_sink):
-            self.fit_clear_sink(self)
+        if callable(self.selection_clear_sink):
+            self.selection_clear_sink(self, "fit")
         self._set_fit_result_text(None)
         label = getattr(self, "fit_result_label", None)
         if label is not None:
@@ -3041,7 +3043,16 @@ class PanelCard(FluentGroupBox):
         combo = getattr(self, "selection_action_combo", None)
         if combo is None:
             return
-        self.config.params["selection_action"] = str(combo.currentData() or "none")
+        old = str(self.config.params.get("selection_action") or "none")
+        new = str(combo.currentData() or "none")
+        if new == old:
+            return
+        self.config.params["selection_action"] = new
+        # Symmetric teardown (#10): LEAVING an action (roi/fit) STOPS + removes the hub node it
+        # created, so a RoiProcessor never keeps consuming after the operator switches the ROI
+        # selector off -- exactly what fit already did on Clear.  Route both through the ONE seam.
+        if old in ("roi", "fit") and callable(self.selection_clear_sink):
+            self.selection_clear_sink(self, old)
         self.changed.emit()
 
     def _set_param(self, key: str, value) -> None:
@@ -6549,7 +6560,7 @@ class TaskConsole(QtWidgets.QWidget):
             grid_recipe_provider=self._grid_recipe,
             short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace,
             render_barrier=self._render_loop.barrier, area_select_sink=self._on_panel_area_select,
-            fit_clear_sink=self._on_panel_fit_clear)
+            selection_clear_sink=self._on_panel_selection_clear)
 
     def _attach_card(self, card: PanelCard) -> None:
         card.setParent(self.board)
@@ -7679,19 +7690,24 @@ class TaskConsole(QtWidgets.QWidget):
         card.set_status(f"fit -> {cfg.title}" + ("" if started else " (start failed — see Logic tab)"),
                         error=not started)
 
-    def _on_panel_fit_clear(self, card: "PanelCard") -> None:
-        """Clearing a panel's fit tears down the FitProcessor that panel's fit created: STOP + REMOVE
-        every FitProcessor consuming this card's signal, so ``fit_x0``/... stop publishing.  The
-        symmetric other half of :meth:`_apply_fit_selection` -- fit is a full-lifecycle hub node
-        (create on apply, remove on clear), never an orphan that keeps republishing after the
-        operator turned it off (#5)."""
+    def _on_panel_selection_clear(self, card: "PanelCard", action: str) -> None:
+        """The ONE selection-teardown seam, symmetric for BOTH actions (#5 + #10): leaving/clearing a
+        panel's selection ACTION STOPS + REMOVES the hub node THAT action created for this card's
+        signal -- a FitProcessor for ``"fit"`` (``fit_x0``/... stop publishing), a RoiProcessor for
+        ``"roi"`` (``roi_frame``/``roi_value`` stop updating).  Neither is left an orphan republishing
+        after the operator turned its selection off; the old fit-only ``_on_panel_fit_clear`` had no
+        roi counterpart, so switching the ROI selector off left the RoiProcessor consuming forever."""
         signal = str(card.config.inputs[0]) if card.config.inputs else ""
         if not signal:
             return
         from ..neutral_atom.operations.processors.fit import FitProcessor
+        from ..neutral_atom.operations.processors.roi import RoiProcessor
+        target = {"fit": FitProcessor, "roi": RoiProcessor}.get(str(action))
+        if target is None:
+            return
         for row in list(self.logic_nodes):
             node = self._logic_nodes.get(id(row))
-            if isinstance(node, FitProcessor) and signal in tuple(node.consumes):
+            if isinstance(node, target) and signal in tuple(getattr(node, "consumes", ())):
                 self._remove_logic_node(row)
 
     def _apply_roi_selection(self, card: "PanelCard", selection) -> None:
