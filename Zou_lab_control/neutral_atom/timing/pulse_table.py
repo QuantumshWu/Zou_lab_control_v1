@@ -504,19 +504,30 @@ class PulseTableState:
     def n_points(self) -> int:
         return len(self.scan_table)
 
+    def _slot_row(self, point_index: int) -> list[float]:
+        """Native-unit values for one point -- the ONE source both slot_point and _slot_point_ns
+        read.  Uses the scan-table row, or each slot's nominal (the reference point, the field's
+        value when it was bound) when there is NO scan table, so a non-scan pulse's slot_point(0)
+        returns its nominal instead of indexing an empty table."""
+
+        if self.scan_table:
+            row = self.scan_table[int(point_index)]
+            return [float(row[index]) for index in range(len(self.scan_slots))]
+        return [float(slot.nominal) for slot in self.scan_slots]
+
     def slot_point(self, point_index: int) -> dict[str, float]:
         """Return one row keyed only by semantic scan-axis names."""
 
-        row = self.scan_table[int(point_index)]
-        return {slot.name: float(row[index]) for index, slot in enumerate(self.scan_slots)}
+        row = self._slot_row(point_index)
+        return {slot.name: row[index] for index, slot in enumerate(self.scan_slots)}
 
     def _slot_point_ns(self, point_index: int) -> dict[str, float]:
         """Return slot values converted to ns for time slots (dac slots pass through)."""
 
-        row = self.scan_table[int(point_index)]
+        row = self._slot_row(point_index)
         out: dict[str, float] = {}
         for index, slot in enumerate(self.scan_slots):
-            value = float(row[index])
+            value = row[index]
             if slot.is_time:
                 value *= UNITS_TO_NS.get(slot.unit, 1.0)
             out[slot_var(index)] = value
@@ -526,18 +537,11 @@ class PulseTableState:
         """Slot values for previewing/validating a non-scan render.
 
         Uses the first scan point if a table exists, else each slot's nominal
-        (the field's value when it was bound).  Time slots are returned in ns.
+        (the field's value when it was bound), via the shared :meth:`_slot_row`.
+        Time slots are returned in ns.
         """
 
-        if self.scan_table:
-            return self._slot_point_ns(0)
-        out: dict[str, float] = {}
-        for index, slot in enumerate(self.scan_slots):
-            value = float(slot.nominal)
-            if slot.is_time:
-                value *= UNITS_TO_NS.get(slot.unit, 1.0)
-            out[slot_var(index)] = value
-        return out
+        return self._slot_point_ns(0)
 
     def _read_field_nominal(self, kind: str, target: str, unit: str) -> float:
         """Read a field's current value (in ``unit``) before it is bound."""

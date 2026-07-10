@@ -150,17 +150,19 @@ def test_notebook_save_and_gui_save_capture_identically(tmp_path):
         plt.close("all")
 
 
-def test_unbound_plot_save_degrades_to_basic(tmp_path):
-    """A plot with NO source binding writes the basic figure + npz: no ``signals`` block, no device
-    ``provenance`` -- ONLY the minimal ``provenance['flow_graph']`` (``raw data -> plot``) every save
-    folds so the Flow tab always has a tree (the bare-plot contract of
-    ``test_flow_graph_provenance.test_bare_plot_save_folds_a_raw_flow_graph``)."""
+def test_unbound_plot_save_folds_self_contained_array_signals(tmp_path):
+    """A plot with NO source binding still folds its OWN x/y as typed ``value`` + ``x`` role signals
+    (so a reopen rebuilds typed data, not a flattened array -- the save contract "neither case
+    silently degrades to flattened arrays"), but with NO device ``provenance``: only the minimal
+    ``provenance['flow_graph']`` (``raw data -> plot``) every save folds so the Flow tab always has a
+    tree (the bare-plot contract of ``test_flow_graph_provenance.test_bare_plot_save_folds_a_raw_flow_graph``)."""
     from Zou_lab_control.frontend import load_figure, panel_plot
 
     p = panel_plot(np.arange(50.0), kind="hist", size="2x4", bins=10, title="bare")
     p.save(str(tmp_path / "bare.png"))
     info = load_figure(next(tmp_path.glob("bare*.npz"))).info
-    assert "signals" not in info, "no source binding -> no signals block"
+    assert {e.get("role") for e in info["signals"].values()} == {"value", "x"}, \
+        "an unbound save folds its own x/y as typed value+x signals (no device source)"
     assert info["provenance"] == {"flow_graph": figure_capture.raw_data_flow_graph()}, \
         "an unbound save carries ONLY the raw data -> plot flow graph, no device provenance"
     plt.close("all")
