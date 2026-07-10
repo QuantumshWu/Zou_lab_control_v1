@@ -133,7 +133,7 @@ def test_virtual_sync_records_source_payload():
     ``last_payload_json`` (with ``periods``) so the pulse GUI's Sync pulls it back -- no error,
     no silent 'nothing prepared'."""
     seqr = virtual.VirtualSequencer(sleep_scale=0.0)
-    state = na.build_release_recapture_pulse(channels=list(seqr.channels))
+    state = na.build_release_recapture_pulse(port_catalog=seqr.port_catalog)
     seqr.prepare(state)
     snap = seqr.snapshot()
     payload = snap.get("last_payload_json")
@@ -142,4 +142,4 @@ def test_virtual_sync_records_source_payload():
     import json
     from Zou_lab_control.neutral_atom.timing import PulseTableState
     restored = PulseTableState.from_dict(json.loads(payload))
-    assert list(restored.channels) == list(state.channels)
+    assert restored.port_catalog == state.port_catalog

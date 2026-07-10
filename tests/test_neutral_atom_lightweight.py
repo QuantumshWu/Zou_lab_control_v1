@@ -1,3 +1,4 @@
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 import matplotlib
 
 matplotlib.use("Agg")
@@ -183,7 +184,8 @@ def test_live_detection_scan_uses_frontend_session():
     exp = na.connect("virtual")
     exp.readout.sitemap(frames=4, display=False)
 
-    scan = exp.readout.detection_time([5e-6, 2e-5, 8e-5], shots=3, display=False, update_time=0.01)
+    scan = exp.readout.detection_time(
+        [5e-6, 2e-5, 8e-5, 2e-4], shots=3, display=False, update_time=0.01)
     assert scan.measurement is not None
     assert scan.plot is scan.measurement.plot
     assert scan.points_done >= 0
@@ -194,7 +196,8 @@ def test_live_detection_scan_uses_frontend_session():
     assert scan.data_figure is scan.plot.data_figure
     assert np.all(np.isfinite(scan.fidelities))
     assert scan.summary()["finished"] is True
-    fit_result, popt = scan.data_figure.decay(is_display=False)
+    fit_result = scan.data_figure.fit("decay", is_display=False)
+    popt = fit_result.popt
     assert fit_result.function == "decay"
     assert popt is not None
 
@@ -383,7 +386,7 @@ def test_fpga_pulse_streamer_rejects_runtime_edge_table_hazards():
             raise AssertionError(f"pulse-streamer validation should reject {expected}")
 
 
-def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkeypatch):
+def test_pulse_gui_launcher_uses_one_hardware_catalog(monkeypatch):
     monkeypatch.delenv("ZLC_PS_REMOTE_HOST", raising=False)
     root = Path(__file__).resolve().parents[1]
     spec = importlib.util.spec_from_file_location("zlc_root_pulse_gui_for_test", root / "pulse_gui.py")
@@ -397,36 +400,37 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
         xdc=root / "fpga" / "board_config" / "board.xdc",
         max_channel_count=62,
     )
-    subset_state = na.PulseTableState(
-        channels=["ch00", "ch03"],
+    channels = pulse_gui_launcher._resolve_channels(args, None)
+    labels = pulse_gui_launcher._resolve_channel_labels(args, channels, None)
+    target_catalog = PortCatalog.from_channels(channels, channel_labels=labels)
+
+    def states(*active):
+        return tuple(int(channel in active) for channel in channels)
+
+    state = na.PulseTableState(
+        port_catalog=target_catalog,
         periods=[
-            na.PulsePeriod(100, (1, 0), unit="ns"),
-            na.PulsePeriod(20, (1, 1), unit="ns"),
-            na.PulsePeriod(100, (0, 0), unit="ns"),
+            na.PulsePeriod(100, states("ch00"), unit="ns"),
+            na.PulsePeriod(20, states("ch00", "ch03"), unit="ns"),
+            na.PulsePeriod(100, states(), unit="ns"),
         ],
-        visible_channels=["ch00", "ch03"],
-        channel_labels={"ch00": "trap"},
+        visible_ports=["ch00", "ch03"],
         time_step_ns=20,
         repeat_forever=True,
     )
-
-    channels = pulse_gui_launcher._resolve_channels(args, subset_state)
-    aligned = subset_state.aligned_to_channels(channels)
-    program = aligned.compile(clock_hz=50_000_000)
+    program = state.compile(clock_hz=50_000_000)
 
     assert channels == [f"ch{i:02d}" for i in range(62)]
-    assert aligned.channels == channels
-    assert aligned.visible_channels == ["ch00", "ch03"]
-    assert all(period.states[1:3] == (0, 0) for period in aligned.periods)
+    assert state.port_catalog.fingerprint == target_catalog.fingerprint
+    assert state.visible_ports == ["ch00", "ch03"]
     assert max(program.masks) < (1 << 62)
-    labels = pulse_gui_launcher._resolve_channel_labels(args, channels, subset_state)
     pins = pulse_gui_launcher._resolve_channel_pins(args, channels)
     # The standalone pulse editor no longer resolves a trigger channel (the sequencer is a pure
     # streamer; the camera owns the capture-trigger line), but the emCCD line is still discoverable
     # from the XDC labels for a real camera's capture_trigger_channels.
     assert not hasattr(pulse_gui_launcher, "_resolve_trigger_channels")
     assert labels["ch11"] == "emCCD"
-    assert labels["ch00"] == "trap"
+    assert labels["ch00"] == "cooling"
     assert labels["ch03"] == "probe"
     assert labels["ch06"] == "trig"
     assert labels["ch11"] == "emCCD"
@@ -436,7 +440,7 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
     assert pins["ch11"] == "M13"
 
     explicit_args = types.SimpleNamespace(**{**args.__dict__, "channel_count": 4})
-    assert pulse_gui_launcher._resolve_channels(explicit_args, subset_state) == ["ch00", "ch01", "ch02", "ch03"]
+    assert pulse_gui_launcher._resolve_channels(explicit_args, state) == ["ch00", "ch01", "ch02", "ch03"]
 
     remote_args = types.SimpleNamespace(
         **{
@@ -447,25 +451,34 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
         }
     )
 
+    remote_ctor = {}
+
     class FailingRemoteNa:
+        PortCatalog = PortCatalog
+
         class RemoteSequencer:
-            def __init__(self, **_kwargs):
+            def __init__(self, *, host, port, connect_on_init):
+                remote_ctor.update(
+                    host=host, port=port, connect_on_init=connect_on_init)
                 raise ConnectionRefusedError("server is not running")
 
-    sequencer, fallback_channels, notice = pulse_gui_launcher._connect_remote_or_offline(
+    sequencer, fallback_catalog, notice = pulse_gui_launcher._connect_remote_or_offline(
         remote_args,
-        subset_state,
+        state,
         FailingRemoteNa,
         explicit_remote=False,
     )
     assert sequencer is None
-    assert fallback_channels == channels
+    assert fallback_catalog.fingerprint == target_catalog.fingerprint
     assert "opened offline editor" in notice
+    assert remote_ctor == {
+        "host": "127.0.0.1", "port": 18861, "connect_on_init": True}
     assert pulse_gui_launcher._remote_host_was_requested([]) is False
     assert pulse_gui_launcher._remote_host_was_requested(["--remote-host", "192.168.0.20"]) is True
 
     try:
-        pulse_gui_launcher._connect_remote_or_offline(remote_args, subset_state, FailingRemoteNa, explicit_remote=True)
+        pulse_gui_launcher._connect_remote_or_offline(
+            remote_args, state, FailingRemoteNa, explicit_remote=True)
     except ConnectionRefusedError:
         pass
     else:
@@ -1002,7 +1015,8 @@ def test_address_switch_xdc_infers_62_outputs_trigger_and_bus_channels():
     count = na.infer_xdc_channel_count(xdc, default=1, max_count=None)
     labels = na.infer_xdc_channel_labels(xdc, default=count, max_count=None)
     channels = [f"ch{index:02d}" for index in range(count)]
-    buses = na.infer_bus_channels(channels, labels)
+    catalog = na.PortCatalog.from_channels(channels, channel_labels=labels)
+    buses = catalog.analog_buses
 
     assert count == 62
     assert labels["ch03"] == "probe"
@@ -1075,7 +1089,7 @@ def test_pulse_table_validate_and_to_sequence_accept_clock_hz_alias():
     a caller's natural ``state.validate(clock_hz=...)`` / ``state.to_sequence(clock_hz=...)``
     must NOT raise "unexpected keyword clock_hz", and must equal passing the reciprocal step."""
     state = na.PulseTableState(
-        channels=["trap", "probe", "emCCD"],
+        port_catalog=PortCatalog.from_channels(["trap", "probe", "emCCD"]),
         periods=[
             na.PulsePeriod(100, (1, 0, 0), unit="ns", name="load"),
             na.PulsePeriod(200, (1, 1, 1), unit="ns", name="image"),
@@ -1099,11 +1113,11 @@ def test_pulse_table_validate_and_to_sequence_accept_clock_hz_alias():
 
 
 def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
-    unnamed = na.PulseTableState(channels=["ch00"])
+    unnamed = na.PulseTableState(port_catalog=PortCatalog.from_channels(["ch00"]))
     assert re.fullmatch(r"pulse_\d{8}_\d{6}", unnamed.name)
 
     state = na.PulseTableState(
-        channels=["trap", "cooling", "probe", "trig", "aod0", "aod1"],
+        port_catalog=PortCatalog.from_channels(["trap", "cooling", "probe", "trig", "aod0", "aod1"]),
         periods=[
             na.PulsePeriod(100, (1, 0, 0, 0, 0, 0), unit="ns", name="load"),
             na.PulsePeriod("2*s0", (1, 0, 1, 1, 0, 0), unit="str (ns)", name="image"),
@@ -1111,7 +1125,8 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
         ],
         delays={"trig": "s0/2"},
         delay_units={"trig": "str (ns)"},
-        scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 100.0}],
+        scan_slots=[{"name": "image_width", "kind": "duration", "target": "1",
+                     "label": "image width", "unit": "ns", "nominal": 100.0}],
         scan_table=[[100.0]],
         time_step_ns=1,
         repeat_start=1,
@@ -1124,20 +1139,24 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
     saved = state.save(tmp_path / "pulse.json")
     loaded = na.PulseTableState.load(saved)
 
-    s0_100 = {"s0": 100.0}
-    s0_200 = {"s0": 200.0}
+    width_100 = {"image_width": 100.0}
+    width_200 = {"image_width": 200.0}
+    compiler_width_100 = {"s0": 100.0}
+    compiler_width_200 = {"s0": 200.0}
 
     assert state.time_step_ns == 1
-    assert state.scan_var_names == ["s0"]
-    assert state.reference_slots() == s0_100
+    assert state.scan_names == ["image_width"]
+    assert state.compiler_scan_vars == ["s0"]
+    assert state.slot_point(0) == width_100
     assert state.total_duration_steps() == 1000
-    assert state.total_duration_steps(slots=s0_200, time_step_ns=10) == 160
+    assert state.total_duration_steps(slots=width_200, time_step_ns=10) == 160
     assert state.total_duration_ns() == 100 + 3 * (200 + 100)
-    assert state.total_duration_ns(slots=s0_200) == 100 + 3 * (400 + 100)
-    assert state.periods[1].duration_steps(slots=s0_200, time_step_ns=state.time_step_ns) == 400
-    assert state.delay_ns("trig", slots=s0_200) == 100
-    assert state.delay_steps("trig", slots=s0_200, time_step_ns=10) == 10
-    resolved = state.with_slots_resolved(s0_200)
+    assert state.total_duration_ns(slots=width_200) == 100 + 3 * (400 + 100)
+    assert state.periods[1].duration_steps(
+        slots=compiler_width_200, time_step_ns=state.time_step_ns) == 400
+    assert state.delay_ns("trig", slots=compiler_width_200) == 100
+    assert state.delay_steps("trig", slots=compiler_width_200, time_step_ns=10) == 10
+    resolved = state.with_slots_resolved(width_200)
     assert resolved.scan_slots == []
     assert resolved.scan_table == []
     assert na.count_trigger_pulses(sequence, trigger_channels=["trig"]) == 3
@@ -1158,14 +1177,14 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
     # and across all three cycle-accurate engine models (no Verilog sim needed).
     from fpga.pulse_streamer.host import engine_model as em
     truth = _additive_truth(
-        state.unrolled_bracket(), slots=s0_100, time_step_ns=10,
+        state.unrolled_bracket(), slots=compiler_width_100, time_step_ns=10,
         channels=list(program.channels), n_ticks=600,
     )
     ep = em.EngineProgram.from_program(program)
     r = em.reference_play(ep, 600)
     assert r == truth
     assert em.prefetch_play(ep, 600) == r and em.rtl_mirror_play(ep, 600) == r
-    program_x = state.compile(clock_hz=100e6, slots=s0_200)
+    program_x = state.compile(clock_hz=100e6, slots=width_200)
     assert program_x.repeat_forever is True
     # s0=200 -> each image is 400 ns = 40 ticks; undelayed flat frame = 10 + 3*(40+10) = 160
     # ticks (trig delay now 10 ticks on channel_delays, not in the frame).
@@ -1173,11 +1192,11 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
     assert program_x.channel_delays == [0, 0, 0, 10, 0, 0]
     assert loaded.to_dict() == state.to_dict()
 
-    state.hide_channel("aod0")
-    assert "aod0" not in state.visible_channels
+    state.hide_port("aod0")
+    assert "aod0" not in state.visible_ports
     assert "aod1" not in state.active_channels()
     try:
-        state.hide_channel("trap")
+        state.hide_port("trap")
     except ValueError as exc:
         assert "active" in str(exc)
     else:
@@ -1185,28 +1204,28 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
 
 
 def test_pulse_table_state_compiles_hardware_repeat_without_expanding_edges():
+    hardware_channels = [f"ch{i:02d}" for i in range(40)]
+    catalog = PortCatalog.from_channels(
+        hardware_channels, channel_labels={"ch00": "trap", "ch03": "trig"})
     state = na.PulseTableState(
-        channels=["ch00", "ch01", "ch02", "ch03"],
+        port_catalog=catalog,
         periods=[
-            na.PulsePeriod(10, (1, 0, 0, 0), unit="ns", name="load"),
-            na.PulsePeriod(20, (0, 1, 0, 1), unit="ns", name="trigger"),
-            na.PulsePeriod(10, (0, 0, 0, 0), unit="ns", name="idle"),
+            na.PulsePeriod(10, (1, 0, 0, 0, *([0] * 36)), unit="ns", name="load"),
+            na.PulsePeriod(20, (0, 1, 0, 1, *([0] * 36)), unit="ns", name="trigger"),
+            na.PulsePeriod(10, (0,) * 40, unit="ns", name="idle"),
         ],
         time_step_ns=10,
         repeat_start=1,
         repeat_end=1,
         repeat_count=500,
-        visible_channels=["ch00", "ch03"],
-        channel_labels={"ch00": "trap", "ch03": "trig"},
+        visible_ports=["ch00", "ch03"],
     )
 
-    hardware_channels = [f"ch{i:02d}" for i in range(40)]
     program = na.compile_pulse_table_runtime_program(
         state,
-        channels=hardware_channels,
+        port_catalog=catalog,
         clock_hz=100_000_000,
     )
-    aligned = state.aligned_to_channels(hardware_channels)
 
     assert len(program.channels) == 40
     assert program.channels == hardware_channels
@@ -1219,9 +1238,9 @@ def test_pulse_table_state_compiles_hardware_repeat_without_expanding_edges():
     assert program.loop_count == 500
     assert len(program.ticks) == len(state.periods) + 1
     assert len(program.ticks) < state.repeat_count
-    assert aligned.channels == hardware_channels
-    assert aligned.periods[0].states[:4] == (1, 0, 0, 0)
-    assert all(value == 0 for value in aligned.periods[0].states[4:])
+    assert program.port_catalog_fingerprint == catalog.fingerprint
+    assert state.periods[0].states[:4] == (1, 0, 0, 0)
+    assert all(value == 0 for value in state.periods[0].states[4:])
     na.validate_pulse_streamer_program(program, max_edges=1024, tick_width=32, channel_count=40)
 
 
@@ -1229,9 +1248,8 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
     channels = ["ch00", "ch01", "ch02", "ch03"]
     labels = {"ch00": "da_test[0]", "ch01": "da_test[1]", "ch02": "da_test[2]", "ch03": "trig"}
     state = na.PulseTableState(
-        channels=channels,
-        channel_labels=labels,
-        visible_channels=channels,
+        port_catalog=PortCatalog.from_channels(channels, channel_labels=labels),
+        visible_ports=["da_test", "ch03"],
         time_step_ns=20,
         periods=[
             na.PulsePeriod(100, (0, 0, 0, 0), unit="ns"),
@@ -1311,7 +1329,8 @@ def _neg_delay_bus_state():
     labels = {"ch00": "da_test[0]", "ch01": "da_test[1]", "ch02": "da_test[2]",
               "ch03": "emCCD", "ch04": "trap"}
     state = na.PulseTableState(
-        channels=channels, channel_labels=labels, visible_channels=channels, time_step_ns=20,
+        port_catalog=PortCatalog.from_channels(channels, channel_labels=labels),
+        visible_ports=["da_test", "ch03", "ch04"], time_step_ns=20,
         periods=[na.PulsePeriod(1000, (0, 0, 0, 1, 1), unit="ns"),
                  na.PulsePeriod(1000, (0, 0, 0, 1, 1), unit="ns")],
     )
@@ -1389,10 +1408,9 @@ def test_dac_ramp_spans_current_period_with_hold_carry_and_edge_step():
     ch = [f"da[{i}]" for i in range(10)] + ["t"]
     labels = {f"da[{i}]": f"da[{i}]" for i in range(10)}
     state = na.PulseTableState(
-        channels=ch,
-        visible_channels=ch,
+        port_catalog=PortCatalog.from_channels(ch, channel_labels=labels),
+        visible_ports=["da", "t"],
         periods=[na.PulsePeriod(1000, tuple([0] * 11), unit="ns") for _ in range(4)],
-        channel_labels=labels,
         time_step_ns=20.0,   # 1000 ns / 20 = 50 ticks per period
         name="ramp_within_period",
     )
@@ -1435,7 +1453,7 @@ def test_every_ramp_ramps_from_the_previous_end_and_forevers_first_period_ramps_
     lab = {f"da[{i}]": f"da[{i}]" for i in range(10)}
 
     # (1) + (3): [ramp 200, hold 200] -- the compiled ramp does NOT bake the steady 712; start_value is 0.
-    state = na.PulseTableState(channels=ch, visible_channels=ch, channel_labels=lab, time_step_ns=20.0,
+    state = na.PulseTableState(port_catalog=PortCatalog.from_channels(ch, channel_labels=lab), visible_ports=["da", "t"], time_step_ns=20.0,
                                name="ramp_loop", periods=[na.PulsePeriod(1000, tuple([0] * 11), unit="ns") for _ in range(2)])
     state.set_analog_bus_mode(0, "da", "ramp", value=200)   # ramp to +200 (code 712)
     state.set_analog_bus_mode(1, "da", "hold")              # then hold it, looping
@@ -1454,7 +1472,7 @@ def test_every_ramp_ramps_from_the_previous_end_and_forevers_first_period_ramps_
 
     # (1): a ramp ramps from the PREVIOUS command's end -- [edge -200, ramp 300, hold] climbs from -200,
     # not 0.  The ramp reaches its target at the period BOUNDARY, so a trailing hold period parks at it.
-    s2 = na.PulseTableState(channels=ch, visible_channels=ch, channel_labels=lab, time_step_ns=20.0,
+    s2 = na.PulseTableState(port_catalog=PortCatalog.from_channels(ch, channel_labels=lab), visible_ports=["da", "t"], time_step_ns=20.0,
                             name="edge_then_ramp", periods=[na.PulsePeriod(1000, tuple([0] * 11), unit="ns") for _ in range(3)])
     s2.set_analog_bus_mode(0, "da", "edge", value=-200)     # edge to -200 (code 312)
     s2.set_analog_bus_mode(1, "da", "ramp", value=300)      # then ramp to +300 (code 812)
@@ -1483,27 +1501,29 @@ def test_preview_is_loop_aware_so_a_looping_ramp_to_a_held_value_shows_flat():
     assert _analog_bus_value_at_tick(plan, starts, 15, looping=True) == 500  # and the hold
 
 
-def test_ttl_toggle_on_a_dac_bus_member_channel_stays_ttl_not_a_phantom_bus():
-    """#phantom-bus: toggling a channel that happens to be a MEMBER of a DAC bus group, while that
-    group was NEVER made an analog bus (no set_analog_bus_mode), must drive it as a plain TTL bit --
-    not synthesize a phantom analog bus from the raw level (which, under a scan, even inherited a scan
-    coefficient and perturbed other channels' timing).  A group is an analog bus IFF it is in
-    analog_bus_modes -- the ONE source of truth."""
+def test_dac_raw_lane_never_reenters_the_ttl_engine():
+    """A raw lane owned by a catalog DAC remains a DAC lane for every program.
+
+    Period states are the physical wire image, so a nonzero member bit without an
+    explicit waveform plan is decoded into a bus edge.  It must never be treated
+    as an independently programmable TTL just because ``analog_bus_modes`` is
+    absent; PortCatalog ownership is the topology source.
+    """
     from Zou_lab_control.neutral_atom.devices.sequencer import (
         _pulse_table_bus_segments, _pulse_table_has_analog_activity)
     ch = [f"da[{i}]" for i in range(10)] + ["t"]
-    mask_on = tuple(1 if i == 9 else 0 for i in range(11))             # da[9] ON: a plain TTL toggle
+    mask_on = tuple(1 if i == 9 else 0 for i in range(11))
     state = na.PulseTableState(
-        channels=ch, visible_channels=ch,
+        port_catalog=PortCatalog.from_channels(ch, channel_labels={f"da[{i}]": f"da[{i}]" for i in range(10)}), visible_ports=["da", "t"],
         periods=[na.PulsePeriod(1000, mask_on, unit="ns"), na.PulsePeriod(1000, tuple([0] * 11), unit="ns")],
-        channel_labels={f"da[{i}]": f"da[{i}]" for i in range(10)},
         time_step_ns=20.0, name="phantom_bus")
-    # NO set_analog_bus_mode -> the "da" group is NOT an analog bus.
-    assert _pulse_table_has_analog_activity(state) is False            # a raw TTL toggle is not analog activity
+    assert state.port_catalog.port_for_lane("da[9]").kind == "dac"
+    assert _pulse_table_has_analog_activity(state) is True
     _, segs, _ = _pulse_table_bus_segments(state, time_step_ns=20.0)
-    assert segs == [], "a non-analog group must NOT synthesize (phantom) DAC bus segments"
-    # da[9] is still DRIVEN -- as a TTL channel in the compiled program (not dropped from both TTL and DAC)
-    assert "da[9]" in state.compile(clock_hz=50_000_000).channels
+    assert segs and {segment.bus_name for segment in segs} == {"da"}
+    program = state.compile(clock_hz=50_000_000)
+    dac_lane_mask = (1 << 10) - 1
+    assert all((mask & dac_lane_mask) == 0 for mask in program.masks)
 
 
 def test_clk_channel_excluded_from_engine_and_carried_as_mask(tmp_path):
@@ -1513,15 +1533,14 @@ def test_clk_channel_excluded_from_engine_and_carried_as_mask(tmp_path):
 
     channels = [f"ch{i:02d}" for i in range(62)]
     state = na.PulseTableState(
-        channels=channels,
-        visible_channels=channels[:8],
+        port_catalog=PortCatalog.from_channels(channels, clk_channels=["ch06"]),
+        visible_ports=["ch00", "ch01", "ch02", "ch03", "ch04", "ch05", "ch07", "ch08"],
         periods=[na.PulsePeriod(1000, tuple(1 if c in (0, 6, 9) else 0 for c in range(62)), unit="ns")],
         time_step_ns=20.0,
-        clk_channels=["ch06"],
     )
     # save/load preserves the clk channel
     loaded = na.PulseTableState.load(state.save(tmp_path / "clk.json"))
-    assert loaded.clk_channels == ["ch06"]
+    assert [port.lanes[0] for port in loaded.port_catalog.clock_ports] == ["ch06"]
     assert loaded.clk_enable_mask() == (1 << 6)
 
     program = state.compile(clock_hz=50_000_000)
@@ -1675,9 +1694,8 @@ def test_pulse_table_scan_allows_analog_bus_ramp_with_timing_scan():
     in lockstep with the scanned timing (no longer rejected)."""
 
     state = na.PulseTableState(
-        channels=["ch00", "ch01"],
-        channel_labels={"ch00": "da_test[0]", "ch01": "da_test[1]"},
-        visible_channels=["ch00", "ch01"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch01"], channel_labels={"ch00": "da_test[0]", "ch01": "da_test[1]"}),
+        visible_ports=["da_test"],
         time_step_ns=20,
         periods=[
             na.PulsePeriod(100, (0, 0), unit="ns"),
@@ -1692,7 +1710,7 @@ def test_pulse_table_scan_allows_analog_bus_ramp_with_timing_scan():
     state.set_analog_bus_mode(1, "da_test", "ramp", value=1)        # 2-bit bus: signed -2..+1
 
     program = na.compile_pulse_table_scan_runtime_program(
-        state, channels=["ch00", "ch01"], clock_hz=50_000_000
+        state, clock_hz=50_000_000
     )
     ramps = [s for s in (program.bus_segments or []) if s.mode == "ramp"]
     assert ramps, "expected a ramp segment"
@@ -1970,7 +1988,7 @@ def test_edge_streamer_rtl_has_proven_structure():
     assert text.count('ram_style = "distributed"') >= 7
 
 
-def test_final_top_regions_match_image_and_has_structure():
+def test_final_top_regions_match_image_and_engine_contract():
     """The final top zlc_pulse_streamer_top.v decodes the SAME word-address
     regions the host packs (host.image.region_bases), instantiates the FINAL
     engine with 3 parallel edge BRAMs + the streaming handshake, and exposes the
@@ -2421,14 +2439,15 @@ def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
 
 def test_pulse_table_state_compiles_pair_array_scan_to_full_40ch_template():
     hardware_channels = [f"ch{i:02d}" for i in range(40)]
+    catalog = PortCatalog.from_channels(hardware_channels)
     # Two bound time slots: s0 scans the camera duration, s1 scans the trailing
     # idle (kept as ``s1+20`` so the affine path carries a non-zero base too).
     state = na.PulseTableState(
-        channels=["ch00", "ch01", "ch02", "ch03"],
+        port_catalog=catalog,
         periods=[
-            na.PulsePeriod(20, (1, 0, 0, 0), unit="ns", name="load"),
-            na.PulsePeriod("s0", (0, 0, 0, 1), unit="str (ns)", name="camera"),
-            na.PulsePeriod("s1+20", (0, 0, 0, 0), unit="str (ns)", name="idle"),
+            na.PulsePeriod(20, (1, 0, 0, 0, *([0] * 36)), unit="ns", name="load"),
+            na.PulsePeriod("s0", (0, 0, 0, 1, *([0] * 36)), unit="str (ns)", name="camera"),
+            na.PulsePeriod("s1+20", (0,) * 40, unit="str (ns)", name="idle"),
         ],
         scan_slots=[
             {"kind": "duration", "target": "1", "unit": "ns", "nominal": 20.0},
@@ -2436,12 +2455,12 @@ def test_pulse_table_state_compiles_pair_array_scan_to_full_40ch_template():
         ],
         scan_table=[[20.0, 20.0], [40.0, 40.0]],
         time_step_ns=20,
-        visible_channels=["ch00", "ch03"],
+        visible_ports=["ch00", "ch03"],
     )
 
     program = na.compile_pulse_table_scan_runtime_program(
         state,
-        channels=hardware_channels,
+        port_catalog=catalog,
         clock_hz=50_000_000,
     )
 
@@ -2543,9 +2562,8 @@ def test_dac_value_scan_behavioral_model_tracks_scanned_code():
     labels = {f"ch{i:02d}": f"da[{i}]" for i in range(10)}
     labels["ch10"] = "trig"
     state = na.PulseTableState(
-        channels=hw,
-        channel_labels=labels,
-        visible_channels=hw,
+        port_catalog=PortCatalog.from_channels(hw, channel_labels=labels),
+        visible_ports=["da", "ch10", "ch11"],
         time_step_ns=20,
         periods=[
             na.PulsePeriod(100, tuple([0] * 10 + [1, 0]), unit="ns"),  # da=0, trig high
@@ -2558,7 +2576,7 @@ def test_dac_value_scan_behavioral_model_tracks_scanned_code():
     codes = [v + 512 for v in signed_values]        # wire layer: offset-binary 0/256/768/1023
     state.set_scan_table([[v] for v in signed_values])
 
-    program = na.compile_pulse_table_scan_runtime_program(state, channels=hw, clock_hz=50_000_000)
+    program = na.compile_pulse_table_scan_runtime_program(state, clock_hz=50_000_000)
     na.validate_pulse_streamer_program(program, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=12)
 
     scanned = [s for s in (program.bus_segments or []) if int(getattr(s, "value_select", 0))]
@@ -2586,9 +2604,8 @@ def test_dac_scan_bind_preserves_ramp_mode_and_unbind_restores():
     _apply_slot_binding used to force {"mode": "edge"} unconditionally."""
 
     state = na.PulseTableState(
-        name="rb", channels=["b0", "b1", "t"],
-        channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"},
-        visible_channels=["b0", "b1", "t"], time_step_ns=20.0,
+        name="rb", port_catalog=PortCatalog.from_channels(["b0", "b1", "t"], channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"}),
+        visible_ports=["da_x", "t"], time_step_ns=20.0,
         periods=[na.PulsePeriod(200, (0, 0, 1), unit="ns"), na.PulsePeriod(400, (0, 0, 0), unit="ns")],
         analog_bus_modes={"da_x": [{"mode": "edge", "value": 1}, {"mode": "ramp", "value": -2}]})
 
@@ -2615,9 +2632,8 @@ def test_dac_ramp_endpoint_scan_compiles_and_tracks_every_point():
     the carried-in level to THAT point's code, landing exactly on it at the ramp end."""
 
     state = na.PulseTableState(
-        name="ramp_scan", channels=["b0", "b1", "t"],
-        channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"},
-        visible_channels=["b0", "b1", "t"], time_step_ns=20.0,
+        name="ramp_scan", port_catalog=PortCatalog.from_channels(["b0", "b1", "t"], channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"}),
+        visible_ports=["da_x", "t"], time_step_ns=20.0,
         periods=[na.PulsePeriod(200, (0, 0, 1), unit="ns"),
                  na.PulsePeriod(400, (0, 0, 0), unit="ns"),
                  na.PulsePeriod(200, (0, 0, 0), unit="ns")],
@@ -2628,7 +2644,7 @@ def test_dac_ramp_endpoint_scan_compiles_and_tracks_every_point():
         scan_table=[[-2.0], [0.0], [1.0]])
 
     program = na.compile_pulse_table_scan_runtime_program(
-        state, channels=list(state.channels), clock_hz=50_000_000, scan_table=state.scan_table)
+        state, clock_hz=50_000_000, scan_table=state.scan_table)
     na.validate_pulse_streamer_program(program, max_edges=1024, max_scan_points=1024,
                                        tick_width=32, channel_count=3, bus_count=4, bus_width=2)
     from fpga.pulse_streamer.host import image as img
@@ -2667,9 +2683,8 @@ def test_dac_ramp_from_a_scanned_edge_carries_the_scanned_level_via_the_register
     scanned code at every scan point (#ramp-carry)."""
 
     state = na.PulseTableState(
-        name="carry", channels=["b0", "b1", "t"],
-        channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"},
-        visible_channels=["b0", "b1", "t"], time_step_ns=20.0,
+        name="carry", port_catalog=PortCatalog.from_channels(["b0", "b1", "t"], channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"}),
+        visible_ports=["da_x", "t"], time_step_ns=20.0,
         periods=[na.PulsePeriod(200, (0, 0, 1), unit="ns"), na.PulsePeriod(400, (0, 0, 0), unit="ns")],
         analog_bus_modes={"da_x": [{"mode": "edge", "value": "s0"},
                                    {"mode": "ramp", "value": 1}]},
@@ -2677,7 +2692,7 @@ def test_dac_ramp_from_a_scanned_edge_carries_the_scanned_level_via_the_register
         scan_table=[[-2.0], [1.0]])
 
     program = na.compile_pulse_table_scan_runtime_program(
-        state, channels=list(state.channels), clock_hz=50_000_000, scan_table=state.scan_table)
+        state, clock_hz=50_000_000, scan_table=state.scan_table)
     ramps = [s for s in (program.bus_segments or []) if s.mode == "ramp"]
     assert len(ramps) == 1
     seg = ramps[0]
@@ -2752,9 +2767,8 @@ def test_dac_plus_duration_scan_behavioral_model_value_and_timing():
     labels = {f"ch{i:02d}": f"da[{i}]" for i in range(10)}
     labels["ch10"] = "trig"
     state = na.PulseTableState(
-        channels=hw,
-        channel_labels=labels,
-        visible_channels=hw,
+        port_catalog=PortCatalog.from_channels(hw, channel_labels=labels),
+        visible_ports=["da", "ch10", "ch11"],
         time_step_ns=20,
         periods=[
             na.PulsePeriod(100, tuple([0] * 10 + [1, 0]), unit="ns"),  # period 0 duration scanned
@@ -2769,7 +2783,7 @@ def test_dac_plus_duration_scan_behavioral_model_value_and_timing():
     codes = [v + 512 for v in signed_values]         # wire codes 0 / 512 / 1023
     state.set_scan_table([[d, v] for d, v in zip(durations_ns, signed_values)])
 
-    program = na.compile_pulse_table_scan_runtime_program(state, channels=hw, clock_hz=50_000_000)
+    program = na.compile_pulse_table_scan_runtime_program(state, clock_hz=50_000_000)
     na.validate_pulse_streamer_program(program, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=12)
 
     seg = next(s for s in program.bus_segments if int(getattr(s, "value_select", 0)))
@@ -2799,9 +2813,8 @@ def test_pulse_table_dac_duration_delay_scan_simultaneously():
     """
 
     state = na.PulseTableState(
-        channels=["ch00", "ch01", "ch02"],
-        channel_labels={"ch00": "da_test[0]", "ch01": "da_test[1]", "ch02": "trig"},
-        visible_channels=["ch00", "ch01", "ch02"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch01", "ch02"], channel_labels={"ch00": "da_test[0]", "ch01": "da_test[1]", "ch02": "trig"}),
+        visible_ports=["da_test", "ch02"],
         time_step_ns=20,
         periods=[
             na.PulsePeriod(100, (0, 0, 1), unit="ns"),  # period 0 duration scanned
@@ -2819,7 +2832,7 @@ def test_pulse_table_dac_duration_delay_scan_simultaneously():
     state.set_scan_table([[40.0, 0.0], [80.0, 3.0], [120.0, 2.0]])
 
     program = na.compile_pulse_table_scan_runtime_program(
-        state, channels=["ch00", "ch01", "ch02"], clock_hz=50_000_000
+        state, clock_hz=50_000_000
     )
     assert program.slot_kinds == ["duration", "dac"]
     scanned = [s for s in (program.bus_segments or []) if int(getattr(s, "value_select", 0))]
@@ -2846,16 +2859,17 @@ def test_pulse_table_dac_duration_delay_scan_simultaneously():
     )
 
 
-def test_sequencer_service_pads_gui_subset_state_to_full_40ch_hardware():
+def test_sequencer_service_rejects_a_subset_catalog():
     hardware_channels = [f"ch{i:02d}" for i in range(40)]
+    device_catalog = PortCatalog.from_channels(hardware_channels)
     prepared_programs: list[na.RuntimeSequenceProgram] = []
     service = na.SequencerService(
-        channels=hardware_channels,
+        port_catalog=device_catalog,
         clock_hz=100_000_000,
         prepare_callback=prepared_programs.append,
     )
     state = na.PulseTableState(
-        channels=["ch00", "ch01", "ch02", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch01", "ch02", "ch03"], channel_labels={"ch00": "trap", "ch03": "trig"}),
         periods=[
             na.PulsePeriod(20, (1, 0, 0, 0), unit="ns", name="load"),
             na.PulsePeriod(20, (1, 0, 0, 1), unit="ns", name="camera"),
@@ -2863,24 +2877,19 @@ def test_sequencer_service_pads_gui_subset_state_to_full_40ch_hardware():
         ],
         time_step_ns=10,
         repeat_forever=True,
-        visible_channels=["ch00", "ch03"],
-        channel_labels={"ch00": "trap", "ch03": "trig"},
+        visible_ports=["ch00", "ch03"],
     )
 
-    payload = service.prepare(state.to_dict())
-    program = na.RuntimeSequenceProgram.from_dict(payload)
-
-    assert len(program.channels) == 40
-    assert program.channels == hardware_channels
-    assert program.masks == [1 << 0, (1 << 0) | (1 << 3), 0, 0]
-    assert all(mask >> 4 == 0 for mask in program.masks)
-    assert prepared_programs == [program]
-    na.validate_pulse_streamer_program(program, max_edges=1024, tick_width=32, channel_count=40)
+    with pytest.raises(ValueError, match="port topology does not match") as exc:
+        service.prepare(state.to_dict())
+    assert state.port_catalog.fingerprint in str(exc.value)
+    assert device_catalog.fingerprint in str(exc.value)
+    assert prepared_programs == []
 
 
 def test_fpga_loop_repeat_keeps_post_loop_idle_before_repeat_forever():
     state = na.PulseTableState(
-        channels=["ch00", "ch01", "ch02", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch01", "ch02", "ch03"]),
         periods=[
             na.PulsePeriod(10, (1, 0, 0, 0), unit="ns", name="load"),
             na.PulsePeriod(20, (0, 0, 0, 1), unit="ns", name="trigger"),
@@ -2895,7 +2904,6 @@ def test_fpga_loop_repeat_keeps_post_loop_idle_before_repeat_forever():
 
     program = na.compile_pulse_table_runtime_program(
         state,
-        channels=[f"ch{i:02d}" for i in range(40)],
         clock_hz=100_000_000,
     )
     history = _simulate_pulse_streamer_program_steps(program, steps=8)
@@ -2911,7 +2919,7 @@ def test_fpga_loop_repeat_keeps_post_loop_idle_before_repeat_forever():
 
 def test_pulse_table_reports_repeat_forever_table_boundary_high_channels():
     state = na.PulseTableState(
-        channels=["ch00", "ch01", "ch02", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch01", "ch02", "ch03"], channel_labels={"ch00": "trap", "ch01": "cooling", "ch03": "trig"}),
         periods=[
             na.PulsePeriod(10, (1, 1, 0, 0), unit="ns", name="load"),
             na.PulsePeriod(10, (0, 0, 0, 1), unit="ns", name="trigger"),
@@ -2922,12 +2930,10 @@ def test_pulse_table_reports_repeat_forever_table_boundary_high_channels():
         repeat_end=1,
         repeat_count=3,
         repeat_forever=True,
-        channel_labels={"ch00": "trap", "ch01": "cooling", "ch03": "trig"},
     )
 
     program = na.compile_pulse_table_runtime_program(
         state,
-        channels=[f"ch{i:02d}" for i in range(40)],
         clock_hz=100_000_000,
     )
     history = _simulate_pulse_streamer_program_steps(program, steps=7)
@@ -2946,7 +2952,7 @@ def test_pulse_table_reports_repeat_forever_table_boundary_high_channels():
 
 def test_pulse_table_no_boundary_warning_when_repeat_bracket_covers_whole_table():
     state = na.PulseTableState(
-        channels=["ch00", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch03"]),
         periods=[
             na.PulsePeriod(10, (1, 0), unit="ns"),
             na.PulsePeriod(10, (0, 1), unit="ns"),
@@ -2961,24 +2967,26 @@ def test_pulse_table_no_boundary_warning_when_repeat_bracket_covers_whole_table(
     assert state.repeat_forever_boundary_active_channels() == []
 
 
-def test_partial_hardware_channels_default_missing_outputs_off():
+def test_sequence_and_table_compile_against_one_explicit_hardware_catalog():
     hardware_channels = [f"ch{i:02d}" for i in range(40)]
+    catalog = PortCatalog.from_channels(hardware_channels)
     seq = na.PulseSequence(name="partial_hardware").pulse("ch00", 0.0, 10e-9).pulse("ch03", 10e-9, 10e-9).forever(period=30e-9)
-    sequence_program = na.compile_runtime_program(seq, channels=hardware_channels, clock_hz=100_000_000)
+    sequence_program = na.compile_runtime_program(
+        seq, channels=catalog.raw_lanes, port_catalog=catalog, clock_hz=100_000_000)
 
     state = na.PulseTableState(
-        channels=["ch00", "ch03"],
+        port_catalog=catalog,
         periods=[
-            na.PulsePeriod(10, (1, 0), unit="ns"),
-            na.PulsePeriod(10, (0, 1), unit="ns"),
-            na.PulsePeriod(10, (0, 0), unit="ns"),
+            na.PulsePeriod(10, (1, 0, 0, 0, *([0] * 36)), unit="ns"),
+            na.PulsePeriod(10, (0, 0, 0, 1, *([0] * 36)), unit="ns"),
+            na.PulsePeriod(10, (0,) * 40, unit="ns"),
         ],
         time_step_ns=10,
-        visible_channels=["ch00", "ch03"],
+        visible_ports=["ch00", "ch03"],
     )
     table_program = na.compile_pulse_table_runtime_program(
         state,
-        channels=hardware_channels,
+        port_catalog=catalog,
         clock_hz=100_000_000,
     )
 
@@ -2996,24 +3004,22 @@ def test_partial_hardware_channels_default_missing_outputs_off():
 def test_40ch_gui_visible_subset_compiles_as_full_width_fpga_program():
     hardware_channels = [f"ch{i:02d}" for i in range(40)]
     state = na.PulseTableState(
-        channels=hardware_channels,
+        port_catalog=PortCatalog.from_channels(hardware_channels, channel_labels={"ch00": "trap", "ch01": "cooling", "ch02": "probe", "ch03": "trig"}),
         periods=[
             na.PulsePeriod(100, (1, 1, 0, 0, *([0] * 36)), unit="ns", name="load"),
             na.PulsePeriod(20, (1, 0, 1, 1, *([0] * 36)), unit="ns", name="camera"),
             na.PulsePeriod(100, (0,) * 40, unit="ns", name="off"),
         ],
         time_step_ns=10,
-        visible_channels=["ch00", "ch01", "ch02", "ch03"],
-        channel_labels={"ch00": "trap", "ch01": "cooling", "ch02": "probe", "ch03": "trig"},
+        visible_ports=["ch00", "ch01", "ch02", "ch03"],
     )
 
     program = na.compile_pulse_table_runtime_program(
         state,
-        channels=hardware_channels,
         clock_hz=100_000_000,
     )
 
-    assert state.visible_channels == hardware_channels[:4]
+    assert state.visible_ports == hardware_channels[:4]
     assert program.channels == hardware_channels
     assert len(program.channels) == 40
     assert program.masks == [0b0011, 0b1101, 0, 0]
@@ -3022,19 +3028,20 @@ def test_40ch_gui_visible_subset_compiles_as_full_width_fpga_program():
     na.validate_pulse_streamer_program(program, max_edges=1024, tick_width=32, channel_count=40)
 
 
-def test_pulse_table_unknown_channel_is_not_silently_ignored():
+def test_pulse_table_foreign_catalog_is_rejected_by_device_compiler():
     state = na.PulseTableState(
-        channels=["ch00", "not_on_fpga"],
+        port_catalog=PortCatalog.from_channels(["ch00", "not_on_fpga"]),
         periods=[na.PulsePeriod(10, (1, 1), unit="ns")],
         time_step_ns=10,
     )
-    try:
-        na.compile_pulse_table_runtime_program(state, channels=[f"ch{i:02d}" for i in range(62)], clock_hz=50_000_000)
-    except ValueError as exc:
-        assert "not in hardware channels" in str(exc)
-        assert "not_on_fpga" in str(exc)
-    else:
-        raise AssertionError("unknown pulse-table channels should be rejected")
+    device_catalog = PortCatalog.from_channels([f"ch{i:02d}" for i in range(62)])
+    with pytest.raises(ValueError, match="port topology does not match") as exc:
+        na.compile_pulse_table_runtime_program(
+            state,
+            port_catalog=device_catalog,
+            clock_hz=50_000_000,
+        )
+    assert "not_on_fpga" in str(exc.value)
 
 
 def test_checked_in_camera_imaging_pulse_compiles_for_address_switch_fpga():
@@ -3042,17 +3049,18 @@ def test_checked_in_camera_imaging_pulse_compiles_for_address_switch_fpga():
     state = na.PulseTableState.load(path)
     program = state.compile(clock_hz=50_000_000)
 
-    assert state.channels == [f"ch{i:02d}" for i in range(62)]
-    assert state.visible_channels == ["ch09", "ch00", "ch03", "ch11"]
+    assert list(state.port_catalog.raw_lanes) == [f"ch{i:02d}" for i in range(62)]
+    assert state.visible_ports == ["ch09", "ch00", "ch03", "ch11"]
     assert state.time_step_ns == 20
-    assert len(state.channel_labels) == 62
-    assert state.channel_labels["ch00"] == "cooling"
-    assert state.channel_labels["ch03"] == "probe"
-    assert state.channel_labels["ch06"] == "trig"
-    assert state.channel_labels["ch11"] == "emCCD"
-    assert state.channel_labels["ch09"] == "trap"
-    assert state.channel_labels["ch18"] == "da_dipole[0]"
-    assert state.channel_labels["ch39"] == "da_clk1"
+    labels = state.port_catalog.channel_labels
+    assert len(labels) == 62
+    assert labels["ch00"] == "cooling"
+    assert labels["ch03"] == "probe"
+    assert labels["ch06"] == "trig"
+    assert labels["ch11"] == "emCCD"
+    assert labels["ch09"] == "trap"
+    assert labels["ch18"] == "da_dipole[0]"
+    assert labels["ch39"] == "da_clk1"
     assert state.delay_steps("ch00", time_step_ns=20) == 0
     assert state.delay_steps("ch11", time_step_ns=20) == 0
     assert state.repeat_start is None
@@ -3063,14 +3071,14 @@ def test_checked_in_camera_imaging_pulse_compiles_for_address_switch_fpga():
     # The camera exposure is bound to a single time slot whose nominal is the
     # default 19.98 ms exposure; the reference render uses that nominal.
     assert [slot.kind for slot in state.scan_slots] == ["duration"]
-    assert state.primary_time_slot() == "s0"
-    assert state.reference_slots() == {"s0": 19_980_000}
+    assert state.primary_time_slot() == "exposure"
+    assert state.slot_point(0) == {"exposure": 19_980_000}
     exposure_period = next(period for period in state.periods if period.name == "camera_exposure")
     assert exposure_period.duration == "s0"
     assert exposure_period.unit == "str (ns)"
     assert state.slot_index_for("duration", str(state.periods.index(exposure_period))) == 0
     assert state.periods[0].states[state.channel_index("ch11")] == 0
-    assert program.channels == state.channels
+    assert program.channels == list(state.port_catalog.raw_lanes)
     assert program.ticks == [0, 100_000, 105_000, 106_000, 1_105_000, 1_106_000]
     assert program.masks == [513, 512, 2568, 520, 512, 0]
     assert program.repeat_forever is True
@@ -3079,14 +3087,15 @@ def test_checked_in_camera_imaging_pulse_compiles_for_address_switch_fpga():
     assert program.loop_count == 1
     na.validate_pulse_streamer_program(program, max_edges=1024, tick_width=32, channel_count=62)
 
-    shorter = state.compile(clock_hz=50_000_000, slots={"s0": 2_000_000})
+    shorter = state.compile(clock_hz=50_000_000, slots={"exposure": 2_000_000})
     assert shorter.ticks == [0, 100_000, 105_000, 106_000, 206_000, 207_000]
     assert shorter.masks == program.masks
-    finite = state.with_slots_resolved({"s0": 2_000_000}).to_sequence(expand_repeat=False).repeated(3)
+    finite = state.with_slots_resolved(
+        {"exposure": 2_000_000}).to_sequence(expand_repeat=False).repeated(3)
     assert na.count_trigger_pulses(finite, trigger_channels=["ch11"]) == 3
     finite_program = na.compile_runtime_program(
         finite,
-        channels=state.channels,
+        channels=state.port_catalog.raw_lanes,
         clock_hz=50_000_000,
     )
     assert finite_program.repeat_forever is False
@@ -3094,7 +3103,7 @@ def test_checked_in_camera_imaging_pulse_compiles_for_address_switch_fpga():
 
 def test_pulse_table_repeat_forever_can_be_disabled_for_single_shot():
     state = na.PulseTableState(
-        channels=["ch00", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch03"]),
         periods=[
             na.PulsePeriod(100, (1, 0), unit="ns"),
             na.PulsePeriod(20, (0, 1), unit="ns"),
@@ -3104,15 +3113,16 @@ def test_pulse_table_repeat_forever_can_be_disabled_for_single_shot():
         repeat_forever=False,
     )
 
+    target_catalog = PortCatalog.from_channels(["ch00", "ch01", "ch02", "ch03"])
+    state = state.aligned_to_catalog(target_catalog)
     program = na.compile_pulse_table_runtime_program(
         state,
-        channels=["ch00", "ch01", "ch02", "ch03"],
         clock_hz=100_000_000,
         repeat_forever=state.repeat_forever,
     )
     service_program = na.compile_runtime_program_for_payload(
         state,
-        channels=["ch00", "ch01", "ch02", "ch03"],
+        port_catalog=target_catalog,
         clock_hz=100_000_000,
     )
     restored = na.PulseTableState.from_dict(state.to_dict())
@@ -3130,13 +3140,14 @@ def test_bind_pulse_controller_updates_slot_and_fires_runtime_sequencer():
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
-        channels=["ch00", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch03"]),
         periods=[
             na.PulsePeriod("s0", (1, 0), unit="str (ns)"),
             na.PulsePeriod(20, (0, 1), unit="ns"),
             na.PulsePeriod(20, (0, 0), unit="ns"),
         ],
-        scan_slots=[{"kind": "duration", "target": "0", "unit": "ns", "nominal": 100.0}],
+        scan_slots=[{"name": "duration", "kind": "duration", "target": "0",
+                     "label": "duration", "unit": "ns", "nominal": 100.0}],
         time_step_ns=10,
         repeat_forever=False,
     )
@@ -3152,7 +3163,7 @@ def test_bind_pulse_controller_updates_slot_and_fires_runtime_sequencer():
     assert program.repeat_forever is False
     assert sequencer.snapshot()["state"] == "done"
     snapshot = pulse.snapshot()
-    assert snapshot["slots"] == {"s0": 200.0}
+    assert snapshot["slots"] == {"duration": 200.0}
     assert snapshot["last_program"]["edge_count"] == len(program.ticks)
 
 
@@ -3163,7 +3174,7 @@ def test_bind_pulse_controller_can_override_repeat_forever_for_scope_debug():
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
-        channels=["ch00", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch03"]),
         periods=[
             na.PulsePeriod(100, (1, 0), unit="ns"),
             na.PulsePeriod(20, (1, 1), unit="ns"),
@@ -3188,7 +3199,7 @@ def test_bind_pulse_controller_rejects_waiting_indefinitely_for_repeat_forever()
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
-        channels=["ch00", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch03"]),
         periods=[
             na.PulsePeriod(100, (1, 0), unit="ns"),
             na.PulsePeriod(20, (1, 1), unit="ns"),
@@ -3218,7 +3229,7 @@ def test_runtime_sequencer_repeat_forever_wait_done_times_out():
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
-        channels=["ch00", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch03"]),
         periods=[
             na.PulsePeriod(100, (1, 0), unit="ns"),
             na.PulsePeriod(20, (1, 1), unit="ns"),
@@ -3249,7 +3260,7 @@ def test_bind_pulse_controller_repeat_forever_wait_timeout_raises():
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
-        channels=["ch00", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch03"]),
         periods=[
             na.PulsePeriod(100, (1, 0), unit="ns"),
             na.PulsePeriod(20, (1, 1), unit="ns"),
@@ -3336,13 +3347,14 @@ def test_detection_time_scan_uses_bound_40ch_pulse_controller():
     sequencer = RecordingVirtualSequencer(channels=hardware_channels, clock_hz=100_000_000, sleep_scale=0.0)
     _bench_trigger_cable(exp.devices.camera, sequencer)   # this streamer's edges now gate the camera
     state = na.PulseTableState(
-        channels=["ch00", "ch02", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch02", "ch03"]),
         periods=[
             na.PulsePeriod(100, (1, 0, 0), unit="ns"),
             na.PulsePeriod("s0", (1, 1, 1), unit="str (ns)"),
             na.PulsePeriod(100, (0, 0, 0), unit="ns"),
         ],
-        scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 1_000.0}],
+        scan_slots=[{"name": "duration", "kind": "duration", "target": "1",
+                     "label": "duration", "unit": "ns", "nominal": 1_000.0}],
         time_step_ns=10,
         repeat_forever=True,
     )
@@ -3393,11 +3405,11 @@ def test_timing_subsystem_bind_pulse_loads_json_for_40ch_remote_style_scan(tmp_p
     exp.devices.devices["sequencer"] = sequencer
     _bench_trigger_cable(exp.devices.camera, sequencer)   # re-plug the camera onto the new streamer
     state = na.PulseTableState(
-        channels=["ch00", "ch02", "ch03"],
+        port_catalog=sequencer.port_catalog,
         periods=[
-            na.PulsePeriod(100, (1, 0, 0), unit="ns"),
-            na.PulsePeriod("s0", (1, 1, 1), unit="str (ns)"),
-            na.PulsePeriod(100, (0, 0, 0), unit="ns"),
+            na.PulsePeriod(100, (1, 0, 0, 0, *([0] * 36)), unit="ns"),
+            na.PulsePeriod("s0", (1, 0, 1, 1, *([0] * 36)), unit="str (ns)"),
+            na.PulsePeriod(100, (0,) * 40, unit="ns"),
         ],
         scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 1_000.0}],
         time_step_ns=10,
@@ -3446,7 +3458,7 @@ def test_bound_pulse_frame_sequence_keeps_pulse_own_trigger_count_regardless_of_
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
-        channels=["ch00", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch03"]),
         periods=[
             na.PulsePeriod(100, (1, 0), unit="ns"),
             na.PulsePeriod(20, (1, 1), unit="ns"),
@@ -3487,7 +3499,7 @@ def test_bind_field_time_slot_always_normalized_to_ns():
     A per-channel delay is a fixed output delay (a delay line) and is NOT scannable, so
     bind_field('delay', ...) raises rather than silently treating it as a constant."""
     state = na.PulseTableState(
-        channels=["a", "b"],
+        port_catalog=PortCatalog.from_channels(["a", "b"]),
         periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(20, (0, 0), unit="us")],
         time_step_ns=20)
     state.bind_field("duration", "1", unit="us")          # period 1 was 20 us
@@ -3502,7 +3514,7 @@ def test_bind_field_time_slot_always_normalized_to_ns():
     assert state.delays == {"a": 5}
     # and the compiled scan value is interpreted in ns: 30000 in the table -> 1500 ticks
     state.set_scan_table([[20000.0], [30000.0]])
-    prog = na.compile_pulse_table_scan_runtime_program(state, channels=["a", "b"], clock_hz=50e6)
+    prog = na.compile_pulse_table_scan_runtime_program(state, clock_hz=50e6)
     # period-1 duration slot value 30000 ns = 1500 ticks (period 0 = 1000 ns = 50 ticks)
     assert prog.scan_points[1][0] == 1500
 
@@ -3511,24 +3523,28 @@ def test_pulse_table_snaps_times_to_minimal_grid():
     # The pulse-table (GUI) path must AUTO-SNAP off-grid durations to the nearest
     # tick instead of rejecting them -- the hardware clock can only land on ticks.
     state = na.PulseTableState(
-        channels=["trap", "trig"],
+        port_catalog=PortCatalog.from_channels(["trap", "trig"]),
         periods=[
             na.PulsePeriod(100, (1, 0), unit="ns"),
             na.PulsePeriod("s0", (0, 1), unit="str (ns)"),
         ],
-        scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 20.0}],
+        scan_slots=[{"name": "duration", "kind": "duration", "target": "1",
+                     "label": "duration", "unit": "ns", "nominal": 20.0}],
         time_step_ns=1,
     )
 
-    assert state.to_sequence(slots={"s0": 20}, time_step_ns=10).validate(clock_hz=100e6, channels=state.channels).ok
+    raw_lanes = state.port_catalog.raw_lanes
+    assert state.to_sequence(
+        slots={"duration": 20}, time_step_ns=10,
+    ).validate(clock_hz=100e6, channels=raw_lanes).ok
     # 25 ns at a 10 ns step snaps to 30 ns (ties away from zero) and stays valid.
-    snapped = state.to_sequence(slots={"s0": 25}, time_step_ns=10)
-    assert snapped.validate(clock_hz=100e6, channels=state.channels).ok
+    snapped = state.to_sequence(slots={"duration": 25}, time_step_ns=10)
+    assert snapped.validate(clock_hz=100e6, channels=raw_lanes).ok
     assert state.periods[1].duration_ns(slots={"s0": 25}, time_step_ns=10) == 30.0
 
     # A duration that rounds toward zero must still snap UP to one tick (never 0).
     tiny = na.PulseTableState(
-        channels=["trap"],
+        port_catalog=PortCatalog.from_channels(["trap"]),
         periods=[na.PulsePeriod(2.5, (1,), unit="ns")],
         time_step_ns=1,
     )
@@ -3540,7 +3556,7 @@ def test_pulse_table_snapped_snaps_literals_and_keeps_expressions():
     from Zou_lab_control.neutral_atom.timing.pulse_table import ScanSlot, snap_scan_table
 
     state = na.PulseTableState(
-        channels=["trap", "trig"],
+        port_catalog=PortCatalog.from_channels(["trap", "trig"]),
         periods=[
             na.PulsePeriod(50, (1, 0), unit="ns"),    # off-grid -> 60 ns at 20 ns step
             na.PulsePeriod("s0", (0, 1), unit="str (ns)"),  # expression: must be kept
@@ -3601,7 +3617,7 @@ def test_scan_slot_dac_ranges_report_signed_bus_width():
     time slots report None."""
 
     state = na.PulseTableState(
-        channels=[f"da[{i}]" for i in range(10)] + ["trig"],
+        port_catalog=PortCatalog.from_channels([f"da[{i}]" for i in range(10)] + ["trig"]),
         periods=[na.PulsePeriod(1000, tuple([0] * 11), unit="ns")],
         scan_slots=[
             {"kind": "dac", "target": "da@0", "unit": "value", "nominal": 0.0},
@@ -3622,13 +3638,12 @@ def test_compile_scan_clamps_dac_codes_to_bus_width():
     ch = [f"da[{i}]" for i in range(10)] + ["trig"]
     labels = {f"da[{i}]": f"da[{i}]" for i in range(10)}
     state = na.PulseTableState(
-        channels=ch,
-        visible_channels=ch,
+        port_catalog=PortCatalog.from_channels(ch, channel_labels=labels),
+        visible_ports=["da", "trig"],
         periods=[
             na.PulsePeriod(1000, tuple([0] * 11), unit="ns"),
             na.PulsePeriod(2000, tuple([0] * 10 + [1]), unit="ns"),
         ],
-        channel_labels=labels,
         time_step_ns=20.0,
     )
     state.bind_field("dac", "da@0", unit="value", label="da")
@@ -3676,7 +3691,7 @@ def test_timing_payload_to_dict_snaps_pulse_table():
     from Zou_lab_control.neutral_atom.devices.sequencer import timing_payload_to_dict
 
     state = na.PulseTableState(
-        channels=["trap", "trig"],
+        port_catalog=PortCatalog.from_channels(["trap", "trig"]),
         periods=[na.PulsePeriod(50, (1, 0), unit="ns"), na.PulsePeriod(120, (0, 1), unit="ns")],
         time_step_ns=20,
     )
@@ -3838,7 +3853,7 @@ def test_pulse_sequence_clock_validation_rejects_off_tick_edges():
 
 def test_pulse_table_from_sequence_materializes_delays_without_double_applying():
     seq = na.PulseSequence(name="delayed").pulse("trig", 0.0, 20e-9).delay("trig", 10e-9)
-    state = na.PulseTableState.from_sequence(seq, channels=["trap", "trig"], clock_hz=100e6)
+    state = na.PulseTableState.from_sequence(seq, port_catalog=PortCatalog.from_channels(["trap", "trig"]), clock_hz=100e6)
     round_trip = state.to_sequence()
 
     assert state.delays == {}
@@ -3979,7 +3994,7 @@ def test_sequencer_service_skips_duplicate_prepare_uploads():
         prepare_callback=prepare_callback,
     )
     state = na.PulseTableState(
-        channels=["ch00", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch03"]),
         periods=[
             na.PulsePeriod("s0", (1, 0), unit="str (ns)"),
             na.PulsePeriod(20, (1, 1), unit="ns"),
@@ -3992,7 +4007,7 @@ def test_sequencer_service_skips_duplicate_prepare_uploads():
 
     first = service.prepare(state)
     second = service.prepare(state)
-    third = service.prepare(state.with_slots_resolved({"s0": 200}))
+    third = service.prepare(state.with_slots_resolved({"duration": 200}))
 
     assert first["sequence_id"] == second["sequence_id"]
     assert third["sequence_id"] != first["sequence_id"]
@@ -4014,7 +4029,7 @@ def test_sequencer_service_safe_state_invalidates_prepare_cache():
         safe_state_callback=lambda: safe_calls.append(True),
     )
     state = na.PulseTableState(
-        channels=["ch00", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch03"]),
         periods=[
             na.PulsePeriod(20, (1, 1), unit="ns"),
             na.PulsePeriod(20, (0, 0), unit="ns"),
@@ -4065,7 +4080,7 @@ def test_rejected_streamed_prepare_safes_backend_then_recovers(monkeypatch):
         repeat_forever=True, scan_points=[[0], [1]])
 
     state = na.PulseTableState(
-        channels=["ch00", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch03"]),
         periods=[na.PulsePeriod(20, (1, 1), unit="ns"), na.PulsePeriod(20, (0, 0), unit="ns")],
         time_step_ns=10, repeat_forever=True)
 
@@ -4617,7 +4632,7 @@ def test_virtual_equals_real_scan_progress_same_dict():
     from Zou_lab_control.neutral_atom.devices.sequencer import PulseController, scan_progress_fields
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
 
-    st = PulseTableState(channels=["probe", "trig"])
+    st = PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"]))
     st.bind_field("duration", "0", unit="us")
     st.set_scan_table([[10.0], [20.0], [30.0]])
     # virtual finite scan, fast-forwarded to its saturated done reading
@@ -4637,7 +4652,7 @@ def test_virtual_single_pass_streamed_scan_reports_scanning():
     from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
 
-    st = PulseTableState(channels=["probe", "trig"])
+    st = PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"]))
     st.bind_field("duration", "0", unit="us")
     st.set_scan_table([[10.0], [20.0], [30.0]])
     st.repeat_forever = False                          # single-pass: N points played once
@@ -4659,7 +4674,7 @@ def test_virtual_stop_unconditionally_drives_safe_state():
     from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
 
-    st = PulseTableState(channels=["probe", "trig"])
+    st = PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"]))
     st.bind_field("duration", "0", unit="us")
     st.set_scan_table([[10.0], [20.0], [30.0]])
     st.repeat_forever = False
@@ -4694,7 +4709,7 @@ def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
     thread = threading.Thread(target=server.start, daemon=True)
     thread.start()
     time.sleep(0.2)
-    remote = na.RemoteSequencer(host="127.0.0.1", port=port, channels=["trap", "cooling", "probe", "emCCD"], clock_hz=50_000_000)
+    remote = na.RemoteSequencer(host="127.0.0.1", port=port)
     seq = na.imaging_sequence(exposure=12e-6, load=True).repeated(4)
     assert na.count_trigger_pulses(seq) == 4
     try:
@@ -4743,11 +4758,9 @@ def test_remote_pulse_controller_sends_pulse_table_x_over_json_protocol(tmp_path
     remote = na.RemoteSequencer(
         host="127.0.0.1",
         port=port,
-        channels=["ch00", "ch03"],
-        clock_hz=1.0,
     )
     state = na.PulseTableState(
-        channels=["ch00", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch03"]),
         periods=[
             na.PulsePeriod(100, (1, 0), unit="ns"),
             na.PulsePeriod("s0", (1, 1), unit="str (ns)"),
@@ -4756,8 +4769,11 @@ def test_remote_pulse_controller_sends_pulse_table_x_over_json_protocol(tmp_path
         scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 1_000.0}],
         time_step_ns=10,
         repeat_forever=True,
-        visible_channels=["ch00", "ch03"],
+        visible_ports=["ch00", "ch03"],
     )
+    remote.open()
+    assert remote.clock_hz == 100_000_000
+    state = state.aligned_to_catalog(remote.port_catalog)
     pulse = na.bind_pulse(remote, state)
     try:
         pulse.set_time(2_000)
@@ -4769,7 +4785,7 @@ def test_remote_pulse_controller_sends_pulse_table_x_over_json_protocol(tmp_path
 
     assert remote.channels == hardware_channels
     assert remote.clock_hz == 100_000_000
-    assert snapshot["slots"] == {"s0": 2_000.0}
+    assert snapshot["slots"] == {"duration": 2_000.0}
     assert program.channels == hardware_channels
     assert program.ticks == [0, 10, 210, 220]
     assert program.masks == [1 << 0, (1 << 0) | (1 << 3), 0, 0]
@@ -4810,11 +4826,9 @@ def test_remote_detection_time_scan_uses_bound_pulse_controller_over_json_protoc
     remote = na.RemoteSequencer(
         host="127.0.0.1",
         port=port,
-        channels=["ch00", "ch03"],
-        clock_hz=1.0,
     )
     state = na.PulseTableState(
-        channels=["ch00", "ch02", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch02", "ch03"]),
         periods=[
             na.PulsePeriod(100, (1, 0, 0), unit="ns"),
             na.PulsePeriod("s0", (1, 1, 1), unit="str (ns)"),
@@ -4824,6 +4838,9 @@ def test_remote_detection_time_scan_uses_bound_pulse_controller_over_json_protoc
         time_step_ns=10,
         repeat_forever=True,
     )
+    remote.open()
+    assert remote.clock_hz == 100_000_000
+    state = state.aligned_to_catalog(remote.port_catalog)
     pulse = na.bind_pulse(remote, state)
     _bench_trigger_cable(exp.devices.camera, remote)      # the remote streamer's edges gate the camera
     try:
@@ -4898,21 +4915,26 @@ def test_real_device_templates_load_without_hardware_connection():
     assert isinstance(remote.sequencer, na.RemoteSequencer)
     assert remote.sequencer.host == "192.168.0.21"
     assert remote.sequencer.port == 18862
-    assert remote.sequencer.channels == hardware_channels
+    # A disconnected remote client has no invented topology; open() binds the
+    # server's PortCatalog and derives raw channels from it.
+    assert remote.sequencer.port_catalog is None
+    assert remote.sequencer.channels == []
     assert remote.sequencer.clock_hz == 50_000_000
     assert remote.sequencer.snapshot()["connected"] is False
 
     exp = na.connect("remote_template", sequencer={"host": "192.168.0.22"})
     assert exp.devices.sequencer.host == "192.168.0.22"
     assert exp.camera.dcam_module_name == na.DEFAULT_DCAM_MODULE
-    assert exp.sequence.channels == ["ch00", "ch03", "ch09", "ch11"]
+    # Offline construction can describe semantic roles, but cannot invent their
+    # physical lanes before the server PortCatalog is connected.
+    assert exp.sequence.channels == ["cooling", "emCCD", "probe", "trap"]
 
     # a BARE config name resolves the bundled file WITH or WITHOUT a .json suffix
     # (a natural thing to type -- must not raise FileNotFoundError).
     suffixed = na.connect("remote_template.json", sequencer={"host": "192.168.0.22"})
     assert isinstance(suffixed.devices.sequencer, na.RemoteSequencer)
     assert suffixed.devices.sequencer.host == "192.168.0.22"
-    assert suffixed.sequence.channels == ["ch00", "ch03", "ch09", "ch11"]
+    assert suffixed.sequence.channels == ["cooling", "emCCD", "probe", "trap"]
 
     try:
         na.load_devices("remote_template", overrides={"sequencer": {"host": "0.0.0.0"}})
@@ -5226,7 +5248,7 @@ def test_pulse_table_delay_is_cyclic_in_preview():
     import Zou_lab_control.neutral_atom as na
 
     st = na.PulseTableState(
-        channels=["ch0"],
+        port_catalog=PortCatalog.from_channels(["ch0"]),
         periods=[na.PulsePeriod(1000, (1,), unit="ns"), na.PulsePeriod(1000, (0,), unit="ns")],
         time_step_ns=20,
     )  # frame = 2000 ns, ch0 ON [0,1000)
@@ -5262,7 +5284,7 @@ def _additive_truth(state, *, slots, time_step_ns, channels, n_ticks):
     table_end = starts[-1]
     bus_members = {c for members in state.bus_channels().values() for c in members}
     delays, intervals = {}, {}
-    for ci, ch in enumerate(state.channels):
+    for ci, ch in enumerate(state.port_catalog.raw_lanes):
         if ch in bus_members:
             continue
         delays[ch] = state.delay_steps(ch, slots=slots, time_step_ns=time_step_ns)
@@ -5320,7 +5342,7 @@ def _scan_point_geometry(state, *, point_ns, time_step_ns):
     table_end = starts[-1]
     bus_members = {c for members in state.bus_channels().values() for c in members}
     geom = {}
-    for ci, ch in enumerate(state.channels):
+    for ci, ch in enumerate(state.port_catalog.raw_lanes):
         if ch in bus_members:
             continue
         d = state.delay_steps(ch, slots=point_ns, time_step_ns=time_step_ns)
@@ -5429,7 +5451,7 @@ def test_pulse_table_repeat_forever_delay_is_additive_in_hardware():
     from fpga.pulse_streamer.host import engine_model as em
 
     st = na.PulseTableState(
-        channels=["ch0"],
+        port_catalog=PortCatalog.from_channels(["ch0"]),
         periods=[na.PulsePeriod(1000, (1,), unit="ns"), na.PulsePeriod(1000, (0,), unit="ns")],
         time_step_ns=20,
     )  # frame 2000 ns = 100 ticks; ch0 ON [0,1000) = ticks [0,50)
@@ -5465,7 +5487,7 @@ def test_pulse_table_negative_delay_global_retranslate_in_hardware():
     from fpga.pulse_streamer.host import engine_model as em
 
     st = na.PulseTableState(
-        channels=["a", "b"],
+        port_catalog=PortCatalog.from_channels(["a", "b"]),
         periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
         time_step_ns=20,
     )  # frame 100 ticks; a,b ON [0,50)
@@ -5603,13 +5625,12 @@ def test_image_pack_zeros_all_bus_delays_no_stale():
 
     # An active TTL channel with a NEGATIVE delay -> global shift G delays the DA bus.
     state = na.PulseTableState(
-        channels=["ch0", "ch1", "ch2"],
-        channel_labels={"ch0": "cooling", "ch1": "da_dipole[0]", "ch2": "da_dipole[1]"},
-        visible_channels=["ch0", "ch1", "ch2"], time_step_ns=20.0,
+        port_catalog=PortCatalog.from_channels(["ch0", "ch1", "ch2"], channel_labels={"ch0": "cooling", "ch1": "da_dipole[0]", "ch2": "da_dipole[1]"}),
+        visible_ports=["ch0", "da_dipole"], time_step_ns=20.0,
         periods=[na.PulsePeriod(200, (1, 0, 0), unit="ns")],
         analog_bus_modes={"da_dipole": [{"mode": "edge", "value": 1}]},
         delays={"ch0": -100.0}, delay_units={"ch0": "ns"})  # -100 ns -> G=5 ticks on the bus
-    prog = compile_pulse_table_runtime_program(state, channels=list(state.channels), clock_hz=50e6)
+    prog = compile_pulse_table_runtime_program(state, clock_hz=50e6)
     assert prog.bus_delays, "an active negative delay should give the driven DA bus a (global-shift) delay"
 
     p = img.StreamerParams()
@@ -5644,7 +5665,7 @@ def test_image_bus_delay_ctrl_packing_roundtrip():
     labels["ch10"] = "trig"
     for d_ns in (1500, 2000, 30000):      # 75t (<T after compile), frame-ish, and far above T
         state = na.PulseTableState(
-            channels=hw, channel_labels=labels, visible_channels=hw, time_step_ns=20,
+            port_catalog=PortCatalog.from_channels(hw, channel_labels=labels), visible_ports=["da", "ch10", "ch11"], time_step_ns=20,
             periods=[na.PulsePeriod(100, tuple([0] * 10 + [1, 0]), unit="ns"),
                      na.PulsePeriod(200, tuple([0] * 12), unit="ns"),
                      na.PulsePeriod(100, tuple([0] * 12), unit="ns")],
@@ -5652,7 +5673,7 @@ def test_image_bus_delay_ctrl_packing_roundtrip():
             delay_units={f"ch{i:02d}": "ns" for i in range(10)})
         state.bind_field("dac", "da@1")
         state.set_scan_table([[0], [256], [768], [1023]])
-        prog = na.compile_pulse_table_scan_runtime_program(state, channels=hw, clock_hz=50_000_000)
+        prog = na.compile_pulse_table_scan_runtime_program(state, clock_hz=50_000_000)
         assert prog.bus_delays, "a delayed DAC bus should carry a bus_delays entry"
         p = img.StreamerParams()
         w = img.pack_program(prog, p)
@@ -5677,7 +5698,7 @@ def test_scanned_dac_value_delayed_beyond_one_frame_compiles_and_streams():
     labels = {f"ch{i:02d}": f"da[{i}]" for i in range(10)}
     labels["ch10"] = "trig"
     state = na.PulseTableState(
-        channels=hw, channel_labels=labels, visible_channels=hw, time_step_ns=20,
+        port_catalog=PortCatalog.from_channels(hw, channel_labels=labels), visible_ports=["da", "ch10", "ch11"], time_step_ns=20,
         periods=[na.PulsePeriod(100, tuple([0] * 10 + [1, 0]), unit="ns"),
                  na.PulsePeriod(200, tuple([0] * 12), unit="ns"),
                  na.PulsePeriod(100, tuple([0] * 12), unit="ns")],
@@ -5690,7 +5711,7 @@ def test_scanned_dac_value_delayed_beyond_one_frame_compiles_and_streams():
     codes = [v + 512 for v in signed_values]         # wire codes 0 / 256 / 768 / 1023
     state.set_scan_table([[v] for v in signed_values])
 
-    prog = na.compile_pulse_table_scan_runtime_program(state, channels=hw, clock_hz=50_000_000)
+    prog = na.compile_pulse_table_scan_runtime_program(state, clock_hz=50_000_000)
     na.validate_pulse_streamer_program(prog, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=12)
 
     T = int(prog.loop_end_tick)
@@ -5722,8 +5743,7 @@ def test_fixed_dac_bus_delayed_beyond_one_frame_compiles_and_streams():
 
     hw = ["ch00", "ch01", "ch02"]
     state = na.PulseTableState(
-        channels=hw, channel_labels={"ch00": "da[0]", "ch01": "da[1]", "ch02": "trig"},
-        visible_channels=hw, time_step_ns=20,
+        port_catalog=PortCatalog.from_channels(hw, channel_labels={"ch00": "da[0]", "ch01": "da[1]", "ch02": "trig"}), visible_ports=["da", "ch02"], time_step_ns=20,
         periods=[na.PulsePeriod(100, (0, 0, 1), unit="ns"),
                  na.PulsePeriod(200, (0, 0, 0), unit="ns"),
                  na.PulsePeriod(100, (0, 0, 0), unit="ns")],
@@ -5731,7 +5751,7 @@ def test_fixed_dac_bus_delayed_beyond_one_frame_compiles_and_streams():
     state.set_analog_bus_mode(0, "da", "edge", value=0)   # 0 = true 0 V (wire code 2)
     state.set_analog_bus_mode(1, "da", "edge", value=1)   # 2-bit bus: signed -2..+1 -> wire code 3
     state.apply_analog_bus_modes_to_period_states()
-    prog = compile_pulse_table_runtime_program(state, channels=hw, clock_hz=50e6, repeat_forever=True)
+    prog = compile_pulse_table_runtime_program(state, clock_hz=50e6, repeat_forever=True)
     na.validate_pulse_streamer_program(prog, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=3)
 
     T = int(prog.loop_end_tick)
@@ -5978,7 +5998,7 @@ def test_delay_eligibility_enforced_in_api():
 
     seq = na.VirtualSequencer(channels=[f"ch{i:02d}" for i in range(62)],
                               clock_hz=50e6)
-    st = na.PulseTableState(channels=[f"ch{i:02d}" for i in range(62)],
+    st = na.PulseTableState(port_catalog=PortCatalog.from_channels([f"ch{i:02d}" for i in range(62)]),
                             periods=[na.PulsePeriod(1000, (0,) * 62, unit="ns")], time_step_ns=20)
     ctl = na.bind_pulse(seq, st)
     ctl.set_channel_delay("ch11", 1000.0)                     # eligible (position 11) -> OK
@@ -6031,7 +6051,7 @@ def test_repeat_forever_delay_is_physical_not_reduced():
     d_ticks = 100 * d_frames
     d_ns = d_ticks * 20                      # 20 ns/tick
     state = na.PulseTableState(
-        channels=["ch00", "ch01"], visible_channels=["ch00", "ch01"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch01"]), visible_ports=["ch00", "ch01"],
         periods=[na.PulsePeriod(1000, (1, 0), unit="ns"),
                  na.PulsePeriod(1000, (0, 1), unit="ns")],
         time_step_ns=20,
@@ -6060,7 +6080,7 @@ def test_repeat_forever_delay_is_physical_not_reduced():
     # ...and a delay so long the in-flight edges exceed the FIFO is REJECTED (no
     # modulo papers over it), with the longest physical delay reported.
     state2 = na.PulseTableState(
-        channels=["ch00", "ch01"], visible_channels=["ch00", "ch01"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch01"]), visible_ports=["ch00", "ch01"],
         periods=[na.PulsePeriod(1000, (1, 0), unit="ns"),
                  na.PulsePeriod(1000, (0, 1), unit="ns")],
         time_step_ns=20,
@@ -6392,14 +6412,15 @@ def test_repeat_forever_scan_resweeps_and_commands_fpga():
     from fpga.pulse_streamer.host import engine_model as em
 
     # A scanned DURATION with enough points to STREAM (N > 2*bank_size).
-    st = na.PulseTableState(channels=["a", "b"],
+    st = na.PulseTableState(port_catalog=PortCatalog.from_channels(["a", "b"]),
         periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
         time_step_ns=20)
     st.bind_field("duration", "1", unit="ns")
     st.set_scan_table([[1000.0 + 100.0 * k] for k in range(10)])   # 10 duration points
     st.repeat_forever = True
 
-    prog = na.compile_runtime_program_for_payload(st, channels=["a", "b"], clock_hz=50e6)
+    prog = na.compile_runtime_program_for_payload(
+        st, port_catalog=st.port_catalog, clock_hz=50e6)
     assert prog.repeat_forever and len(prog.scan_points) == 10
 
     # bank_size 4 -> 2*bank_size = 8 < 10 points, so the scan must STREAM the extra chunk(s).
@@ -6454,7 +6475,7 @@ def _assert_scan_matches_oracle(state, *, channels, clock_hz, repeat_forever, n_
     from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import validate_pulse_streamer_program
 
     prog = na.compile_pulse_table_scan_runtime_program(
-        state, channels=channels, clock_hz=clock_hz, repeat_forever=repeat_forever)
+        state, clock_hz=clock_hz, repeat_forever=repeat_forever)
     validate_pulse_streamer_program(prog, channel_count=62)
     r = _agree_models(prog, n_ticks)
     truth = _additive_scan_truth(
@@ -6473,7 +6494,7 @@ def test_constant_delay_crosses_inner_bracket_boundary_is_supported():
     from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import validate_pulse_streamer_program
 
     st = na.PulseTableState(
-        channels=["a", "b"],
+        port_catalog=PortCatalog.from_channels(["a", "b"]),
         periods=[
             na.PulsePeriod(1000, (0, 0), unit="ns", name="pre"),
             na.PulsePeriod(1000, (1, 0), unit="ns", name="loop0"),   # bracket start; a ON here
@@ -6499,7 +6520,7 @@ def test_scanned_duration_of_bracketed_period_plus_delay():
     import Zou_lab_control.neutral_atom as na
 
     st = na.PulseTableState(
-        channels=["A", "B"],
+        port_catalog=PortCatalog.from_channels(["A", "B"]),
         periods=[
             na.PulsePeriod(1000, (1, 0), unit="ns"),
             na.PulsePeriod("s0", (0, 1), unit="str (ns)"),    # scanned duration, bracketed
@@ -6524,8 +6545,7 @@ def test_scanned_dac_of_bracketed_period_plus_delay():
     from fpga.pulse_streamer.host import engine_model as em
 
     st = na.PulseTableState(
-        channels=["ch00", "ch01", "ch02", "ch03"],
-        channel_labels={"ch00": "da[0]", "ch01": "da[1]", "ch02": "cool", "ch03": "trig"},
+        port_catalog=PortCatalog.from_channels(["ch00", "ch01", "ch02", "ch03"], channel_labels={"ch00": "da[0]", "ch01": "da[1]", "ch02": "cool", "ch03": "trig"}),
         time_step_ns=20,
         periods=[
             na.PulsePeriod(1000, (0, 0, 1, 0), unit="ns"),
@@ -6541,7 +6561,13 @@ def test_scanned_dac_of_bracketed_period_plus_delay():
     plan = u.analog_bus_plan("da")
     assert sum(1 for entry in plan if str(entry.get("value")) == "s0") == 2
     for rf in (False, True):
-        prog = _assert_scan_matches_oracle(st, channels=list(st.channels), clock_hz=50e6, repeat_forever=rf, n_ticks=1600)
+        prog = _assert_scan_matches_oracle(
+            st,
+            channels=list(st.port_catalog.raw_lanes),
+            clock_hz=50e6,
+            repeat_forever=rf,
+            n_ticks=1600,
+        )
         assert 1 in {int(getattr(s, "value_select", 0)) for s in prog.bus_segments}
         # the DAC bus carries the scanned code at each scan point (1 then 3).
         assert 1 in set(em.bus_play(prog, 0, 800, scan_point=0))
@@ -6575,7 +6601,7 @@ def test_constant_delay_with_scanned_duration_is_output_delay_line():
 
     def build(delays):
         st = na.PulseTableState(
-            channels=chans,
+            port_catalog=PortCatalog.from_channels(chans),
             periods=[na.PulsePeriod(1000, (1, 1, 0), unit="ns"),   # trig + a ON
                      na.PulsePeriod(1000, (0, 0, 1), unit="ns")],  # b ON
             time_step_ns=20,
@@ -6585,8 +6611,14 @@ def test_constant_delay_with_scanned_duration_is_output_delay_line():
         st.set_scan_table([[1000.0], [2000.0], [3000.0]])   # three duration points
         return st
 
-    pd = cscan(build({"trig": D_ns}), channels=chans, clock_hz=50e6, repeat_forever=True)
-    p0 = cscan(build({}), channels=chans, clock_hz=50e6, repeat_forever=True)
+    delayed = build({"trig": D_ns})
+    undelayed = build({})
+    pd = cscan(
+        delayed, port_catalog=delayed.port_catalog,
+        clock_hz=50e6, repeat_forever=True)
+    p0 = cscan(
+        undelayed, port_catalog=undelayed.port_catalog,
+        clock_hz=50e6, repeat_forever=True)
     bit = pd.channels.index("trig")
     d_ticks = D_ns / 20   # 75
     assert pd.channel_delays[bit] == d_ticks
@@ -6619,8 +6651,7 @@ def test_constant_delay_with_scanned_dac_value_is_output_delay_line():
 
     def build(delays):
         st = na.PulseTableState(
-            channels=chans,
-            channel_labels={"ch00": "da[0]", "ch01": "da[1]", "ch02": "cool", "ch03": "trig"},
+            port_catalog=PortCatalog.from_channels(chans, channel_labels={"ch00": "da[0]", "ch01": "da[1]", "ch02": "cool", "ch03": "trig"}),
             time_step_ns=20,
             periods=[na.PulsePeriod(1000, (0, 0, 1, 0), unit="ns"),   # cool ON
                      na.PulsePeriod(1000, (0, 0, 0, 1), unit="ns"),   # trig ON (delayed channel)
@@ -6631,8 +6662,14 @@ def test_constant_delay_with_scanned_dac_value_is_output_delay_line():
         st.set_scan_table([[-1.0], [1.0]])                       # signed -> wire codes 1 and 3
         return st
 
-    pd = cscan(build({"ch03": D_ns}), channels=chans, clock_hz=50e6, repeat_forever=True)
-    p0 = cscan(build({}), channels=chans, clock_hz=50e6, repeat_forever=True)
+    delayed = build({"ch03": D_ns})
+    undelayed = build({})
+    pd = cscan(
+        delayed, port_catalog=delayed.port_catalog,
+        clock_hz=50e6, repeat_forever=True)
+    p0 = cscan(
+        undelayed, port_catalog=undelayed.port_catalog,
+        clock_hz=50e6, repeat_forever=True)
     bit = pd.channels.index("ch03")
     d_ticks = D_ns / 20   # 75
     assert pd.channel_delays[bit] == d_ticks
@@ -6665,7 +6702,7 @@ def test_constant_delay_with_inner_bracket_is_output_delay_line():
 
     def build(delays):
         return na.PulseTableState(
-            channels=chans,
+            port_catalog=PortCatalog.from_channels(chans),
             periods=[na.PulsePeriod(1000, (0, 0), unit="ns", name="pre"),
                      na.PulsePeriod(1000, (1, 0), unit="ns", name="loop0"),   # trig ON inside bracket
                      na.PulsePeriod(1000, (0, 0), unit="ns", name="loop1"),
@@ -6705,7 +6742,7 @@ def test_negative_constant_delay_folds_global_shift_into_channel_delays():
 
     def build(delays):
         return na.PulseTableState(
-            channels=chans,
+            port_catalog=PortCatalog.from_channels(chans),
             periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
             time_step_ns=20,
             delays=delays, delay_units=({"a": "ns"} if delays else {}),
@@ -6738,7 +6775,7 @@ def test_unrolled_bracket_overflow_raises_actionable_error():
     width = len(channels)
     periods = [na.PulsePeriod(100, tuple(1 if (i + p) % 2 else 0 for i in range(width)), unit="ns") for p in range(60)]
     st = na.PulseTableState(
-        channels=channels, periods=periods, time_step_ns=20,
+        port_catalog=PortCatalog.from_channels(channels), periods=periods, time_step_ns=20,
         repeat_start=0, repeat_end=59, repeat_count=10_000,
         delays={"ch00": 200}, delay_units={"ch00": "ns"}, repeat_forever=False)
     with pytest.raises(ValueError, match="repeat"):
@@ -6749,19 +6786,17 @@ def test_unrolled_bracket_overflow_raises_actionable_error():
 # Regression guards for the 2026-06-09 audit fixes (config single-source +
 # correctness bugs found in pulse_table / sequencer).
 # --------------------------------------------------------------------------- #
-def test_aligned_to_channels_preserves_clk_channels():
-    """BUG: aligned_to_channels dropped clk_channels, so aligning a saved table onto the
-    device channel list silently reverted a clk-wired channel to engine-driven (its clk pin
-    stopped clocking).  It must survive the align, filtered to the surviving channels."""
+def test_aligned_to_catalog_preserves_clock_topology():
+    """Clock ownership comes from the target device catalog during alignment."""
 
     state = na.PulseTableState(
-        channels=["a", "b", "c"],
+        port_catalog=PortCatalog.from_channels(["a", "b", "c"], clk_channels=["c"]),
         periods=[na.PulsePeriod(1000, (1, 0, 0), unit="ns")],
         time_step_ns=20.0,
-        clk_channels=["c"],
     )
-    aligned = state.aligned_to_channels(["a", "b", "c", "d"])   # superset (the real device list)
-    assert aligned.clk_channels == ["c"]
+    target = PortCatalog.from_channels(["a", "b", "c", "d"], clk_channels=["c"])
+    aligned = state.aligned_to_catalog(target)
+    assert [port.lanes[0] for port in aligned.port_catalog.clock_ports] == ["c"]
     assert aligned.clk_enable_mask() == (1 << 2)
 
 
@@ -6772,12 +6807,11 @@ def test_validate_rejects_clk_channel_that_is_bus_member():
     inferred from labels, not just explicit analog_buses."""
 
     channels = [f"da_x[{i}]" for i in range(10)] + ["trig"]
-    with pytest.raises(ValueError, match="clk channels must not be analog-bus members"):
+    with pytest.raises(ValueError, match="clock lanes cannot belong to DAC ports"):
         na.PulseTableState(
-            channels=channels,
+            port_catalog=PortCatalog.from_channels(channels, clk_channels=["da_x[0]"]),
             periods=[na.PulsePeriod(1000, tuple([0] * 11), unit="ns")],
-            time_step_ns=20.0,
-            clk_channels=["da_x[0]"],   # da_x[0..9] infer to bus "da_x" -> da_x[0] is a member
+            time_step_ns=20.0,   # da_x[0..9] infer to bus "da_x" -> da_x[0] is a member
         )
 
 
@@ -6800,7 +6834,7 @@ def test_snap_scan_table_rejects_width_mismatch_in_both_directions():
 def _two_slot_scan_state() -> "na.PulseTableState":
     """A 2-slot pulse table (both durations, distinct nominals) for width-contract tests."""
     return na.PulseTableState(
-        channels=["trap", "trig"],
+        port_catalog=PortCatalog.from_channels(["trap", "trig"]),
         periods=[
             na.PulsePeriod("s0", (1, 0), unit="str (ns)"),
             na.PulsePeriod("s1", (0, 1), unit="str (ns)"),
@@ -6825,7 +6859,7 @@ def test_set_scan_table_rejects_short_rows_with_actionable_message():
     # The programmatic constructor is equally strict (same experiment-input path).
     with pytest.raises(ValueError, match=r"row 0 has 1 values but 2 scan slot"):
         na.PulseTableState(
-            channels=["trap", "trig"],
+            port_catalog=PortCatalog.from_channels(["trap", "trig"]),
             periods=[
                 na.PulsePeriod("s0", (1, 0), unit="str (ns)"),
                 na.PulsePeriod("s1", (0, 1), unit="str (ns)"),
@@ -6839,22 +6873,18 @@ def test_set_scan_table_rejects_short_rows_with_actionable_message():
         )
 
 
-def test_from_dict_pads_legacy_short_scan_rows_with_nominal_and_warns(caplog):
-    """The ONE tolerated short-row source: a PERSISTED payload (an old save written before a
-    second slot was bound).  from_dict pads the missing column with the bound slot's NOMINAL
-    (bind_field's rule -- never 0.0) and logs a warning naming the payload and the slots."""
-    import logging
+def test_from_dict_rejects_every_scan_table_width_mismatch():
+    """Deserialization enforces the same exact slot width as construction and mutation.
 
+    A persisted payload is executable experiment input; silently inventing a missing
+    column from a nominal value would run a different experiment.
+    """
     state = _two_slot_scan_state()
     state.set_scan_table([[20.0, 40.0], [60.0, 80.0]])
     payload = state.to_dict()
-    payload["scan_table"] = [[20.0], [60.0]]   # legacy save: rows predate the s1 binding
-    with caplog.at_level(logging.WARNING, logger="Zou_lab_control.neutral_atom.timing.pulse_table"):
-        loaded = na.PulseTableState.from_dict(payload)
-    assert loaded.scan_table == [[20.0, 200.0], [60.0, 200.0]]   # s1's nominal, NOT 0.0
-    messages = [record.getMessage() for record in caplog.records]
-    assert any(str(payload["name"]) in message and "nominal" in message for message in messages)
-    # A too-wide persisted row is still an error (silent column drop = data loss).
+    payload["scan_table"] = [[20.0], [60.0]]
+    with pytest.raises(ValueError, match=r"row 0 has 1 values but 2 scan slot"):
+        na.PulseTableState.from_dict(payload)
     payload["scan_table"] = [[20.0, 40.0, 60.0]]
     with pytest.raises(ValueError, match=r"row 0 has 3 values but only 2 scan slot"):
         na.PulseTableState.from_dict(payload)
@@ -6866,7 +6896,7 @@ def test_scan_compile_snaps_zero_duration_to_one_tick_on_direct_call():
     (zero-length) period the engine cannot play.  The snap must hold at this entry point too."""
 
     state = na.PulseTableState(
-        channels=["trap", "trig"],
+        port_catalog=PortCatalog.from_channels(["trap", "trig"]),
         periods=[
             na.PulsePeriod(100, (1, 0), unit="ns"),
             na.PulsePeriod("s0", (0, 1), unit="str (ns)"),
@@ -6875,7 +6905,7 @@ def test_scan_compile_snaps_zero_duration_to_one_tick_on_direct_call():
         time_step_ns=20,
     )
     state.set_scan_table([[0.0], [30000.0]])   # first point: 0 ns -> must snap UP to 1 tick
-    prog = na.compile_pulse_table_scan_runtime_program(state, channels=["trap", "trig"], clock_hz=50e6)
+    prog = na.compile_pulse_table_scan_runtime_program(state, clock_hz=50e6)
     assert prog.scan_points[0][0] == 1          # 0 ns -> one 20 ns tick, never 0
     assert prog.scan_points[1][0] == 1500       # 30000 ns -> 1500 ticks (unchanged)
 
@@ -6943,13 +6973,13 @@ def test_unrolled_bracket_preserves_clk_channels():
     compile (which unrolls first) silently reverted a clk channel to engine-driven."""
 
     state = na.PulseTableState(
-        channels=["D0", "D1"],
+        port_catalog=PortCatalog.from_channels(["D0", "D1"], clk_channels=["D1"]),
         periods=[na.PulsePeriod(10, (1, 0), unit="ns"), na.PulsePeriod(20, (0, 1), unit="ns")],
         repeat_start=0, repeat_end=1, repeat_count=2,
-        clk_channels=["D1"], time_step_ns=20,
+        time_step_ns=20,
     )
     unrolled = state.unrolled_bracket()
-    assert unrolled.clk_channels == ["D1"]
+    assert [port.lanes[0] for port in unrolled.port_catalog.clock_ports] == ["D1"]
     assert unrolled.clk_enable_mask() == (1 << 1)
     assert len(unrolled.periods) == 4   # bracket [P0,P1] x2 unrolled
 
@@ -6962,9 +6992,8 @@ def test_remapped_target_single_source_for_bracket_index():
     ``delay`` channel name / non-numeric ``duration`` expression carries through unchanged."""
 
     state = na.PulseTableState(
-        channels=["D0", "D1", "D2", "D3"],
+        port_catalog=PortCatalog.from_channels(["D0", "D1", "D2", "D3"], analog_buses={"busA": ["D0", "D1"]}),
         periods=[na.PulsePeriod(10, (1, 0, 0, 0), unit="ns") for _ in range(6)],
-        analog_buses={"busA": ["D0", "D1"]},
         repeat_start=1, repeat_end=3, repeat_count=3, time_step_ns=20,
     )
     # bracket [1..3] x3 -> period 5 shifts to 5 + (3-1)*3 = 11; an in-bracket index maps to its
@@ -6979,9 +7008,8 @@ def test_remapped_target_single_source_for_bracket_index():
     # The scan-slot and api-slot loops must produce identical target remapping for the same
     # (kind, target) -- proving they share the one helper rather than two drifting copies.
     unrolled = na.PulseTableState(
-        channels=["D0", "D1", "D2", "D3"],
+        port_catalog=PortCatalog.from_channels(["D0", "D1", "D2", "D3"], analog_buses={"busA": ["D0", "D1"]}),
         periods=[na.PulsePeriod(10, (1, 0, 0, 0), unit="ns") for _ in range(6)],
-        analog_buses={"busA": ["D0", "D1"]},
         scan_slots=[
             {"kind": "duration", "target": "5", "label": "L"},
             {"kind": "dac", "target": "busA@4"},
@@ -7028,11 +7056,11 @@ def test_clk_channel_unknown_raises_not_silently_dropped():
     """BUG 1.5: an unknown clk channel (typo / stale config) used to be silently filtered
     out, leaving clk quietly disabled.  It must raise at construction (validate)."""
 
-    with pytest.raises(ValueError, match="clk channels are not in hardware channels"):
+    with pytest.raises(ValueError, match="clock lanes are not in raw_lanes"):
         na.PulseTableState(
-            channels=["D0", "D1"],
+            port_catalog=PortCatalog.from_channels(["D0", "D1"], clk_channels=["D9_typo"]),
             periods=[na.PulsePeriod(100, (0, 0), unit="ns")],
-            clk_channels=["D9_typo"], time_step_ns=20,
+            time_step_ns=20,
         )
 
 
@@ -7045,7 +7073,8 @@ def test_load_scan_table_1d_reshaped_by_slot_count(tmp_path):
     p = tmp_path / "scan.npy"
     np.save(p, np.array([1.0, 2.0, 3.0]))
     assert load_scan_table(p, n_slots=1) == [[1.0], [2.0], [3.0]]      # 3 points x 1 slot
-    assert load_scan_table(p, n_slots=None) == [[1.0, 2.0, 3.0]]       # legacy: single row
+    with pytest.raises(ValueError, match="1-D scan table is ambiguous"):
+        load_scan_table(p, n_slots=None)
     np.save(p, np.array([1.0, 2.0, 3.0, 4.0]))
     assert load_scan_table(p, n_slots=2) == [[1.0, 2.0], [3.0, 4.0]]   # 2 points x 2 slots
     # a 2-D file is untouched by the reshape
@@ -7073,48 +7102,57 @@ def test_dac_scan_empty_table_static_compile_uses_reference_code():
     # slot from the reference values instead.
     ch = [f"da[{i}]" for i in range(10)] + ["trig"]
     st = na.PulseTableState(
-        channels=ch, periods=[na.PulsePeriod(1000, tuple([0] * 10 + [1]), unit="ns")],
+        port_catalog=PortCatalog.from_channels(ch), periods=[na.PulsePeriod(1000, tuple([0] * 10 + [1]), unit="ns")],
         scan_slots=[{"kind": "dac", "target": "da@0", "unit": "value", "nominal": 256.0}],
         analog_bus_modes={"da": [{"mode": "edge", "value": "s0"}]},
         scan_table=[], time_step_ns=20,
     )
-    prog = na.compile_runtime_program_for_payload(st, channels=ch, clock_hz=50e6)
+    prog = na.compile_runtime_program_for_payload(
+        st, port_catalog=st.port_catalog, clock_hz=50e6)
     segs = prog.bus_segments or []
     assert any(int(s.start_value) == 768 and int(s.value_select) == 0 for s in segs)   # signed 256 -> code 768
 
 
 def test_clk_enable_mask_uses_hardware_channel_order():
-    # BUG: clk_enable was computed in state.channels order but the edge masks use the
-    # COMPILED channel order; a different order pointed the mask at the wrong bit.
-    st = na.PulseTableState(channels=["a", "clk"], periods=[na.PulsePeriod(100, (1, 0), unit="ns")],
-                            clk_channels=["clk"], time_step_ns=20)
-    prog = na.compile_runtime_program_for_payload(st, channels=["clk", "a"], clock_hz=50e6)
+    # clk_enable is computed in the one catalog raw-lane order used by the edge masks.
+    catalog = PortCatalog.from_channels(["clk", "a"], clk_channels=["clk"])
+    st = na.PulseTableState(
+        port_catalog=catalog,
+        periods=[na.PulsePeriod(100, (0, 1), unit="ns")],
+        time_step_ns=20,
+    )
+    prog = na.compile_runtime_program_for_payload(
+        st, port_catalog=catalog, clock_hz=50e6)
     assert prog.channels == ["clk", "a"]
-    assert prog.clk_enable == 1   # clk is channels[0] in the compiled order -> bit 0
+    assert prog.clk_enable == 1
 
 
 def test_off_or_clk_channel_delay_does_not_shift_active_channels():
     # BUG: an OFF channel (or a clk channel) with a (negative) delay entered the global
     # shift G and delayed OTHER active channels for no physical reason.
-    off = na.PulseTableState(channels=["a", "b"], periods=[na.PulsePeriod(100, (1, 0), unit="ns")],
+    off = na.PulseTableState(port_catalog=PortCatalog.from_channels(["a", "b"]), periods=[na.PulsePeriod(100, (1, 0), unit="ns")],
                              delays={"b": -20}, delay_units={"b": "ns"}, time_step_ns=20)
-    assert not na.compile_runtime_program_for_payload(off, channels=["a", "b"], clock_hz=50e6).channel_delays
-    clk = na.PulseTableState(channels=["clk", "a"], periods=[na.PulsePeriod(100, (0, 1), unit="ns")],
-                             clk_channels=["clk"], delays={"clk": -20}, delay_units={"clk": "ns"}, time_step_ns=20)
-    assert not na.compile_runtime_program_for_payload(clk, channels=["clk", "a"], clock_hz=50e6).channel_delays
+    assert not na.compile_runtime_program_for_payload(
+        off, port_catalog=off.port_catalog, clock_hz=50e6).channel_delays
+    clk = na.PulseTableState(port_catalog=PortCatalog.from_channels(["clk", "a"], clk_channels=["clk"]), periods=[na.PulsePeriod(100, (0, 1), unit="ns")],
+                             delays={"clk": -20}, delay_units={"clk": "ns"}, time_step_ns=20)
+    assert not na.compile_runtime_program_for_payload(
+        clk, port_catalog=clk.port_catalog, clock_hz=50e6).channel_delays
 
 
 def test_with_slots_resolved_missing_slots_use_reference_not_zero():
     # BUG: with_slots_resolved defaulted unspecified slots to 0, silently zeroing other
     # periods/DAC levels; they must keep their nominal (reference) value.
     st = na.PulseTableState(
-        channels=["a"],
+        port_catalog=PortCatalog.from_channels(["a"]),
         periods=[na.PulsePeriod("s0", (1,), unit="str (ns)"), na.PulsePeriod("s1", (1,), unit="str (ns)")],
-        scan_slots=[{"kind": "duration", "target": "0", "unit": "ns", "nominal": 60.0},
-                    {"kind": "duration", "target": "1", "unit": "ns", "nominal": 80.0}],
+        scan_slots=[{"name": "first", "kind": "duration", "target": "0",
+                     "label": "first", "unit": "ns", "nominal": 60.0},
+                    {"name": "second", "kind": "duration", "target": "1",
+                     "label": "second", "unit": "ns", "nominal": 80.0}],
         time_step_ns=20,
     )
-    resolved = st.with_slots_resolved({"s0": 100.0})
+    resolved = st.with_slots_resolved({"first": 100.0})
     assert float(resolved.periods[0].duration) == 100.0
     assert float(resolved.periods[1].duration) == 80.0
 
@@ -7124,21 +7162,21 @@ def test_delay_expression_referencing_scanned_slot_is_rejected():
     # reference value in a scan compile; the scan compiler must reject it.
     import pytest
     st = na.PulseTableState(
-        channels=["a", "trig"],
+        port_catalog=PortCatalog.from_channels(["a", "trig"]),
         periods=[na.PulsePeriod(100, (1, 0), unit="ns"), na.PulsePeriod("s0", (0, 1), unit="str (ns)")],
         scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 100.0}],
         scan_table=[[100.0], [200.0]],
         delays={"a": "s0/2"}, delay_units={"a": "str (ns)"}, time_step_ns=20,
     )
     with pytest.raises(ValueError, match="cannot be scanned"):
-        na.compile_pulse_table_scan_runtime_program(st, channels=["a", "trig"], clock_hz=50e6)
+        na.compile_pulse_table_scan_runtime_program(st, clock_hz=50e6)
 
 
 def test_timing_payload_to_dict_snaps_to_target_clock():
     # BUG: timing_payload_to_dict pre-snapped on the PAYLOAD grid; a state saved at 20 ns
     # diverged from a direct compile at the server's clock. It must snap to the target tick.
     from Zou_lab_control.neutral_atom.devices.sequencer import timing_payload_to_dict
-    st = na.PulseTableState(channels=["a"], periods=[na.PulsePeriod(14, (1,), unit="ns")], time_step_ns=20)
+    st = na.PulseTableState(port_catalog=PortCatalog.from_channels(["a"]), periods=[na.PulsePeriod(14, (1,), unit="ns")], time_step_ns=20)
     assert float(timing_payload_to_dict(st, time_step_ns=10.0)["periods"][0]["duration"]) == 10.0
     assert float(timing_payload_to_dict(st)["periods"][0]["duration"]) == 20.0
 
@@ -7147,14 +7185,14 @@ def test_negative_literal_duration_rejected():
     # BUG: a negative literal period duration was silently snapped up to one tick.
     import pytest
     with pytest.raises(ValueError, match="must be >= 0"):
-        na.PulseTableState(channels=["a"], periods=[na.PulsePeriod(-100, (1,), unit="ns")], time_step_ns=20)
+        na.PulseTableState(port_catalog=PortCatalog.from_channels(["a"]), periods=[na.PulsePeriod(-100, (1,), unit="ns")], time_step_ns=20)
 
 
 def test_pulse_controller_set_scan_table_accepts_numpy():
     # BUG: set_scan_table/payload used `rows or []` / `if table:`, raising on a NumPy array.
     seq = na.VirtualSequencer(channels=["a", "trig"], clock_hz=50e6)
     st = na.PulseTableState(
-        channels=["a", "trig"], periods=[na.PulsePeriod("s0", (1, 0), unit="str (ns)")],
+        port_catalog=PortCatalog.from_channels(["a", "trig"]), periods=[na.PulsePeriod("s0", (1, 0), unit="str (ns)")],
         scan_slots=[{"kind": "duration", "target": "0", "unit": "ns", "nominal": 100.0}],
         scan_table=[[100.0]], time_step_ns=20,
     )
@@ -7168,9 +7206,9 @@ def test_pulse_controller_set_scan_table_accepts_numpy():
 def test_explicit_one_channel_analog_bus_rejected():
     # BUG: an explicit 1-channel analog bus passed validate() but crashed deeper.
     import pytest
-    with pytest.raises(ValueError, match="at least two channels"):
-        na.PulseTableState(channels=["b0", "trig"], periods=[na.PulsePeriod(100, (0, 0), unit="ns")],
-                           analog_buses={"one": ["b0"]}, time_step_ns=20)
+    with pytest.raises(ValueError, match="at least two raw lanes"):
+        na.PulseTableState(port_catalog=PortCatalog.from_channels(["b0", "trig"], analog_buses={"one": ["b0"]}), periods=[na.PulsePeriod(100, (0, 0), unit="ns")],
+                           time_step_ns=20)
 
 
 def test_sequencer_prepare_backstops_invalid_program_geometry():
@@ -7180,7 +7218,7 @@ def test_sequencer_prepare_backstops_invalid_program_geometry():
     seq = na.VirtualSequencer(channels=["a", "b"], clock_hz=50e6)
     # a delay beyond the 32-bit TTL field (~42.9 s) must still be rejected by the backstop
     huge_ns = ((1 << 31) + 10) * 20.0
-    st = na.PulseTableState(channels=["a", "b"], periods=[na.PulsePeriod(100, (1, 1), unit="ns")],
+    st = na.PulseTableState(port_catalog=PortCatalog.from_channels(["a", "b"]), periods=[na.PulsePeriod(100, (1, 1), unit="ns")],
                             delays={"a": 0.0, "b": huge_ns}, delay_units={"a": "ns", "b": "ns"}, time_step_ns=20)
     with pytest.raises(ValueError):
         seq.prepare(st)
@@ -7191,7 +7229,7 @@ def test_sequencer_prepare_accepts_streamed_scan_beyond_resident_window():
     # resident window, 4096) and rejected larger STREAMED scans (e.g. 9999 points),
     # which the architecture explicitly supports (points stream through the window).
     seq = na.VirtualSequencer(channels=["a", "b"], clock_hz=50e6)
-    st = na.PulseTableState(channels=["a", "b"], periods=[na.PulsePeriod(100, (1, 1), unit="ns")],
+    st = na.PulseTableState(port_catalog=PortCatalog.from_channels(["a", "b"]), periods=[na.PulsePeriod(100, (1, 1), unit="ns")],
                             time_step_ns=20)
     st.bind_field("duration", "0")
     st.set_scan_table([[100.0 + 20.0 * (i % 50)] for i in range(9999)])
@@ -7434,7 +7472,7 @@ def test_fire_seed_stale_count_drops_tail_edges_fixed_path_does_not():
     count already covers the program."""
     import fpga.pulse_streamer.host.engine_model as em
     ch = ["cooling", "emccd", "trig"]
-    st = na.PulseTableState(channels=ch, periods=[
+    st = na.PulseTableState(port_catalog=PortCatalog.from_channels(ch), periods=[
         na.PulsePeriod(100, (1, 0, 1), unit="ns"), na.PulsePeriod(100, (0, 1, 0), unit="ns"),
         na.PulsePeriod(100, (1, 0, 0), unit="ns"), na.PulsePeriod(100, (0, 0, 0), unit="ns"),
         na.PulsePeriod(100, (1, 1, 0), unit="ns"), na.PulsePeriod(100, (0, 0, 0), unit="ns"),
@@ -7601,13 +7639,14 @@ def test_signed_dac_user_layer_to_wire_codes_end_to_end():
     assert bus_zero_code(10) == 512 and bus_signed_range(10) == (-512, 511)
     ch = [f"da[{i}]" for i in range(10)] + ["trig"]
     st = na.PulseTableState(
-        channels=ch, time_step_ns=20,
+        port_catalog=PortCatalog.from_channels(ch), time_step_ns=20,
         periods=[na.PulsePeriod(1000, tuple([0] * 10 + [1]), unit="ns"),
                  na.PulsePeriod(1000, tuple([0] * 11), unit="ns")],
     )
     st.set_analog_bus_mode(0, "da", "edge", value=-200)
     st.set_analog_bus_mode(1, "da", "ramp", value=300)
-    prog = na.compile_runtime_program_for_payload(st, channels=ch, clock_hz=50e6)
+    prog = na.compile_runtime_program_for_payload(
+        st, port_catalog=st.port_catalog, clock_hz=50e6)
     segs = [(s.mode, s.start_value, s.stop_value) for s in prog.bus_segments]
     # codes = signed + 512: edge -200 -> 312, ramp TO 300 -> 812.  The ramp START is the live
     # register (carries the edge 312 at runtime), so it is NOT baked -- start_value 0 (#ramp-carry).
@@ -7628,9 +7667,10 @@ def test_untouched_dac_bus_idles_at_mid_code():
     from fpga.pulse_streamer.host.engine_model import bus_play
 
     ch = [f"da[{i}]" for i in range(10)] + ["trig"]
-    st = na.PulseTableState(channels=ch, time_step_ns=20,
+    st = na.PulseTableState(port_catalog=PortCatalog.from_channels(ch), time_step_ns=20,
                             periods=[na.PulsePeriod(1000, tuple([0] * 10 + [1]), unit="ns")])
-    prog = na.compile_runtime_program_for_payload(st, channels=ch, clock_hz=50e6)
+    prog = na.compile_runtime_program_for_payload(
+        st, port_catalog=st.port_catalog, clock_hz=50e6)
     assert not (prog.bus_segments or [])                      # nothing emitted
     assert all(v == 512 for v in bus_play(prog, 0, 50))       # model idles at mid (0 V)
 
@@ -7646,11 +7686,11 @@ def test_untouched_dac_bus_idles_at_mid_code():
 
 
 def test_period_name_round_trips_and_survives_transforms():
-    """Editable period names: stored on PulsePeriod, kept by save/load, aligned_to_channels,
+    """Editable period names: stored on PulsePeriod, kept by save/load, aligned_to_catalog,
     with_slots_resolved and unrolled_bracket (per-copy)."""
 
     st = na.PulseTableState(
-        channels=["a", "b"], time_step_ns=20,
+        port_catalog=PortCatalog.from_channels(["a", "b"]), time_step_ns=20,
         periods=[na.PulsePeriod(100, (1, 0), unit="ns", name="load"),
                  na.PulsePeriod(200, (0, 1), unit="ns", name="image")],
         repeat_start=0, repeat_end=1, repeat_count=2,
@@ -7806,23 +7846,25 @@ def test_signal_hub_publish_latest_history_and_versioning():
     hub.publish({"rate": 0.7, "counts": np.array([4.0, 5.0, 6.0])})
     assert hub.version == 2 and hub.shot == 2
     assert hub.latest("rate") == 0.7
-    assert np.array_equal(hub.latest("counts"), [4.0, 5.0, 6.0])
-    assert hub.history("rate").shape == (2,)
-    assert hub.history("counts", 1).shape == (1, 3)
+    assert np.array_equal(hub.latest("counts"), [[[4.0, 5.0, 6.0]]])
+    assert hub.history("rate").shape == (2, 1, 1, 1)
+    assert hub.history("counts", 1).shape == (1, 1, 1, 3)
     # history is bounded by the ring length
     for i in range(20):
         hub.publish({"rate": float(i)})
-    assert hub.history("rate").shape == (8,)
-    # a shape change keeps only the most recent same-shape run
-    hub.publish({"counts": np.zeros(5)})
-    assert hub.history("counts").shape == (1, 5)
+    assert hub.history("rate").shape == (8, 1, 1, 1)
+    # The first publish binds a schema epoch; a shape change cannot silently
+    # reinterpret the same signal name.
+    with pytest.raises(ValueError, match="schema requires"):
+        hub.publish({"counts": np.zeros(5)})
+    assert hub.history("counts").shape == (2, 1, 1, 3)
     with pytest.raises(KeyError):
         hub.latest("nope")
     # the consumer namespace is a plain dict of copies
     snap = hub.snapshot_latest()
     assert set(snap) == {"rate", "counts"}
-    snap["counts"][0] = 999.0
-    assert hub.latest("counts")[0] != 999.0
+    snap["counts"][0, 0, 0] = 999.0
+    assert hub.latest("counts")[0, 0, 0] != 999.0
 
 
 def test_user_composed_loading_readout_publishes_standard_signals():
@@ -7873,13 +7915,15 @@ def test_user_composed_loading_readout_publishes_standard_signals():
     names = set(hub.names())
     assert {"frame_0", "counts", "occupied", "rate", "centers", "thresholds"} <= names
     assert np.squeeze(hub.latest("frame_0")).shape == (96, 128)
-    assert hub.latest("centers").shape == (n, 2)   # the site-map panel's anchor (static, no repeat)
-    assert hub.latest("thresholds").shape == (n,)
+    assert hub.latest("centers").shape == (1, 1, n, 2)
+    assert hub.latest("thresholds").shape == (1, 1, n)
     occ = np.asarray(hub.latest("occupied"))
     counts = np.asarray(hub.latest("counts"))
-    assert occ.ndim == 3 and occ.shape[1:] == (1, n)   # (repeat, 1, n_sites) -- data_points axis kept
+    assert occ.ndim == 3 and occ.shape[1:] == (1, n)   # (R,P,*data_shape), P=1, data_shape=(n_sites,)
     assert counts.shape == occ.shape
-    assert 0.0 <= float(hub.latest("rate")) <= 1.0                     # this block's loading fraction
+    rate = np.asarray(hub.latest("rate"))
+    assert rate.shape == (1, 1, 1)
+    assert 0.0 <= float(rate.item()) <= 1.0
     # the long-run occupancy mean tracks loading_probability (loose: lifetime losses)
     occupancy = hub.history("occupied", 60)
     assert 0.30 <= float(np.nanmean(occupancy)) <= 0.80
@@ -8111,6 +8155,7 @@ def test_misspelled_readout_method_raises_instead_of_silently_falling_back():
     cal = na.TrapCalibration(
         centers=[(2, 2), (2, 6)],
         thresholds=[5.0, 5.0],
+        frame_contract=na.FrameContract(image_shape=(8, 8)),
         grid_shape=(1, 2),
         method="box",
     )
@@ -8160,7 +8205,10 @@ def test_psf_calibration_serialization_round_trip(tmp_path):
     # out of the on-disk record (this parity is why to_dict/from_dict stay explicit per-field, not
     # a generic fields() loop that would emit raw numpy) (#C2).
     from dataclasses import fields as _dc_fields, replace as _dc_replace
-    assert set(cal.to_dict()) == {f.name for f in _dc_fields(na.TrapCalibration)}
+    assert set(cal.to_dict()) == {
+        *{f.name for f in _dc_fields(na.TrapCalibration)},
+        "schema", "version", "fingerprint",
+    }
     # Inject a per-method entry so the round trip also exercises to_dict's by_method encoder
     # + from_dict's by_method parse (a multi-method calibration carries these).
     cal = _dc_replace(cal, by_method={"box": {"thresholds": cal.thresholds, "psf_weights": None, "psf_boxes": None}})

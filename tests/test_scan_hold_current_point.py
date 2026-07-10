@@ -4,6 +4,7 @@ is a pure, testable transform (PulseSequenceEditor._freeze_state_to_scan_point);
 re-prepares + fires that frozen state through the ordinary sequencer path."""
 
 from __future__ import annotations
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 import os
 import sys
@@ -24,9 +25,8 @@ from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor  # noqa: E402
 
 def _scan_state():
     return na.PulseTableState(
-        channels=["ch00", "ch01", "t"],
-        channel_labels={"ch00": "da[0]", "ch01": "da[1]"},
-        visible_channels=["ch00", "ch01", "t"], time_step_ns=20.0,
+        port_catalog=PortCatalog.from_channels(["ch00", "ch01", "t"], channel_labels={"ch00": "da[0]", "ch01": "da[1]"}),
+        visible_ports=["da", "t"], time_step_ns=20.0,
         periods=[na.PulsePeriod(200, (0, 0, 1), unit="ns")],
         scan_slots=[{"kind": "duration", "target": "0", "unit": "ns", "nominal": 200.0}],
         scan_table=[[200.0], [400.0], [600.0]], scan_repeats=0)
@@ -42,15 +42,17 @@ def test_freeze_bakes_the_held_point_into_a_static_pulse():
     assert state.scan_table == [[200.0], [400.0], [600.0]]
 
 
-def test_held_point_text_shows_slot_vars_s0_s1_not_period_dac_names():
-    """#2: the held/current scan-point display reads 's0 = .., s1 = ..' (the slot_var single source),
-    NOT the long 'Period N duration / da[k] level' labels -- and carries no '[..]' wrapper.  The text
-    is a pure function of the row + slot_var (no self.state dependency)."""
+def test_held_point_text_shows_semantic_scan_names_not_compiler_columns():
+    """The held/current point uses stable public identities, never positional ``sN`` tokens."""
+    from types import SimpleNamespace
+
     ed = PulseSequenceEditor.__new__(PulseSequenceEditor)
+    ed.state = SimpleNamespace(scan_names=["exposure", "da_x"])
     text = ed._scan_point_values_text([200.0, -100.0])
-    assert text == "s0 = 200, s1 = -100", text
-    assert "Period" not in text and "da[" not in text and "[" not in text
-    assert ed._held_scan_point_text((0, [200.0, -100.0], 3)) == "held at point 1/3: s0 = 200, s1 = -100"
+    assert text == "exposure = 200, da_x = -100", text
+    assert "s0" not in text and "s1" not in text and "[" not in text
+    assert ed._held_scan_point_text((0, [200.0, -100.0], 3)) == (
+        "held at point 1/3: exposure = 200, da_x = -100")
 
 
 def test_freeze_clamps_an_out_of_range_index_to_the_last_point():

@@ -1,3 +1,4 @@
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 import matplotlib
 
 matplotlib.use("Agg")
@@ -39,7 +40,8 @@ def test_frontend_static_plots_and_data_figure():
     y = 20 * ((0.02 / 2) ** 2) / ((x - 737.1) ** 2 + (0.02 / 2) ** 2) + 3
 
     plot = zf.plot(x, y, labels=("Wavelength (nm)", "Counts", "Counts"), display=False)
-    result, popt = plot.data_figure.lorent(is_display=False)
+    result = plot.data_figure.fit("lorent", is_display=False)
+    popt = result.popt
 
     assert plot.fig.axes
     assert result.function == "lorent"
@@ -398,11 +400,13 @@ def test_frontend_title_pulse_and_public_2d_square_guard():
     assert [tick.get_text() for tick in filtered.ax.get_yticklabels()] == ["ch00", "ch17"]
     assert [tick.get_text() for tick in labeled.ax.get_yticklabels()] == ["trap", "probe"]
     assert len(all_rows.ax.get_yticklabels()) == 40
-    assert all_rows.spec.data_px[1] >= 4 * 360
+    # Geometry is size-driven like every other plot; content density no longer
+    # creates an unbounded bespoke canvas behind the selected preset.
+    assert all_rows.spec == zf.pulse_plot_spec("2x2")
     assert zf.pulse_repeat_notation() == "repeat ∞"
     assert zf.pulse_repeat_notation(0, 2, 4) == "repeat P1-P3 x4"
     repeat_state = na.PulseTableState(
-        channels=["ch00", "ch01"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch01"]),
         periods=[
             na.PulsePeriod(100, (1, 0), unit="ns"),
             na.PulsePeriod(200, (0, 1), unit="ns"),
@@ -887,13 +891,13 @@ def test_pulse_gui_preview_robust_across_states(monkeypatch):
 
     def all_off():
         return na.PulseTableState(
-            channels=["ch00", "ch01", "ch02"], visible_channels=["ch00", "ch01", "ch02"],
+            port_catalog=PortCatalog.from_channels(["ch00", "ch01", "ch02"]), visible_ports=["ch00", "ch01", "ch02"],
             periods=[na.PulsePeriod(100, (0, 0, 0), unit="ns"), na.PulsePeriod(200, (0, 0, 0), unit="ns")],
             time_step_ns=20,
         )
 
     def one_min():
-        return na.PulseTableState(channels=["ch00"], visible_channels=["ch00"],
+        return na.PulseTableState(port_catalog=PortCatalog.from_channels(["ch00"]), visible_ports=["ch00"],
                                   periods=[na.PulsePeriod(100, (1,), unit="ns")], time_step_ns=20)
 
     def scanned():
@@ -947,7 +951,7 @@ def test_pulse_gui_row_alignment_contract(monkeypatch):
         delays = editor.channel_panel
         first_card = editor.drag_container.pulse_cards()[0]
         checked = 0
-        for channel in editor.state.visible_channels[:8]:
+        for channel in editor.state.visible_ports[:8]:
             raw = names.raw_label_widgets.get(channel)
             delay = delays.delay_edits.get(channel)
             check = first_card.checks.get(channel)
@@ -972,18 +976,18 @@ def test_pulse_gui_row_alignment_contract(monkeypatch):
 
     # Now reveal every hardware channel (62 -> 26 px compressed rows) and re-check:
     # this is the regression scenario where the DAC row height diverged.
-    editor.show_all_channels()
+    editor.show_all_ports()
     dt.settle(editor, 300)
     check_alignment("show-all")
 
 
 def test_pulse_gui_channel_display_order_is_fixed_hardware_order(monkeypatch):
     """Edit (and preview) channel rows must ALWAYS render in the fixed hardware
-    channel order, no matter how show/hide/hide-off scrambled visible_channels.
+    channel order, no matter how show/hide/hide-off scrambled visible_ports.
 
     This is the user's "通道显示固定排序不被打乱": _display_rows now walks
-    state.channels (hardware order) filtered by visibility, so the order cannot
-    depend on the order entries happen to sit in visible_channels.
+    ``state.port_catalog.ports`` filtered by visibility, so the order cannot
+    depend on the order entries happen to sit in visible_ports.
     """
 
     pytest.importorskip("PyQt5")
@@ -991,31 +995,32 @@ def test_pulse_gui_channel_display_order_is_fixed_hardware_order(monkeypatch):
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.frontend.pulse_gui import _display_rows
 
-    # --- data-model: a deliberately scrambled visible_channels still displays
+    # --- data-model: a deliberately scrambled visible_ports still displays
     #     in hardware order, visible-filtered.
     channels = [f"ch{i:02d}" for i in range(10)]
     state = na.PulseTableState(
-        channels=channels,
+        port_catalog=PortCatalog.from_channels(channels),
         periods=[na.PulsePeriod(100, tuple(1 for _ in channels), unit="ns")],
         time_step_ns=20,
-        visible_channels=channels,
+        visible_ports=channels,
     )
-    state.visible_channels = ["ch05", "ch01", "ch09", "ch00", "ch03"]  # scrambled
+    state.visible_ports = ["ch05", "ch01", "ch09", "ch00", "ch03"]  # scrambled
     keys = [row["key"] for row in _display_rows(state)]
     assert keys == ["ch00", "ch01", "ch03", "ch05", "ch09"], keys
 
-    # --- editor path: show-all then hide-off must leave visible_channels in
+    # --- editor path: show-all then hide-off must leave visible_ports in
     #     hardware order AND render the panel rows top-to-bottom in that order.
     from Zou_lab_control.frontend import devtools as dt
 
     editor = dt.demo_editor(size=(1480, 900))
-    editor.show_all_channels()
+    editor.show_all_ports()
     dt.settle(editor, 200)
-    editor.hide_off_channels()
+    editor.hide_off_ports()
     dt.settle(editor, 200)
 
-    vis = list(editor.state.visible_channels)
-    assert vis == sorted(vis, key=editor.state.channel_index), vis
+    vis = list(editor.state.visible_ports)
+    order = {port.key: index for index, port in enumerate(editor.state.port_catalog.ports)}
+    assert vis == sorted(vis, key=order.__getitem__), vis
 
     rows = _display_rows(editor.state)
     names = editor.names_panel
@@ -1533,20 +1538,21 @@ def test_task_console_signal_picker_and_declarative_params(monkeypatch):
     console.refresh_once()
     assert card.status.text().startswith("shot ")           # applied instantly + healthy
 
-    # declarative param: one _set_param call -> stored + plot rebuilt
+    # A pure artist parameter applies in place: no canvas teardown/flicker.
     plot_before = card.plotter
     card._set_param("cmap", "gray")
     assert card.config.params["cmap"] == "gray"
     console.refresh_once()
-    assert card.plotter is not plot_before
+    assert card.plotter is plot_before
+    assert card.plotter.image.get_cmap().name == "gray"
     console.shutdown()
 
 
 def test_task_console_panel_editor_tab(monkeypatch, tmp_path):
     """A card's Edit... opens its OWN closable tab (a PanelEditor) bound to a
-    frozen snapshot, where command-line fit, x/y limits and Save Fig work; the
-    tab's X tears it down.  These heavy controls are kept off the Setting popup,
-    and each panel gets its own editor (re-clicking Edit focuses, not dupes)."""
+    frozen snapshot, where structured fit, x/y limits and Save Fig work; the
+    tab's X tears it down.  Fit requests are shared with Setting, and each panel
+    gets one editor (re-clicking Edit focuses, not duplicates)."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -1565,7 +1571,9 @@ def test_task_console_panel_editor_tab(monkeypatch, tmp_path):
     assert editor._plotter is not None
     assert console.tabs.count() == n_tabs + 1                 # a new closable tab opened
     assert console.tabs.currentWidget() is editor
-    assert editor.xmin.text() and editor.xmax.text()          # limits prefilled from the axes
+    # Empty text means autoscale; the current live range is a non-destructive hint.
+    assert editor.xmin.text() == "" and editor.xmax.text() == ""
+    assert editor.xmin.placeholderText() and editor.xmax.placeholderText()
     # the Edit tab carries a (custom, subtle) close button; Monitor has none
     from PyQt5 import QtWidgets as _qtw
     _bar = console.tabs.tabBar()
@@ -1576,15 +1584,15 @@ def test_task_console_panel_editor_tab(monkeypatch, tmp_path):
     console._edit_card(card)
     assert console.tabs.count() == n_tabs + 1
 
-    # command-line fit (preset model + free-text args) draws an overlay
+    # A structured registry model draws an overlay; there is no executable
+    # fit-argument text channel.
     editor.fit_combo.setCurrentText("Gaussian")
-    editor.fit_cmd.setText("")
     editor.do_fit()
-    assert editor._df is not None and editor._df.fit is not None
+    assert card.config.params["fit_request"]["model"] == "gaussian"
 
-    # x/y limits apply to the editor axes
+    # A trace exposes only its x view window; y belongs to the relim controls.
     editor.xmin.setText("0"); editor.xmax.setText("9")
-    editor.ymin.setText("0"); editor.ymax.setText("2")
+    assert editor.ymin is None and editor.ymax is None
     editor.apply_limits()
     assert editor._plotter.ax.get_xlim() == (0.0, 9.0)
 
@@ -1594,7 +1602,7 @@ def test_task_console_panel_editor_tab(monkeypatch, tmp_path):
     assert ".png" in saved and ".npz" in saved
 
     editor.clear_fit()
-    assert editor._df is None
+    assert card.config.params.get("fit_request") is None
 
     # the X on the tab tears the editor down and drops it from the registry
     console._on_editor_tab_closed(editor)
@@ -1644,17 +1652,19 @@ def test_task_console_panel_editor_fit_and_setting_relim(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     import numpy as np
     from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.neutral_atom.core.fitting import fit_models
     from Zou_lab_control.frontend.task_console import (
-        FIT_MODELS, PanelCard, PanelConfig, _fit_labels_for_kind)
+        PanelCard, PanelConfig, _fit_models_for_kind)
 
-    # The fit model set is DEFINED in full (incl. the 2D-Gaussian "2D center"), but the Edit tab OFFERS
+    # The fit model set is defined in full, but the Edit tab offers
     # only the models matching the panel's plot FAMILY: a 1d/monitor trace gets the curve models, a 2d
-    # image gets "2D center", and a hist (its own bimodal fit) gets NO general fit.
-    assert set(FIT_MODELS) >= {"Lorentzian", "Gaussian", "Lorentzian (Zeeman)",
-                               "Rabi", "Exp decay", "2D center"}
-    assert _fit_labels_for_kind("1d") == ["Lorentzian", "Gaussian", "Lorentzian (Zeeman)", "Rabi", "Exp decay"]
-    assert _fit_labels_for_kind("2d") == ["2D center"]
-    assert _fit_labels_for_kind("hist") == []            # a hist carries its OWN bimodal fit
+    # image gets the center model, and a hist (its own bimodal fit) gets no general fit.
+    assert {model.key for model in fit_models()} == {
+        "lorent", "gaussian", "lorent_zeeman", "rabi", "decay", "center"}
+    assert [model.key for model in _fit_models_for_kind("1d")] \
+        == ["lorent", "gaussian", "lorent_zeeman", "rabi", "decay"]
+    assert [model.key for model in _fit_models_for_kind("2d")] == ["center"]
+    assert _fit_models_for_kind("hist") == []            # a hist carries its OWN bimodal fit
     console = dt.demo_console(shots=5)
     card = PanelCard(PanelConfig(kind="1d", title="bump", row=0, col=0, size="2x2",
                                  source="value = bump"), parent=console.board)
@@ -1662,8 +1672,8 @@ def test_task_console_panel_editor_fit_and_setting_relim(monkeypatch):
     x = np.linspace(-5, 5, 60)
     card.refresh({"bump": 3.0 * np.exp(-(x ** 2) / (2 * 1.2 ** 2)) + 0.1, "shot": 1})
 
-    # the Setting popup has NO popup-fit handles (fit is in the per-panel Edit)
-    assert not hasattr(card, "fit_combo") and not hasattr(card, "_do_fit")
+    # Setting and Edit are two adapters over the same structured request.
+    assert card.fit_model_combo is not None and hasattr(card, "_apply_fit_request")
 
     # per-panel Edit tab: fit a Gaussian -> applied as a STORED display knob to the live card + its
     # snapshot (the ONE _edit_param path, not a throwaway _df mutation), so a fit curve draws on the
@@ -1672,18 +1682,17 @@ def test_task_console_panel_editor_fit_and_setting_relim(monkeypatch):
     editor = console._panel_editors[id(card)]
     base = len(editor._plotter.ax.lines)
     editor.fit_combo.setCurrentText("Gaussian")
-    editor.fit_cmd.setText("")
     editor.do_fit()
-    assert card.config.params.get("fit_model") == "gaussian"
+    assert card.config.params["fit_request"]["model"] == "gaussian"
     assert len(editor._plotter.ax.lines) == base + 1
     editor.clear_fit()
-    assert card.config.params.get("fit_model", "none") == "none"
+    assert card.config.params.get("fit_request") is None
     assert len(editor._plotter.ax.lines) == base
 
     # relim is owned by the SETTING popup now (tight/normal), persisted on the
     # card config; the live card picks it up on its next rebuild.
     card.lim_combo.setCurrentText("normal")
-    card._on_relim_mode("normal")
+    card._set_param("relim", "normal")
     assert card.config.params["relim"] == "normal"
     card._reset_plot()                                       # force a fresh build
     card.refresh({"bump": np.ones(60), "shot": 2})
@@ -1693,8 +1702,7 @@ def test_task_console_panel_editor_fit_and_setting_relim(monkeypatch):
 
 def test_task_console_edit_fits_2d_with_center_model(monkeypatch):
     """The Edit tab exposes the FULL DataFigure fit set for EVERY kind -- a 2D
-    image fits the 2D-Gaussian "2D center" model (the fit was previously gated
-    out for 2d/sites/hist)."""
+    image fits the registered 2D Gaussian center model."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -1706,10 +1714,10 @@ def test_task_console_edit_fits_2d_with_center_model(monkeypatch):
         console._edit_card(card)
         editor = console._panel_editors[id(card)]
         models = [editor.fit_combo.itemText(i) for i in range(editor.fit_combo.count())]
-        assert "2D center" in models
-        editor.fit_combo.setCurrentText("2D center")
+        assert "2D Gaussian center" in models
+        editor.fit_combo.setCurrentText("2D Gaussian center")
         editor.do_fit()
-        assert editor._df is not None and editor._df.fit is not None
+        assert card.config.params["fit_request"]["model"] == "center"
     finally:
         console.shutdown()
 
@@ -1735,10 +1743,8 @@ def test_pulse_gui_tabs_have_no_close_button(monkeypatch):
 
 
 def test_monitor_panels_have_no_selectors_and_wheel_scrolls(monkeypatch):
-    """Monitor cards are display-only: NO interactive selectors (so a drag /
-    right-click never starts a zoom/area/cross) and the canvas lets the wheel
-    bubble up (isolate_wheel=False) so the board scrolls under the cursor.  The
-    interactive selectors live in the Edit tab instead."""
+    """Monitor cards build one reusable selector layer but park it while the
+    header switch is off; wheel events still bubble to the board."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -1748,8 +1754,15 @@ def test_monitor_panels_have_no_selectors_and_wheel_scrolls(monkeypatch):
     try:
         for card in console.cards:
             assert card.plotter is not None, card.config.kind
-            assert card.plotter.interactions is False, card.config.kind
-            assert card.plotter.tools.area is None and card.plotter.tools.zoom is None
+            assert card.plotter.interactions is True, card.config.kind
+            handles = card.plotter.interaction_handles()
+            assert handles, card.config.kind
+            for handle in handles:
+                selector = getattr(handle, "selector", None)
+                if selector is not None and hasattr(selector, "active"):
+                    assert selector.active is False
+                else:
+                    assert getattr(handle, "_zlc_selectors_off", False) is True
             assert card.canvas._zlc_isolate_wheel is False, card.config.kind
         # the Edit snapshot, by contrast, IS interactive (selectors attached)
         card = console.cards[0]
@@ -1908,15 +1921,30 @@ def test_task_console_sites_panel_bad_centers_isolated(monkeypatch):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.neutral_atom.operations.logic import LogicNode, SignalSpec
 
     console = dt.demo_console(shots=10)
     sites = next(c for c in console.cards if c.config.kind == "sites")
-    # point the site map at a signal whose producing node publishes NO centres (the camera's
-    # raw ``frame``) -> the panel cannot resolve centres/underlay from that node + errors.
-    sites.config.inputs[0] = "frame_0"
-    sites.config.source = "value = signal"
+    class _OrphanSiteProducer(LogicNode):
+        def shot(self):
+            return {"orphan_sites": np.zeros((1, 1, 35), dtype=float)}
+
+        def _bare_output_specs(self):
+            return (SignalSpec(
+                "orphan_sites", "orphan sites", points_shape=(1,), data_shape=(35,),
+                dtype=np.float64, repeat_capacity=1),)
+
+        def _bare_published_signals(self):
+            return frozenset({"orphan_sites"})
+
+    orphan = _OrphanSiteProducer(console.hub)
+    orphan.step()
+    console.running_nodes.append(orphan)  # a real producer, deliberately without centers/frame outputs
+    sites.config.inputs[0] = "orphan_sites"
+    sites.source_edit.setText("value = signal")
+    sites._apply_source()
     console.refresh_once()
-    assert "frame_0" in sites.status.text()
+    assert "orphan_sites" in sites.status.text()
     healthy = [c for c in console.cards if c is not sites]
     assert all(c.status.text().startswith("shot ") for c in healthy)
     console.shutdown()
@@ -1930,10 +1958,10 @@ def test_task_console_cross_signal_expression_and_error_isolation(monkeypatch):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend import devtools as dt
-    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+    from Zou_lab_control.frontend.task_console import PanelConfig
 
     console = dt.demo_console(shots=20, dual=True)
-    diff = PanelCard(
+    diff = console._new_panel_card(
         PanelConfig(kind="1d", title="A-B occupancy", row=4, col=0, size="2x2",
                     source="value = occupied - b_occupied"))
     console._attach_card(diff)
@@ -1941,7 +1969,7 @@ def test_task_console_cross_signal_expression_and_error_isolation(monkeypatch):
     console.refresh_once()
     assert diff.plotter is not None and diff.status.text().startswith("shot ")
     n_sites = np.asarray(console.hub.latest("occupied")).shape[-1]
-    assert int(diff.plotter.data_y.shape[0]) == n_sites          # one A-B value per site
+    assert diff.plotter.data_y.shape == (1, n_sites)  # P=1, one explicit data series per site
 
     # break ONE panel: it reports, the siblings keep updating
     victim = next(card for card in console.cards if card.config.kind == "monitor")
@@ -2032,11 +2060,8 @@ def test_pulse_gui_clear_all_resets_to_single_blank_1us_period(monkeypatch):
             assert (entry or {}).get("mode", "hold") == "hold", (bus, entry)
             assert (entry or {}).get("value") is None, (bus, entry)
     # hookup preserved
-    assert state.channels == before.channels
-    assert state.visible_channels == before.visible_channels
-    assert state.channel_labels == before.channel_labels
-    assert state.analog_buses == before.analog_buses
-    assert state.clk_channels == before.clk_channels
+    assert state.port_catalog == before.port_catalog
+    assert state.visible_ports == before.visible_ports
 
 
 def test_pulse_gui_selection_outlines_the_card_edge_not_child_widgets(monkeypatch):
@@ -2082,9 +2107,8 @@ def test_pulse_gui_differing_bus_member_delays_survive_read_state(monkeypatch):
     editor = dt.demo_editor(size=(1480, 900), bind_scans=False)
     state = PulseTableState(
         name="mix",
-        channels=["b0", "b1", "t"],
-        channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"},
-        visible_channels=["b0", "b1", "t"],
+        port_catalog=PortCatalog.from_channels(["b0", "b1", "t"], channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"}),
+        visible_ports=["da_x", "t"],
         time_step_ns=20.0,
         periods=[PulsePeriod(200, (0, 0, 1), unit="ns")],
         analog_bus_modes={"da_x": [{"mode": "edge", "value": 1}]},
@@ -2153,7 +2177,7 @@ def test_pulse_gui_inplace_scan_refresh_matches_rebuild(monkeypatch):
     app = ensure_qt_app()
     editor = PulseSequenceEditor(state=dt.demo_state())
     editor.show()
-    editor.show_all_channels()
+    editor.show_all_ports()
     app.processEvents()
 
     def snapshot():
@@ -2432,7 +2456,7 @@ def test_pulse_preview_has_area_selector(monkeypatch):
 
 
 def test_pulse_save_bundles_artifacts(monkeypatch, tmp_path):
-    """Saving a scanned pulse must bundle pulse + preview + scan data together."""
+    """Save keeps scan data solely in the pulse and emits only derived artifacts."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -2451,7 +2475,7 @@ def test_pulse_save_bundles_artifacts(monkeypatch, tmp_path):
     names = {p.name for p in tmp_path.iterdir()}
     assert "mypulse.json" in names
     assert "mypulse.png" in names  # preview figure
-    assert "mypulse_scan.npy" in names  # raw scan data
+    assert "mypulse_scan.npy" not in names
     # The compiled scan program is attempted too; if it cannot compile the status
     # surfaces it rather than failing silently.
     assert "Saved:" in editor.preview_status.text()
@@ -2495,8 +2519,7 @@ def test_scan_run_button_dirty_on_code_edit(monkeypatch):
 
     ensure_qt_app()
     editor = PulseSequenceEditor(state=na.PulseTableState(
-        channels=["ch0", "ch1"], channel_labels={"ch0": "cooling", "ch1": "da_dipole[0]"},
-        visible_channels=["ch0", "ch1"], time_step_ns=20.0,
+        port_catalog=PortCatalog.from_channels(["ch0", "ch1"], channel_labels={"ch0": "cooling", "ch1": "da_dipole[0]"}), visible_ports=["ch0", "ch1"], time_step_ns=20.0,
         periods=[na.PulsePeriod(100, (1, 0), unit="ns")]))
     assert hasattr(editor, "scan_run_button")
     editor.scan_run_button.set_dirty(False)        # baseline clean
@@ -2554,6 +2577,7 @@ def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
 
         def __init__(self, channels):
             self.channels = channels
+            self.port_catalog = PortCatalog.from_channels(channels)
 
     editor = PulseSequenceEditor(sequencer=DummySequencer(channels))
     try:
@@ -2561,12 +2585,13 @@ def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
         editor.show()
         app.processEvents()
 
-        assert len(editor.state.channels) == 62
+        assert len(editor.state.port_catalog.raw_lanes) == 62
         assert re.fullmatch(r"pulse_\d{8}_\d{6}", editor.state.name)
         assert editor.state.time_step_ns == 20
-        assert editor.state.visible_channels == ["ch00", "ch01", "ch02", "ch03"]
-        assert editor.names_panel.label_edits["ch00"].text() == ""
-        assert "4/62 visible" in editor.summary.text()
+        assert editor.state.visible_ports == ["ch00", "ch01", "ch02", "ch03"]
+        assert editor.names_panel.port_labels["ch00"].text() == "ch00"
+        assert not editor.names_panel.port_labels["ch00"].isEnabled()
+        assert "4/62 ports visible" in editor.summary.text()
         assert "step 20 ns" in editor.summary.text()
         assert editor.add_channel_combo.count() == 58
         assert not hasattr(editor.channel_panel, "x_edit")
@@ -2619,7 +2644,7 @@ def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
         control_box = _group_box_ancestor(editor.safe_button)
         channels_box = _group_box_ancestor(editor.add_channel_combo)
         assert control_box is not None and control_box.title() == "Control"
-        assert channels_box is not None and channels_box.title() == "Channels"
+        assert channels_box is not None and channels_box.title() == "Ports"
         # The titled cards are flat (a 1 px border delineates them, no drop-shadow effect).
         assert control_box.graphicsEffect() is None
         assert channels_box.graphicsEffect() is None
@@ -2704,59 +2729,55 @@ def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
         editor.tabs.setCurrentWidget(editor.edit_tab)
         app.processEvents()
 
-        editor.show_all_channels()
+        editor.show_all_ports()
         app.processEvents()
-        assert len(editor.state.visible_channels) == 62
-        assert "62/62 visible" in editor.summary.text()
+        assert len(editor.state.visible_ports) == 62
+        assert "62/62 ports visible" in editor.summary.text()
         assert editor.add_channel_combo.count() == 0
         assert not editor.add_channel_button.isEnabled()
         assert editor.dataset_scroll.verticalScrollBar().width() == editor.timeline_hbar.height()
 
-        editor.hide_off_channels()
+        editor.hide_off_ports()
         app.processEvents()
-        assert editor.state.visible_channels == ["ch00", "ch01", "ch02", "ch03"]
+        assert editor.state.visible_ports == ["ch00", "ch01", "ch02", "ch03"]
 
-        editor.names_panel.label_edits["ch01"].setText("cooling_laser")
+        topology = editor.state.port_catalog.fingerprint
         editor.channel_panel.delay_edits["ch01"].setText("40")
         app.processEvents()
-        assert editor.channel_panel.channel_labels["ch01"].text() == "cooling_laser"
+        assert editor.channel_panel.channel_labels["ch01"].text() == "ch01"
         current_first_card = editor.drag_container.pulse_cards()[0]
-        # Period-card checkboxes elide long labels (with the full name in the
-        # tooltip + tracked in check_full_labels) so they never spill the card.
-        assert current_first_card.check_full_labels["ch01"] == "cooling_laser"
-        assert "cooling_laser" in current_first_card.checks["ch01"].toolTip()
+        assert current_first_card.check_full_labels["ch01"] == "ch01"
         editor.clear_channel("ch01")
         app.processEvents()
-        assert editor.state.visible_channels == ["ch00", "ch01", "ch02", "ch03"]
+        assert editor.state.visible_ports == ["ch00", "ch01", "ch02", "ch03"]
         assert all(not period.states[editor.state.channel_index("ch01")] for period in editor.state.periods)
-        assert editor.state.channel_labels["ch01"] == "cooling_laser"
+        assert editor.state.port_catalog.fingerprint == topology
         assert editor.state.delays["ch01"] == "40"
 
-        editor.hide_off_channels()
+        editor.hide_off_ports()
         app.processEvents()
-        assert editor.state.visible_channels == ["ch00", "ch01", "ch02", "ch03"]
+        assert editor.state.visible_ports == ["ch00", "ch01", "ch02", "ch03"]
         assert editor.add_channel_combo.findText("ch01", QtCore.Qt.MatchStartsWith) == -1
 
-        editor.show_all_channels()
+        editor.show_all_ports()
         app.processEvents()
-        editor.names_panel.label_edits["ch04"].setText("aux_04")
         editor.channel_panel.delay_edits["ch04"].setText("40")
         app.processEvents()
         editor.clear_channel("ch04")
         app.processEvents()
-        editor.hide_off_channels()
+        editor.hide_off_ports()
         app.processEvents()
-        assert editor.state.visible_channels == ["ch00", "ch01", "ch02", "ch03"]
+        assert editor.state.visible_ports == ["ch00", "ch01", "ch02", "ch03"]
         ch04_index = editor.add_channel_combo.findText("ch04", QtCore.Qt.MatchStartsWith)
         assert ch04_index >= 0
         editor.add_channel_combo.setCurrentIndex(ch04_index)
-        editor.add_selected_channel()
+        editor.add_selected_port()
         app.processEvents()
-        assert editor.state.visible_channels == ["ch00", "ch01", "ch02", "ch03", "ch04"]
-        assert editor.names_panel.label_edits["ch04"].text() == "aux_04"
+        assert editor.state.visible_ports == ["ch00", "ch01", "ch02", "ch03", "ch04"]
+        assert editor.names_panel.port_labels["ch04"].text() == "ch04"
         assert editor.channel_panel.delay_edits["ch04"].text() == "40"
 
-        editor.show_all_channels()
+        editor.show_all_ports()
         app.processEvents()
         editor.tabs.setCurrentWidget(editor.preview_tab)
         app.processEvents()
@@ -2836,15 +2857,20 @@ def test_pulse_gui_controls_call_attached_address_switch_sequencer(monkeypatch):
     class RecordingSequencer:
         clock_hz = 50e6
 
-        def __init__(self):
+        def __init__(self, port_catalog):
             self.channels = channels
+            self.port_catalog = port_catalog
             self.prepared = None
             self.events = []
 
         def prepare(self, sequence):
             self.prepared = sequence
-            self.events.append(("prepare", sequence.name, list(sequence.channels)))
-            return na.compile_runtime_program_for_payload(sequence, channels=self.channels, clock_hz=self.clock_hz)
+            self.events.append(("prepare", sequence.name, list(sequence.port_catalog.raw_lanes)))
+            return na.compile_runtime_program_for_payload(
+                sequence,
+                port_catalog=self.port_catalog,
+                clock_hz=self.clock_hz,
+            )
 
         def fire(self):
             self.events.append(("fire",))
@@ -2856,9 +2882,11 @@ def test_pulse_gui_controls_call_attached_address_switch_sequencer(monkeypatch):
         def set_safe_state(self):
             self.events.append(("safe",))
 
-    sequencer = RecordingSequencer()
+    state = na.PulseTableState.load(
+        Path(__file__).resolve().parents[1] / "pulses" / "camera_imaging_address_switch.json")
+    sequencer = RecordingSequencer(state.port_catalog)
     editor = PulseSequenceEditor(
-        state=na.PulseTableState.load(Path(__file__).resolve().parents[1] / "pulses" / "camera_imaging_address_switch.json"),
+        state=state,
         sequencer=sequencer,
         channel_pins={"ch00": "F15", "ch11": "M13"},
     )
@@ -2875,12 +2903,12 @@ def test_pulse_gui_controls_call_attached_address_switch_sequencer(monkeypatch):
         assert not hasattr(editor, "wait_button")
         assert not hasattr(editor, "repeat_forever_switch")
         assert not hasattr(editor, "wait_done")
+        sequencer.events.clear()
         editor.fire()
         editor.safe_state()
         app.processEvents()
 
-        assert sequencer.events[0][0] == "prepare"
-        assert [event[0] for event in sequencer.events] == ["prepare", "fire", "safe"]
+        assert [event[0] for event in sequencer.events] == ["safe", "prepare", "fire", "safe"]
         assert editor.last_program.channels == channels
         assert isinstance(sequencer.prepared, na.PulseTableState)
         assert sequencer.prepared.to_sequence(expand_repeat=False).validate(clock_hz=50e6, channels=channels).ok
@@ -2903,7 +2931,7 @@ def test_pulse_gui_runtime_connection_control(monkeypatch):
     ensure_qt_app()
     channels = [f"ch{i:02d}" for i in range(12)]
     seq = VirtualSequencer(channels=channels)
-    editor = PulseSequenceEditor(channels=channels, sequencer=seq)
+    editor = PulseSequenceEditor(sequencer=seq)
     try:
         # opens reflecting the launch (virtual) sequencer; host:port disabled
         items = [editor.conn_target_combo.itemData(i) for i in range(editor.conn_target_combo.count())]
@@ -2948,12 +2976,16 @@ def test_pulse_gui_repeat_preview_uses_unexpanded_periods(monkeypatch):
 
     app = ensure_qt_app()
     channels = ["ch00", "ch01", "ch02", "ch03"]
-    editor = PulseSequenceEditor(channels=channels, scale=0.86)
+    editor = PulseSequenceEditor(
+        state=na.PulseTableState(port_catalog=PortCatalog.from_channels(
+            channels,
+            channel_labels={"ch00": "trap", "ch01": "cooling"},
+        )),
+        scale=0.86,
+    )
     try:
         editor.show()
         app.processEvents()
-        editor.names_panel.label_edits["ch00"].setText("trap")
-        editor.names_panel.label_edits["ch01"].setText("cooling")
         editor.toggle_bracket()
         app.processEvents()
         bracket_end = next(item.widget for item in editor.drag_container.items if item.item_type == "bracket_end")
@@ -3151,14 +3183,13 @@ def test_pulse_gui_scan_array_toggle_validates_and_marks_symbolic_regions(monkey
 
     app = ensure_qt_app()
     state = na.PulseTableState(
-        channels=["ch00", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch03"], channel_labels={"ch00": "trap", "ch03": "trig"}),
         periods=[
             na.PulsePeriod(20, (1, 0), unit="ns", name="load"),
             na.PulsePeriod(80, (0, 1), unit="ns", name="trigger"),
         ],
         time_step_ns=20,
-        visible_channels=["ch00", "ch03"],
-        channel_labels={"ch00": "trap", "ch03": "trig"},
+        visible_ports=["ch00", "ch03"],
     )
     editor = PulseSequenceEditor(state=state, scale=0.86)
     try:
@@ -3236,14 +3267,12 @@ def test_pulse_gui_analog_bus_uses_line_edit_and_hollow_preview(monkeypatch):
 
     app = ensure_qt_app()
     state = na.PulseTableState(
-        channels=["ch00", "ch01", "ch02"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch01", "ch02"], channel_labels={"ch00": "da_test[0]", "ch01": "da_test[1]", "ch02": "da_test[2]"}, analog_buses={"da_test": ["ch00", "ch01", "ch02"]}),
         periods=[
             na.PulsePeriod(20, (0, 0, 0), unit="ns"),
             na.PulsePeriod(20, (0, 0, 0), unit="ns"),
         ],
-        visible_channels=["ch00", "ch01", "ch02"],
-        channel_labels={"ch00": "da_test[0]", "ch01": "da_test[1]", "ch02": "da_test[2]"},
-        analog_buses={"da_test": ["ch00", "ch01", "ch02"]},
+            visible_ports=["da_test"],
         time_step_ns=20,
     )
     state.set_analog_bus_mode(0, "da_test", "edge", value=0)
@@ -3313,7 +3342,7 @@ def test_pulse_gui_summary_warns_about_repeat_forever_table_boundary_high(monkey
 
     app = ensure_qt_app()
     state = na.PulseTableState(
-        channels=["ch09", "ch06"],
+        port_catalog=PortCatalog.from_channels(["ch09", "ch06"], channel_labels={"ch09": "trap", "ch06": "trig"}),
         periods=[
             na.PulsePeriod(100, (1, 0), unit="ns"),
             na.PulsePeriod(20, (0, 1), unit="ns"),
@@ -3323,8 +3352,7 @@ def test_pulse_gui_summary_warns_about_repeat_forever_table_boundary_high(monkey
         repeat_end=1,
         repeat_count=5,
         repeat_forever=True,
-        channel_labels={"ch09": "trap", "ch06": "trig"},
-        visible_channels=["ch09", "ch06"],
+        visible_ports=["ch09", "ch06"],
         time_step_ns=20,
     )
     editor = PulseSequenceEditor(state=state, scale=0.86)
@@ -3394,10 +3422,9 @@ def test_preview_hides_idle_dac_when_off_rows_off(monkeypatch):
     ch = [f"da[{i}]" for i in range(10)] + ["trig"]
     labels = {f"da[{i}]": f"da[{i}]" for i in range(10)}
     state = PulseTableState(
-        channels=ch,
-        visible_channels=ch,
+        port_catalog=PortCatalog.from_channels(ch, channel_labels=labels),
+        visible_ports=["da", "trig"],
         periods=[PulsePeriod(1000, tuple([0] * 11), unit="ns")],  # DAC = 0 in every period (idle)
-        channel_labels=labels,
         time_step_ns=20.0,
     )
     off, _ = pulse_gui._analog_bus_traces(state, include_always_off=False)
@@ -3444,11 +3471,11 @@ def test_scan_default_template_adapts_to_slot_count(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend import devtools as dt
 
-    ed = dt.demo_editor(size=(1400, 880))   # binds 2 scan slots (s0 duration, s1 dac)
+    ed = dt.demo_editor(size=(1400, 880))   # binds 2 semantic scan slots
     dt.settle(ed, 150)
     ed._refresh_scan_tab()
     code = ed.scan_code.toPlainText()
-    assert "column_stack([s0, s1])" in code      # adapted to the 2 bound slots
+    assert "column_stack([duration_3, da_dipole])" in code
     assert "2 bound slot(s)" in code
 
 
@@ -3514,31 +3541,26 @@ def test_dac_value_field_and_dot_stay_inside_card(monkeypatch):
     assert dot.mapTo(card, dot.rect().topRight()).x() <= card_right
 
 
-def test_clk_button_marks_channel_disables_delay_and_hides_from_preview(monkeypatch):
-    """The per-channel 'clk' toggle: pressing it wires the channel to the FPGA clk -> it
-    enters state.clk_channels, its delay/unit fields grey out, and it drops from the
-    preview (it is no longer engine-driven).  Pressing again restores it."""
+def test_clock_ports_are_topology_owned_and_have_no_pulse_controls(monkeypatch):
+    """A fixed clock port is described by PortCatalog and never becomes an editable
+    pulse row, delay field, checkbox, or document-level clk toggle."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+    from Zou_lab_control.neutral_atom.timing import PulseTableState
 
-    ed = dt.demo_editor(size=(1500, 920))
-    dt.settle(ed, 200)
-    ch = "ch00"
-    assert ch in ed.channel_panel.clk_buttons
-    assert ed.channel_panel.delay_edits[ch].isEnabled()
-    ed.channel_panel.clk_buttons[ch].click()
-    dt.settle(ed, 150)
-    assert ed.state.clk_channels == [ch]
-    assert not ed.channel_panel.delay_edits[ch].isEnabled()      # delay greyed out
-    assert not ed.channel_panel.delay_units[ch].isEnabled()
+    state = PulseTableState(port_catalog=PortCatalog.from_channels(["ttl", "da_clk0"], clk_channels=["da_clk0"]), visible_ports=["ttl"])
+    ed = PulseSequenceEditor(state)
+    dt.settle(ed, 100)
+    assert state.port_catalog.by_key["da_clk0"].kind == "clock"
+    assert "ttl" in ed.channel_panel.delay_edits
+    assert "da_clk0" not in ed.channel_panel.delay_edits
+    assert not hasattr(ed.channel_panel, "clk_buttons")
+    assert not hasattr(ed.channel_panel, "clkRequested")
     _plotter, channels, _repeat = ed._create_preview_plot(ed.read_state(), include_always_off=True)
-    assert ch not in channels                                    # excluded from preview
-    ed.channel_panel.clk_buttons[ch].click()                     # toggle off
-    dt.settle(ed, 150)
-    assert ed.state.clk_channels == []
-    assert ed.channel_panel.delay_edits[ch].isEnabled()
+    assert "da_clk0" not in channels
 
 
 def test_duration_unit_dropdown_excludes_str_ns_until_scanned(monkeypatch):
@@ -3558,21 +3580,24 @@ def test_duration_unit_dropdown_excludes_str_ns_until_scanned(monkeypatch):
     assert bound.currentText() == "str (ns)" and not bound.isEnabled()
 
 
-def test_clk_channel_disables_period_checkboxes(monkeypatch):
-    """#2: marking a channel as clk locks (disables) its checkbox in every period card."""
+def test_read_state_preserves_clock_topology_without_period_checkbox(monkeypatch):
+    """Rebuilding an edited pulse preserves the device catalog fingerprint; a clock
+    lane never appears in a period card from which topology could be mutated."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+    from Zou_lab_control.neutral_atom.timing import PulseTableState
 
-    ed = dt.demo_editor(size=(1480, 900))
-    dt.settle(ed, 120)
-    ed._toggle_clk_channel("ch01")
-    dt.settle(ed, 150)
-    assert "ch01" in ed.state.clk_channels
-    for card in ed.drag_container.pulse_cards():
-        if "ch01" in card.checks:
-            assert not card.checks["ch01"].isEnabled()
+    state = PulseTableState(port_catalog=PortCatalog.from_channels(["ttl", "da_clk0"], clk_channels=["da_clk0"]), visible_ports=["ttl"])
+    ed = PulseSequenceEditor(state)
+    dt.settle(ed, 100)
+    fingerprint = state.port_catalog.fingerprint
+    rebuilt = ed.read_state()
+    assert rebuilt.port_catalog.fingerprint == fingerprint
+    assert [port.lanes[0] for port in rebuilt.port_catalog.clock_ports] == ["da_clk0"]
+    assert all("da_clk0" not in card.checks for card in ed.drag_container.pulse_cards())
 
 
 def test_floatorx_lineedit_residue_removed():
@@ -3621,9 +3646,9 @@ def test_hold_field_tracks_upstream_edge_change(monkeypatch):
     ch = [f"da[{i}]" for i in range(10)] + ["trig"]
     labels = {f"da[{i}]": f"da[{i}]" for i in range(10)}
     state = PulseTableState(
-        channels=ch, visible_channels=ch,
+        port_catalog=PortCatalog.from_channels(ch, channel_labels=labels), visible_ports=["da", "trig"],
         periods=[PulsePeriod(1000, tuple([0] * 11), unit="ns") for _ in range(3)],
-        channel_labels=labels, time_step_ns=20.0,
+        time_step_ns=20.0,
     )
     state.set_analog_bus_mode(0, "da", "edge", value=100)
     state.set_analog_bus_mode(1, "da", "hold")
@@ -3657,7 +3682,7 @@ def test_pulse_gui_clear_bus_clears_analog_bus_modes(monkeypatch):
 
     app = ensure_qt_app()
     editor = PulseSequenceEditor(state=dt.demo_state())
-    editor.show(); editor.show_all_channels(); app.processEvents()
+    editor.show(); editor.show_all_ports(); app.processEvents()
 
     bus = list(editor.state.bus_channels())[0]
     card0 = editor.drag_container.pulse_cards()[0]
@@ -3685,7 +3710,7 @@ def test_pulse_gui_dac_scan_target_follows_period_reorder(monkeypatch):
 
     app = ensure_qt_app()
     editor = PulseSequenceEditor(state=dt.demo_state())
-    editor.show(); editor.show_all_channels(); app.processEvents()
+    editor.show(); editor.show_all_ports(); app.processEvents()
     if editor.state.repeat_start is not None:
         pytest.skip("reorder test assumes no repeat bracket")
 
@@ -3739,8 +3764,8 @@ def _scanable_state():
 
     return PulseTableState(
         name="bundle_test",
-        channels=["ch0", "ch1"],
-        visible_channels=["ch0", "ch1"],
+        port_catalog=PortCatalog.from_channels(["ch0", "ch1"]),
+        visible_ports=["ch0", "ch1"],
         time_step_ns=20.0,
         periods=[PulsePeriod("s0", (1, 0), unit="ns", name="A"),
                  PulsePeriod(400, (0, 1), unit="ns", name="B")],
@@ -3751,8 +3776,8 @@ def _scanable_state():
 
 def test_pulse_gui_save_bundle_always_includes_program(monkeypatch, tmp_path):
     """Save writes the WHOLE bundle: pulse.json + preview.png + the compiled FPGA-ready
-    _program.json -- for a NON-scan pulse too (it used to skip the program without scan
-    slots), plus _scan.npy when a scan table exists."""
+    _program.json -- for both scan and non-scan pulses.  The scan table has one
+    persisted authority: the pulse JSON."""
 
     import json
     pytest.importorskip("PyQt5")
@@ -3766,7 +3791,7 @@ def test_pulse_gui_save_bundle_always_includes_program(monkeypatch, tmp_path):
 
     # --- non-scan pulse: program STILL saved ---
     plain = PulseTableState(
-        name="plain", channels=["ch0", "ch1"], visible_channels=["ch0", "ch1"],
+        name="plain", port_catalog=PortCatalog.from_channels(["ch0", "ch1"]), visible_ports=["ch0", "ch1"],
         time_step_ns=20.0,
         periods=[PulsePeriod(200, (1, 0), unit="ns"), PulsePeriod(400, (0, 1), unit="ns")])
     editor.load_state(plain)
@@ -3783,22 +3808,22 @@ def test_pulse_gui_save_bundle_always_includes_program(monkeypatch, tmp_path):
     assert (tmp_path / "plain.png").exists()
     assert not (tmp_path / "plain_scan.npy").exists()
 
-    # --- scan pulse: full 4-piece bundle ---
+    # --- scan pulse: same 3-piece bundle; no duplicate scan-array sibling ---
     editor.load_state(_scanable_state())
     dt.settle(editor, 100)
     target2 = tmp_path / "scan.json"
     monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
                         staticmethod(lambda *a, **k: (str(target2), "")))
     editor.save_to_file()
-    for name in ("scan.json", "scan.png", "scan_scan.npy", "scan_program.json"):
+    for name in ("scan.json", "scan.png", "scan_program.json"):
         assert (tmp_path / name).exists(), name
+    assert not (tmp_path / "scan_scan.npy").exists()
     prog2 = json.loads((tmp_path / "scan_program.json").read_text(encoding="utf-8"))
     assert prog2.get("scan_points"), "scan save embeds the compiled scan points"
 
 
-def test_pulse_gui_load_restores_bundle_and_redirects_artifacts(monkeypatch, tmp_path):
-    """Load round-trips the bundle: the sibling _scan.npy is re-attached as the
-    loaded-file source, and picking _program.json by mistake redirects to the pulse."""
+def test_pulse_gui_load_uses_embedded_scan_and_redirects_compiled_artifact(monkeypatch, tmp_path):
+    """Load uses only the pulse's embedded table and redirects _program.json."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -3813,15 +3838,18 @@ def test_pulse_gui_load_restores_bundle_and_redirects_artifacts(monkeypatch, tmp
     monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
                         staticmethod(lambda *a, **k: (str(target), "")))
     editor.save_to_file()
-    assert (tmp_path / "bundle_scan.npy").exists()
+    # A stale/manual sibling must never become a second truth source.
+    import numpy as np
+    np.save(tmp_path / "bundle_scan.npy", np.asarray([[999.0]]))
 
-    # load the pulse -> the sibling scan array re-attaches as the loaded source
+    # Load the pulse -> only the embedded scan table is restored.
     monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName",
                         staticmethod(lambda *a, **k: (str(target), "")))
     editor.load_from_file()
-    assert editor._scan_loaded_path.endswith("bundle_scan.npy")
-    assert editor._scan_tables["loaded"], "sibling _scan.npy restored as the loaded source"
-    assert not editor._scan_use_loaded  # the embedded table stays the active source
+    assert editor._scan_loaded_path == ""
+    assert editor._scan_tables["loaded"] == []
+    assert editor._scan_tables["generated"] == [[200.0], [400.0]]
+    assert not editor._scan_use_loaded
 
     # picking the saved program by mistake -> redirected to the pulse json
     monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName",
@@ -3886,9 +3914,8 @@ def test_pulse_gui_dac_dot_on_ramp_period_scans_the_ramp(monkeypatch):
     editor = dt.demo_editor(size=(1480, 900), bind_scans=False)
     dt.settle(editor, 200)
     state = PulseTableState(
-        name="rampgui", channels=["b0", "b1", "t"],
-        channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"},
-        visible_channels=["b0", "b1", "t"], time_step_ns=20.0,
+        name="rampgui", port_catalog=PortCatalog.from_channels(["b0", "b1", "t"], channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"}),
+        visible_ports=["da_x", "t"], time_step_ns=20.0,
         periods=[PulsePeriod(200, (0, 0, 1), unit="ns"), PulsePeriod(400, (0, 0, 0), unit="ns")],
         analog_bus_modes={"da_x": [{"mode": "edge", "value": 1}, {"mode": "ramp", "value": -2}]})
     editor.load_state(state)

@@ -92,7 +92,7 @@ def test_loading_node_channel_mapping_follows_sequencer():
 class _PresetReducer:
     """Per-site reducer that returns a preset row per shot (a NaN = empty site)."""
 
-    n_series = 2
+    data_shape = (2,)
 
     def __init__(self, rows):
         self._rows = list(rows)
@@ -122,6 +122,9 @@ class _FakePulse:
     def set_time(self, *a, **k):
         return self
 
+    def set_slot(self, *a, **k):
+        return self
+
 
 class _CountCamera:
     last_stop = None
@@ -137,7 +140,7 @@ def test_per_site_nan_does_not_poison_scan_point():
     meas = ScannedMeasurement(
         pulse=_FakePulse(), camera=_CountCamera(), sequencer=None,
         calibration=None,
-        axis=ScanAxis(slot="s0", values=[1.0], kind="duration"),
+        axis=ScanAxis(slot="duration", values=[1.0], kind="duration"),
         plan=_FakePlan(),
         reducer=_PresetReducer([[1.0, np.nan], [3.0, 5.0]]),
         shots_per_point=2,
@@ -152,26 +155,28 @@ def test_dac_axis_rejects_unknown_slot_early():
     """A DAC scan whose slot the bound pulse does not have moves nothing on real
     hardware -- it must fail at construction, not silently run a null scan."""
     # Guard the production attribute name itself: the validation reads
-    # ``scan_var_names`` off the bound pulse; if that property is renamed the
-    # check would silently become dead code, so assert it still exists.
+    # Validation reads semantic scan_names plus the authoritative slot kinds.
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
-    assert hasattr(PulseTableState, "scan_var_names")
+    assert hasattr(PulseTableState, "scan_names")
 
     class _SlotPulse(_FakePulse):
-        pulse = types.SimpleNamespace(scan_var_names=["s0", "s1"])
+        pulse = types.SimpleNamespace(
+            scan_names=["da_x", "da_y"],
+            scan_slots=[types.SimpleNamespace(kind="dac"), types.SimpleNamespace(kind="dac")],
+        )
 
-    with pytest.raises(ValueError, match="not a scan slot"):
+    with pytest.raises(ValueError, match="not a semantic scan slot"):
         ScannedMeasurement(
             pulse=_SlotPulse(), camera=_CountCamera(), sequencer=None,
             calibration=None,
-            axis=ScanAxis(slot="s5", values=[0.0], kind="dac"),  # s5 absent
+            axis=ScanAxis(slot="missing", values=[0.0], kind="dac"),
             plan=_FakePlan(), reducer=_PresetReducer([[0.0, 0.0]]),
         )
     # positive control: a real slot constructs fine
     ScannedMeasurement(
         pulse=_SlotPulse(), camera=_CountCamera(), sequencer=None,
         calibration=None,
-        axis=ScanAxis(slot="s0", values=[0.0], kind="dac"),
+        axis=ScanAxis(slot="da_x", values=[0.0], kind="dac"),
         plan=_FakePlan(), reducer=_PresetReducer([[0.0, 0.0]]),
     )
 
@@ -309,7 +314,7 @@ def test_remote_sequencer_abort_reconnects():
     RPC calls, not silently no-op on a dropped link and leave outputs running."""
     from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer
 
-    seq = RemoteSequencer(host="127.0.0.1", port=18861, channels=["ch00", "ch01"])
+    seq = RemoteSequencer(host="127.0.0.1", port=18861)
     opened = {"n": 0}
 
     class _Root:
@@ -358,7 +363,7 @@ def test_scan_engine_threads_stop_into_acquire():
     meas = ScannedMeasurement(
         pulse=_FakePulse(), camera=_CountCamera(), sequencer=None,
         calibration=None,
-        axis=ScanAxis(slot="s0", values=[1.0, 2.0], kind="duration"),
+        axis=ScanAxis(slot="duration", values=[1.0, 2.0], kind="duration"),
         plan=_FakePlan(), reducer=_PresetReducer([[1.0, 2.0]]),
     )
     node = ScannedMeasurementNode(hub, meas, x_key="x", y_key="y")
@@ -387,14 +392,16 @@ def test_release_recapture_builds_on_chNN_channels():
 def test_calibration_rejects_wrong_image_shape():
     """Centers are absolute pixels; a frame from a different (shifted/resized) ROI
     must fail loud, not silently extract the wrong pixels."""
-    from Zou_lab_control.neutral_atom.core.calibration import TrapCalibration
+    from Zou_lab_control.neutral_atom.core.calibration import FrameContract, TrapCalibration
 
-    cal = TrapCalibration(centers=[[2, 2]], thresholds=[5.0], metadata={"image_shape": [8, 8]})
+    cal = TrapCalibration(
+        centers=[[2, 2]], thresholds=[5.0],
+        frame_contract=FrameContract(image_shape=(8, 8)))
     cal.signals(np.zeros((8, 8)))             # matching shape -> fine
     with pytest.raises(ValueError, match="does not match"):
         cal.signals(np.zeros((6, 10)))        # different shape -> raise (recalibrate)
-    # no fingerprint recorded -> no check (backward compatible with old saved calibrations)
-    TrapCalibration(centers=[[2, 2]], thresholds=[5.0]).signals(np.zeros((6, 10)))
+    with pytest.raises(TypeError):
+        TrapCalibration(centers=[[2, 2]], thresholds=[5.0])
 
 
 # --------------------------------------------------------------------------- round-3 plot-kind table guard
@@ -535,23 +542,20 @@ def test_qcmos_exposure_fallback_uses_longest_probe_for_a_heterogeneous_bracket(
     assert max(durations) == pytest.approx(20e-3)                 # the adapter's longest-probe fallback
 
 
-def test_probe_channel_alias_is_single_source():
-    """#5.15 / review-T1: the probe->channel alias (placeholder 'probe' also matches the legacy
-    'ch02') lives in exactly ONE helper -- ``timing.sequence.probe_channel_set`` -- so the camera
-    backends + exposure inference can never drift it (the trap the project has already been burned by).
-    A resolved chNN matches only itself; only the placeholder fans out to the legacy alias."""
+def test_probe_channel_resolution_has_no_historical_raw_lane_alias():
+    """Probe matching is exact; topology aliases belong to PortCatalog."""
     from pathlib import Path
     from Zou_lab_control.neutral_atom.timing import probe_channel_set
     import Zou_lab_control.neutral_atom.devices.qcmos as qcmos_mod
     import Zou_lab_control.neutral_atom.devices.virtual as virtual_mod
     import Zou_lab_control.neutral_atom.timing.sequence as sequence_mod
 
-    assert probe_channel_set("probe") == ["probe", "ch02"]      # placeholder fans out to the legacy alias
-    assert probe_channel_set("ch03") == ["ch03"]                # a resolved chNN matches only itself
-    # The 'ch02' alias literal exists ONLY in the helper's module; a re-copy into a backend fails here.
+    assert probe_channel_set("probe") == ["probe"]
+    assert probe_channel_set("ch03") == ["ch03"]
+    # No camera/timing module may carry a hidden probe -> raw-lane mapping.
     assert '"ch02"' not in Path(qcmos_mod.__file__).read_text()
     assert '"ch02"' not in Path(virtual_mod.__file__).read_text()
-    assert Path(sequence_mod.__file__).read_text().count('"ch02"') == 1
+    assert '"ch02"' not in Path(sequence_mod.__file__).read_text()
 
 
 def test_scalar_validators_are_single_source():
@@ -652,12 +656,18 @@ def test_remote_sequencer_ssl_and_plain_share_one_rpyc_config():
     AsyncResultTimeout while the non-SSL lab was fine.  Pin that both branches carry the SAME
     config."""
     from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer
+    from Zou_lab_control.neutral_atom.ports import PortCatalog
 
     seen = {}
+    catalog = PortCatalog.from_channels(["ch00"]).to_dict()
 
     class _Conn:
         closed = False
-        root = types.SimpleNamespace(snapshot=lambda: {})
+        root = types.SimpleNamespace(
+            snapshot=lambda: {"port_catalog": catalog, "clock_hz": 50_000_000})
+
+        def close(self):
+            self.closed = True
 
     def fake_connect(host, port, config=None):
         seen["plain"] = config
@@ -674,8 +684,8 @@ def test_remote_sequencer_ssl_and_plain_share_one_rpyc_config():
     saved = sys.modules.get("rpyc")
     sys.modules["rpyc"] = fake_rpyc
     try:
-        RemoteSequencer(host="10.0.0.5", port=18861, channels=["ch00"], ssl=False).open()
-        RemoteSequencer(host="10.0.0.5", port=18861, channels=["ch00"], ssl=True,
+        RemoteSequencer(host="10.0.0.5", port=18861, ssl=False).open()
+        RemoteSequencer(host="10.0.0.5", port=18861, ssl=True,
                         ca_certs="ca.pem").open()
     finally:
         if saved is None:

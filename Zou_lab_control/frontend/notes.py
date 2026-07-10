@@ -98,7 +98,7 @@ def write_notes_tex(
     doc_date: str | None = None,
     template_package: str = "zlc_frontend_notes",
 ) -> Path:
-    """Write a XeLaTeX notes document IN PLACE (legacy/debug; leaves a .tex+.sty).
+    """Write an inspectable XeLaTeX source bundle (leaves a ``.tex`` + ``.sty``).
 
     The default manual build does NOT use this -- it assembles the tex in memory
     via :func:`build_notes_tex_string` and compiles through :func:`render_tex_pdf`
@@ -113,48 +113,6 @@ def write_notes_tex(
         doc_date=doc_date, template_package=template_package)
     tex_path.write_text(tex, encoding="utf-8")
     return tex_path
-
-
-def compile_notes_pdf(
-    tex_path: str | Path,
-    *,
-    runs: int = 2,
-    xelatex: str | None = None,
-    halt_on_error: bool = True,
-) -> NotesBuildResult:
-    """Compile a notes ``.tex`` file in place with XeLaTeX.
-
-    This is the debug compiler: TeX auxiliary files and a build log stay beside
-    ``tex_path`` so a failed document can be inspected.  User-facing code should
-    prefer :func:`render_tex_pdf` (or :func:`render_notes_pdf`) when it only
-    wants ``tex -> pdf`` without temporary files in the output directory.
-    """
-    tex_path = Path(tex_path).resolve()
-    build_dir = tex_path.parent
-    exe = xelatex or shutil.which("xelatex")
-    if exe is None:
-        raise RuntimeError("xelatex was not found on PATH.")
-
-    log_path = build_dir / f"{tex_path.stem}.build.log"
-    combined = []
-    for _ in range(max(1, int(runs))):
-        cmd = [exe, "-interaction=nonstopmode"]
-        if halt_on_error:
-            cmd.append("-halt-on-error")
-        cmd.append(tex_path.name)
-        proc = subprocess.run(cmd, cwd=build_dir, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        combined.append(proc.stdout)
-        if proc.returncode != 0:
-            log_path.write_text("\n".join(combined), encoding="utf-8", errors="replace")
-            raise RuntimeError(f"xelatex failed for {tex_path}. See {log_path}.")
-
-    log_path.write_text("\n".join(combined), encoding="utf-8", errors="replace")
-    return NotesBuildResult(
-        tex_path=tex_path,
-        pdf_path=build_dir / f"{tex_path.stem}.pdf",
-        build_dir=build_dir,
-        log_path=log_path,
-    )
 
 
 def render_tex_pdf(
@@ -257,7 +215,7 @@ def render_notes_pdf(
     ``.tex``/``.sty``/``.aux``/``.log``/``.toc``/``.out`` is ever written to
     ``output_dir`` -- only the final ``<filename stem>.pdf`` (alongside any
     committed ``assets/`` it embeds).  ``compile_pdf=False`` is an explicit
-    inspection mode that writes the source ``.tex`` (legacy in-place path)."""
+    inspection mode that writes the source ``.tex`` bundle."""
     output_dir = Path(output_dir)
     pdf_path = output_dir / f"{Path(filename).stem}.pdf"
     if not compile_pdf:
@@ -358,7 +316,6 @@ def build_frontend_manual(
 __all__ = [
     "NotesBuildResult",
     "build_frontend_manual",
-    "compile_notes_pdf",
     "notes_template_dir",
     "render_tex_pdf",
     "render_notes_pdf",

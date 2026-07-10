@@ -22,7 +22,8 @@ import numpy as np
 # flow this makes the processor work out of the box; a second camera instance's slugged
 # frame name is picked in the form.
 from ...core.params import ParamDecl
-from ..logic import FRAME_0, Processor, SignalExpr, DEFAULT_SOURCE
+from ..logic import FRAME_0, Processor, SignalExpr, SignalSpec, DEFAULT_SOURCE
+from ...core.signal_tensor import SignalTensor
 from ..processor import ProcessorSpec
 from ..processor_registry import processor
 from ..signal_expr import hub_namespace
@@ -48,14 +49,12 @@ def mot_roi_intensity(frame, cx: float, cy: float, radius: float) -> float:
 
 
 class MotIntensityProcessor(Processor):
-    """Per-frame MOT intensity (scalar) from a monitor-camera frame block.
+    """Per-cell MOT intensity from a canonical monitor-camera tensor.
 
-    ``repeat_contract == "reduce"``: like the loading ``rate``, the output is ONE scalar per
-    acquisition -- a multi-repeat frame block averages its per-slice intensities (each slice is
-    measured through the same primitive first, so the average is over ROI values, never pixels)."""
+    The transform maps every valid ``(R,P)`` image cell to one scalar and
+    therefore publishes ``(R,P,1)`` without collapsing repeat or point axes."""
 
     provides = ("mot_intensity",)
-    repeat_contract = "reduce"
 
     def __init__(self, hub, *, source_expr=None, roi_cx: float = 0.0, roi_cy: float = 0.0,
                  roi_radius: float = 8.0, prefix: str = ""):
@@ -69,30 +68,49 @@ class MotIntensityProcessor(Processor):
         self.roi_cx = float(roi_cx)
         self.roi_cy = float(roi_cy)
         self.roi_radius = float(roi_radius)
+        self._point_shape = (1,)
+        self._repeat_capacity = 1
 
     def transform(self, inputs: dict[str, object]) -> dict[str, object]:
         # Coherent inputs + the SHARED expression helpers (np/numpy/math/history/...): the one
         # hub_namespace builder, so this source field honours the same SIGNAL_EXPR_HELP contract
         # every other source (panel / pulse-scan y / occupancy) does.
-        value = np.asarray(self.source_expr.evaluate(hub_namespace(self.hub, inputs)), dtype=float)
-        # Accept the camera's uniform (repeat, 1, H, W) block OR one bare (H, W) frame; measure
-        # each repeat slice through the ONE primitive, then reduce (the declared contract).
-        if value.ndim == 2:
-            frames = value[None]
-        elif value.ndim == 4 and value.shape[1] == 1:
-            frames = value[:, 0]
-        elif value.ndim == 3:
-            frames = value
-        else:
-            raise ValueError(f"MOT intensity expects (H, W) or (repeat, 1, H, W); got {value.shape}.")
-        h, w = frames.shape[-2:]
+        frames = np.asarray(
+            self.source_expr.evaluate(hub_namespace(self.hub, inputs)), dtype=float)
+        if frames.ndim != 4:
+            raise ValueError(
+                f"MOT intensity source must preserve canonical (R,P,H,W) axes; got {frames.shape}.")
+        repeats, points, h, w = (int(n) for n in frames.shape)
+        valid = self.input_validity((repeats, points))
         cx = self.roi_cx if self.roi_cx > 0 else w / 2.0
         cy = self.roi_cy if self.roi_cy > 0 else h / 2.0
-        finite = [mot_roi_intensity(f, cx, cy, self.roi_radius)
-                  for f in frames if np.isfinite(f).any()]
-        if not finite:
+        intensity = np.full((repeats, points, 1), np.nan, dtype=float)
+        for repeat_index in range(repeats):
+            for point_index in range(points):
+                if valid[repeat_index, point_index]:
+                    intensity[repeat_index, point_index, 0] = mot_roi_intensity(
+                        frames[repeat_index, point_index], cx, cy, self.roi_radius)
+        if not np.any(valid):
             return {}
-        return {"mot_intensity": float(np.mean(finite))}
+        self._point_shape = self.input_point_shape(points)
+        self._repeat_capacity = self.input_repeat_capacity()
+        spec = self._bare_output_specs()[0]
+        return {
+            "mot_intensity": SignalTensor(
+                intensity, spec.to_schema(dtype=np.float64), valid=valid)
+        }
+
+    def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
+        return (
+            SignalSpec(
+                "mot_intensity", "MOT intensity", "counts",
+                "background-subtracted circular-ROI intensity for each repeat/point cell",
+                points_shape=self._point_shape,
+                data_shape=(1,),
+                dtype=np.float64,
+                repeat_capacity=self._repeat_capacity,
+            ),
+        )
 
 
 @processor(order=20)
@@ -102,9 +120,8 @@ def mot_intensity(readout) -> ProcessorSpec:
     params = (
         ParamDecl("source", "Frame source", "signal_expr",
                   default={"inputs": [FRAME_0], "source": "value = signal"},
-                  tooltip="The monitor-camera frame to measure (pick the monitor camera "
-                          "measurement's frame signal; the value must be ONE (H, W) frame or the "
-                          "camera's (repeat, 1, H, W) block)."),
+                  tooltip="The monitor-camera frame to measure (pick a canonical "
+                          "(R,P,*data_shape) signal with data_shape=(H,W))."),
         ParamDecl("roi_cx", "ROI centre x (px)", "float", default=0.0,
                   tooltip="MOT spot centre, x pixel (0 = the frame centre)."),
         ParamDecl("roi_cy", "ROI centre y (px)", "float", default=0.0,

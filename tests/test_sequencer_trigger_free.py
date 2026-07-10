@@ -18,11 +18,12 @@ def test_runtime_sequencer_has_no_trigger_channels_attr():
     assert not hasattr(seq, "trigger_channels")
 
 
-def test_runtime_program_has_no_trigger_count_and_is_version_3():
+def test_runtime_program_has_no_trigger_count_and_carries_current_catalog_version():
     from Zou_lab_control.neutral_atom.devices.sequencer import _RUNTIME_PROGRAM_VERSION
 
-    # version bumped to 3 when trigger_count was removed (old payloads fail-fast, not mis-decode).
-    assert _RUNTIME_PROGRAM_VERSION == 3
+    # Version 4 adds the PortCatalog fingerprint after version 3 removed trigger_count;
+    # both old shapes fail fast instead of being guessed into the current wire contract.
+    assert _RUNTIME_PROGRAM_VERSION == 4
 
     seq = na.imaging_sequence(exposure=1e-3, load=True)
     program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "emCCD"], clock_hz=50e6)

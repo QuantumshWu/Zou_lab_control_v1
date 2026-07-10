@@ -686,8 +686,8 @@ def fill_grouped_signal_combo(combo, *, names, sources, formats, current, none_l
     visible label is indented.  Shared by the plot panel's slot picker and the logic-node
     source field, so the nested picker is identical everywhere."""
     cur = str(current or "")
-    # A configured input may NAME a signal that is declared but not published yet -- a node's own future
-    # output (a pulse-scan reading its own ``frame_0``), or a not-yet-started producer's signal.  The
+    # A configured input may NAME a signal that is declared but not published yet -- for example a
+    # PulseScan y supplied by a not-yet-started external producer.  The
     # binding is by NAME, resolved at RUN time, so keep such a name in the pool: BOTH the tree and the
     # flat picker then render it as a "waiting" leaf AND read it back.  Single-sources the docstring's
     # "kept selectable" promise across both branches -- the tree branch used to drop a not-listed name,
@@ -853,9 +853,10 @@ class SignalExprHandler(ParamWidgetHandler):
 class PulseSlotsHandler(ParamWidgetHandler):
     """An auto-generated per-slot sub-form for a pulse template (the COMPOSITE
     ``_PulseSlotsWidget``), repopulated from a sibling ``path`` field.  Value is
-    ``{"api": {...}, "scan_mode": "none"|"api"|"scan", "scan_code": "...", "extra_delay": ...}``
-    -- the api fixed values plus a single Scan-mode toggle that picks what one shared scan table
-    sweeps (the build dispatches on ``scan_mode``)."""
+    ``{"program_id": "...", "api": {...}, "sweep_kind": "scan_slot"|"api_slot",
+    "program": "..."}``: fixed API overrides plus exactly one selected sweep program.
+    ``program_id`` prevents an override from one template leaking into another template that
+    happens to reuse an internal slot index."""
 
     def build(self, decl, value, ctx):
         if ctx.pulse_slots_factory is None:
@@ -871,14 +872,16 @@ class PulseSlotsHandler(ParamWidgetHandler):
 
     def write(self, widget, value):
         # The auto-form rebuilds from the template path, so the SLOT ROWS come from the template,
-        # not the blob -- but the saved api VALUES + scan_mode + active program DO round-trip: stash
+        # not the blob -- but the saved fixed values + active program DO round-trip: stash
         # them on the widget so the next repopulation (driven by the seeded template field) restores
         # them.  The form calls refresh()/repopulate AFTER seeding so this stash is consumed.
         if hasattr(widget, "seed_value"):
             widget.seed_value(value)
 
     def is_empty(self, widget) -> bool:
-        return False
+        value = self.read(widget)
+        return not str(value.get("sweep_kind") or "").strip() \
+            or not str(value.get("program") or "").strip()
 
     def refresh(self, widget, providers: RefreshProviders) -> None:
         if providers.repopulate is not None:

@@ -31,3 +31,6 @@ include = ["Zou_lab_control*"]
 [tool.setuptools.package-data]
 "Zou_lab_control.frontend" = ["assets/*.ttf", "templates/*.sty", "content/notebook_templates/*.cells.md", "content/manual_templates/*.texbody"]
 "Zou_lab_control.neutral_atom" = ["configs/*.json", "content/manual_templates/*.texbody"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

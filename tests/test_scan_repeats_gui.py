@@ -13,6 +13,7 @@ separately (the user's acceptance gate), driving a real ``show_pulse_gui`` windo
 """
 
 from __future__ import annotations
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 from pathlib import Path
 import sys
@@ -64,8 +65,8 @@ def _pulse_editor(sequencer=None):
     """A headless PulseSequenceEditor with a tiny scan state (the Scan tab + spin are built)."""
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
-    st = PulseTableState(channels=["probe", "trig"])
-    st.bind_field("duration", "0", unit="us")
+    st = PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"]))
+    st.bind_field("duration", "0", unit="us", name="exposure")
     st.set_scan_table([[10.0], [20.0], [30.0]])
     return PulseSequenceEditor(st, sequencer=sequencer)
 
@@ -82,7 +83,7 @@ def test_scan_repeats_round_trips_through_load_state(_app):
     it (the Save round-trip path)."""
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
     ed = _pulse_editor()
-    loaded = PulseTableState(channels=["probe", "trig"])
+    loaded = PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"]))
     loaded.bind_field("duration", "0", unit="us")
     loaded.set_scan_table([[10.0], [20.0], [30.0]])
     loaded.scan_repeats = 5
@@ -119,8 +120,8 @@ def test_poll_scan_progress_reads_connected_sequencer(_app):
     ed.sequencer = _FakeSeq()
     ed._poll_scan_progress()
     # the live position PLUS the current point's values (#1 "show the current scan points"): the
-    # editor's scan_table is [[10],[20],[30]], so point 1 (0-based) appends "  s0 = 20".
-    assert ed.scan_progress_label.text() == "Scan: point 2 / 3 · sweep 1 / 2  s0 = 20"
+    # editor's scan_table is [[10],[20],[30]], so point 1 appends its semantic identity.
+    assert ed.scan_progress_label.text() == "Scan: point 2 / 3 · sweep 1 / 2  exposure = 20"
 
 
 def test_virtual_sequencer_reports_scan_progress_for_a_software_streamed_scan(_app):
@@ -133,7 +134,7 @@ def test_virtual_sequencer_reports_scan_progress_for_a_software_streamed_scan(_a
     from Zou_lab_control.neutral_atom.devices.sequencer import SCAN_PROGRESS_IDLE
     from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
-    st = PulseTableState(channels=["probe", "trig"])
+    st = PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"]))
     st.bind_field("duration", "0", unit="us")
     st.set_scan_table([[10.0], [20.0], [30.0], [40.0]])   # 4 points, scan_repeats=0 -> repeat_forever
     seq = VirtualSequencer(channels=["probe", "trig"], sleep_scale=1.0)   # real-time (conftest fast-forwards by default)
@@ -142,9 +143,10 @@ def test_virtual_sequencer_reports_scan_progress_for_a_software_streamed_scan(_a
     seq.fire()
     p = seq.scan_progress()
     assert p["scanning"] is True and p["n_points"] == 4    # a streamed scan IS reported (not idle)
-    t0 = p["point"]
+    total0 = p["sweep"] * p["n_points"] + p["point"]
     time.sleep(0.12)                                       # >> the us-scale per-point duration -> the point advances
-    assert seq.scan_progress()["point"] >= t0
+    p1 = seq.scan_progress()
+    assert p1["sweep"] * p1["n_points"] + p1["point"] >= total0
     seq.set_safe_state()                                   # Stop Pulse -> back to idle
     assert seq.scan_progress() == SCAN_PROGRESS_IDLE
 
@@ -238,9 +240,9 @@ def test_prepare_button_also_routes_cyclic_through_controller(_app):
 def _three_period_scan_editor(seq):
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState, PulsePeriod
-    st = PulseTableState(channels=["probe", "trig"])
-    st.periods.append(PulsePeriod(1000, tuple(0 for _ in st.channels), unit="ns"))
-    st.periods.append(PulsePeriod(1000, tuple(0 for _ in st.channels), unit="ns"))
+    st = PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"]))
+    st.periods.append(PulsePeriod(1000, tuple(0 for _ in st.port_catalog.raw_lanes), unit="ns"))
+    st.periods.append(PulsePeriod(1000, tuple(0 for _ in st.port_catalog.raw_lanes), unit="ns"))
     st.bind_field("duration", "0", unit="us")
     st.set_scan_table([[10.0], [20.0], [30.0]])
     ed = PulseSequenceEditor(st, sequencer=seq)
@@ -287,9 +289,9 @@ def test_on_pulse_after_moving_a_scan_slot_uploads_the_current_ui_table(_app):
 def _scan_slot_editor():
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState, PulsePeriod
-    st = PulseTableState(channels=["probe", "trig"])
-    st.periods.append(PulsePeriod(1000, tuple(0 for _ in st.channels), unit="ns"))
-    st.periods.append(PulsePeriod(1000, tuple(0 for _ in st.channels), unit="ns"))
+    st = PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"]))
+    st.periods.append(PulsePeriod(1000, tuple(0 for _ in st.port_catalog.raw_lanes), unit="ns"))
+    st.periods.append(PulsePeriod(1000, tuple(0 for _ in st.port_catalog.raw_lanes), unit="ns"))
     st.bind_field("duration", "0", unit="us")         # one scan slot
     ed = PulseSequenceEditor(st)
     ed.tabs.setCurrentWidget(ed.scan_tab)

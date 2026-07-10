@@ -1,56 +1,221 @@
 {
   "schema": "Zou_lab_control.neutral_atom.PulseTableState",
-  "version": 3,
+  "version": 4,
   "name": "mot_field_scan",
-  "channels": [
-    "trap",
-    "cooling",
-    "probe",
-    "emCCD",
-    "pushout",
-    "microwave",
-    "mot_trigger",
-    "dx0",
-    "dx1",
-    "dx2",
-    "dx3",
-    "dx4",
-    "dx5",
-    "dy0",
-    "dy1",
-    "dy2",
-    "dy3",
-    "dy4",
-    "dy5",
-    "dz0",
-    "dz1",
-    "dz2",
-    "dz3",
-    "dz4",
-    "dz5"
-  ],
-  "scan_slots": [],
-  "scan_table": [],
-  "api_slots": [
+  "port_catalog": {
+    "schema": "Zou_lab_control.neutral_atom.PortCatalog",
+    "version": 1,
+    "raw_lanes": [
+      "trap",
+      "cooling",
+      "probe",
+      "emCCD",
+      "pushout",
+      "microwave",
+      "mot_trigger",
+      "dx0",
+      "dx1",
+      "dx2",
+      "dx3",
+      "dx4",
+      "dx5",
+      "dy0",
+      "dy1",
+      "dy2",
+      "dy3",
+      "dy4",
+      "dy5",
+      "dz0",
+      "dz1",
+      "dz2",
+      "dz3",
+      "dz4",
+      "dz5"
+    ],
+    "ports": [
+      {
+        "key": "trap",
+        "kind": "digital",
+        "lanes": [
+          "trap"
+        ],
+        "label": "trap",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "cooling",
+        "kind": "digital",
+        "lanes": [
+          "cooling"
+        ],
+        "label": "cooling",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "probe",
+        "kind": "digital",
+        "lanes": [
+          "probe"
+        ],
+        "label": "probe",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "unused_camera",
+        "kind": "digital",
+        "lanes": [
+          "emCCD"
+        ],
+        "label": "unused_camera",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "pushout",
+        "kind": "digital",
+        "lanes": [
+          "pushout"
+        ],
+        "label": "pushout",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "microwave",
+        "kind": "digital",
+        "lanes": [
+          "microwave"
+        ],
+        "label": "microwave",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "camera_trigger",
+        "kind": "digital",
+        "lanes": [
+          "mot_trigger"
+        ],
+        "label": "emCCD",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "da_x",
+        "kind": "dac",
+        "lanes": [
+          "dx0",
+          "dx1",
+          "dx2",
+          "dx3",
+          "dx4",
+          "dx5"
+        ],
+        "label": "da_bias_x",
+        "bus_index": 0,
+        "width": 6,
+        "encoding": "offset_binary",
+        "safe_value": 32,
+        "latch_clock": null
+      },
+      {
+        "key": "da_y",
+        "kind": "dac",
+        "lanes": [
+          "dy0",
+          "dy1",
+          "dy2",
+          "dy3",
+          "dy4",
+          "dy5"
+        ],
+        "label": "da_bias_y",
+        "bus_index": 1,
+        "width": 6,
+        "encoding": "offset_binary",
+        "safe_value": 32,
+        "latch_clock": null
+      },
+      {
+        "key": "da_z",
+        "kind": "dac",
+        "lanes": [
+          "dz0",
+          "dz1",
+          "dz2",
+          "dz3",
+          "dz4",
+          "dz5"
+        ],
+        "label": "da_bias_z",
+        "bus_index": 2,
+        "width": 6,
+        "encoding": "offset_binary",
+        "safe_value": 32,
+        "latch_clock": null
+      }
+    ],
+    "fingerprint": "b7743d9e18950ce9"
+  },
+  "scan_slots": [
     {
-      "name": "a1",
+      "name": "da_x",
       "kind": "dac",
       "target": "da_x@0",
-      "unit": "value"
+      "label": "Bx",
+      "unit": "value",
+      "nominal": 0.0
     },
     {
-      "name": "a2",
+      "name": "da_y",
       "kind": "dac",
       "target": "da_y@0",
-      "unit": "value"
+      "label": "By",
+      "unit": "value",
+      "nominal": 0.0
     },
     {
-      "name": "a3",
+      "name": "da_z",
       "kind": "dac",
       "target": "da_z@0",
-      "unit": "value"
+      "label": "Bz",
+      "unit": "value",
+      "nominal": 0.0
     }
   ],
+  "scan_table": [
+    [
+      0.0,
+      0.0,
+      0.0
+    ]
+  ],
+  "scan_code": "",
+  "api_slots": [],
   "time_step_ns": 20.0,
   "periods": [
     {
@@ -58,31 +223,10 @@
       "unit": "ns",
       "name": "settle",
       "states": [
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        0,
-        0,
-        1
+        0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 1,
+        0, 0, 0, 0, 0, 1,
+        0, 0, 0, 0, 0, 1
       ]
     },
     {
@@ -90,31 +234,10 @@
       "unit": "ns",
       "name": "",
       "states": [
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        0,
-        0,
-        1
+        0, 0, 0, 0, 0, 0, 1,
+        0, 0, 0, 0, 0, 1,
+        0, 0, 0, 0, 0, 1,
+        0, 0, 0, 0, 0, 1
       ]
     },
     {
@@ -122,76 +245,24 @@
       "unit": "ns",
       "name": "expose",
       "states": [
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        0,
-        0,
-        1
+        0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 1,
+        0, 0, 0, 0, 0, 1,
+        0, 0, 0, 0, 0, 1
       ]
     }
   ],
-  "visible_channels": [
-    "mot_trigger",
-    "dx0",
-    "dx1",
-    "dx2",
-    "dx3",
-    "dx4",
-    "dx5",
-    "dy0"
+  "visible_ports": [
+    "camera_trigger",
+    "da_x",
+    "da_y",
+    "da_z"
   ],
-  "channel_labels": {},
-  "analog_buses": {
-    "da_x": [
-      "dx0",
-      "dx1",
-      "dx2",
-      "dx3",
-      "dx4",
-      "dx5"
-    ],
-    "da_y": [
-      "dy0",
-      "dy1",
-      "dy2",
-      "dy3",
-      "dy4",
-      "dy5"
-    ],
-    "da_z": [
-      "dz0",
-      "dz1",
-      "dz2",
-      "dz3",
-      "dz4",
-      "dz5"
-    ]
-  },
   "analog_bus_modes": {
     "da_x": [
       {
         "mode": "edge",
-        "value": 0
+        "value": "s0"
       },
       {
         "mode": "hold",
@@ -205,7 +276,21 @@
     "da_y": [
       {
         "mode": "edge",
-        "value": 0
+        "value": "s1"
+      },
+      {
+        "mode": "hold",
+        "value": null
+      },
+      {
+        "mode": "hold",
+        "value": null
+      }
+    ],
+    "da_z": [
+      {
+        "mode": "edge",
+        "value": "s2"
       },
       {
         "mode": "hold",
@@ -223,6 +308,5 @@
   "repeat_end": null,
   "repeat_count": 1,
   "repeat_forever": true,
-  "scan_repeats": 0,
-  "clk_channels": []
+  "scan_repeats": 0
 }

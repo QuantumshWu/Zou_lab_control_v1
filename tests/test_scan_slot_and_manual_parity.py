@@ -2,7 +2,7 @@
 work, and a manually-configured logic node must behave like the one-click task):
 
 1. The console signal picker ROUND-TRIPS a configured input even when that signal is not live yet
-   (a node's own future output, or a not-yet-started producer).  A dropped input silently builds a
+   (for example a PulseScan y from a not-yet-started producer).  A dropped input silently builds a
    node with an empty y-expression -> every scan point NaN -> an empty grid on Start.  Pinned so the
    tree/flat picker branches can never diverge again (only the flat branch used to keep a waiting name).
 
@@ -32,8 +32,8 @@ def test_signal_picker_round_trips_a_not_yet_live_input():
     fill_grouped_signal_combo(combo, names=["survival"], sources={"survival": ["temperature"]},
                               formats={"survival": "(7,)"}, current="frame_0")
     assert read_editable_combo(combo) == "frame_0", (
-        "the picker dropped a configured input that is not a currently-live signal; a pulse-scan y "
-        "referencing its own frame_0 (or a not-yet-running producer) would lose its binding on Start.")
+        "the picker dropped a configured input that is not a currently-live signal; a PulseScan y "
+        "referencing a not-yet-running external producer would lose its binding on Start.")
 
 
 def test_bundled_fireable_templates_author_on_the_hardware_clock_grid():

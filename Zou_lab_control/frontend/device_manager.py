@@ -212,7 +212,7 @@ class _DeviceEntryCard(FluentFrame):
         stored = dict(entry.get("params") or {})
         # A form prefill (``decl.default``) DISPLAYS in the widget but only reaches the config if the
         # user edits that field.  That silently drops the prefill of a kwarg the CONSTRUCTOR requires
-        # (has no signature default) -- e.g. the remote-sequencer ``port`` / ``channels`` -- so
+        # (has no signature default) -- e.g. the remote-sequencer ``host`` -- so
         # ``cls(**params)`` raised "missing 'port'" at Init.  Persist the prefill for exactly those
         # constructor-REQUIRED params (the constructor can't supply them); params the constructor
         # DEFAULTS are left out, so the config stays minimal and opening the editor rewrites nothing.
@@ -234,7 +234,7 @@ class _DeviceEntryCard(FluentFrame):
             self.widgets[decl.key] = widget
         # Flush ONLY the constructor-required prefills the stored config LACKS into the working entry
         # (``entry`` IS self._working[name]), leaving every other stored value untouched -- so a
-        # just-added remote sequencer already carries ``port`` / ``channels`` for Init, without
+        # just-added remote sequencer already carries its connection params for Init, without
         # bloating the config with defaults the constructor would supply anyway.
         resolved = cls.form_to_config(self._panel._clean_values(self))
         additions = {k: v for k, v in resolved.items() if k in required_kwargs and k not in stored}

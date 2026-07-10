@@ -1,12 +1,12 @@
 """#H3w-3: temperature survival must DROP (not stick at 1) after the GUI "Calibrate readout" TASK.
 
 Root cause of the stuck-at-1 regression: a threshold is exposure-specific, but only the
-``ReadoutSubsystem.thresholds`` API path stamped ``threshold_exposure`` -- the GUI ``CalibrateReadoutTask``
+``ReadoutSubsystem.thresholds`` API path recorded the exposure -- the GUI ``CalibrateReadoutTask``
 did NOT, so temperature skipped its exposure-matching and imaged the survival frames at the template's
 baked 20 ms while the thresholds were learnt at 5 ms.  Every empty site then crossed the too-low
 threshold in BOTH frames -> survival stuck at ~1.
 
-Fix: the exposure is stamped in the ONE function every threshold path routes through
+Fix: the exposure is recorded in the typed frame contract by the ONE function every threshold path routes through
 (``calibrate_threshold_from_images``), so EVERY calibration -- API or GUI task -- carries it.  This
 pins that the GUI-task calibration records the exposure and temperature then drops correctly.
 """
@@ -36,8 +36,8 @@ def test_gui_calibrate_task_stamps_exposure_and_temperature_drops():
         task = exp.readout.calibrate_task(hub, grid_shape=(5, 7))
         task.shot()
         cal = exp.readout.current
-        expo = (cal.metadata or {}).get("threshold_exposure")
-        assert expo is not None, "the GUI Calibrate task must stamp threshold_exposure on the calibration"
+        expo = cal.readout_exposure()
+        assert expo is not None, "the GUI Calibrate task must record the calibration exposure"
         assert abs(float(expo) - float(task.readout_exposure)) < 1e-12   # the exposure it learnt at
 
         # temperature now self-matches that exposure -> survival DROPS (not stuck at 1)

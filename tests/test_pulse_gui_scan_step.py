@@ -18,6 +18,7 @@ Offscreen, logic asserts only -- the visual acceptance is the user's separate th
 """
 
 from __future__ import annotations
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 import os
 import sys
@@ -72,10 +73,17 @@ def _scan_editor(seq):
     """A headless PulseSequenceEditor with one scanned duration and a 4-point table (rows in µs)."""
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
-    st = PulseTableState(channels=["probe", "trig"])
-    st.bind_field("duration", "0", unit="us")
+    st = PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"]))
+    st.bind_field("duration", "0", unit="us", name="exposure")
     st.set_scan_table([[10.0], [20.0], [30.0], [40.0]])
     return PulseSequenceEditor(st, sequencer=seq)
+
+
+def test_scan_tab_exposes_semantic_identity_and_demotes_compiler_token(_app):
+    ed = _scan_editor(None)
+    ed._refresh_scan_tab()
+    assert "exposure (compiler s0)" in ed.scan_slots_label.text()
+    assert ed.scan_table_view.toPlainText().splitlines()[0] == "exposure"
 
 
 # ---- hold -> step ▶ / ◀ step: the index moves and the device gets a fresh single-point reload -----
@@ -144,7 +152,7 @@ def test_progress_label_shows_the_held_point_over_total_after_a_step(_app):
     ed.tabs.setCurrentWidget(ed.scan_tab)
     ed.scan_step_forward_button.click()                  # running -> stop+hold at point 2 (0-based)
     ed._poll_scan_progress()
-    assert ed.scan_progress_label.text() == "held at point 3/4: s0 = 30"
+    assert ed.scan_progress_label.text() == "held at point 3/4: exposure = 30"
 
 
 # ---- harmless without a sequencer / without a scan table -----------------------------------------
@@ -152,7 +160,7 @@ def test_step_without_scan_table_is_a_harmless_noop(_app):
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
     seq = _StepSeq()
-    ed = PulseSequenceEditor(PulseTableState(channels=["probe", "trig"]), sequencer=seq)   # no scan
+    ed = PulseSequenceEditor(PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"])), sequencer=seq)   # no scan
     ed.scan_step_forward_button.click()
     ed.scan_step_back_button.click()
     assert ed._held_scan_point is None                   # nothing held

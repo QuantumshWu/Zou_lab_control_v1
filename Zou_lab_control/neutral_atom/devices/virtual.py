@@ -22,6 +22,7 @@ from Zou_lab_control._clock import DEFAULT_CLOCK_HZ
 # imported lazily where used (keeping devices->operations off the import graph, as elsewhere here).
 from Zou_lab_control._readout_math import normal_cdf
 from ..core.utils import site_index
+from ..ports import PortCatalog, coerce_port_catalog
 from .base import (
     ROI_CLEAR_SENTINELS, SOFTWARE_TRIGGER, CameraDevice, DeviceProperty, LaserDevice, RFSourceDevice,
     SequencerDevice, TrapArrayDevice, snap_subarray)
@@ -44,9 +45,8 @@ from ..timing import (
 # The MOT coil DAC buses -- {bus name: bit channels LSB..MSB} -- THE single source both the
 # virtual channel catalog (DEFAULT_CHANNELS below) and the monitor camera's default coil wiring
 # (VirtualMotCamera.coil_buses) derive from, mirroring pulses/mot_field_template.json (three
-# 6-bit buses).  Keeping the bit names in ONE place is what lets the shipped MOT template load
-# onto a stock VirtualSequencer as a SUBSET of the device catalog (the same direction the real
-# rig enforces: board.xdc defines the catalog, a template may only use part of it).
+# 6-bit buses).  The reusable template's semantic labels project these logical controls onto
+# the real board's 10-bit bias buses without copying raw topology here.
 MOT_COIL_BUSES: dict[str, tuple[str, ...]] = {
     "da_x": tuple(f"dx{i}" for i in range(6)),
     "da_y": tuple(f"dy{i}" for i in range(6)),
@@ -54,9 +54,9 @@ MOT_COIL_BUSES: dict[str, tuple[str, ...]] = {
 }
 
 # Display LABELS for the coil bits -- ``dx0 -> "da_x[0]"`` -- so the GUI folds the 18 coil channels
-# into three ``da_x``/``da_y``/``da_z`` bus rows exactly the way the real rig does: the streamer
+# into three logical coil rows: the streamer
 # carries CHANNEL names (``dx0`` here, ``chNN`` on hardware) plus a LABEL per channel written in
-# ``base[bit]`` syntax; ``infer_bus_channels`` folds on the label regex.  Derived from
+# ``base[bit]`` syntax; the device-boundary PortCatalog builder folds them once.  Derived from
 # MOT_COIL_BUSES (never a second hand-typed table) so name<->label stay in lockstep, and put on the
 # VirtualSequencer (not the template) so the fold works straight off the DEVICE with NO template
 # loaded: whenever the coil bits are SHOWN (they are not in the editor's first-four default visible
@@ -1164,7 +1164,8 @@ class VirtualMotCamera(_TriggerWiredCamera):
         # names its own buses in the device config.
         self.coil_buses = {str(k): tuple(str(c) for c in v)
                            for k, v in dict(coil_buses or MOT_COIL_BUSES).items()}
-        self.b0 = {str(k): float(v) for k, v in dict(b0 or {"da_x": 7.0, "da_y": -5.0, "da_z": 11.0}).items()}
+        self.b0 = {str(k): float(v) for k, v in dict(
+            b0 or {"da_x": 7.0, "da_y": -5.0, "da_z": 11.0}).items()}
         self.b_sigma = {str(k): positive_float(v, "b_sigma") for k, v in dict(
             b_sigma or {"da_x": 6.0, "da_y": 6.0, "da_z": 6.0}).items()}
         self.peak_counts = nonnegative_float(peak_counts, "peak_counts")
@@ -1239,6 +1240,26 @@ class VirtualMotCamera(_TriggerWiredCamera):
         return {bus: decode_analog_bus(sequence, members, t_sense)
                 for bus, members in self.coil_buses.items()}
 
+    def _next_scene_levels(self, sequence: PulseSequence | None) -> dict[str, float]:
+        """Decode the next hardware-scan row, or the ordinary sequence state.
+
+        A streamed scan carries its exact PulseTableState in ``source_table``.
+        The real camera sees successive FPGA table rows; this cursor gives the
+        virtual sensor that same ordered view instead of rendering the first
+        reference row for every frame.
+        """
+
+        source = None if sequence is None else getattr(sequence, "source_table", None)
+        if source:
+            state = PulseTableState.from_dict(source)
+            if state.scan_slots and state.scan_table:
+                index = int(getattr(self, "_scan_render_index", 0)) % len(state.scan_table)
+                point = state.with_slots_resolved(state.slot_point(index)).to_sequence(
+                    time_step_ns=state.time_step_ns, expand_repeat=False)
+                self._scan_render_index = index + 1
+                return self._sense_levels(point)
+        return self._sense_levels(sequence)
+
     def _render_at_levels(self, levels: Mapping[str, float], frames: int) -> list[np.ndarray]:
         """THE one rendering core (levels -> efficiency -> spot + noise) BOTH acquisition modes
         share -- free-run and hardware trigger differ only in where ``levels`` come from, never in
@@ -1283,7 +1304,10 @@ class VirtualMotCamera(_TriggerWiredCamera):
         frames = positive_int(frames, "frames")
         if sequence is None or not getattr(sequence, "pulses", None):
             return []
-        return self._render_at_levels(self._sense_levels(sequence), frames)
+        out: list[np.ndarray] = []
+        for _ in range(frames):
+            out.extend(self._render_at_levels(self._next_scene_levels(sequence), 1))
+        return out
 
     def _on_wire_fired(self, sequence) -> None:
         # ``Software`` mode ignores its trigger input entirely (the real Basler sets TriggerMode
@@ -1313,7 +1337,7 @@ class VirtualMotCamera(_TriggerWiredCamera):
         the SAME drop semantics (and therefore the same console "display fell behind" advisory)
         the real pylon free-run produces.  The producer runs for the armed session only."""
         while not self._producer_stop.wait(pace):
-            frame = self._render_at_levels(self._sense_levels(self._scene_source()), 1)[0]
+            frame = self._render_at_levels(self._next_scene_levels(self._scene_source()), 1)[0]
             with self._latest_cond:
                 self._latest = frame
                 self._latest_seq += 1
@@ -1321,6 +1345,7 @@ class VirtualMotCamera(_TriggerWiredCamera):
 
     def _arm(self, frames: int | None) -> None:
         super()._arm(frames)
+        self._scan_render_index = 0
         # FREE-RUN with real pacing: start the resident sensor stream (the virtual StartGrabbing).
         # pace == 0 (pytest fast-forward, sleep_scale = 0) keeps the deterministic render-on-demand
         # path in _grab -- same physics core, only WHO ticks the clock differs.
@@ -1362,7 +1387,7 @@ class VirtualMotCamera(_TriggerWiredCamera):
             self._deliver([frame])
             return True
         # pace == 0 (tests): render on demand -- the exposure clock is fast-forwarded away.
-        self._deliver(self._render_at_levels(self._sense_levels(self._scene_source()), 1))
+        self._deliver(self._render_at_levels(self._next_scene_levels(self._scene_source()), 1))
         return True
 
     def snapshot(self) -> dict[str, object]:
@@ -1407,15 +1432,20 @@ class VirtualSequencer(SequencerDevice):
     """
 
     def __init__(self, channels: Sequence[str] = DEFAULT_CHANNELS, clock_hz: float = DEFAULT_CLOCK_HZ,
-                 sleep_scale: float | None = None, channel_labels: dict | None = None):
+                 sleep_scale: float | None = None, channel_labels: dict | None = None,
+                 port_catalog: PortCatalog | Mapping[str, object] | None = None):
         from .sequencer import SequencerService
-        self.channels = tuple(str(channel) for channel in channels)
-        # Display labels (channel -> ``base[bit]``) so the pulse GUI folds the coil bits into bus
-        # rows -- the virtual analogue of the real sequencer reading its labels off the board XDC.
-        # Restricted to the channels this instance actually carries (a custom channel list drops the
-        # coil labels it does not use), so it never advertises a bus whose members are absent.
+        raw_channels = tuple(str(channel) for channel in channels)
+        # Construct topology once at the device boundary.  The stock labels turn
+        # dx0..dz5 into three DAC ports; thereafter editor, service and compiler
+        # consume this same immutable catalog rather than folding labels again.
         labels = MOT_COIL_LABELS if channel_labels is None else dict(channel_labels)
-        self.channel_labels = {ch: str(labels[ch]) for ch in self.channels if ch in labels}
+        self.port_catalog = coerce_port_catalog(
+            port_catalog,
+            channels=raw_channels,
+            channel_labels={ch: str(labels[ch]) for ch in raw_channels if ch in labels},
+        )
+        self.channels = tuple(self.port_catalog.raw_lanes)
         self.clock_hz = positive_float(clock_hz, "clock_hz")
         # REAL-TIME by default (DEFAULT_SLEEP_SCALE=1.0): a fired program takes its real
         # duration, so the live camera paces with the pulse.  ``None`` -> the module default
@@ -1432,6 +1462,7 @@ class VirtualSequencer(SequencerDevice):
         # all read the same value even when a caller flips it mid-session.
         self.service = SequencerService(
             channels=self.channels,
+            port_catalog=self.port_catalog,
             clock_hz=self.clock_hz,
             sleep_scale=nonnegative_float(sleep_scale, "sleep_scale"),
             scan_progress_callback=self._scan_progress,
@@ -1526,7 +1557,7 @@ class VirtualSequencer(SequencerDevice):
         # loaded pulse .json pass).  Compile a table to a PulseSequence so fire()/firing/acquire
         # all work on ONE type, carrying repeat_forever for a continuous (On Pulse) program.
         if isinstance(sequence, PulseTableState):
-            channels = list(sequence.channels)
+            channels = list(sequence.port_catalog.raw_lanes)
             program = sequence.to_sequence(clock_hz=self.clock_hz)
             # Carry the SOURCE state's cyclic intent onto the camera's firing handle: an On Pulse
             # (continuous until Stop) or a GUI/notebook scan arrives as repeat_forever=True on the
@@ -1763,11 +1794,14 @@ class VirtualSequencer(SequencerDevice):
         # The composed service's snapshot carries the PROTOCOL state (state / cache_prepared /
         # prepared_program / the sync-to-device ``last_payload_json``); the base snapshot merges
         # AFTER it so the ``type`` key still has ONE producer per class (BaseDevice.snapshot),
-        # and the virtual-specific fields land last (``channels`` shows the DAC coil bits folded
-        # into da_x/da_y/da_z buses -- ONE display source).
+        # and the virtual-specific fields land last.  Logical ports and raw
+        # compiler lanes have separate keys; ``channels`` no longer changes
+        # meaning between backends.
         out = {**self.service.snapshot(), **super().snapshot()}
         out.update({
-            "channels": self.display_channels(),
+            "raw_channels": list(self.port_catalog.raw_lanes),
+            "port_catalog": self.port_catalog.to_dict(),
+            "port_catalog_fingerprint": self.port_catalog.fingerprint,
             "clock_hz": self.clock_hz,
             "sleep_scale": self.sleep_scale,
             "runs": sum(1 for row in self.history if row["action"] == "fire"),
@@ -1808,7 +1842,8 @@ def write_virtual_run(
     the SAME on these files as on a real run -- only who wrote them differs.
     """
 
-    from ..operations.imageio import save_frame  # lazy: keep devices->operations off the import graph
+    from ..core.calibration import FrameContract
+    from ..operations.imageio import RunManifest, save_frame  # lazy: keep devices->operations off the import graph
 
     trap = trap_array if trap_array is not None else VirtualTrapArray(
         grid_shape=tuple(grid_shape), loading_probability=float(loading_probability), seed=seed
@@ -1825,6 +1860,14 @@ def write_virtual_run(
             frame = trap.render_image(exposure=exposure)
             n += 1
             save_frame(data_dir / f"{prefix}{n}{suffix}", frame)
+    RunManifest(
+        prefix=str(prefix), shots_per_group=spg, short_shot=int(short_shot),
+        ref_shots=refs, n_groups=n_groups, frames_subdir="",
+        frame_contract=FrameContract(
+            image_shape=tuple(trap.image_shape), sensor_shape=tuple(trap.image_shape),
+            exposure_s=float(short_exposure), camera_type="VirtualCamera",
+            readout_mode="virtual-renderer"),
+    ).save(data_dir / "run_schema.json")
     return {
         "folder": str(data_dir), "prefix": str(prefix), "n_frames": n, "groups": n_groups,
         "shots_per_group": spg, "short_shot": int(short_shot), "ref_shots": refs,

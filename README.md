@@ -127,9 +127,10 @@ generated `impl_1\zlc_pulse_streamer_top.{bit,ltx}`. The full runbook is in the
 ## Frontend
 
 The pulse GUI edits a `PulseTableState` and drives a supplied sequencer; it is a
-frontend only, not a separate hardware-control layer. Scanning uses named slots
-`s0, s1, ...`: bind any duration/DAC field (a scan dot in the GUI, or
-`state.bind_field(kind, target)`), then provide an `N_points x N_slots`
+frontend only, not a separate hardware-control layer. Scanning uses semantic
+`ScanSlot.name` values such as `probe_duration` or `da_x`; `s0, s1, ...` are
+compiler-only column tokens. Bind any duration/DAC field (a scan dot in the GUI,
+or `state.bind_field(kind, target, name=...)`), then provide an `N_points x N_slots`
 `scan_table`. A channel delay is a fixed per-channel output delay set through
 the API; it is never scanned. The **frontend manual** covers the widget library, the
 Edit/Preview/Scan tabs, the scan-dot workflow, and the plotting/PDF API. Open
@@ -145,7 +146,7 @@ configurable grid of live panels (2D image with side distribution and draggable
 clim, rolling trace, bimodal-fit histogram, 1D vector), each wired to named
 experiment signals through a small Python expression (`value = occupied -
 b_occupied`).  It opens empty: from **Add Panel** you assemble the logic nodes
-(a camera Measurement publishing `frame`, a Judge-occupancy Processor turning it
+(a camera Measurement publishing `frame_0`, `frame_1`, ... per trigger event, a Judge-occupancy Processor turning one selected frame signal
 into occupancy / loading-rate signals) and plot panels reading those signals.
 A real experiment is the same graph publishing into a `SignalHub` from a real
 camera (see the frontend manual's Task-console chapter).  Layouts save/load as

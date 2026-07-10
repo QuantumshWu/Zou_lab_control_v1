@@ -13,7 +13,7 @@ from ..timing.verilog import generate_verilog, write_verilog_bundle
 from .base import ExperimentSubsystem
 
 if TYPE_CHECKING:  # pragma: no cover
-    from ..devices import CameraDevice, PulseController
+    from ..devices import PulseController
     from ..session import NeutralAtomSession
 
 
@@ -27,7 +27,7 @@ class TimingSubsystem(ExperimentSubsystem):
     plus its device set.  None of it can live on a single device, because every
     action orchestrates ACROSS devices while the devices themselves stay
     session-blind (a camera is a pure grabber, a sequencer a pure streamer):
-    ``configure_imaging`` writes a camera's exposure AND rebuilds the imaging
+    ``configure_imaging`` writes the readout camera's exposure AND rebuilds the imaging
     sequence around the readout camera's trigger line; ``preflight`` validates
     the sequence against the sequencer's clock/channels and snapshots EVERY
     device into the report; ``write_verilog`` compiles the sequence with the
@@ -36,18 +36,18 @@ class TimingSubsystem(ExperimentSubsystem):
 
     _session: "NeutralAtomSession"
 
-    def configure_imaging(self, *, exposure: float | None = None, camera: "CameraDevice | None" = None,
-                          load: bool = True, trigger_width: float = 20e-6, pre_trigger: float = 100e-6) -> PulseSequence:
+    def configure_imaging(self, *, exposure: float | None = None, load: bool = True,
+                          trigger_width: float = 20e-6, pre_trigger: float = 100e-6) -> PulseSequence:
         """Set the imaging exposure and rebuild the session's imaging sequence.
 
-        The ONE configure-imaging path (``capture`` routes its ``exposure=`` through
-        here too): ``camera`` picks which sensor the exposure is written to (None =
-        the conventional readout camera); the rebuilt sequence always gates the
-        READOUT camera's trigger line and becomes ``session.sequence``.
+        This API exclusively owns the conventional readout camera and its matching pulse;
+        the rebuilt sequence gates that camera's trigger line and becomes
+        ``session.sequence``.  A free-running camera configures its own exposure directly,
+        while any other externally-triggered camera belongs to its measurement/task.
         """
 
         s = self._session
-        cam = getattr(s.devices, "camera", None) if camera is None else camera
+        cam = getattr(s.devices, "camera", None)
         if exposure is not None and hasattr(cam, "configure"):
             cam.configure(exposure=exposure)
         s.sequence = s.build_imaging_sequence(

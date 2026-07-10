@@ -200,13 +200,19 @@ def test_stop_then_remove_purges_a_lingering_nodes_signals():
         exp.devices.sequencer.fire()
         cam = _add_node(console, lambda d: isinstance(d, tuple) and d and d[0] == "camera")
         console._start_logic_node(cam)
-        for _ in range(8):
-            console.refresh_once(); time.sleep(0.005)
+        deadline = time.monotonic() + 2.0
+        while "frame_0" not in console.hub.names() and time.monotonic() < deadline:
+            console.refresh_once()
+            time.sleep(0.005)
+        assert "frame_0" in console.hub.names(), "camera did not publish before the lifecycle deadline"
         occ = _add_node(console, lambda d: isinstance(d, tuple) and d and "occupanc" in str(d[1]).lower())
         console._start_logic_node(occ)
-        for _ in range(3):
-            console.refresh_once(); time.sleep(0.005)
         node = console._logic_nodes.get(id(occ)) or console._last_node.get(id(occ))
+        declared = set(node.published_signals())
+        deadline = time.monotonic() + 2.0
+        while not (declared & set(console.hub.signal_versions())) and time.monotonic() < deadline:
+            console.refresh_once()
+            time.sleep(0.005)
         occ_sigs = {s for s in node.published_signals()} & set(console.hub.signal_versions())
         assert occ_sigs, "occupancy node published nothing to the hub"
         console._stop_logic_node(occ)                                  # STOP -> signals LINGER

@@ -41,11 +41,19 @@ def _source_callable(source) -> Callable | None:
 
 
 def _put_row(data_y: np.ndarray, index: int, value) -> None:
-    arr = np.asarray(value, dtype=float).reshape(-1)
-    if arr.size == 0:
-        return
-    stop = min(arr.size, data_y.shape[1])
-    data_y[index, :stop] = arr[:stop]
+    """Write one explicitly scalar/vector sample without losing a tail axis."""
+
+    arr = np.asarray(value, dtype=float)
+    expected = tuple(data_y.shape[1:])
+    if arr.ndim == 0 and expected == (1,):
+        arr = arr.reshape(1)
+    if tuple(arr.shape) != expected:
+        raise ValueError(
+            f"frontend.run source returned shape {arr.shape}, but its declared row shape is "
+            f"{expected}; values are never flattened, padded, or truncated.  Preallocate an "
+            "exact scalar/vector data_y, or publish a canonical SignalTensor and select/reduce "
+            "its data_shape explicitly.")
+    data_y[index, ...] = arr
 
 
 class RunSession:

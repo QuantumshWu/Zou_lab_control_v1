@@ -53,7 +53,7 @@ zf.plot(np.column_stack([xx.ravel(), yy.ravel()]), frame.ravel(),
 
 框架的 `CameraMeasurement`（相机 measurement 逻辑节点）：每个 shot 抓一帧、publish 成信号 `frame_0`(一个周期 N 个 emCCD 事件就有 `frame_0..frame_{N-1}`)。它的**数据源就是相机**——在看板里点这张 2D 面板的 **Edit…**，标签里的 **Acquisition** 段会列出相机的 `exposure` / `region`（ROI 端点），改了点 **Apply** 就**实时重配相机**（不用重开）。
 
-控制台是**解耦**的：plot 面板是纯视图，只有**连了 signal 且产它的节点在跑**才显示数据。所以这张 2D 面板用 `source="value = frame_0"` 显式连到 `frame`（source 是一行赋给 `value` 的 Python，等价于在 Setting 里把 signal 槽选成 `frame_0`），并把相机 measurement 节点交给 `running_nodes=`（开窗即自动 `start`）。
+控制台是**解耦**的：plot 面板是纯视图，只有**连了 signal 且产它的节点在跑**才显示数据。所以这张 2D 面板用 `source="value = frame_0"` 显式连到 `frame_0`（source 是一行赋给 `value` 的 Python，等价于在 Setting 里把 signal 槽选成 `frame_0`），并把相机 measurement 节点交给 `running_nodes=`（开窗即自动 `start`）。
 
 `%gui qt` 让 Jupyter 在 cell 之间替 Qt 窗口跑事件循环（看板的刷新 timer 才会动）；抓帧在节点的后台线程里，经线程安全的 `SignalHub` 交给看板。`start()` 不带速率参数——**采集按硬件全速跑**（多快由触发频率 + 曝光决定，不设人为上限）；看板多久重画一次是**另一回事**，由每个面板自己的 `update_ms` 节流，和采集环解耦。
 

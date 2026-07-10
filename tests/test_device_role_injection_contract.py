@@ -98,11 +98,6 @@ def test_injection_passes_a_device_not_a_string(readout):
 
     hub = SignalHub()
 
-    # measurement path: make_node -> build(**values), camera name in -> device out on the plan
-    ps = next(s for s in readout.measurement_specs() if s.key == "pulse_scan")
-    plan = ps.make_node(hub, prefix="pulse_scan_", camera="camera").plan
-    assert isinstance(plan.camera, CameraDevice), f"pulse_scan got {type(plan.camera)}, not a device"
-
     # camera_spec path: build(hub, camera=name) -> the node holds the resolved device
     node = readout.camera_spec().build(hub, camera="camera")
     assert isinstance(node.camera, CameraDevice), f"camera_spec got {type(node.camera)}"

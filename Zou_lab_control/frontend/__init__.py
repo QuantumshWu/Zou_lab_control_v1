@@ -76,7 +76,6 @@ from .live import (
 from .notes import (
     NotesBuildResult,
     build_frontend_manual,
-    compile_notes_pdf,
     notes_template_dir,
     render_notes_pdf,
     render_tex_pdf,
@@ -205,7 +204,6 @@ __all__ = [
     "attach_interaction",
     "build_frontend_manual",
     "close_all",
-    "compile_notes_pdf",
     "configure_canvas",
     "create_axes_fixed",
     "design_dpi",

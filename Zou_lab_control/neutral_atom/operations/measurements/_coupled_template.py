@@ -71,9 +71,11 @@ def resolve_coupled_template(
         return default_factory()
 
     loaded = resolve_pulse_template(template, default_name=default_name, default_factory=_missing)
-    chans = list(getattr(sequencer, "channels", ()) or ())
-    if chans and all(c in chans for c in loaded.channels):
-        state = loaded                                   # channels already match -> honour the template
+    catalog = getattr(sequencer, "port_catalog", None)
+    chans = list(getattr(catalog, "raw_lanes", ()) or ())
+    loaded_lanes = loaded.port_catalog.raw_lanes
+    if catalog is not None and all(lane in chans for lane in loaded_lanes):
+        state = loaded.aligned_to_catalog(catalog)
     else:
         kw = imaging_channel_kwargs(sequencer, trigger_channel=trigger_channel)
         role_kwargs = {k: kw[k] for k in role_keys if k in kw}
@@ -81,8 +83,12 @@ def resolve_coupled_template(
         # channel set: True reuses the loaded template's channels (release-recapture, whose factory has
         # no usable None default), False passes None so the factory uses its OWN role defaults
         # (single-image template).  This per-measurement choice is kept EXPLICIT, not silently merged.
-        fallback = list(loaded.channels) if fallback_to_loaded_channels else None
-        state = default_factory(channels=chans or fallback, **role_kwargs)
+        fallback = list(loaded_lanes) if fallback_to_loaded_channels else None
+        state = default_factory(
+            channels=chans or fallback,
+            port_catalog=catalog,
+            **role_kwargs,
+        )
 
     if bind_period is not None:
         # bind the scan slot on the first matching period (fallback: the last period) -- the readout

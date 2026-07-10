@@ -50,6 +50,7 @@ def build_release_recapture_pulse(
     *,
     sequencer=None,
     channels=None,
+    port_catalog=None,
     trap_channel: str | None = None,
     probe_channel: str | None = None,
     trigger_channel: str | None = None,
@@ -97,14 +98,23 @@ def build_release_recapture_pulse(
 
     from types import SimpleNamespace
 
+    from ..ports import PortCatalog
     from ..timing import PulseTableState, imaging_channel_kwargs
     from ..timing.pulse_table import PulsePeriod
 
     # The channel set to build on: an explicit ``channels``, else the sequencer's, else the
     # placeholder convention (virtual / notebook default).
-    if channels is None:
-        channels = list(getattr(sequencer, "channels", ()) or ()) or ["trap", "probe", "emCCD"]
-    channels = list(channels)
+    if port_catalog is None:
+        port_catalog = getattr(sequencer, "port_catalog", None)
+    if port_catalog is not None and not isinstance(port_catalog, PortCatalog):
+        port_catalog = PortCatalog.from_dict(port_catalog)
+    if port_catalog is None:
+        if channels is None:
+            channels = list(getattr(sequencer, "channels", ()) or ()) or ["trap", "probe", "emCCD"]
+        port_catalog = PortCatalog.from_channels(channels)
+    elif channels is not None and tuple(channels) != port_catalog.raw_lanes:
+        raise ValueError("channels do not match port_catalog.raw_lanes")
+    channels = list(port_catalog.raw_lanes)
     # Resolve any role left None from the SAME single source the imaging sequence uses (maps the
     # conventional roles onto whatever these channels actually expose: ch09/ch03/<trigger> on a real
     # streamer, or the trap/probe/emCCD placeholders on the virtual set).  ``{}`` (an unrecognised
@@ -138,14 +148,15 @@ def build_release_recapture_pulse(
         PulsePeriod(secs_to_ns(settle), states(1, 0, 0), unit="ns", name="image2_settle"),
     ]
     state = PulseTableState(
-        channels=channels,
+        port_catalog=port_catalog,
         periods=periods,
         time_step_ns=time_step_ns,
         repeat_forever=False,
         name=name,
     )
-    # Bind the trap-off period (index 2) duration to scan slot s0 -- the t_off axis.
-    state.bind_field("duration", "2", label="t_off", unit="ns")
+    # Bind the trap-off period to the public semantic axis ``t_off``.  Its sN
+    # expression is a compiler detail assigned from the current column order.
+    state.bind_field("duration", "2", label="t_off", unit="ns", name="t_off")
     return state
 
 
@@ -170,9 +181,8 @@ class ReleaseRecapturePlan:
             raise ValueError("release-recapture acquires exactly 2 frames (image1, image2).")
 
     def sequence_for(self, pulse, axis, value: float):
-        # t_off enters through the pulse's primary time slot, exactly like a
-        # scanned readout duration; the sequence keeps its two camera triggers.
-        return pulse.frame_sequence(2, time_ns=float(value) * float(axis.scale_to_ns))
+        return pulse.frame_sequence(
+            2, slots={axis.slot: float(value) * float(axis.scale_to_ns)})
 
 
 @dataclass(frozen=True)
@@ -198,7 +208,7 @@ class FixedReleaseRecapturePlan:
 
     def sequence_for(self, pulse, axis, value: float):
         del axis, value                                   # the swept value drove the DEVICE, not the pulse
-        return pulse.frame_sequence(2, time_ns=float(self.t_off_s) * 1e9)
+        return pulse.frame_sequence(2, slots={"t_off": float(self.t_off_s) * 1e9})
 
 
 # ------------------------------------------------------------------------ reducer
@@ -222,12 +232,14 @@ class SurvivalReducer:
     _n_sites: int | None = field(default=None, repr=False)
 
     @property
-    def n_series(self) -> int:
+    def data_shape(self) -> tuple[int, ...]:
+        """Complete shape of one reduced point."""
+
         if self.per_site:
             if self._n_sites is None:
                 raise RuntimeError("SurvivalReducer.bind_calibration must be called for per-site output.")
-            return int(self._n_sites)
-        return 1
+            return (int(self._n_sites),)
+        return (1,)
 
     def bind_calibration(self, calibration: TrapCalibration) -> "SurvivalReducer":
         """Record the site count so a per-site reducer can size its output array."""
@@ -242,9 +254,9 @@ class SurvivalReducer:
         occ2 = np.asarray(calibration.detect(frames[1]).occupied, dtype=bool)
         survived = occ1 & occ2
         if self.per_site:
-            # The block was pre-allocated to ``n_series == _n_sites`` (from bind_calibration); a reduce
-            # here must return exactly that width.  Fail LOUD if the reduce-time calibration detects a
-            # different site count rather than emit a wrong-width row that silently overflows / NaN-pads
+            # The block was pre-allocated with ``data_shape=(_n_sites,)`` (from bind_calibration); a
+            # reduce here must return exactly that shape.  Fail LOUD if the reduce-time calibration
+            # detects a different site count rather than emit a wrong-width row that silently overflows / NaN-pads
             # the swept block (shape iron-law: a declared shape stays true from build).
             if self._n_sites is not None and occ1.size != self._n_sites:
                 raise ValueError(
@@ -253,7 +265,8 @@ class SurvivalReducer:
             out = np.full(occ1.shape, np.nan, dtype=float)
             out[occ1] = survived[occ1].astype(float)
             return out
-        return float(survived.sum()) / float(max(int(occ1.sum()), 1))
+        value = float(survived.sum()) / float(max(int(occ1.sum()), 1))
+        return np.asarray([value], dtype=float)
 
 
 # ---------------------------------------------------------------------------- fit

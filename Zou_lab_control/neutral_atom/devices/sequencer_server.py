@@ -11,6 +11,7 @@ import socket
 import subprocess
 from typing import Sequence
 
+from ..ports import PortCatalog, coerce_port_catalog
 from .sequencer import DEFAULT_RUNTIME_CLOCK_HZ, RuntimeSequenceProgram, SequencerService, serve_runtime_sequencer
 
 
@@ -256,6 +257,9 @@ def _auto_select_backend(*, channels, clock_hz, state_dir, uart_port, uart_baud,
 def run_server(
     *,
     channels: Sequence[str],
+    port_catalog: PortCatalog | dict | None = None,
+    channel_labels: dict[str, str] | None = None,
+    xdc: str | Path | None = None,
     host: str = "0.0.0.0",
     port: int = 18861,
     clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
@@ -272,6 +276,15 @@ def run_server(
 ):
     """Start the RPyC sequencer service used by ``RemoteSequencer``."""
 
+    channels = _split_channels(channels)
+    if port_catalog is None and channel_labels is None and xdc is not None:
+        from .fpga_pulse_streamer import infer_xdc_channel_labels
+
+        channel_labels = infer_xdc_channel_labels(
+            xdc, default=len(channels), max_count=len(channels))
+    catalog = coerce_port_catalog(
+        port_catalog, channels=channels, channel_labels=channel_labels)
+    channels = list(catalog.raw_lanes)
     backend_name = str(backend).strip().lower().replace("_", "-")
     if backend_name == "auto":
         # Probe transports fastest-first and use the first that VERIFIES against this host's register
@@ -334,6 +347,7 @@ def run_server(
     cache_prepared = _env_bool("ZLC_SEQUENCER_CACHE_PREPARED", False)
     service = SequencerService(
         channels=channels,
+        port_catalog=catalog,
         clock_hz=clock_hz,
         prepare_callback=prepare_callback,
         fire_callback=fire_callback,
@@ -424,6 +438,9 @@ def build_arg_parser() -> ArgumentParser:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=18861)
     parser.add_argument("--channels", nargs="+", required=True, help="Sequencer channels, e.g. ch00 ch01 ... inferred from the selected XDC.")
+    parser.add_argument(
+        "--xdc", default=None,
+        help="Board XDC used once at startup to build the logical PortCatalog (DAC/clock/digital).")
     parser.add_argument("--clock-hz", type=float, default=DEFAULT_RUNTIME_CLOCK_HZ)
     parser.add_argument("--state-dir", default="zlc_sequencer_state")
     parser.add_argument("--prepare-command", default=None)
@@ -454,6 +471,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     run_server(
         channels=_split_channels(args.channels),
+        xdc=args.xdc,
         host=args.host,
         port=args.port,
         clock_hz=args.clock_hz,

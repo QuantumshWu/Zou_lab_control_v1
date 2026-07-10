@@ -3,15 +3,16 @@ contract (the two things the user demanded be impossible to regress):
 
   * an API slot (a1/a2...) is a NAMED handle on a period duration / channel delay / DAC value
     that ``set_api`` (and the ``state.aN`` sugar) set BY NAME, WITHOUT rewriting the field --
-    several fields can share one name (e.g. both long frames of a long-short-long bracket);
+    every handle binds exactly one field and names are unique;
   * the SHIPPED ``pulses/imaging_template.json`` is, on disk, the continuous long-short-long
-    bracket (THREE emCCD frames + api a1/a2) -- not a single window (the user's #1 complaint);
+    bracket (THREE emCCD frames + API handles a1/a2/a3) -- not a single window;
   * EVERY fire path records a syncable ``PulseTableState`` (with ``periods``) -- a bare
     ``PulseSequence`` (a Task firing ``to_sequence()``) is reconstructed into a period table,
     so the pulse GUI's Sync can ALWAYS reload the editor from whatever was fired.
 """
 
 from __future__ import annotations
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 import json
 from pathlib import Path
@@ -35,11 +36,11 @@ from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod
 def test_dac_api_slot_unit_is_normalized_to_value():
     """CONTRACT (#E3): a DAC value is a signed code, not a time -- ApiSlot construction (the
     ONE choke point every slot passes: GUI bind, from_dict, JSON load) forces unit='value'
-    for kind='dac', so a legacy file that saved unit='ns' auto-corrects on load."""
+    for kind='dac'; caller-supplied time units cannot weaken that invariant."""
     from Zou_lab_control.neutral_atom.timing.pulse_table import ApiSlot
 
-    legacy = ApiSlot.from_dict({"name": "a1", "kind": "dac", "target": "da_x@0", "unit": "ns"})
-    assert legacy.unit == "value"
+    payload_slot = ApiSlot.from_dict({"name": "a1", "kind": "dac", "target": "da_x@0", "unit": "ns"})
+    assert payload_slot.unit == "value"
     assert ApiSlot(name="a2", kind="dac", target="da_y@0", unit="ns").unit == "value"
     assert ApiSlot(name="a3", kind="dac", target="da_z@0").unit == "value"       # default path too
     # non-dac kinds keep their declared unit untouched
@@ -47,8 +48,8 @@ def test_dac_api_slot_unit_is_normalized_to_value():
 
 
 def test_shipped_pulse_tables_carry_value_unit_on_every_dac_api_slot():
-    """Every shipped ``pulses/*.json`` pulse TABLE loads with unit='value' on each DAC api slot
-    (the mot_field template's a1/a2/a3 carried 'ns' -- a time unit displayed on a DAC code)."""
+    """Every shipped pulse table uses the typed ``value`` unit on each DAC API slot; the MOT
+    template instead exposes three semantic hardware scan slots and no API slots."""
     pulses = REPO_ROOT / "pulses"
     dac_slots = 0
     for path in sorted(pulses.glob("*.json")):
@@ -60,10 +61,12 @@ def test_shipped_pulse_tables_carry_value_unit_on_every_dac_api_slot():
             if slot.kind == "dac":
                 dac_slots += 1
                 assert slot.unit == "value", f"{path.name}: dac api slot {slot.name} unit={slot.unit!r}"
-    # the sweep must not be vacuous: the mot_field template alone contributes a1/a2/a3
+    # MOT deliberately uses three semantically named hardware scan slots.  Generic PulseScan may
+    # sweep API slots too; this template chooses hardware execution for synchronized field updates.
     mot = PulseTableState.load(pulses / "mot_field_template.json")
-    assert {s.name for s in mot.api_slots if s.kind == "dac"} == {"a1", "a2", "a3"}
-    assert dac_slots >= 3
+    assert mot.api_slots == []
+    assert mot.scan_names == ["da_x", "da_y", "da_z"]
+    assert all(slot.kind == "dac" and slot.unit == "value" for slot in mot.scan_slots)
 
 
 def test_unrolled_bracket_preserves_api_slots_with_remapped_targets():
@@ -73,7 +76,7 @@ def test_unrolled_bracket_preserves_api_slots_with_remapped_targets():
     silently dropping every API binding on any finite-bracket compile -- the same built-but-not-
     passed bug class the adjacent clk_channels comment documents."""
     st = PulseTableState(
-        channels=["ch0"],
+        port_catalog=PortCatalog.from_channels(["ch0"]),
         periods=[PulsePeriod(1.0, [1], unit="us"),
                  PulsePeriod(2.0, [0], unit="us"),
                  PulsePeriod(3.0, [1], unit="us")],
@@ -125,7 +128,7 @@ def test_api_slot_names_are_unique_each_binds_one_field():
 def test_api_slot_on_delay_is_allowed():
     """A delay can be an API slot (set by name) even though it is NOT scannable."""
     st = single_imaging_template()
-    ch = st.channels[0]
+    ch = st.port_catalog.raw_lanes[0]
     st.bind_api_field("delay", ch, unit="us")
     st.set_api(st.api_slot_for("delay", ch), 1.5)
     assert st.delays[ch] == pytest.approx(1.5)
@@ -134,15 +137,16 @@ def test_api_slot_on_delay_is_allowed():
 def test_shipped_imaging_template_file_is_three_emccd_bracket():
     """The FILE on disk is the long-short-long bracket (THREE emCCD frames) and exposes ONE
     api handle per exposure cell (a1 / a2 / a3, unique like the GUI allocates)."""
-    data = json.loads((REPO_ROOT / "pulses" / "imaging_template.json").read_text(encoding="utf-8"))
-    emccd = data["channels"].index("emCCD")
-    n_triggers = sum(1 for p in data["periods"] if p["states"][emccd])
+    data = PulseTableState.load(REPO_ROOT / "pulses" / "imaging_template.json")
+    emccd = data.port_catalog.raw_lanes.index("emCCD")
+    n_triggers = sum(1 for period in data.periods if period.states[emccd])
     assert n_triggers == 3                                          # long-short-long, on disk
-    names = [s["name"] for s in data.get("api_slots", [])]
+    names = [slot.name for slot in data.api_slots]
     assert names == ["a1", "a2", "a3"]                              # unique, one per exposure cell
     # the shipped probe template (the Pulse-scan default) is the SINGLE-image counterpart
-    probe = json.loads((REPO_ROOT / "pulses" / "probe_template.json").read_text(encoding="utf-8"))
-    assert sum(1 for p in probe["periods"] if p["states"][probe["channels"].index("emCCD")]) == 1
+    probe = PulseTableState.load(REPO_ROOT / "pulses" / "probe_template.json")
+    emccd = probe.port_catalog.raw_lanes.index("emCCD")
+    assert sum(1 for period in probe.periods if period.states[emccd]) == 1
 
 
 def test_every_fire_path_records_a_syncable_table():
@@ -160,12 +164,13 @@ def test_every_fire_path_records_a_syncable_table():
         tpl.set_api("a1", 0.02)
         tpl.set_api("a2", 0.005)
         tpl.set_api("a3", 0.02)
+        tpl = tpl.aligned_to_catalog(seqr.port_catalog)
         seq = tpl.to_sequence(name="reference_bracket")
         seqr.prepare(seq)
         data = json.loads(seqr.snapshot()["last_payload_json"])
         assert isinstance(data, dict) and "periods" in data        # syncable (NOT a raw sequence)
         synced = PulseTableState.from_dict(data)                    # the GUI's exact sync step
-        emccd = synced.channels.index("emCCD")
+        emccd = synced.port_catalog.raw_lanes.index("emCCD")
         assert sum(1 for p in synced.periods if p.states[emccd]) == 3   # the fired long-short-long
 
         # a GUI-authored PulseTableState round-trips with its api slots intact (names preserved)

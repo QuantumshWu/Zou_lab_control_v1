@@ -4,13 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 import json
 import math
 
 import numpy as np
 
 from Zou_lab_control._clock import DEFAULT_CLOCK_HZ  # absolute: dependency-free clock seam (config single source)
+from .._serialization import (
+    require_array,
+    require_bool,
+    require_exact_fields,
+    require_int,
+    require_object,
+    require_string,
+)
 from ..core.analysis import finite_float, nonnegative_float, positive_float, positive_int
 
 
@@ -48,13 +56,16 @@ class Pulse:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> "Pulse":
+    def from_dict(cls, payload: Mapping[str, object]) -> "Pulse":
+        require_exact_fields(
+            payload, {"channel", "start", "duration", "value", "name"},
+            what="pulse")
         return cls(
-            channel=channel_name(payload["channel"]),
+            channel=channel_name(require_string(payload["channel"], what="pulse.channel")),
             start=finite_float(payload["start"], "start"),
             duration=finite_float(payload["duration"], "duration"),
-            value=digital_value(payload.get("value", 1)),
-            name=str(payload.get("name", "")),
+            value=digital_value(require_int(payload["value"], what="pulse.value")),
+            name=require_string(payload["name"], what="pulse.name"),
         )
 
 
@@ -77,6 +88,7 @@ class PulseSequence:
         repeat_count: int = 1,
         repeat_period: float | None = None,
         repeat_forever: bool = False,
+        source_table: dict[str, object] | None = None,
     ):
         self.name = str(name)
         self.pulses = tuple(pulses or ())
@@ -84,6 +96,10 @@ class PulseSequence:
         self.repeat_count = positive_int(repeat_count, "repeat_count")
         self.repeat_period = None if repeat_period is None else positive_float(repeat_period, "repeat_period")
         self.repeat_forever = bool(repeat_forever)
+        # Exact editable source carried through low-level preview/trigger helpers.
+        # A sequencer can therefore sync the logical DAC/slot document that was
+        # actually fired instead of reverse-engineering raw edge bits.
+        self.source_table = None if source_table is None else dict(source_table)
 
     def pulse(self, channel: str, start: float, duration: float, *, value: int = 1, name: str = "") -> "PulseSequence":
         channel = channel_name(channel)
@@ -101,6 +117,7 @@ class PulseSequence:
             repeat_count=self.repeat_count,
             repeat_period=self.repeat_period,
             repeat_forever=self.repeat_forever,
+            source_table=self.source_table,
         )
 
     def on(self, channel: str, start: float, stop: float, *, value: int = 1, name: str = "") -> "PulseSequence":
@@ -120,18 +137,21 @@ class PulseSequence:
             repeat_count=self.repeat_count,
             repeat_period=self.repeat_period,
             repeat_forever=self.repeat_forever,
+            source_table=self.source_table,
         )
 
     def repeated(self, repeats: int, *, period: float | None = None) -> "PulseSequence":
         repeats = positive_int(repeats, "repeats")
         period = self.base_duration if period is None else finite_float(period, "period")
-        out = PulseSequence(self.pulses, name=self.name, delays=self.delays, repeat_count=repeats, repeat_period=period)
+        out = PulseSequence(self.pulses, name=self.name, delays=self.delays, repeat_count=repeats,
+                            repeat_period=period, source_table=self.source_table)
         out.validate().raise_if_failed()
         return out
 
     def forever(self, *, period: float | None = None) -> "PulseSequence":
         period = self.base_duration if period is None else finite_float(period, "period")
-        out = PulseSequence(self.pulses, name=self.name, delays=self.delays, repeat_count=1, repeat_period=period, repeat_forever=True)
+        out = PulseSequence(self.pulses, name=self.name, delays=self.delays, repeat_count=1,
+                            repeat_period=period, repeat_forever=True, source_table=self.source_table)
         out.validate().raise_if_failed()
         return out
 
@@ -167,7 +187,8 @@ class PulseSequence:
         return tuple(pulse.shifted(repeat * period) for repeat in range(self.repeat_count) for pulse in base)
 
     def without_repeat(self) -> "PulseSequence":
-        return PulseSequence(self.pulses, name=self.name, delays=self.delays)
+        return PulseSequence(self.pulses, name=self.name, delays=self.delays,
+                             source_table=self.source_table)
 
     def validate(self, *, clock_hz: float | None = None, channels: Sequence[str] | None = None) -> "PulseReport":
         errors: list[str] = []
@@ -262,19 +283,44 @@ class PulseSequence:
             "repeat_period": self.repeat_period,
             "repeat_forever": self.repeat_forever,
             "pulses": [pulse.to_dict() for pulse in self.pulses],
+            "source_table": self.source_table,
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> "PulseSequence":
-        if payload.get("schema", cls.schema) != cls.schema:
-            raise ValueError("unsupported PulseSequence schema.")
+    def from_dict(cls, payload: Mapping[str, object]) -> "PulseSequence":
+        fields = {
+            "schema", "version", "name", "delays", "repeat_count",
+            "repeat_period", "repeat_forever", "pulses", "source_table",
+        }
+        require_exact_fields(payload, fields, what="PulseSequence")
+        if payload["schema"] != cls.schema:
+            raise ValueError(
+                f"unsupported PulseSequence schema {payload['schema']!r}; expected {cls.schema!r}.")
+        if payload["version"] != cls.version:
+            raise ValueError(
+                f"unsupported PulseSequence version {payload['version']!r}; "
+                f"expected {cls.version}.")
+        pulses = require_array(payload["pulses"], what="PulseSequence.pulses")
+        delays = require_object(payload["delays"], what="PulseSequence.delays")
+        source = payload["source_table"]
+        if source is not None:
+            source = require_object(source, what="PulseSequence.source_table")
         return cls(
-            [Pulse.from_dict(item) for item in payload.get("pulses", [])],
-            name=str(payload.get("name", "sequence")),
-            delays=dict(payload.get("delays", {})),
-            repeat_count=int(payload.get("repeat_count", 1)),
-            repeat_period=None if payload.get("repeat_period") is None else finite_float(payload.get("repeat_period"), "repeat_period"),
-            repeat_forever=bool(payload.get("repeat_forever", False)),
+            [Pulse.from_dict(require_object(item, what="PulseSequence pulse")) for item in pulses],
+            name=require_string(payload["name"], what="PulseSequence.name"),
+            delays={
+                require_string(key, what="PulseSequence delay channel"): finite_float(
+                    value, f"delay for {key!r}")
+                for key, value in delays.items()
+            },
+            repeat_count=require_int(payload["repeat_count"], what="PulseSequence.repeat_count"),
+            repeat_period=(
+                None if payload["repeat_period"] is None
+                else finite_float(payload["repeat_period"], "repeat_period")
+            ),
+            repeat_forever=require_bool(
+                payload["repeat_forever"], what="PulseSequence.repeat_forever"),
+            source_table=None if source is None else dict(source),
         )
 
     def save(self, path: str | Path) -> Path:
@@ -441,15 +487,12 @@ def imaging_channel_kwargs(sequencer: object, *, trigger_channel: str | None = N
 
 
 def probe_channel_set(channel: str) -> list[str]:
-    """The set of pulse-channel names that count as the probe for ``channel`` -- the SINGLE
-    source of the probe->channel alias.  When the caller hands the placeholder name ``probe``
-    (no chNN config resolved it yet) we ALSO match the legacy ``ch02`` it historically mapped to,
-    so an exposure inferred from a placeholder-named sequence still finds its probe pulses.  A
-    resolved chNN (e.g. ``ch03``) matches only itself.  Every site that expands a probe channel
-    (exposure inference, the qCMOS + virtual camera bracket exposure) routes through HERE so the
-    alias is defined once and cannot drift (#5.15)."""
-    channel = channel_name(channel)
-    return [channel, "ch02"] if channel == "probe" else [channel]
+    """Return the one explicitly configured logical probe port.
+
+    Port aliases belong to :class:`PortCatalog`; this timing helper must not
+    smuggle an historical raw-lane mapping into otherwise catalog-driven code.
+    """
+    return [channel_name(channel)]
 
 
 def exposure_from_sequence(sequence: PulseSequence | None, *, default: float, channel: str = "probe") -> float:

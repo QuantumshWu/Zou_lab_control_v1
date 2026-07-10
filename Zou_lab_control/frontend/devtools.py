@@ -136,6 +136,7 @@ def demo_state(*, channels: int = 24):
     name/delay/period columns, the DAC rows, and the control/channel-view bars.
     """
 
+    from Zou_lab_control.neutral_atom.ports import PortCatalog
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod, PulseTableState
 
     ch = [f"ch{i:02d}" for i in range(max(channels, 32))]
@@ -143,7 +144,7 @@ def demo_state(*, channels: int = 24):
               "ch04": "pushout", "ch05": "grey_cooling", "ch11": "emCCD", "ch12": "microwave"}
     for i in range(10):
         labels[f"ch{18 + i:02d}"] = f"da_dipole[{i}]"
-    visible = ["ch00", "ch01", "ch02", "ch03", "ch04", "ch05", "ch11", "ch12"] + [f"ch{18 + i:02d}" for i in range(10)]
+    visible = ["ch00", "ch01", "ch02", "ch03", "ch04", "ch05", "ch11", "ch12", "da_dipole"]
 
     def states(active):
         return tuple(1 if c in active else 0 for c in range(len(ch)))
@@ -155,8 +156,13 @@ def demo_state(*, channels: int = 24):
         PulsePeriod(50_000, states({0, 2}), unit="ns"),
         PulsePeriod(20_000, states({0, 1}), unit="ns"),
     ]
-    state = PulseTableState(channels=ch, visible_channels=visible, periods=periods,
-                            channel_labels=labels, time_step_ns=20.0, name="demo_scan")
+    state = PulseTableState(
+        port_catalog=PortCatalog.from_channels(ch, channel_labels=labels),
+        visible_ports=visible,
+        periods=periods,
+        time_step_ns=20.0,
+        name="demo_scan",
+    )
     return state
 
 
@@ -185,7 +191,7 @@ def demo_editor(*, scale: float = 1.0, size=(1440, 880), bind_scans: bool = True
 
 
 
-def _demo_board_state():
+def _demo_board_state(*, board_width: int):
     """A board exercising EVERY panel kind -- both rolling-trace variants included.
 
     The bare app default (``default_console_state``) is empty; this richer board
@@ -197,30 +203,39 @@ def _demo_board_state():
     publish (decoupled VIEW/LOGIC): the camera publishes ``frame``; the
     OccupancyProcessor publishes ``occupied`` / ``counts`` (per-shot blocks) / ``rate`` / ``centers``."""
 
-    from Zou_lab_control.frontend.task_console import PanelConfig, TaskConsoleState
+    from Zou_lab_control.frontend.task_console import (
+        PanelConfig,
+        TaskConsoleState,
+        _first_free_slot,
+    )
 
-    return TaskConsoleState(
-        name="demo_all_kinds",
-        panels=[
+    panels = [
             # Readout image SYNCED with the site map: both read the occupancy processor's
             # ``frame_judged`` (the exact frame it judged, co-published atomically with
             # ``occupied``) -> the 2D image and the rings are always the SAME shot.  (A raw
             # live-camera view would be ``value = frame_0``, but that runs one cycle AHEAD of
             # the judged frame, so it would not line up with the rings.)
-            PanelConfig(kind="2d", title="Readout image", row=0, col=0, size="2x2",
+            PanelConfig(kind="2d", title="Readout image", size="2x2",
                         source="value = frame_judged", inputs=["frame_judged"]),
-            PanelConfig(kind="sites", title="Per-site occupancy", row=0, col=2, size="2x2",
+            PanelConfig(kind="sites", title="Per-site occupancy", size="2x2",
                         source="value = occupied", inputs=["occupied"]),
-            PanelConfig(kind="monitor", title="Loading rate (dist)", row=0, col=4, size="1x2",
+            PanelConfig(kind="monitor", title="Loading rate (dist)", size="1x2",
                         source="value = rate", params={"length": 300, "show_dist": True}),
-            PanelConfig(kind="monitor", title="Loading rate", row=1, col=4, size="1x2",
+            PanelConfig(kind="monitor", title="Loading rate", size="1x2",
                         source="value = rate", params={"length": 300, "show_dist": False}),
-            PanelConfig(kind="hist", title="Counts distribution", row=2, col=0, size="1x2",
+            PanelConfig(kind="hist", title="Counts distribution", size="1x2",
                         source="value = counts", params={"bins": 80}),
-            PanelConfig(kind="1d", title="Per-site counts", row=2, col=2, size="2x4",
+            PanelConfig(kind="1d", title="Per-site counts", size="2x4",
                         source="value = counts"),
-        ],
-    )
+    ]
+    # ``row``/``col`` are raw pixel top-lefts.  Seed the representative board through the SAME
+    # geometry/packing primitive as a freshly Added panel; old grid-like 0/2/4 coordinates all
+    # overlapped in pixel space and gravity therefore stacked every card into one column.
+    placed = []
+    for panel in panels:
+        panel.col, panel.row = _first_free_slot(panel, placed, int(board_width))
+        placed.append(panel)
+    return TaskConsoleState(name="demo_all_kinds", panels=panels)
 
 
 def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=None,
@@ -255,7 +270,12 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=Non
     """
 
     import Zou_lab_control.neutral_atom as na
-    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.qt_fluent import (
+        WINDOW_SCREEN_FRACTION,
+        ensure_qt_app,
+        screen_fit_window_size,
+        set_fluent_scale,
+    )
     from Zou_lab_control.frontend.task_console import LogicNodeConfig, PanelCard, TaskConsole
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
     from Zou_lab_control.neutral_atom.operations.logic import OccupancyProcessor
@@ -278,7 +298,15 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=Non
 
     # The layout: an explicit state overrides the default six-kind board; either
     # way the panels are pure views wired to the signals the nodes below publish.
-    layout = state if state is not None else _demo_board_state()
+    if state is not None:
+        layout = state
+    else:
+        # Resolve the SAME fluent scale TaskConsole will install before asking the board geometry SSOT
+        # for pixel card sizes.  ``size=None`` follows the existing screen-fit window rule.
+        set_fluent_scale(scale)
+        board_width = int(size[0]) if size is not None \
+            else int(screen_fit_window_size(WINDOW_SCREEN_FRACTION).width())
+        layout = _demo_board_state(board_width=board_width)
     console = TaskConsole(hub=SignalHub(), state=layout, session=exp,
                           measurements=exp.readout.measurement_specs(),
                           processors=exp.readout.processor_specs(),

@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Contract: the selector/fit -> SignalHub chain works as ONE GESTURE.
+"""Contract: one semantic selection feeds explicitly chosen Fit or ROI actions.
 
-* Drawing an area rectangle on a LIVE image panel (selectors ON) creates -- or, when one
-  already consumes that signal, retargets -- a RoiProcessor: roi_frame/roi_value appear on
-  the hub with the drawn region, no Edit-tab round trip.
+* A rectangle is data only until ``selection_action='roi'``; that explicit action creates or
+  retargets a RoiProcessor whose canonical outputs appear on the hub.
 * Fit results are hub signals: FitProcessor consumes a frame and publishes the shared
   gaussian2d_center model's parameters (fit_x0/fit_y0/...) as scalars -- usable as a rolling
   monitor or a scan loss, exactly like roi_value.
@@ -11,9 +10,10 @@
 import numpy as np
 
 from Zou_lab_control._readout_math import gaussian2d_center
+from Zou_lab_control.neutral_atom.core.fitting import FitRequest, fit_image
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
 from Zou_lab_control.neutral_atom.operations.processors.fit import (
-    FIT_SPEC_NAME, FitProcessor, fit_frame_center)
+    FIT_SPEC_NAME, FitProcessor)
 from Zou_lab_control.neutral_atom.operations.processors.roi import ROI_SPEC_NAME
 
 from conftest import add_logic_row, make_console
@@ -25,12 +25,13 @@ def _gaussian_frame(h=240, w=320, x0=200.0, y0=90.0, amp=150.0, size=18.0, offse
     return img.astype(np.float64)
 
 
-def test_fit_frame_center_recovers_a_synthetic_gaussian():
-    result = fit_frame_center(_gaussian_frame())
-    assert result is not None
-    assert abs(result["fit_x0"] - 200.0) < 2.0
-    assert abs(result["fit_y0"] - 90.0) < 2.0
-    assert abs(result["fit_size"] - 18.0) < 4.0
+def test_shared_image_fit_recovers_a_synthetic_gaussian():
+    result = fit_image(_gaussian_frame(), FitRequest("center"))
+    assert result.valid, result.status
+    params = result.parameter_map()
+    assert abs(params["x0"] - 200.0) < 2.0
+    assert abs(params["y0"] - 90.0) < 2.0
+    assert abs(params["radius"] - 18.0) < 4.0
 
 
 def test_fit_processor_publishes_fit_scalars_on_the_hub():
@@ -39,11 +40,21 @@ def test_fit_processor_publishes_fit_scalars_on_the_hub():
     hub.publish({"frame_0": _gaussian_frame()})
     out = node.step()
     assert set(out) == set(FitProcessor.provides)
-    assert abs(hub.latest("fit_x0") - 200.0) < 2.0
-    assert abs(hub.latest("fit_y0") - 90.0) < 2.0
+    assert hub.latest("fit_x0").shape == (1, 1, 1)
+    assert abs(hub.latest("fit_x0")[0, 0, 0] - 200.0) < 2.0
+    assert abs(hub.latest("fit_y0")[0, 0, 0] - 90.0) < 2.0
+    assert hub.latest("fit_valid")[0, 0, 0]
+
+    # Failure is an explicit same-transaction overwrite, never stale success.
+    hub.publish({"frame_0": np.ones_like(_gaussian_frame())})
+    node.step()
+    assert not hub.latest("fit_valid")[0, 0, 0]
+    assert hub.latest("fit_status")[0, 0, 0] == 0
+    assert np.isnan(hub.latest("fit_x0")[0, 0, 0])
+    assert np.isnan(hub.latest("fit_rmse")[0, 0, 0])
 
 
-def test_area_drag_on_a_live_panel_creates_then_retargets_a_roi_node():
+def test_explicit_roi_action_creates_then_retargets_a_roi_node():
     import Zou_lab_control.neutral_atom as na
     exp = na.connect("virtual")
     con = make_console(exp)
@@ -64,7 +75,9 @@ def test_area_drag_on_a_live_panel_creates_then_retargets_a_roi_node():
         con.refresh_once()
 
         n_rows = len(con.logic_nodes)
-        con._on_panel_area_select(card, (100.0, 400.0, 50.0, 250.0))   # the drag's rectangle
+        from Zou_lab_control.neutral_atom.core.selection import Selection
+        card.config.params["selection_action"] = "roi"
+        con._on_panel_area_select(card, Selection.rectangle(100.0, 400.0, 50.0, 250.0))
         assert len(con.logic_nodes) == n_rows + 1                       # one ROI row created...
         roi_row = con.logic_nodes[-1]
         assert roi_row.node.name == ROI_SPEC_NAME
@@ -73,15 +86,15 @@ def test_area_drag_on_a_live_panel_creates_then_retargets_a_roi_node():
         node.step(); roi_node.step()
         crop = con.hub.latest([s for s in roi_node.published_signals()
                                if s.endswith("roi_frame")][0])
-        assert crop.shape == (200, 300)                                 # (y, x) of the drawn box
+        assert crop.shape[-2:] == (200, 300)
 
         # second drag: RETARGETS the running consumer, never stacks another row
-        con._on_panel_area_select(card, (0.0, 50.0, 0.0, 40.0))
+        con._on_panel_area_select(card, Selection.rectangle(0.0, 50.0, 0.0, 40.0))
         assert len(con.logic_nodes) == n_rows + 1
         node.step(); roi_node.step()
         crop = con.hub.latest([s for s in roi_node.published_signals()
                                if s.endswith("roi_frame")][0])
-        assert crop.shape == (40, 50)
+        assert crop.shape[-2:] == (40, 50)
     finally:
         con.shutdown()
         exp.close()
@@ -121,6 +134,7 @@ def test_selector_wiring_converts_axis_coords_to_the_frames_own_pixels():
         assert card._roi_built == [100, 400, 50, 250]        # axes carry the crop's origin
 
         card.set_selectors_enabled(True)
+        card.config.params["selection_action"] = "roi"
         area = card.plotter.fig._zlc_tools.area
         assert area.callback == card._forward_area_select    # the sink IS wired on the selector
 
@@ -132,7 +146,7 @@ def test_selector_wiring_converts_axis_coords_to_the_frames_own_pixels():
         cam.step(); roi.step(); nested.step()
         crop = con.hub.latest([s for s in nested.published_signals()
                                if s.endswith("roi_frame")][0])
-        assert crop.shape == (40, 50)             # local (y 30..70, x 50..100), NOT a clamped sliver
+        assert crop.shape[-2:] == (40, 50)        # local (y 30..70, x 50..100), NOT a clamped sliver
     finally:
         con.shutdown()
         exp.close()

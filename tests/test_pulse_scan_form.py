@@ -1,12 +1,4 @@
-"""#H3s-F7 contract tests for the unified pulse-scan param form (`_PulseSlotsWidget`).
-
-ONE scan table + a ``Scan: [None | API | Scan]`` mode toggle (the two always-visible scan tables
-are gone).  The toggle is the SINGLE place that picks WHAT is swept; the table's columns / legend /
-templates adapt to the mode; a mode whose kind is absent is disabled; switching API<->Scan keeps
-each mode's own program buffer; ``values_dict`` emits the new single-``scan_code`` schema.
-
-Offscreen, no real window -- the widget is built directly with synthetic slot rows.
-"""
+"""PulseScan form exposes scan-slot and API-slot execution without schema fallbacks."""
 
 from __future__ import annotations
 
@@ -28,125 +20,134 @@ def _app(monkeypatch):
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
-def _widget_both():
-    """A widget rebuilt with BOTH one api slot and one scan slot."""
+def _api_rows(target="1", current=5.0):
+    return [("a1", "image_duration", "duration", target, "us", current)]
+
+
+def _scan_rows():
+    return [
+        ("da_x", "dac", "da_x@0", "value", "da_x"),
+        ("da_y", "dac", "da_y@0", "value", "da_y"),
+    ]
+
+
+def _widget(program_id="mot-v1", code="scan_table = np.column_stack((da_x, da_y))"):
     from Zou_lab_control.frontend.task_console import _PulseSlotsWidget
-    w = _PulseSlotsWidget()
-    w.rebuild(api_rows=[("a1", "duration", "1", "us", 5.0)],
-              scan_rows=[("s0", "duration", "2", "ns", "probe")])
-    return w
+
+    widget = _PulseSlotsWidget()
+    widget.rebuild(
+        api_rows=_api_rows(),
+        scan_rows=_scan_rows(),
+        hardware_program=code,
+        program_id=program_id,
+    )
+    return widget
 
 
-def _set_mode(w, mode: str) -> None:
-    w._mode_combo.setCurrentIndex(w._mode_combo.findData(mode))
-
-
-def test_default_mode_is_scan_when_scan_slots_exist(_app):
-    """With both api + scan slots, the default mode is Scan (scan slots win the default)."""
-    from Zou_lab_control.frontend.task_console import _scan_modes
-    none, api, scan = _scan_modes()
-    w = _widget_both()
-    assert w.values_dict()["scan_mode"] == scan
-
-
-def test_switch_to_api_shows_api_columns_and_extra_delay(_app):
-    """Switching to API mode shows the api-slot columns + the extra-settle row; that row is hidden
-    again in Scan mode (it is meaningful only for the software api sweep)."""
-    from Zou_lab_control.frontend.task_console import _scan_modes
-    none, api, scan = _scan_modes()
-    w = _widget_both()
-    assert w._extra_delay is None                     # default Scan mode: no extra-delay row
-    _set_mode(w, api)
-    assert w.values_dict()["scan_mode"] == api
-    assert w._extra_delay is not None                 # API mode: extra-settle row shown
-    # the legend names the api column (a1) in API mode
-    legend = _legend_text(w)
-    assert "a1" in legend
-    _set_mode(w, scan)
-    assert w._extra_delay is None                     # back to Scan: extra-delay row gone
-
-
-def _legend_text(w) -> str:
+def _labels(widget):
     from PyQt5 import QtWidgets
-    return "\n".join(lbl.text() for lbl in w.findChildren(QtWidgets.QLabel))
+    return "\n".join(label.text() for label in widget.findChildren(QtWidgets.QLabel))
 
 
-def test_values_dict_schema_per_mode(_app):
-    """``values_dict`` emits exactly ``{api, scan_mode, scan_code, extra_delay}`` -- ONE scan_code
-    (the active mode's program) and no separate api_scan key.  The whole-sweep repeat count is NOT
-    a form field: it is the measurement's auto-injected ``repeat`` (0 = ∞) knob, the single source
-    for every measurement's sweep count."""
-    from Zou_lab_control.frontend.task_console import _scan_modes
-    none, api, scan = _scan_modes()
-    w = _widget_both()
-    v = w.values_dict()
-    assert set(v.keys()) == {"api", "scan_mode", "scan_code", "extra_delay"}
-    assert "api_scan" not in v                          # the old second program key is gone
-    assert v["scan_mode"] == scan
-    _set_mode(w, none)
-    v = w.values_dict()
-    assert v["scan_mode"] == none
-    assert v["scan_code"] == ""                         # None mode -> no table -> empty program
+def test_selected_template_hardware_program_is_loaded_verbatim(_app):
+    from Zou_lab_control.neutral_atom.operations.measurement import SWEEP_SCAN_SLOT
+
+    code = "da_x = np.arange(-4, 5)\nda_y = da_x[::-1]\nscan_table = np.column_stack((da_x, da_y))"
+    widget = _widget(code=code)
+    assert widget._sweep_kind == SWEEP_SCAN_SLOT
+    assert widget._program_code.toPlainText() == code
+    assert "da_x" in _labels(widget) and "da_y" in _labels(widget)
 
 
-def test_absent_kind_disables_that_mode(_app):
-    """A template with no scan slot disables Scan (and defaults to API); no api slot disables API
-    (defaults to Scan); neither -> only None is selectable."""
-    from Zou_lab_control.frontend.task_console import _PulseSlotsWidget, _scan_modes
-    none, api, scan = _scan_modes()
+def test_form_value_has_one_explicit_strategy_and_one_program(_app):
+    from Zou_lab_control.neutral_atom.operations.measurement import SWEEP_SCAN_SLOT
 
-    # api-only -> Scan disabled, default API
-    w_api = _PulseSlotsWidget()
-    w_api.rebuild(api_rows=[("a1", "duration", "1", "us", 5.0)], scan_rows=[])
-    assert w_api.values_dict()["scan_mode"] == api
-    assert not w_api._mode_combo.model().item(w_api._mode_combo.findData(scan)).isEnabled()
-
-    # scan-only -> API disabled, default Scan
-    w_scan = _PulseSlotsWidget()
-    w_scan.rebuild(api_rows=[], scan_rows=[("s0", "duration", "2", "ns", "probe")])
-    assert w_scan.values_dict()["scan_mode"] == scan
-    assert not w_scan._mode_combo.model().item(w_scan._mode_combo.findData(api)).isEnabled()
-
-    # neither -> only None
-    w_none = _PulseSlotsWidget()
-    w_none.rebuild(api_rows=[], scan_rows=[])
-    assert w_none.values_dict()["scan_mode"] == none
-    model = w_none._mode_combo.model()
-    assert not model.item(w_none._mode_combo.findData(api)).isEnabled()
-    assert not model.item(w_none._mode_combo.findData(scan)).isEnabled()
-    assert model.item(w_none._mode_combo.findData(none)).isEnabled()
+    value = _widget().values_dict()
+    assert set(value) == {"program_id", "api", "sweep_kind", "program"}
+    assert value["program_id"] == "mot-v1"
+    assert value["api"]["a1"] == pytest.approx(5.0)
+    assert value["sweep_kind"] == SWEEP_SCAN_SLOT
+    assert "da_x" in value["program"]
 
 
-def test_switching_api_scan_preserves_each_mode_buffer(_app):
-    """Each mode keeps its OWN last-typed program: type one program in API, another in Scan, then
-    switch back and forth -- each mode's editor restores its own text (the columns differ, so the
-    two buffers are never collapsed into one string)."""
-    from Zou_lab_control.frontend.task_console import _scan_modes
-    none, api, scan = _scan_modes()
-    w = _widget_both()                                  # starts in Scan
-    w._scan_code.setPlainText("scan_table = [[2000.0]]")
-    _set_mode(w, api)
-    w._scan_code.setPlainText("scan_table = [[3.0]]")
-    _set_mode(w, scan)
-    assert "2000.0" in w._scan_code.toPlainText()        # scan buffer restored
-    _set_mode(w, api)
-    assert "3.0" in w._scan_code.toPlainText()           # api buffer restored
+def test_api_only_template_is_a_valid_api_slot_sweep(_app):
+    from Zou_lab_control.frontend.task_console import _PulseSlotsWidget
+    from Zou_lab_control.neutral_atom.operations.measurement import SWEEP_API_SLOT
+
+    widget = _PulseSlotsWidget()
+    widget.rebuild(api_rows=_api_rows(), scan_rows=[], program_id="probe-v1")
+    value = widget.values_dict()
+    assert value["sweep_kind"] == SWEEP_API_SLOT
+    assert "image_duration" in value["program"]
+    assert value["program"].strip()
 
 
-def test_seed_value_round_trips_mode_and_program_and_api(_app):
-    """A SAVED blob (a load) restores the api fixed values + the scan_mode + the active program:
-    seed_value stashes them and the next rebuild (the template-driven repopulation) applies them."""
-    from Zou_lab_control.frontend.task_console import _scan_modes
-    none, api, scan = _scan_modes()
-    w = _widget_both()
-    # simulate a load that ran in API mode with a specific program + api value
-    w.seed_value({"api": {"a1": 7.5}, "scan_mode": api,
-                  "scan_code": "scan_table = [[4.0], [5.0]]", "extra_delay": 0.02})
-    # the form re-builds from the template (same slots) -- the round-trip restores the saved state
-    w.rebuild(api_rows=[("a1", "duration", "1", "us", 5.0)],
-              scan_rows=[("s0", "duration", "2", "ns", "probe")])
-    v = w.values_dict()
-    assert v["scan_mode"] == api
-    assert v["api"].get("a1") == pytest.approx(7.5)
-    assert "4.0" in v["scan_code"] and "5.0" in v["scan_code"]
-    assert v["extra_delay"] == pytest.approx(0.02)
+def test_template_without_either_slot_cannot_start_a_scan(_app):
+    from Zou_lab_control.frontend.task_console import _PulseSlotsWidget
+
+    widget = _PulseSlotsWidget()
+    widget.rebuild(api_rows=[], scan_rows=[], program_id="empty-v1")
+    value = widget.values_dict()
+    assert value["sweep_kind"] == "" and value["program"] == ""
+    assert "bind at least one" in _labels(widget).lower()
+
+
+def test_switching_strategy_preserves_each_program_buffer(_app):
+    from Zou_lab_control.neutral_atom.operations.measurement import SWEEP_API_SLOT, SWEEP_SCAN_SLOT
+
+    widget = _widget(code="scan_table = [[1, 2], [3, 4]]")
+    api_index = widget._sweep_combo.findData(SWEEP_API_SLOT)
+    widget._sweep_combo.setCurrentIndex(api_index)
+    assert widget._sweep_kind == SWEEP_API_SLOT
+    widget._program_code.setPlainText("scan_table = [[5], [6]]")
+
+    scan_index = widget._sweep_combo.findData(SWEEP_SCAN_SLOT)
+    widget._sweep_combo.setCurrentIndex(scan_index)
+    assert widget._program_code.toPlainText() == "scan_table = [[1, 2], [3, 4]]"
+    widget._sweep_combo.setCurrentIndex(api_index)
+    assert widget._program_code.toPlainText() == "scan_table = [[5], [6]]"
+
+
+def test_saved_override_round_trips_only_for_same_program(_app):
+    from Zou_lab_control.frontend.task_console import _PulseSlotsWidget
+    from Zou_lab_control.neutral_atom.operations.measurement import SWEEP_API_SLOT, SWEEP_SCAN_SLOT
+
+    widget = _PulseSlotsWidget()
+    widget.seed_value({
+        "program_id": "mot-v1",
+        "api": {"a1": 7.5},
+        "sweep_kind": SWEEP_API_SLOT,
+        "program": "scan_table = [[1], [3]]",
+    })
+    widget.rebuild(
+        api_rows=_api_rows(), scan_rows=_scan_rows(),
+        hardware_program="scan_table = [[0, 0]]", program_id="mot-v1")
+    value = widget.values_dict()
+    assert value["api"]["a1"] == pytest.approx(7.5)
+    assert value["sweep_kind"] == SWEEP_API_SLOT
+    assert "[3]" in value["program"]
+
+    # A different template with the same opaque handle receives neither saved override.
+    widget.seed_value({
+        "program_id": "mot-v1",
+        "api": {"a1": 99},
+        "sweep_kind": SWEEP_API_SLOT,
+        "program": "scan_table = [[99]]",
+    })
+    widget.rebuild(
+        api_rows=_api_rows(target="3", current=2.0),
+        scan_rows=[("probe_duration", "duration", "3", "ns", "probe duration")],
+        hardware_program="scan_table = [[20], [40]]",
+        program_id="probe-v2",
+    )
+    value = widget.values_dict()
+    assert value["api"]["a1"] == pytest.approx(2.0)
+    assert value["sweep_kind"] == SWEEP_SCAN_SLOT
+    assert value["program"] == "scan_table = [[20], [40]]"
+
+
+def test_blank_hardware_program_uses_kind_aware_semantic_starter(_app):
+    widget = _widget(code="")
+    code = widget._program_code.toPlainText()
+    assert "da_x" in code and "da_y" in code
+    assert code.strip()

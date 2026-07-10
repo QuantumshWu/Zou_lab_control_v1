@@ -6,6 +6,7 @@ runs the SAME contract path real hardware runs (only the camera frames are fake)
 per the AGENTS.md virtual==real rule -- guarded structurally by
 ``test_virtual_equals_real_contract``.
 """
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 from pathlib import Path
 import sys
@@ -21,7 +22,7 @@ if sys.path[0] != str(REPO_ROOT):
 
 import Zou_lab_control.neutral_atom as na
 import Zou_lab_control.frontend  # noqa: F401  -- self-registers the live-plot viewer
-from Zou_lab_control.neutral_atom.core.calibration import TrapCalibration
+from Zou_lab_control.neutral_atom.core.calibration import FrameContract, TrapCalibration
 from Zou_lab_control.neutral_atom.operations.measurement import (
     NFramePlan,
     OtsuFidelityReducer,
@@ -60,7 +61,9 @@ def _two_site_calibration():
     """Box calibration with two sites at distinct pixel centers, threshold 50."""
 
     centers = np.array([[3.0, 3.0], [10.0, 3.0]], dtype=float)
-    return TrapCalibration(centers, thresholds=np.array([50.0, 50.0]), roi_radius=1, method="box")
+    return TrapCalibration(
+        centers, thresholds=np.array([50.0, 50.0]),
+        frame_contract=FrameContract(image_shape=(16, 16)), roi_radius=1, method="box")
 
 
 def _frame_with_bright(bright_sites):
@@ -82,19 +85,19 @@ def test_survival_reducer_scalar_counts_both_frames_occupied():
     f0 = _frame_with_bright([0, 1])
     f1 = _frame_with_bright([0])
     # survival = (occ1 & occ2).sum / occ1.sum = 1 / 2
-    assert reducer.reduce([f0, f1], cal) == pytest.approx(0.5)
+    assert reducer.reduce([f0, f1], cal)[0] == pytest.approx(0.5)
 
     # No survivors -> 0; both survive -> 1.
-    assert reducer.reduce([_frame_with_bright([0, 1]), _frame_with_bright([])], cal) == pytest.approx(0.0)
-    assert reducer.reduce([_frame_with_bright([0, 1]), _frame_with_bright([0, 1])], cal) == pytest.approx(1.0)
+    assert reducer.reduce([_frame_with_bright([0, 1]), _frame_with_bright([])], cal)[0] == pytest.approx(0.0)
+    assert reducer.reduce([_frame_with_bright([0, 1]), _frame_with_bright([0, 1])], cal)[0] == pytest.approx(1.0)
     # Denominator floors at 1 when frame 1 had no atoms (no divide-by-zero).
-    assert reducer.reduce([_frame_with_bright([]), _frame_with_bright([])], cal) == pytest.approx(0.0)
+    assert reducer.reduce([_frame_with_bright([]), _frame_with_bright([])], cal)[0] == pytest.approx(0.0)
 
 
 def test_survival_reducer_per_site_marks_lost_survived_and_nan():
     cal = _two_site_calibration()
     reducer = SurvivalReducer(per_site=True).bind_calibration(cal)
-    assert reducer.n_series == 2
+    assert reducer.data_shape == (2,)
 
     f0 = _frame_with_bright([0, 1])   # both occupied in frame 1
     f1 = _frame_with_bright([0])      # site 0 survives, site 1 lost
@@ -149,8 +152,8 @@ def test_release_recapture_pulse_has_two_triggers_and_bound_t_off():
     state = build_release_recapture_pulse(
         channels=["trap", "probe", "emCCD"], exposure=2e-3, settle=2e-4, recapture=2e-4
     )
-    assert state.primary_time_slot() == "s0"
-    seq = state.to_sequence(slots=state.reference_slots(), time_step_ns=state.time_step_ns, expand_repeat=False)
+    assert state.primary_time_slot() == "t_off"
+    seq = state.to_sequence(time_step_ns=state.time_step_ns, expand_repeat=False)
     assert na.count_trigger_pulses(seq, trigger_channels=["emCCD"]) == 2
 
 
@@ -200,11 +203,11 @@ def test_temperature_survival_reaches_zero_at_large_trap_off():
     survival frames at a different exposure than the thresholds were calibrated at: a threshold is
     exposure-specific, so empty sites crossed a mismatched threshold = a readout false-positive floor
     that never reached 0.  The Temperature SPEC build now images at the SAME exposure the thresholds were
-    learnt at (recorded on the calibration metadata), so the readout self-matches and survival -> 0."""
+    learnt at (recorded in the typed frame contract), so the readout self-matches and survival -> 0."""
     exp = _calibrated_virtual_session(grid=(5, 7), readout_exposure=20e-3)
     try:
         # the calibration records the exposure its thresholds were learnt at (so the readout self-matches)
-        assert exp.readout.current.metadata.get("threshold_exposure") == pytest.approx(20e-3)
+        assert exp.readout.current.readout_exposure() == pytest.approx(20e-3)
         spec = {s.name: s for s in exp.readout.measurement_specs()}["Temperature"]
         scan = spec.build(template="pulses/release_recapture.json",
                           t_off=(0.0, 2000.0, 6), shots=40).run(live=False, display=False)
@@ -369,7 +372,7 @@ def test_temperature_rejects_pulse_without_t_off_slot():
     exp = _calibrated_virtual_session(grid=(2, 3))
     # An imaging pulse table with no bound duration slot -> no t_off axis.
     state = na.PulseTableState(
-        channels=["trap", "probe", "emCCD"],
+        port_catalog=PortCatalog.from_channels(["trap", "probe", "emCCD"]),
         periods=[
             na.PulsePeriod(2e6, (1, 1, 1), unit="ns", name="image"),
             na.PulsePeriod(1e5, (1, 0, 0), unit="ns", name="settle"),
@@ -411,19 +414,20 @@ def test_generic_scanned_measurement_drives_detection_axis_directly():
     hardware_channels = [f"ch{i:02d}" for i in range(8)]
     sequencer = na.VirtualSequencer(channels=hardware_channels, clock_hz=100_000_000)
     state = na.PulseTableState(
-        channels=["ch00", "ch03"],
+        port_catalog=PortCatalog.from_channels(["ch00", "ch03"]),
         periods=[
             na.PulsePeriod("s0", (1, 1), unit="str (ns)"),
             na.PulsePeriod(100, (0, 0), unit="ns"),
         ],
-        scan_slots=[{"kind": "duration", "target": "0", "unit": "ns", "nominal": 1000.0}],
+        scan_slots=[{"name": "exposure", "kind": "duration", "target": "0",
+                     "label": "exposure", "unit": "ns", "nominal": 1000.0}],
         time_step_ns=10,
         repeat_forever=True,
     )
     pulse = na.bind_pulse(sequencer, state)
 
     times = np.array([2e-6, 4e-6, 8e-6])
-    axis = ScanAxis(slot="s0", values=times, label="Detection time (s)", unit="s", kind="duration")
+    axis = ScanAxis(slot="exposure", values=times, label="Detection time (s)", unit="s", kind="duration")
     scan = ScannedMeasurement(
         pulse, exp.devices.camera, sequencer, cal, axis,
         NFramePlan(n_frames=4), OtsuFidelityReducer(site=None), shots_per_point=1,
@@ -450,7 +454,7 @@ def test_otsu_fidelity_reduce_degrades_a_frameless_point_instead_of_crashing():
         cal = exp.readout.current
         counts, _threshold, model = otsu_fidelity_from_frames([], cal, None)
         assert counts.size == 0 and not np.isfinite(model.fidelity)     # no readout -> undefined
-        assert OtsuFidelityReducer(site=None).reduce([], cal) == 0.5     # ...degrades, never crashes
+        assert OtsuFidelityReducer(site=None).reduce([], cal)[0] == 0.5  # ...degrades, never crashes
     finally:
         exp.close()
 

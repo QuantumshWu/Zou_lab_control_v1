@@ -5,6 +5,7 @@ K whole sweeps then stop; ``scan_progress()`` reports where the scan is now (poi
 The point/sweep math is single-sourced in ``scan_progress_fields`` and the VIRTUAL backend mirrors
 the real streamer (same method + semantics), so the GUI poll works with no real hardware.
 """
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 import pytest
 
@@ -18,7 +19,7 @@ from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSe
 
 def _scan_state() -> PulseTableState:
     """A minimal 3-point, 1-slot hardware scan (period-0 duration bound as s0)."""
-    st = PulseTableState(channels=["probe", "trig"])
+    st = PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"]))
     st.bind_field("duration", "0", unit="us")
     st.set_scan_table([[10.0], [20.0], [30.0]])
     return st
@@ -157,7 +158,7 @@ def test_virtual_sequencer_composes_one_service_state_machine():
 
 # ---- review fixes: finite scan requires >=2 points + implies streaming + can be waited on ----
 def _one_point_scan_state() -> PulseTableState:
-    st = PulseTableState(channels=["probe", "trig"])
+    st = PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"]))
     st.bind_field("duration", "0", unit="us")
     st.set_scan_table([[10.0]])      # a single scan point
     return st

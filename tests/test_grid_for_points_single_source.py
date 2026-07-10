@@ -1,13 +1,4 @@
-"""``grid_for_points`` is the SINGLE source of "may this signal's flat swept-points axis be reshaped into
-a 2-D map".  Every consumer -- ``describe_shape`` (the legend), the console's ``_signal_structure`` (what a
-panel may reshape) and ``_coerce`` (the reshape itself) -- must share it, so the rule cannot drift.
-
-Root cause this guards (a7c031c -> made systematic): a node may carry a ``grid_shape`` that is NOT a
-swept-points grid -- an OccupancyProcessor stores ``grid_shape=(5,7)`` as the physical TRAP
-LAYOUT.  Reshape eligibility is the dimensional FACT ``points non-empty and prod(grid)==prod(points)``, so
-that trap grid is never smeared onto the per-site ``occupied`` (points=()) and imshow'd as a (5x7) heatmap
--- and the SAME fact, not a per-node special case, decides it in the legend and the reshape too.
-"""
+"""Logical point geometry never reshapes a signal's trailing data dimensions."""
 
 from __future__ import annotations
 
@@ -19,8 +10,9 @@ from Zou_lab_control.neutral_atom.operations.logic import grid_for_points, descr
 def test_grid_for_points_is_the_reshape_validity_precondition():
     # a 2-D scan: flat points (35,) the grid divides exactly -> the grid applies
     assert grid_for_points((5, 7), (35,)) == (5, 7)
-    # per-site DATA (occupancy points=()) -> prod 1 != 35 -> never a grid (the trap layout is not a points grid)
-    assert grid_for_points((5, 7), ()) == ()
+    # Per-site data has one acquisition point; a 5x7 trap layout belongs to data,
+    # so it cannot become a point grid.
+    assert grid_for_points((5, 7), (1,)) == ()
     # a grid that does NOT divide the points -> not a valid reshape -> ()
     assert grid_for_points((5, 7), (30,)) == ()
     # no grid declared -> ()
@@ -32,8 +24,8 @@ def test_grid_for_points_is_the_reshape_validity_precondition():
 
 def test_describe_shape_shares_the_same_rule_no_drift():
     # describe_shape must apply the IDENTICAL rule, not a weaker copy that trusts grid_shape blindly.
-    # occupancy (repeat, 1, n_sites): the single data_points axis is NEVER a 5x7 grid (the grid does not
-    # divide 1 point) -> flat site count, the literal "1" data_points kept (#iron-law, #H3v-3)
+    # occupancy (R,1,n_sites): the physical P axis is NEVER a 5x7 grid (the grid does not
+    # divide one point) -> flat site count, the literal P=1 kept (#iron-law, #H3v-3)
     assert describe_shape(np.zeros((10, 1, 35)), points_shape=(1,), data_shape=(35,), grid_shape=(5, 7)) == "10 × 1 × (35)"
     # a real 2-D scan whose grid divides the points -> the grid IS shown
     assert describe_shape(np.zeros((4, 35, 1)), points_shape=(35,), data_shape=(1,), grid_shape=(5, 7)) == "4 × 5×7 × (1)"
@@ -42,9 +34,9 @@ def test_describe_shape_shares_the_same_rule_no_drift():
     assert describe_shape(np.zeros((4, 30, 1)), points_shape=(30,), data_shape=(1,), grid_shape=(5, 7)) == "4 × 30 × (1)"
 
 
-def test_console_signal_structure_reuses_the_same_helper():
-    # The console must derive a panel's reshape grid from the SAME helper -- not re-implement the predicate.
+def test_console_signal_structure_reads_the_hub_schema_directly():
     import inspect
     from Zou_lab_control.frontend import task_console
     src = inspect.getsource(task_console.TaskConsole._signal_structure)
-    assert "grid_for_points" in src, "_signal_structure must route through the shared grid_for_points helper"
+    assert "self.hub.schema" in src
+    assert "signal_spec" not in src and "output_specs" not in src

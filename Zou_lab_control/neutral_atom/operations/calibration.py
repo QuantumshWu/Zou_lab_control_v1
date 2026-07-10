@@ -15,6 +15,7 @@ without a session.  ``method`` selects the readout the calibration will carry:
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Sequence
 
 import numpy as np
@@ -27,7 +28,7 @@ from ..core.analysis import (
     otsu_threshold,
 )
 from ..core.bimodal import fit_bimodal_per_site
-from ..core.calibration import READOUT_KINDS, TrapCalibration, readout_kind
+from ..core.calibration import FrameContract, READOUT_KINDS, TrapCalibration, readout_kind
 from ..core.psf import fit_site_psfs, fit_uniform_psf, psf_boxes_array, psf_weights_array
 from ..core.results import SitemapResult, ThresholdResult
 from ..core.utils import site_index
@@ -96,7 +97,7 @@ def calibrate_sitemap_from_images(
     # Fingerprint the frame geometry the centers were detected on, so a later
     # ROI change is caught at readout (TrapCalibration.signals) instead of
     # silently extracting the wrong pixels.
-    image_shape = [int(average.shape[0]), int(average.shape[1])]
+    frame_contract = FrameContract(image_shape=tuple(int(v) for v in average.shape))
 
     if readout_kind(method) == "kernel":
         # Per-site fits one independent kernel per spot; uniform fits ONE shared
@@ -112,23 +113,25 @@ def calibrate_sitemap_from_images(
         calibration = TrapCalibration(
             centers,
             thresholds,
+            frame_contract=frame_contract,
             grid_shape=grid_shape,
             method=method,
             psf_weights=psf_weights_array(psfs),
             psf_boxes=psf_boxes_array(psfs),
             background=background,
             metadata={"stage": "sitemap", "thresholds_calibrated": False, "method": method,
-                      "psf_half_width": int(psf_half_width), "image_shape": image_shape},
+                      "psf_half_width": int(psf_half_width)},
         )
     else:
         calibration = TrapCalibration(
             centers,
             thresholds,
+            frame_contract=frame_contract,
             grid_shape=grid_shape,
             roi_radius=roi_radius,
             reducer=reducer,
             method="box",
-            metadata={"stage": "sitemap", "thresholds_calibrated": False, "method": "box", "image_shape": image_shape},
+            metadata={"stage": "sitemap", "thresholds_calibrated": False, "method": "box"},
         )
     plot = plot_image(average, centers=centers, roi_radius=roi_radius, display=display)
     return SitemapResult(calibration, average, stack, plot=plot)
@@ -150,8 +153,8 @@ def calibrate_threshold_from_images(
 
     This is the ONE place thresholds are learned (every calibration path -- the
     ``ReadoutSubsystem.thresholds`` API AND the ``CalibrateReadoutTask`` GUI flow -- routes
-    through it), so it is the single source that stamps ``threshold_exposure`` (the camera
-    gate time the bright counts were learnt at, passed by the caller).  A threshold is
+    through it), so it is the single source that records the camera gate time in
+    the typed frame contract.  A threshold is
     exposure-specific, so any later readout (e.g. the temperature survival frames) must image
     at this SAME exposure; recording it here lets that match happen automatically (#H3w-3).
     """
@@ -179,9 +182,12 @@ def calibrate_threshold_from_images(
         thresholds = np.asarray([otsu_threshold(counts[:, i]) for i in range(counts.shape[1])], dtype=float)
         extra = {"threshold_method": "otsu"}
 
-    if exposure is not None:
-        extra["threshold_exposure"] = float(exposure)   # the gate time these thresholds are valid at
     updated = calibration.with_thresholds(thresholds, stage="threshold", thresholds_calibrated=True, **extra)
+    if exposure is not None:
+        updated = replace(
+            updated,
+            frame_contract=replace(updated.frame_contract, exposure_s=float(exposure)),
+        )
     site = site_index(site, counts.shape[1])
     fidelity = estimate_threshold_fidelity(counts[:, site], thresholds[site])
     plot = plot_threshold_hist(
@@ -243,7 +249,8 @@ def calibrate_all_methods_from_images(
         for m in ALL_READOUT_METHODS if m != "box"
     }
     return TrapCalibration(
-        box.centers, box.thresholds, grid_shape=box.grid_shape, roi_radius=box.roi_radius,
+        box.centers, box.thresholds, frame_contract=box.frame_contract,
+        grid_shape=box.grid_shape, roi_radius=box.roi_radius,
         reducer=box.reducer, method="box", background=box.background, by_method=by_method,
         metadata={**box.metadata, "methods": list(ALL_READOUT_METHODS)})
 

@@ -23,6 +23,7 @@ These tests pin that single source:
 """
 
 from __future__ import annotations
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 from pathlib import Path
 import sys
@@ -44,8 +45,8 @@ def _multi_period_bracket_state(*, time_step_ns: float, scan: bool = False) -> P
     duration slot), built at the supplied ``time_step_ns`` so a 50 MHz-tick state and a
     1 ns-preview state are both exercisable."""
     state = PulseTableState(
-        channels=["trap", "cooling", "probe", "emCCD"],
-        visible_channels=["trap", "cooling", "probe", "emCCD"],
+        port_catalog=PortCatalog.from_channels(["trap", "cooling", "probe", "emCCD"]),
+        visible_ports=["trap", "cooling", "probe", "emCCD"],
         time_step_ns=time_step_ns,
     )
     state.periods.append(PulsePeriod(2.0, (1, 1, 0, 0), unit="us", name="load"))
@@ -90,7 +91,7 @@ def test_compiler_carries_no_private_period_start_mirror():
 @pytest.mark.parametrize("time_step_ns", [1.0, 20.0, 5.0])
 def test_period_start_steps_matches_independent_prefix_sum(time_step_ns):
     state = _multi_period_bracket_state(time_step_ns=time_step_ns)
-    slots = state.reference_slots()
+    slots = state._reference_slots()
     got = state.period_start_steps(slots=slots, time_step_ns=time_step_ns)
     assert got == _independent_prefix_sum(state, time_step_ns=time_step_ns, slots=slots)
 
@@ -101,12 +102,12 @@ def test_compiler_edge_boundaries_equal_period_start_steps(time_step_ns):
     end is ``starts[-1]`` -- so every start must appear among the uploaded edge ticks and the
     table end must equal the last start."""
     state = _multi_period_bracket_state(time_step_ns=time_step_ns)
-    slots = state.reference_slots()
+    slots = state._reference_slots()
     starts = state.period_start_steps(slots=slots, time_step_ns=time_step_ns)
 
     ticks, _masks, _channels, loop_end, _from_idx, _cdelays, _bdelays = sq._pulse_table_edge_table(
         state,
-        channels=list(state.channels),
+        channels=list(state.port_catalog.raw_lanes),
         slots=slots,
         time_step_ns=time_step_ns,
     )
@@ -135,7 +136,7 @@ def test_affine_period_starts_is_the_affine_lift_of_the_same_prefix_sum():
         state, slot_vars=slot_vars, time_step_ns=time_step_ns, coeff_frac_bits=coeff_frac_bits
     )
     scalar = state.period_start_steps(
-        slots=state.reference_slots(), time_step_ns=time_step_ns
+        slots=state._reference_slots(), time_step_ns=time_step_ns
     )
     assert len(affine) == len(scalar) == len(state.periods) + 1
     bases = [base for base, _coeffs in affine]

@@ -10,6 +10,7 @@ the data layer: setting ``state.aN`` writes EVERY member channel's ``delays`` +
 """
 
 from __future__ import annotations
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 from pathlib import Path
 import sys
@@ -32,8 +33,7 @@ def _bus_state() -> PulseTableState:
     """A pulse with one multi-member analog bus plus a plain TTL channel -- the minimal
     state where a bus-delay slot and a channel-delay slot can be compared side by side."""
     return PulseTableState(
-        channels=[*MEMBERS, "ttl0"],
-        analog_buses={BUS: MEMBERS},
+        port_catalog=PortCatalog.from_channels([*MEMBERS, "ttl0"], analog_buses={BUS: MEMBERS}),
         delay_units={"da0": "us", "da1": "us", "da2": "us"},
         time_step_ns=20.0,
     )

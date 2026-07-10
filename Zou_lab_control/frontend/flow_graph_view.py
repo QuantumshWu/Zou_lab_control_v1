@@ -481,7 +481,8 @@ class FlowGraphView(QtWidgets.QWidget):
         shape = e.get("shape")
         if sig and shape is not None:
             try:
-                dims = "×".join(str(int(n)) for n in shape)
+                from ..neutral_atom.operations import format_dims   # ONE shape->string spelling
+                dims = format_dims(shape)
             except Exception:
                 dims = ""
             return f"{sig} ({dims})" if dims else sig

@@ -30,9 +30,10 @@ from test_task_console_measurement_gui import _camera_console  # noqa: E402
 def test_error_does_not_overwrite_last_good_namespace():
     console, node, cam, card, editor = _camera_console()
     try:
-        good = {"frame_0": np.full((64, 80), 50.0), "shot": 1}
-        card.refresh(good)                                  # a successful render
-        assert card._last_namespace is good                 # last-good remembered
+        # The real console factory has already rendered one canonical frame.
+        # Keep that exact successful namespace as the recovery checkpoint.
+        good = card._last_namespace
+        assert good is not None and "frame_0" in good
 
         # a namespace MISSING the bound 'frame_0' -> the source eval raises -> status error, but the
         # last-good namespace is NOT clobbered (so a re-pick / display change still replays valid data)

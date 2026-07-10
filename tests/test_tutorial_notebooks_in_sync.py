@@ -87,3 +87,19 @@ def test_writers_are_idempotent(tmp_path):
         regenerated = [c.source for c in nbformat.read(out, as_version=4).cells]
         shipped = [c.source for c in nbformat.read(REPO_ROOT / "tutorials" / name, as_version=4).cells]
         assert regenerated == shipped, f"{name}: writer output != shipped notebook"
+
+
+@pytest.mark.parametrize("writer,name", [
+    (zf.write_frontend_tutorial, "frontend_tutorial.ipynb"),
+    (zf.write_neutral_atom_tutorial, "neutral_atom_tutorial.ipynb"),
+    (zf.write_neutral_atom_hardware_tutorial, "neutral_atom_hardware_quickstart.ipynb"),
+    (zf.write_neutral_atom_fpga_server_tutorial, "neutral_atom_fpga_server.ipynb"),
+    (zf.write_neutral_atom_qcmos_live_tutorial, "qcmos_live_2d.ipynb"),
+])
+def test_writers_are_byte_stable(writer, name, tmp_path):
+    """Unchanged templates produce byte-identical notebooks, including cell ids."""
+    path = tmp_path / name
+    writer(path)
+    first = path.read_bytes()
+    writer(path)
+    assert path.read_bytes() == first

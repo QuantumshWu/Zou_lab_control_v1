@@ -9,14 +9,17 @@ manual** (`docs/fpga_manual/`).
 
 Default qCMOS camera-imaging preset for the address-switch FPGA pulse-streamer.
 
-- Hardware channels are inferred from the address-switch XDC and saved as
-  `ch00..ch61` in FPGA bit order. The GUI shows four rows by default:
+- The server derives one immutable `PortCatalog` from the address-switch XDC.
+  The preset persists that catalog: raw lanes remain `ch00..ch61` in FPGA bit
+  order, while the GUI/API expose logical digital, DAC, and clock ports. The GUI
+  shows four programmable ports by default:
   - `ch09 trap (M17)`, `ch00 cooling (F15)`, `ch03 probe (N15)`, `ch11 emCCD (M13)`.
 - The qCMOS/external camera trigger is `emCCD` (`ch11/M13`). `ch06/trig/R17`
   exists in the XDC but is not the checked-in camera trigger.
 - Hidden or unconfigured channels stay off in the full-width upload.
-- The saved JSON includes the logical analog buses `da_dipole`, `da_bias_x`,
-  `da_bias_y`, `da_bias_z`.
+- DAC ports `da_dipole`, `da_bias_x`, `da_bias_y`, `da_bias_z` own their member
+  lanes, runtime bus index, width, encoding, safe code, and latch-clock topology
+  in that single catalog. A pulse document cannot relabel lanes or toggle clocks.
 
 Typical control-computer workflow:
 
@@ -34,14 +37,15 @@ finite debugging keep `repeat_forever=False` so the sequencer can report done.
 
 ## Scanning (named slots)
 
-Scanning uses named slots `s0, s1, ...`, not an `x`/`y` array. Bind any period
-duration or analog-bus DAC value to a slot, then provide an
+Every scan slot has a semantic public name such as `exposure`, `da_x`, or
+`t_off`. Internal tokens `s0`, `s1`, ... appear only inside the compiled pulse
+expressions. Bind any period duration or DAC-port value to a slot, then provide an
 `N_points x N_slots` scan table. A channel delay is a fixed per-channel output
 delay set through the API; it is never scanned:
 
 ```python
 state = na.PulseTableState.load("pulses/camera_imaging_address_switch.json")
-s0 = state.bind_field("duration", "1")          # bind period 1 duration -> slot s0
+slot = state.bind_field("duration", "1", name="exposure")
 state.set_scan_table([[1_000], [2_000], [4_000]])  # 3 points, 1 slot, ns
 program = state.compile_scan(clock_hz=50_000_000)
 ```
@@ -52,9 +56,11 @@ the FPGA iterates the points seamlessly. Scan tables can also be loaded from
 
 ## Analog bus rows
 
-XDC labels such as `da_dipole[0] .. da_dipole[9]` fold into one logical
-GUI/API row. Each period uses `Edge` (jump to the code at the period start),
+The sequencer's `PortCatalog` exposes `da_dipole` as one logical GUI/API row;
+its raw member lanes can never reappear as independent TTL controls. Each period
+uses `Edge` (jump to the code at the period start),
 `Ramp` (staircase from the previous anchor over the period), or `Hold`. A
-10-bit bus accepts `0..1023`; the edit field is a line edit that clamps. Buses
+10-bit offset-binary DAC is edited in signed LSB (`-512..511`, with `0` meaning
+physical zero); the compiler alone converts it to the wire code. Buses
 upload through a separate segment table, so a ramp costs one segment instead of
 many TTL edge rows. The preview draws bus rows as hollow stair-step traces.

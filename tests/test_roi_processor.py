@@ -17,11 +17,15 @@ if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
+from Zou_lab_control.neutral_atom.core.signal_tensor import SignalSchema
 from Zou_lab_control.neutral_atom.operations.processors.roi import ROI_REDUCERS, RoiProcessor
 
 
 def _hub_with_frame(block):
     hub = SignalHub()
+    hub.register_signal("frame_0", SignalSchema(
+        point_shape=(block.shape[1],), data_shape=block.shape[2:], dtype=block.dtype,
+        repeat_capacity=block.shape[0]))
     hub.publish({"frame_0": block})
     return hub
 
@@ -36,27 +40,29 @@ def test_roi_crop_is_native_dtype_and_value_matches_reduce():
     block[0, 0, 10:20, 30:40] = 100                       # a bright patch inside the region
     hub = _hub_with_frame(block)
     node = RoiProcessor(hub, x_min=30, x_max=40, y_min=10, y_max=20, reduce="mean")
-    out = node.transform({"frame_0": hub.latest("frame_0")})
-    assert out["roi_frame"].shape == (10, 10)
-    assert out["roi_frame"].dtype == block.dtype           # native passthrough, no float64 balloon
-    assert np.array_equal(out["roi_frame"], block[0, 0, 10:20, 30:40])
-    assert out["roi_value"] == 100.0                       # the patch fills the whole region
+    node.step()
+    crop, value = hub.latest("roi_frame"), hub.latest("roi_value")
+    assert crop.shape == (1, 1, 10, 10)
+    assert crop.dtype == block.dtype
+    assert np.array_equal(crop[0, 0], block[0, 0, 10:20, 30:40])
+    assert value[0, 0, 0] == 100.0
     # every declared reduce verb dispatches through the ONE table
     for verb, fn in ROI_REDUCERS.items():
         node.set_acquisition_parameters(reduce=verb)
-        out = node.transform({"frame_0": hub.latest("frame_0")})
-        assert out["roi_value"] == float(fn(block[0, 0, 10:20, 30:40].astype(float)))
+        hub.publish({"frame_0": block})
+        node.step()
+        assert hub.latest("roi_value")[0, 0, 0] == float(
+            fn(block[0, 0, 10:20, 30:40].astype(float)))
 
 
 def test_roi_defaults_to_full_frame_and_reduces_repeats():
     block = _frame_block(repeats=3)
     hub = _hub_with_frame(block)
     node = RoiProcessor(hub)                               # all-zero region = the whole frame
-    out = node.transform({"frame_0": hub.latest("frame_0")})
-    assert out["roi_frame"].shape == block.shape[-2:]      # full frame
-    assert np.array_equal(out["roi_frame"], block[-1, 0])  # the NEWEST repeat slice
-    expected = float(np.mean([block[r, 0].mean() for r in range(3)]))
-    assert out["roi_value"] == expected                    # per-slice reduce, then average
+    node.step()
+    assert np.array_equal(hub.latest("roi_frame"), block)
+    expected = np.mean(block.astype(float), axis=(-2, -1))[..., None]
+    np.testing.assert_allclose(hub.latest("roi_value"), expected)
 
 
 def test_roi_region_round_trips_with_the_plot_selector():
@@ -66,7 +72,7 @@ def test_roi_region_round_trips_with_the_plot_selector():
     params = node.region_to_acquisition_parameters(30.2, 39.8, 10.1, 19.9)
     node.set_acquisition_parameters(**params)
     assert (node.x_min, node.x_max, node.y_min, node.y_max) == (30.2, 39.8, 10.1, 19.9)
-    node.transform({"frame_0": hub.latest("frame_0")})     # first frame teaches the shape
+    node.step()
     # the declared spatial region (real source pixels) drives the roi_frame panel's axes
     region = node.acquisition_parameters()["region"]
     assert region == [30, 40, 10, 20]

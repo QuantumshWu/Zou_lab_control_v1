@@ -58,8 +58,8 @@ def test_camera_measurement_plus_detect_processor_runs_real_pipeline():
         names = set(hub.names())
         assert {"occupied", "counts", "rate", "centers", "thresholds"} <= names
         occ = np.asarray(hub.latest("occupied"))
-        assert occ.ndim == 3 and occ.shape[1:] == (1, 12)   # (repeat, 1, n_sites) block -- data_points kept
-        assert np.ndim(hub.latest("rate")) == 0
+        assert occ.ndim == 3 and occ.shape[1:] == (1, 12)   # (R,P,*data_shape), P=1, data_shape=(n_sites,)
+        assert np.asarray(hub.latest("rate")).shape == (1, 1, 1)
 
         # virtual == real: the published occupancy IS calibration.detect on that frame.  ``frame`` is
         # the camera's (repeat,1,H,W) block, so judge its last filled slice and compare per shot.
@@ -114,7 +114,7 @@ def test_calibrate_task_produces_calibration_and_drives_detect_processor(tmp_pat
         cam.step()
         det.step()
         occ = np.asarray(hub.latest("occupied"))
-        assert occ.ndim == 3 and occ.shape[1:] == (1, 12)     # (repeat, 1, n_sites) block -- data_points kept
+        assert occ.ndim == 3 and occ.shape[1:] == (1, 12)     # (R,P,*data_shape), P=1, data_shape=(n_sites,)
     finally:
         exp.close()
 
@@ -153,7 +153,7 @@ def test_user_composed_loading_readout_streams_real_detect_off_camera_frames():
         names = set(hub.names())
         assert "frame_0" in names and {"occupied", "rate", "centers"} <= names
         occ = np.asarray(hub.latest("occupied"))
-        assert occ.ndim == 3 and occ.shape[1:] == (1, 12)     # (repeat, 1, n_sites) block -- data_points kept
+        assert occ.ndim == 3 and occ.shape[1:] == (1, 12)     # (R,P,*data_shape), P=1, data_shape=(n_sites,)
         img = np.asarray(hub.latest("frame_0"))[-1, 0]    # judge the camera block's last filled slice
         expected = np.asarray(task.calibration.detect(img).occupied, dtype=float).reshape(-1)
         np.testing.assert_array_equal(occ[-1, 0], expected)   # (repeat, 1, n_sites) -> last shot's site vector

@@ -83,3 +83,30 @@ def test_side_by_side_cards_one_gap_apart():
     left, right = cfgs
     assert left.row == right.row == GAP
     assert right.col - (left.col + _card_size(left.size)[0]) == GAP
+
+
+def test_demo_board_seeds_pixel_positions_from_the_geometry_single_source():
+    """The 1480 px demo window starts as a two-column board, not six overlapping grid-number
+    seeds that gravity turns into one tall column.  The seed is already a packing fixed point and
+    every offset is derived from the real card AABBs plus GAP."""
+    from Zou_lab_control.frontend.devtools import _demo_board_state
+
+    board_width = 1480
+    configs = _demo_board_state(board_width=board_width).panels
+    assert _compact(configs, board_w=board_width) is False
+
+    by_title = {cfg.title: cfg for cfg in configs}
+    left = by_title["Readout image"]
+    right = by_title["Per-site occupancy"]
+    assert (left.col, left.row) == (GAP, GAP)
+    assert right.row == GAP
+    assert right.col == left.col + _card_size(left.size)[0] + GAP
+
+    for index, first in enumerate(configs):
+        x0, y0, x1, y1 = _aabb(first)
+        assert GAP <= x0 and x1 <= board_width - GAP
+        for second in configs[index + 1:]:
+            a0, b0, a1, b1 = _aabb(second)
+            separated = x1 + GAP <= a0 or a1 + GAP <= x0 \
+                or y1 + GAP <= b0 or b1 + GAP <= y0
+            assert separated, (first.title, second.title)

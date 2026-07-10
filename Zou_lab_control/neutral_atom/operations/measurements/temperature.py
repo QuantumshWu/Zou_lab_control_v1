@@ -71,8 +71,7 @@ def temperature_release_recapture(readout) -> MeasurementSpec:
         # the capture-trigger line now, so its channel is threaded in for a real chNN streamer.
         # This measurement is INTENTIONALLY pinned to the readout (science) camera -- it images
         # single-atom survival, which a MOT monitor cannot do -- so it declares NO ``devices=[...]``
-        # role (a camera dropdown would offer a sensor it cannot run on).  Contrast pulse_scan, which
-        # is device-agnostic and DOES declare the role.
+        # role.  The generic pulse scan is a separate sequencer consumer and carries no camera role.
         cam = getattr(s.devices, "camera", None)
         state = _resolve_release_recapture_template(
             template, s.devices.sequencer,
@@ -83,7 +82,7 @@ def temperature_release_recapture(readout) -> MeasurementSpec:
         # at the readout false-positive rate and it never reaches 0 (#H3v-2).  A high-SNR calibration
         # exposure then yields a clean survival -> 0 at large t_off (the real ballistic loss).
         cal = s.require_calibration(require_thresholds=True)
-        # The authoritative reader of the calibration's threshold_exposure; fallback=None means
+        # The authoritative reader of the calibration frame contract's exposure; fallback=None means
         # an UNstamped calibration does not force an exposure match (leave the template windows as-is).
         expo = cal.readout_exposure(fallback=None)
         if expo:

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
-import copy
 import re
 import time
 from typing import Any, Callable, Mapping, Sequence
@@ -12,9 +10,16 @@ from typing import Any, Callable, Mapping, Sequence
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.optimize import OptimizeWarning, curve_fit
-from scipy.signal import find_peaks
-import warnings
+
+from ..neutral_atom.core.fitting import (
+    FitRequest,
+    FitResult,
+    fit_data,
+    fit_image,
+    fit_model,
+)
+from ..neutral_atom.core.raster import RegularRaster
+from ..neutral_atom.core.selection import Selection, SelectedData, select_rows
 
 from .style import PALETTE, small_fontsize
 
@@ -26,19 +31,6 @@ from .style import PALETTE, small_fontsize
 _CENTER_DOT_SIZE = 8       # scatter ``s`` (points^2): a small centre locator, never a signal-blotting blob
 _CENTER_RING_LW = 1.8      # ring linewidth: bold enough to read the fitted radius over noise / the spot
 _CENTER_RING_ALPHA = 0.9   # ring opacity: the ring is the PRIMARY readable overlay, so nearly solid
-
-
-VALID_FIT_FUNCS = ["lorent", "lorent_zeeman", "rabi", "decay", "center", "gaussian"]
-
-
-@dataclass
-class FitResult:
-    """Structured fit result returned by DataFigure fit methods."""
-
-    names: list[str]
-    popt: np.ndarray | None
-    pcov: np.ndarray | None
-    function: str
 
 
 def _as_2d_y(data_y) -> np.ndarray:
@@ -67,6 +59,270 @@ def resolve_save_base(path, stem: str) -> Path:
     return base
 
 
+# Saved figures are an artifact boundary, not an append-only bag of optional
+# ``info`` fields.  The npz has one exact envelope and one current version.
+_SAVED_FIGURE_SCHEMA = "zou_lab_control.saved_figure"
+_SAVED_FIGURE_VERSION = 1
+_SAVED_FIGURE_KEYS = frozenset(
+    {"schema", "version", "data_x", "data_y", "plot", "signals", "recipe", "provenance", "metadata"}
+)
+_SAVED_PLOT_KEYS = frozenset(
+    {"name", "kind", "labels", "unit", "points_done", "repeat_cur", "view", "fit", "size"}
+)
+_SAVED_SIGNAL_KEYS = frozenset(
+    {"block", "points_shape", "data_shape", "label", "unit", "role"}
+)
+_SAVED_SIGNAL_ROLES = frozenset({"value", "x", "centers", "frame"})
+_STRUCTURED_FIGURE_KINDS = frozenset({"pulse", "grid"})
+
+
+def _object_scalar(value: object) -> np.ndarray:
+    """Store one Python object as a scalar object array, never a rank inferred from its contents."""
+    out = np.empty((), dtype=object)
+    out[()] = value
+    return out
+
+
+def _required_keys(value: Mapping[str, Any], expected: frozenset[str], where: str) -> None:
+    actual = frozenset(value)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise ValueError(f"{where} keys must be exactly {sorted(expected)}; missing={missing}, extra={extra}.")
+
+
+def _strict_int(value: object, where: str, *, minimum: int = 0) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"{where} must be an integer, got {type(value).__name__}.")
+    result = int(value)
+    if result < minimum:
+        raise ValueError(f"{where} must be >= {minimum}, got {result}.")
+    return result
+
+
+def _strict_shape(value: object, where: str) -> list[int]:
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"{where} must be a list of positive integers.")
+    shape = [_strict_int(item, f"{where}[{index}]", minimum=1) for index, item in enumerate(value)]
+    if not shape:
+        raise ValueError(f"{where} must be non-empty.")
+    return shape
+
+
+def _strict_numeric_array(value: object, where: str) -> np.ndarray:
+    array = np.asarray(value)
+    if array.dtype.hasobject or array.dtype.kind not in "biufc":
+        raise TypeError(f"{where} must be a numeric ndarray, got dtype {array.dtype}.")
+    if array.ndim < 1:
+        raise ValueError(f"{where} must have at least one axis, got shape {array.shape}.")
+    return array
+
+
+def _validate_plot_record(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError("saved figure plot must be a mapping.")
+    plot = dict(value)
+    _required_keys(plot, _SAVED_PLOT_KEYS, "saved figure plot")
+    for key in ("name", "kind", "unit", "size"):
+        if not isinstance(plot[key], str) or (key in ("name", "kind", "size") and not plot[key]):
+            raise TypeError(f"saved figure plot.{key} must be a non-empty string.")
+    if not isinstance(plot["labels"], list) or len(plot["labels"]) < 2 \
+            or any(not isinstance(label, str) for label in plot["labels"]):
+        raise TypeError("saved figure plot.labels must be a list of at least two strings.")
+    plot["points_done"] = _strict_int(plot["points_done"], "saved figure plot.points_done")
+    plot["repeat_cur"] = _strict_int(plot["repeat_cur"], "saved figure plot.repeat_cur")
+    if not isinstance(plot["view"], Mapping) or any(not isinstance(key, str) for key in plot["view"]):
+        raise TypeError("saved figure plot.view must be a string-keyed mapping.")
+    plot["view"] = dict(plot["view"])
+    fit = plot["fit"]
+    if fit is not None:
+        if not isinstance(fit, Mapping):
+            raise TypeError("saved figure plot.fit must be a mapping or None.")
+        _required_keys(dict(fit), frozenset({"func", "names", "popt"}), "saved figure plot.fit")
+        if not isinstance(fit["func"], str) or not isinstance(fit["names"], list) \
+                or any(not isinstance(name, str) for name in fit["names"]) \
+                or not isinstance(fit["popt"], list):
+            raise TypeError("saved figure plot.fit must contain func:str, names:list[str], popt:list.")
+        plot["fit"] = dict(fit)
+    from .live import PLOT_KIND_BY_KEY
+    if plot["kind"] not in PLOT_KIND_BY_KEY:
+        raise ValueError(
+            f"saved figure plot.kind {plot['kind']!r} is not registered; "
+            f"choose from {sorted(PLOT_KIND_BY_KEY)}.")
+    return plot
+
+
+def _validate_signals(value: object) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        raise TypeError("saved figure signals must be a mapping.")
+    signals: dict[str, dict[str, Any]] = {}
+    roles: set[str] = set()
+    for signal_name, raw in value.items():
+        if not isinstance(signal_name, str) or not signal_name:
+            raise TypeError("saved figure signal names must be non-empty strings.")
+        if not isinstance(raw, Mapping):
+            raise TypeError(f"saved signal {signal_name!r} must be a mapping.")
+        entry = dict(raw)
+        _required_keys(entry, _SAVED_SIGNAL_KEYS, f"saved signal {signal_name!r}")
+        role = entry["role"]
+        if not isinstance(role, str) or role not in _SAVED_SIGNAL_ROLES:
+            raise ValueError(
+                f"saved signal {signal_name!r}.role must be one of {sorted(_SAVED_SIGNAL_ROLES)}.")
+        if role in roles:
+            raise ValueError(f"saved figure has more than one signal with role {role!r}.")
+        roles.add(role)
+        if not isinstance(entry["label"], str) or not isinstance(entry["unit"], str):
+            raise TypeError(f"saved signal {signal_name!r} label and unit must be strings.")
+        points_shape = _strict_shape(entry["points_shape"], f"saved signal {signal_name!r}.points_shape")
+        data_shape = _strict_shape(entry["data_shape"], f"saved signal {signal_name!r}.data_shape")
+        block = _strict_numeric_array(entry["block"], f"saved signal {signal_name!r}.block")
+        expected = (int(block.shape[0]), int(np.prod(points_shape, dtype=np.int64)), *data_shape)
+        if tuple(block.shape) != expected:
+            raise ValueError(
+                f"saved signal {signal_name!r}.block must be canonical (R,P,*data_shape) {expected}; "
+                f"got {block.shape}.")
+        signals[signal_name] = {
+            "block": block,
+            "points_shape": points_shape,
+            "data_shape": data_shape,
+            "label": entry["label"],
+            "unit": entry["unit"],
+            "role": role,
+        }
+    return signals
+
+
+def _validate_recipe(value: object, kind: str) -> dict[str, Any] | None:
+    if kind not in _STRUCTURED_FIGURE_KINDS:
+        if value is not None:
+            raise ValueError(f"array figure kind {kind!r} must store recipe=None.")
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError(f"structured figure kind {kind!r} requires a replay recipe.")
+    recipe = dict(value)
+    if recipe.get("kind") != kind:
+        raise ValueError(
+            f"saved figure kind {kind!r} requires recipe.kind={kind!r}, got {recipe.get('kind')!r}.")
+    if kind == "pulse":
+        expected = frozenset({"kind", "pulse_state", "include_always_off", "panel_size"})
+        _required_keys(recipe, expected, "pulse replay recipe")
+        if not isinstance(recipe["pulse_state"], Mapping):
+            raise TypeError("pulse replay recipe.pulse_state must be a mapping.")
+        if not isinstance(recipe["include_always_off"], (bool, np.bool_)):
+            raise TypeError("pulse replay recipe.include_always_off must be bool.")
+        if not isinstance(recipe["panel_size"], str) or not recipe["panel_size"]:
+            raise TypeError("pulse replay recipe.panel_size must be a non-empty string.")
+        recipe["pulse_state"] = dict(recipe["pulse_state"])
+        recipe["include_always_off"] = bool(recipe["include_always_off"])
+        return recipe
+
+    common = {
+        "kind", "labels", "title", "grid_shape", "panel_size", "focused_cell_index",
+        "display_params", "sub_plot_kind", "per_cell",
+    }
+    sub_kind = recipe.get("sub_plot_kind")
+    family_keys = {
+        "hist": {"bins", "thresholds", "fidelities", "occupied"},
+        "2d": {"cmap"},
+        "1d": {"x"},
+    }
+    if sub_kind not in family_keys:
+        raise ValueError(f"grid replay recipe.sub_plot_kind must be one of {sorted(family_keys)}.")
+    _required_keys(recipe, frozenset(common | family_keys[sub_kind]), "grid replay recipe")
+    if not isinstance(recipe["labels"], list) or len(recipe["labels"]) < 2 \
+            or any(not isinstance(label, str) for label in recipe["labels"]):
+        raise TypeError("grid replay recipe.labels must be a list of at least two strings.")
+    recipe["grid_shape"] = _strict_shape(recipe["grid_shape"], "grid replay recipe.grid_shape")
+    if len(recipe["grid_shape"]) != 2:
+        raise ValueError("grid replay recipe.grid_shape must contain [rows, columns].")
+    if not isinstance(recipe["panel_size"], str) or not recipe["panel_size"]:
+        raise TypeError("grid replay recipe.panel_size must be a non-empty string.")
+    focused = recipe["focused_cell_index"]
+    if focused is not None:
+        recipe["focused_cell_index"] = _strict_int(focused, "grid replay recipe.focused_cell_index")
+    if not isinstance(recipe["display_params"], Mapping):
+        raise TypeError("grid replay recipe.display_params must be a mapping.")
+    recipe["display_params"] = dict(recipe["display_params"])
+    if not isinstance(recipe["per_cell"], list) or not recipe["per_cell"]:
+        raise ValueError("grid replay recipe.per_cell must be a non-empty list.")
+    if int(np.prod(recipe["grid_shape"], dtype=np.int64)) < len(recipe["per_cell"]):
+        raise ValueError("grid replay recipe.grid_shape cannot contain all per_cell entries.")
+    if sub_kind == "hist":
+        recipe["bins"] = _strict_int(recipe["bins"], "grid replay recipe.bins", minimum=1)
+        for key in ("thresholds", "fidelities", "occupied"):
+            if recipe[key] is not None and not isinstance(recipe[key], list):
+                raise TypeError(f"grid replay recipe.{key} must be a list or None.")
+    elif sub_kind == "2d":
+        if not isinstance(recipe["cmap"], str) or not recipe["cmap"]:
+            raise TypeError("grid replay recipe.cmap must be a non-empty string.")
+    elif recipe["x"] is not None and not isinstance(recipe["x"], list):
+        raise TypeError("grid replay recipe.x must be a list or None.")
+    return recipe
+
+
+def _validate_provenance(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError("saved figure provenance must be a mapping.")
+    provenance = dict(value)
+    flow = provenance.get("flow_graph")
+    if not isinstance(flow, Mapping):
+        raise ValueError("saved figure provenance requires a flow_graph mapping.")
+    _required_keys(dict(flow), frozenset({"nodes", "edges"}), "saved figure provenance.flow_graph")
+    if not isinstance(flow["nodes"], list) or not isinstance(flow["edges"], list):
+        raise TypeError("saved figure provenance.flow_graph nodes and edges must be lists.")
+    if any(not isinstance(item, Mapping) for item in (*flow["nodes"], *flow["edges"])):
+        raise TypeError("saved figure provenance.flow_graph entries must be mappings.")
+    provenance["flow_graph"] = {"nodes": list(flow["nodes"]), "edges": list(flow["edges"])}
+    return provenance
+
+
+def _artifact_parts(info: Mapping[str, Any]) -> tuple[dict, dict, dict | None, dict, dict]:
+    """Split the internal flat save metadata into the exact persisted records."""
+    raw = dict(info)
+    plot = {
+        "name": str(raw.pop("name")),
+        "kind": str(raw.pop("kind")),
+        "labels": [str(label) for label in raw.pop("labels")],
+        "unit": str(raw.pop("unit")),
+        "points_done": raw.pop("points_done"),
+        "repeat_cur": raw.pop("repeat_cur"),
+        "view": dict(raw.pop("view")),
+        "fit": raw.pop("fit"),
+        "size": str(raw.pop("size")),
+    }
+    signals = raw.pop("signals")
+    recipe = raw.pop("figure_recipe")
+    provenance = raw.pop("provenance")
+    if not isinstance(raw, dict) or any(not isinstance(key, str) for key in raw):
+        raise TypeError("saved figure metadata must be a string-keyed mapping.")
+    return (
+        _validate_plot_record(plot),
+        _validate_signals(signals),
+        _validate_recipe(recipe, plot["kind"]),
+        _validate_provenance(provenance),
+        raw,
+    )
+
+
+def _write_saved_npz(path: str | Path, *, data_x, data_y, info: Mapping[str, Any]) -> None:
+    """Write the one current saved-figure envelope after validating every required record."""
+    x = _strict_numeric_array(data_x, "saved figure data_x")
+    y = _strict_numeric_array(data_y, "saved figure data_y")
+    plot, signals, recipe, provenance, metadata = _artifact_parts(info)
+    np.savez(
+        path,
+        schema=np.asarray(_SAVED_FIGURE_SCHEMA),
+        version=np.asarray(_SAVED_FIGURE_VERSION, dtype=np.int64),
+        data_x=x,
+        data_y=y,
+        plot=_object_scalar(plot),
+        signals=_object_scalar(signals),
+        recipe=_object_scalar(recipe),
+        provenance=_object_scalar(provenance),
+        metadata=_object_scalar(metadata),
+    )
+
+
 class DataFigure:
     """Data and post-processing handle for a front-end figure.
 
@@ -90,6 +346,11 @@ class DataFigure:
         info: Mapping[str, Any] | None = None,
         name: str | None = None,
         unit: str | None = None,
+        coordinates: Mapping[str, object] | None = None,
+        selection_values=None,
+        selection_mode: str | None = None,
+        selection_frame: str = "data",
+        selection_scope: Sequence[str] = (),
     ):
         self.live_plot = live_plot
         if live_plot is not None:
@@ -110,10 +371,21 @@ class DataFigure:
         # to the figure's first axes (single-axes plots); an explicit ``ax`` binds
         # it to one cell of a multi-axes figure so the stack is reusable per cell.
         self._ax = ax if ax is not None else self.fig.axes[0]
-        self.data_x = np.asarray(data_x, dtype=float)
-        if self.data_x.ndim == 1:
-            self.data_x = self.data_x[:, None]
-        self.data_x_original = copy.deepcopy(self.data_x)
+        self.raster_grid = data_x if isinstance(data_x, RegularRaster) else None
+        if self.raster_grid is None:
+            self.data_x = np.asarray(data_x, dtype=float)
+            if self.data_x.ndim == 1:
+                self.data_x = self.data_x[:, None]
+        else:
+            self.data_x = self.raster_grid
+        # Unit conversion mutates only 1-D x coordinates.  A 2-D image can carry
+        # millions of (x, y) rows, so duplicating that immutable coordinate table
+        # here used another ~35 MiB for a 1920x1200 frame for no purpose.
+        self.data_x_original = (
+            self.data_x.copy()
+            if self.raster_grid is None and self.data_x.shape[1] == 1
+            else self.data_x
+        )
         self.data_y = _as_2d_y(data_y)
         self.labels = list(labels) if labels is not None else ["X", "Y", "Z"]
         self.info = dict(info or {})
@@ -138,6 +410,45 @@ class DataFigure:
         # background frame is supplied, so it stays artist-derived per figure).
         declared = getattr(live_plot, "render_family", None) if live_plot is not None else None
         self.plot_type = declared if declared in ("1D", "2D") else ("2D" if first_ax.images else "1D")
+
+        # Plot -> named coordinates/value is one explicit adapter.  A live plot
+        # owns the representation (histograms use value/bin coordinates; images
+        # use x/y; traces use x), while an explicit DataFigure gets the same
+        # derivation.  Selection and fitting both consume these exact rows.
+        adapted = None
+        if live_plot is not None:
+            adapter = getattr(live_plot, "selection_rows", None)
+            if callable(adapter):
+                adapted = dict(adapter() or {})
+        if adapted is not None:
+            adapted_raster = adapted.get("raster")
+            if adapted_raster is not None:
+                if not isinstance(adapted_raster, RegularRaster):
+                    raise TypeError("plot selection adapter raster must be RegularRaster")
+                self.raster_grid = adapted_raster
+            coordinates = adapted.get("coordinates", coordinates)
+            selection_values = adapted.get("values", selection_values)
+            selection_mode = adapted.get("mode", selection_mode)
+            selection_frame = str(adapted.get("frame", selection_frame))
+            selection_scope = tuple(adapted.get("scope", selection_scope))
+        mode = str(selection_mode or ("xy" if self.plot_type == "2D" else "x")).lower()
+        if coordinates is None and self.raster_grid is None:
+            if mode == "xy" and self.data_x.shape[1] >= 2:
+                coordinates = {"x": self.data_x[:, 0], "y": self.data_x[:, 1]}
+            elif mode == "value":
+                coordinates = {"x": self.data_x[:, 0], "value": self.data_x[:, 0]}
+            else:
+                coordinates = {"x": self.data_x[:, 0]}
+        self._selection_coordinates = {
+            str(key): np.asarray(value).reshape(-1)
+            for key, value in dict(coordinates or {}).items()
+        }
+        if selection_values is None and self.raster_grid is not None:
+            selection_values = self.data_y[:, 0].reshape(self.raster_grid.shape)
+        self._selection_values = self.data_y if selection_values is None else np.asarray(selection_values)
+        self._selection_mode = mode
+        self._selection_frame = str(selection_frame or "data")
+        self._selection_scope = tuple(str(value) for value in selection_scope)
         self.ylabel_original = self.labels[1] if len(self.labels) > 1 else first_ax.get_ylabel()
         self.unit = unit or self._infer_unit(first_ax.get_xlabel())
         self.unit_original = self.info.get("unit", self.unit)
@@ -145,16 +456,16 @@ class DataFigure:
 
         self.p0 = None
         self.popt = None
-        self.fit = None
+        self._fit_artists = None
         self.fit_func = None
         self.text = None
+        self.last_fit_result: FitResult | None = None
         self._scatter_list = []
         # The SOURCE binding (hub + producing node + wired inputs), copied from the live plot when this
         # DataFigure wraps one, so ``save`` can write the RICH npz (``info['signals']`` +
         # ``info['provenance']``) through the ONE core capture -- the SAME logic the console panel uses.
         # ``None`` (a bare array DataFigure) => ``save`` writes the basic figure+npz (old behaviour).
         self._figure_source = getattr(live_plot, "_figure_source", None)
-        warnings.filterwarnings("ignore", category=OptimizeWarning)
 
     @staticmethod
     def _infer_unit(label: str) -> str:
@@ -224,14 +535,11 @@ class DataFigure:
         extra_info: Mapping[str, Any] | None = None,
         image_ext: str = "png",
     ) -> dict[str, Path]:
-        """Save the figure image and a matching ``.npz`` payload.
+        """Save the image plus the one current, versioned saved-figure artifact.
 
-        When this figure carries a SOURCE binding (``bind_source`` / a plot created from live signals),
-        the save is RICH: it folds ``info['signals']`` (raw hub blocks + roles, so a site map's underlay
-        frame + centres round-trip) and ``info['provenance']`` (the device state the data was taken under)
-        captured through the ONE frontend-neutral core -- identical to the console panel's Save.  An
-        explicit ``extra_info`` key WINS over the auto-capture (the GUI passes its own richer blocks), and
-        a bare array figure (no binding) writes just the basic figure+npz."""
+        The artifact always names its plot kind, typed signal blocks and replay recipe (``None`` for an
+        array figure).  A source-bound figure must capture its value signal; a structured figure must
+        carry its complete recipe.  Neither case silently degrades to flattened arrays."""
         current_time = time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime())
         stem = "_".join(p for p in (self.name, current_time) if p)
         base = resolve_save_base(path, stem)
@@ -239,48 +547,93 @@ class DataFigure:
         data_path = base.with_suffix(".npz")
         info = {
             **self.info,
-            **self._rich_capture(),          # auto signals/provenance (bound figure); {} for a bare plot
-            **dict(extra_info or {}),         # an explicit caller block WINS over the auto-capture
+            **self._rich_capture(),
+            **dict(extra_info or {}),
             "labels": self.labels,
             "name": self.name,
             "unit": self.unit_original,
             "points_done": getattr(self.live_plot, "points_done", len(self.data_x)),
             "repeat_cur": getattr(self.live_plot, "repeat_cur", 1),
         }
-        # Fold the CURRENT view unit + any applied fit into ``info`` so a reload
-        # reproduces "the figure as saved" (not just the raw arrays): ``unit`` is
-        # the display unit, and a fit -- if one has been drawn -- carries its
-        # function name, coefficients and parameter names so a reader can see /
-        # re-apply it.  These only APPEND keys; the data_x/data_y/info structure
-        # is unchanged, so an older reader still reads the file.
-        fit_info = self._saved_fit_info()
-        if fit_info is not None:
-            info.setdefault("fit", fit_info)
-        # Stamp the plotter's OWN kind (reverse-looked-up from the ONE PLOT_KINDS table) so a bare
-        # ``plot.save()`` round-trips ``SavedFigure.kind`` to the SAME kind that drew it -- a
-        # HistogramFigure save reopens as ``hist`` (not a fallback 1-D line), a LiveSiteMap save as
-        # ``sites`` (rings, not a 2-D image), a grid as ``grid``.  Only when NEITHER ``self.info`` nor an
-        # explicit ``extra_info`` already carries a kind (those WIN -- e.g. the GUI panel stamps its own),
-        # and only when there IS a bound plotter to ask (a bare array DataFigure has nothing to stamp).
+        info.setdefault("view", {})
+        info.setdefault("fit", self._saved_fit_info())
         if "kind" not in info and self.live_plot is not None:
             from .live import kind_for_plotter
-            auto_kind = kind_for_plotter(self.live_plot)
-            if auto_kind is not None:
-                info["kind"] = auto_kind
-        # SELF-CONTAINED site map: a bare LiveSiteMap save (no hub binding -- the calibration report, a
-        # notebook site map) has no ``info['signals']`` from the rich capture, so a reopen would show
-        # rings on an EMPTY board (the underlay camera frame was never stored -- the reported bug where
-        # site_map.npz was ~1 KB).  Fold the plot's OWN centres + background frame into ``info['signals']``
-        # (the SAME faithful-path blocks a rich save writes), so the figure's data is self-contained: the
-        # reopen rebuilds the rings AND the template underlay without any device provenance.  Only when no
-        # signals block already exists (a rich save's WINS).
-        if info.get("kind") == "sites" and not info.get("signals"):
-            underlay = self._sites_underlay_signals()
-            if underlay:
-                info["signals"] = underlay
+            info["kind"] = kind_for_plotter(self.live_plot)
+        if not info.get("kind"):
+            raise ValueError("saving an explicit DataFigure requires info['kind']; plotter kind cannot be inferred.")
+        recipe = info.get("figure_recipe")
+        info.setdefault("figure_recipe", None)
+        info.setdefault(
+            "size",
+            str((recipe or {}).get("panel_size") or getattr(self.live_plot, "_size", None) or "2x2"),
+        )
+        if "provenance" not in info:
+            raise ValueError("saved figure capture must provide explicit provenance.")
+
+        kind = str(info["kind"])
+        signals = info.get("signals")
+        if kind in _STRUCTURED_FIGURE_KINDS:
+            info["signals"] = dict(signals or {})
+        elif signals:
+            info["signals"] = dict(signals)
+        elif self._figure_source is not None:
+            raise ValueError("source-bound figure save could not capture its required value signal.")
+        elif kind == "sites":
+            info["signals"] = self._sites_underlay_signals()
+        else:
+            info["signals"] = self._array_signals(kind)
+
+        if kind not in _STRUCTURED_FIGURE_KINDS \
+                and not any(entry.get("role") == "value" for entry in info["signals"].values()):
+            raise ValueError(f"saved {kind!r} figure requires exactly one explicit value signal.")
         self.fig.savefig(image_path, bbox_inches="tight")
-        np.savez(data_path, data_x=self.data_x_original, data_y=self.data_y, info=info)
+        _write_saved_npz(data_path, data_x=np.asarray(self.data_x_original), data_y=self.data_y, info=info)
         return {"figure": image_path, "data": data_path}
+
+    def _array_signals(self, kind: str) -> dict[str, Any]:
+        """Typed signal records for an unbound array figure, preserving every trailing data axis."""
+        x = np.asarray(self.data_x_original)
+        y = np.asarray(self.data_y)
+        if kind == "2d":
+            if self.raster_grid is not None:
+                image_shape = tuple(self.raster_grid.shape)
+            elif x.ndim == 2 and x.shape[1] >= 2 and x.shape[0] == y.shape[0]:
+                image_shape = (int(np.unique(x[:, 1]).size), int(np.unique(x[:, 0]).size))
+                if int(np.prod(image_shape, dtype=np.int64)) != y.shape[0]:
+                    raise ValueError("2d figure coordinates do not describe one complete regular raster.")
+            else:
+                raise ValueError("2d figure save requires an explicit RegularRaster or complete (x,y) grid.")
+            if y.ndim != 2 or y.shape[1] != 1:
+                raise ValueError(f"2d figure data_y must be one scalar per raster point, got {y.shape}.")
+            image = y[:, 0].reshape(image_shape)
+            return {
+                "value": {
+                    "block": image.reshape(1, 1, *image_shape),
+                    "points_shape": [1],
+                    "data_shape": list(image_shape),
+                    "label": str(self.labels[2] if len(self.labels) > 2 else self.labels[1]),
+                    "unit": "",
+                    "role": "value",
+                }
+            }
+
+        def one(name: str, array: np.ndarray, label: str, role: str) -> tuple[str, dict[str, Any]]:
+            shape = list(array.shape) if array.ndim else [1]
+            value = array if array.ndim else array.reshape(1)
+            return name, {
+                "block": value.reshape(1, 1, *shape),
+                "points_shape": [1],
+                "data_shape": shape,
+                "label": str(label),
+                "unit": "",
+                "role": role,
+            }
+
+        return dict((
+            one("value", y, self.labels[1] if len(self.labels) > 1 else "Y", "value"),
+            one("x", x, self.labels[0] if self.labels else "X", "x"),
+        ))
 
     def _sites_underlay_signals(self) -> dict[str, Any]:
         """The self-contained ``info['signals']`` blocks a bare SITE-MAP save folds in so a reopen rebuilds
@@ -306,7 +659,11 @@ class DataFigure:
         signals: dict[str, Any] = {
             "value": {"block": occ, "points_shape": [1], "data_shape": [n],
                       "label": str(ylabel), "unit": "", "role": "value"},
-            "centers": {"block": centers, "points_shape": None, "data_shape": None,
+            # ``centers`` is auxiliary external data, not a scan axis: one logical point whose
+            # complete (N, 2) table is the datum.  Store its canonical tensor and full schema instead
+            # of making the loader infer meaning from the rank.
+            "centers": {"block": centers.reshape(1, 1, n, 2),
+                        "points_shape": [1], "data_shape": [n, 2],
                         "label": "site centre", "unit": "px", "role": "centers"},
         }
         if background is not None:
@@ -341,45 +698,52 @@ class DataFigure:
             return round((value - self.grid_center[0]) / self.step_x) * self.step_x + self.grid_center[0]
         return round((value - self.grid_center[1]) / self.step_y) * self.step_y + self.grid_center[1]
 
-    def _valid_index(self) -> np.ndarray:
-        return np.array([i for i, row in enumerate(self.data_y) if np.isfinite(row[0])], dtype=int)
+    def selection(self) -> Selection:
+        """Return the current semantic selection in plot coordinates.
 
-    def _select_fit(self, min_num: int = 2):
-        valid_index = self._valid_index()
-        if valid_index.size == 0:
-            raise ValueError("No finite data points are available for fitting.")
+        Every plot uses the same named-axis contract: traces/monitors select
+        ``x``; distributions select ``value`` (their x axis); images/site maps
+        select ``x`` and ``y``.  A drawn area wins, otherwise the current view
+        limits are the selection.  Grid cells carry their immutable scope so a
+        cell-local selection can never be mistaken for a global one.
+        """
 
-        if self.plot_type == "1D":
-            x = self.data_x[valid_index, 0]
-            y = self.data_y[valid_index, 0]
-            area = getattr(self.area, "range", [None, None, None, None])
-            if area[0] is None:
-                xlim = self._ax.get_xlim()
-                xl, xh = sorted(xlim)
-            else:
-                xl, xh = sorted(area[:2])
-            mask = (x >= xl) & (x <= xh)
-            if int(mask.sum()) <= min_num:
-                return x, y
-            return x[mask], y[mask]
-
-        x_all = self.data_x[valid_index, 0]
-        y_all = self.data_x[valid_index, 1]
-        z_all = self.data_y[valid_index, 0]
         area = getattr(self.area, "range", [None, None, None, None])
-        if area[0] is None:
-            xl, xh = sorted(self._ax.get_xlim())
-            yl, yh = sorted(self._ax.get_ylim())
+        if area is not None and len(area) >= 4 and area[0] is not None:
+            xl, xh, yl, yh = (float(value) for value in area[:4])
         else:
-            xl, xh, yl, yh = area
-            xl, xh = sorted([xl, xh])
-            yl, yh = sorted([yl, yh])
-        xl, xh = [self._align_to_grid(v, "x") for v in (xl, xh)]
-        yl, yh = [self._align_to_grid(v, "y") for v in (yl, yh)]
-        mask = (x_all >= xl) & (x_all <= xh) & (y_all >= yl) & (y_all <= yh)
-        if int(mask.sum()) <= min_num:
-            return (x_all, y_all), z_all
-        return (x_all[mask], y_all[mask]), z_all[mask]
+            xl, xh = (float(value) for value in self._ax.get_xlim())
+            yl, yh = (float(value) for value in self._ax.get_ylim())
+        if self._selection_mode == "xy":
+            xl, xh = (self._align_to_grid(value, "x") for value in sorted((xl, xh)))
+            yl, yh = (self._align_to_grid(value, "y") for value in sorted((yl, yh)))
+            return Selection.rectangle(
+                xl, xh, yl, yh, frame=self._selection_frame, scope=self._selection_scope)
+        if self._selection_mode == "value":
+            return Selection.value(
+                xl, xh, frame=self._selection_frame, scope=self._selection_scope)
+        return Selection.x(xl, xh, frame=self._selection_frame, scope=self._selection_scope)
+
+    def selected_data(self, selection: Selection | None = None) -> SelectedData:
+        """Vectorized selected rows shared by fitting and external data actions.
+
+        Missing axes or an undersized selection remain explicit; this method
+        never falls back to the full dataset merely because the chosen region is
+        small.
+        """
+
+        selected = selection or self.selection()
+        if self.raster_grid is not None:
+            # Materialising coordinate rows is reserved for this explicit data-extraction action;
+            # live fitting takes the compact fit_image path below.
+            return select_rows(
+                self.raster_grid.coordinate_mapping(),
+                np.asarray(self._selection_values).reshape(-1),
+                selected,
+                finite=True,
+            )
+        return select_rows(
+            self._selection_coordinates, self._selection_values, selected, finite=True)
 
     def _place_text(self, ax: plt.Axes, text) -> None:
         candidates = [
@@ -459,286 +823,113 @@ class DataFigure:
                 line.set_alpha(0.5)
         if self.plot_type == "1D" and len(self.data_y) < 2000:
             self._line_to_scatter()
-        # No draw here: this method's ONE caller (_fit_and_draw) places the fit CURVE right after and
+        # No draw here: the rendering adapter places the fit curve immediately after and
         # issues the single terminal draw_idle.  Drawing here too was a premature + redundant full
         # repaint -- it painted the annotation BEFORE the curve existed, then the whole figure again.
 
-    @staticmethod
-    def _clean_param_name(name: str) -> str:
-        return re.sub(r"[\$\\{}]", "", name)
+    def _draw_fit_result(self, result: FitResult, *, is_display: bool) -> None:
+        """Thin Matplotlib adapter for the headless core result."""
 
-    def _fit_and_draw(self, is_fit: bool, is_display: bool, kwargs: Mapping[str, Any]) -> tuple[np.ndarray | None, Any]:
-        for idx, param in enumerate(self.popt_str):
-            clean = self._clean_param_name(param)
-            fixed = kwargs.get(clean, None)
-            if fixed is None:
-                continue
-            low, high = np.sort([fixed * (1 - 1e-5), fixed * (1 + 1e-5)])
-            if low == high:
-                low, high = fixed - 1e-12, fixed + 1e-12
-            self.bounds[0][idx], self.bounds[1][idx] = low, high
-            for p0 in self.p0_list:
-                p0[idx] = fixed
+        self.last_fit_result = result
+        self.fit_func = result.model
+        self.popt = result.popt
+        self.popt_str = list(result.names)
+        if not result.valid:
+            # A failed live fit must remove the previous overlay just as the
+            # processor publishes NaN/valid=0; stale success is never displayed.
+            self.clear()
+            self.fit_func = result.model
+            self.last_fit_result = result
+            return
 
-        if is_fit:
-            loss_min = np.inf
-            popt = None
-            pcov = None
-            for p0 in self.p0_list:
-                try:
-                    popt_cur, pcov_cur = curve_fit(self._fit_func, self.data_x_p, self.data_y_p, p0=p0, bounds=self.bounds)
-                    loss_cur = np.sum((self._fit_func(self.data_x_p, *popt_cur) - self.data_y_p) ** 2)
-                    if loss_cur < loss_min:
-                        loss_min = loss_cur
-                        popt = popt_cur
-                        pcov = pcov_cur
-                except Exception:
-                    continue
-            if popt is None:
-                return None, None
-        else:
-            popt, pcov = np.asarray(self.p0_list[0], dtype=float), None
-
-        self.popt = popt
-        self._display_popt(popt, self.popt_str, is_display)
+        spec = fit_model(result.model)
+        self.formula_str = spec.formula
+        self._display_popt(result.parameters, result.names, is_display)
         ax = self._ax
-        if self.plot_type == "1D":
-            yfit = self._fit_func(self.data_x[:, 0], *popt)
-            if self.fit is None:
-                self.fit = ax.plot(self.data_x[:, 0], yfit, color=PALETTE["fit_right"], linestyle="-", linewidth=2, alpha=0.5)
-            else:
-                self.fit[0].set_data(self.data_x[:, 0], yfit)
+        if spec.family == "1d":
+            x = np.asarray(self._selection_coordinates["x"], dtype=float)
+            order = np.argsort(x)
+            yfit = spec.function(x[order], *result.parameters)
+            self._fit_artists = ax.plot(
+                x[order], yfit, color=PALETTE["fit_right"], linestyle="-",
+                linewidth=2, alpha=0.5)
         else:
-            if self.fit is None:
-                # SAME style as always -- a centre DOT + the fitted-radius CIRCLE (that pairing is fixed).
-                # The DOT is a small LOCATOR (scatter ``s`` is absolute points^2, so a big dot blots the
-                # atom out on a 100px grid thumbnail); the RING is the READABLE element (its radius is data
-                # coords, so it shrinks with the cell -- it must be bold + opaque to stay legible over the
-                # noise/spot).  ``s`` small + ``lw``/``alpha`` up rebalances the two so both read on a tiny
-                # thumbnail AND the full focus view -- one primitive, no per-scale special case.
-                self.fit = [ax.scatter(popt[-2], popt[-1], color=PALETTE["fit_right"],
-                                       s=_CENTER_DOT_SIZE)]
-                circle = matplotlib.patches.Circle(
-                    (popt[-2], popt[-1]),
-                    radius=abs(popt[-3]),
-                    edgecolor=PALETTE["fit_right"],
-                    facecolor="none",
-                    linewidth=_CENTER_RING_LW,
-                    alpha=_CENTER_RING_ALPHA,
-                )
-                self.fit.append(circle)
-                ax.add_patch(circle)
-            else:
-                self.fit[0].set_offsets((popt[-2], popt[-1]))
-                self.fit[1].set_center((popt[-2], popt[-1]))
-                self.fit[1].set_radius(abs(popt[-3]))
+            params = result.parameter_map()
+            x0, y0, radius = params["x0"], params["y0"], abs(params["radius"])
+            self._fit_artists = [ax.scatter(x0, y0, color=PALETTE["fit_right"], s=_CENTER_DOT_SIZE)]
+            circle = matplotlib.patches.Circle(
+                (x0, y0), radius=radius, edgecolor=PALETTE["fit_right"], facecolor="none",
+                linewidth=_CENTER_RING_LW, alpha=_CENTER_RING_ALPHA)
+            self._fit_artists.append(circle)
+            ax.add_patch(circle)
         self.fig.canvas.draw_idle()
-        return popt, pcov
 
-    def lorent(self, p0=None, is_display: bool = True, is_fit: bool = True, **kwargs):
-        if self.plot_type == "2D":
-            return FitResult(["x_0", "FWHM", "H", "B"], None, None, "lorent"), None
-        self.data_x_p, self.data_y_p = self._select_fit(min_num=4)
-        self.formula_str = r"$f(x)=H\frac{(FWHM/2)^2}{(x-x_0)^2+(FWHM/2)^2}+B$"
+    def fit_model(
+        self,
+        model: str,
+        *,
+        request: FitRequest | None = None,
+        selection: Selection | None = None,
+        initial: Sequence[float] | None = None,
+        fixed: Mapping[str, float] | None = None,
+        is_display: bool = True,
+        is_fit: bool = True,
+        sample_budget: int = 12_000,
+        max_evaluations: int = 4_000,
+    ) -> FitResult:
+        """Fit this plot through the single headless fitting engine."""
 
-        def _lorent(x, center, full_width, height, bg):
-            return height * ((full_width / 2) ** 2) / ((x - center) ** 2 + (full_width / 2) ** 2) + bg
-
-        self._fit_func = _lorent
-        if p0 is None:
-            span = abs(self.data_x_p[0] - self.data_x_p[-1]) or 1
-            amp = abs(np.nanmax(self.data_y_p) - np.nanmin(self.data_y_p)) or 1
-            self.p0_list = [
-                [self.data_x_p[np.nanargmax(self.data_y_p)], span / 4, amp, np.nanmin(self.data_y_p)],
-                [self.data_x_p[np.nanargmin(self.data_y_p)], span / 4, -amp, np.nanmax(self.data_y_p)],
-            ]
+        spec = fit_model(model)
+        if request is None:
+            request = FitRequest(
+                spec.key,
+                selection=selection or self.selection(),
+                initial=None if initial is None else tuple(float(value) for value in initial),
+                fixed=dict(fixed or {}),
+                sample_budget=int(sample_budget),
+                max_evaluations=int(max_evaluations),
+                coordinate_frame=self._selection_frame,
+                solve=bool(is_fit),
+            )
+        actual_family = "2d" if self.raster_grid is not None \
+            or "y" in self._selection_coordinates else "1d"
+        if spec.family != actual_family:
+            result = FitResult.invalid(
+                spec,
+                f"{spec.key} is a {spec.family} model but this plot supplies {actual_family} data",
+                coordinate_frame=request.coordinate_frame,
+            )
+        elif self.raster_grid is not None:
+            result = fit_image(
+                np.asarray(self._selection_values).reshape(self.raster_grid.shape),
+                request,
+                grid=self.raster_grid,
+            )
         else:
-            self.p0_list = [list(p0)]
-        width = abs(self.p0_list[0][1]) or 1
-        yrange = abs(np.nanmax(self.data_y_p) - np.nanmin(self.data_y_p)) or 1
-        self.bounds = [
-            [np.nanmin(self.data_x_p), width / 10, -10 * yrange, np.nanmin(self.data_y_p) - 10 * yrange],
-            [np.nanmax(self.data_x_p), width * 10, 10 * yrange, np.nanmax(self.data_y_p) + 10 * yrange],
-        ]
-        self.popt_str = ["x_0", "FWHM", "H", "B"]
-        popt, pcov = self._fit_and_draw(is_fit, is_display, kwargs)
-        self.fit_func = "lorent"
-        return FitResult(self.popt_str, popt, pcov, self.fit_func), popt
+            result = fit_data(self._selection_coordinates, self._selection_values, request)
+        # Exactly one overlay at a time.  Remove the old artists without changing
+        # the current semantic selection, then draw the new result if valid.
+        if self._fit_artists is not None or self.text is not None:
+            self.clear()
+        self._draw_fit_result(result, is_display=is_display)
+        return result
 
-    def gaussian(self, p0=None, is_display: bool = True, is_fit: bool = True, **kwargs):
-        # NOTE (DRY boundary, #H3w-5): this is the INTERACTIVE CURVE-FIT model for a 1-D plot -- a peak
-        # on a BACKGROUND, so it carries an ``offset`` (B) term and amplitude may be negative (a dip).
-        # It is deliberately DISTINCT from ``_readout_math.gaussian`` (a normalised, offset-free PEAK
-        # used by the per-site readout fidelity math).  Different models for different jobs -- do NOT
-        # "unify" them; the offset here would corrupt the readout overlap integral, and removing it
-        # would break fitting a peak that sits on a pedestal.
-        if self.plot_type == "2D":
-            return FitResult(["A", "B", "sigma", "x_0"], None, None, "gaussian"), None
-        self.data_x_p, self.data_y_p = self._select_fit(min_num=4)
-        self.formula_str = r"$f(x)=Ae^{-(x-x_0)^2/(2\sigma^2)}+B$"
+    def fit(self, model: str, **kwargs) -> FitResult:
+        """The sole public fit entry: choose a registered model by key."""
 
-        def _gaussian(x, amplitude, offset, sigma, x0):
-            return amplitude * np.exp(-((x - x0) ** 2) / (2 * sigma**2)) + offset
-
-        self._fit_func = _gaussian
-        if p0 is None:
-            amp = np.nanmax(self.data_y_p) - np.nanmin(self.data_y_p)
-            offset = np.nanmin(self.data_y_p)
-            sigma = abs(self.data_x_p[-1] - self.data_x_p[0]) / 6 or 1
-            x0 = self.data_x_p[np.nanargmax(self.data_y_p)]
-            self.p0_list = [[amp, offset, sigma, x0], [-amp, np.nanmax(self.data_y_p), sigma, x0]]
-        else:
-            self.p0_list = [list(p0)]
-        yrange = abs(np.nanmax(self.data_y_p) - np.nanmin(self.data_y_p)) or 1
-        sigma0 = abs(self.p0_list[0][2]) or 1
-        self.bounds = [
-            [-10 * yrange, np.nanmin(self.data_y_p) - 10 * yrange, sigma0 / 20, np.nanmin(self.data_x_p)],
-            [10 * yrange, np.nanmax(self.data_y_p) + 10 * yrange, sigma0 * 20, np.nanmax(self.data_x_p)],
-        ]
-        self.popt_str = ["A", "B", "sigma", "x_0"]
-        popt, pcov = self._fit_and_draw(is_fit, is_display, kwargs)
-        self.fit_func = "gaussian"
-        return FitResult(self.popt_str, popt, pcov, self.fit_func), popt
-
-    def lorent_zeeman(self, p0=None, is_display: bool = True, is_fit: bool = True, **kwargs):
-        if self.plot_type == "2D":
-            return FitResult(["x_0", "FWHM", "H", "B", "delta"], None, None, "lorent_zeeman"), None
-        self.data_x_p, self.data_y_p = self._select_fit(min_num=5)
-        self.formula_str = r"$f(x)=H(L(\delta/2)+L(-\delta/2))+B$"
-
-        def _lorent_zeeman(x, center, full_width, height, bg, split):
-            return height * ((full_width / 2) ** 2) / ((x - center - split / 2) ** 2 + (full_width / 2) ** 2) + height * (
-                (full_width / 2) ** 2
-            ) / ((x - center + split / 2) ** 2 + (full_width / 2) ** 2) + bg
-
-        self._fit_func = _lorent_zeeman
-        if p0 is None:
-            amp = np.nanmax(self.data_y_p) - np.nanmin(self.data_y_p)
-            peaks, props = find_peaks(self.data_y_p, width=1, prominence=abs(amp) / 8 if amp else None)
-            if len(peaks) == 0:
-                return FitResult([], None, None, "lorent_zeeman"), None
-            largest = peaks[np.argsort(self.data_y_p[peaks])[::-1]]
-            step = abs(self.data_x_p[1] - self.data_x_p[0]) if len(self.data_x_p) > 1 else 1
-            width = float(props["widths"][np.argsort(self.data_y_p[peaks])[-1]] * step)
-            self.p0_list = []
-            for second_peak in largest[: min(4, len(largest))]:
-                center = self.data_x_p[int(np.mean([largest[0], second_peak]))]
-                split = abs((self.data_x_p[second_peak] - center) * 2)
-                self.p0_list.append([center, width or step, amp, np.nanmin(self.data_y_p), split])
-        else:
-            self.p0_list = [list(p0)]
-        width = abs(self.p0_list[0][1]) or 1
-        yrange = abs(np.nanmax(self.data_y_p) - np.nanmin(self.data_y_p)) or 1
-        xrange = abs(self.data_x_p[-1] - self.data_x_p[0]) or 1
-        self.bounds = [
-            [np.nanmin(self.data_x_p), width / 10, -10 * yrange, np.nanmin(self.data_y_p) - 10 * yrange, 0],
-            [np.nanmax(self.data_x_p), width * 10, 10 * yrange, np.nanmax(self.data_y_p) + 10 * yrange, 2 * xrange],
-        ]
-        self.popt_str = ["x_0", "FWHM", "H", "B", "delta"]
-        popt, pcov = self._fit_and_draw(is_fit, is_display, kwargs)
-        self.fit_func = "lorent_zeeman"
-        return FitResult(self.popt_str, popt, pcov, self.fit_func), popt
-
-    def rabi(self, p0=None, is_display: bool = True, is_fit: bool = True, **kwargs):
-        if self.plot_type == "2D":
-            return FitResult(["A", "B", "f", "tau", "phi"], None, None, "rabi"), None
-        self.data_x_p, self.data_y_p = self._select_fit(min_num=5)
-        self.formula_str = r"$f(x)=A\sin(2{\pi}fx+\varphi)e^{-x/\tau}+B$"
-
-        def _rabi(x, amplitude, offset, omega, decay, phi):
-            return amplitude * np.sin(2 * np.pi * omega * x + phi) * np.exp(-x / decay) + offset
-
-        self._fit_func = _rabi
-        if p0 is None:
-            amp = abs(np.nanmax(self.data_y_p) - np.nanmin(self.data_y_p)) / 2 or 1
-            offset = np.nanmean(self.data_y_p)
-            delta_x = self.data_x_p[1] - self.data_x_p[0] if len(self.data_x_p) > 1 else 1
-            y_detrended = self.data_y_p - offset
-            freq = np.fft.fftfreq(len(y_detrended), d=delta_x)
-            vals = np.fft.fft(y_detrended)
-            mask = freq > 0
-            omega = abs(freq[mask][np.argmax(np.abs(vals[mask]))]) if np.any(mask) else 1 / (abs(delta_x) * len(y_detrended))
-            decay = abs(self.data_x_p[-1] - self.data_x_p[0]) or 1
-            self.p0_list = [[amp, offset, omega, decay, np.pi / 2], [-amp, offset, omega, decay, np.pi / 2]]
-        else:
-            self.p0_list = [list(p0)]
-        amp0, off0, om0, dec0, phi0 = self.p0_list[0]
-        yrange = abs(np.nanmax(self.data_y_p) - np.nanmin(self.data_y_p)) or 1
-        self.bounds = [
-            [-5 * abs(amp0), off0 - 2 * yrange, max(abs(om0) / 10, 1e-15), max(abs(dec0) / 20, 1e-15), phi0 - np.pi],
-            [5 * abs(amp0), off0 + 2 * yrange, max(abs(om0) * 10, 1e-15), max(abs(dec0) * 20, 1e-15), phi0 + np.pi],
-        ]
-        self.popt_str = ["A", "B", "f", "tau", "phi"]
-        popt, pcov = self._fit_and_draw(is_fit, is_display, kwargs)
-        self.fit_func = "rabi"
-        return FitResult(self.popt_str, popt, pcov, self.fit_func), popt
-
-    def decay(self, p0=None, is_display: bool = True, is_fit: bool = True, **kwargs):
-        if self.plot_type == "2D":
-            return FitResult(["A", "B", "tau"], None, None, "decay"), None
-        self.data_x_p, self.data_y_p = self._select_fit(min_num=3)
-        self.formula_str = r"$f(x)=Ae^{-x/\tau}+B$"
-
-        def _exp_decay(x, amplitude, offset, decay):
-            return amplitude * np.exp(-x / decay) + offset
-
-        self._fit_func = _exp_decay
-        if p0 is None:
-            amp = abs(np.nanmax(self.data_y_p) - np.nanmin(self.data_y_p)) or 1
-            offset = np.nanmean(self.data_y_p)
-            decay = abs(self.data_x_p[-1] - self.data_x_p[0]) / 2 or 1
-            self.p0_list = [[amp, offset, decay], [-amp, offset, decay]]
-        else:
-            self.p0_list = [list(p0)]
-        yrange = abs(np.nanmax(self.data_y_p) - np.nanmin(self.data_y_p)) or 1
-        decay0 = abs(self.p0_list[0][2]) or 1
-        off0 = self.p0_list[0][1]
-        self.bounds = [[-4 * yrange, off0 - yrange, decay0 / 10], [4 * yrange, off0 + yrange, decay0 * 10]]
-        self.popt_str = ["A", "B", "tau"]
-        popt, pcov = self._fit_and_draw(is_fit, is_display, kwargs)
-        self.fit_func = "decay"
-        return FitResult(self.popt_str, popt, pcov, self.fit_func), popt
-
-    def center(self, p0=None, is_display: bool = True, is_fit: bool = True, **kwargs):
-        if self.plot_type == "1D":
-            return FitResult(["A", "B", "R", "x0", "y0"], None, None, "center"), None
-        self.data_x_p, self.data_y_p = self._select_fit(min_num=5)
-        self.formula_str = r"$f(r)=Ae^{-(r-(x0,y0))^2/R^2}+B$"
-        # The ONE center-model definition (shared with the hub-side FitProcessor) lives in the
-        # dependency-free math seam, so a fitted (x0, y0) means the same thing on both sides.
-        from Zou_lab_control._readout_math import gaussian2d_center
-        self._fit_func = gaussian2d_center
-        if p0 is None:
-            amp = abs(np.nanmax(self.data_y_p) - np.nanmin(self.data_y_p)) or 1
-            offset = np.nanmean(self.data_y_p)
-            top = np.argsort(self.data_y_p)[::-1][: min(5, len(self.data_y_p))]
-            size = np.hypot(np.ptp(self.data_x_p[0][top]), np.ptp(self.data_x_p[1][top])) or 1
-            x0 = float(np.nanmean(self.data_x_p[0][top]))
-            y0 = float(np.nanmean(self.data_x_p[1][top]))
-            self.p0_list = [[amp, offset, size, x0, y0]]
-        else:
-            self.p0_list = [list(p0)]
-        amp0, off0, size0, *_ = self.p0_list[0]
-        self.bounds = [
-            [-5 * abs(amp0), off0 - abs(off0) - abs(amp0), abs(size0) / 20, np.nanmin(self.data_x_p[0]), np.nanmin(self.data_x_p[1])],
-            [5 * abs(amp0), off0 + abs(off0) + abs(amp0), abs(size0) * 20, np.nanmax(self.data_x_p[0]), np.nanmax(self.data_x_p[1])],
-        ]
-        self.popt_str = ["A", "B", "R", "x0", "y0"]
-        popt, pcov = self._fit_and_draw(is_fit, is_display, kwargs)
-        self.fit_func = "center"
-        return FitResult(self.popt_str, popt, pcov, self.fit_func), popt
+        return self.fit_model(model, **kwargs)
 
     def clear(self) -> None:
         if self.text is not None:
             self.text.remove()
             self.text = None
-        if self.fit is not None:
-            for artist in self.fit:
+        if self._fit_artists is not None:
+            for artist in self._fit_artists:
                 try:
                     artist.remove()
                 except Exception:
                     pass
-            self.fit = None
+            self._fit_artists = None
         self._scatter_to_line()
         lines = getattr(self.live_plot, "lines", None) if self.live_plot is not None else self._ax.lines
         for line in lines:
@@ -818,11 +1009,11 @@ class DataFigure:
                 self.cross.vline.set_xdata([new_x, new_x])
             if getattr(self.cross, "point", None) is not None:
                 self.cross.point.set_xdata([new_x])
-        if self.fit is not None and self.fit_func in VALID_FIT_FUNCS:
+        if self._fit_artists is not None and self.fit_func:
             prev_fit = self.fit_func
             self.clear()
             try:
-                getattr(self, prev_fit)(is_display=True)
+                self.fit(prev_fit, is_display=True)
             except Exception:
                 pass
 
@@ -921,13 +1112,17 @@ class SavedFigure:
         self.path = Path(path) if path is not None else None
         self.data_x = np.asarray(data_x)
         self.data_y = np.asarray(data_y)
-        self.info = dict(info or {})
-        self.view = dict(self.info.get(_VIEW_INFO_KEY) or {})
+        self.info = dict(info)
+        required = _SAVED_PLOT_KEYS | {"signals", "figure_recipe", "provenance"}
+        missing = sorted(required - set(self.info))
+        if missing:
+            raise ValueError(f"SavedFigure requires the validated current schema; missing={missing}.")
+        self.view = dict(self.info[_VIEW_INFO_KEY])
 
-    # -- provenance accessors (all read from ``info``, with sane defaults for old npz) ---------
+    # -- validated artifact accessors ----------------------------------------------------------
     @property
-    def kind(self) -> str | None:
-        return self.info.get("kind")
+    def kind(self) -> str:
+        return self.info["kind"]
 
     @property
     def figure_recipe(self) -> Mapping[str, Any] | None:
@@ -937,21 +1132,19 @@ class SavedFigure:
         <PulseTableState.to_dict()>, "include_always_off": ...}``.  ``None`` for an ordinary array figure
         (a scan / hist / site map), whose ``data_x`` / ``data_y`` ARE the faithful source.  The dispatch
         is by ``recipe['kind']``, so a new structured-figure family plugs in without touching this seam."""
-        recipe = self.info.get("figure_recipe")
-        return recipe if isinstance(recipe, Mapping) and recipe.get("kind") else None
+        return self.info["figure_recipe"]
 
     @property
-    def name(self) -> str | None:
-        return self.info.get("name")
+    def name(self) -> str:
+        return self.info["name"]
 
     @property
-    def labels(self) -> list[str] | None:
-        labels = self.info.get("labels")
-        return list(labels) if labels is not None else None
+    def labels(self) -> list[str]:
+        return list(self.info["labels"])
 
     @property
-    def unit(self) -> str | None:
-        return self.info.get("unit") or self.view.get("unit")
+    def unit(self) -> str:
+        return self.info["unit"]
 
     @property
     def shape(self) -> dict[str, tuple[int, ...]]:
@@ -1068,14 +1261,20 @@ class SavedFigure:
         recipe is self-describing."""
         recipe = self.figure_recipe
         if recipe is not None:
+            if kind is not None and kind != recipe["kind"]:
+                raise ValueError(
+                    f"structured figure kind {recipe['kind']!r} cannot be reinterpreted as {kind!r}.")
+            if size is not None or overrides:
+                raise ValueError("structured figure view is fixed by its replay recipe.")
             return self._replay_recipe(recipe)
+        if kind is not None and kind not in self.compatible_kinds():
+            raise ValueError(f"kind {kind!r} is not compatible with saved kind {self.kind!r}.")
         return self._plot_from_arrays(kind, size, **overrides)
 
     def _replay_recipe(self, recipe: Mapping[str, Any]):
         """Re-render a STRUCTURED figure from its ``figure_recipe`` -- a faithful reproduction from the
-        recipe's OWN source, not the fallback ``data_x`` / ``data_y``.  Dispatch is by ``recipe['kind']``,
-        so each structured-figure family owns its rebuild here (and a new family adds a branch); an
-        unknown recipe kind falls back to the ordinary array ``plot`` so nothing crashes.  Returns the
+        recipe's OWN source, not ``data_x`` / ``data_y``.  Dispatch is by ``recipe['kind']``,
+        so each structured-figure family owns its rebuild here (and a new family adds a branch).  Returns the
         family's figure handle (a single-axes :class:`DataFigure` for pulse; a composite grid handle for
         grid), each carrying ``.fig`` + ``.save``.
 
@@ -1091,8 +1290,7 @@ class SavedFigure:
             return self._replay_pulse(recipe)
         if rkind == "grid":
             return self._replay_grid(recipe)
-        # Unknown structured kind: fall back to the ordinary array reproduction (never crash on reopen).
-        return self._plot_from_arrays()
+        raise ValueError(f"unsupported structured figure recipe kind {rkind!r}.")
 
     def _pulse_state_dict(self, recipe: Mapping[str, Any]) -> dict:
         """The ``PulseTableState.to_dict()`` payload to rebuild the pulse figure from -- resolved from ONE
@@ -1109,15 +1307,13 @@ class SavedFigure:
         devices = prov.get("devices") if isinstance(prov, Mapping) else None
         seq = devices.get("sequencer") if isinstance(devices, Mapping) else None
         payload = seq.get("last_payload_json") if isinstance(seq, Mapping) else None
-        if payload:
+        if payload is not None:
             import json
-            try:
-                data = json.loads(payload) if isinstance(payload, str) else dict(payload)
-                if isinstance(data, Mapping) and "periods" in data:
-                    return dict(data)                        # the device-applied state (provenance-sourced)
-            except Exception:
-                pass
-        return dict(recipe.get("pulse_state") or {})         # preview fallback (editor state, never fired)
+            data = json.loads(payload) if isinstance(payload, str) else payload
+            if not isinstance(data, Mapping):
+                raise TypeError("sequencer provenance last_payload_json must decode to a mapping.")
+            return dict(data)                                # the device-applied state (provenance-sourced)
+        return dict(recipe["pulse_state"])                  # pure preview: editor state is the source
 
     def pulse_state(self):
         """The reproduced pulse ``(PulseTableState, include_always_off)`` for a ``kind="pulse"`` save --
@@ -1182,21 +1378,17 @@ class SavedFigure:
 
     def _plot_from_arrays(self, kind: str | None = None, size: str | None = None, **overrides):
         """The ordinary array-figure reproduction (``data_x`` / ``data_y`` -> :func:`~.live.plot`) -- the
-        ONE array path, used by :meth:`plot` for a non-recipe figure AND as the fallback when a recipe's
-        kind is unknown (so there is a single array-reproduction implementation, not two copies)."""
+        ONE array path, used by :meth:`plot` for a non-recipe figure."""
         from .live import panel_plot_spec, plot as _plot
 
-        use_kind = kind or self.kind or "auto"
-        use_size = size or self.info.get("size", "2x2")
+        use_kind = kind or self.kind
+        use_size = size or self.info["size"]
         kwargs = _view_to_plot_kwargs(self.view)
         if self.labels is not None:
             kwargs.setdefault("labels", self.labels)
         kwargs.update(overrides)
         kwargs = {k: v for k, v in kwargs.items() if k in _VIEW_PLOT_KWARGS}
-        try:
-            spec = panel_plot_spec(use_size)
-        except Exception:
-            spec = None
+        spec = panel_plot_spec(use_size)
         plotter = _plot(self.data_x, self.data_y, kind=use_kind, _spec=spec,
                         display=False, data_figure=True, update=False, **kwargs)
         df = getattr(plotter, "data_figure", None) or plotter.to_data_figure()
@@ -1207,20 +1399,66 @@ class SavedFigure:
 
 
 def _load_saved_npz(path) -> tuple[np.ndarray, np.ndarray, dict]:
-    """Read a ``DataFigure.save`` npz -- the ONE loader every saved-figure reopen path goes
-    through (:func:`load_figure` here and the static ``frontend.load`` in ``live``), so the
-    ``data_x`` / ``data_y`` / ``info`` triple is parsed in exactly one place.  ``info`` is
-    normalised to a plain dict (old payloads may carry none).
+    """Read and validate the one current saved-figure artifact envelope.
 
-    SECURITY: ``allow_pickle=True`` unpickles the ``info`` dict on read.  Saved-figure npz
-    are trusted local artifacts -- only open files you or your lab wrote."""
-    data = np.load(str(path), allow_pickle=True)  # noqa: S301 - local experiment tool, trusted input only
-    if "data_x" not in data.files or "data_y" not in data.files:
-        raise ValueError(f"{path} is not a DataFigure save (missing data_x/data_y).")
-    info = data["info"].item() if "info" in data.files else {}
-    if not isinstance(info, Mapping):
-        info = {}
-    return data["data_x"], data["data_y"], dict(info)
+    SECURITY: object records are trusted local experiment artifacts and therefore use pickle.  The
+    exact schema/version/key/type checks happen before a :class:`SavedFigure` is constructed."""
+    with np.load(str(path), allow_pickle=True) as data:  # noqa: S301 - local experiment tool, trusted input only
+        actual = frozenset(data.files)
+        if actual != _SAVED_FIGURE_KEYS:
+            missing = sorted(_SAVED_FIGURE_KEYS - actual)
+            extra = sorted(actual - _SAVED_FIGURE_KEYS)
+            raise ValueError(
+                f"{path} is not a current saved figure; envelope keys must be exactly "
+                f"{sorted(_SAVED_FIGURE_KEYS)}, missing={missing}, extra={extra}.")
+        schema_array = data["schema"]
+        version_array = data["version"]
+        if schema_array.shape != () or schema_array.dtype.kind not in "US" \
+                or str(schema_array.item()) != _SAVED_FIGURE_SCHEMA:
+            raise ValueError(
+                f"{path} has invalid saved-figure schema; expected {_SAVED_FIGURE_SCHEMA!r}.")
+        if version_array.shape != () or version_array.dtype.kind not in "iu" \
+                or int(version_array.item()) != _SAVED_FIGURE_VERSION:
+            raise ValueError(
+                f"{path} has unsupported saved-figure version; expected {_SAVED_FIGURE_VERSION}.")
+
+        def record(key: str, expected_type):
+            array = data[key]
+            if array.shape != () or array.dtype != object:
+                raise TypeError(f"saved figure {key} must be a scalar object record.")
+            value = array.item()
+            if not isinstance(value, expected_type):
+                expected_name = getattr(expected_type, "__name__", str(expected_type))
+                raise TypeError(f"saved figure {key} must be {expected_name}, got {type(value).__name__}.")
+            return value
+
+        x = _strict_numeric_array(data["data_x"], "saved figure data_x").copy()
+        y = _strict_numeric_array(data["data_y"], "saved figure data_y").copy()
+        plot = _validate_plot_record(record("plot", Mapping))
+        signals = _validate_signals(record("signals", Mapping))
+        recipe_record = data["recipe"]
+        if recipe_record.shape != () or recipe_record.dtype != object:
+            raise TypeError("saved figure recipe must be a scalar object record.")
+        recipe = _validate_recipe(recipe_record.item(), plot["kind"])
+        provenance = _validate_provenance(record("provenance", Mapping))
+        metadata = dict(record("metadata", Mapping))
+        if any(not isinstance(key, str) for key in metadata):
+            raise TypeError("saved figure metadata must be a string-keyed mapping.")
+        collisions = set(metadata) & (_SAVED_PLOT_KEYS | {"signals", "figure_recipe", "provenance"})
+        if collisions:
+            raise ValueError(f"saved figure metadata duplicates reserved fields: {sorted(collisions)}.")
+        if plot["kind"] not in _STRUCTURED_FIGURE_KINDS \
+                and sum(entry["role"] == "value" for entry in signals.values()) != 1:
+            raise ValueError(f"saved {plot['kind']!r} figure requires exactly one value signal.")
+
+    info = {
+        **metadata,
+        **plot,
+        "signals": signals,
+        "figure_recipe": recipe,
+        "provenance": provenance,
+    }
+    return x, y, info
 
 
 def load_figure(path) -> SavedFigure:
@@ -1228,12 +1466,11 @@ def load_figure(path) -> SavedFigure:
 
     The read-back counterpart of save: with no hardware or session, reopen an overnight scan /
     a saved panel to inspect what it holds (``.info_summary()``), list how it can be viewed
-    (``.compatible_kinds()``) or re-render it (``.plot()`` / ``.plot(kind=...)``).  Robust to old
-    payloads that carry only ``data_x`` / ``data_y`` and a minimal ``info``."""
+    (``.compatible_kinds()``) or re-render it (``.plot()`` / ``.plot(kind=...)``)."""
     path = Path(path)
     data_x, data_y, info = _load_saved_npz(path)
     return SavedFigure(data_x=data_x, data_y=data_y, info=info, path=path)
 
 
-__all__ = ["DataFigure", "FitResult", "SavedFigure", "VALID_FIT_FUNCS", "load_figure"]
+__all__ = ["DataFigure", "FitResult", "SavedFigure", "load_figure"]
 

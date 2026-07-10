@@ -89,10 +89,15 @@ class MeasurementTaskResult(ResultObject):
 
 @dataclass
 class CaptureResult(ResultObject):
-    """Raw frame capture plus the plot shown in the notebook."""
+    """Raw frame capture plus the plot shown in the notebook.
+
+    ``sequence`` is present only when this capture actually fired the session's readout
+    pulse.  A free-running camera has no pulse provenance, so recording the unrelated
+    session sequence there would be false provenance rather than a convenience.
+    """
 
     images: list[np.ndarray]
-    sequence: PulseSequence
+    sequence: PulseSequence | None
     plot: Any = None
 
     @property
@@ -103,7 +108,7 @@ class CaptureResult(ResultObject):
         return {
             "frames": len(self.images),
             "image_shape": list(self.image.shape),
-            "sequence": self.sequence.name,
+            "sequence": None if self.sequence is None else self.sequence.name,
         }
 
     def _repr_html_(self) -> str:

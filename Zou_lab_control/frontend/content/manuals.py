@@ -284,7 +284,7 @@ def generate_frontend_manual_figures(asset_dir: Path) -> dict[str, Path]:
     y = 18 * ((0.018 / 2) ** 2) / ((x[:, 0] - 737.095) ** 2 + (0.018 / 2) ** 2) + 3
     y = (y + rng.normal(0, 0.18, size=len(x))).reshape(-1, 1)
     p1 = plot(x, y, labels=("Wavelength (nm)", "Counts/0.1s", "Counts"), relim_mode="tight", display=False)
-    p1.data_figure.lorent(is_display=True)
+    p1.data_figure.fit("lorent", is_display=True)
     one_d = asset_dir / "frontend_1d_fit.pdf"
     _save_plot_figure(p1, one_d)
     plt.close(p1.fig)

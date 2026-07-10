@@ -223,8 +223,8 @@ preflight.raise_if_failed()
 <!-- cell:markdown -->
 ## Optional: edit pulses with the PyQt pulse GUI
 
-GUI 只是 pulse 前端。它读取 `exp.devices.sequencer.channels`，编辑
-`PulseTableState`，然后在 `On Pulse/Stop Pulse` 按钮里调用同一个
+GUI 只是 pulse 前端。它读取 `exp.devices.sequencer.port_catalog`，编辑
+引用同一不可变 catalog 的 `PulseTableState`，然后在 `On Pulse/Stop Pulse` 按钮里调用同一个
 sequencer。`On Pulse` 会先把当前 pulse state 上传到 sequencer，再立刻
 start；`Stop Pulse` 调用 safe/reset。
 
@@ -235,16 +235,16 @@ Pulse GUI 的实际工作方式：
 
 ```text
 Edit tab
-  Channel Names:  display label、total duration、visible count
-  Delay / Scan:   FPGA clock(只读)、per-channel delay(ns/us)+X 清除+clk 按钮
-  Period cards:   duration/unit + scan 圆点(绑定 s0..)、DAC bus 行
+  Port Catalog:   只读 logical port/label/kind/lane、fingerprint、total duration
+  Delay / Scan:   FPGA clock(只读)、per-port delay(ns/us)+X 清除
+  Period cards:   duration/unit + scan 圆点(绑定语义 ScanSlot.name)、DAC bus 行
                   (Edge/Ramp/Hold + 值 + scan 圆点)、每个 visible channel 的 on/off
   Control:        On/Stop、Add/Del Column、Add/Del Bracket、Save/Load
-  Channels:       Add Channel、Hide Off、Show All
+  Ports:          Add visible、Hide Off、Show All（只改变 visible_ports）
 
 Preview tab
   自动画当前 PulseTableState，不需要手动 refresh。
-  默认只画 active channel；Show off rows 会显示完整 channel list。
+  默认只画 active port；Show off rows 会显示 catalog 的完整可编程 port 集合。
   被扫描的字段用透明橙色 band + slot 编号标出，不展开全部扫描点。
 
 Scan tab
@@ -378,15 +378,14 @@ occupancy_grid, shot.summary()
 对于 readout-time 或曝光宽度扫描，可以把一张 `PulseTableState` 绑定到当前
 session 的 sequencer。仓库里的
 `pulses/camera_imaging_address_switch.json` 已经把 `camera_exposure` period
-绑定为 scan slot `s0`（`duration="s0", unit="str (ns)"`，nominal
+绑定为公开名 `exposure` 的 scan slot（内部当前列 token 为 `s0`，nominal
 19,980,000 ns），所以这张 pulse 的 exposure 是一个可设置/可扫描的命名量。
 
 扫描用命名 slot + scan table（GUI 里点 duration/DAC 框旁的圆点绑定，
 Scan 页提供表；API 里 `bind_field` + `set_scan_table`）：
 
 ```text
-单点设置:  pulse.set_time(2_000_000)            # 第一个 duration slot, ns
-           pulse.set_slot("s0", 2_000_000)      # 任意 slot 按名字设
+单点设置:  pulse.set_slot("exposure", 2_000_000) # 公开语义名, ns
 硬件扫描:  pulse.set_scan_table([[w0], [w1], ...])   # N_points x N_slots, ns
 ```
 
@@ -401,7 +400,7 @@ Scan 页提供表；API 里 `bind_field` + `set_scan_table`）：
 pulse = exp.timing.bind_pulse("pulses/camera_imaging_address_switch.json")
 pulse.snapshot()
 
-# This does not fire hardware; it shows that the exposure slot (s0) controls
+# This does not fire hardware; it shows that the semantic exposure slot controls
 # the finite readout sequence duration before you run the scan.
 test_widths_ns = [2_000_000, 4_000_000, 8_000_000]
 [(width, pulse.frame_sequence(1, time_ns=width).duration) for width in test_widths_ns]
@@ -410,7 +409,7 @@ RUN_SINGLE_PULSE_TEST = False
 
 single_program = None
 if RUN_SINGLE_PULSE_TEST:
-    pulse.set_time(2_000_000)  # exposure slot s0, ns
+    pulse.set_slot("exposure", 2_000_000)  # semantic scan slot, ns
     single_program = pulse.on_pulse(wait=True, timeout=10.0, repeat_forever=False)
 single_program
 
@@ -453,8 +452,8 @@ clock_hz = exp.devices.sequencer.clock_hz
 time_ticks = np.linspace(int(round(0.2e-3 * clock_hz)), int(round(8e-3 * clock_hz)), 40, dtype=int)
 times = time_ticks / clock_hz
 scan = exp.readout.detection_time(times, shots=30, live=False, display=True, pulse=pulse)
-fit_result, popt = scan.data_figure.decay(is_display=False)
-scan.summary(), fit_result, popt
+fit_result = scan.data_figure.fit("decay")
+scan.summary(), fit_result, fit_result.popt
 
 <!-- cell:markdown -->
 ## Optional live readout-time scan
@@ -475,9 +474,9 @@ live_scan
 
 上面是脚本式流程。日常上机更常用 **Task 控制台**——一个 GUI,把 device / measurement / processor / task / plot 五层用 `SignalHub` 接好,Add Panel 即可搭出活读出板。它和脚本走**同一批建器**(虚拟 == 实机),所以这里连的是真相机/真 sequencer,操作和 `task_console_tutorial.ipynb` 里虚拟那套一模一样:
 
-1. **Add Panel → Camera**:Edit 里设曝光/ROI,Start → 发 `frame`;再加 **2D plot** 选 `frame` 看活图。
+1. **Add Panel → Camera**:Edit 里设曝光/ROI,Start → 按 pulse 的触发事件发 `frame_0`/`frame_1`/...；单触发 live 源再加 **2D plot** 选 `frame_0` 看活图。
 2. **Add Panel → Task: Calibrate readout**:`pulse template` **Browse** 选你自己的成像程序(pulse GUI 存的 `pulses/camera_imaging_address_switch.json`),`folder` 选数据/报告目录,设曝光/帧数,Start。注意 **启动 task 会先停掉相机**(task 直接占用相机+sequencer,避免抢资源卡死),跑完标定自动成为会话标定。
-3. **Add Panel → Judge occupancy**:`calibration` 留空用刚标好的,`source` 选 `frame`,`method` 选 box / per-site PSF / uniform PSF,Start → 发 `occupied`/`counts`/`rate`/`centers`/`frame_judged`。
+3. **Add Panel → Judge occupancy**:`calibration` 留空用刚标好的,`source` 选对应触发事件（单触发时为 `frame_0`）,`method` 选 box / per-site PSF / uniform PSF,Start → 发 `occupied`/`counts`/`rate`/`centers`/`frame_judged`。
 4. **Add Panel → Site map**:只选一个信号 `occupied`(圆心+底图自动来自同一节点,环和图永远同一发)。
 
 关窗(配 `on_close=exp.close`)会停掉所有采集线程并安全断开 device——不会有线程占着相机或 RPyC 链路。

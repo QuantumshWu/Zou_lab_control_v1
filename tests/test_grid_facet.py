@@ -1,6 +1,6 @@
 """The grid as an AXIS-EXPANDER (facet) contracts.
 
-A grid expands ONE axis of a measurement's ``(repeat, points, *data_dim)`` block into N aligned
+A grid expands ONE axis of a measurement's canonical ``(R,P,*data_shape)`` block into N aligned
 cells, each a standard ``sub_plot_kind`` panel of the remaining axes.  These contracts pin the
 single slicing rule (``facet_cells``), the auto per-cell kind, the live in-place update path
 (artists move, never rebuild), the focused-cell feed, and the console panel's end-to-end flow.
@@ -37,14 +37,14 @@ from Zou_lab_control.frontend.live import (
 )
 
 RNG = np.random.default_rng(11)
-#: one 3-level-scan block (repeat=4, points=3*5*6 flat, data_dim=1) reused across the contracts
+#: one 3-level-scan block (R=4, P=3*5*6 flat, data_shape=(1,)) reused across the contracts
 BLOCK = RNG.normal(100.0, 8.0, size=(4, 3 * 5 * 6, 1))
 PTS = (3, 5, 6)
 
 
 # --------------------------------------------------------------------------- the ONE slicing rule
 def test_facet_cells_slices_every_axis_group_per_the_shape_iron_law():
-    """repeat / points:i / dim:i each slice their OWN axis of (repeat, points, *data_dim); every
+    """repeat / points:i / data:i each slice their OWN axis of (R,P,*data_shape); every
     cell keeps the remaining axes, shaped for its kind (hist pools, 2d frames, 1d curves)."""
     # points:0 -> one 2-D frame per OUTER scan step, repeats averaged
     cells = facet_cells(BLOCK, "points:0", sub_plot_kind="2d", points_shape=PTS)
@@ -55,11 +55,11 @@ def test_facet_cells_slices_every_axis_group_per_the_shape_iron_law():
     assert len(hist) == 4 and hist[0].shape == (90,)
     np.testing.assert_allclose(hist[2], BLOCK[2].reshape(-1))
     # points:1 -> one curve per MIDDLE scan step (repeat averaged, rest flattened)
-    curves = facet_cells(BLOCK, ("points", 1), sub_plot_kind="1d", points_shape=PTS)
+    curves = facet_cells(BLOCK, "points:1", sub_plot_kind="1d", points_shape=PTS)
     assert len(curves) == 5 and curves[0].shape == (18,)
-    # dim:0 -> one cell per site of a per-site vector
+    # data:0 -> one cell per site of a per-site vector
     per_site = RNG.normal(size=(3, 7, 6))
-    sites = facet_cells(per_site, "dim:0", sub_plot_kind="hist")
+    sites = facet_cells(per_site, "data:0", sub_plot_kind="hist")
     assert len(sites) == 6 and sites[0].shape == (21,)
     np.testing.assert_allclose(sites[4], per_site[:, :, 4].reshape(-1))
     # repeat_mode verbs collapse the repeat axis for image/line cells (hist always pools)
@@ -81,13 +81,16 @@ def test_all_nan_facet_collapse_is_a_silent_gap_not_a_warning():
     assert len(cells) == 3 and all(c.shape == (5, 6) and np.isnan(c).all() for c in cells)
 
 
-def test_normalize_facet_spellings_and_rejects():
-    assert normalize_facet(None) is None and normalize_facet("") is None
+def test_normalize_facet_accepts_only_the_canonical_string_grammar():
     assert normalize_facet("repeat") == ("repeat", 0)
-    assert normalize_facet("points") == ("points", 0)
+    assert normalize_facet("points:0") == ("points", 0)
     assert normalize_facet("points:2") == ("points", 2)
-    assert normalize_facet(("dim", 1)) == ("dim", 1)
-    for bad in ("banana", "points:-1", ("repeat",)):
+    assert normalize_facet("data:1") == ("data", 1)
+    for bad in (
+        None, "", "points", "data", "repeat:0", "repeat:3", "dim:0", "banana",
+        "points:-1", "points:+1", "points:01", " points:0", "points:0 ",
+        ("data", 1), ["points", 0], ("repeat",), ("unknown-axis", 1),
+    ):
         with pytest.raises(ValueError):
             normalize_facet(bad)
 
@@ -98,7 +101,76 @@ def test_default_sub_plot_kind_follows_what_each_cell_has_left():
     assert default_sub_plot_kind("points:0", points_shape=PTS) == "2d"
     assert default_sub_plot_kind("repeat", points_shape=(90,)) == "1d"
     assert default_sub_plot_kind("points:0", points_shape=(4, 7)) == "1d"
-    assert default_sub_plot_kind("dim:0", points_shape=(1,), data_shape=(35,)) == "hist"
+    assert default_sub_plot_kind("data:0", points_shape=(1,), data_shape=(35,)) == "hist"
+
+
+def test_data_facet_preserves_remaining_data_shape_and_never_merges_it_with_p():
+    """Faceting removes exactly one declared data_shape axis.  A remaining 2-D data tuple stays a
+    2-D frame; a 1-D cell refuses to merge P with the remaining data axis into one vector."""
+    block = np.arange(2 * 1 * 3 * 4 * 5, dtype=float).reshape(2, 1, 3, 4, 5)
+    frames = facet_cells(block, "data:0", sub_plot_kind="2d", points_shape=(1,))
+    assert len(frames) == 3 and all(frame.shape == (4, 5) for frame in frames)
+    np.testing.assert_allclose(frames[2], block[:, 0, 2].mean(axis=0))
+
+    matrix = np.arange(2 * 7 * 3, dtype=float).reshape(2, 7, 3)
+    with pytest.raises(ValueError, match="cannot merge P with data_shape"):
+        facet_cells(matrix, "repeat", sub_plot_kind="1d", points_shape=(7,))
+
+
+@pytest.mark.parametrize("data_shape", [(1, 4, 5), (4, 1, 5), (4, 5, 1), (1, 1, 4, 5)])
+def test_2d_facet_never_deletes_unselected_singleton_data_axes(data_shape):
+    """Singleton length does not make a declared data axis disposable: a 2-D image is legal only
+    when exactly two data axes remain, so every higher-rank form requires an explicit data facet or
+    reduction instead of ``squeeze`` silently changing the schema."""
+    block = np.zeros((2, 1, *data_shape), dtype=float)
+    with pytest.raises(ValueError, match="exact 2-D frame"):
+        facet_cells(block, "repeat", sub_plot_kind="2d", points_shape=(1,))
+    with pytest.raises(ValueError, match="no unambiguous automatic renderer"):
+        default_sub_plot_kind("repeat", points_shape=(1,), data_shape=data_shape)
+
+
+def test_facet_auto_classifier_never_selects_an_impossible_renderer():
+    """Auto and slicing share one retained-axis classifier: valid auto choices execute, while a
+    2-D points grid carrying non-scalar data fails before a renderer can be selected."""
+    cases = [
+        ("points:0", (3, 4, 5), (1,), np.zeros((2, 60, 1))),
+        ("repeat", (7,), (1,), np.zeros((2, 7, 1))),
+        ("data:0", (1,), (3, 4, 5), np.zeros((2, 1, 3, 4, 5))),
+        ("data:0", (1,), (5,), np.zeros((2, 1, 5))),
+        ("repeat", (1,), (4, 5), np.zeros((2, 1, 4, 5))),
+    ]
+    for facet, points_shape, data_shape, block in cases:
+        kind = default_sub_plot_kind(facet, points_shape=points_shape, data_shape=data_shape)
+        assert facet_cells(block, facet, sub_plot_kind=kind, points_shape=points_shape)
+
+    with pytest.raises(ValueError, match="no unambiguous automatic renderer"):
+        default_sub_plot_kind("repeat", points_shape=(3, 4), data_shape=(2,))
+
+
+def test_every_auto_classified_facet_is_executable_by_the_canonical_slicer():
+    """For every axis group and representative retained rank, auto may either reject ambiguity or
+    return a renderer that ``facet_cells`` can actually execute on the same canonical tensor."""
+    executable = 0
+    for points_shape in ((1,), (4,), (2, 3), (2, 3, 4)):
+        for data_shape in ((), (1,), (5,), (3, 4), (2, 3, 4)):
+            block = np.zeros((2, int(np.prod(points_shape)), *data_shape), dtype=float)
+            facets = (["repeat"]
+                      + [f"points:{i}" for i in range(len(points_shape))]
+                      + [f"data:{i}" for i in range(len(data_shape))])
+            for facet in facets:
+                try:
+                    kind = default_sub_plot_kind(
+                        facet, points_shape=points_shape, data_shape=data_shape)
+                except ValueError:
+                    continue
+                cells = facet_cells(
+                    block, facet, sub_plot_kind=kind, points_shape=points_shape)
+                group, index = normalize_facet(facet)
+                expected = (2 if group == "repeat" else
+                            points_shape[index] if group == "points" else data_shape[index])
+                assert len(cells) == expected
+                executable += 1
+    assert executable > 0
 
 
 # --------------------------------------------------- figure-level axis labels follow the facet (#6)
@@ -118,7 +190,7 @@ def test_facet_axis_labels_map_the_remaining_axes_to_the_cell_x_y():
     # repeat facet of a 1-D scan -> a 1d cell: x IS the swept axis, y the produced quantity
     assert facet_axis_labels("repeat", "1d", points_shape=(41,), data_shape=(1,),
                              param_names=["delay"], value_label="atom rate") == ("delay", "atom rate")
-    # a remaining 2-D data_dim (a camera frame) keeps its pixel axes -- never a scan name
+    # a remaining 2-D data_shape (a camera frame) keeps its pixel axes -- never a scan name
     assert facet_axis_labels("repeat", "2d", points_shape=(1,), data_shape=(20, 24),
                              param_names=names) == ("x (px)", "y (px)")
     # hist pools samples of the VALUE: x = the value's axis name, y = shot count
@@ -255,7 +327,7 @@ def test_line_grid_recipe_roundtrip():
 
 
 # ------------------------------------------------------------------------- console panel end-to-end
-STRUCT = {"points_shape": (90,), "data_shape": (1,), "grid_shape": PTS, "core_ndim": 2, "per_signal": False}
+STRUCT = {"points_shape": (90,), "data_shape": (1,), "grid_shape": PTS}
 
 
 def _facet_card(params, struct=STRUCT):
@@ -302,6 +374,30 @@ def test_console_facet_panel_builds_updates_and_stays_enlarged():
     finally:
         card.shutdown()
         plt.close("all")
+
+
+def test_console_facet_choices_publish_only_data_tokens():
+    card = _facet_card(
+        {"facet": "data:0"},
+        struct={"points_shape": (1,), "data_shape": (2, 3), "grid_shape": ()},
+    )
+    try:
+        options = [card.facet_combo.itemData(i) for i in range(card.facet_combo.count())]
+        assert set(options) == {"repeat", "data:0", "data:1"}
+        assert all(isinstance(token, str) and normalize_facet(token) for token in options)
+    finally:
+        card.shutdown()
+
+
+def test_console_facet_config_uses_none_for_absence_and_rejects_noncanonical_values():
+    card = _facet_card({})
+    try:
+        assert card._facet() is None
+        assert "facet" not in card.config.params
+    finally:
+        card.shutdown()
+    with pytest.raises(ValueError, match="facet must be exactly"):
+        _facet_card({"facet": ""})
 
 
 def test_console_facet_change_rebuilds_to_the_new_structure():
@@ -357,10 +453,10 @@ def test_camera_frame_facet_resolves_to_an_image_cell_per_repeat():
     """A camera block (repeat, 1, H, W) faceted on repeat leaves ONE 2-D frame per cell -> the auto
     rule picks '2d' (it used to fall through to a flattened '1d' curve); a per-scan-point frame
     resolves the same way; a curve stays a curve; and the 2d shaper NEVER silently picks one
-    component of a non-trivial leftover data_dim -- it raises."""
+    component of a non-trivial leftover data_shape -- it raises."""
     assert default_sub_plot_kind("repeat", points_shape=(1,), data_shape=(20, 24)) == "2d"
     assert default_sub_plot_kind("points:0", points_shape=(5,), data_shape=(20, 24)) == "2d"
-    assert default_sub_plot_kind("dim:0", points_shape=(11,), data_shape=(35,)) == "1d"
+    assert default_sub_plot_kind("data:0", points_shape=(11,), data_shape=(35,)) == "1d"
     frames = facet_cells(RNG.normal(size=(4, 1, 20, 24)), "repeat",
                          sub_plot_kind="2d", points_shape=(1,))
     assert len(frames) == 4 and frames[0].shape == (20, 24)
@@ -451,7 +547,7 @@ def test_add_panel_grid_shows_every_repeat_as_a_cell_and_rows_follow_the_kind(mo
 def test_every_display_param_of_the_sub_kind_is_consumed_by_the_grid():
     """MECHANICAL anti-drift (round S): every display ParamDecl of a cell family's standalone kind
     must be CONSUMED on the grid -- the cell family renders it (consume_param -> thumbnails redraw)
-    through the SAME primitives the standalone plot uses (fit_histogram_curves, set_yscale, cmap).
+    through the SAME primitives the standalone plot uses (core fit_histogram, set_yscale, cmap).
     A new PANEL_PARAMS knob that silently does nothing on a grid fails here (the 'grid params are
     baked / the fit chooser is dead' class of bug the user hit twice)."""
     from Zou_lab_control.frontend.task_console import PANEL_PARAMS
@@ -484,7 +580,7 @@ def test_every_display_param_of_the_sub_kind_is_consumed_by_the_grid():
 
 def test_grid_hist_fit_draws_the_standard_curves_on_the_thumbnails():
     """apply_param('fit', 'double') on a hist grid fits + draws the SAME three curves the standalone
-    dis draws (ONE primitive: fit_histogram_curves), keeps them tracking on a live in-place update,
+    dis draws (ONE primitive: core fit_histogram), keeps them tracking on a live in-place update,
     and seeds the enlarged view's fit -- the 'dis fit is missing on the grid' fix."""
     vals = [np.concatenate([RNG.normal(100, 8, 300), RNG.normal(200, 12, 200)]) for _ in range(4)]
     g = grid(vals, sub_plot_kind="hist", display=False)
@@ -519,7 +615,8 @@ def test_grid_general_fit_survives_notebook_focus_unfocus():
     cells = facet_cells(BLOCK, "points:0", sub_plot_kind="2d", points_shape=PTS)   # 3 image cells
     g = grid(cells, sub_plot_kind="2d", display=False)
     try:
-        g.apply_param("fit_model", "center")                # the 2d family's general fit (ImageCell)
+        from Zou_lab_control.neutral_atom.core.fitting import FitRequest
+        g.apply_param("fit_request", FitRequest("center").to_dict())
 
         def live_fit_artists() -> int:
             drawn = set()

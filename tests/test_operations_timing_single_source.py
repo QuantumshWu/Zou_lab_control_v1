@@ -210,9 +210,9 @@ def test_timing_orchestration_lives_on_the_subsystem_not_the_session():
 
 
 def test_capture_routes_exposure_through_the_one_configure_imaging_path(monkeypatch):
-    """``capture(exposure=...)`` shares the ONE configure-imaging path (timing subsystem):
-    the named camera gets the exposure AND the session sequence is rebuilt around it --
-    never a hand-copied ``cam.configure`` + sequence rebuild inside capture."""
+    """The conventional readout capture shares the ONE configure-imaging path: its camera
+    gets the exposure and the matching session sequence is rebuilt before arm-before-fire.
+    ``configure_imaging`` has no arbitrary-camera escape hatch because it owns this pair."""
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.neutral_atom.subsystems.timing import TimingSubsystem
 
@@ -228,6 +228,65 @@ def test_capture_routes_exposure_through_the_one_configure_imaging_path(monkeypa
     seq_before = exp.sequence
     exp.capture(exposure=2e-3, display=False)
     assert calls and calls[0]["exposure"] == pytest.approx(2e-3)
-    assert calls[0]["camera"] is exp.camera             # default capture camera == readout camera
+    assert "camera" not in calls[0]                     # timing owns only the readout role
     assert exp.camera_exposure() == pytest.approx(2e-3)   # the camera really got it
     assert exp.sequence is not seq_before               # and the imaging sequence was rebuilt
+
+
+def test_capture_free_running_camera_never_rebuilds_or_fires(monkeypatch):
+    """A no-trigger camera is an explicit direct-acquire path.  Its exposure changes only
+    that camera; the unrelated readout sequence and sequencer remain untouched, and the
+    result records no fake pulse provenance."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.subsystems.timing import TimingSubsystem
+
+    exp = na.connect("virtual")
+    try:
+        monitor = exp.devices["monitor_camera"]
+        assert monitor.effective_trigger_channels == ()
+        sequence_before = exp.sequence
+        exp.devices.sequencer.history.clear()
+
+        def forbidden_rebuild(*args, **kwargs):
+            raise AssertionError("free-running capture must not rebuild a readout pulse")
+
+        monkeypatch.setattr(TimingSubsystem, "configure_imaging", forbidden_rebuild)
+        result = exp.capture(camera="monitor_camera", exposure=3e-3, display=False)
+
+        assert monitor.exposure == pytest.approx(3e-3)
+        assert exp.sequence is sequence_before
+        assert exp.devices.sequencer.history == []
+        assert result.sequence is None
+        assert result.summary()["sequence"] is None
+    finally:
+        exp.close()
+
+
+def test_capture_rejects_non_readout_external_camera_before_hardware(monkeypatch):
+    """A non-readout trigger wire has no session-owned pulse.  Reject before configure,
+    acquire, prepare, or fire, with the owner task named in the actionable error."""
+    import Zou_lab_control.neutral_atom as na
+
+    exp = na.connect("virtual")
+    try:
+        monitor = exp.devices["monitor_camera"]
+        monitor.trigger_source = "mot_trigger"
+        monitor.capture_trigger_channels = ("mot_trigger",)
+        assert monitor.effective_trigger_channels == ("mot_trigger",)
+        sequencer = exp.devices.sequencer
+        sequencer.history.clear()
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("rejected capture touched hardware")
+
+        monkeypatch.setattr(monitor, "configure", forbidden)
+        monkeypatch.setattr(monitor, "acquire", forbidden)
+        monkeypatch.setattr(sequencer, "prepare", forbidden)
+        monkeypatch.setattr(sequencer, "fire", forbidden)
+
+        with pytest.raises(RuntimeError, match="Optimize-MOT-field") as exc:
+            exp.capture(camera="monitor_camera", exposure=3e-3, display=False)
+        assert "mot_trigger" in str(exc.value)
+        assert sequencer.history == []
+    finally:
+        exp.close()

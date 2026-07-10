@@ -7,13 +7,13 @@ and remote FPGA sequencers share the same timing source of truth.
 
 Scanning
 --------
-Any per-field value (a period duration, a channel delay, or an analog-bus DAC
-value) can be *bound to a scan slot*.  Slots are named ``s0, s1, ...`` in bind
-order.  A bound field's value is taken, per scan point, from one column of a
-``scan_table`` (an ``N_points x N_slots`` array, typically loaded from a file).
-The hardware iterates the scan-point rows seamlessly; the host only uploads the
-sequence template plus the parameter table.  There is exactly one scan concept
-(named slots); there is no separate ``x``/``y`` notion.
+A period duration or analog-bus DAC value can be bound to a scan slot; a channel
+delay is fixed and may only carry an API handle.  Every scan slot has a stable
+semantic :attr:`ScanSlot.name` (for example ``t_off`` or ``da_x``).  Positional
+``s0, s1, ...`` strings exist only inside period expressions and the affine FPGA
+matrix.  A bound field's value is taken, per scan point, from one column of a
+``scan_table`` (an ``N_points x N_slots`` array).  The hardware iterates the rows
+seamlessly; the host uploads one sequence template plus one parameter table.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from pathlib import Path
 import ast
 import functools
 import json
-import logging
 import math
 from numbers import Number
 import re
@@ -36,10 +35,11 @@ from .sequence import (CLOCK_GRID_ATOL_TICKS as GRID_ATOL_STEPS,
                        CLOCK_GRID_RTOL as GRID_RTOL, DEFAULT_CLOCK_HZ,
                        READOUT_GAP_SECONDS,
                        PulseSequence, channel_names, positive_float, round_ticks)
+from .._serialization import require_exact_fields as _require_exact_fields
+from ..ports import PORT_CLOCK, PORT_DAC, PortCatalog
 
 
 UNITS_TO_NS = {"ns": 1.0, "us": 1_000.0, "ms": 1_000_000.0, "s": 1_000_000_000.0, "str (ns)": 1.0}
-BUS_LABEL_RE = re.compile(r"^(?P<base>.+)\[(?P<bit>\d+)\]$")
 ANALOG_BUS_MODES = ("hold", "edge", "ramp")
 
 
@@ -123,6 +123,7 @@ SCAN_SLOT_KINDS = tuple(k for k, v in FIELD_KINDS.items() if v.scan)
 API_SLOT_KINDS = tuple(k for k, v in FIELD_KINDS.items() if v.api)
 SLOT_VAR_RE = re.compile(r"^s(?P<index>\d+)$")
 API_VAR_RE = re.compile(r"^a(?P<index>\d+)$")
+SCAN_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def api_var(index: int) -> str:
@@ -164,6 +165,21 @@ def slot_var(index: int) -> str:
     return f"s{int(index)}"
 
 
+def _default_scan_name(kind: str, target: str) -> str:
+    """Deterministic public identity when the caller supplied no semantic label."""
+
+    target = str(target)
+    if str(kind) == "dac":
+        bus, _, period = target.partition("@")
+        raw = f"{bus}_p{period or '0'}"
+    else:
+        raw = f"{kind}_p{target}"
+    name = re.sub(r"[^0-9A-Za-z_]+", "_", raw).strip("_")
+    if not name or name[0].isdigit():
+        name = f"scan_{name or 'parameter'}"
+    return name
+
+
 @dataclass(frozen=True)
 class ScanSlot:
     """One bound scan parameter.
@@ -183,6 +199,7 @@ class ScanSlot:
     label: str = ""
     unit: str = "ns"
     nominal: float = 0.0
+    name: str = ""
 
     def __post_init__(self) -> None:
         if self.kind not in SCAN_SLOT_KINDS:
@@ -191,6 +208,15 @@ class ScanSlot:
         object.__setattr__(self, "label", str(self.label))
         object.__setattr__(self, "unit", str(self.unit))
         object.__setattr__(self, "nominal", float(self.nominal))
+        explicit = str(self.name or "").strip()
+        semantic_label = re.sub(r"[^0-9A-Za-z_]+", "_", str(self.label)).strip("_")
+        if semantic_label and semantic_label[0].isdigit():
+            semantic_label = "scan_" + semantic_label
+        name = explicit or semantic_label or _default_scan_name(self.kind, self.target)
+        if not SCAN_NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"scan slot name must be a Python identifier, got {name!r}.")
+        object.__setattr__(self, "name", name)
 
     @property
     def is_time(self) -> bool:
@@ -209,16 +235,21 @@ class ScanSlot:
         return int(self.target.split("@", 1)[1])
 
     def to_dict(self) -> dict[str, object]:
-        return {"kind": self.kind, "target": self.target, "label": self.label, "unit": self.unit, "nominal": self.nominal}
+        return {"name": self.name, "kind": self.kind, "target": self.target,
+                "label": self.label, "unit": self.unit, "nominal": self.nominal}
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "ScanSlot":
+        _require_exact_fields(
+            payload, {"name", "kind", "target", "label", "unit", "nominal"},
+            what="scan slot")
         return cls(
-            kind=str(payload.get("kind", "duration")),
-            target=str(payload.get("target", "")),
-            label=str(payload.get("label", "")),
-            unit=str(payload.get("unit", "ns")),
-            nominal=float(payload.get("nominal", 0.0)),
+            name=str(payload["name"]),
+            kind=str(payload["kind"]),
+            target=str(payload["target"]),
+            label=str(payload["label"]),
+            unit=str(payload["unit"]),
+            nominal=float(payload["nominal"]),
         )
 
 
@@ -251,7 +282,7 @@ class ApiSlot:
         object.__setattr__(self, "target", str(self.target))
         # A DAC slot's value is a signed DAC code, not a time: the unit is 'value' by
         # definition of the kind, forced HERE (the one construction choke point every slot
-        # passes -- GUI bind, from_dict, a legacy JSON that saved 'ns' auto-corrects on load).
+        # passes -- GUI bind and from_dict cannot admit a time unit for a DAC code).
         object.__setattr__(self, "unit", "value" if self.kind == "dac" else str(self.unit))
 
     def to_dict(self) -> dict[str, object]:
@@ -259,11 +290,13 @@ class ApiSlot:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "ApiSlot":
+        _require_exact_fields(
+            payload, {"name", "kind", "target", "unit"}, what="API slot")
         return cls(
-            name=str(payload.get("name", "a1")),
-            kind=str(payload.get("kind", "duration")),
-            target=str(payload.get("target", "")),
-            unit=str(payload.get("unit", "ns")),
+            name=str(payload["name"]),
+            kind=str(payload["kind"]),
+            target=str(payload["target"]),
+            unit=str(payload["unit"]),
         )
 
 
@@ -315,11 +348,18 @@ class PulsePeriod:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "PulsePeriod":
+        _require_exact_fields(
+            payload, {"duration", "unit", "name", "states"}, what="pulse period")
+        states = payload["states"]
+        if not isinstance(states, (list, tuple)) or isinstance(states, (str, bytes)):
+            raise ValueError("pulse period states must be an ordered array")
+        if any(type(value) not in (bool, int) or int(value) not in (0, 1) for value in states):
+            raise ValueError("pulse period states must contain only boolean/0/1 values")
         return cls(
-            duration=payload.get("duration", 10),
-            unit=str(payload.get("unit", "ns")),
-            name=str(payload.get("name", "")),
-            states=tuple(int(bool(v)) for v in payload.get("states", ())),
+            duration=payload["duration"],
+            unit=str(payload["unit"]),
+            name=str(payload["name"]),
+            states=tuple(int(bool(v)) for v in states),
         )
 
 
@@ -327,12 +367,12 @@ class PulseTableState:
     """Editable period table that compiles into a ``PulseSequence``."""
 
     schema = "Zou_lab_control.neutral_atom.PulseTableState"
-    version = 3
+    version = 4
 
     def __init__(
         self,
         *,
-        channels: Sequence[str],
+        port_catalog: PortCatalog | Mapping[str, object],
         periods: Iterable[PulsePeriod] | None = None,
         delays: Mapping[str, float | str] | None = None,
         delay_units: Mapping[str, str] | None = None,
@@ -347,21 +387,27 @@ class PulseTableState:
         repeat_count: int = 1,
         repeat_forever: bool = True,
         scan_repeats: int = 0,
-        visible_channels: Sequence[str] | None = None,
-        channel_labels: Mapping[str, str] | None = None,
-        analog_buses: Mapping[str, Sequence[str]] | None = None,
+        visible_ports: Sequence[str] | None = None,
         analog_bus_modes: Mapping[str, Sequence[Mapping[str, object] | str | None]] | None = None,
-        clk_channels: Sequence[str] | None = None,
     ):
-        self.channels = list(channel_names(channels, "channels"))
-        # O(1) channel->bit index (channels are fixed after construction).  channel_index is
+        self.port_catalog = (
+            port_catalog if isinstance(port_catalog, PortCatalog)
+            else PortCatalog.from_dict(port_catalog)
+        )
+        raw_lanes = self.port_catalog.raw_lanes
+        # O(1) raw-lane->bit index (topology is immutable after construction).  channel_index is
         # called per period x channel x rebuild from the GUI, so list.index() there is wasteful.
-        self._channel_index = {channel: index for index, channel in enumerate(self.channels)}
+        self._channel_index = {lane: index for index, lane in enumerate(raw_lanes)}
         self.name = str(name) if name is not None else default_pulse_name()
         self.time_step_ns = positive_time_step_ns(time_step_ns)
-        self.scan_slots = [slot if isinstance(slot, ScanSlot) else ScanSlot.from_dict(slot) for slot in (scan_slots or [])]
-        # STRICT width check: a programmatic build must supply one column per bound slot.
-        # Legacy short rows are tolerated only at the from_dict deserialization seam.
+        # Programmatic construction may use keyword mappings with the dataclass's documented optional
+        # fields.  Serialized documents do not pass this seam: ``from_dict`` validates their complete
+        # versioned shape first and supplies typed ScanSlot objects.
+        self.scan_slots = [
+            slot if isinstance(slot, ScanSlot) else ScanSlot(**dict(slot))
+            for slot in (scan_slots or [])
+        ]
+        # STRICT width check: every build supplies exactly one column per bound slot.
         self.scan_table = _normalize_scan_table(scan_table, slots=self.scan_slots)
         # The Scan-tab code editor's SOURCE text: the Python snippet that GENERATES scan_table.
         # scan_table is the derived result the hardware plays; scan_code is how the user made it,
@@ -370,8 +416,11 @@ class PulseTableState:
         self.scan_code = str(scan_code or "")
         # API slots: named handles (a1/a2...) the API/Task set by name (set_api / state.aN).
         # Set EARLY so the ``state.aN = value`` attribute sugar (__setattr__) can find them.
-        self.api_slots = [slot if isinstance(slot, ApiSlot) else ApiSlot.from_dict(slot) for slot in (api_slots or [])]
-        self.periods = list(periods or default_periods(self.channels))
+        self.api_slots = [
+            slot if isinstance(slot, ApiSlot) else ApiSlot(**dict(slot))
+            for slot in (api_slots or [])
+        ]
+        self.periods = list(periods or default_periods(raw_lanes))
         self.delays = {str(k): v for k, v in dict(delays or {}).items()}
         self.delay_units = {str(k): str(v) for k, v in dict(delay_units or {}).items()}
         self.repeat_start = None if repeat_start is None else int(repeat_start)
@@ -380,23 +429,15 @@ class PulseTableState:
         self.repeat_forever = bool(repeat_forever)
         # Number of FULL scan sweeps before the scan stops: 0 = sweep forever (the default,
         # matching the seamless cyclic streaming), K>=1 = play every scan point K times then
-        # halt.  ORTHOGONAL to the measurement-layer camera ``repeat`` (frames per point); this
-        # counts whole-table sweeps of the scan_table / api sweep.
+        # halt.  This counts whole-table sweeps of the scan table; acquisition cadence and
+        # buffering belong to the independent signal producer.
         self.scan_repeats = max(0, int(scan_repeats))
-        self.visible_channels = list(channel_names(visible_channels, "visible_channels", allow_empty=True)) if visible_channels is not None else default_visible_channels(self.channels)
-        self.channel_labels = {str(k): str(v) for k, v in dict(channel_labels or {}).items()}
-        self.analog_buses = {
-            str(name): list(channel_names(members, f"analog bus {name!r}"))
-            for name, members in dict(analog_buses or {}).items()
-        }
+        self.visible_ports = (
+            [str(key) for key in visible_ports]
+            if visible_ports is not None
+            else default_visible_ports(self.port_catalog)
+        )
         self.analog_bus_modes = self._normalize_analog_bus_modes(analog_bus_modes)
-        # Channels wired directly to the FPGA clk (output = clk).  They are EXCLUDED from
-        # the pulse engine (their edge-table bit is forced 0) so the engine never fights
-        # the clk routing; the top muxes clk onto their pin via a runtime clk-enable mask.
-        # Keep clk_channels RAW (do not silently drop unknown names) so validate() can flag a
-        # typo / stale config instead of leaving clk quietly disabled.  Callers that intend to
-        # drop clk channels missing from a new channel list (aligned_to_channels) pre-filter.
-        self.clk_channels = [str(x) for x in (clk_channels or [])]
         self.validate()
 
     # -- scan slot helpers -------------------------------------------------
@@ -406,8 +447,46 @@ class PulseTableState:
         return len(self.scan_slots)
 
     @property
-    def scan_var_names(self) -> list[str]:
+    def compiler_scan_vars(self) -> list[str]:
+        """Positional expression tokens consumed only by the compiler."""
+
         return [slot_var(index) for index in range(len(self.scan_slots))]
+
+    @property
+    def scan_names(self) -> list[str]:
+        """Semantic public scan-axis identities; ``sN`` stays compiler-internal."""
+
+        return [slot.name for slot in self.scan_slots]
+
+    def _compiler_var_for_name(self, name: str) -> str:
+        """Translate a semantic scan identity to its internal ``sN`` expression."""
+
+        key = str(name)
+        for index, slot in enumerate(self.scan_slots):
+            if slot.name == key:
+                return slot_var(index)
+        raise ValueError(
+            f"unknown scan slot {name!r}; available semantic names: {self.scan_names}")
+
+    def _compiler_values_for(self, values: Mapping[str, float]) -> dict[str, float]:
+        """Translate a public semantic-value mapping at the compiler boundary."""
+
+        return {
+            self._compiler_var_for_name(str(name)): float(value)
+            for name, value in dict(values).items()
+        }
+
+    def _semantic_values_from_compiler(
+        self, values: Mapping[str, float],
+    ) -> dict[str, float]:
+        """Translate an internal expression environment back to stable axis names."""
+
+        internal = dict(values)
+        return {
+            slot.name: float(internal[slot_var(index)])
+            for index, slot in enumerate(self.scan_slots)
+            if slot_var(index) in internal
+        }
 
     @property
     def scan_enabled(self) -> bool:
@@ -418,12 +497,12 @@ class PulseTableState:
         return len(self.scan_table)
 
     def slot_point(self, point_index: int) -> dict[str, float]:
-        """Return ``{s0: value, ...}`` for one scan-table row (native units)."""
+        """Return one row keyed only by semantic scan-axis names."""
 
         row = self.scan_table[int(point_index)]
-        return {slot_var(index): float(row[index]) for index in range(len(self.scan_slots))}
+        return {slot.name: float(row[index]) for index, slot in enumerate(self.scan_slots)}
 
-    def slot_point_ns(self, point_index: int) -> dict[str, float]:
+    def _slot_point_ns(self, point_index: int) -> dict[str, float]:
         """Return slot values converted to ns for time slots (dac slots pass through)."""
 
         row = self.scan_table[int(point_index)]
@@ -435,7 +514,7 @@ class PulseTableState:
             out[slot_var(index)] = value
         return out
 
-    def reference_slots(self) -> dict[str, float]:
+    def _reference_slots(self) -> dict[str, float]:
         """Slot values for previewing/validating a non-scan render.
 
         Uses the first scan point if a table exists, else each slot's nominal
@@ -443,7 +522,7 @@ class PulseTableState:
         """
 
         if self.scan_table:
-            return self.slot_point_ns(0)
+            return self._slot_point_ns(0)
         out: dict[str, float] = {}
         for index, slot in enumerate(self.scan_slots):
             value = float(slot.nominal)
@@ -457,7 +536,7 @@ class PulseTableState:
 
         scale = UNITS_TO_NS.get(unit, 1.0)
         try:
-            slots = self.reference_slots()
+            slots = self._reference_slots()
             if kind == "duration":
                 return self.periods[int(target)].duration_ns(slots=slots) / scale
             if kind == "dac":
@@ -481,7 +560,8 @@ class PulseTableState:
             pass   # malformed/out-of-range field -> fall back to the kind default (don't hide a real bug)
         return (1000.0 / scale) if kind == "duration" else 0.0
 
-    def bind_field(self, kind: str, target: str, *, label: str = "", unit: str = "ns", nominal: float | None = None) -> int:
+    def bind_field(self, kind: str, target: str, *, label: str = "", unit: str = "ns",
+                   nominal: float | None = None, name: str = "") -> int:
         """Bind a field to a new scan slot and rewrite the field to ``s{i}``.
 
         Returns the new slot index.  Idempotent: re-binding an already bound
@@ -505,7 +585,8 @@ class PulseTableState:
             nominal = float(nominal) * UNITS_TO_NS.get(unit, 1.0)
             unit = "ns"
         index = len(self.scan_slots)
-        slot = ScanSlot(kind=kind, target=str(target), label=label, unit=unit, nominal=float(nominal))
+        slot = ScanSlot(kind=kind, target=str(target), label=label, unit=unit,
+                        nominal=float(nominal), name=name)
         self.scan_slots.append(slot)
         self._apply_slot_binding(index, slot)
         for row in self.scan_table:
@@ -709,12 +790,12 @@ class PulseTableState:
 
     def _read_api_field(self, slot: ApiSlot) -> float:
         if slot.kind == "duration":
-            return float(self.periods[int(slot.target)].duration_ns(slots=self.reference_slots())) / UNITS_TO_NS.get(slot.unit, 1.0)
+            return float(self.periods[int(slot.target)].duration_ns(slots=self._reference_slots())) / UNITS_TO_NS.get(slot.unit, 1.0)
         if slot.kind == "delay":
             # For a bus the members are uniform after any set (an API slot IMPLIES
             # uniformity), so the first member's delay is the shared value.
             source = self._delay_targets(slot.target)[0]
-            return eval_time_expr(self.delays.get(source, 0.0), slots=self.reference_slots())
+            return eval_time_expr(self.delays.get(source, 0.0), slots=self._reference_slots())
         bus, period_index = slot.target.split("@", 1)
         plan = self.analog_bus_plan(bus)
         entry = plan[int(period_index)] if int(period_index) < len(plan) else {}
@@ -746,20 +827,23 @@ class PulseTableState:
         return self.set_scan_table(load_scan_table(path, n_slots=len(self.scan_slots) or None))
 
     def clk_enable_mask(self) -> int:
-        """Bitmask (bit n = channel ``self.channels[n]``) of channels wired to the FPGA
+        """Bitmask of raw lanes wired directly to the FPGA clock.
+
+        Bit ``n`` corresponds to ``port_catalog.raw_lanes[n]``.  Clock ports are
         clk.  The compiler forces these bits to 0 in the edge table and ships this mask so
         the top muxes the DAC strobe onto their pins (out_final[n] = clk_en[n] ? ~clk :
         engine_out[n]) -- the INVERTED clk so the DAC latches the parallel word at its
         data-eye centre (see zlc_pulse_streamer_top.v "DAC LATCH PHASE")."""
 
         mask = 0
-        for channel in self.clk_channels:
-            if channel in self.channels:
-                mask |= 1 << self.channel_index(channel)
+        for port in self.port_catalog.clock_ports:
+            mask |= 1 << self.channel_index(port.lanes[0])
         return mask
 
     def is_clk_channel(self, channel: str) -> bool:
-        return str(channel) in set(self.clk_channels)
+        return str(channel) in {
+            port.lanes[0] for port in self.port_catalog.clock_ports
+        }
 
     def scan_slot_dac_ranges(self) -> list[tuple[int, int] | None]:
         """Per-slot SIGNED DAC value range ``(-2^(B-1), +2^(B-1)-1)`` for ``dac``
@@ -784,7 +868,7 @@ class PulseTableState:
         columns -- a DAC column is never given a duration's ns sweep."""
         ranges = self.scan_slot_dac_ranges()
         step = positive_time_step_ns(self.time_step_ns)
-        return [scan_column_spec(slot_var(index), slot.kind, nominal=slot.nominal, unit=slot.unit,
+        return [scan_column_spec(slot.name, slot.kind, nominal=slot.nominal, unit=slot.unit,
                                  signed_range=ranges[index], time_step_ns=step)
                 for index, slot in enumerate(self.scan_slots)]
 
@@ -813,10 +897,10 @@ class PulseTableState:
 
         new = PulseTableState.from_dict(self.to_dict())
         # Missing slots default to their NOMINAL (reference) value, NOT 0 -- so a single-shot
-        # resolve like set_time({"s0": ...}) only changes s0 and leaves the other slots at their
+        # resolve like {"exposure": ...} changes only that semantic axis and leaves the others at
         # nominal, instead of silently zeroing those periods/DAC levels.
-        resolved = new.reference_slots()
-        resolved.update({str(k): float(v) for k, v in dict(slots or {}).items()})
+        resolved = new._reference_slots()
+        resolved.update(new._compiler_values_for(slots or {}))
         for index, slot in enumerate(new.scan_slots):
             value = float(resolved.get(slot_var(index), float(slot.nominal)))
             if slot.kind == "duration":
@@ -838,7 +922,8 @@ class PulseTableState:
         """Return a copy with the named API slots set to ``values`` (each via :meth:`set_api`).
 
         This is the SOFTWARE analogue of :meth:`with_slots_resolved`: the hardware scan table
-        streams scan slots on the FPGA, but API slots are fixed handles set per shot in software.
+        streams scan slots on the FPGA, while API slots are mutable handles resolved per point in
+        software.
         A pulse-scan that sweeps an API slot deep-copies the base state and calls this per point,
         so each point fires a freshly-loaded pulse (load -> on_pulse -> wait -> next).  Unknown
         names raise (``set_api`` fails loud), exactly like the fixed-value path."""
@@ -849,11 +934,11 @@ class PulseTableState:
         return new
 
     def primary_time_slot(self) -> str | None:
-        """Return the variable name of the first duration (time) scan slot."""
+        """Return the semantic name of the first duration scan slot."""
 
         for index, slot in enumerate(self.scan_slots):
             if slot.is_time:
-                return slot_var(index)
+                return slot.name
         return None
 
     def _resolve_step_ns(self, time_step_ns: float | None, clock_hz: float | None) -> float:
@@ -869,61 +954,36 @@ class PulseTableState:
         return self.time_step_ns if time_step_ns is None else positive_time_step_ns(time_step_ns)
 
     def validate(self, *, slots: Mapping[str, float] | None = None, time_step_ns: float | None = None,
-                 clock_hz: float | None = None, validate_scan_slots: bool = True) -> "PulseTableState":
+                 clock_hz: float | None = None, validate_scan_slots: bool = True,
+                 _slots_are_compiler: bool = False) -> "PulseTableState":
         # ``validate_scan_slots`` checks the slot bindings + the FULL N-row scan table; it is
         # SLOT-INDEPENDENT, so a per-scan-point validate (compile_scan) sets it False after
         # one full check -- otherwise validating N points each rescans the whole table, an
         # O(N^2) blow-up that dominated compile at thousands of points.
         # ``clock_hz`` is an ergonomic alias for ``time_step_ns`` (this table's tick grid).
         step_ns = self._resolve_step_ns(time_step_ns, clock_hz)
-        slots = self.reference_slots() if slots is None else dict(slots)
-        if not self.channels:
-            raise ValueError("pulse table must have at least one channel.")
-        if len(set(self.channels)) != len(self.channels):
-            raise ValueError("pulse table channels must be unique.")
-        if len(set(self.visible_channels)) != len(self.visible_channels):
-            raise ValueError("visible channels must be unique.")
-        if not self.visible_channels:
-            raise ValueError("pulse table must show at least one channel.")
-        unknown_visible = [channel for channel in self.visible_channels if channel not in self.channels]
+        slots = (
+            self._reference_slots()
+            if slots is None
+            else dict(slots) if _slots_are_compiler
+            else self._compiler_values_for(slots)
+        )
+        raw_lanes = self.port_catalog.raw_lanes
+        if len(set(self.visible_ports)) != len(self.visible_ports):
+            raise ValueError("visible ports must be unique.")
+        if not self.visible_ports:
+            raise ValueError("pulse table must show at least one programmable port.")
+        programmable = {
+            port.key for port in self.port_catalog.ports if port.kind != PORT_CLOCK
+        }
+        unknown_visible = [key for key in self.visible_ports if key not in programmable]
         if unknown_visible:
-            raise ValueError(f"visible channels are not in hardware channels: {unknown_visible}.")
-        unknown_labels = [channel for channel in self.channel_labels if channel not in self.channels]
-        if unknown_labels:
-            raise ValueError(f"channel label keys are not in hardware channels: {unknown_labels}.")
-        bus_members: list[str] = []
-        for name, members in self.analog_buses.items():
-            # A DAC bus is multi-bit; a 1-channel "bus" is just a TTL channel and is only
-            # half-supported (bus_value()/preview use min_width=2 and would not see it),
-            # so reject it up front instead of letting it crash deeper.
-            if len(members) < 2:
-                raise ValueError(f"analog bus {name!r} must contain at least two channels.")
-            unknown_members = [channel for channel in members if channel not in self.channels]
-            if unknown_members:
-                raise ValueError(f"analog bus {name!r} contains channels not in hardware channels: {unknown_members}.")
-            bus_members.extend(members)
-        duplicated_bus_members = sorted({channel for channel in bus_members if bus_members.count(channel) > 1})
-        if duplicated_bus_members:
-            raise ValueError(f"analog bus channels must not overlap: {duplicated_bus_members}.")
+            raise ValueError(f"visible ports are not programmable ports: {unknown_visible}.")
         known_buses = self.bus_channels(min_width=1)
-        # An unknown clk channel is almost always a typo / stale config -- raise rather than
-        # silently leave clk disabled on a pin the user thinks is clocked.
-        unknown_clk = [c for c in self.clk_channels if c not in self.channels]
-        if unknown_clk:
-            raise ValueError(f"clk channels are not in hardware channels: {unknown_clk}.")
-        # A clk channel is muxed directly onto the FPGA clk pin; if it were also an analog-bus
-        # member the bus engine would drive that same DAC bit -> ambiguous double-drive on
-        # hardware.  The GUI guards this, but validate() is the real contract gate (JSON /
-        # notebook / from_dict bypass the GUI), so reject it here too.  Check against ALL
-        # bus members -- inferred-from-labels AND explicit -- not just explicit analog_buses.
-        all_bus_members = {channel for members in known_buses.values() for channel in members}
-        clk_bus = sorted(set(self.clk_channels) & all_bus_members)
-        if clk_bus:
-            raise ValueError(f"clk channels must not be analog-bus members: {clk_bus}.")
         unknown_bus_modes = [name for name in self.analog_bus_modes if name not in known_buses]
         if unknown_bus_modes:
             raise ValueError(f"analog bus modes reference unknown buses: {unknown_bus_modes}.")
-        width = len(self.channels)
+        width = len(raw_lanes)
         if not self.periods:
             raise ValueError("pulse table must have at least one period.")
         for index, period in enumerate(self.periods):
@@ -963,7 +1023,7 @@ class PulseTableState:
             if self.repeat_start < 0 or self.repeat_end < self.repeat_start or self.repeat_end >= len(self.periods):
                 raise ValueError("repeat bracket must select an existing period range.")
         for channel in self.delays:
-            if channel not in self.channels:
+            if channel not in raw_lanes:
                 raise ValueError(f"delay channel {channel!r} is not in channels.")
         # Slot-DEPENDENT resolution (period durations + channel delays) is the ONLY part of
         # validate that varies per scan point; everything above is slot-invariant structure.  A
@@ -995,7 +1055,7 @@ class PulseTableState:
         api-slot carry use -- so a bus-delay api slot is never wrongly dropped on a state rebuild
         (dropping it made the dot impossible to toggle OFF and let only one bus ever hold a slot)."""
         t = str(target)
-        return t in self.channels or t in self.bus_channels(min_width=1)
+        return t in self.port_catalog.raw_lanes or t in self.bus_channels(min_width=1)
 
     def _validate_api_slots(self) -> None:
         # Names are UNIQUE within a state (one handle = one field).  The GUI's per-cell dot
@@ -1029,6 +1089,11 @@ class PulseTableState:
                     raise ValueError(f"api slot {slot.name!r} binds dac of missing period {period!r}.")
 
     def _validate_scan_slots(self) -> None:
+        names = [slot.name for slot in self.scan_slots]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(
+                f"scan slot names must be unique semantic identifiers; duplicates: {duplicates}")
         for index, slot in enumerate(self.scan_slots):
             if slot.kind == "duration":
                 period_index = int(slot.target) if slot.target.lstrip("-").isdigit() else -1
@@ -1068,31 +1133,139 @@ class PulseTableState:
             out[str(bus_name)] = normalized[: len(self.periods)]
         return out
 
-    def aligned_to_channels(self, channels: Sequence[str]) -> "PulseTableState":
-        """Return a copy whose channel list matches hardware, filling missing channels off."""
+    def aligned_to_catalog(
+        self,
+        port_catalog: PortCatalog | Mapping[str, object],
+    ) -> "PulseTableState":
+        """Return a copy projected onto a connected sequencer's catalog.
 
-        channels = list(channel_names(channels, "channels"))
-        source_index = {channel: index for index, channel in enumerate(self.channels)}
-        unknown = [channel for channel in self.channels if channel not in source_index or channel not in channels]
-        if unknown:
-            raise ValueError(f"pulse state channels are not in hardware channels: {unknown}.")
+        Alignment is a logical-port recipe projected onto a topology.  Required
+        ports match by exact key, then by one unique same-kind semantic label;
+        the target supplies every raw lane, DAC width/index/clock and safe code.
+        A naked raw-lane list is therefore never accepted here.
+        """
+
+        target_catalog = (
+            port_catalog if isinstance(port_catalog, PortCatalog)
+            else PortCatalog.from_dict(port_catalog)
+        )
+        source_lanes = self.port_catalog.raw_lanes
+        target_lanes = target_catalog.raw_lanes
+        source_index = {lane: index for index, lane in enumerate(source_lanes)}
+        target_index = {lane: index for index, lane in enumerate(target_lanes)}
+
+        # Only ports that affect the program must map.  An intentionally small
+        # reusable template may carry dormant documentation ports absent from a
+        # particular board; active/visible/bound ports can never disappear.
+        required = set(self.visible_ports) | set(self.period_active_ports()) \
+            | set(self.analog_bus_modes)
+        for slot in self.scan_slots:
+            if slot.kind == "dac":
+                required.add(slot.dac_bus)
+        for slot in self.api_slots:
+            if slot.kind == "dac":
+                required.add(slot.target.split("@", 1)[0])
+            elif slot.kind == "delay":
+                required.add(self.port_catalog.port_for_lane(slot.target).key)
+        for lane in {*self.delays, *self.delay_units}:
+            required.add(self.port_catalog.port_for_lane(lane).key)
+
+        port_map = {
+            key: target_catalog.matching_port(self.port_catalog.by_key[key])
+            for key in required
+        }
+        if len({port.key for port in port_map.values()}) != len(port_map):
+            raise ValueError(
+                "multiple template ports resolve to the same hardware port; give every "
+                "required semantic port a unique key/label.")
+
+        # Unmentioned target DACs start at their catalog safe code (normally
+        # mid-scale == signed zero), never raw all-zero/max-negative.
+        base_states = [0] * len(target_lanes)
+        for port in target_catalog.dac_ports:
+            for bit, lane in enumerate(port.lanes):
+                base_states[target_index[lane]] = (int(port.safe_value) >> bit) & 1
+
         periods = []
         for period in self.periods:
-            states = tuple(int(period.states[source_index[channel]]) if channel in source_index else 0 for channel in channels)
-            periods.append(PulsePeriod(period.duration, states, unit=period.unit, name=period.name))
-        visible = [channel for channel in self.visible_channels if channel in channels]
+            states = list(base_states)
+            for source_key, target_port in port_map.items():
+                source_port = self.port_catalog.by_key[source_key]
+                if source_port.kind == PORT_CLOCK:
+                    continue
+                if source_port.kind != PORT_DAC:
+                    states[target_index[target_port.lanes[0]]] = int(
+                        period.states[source_index[source_port.lanes[0]]])
+                    continue
+                source_code = sum(
+                    int(period.states[source_index[lane]]) << bit
+                    for bit, lane in enumerate(source_port.lanes)
+                )
+                signed = source_code - int(source_port.safe_value)
+                lo, hi = target_port.signed_range
+                if signed < lo or signed > hi:
+                    raise ValueError(
+                        f"template DAC {source_key!r} value {signed} is outside hardware "
+                        f"port {target_port.key!r} range {lo}..{hi}.")
+                target_code = signed + int(target_port.safe_value)
+                for bit, lane in enumerate(target_port.lanes):
+                    states[target_index[lane]] = (target_code >> bit) & 1
+            periods.append(PulsePeriod(period.duration, tuple(states), unit=period.unit, name=period.name))
+
+        visible_target = {port_map[key].key for key in self.visible_ports}
+        visible = [
+            port.key for port in target_catalog.ports
+            if port.kind != PORT_CLOCK and port.key in visible_target
+        ]
         if not visible:
-            visible = default_visible_channels(channels)
+            visible = default_visible_ports(target_catalog)
+        def map_dac_target(target: str) -> str:
+            bus, period = str(target).split("@", 1)
+            return f"{port_map[bus].key}@{period}"
+
+        def map_delay_lane(lane: str) -> str:
+            source_port = self.port_catalog.port_for_lane(lane)
+            target_port = port_map[source_port.key]
+            if source_port.kind != PORT_DAC:
+                return target_port.lanes[0]
+            if source_port.width != target_port.width:
+                raise ValueError(
+                    f"cannot map a raw-lane delay from {source_port.key!r} width "
+                    f"{source_port.width} to {target_port.key!r} width {target_port.width}; "
+                    "declare the delay on the target hardware topology.")
+            return target_port.lanes[source_port.lanes.index(lane)]
+
+        scan_slots = []
+        for slot in self.scan_slots:
+            payload = slot.to_dict()
+            if slot.kind == "dac":
+                payload["target"] = map_dac_target(slot.target)
+            scan_slots.append(payload)
+        api_slots = []
+        for slot in self.api_slots:
+            payload = slot.to_dict()
+            if slot.kind == "dac":
+                payload["target"] = map_dac_target(slot.target)
+            elif slot.kind == "delay":
+                payload["target"] = map_delay_lane(slot.target)
+            api_slots.append(payload)
+        delays = {map_delay_lane(lane): value for lane, value in self.delays.items()}
+        delay_units = {map_delay_lane(lane): value for lane, value in self.delay_units.items()}
+        analog_bus_modes = {
+            port_map[name].key: [dict(entry) for entry in entries]
+            for name, entries in self.analog_bus_modes.items()
+        }
+
         return type(self)(
-            channels=channels,
+            port_catalog=target_catalog,
             periods=periods,
-            delays={channel: value for channel, value in self.delays.items() if channel in channels},
-            delay_units={channel: value for channel, value in self.delay_units.items() if channel in channels},
+            delays=delays,
+            delay_units=delay_units,
             name=self.name,
-            scan_slots=[slot.to_dict() for slot in self.scan_slots],
+            scan_slots=scan_slots,
             scan_table=[list(row) for row in self.scan_table],
             # The editor SOURCE code is channel-independent, so it survives the align verbatim --
-            # else a subset-channel file load (load_from_file -> aligned_to_channels) would drop
+            # else a subset-catalog file load would drop
             # the user's scan program while keeping the table (the same built-but-not-passed bug
             # class as clk_channels below).
             scan_code=self.scan_code,
@@ -1101,35 +1274,20 @@ class PulseTableState:
             # under a superset re-order -- ``duration`` targets a period INDEX (periods keep their
             # order), ``delay`` targets a channel NAME (guaranteed present: non-subset raises
             # above), ``dac`` targets ``bus@period`` (buses are filtered to surviving channels).
-            api_slots=[slot.to_dict() for slot in self.api_slots],
+            api_slots=api_slots,
             time_step_ns=self.time_step_ns,
             repeat_start=self.repeat_start,
             repeat_end=self.repeat_end,
             repeat_count=self.repeat_count,
             repeat_forever=self.repeat_forever,
             scan_repeats=self.scan_repeats,
-            visible_channels=visible,
-            channel_labels={channel: value for channel, value in self.channel_labels.items() if channel in channels},
-            analog_buses={
-                name: filtered
-                for name, members in self.analog_buses.items()
-                for filtered in ([channel for channel in members if channel in channels],)
-                if filtered
-            },
-            analog_bus_modes={
-                name: list(entries)
-                for name, entries in self.analog_bus_modes.items()
-                if name in self.bus_channels(min_width=1)
-            },
-            # A channel wired to the FPGA clk must survive an align onto the device
-            # channel list (else it silently reverts to engine-driven and the clk pin
-            # stops clocking) -- filter to the surviving channels like delays/labels.
-            clk_channels=[channel for channel in self.clk_channels if channel in channels],
+            visible_ports=visible,
+            analog_bus_modes=analog_bus_modes,
         )
 
     def label_for(self, channel: str) -> str:
-        channel = self.channels[self.channel_index(channel)]
-        return self.channel_labels.get(channel) or channel
+        lane = self.port_catalog.raw_lanes[self.channel_index(channel)]
+        return self.port_catalog.channel_labels.get(lane) or lane
 
     def channel_index(self, channel: str) -> int:
         try:
@@ -1139,22 +1297,38 @@ class PulseTableState:
 
     def active_channels(self) -> list[str]:
         active: list[str] = []
-        for channel in self.channels:
+        for channel in self.port_catalog.raw_lanes:
             if channel in self.period_active_channels() or self.delay_steps(channel) != 0:
                 active.append(channel)
         return active
 
     def period_active_channels(self) -> list[str]:
         active: list[str] = []
-        for channel in self.channels:
+        for channel in self.port_catalog.raw_lanes:
             index = self.channel_index(channel)
             if any(int(period.states[index]) for period in self.periods):
                 active.append(channel)
         return active
 
-    def hidden_active_channels(self) -> list[str]:
-        visible = set(self.visible_channels)
-        return [channel for channel in self.period_active_channels() if channel not in visible]
+    def period_active_ports(self) -> list[str]:
+        """Logical programmable ports with activity in the current schedule."""
+
+        active_lanes = set(self.period_active_channels())
+        active: list[str] = []
+        for port in self.port_catalog.ports:
+            if port.kind == PORT_CLOCK:
+                continue
+            if port.kind == PORT_DAC:
+                plan = self.analog_bus_modes.get(port.key, ())
+                if any(str(entry.get("mode", "hold")) != "hold" for entry in plan):
+                    active.append(port.key)
+            elif port.lanes[0] in active_lanes:
+                active.append(port.key)
+        return active
+
+    def hidden_active_ports(self) -> list[str]:
+        visible = set(self.visible_ports)
+        return [key for key in self.period_active_ports() if key not in visible]
 
     def repeat_forever_boundary_active_channels(self) -> list[str]:
         """Channels that go high when an internal finite bracket restarts the table."""
@@ -1164,19 +1338,19 @@ class PulseTableState:
         if int(self.repeat_start) == 0 and int(self.repeat_end) == len(self.periods) - 1:
             return []
         first_states = self.periods[0].states
-        return [channel for channel, state in zip(self.channels, first_states) if int(state)]
+        return [
+            lane for lane, state in zip(self.port_catalog.raw_lanes, first_states)
+            if int(state)
+        ]
 
     def bus_channels(self, *, min_width: int = 2) -> dict[str, list[str]]:
-        """Return logical bus channels inferred from labels like ``da[0]``."""
+        """Return DAC data lanes from the sequencer's immutable port catalog."""
 
-        explicit = {
-            str(name): [channel for channel in members if channel in self.channels]
-            for name, members in self.analog_buses.items()
-            if len([channel for channel in members if channel in self.channels]) >= int(min_width)
+        return {
+            port.key: list(port.lanes)
+            for port in self.port_catalog.dac_ports
+            if port.width >= int(min_width)
         }
-        inferred = infer_bus_channels(self.channels, self.channel_labels, min_width=min_width)
-        inferred.update(explicit)
-        return inferred
 
     def bus_value(self, period_index: int, bus_name: str) -> int:
         """Return the integer value encoded by a bus in one period."""
@@ -1283,7 +1457,7 @@ class PulseTableState:
         the underlying TTL bits keep a sensible preview value.
         """
 
-        slots = self.reference_slots()
+        slots = self._reference_slots()
         starts = self.period_start_steps(slots=slots, time_step_ns=self.time_step_ns)
         groups = self.bus_channels(min_width=1)
         for bus_name, members in groups.items():
@@ -1319,38 +1493,61 @@ class PulseTableState:
         return resolved
 
     def analog_bus_value_at_period_start(self, period_index: int, bus_name: str) -> int:
-        slots = self.reference_slots()
+        slots = self._reference_slots()
         starts = self.period_start_steps(slots=slots, time_step_ns=self.time_step_ns)
         return _analog_bus_value_at_tick(self._resolved_bus_plan(bus_name, slots), starts, starts[int(period_index)])
 
-    def show_channel(self, channel: str, *, index: int | None = None) -> "PulseTableState":
-        channel = self.channels[self.channel_index(channel)]
-        if channel in self.visible_channels:
+    def show_port(self, key: str, *, index: int | None = None) -> "PulseTableState":
+        key = str(key)
+        port = self.port_catalog.by_key.get(key)
+        if port is None or port.kind == PORT_CLOCK:
+            raise ValueError(f"unknown programmable port {key!r}.")
+        if key in self.visible_ports:
             return self
         if index is None:
-            target = self.channel_index(channel)
-            index = sum(1 for item in self.visible_channels if self.channel_index(item) < target)
-            self.visible_channels.insert(index, channel)
+            order = {
+                port.key: position
+                for position, port in enumerate(self.port_catalog.ports)
+                if port.kind != PORT_CLOCK
+            }
+            target = order[key]
+            index = sum(1 for item in self.visible_ports if order[item] < target)
+            self.visible_ports.insert(index, key)
         else:
-            self.visible_channels.insert(max(0, min(int(index), len(self.visible_channels))), channel)
+            self.visible_ports.insert(max(0, min(int(index), len(self.visible_ports))), key)
         self.validate()
         return self
 
-    def hide_channel(self, channel: str, *, clear: bool = False) -> "PulseTableState":
-        channel = self.channels[self.channel_index(channel)]
-        if channel not in self.visible_channels:
+    def hide_port(self, key: str, *, clear: bool = False) -> "PulseTableState":
+        key = str(key)
+        port = self.port_catalog.by_key.get(key)
+        if port is None or port.kind == PORT_CLOCK:
+            raise ValueError(f"unknown programmable port {key!r}.")
+        if key not in self.visible_ports:
             return self
-        if channel in self.period_active_channels():
+        if key in self.period_active_ports():
             if not clear:
-                raise ValueError(f"channel {channel!r} is active; pass clear=True before hiding it.")
-            self.clear_channel(channel)
-        self.visible_channels = [item for item in self.visible_channels if item != channel]
+                raise ValueError(f"port {key!r} is active; pass clear=True before hiding it.")
+            if port.kind == PORT_DAC:
+                self.analog_bus_modes[key] = [
+                    {"mode": "hold", "value": None} for _ in self.periods
+                ]
+            for lane in port.lanes:
+                self.clear_channel(lane, clear_delay=True, validate=False)
+            self.apply_analog_bus_modes_to_period_states()
+        self.visible_ports = [item for item in self.visible_ports if item != key]
         self.validate()
         return self
 
-    def clear_channel(self, channel: str, *, clear_delay: bool = False) -> "PulseTableState":
+    def clear_channel(
+        self,
+        channel: str,
+        *,
+        clear_delay: bool = False,
+        validate: bool = True,
+    ) -> "PulseTableState":
         index = self.channel_index(channel)
-        channel = self.channels[index]
+        channel = self.port_catalog.raw_lanes[index]
         self.periods = [
             PulsePeriod(period.duration, tuple(0 if i == index else value for i, value in enumerate(period.states)), unit=period.unit, name=period.name)
             for period in self.periods
@@ -1358,7 +1555,8 @@ class PulseTableState:
         if clear_delay:
             self.delays.pop(channel, None)
             self.delay_units.pop(channel, None)
-        self.validate()
+        if validate:
+            self.validate()
         return self
 
     def set_period_state(self, period_index: int, channel: str, value: int) -> "PulseTableState":
@@ -1451,16 +1649,17 @@ class PulseTableState:
         the period indices that scan slots and the repeat bracket reference, so those
         structural edits stay in the GUI (which reconciles them); a measurement that
         builds a program programmatically appends its steps in order."""
+        width = len(self.port_catalog.raw_lanes)
         if isinstance(states, Mapping):
-            vec = [0] * len(self.channels)
+            vec = [0] * width
             for channel, value in states.items():
                 vec[self.channel_index(channel)] = 1 if int(value) else 0
         elif states is None:
-            vec = [0] * len(self.channels)
+            vec = [0] * width
         else:
             vec = [1 if int(v) else 0 for v in states]
-            if len(vec) != len(self.channels):
-                raise ValueError(f"states must have one value per channel ({len(self.channels)}).")
+            if len(vec) != width:
+                raise ValueError(f"states must have one value per raw lane ({width}).")
         self.periods.append(PulsePeriod(duration, tuple(vec), unit=str(unit), name=str(name)))
         # Keep per-period analog-bus mode entries in step with the new period count
         # (the same step the GUI's add-period does): a new period defaults to a HOLD
@@ -1568,7 +1767,7 @@ class PulseTableState:
             api_slots.append(payload)
 
         return type(self)(
-            channels=list(self.channels),
+            port_catalog=self.port_catalog,
             periods=[PulsePeriod(p.duration, p.states, unit=p.unit, name=p.name) for p in expand(self.periods)],
             delays=dict(self.delays),
             delay_units=dict(self.delay_units),
@@ -1581,19 +1780,14 @@ class PulseTableState:
             # finite-bracket compile -- the same built-but-not-passed bug class as clk_channels below.
             api_slots=api_slots,
             scan_table=[list(row) for row in self.scan_table],
+            scan_code=self.scan_code,
             time_step_ns=self.time_step_ns,
             repeat_start=None,
             repeat_end=None,
             repeat_count=1,
             repeat_forever=self.repeat_forever,
-            visible_channels=list(self.visible_channels),
-            channel_labels=dict(self.channel_labels),
-            analog_buses={name: list(members) for name, members in self.analog_buses.items()},
+            visible_ports=list(self.visible_ports),
             analog_bus_modes={name: [dict(entry) for entry in expand(entries)] for name, entries in self.analog_bus_modes.items()},
-            # channels are unchanged by the unroll, so the clk set carries verbatim -- without
-            # this a finite-bracket-with-delay compile (which unrolls first) would silently drop
-            # clk channels back to engine-driven (same bug class as aligned_to_channels).
-            clk_channels=list(self.clk_channels),
         )
 
     def delay_steps(self, channel: str, *, slots: Mapping[str, float] | None = None, time_step_ns: float | None = None) -> int:
@@ -1615,7 +1809,7 @@ class PulseTableState:
 
     def total_duration_steps(self, *, slots: Mapping[str, float] | None = None, time_step_ns: float | None = None) -> int:
         step_ns = self.time_step_ns if time_step_ns is None else positive_time_step_ns(time_step_ns)
-        slots = self.reference_slots() if slots is None else dict(slots)
+        slots = self._reference_slots() if slots is None else self._compiler_values_for(slots)
         return sum(period.duration_steps(slots=slots, time_step_ns=step_ns) for period in self.expanded_periods())
 
     def total_duration_ns(self, *, slots: Mapping[str, float] | None = None, time_step_ns: float | None = None) -> float:
@@ -1643,17 +1837,18 @@ class PulseTableState:
         expand_repeat: bool = True,
     ) -> PulseSequence:
         step_ns = self._resolve_step_ns(time_step_ns, clock_hz)   # clock_hz = ergonomic alias for time_step_ns
-        slots = self.reference_slots() if slots is None else dict(slots)
-        self.validate(slots=slots, time_step_ns=step_ns)
+        slots = self._reference_slots() if slots is None else self._compiler_values_for(slots)
+        self.validate(slots=slots, time_step_ns=step_ns, _slots_are_compiler=True)
         sequence = PulseSequence(name=name or self.name)
         # First build each channel's UN-delayed ON intervals (in steps) over the frame.
-        starts: dict[str, int | None] = {channel: None for channel in self.channels}
-        intervals: dict[str, list[tuple[int, int]]] = {channel: [] for channel in self.channels}
+        raw_lanes = self.port_catalog.raw_lanes
+        starts: dict[str, int | None] = {lane: None for lane in raw_lanes}
+        intervals: dict[str, list[tuple[int, int]]] = {lane: [] for lane in raw_lanes}
         t_steps = 0
         periods = self.expanded_periods() if expand_repeat else list(self.periods)
         for period in periods:
             next_t_steps = t_steps + period.duration_steps(slots=slots, time_step_ns=step_ns)
-            for channel, state in zip(self.channels, period.states):
+            for channel, state in zip(raw_lanes, period.states):
                 active_start = starts[channel]
                 if state and active_start is None:
                     starts[channel] = t_steps
@@ -1673,13 +1868,25 @@ class PulseTableState:
         # view is NOT what the streamer plays; do not use to_sequence as the hardware
         # truth.  See _cyclic_shift_interval.
         total_steps = t_steps
-        for channel in self.channels:
+        for channel in raw_lanes:
             d_steps = self.delay_steps(channel, slots=slots, time_step_ns=step_ns)
             for start_steps, stop_steps in intervals[channel]:
                 for a, b in _cyclic_shift_interval(start_steps, stop_steps, d_steps, total_steps):
                     if b > a:
                         sequence = sequence.pulse(channel, a * step_ns * 1e-9, (b - a) * step_ns * 1e-9)
-        return sequence
+        # Preserve the exact editable/logical source across helpers that still
+        # need a PulseSequence view (preview, camera trigger counting).  The
+        # sequencer records this instead of attempting a lossy edge->period
+        # decompile that cannot recover DAC ports or scan semantics.
+        return PulseSequence(
+            sequence.pulses,
+            name=sequence.name,
+            delays=sequence.delays,
+            repeat_count=sequence.repeat_count,
+            repeat_period=sequence.repeat_period,
+            repeat_forever=sequence.repeat_forever,
+            source_table=self.to_dict(),
+        )
 
     def compile(
         self,
@@ -1693,7 +1900,6 @@ class PulseTableState:
         clock_hz = positive_float(clock_hz, "clock_hz")
         return compile_pulse_table_runtime_program(
             self,
-            channels=self.channels,
             clock_hz=clock_hz,
             slots=slots,
             repeat_forever=self.repeat_forever if repeat_forever is None else bool(repeat_forever),
@@ -1720,7 +1926,6 @@ class PulseTableState:
         snapped = source.snapped(time_step_ns=step_ns)
         return compile_pulse_table_scan_runtime_program(
             snapped,
-            channels=snapped.channels,
             clock_hz=clock_hz,
             scan_table=snapped.scan_table,
             repeat_forever=snapped.repeat_forever if repeat_forever is None else bool(repeat_forever),
@@ -1731,16 +1936,14 @@ class PulseTableState:
             "schema": self.schema,
             "version": self.version,
             "name": self.name,
-            "channels": list(self.channels),
+            "port_catalog": self.port_catalog.to_dict(),
             "scan_slots": [slot.to_dict() for slot in self.scan_slots],
             "scan_table": [list(row) for row in self.scan_table],
             "scan_code": self.scan_code,
             "api_slots": [slot.to_dict() for slot in self.api_slots],
             "time_step_ns": self.time_step_ns,
             "periods": [period.to_dict() for period in self.periods],
-            "visible_channels": list(self.visible_channels),
-            "channel_labels": dict(self.channel_labels),
-            "analog_buses": {name: list(members) for name, members in self.analog_buses.items()},
+            "visible_ports": list(self.visible_ports),
             "analog_bus_modes": {
                 name: [dict(entry) for entry in entries]
                 for name, entries in self.analog_bus_modes.items()
@@ -1752,7 +1955,6 @@ class PulseTableState:
             "repeat_count": self.repeat_count,
             "repeat_forever": self.repeat_forever,
             "scan_repeats": int(self.scan_repeats),
-            "clk_channels": list(self.clk_channels),
         }
 
     def snapped(self, *, time_step_ns: float | None = None) -> "PulseTableState":
@@ -1766,6 +1968,10 @@ class PulseTableState:
 
         step = self.time_step_ns if time_step_ns is None else positive_time_step_ns(time_step_ns)
         copy = PulseTableState.from_dict(self.to_dict())
+        # The snapped document is now authored on this grid.  Keeping the old
+        # time_step_ns would make the editor display one resolution while every
+        # value had just been quantized for another server clock.
+        copy.time_step_ns = step
         copy.periods = [
             PulsePeriod(
                 _snap_literal_time_value(period.duration, period.unit, step, allow_zero=False),
@@ -1792,46 +1998,70 @@ class PulseTableState:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "PulseTableState":
-        if payload.get("schema", cls.schema) != cls.schema:
-            raise ValueError("unsupported pulse table schema.")
-        # The ONE legacy-tolerance seam for short scan-table rows.  from_dict is where every
-        # PERSISTED payload re-enters the object model (load()ed .json pulse files, saved-figure
-        # recipes, server pulse transfers), and only an old save written before another slot was
-        # bound legitimately carries short rows.  Bare __init__ cannot tell a saved payload from
-        # a programmatic build, so __init__/set_scan_table stay strict and the pad lives here:
-        # missing columns take the bound slot's NOMINAL (bind_field's rule, never 0.0) and a
-        # warning names the payload.  In-process to_dict() round-trips (snapped(), with_*_resolved)
-        # always carry full-width rows, so the pad never fires for them.
+        fields = {
+            "schema", "version", "name", "port_catalog", "scan_slots", "scan_table",
+            "scan_code", "api_slots", "time_step_ns", "periods", "visible_ports",
+            "analog_bus_modes", "delays", "delay_units", "repeat_start", "repeat_end",
+            "repeat_count", "repeat_forever", "scan_repeats",
+        }
+        _require_exact_fields(payload, fields, what="pulse table")
+        if payload["schema"] != cls.schema:
+            raise ValueError(
+                f"unsupported pulse table schema {payload['schema']!r}; expected {cls.schema!r}.")
+        if type(payload["version"]) is not int or payload["version"] != cls.version:
+            raise ValueError(
+                f"unsupported pulse table version {payload['version']!r}; "
+                f"expected {cls.version}.")
+        catalog_payload = payload["port_catalog"]
+        if not isinstance(catalog_payload, Mapping):
+            raise ValueError("pulse table requires an embedded PortCatalog.")
+        for key in ("scan_slots", "scan_table", "api_slots", "periods", "visible_ports"):
+            value = payload[key]
+            if not isinstance(value, (list, tuple)) or isinstance(value, (str, bytes)):
+                raise ValueError(f"pulse table {key} must be an ordered array")
+        if not payload["periods"]:
+            raise ValueError("pulse table periods must contain at least one period")
+        for key in ("analog_bus_modes", "delays", "delay_units"):
+            if not isinstance(payload[key], Mapping):
+                raise ValueError(f"pulse table {key} must be an object")
+        if not isinstance(payload["name"], str) or not isinstance(payload["scan_code"], str):
+            raise ValueError("pulse table name and scan_code must be strings")
+        if isinstance(payload["time_step_ns"], bool) or not isinstance(payload["time_step_ns"], Number):
+            raise ValueError("pulse table time_step_ns must be numeric")
+        if type(payload["repeat_forever"]) is not bool:
+            raise ValueError("pulse table repeat_forever must be boolean")
+        for key in ("repeat_count", "scan_repeats"):
+            if type(payload[key]) is not int:
+                raise ValueError(f"pulse table {key} must be an integer")
+        for key in ("repeat_start", "repeat_end"):
+            if payload[key] is not None and type(payload[key]) is not int:
+                raise ValueError(f"pulse table {key} must be an integer or null")
         scan_slots = [
             slot if isinstance(slot, ScanSlot) else ScanSlot.from_dict(slot)
-            for slot in payload.get("scan_slots", ())
+            for slot in payload["scan_slots"]
         ]
         scan_table = _normalize_scan_table(
-            payload.get("scan_table", ()),
+            payload["scan_table"],
             slots=scan_slots,
-            pad_legacy_source=str(payload.get("name", "")) or "<unnamed>",
         )
         return cls(
-            name=str(payload["name"]) if "name" in payload else None,
-            channels=payload["channels"],
+            name=str(payload["name"]),
+            port_catalog=catalog_payload,
             scan_slots=scan_slots,
             scan_table=scan_table,
-            scan_code=str(payload.get("scan_code", "")),
-            api_slots=payload.get("api_slots", ()),
-            time_step_ns=float(payload.get("time_step_ns", 1.0)),
-            periods=[PulsePeriod.from_dict(item) for item in payload.get("periods", [])],
-            visible_channels=payload.get("visible_channels"),
-            channel_labels=dict(payload.get("channel_labels", {})),
-            analog_buses=dict(payload.get("analog_buses", {})),
-            analog_bus_modes=dict(payload.get("analog_bus_modes", {})),
-            delays=dict(payload.get("delays", {})),
-            delay_units=dict(payload.get("delay_units", {})),
-            repeat_start=payload.get("repeat_start"),
-            repeat_end=payload.get("repeat_end"),
-            repeat_count=int(payload.get("repeat_count", 1)),
-            repeat_forever=bool(payload.get("repeat_forever", True)),
-            scan_repeats=int(payload.get("scan_repeats", 0)),
-            clk_channels=payload.get("clk_channels"),
+            scan_code=str(payload["scan_code"]),
+            api_slots=[ApiSlot.from_dict(item) for item in payload["api_slots"]],
+            time_step_ns=float(payload["time_step_ns"]),
+            periods=[PulsePeriod.from_dict(item) for item in payload["periods"]],
+            visible_ports=payload["visible_ports"],
+            analog_bus_modes=dict(payload["analog_bus_modes"]),
+            delays=dict(payload["delays"]),
+            delay_units=dict(payload["delay_units"]),
+            repeat_start=payload["repeat_start"],
+            repeat_end=payload["repeat_end"],
+            repeat_count=payload["repeat_count"],
+            repeat_forever=payload["repeat_forever"],
+            scan_repeats=payload["scan_repeats"],
         )
 
     def save(self, path: str | Path) -> Path:
@@ -1845,11 +2075,22 @@ class PulseTableState:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
     @classmethod
-    def from_sequence(cls, sequence: PulseSequence, *, channels: Sequence[str], clock_hz: float = DEFAULT_CLOCK_HZ) -> "PulseTableState":
+    def from_sequence(
+        cls,
+        sequence: PulseSequence,
+        *,
+        port_catalog: PortCatalog | Mapping[str, object],
+        clock_hz: float = DEFAULT_CLOCK_HZ,
+    ) -> "PulseTableState":
+        catalog = (
+            port_catalog if isinstance(port_catalog, PortCatalog)
+            else PortCatalog.from_dict(port_catalog)
+        )
+        channels = catalog.raw_lanes
         ticks, masks, channels = sequence.edges(clock_hz=clock_hz, channels=channels)
         periods: list[PulsePeriod] = []
         if not ticks:
-            return cls(channels=channels, name=sequence.name)
+            return cls(port_catalog=catalog, name=sequence.name)
         if ticks[0] > 0:
             periods.append(PulsePeriod(duration=int(ticks[0]), unit="str (ns)", states=tuple(0 for _ in channels), name="idle"))
         for index, tick in enumerate(ticks):
@@ -1859,16 +2100,34 @@ class PulseTableState:
                 continue
             states = tuple((masks[index] >> bit) & 1 for bit in range(len(channels)))
             periods.append(PulsePeriod(duration=int(duration_ticks), unit="str (ns)", states=states))
-        visible = []
+        active_lanes = []
         for index, channel in enumerate(channels):
             if any((mask >> index) & 1 for mask in masks) or channel in sequence.delays:
-                visible.append(channel)
+                active_lanes.append(channel)
+        visible = [
+            port.key for port in catalog.ports
+            if port.kind != PORT_CLOCK and any(lane in active_lanes for lane in port.lanes)
+        ]
         step_ns = 1e9 / positive_float(clock_hz, "clock_hz")
         scaled_periods = [
             PulsePeriod(duration=int(period.duration) * step_ns, unit="ns", states=period.states, name=period.name)
             for period in periods
         ]
-        return cls(channels=channels, periods=scaled_periods, name=sequence.name, time_step_ns=step_ns, visible_channels=visible or default_visible_channels(channels))
+        state = cls(
+            port_catalog=catalog,
+            periods=scaled_periods,
+            name=sequence.name,
+            time_step_ns=step_ns,
+            visible_ports=visible or default_visible_ports(catalog),
+        )
+        # The raw edge view contains the DAC member bits.  Project those bits
+        # once into logical edge/hold plans using the catalog, then keep the
+        # catalog as the only topology source for subsequent sync/edit/compile.
+        state.analog_bus_modes = {
+            port.key: state.analog_bus_plan(port.key)
+            for port in state.port_catalog.dac_ports
+        }
+        return state
 
 
 def default_periods(channels: Sequence[str]) -> list[PulsePeriod]:
@@ -1882,6 +2141,7 @@ def default_periods(channels: Sequence[str]) -> list[PulsePeriod]:
 def default_imaging_template(
     channels: Sequence[str] | None = None,
     *,
+    port_catalog: PortCatalog | None = None,
     cooling: float = 2e-3,
     reference_exposure: float = 20e-3,
     readout_exposure: float = 5e-3,
@@ -1907,7 +2167,13 @@ def default_imaging_template(
     those durations, never the structure.  What you load IS what is fired: open this
     template in the pulse GUI and you see exactly the long-short-long the task runs."""
 
-    chans = list(channels) if channels else [trap_channel, cooling_channel, probe_channel, trigger_channel]
+    if port_catalog is not None:
+        chans = list(port_catalog.raw_lanes)
+        if channels is not None and tuple(channels) != port_catalog.raw_lanes:
+            raise ValueError("channels do not match port_catalog.raw_lanes")
+    else:
+        chans = list(channels) if channels else [trap_channel, cooling_channel, probe_channel, trigger_channel]
+        port_catalog = PortCatalog.from_channels(chans)
 
     def states(active) -> tuple[int, ...]:
         return tuple(1 if ch in active else 0 for ch in chans)
@@ -1922,7 +2188,7 @@ def default_imaging_template(
         PulsePeriod(float(gap), held, unit="s", name="gap_1"),
         PulsePeriod(float(reference_exposure), image, unit="s", name="image_2"),
     ]
-    state = PulseTableState(channels=chans, periods=periods, name="imaging_template")
+    state = PulseTableState(port_catalog=port_catalog, periods=periods, name="imaging_template")
     # One API handle per exposure cell (names are unique, like the GUI allocates):
     # a1 = first long reference (image_0), a2 = short readout (image_1), a3 = second long
     # reference (image_2).  The Calibrate task sets all three by name.
@@ -1945,6 +2211,7 @@ PROBE_TEMPLATE_PATH = "pulses/probe_template.json"
 def single_imaging_template(
     channels: Sequence[str] | None = None,
     *,
+    port_catalog: PortCatalog | None = None,
     cooling: float = 2e-3,
     exposure: float = 5e-3,
     trap_channel: str = "trap",
@@ -1952,13 +2219,20 @@ def single_imaging_template(
     probe_channel: str = "probe",
     trigger_channel: str = "emCCD",
 ) -> "PulseTableState":
-    """A SINGLE-shot imaging program (``load`` -> one ``image`` frame, ONE camera trigger) --
-    the base pulse for a generic single-image measurement (e.g. the Pulse-scan, which images
-    ONCE per scan point), as opposed to the Calibrate task's long-short-long
-    :func:`default_imaging_template` (three triggers).  The ``image`` duration is API slot
-    ``a1`` so a notebook/API can set the exposure by name."""
+    """A SINGLE-shot imaging program (``load`` -> one ``image`` frame, ONE camera trigger).
 
-    chans = list(channels) if channels else [trap_channel, cooling_channel, probe_channel, trigger_channel]
+    It is the compact probe program used wherever one editable image window is desired, including
+    as the generic Pulse-scan's default pulse table.  Acquisition remains a separate producer.
+    The Calibrate task instead uses :func:`default_imaging_template` (three triggers).  The
+    ``image`` duration is API slot ``a1`` so a notebook/API can set the exposure by name."""
+
+    if port_catalog is not None:
+        chans = list(port_catalog.raw_lanes)
+        if channels is not None and tuple(channels) != port_catalog.raw_lanes:
+            raise ValueError("channels do not match port_catalog.raw_lanes")
+    else:
+        chans = list(channels) if channels else [trap_channel, cooling_channel, probe_channel, trigger_channel]
+        port_catalog = PortCatalog.from_channels(chans)
 
     def states(active) -> tuple[int, ...]:
         return tuple(1 if ch in active else 0 for ch in chans)
@@ -1967,7 +2241,7 @@ def single_imaging_template(
         PulsePeriod(float(cooling), states({trap_channel, cooling_channel}), unit="s", name="load"),
         PulsePeriod(float(exposure), states({trap_channel, probe_channel, trigger_channel}), unit="s", name="image"),
     ]
-    state = PulseTableState(channels=chans, periods=periods, name="probe_template")
+    state = PulseTableState(port_catalog=port_catalog, periods=periods, name="probe_template")
     state.bind_api_field("duration", "1", name="a1", unit="s")   # image exposure, settable by name
     return state
 
@@ -2018,106 +2292,31 @@ def resolve_fireable_template(template, *, default_name: str, default_factory, s
       and cannot fire ("api slot does not work"); snapping the grid here makes author == snap ==
       fire for every template, including a user-local one under ``pulses/``, on whatever clock the
       connected board reports.
-    * a template whose channels are a SUBSET of the device catalog is expanded onto the FULL
-      catalog (:meth:`PulseTableState.aligned_to_channels`: device order, missing channels as off
-      rows -- no pulses added, the compiled program is identical).  A template is a saved SUBSET
-      of the board's channels, not the catalog itself; without the expansion the GUI's "Show All"
-      (and any per-channel edit) could only ever reach the rows the file happened to save.
-      A NON-subset template is returned untouched: the prepare layer rejects unknown channels
-      explicitly, and the coupled-template resolver (``resolve_coupled_template``) owns the
-      role-name -> device-name universe translation -- this loader never guesses a remap."""
+    * a reusable template is projected onto the FULL device catalog through immutable
+      logical-port identity: exact key first, otherwise one unique same-kind semantic
+      label. Raw lanes, DAC width/index/clock and safe code always come from the device;
+      signed DAC values are re-encoded into that topology. Ambiguous or missing required
+      ports fail loudly. This lets a recipe use semantic ports without becoming a second
+      copy of the board wiring.
+    """
     state = resolve_pulse_template(template, default_name=default_name, default_factory=default_factory)
     tick_ns = hardware_tick_ns(sequencer)
     if state.time_step_ns != tick_ns:
         state.time_step_ns = tick_ns
-    device_channels = [str(c) for c in (getattr(sequencer, "channels", None) or ())]
-    if (device_channels and list(state.channels) != device_channels
-            and all(channel in device_channels for channel in state.channels)):
-        state = state.aligned_to_channels(device_channels)
+    device_catalog = getattr(sequencer, "port_catalog", None)
+    if device_catalog is not None and state.port_catalog.fingerprint != device_catalog.fingerprint:
+        state = state.aligned_to_catalog(device_catalog)
     return state
 
 
-def default_visible_channels(channels: Sequence[str]) -> list[str]:
-    channels = list(channel_names(channels, "channels"))
-    preferred = [channel for channel in ("trap", "cooling", "probe", "emCCD") if channel in channels]
+def default_visible_ports(port_catalog: PortCatalog) -> list[str]:
+    programmable = [
+        port.key for port in port_catalog.ports if port.kind != PORT_CLOCK
+    ]
+    preferred = [key for key in ("trap", "cooling", "probe", "emCCD") if key in programmable]
     if preferred:
         return preferred
-    return channels[: min(8, len(channels))]
-
-
-@functools.lru_cache(maxsize=64)
-def _infer_bus_channels_cached(channels: tuple, labels: tuple, min_width: int) -> tuple:
-    """Cached core of ``infer_bus_channels``: a PURE function of (channels, labels, min_width).  A
-    scan's per-point re-validation invoked this regex sweep once PER scan point (thousands of times for
-    a 2000-point scan -- ~0.7 s of the compile), even though the channel catalog never changes across
-    points.  Memoised on the immutable keys so the sweep runs once per distinct channel set."""
-    labels_map = dict(labels)
-    by_base: dict[str, dict[int, str]] = {}
-    for channel in channel_names(channels, "channels"):
-        label = labels_map.get(channel) or channel
-        match = BUS_LABEL_RE.fullmatch(str(label).strip())
-        if not match:
-            continue
-        base = match.group("base").strip()
-        bit = int(match.group("bit"))
-        if not base:
-            continue
-        by_base.setdefault(base, {})[bit] = channel
-    out: list[tuple[str, tuple[str, ...]]] = []
-    for base, members in by_base.items():
-        if len(members) < int(min_width):
-            continue
-        bits = sorted(members)
-        if bits != list(range(bits[0], bits[-1] + 1)):
-            continue
-        out.append((base, tuple(members[bit] for bit in bits)))
-    return tuple(out)
-
-
-def infer_bus_channels(
-    channels: Sequence[str],
-    channel_labels: Mapping[str, str] | None = None,
-    *,
-    min_width: int = 2,
-) -> dict[str, list[str]]:
-    """Infer logical buses from labels such as ``da_dipole[0]`` ... ``[9]``."""
-
-    try:
-        channels_key = tuple(channels)
-    except TypeError:
-        channels_key = tuple(str(c) for c in channels)
-    labels_key = tuple(sorted((str(k), str(v)) for k, v in dict(channel_labels or {}).items()))
-    # Rebuild a FRESH mutable dict every call so callers may mutate their result without corrupting the
-    # cache (the cached value is an immutable tuple-of-tuples).
-    return {base: list(members) for base, members in _infer_bus_channels_cached(channels_key, labels_key, int(min_width))}
-
-
-def channels_as_buses(
-    channels: Sequence[str],
-    channel_labels: Mapping[str, str] | None = None,
-    *,
-    min_width: int = 2,
-) -> list[str]:
-    """The channel catalog as a USER sees a DAC device: the multi-bit coil DACs folded into their bus
-    (``dx0``..``dz5`` -> ``da_x``/``da_y``/``da_z``), every plain channel kept as-is, in hardware order.
-
-    This is the ONE fold a device SNAPSHOT / viewer uses to report channels the way the pulse editor
-    draws them -- three physical analog buses, not 18 separate bit lines.  Reads the SAME
-    :func:`infer_bus_channels` fold the editor uses (a bus needs its labels; with none, or fewer than
-    ``min_width`` contiguous bits, the raw channel list comes back unchanged, so real == virtual once the
-    real board's labels are loaded)."""
-    buses = infer_bus_channels(channels, channel_labels, min_width=min_width)
-    member_to_bus = {ch: base for base, members in buses.items() for ch in members}
-    out: list[str] = []
-    emitted: set[str] = set()
-    for channel in channel_names(channels, "channels"):
-        base = member_to_bus.get(channel)
-        if base is None:
-            out.append(channel)
-        elif base not in emitted:
-            out.append(base)
-            emitted.add(base)
-    return out
+    return programmable[: min(8, len(programmable))]
 
 
 def bus_period_levels(
@@ -2252,7 +2451,6 @@ def _normalize_scan_table(
     rows: Sequence[Sequence[float]] | None,
     *,
     slots: Sequence["ScanSlot"],
-    pad_legacy_source: str | None = None,
 ) -> list[list[float]]:
     """Coerce ``rows`` to floats and REJECT any width mismatch against the bound ``slots``.
 
@@ -2261,13 +2459,8 @@ def _normalize_scan_table(
     the hardware runs a different experiment than the user asked for, so both are hard errors
     with the offending row named.
 
-    ``pad_legacy_source`` is the ONE deliberate tolerance, reserved for deserializing
-    PERSISTED payloads (:meth:`PulseTableState.from_dict`): a save written before another
-    slot was bound legitimately carries short rows.  When set (to a human-readable payload
-    name for the warning), short rows are padded with each missing slot's NOMINAL value --
-    the same "a new scan dimension starts at the field's current value" rule
-    :meth:`PulseTableState.bind_field` uses, never 0.0 -- and a warning is logged.  Too-wide
-    rows still raise even then (there is no legacy writer of wide rows; that is data loss).
+    A non-empty table with no bound slots is equally invalid: without an ordered slot schema
+    its columns have no physical meaning.
     """
     if rows is None:
         return []
@@ -2276,33 +2469,28 @@ def _normalize_scan_table(
         f"{slot_var(i)}={slot.label or f'{slot.kind}:{slot.target}'}" for i, slot in enumerate(slots)
     )
     out: list[list[float]] = []
-    padded_rows: list[int] = []
     for index, row in enumerate(rows):
         if isinstance(row, Number):
             values = [float(row)]
         else:
             values = [float(value) for value in row]
+        if not n_slots and values:
+            raise ValueError(
+                f"scan table row {index} has {len(values)} value(s), but no scan slots are bound; "
+                "bind the physical fields before loading a table."
+            )
         if n_slots and len(values) != n_slots:
             if len(values) > n_slots:
                 raise ValueError(
                     f"scan table row {index} has {len(values)} values but only {n_slots} scan "
                     f"slot(s) are bound ({slot_names}); give exactly one column per bound slot."
                 )
-            if pad_legacy_source is None:
-                raise ValueError(
-                    f"scan table row {index} has {len(values)} values but {n_slots} scan slot(s) "
-                    f"are bound ({slot_names}); a short row would silently scan a wrong value for "
-                    f"the missing slot(s) -- give exactly one column per bound slot."
-                )
-            values = values + [float(slot.nominal) for slot in slots[len(values):]]
-            padded_rows.append(index)
+            raise ValueError(
+                f"scan table row {index} has {len(values)} values but {n_slots} scan slot(s) "
+                f"are bound ({slot_names}); a short row would silently scan a wrong value for "
+                f"the missing slot(s) -- give exactly one column per bound slot."
+            )
         out.append(values)
-    if padded_rows:
-        logging.getLogger(__name__).warning(
-            "pulse table %r: scan table row(s) %s are narrower than the %d bound scan slot(s) "
-            "(%s); padded the missing column(s) with each slot's nominal value (legacy save).",
-            pad_legacy_source, padded_rows, n_slots, slot_names,
-        )
     return out
 
 
@@ -2313,11 +2501,10 @@ def load_scan_table(path: str | Path, *, n_slots: int | None = None) -> list[lis
     separators and ignore ``#`` comment lines and a single header line of names.
 
     A 1-D array is ambiguous (``[1, 2, 3]`` could be 1 point of 3 slots or 3 points
-    of 1 slot).  When ``n_slots`` is given it disambiguates: a flat array whose length
+    of 1 slot), so ``n_slots`` is required for that case.  A flat array whose length
     is a multiple of ``n_slots`` is reshaped to ``(-1, n_slots)`` -- so ``n_slots=1``
-    gives a COLUMN (3 points x 1 slot), the intuitive single-slot case, and
-    ``n_slots=2`` over ``[a, b, c, d]`` gives 2 points.  Without ``n_slots`` a 1-D array
-    stays a single row (legacy behavior)."""
+    gives a column (3 points x 1 slot), and ``n_slots=2`` over ``[a, b, c, d]`` gives
+    2 points.  A genuinely 2-D file already carries its own row/column boundary."""
 
     import numpy as np
 
@@ -2341,11 +2528,29 @@ def load_scan_table(path: str | Path, *, n_slots: int | None = None) -> list[lis
                 continue  # header / names line
         array = np.asarray(rows, dtype=float) if rows else np.zeros((0, 0))
     array = np.asarray(array, dtype=float)
-    # Disambiguate a 1-D array by the known slot count: a flat array whose length is a
-    # multiple of n_slots is N points x n_slots (so n_slots=1 -> a column of points).
-    if array.ndim == 1 and n_slots and int(n_slots) > 0 and array.size % int(n_slots) == 0:
-        array = array.reshape(-1, int(n_slots))
-    array = np.atleast_2d(array)
+    expected = None if n_slots is None else int(n_slots)
+    if expected is not None and expected < 1:
+        raise ValueError(f"n_slots must be >= 1, got {n_slots!r}.")
+    if array.ndim == 0:
+        if expected not in (None, 1):
+            raise ValueError(
+                f"scalar scan table contains one column, but n_slots={expected}.")
+        array = array.reshape(1, 1)
+    elif array.ndim == 1:
+        if expected is None:
+            raise ValueError(
+                "a 1-D scan table is ambiguous; pass n_slots or save an explicit "
+                "(N_points, N_slots) array.")
+        if array.size % expected:
+            raise ValueError(
+                f"flat scan table has {array.size} values, not a multiple of n_slots={expected}.")
+        array = array.reshape(-1, expected)
+    elif array.ndim != 2:
+        raise ValueError(
+            f"scan table must be a scalar, 1-D flat vector, or 2-D matrix; got shape {array.shape}.")
+    if expected is not None and array.shape[1] != expected:
+        raise ValueError(
+            f"scan table has {array.shape[1]} column(s), but n_slots={expected}.")
     return [[float(value) for value in row] for row in array]
 
 
@@ -2617,7 +2822,7 @@ def scan_target_label(state: "PulseTableState", kind: str, target: str) -> str:
     if kind == "delay":
         # A plain CHANNEL delay shows the channel's friendly label; a DAC BUS delay (the bus name
         # is not an individual channel) shows the raw bus name -- matching enumerate_pulse_params.
-        name = state.label_for(target) if target in state.channels else target
+        name = state.label_for(target) if target in state.port_catalog.raw_lanes else target
         return f"{name} delay"
     return f"{kind} {target}"
 
@@ -2904,7 +3109,7 @@ def enumerate_pulse_params(state: "PulseTableState") -> list[tuple[str, str, str
     bus_members = {channel for members in bus_channels.values() for channel in members}
     for bus in bus_channels:
         out.append(("delay", str(bus), scan_target_label(state, "delay", str(bus))))
-    for channel in state.channels:
+    for channel in state.port_catalog.raw_lanes:
         if channel in bus_members:
             continue   # its delay is exposed via the owning bus's slot, not per-member
         out.append(("delay", str(channel), scan_target_label(state, "delay", str(channel))))
@@ -2928,10 +3133,9 @@ __all__ = [
     "affine_coeffs",
     "default_pulse_name",
     "default_periods",
-    "default_visible_channels",
+    "default_visible_ports",
     "eval_time_expr",
     "evaluate_scan_table_code",
-    "infer_bus_channels",
     "load_scan_table",
     "positive_time_step_ns",
     "quantized_time_ns",

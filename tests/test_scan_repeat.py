@@ -1,5 +1,5 @@
 """Contract: a finite scan can be RE-RUN ``repeat`` times, and the node only FILLS a raw
-``(repeat, points, dim)`` block point-by-point -- it does NOT combine the repeats.  HOW the repeats
+``(R,P,*data_shape)`` block point-by-point -- it does NOT combine the repeats.  HOW the repeats
 are displayed (average / add / replace / roll / new) is the PLOT's ``repeat_mode`` (#3), which
 reduces the repeat axis via the single owned helper ``frontend.live.reduce_repeat``.
 
@@ -18,7 +18,7 @@ from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode
 
 
 class _Reducer:
-    n_series = 1
+    data_shape = (1,)
     labels = ("x", "y", "z")
 
 
@@ -39,7 +39,7 @@ class _CountingMeasurement:
     def measure(self, value, index):
         v = float(self._calls)
         self._calls += 1
-        return v
+        return np.asarray([v])
 
 
 def test_scan_publishes_a_raw_repeat_block_not_a_combined_curve():
@@ -52,12 +52,13 @@ def test_scan_publishes_a_raw_repeat_block_not_a_combined_curve():
     assert node.finished and node.points_done == 6
 
     raw = np.asarray(hub.latest("m_y"))
-    assert raw.shape == (2, 3, 1)              # RAW (repeat, points, dim) -- NOT a combined (3,) curve
+    assert raw.shape == (2, 3, 1)              # RAW (R,P,*data_shape) -- NOT a combined (3,) curve
     # pass 1 measured calls 0,1,2 (slot 0) ; pass 2 measured 3,4,5 (slot 1) -- node did NOT average.
     assert np.allclose(raw[0, :, 0], [0.0, 1.0, 2.0])
     assert np.allclose(raw[1, :, 0], [3.0, 4.0, 5.0])
-    assert np.allclose(hub.latest("m_x"), [10.0, 20.0, 30.0])
-    assert float(hub.latest("m_scan_done")) == 1.0
+    np.testing.assert_allclose(
+        hub.latest("m_x"), np.asarray([[[10.0], [20.0], [30.0]]]))
+    assert node.finished                       # completion is control state, not a data signal
 
 
 def test_repeat_one_is_a_single_pass_block():
@@ -89,7 +90,7 @@ def test_repeat_zero_is_infinite_rolling_one_deep():
 
 
 def test_reduce_repeat_modes_collapse_the_repeat_axis():
-    """The PLOT's reduction (the ONE owned helper) over a raw (repeat, points, dim) block."""
+    """The PLOT's reduction (the ONE owned helper) over a raw (R,P,*data_shape) block."""
     from Zou_lab_control.frontend.live import reduce_repeat, repeats_with_data, REPEAT_MODES
     raw = np.array([[[0.0], [1.0], [2.0]], [[3.0], [4.0], [5.0]]])    # (2, 3, 1)
     assert np.allclose(reduce_repeat(raw, "average")[:, 0], [1.5, 2.5, 3.5])
@@ -113,21 +114,19 @@ def test_reduce_repeat_average_ignores_not_yet_measured_repeats():
 
 
 def test_reduce_repeat_handles_a_2d_grid_block():
-    """A 2-D scan publishes a raw (repeat, n0, n1) block; the reduction drops the repeat axis to the
-    (n0, n1) map (so a 2-D panel shows one reduced image; 'new' is offered only for 1-D)."""
+    """A scalar 2-D scan flattens only its physical P axis; logical geometry stays in the schema."""
     from Zou_lab_control.frontend.live import reduce_repeat
-    raw = np.arange(2 * 2 * 3, dtype=float).reshape(2, 2, 3)
-    assert reduce_repeat(raw, "average").shape == (2, 3)
+    raw = np.arange(2 * 6, dtype=float).reshape(2, 6, 1)
+    assert reduce_repeat(raw, "average").shape == (6, 1)
     assert np.allclose(reduce_repeat(raw, "replace"), raw[1])
 
 
 def test_reduce_repeat_passes_through_already_reduced_arrays():
-    """A non-3-D array (an already-reduced curve, a plain image, a scalar) has NO repeat axis and
-    must pass through untouched -- so a sitemap image is never mistaken for a repeat stack."""
+    """An external datum has no R axis only when the caller marks that boundary explicitly."""
     from Zou_lab_control.frontend.live import reduce_repeat, repeats_with_data
     img = np.arange(6.0).reshape(2, 3)
-    assert np.allclose(reduce_repeat(img, "average"), img)     # 2-D image -> unchanged
-    assert repeats_with_data(img) == 1
+    assert np.allclose(reduce_repeat(img, "average", has_repeat=False), img)
+    assert repeats_with_data(img, has_repeat=False) == 1
 
 
 def test_repeat_is_a_measurement_param_auto_injected_as_one_knob(monkeypatch):
@@ -209,29 +208,24 @@ def test_plot_setting_has_only_repeat_mode_not_repeat(monkeypatch):
         console.shutdown()
 
 
-def test_api_and_scan_modes_share_one_table_form(monkeypatch):
-    """#H3s-F7: there is ONE scan table whose form (per-column legend + column_stack/grid template
-    buttons + a code editor) is identical in API mode and Scan mode -- the SAME shared renderer.  At
-    any time exactly ONE table is shown (one set of template buttons), not two simultaneous tables."""
+def test_pulse_slots_form_has_one_selected_sweep_program(monkeypatch):
+    """The selected strategy owns one program while API resting values stay separate."""
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from PyQt5 import QtWidgets
-    from Zou_lab_control.frontend.task_console import _PulseSlotsWidget, _scan_modes
+    from Zou_lab_control.frontend.task_console import _PulseSlotsWidget
     from Zou_lab_control.frontend.qt_fluent import FluentButton
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    none, api, scan = _scan_modes()
     w = _PulseSlotsWidget()
-    w.rebuild(api_rows=[("a1", "duration", "1", "us", 5.0)],
-              scan_rows=[("s0", "duration", "2", "ns", "probe")])
-    # both kinds present -> defaults to Scan; ONE table (one pair of template buttons), one editor
-    assert w.values_dict()["scan_mode"] == scan
+    w.rebuild(api_rows=[("a1", "image_duration", "duration", "1", "us", 5.0)],
+              scan_rows=[("probe_duration", "duration", "2", "ns", "probe")],
+              hardware_program="scan_table = np.array([[10], [20]])", program_id="template-a")
+    values = w.values_dict()
+    assert set(values) == {"program_id", "api", "sweep_kind", "program"}
+    assert values["program_id"] == "template-a"
+    assert values["api"] == {"a1": 5.0}
+    assert "[[10], [20]]" in values["program"]
     btns = [b.text() for b in w.findChildren(FluentButton)]
     assert btns.count("column_stack") == 1 and btns.count("grid") == 1, btns
-    assert w._scan_code is not None
-    # flip to API -> still ONE table with the SAME form (one pair of template buttons + an editor)
-    w._mode_combo.setCurrentIndex(w._mode_combo.findData(api))
-    assert w.values_dict()["scan_mode"] == api
-    btns = [b.text() for b in w.findChildren(FluentButton)]
-    assert btns.count("column_stack") == 1 and btns.count("grid") == 1, btns
-    assert w._scan_code is not None
+    assert w._program_code is not None and w._sweep_combo is not None

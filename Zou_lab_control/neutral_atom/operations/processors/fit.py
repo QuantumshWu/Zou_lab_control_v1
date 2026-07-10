@@ -1,137 +1,194 @@
-"""Fit center -- live 2-D Gaussian-centre fitting as a func node: FIT RESULTS ON THE HUB.
+"""Live fitting processor backed by the same headless engine as ``DataFigure``.
 
-Consumes a camera frame signal and republishes the fitted centre-model parameters as
-SCALAR signals every shot -- the "fit results become signals" half of the selector/fit
-chain: bind ``fit_x0``/``fit_y0`` to rolling monitors to watch the MOT drift live, or use
-them (or ``fit_amplitude``) as a pulse-scan y / loss signal, exactly like ``roi_value``.
-
-The model is the ONE :func:`Zou_lab_control._readout_math.gaussian2d_center` definition the
-display-side ``DataFigure.center`` fit uses (popt names A/B/R/x0/y0).  Coordinates are the
-CONSUMED frame's OWN pixels (origin = the frame's corner): when the producing node declares
-a spatial ``region``, a panel overlay fit reports the shifted AXIS pixels instead -- the two
-differ by exactly that region origin.  The frame is stride-decimated to a
-small grid before ``curve_fit`` (moment-method seeds), so a 2.3 MP stream fits in ~ms on the
-node's own thread -- the GUI never runs this.
-
-Reactive and decoupled exactly like ROI crop / Judge occupancy: it runs beside whatever
-camera measurement publishes the frame (virtual == real: only the frames differ).
+The processor is an adapter only: it preserves the input tensor's physical
+``(R, P)`` cells, hands each image datum to :mod:`neutral_atom.core.fitting`,
+and publishes complete scalar result tensors.  A failed fit publishes NaN
+parameters plus explicit validity/quality/status fields; it never leaves stale
+values on the hub.
 """
 
 from __future__ import annotations
 
+from threading import Lock
+from typing import Mapping
+
 import numpy as np
 
-from Zou_lab_control._readout_math import gaussian2d_center
+from ...core.fitting import FitRequest, FitResult, fit_image, fit_model
 from ...core.params import ParamDecl
 from ..logic import DEFAULT_SOURCE, FRAME_0, Processor, SignalExpr, SignalSpec
 from ..processor import ProcessorSpec
 from ..processor_registry import processor
 
-#: The catalog/spec display name (single source, like ROI_SPEC_NAME).
+
 FIT_SPEC_NAME = "Fit center"
-
-#: Longest side of the stride-decimated grid the fit runs on.  A centre/width estimate does
-#: not need full sensor resolution -- 96 px keeps curve_fit ~ms even for a 2.3 MP stream while
-#: resolving the centre to a fraction of the decimation step (sub-pixel from the model fit).
-_FIT_GRID_MAX = 96
+FIT_STATUS_INVALID = np.int8(0)
+FIT_STATUS_OK = np.int8(1)
 
 
-def fit_frame_center(frame) -> dict[str, float] | None:
-    """Fit the ONE shared centre model to ``frame`` -> {fit_x0, fit_y0, fit_amplitude,
-    fit_size, fit_offset} in THIS frame's own pixel coordinates (never any upstream
-    region/axis frame -- the processor only sees the array), or None when the fit fails
-    (flat frame / no convergence).  Moment-method seeds + stride decimation, then
-    ``scipy.optimize.curve_fit`` on :func:`gaussian2d_center`."""
-    from scipy.optimize import curve_fit
-
-    img = np.asarray(frame, dtype=float)
-    if img.ndim != 2 or img.size == 0 or not np.isfinite(img).all():
-        return None
-    step = max(1, int(np.ceil(max(img.shape) / _FIT_GRID_MAX)))
-    small = img[::step, ::step]
-    ys, xs = np.mgrid[0:small.shape[0], 0:small.shape[1]]
-    offset = float(np.median(small))
-    weights = np.clip(small - offset, 0.0, None)
-    total = float(weights.sum())
-    if total <= 0.0:
-        return None                                   # flat frame: nothing to centre on
-    x0 = float((weights * xs).sum() / total)
-    y0 = float((weights * ys).sum() / total)
-    size = float(np.sqrt(((weights * ((xs - x0) ** 2 + (ys - y0) ** 2)).sum() / total)) or 1.0)
-    amp = float(small.max() - offset) or 1.0
-    coord = (xs.ravel(), ys.ravel())
-    try:
-        popt, _ = curve_fit(gaussian2d_center, coord, small.ravel().astype(float),
-                            p0=[amp, offset, size, x0, y0], maxfev=200)
-    except (RuntimeError, ValueError):
-        return None
-    amplitude, offset, size, x0, y0 = (float(v) for v in popt)
-    return {"fit_x0": x0 * step, "fit_y0": y0 * step, "fit_amplitude": amplitude,
-            "fit_size": abs(size) * step, "fit_offset": offset}
+def _request(value=None) -> FitRequest:
+    if value is None or value == "":
+        return FitRequest("center")
+    if isinstance(value, FitRequest):
+        request = value
+    elif isinstance(value, str):
+        request = FitRequest(value)
+    elif isinstance(value, Mapping):
+        request = FitRequest.from_dict(value)
+    else:
+        raise TypeError("fit request must be FitRequest, mapping, model key, or None")
+    if fit_model(request.model).family != "2d":
+        raise ValueError("Fit center consumes image data and therefore requires a 2D fit model")
+    return request
 
 
 class FitProcessor(Processor):
-    """Per-shot 2-D centre fit of a consumed frame -> fitted params as hub scalars."""
+    """Fit every valid image cell in a canonical ``(R,P,H,W)`` signal."""
 
     node_label = "fit"
-    provides = ("fit_x0", "fit_y0", "fit_amplitude", "fit_size", "fit_offset")
+    provides = (
+        "fit_x0", "fit_y0", "fit_amplitude", "fit_size", "fit_offset",
+        "fit_valid", "fit_rmse", "fit_r2", "fit_status", "fit_points",
+    )
 
-    def __init__(self, hub, *, source_expr=None, prefix: str = ""):
+    def __init__(self, hub, *, source_expr=None, fit_request=None, prefix: str = ""):
         expr = source_expr if isinstance(source_expr, SignalExpr) else SignalExpr.from_value(source_expr)
         if not expr.inputs:
             expr = SignalExpr([FRAME_0], DEFAULT_SOURCE)
         super().__init__(hub, consumes=tuple(expr.inputs), prefix=prefix)
         self.source_expr = expr
+        self._request_lock = Lock()
+        self._fit_request = _request(fit_request)
+        self.last_results: tuple[FitResult, ...] = ()
+
+    @property
+    def fit_request(self) -> FitRequest:
+        with self._request_lock:
+            return self._fit_request
+
+    def set_fit_request(self, request) -> None:
+        """Atomically replace the structured request between processor shots."""
+
+        parsed = _request(request)
+        with self._request_lock:
+            self._fit_request = parsed
+
+    def _input_contract(self, value) -> tuple[np.ndarray, np.ndarray, tuple[int, ...], int | None]:
+        array = np.asarray(value)
+        if len(self._input_tensors) != 1:
+            raise ValueError(
+                "Fit center requires exactly one registered canonical image source.")
+        tensor = next(iter(self._input_tensors.values()))
+        schema = tensor.schema
+        if tuple(schema.data_shape) != tuple(array.shape[2:]) or len(schema.data_shape) != 2:
+            raise ValueError(
+                "Fit center requires schema data_shape=(H,W); "
+                f"got data_shape={schema.data_shape}, evaluated shape={array.shape}.")
+        if array.ndim != 4 or tuple(array.shape[:2]) != tuple(tensor.valid.shape):
+            raise ValueError(
+                "Fit expression must preserve canonical (R,P,H,W) axes; "
+                f"got {array.shape} for validity {tensor.valid.shape}.")
+        return array, np.asarray(tensor.valid, dtype=bool), schema.point_shape, schema.repeat_capacity
 
     def transform(self, inputs: dict[str, object]) -> dict[str, object]:
         from ..signal_expr import hub_namespace
+
         value = self.source_expr.evaluate(hub_namespace(self.hub, inputs))
-        block = np.asarray(value)
-        # Accept the camera's uniform (repeat, 1, H, W) block OR one bare (H, W) frame; the
-        # NEWEST slice is what a live tracker wants.
-        if block.ndim == 2:
-            frame = block
-        elif block.ndim == 4 and block.shape[1] == 1:
-            frame = block[-1, 0]
-        elif block.ndim == 3:
-            frame = block[-1]
-        else:
-            raise ValueError(f"Fit center expects (H, W) or (repeat, 1, H, W); got shape {block.shape}.")
-        result = fit_frame_center(frame)
-        return dict(result) if result else {}         # a failed fit is a clean no-op shot
+        block, input_valid, _point_shape, _repeat_capacity = self._input_contract(value)
+        shape = (*block.shape[:2], 1)
+        outputs = {
+            name: np.full(shape, np.nan, dtype=np.float64)
+            for name in (
+                "fit_x0", "fit_y0", "fit_amplitude", "fit_size", "fit_offset",
+                "fit_rmse", "fit_r2", "fit_points",
+            )
+        }
+        outputs["fit_valid"] = np.zeros(shape, dtype=np.bool_)
+        outputs["fit_status"] = np.full(shape, FIT_STATUS_INVALID, dtype=np.int8)
+
+        request = self.fit_request
+        results: list[FitResult] = []
+        for repeat, point in np.ndindex(block.shape[:2]):
+            if input_valid[repeat, point]:
+                result = fit_image(block[repeat, point], request)
+            else:
+                result = FitResult.invalid(
+                    request.model, "input tensor cell is invalid",
+                    coordinate_frame=request.coordinate_frame)
+            results.append(result)
+            params = result.parameter_map()
+            outputs["fit_x0"][repeat, point, 0] = params.get("x0", np.nan)
+            outputs["fit_y0"][repeat, point, 0] = params.get("y0", np.nan)
+            outputs["fit_amplitude"][repeat, point, 0] = params.get("amplitude", np.nan)
+            outputs["fit_size"][repeat, point, 0] = abs(params.get("radius", np.nan))
+            outputs["fit_offset"][repeat, point, 0] = params.get("offset", np.nan)
+            outputs["fit_valid"][repeat, point, 0] = result.valid
+            outputs["fit_rmse"][repeat, point, 0] = result.quality.get("rmse", np.nan)
+            outputs["fit_r2"][repeat, point, 0] = result.quality.get("r2", np.nan)
+            outputs["fit_status"][repeat, point, 0] = FIT_STATUS_OK if result.valid else FIT_STATUS_INVALID
+            outputs["fit_points"][repeat, point, 0] = float(result.n_points)
+        self.last_results = tuple(results)
+        return outputs
+
+    def _result_shape(self) -> tuple[tuple[int, ...], int | None]:
+        if not self._input_tensors:
+            return (1,), 1
+        tensor = next(iter(self._input_tensors.values()))
+        return tuple(tensor.schema.point_shape), tensor.schema.repeat_capacity
 
     def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
+        points, repeat_capacity = self._result_shape()
+        common = {"points_shape": points, "data_shape": (1,),
+                  "repeat_capacity": repeat_capacity}
         return (
-            SignalSpec("fit_x0", "fit x0", "px",
-                       "Fitted Gaussian centre x (frame pixels) -- a rolling monitor of the "
-                       "cloud/spot position, or a scan loss signal."),
-            SignalSpec("fit_y0", "fit y0", "px", "Fitted Gaussian centre y (frame pixels)."),
-            SignalSpec("fit_amplitude", "fit amplitude", "counts",
-                       "Fitted peak height above the offset -- a brightness/loading signal."),
-            SignalSpec("fit_size", "fit size", "px", "Fitted 1/e radius R of the Gaussian."),
-            SignalSpec("fit_offset", "fit offset", "counts", "Fitted background level B."),
+            SignalSpec("fit_x0", "fit x0", "px", "Fitted centre x.", dtype=np.float64, **common),
+            SignalSpec("fit_y0", "fit y0", "px", "Fitted centre y.", dtype=np.float64, **common),
+            SignalSpec("fit_amplitude", "fit amplitude", "counts", "Fitted peak height.",
+                       dtype=np.float64, **common),
+            SignalSpec("fit_size", "fit size", "px", "Fitted Gaussian radius.",
+                       dtype=np.float64, **common),
+            SignalSpec("fit_offset", "fit offset", "counts", "Fitted background.",
+                       dtype=np.float64, **common),
+            SignalSpec("fit_valid", "fit valid", "", "1 when the selected fit converged.",
+                       dtype=np.bool_, **common),
+            SignalSpec("fit_rmse", "fit RMSE", "counts", "Root mean squared residual.",
+                       dtype=np.float64, **common),
+            SignalSpec("fit_r2", "fit R²", "", "Coefficient of determination.",
+                       dtype=np.float64, **common),
+            SignalSpec("fit_status", "fit status", "", "1=ok, 0=invalid; text is on last_results.",
+                       dtype=np.int8, metadata={"codes": {"0": "invalid", "1": "ok"}}, **common),
+            SignalSpec("fit_points", "fit points", "", "Finite selected points used by the solver.",
+                       dtype=np.float64, **common),
         )
 
 
 @processor(order=26)
 def fit_center(readout) -> ProcessorSpec:
-    """Fit the shared 2-D Gaussian centre model to a live frame each shot."""
+    """Fit the shared 2-D Gaussian centre model to every image tensor cell."""
 
+    default_request = FitRequest("center").to_dict()
     params = (
         ParamDecl("source", "Frame source", "signal_expr",
                   default={"inputs": [FRAME_0], "source": "value = signal"},
-                  tooltip="The camera frame to fit (ONE (H, W) frame or the camera's "
-                          "(repeat, 1, H, W) block; the newest slice is fitted)."),
+                  tooltip="One registered image signal with data_shape=(H,W)."),
+        ParamDecl("fit_request", "Fit request", "json", default=default_request,
+                  tooltip="Structured FitRequest shared with the plot selector.", display=False),
     )
 
     def make_node(hub, *, prefix: str = "", **values):
-        return FitProcessor(hub, source_expr=values.get("source"), prefix=prefix)
+        return FitProcessor(
+            hub, source_expr=values.get("source"), fit_request=values.get("fit_request"), prefix=prefix)
 
     return ProcessorSpec(
         name=FIT_SPEC_NAME,
         params=params,
         make_node=make_node,
         result_keys=FitProcessor.provides,
-        default_kind="monitor",          # the natural first view: watch the centre drift
+        default_kind="monitor",
         default_value_key="fit_x0",
     )
+
+
+__all__ = [
+    "FIT_SPEC_NAME", "FIT_STATUS_INVALID", "FIT_STATUS_OK", "FitProcessor", "fit_center",
+]

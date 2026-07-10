@@ -78,9 +78,11 @@ PROJECT_ROOT = Path("..").resolve()
 FPGA_DIR = PROJECT_ROOT / "fpga" / "pulse_streamer"
 XDC = PROJECT_ROOT / "fpga" / "board_config" / "board.xdc"   # the na-layer default (infer_xdc_* with no path resolves to it)
 
-CHANNELS = na.infer_xdc_channels(XDC)
-CHANNEL_LABELS = na.infer_xdc_channel_labels(XDC)
+RAW_LANES = na.infer_xdc_channels(XDC)
+RAW_LABELS = na.infer_xdc_channel_labels(XDC)
 CHANNEL_PINS = na.infer_xdc_channel_pins(XDC)
+# XDC 是唯一允许从 raw lanes/labels 构造拓扑的边界；此后只传 PortCatalog。
+PORT_CATALOG = na.PortCatalog.from_channels(RAW_LANES, channel_labels=RAW_LABELS)
 # 相机触发线（emCCD）只是给控制机的相机配 capture_trigger_channels 用的提示：
 # 序列器是纯脉冲流送器，不感知谁被它触发，所以下面 server / RemoteSequencer 都不接它。
 CAMERA_TRIGGER_CHANNELS = na.infer_xdc_trigger_channels(XDC)
@@ -88,11 +90,11 @@ if not CAMERA_TRIGGER_CHANNELS:
     raise RuntimeError("The selected XDC must label the camera trigger output as emCCD.")
 CLOCK_HZ = 50_000_000.0
 
-print("channel count:", len(CHANNELS))
+print("catalog:", PORT_CATALOG.fingerprint, "raw lane count:", len(PORT_CATALOG.raw_lanes))
 print("camera trigger line:", CAMERA_TRIGGER_CHANNELS,
-      {ch: CHANNEL_LABELS.get(ch) for ch in CAMERA_TRIGGER_CHANNELS})
-print("camera subset:", {ch: (CHANNEL_LABELS.get(ch), CHANNEL_PINS.get(ch)) for ch in ("ch09", "ch00", "ch03", "ch11")})
-print("trig output still exists:", "ch06", CHANNEL_LABELS.get("ch06"), CHANNEL_PINS.get("ch06"))
+      {ch: RAW_LABELS.get(ch) for ch in CAMERA_TRIGGER_CHANNELS})
+print("camera subset:", {ch: (RAW_LABELS.get(ch), CHANNEL_PINS.get(ch)) for ch in ("ch09", "ch00", "ch03", "ch11")})
+print("trig output still exists:", "ch06", RAW_LABELS.get("ch06"), CHANNEL_PINS.get("ch06"))
 print("clock:", CLOCK_HZ, "Hz; step:", 1e9 / CLOCK_HZ, "ns")
 
 # The final design is ONE clean build target -- these are the only RTL/tcl files.
@@ -184,7 +186,7 @@ python -m Zou_lab_control.neutral_atom.devices.sequencer_server `
   --backend jtag-axi `
   --host {HOST} `
   --port {PORT} `
-  --channels {" ".join(CHANNELS)} `
+  --channels {" ".join(PORT_CATALOG.raw_lanes)} `
   --clock-hz {CLOCK_HZ:g} `
   --state-dir "{STATE_DIR}"
 """)
@@ -197,7 +199,8 @@ python -m Zou_lab_control.neutral_atom.devices.sequencer_server `
 
 <!-- cell:code -->
 na.run_sequencer_server(
-    channels=CHANNELS,
+    channels=PORT_CATALOG.raw_lanes,  # server CLI seam derives raw width from this same catalog
+    port_catalog=PORT_CATALOG,
     host=HOST,
     port=PORT,
     clock_hz=CLOCK_HZ,
@@ -250,15 +253,17 @@ connected to the running server rather than offline mode.
 # import Zou_lab_control.frontend as zf
 # import Zou_lab_control.neutral_atom as na
 #
+# pulse_state = na.PulseTableState.load(
+#     PROJECT_ROOT / "pulses" / "camera_imaging_address_switch.json")
 # local_sequencer = na.RemoteSequencer(
 #     host="127.0.0.1",
 #     port=PORT,
-#     channels=CHANNELS,
-#     clock_hz=CLOCK_HZ,
 # )
+# local_sequencer.open()  # server snapshot is the only PortCatalog/clock source
+# pulse_state = pulse_state.aligned_to_catalog(local_sequencer.port_catalog).snapped(
+#     time_step_ns=1e9 / local_sequencer.clock_hz)
 # pulse_gui = zf.show_pulse_gui(
-#     state=na.PulseTableState.load(PROJECT_ROOT / "pulses" / "camera_imaging_address_switch.json"),
-#     channels=CHANNELS,
+#     state=pulse_state,
 #     sequencer=local_sequencer,
 #     scale=0.82,
 #     window_ratio=0.90,
@@ -292,7 +297,8 @@ One edge row is a complete state mask at a time point. If trap and emCCD change
 at the same tick, that is still one row, not two. GUI hidden channels do not
 change row width; they simply have zero bits in the uploaded masks.
 
-A hardware scan binds duration / DAC-value fields to slots `s0..sN`; the
+A hardware scan binds duration / DAC-value fields to semantic `ScanSlot.name`
+axes; `s0..sN` are compiler-only column tokens. The
 scan table is one row per scan point. Because the edge ticks are affine in the
 slots, a scanned duration moves the edges (and any analog ramp) in lockstep.
 A channel delay is a fixed per-channel output delay set through the API; it is

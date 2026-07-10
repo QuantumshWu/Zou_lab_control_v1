@@ -1,10 +1,10 @@
-"""Contract: the virtual sequencer carries display LABELS so its DAC coil bits fold into
-``da_x``/``da_y``/``da_z`` bus rows -- the same way the real rig folds them.
+"""Contract: the virtual sequencer publishes one PortCatalog whose DAC ports are
+``da_x``/``da_y``/``da_z`` -- semantic controls projected to the real bias buses.
 
 A device names its coil bits ``dx0..dz5`` (real hardware: ``chNN``) and LABELS each in
-``base[bit]`` syntax (``dx0 -> "da_x[0]"``; real: ``da_dipole[0]`` off the board XDC).
-``infer_bus_channels`` folds on the label regex -- from the DEVICE's own labels, with NO template
-loaded -- so WHEN the coil bits are shown (they are not in a fresh editor's first-four default
+``base[bit]`` syntax (``dx0 -> "da_x[0]"``).
+The device-boundary catalog builder folds labels once, with NO template loaded, so WHEN the coil
+bits are shown (they are not in a fresh editor's first-four default
 visible set) the editor draws three bus rows, not 18 single channel rows.  The labels are DERIVED
 from ``MOT_COIL_BUSES`` (one source), so name<->label never drift.
 
@@ -37,15 +37,15 @@ def test_coil_labels_derive_from_the_one_bus_table():
                 for bus, members in MOT_COIL_BUSES.items()
                 for bit, ch in enumerate(members)}
     assert MOT_COIL_LABELS == expected
-    assert MOT_COIL_LABELS["dx0"] == "da_x[0]" and MOT_COIL_LABELS["dz5"] == "da_z[5]"
+    assert MOT_COIL_LABELS["dx0"] == "da_x[0]"
+    assert MOT_COIL_LABELS["dz5"] == "da_z[5]"
 
 
 def test_virtual_sequencer_advertises_coil_labels():
     seq = VirtualSequencer()
-    # only the coil bits carry labels (the plain TTL lines stay unlabelled)
-    assert seq.channel_labels["dx0"] == "da_x[0]"
-    assert "trap" not in seq.channel_labels
-    assert set(seq.channel_labels) == {ch for members in MOT_COIL_BUSES.values() for ch in members}
+    assert seq.port_catalog.channel_labels["dx0"] == "da_x[0]"
+    assert not hasattr(seq, "channel_labels")
+    assert [port.key for port in seq.port_catalog.dac_ports] == ["da_x", "da_y", "da_z"]
 
 
 def test_state_from_virtual_sequencer_folds_the_three_buses():
@@ -53,7 +53,7 @@ def test_state_from_virtual_sequencer_folds_the_three_buses():
     coil bits into exactly the three coil buses (members == the single-source table) -- no template
     needed."""
     seq = VirtualSequencer()
-    state = PulseTableState(channels=list(seq.channels), channel_labels=dict(seq.channel_labels))
+    state = PulseTableState(port_catalog=seq.port_catalog)
     buses = state.bus_channels()
     for bus, members in MOT_COIL_BUSES.items():
         assert bus in buses, f"{bus} should fold from labels"
@@ -69,18 +69,18 @@ def test_display_rows_fold_the_coils_only_when_shown():
     from Zou_lab_control.frontend.pulse_gui import _display_rows
 
     seq = VirtualSequencer()
-    channels = list(seq.channels)
-    labels = dict(seq.channel_labels)
+    programmable = [
+        port.key for port in seq.port_catalog.ports if port.kind != "clock"
+    ]
     coil_bits = {ch for members in MOT_COIL_BUSES.values() for ch in members}
 
-    # Fresh editor default: only the first four channels are visible (pulse_gui seeds
-    # visible_channels=channels[:4]); none are coil bits, so NO bus row is drawn.
-    fresh = PulseTableState(channels=channels, channel_labels=labels,
-                            visible_channels=channels[: min(4, len(channels))])
+    # Fresh editor default: only the first four logical ports are visible.
+    fresh = PulseTableState(port_catalog=seq.port_catalog,
+                            visible_ports=programmable[:4])
     assert not [r for r in _display_rows(fresh) if r["kind"] == "bus"]
 
-    # Show-all: every coil bit visible -> exactly the three da_* bus rows, zero single coil rows.
-    shown = PulseTableState(channels=channels, channel_labels=labels, visible_channels=channels)
+    # Show-all: each DAC is one visible port, never its member lanes.
+    shown = PulseTableState(port_catalog=seq.port_catalog, visible_ports=programmable)
     rows = _display_rows(shown)
     bus_rows = {str(r["name"]): tuple(r["channels"]) for r in rows if r["kind"] == "bus"}
     assert bus_rows == {bus: tuple(members) for bus, members in MOT_COIL_BUSES.items()}
@@ -92,32 +92,23 @@ def test_custom_channel_list_drops_unused_coil_labels():
     """A sequencer built with a channel list that omits the coil bits advertises no coil labels
     (never a bus whose members are absent)."""
     seq = VirtualSequencer(channels=("trap", "cooling", "probe", "emCCD"))
-    assert seq.channel_labels == {}
+    assert seq.port_catalog.dac_ports == ()
+    assert set(seq.port_catalog.channel_labels) == {"trap", "cooling", "probe", "emCCD"}
 
 
-def test_channels_as_buses_folds_the_dac_coils():
-    """``channels_as_buses`` (the ONE fold a device snapshot / viewer uses) collapses the 18 coil bit
-    lines into the three ``da_*`` buses and keeps every plain channel -- so the device presents its 3
-    physical DAC buses, not 18 separate lines."""
-    from Zou_lab_control.neutral_atom.timing import channels_as_buses
+def test_port_catalog_owns_the_three_dac_ports():
     seq = VirtualSequencer()
-    folded = channels_as_buses(seq.channels, seq.channel_labels)
-    assert {"da_x", "da_y", "da_z"} <= set(folded)
-    coils = {ch for members in MOT_COIL_BUSES.values() for ch in members}
-    assert not (set(folded) & coils), "a folded bus must not also list its raw bit lines"
-    for ch in seq.channels:                      # every non-coil channel survives, in order
-        if ch not in coils:
-            assert ch in folded
+    assert seq.port_catalog.analog_buses == {
+        bus: list(members) for bus, members in MOT_COIL_BUSES.items()}
+    assert all(seq.port_catalog.port_for_lane(lane).kind == "dac"
+               for members in MOT_COIL_BUSES.values() for lane in members)
 
 
-def test_sequencer_snapshot_and_readback_report_folded_channels():
-    """The sequencer's OBSERVE surface (snapshot + the ``channels`` runtime-control read-back) presents
-    the DAC as buses, NOT 18 separately-counted bit lines -- the "counted separately" report.  Both read
-    the ONE ``display_channels`` source, and the raw catalog stays on ``self.channels`` for the compiler."""
+def test_sequencer_snapshot_separates_ports_and_raw_lanes():
     seq = VirtualSequencer()
     snap = seq.snapshot()
-    assert "da_x" in snap["channels"] and "dx0" not in snap["channels"]
-    assert seq.display_channels() == snap["channels"]            # ONE source
-    assert list(seq.channels) != snap["channels"]                # raw 25 kept for the compiler, folded for display
-    readback = {c.decl.key: c.getter(seq) for c in seq.runtime_controls()}["channels"]
+    assert "channels" not in snap
+    assert snap["raw_channels"] == list(seq.port_catalog.raw_lanes)
+    assert snap["port_catalog_fingerprint"] == seq.port_catalog.fingerprint
+    readback = {c.decl.key: c.getter(seq) for c in seq.runtime_controls()}["ports"]
     assert "da_x" in readback and "dx0" not in readback

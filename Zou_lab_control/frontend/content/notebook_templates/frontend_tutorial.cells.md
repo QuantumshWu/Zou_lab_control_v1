@@ -33,8 +33,8 @@ ple = zf.plot(
     relim_mode="tight",
     title="Lorentzian scan",
 )
-fit_result, popt = ple.data_figure.lorent()
-fit_result, popt
+fit_result = ple.data_figure.fit("lorent")
+fit_result, fit_result.popt
 
 <!-- cell:markdown -->
 ## 2D plot
@@ -53,7 +53,7 @@ map_x = np.column_stack([SX.ravel(), SY.ravel()])
 map_y = Z.ravel().reshape(-1, 1)
 
 pl_map = zf.plot(map_x, map_y, labels=("X (um)", "Y (um)", "Counts/50ms"), title="2D count map")
-pl_map.data_figure.center()
+pl_map.data_figure.fit("center")
 
 <!-- cell:markdown -->
 ## Pulse sequence plot
@@ -78,31 +78,32 @@ pulse_plot = zf.plot(
 <!-- cell:markdown -->
 ## Pulse table model and PyQt pulse GUI
 
-`PulseTableState` 是 pulse GUI 和 notebook 共用的 period-card 模型。GUI 是可选前端；不打开 GUI 时，也可以直接用这个模型生成 `PulseSequence`。新建 pulse 默认名是 `pulse_YYYYMMDD_HHMMSS`。`channels` 是硬件 channel 名和 FPGA bit order，例如 `ch00/ch01/...`；display label 只是前端名字。standalone `pulse_gui.bat` 会从 address-switch XDC 推断完整 channel list、display label 和 package pin；JSON 里保存过的 `channel_labels` 优先。`time_step_ns` 是 minimal time，连接默认 FPGA server 时是 20 ns。所有 duration、delay 和 scan array 的值都要是它的整数倍。扫描用命名 slot：给任意 duration 或 DAC 字段绑定一个 slot(`s0, s1, ...`)，再提供一张 `N_points x N_slots` 的 `scan_table`（channel delay 是固定的每通道值，不能扫描）。GUI 默认只显示常用子集，其它 channel 可以在 GUI 里临时添加或隐藏；隐藏不改变上传宽度，compile/upload 会自动补齐完整硬件 channel order。Preview 页自动调用 `zf.plot(..., kind="pulse")`，默认隐藏 off-only channel，并保留 symbolic slot 标记，不把 scan array 展开成大量 period columns。
+`PulseTableState` 是 pulse GUI 和 notebook 共用的 period-card 模型。GUI 是可选前端；不打开 GUI 时，也可以直接用这个模型生成 `PulseSequence`。它只接收一个不可变 `PortCatalog` 作为拓扑真相：raw FPGA lane 顺序、逻辑 digital/DAC/clock port、只读 label、DAC lane ownership 与 latch clock 都在 catalog 里，并由 fingerprint 锁定。pulse JSON 嵌入同一份 catalog，不保存任何平行拓扑镜像。standalone `pulse_gui.bat` 在设备/XDC 边界构造 catalog；编辑器只读，不允许 pulse 文档改硬件拓扑。`visible_ports` 只是当前视图子集，不创建、删除或重排端口。`time_step_ns` 是 minimal time，连接默认 FPGA server 时是 20 ns；所有 duration、delay 和 scan table 值都要落在它的整数网格上。扫描轴的公开身份是 `ScanSlot.name`；`s0/s1/...` 只是编译器在表内使用的 token。Preview 页保留这些 symbolic binding，不把 scan table 展开成大量 period columns。
 
 Pulse GUI 的 Edit 页可以按这个顺序读：
 
 ```text
-Channel Names:   pulse 名字、总时长、可见 channel 的 display name。
-Delay / Scan:    FPGA clock(只读显示)、每通道 delay(ns/us)+X 清除按钮+clk 按钮。
-Period cards:    每个 period 的 duration/unit + scan 圆点(绑定 s0..)、
+Port Catalog:    pulse 名字、总时长、只读 port label/kind/lane 与 catalog fingerprint。
+Delay / Scan:    FPGA clock(只读显示)、每个可编程 port 的 delay(ns/us)+X 清除按钮。
+Period cards:    每个 period 的 duration/unit + scan 圆点(绑定语义 ScanSlot.name)、
                  DAC bus 行(Edge/Ramp/Hold + 值 + scan 圆点)、channel on/off。
 Control:         On Pulse/Stop Pulse、Sync、Add Period/Remove、Add Bracket、
                  Save/Load、Collapse。
-Channels:        Add Channel、Hide Off、Show All 和 visible/hidden 计数。
+Ports:           Add visible、Hide Off、Show All 和 visible/hidden 计数；只改变 visible_ports。
 Scan tab:        已绑定 slot 列表、代码生成/Load Array 两种 scan_table 来源、Run。
 ```
 
-Name 面板左侧 raw column 在 standalone address-switch 路线下显示 XDC package pin，
-例如 `M17/F15/N15/M13`，不是 `ch09/ch00/ch03/ch11`。硬件 bit 名仍然保存在
-tooltip、JSON 和 API state 中，所以保存、编译和上传不会丢失真正的 channel order。
-Preview y 轴显示 display label，例如 `trap/cooling/probe/emCCD`；如果打开
-`Show off rows`，它会显示完整硬件 channel list，但 y 轴仍然不显示总标题 `Pulse`。
+Port Catalog 面板显示 catalog 给出的只读 label，例如 `trap/cooling/probe/emCCD`，
+tooltip 同时显示 logical key、kind、raw lane 与 XDC package pin。保存、编译和上传都
+携带并校验同一 fingerprint，所以不存在 GUI label 覆盖硬件 bit order 的第二份真相。
+Preview y 轴使用 logical port label；`Show off rows` 只扩展视图到 catalog 的完整
+可编程 port 集合，不会把 DAC 的 raw lanes 重新暴露成可编辑 TTL。
 
 `On Pulse` 的语义和 API 一样：先读取当前 GUI state，按 attached sequencer 的
-clock/channel list 编译成 full-width edge table，`prepare` 上传，再 `fire`。如果
-GUI 只显示四路，上传仍然是完整 address-switch channel 宽度；没显示、没配置或被
-隐藏的 channel mask bit 都是 0。`Stop Pulse` 调用 sequencer safe/reset。`Sync`
+clock 与 `PortCatalog.raw_lanes` 编译成 full-width edge table，先校验 pulse catalog
+fingerprint 与 attached sequencer 完全一致，再 `prepare` 上传和 `fire`。如果 GUI
+只显示四个 port，上传仍然是 catalog 的完整硬件宽度；未显示的可编程 port 保持其
+明确安全状态。`Stop Pulse` 调用 sequencer safe/reset。`Sync`
 把设备上实际生效的脉冲程序拉回编辑器（sequencer 会记录每次成功 prepare 的
 PulseTableState 来源，无论它来自这个 GUI 还是 notebook/raw API 调用，比如
 `PulseController.on_pulse`）——在 GUI 之外改了设备后点它，GUI 就重新反映设备
@@ -111,10 +112,13 @@ PulseTableState 来源，无论它来自这个 GUI 还是 notebook/raw API 调�
 <!-- cell:code -->
 import Zou_lab_control.neutral_atom as na
 
-pulse_state = na.PulseTableState(
-    channels=[f"ch{i:02d}" for i in range(62)],
-    visible_channels=["ch09", "ch00", "ch03", "ch11"],
+catalog = na.PortCatalog.from_channels(
+    [f"ch{i:02d}" for i in range(62)],
     channel_labels={"ch09": "trap", "ch00": "cooling", "ch03": "probe", "ch11": "emCCD"},
+)
+pulse_state = na.PulseTableState(
+    port_catalog=catalog,
+    visible_ports=["ch09", "ch00", "ch03", "ch11"],
     time_step_ns=20,
 )
 pulse_state.set_period_state(0, "ch09", 1)
@@ -124,7 +128,7 @@ pulse_state.total_duration_steps(time_step_ns=20)
 api_pulse_plot = zf.plot(
     pulse_sequence,
     kind="pulse",
-    channels=pulse_state.channels,
+    channels=pulse_state.port_catalog.raw_lanes,
     title="PulseTableState API sequence",
 )
 
@@ -132,12 +136,15 @@ api_pulse_plot = zf.plot(
 # pulse_gui = zf.show_pulse_gui(state=pulse_state, scale=0.82, window_ratio=0.90)
 
 <!-- cell:markdown -->
-扫描用**命名 scan slot**（`s0, s1, ...`）。`bind_field(kind, target)` 把一个字段绑定成下一个 slot：`kind="duration"` 时 `target` 是 period 序号，`kind="dac"` 时是 `"bus@period"`（channel delay 是固定量，不能绑定）。绑定后该字段的值变成 slot 表达式（如 `"s0"`），再用 `set_scan_table` 提供一张 `N_points x N_slots` 的表；`compile_scan` 把整张表编译成**一个**硬件 program——FPGA 在扫描点之间无缝切换（affine tick：`effective_tick = base + (coeff*s0)>>8`），不需要逐点重新上传。GUI 里的同一件事是：点 duration/DAC 输入框右侧的圆点（变橙色、显示 slot 号），再到 Scan 页生成或 Load Array 一张 scan table。下面这个例子不打开 GUI，只用 API 扫 `image` period 的宽度。
+扫描用**有语义名字的 `ScanSlot`**。`bind_field(kind, target, label=...)` 把 duration 或 DAC 字段绑定到一个公开名字；`s0/s1/...` 只是在 period 表达式与 affine 编译器里的列 token，不是 UI、plot 或结果数据的轴名。`set_scan_table` 提供 `N_points x N_slots` 的表；`compile_scan` 把整张表编译成**一个**硬件 program——FPGA 在扫描点之间无缝切换，不逐点重新上传。GUI 里的同一件事是：绑定字段、给 slot 命名，再到 Scan 页生成或 Load Array。下面这个例子不打开 GUI，只用 API 扫 `image width`。
 
 <!-- cell:code -->
-scan_state = na.PulseTableState(
-    channels=["ch09", "ch03", "ch11"],
+scan_catalog = na.PortCatalog.from_channels(
+    ["ch09", "ch03", "ch11"],
     channel_labels={"ch09": "trap", "ch03": "probe", "ch11": "emCCD"},
+)
+scan_state = na.PulseTableState(
+    port_catalog=scan_catalog,
     time_step_ns=20,
     periods=[
         na.PulsePeriod(1000, (1, 0, 0), unit="ns", name="pre"),
@@ -145,18 +152,20 @@ scan_state = na.PulseTableState(
         na.PulsePeriod(1000, (0, 0, 0), unit="ns", name="idle"),
     ],
 )
-scan_state.bind_field("duration", "1", label="image width")   # period 1 duration -> s0
+scan_state.bind_field(
+    "duration", "1", label="image width", name="image_width")
 scan_state = scan_state.set_scan_table([[240], [500], [1000], [2000]])  # N_points x N_slots, ns
 
 scan_program = scan_state.compile_scan(clock_hz=50_000_000)
 scan_program.scan_points, scan_program.ticks  # 一个 program 携带全部扫描点(tick 单位)
 
 <!-- cell:code -->
-# 单点检查：with_slots_resolved 把 s0 换成一个具体值(其余 slot 保持 nominal)，
+# 单点检查：with_slots_resolved 按公开名 image_width 换成具体值，
 # 得到一张普通的静态表；compile(slots=...) 等价。
-single = scan_state.with_slots_resolved({"s0": 500})
+single = scan_state.with_slots_resolved({"image_width": 500})
 single_program = single.compile(clock_hz=50_000_000)
-[(width, scan_state.total_duration_steps(slots={"s0": width}, time_step_ns=20))
+[(width, scan_state.with_slots_resolved({"image_width": width})
+                   .total_duration_steps(time_step_ns=20))
  for width in [240, 500, 1000, 2000]], single_program.ticks
 
 <!-- cell:markdown -->
@@ -164,16 +173,18 @@ For real hardware, do not let the GUI invent hardware. Start the server on the
 FPGA/Vivado computer, then attach the same `RemoteSequencer` from GUI or API:
 
 ```python
+pulse_state = na.PulseTableState.load("pulses/camera_imaging_address_switch.json")
 sequencer = na.RemoteSequencer(
     host="FPGA_SERVER_IP",   # 改成你 FPGA/Vivado 电脑的 IP
     port=18861,
-    channels=[f"ch{i:02d}" for i in range(62)],
-    clock_hz=50_000_000,
 )
+sequencer.open()  # PortCatalog 与 clock_hz 都只从 server snapshot 绑定
+pulse_state = pulse_state.aligned_to_catalog(sequencer.port_catalog).snapped(
+    time_step_ns=1e9 / sequencer.clock_hz)
 # 哪条线触发相机（emCCD/M13）是相机的属性（camera.capture_trigger_channels），
 # 不是序列器的——序列器是纯脉冲流送器，不感知谁被它触发。
 gui = zf.show_pulse_gui(
-    state=na.PulseTableState.load("pulses/camera_imaging_address_switch.json"),
+    state=pulse_state,
     sequencer=sequencer,
 )
 ```

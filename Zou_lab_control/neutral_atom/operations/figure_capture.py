@@ -6,8 +6,8 @@ A saved ``.npz`` carries more than ``data_x`` / ``data_y``: to re-BUILD every pa
 record "what the apparatus was doing when this data was taken", the save folds two blocks into
 ``info``:
 
-  * ``info['signals']`` -- the RAW native hub blocks the panel consumes, keyed by bare name, each with
-    its :class:`SignalSpec` contract metadata and a ROLE (value / x / centers / frame);
+  * ``info['signals']`` -- the canonical Hub tensors the panel consumes, keyed by bare name, each with
+    its registered :class:`SignalSchema` metadata and a ROLE (value / x / centers / frame);
   * ``info['provenance']`` -- a FLAT device-state record of the SOURCE that produced the data (the
     ``devices`` snapshots + acquisition params always at the top level, whether the panel is wired
     straight to a measurement or to a processor of one).
@@ -35,21 +35,16 @@ import numpy as np
 ResolveNode = Callable[[str], object]
 
 
-def _spec_shapes(node, full: str) -> tuple[Optional[tuple], Optional[tuple], str, str]:
-    """The ``(points_shape, data_shape, label, unit)`` a signal's :class:`SignalSpec` declares, read off
-    its producing ``node`` -- so the reloader has the SAME contract metadata the live panel had.  Every
-    lookup soft-fails (a node without ``signal_spec`` / a signal with no spec -> defaults), so a save is
-    never blocked for a role whose metadata cannot be resolved."""
-    spec = None
-    try:
-        spec = node.signal_spec(full)
-    except Exception:
-        spec = None
-    ps = tuple(spec.points_shape) if (spec is not None and spec.points_shape is not None) else None
-    ds = tuple(spec.data_shape) if (spec is not None and spec.data_shape is not None) else None
-    label = str(getattr(spec, "label", "") or "") if spec is not None else ""
-    unit = str(getattr(spec, "unit", "") or "") if spec is not None else ""
-    return ps, ds, label, unit
+def _schema_shapes(schema) -> tuple[tuple, tuple, str, str]:
+    """Serialize the schema carried by one atomic Hub tensor snapshot.
+
+    The Hub is the normalization boundary for both declared producer outputs and raw external values.
+    In particular, an external auxiliary array is registered as one point whose full ndarray shape is
+    ``data_shape``.  Reading the schema from the same :class:`SignalTensor` as the block keeps save and
+    load faithful across schema epochs without a second registry read or any ndarray-rank guess.
+    """
+    return (tuple(schema.point_shape), tuple(schema.data_shape),
+            str(schema.label or ""), str(schema.unit or ""))
 
 
 def capture_figure_signals(hub, node, inputs) -> dict[str, dict]:
@@ -69,8 +64,9 @@ def capture_figure_signals(hub, node, inputs) -> dict[str, dict]:
       * ``centers`` = the node's site-centre output (``prefix + sitemap_centers_key``);
       * ``frame``   = the node's underlay-image output (``prefix + sitemap_image_key``).
 
-    Each role stores the CURRENT native block (``hub.latest`` -- a copy of the raw, un-reshaped array)
-    plus the :class:`SignalSpec`'s ``points_shape`` / ``data_shape`` / ``label`` / ``unit``.  A missing
+    Each role stores one atomic ``hub.latest_tensor`` snapshot: its CURRENT canonical block
+    (``(R,P,*data_shape)``) plus that same tensor's registered ``point_shape`` / ``data_shape`` /
+    ``label`` / ``unit``.  A missing
     role (no such signal / not on the hub / no producing node) is simply SKIPPED -- a save never fails
     for a role it cannot resolve, and only the ``signals`` key is added (``data_x`` / ``data_y``
     unchanged).  Returns ``{}`` when there is no wired input or no producing node."""
@@ -95,9 +91,10 @@ def capture_figure_signals(hub, node, inputs) -> dict[str, dict]:
         if not full:
             continue
         try:
-            block = hub.latest(full)                        # raw native block (a copy), un-reshaped
+            tensor = hub.latest_tensor(full)                # one atomic data + schema snapshot
         except Exception:
             continue                                        # signal not on the hub right now -> skip role
+        block = tensor.data
         bare = full[len(prefix):] if prefix and full.startswith(prefix) else full
         # One SIGNAL can fill two roles (a 2-D camera panel whose ``value`` IS the underlay ``frame``:
         # inputs[0] == sitemap_image_key).  ``roles`` lists ``value`` FIRST, so the first writer wins --
@@ -105,7 +102,7 @@ def capture_figure_signals(hub, node, inputs) -> dict[str, dict]:
         # same-signal ``frame`` rather than clobbering it to role="frame".
         if bare in signals:
             continue
-        ps, ds, label, unit = _spec_shapes(node, full)
+        ps, ds, label, unit = _schema_shapes(tensor.schema)
         signals[bare] = {
             "block": np.asarray(block),
             "points_shape": ps,

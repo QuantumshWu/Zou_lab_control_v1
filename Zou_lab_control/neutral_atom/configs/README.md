@@ -36,6 +36,9 @@ hardware-trigger config**, or multi-frame acquisitions count edges on the wrong 
 
 **`RemoteSequencer`** (`remote_template.json`) — set `host` to your FPGA/Vivado server's address
 (the placeholder `"FPGA_SERVER_IP"` fails clearly until replaced); `port` must match `run_server`.
+Its raw lanes and logical DAC/clock/digital ports come only from the connected server's immutable
+`PortCatalog`, and its clock comes from that same server snapshot. There are no client-side
+`channels`, `port_catalog`, or `clock_hz` hardware facts to keep in sync.
 `ManualSequencer` (`manual_template.json`) prints its `message` and waits for you to arm the FPGA
 by hand — no server needed.
 
@@ -48,10 +51,12 @@ by hand — no server needed.
   roles are tolerated. Keep comments here in this README, not as `_comment` keys in the JSON.
 - A camera that images single atoms in tweezers (readout / survival / fidelity) must be the science
   camera; a MOT `monitor_camera` cannot. The temperature/fidelity measurements are pinned to the
-  readout camera on purpose (no dropdown); `pulse_scan` / camera-live / MOT-field expose the choice.
+  readout camera on purpose. Generic `pulse_scan` owns only the sequencer and consumes an explicitly
+  selected Hub signal; camera acquisition and reduction are independent measurement/processor nodes.
 - **`camera` vs `monitor_camera` are NOT two device types — both are `CameraDevice`, one domain.**
   The names are just config keys for two physical sensors (a readout qCMOS wired to the emCCD line;
-  a MOT viewer wired to `mot_trigger`). Every camera-using form lists BOTH in its Camera dropdown.
+  a MOT viewer wired to `mot_trigger`). Forms that declare a general camera-device role list both;
+  domain-specific operations may bind the required sensor directly.
   Convention: name your primary/readout camera `camera` — `default_camera_name()` / `exp.camera`
   resolve to that name when present, else to the first camera by name (no crash, but the default may
   then not be the one you meant, so with two unconventionally-named cameras, name one `camera` or pick

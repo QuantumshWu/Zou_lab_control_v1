@@ -74,7 +74,9 @@ def test_delay_field_can_become_an_api_slot_via_gui():
     editor = PulseSequenceEditor(state=default_imaging_template())
     try:
         state = editor.read_state()
-        channel = next(c for c in state.channels if c != "emCCD")   # any non-bus TTL channel
+        channel = next(
+            lane for lane in state.port_catalog.raw_lanes if lane != "emCCD"
+        )   # any non-bus TTL channel
         assert editor.state.api_slot_for("delay", channel) is None
         editor._toggle_delay_api(channel)                            # the dot's none -> api step
         bound = editor.read_state()

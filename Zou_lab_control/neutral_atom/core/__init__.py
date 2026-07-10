@@ -10,8 +10,21 @@ from .analysis import (
     sort_centers_grid,
 )
 from .bimodal import BimodalFit, exact_otsu_threshold, fit_bimodal, fit_bimodal_per_site, gaussian_fidelity, optimal_gaussian_threshold
-from .calibration import TrapCalibration
+from .calibration import FrameContract, TrapCalibration
+from .fitting import (
+    FitModel,
+    FitRequest,
+    FitResult,
+    HistogramFitResult,
+    fit_data,
+    fit_histogram,
+    fit_image,
+    fit_model,
+    fit_models,
+    fit_selected,
+)
 from .psf import SitePSF, fit_site_psfs, psf_boxes_array, psf_signals, psf_weights_array
+from .raster import RegularRaster
 from .results import (
     CaptureResult,
     DetectionResult,
@@ -22,26 +35,66 @@ from .results import (
     SitemapResult,
     ThresholdResult,
 )
+from .signals import (
+    CoherentUpdate,
+    HistoryReservation,
+    SignalCursor,
+    SignalHistoryGap,
+    SignalHub,
+    SignalSchema,
+    SignalSubscription,
+    SignalSubscriptionCursor,
+    SignalTensor,
+    TensorHistory,
+    TensorPatch,
+)
+from .selection import AxisRange, SelectedData, Selection, select_rows
 
 __all__ = [
     "AtomDetection",
+    "AxisRange",
     "BimodalFit",
     "CaptureResult",
+    "CoherentUpdate",
     "DetectionResult",
     "DetectionTimeScanResult",
     "FidelityEstimate",
+    "FitModel",
+    "FitRequest",
+    "FitResult",
+    "FrameContract",
+    "HistogramFitResult",
+    "HistoryReservation",
     "MeasurementTaskResult",
     "PreflightReport",
+    "RegularRaster",
     "ResultObject",
+    "SignalCursor",
+    "SignalHistoryGap",
+    "SignalHub",
+    "SignalSchema",
+    "SignalSubscription",
+    "SignalSubscriptionCursor",
+    "SignalTensor",
+    "SelectedData",
+    "Selection",
     "SitePSF",
     "SitemapResult",
     "ThresholdResult",
+    "TensorHistory",
+    "TensorPatch",
     "TrapCalibration",
     "estimate_threshold_fidelity",
     "exact_otsu_threshold",
     "find_site_centers",
     "fit_bimodal",
     "fit_bimodal_per_site",
+    "fit_data",
+    "fit_histogram",
+    "fit_image",
+    "fit_model",
+    "fit_models",
+    "fit_selected",
     "fit_site_psfs",
     "gaussian_fidelity",
     "optimal_gaussian_threshold",
@@ -50,5 +103,6 @@ __all__ = [
     "psf_signals",
     "psf_weights_array",
     "roi_counts",
+    "select_rows",
     "sort_centers_grid",
 ]

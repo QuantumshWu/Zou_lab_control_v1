@@ -19,9 +19,10 @@ from .core.analysis import (
     sort_centers_grid,
 )
 from .core.bimodal import BimodalFit, fit_bimodal, fit_bimodal_per_site, gaussian_fidelity
-from .core.calibration import TrapCalibration
+from .core.calibration import FrameContract, TrapCalibration
 from .core.params import ParamDecl
 from .core.psf import SitePSF, fit_site_psfs, psf_signals
+from .ports import PortCatalog, PortSpec
 from .devices import DEFAULT_DCAM_MODULE, QCMOSCamera, QCMOSConfig
 from .devices import (
     BaseDevice,
@@ -65,7 +66,6 @@ from .timing import (
     default_pulse_name,
     exposure_from_sequence,
     imaging_sequence,
-    infer_bus_channels,
     plot_sequence,
     positive_time_step_ns,
     quantized_time_ns,
@@ -85,6 +85,7 @@ from .operations import (
     ProcessorSpec,
     ReleaseRecapturePlan,
     RunIndex,
+    RunManifest,
     ScanAxis,
     ScanResult,
     ScannedMeasurement,
@@ -97,6 +98,7 @@ from .operations import (
     fit_temperature,
     frame_files,
     index_run,
+    index_manifest,
     load_frame,
     measurement,
     processor,
@@ -216,11 +218,14 @@ __all__ = [
     "LogicNode",
     "ExperimentSubsystem",
     "FidelityEstimate",
+    "FrameContract",
     "MeasurementSpec",
     "ManualSequencer",
     "MeasurementTaskResult",
     "NeutralAtomSession",
     "ANALOG_BUS_MODES",
+    "PortCatalog",
+    "PortSpec",
     "PreflightReport",
     "Pulse",
     "PulseController",
@@ -277,7 +282,6 @@ __all__ = [
     "hardware_channel_names",
     "image_to_points",
     "imaging_sequence",
-    "infer_bus_channels",
     "discover_devices",
     "discovery_note",
     "infer_xdc_channel_count",
@@ -305,10 +309,12 @@ __all__ = [
     "virtual_config",
     "write_virtual_run",
     "index_run",
+    "index_manifest",
     "load_frame",
     "save_frame",
     "frame_files",
     "RunIndex",
+    "RunManifest",
     "build_release_recapture_pulse",
     "fit_temperature",
     "release_recapture_survival",

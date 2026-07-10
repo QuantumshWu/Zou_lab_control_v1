@@ -207,7 +207,7 @@ def test_snapshot_type_key_is_produced_only_by_the_base_class(monkeypatch):
         PylonCamera(trigger_source=SOFTWARE_TRIGGER),
         QCMOSCamera({"exposure": 1e-3}),
         ManualSequencer(channels=["trap", "emCCD"]),
-        RemoteSequencer(host="192.0.2.1", port=1, channels=["trap", "emCCD"]),
+        RemoteSequencer(host="192.0.2.1", port=1),
     ]
     for dev in devices:                                      # the normal reading first
         snap = dev.snapshot()

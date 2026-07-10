@@ -368,24 +368,31 @@ def generate_fpga_manual_figures(asset_dir: str | Path) -> dict[str, Path]:
     figs: dict[str, Path] = {}
 
     # (1) 20 ns / 1-tick resolution: back-to-back 1-tick edges, one per 20 ns tick.
-    tick = na.PulseTableState(
-        channels=["ch00", "ch01", "ch02"],
+    tick_catalog = na.PortCatalog.from_channels(
+        ["ch00", "ch01", "ch02"],
         channel_labels={"ch00": "cooling", "ch01": "probe", "ch02": "trig"},
-        visible_channels=["ch00", "ch01", "ch02"],
+    )
+    tick = na.PulseTableState(
+        port_catalog=tick_catalog,
+        visible_ports=["ch00", "ch01", "ch02"],
         time_step_ns=20,
         periods=[na.PulsePeriod(20, (1, 0, 0), unit="ns"), na.PulsePeriod(20, (0, 1, 0), unit="ns"),
                  na.PulsePeriod(20, (0, 0, 1), unit="ns"), na.PulsePeriod(20, (0, 0, 0), unit="ns")],
     )
     figs["tick"] = _render_pulse_png(asset_dir / "fpga_1tick.png", tick.to_sequence(),
-                                     channels=["ch00", "ch01", "ch02"], channel_labels=tick.channel_labels,
+                                     channels=["ch00", "ch01", "ch02"],
+                                     channel_labels=tick.port_catalog.channel_labels,
                                      show_names=True, caption="背靠背 1-tick 脉冲")
 
     # (2) affine scan: the SAME pulse rendered at two scan points -- the scanned
     # middle period slides the later edge in lockstep.
     def scan_state(mid_ns):
+        catalog = na.PortCatalog.from_channels(
+            ["ch00", "ch01"],
+            channel_labels={"ch00": "cooling", "ch01": "probe"},
+        )
         return na.PulseTableState(
-            channels=["ch00", "ch01"], channel_labels={"ch00": "cooling", "ch01": "probe"},
-            visible_channels=["ch00", "ch01"], time_step_ns=20,
+            port_catalog=catalog, visible_ports=["ch00", "ch01"], time_step_ns=20,
             periods=[na.PulsePeriod(60, (1, 0), unit="ns"), na.PulsePeriod(mid_ns, (0, 1), unit="ns"),
                      na.PulsePeriod(60, (0, 0), unit="ns")])
     figs["scan_lo"] = _render_pulse_png(asset_dir / "fpga_scan_lo.png", scan_state(40).to_sequence(),
@@ -395,8 +402,11 @@ def generate_fpga_manual_figures(asset_dir: str | Path) -> dict[str, Path]:
 
     # (3) hardware loop / repeat-forever: the loop body with a repeat bracket.
     rep = na.PulseTableState(
-        channels=["ch00", "ch01"], channel_labels={"ch00": "load", "ch01": "trig"},
-        visible_channels=["ch00", "ch01"], time_step_ns=20,
+        port_catalog=na.PortCatalog.from_channels(
+            ["ch00", "ch01"],
+            channel_labels={"ch00": "load", "ch01": "trig"},
+        ),
+        visible_ports=["ch00", "ch01"], time_step_ns=20,
         periods=[na.PulsePeriod(40, (1, 0), unit="ns"), na.PulsePeriod(40, (0, 1), unit="ns"),
                  na.PulsePeriod(40, (0, 0), unit="ns")])
     rep_seq = rep.to_sequence(expand_repeat=False)
@@ -421,7 +431,9 @@ def generate_fpga_manual_figures(asset_dir: str | Path) -> dict[str, Path]:
     # start + end marker pulses so the timeline x-axis spans the full 0..4 us and the
     # ramp (1..3 us) is on-screen.
     dctx = na.PulseTableState(
-        channels=["ch00"], channel_labels={"ch00": "trig"}, visible_channels=["ch00"], time_step_ns=20,
+        port_catalog=na.PortCatalog.from_channels(
+            ["ch00"], channel_labels={"ch00": "trig"}),
+        visible_ports=["ch00"], time_step_ns=20,
         periods=[na.PulsePeriod(40, (1,), unit="ns"), na.PulsePeriod(3920, (0,), unit="ns"),
                  na.PulsePeriod(40, (1,), unit="ns")])
     figs["dac"] = _render_pulse_png(asset_dir / "fpga_dac.png", dctx.to_sequence(), channels=["ch00"],

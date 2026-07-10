@@ -1,71 +1,465 @@
 {
   "schema": "Zou_lab_control.neutral_atom.PulseTableState",
-  "version": 3,
+  "version": 4,
   "name": "camera_imaging_address_switch",
-  "channels": [
-    "ch00",
-    "ch01",
-    "ch02",
-    "ch03",
-    "ch04",
-    "ch05",
-    "ch06",
-    "ch07",
-    "ch08",
-    "ch09",
-    "ch10",
-    "ch11",
-    "ch12",
-    "ch13",
-    "ch14",
-    "ch15",
-    "ch16",
-    "ch17",
-    "ch18",
-    "ch19",
-    "ch20",
-    "ch21",
-    "ch22",
-    "ch23",
-    "ch24",
-    "ch25",
-    "ch26",
-    "ch27",
-    "ch28",
-    "ch29",
-    "ch30",
-    "ch31",
-    "ch32",
-    "ch33",
-    "ch34",
-    "ch35",
-    "ch36",
-    "ch37",
-    "ch38",
-    "ch39",
-    "ch40",
-    "ch41",
-    "ch42",
-    "ch43",
-    "ch44",
-    "ch45",
-    "ch46",
-    "ch47",
-    "ch48",
-    "ch49",
-    "ch50",
-    "ch51",
-    "ch52",
-    "ch53",
-    "ch54",
-    "ch55",
-    "ch56",
-    "ch57",
-    "ch58",
-    "ch59",
-    "ch60",
-    "ch61"
+  "port_catalog": {
+    "schema": "Zou_lab_control.neutral_atom.PortCatalog",
+    "version": 1,
+    "raw_lanes": [
+      "ch00",
+      "ch01",
+      "ch02",
+      "ch03",
+      "ch04",
+      "ch05",
+      "ch06",
+      "ch07",
+      "ch08",
+      "ch09",
+      "ch10",
+      "ch11",
+      "ch12",
+      "ch13",
+      "ch14",
+      "ch15",
+      "ch16",
+      "ch17",
+      "ch18",
+      "ch19",
+      "ch20",
+      "ch21",
+      "ch22",
+      "ch23",
+      "ch24",
+      "ch25",
+      "ch26",
+      "ch27",
+      "ch28",
+      "ch29",
+      "ch30",
+      "ch31",
+      "ch32",
+      "ch33",
+      "ch34",
+      "ch35",
+      "ch36",
+      "ch37",
+      "ch38",
+      "ch39",
+      "ch40",
+      "ch41",
+      "ch42",
+      "ch43",
+      "ch44",
+      "ch45",
+      "ch46",
+      "ch47",
+      "ch48",
+      "ch49",
+      "ch50",
+      "ch51",
+      "ch52",
+      "ch53",
+      "ch54",
+      "ch55",
+      "ch56",
+      "ch57",
+      "ch58",
+      "ch59",
+      "ch60",
+      "ch61"
+    ],
+    "ports": [
+      {
+        "key": "ch00",
+        "kind": "digital",
+        "lanes": [
+          "ch00"
+        ],
+        "label": "cooling",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch01",
+        "kind": "digital",
+        "lanes": [
+          "ch01"
+        ],
+        "label": "cooling_pgc",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch02",
+        "kind": "digital",
+        "lanes": [
+          "ch02"
+        ],
+        "label": "repump",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch03",
+        "kind": "digital",
+        "lanes": [
+          "ch03"
+        ],
+        "label": "probe",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch04",
+        "kind": "digital",
+        "lanes": [
+          "ch04"
+        ],
+        "label": "pushout",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch05",
+        "kind": "digital",
+        "lanes": [
+          "ch05"
+        ],
+        "label": "state_pre",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch06",
+        "kind": "digital",
+        "lanes": [
+          "ch06"
+        ],
+        "label": "trig",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch07",
+        "kind": "digital",
+        "lanes": [
+          "ch07"
+        ],
+        "label": "coil",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch08",
+        "kind": "digital",
+        "lanes": [
+          "ch08"
+        ],
+        "label": "grey_cooling",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch09",
+        "kind": "digital",
+        "lanes": [
+          "ch09"
+        ],
+        "label": "trap",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch10",
+        "kind": "digital",
+        "lanes": [
+          "ch10"
+        ],
+        "label": "UV",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch11",
+        "kind": "digital",
+        "lanes": [
+          "ch11"
+        ],
+        "label": "emCCD",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch12",
+        "kind": "digital",
+        "lanes": [
+          "ch12"
+        ],
+        "label": "microwave",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch13",
+        "kind": "digital",
+        "lanes": [
+          "ch13"
+        ],
+        "label": "address",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch14",
+        "kind": "digital",
+        "lanes": [
+          "ch14"
+        ],
+        "label": "cooling_shutter",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch15",
+        "kind": "digital",
+        "lanes": [
+          "ch15"
+        ],
+        "label": "repump_shutter",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch16",
+        "kind": "digital",
+        "lanes": [
+          "ch16"
+        ],
+        "label": "probe_shutter",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch17",
+        "kind": "digital",
+        "lanes": [
+          "ch17"
+        ],
+        "label": "bias",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "da_dipole",
+        "kind": "dac",
+        "lanes": [
+          "ch18",
+          "ch19",
+          "ch20",
+          "ch21",
+          "ch22",
+          "ch23",
+          "ch24",
+          "ch25",
+          "ch26",
+          "ch27"
+        ],
+        "label": "da_dipole",
+        "bus_index": 0,
+        "width": 10,
+        "encoding": "offset_binary",
+        "safe_value": 512,
+        "latch_clock": "da_clk0"
+      },
+      {
+        "key": "da_clk0",
+        "kind": "clock",
+        "lanes": [
+          "ch28"
+        ],
+        "label": "da_clk0",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "da_bias_y",
+        "kind": "dac",
+        "lanes": [
+          "ch38",
+          "ch37",
+          "ch36",
+          "ch35",
+          "ch34",
+          "ch33",
+          "ch32",
+          "ch31",
+          "ch30",
+          "ch29"
+        ],
+        "label": "da_bias_y",
+        "bus_index": 1,
+        "width": 10,
+        "encoding": "offset_binary",
+        "safe_value": 512,
+        "latch_clock": "da_clk1"
+      },
+      {
+        "key": "da_clk1",
+        "kind": "clock",
+        "lanes": [
+          "ch39"
+        ],
+        "label": "da_clk1",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "da_bias_x",
+        "kind": "dac",
+        "lanes": [
+          "ch40",
+          "ch41",
+          "ch42",
+          "ch43",
+          "ch44",
+          "ch45",
+          "ch46",
+          "ch47",
+          "ch48",
+          "ch49"
+        ],
+        "label": "da_bias_x",
+        "bus_index": 2,
+        "width": 10,
+        "encoding": "offset_binary",
+        "safe_value": 512,
+        "latch_clock": "da_clk2"
+      },
+      {
+        "key": "da_clk2",
+        "kind": "clock",
+        "lanes": [
+          "ch50"
+        ],
+        "label": "da_clk2",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "da_bias_z",
+        "kind": "dac",
+        "lanes": [
+          "ch60",
+          "ch59",
+          "ch58",
+          "ch57",
+          "ch56",
+          "ch55",
+          "ch54",
+          "ch53",
+          "ch52",
+          "ch51"
+        ],
+        "label": "da_bias_z",
+        "bus_index": 3,
+        "width": 10,
+        "encoding": "offset_binary",
+        "safe_value": 512,
+        "latch_clock": "da_clk3"
+      },
+      {
+        "key": "da_clk3",
+        "kind": "clock",
+        "lanes": [
+          "ch61"
+        ],
+        "label": "da_clk3",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      }
+    ],
+    "fingerprint": "287d252a3521823f"
+  },
+  "scan_slots": [
+    {
+      "name": "exposure",
+      "kind": "duration",
+      "target": "3",
+      "label": "exposure",
+      "unit": "ns",
+      "nominal": 19980000.0
+    }
   ],
+  "scan_table": [],
+  "scan_code": "",
+  "api_slots": [],
   "time_step_ns": 20.0,
   "periods": [
     {
@@ -414,126 +808,12 @@
       ]
     }
   ],
-  "visible_channels": [
+  "visible_ports": [
     "ch09",
     "ch00",
     "ch03",
     "ch11"
   ],
-  "channel_labels": {
-    "ch00": "cooling",
-    "ch01": "cooling_pgc",
-    "ch02": "repump",
-    "ch03": "probe",
-    "ch04": "pushout",
-    "ch05": "state_pre",
-    "ch06": "trig",
-    "ch07": "coil",
-    "ch08": "grey_cooling",
-    "ch09": "trap",
-    "ch10": "UV",
-    "ch11": "emCCD",
-    "ch12": "microwave",
-    "ch13": "address",
-    "ch14": "cooling_shutter",
-    "ch15": "repump_shutter",
-    "ch16": "probe_shutter",
-    "ch17": "bias",
-    "ch18": "da_dipole[0]",
-    "ch19": "da_dipole[1]",
-    "ch20": "da_dipole[2]",
-    "ch21": "da_dipole[3]",
-    "ch22": "da_dipole[4]",
-    "ch23": "da_dipole[5]",
-    "ch24": "da_dipole[6]",
-    "ch25": "da_dipole[7]",
-    "ch26": "da_dipole[8]",
-    "ch27": "da_dipole[9]",
-    "ch28": "da_clk0",
-    "ch29": "da_bias_y[9]",
-    "ch30": "da_bias_y[8]",
-    "ch31": "da_bias_y[7]",
-    "ch32": "da_bias_y[6]",
-    "ch33": "da_bias_y[5]",
-    "ch34": "da_bias_y[4]",
-    "ch35": "da_bias_y[3]",
-    "ch36": "da_bias_y[2]",
-    "ch37": "da_bias_y[1]",
-    "ch38": "da_bias_y[0]",
-    "ch39": "da_clk1",
-    "ch40": "da_bias_x[0]",
-    "ch41": "da_bias_x[1]",
-    "ch42": "da_bias_x[2]",
-    "ch43": "da_bias_x[3]",
-    "ch44": "da_bias_x[4]",
-    "ch45": "da_bias_x[5]",
-    "ch46": "da_bias_x[6]",
-    "ch47": "da_bias_x[7]",
-    "ch48": "da_bias_x[8]",
-    "ch49": "da_bias_x[9]",
-    "ch50": "da_clk2",
-    "ch51": "da_bias_z[9]",
-    "ch52": "da_bias_z[8]",
-    "ch53": "da_bias_z[7]",
-    "ch54": "da_bias_z[6]",
-    "ch55": "da_bias_z[5]",
-    "ch56": "da_bias_z[4]",
-    "ch57": "da_bias_z[3]",
-    "ch58": "da_bias_z[2]",
-    "ch59": "da_bias_z[1]",
-    "ch60": "da_bias_z[0]",
-    "ch61": "da_clk3"
-  },
-  "analog_buses": {
-    "da_dipole": [
-      "ch18",
-      "ch19",
-      "ch20",
-      "ch21",
-      "ch22",
-      "ch23",
-      "ch24",
-      "ch25",
-      "ch26",
-      "ch27"
-    ],
-    "da_bias_y": [
-      "ch38",
-      "ch37",
-      "ch36",
-      "ch35",
-      "ch34",
-      "ch33",
-      "ch32",
-      "ch31",
-      "ch30",
-      "ch29"
-    ],
-    "da_bias_x": [
-      "ch40",
-      "ch41",
-      "ch42",
-      "ch43",
-      "ch44",
-      "ch45",
-      "ch46",
-      "ch47",
-      "ch48",
-      "ch49"
-    ],
-    "da_bias_z": [
-      "ch60",
-      "ch59",
-      "ch58",
-      "ch57",
-      "ch56",
-      "ch55",
-      "ch54",
-      "ch53",
-      "ch52",
-      "ch51"
-    ]
-  },
   "analog_bus_modes": {},
   "delays": {},
   "delay_units": {},
@@ -541,14 +821,5 @@
   "repeat_end": null,
   "repeat_count": 1,
   "repeat_forever": true,
-  "scan_slots": [
-    {
-      "kind": "duration",
-      "target": "3",
-      "label": "exposure",
-      "unit": "ns",
-      "nominal": 19980000.0
-    }
-  ],
-  "scan_table": []
+  "scan_repeats": 0
 }

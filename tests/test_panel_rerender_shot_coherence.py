@@ -20,7 +20,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("ZLC_VIRTUAL_SLEEP_SCALE", "0")
 
 
-def test_rerender_uses_current_shot_not_stale_cache():
+def test_rerender_uses_current_shot_not_stale_cache(tmp_path):
     import Zou_lab_control.neutral_atom as na
     from tests.conftest import fire_live_imaging
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
@@ -44,6 +44,9 @@ def test_rerender_uses_current_shot_not_stale_cache():
             kc.setCurrentIndex(i); con._add_panel(); return con.logic_nodes[-1]
 
         cam = add(("camera", "live")); jud = add(("processor", "Judge occupancy"))
+        # The explicit default is session-owned calibration; no filesystem
+        # artifact or fallback can change the geometry according to suite order.
+        assert con._logic_editors[id(jud)].collect_values()["calibration_origin"] == "session"
         i = next(j for j in range(kc.count()) if kc.itemData(j) == "2d")
         kc.setCurrentIndex(i); con._add_panel()
         twod = con.cards[-1]; twod.config.inputs = ["frame_judged"]

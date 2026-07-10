@@ -19,6 +19,7 @@ functions, never re-typed literals, so the tests cannot silently drift from the 
 """
 
 from __future__ import annotations
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 import os
 import sys
@@ -59,7 +60,7 @@ def _busy_state() -> PulseTableState:
     ch = [f"ch{i}" for i in range(8)]
     periods = [PulsePeriod(duration=5 + p, unit="us", name=f"P{p}",
                            states=tuple((p + i) % 2 for i in range(len(ch)))) for p in range(6)]
-    return PulseTableState(channels=ch, periods=periods, name="busy")
+    return PulseTableState(port_catalog=PortCatalog.from_channels(ch), periods=periods, name="busy")
 
 
 def _mostly_off_state() -> PulseTableState:
@@ -72,7 +73,7 @@ def _mostly_off_state() -> PulseTableState:
     periods = [PulsePeriod(duration=5 + p, unit="us", name=f"P{p}",
                            states=tuple((1 if (c in active and (p + ai) % 2 == 0) else 0)
                                         for ai, c in enumerate(ch))) for p in range(3)]
-    return PulseTableState(channels=ch, periods=periods, name="mostly_off")
+    return PulseTableState(port_catalog=PortCatalog.from_channels(ch), periods=periods, name="mostly_off")
 
 
 def _grid_recipe(n=6):
@@ -747,7 +748,7 @@ def test_preview_default_size_uses_optimal():
     dropdown offers exactly ``PANEL_SIZES``.  Picking a size PINS it (stops auto-tracking the content)."""
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
     st = _busy_state()
-    gui = PulseSequenceEditor(state=st, channels=list(st.channels))
+    gui = PulseSequenceEditor(state=st)
     try:
         # unpinned: the effective preview size equals the shared default
         assert gui._preview_size_pinned is False
@@ -778,7 +779,7 @@ def test_preview_size_pin_is_transient_and_auto_recomputes():
     but a plain refresh WHILE staying on Preview keeps a pin (so a manual pick is sticky in-place)."""
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
     st = _mostly_off_state()
-    gui = PulseSequenceEditor(state=st, channels=list(st.channels))
+    gui = PulseSequenceEditor(state=st)
     try:
         # (i) entering the Preview tab: pin is reset and the effective size is the shared optimal default.
         gui._preview_size_pinned = True                       # pretend a pin lingered from a prior visit

@@ -49,9 +49,9 @@ def test_hub_per_signal_history_policy_preserves_native_image_dtype():
     assert hub.history_limit("img") == 3
     assert hub.history_len == 3                         # conservative minimum active ring
     hist = hub.history("img")
-    assert hist.shape == (3, 4, 5)
+    assert hist.shape == (3, 1, 1, 4, 5)               # updates, R, P, H, W
     assert hist.dtype == np.uint16
-    assert int(hist[-1, 0, 0]) == 4
+    assert int(hist[-1, 0, 0, 0, 0]) == 4
 
     hub.remove_signals(["img"])
     assert hub.history_limit("img") == 16               # lifecycle cleanup removes the compact policy too
@@ -72,14 +72,18 @@ def test_console_warns_amber_when_display_falls_behind_then_clears(offscreen):
     console._timer.stop()
     try:
         console._update_summary()                        # establish the baseline read (shot 0)
+        assert "signals" in console.summary.text() and "shot 0" in console.summary.text()
+        assert console.status_strip.text() == ""         # idle status is not a telemetry duplicate
         for i in range(40):                              # a burst FAR exceeding the 8-deep ring
             hub.publish({"v": float(i)})
         console._update_summary()                        # the display "reads" again -> detects the overrun
         assert console.status_strip.severity == "warning"
         assert "display behind" in console.status_strip.text()
         assert "acquisition unaffected" in console.status_strip.text()  # the run is never implicated
+        assert "1 signals" in console.summary.text() and "shot 40" in console.summary.text()
 
         console._update_summary()                        # no new shots since -> display caught up -> clears
         assert console.status_strip.severity != "warning"
+        assert console.status_strip.text() == ""
     finally:
         console.shutdown()

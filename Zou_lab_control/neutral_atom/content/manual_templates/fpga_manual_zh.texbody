@@ -129,7 +129,7 @@ __FPGA_FIG_TICK__
 引擎只有\tfocus{一个}全局边沿指针，所以一次 repeat / loop-rewind / scan-advance / start 只是\tfocus{单周期}的指针 + 影子重装。四个 gapless 重装点（start / loop-rewind / scan-advance / repeat）在边界用上一节的 SEED 不变式重新播种 \pyapi{FIFO_DEPTH} 条影子，于是\tfocus{点 k 的最后一条边沿与点 k+1 的第一条边沿在时间上紧挨着，中间没有缝}。
 
 \section{扫描点 k -> k+1 跨界无缝:前端脉冲实绘}
-仿射扫描把 duration/DAC 值绑到 slot \pyapi{s0..sN}(channel 延时不是扫描量);每个扫描点用新的 slot 向量,边沿的有效 tick = \pyapi{base + (sum coeff*slot) >>> FRAC} 随之平移。下图是\tfocus{前端实绘}的同一脉冲在两个扫描点的输出——被扫的中间周期把后面的边沿在硬件里 lockstep 平移。引擎在播放点 k 末尾的同一拍,就已按 k+1 的新 slot 向量把首批影子重新播种好,所以\tfocus{点 k 的末边沿与点 k+1 的首边沿在时间上紧挨着、无 gap}。
+仿射扫描把 duration/DAC 值绑到有语义名的 \pyapi{ScanSlot}(channel 延时不是扫描量)；公开身份如 \pyapi{probe\_duration}/\pyapi{da\_x}，编译器才按列映射为 \pyapi{s0..sN}。每个扫描点用新的 slot 向量，边沿的有效 tick = \pyapi{base + (sum coeff*slot) >>> FRAC} 随之平移。下图是\tfocus{前端实绘}的同一脉冲在两个扫描点的输出——被扫的中间周期把后面的边沿在硬件里 lockstep 平移。引擎在播放点 k 末尾的同一拍,就已按 k+1 的新 slot 向量把首批影子重新播种好,所以\tfocus{点 k 的末边沿与点 k+1 的首边沿在时间上紧挨着、无 gap}。
 
 __FPGA_FIG_SCAN__
 
@@ -196,7 +196,7 @@ case B 晚到:  游标到 4096 但 bank0 还不是 chunk2
 effective_tick = base_tick + (sum_j coeff_j * slot_j) >>> COEFF_FRAC_BITS
 \end{codeblock}
 
-其中 \pyapi{slot_j} 是当前扫描点第 $j$ 个 slot 的值（来自扫描点表那一行），\pyapi{COEFF_FRAC_BITS=8} 是定点小数位数。\tfocus{已经没有 x/y}——slot 是任意多个命名维度 \pyapi{s0,s1,...}，每个绑定一个 duration 或 DAC 值字段（\pyapi{SCAN_SLOT_KINDS=("duration","dac")}；channel 延时是固定值，不是扫描量）。这同一个 \pyapi{effective_tick} 表达式被边沿 tick、loop 终点 tick、以及总线段起止 tick \tfocus{复用}——这正是为什么 duration 与 DAC 值能任意组合地同时扫描，且只花一条 MAC 的 LUT。
+其中 \pyapi{slot_j} 是当前扫描点第 $j$ 个语义 slot 的值（来自扫描点表那一行），\pyapi{COEFF_FRAC_BITS=8} 是定点小数位数。\tfocus{没有固定 x/y}——slot 是任意多个 \pyapi{ScanSlot.name} 命名维度，每个绑定一个 duration 或 DAC 值字段；\pyapi{s0,s1,...} 仅是 RTL/编译矩阵的列 token（\pyapi{SCAN_SLOT_KINDS=("duration","dac")}；channel 延时是固定值，不是扫描量）。这同一个 \pyapi{effective_tick} 表达式被边沿 tick、loop 终点 tick、以及总线段起止 tick \tfocus{复用}——这正是为什么 duration 与 DAC 值能任意组合地同时扫描，且只花一条 MAC 的 LUT。
 
 \section{为什么这是对的取舍}
 扫描引擎是把仿射引擎\tfocus{泛化}成 N 个 slot 的流式扫描点表，而不是逐通道游程编码（per-channel）+ 双 bank 存储。取舍围绕 35T 的现实：
@@ -288,13 +288,13 @@ event scheduler (硬件, 真相): [.....0.....][原信号右移 d.....]   <- fir
 
 \textbf{成本小结。} TTL 每条 channel 一个事件 FIFO、DAC 每条\tfocus{总线}一个段 FIFO；这些 FIFO 都是\tfocus{分布式 RAM（LUTRAM / distributed）}，\tfocus{不占额外 BRAM}（\pyapi{ram_style="distributed"}）。因为存的是\tfocus{段描述符}（每条延时总线在途至多 \pyapi{BUS_EVT_DEPTH} 个）而非每 bit 的值事件，一条被延时的密集/长 ramp 只花一个描述符，占用比旧的逐位值 FIFO\tfocus{小得多}。每个信号的 32 位延时值走 \pyapi{R_DELAY} 寄存器区下发，\tfocus{没有}延时上传映像、\tfocus{没有}延时 CTRL 字、\tfocus{没有}迷你装载器。在 35T（\pyapi{xc7a35t}）上 LUT 是绑定轴：段延时落地后在旧配置（\pyapi{EVT_DEPTH}=128 / \pyapi{BUS_SEG_ADDR_WIDTH}=6）超出 35T（$\sim$21958 / 20800 Slice LUT），故发布配置降到 \pyapi{EVT_DEPTH}=64（TTL 事件 LUTRAM 减半）+ \pyapi{BUS_SEG_ADDR_WIDTH}=5（逐总线段表减半），估约 $\sim$20.0k / 20800 $\approx$ 96\%（余量 $\sim$0.8k）；BRAM 38/50、DSP 约 58\%（最终由 Vivado \pyapi{report_utilization} 在比特流重建后确认）。
 
-\section{逐通道 clk 输出（把某通道直接接到时钟）}
-有时需要某个 TTL 引脚直接输出 FPGA 的 \pyapi{clk}（例如给外部 DAC 喂时钟），而引擎按 tick 寄存的输出本身\tfocus{产生不出}一个时钟方波。为此顶层在引脚映射上加了一层\tfocus{运行时可选的 clk 复用}：一个 \pyapi{CHANNEL_COUNT} 位的 \pyapi{clk\_enable} 掩码（CTRL 字 \pyapi{C_CLK_ENABLE}，紧接 20 个命令字之后 = 字 20，62 位占 2 个字；CTRL 块里\tfocus{没有任何延时字}，延时都在 \pyapi{R_DELAY} 寄存器区）随程序映像下发，顶层据此把每个引脚选成
+\section{PortCatalog 固定的 clock port 输出}
+外部 DAC 的 latch-clock 引脚需要直接输出 FPGA \pyapi{clk}，而引擎按 tick 寄存的输出本身\tfocus{产生不出}连续时钟。顶层因此保留一层 clk 复用：\pyapi{CHANNEL_COUNT} 位 \pyapi{clk\_enable} 掩码位于 CTRL 字 \pyapi{C_CLK_ENABLE}（字 20 起，62 位占 2 字；延时仍只在 \pyapi{R_DELAY} 区）。但这个寄存器只是映像承载格式，\tfocus{不是 pulse 可编辑开关}：设备/XDC 边界构造唯一不可变 \pyapi{PortCatalog}，其中 kind=clock 的 port 与每个 DAC 的 \pyapi{latch\_clock} 固定物理所有权；编译器只能从该 catalog 确定掩码，pulse state/JSON/GUI 都不能另列或改选 clock channel。顶层据此把相应引脚选成
 \begin{codeblock}[逐通道 clk 复用（zlc\_pulse\_streamer\_top.v）]
 assign out_final[n] = clk_en[n] ? ~clk : out[n];  // n: 0..CHANNEL_COUNT-1（strobe = 反相 clk）
 // 引脚映射改为驱动 out_final（不是 out）：assign trig = out_final[6]; assign da_clk0 = out_final[28]; ...
 \end{codeblock}
-所以被标记为 clk 的通道，其引脚输出\tfocus{反相的 clk}（即 clk 的\tfocus{下降沿}对应选通上升沿），与引擎完全无关。\tfocus{为什么是反相而不是直接 clk}：DAC 的 40 个并行数据位（\pyapi{da\_bias\_*}/\pyapi{da\_dipole}）由引擎在 \pyapi{posedge clk} 寄存——也就是\tfocus{在上升沿改变}。若选通就是 \pyapi{clk}，DAC 会在\tfocus{同一个上升沿}锁存正在跳变的数据（而且 period 边界上还叠加几十路 TTL 同时翻转的开关噪声），把一次跳变锁成\tfocus{半新半旧的第三个码}——这正是\tfocus{“两个 edge period 之间偶发出现第三种 DA 值”}的根因（在两段之间塞一段 hold 把 DAC 跳变挪离这个忙沿只能治标）。用\tfocus{反相 clk}做选通，DAC 改在 clk 下降沿锁存 = 数据眼图\tfocus{正中}（50\,MHz 下两侧各 $\sim$10\,ns 已稳定）、且是没有任何东西翻转的\tfocus{安静半周期}，于是\tfocus{永远}锁到干净稳定的码。证据见 \filepath{sim/tb\_da\_clk\_phase.v}（引擎段跳变逐 tick 干净无中间值；同沿锁存在真实偏斜下会锁进第三个码，眼图正中锁存\tfocus{从不}）。配套地，主机编译时把该通道的 mask 位\tfocus{强制清 0}（\pyapi{masks[i] &= ~clk_enable}），引擎\tfocus{绝不驱动}它、也就\tfocus{不会覆盖}clk 行为；\pyapi{clk\_enable} 掩码由 \pyapi{PulseTableState.clk\_channels} 经 \pyapi{clk\_enable\_mask()} 算出，随 \pyapi{RuntimeSequenceProgram.clk\_enable} 打包进 CTRL 字（\pyapi{host.image.CtrlWords.CLK_ENABLE}）。换哪条通道做 clk\tfocus{只是改这份运行时掩码、不需要重新综合}；但首次引入这套 mux 需要重新构建一次 bitstream。DAC 总线成员位不允许设成 clk（会破坏 DAC，GUI 已禁用）。这套 mux 是纯组合逻辑、几乎不占资源。
+catalog 标记为 clock 的 port 输出\tfocus{反相的 clk}（即 clk 下降沿对应外设锁存上升沿），与边沿引擎完全无关。\tfocus{为什么反相}：DAC 的并行数据位在 \pyapi{posedge clk} 更新；若同一上升沿又锁存，真实偏斜可能把一次跳变锁成半新半旧的第三个码。在下降沿锁存则位于 50\,MHz 数据眼图中点，两侧各约 10\,ns 已稳定。证据见 \filepath{sim/tb\_da\_clk\_phase.v}。配套地，编译器按 \pyapi{state.port\_catalog.clock\_ports} 生成 \pyapi{clk\_enable\_mask()}，强制清除这些 raw lane 的普通 edge mask，再随 \pyapi{RuntimeSequenceProgram.clk\_enable} 写入 \pyapi{host.image.CtrlWords.CLK_ENABLE}。DAC data lane 与 clock port 的互斥、DAC 到 latch clock 的引用都由 \pyapi{PortCatalog} 构造时一次校验；GUI 与 pulse 文档都不能切换 clock ownership。要改物理 clock port 必须改设备/XDC catalog 并让 fingerprint 校验通过，而不是修改某个 pulse。
 
 \section{两件没有下放进 sequencer 的事}
 两条边界澄清，免得把架构搞混：
@@ -328,7 +328,7 @@ FPGA 侧只有一个入口 \filepath{fpga\textbackslash build\_and\_program.bat}
 \begin{codeblock}[PowerShell]
 .\fpga\build_and_program.bat --check    # 不连板的 HDL 综合 + 容量自查
 .\fpga\build_and_program.bat            # build + program
-.\fpga\run_server.bat --check-config    # 打印 project/bit/ltx/xdc/channels/clock/capacity
+.\fpga\run_server.bat --check-config    # 打印 project/bit/ltx/xdc/catalog fingerprint/clock/capacity
 .\fpga\run_server.bat                    # 启动常驻 hw_axi server (host 0.0.0.0, port 18861)
 \end{codeblock}
 

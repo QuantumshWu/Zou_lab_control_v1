@@ -87,7 +87,7 @@ def test_calibrate_task_computes_every_method_processor_picks(threshold_method):
             occ = OccupancyProcessor(hub, calibration=cal, source_expr={"inputs": ["frame_0"], "source": "value = signal"}, method=m)
             cam.step(); occ.step()
             occupied = np.asarray(hub.latest("occupied"))
-            assert occupied.ndim == 3 and occupied.shape[1:] == (1, 12)   # (repeat, 1, n_sites) -- data_points kept
+            assert occupied.ndim == 3 and occupied.shape[1:] == (1, 12)   # (R,P,*data_shape), P=1
             # the judged frame block is published atomically -> rings + underlay are the same shots; the
             # frame_judged (repeat, 1, H, W) is the camera's frame UNCHANGED (a frame keeps one shape raw or judged)
             assert np.array_equal(hub.latest("frame_judged"), np.asarray(hub.latest("frame_0")))
@@ -97,7 +97,7 @@ def test_calibrate_task_computes_every_method_processor_picks(threshold_method):
 
 def test_calibrate_task_pins_live_camera_exposure_to_the_readout_gate():
     """#issue-2 (live sitemap path): after a live calibration the session camera exposure is PINNED to
-    the gate the thresholds were learnt at (``threshold_exposure``), so the live OccupancyProcessor --
+    the gate the thresholds were learnt at (the typed frame contract), so the live OccupancyProcessor --
     which judges the RUNNING pulse's frames at the camera exposure -- self-matches the calibration
     instead of imaging at a stale default (which would classify every atom dark while the report says
     99 %).  Calibrate at a SHORT 4 ms readout while the camera default is 20 ms, then verify the live
@@ -113,7 +113,7 @@ def test_calibrate_task_pins_live_camera_exposure_to_the_readout_gate():
         task.run_to_completion()
         # the live readout exposure is now the calibrated gate, not the stale 20 ms default
         assert exp.devices.camera.exposure == pytest.approx(0.004), exp.devices.camera.exposure
-        assert (task.calibration.metadata or {}).get("threshold_exposure") == pytest.approx(0.004)
+        assert task.calibration.readout_exposure() == pytest.approx(0.004)
         # and the live judge (camera frame at the pinned exposure) is accurate, not ~0.5 chance
         fire_live_imaging(exp)
         accs = []
@@ -140,7 +140,7 @@ def test_calibration_adoption_survives_exposure_pin_rejection_but_warns(caplog):
     import logging
 
     import Zou_lab_control.neutral_atom as na
-    from Zou_lab_control.neutral_atom.core.calibration import TrapCalibration
+    from Zou_lab_control.neutral_atom.core.calibration import FrameContract, TrapCalibration
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
     class _RejectingCamera:
@@ -165,9 +165,10 @@ def test_calibration_adoption_survives_exposure_pin_rejection_but_warns(caplog):
 
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (48, 60)})
     try:
-        # a stamped calibration (threshold_exposure) so the sink attempts the pin
-        cal = TrapCalibration(centers=[[3.0, 3.0], [9.0, 3.0]], thresholds=[5.0, 5.0],
-                              metadata={"threshold_exposure": 0.004})
+        # A typed exposure contract makes the sink attempt the pin.
+        cal = TrapCalibration(
+            centers=[[3.0, 3.0], [9.0, 3.0]], thresholds=[5.0, 5.0],
+            frame_contract=FrameContract(image_shape=(48, 60), exposure_s=0.004))
         task = exp.readout.calibrate_task(SignalHub(), camera=_RejectingCamera())
         with caplog.at_level(logging.WARNING,
                              logger="Zou_lab_control.neutral_atom.subsystems.readout"):
@@ -242,7 +243,7 @@ def test_calibrate_task_builds_long_short_long_bracket_from_two_exposures(tmp_pa
         # file == fired: the TEMPLATE FILE itself is the long-short-long bracket (3 emCCD
         # frames already in it, not derived at fire time) -- the user's complaint that the
         # template "still has only one emCCD" must never recur.
-        emccd_bit = st.channels.index("emCCD")
+        emccd_bit = st.port_catalog.raw_lanes.index("emCCD")
         assert sum(1 for p in st.periods if p.states[emccd_bit]) == 3
         # The cali sets ONLY the three exposures BY NAME (a1 = first long, a2 = short readout,
         # a3 = second long) and fires THAT template -- it does not invent or unroll a bracket.
@@ -498,10 +499,7 @@ def test_sitemap_is_single_slot_while_other_kinds_allow_multi_slot():
 
 
 def test_pulse_scan_slots_form_is_template_driven():
-    """The Pulse-scan measurement carries ONE auto-form (kind ``pulse_slots``) bound to the
-    sibling ``template`` field: one numeric row per API slot + a Scan-mode toggle over ONE shared
-    scan-table program, rebuilt whenever the template path changes; ``collect_values`` returns the
-    {'api', 'scan_mode', 'scan_code', 'extra_delay'} dict the build() consumes (#H3s-F7)."""
+    """The Pulse-scan form derives both sweep strategies directly from the selected template."""
     from Zou_lab_control.frontend.task_console import MeasurementPanel
 
     exp = _calibrated()
@@ -511,10 +509,9 @@ def test_pulse_scan_slots_form_is_template_driven():
         widget = panel._widgets["pulse_slots"]
         assert panel._decls["pulse_slots"].kind == "pulse_slots"
         out = panel.collect_values()["pulse_slots"]
-        # the form returns the api numeric rows + the single Scan-mode + the active scan_code program
-        # + the inter-point extra_delay -- ONE scan_code (no separate api_scan key anymore).
-        assert isinstance(out, dict) and set(out) == {"api", "scan_mode", "scan_code", "extra_delay"}
-        assert out["scan_mode"] in {"none", "api", "scan"}
+        assert isinstance(out, dict) and set(out) == {
+            "program_id", "api", "sweep_kind", "program"}
+        assert out["program_id"]
         # the imaging template carries 3 unique API handles -> 3 numeric rows after a switch
         panel._widgets["template"].setText("imaging_template.json")
         panel._repopulate_pulse_slots("pulse_slots")
@@ -612,8 +609,9 @@ def test_shipped_imaging_template_is_a_continuous_three_trigger_bracket():
     ``default_imaging_template`` (== ``pulses/imaging_template.json``) must, on its own:
       * trigger the camera THREE DISTINCT times (the trap-held gaps keep the frames separate);
       * cool the cloud ONCE and hold the trap continuously (no re-cool between frames);
-      * expose the two exposures as API slots a1 (the long reference frames) + a2 (the short
-        readout), so the cali sets ONLY those durations BY NAME -- file == fired."""
+      * expose one unique API handle per exposure cell: a1 (first long), a2 (short readout), and
+        a3 (second long); calibration writes the reference value to both outer handles and the
+        readout value to the middle handle -- file == fired."""
     from Zou_lab_control.neutral_atom.timing import default_imaging_template
     from Zou_lab_control.neutral_atom.devices.camera_trigger import count_trigger_pulses
 

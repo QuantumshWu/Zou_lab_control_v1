@@ -145,7 +145,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
     def detect(self, *, exposure: float | None = None, display: bool = True, what: str = "occupancy") -> DetectionResult:
         """Acquire one shot and classify occupancy/counts against the calibration.
 
-        The default readout exposure is the calibration's ``threshold_exposure`` -- the gate time the
+        The default readout exposure is the calibration frame contract's exposure -- the gate time the
         thresholds were LEARNT at -- NOT the camera's current exposure.  The per-site thresholds (bright
         counts) are only valid at the exposure they were measured at: imaging at a different exposure
         (e.g. a 2 ms frame against 20 ms thresholds) classifies every atom dark -> ~50 % occupancy while
@@ -155,8 +155,8 @@ class ReadoutSubsystem(ExperimentSubsystem):
         s = self._session
         calibration = s.require_calibration(require_thresholds=True)
         if exposure is None:
-            # The authoritative reader of the calibration's threshold_exposure (the gate the
-            # thresholds were learnt at); fall back to the camera's current exposure when unstamped.
+            # The authoritative typed reader of the calibration exposure; fall
+            # back to the camera's current exposure when it is unspecified.
             exposure = calibration.readout_exposure(fallback=s.camera_exposure())
         sequence = s.build_imaging_sequence(exposure=float(exposure), load=True, name="detect")
         seq_dev = getattr(s.devices, "sequencer", None)
@@ -429,7 +429,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         This is the SPINE every coupled-reduce measurement shares -- "sweep a NAMED
         pulse slot, reduce each point": a :class:`ScanAxis` over ``slot`` x a
         ``ShotPlan`` x a ``PointReducer``, run by the one :class:`ScannedMeasurement`.
-        :meth:`build_temperature_scan` (slot ``s0`` trap-off -> survival) and
+        :meth:`build_temperature_scan` (semantic slot ``t_off`` -> survival) and
         :meth:`build_detection_scan` (slot ``exposure`` -> Otsu fidelity) are the SAME
         concept and differ ONLY in ``(slot, plan, reducer)`` -- so they call THIS instead
         of re-spelling the engine wiring (the duplication the audit flagged).
@@ -475,7 +475,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
     ) -> ScannedMeasurement:
         """Build (but do not run) the release-recapture survival scan.
 
-        The trap-off axis (``t_off_s`` seconds, bound slot ``s0``) x a
+        The trap-off axis (``t_off_s`` seconds, semantic slot ``t_off``) x a
         ``ReleaseRecapturePlan`` (two frames per point) x a ``SurvivalReducer``
         over the one scan engine.  Single source of truth for release-recapture:
         both :meth:`temperature` (which runs it) and the Temperature measurement
@@ -499,7 +499,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         if per_site:
             reducer.bind_calibration(calibration)
         return self._build_slot_scan(
-            pulse, calibration, slot="s0", values=t_off, label="Trap-off time",
+            pulse, calibration, slot="t_off", values=t_off, label="Trap-off time",
             plan=ReleaseRecapturePlan(), reducer=reducer, shots_per_point=positive_int(shots, "shots"),
         )
 
@@ -724,8 +724,15 @@ class ReadoutSubsystem(ExperimentSubsystem):
             # left on the camera by a previous node.  Endpoints<->ROI conversion is in
             # CameraMeasurement.set_acquisition_parameters (one source of truth).
             apply["region"] = _parse_region(region)
-            if apply and hasattr(node, "apply_acquisition_parameters"):
-                node.apply_acquisition_parameters(**apply)
+            if apply:
+                # A builder configures an UNRUN node; it must not publish.  Calling the public
+                # cross-thread apply entry here used its idle convenience path (configure + step),
+                # so rebuilding one console row on a different-sized camera attempted to publish the
+                # new frame before the row had stopped/transferred ownership from its old schema.  The
+                # console then reported a build failure and silently kept the old camera.  At build time
+                # this thread owns the idle source, so call the owner-thread setter directly.  The first
+                # explicit step/start remains the sole publication boundary.
+                node.set_acquisition_parameters(**apply)
             return node
 
         spec = MeasurementSpec(
@@ -785,13 +792,14 @@ class ReadoutSubsystem(ExperimentSubsystem):
             # task completes -- no path to type, the cali->occupancy connection.
             s.calibration_data = calibration
             # Pin the LIVE readout exposure to the gate the thresholds were learnt at
-            # (``threshold_exposure``): the live OccupancyProcessor judges the RUNNING pulse's frames,
+            # (the FrameContract exposure): the live OccupancyProcessor judges the RUNNING pulse's frames,
             # and a per-site threshold is exposure-specific -- calibrating at the short readout gate but
             # imaging live at the camera default classifies every atom dark (~50 % occupancy while the
             # report says 99 %).  Setting the camera exposure to the calibrated gate makes the default
             # live readout self-match (#issue-2 live path); a frame still imaged at a different gate is
-            # the operator's explicit choice.  threshold_exposure is stamped by calibrate_threshold_from_images.
-            # fallback=None: an UNstamped calibration does not force a re-pin (leave the camera as-is).
+            # the operator's explicit choice.  The typed exposure is set by
+            # calibrate_threshold_from_images. fallback=None leaves a calibration
+            # without an exposure from forcing a re-pin.
             expo = calibration.readout_exposure(fallback=None)
             if expo:
                 # A real camera can REJECT the exposure (out-of-range gate, driver error) -- that
@@ -847,6 +855,13 @@ class _SessionImagingController:
         return self
 
     def frame_sequence(self, frames: int, *, time_ns: float | None = None, slots=None, trigger_channels=None):
+        if time_ns is None and slots:
+            values = dict(slots)
+            unknown = set(values) - {"exposure"}
+            if unknown:
+                raise ValueError(
+                    f"session imaging accepts only the semantic exposure slot; got {sorted(unknown)}")
+            time_ns = float(values["exposure"])
         exposure = self._session.camera_exposure() if time_ns is None else float(time_ns) * 1e-9
         return self._session.build_imaging_sequence(exposure=exposure, load=True, name=self._name)
 

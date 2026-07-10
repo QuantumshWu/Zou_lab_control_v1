@@ -52,12 +52,14 @@ def test_readout_fidelity_processor_drives_characterize(tmp_path):
     assert spec.default_value_key == "fidelity_site"
     assert "fidelity_site" in spec.result_keys
 
-    params = {**spec.defaults(), "data_dir": str(data_dir), "seed": 2}
+    params = {**spec.defaults(), "data_dir": str(data_dir), "seed": 2,
+              "store_thresholds": True}
     out = spec.run(ProcessorContext(readout=exp.readout, params=params))
 
     assert set(spec.result_keys) <= set(out)            # every declared key produced
-    assert np.asarray(out["fidelity_site"]).shape == (35,)
-    assert out["aggregate_fidelity"] > 0.9
+    assert np.asarray(out["fidelity_site"]).shape == (1, 1, 35)
+    assert np.asarray(out["fidelity_centers"]).shape == (1, 1, 35, 2)
+    assert float(np.asarray(out["aggregate_fidelity"])[0, 0, 0]) > 0.9
     # it DROVE characterize -> trained thresholds written back through the subsystem
     assert exp.readout.current.metadata.get("threshold_method") == "per_site_reference"
     assert np.all(np.isfinite(exp.readout.current.thresholds))
@@ -79,13 +81,16 @@ def test_processor_run_once_and_publishes_to_hub(tmp_path):
     spec = next(s for s in exp.readout.processor_specs() if s.name == "Readout fidelity")
 
     hub = SignalHub()
-    params = {**spec.defaults(), "data_dir": str(data_dir), "seed": 1}
+    params = {**spec.defaults(), "data_dir": str(data_dir), "seed": 1,
+              "store_thresholds": True}
     ctx = ProcessorContext(readout=exp.readout, params=params,
                            camera=None, sequencer=None, stop=None)
     result = spec.run(ctx)
     hub.publish(result)
 
-    assert np.asarray(hub.latest("fidelity_site")).shape == (20,)        # 4x5 sites
+    assert np.asarray(hub.latest("fidelity_site")).shape == (1, 1, 20)  # R=1, P=1, N=4x5 sites
+    assert hub.schema("fidelity_site").point_shape == (1,)
+    assert hub.schema("fidelity_site").data_shape == (20,)
     assert set(spec.result_keys) <= set(hub.names())                     # all declared landed
     assert exp.readout.current.metadata.get("threshold_method") == "per_site_reference"
 

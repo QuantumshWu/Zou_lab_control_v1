@@ -17,6 +17,7 @@ These pin:
 """
 
 from __future__ import annotations
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 import os
 import sys
@@ -146,7 +147,7 @@ def test_fit_is_stored_in_saved_info(tmp_path):
     name, parameter names and coefficients so a reader can see / re-apply it -- the view-state fold."""
     p, df = _hist_datafigure()
     # A hist DataFigure has render_family 1D, so a gaussian fit applies; run it non-displayed.
-    df.gaussian(is_display=False)
+    df.fit("gaussian", is_display=False)
     out = df.save(str(tmp_path / "fitted"), extra_info={"kind": "hist"})
     plt.close(p.fig)
     saved = load_figure(out["data"])
@@ -406,8 +407,7 @@ def _pulse_editor():
         PulsePeriod(duration=20, unit="us", name="p1", states=(0, 1, 1, 0, 1, 0)),
     ]
     st = PulseTableState(
-        channels=["probe", "trig", "da0", "da1", "da2", "da3"], periods=periods, name="demo_pulse",
-        analog_buses={"da": ["da0", "da1", "da2", "da3"]},
+        port_catalog=PortCatalog.from_channels(["probe", "trig", "da0", "da1", "da2", "da3"], analog_buses={"da": ["da0", "da1", "da2", "da3"]}), periods=periods, name="demo_pulse",
     )
     return PulseSequenceEditor(st), st
 
@@ -435,9 +435,9 @@ def test_pulse_preview_save_stores_a_faithful_figure_recipe(tmp_path):
         assert isinstance(recipe, dict) and recipe.get("kind") == "pulse"
         # the stored pulse_state faithfully round-trips (from_dict rebuilds the exact editor state)
         rebuilt = PulseTableState.from_dict(recipe["pulse_state"])
-        assert list(rebuilt.channels) == list(state.channels)
+        assert rebuilt.port_catalog == state.port_catalog
         assert len(rebuilt.periods) == len(state.periods)
-        assert dict(rebuilt.analog_buses) == dict(state.analog_buses)
+        assert rebuilt.port_catalog.analog_buses == state.port_catalog.analog_buses
         out = df.save(str(tmp_path / "demo_pulse.png"))
         assert Path(out["figure"]).exists() and Path(out["data"]).exists()
         data = np.load(out["data"], allow_pickle=True)
@@ -494,9 +494,9 @@ def test_pulse_recipe_prefers_provenance_sequencer_payload(tmp_path):
     import json
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState, PulsePeriod
 
-    recipe_state = PulseTableState(channels=["a", "b"],
+    recipe_state = PulseTableState(port_catalog=PortCatalog.from_channels(["a", "b"]),
                                    periods=[PulsePeriod(duration=5, unit="us", states=(1, 0))], name="recipe")
-    fired_state = PulseTableState(channels=["a", "b", "c"],
+    fired_state = PulseTableState(port_catalog=PortCatalog.from_channels(["a", "b", "c"]),
                                   periods=[PulsePeriod(duration=7, unit="us", states=(1, 0, 1))], name="fired")
     info = {
         "kind": "pulse", "name": "x",

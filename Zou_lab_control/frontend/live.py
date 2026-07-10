@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+import hashlib
 from math import ceil
+import re
 from typing import Any, Mapping, Sequence
 
 import matplotlib
@@ -13,19 +15,12 @@ from matplotlib.collections import PolyCollection
 from matplotlib.patches import Rectangle
 from matplotlib.ticker import FixedLocator, Formatter, FuncFormatter, LogLocator, MaxNLocator, NullLocator, ScalarFormatter
 import numpy as np
-from scipy.optimize import curve_fit
 
 from ._validate import _positive_float
 from .canvas import FigureSpec, configure_canvas, create_axes_fixed, create_axes_grid, display_figure, fit_grid_shape_for_aspect, grid_shape_for, new_figure, split_axes_horizontally
 from .selectors import AreaSelector, CrossSelector, DragHLine, DragVLine, InteractionBundle, PlotState, ZoomPan, attach_interaction
-from Zou_lab_control._readout_math import (
-    bimodal_jacobian,
-    bimodal_model,
-    confidence_weighted_fidelity,
-    finite_mean,
-    gaussian,
-    gaussian_jacobian,
-)
+from Zou_lab_control._readout_math import confidence_weighted_fidelity, finite_mean
+from ..neutral_atom.core.fitting import fit_histogram
 from .style import (
     DESIGN_DPI,
     HIST_FILL_ALPHA,
@@ -58,14 +53,16 @@ PULSE_COLORS = list(PALETTE["pulse_cycle"])
 #: 'grey' #808080, alpha 1, the global lines.linewidth=1); the colour CYCLES for multi-line plots.
 LINE_SINGLE = PALETTE["line_single"]
 #: The per-line colour cycle, confocal's ['grey', 'skyblue', ...]: a lone line is the first (grey),
-#: extra lines (data dimensions OR ``create`` repeats) take the next colours.
+#: extra lines (entries along the one-dimensional ``data_shape`` OR ``create`` repeats) take the
+#: next colours.
 LINE_CYCLE = [LINE_SINGLE, PALETTE.get("bright", "skyblue")] + list(PALETTE["series"])
 
 
 # --- Repeat-axis reduction (the PLOT's `repeat_mode`) ---------------------------------------------
-# Every measurement publishes a RAW block whose LEADING axis is the repeat: ``(repeat, *points_shape,
-# *data_shape)`` -- a 1-D scan's ``(repeat, points, dim)``, a 2-D scan's ``(repeat, n0*n1, dim)``, a
-# camera's ``(repeat, 1, H, W)``.  It just FILLS each repeat (NaN = not-yet-measured), never combines.
+# Every measurement publishes a RAW block with physical shape ``(R, P, *data_shape)``.  Logical
+# ``point_shape`` metadata may restore P to a scan grid, while ``data_shape`` is retained verbatim:
+# a scalar scan is ``(R, P, 1)`` and a camera is ``(R, 1, H, W)``.  A measurement just FILLS each
+# repeat (NaN = not-yet-measured), never combines.
 # `repeat_mode` is a PLOT parameter that decides HOW to collapse the repeat axis O0 for display -- so
 # the SAME raw data can be shown as a mean, a sum, the latest, a rolling newest, or (1-D) every repeat
 # as its own line, without re-running.
@@ -74,30 +71,11 @@ LINE_CYCLE = [LINE_SINGLE, PALETTE.get("bright", "skyblue")] + list(PALETTE["ser
 REPEAT_MODES = ("average", "add", "replace", "roll", "create")
 
 
-def _has_repeat_axis(a, core_ndim) -> bool:
-    """Whether array ``a``'s LEADING axis is the repeat to collapse.
-
-    STRUCTURE-driven when the producing signal declares its ``core_ndim`` (= len(points_shape) +
-    len(data_shape), #H3s-F3): a block carries the repeat axis exactly when ``a.ndim == 1 + core_ndim``
-    (and an already-reduced ``a.ndim == core_ndim`` value passes through).  This is the clean fix for
-    the muddle a bare ndim heuristic caused -- a clean ``(repeat, n_sites)`` (ndim 2, core_ndim 1) is a
-    repeat block, while a static ``(n_sites,)`` value is not.  When ``core_ndim is None`` (an
-    undeclared/legacy caller -- a camera/scan signal that does not pass it), fall back to the EXACT
-    ndim>=3 rule so those paths behave byte-identically."""
-    if core_ndim is not None:
-        return a.ndim == 1 + int(core_ndim)
-    return a.ndim >= 3
-
-
-def reduce_repeat(raw, mode: str = "average", *, core_ndim=None, hist=False):
-    """Collapse a raw block over its LEADING (repeat) axis O0 for display.  Works for ANY trailing
-    shape -- a 1-D scan's ``(repeat, points, dim)``, a 2-D scan's ``(repeat, n0*n1, dim)``, a camera's
-    ``(repeat, 1, H, W)``, a clean occupancy ``(repeat, 1, n_sites)`` -- because the repeat axis is always
-    axis 0.  WHETHER axis 0 IS the repeat is decided by the producing signal's declared structure when
-    given (``core_ndim``, #H3s-F3): collapse when ``raw.ndim == 1 + core_ndim``, pass through an
-    already-reduced ``raw.ndim == core_ndim`` value.  When ``core_ndim is None`` the EXISTING ndim>=3
-    fallback is kept EXACTLY (an already-reduced <3-D array passes through, so a plain image is never
-    mistaken for a stack) -- so undeclared camera/scan callers are unaffected.
+def reduce_repeat(raw, mode: str = "average", *, has_repeat: bool = True, valid=None, hist=False):
+    """Collapse a canonical ``(R,P,*data_shape)`` block over its leading R axis for display.  It
+    works for any retained ``data_shape``: ``(D,)`` for a multi-series scan, ``(H,W)`` for a camera,
+    or ``(N,)`` for occupancy.  ``has_repeat`` is supplied by the schema/external-data boundary;
+    array rank is never used to guess whether axis 0 is R.
 
     * ``average`` -> ``nanmean`` over the repeats that HAVE data (the true running mean; magnitude-
       stable regardless of how many repeats completed = a long exposure for a camera) -> drops O0.
@@ -106,14 +84,16 @@ def reduce_repeat(raw, mode: str = "average", *, core_ndim=None, hist=False):
     * ``pool``    -> a DISTRIBUTION mode: do NOT reduce the repeat axis -- flatten EVERY repeat-with-data's
       samples into one 1-D set so a histogram bins all shots together.
     * ``create``  -> keep EVERY repeat-with-data as its own column.  For a TRACE the core's leading axis
-      is the x-points, so ``(R, points, dim) -> (points, R*dim)`` draws one line per repeat (confocal's
-      "create"); for an image ``(R, 1, H, W)`` each repeat's whole core flattens to a column.
+      is the x-points; when ``data_shape=(D,)``, the result ``(P,R*D)`` draws one line per repeat and
+      data entry (confocal's "create").  Multidimensional trailing data is rejected; callers must
+      choose a component or an explicit reduction instead of flattening ``data_shape``.
 
     ``hist=True`` reduces for a DISTRIBUTION (the kind decides this, #iron-law): a histogram's core is
     ALL samples -- it has NO x-axis -- so EVERY non-pool reduction is flattened to one 1-D sample set
     (the dis bins all of it), and ``create`` keeps each repeat's WHOLE flattened core as its own column
     ``(n_samples, R)`` = one histogram per repeat.  This is why a trace and a histogram, whose blocks can
-    be the SAME ndim (``(R, points, dim)`` vs ``(R, 1, n_sites)``), need the kind to pick the layout."""
+    share the same canonical rank while giving the data axis different semantics, need the kind to
+    pick the layout."""
     # NATIVE dtype passthrough: an integer block (a camera's uint8/uint16 stream) cannot carry NaN
     # sentinels, so the whole isfinite machinery is skipped and every repeat slice holds data --
     # no float64 expansion of a 2.3 MP frame just to ask "is it finite".  Float blocks (a scan's
@@ -121,7 +101,7 @@ def reduce_repeat(raw, mode: str = "average", *, core_ndim=None, hist=False):
     a = np.asarray(raw)
     if a.dtype.kind not in "iub":
         a = np.asarray(a, dtype=float)
-    if not _has_repeat_axis(a, core_ndim):              # not a repeat block -> leave as-is (a hist with no
+    if not has_repeat:                                  # explicit external datum with no R axis
         return a.reshape(-1) if hist else a             # repeat axis is just ONE sample set -> flatten)
     if a.shape[0] == 1 and a.dtype.kind in "iub" and mode != "create":
         # ONE integer repeat slice (the live camera's ring_depth-1 stream): average / add /
@@ -130,8 +110,14 @@ def reduce_repeat(raw, mode: str = "average", *, core_ndim=None, hist=False):
         # every tick.  ``create`` keeps its column layout; float blocks keep NaN semantics.
         out = a[0]
         return out.reshape(-1) if hist else out
-    if a.dtype.kind in "iub":
-        idx = np.arange(a.shape[0])                     # integer block: every repeat slice holds data
+    if valid is not None:
+        mask = np.asarray(valid, dtype=bool)
+        if mask.ndim != 2 or mask.shape[0] != a.shape[0]:
+            raise ValueError(
+                f"repeat validity must be (R,P) with R={a.shape[0]}; got {mask.shape}")
+        idx = np.flatnonzero(mask.any(axis=1))
+    elif a.dtype.kind in "iub":
+        idx = np.arange(a.shape[0])
     else:
         has = np.isfinite(a).any(axis=tuple(range(1, a.ndim)))   # which repeat slices hold any data
         idx = np.flatnonzero(has)
@@ -139,13 +125,14 @@ def reduce_repeat(raw, mode: str = "average", *, core_ndim=None, hist=False):
         cols = idx if idx.size else np.array([0])
         if hist:                                              # a histogram's core is ALL samples (no x-axis):
             return a[cols].reshape(len(cols), -1).T           #   each repeat's whole core -> a column (n_samples, R)
-        if a.ndim == 2:                                       # (R, points) reduced scan -> (points, R) lines
+        if a.ndim == 2:                                       # no trailing data axis: (R,P) -> (P,R) lines
             return a[cols].T
-        if a.ndim == 3:                                       # (R, points, dim) scan -> (points, R*dim)
-            return np.concatenate([a[r] for r in cols], axis=1)   #   confocal: repeat-major dim-minor columns
-        # ndim >= 4: an image block (a camera's (R, 1, H, W)) -- create is ORTHOGONAL to the data axes:
-        # flatten each repeat's core to a column so there is ONE trace per repeat (NOT per image row).
-        return a[cols].reshape(len(cols), -1).T               # (prod(core), R) = x=pixel index, R lines
+        if a.ndim == 3:                                       # data_shape=(D,) -> (P,R*D)
+            return np.concatenate([a[r] for r in cols], axis=1)   # repeat-major, data-entry-minor columns
+        raise ValueError(
+            "create mode requires canonical (R,P,*data_shape) trace data with data_shape=(D,); "
+            "multidimensional data_shape "
+            "must be selected or reduced explicitly before plotting")
     if mode == "pool":                                    # histogram: flatten ALL repeats' samples (no reduce)
         if idx.size == a.shape[0]:                        # every slice holds data -> zero-copy view
             return a.reshape(-1)
@@ -162,13 +149,18 @@ def reduce_repeat(raw, mode: str = "average", *, core_ndim=None, hist=False):
     return out.reshape(-1) if hist else out
 
 
-def repeats_with_data(raw, *, core_ndim=None) -> int:
-    """How many repeat slices of a raw block currently hold data (drives the plot's ``xN`` label).
-    A non-repeat-block (structure-driven when ``core_ndim`` is given, else the ndim>=3 fallback) -> 1."""
+def repeats_with_data(raw, *, has_repeat: bool = True, valid=None) -> int:
+    """How many explicit R slices currently hold data."""
     a = np.asarray(raw)
-    if not _has_repeat_axis(a, core_ndim):
+    if not has_repeat:
         return 1
-    if a.dtype.kind in "iub":                           # integer block: every published slice holds data
+    if valid is not None:
+        mask = np.asarray(valid, dtype=bool)
+        if mask.ndim != 2 or mask.shape[0] != a.shape[0]:
+            raise ValueError(
+                f"repeat validity must be (R,P) with R={a.shape[0]}; got {mask.shape}")
+        return int(np.count_nonzero(mask.any(axis=1)))
+    if a.dtype.kind in "iub":
         return int(a.shape[0])
     return int(np.count_nonzero(np.isfinite(np.asarray(a, dtype=float)).any(axis=tuple(range(1, a.ndim)))))
 
@@ -608,9 +600,16 @@ class BaseLivePlot:
         self.ylabel = self.labels[1] if len(self.labels) > 1 else "Y"
         self.zlabel = self.labels[-1]
         self.title = "" if title is None else str(title)
-        self.data_x = _as_data_x(data_x)
-        self.data_y = _as_data_y(data_y, len(self.data_x))
-        self.points_total = len(self.data_x)
+        from ..neutral_atom.core.raster import RegularRaster
+        self.raster_grid = data_x if isinstance(data_x, RegularRaster) else None
+        if self.raster_grid is None:
+            self.data_x = _as_data_x(data_x)
+            point_count = len(self.data_x)
+        else:
+            self.data_x = self.raster_grid
+            point_count = self.raster_grid.point_count
+        self.data_y = _as_data_y(data_y, point_count)
+        self.points_total = point_count
         self.points_done = self._infer_points_done()
         self.repeat_cur = 1
         self.repeat_label = 1
@@ -1218,29 +1217,26 @@ class BaseLivePlot:
                 ax.set_ylim(*self._view_ylim)
                 self.draw()
             return True
-        if str(key) in ("fit_model", "fit_cmd"):
-            if str(key) == "fit_model":
-                self._fit_model = str(value or "none")
-            else:
-                self._fit_cmd = str(value or "")
+        if str(key) == "fit_request":
+            self._fit_request = None if value in (None, "", "none") else dict(value)
             self._reapply_general_fit()
             self.draw()
             return True
         return False
 
     def _reapply_general_fit(self) -> None:
-        """Remove this plot's previous general-fit curve and, if a ``_fit_model`` is set, run it on
+        """Remove this plot's previous general-fit curve and apply its structured request to
         ``self`` via the ONE :func:`apply_fit_to_figure` primitive -- the flat-panel counterpart of the
         grid's :meth:`GridPlot._refit_axes`, so both surfaces fit through identical code.  Tracks the drawn
         artists so the next re-fit removes exactly one curve.
 
-        Guarded by a data+command fingerprint (the flat-panel counterpart of
+        Guarded by a data+request fingerprint (the flat-panel counterpart of
         :class:`HistogramFigure`'s ``_fit_cache_key``): a live tick that did not move the data re-runs
-        NOTHING -- no ``curve_fit``, no annotation repaint -- so a pinned live fit costs one fingerprint
+        NOTHING -- no solver call, no annotation repaint -- so a pinned live fit costs one fingerprint
         per tick instead of a fresh fit + 6-candidate bbox search every frame."""
-        model = getattr(self, "_fit_model", "none")
+        request = getattr(self, "_fit_request", None)
         ax = getattr(self, "ax", None)
-        if not model or model == "none" or ax is None:
+        if not request or ax is None:
             # fit cleared / never set: drop any stale curve + cache key (so a re-enable always re-fits).
             for art in getattr(self, "_general_fit_artists", []):
                 try:
@@ -1249,9 +1245,9 @@ class BaseLivePlot:
                     pass
             self._general_fit_artists = []
             self._general_fit_key = None
+            self._last_fit_result = None
             return
-        cmd = getattr(self, "_fit_cmd", "")
-        key = (self._fit_data_fingerprint(), str(model), str(cmd))
+        key = (self._fit_data_fingerprint(), repr(sorted(dict(request).items())))
         arts = getattr(self, "_general_fit_artists", [])
         # Skip only when nothing moved AND the drawn curve is still attached: a focus swap / axes
         # rebuild that wiped the artists must re-fit even on identical data.
@@ -1268,18 +1264,31 @@ class BaseLivePlot:
         # (is_display defaults True in apply_fit_to_figure); track EVERY child the fit added (curve + text)
         # so a re-fit removes it all -- the flat counterpart of the grid's :meth:`GridPlot._refit_axes`.
         before = set(id(c) for c in ax.get_children())
-        apply_fit_to_figure(self.to_data_figure(), model, cmd)
+        self._last_fit_result = apply_fit_to_figure(self.to_data_figure(), request)
         self._general_fit_artists = [c for c in ax.get_children() if id(c) not in before]
 
     def _fit_data_fingerprint(self):
         """Cheap identity of the data the general fit runs on -- the same ``data_x``/``data_y``
         ``apply_fit_to_figure`` reads via ``to_data_figure`` -- so ``_reapply_general_fit`` can skip a
-        re-fit when nothing moved.  Shapes + dtype + bytes of both arrays, exactly how
-        :class:`HistogramFigure` keys its fit cache on the counts."""
+        re-fit when nothing moved.  The digest is streamed from contiguous array buffers: retaining
+        ``tobytes()`` in the cache duplicated a 1920x1200 image plus its coordinates by 55.3 MiB and
+        allocated the same amount again on every cache probe."""
         parts = []
-        for arr in (getattr(self, "data_x", None), getattr(self, "data_y", None)):
+        grid = getattr(self, "raster_grid", None)
+        if grid is not None:
+            parts.append(("regular_raster", grid.shape, grid.origin, grid.spacing))
+            arrays = (getattr(self, "data_y", None),)
+        else:
+            arrays = (getattr(self, "data_x", None), getattr(self, "data_y", None))
+        for arr in arrays:
             a = np.asarray(arr)
-            parts.append((a.shape, a.dtype.str, a.tobytes()))
+            if a.flags.c_contiguous:
+                payload = memoryview(a).cast("B")
+            else:
+                # Plot inputs are normally canonical C arrays.  Preserve exact
+                # logical C-order semantics for an unusual strided input.
+                payload = memoryview(np.ascontiguousarray(a)).cast("B")
+            parts.append((a.shape, a.dtype.str, hashlib.sha256(payload).digest()))
         return tuple(parts)
 
     def _reapply_view_knobs(self) -> None:
@@ -1293,7 +1302,7 @@ class BaseLivePlot:
         ax = getattr(self, "ax", None)
         if ax is None:
             return
-        if getattr(self, "_fit_model", "none") not in (None, "none", ""):
+        if getattr(self, "_fit_request", None):
             self._reapply_general_fit()
         if getattr(self, "_view_xlim", None) is not None:
             ax.set_xlim(*self._view_xlim)
@@ -1303,6 +1312,41 @@ class BaseLivePlot:
     def after_plot(self):
         """Create and attach a DataFigure handle."""
         return self.to_data_figure()
+
+    def selection_rows(self) -> dict[str, object]:
+        """Named coordinate/value rows for selectors and the shared fit core.
+
+        This is the one plot-to-data adapter used by :class:`DataFigure`.
+        Rendering details never leak into selection: 1-D/monitor/pulse plots
+        expose x, image/site plots expose x+y.  Derived plot families such as a
+        distribution override only this adapter.
+        """
+
+        values = np.asarray(self.data_y)
+        if self.raster_grid is not None:
+            return {
+                "raster": self.raster_grid,
+                "coordinates": {},
+                "values": values[:, 0].reshape(self.raster_grid.shape),
+                "mode": "xy",
+                "frame": str(self.info.get("coordinate_frame", "data")),
+                "scope": (),
+            }
+        x = np.asarray(self.data_x)
+        if self.render_family == "2D" or (
+                self.render_family == "auto" and x.ndim == 2 and x.shape[1] >= 2):
+            coordinates = {"x": x[:, 0], "y": x[:, 1]}
+            mode = "xy"
+        else:
+            coordinates = {"x": x[:, 0] if x.ndim > 1 else x.reshape(-1)}
+            mode = "x"
+        return {
+            "coordinates": coordinates,
+            "values": values,
+            "mode": mode,
+            "frame": str(self.info.get("coordinate_frame", "data")),
+            "scope": (),
+        }
 
     def to_data_figure(self):
         from .data_figure import DataFigure
@@ -1344,7 +1388,7 @@ class Live1D(BaseLivePlot):
     def _color_lines(self) -> None:
         """Colour the curve(s) EXACTLY like Confocal-GUIv2: every line solid, ``alpha=1``,
         ``linewidth=1``; the COLOUR cycles (grey, skyblue, ...) by column index.  A lone line is
-        grey.  There is NO per-repeat fade and NO dim-vs-create distinction -- the data-dimension
+        grey.  There is NO per-repeat fade and NO data-vs-create distinction -- the data-axis
         lines and the ``create`` repeat-lines are styled identically (one line per column), so this
         matches the reference and the single-line look is unchanged."""
         for i, line in enumerate(self.lines):
@@ -1479,34 +1523,25 @@ class LiveLiveDis(LiveLive):
         return np.histogram(vals, bins=self.n_bins, range=(self.ylim_min, self.ylim_max))
 
     def _update_gauss_fit(self):
-        # Skip the per-tick curve_fit when the distribution counts have not changed since the last fit
+        # Skip the per-tick headless fit when the distribution counts have not changed since the last fit
         # -- the rolling-monitor counterpart of HistogramFigure's ``_fit_cache_key``.  ``monitor`` is the
         # console's DEFAULT panel and the most frequently refreshed; a tick that did not move the data
-        # keeps the drawn gaussian + sigma label instead of re-running scipy curve_fit (~ms) on the GUI
+        # keeps the drawn gaussian + sigma label instead of re-running the core solver (~ms) on the GUI
         # thread every frame.
         key = (self.n.tobytes(), self.bins.tobytes())
         if key == getattr(self, "_gauss_fit_key", None):
             return
         self._gauss_fit_key = key
-        mask = self.n > 0
-        centers = (self.bins[:-1] + self.bins[1:]) / 2
-        x = centers[mask]
-        y = self.n[mask]
-        if len(x) < 3 or np.ptp(x) == 0:
-            return
-        try:
-            popt, _ = curve_fit(
-                gaussian,
-                x,
-                y,
-                p0=[np.max(y), np.mean(x), max(np.ptp(x) / 4, 1e-12)],
-                bounds=([0, np.min(x), max(np.ptp(x) / 100, 1e-12)], [max(np.max(y) * 4, 1), np.max(x), max(np.ptp(x) * 10, 1e-12)]),
-                jac=gaussian_jacobian,
-            )
-        except Exception:
+        result = fit_histogram(self.bins, self.n, "single")
+        self._histogram_fit_result = result
+        if not result.valid:
+            self.gauss_line.set_data([], [])
+            if self.fit_text is not None:
+                self.fit_text.set_text("")
             return
         x_fit = np.linspace(self.ylim_min, self.ylim_max, 100)
-        self.gauss_line.set_data(gaussian(x_fit, *popt), x_fit)
+        self.gauss_line.set_data(result.evaluate(x_fit), x_fit)
+        popt = result.parameters
         if popt[1] <= 0:
             label = r"$\sigma$=0"
         else:
@@ -1608,7 +1643,7 @@ class Live2DDis(BaseLivePlot):
     def __init__(self, *args, cmap: str = PALETTE["cmap_scan"], bad_color: str = PALETTE["bad"], square: bool = True,
                  clim: "tuple[float, float] | None" = None, **kwargs):
         super().__init__(*args, **kwargs)
-        if self.data_x.shape[1] != 2:
+        if self.raster_grid is None and self.data_x.shape[1] != 2:
             raise ValueError("Live2DDis requires data_x with shape (N, 2).")
         self.cmap = cmap
         self.bad_color = bad_color
@@ -1624,6 +1659,8 @@ class Live2DDis(BaseLivePlot):
         fixed for the plot's life) so :meth:`fill_grid` reshapes in O(1) per frame instead of an
         O(N) searchsorted scatter -- a full 1920x1200 frame then updates with no per-tick cost,
         which is why the image reaches the plot at NATIVE resolution (no upstream point-count cap)."""
+        if self.raster_grid is not None:
+            return True
         ny, nx = self.data_shape
         if self.data_x.shape[0] != ny * nx:
             return False
@@ -1648,9 +1685,14 @@ class Live2DDis(BaseLivePlot):
     def init_core(self) -> None:
         self.ax, self.axdis, self.cax = split_axes_horizontally(self.fig, self.ax, *_IMAGE_SPLIT)
         self.axes = self.ax
-        self.x_array = np.unique(self.data_x[:, 0])
-        self.y_array = np.unique(self.data_x[:, 1])
-        self.data_shape = (len(self.y_array), len(self.x_array))
+        if self.raster_grid is not None:
+            self.x_array = self.raster_grid.x_axis
+            self.y_array = self.raster_grid.y_axis
+            self.data_shape = self.raster_grid.shape
+        else:
+            self.x_array = np.unique(self.data_x[:, 0])
+            self.y_array = np.unique(self.data_x[:, 1])
+            self.data_shape = (len(self.y_array), len(self.x_array))
         self._regular_raster = self._is_regular_raster()   # cache once: data_x is fixed for the plot's life
         self.grid = self.fill_grid()
         try:
@@ -2066,7 +2108,7 @@ def pulse_plot_channels(
 # nothing else -- the visual language is owned here.
 PANEL_SIZES = ("1x2", "2x2", "4x2", "1x4", "2x4", "4x4", "4x8", "8x4", "8x8")
 PANEL_UNIT_PX = (180, 240)     # (height, width) of one half-unit of the stock region
-PANEL_MARGINS_PX = (STOCK_MARGINS_PX[0], 86, 80, TITLE_SLOT_PX)   # stock margins (L, R, B, T).
+PANEL_MARGINS_PX = (STOCK_MARGINS_PX[0], 96, 80, TITLE_SLOT_PX)   # stock margins (L, R, B, T).
                                          # L = STOCK_MARGINS_PX[0] (confocal's left, 110) and
                                          # is the MINIMUM that holds a 4-5 digit y-tick label
                                          # ("1180", a qCMOS ROI pixel) PLUS the rotated y-title:
@@ -2078,9 +2120,10 @@ PANEL_MARGINS_PX = (STOCK_MARGINS_PX[0], 86, 80, TITLE_SLOT_PX)   # stock margin
                                          # _with_title_margin's floor, so panel_display_size --
                                          # which reads this top -- matches the real titled figure
                                          # instead of under-reporting the card height).
-                                         # R/B stay tightened from the old (110,110,100,70)
-                                         # -- they never clipped (R holds the 2D colorbar
-                                         # tick labels + z-label, B the x-label+ticks) and
+                                         # R/B stay tighter than the notebook stock geometry.
+                                         # R=96 holds the 2D colorbar tick labels + z-label with
+                                         # a measured positive pixel margin even for decimal ticks;
+                                         # B holds the x-label+ticks.  Both
                                          # keep the data area dense (~71% wide).
 # Panels are DISPLAYED scaled through the standard high-DPI canvas path
 # (qt_canvas.panel_canvas): on screen their text sits at PANEL_DISPLAY_SCALE (~70%) of a
@@ -2255,87 +2298,96 @@ def coerce_panel_value(kind, value, *, structure=None, params=None, repeat_mode=
     an image, hist bins samples, monitor a scalar, sites one value/site).  This lives WITH the plots,
     NOT in task_console: the console only GATHERS the inputs (value, structure, params, repeat mode)
     and calls here, so the wiring layer holds zero per-kind reshape logic.  ``structure`` is the
-    producing node's ``{"data_shape", "grid_shape"}`` mapping, or None when unknown (a custom
-    expression / raw array) -- then shape is INFERRED from the value, never assumed."""
+    producing node's authoritative ``{"points_shape", "data_shape", "grid_shape"}`` mapping.
+    A transforming expression/raw array crosses the explicit external-data boundary with
+    ``structure=None``; only there is its complete array treated as one datum."""
     params = params or {}
     # A pulse panel's value is a STRUCTURED object (a sequence / PulseTableState) with no array shape.
     if kind == "pulse":
         return value
-    arr = np.asarray(value)                  # NATIVE dtype: a uint8/uint16 camera frame passes through
-    if arr.dtype.kind not in "iubf":         # untouched (no float64 balloon on the per-tick path);
-        arr = np.asarray(value, dtype=float)  # only non-numeric values normalize to float
+    arr = np.asarray(value)
+    if arr.dtype.kind not in "iubf":
+        arr = np.asarray(value, dtype=float)
+    st = dict(structure or {})
+    ps = tuple(int(n) for n in st.get("points_shape", ()))
+    ds = tuple(int(n) for n in st.get("data_shape", ()))
+    gs = tuple(int(n) for n in st.get("grid_shape", ()))
+    external = not ps or not ds
+    if external:
+        # A transformed/raw expression crosses one explicit boundary: one point
+        # whose complete array is the datum.  This is deterministic external-data
+        # semantics, not repeat/point inference from rank.
+        ps = (1,)
+        ds = tuple(int(n) for n in arr.shape) or (1,)
+    points = int(np.prod(ps, dtype=np.int64))
     if kind == "grid":
-        # A FACET grid consumes the bound block RAW (repeat, points, *data_dim); facet_cells slices it.
+        expected = (int(arr.shape[0]), points, *ds)
+        if external or tuple(arr.shape) != expected:
+            raise ValueError(
+                "grid panels require a registered canonical (R,P,*data_shape) signal; "
+                f"got {arr.shape}, point_shape={ps}, data_shape={ds}")
         return arr
-    # Reshape is decided by the DATA dimensionality (#H3o, NOT a size threshold): data_shape 2-D -> an
-    # image; 1-D -> multiple series (lines); grid_shape un-flattens a 2-D scan's points to a map.
-    st = structure
-    ds = tuple(st["data_shape"]) if st else ()
-    gs = tuple(st["grid_shape"]) if st else ()
+
     if kind == "1d":
-        # y-vs-index by default; only an explicit xy=True panel reads (N, 2) as an x-y curve.
-        if params.get("xy") and arr.ndim == 2 and arr.shape[1] == 2 and arr.shape[0] >= 1:
+        if external:
+            if arr.ndim not in (1, 2) or arr.size < 1:
+                raise ValueError(f"1D external value must be a vector/matrix; got {arr.shape}")
             return arr
-        a = np.squeeze(arr)
-        if len(ds) == 2:
-            # 2-D DATA: 'create' arrived as (pixels, repeat) -> one line per repeat; else flatten to one trace.
-            if repeat_mode == "create" and a.ndim == 2:
-                return a
-            flat = a.reshape(-1)
-            if flat.size < 1:
-                raise ValueError("panel value is empty")
-            return flat
-        # 1-D DATA / unknown: a 2-D (points, lines) stays 2-D (one line per series); a 1-D value is one line.
-        if a.ndim == 2:
-            return a
-        flat = a.reshape(-1)
-        if flat.size < 1:
-            raise ValueError("panel value is empty")
-        return flat
+        if repeat_mode == "create":
+            if arr.ndim != 2 or arr.shape[0] != points:
+                raise ValueError(
+                    f"1D create view expects (P,R*D); got {arr.shape} for P={points}")
+            return arr
+        expected = (points, *ds)
+        if tuple(arr.shape) != expected:
+            raise ValueError(f"1D panel expects reduced canonical {expected}; got {arr.shape}")
+        if len(ds) != 1:
+            raise ValueError(
+                "1D panel requires data_shape=(D,); select an explicit component before plotting "
+                f"multidimensional data_shape={ds}")
+        if params.get("xy"):
+            if ds != (2,):
+                raise ValueError(f"xy mode requires data_shape=(2,), got {ds}")
+            return arr
+        return arr[:, 0] if ds == (1,) else arr
     if kind == "2d":
-        # Image by structure: a 2-D data core IS the image; a 2-D scan un-flattens to grid_shape; an
-        # unknown-structure 2-D value is shown as-is.  NATIVE resolution -- the DISPLAY layer (Live2DDis)
-        # block-means only for the screen budget, reversibly (zoom re-slices the full array to 1:1).
-        a = arr
-        if len(ds) == 2:
-            img = np.squeeze(a)
-            if img.ndim > 2:
-                img = img.reshape(img.shape[0], img.shape[1], -1)[:, :, 0]
-        elif gs and int(np.prod(gs)) == int(a.size):
-            img = a.reshape(tuple(int(n) for n in gs))
-        elif not ds and np.squeeze(a).ndim == 2:
-            # NO declared data shape (no structure at all, OR a producer that honestly does not
-            # know its frame size yet -- e.g. a camera backend without frame_shape, before its
-            # first frame): "undeclared" is NOT "declared non-image", so fall back to the value's
-            # own shape.  The error below is reserved for a REAL contradiction: a producer that
-            # DECLARES a non-2-D data core (a scan's (1,)) bound to an image panel.
-            img = np.squeeze(a)
+        if external:
+            img = arr if arr.ndim == 2 else None
+        elif len(ds) == 2 and points == 1 and tuple(arr.shape) == (1, *ds):
+            img = arr[0]
+        elif ds == (1,) and gs and int(np.prod(gs)) == points \
+                and tuple(arr.shape) == (points, 1):
+            img = arr[:, 0].reshape(gs)
         else:
             raise ValueError(
-                f"2D panel needs an image (a 2-D data_shape or a grid_shape); got value shape "
-                f"{arr.shape}, data_shape={ds}, grid_shape={gs}")
-        if img.ndim != 2 or min(img.shape) < 2:
+                "2D panel accepts data_shape=(H,W) at P=1 or a scalar point grid; "
+                f"got value={arr.shape}, point_shape={ps}, data_shape={ds}, grid_shape={gs}")
+        if img is None or img.ndim != 2 or min(img.shape) < 2:
             raise ValueError(f"2D panel needs a 2D image value (got shape {arr.shape})")
         return img
     if kind == "hist":
-        # Bin SAMPLES: 'create' per-repeat COLUMNS (n_samples, R) stay 2-D (one histogram per repeat);
-        # anything else flattens to ONE histogram -- bin exactly what the source gives.
+        # A histogram is an explicit sample view: flattening is its declared
+        # visualization semantics and never changes the signal contract.
         return arr if (arr.ndim == 2 and arr.shape[1] > 1) else arr.reshape(-1)
     if kind == "monitor":
-        flat = arr.reshape(-1)
-        if flat.size != 1:
-            raise ValueError(f"rolling-trace panel needs a scalar value (got shape {arr.shape})")
-        return float(flat[0])
-    flat = arr.reshape(-1)
-    if flat.size < 1:
-        raise ValueError("panel value is empty")
+        if external:
+            if arr.size != 1:
+                raise ValueError(f"rolling-trace panel needs one external scalar; got {arr.shape}")
+            return float(arr.reshape(1)[0])
+        if points != 1 or ds != (1,) or tuple(arr.shape) != (1, 1):
+            raise ValueError(
+                "rolling-trace panel requires canonical scalar (P=1,data_shape=(1,)); "
+                f"got {arr.shape}, point_shape={ps}, data_shape={ds}")
+        return float(arr[0, 0])
     if kind == "sites":
-        # ONE value per site: 'create' concatenates repeats -> collapse back to n_sites (mean over repeats).
-        if len(ds) == 1 and int(ds[0]) > 0 and flat.size != int(ds[0]) and flat.size % int(ds[0]) == 0:
-            flat = finite_mean(flat.reshape(-1, int(ds[0])), 0)   # unfilled sites -> NaN, silently
-        if flat.size > 4096:
-            raise ValueError(f"site-map panel needs one value per site (got {flat.size} values)")
-    return flat
+        if external or points != 1 or len(ds) != 1 or tuple(arr.shape) != (1, *ds):
+            raise ValueError(
+                "site-map panel requires canonical (P=1,data_shape=(N,)); "
+                f"got {arr.shape}, point_shape={ps}, data_shape={ds}")
+        return arr[0]
+    if arr.size < 1:
+        raise ValueError("panel value is empty")
+    return arr
 
 
 def panel_plot(data_x, data_y=None, *, kind: str, size: str = "2x2", **kwargs):
@@ -2420,7 +2472,7 @@ def pulse_repeat_markers(
         repeat_end = getattr(state_or_periods, "repeat_end", repeat_end)
         repeat_count = getattr(state_or_periods, "repeat_count", repeat_count)
         default_forever = bool(getattr(state_or_periods, "repeat_forever", default_forever))
-        slots = state_or_periods.reference_slots() if hasattr(state_or_periods, "reference_slots") else slots
+        slots = state_or_periods._reference_slots() if hasattr(state_or_periods, "_reference_slots") else slots
         time_step_ns = getattr(state_or_periods, "time_step_ns", time_step_ns)
     elif state_or_periods is not None:
         periods = list(state_or_periods)
@@ -2502,7 +2554,7 @@ def analog_bus_traces(state, *, include_always_off: bool = True) -> "tuple[list[
     if not buses:
         return [], set()
     starts_steps = [0]
-    slots = state.reference_slots()
+    slots = state._reference_slots()
     for period in state.periods:
         starts_steps.append(starts_steps[-1] + period.duration_steps(slots=slots, time_step_ns=state.time_step_ns))
     traces: list[dict[str, object]] = []
@@ -2548,8 +2600,11 @@ def pulse_drawn_rows(state, *, include_always_off: bool) -> tuple[list[str], lis
     never a re-derived approximation that could drift from the render."""
     sequence = state.to_sequence(expand_repeat=False)
     analog_traces, folded_members = analog_bus_traces(state, include_always_off=include_always_off)
-    clk_set = set(getattr(state, "clk_channels", []))
-    universe = [c for c in state.channels if c not in folded_members and c not in clk_set]
+    clk_set = {port.lanes[0] for port in state.port_catalog.clock_ports}
+    universe = [
+        lane for lane in state.port_catalog.raw_lanes
+        if lane not in folded_members and lane not in clk_set
+    ]
     channels = [c for c in pulse_plot_channels(sequence, channels=universe,
                                                include_always_off=include_always_off)
                 if c not in folded_members]
@@ -2594,9 +2649,9 @@ def build_pulse_preview_plot(state, *, include_always_off: bool, size: str | Non
             for (start, stop, label) in repeat_brackets
         ]
     analog_traces, folded_members = analog_bus_traces(state, include_always_off=include_always_off)
-    clk_set = set(getattr(state, "clk_channels", []))
+    clk_set = {port.lanes[0] for port in state.port_catalog.clock_ports}
     digital_channel_universe = [
-        channel for channel in state.channels
+        channel for channel in state.port_catalog.raw_lanes
         if channel not in folded_members and channel not in clk_set   # clk channels aren't engine-driven
     ]
     channels = pulse_plot_channels(
@@ -2643,7 +2698,7 @@ def annotate_pulse_variable_regions(plotter, state, channels=None, *, bus_rows=N
     so several scanned DAC buses get distinct, non-overlapping labels instead of piling up."""
     if not hasattr(plotter, "ax"):
         return
-    slots = state.reference_slots()
+    slots = state._reference_slots()
     starts_ns = [0.0]
     for period in state.periods:
         starts_ns.append(starts_ns[-1] + period.duration_ns(slots=slots, time_step_ns=state.time_step_ns))
@@ -3105,113 +3160,6 @@ def histogram_binned(vals, bins):
     return np.histogram(v, bins=bins)
 
 
-def fit_histogram_curves(edges, counts, mode: str):
-    """The ONE histogram-fit rule: fit ``mode`` ("none" / "single" / "double") to a BINNED sample set
-    and return the CURVE DATA + threshold -- consumed by :class:`HistogramFigure` (the standalone dis)
-    AND by the grid's :class:`HistogramCell` thumbnails, so the two can never fit differently.
-
-    Operates ENTIRELY on (edges, counts): the Otsu seed split, the per-side mean/std seeds and the
-    fit itself are all O(bins) -- never O(samples).  (The old form sorted the raw samples for Otsu:
-    ~80 ms per tick on a 2.3 MP camera frame, on the GUI thread, for a split the classic Otsu
-    computes from the histogram anyway.)
-
-    Returns ``None`` when there is nothing to draw (mode "none", too few samples, or a genuinely
-    failed fit), else ``{"x", "left", "right", "total", "threshold", "separated", "bimodal_popt",
-    "single_popt"}`` (``left``/``right`` are None for a single-Gaussian outcome; ``threshold`` is set
-    only when the two fitted peaks separate by >= 1.5 summed widths -- the honest-threshold gate)."""
-    edges = np.asarray(edges, dtype=float)
-    counts = np.asarray(counts, dtype=float)
-    centers = (edges[:-1] + edges[1:]) / 2
-    n_samples = float(counts.sum())
-    span = float(edges[-1] - edges[0]) or 1.0
-    mode = str(mode)
-    # Fewer than 2 occupied bins = no spread to fit: a CONSTANT sample set lands in one bin (this is
-    # the binned form of the old ``ptp(vals) == 0`` guard -- np.histogram expands a zero range to
-    # lo±0.5, so the edge span alone can never detect it), and a single-bin histogram would also
-    # crash the Otsu split below (empty cumsum -> argmax of an empty sequence).
-    if mode == "none" or n_samples < 6 or np.count_nonzero(counts) < 2:
-        return None
-    x_fit = np.linspace(edges[0], edges[-1], 400)
-
-    def _weighted_stats(c, w):
-        tot = float(w.sum())
-        mu = float((w * c).sum() / tot)
-        sd = float(np.sqrt(max((w * (c - mu) ** 2).sum() / tot, 0.0)))
-        return mu, sd
-
-    def _single():
-        try:
-            mu, sd = _weighted_stats(centers, counts)
-            p0 = [max(float(np.max(counts)), 1.0), mu, max(sd, span / 40, 1e-9)]
-            popt, _ = curve_fit(gaussian, centers, counts, p0=p0, maxfev=20000)
-        except Exception:
-            return None
-        return {"x": x_fit, "left": None, "right": None, "total": gaussian(x_fit, *popt),
-                "threshold": None, "separated": False, "bimodal_popt": None,
-                "single_popt": (float(popt[0]), float(popt[1]), float(popt[2]))}
-
-    if mode != "double":
-        return _single()                     # "single": one Gaussian, no dark/bright split
-    # Otsu split (between-class variance) in its classic BINNED form -- seeds each side.
-    w0 = np.cumsum(counts)[:-1]                          # class-0 weight up to each bin boundary
-    m0 = np.cumsum(counts * centers)[:-1]                # class-0 first moment
-    w1 = n_samples - w0
-    m_total = float((counts * centers).sum())
-    with np.errstate(divide="ignore", invalid="ignore"):
-        score = np.where((w0 > 0) & (w1 > 0),
-                         w0 * w1 * (m0 / w0 - (m_total - m0) / w1) ** 2, 0.0)
-    si = int(np.argmax(score))                           # split boundary AFTER bin si
-    left_c, left_w = centers[: si + 1], counts[: si + 1]
-    right_c, right_w = centers[si + 1:], counts[si + 1:]
-    if float(left_w.sum()) < 2 or float(right_w.sum()) < 2:
-        half = np.searchsorted(np.cumsum(counts), n_samples / 2)   # fallback: split at the median bin
-        left_c, left_w = centers[: half + 1], counts[: half + 1]
-        right_c, right_w = centers[half + 1:], counts[half + 1:]
-        if float(left_w.sum()) <= 0 or float(right_w.sum()) <= 0:
-            return _single()
-    mu0, s0 = _weighted_stats(left_c, left_w)
-    mu1, s1 = _weighted_stats(right_c, right_w)
-    if mu0 > mu1:
-        mu0, mu1 = mu1, mu0
-        s0, s1 = s1, s0
-    s0 = max(s0, span / 40, 1e-9)
-    s1 = max(s1, span / 40, 1e-9)
-
-    def _amp_near(mu):
-        return max(float(counts[int(np.clip(np.searchsorted(centers, mu), 0, len(counts) - 1))]), 1.0)
-
-    # DOUBLE mode ALWAYS attempts the two-Gaussian decomposition -- the toggle drives the display
-    # DIRECTLY, never a hidden auto-collapse based on how the data looks; only a genuine curve_fit
-    # failure falls back to the single Gaussian (the "toggle does nothing" bug).
-    p0 = [_amp_near(mu0), mu0, s0, _amp_near(mu1), mu1, s1]
-    bounds = (
-        [0, float(edges[0]), span / 200, 0, float(edges[0]), span / 200],
-        [max(_amp_near(mu0) * 5, 1), float(edges[-1]), span * 2,
-         max(_amp_near(mu1) * 5, 1), float(edges[-1]), span * 2],
-    )
-    try:
-        popt, _ = curve_fit(bimodal_model, centers, counts, p0=p0, bounds=bounds,
-                            jac=bimodal_jacobian, maxfev=20000)
-    except Exception:
-        return _single()
-    if popt[1] > popt[4]:
-        popt = np.array([popt[3], popt[4], popt[5], popt[0], popt[1], popt[2]], dtype=float)
-    # Both peaks always DRAW in double mode; the threshold (and the fidelity stat upstream) is only
-    # meaningful when the fitted means separate by >= 1.5 summed widths -- the same gate as before.
-    fitted_sep = abs(popt[4] - popt[1]) / (abs(popt[2]) + abs(popt[5]) + 1e-12)
-    separated = fitted_sep >= 1.5
-    y0 = gaussian(x_fit, *popt[:3])
-    y1 = gaussian(x_fit, *popt[3:])
-    threshold = None
-    lo, hi = float(popt[1]), float(popt[4])
-    if separated and hi > lo:
-        x_mid = np.linspace(lo, hi, 400)
-        diff = np.abs(gaussian(x_mid, *popt[:3]) - gaussian(x_mid, *popt[3:]))
-        threshold = float(x_mid[int(np.nanargmin(diff))])
-    return {"x": x_fit, "left": y0, "right": y1, "total": y0 + y1, "threshold": threshold,
-            "separated": separated, "bimodal_popt": popt, "single_popt": None}
-
-
 class HistogramFigure(BaseLivePlot):
     """Neutral-atom-friendly histogram with threshold classification tools.
 
@@ -3391,8 +3339,8 @@ class HistogramFigure(BaseLivePlot):
         self._refresh_overlays()
         self._apply_value_xlim()
         self._apply_count_yscale()
-        # Skip the bimodal curve_fit when its inputs are byte-identical to the last fit: re-fitting the
-        # SAME histogram yields the SAME popt but costs ~10 ms of scipy ``curve_fit`` per tick on the GUI
+        # Skip the bimodal fit when its inputs are byte-identical to the last fit: re-fitting the
+        # SAME histogram yields the SAME popt but costs ~10 ms of core solver work per tick on the GUI
         # thread (profiled -- a live dis panel re-fit unchanged data every tick, starving the event loop).
         # A new shot re-bins ``self.n`` and a Setting change re-strings ``self._fit`` -- both miss the
         # cache and re-fit.  Performance-only, appearance-neutral (AGENTS §3 skip-if-unchanged).
@@ -3510,30 +3458,34 @@ class HistogramFigure(BaseLivePlot):
     def _fit_bimodal(self) -> None:
         # A robust two-Gaussian fit with a UNIMODAL FALLBACK.  The old median split sat INSIDE the
         # dark blob whenever the bright mode was sparse (rare high occupancy), seeding both Gaussians
-        # on dark so curve_fit collapsed to one blob and reported a MISLEADING fidelity.  Fix: split by
+        # on dark so the solver collapsed to one blob and reported a MISLEADING fidelity.  Fix: split by
         # between-class variance (Otsu) over the samples, seed each side's amplitude from its own bin
         # counts, and -- when the bright mode is too sparse or unseparated -- fit ONE Gaussian and
         # report fit F = N/A (honest), never a fake number.  The MATH lives in the ONE
-        # fit_histogram_curves primitive (shared with the grid's HistogramCell thumbnails);
+        # core.fitting.fit_histogram primitive (shared with the grid's HistogramCell thumbnails);
         # this method only lands the result on the figure's artists + stat state.
         self.bimodal_popt = None
         self.fit_threshold = None
         self.single_popt = None
+        self._histogram_fit_result = None
         self._fit_separated = False
         self._has_threshold = self._explicit_thr        # no fit yet -> only an explicit cut shows
         for ln in (self.fit_line_left, self.fit_line_right, self.fit_line_total):
             ln.set_data([], [])
-        res = fit_histogram_curves(self.bins, self.n, self._fit)
-        if res is None:
+        result = fit_histogram(self.bins, self.n, self._fit)
+        self._histogram_fit_result = result
+        if not result.valid:
             return
-        if res["left"] is not None:
-            self.fit_line_left.set_data(res["x"], res["left"])
-            self.fit_line_right.set_data(res["x"], res["right"])
-        self.fit_line_total.set_data(res["x"], res["total"])
-        self.bimodal_popt = res["bimodal_popt"]
-        self.single_popt = res["single_popt"]
-        self._fit_separated = bool(res["separated"])
-        self.fit_threshold = res["threshold"]
+        x_fit = np.linspace(self.bins[0], self.bins[-1], 400)
+        left, right, total = result.curves(x_fit)
+        if left is not None:
+            self.fit_line_left.set_data(x_fit, left)
+            self.fit_line_right.set_data(x_fit, right)
+        self.fit_line_total.set_data(x_fit, total)
+        self.bimodal_popt = result.bimodal_parameters
+        self.single_popt = result.single_parameters
+        self._fit_separated = result.separated
+        self.fit_threshold = result.threshold
         self._has_threshold = self._fit_separated or self._explicit_thr
 
     def _fit_fidelity(self, threshold: float) -> float | None:
@@ -3574,13 +3526,11 @@ class HistogramFigure(BaseLivePlot):
         n = getattr(self, "n", None)
         if n is None or float(np.sum(n)) <= 0 or getattr(self, "bins", None) is None:
             return None
-        centers = (self.bins[:-1] + self.bins[1:]) / 2
-        if self.single_popt is not None:
-            fitted = gaussian(centers, *self.single_popt)
-        elif self.bimodal_popt is not None:
-            fitted = bimodal_model(centers, *self.bimodal_popt)
-        else:
+        result = getattr(self, "_histogram_fit_result", None)
+        if result is None or not result.valid:
             return None
+        centers = (self.bins[:-1] + self.bins[1:]) / 2
+        fitted = result.evaluate(centers)
         overlap = float(np.sum(np.minimum(n.astype(float), np.clip(fitted, 0.0, None))))
         return float(max(0.0, 1.0 - overlap / float(np.sum(n))))
 
@@ -3626,6 +3576,20 @@ class HistogramFigure(BaseLivePlot):
             self.stats_text.set_text(f"gauss mean={mu:.4g}\nsd={abs(sigma):.3g}{out_text}")
         else:
             self.stats_text.set_text(f"single peak (no split){out_text}")
+
+    def selection_rows(self) -> dict[str, object]:
+        """Distribution selection is a value range, not sample-index x."""
+
+        centers = (np.asarray(self.bins[:-1], dtype=float)
+                   + np.asarray(self.bins[1:], dtype=float)) / 2.0
+        counts = np.asarray(self.n, dtype=float)
+        return {
+            "coordinates": {"x": centers, "value": centers},
+            "values": counts,
+            "mode": "value",
+            "frame": "value",
+            "scope": (),
+        }
 
     def _install_state(self) -> None:
         self.fig._zlc_state = PlotState(plot_type="hist", x_array=self.bins, y_array=self.n)
@@ -3837,33 +3801,107 @@ def _as_per_site_list(per_site_values, n_sites: int | None = None):
 
 
 # ------------------------------------------------------------------ facet: the grid as an axis-expander
-# A grid is a DIMENSION-EXPANSION tool: pick ONE axis of a measurement block -- the block always obeys
-# the shape iron law ``(repeat, points, *data_dim)`` -- and lay that axis out as N aligned cells, each a
+# A grid is an AXIS-EXPANSION tool: pick ONE axis of a canonical measurement block
+# ``(R, P, *data_shape)`` and lay that axis out as N aligned cells, each a
 # standard ``sub_plot_kind`` panel of the REMAINING axes.  ``facet_cells`` below is the ONE slicing rule
 # every surface shares (the console's live grid panel, the notebook ``grid(value, facet=...)`` factory),
 # so "which axis becomes the cells and what each cell shows" is defined in exactly one place.
 
-def normalize_facet(facet):
-    """Parse a facet spec into the canonical ``(group, index)`` pair -- or ``None`` (no faceting:
-    the grid shows a static per-cell recipe, the pre-facet behaviour).
+_INDEXED_FACET_TOKEN = re.compile(r"(points|data):(0|[1-9][0-9]*)\Z")
 
-    Accepted spellings: ``"repeat"`` (one cell per repeat), ``"points"``/``"points:i"`` (one cell per
-    entry of the i-th POINTS axis -- the scan grid's axes, e.g. the outer axis of a 3-D pulse scan),
-    ``"dim"``/``"dim:i"`` (one cell per entry of the i-th DATA axis, e.g. per site of a per-site
-    vector), or an explicit ``(group, index)`` tuple.  Anything else raises."""
-    if facet is None or facet == "":
-        return None
-    if isinstance(facet, (tuple, list)) and len(facet) == 2:
-        group, index = str(facet[0]), int(facet[1])
-    else:
-        text = str(facet).strip()
-        group, _, idx = text.partition(":")
-        group = group.strip()
-        index = int(idx) if idx.strip() else 0
-    if group not in ("repeat", "points", "dim") or index < 0:
+
+def normalize_facet(facet: str) -> tuple[str, int]:
+    """Parse the one facet grammar into its internal ``(axis_group, axis_index)`` pair.
+
+    The serialized declaration has exactly three forms: ``"repeat"``, ``"points:k"`` and
+    ``"data:k"``, where ``k`` is a canonical non-negative decimal integer.  Absence is represented
+    by the caller not invoking this parser; empty strings, implicit axis zero, tuple/list forms and
+    every other spelling are invalid rather than aliases for the same declaration.
+    """
+    if isinstance(facet, str) and facet == "repeat":
+        return "repeat", 0
+    match = _INDEXED_FACET_TOKEN.fullmatch(facet) if isinstance(facet, str) else None
+    if match is None:
         raise ValueError(
-            f"facet must be 'repeat', 'points[:i]' or 'dim[:i]' (or a (group, i) pair); got {facet!r}.")
-    return group, index
+            "facet must be exactly 'repeat', 'points:k' or 'data:k' with canonical k >= 0; "
+            f"got {facet!r}.")
+    return match.group(1), int(match.group(2))
+
+
+@dataclass(frozen=True)
+class _FacetCellLayout:
+    """A facet cell's retained axis contract.
+
+    ``image_shape`` is present only when the retained axes have one unambiguous 2-D
+    interpretation.  ``curve_size`` is present only when a curve can be formed without
+    merging P with non-scalar data or flattening a multidimensional ``data_shape``.
+    The auto renderer and the concrete slicer consume this same classification.
+    """
+
+    points_shape: tuple[int, ...]
+    data_shape: tuple[int, ...]
+    image_shape: tuple[int, int] | None
+    image_source: str | None
+    curve_size: int | None
+
+    @property
+    def auto_kind(self) -> str:
+        if self.image_shape is not None:
+            return "2d"
+        if self.curve_size is not None:
+            return "1d" if self.curve_size > 1 else "hist"
+        raise ValueError(
+            "the retained facet axes have no unambiguous automatic renderer: "
+            f"points left {self.points_shape}, data_shape left {self.data_shape}.  "
+            "Choose another facet or reduce/select explicitly."
+        )
+
+
+def _classify_facet_cell(points_shape, data_shape) -> _FacetCellLayout:
+    """Classify retained facet axes without deleting any declared axis."""
+
+    pts = tuple(int(n) for n in points_shape)
+    data = tuple(int(n) for n in data_shape)
+    point_count = int(np.prod(pts or (1,), dtype=np.int64))
+    data_items = int(np.prod(data or (1,), dtype=np.int64))
+    scalar_data = data in ((), (1,))
+
+    image_shape = None
+    image_source = None
+    if len(pts) == 2 and scalar_data:
+        image_shape = (pts[0], pts[1])
+        image_source = "points"
+    elif point_count == 1 and len(data) == 2:
+        image_shape = (data[0], data[1])
+        image_source = "data"
+
+    curve_size = None
+    if len(data) <= 1 and not (point_count > 1 and data_items > 1):
+        curve_size = point_count if data_items == 1 else data_items
+
+    return _FacetCellLayout(
+        points_shape=pts,
+        data_shape=data,
+        image_shape=image_shape,
+        image_source=image_source,
+        curve_size=curve_size,
+    )
+
+
+def _facet_remainder_shapes(facet, *, points_shape=(), data_shape=()):
+    """Return the exact logical shapes left after one facet slice."""
+
+    spec = None if facet is None else normalize_facet(facet)
+    pts = tuple(int(n) for n in points_shape) or (1,)
+    data = tuple(int(n) for n in data_shape) or (1,)
+    if spec is None or spec[0] == "repeat":
+        return pts, data
+    group, index = spec
+    shape = pts if group == "points" else data
+    if index >= len(shape):
+        raise ValueError(f"facet {group}:{index} out of range for {group}_shape {shape}.")
+    remainder = tuple(n for i, n in enumerate(shape) if i != index)
+    return (remainder, data) if group == "points" else (pts, remainder)
 
 
 def facet_cell_labels(facet, n_cells, *, points_shape=(), coords=None, param_names=None):
@@ -3871,7 +3909,7 @@ def facet_cell_labels(facet, n_cells, *, points_shape=(), coords=None, param_nam
     cell index ``k``) into human text, so a cell's label MATCHES the axis it was faceted on instead of a
     hardcoded ``s{k}`` everywhere:
 
-    * ``dim`` (a per-SITE data slice) or a non-faceted recipe grid -> ``s{k}`` (the readout/calibration tag),
+    * ``data`` (a per-SITE data slice) or a non-faceted recipe grid -> ``s{k}`` (the readout/calibration tag),
     * ``repeat`` -> ``rep {k}``,
     * ``points`` (a SCAN axis) -> the scan coordinate: ``{name}={value}`` when the producing scan's param
       ``name`` / ``coords`` are known (e.g. ``Bz=1.2``), else the bare value, else ``pt {k}``.
@@ -3880,9 +3918,9 @@ def facet_cell_labels(facet, n_cells, *, points_shape=(), coords=None, param_nam
     :meth:`GridCell.cell_title`, so the label a cell shows is DERIVED here, never re-hardcoded per cell
     family -- the DRY fix for the three ``f"s{k}"`` literals."""
     del points_shape                                   # reserved for future per-axis coordinate mapping
-    spec = normalize_facet(facet)
+    spec = None if facet is None else normalize_facet(facet)
     n = int(n_cells)
-    if spec is None or spec[0] == "dim":
+    if spec is None or spec[0] == "data":
         return [f"site {k}" for k in range(n)]
     group, index = spec
     if group == "repeat":
@@ -3916,12 +3954,12 @@ def facet_axis_labels(facet, sub_plot_kind, *, points_shape=(), data_shape=(),
     """The grid's figure-level ``(xlabel, ylabel)`` DERIVED from what each cell has LEFT after the
     facet slice -- the axis-name counterpart of :func:`facet_cell_labels` (which names the CELLS) and
     the ONE place "which remaining axis is a cell's x / y" is written down.  It mirrors
-    :func:`facet_cells`' slicing (``pts_rest`` / ``dim_rest``) and the cell renderers' orientation:
+    :func:`facet_cells`' slicing (``points_rest`` / ``data_rest``) and the cell renderers' orientation:
 
     * ``2d`` cell of a remaining 2-D POINTS grid (``core.reshape(pts_rest)`` + ``imshow(origin=
       'lower')``): row axis ``pts_rest[0]`` runs along y, column axis ``pts_rest[1]`` along x ->
       the labels are those scan axes' ``param_names``;
-    * ``2d`` cell of a remaining 2-D DATA_DIM (a camera frame): pixel coordinates stay
+    * ``2d`` cell of a remaining 2-D ``data_shape`` (a camera frame): pixel coordinates stay
       ``("x (px)", "y (px)")``;
     * ``1d`` cell whose single non-trivial remaining axis is a POINTS axis: x = that axis's param
       name, y = ``value_label`` (the produced quantity's declared axis name);
@@ -3939,22 +3977,22 @@ def facet_axis_labels(facet, sub_plot_kind, *, points_shape=(), data_shape=(),
     if kind == "hist":
         return (value_text or default_x, default_y)
 
-    spec = normalize_facet(facet)
+    spec = None if facet is None else normalize_facet(facet)
     pts_axes = list(enumerate(int(n) for n in (points_shape or ())))   # (original axis index, length)
-    dim_rest = tuple(int(n) for n in (data_shape or ()))
+    data_rest = tuple(int(n) for n in (data_shape or ()))
     if spec is not None:
         group, index = spec
         if group == "points":
             pts_axes = [(i, n) for i, n in pts_axes if i != index]
-        elif group == "dim":
-            dim_rest = tuple(n for i, n in enumerate(dim_rest) if i != index)
-    dim_trivial = int(np.prod(dim_rest or (1,), dtype=np.int64)) == 1
+        elif group == "data":
+            data_rest = tuple(n for i, n in enumerate(data_rest) if i != index)
+    scalar_data = data_rest in ((), (1,))
 
     def _name(axis_index: int) -> str:
         return names[axis_index] if axis_index < len(names) else ""
 
     if kind == "2d":
-        if len(pts_axes) == 2 and dim_trivial:
+        if len(pts_axes) == 2 and scalar_data:
             # the frame is the remaining 2-D points grid (facet_cells' core.reshape(pts_rest));
             # imshow (the shared ``_IMAGE_ORIGIN``) puts rows (pts_rest[0]) on y, columns (pts_rest[1]) on x
             xlabel, ylabel = _name(pts_axes[1][0]), _name(pts_axes[0][0])
@@ -3962,9 +4000,9 @@ def facet_axis_labels(facet, sub_plot_kind, *, points_shape=(), data_shape=(),
         return (default_x, default_y)              # a camera-frame cell keeps its pixel axes
 
     # "1d": the remaining axes flatten to a curve; its x axis is MEANINGFUL (a named scan
-    # coordinate) only when exactly one non-trivial points axis remains and data_dim is trivial.
+    # coordinate) only when exactly one non-trivial points axis remains and data_shape is scalar.
     nontrivial = [i for i, n in pts_axes if n > 1]
-    xlabel = _name(nontrivial[0]) if len(nontrivial) == 1 and dim_trivial else ""
+    xlabel = _name(nontrivial[0]) if len(nontrivial) == 1 and scalar_data else ""
     return (xlabel or default_x, value_text or default_y)
 
 
@@ -3987,27 +4025,16 @@ def _collapse_repeat(sliced, repeat_mode: str):
 def default_sub_plot_kind(facet, *, points_shape=(), data_shape=()) -> str:
     """The natural per-cell kind for a facet slice -- from what each cell has LEFT after the slice
     (the same by-dimensionality rule the console's reshape uses, #H3o): a remaining 2-D points grid
-    OR a remaining 2-D data_dim (a camera frame) is an image cell, more than one remaining value is
+    OR a remaining 2-D ``data_shape`` (a camera frame) is an image cell, more than one remaining value is
     a curve, a bare sample set is a distribution.  The ONE auto rule the console's 'auto'
     sub_plot_kind and the notebook factory share."""
-    group, index = normalize_facet(facet) or ("", 0)
-    pts = tuple(int(n) for n in points_shape) or (1,)
-    dim = tuple(int(n) for n in data_shape) or (1,)
-    if group == "points":
-        pts = tuple(n for i, n in enumerate(pts) if i != index)
-    elif group == "dim":
-        dim = tuple(n for i, n in enumerate(dim) if i != index)
-    if len(pts) == 2:
-        return "2d"                            # a remaining 2-D scan grid is an image
-    if int(np.prod(pts, dtype=np.int64)) == 1 and len([n for n in dim if n > 1]) == 2:
-        return "2d"                            # a remaining 2-D data_dim (a camera frame) is an image
-    if int(np.prod(pts, dtype=np.int64)) > 1 or int(np.prod(dim, dtype=np.int64)) > 1:
-        return "1d"                            # an ordered remaining axis reads as a curve
-    return "hist"                              # nothing left but repeats -> a sample distribution
+    pts, data = _facet_remainder_shapes(
+        facet, points_shape=points_shape, data_shape=data_shape)
+    return _classify_facet_cell(pts, data).auto_kind
 
 
 def facet_cells(value, facet, *, sub_plot_kind: str, points_shape=(), repeat_mode: str = "average"):
-    """Slice ONE ``(repeat, points, *data_dim)`` block along the facet axis into the per-cell inputs a
+    """Slice ONE ``(R, P, *data_shape)`` block along the facet axis into the per-cell inputs a
     :class:`GridPlot` of ``sub_plot_kind`` cells displays -- the SINGLE data rule of the grid-as-facet
     design.  Returns ``[cell_0_data, cell_1_data, ...]``.
 
@@ -4018,10 +4045,12 @@ def facet_cells(value, facet, *, sub_plot_kind: str, points_shape=(), repeat_mod
     * ``hist``  -- the cell's SAMPLES: everything left after the slice, pooled (a distribution pools
       repeats by definition; ``repeat_mode`` is not consulted).
     * ``2d``    -- the cell's FRAME: repeats collapsed by ``repeat_mode``, then the remaining points
-      grid (2-D) or the 2-D data_dim is the image.
-    * ``1d``    -- the cell's CURVE: repeats collapsed by ``repeat_mode``, remaining values flattened.
+      grid (2-D) or the 2-D ``data_shape`` is the image.
+    * ``1d``    -- the cell's CURVE: repeats collapsed by ``repeat_mode``; only the physical P axis
+      or one remaining data axis may vary.  A P-by-data matrix or multidimensional ``data_shape``
+      must be faceted/reduced explicitly and is never flattened into one ambiguous vector.
     """
-    spec = normalize_facet(facet)
+    spec = None if facet is None else normalize_facet(facet)
     if spec is None:
         raise ValueError("facet_cells needs an explicit facet; None means a recipe (non-faceted) grid.")
     group, index = spec
@@ -4029,54 +4058,57 @@ def facet_cells(value, facet, *, sub_plot_kind: str, points_shape=(), repeat_mod
     if a.dtype.kind not in "iubf":            # only non-numeric values normalize to float
         a = np.asarray(a, dtype=float)
     if a.ndim < 2:
-        raise ValueError(f"a facet grid slices a (repeat, points, *data_dim) block; got shape {a.shape}.")
+        raise ValueError(f"a facet grid slices a canonical (R,P,*data_shape) block; got shape {a.shape}.")
     n_repeat, n_points = int(a.shape[0]), int(a.shape[1])
-    dim_shape = tuple(int(n) for n in a.shape[2:])
+    data_shape = tuple(int(n) for n in a.shape[2:])
     pts_shape = tuple(int(n) for n in (points_shape or (n_points,)))
     if int(np.prod(pts_shape)) != n_points:
         raise ValueError(f"points_shape {pts_shape} does not match the block's points axis ({n_points}).")
-    # expose the points axis in its declared multi-D form: (repeat, *pts_shape, *dim_shape)
-    a = a.reshape((n_repeat, *pts_shape, *dim_shape))
+    # Expose only the physical P axis in its declared logical point geometry.  The complete trailing
+    # data_shape tuple is appended unchanged.
+    a = a.reshape((n_repeat, *pts_shape, *data_shape))
     if group == "repeat":
-        slices = [a[r] for r in range(n_repeat)]                    # each: (*pts, *dim), repeat consumed
-        pts_rest, dim_rest, has_repeat = pts_shape, dim_shape, False
+        slices = [a[r] for r in range(n_repeat)]                    # each: (*point_shape, *data_shape)
+        pts_rest, data_rest, has_repeat = pts_shape, data_shape, False
     elif group == "points":
         if index >= len(pts_shape):
             raise ValueError(f"facet points:{index} out of range for points_shape {pts_shape}.")
-        moved = np.moveaxis(a, 1 + index, 0)                        # (n_i, repeat, *pts_rest, *dim)
+        moved = np.moveaxis(a, 1 + index, 0)                        # (n_i, R, *points_rest, *data_shape)
         slices = [moved[j] for j in range(moved.shape[0])]
         pts_rest = tuple(n for i, n in enumerate(pts_shape) if i != index)
-        dim_rest, has_repeat = dim_shape, True
-    else:  # "dim"
-        if index >= len(dim_shape):
-            raise ValueError(f"facet dim:{index} out of range for data_dim {dim_shape}.")
-        moved = np.moveaxis(a, 1 + len(pts_shape) + index, 0)       # (n_i, repeat, *pts, *dim_rest)
+        data_rest, has_repeat = data_shape, True
+    else:  # "data"
+        if index >= len(data_shape):
+            raise ValueError(f"facet data:{index} out of range for data_shape {data_shape}.")
+        moved = np.moveaxis(a, 1 + len(pts_shape) + index, 0)       # (n_i, R, *points, *data_rest)
         slices = [moved[j] for j in range(moved.shape[0])]
         pts_rest = pts_shape
-        dim_rest = tuple(n for i, n in enumerate(dim_shape) if i != index)
+        data_rest = tuple(n for i, n in enumerate(data_shape) if i != index)
         has_repeat = True
 
     kind = str(sub_plot_kind)
     if kind == "hist":
         return [s.reshape(-1) for s in slices]                      # a distribution pools everything left
+    layout = _classify_facet_cell(pts_rest, data_rest)
     cells = []
     for s in slices:
         core = _collapse_repeat(s, repeat_mode) if has_repeat else np.asarray(s, dtype=float)
         if kind == "2d":
-            # the frame is the remaining 2-D points grid (data_dim trivial -- keep declared 1-length
-            # scan axes), else whatever 2-D core the slice leaves (a camera frame).  Anything that is
-            # not exactly 2-D after dropping 1-length axes raises -- NEVER a silent component pick.
-            if len(pts_rest) == 2 and int(np.prod(dim_rest, dtype=np.int64)) == 1:
-                core = core.reshape(pts_rest)
-            else:
-                core = np.squeeze(core)
-            if core.ndim != 2:
+            # Reshape only to the exact 2-D geometry identified by the shared classifier.  This
+            # removes structural scalar P/data cells, never arbitrary singleton data axes.
+            if layout.image_shape is None:
                 raise ValueError(
-                    f"a 2d facet cell needs a 2-D frame after slicing; got shape {core.shape} "
-                    f"(points left {pts_rest}, data_dim left {dim_rest}).")
-            cells.append(core)
+                    f"a 2d facet cell needs an exact 2-D frame: a points grid with scalar data or an exact "
+                    f"2-D data_shape with scalar P; got shape {core.shape} "
+                    f"(points left {pts_rest}, data_shape left {data_rest}).")
+            cells.append(core.reshape(layout.image_shape))
         else:  # "1d"
-            cells.append(core.reshape(-1))
+            if layout.curve_size is None:
+                raise ValueError(
+                    "a 1d facet cell cannot merge P with data_shape or flatten multidimensional "
+                    f"data_shape; points left {pts_rest}, data_shape left {data_rest}.  "
+                    "Choose data:k or reduce/select explicitly.")
+            cells.append(core.reshape(layout.curve_size))
     return cells
 
 
@@ -4139,21 +4171,19 @@ class GridCell:
     #:  * ``view_xlim`` = a pinned (lo, hi) x-window (``None`` = autoscale), applied to every cell's axes;
     #:  * ``view_ylim`` = the y sibling, accepted ONLY by an image family (``y_is_view_axis``: x AND y
     #:    are pixel coordinates there; on a 1d/hist cell y is the DATA axis owned by relim);
-    #:  * ``fit_model`` = a :data:`data_figure` fit method name ('gaussian'/'decay'/...) or ``"none"``;
-    #:  * ``fit_cmd`` = the optional argument string for that fit call (``p0=...`` etc).
+    #:  * ``fit_request`` = one serialized :class:`core.fitting.FitRequest`, or ``None``.
     view_xlim: "tuple[float, float] | None" = None
     view_ylim: "tuple[float, float] | None" = None
     #: Same flag, same rule as :attr:`BaseLivePlot.y_is_view_axis` -- the ONE gate every surface
     #: (Edit row, consume_param, _apply_view_knobs) keys the y-window pin off.
     y_is_view_axis: bool = False
-    fit_model: str = "none"
-    fit_cmd: str = ""
-    #: Does this cell family accept the general Edit-tab curve fit (``fit_model``)?  A family with its OWN
+    fit_request: "dict[str, Any] | None" = None
+    #: Does this cell family accept the general Edit-tab curve fit?  A family with its OWN
     #: built-in fit sets this ``False`` so the general fit is a NO-OP on it -- a histogram cell has the
     #: bimodal readout fit, and stacking a 1-D peak model on the counts array fit it with an absurd curve
     #: and dimmed the bimodal (#dis-fit mess).  The x-window pin (``view_xlim``) is unaffected (it is not a
     #: fit).  Mirrors the console's :func:`task_console._kind_offers_general_fit` (which hides the fit UI for
-    #: the same families), so a stale ``fit_model`` from an old recipe / a notebook poke is ALSO inert here.
+    #: the same families), so an incompatible request is inert here.
     supports_general_fit: bool = True
 
     def thumb_lims(self, auto_lo: float, auto_hi: float) -> tuple[float, float]:
@@ -4188,7 +4218,7 @@ class GridCell:
 
     def _cell_popt(self, k: int):
         """The cell's fitted parameters for the title template's ``{popt}`` -- the general Edit-tab fit's
-        popt (populated by :meth:`GridPlot._apply_view_knobs` when a ``fit_model`` is active), so ANY cell
+        popt (populated by :meth:`GridPlot._apply_view_knobs` when a fit request is active), so ANY cell
         kind's title can reference ``{popt[i]}``; empty until the cell has been fitted (a template
         referencing ``popt`` then degrades to the identifier).  A family with its OWN fit (a hist cell's
         bimodal) overrides this to prefer that when no general fit is active."""
@@ -4250,17 +4280,11 @@ class GridCell:
                 return False
             self.view_ylim = new
             return True
-        if str(key) == "fit_model":
-            new = str(value or "none")
-            if self.fit_model == new:
+        if str(key) == "fit_request":
+            new = None if value in (None, "", "none") else dict(value)
+            if self.fit_request == new:
                 return False
-            self.fit_model = new
-            return True
-        if str(key) == "fit_cmd":
-            new = str(value or "")
-            if self.fit_cmd == new:
-                return False
-            self.fit_cmd = new
+            self.fit_request = new
             return True
         return False
 
@@ -4301,7 +4325,7 @@ class GridCell:
     def on_threshold_drag(self, k: int, x: float) -> None:
         """Called while a threshold is dragged (update data + any annotation)."""
 
-    def data_figure(self, fig, ax, k: int):
+    def data_figure(self, fig, ax, k: int, *, tools=None, scope=()):
         """The per-cell :class:`DataFigure` (reusable fitting stack)."""
         raise NotImplementedError
 
@@ -4309,7 +4333,7 @@ class GridCell:
         """The ``panel_plot`` args for the STANDALONE enlarged view of cell ``k``: ``{"data_x": ..., "data_y":
         ..., ...kind-specific kwargs...}`` merged into ``panel_plot(kind=self.sub_plot_kind, size=..., **here)``
         by :meth:`GridPlot.build_focus_plotter`.  A distribution cell returns its sample vector + bins / fit /
-        threshold; an image cell returns the pixel-coordinate scatter + cmap.  ``display_params`` are the
+        threshold; an image cell returns compact raster coordinates + cmap.  ``display_params`` are the
         grid's live display knobs (bins / fit / ylog / cmap) folded in, so a Setting change reaches the
         enlarged cell.  Because the result is a REAL standalone ``panel_plot`` of ``sub_plot_kind``, the enlarged
         cell carries that kind's full x/y axes, draggable threshold, fit and standard relim -- no bespoke code."""
@@ -4342,7 +4366,7 @@ class HistogramCell(GridCell):
         self.labels = tuple(labels)
         self.edges = None
         # The hist kind's OWN display knobs, rendered on the thumbnails through the SAME primitives
-        # the standalone HistogramFigure uses (fit_histogram_curves / set_yscale) -- and the SAME
+        # the standalone HistogramFigure uses (core fit_histogram / set_yscale) -- and the SAME
         # defaults (DEFAULT_HIST_FIT): what the Setting UI shows as the default IS what the grid
         # draws, never a per-surface divergence.
         self.fit = DEFAULT_HIST_FIT
@@ -4409,13 +4433,13 @@ class HistogramCell(GridCell):
         """The cell's fit popt for the title ``{popt}`` context: ALWAYS this hist cell's own bimodal fit popt
         (6-tuple bimodal / 3-tuple single); empty until fitted (a ``{popt}`` template then falls back to the
         identifier).  Single source -- the hist family does not accept the general Edit-tab fit
-        (``supports_general_fit=False``), so there is no general popt to prefer, and a stale ``fit_model``
+        (``supports_general_fit=False``), so there is no general popt to prefer, and a stale request
         never hijacks the title's parameters from the bimodal fit."""
         return self._cell_popt_store.get(int(k), ())
 
     def _apply_fit_lines(self, ax, k: int, counts) -> None:
         """(Re)fit + draw cell ``k``'s fit curves through the ONE primitive the standalone dis uses
-        (:func:`fit_histogram_curves`) -- the same three lines in the same colours, moved in place on
+        (:func:`core.fitting.fit_histogram`) -- the same three lines in the same colours, moved in place on
         a live tick.  Off ("none") / impossible fits leave the lines empty."""
         lines = self._fit_lines[k]
         if self.fit == "none" and lines is None:
@@ -4428,20 +4452,22 @@ class HistogramCell(GridCell):
             self._fit_lines[k] = lines
         for ln in lines:
             ln.set_data([], [])
-        res = fit_histogram_curves(self.edges, counts, self.fit)
-        if res is None:
+        result = fit_histogram(self.edges, counts, self.fit)
+        if not result.valid:
             self._cell_popt_store.pop(int(k), None)         # no fit on this cell -> drop stale popt
             return
         # expose the fitted params for the title {popt} context (bimodal 6-tuple else single 3-tuple);
         # ``is not None`` (not ``or``) -- a popt is a numpy array whose truth value is ambiguous.
-        popt = res.get("bimodal_popt")
+        popt = result.bimodal_parameters
         if popt is None:
-            popt = res.get("single_popt")
+            popt = result.single_parameters
         self._cell_popt_store[int(k)] = tuple(popt) if popt is not None else ()
-        if res["left"] is not None:
-            lines[0].set_data(res["x"], res["left"])
-            lines[1].set_data(res["x"], res["right"])
-        lines[2].set_data(res["x"], res["total"])
+        x_fit = np.linspace(self.edges[0], self.edges[-1], 400)
+        left, right, total = result.curves(x_fit)
+        if left is not None:
+            lines[0].set_data(x_fit, left)
+            lines[1].set_data(x_fit, right)
+        lines[2].set_data(x_fit, total)
 
     def _apply_count_ylim(self, ax, counts) -> None:
         """The thumbnail's count-axis scale + range: the SHARED top (every cell shows the same count
@@ -4531,12 +4557,14 @@ class HistogramCell(GridCell):
         if grid_line is not None:             # keep the grid line synced with a focus-view drag
             grid_line.set_xdata([x, x])
 
-    def data_figure(self, fig, ax, k: int):
+    def data_figure(self, fig, ax, k: int, *, tools=None, scope=()):
         from .data_figure import DataFigure
         centers = (self.edges[:-1] + self.edges[1:]) / 2
         ylabel = self.labels[1] if len(self.labels) > 1 else "Shots"
         return DataFigure(fig=fig, ax=ax, data_x=centers, data_y=self.cell_counts[k],
-                          labels=(self.labels[0], ylabel), name=f"site{k}")
+                          labels=(self.labels[0], ylabel), name=f"site{k}", tools=tools,
+                          coordinates={"x": centers, "value": centers}, selection_mode="value",
+                          selection_frame="value", selection_scope=scope)
 
     def auto_lims(self) -> tuple[float, float]:
         """The tallest cell's count-axis range (same 8% headroom the thumbnail draw applies) --
@@ -4757,35 +4785,30 @@ class ImageCell(GridCell):
         focus_plotter.update(self.images[k].reshape(-1))     # the standalone 2d consumes the flat frame
 
     def _pixel_coords(self, k: int):
-        """The image cell's pixel grid as the ``(N, 2)`` coordinate scatter + value column the 2d plot-kind
-        (:class:`Live2DDis` / :func:`DataFigure.center`) consumes.  The ONE coordinate construction shared by
-        :meth:`data_figure` (thumbnail + save + the general ``center`` fit) and :meth:`focus_data` (the
-        enlarged view), so the two never feed the SAME cell different shapes -- the 2D-Gaussian ``center`` fit
-        used to crash on the thumbnail's 1-D coords while working on the enlarged view's (N, 2)."""
+        """The image cell's compact regular grid plus its row-major value column."""
         im = self.images[k]
-        ny, nx = im.shape
-        xx, yy = np.meshgrid(np.arange(nx, dtype=float), np.arange(ny, dtype=float))
-        return np.column_stack([xx.ravel(), yy.ravel()]), im.ravel()
+        from ..neutral_atom.core.raster import RegularRaster
+        return RegularRaster(tuple(im.shape)), im.ravel()
 
-    def data_figure(self, fig, ax, k: int):
+    def data_figure(self, fig, ax, k: int, *, tools=None, scope=()):
         from .data_figure import DataFigure
-        # The image cell represents itself as the SAME (N,2) pixel-scatter + value column the enlarged view
-        # feeds (:meth:`_pixel_coords`), so the general ``2D center`` fit runs on a thumbnail exactly as on
-        # the double-click focus (a 1-D flat crashed the 2D-Gaussian centroid).  The faithful per-site images
-        # are saved through ``grid_recipe_from_cells``' ``per_cell``, not this top-level fallback.
+        # Thumbnail and focus share the same compact regular-grid contract.  The faithful per-site
+        # images are saved through ``grid_recipe_from_cells``' ``per_cell``.
         data_x, data_y = self._pixel_coords(k)
-        return DataFigure(fig=fig, ax=ax, data_x=data_x, data_y=data_y, labels=self.labels, name=f"site{k}_psf")
+        return DataFigure(fig=fig, ax=ax, data_x=data_x, data_y=data_y, labels=self.labels,
+                          name=f"site{k}_psf", tools=tools, selection_mode="xy",
+                          selection_frame="cell_px", selection_scope=scope)
 
     def focus_data(self, k: int, *, display_params: Mapping[str, Any] | None = None) -> dict:
         """The ``panel_plot(kind="2d")`` args for the STANDALONE enlarged view of kernel cell ``k`` -- the SAME
         ``2d`` panel a standalone image uses, so the enlarged kernel carries the side clim distribution, the
         colorbar, the draggable clim lines and full x/y pixel axes -- reusing the ONE plot-kind renderer (never
-        a hand-rolled copy).  The image's pixel grid is unpacked into the ``(N, 2)`` coordinate scatter + value
-        column ``Live2DDis`` consumes (the SAME convention the console's ``2d`` panel uses).  The cmap can be
+        a hand-rolled copy).  The image keeps its pixel grid as a compact ``RegularRaster`` plus the
+        row-major value column ``Live2DDis`` consumes (the SAME convention the console's ``2d`` panel uses).  The cmap can be
         overridden by the grid's ``cmap`` / ``colorset`` display param.  :meth:`GridPlot.build_focus_plotter`
         merges this into ``panel_plot``."""
         params = dict(display_params or {})
-        data_x, data_y = self._pixel_coords(k)           # SAME (N,2) coords the thumbnail/fit path feeds
+        data_x, data_y = self._pixel_coords(k)           # same compact grid the thumbnail/fit path feeds
         cmap = str(params.get("cmap") or params.get("colorset") or self.cmap)
         if not hasattr(self, "vmin"):
             self.prepare()
@@ -4806,29 +4829,37 @@ class ImageCell(GridCell):
         }
 
 
-def apply_fit_to_figure(df, model: str, cmd: str = "", *, is_display: bool = True):
-    """Run a :class:`DataFigure` fit ``model`` (a data_figure method name -- ``"gaussian"`` / ``"decay"`` /
-    ``"lorentzian"`` / ... ) on ``df`` with the optional ``cmd`` argument string (``"p0=..."`` etc), returning
-    its ``FitResult`` (or ``None``).  ``model`` of ``"none"`` / ``""`` just CLEARS any fit ``df`` drew.  The
-    ONE fit-application primitive both the console Edit tab and the grid's per-cell general fit call, so a
-    grid subplot and a flat panel fit through identical code (the same trusted-local-tool ``eval`` of the
-    typed args the operator's fit box holds).  ``is_display`` picks the render depth: ``True`` draws the fit
-    CURVE + the formula/parameter annotation (a full standalone plot / a focused cell), ``False`` draws the
-    CURVE ONLY (a tiny grid THUMBNAIL, where the equation text would overflow the cell) -- the SAME curve
-    either way, so the popt returned for the title is identical.  An explicit ``cmd`` may override it."""
-    if getattr(df, "fit", None) is not None:
-        try:
-            df.clear()
-        except Exception:
-            pass
-    if not model or str(model) == "none":
+def apply_fit_to_figure(df, request, *, is_display: bool = True):
+    """Apply one structured core FitRequest to a DataFigure.
+
+    The fit model, selection, seeds/bounds and solver all live in the
+    headless core.  This frontend primitive only clears/draws the returned
+    result; it never evals an argument string or owns a model.
+    """
+    from ..neutral_atom.core.fitting import FitRequest
+
+    if request in (None, "", "none"):
+        df.clear()
         return None
-    call = f"_df.{model}({cmd})" if cmd else f"_df.{model}(is_display={bool(is_display)})"
-    try:
-        result, _ = eval(call, {"_df": df, "np": np})   # noqa: S307 - local experiment tool (typed fit args)
-    except Exception:
+    if isinstance(request, str):
+        request = FitRequest(str(request), selection=df.selection())
+    elif isinstance(request, Mapping):
+        request = FitRequest.from_dict(request)
+    if not isinstance(request, FitRequest):
+        raise TypeError("fit request must be FitRequest, mapping, model key, or none")
+    return df.fit_model(request.model, request=request, is_display=is_display)
+
+
+def _fit_request_for_cell(request, cell_index: int):
+    """Return a request only when its optional cell scope matches."""
+    if request is None:
         return None
-    return result
+    from ..neutral_atom.core.fitting import FitRequest
+    parsed = FitRequest.from_dict(request) if isinstance(request, Mapping) else request
+    tags = [item for item in parsed.selection.scope if item.startswith("cell:")]
+    if tags and tags[-1] != f"cell:{int(cell_index)}":
+        return None
+    return request
 
 
 class _GridData:
@@ -4839,7 +4870,17 @@ class _GridData:
     def __init__(self, grid: "GridPlot"):
         self.grid = grid
         self.fig = grid.fig
-        self.cells = [grid.cell_renderer.data_figure(grid.fig, ax, k) for k, ax in enumerate(grid.site_axes)]
+        bundles = list(getattr(grid, "_cell_interactions", ()))
+        self.cells = [
+            grid.cell_renderer.data_figure(
+                grid.fig,
+                ax,
+                k,
+                tools=(bundles[k] if k < len(bundles) else None),
+                scope=(f"cell:{k}",),
+            )
+            for k, ax in enumerate(grid.site_axes)
+        ]
         self._figure_source: dict | None = None
 
     def bind_source(self, hub, node, *, inputs, resolve_node=None, session=None):
@@ -4853,6 +4894,32 @@ class _GridData:
 
     def cell(self, k: int):
         return self.cells[k]
+
+    def selection(self):
+        """No cell gesture means an intentional unscoped all-cell selection."""
+        from ..neutral_atom.core.selection import Selection
+        return Selection(frame="grid")
+
+    def selected_data(self, selection=None):
+        """Materialize one scoped cell or concatenate an unscoped grid selection."""
+        from ..neutral_atom.core.selection import SelectedData
+
+        selection = selection or self.selection()
+        tags = [item for item in selection.scope if item.startswith("cell:")]
+        if tags:
+            index = int(tags[-1].split(":", 1)[1])
+            return self.cells[index].selected_data(selection)
+        parts = [cell.selected_data(selection) for cell in self.cells]
+        if not parts:
+            return SelectedData({}, np.empty((0, 1)), np.empty(0, dtype=np.int64), selection)
+        keys = set(parts[0].coordinates)
+        for part in parts[1:]:
+            keys &= set(part.coordinates)
+        values = np.concatenate([part.values for part in parts], axis=0)
+        coordinates = {key: np.concatenate([part.coordinates[key] for part in parts]) for key in keys}
+        offsets = np.cumsum([0, *[part.count for part in parts[:-1]]])
+        indices = np.concatenate([part.indices + offset for part, offset in zip(parts, offsets)])
+        return SelectedData(coordinates, values, indices, selection, parts[0].value_shape)
 
     def fit_targets(self):
         """The grid's per-cell DataFigures -- the fit / limit stack loops over these so a grid fit or
@@ -4874,60 +4941,43 @@ class _GridData:
     def save(self, path: str = "", *, extra_info=None, image_ext: str = "png", **kwargs):
         """Save the whole grid the SAME way DataFigure saves a single plot: ONE png AND ONE matching
         ``.npz`` that ``load_figure`` reopens FAITHFULLY.  A grid is a first-class LOADABLE kind (like the
-        pulse figure): the ``.npz`` carries the standard ``data_x`` / ``data_y`` / ``info`` triple with
-        ``info['kind'] == 'grid'`` and a ``info['figure_recipe']`` (:func:`grid_recipe_from_cells`) that is
+        pulse figure): the ``.npz`` carries an explicit ``kind='grid'`` and ``recipe``
+        (:func:`grid_recipe_from_cells`) that is
         the SINGLE truth source for reproduction -- :func:`build_grid_figure` rebuilds the exact grid from
         it, so ``na.load_figure(npz).plot()`` and a seeded ``kind="grid"`` console panel both redraw the
-        per-site distributions / kernels faithfully (not a flattened line off the fallback arrays).
-
-        The ``data_x`` / ``data_y`` are a VALID no-recipe fallback (each cell's flattened series stacked +
-        the cell index) so ``load_figure``'s ``data_x`` / ``data_y`` assertion passes and an older reader
-        still gets an array payload -- exactly as the pulse save writes numeric fallback arrays beside its
-        recipe.  ``extra_info`` (the caller's metadata) WINS over the auto keys, and its ``kind`` is not
-        overridden."""
+        per-site distributions / kernels faithfully.  Recipe capture is mandatory: a grid whose cell
+        family cannot serialize raises at save time instead of producing a different array figure.
+        ``extra_info`` (the caller's metadata) may add view/provenance state but must still satisfy the
+        grid artifact contract."""
         import time
-        from .data_figure import resolve_save_base
+        from .data_figure import _write_saved_npz, resolve_save_base
         base = resolve_save_base(path, time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime()))   # shared path stem (#C4)
         image_path = base.with_suffix(f".{image_ext}")   # dotless ext, same as DataFigure.save
         data_path = base.with_suffix(".npz")
         self.fig.savefig(image_path, **kwargs)
-        # The faithful reproduction source: the grid's replay recipe (per-cell distributions / kernels +
-        # thresholds / fidelities / labels / shape).  Never raises the save -- a cell family with no recipe
-        # degrades to the array-only fallback.
-        try:
-            recipe = grid_recipe_from_cells(self.grid)
-        except Exception:
-            recipe = None
-        # A VALID no-recipe fallback: stack each cell's flat series as data_y columns (padded to a common
-        # length so it is a clean 2-D array) and the cell index as data_x, so ``load_figure``'s
-        # data_x/data_y assertion passes even for a reader that ignores the recipe.
-        columns: list[np.ndarray] = []
-        for c in self.cells:
-            try:
-                columns.append(np.asarray(c.data_y, dtype=float).reshape(-1))
-            except Exception:
-                columns.append(np.zeros(1, dtype=float))
-        width = max((col.size for col in columns), default=1)
-        data_y = np.full((len(columns) or 1, width), np.nan, dtype=float)
-        for k, col in enumerate(columns):
-            data_y[k, : col.size] = col
-        data_x = np.arange(data_y.shape[0], dtype=float).reshape(-1, 1)
-        info: dict[str, Any] = {"name": str(self.grid.title or "grid")}
-        # Only stamp ``kind='grid'`` when a recipe was captured -- the reopen resolves a grid figure by its
-        # recipe, so a grid ``kind`` WITHOUT a recipe would send the reopen down ``plot(kind='grid')``
-        # (which is rejected, like pulse) and crash.  A recipe-less save therefore has NO ``kind`` and the
-        # ``data_x`` / ``data_y`` fallback reopens through shape inference, exactly as the docstring's
-        # "degrades to the array-only fallback" promises.
-        if recipe is not None:
-            info["kind"] = "grid"
-            info["figure_recipe"] = recipe
+        recipe = grid_recipe_from_cells(self.grid)
+        data_x = np.empty((0, 1), dtype=float)
+        data_y = np.empty((0, 1), dtype=float)
+        info: dict[str, Any] = {
+            "name": str(self.grid.title or "grid"),
+            "kind": "grid",
+            "labels": list(recipe["labels"]),
+            "unit": "",
+            "points_done": int(len(recipe["per_cell"])),
+            "repeat_cur": 1,
+            "view": {},
+            "fit": None,
+            "size": str(recipe["panel_size"]),
+            "signals": {},
+            "figure_recipe": recipe,
+        }
         # The RICH signals / provenance blocks (bound via :meth:`bind_source`) -- captured through the SAME
         # frontend-neutral composition point a flat DataFigure.save uses (capture_rich_info), so a grid
         # panel Save writes the same rich npz: the Flow tab has a tree, the signals are recorded.
         info.update(self._rich_capture())
         if extra_info is not None:    # mirror DataFigure.save: caller metadata WINS over the auto keys
             info.update(dict(extra_info))
-        np.savez(data_path, data_x=data_x, data_y=data_y, info=info)
+        _write_saved_npz(data_path, data_x=data_x, data_y=data_y, info=info)
         return {"figure": image_path, "data": data_path}
 
     def _rich_capture(self) -> dict:
@@ -5274,7 +5324,8 @@ class GridPlot(BaseLivePlot):
                 ax.set_ylim(float(cell.view_ylim[0]), float(cell.view_ylim[1]))
             # is_display=True: the enlarged cell is a FULL standalone plot, so it shows the fit equation +
             # parameters (unlike the tiny thumbnail, which draws the curve only).
-            popt = self._refit_axes(ax, p.to_data_figure(), cell.fit_model, cell.fit_cmd,
+            popt = self._refit_axes(ax, p.to_data_figure(),
+                                    _fit_request_for_cell(cell.fit_request, int(k)),
                                     key="focus", is_display=True)
             if popt:
                 cell._general_popt_store = {**getattr(cell, "_general_popt_store", {}), int(k): popt}
@@ -5384,8 +5435,8 @@ class GridPlot(BaseLivePlot):
         # a general-fit knob HERE would only leak an inert value into ``_display_params`` and thus into
         # the saved recipe (``grid_recipe_from_cells`` reads it).  Gate at the store on the SAME
         # ``supports_general_fit`` fact the renderer uses, so store and render never disagree and a hist
-        # grid's .npz never carries a phantom ``fit_model``.
-        if str(key) in ("fit_model", "fit_cmd") and not getattr(
+        # grid's .npz never carries a phantom fit request.
+        if str(key) == "fit_request" and not getattr(
                 self.cell_renderer, "supports_general_fit", True):
             return False
         # Same store-gate for the y-window pin: only an image family (``y_is_view_axis``) accepts it,
@@ -5475,7 +5526,7 @@ class GridPlot(BaseLivePlot):
 
     def _apply_view_knobs(self, focus=None) -> None:
         """Re-apply the grid's stored VIEW knobs -- the pinned x-window (:attr:`GridCell.view_xlim`) and the
-        general curve fit (:attr:`GridCell.fit_model` / :attr:`GridCell.fit_cmd`) -- to whatever surface is
+        general curve fit (:attr:`GridCell.fit_request`) -- to whatever surface is
         drawn NOW: the enlarged cell when zoomed (this grid's own focus, or the console HOST's
         ``focus=(plotter, k)``), else every thumbnail.  Called after EVERY thumbnail redraw, live tick and
         focus build, so a pinned x-window and a fit STICK across the per-tick autoscale + fan to every cell
@@ -5487,15 +5538,13 @@ class GridPlot(BaseLivePlot):
         cell = self.cell_renderer
         vx = cell.view_xlim
         vy = cell.view_ylim if cell.y_is_view_axis else None   # y pin exists only on the image family
-        # A family with its own built-in fit (a hist cell's bimodal) does NOT accept the general curve fit --
-        # force ``model`` to "none" so a stale ``fit_model`` (an old recipe / notebook poke) is inert and never
-        # stacks an absurd 1-D peak on the bimodal; the x-window pin (``view_xlim``) still applies (not a fit).
-        model = cell.fit_model if getattr(cell, "supports_general_fit", True) else "none"
-        cmd = cell.fit_cmd
+        # A family with its own built-in fit does not accept the general fit.  A stale request from an old
+        # recipe is therefore inert; the x-window pin remains independent of fitting.
+        request = cell.fit_request if getattr(cell, "supports_general_fit", True) else None
         # Fast path: nothing pinned, no fit, no leftover fit artists to clear -> no per-tick work (this
         # method runs every live tick, so it must cost nothing when the grid carries no view knobs -- never
         # build an N-cell _GridData for a no-op).
-        if vx is None and vy is None and (not model or model == "none") and not self._general_fit_artists:
+        if vx is None and vy is None and request is None and not self._general_fit_artists:
             return
         store: dict = {}
         fp, fk = ((self._focus_plotter, self._focused) if self._focused is not None
@@ -5507,7 +5556,8 @@ class GridPlot(BaseLivePlot):
                     ax.set_xlim(float(vx[0]), float(vx[1]))
                 if vy is not None:
                     ax.set_ylim(float(vy[0]), float(vy[1]))
-                popt = self._refit_axes(ax, fp.to_data_figure(), model, cmd, key="focus", is_display=True)
+                scoped = _fit_request_for_cell(request, int(fk))
+                popt = self._refit_axes(ax, fp.to_data_figure(), scoped, key="focus", is_display=True)
                 if popt:
                     store[int(fk)] = popt
         else:
@@ -5517,19 +5567,20 @@ class GridPlot(BaseLivePlot):
                     ax.set_xlim(float(vx[0]), float(vx[1]))
                 if vy is not None:
                     ax.set_ylim(float(vy[0]), float(vy[1]))
-                popt = self._refit_axes(ax, cdf, model, cmd, key=k)
+                popt = self._refit_axes(
+                    ax, cdf, _fit_request_for_cell(request, k), key=k)
                 if popt:
                     store[k] = popt
             # popt drives the title's ``{popt}`` context -- refresh titles so a template referencing it
             # shows the fresh values (a no-op relative to the identifier when no template uses popt).
             # Go through the ONE re-title primitive so the per-cell title rule (size / pad / cell_title)
             # lives in a single place and the fit-refresh path can never drift from a title-only edit.
-            if model != "none":
+            if request is not None:
                 self._retitle_cells()
         cell._general_popt_store = store
 
-    def _refit_axes(self, ax, df, model: str, cmd: str, *, key, is_display: bool = False) -> tuple:
-        """Remove ``key``'s previously-drawn general-fit artists, then (if ``model`` is set) run it on ``df``
+    def _refit_axes(self, ax, df, request, *, key, is_display: bool = False) -> tuple:
+        """Remove ``key``'s previously-drawn general-fit artists, then run ``request`` on ``df``
         via the ONE :func:`apply_fit_to_figure` primitive and track the new artists so the next re-fit can
         remove them -- keeping exactly one general-fit curve per cell across live ticks.  ``is_display``
         chooses curve-only (a THUMBNAIL, default) vs curve+annotation (the enlarged cell).  Tracks the FULL
@@ -5541,10 +5592,10 @@ class GridPlot(BaseLivePlot):
                 art.remove()
             except Exception:
                 pass                       # already gone (an axes-clear redraw wiped it) -- fine
-        if not model or str(model) == "none":
+        if request is None:
             return ()
         before = set(id(c) for c in ax.get_children())
-        res = apply_fit_to_figure(df, model, cmd, is_display=is_display)
+        res = apply_fit_to_figure(df, request, is_display=is_display)
         self._general_fit_artists[key] = [c for c in ax.get_children() if id(c) not in before]
         popt = getattr(res, "popt", None)
         return tuple(popt) if popt is not None else ()
@@ -5671,7 +5722,7 @@ def _append_grid_plot_kind() -> None:
     PLOT_KINDS = PLOT_KINDS + (
         # panel=True: since the FACET design a grid is a live Add-Panel kind like any other -- bind a
         # measurement block signal and pick the facet axis in Setting (the recipe/snapshot path is the
-        # facet="" case, it no longer makes the grid seed-only).
+        # non-faceted case, it no longer makes the grid seed-only).
         PlotKind(key="grid", cls=GridPlot, label="Site grid", render_family="1D", panel=True),
     )
     PLOT_KIND_BY_KEY = {pk.key: pk for pk in PLOT_KINDS}
@@ -5758,11 +5809,12 @@ class LineCell(GridCell):
     def focus_update(self, focus_plotter, k: int) -> None:
         focus_plotter.update(self.ys[k])       # the standalone 1d redraws its single curve
 
-    def data_figure(self, fig, ax, k: int):
+    def data_figure(self, fig, ax, k: int, *, tools=None, scope=()):
         from .data_figure import DataFigure
         ylabel = self.labels[1] if len(self.labels) > 1 else "Y"
         return DataFigure(fig=fig, ax=ax, data_x=self._cell_x(k), data_y=self.ys[k],
-                          labels=(self.labels[0], ylabel), name=f"site{k}")
+                          labels=(self.labels[0], ylabel), name=f"site{k}", tools=tools,
+                          selection_mode="x", selection_scope=scope)
 
     def focus_data(self, k: int, *, display_params: Mapping[str, Any] | None = None) -> dict:
         """The ``panel_plot(kind="1d")`` args for the STANDALONE enlarged view of curve cell ``k`` --
@@ -5822,7 +5874,7 @@ def grid(
         raise ValueError(
             f"unknown grid sub_plot_kind {sub_plot_kind!r}; choose from {sorted(GRID_CELL_BY_KIND)}.")
     if facet is not None:
-        # the grid as an AXIS-EXPANDER: hand ONE (repeat, points, *data_dim) block + the axis to
+        # the grid as an AXIS-EXPANDER: hand ONE canonical (R,P,*data_shape) block + the axis to
         # expand, and the single slicing rule (facet_cells) produces the per-cell inputs
         block = np.asarray(per_cell, dtype=float)
         per_cell = facet_cells(block, facet, sub_plot_kind=kind,
@@ -5985,43 +6037,36 @@ def build_grid_figure(recipe: Mapping[str, Any], *, fig: plt.Figure | None = Non
     ``interactions=False`` builds a display-only grid (the read-only Monitor card) with no selectors.  The
     recipe's saved DISPLAY params (bins / fit / ylog for a hist grid) and any ``focused_cell_index`` are
     re-applied after the build, so a reopened grid looks EXACTLY as it did when saved (part C)."""
-    # Saved-DATA migration (not an API compat shim): npz written before the sub_plot_kind rename
-    # recorded the family as recipe['cell'] = 'hist'/'image' -- map it so an operator's stored
-    # image grid never silently reopens as a histogram of flattened pixels.
-    legacy = {"image": "2d", "hist": "hist"}.get(str(recipe.get("cell") or ""))
-    sub_plot_kind = str(recipe.get("sub_plot_kind") or legacy or "hist")
-    labels = tuple(str(x) for x in (recipe.get("labels") or ("X", "Y")))
-    title = str(recipe.get("title") or "")
-    grid_shape = recipe.get("grid_shape")
-    grid_shape = tuple(int(n) for n in grid_shape) if grid_shape else None
-    # size resolution: an explicit arg wins; else the saved panel_size; else the shape-driven default
-    # (GridPlot's own size=None path).  ONE rule shared with the pulse reopen's panel_size handling.
+    from .data_figure import _validate_recipe
+    recipe = _validate_recipe(recipe, "grid")
+    sub_plot_kind = recipe["sub_plot_kind"]
+    labels = tuple(recipe["labels"])
+    title = recipe["title"]
+    grid_shape = tuple(recipe["grid_shape"])
     if size is None:
-        recorded = recipe.get("panel_size")
-        size = str(recorded) if recorded else None
-    display_params = dict(recipe.get("display_params") or {})
-    focused = recipe.get("focused_cell_index")
+        size = recipe["panel_size"]
+    display_params = dict(recipe["display_params"])
+    focused = recipe["focused_cell_index"]
     if sub_plot_kind == "2d":
-        images = [np.asarray(im, dtype=float) for im in (recipe.get("per_cell") or [])]
-        cmap = recipe.get("cmap") or (display_params.get("cmap") or display_params.get("colorset"))
+        images = [np.asarray(im, dtype=float) for im in recipe["per_cell"]]
+        cmap = recipe["cmap"]
         plotter = GridPlot(ImageCell(images, labels=labels, cmap=cmap), grid_shape=grid_shape, labels=labels,
                            title=title, fig=fig, interactions=interactions, size=size).show(display=display)
     elif sub_plot_kind == "1d":
-        curves = [np.asarray(y, dtype=float).reshape(-1) for y in (recipe.get("per_cell") or [])]
-        x = recipe.get("x")
+        curves = [np.asarray(y, dtype=float).reshape(-1) for y in recipe["per_cell"]]
+        x = recipe["x"]
         plotter = GridPlot(LineCell(curves, x=None if x is None else np.asarray(x, dtype=float), labels=labels),
                            grid_shape=grid_shape, labels=labels,
                            title=title, fig=fig, interactions=interactions, size=size).show(display=display)
     else:
-        # per-site distribution grid (the default)
-        per_site = [np.asarray(v, dtype=float).reshape(-1) for v in (recipe.get("per_cell") or [])]
-        thresholds = recipe.get("thresholds")
-        fidelities = recipe.get("fidelities")
-        occupied = recipe.get("occupied")
+        per_site = [np.asarray(v, dtype=float).reshape(-1) for v in recipe["per_cell"]]
+        thresholds = recipe["thresholds"]
+        fidelities = recipe["fidelities"]
+        occupied = recipe["occupied"]
         plotter = SiteHistogramGrid(
             per_site, thresholds=thresholds, site_fidelities=fidelities,
             occupied=None if occupied is None else [np.asarray(o, dtype=float).reshape(-1) for o in occupied],
-            grid_shape=grid_shape, bins=int(recipe.get("bins", 36)), labels=labels, title=title,
+            grid_shape=grid_shape, bins=recipe["bins"], labels=labels, title=title,
             fig=fig, interactions=interactions, size=size).show(display=display)
     # Restore the saved display knobs in ONE render pass: each apply_param would otherwise redraw the
     # whole (e.g. 36-cell) figure, so N knobs = N full re-renders during a single build.  Suspend, then
@@ -6057,7 +6102,8 @@ def plot(
 ):
     """Create a static or live notebook plot from the same array contract.
 
-    ``data_x`` is ``(N, coord_dim)`` and ``data_y`` is ``(N, channel_dim)``.
+    ``data_x`` is ``(N, coord_dim)`` or a compact :class:`RegularRaster`; ``data_y`` is
+    ``(N, channel_dim)``.
     ``coord_dim == 1`` creates a 1D line plot and ``coord_dim == 2`` creates a
     2D scan image. ``kind="hist"`` treats ``data_x`` as the values array. With
     ``update="watch"``, the returned object starts a frontend timer and refreshes
@@ -6088,10 +6134,19 @@ def plot(
         labels = tuple(labels or ("Time (s)", "", "State"))
         plotter = PLOT_KIND_BY_KEY["pulse"].cls(data_x, labels=labels, **kwargs).show(display=display)
     else:
-        x = _as_data_x(data_x)
-        y = _as_data_y(data_y, len(x))
-        if normalized_kind == "auto":
-            normalized_kind = "2d" if x.shape[1] == 2 else "1d"
+        from ..neutral_atom.core.raster import RegularRaster
+        if isinstance(data_x, RegularRaster):
+            x = data_x
+            y = _as_data_y(data_y, x.point_count)
+            if normalized_kind == "auto":
+                normalized_kind = "2d"
+            if normalized_kind != "2d":
+                raise ValueError("RegularRaster coordinates are valid only for kind='2d'.")
+        else:
+            x = _as_data_x(data_x)
+            y = _as_data_y(data_y, len(x))
+            if normalized_kind == "auto":
+                normalized_kind = "2d" if x.shape[1] == 2 else "1d"
         labels = tuple(labels or ("X", "Y", "Z"))
         spec = PLOT_KIND_BY_KEY.get(normalized_kind)
         if spec is None or spec.key in ("hist", "pulse", "grid"):
@@ -6129,35 +6184,20 @@ def plot(
     return plotter
 
 
-def load(path, *, kind: str | None = "auto", display: bool = True):
+def load(path, *, kind: str | None = None, display: bool = True):
     """Reopen a ``.npz`` saved by :meth:`DataFigure.save` as a static, refittable
     figure -- the read-back counterpart of save.
 
-    The saved payload carries the original ``data_x``/``data_y`` plus an ``info``
-    dict (labels, unit, name).  This rebuilds the figure through the SAME
-    :func:`plot` renderer (so the reloaded figure looks identical to the live
-    one), restores the recorded unit/name, and returns the :class:`DataFigure`
-    handle -- so an overnight scan saved to disk can be reopened weeks later to
-    re-fit, change units, or re-save without any hardware or session.
-
-    ``kind`` defaults to ``"auto"`` (1d/2d inferred from ``data_x`` shape, the
-    usual scan case); pass an explicit kind to reopen a ``hist``/``sites`` save.
+    The artifact's explicit plot kind is used by default.  ``kind`` may select a
+    compatible reinterpretation for an array figure; structured figures render
+    only from their mandatory recipe.
     """
-    from .data_figure import _load_saved_npz   # the ONE saved-npz loader (trust boundary lives there)
+    from .data_figure import load_figure
 
-    data_x, data_y, info = _load_saved_npz(path)
-    labels = info.get("labels")
-    plotter = plot(data_x, data_y, kind=kind, labels=labels, update=False,
-                   display=display, data_figure=True)
-    df = plotter.data_figure if plotter.data_figure is not None else plotter.to_data_figure()
-    # Restore provenance so unit conversion + a re-save round-trip identically.
-    df.info = {**df.info, **info}
-    if info.get("name"):
-        df.name = info["name"]
-    if info.get("unit"):
-        df.unit = info["unit"]
-        df.unit_original = info["unit"]
-    return df
+    result = load_figure(path).plot(kind=kind)
+    if display:
+        result.fig.show()
+    return result
 
 
 __all__ = [

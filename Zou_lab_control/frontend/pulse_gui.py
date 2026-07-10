@@ -10,10 +10,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Mapping, Sequence
 import os
+import re
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from Zou_lab_control._clock import default_clock_hz as _default_hardware_clock_hz
+from Zou_lab_control.neutral_atom.ports import PORT_CLOCK, PORT_DAC, PortCatalog
 from Zou_lab_control.neutral_atom.timing.pulse_table import (
     DELAY_MAX_TICKS,
     SCAN_SLOT_KINDS,
@@ -440,32 +442,43 @@ def _is_bus_key(key: str) -> bool:
 
 
 def _display_rows(state: PulseTableState) -> list[dict[str, object]]:
-    buses = state.bus_channels()
-    member_to_bus = {channel: bus for bus, members in buses.items() for channel in members}
+    """Logical, pulse-programmable ports in physical catalog order.
+
+    The editor never rediscovers buses from labels and never iterates raw DAC
+    lanes as user channels.  Raw lanes remain in ``PulsePeriod.states`` solely
+    because that is the compiler representation.  Clock ports are topology
+    owned by the sequencer and are not pulse-programmable rows.
+    """
+
     rows: list[dict[str, object]] = []
-    emitted: set[str] = set()
-    visible = set(state.visible_channels)
-    # Display order is ALWAYS the fixed hardware-channel order (state.channels),
-    # filtered to the visible set -- NOT the order entries happen to sit in
-    # visible_channels.  This keeps the Edit panel rows (and the names/period
-    # cards built from these rows) stable no matter what show/hide/hide-off
-    # history produced visible_channels, matching the preview which also walks
-    # state.channels.  (Channels have no user-defined order; only periods are
-    # drag-reorderable.)
-    for channel in state.channels:
-        if channel not in visible:
+    visible = set(state.visible_ports)
+    for port in state.port_catalog.ports:
+        if port.kind == PORT_CLOCK or port.key not in visible:
             continue
-        bus = member_to_bus.get(channel)
-        if bus is not None:
-            if bus in emitted:
-                continue
-            members = buses[bus]
-            if any(member in visible for member in members):
-                rows.append({"kind": "bus", "key": _bus_key(bus), "name": bus, "channels": members, "label": bus})
-                emitted.add(bus)
-            continue
-        rows.append({"kind": "channel", "key": channel, "name": channel, "channels": [channel], "label": state.label_for(channel)})
+        if port.kind == PORT_DAC:
+            rows.append({"kind": "bus", "key": _bus_key(port.key), "name": port.key,
+                         "channels": list(port.lanes), "label": port.label})
+        else:
+            lane = port.lanes[0]
+            rows.append({"kind": "channel", "key": lane, "name": port.key,
+                         "channels": [lane], "label": port.label})
     return rows
+
+
+def _port_visibility(state: PulseTableState) -> tuple[int, int]:
+    """Visible/total pulse-programmable logical ports (never raw lanes)."""
+
+    programmable = tuple(port for port in state.port_catalog.ports if port.kind != PORT_CLOCK)
+    return len(state.visible_ports), len(programmable)
+
+
+def _hidden_active_ports(state: PulseTableState) -> list[str]:
+    visible = set(state.visible_ports)
+    active = set(state.period_active_ports())
+    return [port.label for port in state.port_catalog.ports
+            if port.kind != PORT_CLOCK
+            and port.key in active
+            and port.key not in visible]
 
 
 def _display_row_label(row: Mapping[str, object], labels: Mapping[str, str] | None = None) -> str:
@@ -1248,10 +1261,10 @@ class ChannelNamesPanel(FluentGroupBox):
     changed = QtCore.pyqtSignal()
 
     def __init__(self, state: PulseTableState, *, raw_labels: Mapping[str, str] | None = None, parent=None):
-        super().__init__("Channel Names", parent)
+        super().__init__("Port Catalog", parent)
         self.state = state
         self.raw_labels = {str(channel): str(label) for channel, label in dict(raw_labels or {}).items()}
-        self.label_edits: dict[str, FluentLineEdit] = {}
+        self.port_labels: dict[str, FluentLineEdit] = {}
         self.raw_label_widgets: dict[str, FluentLabel] = {}
         self.top_labels: dict[str, FluentLabel] = {}
         self.rows = _display_rows(state)
@@ -1295,45 +1308,43 @@ class ChannelNamesPanel(FluentGroupBox):
             row = QtWidgets.QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(_px(5, minimum=3))
-            hardware_text = str(row_info["name"]) if row_info.get("kind") == "bus" else self.raw_labels.get(key, key)
+            hardware_text = (str(row_info["name"]) if row_info.get("kind") == "bus"
+                             else self.raw_labels.get(key, str(row_info["name"])))
             hardware = FluentLabel(hardware_text)
             if row_info.get("kind") == "bus":
                 hardware.setToolTip(", ".join(str(item) for item in row_info.get("channels", [key])))
             else:
-                semantic = state.channel_labels.get(key, key)
-                hardware.setToolTip(f"{key} / {semantic}")
+                hardware.setToolTip(f"port {row_info['name']} / raw lane {key}")
             hardware.setAlignment(QtCore.Qt.AlignCenter)
             hardware.setFixedSize(label_w, row_height)
             self.raw_label_widgets[key] = hardware
-            if row_info.get("kind") == "bus":
-                edit = FluentLineEdit(_bus_display_label(str(row_info["name"])))
-                edit.setEnabled(False)
-                edit.setToolTip("Analog bus inferred from XDC/JSON labels or analog_buses config.")
-            else:
-                edit = FluentLineEdit(state.channel_labels.get(key, ""))
-                edit.setPlaceholderText("display name")
-                edit.setToolTip(f"Display name for {key}")
-            edit.setFixedSize(edit_w, row_height)
-            edit.textChanged.connect(self.changed)
-            self.label_edits[key] = edit
+            label = FluentLineEdit(str(row_info.get("label") or row_info["name"]))
+            label.setToolTip(
+                "The channel's display NAME (editable).  Renaming only changes the human label; the "
+                "hardware wiring (raw lane / DAC grouping / ABI fingerprint) is fixed by the sequencer "
+                "PortCatalog and is never touched here -- the left column shows that fixed lane/pin.")
+            label.setFixedWidth(edit_w)
+            label.setFixedHeight(row_height)
+            label.textChanged.connect(self.changed)
+            # Keyed by the PORT KEY (``row_info['name']``), which is what ``PortCatalog.with_label``
+            # renames -- NOT the row key (a raw lane for a channel, ``bus:...`` for a DAC).
+            self.port_labels[str(row_info["name"])] = label
             row.addWidget(hardware)
-            row.addWidget(edit, 1)
+            row.addWidget(label, 1)
             layout.addLayout(row)
         layout.addStretch()
 
     def read_values(self, state: PulseTableState) -> None:
-        for row_info in self.rows:
-            if row_info.get("kind") == "bus":
-                continue
-            channel = str(row_info["key"])
-            edit = self.label_edits.get(channel)
-            if edit is None:
-                continue
-            label = edit.text().strip()
-            if label and label != channel:
-                state.channel_labels[channel] = label
-            else:
-                state.channel_labels.pop(channel, None)
+        """Apply any edited channel display names back onto the state's PortCatalog through the ONE
+        rename entry (``with_label``).  Labels are display-only metadata (outside the ABI fingerprint),
+        so this never alters topology; the pulse name above is read by the editor separately."""
+        catalog = state.port_catalog
+        for port_key, widget in self.port_labels.items():
+            new_label = widget.text().strip() or port_key
+            spec = catalog.by_key.get(port_key)
+            if spec is not None and spec.label != new_label:
+                catalog = catalog.with_label(port_key, new_label)
+        state.port_catalog = catalog
 
 
 class ChannelPanel(FluentGroupBox):
@@ -1341,7 +1352,6 @@ class ChannelPanel(FluentGroupBox):
     clearRequested = QtCore.pyqtSignal(str)
     loadScanRequested = QtCore.pyqtSignal()
     scanSourceToggled = QtCore.pyqtSignal(bool)
-    clkRequested = QtCore.pyqtSignal(str)   # toggle: wire this channel's pin to the FPGA clk
     delayApiRequested = QtCore.pyqtSignal(str)  # cycle this channel's delay as an API slot (none->api->none)
 
     def __init__(self, state: PulseTableState, parent=None):
@@ -1349,18 +1359,15 @@ class ChannelPanel(FluentGroupBox):
         self.state = state
         self.delay_edits: dict[str, FluentLineEdit] = {}
         self.delay_units: dict[str, FluentComboBox] = {}
-        self.clk_buttons: dict[str, FluentButton] = {}
         self.channel_labels: dict[str, ElidedLabel] = {}
         self.top_labels: dict[str, FluentLabel] = {}
         self.rows = _display_rows(state)
-        clk_set = set(getattr(state, "clk_channels", []))
         label_w = _channel_label_width()
         delay_w = _px(70, minimum=60)
         unit_w = _time_unit_width()
         hide_w = _hide_button_width()
-        clk_w = _px(30, minimum=26)
         gap = _px(4, minimum=3)
-        content_w = label_w + delay_w + unit_w + hide_w + clk_w + gap * 4 + _px(16)
+        content_w = label_w + delay_w + unit_w + hide_w + gap * 3 + _px(16)
         self.setMinimumWidth(content_w)
         self.setMaximumWidth(content_w)
 
@@ -1503,34 +1510,16 @@ class ChannelPanel(FluentGroupBox):
             clear_btn.setToolTip("Set this row fully off.")
             clear_btn.clicked.connect(lambda _=False, ch=key: self.clearRequested.emit(ch))
 
-            # 'clk' toggle: wire this single channel's PIN directly to the FPGA clk
-            # (output = clk).  Only valid for a single TTL channel, not a DAC bus.
-            is_clk = (not is_bus) and key in clk_set
-            clk_btn = FluentButton("clk", color=(ACCENT if is_clk else GREY))
-            clk_btn.setFixedSize(clk_w, row_height)
-            if is_bus:
-                clk_btn.setEnabled(False)
-                clk_btn.setToolTip("A DAC bus cannot be driven by clk.")
-            else:
-                clk_btn.setToolTip(
-                    "Drive this channel's output pin directly from the FPGA clk "
-                    "(removes it from the pulse engine + preview)."
-                )
-                clk_btn.clicked.connect(lambda _=False, ch=key: self.clkRequested.emit(ch))
-            self.clk_buttons[key] = clk_btn
-            # A delay needs an event FIFO; only the real TTL outputs have one.  A clk-mode
-            # channel (pin = clk) or a da_clk-pin channel (hardware position past the
-            # delay-eligible set) cannot be delayed -> grey out its delay field.
+            # A delay needs an event FIFO; only real pulse-programmable outputs
+            # appear here.  Fixed clock ports were filtered by _display_rows.
             hw_pos = _delay_eligible_position(key)
             not_eligible = (not is_bus) and hw_pos is not None and hw_pos >= NUM_DELAY_CHANNELS
-            if is_clk or not_eligible:
+            if not_eligible:
                 delay_edit.setEnabled(False)
                 unit.setEnabled(False)
-                if not_eligible and not is_clk:
-                    delay_edit.setToolTip(
-                        f"This is a da_clk / clock pin (hardware position past the "
-                        f"{NUM_DELAY_CHANNELS} delay-eligible outputs); it has no event FIFO and "
-                        "cannot be delayed. Only the real TTL outputs can be delayed.")
+                delay_edit.setToolTip(
+                    f"This output is past the {NUM_DELAY_CHANNELS} delay-eligible lanes; "
+                    "it has no event FIFO and cannot be delayed.")
 
             self.delay_edits[key] = delay_edit
             self.delay_units[key] = unit
@@ -1538,7 +1527,6 @@ class ChannelPanel(FluentGroupBox):
             row.addWidget(delay_edit, 1)
             row.addWidget(unit)
             row.addWidget(clear_btn)
-            row.addWidget(clk_btn)
             layout.addLayout(row)
             self._handle_delay_text(key, delay_edit.text())
             self._handle_delay_unit(key, unit.currentText())
@@ -1636,10 +1624,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self,
         state: PulseTableState | None = None,
         *,
-        channels: Sequence[str] | None = None,
         sequencer=None,
         experiment=None,
-        channel_labels: Mapping[str, str] | None = None,
         channel_pins: Mapping[str, str] | None = None,
         scale: float | None = None,
         window_ratio: float = DEFAULT_WINDOW_RATIO,
@@ -1650,40 +1636,43 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.ui_scale = self._resolve_scale(scale, app=app)
         set_fluent_scale(self.ui_scale)
         self.window_ratio = max(0.45, min(1.0, float(window_ratio)))
+        if sequencer is None and experiment is not None and hasattr(experiment, "devices"):
+            sequencer = getattr(experiment.devices, "sequencer", None)
+        bound_sequencer = sequencer or (
+            getattr(getattr(experiment, "devices", None), "sequencer", None)
+            if experiment is not None else None)
+        # A RemoteSequencer is deliberately unbound until open(): do not let the
+        # editor fabricate a client-side catalog/clock while a real server is the
+        # authority.  Other sequencers already expose their immutable facts.
+        if (bound_sequencer is not None
+                and getattr(bound_sequencer, "port_catalog", None) is None
+                and hasattr(bound_sequencer, "open")):
+            bound_sequencer.open()
         if state is None:
-            if channels is None and sequencer is not None and hasattr(sequencer, "channels"):
-                channels = sequencer.channels
-            if channels is None and experiment is not None and hasattr(experiment, "devices"):
-                sequencer = getattr(experiment.devices, "sequencer", sequencer)
-                channels = getattr(sequencer, "channels", channels)
-            # Pick the display LABELS off the sequencer too (symmetric with channels): a device
-            # names its DAC bits ``dx0`` and labels them ``da_x[0]``, so an editor started from the
-            # device folds the 18 coil channels into three bus rows WHENEVER they are shown -- with NO
-            # template loaded (the default visible set below is the first four channels, so the coil
-            # buses appear once the coils are made visible).  The real rig does exactly this from the
-            # board XDC labels (real == virtual).
-            if channel_labels is None and sequencer is not None:
-                channel_labels = getattr(sequencer, "channel_labels", None)
-            channels = list(channels or DEFAULT_CHANNEL_NAMES)
-            labels = {str(k): str(v) for k, v in dict(channel_labels or {}).items()}
+            port_catalog = getattr(bound_sequencer, "port_catalog", None)
+            if port_catalog is None:
+                if not DEFAULT_CHANNEL_NAMES:
+                    raise ValueError(
+                        "standalone Pulse GUI needs a sequencer PortCatalog or an explicit state")
+                port_catalog = PortCatalog.from_channels(DEFAULT_CHANNEL_NAMES)
+            visible = [
+                port.key for port in port_catalog.ports if port.kind != PORT_CLOCK
+            ][:4]
             state = PulseTableState(
-                channels=channels,
-                visible_channels=channels[: min(4, len(channels))],
-                time_step_ns=self._clock_step_ns(sequencer) or DEFAULT_TIME_STEP_NS,
-                channel_labels=labels,
+                port_catalog=port_catalog,
+                visible_ports=visible,
+                time_step_ns=self._clock_step_ns(bound_sequencer) or DEFAULT_TIME_STEP_NS,
             )
-        if state is not None and channels is not None and list(state.channels) != list(channels):
-            state = state.aligned_to_channels(channels)
-        if state is not None and channel_labels:
-            for key, value in dict(channel_labels).items():
-                channel = str(key)
-                label = str(value)
-                if channel in state.channels and channel not in state.channel_labels and label and label != channel:
-                    state.channel_labels[channel] = label
-            state.validate()
+        device_catalog = getattr(bound_sequencer, "port_catalog", None)
+        if state is not None and device_catalog is not None \
+                and state.port_catalog.fingerprint != device_catalog.fingerprint:
+            state = state.aligned_to_catalog(device_catalog)
+        device_step_ns = self._clock_step_ns(bound_sequencer)
+        if device_step_ns is not None and state.time_step_ns != device_step_ns:
+            state = state.snapped(time_step_ns=device_step_ns)
         self.state = state
         self.channel_pins = {str(channel): str(pin) for channel, pin in dict(channel_pins or {}).items()}
-        self.sequencer = sequencer or (getattr(getattr(experiment, "devices", None), "sequencer", None) if experiment is not None else None)
+        self.sequencer = bound_sequencer
         # Connection seeds for the runtime Connection control: a virtual or remote
         # sequencer built later (the user picks the backend AFTER opening, instead
         # of fixing it at launch) reuses the SAME channels the editor shows, so a
@@ -1759,7 +1748,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.clear_all_button.setToolTip(
             "Reset the schedule: remove every period and every channel delay, leaving one "
             "blank 1 µs period with no channel on.\n"
-            "Channel names, visibility and clk assignments are kept."
+            "The sequencer-owned PortCatalog and current visibility are kept."
         )
         self.clear_all_button.clicked.connect(self._clear_all)
         header.addWidget(self.status_dot)
@@ -1964,27 +1953,27 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         conn_col.addStretch(1)
         bar.addWidget(conn_area)
 
-        view_area = FluentGroupBox("Channels")
+        view_area = FluentGroupBox("Ports")
         view_area.setFixedWidth(_px(286, minimum=246))
         view_col = QtWidgets.QVBoxLayout(view_area)
         view_col.setContentsMargins(_px(8), _px(2), _px(8), _px(6))
         view_col.setSpacing(_px(4, minimum=3))
         self.add_channel_combo = FluentComboBox()
         self.add_channel_combo.setFixedHeight(cb_h)
-        self.add_channel_combo.setToolTip("Pick a hidden channel or DAC bus to show.")
+        self.add_channel_combo.setToolTip("Pick a hidden sequencer port to show.")
         view_col.addWidget(self.add_channel_combo)
         view_btn_row = QtWidgets.QHBoxLayout()
         view_btn_row.setContentsMargins(0, 0, 0, 0)
         view_btn_row.setSpacing(_px(6, minimum=4))
         self.add_channel_button = FluentButton("Add", color=ACCENT)
-        self.add_channel_button.setToolTip("Add the selected hidden channel/bus to the table.")
-        self.add_channel_button.clicked.connect(self.add_selected_channel)
+        self.add_channel_button.setToolTip("Add the selected hidden port to the table.")
+        self.add_channel_button.clicked.connect(self.add_selected_port)
         self.hide_off_button = FluentButton("Hide Off", color=ORANGE)
-        self.hide_off_button.setToolTip("Hide channels that are off in every period.")
-        self.hide_off_button.clicked.connect(self.hide_off_channels)
+        self.hide_off_button.setToolTip("Hide ports that are inactive in every period.")
+        self.hide_off_button.clicked.connect(self.hide_off_ports)
         self.show_all_button = FluentButton("Show All", color=ACCENT)
-        self.show_all_button.setToolTip("Show every hardware channel.")
-        self.show_all_button.clicked.connect(self.show_all_channels)
+        self.show_all_button.setToolTip("Show every programmable sequencer port.")
+        self.show_all_button.clicked.connect(self.show_all_ports)
         for button in (self.add_channel_button, self.hide_off_button, self.show_all_button):
             button.setFixedHeight(cb_h)
             button.setMinimumWidth(_px(56, minimum=48))
@@ -2140,7 +2129,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 self.scan_repeats_spin.setValue(int(getattr(state, "scan_repeats", 0)))
         # Restore the Scan-tab editor's SOURCE code from the loaded state so a Save/Load round-trips
         # the editable program (not just the frozen scan_table).  This is IDEMPOTENT for in-session
-        # mutations (add/remove period, clk toggle): read_state carried the current editor text, so
+        # in-session schedule mutations: read_state carried the current editor text, so
         # state.scan_code already equals the editor and the ``!=`` guard skips.  It only fires for a
         # FILE/DEVICE load or Clear All, where it must match the editor to the loaded program and mark
         # Run NOT dirty (code + table came from the same source -> the on-screen table is not stale).
@@ -2165,14 +2154,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             # them untouched.  Skipping their teardown+rebuild when this key is
             # unchanged cuts a third off every Add/Remove-Period press.
             chan_key = (
-                tuple(state.channels), tuple(state.visible_channels),
+                state.port_catalog.fingerprint, tuple(state.visible_ports),
                 tuple(sorted((str(k), str(v)) for k, v in (getattr(state, "labels", None) or {}).items())),
                 # str(v) not float(v): a delay value is legitimately a string EXPRESSION ("s0", "20+s1")
                 # per PulseTableState.delays (float | str); float() would crash load_state on a valid saved
                 # pulse.  This key only detects change, so string identity is sufficient and correct.
                 tuple(sorted((str(k), str(v)) for k, v in (state.delays or {}).items())),
                 tuple(sorted((str(k), str(v)) for k, v in (state.delay_units or {}).items())),
-                tuple(getattr(state, "clk_channels", []) or []),
                 len(state.scan_slots), float(state.time_step_ns),
             )
             if chan_key != getattr(self, "_chan_panel_key", None) or not hasattr(self, "channel_panel"):
@@ -2207,19 +2195,20 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 
         Cleared: all periods, all channel/bus delays, DA bus plans, scan bindings +
         table, and the repeat bracket (they all describe the schedule being wiped).
-        Kept: channel names/labels, visibility, bus wiring and clk assignments --
-        those describe the hardware hookup, not the pulse."""
+        Kept: visibility and the immutable PortCatalog -- those describe the
+        hardware hookup, not the pulse."""
 
         state = self.read_state()
         blank = PulseTableState(
-            channels=list(state.channels),
-            periods=[PulsePeriod(1.0, tuple(0 for _ in state.channels), unit="us")],
+            port_catalog=state.port_catalog,
+            periods=[PulsePeriod(
+                1.0,
+                tuple(0 for _ in state.port_catalog.raw_lanes),
+                unit="us",
+            )],
             name=state.name,
             time_step_ns=state.time_step_ns,
-            visible_channels=list(state.visible_channels),
-            channel_labels=dict(state.channel_labels),
-            analog_buses={bus: list(members) for bus, members in state.analog_buses.items()},
-            clk_channels=list(state.clk_channels),
+            visible_ports=list(state.visible_ports),
         )
         self.load_state(blank)
 
@@ -2247,7 +2236,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.channel_panel.clearRequested.connect(self.clear_channel)
         self.channel_panel.loadScanRequested.connect(self._load_scan_file)
         self.channel_panel.scanSourceToggled.connect(self._on_scan_source_toggled)
-        self.channel_panel.clkRequested.connect(self._toggle_clk_channel)
         self.channel_panel.delayApiRequested.connect(self._toggle_delay_api)
         self.channel_panel_layout.addWidget(self.channel_panel)
         # Restore the active scan-table source (the panel was just recreated, so its
@@ -2271,13 +2259,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         for index, period in enumerate(self.state.periods):
             hidden_states = {
                 channel: period.states[self.state.channel_index(channel)]
-                for channel in self.state.channels
+                for channel in self.state.port_catalog.raw_lanes
             }
             card = PeriodCard(
                 index,
                 period,
                 total_periods=total_periods,
-                channels=self.state.channels,
+                channels=self.state.port_catalog.raw_lanes,
                 labels=labels,
                 hidden_states=hidden_states,
                 rows=rows,
@@ -2338,19 +2326,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self._sync_timeline_scrollbar()
 
     def _display_labels_from_name_panel(self) -> dict[str, str]:
-        labels: dict[str, str] = {}
         rows = getattr(getattr(self, "names_panel", None), "rows", _display_rows(self.state))
-        if not hasattr(self, "names_panel"):
-            return {str(row["key"]): _display_row_label(row) for row in rows}
-        for row in rows:
-            key = str(row["key"])
-            if row.get("kind") == "bus":
-                labels[key] = _display_row_label(row)
-                continue
-            edit = self.names_panel.label_edits.get(key)
-            text = edit.text().strip() if edit is not None else self.state.channel_labels.get(key, "")
-            labels[key] = text if text and text != key else key
-        return labels
+        return {str(row["key"]): _display_row_label(row) for row in rows}
 
     def _refresh_visible_display_labels(self) -> None:
         labels = self._display_labels_from_name_panel()
@@ -2432,10 +2409,14 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         # The tick step is fixed by the FPGA clock (shown read-only in the panel), so
         # it always comes from the current state -- never an editable field.
         time_step_ns = float(self.state.time_step_ns)
-        slots = self.state.reference_slots()
+        slots = self.state._reference_slots()
         cards = self.drag_container.pulse_cards()
         periods = [
-            card.to_period(full_channels=self.state.channels, time_step_ns=time_step_ns, slots=slots)
+            card.to_period(
+                full_channels=self.state.port_catalog.raw_lanes,
+                time_step_ns=time_step_ns,
+                slots=slots,
+            )
             for card in cards
         ]
         scan_slots = self._reconcile_scan_slots(periods)
@@ -2451,8 +2432,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             for bus_name, entry in card.bus_modes().items():
                 analog_bus_modes.setdefault(bus_name, []).append(dict(entry))
         state = PulseTableState(
-            channels=self.state.channels,
-            visible_channels=self.state.visible_channels,
+            port_catalog=self.state.port_catalog,
+            visible_ports=self.state.visible_ports,
             periods=periods,
             name=self.name_edit.text().strip() or self.state.name or _default_pulse_name(),
             scan_slots=scan_slots,
@@ -2470,8 +2451,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                        else getattr(self.state, "scan_code", "")),
             api_slots=api_slots,
             time_step_ns=time_step_ns,
-            channel_labels=dict(self.state.channel_labels),
-            analog_buses=dict(self.state.analog_buses),
             analog_bus_modes=analog_bus_modes or dict(self.state.analog_bus_modes),
             delays=dict(self.state.delays),
             delay_units=dict(self.state.delay_units),
@@ -2483,7 +2462,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             scan_repeats=(int(self.scan_repeats_spin.value())
                           if getattr(self, "scan_repeats_spin", None) is not None
                           else int(getattr(self.state, "scan_repeats", 0))),
-            clk_channels=list(self.state.clk_channels),
         )
         self.names_panel.read_values(state)
         self.channel_panel.read_values(state)
@@ -2524,10 +2502,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             if slot.kind == "duration":
                 period_index = var_to_period.get(index)
                 target = str(period_index) if period_index is not None else slot.target
-                out.append(ScanSlot("duration", target, slot.label, slot.unit, slot.nominal))
+                out.append(ScanSlot("duration", target, slot.label, slot.unit,
+                                    slot.nominal, slot.name))
             elif slot.kind == "dac":
                 target = var_to_dac_target.get(index, slot.target)
-                out.append(ScanSlot("dac", target, slot.label, slot.unit, slot.nominal))
+                out.append(ScanSlot("dac", target, slot.label, slot.unit,
+                                    slot.nominal, slot.name))
             else:
                 out.append(slot)
         return out
@@ -2757,7 +2737,22 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             state.bind_api_field(kind, target, unit=unit)             # ...then tag the handle
         elif scannable:
             self._remember_field_state(state, kind, target)           # none -> SCAN
-            new_index = state.bind_field(kind, target, unit=unit, label=label)
+            # ``sN`` is only the compiler reference.  The public scan axis is a
+            # stable semantic identifier (normally the DAC port key, e.g.
+            # ``da_x``); make a deterministic suffix only when two fields of
+            # the same port are independently scanned.
+            raw_name = (str(target).split("@", 1)[0] if kind == "dac"
+                        else (str(label).strip() or f"duration_{target}"))
+            base_name = re.sub(r"[^0-9A-Za-z_]+", "_", raw_name).strip("_") or "scan_parameter"
+            if base_name[0].isdigit():
+                base_name = "scan_" + base_name
+            used = {slot.name for slot in state.scan_slots}
+            name = base_name
+            suffix = 2
+            while name in used:
+                name = f"{base_name}_{suffix}"
+                suffix += 1
+            new_index = state.bind_field(kind, target, unit=unit, label=label, name=name)
             self._restore_scan_column(state, kind, target, new_index)
         else:
             state.bind_api_field(kind, target, unit=unit)             # delay: none -> API
@@ -2850,6 +2845,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             start = str(Path(self.address_str).parent if self.address_str else _pulse_files_dir())
             path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load scan array", start, "Scan array (*.npy *.csv *.txt *.json)")
             if not path:
+                return
+            if Path(path).suffix.lower() == ".json":
+                # JSON is a typed pulse/program artifact, not a numeric text
+                # matrix.  Reuse the Scan-tab importer so both buttons apply
+                # the same schema validation and wire-to-user conversion.
+                self._ingest_scan_program_file(Path(path))
                 return
             loaded = snap_scan_table(
                 # pass the slot count so a 1-D array is read as N points x n_slots
@@ -3065,24 +3066,28 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         """Return a STATIC copy of ``state`` holding exactly scan point ``point_index`` -- the program the
         Stop button reloads to HOLD the current point's pulse, looped forever.  BAKES that point's slot
         values into their targets (period duration / DAC level, waveform mode preserved) and CLEARS the
-        scan via ``with_slots_resolved`` (a 1-row scan_table would degrade to the slots' NOMINALS, not
-        the held values).  ``slot_point_ns`` is the same per-point resolve ``reference_slots`` uses.
-        Testable without the GUI."""
+        scan via ``with_slots_resolved``.  Resolves the held point through the ONE public per-point
+        contract ``with_slots_resolved(slot_point(k))`` -- byte-for-byte the call the virtual sequencer
+        renders each streamed scan point with (``devices/virtual.py``), so the held preview and the
+        streamed hardware point can never diverge.  Testable without the GUI."""
         table = list(getattr(state, "scan_table", None) or [])
         if not table:
             frozen = state.__class__.from_dict(state.to_dict())
             frozen.scan_repeats = 0
             return frozen
         k = max(0, min(int(point_index), len(table) - 1))
-        frozen = state.with_slots_resolved(state.slot_point_ns(k))
+        frozen = state.with_slots_resolved(state.slot_point(k))
         frozen.scan_repeats = 0
         return frozen
 
     def _scan_point_values_text(self, row) -> str:
-        # Show the scan-point as the SLOT identifiers + values: "s0 = .., s1 = ..".  slot_var is the
-        # single source of the s0/s1/.. convention (pulse_table.slot_var), the same labels the Scan
-        # tab and the bind-expression namespace use -- NOT the long "Period N duration / da[k] level".
-        return ", ".join(f"{slot_var(i)} = {float(v):g}" for i, v in enumerate(row))
+        # Operator-facing identity is the stable semantic ScanSlot.name (``da_x``, ``t_off``), never
+        # the positional compiler token ``sN``.  Strict zip catches a corrupt row/catalog mismatch
+        # instead of silently attaching a value to the wrong physical parameter.
+        return ", ".join(
+            f"{name} = {float(value):g}"
+            for name, value in zip(self.state.scan_names, row, strict=True)
+        )
 
     def _current_scan_point_text(self, progress) -> str:
         """The CURRENT scan point's VALUES (#1) at the live position -- looked up in the streaming table."""
@@ -3178,7 +3183,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 else:
                     allowed = f"snapped to a whole {format_compact_number(step)} ns tick (≥ 1 tick)"
                 lines.append(
-                    f"  {slot_var(index)}: {_scan_slot_label(state, index)}  [{slot.unit}]  "
+                    f"  {slot.name} (compiler {slot_var(index)}): "
+                    f"{_scan_slot_label(state, index)}  [{slot.unit}]  "
                     f"(nominal {format_compact_number(slot.nominal)}) → {allowed}"
                 )
             lines.append("")
@@ -3210,12 +3216,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         else:
             self.scan_slots_label.setText(
                 "No scan or API slots bound yet. In the Edit tab, click the dot next to any duration "
-                "or DAC value: 1st click = scan (sN, orange), 2nd = API handle (aN, violet), 3rd = off. "
+                "or DAC value: 1st click = semantic scan parameter (orange; sN is only its compiler "
+                "column), 2nd = API handle (aN, violet), 3rd = off. "
                 "(A channel delay can be an API slot but is not scannable.)"
             )
         rows = state.scan_table
         if rows:
-            header = "   ".join(f"s{i}" for i in range(len(state.scan_slots)))
+            header = "   ".join(state.scan_names)
             shown = ["   ".join(format_compact_number(value) for value in row) for row in rows[:40]]
             footer = f"\n... {len(rows)} points total" if len(rows) > 40 else f"\n{len(rows)} point(s)"
             self.scan_table_view.setPlainText(header + "\n" + "\n".join(shown) + footer)
@@ -3378,7 +3385,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         """Load a scan source in ANY of the formats Save/notebooks produce.
 
         * ``.py`` / ``.txt`` -- Python that builds ``scan_table`` (goes into the editor);
-        * ``.npy`` / ``.csv`` -- a saved scan ARRAY (the ``<stem>_scan.npy`` bundle file);
+        * ``.npy`` / ``.csv`` -- an explicitly exported scan array;
         * ``.json``          -- a saved PULSE (its embedded scan table) or a saved compiled
           PROGRAM (``<stem>_program.json``; its wire-domain ``scan_points`` are converted
           back to user units: duration ticks -> ns, DAC offset-binary codes -> signed).
@@ -3607,7 +3614,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             insert_at = min(self._selected_period + 1, len(state.periods))
         else:
             insert_at = len(state.periods)
-        state.periods.insert(insert_at, PulsePeriod(1_000, tuple(0 for _ in state.channels), unit="ns", name=""))
+        state.periods.insert(insert_at, PulsePeriod(
+            1_000,
+            tuple(0 for _ in state.port_catalog.raw_lanes),
+            unit="ns",
+            name="",
+        ))
         if insert_at < len(state.periods) - 1:    # mid-list: re-aim slots/plans/bracket
             self._shift_slot_targets(state, inserted=insert_at)
             self._edit_analog_bus_modes(state, inserted=insert_at)
@@ -3694,90 +3706,56 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             return
         self.load_state(state)
 
-    def _toggle_clk_channel(self, channel: str) -> None:
-        """Toggle a single channel between engine-driven and wired-to-clk.  A clk channel
-        outputs the FPGA clk on its pin and is removed from the pulse engine + preview."""
-
-        try:
-            state = self.read_state()
-            channel = str(channel)
-            clk = [c for c in state.clk_channels if c != channel]
-            if channel not in state.clk_channels:
-                if channel not in state.channels:
-                    return
-                if channel in {m for members in state.bus_channels().values() for m in members}:
-                    self._message(f"{channel!r} is a DAC bus member and cannot be driven by clk.")
-                    return
-                clk.append(channel)
-            state.clk_channels = clk
-            state.validate()
-        except Exception as exc:
-            self._message(str(exc))
-            return
-        self.load_state(state)
-
-    def hide_off_channels(self) -> None:
+    def hide_off_ports(self) -> None:
         state = self.read_state()
-        off_channels = {channel for channel in state.channels if not self._channel_has_period_on(state, channel)}
-        keepers = [channel for channel in state.visible_channels if channel not in off_channels]
-        min_visible = min(4, len(state.channels))
-        for channel in state.channels:
+        active = set(state.period_active_ports())
+        programmable = [
+            port.key for port in state.port_catalog.ports if port.kind != PORT_CLOCK
+        ]
+        keepers = [key for key in state.visible_ports if key in active]
+        min_visible = min(4, len(programmable))
+        for key in programmable:
             if len(keepers) >= min_visible:
                 break
-            if channel not in keepers:
-                keepers.append(channel)
+            if key not in keepers:
+                keepers.append(key)
         if not keepers:
-            keepers = list(state.channels[:min_visible])
-        # Keep visible_channels in fixed hardware order (the display already walks
-        # hardware order, but normalising the stored list keeps the saved JSON and
-        # every other consumer stable too).
+            keepers = programmable[:min_visible]
         keep_set = set(keepers)
-        state.visible_channels = [channel for channel in state.channels if channel in keep_set]
+        state.visible_ports = [key for key in programmable if key in keep_set]
         state.validate()
         self.load_state(state)
 
-    @staticmethod
-    def _channel_has_period_on(state: PulseTableState, channel: str) -> bool:
-        index = state.channel_index(channel)
-        return any(int(period.states[index]) for period in state.periods)
-
-    def show_all_channels(self) -> None:
+    def show_all_ports(self) -> None:
         state = self.read_state()
-        state.visible_channels = list(state.channels)
+        state.visible_ports = [
+            port.key for port in state.port_catalog.ports if port.kind != PORT_CLOCK
+        ]
         state.validate()
         self.load_state(state)
 
-    def add_selected_channel(self) -> None:
+    def add_selected_port(self) -> None:
         data = self.add_channel_combo.currentData()
-        text = str(data if data is not None else self.add_channel_combo.currentText())
-        if not text:
+        key = str(data if data is not None else "")
+        if not key:
             return
-        channel = text.split("  ", 1)[0]
         state = self.read_state()
-        if _is_bus_key(channel):
-            bus = channel.split(":", 1)[1]
-            for member in state.bus_channels().get(bus, []):
-                state.show_channel(member)
-        else:
-            state.show_channel(channel)
+        state.show_port(key)
         self.load_state(state)
 
     def _refresh_hidden_combo(self) -> None:
         self.add_channel_combo.clear()
-        visible = set(self.state.visible_channels)
-        bus_members = set()
-        for bus, members in self.state.bus_channels().items():
-            bus_members.update(members)
-            if not any(member in visible for member in members):
-                self.add_channel_combo.addItem(f"{_bus_display_label(bus)}  ({len(members)} pins)", _bus_key(bus))
-        for channel in self.state.channels:
-            if channel in bus_members:
+        visible = set(self.state.visible_ports)
+        for port in self.state.port_catalog.ports:
+            if port.kind == PORT_CLOCK or port.key in visible:
                 continue
-            if channel not in visible:
-                label = self.state.label_for(channel)
-                raw = self.channel_pins.get(channel, channel)
-                display = f"{raw}  ({label})" if label != channel else raw
-                self.add_channel_combo.addItem(display, channel)
+            if port.kind == PORT_DAC:
+                display = f"{port.label}  ({port.width} pins)"
+            else:
+                lane = port.lanes[0]
+                raw = self.channel_pins.get(lane, lane)
+                display = f"{raw}  ({port.label})" if port.label != lane else raw
+            self.add_channel_combo.addItem(display, port.key)
         has_hidden = self.add_channel_combo.count() > 0
         self.add_channel_combo.setEnabled(has_hidden)
         self.add_channel_button.setEnabled(has_hidden)
@@ -3938,8 +3916,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
     def _apply_connection(self) -> None:
         """Swap the sequencer transport to the chosen backend.
 
-        Virtual / Remote rebuild a sequencer with the editor's OWN channels (so a
-        transport swap never churns the channel layout); Offline detaches.  On
+        Virtual uses the editor's immutable PortCatalog.  Remote opens first, then
+        the editor aligns to the server-owned PortCatalog and clock; the client
+        never supplies either hardware fact.  Offline detaches.  On
         Pulse / Stop / Sync already guard a missing sequencer, so an offline
         editor stays fully usable -- this only changes what the run controls talk
         to."""
@@ -3951,18 +3930,31 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer
         from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
 
-        kwargs = {"channels": list(self.state.channels), "clock_hz": self._clock_hz}
+        candidate = None
         try:
             if target == "virtual":
-                self._set_sequencer(VirtualSequencer(**kwargs), label="Virtual (sim)")
+                candidate = VirtualSequencer(
+                    port_catalog=self.state.port_catalog,
+                    clock_hz=self._clock_hz,
+                )
+                self._set_sequencer(candidate, label="Virtual (sim)")
                 self._message("Connected to a virtual (in-memory) sequencer.")
             else:
                 host, port = self._parse_addr(self.conn_addr_edit.text())
-                self._set_sequencer(
-                    RemoteSequencer(host=host, port=port, connect_on_init=True, **kwargs),
-                    label=f"{host}:{port}")
+                candidate = RemoteSequencer(host=host, port=port)
+                candidate.open()
+                state = self.read_state()
+                if state.port_catalog.fingerprint != candidate.port_catalog.fingerprint:
+                    state = state.aligned_to_catalog(candidate.port_catalog)
+                state = state.snapped(time_step_ns=1e9 / float(candidate.clock_hz))
+                self.load_state(state)
+                self._set_sequencer(candidate, label=f"{host}:{port}")
                 self._message(f"Connected to sequencer server at {host}:{port}.")
+            candidate = None  # ownership transferred to ``self.sequencer``
         except Exception as exc:
+            if candidate is not None and candidate is not self.sequencer \
+                    and hasattr(candidate, "close"):
+                candidate.close()
             # leave the current connection untouched; just report the failure
             self._refresh_connection_label()
             self._message(f"Connection failed: {exc}")
@@ -3977,7 +3969,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 pass
         self.sequencer = sequencer
         if sequencer is not None:
-            self._clock_hz = float(getattr(sequencer, "clock_hz", self._clock_hz))
+            clock_hz = getattr(sequencer, "clock_hz", None)
+            if clock_hz is not None:
+                self._clock_hz = float(clock_hz)
         self._connection_label = label
         self._refresh_connection_label()
         # a fresh connection has nothing of ours applied yet -> the editor's pulse
@@ -4021,10 +4015,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 path_obj = Path(path)
                 if path_obj.suffix == "":
                     path_obj = path_obj.with_suffix(".json")
-                # Bundle next to the pulse: (1) the pulse itself, (2) the preview
-                # figure, and (3) the scan -- both its raw data (.npy) and the
-                # compiled, FPGA-ready scan program (.json).  Per-artifact failures
-                # are reported (not silently swallowed) so a partial save is visible.
+                # The editable pulse JSON is the sole persisted source of the scan
+                # table.  Preview and compiled program are derived artifacts.
+                # Per-artifact failures are reported so a partial save is visible.
                 saved: list[str] = []
                 failed: list[str] = []
                 state.save(path_obj)
@@ -4035,15 +4028,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                     saved.append(figure_path.name)
                 except Exception as exc:
                     failed.append(f"preview ({exc})")
-                if state.scan_table:
-                    try:
-                        import numpy as np
-
-                        scan_path = path_obj.with_name(path_obj.stem + "_scan.npy")
-                        np.save(scan_path, np.asarray(state.scan_table, dtype=float))
-                        saved.append(scan_path.name)
-                    except Exception as exc:
-                        failed.append(f"scan data ({exc})")
                 # The compiled, FPGA-ready program is ALWAYS part of the bundle (scan or
                 # not): the payload dispatcher picks the scan path when slots + a table
                 # are bound and the plain runtime program otherwise -- exactly what On
@@ -4056,7 +4040,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                     )
 
                     program = compile_runtime_program_for_payload(
-                        state, channels=list(state.channels),
+                        state, port_catalog=state.port_catalog,
                         clock_hz=1e9 / float(state.time_step_ns),
                     )
                     program_path = path_obj.with_name(path_obj.stem + "_program.json")
@@ -4082,59 +4066,32 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             start = str(Path(self.address_str).parent if self.address_str else _pulse_files_dir())
             path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load pulse", start, "ZLC pulse (*.json)")
             if path:
-                # Picking a sibling artifact of a saved bundle (<stem>_program.json /
-                # <stem>_scan.npy) is an easy mistake -- redirect to the pulse itself.
+                # Picking the compiled sibling is an easy mistake -- redirect to
+                # the editable pulse itself.
                 path_obj = Path(path)
-                for suffix, strip in (("_program.json", "_program"), ("_scan.npy", "_scan")):
-                    if path_obj.name.endswith(suffix):
-                        candidate = path_obj.with_name(path_obj.name[: -len(suffix)] + ".json")
-                        if candidate.exists():
-                            path_obj = candidate
-                            self._message(f"That file is a saved artifact; loading the pulse {candidate.name} instead.")
-                        break
+                suffix = "_program.json"
+                if path_obj.name.endswith(suffix):
+                    candidate = path_obj.with_name(path_obj.name[: -len(suffix)] + ".json")
+                    if candidate.exists():
+                        path_obj = candidate
+                        self._message(f"That file is a compiled artifact; loading the pulse {candidate.name} instead.")
                 path = str(path_obj)
                 state = PulseTableState.load(path)
-                # LOAD == ALIGN onto the editor's channel catalog (the device's channel list the
-                # editor was opened on): a saved pulse is a SUBSET of the board's channels, not
-                # the catalog itself, so a subset file is expanded via aligned_to_channels
-                # (catalog order, missing channels as off rows -- Show All then really shows
-                # every device channel, not just the rows the file happened to save).  A file
-                # whose channels are NOT all in the catalog is rejected here (aligned_to_channels
-                # raises on a superset), with the same wording the root launcher uses -- the
-                # editor never silently swaps its channel universe to a foreign file's.
-                catalog = [str(c) for c in self.state.channels]
-                if list(state.channels) != catalog:
-                    if all(channel in catalog for channel in state.channels):
-                        state = state.aligned_to_channels(catalog)
-                    else:
-                        self._message(
-                            "loaded pulse state channels do not match the sequencer channels: "
-                            f"state={list(state.channels)!r}, sequencer={catalog!r}. "
-                            "Load a matching pulse JSON or use hardware channel names with display labels."
-                        )
+                # A saved document is aligned topology-to-topology.  Raw lane
+                # equality alone cannot prove DAC/clock semantics.
+                if state.port_catalog.fingerprint != self.state.port_catalog.fingerprint:
+                    try:
+                        state = state.aligned_to_catalog(self.state.port_catalog)
+                    except ValueError as exc:
+                        self._message(str(exc))
                         return
                 self.address_str = path
                 self._last_load_state = state.to_dict()
                 self._last_save_state = None
-                # A freshly opened pulse's scan table becomes the "generated" source.
-                # If the saved bundle's scan array (<stem>_scan.npy) sits next to the
-                # pulse, restore it as the loaded-file source too (same numbers as the
-                # embedded table at save time) so Load round-trips the WHOLE bundle.
+                # A freshly opened pulse's embedded scan table is authoritative.
                 self._scan_tables = {"generated": [list(row) for row in state.scan_table], "loaded": []}
                 self._scan_loaded_path = ""
                 self._scan_use_loaded = False
-                sibling_npy = path_obj.with_name(path_obj.stem + "_scan.npy")
-                if sibling_npy.exists() and state.scan_slots:
-                    try:
-                        self._scan_tables["loaded"] = snap_scan_table(
-                            load_scan_table(sibling_npy, n_slots=len(state.scan_slots) or None),
-                            state.scan_slots,
-                            time_step_ns=state.time_step_ns,
-                            dac_ranges=state.scan_slot_dac_ranges(),
-                        )
-                        self._scan_loaded_path = str(sibling_npy)
-                    except Exception:
-                        pass  # a stale/incompatible sibling never blocks the pulse load
                 self.stateui_manager.address_str = path
                 self.stateui_manager.filestate = PulseStateUIManager.FileState.LOAD
                 self.load_state(state)
@@ -4182,10 +4139,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                     and self._applied_state_key is not None
                     and state_key == self._applied_state_key):
                 self.stateui_manager.runstate = self._unsynced_from or RunState.PREPARED
-            hidden = state.hidden_active_channels()
+            hidden = _hidden_active_ports(state)
+            visible_ports, total_ports = _port_visibility(state)
             total_ns = state.total_duration_ns()
             parts = [
-                f"{len(state.visible_channels)}/{len(state.channels)} visible",
+                f"{visible_ports}/{total_ports} ports visible",
                 f"{len(state.periods)} periods",
                 f"step {state.time_step_ns:g} ns",
                 f"{total_ns:.3g} ns",
@@ -4211,9 +4169,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 self.names_panel.total_label.setText(_summary_time_text(total_ns))
                 self.names_panel.total_label.setToolTip(f"{total_ns:.9g} ns total (one frame)")
                 self.names_panel.periods_label.setText(f"{len(state.periods)}")
-                self.names_panel.visible_label.setText(f"{len(state.visible_channels)}/{len(state.channels)}")
+                self.names_panel.visible_label.setText(f"{visible_ports}/{total_ports}")
             if hasattr(self, "visible_label"):
-                self.visible_label.setText(f"Visible {len(state.visible_channels)}/{len(state.channels)} | Hidden {len(state.channels) - len(state.visible_channels)}")
+                self.visible_label.setText(
+                    f"Visible {visible_ports}/{total_ports} ports | Hidden {total_ports - visible_ports}")
             self._update_file_state(state)
         except Exception as exc:
             self.summary.setText(str(exc))
@@ -4503,7 +4462,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             self._replace_preview_canvas(plotter)
             repeat_part = f" | {repeat}" if repeat else ""
             mode = "all channels" if include_always_off else "active channels"
-            self._preview_status_text = f"{len(channels)}/{len(state.channels)} plotted ({mode}){repeat_part}"
+            total = len(tuple(
+                port for port in state.port_catalog.ports if port.kind != PORT_CLOCK
+            ))
+            self._preview_status_text = f"{len(channels)}/{total} plotted ({mode}){repeat_part}"
             self.preview_status.setText(self._preview_status_text)
             self._preview_dirty = False
             self._preview_render_key = render_key
@@ -4618,10 +4580,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 def show_pulse_gui(
     *,
     state: PulseTableState | None = None,
-    channels: Sequence[str] | None = None,
     sequencer=None,
     experiment=None,
-    channel_labels: Mapping[str, str] | None = None,
     channel_pins: Mapping[str, str] | None = None,
     scale: float | None = None,
     window_ratio: float = DEFAULT_WINDOW_RATIO,
@@ -4630,10 +4590,8 @@ def show_pulse_gui(
     ensure_qt_app()          # the editor is a QWidget: the app must exist BEFORE its ctor
     editor = PulseSequenceEditor(
         state=state,
-        channels=channels,
         sequencer=sequencer,
         experiment=experiment,
-        channel_labels=channel_labels,
         channel_pins=channel_pins,
         scale=scale,
         window_ratio=window_ratio,

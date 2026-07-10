@@ -35,6 +35,7 @@ frontend.panel_plot and never part of the layout.
 from __future__ import annotations
 
 import json
+import hashlib
 import math as _math
 import os
 import re
@@ -51,6 +52,7 @@ from .live import (
     PANEL_SIZES,
     PLOT_KINDS,
     coerce_panel_value,
+    normalize_facet,
     panel_display_size,
     panel_plot,
     panel_size_cells,
@@ -143,12 +145,14 @@ from Zou_lab_control.neutral_atom.operations.task import DEFAULT_MID_RUN_KEY
 TASK_FILES_ENV = "ZLC_TASK_DIR"
 
 # ---- RESERVED expression-namespace keys (each spelled ONCE; every writer/reader shares these).
-#: The running task's mid-run frame: injected off-hub by the console each tick, read by the
+#: The running task's typed mid-run tensor: injected off-hub by the console each tick, read by the
 #: task's dedicated panel (its source is ``value = {TASK_FRAME_KEY}``) -- never a hub signal.
 TASK_FRAME_KEY = "__task_frame__"
 #: Per-signal publish counters ({name: version}) so a rolling monitor tells a new sample of
 #: its OWN source from an unrelated node's version bump.
 SIG_VERSIONS_KEY = "__sig_versions__"
+#: Shot-coherent per-signal physical validity masks ({name: (R,P) bool}).
+SIG_VALID_KEY = "__sig_valid__"
 #: Coordinate frames ({signal_name: [x0, x1, y0, y1]}) from any node whose acquisition source
 #: declares a ROI -- a 2D panel puts its axes in real camera pixels.
 COORD_FRAMES_KEY = "__coord_frames__"
@@ -271,14 +275,6 @@ def strip_node_prefix(full: str, prefix: str) -> str:
     return full[len(prefix):] if (prefix and full.startswith(prefix) and len(full) > len(prefix)) else full
 
 
-def _scan_modes() -> tuple[str, str, str]:
-    """The ("none", "api", "scan") tuple -- fetched lazily from the ONE backend source
-    (``operations.measurements.pulse_scan.SCAN_MODES``) so the name strings are typed once and the
-    frontend module import stays off neutral_atom's import-time graph (every other na use is lazy)."""
-    from ..neutral_atom.operations.measurements.pulse_scan import SCAN_MODES
-    return SCAN_MODES
-
-
 def _is_number(v) -> bool:
     """True when ``v`` can be read as a finite float (a saved numeric param), else False."""
     try:
@@ -289,29 +285,17 @@ def _is_number(v) -> bool:
 
 
 class _PulseSlotsWidget(QtWidgets.QWidget):
-    """Auto-built sub-form for a pulse template's API + scan slots.
+    """Structured editor for the two PulseScan execution strategies.
 
-    One numeric row per API slot (``a1``, ``a2``, ...): the FIXED operator-set value, in the slot's
-    own unit, seeded from the template's current value (these are ALWAYS shown and ALWAYS applied).
+    A scan-slot sweep uploads one complete FPGA table; an API-slot sweep submits one finite pulse
+    per row.  The selector changes the meaning and columns of a single program editor.  Each
+    strategy keeps its own in-memory buffer because those column spaces are not interchangeable.
+    Selecting a pulse template seeds the scan-slot buffer from that template's persisted program;
+    the API-slot buffer is generated from its API fields.
 
-    Then ONE ``Scan:`` mode toggle -- ``[None | API | Scan]`` -- and ONE shared scan-table editor
-    whose columns / legend / templates ADAPT to the selected mode:
-
-    * **Scan** sweeps the bound HARDWARE scan slots (``s0``, ``s1``, ...) -- the columns are the
-      hardware slots in ns ticks / LSB, snapped to the FPGA grid by the build.
-    * **API** sweeps the API slots in SOFTWARE (``a1``, ``a2``, ...) -- the columns are the api
-      slots in their native units (no snap); the ``Extra settle delay`` row is shown only here.
-    * **None** fires a single fixed point at the api values -- the table is hidden.
-
-    Each program is the SAME table model as the pulse GUI Scan tab (``column_stack`` / ``grid``
-    templates): one ROW per point, one COLUMN per slot, advanced in LOCKSTEP.  A mode whose kind is
-    ABSENT (no api slots -> API; no scan slots -> Scan) is disabled.  TWO remembered buffers (one
-    per mode) so switching API<->Scan keeps each mode's last program -- the column MEANING differs,
-    so they are never collapsed into one string.
-
-    Output schema: ``{"api": {a1: float, ...}, "scan_mode": "none"|"api"|"scan",
-    "scan_code": "<the active mode's program>", "extra_delay": float}`` (ONE ``scan_code`` = the
-    active table; the build dispatches on ``scan_mode``)."""
+    A saved task override is tied to ``program_id``.  It is restored only when that exact template
+    is selected; values named ``a1`` or a code buffer can therefore never leak from one template
+    into another template whose opaque internal slot happens to have the same index."""
 
     changed = QtCore.pyqtSignal()
 
@@ -319,32 +303,21 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
         self._api_widgets: dict[str, QtWidgets.QWidget] = {}
-        self._api_remembered: dict[str, str] = {}     # typed api values, kept across reloads
-        # TWO remembered buffers -- one per sweep mode -- because the columns mean DIFFERENT things
-        # (api native units vs hardware ns/LSB); switching API<->Scan must restore each mode's own
-        # program.  Keyed by the SINGLE-source mode names (api, scan); None has no table.
-        _none, _api, _scan = _scan_modes()
-        self._scan_buffers: dict[str, str] = {_api: "", _scan: ""}
-        self._extra_remembered: str = ""              # typed extra settle delay, kept across reloads
-        self._scan_code = None                        # the ONE active-mode FluentCodeEdit (None in None mode)
-        self._extra_delay = None                      # the extra-settle FluentLineEdit (API mode only)
-        self._mode_combo = None                       # the Scan:[None|API|Scan] toggle
-        self._mode = "none"                           # the currently selected mode
-        # A pending SAVED state to restore on the next rebuild (a load / round-trip).  Kept apart
-        # from the live-typed _api_remembered so rebuild's own stash-of-current-text never clobbers
-        # it; consumed (cleared) once applied.
-        self._pending_mode = None
+        from ..neutral_atom.operations.measurement import SWEEP_API_SLOT, SWEEP_SCAN_SLOT
+        self._scan_slot_kind = SWEEP_SCAN_SLOT
+        self._api_slot_kind = SWEEP_API_SLOT
+        self._program_code = None
+        self._sweep_combo = None
+        self._sweep_kind = ""
+        self._program_buffers = {SWEEP_SCAN_SLOT: "", SWEEP_API_SLOT: ""}
+        self._columns: dict[str, list] = {SWEEP_SCAN_SLOT: [], SWEEP_API_SLOT: []}
+        self._specs: dict[str, list] = {SWEEP_SCAN_SLOT: [], SWEEP_API_SLOT: []}
+        self._available = {SWEEP_SCAN_SLOT: False, SWEEP_API_SLOT: False}
+        self._program_id = ""
+        self._pending_program_id = ""
         self._pending_api: dict[str, str] = {}
-        self._api_columns: list[tuple[str, str, str]] = []   # the api-mode table columns (legend)
-        self._scan_columns: list[tuple[str, str, str]] = []  # the scan-mode table columns (legend)
-        self._api_specs: list = []                           # per-kind template column specs (api)
-        self._scan_specs: list = []                          # per-kind template column specs (scan)
-        self._have_api = False
-        self._have_scan = False
-        self._n_slots = 0                             # bound hardware scan slot count
-        # Spans the FULL form width.  An always-on "API slots" header + the per-slot value rows live
-        # in _api_box; the mode toggle + the single adaptive table live in _table_box (rebuilt on a
-        # mode switch WITHOUT tearing down the api rows, so the value edits survive a toggle).
+        self._pending_sweep_kind = ""
+        self._pending_program = ""
         self._box = QtWidgets.QVBoxLayout(self)
         self._box.setContentsMargins(0, 0, 0, 0)
         self._box.setSpacing(scaled_px(6, minimum=4))
@@ -352,13 +325,14 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         self._api_box.setContentsMargins(0, 0, 0, 0)
         self._api_box.setSpacing(scaled_px(6, minimum=4))
         self._box.addLayout(self._api_box)
-        self._table_box = QtWidgets.QVBoxLayout()
-        self._table_box.setContentsMargins(0, 0, 0, 0)
-        self._table_box.setSpacing(scaled_px(6, minimum=4))
-        self._box.addLayout(self._table_box)
-        # The whole-sweep count is the measurement's auto-injected ``Repeat (0 = ∞)`` knob -- a
-        # pulse-scan pass IS a whole sweep, so the ONE repeat axis already counts sweeps (0 = sweep
-        # forever).  There is NO separate "scan repeats" field here (it would double the same number).
+        self._selector_box = QtWidgets.QVBoxLayout()
+        self._selector_box.setContentsMargins(0, 0, 0, 0)
+        self._selector_box.setSpacing(scaled_px(6, minimum=4))
+        self._box.addLayout(self._selector_box)
+        self._program_box = QtWidgets.QVBoxLayout()
+        self._program_box.setContentsMargins(0, 0, 0, 0)
+        self._program_box.setSpacing(scaled_px(6, minimum=4))
+        self._box.addLayout(self._program_box)
 
     @staticmethod
     def _drop_layout(layout) -> None:
@@ -372,271 +346,226 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
             if child is not None:
                 _PulseSlotsWidget._drop_layout(child)
 
-    def rebuild(self, api_rows, scan_rows) -> None:
-        """``api_rows`` = ``[(name, kind, target, unit, current_value), ...]``.
-        ``scan_rows`` = ``[(name, kind, target, unit, label), ...]`` (the bound scan slots = the
-        columns of the scan table)."""
-        # Remember whatever the operator currently typed (api values + the active mode's program),
-        # then rebuild both the api rows and the toggle + table.  A queued SAVED load (seed_value set
-        # _pending_*) must NOT be clobbered by stashing the current (default) editor text, so skip the
-        # stash in that case -- the pending buffers / values are the source of truth for this rebuild.
-        pending_load = bool(self._pending_mode) or bool(self._pending_api)
-        if not pending_load:
-            for name, w in list(self._api_widgets.items()):
-                self._api_remembered[name] = w.text().strip()
-            self._stash_active_buffer()
-            if self._extra_delay is not None:
-                self._extra_remembered = self._extra_delay.text().strip()
+    def rebuild(self, api_rows, scan_rows, *, hardware_program: str = "",
+                program_id: str = "") -> None:
+        """Rebuild from one pulse template.
+
+        ``api_rows`` entries are ``(handle, coordinate, kind, target, unit, current)``;
+        ``scan_rows`` entries are ``(coordinate, kind, target, unit, label)``.
+        """
+
+        program_id = str(program_id or "")
+        same_program = bool(program_id and program_id == self._program_id)
+        restore_saved = bool(program_id and program_id == self._pending_program_id)
+
+        remembered_api = {}
+        if same_program:
+            remembered_api = {name: widget.text().strip()
+                              for name, widget in self._api_widgets.items()}
+            self._stash_program()
+
         self._drop_layout(self._api_box)
-        self._drop_layout(self._table_box)
+        self._drop_layout(self._selector_box)
+        self._drop_layout(self._program_box)
         self._api_widgets = {}
-        self._scan_code = None
-        self._extra_delay = None
-        self._mode_combo = None
-        self._n_slots = len(scan_rows)
-        self._have_api = bool(api_rows)
-        self._have_scan = bool(scan_rows)
+        self._program_code = None
+        self._sweep_combo = None
+        self._program_id = program_id
 
-        # ---- API slots section: ALWAYS shown.  One FIXED value row per api slot (used in every
-        # mode; in API mode a row may ALSO be the swept dimension, with this value as the seed).
-        self._api_box.addWidget(FluentSectionLabel("API slots"))
+        self._api_box.addWidget(FluentSectionLabel("API parameters"))
         if api_rows:
-            api_labels = [f"{name}  {slot_label(kind, target)}" for name, kind, target, _u, _c in api_rows]
-            api_lw = setting_label_width(api_labels, minimum=72)   # same row rule as every form
-            for name, kind, target, unit, current in api_rows:
-                label = f"{name}  {slot_label(kind, target)}"
-                # a saved value (a load) wins over the live-typed buffer wins over the template seed
-                seed_text = (self._pending_api.get(name) or self._api_remembered.get(name)
-                             or f"{float(current):g}")
-                edit = FluentLineEdit(seed_text, self)
+            labels = [slot_label(kind, target)
+                      for _handle, _coord, kind, target, _unit, _current in api_rows]
+            label_width = setting_label_width(labels, minimum=72)
+            for handle, _coordinate, kind, target, unit, current in api_rows:
+                label = slot_label(kind, target)
+                seed = (self._pending_api.get(handle) if restore_saved else None)
+                if seed is None and same_program:
+                    seed = remembered_api.get(handle)
+                if seed is None:
+                    seed = f"{float(current):g}"
+                edit = FluentLineEdit(seed, self)
                 edit.setMinimumWidth(scaled_px(120, minimum=96))
-                edit.setPlaceholderText(f"{unit}")
-                edit.setToolTip(f"Fixed value for API slot {name!r} (unit: {unit}) -- used in every "
-                                "mode (in API mode it is the resting seed unless that slot is swept).")
+                edit.setPlaceholderText(str(unit))
+                edit.setToolTip(
+                    f"Resting value for {label} ({unit}).  In an API-slot sweep, the program "
+                    "overrides this handle once per row.")
                 edit.textChanged.connect(self.changed)
-                self._api_box.addWidget(FluentSettingRow(label, edit, label_width=api_lw))
-                self._api_widgets[name] = edit
+                self._api_box.addWidget(FluentSettingRow(label, edit, label_width=label_width))
+                self._api_widgets[str(handle)] = edit
         else:
-            api_note = FluentLabel("(no API slot -- in the pulse GUI Edit tab, click a duration / DAC "
-                                   "cell to its API (purple) state to fix or sweep a value by name aN.)", self)
-            api_note.setWordWrap(True)
-            api_note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            self._api_box.addWidget(api_note)
-
-        # the per-mode table columns (api native units; hardware scan ns/LSB) + the per-kind template
-        # column specs (so a DAC column is seeded with its signed code range, not a duration's ns range).
-        from ..neutral_atom.timing import scan_column_spec
-        self._api_columns = [(name, slot_label(kind, target), (unit or "value"))
-                             for name, kind, target, unit, _c in api_rows]
-        self._api_specs = [scan_column_spec(name, ("dac" if kind == "dac" else "duration"), unit=(unit or "ns"))
-                           for name, kind, target, unit, _c in api_rows]
-        self._scan_columns = []
-        self._scan_specs = []
-        for i, (name, kind, target, unit, stored_label) in enumerate(scan_rows):
-            disp = stored_label or slot_label(kind, target)
-            u = "ns ticks" if kind == "duration" else ("integer code (LSB)" if kind == "dac" else (unit or ""))
-            self._scan_columns.append((f"s{i}", disp, u))
-            self._scan_specs.append(scan_column_spec(f"s{i}", kind, unit=(unit or "ns")))
-
-        # Default mode: Scan if scan slots exist, else API if api slots exist, else None.  A SAVED
-        # mode (set by seed_value on a load) wins -- but only if that kind is still available for the
-        # loaded template (a saved "scan" with no scan slots falls back to the default).
-        none, api, scan = _scan_modes()
-        default_mode = scan if self._have_scan else (api if self._have_api else none)
-        available = {none: True, api: self._have_api, scan: self._have_scan}
-        self._mode = (self._pending_mode if self._pending_mode and available.get(self._pending_mode)
-                      else default_mode)
-        self._pending_mode = None
-        self._pending_api = {}                         # consumed: a later template-driven rebuild is fresh
-        self._build_mode_toggle()
-        self._render_active_table()
-        self.changed.emit()
-
-    def _build_mode_toggle(self) -> None:
-        """The ONE ``Scan:`` mode toggle -- a FluentComboBox of [None | API | Scan].  A mode whose
-        kind is absent is added but disabled (so the toggle is the single place that picks the swept
-        kind, and an impossible mode reads as unavailable rather than silently missing)."""
-        none, api, scan = _scan_modes()
-        labels = {none: "None", api: "API", scan: "Scan"}
-        enabled = {none: True, api: self._have_api, scan: self._have_scan}
-        combo = FluentComboBox()
-        combo.setMinimumWidth(scaled_px(120, minimum=96))
-        for mode in (none, api, scan):
-            combo.addItem(labels[mode], mode)
-            item = combo.model().item(combo.count() - 1)
-            if item is not None and not enabled[mode]:
-                item.setEnabled(False)
-        idx = combo.findData(self._mode)
-        combo.setCurrentIndex(idx if idx >= 0 else 0)
-        combo.currentIndexChanged.connect(self._on_mode_changed)
-        combo.setToolTip("What to sweep: None = one fixed point; API = sweep the api slots in "
-                         "software; Scan = sweep the bound hardware scan slots.  A mode is disabled "
-                         "when the template has no slot of that kind.")
-        self._mode_combo = combo
-        self._table_box.addWidget(FluentSettingRow("Scan", combo,
-                                                   label_width=setting_label_width(["Scan"], minimum=72)))
-
-    def _on_mode_changed(self, *_a) -> None:
-        if self._mode_combo is None:
-            return
-        new_mode = str(self._mode_combo.currentData() or "none")
-        if new_mode == self._mode:
-            return
-        self._stash_active_buffer()                   # keep the program the operator just typed
-        self._mode = new_mode
-        self._render_active_table()
-        self.changed.emit()
-
-    def _stash_active_buffer(self) -> None:
-        """Save the active code editor's text into its mode's buffer (so a switch preserves it)."""
-        if self._scan_code is not None and self._mode in self._scan_buffers:
-            self._scan_buffers[self._mode] = self._scan_code.toPlainText()
-        if self._extra_delay is not None:
-            self._extra_remembered = self._extra_delay.text().strip()
-
-    def _render_active_table(self) -> None:
-        """(Re)build the single adaptive table area below the toggle for the current mode: nothing
-        for None; the api columns + extra-settle row for API; the hardware scan columns for Scan."""
-        # Drop everything in the table box EXCEPT the first item (the mode toggle row).
-        while self._table_box.count() > 1:
-            item = self._table_box.takeAt(self._table_box.count() - 1)
-            w = item.widget()
-            if w is not None:
-                w.setParent(None); w.deleteLater()
-            child = item.layout()
-            if child is not None:
-                self._drop_layout(child)
-        self._scan_code = None
-        self._extra_delay = None
-        none, api, scan = _scan_modes()
-        if self._mode == none:
-            note = FluentLabel("(None -- no sweep: the pulse fires ONCE at the fixed api values above.)",
-                               self)
+            note = FluentLabel("(this template has no API parameter)", self)
             note.setWordWrap(True)
             note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            self._table_box.addWidget(note)
-            return
-        columns = self._api_columns if self._mode == api else self._scan_columns
-        self._render_scan_table_body(columns, mode=self._mode)
-        if self._mode == api:
-            # The inter-point software settle is meaningful only for the API sweep (the device
-            # streams hardware scans itself), so its row appears ONLY here.
-            self._extra_delay = FluentLineEdit(self._extra_remembered, self)
-            self._extra_delay.setMinimumWidth(scaled_px(120, minimum=96))
-            self._extra_delay.setPlaceholderText("0")
-            self._extra_delay.setToolTip("Extra settle delay (seconds) the device holds AFTER each "
-                                         "point's pulse finishes, before the next is loaded (0 = none).")
-            self._extra_delay.textChanged.connect(self.changed)
-            self._table_box.addWidget(FluentSettingRow("Extra settle delay (s)", self._extra_delay,
-                                                       label_width=setting_label_width(["Extra settle delay (s)"])))
+            self._api_box.addWidget(note)
 
-    def _render_scan_table_body(self, columns, *, mode: str) -> None:
-        """Render the shared scan-table form for the active ``mode``: a per-column legend +
-        column_stack / grid template buttons + the ``FluentCodeEdit`` that assigns an (N x n_cols)
-        ``scan_table``.  ONE renderer, so the API and Scan tables are byte-identical in FORM; only
-        the columns / legend / remembered buffer differ.  ``columns`` = ``[(col_var, display, unit),
-        ...]``.  The editor seeds from this mode's remembered buffer, or the column_stack template."""
-        from ..neutral_atom.timing import scan_table_template
-        _none, api_mode, _scan = _scan_modes()
-        specs = self._api_specs if mode == api_mode else self._scan_specs
+        from ..neutral_atom.timing import scan_column_spec
+        self._columns[self._api_slot_kind] = [
+            (coordinate, slot_label(kind, target), str(unit or ""))
+            for _handle, coordinate, kind, target, unit, _current in api_rows
+        ]
+        self._specs[self._api_slot_kind] = [
+            scan_column_spec(coordinate, "dac" if kind == "dac" else "duration",
+                             unit=(unit or "ns"))
+            for _handle, coordinate, kind, _target, unit, _current in api_rows
+        ]
+        self._columns[self._scan_slot_kind] = []
+        self._specs[self._scan_slot_kind] = []
+        for coordinate, kind, target, unit, stored_label in scan_rows:
+            display = stored_label or slot_label(kind, target)
+            display_unit = "ns ticks" if kind == "duration" else (
+                "integer code (LSB)" if kind == "dac" else str(unit or ""))
+            self._columns[self._scan_slot_kind].append((coordinate, display, display_unit))
+            self._specs[self._scan_slot_kind].append(
+                scan_column_spec(coordinate, kind, unit=(unit or "ns")))
+
+        self._available = {
+            self._scan_slot_kind: bool(scan_rows),
+            self._api_slot_kind: bool(api_rows),
+        }
+        if not same_program:
+            self._program_buffers = {
+                self._scan_slot_kind: str(hardware_program or ""),
+                self._api_slot_kind: "",
+            }
+        elif not self._program_buffers[self._scan_slot_kind].strip():
+            self._program_buffers[self._scan_slot_kind] = str(hardware_program or "")
+
+        default_kind = self._scan_slot_kind if scan_rows else (
+            self._api_slot_kind if api_rows else "")
+        if restore_saved and self._available.get(self._pending_sweep_kind, False):
+            self._sweep_kind = self._pending_sweep_kind
+            self._program_buffers[self._sweep_kind] = self._pending_program
+        elif not same_program or not self._available.get(self._sweep_kind, False):
+            self._sweep_kind = default_kind
+
+        self._build_sweep_selector()
+        self._render_program()
+        self._pending_program_id = ""
+        self._pending_api = {}
+        self._pending_sweep_kind = ""
+        self._pending_program = ""
+        self.changed.emit()
+
+    def _build_sweep_selector(self) -> None:
+        combo = FluentComboBox()
+        choices = (
+            ("Scan slots (hardware table)", self._scan_slot_kind),
+            ("API slots (one pulse per point)", self._api_slot_kind),
+        )
+        for label, kind in choices:
+            combo.addItem(label, kind)
+            item = combo.model().item(combo.count() - 1)
+            if item is not None:
+                item.setEnabled(bool(self._available[kind]))
+        index = combo.findData(self._sweep_kind)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.currentIndexChanged.connect(self._on_sweep_changed)
+        combo.setToolTip(
+            "Scan slots upload one complete FPGA table. API slots resolve and submit one finite "
+            "pulse per program row.")
+        self._sweep_combo = combo
+        self._selector_box.addWidget(FluentSettingRow(
+            "Sweep", combo, label_width=setting_label_width(["Sweep"], minimum=72)))
+
+    def _on_sweep_changed(self, *_args) -> None:
+        if self._sweep_combo is None:
+            return
+        kind = str(self._sweep_combo.currentData() or "")
+        if kind == self._sweep_kind or not self._available.get(kind, False):
+            return
+        self._stash_program()
+        self._sweep_kind = kind
+        self._render_program()
+        self.changed.emit()
+
+    def _stash_program(self) -> None:
+        if self._program_code is not None and self._sweep_kind:
+            self._program_buffers[self._sweep_kind] = self._program_code.toPlainText()
+
+    def _render_program(self) -> None:
+        self._drop_layout(self._program_box)
+        self._program_code = None
+        if not self._sweep_kind or not self._available.get(self._sweep_kind, False):
+            note = FluentLabel(
+                "(bind at least one scan slot or API slot in the Pulse GUI)", self)
+            note.setWordWrap(True)
+            note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            self._program_box.addWidget(note)
+            return
+
+        title = "Hardware scan-slot program" if self._sweep_kind == self._scan_slot_kind \
+            else "API-slot sweep program"
+        self._program_box.addWidget(FluentSectionLabel(title))
+        columns = self._columns[self._sweep_kind]
         legend = ["Columns of scan_table (one row = one point, columns advance in lockstep):"]
-        for var, disp, unit in columns:
-            legend.append(f"  {var}: {disp}  [{unit}]")
+        legend.extend(f"  {name}: {display}  [{unit}]" for name, display, unit in columns)
         legend_label = FluentLabel("\n".join(legend), self)
         legend_label.setWordWrap(True)
         legend_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-        self._table_box.addWidget(legend_label)
-        remembered = self._scan_buffers.get(mode, "").strip()
-        seed = remembered or scan_table_template("column_stack", specs)
+        self._program_box.addWidget(legend_label)
+
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.setContentsMargins(0, 0, 0, 0)
         btn_row.setSpacing(scaled_px(6, minimum=4))
         btn_row.addWidget(FluentLabel("template:", self))
-        cs = FluentButton("column_stack", color=GREY)
-        cs.setToolTip("Insert the column_stack template (one column per slot), adapted to the columns.")
-        cs.clicked.connect(lambda *_a: self._insert_template("column_stack"))
-        gr = FluentButton("grid", color=GREY)
-        gr.setToolTip("Insert the grid template (every combination of the axis arrays).")
-        gr.clicked.connect(lambda *_a: self._insert_template("grid"))
-        btn_row.addWidget(cs, 0)
-        btn_row.addWidget(gr, 0)
+        for template in ("column_stack", "grid"):
+            button = FluentButton(template, color=GREY)
+            button.clicked.connect(lambda *_a, value=template: self._insert_template(value))
+            btn_row.addWidget(button, 0)
         btn_row.addStretch(1)
-        self._table_box.addLayout(btn_row)
+        self._program_box.addLayout(btn_row)
+
+        from ..neutral_atom.timing import scan_table_template
+        seed = str(self._program_buffers[self._sweep_kind] or "").strip()
+        if not seed:
+            seed = scan_table_template("column_stack", self._specs[self._sweep_kind])
+        self._program_buffers[self._sweep_kind] = seed
         editor = FluentCodeEdit(seed)
         editor.setMinimumHeight(scaled_px(120, minimum=90))
-        editor.setToolTip("Python that assigns an (N_points x n_cols) array to 'scan_table' "
-                          "(one column per slot, in the slot's native unit).")
+        editor.setToolTip(
+            "Python assigning an (N_points x n_columns) array to scan_table. Values use each "
+            "selected slot's native unit.")
         editor.textChanged.connect(self.changed)
-        self._table_box.addWidget(editor)
-        self._scan_code = editor
+        self._program_box.addWidget(editor)
+        self._program_code = editor
 
     def _insert_template(self, template: str) -> None:
         from ..neutral_atom.timing import scan_table_template
-        if self._scan_code is not None:
-            _none, api_mode, _scan = _scan_modes()
-            specs = self._api_specs if self._mode == api_mode else self._scan_specs
-            self._scan_code.setPlainText(scan_table_template(template, specs))
+        if self._program_code is not None and self._sweep_kind:
+            self._program_code.setPlainText(
+                scan_table_template(template, self._specs[self._sweep_kind]))
 
     def values_dict(self) -> dict:
-        """The current ``{"api": {name: float}, "scan_mode": "none"|"api"|"scan",
-        "scan_code": "<python>", "extra_delay": float}`` snapshot.  ONE ``scan_code`` = the ACTIVE
-        mode's program (the build dispatches on ``scan_mode``); an empty / blank api row is dropped
-        (keeps the template's value).  The whole-sweep count is the measurement's auto-injected
-        ``Repeat (0 = ∞)`` knob (a pulse-scan pass IS a sweep) -- not a field here."""
+        """Return the sole structured PulseScan form value."""
+
         api: dict[str, float] = {}
-        for name, w in self._api_widgets.items():
-            text = w.text().strip()
+        for name, widget in self._api_widgets.items():
+            text = widget.text().strip()
             if not text:
                 continue
             try:
                 api[name] = float(text)
             except ValueError:
                 continue
-        code = self._scan_code.toPlainText() if self._scan_code is not None else ""
-        extra = 0.0
-        if self._extra_delay is not None:
-            try:
-                extra = float(self._extra_delay.text().strip() or 0.0)
-            except ValueError:
-                extra = 0.0
-        return {"api": api, "scan_mode": self._mode, "scan_code": code, "extra_delay": extra}
+        program = self._program_code.toPlainText() if self._program_code is not None else ""
+        return {
+            "program_id": self._program_id,
+            "api": api,
+            "sweep_kind": self._sweep_kind,
+            "program": program,
+        }
 
     def seed_value(self, value) -> None:
-        """Seed from a SAVED ``{"api", "scan_mode", "scan_code", "extra_delay"}`` blob (a load /
-        round-trip).  The auto-form is rebuilt from the template path (the slots themselves come
-        from the template, not the blob), so we stash the saved api values + mode + active program
-        into the per-mode buffers here; the next :meth:`rebuild` (triggered by the template field's
-        repopulation) restores them.  ``_pending_mode`` is honoured by ``rebuild`` over the default
-        when the saved mode is still available for the loaded template."""
+        """Queue a saved override, applied only to the exact matching pulse program."""
+
         if not isinstance(value, Mapping):
             return
-        for name, v in dict(value.get("api") or {}).items():
-            self._pending_api[str(name)] = f"{float(v):g}" if _is_number(v) else str(v)
-        mode = str(value.get("scan_mode") or "").strip().lower()
-        code = str(value.get("scan_code") or "")
-        none, api, scan = _scan_modes()
-        if mode in self._scan_buffers and code.strip():
-            self._scan_buffers[mode] = code
-        elif not mode and code.strip():
-            # a legacy blob (no scan_mode) carried only scan_code -- keep it for both buffers so
-            # whichever mode the rebuild defaults to picks it up.
-            self._scan_buffers[scan] = self._scan_buffers[api] = code
-        self._pending_mode = mode if mode in (none, api, scan) else None
-        self._extra_remembered = (f"{float(value['extra_delay']):g}"
-                                  if _is_number(value.get("extra_delay")) else self._extra_remembered)
-
-    def has_scan_rows(self) -> bool:
-        return self._n_slots > 0
-
-    def all_scan_rows_filled(self) -> bool:
-        """The form has SOMETHING to run: a fixed point (None mode) is always runnable; a sweep mode
-        needs its program filled (or the column_stack default the build supplies, which a blank
-        editor seeds, so a non-None mode is considered ready)."""
-        none, _api, _scan = _scan_modes()
-        if self._mode == none:
-            return True
-        return self._scan_code is not None and bool(self._scan_code.toPlainText().strip())
-
+        for name, item in dict(value.get("api") or {}).items():
+            self._pending_api[str(name)] = f"{float(item):g}" if _is_number(item) else str(item)
+        self._pending_sweep_kind = str(value.get("sweep_kind") or "")
+        self._pending_program = str(value.get("program") or "")
+        self._pending_program_id = str(value.get("program_id") or "")
 
 # The ONE description of a source expression's namespace -- owned by operations.signal_expr
 # (the single source the analysis layer + GUI share), fetched lazily so the frontend module
@@ -997,23 +926,6 @@ def _resolved_cmap(kind: str, params: Mapping[str, object]) -> str:
     default = _panel_param_default(kind, "cmap")
     return str(default) if default else ""
 
-# Curve fits a panel's Edit tab can run on its frozen snapshot.  label -> (DataFigure method name,
-# render family).  The family ("1D" curve models vs the "2D" centroid) is the SAME "1D"/"2D" vocabulary
-# ``PLOT_KINDS.render_family`` uses, so the Edit tab offers ONLY the fits that match the panel's plot family
-# (a 2d image gets the 2D-Gaussian ``center``; a 1d/monitor trace gets the curve models) instead of listing
-# dead options a mismatched DataFigure method silently no-ops.  A kind that carries its OWN built-in fit (a
-# hist's bimodal ``fit`` PANEL_PARAM) offers NO general fit at all -- see :func:`_kind_offers_general_fit`.
-# The Setting popup carries NO fit controls (basic display only); fitting lives in each panel's Edit tab.
-FIT_MODELS: dict[str, tuple[str, str]] = {
-    "Lorentzian": ("lorent", "1D"),
-    "Gaussian": ("gaussian", "1D"),
-    "Lorentzian (Zeeman)": ("lorent_zeeman", "1D"),
-    "Rabi": ("rabi", "1D"),
-    "Exp decay": ("decay", "1D"),
-    "2D center": ("center", "2D"),
-}
-
-
 def _kind_offers_general_fit(kind: str) -> bool:
     """A plot kind gets the Edit-tab general curve fit UNLESS it declares its OWN built-in fit -- a
     histogram carries a bimodal ``fit`` PANEL_PARAM (none/single/double), which IS its fit, so stacking a
@@ -1043,16 +955,20 @@ def _card_y_is_view_axis(card) -> bool:
     return bool(getattr(pk.cls, "y_is_view_axis", False)) if pk is not None else False
 
 
-def _fit_labels_for_kind(kind: str) -> list[str]:
-    """The fit-model labels a panel of ``kind`` offers: none if it has a built-in fit (hist), else the
-    models whose render family matches the kind's (:data:`FIT_MODELS`) -- 2d -> just ``2D center``,
-    a 1d/monitor trace -> the curve models.  ONE place the Edit tab's fit chooser is populated from."""
+def _fit_models_for_kind(kind: str) -> list:
+    """Compatible models from the one headless fit registry.
+
+    The console owns no model table and no executable argument language.  Both
+    Setting and Edit read this adapter, while the fit engine remains the sole
+    source of model keys, families, parameter names, and implementations.
+    """
+    from ..neutral_atom.core.fitting import fit_models
     from .live import PLOT_KIND_BY_KEY
     if not _kind_offers_general_fit(kind):
         return []
     pk = PLOT_KIND_BY_KEY.get(str(kind))
-    fam = pk.render_family if pk is not None else None
-    return [lbl for lbl, (_method, mf) in FIT_MODELS.items() if fam in (None, "auto") or mf == fam]
+    family = str(pk.render_family).lower() if pk is not None else "auto"
+    return list(fit_models() if family == "auto" else fit_models(family=family))
 
 
 def _py_to_text(value) -> str:
@@ -1740,6 +1656,10 @@ class PanelCard(FluentGroupBox):
         # Every plotter (re)build parks its selector layer to this flag (``_apply_selectors_state``),
         # so a fresh figure always inherits the switch instead of coming up live.
         self._selectors_on = False
+        # Last DATA selection made on this panel.  It is plot-independent and
+        # serializable; selecting never implies an ROI or a fit.  The explicit
+        # ``selection_action`` config decides what a later release does.
+        self._active_selection = None
         # GRID focus-zoom state (console path).  A GRID panel is display-only (interactions=False), so its
         # own double-click handler is dormant; THIS card catches the double-click on the grid canvas and
         # swaps ``self.plotter`` / ``self.canvas`` to a STANDALONE plot-kind figure of the clicked cell
@@ -2062,7 +1982,7 @@ class PanelCard(FluentGroupBox):
                 self._make_fixed_lim_row(self._on_fixed_lim_edited, label_w)
             sec.addWidget(self.fixed_lim_row)
 
-            # FACET chooser (grid panels only): which axis of the bound (repeat, points, *data_dim)
+            # FACET chooser (grid panels only): which axis of the bound (R,P,*data_shape)
             # block expands into the cells -- the grid-as-axis-expander declaration.  Options derive
             # from the producing node's declared structure and refresh on every Setting open (the
             # signal-combo rule); "(recipe)" keeps the loaded-figure snapshot behaviour.  Beside it
@@ -2112,6 +2032,59 @@ class PanelCard(FluentGroupBox):
                 "site-map stay shot-coherent.  A fast 100 ms suits a live-1D alignment monitor.")
             self.update_combo.currentIndexChanged.connect(self._on_update_interval)
             sec.addWidget(FluentSettingRow("update", self.update_combo, label_width=label_w))
+
+            # ---- Fit -------------------------------------------------------
+            # This is the live entry point, not a decorative mirror of the Edit
+            # page.  It emits one structured FitRequest shared by the overlay and
+            # FitProcessor; there is no executable argument string.
+            models = _fit_models_for_kind(self._param_kind())
+            self.fit_toggle = self.fit_model_combo = self.fit_result_label = None
+            self.selection_action_combo = None
+            if models:
+                fit_sec = section_box("Fit")
+                self.fit_toggle = FluentSwitch("live fit")
+                self.fit_toggle.setChecked(bool(self.config.params.get("fit_request")))
+                fit_sec.addWidget(FluentSettingRow("enabled", self.fit_toggle, label_width=label_w))
+
+                self.fit_model_combo = FluentComboBox()
+                for model in models:
+                    self.fit_model_combo.addItem(model.formula, model.key)
+                saved_request = self.config.params.get("fit_request") or {}
+                saved_model = str(saved_request.get("model", "")) if isinstance(saved_request, Mapping) else ""
+                model_index = self.fit_model_combo.findData(saved_model)
+                self.fit_model_combo.setCurrentIndex(max(0, model_index))
+                apply_fit = FluentButton("Apply", color=ACCENT)
+                apply_fit.clicked.connect(self._apply_fit_request)
+                clear_fit = FluentButton("Clear", color=GREY)
+                clear_fit.clicked.connect(self._clear_fit_request)
+                fit_actions = QtWidgets.QWidget()
+                fit_actions_layout = QtWidgets.QHBoxLayout(fit_actions)
+                fit_actions_layout.setContentsMargins(0, 0, 0, 0)
+                fit_actions_layout.setSpacing(scaled_px(6, minimum=4))
+                fit_actions_layout.addWidget(self.fit_model_combo, 1)
+                fit_actions_layout.addWidget(apply_fit, 0)
+                fit_actions_layout.addWidget(clear_fit, 0)
+                fit_sec.addWidget(FluentSettingRow("model", fit_actions, label_width=label_w))
+
+                self.selection_action_combo = FluentComboBox()
+                self.selection_action_combo.addItem("select only", "none")
+                self.selection_action_combo.addItem("fit", "fit")
+                if any(model.family == "2d" for model in models):
+                    self.selection_action_combo.addItem("ROI", "roi")
+                action = str(self.config.params.get("selection_action") or "none")
+                action_index = self.selection_action_combo.findData(action)
+                self.selection_action_combo.setCurrentIndex(max(0, action_index))
+                self.selection_action_combo.currentIndexChanged.connect(self._on_selection_action_changed)
+                fit_sec.addWidget(FluentSettingRow(
+                    "selection", self.selection_action_combo, label_width=label_w))
+
+                self.fit_result_label = FluentLabel("not fitted")
+                self.fit_result_label.setWordWrap(True)
+                self.fit_result_label.setStyleSheet(
+                    f"color: {GREY}; background: transparent; border: none;")
+                fit_sec.addWidget(FluentSettingRow(
+                    "result", self.fit_result_label, label_width=label_w))
+                self.fit_toggle.toggled.connect(self._on_fit_toggled)
 
         # ---- Panel ---------------------------------------------------------
         sec = section_box("Panel")
@@ -2524,12 +2497,6 @@ class PanelCard(FluentGroupBox):
         if self.canvas is not None:
             self.canvas.draw_idle()
 
-    def _on_relim_mode(self, mode: str) -> None:
-        """Back-compat shim: drive a relim change through the declarative ``_set_param`` path (the relim
-        chooser is now a ParamDecl, #H3v-4b).  Kept so callers that set relim by name -- notebook code,
-        tests -- still work; ``_set_param`` does the persist + plotter push + fixed-row reveal."""
-        self._set_param("relim", str(mode))
-
     def apply_fixed_lims(self, lo: float, hi: float) -> None:
         """Persist + apply the fixed lo/hi NOW through the ONE in-place entry every surface uses
         (``apply_param``'s relim family): on a ZOOMED grid the pin is ALSO stored on the parked grid
@@ -2628,11 +2595,15 @@ class PanelCard(FluentGroupBox):
         return out
 
     # --------------------------------------------------------------- facet (the grid as an axis-expander)
-    def _facet(self) -> str:
+    def _facet(self) -> str | None:
         """The panel's facet declaration (``config.params["facet"]``): which axis of the bound
-        ``(repeat, points, *data_dim)`` block expands into the grid cells.  Empty = a RECIPE grid
-        (the loaded-figure snapshot, the pre-facet behaviour)."""
-        return str(self.config.params.get("facet") or "")
+        canonical ``(R,P,*data_shape)`` block expands into the grid cells.  A missing value means a
+        non-faceted recipe grid; every present value is one canonical facet token."""
+        value = self.config.params.get("facet")
+        if value is None:
+            return None
+        normalize_facet(value)
+        return str(value)
 
     def _facet_value_shapes(self) -> tuple[tuple, tuple]:
         """(points multi-D shape, data shape) from the producing node's declared structure (#H3o) --
@@ -2640,9 +2611,7 @@ class PanelCard(FluentGroupBox):
         declared one.  The ONE source the facet choices, the auto sub-kind and the slicer share."""
         st = self._bound_structure() or {}
         gs = tuple(int(n) for n in (st.get("grid_shape") or ()))
-        # A task mid-run panel binds ``__task_frame__`` (off-hub, #6), so there is no producing hub node
-        # to read structure from -- its scan shape comes from the panel params the task set at start.
-        ps = tuple(int(n) for n in (st.get("points_shape") or self.config.params.get("points_shape") or ()))
+        ps = tuple(int(n) for n in (st.get("points_shape") or ()))
         ds = tuple(int(n) for n in (st.get("data_shape") or ()))
         return (gs or ps), ds
 
@@ -2653,8 +2622,9 @@ class PanelCard(FluentGroupBox):
         sub = str(self.config.params.get("sub_plot_kind") or "")
         if sub in GRID_CELL_BY_KIND:
             return sub
-        pts, dim = self._facet_value_shapes()
-        return default_sub_plot_kind(self._facet() or "repeat", points_shape=pts, data_shape=dim)
+        points_shape, data_shape = self._facet_value_shapes()
+        return default_sub_plot_kind(
+            self._facet() or "repeat", points_shape=points_shape, data_shape=data_shape)
 
     def _facet_cells(self, value):
         """Slice the bound block into the per-cell inputs through the ONE rule (live.facet_cells)."""
@@ -2664,7 +2634,7 @@ class PanelCard(FluentGroupBox):
             block = np.asarray(block, dtype=float)
         if block.ndim < 2:
             raise ValueError(
-                "a facet grid slices the bound signal's (repeat, points, *data_dim) block; got shape "
+                "a facet grid slices the bound signal's canonical (R,P,*data_shape) block; got shape "
                 f"{block.shape} -- bind a measurement's block signal (not a scalar).")
         pts, _ = self._facet_value_shapes()
         if int(np.prod(pts, dtype=np.int64) if pts else 0) != int(block.shape[1]):
@@ -2678,7 +2648,7 @@ class PanelCard(FluentGroupBox):
         # placeholders (broadcast views -- never a materialised full-size frame), so the grid holds
         # a constant ring cells from the first shot: not-yet-taken cells render blank (NaN), filled
         # cells stream through the in-place update_cells fast path, and the cell-count cap fires
-        # immediately.  Only the repeat facet pads: a points/dim facet's cell count is a declared
+        # immediately.  Only the repeat facet pads: a points/data facet's cell count is a declared
         # shape, not the fill state.
         spec = normalize_facet(self._facet())
         if spec is not None and spec[0] == "repeat" and cells:
@@ -2701,14 +2671,14 @@ class PanelCard(FluentGroupBox):
         # the labels EXPLICITLY, derived from the bound facet + its points shape through the ONE
         # ``facet_cell_labels`` source -- so a repeat / scan / site grid's cells read 'rep k' / a scan
         # coordinate / 's k' instead of a hardcoded site tag, from the same source the notebook path uses.
-        pts, dim = self._facet_value_shapes()
+        points_shape, data_shape = self._facet_value_shapes()
         # The swept axis NAMES + per-cell COORDINATES are metadata of the producing SCAN NODE and the
         # facet spec -- NOT of the value expression -- so they are fetched UNGATED: even a transforming
         # value (``np.log(f)``, ``a-b``) still faceted on scan axis i, so cell k is still scan point k
         # of axis i and its coordinate is known.  (``_bound_structure`` is identity-gated because it
         # drives the value's SHAPE reshape, a DIFFERENT concern; the scan names/coordinates never
         # change under a value transform -- gating them there was the root cause of the ``pt k``
-        # fallback.)  ``param_names`` are needed for EVERY facet group -- a repeat / dim facet's cells
+        # fallback.)  ``param_names`` are needed for EVERY facet group -- a repeat / data facet's cells
         # keep the scan axes as their remaining x/y (#6) -- while the per-cell COORDS label only a
         # POINTS facet's cells (``Bz=1.2`` instead of a bare ``pt k``).
         from .live import normalize_facet
@@ -2726,7 +2696,7 @@ class PanelCard(FluentGroupBox):
                     axis = int(spec[1])
                     if axis < len(all_coords) and len(all_coords[axis]) == len(cells):
                         coords = all_coords[axis]
-        cell_labels = facet_cell_labels(self._facet(), len(cells), points_shape=pts,
+        cell_labels = facet_cell_labels(self._facet(), len(cells), points_shape=points_shape,
                                         coords=coords, param_names=names)
         plotter = build_facet_grid(
             cells, sub_plot_kind=sub, size=self.config.size, cell_labels=cell_labels,
@@ -2735,8 +2705,9 @@ class PanelCard(FluentGroupBox):
             # label), degrading to the kind's stock defaults when the metadata is unknown.  The
             # console pre-slices (facet=None to the factory), so it hands the labels explicitly --
             # the same derivation the notebook ``grid(value, facet=...)`` path runs inside.
-            labels=facet_axis_labels(self._facet(), sub, points_shape=pts, data_shape=dim,
-                                     param_names=names, value_label=self._source_axis_label()),
+            labels=facet_axis_labels(
+                self._facet(), sub, points_shape=points_shape, data_shape=data_shape,
+                param_names=names, value_label=self._source_axis_label()),
             display=False, interactions=interactions, title=self.config.title or "")
         # Fold the persisted display knobs in with the draws SUSPENDED.  Each ``apply_param`` otherwise
         # forces a synchronous N-cell repaint, so ~10 keys = up to 10 full grid ``draw()``s per build --
@@ -2745,7 +2716,7 @@ class PanelCard(FluentGroupBox):
         # plotter is built ``display=False``), exactly as the non-facet grid path.
         with plotter.suspend_draws():
             for key in ([d.key for d in _panel_display_decls("grid", sub)]
-                        + ["relim", "fixed_lo", "fixed_hi", "view_xlim", "view_ylim", "fit_model", "fit_cmd"]):
+                        + ["relim", "fixed_lo", "fixed_hi", "view_xlim", "view_ylim", "fit_request"]):
                 if key == "cmap":
                     # Inject the RESOLVED cmap (operator's pick ELSE the sub-kind's declared PANEL_PARAMS
                     # default) through the ONE ``_resolved_cmap`` resolver -- the SAME source the Setting
@@ -2757,7 +2728,7 @@ class PanelCard(FluentGroupBox):
                     plotter.apply_param(key, self.config.params[key])
         return plotter
 
-    def _facet_choices(self) -> list[tuple[str, str, bool]]:
+    def _facet_choices(self) -> list[tuple[str | None, str, bool]]:
         """The facet dropdown's ``[(stored value, display text, enabled)]`` -- derived from the
         producing node's declared axis structure, with the axis LENGTH shown so the operator picks
         by meaning ('scan axis 0 (5)').  An axis longer than :data:`MAX_GRID_CELLS` is listed but
@@ -2766,22 +2737,22 @@ class PanelCard(FluentGroupBox):
         from .live import MAX_GRID_CELLS
         out = []
         if self._grid_recipe_or_none() is not None:
-            out.append(("", "(saved figure)", True))
+            out.append((None, "(saved figure)", True))
         out.append(("repeat", "repeat", True))
 
         def _axis(value, text, n):
             ok = int(n) <= MAX_GRID_CELLS
             out.append((value, text if ok else f"{text} – too many", ok))
 
-        pts, dim = self._facet_value_shapes()
-        if len(pts) > 1:
-            for i, n in enumerate(pts):
+        points_shape, data_shape = self._facet_value_shapes()
+        if len(points_shape) > 1:
+            for i, n in enumerate(points_shape):
                 _axis(f"points:{i}", f"scan axis {i} ({n})", n)
-        elif pts and pts[0] > 1:
-            _axis("points:0", f"scan axis 0 ({pts[0]})", pts[0])
-        for i, n in enumerate(dim):
+        elif points_shape and points_shape[0] > 1:
+            _axis("points:0", f"scan axis 0 ({points_shape[0]})", points_shape[0])
+        for i, n in enumerate(data_shape):
             if n > 1:
-                _axis(f"dim:{i}", f"data axis {i} ({n})", n)
+                _axis(f"data:{i}", f"data axis {i} ({n})", n)
         return out
 
     def _refresh_facet_combo(self) -> None:
@@ -2808,11 +2779,17 @@ class PanelCard(FluentGroupBox):
         """The operator picked a facet axis: persist + rebuild.  A facet change is a STRUCTURE change
         (the cell count and even the per-cell kind may differ), so it goes through the ordinary reset
         path -- the generic refocus rule returns to the enlarged cell when it survives the rebuild."""
-        value = str(self.facet_combo.itemData(int(index)) or "")
+        raw_value = self.facet_combo.itemData(int(index))
+        value = None if raw_value is None else str(raw_value)
+        if value is not None:
+            normalize_facet(value)
         if value == self._facet():
             return
         self._wait_render_idle()   # the teardown+rebuild below must own the figure (ownership protocol)
-        self.config.params["facet"] = value
+        if value is None:
+            self.config.params.pop("facet", None)
+        else:
+            self.config.params["facet"] = value
         self._reset_plot()
         self._render_version = -1
         self._rerender_last()
@@ -2861,6 +2838,8 @@ class PanelCard(FluentGroupBox):
         self._apply_lim_to_plotter()                     # relim family via the ONE in-place entry
         self._apply_unit()
         self._apply_view_lims()
+        if "fit_request" in self.config.params:
+            self.plotter.apply_param("fit_request", self.config.params.get("fit_request"))
 
     def _apply_view_lims(self) -> None:
         """Re-apply the persisted view-window pins (#3) to the LIVE plotter through the SAME
@@ -3043,6 +3022,100 @@ class PanelCard(FluentGroupBox):
         finally:
             self.setUpdatesEnabled(True)
 
+    def current_selection(self):
+        """Return this panel's selection in the displayed coordinate frame."""
+
+        from ..neutral_atom.core.selection import Selection
+
+        selection = self._active_selection
+        if selection is None:
+            payload = self.config.params.get("selection")
+            if isinstance(payload, Mapping):
+                selection = Selection.from_dict(payload)
+        if selection is None and self.plotter is not None:
+            selection = self.plotter.to_data_figure().selection()
+        if selection is None:
+            selection = Selection()
+        metadata = dict(selection.metadata)
+        roi = getattr(self, "_roi_built", None)
+        if roi and len(roi) >= 4:
+            metadata["origin"] = [float(roi[0]), float(roi[2])]
+        scope = selection.scope
+        if self._grid_focus is not None:
+            scope = (*scope, f"cell:{int(self._grid_focus.k)}")
+        return Selection(selection.ranges, frame=selection.frame, scope=scope, metadata=metadata)
+
+    def _selected_fit_model(self) -> str | None:
+        combo = getattr(self, "fit_model_combo", None)
+        if combo is None:
+            return None
+        value = combo.currentData()
+        return str(value) if value else None
+
+    def _set_fit_result_text(self, result=None) -> None:
+        label = getattr(self, "fit_result_label", None)
+        if label is None:
+            return
+        result = result if result is not None else getattr(self.plotter, "_last_fit_result", None)
+        if result is None:
+            label.setText("not fitted")
+        elif result.valid:
+            quality = result.quality
+            label.setText(
+                f"ok · {result.n_points} points · R²={quality.get('r2', float('nan')):.4g} · "
+                f"RMSE={quality.get('rmse', float('nan')):.4g}")
+        else:
+            label.setText(f"invalid · {result.status}")
+
+    def _apply_fit_request(self) -> None:
+        """Apply one request to both the live overlay and processor sink."""
+
+        model = self._selected_fit_model()
+        if not model:
+            return
+        from ..neutral_atom.core.fitting import FitRequest
+
+        selection = self.current_selection()
+        request = FitRequest(model, selection=selection, coordinate_frame=selection.frame)
+        self.config.params["selection_action"] = "fit"
+        combo = getattr(self, "selection_action_combo", None)
+        if combo is not None:
+            index = combo.findData("fit")
+            if index >= 0:
+                combo.blockSignals(True); combo.setCurrentIndex(index); combo.blockSignals(False)
+        self._set_param("fit_request", request.to_dict())
+        toggle = getattr(self, "fit_toggle", None)
+        if toggle is not None and not toggle.isChecked():
+            toggle.blockSignals(True); toggle.setChecked(True); toggle.blockSignals(False)
+        if callable(self.area_select_sink):
+            self.area_select_sink(self, selection)
+        self._set_fit_result_text()
+
+    def _clear_fit_request(self) -> None:
+        self._set_param("fit_request", None)
+        if self.config.params.get("selection_action") == "fit":
+            self.config.params["selection_action"] = "none"
+        toggle = getattr(self, "fit_toggle", None)
+        if toggle is not None and toggle.isChecked():
+            toggle.blockSignals(True); toggle.setChecked(False); toggle.blockSignals(False)
+        self._set_fit_result_text(None)
+        label = getattr(self, "fit_result_label", None)
+        if label is not None:
+            label.setText("cleared")
+
+    def _on_fit_toggled(self, checked: bool) -> None:
+        if checked:
+            self._apply_fit_request()
+        else:
+            self._clear_fit_request()
+
+    def _on_selection_action_changed(self, _index: int) -> None:
+        combo = getattr(self, "selection_action_combo", None)
+        if combo is None:
+            return
+        self.config.params["selection_action"] = str(combo.currentData() or "none")
+        self.changed.emit()
+
     def _set_param(self, key: str, value) -> None:
         """A declarative parameter edit: store, apply, mark dirty.
 
@@ -3208,8 +3281,8 @@ class PanelCard(FluentGroupBox):
             self.set_status("pick a signal in Setting", error=False)
             return True
         try:
-            # The three decoupled stages (#H3l): signal (per data_points slice) -> repeat reduce
-            # (the measurement's own repeat axis, per the plot's repeat_mode) -> dim split.  The
+            # The three decoupled stages (#H3l): signal (per physical P slice) -> repeat reduce
+            # (the measurement's own repeat axis, per the plot's repeat_mode) -> data-axis split.  The
             # measurement OWNS ``repeat``; the plot only chooses how to display it.
             value = self._signal_then_repeat(namespace)
             if offthread and self._needs_structural_build(value, namespace):
@@ -3255,16 +3328,7 @@ class PanelCard(FluentGroupBox):
         return SignalExpr(self.config.inputs, self._compiled_source)
 
     def _signal_then_repeat(self, namespace: Mapping[str, object]):
-        """The decoupled plot pipeline.  The MEASUREMENT owns the repeat axis: it publishes a RAW
-        block whose LEADING axis is the repeat (a 1-D scan's ``(repeat, points, dim)``, a camera's
-        ``(repeat, H, W)``); a node with no repeat publishes a plain value (a curve / image / scalar).
-
-        The plot runs the ``value = ...`` expression PER REPEAT (``signal`` = that repeat's whole
-        core -- the (H, W) frame, or the (points, dim) curve -- so the user can write ``value =
-        signal[0]`` etc.); ONLY the repeat axis is looped, so it stays decoupled.  Then ``repeat_mode``
-        reduces the repeat axis (average = the long-exposure mean over the repeats that have data, add
-        = sum, create = one line per repeat, ...).  ``_repeat_cur`` (how many repeats hold data) drives
-        the plotter's "xN" ylabel."""
+        """Evaluate and reduce canonical signal tensors without rank inference."""
         from .live import reduce_repeat, repeats_with_data
         # A pulse panel's ``value`` is a STRUCTURED object (a sequence / PulseTableState), not an array --
         # it has no repeat axis and must NOT be float-coerced.  Read the bound signal (or the ``value =
@@ -3274,92 +3338,90 @@ class PanelCard(FluentGroupBox):
         if self.config.kind == "pulse":
             self._repeat_cur = 1
             return self._signal_expr().evaluate(namespace)
-        mode = self._repeat_mode_value()                          # clamped to this kind's valid modes (#issue-1)
-        # core_ndim of the bound signal (a Judge-occupancy output declares its OWN per-signal structure,
-        # so its clean ``(repeat, n_sites)`` block is collapsed by STRUCTURE, not an ndim guess; camera /
-        # scan stay on the legacy ndim>=3 path with core_ndim=None) -- #H3s-F3.
-        core_ndim = self._bound_core_ndim()
-        block, had_repeat = self._eval_signal_per_slice(namespace, core_ndim=core_ndim)
-        if isinstance(block, (list, tuple)):                      # a free expression returned a list
-            self._repeat_cur = 1
-            return np.asarray(block, dtype=float)
-        b = np.asarray(block)                                     # NATIVE dtype: a uint8 camera block must
-        if b.dtype.kind not in "iubf":                            # not balloon to float64 here (17.6 MiB/frame);
-            b = np.asarray(b, dtype=float)                        # only non-numeric results normalize to float
-        if had_repeat and self.config.kind == "1d" and core_ndim is None and b.ndim == 2:
-            b = b[:, :, None]                                     # legacy (repeat, points) -> add dim axis
-        # a repeat block (axis 0 = repeat) -- structure-driven when core_ndim is declared, else ndim>=3
-        if had_repeat and (b.ndim == 1 + core_ndim if core_ndim is not None else b.ndim >= 3):
-            self._repeat_cur = repeats_with_data(b, core_ndim=core_ndim)   # scan / camera / occupancy block
-            if self.config.kind == "grid" and self._facet():
-                # A FACET grid owns the repeat axis ITSELF: facet=repeat slices it into cells, and any
-                # other facet collapses the leftover repeats INSIDE facet_cells (per repeat_mode) --
-                # reducing here would hand the slicer a block whose repeat axis is already gone
-                # (facet=repeat would always show ONE cell).
+        mode = self._repeat_mode_value()
+        structure = self._bound_structure()
+        if structure is not None:
+            block = self._signal_expr().evaluate(namespace)
+            b = self._validate_canonical_block(block, structure, self.config.inputs[0])
+            valid = (namespace.get(SIG_VALID_KEY, {}) or {}).get(self.config.inputs[0])
+            self._repeat_cur = repeats_with_data(b, valid=valid)
+            if self.config.kind == "grid":
                 return b
-            # ONE reducer dispatches on the chosen mode; the only kind input is hist=, because a histogram
-            # has NO x-axis in its core (#iron-law): every non-pool reduction flattens to one sample set,
-            # and 'create' keeps each repeat's whole core as a column (n_samples, R) -- a trace's create
-            # instead keeps the points axis.  A trace/image block and a hist block can be the SAME ndim
-            # ((R, points, dim) vs (R, 1, n_sites)), so the kind, not the shape, picks the layout.
-            return reduce_repeat(b, mode, core_ndim=core_ndim, hist=(self.config.kind == "hist"))
-        self._repeat_cur = 1                                      # no repeat axis -> nothing to reduce
-        return b
+            return reduce_repeat(
+                b, mode, valid=valid, hist=(self.config.kind == "hist"))
 
-    def _eval_signal_per_slice(self, namespace: Mapping[str, object], *, core_ndim=None):
-        """Run the ``value`` expression once PER REPEAT and re-stack -> ``(repeat, *result), True``.
-        Every signal the expression reads that carries a repeat axis (the bound ``signal`` AND any
-        raw hub signal the source names directly, e.g. ``value = frame_0``) is presented as that
-        repeat's whole core -- the (H, W) frame / the (points, dim) curve -- so the user can process
-        it (``signal[0]``, ``frame.mean()``, ...) while the repeat axis stays OUTSIDE the expression.
-        When nothing read has a repeat axis (a single frame / curve / scalar) the expression runs
-        once -> ``value, False``.  The default ``value = signal`` on one bound block short-circuits.
+        block, had_repeat, valid = self._eval_signal_per_slice(namespace)
+        b = np.asarray(block)
+        if b.dtype.kind not in "iubf":
+            b = np.asarray(b, dtype=float)
+        if not had_repeat:
+            self._repeat_cur = 1
+            return b
+        self._repeat_cur = repeats_with_data(b, valid=valid)
+        return reduce_repeat(b, mode, valid=valid, hist=(self.config.kind == "hist"))
 
-        WHETHER the bound ``signal`` carries a repeat axis is STRUCTURE-driven when its producing signal
-        declares ``core_ndim`` (a clean occupancy ``(repeat, n_sites)`` is ndim ``1 + 1``, #H3s-F3);
-        camera / scan slots (core_ndim None) keep the ndim>=3 rule."""
-        from ..neutral_atom.operations.signal_expr import DEFAULT_SOURCE
+    @staticmethod
+    def _validate_canonical_block(value, structure, name="signal") -> np.ndarray:
+        array = np.asarray(value)
+        point_shape = tuple(int(n) for n in structure["points_shape"])
+        data_shape = tuple(int(n) for n in structure["data_shape"])
+        points = int(np.prod(point_shape, dtype=np.int64))
+        expected_tail = (points, *data_shape)
+        if array.ndim != 1 + len(expected_tail) or tuple(array.shape[1:]) != expected_tail:
+            raise ValueError(
+                f"signal {name!r} violates its canonical schema: expected (R,{points},"
+                f"{','.join(map(str, data_shape))}), got {array.shape}")
+        return array
 
-        def _slot_has_repeat(s) -> bool:
-            if s is None:
-                return False
-            return np.ndim(s) == 1 + int(core_ndim) if core_ndim is not None else np.ndim(s) >= 3
-
+    def _eval_signal_per_slice(self, namespace: Mapping[str, object]):
+        """Evaluate a transformed expression once per declared R slice."""
         expr = self._signal_expr()
-        # A panel reads EXACTLY the signal it is bound to -- no rewrite.  A camera's `frame` shows the
-        # camera's own (repeat, 1, H, W) block (so average/create work), INDEPENDENT of any Judge
-        # processor (a Judge is a separate reactive node; its `frame_judged` is its OWN output, bound
-        # explicitly when wanted).  The site-map underlay coherence is handled separately (#_sites_aux).
         sig = expr.signal_for(namespace)
         slots = sig if isinstance(sig, list) else [sig]
-        # raw hub signals the source TEXT names directly (not via ``signal``) that carry a repeat
-        # axis -- these are NOT the bound signal, so they keep the ndim>=3 rule (no per-signal
-        # core_ndim for them).  MUST be direct_names(), never co_names(): co_names folds the bound
-        # inputs in for version-gating, and treating the bound slot as a "raw" name here disabled
-        # the identity zero-copy path below for EVERY bound panel (a 17.6 MiB float64 stack of the
-        # camera frame per panel per tick).
-        raw_names = [n for n in expr.direct_names()
-                     if n != "signal" and np.ndim(namespace.get(n)) >= 3]
-        sig_rep = bool(slots) and all(_slot_has_repeat(s) for s in slots)
-        if not sig_rep and not raw_names:                         # no repeat axis -> evaluate once
+        structured: dict[str, tuple[np.ndarray, Mapping[str, object]]] = {}
+        for name, value in zip(self.config.inputs, slots):
+            structure = self.structure_provider(name) if callable(self.structure_provider) and name else None
+            if structure is not None:
+                structured[f"slot:{len(structured)}"] = (
+                    self._validate_canonical_block(value, structure, name), structure)
+        raw_names = []
+        for name in expr.direct_names():
+            if name == "signal" or name not in namespace:
+                continue
+            structure = self.structure_provider(name) if callable(self.structure_provider) else None
+            if structure is not None:
+                structured[f"raw:{name}"] = (
+                    self._validate_canonical_block(namespace[name], structure, name), structure)
+                raw_names.append(name)
+        if not structured:
             ns = dict(namespace); ns["signal"] = sig
-            return expr.exec_in(ns), False
-        if sig_rep and not raw_names and len(slots) == 1 \
-                and str(self._compiled_source).strip() == DEFAULT_SOURCE:
-            return np.asarray(slots[0]), True                     # identity: the block IS the value, NATIVE
-        # dtype (a uint8 camera block passes through untouched -- no float64 balloon per tick)
-        raw = {n: np.asarray(namespace[n], dtype=float) for n in raw_names}
-        sl = [np.asarray(s, dtype=float) for s in slots] if sig_rep else None
-        R = int((sl[0] if sig_rep else raw[raw_names[0]]).shape[0])
+            return expr.exec_in(ns), False, None
+        repeats = {array.shape[0] for array, _structure in structured.values()}
+        if len(repeats) != 1:
+            raise ValueError(f"expression inputs have incompatible repeat sizes {sorted(repeats)}")
+        repeat = repeats.pop()
+        valid_by_name = namespace.get(SIG_VALID_KEY, {}) or {}
+        repeat_valid = np.ones(repeat, dtype=bool)
+        for name in (*self.config.inputs, *raw_names):
+            mask = valid_by_name.get(name)
+            if mask is not None:
+                mask = np.asarray(mask, dtype=bool)
+                if mask.ndim != 2 or mask.shape[0] != repeat:
+                    raise ValueError(f"signal {name!r} validity must be (R,P); got {mask.shape}")
+                repeat_valid &= mask.any(axis=1)
 
         def _run(r):
             ns = dict(namespace)
-            for n, a in raw.items():
-                ns[n] = a[r]                                       # slice each named block to this repeat
-            ns["signal"] = (sl[0][r] if len(sl) == 1 else [a[r] for a in sl]) if sl is not None else sig
+            for name in raw_names:
+                ns[name] = np.asarray(namespace[name])[r]
+            sliced_slots = []
+            for name, value in zip(self.config.inputs, slots):
+                structure = self.structure_provider(name) if callable(self.structure_provider) and name else None
+                sliced_slots.append(np.asarray(value)[r] if structure is not None else value)
+            ns["signal"] = sliced_slots[0] if len(sliced_slots) == 1 else sliced_slots
             return np.asarray(expr.exec_in(ns), dtype=float)
 
-        return np.stack([_run(r) for r in range(R)], axis=0), True
+        return np.stack([_run(r) for r in range(repeat)], axis=0), True, repeat_valid[:, None]
 
     def _bound_structure(self):
         """The producing node's ``{points_shape, data_shape, grid_shape}`` for this panel's bound
@@ -3379,19 +3441,6 @@ class PanelCard(FluentGroupBox):
             return self.structure_provider(self.config.inputs[0])
         except Exception:
             return None
-
-    def _bound_core_ndim(self):
-        """``core_ndim`` (= len(points)+len(data)) for the bound signal, fed to ``reduce_repeat`` /
-        ``repeats_with_data`` so the LEADING repeat axis is collapsed by STRUCTURE (#H3s-F3) -- a clean
-        occupancy ``(repeat, n_sites)`` (ndim 2, core_ndim 1) IS a repeat block where a bare ndim guess
-        would miss it.  Returned ONLY when the bound signal declares its OWN per-signal structure (a
-        Judge-occupancy output): for camera / scan signals (node-level structure, ``per_signal`` False)
-        this returns ``None`` so ``reduce_repeat`` keeps the legacy ndim>=3 rule byte-identically.
-        ``None`` too for a custom expression (``_bound_structure`` already gates on identity source)."""
-        st = self._bound_structure()
-        if st is None or not st.get("per_signal"):
-            return None
-        return int(st.get("core_ndim", 0))
 
     def _coerce(self, value):
         # The per-kind reshape (image / lines / samples / one-value-per-site) lives WITH the plots
@@ -3425,20 +3474,26 @@ class PanelCard(FluentGroupBox):
                 f"site map needs the centres from `{occ}`'s producing node -- point it at an occupancy "
                 "signal from a Judge-occupancy processor (it publishes occupied + centres + frame).")
         centers = np.asarray(centers, dtype=float)
-        if centers.ndim != 2 or centers.shape[1] < 2:
-            raise ValueError(f"centres signal must have shape (N, 2); got {centers.shape}")
+        if centers.ndim != 4 or centers.shape[:2] != (1, 1) or centers.shape[-1] != 2:
+            raise ValueError(
+                "centres signal must be canonical (1,1,N,2) with data_shape=(N,2); "
+                f"got {centers.shape}")
+        centers = centers[0, 0]
         image = namespace.get(image_name) if image_name else None
         if image is not None:
             image = np.asarray(image, dtype=float)
-            if image.ndim >= 3:        # a (repeat, H, W) frame_judged block -> ONE coherent (H,W) underlay
-                from .live import reduce_repeat
-                # The underlay obeys the SAME ``repeat_mode`` Setting as the occupancy rings (#H3u-3):
-                # average = a long-exposure mean over the kept frames (coherent with the averaged
-                # occupancy), replace/roll = the latest frame, add = the summed frame.  A 2-D image
-                # cannot be per-repeat lines, so 'create' falls back to the latest (exactly as a 2-D
-                # panel offers no 'create') -- the rings and the frame are always the same reduction.
-                mode = self._repeat_mode_value()      # the ONE clamped reader (#A2)
-                image = np.squeeze(reduce_repeat(image, "replace" if mode == "create" else mode))
+            if image.ndim != 4 or image.shape[1] != 1:
+                raise ValueError(
+                    "site underlay must be canonical (R,1,H,W) with data_shape=(H,W); "
+                    f"got {image.shape}")
+            from .live import reduce_repeat
+            # Reduce only the declared repeat axis.  P remains explicit until we
+            # select its sole point; no squeeze/rank guess is involved.
+            mode = self._repeat_mode_value()
+            valid = (namespace.get(SIG_VALID_KEY, {}) or {}).get(image_name)
+            image = reduce_repeat(
+                image[:, 0], "replace" if mode == "create" else mode, valid=valid)
+            image = np.asarray(image).reshape(image.shape[-2:])
         return centers[:, :2], image
 
     def _co_names(self) -> frozenset:
@@ -3513,40 +3568,59 @@ class PanelCard(FluentGroupBox):
             # mutate artists.  Hung here because this is the ONE apply point every build / focus
             # swap converges on, so a fresh or enlarged canvas always carries it (idempotent).
             canvas._zlc_render_barrier = self.render_barrier
-        # The LIVE-board ROI gesture: an armed area selector on an IMAGE panel forwards its
-        # released rectangle to the console's ROI-chain sink.  Wired at this same one apply
-        # point so every (re)build inherits it; OFF (or a non-image kind / an enlarged grid
-        # cell) unhooks, leaving the selector display-only exactly as before.
-        tools = getattr(getattr(plotter, "fig", None), "_zlc_tools", None)
-        area = getattr(tools, "area", None)
-        if area is not None:
-            wire = (on and self.config.kind == "2d" and self._grid_focus is None
-                    and callable(self.area_select_sink))
-            area.callback = self._forward_area_select if wire else None
+        # Every family exposes the same DATA-selection callback.  Its DataFigure
+        # adapter determines whether the gesture means x, xy, or value bounds;
+        # selecting alone never implies either fit or ROI.
+        bundles = list(getattr(getattr(plotter, "fig", None), "_zlc_grid_tools", ()) or ())
+        if bundles:
+            for cell_index, bundle in enumerate(bundles):
+                area = getattr(bundle, "area", None)
+                if area is not None:
+                    area.callback = (lambda k=cell_index: self._forward_area_select(k)) \
+                        if on and callable(self.area_select_sink) else None
+        else:
+            tools = getattr(getattr(plotter, "fig", None), "_zlc_tools", None)
+            area = getattr(tools, "area", None)
+            if area is not None:
+                area.callback = self._forward_area_select \
+                    if on and callable(self.area_select_sink) else None
 
-    def _forward_area_select(self) -> None:
-        """The armed LIVE-board area selector released on this image panel: forward the drawn
-        rectangle to the console's ROI-chain sink IN THE DISPLAYED FRAME'S OWN PIXELS.  The
-        selector yields AXIS coordinates -- and this panel's axes carry the producing node's
-        declared ``region`` origin (a ROI crop's panel shows camera x 500..700, a hardware
-        sub-array camera shows sensor pixels) -- while a CONSUMING RoiProcessor's region params
-        are local frame pixels (``_bounds`` clips against 0..w).  Subtract the axis origin the
-        panel was built with (``_roi_built``, the same source ``_render`` used), so an
-        ROI-of-ROI / sub-array drag crops exactly the drawn box; an origin-(0, 0) panel is
-        unchanged.  A cleared/degenerate drag (range None) is just a deselect: never forwarded,
-        never resets a node."""
-        tools = getattr(getattr(self.plotter, "fig", None), "_zlc_tools", None)
+    def _forward_area_select(self, cell_index: int | None = None) -> None:
+        """Persist and forward one plot-independent selection.
+
+        The displayed coordinate frame is retained for fitting.  Conversion to
+        local frame indices belongs exclusively to the explicit ROI action.
+        """
+        bundles = list(getattr(getattr(self.plotter, "fig", None), "_zlc_grid_tools", ()) or ())
+        tools = bundles[int(cell_index)] if cell_index is not None and int(cell_index) < len(bundles) \
+            else getattr(getattr(self.plotter, "fig", None), "_zlc_tools", None)
         rng = list(getattr(getattr(tools, "area", None), "range", None) or [None] * 4)
         if any(v is None for v in rng):
             return
-        x_min, x_max, y_min, y_max = (float(v) for v in rng)
+        data_figure = self.plotter.to_data_figure()
+        target = data_figure.cell(int(cell_index)) if cell_index is not None else data_figure
+        selection = target.selection()
+        metadata = dict(selection.metadata)
         roi = self._roi_built
         if roi and len(roi) >= 4:
-            x0, y0 = float(roi[0]), float(roi[2])
-            x_min, x_max, y_min, y_max = x_min - x0, x_max - x0, y_min - y0, y_max - y0
-        self.area_select_sink(self, (x_min, x_max, y_min, y_max))
+            metadata["origin"] = [float(roi[0]), float(roi[2])]
+        scope = selection.scope
+        if self._grid_focus is not None and not any(
+                item == f"cell:{int(self._grid_focus.k)}" for item in scope):
+            scope = (*scope, f"cell:{int(self._grid_focus.k)}")
+        self._active_selection = type(selection)(
+            selection.ranges, frame=selection.frame, scope=scope, metadata=metadata)
+        self.config.params["selection"] = self._active_selection.to_dict()
+        self.changed.emit()
+        self.area_select_sink(self, self._active_selection)
 
-    def _needs_structural_build(self, value, namespace: Mapping[str, object] | None) -> bool:
+    def _needs_structural_build(
+        self,
+        value,
+        namespace: Mapping[str, object] | None,
+        *,
+        value_is_coerced: bool = False,
+    ) -> bool:
         """Whether rendering ``value`` requires (re)building the plotter -- a Qt-widget operation
         ONLY the GUI thread may run.  False -> a pure in-place artist update (thread-agnostic).
         The ONE dirtiness rule: ``_render`` dispatches on it AND the render thread probes it
@@ -3560,7 +3634,8 @@ class PanelCard(FluentGroupBox):
             return True                     # a pulse panel rebuilds its structured figure every refresh
         if self.plotter is None or self._force_rebuild:
             return True
-        value = self._coerce(value)
+        if not value_is_coerced:
+            value = self._coerce(value)
         if kind == "grid":
             if self._facet():
                 # A cell-count change (the scan restructured) rebuilds through build-then-swap.
@@ -3604,9 +3679,18 @@ class PanelCard(FluentGroupBox):
                     if self.plotter is not None:
                         self.plotter.compose()
             return
-        value = self._coerce(value)
+        # A recipe grid is a frozen artifact, not a view of this tick's scalar placeholder.
+        # Once built, steady refreshes return before the canonical signal coercer (which correctly
+        # rejects the numeric placeholder as grid data).  The FIRST tick and an explicit rebuild must
+        # continue into ``_build_plot`` so the recipe carried by the producing node actually becomes a
+        # plotter; the placeholder is intentionally ignored by that build branch.
+        recipe_grid = self.config.kind == "grid" and not self._facet()
+        if recipe_grid and self.plotter is not None and not self._force_rebuild:
+            return
+        if not recipe_grid:
+            value = self._coerce(value)
         kind = self.config.kind
-        if self._needs_structural_build(value, namespace):
+        if self._needs_structural_build(value, namespace, value_is_coerced=True):
             # STRUCTURAL (re)build -- creates the plotter + its Qt canvas, so this branch runs on
             # the GUI thread only (compose(offthread=True) hands such panels back to the board).
             # A pulse panel renders a STRUCTURED figure (a whole timeline) from its sequence
@@ -3780,18 +3864,16 @@ class PanelCard(FluentGroupBox):
             # carry, so it is resolved off the producing node via ``grid_recipe_provider`` -- the SAME "aux
             # data from the producing node" wiring the pulse panel + site map use (the hub ``value`` here is
             # only a numeric placeholder).  Its geometry (cell count-driven size) is frontend-owned.
-            # A GRID stays interactions=False even under the "Selectors" switch: GridPlot's own
-            # _attach_interactions wires a canvas-level double-click focus-zoom that would DOUBLE-FIRE
-            # against this card's _on_grid_canvas_click (two competing focus mechanisms).  The grid's
-            # interactive surface is its ENLARGED cell (see _focus_grid_cell), which builds WITH
-            # selectors and follows the switch like any standalone panel.
+            # Build every cell's selector bundle; the card disables GridPlot's
+            # notebook focus callback below so its own focus host remains the sole
+            # double-click owner.
             facet = self._facet()
             if facet:
                 # A FACET grid: the bound block IS the data -- slice it along the declared axis
                 # (facet_cells, the ONE rule) and build through the ONE shared builder (the Edit-tab
                 # snapshot uses the same one); every tick after this first build moves the cells in
                 # place (update_cells in _render).
-                plotter = self._build_facet_plotter(value, interactions=False)
+                plotter = self._build_facet_plotter(value, interactions=True)
             else:
                 from .live import build_grid_figure
 
@@ -3803,7 +3885,11 @@ class PanelCard(FluentGroupBox):
                         "fig_value signal) -- or pick a facet in Setting to expand a measurement "
                         "block's axis into cells.")
                 recipe = self._grid_recipe_with_params(recipe)   # fold the panel's live display knobs in
-                plotter = build_grid_figure(recipe, interactions=False, size=size, display=False)
+                plotter = build_grid_figure(recipe, interactions=True, size=size, display=False)
+            click_cid = getattr(plotter, "_click_cid", None)
+            if click_cid is not None:
+                plotter.fig.canvas.mpl_disconnect(click_cid)
+                plotter._click_cid = None
         elif kind == "sites":
             centers, image = self._sites_aux(namespace or {})
             vec = np.asarray(value, dtype=float).reshape(-1)
@@ -3833,8 +3919,8 @@ class PanelCard(FluentGroupBox):
             else:
                 x0, y0 = 0.0, 0.0
                 xlabel, ylabel = "X (px)", "Y (px)"
-            xx, yy = np.meshgrid(x0 + np.arange(nx, dtype=float), y0 + np.arange(ny, dtype=float))
-            data_x = np.column_stack([xx.ravel(), yy.ravel()])
+            from ..neutral_atom.core.raster import RegularRaster
+            data_x = RegularRaster((ny, nx), origin=(x0, y0))
             plotter = panel_plot(
                 data_x, arr.ravel(), kind="2d", size=size, interactions=True,
                 cmap=_resolved_cmap("2d", self.config.params),   # operator pick, else the kind default (ONE resolver)
@@ -3876,7 +3962,7 @@ class PanelCard(FluentGroupBox):
                 ylabel = str(self.config.params.get("ylabel", "")) or label
             else:
                 # A reduced scan curve is ``(points, ncols)`` -- KEEP it 2-D so each column draws as
-                # its own line (the dimension axis O2, or one line per repeat in ``create`` mode); a
+                # its own line (the one-dimensional data_shape, or one line per repeat in ``create`` mode); a
                 # plain vector stays 1-D (one line).  npts = the point count either way.
                 vec = arr if arr.ndim == 2 else arr.reshape(-1)
                 npts = arr.shape[0] if arr.ndim == 2 else vec.size
@@ -4462,16 +4548,32 @@ class MeasurementPanel(QtWidgets.QWidget):
         src = self._sibling_path_widget(decl)
         path = src.text() if src is not None else ""
         try:
-            from ..neutral_atom.operations.measurements.pulse_scan import _resolve_probe_template
+            from ..neutral_atom.operations.measurements.pulse_scan import (
+                _resolve_probe_template,
+                _semantic_api_names,
+                _semantic_scan_names,
+            )
             state = _resolve_probe_template(path)
         except Exception:
-            widget.rebuild([], [])
+            widget.rebuild([], [], program_id="")
             return
-        api_rows = [(s.name, str(s.kind), str(s.target), str(s.unit), float(state._read_api_field(s)))
-                    for s in state.api_slots]
-        scan_rows = [(f"s{i}", str(s.kind), str(s.target), str(s.unit), s.label)
+        api_names = _semantic_api_names(state)
+        api_rows = [
+            (slot.name, api_names[index], str(slot.kind), str(slot.target), str(slot.unit),
+             float(state._read_api_field(slot)))
+            for index, slot in enumerate(state.api_slots)
+        ]
+        scan_names = _semantic_scan_names(state)
+        scan_rows = [(scan_names[i], str(s.kind), str(s.target), str(s.unit), s.label)
                      for i, s in enumerate(state.scan_slots)]
-        widget.rebuild(api_rows, scan_rows)
+        code = str(getattr(state, "scan_code", "") or "")
+        if not code.strip() and getattr(state, "scan_table", None):
+            code = "scan_table = np.array(" + repr([list(row) for row in state.scan_table]) + ", dtype=float)"
+        payload = state.to_dict()
+        program_id = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()
+        widget.rebuild(api_rows, scan_rows, hardware_program=code, program_id=program_id)
 
     def _repopulate_pulse_param(self, key: str) -> None:
         """Fill a ``pulse_param`` combo from the pulse template named in its ``depends_on``
@@ -4608,7 +4710,7 @@ class MeasurementPanel(QtWidgets.QWidget):
         for key in getattr(self, "_pulse_param_decls", {}):
             self._repopulate_pulse_param(key)
         # A pulse_slots auto-form rebuilds from its template field too: repopulate AFTER seeding so
-        # the rebuild runs with the stash write() left (saved api values + scan_mode + program) and
+        # the rebuild runs with the stash write() left (saved fixed values + hardware program) and
         # the round-trip restores them, regardless of seed order.
         for key in getattr(self, "_pulse_slots_decls", {}):
             self._repopulate_pulse_slots(key)
@@ -4638,8 +4740,8 @@ class PanelEditor(QtWidgets.QWidget):
     Setting popup AND do NOT duplicate it (Setting owns source / size / colormap
     / relim / unit):
 
-      * curve fit  -- model (gated by the panel's plot kind) + free-text args +
-        Fit / Clear, run on the snapshot via :class:`DataFigure`;
+      * curve fit -- a structured model request gated by the plot family,
+        shared with the live overlay and :class:`DataFigure`;
       * manual x/y limits + Save Fig;
       * for a panel that came from a measurement, that measurement's
         AUTO-generated parameter form (the same ParamDecl form the launcher
@@ -4670,7 +4772,6 @@ class PanelEditor(QtWidgets.QWidget):
         self._node_widgets: dict = {}           # acquisition-param name -> editable field
         self._node_now_labels: dict = {}        # acquisition-param name -> "now: X" reference
         self.fit_combo = None
-        self.fit_cmd = None
         self.xmin = self.xmax = self.ymin = self.ymax = None
 
         outer = QtWidgets.QVBoxLayout(self)
@@ -4885,14 +4986,15 @@ class PanelEditor(QtWidgets.QWidget):
             # The general curve fit lists ONLY the models that match this panel's plot family, and appears
             # NOT AT ALL for a kind with its OWN built-in fit (a hist's bimodal): stacking a 1-D peak on a
             # histogram fit the counts with an absurd curve and dimmed the bimodal (#dis-fit mess).  ONE
-            # source (:func:`_fit_labels_for_kind`) drives BOTH whether the section shows and which models it
-            # lists; ``fit_combo``/``fit_cmd`` stay ``None`` (initialised above) when it does not -- ``do_fit``
-            # already no-ops on a ``None`` combo.
-            fit_labels = _fit_labels_for_kind(self.card._param_kind() if self.card is not None else self.config.kind)
-            if fit_labels:
+            # ``_fit_models_for_kind`` drives BOTH whether the section shows and which models it
+            # lists; ``fit_combo`` stays ``None`` when it does not and ``do_fit`` no-ops.
+            fit_models = _fit_models_for_kind(
+                self.card._param_kind() if self.card is not None else self.config.kind)
+            if fit_models:
                 section("Fit")
                 self.fit_combo = FluentComboBox()
-                self.fit_combo.addItems(fit_labels)
+                for model in fit_models:
+                    self.fit_combo.addItem(model.formula, model.key)
                 self.fit_combo.setFixedWidth(scaled_px(150, minimum=120))
                 self.fit_combo.setToolTip(
                     "Curve-fit model for this panel's plot family.  A 2d image offers the 2D-Gaussian\n"
@@ -4905,16 +5007,6 @@ class PanelEditor(QtWidgets.QWidget):
                 model_row = _inline(self.fit_combo, trailing=fit_btn)
                 model_row.layout().addWidget(clear_btn, 0)
                 col.addWidget(FluentSettingRow("model", model_row, label_width=proc_lw))
-                # args on its OWN full-width row (it needs the room; jamming it next to
-                # the combo squeezed both).
-                self.fit_cmd = FluentLineEdit("")
-                self.fit_cmd.setPlaceholderText("p0=[1,0,1,0], B=0.1, is_fit=False")
-                self.fit_cmd.setStyleSheet(self.fit_cmd.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
-                self.fit_cmd.setToolTip(
-                    "Optional fit arguments injected into the call (trusted local code):\n"
-                    "p0=[...] initial guess; NAME=value fixes a named parameter; is_fit=False just overlays p0.")
-                self.fit_cmd.returnPressed.connect(self.do_fit)
-                col.addWidget(FluentSettingRow("args", self.fit_cmd, label_width=proc_lw))
 
             # x/y-range pins (#3): the VIEW window, applied to the LIVE panel AND every grid cell (global,
             # not the snapshot only).  The boxes EDIT THE STORED PIN (``view_xlim``/``view_ylim``), NOT the
@@ -4973,7 +5065,7 @@ class PanelEditor(QtWidgets.QWidget):
 
             # ---- Command: a one-line REPL on the panel's DataFigure (confocal runs the same
             # `data_figure.<fn>(...)` form).  Type e.g. `data_figure.xlim(0, 10)`,
-            # `df.lorentzian(p0=[1,0,1,0])`, `ax.set_title('x')` -- it runs on the snapshot and
+            # `df.fit('gaussian')`, `ax.set_title('x')` -- it runs on the snapshot and
             # the result/exception shows below.  Trusted-local-tool posture (same as the Scan
             # tab / fit args): only run code you wrote.
             section("Command")
@@ -4982,7 +5074,7 @@ class PanelEditor(QtWidgets.QWidget):
             self.cmd_input.setStyleSheet(self.cmd_input.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
             self.cmd_input.setToolTip(
                 "Run a line of Python on this panel's figure.  Names: data_figure / df, fig, ax,\n"
-                "plotter, np.  e.g. df.lorentzian(p0=[1,0,1,0]) ; ax.set_title('x') ; data_figure.xlim(0,10)")
+                "plotter, np.  e.g. df.fit('gaussian') ; ax.set_title('x') ; data_figure.xlim(0,10)")
             cmd_run = FluentButton("Run", color=ACCENT)
             cmd_run.clicked.connect(self._run_command)
             self.cmd_input.returnPressed.connect(self._run_command)
@@ -5517,22 +5609,21 @@ class PanelEditor(QtWidgets.QWidget):
     def do_fit(self) -> None:
         if self.fit_combo is None:
             return
-        entry = FIT_MODELS.get(self.fit_combo.currentText())      # (DataFigure method, render family)
-        if entry is None:
+        model = self.fit_combo.currentData()
+        if not model or self.card is None:
             return
-        method = entry[0]
-        # Fit = two ORDINARY display knobs (the model name + its typed-arg string) applied through the SAME
-        # ``_edit_param`` entry every other knob uses -> the LIVE card (whose ``apply_param`` fans the fit to
-        # every subplot via :func:`live.apply_fit_to_figure` -- a grid re-fits each cell, a flat panel fits
-        # itself) + the snapshot + ``config.params`` + save.  So a grid fit now TAKES EFFECT, STICKS across
-        # ticks, matches the double-click focus, and reopens with the figure (#4) -- no throwaway-snapshot
-        # DataFigure mutation the live grid never saw, no per-kind fanning code here.
-        self._edit_param("fit_cmd", self.fit_cmd.text().strip())
-        self._edit_param("fit_model", method)
+        from ..neutral_atom.core.fitting import FitRequest
+        selection = self.card.current_selection()
+        request = FitRequest(str(model), selection=selection, coordinate_frame=selection.frame)
+        self.card.config.params["selection_action"] = "fit"
+        self._edit_param("fit_request", request.to_dict())
+        self.console._on_panel_area_select(self.card, selection)
         self.status.setText(f"fit {self.fit_combo.currentText()}: applied to all subplots")
 
     def clear_fit(self) -> None:
-        self._edit_param("fit_model", "none")
+        self._edit_param("fit_request", None)
+        if self.card is not None and self.card.config.params.get("selection_action") == "fit":
+            self.card.config.params["selection_action"] = "none"
         self.status.setText("fit cleared")
 
     def refresh_on_show(self) -> None:
@@ -5840,11 +5931,10 @@ class PanelEditor(QtWidgets.QWidget):
             pin = params.get(key)
             if pin:
                 view[key] = [float(pin[0]), float(pin[1])]
-        # the general curve fit (#4) is a cross-kind view knob too: persist the model + its arg string so a
-        # reopened figure redraws the SAME fit on every subplot (omitted while unset, staying unfitted).
-        if str(params.get("fit_model") or "none") != "none":
-            view["fit_model"] = str(params["fit_model"])
-            view["fit_cmd"] = str(params.get("fit_cmd") or "")
+        # The serialized request is the one cross-surface fit state.  It contains
+        # model + Selection + typed options and is safe to round-trip as data.
+        if params.get("fit_request"):
+            view["fit_request"] = dict(params["fit_request"])
         for decl in _panel_display_decls(self.card.config.kind, self.card._param_kind()):
             view[decl.key] = params.get(decl.key, decl.default)
         return view
@@ -6059,8 +6149,8 @@ class LogicNodeEditor(QtWidgets.QWidget):
             # A reactive processor's source picker must not offer the node's OWN outputs -- picking
             # one is the self-feedback loop Processor.__init__ rejects loud at Start; hide it here
             # so the misclick cannot happen (declared keys, #prebind, so it holds before the first
-            # run too).  PROCESSOR rows only: a pulse-scan's y reading its own relayed frame is a
-            # documented PULL pattern and keeps its pick (see _reactive_ring).
+            # run too).  This filter applies only to PROCESSOR rows; acquisition measurements use
+            # their own explicitly bounded input contract (see ``_reactive_ring``).
             def names_provider(_base=names_provider, _console=console, _row=row):
                 own = {str(k) for k in _console._declared_signal_keys(_row)}
                 return [n for n in _base() if str(n) not in own]
@@ -6188,7 +6278,8 @@ class TaskConsole(QtWidgets.QWidget):
         self._running_task_row: "LogicNodeRow | None" = None
         self._task_card: "PanelCard | None" = None
         self._task_mid_key = DEFAULT_MID_RUN_KEY   # which output-buffer key the task panel shows
-        self._task_card_frame = None           # last mid-run frame (kept frozen after the task ends)
+        self._task_output_node = None          # running Task whose typed TaskOutput feeds the panel
+        self._task_card_tensor = None          # immutable latest SignalTensor, including validity
         self._task_locked = False              # True while a task runs -> all other actions blocked
 
         # Multi-rate refresh: the timer ticks at the BASE interval (the smallest panel
@@ -6277,6 +6368,10 @@ class TaskConsole(QtWidgets.QWidget):
         self.name_edit.setPlaceholderText("task name")
         self.name_edit.setFixedWidth(scaled_px(150, minimum=110))
         self.name_edit.textChanged.connect(self._mark_dirty)
+        # Persistent telemetry belongs to the original header: it is orthogonal to the event/status
+        # channel below and therefore never disappears behind a task message or node error.
+        self.summary = FluentLabel("")
+        self.summary.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
         self.kind_combo = FluentComboBox()
         # Add Panel offers EXACTLY the four kinds the user designs with -- nothing
         # invented, no composite:
@@ -6360,10 +6455,7 @@ class TaskConsole(QtWidgets.QWidget):
 
         for widget in (self.status_dot, self.name_edit):
             header.addWidget(widget)
-        # The status readout no longer squats in this stretch slot (a 200-char node error used
-        # to overwrite it and fight the header buttons for width) -- it lives on the PERSISTENT
-        # status strip below the header; the stretch just keeps the action cluster right-aligned.
-        header.addStretch(1)
+        header.addWidget(self.summary, 1)
         # Add Panel stays even when embedded (a loaded figure is re-wired + extra panels added), and so
         # does the Selectors switch (inspecting a loaded figure is exactly when the selectors help);
         # the four whole-console buttons only when they exist.
@@ -6382,10 +6474,10 @@ class TaskConsole(QtWidgets.QWidget):
 
         # PERSISTENT status strip -- the ONE always-visible line between the header and the
         # tabs.  Its content switches by PRIORITY (node error > running task's progress >
-        # display-behind advisory > the idle summary, see _update_summary); the Stop-task
+        # display-behind advisory; idle is empty, see _update_summary); the Stop-task
         # action shows only while a task owns the console.  This replaces BOTH old mechanisms:
         # the transient orange task banner (its show/hide shifted the whole layout under the
-        # pointer) and the header summary label a node error used to overwrite.
+        # pointer).  Header telemetry remains visible independently above it.
         self.status_strip = FluentStatusStrip(action_text="Stop task")
         self.status_strip.action_clicked.connect(self._stop_running_task)
         root.addWidget(self.status_strip)
@@ -6767,6 +6859,9 @@ class TaskConsole(QtWidgets.QWidget):
                     out[str(spec.name)] = (spec.axis_label, spec.unit)
             except Exception:
                 continue
+        task_spec = self._task_mid_run_spec()
+        if task_spec is not None:
+            out[TASK_FRAME_KEY] = (task_spec.axis_label, task_spec.unit)
         return out
 
     def _signal_short_names(self) -> dict:
@@ -6913,20 +7008,11 @@ class TaskConsole(QtWidgets.QWidget):
         for full in sorted(node.published_signals()):
             short = strip_node_prefix(full, pfx)             # ONE rule, shared with the picker nest
             try:
-                # PER-SIGNAL structure (#H3s-F3): a signal whose own SignalSpec declares a points/data
-                # slot (occupied -> 5 × (35); frame_judged -> 5 × (96×128)) shows in CONTRACT form off
-                # ITS structure.  Else the node's PRIMARY block (camera frame, scan y) shows in contract
-                # form off the node-level triple; any other AUX signal (a static centers (35, 2) /
-                # thresholds (35,), a per-trigger frame_i) shows its RAW numpy shape.
-                spec = specs.get(full)
-                primary = full == pfx + str(getattr(node, "primary_signal", "") or "")
-                if spec is not None and getattr(spec, "has_structure", False):
-                    ps, ds, gs = spec.points_shape, spec.data_shape, getattr(node, "grid_shape", ())
-                elif primary:                               # node-level primary block (camera / scan)
-                    ps = getattr(node, "points_shape", ()); ds = getattr(node, "data_shape", ())
-                    gs = getattr(node, "grid_shape", ())
-                else:                                       # an aux signal with no contract slot -> raw shape
-                    ps, ds, gs = None, None, ()
+                schema = self.hub.schema(full)
+                ps, ds = schema.point_shape, schema.data_shape
+                gs = tuple(schema.metadata.get("grid_shape", ()))
+                if not gs and len(ps) == 2:
+                    gs = tuple(ps)
                 shape = describe_shape(self.hub.latest(full), points_shape=ps, data_shape=ds, grid_shape=gs)
             except Exception:
                 shape = "—"
@@ -6987,9 +7073,9 @@ class TaskConsole(QtWidgets.QWidget):
         """The signal-name path of an INDIRECT reactive ring that starting ``start_node`` would
         close (A consumes B's output while B consumes A's), or None.  Walked over REACTIVE edges
         only -- ``Processor.consumes`` (the versions that WAKE a node) -- because only an all-
-        reactive ring is self-sustaining: a pulse-scan's y reading its own relayed ``frame_0`` is
-        a documented PULL (one bounded await per point), so measurements contribute outputs but
-        never an out-edge here and that pattern stays legal.
+        reactive ring is self-sustaining.  PulseScan consumes an external y through one bounded,
+        cursor-ordered await per point; measurements therefore contribute outputs but never a
+        reactive out-edge here.
 
         The graph is the RUNNING nodes only (``self.running_nodes`` -- GUI rows AND notebook-
         injected ``running_nodes=`` processors alike, which have no row at all).  A runtime ring
@@ -7040,72 +7126,112 @@ class TaskConsole(QtWidgets.QWidget):
                     continue
         return None
 
-    def _signal_structure(self, name: str):
-        """The output-contract structure for ONE signal ``name`` from its producing node (#H3o, #H3s-F3):
-        ``{"points_shape", "data_shape", "grid_shape", "core_ndim"}`` -- so a plot knows whether the DATA
-        is 1-D (multiple series -> lines) or 2-D (an image -> reshape/imshow), what the swept points are,
-        the 2-D ``grid_shape`` for reshaping a flattened scan grid, and ``core_ndim`` (= len(points) +
-        len(data)) so ``reduce_repeat`` collapses the LEADING repeat axis by STRUCTURE, never an ndim
-        guess.  PER-SIGNAL first: a node may publish signals of different structure (occupancy's
-        ``(repeat, n_sites)`` vs its static ``centers`` (N, 2)), so when the signal's own
-        :class:`SignalSpec` declares a points/data slot it wins; only when it declares none does this
-        fall back to the node-level triple (so other nodes are unaffected).  ``None`` when no producing
-        node is found (a derived expression / a raw array): the consumer then uses shape heuristics."""
-        node = self._node_for_signal(str(name or ""))
-        if node is None and str(name) == TASK_FRAME_KEY:
-            # A task mid-run panel binds the reserved ``__task_frame__`` (task output is OFF the hub, #6),
-            # so ``_node_for_signal`` (which only knows hub producers) can't resolve it.  Its producer IS
-            # the RUNNING TASK node -- resolve it directly so a scan task's ``scan_names``/``scan_arrays``
-            # reach the facet-grid title (``Bz=<code>`` instead of ``pt k``), exactly like a hub scan node.
-            row = self._running_task_row
-            node = self._logic_nodes.get(id(row)) if row is not None else None
+    @staticmethod
+    def _schema_structure(schema) -> dict[str, object]:
+        """Project one authoritative ``SignalSchema`` into the plot structure mapping."""
+
+        ps = tuple(schema.point_shape)
+        ds = tuple(schema.data_shape)
+        metadata = dict(schema.metadata)
+        grid = tuple(metadata.get("grid_shape", ()))
+        if not grid and len(ps) == 2:
+            grid = ps
+        return {
+            "points_shape": ps,
+            "data_shape": ds,
+            "grid_shape": grid,
+            "ring": int(schema.repeat_capacity or 1),
+            "metadata": metadata,
+        }
+
+    def _task_mid_run_spec(self):
+        """The declared ``SignalSpec`` behind the running task panel's reserved source."""
+
+        node = self._task_output_node
+        if node is None or not hasattr(node, "output_specs"):
+            return None
+        try:
+            return next(
+                (spec for spec in node.output_specs() if str(spec.name) == self._task_mid_key),
+                None,
+            )
+        except Exception:
+            return None
+
+    def _task_mid_run_schema(self):
+        """The TaskOutput schema, available both before and after its first numeric publish."""
+
+        node = self._task_output_node
         if node is None:
             return None
-        node_grid = tuple(int(n) for n in (getattr(node, "grid_shape", ()) or ()))
-        # ``grid_shape`` un-flattens a 2-D scan's SWEPT POINTS into a map; whether it applies to THIS
-        # signal is the ONE shared rule grid_for_points (operations layer) -- prod(grid)==prod(points) and
-        # points non-empty -- the SAME fact describe_shape and _coerce use, so it can never drift.  A
-        # per-site DATA signal (occupancy points=()) gets () and so can never be imshow'd as a (5x7)
-        # heatmap; the site map stays frame + rings (the trap layout is camera-pixel centres, not a grid).
-        from Zou_lab_control.neutral_atom.operations.logic import grid_for_points
+        try:
+            return node.output.schema(self._task_mid_key)
+        except KeyError:
+            spec = self._task_mid_run_spec()
+            return spec.to_schema() if spec is not None else None
 
-        def _grid_for(points) -> tuple:
-            return grid_for_points(node_grid, points)
+    def _task_mid_run_structure(self):
+        """Plot structure for the off-hub TaskOutput, without downgrading it to raw data."""
 
-        # PER-SIGNAL: the producing signal's own SignalSpec (occupied declares points=(), data=(n_sites,);
-        # centers declares neither -> None) takes precedence over the node-level triple.
-        spec = None
-        if hasattr(node, "signal_spec"):
-            try:
-                spec = node.signal_spec(str(name))
-            except Exception:
-                spec = None
-        # The declared repeat-ring CAP (logic.LogicNode.ring_depth, the one source): a published
-        # block's leading axis grows 1..ring as shots land, so a facet=repeat grid reads THIS for
-        # its constant cell count instead of the still-filling block depth.
-        ring = int(getattr(node, "ring_depth", 1) or 1)
-        if spec is not None and getattr(spec, "has_structure", False):
-            ps = tuple(spec.points_shape or ())
-            ds = tuple(spec.data_shape or ())
-            return {"points_shape": ps, "data_shape": ds,
-                    "grid_shape": _grid_for(ps), "ring": ring,
-                    "core_ndim": len(ps) + len(ds), "per_signal": True}
-        # fall back to the node-level contract triple (camera / scan / a node with no per-signal spec).
-        # ``per_signal`` False -> a consumer keeps the legacy ndim>=3 repeat detection (core_ndim NOT
-        # fed to reduce_repeat) so camera / scan paths stay byte-identical.
-        ps = tuple(getattr(node, "points_shape", ()) or ())
-        ds = tuple(getattr(node, "data_shape", ()) or ())
-        result = {"points_shape": ps, "data_shape": ds,
-                  "grid_shape": _grid_for(ps), "ring": ring,
-                  "core_ndim": len(ps) + len(ds), "per_signal": False}
-        # A SCAN node carries its swept param NAMES + per-axis coordinate arrays -- carry them so a
-        # ``facet="points:i"`` grid labels each cell with the REAL scan coordinate (``delay=1.0``) instead of
-        # a bare ``pt k`` (the facet-label source already renders ``{name}={value}`` when given these).
-        names = getattr(node, "scan_names", None)
-        arrays = getattr(node, "scan_arrays", None)
-        if names and arrays is not None:
-            result["param_names"] = [str(n) for n in names]
-            result["points_coords"] = [np.asarray(a, dtype=float).reshape(-1).tolist() for a in arrays]
+        schema = self._task_mid_run_schema()
+        node = self._task_output_node
+        if schema is None or node is None:
+            return None
+        result = self._schema_structure(schema)
+        # A multidimensional TaskOutput point_shape is already the authoritative scan geometry.
+        # Do not borrow an unrelated node ``grid_shape`` (CalibrateReadoutTask uses that name for
+        # trap-site layout while its frame output correctly has point_shape=(1,)).
+        if len(schema.point_shape) > 1:
+            result["grid_shape"] = tuple(schema.point_shape)
+
+        names = tuple(str(n) for n in (getattr(node, "scan_names", ()) or ()))
+        arrays = tuple(getattr(node, "scan_arrays", ()) or ())
+        if names:
+            result["param_names"] = list(names)
+        elif schema.metadata.get("coordinate_names"):
+            result["param_names"] = [str(n) for n in schema.metadata["coordinate_names"]]
+        if arrays:
+            point_shape = tuple(result["grid_shape"] or result["points_shape"])
+            if len(arrays) != len(point_shape):
+                raise ValueError(
+                    f"task declares {len(arrays)} coordinate arrays for point_shape {point_shape}.")
+            coordinates = []
+            for axis, (values, size) in enumerate(zip(arrays, point_shape)):
+                values = np.asarray(values).reshape(-1)
+                if values.size != size:
+                    raise ValueError(
+                        f"task coordinate axis {axis} has {values.size} values; expected {size}.")
+                coordinates.append(values.tolist())
+            result["points_coords"] = coordinates
+        return result
+
+    def _signal_structure(self, name: str):
+        """Read the authoritative Hub or TaskOutput ``SignalSchema`` for plotting."""
+
+        name = str(name)
+        if name == TASK_FRAME_KEY:
+            return self._task_mid_run_structure()
+        try:
+            schema = self.hub.schema(name)
+        except KeyError:
+            return None
+        result = self._schema_structure(schema)
+        metadata = dict(schema.metadata)
+        coordinate_names = tuple(metadata.get("coordinate_signals", ()))
+        if coordinate_names:
+            arrays = []
+            for coordinate_name in coordinate_names:
+                coordinate = np.asarray(self.hub.latest(str(coordinate_name)), dtype=float)
+                coordinate_schema = self.hub.schema(str(coordinate_name))
+                expected = (coordinate.shape[0], coordinate_schema.point_count, 1)
+                if coordinate_schema.data_shape != (1,) or tuple(coordinate.shape) != expected:
+                    raise ValueError(
+                        f"coordinate signal {coordinate_name!r} must be canonical (R,P,1); "
+                        f"got {coordinate.shape}")
+                arrays.append(coordinate[-1, :, 0].tolist())
+            result["param_names"] = [str(value) for value in
+                                     metadata.get("axis_order", coordinate_names)]
+            result["points_coords"] = arrays
         return result
 
     def _refresh_signal_info(self) -> None:
@@ -7522,16 +7648,98 @@ class TaskConsole(QtWidgets.QWidget):
         return row
 
     # ------------------------------------------------------- selector -> ROI chain
-    def _on_panel_area_select(self, card: "PanelCard", rect: tuple) -> None:
-        """A LIVE image panel's area selector released with a drawn rectangle: wire it into the
-        ROI signal chain -- the 'select a small region -> get its distribution / total counts as
-        signals' gesture.  The selection itself NEVER enters the hub (GUI state stays out of the
-        data plane): it retargets the region params of every RUNNING processor consuming this
-        panel's signal (thread-safe, applied between shots), and when none exists it CREATES the
-        stock 'ROI crop' logic row seeded with this signal + the rectangle and STARTS it -- one
-        drag, ``roi_frame``/``roi_value`` on the hub, ready for a dis panel or a scan loss."""
+    def _on_panel_area_select(self, card: "PanelCard", selection) -> None:
+        """Dispatch a selection only through the operator's explicit action."""
+
+        action = str(card.config.params.get("selection_action") or "none")
+        if action == "fit":
+            self._apply_fit_selection(card, selection)
+        elif action == "roi":
+            self._apply_roi_selection(card, selection)
+        else:
+            try:
+                count = card.plotter.to_data_figure().selected_data(selection).count
+                card.set_status(f"selected {count} data points", error=False)
+            except Exception as exc:
+                card.set_status(f"selection invalid: {str(exc).splitlines()[0][:100]}", error=True)
+
+    def _apply_fit_selection(self, card: "PanelCard", selection) -> None:
+        """Share one FitRequest between overlay and any live image FitProcessor."""
+
+        from ..neutral_atom.core.fitting import FitRequest
+
+        saved = card.config.params.get("fit_request")
+        if isinstance(saved, Mapping) and saved.get("model"):
+            model = str(saved["model"])
+        else:
+            models = _fit_models_for_kind(card._param_kind())
+            if not models:
+                card.set_status("this plot family has no general fit", error=True)
+                return
+            model = models[0].key
+        request = FitRequest(model, selection=selection, coordinate_frame=selection.frame)
+        payload = request.to_dict()
+        card._set_param("fit_request", payload)
+
+        # The stock processor currently owns image-datum fitting.  Curve overlays
+        # still use the exact same core request, but are not forced through an
+        # image processor with an incompatible schema.
+        if model != "center" or card.config.kind == "grid":
+            card._set_fit_result_text()
+            return
         signal = str(card.config.inputs[0]) if card.config.inputs else ""
         if not signal or self._task_locked:
+            return
+        from ..neutral_atom.operations.processors.fit import FIT_SPEC_NAME, FitProcessor
+
+        retargeted = []
+        for row in self.logic_nodes:
+            node = self._logic_nodes.get(id(row))
+            if not isinstance(node, FitProcessor) or signal not in tuple(node.consumes):
+                continue
+            node.set_fit_request(request)
+            row.node.values = {**dict(row.node.values or {}), "fit_request": payload}
+            editor = self._logic_editors.get(id(row))
+            if editor is not None and hasattr(getattr(editor, "form", None), "seed_values"):
+                editor.form.seed_values({"fit_request": payload})
+            retargeted.append(str(row.node.title))
+        if retargeted:
+            self._mark_dirty()
+            card.set_status(f"fit -> {', '.join(retargeted)}", error=False)
+            return
+        from ..neutral_atom.operations.signal_expr import DEFAULT_SOURCE
+        cfg = LogicNodeConfig(
+            kind="processor", name=FIT_SPEC_NAME,
+            title=indexed_unique_name(FIT_SPEC_NAME, {r.node.title for r in self.logic_nodes}),
+            values={"source": {"inputs": [signal], "source": DEFAULT_SOURCE},
+                    "fit_request": payload})
+        row = self._add_logic_node(cfg, focus=False)
+        self._start_logic_node(row)
+        started = self._logic_nodes.get(id(row)) is not None
+        card.set_status(f"fit -> {cfg.title}" + ("" if started else " (start failed — see Logic tab)"),
+                        error=not started)
+
+    def _apply_roi_selection(self, card: "PanelCard", selection) -> None:
+        """Convert an xy selection to local pixels and retarget/create ROI crop."""
+
+        x_bounds, y_bounds = selection.bounds("x"), selection.bounds("y")
+        if x_bounds is None or y_bounds is None:
+            card.set_status("ROI requires an x/y selection", error=True)
+            return
+        ox, oy = selection.metadata.get("origin", (0.0, 0.0))
+        rect = (float(x_bounds[0]) - float(ox), float(x_bounds[1]) - float(ox),
+                float(y_bounds[0]) - float(oy), float(y_bounds[1]) - float(oy))
+        signal = str(card.config.inputs[0]) if card.config.inputs else ""
+        if not signal or self._task_locked:
+            return
+        try:
+            schema = self.hub.schema(signal)
+        except KeyError:
+            card.set_status("ROI source has no registered signal schema", error=True)
+            return
+        if len(schema.data_shape) != 2:
+            card.set_status(
+                f"ROI requires image data_shape=(H,W); source has {schema.data_shape}", error=True)
             return
         from ..neutral_atom.operations.processors.roi import ROI_SPEC_NAME, region_values
         retargeted = []
@@ -7672,6 +7880,15 @@ class TaskConsole(QtWidgets.QWidget):
         if not self._timer.isActive():
             self._timer.start()
         try:
+            # A restart of THIS logical row keeps its signal names.  Hand the stopped instance's
+            # schema-ownership proof to the replacement before its worker can publish: if switching
+            # devices/ROI changes data_shape, the replacement's first frame then takes the normal
+            # explicit schema-version path (which drops incompatible history) instead of looking like
+            # an unrelated producer trying to clobber the lingering signal.  The node base validates
+            # same hub + stopped owner + exact current definition; the console never relaxes shape
+            # compatibility and never reaches into the hub's schema internals.
+            if _prev is not None:
+                node._inherit_output_schema_ownership(_prev)
             node.start()
         except Exception as exc:
             row.set_state("error", status=f"start failed: {str(exc).splitlines()[0][:80]}")
@@ -7727,8 +7944,8 @@ class TaskConsole(QtWidgets.QWidget):
         machinery a pulse-scan grid panel uses; the panel's ``sub_plot_kind`` auto-derives from the
         remaining axes, so it is not hand-set here).  Anything else is a plain frame panel.  Every task
         panel reads the reserved ``__task_frame__`` the console injects each tick from the task's OWN
-        output buffer (off the hub, #6); its ``points_shape`` reaches ``_facet_value_shapes`` through the
-        panel params (a task panel binds no producing hub node to read a declared structure from)."""
+        typed TaskOutput (off the hub, #6).  Its SignalSchema reaches the generic panel through
+        ``_signal_structure`` exactly like a Hub tensor; no shape is copied into panel params."""
         kind = str(getattr(spec, "default_kind", "2d") or "2d")
         source = f"value = {TASK_FRAME_KEY}"    # the reserved off-hub key (one spelling, TASK_FRAME_KEY)
         gshape = tuple(int(n) for n in (getattr(node, "grid_shape", ()) or ()))
@@ -7736,7 +7953,7 @@ class TaskConsole(QtWidgets.QWidget):
             facet_axis = len(gshape) - 1                 # facet the LAST scan axis -> one plane per cell
             return PanelConfig(kind="grid", title=title, source=source,
                                size=recommended_grid_size(gshape[facet_axis]),
-                               params={"facet": f"points:{facet_axis}", "points_shape": list(gshape)})
+                               params={"facet": f"points:{facet_axis}"})
         if kind == "grid":
             kind = "1d"                                  # a 0/1-D "scan" is a plain task curve, not a grid
         return PanelConfig(kind=kind, title=title, source=source)
@@ -7747,7 +7964,10 @@ class TaskConsole(QtWidgets.QWidget):
         controls so the only actions are Stop / wait (#5, confocal task semantics)."""
         spec = self._spec_for_logic(row.node)
         self._task_mid_key = str(getattr(spec, "mid_run_key", DEFAULT_MID_RUN_KEY))
-        self._task_card_frame = None
+        # Bind the typed source BEFORE constructing the generic PanelCard: construction may ask its
+        # structure provider for the declared schema before the task's first numeric publish.
+        self._task_output_node = node
+        self._task_card_tensor = None
         config = self._task_mid_run_config(spec, node, title=f"Task: {row.node.title}")
         card = self._new_panel_card(config)
         self._attach_card(card)
@@ -7801,19 +8021,21 @@ class TaskConsole(QtWidgets.QWidget):
         self._apply_task_lock(False)                          # unlock BEFORE remove (remove no-ops while locked)
         if card is not None and card in self.cards:
             self._remove_panel(card)
+        self._task_card_tensor = None
+        self._task_output_node = None
 
     def _refresh_task_panel(self) -> None:
         """Pump the running task's mid-run output (from its OWN buffer) into the
         dedicated panel + banner each tick, and leave task-run mode once it finishes."""
         if self._task_card is None:
             return
-        row = self._running_task_row
-        node = self._logic_nodes.get(id(row)) if row is not None else None
+        node = self._task_output_node
         if node is None:
             return
-        frame = node.output.latest(self._task_mid_key)
-        if frame is not None:
-            self._task_card_frame = frame
+        try:
+            self._task_card_tensor = node.output.latest_tensor(self._task_mid_key)
+        except KeyError:
+            pass
         self._update_task_status_text(node)
         # The mid-run panel refresh touches its figure on the GUI thread, so it may only run while
         # the render worker is idle (the worker never composes _task_card -- it is not in
@@ -7875,7 +8097,7 @@ class TaskConsole(QtWidgets.QWidget):
         if kind == "measurement":
             # The SPEC owns the assembly (its ProcessorSpec.make_node counterpart): ask it for the live
             # node.  ``repeat`` (re-run the whole scan N times, 0 = ∞) is the MEASUREMENT knob -- pop it
-            # and hand the count to make_node; the node only FILLS its raw ``(ring, points, dim)`` block,
+            # and hand the count to make_node; the node only FILLS its raw ``(R,P,*data_shape)`` block,
             # HOW the repeats are displayed is the PLOT's ``repeat_mode`` (#H3l).  The signal prefix is
             # the shared per-instance rule: normally the measurement's slug (spec.key) so every signal
             # is ``<slug>_<quantity>`` (temperature_t_off -- one name, derived), upgraded to the row
@@ -8039,7 +8261,7 @@ class TaskConsole(QtWidgets.QWidget):
                 # self-guarded so this is a no-op once the shapes stop changing.
                 self._update_row_publishes(row)
                 # (The "xN" repeat tag is computed by each plot panel itself while it reduces the raw
-                # (repeat, points, dim) block per its repeat_mode -- the console no longer pushes a
+                # canonical (R,P,*data_shape) block per its repeat_mode -- the console no longer pushes a
                 # repeat counter onto plotters, since the panel is decoupled and owns the reduction.)
             # A node that ENDS ON ITS OWN -- a task finishing / erroring, a finite measurement
             # taking its last repeat -- must reach the SAME terminal state the Stop button
@@ -8109,25 +8331,31 @@ class TaskConsole(QtWidgets.QWidget):
         # different shots -- the faster camera is held back to the slower co-displayed producer.  A signal
         # with no sample at that shot (a free-running scalar, or a producer not yet there) falls back to its
         # latest, never blanking a panel.  display_shot None -> latest of each (snapshot_latest).  A LONE
-        # fast panel is NOT held back: its own signal is the min (see _display_shot).  (Task mid-run output
-        # is intentionally absent here: it is off-hub via TASK_FRAME_KEY.)
+        # fast panel is NOT held back: its own signal is the min (see _display_shot).  The off-hub task
+        # tensor is appended below with the same canonical data + validity interface.
         # The helpers (np/numpy/math/history/latest/names/shot) come from the ONE signal_expr builder
         # layered on this view's snapshot -- a panel expression and a node-side expression (pulse-scan
         # y, processor source) can never diverge in capability (GUI == node).
         from Zou_lab_control.neutral_atom.operations.signal_expr import hub_namespace
-        namespace = hub_namespace(self.hub, self.hub.snapshot_at(disp))
+        tensors = self.hub.snapshot_at(disp, tensors=True)
+        namespace = hub_namespace(self.hub, {name: tensor.data for name, tensor in tensors.items()})
+        valid = {name: tensor.valid for name, tensor in tensors.items()}
+        task_tensor = self._task_card_tensor
+        namespace[TASK_FRAME_KEY] = task_tensor.data if task_tensor is not None else None
+        if task_tensor is not None:
+            valid[TASK_FRAME_KEY] = task_tensor.valid
+        namespace[SIG_VALID_KEY] = valid
         # Per-signal publish counters (reserved key) so a rolling monitor can tell
         # a new sample of its own source from an unrelated node's version bump.
-        namespace[SIG_VERSIONS_KEY] = self.hub.signal_versions()
+        versions = self.hub.signal_versions()
+        if self._task_output_node is not None:
+            versions[TASK_FRAME_KEY] = int(self._task_output_node.output.version)
+        namespace[SIG_VERSIONS_KEY] = versions
         # Coordinate frames (reserved key): {signal_name: [x, w, y, h]} from any
         # node whose acquisition source declares a ROI.  A 2D panel reads its
         # source signal's frame so the image axes are the REAL camera pixel
         # coordinates (ROI), not 0..N -- and an area-select maps back to the ROI.
         namespace[COORD_FRAMES_KEY] = self._coord_frames()
-        # Reserved key for the running task's dedicated mid-run panel: the latest frame
-        # from the task's OWN output buffer (NOT the hub -- #6), kept frozen after the
-        # task ends until its transient panel is dropped.
-        namespace[TASK_FRAME_KEY] = self._task_card_frame
         return namespace
 
     def _coord_frames(self) -> dict[str, list]:
@@ -8395,6 +8623,10 @@ class TaskConsole(QtWidgets.QWidget):
             n_signals = len(self.hub.names())
         except Exception:
             n_signals = 0
+        telemetry = f"{len(self.cards)} panels | {n_signals} signals | shot {self.hub.shot}"
+        if telemetry != getattr(self, "_summary_text", None):
+            self._summary_text = telemetry
+            self.summary.setText(telemetry)
         dropped = self._note_display_drops()
         # The persistent strip's ONE priority ladder (every tick): a wedged node must never fail
         # silently, so a red node error outranks even the running task's progress line; the
@@ -8415,11 +8647,9 @@ class TaskConsole(QtWidgets.QWidget):
                 f"⚠ display behind: dropped {dropped} shot(s) faster than the "
                 f"{self.hub.history_len}-deep buffer -- acquisition unaffected", severity="warning")
         else:
-            # No single global refresh rate any more -- each panel sets its OWN update interval
-            # (see UPDATE_INTERVALS), so the strip never claims one "every N ms".
-            self.status_strip.show_message(
-                f"{len(self.cards)} panels | {n_signals} signals | shot {self.hub.shot}",
-                severity="info")
+            # Idle telemetry already lives in the header.  Keep the status surface empty (but at its
+            # fixed height, so layout never jumps) until an event worth the operator's attention exists.
+            self.status_strip.show_message("", severity="info")
 
     # ------------------------------------------------------------------ files
     def save_to_file(self) -> None:

@@ -3,10 +3,9 @@ plot AUTO-reshapes by the DATA dimensionality (declared ``data_shape``), NOT a s
 
 * ``data_shape`` is 1-D (a scan's series) -> each data series is its OWN line; the data does NOT
   reshape into an image.
-* ``data_shape`` is 2-D (a camera frame H*W) -> the data reshapes: a 1-D panel UNROLLS it to one
-  trace, a 2-D panel imshows it.
-* ``repeat_mode='create'`` is orthogonal to both -- it adds ONE line per repeat regardless of the
-  data dimensionality (a camera frame + create = R lines, NOT H image-rows -- the bug this guards).
+* ``data_shape`` is 2-D (a camera frame H*W) -> only a 2-D image view accepts it.  A 1-D view must
+  not flatten away those axes; the user first chooses a component or explicit reduction.
+* ``repeat_mode='create'`` adds lines only for one-dimensional per-point data.
 * a flattened 2-D scan's points reshape to an image via ``grid_shape``.
 
 This is the machine guard that replaces the deleted ``_DIM_MULTILINE_MAX`` heuristic; it encodes the
@@ -45,13 +44,11 @@ def _card(kind, mode, struct):
 
 
 @pytest.mark.parametrize("node,mode,expected_lines", [
-    ("camera",  "average", 1),    # an image flattened to ONE trace
     ("scan_d1", "average", 1),    # one series -> one line
-    ("scan_d3", "average", 3),    # three series -> three lines (data dim, NOT repeat)
+    ("scan_d3", "average", 3),    # data_shape=(3,) -> three lines (not repeat)
     ("scan_2d", "average", 1),    # a flattened grid as one trace on a 1-D panel
-    ("camera",  "create",  R),    # THE BUG FIX: R repeat-lines, NOT H image-rows
     ("scan_d1", "create",  R),    # one line per repeat
-    ("scan_d3", "create",  R * 3),  # repeat x data-dim, both orthogonal columns
+    ("scan_d3", "create",  R * 3),  # repeat x one-dimensional data_shape, orthogonal columns
     ("scan_2d", "create",  R),    # one flattened-grid trace per repeat
 ])
 def test_1d_panel_line_count(node, mode, expected_lines):
@@ -62,6 +59,18 @@ def test_1d_panel_line_count(node, mode, expected_lines):
         assert len(c.plotter.lines) == expected_lines
     finally:
         c.shutdown()
+
+
+@pytest.mark.parametrize("mode", ["average", "create"])
+def test_1d_panel_rejects_multidimensional_image_data(mode):
+    block, structure = NODES["camera"]
+    card = _card("1d", mode, structure)
+    try:
+        card.refresh({"sig": block, "shot": 1})
+        assert card.plotter is None
+        assert "multidimensional data_shape" in card.status.text()
+    finally:
+        card.shutdown()
 
 
 @pytest.mark.parametrize("node,expected_shape", [
@@ -104,7 +113,7 @@ def test_custom_expression_falls_back_to_shape_inference():
 
 
 def test_average_reduce_of_partial_scan_emits_no_runtime_warning():
-    """A LIVE scan publishes a (repeat, points, dim) block that is only partially filled -- the
+    """A LIVE scan publishes a (R,P,*data_shape) block that is only partially filled -- the
     not-yet-measured point columns are all-NaN.  Averaging the repeat axis of an all-NaN column is
     NaN BY INTENT (a gap in the curve), so reduce_repeat('average') must NOT leak numpy's spurious
     'Mean of empty slice' RuntimeWarning (the temperature live-scan noise).  Result still correct."""
@@ -113,7 +122,7 @@ def test_average_reduce_of_partial_scan_emits_no_runtime_warning():
     block[:, 0, 0] = [1.0, 2.0, 3.0]              # ...except point 0 -> points 1..3 are all-NaN columns
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)   # any leaked RuntimeWarning -> test failure
-        out = np.asarray(reduce_repeat(block, "average", core_ndim=2))
+        out = np.asarray(reduce_repeat(block, "average"))
     assert out.shape == (4, 1)
     assert abs(float(out[0, 0]) - 2.0) < 1e-9          # measured point = mean over repeats
     assert np.isnan(out[1:, 0]).all()                  # unmeasured points stay NaN gaps

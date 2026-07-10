@@ -3,13 +3,10 @@
 Given a calibration (site centers + per-site thresholds [+ PSF weights]) this consumes
 each camera ``frame`` signal and republishes per-site occupancy / counts + the cumulative
 loading fraction, through the SAME ``calibration.detect`` contract the notebook / real
-readout uses (it re-implements no detection math).  The calibration is an EXPLICIT, always-
-named FILE (a Calibrate-readout task's artifact) -- the field defaults to the canonical
-``calibrations/calibration.json`` the Calibrate task writes, so a calibrate-then-judge flow
-needs no path typed, yet the file in use is always shown (never a blank mystery, matching the
-Rb87 reference's explicit-file model).  Until that file is on disk the detector falls back to
-the current session calibration, so a notebook-calibrated or mid-calibration session also
-judges immediately.
+readout uses (it re-implements no detection math).  Calibration ownership is explicit:
+``session`` means the current in-memory calibration; ``file`` means the named,
+versioned artifact.  Neither mode falls back to the other.  The file field defaults
+to ``calibrations/calibration.json`` for a deliberate file-backed flow.
 
 Reactive: it runs beside the camera measurement that publishes ``frame``, emitting only
 when a new frame arrives.  Its output is a PROCESSOR signal on the hub (virtual==real:
@@ -50,24 +47,27 @@ if tuple(METHOD_LABELS.values()) != tuple(ALL_READOUT_METHODS):
 def judge_occupancy(readout) -> ProcessorSpec:
     """Judge per-site occupancy from each live ``frame`` BLOCK using a loaded calibration.
 
-    Judges EVERY repeat slice (repeat_contract='preserve', #H3q) and PRESERVES the uniform
-    ``(repeat, data_points, *data_dim)`` shape: occupancy judges ONE readout per shot, so data_points=1.
-    It publishes ``occupied`` and ``counts`` as ``(repeat, 1, n_sites)`` blocks, ``frame_judged`` as the
-    SAME ``(repeat, 1, H, W)`` the camera frame carries, the scalar
-    ``rate`` (this block's loading fraction, for a rolling monitor / scan y), and ``centers``
-    (N, 2) / ``thresholds`` (N,) static calibration geometry.  The default view is the 'sites'
-    atom map coloured by occupancy; set its ``repeat_mode=average`` to colour by the per-site
-    LOADING PROBABILITY (averaging the camera's ``repeat`` shots recovers every site)."""
+    Judges every valid physical ``(R,P)`` cell and preserves the canonical
+    ``(R,P,*data_shape)`` layout.  ``occupied``/``counts`` declare ``data_shape=(N,)``,
+    ``rate`` declares ``(1,)``, and ``frame_judged`` retains image ``(H,W)``.  Static calibration geometry is
+    canonical too: ``centers`` is ``(1,1,N,2)`` and ``thresholds`` is ``(1,1,N)``.  Logical
+    multi-dimensional point geometry remains in each signal's ``SignalSchema.point_shape``;
+    only the physical P axis is flattened.  The default sites view is coloured by occupancy;
+    ``repeat_mode=average`` displays per-site loading probability."""
 
     params = (
+        ParamDecl("calibration_origin", "Calibration source", "choice", default="session",
+                  choices=("session", "file"),
+                  tooltip="session = use exactly the experiment's current calibration; "
+                          "file = load exactly the named calibration artifact. No fallback."),
         ParamDecl("calibration", "Calibration file", "path", default=DEFAULT_CALIBRATION_FILE,
                   path_mode="file", file_filter="Calibration (*.json *.npz);;All files (*)",
                   base_dir=CALIBRATION_DIR, required=True,
                   tooltip="The calibration file the detector LOADS (.json/.npz: site centers + "
                           "per-site thresholds [+ PSF kernels]).  Defaults to the canonical file "
                           "the Calibrate-readout task writes (calibrations/calibration.json), so "
-                          "calibrate-then-judge needs no path typed; Browse to use another.  Until "
-                          "this file exists the detector uses the current session calibration."),
+                          "Select Calibration source = file to use it; it must exist and match "
+                          "the camera frame contract."),
         ParamDecl("source", "Frame source", "signal_expr",
                   default={"inputs": [FRAME_0], "source": "value = signal"},
                   tooltip="The camera frame to judge: pick one emCCD event's signal (`frame_0`, "
@@ -84,29 +84,35 @@ def judge_occupancy(readout) -> ProcessorSpec:
 
     def make_node(hub, *, prefix: str = "", **values):
         # Reactive node reuses the real readout pipeline (calibration.detect); the console never
-        # re-implements detection.  The calibration field is an EXPLICIT, always-named FILE (the
-        # canonical calibration.json by default -- never a blank "current" mystery).  Loading is
-        # lazy: prefer that file; while it is not on disk yet (a Calibrate task may be mid-run,
-        # about to write it, or the session was calibrated in a notebook without saving) fall back
-        # to the in-memory session calibration, and keep retrying until the named file appears.
+        # re-implements detection.  Source selection is tagged and exhaustive.
         from ...core.calibration import TrapCalibration
         from Zou_lab_control._paths import resolve_under_project
 
         cal_path = resolve_under_project(values.get("calibration", "") or DEFAULT_CALIBRATION_FILE)
 
         def _load_calibration():
-            if cal_path.is_file():
-                try:
-                    return TrapCalibration.load(cal_path)
-                except Exception as exc:                       # corrupt / wrong-format file -> clear text error
-                    raise ValueError(
-                        f"Judge occupancy: cannot load calibration file {cal_path.name}: {exc}. "
-                        "The file is missing required fields or is not a valid calibration "
-                        "(.json/.npz) -- re-run Calibrate readout, or pick a valid file.") from exc
-            return readout.current        # graceful fallback until the named file exists
+            if not cal_path.is_file():
+                raise FileNotFoundError(
+                    f"Judge occupancy calibration does not exist: {cal_path}. "
+                    "Run Calibrate readout or select an existing calibration file.")
+            try:
+                return TrapCalibration.load(cal_path)
+            except Exception as exc:
+                raise ValueError(
+                    f"Judge occupancy: cannot load calibration file {cal_path.name}: {exc}. "
+                    "Re-run Calibrate readout, or pick a current-version calibration.") from exc
 
-        calibration = _load_calibration()
-        calibration_source = None if calibration is not None else _load_calibration
+        origin = str(values.get("calibration_origin", "session"))
+        if origin == "session":
+            calibration = readout.current
+            if calibration is None:
+                raise ValueError(
+                    "Judge occupancy selected the session calibration, but the session has none. "
+                    "Run Calibrate readout or select Calibration source = file.")
+        elif origin == "file":
+            calibration = _load_calibration()
+        else:
+            raise ValueError(f"unknown calibration source {origin!r}; expected 'session' or 'file'.")
         try:
             grid = readout._session.resolve_grid_shape(None)
         except Exception:
@@ -114,15 +120,10 @@ def judge_occupancy(readout) -> ProcessorSpec:
         method = METHOD_LABELS.get(str(values.get("method", "box")), "box")
         # ``source`` is a signal_expr value ({"inputs": [...], "source": "value = ..."}) -- the
         # same universal multi-source picker every source field uses; the node builds the shared
-        # SignalExpr and judges the resulting (H×W) frame.  ``session_calibration`` is the live
-        # in-memory calibration (built from THIS camera's ROI, so it always matches the live
-        # frame): the node falls back to it if the loaded FILE calibration's ROI does not match
-        # the frame (a stale calibration.json from a different camera shape would otherwise wedge
-        # the whole readout) -- the operator still sees the file's name, but a mismatched file
-        # never silently freezes every panel.
+        # SignalExpr and judges the resulting (H×W) frame.  A mismatch propagates as a node error;
+        # substituting another calibration would make the UI label disagree with the math used.
         return OccupancyProcessor(
-            hub, calibration=calibration, calibration_source=calibration_source,
-            session_calibration=lambda: readout.current,
+            hub, calibration=calibration,
             source_expr=values.get("source"),
             method=method, grid_shape=grid, prefix=prefix)
 

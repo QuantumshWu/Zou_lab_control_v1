@@ -170,20 +170,19 @@ def test_added_entry_does_not_bloat_the_config_with_constructor_defaults():
 
 
 def test_constructor_required_params_drive_which_prefills_persist():
-    """The core of the fix: a config param with NO constructor default (RemoteSequencer host / port /
-    channels) is a required kwarg whose prefill MUST reach the config; one the constructor DEFAULTS
-    (clock_hz / ssl) must not.  This is what makes ``RemoteSequencer(**params)`` succeed at Init."""
+    """A config param with NO constructor default (RemoteSequencer host / port)
+    is a required kwarg whose prefill MUST reach the config; optional connection
+    params (ssl) need not.  Hardware facts are not constructor params at all."""
     from Zou_lab_control.frontend.device_manager import _constructor_required_params
     from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer
     required = _constructor_required_params(RemoteSequencer)
-    assert {"host", "port", "channels"} <= required        # no signature default -> persist the prefill
-    assert "clock_hz" not in required and "ssl" not in required   # defaulted -> constructor supplies them
+    assert {"host", "port"} <= required                    # no signature default -> persist the prefill
+    assert not ({"channels", "port_catalog", "clock_hz"} & required)
+    assert "ssl" not in required                            # optional connection setting
 
 
-def test_remote_sequencer_entry_carries_port_and_channels_into_the_config():
-    """The exact real-hardware failure: a remote sequencer with ONLY ``host`` typed still Init's,
-    because the prefilled ``port`` + ``channels`` (required-with-default kwargs) reach the config and
-    ``RemoteSequencer(**params)`` constructs with no missing-arg TypeError."""
+def test_remote_sequencer_entry_carries_connection_not_topology_into_the_config():
+    """A remote entry persists its connection only; the server supplies PortCatalog on open."""
     from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer
     try:
         RemoteSequencer.config_params()                     # needs the server module importable
@@ -194,5 +193,6 @@ def test_remote_sequencer_entry_carries_port_and_channels_into_the_config():
         on_init_session=lambda cfg: None)
     params = panel.working_config()["seq"]["params"]
     assert params["host"] == "10.0.0.5"
-    assert isinstance(params.get("port"), int) and params.get("channels")
+    assert isinstance(params.get("port"), int)
+    assert not ({"channels", "port_catalog", "clock_hz"} & set(params))
     RemoteSequencer(**params)                                # constructs (no 'missing port'); does not connect

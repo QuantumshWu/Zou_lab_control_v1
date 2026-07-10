@@ -1,16 +1,16 @@
 """The pulse-template CHANNEL CATALOG contract (#8: "Show All can't show emCCD"):
 
-The channel catalog is a DEVICE property (the real rig's board.xdc pin list; the virtual rig's
-DEFAULT_CHANNELS) -- a saved pulse template is a SUBSET of it, never its definition.  Loading a
-template to fire/edit therefore ALIGNS it onto the device catalog (``aligned_to_channels``:
-catalog order, missing channels as off rows, compiled program identical), so the GUI's "Show All"
+The port catalog is a DEVICE property (the real rig's board.xdc topology; the virtual rig's
+catalog) and is embedded intact in each saved pulse. Loading a template to fire/edit aligns one
+catalog onto the device catalog (``aligned_to_catalog``: physical order, missing raw lanes as off),
+so the GUI's "Show All"
 really shows every device channel -- with the shipped templates regenerated onto the full virtual
 catalog the same way (never hand-typed).  Four mechanical pins:
 
   1. the virtual catalog and the monitor camera's coil wiring derive from ONE source
      (``MOT_COIL_BUSES``) -- they used to be two hand-typed mirror copies;
   2. every shipped pulse-table template carries the FULL virtual catalog while its saved
-     default view (``visible_channels``) stays the original driving subset;
+     default view (``visible_ports``) stays the original driving subset;
   3. ``resolve_fireable_template(..., sequencer=...)`` expands a SUBSET template onto the
      device catalog with an IDENTICAL compiled product, and leaves a non-subset template
      untouched (the prepare layer / coupled resolver own that case);
@@ -18,12 +18,12 @@ catalog the same way (never hand-typed).  Four mechanical pins:
      the whole catalog), non-subset -> an error message, never a crash or a silent swap of
      the editor's channel universe.
 
-Plus the align-preservation pin (5): ``aligned_to_channels`` carries ``api_slots`` and
-``scan_repeats`` (the same built-but-not-passed bug class as the clk_channels regression --
-dropping them would strip the MOT template's a1/a2/a3 DAC handles on every load).
+Plus the align-preservation pin (5): ``aligned_to_catalog`` carries ``api_slots`` and
+``scan_repeats``.
 """
 
 from __future__ import annotations
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 import json
 from pathlib import Path
@@ -73,47 +73,49 @@ def test_virtual_catalog_and_mot_camera_coil_buses_share_one_source():
 @pytest.mark.parametrize("name", TEMPLATE_FILES)
 def test_shipped_template_channels_are_the_full_virtual_catalog(name):
     state = PulseTableState.load(REPO_ROOT / "pulses" / name)
-    assert list(state.channels) == CATALOG, f"{name}: channels must be the device catalog"
+    assert list(state.port_catalog.raw_lanes) == CATALOG, f"{name}: raw lanes must match the device catalog"
     # the saved default VIEW stays the original driving subset -- load looks unchanged,
     # only Show All spreads to the whole catalog
-    assert set(state.visible_channels) < set(state.channels), f"{name}: visible must stay a proper subset"
-    assert state.visible_channels == [c for c in state.channels if c in set(state.visible_channels)]
+    programmable = [
+        port.key for port in state.port_catalog.ports if port.kind != "clock"
+    ]
+    assert set(state.visible_ports) <= set(programmable)
+    assert state.visible_ports == [key for key in programmable if key in set(state.visible_ports)]
     # the expansion added OFF rows only: the template does not drive the whole catalog
-    assert len(state.period_active_channels()) < len(state.channels)
+    assert len(state.period_active_channels()) < len(state.port_catalog.raw_lanes)
 
 
-def test_regenerated_mot_template_kept_its_dac_api_slots_and_buses():
-    """The regen must not strip what the file carried: the a1/a2/a3 DAC handles the MOT task sets
-    and the three coil buses (which must equal the ONE source the virtual camera wires)."""
+def test_regenerated_mot_template_kept_its_semantic_dac_scan_slots_and_buses():
+    """The MOT task streams one named hardware-scan slot per coil bus."""
     mot = PulseTableState.load(REPO_ROOT / "pulses" / "mot_field_template.json")
-    assert {s.name for s in mot.api_slots if s.kind == "dac"} == {"a1", "a2", "a3"}
-    assert dict(mot.analog_buses) == {k: list(v) for k, v in MOT_COIL_BUSES.items()}
+    assert mot.scan_names == ["da_x", "da_y", "da_z"]
+    assert mot.api_slots == []
+    assert mot.port_catalog.analog_buses == {k: list(v) for k, v in MOT_COIL_BUSES.items()}
 
 
 # --------------------------------- (3) resolve_fireable_template expands a subset, equivalently
 def test_resolve_fireable_template_expands_a_subset_template_to_the_device_catalog(tmp_path):
     subset = single_imaging_template()                       # trap/cooling/probe/emCCD -- a subset
-    assert set(subset.channels) < set(CATALOG)
+    assert set(subset.port_catalog.raw_lanes) < set(CATALOG)
     path = tmp_path / "subset_probe.json"
     subset.save(path)
 
     seqr = VirtualSequencer()
     state = resolve_fireable_template(str(path), default_name=str(path),
                                       default_factory=single_imaging_template, sequencer=seqr)
-    assert list(state.channels) == list(seqr.channels) == CATALOG
+    assert list(state.port_catalog.raw_lanes) == list(seqr.port_catalog.raw_lanes) == CATALOG
     assert _pulse_key(state) == _pulse_key(subset), "the expansion must not change the compiled program"
     assert state.api_names() == subset.api_names(), "api handles survive the load-time align"
 
 
-def test_resolve_fireable_template_leaves_a_non_subset_template_untouched(tmp_path):
-    foreign = PulseTableState(channels=["trap", "alien_line"])
+def test_resolve_fireable_template_rejects_a_foreign_catalog(tmp_path):
+    foreign = PulseTableState(port_catalog=PortCatalog.from_channels(["trap", "alien_line"]))
     path = tmp_path / "foreign.json"
     foreign.save(path)
-    state = resolve_fireable_template(str(path), default_name=str(path),
-                                      default_factory=single_imaging_template,
-                                      sequencer=VirtualSequencer())
-    assert list(state.channels) == ["trap", "alien_line"], \
-        "a non-subset template is NOT remapped here (prepare / the coupled resolver own that)"
+    with pytest.raises(ValueError, match="raw lanes are not in hardware catalog"):
+        resolve_fireable_template(str(path), default_name=str(path),
+                                  default_factory=single_imaging_template,
+                                  sequencer=VirtualSequencer())
 
 
 def test_resolve_fireable_template_without_a_sequencer_keeps_the_saved_channels(tmp_path):
@@ -122,16 +124,16 @@ def test_resolve_fireable_template_without_a_sequencer_keeps_the_saved_channels(
     subset.save(path)
     state = resolve_fireable_template(str(path), default_name=str(path),
                                       default_factory=single_imaging_template)
-    assert list(state.channels) == list(subset.channels)     # no device in scope -> no catalog
+    assert state.port_catalog == subset.port_catalog
 
 
-# ----------------------------------------------- (5) aligned_to_channels carries api_slots et al.
-def test_aligned_to_channels_preserves_api_slots_and_scan_repeats():
-    st = PulseTableState(channels=["a", "b"])
+# ----------------------------------------------- (5) aligned_to_catalog carries api_slots et al.
+def test_aligned_to_catalog_preserves_api_slots_and_scan_repeats():
+    st = PulseTableState(port_catalog=PortCatalog.from_channels(["a", "b"]))
     st.bind_api_field("duration", "0", name="a1", unit="us")
     st.bind_api_field("delay", "b", name="a2", unit="us")
     st.scan_repeats = 4
-    out = st.aligned_to_channels(["a", "b", "c"])
+    out = st.aligned_to_catalog(PortCatalog.from_channels(["a", "b", "c"]))
     assert [(s.name, s.kind, s.target) for s in out.api_slots] == \
         [("a1", "duration", "0"), ("a2", "delay", "b")]
     assert int(out.scan_repeats) == 4
@@ -148,7 +150,7 @@ def _app(monkeypatch):
 
 def _catalog_editor():
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
-    return PulseSequenceEditor(channels=CATALOG)
+    return PulseSequenceEditor(sequencer=VirtualSequencer(sleep_scale=0))
 
 
 def _point_load_dialog_at(monkeypatch, path):
@@ -166,25 +168,28 @@ def test_gui_load_expands_a_subset_file_and_show_all_lists_the_whole_catalog(_ap
     _point_load_dialog_at(monkeypatch, path)
     ed.load_from_file()
 
-    assert list(ed.state.channels) == CATALOG, "load must expand a subset file onto the catalog"
-    assert list(ed.state.visible_channels) == list(subset.visible_channels), \
+    assert list(ed.state.port_catalog.raw_lanes) == CATALOG
+    assert list(ed.state.visible_ports) == list(subset.visible_ports), \
         "the default view stays the file's own driving rows"
     assert _pulse_key(ed.read_state()) == _pulse_key(subset)
 
-    ed.show_all_channels()
-    shown = ed.read_state().visible_channels
-    assert list(shown) == CATALOG, "Show All must list every device channel (emCCD, trap, ...)"
+    ed.show_all_ports()
+    shown = ed.read_state().visible_ports
+    expected = [
+        port.key for port in ed.state.port_catalog.ports if port.kind != "clock"
+    ]
+    assert list(shown) == expected
 
 
 def test_gui_load_rejects_a_non_subset_file_without_crashing(_app, monkeypatch, tmp_path):
-    foreign = PulseTableState(channels=["trap", "alien_line"])
+    foreign = PulseTableState(port_catalog=PortCatalog.from_channels(["trap", "alien_line"]))
     path = tmp_path / "foreign.json"
     foreign.save(path)
 
     ed = _catalog_editor()
-    before = list(ed.state.channels)
+    before = ed.state.port_catalog
     _point_load_dialog_at(monkeypatch, path)
     ed.load_from_file()                                      # must not raise
 
-    assert list(ed.state.channels) == before, "a rejected load must not swap the channel universe"
-    assert "do not match the sequencer channels" in ed.summary.text()
+    assert ed.state.port_catalog == before
+    assert "raw lanes are not in hardware catalog" in ed.summary.text()

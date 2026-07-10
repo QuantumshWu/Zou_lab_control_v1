@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
-from Zou_lab_control.neutral_atom.operations.logic import LogicNode
+from Zou_lab_control.neutral_atom.operations.logic import LogicNode, SignalSpec
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
 
@@ -34,6 +34,12 @@ class _EchoNode(LogicNode):
 
     def shot(self):
         return {"v": float(self._v)}
+
+    def _bare_published_signals(self):
+        return frozenset({"v"})
+
+    def _bare_output_specs(self):
+        return (SignalSpec("v", "echo value", points_shape=(1,), data_shape=(1,)),)
 
     def acquisition_parameters(self):
         return {"v": self._v}
@@ -49,7 +55,7 @@ def test_idle_apply_bumps_epoch_and_publishes_synchronously():
     assert node.acquisition_epoch() == 0
     node.apply_acquisition_parameters(v=5)        # idle: applied + published right here
     assert node.acquisition_epoch() == 1
-    assert float(hub.latest("v")) == 5.0
+    assert float(hub.latest("v").item()) == 5.0
 
 
 def test_running_apply_advances_epoch_only_when_new_param_frame_is_published():
@@ -63,6 +69,6 @@ def test_running_apply_advances_epoch_only_when_new_param_frame_is_published():
         while node.acquisition_epoch() == epoch0 and time.monotonic() < deadline:
             time.sleep(0.005)
         assert node.acquisition_epoch() > epoch0  # advanced once the loop applied + published
-        assert float(hub.latest("v")) == 9.0          # the epoch-advance frame reflects the new param
+        assert float(hub.latest("v").item()) == 9.0   # the epoch-advance frame reflects the new param
     finally:
         node.stop()

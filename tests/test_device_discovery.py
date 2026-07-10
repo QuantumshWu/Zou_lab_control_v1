@@ -287,9 +287,10 @@ def test_discover_devices_never_raises_and_always_reports():
     assert all(str(r) for r in rows)                  # every row renders as a table line
 
 
-def test_camera_names_is_the_one_choice_source():
-    """DeviceSet.camera_names() lists every CameraDevice sorted -- and BOTH camera choices
-    (the Camera measurement's and Pulse scan's) are exactly that tuple (single source)."""
+def test_camera_measurement_choices_come_from_the_device_set():
+    """DeviceSet.camera_names() lists every CameraDevice sorted, and the Camera measurement's
+    device-role choice is exactly that tuple.  Pulse scan consumes a Hub signal and has no camera
+    parameter."""
     import matplotlib
     matplotlib.use("Agg")
     from Zou_lab_control import neutral_atom as na
@@ -301,7 +302,7 @@ def test_camera_names_is_the_one_choice_source():
         cam_spec = exp.readout.camera_spec()
         assert next(p for p in cam_spec.params if p.key == "camera").choices == names
         scan_spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
-        assert next(p for p in scan_spec.params if p.key == "camera").choices == names
+        assert not any(p.key == "camera" for p in scan_spec.params)
     finally:
         exp.close()
 

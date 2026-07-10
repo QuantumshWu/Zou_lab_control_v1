@@ -76,7 +76,7 @@ form.add_row("Total:", qf.FluentLineEdit("1.2 ms"))
     \node[tab, right=2mm of e] (p) {Preview};
     \node[tab, right=2mm of p] (s) {Scan};
     \node[panel, below=3mm of e, text width=30mm, minimum height=20mm, anchor=north west] (ep)
-      {Channel Names\\Delay \& Scan\\period 卡片时间线\\Control Buttons\\Channel View};
+      {Port Catalog\\Delay \& Scan\\period 卡片时间线\\Control Buttons\\Port View};
     \node[panel, below=3mm of p, text width=30mm, minimum height=20mm, anchor=north west] (pp)
       {plot(kind="pulse")\\未展开周期表\\repeat 用 $\times\infty$ / $\times N$\\Show off rows 开关};
     \node[panel, below=3mm of s, text width=30mm, minimum height=20mm, anchor=north west] (sp)
@@ -91,14 +91,14 @@ form.add_row("Total:", qf.FluentLineEdit("1.2 ms"))
 \begin{figure}[htbp]
   \centering
   \includegraphics[width=\textwidth]{__GUI_EDIT__}
-  \caption{Edit 标签页的真实截图（脱机离屏渲染）。左侧 Channel Names 与 Delay / Scan 列，中间是横向滚动的 period 卡片时间线，下方是 Control / Channels 控制条。橙色字段是已绑定到扫描 slot 的字段，字段右侧的圆点显示它的 slot 编号。}
+  \caption{Edit 标签页。左侧 Port Catalog 只读展示设备拓扑，Delay / Scan 只编辑可编程端口的时序；中间是 period 时间线。}
   \label{fig:fe-edit-shot}
 \end{figure}
 
 按区域理解：
 
 \begin{description}
-  \item[\pyapi{Channel Names and Duration}] 脉冲名、总时长、period 数、可见数。左侧 raw 列在能读到 XDC 时显示物理 package pin（如 \pyapi{M17/M13}）；\pyapi{chNN} 保存在 tooltip 和 JSON/API state。右侧是可选的显示标签。
+  \item[\pyapi{Port Catalog}] 脉冲名可编辑；总时长/period/visible 与每个 logical port 的 raw lane、semantic label、digital/DAC/clock kind 均只读。拓扑来自 sequencer 的不可变 \pyapi{PortCatalog}，不属于 pulse 文档。
   \item[\pyapi{Delay \& Scan}] \pyapi{Clock}（\tfocus{只读}显示当前 sequencer 时钟，如 \pyapi{50 MHz · 20 ns}，由硬件固定、不可编辑）、每条可见 channel 的固定延时、以及 \pyapi{Load Array}（载入扫描表文件，旁边显示已载入文件名）和一个\tfocus{来源开关}（关 = 用 Scan 页生成的扫描表；开 = 用载入文件的数组）。Scan 页本身从顶部的 \pyapi{Scan} 标签直接进入。
   \item[period 卡片时间线] 每张卡是一段持续时间，不是网格表。卡片含 duration、单位选择、位置（\pyapi{Period 1/5}）和每条 channel 的勾选框。
   \item[\pyapi{Control Buttons}] \pyapi{On Pulse}/\pyapi{Stop Pulse}、增删 period、repeat bracket、保存/读取、\pyapi{Sync}。\pyapi{On Pulse} 先 prepare/上传当前脉冲再 start；\pyapi{Sync} 把设备上实际应用的脉冲拉回编辑器（用于 notebook/API 改了设备而 GUI 没跟上时）。
@@ -118,7 +118,7 @@ channel 名列、延时列、period 勾选框列共享\tfocus{同一个}竖直�
   \label{fig:fe-scan-shot}
 \end{figure}
 
-扫描以\tfocus{命名 slot}为单位（\pyapi{s0, s1, ...}），没有 x/y。只有 \tfocus{duration 和 DAC 值}两类字段可扫，channel 延时\tfocus{不可扫}。
+扫描以\tfocus{语义命名的 slot}为单位（例如 \pyapi{exposure} 或 \pyapi{da\_x}），没有固定 x/y两轴。\pyapi{s0, s1, ...} 只是 period 表达式与 FPGA 编译矩阵的位置 token，不是 UI、Hub signal 或结果轴的公开名。只有 \tfocus{duration 和 DAC 值}两类字段可扫，channel 延时\tfocus{不可扫}。
 
 \begin{enumerate}
   \item 在 Edit 页点某个 duration / DAC 字段旁的\tfocus{扫描圆点}。该字段变橙、显示它的 slot 编号；这等价于 API 的 \pyapi{state.bind_field(kind, target)}。
@@ -133,11 +133,11 @@ channel 名列、延时列、period 勾选框列共享\tfocus{同一个}竖直�
 
 \begin{codeblock}[Scan 页里的代码（column\_stack 默认模板，2 个 slot 时）]
 import numpy as np
-# 2 个已绑定 slot：s0、s1。行 = 一个扫描点，列 = slot（ns / DAC code）。
+# 2 个语义 slot：exposure、da_x。行 = 扫描点，列 = slot（ns / DAC code）。
 points = np.arange(20, 200e3, 20)         # 基准扫描
-s0 = points
-s1 = 200e3 - s0                           # 反相关：s0 + s1 = 200 us 恒定
-scan_table = np.column_stack([s0, s1])
+exposure = points
+da_x = np.linspace(-128, 128, len(exposure)).round().astype(int)
+scan_table = np.column_stack([exposure, da_x])
 \end{codeblock}
 
 \section{Preview 页}
@@ -153,38 +153,37 @@ Preview 复用 \pyapi{frontend.plot(..., kind="pulse")}，在打开标签页或�
 
 \tfocus{Show off rows 同样管 DAC 行}：开关\tfocus{关}时，预览只画有信号的行——一条全程为 0 / hold 的\tfocus{空闲 DAC 总线会被隐藏}（就像一条全程 off 的数字通道），只有带非零值或被扫描的 DAC 才显示；开关\tfocus{开}时，所有 DAC 总线都显示。无论隐藏与否，DAC 的位通道\tfocus{绝不}会作为单独的数字行泄漏出来。
 
-\section{保存与读取：完整的一包（pulse + 预览 + 程序 + 扫描表）}
-\tfocus{Save 一次写一整包}，四件文件落在同一目录、共享同一个文件名前缀：
+\section{保存与读取：一个真相源与两个衍生物}
+\tfocus{Save 一次写三件文件}，落在同一目录、共享同一个文件名前缀：
 \begin{itemize}
   \item \filepath{<名字>.json} —— 脉冲本体（编辑器的完整状态，load 回来逐项还原）；
   \item \filepath{<名字>.png} —— 预览图（和 Preview 页看到的一样）；
-  \item \filepath{<名字>_program.json} —— \tfocus{编译好的、FPGA 可直接上载的程序}（与点 On Pulse 实际上传的内容一致；\tfocus{无论是否扫描都会保存}：有扫描槽和扫描表时是扫描程序，否则是普通运行程序）；
-  \item \filepath{<名字>_scan.npy} ——（仅当存在扫描表时）扫描表原始数组。
+  \item \filepath{<名字>_program.json} —— \tfocus{编译好的、FPGA 可直接上载的程序}（与点 On Pulse 实际上传的内容一致；\tfocus{无论是否扫描都会保存}：有扫描槽和扫描表时是扫描程序，否则是普通运行程序）。
 \end{itemize}
 某一件写失败不会让整个保存失败：状态栏会写明哪些写成功、哪些被跳过及原因。
 
-\tfocus{Load 把整包读回来}：在 Edit 页点读取并选 \filepath{<名字>.json}，编辑器还原脉冲本体；若同目录有配套的 \filepath{<名字>_scan.npy}，它会被\tfocus{自动重新挂回}"载入文件"来源（Delay / Scan 面板会显示该文件名），内嵌在 .json 里的扫描表则照常成为"生成"来源——两者在保存时刻数值相同，来源开关保持在"生成"。\tfocus{误选了} \filepath{_program.json} 或 \filepath{_scan.npy}？只要同目录有对应的脉冲 \filepath{.json}，软件会自动改为加载脉冲本体并提示一句。\filepath{.png} 与 \filepath{_program.json} 是衍生物，load 后由当前状态随时重新生成，无需单独读取。
+扫描表只保存在 \filepath{<名字>.json} 的严格 \pyapi{scan\_table} 字段中；不存在自动写出或自动发现的同名 \filepath{_scan.npy} 第二真相源。需要与外部工具交换数组时，在 Scan 页明确使用 Save Array / Load Array，导入后再保存 pulse 才会成为该 pulse 的状态。\tfocus{Load} 只读取所选 pulse JSON；误选同名前缀的 \filepath{_program.json} 时会明确改为加载 pulse。\filepath{.png} 与 \filepath{_program.json} 都是可重建衍生物。
 
 \chapter{逐个按钮：完整操作参考（详解）}
 
 本章面向\tfocus{第一次打开本软件的人}，把脉冲编辑器 Edit / Preview / Scan 三个页面上的\tfocus{每一个控件}逐个讲清：作用、能填什么、点击或输入后会发生什么、常见坑、以及一个实用提示。配合每节的真实截图阅读。
 
-\section{Edit 页 — Channel Names 面板（逐控件详解）}
+\section{Edit 页 — Port Catalog 面板（逐控件详解）}
 
-这一节专为\tfocus{第一次打开本软件、从未见过这个界面的人}写。我们会把 Edit（编辑）页最左边那一块叫做 \tfocus{Channel Names（通道名字）} 的白色卡片，从上到下、一个控件接一个控件地讲清楚：它是干什么的、能填什么、点了或填了之后会发生什么、新手最容易踩的坑、以及一个能立刻用上的小技巧。读完这一节，你应该能独立看懂这块面板上的每一个字、每一个输入框。
+Edit 页最左侧是 \tfocus{Port Catalog}：它显示当前 sequencer 的硬件端口契约，不是改接线的地方。
 
 \begin{figure}[htbp]
   \centering
   \includegraphics[width=0.78\textwidth]{__GUI_NAMES__}
-  \caption{Edit 页最左侧的 Channel Names 面板。顶部是 Name / Total / Periods / Visible 四个带标签的字段，下面是逐通道的两列：左边只读的物理引脚名（如 \pyapi{M17}），右边可编辑的显示名（如 \pyapi{cooling}）。}
+  \caption{Port Catalog 面板。只有 pulse Name 可编辑；port identity、semantic label、DAC/clock ownership 均只读。}
 \end{figure}
 
 \subsection{这块面板是什么、在哪里}
 
-Channel Names 面板是 Edit 页\tfocus{最左边}的一张白色、带标题的卡片，标题就写着 \pyapi{Channel Names}。它的职责只有两件事：一是显示并让你修改整条脉冲序列的\tfocus{身份信息}（名字、总时长、周期数、可见通道数），二是为每一条\tfocus{通道}提供两个名字——一个是硬件上固定的物理引脚名（只读），一个是你自己起的、好记的显示名（可改）。
+Port Catalog 面板显示 pulse 身份和硬件端口。\pyapi{Name} 是唯一可编辑项；port key/label、raw lanes、DAC bus index/encoding/safe value/latch clock 由设备配置决定并随 catalog fingerprint 校验，不能在 pulse 文件里改。
 
 \begin{notebox}[先记住一句话]
-这块面板里能真正\tfocus{改变硬件行为}的东西非常少。除了最上面的 \pyapi{Name} 是给整个文件起名，下面每条通道右边的“显示名”\tfocus{只改怎么显示、不改硬件}。其余字段全部是\tfocus{只读}的、自动算出来的，看就行，改不了也不用改。
+这里只有 \pyapi{Name} 可编辑。semantic label 看似文本框但被禁用；要改端口命名、DAC 分组或 clock ownership，必须改 sequencer/XDC 配置并生成新的 \pyapi{PortCatalog}，不能靠 pulse 存档覆盖。
 \end{notebox}
 
 \subsection{顶部信息区：Name / Total / Periods / Visible}
@@ -226,31 +225,13 @@ Channel Names 面板是 Edit 页\tfocus{最左边}的一张白色、带标题的
   \end{itemize}
 \end{description}
 
-\subsection{逐通道两列：左边只读引脚名 + 右边可编辑显示名}
+\subsection{逐 port 两列：raw lane / package pin + immutable semantic identity}
 
-顶部信息区下面，是\tfocus{一条通道一行}的列表，只列出当前可见的那些通道（也就是 \pyapi{Visible} 左边那个数那么多行）。每一行有两列：左边是硬件给定的、改不了的物理名字；右边是一个你可以随便改的、好记的显示名输入框。
+每一行代表一个 \pyapi{PortSpec}。左列显示 raw lane 或 XDC package pin；右列显示 logical port key/label。两列都只读，完整 lanes/kind 放在 tooltip。DAC 的多条 raw lanes 只显示为一个 logical bus，clock port 不进入可编程 schedule。
 
-\begin{description}
-\item[左列：raw 标签（物理引脚名，只读）] 每行最左边是一个\tfocus{只读}标签，显示这条通道对应的\tfocus{物理封装引脚名}。
-  \begin{itemize}
-  \item \tfocus{它显示什么}：如果软件知道这条通道接到了板子上的哪个引脚（来自板卡的 XDC 约束文件），就显示那个引脚名，例如 \pyapi{M17}；如果不知道，就退而显示内部名 \pyapi{chNN}，例如 \pyapi{ch00}。
-  \item \tfocus{为什么只读}：这是硬件接线决定的事实，不是你能在软件里改的。它代表“第几号物理输出”，改它没有意义，所以软件不让你动。
-  \item \tfocus{名字太长会怎样}：当引脚名太长、一行放不下时，界面会用 \pyapi{...} 把它截断显示；\tfocus{完整文本会放进鼠标悬停提示（tooltip）}里。
-  \item \tfocus{一个永远的保底}：不管左边显示的是引脚名还是被截断的文字，\tfocus{完整的内部名 \pyapi{chNN} 始终能在该标签的 tooltip 里看到}。所以你随时可以把鼠标停在上面，确认这到底是第几号通道。
-  \item \tfocus{常见坑}：不要把这个只读的 \pyapi{M17} 当成可以重命名的东西去双击——它不会进入编辑状态。想起别名，请用它右边那个框。
-  \item \tfocus{小技巧}：当你需要把界面上的某条通道和实际接线、和 FPGA 比特位对上号时，悬停看 tooltip 里的 \pyapi{chNN}，这是最可靠的对照方式。
-  \end{itemize}
-
-\item[右列：display-label 输入框（显示名，可编辑）] 每行右边是一个\tfocus{可编辑}的文本框，让你给这条通道起一个人类好记的名字，例如 \pyapi{cooling} 或 \pyapi{da\_dipole[0]}。
-  \begin{itemize}
-  \item \tfocus{作用}：纯粹是\tfocus{显示用}的别名。你填的名字会出现在界面的各处标签上，以及预览图的 y 轴上，让你看图、找通道时一眼认出谁是谁。
-  \item \tfocus{关键事实——它不改硬件}：这个显示名\tfocus{只影响“怎么显示”，绝不改变硬件的比特位顺序}。也就是说，无论你把第 0 号通道叫 \pyapi{cooling} 还是叫 \pyapi{laser\_A}，它在 FPGA 里仍然是同一根输出、同一个比特位。改名只换标签，不换接线。
-  \item \tfocus{接受什么}：任意文本，可以带方括号和下标风格的写法，例如 \pyapi{da\_dipole[0]}，方便你给同类通道编号。
-  \item \tfocus{填了会怎样}：你敲完之后，界面上引用这条通道的地方、以及预览图 y 轴上对应的那一行，都会换成你起的新名字。
-  \item \tfocus{常见坑}：千万别误以为“把两条通道的显示名对调，就能交换它们的硬件输出”——不会的，硬件顺序由比特位决定，显示名只是贴在外面的标签。还有，给两条通道起完全一样的显示名虽然不报错，但看图时容易把自己搞糊涂。
-  \item \tfocus{小技巧}：用统一的命名规则（比如冷却光统一叫 \pyapi{cooling}、偶极阱用 \pyapi{da\_dipole[0]}、\pyapi{da\_dipole[1]}），预览图 y 轴会立刻变得清爽好读，排查实验问题时事半功倍。
-  \end{itemize}
-\end{description}
+\begin{notebox}[为什么不能在 pulse GUI 改名]
+名字、DAC membership、bus index、encoding、safe value 与 latch clock 一起组成硬件 ABI；它们必须随 sequencer 配置生成并由 fingerprint 校验。把 label 当 pulse 文档私有显示项会产生第二份拓扑并允许同一 raw lane 被不同文件解释成不同设备，因而被彻底禁止。
+\end{notebox}
 
 \subsection{对齐契约：三列同一行、一起滚动}
 
@@ -262,7 +243,7 @@ Channel Names 面板是 Edit 页\tfocus{最左边}的一张白色、带标题的
 \end{description}
 
 \begin{notebox}[这个对齐为什么重要]
-因为你经常需要\tfocus{横着读一整行}：先在最左边认出这是哪条通道（看引脚名或显示名），再顺着同一行往右看它的延时是多少、它在第一个周期里开没开。正因为三列严格对齐、一起滚动，你才可以放心地“一行从左读到右”，不用担心读串行。如果哪天你觉得名字和延时框对不上，那通常意味着界面出了渲染问题，而不是这条通道的设定真的错位了。
+三列严格对齐：最左边读 immutable port identity，再向右读 delay 与 period state。任何错位都是渲染错误，不是 topology 被 pulse 改写。
 \end{notebox}
 
 \section{Edit 页 — Delay / Scan 面板与扫描圆点（逐控件详解）}
@@ -288,7 +269,7 @@ Channel Names 面板是 Edit 页\tfocus{最左边}的一张白色、带标题的
 \subsection{顶部入口：Load Array 按钮、文件名与来源开关}
 
 \begin{description}
-\item[Load Array 按钮] 作用：打开一个\tfocus{文件选择对话框}，从磁盘载入一份\tfocus{扫描表（scan table）}文件，存为“载入”来源。可接受的文件类型是 \pyapi{.npy} / \pyapi{.csv} / \pyapi{.txt} / \pyapi{.json}。文件的格式约定非常重要：\tfocus{每一行代表一个扫描点，每一列代表一个已绑定的扫描槽}。点击后会发生什么：弹出系统文件对话框，你选中文件后，表里的数值被读进来并\tfocus{自动 snap}（duration 对齐节拍、DAC 夹到带符号范围 \pyapi{-512..+511}），同时\tfocus{右边的标签显示该文件路径的末尾十几个字符}，并把来源开关\tfocus{自动打开}（即开始使用这份载入数组）。常见的坑：行列别搞反（行=点、列=槽）；列数和槽数对不上时会被截断/补零。实用提示：不想手写文件就用 Scan 页的代码生成；Load Array 更适合从外部仪器或脚本导出的现成数据。
+\item[Load Array 按钮] 作用：打开一个\tfocus{文件选择对话框}，从磁盘载入一份\tfocus{扫描表（scan table）}文件，存为“载入”来源。可接受的文件类型是 \pyapi{.npy} / \pyapi{.csv} / \pyapi{.txt} / \pyapi{.json}；JSON 必须是当前 schema 的 pulse document 或 compiled program。文件的格式约定非常重要：\tfocus{每一行代表一个扫描点，每一列代表一个已绑定的语义扫描槽}。点击后会发生什么：弹出系统文件对话框，你选中文件后，表里的数值被读进来并\tfocus{自动 snap}（duration 对齐节拍、DAC 夹到带符号范围 \pyapi{-512..+511}），同时\tfocus{右边的标签显示该文件路径的末尾十几个字符}，并把来源开关\tfocus{自动打开}（即开始使用这份载入数组）。列数必须与已绑定 slot 数\tfocus{严格相等}；少列或多列都会明确报错，绝不截断/补零。实用提示：不想手写文件就用 Scan 页的代码生成；Load Array 更适合从外部仪器或脚本导出的现成数据。
 
 \item[已载入文件名标签] 作用：显示\tfocus{当前载入}的扫描表文件路径（从左侧省略，保留\tfocus{末尾}十几个字符，鼠标悬停看完整路径）。没有载入任何文件时显示 \pyapi{(no file)}。它是只读的，仅用于让你确认“开关打开时用的是哪份文件”。
 
@@ -308,11 +289,11 @@ Channel Names 面板是 Edit 页\tfocus{最左边}的一张白色、带标题的
 \subsection{每个通道一行：单位下拉框与 X 隐藏按钮}
 
 \begin{description}
-\item[单位下拉框（ns / us）] 作用：选择该行延迟数值的\tfocus{时间单位}。延迟的可选单位\tfocus{只有 \pyapi{ns} 和 \pyapi{us} 两个}——延迟被延时线深度限制在约 $\pm40\,\mu$s 以内，\pyapi{ms}/\pyapi{s} 一定超界，而 \pyapi{str (ns)}（仿射表达式单位）对一个固定、不可扫描的延迟也没有意义，所以这里不再提供。点击后会发生什么：下拉展开，选中某个单位后，左边输入框里的数字就按这个单位解释（例如填 \pyapi{1} 配 \pyapi{us} 等于 1 微秒）。常见的坑：单位选错会让延迟差出 1000 倍（把 \pyapi{us} 当成 \pyapi{ns}）；另外最终值仍会被时钟节拍量化，所以填一个比节拍还小的组合可能被对齐成 \pyapi{0}。实用提示：日常多用 \pyapi{ns}，较长的固定延迟用 \pyapi{us}。
+\item[单位下拉框（ns / us）] 选择该行固定延迟的输入单位。UI 只提供 \pyapi{ns}/\pyapi{us}；32 位 tick 范围在 50 MHz 下约为 $\pm42.9\,$s，所以毫秒级值可以直接以 $\mu$s 填写（例如 40 ms = 40000 us）。\pyapi{str (ns)} 只属于扫描编译表达式，不在固定 delay 下拉中。最终值仍会对齐到硬件 tick。
 
-\item[X 按钮（隐藏通道）] 作用：把该通道从表里\tfocus{隐藏}，让界面更清爽。点击后会发生什么：这一行从 Delay / Scan 表里消失，该通道被移到\tfocus{隐藏列表}中。它去哪了：底部的 \pyapi{Channels}（通道）卡片会记录被隐藏的通道，你可以从那里把它\tfocus{重新调出来}。常见的坑：以为 X 是“删除/禁用通道”——它只是\tfocus{视觉上隐藏}，不会改动该通道的脉冲内容；找不回来时别新建，去底部 Channels 卡找。实用提示：把当前实验用不到的通道隐藏起来，可以让一长串通道里真正关心的几行更醒目、对齐更易读。
+\item[X 按钮（隐藏 port）] 把该 logical port 从 \pyapi{visible\_ports} 移除；底部 Ports 卡片可把它加回。X 不删除/禁用硬件、不改 schedule，更不会改变 PortCatalog。
 
-\item[clk 按钮（把通道接到 FPGA 时钟）] 作用：把\tfocus{这一条通道的输出引脚接到 FPGA 时钟}，用来给外部设备（比如 DAC）提供锁存选通。点击后会发生什么：该通道被标记为 clk 通道——它\tfocus{从脉冲引擎里移除}（不再由边沿表驱动，所以引擎\tfocus{绝不会覆盖}它的 clk 行为），它这一行的\tfocus{延迟框和单位框都变灰禁止编辑}（对一条 clk 通道没有意义），并且\tfocus{从 Preview 里隐去}（它输出的是时钟方波，不是脉冲）。再点一次恢复成普通的引擎驱动通道。实现上，编译时把该通道的 mask 位强制清 0，并把一个 62 位的 \pyapi{clk_enable} 掩码随程序下发；FPGA 顶层用 \pyapi{out_final[n] = clk_en[n] ? ~clk : out[n]} 把\tfocus{反相的 clk}接到该引脚（运行时由 CTRL 寄存器选择，换 clk 通道\tfocus{不需要重新综合}，但首次启用这套 mux 需要一次重新构建 bitstream）。\tfocus{为什么是反相 clk}：DAC 的并行数据位是在 clk 上升沿改变的，若选通也用上升沿，DAC 会在数据正在跳变的瞬间锁存而锁进\tfocus{错误的中间码}（表现为"两个 DA edge 段之间偶发出现第三种值"）；用反相 clk 让 DAC 改在下降沿（数据眼图正中、最稳）锁存，从根本上消除这个竞争。常见的坑：DAC 总线（da\_dipole 等）的成员位\tfocus{不能}单独设成 clk（会破坏 DAC），所以这些行的 clk 按钮是禁用的。实用提示：要给外部 DAC 喂时钟，就把对应那条通道（如某个 da\_clk 线）设成 clk，不用再在脉冲里手动翻转它。
+\item[Clock ports（只读拓扑）] \pyapi{PortCatalog.clock\_ports} 与每个 DAC 的 \pyapi{latch\_clock} 在设备/XDC 配置中固定。clock raw lane 永远不进入 period、delay 或 scan 控件；编译器按 catalog 生成 \pyapi{clk\_enable} mask。Pulse GUI 没有切换 clock ownership 的按钮。
 \end{description}
 
 \subsection{扫描圆点（scan dot）——把字段变成扫描变量}
@@ -322,23 +303,23 @@ Channel Names 面板是 Edit 页\tfocus{最左边}的一张白色、带标题的
 \begin{figure}[htbp]
   \centering
   \includegraphics[width=0.52\textwidth]{__GUI_DOT__}
-  \caption{扫描圆点的两种状态。左：未绑定——空心灰色圆环加一个小小的中心点；右：已绑定——实心橙色圆点，里面显示该槽的 1 起编号（\pyapi{s0} 显示 “1”），同时字段变成淡橙底、深橙字的只读样式。}
+  \caption{扫描圆点的两种状态。左：未绑定——空心灰色圆环加一个中心点；右：已绑定——实心橙色圆点，里面显示扫描表的 1 起列序（编译列 \pyapi{s0} 显示 “1”），同时字段变成只读橙色样式。该 slot 的公开身份是 Scan 页显示的语义名，不是 \pyapi{s0}。}
 \end{figure}
 
 \begin{description}
 \item[未绑定时的外观] 一个\tfocus{空心灰色圆环}，中间有一个很小的中心点。看到这个样子，说明该字段还是普通可编辑的数值，没有参与扫描。
 
-\item[点击一次：绑定（bind）] 作用：把该字段绑定到一个扫描槽。点击后会发生三件事：（1）字段变成\tfocus{橙色样式}——淡橙色背景、深橙色文字，并变为\tfocus{只读}（你不能再直接在框里打字，因为它的值现在由扫描表决定）；（2）圆点变成一个\tfocus{实心橙色圆点}，里面显示该槽的\tfocus{从 1 起的编号}——槽 \pyapi{s0} 显示 “1”，\pyapi{s1} 显示 “2”，以此类推；（3）字段里原本存的数值被\tfocus{改写成一个符号表达式} \pyapi{s0} / \pyapi{s1} ……，表示“此处的值取自对应扫描槽”。
+\item[点击一次：绑定（bind）] 作用：把该字段绑定到一个扫描槽。点击后：（1）字段变成\tfocus{橙色只读样式}，值由扫描表决定；（2）圆点显示从 1 起的\tfocus{列序}；（3）字段内部改写为 \pyapi{s0}/\pyapi{s1} 之类编译表达式。同时 该 slot 获得稳定的 \pyapi{ScanSlot.name}：DAC 默认取 logical port 名（如 \pyapi{da\_x}），duration 取 period 语义名（如 \pyapi{probe\_duration}）。Scan 页、PulseScan 坐标 signal 和保存结果都用这个语义名。
 
 \item[再点一次：解绑（unbind）] 作用：把字段从扫描槽上解开，恢复成普通可编辑数值。贴心之处：当你\tfocus{再次绑定同一个字段}时，之前为它在扫描表里填过的那些数值会\tfocus{被记住并恢复}，不用重填。
 
 \item[这等价于哪条 API] 这个圆点就是图形界面里对应的一次 API 调用 \pyapi{state.bind_field(kind, target)}——也就是说，鼠标点圆点和在代码里调用 \pyapi{bind_field} 是同一件事的两种入口。
 
-\item[编号与重新编号（重要的坑）] 槽按\tfocus{绑定顺序}依次命名为 \pyapi{s0}、\pyapi{s1}、\pyapi{s2} ……。如果你\tfocus{解绑中间的一个槽}，它后面的槽会\tfocus{自动重新编号}向前补位——因为这个编号\tfocus{就是表达式里用的 s 变量}本身。常见的坑：你在 Scan 页或某个表达式里写死了 \pyapi{s2}，结果解绑了前面的槽，原来的 \pyapi{s2} 变成了 \pyapi{s1}，含义就跟着变了。实用提示：尽量\tfocus{先把所有要扫的字段绑定齐}再去写扫描表达式；若必须中途解绑，回头核对一遍各表达式里的 s 编号是否还指向你想要的字段，并瞄一眼顶部 Scan 汇总确认槽数正确。
+\item[语义名与编译列] \pyapi{ScanSlot.name} 是稳定的公开身份；\pyapi{s0/s1/...} 只按当前列序分配。解绑中间一列时，后面的 \pyapi{sN} 会前移，但它们的语义名不变；Scan 页的标题、当前点读数和 Hub signal 仍然显示 \pyapi{da\_x}/\pyapi{t\_off} 等名字。编译器会重写 period 内部的 \pyapi{sN} 引用，不要在外部处理或结果分析中把 \pyapi{sN} 当成实验参数名。
 \end{description}
 
 \begin{notebox}[一句话记住扫描圆点]
-灰色空心环 = 普通数值；点一下变\tfocus{橙色实心带编号} = 这个字段交给扫描槽 \pyapi{s$n$} 自动扫；再点一下还原，且\tfocus{记得}你之前填的扫描值。编号即 s 变量，解绑中间槽会让后面的槽\tfocus{整体前移}。
+灰色空心环 = 普通数值；点一下变\tfocus{橙色实心带列序} = 该字段交给一个有语义名的扫描槽；再点一下还原，且\tfocus{记得}之前的扫描列。\pyapi{sN} 是会随列序变动的编译 token，语义名才是给人、signal 与结果使用的身份。
 \end{notebox}
 
 \section{Edit 页 — period 卡片与 DAC 行（逐控件详解）}
@@ -408,7 +389,7 @@ Duration 输入框旁边有一个\tfocus{单位下拉框（combo）}。
 \item[作用] 它控制「在这一段时间里，这条通道是高还是低」。\tfocus{勾选 = 该通道在本 period 内为高电平（HIGH）}；\tfocus{不勾 = 低电平（low）}。
 \item[接受什么值] 只有「勾 / 不勾」两种状态，没有中间态。
 \item[点击后会发生什么] 勾上某通道，本段时间里这条线就被拉高；取消勾选则保持低。整段时间内电平不变——要让一条通道在某时刻翻转，就靠相邻 period 之间该复选框勾选状态的不同来实现。
-\item[标签被省略的情况] 通道标签如果太长，会被用省略号 \pyapi{...} 截断显示；\tfocus{完整名字在鼠标悬停的 tooltip 里}。所以看不清全名时，把鼠标停在标签上稍等即可看到完整通道名。
+\item[标签被省略的情况] PortCatalog 的只读 semantic label 如果太长，会用省略号 \pyapi{...} 截断；tooltip 显示完整 logical key、label、kind 与 raw lane。
 \item[常见坑] 因为标签会被省略，不同通道的截断结果可能看起来很像，容易勾错行。下手前最好靠 tooltip 确认这一行到底是哪条通道。
 \item[实用提示] 把「这条通道在哪几段为高」想成在时间轴上画一条方波：相邻卡片勾选状态相同就是电平保持，状态变化的地方就是一个上升沿或下降沿。顺着卡片从左到右看这一列复选框，就能一眼读出该通道的整个波形。
 \end{description}
@@ -417,8 +398,8 @@ Duration 输入框旁边有一个\tfocus{单位下拉框（combo）}。
 
 卡片下部，\tfocus{每一条模拟总线（DAC）}各占一行，例如 \pyapi{da_dipole} 或线圈的 \pyapi{da_x}/\pyapi{da_y}/\pyapi{da_z}。每行由两个控件组成：一个 mode 下拉 + 一个 value 输入框。先看 mode 下拉。
 
-\begin{notebox}[总线行从哪来：设备自带的通道标签]
-一条模拟总线是由若干\tfocus{位通道}拼出来的（例如三路线圈各占一段 6 bit）。编辑器把这些位通道\tfocus{折叠}成一条总线行，依据的是\tfocus{设备自带的通道标签}——真机的标签来自板卡 XDC（如 \pyapi{da_dipole[0]}），虚拟序列器同样自带一份对齐的标签。所以\tfocus{从会话打开的编辑器}（\pyapi{exp.pulse\_gui()}）\tfocus{一开始、还没载入任何模板}时就已经把线圈显示成 \pyapi{da_x}/\pyapi{da_y}/\pyapi{da_z} 三条总线行，和真机同构——不是要先载一个模板才折叠。标签只标注设备\tfocus{真正携带}的那些通道，绝不广告一条成员缺席的空总线。
+\begin{notebox}[总线行只来自 PortCatalog]
+一条 DAC logical port 在 \pyapi{PortCatalog} 中显式拥有有序 raw lanes、\pyapi{bus\_index}、encoding、safe value 与可选 latch clock。编辑器直接画这条 logical port，\tfocus{不再从字符串 label 猜分组、也不把 raw lanes 当 TTL 行}。真机 catalog 在 XDC/device 边界构造，虚拟 sequencer 提供同构 catalog；因此刚打开编辑器就能正确显示 \pyapi{da\_x/da\_y/da\_z}，与加载哪个 pulse 模板无关。
 \end{notebox}
 
 \begin{description}
@@ -452,18 +433,18 @@ Duration 输入框旁边有一个\tfocus{单位下拉框（combo）}。
 把一张 period 卡片读完，你就知道了这段时间的「全部信息」：它持续多久（Duration + 单位）、每条数字通道是高还是低（复选框）、每条模拟总线输出什么码、怎么变（DAC 行的 mode + value）。整条实验时序，无非是把这样一张张卡片按时间轴从左到右拼接起来。\tfocus{时长不能为 0}、\tfocus{DAC 填的是 -512..+511 的带符号 LSB（0 = 0 V）而非电压}、\tfocus{拖动卡片即可重排顺序}——记住这三条，基本就不会在 Edit 页踩坑。
 \end{notebox}
 
-\section{Edit 页 — 底部 Control / Connection / Channels 控制条（逐按钮详解）}
+\section{Edit 页 — 底部 Control / Connection / Ports 控制条（逐按钮详解）}
 
-Edit 页（脉冲编辑页）的最下方有一整条横向工具区，分成三张带标题的卡片：左侧是 \tfocus{Control}（运行与文件控制），中间是 \tfocus{Connection}（选连什么时序器后端），右侧是 \tfocus{Channels}（通道显示控制）。如果你以前从没用过这个界面，可以把它想象成「磁带录音机的操作面板」：上半部分是你画脉冲波形的大画布，而这一条底部工具区就是控制「录、放、停、存、读」、「接哪台机器」以及「让画面里显示哪些轨道」的按钮。下面对每一个按钮、每一个下拉框逐一讲清楚：它是干什么的、能接受什么值、点下去之后会发生什么、容易踩的坑，以及一个实用小提示。
+Edit 页最下方有三张卡片：Control（运行/文件）、Connection（attached sequencer）与 Ports（只管理 \pyapi{visible\_ports}）。Ports 不提供任何硬件拓扑编辑入口。
 
 \begin{figure}[htbp]
   \centering
   \includegraphics[width=\textwidth]{__GUI_BOTTOMBAR__}
-  \caption{Edit 页底部的三张控制卡片——左为 Control（9 个按钮，3 行 3 列），中为 Connection（后端下拉 + host:port + Connect + 状态行），右为 Channels（下拉框 + 三个按钮 + 一个只读统计标签）。}
+  \caption{Edit 页底部三张卡片：Control、Connection、Ports；Ports 只有视图下拉、按钮与只读统计。}
 \end{figure}
 
 \subsection{Connection 卡片——打开后再选连什么}
-\tfocus{打开 GUI 后}在这里挑时序器后端，不必在命令行里事先定死。下拉三选一：\tfocus{Virtual (sim)}（本地内存时序器，可离线编辑 + 模拟 On Pulse）、\tfocus{Remote server}（连一台正在跑的 FPGA 时序器服务，填 \pyapi{host:port}）、\tfocus{Offline (edit only)}（只编辑、不调后端）。选 Remote 时下方 \pyapi{host:port} 输入框才可编辑；点 \pyapi{Connect} 应用所选连接，状态行显示当前连到哪。换后端只换 On Pulse / Stop / Sync 背后说话的对象，\tfocus{用编辑器自己的通道}重建时序器——通道布局不会被打乱；连不上会弹出提示并保持原连接不变。默认启动即 Virtual（命令行 \pyapi{pulse\_gui.py} 无参数时），显式 \pyapi{--remote-host} 才在启动时直连。
+\tfocus{打开 GUI 后}可选择 Virtual / Remote / Offline backend。连接成功后 editor 使用该 sequencer 的 \pyapi{PortCatalog}；已打开 state 的 catalog fingerprint 必须匹配，绝不拿编辑器里的平行 channel 列表重建后端。连不上或拓扑不符会明确报错并保持原连接。
 
 \subsection{Control 卡片：运行控制按钮（Stop / On）}
 
@@ -494,43 +475,43 @@ Control 卡片一共有 9 个按钮，排成 3 行 3 列。最重要、也最需
 \subsection{Control 卡片：Collapse（折叠左侧面板）}
 
 \begin{description}
-\item[Collapse] \tfocus{作用}：把左边的 \tfocus{Channel Names（通道名）} 面板和 \tfocus{Delay / Scan（延时/扫描）} 面板\tfocus{隐藏起来}，从而把腾出来的横向空间全部让给中间的周期时间线，让波形画布更宽、更好看。\tfocus{接受什么}：动作按钮（切换性质），无输入。\tfocus{点下去会发生什么}：左侧两块面板收起，时间线立刻变宽；同时这颗按钮的文字会从「Collapse」变成「\tfocus{Show Left}」，并且界面上会留下一个小小的存根（stub），让你随时能把面板再调回来。\tfocus{常见坑}：折叠之后通道名和延时编辑区暂时看不见了，新手容易以为「设置丢了」——其实只是被藏起来，数据都还在，点 Show Left（或那个小存根）就回来了。\tfocus{实用提示}：当你的序列周期很多、时间线被挤得很窄看不清细节时，先 Collapse 腾地方专心看波形；需要改通道名或延时时再 Show Left 调回来。
+\item[Collapse] 收起只读 Port Catalog 与 Delay / Scan，把空间让给 period 时间线；Show Left 恢复。它只改变视图，不改变 \pyapi{PortCatalog} 或 pulse schedule。
 \end{description}
 
 \subsection{Control 卡片：文件操作（Save / Load）}
 
 \begin{description}
-\item[Save] \tfocus{作用}：把当前脉冲保存成\tfocus{完整的一包}磁盘文件。\tfocus{接受什么}：动作按钮，无需在按钮上输入参数（实际文件名通过保存流程确定）。\tfocus{点下去会发生什么}：它会写出 \pyapi{.json} 脉冲本体 + \pyapi{.png} 预览图 + \pyapi{<name>_program.json}\tfocus{（编译好的、FPGA 可直接上载的程序——无论是否扫描都会保存，与 On Pulse 实际上传的内容一致）}；如果当前存在扫描表（scan table），还会再写出 \pyapi{<name>_scan.npy} 数组文件。也就是说一次 Save 产出三到四个配套文件，方便你完整复现这次实验设置；某一件写失败时状态栏会写明跳过了哪件及原因。\tfocus{状态指示（confocal 同款）}：有\tfocus{未保存的修改}时按钮显示\tfocus{黄色}且文字带星号（\pyapi{Save*}），标题栏同时带星号；内容保存干净后变回\tfocus{蓝色}的 \pyapi{Save}。\tfocus{实用提示}：把「\pyapi{Save} 蓝色 + 标题栏星号消失」当作「已存盘」的可靠信号；运行前如果看到 \pyapi{Save*} 还是黄色，说明你最新的改动还没落盘，建议先 Save 再 On Pulse，避免事后找不到这次用的是哪份配置。
+\item[Save] \tfocus{作用}：保存当前脉冲及其可重建衍生物。\tfocus{点下去会发生什么}：写出 \pyapi{.json} 脉冲本体（唯一可编辑真相源，包含 scan table）+ \pyapi{.png} 预览图 + \pyapi{<name>_program.json} 编译程序。不会再自动写出重复的 \pyapi{_scan.npy}；数组交换由 Scan 页的 Save Array 明确完成。某一衍生物写失败时状态栏会写明原因。\tfocus{状态指示（confocal 同款）}：有\tfocus{未保存的修改}时按钮显示\tfocus{黄色}且文字带星号（\pyapi{Save*}），标题栏同时带星号；内容保存干净后变回\tfocus{蓝色}的 \pyapi{Save}。
 
-\item[Load] \tfocus{作用}：从磁盘\tfocus{载入}一个脉冲 \pyapi{.json} 文件，并\tfocus{把保存时的整包关联一起恢复}。\tfocus{接受什么}：动作按钮；会让你选择一个之前保存过的 \pyapi{.json}。\tfocus{点下去会发生什么}：选中的脉冲文件被读入，画布上的周期、通道、延时、扫描等设置会替换成文件里的内容；若同目录有配套的 \pyapi{<name>_scan.npy}，它会被自动重新挂回"载入文件"来源（Delay / Scan 面板显示该文件名）。\tfocus{误选}了 \pyapi{_program.json} 或 \pyapi{_scan.npy} 时，只要同目录有对应的脉冲 \pyapi{.json}，会自动改为加载脉冲本体并提示。\tfocus{常见坑}：Load 会用文件内容\tfocus{覆盖}当前编辑区——如果你当前有未保存的改动（Save 还是黄色、标题栏有星号），载入前务必先 Save，否则改动会丢失。\tfocus{实用提示}：Save 与 Load 是一对——一包文件同名成套（\pyapi{.json}、\pyapi{.png}、\pyapi{_program.json}、\pyapi{_scan.npy}），日后一眼认出哪份配置对应哪次实验，复现和归档都更省心。
+\item[Load] \tfocus{作用}：从磁盘载入一个脉冲 \pyapi{.json}。其中的周期、端口、延时、语义扫描槽、扫描表与 scan code 一次性替换编辑区；不会搜索同目录的数组文件。误选同名前缀的 \pyapi{_program.json} 时会明确转到 pulse JSON。Load 会覆盖当前未保存编辑，先看 Save 是否仍为黄色。
 \end{description}
 
 \begin{notebox}[一次 Save 到底产生几个文件？]
-通常三个：\pyapi{.json} 脉冲本体 + \pyapi{.png} 预览图 + \pyapi{<name>_program.json} 编译好的 FPGA 程序（\tfocus{无论是否扫描都有}）。设置了扫描表时是四个（再加 \pyapi{<name>_scan.npy} 扫描数组）。看到 Save 变蓝、标题栏星号消失，就代表这一套都已经写好了。
+始终三个：\pyapi{.json} 脉冲本体 + \pyapi{.png} 预览图 + \pyapi{<name>_program.json} 编译好的 FPGA 程序。扫描表已经在 pulse JSON 中，绝不自动复制为第二份数组。
 \end{notebox}
 
-\subsection{Channels 卡片：把隐藏通道调回来（下拉框 + Add）}
+\subsection{Ports 卡片：把隐藏 logical port 加回视图}
 
-右侧的 Channels 卡片专门管「画面里显示哪些通道」，它不改变硬件输出，只改变\tfocus{你看到什么}。
-
-\begin{description}
-\item[隐藏通道 / DAC 总线 下拉框] \tfocus{作用}：这是一个下拉列表，里面列出当前\tfocus{被隐藏的}通道以及 DAC 总线，供你挑一个重新显示出来。\tfocus{接受什么}：从下拉项中选择一个条目（某个被藏起来的通道或某条总线）。\tfocus{点下去会发生什么}：仅仅是「选中」，此时还没真正显示——它只是告诉旁边的 Add 按钮「我要调回的是这一个」。\tfocus{常见坑}：光在下拉框里选好并不会让通道出现，必须再点 Add 才生效；如果下拉框是空的，说明当前没有被隐藏的通道可调回。\tfocus{实用提示}：先在下拉框里看一眼到底有哪些通道被藏了，这本身就是个快速排查「我的某个通道怎么不见了」的好办法。
-
-\item[Add] \tfocus{作用}：把下拉框里\tfocus{当前选中}的那个通道/总线\tfocus{重新显示}出来。\tfocus{接受什么}：动作按钮，配合上面的下拉框使用。\tfocus{点下去会发生什么}：被选中的通道立刻回到时间线画布上，重新可见可编辑。\tfocus{常见坑}：注意这是「显示/隐藏」层面的操作，把通道调回来\tfocus{不会}改变它的脉冲内容，也不会改变硬件输出；别把它误解成「新增一个硬件通道」。\tfocus{实用提示}：配合下面的 Hide Off 一起用——先 Hide Off 把无关通道清掉，等需要某个特定通道时再用「下拉框选中 + Add」精准把它单独调回来。
-\end{description}
-
-\subsection{Channels 卡片：批量显示/隐藏（Hide Off / Show All）与统计标签}
+右侧的 Ports 卡片只管理 \pyapi{visible\_ports}：它从不可变 PortCatalog 的可编程 logical ports 中选择画面行，不改变硬件拓扑、日程或上传宽度。
 
 \begin{description}
-\item[Hide Off] \tfocus{作用}：\tfocus{隐藏所有「全程为关」的通道}——也就是那些在\tfocus{每一个周期里都处于关（低电平 0）}的通道，用来减少画面杂乱。\tfocus{接受什么}：动作按钮，无输入。\tfocus{点下去会发生什么}：凡是从头到尾都没被用到（始终是 0）的通道会从画布上消失，剩下的都是真正参与了这个序列的通道，画面立刻清爽很多。\tfocus{常见坑}：判断标准是「在\tfocus{每个}周期都为关」——只要某个通道在\tfocus{任意一个}周期里有过高电平，它就\tfocus{不会}被隐藏。所以如果你期望某条线被藏却没被藏，多半是它在某个周期里其实有输出。\tfocus{实用提示}：序列搭好后先点一下 Hide Off，能把几十条通道里真正在用的那几条凸显出来，审阅波形时效率高很多；想看全貌时再用下面的 Show All 还原。
+\item[Hidden port 下拉框] 列出 catalog 中当前未显示的 digital/DAC logical ports；选择只确定 Add 的目标。clock port 与 DAC raw data lanes 不进入可编辑行。
 
-\item[Show All] \tfocus{作用}：\tfocus{显示所有硬件通道}，把之前隐藏的全部调回来。\tfocus{接受什么}：动作按钮，无输入。\tfocus{点下去会发生什么}：所有硬件通道（无论之前是被 Hide Off 还是被单独隐藏的）一次性全部重新出现在画布上。\tfocus{常见坑}：通道一多画面会变得很密集、需要滚动，这是正常的；Show All 是「看全貌」用的，不适合长时间编辑细节。\tfocus{实用提示}：把 Hide Off 和 Show All 当成一对开关——\tfocus{Hide Off 聚焦、Show All 总览}。检查「是不是漏配了某个通道」时点 Show All，专注编辑时点 Hide Off。
-
-\item[只读统计标签] \tfocus{作用}：这是一个\tfocus{不可编辑}的文字标签，实时显示当前的可见/隐藏统计，例如「\pyapi{Visible 18/32 | Hidden 14}」。\tfocus{接受什么}：它不接受任何输入，纯展示。\tfocus{点下去会发生什么}：什么都不会发生——它只是一面「仪表」，告诉你 32 条硬件通道里当前显示了 18 条、藏了 14 条。\tfocus{常见坑}：别试图点它或改它，它不是按钮也不是输入框。\tfocus{实用提示}：用它快速核对——比如你 Hide Off 之后看到「Visible 6/32」，就能立刻知道这个序列实际只用到了 6 条通道；数字和你的预期不符时，说明有通道被多配或漏配，值得回头检查。
+\item[Add] 把所选 logical port 加回 \pyapi{visible\_ports}。它不会新增硬件、改 label、改 port kind 或改变已有脉冲内容。
 \end{description}
 
-\begin{notebox}[Channels 卡片只影响「显示」，不影响「输出」]
-请牢记：Channels 卡片里的下拉框、Add、Hide Off、Show All 全部只改变\tfocus{画面上看到哪些通道}，丝毫不改变 FPGA 实际输出的脉冲。把一条通道藏起来，它在硬件上该高还是高、该低还是低；调出来也只是让你重新看见而已。真正改变运行行为的，是左边 Control 卡片里的 On Pulse / Stop Pulse。
+\subsection{Ports 卡片：批量显示/隐藏与统计}
+
+\begin{description}
+\item[Hide Off] 隐藏 schedule 全程处于安全/hold 状态的可编程 logical ports，只缩减画面行。
+
+\item[Show All] 把 catalog 的全部可编程 logical ports 加回视图；不会暴露 clock port 或 DAC raw lanes。
+
+\item[只读统计标签] 显示 logical port 的 visible/hidden 数；它只是 \pyapi{visible\_ports} 的仪表，不是按钮或输入框。
+\end{description}
+
+\begin{notebox}[Ports 卡片只影响视图]
+下拉框、Add、Hide Off、Show All 只写 \pyapi{visible\_ports}。真正拓扑始终是 \pyapi{PortCatalog}，真正输出由 period/DAC schedule 经编译后决定。
 \end{notebox}
 
 \section{Preview 页与扫描高亮在预览里怎么显示（逐元素详解）}
@@ -604,20 +585,19 @@ Preview（预览）页是你在真正把脉冲发到 FPGA 之前，用来"用眼
 \item[实用提示] 看 repeat 标记时，先找最外层的 ×∞ 确认整体是不是无限跑，再逐个看内层的 ×N 核对每段重复次数对不对。如果发现括号右端伸得比你预期长，去检查相关通道的延迟设置，多半就是它把边沿推出去了。
 \end{description}
 
-\subsection{扫描高亮（橘色透明）：三种被扫描的量怎么标}
+\subsection{扫描高亮（橘色透明）：两种可扫字段怎么标}
 
 这是 Preview 页最有特色的部分。当你把某个参数绑定为\tfocus{扫描槽位（scan slot）}时，预览会用\tfocus{透明的橘色}把这个参数在图上对应的位置高亮出来，并\tfocus{在该高亮上标一次它的槽位编号}。编号是 \tfocus{1 基（1-based）}的——也就是从 1 开始数，而不是从 0；每个高亮只标\tfocus{一次}编号，不会在同一段上重复盖好几个相同的数字。
 
-下面分三种被扫描的量来讲，它们的高亮形状和编号位置各不相同，认清形状就能一眼分辨你扫的到底是哪一类量。
+下面只有两种高亮：duration 与 DAC value。channel delay 是固定输出延时，不是 scan slot；它可以绑定紫色 API handle 由 task/notebook 在运行前设定，但不会出现橙色扫描带。
 
 \begin{description}
 \item[被扫描的 DURATION（周期时长）] 当你扫描某个周期的\tfocus{时长}时，高亮是一条\tfocus{橘色的竖向带子}，盖住\tfocus{这个周期所占的那段时间}。关键点：这条带子在纵向上\tfocus{只覆盖通道行的区域}——它的\tfocus{顶部恰好到最上面那条通道的顶}，\tfocus{绝不会再往上越过去}盖到标题那一带。它的\tfocus{槽位编号}写在\tfocus{最顶上通道正上方那一小条空隙（headroom）里}，刚好夹在通道和标题之间，\tfocus{不会和标题文字叠在一起}。这样你既能看清是哪个周期被扫，又不会让数字糊进标题。
-\item[被扫描的 DELAY（通道延迟）] 当你扫描某个通道的\tfocus{延迟}时，高亮是一条橘色带子，盖在\tfocus{这个通道自己脉冲的"前导段（lead-in）"}上，而且\tfocus{就画在这条通道自己的行上}——它会\tfocus{精确落到正确的那条通道行}，不会跑到别的通道去。\tfocus{槽位编号}也写在\tfocus{这条通道的行上}。所以当你看到某条通道行的脉冲前面有一段橘色，就知道这条通道的延迟正被扫描。
 \item[被扫描的 DAC 值] 当你扫描某条 DAC 总线的\tfocus{输出值}时，高亮\tfocus{跟着那条模拟阶梯线走}：它是一段\tfocus{位于该数值高度上的、短短的橘色线段}，只覆盖被扫描的那个周期，\tfocus{而不是把整行涂成一个色块}。也就是说，橘色出现在"线当前的高度"上，随值高低而高低。它的\tfocus{槽位编号}写在\tfocus{这条模拟行的正下方一点点}的位置。
 \end{description}
 
-\begin{notebox}[怎么靠形状区分三种扫描]
-快速心法：橘色\tfocus{满高地盖住整段时间、数字在顶部通道上方} = 在扫\tfocus{周期时长}；橘色\tfocus{只盖某条通道脉冲的开头、数字在那条通道行上} = 在扫这条通道的\tfocus{延迟}；橘色\tfocus{是一小段贴着阶梯线高度的短线、数字在模拟行下方} = 在扫\tfocus{DAC 值}。记住这三种形状，你不用点任何东西就能读出自己到底在扫什么。
+\begin{notebox}[怎么靠形状区分两种扫描]
+橘色\tfocus{满高盖住整段时间、列序在顶部通道上方} = 扫\tfocus{周期时长}；橘色\tfocus{贴着阶梯线高度的短线、列序在模拟行中} = 扫\tfocus{DAC 值}。通道 delay 不可扫，因此不存在第三种橘色形状。
 \end{notebox}
 
 \begin{notebox}[编号为什么只出现一次]
@@ -626,9 +606,9 @@ Preview（预览）页是你在真正把脉冲发到 FPGA 之前，用来"用眼
 
 \section{Scan 页与扫描工作流（逐元素详解 + 实操配方）}
 
-Scan 页是你\tfocus{搭建扫描表}（也就是扫描点列表）的地方。所谓"扫描表"，本质上是一张二维数表：每一\tfocus{行}代表实验要采集的一个\tfocus{扫描点}，每一\tfocus{列}代表一个被绑定的扫描槽（slot，记作 \pyapi{s0}、\pyapi{s1}、\pyapi{s2} ……）。当你在硬件上 On Pulse 时，序列器会从上到下逐行执行这张表，每一行对应硬件上的一次无缝扫描点，并且\tfocus{每个扫描点恰好发一次相机触发}。换句话说，扫描表有多少行，这一轮就采集多少个数据点。
+Scan 页是你\tfocus{搭建扫描表}（扫描点列表）的地方。每一\tfocus{行}是一次模板实例化，每一\tfocus{列}是一个有语义名的 \pyapi{ScanSlot}（如 \pyapi{exposure}、\pyapi{da\_x}）。On Pulse 后 sequencer 无缝逐行执行，但它\tfocus{不知道相机}：每行有零个、一个还是多个 trigger，只取决于 pulse 模板本身。扫描表行数是硬件点数，不是相机帧数的隐式诺言。若用 PulseScan 收 y，必须另外启动真正拥有相机/处理器的 producer，并让它每行发布一个带 provenance 的新 y；PulseScan 按 cursor 顺序消费，不采帧也不转发 frame。
 
-在动手之前，先记住贯穿整页的核心约束：扫描表里你能引用的变量只有 \pyapi{s0} 到 \pyapi{s\{n-1\}}，没有历史遗留的 \pyapi{x}/\pyapi{y} 概念。每一列对应哪个物理量，是你在 Edit 页给某个字段点"扫描圆点"绑定时决定的——绑定第一个字段得到 \pyapi{s0}，第二个得到 \pyapi{s1}，以此类推。Scan 页本身不创建槽，它只负责给这些已存在的槽\tfocus{填数值}。
+核心约束是：列序由 Edit 页的绑定顺序决定，列标题始终显示 \pyapi{ScanSlot.name}。代码编辑器唯一必需的输出变量是 \pyapi{scan\_table}；模板会用 \pyapi{exposure}/\pyapi{da\_x} 之类语义局部变量组列。\pyapi{s0..sN} 仅出现在 pulse 内部表达式与“compiler sN”辅助标注中。Scan 页不创建 slot，只给已绑定 slot 填值。
 
 \begin{figure}[htbp]
   \centering
@@ -641,10 +621,10 @@ Scan 页是你\tfocus{搭建扫描表}（也就是扫描点列表）的地方。
 页面最顶部是一块\tfocus{只读的说明文字}，每一个被绑定的扫描槽占一行，告诉你这张表的每一列到底代表什么物理量、属于哪个周期或通道、以及它的\tfocus{单位}。
 
 \begin{description}
-\item[它显示什么] 每行形如 \pyapi{s0: Period 4 duration [ns] (nominal 50000)}、\pyapi{s1: da\_dipole (period 2) [value]}。冒号前是槽号（与代码里要用的变量名一一对应），冒号后是这个槽绑定到的字段的人类可读描述：是哪个周期的 duration，还是哪个周期的某个 DAC 总线值。
-\item[单位约定] 方括号里的单位非常关键。时间类的槽（duration、delay）单位是 \pyapi{[ns]}（纳秒），你在代码里填的数字就按纳秒理解；DAC 类的槽单位是 \pyapi{[value]}，表示\tfocus{带符号 DAC 值}（LSB，0 = 0 V），不是电压、也不是纳秒，取值范围是整数 \pyapi{-512} 到 \pyapi{+511}（线上自动换算成 offset-binary 码）。把这两类单位搞混是新手最常见的错误。
+\item[它显示什么] 每行形如 \pyapi{probe\_duration (compiler s0): Period 4 duration [ns]} 或 \pyapi{da\_x (compiler s1): da\_x (period 2) [value]}。最前面是稳定的语义名，括号内 \pyapi{sN} 只是调试用的编译列；后面是真实物理字段与单位。
+\item[单位约定] duration scan slot 是 \pyapi{[ns]}；DAC scan slot 是 \pyapi{[value]}（带符号 LSB，0 = 0 V）。delay 不是 scan slot，只能作为固定值或紫色 API handle。
 \item[nominal 标注] 对于像 duration 这样有标称值的槽，括号里会附带 \pyapi{(nominal 50000)}，告诉你这个字段在 Edit 页填的原始值是多少。它是一个\tfocus{参照基准}：你可以围绕这个标称值设计扫描范围（比如以 50000 ns 为中心上下扫），心里好有个数。
-\item[点击后会发生什么] 这块区域是纯展示，\tfocus{不能点击、不能编辑}。它会随着你在 Edit 页绑定/解绑字段而自动刷新行数和内容——你在 Edit 多绑一个字段，这里就多出一行 \pyapi{s\{下一个号\}}。
+\item[点击后会发生什么] 这块区域是纯展示，\tfocus{不能点击、不能编辑}。它会随 Edit 页的绑定/解绑自动刷新；新列会显示新的语义名和当前 compiler 列序。
 \item[常见坑] 如果这里\tfocus{一行都没有}（显示类似"无扫描槽"的占位提示），说明你还没在 Edit 页绑定任何字段，此时写再多代码也没有列可填。请先回 Edit 页点亮至少一个扫描圆点。
 \item[实用提示] 写代码前，先照着这块说明从上往下数一遍：第 0 行就是 \pyapi{scan\_table} 的第 0 列，第 1 行就是第 1 列……让脑子里的"列序"和说明里的"槽序"对齐，能避免把 duration 的数填进 DAC 列这类张冠李戴的错误。
 \end{description}
@@ -656,10 +636,10 @@ Scan 页是你\tfocus{搭建扫描表}（也就是扫描点列表）的地方。
 \begin{description}
 \item[作用] 它是构建扫描表最灵活的方式：用代码生成任意规则或不规则的扫描点序列（等间距、对数、随机、网格……），远比手动敲数字高效。
 \item[可用的命名空间] 代码执行时，环境里已经为你准备好了：\pyapi{numpy}（以 \pyapi{np} 名字提供）、\pyapi{math} 模块，以及整数 \pyapi{n\_slots}（当前被绑定的槽数量，等于扫描表应有的列数）。你可以直接用 \pyapi{np.linspace}、\pyapi{np.arange}、\pyapi{np.column\_stack} 等，无需自己 import。
-\item[必须满足的契约] 代码运行完，命名空间里\tfocus{必须存在}一个名为 \pyapi{scan\_table} 的变量，且它是一个二维数组：行数 = 扫描点个数（你自己定，比如 21、50、100），列数 = \pyapi{n\_slots}。第 \pyapi{j} 列填的就是槽 \pyapi{s\{j\}} 在它\tfocus{显示单位}下的数值（时间槽填 ns、DAC 槽填 -512..+511 的带符号值，0 = 0 V）。
+\item[必须满足的契约] 代码运行完，命名空间里\tfocus{必须存在}二维 \pyapi{scan\_table}：行数 = 扫描点数，列数 = \pyapi{n\_slots}。第 \pyapi{j} 列对应顶部第 j 个语义名，并使用该列声明的单位（duration 填 ns，DAC 填带符号 LSB）。
 \item[点击 Run 后会发生什么] 见下一小节。简单说：代码被执行，\pyapi{scan\_table} 被读出并写回状态，下方预览随即刷新。
 \item[常见坑] （1）忘了把结果命名成 \pyapi{scan\_table}，或者拼错变量名；（2）数组列数和 \pyapi{n\_slots} 不一致——比如绑了 3 个槽却只给了 2 列；（3）把 DAC 列写成了纳秒级的大数（如 50000），而 DAC 带符号值的合法范围只有 -512..+511；（4）写成一维数组而忘了它需要是二维（哪怕只有一个槽，也应是 N×1 的形状）。
-\item[实用提示] 善用 \pyapi{n\_slots} 让代码自适应：用 \pyapi{np.column\_stack([...])} 按列拼装，每个槽一列，顺序严格对应顶部说明里的 \pyapi{s0, s1, ...}。先在脑中确认"第几列是哪个物理量"，再动手拼列，能一次写对。
+\item[实用提示] 用 \pyapi{np.column\_stack([...])} 按顶部的语义名顺序拼列。默认模板已直接以 \pyapi{ScanSlot.name} 命名每个局部列，无需根据 \pyapi{sN} 反猜物理量。
 \end{description}
 
 \subsection{Run 按钮（绿色）}
@@ -678,7 +658,7 @@ Scan 页是你\tfocus{搭建扫描表}（也就是扫描点列表）的地方。
 
 \begin{description}
 \item[Load Program 按钮] 作用：从磁盘载入一段 Python 程序（\pyapi{.py}/\pyapi{.txt}）\tfocus{到代码编辑器}里。注意它载入的是\tfocus{代码}，不是数组数据——和载入扫描表数组（在 Delay / Scan 面板的 \pyapi{Load Array}）是两回事。常见用途：把一段调好的生成逻辑存成 \pyapi{.py}，下次直接载入复用。
-\item[Template: column\_stack 按钮] 作用：把\tfocus{默认模板}填进编辑器——每个槽一列、用 \pyapi{np.column\_stack} 拼装。它\tfocus{按当前绑定的槽数自动适配}（一个槽给单列，两个槽给"反相关、总和恒定"的示例）。这是新手最该先点的按钮。
+\item[Template: column\_stack 按钮] 默认模板以 \pyapi{np.column\_stack} 每个 slot 生成一列。它按当前 slot 数、语义名、类型和各自单位/范围生成：DAC 列绝不会套用 duration 的 ns 范围。
 \item[Template: grid 按钮] 作用：填入\tfocus{网格（外积）模板}——用两个数组的 \pyapi{np.meshgrid} 生成所有组合点，同样按槽数自适应。适合二维扫描（比如同时扫时长和 DAC 码的每个组合）。
 \end{description}
 
@@ -699,8 +679,8 @@ Scan 页是你\tfocus{搭建扫描表}（也就是扫描点列表）的地方。
 \subsection{下方：只读扫描表预览}
 
 \begin{description}
-\item[作用] 编辑器下方是一张\tfocus{只读}的扫描表预览，按 \pyapi{s0}/\pyapi{s1}/\pyapi{...} 列展示扫描表的\tfocus{前若干行}，并显示总的扫描点数（point count）。
-\item[它告诉你什么] 这是你"所写即所得"的核对窗口：列名让你确认每一列对应哪个槽，前几行数值让你检查范围和步长是否正确，点数让你确认这一轮会采多少个点（也就是会发多少次相机触发）。
+\item[作用] 编辑器下方是一张\tfocus{只读}的扫描表预览，以 \pyapi{ScanSlot.name}（如 \pyapi{exposure}/\pyapi{da\_x}）作列标题，展示前若干行和总点数。
+\item[它告诉你什么] 列名核对物理量，数值核对范围/步长，point count 核对硬件实例化次数。trigger 数由 pulse 模板内容决定，不能从 point count 推断。
 \item[点击后会发生什么] 它\tfocus{不可编辑}，纯展示。每次 Run、Load Array 或切换来源开关后它会自动刷新。
 \item[常见坑] 它通常只显示前几行，别因为没看到全部行就以为表被截断了——以显示的\tfocus{总点数}为准。如果点数或列数和你预期不符，回到代码或文件去查，而不是试图在预览里改。
 \item[实用提示] 上硬件前，最后扫一眼这里的\tfocus{点数}和\tfocus{第一行/最后一行}（如果能看到），快速验证扫描范围的两个端点是否如你设计，这是最省事的"出错前一刻"检查。
@@ -711,40 +691,39 @@ Scan 页是你\tfocus{搭建扫描表}（也就是扫描点列表）的地方。
 把整个扫描串起来，一共四步，前面在 Edit 页，后面在 Scan 页和运行：
 
 \begin{enumerate}
-\item \tfocus{在 Edit 页绑定字段}：找到你想扫的字段（某周期的 duration、或某周期的 DAC 总线值），点它旁边的\tfocus{扫描圆点}。第一个绑定的字段成为 \pyapi{s0}，第二个成为 \pyapi{s1}，依次类推。绑定后该字段会被高亮标记并显示槽号。
+\item \tfocus{在 Edit 页绑定字段}：点 duration 或 DAC value 旁的扫描圆点。系统以 period 语义或 DAC logical port 生成稳定 \pyapi{ScanSlot.name}，并另行分配仅供编译的 \pyapi{sN} 列。
 \item \tfocus{在 Scan 页写代码}：照着顶部"列含义说明"确认每一列是哪个槽、什么单位，然后在代码编辑器里构造一个 N\_points × \pyapi{n\_slots} 的数组并赋给 \pyapi{scan\_table}。
 \item \tfocus{点 Run}：执行代码，把 \pyapi{scan\_table} 写回状态，并在下方预览核对行数、列、数值。
-\item \tfocus{On Pulse 运行}：硬件\tfocus{无缝}地逐行执行这张扫描表，每个扫描点对应一次相机触发。一轮跑完，你就得到了对应所有扫描点的数据。
+\item \tfocus{On Pulse 运行}：硬件无缝逐行实例化 pulse 模板。每行 trigger 数完全等于模板内的 trigger 数；sequencer 不隐式添加相机行为。
 \end{enumerate}
 
 \begin{notebox}[一句话记忆]
-Edit 页\tfocus{绑定}决定有几列（\pyapi{s0, s1, ...}），Scan 页\tfocus{填数}决定有几行（扫描点）。列错了回 Edit，行错了回代码。
+Edit 页\tfocus{绑定}决定语义列及顺序，Scan 页\tfocus{填数}决定行数。对外记 \pyapi{ScanSlot.name}，\pyapi{sN} 只给编译器用。
 \end{notebox}
 
 \subsection{实操配方一：一维 duration 扫描}
 
-最常见的需求：固定其它一切，只扫某个周期的持续时间。假设你在 Edit 页只绑定了一个字段（某周期的 duration），它是 \pyapi{s0}，单位 ns，标称值 \pyapi{50000}。下面这段代码以标称值为中心、从 \pyapi{40000} ns 到 \pyapi{60000} ns 扫 \pyapi{21} 个等间距点：
+最常见的需求：固定其它一切，只扫某个周期的 duration。假设该 slot 的语义名是 \pyapi{probe\_duration}（内部编译列恰好为 \pyapi{s0}），单位 ns，标称值 50000：
 
 \begin{codeblock}[Python]
-# 只绑定了一个 duration 槽 s0（单位 ns）
-durations = np.linspace(40000, 60000, 21)   # 21 个点，含两端
-scan_table = durations.reshape(-1, 1)        # 形状 (21, 1) = N_points x n_slots
+# 公开名 probe_duration；单一列的 compiler token 是 s0
+probe_duration = np.linspace(40000, 60000, 21)
+scan_table = probe_duration.reshape(-1, 1)   # (21, 1) = N_points x n_slots
 \end{codeblock}
 
 \begin{description}
-\item[要点] \pyapi{linspace(a, b, n)} 生成含两端、共 \pyapi{n} 个等间距值；\pyapi{reshape(-1, 1)} 把一维数组变成 N×1 的二维表（一列对应唯一的槽 \pyapi{s0}）。
+\item[要点] \pyapi{reshape(-1, 1)} 把一维坐标列变成 N×1 扫描表；列的公开身份仍是 \pyapi{probe\_duration}。
 \item[常见坑] 别忘了 \pyapi{reshape}——一维数组不满足"二维 N×slots"的契约；时间值用 ns，别误填成别的单位。
 \item[提示] 想换成对数扫描就把 \pyapi{np.linspace} 换成 \pyapi{np.logspace}；想改点数只改第三个参数，预览里的 point count 会立刻反映出来。
 \end{description}
 
 \subsection{实操配方二：扫一个 DAC 电平（带符号值 -512..+511，0 = 0 V）}
 
-如果你绑定的是一个 DAC 总线值字段（\pyapi{[value]} 单位），它对应带符号 DAC 值（0 = 0 V），合法范围是整数 \pyapi{-512} 到 \pyapi{+511}。假设它是唯一绑定的槽 \pyapi{s0}，下面在整个量程上扫 \pyapi{32} 个点：
+如果绑定的 DAC logical port 是 \pyapi{da\_x}，它的语义 slot 名也是 \pyapi{da\_x}，合法带符号范围是 -512..+511：
 
 \begin{codeblock}[Python]
-# 只绑定了一个 DAC 值槽 s0（带符号值 -512..+511，0 = 0 V）
-codes = np.linspace(-512, 511, 32).round().astype(int)
-scan_table = codes.reshape(-1, 1)            # 形状 (32, 1)
+da_x = np.linspace(-512, 511, 32).round().astype(int)
+scan_table = da_x.reshape(-1, 1)              # 形状 (32, 1)
 \end{codeblock}
 
 \begin{description}
@@ -755,35 +734,34 @@ scan_table = codes.reshape(-1, 1)            # 形状 (32, 1)
 
 \subsection{实操配方三：二维扫描（duration × DAC）}
 
-二维扫描就是把两个槽的取值做\tfocus{笛卡尔网格}，每个组合是一个扫描点。假设 \pyapi{s0} 是 duration（ns），\pyapi{s1} 是 DAC 带符号值（-512..+511）。下面构造一个 \pyapi{11 × 8 = 88} 点的网格：
+二维扫描就是把 \pyapi{probe\_duration} 与 \pyapi{da\_x} 做笛卡尔网格。它们在当前列序中的内部 token 可能是 \pyapi{s0/s1}，但该 token 不进入结果 signal：
 
 \begin{codeblock}[Python]
-# s0 = duration [ns], s1 = DAC value [-512..+511] (0 = 0 V)
-durs  = np.linspace(40000, 60000, 11)        # 11 个 duration
-codes = np.linspace(-512, 511, 8).round().astype(int)  # 8 个带符号 DAC 值
+probe_duration = np.linspace(40000, 60000, 11)
+da_x = np.linspace(-512, 511, 8).round().astype(int)
 
 # 笛卡尔积：每个 (duration, code) 组合一行
-D, C = np.meshgrid(durs, codes, indexing="ij")
+D, C = np.meshgrid(probe_duration, da_x, indexing="ij")
 scan_table = np.column_stack([D.ravel(), C.ravel()])  # 形状 (88, 2)
 \end{codeblock}
 
 \begin{description}
-\item[要点] \pyapi{np.meshgrid(..., indexing="ij")} 配 \pyapi{ravel()} 展平，再用 \pyapi{np.column\_stack} 按\tfocus{槽序}拼成两列——第 0 列是 \pyapi{s0}（duration），第 1 列是 \pyapi{s1}（DAC）。列序必须和顶部说明一致。
+\item[要点] 第 0 列是 \pyapi{probe\_duration}，第 1 列是 \pyapi{da\_x}；列序必须和顶部语义说明一致。
 \item[常见坑] 列放反（把 DAC 码放进 duration 列）会让两个物理量错位；网格点数是两边相乘，点数容易爆炸，先在预览里确认 point count 别太大。
-\item[提示] 想加第三维（比如再扫一个 DAC 值槽 \pyapi{s2}），把它也放进 \pyapi{meshgrid} 并在 \pyapi{column\_stack} 里加一列即可。
+\item[提示] 想加第三维（如 \pyapi{da\_y}），把它也放进 \pyapi{meshgrid} 并在 \pyapi{column\_stack} 里加一列。
 \end{description}
 
 \begin{notebox}[同时扫多个物理量]
-DAC 值与 duration 两类槽\tfocus{可以在同一轮里一起扫}（通道延时是固定值，不参与扫描）。你在 Edit 页绑定几个字段、Scan 页就给几列填数，硬件会按行无缝执行这张多列扫描表，每个扫描点照常发一次相机触发。这让"沿某条轨迹同步改变多个参数"或"多维网格扫描"成为一次 On Pulse 就能完成的事。
+DAC 值与 duration 可在同一张表里联动（delay 不参与扫描）。硬件按行无缝实例化模板；每行是否产生相机 trigger、产生几个，只由模板本身决定。
 \end{notebox}
 
 \section{Sync 按钮、UNSYNCED 状态与 period 选择}
 
 \begin{itemize}
   \item \tfocus{Sync（橙色）}：把"sequencer 上实际应用的脉冲"拉回编辑器。当你在 notebook 里用 \pyapi{PulseController}（\pyapi{on_pulse}/\pyapi{set_channel_delay} 等）改了设备而 GUI 没跟上时，点一下即恢复一致——服务端在每次成功 prepare 时记录源 payload，GUI 与 API 读的是同一份。
-  \item \tfocus{UNSYNCED（\pyapi{On Pulse*} 星号 + 橙色状态点）}：设备在 RUNNING/PREPARED 状态下，\tfocus{任何}编辑（duration/delay/DA/scan/clk/显隐/载入……）都会给 On Pulse 按钮加上 confocal 同款的\tfocus{星号}并把\tfocus{标题栏状态点}变橙——提示"设备上跑的已不是你眼前的参数，按一下应用"。按钮本身\tfocus{保持绿色}（颜色不用于表达状态，避免与 Remove/Load/Sync 的常驻橙色混淆）。若把修改改回原样，星号与橙点自动消失；重新 On Pulse 即清除。Save 的 \pyapi{Save*} 黄色+星号语义表示"未保存到文件"，与运行状态相互独立。
+  \item \tfocus{UNSYNCED（\pyapi{On Pulse*} 星号 + 橙色状态点）}：duration/delay/DAC/scan/显隐/载入等 schedule/view 编辑使眼前 state 与设备上运行程序不同；clock topology 不可在这里编辑。
   \item \tfocus{点选 period / 中缝}：单击一张 period 卡片（\tfocus{整张卡片的外缘}出现一圈圆角描边——只描卡片边缘，不影响卡内任何控件）或两张卡片之间的空隙（出现竖线指示），Add Period 就插到所选位置、Remove 删除所选；再点一次取消选择；无选择时维持旧行为（加/删最后一个）。扫描 slot 绑定、DAC 总线计划与 repeat bracket 会随中间插入/删除自动重定位。
-  \item \tfocus{Clear All（标题栏右端，橙色）}：一键把\tfocus{日程}清空——删除所有 period 与所有通道/总线延时，只留下\tfocus{一个 1 \textmu s 的空白 period}（没有任何通道为 on，DA 总线为 Hold 空闲）；扫描绑定、扫描表与 repeat bracket 同时清除。\tfocus{保留}的是硬件接线层信息：通道名/语义标签、显示/隐藏状态、DA 总线分组与 clk 指派。清空属于普通编辑：会照常触发 \pyapi{Save*}（未保存）与 UNSYNCED 星号，不会自动写盘或上传——从零搭一个新脉冲前先点它最方便。
+  \item \tfocus{Clear All（标题栏右端，橙色）}：清空 schedule/value/delay/slots/repeat bracket，只留一个空白 period；不可变 \pyapi{port\_catalog} 从未属于可清内容。
   \item \tfocus{单 period 保护}：只剩一个 period 时 Remove 被禁用（脉冲表至少要有一个 period）。
   \item \tfocus{拖动排序}：拖动时光标下有半透明卡片缩略图，插入位置竖线为覆盖层（不引起整行重排抖动），拖到视口边缘会自动滚动——后面的 period 始终可达。
   \item \tfocus{预览横轴自动加宽}：与纵轴的行块一致，每 5 个 period 增加一个基础宽度块，最多 3 倍（\pyapi{live.PULSE_X_PERIODS_PER_BLOCK} / \pyapi{PULSE_X_MAX_WIDTH_FACTOR} 可配置）。深度缩放下刻度标签按间距自适应精度，避免退化成一排相同的 "8ms"。
@@ -810,7 +788,7 @@ ed = PulseSequenceEditor()        # 空白脉冲表
 ed.show(); app.exec_()
 \end{codeblock}
 
-打开后默认停在 \tfocus{Edit} 页。顶部三个标签 \pyapi{Edit / Preview / Scan}，顶部状态条显示可见数、period 数、step、总时长等；状态条右端是 \pyapi{Clear All} 按钮（一键清空日程到一个 1 \textmu s 的空白 period，通道名/显隐/总线分组/clk 指派保留——从零开始搭新脉冲时先点它）。
+打开后默认停在 \tfocus{Edit} 页。\pyapi{Clear All} 只清 schedule；\pyapi{PortCatalog} 始终来自 sequencer。
 
 \section{第 1 步：理解“一段就是一张卡片”}
 脉冲序列不是网格表，而是一排\tfocus{周期卡片（period）}，每张卡是一段持续时间。中间区域横向排着 \pyapi{Period 1/5}、\pyapi{Period 2/5}……每张卡上有这一段的时长、单位、和每条 channel 的勾选框。时间从左到右流动。
@@ -822,7 +800,7 @@ ed.show(); app.exec_()
 \end{enumerate}
 
 \section{第 3 步：让 channel 在某些段为高}
-在每张卡上，勾选要在这段时间内\tfocus{打开}的 channel（勾上=高电平）。例如让 \pyapi{trap} 在所有段都勾上、\pyapi{cooling} 只在加载段勾上、\pyapi{probe} 只在成像段勾上。左侧 \pyapi{Channel Names} 列可以给每条 channel 起个好记的名字。
+在每张卡上编辑可编程 digital port 或 DAC value；左侧 Port Catalog 的 semantic names 来自硬件配置并只读。
 
 \section{第 4 步：设延时（可选）}
 在 \pyapi{Delay / Scan} 列，给某条 channel 的延时框填一个值（可正可负），用来补偿器件/线缆时延。延时只平移这条 channel 的开关沿，不改变周期长度。
@@ -850,7 +828,7 @@ scan_table = np.linspace(1000, 10000, 10).reshape(-1, 1)   # 单位 ns
 
 \section{第 8 步：运行 / 保存}
 \begin{enumerate}
-  \item 回 Edit 页，点 \pyapi{On Pulse}：它先把当前脉冲编译上传到 sequencer，再启动。硬件会无缝地逐个扫描点跑，每点触发一次相机。
+  \item 回 Edit 页点 \pyapi{On Pulse}：它上传并启动当前模板/扫描表。硬件无缝逐点运行；模板内的 trigger 保持原样，GUI 和 sequencer 都不自动加相机触发。
   \item \pyapi{Stop Pulse} 让输出回到安全态。
   \item \pyapi{Save} 把脉冲 \filepath{.json} + 预览 \filepath{.png} +（有扫描表时）扫描数组一起存出，三件配套。
 \end{enumerate}
@@ -864,7 +842,7 @@ scan_table = np.linspace(1000, 10000, 10).reshape(-1, 1)   # 单位 ns
 
 \begin{codeblock}[Scan 页：扫 DAC 码]
 import numpy as np
-scan_table = np.linspace(0, 1000, 11).astype(int).reshape(-1, 1)
+scan_table = np.linspace(-512, 511, 11).astype(int).reshape(-1, 1)
 \end{codeblock}
 
 \begin{enumerate}
@@ -887,7 +865,7 @@ Task 控制台（\filepath{task\_console.bat} / \pyapi{frontend.show\_task\_cons
 数据通路分五层（device / measurement / processor / task / plot），互相只通过\tfocus{信号集线器（SignalHub）}耦合：
 \begin{description}
   \item[\pyapi{SignalHub}（\filepath{neutral\_atom/core/signals.py}）] 线程安全的命名信号环：实验循环每个 shot \pyapi{publish} 一批命名值（标量或数组），控制台轮询 \pyapi{latest}/\pyapi{history}，用版本号跳过无新数据的刷新。
-  \item[逻辑节点（\filepath{neutral\_atom/operations/logic.py}）] 三类生产节点共用 \pyapi{LogicNode} 基类（同一 worker-loop + 协作取消 + owner-thread 参数队列）。\pyapi{Measurement} 驱动设备采集并发命名信号（相机 \pyapi{CameraMeasurement} 发 \pyapi{frame}、扫描型 \pyapi{ScannedMeasurementNode} 让有限扫描在 Monitor 里逐点长出 live 曲线、自停）；\pyapi{Processor} 是无采集的\tfocus{反应式}变换节点（“func”层），消费 hub 信号、republish 派生信号，如 \pyapi{OccupancyProcessor} 用与真机读出\tfocus{相同}的 \pyapi{calibration.detect} 契约把 \pyapi{frame} 变成 \pyapi{counts}（逐站计数）/\pyapi{occupied}（占据）/\pyapi{rate}（滚动装载率）/\pyapi{rate\_sites}/\pyapi{rate\_grid}/\pyapi{centers}/\pyapi{thresholds}；\pyapi{Task} 是一次性编排（如 \pyapi{CalibrateReadoutTask} 产 \pyapi{TrapCalibration}+npz 产物、中途把模板帧流到一个面板）。\tfocus{装载读出由你用这三类节点自己拼}（标定 task + 相机 measurement + detect processor），\tfocus{没有单体节点一次造出所有信号}——每个节点只经 \pyapi{CameraDevice} 契约取帧，换真机只换传入的 \pyapi{camera}（唯一虚拟之处=相机数据源）。所有节点都可同步驱动（\pyapi{step()}，测试/Notebook）或后台线程（\pyapi{start(rate\_hz=...)}）。
+  \item[逻辑节点（\filepath{neutral\_atom/operations/logic.py}）] 三类生产节点共用 \pyapi{LogicNode} 基类（同一 worker-loop + 协作取消 + owner-thread 参数队列）。\pyapi{Measurement} 驱动设备采集并发布 typed signal：\pyapi{CameraMeasurement} 按触发事件发布 \pyapi{frame\_0/frame\_1/...=(R,1,H,W)}；扫描节点按 schema patch \pyapi{(R,P,*data\_shape)} 并在有限扫描后自停。\pyapi{Processor} 无采集，按 cursor 消费 lineage-coherent tensor；\pyapi{OccupancyProcessor} 对每个有效 \pyapi{(R,P)} cell 跑同一 \pyapi{calibration.detect}，发布 \pyapi{counts/occupied=(R,P,N)}、\pyapi{rate=(R,P,1)}、\pyapi{frame\_judged=(R,P,H,W)} 与显式 schema 的 \pyapi{centers/thresholds}。\pyapi{Task} 是一次性编排（如 \pyapi{CalibrateReadoutTask} 产 \pyapi{TrapCalibration}+npz）。装载读出由标定 task + camera measurement + detect processor 显式拼接；换真机只换 \pyapi{CameraDevice} 实现。
   \item[面板（panel）] 即 frontend live 绘图类的复用，所有图内交互（滚轮缩放、中键平移、右键十字、框选、拖 clim/阈值线）原样可用。plot 面板是\tfocus{纯视图}，只订阅信号名，与采集\tfocus{解耦}（加一张 plot 不启动任何东西，见下）。
 \end{description}
 
@@ -902,12 +880,12 @@ Task 控制台（\filepath{task\_console.bat} / \pyapi{frontend.show\_task\_cons
 \end{description}
 
 \section{Setting：每个面板的基本配置}
-卡片标题行右端的 \pyapi{Setting} 文字按钮打开该面板的设置弹窗。排版照搬 confocal\_gui 的\tfocus{竖排}范式：粗体小标题占独立一行，下方每行 \pyapi{[固定宽度标签 | 控件]}（复用 \pyapi{FluentSectionLabel} 与 \pyapi{FluentSettingRow}，全 frontend 共享同一节律）。从上到下五段——\tfocus{Source / Display / Unit / Limits / Panel}，全部即时生效（只 Source 因要校验表达式有自己的 Apply，其他控件改完就立刻刷新面板）。命令行拟合、relim 这类重控件仍在 \pyapi{Control} 标签页（\pyapi{Edit…} 按钮进入）：
+卡片标题行右端的 \pyapi{Setting} 打开竖排设置。除 Source/Display/Unit/Limits/Panel 外，兼容的 plot family 还显示 typed Selection action 与 live fit：模型 + selection 组成 \pyapi{FitRequest}，无自由文本 fit 参数。
 \begin{description}
   \item[Source（接什么数据）] \pyapi{signal} 下拉列出 hub 里\tfocus{此刻真实存在的所有信号名}——选一个，面板立即切到 \pyapi{value = 信号名}，不用打字。要做运算（差值、切片、历史堆叠）就在下面的表达式框写一行 Python 并点 \pyapi{Apply}（或回车）；下拉会自动回显纯信号表达式。命名空间：每个信号名（最新值）、\pyapi{history(name, n)}、\pyapi{latest(name)}、\pyapi{names()}、\pyapi{shot}、\pyapi{np}、\pyapi{math}。表达式出错时 \pyapi{Setting} 按钮变红，错误只落在\tfocus{该面板自己}的状态行，其余面板照常刷新。
   \item[Display（怎么显示）] \pyapi{size} 尺寸预设；2D / Site map 的 \pyapi{colormap}——\tfocus{这就是改 colorbar 配色（colorset）的地方}（没有"显隐 colorbar"开关，因为带 colorbar 的图恒显 colorbar）；以及各类型的\tfocus{声明式参数}（\pyapi{PANEL\_PARAMS} 里一行一个 \pyapi{ParamDecl}，控件由 \pyapi{param\_widgets.PARAM\_WIDGETS} 注册表按 kind 自动生成）：Site map 的 \pyapi{centers}/\pyapi{image} 信号名（\pyapi{image} 留空＝不垫相机帧）、Rolling trace 的历史长度、Distribution 的 bin 数。
   \item[relim 与 Unit] Display 段最后两行是\tfocus{轴控制}：\pyapi{relim} 下拉用 confocal\_gui 的 \pyapi{combo\_relim} 命名 \pyapi{tight}（紧贴数据自适应）/ \pyapi{normal}（带边距自适应）/ \pyapi{fixed}（\tfocus{钉死}上下限——选 fixed 时下方多出一行填 lo/hi），写进 \pyapi{config.params["relim"]}——这与该面板 Edit 标签里的 relim 控件是\tfocus{同一个 key}（单一真相源，绝不漂移），并\tfocus{对 2D image 与 Site map 的 colorbar clim 同样生效}（相机帧颜色范围跟着 tight/normal/fixed 走，不只是 1D 的 y 轴）；\pyapi{Unit} 按钮 + 右侧当前 unit 倍数。点一次在该轴单位环上前进一档（GHz/nm/MHz 或 ns/us/ms 等，复用 \pyapi{DataFigure.change\_unit}），轴标签无定义单位时是 no-op；当前 \pyapi{unit\_index} \tfocus{随布局 JSON 一起保存}，重建时由 \pyapi{\_apply\_display\_params} 重新应用——所以"这张卡我切到 normal + us"保存/载入/重建后都保持。\tfocus{Setting 没有手动 x/y 轴 lim 四框}（confocal\_gui 也没有，那在 \pyapi{Edit…} 标签）——但把\tfocus{数据范围数字钉死}就用上面 relim=\pyapi{fixed} + lo/hi（\tfocus{就在这儿，不必去 Edit}）；坐标轴范围细看用画布缩放 / 拖拽。
-  \item[Panel（这张卡）] 标题（显示在图内，改动通过 \pyapi{BaseLivePlot.\_apply\_title} → \pyapi{style.apply\_title} 走密封 API，字号永远是 \pyapi{title\_fontsize()}）；一行操作 \pyapi{Remove}（移除）、\pyapi{Edit…}（打开该面板自己的 Edit 标签做命令行拟合 / 手动 lim / 详细处理，导出图的 \pyapi{Save Fig} 也在那里）。
+  \item[Panel（这张卡）] 标题 + Remove/Edit。Edit 提供冻结快照、source acquisition、limits、通用可信 command 与 Save；fit 仍走同一个 typed request/core。
 \end{description}
 
 一张\tfocus{满分辨率相机帧}（如 $1920\times1200$）怎么显示到面板上？不是把整幅原图交给 matplotlib 每帧重采样（那样又慢又糊），而是走下图这条链：全分辨率数组\tfocus{留在内存}，显示层按\tfocus{当前视野}裁剪、再\tfocus{块平均}降到该 axes 的像素预算（面积平均，比最近邻抽样\tfocus{提信噪}），交给 \pyapi{imshow(interpolation="auto")}；嵌入画布把 Agg 缓冲渲染成\tfocus{恰好等于屏幕设备像素}的大小做 1:1 贴图。整条链\tfocus{只有一次重采样}；放大时从满分辨率数组\tfocus{重新切片}，细节随之\tfocus{渐进回归}，直到视野内 1:1。
@@ -963,11 +941,11 @@ measurement / processor / task 三份目录都是\tfocus{自动发现的}:往 \p
 \begin{description}
   \item[Acquisition（编辑数据源的采集参数）] 一张 plot 面板是\tfocus{视图}，它读的信号由某个\tfocus{逻辑节点}生产，背后是\tfocus{数据源}——相机本身，或一个变换节点。Edit 顶部列出该\tfocus{数据源经 \pyapi{acquisition\_parameters()} 自报的可编辑参数}：一张原始相机帧面板（源是 \pyapi{CameraMeasurement}）列出相机的 \pyapi{exposure} / \pyapi{region}（ROI 端点）；一张占据面板（源是 \pyapi{OccupancyProcessor}）列出它的 detect 设置。每格预填\tfocus{当前正在跑的值}并在下方标 \pyapi{now: <值>} 供改参时参照；改完点 \pyapi{Apply} 就把改动\tfocus{原地}推给数据源（相机即 \pyapi{configure} 实时重配，\tfocus{不重启节点}——节点从它自己在 Logic tab 的 Edit Start），活面板以同一信号名无缝续刷。\tfocus{所以一张 qCMOS live 2D 的 Edit 就能直接调相机曝光/ROI}。（plot 面板\tfocus{绝不}自带某 measurement 的"参数表单 + Start"，那在 Logic 节点自己的 Edit 里——见下。）
   \item[Parameters（plot 的 API 参数）] 该面板\tfocus{plot 调用里可变的参数}自动铺成 GUI 控件（\pyapi{length} / \pyapi{bins} / \pyapi{centers} / \pyapi{image}……，由该 kind 的声明\tfocus{自动发现}）；改一下就\tfocus{实时重渲染}活面板与快照。colormap / relim / unit 这类\tfocus{轻量显示旋钮} Setting 与 Edit 的 Display 段\tfocus{两处都给}（\tfocus{同 key 单源}、改一处另一处跟着，不是两份逻辑），其余 \pyapi{display=False} 的功能参数只在这里。
-  \item[框选写回源的采集参数（而非内嵌测量表单）] plot 面板\tfocus{不}内嵌某测量的"参数表单 + Start"——那在该 measurement 作为 Logic 节点时它\tfocus{自己}的 Edit 里（Logic tab，见上）。这里保留的是\tfocus{框选写回}：在 Edit 快照上拖一个矩形（或缩放/平移），\pyapi{\_read\_region} 把端点 \pyapi{(x\_min,x\_max,y\_min,y\_max)} 交给产这张图的\tfocus{源节点}的 \pyapi{region\_to\_acquisition\_parameters}，源各转各的格式（相机节点→ROI 矩形、二维扫描→两条轴范围），\tfocus{填进上面 Acquisition 段的对应输入框}，点 \pyapi{Apply} 生效（学 \pyapi{confocal\_gui} 的 \pyapi{area.callback}；缩放/平移与框选共用同一回调，框选 OVERRIDE）。填的是\tfocus{采集参数}本身、不是坐标轴 lim。
-  \item[Fit（全套 data\_figure）] 模型下拉是\tfocus{完整的 DataFigure 集合}（Lorentzian / Gaussian / Lorentzian (Zeeman) / Rabi / Exp decay / \tfocus{2D center}），\tfocus{不按 plot 类型门控}——2D 图用 2D 高斯 \pyapi{center} 拟合，其余拟合 1D 轨迹。一行自由文本拟合参数（\pyapi{p0=[...]} 初值、\pyapi{名字=值} 固定、\pyapi{is\_fit=False} 只叠加不优化）+ \pyapi{Fit}/\pyapi{Clear}；底层 \pyapi{DataFigure}（与 notebook 的 \pyapi{p.data\_figure.lorent()} 同源）。
+  \item[Selection 与 Acquisition 分离] selector 统一产 \pyapi{Selection(ranges,frame,scope,metadata)}；none/fit/ROI 是显式 action。Edit 快照可另把端点填进源节点自报的 acquisition form，但只 staging，Apply/Start 后才改变采集。
+  \item[Fit] 模型按 plot family 过滤。Setting/Edit 都生成同一个 \pyapi{FitRequest}；\pyapi{core.fitting} 唯一拥有 solver/metrics，DataFigure 只画 overlay，FitProcessor 只发布 typed hub 结果。
   \item[手动 x/y lim + 冻结快照 + Save Fig] 四个数字框 + \pyapi{Apply lim}（调 \pyapi{DataFigure.xlim/ylim}，作用在快照上，打开时自动回填）；快照\tfocus{照搬 Monitor 那张卡的 size}（与活面板\tfocus{同尺寸}、绝不裁切、也绝不强塞一个固定 2x4 撑破窄视区），画布\tfocus{钉成固定大小}（\pyapi{pin\_size}：\pyapi{min==max}=设计尺寸，连画布自己 deferred 的 resync 也守住），所以\tfocus{改一个参数重抓快照时它既不会胀大、也不会缩没}；重抓走\tfocus{先建后换}（新图建成功才换，建图报错就保留上一张好图、绝不留空白），并\tfocus{每种 kind 含 Site map 都吃 relim/fixed}（由单一 \pyapi{\_view\_kwargs} 同时喂活面板与快照，所以 sitemap 改 lim 也随之刷新）。配 \pyapi{Refresh} 重抓 + \pyapi{Save Fig}（一个 \pyapi{png}/\pyapi{pdf}/\pyapi{jpg} 格式下拉 + 按钮，导出\tfocus{当前面板}的图 + 同名 \pyapi{.npz} 到 \filepath{tasks/}，npz 数据不随图片格式变）。这个 Save 内部先把图 \pyapi{bind\_source} 到该面板接的信号、再调 \pyapi{DataFigure.save}——\tfocus{与 notebook 的 \pyapi{p.save()} 是同一套核心}（见"保存与回看图"一章），所以 GUI 面板 Save 与 notebook 存图产出的 npz 逐字一致，都能用 \pyapi{exp.figure\_viewer} 回看。
 \end{description}
-\tfocus{选择器分工}：Monitor 卡\tfocus{默认停用所有选择器}（工具已就位但未武装 + \pyapi{isolate\_wheel=False}）——滚轮直接\tfocus{滚仪表盘}、绝不被框选/缩放吞掉；表头的 \tfocus{Selectors} 开关可就地武装全部卡片（框选/十字/缩放/拖线即刻可用，滚轮转为图内缩放），关掉立即回到显示专用。Edit 快照\tfocus{始终}带完整选择器。每个 Edit 标签是\tfocus{独立快照}，不打扰 Monitor 实时刷新；relim / unit 这类只在 Setting，避免重复。
+\tfocus{选择器分工}：Monitor 默认停用，Selectors 开关武装所有 plot family；每个 adapter 决定 x/xy/value selection，grid cell 加 scope。选择本身无副作用，后续 action 才决定 fit/ROI。
 
 \section{保存 / 载入布局：设计一次，随处载回}
 布局（面板、位置、尺寸、表达式、参数 + Logic 节点声明）整包存成\tfocus{一个 JSON}，文件名就是任务名。\tfocus{没有内置预设}——唯一的"任务"就是\tfocus{你自己 Save 出来的布局}。三个入口完全等价：
@@ -984,7 +962,7 @@ measurement / processor / task 三份目录都是\tfocus{自动发现的}:往 \p
 \section{启动与接线}
 双击 \filepath{task\_console.bat}（或 \pyapi{python task\_console.py}）即以\tfocus{虚拟实验}启动：走\tfocus{与真机同一个 \pyapi{connect()} 契约}连一个虚拟实验（只有相机帧是仿真的），\pyapi{sitemap}/\pyapi{thresholds} 自标定让目录里的 measurement / processor / task 能跑，再把\tfocus{自动发现的三份目录接进 Add Panel}——但控制台开局 \tfocus{空 hub、全停}，\tfocus{不自动建/启任何读出}（解耦的 VIEW / LOGIC 模型）。看 loading 你自己从 Logic tab 加 \pyapi{Measurement: Camera (live frames)} + \pyapi{Processor: Judge occupancy} + \pyapi{Task: Calibrate readout} 并 Start，再加 Plot 面板连它们的信号。常用参数：\pyapi{--config remote\_template}（\tfocus{真机直跑}：连真实设备、同一 \pyapi{connect()} 契约——首光站点/阈值标定仍在 notebook 做，见 \filepath{docs/REAL\_HARDWARE\_BRINGUP\_zh.md}）、\pyapi{--grid 5x7}（阵列形状，虚拟与 \pyapi{--config} 通用）、\pyapi{--task 名字}（载入你存的命名布局）、\pyapi{--state xxx.json}（按路径载入布局）、\pyapi{--scale}（UI 缩放，默认 auto）、\pyapi{--no-connect}（不连任何会话，自己接 hub）。
 
-从 Notebook 接\tfocus{真实实验}：建一个 hub，开控制台（开局空——自己加 Plot 面板把 Source 指到下面 publish 的信号，或 \pyapi{task="你存的布局"} 整套载回），在实验循环里每个 shot publish 一次——发布的信号集尽量沿用约定信号名（\pyapi{frame}/\pyapi{counts}/\pyapi{occupied}/\pyapi{centers}/\pyapi{rate}……），这样同一套命名布局在虚拟和真机之间\tfocus{零修改通用}：
+从 Notebook 接\tfocus{真实实验}：建一个 hub，开控制台（开局空——自己加 Plot 面板把 Source 指到下面 publish 的信号，或 \pyapi{task="你存的布局"} 整套载回），在实验循环里每个 shot publish 一次——发布的信号集沿用约定 typed 名称（单触发相机为 \pyapi{frame\_0}，下游为 \pyapi{counts}/\pyapi{occupied}/\pyapi{centers}/\pyapi{rate}……），这样同一套命名布局在虚拟和真机之间\tfocus{零修改通用}：
 \begin{codeblock}[Python]
 from Zou_lab_control import frontend as zf
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
@@ -1002,7 +980,7 @@ for shot in range(1000):
     det = exp.readout.from_image(frame, display=False)
     occ = det.occupied.astype(float)
     rate = occ.mean() if rate is None else 0.95 * rate + 0.05 * occ.mean()
-    hub.publish({"frame": frame, "counts": det.counts, "occupied": occ,
+    hub.publish({"frame_0": frame, "counts": det.counts, "occupied": occ,
                  "centers": centers, "rate": rate, "shot": float(shot)})
 \end{codeblock}
 读出保真度一类的慢量也一样：算出来 \pyapi{hub.publish(\{"fidelity": f\})}，再开一个 Rolling trace 面板把 Source 指到 \pyapi{fidelity} 即可。
@@ -1060,7 +1038,7 @@ zf.plot(data_x, data_y=None, *, kind="auto", update="once", labels=None,
   \item[\pyapi{update}] \pyapi{once}（默认，静态）或 \pyapi{watch}（启动前端定时器，从共享数组刷新）。watch 模型：采集线程在另一侧\tfocus{原地修改}数组，前端拥有 artist 与刷新。
   \item[\pyapi{labels}] \pyapi{(xlabel, ylabel, zlabel)}；各 kind 有不同默认（1d/2d=(X,Y,Z)、hist=(Counts,Shots,Population)、pulse=(Time (s), 空, State)）。
   \item[\pyapi{display}] 是否立刻在 notebook 显示。
-  \item[\pyapi{data_figure}] 是否附 \pyapi{DataFigure} 句柄（用于 \pyapi{.lorent()}/\pyapi{.decay()} 等拟合）。
+  \item[\pyapi{data_figure}] 是否附 \pyapi{DataFigure} 句柄；所有模型统一走 \pyapi{.fit("lorent")} / \pyapi{.fit("decay")} / \pyapi{.fit("center")}，高级约束由 typed \pyapi{FitRequest} 携带。
   \item[\pyapi{watch_interval} / \pyapi{stop_when_full} / \pyapi{done} / \pyapi{points_done} / \pyapi{copy} / \pyapi{lock}] watch 模式的刷新间隔、满即停、完成回调/标志、是否拷贝、线程锁。\tfocus{线程契约}：阻塞式硬件采集不能跑在 UI 线程里。
   \item[\pyapi{**kwargs}] 透传给具体 plotter 的\tfocus{数据}选项：\pyapi{cmap}、\pyapi{bins}、\pyapi{thresholds}、\pyapi{relim_mode}、\pyapi{title}……\tfocus{这些是数据选项，不是几何选项}。传 \pyapi{data_px}/\pyapi{margins_px}/\pyapi{spec}/\pyapi{dpi}/\pyapi{bad_color} 会报 TypeError。
 \end{description}
@@ -1071,12 +1049,14 @@ zf.plot(data_x, data_y=None, *, kind="auto", update="once", labels=None,
 \begin{codeblock}[Python]
 import numpy as np
 from Zou_lab_control import frontend as zf
+from Zou_lab_control.neutral_atom.core.fitting import FitRequest
 
 # 一维 + 洛伦兹拟合
 x = np.linspace(737.0, 737.2, 220).reshape(-1, 1)
 y = (lorentzian(x) + noise).reshape(-1, 1)
 p = zf.plot(x, y, labels=("Wavelength (nm)", "Counts/0.1s", "Counts"))
-p.data_figure.lorent(is_display=True)
+request = FitRequest(model="lorent", sample_budget=12_000, max_evaluations=4_000)
+fit_result = p.data_figure.fit("lorent", request=request)
 
 # 二维扫描： data_x=(N,2)
 zf.plot(coords_xy, signal.reshape(-1, 1), kind="2d", labels=("X", "Y", "Counts"))
@@ -1118,14 +1098,14 @@ zf.plot(coords_xy, signal.reshape(-1, 1), kind="2d", labels=("X", "Y", "Counts")
 
 \textbf{完整签名}：
 \begin{codeblock}[Python]
-zf.show_pulse_gui(*, state=None, channels=None, sequencer=None,
-                  experiment=None, channel_labels=None, channel_pins=None,
+zf.show_pulse_gui(*, state=None, port_catalog=None, sequencer=None,
+                  experiment=None, channel_pins=None,
                   scale=None, window_ratio=...) -> PulseSequenceEditor
 \end{codeblock}
 
-\textbf{每个参数}：\pyapi{state}（PulseTableState，None=空白）；\pyapi{channels}（通道名序列）；\pyapi{sequencer}（传入的 SequencerDevice，On Pulse 用它上传——\tfocus{frontend 不拥有硬件动作}）；\pyapi{experiment}（可选实验对象）；\pyapi{channel_labels}/\pyapi{channel_pins}（显示名 / 物理引脚映射）；\pyapi{scale}（\pyapi{None}=自动，见边界）；\pyapi{window_ratio}（窗口占屏比例）。
+\textbf{拓扑参数}：已有 \pyapi{state} 自带唯一 \pyapi{port\_catalog}；新建离线 state 必须给 \pyapi{port\_catalog}；连接 \pyapi{sequencer} 时直接使用设备 catalog 并校验 fingerprint。\pyapi{channel\_pins} 只补充 package-pin 展示，不改变逻辑端口。
 
-\textbf{示例}：\pyapi{ed = zf.show_pulse_gui(sequencer=exp.devices.sequencer, channels=[...])}；命令行入口是 \filepath{pulse\_gui.bat}。逐控件操作见前面“逐个按钮”章。
+\textbf{示例}：\pyapi{ed = zf.show_pulse_gui(sequencer=exp.devices.sequencer)}；命令行入口是 \filepath{pulse\_gui.bat}。
 
 \textbf{不可配置的边界}：\pyapi{scale=None} 时走\tfocus{唯一的 auto-scale 规则}（不要手动钉 scale，否则破坏高 DPI 视觉一致性）；窗口几何/Fluent 样式由 frontend 拥有。
 
@@ -1156,13 +1136,13 @@ console = zf.show_task_console(hub=hub, session=exp,
 \section{SignalHub —— 仪表盘数据契约}
 \textbf{导入}：\pyapi{from Zou_lab_control.neutral_atom.core.signals import SignalHub}（它是控制台的数据总线）。
 
-\textbf{发布侧} \pyapi{hub.publish(values, *, shot=None) -> int}：每个值被\tfocus{强制转成 float ndarray（标量->0 维）并拷贝}（生产者可随意复用缓冲），返回新 version。
+\textbf{发布侧}：先注册 \pyapi{SignalSchema}，再发布 \pyapi{SignalTensor}/\pyapi{TensorPatch}。物理数组恒为 \pyapi{(R,P,*data\_shape)}，\pyapi{P=prod(point\_shape)}；只展平 logical point geometry，任意维 \pyapi{data\_shape} 永不压成一个 D。Hub 原子校验 dtype/shape/validity 并保存不可变副本。
 
-\textbf{消费侧}：\pyapi{latest(name)}（0 维->float，否则 ndarray 拷贝；不存在报 KeyError）、\pyapi{history(name, n=None) -> ndarray}（\tfocus{形状 (shots, *value\_shape)}，axis 0 是 shot；形状变过只保留最近同形状连续段）、\pyapi{names() -> list}、\pyapi{snapshot_latest() -> dict}（一致快照=表达式命名空间）、属性 \pyapi{version}/\pyapi{shot}。
+\textbf{消费侧}：\pyapi{latest\_tensor} 返回 schema/validity/version/provenance；\pyapi{latest} 返回 canonical array；\pyapi{latest\_logical} 只按 schema 还原 point geometry。\pyapi{history\_tensor} 是有界可逆 patch journal，\pyapi{history} 形状为 \pyapi{(updates,R,P,*data\_shape)}。
 
-\textbf{约定俗成的信号名}（沿用它们->同一命名任务在虚拟/真机间零修改通用）：\pyapi{frame}（相机帧）、\pyapi{counts}、\pyapi{occupied}（均 \pyapi{(repeat, n_sites)} 块，\pyapi{repeat_mode=average} 即逐站装载概率）、\pyapi{rate}（本块装载率标量）、\pyapi{centers}（站点中心 \pyapi{(N,2)}）、\pyapi{thresholds}、\pyapi{shot}。
+\textbf{典型 schema}：每个触发事件分别发布 \pyapi{frame\_0/frame\_1/...=(R,1,H,W)}，下游再发布 \pyapi{occupied/counts=(R,P,N)}、\pyapi{rate=(R,P,1)}、\pyapi{centers=(1,1,N,2)}、\pyapi{thresholds=(1,1,N)}。整数帧的未填 cell 由 \pyapi{valid=(R,P)} 表示，不能拿零值冒充有效数据。
 
-\textbf{示例}：\pyapi{hub.publish(\{"counts": c, "rate": r, "shot": float(s)\})}，再开一个 Rolling trace 面板把 Source 指到信号名即可。
+\textbf{示例}：producer 的 \pyapi{output\_specs()} 注册 schema 后，\pyapi{hub.publish(\{"counts": tensor\})}；面板从 \pyapi{hub.schema("counts")} 取得所有轴语义。
 
 \section{Measurement 框架 —— 一键可扫描的测量（Logic 节点）}
 \textbf{一句话用途}：把一个"扫一个被绑定的脉冲参数、每点采几帧、约简成一条曲线"的测量声明一次，\tfocus{API 一行与 GUI Start 按钮同源}地跑它。这些类在 \pyapi{Zou_lab_control.neutral_atom.operations.measurement}（声明 \pyapi{MeasurementSpec}/\pyapi{ParamDecl}）与 \pyapi{...operations.logic}（\pyapi{ScannedMeasurementNode} 包装）；\tfocus{目录入口}是子系统方法 \pyapi{exp.readout.measurement\_specs()}。
@@ -1171,11 +1151,11 @@ console = zf.show_task_console(hub=hub, session=exp,
 
 \textbf{加一个自己的测量(自动被发现)}：写一个 \pyapi{build(readout) -> MeasurementSpec} 工厂(\pyapi{build} 闭包用 \pyapi{readout.session} 拿 \pyapi{exp}、复用 \pyapi{readout.build\_*\_scan} 或自己拼 \pyapi{ScannedMeasurement}),两条路任选其一让它进目录:(1) 把工厂放进 \pyapi{operations/measurements/你的文件.py} 用 \pyapi{@measurement} 装饰——\tfocus{丢个文件就被自动载入},下次开 task\_console 它就在 Add Panel 里;(2) 在 notebook 里 \pyapi{na.register\_measurement(你的工厂)}(临时用,\pyapi{na.unregister\_measurement} 撤销)。目录按 \pyapi{order}(内置在前)排序、按 \pyapi{name} 去重(后注册覆盖,可借此覆盖内置)。下划线开头的模块被跳过(留给包内私有助手)。
 
-\textbf{\pyapi{MeasurementSpec}（声明式单一真相源）}：字段 \pyapi{name}（显示名）、\pyapi{params}（\pyapi{ParamDecl} 元组，声明一次，API 默认与 GUI 控件都从它派生）、\pyapi{result\_labels}/\pyapi{x\_key}/\pyapi{y\_key}（曲线轴名 + 发布到 hub 的信号名）、\pyapi{build(**param\_values) -> ScannedMeasurement}（返回\tfocus{未跑}的测量）、\pyapi{metadata}（如温度拟合的 capture\_radius 换算）。辅助：\pyapi{spec.defaults()} 给每个参数的默认值，\pyapi{spec.param(key)} 取某个声明。逐站点结果的 2D 网格视图是对 \pyapi{<y\_key>\_sites} 信号的 reshape 表达式（用阱阵列的网格形状），不是 spec 上的字段。
+\textbf{\pyapi{MeasurementSpec}} 声明参数与建器；实际输出结构由节点的逐信号 \pyapi{SignalSpec} 注册为 \pyapi{SignalSchema}。扫描 grid 是 \pyapi{point\_shape} 元数据，不复制成另一条 reshape 信号。
 
 \textbf{\pyapi{ParamDecl}（一个参数的声明）}：\pyapi{ParamDecl(key, label, kind, default, unit="", lo=0.0, hi=1e12, required=False, choices=(), tooltip="")}。\pyapi{kind} $\in$ \{\pyapi{float}, \pyapi{int}, \pyapi{axis\_range}（值=\pyapi{(min,max,points)}，GUI 出三框）, \pyapi{bool}, \pyapi{choice}\}。\tfocus{任何值都不被 eval}——消费方按 \pyapi{kind} 校验/强转（confocal 的"不自由文本 eval"教训）。
 
-\textbf{\pyapi{ScannedMeasurementNode}（把扫描测量包成 Logic 节点）}：\pyapi{ScannedMeasurementNode(hub, measurement, *, x\_key, y\_key, prefix="")}（在 \pyapi{operations.logic}，与 \pyapi{CameraMeasurement} 同为 \pyapi{LogicNode} 子类）。每个 \pyapi{step()} 前进\tfocus{一个扫描点}并 publish 累积曲线 \pyapi{\{x\_key: x[:k], y\_key: y[:k], scan\_done\}}（仅逐站点 reducer 另发扁平向量 \pyapi{<y\_key>\_sites}；\tfocus{不发可派生量}——网格是 reshape 表达式，shot 计数走面板命名空间的全局 \pyapi{hub.shot}）。\tfocus{有限扫描自停}：最后一点发布后置 stop，后台 \pyapi{start()} 线程自退；\pyapi{finished} 报告完成，\pyapi{run\_to\_completion()} 同步跑完剩余点（测试/headless）。它只碰 \pyapi{measure} 与 \pyapi{hub.publish}，零 import 具体后端、零读仿真真值（虚拟==实机）。GUI 里一个 \pyapi{Measurement: <扫描名>} Logic 节点 Start 时内部就是建一个这个 Node（\tfocus{只 publish 到 hub、不自动出图}——plot=False，你自己加 Plot 面板连它发布的信号）。
+\textbf{\pyapi{ScannedMeasurementNode}} 预注册 coordinate/y stores，每个 \pyapi{step()} 只 patch 当前 \pyapi{(R,P)} cell。有限扫描的完成是 \pyapi{finished} 节点状态；最后一点后自停，不额外发布完成量或重复网格。
 
 \textbf{示例（headless 跑一个温度扫描并喂 hub）}：
 \begin{codeblock}[Python]
@@ -1198,7 +1178,7 @@ zf.render_tex_pdf(r"\documentclass{article}\begin{document}你好\end{document}"
 zf.render_tex_pdf("notes/manual.tex", "notes/manual.pdf")
 \end{codeblock}
 
-\textbf{\pyapi{zf.render_notes_pdf(output_dir, *, filename, title, ..., body, compile_pdf=True, ...) -> NotesBuildResult}（整本手册）}：在内存里拼装标题页+目录+正文，再经 \pyapi{render_tex_pdf} 在临时目录编译，\tfocus{output\_dir 里只留 .pdf}（外加它引用的 \pyapi{assets/}）。本手册自身就是用这条路径生成的（见 \filepath{frontend/notes.py} 的 \pyapi{build_frontend_manual}）。\pyapi{write_notes_tex}/\pyapi{compile_notes_pdf} 是\tfocus{调试}用的就地写盘助手，不在默认构建路径上。
+\textbf{\pyapi{zf.render_notes_pdf(output_dir, *, filename, title, ..., body, compile_pdf=True, ...) -> NotesBuildResult}（整本手册）}：在内存里拼装标题页+目录+正文，再经 \pyapi{render_tex_pdf} 在临时目录编译，\tfocus{output\_dir 里只留 .pdf}（外加它引用的 \pyapi{assets/}）。本手册自身就是用这条路径生成的（见 \filepath{frontend/notes.py} 的 \pyapi{build_frontend_manual}）。\pyapi{write_notes_tex} 只负责显式生成可检查的源码 bundle；需要编译时仍统一调用 \pyapi{render_tex_pdf}，没有第二套就地 compiler。
 
 \section{一页速查（“我想做 X -> 调用 Y”）}
 \begin{center}
@@ -1231,7 +1211,7 @@ from Zou_lab_control.frontend import plot
 x = np.linspace(737.0, 737.2, 220).reshape(-1, 1)
 y = (lorentzian(x) + noise).reshape(-1, 1)
 p = plot(x, y, labels=("Wavelength (nm)", "Counts/0.1s", "Counts"))
-p.data_figure.lorent(is_display=True)      # 叠加洛伦兹拟合
+fit_result = p.data_figure.fit("lorent")  # 统一入口叠加洛伦兹拟合
 \end{codeblock}
 
 \begin{figure}[htbp]
@@ -1283,7 +1263,7 @@ from Zou_lab_control import frontend as zf
 x = np.linspace(737.0, 737.2, 220).reshape(-1, 1)
 y = (lorentzian(x) + noise).reshape(-1, 1)
 p = zf.plot(x, y, labels=("Wavelength (nm)", "Counts/0.1s", "Counts"), display=False)
-p.data_figure.lorent(is_display=True)          # 叠加洛伦兹拟合
+fit_result = p.data_figure.fit("lorent")      # 统一入口叠加洛伦兹拟合
 
 out = p.save("scans/probe_scan")               # 写 scans/probe_scan_<时间戳>.png + .npz
 # out == {"figure": <...>.png, "data": <...>.npz}
@@ -1333,7 +1313,7 @@ print(sf.info_summary())          # 它存了什么：名字/来源/图型/标�
 print(sf.compatible_kinds())      # 这份数据能被当成哪些图型看（由数据形状推，非写死）
 df = sf.plot()                    # 按存下的图型重画，复刻原图 -> 一个 DataFigure
 df2 = sf.plot(kind="hist")        # 用另一种兼容图型重新解读同一份 data_x/data_y
-df2.gaussian()                    # 重开的图照样能拟合
+fit_result = df2.fit("gaussian") # 重开的图照样走同一个拟合入口
 df2.save("scans/refit")           # 也能再存
 \end{codeblock}
 
@@ -1375,7 +1355,7 @@ render_tex_pdf("docs/main_manual/main_manual_zh.tex",
 扩展 \filepath{qt_fluent.py}，复用 \pyapi{Metrics} token 和 \pyapi{scaled_px()}，不要在 GUI 模块里另造样式或缩放。新控件应能在 \pyapi{FluentFormGrid} 里以 \pyapi{Metrics.row_h()} 高度对齐。
 
 \section{我要给脉冲 GUI 加一行}
-任何新行、spacer、标题、开关文字或局部 margin，都必须保证 \pyapi{Channel Names}、\pyapi{Delay \& Scan}、period 卡片、repeat bracket 这几块的顶部控制行仍然对齐。改完后加 object-level 断言：同一 channel 的 raw 标签、延时框、第一个 period 勾选框的 y 坐标相等。
+任何新行、spacer、标题、开关文字或局部 margin，都必须保证 \pyapi{Port Catalog}、\pyapi{Delay \& Scan}、period 卡片、repeat bracket 的顶部控制行仍然对齐。
 
 \section{我要改截图 QA}
 截图前必须跑事件循环并等待；\pyapi{show()} 或状态变化后不要立刻 \pyapi{grab()}：

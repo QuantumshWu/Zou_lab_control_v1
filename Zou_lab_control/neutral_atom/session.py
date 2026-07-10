@@ -224,43 +224,70 @@ class NeutralAtomSession:
         ``self.devices.open()`` for the notebook and the device manager's "Open devices" button; on the
         virtual backend the opens are trivial.  Returns ``self``."""
         self.devices.open()
+        # A remote sequencer binds its sole PortCatalog while opening.  Rebuild
+        # the session's convenience imaging sequence only after that boundary,
+        # so an offline semantic placeholder can never survive as the program
+        # later sent to real physical lanes.
+        self.sequence = self.build_imaging_sequence(
+            exposure=self.camera_exposure(), load=True)
         return self
 
     def capture(self, frames: int = 1, *, camera: str | None = None, exposure: float | None = None,
                 display: bool = True) -> CaptureResult:
         """Grab raw frames from a named camera and return a notebook-friendly ``CaptureResult``.
 
-        SESSION-level orchestration of the one-off snapshot: the session picks the sensor
-        (``camera`` names any camera in the device config; None = the conventional readout
-        role), optionally writes ``exposure`` to THAT camera and refreshes the imaging
-        sequence, then runs the standard arm-before-fire shot (``triggered_frames``: arm the
-        camera, fire the session sequencer, read the frames back).  The camera itself stays a
-        pure grabber -- it knows nothing about the session.  ``capture`` always shows raw
-        camera data; site overlays belong to calibrated readout/detection, not to capture."""
+        The selected camera's declared capture-trigger wiring determines the only legal path:
+
+        * a free-running camera (no active capture-trigger channels) is acquired directly;
+          ``exposure`` configures only that sensor and no pulse is rebuilt or fired;
+        * the conventional ``"camera"`` readout role uses the session imaging sequence and
+          the standard arm-before-fire shot;
+        * any other externally-triggered camera is rejected before touching hardware because
+          only the measurement/task owning both that camera and its pulse template can fire it.
+
+        The camera stays a pure grabber and ``capture`` always shows raw pixels; site overlays
+        belong to calibrated readout/detection, not to capture."""
         from .operations.measurement import triggered_frames
+        from .devices.camera_trigger import resolve_camera_trigger_channels
         from .views.plots import plot_image
 
         name = str(camera) if camera else self.devices.default_camera_name()
         cam = self.devices[name]
-        if exposure is not None:
-            # The ONE configure-imaging path (owned by the timing subsystem): write the
-            # exposure to THIS camera and rebuild the imaging sequence -- never hand-rolled.
-            self.timing.configure_imaging(exposure=float(exposure), camera=cam)
-        sequence = self.sequence
-        images = triggered_frames(cam, getattr(self.devices, "sequencer", None), sequence, int(frames))
-        if not images:
-            # No edge on this camera's trigger line -> no frame (the pure-grabber contract).  The
-            # readout imaging sequence gates the READOUT camera's trigger; a camera wired to another
-            # line (e.g. the MOT monitor on ``mot_trigger``) is snapshotted through ITS own template,
-            # not this convenience.  Fail with an actionable message, never an IndexError on ``[-1]``.
-            from .devices.camera_trigger import resolve_camera_trigger_channels
-            trig = resolve_camera_trigger_channels(cam)
+        trigger_channels = resolve_camera_trigger_channels(cam)
+        readout_owned = self.devices.devices.get("camera") is cam
+
+        if not trigger_channels:
+            # A free-running sensor owns its exposure clock.  Configuring it must not mutate the
+            # readout sequence (which may belong to a different camera), and there is no trigger
+            # edge for the session to fire.
+            if exposure is not None:
+                cam.configure(exposure=float(exposure))
+            sequence = None
+            images = cam.acquire(int(frames))
+        elif not readout_owned:
+            # Reject BEFORE configure/arm/prepare/fire: the session readout pulse does not own this
+            # camera's trigger wire, so trying it and inspecting an empty buffer afterwards is too
+            # late -- an unrelated hardware program has already run by then.
             raise RuntimeError(
-                f"camera {name!r} captured no frames: the imaging sequence gates the readout "
-                f"camera's trigger, but {name!r} is triggered on {trig or '(unknown line)'}.  "
-                f"Snapshot a non-readout camera (e.g. the MOT monitor) through its OWN pulse "
-                f"template -- run a Pulse-scan measurement or the Optimize-MOT-field task with "
-                f"camera={name!r} (they fire the coil template that pulses its trigger).")
+                f"camera {name!r} is externally triggered on {trigger_channels}; "
+                f"session.capture() only owns the conventional 'camera' readout pulse.  "
+                f"Use the measurement/task that owns both {name!r} and its pulse template; "
+                f"for a MOT camera, run Optimize-MOT-field with camera={name!r}.")
+        else:
+            sequencer = self.devices.devices.get("sequencer")
+            if sequencer is None:
+                raise RuntimeError(
+                    f"camera {name!r} is externally triggered on {trigger_channels}, but this "
+                    f"device config has no sequencer to drive the readout pulse.")
+            if exposure is not None:
+                self.timing.configure_imaging(exposure=float(exposure))
+            sequence = self.sequence
+            images = triggered_frames(cam, sequencer, sequence, int(frames))
+
+        if not images:
+            raise RuntimeError(
+                f"camera {name!r} returned no frames via its "
+                f"{'free-running acquisition' if sequence is None else 'readout pulse'}.")
         plot = plot_image(images[-1], display=display)      # display=False builds the figure, doesn't show it
         result = CaptureResult(images=images, sequence=sequence, plot=plot)
         self.history.append(result)

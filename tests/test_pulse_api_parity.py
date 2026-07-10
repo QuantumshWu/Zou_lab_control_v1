@@ -8,6 +8,7 @@ prove the edits survive ``to_sequence`` + a save/load round-trip.
 """
 
 from __future__ import annotations
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 import json
 from pathlib import Path
@@ -32,7 +33,8 @@ DAC_LABELS = {"ch00": "da_test[0]", "ch01": "da_test[1]", "ch02": "da_test[2]", 
 
 def _dac_bus_state() -> PulseTableState:
     st = PulseTableState(
-        channels=DAC_CHANNELS, channel_labels=DAC_LABELS, visible_channels=DAC_CHANNELS,
+        port_catalog=PortCatalog.from_channels(DAC_CHANNELS, channel_labels=DAC_LABELS),
+        visible_ports=["da_test", "ch03"],
         time_step_ns=20,
         periods=[PulsePeriod(100, (0, 0, 0, 0), unit="ns") for _ in range(3)],
     )
@@ -44,7 +46,7 @@ def _dac_bus_state() -> PulseTableState:
 def test_pulse_state_mutators_match_gui_edits():
     """set_period_duration / set_period_name / set_channel_delay / add_period mirror the
     GUI's per-period + per-channel edits, and they compile + round-trip through dict."""
-    st = PulseTableState(channels=CHANNELS)
+    st = PulseTableState(port_catalog=PortCatalog.from_channels(CHANNELS))
     n0 = len(st.periods)
 
     st.set_period_duration(0, 1234.0)
@@ -73,7 +75,7 @@ def test_measurement_can_load_and_retune_a_saved_program(tmp_path):
     """The measurement use-case: a program saved from the pulse GUI is LOADED and its
     readout duration RETUNED in code, and the change reaches the compiled sequence."""
     path = tmp_path / "readout.json"
-    PulseTableState(channels=CHANNELS).set_period_name(0, "readout").save(path)
+    PulseTableState(port_catalog=PortCatalog.from_channels(CHANNELS)).set_period_name(0, "readout").save(path)
 
     loaded = PulseTableState.load(path)
     loaded.set_period_duration(0, 5000.0)              # retune the readout duration
@@ -85,7 +87,7 @@ def test_measurement_can_load_and_retune_a_saved_program(tmp_path):
 
 def test_pulse_state_mutators_validate_inputs():
     """The mutators fail loud on a bad index / unknown channel (no silent corruption)."""
-    st = PulseTableState(channels=CHANNELS)
+    st = PulseTableState(port_catalog=PortCatalog.from_channels(CHANNELS))
     with pytest.raises(ValueError):
         st.set_period_duration(999, 1.0)
     with pytest.raises(ValueError):
@@ -118,7 +120,7 @@ def test_add_period_keeps_analog_bus_modes_in_step():
 def test_set_period_duration_refuses_scan_bound_period():
     """A period whose duration is SCAN-BOUND carries an ``sN`` expression a scan slot
     targets; set_period_duration must fail loud (don't orphan the slot) -- unbind first."""
-    st = PulseTableState(channels=CHANNELS)
+    st = PulseTableState(port_catalog=PortCatalog.from_channels(CHANNELS))
     st.bind_field("duration", "0")                     # bind period 0's duration to a slot
     with pytest.raises(ValueError):
         st.set_period_duration(0, 1234.0)

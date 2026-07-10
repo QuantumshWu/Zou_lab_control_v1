@@ -145,7 +145,7 @@ def test_site_grid_exposes_per_cell_selectors_and_fitting():
         assert len(data.cells) == 8
         cell0 = data.cell(0)
         assert isinstance(cell0, DataFigure)
-        _, popt = cell0.gaussian(is_display=False)
+        popt = cell0.fit("gaussian", is_display=False).popt
         assert popt is not None
         # dragging a threshold updates that site's stored cut (live reclassify)
         g._make_threshold_cb(3)(33.0)
@@ -171,7 +171,7 @@ def test_fit_targets_is_the_one_fanout_seam_for_grid_and_flat():
         assert all(isinstance(t, DataFigure) for t in targets)
         # fan-out: fitting each target INDEPENDENTLY gives every cell a popt (all subplots fitted)
         for target in targets:
-            _, popt = target.gaussian(is_display=False)
+            popt = target.fit("gaussian", is_display=False).popt
             assert popt is not None
         # a flat DataFigure is its OWN single target -- the base case do_fit shares with the grid
         assert list(targets[0].fit_targets()) == [targets[0]]
@@ -191,10 +191,10 @@ def test_grid_cell_title_is_facet_aware_and_templated_from_one_source():
     from Zou_lab_control.frontend.style import tick_fontsize
 
     # (1) facet_cell_labels is the ONE identifier source, facet-aware per group -- each facet dimension
-    #     reads DIFFERENTLY (#5): a site/dim grid -> "site k", a repeat grid -> "repeat k", a scan grid ->
+    #     reads DIFFERENTLY (#5): a site/data grid -> "site k", a repeat grid -> "repeat k", a scan grid ->
     #     "<param>=<value>", so the identifier tells the operator WHICH axis expanded into the cells.
     assert facet_cell_labels("repeat", 3) == ["repeat 0", "repeat 1", "repeat 2"]
-    assert facet_cell_labels("dim", 3) == ["site 0", "site 1", "site 2"]         # per-site
+    assert facet_cell_labels("data:0", 3) == ["site 0", "site 1", "site 2"]      # per-site
     assert facet_cell_labels("points:0", 2, coords=[1.0, 2.5], param_names=["Bz"]) == ["Bz=1", "Bz=2.5"]
     assert facet_cell_labels(None, 2) == ["site 0", "site 1"]                    # recipe grid keeps the tag
 
@@ -379,6 +379,22 @@ def test_notebook_rolling_run_accepts_a_scalar_window():
     # a fixed (append) kind has no window meaning -> a scalar is still rejected
     with pytest.raises((ValueError, TypeError)):
         zf.run(50, src, kind="1d", autostart=False, display=False)
+
+
+def test_run_row_adapter_never_flattens_or_truncates_data_shape():
+    from Zou_lab_control.frontend.session import _put_row
+
+    target = np.full((2, 3), np.nan)
+    _put_row(target, 0, np.array([1.0, 2.0, 3.0]))
+    assert np.array_equal(target[0], [1.0, 2.0, 3.0])
+
+    for bad in (np.array([1.0, 2.0]), np.arange(6.0).reshape(2, 3), 1.0):
+        with pytest.raises(ValueError, match="never flattened, padded, or truncated"):
+            _put_row(target, 1, bad)
+
+    scalar_target = np.full((1, 1), np.nan)
+    _put_row(scalar_target, 0, 4.0)
+    assert scalar_target[0, 0] == 4.0
 
 
 # ---- pulse is a real plot kind: its RENDER lives in the plot layer (live.py), not the GUI app --------

@@ -57,7 +57,8 @@ if "%ZLC_PS_HOST%"=="" set "ZLC_PS_HOST=0.0.0.0"
 if "%ZLC_PS_PORT%"=="" set "ZLC_PS_PORT=18861"
 if "%ZLC_PS_SERVER_BACKEND%"=="" set "ZLC_PS_SERVER_BACKEND=auto"
 if "%ZLC_PS_VIVADO_PROGRAM_ON_RUN%"=="" set "ZLC_PS_VIVADO_PROGRAM_ON_RUN=0"
-if "%ZLC_PS_CLOCK_HZ%"=="" set "ZLC_PS_CLOCK_HZ=50000000"
+set "ZLC_PS_CLOCK_HZ_ARG="
+if not "%ZLC_PS_CLOCK_HZ%"=="" set "ZLC_PS_CLOCK_HZ_ARG=--clock-hz %ZLC_PS_CLOCK_HZ%"
 if "%ZLC_PS_MAX_CHANNEL_COUNT%"=="" (
   set "ZLC_PS_MAX_CHANNEL_COUNT_ARG="
 ) else (
@@ -65,14 +66,20 @@ if "%ZLC_PS_MAX_CHANNEL_COUNT%"=="" (
 )
 if "%ZLC_PS_XDC%"=="" if exist "%CD%\fpga\board_config\board.xdc" set "ZLC_PS_XDC=%CD%\fpga\board_config\board.xdc"
 if "%ZLC_PS_CHANNEL_COUNT%"=="" (
-  for /f "delims=" %%I in ('%ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer infer_channel_count --xdc "%ZLC_PS_XDC%" --default-count 62 %ZLC_PS_MAX_CHANNEL_COUNT_ARG% 2^>nul') do if "!ZLC_PS_CHANNEL_COUNT!"=="" set "ZLC_PS_CHANNEL_COUNT=%%I"
+  for /f "delims=" %%I in ('%ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer infer_channel_count --xdc "%ZLC_PS_XDC%" %ZLC_PS_MAX_CHANNEL_COUNT_ARG% 2^>nul') do if "!ZLC_PS_CHANNEL_COUNT!"=="" set "ZLC_PS_CHANNEL_COUNT=%%I"
 )
-if "%ZLC_PS_CHANNEL_COUNT%"=="" set "ZLC_PS_CHANNEL_COUNT=62"
+if "%ZLC_PS_CHANNEL_COUNT%"=="" (
+  echo ERROR: channel count could not be derived from board XDC/config.
+  popd
+  exit /b 2
+)
 if "%ZLC_PS_CHANNELS%"=="" (
   for /f "delims=" %%I in ('%ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer infer_channels --xdc "%ZLC_PS_XDC%" --default-count %ZLC_PS_CHANNEL_COUNT% %ZLC_PS_MAX_CHANNEL_COUNT_ARG% 2^>nul') do if "!ZLC_PS_CHANNELS!"=="" set "ZLC_PS_CHANNELS=%%I"
 )
 if "%ZLC_PS_CHANNELS%"=="" (
-  for /f "delims=" %%I in ('%ZLC_PY_CMD% -c "print(' '.join(f'ch{i:02d}' for i in range(62)))" 2^>nul') do if "!ZLC_PS_CHANNELS!"=="" set "ZLC_PS_CHANNELS=%%I"
+  echo ERROR: channel names could not be derived from board XDC/config.
+  popd
+  exit /b 2
 )
 rem The sequencer is a PURE streamer: it streams pulses on its named channels and NEVER
 rem needs to know which line gates a camera.  Which channel is a camera capture trigger is
@@ -117,7 +124,11 @@ echo Backend: %ZLC_PS_SERVER_BACKEND%
 echo Bit:     %ZLC_PS_VIVADO_BIT%
 echo LTX:     %ZLC_PS_VIVADO_LTX%
 echo Channels: %ZLC_PS_CHANNELS%
-echo Clock:   %ZLC_PS_CLOCK_HZ% Hz
+if "%ZLC_PS_CLOCK_HZ%"=="" (
+  echo Clock:   fpga\board_config\streamer_config.json
+) else (
+  echo Clock:   %ZLC_PS_CLOCK_HZ% Hz ^(explicit override^)
+)
 echo Program-on-start: %ZLC_PS_VIVADO_PROGRAM_ON_RUN% ^(0 = assume build_and_program already loaded the FPGA^)
 
 if "%ZLC_RUN_SERVER_CHECK%"=="1" (
@@ -136,7 +147,8 @@ if not "%ZLC_PS_UART_BAUD%"=="" set "ZLC_PS_UART_ARGS=%ZLC_PS_UART_ARGS% --uart-
   --host %ZLC_PS_HOST% ^
   --port %ZLC_PS_PORT% ^
   --channels %ZLC_PS_CHANNELS% ^
-  --clock-hz %ZLC_PS_CLOCK_HZ% ^
+  --xdc "%ZLC_PS_XDC%" ^
+  %ZLC_PS_CLOCK_HZ_ARG% ^
   --state-dir "%ZLC_PS_STATE_DIR%"
 set "ZLC_STATUS=%ERRORLEVEL%"
 popd
@@ -144,7 +156,7 @@ endlocal & exit /b %ZLC_STATUS%
 
 :zlc_help
 echo Start the FINAL ZLC FPGA pulse-streamer server ^(auto: UART fast-control side-channel, else JTAG-to-AXI / hw_axi^).
-echo Engine: 1-tick ^(20 ns^) FIFO prefetch + unbounded 2-bank streaming scan.
+echo Engine: 1-tick FIFO prefetch + unbounded 2-bank streaming scan.
 echo.
 echo Usage:
 echo   fpga\run_server.bat
@@ -153,8 +165,8 @@ echo.
 echo Defaults:
 echo   host/port: 0.0.0.0:18861
 echo   backend:   auto  ^(probe UART fast-control side-channel first, else JTAG-to-AXI / hw_axi; ZLC_PS_SERVER_BACKEND to force^)
-echo   channels:  inferred from ZLC_PS_XDC, fallback ch00 ... ch61
-echo   clock:     50000000 Hz ^(override with ZLC_PS_CLOCK_HZ^)
+echo   channels:  inferred from ZLC_PS_XDC + board config ^(no fabricated fallback^)
+echo   clock:     fpga\board_config\streamer_config.json ^(override with ZLC_PS_CLOCK_HZ^)
 echo   bit/ltx:   fpga\build\ps\ps.runs\impl_1\zlc_pulse_streamer_top.{bit,ltx}
 echo.
 echo Run fpga\build_and_program.bat first ^(it builds AND programs the FPGA^).
@@ -171,7 +183,16 @@ exit /b 0
 
 :zlc_verify_sources
 set "ZLC_DEFAULT_XDC=%REPO_ROOT%\fpga\board_config\board.xdc"
+set "ZLC_STREAMER_CONFIG=%REPO_ROOT%\fpga\board_config\streamer_config.json"
 if not defined ZLC_PS_XDC set "ZLC_PS_XDC=%ZLC_DEFAULT_XDC%"
+if not exist "%ZLC_PS_XDC%" (
+  echo ERROR: missing board XDC: %ZLC_PS_XDC%
+  exit /b 2
+)
+if not exist "%ZLC_STREAMER_CONFIG%" (
+  echo ERROR: missing streamer geometry config: %ZLC_STREAMER_CONFIG%
+  exit /b 2
+)
 if not exist "%STREAMER_DIR%\zlc_edge_streamer.v" (
   echo ERROR: missing FINAL engine HDL: %STREAMER_DIR%\zlc_edge_streamer.v
   exit /b 2
@@ -192,7 +213,7 @@ findstr /C:"module zlc_edge_streamer" "%STREAMER_DIR%\zlc_edge_streamer.v" >nul 
   echo ERROR: FINAL engine module name is wrong.
   exit /b 2
 )
-echo ZLC FINAL source contract: channels=62 num_slots=4 control=JTAG-to-AXI
+echo ZLC FINAL source contract: topology=XDC geometry=streamer_config.json control=JTAG-to-AXI
 exit /b 0
 
 :zlc_default_paths

@@ -28,10 +28,11 @@
 ### 配置文件
 - [ ] `Zou_lab_control/neutral_atom/configs/remote_template.json` 按实际改:
       `camera`(QCMOSCamera:exposure / roi / device_index / timeout_ms、`capture_trigger_channels`)、
-      `sequencer`(RemoteSequencer:**host / port** = FPGA 端 IP:端口、`channels`)。
+      `sequencer`(RemoteSequencer:**host / port** = FPGA 端 IP:端口)。端口拓扑只从 server 的
+      `PortCatalog` 与 `clock_hz` 读取，control computer 不再维护第二份拓扑或时钟。
       序列器是纯脉冲流送器,不再有 `trigger_channels`:相机被哪条线触发是**相机**的属性
       (`camera.config.capture_trigger_channels`),由相机持有、向上暴露,序列器不感知。
-- [ ] `channels` 与板子 XDC 一致;`capture_trigger_channels` 是相机外部触发接的那条线(模板里是 `ch11`)。
+- [ ] server 发布的 `PortCatalog` 与板子 XDC 一致;`capture_trigger_channels` 是相机外部触发接的那条线(模板里是 `ch11`)。
       成像默认用 `ch09=trap / ch00=cooling / ch03=probe` + 相机的 `capture_trigger_channels[0]`。
       这套映射在 `session.py:_imaging_channel_kwargs` 里(它从 `camera.capture_trigger_channels[0]`
       取触发通道喂给 `imaging_channel_kwargs`),若通道名变了要同步。
@@ -69,10 +70,10 @@ from Zou_lab_control.frontend import show_task_console
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
 from Zou_lab_control.neutral_atom.operations.logic import OccupancyProcessor
 hub = SignalHub()
-camera = exp.readout.camera_measurement(hub)          # CameraMeasurement:只发 frame
+camera = exp.readout.camera_measurement(hub)          # CameraMeasurement:只发 frame_0/frame_1/...
 calibration = exp.readout.require(thresholds=True)    # 上面 sitemap/thresholds 标定出的 TrapCalibration
 detect = OccupancyProcessor(hub, calibration=calibration, grid_shape=(5, 7))  # 逐帧真 detect
-camera.start(); detect.start()                       # 相机产 frame、detect 逐帧消费(reactive);采集按硬件全速,不设速率上限
+camera.start(); detect.start()                       # 相机按触发事件产 frame_0/frame_1/...，detect 逐帧消费(reactive)
 show_task_console(hub=hub, running_nodes=[camera, detect],
                   measurements=exp.readout.measurement_specs())
 ```
@@ -85,7 +86,7 @@ python task_console.py --config remote_template.json --grid 5x7
 
 - 控制台开局**空、全停**。看 loading:从 **Add Panel** 加 `Measurement: Camera (live frames)` +
   `Processor: Judge occupancy` + `Task: Calibrate readout` 三个 logic 节点,各自 Start,再加 Plot 面板
-  连它们发的 `frame`/`occupied`/`rate`/`centers` 等信号,拼出你要的看板;布局 Save/Load。
+  连它们发的 `frame_0`/`frame_1`/...、`occupied`/`rate`/`centers` 等信号,拼出你要的看板;布局 Save/Load。
 - **无内置预设**——布局都是你自己拼好再 Save 出来的(`--task <你存的名字>` 载回)。
 - 每个 logic 节点的参数表单在它**自己**的 Edit 标签(由 ParamDecl 自动生成);plot 面板的 Edit 也给产它信号
   的那个 measurement/processor 的参数表单。task 运行时占一张固定面板看中途过程、并锁定其他操作只留 Stop。

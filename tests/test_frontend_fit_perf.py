@@ -8,13 +8,14 @@ main data tick already fixed everywhere else):
   a 300dpi raster just to size a text box, on the every-tick live-fit path.
 * :meth:`Live1D._reapply_general_fit` is guarded by a data+command fingerprint (the flat-panel
   counterpart of :class:`HistogramFigure`'s ``_fit_cache_key``): a live tick that did not move the
-  data re-runs NO ``curve_fit`` and repaints NO annotation.  A "sticky" live fit then costs one
+  data re-runs NO solver and repaints NO annotation.  A "sticky" live fit then costs one
   fingerprint per tick instead of a fresh fit + 6-candidate bbox search every frame.
 """
 
 from __future__ import annotations
 
 import os
+import tracemalloc
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -28,6 +29,7 @@ import numpy as np
 
 import Zou_lab_control.frontend.live as live_mod
 from Zou_lab_control.frontend.live import Live1D
+from Zou_lab_control.neutral_atom.core.fitting import FitRequest
 
 
 def _gaussian_plot() -> Live1D:
@@ -37,8 +39,7 @@ def _gaussian_plot() -> Live1D:
     y = 3.0 * np.exp(-(x ** 2) / (2 * 1.2 ** 2)) + 0.4
     plot = Live1D(x.reshape(-1, 1), y.reshape(-1, 1))
     plot.show(display=False)
-    plot._fit_model = "gaussian"
-    plot._fit_cmd = ""
+    plot._fit_request = FitRequest("gaussian").to_dict()
     return plot
 
 
@@ -102,13 +103,13 @@ def test_general_fit_is_cached_by_data_fingerprint(monkeypatch):
         assert calls["n"] == 1
 
         plot._reapply_general_fit()                       # identical data + command -> cache hit
-        assert calls["n"] == 1, "unchanged data must not re-run curve_fit"
+        assert calls["n"] == 1, "unchanged data must not re-run the solver"
 
         plot.data_y = plot.data_y + 1.0                   # the data moves -> cache miss -> re-fit
         plot._reapply_general_fit()
         assert calls["n"] == 2, "changed data must re-run the fit"
 
-        plot._fit_model = "none"                          # fit cleared -> drop the cache key + curve
+        plot._fit_request = None                          # fit cleared -> drop the cache key + curve
         plot._reapply_general_fit()
         assert plot._general_fit_key is None
         assert plot._general_fit_artists == []
@@ -117,7 +118,7 @@ def test_general_fit_is_cached_by_data_fingerprint(monkeypatch):
 
 
 def test_monitor_gauss_fit_is_cached_across_unchanged_ticks(monkeypatch):
-    """The rolling ``monitor`` panel (console default) does not re-run ``curve_fit`` every tick when
+    """The rolling ``monitor`` panel (console default) does not re-run the core fit every tick when
     its distribution counts are unchanged -- the counterpart of the histogram's ``_fit_cache_key``.
     A moved distribution re-fits."""
     from Zou_lab_control.frontend.live import LiveLiveDis
@@ -129,18 +130,18 @@ def test_monitor_gauss_fit_is_cached_across_unchanged_ticks(monkeypatch):
     plot.bins = np.linspace(0.0, 10.0, 6)
 
     calls = {"n": 0}
-    real = live_mod.curve_fit
+    real = live_mod.fit_histogram
 
     def spy(*a, **k):
         calls["n"] += 1
         return real(*a, **k)
 
-    monkeypatch.setattr(live_mod, "curve_fit", spy)
+    monkeypatch.setattr(live_mod, "fit_histogram", spy)
     try:
         plot._update_gauss_fit()
         assert calls["n"] == 1
         plot._update_gauss_fit()                          # identical counts -> cache hit
-        assert calls["n"] == 1, "unchanged distribution must not re-run curve_fit every tick"
+        assert calls["n"] == 1, "unchanged distribution must not re-run the solver every tick"
         plot.n = np.array([1.0, 2.0, 8.0, 2.0, 1.0])      # the distribution moved -> re-fit
         plot._update_gauss_fit()
         assert calls["n"] == 2
@@ -161,4 +162,45 @@ def test_a_wiped_curve_refits_even_on_identical_data():
         plot._reapply_general_fit()                       # identical data, but artists gone -> must re-fit
         assert plot._general_fit_artists, "a wiped fit curve must be redrawn on the next tick"
     finally:
+        plt.close(plot.fig)
+
+
+def test_fit_fingerprint_streams_a_constant_size_digest_without_frame_copy():
+    plot = Live1D(np.arange(2.0).reshape(-1, 1), np.arange(2.0).reshape(-1, 1))
+    # The 7.2 MiB payload is allocated before tracing.  The fingerprint may scan
+    # it but must neither return nor transiently allocate a payload-sized bytes.
+    plot.data_x = np.zeros((300_000, 2), dtype=np.float64)
+    plot.data_y = np.ones((300_000, 1), dtype=np.float64)
+
+    tracemalloc.start()
+    key = plot._fit_data_fingerprint()
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert [len(part[2]) for part in key] == [32, 32]
+    assert peak < 64 * 1024, f"fingerprint allocated {peak:,} B for constant-size digests"
+
+
+def test_unchanged_fit_request_runs_zero_solver_and_zero_draw(monkeypatch):
+    plot = _gaussian_plot()
+    solver_calls = {"n": 0}
+    draw_calls = {"n": 0}
+    real_apply = live_mod.apply_fit_to_figure
+    try:
+        def spy_apply(*args, **kwargs):
+            solver_calls["n"] += 1
+            return real_apply(*args, **kwargs)
+
+        monkeypatch.setattr(live_mod, "apply_fit_to_figure", spy_apply)
+        plot._reapply_general_fit()
+        assert solver_calls["n"] == 1
+        original_draw = plot.fig.canvas.draw
+        plot.fig.canvas.draw = lambda *args, **kwargs: draw_calls.__setitem__("n", draw_calls["n"] + 1)
+        for _ in range(100):
+            plot._reapply_general_fit()
+        assert solver_calls["n"] == 1
+        assert draw_calls["n"] == 0
+    finally:
+        if "original_draw" in locals():
+            plot.fig.canvas.draw = original_draw
         plt.close(plot.fig)

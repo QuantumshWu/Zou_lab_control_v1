@@ -5,7 +5,7 @@ Four findings from the whole-project review are pinned here:
 
   F1  ``TrapCalibration.readout_exposure(fallback)`` is the ONE reader of the
       exposure-self-match invariant; detect / live-adopt / temperature survival all
-      route through it instead of poking ``metadata['threshold_exposure']`` by hand.
+      route through its typed FrameContract instead of unversioned metadata.
   F2  ``signals()`` dispatches by an EXPLICIT readout-kind table (READOUT_KINDS),
       NOT a ``"psf" in name`` substring; every offered method is registered.
   F3  A PSF (kernel) calibration carries NO dead box-only state: roi_radius /
@@ -31,6 +31,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from Zou_lab_control.neutral_atom.core.calibration import (  # noqa: E402
+    FrameContract,
     READOUT_KINDS,
     TrapCalibration,
     readout_kind,
@@ -38,19 +39,25 @@ from Zou_lab_control.neutral_atom.core.calibration import (  # noqa: E402
 from Zou_lab_control.neutral_atom.operations.calibration import ALL_READOUT_METHODS  # noqa: E402
 
 
+def _frame_contract(*, exposure=None):
+    return FrameContract(image_shape=(10, 10), exposure_s=exposure)
+
+
 def _psf_calibration(roi_radius=2, reducer="sum"):
     w = np.ones((2, 3, 3), dtype=float)
     w /= w.sum(axis=(1, 2), keepdims=True)
     boxes = np.array([[1, 1, 3, 3], [5, 1, 3, 3]], dtype=int)
     return TrapCalibration(
-        centers=[(2, 2), (6, 2)], thresholds=[1.0, 1.0], method="psf",
+        centers=[(2, 2), (6, 2)], thresholds=[1.0, 1.0],
+        frame_contract=_frame_contract(), method="psf",
         psf_weights=w, psf_boxes=boxes, roi_radius=roi_radius, reducer=reducer,
     )
 
 
 def _box_calibration(roi_radius=2, reducer="sum"):
     return TrapCalibration(
-        centers=[(2, 2), (6, 2)], thresholds=[3.0, 4.0], method="box",
+        centers=[(2, 2), (6, 2)], thresholds=[3.0, 4.0],
+        frame_contract=_frame_contract(), method="box",
         roi_radius=roi_radius, reducer=reducer,
     )
 
@@ -58,18 +65,19 @@ def _box_calibration(roi_radius=2, reducer="sum"):
 # ------------------------------------------------------------------ F1: exposure accessor
 def test_readout_exposure_accessor_is_the_single_reader():
     """The accessor returns the stamped exposure when present and the caller's fallback when not --
-    the ONE place threshold_exposure is read (#issue-2 / #H3v-2)."""
-    stamped = TrapCalibration(centers=[(2, 2)], thresholds=[1.0],
-                              metadata={"threshold_exposure": 0.005})
+    the ONE place the frame-contract exposure is read (#issue-2 / #H3v-2)."""
+    stamped = TrapCalibration(
+        centers=[(2, 2)], thresholds=[1.0], frame_contract=_frame_contract(exposure=0.005))
     assert stamped.readout_exposure(fallback=0.02) == pytest.approx(0.005)   # stamp wins
-    bare = TrapCalibration(centers=[(2, 2)], thresholds=[1.0])
+    bare = TrapCalibration(
+        centers=[(2, 2)], thresholds=[1.0], frame_contract=_frame_contract())
     assert bare.readout_exposure(fallback=0.02) == pytest.approx(0.02)       # fallback when unstamped
     assert bare.readout_exposure() is None                                   # None fallback = no forcing
     assert bare.readout_exposure(fallback=None) is None
 
 
 def test_detect_default_exposure_self_matches_the_calibration():
-    """detect() with exposure=None images at the calibration's threshold_exposure -- it sources that
+    """detect() with exposure=None images at the calibration's typed exposure -- it sources that
     gate through the accessor, so the calibration and a default re-image always agree (#issue-2)."""
     import Zou_lab_control.neutral_atom as na
 
@@ -142,7 +150,7 @@ def test_psf_and_box_signals_dispatch_correctly():
     psf = _psf_calibration()
     box = _box_calibration(roi_radius=1, reducer="mean")
     box = TrapCalibration(centers=box.centers, thresholds=box.thresholds, method="box",
-                          roi_radius=1, reducer="mean")
+                          frame_contract=_frame_contract(), roi_radius=1, reducer="mean")
     assert psf.signals(img).shape == (2,)
     assert box.signals(img).shape == (2,)
 
@@ -158,7 +166,7 @@ def test_box_readout_is_only_available_as_the_calibrations_own_method():
     img = np.zeros((10, 10), dtype=float)
     # Own-method box reads fine.
     box = TrapCalibration(centers=[(2, 2), (6, 2)], thresholds=[3.0, 4.0], method="box",
-                          roi_radius=1, reducer="mean")
+                          frame_contract=_frame_contract(), roi_radius=1, reducer="mean")
     assert box.signals(img, method="box").shape == (2,)
     # A psf-primary calibration cannot read box at all (roi geometry was null'd) -- rejected up front.
     with pytest.raises(ValueError, match="not one of"):
@@ -166,7 +174,8 @@ def test_box_readout_is_only_available_as_the_calibrations_own_method():
     # The smuggled-box trap: 'box' in by_method of a kernel-primary calibration passes
     # _resolve_method but must be refused by the box branch (not read with None geometry).
     smuggled = TrapCalibration(
-        centers=[(2, 2), (6, 2)], thresholds=[1.0, 1.0], method="psf",
+        centers=[(2, 2), (6, 2)], thresholds=[1.0, 1.0],
+        frame_contract=_frame_contract(), method="psf",
         psf_weights=np.ones((2, 3, 3)) / 9.0,
         psf_boxes=np.array([[1, 1, 3, 3], [5, 1, 3, 3]], dtype=int),
         by_method={"box": {"thresholds": [1.0, 1.0]}},
@@ -245,7 +254,10 @@ def test_to_dict_keeps_every_field_even_when_box_geometry_is_none():
 
     psf = _psf_calibration()
     payload = psf.to_dict()
-    assert set(payload) == {f.name for f in _dc_fields(TrapCalibration)}
+    assert set(payload) == {
+        *{f.name for f in _dc_fields(TrapCalibration)},
+        "schema", "version", "fingerprint",
+    }
     assert payload["roi_radius"] is None and payload["reducer"] is None
 
 
@@ -280,7 +292,7 @@ def test_coupled_resolver_missing_policy_is_explicit_per_measurement():
         _resolve_release_recapture_template("pulses/does_not_exist_rr.json", seqr)
     # temperature: an unnamed template fabricates the standard release-recapture (its trap-off slot)
     rr = _resolve_release_recapture_template("", seqr)
-    assert rr.primary_time_slot() == "s0"
+    assert rr.primary_time_slot() == "t_off"
 
     # readout_duration: a missing template fabricates the single-image default and binds the scan slot
     img = _resolve_imaging_template("pulses/does_not_exist_img.json", seqr)

@@ -26,7 +26,8 @@ def test_on_pulse_finite_and_continuous_on_virtual():
     exp = na.connect("virtual")
     try:
         # build_release_recapture_pulse returns a PulseTableState (the GUI's pulse type).
-        state = na.build_release_recapture_pulse(channels=list(exp.devices.sequencer.channels))
+        state = na.build_release_recapture_pulse(
+            port_catalog=exp.devices.sequencer.port_catalog)
         pulse = na.bind_pulse(exp.devices.sequencer, state)
 
         # finite shot, wait for done -> a real program (NOT None) with a name.
@@ -52,7 +53,7 @@ def test_virtual_sequencer_prepare_accepts_pulse_table_state_and_returns_program
     from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
 
     seqr = VirtualSequencer()
-    state = na.build_release_recapture_pulse(channels=list(seqr.channels))
+    state = na.build_release_recapture_pulse(port_catalog=seqr.port_catalog)
     prog = seqr.prepare(state)                      # PulseTableState -> compiled program
     assert prog is not None and prog.sequence_name == state.name
     assert seqr.last_program is prog

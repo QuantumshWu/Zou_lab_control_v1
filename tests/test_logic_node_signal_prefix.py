@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sys
+import time
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
@@ -89,10 +90,23 @@ def test_switching_the_rows_device_keeps_its_signal_names():
 
         exp.devices.sequencer.set_safe_state()                   # the user hits Stop Pulse
         node2 = _start_with_camera(con, row, camera_name="monitor_camera")
+        assert node2 is not node and node2.camera is exp.devices["monitor_camera"]
         assert set(node2.published_signals()) == {"frame_0"}     # SAME names: same instance
-        node2.step()                                             # monitor free-runs (no pulse needed)
+        # The started node owns camera.acquire; never race it with a test-thread step().  Wait for the
+        # selected free-running monitor's first publish through the real worker path.  Its HxW differs
+        # from the old camera, so this also proves the row transferred schema ownership and replaced
+        # the old frame_0 version/history instead of silently retaining the stale frame.
+        expected = exp.devices["monitor_camera"].sensor_shape
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            try:
+                if np.asarray(con.hub.latest("frame_0")).shape[-2:] == expected:
+                    break
+            except KeyError:
+                pass
+            time.sleep(0.01)
         mon_frame = np.asarray(con.hub.latest("frame_0"))
-        assert mon_frame.shape[-2:] == exp.devices["monitor_camera"].sensor_shape
+        assert mon_frame.shape[-2:] == expected
     finally:
         con.shutdown()
         exp.close()

@@ -84,8 +84,8 @@ def test_processor_node_runs_and_publishes(tmp_path):
         while not getattr(node, "finished", False) and time.monotonic() < deadline:
             time.sleep(0.02)
         assert node.finished
-        assert float(console.hub.latest("processor_done")) == 1.0
-        assert np.asarray(console.hub.latest("fidelity_site")).shape == (20,)
+        assert np.asarray(console.hub.latest("fidelity_site")).shape == (1, 1, 20)
+        assert console.hub.schema("fidelity_site").data_shape == (20,)
         # display suppressed: running the processor created NO plot panel
         assert console.cards == []
     finally:
@@ -128,10 +128,11 @@ def test_judge_occupancy_node_reacts_to_frames(tmp_path):
         assert SignalExpr.from_value(vals["source"]).source == "value = signal"
         assert "ema" not in vals
 
-        # point the detector at a REAL saved calibration file (the reference's explicit-file
-        # model) -- the canonical default path may not exist in a fresh checkout.
+        # Deliberately switch to the file-owned mode and point it at a real
+        # current-version calibration artifact.
         cal_file = tmp_path / "cal.json"
         exp.readout.save(str(cal_file))
+        editor.form._widgets["calibration_origin"].setCurrentText("file")
         editor.form._widgets["calibration"].setText(str(cal_file))
 
         # a camera measurement publishes `frame`; the occupancy processor reacts to it
@@ -152,10 +153,11 @@ def test_judge_occupancy_node_reacts_to_frames(tmp_path):
             time.sleep(0.03)
         assert occ_name in hub.names()
         cen = np.asarray(hub.latest(cen_name))
-        assert cen.shape == (20, 2)                                     # static (N, 2) centres
-        # occupancy is the UNIFORM (repeat, data_points, n_sites) block the processor preserves (#H3q):
-        # one shot judged, one readout point -> (1, 1, n_sites), the data_points axis kept
-        assert np.asarray(hub.latest(occ_name)).shape == (1, 1, cen.shape[0])
+        assert cen.shape == (1, 1, 20, 2)
+        assert hub.schema(cen_name).data_shape == (20, 2)
+        # occupancy is the canonical (R,P,*data_shape) block the processor preserves (#H3q):
+        # one shot judged, one readout point -> (1,1,n_sites), P kept and data_shape=(n_sites,)
+        assert np.asarray(hub.latest(occ_name)).shape == (1, 1, cen.shape[2])
         # reactive: it keeps running (NOT a one-shot finished node)
         assert getattr(node, "finished", False) is False
         cam.stop()

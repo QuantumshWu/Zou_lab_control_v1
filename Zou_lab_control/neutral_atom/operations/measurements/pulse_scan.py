@@ -1,30 +1,17 @@
-"""Generic "Pulse scan" measurement (auto-discovered).
+"""Pulse-table scan measurement (auto-discovered).
 
-A pulse template the user loads exposes TWO kinds of named handle:
+The pulse template is the single source of two intentionally different sweep mechanisms:
 
-* **API slots** (``a1``, ``a2`` ...) — one numeric value the operator wants to FIX before the
-  run.  Each slot is set ONCE at build time via :meth:`PulseTableState.set_api`.
-* **Scan slots** (``s0``, ``s1`` ...) — handles bound to a HARDWARE scan column (the FPGA scan
-  table), resolved per point via :meth:`PulseTableState.with_slots_resolved` (the SAME named-slot
-  resolver the hardware scan + pulse GUI use).
+* ``scan_slot`` sweeps the template's hardware scan slots.  One complete
+  ``(points, slots)`` table is attached to :class:`PulseTableState`, uploaded once, and streamed
+  by the sequencer.
+* ``api_slot`` sweeps the template's API handles.  Each row is resolved into one finite pulse and
+  fired in software; API values remain in their declared native units.
 
-A pulse scan runs in ONE of three :data:`SCAN_MODES` -- a single ``scan_mode`` in the spec picks
-WHAT a single shared scan table sweeps and HOW the device runs it:
-
-* ``"scan"`` — sweep the bound hardware scan slots (one ``(N x n_slots)`` table snapped to the
-  FPGA grid, slots advancing in lockstep).  ``x`` = the scan points (1-D = one slot; 2-D = a grid).
-* ``"api"`` — SOFTWARE sweep of the API slots (the analogue table, native units, no snap): per
-  point the node ``set_api``'s that row, fires, waits the pulse + an extra settle, then advances.
-* ``"none"`` — no sweep: fire ONE point at the fixed api values (a single-point measurement).
-
-The fixed api values are ALWAYS applied first; the mode only decides whether (and how) to sweep.
-
-The ``y`` is DECOUPLED: pulse-scan does not reduce its own frames.  It is a device-driving
-logic node that fires the pulse, publishes the camera ``frame`` it produces, and then reads
-``y`` from a **source expression** that subscribes to a signal published by ANOTHER running
-node (e.g. a Judge-occupancy processor's loading ``rate``).  So the readout pipeline lives in
-its own node (calibration, detection) and pulse-scan just sweeps + records its output -- the
-same decoupling the rest of the console uses.  The driving node is :class:`~..logic.PulseScanNode`.
+There is no camera role and no frame relay.  A separately running measurement/processor pipeline
+publishes the chosen ``y`` signal; :class:`~..logic.PulseScanNode` samples one fresh,
+lineage-coherent update per point.  Both mechanisms share the same coordinate and signal-consumer
+contract; only their sequencer execution strategy differs.
 """
 
 from __future__ import annotations
@@ -44,30 +31,27 @@ from ...timing import (
     snap_scan_table,
 )
 from ...core.params import ParamDecl
-from ..measurement import NODE_META_KEY, PULSE_SCAN_NODE, MeasurementSpec
+from ..measurement import (
+    NODE_META_KEY,
+    PULSE_SCAN_NODE,
+    PULSE_SWEEP_KINDS,
+    SWEEP_API_SLOT,
+    SWEEP_SCAN_SLOT,
+    MeasurementSpec,
+)
+from ..measurement import measurement_slug
 from ..measurement_registry import measurement
 from ..signal_expr import SignalExpr
 
-#: The THREE pulse-scan modes -- the SINGLE source for the name strings the widget toggle, the
-#: build() dispatch, and the tests all share (so "none"/"api"/"scan" is typed in exactly one place):
-#:   * ``"none"`` -- no sweep; fire ONE point at the fixed api values (a single-point measurement).
-#:   * ``"api"``  -- SOFTWARE sweep of the API slots (load -> on_pulse -> settle -> next), no snap.
-#:   * ``"scan"`` -- HARDWARE sweep of the bound scan slots (the FPGA scan table), snapped to the grid.
-SCAN_MODE_NONE = "none"
-SCAN_MODE_API = "api"
-SCAN_MODE_SCAN = "scan"
-SCAN_MODES: tuple[str, str, str] = (SCAN_MODE_NONE, SCAN_MODE_API, SCAN_MODE_SCAN)
-
-#: A pulse scan images ONCE per point, so the default pulse is the SINGLE-image probe template
-#: (one camera trigger) -- NOT the Calibrate task's long-short-long bracket.  The shipped
-#: file's path is typed ONCE, in the timing layer beside its in-memory factory.
+#: The generic scan needs a compact, inspectable pulse program to sweep.  The shipped probe
+#: template is that default; acquiring and reducing the external y signal remain the independent
+#: producer pipeline's responsibility.
 DEFAULT_PROBE_TEMPLATE = PROBE_TEMPLATE_PATH
 
 #: Default y source: the loading ``rate`` published by a Judge-occupancy processor (the common
 #: case -- sweep a pulse parameter, watch the loading fraction).  The operator re-picks it in
 #: the form / notebook to any running node's signal.
 DEFAULT_Y_SOURCE: Mapping[str, object] = {"inputs": ["rate"], "source": "value = signal"}
-
 
 class _Axis:
     """The scan-axis the live node reads (``values`` + plot labels)."""
@@ -88,93 +72,112 @@ def _resolve_probe_template(template: str, sequencer=None) -> PulseTableState:
                                      default_factory=single_imaging_template, sequencer=sequencer)
 
 
+def _unique_names(candidates: Sequence[str]) -> list[str]:
+    """Normalize coordinate candidates and disambiguate them deterministically."""
+
+    names: list[str] = []
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        base = measurement_slug(candidate) or "scan_parameter"
+        counts[base] = counts.get(base, 0) + 1
+        names.append(base if counts[base] == 1 else f"{base}_{counts[base]}")
+    return names
+
+
+def _semantic_scan_names(state: PulseTableState) -> list[str]:
+    """Return the authoritative public identities without deriving a second namespace."""
+
+    return list(state.scan_names)
+
+
+def _semantic_api_names(state: PulseTableState) -> list[str]:
+    """Meaningful public coordinates for API handles.
+
+    ``a1``/``a2`` are mutation handles, not experiment vocabulary.  A sweep therefore publishes
+    the bound pulse field (``da_x``, ``probe_duration``, ``camera_delay``), while retaining the API
+    handle separately for :meth:`PulseTableState.set_api`.
+    """
+
+    candidates: list[str] = []
+    for slot in state.api_slots:
+        target = str(slot.target)
+        if slot.kind == "dac":
+            candidate = target.split("@", 1)[0]
+        elif slot.kind == "duration":
+            try:
+                period = state.periods[int(target)]
+                candidate = f"{period.name or f'period_{target}'}_duration"
+            except (IndexError, TypeError, ValueError):
+                candidate = f"period_{target}_duration"
+        elif slot.kind == "delay":
+            candidate = f"{target}_delay"
+        else:
+            candidate = scan_target_label(state, slot.kind, target)
+        candidates.append(candidate)
+    return _unique_names(candidates)
+
+
 def _scan_table_arrays(
-    state: PulseTableState, scan_code: str,
-) -> tuple[list[str], list[np.ndarray], tuple[int, int] | None]:
-    """Evaluate the scan PROGRAM into per-slot arrays (one array per bound scan slot, in slot
-    order).
+    state: PulseTableState, scan_code: str | None,
+) -> tuple[list[str], list[np.ndarray], tuple[int, ...] | None]:
+    """Attach one hardware-legal scan table to ``state`` and expose its semantic axes.
 
-    The program builds ONE ``(N_points x n_slots)`` table -- the slots advance in LOCKSTEP, one
-    row per scan point -- which is then snapped to the hardware grid via the SAME ``snap_scan_table``
-    the pulse GUI + server use (durations -> whole clock ticks, DAC -> integer codes in range).
-    The points are NOT set per slot in isolation: the whole table is one object, so correlations
-    between slots are expressed by how the columns are built.  Returns ``(slot names, columns)``."""
+    Source precedence is deliberate: an explicit task-console program, then the program persisted
+    in the selected template, then the template's already-materialised table, and finally the shared
+    starter program.  Whichever source wins is snapped once and written back to the same
+    :class:`PulseTableState` that the node later passes to ``sequencer.prepare``.
+    """
 
-    names = [f"s{i}" for i in range(len(state.scan_slots))]
-    if not names:
+    if not state.scan_slots:
         raise ValueError(
-            "the pulse template has no scan slot bound -- in the pulse GUI Edit tab, click the dot "
-            "next to a duration or DAC value to bind a scan slot (sN), then give a scan program.")
-    table, scan_shape = evaluate_scan_table_code(scan_code, len(names))   # N x n_slots + optional grid shape
-    snapped = snap_scan_table(table, state.scan_slots, time_step_ns=state.time_step_ns,
-                              dac_ranges=state.scan_slot_dac_ranges())  # hardware-legal table
-    columns = list(zip(*snapped))                                      # one column per slot, length N
-    arrays = [np.asarray(col, dtype=float) for col in columns]
-    return names, arrays, scan_shape
+            "Pulse scan selected a scan-slot sweep, but the pulse template has no scan slot. "
+            "Bind one in the Pulse GUI or select the API-slot sweep strategy.")
+
+    code = str(scan_code or "").strip() or str(getattr(state, "scan_code", "") or "").strip()
+    scan_shape: tuple[int, ...] | None = None
+    if code:
+        table, scan_shape = evaluate_scan_table_code(code, len(state.scan_slots))
+    elif state.scan_table:
+        table = [list(row) for row in state.scan_table]
+    else:
+        code = scan_table_template("column_stack", state.scan_column_specs())
+        table, scan_shape = evaluate_scan_table_code(code, len(state.scan_slots))
+
+    snapped = snap_scan_table(
+        table, state.scan_slots, time_step_ns=state.time_step_ns,
+        dac_ranges=state.scan_slot_dac_ranges())
+    state.set_scan_table(snapped)
+    state.scan_code = code
+    matrix = np.asarray(state.scan_table, dtype=float)
+    arrays = [matrix[:, index].copy() for index in range(matrix.shape[1])]
+    return _semantic_scan_names(state), arrays, scan_shape
 
 
-def _api_table_arrays(state: PulseTableState, api_code: str) -> tuple[list[str], list[np.ndarray], tuple[int, ...] | None]:
-    """Evaluate the SOFTWARE api-sweep program into per-api-slot arrays (one column per API slot,
-    in slot order).
+def _api_table_arrays(
+    state: PulseTableState, program: str | None,
+) -> tuple[list[str], list[str], list[np.ndarray], tuple[int, ...] | None]:
+    """Evaluate one API-slot sweep program without hardware-table snapping.
 
-    The api sweep is the software analogue of the hardware scan table: ONE ``(N_points x n_api)``
-    program (the api slots advance in lockstep, one row per point).  Values are in each slot's
-    NATIVE unit (``set_api`` interprets them: a duration api slot's value in its unit, a DAC api
-    slot's value in signed LSB) -- there is NO hardware snap here (set_api snaps a duration to the
-    clock grid itself).  Returns ``(api names, columns, declared scan_shape or None)`` -- the same
-    optional grid declaration the hardware table carries, so a multi-axis api sweep (e.g. the x/y/z
-    coil-field grid) facets into the SAME grid display a hardware scan does."""
-
-    names = [s.name for s in state.api_slots]
-    if not names:
-        raise ValueError(
-            "the pulse template has no API slot to sweep -- in the pulse GUI Edit tab, click a "
-            "duration / DAC cell to its API (purple) state to expose a named handle aN, then give "
-            "an api-sweep program here.")
-    table, scan_shape = evaluate_scan_table_code(api_code, len(names))   # N x n_api + optional grid shape
-    columns = list(zip(*table))                                          # one column per api slot
-    arrays = [np.asarray(col, dtype=float) for col in columns]
-    return names, arrays, scan_shape
-
-
-def _resolve_scan_mode(spec: Mapping, state: PulseTableState) -> str:
-    """The pulse-scan mode ("none" | "api" | "scan") -- ONE place that picks WHAT is swept.
-
-    A form built on the new schema sets ``scan_mode`` explicitly.  A LEGACY saved task (pre-toggle)
-    has no ``scan_mode`` key but may carry the old separate programs (``scan_code`` for the hardware
-    scan + ``api_scan`` for the software api sweep).  Infer it ONCE here (no dual runtime path):
-      * a hardware ``scan_code`` + bound scan slots -> "scan" (the old default when slots existed);
-      * else an old ``api_scan`` program -> "api";
-      * else "none" (nothing to sweep -> a single fixed point)."""
-
-    mode = str(spec.get("scan_mode") or "").strip().lower()
-    if mode in SCAN_MODES:
-        return mode
-    # ---- legacy inference (no scan_mode key) -- map the OLD two-table schema onto a single mode.
-    legacy_scan = str(spec.get("scan_code") or "").strip()
-    legacy_api = str(spec.get("api_scan") or "").strip()
-    if state.scan_slots and legacy_scan:
-        return SCAN_MODE_SCAN
-    if legacy_api:
-        return SCAN_MODE_API
-    # An old task that bound scan slots but left the program blank still meant a hardware scan
-    # (the build seeded the column_stack default), so honour that too.
-    if state.scan_slots:
-        return SCAN_MODE_SCAN
-    if state.api_slots and legacy_scan:
-        # the only program present is under scan_code but there are no scan slots -> it was an api one
-        return SCAN_MODE_API
-    return SCAN_MODE_NONE
-
-
-def _label_for_first_api_slot(state: PulseTableState) -> tuple[str, str]:
-    """``(axis label, unit)`` for the FIRST API slot (drives the x label of an api-only sweep)."""
+    Returns public semantic coordinate names, private API mutation handles, aligned columns, and
+    optional logical point geometry.  Keeping the two identities separate prevents opaque ``aN``
+    handles from leaking into the signal namespace.
+    """
 
     if not state.api_slots:
-        return ("point", "")
-    slot = state.api_slots[0]
-    name = slot.name + ": " + scan_target_label(state, slot.kind, slot.target)
-    return (name, str(getattr(slot, "unit", "") or ""))
+        raise ValueError(
+            "Pulse scan selected an API-slot sweep, but the pulse template has no API slot.")
+    code = str(program or "").strip()
+    if not code:
+        code = scan_table_template("column_stack", state.api_column_specs())
+    table, scan_shape = evaluate_scan_table_code(code, len(state.api_slots))
+    matrix = np.asarray(table, dtype=float)
+    arrays = [matrix[:, index].copy() for index in range(matrix.shape[1])]
+    return (
+        _semantic_api_names(state),
+        [str(slot.name) for slot in state.api_slots],
+        arrays,
+        scan_shape,
+    )
 
 
 def _label_for_first_scan_slot(state: PulseTableState) -> tuple[str, str]:
@@ -197,143 +200,125 @@ def _label_for_first_scan_slot(state: PulseTableState) -> tuple[str, str]:
     return (name, str(getattr(slot, "unit", "") or ""))
 
 
+def _label_for_first_api_slot(state: PulseTableState) -> tuple[str, str]:
+    """Human axis label and native unit for the first swept API handle."""
+
+    if not state.api_slots:
+        return ("point", "")
+    slot = state.api_slots[0]
+    return (
+        scan_target_label(state, slot.kind, slot.target),
+        str(getattr(slot, "unit", "") or ""),
+    )
+
+
 class PulseScanPlan:
-    """Everything :class:`~..logic.PulseScanNode` needs to drive a pulse-template scan.
+    """Immutable run inputs for :class:`~..logic.PulseScanNode`.
 
-    API slots are already FIXED on ``base_state`` (``set_api``); ``scan_names``/``scan_arrays``
-    are the bound scan slots + their per-point sweep values (the x axis), resolved per point via
-    ``with_slots_resolved`` (no clearing, no period editing).  ``y_expr`` is the DECOUPLED y
-    source -- a :class:`~..signal_expr.SignalExpr` over signals published by other running nodes.
-    ``settle`` (optional) lets a HEADLESS caller step the consumer inline for single-threaded
-    determinism; in the GUI it is ``None`` and the node waits for the consumer's own thread to
-    republish the y signals (a per-signal version bump)."""
+    ``sweep_kind`` chooses exactly one execution strategy.  ``scan_names`` are public semantic
+    coordinates; ``api_handles`` are present only for an API sweep and are private mutation keys.
+    A scan-slot plan's ``pulse_state`` already contains the complete snapped hardware table.
+    """
 
-    def __init__(self, base_state: PulseTableState, scan_names: Sequence[str],
-                 scan_arrays: Sequence[np.ndarray], camera, sequencer, *,
+    def __init__(self, pulse_state: PulseTableState, scan_names: Sequence[str],
+                 scan_arrays: Sequence[np.ndarray], sequencer, *,
                  axis_label: str = "point", axis_unit: str = "", y_key: str = "signal",
-                 y_expr=None, scan_shape: tuple[int, ...] | None = None, settle=None,
-                 api_names: Sequence[str] = (), api_arrays: Sequence[np.ndarray] = (),
-                 extra_delay_s: float = 0.0):
-        self.base_state = base_state
+                 y_expr=None, scan_shape: tuple[int, ...] | None = None,
+                 sweep_kind: str = SWEEP_SCAN_SLOT, api_handles: Sequence[str] = ()):
+        self.pulse_state = pulse_state
         self.scan_names = list(scan_names)
         self.scan_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in scan_arrays]
-        # SOFTWARE api-slot sweep (the analogue of the hardware scan table): per point the node
-        # deep-copies the base state, calls set_api for each api column, fires, waits the pulse +
-        # extra_delay_s, then advances.  The DEVICE owns the inter-point wait (sequencer.settle).
-        self.api_names = list(api_names)
-        self.api_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in api_arrays]
-        self.extra_delay_s = max(0.0, float(extra_delay_s))
-        # The whole-sweep count is NOT carried on the plan: a pulse-scan pass IS a whole sweep, so the
-        # measurement's ONE ``repeat`` knob (0 = ∞), injected by the console into PulseScanNode, is the
-        # sweep count.  PulseScanNode bounds the number of point-by-point passes by that ``repeat``.
-        # The x axis is the swept dimension: the hardware scan slots if any, else the software api
-        # sweep, else a single point.
-        primary = self.scan_arrays[0] if self.scan_arrays else (
-            self.api_arrays[0] if self.api_arrays else [0.0])
+        if len(self.scan_names) != len(self.scan_arrays) or not self.scan_arrays:
+            raise ValueError("pulse scan plan needs one semantic axis per bound scan-table column.")
+        lengths = {int(a.size) for a in self.scan_arrays}
+        if len(lengths) != 1 or next(iter(lengths), 0) < 1:
+            raise ValueError("pulse scan coordinate columns must be non-empty and aligned.")
+        self.sweep_kind = str(sweep_kind)
+        if self.sweep_kind not in PULSE_SWEEP_KINDS:
+            raise ValueError(
+                f"pulse sweep kind must be one of {PULSE_SWEEP_KINDS}, got {self.sweep_kind!r}.")
+        self.api_handles = [str(name) for name in api_handles]
+        if self.sweep_kind == SWEEP_API_SLOT:
+            if len(self.api_handles) != len(self.scan_arrays):
+                raise ValueError("an API-slot sweep needs one API handle per coordinate column.")
+        elif self.api_handles:
+            raise ValueError("a scan-slot sweep cannot carry API mutation handles.")
+        if self.sweep_kind == SWEEP_SCAN_SLOT \
+                and next(iter(lengths)) != len(self.pulse_state.scan_table):
+            raise ValueError(
+                "scan-slot axes must all have the same length as pulse_state.scan_table.")
+        primary = self.scan_arrays[0]
         self.axis = _Axis(primary, label=axis_label, unit=axis_unit)
         self.axis_label = str(axis_label)
         self.axis_unit = str(axis_unit)
-        self.camera = camera
         self.sequencer = sequencer
         # The OUTPUT signal name (user-set #7): the node publishes y under this key.
         self.y_key = str(y_key or "signal").strip() or "signal"
-        # Optional grid shape (n0, n1) for a 2-D scan: the node publishes the raw ``<y_key>_grid``
-        # ``(repeat, n0, n1)`` block (a pure reshape of its raw y, no combine) so a 2-D image panel
-        # reduces the repeat axis then shows the (n0, n1) map.  None = 1-D.
+        # Optional logical grid geometry.  The unique y signal remains physical
+        # ``(R,P,1)``; SignalSchema.point_shape carries this geometry so a view
+        # can unflatten P without publishing a duplicate array.
         self.scan_shape = scan_shape
         self.y_expr = y_expr if isinstance(y_expr, SignalExpr) else SignalExpr.from_value(y_expr)
-        self.settle = settle
 
 
-@measurement(order=30, devices=["camera"])
+@measurement(order=30)
 def pulse_scan(readout) -> MeasurementSpec:
-    """Pulse-template scan: set every API slot's value, give scan-points per scan slot (x),
-    sweep the points, and record y from a source signal published by another running node.
-
-    The camera is a declared device ROLE (``devices=["camera"]``): the base appends the camera
-    dropdown to this form and injects the RESOLVED device into ``build`` -- so this factory
-    never spells ``choices=camera_names()`` or ``s.devices[name]`` itself (any camera in the
-    config sweeps the same way, and a new device domain needs no edit here)."""
+    """Sweep either scan slots or API slots and record an external y per point."""
 
     s = readout.session
 
     def build(*, template: str = DEFAULT_PROBE_TEMPLATE, pulse_slots: Mapping | None = None,
-              camera=None,
-              y=None, y_name: str = "signal", **_ignored) -> PulseScanPlan:
+              y=None, y_name: str = "signal") -> PulseScanPlan:
         state = _resolve_probe_template(template, sequencer=s.devices.sequencer)
         spec = dict(pulse_slots or {})
+        unknown = sorted(set(spec) - {"program_id", "api", "sweep_kind", "program"})
+        if unknown:
+            raise ValueError(
+                f"unsupported pulse-scan field(s) {unknown}; expected only program_id, api, "
+                "sweep_kind, program.")
         api_values: Mapping[str, float] = dict(spec.get("api") or {})
-        scan_code = str(spec.get("scan_code") or "")
-        extra_delay_s = max(0.0, float(spec.get("extra_delay") or 0.0))
-        # The mode is the SINGLE place that picks WHAT is swept: "scan" (hardware scan slots, snap),
-        # "api" (software api sweep, no snap), "none" (one fixed point).  ONE scan_code (the active
-        # mode's program); the form never emits two simultaneous tables.
-        scan_mode = _resolve_scan_mode(spec, state)
+        sweep_kind = str(spec.get("sweep_kind") or "").strip()
+        if not sweep_kind:
+            sweep_kind = SWEEP_SCAN_SLOT if state.scan_slots else (
+                SWEEP_API_SLOT if state.api_slots else "")
+        if sweep_kind not in PULSE_SWEEP_KINDS:
+            raise ValueError(
+                f"pulse sweep kind must be one of {PULSE_SWEEP_KINDS}; got {sweep_kind!r}.")
+        program = str(spec.get("program") or "")
 
         # Apply the FIXED api values ONCE; reject typos (set_api raises for unknown handle names).
-        # (An api slot named in the api SWEEP below is driven per point instead, so its fixed value
-        # here is just the resting seed.)
         for name, value in api_values.items():
             if str(value).strip() == "":
                 continue                                       # leave the template's value
             state.set_api(name, float(value))
 
-        scan_names, scan_arrays, scan_shape = [], [], None
-        api_names, api_arrays = [], []
-        if scan_mode == SCAN_MODE_SCAN:
-            # HARDWARE scan slots (x on the FPGA scan table): ONE (N_points x n_slots) program,
-            # snapped to the hardware grid, slots advancing in lockstep.  A 2-slot grid program
-            # also declares scan_shape (n0, n1) -> a 2-D scan map.  Empty program with bound slots
-            # -> the column_stack default.
-            if not scan_code.strip():
-                scan_code = scan_table_template("column_stack", state.scan_column_specs())
-            scan_names, scan_arrays, scan_shape = _scan_table_arrays(state, scan_code)
-        elif scan_mode == SCAN_MODE_API:
-            # SOFTWARE api sweep (the analogue, for api slots): the SAME single scan_code, read as
-            # an (N_points x n_api) table in native units (no hardware snap; set_api snaps a duration
-            # itself).  Empty program -> the column_stack default for the api columns.
-            if not scan_code.strip():
-                scan_code = scan_table_template("column_stack", state.api_column_specs())
-            api_names, api_arrays, scan_shape = _api_table_arrays(state, scan_code)
-        # scan_mode == "none": no sweep -> a single point at the fixed api values (scan/api arrays
-        # stay empty; PulseScanPlan's primary axis is then the lone [0.0] point).
-
-        # x axis label: the hardware scan slot if scanning, the swept API slot if api-sweeping, else
-        # (none) the fixed point's first api slot (a meaningful single-point label).
-        if scan_arrays:
+        api_handles: list[str] = []
+        if sweep_kind == SWEEP_SCAN_SLOT:
+            scan_names, scan_arrays, scan_shape = _scan_table_arrays(state, program)
             axis_label, axis_unit = _label_for_first_scan_slot(state)
         else:
+            scan_names, api_handles, scan_arrays, scan_shape = _api_table_arrays(state, program)
             axis_label, axis_unit = _label_for_first_api_slot(state)
         y_expr = SignalExpr.from_value(y if y is not None else DEFAULT_Y_SOURCE)
-        # ``camera`` is ALREADY the resolved device the base injected from the dropdown choice
-        # (the readout qCMOS, or a monitor sensor for a MOT sweep) -- the pure-grabber contract
-        # is identical, so the scan engine never cares which sensor it arms.
-        scan_camera = camera
         return PulseScanPlan(
-            state, scan_names, scan_arrays, scan_camera, s.devices.sequencer,
+            state, scan_names, scan_arrays, s.devices.sequencer,
             axis_label=axis_label, axis_unit=axis_unit, y_key=y_name, y_expr=y_expr,
-            scan_shape=scan_shape, api_names=api_names, api_arrays=api_arrays,
-            extra_delay_s=extra_delay_s)
+            scan_shape=scan_shape, sweep_kind=sweep_kind, api_handles=api_handles)
 
     params = (
         ParamDecl("template", "Pulse template", "path", default=DEFAULT_PROBE_TEMPLATE,
                   path_mode="file", base_dir="pulses", file_filter="Pulse program (*.json);;All files (*)",
-                  tooltip="The pulse program fired each point.  Its api / scan slots populate the "
-                          "auto-form below (one numeric input per api slot + ONE scan-table program)."),
-        # (the "Camera" dropdown is appended by the base from devices=["camera"] -- not hand-rolled here)
+                  tooltip="The complete hardware pulse program. Its fixed API values and persisted "
+                          "scan-slot program populate the form below."),
         ParamDecl("pulse_slots", "Slots", "pulse_slots", default={}, depends_on="template",
-                  tooltip="One numeric input per API slot (the fixed operator-set value), then a "
-                          "Scan: [None | API | Scan] mode toggle that picks WHAT one shared scan "
-                          "table sweeps: API sweeps the api slots in software (native units, no "
-                          "snap); Scan sweeps the bound hardware scan slots (snapped to the FPGA "
-                          "grid); None fires a single fixed point.  Same table model as the pulse "
-                          "GUI Scan tab (column_stack / grid templates) -- one row per point, one "
-                          "column per slot, advanced in lockstep (this is x)."),
+                  tooltip="One resting value per API slot plus one sweep program. Select scan-slot "
+                          "execution for a single FPGA table or API-slot execution for one finite "
+                          "software-submitted pulse per row; all selected columns advance together."),
         ParamDecl("y", "Signal (y)", "signal_expr", default=dict(DEFAULT_Y_SOURCE),
                   tooltip="The y recorded per point.  Pick a signal published by ANOTHER running node "
-                          "(e.g. a Judge-occupancy processor's loading 'rate') and combine via value = ... .  "
-                          "Start that producer FIRST; pulse-scan fires the pulse each point and reads this "
-                          "UPSTREAM signal back for the point's y (it does not own the camera)."),
+                          "(e.g. a Judge-occupancy processor's loading 'rate') and combine via value = ... . "
+                          "Start the selected producer/processor pipeline first; Pulse scan owns only "
+                          "the sequencer and samples each fresh lineage once."),
         ParamDecl("y_name", "Output name", "text", default="signal",
                   tooltip="Name of the OUTPUT signal this scan publishes (the y curve), e.g. "
                           "'loading_rate' or 'survival' -- so a plot picks a meaningful name."),
@@ -342,6 +327,5 @@ def pulse_scan(readout) -> MeasurementSpec:
         name="Pulse scan", key="pulse_scan", params=params,
         result_labels=("Pulse parameter", "Signal"),
         x_key="param", y_key="signal", build=build,
-        # The console builds a device-driving PulseScanNode (not a ScannedMeasurementNode):
-        # it fires + publishes a frame + reads y from a subscribed signal, per point.
+        # The console builds the dedicated sequencer-driving, signal-consuming PulseScanNode.
         metadata={NODE_META_KEY: PULSE_SCAN_NODE})

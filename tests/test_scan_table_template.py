@@ -9,6 +9,7 @@ Pulse-scan form) used to special-case only 1/2 slots and put inline `# s{j}` com
 single-line list literal, so the 3+-slot template was a hard SyntaxError; that regression is also
 pinned here.
 """
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 import numpy as np
 import pytest
@@ -83,8 +84,7 @@ def test_set_period_duration_floors_a_zero_or_subtick_to_one_tick():
     """A 0 / sub-tick LITERAL duration can never be stored -- it is floored to exactly one tick (the
     api-sweep path sets durations point-by-point with NO table snap, so this is the structural guard
     against a 0-length period reaching the driver).  A negative literal still raises."""
-    st = PulseTableState(channels=["ch00", "t"], channel_labels={"ch00": "da[0]"},
-                         visible_channels=["ch00", "t"], time_step_ns=20.0,
+    st = PulseTableState(port_catalog=PortCatalog.from_channels(["ch00", "t"], channel_labels={"ch00": "da[0]"}), visible_ports=["ch00", "t"], time_step_ns=20.0,
                          periods=[PulsePeriod(200, (0, 1), unit="ns")])
     st.set_period_duration(0, 0.0)
     assert float(st.periods[0].duration) == 20.0                              # 0 -> 1 tick (20 ns)

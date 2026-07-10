@@ -33,10 +33,10 @@ def test_describe_shape_standardizes_straight_from_the_value():
     assert describe_shape(3.0) == "scalar"
     assert describe_shape(np.float64(1.0)) == "scalar"
     assert describe_shape(np.zeros(())) == "scalar"
-    assert describe_shape(np.zeros(35)) == "(35,)"             # 1-D keeps the numpy comma
-    assert describe_shape(np.zeros((35, 2))) == "(35, 2)"
-    assert describe_shape(np.zeros((96, 128))) == "(96, 128)"
-    assert describe_shape(np.zeros((7, 3))) == "(7, 3)"        # an arbitrary shape, no table
+    assert describe_shape(np.zeros(35)) == "(35)"              # ONE '×' spelling, never the numpy comma
+    assert describe_shape(np.zeros((35, 2))) == "(35×2)"
+    assert describe_shape(np.zeros((96, 128))) == "(96×128)"
+    assert describe_shape(np.zeros((7, 3))) == "(7×3)"         # an arbitrary shape, no table
     assert describe_shape(None) == "—"                         # no value yet
 
 
@@ -64,9 +64,15 @@ def test_console_signal_formats_are_the_real_hub_array_shapes():
     console._timer.stop()
     try:
         fmts = console._signal_formats()
-        for name, value in published.items():
-            assert fmts[name] == describe_shape(np.asarray(value)), name
-        # the arbitrary-shape signal proves it is read from the VALUE, not a lookup
-        assert fmts["odd_blob"] == "(7, 3)"
+        for name in published:
+            schema = hub.schema(name)
+            assert fmts[name] == describe_shape(
+                hub.latest(name),
+                points_shape=schema.point_shape,
+                data_shape=schema.data_shape,
+            ), name
+        # An unregistered external matrix is deterministically one datum; rank
+        # never invents repeat or point axes.
+        assert fmts["odd_blob"] == "1 × 1 × (7×3)"
     finally:
         console.shutdown()

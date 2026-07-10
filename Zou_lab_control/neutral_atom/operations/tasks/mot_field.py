@@ -1,18 +1,18 @@
 """Optimize the MOT coil field -- sweep three coil DACs, watch the monitor camera, report the
 optimum.
 
-The one-click flow the notebook / console runs: for every (Bx, By, Bz) point of a 3-D coil grid
-the task resolves the pulse template's three DAC api slots, fires the sequence through the one
-arm-before-fire helper (``triggered_frames``) and measures the MOT fluorescence on the MONITOR camera through the
+The one-click flow uploads one 3-D (Bx, By, Bz) hardware scan table through the pulse template's
+three semantically named DAC scan slots, fires it once, and measures the resulting MONITOR-camera
+frames through the
 SAME :func:`~..processors.mot_intensity.mot_roi_intensity` primitive the live "MOT intensity"
 processor uses -- so the optimiser and the live view can never disagree.  The optimum is the
 argmax refined by a local centre-of-mass; the report (a facet grid of the Bz planes + the raw
 intensity block) lands in ``folder`` through the registered frontend plotter (this layer never
 imports frontend.*).
 
-For a MANUAL sweep with live plots, run the generic *Pulse-template scan* measurement instead
-with ``camera = monitor_camera`` and y = the "MOT intensity" processor's ``mot_intensity``; the
-grid facet display then shows the same block live.  This task is the batch/one-click sibling.
+For a MANUAL sweep with live plots, start a Camera measurement on ``monitor_camera``, feed its
+frame into the "MOT intensity" processor, then run generic PulseScan with y bound to that scalar
+processor output.  PulseScan still owns only the sequencer.  This task is the batch/one-click sibling.
 """
 
 from __future__ import annotations
@@ -27,14 +27,16 @@ from Zou_lab_control._viewer_registry import active_plotter
 
 from ...core.params import ParamDecl
 from ...devices.base import CameraDevice
+from ...ports import PORT_DAC
 from ...timing import resolve_fireable_template, single_imaging_template
-from ..logic import Task, TaskOutput
-from ..measurement import triggered_frames
+from ..logic import SignalSpec, Task, TaskOutput
+from ..measurement import prepare_hardware_scan, program_completion_timeout
 from ..task import TaskSpec
 from ..processors.mot_intensity import mot_roi_intensity
 from ..task_registry import task
 
 DEFAULT_MOT_TEMPLATE = "pulses/mot_field_template.json"
+MOT_SCAN_SLOTS = ("da_x", "da_y", "da_z")
 
 #: The task's ONE hub-namespace token: the ctor default, the ``build`` closure default and
 #: the :class:`TaskSpec` all reference THIS, so the discovery collision guard
@@ -43,7 +45,7 @@ MOT_TASK_PREFIX = "mot_"
 
 
 class OptimizeMotFieldTask(Task):
-    """Scan the three coil-field DAC api slots over a 3-D grid, measure the MOT spot intensity per
+    """Scan the three named coil-field DAC slots over a 3-D grid, measure the MOT spot intensity per
     point on the monitor camera, and report the optimum field (argmax + local centre-of-mass)."""
 
     # The mid-run signals the console shows LIVE while the task runs: ``grid`` (the accumulating 3-D
@@ -79,16 +81,55 @@ class OptimizeMotFieldTask(Task):
         self.scan_names = ["Bx", "By", "Bz"]
         self.scan_arrays = [self._axis_codes(c) for c in self.centers]
 
+    def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
+        frame_shape = tuple(int(n) for n in (self.camera.frame_shape or ()))
+        if len(frame_shape) != 2 or any(n < 1 for n in frame_shape):
+            raise ValueError(
+                f"MOT task camera must declare positive frame_shape (H,W), got {frame_shape}.")
+        return (
+            SignalSpec(
+                "grid", "MOT intensity", "counts", "intensity at each semantic coil-grid point",
+                points_shape=self.grid_shape, data_shape=(1,),
+                dtype=np.float64, repeat_capacity=1,
+                metadata={"coordinate_names": tuple(self.scan_names)}),
+            SignalSpec(
+                "frame", "monitor frame", "counts", "camera frame for the current grid point",
+                points_shape=(1,), data_shape=frame_shape,
+                repeat_capacity=1),
+            SignalSpec(
+                "progress", "progress", "", "task completion fraction",
+                dtype=np.float64, repeat_capacity=1),
+        )
+
     # ------------------------------------------------------------------ pieces
     def _coil_slots(self, state) -> list[str]:
-        """The template's DAC api slots, in declaration order -- the three coil handles."""
-        names = [s.name for s in state.api_slots if s.kind == "dac"]
-        if len(names) != 3:
+        """Return the public x/y/z slots after validating their resolved DAC ports.
+
+        Slot names are the experiment API.  The template-to-hardware topology
+        projection decides whether they resolve to ``da_x`` on the virtual board
+        or ``da_bias_x`` on the real board; this task must not repeat that mapping.
+        """
+
+        expected = MOT_SCAN_SLOTS
+        slots = {slot.name: slot for slot in state.scan_slots}
+        problems = [
+            name for name in expected
+            if name not in slots or slots[name].kind != "dac"
+        ]
+        extras = sorted(set(slots) - set(expected))
+        buses = [slots[name].dac_bus for name in expected if name in slots and slots[name].kind == "dac"]
+        invalid_buses = [
+            bus for bus in buses
+            if bus not in state.port_catalog.by_key
+            or state.port_catalog.by_key[bus].kind != PORT_DAC
+        ]
+        if problems or extras or len(slots) != 3 or len(set(buses)) != 3 or invalid_buses:
             raise ValueError(
-                f"the MOT template must expose exactly THREE dac api slots (the x/y/z coils); "
-                f"{self.template!r} exposes {names or 'none'}.  Tag the three coil buses as api "
-                "slots in the pulse GUI (a-state on the DAC cell) and save the template.")
-        return names
+                f"the MOT template must expose exactly the DAC scan slots {list(expected)} "
+                "resolved to three distinct DAC ports in the connected sequencer catalog; "
+                f"{self.template!r} exposes "
+                f"{[(slot.name, slot.kind, slot.target) for slot in state.scan_slots] or 'none'}.")
+        return list(expected)
 
     def _axis_codes(self, center: float) -> np.ndarray:
         """One coil axis' scan values: ``points`` integer DAC codes across center +- span."""
@@ -129,6 +170,17 @@ class OptimizeMotFieldTask(Task):
         nx, ny, nz = (len(a) for a in axes)
         n_total = nx * ny * nz
         block = np.full((nx, ny, nz), np.nan)
+        state.set_scan_table([
+            [
+                {"da_x": float(bx), "da_y": float(by), "da_z": float(bz)}[slot.name]
+                for slot in state.scan_slots
+            ]
+            for bx in axes[0] for by in axes[1] for bz in axes[2]
+        ])
+        # This task materialises its parameter-driven grid directly.  Persisted
+        # scan_code describes template-authored scans and must not compete with
+        # the one table submitted below.
+        state.scan_code = ""
 
         # The LIVE 3-D grid: the console binds a facet grid to this (repeat=1, n_points, 1) block +
         # points_shape=(nx,ny,nz) (see ``grid_shape``), facets the Bz axis -> one (Bx,By) map per plane
@@ -137,31 +189,40 @@ class OptimizeMotFieldTask(Task):
         out.publish(progress=0.0, stage=f"sweeping {nx}x{ny}x{nz} coil grid on {slots}",
                     grid=block.reshape(1, -1, 1).copy())
         done = 0
-        for i, bx in enumerate(axes[0]):
-            for j, by in enumerate(axes[1]):
-                for k, bz in enumerate(axes[2]):
-                    if self._stop.is_set():
-                        raise RuntimeError("MOT field scan stopped.")
-                    resolved = state.with_api_resolved(
-                        {slots[0]: int(bx), slots[1]: int(by), slots[2]: int(bz)})
-                    sequence = resolved.to_sequence()
-                    frames = triggered_frames(self.camera, self.sequencer, sequence, 1, stop=self._stop)
-                    if not frames:
-                        # Only a cooperative Stop leaves an empty read: a hardware trigger that
-                        # never comes now RAISES in the camera (TimeoutError -- virtual and pylon
-                        # alike), so a trigger deficit can no longer silently punch NaN holes in
-                        # the grid and skew the argmax.
-                        continue
-                    frame = frames[0]
-                    h, w = frame.shape[-2:]
-                    cx = self.roi_cx if self.roi_cx > 0 else w / 2.0
-                    cy = self.roi_cy if self.roi_cy > 0 else h / 2.0
-                    block[i, j, k] = mot_roi_intensity(frame, cx, cy, self.roi_radius)
-                    done += 1
-                    out.publish(frame=np.asarray(frame, dtype=float),
-                                progress=done / n_total,
-                                stage=f"({bx}, {by}, {bz}) -> {block[i, j, k]:.1f}",
-                                grid=block.reshape(1, -1, 1).copy())     # the live 3-D grid, one point fuller
+        self.camera.arm(n_total)
+        try:
+            program = prepare_hardware_scan(self.sequencer, state, scan_repeats=1)
+            for i, bx in enumerate(axes[0]):
+                for j, by in enumerate(axes[1]):
+                    for k, bz in enumerate(axes[2]):
+                        if self._stop.is_set():
+                            raise RuntimeError("MOT field scan stopped.")
+                        frames = self.camera.read_frames(1, stop=self._stop)
+                        if len(frames) != 1:
+                            raise TimeoutError(
+                                f"MOT hardware scan lost the frame for point {(bx, by, bz)}")
+                        frame = frames[0]
+                        h, w = frame.shape[-2:]
+                        cx = self.roi_cx if self.roi_cx > 0 else w / 2.0
+                        cy = self.roi_cy if self.roi_cy > 0 else h / 2.0
+                        block[i, j, k] = mot_roi_intensity(frame, cx, cy, self.roi_radius)
+                        done += 1
+                        out.publish(frame=np.asarray(frame, dtype=float),
+                                    progress=done / n_total,
+                                    stage=f"({bx}, {by}, {bz}) -> {block[i, j, k]:.1f}",
+                                    grid=block.reshape(1, -1, 1).copy())
+            budget = program_completion_timeout(program)
+            if not self.sequencer.wait_done(timeout=budget, stop=self._stop):
+                raise TimeoutError(
+                    f"MOT hardware scan did not finish {n_total} points within {budget:.1f} s")
+        except BaseException:
+            try:
+                self.sequencer.set_safe_state()
+            except Exception:
+                pass
+            raise
+        finally:
+            self.camera.disarm()
 
         if not np.isfinite(block).any():
             raise RuntimeError("the coil sweep produced no frames -- is the sequencer firing?")
@@ -208,8 +269,9 @@ MOT_FIELD_PARAMS = (
     ParamDecl("template", "Pulse template", "path", default=DEFAULT_MOT_TEMPLATE,
               path_mode="file", base_dir="pulses",
               file_filter="Pulse program (*.json);;All files (*)",
-              tooltip="The pulse fired per point.  It must expose exactly THREE dac api slots "
-                      "(the x/y/z coil buses) -- the bundled mot_field_template.json does."),
+              tooltip="The hardware-scanned pulse. It must expose semantic DAC scan slots "
+                      "da_x, da_y and da_z; topology projection binds them to the connected "
+                      "sequencer's three coil-bias DAC ports."),
     ParamDecl("center_x", "Bx centre (code)", "float", default=0.0,
               tooltip="Coil-x sweep centre, signed DAC code (0 = 0 V)."),
     ParamDecl("center_y", "By centre (code)", "float", default=0.0,

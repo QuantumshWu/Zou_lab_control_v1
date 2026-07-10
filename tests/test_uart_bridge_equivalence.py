@@ -11,6 +11,7 @@ so they can never disagree on a byte.
 """
 
 from __future__ import annotations
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 from pathlib import Path
 import sys
@@ -47,14 +48,14 @@ def _programs():
     progs = []
 
     # (a) plain TTL, a few periods + a channel delay -> ctrl/tick/coeff/mask/delay
-    st = PulseTableState(channels=chans)
+    st = PulseTableState(port_catalog=PortCatalog.from_channels(chans))
     st.periods = [PulsePeriod(10.0, tuple(1 if i == 0 else 0 for i in range(62)), unit="us", name="MOT"),
                   PulsePeriod(3.0, tuple(1 if i == 3 else 0 for i in range(62)), unit="ms", name="image"),
                   PulsePeriod(5.0, tuple(0 for _ in range(62)), unit="us", name="dead")]
     progs.append(("ttl", compile_runtime_program_for_payload(st, channels=chans, clock_hz=50e6)))
 
     # (b) a scan (duration slot) with a real table -> scan region + repeat_forever
-    st2 = PulseTableState(channels=chans)
+    st2 = PulseTableState(port_catalog=PortCatalog.from_channels(chans))
     st2.periods = [PulsePeriod(10.0, tuple(1 if i == 0 else 0 for i in range(62)), unit="us", name="p"),
                    PulsePeriod(1.0, tuple(1 if i == 3 else 0 for i in range(62)), unit="us", name="probe")]
     st2.bind_field("duration", "1", unit="us")

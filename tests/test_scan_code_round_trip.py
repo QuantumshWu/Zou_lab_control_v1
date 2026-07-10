@@ -12,6 +12,7 @@ the data-model round-trip (headless) and the pulse_gui editor round-trip (offscr
 """
 
 from __future__ import annotations
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 from pathlib import Path
 import sys
@@ -29,7 +30,7 @@ _CUSTOM = "# my custom scan program\nimport numpy as np\nscan_table = np.column_
 
 # --------------------------------------------------------------- data model (no Qt)
 def test_scan_code_round_trips_through_to_dict_from_dict_and_save_load(tmp_path):
-    s = PulseTableState(channels=["ch00", "ch01"], scan_code=_CUSTOM)
+    s = PulseTableState(port_catalog=PortCatalog.from_channels(["ch00", "ch01"]), scan_code=_CUSTOM)
     assert s.to_dict()["scan_code"] == _CUSTOM
     assert PulseTableState.from_dict(s.to_dict()).scan_code == _CUSTOM
     p = tmp_path / "pulse.json"
@@ -37,18 +38,20 @@ def test_scan_code_round_trips_through_to_dict_from_dict_and_save_load(tmp_path)
     assert PulseTableState.load(p).scan_code == _CUSTOM          # persisted in the .json bundle
 
 
-def test_scan_code_survives_aligned_to_channels_and_snapped():
-    """A subset-channel file load goes through ``aligned_to_channels``; ``snapped`` (compile/display
+def test_scan_code_survives_aligned_to_catalog_and_snapped():
+    """A subset-catalog file load goes through ``aligned_to_catalog``; ``snapped`` (compile/display
     snap) goes through ``from_dict(to_dict())`` -- both must keep the editor code."""
-    s = PulseTableState(channels=["ch00", "ch01"], scan_code=_CUSTOM)
-    assert s.aligned_to_channels(["ch00", "ch01", "ch02", "ch03"]).scan_code == _CUSTOM
+    s = PulseTableState(port_catalog=PortCatalog.from_channels(["ch00", "ch01"]), scan_code=_CUSTOM)
+    target = PortCatalog.from_channels(["ch00", "ch01", "ch02", "ch03"])
+    assert s.aligned_to_catalog(target).scan_code == _CUSTOM
     assert s.snapped().scan_code == _CUSTOM
 
 
-def test_old_pulse_without_scan_code_loads_with_empty_default():
-    payload = PulseTableState(channels=["ch00", "ch01"]).to_dict()
-    payload.pop("scan_code")                                     # an old save predating the field
-    assert PulseTableState.from_dict(payload).scan_code == ""    # default "", never a crash
+def test_current_pulse_schema_rejects_missing_scan_code():
+    payload = PulseTableState(port_catalog=PortCatalog.from_channels(["ch00", "ch01"])).to_dict()
+    payload.pop("scan_code")
+    with pytest.raises(ValueError, match=r"missing=.*scan_code"):
+        PulseTableState.from_dict(payload)
 
 
 # --------------------------------------------------------------- pulse_gui editor (offscreen Qt)
@@ -62,7 +65,7 @@ def _app(monkeypatch):
 
 def _pulse_editor():
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
-    st = PulseTableState(channels=["probe", "trig"])
+    st = PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"]))
     st.bind_field("duration", "0", unit="us")
     st.set_scan_table([[10.0], [20.0], [30.0]])
     return PulseSequenceEditor(st)
@@ -104,7 +107,7 @@ def test_loading_a_codeless_pulse_clears_stale_editor_code(_app):
     pulse's program in the box -- else the editor lies about what generated the loaded table."""
     ed = _pulse_editor()
     ed.scan_code.setPlainText("scan_table = [[999.0]]")        # stale from a previous pulse
-    codeless = PulseTableState(channels=["probe", "trig"])     # scan_code == ""
+    codeless = PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"]))     # scan_code == ""
     codeless.bind_field("duration", "0", unit="us")
     codeless.set_scan_table([[10.0]])
     ed.load_state(codeless)

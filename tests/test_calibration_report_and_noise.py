@@ -206,10 +206,12 @@ def test_overlapping_readout_reports_sub_unity_fidelity_and_per_method_summary(t
 # whole input write_calibration_report needs, so these run in milliseconds.
 
 def _tiny_report_inputs():
-    from Zou_lab_control.neutral_atom.core.calibration import TrapCalibration
+    from Zou_lab_control.neutral_atom.core.calibration import FrameContract, TrapCalibration
 
     rng = np.random.default_rng(3)
-    cal = TrapCalibration(centers=[[3.0, 3.0], [11.0, 3.0]], thresholds=[5.0, 5.0])
+    cal = TrapCalibration(
+        centers=[[3.0, 3.0], [11.0, 3.0]], thresholds=[5.0, 5.0],
+        frame_contract=FrameContract(image_shape=(8, 16)))
     frames = [rng.normal(4.0, 1.0, size=(8, 16)) for _ in range(6)]
     return cal, frames
 

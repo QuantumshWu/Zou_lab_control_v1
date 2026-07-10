@@ -1,12 +1,11 @@
-"""Contract (#iron-law): every measurement/processor block is ``(repeat, data_points, *data_dim)`` --
-the data_points axis is ALWAYS present (a no-scan acquisition = exactly ONE point), and a processor
+"""Contract (#iron-law): every measurement/processor block is ``(R,P,*data_shape)`` --
+the physical P axis is ALWAYS present (a no-scan acquisition = exactly ONE point), and a processor
 PRESERVES it.  Occupancy judges ONE readout per shot, so ``occupied``/``counts`` are
 ``(repeat, 1, n_sites)`` and ``frame_judged`` is ``(repeat, 1, H, W)`` -- the SAME shape the camera
 frame carries (a frame keeps one shape raw or judged).  The middle 1 is NEVER dropped.
 
-The repeat-collapse is STRUCTURE-driven (the signal's declared ``core_ndim = len(points)+len(data)``),
-and the plot squeezes the size-1 data_points axis for display -- so a sites panel still draws exactly
-``n_sites`` rings and a 2D readout image is one (H, W) map.
+Every signal carries a registered SignalSchema.  Static site geometry is also canonical:
+centres are ``(1,1,N,2)`` and thresholds ``(1,1,N)``; site remains data, never P.
 
 Real reproduction: a virtual exp + camera + OccupancyProcessor run for ``repeat`` shots, then fed
 through the REAL sites-plot consumption path (``PanelCard._signal_then_repeat`` -> ``reduce_repeat`` ->
@@ -56,10 +55,10 @@ def _calibrated_occupancy(hub):
     return exp, cam, det
 
 
-def test_occupancy_block_keeps_the_data_points_axis():
-    """`occupied` / `counts` are ``(repeat, 1, n_sites)`` (the mandatory data_points axis is PRESENT,
+def test_occupancy_block_keeps_point_and_full_data_shape_axes():
+    """`occupied` / `counts` are ``(R,P,*data_shape)`` with P=1 and data_shape=(n_sites,) (P is PRESENT,
     size 1 for a no-scan readout); `frame_judged` is ``(repeat, 1, H, W)`` -- the SAME shape the camera
-    `frame_0` carries; static geometry carries no repeat axis."""
+    `frame_0` carries; static geometry uses a single repeat/point cell."""
     hub = SignalHub()
     exp, cam, _ = _calibrated_occupancy(hub)
     try:
@@ -67,37 +66,37 @@ def test_occupancy_block_keeps_the_data_points_axis():
         counts = np.asarray(hub.latest("counts"))
         frame_judged = np.asarray(hub.latest("frame_judged"))
         frame_raw = np.asarray(hub.latest("frame_0"))
-        assert occupied.shape == (REPEAT, 1, N_SITES)          # (repeat, data_points=1, n_sites)
+        assert occupied.shape == (REPEAT, 1, N_SITES)          # (R,P,*data_shape), P=1
         assert counts.shape == (REPEAT, 1, N_SITES)
         assert frame_judged.shape == frame_raw.shape           # judged frame == raw frame shape (r,1,H,W)
         assert frame_judged.ndim == 4 and frame_judged.shape[1] == 1
-        # static / scalar outputs do NOT gain a repeat axis
-        assert np.asarray(hub.latest("centers")).shape == (N_SITES, 2)
-        assert np.asarray(hub.latest("thresholds")).shape == (N_SITES,)
-        assert np.ndim(hub.latest("rate")) == 0
+        assert np.asarray(hub.latest("centers")).shape == (1, 1, N_SITES, 2)
+        assert np.asarray(hub.latest("thresholds")).shape == (1, 1, N_SITES)
+        assert np.asarray(hub.latest("rate")).shape == (REPEAT, 1, 1)
+        assert hub.schema("centers").point_shape == (1,)
+        assert hub.schema("centers").data_shape == (N_SITES, 2)
     finally:
         exp.close()
 
 
-def test_reduce_repeat_core_ndim_averages_to_per_site_loading_probability():
-    """`reduce_repeat((repeat, 1, n_sites), 'average', core_ndim=2)` collapses ONLY the repeat axis ->
-    ``(1, n_sites)`` = the per-site mean over the N shots' 0/1; the display squeezes the size-1
-    data_points axis to the (n_sites,) loading-probability vector.  Structure-driven (core_ndim 2),
-    not an ndim guess."""
+def test_schema_validity_guides_repeat_average_to_per_site_loading_probability():
+    """The declared R axis is reduced while P=1 and data_shape=(N,) remain intact."""
     from Zou_lab_control.frontend.live import reduce_repeat, repeats_with_data
     hub = SignalHub()
     exp, _, _ = _calibrated_occupancy(hub)
     try:
-        occupied = np.asarray(hub.latest("occupied"))
-        reduced = reduce_repeat(occupied, "average", core_ndim=2)
-        assert reduced.shape == (1, N_SITES)                   # repeat collapsed; data_points axis kept
+        tensor = hub.latest_tensor("occupied")
+        occupied = np.asarray(tensor.data)
+        reduced = reduce_repeat(occupied, "average", valid=tensor.valid)
+        assert reduced.shape == (1, N_SITES)                   # R collapsed; P axis kept
         prob = np.squeeze(reduced)                             # the display squeeze -> (n_sites,)
         assert prob.shape == (N_SITES,)
         np.testing.assert_allclose(prob, np.nanmean(occupied, axis=0).reshape(-1))
         assert np.all((prob >= 0) & (prob <= 1))
-        assert repeats_with_data(occupied, core_ndim=2) == REPEAT
-        # an already-reduced value (ndim == core_ndim) passes through untouched
-        passthrough = reduce_repeat(reduced, "average", core_ndim=2)
+        assert repeats_with_data(occupied, valid=tensor.valid) == REPEAT
+        # An external already-reduced value has no R axis only when the caller
+        # says so explicitly; ndarray rank is never used to infer that fact.
+        passthrough = reduce_repeat(reduced, "average", has_repeat=False)
         np.testing.assert_array_equal(passthrough, reduced)
     finally:
         exp.close()
@@ -105,8 +104,8 @@ def test_reduce_repeat_core_ndim_averages_to_per_site_loading_probability():
 
 def test_describe_shape_renders_all_three_groups():
     """`describe_shape` renders each occupancy signal off ITS declared structure, ALWAYS as
-    ``repeat × data_points × (data)`` (the middle is never dropped): occupied ``5 × 1 × (35)``,
-    frame_judged ``5 × 1 × (96×128)``, centers as the raw ``(35, 2)`` (static, no repeat)."""
+    ``R × P × data_shape`` (the middle is never dropped): occupied ``5 × 1 × (35)``,
+    frame_judged ``5 × 1 × (96×128)``, centers ``1 × 1 × (35×2)``."""
     hub = SignalHub()
     exp, _, det = _calibrated_occupancy(hub)
     try:
@@ -118,27 +117,29 @@ def test_describe_shape_renders_all_three_groups():
         H, W = np.asarray(frame_judged).shape[2:]
         assert describe_shape(occupied, points_shape=occ_spec.points_shape,
                               data_shape=occ_spec.data_shape) == f"{REPEAT} × 1 × ({N_SITES})"
-        # #H3v-3: a no-scan signal's data_points shows the literal 1, NEVER a trap-grid -- even if a
+        # #H3v-3: a no-scan signal's P shows the literal 1, NEVER a trap-grid -- even if a
         # grid_shape is passed it is ignored (the 35 sites are not "5×7"; that layout is the sitemap's
-        # display concern, not the dim).  grid_shape only reshapes a 2-D SCAN's points.
+        # display concern, not data_shape).  grid_shape only reshapes a 2-D SCAN's points.
         assert describe_shape(occupied, points_shape=occ_spec.points_shape,
                               data_shape=occ_spec.data_shape,
                               grid_shape=GRID) == f"{REPEAT} × 1 × ({N_SITES})"
         assert describe_shape(frame_judged, points_shape=frame_spec.points_shape,
                               data_shape=frame_spec.data_shape) == f"{REPEAT} × 1 × ({H}×{W})"
-        # centers declares NO structure -> raw shape, no repeat axis
-        assert not specs["centers"].has_structure
-        assert describe_shape(hub.latest("centers")) == f"({N_SITES}, 2)"
-        # the per-signal core_ndim is the single source the plot collapses by (points 1 + data)
-        assert occ_spec.core_ndim == 2 and frame_spec.core_ndim == 3
-        assert specs["centers"].core_ndim is None
+        center_spec = specs["centers"]
+        assert center_spec.points_shape == (1,)
+        assert center_spec.data_shape == (N_SITES, 2)
+        assert describe_shape(
+            hub.latest("centers"),
+            points_shape=center_spec.points_shape,
+            data_shape=center_spec.data_shape,
+        ) == f"1 × 1 × ({N_SITES}×2)"
     finally:
         exp.close()
 
 
 def test_sites_panel_renders_the_averaged_per_site_map_from_occupancy():
     """Reproduce the REAL sitemap consumption: a `sites` PanelCard bound to the `occupied` signal
-    (default `value = signal`) runs `_signal_then_repeat` -> `reduce_repeat(core_ndim=2)` -> `_coerce`
+    (default `value = signal`) runs `_signal_then_repeat` through its registered schema -> `_coerce`
     and yields exactly the per-site loading-probability vector (n_sites values), which the sites plotter
     draws as the ring colours.  Not a mock -- the same path the live site map takes."""
     pytest.importorskip("PyQt5")
@@ -155,8 +156,7 @@ def test_sites_panel_renders_the_averaged_per_site_map_from_occupancy():
         # the console resolves a bound signal's producing-node structure + the site-map centres/underlay
         def structure_provider(name):
             if name == "occupied":
-                return {"points_shape": (1,), "data_shape": (N_SITES,), "grid_shape": (),
-                        "core_ndim": 2, "per_signal": True}
+                return {"points_shape": (1,), "data_shape": (N_SITES,), "grid_shape": ()}
             return None
 
         def sites_inputs_provider(occ):
@@ -166,11 +166,12 @@ def test_sites_panel_renders_the_averaged_per_site_map_from_occupancy():
                          structure_provider=structure_provider,
                          sites_inputs_provider=sites_inputs_provider)
         namespace = dict(hub.snapshot_latest())
-        # the panel pipeline: per-slice eval -> structure-driven repeat collapse -> squeeze data_points
+        # the panel pipeline: per-slice eval -> structure-driven R collapse -> squeeze P
         reduced = card._signal_then_repeat(namespace)
         coerced = card._coerce(reduced)
         # it IS the per-site loading probability (mean over the REPEAT shots), one value per site
-        expected = np.squeeze(reduce_repeat(np.asarray(hub.latest("occupied")), "average", core_ndim=2))
+        tensor = hub.latest_tensor("occupied")
+        expected = np.squeeze(reduce_repeat(tensor.data, "average", valid=tensor.valid))
         assert np.asarray(coerced).shape == (N_SITES,)
         np.testing.assert_allclose(np.asarray(coerced), expected)
         assert np.all((np.asarray(coerced) >= 0) & (np.asarray(coerced) <= 1))
@@ -191,7 +192,7 @@ def test_centers_align_with_the_judged_frame():
     hub = SignalHub()
     exp, _, _ = _calibrated_occupancy(hub)
     try:
-        centers = np.asarray(hub.latest("centers"), dtype=float)
+        centers = np.asarray(hub.latest("centers"), dtype=float)[0, 0]
         fj = np.squeeze(reduce_repeat(np.asarray(hub.latest("frame_judged"), dtype=float), "average"))
         h_img, w_img = fj.shape
 
@@ -225,8 +226,7 @@ def test_sites_underlay_obeys_the_panel_repeat_mode():
     try:
         def structure_provider(name):
             if name == "occupied":
-                return {"points_shape": (1,), "data_shape": (N_SITES,), "grid_shape": GRID,
-                        "core_ndim": 2, "per_signal": True}
+                return {"points_shape": (1,), "data_shape": (N_SITES,), "grid_shape": GRID}
             return None
 
         def sites_inputs_provider(occ):

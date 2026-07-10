@@ -51,9 +51,9 @@ def _mot_sequence_at(cam, values_fn):
     always derive from the device's own public model (``cam.b0``), never re-typed constants."""
     state = resolve_fireable_template(MOT_TEMPLATE, default_name=DEFAULT_MOT_TEMPLATE,
                                       default_factory=single_imaging_template)
-    slots = [s.name for s in state.api_slots if s.kind == "dac"]
-    values = {name: int(values_fn(bus)) for name, bus in zip(slots, cam.coil_buses)}
-    return state.with_api_resolved(values).to_sequence()
+    slots = [slot for slot in state.scan_slots if slot.kind == "dac"]
+    values = {slot.name: int(values_fn(slot.dac_bus)) for slot in slots}
+    return state.with_slots_resolved(values).to_sequence()
 
 
 # --------------------------------------------------------------------------- (a) free-run default

@@ -1,6 +1,6 @@
 """Reopen a saved figure ``.npz`` INTO the Task console -- ``exp.figure_viewer()``.
 
-A saved panel / overnight scan writes a ``<name>_<time>.npz`` (``data_x`` / ``data_y`` / ``info``)
+A saved panel / overnight scan writes a versioned ``<name>_<time>.npz`` artifact
 next to its ``.png`` (see :meth:`~.data_figure.DataFigure.save`).  This window is the GUI
 counterpart of the notebook one-liner ``na.load_figure('scan.npz')`` -- but instead of a bespoke
 viewer, the loaded figure becomes ONE hub SIGNAL and the whole reuse is the Task console board:
@@ -9,10 +9,10 @@ viewer, the loaded figure becomes ONE hub SIGNAL and the whole reuse is the Task
   1-D save its companion ``fig_x``; for a site map its ``fig_centers`` and ``fig_frame`` underlay),
   declaring the SAME ``output_specs`` / ``published_signals`` / ``x_signal`` / ``sitemap_*`` a live
   producer does -- so a panel wired to it reads the right axis label, unit, x-coordinates AND the
-  site-map background frame.  A new save records the full producer blocks under ``info['signals']`` (each
+  site-map background frame.  Every save records the full producer blocks under ``info['signals']`` (each
   a native ``(repeat, *points, *data)`` array + ``points_shape`` / ``data_shape`` + a ``role``), which
-  the node re-publishes VERBATIM (a faithful round-trip); an old npz with no ``info['signals']`` falls
-  back to inferring the blocks from ``data_x`` / ``data_y`` (a site map then has rings but no frame);
+  the node re-publishes VERBATIM (a faithful round-trip); missing or malformed typed blocks reject the
+  artifact instead of being reconstructed from ndarray rank;
 * the window SEEDS one panel with the SAVED ``kind`` + ``view`` (``PanelConfig(kind=sf.kind,
   source="value = fig_value", params=sf.info["view"])``) so it opens reproducing the original figure;
 * the panel lives on a real :class:`~.task_console.TaskConsole`, so the user gets the board, Add Panel,
@@ -127,15 +127,22 @@ def _resolve_npz(path: Path) -> Path:
     return path
 
 
-def _as_tuple_or_none(shape) -> tuple | None:
-    """A stored ``points_shape`` / ``data_shape`` (a list from the npz, ``None``, or the illegal empty
-    ``()``) coerced to the ``SignalSpec`` contract: ``None`` (no repeat slot) or a NON-EMPTY tuple.  The
-    empty ``()`` is treated as ``None`` (the iron-law guard rejects it), so a malformed slot degrades to
-    'no contract' rather than raising on load."""
-    if shape is None:
-        return None
-    t = tuple(int(n) for n in shape)
-    return t or None
+def _stored_shape(entry: Mapping, key: str, signal_name: str) -> tuple[int, ...]:
+    """Read one mandatory non-empty stored tensor shape.
+
+    ``info['signals']`` is the faithful typed path, so a present entry is never allowed to fall back to
+    ndarray-rank inference.  Array-only saves use the separate ``_build_from_arrays`` boundary; a typed
+    entry with a missing shape is malformed and must say so explicitly.
+    """
+    raw = entry.get(key)
+    if raw is None:
+        raise ValueError(f"saved signal {signal_name!r} is missing required {key}.")
+    shape = tuple(int(n) for n in raw)
+    if not shape or any(n < 1 for n in shape):
+        raise ValueError(
+            f"saved signal {signal_name!r} has invalid {key}={raw!r}; "
+            "stored tensor shapes must be non-empty and positive.")
+    return shape
 
 
 def _kind_label(key: str | None) -> str:
@@ -155,7 +162,7 @@ class LoadedFigureNode(LogicNode):
     to a camera / measurement -- except its ``shot()`` returns the SAME saved data every time (a file,
     not hardware).
 
-    **Faithful path (new npz that stored ``info['signals']``).**  A save now records the FULL producer
+    A save records the FULL producer
     blocks it plotted: for each named signal a ``block`` (its native ``(repeat, *points, *data)`` array),
     its ``points_shape`` / ``data_shape`` and a ``role`` (``value`` / ``x`` / ``centers`` / ``frame``).
     This node re-publishes each block **verbatim** under its own bare name and declares the SAME
@@ -167,11 +174,7 @@ class LoadedFigureNode(LogicNode):
     * ``x`` -> the companion 1-D curve x (``x_signal``);
     * ``centers`` -> ``sitemap_centers_key`` (the rings);
     * ``frame`` -> ``sitemap_image_key`` -- so a site-map save gets its BACKGROUND camera frame back
-      (the underlay the live occupancy panel had), not a bare ring plot.
-
-    **Fallback path (old npz with no ``info['signals']``).**  Only ``data_x`` / ``data_y`` were stored,
-    so the node infers a static single-block ``value`` (+ ``x`` for 1-D, ``centers`` for a site map) from
-    the arrays; a site map then shows rings + occupancy with NO background image (nothing was stored)."""
+      (the underlay the live occupancy panel had), not a bare ring plot."""
 
     layer = "figure"
 
@@ -181,9 +184,7 @@ class LoadedFigureNode(LogicNode):
         self.node_label = str(saved.name or "figure")
         self.instance_label = self.node_label
 
-        data_x = np.asarray(saved.data_x, dtype=float)
-        data_y = np.asarray(saved.data_y, dtype=float)
-        kind = self.kind = str(saved.kind or ("2d" if (data_x.ndim == 2 and data_x.shape[1] >= 2) else "1d"))
+        kind = self.kind = saved.kind
         # The saved ``labels`` are the FULL matplotlib axis labels (the unit is baked in-line, e.g.
         # "Detuning (GHz)"), so the SignalSpec keeps unit="" -- appending saved.unit again would double
         # the "(unit)" suffix.  The display unit is carried on the panel's view / DataFigure separately.
@@ -191,13 +192,12 @@ class LoadedFigureNode(LogicNode):
         # text, and the 1-D panel's fallback axes).  The panel's RENDERED axes -- x, y and a 2-D colour
         # bar -- come from the saved labels seeded into the panel params (``_seed_state`` reads the ONE
         # ``saved.axis_labels()`` source), so there is no separate z field to carry here.
-        labels = saved.labels or ["X", "Y", "Z"]
+        labels = saved.labels
         self._xlabel = str(labels[0]) if len(labels) > 0 else "X"
         self._ylabel = str(labels[1]) if len(labels) > 1 else "Y"
 
         # bare key -> (block, SignalSpec) for every signal this node publishes, in publish order.  The
-        # faithful path fills it from the stored ``info['signals']``; the fallback synthesises value/x/
-        # centres from data_x/data_y.  ``_role_key`` maps each role to the bare key it landed on.
+        # ``_role_key`` maps each explicitly stored role to the fixed bare key it lands on.
         self._blocks: dict[str, np.ndarray] = {}
         self._specs: dict[str, SignalSpec] = {}
         self._role_key: dict[str, str] = {}
@@ -221,11 +221,7 @@ class LoadedFigureNode(LogicNode):
         elif kind == "grid":
             self._build_grid(saved)
         else:
-            stored = saved.info.get("signals")
-            if isinstance(stored, Mapping) and stored:
-                self._build_from_signals(stored)
-            else:
-                self._build_from_arrays(kind, data_x, data_y)
+            self._build_from_signals(saved.info["signals"])
 
     # ------------------------------------------------------- faithful (info['signals'])
     def _build_from_signals(self, stored: Mapping) -> None:
@@ -239,55 +235,39 @@ class LoadedFigureNode(LogicNode):
                        "centers": FIG_CENTERS_KEY, "frame": FIG_FRAME_KEY}
         for name, entry in stored.items():
             if not isinstance(entry, Mapping):
-                continue
-            role = str(entry.get("role") or ("value" if "value" not in self._role_key else ""))
-            bare = role_to_key.get(role)
-            if bare is None or bare in self._blocks:
-                continue
+                raise TypeError(f"saved signal {name!r} must be a mapping.")
+            role = entry["role"]
+            if role not in role_to_key:
+                raise ValueError(f"saved signal {name!r} has unsupported role {role!r}.")
+            bare = role_to_key[role]
+            if bare in self._blocks:
+                raise ValueError(f"saved figure has more than one signal with role {role!r}.")
             block = np.asarray(entry.get("block"))
             # The value block's declared axis label (legend / picker) falls back to ``_ylabel``; the panel's
             # RENDERED axes -- incl. a 2D colour bar -- come from the saved labels seeded into the panel
             # params (see _seed_state -> PanelCard._panel_labels), so this per-signal label is never the
             # colour-bar source and needs no 2D special case.
-            label = str(entry.get("label") or (self._ylabel if role == "value" else name))
-            unit = str(entry.get("unit") or "")
-            ps = _as_tuple_or_none(entry.get("points_shape"))
-            ds = _as_tuple_or_none(entry.get("data_shape"))
+            label = entry["label"]
+            unit = entry["unit"]
+            ps = _stored_shape(entry, "points_shape", str(name))
+            ds = _stored_shape(entry, "data_shape", str(name))
+            if block.ndim < 3:
+                raise ValueError(
+                    f"saved signal {name!r} must be a canonical (R,P,*data_shape) tensor; "
+                    f"got {block.shape}.")
+            expected = (int(block.shape[0]), int(np.prod(ps, dtype=np.int64)), *ds)
+            if tuple(block.shape) != expected:
+                raise ValueError(
+                    f"saved signal {name!r} must be canonical (R,P,*data_shape) {expected}; "
+                    f"got {block.shape}.")
             self._blocks[bare] = block
             self._specs[bare] = SignalSpec(bare, label, unit,
                                            f"the saved figure's {role} block ({name})",
-                                           points_shape=ps, data_shape=ds)
+                                           points_shape=ps, data_shape=ds,
+                                           dtype=block.dtype, repeat_capacity=int(block.shape[0]))
             self._role_key[role] = bare
-        # A save must carry a value block; if none was tagged, promote the first stored entry so the
-        # window still opens with a reproduction rather than an empty board.
-        if FIG_VALUE_KEY not in self._blocks and self._blocks:
-            first = next(iter(self._blocks))
-            self._role_key["value"] = first
-
-    # ------------------------------------------------------- fallback (data_x / data_y only)
-    def _build_from_arrays(self, kind: str, data_x: np.ndarray, data_y: np.ndarray) -> None:
-        """Old-npz path: infer a static single-block ``value`` (+ ``x`` / ``centers``) from the raw
-        arrays, each with ``points_shape`` / ``data_shape`` = ``None`` (no repeat contract) so a panel
-        plots it verbatim.  A site map here has NO frame (none was stored) -- rings + occupancy only."""
-        def add(bare: str, block: np.ndarray, label: str, unit: str, desc: str, role: str) -> None:
-            self._blocks[bare] = np.asarray(block, dtype=float)
-            self._specs[bare] = SignalSpec(bare, label, unit, desc)
-            self._role_key[role] = bare
-
-        if kind in ("2d",):
-            add(FIG_VALUE_KEY, self._as_image(data_x, data_y), self._ylabel, "",
-                "the saved figure's primary data (data_y)", "value")
-        elif kind in ("sites",):
-            add(FIG_VALUE_KEY, self._first_column(data_y), self._ylabel, "",
-                "the saved figure's primary data (data_y)", "value")
-            if data_x.ndim == 2 and data_x.shape[1] >= 2:
-                add(FIG_CENTERS_KEY, data_x[:, :2], "site centres", "px",
-                    "per-tweezer (N, 2) camera-pixel centres (data_x)", "centers")
-        else:  # 1d / monitor / hist and any 1-D family
-            add(FIG_VALUE_KEY, self._first_column(data_y), self._ylabel, "",
-                "the saved figure's primary data (data_y)", "value")
-            add(FIG_X_KEY, self._first_column(data_x), self._xlabel, "",
-                "the saved figure's x axis (data_x)", "x")
+        if FIG_VALUE_KEY not in self._blocks:
+            raise ValueError("saved array figure is missing its required value-role signal.")
 
     # ------------------------------------------------------- structured (pulse)
     def _build_pulse(self, saved: SavedFigure) -> None:
@@ -299,8 +279,10 @@ class LoadedFigureNode(LogicNode):
         bare hub value).  The hub ``fig_value`` is a numeric PLACEHOLDER (the period count) so the shot
         clock / version gate still tick; the pulse panel renders from the resolved state, not this value."""
         resolved = saved.pulse_state()
-        self.pulse_state, self.pulse_include_always_off = (resolved if resolved is not None else (None, True))
-        n_periods = float(len(self.pulse_state.periods)) if self.pulse_state is not None else 0.0
+        if resolved is None:
+            raise ValueError("saved pulse figure is missing its validated pulse recipe.")
+        self.pulse_state, self.pulse_include_always_off = resolved
+        n_periods = float(len(self.pulse_state.periods))
         self._blocks[FIG_VALUE_KEY] = np.array([n_periods], dtype=float)   # numeric placeholder for the hub
         self._specs[FIG_VALUE_KEY] = SignalSpec(
             FIG_VALUE_KEY, str(saved.name or "pulse"), "",
@@ -315,35 +297,14 @@ class LoadedFigureNode(LogicNode):
         numeric PLACEHOLDER (the cell count) so the shot clock / version gate still tick; the grid panel
         renders from the resolved recipe, not this value (mirrors :meth:`_build_pulse`)."""
         self.grid_recipe = saved.grid_recipe()
-        n_cells = float(len(self.grid_recipe.get("per_cell", []))) if self.grid_recipe is not None else 0.0
+        if self.grid_recipe is None:
+            raise ValueError("saved grid figure is missing its validated grid recipe.")
+        n_cells = float(len(self.grid_recipe["per_cell"]))
         self._blocks[FIG_VALUE_KEY] = np.array([n_cells], dtype=float)    # numeric placeholder for the hub
         self._specs[FIG_VALUE_KEY] = SignalSpec(
             FIG_VALUE_KEY, str(saved.name or "grid"), "",
             "the saved grid figure (its replay recipe is carried on the node, read via the provider)")
         self._role_key["value"] = FIG_VALUE_KEY
-
-    # ---------------------------------------------------------------- shaping
-    @staticmethod
-    def _first_column(arr: np.ndarray) -> np.ndarray:
-        a = np.asarray(arr, dtype=float)
-        return a[:, 0] if a.ndim == 2 else a.reshape(-1)
-
-    @staticmethod
-    def _as_image(data_x: np.ndarray, data_y: np.ndarray) -> np.ndarray:
-        """The ``(H, W)`` image a 2-D save stored as an ``(N, 2)`` grid of ``data_x`` + flat ``data_y``.
-        Recover the grid from the unique x / y coordinates (the SAME reshape ``Live2DDis`` uses); fall
-        back to a square-ish reshape when data_x is not a clean 2-column grid."""
-        y = np.asarray(data_y, dtype=float).reshape(-1)
-        x = np.asarray(data_x, dtype=float)
-        if x.ndim == 2 and x.shape[1] >= 2 and x.shape[0] == y.size:
-            nx = np.unique(x[:, 0]).size
-            ny = np.unique(x[:, 1]).size
-            if nx * ny == y.size and nx > 1 and ny > 1:
-                return y.reshape(ny, nx)
-        side = int(round(np.sqrt(y.size)))
-        if side * side == y.size and side > 1:
-            return y.reshape(side, side)
-        return y.reshape(1, -1)
 
     # -------------------------------------------------------- sites wiring
     @property
@@ -394,24 +355,19 @@ class LoadedFigureNode(LogicNode):
 
 def _seed_state(saved: SavedFigure, node: LoadedFigureNode) -> TaskConsoleState:
     """The console layout that REPRODUCES the saved figure: ONE panel of the saved ``kind`` wired to
-    ``node.y_signal`` (``fig_value`` normally; the promoted key when the save carried no value-role
-    block) with the saved ``info['view']`` restored as its params, so it opens exactly as saved.  The
-    NODE is the single owner of "which key the value landed on" -- seeding from ``node.y_signal``
-    instead of a hand-built ``FIG_PREFIX + FIG_VALUE_KEY`` keeps the panel bound to a signal the node
-    actually publishes even on the promote fallback (the hand copy opened an EMPTY board there).
+    ``node.y_signal`` (``fig_value``) with the saved ``info['view']`` restored as its params, so it opens
+    exactly as saved.  The node is the single owner of the explicit value-role binding.
     EVERY kind takes this ONE path -- a pulse figure seeds a ``kind="pulse"`` panel exactly as a hist
     figure seeds a ``kind="hist"`` panel (``PanelCard`` then renders each by its kind).  ``pulse`` is
     ``panel=False`` (not offered in the live Add-Panel dropdown) but it IS a real panel kind on this
-    SEED path, so it is NOT downgraded.  Only a genuinely UNKNOWN kind (not in the plot-kind table)
-    falls back to shape inference so the window still opens with a reproduction."""
+    SEED path, so it is NOT downgraded."""
     from .live import PLOT_KIND_BY_KEY, default_pulse_size
 
-    kind = str(saved.kind or "")
+    kind = saved.kind
     pk = PLOT_KIND_BY_KEY.get(kind)
-    if pk is None:                              # unknown kind only -- a real panel kind (incl. pulse) stays
-        kind = "2d" if (np.asarray(saved.data_x).ndim == 2 and np.asarray(saved.data_x).shape[1] >= 2) else "1d"
-        pk = PLOT_KIND_BY_KEY.get(kind)
-    view = dict(saved.view or {})
+    if pk is None:
+        raise ValueError(f"saved figure kind {kind!r} is not registered.")
+    view = dict(saved.view)
     recipe = saved.figure_recipe or {}
     # The panel opens at the size it was SAVED at, so a reopened figure looks like it did when saved (the
     # operator can still change it via Setting).  A structured figure (pulse / grid) records ``panel_size``
@@ -796,17 +752,9 @@ class FigureViewer(QtWidgets.QWidget):
         if self.info_layout.count() == 0:
             self._add_info_row("provenance", "(none recorded)")
 
-        # --- Flow tab: the upstream DAG of how the data was produced (raw / measurement / processor
-        # chain, branching upward).  Read off ``provenance['flow_graph']``; when it is ABSENT (an old npz
-        # that predates flow_graph, or a figure saved with no producing node) synthesize the raw-data->plot
-        # fallback from the ONE source (figure_capture.raw_data_flow_graph) -- so the Flow tab ALWAYS draws
-        # at least ``raw data -> plot`` and NEVER shows a "no data-flow" message.
-        provenance = saved.info.get("provenance")
-        flow = provenance.get("flow_graph") if isinstance(provenance, Mapping) else None
-        if not flow:
-            from Zou_lab_control.neutral_atom.operations.figure_capture import raw_data_flow_graph
-            flow = raw_data_flow_graph()
-        self.flow_view.set_graph(flow)
+        # --- Flow tab: the upstream DAG stored by the required provenance record.
+        provenance = saved.info["provenance"]
+        self.flow_view.set_graph(provenance["flow_graph"])
 
         # --- Raw tab: the WHOLE dict verbatim (every key the npz stored), multi-line + scrollable ---
         text = repr(dict(saved.info))

@@ -38,15 +38,17 @@ def test_two_triggers_publish_frame_0_and_frame_1():
     for _ in range(2):
         cam_node.step()
 
-    # ONE signal per emCCD event, each its OWN (filled, 1, H, W) block; NO lumped ``frame``.
-    # The block carries exactly the repeats that HOLD DATA (2 of the 4 requested after 2 steps)
-    # in the camera's native dtype -- never NaN-padded to full ring depth.
+    # ONE signal per emCCD event, each its OWN canonical (R,1,H,W) block; NO lumped ``frame``.
+    # R is the declared capacity (4), while the (R,P) validity plane marks the two cells filled
+    # after two steps.  Missingness is never encoded by changing ndarray rank/length or NaN-padding.
     assert set(cam_node.published_signals()) == {"frame_0", "frame_1"}
     b0 = np.asarray(hub.latest("frame_0"))
     b1 = np.asarray(hub.latest("frame_1"))
-    for b in (b0, b1):
-        assert b.shape == (2, 1, 40, 50)                       # (filled, 1, H, W) block per event
+    for name, b in (("frame_0", b0), ("frame_1", b1)):
+        assert b.shape == (4, 1, 40, 50)                       # fixed (R, P, H, W)
         assert b.dtype.kind in "iu"                            # native camera dtype, no float64 balloon
+        valid = hub.latest_tensor(name).valid
+        assert valid.shape == (4, 1) and np.count_nonzero(valid) == 2
     # the two emCCD events are DISTINCT images, each stacked across repeats in its own ring
     assert not np.array_equal(b0, b1)
 
@@ -189,7 +191,7 @@ def test_readout_image_frame_judged_is_synced_with_occupancy():
         det.step()
     frame_judged = np.asarray(hub.latest("frame_judged"))
     occupied = np.asarray(hub.latest("occupied"))
-    # uniform (repeat, data_points=1, *data): frame_judged (repeat,1,H,W), occupied (repeat,1,n_sites)
+    # canonical (R,P,*data_shape): frame_judged data_shape=(H,W), occupied data_shape=(n_sites,)
     assert frame_judged.ndim == 4 and occupied.ndim == 3 and frame_judged.shape[1] == occupied.shape[1] == 1
     # the readout image and the rings are the SAME shots: re-judging each frame_judged slice
     # reproduces exactly the published occupancy slice (they came from one atomic publish).

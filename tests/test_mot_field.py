@@ -1,21 +1,20 @@
 """MOT coil-field optimisation chain -- MECHANICAL contracts for every link.
 
-The chain (W round): pulse template with THREE dac api slots -> fired sequence encodes the coil
-buses as bit-channel pulses -> the virtual MOT monitor camera SENSES those levels back through
-``decode_analog_bus`` (the encoder's exact inverse) -> ``mot_roi_intensity`` reads the MOT spot ->
-the manual pulse-scan (api mode, camera=monitor_camera) facets the 3-D block / the
-Optimize-MOT-field task finds the optimum.  Each contract here pins one link so the whole chain
-can never silently rot:
+The chain: a pulse template with THREE named DAC scan slots -> one hardware table drives the coil
+buses as bit-channel pulses -> the monitor-camera measurement observes the fired levels -> the
+MOT-intensity processor publishes the scalar y consumed by Pulse Scan -> the 3-D tensor facets by
+its declared point shape.  The Optimize-MOT-field task uses the same scan-slot pulse semantics to
+find the optimum.  Each contract here pins one link so the whole chain cannot silently diverge:
 
-* decode_analog_bus really is set_api's inverse THROUGH the compiled artefact (this also pins the
-  ``_set_api_field`` dac fix: set_api must bake the plan into period states, else the sequence a
-  virtual/real machine plays would ignore software-set DAC values entirely), and it reads the
+* ``decode_analog_bus`` is the scan-slot resolver's inverse THROUGH the compiled artefact: resolving
+  a DAC slot must bake the value into period states, or the virtual/real sequence would ignore it;
+  the decoder reads the
   DELAYED base-cycle timeline -- the one ``edges()`` actually streams -- never the raw pulse list;
 * the virtual monitor camera senses ONLY the sequence FIRED over its wired streamer (the
   ``sequencer`` construction parameter -- the simulated trigger cable); free-running (its
   ``Software`` default) it images the held/safe output state, never anyone's set-points;
 * the intensity primitive + processor shapes;
-* the api sweep carries its declared scan_shape (grid facet parity with the hardware scan);
+* the hardware scan carries its declared ``scan_shape`` for generic tensor faceting;
 * the task converges on the SAME model the frames obey (no ground-truth peeking: the test talks
   to the public device model ``mot_efficiency``/``b0``, the task only ever sees frames).
 
@@ -43,7 +42,7 @@ from Zou_lab_control.neutral_atom.operations.tasks.mot_field import (
     DEFAULT_MOT_TEMPLATE, OptimizeMotFieldTask)
 from Zou_lab_control._clock import DEFAULT_CLOCK_HZ
 from Zou_lab_control.neutral_atom.timing import (
-    BUS_SAFE_SIGNED_LEVEL, resolve_fireable_template, single_imaging_template)
+    BUS_SAFE_SIGNED_LEVEL, PulseTableState, resolve_fireable_template, single_imaging_template)
 from Zou_lab_control.neutral_atom.timing.sequence import decode_analog_bus
 
 MOT_TEMPLATE = str(REPO_ROOT / DEFAULT_MOT_TEMPLATE)
@@ -53,6 +52,25 @@ def _mot_state():
     # The ONE timing-layer fireable loader the MOT task itself uses (resolve + hardware tick).
     return resolve_fireable_template(MOT_TEMPLATE, default_name=DEFAULT_MOT_TEMPLATE,
                                      default_factory=single_imaging_template)
+
+
+def test_mot_template_projects_semantic_slots_to_real_board_catalog():
+    """The bundled recipe is reusable, but the connected sequencer owns all raw lanes,
+    bus widths/indices and clocks.  Projection preserves public da_x/y/z names while
+    binding them to the real 10-bit da_bias buses and the real emCCD trigger."""
+
+    hardware = PulseTableState.load(
+        REPO_ROOT / "pulses" / "camera_imaging_address_switch.json").port_catalog
+    aligned = _mot_state().aligned_to_catalog(hardware)
+    assert aligned.scan_names == ["da_x", "da_y", "da_z"]
+    assert [slot.dac_bus for slot in aligned.scan_slots] == [
+        "da_bias_x", "da_bias_y", "da_bias_z"]
+    assert {name: hardware.by_key[name].width for name in aligned.analog_bus_modes} == {
+        "da_bias_x": 10, "da_bias_y": 10, "da_bias_z": 10}
+    trig = hardware.by_key["ch11"].lanes[0]
+    bit = hardware.raw_lanes.index(trig)
+    assert [period.states[bit] for period in aligned.periods] == [0, 1, 0]
+    aligned.validate()
 
 
 def _mid_frame_time(sequence) -> float:
@@ -90,21 +108,20 @@ def _edges_level(sequence, members, at_time: float) -> int:
 
 # --------------------------------------------------------------------------- encode <-> decode
 @pytest.mark.parametrize("values", [(7, -5, 11), (0, 0, 0), (-31, 31, 1)])
-def test_decode_analog_bus_inverts_set_api_through_compiled_sequence(values):
-    """set_api(dac) -> to_sequence -> decode_analog_bus round-trips EXACTLY (incl. the signed
-    range edges of the template's 6-bit buses -- except the full-negative code -2^(B-1), whose
+def test_decode_analog_bus_inverts_scan_slot_resolve_through_compiled_sequence(values):
+    """semantic scan-slot resolve -> to_sequence -> decode_analog_bus round-trips EXACTLY (incl. the signed
+    range of the template's 10-bit buses -- except the full-negative code -2^(B-1), whose
     all-bits-low projection is bit-identical to an UNDRIVEN bus and so decodes as the safe level;
     that corner is pinned in test_virtual_da_safe_state.py).  This pins BOTH directions: the
-    encoder must bake api-set DAC values into the compiled artefact (the _set_api_field fix --
-    before it, a software set_api was silently absent from the sequence), and the decoder must be
+    encoder must bake each resolved DAC value into the compiled artefact, and the decoder must be
     its exact inverse."""
     state = _mot_state()
-    slots = [s.name for s in state.api_slots if s.kind == "dac"]
-    resolved = state.with_api_resolved(dict(zip(slots, values)))
+    slots = state.scan_names
+    resolved = state.with_slots_resolved(dict(zip(slots, values)))
     sequence = resolved.to_sequence()
     t = _mid_frame_time(sequence)
     decoded = [decode_analog_bus(sequence, members, t)
-               for members in state.analog_buses.values()]
+               for members in state.port_catalog.analog_buses.values()]
     assert decoded == list(values)
 
 
@@ -119,16 +136,16 @@ def test_decode_analog_bus_reads_the_delayed_timeline():
     then it read the delayed timeline but decoded the pre-window idle as the all-low word
     -2^(B-1) while the hardware idles at the mid code.)"""
     state = _mot_state()
-    slots = [s.name for s in state.api_slots if s.kind == "dac"]
+    slots = state.scan_names
     values = (7, -5, 11)
-    sequence = state.with_api_resolved(dict(zip(slots, values))).to_sequence()
+    sequence = state.with_slots_resolved(dict(zip(slots, values))).to_sequence()
     dt = 20e-6
-    for members in state.analog_buses.values():
+    for members in state.port_catalog.analog_buses.values():
         for channel in members:
             sequence = sequence.delay(channel, dt)
     t_after = _mid_frame_time(sequence)                # mid of the DELAYED base cycle
     t_before = 0.25 * dt                               # the delayed bits have not started driving
-    for members, value in zip(state.analog_buses.values(), values):
+    for members, value in zip(state.port_catalog.analog_buses.values(), values):
         assert decode_analog_bus(sequence, members, t_after) == value \
             == _edges_level(sequence, members, t_after)
         assert decode_analog_bus(sequence, members, t_before) == BUS_SAFE_SIGNED_LEVEL \
@@ -145,7 +162,7 @@ def test_virtual_mot_camera_senses_only_the_fired_sequence():
     ds = load_devices("virtual", open_devices=False)
     cam, seqr = ds.devices["monitor_camera"], ds.devices["sequencer"]
     state = _mot_state()
-    slots = [s.name for s in state.api_slots if s.kind == "dac"]
+    slots = state.scan_names
 
     # Nothing fired: the free-running sensor still delivers a frame (a real Software Basler never
     # freezes), imaging the SAFE state -- every coil DAC parked at signed level 0.
@@ -154,12 +171,12 @@ def test_virtual_mot_camera_senses_only_the_fired_sequence():
     assert cam.last_levels == {bus: 0.0 for bus in cam.coil_buses}
 
     at_peak = {name: int(cam.b0[bus]) for name, bus in zip(slots, cam.coil_buses)}
-    seq = state.with_api_resolved(at_peak).to_sequence()
+    seq = state.with_slots_resolved(at_peak).to_sequence()
     frame_peak = triggered_frames(cam, seqr, seq, 1)[0]
     assert cam.last_levels == {bus: int(cam.b0[bus]) for bus in cam.coil_buses}
 
     far = {name: int(cam.b0[bus] - 4 * cam.b_sigma[bus]) for name, bus in zip(slots, cam.coil_buses)}
-    frame_far = triggered_frames(cam, seqr, state.with_api_resolved(far).to_sequence(), 1)[0]
+    frame_far = triggered_frames(cam, seqr, state.with_slots_resolved(far).to_sequence(), 1)[0]
     # brightness ratio follows the SAME public model the optimum test uses.  The faithful sensor
     # is full-frame (the spot is a tiny fraction of 2.3 MP), so brightness is read AT the spot
     # centre and the threshold derives from the camera's own model, never a re-typed constant.
@@ -181,9 +198,9 @@ def test_virtual_mot_camera_senses_the_delayed_coil_timeline():
     ds = load_devices("virtual", open_devices=False)
     cam, seqr = ds.devices["monitor_camera"], ds.devices["sequencer"]
     state = _mot_state()
-    slots = [s.name for s in state.api_slots if s.kind == "dac"]
+    slots = state.scan_names
     at_peak = {name: int(cam.b0[bus]) for name, bus in zip(slots, cam.coil_buses)}
-    seq = state.with_api_resolved(at_peak).to_sequence()
+    seq = state.with_slots_resolved(at_peak).to_sequence()
 
     def with_coil_delay(dt: float):
         out = seq
@@ -219,29 +236,33 @@ def test_mot_roi_intensity_is_disc_minus_annulus():
         mot_roi_intensity(np.zeros((2, 3, 4)), 1, 1, 1)  # not one (H, W) frame
 
 
-def test_mot_intensity_processor_accepts_bare_and_block_frames():
-    """The processor consumes ONE (H, W) frame or the camera's uniform (repeat, 1, H, W) block,
-    measures each repeat slice through the same primitive, then reduces (its declared contract)."""
-    assert MotIntensityProcessor.repeat_contract == "reduce"
+def test_mot_intensity_processor_preserves_every_repeat_point_cell():
+    """The processor maps canonical ``(R,P,H,W)`` to ``(R,P,1)`` without a node-level mode."""
     assert MotIntensityProcessor.provides == ("mot_intensity",)
     hub = SignalHub()
+    from Zou_lab_control.neutral_atom.core.signals import SignalSchema
+    hub.register_signal(
+        "frame_0",
+        SignalSchema(point_shape=(1,), data_shape=(32, 32), dtype=np.float64,
+                     repeat_capacity=2),
+    )
     proc = MotIntensityProcessor(hub, source_expr={"inputs": ["frame_0"], "source": "value = signal"},
                                  roi_radius=6.0)
     frame = np.full((32, 32), 10.0)
-    bare = proc.transform({"frame_0": frame})["mot_intensity"]
-    block = proc.transform({"frame_0": np.stack([frame, frame])[:, None]})["mot_intensity"]
-    assert bare == pytest.approx(0.0)                  # flat frame: disc == annulus
-    assert block == pytest.approx(bare)
+    hub.publish({"frame_0": np.stack([frame, frame])[:, None]})
+    proc.step()
+    block = hub.latest("mot_intensity")
+    assert block.shape == (2, 1, 1)
+    np.testing.assert_allclose(block, 0.0)             # flat frame: disc == annulus
     with pytest.raises(ValueError):
         proc.transform({"frame_0": np.zeros((2, 3, 4, 5, 6))})
 
 
-# --------------------------------------------------------------------------- api sweep grid parity
-def test_api_sweep_carries_declared_scan_shape():
-    """A multi-axis SOFTWARE api sweep declares scan_shape exactly like the hardware table -- the
-    x/y/z coil grid facets into the same grid display either way.  (Regression: the api branch
-    used to discard the declaration, so a 3-D coil sweep could never facet.)"""
+# --------------------------------------------------------------------------- hardware scan grid geometry
+def test_hardware_scan_carries_declared_scan_shape():
+    """The semantic x/y/z hardware table carries its declared grid shape."""
     from Zou_lab_control import neutral_atom as na
+    from Zou_lab_control.neutral_atom.operations.measurement import SWEEP_SCAN_SLOT
     exp = na.connect("virtual")
     try:
         spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
@@ -250,11 +271,13 @@ def test_api_sweep_carries_declared_scan_shape():
                 "A, B, C = np.meshgrid(a, b, c, indexing='ij')\n"
                 "scan_table = np.column_stack([A.ravel(), B.ravel(), C.ravel()])\n"
                 "scan_shape = (len(a), len(b), len(c))\n")
-        plan = spec.build(template=MOT_TEMPLATE, camera="monitor_camera",
-                          pulse_slots={"api": {}, "scan_mode": "api", "scan_code": prog})
+        plan = spec.build(template=MOT_TEMPLATE,
+                          pulse_slots={"api": {}, "sweep_kind": SWEEP_SCAN_SLOT, "program": prog})
+        assert plan.sweep_kind == SWEEP_SCAN_SLOT
+        assert plan.pulse_state.api_slots == []
         assert plan.scan_shape == (2, 2, 2)
-        assert plan.api_names == [s.name for s in plan.base_state.api_slots]
-        assert plan.camera is exp.devices["monitor_camera"]
+        assert plan.scan_names == ["da_x", "da_y", "da_z"]
+        assert not hasattr(plan, "camera")
     finally:
         exp.close()
 
@@ -385,7 +408,7 @@ def test_console_task_panel_is_a_live_facet_grid():
         cfg = con._task_card.config
         assert cfg.kind == "grid"
         assert list(node.grid_shape) == [3, 3, 3]
-        assert cfg.params["points_shape"] == list(node.grid_shape)
+        assert "points_shape" not in cfg.params       # geometry comes only from TaskOutput's schema
         assert cfg.params["facet"] == f"points:{len(node.grid_shape) - 1}"
         assert "__task_frame__" in cfg.source
         # size from the ONE recommendation rule, not a magic constant
@@ -395,6 +418,32 @@ def test_console_task_panel_is_a_live_facet_grid():
         # the live grid render cmap == the Setting default == the ONE PALETTE source
         setting_default = next(d.default for d in PANEL_PARAMS["2d"] if d.key == "cmap")
         assert _resolved_cmap("2d", cfg.params) == setting_default == PALETTE["cmap_scan"]
+
+        # Publish one typed canonical block with a nontrivial validity mask.  The reserved task source
+        # carries all three pieces -- data, schema and validity -- through the same generic card path as
+        # a Hub signal; faceting the final point axis yields one (Bx,By) image per Bz value.
+        from Zou_lab_control.frontend.task_console import SIG_VALID_KEY, TASK_FRAME_KEY
+        from Zou_lab_control.neutral_atom.core.signal_tensor import SignalTensor
+        output_spec = next(spec for spec in node.output_specs() if spec.name == "grid")
+        schema = output_spec.to_schema()
+        values = np.arange(np.prod(node.grid_shape), dtype=float).reshape(1, -1, 1)
+        valid = np.ones(values.shape[:2], dtype=bool)
+        valid[0, -1] = False
+        node.output.publish(grid=SignalTensor(values, schema, valid=valid))
+        con._refresh_task_panel()
+
+        structure = con._signal_structure(TASK_FRAME_KEY)
+        assert structure["points_shape"] == node.grid_shape
+        assert structure["data_shape"] == (1,)
+        assert structure["grid_shape"] == node.grid_shape
+        assert structure["param_names"] == node.scan_names
+        namespace = con._expression_namespace()
+        np.testing.assert_array_equal(namespace[SIG_VALID_KEY][TASK_FRAME_KEY], valid)
+        block = con._task_card._signal_then_repeat(namespace)
+        cells = con._task_card._facet_cells(block)
+        assert len(cells) == node.grid_shape[-1]
+        assert all(cell.shape == node.grid_shape[:2] for cell in cells)
+        assert con._task_card.plotter is not None
         con.shutdown()
     finally:
         exp.close()
@@ -402,16 +451,16 @@ def test_console_task_panel_is_a_live_facet_grid():
 
 # --------------------------------------------------------------------------- discovery
 def test_registries_discover_the_mot_chain():
-    """Console visibility: the task, the processor and the monitor camera choice are all
-    auto-discovered (no hand-wiring anywhere)."""
+    """Console visibility: the task and processor are auto-discovered, while generic Pulse Scan
+    exposes the external y selector without owning a camera role."""
     from Zou_lab_control import neutral_atom as na
     exp = na.connect("virtual")
     try:
         assert "Optimize MOT field" in {s.name for s in exp.readout.task_specs()}
         assert "MOT intensity" in {s.name for s in exp.readout.processor_specs()}
         spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
-        camera_param = next(p for p in spec.params if p.key == "camera")
-        assert "monitor_camera" in camera_param.choices
+        assert not any(p.key == "camera" for p in spec.params)
+        assert any(p.key == "y" for p in spec.params)
     finally:
         exp.close()
 
@@ -422,5 +471,5 @@ def test_task_requires_exactly_three_dac_slots():
     from Zou_lab_control.neutral_atom.timing import single_imaging_template
     ds = load_devices("virtual", open_devices=False)
     task = OptimizeMotFieldTask(SignalHub(), ds.devices["monitor_camera"], ds.devices["sequencer"])
-    with pytest.raises(ValueError, match="THREE dac api slots"):
+    with pytest.raises(ValueError, match="da_x.*da_y.*da_z"):
         task._coil_slots(single_imaging_template())

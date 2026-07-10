@@ -31,13 +31,27 @@ def test_hub_provenance_primitives_and_coherent_read():
     assert h.provenance_map() == {"frame_0": s2, "derived": s1, "rate": NO_LINEAGE}
     # coherent read at s1: the ahead frame is held back to s1, the scalar shows latest
     snap = h.snapshot_at(s1)
-    assert snap["frame_0"][0, 0] == 1.0 and snap["derived"][0] == 1.0 and snap["rate"] == 7.0
-    assert h.snapshot_at(None)["frame_0"][0, 0] == 2.0             # None == latest of each
+    assert snap["frame_0"][0, 0, 0, 0] == 1.0
+    assert snap["derived"][0, 0, 0] == 1.0
+    assert snap["rate"][0, 0, 0] == 7.0
+    assert h.snapshot_at(None)["frame_0"][0, 0, 0, 0] == 2.0      # None == latest of each
     # clear() / remove_signals() drop the parallel provenance store in lockstep
     h.remove_signals(["frame_0"])
     assert "frame_0" not in h.provenance_map()
     h.clear()
     assert h.provenance_map() == {}
+
+
+def test_snapshot_at_never_substitutes_latest_for_an_evicted_lineage():
+    from Zou_lab_control.neutral_atom.core.signals import SignalHistoryGap, SignalHub
+
+    hub = SignalHub(history=2)
+    for provenance in (1, 2, 3):
+        hub.publish({"frame_0": np.array([float(provenance)])}, provenance=provenance)
+
+    with pytest.raises(SignalHistoryGap, match="cannot substitute its latest value"):
+        hub.snapshot_at(1)
+    assert hub.snapshot_at(2)["frame_0"][0, 0, 0] == 2.0
 
 
 def test_camera_mints_and_occupancy_inherits():

@@ -97,7 +97,8 @@ def test_camera_measurement_declares_data_shape_at_build():
     exp = na.connect("virtual")
     try:
         node = CameraMeasurement(SignalHub(), exp.devices.camera)
-        assert node.data_shape == exp.devices.camera.frame_shape   # declared BEFORE any frame
+        frame_spec = next(spec for spec in node.output_specs() if spec.name == "frame_0")
+        assert frame_spec.data_shape == exp.devices.camera.frame_shape  # declared BEFORE any frame
     finally:
         exp.close()
 

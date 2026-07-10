@@ -1,36 +1,369 @@
 {
   "schema": "Zou_lab_control.neutral_atom.PulseTableState",
-  "version": 3,
+  "version": 4,
   "name": "probe_template",
-  "channels": [
-    "trap",
-    "cooling",
-    "probe",
-    "emCCD",
-    "pushout",
-    "microwave",
-    "mot_trigger",
-    "dx0",
-    "dx1",
-    "dx2",
-    "dx3",
-    "dx4",
-    "dx5",
-    "dy0",
-    "dy1",
-    "dy2",
-    "dy3",
-    "dy4",
-    "dy5",
-    "dz0",
-    "dz1",
-    "dz2",
-    "dz3",
-    "dz4",
-    "dz5"
-  ],
+  "port_catalog": {
+    "schema": "Zou_lab_control.neutral_atom.PortCatalog",
+    "version": 1,
+    "raw_lanes": [
+      "trap",
+      "cooling",
+      "probe",
+      "emCCD",
+      "pushout",
+      "microwave",
+      "mot_trigger",
+      "dx0",
+      "dx1",
+      "dx2",
+      "dx3",
+      "dx4",
+      "dx5",
+      "dy0",
+      "dy1",
+      "dy2",
+      "dy3",
+      "dy4",
+      "dy5",
+      "dz0",
+      "dz1",
+      "dz2",
+      "dz3",
+      "dz4",
+      "dz5"
+    ],
+    "ports": [
+      {
+        "key": "trap",
+        "kind": "digital",
+        "lanes": [
+          "trap"
+        ],
+        "label": "trap",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "cooling",
+        "kind": "digital",
+        "lanes": [
+          "cooling"
+        ],
+        "label": "cooling",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "probe",
+        "kind": "digital",
+        "lanes": [
+          "probe"
+        ],
+        "label": "probe",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "emCCD",
+        "kind": "digital",
+        "lanes": [
+          "emCCD"
+        ],
+        "label": "emCCD",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "pushout",
+        "kind": "digital",
+        "lanes": [
+          "pushout"
+        ],
+        "label": "pushout",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "microwave",
+        "kind": "digital",
+        "lanes": [
+          "microwave"
+        ],
+        "label": "microwave",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "mot_trigger",
+        "kind": "digital",
+        "lanes": [
+          "mot_trigger"
+        ],
+        "label": "mot_trigger",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dx0",
+        "kind": "digital",
+        "lanes": [
+          "dx0"
+        ],
+        "label": "dx0",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dx1",
+        "kind": "digital",
+        "lanes": [
+          "dx1"
+        ],
+        "label": "dx1",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dx2",
+        "kind": "digital",
+        "lanes": [
+          "dx2"
+        ],
+        "label": "dx2",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dx3",
+        "kind": "digital",
+        "lanes": [
+          "dx3"
+        ],
+        "label": "dx3",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dx4",
+        "kind": "digital",
+        "lanes": [
+          "dx4"
+        ],
+        "label": "dx4",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dx5",
+        "kind": "digital",
+        "lanes": [
+          "dx5"
+        ],
+        "label": "dx5",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dy0",
+        "kind": "digital",
+        "lanes": [
+          "dy0"
+        ],
+        "label": "dy0",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dy1",
+        "kind": "digital",
+        "lanes": [
+          "dy1"
+        ],
+        "label": "dy1",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dy2",
+        "kind": "digital",
+        "lanes": [
+          "dy2"
+        ],
+        "label": "dy2",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dy3",
+        "kind": "digital",
+        "lanes": [
+          "dy3"
+        ],
+        "label": "dy3",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dy4",
+        "kind": "digital",
+        "lanes": [
+          "dy4"
+        ],
+        "label": "dy4",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dy5",
+        "kind": "digital",
+        "lanes": [
+          "dy5"
+        ],
+        "label": "dy5",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dz0",
+        "kind": "digital",
+        "lanes": [
+          "dz0"
+        ],
+        "label": "dz0",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dz1",
+        "kind": "digital",
+        "lanes": [
+          "dz1"
+        ],
+        "label": "dz1",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dz2",
+        "kind": "digital",
+        "lanes": [
+          "dz2"
+        ],
+        "label": "dz2",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dz3",
+        "kind": "digital",
+        "lanes": [
+          "dz3"
+        ],
+        "label": "dz3",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dz4",
+        "kind": "digital",
+        "lanes": [
+          "dz4"
+        ],
+        "label": "dz4",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "dz5",
+        "kind": "digital",
+        "lanes": [
+          "dz5"
+        ],
+        "label": "dz5",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      }
+    ],
+    "fingerprint": "191b700db7d12e77"
+  },
   "scan_slots": [],
   "scan_table": [],
+  "scan_code": "",
   "api_slots": [
     {
       "name": "a1",
@@ -106,14 +439,12 @@
       ]
     }
   ],
-  "visible_channels": [
+  "visible_ports": [
     "trap",
     "cooling",
     "probe",
     "emCCD"
   ],
-  "channel_labels": {},
-  "analog_buses": {},
   "analog_bus_modes": {},
   "delays": {},
   "delay_units": {},
@@ -121,6 +452,5 @@
   "repeat_end": null,
   "repeat_count": 1,
   "repeat_forever": true,
-  "scan_repeats": 0,
-  "clk_channels": []
+  "scan_repeats": 0
 }

@@ -12,12 +12,21 @@ operations, the readout subsystem) is unchanged across methods.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import hashlib
 import json
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, ClassVar, Mapping, Sequence
 
 import numpy as np
 
+from .._serialization import (
+    require_array,
+    require_exact_fields,
+    require_int,
+    require_number,
+    require_object,
+    require_string,
+)
 from .analysis import AtomDetection, centers_array, grid_shape_tuple, nonnegative_int, roi_counts, threshold_array
 from .bimodal import classify_threshold
 from .psf import psf_signals
@@ -31,6 +40,160 @@ from .psf import psf_signals
 #: every offered method is registered here.  core owns this (it owns ``signals()`` dispatch) and
 #: never imports operations, keeping the analysis->backend decoupling direction (AGENTS §2).
 READOUT_KINDS = {"box": "box", "psf": "kernel", "uniform_psf": "kernel"}
+
+
+@dataclass(frozen=True)
+class FrameContract:
+    """Physical camera geometry/settings on which a calibration is valid.
+
+    ``image_shape`` alone cannot distinguish two equal-sized ROIs at different
+    sensor offsets.  The complete contract therefore carries the sensor window,
+    exposure and camera identity as independent, fingerprinted facts.
+    """
+
+    schema: ClassVar[str] = "Zou_lab_control.neutral_atom.FrameContract"
+    version: ClassVar[int] = 1
+
+    image_shape: tuple[int, int]
+    sensor_shape: tuple[int, int] | None = None
+    roi: tuple[int, int, int, int] | None = None
+    exposure_s: float | None = None
+    camera_type: str | None = None
+    camera_id: str | None = None
+    readout_mode: str | None = None
+
+    def __post_init__(self) -> None:
+        image = grid_shape_tuple(self.image_shape, "frame contract image_shape")
+        object.__setattr__(self, "image_shape", image)
+        sensor = None if self.sensor_shape is None else grid_shape_tuple(
+            self.sensor_shape, "frame contract sensor_shape")
+        object.__setattr__(self, "sensor_shape", sensor)
+        if self.roi is not None:
+            roi = tuple(int(v) for v in self.roi)
+            if len(roi) != 4:
+                raise ValueError("frame contract roi must be (x, width, y, height).")
+            x, width, y, height = roi
+            if x < 0 or y < 0 or width < 1 or height < 1:
+                raise ValueError("frame contract roi requires x/y >= 0 and positive width/height.")
+            if (height, width) != image:
+                raise ValueError(
+                    f"frame contract roi size {(height, width)} != image_shape {image}.")
+            if sensor is not None and (x + width > sensor[1] or y + height > sensor[0]):
+                raise ValueError(f"frame contract roi {roi} lies outside sensor_shape {sensor}.")
+            object.__setattr__(self, "roi", roi)
+        elif sensor is not None and sensor != image:
+            raise ValueError(
+                "frame contract without an roi must have image_shape == sensor_shape.")
+        if self.exposure_s is not None:
+            exposure = float(self.exposure_s)
+            if not np.isfinite(exposure) or exposure <= 0:
+                raise ValueError("frame contract exposure_s must be finite and > 0.")
+            object.__setattr__(self, "exposure_s", exposure)
+        for name in ("camera_type", "camera_id", "readout_mode"):
+            value = getattr(self, name)
+            if value is not None:
+                value = str(value).strip()
+                if not value:
+                    raise ValueError(f"frame contract {name} cannot be blank.")
+                object.__setattr__(self, name, value)
+
+    @property
+    def fingerprint(self) -> str:
+        raw = json.dumps(self.to_dict(include_fingerprint=False), sort_keys=True,
+                         separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def to_dict(self, *, include_fingerprint: bool = True) -> dict[str, Any]:
+        payload = {
+            "schema": self.schema,
+            "version": self.version,
+            "image_shape": list(self.image_shape),
+            "sensor_shape": None if self.sensor_shape is None else list(self.sensor_shape),
+            "roi": None if self.roi is None else list(self.roi),
+            "exposure_s": self.exposure_s,
+            "camera_type": self.camera_type,
+            "camera_id": self.camera_id,
+            "readout_mode": self.readout_mode,
+        }
+        if include_fingerprint:
+            payload["fingerprint"] = self.fingerprint
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "FrameContract":
+        fields = {
+            "schema", "version", "image_shape", "sensor_shape", "roi",
+            "exposure_s", "camera_type", "camera_id", "readout_mode", "fingerprint",
+        }
+        require_exact_fields(payload, fields, what="calibration frame contract")
+        schema = require_string(payload["schema"], what="FrameContract.schema")
+        version = require_int(payload["version"], what="FrameContract.version")
+        if schema != cls.schema or version != cls.version:
+            raise ValueError(
+                f"unsupported frame contract {schema!r} version {version!r}; "
+                f"expected {cls.schema!r} version {cls.version}.")
+        image_shape = require_array(payload["image_shape"], what="FrameContract.image_shape")
+        sensor_shape = (None if payload["sensor_shape"] is None else
+                        require_array(payload["sensor_shape"], what="FrameContract.sensor_shape"))
+        roi = (None if payload["roi"] is None else
+               require_array(payload["roi"], what="FrameContract.roi"))
+        exposure = (None if payload["exposure_s"] is None else
+                    require_number(payload["exposure_s"], what="FrameContract.exposure_s"))
+        strings = {
+            name: (None if payload[name] is None else require_string(
+                payload[name], what=f"FrameContract.{name}"))
+            for name in ("camera_type", "camera_id", "readout_mode")
+        }
+        contract = cls(
+            image_shape=tuple(image_shape), sensor_shape=None if sensor_shape is None else tuple(sensor_shape),
+            roi=None if roi is None else tuple(roi), exposure_s=exposure, **strings,
+        )
+        if require_string(payload["fingerprint"], what="FrameContract.fingerprint") != contract.fingerprint:
+            raise ValueError("calibration frame-contract fingerprint mismatch.")
+        return contract
+
+    @classmethod
+    def from_camera(cls, camera, *, image_shape=None, exposure_s=None) -> "FrameContract":
+        """Snapshot a camera without importing a concrete backend."""
+
+        snap = camera.snapshot() if hasattr(camera, "snapshot") else {}
+        shape = image_shape or getattr(camera, "frame_shape", None)
+        if shape is None:
+            raise ValueError("camera frame shape is unknown; acquire a frame before calibration.")
+        sensor = getattr(camera, "sensor_shape", None)
+        roi = getattr(camera, "roi", None)
+        exposure = exposure_s if exposure_s is not None else snap.get(
+            "exposure", getattr(camera, "exposure", None))
+        identity = snap.get("device_index", snap.get("serial_number", snap.get("serial")))
+        mode = snap.get("readout_speed", snap.get("readout_mode"))
+        return cls(
+            image_shape=tuple(int(v) for v in shape),
+            sensor_shape=None if sensor is None else tuple(int(v) for v in sensor),
+            roi=None if roi is None else tuple(int(v) for v in roi),
+            exposure_s=exposure,
+            camera_type=type(camera).__name__,
+            camera_id=None if identity is None else str(identity),
+            readout_mode=None if mode is None else str(mode),
+        )
+
+    def assert_image(self, image) -> None:
+        got = tuple(int(v) for v in np.shape(image))
+        if got != self.image_shape:
+            raise ValueError(
+                f"image shape {got} does not match calibration frame contract "
+                f"{self.image_shape}; recalibrate for the current camera ROI.")
+
+    def assert_compatible(self, observed: "FrameContract") -> None:
+        """Reject any known physical-camera fact that differs."""
+
+        mismatches = []
+        for name in ("image_shape", "sensor_shape", "roi", "exposure_s",
+                     "camera_type", "camera_id", "readout_mode"):
+            expected, actual = getattr(self, name), getattr(observed, name)
+            if expected is not None and actual is not None and expected != actual:
+                mismatches.append(f"{name}: calibrated={expected!r}, current={actual!r}")
+        if mismatches:
+            raise ValueError("camera/calibration frame-contract mismatch (" + "; ".join(mismatches) + ").")
 
 
 def readout_kind(method: str) -> str:
@@ -47,8 +210,12 @@ def readout_kind(method: str) -> str:
 
 @dataclass(frozen=True)
 class TrapCalibration:
+    schema: ClassVar[str] = "Zou_lab_control.neutral_atom.TrapCalibration"
+    version: ClassVar[int] = 1
+
     centers: np.ndarray
     thresholds: np.ndarray | float
+    frame_contract: FrameContract | Mapping[str, Any]
     grid_shape: tuple[int, int] | None = None
     # roi_radius / reducer are the BOX readout's extraction geometry (square ROI half-width +
     # how it reduces).  They are meaningful ONLY for method='box'; a PSF (kernel) calibration
@@ -69,6 +236,10 @@ class TrapCalibration:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        contract = (self.frame_contract if isinstance(self.frame_contract, FrameContract)
+                    else FrameContract.from_dict(require_object(
+                        self.frame_contract, what="TrapCalibration.frame_contract")))
+        object.__setattr__(self, "frame_contract", contract)
         centers = centers_array(self.centers)
         object.__setattr__(self, "centers", centers)
         object.__setattr__(self, "thresholds", threshold_array(self.thresholds, len(centers)))
@@ -172,16 +343,18 @@ class TrapCalibration:
         return entry.get("background") if entry.get("background") is not None else self.background
 
     def readout_exposure(self, fallback: float | None = None) -> float | None:
-        """The camera gate time these thresholds were LEARNT at (``threshold_exposure`` on the
-        metadata), or ``fallback`` when none was recorded.  This is the ONE authoritative reader
+        """The camera gate time these thresholds were learned at, or ``fallback``.
+
+        Exposure is a typed field of :class:`FrameContract`, not an unversioned
+        metadata spelling.  This is the ONE authoritative reader
         of that exposure-self-match invariant: every readout that must image at the calibration's
         exposure (``detect``, the live calibrate-task adoption, the temperature survival frames)
-        goes through HERE instead of each reaching into ``metadata`` with its own defensive spelling
+        goes through HERE instead of reaching into unversioned metadata
         -- a threshold is exposure-specific, so a missed/mistyped lookup re-floors occupancy /
         sticks survival at the readout false-positive rate (#issue-2 / #H3v-2).  Callers pass their
         OWN fallback (the camera exposure, or None to mean 'do not force a match')."""
-        value = self.metadata.get("threshold_exposure")
-        return float(value) if value else fallback
+        value = self.frame_contract.exposure_s
+        return float(value) if value is not None else fallback
 
     def thresholds_for(self, method=None) -> np.ndarray:
         """Per-site thresholds for ``method`` (this calibration's own, or a ``by_method``
@@ -199,18 +372,7 @@ class TrapCalibration:
         picks the readout: ``box`` square-ROI, ``psf``/``uniform_psf`` matched-filter --
         so one calibration can be read several ways (the processor chooses)."""
 
-        # ROI fingerprint: the centers/PSF boxes are absolute camera pixels, so a
-        # frame from a DIFFERENT camera ROI (same size but shifted) would silently
-        # extract the WRONG pixels -- in-bounds, no error, every count wrong.  When
-        # the calibration recorded the image shape it was built on, fail loud on a
-        # mismatch instead (raise -> recalibrate) rather than corrupt results.
-        expected = self.metadata.get("image_shape")
-        if expected is not None:
-            got = tuple(int(v) for v in np.shape(image)[:2])
-            if got != tuple(int(v) for v in expected):
-                raise ValueError(
-                    f"image shape {got} does not match the calibration's {tuple(expected)} "
-                    "(camera ROI changed since calibration?) -- recalibrate before reading out.")
+        self.frame_contract.assert_image(image)
         m = self._resolve_method(method)
         if readout_kind(m) == "kernel":
             weights, boxes = self._kernels_for(m)
@@ -290,10 +452,19 @@ class TrapCalibration:
             }
         return out
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    @property
+    def fingerprint(self) -> str:
+        raw = json.dumps(self.to_dict(include_fingerprint=False), sort_keys=True,
+                         separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def to_dict(self, *, include_fingerprint: bool = True) -> dict[str, Any]:
+        payload = {
+            "schema": self.schema,
+            "version": self.version,
             "centers": self.centers.tolist(),
             "thresholds": self.thresholds.tolist(),
+            "frame_contract": self.frame_contract.to_dict(),
             "grid_shape": None if self.grid_shape is None else list(self.grid_shape),
             "roi_radius": self.roi_radius,
             "reducer": self.reducer,
@@ -304,22 +475,58 @@ class TrapCalibration:
             "by_method": self._by_method_to_json(self.by_method),
             "metadata": self.metadata,
         }
+        if include_fingerprint:
+            payload["fingerprint"] = self.fingerprint
+        return payload
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TrapCalibration":
-        return cls(
-            payload["centers"],
-            payload["thresholds"],
-            grid_shape=None if payload.get("grid_shape") is None else tuple(payload["grid_shape"]),
-            roi_radius=payload.get("roi_radius", 1),
-            reducer=payload.get("reducer", "mean"),
-            method=payload.get("method", "box"),
-            psf_weights=payload.get("psf_weights"),
-            psf_boxes=payload.get("psf_boxes"),
-            background=payload.get("background", "none"),
-            by_method=payload.get("by_method"),
-            metadata=payload.get("metadata", {}),
+    def from_dict(cls, payload: Mapping[str, Any]) -> "TrapCalibration":
+        fields = {
+            "schema", "version", "centers", "thresholds", "frame_contract",
+            "grid_shape", "roi_radius", "reducer", "method", "psf_weights",
+            "psf_boxes", "background", "by_method", "metadata", "fingerprint",
+        }
+        require_exact_fields(payload, fields, what="trap calibration")
+        schema = require_string(payload["schema"], what="TrapCalibration.schema")
+        version = require_int(payload["version"], what="TrapCalibration.version")
+        if schema != cls.schema or version != cls.version:
+            raise ValueError(
+                f"unsupported trap calibration {schema!r} version {version!r}; "
+                f"expected {cls.schema!r} version {cls.version}.")
+        centers = require_array(payload["centers"], what="TrapCalibration.centers")
+        thresholds = require_array(payload["thresholds"], what="TrapCalibration.thresholds")
+        grid = (None if payload["grid_shape"] is None else
+                require_array(payload["grid_shape"], what="TrapCalibration.grid_shape"))
+        roi_radius = (None if payload["roi_radius"] is None else
+                      require_int(payload["roi_radius"], what="TrapCalibration.roi_radius"))
+        reducer = (None if payload["reducer"] is None else
+                   require_string(payload["reducer"], what="TrapCalibration.reducer"))
+        method = require_string(payload["method"], what="TrapCalibration.method")
+        background = require_string(payload["background"], what="TrapCalibration.background")
+        psf_weights = (None if payload["psf_weights"] is None else
+                       require_array(payload["psf_weights"], what="TrapCalibration.psf_weights"))
+        psf_boxes = (None if payload["psf_boxes"] is None else
+                     require_array(payload["psf_boxes"], what="TrapCalibration.psf_boxes"))
+        by_method = (None if payload["by_method"] is None else
+                     require_object(payload["by_method"], what="TrapCalibration.by_method"))
+        calibration = cls(
+            centers,
+            thresholds,
+            frame_contract=FrameContract.from_dict(require_object(
+                payload["frame_contract"], what="TrapCalibration.frame_contract")),
+            grid_shape=None if grid is None else tuple(grid),
+            roi_radius=roi_radius,
+            reducer=reducer,
+            method=method,
+            psf_weights=psf_weights,
+            psf_boxes=psf_boxes,
+            background=background,
+            by_method=by_method,
+            metadata=require_object(payload["metadata"], what="TrapCalibration.metadata"),
         )
+        if require_string(payload["fingerprint"], what="TrapCalibration.fingerprint") != calibration.fingerprint:
+            raise ValueError("trap-calibration fingerprint mismatch.")
+        return calibration
 
     def save(self, path: str | Path) -> Path:
         path = Path(path)
@@ -327,6 +534,11 @@ class TrapCalibration:
         if path.suffix.lower() == ".npz":
             np.savez(
                 path,
+                schema=np.asarray(self.schema),
+                version=np.asarray(self.version, dtype=np.int64),
+                fingerprint=np.asarray(self.fingerprint),
+                frame_contract_json=np.asarray(json.dumps(
+                    self.frame_contract.to_dict(), ensure_ascii=False, sort_keys=True)),
                 centers=self.centers,
                 thresholds=self.thresholds,
                 grid_shape=np.asarray([] if self.grid_shape is None else self.grid_shape),
@@ -349,30 +561,44 @@ class TrapCalibration:
     def load(cls, path: str | Path) -> "TrapCalibration":
         path = Path(path)
         if path.suffix.lower() == ".npz":
-            data = np.load(path, allow_pickle=False)
-            grid = data["grid_shape"]
-            metadata = json.loads(str(data["metadata_json"].item())) if "metadata_json" in data.files else {}
-            by_method = json.loads(str(data["by_method_json"].item())) if "by_method_json" in data.files else None
-            psf_weights = data["psf_weights"] if "psf_weights" in data.files else None
-            psf_boxes = data["psf_boxes"] if "psf_boxes" in data.files else None
-            # roi_radius / reducer sentinels (-1 / "") restore to None (a PSF calibration carried
-            # no box geometry); __post_init__ also drops them for any non-box method either way.
-            roi_radius_raw = int(data["roi_radius"].item())
-            reducer_raw = str(data["reducer"].item())
-            return cls(
-                data["centers"],
-                data["thresholds"],
-                grid_shape=None if grid.size == 0 else tuple(int(v) for v in grid),
-                roi_radius=None if roi_radius_raw < 0 else roi_radius_raw,
-                reducer=None if reducer_raw == "" else reducer_raw,
-                method=str(data["method"].item()) if "method" in data.files else "box",
-                psf_weights=None if psf_weights is None or psf_weights.size == 0 else psf_weights,
-                psf_boxes=None if psf_boxes is None or psf_boxes.size == 0 else psf_boxes,
-                background=str(data["background"].item()) if "background" in data.files else "none",
-                by_method=by_method,
-                metadata=metadata,
-            )
-        return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            expected = {
+                "schema", "version", "fingerprint", "frame_contract_json",
+                "centers", "thresholds", "grid_shape", "roi_radius", "reducer",
+                "method", "background", "psf_weights", "psf_boxes",
+                "by_method_json", "metadata_json",
+            }
+            with np.load(path, allow_pickle=False) as data:
+                actual = set(data.files)
+                if actual != expected:
+                    raise ValueError(
+                        f"trap calibration npz fields mismatch: missing={sorted(expected - actual)}, "
+                        f"unknown={sorted(actual - expected)}.")
+                grid = data["grid_shape"]
+                psf_weights = data["psf_weights"]
+                psf_boxes = data["psf_boxes"]
+                roi_radius_raw = int(data["roi_radius"].item())
+                reducer_raw = str(data["reducer"].item())
+                payload = {
+                    "schema": str(data["schema"].item()),
+                    "version": int(data["version"].item()),
+                    "fingerprint": str(data["fingerprint"].item()),
+                    "frame_contract": json.loads(str(data["frame_contract_json"].item())),
+                    "centers": data["centers"].tolist(),
+                    "thresholds": data["thresholds"].tolist(),
+                    "grid_shape": None if grid.size == 0 else [int(v) for v in grid],
+                    "roi_radius": None if roi_radius_raw < 0 else roi_radius_raw,
+                    "reducer": None if reducer_raw == "" else reducer_raw,
+                    "method": str(data["method"].item()),
+                    "background": str(data["background"].item()),
+                    "psf_weights": None if psf_weights.size == 0 else psf_weights.tolist(),
+                    "psf_boxes": None if psf_boxes.size == 0 else psf_boxes.tolist(),
+                    "by_method": json.loads(str(data["by_method_json"].item())),
+                    "metadata": json.loads(str(data["metadata_json"].item())),
+                }
+            return cls.from_dict(payload)
+        payload = require_object(
+            json.loads(path.read_text(encoding="utf-8")), what="trap calibration file")
+        return cls.from_dict(payload)
 
 
-__all__ = ["TrapCalibration", "READOUT_KINDS", "readout_kind"]
+__all__ = ["FrameContract", "TrapCalibration", "READOUT_KINDS", "readout_kind"]

@@ -38,7 +38,9 @@ computer pass `--remote-host`; for pure offline editing pass `--no-sequencer`.
 .\pulse_gui.bat --xdc D:\pin_maps\my_board.xdc --channel-count 24
 ```
 
-The launcher infers channel count, display labels, and package pins from the
-FPGA XDC (fallback 62). A JSON with only a subset is aligned to the full
-hardware list before upload; hidden channels are a view-only operation and are
-zeroed in the uploaded masks.
+In explicit offline/XDC mode the launcher builds the editor's `PortCatalog`
+from that XDC. Remote mode is different: `RemoteSequencer.open()` first binds
+the server snapshot's complete `PortCatalog` and clock, with no client topology
+or clock fallback; a pulse document must carry the matching fingerprint before
+upload. Hidden ports are view-only and never change the catalog or raw mask
+width.

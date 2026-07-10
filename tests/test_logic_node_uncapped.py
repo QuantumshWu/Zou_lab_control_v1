@@ -19,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
-from Zou_lab_control.neutral_atom.operations.logic import LogicNode
+from Zou_lab_control.neutral_atom.operations.logic import LogicNode, SignalSpec
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
 
@@ -31,6 +31,12 @@ class _FastNode(LogicNode):
     def shot(self):
         time.sleep(self.PER_SHOT_S)   # stands in for a blocking device read
         return {"v": 1.0}
+
+    def _bare_published_signals(self):
+        return frozenset({"v"})
+
+    def _bare_output_specs(self):
+        return (SignalSpec("v", "acquired value", points_shape=(1,), data_shape=(1,)),)
 
 
 class _IdleNode(LogicNode):
@@ -86,6 +92,12 @@ class _Reactor(LogicNode):
         self._seen = v
         return {"out": float(v)}
 
+    def _bare_published_signals(self):
+        return frozenset({"out"})
+
+    def _bare_output_specs(self):
+        return (SignalSpec("out", "reacted version", points_shape=(1,), data_shape=(1,)),)
+
 
 def test_reactive_node_wakes_on_publish_not_after_the_idle_cap():
     """The idle wait is EVENT-DRIVEN: a reactive node reacts the instant its input is published, NOT after
@@ -105,12 +117,12 @@ def test_reactive_node_wakes_on_publish_not_after_the_idle_cap():
             deadline = time.monotonic() + 0.5
             while time.monotonic() < deadline:
                 try:
-                    if float(hub.latest("out")) == float(i):
+                    if float(hub.latest("out").item()) == float(i):
                         break
                 except KeyError:
                     pass
                 time.sleep(0.001)
-            got.append(float(hub.latest("out")))
+            got.append(float(hub.latest("out").item()))
         elapsed = time.monotonic() - t0
     finally:
         node.stop()

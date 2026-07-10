@@ -56,13 +56,16 @@ def test_shared_math_functions_are_not_redefined():
 def test_both_sides_use_the_same_shared_objects():
     """Same function objects on both sides -> they cannot diverge."""
     from Zou_lab_control import _readout_math as rm
-    from Zou_lab_control.neutral_atom.core import analysis, bimodal
+    from Zou_lab_control.neutral_atom.core import analysis, bimodal, fitting
     from Zou_lab_control.frontend import live
 
     assert analysis.confidence_weighted_fidelity is rm.confidence_weighted_fidelity
     assert bimodal.normal_cdf is rm.normal_cdf
     assert live.confidence_weighted_fidelity is rm.confidence_weighted_fidelity
-    assert live.gaussian is rm.gaussian and live.bimodal_model is rm.bimodal_model
+    # Histogram model/solver ownership moved out of the UI and into core.fitting;
+    # the core still imports the exact shared readout kernels rather than copying them.
+    assert fitting.gaussian is rm.gaussian
+    assert fitting.bimodal_model is rm.bimodal_model
 
 
 def test_finite_mean_is_the_one_gap_safe_average_on_both_sides():

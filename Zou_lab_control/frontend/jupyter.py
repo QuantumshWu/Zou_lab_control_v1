@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
@@ -73,7 +74,11 @@ def notebook_setup(*, apply_frontend_style: bool = False) -> None:
 
 
 def write_notebook(path: str | Path, cells: Iterable[dict], *, title: str | None = None) -> NotebookBuildResult:
-    """Write a UTF-8 notebook from simple cell dictionaries."""
+    """Write a byte-stable UTF-8 notebook from simple cell dictionaries.
+
+    Cell ids are content-addressed (with the ordinal disambiguating duplicate
+    cells), so rebuilding an unchanged template produces no random-id Git churn.
+    """
 
     import nbformat as nbf
 
@@ -87,13 +92,16 @@ def write_notebook(path: str | Path, cells: Iterable[dict], *, title: str | None
     if title:
         notebook.metadata["title"] = str(title)
     nb_cells = []
-    for cell in cells:
+    for index, cell in enumerate(cells):
         kind = cell.get("kind", "markdown")
         source = str(cell.get("source", "")).strip()
+        identity = hashlib.sha256(
+            f"{index}\0{kind}\0{source}".encode("utf-8")
+        ).hexdigest()[:16]
         if kind == "code":
-            nb_cells.append(nbf.v4.new_code_cell(source))
+            nb_cells.append(nbf.v4.new_code_cell(source, id=identity))
         elif kind == "markdown":
-            nb_cells.append(nbf.v4.new_markdown_cell(source))
+            nb_cells.append(nbf.v4.new_markdown_cell(source, id=identity))
         else:
             raise ValueError(f"unknown notebook cell kind {kind!r}.")
     notebook.cells = nb_cells

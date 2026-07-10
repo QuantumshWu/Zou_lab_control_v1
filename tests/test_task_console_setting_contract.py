@@ -60,31 +60,24 @@ def _combo_item_sets(card):
 
 
 # ---------------------------------------------------------------- structural
-def test_setting_popup_has_no_fit_controls():
-    """The Setting popup is BASIC display only: no Fit/Clear buttons.
-
-    The relim combo (``tight`` / ``normal``, confocal naming) IS present as the
-    Limits "mode" row -- that's the user-requested confocal layout, and it
-    persists into ``config.params["relim"]`` (the same key Control's ed_relim
-    writes to, so they stay in sync).  See ``test_setting_relim_combo_writes
-    _config_params_relim`` for the relim semantic, and ``test_setting_popup
-    _has_unit_and_limit_controls`` for the structural presence check.
-    """
+def test_setting_popup_has_live_fit_controls_from_the_core_registry():
+    """General-fit families expose the real live Apply/Clear entry; hist keeps its own fit."""
     from Zou_lab_control.frontend.task_console import PANEL_PARAMS
     for kind in ("1d", "monitor", "2d", "sites", "hist"):
         card = _card(kind)
         try:
             texts = _button_texts(card)
-            assert "Fit" not in texts, (kind, texts)
-            assert "Clear" not in texts, (kind, texts)
+            if kind == "hist":
+                assert "Clear" not in texts, (kind, texts)
+                assert card.fit_model_combo is None
+            else:
+                assert "Apply" in texts and "Clear" in texts, (kind, texts)
+                assert card.fit_model_combo is not None
             # relim is not a declarative PANEL_PARAMS spec -- it has its OWN
             # row in the Limits section (the Limits combo).  Keep the spec set
             # clean of any duplicate "relim" key.
             param_keys = {spec.key for spec in PANEL_PARAMS.get(kind, ())}
             assert "relim" not in param_keys, (kind, param_keys)
-            # the card no longer carries the popup-fit handles
-            assert not hasattr(card, "fit_combo"), kind
-            assert not hasattr(card, "_do_fit"), kind
         finally:
             card.shutdown()
 
@@ -124,7 +117,7 @@ def test_setting_popup_has_unit_and_relim_controls():
             assert hasattr(img, attr), attr
 
         # the restored handlers
-        for attr in ("_on_unit_cycle", "_on_relim_mode",
+        for attr in ("_on_unit_cycle",
                      "_apply_unit", "_apply_display_params",
                      "_current_unit_text", "_unit_df", "_unit_cycle_len"):
             assert hasattr(img, attr), attr
@@ -200,7 +193,7 @@ def test_setting_relim_combo_writes_config_params_relim():
         assert card.lim_combo.currentText() == "tight"
         # picking "normal" persists onto the same key the Control tab uses
         card.lim_combo.setCurrentText("normal")
-        card._on_relim_mode("normal")
+        card._set_param("relim", "normal")
         assert card.config.params["relim"] == "normal"
         assert card.plotter.relim_mode == "normal"
         # data-shape change rebuilds the plotter -> relim must reapply
@@ -245,9 +238,9 @@ def test_2d_relim_toggle_remaps_colorbar_both_ways():
         frame[3:5, 3:5] = 250.0
         card.refresh({"frame": frame, "shot": 1})
         assert card.plotter.ylim_min > 0.0            # built tight
-        card._on_relim_mode("normal")
+        card._set_param("relim", "normal")
         assert card.plotter.ylim_min == 0.0           # re-mapped to normal live
-        card._on_relim_mode("tight")
+        card._set_param("relim", "tight")
         assert card.plotter.ylim_min > 0.0            # back to tight live
     finally:
         card.shutdown()

@@ -34,21 +34,38 @@ here -- the acquisition loop must not be slowed to a display rate.
 
 from __future__ import annotations
 
+import ast
 import logging
+import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Mapping
 
 import numpy as np
 
 from Zou_lab_control._paths import CALIBRATION_DIR
 from ..devices.base import EXCLUSIVE, OBSERVE
 from ..core.analysis import grid_shape_tuple
-from ..core.signals import NO_LINEAGE, SignalHub
+from ..core.signals import (
+    NO_LINEAGE,
+    SignalHub,
+    SignalSchema,
+    SignalTensor,
+    TensorPatch,
+)
 from ..devices.base import CameraDevice
-from .measurement import triggered_frames
-from .signal_expr import DEFAULT_SOURCE, SignalExpr, hub_namespace
+from .measurement import (
+    SWEEP_API_SLOT,
+    SWEEP_SCAN_SLOT,
+    fire_api_sweep_point,
+    prepare_hardware_scan,
+    program_completion_timeout,
+    reducer_data_shape,
+    triggered_frames,
+)
+from .signal_expr import DEFAULT_SOURCE, ProcessorSignalSnapshot, SignalExpr, hub_namespace
 
 # The background loop's ONLY two time constants -- and NEITHER is an acquisition-rate cap.  A pass that
 # published (an acquiring measurement, a reactive processor whose input advanced) loops immediately, so
@@ -64,8 +81,7 @@ IMAGE_STREAM_HISTORY = 8   # short shot-coherence buffer for full-frame image st
 
 @dataclass(frozen=True)
 class SignalSpec:
-    """What ONE output of a logic node MEANS -- the human label + unit + one-line
-    description for a signal it publishes (or, for a task, produces off-hub).
+    """The complete, authoritative contract for one logic-node output.
 
     A node declares these ONCE (``output_specs``); the GUI reads them so a plot can
     set its axis label/unit from the producing measurement (not a hard-coded per-kind
@@ -74,15 +90,15 @@ class SignalSpec:
     signal name (with the node's prefix), so a consumer maps a signal straight to its
     meaning.
 
-    ``points_shape`` / ``data_shape`` declare THIS signal's OWN slot in the
-    ``(repeat, *points_shape, *data_shape)`` contract -- because one node publishes signals
-    of DIFFERENT structure (occupancy judges a frame's repeat axis into a per-site vector,
-    while its ``centers`` is static geometry with NO repeat axis).  Both ``None`` (the
-    default) means "this signal does NOT follow the repeat contract" -- a consumer prints its
-    raw shape and falls back to the node-level points/data triple.  A signal that DOES carry
-    the repeat axis declares ``points_shape``/``data_shape`` so ``core_ndim =
-    len(points_shape) + len(data_shape)`` tells the plot exactly which leading axis is the
-    repeat to collapse -- structure-driven, never an ndim guess.
+    Every physical signal has exactly ``(R, P, *data_shape)`` axes.
+    ``point_shape`` is the logical scan geometry whose product is the one physical
+    P axis; ``data_shape`` is retained verbatim.  Both are non-empty,
+    including scalars (``(1,)`` + ``(1,)``).  There is no unstructured/``None``
+    branch and no dimensionality heuristic.
+
+    This object is the producer-side single source of truth.  :meth:`to_schema`
+    creates the transport-level :class:`SignalSchema` used by :class:`SignalHub`;
+    UI consumers read that registered schema rather than reconstructing structure.
 
     ``history`` declares the hub storage depth for THIS signal.  ``None`` means
     "use the hub default" (deep histories for small scalar/count streams);
@@ -94,68 +110,88 @@ class SignalSpec:
     label: str              # axis / legend label, e.g. "loading rate"
     unit: str = ""          # physical unit, e.g. "s" / "K" (blank = dimensionless)
     description: str = ""    # one-line human meaning for the publishes legend
-    points_shape: tuple | None = None   # this signal's swept-parameter (data_points) axes (None = no contract slot)
-    data_shape: tuple | None = None     # this signal's per-point data axes (None = no contract slot)
+    points_shape: tuple[int, ...] = (1,)
+    data_shape: tuple[int, ...] = (1,)
+    dtype: Any = None
+    repeat_capacity: int | None = None
     history: int | None = None          # per-signal hub ring depth override (None = hub default)
+    metadata: Mapping[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
     def __post_init__(self):
-        # IRON-LAW guard: a signal that follows the repeat contract is ALWAYS (repeat, data_points, *data_dim)
-        # with the data_points axis PRESENT (a no-scan acquisition = exactly ONE point -> points_shape=(1,)).
-        # The empty tuple () means "repeat-carrying but ZERO points" -- a contradiction that historically
-        # crept in (dropping the middle 1) and broke the uniform shape.  points_shape is therefore EITHER
-        # None (no repeat contract: a static constant / a derived scalar) OR a NON-EMPTY tuple.  data_shape
-        # follows the same rule so a declared contract slot is never half-specified.
-        if self.points_shape == () or self.data_shape == ():
+        points = tuple(int(n) for n in self.points_shape)
+        data = tuple(int(n) for n in self.data_shape)
+        if not points or any(n < 1 for n in points):
             raise ValueError(
-                f"SignalSpec({self.name!r}): points_shape/data_shape must be None (no repeat contract) or a "
-                f"NON-EMPTY tuple -- got points_shape={self.points_shape!r}, data_shape={self.data_shape!r}.  "
-                "A no-scan, single-point signal is (repeat, 1, *data) with points_shape=(1,); the empty () "
-                "drops the mandatory data_points axis (#iron-law).")
+                f"SignalSpec({self.name!r}): points_shape must be a non-empty tuple of "
+                f"positive sizes, got {self.points_shape!r}.")
+        if not data or any(n < 1 for n in data):
+            raise ValueError(
+                f"SignalSpec({self.name!r}): data_shape must be a non-empty tuple of "
+                f"positive sizes, got {self.data_shape!r}.")
+        object.__setattr__(self, "points_shape", points)
+        object.__setattr__(self, "data_shape", data)
+        if self.repeat_capacity is not None and int(self.repeat_capacity) < 1:
+            raise ValueError(
+                f"SignalSpec({self.name!r}): repeat_capacity must be >= 1 or None, "
+                f"got {self.repeat_capacity!r}.")
+        if self.repeat_capacity is not None:
+            object.__setattr__(self, "repeat_capacity", int(self.repeat_capacity))
         if self.history is not None and int(self.history) < 1:
             raise ValueError(f"SignalSpec({self.name!r}): history must be >= 1 or None, got {self.history!r}.")
+        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+
+        # Reuse SignalSchema's dtype/shape validation at declaration time.  The
+        # returned object is discarded; to_schema() adds the final runtime dtype.
+        self.to_schema()
 
     @property
     def axis_label(self) -> str:
         """``label (unit)`` for a plot axis, or just ``label`` when dimensionless."""
         return f"{self.label} ({self.unit})" if self.unit else self.label
 
-    @property
-    def has_structure(self) -> bool:
-        """True when this signal declares its OWN repeat-contract slot (points/data shape),
-        so a consumer reads the per-signal structure instead of the node-level triple."""
-        return self.points_shape is not None or self.data_shape is not None
+    def to_schema(self, *, dtype=None) -> SignalSchema:
+        """Create the one transport schema represented by this declaration.
 
-    @property
-    def core_ndim(self) -> int | None:
-        """``len(points_shape) + len(data_shape)`` -- the dimensionality of ONE repeat slice of
-        this signal, so ``reduce_repeat`` knows the block carries a repeat axis exactly when its
-        ndim is ``1 + core_ndim``.  ``None`` when the signal declares no structure."""
-        if not self.has_structure:
-            return None
-        return len(self.points_shape or ()) + len(self.data_shape or ())
+        ``dtype`` is supplied by the unified publish boundary when this spec left
+        it unbound.  Producers that publish patches declare a dtype up front so
+        the hub can initialize their store before applying the first patch.
+        """
+
+        resolved_dtype = self.dtype if self.dtype is not None else dtype
+        return SignalSchema(
+            point_shape=self.points_shape,
+            data_shape=self.data_shape,
+            dtype=resolved_dtype,
+            repeat_capacity=self.repeat_capacity,
+            label=self.label,
+            unit=self.unit,
+            description=self.description,
+            metadata=self.metadata,
+        )
 
 
 def grid_for_points(grid, points) -> tuple:
-    """The SINGLE validity precondition for un-flattening a flat swept-points axis into a 2-D map.
+    """Validate an optional display grid against logical point geometry.
 
-    A 2-D scan publishes its swept points FLAT (``points_shape=(P,)``) and declares ``grid_shape=(n0,n1)``
-    so a 2-D panel can reshape them back into an image.  That reshape is valid IFF the points exist AND the
-    grid divides them exactly -- ``points`` non-empty and ``prod(grid) == prod(points)``.  Returns ``grid``
-    when valid, else ``()``.
-
-    This is the ONE rule EVERY consumer shares -- :func:`describe_shape` (the legend), the console's
-    ``_signal_structure`` (what a panel reshapes) and ``_coerce`` (the actual reshape) -- so the rule can
-    never drift between them.  Crucially, a node may carry a ``grid_shape`` that is NOT a swept-points grid:
-    an :class:`OccupancyProcessor` stores ``grid_shape=(5,7)`` as the physical TRAP LAYOUT,
-    which has nothing to do with reshaping points.  Because reshape eligibility is a dimensional FACT about
-    the signal (``prod(grid)==prod(points)``), such a trap grid is never smeared onto a per-site signal
-    (occupancy ``points=()`` -> ``prod=1`` != ``35``) and imshow'd as a (5x7) heatmap -- no per-node
-    special-casing, the same fact decides it everywhere."""
+    ``SignalSchema.point_shape`` is authoritative and the physical P axis is its
+    product.  A separate ``grid`` is only a presentation alias and is accepted
+    when it has the same point count; it never reshapes ``data_shape``.
+    """
     pts = tuple(int(n) for n in (points or ()))
     g = tuple(int(n) for n in (grid or ()))
     if pts and g and int(np.prod(g)) == int(np.prod(pts)):
         return g
     return ()
+
+
+def format_dims(dims) -> str:
+    """The ONE spelling of a dims tuple for the GUI: axes joined by the ``×`` glyph
+    (``40×20``), and ``"1"`` for an empty/scalar shape.  EVERY surface that turns a
+    signal's shape into a display string routes through here, so ``(40, 20)`` (numpy-tuple
+    spelling) can never appear beside ``40×20`` again -- the single source :func:`describe_shape`
+    and the flow-graph / picker labels all share."""
+    parts = tuple(str(int(n)) for n in (dims or ()))
+    return "×".join(parts) if parts else "1"
 
 
 def describe_shape(value, *, points_shape=None, data_shape=None, grid_shape=None) -> str:
@@ -164,15 +200,15 @@ def describe_shape(value, *, points_shape=None, data_shape=None, grid_shape=None
     than a hand-typed name->format map (which silently drifts from what a node really
     emits).  ``scalar`` for a 0-d / Python number; ``None`` -> ``"—"`` (no value yet).
 
-    When the value IS a measurement/processor's contract block (its shape matches the declared
-    ``(repeat, *points_shape, *data_shape)``, #H3o) it is shown in CONTRACT form
-    ``repeat × points × (data)`` -- ALWAYS all three groups (the data_points axis is mandatory, never
+    When the value is a registered signal tensor (its shape matches the declared
+    physical ``(repeat, prod(points_shape), *data_shape)``) it is shown in contract form
+    ``repeat × points × (data)`` -- ALWAYS all three groups (the physical P axis is mandatory, never
     dropped): a 1-D scan ``5 × 8 × (3)``; a 2-D scan ``5 × (4×5) × (1)`` via ``grid_shape`` reshaping the
     SWEPT POINTS; a no-scan single-point signal is ``5 × 1 × (...)`` -- a camera/judged frame
     ``5 × 1 × (96×128)``, per-site occupancy ``5 × 1 × (35)``.  ``grid_shape`` is ONLY a 2-D SCAN's
     points reshape -- it is NEVER applied to the DATA (the 35 sites read ``(35)``, not ``5×7``: that
     layout is the sitemap's display concern, #H3v-3).  Otherwise the raw numpy shape (``(35,)`` /
-    ``(96, 128)``) -- e.g. static ``centers`` (35, 2) carries no repeat axis."""
+    ``(96, 128)``)."""
     if value is None:
         return "—"
     shape = tuple(int(n) for n in np.shape(value))
@@ -180,15 +216,14 @@ def describe_shape(value, *, points_shape=None, data_shape=None, grid_shape=None
         return "scalar"
     ps = tuple(int(n) for n in (points_shape or ()))
     dsh = tuple(int(n) for n in (data_shape or ()))
-    if (points_shape is not None or data_shape is not None) and len(shape) >= 1 \
-            and tuple(shape[1:]) == ps + dsh:
+    if ps and dsh and len(shape) == 2 + len(dsh) \
+            and shape[1] == int(np.prod(ps, dtype=np.int64)) \
+            and tuple(shape[2:]) == dsh:
         gs = grid_for_points(grid_shape, ps)   # ONE rule: a grid shows only when it divides the points
-        dstr = "×".join(str(n) for n in dsh) or "1"
-        pstr = "×".join(str(n) for n in (gs or ps)) or "1"   # data_points ALWAYS shown (no-scan = 1)
-        return f"{shape[0]} × {pstr} × ({dstr})"              # repeat × data_points × (data)
-    if len(shape) == 1:                  # numpy 1-D repr keeps the trailing comma: (35,)
-        return f"({shape[0]},)"
-    return "(" + ", ".join(str(n) for n in shape) + ")"
+        return f"{shape[0]} × {format_dims(gs or ps)} × ({format_dims(dsh)})"   # R × P × data_shape
+    # Raw shape (schema unknown): the SAME ``×`` spelling as the contract form and the flow-graph
+    # labels -- never the numpy-tuple ``(96, 128)`` that made the same signal read two different ways.
+    return f"({format_dims(shape)})"
 
 
 class LogicNode:
@@ -217,20 +252,6 @@ class LogicNode:
     # declared name is a real attribute, so a declaration can never silently point at
     # nothing (the drift a private-name rename once caused).
     _devices: dict = {}
-    # UNIFORM measurement output contract (#H3n): an ACQUIRING node publishes its primary data block
-    # with shape ``(repeat, *points_shape, *data_shape)`` -- ``points_shape`` is the swept parameter
-    # space (a camera = ``(1,)``, a 1-D scan = ``(n_points,)``, a 2-D scan = ``(n0*n1,)``) and
-    # ``data_shape`` is the per-point data (a scan scalar = ``(dim,)``, a camera frame = ``(H, W)``).
-    # Defaults are empty (a processor / task publishes no such block); camera + scan nodes set them,
-    # and ``tests/test_measurement_output_contract.py`` MECHANICALLY enforces the published shape.
-    points_shape: tuple = ()
-    data_shape: tuple = ()
-    # The INTENDED 2-D display geometry of the points axis when it is a flattened grid -- a 2-D scan
-    # declares ``grid_shape=(n0, n1)`` (prod == points_shape[0]) so a 2-D panel can reshape the
-    # flattened points back into an image, since ``data_shape`` stays ``(1,)`` for a scan (#H3o).
-    # Empty for a camera (its image is in ``data_shape``) and a 1-D scan.
-    grid_shape: tuple = ()
-
     def __init__(self, hub: SignalHub, *, prefix: str = ""):
         self.hub = hub
         self.prefix = str(prefix)
@@ -271,6 +292,11 @@ class LogicNode:
         # scan, already in the data).  ``provenance_snapshot()`` returns this cached dict, computing +
         # caching it once on first read for a notebook ``step()`` loop that never called ``start()``.
         self._provenance: dict[str, object] | None = None
+        # Schemas installed by THIS instance.  Besides avoiding duplicate work,
+        # this is the ownership proof required for an explicit dynamic-layout
+        # replacement (for example a camera ROI or calibration-site change).
+        self._registered_output_schemas: dict[str, SignalSchema] = {}
+        self._registered_output_history: dict[str, int | None] = {}
 
     @property
     def display_label(self) -> str:
@@ -311,7 +337,7 @@ class LogicNode:
         if not values:
             return {}
         named = {self.prefix + key: value for key, value in values.items()}
-        self._configure_signal_storage(named.keys())
+        self._register_output_schemas(named)
         # Tag every signal of this shot with the SOURCE-shot id shot() set (mint for an acquiring node,
         # inherited for a reactive processor; None -> NO_LINEAGE for a free-running publish), so a derived
         # signal and the frame it came from share ONE id and the console can show them as one shot.  Clear
@@ -326,23 +352,111 @@ class LogicNode:
         # ``provenance_snapshot()`` (captured on first read, then cached), so this hot path stays clean.
         return named
 
-    def _configure_signal_storage(self, names) -> None:
-        """Apply per-signal hub storage declared by this node's SignalSpec.
+    @staticmethod
+    def _payload_dtype(value) -> np.dtype:
+        if isinstance(value, SignalTensor):
+            return value.data.dtype
+        if isinstance(value, TensorPatch):
+            return np.asarray(value.values).dtype
+        return np.asarray(value).dtype
 
-        The producer owns the data contract (including whether a signal is a
-        deep scalar history or a compact image stream).  The hub stays generic:
-        it merely enforces the requested ring depth for the names about to be
-        published.
+    def _register_output_schemas(self, values: Mapping[str, object]) -> None:
+        """Resolve ``SignalSpec`` and register every value before atomic publish.
+
+        A declaration may leave dtype unbound until hardware returns its first
+        value.  Structural changes are allowed only when this same node instance
+        installed the previous schema; the replacement starts a new hub schema
+        version and discards incompatible history.  Shape is never inferred from
+        ndarray rank.
         """
 
-        # LOUD by design: a node whose own output_specs() raises is a broken declaration -- swallowing
-        # it here silently downgraded image streams to the deep default ring (8 -> 2048 frames of
-        # 2.3 MP each), a multi-GiB failure mode far worse than the traceback.
+        # LOUD by design: swallowing output_specs errors once downgraded image
+        # streams to the deep default ring and consumed multiple GiB.
         specs = {str(spec.name): spec for spec in self.output_specs()}
-        for name in names:
-            spec = specs.get(str(name))
-            if spec is not None:
-                self.hub.configure_signal(str(name), history=spec.history)
+        missing = sorted(str(name) for name in values if str(name) not in specs)
+        if missing:
+            raise ValueError(
+                f"{type(self).__name__} has no SignalSpec for published signal(s) {missing}.")
+
+        for raw_name, payload in values.items():
+            name = str(raw_name)
+            spec = specs[name]
+            schema = spec.to_schema(dtype=self._payload_dtype(payload))
+            previous = self._registered_output_schemas.get(name)
+            try:
+                current = self.hub.schema(name)
+            except KeyError:
+                current = None
+
+            if previous is not None and previous.same_definition(schema):
+                if current is None or not current.same_definition(previous):
+                    raise RuntimeError(
+                        f"{type(self).__name__} lost ownership of unchanged schema {name!r}.")
+                if self._registered_output_history.get(name) != spec.history:
+                    self.hub.configure_signal(name, history=spec.history)
+                    self._registered_output_history[name] = spec.history
+                # Hot path: a scan may publish thousands of point patches.  Its
+                # immutable schema was registered once; avoid repeated hub locks
+                # and metadata fingerprints for every point.
+                continue
+
+            replace_schema = previous is not None and not previous.same_definition(schema)
+            if replace_schema:
+                if current is None or not current.same_definition(previous):
+                    raise RuntimeError(
+                        f"{type(self).__name__} cannot replace schema for {name!r}: the hub no "
+                        "longer carries the definition this node installed.")
+            elif current is not None and not current.same_definition(schema):
+                raise ValueError(
+                    f"signal {name!r} already has an incompatible schema from another "
+                    "producer; namespace one of the nodes instead of replacing it.")
+
+            self.hub.register_signal(
+                name,
+                schema,
+                history=spec.history,
+                replace=replace_schema,
+                initialize=isinstance(payload, TensorPatch),
+            )
+            self._registered_output_schemas[name] = schema
+            self._registered_output_history[name] = spec.history
+
+    def _inherit_output_schema_ownership(self, previous: "LogicNode") -> None:
+        """Transfer the schema proof for outputs retained by a rebuilt node instance.
+
+        A Task-console row may be stopped, rebuilt with different acquisition geometry, and
+        restarted under the SAME signal names.  The lingering hub schema belongs to that logical
+        row, but a fresh Python node has no local proof that it installed it; without an explicit
+        handoff its first changed-shape frame is correctly rejected as an attempted overwrite by an
+        unrelated producer.  Once ``previous`` is stopped, the row owner calls this method before
+        starting the replacement.  Only schemas that (a) were installed by ``previous``, (b) are
+        still byte-for-byte the hub's current definitions, and (c) remain declared by this node are
+        inherited.  The replacement can then use the normal ``replace=True`` path on its first
+        changed-shape publish, which atomically starts a new schema version and discards incompatible
+        history.  No canonical validation is bypassed and no unrelated producer can be adopted.
+        """
+
+        if previous is self:
+            return
+        if not isinstance(previous, LogicNode) or previous.hub is not self.hub:
+            raise ValueError("schema ownership can transfer only between LogicNodes on the same SignalHub.")
+        if previous.running:
+            raise RuntimeError("stop the previous LogicNode before transferring its output schemas.")
+
+        retained = {str(name) for name in self.published_signals()}
+        for name, schema in previous._registered_output_schemas.items():
+            if name not in retained:
+                continue
+            try:
+                current = self.hub.schema(name)
+            except KeyError:
+                continue
+            if not current.same_definition(schema):
+                raise RuntimeError(
+                    f"cannot transfer schema ownership for {name!r}: the hub no longer carries "
+                    "the definition installed by the previous node instance.")
+            self._registered_output_schemas[name] = schema
+            self._registered_output_history[name] = previous._registered_output_history.get(name)
 
     def start(self) -> "LogicNode":
         """Publish shots from a daemon thread AS FAST AS THE HARDWARE ALLOWS until ``stop()``.
@@ -724,8 +838,8 @@ class LogicNode:
 class Measurement(LogicNode):
     """A logic node that ACQUIRES data from devices and publishes named signals.
 
-    A Measurement OWNS the repeat axis: each concrete measurement FILLS a
-    ``(repeat, *points_shape, *data_shape)`` BLOCK every shot (the camera's depth-``repeat``
+    A Measurement OWNS the repeat axis: each concrete measurement FILLS a physical
+    ``(R,P,*data_shape)`` BLOCK every shot (the camera's depth-``repeat``
     ring, a scan's raw block) and publishes it whole.  It does NOT collapse the repeat axis --
     HOW the repeats are combined for viewing (average / add / roll / create) is the PLOT's
     ``repeat_mode`` (display-only), the SINGLE place a repeat axis is collapsed.  So there are
@@ -742,10 +856,6 @@ class Measurement(LogicNode):
         depth derives here -- camera and swept twins once retyped these two lines each."""
         self.repeat = max(0, int(repeat))
         self._ring = max(1, self.repeat)
-    # The published key that carries the (repeat,*points_shape,*data_shape) CONTRACT block.  Each
-    # concrete measurement sets it (camera -> "frame_0"; a scan -> its y_key) so the base can verify the
-    # block shape at publish time and the output-contract test can find it generically.
-    primary_signal: str = ""
 
     @property
     def ring_depth(self) -> int:
@@ -756,76 +866,35 @@ class Measurement(LogicNode):
         Resolved defensively: a subclass that forgot ``_ring``/``repeat`` still gets a sane 1."""
         return int(getattr(self, "_ring", 0)) or max(1, int(getattr(self, "repeat", 1)))
 
-    def _assert_primary_shape(self, out: dict) -> dict:
-        """Publish-time contract guard: the primary block MUST be ``(repeat, *points_shape, *data_shape)``.
-
-        A new measurement that mis-sizes its block (forgets the repeat axis, sets only one of
-        points/data shape, publishes an un-repeated 2-D array) fails LOUD here instead of silently
-        producing a wrong plot.  Returns ``out`` so a subclass can ``return self._assert_primary_shape(out)``."""
-
-        key = self.primary_signal
-        if key and key in out and out[key] is not None:
-            block = np.asarray(out[key])
-            # IRON-LAW guard: a measurement that publishes a primary block ALWAYS has the data_points
-            # axis -- a no-scan acquisition is exactly ONE point (points_shape=(1,)), never the empty ()
-            # that drops the axis.  Catch the omission LOUD here so a new measurement cannot silently
-            # publish a (repeat, *data) block missing data_points (the drift the iron law forbids).
-            if not tuple(self.points_shape):
-                raise ValueError(
-                    f"{type(self).__name__} publishes primary block {key!r} but points_shape is empty: every "
-                    "measurement block is (repeat, data_points, *data_dim) with the data_points axis PRESENT "
-                    "-- set points_shape=(1,) for a no-scan acquisition, or (n_points,) for a scan (#iron-law).")
-            # The block's first axis is the number of repeat slices that HOLD DATA so far: a block
-            # grows 1..ring as shots land (a producer never publishes NaN-padded not-yet-taken
-            # slices, so the block stays NATIVE dtype and only as large as the data that exists).
-            # ``ring`` = max(1, repeat) is the CAP (``repeat=0`` = ∞ keeps a 1-deep rolling ring).
-            ring = self.ring_depth
-            expected_tail = (*tuple(self.points_shape), *tuple(self.data_shape))
-            if block.shape[1:] != expected_tail or not 1 <= block.shape[0] <= ring:
-                raise ValueError(
-                    f"{type(self).__name__} primary block {key!r} has shape {block.shape}, but the "
-                    f"measurement output contract requires (filled, *points_shape, *data_shape) = "
-                    f"(1..{ring}, *{tuple(self.points_shape)}, *{tuple(self.data_shape)}) with the leading "
-                    "axis = repeat slices holding data (never NaN-padded); set points_shape/data_shape "
-                    "(and fill the ring axis) to match what you publish.")
-        return out
-
 
 class Processor(LogicNode):
     """A logic node that TRANSFORMS hub signals into derived signals (the "func" layer).
 
     It consumes one or more named signals, computes, and publishes -- with NO device
-    acquisition of its own.  REACTIVE: it only emits when a consumed signal advanced
-    since the last tick (tracked via the hub's per-signal version), so it runs as a
-    live graph node beside the measurement that produces its input, at its own poll
-    rate, and no-ops (``shot`` returns ``{}``) when there is nothing new.
+    acquisition of its own.  REACTIVE: construction opens one stateful Hub
+    subscription and every shot consumes at most one retained update.  A single
+    input is replayed in publication order; multiple inputs advance only at their
+    earliest shared provenance.  The Processor therefore never collapses a burst
+    to ``latest`` or assembles values from different acquisitions.  If its bounded
+    input journal is overrun, the Hub's ``SignalHistoryGap`` propagates loudly.
 
-    A processor is a PURE TYPED TRANSFORM with NO user-facing mode (that would be a third
-    repeat knob on top of the measurement's ``repeat`` (0 = ∞) and the plot's
-    ``repeat_mode`` -- the tangle we deliberately do not have).  Its relationship to the repeat
-    axis is a STATIC class fact, ``repeat_contract``, NOT a runtime knob and NEVER shown in a form:
-      * ``"reduce"`` (default, the common case): emits derived signals that carry NO repeat axis
-        (a per-shot judgement / a statistic over a shot set).  There is nothing left for the plot
-        to collapse, so it never collides with ``repeat_mode``.
-      * ``"preserve"``: maps each repeat slice 1:1 and emits a >=3-D block whose axis 0 IS the
-        repeat, so the SAME plot ``reduce_repeat`` machinery collapses it (a future per-slice
-        image filter -- no console instance yet).
-    Enforced by ``tests/test_processor_repeat_contract.py``."""
+    Every output independently declares its complete ``SignalSpec``.  Whether a
+    transform preserves or reduces an axis is therefore visible in the output
+    schema itself, not in a coarse node-level mode string."""
 
     layer = "processor"
     node_label = "processor"
     provides: tuple[str, ...] = ()
-    repeat_contract = "reduce"   # see class docstring; static, never a user knob
-    # Provenance inheritance (#shot-clock): a single-input processor inherits its input's source-shot id so
-    # its derived signals group with that frame.  With MULTIPLE inputs, by default the processor no-ops until
-    # they share one id (they are not one coherent shot); set True to instead fuse them at max(ids) -- only
-    # for a processor that deliberately combines several acquisitions into one derived result.
-    fuse_across_shots = False
-
     def __init__(self, hub: SignalHub, *, consumes, prefix: str = ""):
         super().__init__(hub, prefix=prefix)
         self.consumes = tuple(str(c) for c in consumes)
-        self._seen_version: dict[str, int] = {}
+        if not self.consumes:
+            raise ValueError(f"{type(self).__name__} requires at least one consumed signal.")
+        if len(set(self.consumes)) != len(self.consumes):
+            raise ValueError(
+                f"{type(self).__name__} consumes contains duplicate signal names: "
+                f"{self.consumes!r}.")
+        self._input_tensors: dict[str, SignalTensor] = {}
         # SELF-LOOP guard, at the base and at construction (the single source, covering the
         # console AND a bare notebook node).  A processor consuming its OWN published signal is
         # never meaningful: with no lingering value it silently starves forever (its input only
@@ -840,32 +909,77 @@ class Processor(LogicNode):
                 f"{sorted(own)} -- a self-feedback loop (silent starvation or a runaway "
                 "republish spiral).  Pick an upstream signal as the source instead.")
 
-    def new_inputs(self) -> dict[str, object] | None:
-        """Latest values of the consumed signals IF any advanced since last seen,
-        else None (so ``step`` no-ops this tick)."""
-        versions = self.hub.signal_versions()
-        if not any(versions.get(n, 0) > self._seen_version.get(n, 0) for n in self.consumes):
+        # Subscribe at construction, before this node can run.  Existing values
+        # define the starting boundary; every publication after that boundary is
+        # replayed exactly once.  Rebuilding a Processor intentionally starts a
+        # new subscription rather than re-processing an arbitrary old latest.
+        self._input_subscription = self.hub.signal_cursors(self.consumes)
+
+    def new_inputs(self) -> ProcessorSignalSnapshot | None:
+        """Consume the next exact retained input transaction, if one is ready.
+
+        ``None`` is only the ordinary reactive idle state.  A missing journal
+        entry, removed stream, or schema epoch change is not idle: the Hub raises
+        ``SignalHistoryGap`` and the LogicNode worker records it in ``last_error``.
+        """
+
+        update = self.hub.next_coherent_update(
+            self.consumes, self._input_subscription, timeout=0)
+        if update is None:
             return None
-        self._seen_version = {n: versions.get(n, 0) for n in self.consumes}
-        try:
-            inputs = {n: self.hub.latest(n) for n in self.consumes}
-        except KeyError:
-            return None
-        # INHERIT the consumed input's source-shot id so the derived signals (occupied / frame_judged)
-        # carry the SAME id as the frame they were computed from -> the console groups them into one
-        # display shot (#shot-clock).  Single input -> that id.  Multiple inputs from DIFFERENT shots are
-        # not one coherent acquisition -> no-op until they line up (or max-fuse if fuse_across_shots).
-        ids = {self.hub.latest_provenance(n) for n in self.consumes}
-        ids.discard(NO_LINEAGE)
-        if len(ids) == 1:
-            self._current_source_shot = next(iter(ids))
-        elif not ids:
-            self._current_source_shot = None                  # inputs carry no lineage -> derived is NO_LINEAGE too
-        elif self.fuse_across_shots:
-            self._current_source_shot = max(ids)
-        else:
-            return None                                       # different acquisitions -> wait for one coherent shot
-        return inputs
+        self._input_subscription = update.cursors
+        self._input_tensors = dict(update.tensors)
+        self._current_source_shot = (
+            None if update.provenance == NO_LINEAGE else int(update.provenance))
+        return ProcessorSignalSnapshot(
+            self._input_tensors, provenance=int(update.provenance))
+
+    def input_validity(self, physical_shape: tuple[int, int]) -> np.ndarray:
+        """Intersection of consumed ``(R,P)`` validity masks.
+
+        A transform may combine several signals only when their physical cells
+        align.  Mismatched masks are a schema/wiring error, never something to
+        broadcast or infer from ndarray dimensions.
+        """
+
+        expected = tuple(int(n) for n in physical_shape)
+        masks = []
+        for name in self.consumes:
+            tensor = self._input_tensors.get(name)
+            if tensor is None:
+                continue
+            if tuple(tensor.valid.shape) != expected:
+                raise ValueError(
+                    f"processor input {name!r} has R/P shape {tensor.valid.shape}, but the "
+                    f"transform result uses {expected}; preserve axes explicitly in the source expression.")
+            masks.append(tensor.valid)
+        if not masks:
+            return np.ones(expected, dtype=bool)
+        return np.logical_and.reduce(masks)
+
+    def input_repeat_capacity(self) -> int:
+        """Declared upstream repeat capacity for shape-preserving outputs."""
+
+        capacities = {
+            int(tensor.schema.repeat_capacity or tensor.data.shape[0])
+            for tensor in self._input_tensors.values()
+        }
+        if len(capacities) > 1:
+            raise ValueError(
+                f"processor inputs have incompatible repeat capacities {sorted(capacities)}.")
+        return next(iter(capacities), 1)
+
+    def input_point_shape(self, point_count: int) -> tuple[int, ...]:
+        """Logical point geometry shared by all consumed tensors."""
+
+        shapes = {tuple(tensor.schema.point_shape) for tensor in self._input_tensors.values()}
+        if len(shapes) > 1:
+            raise ValueError(f"processor inputs have incompatible point shapes {sorted(shapes)}.")
+        shape = next(iter(shapes), (int(point_count),))
+        if int(np.prod(shape, dtype=np.int64)) != int(point_count):
+            raise ValueError(
+                f"processor input point_shape {shape} does not flatten to physical P={point_count}.")
+        return shape
 
     def transform(self, inputs: dict[str, object]) -> dict[str, object]:  # pragma: no cover - abstract
         raise NotImplementedError
@@ -900,26 +1014,15 @@ class OccupancyProcessor(Processor):
     centers + per-site thresholds) comes from a prior calibrate-readout Task, exactly
     as on real hardware.
 
-    ``repeat_contract == "preserve"`` (#H3q): the repeat axis flows THROUGH the processor, and so
-    does the UNIFORM ``(repeat, data_points, *data_dim)`` shape -- occupancy judges ONE readout per
-    shot (no parameter sweep), so data_points = 1, the SAME single-point axis the camera frame carries.
-    Fed the camera's ``(repeat, 1, H, W)`` block it judges every slice and publishes ``occupied`` /
-    ``counts`` as ``(repeat, 1, n_sites)`` (points_shape=(1,), data_shape=(n_sites,)) and
-    ``frame_judged`` as the SAME ``(repeat, 1, H, W)`` it was fed (a frame keeps ONE shape raw or
-    judged).  Each repeat-collapse is STRUCTURE-driven, not an ndim guess: the signal's declared
-    ``core_ndim = len(points)+len(data)`` tells the plot that axis 0 is the repeat
-    (``ndim == 1 + core_ndim``), so a sites/2d panel with ``repeat_mode=average`` over ``occupied``
-    averages ``(repeat, 1, n_sites) -> (1, n_sites) -> (n_sites,)`` = the per-site LOADING PROBABILITY
-    (averaging N shots recovers every ~50%-loaded site) -- ONE mechanism (the plot's repeat collapse),
-    not a private in-node accumulator.  The user sets
-    how many shots to average via the camera's ``repeat``.  ``centers`` (N, 2) and
-    ``thresholds`` (N,) are STATIC calibration geometry -- they declare NO contract slot (their
-    SignalSpec leaves points/data ``None``), so they print their raw shape and carry no repeat
-    axis a consumer could mistake for one."""
+    It preserves every valid physical ``(R,P)`` input cell and the canonical
+    ``(R,P,*data_shape)`` layout.  Camera ``data_shape=(H,W)`` becomes occupancy/count/rate
+    ``data_shape=(N,)``, ``(N,)``, and ``(1,)``; ``frame_judged`` retains ``(H,W)``.
+    Logical multi-dimensional point geometry is carried by SignalSchema and only
+    flattened on the physical P axis.  Static calibration geometry is still a
+    physical tensor with no scan: centers ``(1,1,N,2)`` and thresholds
+    ``(1,1,N)``.  Site is data, never a sampling-point axis."""
 
     node_label = "occupancy"
-    repeat_contract = "preserve"        # judges each repeat slice -> a clean (repeat, n_sites) block
-    points_shape: tuple = ()            # one frame per shot sweeps no parameter (n_sites is the data)
     # ``frame_judged`` = the EXACT block this occupancy was computed from, republished so
     # the site map's underlay is the SAME shots as the rings (the camera keeps streaming
     # newer frames on its own thread; using the live camera frame would offset the rings).
@@ -967,12 +1070,17 @@ class OccupancyProcessor(Processor):
         # time: one calibration carries every method's geometry + thresholds, and the
         # processor picks which to read with (None = the calibration's default).
         self.method = None if method in (None, "") else str(method)
-        # The per-site DATA width -- set on the first judged block so structure_provider can
-        # drive the plot's reshape (the (repeat, n_sites) contract).  () until the first shot.
-        self.data_shape: tuple = ()
-        # The judged frame's (H, W) -- the data_shape of the ``frame_judged`` signal's per-signal
-        # structure, set on the first judged block (() until then).
-        self.frame_shape: tuple = ()
+        # Dynamic dimensions are owned by this producer instance.  The calibration
+        # usually supplies N/H/W immediately; the first valid input binds anything
+        # not known at construction before the hub sees a publication.
+        centers = np.asarray(getattr(calibration, "centers", ()))
+        n_sites = int(centers.shape[0]) if centers.ndim == 2 and centers.shape[1:] == (2,) else 1
+        image_shape = tuple(int(n) for n in (getattr(calibration, "metadata", {}) or {}).get(
+            "image_shape", ()))
+        self._point_shape: tuple[int, ...] = (1,)
+        self._site_shape: tuple[int, ...] = (max(1, n_sites),)
+        self._frame_shape: tuple[int, ...] = image_shape if len(image_shape) == 2 else (1, 1)
+        self._output_repeat_capacity = 1
 
     def _resolve_calibration(self):
         if self.calibration is None and self.calibration_source is not None:
@@ -982,118 +1090,124 @@ class OccupancyProcessor(Processor):
     def transform(self, inputs: dict[str, object]) -> dict[str, object]:
         calibration = self._resolve_calibration()
         if calibration is None:
-            return {}                                       # not calibrated yet -> no-op (non-blocking)
-        # The frame to judge = the source expression over the consumed signals (default
-        # ``value = signal`` on one input IS that frame; an expression may combine several,
-        # e.g. ``value = (signal[0] + signal[1]) / 2``).  The value must be ONE (H×W) frame.
-        # The namespace = this tick's COHERENT inputs + the shared helpers (hub_namespace layers
-        # np/numpy/math/history/... on the snapshot), so a processor source expression has the
-        # SAME capabilities SIGNAL_EXPR_HELP promises every source field (panel == node).
-        try:
-            value = np.asarray(self.source_expr.evaluate(hub_namespace(self.hub, inputs)))
-        except Exception:
-            return {}                                       # malformed expression -> no-op (don't wedge)
-        # Normalize whatever the source expression yields to a (repeat, 1, H, W) BLOCK -- the camera's
-        # own ``(repeat,1,H,W)`` block, a bare ``(H,W)`` frame, or a ``(repeat,H,W)`` stack all become
-        # one uniform block.  Occupancy is then judged PER repeat slice so the repeat axis flows
-        # THROUGH the node (repeat_contract='preserve'): a sites/2d panel's repeat_mode=average over
-        # ``occupied`` IS the per-site loading probability (averaging N shots recovers every site).
-        if value.ndim == 2:
-            block = value[None, None]                       # (1, 1, H, W)
-        elif value.ndim == 3:
-            block = value[:, None]                          # (repeat, H, W) -> (repeat, 1, H, W)
-        elif value.ndim == 4:
-            block = value
-        else:
-            return {}                                       # not an image / image block -> no-op
+            return {}
+        block = np.asarray(self.source_expr.evaluate(hub_namespace(self.hub, inputs)))
+        if block.ndim != 4:
+            raise ValueError(
+                f"occupancy source must preserve canonical (R,P,*data_shape) axes with "
+                f"data_shape=(H,W); got {block.shape}.  "
+                "Indexing away R/P in a signal expression is not allowed.")
 
-        occ_rows: list = []
-        cnt_rows: list = []
-        n_sites = None
+        repeats, points, height, width = (int(n) for n in block.shape)
+        valid = self.input_validity((repeats, points))
+        if not np.any(valid):
+            return {}
+
+        centers = np.asarray(calibration.centers, dtype=float)
+        if centers.ndim != 2 or centers.shape[1:] != (2,) or centers.shape[0] < 1:
+            raise ValueError(
+                f"occupancy calibration centers must have shape (N,2), got {centers.shape}.")
+        n_sites = int(centers.shape[0])
+        occupied = np.full((repeats, points, n_sites), np.nan, dtype=float)
+        counts = np.full_like(occupied, np.nan)
         thresholds = None
-        centers = None
-        for r in range(int(block.shape[0])):
-            img = np.asarray(block[r, 0], dtype=float)
-            if not np.isfinite(img).any():
-                occ_rows.append(None); cnt_rows.append(None); continue   # unfilled ring slice
-            try:
-                detection = calibration.detect(img, method=self.method)  # the single readout contract
-            except ValueError as exc:
-                # The loaded calibration does not fit this frame (e.g. a calibration.json from a
-                # different camera ROI/shape, or one that lacks the chosen readout method).  Try the
-                # live SESSION calibration (built from THIS camera, so it matches); if there is none
-                # that fits, RAISE a clear text error -- the node surfaces it like a signal-size
-                # mismatch (red node-error banner) instead of silently producing no data forever.
-                fallback = self.session_calibration() if callable(self.session_calibration) else None
-                if fallback is None or fallback is calibration:
+
+        for repeat_index in range(repeats):
+            for point_index in range(points):
+                if not valid[repeat_index, point_index]:
+                    continue
+                image = np.asarray(block[repeat_index, point_index], dtype=float)
+                try:
+                    detection = calibration.detect(image, method=self.method)
+                except ValueError as exc:
+                    fallback = self.session_calibration() if callable(self.session_calibration) else None
+                    if fallback is None or fallback is calibration:
+                        raise ValueError(
+                            f"Judge occupancy: the loaded calibration does not fit this frame "
+                            f"(frame {image.shape}, method {self.method or 'default'}): {exc}.  "
+                            "Recalibrate for this camera or select the matching calibration.") from exc
+                    detection = fallback.detect(image, method=self.method)
+                    self.calibration = calibration = fallback
+                    centers = np.asarray(calibration.centers, dtype=float)
+                    if centers.shape != (n_sites, 2):
+                        raise ValueError(
+                            "fallback calibration changes the site count within one tensor update; "
+                            "restart the processor so the schema change is explicit.")
+
+                occ = np.asarray(detection.occupied, dtype=float).reshape(-1)
+                cnt = np.asarray(detection.counts, dtype=float).reshape(-1)
+                thr = np.asarray(detection.thresholds, dtype=float).reshape(-1)
+                if occ.shape != (n_sites,) or cnt.shape != (n_sites,) or thr.shape != (n_sites,):
                     raise ValueError(
-                        f"Judge occupancy: the loaded calibration does not fit this frame "
-                        f"(frame {img.shape}, method {self.method or 'default'}): {exc}.  It is likely "
-                        f"a calibration for a different camera ROI/shape or missing this method -- "
-                        f"recalibrate for THIS camera, or pick the matching calibration file.") from exc
-                detection = fallback.detect(img, method=self.method)
-                self.calibration = calibration = fallback     # adopt the matching one for next shots
-            occ_rows.append(np.asarray(detection.occupied, dtype=float).reshape(-1))
-            cnt_rows.append(np.asarray(detection.counts, dtype=float).reshape(-1))
-            n_sites = occ_rows[-1].size
-            thresholds = np.asarray(detection.thresholds, dtype=float).reshape(-1)
-            centers = np.asarray(calibration.centers, dtype=float)
-        if n_sites is None:
-            return {}                                       # no filled slice judged this tick -> no-op
-        nan = np.full(int(n_sites), np.nan)
-        # Every per-shot BLOCK obeys the UNIFORM contract (repeat, data_points, *data_dim): occupancy
-        # judges ONE readout per shot (no parameter sweep), so data_points = 1 -- the SAME single-point
-        # axis the camera frame carries.  occupied/counts are (repeat, 1, n_sites); frame_judged is the
-        # camera block (repeat, 1, H, W) unchanged.  This middle 1 is NEVER dropped: a frame keeps one
-        # shape raw or judged, and occupancy/sites/scan/camera all read as (repeat, points, data).
-        # unfilled slices are NaN so the plot's nanmean ignores them.
-        occupied = np.stack([o if o is not None else nan for o in occ_rows], axis=0)[:, None, :]
-        counts = np.stack([c if c is not None else nan for c in cnt_rows], axis=0)[:, None, :]
-        self.data_shape = (int(n_sites),)                   # the per-site DATA width (points axis is the (1,))
-        self.frame_shape = (int(block.shape[2]), int(block.shape[3]))   # (H, W) of frame_judged
+                        "calibration.detect returned a site vector inconsistent with centers: "
+                        f"occupied={occ.shape}, counts={cnt.shape}, thresholds={thr.shape}, N={n_sites}.")
+                occupied[repeat_index, point_index] = occ
+                counts[repeat_index, point_index] = cnt
+                thresholds = thr
+
+        if thresholds is None:
+            return {}
+        finite = np.isfinite(occupied)
+        denominator = np.sum(finite, axis=-1, keepdims=True)
+        rate = np.divide(
+            np.nansum(occupied, axis=-1, keepdims=True),
+            denominator,
+            out=np.full((repeats, points, 1), np.nan, dtype=float),
+            where=denominator > 0,
+        )
+
+        self._point_shape = self.input_point_shape(points)
+        self._site_shape = (n_sites,)
+        self._frame_shape = (height, width)
+        self._output_repeat_capacity = self.input_repeat_capacity()
+        specs = {spec.name: spec for spec in self._bare_output_specs()}
+
+        def tensor(name: str, data: np.ndarray, mask: np.ndarray) -> SignalTensor:
+            schema = specs[name].to_schema(dtype=data.dtype)
+            return SignalTensor(data, schema, valid=mask)
+
+        static_valid = np.ones((1, 1), dtype=bool)
         return {
-            "occupied": occupied,                           # (repeat, 1, n_sites) per-shot occupancy
-            "counts": counts,                               # (repeat, 1, n_sites) per-shot readout signal
-            "rate": float(np.nanmean(occupied)),            # per-cycle loading fraction (derived scalar, no repeat)
-            "centers": centers,                             # (N, 2) static site geometry -- no repeat axis
-            "thresholds": thresholds,                       # (N,) calibration constant -- no repeat axis
-            # the judged BLOCK, published ATOMICALLY with the occupancy -> the site map's underlay +
-            # rings are always the SAME shots (the site-map path reduces it to one (H,W) underlay).
-            "frame_judged": block,                          # (repeat, 1, H, W) -- the SAME single-point frame
+            "occupied": tensor("occupied", occupied, valid),
+            "counts": tensor("counts", counts, valid),
+            "rate": tensor("rate", rate, valid),
+            "centers": tensor("centers", centers.reshape(1, 1, n_sites, 2), static_valid),
+            "thresholds": tensor(
+                "thresholds", thresholds.reshape(1, 1, n_sites), static_valid),
+            "frame_judged": tensor("frame_judged", block, valid),
         }
 
     def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
-        """Label + meaning of each detection signal (the readout pipeline's outputs), each with its
-        OWN repeat-contract structure (#H3s-F3) -- so a consumer reads each signal's points/data slot,
-        not one node-level triple that can only be right for one of them:
-
-          * ``occupied`` / ``counts`` -- ``(repeat, 1, n_sites)``: points=(1,), data=(n_sites,) (core_ndim 2)
-            -- one judged readout per shot (data_points=1, never dropped), n_sites per point.
-          * ``frame_judged`` -- ``(repeat, 1, H, W)``: points=(1,), data=(H, W) (core_ndim 3) -- the SAME
-            shape the camera frame carries (a frame keeps ONE shape raw or judged).
-          * ``rate`` -- a per-cycle loading fraction, a DERIVED SCALAR (already reduced over the block),
-            NOT a per-shot block: points/data ``None`` (no repeat contract), consumed by a rolling monitor.
-          * ``centers`` / ``thresholds`` -- STATIC geometry with NO repeat axis: they leave points/data
-            ``None`` (no contract slot), so a consumer prints their raw shape ``(N, 2)`` / ``(N,)``."""
-        # (n_sites,) / (H, W) once judged, else None -- BEFORE the first judge the data width is unknown,
-        # so the signal declares NO contract slot yet (None, not the illegal empty ()); once judged it is
-        # the uniform (repeat, 1, *data) block.  points_shape pairs with data_shape: both known or both None.
-        # BARE names throughout -- the base's output_specs applies the one prefix rule.
-        sites = tuple(self.data_shape) if self.data_shape else None
-        frame = tuple(self.frame_shape) if self.frame_shape else None
+        """Complete typed schemas for every occupancy output."""
+        sites = self._site_shape
+        frame = self._frame_shape
+        points = self._point_shape
+        repeat_capacity = self._output_repeat_capacity
         return (
-            SignalSpec("occupied", "occupancy", "", "per-site per-shot occupancy (0 / 1); average = loading probability",
-                       points_shape=((1,) if sites else None), data_shape=sites),
-            SignalSpec("counts", "readout counts", "", "per-site per-shot integrated readout signal",
-                       points_shape=((1,) if sites else None), data_shape=sites),
-            SignalSpec("rate", "loading rate", "", "loading fraction of this block (scalar) -> rolling-trace monitor / scan y"),
-            SignalSpec("centers", "site centre", "px", "site centres in camera pixels (N, 2)"),
-            SignalSpec("thresholds", "threshold", "counts", "per-site bright/dark count threshold"),
+            SignalSpec("occupied", "occupancy", "",
+                       "per-site occupancy (0/1) for every valid repeat/point cell",
+                       points_shape=points, data_shape=sites, dtype=np.float64,
+                       repeat_capacity=repeat_capacity),
+            SignalSpec("counts", "readout counts", "",
+                       "per-site integrated readout signal for every valid repeat/point cell",
+                       points_shape=points, data_shape=sites, dtype=np.float64,
+                       repeat_capacity=repeat_capacity),
+            SignalSpec("rate", "loading rate", "",
+                       "per-cell mean occupancy across sites",
+                       points_shape=points, data_shape=(1,), dtype=np.float64,
+                       repeat_capacity=repeat_capacity),
+            SignalSpec("centers", "site centre", "px", "site centres in camera pixels",
+                       points_shape=(1,), data_shape=(*sites, 2), dtype=np.float64,
+                       repeat_capacity=1),
+            SignalSpec("thresholds", "threshold", "counts", "per-site bright/dark threshold",
+                       points_shape=(1,), data_shape=sites, dtype=np.float64,
+                       repeat_capacity=1),
             SignalSpec("frame_judged", "camera image", "counts",
                        "the EXACT frame this occupancy was judged from -- shot-locked to occupied/centers "
                        "(one atomic publish).  Use THIS for a 2D readout image that matches the site map "
                        "(same shot); the camera's live `frame` advances independently and is NOT shot-locked.",
-                       points_shape=((1,) if frame else None), data_shape=frame,
+                       points_shape=points, data_shape=frame,
+                       repeat_capacity=repeat_capacity,
                        history=IMAGE_STREAM_HISTORY),
         )
 
@@ -1110,22 +1224,54 @@ class TaskOutput:
     The console reads ``latest`` / ``version`` to render the task's dedicated panel; a
     textual stage is surfaced via the numeric ``progress`` 0..1."""
 
-    def __init__(self, *, prefix: str = ""):
+    def __init__(self, *, prefix: str = "", spec_provider=None):
         self.prefix = str(prefix)
         self.progress = 0.0
         self._latest: dict[str, object] = {}
+        self._tensors: dict[str, SignalTensor] = {}
+        self._schemas: dict[str, SignalSchema] = {}
+        self._spec_provider = spec_provider
         self._version = 0
 
     def publish(self, **signals) -> None:
-        if "progress" in signals:
-            self.progress = float(signals["progress"])
-        # buffer (task-local, so raw names -- no prefix collision to guard against)
-        self._latest.update({str(key): value for key, value in signals.items()})
+        # Human stage text is control-plane status for the task banner, not an
+        # object-dtype signal.  Keep latest("stage") for the banner API.
+        if "stage" in signals:
+            self._latest["stage"] = str(signals.pop("stage"))
+
+        specs = ({str(spec.name): spec for spec in self._spec_provider()}
+                 if callable(self._spec_provider) else {})
+        for raw_key, value in signals.items():
+            key = str(raw_key)
+            spec = specs.get(key)
+            if spec is None:
+                raise ValueError(f"TaskOutput has no SignalSpec for numeric output {key!r}.")
+            dtype = value.data.dtype if isinstance(value, SignalTensor) else np.asarray(value).dtype
+            schema = spec.to_schema(dtype=dtype)
+            tensor = value if isinstance(value, SignalTensor) else SignalTensor.from_value(value, schema)
+            schema.assert_compatible(tensor.schema, check_repeat=True)
+            self._schemas[key] = schema
+            self._tensors[key] = tensor
+            self._latest[key] = tensor.data.copy()
+            if key == "progress":
+                self.progress = float(tensor.data[0, 0, 0])
         self._version += 1
 
     def latest(self, name: str):
         """The most recent value buffered under ``name`` (or ``None``)."""
         return self._latest.get(str(name))
+
+    def latest_tensor(self, name: str) -> SignalTensor:
+        try:
+            return self._tensors[str(name)]
+        except KeyError as exc:
+            raise KeyError(f"no numeric task output {name!r}") from exc
+
+    def schema(self, name: str) -> SignalSchema:
+        try:
+            return self._schemas[str(name)]
+        except KeyError as exc:
+            raise KeyError(f"no task output schema {name!r}") from exc
 
     def names(self) -> list:
         """Names buffered so far (the task's declared ``mid_run`` keys as they arrive)."""
@@ -1211,7 +1357,7 @@ class Task(OneShotNode):
         super().__init__(hub, prefix=prefix)
         # Mid-run output is a per-task BUFFER (NOT the hub) -- created up front so the
         # console can bind the task's dedicated panel to it before/while it runs.
-        self.output = TaskOutput(prefix=self.prefix)
+        self.output = TaskOutput(prefix=self.prefix, spec_provider=self._bare_output_specs)
 
     def run(self, out: "TaskOutput") -> dict:  # pragma: no cover - abstract
         raise NotImplementedError
@@ -1254,8 +1400,8 @@ class CalibrateReadoutTask(Task):
     # long-short-long bracket (3 emCCD frames in one cooling cycle), not a single window the
     # task secretly unrolls.  A bare name resolves to the shipped ``pulses/`` template; an
     # absolute path to the user's own PulseTableState .json.  Each cali pass LOADS it and sets
-    # ONLY the two exposures BY NAME -- API slot a1 = the long reference frame(s), a2 = the
-    # short readout -- so what is fired == the template file.  The cali does not choose a
+    # ONLY the three exposure cells BY NAME -- API slots a1/a3 receive the long reference value,
+    # and a2 receives the short readout value -- so what is fired == the template file.  The cali does not choose a
     # readout METHOD: it computes ALL methods (box / per-site PSF / uniform PSF) and the
     # OccupancyProcessor picks one.
     # The ONE canonical default imaging-template path (the cali task spec + the generic
@@ -1280,13 +1426,39 @@ class CalibrateReadoutTask(Task):
 
     def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
         """What the calibration PRODUCES (off the hub) + streams mid-run -- keyed by the
-        bare ``provides`` / ``mid_run`` names so the console legend reads e.g.
-        ``centers (result)  (35, 2)  fitted site coordinates``."""
+        bare ``provides`` / ``mid_run`` names."""
+        if str(getattr(self, "source", "")) == "saved frames":
+            # The selected run, not the connected camera, owns the saved-frame schema.  RunIndex
+            # reads this shape while indexing paths, before TaskOutput registers its immutable
+            # signal contract, so a 96x128 run cannot be mislabeled as the live camera's 48x60.
+            frame_shape = tuple(int(n) for n in self._index_saved_run().image_shape)
+        else:
+            frame_shape = tuple(int(n) for n in (
+                getattr(getattr(self, "camera", None), "frame_shape", ()) or ()))
+        if len(frame_shape) != 2 or any(n < 1 for n in frame_shape):
+            frame_shape = (1, 1)
+        grid = tuple(int(n) for n in getattr(self, "grid_shape", (1, 1)))
+        n_sites = max(1, int(np.prod(grid, dtype=np.int64)))
         return (
-            SignalSpec("frame", "reference frame", "counts", "long-exposure template frame (streamed live)"),
-            SignalSpec("centers", "site centres", "px", "fitted site coordinates (N, 2)"),
-            SignalSpec("thresholds", "threshold", "counts", "per-site bright/dark count threshold (N,)"),
-            SignalSpec("n_sites", "site count", "", "number of trap sites found"),
+            SignalSpec(
+                "frame", "reference frame", "counts",
+                "long-exposure template frame (streamed live)",
+                points_shape=(1,), data_shape=frame_shape,
+                repeat_capacity=1, history=IMAGE_STREAM_HISTORY),
+            SignalSpec(
+                "progress", "progress", "", "task completion fraction",
+                dtype=np.float64, repeat_capacity=1),
+            SignalSpec(
+                "centers", "site centres", "px", "fitted site coordinates",
+                points_shape=(1,), data_shape=(n_sites, 2),
+                dtype=np.float64, repeat_capacity=1),
+            SignalSpec(
+                "thresholds", "threshold", "counts", "per-site bright/dark threshold",
+                points_shape=(1,), data_shape=(n_sites,),
+                dtype=np.float64, repeat_capacity=1),
+            SignalSpec(
+                "n_sites", "site count", "", "number of trap sites found",
+                dtype=np.float64, repeat_capacity=1),
         )
 
     def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
@@ -1521,8 +1693,9 @@ class CalibrateReadoutTask(Task):
         from ..devices.camera_trigger import resolve_camera_trigger_channels
         # WHICH line gates a frame is the CAMERA's knowledge (it is wired to it), not the sequencer's
         # -- resolved through the one camera->channels rule (never a re-spelled fallback).
-        trig = [c for c in resolve_camera_trigger_channels(self.camera) if c in state.channels]
-        bits = [state.channels.index(c) for c in trig]
+        raw_lanes = state.port_catalog.raw_lanes
+        trig = [c for c in resolve_camera_trigger_channels(self.camera) if c in raw_lanes]
+        bits = [raw_lanes.index(c) for c in trig]
         frame_periods = [i for i, p in enumerate(state.periods) if any(p.states[b] for b in bits)]
         if len(frame_periods) < 2:
             raise ValueError(
@@ -1545,8 +1718,9 @@ class CalibrateReadoutTask(Task):
         # The imaging template IS the long-short-long bracket: ONE cooling/load cycle, then the
         # camera-trigger frames back-to-back with trap-held gaps (no re-cooling between them, so
         # the long frames bracket and label the SAME atoms).  The cali ONLY sets the exposures
-        # BY NAME -- api slot a1 = the long reference frame(s), a2 = the short readout -- so
-        # editing reference_exposure/readout_exposure changes those durations and NOTHING else.
+        # BY NAME -- each exposure cell has its own unique handle: a1 = first long reference,
+        # a2 = short readout, a3 = second long reference.  The two reference handles receive the
+        # same configured value; editing either exposure setting changes only those durations.
         # What is fired == the template the operator chose: file == fired.
         template = self._resolve_template(self.pulse_template, self.sequencer)
         try:
@@ -1776,16 +1950,18 @@ class CameraMeasurement(Measurement):
         self.camera = camera
         self.sequencer = sequencer
         self.frames_per_cycle = max(1, int(frames_per_cycle))
-        self.points_shape: tuple = (1,)                  # one frame = one data point (no swept param)
-        self.primary_signal = FRAME_0                    # event 0's (repeat,1,H,W) block (#H3r-F4)
         # Declare (H, W) at BUILD time from the camera's own contract (``frame_shape`` = ROI else full
         # sensor): the node's structure must be TRUE the moment it is built, not after the first frame
         # -- a restarted measurement whose trigger is not firing yet (e.g. right after a calibration
         # task parked the sequencer on a finished finite program) would otherwise declare data_shape=()
         # and every 2-D panel bound to frame_0 would refuse the hub's perfectly good lingering block.
-        # A backend that honestly does not know its shape yet gives None -> () -> the first frame still
-        # teaches it (the ROI-change correction in shot() below stays the one re-learn path).
-        self.data_shape: tuple = tuple(camera.frame_shape or ())
+        # A camera driver must expose this before acquisition: without it a producer cannot register a
+        # truthful schema and consumers cannot allocate safely while waiting for the first trigger.
+        self._frame_shape: tuple[int, int] = tuple(int(n) for n in (camera.frame_shape or ()))
+        if len(self._frame_shape) != 2 or any(n < 1 for n in self._frame_shape):
+            raise ValueError(
+                f"{type(camera).__name__}.frame_shape must declare positive (H, W) before "
+                f"CameraMeasurement is built; got {camera.frame_shape!r}.")
         self._rings = None                               # list of N (ring,1,H,W) blocks; None until 1st frame
         self.set_repeat(repeat)
 
@@ -1832,16 +2008,16 @@ class CameraMeasurement(Measurement):
         n = len(frames)
         f0 = frames[0]
         if self.repeat <= 0:
-            self.data_shape = tuple(f0.shape)            # (H, W) -- the per-point DATA shape
+            self._frame_shape = tuple(f0.shape)          # an explicit ROI/schema-version change
             keys = camera_frame_keys(n)
             out = {keys[i]: np.asarray(fi)[None, None] for i, fi in enumerate(frames)}
             self._filled += 1
-            return self._assert_primary_shape(out)       # frame_0 == (1, 1, H, W) -- contract guard
+            return self._assert_declared(out, self._bare_published_signals())
 
-        if (self._rings is None or len(self._rings) != n or self.data_shape != f0.shape
+        if (self._rings is None or len(self._rings) != n or self._frame_shape != f0.shape
                 or self._rings[0].dtype != f0.dtype):
-            self.data_shape = tuple(f0.shape)            # (H, W) -- the per-point DATA shape
-            self._rings = [np.zeros((self._ring, 1, *self.data_shape), dtype=f0.dtype)
+            self._frame_shape = tuple(f0.shape)          # an explicit ROI/schema-version change
+            self._rings = [np.zeros((self._ring, 1, *self._frame_shape), dtype=f0.dtype)
                            for _ in range(n)]            # ONE repeat block per emCCD event of the cycle
             self._filled = 0
         out: dict[str, object] = {}
@@ -1858,7 +2034,7 @@ class CameraMeasurement(Measurement):
         self._filled = filled_after
         if self.finished:                                # take exactly K cycles, then stop
             self._stop.set()
-        return self._assert_primary_shape(out)           # frame_0 == (repeat, 1, H, W) -- contract guard
+        return self._assert_declared(out, self._bare_published_signals())
 
     def _bare_published_signals(self) -> frozenset:
         # ONE block per emCCD event; no lumped `frame`.  Same source as the console's declared picker.
@@ -1874,8 +2050,12 @@ class CameraMeasurement(Measurement):
             desc = (f"emCCD event {i} of the cycle: (repeat, 1, H, W) block -- plot reduces repeats "
                     f"(average = long exposure of event {i}).  LIVE camera, advances independently of the "
                     "readout: for a 2D image shot-locked to the site map, bind Judge-occupancy `frame_judged`.")
-            specs.append(SignalSpec(bare, "camera image", "counts", desc,
-                                    history=IMAGE_STREAM_HISTORY))
+            specs.append(SignalSpec(
+                bare, "camera image", "counts", desc,
+                points_shape=(1,), data_shape=self._frame_shape,
+                repeat_capacity=self.ring_depth,
+                history=IMAGE_STREAM_HISTORY,
+            ))
         return tuple(specs)
 
     def acquisition_parameters(self) -> dict[str, object]:
@@ -1944,10 +2124,10 @@ class CameraMeasurement(Measurement):
 class _SweptBlockMeasurement(Measurement):
     """Shared swept-block ring contract for EVERY scan node (#E4).
 
-    A scan node fills a RAW ``(repeat, *points_shape, *data_shape)`` block point-by-point and
-    publishes it WHOLE -- the node never combines the repeats; the PLOT reduces the repeat axis per
-    its ``repeat_mode``.  ONE knob ``repeat``: 0 = ∞ (roll a 1-deep ring forever, a live scan showing
-    the latest sweep); K = keep K whole passes (averageable) then STOP.  A subclass sets the swept x
+    A scan node fills a physical ``(R,P,*data_shape)`` tensor point-by-point.
+    It publishes one :class:`TensorPatch` per new point, so a P-point scan stores O(P*D)
+    payload instead of P cumulative O(P*D) snapshots.  ONE knob ``repeat``: 0 = ∞
+    (roll a 1-deep ring forever); K = keep K passes then STOP.  A subclass sets the swept x
     values + per-point data width once via :meth:`_init_swept_block`, implements only its per-point
     body (calling :meth:`_fill_point`), and reuses the ring state / progress properties / publish /
     finite-scan stop here -- so neither twin (a :class:`ScannedMeasurement` driver or a
@@ -1965,50 +2145,48 @@ class _SweptBlockMeasurement(Measurement):
         """Full hub name of the swept y block -- ALWAYS ``prefix + y_key`` (see ``x_signal``)."""
         return self.prefix + self.y_key
 
-    def _init_swept_block(self, *, values, data_shape: tuple, repeat: int) -> None:
+    def _init_swept_block(self, *, values, data_shape: tuple, repeat: int,
+                          point_shape: tuple | None = None) -> None:
         """Set up the swept x values + the pre-allocated RAW block.  ``repeat`` (0 = ∞) fixes the ring
-        depth; ``data_shape`` is the per-point data (``(n_series,)`` for a reducer curve, ``(1,)`` for
-        a scalar).  Requires ``x_key``/``y_key`` already set: the node's short label derives here
+        depth; ``data_shape`` is the complete per-point data tensor (``(1,)`` for a scalar).
+        Requires ``x_key``/``y_key`` already set: the node's short label derives here
         (the instance prefix stem, else the y key) so neither twin retypes the fallback."""
         self.node_label = str(self.prefix).rstrip("_") or str(self.y_key)
-        # The RAW y block is THE contract's primary-shape signal -- set here (not per twin) so a new
-        # swept node can never forget it and silently lose the (ring, *points, *data) publish guard
-        # (``_assert_primary_shape`` no-ops when ``primary_signal`` is falsy).
-        self.primary_signal = self.y_key
         self._set_repeat_ring(repeat)                 # block depth: K passes for finite, 1 (rolling) for INF
         self._index = 0                               # within-pass point index (0..n_points-1)
         self._pass = 0                                # 0-based pass currently being filled
         self._values = np.asarray(values, dtype=float).reshape(-1)
-        self.points_shape: tuple = (int(self._values.size),)   # the swept parameter points
-        self.data_shape: tuple = tuple(data_shape)             # per-point data
-        # RAW (repeat, *points_shape, *data_shape), NaN = not-yet-measured; filled in place by
-        # (pass, point) and published whole (the plot reduces the leading repeat axis).
-        self._raw = np.full((self._ring, *self.points_shape, *self.data_shape), np.nan, dtype=float)
+        proposed = tuple(int(n) for n in (point_shape or (self._values.size,)))
+        if not proposed or any(n < 1 for n in proposed) \
+                or int(np.prod(proposed, dtype=np.int64)) != int(self._values.size):
+            raise ValueError(
+                f"point_shape {proposed} must be positive and flatten to P={self._values.size}.")
+        self._point_shape = proposed
+        self._data_shape = tuple(int(n) for n in data_shape)
+        if not self._data_shape or any(n < 1 for n in self._data_shape):
+            raise ValueError(f"data_shape must be non-empty and positive, got {data_shape!r}.")
+        # Local state mirrors the hub store only to build patches and implement a
+        # rolling pass reset.  Its point axis is always physically flattened.
+        self._raw = np.full(
+            (self._ring, self._values.size, *self._data_shape), np.nan, dtype=float)
+        self._coordinates: dict[str, np.ndarray] = {self.x_key: self._values.copy()}
+        self._x_published = False
 
-    SCAN_DONE = "scan_done"                            # the ONE finite-scan-complete sentinel key
+    def _swept_publish(self, patch: TensorPatch) -> dict[str, object]:
+        """Publish one y patch and publish immutable x coordinates only once."""
 
-    def _swept_publish(self, extra: "dict | None" = None) -> dict[str, object]:
-        """Build + publish the standard swept-scan block: the FULL stable x axis, the RAW
-        ``(repeat, *points, *data)`` y block, and the ``scan_done`` flag, plus any per-twin ``extra``
-        (a 2-D grid block).  The ONE place the swept output dict is built, so neither twin can drift
-        the published-key set."""
-        out = {self.x_key: self._values.copy(),
-               self.y_key: self._publish_raw(),
-               self.SCAN_DONE: 1.0 if self.finished else 0.0}
-        if extra:
-            out.update(extra)
-        return self._assert_primary_shape(out)
+        out: dict[str, object] = {self.y_key: patch}
+        if not self._x_published:
+            out.update({
+                name: values.reshape(1, self.n_points, 1)
+                for name, values in self._coordinates.items()
+            })
+            self._x_published = True
+        return self._assert_declared(out, self._bare_published_signals())
 
     def _bare_published_signals(self) -> frozenset:
-        """The swept node's OWN outputs (behind ``prefix``): x axis + RAW y block + scan_done.  A twin
-        with an extra output (a 2-D grid block) extends this via ``super()``."""
-        return frozenset((self.x_key, self.y_key, self.SCAN_DONE))
-
-    def _scan_done_spec(self) -> "SignalSpec":
-        """The ONE ``scan_done`` SignalSpec both twins publish -- so the sentinel's label / meaning is
-        declared once and can never drift between the scan drivers (it had already drifted)."""
-        return SignalSpec(self.SCAN_DONE, "scan complete", "",
-                          "1.0 once the finite scan has measured its final point")
+        """The swept node's data outputs.  Completion is node control state, not a signal."""
+        return frozenset((*self._coordinates, self.y_key))
 
     @property
     def n_points(self) -> int:
@@ -2029,39 +2207,76 @@ class _SweptBlockMeasurement(Measurement):
         """True once every point of every pass has been measured (never, while ∞ / repeat=0)."""
         return self.repeat > 0 and (self._pass >= int(self.repeat))
 
-    def _publish_raw(self) -> np.ndarray:
-        """The raw block to publish.  Finite: as-is (slot == pass, already chronological).  ∞ rolling
-        ring: rolled so the most-recently-written slice is LAST (oldest->newest), so the plot's
-        replace/roll/create read the newest correctly."""
-        if self.repeat > 0:
-            return self._raw.copy()
-        last = (self._pass if self._index > 0 else self._pass - 1) % self._ring
-        return np.roll(self._raw, self._ring - 1 - last, axis=0).copy()
-
-    def _fill_point(self, index: int, row) -> None:
+    def _fill_point(self, index: int, row) -> TensorPatch:
         """Fill measured ``row`` into the raw block at the current ``(pass, point)`` and advance the
         within-pass index / pass counter.  Clears a reused ring slot on a pass's first point so two
         passes never mix.  The node only FILLS; HOW the repeats combine for display is the plot's job."""
-        row = np.atleast_1d(np.asarray(row, dtype=float))
+        row = np.asarray(row, dtype=float)
+        if row.ndim == 0 and self._data_shape == (1,):
+            row = row.reshape(1)
+        if row.shape != self._data_shape:
+            raise ValueError(
+                f"scan point produced shape {row.shape}; declared data_shape is {self._data_shape}.")
         slot = self._pass % self._ring
-        if index == 0:                               # first point of a pass -> clear its slice
-            self._raw[slot] = np.nan                 # (so a reused ring slot never mixes 2 passes)
-        self._raw[slot, index, :row.size] = row
+        reset_rolling_slot = index == 0 and self.repeat <= 0
+        if reset_rolling_slot:
+            self._raw[slot] = np.nan
+        self._raw[slot, index] = row
+        if reset_rolling_slot:
+            valid = np.zeros(self.n_points, dtype=bool)
+            valid[index] = True
+            patch = TensorPatch(
+                (slot, slice(None)), self._raw[slot].copy(), valid=valid)
+        else:
+            patch = TensorPatch.point(slot, index, row.copy(), valid=True)
         self._index += 1
         if self._index >= self.n_points:             # this pass complete -> start the next one
             self._index = 0
             self._pass += 1
+        return patch
 
     def step(self) -> dict[str, object]:
-        """Run one point, publish it, and self-stop once the final point lands (so a background
-        ``start()`` thread's loop exits cleanly on a finite scan)."""
-        named = super().step()
+        """Publish one complete scan-point transaction and apply the shared stop law.
+
+        Acquisition, schema registration and Hub publication are one transaction from a
+        swept node's point cursor.  A subclass may release strategy-specific resources in
+        :meth:`_on_step_failure`, but it must not replace this cursor/publish boundary.
+        """
+        try:
+            named = super().step()
+        except Exception as exc:
+            self._on_step_failure(exc)
+            raise
         if self.finished:
             self._stop.set()
         return named
 
+    def _on_step_failure(self, exc: BaseException) -> None:
+        """Release resources after a failed point transaction.
+
+        Most swept measurements own no persistent execution resource, so stopping their
+        loop is sufficient.  Hardware-backed scans extend this hook to drive their device
+        safe without reimplementing :meth:`step`.
+        """
+
+        self._stop.set()
+
     def run_to_completion(self):
-        """Synchronously run + publish every remaining scan point (test/headless)."""
+        """Synchronously run + publish every remaining scan point (test/headless).
+
+        ``stop()`` is a cancellation boundary for the previous background run,
+        not a permanent poison pill for this explicit synchronous resume.  A
+        live owner thread may never be resumed concurrently; once it has been
+        joined, clear its consumed cancellation token before driving the
+        remaining points on the caller thread.
+        """
+        if self.finished:
+            return self
+        if self.running:
+            raise RuntimeError(
+                "cannot run_to_completion while the scan's owner thread is still running; "
+                "stop it first.")
+        self._stop.clear()
         while not self.finished:
             self.step()
         return self
@@ -2086,14 +2301,12 @@ class ScannedMeasurementNode(_SweptBlockMeasurement):
 
     Published per shot (behind ``prefix``):
 
-    ``<x_key>``         (points,) the full swept x axis, stable from shot 1 (NaN-free)
-    ``<y_key>``         (repeat, points, dim) the RAW output block -- the node FILLS it point by
+    ``<x_key>``         ``(1,P,1)`` full swept x tensor, stable from shot 1 (NaN-free)
+    ``<y_key>``         ``(R,P,*data_shape)`` RAW output block -- the node FILLS it point by
                         point and does NOT combine the repeats; a PLOT reduces the repeat axis per
-                        its ``repeat_mode`` (average / add / replace / roll / new).  ``dim`` is the
-                        reducer's series count (a per-site reducer makes ``dim = n_sites``, so a
-                        1-D plot draws one line per site and a grid view reshapes a reduced point).
-    ``scan_done``       0 while running, 1 once the final point has been published
-
+                        its ``repeat_mode`` (average / add / replace / roll / create).  For this
+                        reducer's complete declared ``data_shape`` (a per-site reducer uses
+                        ``(n_sites,)``; higher-rank output retains every trailing axis).
     Nothing DERIVABLE is published: the panel namespace already carries the global ``shot`` counter,
     and any combine / per-site grid view is a PLOT-side reduction + reshape, never a separate signal.
 
@@ -2115,8 +2328,8 @@ class ScannedMeasurementNode(_SweptBlockMeasurement):
     ):
         super().__init__(hub, prefix=prefix)
         self.measurement = measurement
-        # UNIFORM contract (#H3n): the block is ``(repeat, *points_shape, *data_shape)`` = a 1-D scan's
-        # ``(ring, n_points, dim)``.  ONE knob ``repeat``, 0 = ∞ (no free-run toggle): repeat=K keeps a
+        # UNIFORM contract (#H3n): the physical block is ``(R,P,*data_shape)``; for this reducer
+        # the reducer's complete ``data_shape``.  ONE knob ``repeat``, 0 = ∞ (no free-run toggle): repeat=K keeps a
         # K-deep block (K passes averaged) then STOPS; repeat=0 rolls a 1-deep ring forever (a live scan
         # showing the latest sweep).  The node only FILLS point-by-point; HOW the repeats are combined
         # for display is the PLOT's ``repeat_mode``.
@@ -2127,12 +2340,15 @@ class ScannedMeasurementNode(_SweptBlockMeasurement):
             pass
         self.x_key = str(x_key)
         self.y_key = str(y_key)
-        # The swept-block contract (ring depth, RAW (repeat, n_points, dim) buffer, progress
+        # The swept-block contract (ring depth, RAW (R,P,*data_shape) buffer, progress
         # properties, finite-scan stop) is owned by _SweptBlockMeasurement; we supply the swept x
-        # values (the measurement's axis = the single source of truth) and the per-point data width
-        # (the reducer's series count, so a per-site reducer makes dim = n_sites).
-        n_series = max(1, int(getattr(measurement.reducer, "n_series", 1)))
-        self._init_swept_block(values=measurement.axis.values, data_shape=(n_series,), repeat=repeat)
+        # values (the measurement's axis = the single source of truth) and the complete per-point
+        # tensor shape declared by its reducer.  There is no scalar-width fallback.
+        self._init_swept_block(
+            values=measurement.axis.values,
+            data_shape=reducer_data_shape(measurement.reducer),
+            repeat=repeat,
+        )
 
     def _wrapped_devices(self) -> tuple:
         """The hardware the wrapped :class:`ScannedMeasurement` drives -- this node is a WRAPPER
@@ -2152,7 +2368,7 @@ class ScannedMeasurementNode(_SweptBlockMeasurement):
         return self._wrapped_devices()
 
     def shot(self) -> dict[str, object]:
-        """Measure ONE scan point and FILL it into the raw ``(repeat, points, dim)`` block at
+        """Measure ONE scan point and FILL it into the raw ``(R,P,*data_shape)`` block at
         ``(pass, point)`` -- the node only fills, it does NOT combine the repeats (the PLOT's
         ``repeat_mode`` decides how to reduce the repeat axis).  Publishes the FULL raw block + the
         stable x axis every shot (NaN = not-yet-measured).  Raises ``StopIteration`` once finished."""
@@ -2162,14 +2378,14 @@ class ScannedMeasurementNode(_SweptBlockMeasurement):
         index = self._index
         value = float(self._values[index])
         row = self.measurement.measure(value, index)
-        self._fill_point(index, row)                      # base owns slot/pass-clear/advance (#E4)
+        patch = self._fill_point(index, row)              # O(data_shape) point update
 
         self._current_source_shot = self.hub.next_source_shot()   # one SOURCE-shot per scan point (#shot-clock)
-        return self._swept_publish()                     # x axis + RAW y block + scan_done (base owns the dict)
+        return self._swept_publish(patch)
 
     def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
         """x / y axis labels + units come from the swept measurement itself (the scan AXIS for x,
-        the REDUCER labels for the curve).  ``y_key`` is the RAW ``(repeat, points, dim)`` block --
+        the REDUCER labels for the curve).  ``y_key`` is the RAW ``(R,P,*data_shape)`` block --
         a plot reduces its repeat axis per ``repeat_mode``."""
         axis = self.measurement.axis
         rlabels = tuple(self.measurement.reducer.labels)          # (xlabel, ylabel, zlabel)
@@ -2177,266 +2393,501 @@ class ScannedMeasurementNode(_SweptBlockMeasurement):
         xlabel = str(getattr(axis, "label", "x"))
         xunit = str(getattr(axis, "unit", ""))
         return (
-            SignalSpec(self.x_key, xlabel, xunit, "scan x axis (the swept parameter)"),
-            SignalSpec(self.y_key, ylabel, "", "raw (repeat, points, dim) block; plot reduces repeats"),
-            self._scan_done_spec(),                      # the ONE scan_done spec (base-owned, can't drift)
+            SignalSpec(
+                self.x_key, xlabel, xunit, "scan coordinate",
+                points_shape=self._point_shape, data_shape=(1,),
+                dtype=np.float64, repeat_capacity=1,
+                metadata={"role": "coordinate"},
+            ),
+            SignalSpec(
+                self.y_key, ylabel, "", "measured value at each scan point",
+                points_shape=self._point_shape, data_shape=self._data_shape,
+                dtype=np.float64, repeat_capacity=self.ring_depth,
+            ),
         )
 
 
 class PulseScanNode(_SweptBlockMeasurement):
-    """Drive a pulse-template scan one point per ``shot()``, with a DECOUPLED y.
+    """Run a scan-slot or API-slot pulse sweep and collect an external y stream.
 
-    Unlike :class:`ScannedMeasurementNode` (which reduces its OWN frames through a calibration),
-    pulse-scan is a DEVICE driver whose y comes from ANOTHER running node: per point it resolves
-    the bound scan slots to that row (``with_slots_resolved`` -- the SAME named-slot resolver the
-    hardware scan + pulse GUI use; api slots stay FIXED on the base state), FIRES + acquires the
-    camera ``frame``(s), PUBLISHES them, lets the consumers (e.g. a Judge-occupancy processor)
-    recompute, then evaluates a SOURCE EXPRESSION over the hub for y.  So x = the scan points and
-    y = a signal published by a decoupled producer (e.g. occupancy ``rate``) combined by a
-    ``value = ...`` expression.
-
-    Because the device lockout allows only ONE device driver, pulse-scan owns the streamer +
-    camera and publishes the per-event ``frame_i`` itself; the reactive processors it subscribes to keep running
-    (processors are not device-driving), so the user starts the producer FIRST, then pulse-scan.
-
-    Settling y to THIS point's frame (the riskiest part) is race-free:
-      * GUI / live: the consumer runs on its OWN thread, so the node WAITS for the picked y
-        signals' per-signal version to advance past the pre-publish snapshot (it only READS the
-        hub -- never steps another node's thread -- so there is no cross-thread step() race).
-      * headless / notebook / tests: an optional ``settle`` callback steps the consumer INLINE
-        (single-threaded, deterministic) -- the consumer's thread is not running, so settle is
-        the only thing touching it.
-    Both paths read y through the SAME expression once the consumer is fresh.
-
-    It touches only ``with_slots_resolved`` + ``to_sequence`` + ``triggered_frames`` (the one
-    arm-fire-read helper) + the hub (publish / signal_versions / latest), reads no simulation
-    ground truth and imports no concrete backend -- guarded by
-    ``tests/test_virtual_equals_real_contract.py`` like the rest of the analysis layer.
+    The node owns only the sequencer.  A scan-slot sweep uploads one complete hardware table and
+    fires once; an API-slot sweep resolves and submits one finite pulse per row.  Neither path arms
+    a camera or relays a frame.  A separately running measurement/processor pipeline publishes y,
+    and each step consumes one fresh, lineage-coherent sample for the next point.
     """
 
-    # Runs the full shot orchestration per point (arm its camera, fire its sequencer, read
-    # back) and holds both as top-level attributes -- the base collection reads them here.
-    _devices = {"camera": EXCLUSIVE, "sequencer": EXCLUSIVE}
+    _devices = {"sequencer": EXCLUSIVE}
 
-    #: How long (s) to wait for the subscribed y signals to refresh for THIS point before
-    #: reading them anyway (so a mis-wired y never wedges the scan; a real consumer ticks well
-    #: under this).
-    SETTLE_TIMEOUT_S = 5.0
+    #: Maximum wait for the next ordered y update.  A missing producer aborts the scan loudly;
+    #: reusing a previous value would silently associate the wrong observation with this point.
+    Y_UPDATE_TIMEOUT_S = 5.0
 
     def __init__(self, hub: SignalHub, plan, *, x_key: str = "param", y_key: str = "signal",
                  prefix: str = "", repeat: int = 1):
         super().__init__(hub, prefix=prefix)
         self.plan = plan
-        # The swept-block ring contract -- ``(repeat, n_points, 1)`` buffer, ring depth, progress
-        # properties, finite-scan stop -- is owned by _SweptBlockMeasurement (#E4); set up below via
-        # _init_swept_block once the swept x values are known.  Pulse-scan fires ONCE per point per
-        # pass, so a "pass" IS a whole re-sweep (repeat=K keeps K averageable sweeps then STOPS;
-        # repeat=0 rolls a 1-deep ring forever); the PLOT combines the repeats + (2-D) reshapes by
-        # ``scan_shape``.
-        self.base_state = plan.base_state
-        # FIRE-side columns, kept verbatim per mechanism: hardware named-slot rows resolve
-        # through with_slots_resolved, SOFTWARE api-slot rows through set_api (the analogue of
-        # the hardware scan table: per point set each api column on a deep copy, fire, then
-        # wait extra_delay_s -- the device-owned inter-point settle).
-        self._hw_slot_names = list(plan.scan_names)
-        self._hw_slot_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in plan.scan_arrays]
-        self.api_names = list(getattr(plan, "api_names", ()))
-        self.api_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in getattr(plan, "api_arrays", ())]
-        # SELF-DESCRIPTION (the console's structure contract, same fields a task exposes):
-        # ``scan_names``/``scan_arrays`` are the SWEPT PARAMETER AXES regardless of the fire
-        # mechanism -- a hardware slot scan and a software api sweep are the same experiment
-        # shape, so facet titles / axis labels read one fact instead of guessing which
-        # mechanism drove the sweep (an api-only sweep once self-described as axis-less).
-        self.scan_names = list(self._hw_slot_names) or list(self.api_names)
-        self.scan_arrays = list(self._hw_slot_arrays) or list(self.api_arrays)
-        self.extra_delay_s = max(0.0, float(getattr(plan, "extra_delay_s", 0.0)))
-        self.camera = plan.camera
+        self.pulse_state = plan.pulse_state
+        self.sweep_kind = str(plan.sweep_kind)
+        if self.sweep_kind not in (SWEEP_SCAN_SLOT, SWEEP_API_SLOT):
+            raise ValueError(f"unsupported PulseScan sweep kind {self.sweep_kind!r}.")
+        # Public coordinates describe both execution strategies.  API mutation handles stay
+        # private so opaque a1/a2 names never leak into the Hub namespace.
+        self.scan_names = [str(name) for name in plan.scan_names]
+        self.scan_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in plan.scan_arrays]
+        self.api_handles = [str(name) for name in getattr(plan, "api_handles", ())]
+        if not self.scan_names or any(not name for name in self.scan_names):
+            raise ValueError("PulseScan requires one non-empty semantic name per scan axis.")
+        if len(set(self.scan_names)) != len(self.scan_names):
+            raise ValueError(f"PulseScan semantic coordinate names must be unique: {self.scan_names}.")
+        if len(self.scan_arrays) != len(self.scan_names):
+            raise ValueError("PulseScan scan_names and scan_arrays must have the same length.")
+        if self.sweep_kind == SWEEP_API_SLOT and len(self.api_handles) != len(self.scan_arrays):
+            raise ValueError("PulseScan API sweep needs one mutation handle per coordinate.")
+        if self.sweep_kind == SWEEP_SCAN_SLOT and self.api_handles:
+            raise ValueError("PulseScan scan-slot sweep cannot carry API mutation handles.")
+        point_counts = {int(array.size) for array in self.scan_arrays}
+        if len(point_counts) != 1 or next(iter(point_counts), 0) < 1:
+            raise ValueError(
+                f"PulseScan coordinate arrays must be non-empty and aligned; sizes={sorted(point_counts)}.")
+        point_count = next(iter(point_counts))
+        if self.sweep_kind == SWEEP_SCAN_SLOT and int(repeat) > 0 and point_count < 2:
+            raise ValueError(
+                "a finite PulseScan scan-slot sweep needs at least two table rows; the hardware "
+                "counts completed sweeps when its point cursor wraps.  Add another scan point, "
+                "use repeat=0 for a continuous one-point stream, or fire a fixed pulse instead.")
         self.sequencer = plan.sequencer
         self.y_expr = plan.y_expr if isinstance(plan.y_expr, SignalExpr) else SignalExpr.from_value(plan.y_expr)
-        # Optional inline settle (headless single-threaded determinism); None in the GUI, where
-        # the node instead waits for the consumer's own thread to republish the y signals.
-        self.settle = getattr(plan, "settle", None)
-        # Warn ONCE per scan when the y inputs never refresh (the consumer is not running):
-        # every stale point is recorded as NaN, not the hub's previous-shot value (#C1).
-        self._stale_y_warned = False
-        self.x_key = str(x_key)
+        self._run_started = False
+        self._run_program = None
+        self._point_program = None
+        self._y_cursors = {}
+        self._subscribed_y_names: tuple[str, ...] | None = None
+        self._selected_y_tensors: dict[str, SignalTensor] = {}
+        self._last_y_provenance: int | None = None
+        self._fatal_scan_error = False
+        self._y_history_reservation = None
+        self.y_history_reservation_bytes = 0
+        # x_key used to be the generic duplicate ``param``.  The first semantic
+        # ScanSlot.name is now the primary x binding; every axis is published once.
+        del x_key
+        self.x_key = self.scan_names[0]
         # The OUTPUT signal name (user-set #7) comes from the plan; the constructor default is the
         # fallback for callers that don't carry it.
         self.y_key = str(getattr(plan, "y_key", "") or y_key)
+        if self.y_key in self.scan_names:
+            raise ValueError(
+                f"PulseScan y signal {self.y_key!r} collides with a semantic coordinate; "
+                "choose a distinct y name.")
         # Optional (n0, n1) grid shape for a 2-D scan: a 2-D panel reduces the raw y block's repeat
         # axis then reshapes the (points,) curve into this map (the node itself never reshapes).
         self.scan_shape = getattr(plan, "scan_shape", None)
-        # The x dimension is the hardware scan slots if any, else the software api sweep; the base
-        # pre-allocates the RAW (repeat, n_points, 1) NaN block + ring/progress state from it (a stable
-        # x axis from shot 1).  One scalar per point (data_shape=(1,)); a 2-D scan flattens its n0*n1
-        # grid into n_points here and the 2-D panel reshapes by scan_shape.
-        if self.scan_arrays:                             # the unified swept axes (hw slots, else api)
-            swept_values = self.scan_arrays[0].astype(float)
-        else:
-            swept_values = np.array([0.0])
-        self._init_swept_block(values=swept_values, data_shape=(1,), repeat=repeat)
-        # 2-D scan: the flattened points reshape to this (n0, n1) image on a 2-D panel (#H3o); the
-        # data stays a scalar, so the 2-D-ness is HERE, not in data_shape.
-        self.grid_shape: tuple = tuple(self.scan_shape) if self.scan_shape else ()
+        # One scalar per hardware scan-table row.
+        swept_values = self.scan_arrays[0].astype(float)
+        self._init_swept_block(
+            values=swept_values,
+            data_shape=(1,),
+            repeat=repeat,
+            point_shape=(tuple(self.scan_shape) if self.scan_shape else None),
+        )
+        self._coordinates = {
+            name: array.copy() for name, array in zip(self.scan_names, self.scan_arrays)
+        }
         self._axis_label = str(plan.axis_label)
         self._axis_unit = str(plan.axis_unit)
 
-    def _publish_grid(self) -> np.ndarray:
-        """For a GRID scan: the SAME raw block reshaped to ``(repeat, *scan_shape)`` -- a pure reshape
-        of this node's own data, NO cross-repeat combine.  A 2-level scan gives the ``(repeat, n0, n1)``
-        map a 2-D panel shows; a deeper scan (3-level ...) gives the block a facet grid expands along
-        its outer axis.  The plot reduces the repeat axis (per ``repeat_mode``), never this node."""
-        dims = tuple(int(n) for n in self.scan_shape)
-        return self._publish_raw()[:, :, 0].reshape(self._ring, *dims)
-
-    def _bare_published_signals(self) -> frozenset:
-        """The scan's OWN outputs (behind ``prefix``): the swept x axis, the RAW y block, the
-        scan-done flag, plus (2-D scan) the raw block reshaped into the grid.  Declaring them lets
-        the console map a panel back to THIS node (so the 1-D frame-title reads ``<y> <-
-        pulse_scan``) and resolve x.  Both y signals are RAW (repeat-axis kept) -- the PLOT
-        reduces them; the node never combines repeats."""
-        keys = set(super()._bare_published_signals())     # x + RAW y + scan_done (base-owned)
-        if self.scan_shape is not None:
-            keys.add(self.y_key + "_grid")
-        return frozenset(keys)
-
-    def _unprefixed_published_signals(self) -> frozenset:
-        # The RELAY exception (#E1): pulse-scan fires ONE trigger per point and republishes the
-        # camera frame under the SAME bare ``frame_0`` a single-cycle CameraMeasurement emits --
-        # the scan REPLACES the camera as the device driver, so a frame consumer (the occupancy
-        # judge) keeps its binding whichever one drives.  ONE name source (no lumped ``frame``).
-        return frozenset(camera_frame_keys(1))
-
     def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
-        """LABEL / unit / meaning per published signal -- so a 1-D panel wired to the y curve reads
-        its x-axis label+unit (the swept parameter) and y label from THIS node.  ``y_key`` is the RAW
-        ``(repeat, points, 1)`` block; ``<y>_grid`` the RAW ``(repeat, n0, n1)`` block -- a plot
-        reduces the repeat axis per ``repeat_mode``."""
-        specs = [
-            SignalSpec(self.x_key, self._axis_label, self._axis_unit, "scan x axis (the swept parameter)"),
-            SignalSpec(self.y_key, self.y_key, "", "raw (repeat, points, 1) block; plot reduces repeats"),
-            self._scan_done_spec(),                       # the ONE scan_done spec (base-owned, can't drift)
-        ]
-        if self.scan_shape is not None:
-            specs.append(SignalSpec(self.y_key + "_grid", self.y_key, "",
-                                    "raw (repeat, n0, n1) block; plot reduces repeats then shows the map"))
-        for key in camera_frame_keys(1):
-            specs.append(SignalSpec(
-                key, "camera image", "counts",
-                "camera frame relayed by this pulse scan point for downstream processors; compact "
-                "history is enough because the scan y-block owns the long-lived result.",
-                history=IMAGE_STREAM_HISTORY))
-        return tuple(specs)
+        """One schema per semantic coordinate plus the unique physical y tensor."""
+        coordinate_specs = tuple(
+            SignalSpec(
+                name,
+                self._axis_label if index == 0 else name,
+                self._axis_unit if index == 0 else "",
+                f"semantic scan coordinate {name}",
+                points_shape=self._point_shape,
+                data_shape=(1,),
+                dtype=np.float64,
+                repeat_capacity=1,
+                metadata={"role": "coordinate", "axis_index": index},
+            )
+            for index, name in enumerate(self.scan_names)
+        )
+        return (*coordinate_specs,
+            SignalSpec(
+                self.y_key, self.y_key, "", "external value at each hardware scan-table row",
+                points_shape=self._point_shape, data_shape=(1,),
+                dtype=np.float64, repeat_capacity=self.ring_depth,
+                metadata={
+                    "coordinate_signals": tuple(self.prefix + name for name in self.scan_names),
+                    "axis_order": tuple(self.scan_names),
+                },
+            ),
+        )
 
     def shot(self) -> dict[str, object]:
         if self.finished:
             raise StopIteration("PulseScanNode: scan already complete.")
-        index = self._index
-        # Resolve THIS point's pulse: the hardware scan slots through the named-slot resolver, AND
-        # (software) any swept API slots through set_api on the deep copy.  Either or both may be
-        # present; an api-only sweep has no scan slots.
-        resolved = self.base_state
-        if self._hw_slot_names:
-            slots = {name: float(arr[index])
-                     for name, arr in zip(self._hw_slot_names, self._hw_slot_arrays)}
-            resolved = resolved.with_slots_resolved(slots)
-        if self.api_names:
-            api_row = {name: float(arr[index]) for name, arr in zip(self.api_names, self.api_arrays)}
-            resolved = resolved.with_api_resolved(api_row)
-        sequence = resolved.to_sequence(name="pulse_scan")
-        # ONE trigger per point: pulse-scan FIRES the pulse and reads the UPSTREAM signal (y) -- it
-        # is decoupled from the camera's exposure/averaging (no n_frames knob; temporal averaging
-        # belongs to the upstream camera/processor).  The shot goes through the ONE measurement-
-        # layer helper (arm camera -> fire sequencer -> read frames); the camera never drives the
-        # sequencer.  No bound sequencer -> nothing to fire -> no trigger -> no frame.
-        frames = triggered_frames(self.camera, self.sequencer, sequence, 1, stop=self._stop)
-        if not frames:
-            # No trigger reached the camera (streamer stopped / no streamer bound): freeze, do
-            # not advance -- the SAME data-source gate the live camera measurement uses.
-            return {}
-        # 1) publish the camera frame(s) under BARE names so the reactive consumers (e.g. a
-        #    Judge-occupancy processor consuming ``frame_0``) pick them up -- this is the SAME
-        #    ``frame_0`` signal a single-cycle CameraMeasurement publishes (default 2D = frame_0).
-        before = self.hub.signal_versions()
-        # Mint ONE source-shot id for this scan point: the camera frame, any consumer that inherits it
-        # (a Judge-occupancy processor on `frame`), AND the scan y-block (published via step()) all share
-        # it, so this point's frame + derived occupancy + y are one coherent shot.  Order matters: the
-        # frame publish (with sid) must precede the consumer recompute (_await_y_inputs) so it inherits sid
-        # before _read_y -- a reorder would break lineage coherence (#shot-clock).
-        sid = self.hub.next_source_shot()
-        frame_pub = {key: np.asarray(f)
-                     for key, f in zip(camera_frame_keys(len(frames)), frames)}
-        self._configure_signal_storage(frame_pub.keys())
-        self.hub.publish(frame_pub, provenance=sid)
-        self._current_source_shot = sid                  # the y-block (base step()) carries the same id
-        # 2) make the y signals FRESH for this frame, then 3) read y from the source expression.
-        # A consumer that never refreshed within the settle window (its producer is not running,
-        # or one recompute genuinely takes longer than SETTLE_TIMEOUT_S) must NOT be read anyway:
-        # the hub still holds the PREVIOUS shot's value, and silently recording it would fill the
-        # curve with one stale number per point (5 s stall each) -- wrong data with no error.  The
-        # never-wedge contract stays (the wait still times out); staleness is mechanically
-        # excluded by recording NaN for the point and warning ONCE per scan.
-        fresh = self._await_y_inputs(before)
-        y = self._read_y() if fresh else float("nan")
-        if not fresh and not self._stale_y_warned:
-            self._stale_y_warned = True
-            logging.getLogger(__name__).warning(
-                "pulse scan y inputs %s did not refresh within %.1f s -- is the consumer "
-                "(e.g. the occupancy processor) running?  Stale points are recorded as NaN.",
-                [n for n in self.y_expr.inputs if n], self.SETTLE_TIMEOUT_S)
-        # 4) device-owned inter-point settle: load -> fire -> read the point's frame -> settle
-        #    (extra_delay_s) -> next.  The sequencer owns the wait (the caller just sets the
-        #    adjustable extra delay); honours Stop so a long settle does not wedge teardown.
-        #    No bound sequencer -> nothing to settle, exactly like ``triggered_frames`` fires
-        #    nothing without a streamer: every sequencer-owned action (fire AND settle) is a
-        #    no-op when ``self.sequencer is None``, so a sequencer-less scan never wedges on
-        #    ``None.settle``.
-        if self.extra_delay_s > 0.0 and self.sequencer is not None and not self._stop.is_set():
-            self.sequencer.settle(self.extra_delay_s, stop=self._stop)
-        self._fill_point(index, y)                        # base owns slot/pass-clear/advance (#E4)
-        # the 2-D scan additionally publishes the RAW grid block; the base owns x + RAW y + scan_done.
-        extra = {self.y_key + "_grid": self._publish_grid()} if self.scan_shape is not None else None
-        return self._swept_publish(extra)
-
-    def _await_y_inputs(self, before: dict) -> bool:
-        """Block until the picked y signals have advanced past ``before`` (a per-signal version
-        bump = the consumer republished them from the frame just published), honouring Stop.
-        Returns True when the inputs are FRESH for this point (advanced / no inputs / inline
-        settle), False on a timeout or Stop -- the caller records the point as NaN instead of
-        reading the hub's PREVIOUS-shot value (never wedge, never silently stale).
-
-        Inline ``settle`` (headless) short-circuits this: it steps the consumer once, single-
-        threaded, so the version is fresh immediately."""
-        names = [n for n in self.y_expr.inputs if n]
-        if not names:
-            return True
-        if self.settle is not None:
-            try:
-                self.settle()
-            except Exception:
-                pass
-            return True
-        deadline = time.monotonic() + self.SETTLE_TIMEOUT_S
-        while not self._stop.is_set():
-            seen = self.hub.version                          # capture BEFORE the check so a racing publish is not missed
-            now = self.hub.signal_versions()
-            if all(now.get(n, 0) > before.get(n, 0) for n in names):
-                return True
-            if time.monotonic() >= deadline:
-                return False                                 # timeout: never wedge -- caller NaNs the point
-            # Wake the instant the consumer republishes (event-driven), not every 10 ms -- so a decoupled
-            # scan's per-point wait tracks the consumer's real compute time, never a fixed poll interval.
-            self.hub.wait_for_change(seen, timeout=max(0.0, deadline - time.monotonic()), stop=self._stop)
-        return False
-
-    def _read_y(self) -> float:
-        """y = the source expression over the live hub (the decoupled subscription)."""
         try:
-            value = self.y_expr.evaluate(hub_namespace(self.hub))
-            arr = np.asarray(value, dtype=float).reshape(-1)
-            return float(arr[0]) if arr.size else float("nan")
-        except Exception:
-            return float("nan")
+            index = self._index
+            self._start_execution(index)
+            fresh, lineage, snapshot = self._await_y_sample()
+            if not fresh:
+                raise TimeoutError(
+                    f"PulseScan y inputs {self._y_input_names()} produced no next ordered update "
+                    f"within {self.Y_UPDATE_TIMEOUT_S:.1f}s; scan aborted to avoid assigning a late "
+                    "sample to the wrong point.")
+            y = self._read_y(snapshot)
+            if self.sweep_kind == SWEEP_API_SLOT:
+                self._finish_api_point()
+            # The result inherits the external acquisition's lineage; this node mints no camera shot.
+            self._current_source_shot = lineage
+            patch = self._fill_point(index, y)
+            out = self._swept_publish(patch)
+            if self.finished and self.sweep_kind == SWEEP_SCAN_SLOT:
+                self._finish_scan_slot_run()
+        except Exception as exc:
+            self._fail_scan(exc)
+            raise
+        if self.finished:
+            self._release_y_history()
+        return out
+
+    def _on_step_failure(self, exc: BaseException) -> None:
+        """Drive the sequencer safe when any part of a point transaction fails."""
+
+        self._fail_scan(exc)
+
+    def _fail_scan(self, exc: BaseException) -> None:
+        """Record one terminal fault, release buffers, and safe the sequencer."""
+
+        # Match the base loop's cooperative-stop semantics: an operator Stop
+        # racing a blocked read is a clean cancellation, not a red error banner.
+        # A real PulseScan fault sets this flag before setting _stop, so the
+        # outer step() boundary can encounter the same exception idempotently.
+        if self._stop.is_set() and not self._fatal_scan_error:
+            return
+        if not self._fatal_scan_error:
+            self._fatal_scan_error = True
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            self.consecutive_errors += 1
+        self._stop.set()
+        self._release_y_history()
+        # Idempotent across the shot() and step() exception boundaries: shot()
+        # may already have safed and cleared _run_started before step() sees
+        # the same exception.
+        if self._run_started:
+            try:
+                self._abort_execution(force=True)
+            except Exception as safe_exc:
+                # Preserve the data-alignment fault as the raised/root error,
+                # but make a failed hardware-safe transition impossible to
+                # miss in health state and logs.
+                self.last_error += (
+                    f"; SAFE-STATE FAILURE: {type(safe_exc).__name__}: {safe_exc}")
+                logging.getLogger(__name__).exception(
+                    "PulseScan failed to put the sequencer in safe state")
+
+    def _ensure_y_subscription(self) -> None:
+        """Reserve and position every y cursor before the first pulse is fired."""
+
+        if self._subscribed_y_names is not None:
+            return
+        names = self._y_input_names()
+        self._reserve_y_history(names)
+        self._y_cursors = self.hub.signal_cursors(names)
+        disappeared = [
+            name for name, cursor in self._y_cursors.items()
+            if cursor.schema_version == 0
+        ]
+        if disappeared:
+            self._release_y_history()
+            raise ValueError(
+                f"PulseScan y input(s) {disappeared} disappeared before hardware fire.")
+        # The plan's expression wiring is immutable for this run.  Cache the
+        # validated subscription so a long hardware scan does not parse Python
+        # or walk the schema registry once per point.
+        self._subscribed_y_names = tuple(names)
+
+    def _start_execution(self, index: int) -> None:
+        """Start the selected execution strategy for ``index``.
+
+        A scan-slot run starts once and then streams all rows.  An API-slot run starts one finite
+        pulse for every row; the shared subscription remains positioned across those pulses.
+        """
+
+        if self.sweep_kind == SWEEP_SCAN_SLOT and self._run_started:
+            return
+        self._ensure_y_subscription()
+        try:
+            if self.sweep_kind == SWEEP_SCAN_SLOT:
+                self._run_program = prepare_hardware_scan(
+                    self.sequencer, self.pulse_state, scan_repeats=self.repeat)
+            else:
+                api_row = {
+                    handle: float(column[index])
+                    for handle, column in zip(self.api_handles, self.scan_arrays)
+                }
+                self._point_program = fire_api_sweep_point(
+                    self.sequencer, self.pulse_state, api_row)
+        except Exception as exc:
+            self._release_y_history()
+            try:
+                self._abort_execution(force=True)
+            except Exception as safe_exc:
+                raise RuntimeError(
+                    f"pulse scan start failed ({type(exc).__name__}: {exc}) and the "
+                    f"sequencer safe-state transition also failed "
+                    f"({type(safe_exc).__name__}: {safe_exc})") from exc
+            raise
+        self._run_started = True
+
+    def _finish_api_point(self) -> None:
+        """Wait for the finite API pulse tail before another row can replace it."""
+
+        program = self._point_program
+        waiter = getattr(self.sequencer, "wait_done", None)
+        if callable(waiter):
+            budget = program_completion_timeout(program)
+            if not waiter(timeout=budget, stop=self._stop):
+                if self._stop.is_set():
+                    raise RuntimeError("PulseScan API sweep cancelled while waiting for pulse completion.")
+                raise TimeoutError(
+                    f"PulseScan API point did not finish within {budget:.1f}s; refusing to "
+                    "replace a still-running pulse with the next row.")
+        self._point_program = None
+        self._run_started = False
+
+    def _finish_scan_slot_run(self) -> None:
+        """Wait for the finite hardware-scan tail before releasing the sequencer."""
+
+        program = self._run_program
+        waiter = getattr(self.sequencer, "wait_done", None)
+        if callable(waiter):
+            budget = program_completion_timeout(program)
+            if not waiter(timeout=budget, stop=self._stop):
+                if self._stop.is_set():
+                    raise RuntimeError(
+                        "PulseScan scan-slot sweep cancelled while waiting for hardware completion.")
+                raise TimeoutError(
+                    f"PulseScan scan-slot sweep did not finish within {budget:.1f}s; refusing "
+                    "to release a sequencer that may still be playing its tail.")
+        self._run_program = None
+        self._run_started = False
+
+    def _reserve_y_history(self, names: list[str]) -> None:
+        """Preflight y schemas and reserve every finite scan-point update."""
+
+        if not names:
+            raise ValueError(
+                "PulseScan requires at least one explicit y input; a constant or live helper "
+                "expression has no cursor event to associate with a scan point.")
+        identity = self._identity_y_source(names)
+        if identity and len(names) != 1:
+            raise ValueError(
+                "PulseScan with multiple y inputs requires an explicit scalar SignalExpr.")
+
+        capacity = self.total_points if self.repeat > 0 else 0
+        estimated = 0
+        for name in names:
+            try:
+                schema = self.hub.schema(name)
+            except KeyError as exc:
+                raise ValueError(
+                    f"PulseScan y input {name!r} has no registered SignalSchema.  Start the "
+                    "measurement/processor pipeline before firing the hardware scan.") from exc
+            if identity and schema.data_shape != (1,):
+                raise ValueError(
+                    f"PulseScan y input {name!r} has data_shape={schema.data_shape}, not a scalar "
+                    "cell.  Select a component or reduce explicitly in SignalExpr before firing.")
+            if capacity:
+                dtype_bytes = int(schema.dtype.itemsize) if schema.dtype is not None else 8
+                cells = int(schema.repeat_capacity or 1) * schema.point_count
+                data_items = int(np.prod(schema.data_shape, dtype=np.int64))
+                estimated += capacity * cells * data_items * dtype_bytes
+
+        self.y_history_reservation_bytes = estimated
+        if capacity:
+            self._y_history_reservation = self.hub.reserve_history(names, capacity)
+            if estimated >= 1024 * 1024:
+                logging.getLogger(__name__).warning(
+                    "PulseScan reserves %d ordered updates for %s (estimated payload %.1f MiB).  "
+                    "Reducing camera/image data in an upstream processor before the scan avoids "
+                    "retaining full frames.",
+                    capacity, names, estimated / (1024.0 * 1024.0))
+
+    def _expression_dependencies(self) -> set[str]:
+        """Return direct signal names in the y expression, before hardware fire.
+
+        PulseScan deliberately accepts only a pure expression over its selected
+        event snapshot.  Hub lookup helpers (``latest/history/tensor/...``)
+        would read outside the cursor transaction and can therefore assign a
+        newer frame to an older scan point; they are rejected even when they
+        happen to return a scalar.
+        """
+
+        try:
+            tree = ast.parse(self.y_expr.source, mode="exec")
+        except SyntaxError as exc:
+            raise ValueError(f"invalid PulseScan y expression: {exc.msg}") from exc
+        loaded = {
+            node.id for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        }
+        stored = {
+            node.id for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+        }
+        forbidden = {
+            "history", "history_logical", "latest", "tensor", "logical", "valid",
+            "schema", "names", "shot",
+        }
+        bypass = sorted(loaded & forbidden)
+        if bypass:
+            raise ValueError(
+                "PulseScan y expression cannot use live/history Hub helper(s) "
+                f"{bypass}; select every signal as an input so reservation and cursors cover it.")
+        pure_names = {
+            "signal", "np", "numpy", "math", "float", "int", "bool", "abs",
+            "min", "max", "sum", "len", "round",
+        }
+        registered = set(self.hub.registered_names())
+        candidates = loaded - pure_names
+        direct = candidates & registered
+        # Locals introduced inside the expression (e.g. a temporary or a
+        # comprehension variable) are not signal dependencies.  A registered
+        # name wins over that exemption so shadowing cannot evade reservation.
+        unknown = sorted(candidates - direct - stored)
+        if unknown:
+            raise ValueError(
+                f"PulseScan y expression references unregistered signal(s) {unknown}; "
+                "start and register every producer before firing the hardware scan.")
+        return direct
+
+    def _identity_y_source(self, names: list[str]) -> bool:
+        """Whether the expression semantically passes through one input unchanged."""
+
+        tree = ast.parse(self.y_expr.source, mode="exec")
+        if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Assign):
+            return False
+        assignment = tree.body[0]
+        if len(assignment.targets) != 1 \
+                or not isinstance(assignment.targets[0], ast.Name) \
+                or assignment.targets[0].id != "value" \
+                or not isinstance(assignment.value, ast.Name):
+            return False
+        source_name = assignment.value.id
+        if source_name == "signal":
+            return len(self.y_expr.inputs) == 1
+        return len(names) == 1 and source_name == names[0]
+
+    def _release_y_history(self) -> None:
+        reservation = self._y_history_reservation
+        self._y_history_reservation = None
+        if reservation is not None:
+            reservation.release()
+
+    def _abort_execution(self, *, force: bool = False) -> None:
+        """Immediately put the sequencer safe after any collection failure."""
+
+        should_abort = force or (self._run_started and not self.finished)
+        try:
+            if should_abort and self.sequencer is not None:
+                callbacks = []
+                for method in ("set_safe_state", "abort"):
+                    callback = getattr(self.sequencer, method, None)
+                    if callable(callback) and callback not in callbacks:
+                        callbacks.append(callback)
+                last_error = None
+                for callback in callbacks:
+                    try:
+                        callback()
+                        return
+                    except Exception as exc:
+                        last_error = exc
+                if last_error is not None:
+                    raise RuntimeError(
+                        "every sequencer safe-state callback failed") from last_error
+        finally:
+            self._run_started = False
+            self._run_program = None
+            self._point_program = None
+
+    def _y_input_names(self) -> list[str]:
+        """Hub signals whose next coherent publish constitutes one scan point."""
+
+        if self._subscribed_y_names is not None:
+            return list(self._subscribed_y_names)
+        names = [str(name) for name in self.y_expr.inputs if str(name)]
+        for name in sorted(self._expression_dependencies()):
+            if name not in names:
+                names.append(name)
+        return names
+
+    def _await_y_sample(self) -> tuple[bool, int | None, dict[str, object] | None]:
+        """Consume exactly the next retained lineage-coherent y update."""
+
+        names = self._y_input_names()
+        if not names:
+            self._selected_y_tensors = {}
+            return True, None, {}
+        update = self.hub.next_coherent_update(
+            names,
+            self._y_cursors,
+            timeout=self.Y_UPDATE_TIMEOUT_S,
+            stop=self._stop,
+        )
+        if update is None:
+            return False, None, None
+        lineage = int(update.provenance)
+        if lineage != NO_LINEAGE and self._last_y_provenance is not None \
+                and lineage <= self._last_y_provenance:
+            raise ValueError(
+                f"PulseScan y provenance must be strictly increasing; got {lineage} after "
+                f"{self._last_y_provenance}.  Duplicate/out-of-order source shots cannot be "
+                "assigned safely to successive scan points.")
+        self._y_cursors = dict(update.cursors)
+        self._selected_y_tensors = dict(update.tensors)
+        if lineage != NO_LINEAGE:
+            self._last_y_provenance = lineage
+        return True, lineage, update.values()
+
+    def _read_y(self, snapshot: dict[str, object] | None) -> float:
+        """Evaluate one explicit scalar without flattening or choosing a component."""
+
+        # Snapshot-only namespace: no helper in this expression can reach a
+        # newer Hub value than the exact cursor-selected tensors above.
+        namespace = dict(snapshot or {})
+        namespace.update({"np": np, "numpy": np, "math": math})
+        value = self.y_expr.evaluate(namespace)
+        array = np.asarray(value, dtype=float)
+        # A Python/NumPy scalar means the expression explicitly selected or
+        # reduced its inputs; accepting it cannot discard an implicit axis.
+        if array.ndim == 0:
+            return float(array.item())
+        if array.ndim != 3 or tuple(array.shape[2:]) != (1,):
+            raise ValueError(
+                "PulseScan y expression must return a scalar or canonical (R,P,1) tensor; "
+                f"got {array.shape}.  Select a component or reduce explicitly in SignalExpr.")
+
+        masks = []
+        for name, tensor in self._selected_y_tensors.items():
+            if tensor.data.shape[:2] != array.shape[:2]:
+                raise ValueError(
+                    f"PulseScan y result has R/P={array.shape[:2]}, but input {name!r} has "
+                    f"R/P={tensor.data.shape[:2]}; reduce explicitly in SignalExpr.")
+            masks.append(tensor.valid)
+        valid = np.logical_and.reduce(masks) if masks else np.ones(array.shape[:2], dtype=bool)
+        if int(np.count_nonzero(valid)) != 1:
+            raise ValueError(
+                f"PulseScan y has {int(np.count_nonzero(valid))} valid scalar cells; exactly one "
+                "is required per scan point.  Select a repeat/point or reduce explicitly in SignalExpr.")
+        return float(array[..., 0][valid][0])
+
+    def stop(self) -> None:
+        """Stop collection and stop unfinished pulse playback."""
+
+        super().stop()
+        self._release_y_history()
+        self._abort_execution()
 
 
 class ProcessorRun(OneShotNode):
@@ -2480,12 +2931,36 @@ class ProcessorRun(OneShotNode):
 
     def _publish_result(self) -> dict[str, object]:
         out = dict(self.result)
-        out["processor_done"] = 1.0
         self._current_source_shot = self.hub.next_source_shot()   # one SOURCE-shot for this discrete result (#shot-clock)
-        return self._assert_declared(out, tuple(self.spec.result_keys) + ("processor_done",))
+        return self._assert_declared(out, tuple(self.spec.result_keys))
 
     def _bare_published_signals(self) -> frozenset:
-        return frozenset(tuple(self.spec.result_keys) + ("processor_done",))
+        return frozenset(self.spec.result_keys)
+
+    def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
+        """Use typed one-shot results as the dynamic schema source.
+
+        Scalar raw results use SignalSpec's formal scalar default.  A non-scalar
+        result must be a SignalTensor, forcing the concrete processor to state
+        point/data semantics instead of making this host infer them from rank.
+        """
+
+        specs = []
+        for key in self.spec.result_keys:
+            value = self.result.get(key)
+            if isinstance(value, SignalTensor):
+                schema = value.schema
+                specs.append(SignalSpec(
+                    str(key), schema.label or str(key), schema.unit, schema.description,
+                    points_shape=schema.point_shape,
+                    data_shape=schema.data_shape,
+                    dtype=schema.dtype,
+                    repeat_capacity=schema.repeat_capacity,
+                    metadata=schema.metadata,
+                ))
+            else:
+                specs.append(SignalSpec(str(key), str(key)))
+        return tuple(specs)
 
 
 __all__ = [

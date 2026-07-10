@@ -10,6 +10,7 @@ frame per tick (~52 ms/panel).  The detector must use ``direct_names()`` (the so
 TEXT's own identifiers only).
 """
 import numpy as np
+import pytest
 
 from Zou_lab_control.frontend.live import reduce_repeat
 from Zou_lab_control.neutral_atom.operations.signal_expr import DEFAULT_SOURCE, SignalExpr
@@ -33,9 +34,14 @@ def test_reduce_repeat_single_integer_repeat_is_a_zero_copy_view():
         assert out.dtype == np.uint8, mode
         ref = blk[0].reshape(-1) if mode == "pool" else blk[0]
         assert np.array_equal(np.asarray(out).reshape(-1), ref.reshape(-1)), mode
-    # create keeps its column layout (prod(core), R) -- NOT the slice itself
-    created = reduce_repeat(blk, "create")
-    assert created.shape == (2 * 3 * 4, 1)
+    # ``create`` may only turn repeats and a one-dimensional data_shape into
+    # trace columns; it must not flatten a multidimensional data tensor.
+    with pytest.raises(ValueError, match="multidimensional data_shape"):
+        reduce_repeat(blk, "create")
+
+    trace = np.arange(2 * 3, dtype=np.uint8).reshape(1, 2, 3)
+    created = reduce_repeat(trace, "create")
+    assert created.shape == (2, 3)
 
 
 def test_reduce_repeat_float_single_repeat_keeps_nan_semantics():

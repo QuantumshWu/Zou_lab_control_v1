@@ -17,8 +17,18 @@ import numpy as np
 
 from Zou_lab_control._clock import default_clock_hz as _default_clock_hz
 from Zou_lab_control._streamer_geometry import DEFAULT_COEFF_FRAC_BITS
+from .._serialization import (
+    require_array,
+    require_bool,
+    require_exact_fields,
+    require_int,
+    require_number,
+    require_object,
+    require_string,
+)
 from ..core.analysis import nonnegative_float, positive_int
 from .base import SequencerDevice
+from ..ports import PortCatalog, coerce_port_catalog
 from ..timing import (
     PulseSequence,
     PulseTableState,
@@ -38,7 +48,6 @@ from ..timing.pulse_table import (
 
 
 DEFAULT_RUNTIME_CLOCK_HZ = _default_clock_hz()
-DEFAULT_RUNTIME_BUS_NAMES = ("da_dipole", "da_bias_y", "da_bias_x", "da_bias_z")
 
 
 def _channel_delays_list(channel_delays: Mapping[int, int] | None, n_channels: int) -> list[int]:
@@ -54,7 +63,7 @@ def _clk_enable_mask_for_channels(channels: Sequence[str], clk_channels: Sequenc
     """clk-enable bitmask in the COMPILED hardware channel order (bit n = ``channels[n]``).
 
     The program's edge masks are in the order passed to the compiler (which may differ from
-    ``state.channels``); using ``state.clk_enable_mask()`` (state-order) would point the mask
+    ``state.port_catalog.raw_lanes``); using a mask in another order would point it
     at the wrong bits and could clear a real engine bit.  Always derive it from the order the
     masks actually use."""
     clk_set = {str(c) for c in clk_channels}
@@ -87,7 +96,11 @@ class RuntimeBusDelay:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "RuntimeBusDelay":
-        return cls(bus_index=int(payload.get("bus_index", 0)), delay=int(payload.get("delay", 0)))
+        require_exact_fields(payload, {"bus_index", "delay"}, what="runtime bus delay")
+        return cls(
+            bus_index=require_int(payload["bus_index"], what="runtime bus delay.bus_index"),
+            delay=require_int(payload["delay"], what="runtime bus delay.delay"),
+        )
 
 
 def _fold_global_delay_shift(
@@ -165,26 +178,42 @@ class RuntimeBusSegment:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "RuntimeBusSegment":
+        fields = {
+            "bus_index", "bus_name", "start_tick", "stop_tick",
+            "start_value", "stop_value", "mode", "value_select",
+            "stop_value_select", "start_tick_coeffs", "stop_tick_coeffs",
+        }
+        require_exact_fields(payload, fields, what="runtime bus segment")
         return cls(
-            bus_index=int(payload.get("bus_index", 0)),
-            bus_name=str(payload.get("bus_name", "")),
-            start_tick=int(payload.get("start_tick", 0)),
-            stop_tick=int(payload.get("stop_tick", payload.get("start_tick", 0))),
-            start_value=int(payload.get("start_value", payload.get("stop_value", 0))),
-            stop_value=int(payload.get("stop_value", payload.get("start_value", 0))),
-            mode=str(payload.get("mode", "edge")).strip().lower(),
-            value_select=int(payload.get("value_select", 0)),
-            # stop select defaults to the start select so an edge/hold held-value scan
-            # (start==stop) stays correct when only value_select is given.
-            stop_value_select=int(payload.get("stop_value_select", payload.get("value_select", 0))),
-            start_tick_coeffs=[int(v) for v in payload.get("start_tick_coeffs", [])] or None,
-            stop_tick_coeffs=[int(v) for v in payload.get("stop_tick_coeffs", [])] or None,
+            bus_index=require_int(payload["bus_index"], what="runtime bus segment.bus_index"),
+            bus_name=require_string(payload["bus_name"], what="runtime bus segment.bus_name"),
+            start_tick=require_int(payload["start_tick"], what="runtime bus segment.start_tick"),
+            stop_tick=require_int(payload["stop_tick"], what="runtime bus segment.stop_tick"),
+            start_value=require_int(payload["start_value"], what="runtime bus segment.start_value"),
+            stop_value=require_int(payload["stop_value"], what="runtime bus segment.stop_value"),
+            mode=require_string(payload["mode"], what="runtime bus segment.mode").strip().lower(),
+            value_select=require_int(
+                payload["value_select"], what="runtime bus segment.value_select"),
+            stop_value_select=require_int(
+                payload["stop_value_select"], what="runtime bus segment.stop_value_select"),
+            start_tick_coeffs=[
+                require_int(v, what="runtime bus segment.start_tick_coeffs item")
+                for v in require_array(
+                    payload["start_tick_coeffs"],
+                    what="runtime bus segment.start_tick_coeffs")
+            ] or None,
+            stop_tick_coeffs=[
+                require_int(v, what="runtime bus segment.stop_tick_coeffs item")
+                for v in require_array(
+                    payload["stop_tick_coeffs"],
+                    what="runtime bus segment.stop_tick_coeffs")
+            ] or None,
         )
 
 
 # Serialized RuntimeSequenceProgram schema version -- ONE source, written by to_dict AND checked by
 # from_dict (#G4) so a future schema bump fails fast with a rebuild message instead of mis-decoding.
-_RUNTIME_PROGRAM_VERSION = 3
+_RUNTIME_PROGRAM_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -206,6 +235,7 @@ class RuntimeSequenceProgram:
     duration: float
     source_sequence: dict[str, Any] | None = None
     source_table: dict[str, Any] | None = None
+    port_catalog_fingerprint: str = ""
     repeat_forever: bool = False
     loop_start_index: int = 0
     loop_end_tick: int = 0
@@ -274,6 +304,7 @@ class RuntimeSequenceProgram:
             "ticks": list(self.ticks),
             "masks": list(self.masks),
             "duration": self.duration,
+            "port_catalog_fingerprint": str(self.port_catalog_fingerprint),
             "repeat_forever": bool(self.repeat_forever),
             "loop_start_index": int(self.loop_start_index),
             "loop_end_tick": int(self.loop_end_tick),
@@ -301,47 +332,149 @@ class RuntimeSequenceProgram:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "RuntimeSequenceProgram":
-        if payload.get("schema") != cls.schema:
-            raise ValueError("unsupported runtime sequence program schema.")
+        required = {
+            "schema", "version", "sequence_id", "sequence_name", "clock_hz",
+            "channels", "ticks", "masks", "duration", "port_catalog_fingerprint",
+            "repeat_forever", "loop_start_index", "loop_end_tick", "loop_count",
+            "repeat_from_index", "slot_count", "slot_kinds", "loop_end_slot_coeffs",
+            "tick_slot_coeffs", "scan_points", "scan_point_durations",
+            "scan_coeff_frac_bits", "scan_repeats", "bus_names", "bus_segments",
+            "bus_delays", "channel_delays", "clk_enable",
+        }
+        require_exact_fields(
+            payload, required, optional={"source_sequence", "source_table"},
+            what="runtime sequence program")
+        if payload["schema"] != cls.schema:
+            raise ValueError(
+                f"unsupported runtime sequence program schema {payload['schema']!r}; "
+                f"expected {cls.schema!r}.")
         # ``version`` is load-bearing, not a written-but-unread field (#G4): a future schema bump
         # fails fast here with a clear rebuild message instead of silently mis-decoding an old payload.
-        version = int(payload.get("version", 0))
+        version = require_int(payload["version"], what="runtime sequence program.version")
         if version != _RUNTIME_PROGRAM_VERSION:
             raise ValueError(
                 f"unsupported runtime sequence program version {version} "
                 f"(this host reads/writes version {_RUNTIME_PROGRAM_VERSION}); rebuild the program.")
-        slot_count = int(payload.get("slot_count", 0))
-        tick_slot_coeffs = [[int(v) for v in row] for row in payload.get("tick_slot_coeffs", [])]
+        slot_count = require_int(
+            payload["slot_count"], what="runtime sequence program.slot_count")
+        tick_slot_coeffs = [
+            [
+                require_int(v, what="runtime sequence program.tick_slot_coeffs item")
+                for v in require_array(
+                    row, what="runtime sequence program.tick_slot_coeffs row")
+            ]
+            for row in require_array(
+                payload["tick_slot_coeffs"],
+                what="runtime sequence program.tick_slot_coeffs")
+        ]
         if tick_slot_coeffs and not any(any(row) for row in tick_slot_coeffs):
             tick_slot_coeffs = []
+        source_sequence = payload.get("source_sequence")
+        if source_sequence is not None:
+            source_sequence = require_object(
+                source_sequence, what="runtime sequence program.source_sequence")
+        source_table = payload.get("source_table")
+        if source_table is not None:
+            source_table = require_object(
+                source_table, what="runtime sequence program.source_table")
         return cls(
-            sequence_id=str(payload["sequence_id"]),
-            sequence_name=str(payload["sequence_name"]),
-            clock_hz=positive_float(payload["clock_hz"], "clock_hz"),
-            channels=list(channel_names(payload["channels"], "channels")),
-            ticks=[int(v) for v in payload["ticks"]],
-            masks=[int(v) for v in payload["masks"]],
-            duration=float(payload["duration"]),
-            source_sequence=None if payload.get("source_sequence") is None else dict(payload["source_sequence"]),
-            source_table=None if payload.get("source_table") is None else dict(payload["source_table"]),
-            repeat_forever=bool(payload.get("repeat_forever", False)),
-            loop_start_index=int(payload.get("loop_start_index", 0)),
-            loop_end_tick=int(payload.get("loop_end_tick", 0)),
-            loop_count=int(payload.get("loop_count", 1)),
-            repeat_from_index=int(payload.get("repeat_from_index", 0)),
+            sequence_id=require_string(
+                payload["sequence_id"], what="runtime sequence program.sequence_id"),
+            sequence_name=require_string(
+                payload["sequence_name"], what="runtime sequence program.sequence_name"),
+            clock_hz=positive_float(
+                require_number(payload["clock_hz"], what="runtime sequence program.clock_hz"),
+                "clock_hz"),
+            channels=list(channel_names([
+                require_string(v, what="runtime sequence program.channels item")
+                for v in require_array(
+                    payload["channels"], what="runtime sequence program.channels")
+            ], "channels")),
+            ticks=[
+                require_int(v, what="runtime sequence program.ticks item")
+                for v in require_array(
+                    payload["ticks"], what="runtime sequence program.ticks")
+            ],
+            masks=[
+                require_int(v, what="runtime sequence program.masks item")
+                for v in require_array(
+                    payload["masks"], what="runtime sequence program.masks")
+            ],
+            duration=require_number(
+                payload["duration"], what="runtime sequence program.duration"),
+            source_sequence=None if source_sequence is None else dict(source_sequence),
+            source_table=None if source_table is None else dict(source_table),
+            port_catalog_fingerprint=require_string(
+                payload["port_catalog_fingerprint"],
+                what="runtime sequence program.port_catalog_fingerprint"),
+            repeat_forever=require_bool(
+                payload["repeat_forever"], what="runtime sequence program.repeat_forever"),
+            loop_start_index=require_int(
+                payload["loop_start_index"], what="runtime sequence program.loop_start_index"),
+            loop_end_tick=require_int(
+                payload["loop_end_tick"], what="runtime sequence program.loop_end_tick"),
+            loop_count=require_int(
+                payload["loop_count"], what="runtime sequence program.loop_count"),
+            repeat_from_index=require_int(
+                payload["repeat_from_index"], what="runtime sequence program.repeat_from_index"),
             slot_count=slot_count,
-            slot_kinds=[str(v) for v in payload.get("slot_kinds", [])] or None,
-            loop_end_slot_coeffs=[int(v) for v in payload.get("loop_end_slot_coeffs", [])] or None,
+            slot_kinds=[
+                require_string(v, what="runtime sequence program.slot_kinds item")
+                for v in require_array(
+                    payload["slot_kinds"], what="runtime sequence program.slot_kinds")
+            ] or None,
+            loop_end_slot_coeffs=[
+                require_int(v, what="runtime sequence program.loop_end_slot_coeffs item")
+                for v in require_array(
+                    payload["loop_end_slot_coeffs"],
+                    what="runtime sequence program.loop_end_slot_coeffs")
+            ] or None,
             tick_slot_coeffs=tick_slot_coeffs or None,
-            scan_points=[[int(v) for v in item] for item in payload.get("scan_points", [])] or None,
-            scan_point_durations=[float(v) for v in payload.get("scan_point_durations", [])] or None,
-            scan_coeff_frac_bits=int(payload.get("scan_coeff_frac_bits", DEFAULT_COEFF_FRAC_BITS)),
-            scan_repeats=int(payload.get("scan_repeats", 0)),
-            bus_names=[str(item) for item in payload.get("bus_names", [])] or None,
-            bus_segments=[RuntimeBusSegment.from_dict(item) for item in payload.get("bus_segments", [])] or None,
-            bus_delays=[RuntimeBusDelay.from_dict(item) for item in payload.get("bus_delays", [])] or None,
-            channel_delays=[int(v) for v in payload.get("channel_delays", [])] or None,
-            clk_enable=int(payload.get("clk_enable", 0)),
+            scan_points=[
+                [
+                    require_int(v, what="runtime sequence program.scan_points item")
+                    for v in require_array(
+                        row, what="runtime sequence program.scan_points row")
+                ]
+                for row in require_array(
+                    payload["scan_points"], what="runtime sequence program.scan_points")
+            ] or None,
+            scan_point_durations=[
+                require_number(v, what="runtime sequence program.scan_point_durations item")
+                for v in require_array(
+                    payload["scan_point_durations"],
+                    what="runtime sequence program.scan_point_durations")
+            ] or None,
+            scan_coeff_frac_bits=require_int(
+                payload["scan_coeff_frac_bits"],
+                what="runtime sequence program.scan_coeff_frac_bits"),
+            scan_repeats=require_int(
+                payload["scan_repeats"], what="runtime sequence program.scan_repeats"),
+            bus_names=[
+                require_string(v, what="runtime sequence program.bus_names item")
+                for v in require_array(
+                    payload["bus_names"], what="runtime sequence program.bus_names")
+            ] or None,
+            bus_segments=[
+                RuntimeBusSegment.from_dict(require_object(
+                    item, what="runtime sequence program.bus segment"))
+                for item in require_array(
+                    payload["bus_segments"], what="runtime sequence program.bus_segments")
+            ] or None,
+            bus_delays=[
+                RuntimeBusDelay.from_dict(require_object(
+                    item, what="runtime sequence program.bus delay"))
+                for item in require_array(
+                    payload["bus_delays"], what="runtime sequence program.bus_delays")
+            ] or None,
+            channel_delays=[
+                require_int(v, what="runtime sequence program.channel_delays item")
+                for v in require_array(
+                    payload["channel_delays"],
+                    what="runtime sequence program.channel_delays")
+            ] or None,
+            clk_enable=require_int(
+                payload["clk_enable"], what="runtime sequence program.clk_enable"),
         )
 
     @property
@@ -388,10 +521,12 @@ def compile_runtime_program(
     *,
     channels: Sequence[str],
     clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
+    port_catalog: PortCatalog | Mapping[str, object] | None = None,
 ) -> RuntimeSequenceProgram:
     """Compile a ``PulseSequence`` into an uploadable edge table."""
 
-    channels = list(channel_names(channels, "channels"))
+    catalog = coerce_port_catalog(port_catalog, channels=channels)
+    channels = list(catalog.raw_lanes)
     clock_hz = positive_float(clock_hz, "clock_hz")
     base_sequence = sequence.without_repeat()
     ticks, masks, channels = base_sequence.edges(clock_hz=clock_hz, channels=channels)
@@ -412,6 +547,7 @@ def compile_runtime_program(
         "masks": masks,
         "repeat_count": sequence.repeat_count,
         "repeat_forever": sequence.repeat_forever,
+        "port_catalog_fingerprint": catalog.fingerprint,
     }
     sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     return RuntimeSequenceProgram(
@@ -423,6 +559,8 @@ def compile_runtime_program(
         masks=list(masks),
         duration=sequence.duration,
         source_sequence=sequence.to_dict(),
+        source_table=sequence.source_table,
+        port_catalog_fingerprint=catalog.fingerprint,
         repeat_forever=bool(sequence.repeat_forever),
         loop_start_index=0,
         loop_end_tick=loop_end_tick,
@@ -430,24 +568,44 @@ def compile_runtime_program(
     )
 
 
-def _resolve_hardware_channels(state: "PulseTableState", channels) -> list[str]:
-    """The hardware channel list a pulse-table program compiles against -- the explicit ``channels``
-    or the state's own -- validated so every channel the table USES is a real hardware channel (#G5).
-    ONE source for both compile paths (1-D + scan), so the unknown-channel guard can't drift."""
-    resolved = list(channel_names(state.channels if channels is None else channels, "channels"))
-    unknown = [channel for channel in state.channels if channel not in resolved]
-    if unknown:
-        raise ValueError(f"pulse table channels are not in hardware channels: {unknown}.")
-    return resolved
+def _resolve_hardware_catalog(
+    state: "PulseTableState",
+    port_catalog: PortCatalog | Mapping[str, object] | None = None,
+) -> tuple[list[str], PortCatalog]:
+    """Resolve the one catalog a pulse-table compiler is allowed to use.
+
+    A pulse table is already bound to a complete immutable topology.  Passing
+    a connected device catalog is only a fingerprint assertion; it cannot
+    supply a second raw-lane universe or silently align the document.
+    """
+
+    catalog = state.port_catalog
+    if port_catalog is not None:
+        device_catalog = (
+            port_catalog if isinstance(port_catalog, PortCatalog)
+            else PortCatalog.from_dict(port_catalog)
+        )
+        if device_catalog.fingerprint != catalog.fingerprint:
+            pulse_only = sorted(set(catalog.raw_lanes) - set(device_catalog.raw_lanes))
+            device_only = sorted(set(device_catalog.raw_lanes) - set(catalog.raw_lanes))
+            raise ValueError(
+                "pulse port topology does not match the connected sequencer: "
+                f"pulse={catalog.fingerprint}, device={device_catalog.fingerprint}. "
+                f"Pulse-only raw lanes: {pulse_only}; device-only raw lanes: {device_only}. "
+                "Align the template to the device PortCatalog before compiling.")
+    if not catalog.raw_lanes:
+        raise ValueError(
+            "pulse PortCatalog must contain at least one raw lane.")
+    return list(catalog.raw_lanes), catalog
 
 
 def compile_pulse_table_runtime_program(
     state: PulseTableState,
     *,
-    channels: Sequence[str] | None = None,
     clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
     slots: Mapping[str, float] | None = None,
     repeat_forever: bool = True,
+    port_catalog: PortCatalog | Mapping[str, object] | None = None,
 ) -> RuntimeSequenceProgram:
     """Compile GUI period-card state into an unexpanded FPGA loop program.
 
@@ -459,10 +617,10 @@ def compile_pulse_table_runtime_program(
     scan point), so this path emits a single static program.
     """
 
-    channels = _resolve_hardware_channels(state, channels)
+    channels, catalog = _resolve_hardware_catalog(state, port_catalog)
     clock_hz = positive_float(clock_hz, "clock_hz")
     clock_step_ns = 1e9 / clock_hz
-    slot_values = state.reference_slots() if slots is None else dict(slots)
+    slot_values = state._reference_slots() if slots is None else state._compiler_values_for(slots)
 
     # A (constant) channel delay inside a finite repeat bracket: there is no inner-loop
     # boundary for an additively-shifted edge to cross once the bracket is UNROLLED into a
@@ -476,14 +634,17 @@ def compile_pulse_table_runtime_program(
         _check_unrolled_edge_budget(unrolled, slots=slot_values, time_step_ns=clock_step_ns)
         return compile_pulse_table_runtime_program(
             unrolled,
-            channels=channels,
             clock_hz=clock_hz,
             slots=slots,
             repeat_forever=repeat_forever,
+            port_catalog=catalog,
         )
 
-    state.validate(slots=slot_values, time_step_ns=clock_step_ns)
-    sequence = state.to_sequence(slots=slot_values, time_step_ns=clock_step_ns, expand_repeat=False)
+    state.validate(
+        slots=slot_values, time_step_ns=clock_step_ns, _slots_are_compiler=True)
+    sequence = state.to_sequence(
+        slots=state._semantic_values_from_compiler(slot_values),
+        time_step_ns=clock_step_ns, expand_repeat=False)
     period_starts = state.period_start_steps(slots=slot_values, time_step_ns=clock_step_ns)
     bus_names, bus_segments, raw_bus_delays = _pulse_table_bus_segments(
         state,
@@ -531,7 +692,8 @@ def compile_pulse_table_runtime_program(
     # Channels wired to clk are driven by the top's clk mux, NOT the engine: force their
     # bits to 0 in every edge mask so the engine never fights the clk routing.  Compute the
     # mask in the COMPILED channel order (masks use that order, which may differ from state).
-    clk_enable = _clk_enable_mask_for_channels(channels, state.clk_channels)
+    clock_lanes = [port.lanes[0] for port in state.port_catalog.clock_ports]
+    clk_enable = _clk_enable_mask_for_channels(channels, clock_lanes)
     if clk_enable:
         masks = [int(mask) & ~clk_enable for mask in masks]
     effective_duration_ticks = _pulse_table_effective_duration_ticks(state, slots=slot_values, time_step_ns=clock_step_ns)
@@ -553,6 +715,7 @@ def compile_pulse_table_runtime_program(
         "bus_delays": [bd.to_dict() for bd in bus_delays],
         "channel_delays": _channel_delays_list(channel_delays, len(channels)),
         "clk_enable": int(clk_enable),
+        "port_catalog_fingerprint": catalog.fingerprint,
     }
     channel_delays_list = _channel_delays_list(channel_delays, len(channels)) if channel_delays else None
     sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
@@ -569,6 +732,7 @@ def compile_pulse_table_runtime_program(
         duration=effective_duration_ticks / clock_hz,
         source_sequence=sequence.to_dict(),
         source_table=state.to_dict(),
+        port_catalog_fingerprint=catalog.fingerprint,
         repeat_forever=bool(repeat_forever),
         loop_start_index=loop_start_index,
         loop_end_tick=loop_end_tick,
@@ -586,10 +750,10 @@ def compile_pulse_table_scan_runtime_program(
     state: PulseTableState,
     *,
     scan_table: Sequence[Sequence[float]] | None = None,
-    channels: Sequence[str] | None = None,
     clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
     repeat_forever: bool = False,
     coeff_frac_bits: int = DEFAULT_COEFF_FRAC_BITS,   # config single source (bitstream-affecting)
+    port_catalog: PortCatalog | Mapping[str, object] | None = None,
 ) -> RuntimeSequenceProgram:
     """Compile a ``PulseTableState`` with bound scan slots into a scan program.
 
@@ -601,7 +765,7 @@ def compile_pulse_table_scan_runtime_program(
     parameter table are uploaded.
     """
 
-    channels = _resolve_hardware_channels(state, channels)
+    channels, catalog = _resolve_hardware_catalog(state, port_catalog)
     clock_hz = positive_float(clock_hz, "clock_hz")
     clock_step_ns = 1e9 / clock_hz
     if not state.scan_slots:
@@ -616,14 +780,14 @@ def compile_pulse_table_scan_runtime_program(
     has_bracket = state.repeat_start is not None and state.repeat_end is not None
     if has_bracket and _pulse_table_has_any_delay(state):
         unrolled = state.unrolled_bracket()
-        _check_unrolled_edge_budget(unrolled, slots=unrolled.reference_slots(), time_step_ns=clock_step_ns)
+        _check_unrolled_edge_budget(unrolled, slots=unrolled._reference_slots(), time_step_ns=clock_step_ns)
         return compile_pulse_table_scan_runtime_program(
             unrolled,
             scan_table=scan_table,
-            channels=channels,
             clock_hz=clock_hz,
             repeat_forever=repeat_forever,
             coeff_frac_bits=coeff_frac_bits,
+            port_catalog=catalog,
         )
 
     # DAC value + duration scan simultaneously: every analog-bus segment's ticks are
@@ -645,7 +809,7 @@ def compile_pulse_table_scan_runtime_program(
     table = _snap_scan_table(
         raw_rows, state.scan_slots, time_step_ns=clock_step_ns, dac_ranges=state.scan_slot_dac_ranges()
     )
-    slot_vars = state.scan_var_names
+    slot_vars = state.compiler_scan_vars
 
     def point_slots_ns(row: Sequence[float]) -> dict[str, float]:
         # Time slots carry a physical time (-> ns); DAC slots carry the user-facing
@@ -692,7 +856,9 @@ def compile_pulse_table_scan_runtime_program(
     # _validate_slot_timing) was pure O(N) waste.  ``_validate_slot_timing`` remains the single
     # source the reference validate uses.  (Empty ``scan_dep_*`` -> the per-point body is a no-op,
     # exactly matching a scan whose only slots are DAC values.)
-    state.validate(slots=state.reference_slots(), time_step_ns=clock_step_ns)
+    state.validate(
+        slots=state._reference_slots(), time_step_ns=clock_step_ns,
+        _slots_are_compiler=True)
     _refs_slot = re.compile(r"s\d").search
     scan_dep_periods = [period for period in state.periods if _refs_slot(str(period.duration))]
     scan_dep_delays = [channel for channel, value in state.delays.items() if _refs_slot(str(value))]
@@ -713,21 +879,20 @@ def compile_pulse_table_scan_runtime_program(
     # they are not also driven as TTL bits.
     bus_names: list[str] = []
     bus_segments: list[RuntimeBusSegment] = []
-    bus_members: list[str] = []
+    # DAC membership is topology, never inferred from whether this particular
+    # pulse happens to contain a waveform plan.  Its raw lanes must never leak
+    # back into the TTL edge engine when a bus is idle.
+    bus_members: list[str] = [
+        lane for port in state.port_catalog.dac_ports for lane in port.lanes]
     raw_bus_delays: dict[int, int] = {}
     if _pulse_table_has_analog_activity(state):
         bus_names, bus_segments, raw_bus_delays = _pulse_table_bus_segments(
             state,
-            slots=state.reference_slots(),
+            slots=state._reference_slots(),
             time_step_ns=clock_step_ns,
             slot_vars=slot_vars,
             coeff_frac_bits=coeff_frac_bits,
         )
-        # Exclude from the TTL edge table ONLY the members of ANALOG buses (those bus-engine driven).
-        # A channel in a bus group that is NOT an analog bus is a plain TTL bit and must STAY in the
-        # edge table -- not silently dropped from both TTL and DAC (#phantom-bus).
-        bus_members = [channel for bus, members in state.bus_channels().items()
-                       if bus in state.analog_bus_modes for channel in members]
 
     # PHYSICAL CHANNEL DELAY: a delay is NOT scanned and NOT baked into the edges -- it is a
     # CONSTANT per-channel OUTPUT delay (a delay line; see engine_model.delay_line_reference).
@@ -753,9 +918,9 @@ def compile_pulse_table_scan_runtime_program(
                 raise ValueError(
                     f"channel {ch!r} delay {raw!r} references a scanned slot; a channel delay is "
                     "a fixed per-channel value and cannot be scanned (scan the duration instead).")
-    clk_set = set(state.clk_channels)
+    clk_set = {port.lanes[0] for port in state.port_catalog.clock_ports}
     raw_delay = {}
-    for ch in state.channels:
+    for ch in state.port_catalog.raw_lanes:
         # clk channels are clk-mux driven (no engine output); OFF channels emit nothing -- neither
         # may contribute a delay that would shift the global frame G and delay ACTIVE channels.
         if ch in bus_members or ch not in hardware_bits or ch in clk_set:
@@ -763,7 +928,7 @@ def compile_pulse_table_scan_runtime_program(
         ch_index = state.channel_index(ch)
         if not any(int(period.states[ch_index]) for period in state.periods):
             continue
-        raw_delay[ch] = state.delay_steps(ch, slots=state.reference_slots(), time_step_ns=clock_step_ns)
+        raw_delay[ch] = state.delay_steps(ch, slots=state._reference_slots(), time_step_ns=clock_step_ns)
     # EVERY DRIVEN bus (emits >= 1 segment) must inherit the global shift G, even with no
     # explicit delay of its own -- so a negative TTL delay shifts the DAC buses in lockstep
     # with the TTLs instead of letting them lead (the "-2 s emCCD shows DA_bias_y first" bug).
@@ -789,8 +954,8 @@ def compile_pulse_table_scan_runtime_program(
     ticks = [row[0] for row in rows]
     masks = [row[1] for row in rows]
     # Channels wired to clk are driven by the top's clk mux, not the engine -> 0 in masks.
-    # Mask in the COMPILED channel order (not state.channels) so it lands on the right bits.
-    clk_enable = _clk_enable_mask_for_channels(channels, state.clk_channels)
+    # Mask in the compiled raw-lane order so it lands on the right bits.
+    clk_enable = _clk_enable_mask_for_channels(channels, clk_set)
     if clk_enable:
         masks = [int(mask) & ~clk_enable for mask in masks]
     tick_slot_coeffs = [list(row[2]) for row in rows]
@@ -805,7 +970,9 @@ def compile_pulse_table_scan_runtime_program(
         float(_apply_affine_ticks(ticks[-1], tick_slot_coeffs[-1], point, coeff_frac_bits)) / clock_hz
         for point in points_ticks
     ]
-    sequence = state.to_sequence(slots=point_slots_ns(table[0]), time_step_ns=clock_step_ns, expand_repeat=False)
+    sequence = state.to_sequence(
+        slots=state._semantic_values_from_compiler(point_slots_ns(table[0])),
+        time_step_ns=clock_step_ns, expand_repeat=False)
     slot_kinds = [slot.kind for slot in state.scan_slots]
     source_table = state.to_dict()
     source_table["scan_table"] = [list(row) for row in table]
@@ -829,6 +996,7 @@ def compile_pulse_table_scan_runtime_program(
         "bus_delays": [bd.to_dict() for bd in bus_delays],
         "channel_delays": _channel_delays_list(channel_delays, len(channels)),
         "clk_enable": int(clk_enable),
+        "port_catalog_fingerprint": catalog.fingerprint,
     }
     channel_delays_list = _channel_delays_list(channel_delays, len(channels)) if channel_delays else None
     sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
@@ -845,6 +1013,7 @@ def compile_pulse_table_scan_runtime_program(
         duration=sum(point_durations),
         source_sequence=sequence.to_dict(),
         source_table=source_table,
+        port_catalog_fingerprint=catalog.fingerprint,
         repeat_forever=bool(repeat_forever),
         loop_start_index=loop_start_index,
         loop_end_tick=loop_end_tick,
@@ -868,8 +1037,9 @@ def compile_pulse_table_scan_runtime_program(
 def compile_runtime_program_for_payload(
     payload: PulseSequence | PulseTableState,
     *,
-    channels: Sequence[str],
+    channels: Sequence[str] | None = None,
     clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
+    port_catalog: PortCatalog | Mapping[str, object] | None = None,
 ) -> RuntimeSequenceProgram:
     """Compile either finite sequence data or GUI pulse-table data."""
 
@@ -883,18 +1053,27 @@ def compile_runtime_program_for_payload(
         if payload.scan_slots and payload.scan_table:
             return compile_pulse_table_scan_runtime_program(
                 payload,
-                channels=channels,
                 clock_hz=clock_hz,
                 scan_table=payload.scan_table,
                 repeat_forever=payload.repeat_forever,
+                port_catalog=port_catalog,
             )
         return compile_pulse_table_runtime_program(
             payload,
-            channels=channels,
             clock_hz=clock_hz,
             repeat_forever=payload.repeat_forever,
+            port_catalog=port_catalog,
         )
-    return compile_runtime_program(payload, channels=channels, clock_hz=clock_hz)
+    if channels is None:
+        if port_catalog is None:
+            raise ValueError("compiling a PulseSequence requires a PortCatalog")
+        catalog = (
+            port_catalog if isinstance(port_catalog, PortCatalog)
+            else PortCatalog.from_dict(port_catalog)
+        )
+        channels = catalog.raw_lanes
+    return compile_runtime_program(
+        payload, channels=channels, clock_hz=clock_hz, port_catalog=port_catalog)
 
 
 class SequencerService:
@@ -908,7 +1087,8 @@ class SequencerService:
     def __init__(
         self,
         *,
-        channels: Sequence[str],
+        channels: Sequence[str] | None = None,
+        port_catalog: PortCatalog | Mapping[str, object] | None = None,
         clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
         prepare_callback: Callable[[RuntimeSequenceProgram], None] | None = None,
         fire_callback: Callable[[RuntimeSequenceProgram], None] | None = None,
@@ -918,7 +1098,8 @@ class SequencerService:
         sleep_scale: float = 0.0,
         cache_prepared: bool = True,
     ):
-        self.channels = list(channel_names(channels, "channels"))
+        self.port_catalog = coerce_port_catalog(port_catalog, channels=channels)
+        self.channels = list(self.port_catalog.raw_lanes)
         self.clock_hz = positive_float(clock_hz, "clock_hz")
         self.prepare_callback = prepare_callback
         self.fire_callback = fire_callback
@@ -957,6 +1138,7 @@ class SequencerService:
                 timing_payload,
                 channels=self.channels,
                 clock_hz=self.clock_hz,
+                port_catalog=self.port_catalog,
             )
             # Backstop: validate the compiled program against the FPGA geometry / delay-line
             # depth REGARDLESS of which backend's prepare_callback runs.  An AXI backend
@@ -1016,21 +1198,24 @@ class SequencerService:
         return program.to_dict()
 
     def _record_source_payload(self, sequence_payload) -> None:
-        """Record the SOURCE timing as a syncable ``PulseTableState`` JSON (always carries
-        ``periods``), so the pulse GUI's Sync can ALWAYS reconstruct the editor from whatever
-        ANYONE handed the server -- GUI, API or Task -- because the server records the timing
-        it was given.  A GUI-authored ``PulseTableState`` is recorded verbatim (names + slots
-        preserved); a bare ``PulseSequence`` (compiled timing with no periods -- e.g. a Task
-        firing ``reference_bracket.to_sequence()``) is reconstructed into a period table via
-        :meth:`PulseTableState.from_sequence`, so it syncs too.  This is the single record
-        seam shared by ``prepare`` and ``fire`` -- there is no path that fires timing the GUI
-        then "cannot sync"."""
+        """Record the exact editable source applied to this sequencer.
+
+        ``PulseTableState.to_sequence`` carries its source document explicitly;
+        consuming it here avoids the old lossy edge decompile that erased DAC
+        ports, slots and scan code.  A genuinely low-level PulseSequence has no
+        such document, so its fallback table is built against this service's
+        PortCatalog: even that honest best-effort view preserves logical DAC
+        rows rather than exposing their raw bit lanes.
+        """
         step = 1e9 / float(self.clock_hz)
         timing = timing_from_payload(sequence_payload)   # parses str / dict / object
         if isinstance(timing, PulseTableState):
             table = timing.snapped(time_step_ns=step)
+        elif timing.source_table is not None:
+            table = PulseTableState.from_dict(timing.source_table).snapped(time_step_ns=step)
         else:
-            table = PulseTableState.from_sequence(timing, channels=self.channels, clock_hz=self.clock_hz)
+            table = PulseTableState.from_sequence(
+                timing, port_catalog=self.port_catalog, clock_hz=self.clock_hz)
         self.last_payload_json = json.dumps(table.to_dict())
 
     def fire(self, sequence_payload=None) -> dict[str, object]:
@@ -1041,6 +1226,7 @@ class SequencerService:
                     timing_from_payload(sequence_payload),
                     channels=self.channels,
                     clock_hz=self.clock_hz,
+                    port_catalog=self.port_catalog,
                 )
                 if requested.sequence_id != program.sequence_id:
                     raise RuntimeError("fire(sequence) does not match the prepared runtime program.")
@@ -1142,7 +1328,9 @@ class SequencerService:
         with self._lock:
             return {
                 "type": type(self).__name__,
-                "channels": list(self.channels),
+                "raw_channels": list(self.port_catalog.raw_lanes),
+                "port_catalog": self.port_catalog.to_dict(),
+                "port_catalog_fingerprint": self.port_catalog.fingerprint,
                 "clock_hz": self.clock_hz,
                 "state": self.state,
                 "cache_prepared": self.cache_prepared,
@@ -1171,30 +1359,32 @@ class ManualSequencer(SequencerDevice):
     def __init__(
         self,
         *,
-        channels: Sequence[str],
+        channels: Sequence[str] | None = None,
+        port_catalog: PortCatalog | Mapping[str, object] | None = None,
         clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
         message: str | None = None,
     ):
-        self.channels = list(channel_names(channels, "channels"))
+        self.port_catalog = coerce_port_catalog(port_catalog, channels=channels)
+        self.channels = list(self.port_catalog.raw_lanes)
         self.clock_hz = positive_float(clock_hz, "clock_hz")
         self.message = message or "Camera is armed. Start the FPGA/manual trigger sequence now."
-        self.prepared_sequence: PulseSequence | None = None
+        self.prepared_sequence: PulseSequence | PulseTableState | None = None
         self.state = "idle"
         self.history: list[dict[str, object]] = []
 
-    def prepare(self, sequence: PulseSequence) -> RuntimeSequenceProgram:
-        sequence.validate(clock_hz=self.clock_hz, channels=self.channels).raise_if_failed()
-        program = compile_runtime_program(
+    def prepare(self, sequence: PulseSequence | PulseTableState) -> RuntimeSequenceProgram:
+        program = compile_runtime_program_for_payload(
             sequence,
             channels=self.channels,
             clock_hz=self.clock_hz,
+            port_catalog=self.port_catalog,
         )
         self.prepared_sequence = sequence
         self.state = "prepared"
         self.history.append({"action": "prepare", "sequence_id": program.sequence_id})
         return program
 
-    def fire(self, sequence: PulseSequence | None = None) -> None:
+    def fire(self, sequence: PulseSequence | PulseTableState | None = None) -> None:
         if self.prepared_sequence is None:
             raise RuntimeError("ManualSequencer.fire() called before prepare().")
         if sequence is not None and sequence is not self.prepared_sequence:
@@ -1219,7 +1409,9 @@ class ManualSequencer(SequencerDevice):
     def snapshot(self) -> dict[str, object]:
         out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot
         out.update({
-            "channels": self.display_channels(),   # DAC coil bits folded into buses (ONE source)
+            "raw_channels": list(self.port_catalog.raw_lanes),
+            "port_catalog": self.port_catalog.to_dict(),
+            "port_catalog_fingerprint": self.port_catalog.fingerprint,
             "clock_hz": self.clock_hz,
             "state": self.state,
             "prepared": self.prepared_sequence is not None,
@@ -1236,8 +1428,6 @@ class RemoteSequencer(SequencerDevice):
         *,
         host: str,
         port: int,
-        channels: Sequence[str],
-        clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
         ssl: bool = False,
         ca_certs: str | None = None,
         connect_on_init: bool = False,
@@ -1246,8 +1436,12 @@ class RemoteSequencer(SequencerDevice):
         if self.host in {"", "0.0.0.0", "::"}:
             raise ValueError("RemoteSequencer host must be the server address reachable from the control computer.")
         self.port = int(port)
-        self.channels = list(channel_names(channels, "channels"))
-        self.clock_hz = positive_float(clock_hz, "clock_hz")
+        # A disconnected remote client has no hardware facts.  Topology and clock
+        # are bound atomically from the server snapshot in ``open()``; accepting
+        # either as a constructor input would create a second, drift-prone truth.
+        self.port_catalog: PortCatalog | None = None
+        self.channels: list[str] = []
+        self.clock_hz: float | None = None
         self.ssl = bool(ssl)
         self.ca_certs = ca_certs
         self._conn = None
@@ -1258,17 +1452,15 @@ class RemoteSequencer(SequencerDevice):
     # ------------------------------------------------------------------ config schema (self-describing)
     @classmethod
     def config_params(cls):
-        """The remote-streamer form with USABLE prefills the bare reflection cannot know:
-        ``port`` defaults to the server's own serve default (read from
-        ``serve_runtime_sequencer``'s signature -- one source, never a re-typed magic
-        number) and ``channels`` to the FPGA bit-order names (``hardware_channel_names``,
-        the same list the bundled remote template carries).  ``host`` stays required --
-        only the lab knows its FPGA computer's address."""
+        """Remote connection form; hardware facts come from the server snapshot.
+
+        ``port`` defaults to the server's own serve default (one source).  The form
+        contains connection parameters only: no client-side topology or clock copy.
+        """
         import inspect as _inspect
         from dataclasses import replace
 
         from .base import config_params_from_signature
-        from .fpga_pulse_streamer import hardware_channel_names
 
         serve_port = int(_inspect.signature(serve_runtime_sequencer).parameters["port"].default)
         rows = []
@@ -1278,11 +1470,6 @@ class RemoteSequencer(SequencerDevice):
                                              "control computer (never 0.0.0.0).")
             elif decl.key == "port":
                 decl = replace(decl, default=serve_port, required=False)
-            elif decl.key == "channels":
-                decl = replace(decl, kind="json", default=list(hardware_channel_names()),
-                               required=False,
-                               tooltip="Channel names in FPGA bit order (the server snapshot "
-                                       "overwrites these on connect).")
             rows.append(decl)
         return tuple(rows)
 
@@ -1294,7 +1481,7 @@ class RemoteSequencer(SequencerDevice):
             # would otherwise be returned FOREVER and every call would keep raising
             # EOFError until the user restarted the GUI/notebook too.  Drop it and
             # reconnect transparently on this call.
-            self._conn = None
+            self.close()
         try:
             import rpyc
         except ImportError as exc:  # pragma: no cover - depends on lab install
@@ -1311,9 +1498,21 @@ class RemoteSequencer(SequencerDevice):
                 host=self.host, port=self.port, ca_certs=self.ca_certs, config=rpyc_config)
         else:
             self._conn = rpyc.connect(self.host, self.port, config=rpyc_config)
-        snap = self._conn.root.snapshot()
-        self.channels = list(snap.get("channels", self.channels))
-        self.clock_hz = float(snap.get("clock_hz", self.clock_hz))
+        try:
+            # Parse both facts before publishing either one on the client.  A partial
+            # or stale server cannot leave a half-bound RemoteSequencer behind.
+            snap = self._conn.root.snapshot()
+            remote_catalog = PortCatalog.from_dict(snap["port_catalog"])
+            remote_clock_hz = positive_float(snap["clock_hz"], "server snapshot clock_hz")
+        except Exception as exc:
+            self.close()
+            raise RuntimeError(
+                "the sequencer server snapshot must contain a complete PortCatalog and a "
+                "positive clock_hz; update/restart the server before connecting this client"
+            ) from exc
+        self.port_catalog = remote_catalog
+        self.channels = list(remote_catalog.raw_lanes)
+        self.clock_hz = remote_clock_hz
         return self
 
     def prepare(self, sequence: PulseSequence | PulseTableState) -> RuntimeSequenceProgram:
@@ -1323,6 +1522,11 @@ class RemoteSequencer(SequencerDevice):
             timing_payload_to_dict(sequence, time_step_ns=step), _WIRE_ARRAY_FIELDS_PAYLOAD)
         prog_head, prog_blobs = self._conn.root.prepare(head, blobs)
         self._last_program = RuntimeSequenceProgram.from_dict(decode_wire_payload(prog_head, prog_blobs))
+        if self._last_program.port_catalog_fingerprint != self.port_catalog.fingerprint:
+            raise RuntimeError(
+                "remote compiler returned a program for a different PortCatalog: "
+                f"program={self._last_program.port_catalog_fingerprint}, "
+                f"connected={self.port_catalog.fingerprint}")
         return self._last_program
 
     def fire(self, sequence: PulseSequence | PulseTableState | None = None) -> None:
@@ -1343,14 +1547,11 @@ class RemoteSequencer(SequencerDevice):
         return bool(self._conn.root.wait_done(timeout))
 
     def scan_progress(self) -> dict:
-        # Lightweight poll for the GUI's live scan progress -- reconnect like every other call so a
-        # server blip never wedges the poller; fall back to idle if the server lacks the method.
-        from .base import SequencerDevice
+        # Lightweight poll for the GUI's live scan progress.  This is a required
+        # server capability: pretending an old/incompatible server is idle hides
+        # both version skew and a running experiment.
         self.open()
-        try:
-            return dict(self._conn.root.scan_progress())
-        except AttributeError:
-            return SequencerDevice.scan_progress(self)
+        return dict(self._conn.root.scan_progress())
 
     def abort(self) -> None:
         # Reconnect first, exactly like fire/wait_done/set_safe_state.  abort runs
@@ -1366,10 +1567,13 @@ class RemoteSequencer(SequencerDevice):
 
     def snapshot(self) -> dict[str, object]:
         out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot
+        catalog = self.port_catalog
         out.update({
             "host": self.host,
             "port": self.port,
-            "channels": list(self.channels),
+            "raw_channels": [] if catalog is None else list(catalog.raw_lanes),
+            "port_catalog": None if catalog is None else catalog.to_dict(),
+            "port_catalog_fingerprint": None if catalog is None else catalog.fingerprint,
             "clock_hz": self.clock_hz,
             "connected": self._conn is not None,
             "last_program": None if self._last_program is None else self._last_program.to_dict(),
@@ -1392,6 +1596,9 @@ class RemoteSequencer(SequencerDevice):
                 self._conn.close()
             finally:
                 self._conn = None
+        self.port_catalog = None
+        self.channels = []
+        self.clock_hz = None
 
 
 class PulseController:
@@ -1399,7 +1606,7 @@ class PulseController:
 
     It keeps readout scans terse.  A single-point scan sets one slot per shot::
 
-        pulse.set_time(200)          # ns into the first duration/delay slot
+        pulse.set_slot("exposure", 200)  # ns into a semantic duration slot
         pulse.on_pulse()
 
     A multi-point hardware scan uploads a whole scan table once::
@@ -1417,22 +1624,31 @@ class PulseController:
         self.slots: dict[str, float] = {}
         self.last_program: RuntimeSequenceProgram | None = None
 
-    def set_slot(self, key: int | str, value: float) -> "PulseController":
-        """Set one scan-slot value for single-shot resolves.
+    def set_slot(self, key: str, value: float) -> "PulseController":
+        """Set one semantic scan-slot value for a single-shot resolve.
 
         Time slots take ns.  DAC slots take the SIGNED user value (0 = true 0 V,
         -2^(B-1)..+2^(B-1)-1); the offset-binary wire code is produced by the
-        compiler -- never pass a raw 0..1023 code here."""
-        name = key if isinstance(key, str) else slot_var(int(key))
+        compiler -- never pass a raw 0..1023 code here.  Positional ``sN``
+        tokens and integer columns are compiler internals and are rejected."""
+
+        if not isinstance(key, str):
+            raise TypeError("scan slot must be addressed by its semantic ScanSlot.name")
+        if not isinstance(self.pulse, PulseTableState):
+            raise TypeError("only PulseTableState exposes semantic scan slots")
+        name = str(key)
+        if name not in self.pulse.scan_names:
+            raise ValueError(
+                f"unknown semantic scan slot {name!r}; available: {self.pulse.scan_names}")
         self.slots[name] = float(value)
         return self
 
     def set_time(self, value_ns: float) -> "PulseController":
-        """Set the first duration/delay scan slot (in ns) for the next shot."""
+        """Set the first duration scan slot (in ns) for the next shot."""
 
         name = self.pulse.primary_time_slot() if isinstance(self.pulse, PulseTableState) else None
         if name is None:
-            raise TypeError("pulse has no duration/delay scan slot; bind one via the GUI scan dot or state.bind_field(...).")
+            raise TypeError("pulse has no duration scan slot; bind one via the GUI scan dot or state.bind_field(...).")
         return self.set_slot(name, value_ns)
 
     def set_scan_table(self, rows: Sequence[Sequence[float]] | None) -> "PulseController":
@@ -1481,9 +1697,10 @@ class PulseController:
             merged[name] = float(time_ns)
         payload = self.payload(slots=merged, scan_table=[], repeat_forever=False)
         if isinstance(payload, PulseTableState):
-            ref_slots = payload.reference_slots()
+            ref_slots = payload._reference_slots()
             sequence = payload.to_sequence(
-                slots=ref_slots, time_step_ns=payload.time_step_ns, expand_repeat=False)
+                slots=payload._semantic_values_from_compiler(ref_slots),
+                time_step_ns=payload.time_step_ns, expand_repeat=False)
             # ``to_sequence`` returns only the pulse EDGES, so a trailing all-low period (a gap the
             # table defines AFTER the last edge) is invisible in the edge list -- its duration would
             # be dropped, shortening the fired program by that tail.  The program must run the WHOLE
@@ -1620,8 +1837,10 @@ class PulseController:
         if not isinstance(self.pulse, PulseTableState):
             raise TypeError("set_channel_delay needs a PulseTableState pulse (not a raw PulseSequence).")
         channel = str(channel)
-        if channel not in self.pulse.channels:
-            raise ValueError(f"unknown channel {channel!r}; choices: {list(self.pulse.channels)}")
+        if channel not in self.pulse.port_catalog.raw_lanes:
+            raise ValueError(
+                f"unknown channel {channel!r}; choices: "
+                f"{list(self.pulse.port_catalog.raw_lanes)}")
         # Only the real TTL outputs have a delay line; a delay on a bus-member bit or a
         # da_clk pin has no hardware effect, so reject it here (the RTL also gates it to a
         # passthrough).  Eligible = hardware position < the eligible count.
@@ -1904,7 +2123,7 @@ def _pulse_table_affine_rows(
     starts = _pulse_table_affine_period_starts(state, slot_vars=slot_vars, time_step_ns=time_step_ns, coeff_frac_bits=coeff_frac_bits)
     events: list[tuple[tuple[int, tuple[int, ...]], str | None, int | None]] = []
 
-    for channel_index, channel in enumerate(state.channels):
+    for channel_index, channel in enumerate(state.port_catalog.raw_lanes):
         if channel in exclude:
             continue  # analog-bus members are driven by the bus engine, not TTL edges
         active_start: tuple[int, tuple[int, ...]] | None = None
@@ -2153,8 +2372,8 @@ def _pulse_table_edge_table(
     # --- per-channel UN-delayed ON intervals over [0, T) + each channel's raw delay ---
     base_intervals: dict[str, list[tuple[int, int]]] = {}
     raw_delay: dict[str, int] = {}
-    clk_set = set(state.clk_channels)
-    for channel_index, channel in enumerate(state.channels):
+    clk_set = {port.lanes[0] for port in state.port_catalog.clock_ports}
+    for channel_index, channel in enumerate(state.port_catalog.raw_lanes):
         # clk channels are driven by the top's clk mux, not the engine -> no edges, no delay.
         if channel in bus_members or channel not in channel_bits or channel in clk_set:
             continue
@@ -2175,9 +2394,6 @@ def _pulse_table_edge_table(
         base_intervals[channel] = ivals
     if fold_analog_buses:
         for bus_name, members in bus_groups.items():
-            if bus_name not in state.analog_bus_modes:
-                continue   # only ANALOG buses fold into the masks; a non-analog group's members are
-                           # plain TTL and were already processed above (#phantom-bus)
             bus_delay = _pulse_table_bus_delay_steps(state, members, slots=slots, time_step_ns=time_step_ns)
             plan = state.analog_bus_plan(bus_name)
             # An UNTOUCHED bus (all-hold plan, resting at 0 V) folds NOTHING -- the
@@ -2293,14 +2509,6 @@ def _pulse_table_bus_delay_steps(
     return next(iter(delays), 0)
 
 
-def _pulse_table_bus_order(bus_groups: Mapping[str, Sequence[str]]) -> list[str]:
-    """Return the HDL bus order, keeping address-switch buses stable."""
-
-    names = [name for name in DEFAULT_RUNTIME_BUS_NAMES if name in bus_groups]
-    names.extend(name for name in bus_groups if name not in names)
-    return names
-
-
 def _slot_ref_index(value: object, slot_vars: Sequence[str]) -> int | None:
     """Return the scan-slot column index a bus value references, else ``None``.
 
@@ -2359,14 +2567,18 @@ def _pulse_table_bus_segments(
         else None
     )
     bus_groups = state.bus_channels()
-    bus_names = _pulse_table_bus_order(bus_groups)
+    # Physical bus order/index belongs to PortCatalog.  Never sort by a
+    # hand-written tuple or template dict insertion order: either would silently
+    # route a logical DAC to the wrong zlc_bus_out slice.
+    bus_specs = [port for port in state.port_catalog.dac_ports if port.key in bus_groups]
+    bus_names = [port.key for port in bus_specs]
     segments: list[RuntimeBusSegment] = []
     bus_delays: dict[int, int] = {}
-    for bus_index, bus_name in enumerate(bus_names):
+    for bus_spec in bus_specs:
+        bus_index = int(bus_spec.bus_index)
+        bus_name = bus_spec.key
         members = bus_groups[bus_name]
         plan = state.analog_bus_plan(bus_name)
-        if bus_name not in state.analog_bus_modes:
-            continue   # a group not explicitly an analog bus is plain TTL -- never a (phantom) DAC bus (#phantom-bus)
         # A bus delay is NOT baked into the segment ticks (that capped it at one frame).
         # Segments are emitted at their NOMINAL (undelayed) phase; the per-bus delay is
         # returned separately and realised by the engine's per-signal EVENT SCHEDULER (each DA
@@ -2475,11 +2687,13 @@ def _pulse_table_bus_segments(
 
 
 def _pulse_table_has_analog_activity(state: PulseTableState) -> bool:
-    # A group is an analog DAC bus IFF it is explicitly in ``analog_bus_modes`` -- the ONE source of
-    # truth.  A nonzero level on a bus-MEMBER channel that the user toggled as a plain TTL bit (its
-    # group never made an analog bus) is NOT analog activity; treating it as such synthesized a
-    # PHANTOM bus that even inherited a scan coefficient and corrupted other channels (#phantom-bus).
-    return any(bus_name in state.analog_bus_modes for bus_name in state.bus_channels())
+    """Whether any catalog DAC has an edge/ramp to emit through the bus engine."""
+
+    return any(
+        any(str(entry.get("mode", "hold")).lower() in {"edge", "ramp"}
+            for entry in state.analog_bus_plan(port.key))
+        for port in state.port_catalog.dac_ports
+    )
 
 
 def _pulse_table_has_any_delay(state: PulseTableState) -> bool:
@@ -2491,11 +2705,11 @@ def _pulse_table_has_any_delay(state: PulseTableState) -> bool:
     treated as present; a literal delay counts only when it rounds to a nonzero tick.
     """
 
-    for channel in state.channels:
+    for channel in state.port_catalog.raw_lanes:
         raw = state.delays.get(channel, 0.0)
         if isinstance(raw, str) and not _is_plain_number(raw):
             return True  # scanned / expression delay (e.g. "s0", "20+s1")
-        if state.delay_steps(channel, slots=state.reference_slots(), time_step_ns=state.time_step_ns) != 0:
+        if state.delay_steps(channel, slots=state._reference_slots(), time_step_ns=state.time_step_ns) != 0:
             return True
     return False
 
@@ -2526,7 +2740,7 @@ def _check_unrolled_edge_budget(
     # 2 edges per ON run + a tick-0 anchor + a final off edge is a generous upper bound;
     # the real count is <= this, so we never reject a program the streamer could hold.
     n_periods = len(state.periods)
-    upper_bound_edges = 2 * len(state.channels) * n_periods + 2
+    upper_bound_edges = 2 * len(state.port_catalog.raw_lanes) * n_periods + 2
     if upper_bound_edges > DEFAULT_MAX_EDGES:
         raise ValueError(
             f"unrolling the inner repeat bracket would make up to {upper_bound_edges} edges, "
@@ -2542,7 +2756,10 @@ def _pulse_table_has_delays(
     slots: Mapping[str, float] | None = None,
     time_step_ns: float,
 ) -> bool:
-    return any(state.delay_steps(channel, slots=slots, time_step_ns=time_step_ns) != 0 for channel in state.channels)
+    return any(
+        state.delay_steps(channel, slots=slots, time_step_ns=time_step_ns) != 0
+        for channel in state.port_catalog.raw_lanes
+    )
 
 
 def _plain_rpc_payload(value):

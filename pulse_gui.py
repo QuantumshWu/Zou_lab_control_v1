@@ -74,7 +74,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_optional_positive_int_env("ZLC_PS_MAX_CHANNEL_COUNT"),
         help="Maximum channel count accepted from --xdc. Omit for no GUI-side limit.",
     )
-    parser.add_argument("--clock-hz", type=_positive_float, default=50_000_000.0, help="Sequencer clock in Hz.")
+    parser.add_argument(
+        "--clock-hz",
+        type=_positive_float,
+        default=50_000_000.0,
+        help="Virtual/offline authoring clock in Hz. A remote connection always uses the server clock.",
+    )
     parser.add_argument(
         "--scale",
         type=_positive_float,
@@ -141,8 +146,6 @@ def _resolve_channel_labels(args, channels: Sequence[str], state) -> dict[str, s
         ).items()
         if channel in channels and label and label != channel
     }
-    if state is not None:
-        labels.update({str(channel): str(label) for channel, label in state.channel_labels.items() if channel in channels and label})
     return labels
 
 
@@ -162,13 +165,10 @@ def _resolve_channel_pins(args, channels: Sequence[str]) -> dict[str, str]:
 
 
 def _connect_remote_or_offline(args, state, na, *, explicit_remote: bool):
-    seed_channels = _resolve_channels(args, state)
     try:
         sequencer = na.RemoteSequencer(
             host=args.remote_host,
             port=args.remote_port,
-            channels=seed_channels,
-            clock_hz=args.clock_hz,
             connect_on_init=True,
         )
     except Exception as exc:
@@ -182,8 +182,13 @@ def _connect_remote_or_offline(args, state, na, *, explicit_remote: bool):
         # No server listening is the normal offline case -- print a clean one-liner, not
         # the raw ConnectionRefusedError traceback (it reads as a scary error otherwise).
         print(f"ZLC pulse GUI: {notice}")
-        return None, seed_channels, notice
-    return sequencer, list(sequencer.channels), None
+        seed_channels = _resolve_channels(args, state)
+        seed_catalog = na.PortCatalog.from_channels(
+            seed_channels,
+            channel_labels=_resolve_channel_labels(args, seed_channels, state),
+        )
+        return None, seed_catalog, notice
+    return sequencer, sequencer.port_catalog, None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -205,7 +210,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     startup_notice = None
     if not args.no_sequencer:
         if explicit_remote:
-            sequencer, channels, startup_notice = _connect_remote_or_offline(
+            sequencer, port_catalog, startup_notice = _connect_remote_or_offline(
                 args,
                 state,
                 na,
@@ -221,45 +226,41 @@ def main(argv: Sequence[str] | None = None) -> int:
             # so the pulse editor never seeds a trigger channel.
             channels = _resolve_channels(args, state)
             channel_labels = _resolve_channel_labels(args, channels, state)
+            port_catalog = na.PortCatalog.from_channels(
+                channels, channel_labels=channel_labels)
             sequencer = na.VirtualSequencer(
-                channels=channels,
+                port_catalog=port_catalog,
                 clock_hz=args.clock_hz,
             )
     else:
         channels = _resolve_channels(args, state)
         channel_labels = _resolve_channel_labels(args, channels, state)
+        port_catalog = na.PortCatalog.from_channels(
+            channels, channel_labels=channel_labels)
 
-    if state is not None and list(state.channels) != list(channels):
-        if all(channel in channels for channel in state.channels):
-            state = state.aligned_to_channels(channels)
-        else:
-            parser = _build_parser()
-            parser.error(
-                "loaded pulse state channels do not match the sequencer channels: "
-                f"state={list(state.channels)!r}, sequencer={list(channels)!r}. "
-                "Load a matching pulse JSON or use hardware channel names with display labels."
-            )
-    channel_labels = locals().get("channel_labels") or _resolve_channel_labels(args, channels, state)
+    if state is not None and state.port_catalog.fingerprint != port_catalog.fingerprint:
+        try:
+            state = state.aligned_to_catalog(port_catalog)
+        except ValueError as exc:
+            _build_parser().error(str(exc))
+    if state is not None and isinstance(sequencer, na.RemoteSequencer):
+        state = state.snapped(time_step_ns=1_000_000_000.0 / float(sequencer.clock_hz))
+    channels = list(port_catalog.raw_lanes)
     channel_pins = _resolve_channel_pins(args, channels)
-    if state is not None and channel_labels:
-        for channel, label in channel_labels.items():
-            if channel in state.channels and channel not in state.channel_labels and label != channel:
-                state.channel_labels[channel] = label
-        state.validate()
 
-    if state is None and not args.channels:
+    if state is None:
+        visible_ports = [
+            port.key for port in port_catalog.ports if port.kind != "clock"
+        ][:4]
         state = na.PulseTableState(
-            channels=channels,
+            port_catalog=port_catalog,
             time_step_ns=1_000_000_000.0 / float(getattr(sequencer, "clock_hz", args.clock_hz)),
-            visible_channels=channels[: min(4, len(channels))],
-            channel_labels=channel_labels,
+            visible_ports=visible_ports,
         )
 
     editor = zf.show_pulse_gui(
         state=state,
-        channels=channels,
         sequencer=sequencer,
-        channel_labels=channel_labels,
         channel_pins=channel_pins,
         scale=args.scale,
         window_ratio=args.window_ratio,

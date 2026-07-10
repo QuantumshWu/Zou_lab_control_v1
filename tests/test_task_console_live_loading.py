@@ -354,9 +354,14 @@ def test_add_plot_is_blank_until_signal_set_and_node_started():
         while "frame_0" not in console.hub.names() and time.monotonic() < deadline:
             time.sleep(0.03)
 
-        # now wire the plot to that signal -> it shows data
-        card.config.source = "value = frame_0"
-        card._compiled_source = "value = frame_0"
+        # now wire the plot through the same two-part binding the signal picker applies: the REAL
+        # input name lives in ``inputs`` and the source expression reads the ``signal`` slot.  Apply
+        # through the card boundary so structure binding/render-version reset are exercised too;
+        # assigning the compiled cache directly bypasses the production contract.
+        from Zou_lab_control.neutral_atom.operations.signal_expr import DEFAULT_SOURCE
+        card.config.inputs = ["frame_0"]
+        card.source_edit.setText(DEFAULT_SOURCE)
+        card._apply_source()
         console.refresh_once()
         assert card.plotter is not None
         assert np.asarray(card.plotter.data_y).size > 0
@@ -746,6 +751,7 @@ def test_plot_edit_shows_producing_processor_param_form():
         assert SignalExpr.from_value(vals["source"]).source == "value = signal"
         # calibration prefilled with the canonical file path -- never a blank mystery
         assert vals["calibration"].replace("\\", "/").endswith("calibrations/calibration.json")
+        assert vals["calibration_origin"] == "session"
     finally:
         console.shutdown()
         exp.close()

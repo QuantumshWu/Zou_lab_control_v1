@@ -98,9 +98,10 @@ background model is PART of the readout and is carried per method in `by_method`
    trap so the emCCD line drops and re-rises into three DISTINCT triggers; cooling/probe/emCCD
    are off in the gap, so no re-cooling rearranges the atoms mid-bracket). **`file == fired`**:
    the cali does NOT unroll/derive a bracket (the deleted `with_imaging_bracket`) — it loads the
-   template and sets ONLY the two exposure durations BY NAME via **API slots**: `set_api("a1",
-   reference_exposure)` (the long reference frames, image_0 + image_2 share the `a1` handle) and
-   `set_api("a2", readout_exposure)` (the short readout, image_1). `_imaging_layout` reads the
+   template and writes ONLY its three exposure cells BY NAME via **unique API slots**:
+   `set_api("a1", reference_exposure)` for image_0, `set_api("a2", readout_exposure)` for
+   image_1, and `set_api("a3", reference_exposure)` for image_2.  The two long cells receive
+   the same parameter value but remain distinct one-field handles. `_imaging_layout` reads the
    frame count + readout index from the template (emCCD-trigger periods; the `a2`-tagged one is
    the readout), so a user's own template with N triggers works too. `reference_exposure` (LONG)
    and `readout_exposure` (SHORT) are both explicit cali params — open the template in the pulse
@@ -108,8 +109,8 @@ background model is PART of the readout and is carried per method in `by_method`
    tells whether the atom survived; when they
    AGREE (strict consensus) they vote the ground-truth occupancy for the short readout, and a
    shot where they disagree (atom loss, modelled by the virtual `detection_lifetime`) is dropped
-   as ambiguous. (`timing.reference_bracket_sequence` builds the equivalent bracket FROM SCRATCH
-   — explicit channels, no template — for tests/notebooks without a template file.)
+   as ambiguous. (`timing.reference_bracket_sequence` builds the equivalent bracket from an explicit
+   `PortCatalog` for tests/notebooks without a template file.)
 2. **Site map + PSF** from averaging the bracket's LONG reference frames (each images a real
    ~50% loading; the average reveals every trap). This is the SAME path live and from saved
    frames — there is no separate site-map acquisition pass.
@@ -128,7 +129,7 @@ background model is PART of the readout and is carried per method in `by_method`
 window ITS trigger gates, so a heterogeneous bracket images successive frames for different
 durations. The virtual camera honours this via `devices.virtual.exposures_per_frame`
 (parallel to the cooling/trap-off per-frame helpers); a uniform repeated sequence yields one
-exposure per frame, identical to the legacy behaviour. The real qCMOS adapter, given a
+equal exposure per frame. The real qCMOS adapter, given a
 non-uniform bracket, integrates for the longest probe (the trigger gates each frame; atoms
 scatter only during their own probe), keeping virtual == real.
 
@@ -227,20 +228,22 @@ sweep wrap is just another chunk boundary, so the re-sweep is SEAMLESS for any N
 
 ## 4. N-Slot Scan Model
 
-Scans bind named slots `s0, s1, ...` in bind order. **There is no `x`/`y` axis concept** — any
-per-field value is bound to a slot, never to a fixed `x`/`y` channel.
+Scans bind ordered, semantic `ScanSlot` objects. **There is no `x`/`y` axis concept** — any
+per-field value is bound to a slot, never to a fixed `x`/`y` channel.  A slot's stable public
+identity is `ScanSlot.name`; `s0`, `s1`, ... are compiler-only column tokens assigned by order.
 
 - Any scannable per-field value (period duration, analog-bus DAC value) can
-  be bound to a named scan **slot** `s0, s1, ...` in bind order, via the GUI
+  be bound to a semantic scan **slot** in ordered bind order, via the GUI
   scan dot or `state.bind_field(kind, target)` where `kind in
   {"duration","dac"}`. A channel delay is a FIXED per-channel output delay
   line: it takes an API slot (`aN`) but never a scan slot (`FIELD_KINDS` in
   `timing/pulse_table.py` is the single source; `bind_field("delay", ...)`
   raises).
 - `scan_table` is an `N_points x N_slots` array, loadable from `.npy/.csv/.txt`
-  (`load_scan_table`) or built in the GUI Scan tab. Row = one scan point, column
-  `j` = slot `s{j}` in that slot's display unit (ns for time slots, integer DAC
-  code for `dac` slots).
+  (`load_scan_table`) or built in the GUI Scan tab. Row = one scan point; column
+  `j` belongs to ordered `scan_slots[j]` in that slot's display unit (ns for time
+  slots, integer DAC code for `dac` slots).  Internal expressions address that
+  column as `s{j}`; UI, Hub schemas, plots and saved results use the semantic name.
 - Host compiles to an affine edge template plus a streamed scan-point table:
   `compile_pulse_table_scan_runtime_program` (sequencer.py). The FPGA evaluates
   `effective_tick = base + (sum_j coeff_j * slot_j) >>> COEFF_FRAC_BITS` and
@@ -325,9 +328,10 @@ flat card border a sealed construction detail; do not replace the editor with pl
   field cycles none -> scan (`sN`, orange, value HIDDEN/disabled) -> api (`aN`,
   violet, value KEPT and still editable) -> none. A **channel delay** field is not
   scannable, so its dot cycles none -> api (`aN`, violet) -> none only. A scan slot
-  is swept from the `scan_table`; an API slot is a named handle several fields can
-  share that `set_api(name, v)` / `state.aN = v` set BY NAME without rewriting the
-  field (e.g. both long frames of the imaging bracket share `a1`). The Scan tab
+  is swept from the `scan_table`; an API slot is a unique one-field handle that
+  `set_api(name, v)` / `state.aN = v` sets BY NAME without rewriting the field.
+  The imaging bracket therefore uses independent `a1`/`a2`/`a3` handles;
+  calibration writes the same reference value to `a1` and `a3`. The Scan tab
   lets the user write Python that assigns an `N_points x N_slots` array to a
   `scan_table` variable (namespace has `np`, `math`, `n_slots`).
 - Preview reuses `frontend.plot(..., kind="pulse")`, redraws on tab open / `Show
@@ -335,15 +339,14 @@ flat card border a sealed construction detail; do not replace the editor with pl
   table, y-axis labels are channel display labels (no `Pulse` title), repeats
   use `×∞` / `×N` (never the literal `inf`), slot-bound regions are drawn as
   spanning translucent markers, analog-bus rows are hollow stair-steps.
-- Saving writes the bundle together: pulse `.json` + preview `.png` +
-  `<stem>_program.json` (the compiled runtime program, wire domain) +
-  `<stem>_scan.npy` (when a scan table exists).  Loading accepts any bundle
-  member and redirects to the pulse `.json` (picking `<stem>_program.json` /
-  `<stem>_scan.npy` by mistake is handled).
-- Raw left column shows package pins (`M17`, `M13`) when the XDC map is
-  available; `chNN` stays in tooltip and saved/API state. Hiding is a view op;
-  `Hide Off` hides channels with no period on; clearing a channel turns its
-  period states off but preserves label/delay.
+- Saving writes one editable authority, pulse `.json` (including scan code and
+  scan table), plus preview `.png` and `<stem>_program.json` as derived
+  artifacts.  It never auto-writes or auto-discovers a sibling scan array;
+  array interchange is an explicit Scan-page export/import.  Loading a compiled
+  sibling redirects to the pulse JSON.
+- The left column shows immutable `PortCatalog` identities/labels (and package pins when available).
+  Pulse documents edit schedules, values and delays, never port names, DAC membership, bus indices or
+  clock ownership. Hiding is only a view operation; `Hide Off` hides inactive programmable ports.
 
 ### Screenshot QA
 
@@ -356,10 +359,10 @@ editor.grab_screenshot(path, settle_ms=1000)   # preferred helper
 ```
 
 Prefer native Windows Qt screenshots; offscreen captures can miss text, so also
-run object-level checks (button text fits, geometry, state, `show_all_channels`
-keeps the full list, `On Pulse` prepares-then-fires, `Stop Pulse` calls safe
-state). Capture default visible channels, all XDC channels at scroll top, and
-all XDC channels mid-scroll. Verify both the inner editor and the `FluentWindow`
+run object-level checks (button text fits, geometry, state, `show_all_ports`
+keeps the full logical-port list, `On Pulse` prepares-then-fires, `Stop Pulse` calls safe
+state). Capture the default visible ports, all programmable ports at scroll top, and
+all programmable ports mid-scroll. Verify both the inner editor and the `FluentWindow`
 wrapper.
 
 ## 6. FPGA: Hardware, Capacity, RTL
@@ -725,10 +728,10 @@ sync" -- whatever ANYONE fires (GUI, notebook API, Task) reloads into the editor
 `snapshot()` publishes it; `RemoteSequencer` flattens it across RPyC.  The GUI's **Sync**
 button and `pulse.synced_state()` both read this single source of truth.
 
-**API slots** (`pulse_table.ApiSlot`, parallel to scan slots): a NAMED handle (`a1`, `a2`...)
-on a period duration / channel delay / DAC value that the API/Task sets BY NAME --
-`state.set_api("a1", v)` or `state.a1 = v` -- WITHOUT rewriting the field (the number stays;
-several fields can share one name).  In the pulse GUI a duration/DAC cell's dot CYCLES
+**API slots** (`pulse_table.ApiSlot`, parallel to scan slots): a unique NAMED handle (`a1`, `a2`...)
+on exactly one period duration / channel delay / DAC value that the API/Task sets BY NAME --
+`state.set_api("a1", v)` or `state.a1 = v` -- WITHOUT rewriting the field (the number stays).
+One handle never aliases multiple fields; the GUI allocates a fresh handle per bound cell.  In the pulse GUI a duration/DAC cell's dot CYCLES
 none -> scan (`sN`, orange, value hidden) -> API (`aN`, violet, value kept) -> none; a delay
 cell cycles none -> API -> none (delay is not scannable).  `read_state` carries API slots by
 index (`_carry_api_slots`).  This is what lets the Calibrate task set the imaging template's
@@ -755,9 +758,9 @@ must be on PATH (or pass `xelatex=`). **Only the `.pdf` lands in `docs/<manual>/
 (plus the committed `assets/`); no `.tex`/`.sty`/`.aux`/`.log`/`.toc`/`.out` is
 ever written there (`docs/**/*.tex` and `*.sty` are gitignored). A failed build
 leaves only a `.build.log` next to the target PDF. `render_tex_pdf(tex, out_pdf)`
-accepts a tex **string** or a `.tex` **path**; `write_notes_tex` /
-`compile_notes_pdf` are legacy in-place helpers kept for debug, NOT on the build
-path. See §18.
+accepts a tex **string** or a `.tex` **path**. `write_notes_tex` is the explicit
+source-inspection path; PDF compilation always goes through the temporary-directory
+renderer. See §18.
 
 ## §18. frontend public-API seal (the visual-design contract)
 
@@ -858,10 +861,9 @@ CLI for its pre-build estimate, with the configured `fpga_part`.
   `board_config/README.md`. All env knobs are tabulated there.
 
 ### Correctness bugs fixed (host-side; from the adversarial audit)
-- `aligned_to_channels` dropped `clk_channels` → a clk-wired channel silently reverted to
-  engine-driven on align. Now filtered+carried.
-- `validate()` allowed a clk channel that is also a DAC-bus member (inferred OR explicit) →
-  double-drive. Now rejected at the contract gate (`__init__`/`from_dict`).
+- `PortCatalog` now gives every raw lane exactly one logical owner, requires contiguous explicit DAC
+  bus indices, and validates DAC→clock references. A lane therefore cannot silently change kind or be
+  double-driven when a pulse is loaded.
 - `snap_scan_table` silently truncated too-wide rows via `zip()` → now normalizes width
   first (raises too-wide, pads too-short).
 - `compile_pulse_table_scan_runtime_program` didn't snap on a DIRECT call → a 0 ns scanned
@@ -912,11 +914,11 @@ The three bring-up items from the adversarial RTL hunt are now fixed/guarded. Th
   fill counter was rejected — such a counter saturates on long runs, which would disable
   the fix exactly when it matters; the unconditional advance is safe (a new FIRE clears
   every scheduler's wr/rd/cnt).
-- **B1/B2 — `da_clk0..3` = `out_final[28/39/50/61]`: the clk button wires these strobe pins
-  to the FPGA clk.** (The former compile-time `_warn_idle_dac_clock_pins` warning -- fired when
+- **B1/B2 — `da_clk0..3` = `out_final[28/39/50/61]`: the immutable `PortCatalog` declares these
+  strobe pins as clock ports and links each DAC to its latch clock.** (The former compile-time
+  `_warn_idle_dac_clock_pins` warning -- fired when
   a `da_clkN` pin was driven-but-idle -- was REMOVED at the user's request: it was noisy and
-  read as an inexplicable error.  Enabling the da_clk pins is still the user's responsibility
-  via the GUI clk button.)
+  read as an inexplicable error. Clock ownership is hardware topology, never a pulse-document toggle.)
 - **B1/B2 — REVISED 2026-06-11 (⚠️ needs bitstream rebuild): the strobe is now `~clk`, NOT
   `clk` — the "third DA value between two edge periods" race.** The earlier note said "BY
   DESIGN, no RTL change"; that was WRONG and missed a real source-synchronous output hazard.
@@ -1138,16 +1140,17 @@ new scan loop (`operations/measurement.py`):
 
 Engine: **`ScannedMeasurement(pulse, camera, sequencer, calibration, axis, plan,
 reducer, shots_per_point)`**. `measure(value, index)` = `axis.apply` →
-`plan.sequence_for` → `camera.acquire(plan.n_frames, ...)` → `reducer.reduce`
-(averaged over `shots_per_point`) — this is the per-point callback. `run(live=...)`
+`plan.sequence_for` → `triggered_frames(...)` → `reducer.reduce`; every reducer result
+must exactly match its declared non-empty `data_shape`, and `np.stack` creates a separate
+shot axis before averaging only that axis.  This is the per-point callback. `run(live=...)`
 hands it to `active_plotter().run` when a viewer is registered (background worker,
 UI-thread refresh, cooperative `stop()`), else runs the same callback synchronously
-and still returns a complete `ScanResult` (x + `data_y` `(n_points, n_series)`).
+and still returns a complete `ScanResult` (x + `data_y` `(P,*data_shape)`).
 
 ### Scan taxonomy: temperature, readout-duration AND pulse-scan are ONE concept (two tiers)
 
 A recurring question ("isn't Temperature just a kind of pulse-scan?") — yes. EVERY scan in the
-system is the same concept: **sweep one or more NAMED pulse slots, reduce each point to a value**.
+system is the same concept: **sweep one or more semantic pulse parameters, reduce each point to a value**.
 They split into two tiers by WHERE the per-point reduce lives, NOT by being different machines:
 
 - **Coupled tier — `ScannedMeasurement` (inline reducer).** `Temperature` (trap-off → `SurvivalReducer`)
@@ -1162,7 +1165,8 @@ They split into two tiers by WHERE the per-point reduce lives, NOT by being diff
   ParamDecl editable in the pulse GUI, whose ONE swept DURATION slot is the scan axis — the same
   "pick a pulse" entry the generic `pulse_scan` has, so both are *visibly* pulse-scans; only the reduce
   stays coupled. `Temperature` defaults to `pulses/release_recapture.json`, sweeping the trap-off slot
-  `s0` (`temperature.py::_resolve_release_recapture_template`). `Fidelity vs duration` defaults to the
+  semantic slot `t_off` (`s0` is only its current compiler column token;
+  `temperature.py::_resolve_release_recapture_template`). `Fidelity vs duration` defaults to the
   single-image `pulses/probe_template.json`, sweeping the imaging template's **image-period readout
   window** (`readout_duration.py::_resolve_imaging_template` binds a `duration` scan slot on the `image`
   period; `build_detection_scan`'s `_ExposureConfiguringPlan` matches the camera gate per point, so the
@@ -1184,11 +1188,11 @@ They split into two tiers by WHERE the per-point reduce lives, NOT by being diff
   `operations.fidelity.characterize_readout`). The three properties they share with a task —
   template + UI-params→auto-generated scan table + internal (camera/occupancy-derived) signal — are NOT
   task-defining; they are exactly how a COUPLED pulse-scan MEASUREMENT works. So they stay measurements.
-- **Decoupled tier — `PulseScanNode` (y from a separate processor's signal, §20).** The GUI
-  `pulse_scan` sweeps named pulse slots exactly the same way, but instead of an inline reducer it
-  PUBLISHES the raw frames and reads y from another running node's signal via a `signal_expr`
-  (e.g. `rate` off a Judge-occupancy processor). This is the decouplable case — y is a single-frame
-  signal expression, so the reduce can live in its own node.
+- **Decoupled tier — `PulseScanNode` (y from a separate producer, §20).** It always owns only the
+  sequencer and an external-y cursor, but its explicit strategy is either `scan_slot` (one complete
+  hardware table, one prepare/fire) or `api_slot` (resolve one API-table row into one finite pulse
+  per point). It never owns a camera or republishes frames. A separate producer publishes y; the
+  scan consumes one ordered, lineage-coherent typed update per point.
 
 So "Temperature is a pulse-scan" is literally true at the model level (`ScanAxis` over a bound pulse
 slot); it sits in the coupled tier because its reduce is frame-structural. Adding a new
@@ -1201,9 +1205,9 @@ The recurring temptation is to "finish" the unification by routing temperature /
 the decoupled `PulseScanNode`. That is IMPOSSIBLE without breaking physics, and the boundary is enforced
 mechanically — pinned by `tests/test_scan_tier_boundary.py`:
 
-- **Decoupled per-point acquisition = `acquire(1)`: ONE camera trigger, ONE frame** (`logic.py`
-  `PulseScanNode.shot` → `camera.acquire(1, sequence=...)`). Its y is then a SINGLE-FRAME
-  `signal_expr` over the published `frame` (read off another node, e.g. `rate`).
+- **Decoupled collection is not acquisition.** In `scan_slot` the node fires one complete hardware
+  table; in `api_slot` it fires finite per-row pulses. In both cases it only consumes the next ordered
+  y update. Camera triggering, frame ownership, and reduction remain in the separate readout pipeline.
 - **The coupled reducers need a multi-frame structure a single published frame cannot carry:**
   - `SurvivalReducer` needs EXACTLY 2 frames from ONE atom loading (`temperature.py`: raises unless
     `len(frames)==2`), produced by `ReleaseRecapturePlan` (`n_frames` fixed at 2 — the two camera
@@ -1216,8 +1220,8 @@ mechanically — pinned by `tests/test_scan_tier_boundary.py`:
   between them). The camera reads N frames off whatever sequence it is handed; a 2-trigger release-
   recapture pulse is ONE loading read twice, while a 1-trigger imaging pulse read N times reloads
   between frames (independent shots, decided per-frame by the atom device). So the coupled tier's
-  release-recapture pulse INTRINSICALLY produces 2 frames of one loading — the decoupled node's
-  per-point `acquire(1)` would only image once, never the two-read survival. The trigger-counting util
+  release-recapture pulse INTRINSICALLY produces 2 frames of one loading — the decoupled node has no
+  frame structure to interpret, so that coupled reducer cannot be moved into it. The trigger-counting util
   `count_trigger_pulses` lives in the camera seam (`devices/camera_trigger.py`), not the sequencer:
   the streamer is a pure pulse streamer and never inspects which channel gates a camera.
 
@@ -1240,7 +1244,7 @@ Both are pinned by `tests/test_scan_slot_and_manual_parity.py`.
 
 - **A manually-configured logic node behaves like the one-click task.** A node's `y` (or a plot/processor
   source) binds a signal BY NAME, resolved at RUN time — the name may reference a signal that is not live yet
-  (a pulse-scan reading its OWN `frame_0`, or a not-yet-started producer's output). The console signal picker
+  (for example, a not-yet-started producer's output). The console signal picker
   (`fill_grouped_signal_combo`) must therefore ROUND-TRIP any configured name, live or not: it adds a
   configured `current` to the name pool so BOTH the tree and flat picker render it as a "waiting" leaf and
   read it back. The tree branch used to drop a not-listed name → `read_editable_combo` returned `''` →
@@ -1260,21 +1264,17 @@ Both are pinned by `tests/test_scan_slot_and_manual_parity.py`.
   sweep produce sub-tick durations (`np.linspace` → 5.95 ns …) that `set_api` snaps to the template grid but
   that still fail the clock-grid validation → the sweep cannot fire ("api slot does not work"). Snapping to
   the board's tick at load makes **author == snap == fire** for every template on whatever clock the connected
-  board reports, so both the software api sweep (`SCAN_MODE_API`) and the hardware scan table
-  (`SCAN_MODE_SCAN`) of a duration slot always fire. Callers with a device in scope pass it:
+  board reports, for both a `scan_slot` hardware table and each finite `api_slot` pulse. Callers with a device in scope pass it:
   `pulse_scan.build` → `s.devices.sequencer` (via `_resolve_probe_template`, the probe-flavoured binding of
   the same helper, which the GUI slot preview also imports), `mot_field.run` → `self.sequencer`, and the
   Calibrate task's `_resolve_template` (logic.py) → `self.sequencer` (its GUI slot preview calls the same
   classmethod without a device and falls back to the config-default grid, like every other preview). The
-  tick is pinned by `tests/test_scan_slot_and_manual_parity.py`. The CHANNEL CATALOG follows the same
-  device-owned rule: a saved template is a SUBSET of the board's channels, so the loader (and the pulse
-  GUI's Load) expands a subset template onto the connected device's full channel list via
-  `aligned_to_channels` (catalog order, missing channels as off rows — the compiled program is identical,
-  and "Show All" then really lists every device channel); a NON-subset template is left untouched (the
-  prepare layer rejects unknown channels, `resolve_coupled_template` owns role→device remapping). The
-  virtual catalog (`devices/virtual.DEFAULT_CHANNELS`, 25 channels) and `VirtualMotCamera.coil_buses`
-  both derive from the one `MOT_COIL_BUSES` source; the shipped `pulses/*.json` templates are regenerated
-  onto that full catalog. Pinned by `tests/test_pulse_template_channel_catalog.py`.
+  tick is pinned by `tests/test_scan_slot_and_manual_parity.py`. Port topology follows the stricter
+  device-owned rule: XDC/device configuration constructs one immutable `PortCatalog`; every
+  `PulseTableState` stores that catalog as its sole topology and serialized documents carry its
+  fingerprint. Load/prepare requires the document and connected sequencer catalogs to match; it never
+  aligns or reconstructs topology from parallel lists. The virtual device and shipped pulse templates
+  use the same catalog contract. Pinned by `tests/test_port_catalog_contract.py`.
 
 ### A task's mid-run panel is DECLARED, sized and coloured from single sources (no console special-case)
 
@@ -1299,43 +1299,51 @@ with the SAME single sources, a user's manually-composed panel uses — never a 
   Setting said inferno — the render-vs-Setting divergence.) The na-side calibration report (`build_grid_figure`)
   keeps its camera-crop grey default; that is a different, device-frame path, correctly separate.
 
-### Repeat is a measurement param; repeat_mode is a plot param (the data model)
+### Repeat is a measurement param; repeat_mode is a plot param (the typed data model)
 
-**Uniform output contract (#H3n), enforced by the base class + `tests/test_measurement_output_contract.py`:**
-EVERY acquiring measurement publishes its primary block with shape **`(repeat, *points_shape, *data_shape)`**
-— `repeat` = the repeat-axis depth, `points_shape` = the swept parameter space, `data_shape` = the
-per-point data. `LogicNode` declares `points_shape`/`data_shape` (default `()`); the nodes set them:
+**Uniform signal contract (#H3n), enforced at the hub boundary:** every registered signal has an
+authoritative `SignalSchema`, and every stored value is a `SignalTensor` in the physical shape
+**`(R, P, *data_shape)`**. `R` is repeat, `P = prod(point_shape)` is the one physical point axis,
+and `data_shape` is a non-empty trailing tuple that is preserved verbatim. Only the logical point
+geometry is flattened into `P`; multidimensional data is never collapsed into a single `D` item.
+The tensor also carries a `(R, P)` validity mask, so an integer camera buffer has no fake zero-valued
+"unfilled" cells.
 
-| node | `points_shape` | `data_shape` | block |
+| signal | `point_shape` | `data_shape` | physical tensor |
 |------|------|------|------|
-| camera | `(1,)` (a frame sweeps no input param) | `(H, W)` (the image IS the data) | `(repeat, 1, H, W)` |
-| 1-D scan | `(n_points,)` | `(dim,)` | `(repeat, n_points, dim)` |
-| 2-D scan | `(n0*n1,)` (param1×param2) | `(1,)` | `(repeat, n0*n1, 1)` (+ `_grid` reshape) |
+| scalar | `(1,)` | `(1,)` | `(R, 1, 1)` |
+| camera frame | `(1,)` | `(H, W)` | `(R, 1, H, W)` |
+| scalar scan | `(n,)` or logical grid `(n0, n1, ...)` | `(1,)` | `(R, P, 1)` |
+| vector/image per point | any non-empty logical geometry | `(D,)` / `(H, W)` / higher rank | `(R, P, *data_shape)` |
+
+`SignalSpec` is the producer-facing declaration and converts directly to `SignalSchema`; the schema
+belongs to each signal, not to a `LogicNode`. A raw unregistered publish has one deterministic external
+meaning (`R=P=1`, the complete input array is one datum) rather than a rank-based guess.
 
 `repeat` is the **ONE measurement** param, **0 = ∞** (#H3u-2): the Acquisition `Repeat (0 = ∞)` int,
 declared ONCE in `_acquisition_param_decls(repeat_default)` and **auto-injected** through the SAME
 `_rebuild_form` as every param (never a hand-placed widget). There is **NO separate Free-run toggle** —
 0 IS infinite, the same semantics everywhere (and the same as the scan-repeat count). `_repeat_value(values)`
-→ **`int`**: `repeat=K>0` keeps a K-deep block (K passes/photos **averaged**) then **STOPS**; `repeat=0`
+→ **`int`**: `repeat=K>0` fills a K-deep block with K distinct passes/photos then **STOPS**; `repeat=0`
 rolls a **1-deep ring forever** (a live monitor showing the latest). The kept block depth is
 `_ring = max(1, repeat)` (K for finite, 1 for ∞). A scan re-runs the whole sweep `repeat` times; a
 **camera takes exactly `repeat` photos then FINISHES** (or rolls forever at 0). **Per-type default:** a
 camera defaults to `0` (∞, a live monitor); a scan defaults to `1` (one finite sweep) — the node ctor
-defaults mirror the GUI form defaults so a headless `run_to_completion()` terminates. `frame` = the
-`(repeat, 1, H, W)` block itself (`repeat`=`_ring`); `frame_i` stay the single per-trigger images
-(`OccupancyProcessor` reduces a >2-D `frame` to its newest filled (H,W) slice for the per-shot judge).
+defaults mirror the GUI form defaults so a headless `run_to_completion()` terminates. Each trigger
+event is its own typed `frame_i=(R,1,H,W)` signal; there is no lumped frame output.
+`OccupancyProcessor` maps every valid `(R,P)` frame cell and preserves both axes.
 **Two-cameras fix:** the built node's `instance_label` is set to its row TITLE, so its provider label
-matches the declared row (the empty-prefix camera no longer shows `frame` under both "camera" and
+matches the declared row (the empty-prefix camera no longer shows `frame_0` under both "camera" and
 "Camera (live frames)").
 
 HOW the repeats become a picture is a **plot** parameter, `repeat_mode` (each plot panel's Setting
 combo, persisted in `config.params`): `average | add | replace | roll | create`. The pipeline
-(`PanelCard._signal_then_repeat` → `_eval_signal_per_slice`) runs the `value = ...` expression **once
-per repeat**, presenting every repeat-carrying signal it reads (the bound `signal` AND any raw hub
-signal it names directly, e.g. `value = frame[0]`) as that repeat's whole core — so the repeat axis
-stays OUTSIDE the expression and `signal` only ever sees one frame / curve. The re-stacked block (any
-3-D value, regardless of how it was named) is then collapsed by the ONE owned reducer
-`frontend.live.reduce_repeat(raw, mode)`: `average` = `nanmean` over the repeats that **have data**
+(`PanelCard._signal_then_repeat` → `_eval_signal_per_slice`) runs a transformed expression **once
+per repeat**, presenting every registered input as that repeat's whole core. Identity sources retain
+their exact `SignalSchema`; transformed results cross one explicit external-data boundary rather than
+inventing axes from rank. The re-stacked block is then collapsed by the ONE owned reducer
+`frontend.live.reduce_repeat(raw, mode, valid=...)`: `average` = the mean over repeats whose validity
+mask contains data
 (the true running mean = a long exposure for a camera, magnitude-stable; this is what "average" means,
 not a sum), `add` = `nansum`, `replace`/`roll` = the latest, `create` = every repeat as its own column
 (one line per repeat, **1-D only**). A 1-D panel keeps the reduced 2-D shape so the dimension axis
@@ -1346,22 +1354,20 @@ skyblue, …) by column index — a lone line is grey (identical to confocal's `
 fade. There is **no** measurement-side averaging anywhere (that was the camera live-stutter); the
 plot owns every reduction.
 
-**Auto-reshape (#H3o) — STRUCTURE-DRIVEN, decided by the DATA dimensionality, not a size threshold.**
-The three axes (repeat / points / data) are ORTHOGONAL. A node declares `points_shape` / `data_shape`
-/ `grid_shape` (base-class fields); the console threads them to `PanelCard` via `structure_provider`
-(`_signal_structure` → `_node_for_signal`). `PanelCard._bound_structure()` returns them ONLY for the
-default `value = signal` source — a custom expression rewrites the core, so structure is then advisory
-and the code degrades to shape inference. `_coerce` reshapes by `len(data_shape)`:
-- **`data_shape` 1-D** (a scan's `(dim,)` series): each data series is its OWN line; a 1-D `(points,
-  dim)` value stays 2-D (multi-line); it never reshapes to an image.
-- **`data_shape` 2-D** (a camera frame `(H,W)`): the data is an image → a **2-D** panel imshows it; a
-  **1-D** panel UNROLLS it to ONE trace.
-- **`grid_shape`** un-flattens a 2-D scan's `(n0*n1,)` points to an `(n0,n1)` map on a 2-D panel (a
-  scan's `data_shape` stays `(1,)`, so the 2-D-ness is in the POINTS, recovered via `grid_shape`).
-- a 1-D-data / 1-D-points value on a **2-D** panel RAISES (never a silently-wrong image); **dist**
-  flattens to a histogram (structure not consulted).
+**Display adaptation (#H3o) is schema-driven, never rank-driven.** The three domains (repeat / logical
+points / trailing data) remain orthogonal. The console reads `hub.schema(name)` and threads
+`point_shape`, `data_shape`, grid metadata, and validity to the panel. Each plot kind then has an
+explicit input contract:
+- **1-D** accepts `data_shape=(D,)`; multidimensional `data_shape` requires an explicit component
+  selection instead of silently flattening it.
+- **2-D** accepts one image datum (`P=1, data_shape=(H,W)`) or a scalar point grid
+  (`data_shape=(1,)`, logical grid in `point_shape`).
+- **histogram** deliberately flattens its selected samples because flattening is that view's declared
+  operation; it does not mutate the transported tensor or its schema.
+- **monitor/site map/grid** validate their scalar/site/facet contracts explicitly. A mismatched schema
+  raises rather than squeezing, selecting component zero, or guessing from ndarray rank.
 
-`repeat_mode` stays orthogonal: `reduce_repeat`/`repeats_with_data` accept any `(repeat, *rest)`
+`repeat_mode` stays orthogonal: `reduce_repeat`/`repeats_with_data` accept any `(R, P, *data_shape)`
 (camera 4-D block included), reducing axis 0 only; **`create` is orthogonal to the data axes** —
 a 3-D scan block → `(points, R*dim)` (confocal columns), a ≥4-D image block → `(prod(core), R)` so a
 camera frame + create draws **R repeat-traces, NOT H image-rows** (the bug #H3o fixed). `_DIM_MULTILINE_MAX`
@@ -1406,11 +1412,10 @@ role (they image single atoms and must run on the science camera, not a MOT moni
 declared roles → real choice params; Pin C: injection passes a device, not a string). The GUI face of
 the device-DOMAIN registry is `exp.device_manager()` / the task-console "Devices" button.
 
-`ScannedMeasurementNode` (`operations/logic.py`) wraps a measurement as a console
-logic node: each `shot()` advances ONE scan point and publishes the CUMULATIVE
-`{x_key: x[:k], y_key: y[:k], scan_done, shot}`; finite-scan **self-stop** (sets its
-own stop event after the last point, so a background `start()` thread exits).
-`run_to_completion()` for headless/tests.
+`ScannedMeasurementNode` (`operations/logic.py`) wraps a measurement as a console logic node.
+Each `shot()` advances one point and publishes typed coordinate/result `TensorPatch` updates into
+pre-registered `(R,P,*data_shape)` stores. Completion is node state, not a redundant hub signal;
+finite scans self-stop after the final patch. `run_to_completion()` serves headless/tests.
 
 **Virtual == real guard.** Engine + node touch only `camera.acquire` /
 sequencer (via pulse) / `calibration.signals|detect` / `active_plotter().run` — zero
@@ -1439,7 +1444,7 @@ category with no catalog edit.
   math; `readout` is captured in the factory closure so the console stays decoupled
   (it drives the action through the plain spec list, never holding the subsystem).
 - `ProcessorRun` (`operations/logic.py`) runs the spec ONCE on its owner thread,
-  publishes the result (+ a `processor_done` scalar) to the hub, and self-stops; the
+  publishes exactly the spec-declared result signals to the hub, and self-stops; the
   cooperative-stop event is shared so a long grab cancels cleanly. The console's
   result panel reuses the EXISTING `sites` atom kind (camera underlay + per-site
   circles); the scalars are visible in every panel's signal legend.
@@ -1462,9 +1467,9 @@ al., PRA 78, 033425 (2008).
   `capture_radius` (metres, from trap geometry ≈ tweezer waist) MUST be supplied;
   `fit_temperature` takes it as a known input and fits T (+ optional baseline) only.
 - **The 6-period pulse** (`build_release_recapture_pulse`): image1_expose,
-  image1_settle, **trap_off (duration bound to scan slot s0 = t_off)**,
+  image1_settle, **trap_off (duration bound to semantic scan slot `t_off`)**,
   trap_recapture, image2_expose, image2_settle — two emCCD triggers, one trap-off
-  between. Bound via `bind_field("duration","2")` — the SAME slot mechanism a scanned
+  between. Bound via `bind_field("duration", "2", name="t_off")` — the SAME slot mechanism a scanned
   readout duration uses, so hardware can stream a whole t_off table. Must be a SINGLE
   two-trigger sequence the camera reads as TWO frames of ONE atom loading, NOT a repeated
   single-trigger sequence: a single-trigger pulse the camera reads twice is a fresh shot per
@@ -1513,7 +1518,7 @@ and blit engages. Colorbar ticks now sit at the committed clim ends (guides stil
 min/max). **Iron law: blit engages only if ALL of a panel's autoscale axes have a dead-band; a new
 plot with an autoscaling secondary axis must wire it in or it silently falls back to full draw.**
 Measured (2x2, offscreen, update() end-to-end): 1d 13→0.9 ms, 2d 20→2.3 ms, monitor 18→6.9 ms
-(monitor residual = the per-tick σ curve_fit + mathtext in `update_core`, not the draw). Guarded by
+(monitor residual = the per-tick core histogram fit + mathtext in `update_core`, not the draw). Guarded by
 `tests/test_frontend_blit_render.py` (engages + equals full draw + no ghosting + recapture-on-relim).
 
 A separately-rejected speed-up (still off the table): **freezing title/xlabel positions** — draw
@@ -1556,10 +1561,9 @@ the code had moved on.
 A "source" anywhere in the system — a plot panel's data source, a processor's input, a
 pulse-scan's y — is the SAME object: a list of picked hub-signal names (the *slots*, read as
 `signal` / `signal[i]`) plus a one-line `value = ...` expression. `SignalExpr` owns the
-slot-packing rule (scalar for one input, list for many), the `value` contract, `co_names()`
-(names referenced + picked slots, for version-gating), an optional `resolve` hook (the
-frame-coherence rewrite, injected by the frontend, never baked into the analysis layer), and
-the ONE namespace: `NAMESPACE_HELPERS` names the helper set
+slot-packing rule (scalar for one input, list for many), the `value` contract and `co_names()`
+(names referenced + picked slots). The caller supplies one typed, lineage-coherent snapshot; expression
+evaluation never rewrites a binding. The ONE namespace is defined by `NAMESPACE_HELPERS`
 (history/latest/names/shot/np/numpy/math), `namespace_helpers(hub)` binds it, and
 `hub_namespace(hub, snapshot=None)` layers those helpers on a signal snapshot (latest by
 default; the console passes its shot-coherent `snapshot_at` view + its reserved view keys,
@@ -1571,125 +1575,85 @@ ONE definition. `PanelCard._with_signal_slots` / `_evaluate` / `_co_names` deleg
 help text). `tests/test_signal_expr.py` guards it.
 
 ### Pulse-scan is a device-driving `PulseScanNode`, with a DECOUPLED y
-`PulseScanNode` (`operations/logic.py`) replaces the old frame-reducing measurement. **x** = the
-scan points: api slots are FIXED once on the base state, scan slots are resolved per point via
-`PulseTableState.with_slots_resolved({s0: row, ...})` — the SAME named-slot resolver the
-hardware scan + pulse GUI use (api and scan slots are different mechanisms and stay separate; no
-clearing, no per-period editing). **y** is decoupled from the readout: per point the node fires
-+ acquires the camera `frame`, PUBLISHES it (bare `frame`, the same signal a `CameraMeasurement`
-publishes), lets the subscribed consumer (e.g. a Judge-occupancy processor) recompute, then
-evaluates a `signal_expr` over the hub for y. So the readout pipeline lives in its own node and
-pulse-scan just sweeps + records its output.
+`PulseScanNode` always owns only the sequencer plus an external-y cursor. `sweep_kind` selects exactly
+one execution strategy:
 
-Settling y to THIS point's frame is **race-free without any cross-thread `step()`**:
-- GUI / live: the consumer runs on its own daemon thread, so the node WAITS for the picked y
-  signals' per-signal version (`SignalHub.signal_versions()`) to advance past the pre-publish
-  snapshot — it only READS the hub.
-- headless / notebook / tests: an optional inline `settle` callback steps the consumer once,
-  single-threaded (its thread is not running), so the value is fresh immediately.
-Both read y through the same `SignalExpr.evaluate` once the consumer is fresh. A 5 s timeout
-means a mis-wired y never wedges the scan. The device lockout (`DEVICE_DRIVING_KINDS`) makes
-pulse-scan the sole device driver; processors are not device-driving, so the workflow is: start
-the producer (occupancy) FIRST, then pulse-scan.
+- **`scan_slot`** — evaluate/snap the scan program, attach the complete `scan_table` to the selected
+  `PulseTableState`, then prepare/fire once; hardware advances all scan-slot columns in lockstep.
+  Public x identities are semantic `ScanSlot.name` values; `sN` remains compiler-only.
+- **`api_slot`** — evaluate a table whose columns correspond to the template's API handles. For each
+  row, call `set_api`, compile one finite pulse, prepare/fire it, then advance. Public x identities are
+  semantic target names such as `probe_duration` or `da_x`; private `aN` handles never leak into Hub keys.
 
-`pulse_scan.py` `build()` returns a `PulseScanPlan` (base state + scan/api arrays + camera/sequencer
-+ y `SignalExpr` + `extra_delay_s`); the spec carries `metadata={"node": "pulse_scan"}` to mark its
-scan TIER. `MeasurementSpec.make_node(hub, prefix=, repeat=)` (the `ProcessorSpec.make_node`
-counterpart) owns the spec→live-node assembly: it reads that tier tag and returns a `PulseScanNode`
-for the decoupled `"pulse_scan"` tier, else a `ScannedMeasurementNode` (the coupled
-temperature/fidelity tier reduces inline over a loading's frames). The console's `_build_logic_node`
-just calls `spec.make_node(...)` — it never imports a concrete na node class to pick one by the
-metadata string. Pulse-scan
-images ONCE per point (`triggered_frames(camera, sequencer, sequence, 1)`, the single arm-fire-read
-helper — no hand-rolled `camera.acquire`) — it is decoupled from the camera's exposure/averaging,
-so there is no frame-count knob; the params are `template` + `pulse_slots` (api fixed/sweep + scan
-program + extra settle) + `y` (signal_expr) + `y_name` (the output signal name).
+Neither strategy owns a camera, publishes/relays frames, or reduces readout. Before its first fire the
+node captures per-signal cursors and reserves bounded journal history. Each point consumes the next
+lineage-coherent `SignalTensor` update from another running producer; timeout aborts to safe state rather
+than pairing a late y with the wrong row. The y patch inherits source lineage, and its schema carries
+semantic coordinate names plus multidimensional `point_shape`.
 
-### Scan POINTS are ONE `scan_table` program (the pulse-GUI model), not per-slot
-The scan points are a single `(N_points x n_slots)` table — one ROW per scan point, one COLUMN
-per bound scan slot, the slots advanced in LOCKSTEP — built by a small Python program assigned to
-`scan_table`, EXACTLY like the pulse GUI Scan tab. There is no separate points box per slot. The
-templates (`column_stack` default, `grid`) + the evaluator live ONCE in
-`timing/pulse_table.py::scan_table_template` / `evaluate_scan_table_code` (analysis layer, so both
-GUIs + `build()` share them; `pulse_gui._template_*` delegate to them). `build()` evaluates the
-program, then `snap_scan_table(..., time_step_ns=state.time_step_ns, dac_ranges=...)` makes each
-column hardware-legal IN ITS NATIVE UNIT (a duration column → whole clock ticks in ns, a DAC
-column → integer LSB code — the axis unit is derived per slot KIND, never assumed to be time).
-The column count MUST equal the bound slot count (lockstep contract), else `build()` raises. The
-GUI `_PulseSlotsWidget` renders TWO peer sections (hierarchy = weight+colour, never a wrapper
-header): **API slots** (always shown) + **Scan table** (always shown). Its value is
-`{"api": {...}, "scan_code": "<python>", "api_scan": "<python>", "extra_delay": <s>}`.
+`pulse_scan.py::build()` returns a `PulseScanPlan` containing state, semantic coordinate arrays,
+`sweep_kind`, private API handles only when needed, sequencer, y expression, and optional logical scan
+shape. `MeasurementSpec.make_node(...)` owns spec→node assembly. Public measurement parameters are
+exactly `template`, `pulse_slots`, `y`, and `y_name`.
 
-### API slots also sweep — in SOFTWARE — the analogue of the hardware scan table
-Scan slots (`sN`) stream on the FPGA; api slots (`aN`) are fixed handles set per shot in software.
-So an api slot can be **fixed** (a numeric value, `set_api` once at build) OR **swept**: the API
-section's `api_scan` program (a `(N x n_api)` table, one column per api slot in order, the same
-`evaluate_scan_table_code` evaluator as the scan table — no hardware snap, `set_api` interprets each
-value in the slot's native unit) drives `PulseTableState.with_api_resolved({aN: row})` per point —
-the software twin of `with_slots_resolved`. A pulse with ONLY api slots is therefore fully
-sweepable (x = the swept api slot); scan + api slots may both sweep in lockstep. The per-point loop
-is **load → on_pulse → wait the pulse done (`camera.acquire`) → settle → next**, and the settle is
-owned by the DEVICE so callers don't hand-roll timing: `SequencerDevice.settle(seconds, *, stop=)`
-idles the (adjustable) `extra_delay` between points (`VirtualSequencer` scales it
-by `sleep_scale` like `wait_done`; the wait is cooperatively cancellable on Stop). Guarded by
-`test_pulse_param_scan.py` (api-only sweep drives each point; settle is called once per point).
+### One program matrix, two execution strategies
+Both strategies use one `(N_points, N_columns)` matrix produced by the shared
+`scan_table_template/evaluate_scan_table_code` evaluator; there is no separate points box per column.
+For `scan_slot` the columns must match `state.scan_slots`, are snapped in their native units, and are
+stored back into `state.scan_table`; the winning source program is also retained in the legitimate
+`PulseTableState.scan_code` field. For `api_slot` the columns must match `state.api_slots` and remain
+in the API handles' declared native units; each row becomes one finite pulse.
+
+`_PulseSlotsWidget` has one canonical value:
+`{"program_id": "...", "api": {...}, "sweep_kind": "scan_slot|api_slot", "program": "<python>"}`.
+`program_id` binds the editor value to the loaded template, `api` carries explicit baseline/fixed API
+values, `sweep_kind` selects execution, and `program` is the selected strategy's table generator.
+There are no camera/frame/delay/mode aliases. MOT-field's hardware-synchronous three-DAC template must
+select `scan_slot`; generic PulseScan supports both strategies.
 
 ### Repeat: TWO systems, three orthogonal axes, processors are typed transforms (#H3o)
-There are EXACTLY TWO repeat knobs in the whole pipeline — never three. The design panel
-(workflow `processor-update-mode-design`) verified this against the code and rejected every attempt
-to add a processor-side mode.
+There are exactly two repeat controls in the pipeline: acquisition `repeat` and display
+`repeat_mode`. A processor has neither.
 
-1. **ACQUIRE-FILL (measurement layer).** Every acquiring `Measurement` OWNS the repeat axis and
-   FILLS a `(ring, *points_shape, *data_shape)` BLOCK in `shot()` (the camera ring; a scan's raw
-   block) where `ring = max(1, repeat)`. Driven by ONE user field, auto-injected as an acquisition
-   ParamDecl: `repeat:int`, **0 = ∞** (#H3u-2) — `K>0` keeps K shots & averages then stops; `0` rolls
+1. **ACQUIRE-FILL (measurement layer).** Every acquiring `Measurement` owns the repeat axis and
+   fills typed `(R, P, *data_shape)` tensors where `R = max(1, repeat)`. Driven by one user field,
+   auto-injected as an acquisition
+   ParamDecl: `repeat:int`, **0 = ∞** (#H3u-2) — `K>0` fills K repeat slices then stops; `0` rolls
    a 1-deep ring forever. No separate free-run toggle. The measurement NEVER collapses the repeat axis.
 2. **DISPLAY-COLLAPSE (plot layer).** The plot collapses the repeat axis FOR DISPLAY ONLY via
    `repeat_mode` (`live.reduce_repeat`, modes `average/add/replace/roll/create`). Stored data is
    never mutated; this is the SINGLE place a repeat axis is collapsed.
 
-The three axes (repeat = block axis 0 / points = middle / data = trailing) are orthogonal (#H3n/#H3o):
-`reduce_repeat` collapses axis 0 (only on a `ndim>=3` block), `_coerce` reshapes points/data.
+Repeat, logical point geometry, and trailing data axes are orthogonal (#H3n/#H3o). The schema tells
+`reduce_repeat` that axis 0 is R; it never infers an axis from `ndim`.
 
-**A processor has NO user-facing mode.** A `Processor` is a pure typed transform; its relationship to
-the repeat axis is a STATIC class attribute `repeat_contract`, NEVER a runtime knob or form field:
-* `"preserve"` — maps each repeat slice 1:1 and emits a block whose LEADING axis 0 IS the repeat, so
-  the SAME plot `reduce_repeat` machinery collapses it. **`OccupancyProcessor` is `preserve`** (#H3q,
-  #H3s-F3): the repeat axis flows THROUGH it — fed the camera's `(repeat,1,H,W)` block it judges EVERY
-  slice and publishes `occupied`/`counts` as CLEAN `(repeat, n_sites)` blocks (a leading repeat axis,
-  NO vestigial middle 1) and `frame_judged` as `(repeat, H, W)`. Repeat-collapse is **structure-driven,
-  not an ndim guess**: each signal's `SignalSpec` declares its OWN `points_shape`/`data_shape`, so
-  `core_ndim = len(points)+len(data)` (occupancy: points=(), data=(n_sites,) → core_ndim 1) tells
-  `reduce_repeat(block, mode, core_ndim=core_ndim)` that axis 0 is the repeat exactly when
-  `block.ndim == 1 + core_ndim`. `reduce_repeat`'s legacy ndim≥3 fallback is kept verbatim for callers
-  that pass no `core_ndim` (camera `(repeat,1,H,W)` / scan `(repeat,pts,dim)` blocks), so those paths
-  are byte-identical. Static geometry — `centers` (N,2) / `thresholds` (N,) — declares NO contract
-  slot (its SignalSpec leaves points/data `None`), so it prints its raw shape and carries no repeat
-  axis a consumer could mistake for one.
-* `"reduce"` (the base default) — emits a result with NO repeat axis (a statistic over a shot set, e.g.
-  a `FidelityProcessor`). Nothing is left for the plot to collapse, so it can't collide with `repeat_mode`.
+**A processor has no repeat mode or class-level repeat contract.** It is a pure typed transform. It
+reads input `SignalTensor` envelopes, including schema and validity, and publishes one explicitly
+declared schema per output. A cell-wise processor preserves every valid `(R,P)` cell; an aggregate
+processor returns a canonical `(1,1,*data_shape)` result and says so in its output schema. This is a
+mathematical property of each output, not a second runtime knob or a string attribute.
+
+`OccupancyProcessor`, for example, maps every valid camera cell `(R,P,H,W)` and publishes
+`occupied`/`counts` as `(R,P,N)`, `frame_judged` as `(R,P,H,W)`, and static calibration geometry as
+typed `(1,1,N,2)` / `(1,1,N)` tensors. No signal may omit point/data semantics.
 
 So the everyday quantities all come out without a third knob, via ONE mechanism (plot `repeat_mode` over
-the block): **S1** averaged site-map image = a `frame` panel `repeat_mode='average'`; **S2** per-site
+the block): **S1** averaged site-map image = a `frame_0` panel `repeat_mode='average'`; **S2** per-site
 loading PROBABILITY = a `sites`/`2d` panel bound to `occupied` with `repeat_mode='average'` (averaging
 the camera's `repeat` shots recovers every site — the user sets how many via `repeat`); **S3**
 loading-rate-vs-time = the processor's scalar `rate` (this block's loading fraction) on a rolling panel;
 **S4** readout fidelity = a `reduce` operation (`readout_fidelity` spec) over a shot set. `OccupancyProcessor`
-keeps ONLY the scalar `rate` (no good substitute as a pulse-scan's default y); the cumulative
-`rate_sites`/`rate_grid`/`_occ_sum` accumulators are **deleted** — they duplicated `repeat_mode=average`.
+keeps only the scalar `rate`; per-site probability is the `occupied` tensor viewed with
+`repeat_mode=average`, so there is no second cumulative signal path.
 The `counts` histogram flattens the WHOLE block (every repeat × site sample), never averaged
 (`_signal_then_repeat` skips the reduce for `kind=='hist'`); a `create`-mode sites panel collapses back
 to one value/site (`_coerce`). The site-map underlay reduces `frame_judged` (`'replace'`) to one coherent
-`(H,W)` shot (`_sites_aux`). Also deleted: the dead third system `Measurement.UPDATE_MODES` /
-`_postprocess` / `update_mode` / `repeats` / `_accum` (the base accumulate-then-emit that violated the
-block contract; every concrete node already bypassed it). Guarded by `test_processor_repeat_contract.py`
-(every processor declares a valid contract, never as a ctor arg; OccupancyProcessor is the canonical
-`preserve` and `repeat_mode=average` over `occupied` recovers the per-site probability), `test_scan_repeat.py`,
-`test_measurement_output_contract.py`, `test_panel_reshape_orthogonal.py`.
+`(H,W)` shot (`_sites_aux`). SignalTensor transport, producer-schema, scan-tensor, and
+processor-core contract tests guard the two-control design.
 
 **DECOUPLING (#H3o).** A panel reads EXACTLY the signal it is bound to — there is NO frame-coherence
-rewrite. A `frame` panel shows the camera's own block (averaged per `repeat_mode`), INDEPENDENT of any
-running Judge; a Judge publishes its OWN keys (`occupied`, `frame_judged`) and never touches `frame`.
+rewrite. A `frame_0` panel shows the camera's own block (averaged per `repeat_mode`), INDEPENDENT of any
+running Judge; a Judge publishes its OWN keys (`occupied`, `frame_judged`) and never touches `frame_0`.
 The site-map underlay still tracks the rings' shot because `frame_judged` is published ATOMICALLY with
 `occupied` (one transform dict) and the map resolves both from the SAME producing node via
 `_sites_aux` — a separate path, not a binding rewrite. (Per-shot semantics: the site-map underlay is
@@ -1742,14 +1706,12 @@ monitor = a scalar), enforced in `PanelCard._coerce`. Guard: `test_task_cali_mod
 asserts sites is single-slot (no `add_slot_button`, keeps `source_edit`) while 2D is multi.
 
 ### Every `kind="signal"` source is now `signal_expr`
-The new `ParamDecl` kind `"signal_expr"` (whitelisted in `measurement.py::ParamDecl.__post_init__`
-— `processor.py` only re-exports it) renders the reusable `_SignalExprWidget` (multi-slot
-grouped signal picker + `+/- signal` + a `value = ...` editor with the floating `Edit…`). Its
-value is `{"inputs": [...], "source": "value = ..."}`. `OccupancyProcessor.source` is one such
-field: the node builds a `SignalExpr`, sets `consumes = tuple(expr.inputs)` (so it reacts to the
-picked signals), and `transform` judges `expr.evaluate(inputs)` — `value = signal` on `frame` is
-the single-frame default, `value = (signal[0] + signal[1]) / 2` averages two. The console's
-frame-coherence resolver matches on `name in node.consumes` (the canonical reactive input set).
+The `ParamDecl(kind="signal_expr")` record lives in `core/params.py` and dispatches through the
+registered `SignalExprHandler` to the reusable multi-input picker + `value = ...` editor. Its value is
+`{"inputs": [...], "source": "value = ..."}`. `OccupancyProcessor.source` builds a `SignalExpr`,
+sets `consumes = tuple(expr.inputs)`, and evaluates a lineage-coherent cursor snapshot; the default is
+`value = signal` on `frame_0`. There is no frontend binding rewrite: if two inputs are combined, their
+coherence requirement is explicit in the typed snapshot/provenance boundary.
 
 ## 21. The catalog / node / UI / layout base-class framework (#H3r, 2026-06-26)
 
@@ -1772,14 +1734,12 @@ contract test — the single mechanical guard. Change the framework = change the
 - **Reactive processor node** — `operations/logic.py::Processor`: `provides` (a class fact) is the
   SINGLE output-key source; `output_keys()`/`published_signals()` and the spec's `result_keys`
   derive from it. `shot()` ENFORCES publish-time conformance — a processor may only emit keys it
-  declared (an undeclared signal raises, never leaks). `repeat_contract` (reduce|preserve) is a
-  static class attr, never a user knob. Guards: `tests/test_processor_output_contract.py`,
-  `test_processor_repeat_contract.py`.
-- **Acquiring measurement node** — `operations/logic.py::Measurement`: declares `primary_signal`
-  (the key carrying the `(repeat,*points_shape,*data_shape)` contract block) and
-  `_assert_primary_shape(out)`. Camera / Scanned / PulseScan all `return self._assert_primary_shape(out)`
-  from `shot()`, so ANY measurement (incl. a future one) that mis-shapes its block (forgets the
-  repeat axis, sets only one of points/data shape) fails LOUD at publish, not as a wrong plot.
+  declared (an undeclared signal raises, never leaks). Each non-scalar output carries an explicit
+  `SignalTensor`; raw output is accepted only for a declared canonical scalar.
+- **Acquiring measurement node** — each output `SignalSpec` declares non-empty `point_shape` and
+  `data_shape`, and `SignalHub` validates exact `(R,P,*data_shape)` shape, dtype, repeat capacity,
+  and validity before mutating any store. Camera / Scanned / PulseScan therefore fail loudly at the
+  one transport boundary if any output violates its own schema.
   Guard: `tests/test_measurement_output_contract.py`. (The full ring/pass de-dup across the three
   acquiring nodes is intentionally NOT done — the per-pass NaN-clear + the `repeat=0`=∞ roll are
   data-correctness logic that must be reproduced on real frames, not refactored blind.)
@@ -1943,7 +1903,7 @@ Behaviour-neutral throughout. The single sources added/relocated, by layer:
   `psf_boxes`), so no dead box-only state rides on a PSF calibration. `core.results` rings fall back to
   the box default when a calibration carries no `roi_radius`.
 - `operations.measurements._coupled_template.resolve_coupled_template(...)` — the ONE coupled-tier
-  template resolver (load-or-default -> compare channels -> rebuild via `imaging_channel_kwargs` ->
+  template resolver (load-or-default -> validate the device `PortCatalog` fingerprint ->
   optionally bind a duration scan slot). `temperature` and `readout_duration` both delegate, differing
   only in `default_name` / `default_factory` / `role_keys` / bind target and — made EXPLICIT, since it
   had silently drifted — the `missing_policy`: temperature passes `"raise"` (an operator-named but
@@ -1954,9 +1914,9 @@ Behaviour-neutral throughout. The single sources added/relocated, by layer:
   `summary_keys = FidelityReport.SUMMARY_KEYS` instead of hand-copying the tuple, so a processor's
   declared scalars can never drift from what the report publishes (a drift would trip the
   publish-boundary `_assert_declared`).
-- `ProcessorSpec` no longer carries a `consumes` field — the canonical reactive input set is
-  `node.consumes` (derived from the node's `source_expr`, see §20), the ONE source the frame-coherence
-  resolver matches on; a spec-level copy could only drift from it.
+- `ProcessorSpec` carries no duplicate `consumes` field. The canonical reactive input set is
+  `node.consumes`, derived from `source_expr` and used for cursor subscription/provider graph; typed
+  snapshot/provenance enforces coherence without a frontend resolver.
 
 **frontend (art-internal; na never imports frontend)**
 - `frontend/_validate.py` — the dependency-free seam (same pattern as `_paths` / `_readout_math` /
@@ -2043,10 +2003,9 @@ the dis panel additionally ran `np.sort(2.3M)` (Otsu seed) + a raw-sample fit ev
 thread. Five orthogonal fixes, each at its own layer:
 
 1. **Data plane = native dtype end-to-end.** `CameraMeasurement`'s finite ring is native-dtype and
-   publishes the `(filled, 1, H, W)` slice of repeats that HOLD data — no NaN prefill, no float64
-   forcing, no publish-side copy (the hub's `_stored_array` makes the one defensive copy). The
-   output contract (`_assert_primary_shape`) now reads: leading axis = repeats holding data
-   (1..ring). Consumers (`reduce_repeat` / `facet_cells` / `coerce_panel_value` / `_as_data_y` /
+   publishes `(R, 1, H, W)` plus a `(R,1)` validity mask — no NaN prefill and no float64
+   forcing. The typed hub owns the one defensive immutable copy and validates the registered camera
+   schema. Consumers (`reduce_repeat` / `facet_cells` / `coerce_panel_value` / `_as_data_y` /
    the console identity path) pass integer blocks through NATIVE — an integer block cannot carry
    NaN sentinels, so the isfinite machinery is skipped and pool/replace are zero-copy views; float
    blocks (a scan's NaN-prefilled array) keep gap semantics unchanged. A `facet=repeat` grid now
@@ -2054,7 +2013,7 @@ thread. Five orthogonal fixes, each at its own layer:
    `_configure_signal_storage` fails LOUD if a node's `output_specs()` raises (the silent fallback
    used to downgrade image streams to the 2048-deep default ring).
 
-2. **dis panel is O(bins), never O(samples).** `fit_histogram_curves(edges, counts, mode)` takes
+2. **dis panel is O(bins), never O(samples).** `core.fitting.fit_histogram(edges, counts, mode)` takes
    ONLY the binned histogram: Otsu in its classic binned form, weighted-bin seeds, bounds from the
    edges. `histogram_binned` adds an exact bincount fast path for small-domain integer samples
    (bin-for-bin identical to `np.histogram`, ~5x at 2.3 MP). Threshold L/R fractions interpolate
@@ -2091,7 +2050,7 @@ dead code) are deleted, the service-level wall-clock scan-progress simulation we
 `VirtualSequencer.wait_done` enforces the same deadlock guard + protocol bookkeeping as the bare
 service (`WAIT_FOREVER_MESSAGE` single source).
 
-## 25. The render thread: compose off the GUI thread + the selector→ROI gesture (2026-07-09, W round)
+## 25. The render thread + typed selection actions (2026-07-09, W round)
 
 The V3 tick budget/rotor only *rescheduled* the GUI-thread render burst; the W round removed it.
 `frontend/render_loop.py` is the console's ONE background worker: every steady-tick compose (the
@@ -2142,23 +2101,20 @@ clock.  Three guards, one per scope: `Processor.__init__` rejects `consumes ∩ 
 (base single source); `TaskConsole._reactive_ring` walks REACTIVE edges over the RUNNING nodes
 only (GUI rows and notebook-injected `running_nodes=` processors alike) at each start — the start
 that would CLOSE a ring is the one refused, so start order cannot smuggle one in, and a stopped
-row's stale stored values can never false-reject a legal start (a pulse-scan's y reading its own
-relayed frame stays legal — it is a bounded PULL, never self-sustaining); the processor Edit
+row's stale stored values can never false-reject a legal start; the processor Edit
 picker no longer offers the node's own declared outputs.
 
-**Selector→hub chain completed** (the V6 gap): drawing an area rectangle on a LIVE image panel
-(selectors ON) now retargets every RUNNING region-capable processor consuming that signal through
-the thread-safe apply path, or — when none exists — CREATES the stock `ROI crop` row seeded with
-the signal + rectangle and STARTS it (`_on_panel_area_select`; `roi.region_values` is the one
-endpoint→params mapping).  **Coordinate frames** (audit fix): the selector yields AXIS
-coordinates, and a panel's axes carry the PRODUCING node's declared `region` origin — a consuming
-`RoiProcessor`'s region params are the frame's OWN pixels, so `_forward_area_select` subtracts the
-panel's `_roi_built` origin before forwarding (an ROI-of-ROI / hardware-sub-array drag crops the
-drawn box, not a clamped corner sliver).  A retarget also marks the layout dirty and reseeds an
-already-open Logic Edit tab.  Fit results are hub signals: `FitProcessor` ("Fit center") publishes
-`fit_x0/fit_y0/fit_amplitude/fit_size/fit_offset` scalars per shot — in the CONSUMED frame's own
-pixel coordinates — from the ONE `_readout_math.gaussian2d_center` model `DataFigure.center` also
-uses (an overlay fit on a region-declaring source reports axis pixels; they differ by the origin).
+**Selectors produce data, not side effects.** Every plot family adapts a gesture to the common
+`Selection` value (`ranges`, coordinate frame, optional grid-cell scope and metadata). Selecting by
+itself only stores/highlights that value. The operator explicitly chooses `none`, `fit`, or `ROI`;
+the console dispatches that action. ROI conversion alone translates displayed coordinates to a
+source-local region. Grid-cell scope is preserved so a cell request never broadcasts accidentally.
+
+**One fit request/core.** Setting and Edit both create the same `FitRequest` (model + `Selection`).
+`core.fitting` owns model registry, masking, solver, quality metrics and `FitResult`; DataFigure is
+an overlay adapter and `FitProcessor` is the hub adapter. The image processor publishes canonical
+scalar result tensors (`fit_x0`, `fit_y0`, amplitude, size, offset, validity and quality) and keeps
+status text on the result envelope rather than inventing a second frontend solver.
 
 **Persistent status strip**: `qt_fluent.FluentStatusStrip` (severity dot + eliding message +
 optional action) replaces both the header summary label an error used to overwrite and the

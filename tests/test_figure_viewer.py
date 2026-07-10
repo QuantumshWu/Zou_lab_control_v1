@@ -16,6 +16,7 @@ Runs headless (``QT_QPA_PLATFORM=offscreen``); the window is built + torn down i
 """
 
 from __future__ import annotations
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 import os
 import sys
@@ -227,7 +228,7 @@ def test_grid_panel_exposes_editable_cell_title_template_and_size():
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     from Zou_lab_control.frontend.task_console import (
         GRID_TITLE_PARAMS, PanelConfig, TaskConsole, _panel_display_decls, default_console_state)
-    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub, SignalSchema
 
     # grid folds the title-template knob into its enumeration; a flat panel does NOT.  (There is no
     # title-SIZE knob: the cell title auto-tracks the xy tick-label size.)
@@ -237,7 +238,10 @@ def test_grid_panel_exposes_editable_cell_title_template_and_size():
 
     ensure_qt_app()
     exp = na.connect("virtual")
-    con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
+    hub = SignalHub()
+    hub.register_signal("__probe__", SignalSchema(
+        point_shape=(1,), data_shape=(110,), dtype=np.float64, repeat_capacity=4))
+    con = TaskConsole(hub=hub, state=default_console_state(), session=exp,
                       measurements=exp.readout.measurement_specs(),
                       processors=exp.readout.processor_specs(),
                       tasks=exp.readout.task_specs(), window_px=(1000, 700))
@@ -250,7 +254,8 @@ def test_grid_panel_exposes_editable_cell_title_template_and_size():
                                                params={"sub_plot_kind": "hist", "facet": "repeat",
                                                        "points_shape": (1,)}))
         con._attach_card(card)
-        card._render(block, {})
+        namespace = {"__probe__": block}
+        card._render(card._signal_then_repeat(namespace), namespace)
         con._tick()
         con._edit_card(card)
         ed = con._panel_editors[id(card)]
@@ -277,11 +282,14 @@ def test_edit_x_range_pin_is_global_live_and_persisted():
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     from Zou_lab_control.frontend.task_console import (
         PanelConfig, TaskConsole, default_console_state)
-    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub, SignalSchema
 
     ensure_qt_app()
     exp = na.connect("virtual")
-    con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
+    hub = SignalHub()
+    hub.register_signal("__probe__", SignalSchema(
+        point_shape=(1,), data_shape=(80,), dtype=np.float64, repeat_capacity=6))
+    con = TaskConsole(hub=hub, state=default_console_state(), session=exp,
                       measurements=exp.readout.measurement_specs(),
                       processors=exp.readout.processor_specs(),
                       tasks=exp.readout.task_specs(), window_px=(900, 600))
@@ -293,7 +301,8 @@ def test_edit_x_range_pin_is_global_live_and_persisted():
                                                params={"sub_plot_kind": "hist", "facet": "repeat",
                                                        "points_shape": (1,)}))
         con._attach_card(card)
-        card._render(block, {})
+        namespace = {"__probe__": block}
+        card._render(card._signal_then_repeat(namespace), namespace)
         con._tick()
         con._edit_card(card)
         ed = con._panel_editors[id(card)]
@@ -325,20 +334,24 @@ def test_edit_y_range_pin_exists_only_on_the_image_family_and_round_trips():
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     from Zou_lab_control.frontend.task_console import (
         PanelConfig, TaskConsole, default_console_state)
-    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub, SignalSchema
 
     ensure_qt_app()
     exp = na.connect("virtual")
-    con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
+    hub = SignalHub()
+    hub.register_signal("__probe__", SignalSchema(
+        point_shape=(1,), data_shape=(48, 64), dtype=np.float64, repeat_capacity=1))
+    con = TaskConsole(hub=hub, state=default_console_state(), session=exp,
                       measurements=exp.readout.measurement_specs(),
                       processors=exp.readout.processor_specs(),
                       tasks=exp.readout.task_specs(), window_px=(900, 600))
     try:
-        frame = np.random.default_rng(0).normal(200, 5, (1, 48, 64))
+        frame = np.random.default_rng(0).normal(200, 5, (1, 1, 48, 64))
         card = con._new_panel_card(PanelConfig(kind="2d", title="IMG", size="4x4",
                                                source="value = __probe__", params={}))
         con._attach_card(card)
-        card._render(frame, {})
+        namespace = {"__probe__": frame}
+        card._render(card._signal_then_repeat(namespace), namespace)
         con._tick()
         con._edit_card(card)
         ed = con._panel_editors[id(card)]
@@ -417,7 +430,7 @@ def test_window_opens_at_screen_fit_not_content_width(tmp_path):
 
 def _saved_sites_with_signals_npz(tmp_path) -> Path:
     """Write a SITE-MAP npz that stored ``info['signals']`` (the faithful save side): a value occupancy
-    block ``(r, 1, N)``, its ``(N, 2)`` centres and -- crucially -- the judged camera FRAME block
+    block ``(r, 1, N)``, its canonical one-point ``(1, 1, N, 2)`` centres and -- crucially -- the judged camera FRAME block
     ``(r, 1, H, W)``.  Return the ``.npz`` path (no live plot -- a hand-built payload, no hardware)."""
     R, N, H, W = 3, 12, 40, 50
     rng = np.random.default_rng(1)
@@ -433,7 +446,8 @@ def _saved_sites_with_signals_npz(tmp_path) -> Path:
             "labels": ["site", "occupancy", "Z"], "unit": "", "view": {"relim": "tight"},
             "signals": {
                 "occupied": sig(occ, [1], [N], "occupancy", "", "value"),
-                "centers": sig(centers, None, None, "site centre", "px", "centers"),
+                "centers": sig(centers.reshape(1, 1, N, 2), [1], [N, 2],
+                               "site centre", "px", "centers"),
                 "frame_judged": sig(frame, [1], [H, W], "camera image", "counts", "frame"),
             }}
     path = tmp_path / "occ_sites.npz"
@@ -506,8 +520,8 @@ def _saved_1d_with_repeat_npz(tmp_path) -> Path:
     info = {"name": "survival", "kind": "1d", "source": "value = survival",
             "labels": ["t (s)", "survival", "Z"], "unit": "",
             "view": {"relim": "tight", "repeat_mode": "create"},
-            "signals": {"survival": sig(block, None, None, "survival", "", "value"),
-                        "t": sig(x, None, None, "t (s)", "", "x")}}
+            "signals": {"survival": sig(block, [P], [1], "survival", "", "value"),
+                        "t": sig(x.reshape(1, 1, P), [1], [P], "t (s)", "", "x")}}
     path = tmp_path / "survival_repeat.npz"
     np.savez(path, data_x=x.reshape(P, 1), data_y=block.mean(0).reshape(P, 1), info=info)
     return path
@@ -669,10 +683,10 @@ def _saved_pulse_recipe_npz(tmp_path) -> Path:
     pulse editor -- so the viewer's structured-figure path can be exercised without the GUI editor."""
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState, PulsePeriod
     st = PulseTableState(
-        channels=["probe", "trig", "da0", "da1"],
+        port_catalog=PortCatalog.from_channels(["probe", "trig", "da0", "da1"], analog_buses={"da": ["da0", "da1"]}),
         periods=[PulsePeriod(duration=10, unit="us", name="p0", states=(1, 0, 0, 1)),
                  PulsePeriod(duration=20, unit="us", name="p1", states=(0, 1, 1, 0))],
-        name="demo_pulse", analog_buses={"da": ["da0", "da1"]})
+        name="demo_pulse")
     info = {"kind": "pulse", "name": "demo_pulse", "source": "pulse preview",
             "figure_recipe": {"kind": "pulse", "pulse_state": st.to_dict(), "include_always_off": True}}
     path = tmp_path / "demo_pulse.npz"
@@ -800,7 +814,7 @@ def test_pulse_panel_size_round_trips_from_recipe(tmp_path):
     operator's saved size wins over the optimal default) -- the size flows with the figure."""
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState, PulsePeriod
     st = PulseTableState(
-        channels=["probe", "trig"],
+        port_catalog=PortCatalog.from_channels(["probe", "trig"]),
         periods=[PulsePeriod(duration=10, unit="us", name="p0", states=(1, 0)),
                  PulsePeriod(duration=20, unit="us", name="p1", states=(0, 1))],
         name="sized_pulse")
@@ -1275,6 +1289,11 @@ def test_bare_sitemap_save_uses_neutral_role_keys_and_binds_fully(tmp_path):
     assert set(signals) == {"value", "centers", "frame"},         "bare-save keys are the neutral role vocabulary, not a processor's private names"
     for key, entry in signals.items():
         assert entry["role"] == key, "each neutral key IS its role (loader binds by role)"
+        point_shape = tuple(entry["points_shape"])
+        data_shape = tuple(entry["data_shape"])
+        block = np.asarray(entry["block"])
+        assert point_shape and data_shape
+        assert block.shape == (block.shape[0], int(np.prod(point_shape)), *data_shape)
 
     hub = SignalHub()
     node = LoadedFigureNode(hub, saved)

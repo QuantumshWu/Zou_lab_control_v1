@@ -79,7 +79,8 @@ def test_2d_panel_survives_calibration_task_and_camera_restart():
         #    lingering frame instead of erroring on data_shape=().
         con._start_logic_node(camrow)
         cam2 = con._logic_nodes[id(camrow)]
-        assert cam2.data_shape == exp.devices.camera.frame_shape
+        frame_spec = next(spec for spec in cam2.output_specs() if spec.name == "frame_0")
+        assert frame_spec.data_shape == exp.devices.camera.frame_shape
         card._render_version = -1                     # force a recompose this tick
         con._tick()
         assert card._status_error is False, card._status_text

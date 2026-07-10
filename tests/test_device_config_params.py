@@ -134,12 +134,10 @@ def test_qcmos_nested_config_flattens_and_regroups_losslessly():
 
 
 def test_remote_sequencer_prefills_derive_from_their_single_sources():
-    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import hardware_channel_names
     from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer, serve_runtime_sequencer
 
     decls = {d.key: d for d in RemoteSequencer.config_params()}
     assert decls["host"].required and decls["host"].kind == "text"
     serve_port = inspect.signature(serve_runtime_sequencer).parameters["port"].default
     assert decls["port"].default == serve_port                      # the server's own default
-    assert decls["channels"].kind == "json"
-    assert decls["channels"].default == list(hardware_channel_names())
+    assert not ({"channels", "port_catalog", "clock_hz"} & set(decls))  # hardware facts come from server

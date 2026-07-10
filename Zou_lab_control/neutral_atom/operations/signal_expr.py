@@ -29,14 +29,30 @@ SIGNAL_EXPR_HELP = (
     "Data source: one line of Python evaluated against the live signals.\n"
     "Assign the result to `value`.  `signal` is the picked signal (one slot); with more\n"
     "than one slot it is a list, so `value = signal[0] - signal[1]` combines them.\n"
-    "Namespace: every signal name (latest value), history(name, n), latest(name),\n"
-    "names(), shot, np (alias numpy), math.")
+    "Every signal value is canonical (R, P, *data_shape).\n"
+    "Namespace: every signal name (latest canonical value), history(name, n),\n"
+    "history_logical(name, n), latest(name),\n"
+    "tensor(name), logical(name), valid(name), schema(name), names(), shot, np (alias numpy), math.\n"
+    "Reactive processors evaluate only their cursor-selected input snapshot: they retain\n"
+    "logical/valid/schema/names/shot plus np/numpy/math, but expose no live/latest/history/tensor lookup.")
 
 #: The helper names EVERY expression namespace injects -- the SINGLE spelling.  The GUI's
 #: reference-exclusion set (which identifiers in a source are NOT hub signals) and the help
 #: text above derive from this, and :func:`namespace_helpers` binds exactly these names, so a
 #: helper added in one place can never silently miss the others (contract-tested).
-NAMESPACE_HELPERS: tuple[str, ...] = ("history", "latest", "names", "shot", "np", "numpy", "math")
+NAMESPACE_HELPERS: tuple[str, ...] = (
+    "history", "history_logical", "latest", "tensor", "logical", "valid", "schema",
+    "names", "shot", "np", "numpy", "math",
+)
+
+#: Helpers that are safe inside a Processor's one-update transaction.  Every
+#: data-bearing helper resolves only against the exact immutable tensors selected
+#: by that processor's Hub subscription; none can reach a newer Hub value or an
+#: unconsumed dependency.  In particular, history/latest/tensor are intentionally
+#: absent rather than silently redirected to live state.
+PROCESSOR_NAMESPACE_HELPERS: tuple[str, ...] = (
+    "logical", "valid", "schema", "names", "shot", "np", "numpy", "math",
+)
 
 #: The canonical source for a single picked signal: the picked signal IS ``signal``.
 DEFAULT_SOURCE = "value = signal"
@@ -169,6 +185,47 @@ class SignalExpr:
         return self.exec_in(ns)
 
 
+class ProcessorSignalSnapshot(dict):
+    """One Processor cursor transaction, represented as canonical arrays.
+
+    ``tensors`` are the exact historical :class:`SignalTensor` states returned
+    together by :meth:`SignalHub.next_coherent_update`.  The dict values are
+    independent canonical ``(R,P,*data_shape)`` copies for ordinary expressions;
+    the immutable tensors remain attached so snapshot-safe schema/valid/logical
+    helpers never consult the live Hub.  This marker also lets :func:`hub_namespace`
+    enforce the narrower Processor namespace without every concrete Processor
+    reimplementing the policy.
+    """
+
+    def __init__(self, tensors: Mapping[str, object], *, provenance: int):
+        selected = {str(name): tensor for name, tensor in tensors.items()}
+        super().__init__({name: tensor.data.copy() for name, tensor in selected.items()})
+        self.tensors = selected
+        self.provenance = int(provenance)
+
+
+def processor_namespace_helpers(snapshot: ProcessorSignalSnapshot) -> dict:
+    """Snapshot-bound helpers for a Processor SignalExpr.
+
+    Name lookup is intentionally strict: asking for a signal that was not part
+    of ``consumes`` raises ``KeyError`` instead of reading it from the Hub.
+    """
+
+    def _tensor(name):
+        return snapshot.tensors[str(name)]
+
+    return {
+        "logical": lambda name: _tensor(name).logical(),
+        "valid": lambda name: _tensor(name).valid.copy(),
+        "schema": lambda name: _tensor(name).schema,
+        "names": lambda: sorted(snapshot.tensors),
+        "shot": snapshot.provenance,
+        "np": np,
+        "numpy": np,
+        "math": math,
+    }
+
+
 def namespace_helpers(hub) -> dict:
     """The helper bindings (:data:`NAMESPACE_HELPERS` name -> value) every expression namespace
     carries for ``hub``.  The ONE builder: the console panel, the pulse-scan y, and a reactive
@@ -177,8 +234,16 @@ def namespace_helpers(hub) -> dict:
     namespace ships)."""
 
     return {
+        # Canonical arrays are always explicit physical axes.  ``logical`` is
+        # the equally-explicit schema reshape for an image/grid processor; no
+        # helper examines ndarray rank to decide what an axis means.
         "history": lambda name, n=None: hub.history(name, n),
+        "history_logical": lambda name, n=None: hub.history_logical(name, n),
         "latest": lambda name: hub.latest(name),
+        "tensor": lambda name: hub.latest_tensor(name),
+        "logical": lambda name: hub.latest_logical(name),
+        "valid": lambda name: hub.latest_valid(name),
+        "schema": lambda name: hub.schema(name),
         "names": lambda: hub.names(),
         "shot": hub.shot,
         "np": np,
@@ -195,9 +260,14 @@ def hub_namespace(hub, snapshot: Mapping[str, object] | None = None) -> dict:
     namespace only adds its view-only reserved keys on top of this."""
 
     ns = dict(hub.snapshot_latest() if snapshot is None else snapshot)
-    ns.update(namespace_helpers(hub))
+    if isinstance(snapshot, ProcessorSignalSnapshot):
+        ns.update(processor_namespace_helpers(snapshot))
+    else:
+        ns.update(namespace_helpers(hub))
     return ns
 
 
 __all__ = ["SignalExpr", "SIGNAL_EXPR_HELP", "DEFAULT_SOURCE", "NAMESPACE_HELPERS",
-           "seed_source_for_slots", "namespace_helpers", "hub_namespace"]
+           "PROCESSOR_NAMESPACE_HELPERS", "ProcessorSignalSnapshot",
+           "seed_source_for_slots", "namespace_helpers", "processor_namespace_helpers",
+           "hub_namespace"]

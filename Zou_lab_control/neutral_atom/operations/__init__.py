@@ -14,6 +14,7 @@ from .logic import (
     SignalSpec,
     Task,
     describe_shape,
+    format_dims,
 )
 from .fidelity import (
     FidelityReport,
@@ -24,7 +25,7 @@ from .fidelity import (
     reference_labels,
     train_test_split,
 )
-from .imageio import RunIndex, frame_files, index_run, load_frame, save_frame
+from .imageio import RunIndex, RunManifest, frame_files, index_manifest, index_run, load_frame, save_frame
 from .measurement import (
     MeasurementSpec,
     NFramePlan,
@@ -103,6 +104,7 @@ __all__ = [
     "TaskSpec",
     "frame_files",
     "index_run",
+    "index_manifest",
     "load_frame",
     "Measurement",
     "Processor",
@@ -119,6 +121,7 @@ __all__ = [
     "release_recapture_survival",
     "ReleaseRecapturePlan",
     "RunIndex",
+    "RunManifest",
     "save_frame",
     "ScanAxis",
     "ScannedMeasurement",
@@ -127,6 +130,7 @@ __all__ = [
     "ShotPlan",
     "SignalSpec",
     "describe_shape",
+    "format_dims",
     "SiteFidelity",
     "SurvivalReducer",
     "TemperatureFit",

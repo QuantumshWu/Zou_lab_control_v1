@@ -71,7 +71,7 @@ def test_none_draws_no_fit():
 
 def test_create_draws_one_outlined_histogram_per_repeat():
     """'create' for a DISTRIBUTION: reduce_repeat(hist=True) collapses each repeat's WHOLE core to a
-    column -> (n_samples, R) for the iron-law (repeat, data_points=1, n_sites) block; the dis draws ONE
+    column -> (n_samples, R) for the canonical (R,P,*data_shape), data_shape=(n_sites,), block; the dis draws ONE
     histogram per repeat -- column 0 the FULL treatment (fill + fit + threshold + text), columns 1.. the
     SAME FILLED histogram in a different LINE_CYCLE colour + alpha (NOT an outline).  Non-create modes
     stay 1-D (the hist bins everything); a plain 1-D value (pool / single repeat) is a single histogram
@@ -80,13 +80,13 @@ def test_create_draws_one_outlined_histogram_per_repeat():
     from Zou_lab_control.frontend.live import reduce_repeat
     rng = np.random.default_rng(0)
     R, n_sites = 4, 35
-    # iron-law per-site readout block: (repeat, data_points=1, n_sites), core_ndim=2 -- the REAL shape
+    # Canonical per-site readout block: (R,P,*data_shape), P=1, data_shape=(n_sites,).
     block = np.stack([np.concatenate([rng.normal(300, 16, n_sites // 2),
                                       rng.normal(470, 16, n_sites - n_sites // 2)])
                       for _ in range(R)])[:, None, :]            # (R, 1, n_sites)
-    created = reduce_repeat(block, "create", core_ndim=2, hist=True)
+    created = reduce_repeat(block, "create", hist=True)
     assert created.shape == (n_sites, R)                         # one COLUMN (n_sites samples) per repeat
-    assert reduce_repeat(block, "average", core_ndim=2, hist=True).ndim == 1   # non-create -> ONE 1-D set
+    assert reduce_repeat(block, "average", hist=True).ndim == 1   # non-create -> ONE 1-D set
     fig = plot(created, kind="hist", bins=20, fit="double")
     assert _two_peaks_drawn(fig)                                 # the FIRST repeat keeps the full fit
     assert len(fig._overlay_polys) == R - 1                      # one FILLED histogram per non-first repeat
@@ -112,7 +112,7 @@ def test_primary_and_overlay_bins_share_the_one_owned_fill_alpha():
     R, n_sites = 3, 30
     block = np.stack([rng.normal(300, 16, n_sites) for _ in range(R)])[:, None, :]   # (R,1,n_sites)
     from Zou_lab_control.frontend.live import reduce_repeat
-    created = reduce_repeat(block, "create", core_ndim=2, hist=True)
+    created = reduce_repeat(block, "create", hist=True)
     fig2 = plot(created, kind="hist", bins=20)
     assert fig2.poly.get_alpha() == HIST_FILL_ALPHA
     for ov in fig2._overlay_polys:

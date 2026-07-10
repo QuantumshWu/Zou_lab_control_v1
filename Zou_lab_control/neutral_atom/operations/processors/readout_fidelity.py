@@ -18,6 +18,7 @@ import numpy as np
 
 from ..fidelity import FidelityReport
 from ...core.params import ParamDecl
+from ...core.signal_tensor import SignalSchema, SignalTensor
 from ..imageio import DEFAULT_SHORT_SHOT, DEFAULT_SHOTS_PER_GROUP, SHOT_INDEX_MIN
 from ..processor import ProcessorContext, ProcessorSpec
 from ..processor_registry import processor
@@ -72,9 +73,34 @@ def readout_fidelity(readout) -> ProcessorSpec:
             store_thresholds=bool(p["store_thresholds"]),
             save=False,
         )
+        site_fidelity = np.asarray(report.site_fidelities, dtype=float).reshape(-1)
+        thresholds = np.asarray(report.thresholds, dtype=float).reshape(-1)
+        if site_fidelity.shape != thresholds.shape or site_fidelity.size < 1:
+            raise ValueError(
+                "readout fidelity must return one non-empty threshold per site; "
+                f"got fidelity={site_fidelity.shape}, thresholds={thresholds.shape}.")
+        n_sites = int(site_fidelity.size)
+
+        def tensor(data, *, point_shape, data_shape, label, unit="") -> SignalTensor:
+            array = np.asarray(data, dtype=float)
+            schema = SignalSchema(
+                point_shape=point_shape,
+                data_shape=data_shape,
+                dtype=np.float64,
+                repeat_capacity=1,
+                label=label,
+                unit=unit,
+            )
+            return SignalTensor(array, schema)
+
         out: dict = {
-            "fidelity_site": np.asarray(report.site_fidelities, dtype=float),
-            "fidelity_threshold": np.asarray(report.thresholds, dtype=float),
+            "fidelity_site": tensor(
+                site_fidelity.reshape(1, 1, n_sites),
+                point_shape=(1,), data_shape=(n_sites,), label="site fidelity"),
+            "fidelity_threshold": tensor(
+                thresholds.reshape(1, 1, n_sites),
+                point_shape=(1,), data_shape=(n_sites,),
+                label="readout threshold", unit="counts"),
         }
         # The site centers (N, 2) so the default 'sites' atom map can place its
         # circles standalone (no live logic node needed): read from the calibration the
@@ -83,10 +109,22 @@ def readout_fidelity(readout) -> ProcessorSpec:
         # ``centers``; two processors may not publish the same hub signal).
         cal = readout.current
         if cal is not None:
-            out["fidelity_centers"] = np.asarray(cal.centers, dtype=float)
+            centers = np.asarray(cal.centers, dtype=float)
+            if centers.shape != (n_sites, 2):
+                raise ValueError(
+                    f"readout calibration centers must have shape {(n_sites, 2)}, got {centers.shape}.")
+            out["fidelity_centers"] = tensor(
+                centers.reshape(1, 1, n_sites, 2),
+                point_shape=(1,), data_shape=(n_sites, 2),
+                label="site centre", unit="px")
         # report.summary() is all scalars -> the numeric pane (single source: the
         # report owns these names, we just republish them).
-        out.update({str(k): float(v) for k, v in report.summary().items()})
+        out.update({
+            str(key): tensor(
+                np.asarray(value, dtype=float).reshape(1, 1, 1),
+                point_shape=(1,), data_shape=(1,), label=str(key))
+            for key, value in report.summary().items()
+        })
         return out
 
     # SINGLE SOURCE: the report owns its scalar key names; declare them straight from

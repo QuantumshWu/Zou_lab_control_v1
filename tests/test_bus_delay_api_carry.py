@@ -7,6 +7,7 @@ list ALONE, but a bus-delay slot's target is the BUS NAME (not a channel), so it
 (could never toggle OFF), and binding a second bus dropped the first (only one bus could hold a slot).
 The fix routes both the validator and the carry through one ``PulseTableState.is_delay_target`` source.
 """
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 import os
 import pytest
@@ -18,8 +19,7 @@ from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
 
 def _bus_state() -> PulseTableState:
     return PulseTableState(
-        channels=["da0", "da1", "da2", "da3", "probe", "trig"],
-        analog_buses={"busA": ["da0", "da1"], "busB": ["da2", "da3"]},
+        port_catalog=PortCatalog.from_channels(["da0", "da1", "da2", "da3", "probe", "trig"], analog_buses={"busA": ["da0", "da1"], "busB": ["da2", "da3"]}),
     )
 
 

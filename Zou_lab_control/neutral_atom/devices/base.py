@@ -982,13 +982,15 @@ class SequencerDevice(BaseDevice):
     """Required contract for a timing/sequencer backend."""
 
     channels: list[str] | tuple[str, ...]
+    port_catalog: Any
     clock_hz: float
 
     #: Read-only facts an OBSERVE-mode consumer may touch (see :class:`ReadOnlyDevice`):
     #: the live firing/progress state and static geometry -- never prepare/fire/
     #: set_safe_state/settle (those drive the one shared streamer).
     OBSERVE_API = BaseDevice.OBSERVE_API | frozenset(
-        {"firing", "last_fired", "scan_progress", "channels", "clock_hz", "sleep_scale"})
+        {"firing", "last_fired", "scan_progress", "raw_channels", "port_catalog",
+         "clock_hz", "sleep_scale"})
 
     @abstractmethod
     def prepare(self, sequence) -> Any:
@@ -1027,17 +1029,14 @@ class SequencerDevice(BaseDevice):
         from .sequencer import SCAN_PROGRESS_IDLE
         return dict(SCAN_PROGRESS_IDLE)
 
-    def display_channels(self) -> list[str]:
-        """The output channel catalog as a USER sees it: the multi-bit coil DACs folded into their bus
-        (``dx0``..``dz5`` -> ``da_x``/``da_y``/``da_z``), every plain channel as-is.  The ONE source the
-        snapshot AND the ``channels`` read-back present, so a physical DAC bus shows as ONE channel, not
-        its six separate bit lines (the "counted separately" complaint).  Reads the SAME
-        ``channels_as_buses`` fold the pulse editor draws with -- it needs the backend's
-        ``channel_labels``; with none (or non-contiguous bits) the raw catalog comes back unchanged, so
-        real == virtual once the board's labels are loaded.  The raw catalog stays on ``self.channels``
-        for the compiler; this is display only."""
-        from ..timing import channels_as_buses
-        return channels_as_buses(getattr(self, "channels", ()), getattr(self, "channel_labels", None))
+    @property
+    def raw_channels(self) -> tuple[str, ...]:
+        """Physical compiler lanes, explicitly separated from logical output ports."""
+
+        catalog = getattr(self, "port_catalog", None)
+        if catalog is None:
+            return tuple(str(value) for value in getattr(self, "channels", ()))
+        return tuple(catalog.raw_lanes)
 
     def runtime_controls(self) -> tuple["RuntimeControl", ...]:
         """The sequencer's live control catalog (see :meth:`BaseDevice.runtime_controls`): the
@@ -1070,10 +1069,11 @@ class SequencerDevice(BaseDevice):
                           tooltip="Where a running scan is now (point K/N · sweep r/R), or idle."),
                 getter=_fmt_progress),
             RuntimeControl(
-                ParamDecl(key="channels", label="channels", kind="text",
-                          tooltip="The sequencer's output channels (multi-bit DAC coils shown as ONE bus)."),
-                getter=lambda dev: ", ".join(dev.display_channels()) if hasattr(dev, "display_channels")
-                else str(len(getattr(dev, "channels", ()) or ())) + " channels"),
+                ParamDecl(key="ports", label="ports", kind="text",
+                          tooltip="Logical sequencer outputs; DAC data lanes are represented by one port."),
+                getter=lambda dev: ", ".join(
+                    port.key for port in getattr(getattr(dev, "port_catalog", None), "ports", ()))
+                or "(none)"),
         ]
         # ``sleep_scale`` is a WRITABLE knob only where the backend actually carries a settable
         # attribute (the virtual sequencer's plain instance field); a real/remote streamer has

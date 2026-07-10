@@ -157,11 +157,16 @@ def test_node_start_builds_node_and_streams_no_auto_plot():
         console.refresh_once()
 
         # the console node publishes under the measurement slug: <key>_<quantity>.
-        x = console.hub.latest(f"{spec.key}_{spec.x_key}")
-        # y is the RAW (repeat, points, dim) block; reduce the repeat axis the way a plot does.
+        x_tensor = np.asarray(console.hub.latest(f"{spec.key}_{spec.x_key}"), dtype=float)
+        assert x_tensor.shape == (1, 5, 1)
+        x = x_tensor[0, :, 0]          # explicitly select the sole R and scalar data cell
+        # y is the RAW (R,P,*data_shape) block; reduce the repeat axis the way a plot does.
         from Zou_lab_control.frontend.live import reduce_repeat
-        y = np.asarray(reduce_repeat(np.asarray(console.hub.latest(f"{spec.key}_{spec.y_key}"),
-                                                dtype=float), "replace"), dtype=float).reshape(-1)
+        y_tensor = np.asarray(reduce_repeat(
+            np.asarray(console.hub.latest(f"{spec.key}_{spec.y_key}"), dtype=float), "replace"),
+            dtype=float)
+        assert y_tensor.shape == (5, 1)
+        y = y_tensor[:, 0]             # scalar data_shape=(1,), never flatten an unknown tail
         assert x.shape == (5,) and y.shape == (5,)
         assert np.all(np.isfinite(y)) and np.all((y >= 0) & (y <= 1))
         assert y[0] > y[-1] + 0.3

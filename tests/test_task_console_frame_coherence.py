@@ -23,8 +23,7 @@ from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
 class _Spec:
     def __init__(self, data_shape):
-        self.has_structure = True
-        self.points_shape = ()
+        self.points_shape = (1,)
         self.data_shape = data_shape
 
 
@@ -41,7 +40,7 @@ class _FakeProducer:
 
 
 def _img(shot):
-    return np.full((1, 8, 8), shot * 100.0, dtype=float)     # (repeat, H, W) camera contract
+    return np.full((1, 1, 8, 8), shot * 100.0, dtype=float)
 
 
 def _frame_shot(card):
@@ -51,6 +50,15 @@ def _frame_shot(card):
 def test_three_emccd_frames_never_split_when_clock_advances_via_a_lagging_coproducer():
     ensure_qt_app()
     hub = SignalHub()
+    from Zou_lab_control.neutral_atom.core.signal_tensor import SignalSchema
+    hub.register_signal(
+        "frame_0", SignalSchema(data_shape=(8, 8), dtype=np.float64, repeat_capacity=1))
+    hub.register_signal(
+        "frame_1", SignalSchema(data_shape=(8, 8), dtype=np.float64, repeat_capacity=1))
+    hub.register_signal(
+        "frame_2", SignalSchema(data_shape=(8, 8), dtype=np.float64, repeat_capacity=1))
+    hub.register_signal(
+        "occupancy", SignalSchema(data_shape=(1,), dtype=np.float64, repeat_capacity=1))
     state = zf.TaskConsoleState(name="coh", panels=[
         zf.PanelConfig(kind="2d", title="f0", size="2x2", source="value = frame_0"),
         zf.PanelConfig(kind="2d", title="f1", size="2x2", source="value = frame_1"),
@@ -64,7 +72,7 @@ def test_three_emccd_frames_never_split_when_clock_advances_via_a_lagging_coprod
     console._refresh_task_panel = lambda: None
     try:
         hub.publish({"frame_0": _img(0), "frame_1": _img(0), "frame_2": _img(0)}, provenance=0)
-        hub.publish({"occupancy": 0.0}, provenance=0)
+        hub.publish({"occupancy": np.asarray([[[0.0]]])}, provenance=0)
         tick(console)
         assert all(c.plotter is not None for c in console.cards)
 
@@ -81,7 +89,7 @@ def test_three_emccd_frames_never_split_when_clock_advances_via_a_lagging_coprod
             # tick B: occupancy CATCHES UP to shot S -> the clock advances S-1 -> S at a tick where the
             # frame panels' OWN signal did NOT republish.  The per-signal gate skipped them here (desync);
             # the display-shot gate recomposes all three together -> still one coherent shot.
-            hub.publish({"occupancy": float(S)}, provenance=S)
+            hub.publish({"occupancy": np.asarray([[[float(S)]]])}, provenance=S)
             tick(console)
             disp_b = console._display_shot()
             shots_b = [_frame_shot(console.cards[k]) for k in range(3)]

@@ -5,7 +5,7 @@ Stop/Start cycles with the imaging pulse actually FIRED, and assert
   (2) the LIVE occupied classification, measured per-frame against the SAME frame's ground truth, equals
       the calibration fidelity (~0.84 box @2ms) -- NOT the ~0.5 chance the user saw when the readout ran at
       a different exposure than the calibration (the exposure-mismatch bug, now fixed by the camera-exposure
-      pin + detect threshold_exposure).
+      pin + detect the typed calibration exposure).
 
 The virtual camera re-randomises the loading every frame, so truth MUST be read in lockstep with the judged
 frame (read trap.occupancy right after the camera step, before the next frame) -- comparing across frames
@@ -15,6 +15,7 @@ gives a spurious ~0.5.  Routes through the same TaskConsole + calibration.detect
 from __future__ import annotations
 
 import os
+import time
 import numpy as np
 import pytest
 
@@ -58,26 +59,39 @@ def test_console_three_startstop_cycles_stable_name_and_live_accuracy():
         def cycle():
             con._start_logic_node(camrow); con._start_logic_node(judrow)
             fire_live_imaging(exp, exposure=0.002)
-            camN = con._logic_nodes[id(camrow)]; judN = con._logic_nodes[id(judrow)]
-            accs = []; name = None
-            for _ in range(30):
-                camN.step()                                   # one frame -> trap.occupancy is ITS truth
-                truth = np.asarray(trap.occupancy, dtype=bool).reshape(-1)
-                judN.step()                                   # judge THAT frame
+            deadline = time.monotonic() + 3.0
+            names = []
+            while not names and time.monotonic() < deadline:
                 names = [n for n in con.hub.signal_versions() if n.endswith("occupied")]
-                if names:
-                    name = names[0]
-                    pred = np.asarray(con.hub.latest(name), dtype=bool).reshape(-1)
-                    if pred.shape == truth.shape:
-                        accs.append(float((pred == truth).mean()))
+                time.sleep(0.01)
             con._stop_logic_node(judrow); con._stop_logic_node(camrow)
-            return name, (float(np.mean(accs)) if accs else float("nan"))
+            return names[0] if names else None
 
-        results = [cycle(), cycle(), cycle()]
-        names = {n for n, _ in results}
-        accs = [a for _, a in results]
+        names = {cycle(), cycle(), cycle()}
         assert names == {"occupied"}, f"signal name must stay 'occupied' across Stop/Start, got {names}"
-        assert all(a >= 0.78 for a in accs), f"live occupied accuracy must equal the calibration (~0.84), got {accs}"
+
+        # Accuracy is a separate synchronous transaction.  Calling ``step`` on a node
+        # while its console-owned background thread is also stepping it races two frames
+        # and compares one prediction with another frame's truth.
+        from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement, OccupancyProcessor
+        hub = SignalHub()
+        camera = CameraMeasurement(
+            hub, exp.devices.camera, sequencer=exp.devices.sequencer, repeat=0)
+        judge = OccupancyProcessor(
+            hub, calibration=task.calibration,
+            source_expr={"inputs": ["frame_0"], "source": "value = signal"},
+            method="box")
+        fire_live_imaging(exp, exposure=0.002)
+        accs = []
+        for _ in range(90):
+            camera.step()
+            truth = np.asarray(trap.occupancy, dtype=bool).reshape(-1)
+            judge.step()
+            pred = np.asarray(hub.latest("occupied"), dtype=bool).reshape(-1)
+            accs.append(float((pred == truth).mean()))
+        accuracy = float(np.mean(accs))
+        assert accuracy >= 0.78, (
+            f"live occupied accuracy must equal the calibration (~0.84), got {accuracy}")
     finally:
         if con is not None:
             con.shutdown()

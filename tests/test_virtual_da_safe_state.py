@@ -56,8 +56,8 @@ def _mot_state():
 
 
 def _sequence_at(state, values_by_slot):
-    slots = [s.name for s in state.api_slots if s.kind == "dac"]
-    return state.with_api_resolved(dict(zip(slots, values_by_slot))).to_sequence()
+    slots = [slot.name for slot in state.scan_slots if slot.kind == "dac"]
+    return state.with_slots_resolved(dict(zip(slots, values_by_slot))).to_sequence()
 
 
 def _ttl_only_sequence() -> PulseSequence:
@@ -72,7 +72,7 @@ def test_decoder_reads_an_undriven_bus_as_the_safe_level():
     state = _mot_state()
     seq = _ttl_only_sequence()
     t = 0.5 * seq.base_duration
-    for members in state.analog_buses.values():
+    for members in state.port_catalog.analog_buses.values():
         assert decode_analog_bus(seq, members, t) == BUS_SAFE_SIGNED_LEVEL
 
 
@@ -82,18 +82,18 @@ def test_explicit_zero_and_full_negative_corner():
     bus -- so it unifies to the safe level (the documented un-decodable corner, matching the
     hardware whose unused buses genuinely rest at 0 V)."""
     state = _mot_state()
-    n_slots = sum(1 for s in state.api_slots if s.kind == "dac")
+    n_slots = sum(1 for slot in state.scan_slots if slot.kind == "dac")
 
     zero = _sequence_at(state, (0,) * n_slots)
     t = 0.5 * zero.base_duration
-    for members in state.analog_buses.values():
+    for members in state.port_catalog.analog_buses.values():
         # the driven path really is exercised: the mid code puts a pulse on the MSB member
         assert any(p.channel == members[-1] for p in zero.base_pulses())
         assert decode_analog_bus(zero, members, t) == 0
 
-    lo = [bus_signed_range(len(m))[0] for m in state.analog_buses.values()]
+    lo = [bus_signed_range(len(m))[0] for m in state.port_catalog.analog_buses.values()]
     negfull = _sequence_at(state, lo)
-    for members in state.analog_buses.values():
+    for members in state.port_catalog.analog_buses.values():
         assert not any(p.channel in members for p in negfull.base_pulses())   # nothing projected
         assert decode_analog_bus(negfull, members, 0.5 * negfull.base_duration) \
             == BUS_SAFE_SIGNED_LEVEL
@@ -113,7 +113,7 @@ def test_delayed_driven_bus_rests_at_the_safe_level_before_its_window():
     from Zou_lab_control.neutral_atom.timing.pulse_table import bus_zero_code
 
     state = _mot_state()
-    n_slots = sum(1 for s in state.api_slots if s.kind == "dac")
+    n_slots = sum(1 for slot in state.scan_slots if slot.kind == "dac")
     values = tuple(range(3, 3 + n_slots))              # nonzero driven levels (inputs, in range)
     seq = _sequence_at(state, values)
 
@@ -121,12 +121,12 @@ def test_delayed_driven_bus_rests_at_the_safe_level_before_its_window():
     step = seq.base_duration / n_samples
     d_steps = n_samples // 4
     delayed = seq
-    for members in state.analog_buses.values():
+    for members in state.port_catalog.analog_buses.values():
         for channel in members:
             delayed = delayed.delay(channel, d_steps * step)
 
     times = [(k + 0.5) * step for k in range(n_samples)]   # mid-step samples, whole base cycle
-    for members in state.analog_buses.values():
+    for members in state.port_catalog.analog_buses.values():
         zero = bus_zero_code(len(members))                 # wire mid code = the safe rest value
         undelayed = [decode_analog_bus(seq, members, t) + zero for t in times]
         expected = bus_delay_line_reference(undelayed, d_steps, safe_value=zero)
@@ -143,7 +143,7 @@ def test_ttl_only_fire_images_the_same_scene_as_explicit_zero_da():
     MOT spot as firing the template with every DAC explicitly at 0 (both drive 0 V on the coils).
     Before the fix the TTL-only fire sensed every coil at -2^(B-1) and the spot vanished."""
     state = _mot_state()
-    n_slots = sum(1 for s in state.api_slots if s.kind == "dac")
+    n_slots = sum(1 for slot in state.scan_slots if slot.kind == "dac")
     seqr = VirtualSequencer()
     cam = VirtualMotCamera(sequencer=seqr, seed=0)
 
@@ -179,12 +179,12 @@ def test_explicit_nonzero_da_still_senses_exactly():
     state = _mot_state()
     seqr = VirtualSequencer()
     cam = VirtualMotCamera(sequencer=seqr, seed=0)
-    slots = [s.name for s in state.api_slots if s.kind == "dac"]
-    at_peak = [int(cam.b0[bus]) for bus in cam.coil_buses]
+    slots = [slot for slot in state.scan_slots if slot.kind == "dac"]
+    at_peak = [int(cam.b0[slot.dac_bus]) for slot in slots]
     seq = _sequence_at(state, at_peak)
     seqr.prepare(seq)
     seqr.fire(seq)
     cam.acquire(1)
     assert cam.last_levels == {bus: int(cam.b0[bus]) for bus in cam.coil_buses}
     assert cam.mot_efficiency(cam.last_levels) == pytest.approx(1.0)
-    assert len(slots) == len(cam.coil_buses)           # template and camera agree on the bus count
+    assert [slot.dac_bus for slot in slots] == list(cam.coil_buses)

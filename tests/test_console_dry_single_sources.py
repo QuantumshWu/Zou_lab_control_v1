@@ -20,6 +20,8 @@ if sys.path[0] != str(REPO_ROOT):
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import numpy as np
+
 import Zou_lab_control.neutral_atom as na
 from conftest import add_logic_row, make_console
 
@@ -81,6 +83,38 @@ def test_task_frame_source_and_injection_share_one_constant():
         # the declared picker entry for a task = its spec's mid_run_key + the ONE display tag
         keys = con._declared_signal_keys(taskrow)
         assert keys == [f"{spec.mid_run_key}{MID_RUN_TAG}"]
+    finally:
+        con.shutdown()
+        exp.close()
+
+
+def test_calibrate_task_panel_consumes_typed_task_output_with_schema_and_validity():
+    """The off-hub task channel is still a canonical typed source: a raw ``(H,W)`` publish becomes
+    ``(1,1,H,W)``, the generic 2-D card receives its schema + validity, and builds the real image."""
+    from Zou_lab_control.frontend.task_console import SIG_VALID_KEY, TASK_FRAME_KEY
+
+    exp = na.connect("virtual")
+    con = make_console(exp)
+    try:
+        row = add_logic_row(con, ("task", "Calibrate readout"))
+        node = con._build_logic_node(row.node, dict(row.node.values))
+        con._set_task_running(row, node)
+        frame_shape = tuple(node.camera.frame_shape)
+        raw = np.arange(np.prod(frame_shape), dtype=np.uint16).reshape(frame_shape)
+        node.output.publish(frame=raw)
+        con._refresh_task_panel()
+
+        tensor = node.output.latest_tensor("frame")
+        assert tensor.shape == (1, 1, *frame_shape)
+        structure = con._signal_structure(TASK_FRAME_KEY)
+        assert structure["points_shape"] == (1,)
+        assert structure["data_shape"] == frame_shape
+        namespace = con._expression_namespace()
+        np.testing.assert_array_equal(namespace[TASK_FRAME_KEY], tensor.data)
+        np.testing.assert_array_equal(namespace[SIG_VALID_KEY][TASK_FRAME_KEY], tensor.valid)
+        assert con._task_card._bound_structure() == structure
+        assert con._task_card.plotter is not None
+        assert con._task_card.plotter.grid.shape == frame_shape
     finally:
         con.shutdown()
         exp.close()

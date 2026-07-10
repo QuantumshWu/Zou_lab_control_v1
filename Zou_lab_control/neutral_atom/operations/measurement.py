@@ -1,8 +1,8 @@
 """Generic scanned-measurement abstraction (the engine behind every live scan).
 
 A "scanned measurement" sweeps one bound pulse parameter, acquires a few camera
-frames per point, and reduces those frames to a number (or one number per site)
-that becomes the live curve's y value.  Detection-time/fidelity and
+frames per point, and reduces those frames to one declared per-point data tensor.
+Detection-time/fidelity and
 release-recapture temperature are both this same shape; the only difference is
 WHICH slot is scanned (``ScanAxis``), HOW the per-point sequence is built
 (``ShotPlan``), and HOW the frames become a y value (``PointReducer``).  Holding
@@ -47,12 +47,88 @@ from ..views.plots import plot_detection_scan
 NODE_META_KEY = "node"
 PULSE_SCAN_NODE = "pulse_scan"
 
+#: The two execution semantics supported by PulseScan.  A hardware scan slot is uploaded as one
+#: complete table; an API slot is resolved and submitted as one finite pulse per point.  Keeping
+#: this discriminator beside the shared execution helpers gives the measurement factory, logic
+#: node, and frontend one source instead of parallel mode vocabularies.
+SWEEP_SCAN_SLOT = "scan_slot"
+SWEEP_API_SLOT = "api_slot"
+PULSE_SWEEP_KINDS: tuple[str, str] = (SWEEP_SCAN_SLOT, SWEEP_API_SLOT)
+
 #: The metadata marker every COUPLED-tier measurement (temperature / fidelity-vs-duration /
 #: grey-molasses-detuning -- the pulse-scan special cases whose y is reduced INLINE over a loading's
 #: frames) tags its spec with -- the ONE source (was hand-typed ``"coupled"`` in each spec), read by
 #: the docs and ``tests/test_scan_tier_boundary.py``.
 SCAN_TIER_KEY = "scan_tier"
 SCAN_TIER_COUPLED = "coupled"
+
+
+def _replace_running_pulse(sequencer, payload):
+    """Stop prior playback, prepare ``payload``, and fire it exactly once."""
+
+    if sequencer is None:
+        raise RuntimeError("a pulse scan requires a sequencer")
+    stop = getattr(sequencer, "set_safe_state", None)
+    if not callable(stop):
+        stop = getattr(sequencer, "abort", None)
+    if callable(stop):
+        stop()
+    program = sequencer.prepare(payload)
+    sequencer.fire()
+    return program
+
+
+def prepare_hardware_scan(sequencer, pulse_state, *, scan_repeats: int):
+    """Upload and fire one complete hardware scan, returning its runtime program.
+
+    The caller supplies a ``PulseTableState`` whose slots and whole scan table are final.  This
+    shared execution seam clones it, applies the whole-table repeat count (``0`` = continuous),
+    stops prior playback, then performs exactly one ``prepare(state)`` and one ``fire()``.  It
+    never resolves individual rows and knows nothing about cameras or reducers.
+    """
+
+    if not getattr(pulse_state, "scan_slots", None) or not getattr(pulse_state, "scan_table", None):
+        raise ValueError("hardware scan state must contain both scan_slots and scan_table")
+    payload = pulse_state.to_dict()
+    payload["scan_repeats"] = max(0, int(scan_repeats))
+    payload["repeat_forever"] = True
+    submitted = type(pulse_state).from_dict(payload)
+
+    return _replace_running_pulse(sequencer, submitted)
+
+
+def program_completion_timeout(program) -> float:
+    """Conservative wait budget for one finite submitted runtime program.
+
+    ``RuntimeSequenceProgram.duration`` covers one complete streamed-table sweep,
+    so a finite ``scan_repeats=K`` run needs ``K`` times that duration.  Ordinary
+    and API-resolved programs have no scan points and use their duration once.
+    Every tail wait shares the same five-second transport slack.
+    """
+
+    duration = max(0.0, float(getattr(program, "duration", 0.0) or 0.0))
+    scan_points = getattr(program, "scan_points", None)
+    repeats = max(1, int(getattr(program, "scan_repeats", 0) or 0)) if scan_points else 1
+    return 2.0 * duration * repeats + 5.0
+
+
+def fire_api_sweep_point(sequencer, pulse_state, values):
+    """Resolve and fire one finite API-slot sweep point.
+
+    Any hardware scan slots in the same template are first resolved to their nominal values and
+    removed, so selecting an API sweep can never accidentally start the template's persisted FPGA
+    table.  ``values`` then overrides the named API handles on a fresh state.  The returned runtime
+    program is used by the caller to derive a finite completion timeout before submitting the next
+    point.
+    """
+
+    base = pulse_state.with_slots_resolved({})
+    submitted = base.with_api_resolved(values)
+    payload = submitted.to_dict()
+    payload["repeat_forever"] = False
+    payload["scan_repeats"] = 1
+    submitted = type(submitted).from_dict(payload)
+    return _replace_running_pulse(sequencer, submitted)
 
 
 def triggered_frames(camera, sequencer, sequence, frames: int = 1, *, stop=None) -> list:
@@ -104,7 +180,7 @@ def triggered_frames(camera, sequencer, sequence, frames: int = 1, *, stop=None)
         if not getattr(program, "repeat_forever", False):
             waiter = getattr(sequencer, "wait_done", None)
             if callable(waiter):
-                budget = 2.0 * float(getattr(program, "duration", 0.0) or 0.0) + 5.0
+                budget = program_completion_timeout(program)
                 # Thread ``stop`` so this program-tail wait is cooperatively cancellable like the frame read
                 # above: without it a Stop pressed here blocks up to ``2*duration+5`` s while the node still
                 # reports "running" and holds the camera armed -- the double-acquire wedge the sole-owner
@@ -272,7 +348,7 @@ class MeasurementSpec(CatalogSpec):
     measurement a logic node can drive point-by-point.  ``metadata`` carries
     spec-specific extras (e.g. the capture radius the temperature fit needs) without
     widening the call signature.  (A per-site result lives in the raw ``<y_key>`` block's
-    dimension axis -- the node publishes ONE raw ``(repeat, points, dim)`` signal; a per-site
+    ``data_shape=(n_sites,)`` -- the node publishes ONE canonical ``(R,P,*data_shape)`` signal; a per-site
     grid view is a PLOT-side reduce + reshape on it, using the trap array's grid shape, not a
     separate stored field.)
     """
@@ -333,9 +409,9 @@ class MeasurementSpec(CatalogSpec):
 class ScanAxis:
     """Declares the swept parameter: which bound slot, which values, units.
 
-    ``slot`` is the ``PulseController`` slot key (``"s0"``..., or an int slot
-    index).  ``values`` are the scan points in the axis's own unit: a time
-    (``duration``) slot is set with ``pulse.set_time`` and takes NANOSECONDS at
+    ``slot`` is the semantic :class:`ScanSlot.name`; positional ``sN`` tokens
+    never cross this boundary.  ``values`` are the scan points in the axis's own unit: a time
+    (``duration``) slot is set with ``pulse.set_slot`` and takes NANOSECONDS at
     the wire, but ``values``/``unit`` are kept in the user-facing unit (seconds by
     default, like ``detection_time``) and converted by ``scale_to_ns``.  A
     ``dac`` slot is set with ``pulse.set_slot`` and takes the SIGNED user value
@@ -368,7 +444,7 @@ class ScanAxis:
         """Push one scan value into the bound pulse (contract-only)."""
 
         if self.is_time:
-            pulse.set_time(float(value) * float(self.scale_to_ns))
+            pulse.set_slot(self.slot, float(value) * float(self.scale_to_ns))
         else:
             pulse.set_slot(self.slot, float(value))
 
@@ -444,20 +520,55 @@ class NFramePlan:
 
     def sequence_for(self, pulse, axis: "ScanAxis", value: float):
         if axis.is_time:
-            return pulse.frame_sequence(self.n_frames, time_ns=float(value) * float(axis.scale_to_ns))
-        # A DAC-axis scan still needs N triggers; the slot was already set via axis.apply.
-        return pulse.frame_sequence(self.n_frames, slots={axis.slot: float(value)})
+            resolved = float(value) * float(axis.scale_to_ns)
+        else:
+            resolved = float(value)
+        return pulse.frame_sequence(self.n_frames, slots={axis.slot: resolved})
 
 
 @runtime_checkable
 class PointReducer(Protocol):
-    """Reduce one point's frames (+ calibration) to its y value(s)."""
+    """Reduce one point's frames to exactly one declared data tensor.
+
+    ``data_shape`` is the complete, non-empty shape returned by :meth:`reduce`.
+    A scalar quantity therefore declares and returns ``(1,)``; a per-site
+    quantity declares ``(n_sites,)``; higher-rank data retains every axis.
+    """
 
     labels: tuple[str, str, str]
-    n_series: int
+    data_shape: tuple[int, ...]
 
-    def reduce(self, frames, calibration: TrapCalibration):
+    def reduce(self, frames, calibration: TrapCalibration) -> np.ndarray:
         ...
+
+
+def reducer_data_shape(reducer: PointReducer) -> tuple[int, ...]:
+    """Return the reducer's complete positive ``data_shape`` or fail loudly.
+
+    This is the single validation seam shared by the acquisition engine and
+    its hub adapter.  There is deliberately no scalar-width fallback: every
+    reducer must declare the actual tensor shape it produces.
+    """
+
+    try:
+        raw_shape = reducer.data_shape
+    except AttributeError as exc:
+        raise TypeError(
+            f"{type(reducer).__name__} must declare a non-empty data_shape tuple.") from exc
+    try:
+        shape = tuple(
+            positive_int(size, f"{type(reducer).__name__}.data_shape[{axis}]")
+            for axis, size in enumerate(raw_shape)
+        )
+    except TypeError as exc:
+        raise TypeError(
+            f"{type(reducer).__name__}.data_shape must be a non-empty iterable of "
+            f"positive integers, got {raw_shape!r}.") from exc
+    if not shape:
+        raise ValueError(
+            f"{type(reducer).__name__}.data_shape must be non-empty; "
+            "a scalar reducer declares (1,).")
+    return shape
 
 
 def otsu_fidelity_from_frames(frames, calibration: TrapCalibration, site: int | None):
@@ -505,18 +616,18 @@ class OtsuFidelityReducer:
 
     site: int | None = None
     labels: tuple[str, str, str] = ("Detection time (s)", "Fidelity", "Fidelity")
-    n_series: int = 1
+    data_shape: ClassVar[tuple[int, ...]] = (1,)
     thresholds: list[float] = field(default_factory=list)
     fidelities: list[float] = field(default_factory=list)
 
-    def reduce(self, frames, calibration: TrapCalibration) -> float:
+    def reduce(self, frames, calibration: TrapCalibration) -> np.ndarray:
         _counts, threshold, model = otsu_fidelity_from_frames(frames, calibration, self.site)
         fidelity = float(model.fidelity)
         if not np.isfinite(fidelity):
             fidelity = 0.5
         self.thresholds.append(float(threshold))
         self.fidelities.append(fidelity)
-        return fidelity
+        return np.asarray([fidelity], dtype=float)
 
 
 @dataclass
@@ -525,8 +636,8 @@ class ScanResult(MeasurementTaskResult):
 
     Inherits ``stop()``/``points_done``/``running``/``measurement_done`` from
     :class:`MeasurementTaskResult` (so the GUI gets the same cooperative stop the
-    detection-time scan has).  ``data_y`` is ``(n_points, n_series)``; a scalar
-    reducer fills column 0, a per-site reducer fills one column per site.
+    detection-time scan has).  ``data_y`` is ``(P,*data_shape)`` and retains
+    every axis declared by the reducer.
     """
 
     x: np.ndarray
@@ -538,20 +649,44 @@ class ScanResult(MeasurementTaskResult):
 
     @property
     def y(self) -> np.ndarray:
-        """First series (the scalar curve, or site 0 of a per-site scan)."""
+        """First value of a one-axis data shape (the scalar/site-0 curve).
 
+        Higher-rank data has no unambiguous implicit selection; callers use
+        :attr:`data_y` and explicitly select or reduce the desired axes.
+        """
+
+        if self.data_y.ndim != 2:
+            raise ValueError(
+                f"ScanResult.y is only defined for a one-axis data_shape; got "
+                f"data_shape={self.data_y.shape[1:]}. Use data_y and explicitly "
+                "select or reduce its data axes.")
         return self.data_y[:, 0]
 
     @property
+    def points_done(self) -> int:
+        """Count completed P rows without treating any data axis as points."""
+
+        if self.measurement is not None and hasattr(self.measurement, "points_done"):
+            return int(self.measurement.points_done)
+        if not self.data_y.size:
+            return 0
+        finite = np.isfinite(self.data_y)
+        if finite.ndim == 1:
+            has_data = finite
+        else:
+            has_data = np.any(finite, axis=tuple(range(1, finite.ndim)))
+        return int(np.count_nonzero(has_data))
+
+    @property
     def finished(self) -> bool:
-        return bool(self.data_y.size and np.all(np.isfinite(self.data_y[:, 0])))
+        return bool(len(self.x) and self.points_done == len(self.x))
 
     def summary(self) -> dict[str, Any]:
         return {
             "label": self.labels[0],
             "points": int(len(self.x)),
             "points_done": self.points_done,
-            "series": int(self.data_y.shape[1]),
+            "data_shape": tuple(int(n) for n in self.data_y.shape[1:]),
             "running": self.running,
             "finished": self.finished,
         }
@@ -593,23 +728,30 @@ class ScannedMeasurement:
     plan: ShotPlan
     reducer: PointReducer
     shots_per_point: int = 1
+    data_shape: tuple[int, ...] = field(init=False)
 
     def __post_init__(self) -> None:
-        self.shots_per_point = positive_int(self.shots_per_point, "shots_per_point")
+        # The fireable pulse handle is the outer orchestration boundary.  Reject it
+        # before inspecting collaborators so every entry point reports the one shared
+        # controller error instead of whichever invalid helper happens to be visited first.
         require_pulse_controller(self.pulse)
-        # Fail early on a DAC axis whose slot the bound pulse doesn't have: a bad
-        # slot key is otherwise silently stored by set_slot and never applied, so
-        # the scan runs but moves nothing -- a wrong experiment with no error.
-        # (e.g. slot=0 stringifies to "0", not "s0"; a typo "s5" on a 3-slot pulse.)
-        if self.axis.kind == "dac":
-            underlying = getattr(self.pulse, "pulse", None)
-            # PulseTableState exposes its scan-slot keys as the `scan_var_names`
-            # property ("s0".."sN"); validate against it when present.
-            known = getattr(underlying, "scan_var_names", None)
-            if known and self.axis.slot not in known:
+        self.shots_per_point = positive_int(self.shots_per_point, "shots_per_point")
+        self.data_shape = reducer_data_shape(self.reducer)
+        # Validate the exact semantic field for BOTH duration and DAC axes.  A
+        # duration axis must not silently mutate the first duration slot when it
+        # declared another one, and an sN token is never a public identity.
+        underlying = getattr(self.pulse, "pulse", None)
+        if underlying is not None and hasattr(underlying, "scan_names"):
+            known = list(underlying.scan_names)
+            if self.axis.slot not in known:
                 raise ValueError(
-                    f"ScanAxis.slot {self.axis.slot!r} is not a scan slot of the bound pulse "
-                    f"(known slots: {list(known)}); a DAC scan must target one of them.")
+                    f"ScanAxis.slot {self.axis.slot!r} is not a semantic scan slot of the "
+                    f"bound pulse (known slots: {known}).")
+            actual_kind = underlying.scan_slots[known.index(self.axis.slot)].kind
+            if actual_kind != self.axis.kind:
+                raise ValueError(
+                    f"ScanAxis {self.axis.slot!r} declares kind={self.axis.kind!r}, but the "
+                    f"bound ScanSlot kind is {actual_kind!r}.")
         # Snap a DURATION axis to the sequencer clock grid: the hardware only lands on
         # whole ticks, so a continuous / linspace sweep (readout-duration -> fidelity,
         # release-recapture hold, ...) is quantized HERE, at the one place every duration
@@ -640,27 +782,36 @@ class ScannedMeasurement:
         self.axis.apply(self.pulse, float(value))
         sequence = self.plan.sequence_for(self.pulse, self.axis, float(value))
         sequencer = self._sequencer()
-        rows = []
-        for _ in range(self.shots_per_point):
+        rows: list[np.ndarray] = []
+        for shot in range(self.shots_per_point):
             frames = triggered_frames(
                 self.camera, sequencer, sequence, self.plan.n_frames, stop=self.stop_event)
-            rows.append(np.atleast_1d(np.asarray(self.reducer.reduce(frames, self.calibration), dtype=float)))
+            row = np.asarray(self.reducer.reduce(frames, self.calibration), dtype=float)
+            if row.shape != self.data_shape:
+                raise ValueError(
+                    f"{type(self.reducer).__name__}.reduce returned shape {row.shape} "
+                    f"for shot {shot}; declared data_shape is {self.data_shape}.")
+            rows.append(row)
         # Average over the shots where each site HAD an atom: a per-site reducer returns NaN for a
         # site that was empty on a given shot (no atom -> survival undefined), and a plain mean would
         # let one NaN shot poison that site's whole scan point.  ``finite_mean`` (the ONE gap-safe
         # average, shared with the live plots) averages the occupied shots; a site empty across ALL
         # shots stays NaN (correctly: no data) -- computed directly as sum/count, so it neither warns
         # nor needs a catch_warnings that would blanket-ignore every other RuntimeWarning here.
-        return finite_mean(np.vstack(rows), axis=0)
+        return finite_mean(np.stack(rows, axis=0), axis=0)
 
     def run(self, *, live: bool = True, update_time: float = 0.05, display: bool = True,
             stop_hint: str | bool = True) -> ScanResult:
         values = self.axis.values
-        n_series = int(self.reducer.n_series)
-        data_y = np.full((len(values), n_series), np.nan, dtype=float)
+        data_y = np.full((len(values), *self.data_shape), np.nan, dtype=float)
         result = ScanResult(x=values, data_y=data_y, labels=tuple(self.reducer.labels))
 
         plotter = active_plotter()
+        if live and plotter is not None and len(self.data_shape) > 1:
+            raise ValueError(
+                f"live curve rendering needs an explicit selection or reduction for "
+                f"data_shape={self.data_shape}; use ScannedMeasurementNode with a facet, "
+                "or run with live=False and inspect ScanResult.data_y.")
         if live and plotter is not None:
             result.measurement = plotter.run(
                 values.reshape(-1, 1),
@@ -676,8 +827,10 @@ class ScannedMeasurement:
             # No viewer registered (headless / frontend not imported): run the scan
             # synchronously and still return a complete result.
             for index, value in enumerate(values):
-                data_y[index, :] = self.measure(float(value), index)
-            result.plot = plot_detection_scan(values, data_y[:, 0], labels=tuple(self.reducer.labels), display=display)
+                data_y[index, ...] = self.measure(float(value), index)
+            if len(self.data_shape) == 1:
+                result.plot = plot_detection_scan(
+                    values, data_y[:, 0], labels=tuple(self.reducer.labels), display=display)
         return result
 
 
@@ -688,10 +841,13 @@ __all__ = [
     "OtsuFidelityReducer",
     "ParamDecl",
     "PointReducer",
+    "program_completion_timeout",
+    "reducer_data_shape",
     "ScanAxis",
     "ScanResult",
     "ScannedMeasurement",
     "ShotPlan",
+    "prepare_hardware_scan",
     "require_pulse_controller",
     "triggered_frames",
 ]
