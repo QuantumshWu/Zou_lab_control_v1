@@ -35,6 +35,25 @@ def test_nan_payloads_have_one_canonical_spelling():
     assert encode(ordinary) == encode(alternate)
 
 
+def test_ndarray_nan_payloads_have_one_canonical_spelling():
+    ordinary = np.array([float("nan"), 2.0], dtype=np.float64)
+    alternate = np.array([0x7FF8000000000001, 0x4000000000000000], dtype=np.uint64).view(np.float64)
+    assert encode(ordinary) == encode(alternate)
+
+    complex_ordinary = np.array([complex(float("nan"), float("nan"))], dtype=np.complex128)
+    complex_alternate = np.array(
+        [0x7FF8000000000001, 0x7FF8000000000002], dtype=np.uint64
+    ).view(np.complex128)
+    assert encode(complex_ordinary) == encode(complex_alternate)
+
+
+def test_floating_scalar_wider_than_float64_is_not_silently_narrowed():
+    if np.dtype(np.longdouble).itemsize <= 8:
+        pytest.skip("this platform's longdouble is float64")
+    with pytest.raises(CanonicalEncodingError, match="wider than float64"):
+        encode(np.longdouble("1.0000000000000000001"))
+
+
 def test_ndarray_normalizes_byte_order_and_memory_order():
     native_c = np.arange(12, dtype=np.int16).reshape(3, 4)
     big_endian_f = np.asfortranarray(native_c.astype(">i2"))

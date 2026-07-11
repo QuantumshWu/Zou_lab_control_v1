@@ -81,6 +81,8 @@ def _encode_value(value: Any, *, path: str) -> list[Any]:
         return ["bool", bool(value)]
     if isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)):
         return ["int", str(int(value))]
+    if isinstance(value, np.floating) and value.dtype.itemsize > 8:
+        raise CanonicalEncodingError(f"{path}: floating scalars wider than float64 are forbidden")
     if isinstance(value, (float, np.floating)):
         number = float(value)
         if math.isnan(number):
@@ -119,7 +121,15 @@ def _encode_array(value: np.ndarray, *, path: str) -> list[Any]:
     if array.dtype.hasobject or array.dtype.fields is not None:
         raise CanonicalEncodingError(f"{path}: object and structured ndarrays are forbidden")
     dtype = array.dtype.newbyteorder("<")
-    normalized = np.ascontiguousarray(array.astype(dtype, copy=False)).reshape(array.shape)
+    normalized = np.array(array, dtype=dtype, order="C", copy=True).reshape(array.shape)
+    if dtype.kind == "f":
+        canonical_nan = np.array(float("nan"), dtype=dtype)
+        np.copyto(normalized, canonical_nan, where=np.isnan(normalized))
+    elif dtype.kind == "c":
+        component_dtype = np.dtype("<f4" if dtype.itemsize == 8 else "<f8")
+        components = normalized.view(component_dtype)
+        canonical_nan = np.array(float("nan"), dtype=component_dtype)
+        np.copyto(components, canonical_nan, where=np.isnan(components))
     payload = base64.b64encode(normalized.tobytes(order="C")).decode("ascii")
     return [
         "ndarray",
