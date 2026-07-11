@@ -15,6 +15,7 @@ Two mechanically-enforced rules:
   ``bins`` ParamDecl cap declared ONCE in ``PANEL_PARAMS`` -- an O(bins) micro-solve any thread may run.
 """
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -179,6 +180,78 @@ def test_monitor_side_gaussian_stays_in_plot_and_off_the_guard(fit_thread_guard)
             cam.step()
             tick(con)                             # side-gaussian fit runs in-plot -> must not raise
         assert card.plotter is not None
+    finally:
+        con.shutdown()
+        exp.close()
+
+
+# --------------------------------------------------------------------------- (#6b) grid: fit off the GUI thread
+def _facet_grid_console(exp):
+    """A console with a REAL camera producer (repeat=4 -> frame_0 is 4 stacked frames) and a facet grid
+    panel bound to it (facet=repeat, sub_plot_kind=2d -> 4 image cells).  A real producer so the frame
+    signal survives the console's orphan GC and carries a real schema/structure."""
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
+    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
+    from conftest import fire_live_imaging
+    con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
+                      measurements=exp.readout.measurement_specs(),
+                      processors=exp.readout.processor_specs(),
+                      tasks=exp.readout.task_specs(), window_px=(1000, 700))
+    con._timer.stop()
+    cam = CameraMeasurement(con.hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+                            frames_per_cycle=1, repeat=4)
+    con.running_nodes = [cam]
+    fire_live_imaging(exp)
+    cam.step()
+    kc = con.kind_combo
+    kc.setCurrentIndex(next(i for i in range(kc.count()) if kc.itemData(i) == "grid"))
+    con._add_panel()
+    card = con.cards[-1]
+    card.config.inputs = ["frame_0"]
+    card.config.params["facet"] = "repeat"
+    card.config.params["sub_plot_kind"] = "2d"
+    card.source_edit.setText("value = signal")
+    card._apply_source()
+    con.refresh_once()
+    return con, cam, card
+
+
+def test_facet_grid_fit_solves_on_the_worker_never_the_gui_thread(fit_thread_guard):
+    """#6b: a facet grid fit is the SAME per-panel FitProcessor, made facet-aware -- it solves EVERY cell
+    on its worker and publishes per-cell params ``(1,1,N)``; the grid only DISPLAYS them (reconstruct via
+    solve=False).  With the guard armed, NONE of the three formerly-red grid paths -- arming the fit
+    (_set_param('fit_request')), refresh_once, and a double-click focus -- may solve on the Qt thread."""
+    from Zou_lab_control.neutral_atom.core.fitting import FitRequest
+    from Zou_lab_control.neutral_atom.core.selection import Selection
+    exp = na.connect("virtual", sitemap={"grid_shape": (2, 2), "image_shape": (24, 30)})
+    con, cam, card = _facet_grid_console(exp)
+    try:
+        assert card.plotter.n_cells == 4
+        # RED PATH 1: arming the grid fit must NOT solve in place on the Qt thread (guard would raise).
+        card.set_fit_request(FitRequest("center", selection=Selection()))
+        assert card.plotter._published_cell_popt is not None          # grid is now display-only
+        node = con._logic_nodes.get(id(con._panel_analysis_row(card)))
+        assert node is not None and getattr(node, "_facet", None) == "repeat"
+
+        # the node solves per-cell on its worker and publishes (1,1,N)
+        key = node.prefix + "fit_valid"
+        deadline = time.time() + 10.0
+        while time.time() < deadline and key not in con.hub.names():
+            cam.step(); tick(con); time.sleep(0.02)
+        assert key in con.hub.names(), "the facet fit node never published"
+        assert _no_guard_violation(node)
+        assert con.hub.latest(node.prefix + "fit_x0").shape == (1, 1, 4)   # one param per cell
+
+        # RED PATH 2: refresh_once reconstructs from published params (solve=False) -- must not raise.
+        con._update_fit_overlays()
+        con.refresh_once()
+
+        # RED PATH 3: a double-click focus builds the enlarged cell + reconstructs its fit -- not a solve.
+        ev = type("Ev", (), {"dblclick": True, "button": 1,
+                             "inaxes": card.plotter.site_axes[0]})()
+        card._on_grid_canvas_click(ev)
+        con.refresh_once()
     finally:
         con.shutdown()
         exp.close()

@@ -88,6 +88,29 @@ class FitProcessor(RegionProcessor):
         self._request_lock = Lock()
         self._fit_request = _request(fit_request)
         self.last_results: tuple[FitResult, ...] = ()
+        # FACET-AWARE state (a grid panel fits per-cell -- the SAME facet slice GridPlot displays, so the
+        # node solves every cell on its worker and the panel only draws the published params, #6b).  A
+        # non-grid panel leaves these unset (``_facet is None``) and fits once as before.  Set by the
+        # console via acquisition params (facet / sub_plot_kind / repeat_mode / points_shape).
+        self._facet: str | None = None
+        self._facet_sub_plot_kind: str = "1d"
+        self._facet_repeat_mode: str = "average"
+        self._facet_points_shape: tuple[int, ...] = ()
+        self._facet_n_cells: int = 1               # the last-fit cell count -> the published (1,1,N) width
+
+    def set_facet(self, *, facet=None, sub_plot_kind=None, repeat_mode=None, points_shape=None) -> None:
+        """Configure the per-cell facet fit between shots (a grid panel's Analysis node).  ``facet=None``
+        (or ``''``) restores the single whole-region fit.  The slice rule is the ONE shared
+        ``core.facet.facet_cells`` GridPlot uses, so the fit cells match the displayed cells exactly."""
+        with self._request_lock:
+            if facet is not None:
+                self._facet = str(facet) or None
+            if sub_plot_kind is not None:
+                self._facet_sub_plot_kind = str(sub_plot_kind or "1d")
+            if repeat_mode is not None:
+                self._facet_repeat_mode = str(repeat_mode or "average")
+            if points_shape is not None:
+                self._facet_points_shape = tuple(int(n) for n in points_shape)
 
     @property
     def fit_request(self) -> FitRequest:
@@ -107,6 +130,9 @@ class FitProcessor(RegionProcessor):
     def set_acquisition_parameters(self, **values) -> None:
         if "fit_request" in values:
             self.set_fit_request(values["fit_request"])
+        if any(k in values for k in ("facet", "sub_plot_kind", "repeat_mode", "points_shape")):
+            self.set_facet(facet=values.get("facet"), sub_plot_kind=values.get("sub_plot_kind"),
+                           repeat_mode=values.get("repeat_mode"), points_shape=values.get("points_shape"))
 
     def output_keys(self) -> tuple[str, ...]:
         """The bare published names derive from THIS node's model (the single source), so a gaussian
@@ -124,15 +150,19 @@ class FitProcessor(RegionProcessor):
             coordinate_frame=(selection.frame or base.coordinate_frame))
         return request, fit_model(request.model)
 
-    def _result_shape(self) -> tuple[tuple[int, ...], int | None]:
-        """The output (point_shape, repeat_capacity): a 2-D image fit is PER-CELL (the source's
-        geometry); a 1-D / hist fit is ONE result for the whole curve/distribution."""
+    def _result_shape(self) -> tuple[tuple[int, ...], tuple[int, ...], int | None]:
+        """The output (point_shape, data_shape, repeat_capacity).  A FACET fit publishes one param value
+        PER CELL as ``(1, 1, N)`` (N==1 degenerates to today's scalar shape, so existing fit_x0 consumers
+        are unaffected -- they read cell 0).  A 2-D image fit is PER-(R,P) cell (the source's geometry);
+        a 1-D / hist fit is ONE result for the whole curve/distribution."""
+        if self._facet:
+            return (1,), (max(1, int(self._facet_n_cells)),), 1
         if fit_model(self.fit_request.model).family != "2d":
-            return (1,), 1
+            return (1,), (1,), 1
         if not self._input_tensors:
-            return (1,), 1
+            return (1,), (1,), 1
         tensor = next(iter(self._input_tensors.values()))
-        return tuple(tensor.schema.point_shape), tensor.schema.repeat_capacity
+        return tuple(tensor.schema.point_shape), (1,), tensor.schema.repeat_capacity
 
     # ------------------------------------------------------------------ transform
     def transform(self, inputs: dict[str, object]) -> dict[str, object]:
@@ -141,9 +171,50 @@ class FitProcessor(RegionProcessor):
         value = self.source_expr.evaluate(hub_namespace(self.hub, inputs))
         block = np.asarray(value)
         request, model = self._request_with_region()
+        if self._facet:
+            return self._fit_facets(block, request, model)
         if model.family == "2d":
             return self._fit_2d(block, request, model)
         return self._fit_1d(block, request, model)
+
+    def _fit_facets(self, block, request, model) -> dict[str, object]:
+        """Fit EACH facet cell of the block on the worker and publish per-cell parameter vectors
+        ``(1, 1, N)`` -- the grid counterpart of the single fit, using the ONE shared slice rule
+        (``core.facet.facet_cells``) GridPlot displays, so the fit cells match the drawn cells."""
+        from ...core.facet import facet_cells
+        with self._request_lock:
+            facet = self._facet
+            sub = self._facet_sub_plot_kind
+            repeat_mode = self._facet_repeat_mode
+            points_shape = self._facet_points_shape
+        cells = facet_cells(block, facet, sub_plot_kind=str(sub),
+                            points_shape=points_shape, repeat_mode=str(repeat_mode))
+        n = max(1, len(cells))
+        self._facet_n_cells = n                                # drives the (1,1,N) publish schema this shot
+        outputs = self._empty_outputs((1, 1, n), request)
+        results: list[FitResult] = []
+        for k, cell in enumerate(cells):
+            result = self._fit_one_cell(np.asarray(cell), request, model, str(sub))
+            results.append(result)
+            self._store(outputs, (0, 0, k), model, result)
+        self.last_results = tuple(results)
+        return outputs
+
+    def _fit_one_cell(self, cell, request, model, sub_plot_kind: str) -> FitResult:
+        """Fit ONE facet cell by its kind, over the SAME domain the cell's display uses (a 1-D cell over
+        the point index -- ``LineCell`` draws over ``arange`` too, so the published centre lands right)."""
+        if sub_plot_kind == "2d" or model.family == "2d":
+            arr = np.asarray(cell, dtype=float)
+            if arr.ndim != 2:
+                return FitResult.invalid(
+                    request.model, f"a 2-D facet cell needs a 2-D frame; got shape {arr.shape}",
+                    coordinate_frame=request.coordinate_frame)
+            return fit_image(arr, request)
+        if sub_plot_kind == "hist":
+            return self._fit_histogram(np.asarray(cell), request)
+        y = np.asarray(cell, dtype=np.float64).reshape(-1)
+        x = np.arange(y.size, dtype=np.float64)
+        return fit_data({"x": x}, y, request)
 
     def _empty_outputs(self, shape, request) -> dict[str, object]:
         outputs = {
@@ -249,8 +320,8 @@ class FitProcessor(RegionProcessor):
         return x, np.asarray(y, dtype=np.float64).reshape(-1)
 
     def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
-        points, repeat_capacity = self._result_shape()
-        common = {"points_shape": points, "data_shape": (1,),
+        points, data_shape, repeat_capacity = self._result_shape()
+        common = {"points_shape": points, "data_shape": data_shape,
                   "repeat_capacity": repeat_capacity}
         model = fit_model(self.fit_request.model)
         # One SignalSpec per fitted parameter -- name + description derive from the model (single

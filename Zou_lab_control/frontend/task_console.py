@@ -2863,6 +2863,12 @@ class PanelCard(FluentGroupBox):
         # the draw-per-mutation anti-pattern, byte-identical to the loop in ``build_grid_figure`` above
         # (which already suspends).  The ONE first render happens via the caller's ``canvas.draw`` (the
         # plotter is built ``display=False``), exactly as the non-facet grid path.
+        # A console-driven grid with an active fit is DISPLAY-ONLY: mark it before replaying fit_request
+        # so the build's apply_param never solves in place on the build thread (#6b -- the worker node
+        # fits per-cell; the next _update_fit_overlays pushes the params and this reconstructs them).
+        if callable(self.fit_node_sink) and self.config.params.get("fit_request") \
+                and getattr(plotter, "_published_cell_popt", None) is None:
+            plotter._published_cell_popt = {}
         with plotter.suspend_draws():
             for key in ([d.key for d in _panel_display_decls("grid", sub)]
                         + ["relim", "fixed_lo", "fixed_hi", "view_xlim", "view_ylim", "fit_request"]):
@@ -3270,6 +3276,15 @@ class PanelCard(FluentGroupBox):
         fit path (the Analysis combo, an Edit Fit action, a drag retarget) funnels through here, so the
         overlay, the two surfaces, and the hub node can never hold divergent fit state (#8)."""
         payload = request.to_dict() if request is not None else None
+        # A console-attached facet grid fits per-cell on its worker node (below) and only DISPLAYS the
+        # published params: put it in display-only mode BEFORE apply_param, so the arming _set_param never
+        # solves in place on the Qt thread (#6b).  ``fit_node_sink`` set == a console (a notebook grid has
+        # none and keeps its in-place solve).
+        plotter = self.plotter
+        if request is not None and callable(self.fit_node_sink) \
+                and hasattr(plotter, "apply_published_cell_fits") \
+                and getattr(plotter, "_published_cell_popt", None) is None:
+            plotter._published_cell_popt = {}
         self._set_param("fit_request", payload)          # store + apply overlay in place (apply_param)
         self._refresh_analysis_controls()
         if request is None:
@@ -8116,9 +8131,11 @@ class TaskConsole(QtWidgets.QWidget):
         on the node's published version so an unchanged fit costs nothing (and the result labels are
         change-gated on top, so no per-tick setText thrash)."""
         from ..neutral_atom.operations.processors.fit import FitProcessor
+        from .live import GridPlot
         for card in self.cards:
             plotter = card.plotter
-            if plotter is None or not hasattr(plotter, "apply_published_fit"):
+            is_grid = isinstance(plotter, GridPlot)
+            if plotter is None or not (is_grid or hasattr(plotter, "apply_published_fit")):
                 continue
             row = self._panel_analysis_row(card)
             node = self._logic_nodes.get(id(row)) if row is not None else None
@@ -8127,6 +8144,19 @@ class TaskConsole(QtWidgets.QWidget):
             if not isinstance(node, FitProcessor) or getattr(node, "action", "fit") != "fit":
                 continue
             version = self.hub.signal_versions().get(node.prefix + "fit_valid", -1)
+            if is_grid:
+                # #6b: a facet grid fit is the SAME worker node, publishing per-cell params.  Push them
+                # to the grid, which reconstructs each cell's curve (solve=False) -- so a grid fit NEVER
+                # solves on the Qt thread either.  Gate on the version, but ALSO push once when the grid
+                # is not yet in console (display-only) mode, so it stops solving in place from the start.
+                if self._fit_overlay_pushed.get(id(card)) == version \
+                        and getattr(plotter, "_published_cell_popt", None) is not None:
+                    continue
+                self._fit_overlay_pushed[id(card)] = version
+                model, cell_popts = self._published_cell_fits(node)
+                plotter.apply_published_cell_fits(cell_popts, model=model)
+                card._set_fit_result_text(self._published_fit_result(node))
+                continue
             # Skip only when the version is unchanged AND this very plotter already carries the pushed
             # overlay: a legitimate structural rebuild swaps in a FRESH plotter (which never had
             # apply_published_fit called -- no _fit_overlay_result attribute), and without this second
@@ -8146,6 +8176,29 @@ class TaskConsole(QtWidgets.QWidget):
             edit_controls = getattr(editor, "_analysis_controls", None) if editor is not None else None
             if edit_controls is not None:
                 edit_controls.set_result(card._fit_result_text(result))
+
+    def _published_cell_fits(self, node) -> tuple[str, dict]:
+        """Read a facet FitProcessor node's PUBLISHED per-cell params off the hub as ``(model_key,
+        {cell_index: (p0, p1, ...)})`` in the model's parameter order -- the per-cell counterpart of
+        :meth:`_published_fit_result`, so a grid draws every cell from solved params with no Qt solve
+        (#6b).  A cell whose fit is invalid (NaN / not converged) is omitted (that cell draws nothing)."""
+        from ..neutral_atom.core.fitting import fit_model
+        model = fit_model(node.fit_request.model)
+        prefix = node.prefix
+        try:
+            valid = np.asarray(self.hub.latest(prefix + "fit_valid")).reshape(-1)
+            params = [np.asarray(self.hub.latest(prefix + f"fit_{name}")).reshape(-1)
+                      for name in model.names]
+        except Exception:
+            return model.key, {}
+        cell_popts: dict[int, tuple] = {}
+        for k in range(int(valid.size)):
+            if not bool(valid[k]):
+                continue
+            vec = tuple(float(p[k]) for p in params)
+            if all(np.isfinite(v) for v in vec):
+                cell_popts[k] = vec
+        return model.key, cell_popts
 
     def _apply_panel_analysis(self, card: "PanelCard", *, action: str, selection, extra_values=None,
                               node_params=None) -> None:
@@ -8209,21 +8262,24 @@ class TaskConsole(QtWidgets.QWidget):
         on its per-panel Analysis node, which solves on its WORKER and publishes the model's parameters
         as signals (``fit_x0``/``fit_sigma``/... -- consumable by a Monitor or a scan loss, and read
         back by the panel's DISPLAY-only overlay).  EVERY fit family is a node -- 2-D image centre,
-        1-D peak, hist gaussian -- so no fit ever solves on the Qt thread (#6).  The drawn selection
-        travels on the panel's region signal; the config request carries only model + fixed/initial.
-        A facet grid fits per-cell in place (no hub node)."""
+        1-D peak, hist gaussian, AND a facet grid (which the node fits PER CELL and publishes as
+        ``(1,1,N)`` param vectors) -- so no fit ever solves on the Qt thread (#6b).  The drawn selection
+        travels on the panel's region signal; the config request carries only model + fixed/initial."""
         from ..neutral_atom.core.fitting import FitRequest
         from dataclasses import replace as _dc_replace
         from ..neutral_atom.core.selection import Selection
         req = FitRequest.from_dict(request) if isinstance(request, Mapping) else request
-        if card.config.kind == "grid":
-            card._set_fit_result_text()      # a facet grid fits per-cell in place, not as a hub node
-            self._remove_panel_analysis(card)
-            return
         payload = _dc_replace(req, selection=Selection()).to_dict()
+        # A facet grid fit is the SAME per-panel node, made facet-aware: the node slices with the ONE
+        # shared rule (core.facet.facet_cells) GridPlot displays and fits every cell on its worker, and
+        # the panel reconstructs the published per-cell params for DISPLAY (no in-place solve, #6b).
+        extra = {"fit_request": payload}
+        if card.config.kind == "grid" and card._facet() is not None:
+            points_shape, _ = card._facet_value_shapes()
+            extra.update(facet=card._facet(), sub_plot_kind=card._resolved_sub_kind(),
+                         repeat_mode=card._repeat_mode_value(), points_shape=list(points_shape))
         self._apply_panel_analysis(card, action="fit", selection=req.selection,
-                                   extra_values={"fit_request": payload},
-                                   node_params={"fit_request": payload})
+                                   extra_values=extra, node_params=extra)
 
     def _on_panel_selection_clear(self, card: "PanelCard", action: str) -> None:
         """The ONE selection-teardown seam, symmetric for BOTH analyses AND the region itself: an

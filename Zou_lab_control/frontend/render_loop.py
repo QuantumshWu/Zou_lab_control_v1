@@ -37,7 +37,31 @@ from __future__ import annotations
 import threading
 import time
 
-from PyQt5 import QtCore
+from PyQt5 import QtCore, QtWidgets
+
+
+def _fit_solve_on_gui_thread_guard() -> None:
+    """The Qt-thread check the headless ``core.fitting`` calls when its guard is armed (#6): raise if a
+    REAL curve-fit solve is about to run ON the Qt application thread.  Lives HERE (the frontend already
+    owns Qt) and is registered into ``core.fitting`` at import, so the core stays Qt-free (the sealed
+    neutral_atom<->frontend seam).  Scoped: fires only when a QApplication exists (a GUI session) AND the
+    current thread IS the app thread -- a worker-node solve and a headless notebook solve both pass."""
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return
+    if QtCore.QThread.currentThread() is app.thread():
+        raise RuntimeError(
+            "curve-fit solve on the Qt application thread is forbidden (ZLC_FIT_THREAD_GUARD): a console "
+            "fit must run on its worker node, not the GUI event loop (#6).")
+
+
+# Register the Qt guard the moment the frontend is imported: from then on the env-var / fixture arms it.
+try:  # pragma: no branch
+    from ..neutral_atom.core.fitting import register_solve_thread_guard as _register_guard
+    _register_guard(_fit_solve_on_gui_thread_guard)
+except Exception:  # pragma: no cover - core import guard (never expected)
+    pass
+
 
 #: The render worker thread's name -- ONE source, shared with the canvas barrier so a
 #: compose-phase re-entry (a stock ``canvas.draw()`` that fires mid-compose) can recognise

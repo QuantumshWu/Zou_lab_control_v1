@@ -20,28 +20,30 @@ import numpy as np
 #: to mechanically prove a console fit NEVER solves on the Qt event loop (#6).
 _FIT_THREAD_GUARD_ENV = "ZLC_FIT_THREAD_GUARD"
 
+#: The Qt-thread check, REGISTERED by the frontend at import (:func:`register_solve_thread_guard`).  The
+#: headless core keeps ZERO Qt dependency (devices/base contract, sealed seam) -- the frontend, which
+#: already owns Qt, supplies the "am I on the app thread?" test; a pure-headless/notebook session never
+#: registers one, so the guard is inert there (a hub-less solve is legal).
+_solve_thread_guard = None
+
+
+def register_solve_thread_guard(guard) -> None:
+    """Install (or clear with ``None``) the Qt-thread check the frontend supplies -- see
+    :func:`_assert_off_gui_thread`.  Kept here so ``core.fitting`` never imports Qt itself."""
+    global _solve_thread_guard
+    _solve_thread_guard = guard
+
 
 def _assert_off_gui_thread() -> None:
-    """When armed (``ZLC_FIT_THREAD_GUARD``), raise if an unbounded curve-fit solve is about to run ON
-    the Qt application thread -- the mechanical enforcement of 'no fit ever solves on the Qt event loop'.
-
-    Scoped so notebook use stays legal: it fires ONLY when a ``QApplication`` exists (a GUI session) AND
-    the current thread IS that app's thread.  A worker-node solve (``zlc-node-*`` / ``zlc-render``) and a
-    hub-less notebook solve (no QApplication) both pass.  PyQt is imported lazily so the headless core
-    keeps zero Qt dependency."""
+    """When armed (``ZLC_FIT_THREAD_GUARD``) AND a Qt-thread check is registered, raise if an unbounded
+    curve-fit solve is about to run ON the Qt application thread -- the mechanical enforcement of 'no fit
+    ever solves on the Qt event loop' (#6).  A worker-node solve, and a headless/notebook solve (no guard
+    registered), both pass."""
     if not os.environ.get(_FIT_THREAD_GUARD_ENV):
         return
-    try:
-        from PyQt5 import QtCore, QtWidgets
-    except Exception:  # pragma: no cover - no Qt installed -> nothing to guard against
-        return
-    app = QtWidgets.QApplication.instance()
-    if app is None:
-        return                                   # no GUI session -> a notebook/headless solve is legal
-    if QtCore.QThread.currentThread() is app.thread():
-        raise RuntimeError(
-            "curve-fit solve on the Qt application thread is forbidden (ZLC_FIT_THREAD_GUARD): a console "
-            "fit must run on its worker node, not the GUI event loop (#6).")
+    guard = _solve_thread_guard
+    if guard is not None:
+        guard()
 
 from Zou_lab_control._readout_math import (
     bimodal_jacobian,

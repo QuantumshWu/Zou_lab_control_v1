@@ -52,7 +52,8 @@ class AnalysisProcessor(FitProcessor, RoiProcessor):
     provides = ()                                  # dynamic -- see output_keys()
 
     def __init__(self, hub, *, action: str = "roi", source_expr=None, region=None, selection=None,
-                 reduce: str = "mean", fit_request=None, prefix: str = ""):
+                 reduce: str = "mean", fit_request=None, prefix: str = "",
+                 facet=None, sub_plot_kind=None, repeat_mode=None, points_shape=None):
         if str(action) not in ANALYSIS_ACTIONS:
             raise ValueError(f"analysis action must be one of {ANALYSIS_ACTIONS}; got {action!r}.")
         self.action = str(action)
@@ -60,6 +61,9 @@ class AnalysisProcessor(FitProcessor, RoiProcessor):
             raise ValueError(f"ROI reduce must be one of {tuple(ROI_REDUCERS)}; got {reduce!r}.")
         self.reduce = str(reduce)
         self._init_fit_state(fit_request)          # before the base chain: the self-loop guard reads
+        # A facet grid panel fits per-cell (the fit half slices with the SAME rule GridPlot displays).
+        self.set_facet(facet=facet, sub_plot_kind=sub_plot_kind,
+                       repeat_mode=repeat_mode, points_shape=points_shape)
         RegionProcessor.__init__(                  # output_keys() -> action/fit_request
             self, hub, source_expr=source_expr, region=region, selection=selection, prefix=prefix)
         self._init_roi_state(hub)
@@ -92,7 +96,9 @@ class AnalysisProcessor(FitProcessor, RoiProcessor):
                 raise ValueError(f"analysis action must be one of {ANALYSIS_ACTIONS}; got {action!r}.")
             self.action = action
         RoiProcessor.set_acquisition_parameters(self, **{k: v for k, v in values.items() if k == "reduce"})
-        FitProcessor.set_acquisition_parameters(self, **{k: v for k, v in values.items() if k == "fit_request"})
+        FitProcessor.set_acquisition_parameters(self, **{
+            k: v for k, v in values.items()
+            if k in ("fit_request", "facet", "sub_plot_kind", "repeat_mode", "points_shape")})
 
 
 def _declared_keys(values) -> tuple[str, ...]:
@@ -197,7 +203,9 @@ def analysis(readout) -> ProcessorSpec:
             region=region_name or None,
             selection=None if region_name else _inline_selection(values),
             reduce=str(values.get("reduce") or "mean"),
-            fit_request=fit_request, prefix=prefix)
+            fit_request=fit_request, prefix=prefix,
+            facet=values.get("facet"), sub_plot_kind=values.get("sub_plot_kind"),
+            repeat_mode=values.get("repeat_mode"), points_shape=values.get("points_shape"))
 
     return ProcessorSpec(
         name=ANALYSIS_SPEC_NAME,
