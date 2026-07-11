@@ -831,7 +831,7 @@ class CameraDevice(BaseDevice):
         while len(out) < n:
             with state["cond"]:
                 while state["pending"] and len(out) < n:
-                    out.append(state["pending"].pop(0))
+                    out.append(state["pending"].popleft())
             if len(out) >= n:
                 break
             if not self._grab(n - len(out), timeout=timeout, stop=stop, **kwargs):
@@ -912,7 +912,7 @@ class CameraDevice(BaseDevice):
             "cond": threading.Condition(lock),
             "seq": 0,        # total frames ever retained
             "cursor": 0,     # drain watermark
-            "pending": [],   # LOSSLESS armed-session queue read_frames consumes
+            "pending": deque(),  # LOSSLESS armed-session queue read_frames consumes
             "armed": False,
             "armed_frames": None,
         }
