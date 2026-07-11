@@ -1596,6 +1596,10 @@ class LiveLiveDis(LiveLive):
         if key == getattr(self, "_gauss_fit_key", None):
             return
         self._gauss_fit_key = key
+        # BOUNDED MICRO-SOLVE EXEMPTION (#6c): a domain hist fit stays IN-PLOT (never a worker node).  It is
+        # principled because ``counts.size`` (``self.n``) is bounded by the ``bins`` ParamDecl cap
+        # (PANEL_PARAMS["hist"] bins.hi) -- an O(bins) micro-solve (~1 ms), so any thread may run it.  It
+        # does NOT route through ``fit_selected`` (the unbounded-fit guard), so it is exempt by construction.
         result = fit_histogram(self.bins, self.n, "single")
         self._histogram_fit_result = result
         if not result.valid:
@@ -3647,6 +3651,10 @@ class HistogramFigure(BaseLivePlot):
         self._has_threshold = self._explicit_thr        # no fit yet -> only an explicit cut shows
         for ln in (self.fit_line_left, self.fit_line_right, self.fit_line_total):
             ln.set_data([], [])
+        # BOUNDED MICRO-SOLVE EXEMPTION (#6c): the bimodal fit stays IN-PLOT.  ``self.n`` (counts) is
+        # bounded by the ``bins`` ParamDecl cap (PANEL_PARAMS["hist"] bins.hi) -> an O(bins) micro-solve;
+        # ``fit_histogram`` does NOT route through the unbounded-fit guard (``fit_selected``), so no worker
+        # node is warranted for this domain fit.
         result = fit_histogram(self.bins, self.n, self._fit)
         self._histogram_fit_result = result
         if not result.valid:
@@ -4652,6 +4660,9 @@ class HistogramCell(GridCell):
             self._fit_lines[k] = lines
         for ln in lines:
             ln.set_data([], [])
+        # BOUNDED MICRO-SOLVE EXEMPTION (#6c): a hist grid cell's bimodal fit stays IN-PLOT.  ``counts`` is
+        # bounded by the ``bins`` ParamDecl cap (PANEL_PARAMS["hist"] bins.hi) -> O(bins) per cell;
+        # ``fit_histogram`` does not route through the unbounded-fit guard, so it is exempt by construction.
         result = fit_histogram(self.edges, counts, self.fit)
         if not result.valid:
             self._cell_popt_store.pop(int(k), None)         # no fit on this cell -> drop stale popt

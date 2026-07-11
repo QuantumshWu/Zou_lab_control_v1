@@ -8,10 +8,40 @@ and publish the same result.  There is no Qt/Matplotlib dependency here.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Sequence
 
 import numpy as np
+
+
+#: Opt-in env var (or the conftest fixture) that arms :func:`_assert_off_gui_thread`.  Off by default so
+#: a legitimate notebook main-thread solve (no console) stays legal; the per-kind fit-thread tests set it
+#: to mechanically prove a console fit NEVER solves on the Qt event loop (#6).
+_FIT_THREAD_GUARD_ENV = "ZLC_FIT_THREAD_GUARD"
+
+
+def _assert_off_gui_thread() -> None:
+    """When armed (``ZLC_FIT_THREAD_GUARD``), raise if an unbounded curve-fit solve is about to run ON
+    the Qt application thread -- the mechanical enforcement of 'no fit ever solves on the Qt event loop'.
+
+    Scoped so notebook use stays legal: it fires ONLY when a ``QApplication`` exists (a GUI session) AND
+    the current thread IS that app's thread.  A worker-node solve (``zlc-node-*`` / ``zlc-render``) and a
+    hub-less notebook solve (no QApplication) both pass.  PyQt is imported lazily so the headless core
+    keeps zero Qt dependency."""
+    if not os.environ.get(_FIT_THREAD_GUARD_ENV):
+        return
+    try:
+        from PyQt5 import QtCore, QtWidgets
+    except Exception:  # pragma: no cover - no Qt installed -> nothing to guard against
+        return
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return                                   # no GUI session -> a notebook/headless solve is legal
+    if QtCore.QThread.currentThread() is app.thread():
+        raise RuntimeError(
+            "curve-fit solve on the Qt application thread is forbidden (ZLC_FIT_THREAD_GUARD): a console "
+            "fit must run on its worker node, not the GUI event loop (#6).")
 
 from Zou_lab_control._readout_math import (
     bimodal_jacobian,
@@ -546,6 +576,11 @@ def fit_selected(selected: SelectedData, request: FitRequest) -> FitResult:
             model.key, model.names, popt, None, True, "initial values",
             {"rmse": rmse, "r2": r2}, sampled.count, request.coordinate_frame)
 
+    # Only a REAL solve is gated: the ``solve=False`` reconstruction above (draw a curve from
+    # already-known params, e.g. a grid cell redrawing published node params) never runs curve_fit,
+    # so it is legal on any thread.  ``fit_histogram`` (the bounded bimodal micro-solve) does not route
+    # through here and is exempt by construction (#6c).
+    _assert_off_gui_thread()
     best, best_loss, failures = _solve_candidates(
         model.function,
         xdata,

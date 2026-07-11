@@ -45,6 +45,18 @@ def close_matplotlib_figures():
     plt.close("all")
 
 
+@pytest.fixture
+def fit_thread_guard(monkeypatch):
+    """Arm the opt-in fit-thread guard for a test: while active, a REAL unbounded curve-fit solve
+    (``core.fitting._solve_candidates`` via ``fit_selected``) that runs ON the Qt application thread
+    RAISES (#6).  Off by default so a notebook main-thread solve stays legal; a worker-node solve and a
+    ``solve=False`` reconstruction both pass.  A per-kind test uses this to mechanically prove a console
+    fit never solves on the GUI event loop."""
+    from Zou_lab_control.neutral_atom.core.fitting import _FIT_THREAD_GUARD_ENV
+    monkeypatch.setenv(_FIT_THREAD_GUARD_ENV, "1")
+    yield
+
+
 def fire_imaging_pulse(sequencer, *, exposure=20e-3, cooling=2e-3):
     """Fire a CONTINUOUS imaging pulse (``repeat_forever``) on a raw sequencer -- the
     software model of the pulse GUI's "On Pulse".  An externally-triggered camera produces
