@@ -3461,8 +3461,15 @@ class PanelCard(FluentGroupBox):
     def present(self) -> None:
         """Phase 2 of the board's two-phase render: flush this panel's composed buffer to the screen
         (schedule its Qt paint).  The board calls this for every panel it composed THIS tick, so they
-        all repaint in ONE frame -- the board never shows a torn mix of shots."""
+        all repaint in ONE frame -- the board never shows a torn mix of shots.
+
+        Always GUI-thread: this is where a hist that grew NEW threshold draggers during its
+        worker-thread compose gets those draggers PARKED to the panel's Selectors switch (an mpl
+        connect/disconnect the render worker must never do itself, #4-A)."""
         if self.plotter is not None and self.canvas is not None:
+            if getattr(self.plotter, "_zlc_draggers_grew", False):
+                self.plotter._zlc_draggers_grew = False
+                self._apply_selectors_state()
             self.plotter.present()
 
     def refresh(self, namespace: dict[str, object]) -> None:
@@ -3840,9 +3847,10 @@ class PanelCard(FluentGroupBox):
                 per_cell = self._facet_cells(self._coerce(value))
                 if len(per_cell) == parked.grid.n_cells:
                     parked.grid.update_cells(per_cell, focus=(self.plotter, parked.k))
-                    # a hist focus feed can grow NEW threshold draggers inside update_core --
-                    # re-park them to the switch (idempotent, cheap) so OFF stays display-only.
-                    self._apply_selectors_state()
+                    # a hist focus feed can grow NEW threshold draggers inside update_core; the
+                    # plotter flags that (``_zlc_draggers_grew``) and the GUI re-parks them to the
+                    # switch at present() -- never here (this runs on the render worker; a selector
+                    # connect/disconnect off the GUI thread is what drove the drag self-deadlock, #4-A).
                     if self.plotter is not None:
                         self.plotter.compose()
             return
@@ -3922,9 +3930,10 @@ class PanelCard(FluentGroupBox):
         else:  # hist / 1d-vector
             self.plotter.update(value, draw=False)
         # an in-place update can grow NEW selector handles (a hist whose threshold count changed
-        # rebuilds its draggers inside update_core) -- re-park them to the switch state.  Idempotent
-        # and cheap (a few attribute checks), so it never weighs on the live tick.
-        self._apply_selectors_state()
+        # rebuilds its draggers inside update_core).  This runs on the RENDER WORKER, so it must NOT
+        # re-park them here (an mpl connect/disconnect off the GUI thread + the canvas.draw() an mpl
+        # set_active triggers is the drag self-deadlock, #4-A): the plotter flags the growth
+        # (``_zlc_draggers_grew``) and the GUI re-parks at present().
         # COMPOSE this panel's buffer (blit: ~0.6 ms restore chrome bg + redraw data artists); nothing is
         # pushed to the screen here.  The board PRESENTS every composed buffer TOGETHER in phase 2 so the
         # whole board flips ONE coherent shot; a lone single-card refresh() presents right after.  A chrome
@@ -6275,7 +6284,15 @@ class LogicNodeRow(FluentFrame):
         outer.addWidget(self.publishes_label)
 
     def set_state(self, state: str, *, status: str = "") -> None:
-        """Reflect the node's run state on the dot + status text + Start/Stop enable."""
+        """Reflect the node's run state on the dot + status text + Start/Stop enable.
+
+        Change-gated (cache the last ``(state, status)``): a steady tick calls this on every
+        running row, so re-setText / re-setStyleSheet / re-setEnabled an UNCHANGED row every tick
+        is pure churn (#4-E) -- like the ``set_publishes`` text gate."""
+        key = (state, status)
+        if key == getattr(self, "_state_key", None):
+            return
+        self._state_key = key
         self.dot.set_color(self.STATE_COLORS.get(state, GREY))
         self.status_label.setText(status or state)
         colour = RED if state == "error" else GREY
@@ -7269,7 +7286,10 @@ class TaskConsole(QtWidgets.QWidget):
             try:
                 # SAME schema-driven formatter as the task branch (#12): a hub signal and a task
                 # output of the same logical shape render byte-identically -- no drift possible.
-                shape = self._describe_from_schema(self.hub.latest(full), self.hub.schema(full))
+                # ZERO-COPY: read the tensor's ``.data`` (a reference -- only ``.shape`` is used) rather
+                # than ``hub.latest`` (which .copy()s the whole 2.3 MB frame every tick just to format a
+                # shape string, #4-E).
+                shape = self._describe_from_schema(self.hub.latest_tensor(full).data, self.hub.schema(full))
             except Exception:
                 shape = "—"
             rows.append((short, shape, desc(full)))
@@ -8729,6 +8749,13 @@ class TaskConsole(QtWidgets.QWidget):
         from ..neutral_atom.core.signals import NO_LINEAGE     # single source of the sentinel (lazy: off na import graph)
         live: set[str] = set()
         for node in self.running_nodes:
+            # Exclude a FAULTED node's straggling signals from the min, the SAME principle as the
+            # STOPPED-node exclusion above: a running-but-erroring analysis node (its provenance frozen
+            # at its last good shot) would otherwise pin the whole board's clock and freeze every panel
+            # (#4-C).  A slow-but-HEALTHY node (consecutive_errors == 0) is kept, so coherence still
+            # holds it back -- only a dead one is dropped.
+            if int(getattr(node, "consecutive_errors", 0) or 0) > 0:
+                continue
             try:
                 live |= {str(s) for s in node.published_signals()}
             except Exception:

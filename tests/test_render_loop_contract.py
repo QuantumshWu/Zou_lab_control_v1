@@ -15,12 +15,37 @@
   onto busy ticks and starve behind a heavy fast-beat sibling.
 """
 import threading
+import time
 
 import Zou_lab_control.neutral_atom as na
 from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
 from Zou_lab_control.frontend.render_loop import RenderLoop
 
 from conftest import add_logic_row, make_console, tick
+
+
+def test_barrier_on_the_render_worker_short_circuits():
+    """A compose-phase re-entry into ``barrier()`` (a stock ``canvas.draw()`` fired mid-compose --
+    e.g. an mpl selector ``set_active`` doing an ``update_background`` draw) must NOT wait on its own
+    in-flight job: it already OWNS the figure it is composing.  Before the fix this self-deadlocked
+    for the full 5 s timeout -- the drag freeze (#4-A: worker compose -> canvas.draw() -> barrier)."""
+    ensure_qt_app()
+    loop = RenderLoop(lambda _r: None)
+    try:
+        seen = {}
+
+        def job():
+            t0 = time.monotonic()
+            seen["result"] = loop.barrier()          # re-enter the barrier from the worker thread
+            seen["elapsed"] = time.monotonic() - t0
+            return "batch"
+
+        assert loop.submit(job)
+        assert loop._published.wait(5.0)             # the job returned (did not self-deadlock)
+        assert seen["result"] is True                # short-circuited on the worker, not a timeout
+        assert seen["elapsed"] < 1.0                 # immediate -- never the 5 s self-wait
+    finally:
+        loop.stop()
 
 
 def test_busy_holds_until_the_gui_consumes_and_barrier_delivers():

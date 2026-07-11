@@ -359,3 +359,47 @@ def test_fit_center_spec_is_registered():
         assert "Frame fit" not in names and "ROI crop" not in names
     finally:
         exp.close()
+
+
+def test_set_selectors_active_only_forwards_on_a_real_state_flip():
+    """#4-A idempotence gate: an mpl selector's ``set_active`` does a full ``update_background``
+    canvas.draw() when the selection box is visible.  Forwarding it every tick (a no-op re-arm on the
+    render worker) is what drove the drag self-deadlock -- so a repeated SAME-state call must NOT reach
+    the mpl selector; only a real OFF<->ON flip forwards."""
+    import Zou_lab_control.neutral_atom as na
+    exp = na.connect("virtual")
+    con = make_console(exp)
+    try:
+        cam_row, frame_sig = _live_camera_signal(con)
+        card = _add_2d_panel(con, frame_sig, title="frame")
+        card.source_edit.setText("value = signal")           # bind the picked input (builds the plotter)
+        card._apply_source()
+        con.refresh_once()
+        card.set_selectors_enabled(True)                     # arm the layer so an mpl selector exists
+        plotter = card.plotter
+        assert plotter is not None
+        mpl_sels = [getattr(h, "selector", None) for h in plotter.interaction_handles()]
+        mpl_sels = [s for s in mpl_sels if s is not None and hasattr(s, "set_active")]
+        assert mpl_sels, "expected an mpl-backed AreaSelector on a live 2-D panel"
+
+        calls = []
+        for s in mpl_sels:
+            real = s.set_active
+            def spy(active, _real=real, _c=calls):
+                _c.append(bool(active))
+                _real(active)
+            s.set_active = spy
+
+        state = bool(mpl_sels[0].get_active())
+        plotter.set_selectors_active(state)                  # same state -> no forward
+        plotter.set_selectors_active(state)
+        assert calls == []
+        plotter.set_selectors_active(not state)              # real flip -> forwarded exactly once each
+        assert calls == [not state] * len(mpl_sels)
+        plotter.set_selectors_active(not state)              # already flipped -> no re-forward
+        assert calls == [not state] * len(mpl_sels)
+        plotter.set_selectors_active(state)                  # flip back
+        assert calls == [not state] * len(mpl_sels) + [state] * len(mpl_sels)
+    finally:
+        con.shutdown()
+        exp.close()

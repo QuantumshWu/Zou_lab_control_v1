@@ -829,7 +829,13 @@ class BaseLivePlot:
         for handle in handles:
             selector = getattr(handle, "selector", None)
             if selector is not None and hasattr(selector, "set_active"):
-                selector.set_active(active)
+                # Idempotence gate: only forward on a REAL active-state flip.  mpl's
+                # ``set_active`` does a full ``update_background`` canvas.draw() when the
+                # selection box is visible; forwarding it every tick (a no-op re-arm) is what
+                # drove the drag self-deadlock (worker compose -> draw() -> barrier).  Aligns
+                # with the ``_zlc_selectors_off`` gate the self-managed tools already use.
+                if bool(selector.get_active()) != active:
+                    selector.set_active(active)
                 continue
             if bool(getattr(handle, "_zlc_selectors_off", False)) == (not active):
                 continue                     # already in the requested state (idempotent)
@@ -1258,6 +1264,8 @@ class BaseLivePlot:
             except Exception:
                 pass
         self._fit_overlay_artists = []
+        self._fit_overlay_dot = None
+        self._fit_overlay_ring = None
         self._restore_overlay_lines()
 
     def _dim_overlay_lines(self) -> None:
@@ -1283,36 +1291,62 @@ class BaseLivePlot:
     def _draw_fit_overlay(self, result) -> None:
         """Reconstruct the fit overlay from PUBLISHED parameters (no solve): a centre dot + radius ring
         for a 2-D image (view-preserving), or the model curve for a 1-D / distribution (with the data
-        line dimmed).  Removes any prior overlay first, so a re-push replaces exactly one overlay."""
+        line dimmed).  For the 2-D dot/ring the artists are UPDATED IN PLACE (set_offsets/set_center/
+        set_radius); they are created/deleted only on a valid<->invalid flip.  Removes any prior overlay
+        first (1-D curve, or a family switch), so a re-push replaces exactly one overlay."""
         from .data_figure import _CENTER_DOT_SIZE, _CENTER_RING_LW, _CENTER_RING_ALPHA
         from ..neutral_atom.core.fitting import fit_model
         ax = getattr(self, "ax", None)
-        self._clear_fit_overlay()
         if ax is None or result is None or not result.valid:
+            self._clear_fit_overlay()
             return
         spec = fit_model(result.model)
         if spec.family == "2d":
             # #11: the centre dot + radius ring are a READOUT overlay on the image, NOT new data -- snapshot
-            # the view (xlim/ylim, both autoscale flags, image clim) and restore it, so the scatter/patch's
-            # dataLim can never expand the image's displayed range or drop its colour limit.
+            # the view (xlim/ylim, both autoscale flags, image clim) and restore it INSIDE a lim-batch so
+            # restoring the SAME limits never retriggers the 2.3 MP re-decimation (#4-D); the scatter/patch's
+            # dataLim then can never expand the image's displayed range or drop its colour limit.
             xlim, ylim = ax.get_xlim(), ax.get_ylim()
             auto_x, auto_y = ax.get_autoscalex_on(), ax.get_autoscaley_on()
             clims = [(im, im.get_clim()) for im in ax.get_images()]
             params = result.parameter_map()
             x0, y0, radius = params["x0"], params["y0"], abs(params["radius"])
-            dot = ax.scatter(x0, y0, color=PALETTE["fit_right"], s=_CENTER_DOT_SIZE, clip_on=True)
-            circle = matplotlib.patches.Circle(
-                (x0, y0), radius=radius, edgecolor=PALETTE["fit_right"], facecolor="none",
-                linewidth=_CENTER_RING_LW, alpha=_CENTER_RING_ALPHA, clip_on=True)
-            ax.add_patch(circle)
-            self._fit_overlay_artists = [dot, circle]
-            ax.set_xlim(*xlim)
-            ax.set_ylim(*ylim)
-            ax.set_autoscalex_on(auto_x)
-            ax.set_autoscaley_on(auto_y)
-            for image, clim in clims:
-                image.set_clim(*clim)
+            dot = getattr(self, "_fit_overlay_dot", None)
+            circle = getattr(self, "_fit_overlay_ring", None)
+            reuse = (dot is not None and getattr(dot, "axes", None) is ax
+                     and circle is not None and getattr(circle, "axes", None) is ax)
+            if reuse:
+                # In place: never remove+rebuild the scatter/patch each push (~2 ms/tick saved on the
+                # worker's _reapply_view_knobs redraw too).
+                dot.set_offsets([[x0, y0]])
+                circle.set_center((x0, y0))
+                circle.set_radius(radius)
+            else:
+                self._clear_fit_overlay()
+                dot = ax.scatter(x0, y0, color=PALETTE["fit_right"], s=_CENTER_DOT_SIZE, clip_on=True)
+                circle = matplotlib.patches.Circle(
+                    (x0, y0), radius=radius, edgecolor=PALETTE["fit_right"], facecolor="none",
+                    linewidth=_CENTER_RING_LW, alpha=_CENTER_RING_ALPHA, clip_on=True)
+                ax.add_patch(circle)
+                self._fit_overlay_dot = dot
+                self._fit_overlay_ring = circle
+                self._fit_overlay_artists = [dot, circle]
+            fig = getattr(ax, "figure", None)
+            prev_batch = bool(getattr(fig, "_zlc_lim_batch", False)) if fig is not None else False
+            if fig is not None:
+                fig._zlc_lim_batch = True                # suppress the xlim/ylim decimation callbacks
+            try:
+                ax.set_xlim(*xlim)
+                ax.set_ylim(*ylim)
+                ax.set_autoscalex_on(auto_x)
+                ax.set_autoscaley_on(auto_y)
+                for image, clim in clims:
+                    image.set_clim(*clim)
+            finally:
+                if fig is not None:
+                    fig._zlc_lim_batch = prev_batch
         else:
+            self._clear_fit_overlay()
             x = np.asarray(self._overlay_x(), dtype=float)
             if x.size == 0:
                 return
@@ -3490,6 +3524,10 @@ class HistogramFigure(BaseLivePlot):
             self.threshold_lines.append(line)
             if self.interactions:                        # gate the grab, not the line (#dis-threshold-disable)
                 self.threshold_draggers.append(DragVLine(line, self._on_threshold_drag, self.ax))
+                # update_core runs on the RENDER WORKER; parking the new dragger to the panel's
+                # Selectors switch is a Qt-event op (mpl connect/disconnect) that must happen on the
+                # GUI thread.  Flag it here; the card re-parks at present() (#4-A).
+                self._zlc_draggers_grew = True
         for line, threshold in zip(self.threshold_lines, self.thresholds):
             line.set_xdata([threshold, threshold])
             line.set_visible(self._has_threshold)        # show/hide live as the data separates / merges

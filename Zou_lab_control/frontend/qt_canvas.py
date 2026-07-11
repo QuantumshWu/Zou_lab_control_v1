@@ -28,7 +28,11 @@ a surrounding QScrollArea, so in-plot zoom never scrolls the page.
 
 from __future__ import annotations
 
+import logging
+import threading
+
 from .style import DESIGN_DPI
+from .render_loop import RENDER_THREAD_NAME
 
 try:
     from PyQt5 import QtCore, QtGui, QtWidgets
@@ -283,14 +287,21 @@ else:
                 painter.drawImage(self.rect(), front)
                 painter.end()
                 return
-            # Fallback path (no front image): the Agg buffer is about to be read -- and possibly
-            # re-rendered -- on the GUI thread, so wait out any in-flight compose first (a repaint
-            # in the post-drag window otherwise reads the buffer the worker is writing).
-            self._zlc_wait_render()
+            # Fallback path (no front image -- a GUI-thread-only host, or before the first present):
+            # the Agg buffer is about to be read on the GUI thread, so wait out any in-flight compose
+            # first.  If the barrier TIMES OUT (a wedged render), a worker may STILL be composing into
+            # the buffer -- reading it now is exactly the torn colorbar (#9), so skip the blit and log
+            # (Qt keeps the previous pixels: a stale frame beats a torn one).
+            if not self._zlc_wait_render():
+                logging.getLogger(__name__).warning(
+                    "paintEvent: render barrier timed out; skipping Agg blit to avoid a torn buffer read")
+                return
             self._zlc_draw_if_needed()          # render the buffer only if it is out of date (else reuse)
             renderer = self.renderer
             w, h = int(renderer.width), int(renderer.height)
-            image = QtGui.QImage(self.buffer_rgba(), w, h, QtGui.QImage.Format_RGBA8888)
+            # ``.copy()`` so the QImage OWNS its pixels -- never a live view into the Agg buffer that a
+            # subsequent compose could overwrite mid-blit.
+            image = QtGui.QImage(self.buffer_rgba(), w, h, QtGui.QImage.Format_RGBA8888).copy()
             painter = QtGui.QPainter(self)
             painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
             painter.drawImage(self.rect(), image)
@@ -306,15 +317,23 @@ else:
             self.update()
 
         # ------------------------------------------------------------- behaviour
-        def _zlc_wait_render(self) -> None:
+        def _zlc_wait_render(self) -> bool:
             # The render-thread ownership barrier: a host that composes this canvas off the GUI
             # thread hangs its barrier here (``_zlc_render_barrier``); every mouse path into the
             # figure (press, double-click, wheel zoom) waits for the in-flight compose FIRST, so
             # a selector/zoom callback never mutates artists the worker is rasterising.  Free when
-            # idle; unset on GUI-thread-only hosts (pulse_gui, Edit snapshots).
+            # idle; unset on GUI-thread-only hosts (pulse_gui, Edit snapshots).  Returns True when
+            # the loop is settled (or there is no barrier), False ONLY on a pathological barrier
+            # timeout -- the paintEvent fallback then must NOT read the Agg buffer (a wedged worker
+            # may still be writing it).
+            # Short-circuit when this IS the render worker: a compose-phase stock ``draw()`` already
+            # OWNS the figure, so it must never wait on its own in-flight job (the drag self-deadlock).
+            if threading.current_thread().name == RENDER_THREAD_NAME:
+                return True
             barrier = getattr(self, "_zlc_render_barrier", None)
             if callable(barrier):
-                barrier()
+                return bool(barrier())
+            return True
 
         def mousePressEvent(self, event):  # noqa: N802 - Qt naming
             self._zlc_wait_render()

@@ -187,6 +187,45 @@ def test_console_display_shot_holds_camera_to_lagging_occupancy():
         exp.close()
 
 
+# --------------------------------------------------------------- (B') faulted node excluded from the clock
+def test_display_shot_excludes_a_faulted_nodes_frozen_signal():
+    """A running-but-FAULTED analysis node (``consecutive_errors > 0``) whose provenance froze at an
+    old shot must NOT pin the whole board's display shot -- otherwise ONE dead node freezes EVERY panel
+    (#4-C).  This is the SAME principle as the existing STOPPED-node exclusion, only for a node that is
+    still 'running' but erroring.  A slow-but-HEALTHY node stays in the min (coherence over freshness);
+    only a faulted one is dropped."""
+    exp = _calibrated()
+    console = _console(exp)
+    hub = console.hub
+    cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+                            frames_per_cycle=3, repeat=0)
+    det = OccupancyProcessor(hub, calibration=exp.readout.current,
+                             source_expr={"inputs": ["frame_1"], "source": "value = signal"},
+                             method="box", grid_shape=(3, 4))
+    try:
+        _add_2d(console, ["frame_0"])
+        _add_2d(console, ["occupied"])           # the faulted node's displayed signal
+        console.running_nodes = [cam, det]
+        fire_live_imaging(exp)
+
+        cam.step()
+        det.step()                               # occupancy @ S1
+        cam.step(); cam.step()                   # camera -> S3, occupancy frozen at S1
+
+        # HEALTHY lag: the board is held back to the occupancy's older shot (coherence).
+        assert console._display_shot() == hub.latest_provenance("occupied")
+
+        # The occupancy node now FAULTS (its provenance stays frozen at S1).  Its signals leave the
+        # min set, so the clock follows the healthy camera instead of freezing at the dead node's shot.
+        det.consecutive_errors = 4
+        det.last_error = "ValueError: boom"
+        assert console._display_shot() == hub.latest_provenance("frame_0")   # follows the live camera
+        assert console._display_shot() != hub.latest_provenance("occupied")  # not pinned to the dead node
+    finally:
+        console.shutdown()
+        exp.close()
+
+
 # ----------------------------------------------------------------------------- (C) anti-oscillation
 def test_lone_camera_panel_is_not_held_back():
     """A LONE camera panel (no slower co-displayed producer) is NOT held back: its display shot is the

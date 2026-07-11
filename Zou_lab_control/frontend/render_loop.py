@@ -39,6 +39,11 @@ import time
 
 from PyQt5 import QtCore
 
+#: The render worker thread's name -- ONE source, shared with the canvas barrier so a
+#: compose-phase re-entry (a stock ``canvas.draw()`` that fires mid-compose) can recognise
+#: it is already ON the worker and must never wait on its own in-flight job.
+RENDER_THREAD_NAME = "zlc-render"
+
 
 class RenderLoop(QtCore.QObject):
     """One daemon worker executing submitted render jobs strictly one at a time.
@@ -66,7 +71,7 @@ class RenderLoop(QtCore.QObject):
         self._published = threading.Event()   # worker finished computing; result awaits delivery
         self._stopping = False
         self.job_done.connect(self.deliver_pending)
-        self._thread = threading.Thread(target=self._loop, name="zlc-render", daemon=True)
+        self._thread = threading.Thread(target=self._loop, name=RENDER_THREAD_NAME, daemon=True)
         self._thread.start()
 
     # ------------------------------------------------------------------ GUI side
@@ -115,7 +120,16 @@ class RenderLoop(QtCore.QObject):
         in flight OR pending (a pending batch delivered later would stomp whatever the
         caller is about to do to those figures).  Idempotent and free when idle.
         Returns False only on a pathological timeout (a wedged render), in which case
-        the caller proceeds -- a rare visual glitch beats a frozen UI."""
+        the caller proceeds -- a rare visual glitch beats a frozen UI.
+
+        Short-circuit when called ON the render worker itself: a compose path that
+        re-enters here (a stock ``canvas.draw()`` triggered mid-compose -- e.g. an mpl
+        selector ``set_active`` doing an ``update_background`` draw) already OWNS the
+        figure it is composing, so it must never wait on its own in-flight job (the 5 s
+        drag self-deadlock: worker compose -> canvas.draw() -> barrier waits on its own
+        job).  It has the figure; proceed immediately."""
+        if threading.current_thread() is self._thread:
+            return True
         deadline = time.monotonic() + timeout
         while True:
             self.deliver_pending()
