@@ -16,7 +16,7 @@ from Zou_lab_control.neutral_atom.operations.processors.fit import (
     FIT_SPEC_NAME, FitProcessor)
 from Zou_lab_control.neutral_atom.operations.processors.roi import ROI_SPEC_NAME
 
-from conftest import add_logic_row, make_console
+from conftest import add_logic_row, make_console, tick
 
 
 def _gaussian_frame(h=240, w=320, x0=200.0, y0=90.0, amp=150.0, size=18.0, offset=12.0):
@@ -178,6 +178,52 @@ def _add_2d_panel(con, signal, *, title=None):
     card._apply_source()
     con.refresh_once()
     return card
+
+
+def test_stop_start_same_signal_keeps_plotter_view_and_selector():
+    """#3 root fix: STOP then START of a producing node whose signal name + shape are unchanged must
+    NOT rebuild the bound 2-D panel.  The coordinate frame reads _provider_nodes (running first, each
+    row's last build kept past Stop), so _needs_structural_build sees a CONSTANT region across the
+    stop/start window and the plotter object, zoom lims, and drawn selector geometry all survive.
+    (A genuinely CHANGED region still rebuilds -- test_2d_panel_rebuilds_when_roi_shifts_same_shape.)"""
+    import Zou_lab_control.neutral_atom as na
+    exp = na.connect("virtual")
+    con = make_console(exp)
+    try:
+        cam_row, frame_sig = _live_camera_signal(con)
+        cam = con._logic_nodes[id(cam_row)]
+        card = _add_2d_panel(con, frame_sig, title="frame")
+        card.source_edit.setText("value = signal")     # bind the picked input (builds the plotter)
+        card._apply_source()
+        con.refresh_once()
+        card.set_selectors_enabled(True)
+        card.config.params["selection_action"] = "roi"
+        area = card.plotter.fig._zlc_tools.area
+        area.range = [400.0, 900.0, 200.0, 700.0]
+        area._call()                                   # real release dispatch -> per-panel ROI node
+        roi = con._logic_nodes[id(con._panel_analysis[id(card)])]
+        cam.step(); roi.step()
+        tick(con)
+        plotter = card.plotter
+        plotter.ax.set_xlim(500.0, 800.0)              # user zoom
+        plotter.ax.set_ylim(700.0, 350.0)
+
+        con._stop_logic_node(cam_row)                  # STOP the producing camera
+        tick(con)
+        assert card.plotter is plotter                 # NOT rebuilt on stop
+        assert card.plotter.ax.get_xlim() == (500.0, 800.0)
+        assert card.plotter.ax.get_ylim() == (700.0, 350.0)
+        assert card.plotter.fig._zlc_tools.area.range == [400.0, 900.0, 200.0, 700.0]
+
+        con._start_logic_node(cam_row)                 # RESTART: same signal name + shape
+        con._logic_nodes[id(cam_row)].step()
+        tick(con)
+        assert card.plotter is plotter                 # NOT rebuilt on restart either
+        assert card.plotter.ax.get_xlim() == (500.0, 800.0)
+        assert card.plotter.fig._zlc_tools.area.range == [400.0, 900.0, 200.0, 700.0]
+    finally:
+        con.shutdown()
+        exp.close()
 
 
 def test_two_panels_on_one_source_get_distinct_per_panel_analysis_nodes():

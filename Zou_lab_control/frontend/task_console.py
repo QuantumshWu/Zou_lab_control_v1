@@ -8015,7 +8015,13 @@ class TaskConsole(QtWidgets.QWidget):
             if not isinstance(node, FitProcessor):
                 continue
             version = self.hub.signal_versions().get(node.prefix + "fit_valid", -1)
-            if self._fit_overlay_pushed.get(id(card)) == version:
+            # Skip only when the version is unchanged AND this very plotter already carries the pushed
+            # overlay: a legitimate structural rebuild swaps in a FRESH plotter (which never had
+            # apply_published_fit called -- no _fit_overlay_result attribute), and without this second
+            # gate an unchanged fit version would leave the new plotter overlay-less until the next fit
+            # publish (the #3 risks' one-line hygiene fix, keyed on the plotter instead of a card hook).
+            if self._fit_overlay_pushed.get(id(card)) == version \
+                    and hasattr(plotter, "_fit_overlay_result"):
                 continue
             self._fit_overlay_pushed[id(card)] = version
             plotter.apply_published_fit(self._published_fit_result(node))
@@ -8747,9 +8753,22 @@ class TaskConsole(QtWidgets.QWidget):
         endpoints ``[x_min, x_max, y_min, y_max]`` (the acquisition-layer format)
         when the node declares one (a camera frame), so a panel can put its axes in
         real source pixels.  A panel reads index 0 (x_min) and index 2 (y_min) as
-        the axis origin, so this is robust to endpoints vs any position+size form."""
+        the axis origin, so this is robust to endpoints vs any position+size form.
+
+        Reads :meth:`_provider_nodes` -- the ONE source of "which nodes count" (running nodes first,
+        then each Logic row's last build kept past Stop) -- with ``setdefault`` so a RUNNING provider
+        wins, exactly the first-match semantics :meth:`_node_for_signal` uses.  The coordinate frame is
+        a property of the signal's producing node, NOT of its run state: a STOPPED camera's lingering
+        ``frame_0`` keeps its real pixel frame, so a bound 2-D panel's ``_needs_structural_build``
+        region comparison stays constant across stop/start and the panel is NEVER rebuilt (zoom /
+        selector geometry / clim all survive).  The old running-only scan flipped the frame to None on
+        Stop and back on Start -- two spurious full rebuilds that wiped the view (#3)."""
         frames: dict[str, list] = {}
-        for node in self.running_nodes:
+        seen: set[int] = set()
+        for node in self._provider_nodes():
+            if node is None or id(node) in seen:
+                continue
+            seen.add(id(node))
             try:
                 region = node.acquisition_parameters().get("region")
             except Exception:
@@ -8761,7 +8780,7 @@ class TaskConsole(QtWidgets.QWidget):
             except Exception:
                 sigs = ()
             for s in sigs:
-                frames[str(s)] = list(region)
+                frames.setdefault(str(s), list(region))
         return frames
 
     def _recompute_tick_interval(self) -> None:
