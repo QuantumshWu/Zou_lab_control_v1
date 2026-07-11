@@ -403,3 +403,43 @@ def test_set_selectors_active_only_forwards_on_a_real_state_flip():
     finally:
         con.shutdown()
         exp.close()
+
+
+def test_setting_and_edit_result_rows_reflect_the_published_node_fit():
+    """#6 stale-result-row fix: once the per-panel FitProcessor node publishes, the fit RESULT line
+    updates on BOTH surfaces (the Setting popup AND the open Edit tab) -- previously the overlay updated
+    but the result row said 'not fitted' forever (it was only written on build/set_fit_request)."""
+    import time
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.core.fitting import FitRequest
+    from Zou_lab_control.neutral_atom.core.selection import Selection
+    exp = na.connect("virtual")
+    con = make_console(exp)
+    try:
+        cam_row, frame_sig = _live_camera_signal(con)
+        cam = con._logic_nodes[id(cam_row)]
+        card = _add_2d_panel(con, frame_sig, title="frame")
+        card.source_edit.setText("value = signal")
+        card._apply_source()
+        con.refresh_once()
+        card._open_settings(); card.settings_popup.hide()     # build the Setting Analysis controls
+        from Zou_lab_control.frontend.task_console import PanelEditor
+        editor = PanelEditor(card, con)
+        con._panel_editors[id(card)] = editor                 # register the Edit surface
+        assert card.fit_result_label.text() == "not fitted"
+
+        card.set_fit_request(FitRequest("center",
+                                        selection=Selection.rectangle(400.0, 900.0, 200.0, 700.0)))
+        node = con._logic_nodes.get(id(con._panel_analysis_row(card)))
+        assert node is not None
+        key = node.prefix + "fit_valid"
+        cam.step(); tick(con)
+        deadline = time.time() + 8.0
+        while time.time() < deadline and key not in con.hub.names():
+            tick(con); time.sleep(0.02)
+        con._update_fit_overlays()
+        assert card.fit_result_label.text().startswith("ok ·")        # Setting surface updated
+        assert editor._analysis_controls.result_label.text().startswith("ok ·")   # Edit surface updated too
+    finally:
+        con.shutdown()
+        exp.close()

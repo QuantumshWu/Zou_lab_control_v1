@@ -1091,18 +1091,148 @@ def _apply_analysis_state_to_widgets(card, *, action_combo=None, model_combo=Non
             if model_index >= 0:
                 with _signals_blocked(model_combo):
                     model_combo.setCurrentIndex(model_index)
-        # Only GATE the model picker on the action when there IS an action combo driving on/off (the
-        # Setting popup); on the Edit tab the picker + Fit button IS the entry, so it stays enabled.
-        if action_combo is not None:
-            model_combo.setEnabled(active == "fit")
+        # ONE rule for BOTH surfaces: the model picker + fix/seed stay ENABLED regardless of the action, so
+        # a seed can be pre-entered BEFORE turning the fit on (the #6 pre-seed workflow -- previously the
+        # Setting popup gated them on ``active=='fit'`` and opened the fit with an empty seed).
+        model_combo.setEnabled(True)
     if fix_seed is not None:
         current_model = model_combo.currentData() if model_combo is not None else model
         fix_seed.set_model(str(current_model or ""))
         fix_seed.seed_from_request(request)
-        if action_combo is not None:
-            fix_seed.setEnabled(active == "fit")
+        fix_seed.setEnabled(True)
     if result_label is not None:
-        result_label.setText(card._fit_result_text())
+        text = card._fit_result_text()
+        if result_label.text() != text:                # only setText on a real change (no per-tick thrash)
+            result_label.setText(text)
+
+
+class AnalysisControls(QtWidgets.QWidget):
+    """The ONE fit + ROI 'Analysis' control set -- built ONCE here and embedded by BOTH the Setting popup
+    and the Edit tab.  ``surface='setting'|'edit'`` only tweaks layout (whether the explicit Fit/Clear
+    buttons show); every control DERIVES from the card's ``config.params['fit_request']`` (the fit) plus
+    ``['selection_action']`` (the ROI) through :func:`_apply_analysis_state_to_widgets`, so no widget owns
+    a private 'is fitting' and the two surfaces can never disagree (#8).
+
+    Exposes ``action_combo`` / ``model_combo`` / ``fix_seed`` / ``result_label`` (each ``None`` when the
+    panel family offers no fit / ROI); the host aliases the test-keyed attribute names onto these
+    (``analysis_combo`` / ``fit_model_combo`` / ``fit_fix_seed`` / ``fit_result_label`` on the card,
+    ``fit_combo`` / ``ed_fix_seed`` on the editor)."""
+
+    def __init__(self, card, *, surface: str, label_w: int, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background: transparent;")
+        self.card = card
+        self.surface = str(surface)
+        self.action_combo = self.model_combo = self.fix_seed = None
+        self.result_label = self.fit_button = self.clear_button = None
+        models = _general_fit_models_for_kind(card._param_kind())
+        offers_roi = kind_supports_roi(card._param_kind())
+        col = QtWidgets.QVBoxLayout(self)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(scaled_px(6, minimum=4))
+        self.empty = not (models or offers_roi)
+        if self.empty:
+            return
+        # action combo (both surfaces) -- the action VOCABULARY is the AnalysisProcessor's own
+        # ANALYSIS_ACTIONS (single source), each entry gated by this panel kind's capability.
+        from ..neutral_atom.operations.processors.analysis import ANALYSIS_ACTIONS
+        self.action_combo = FluentComboBox()
+        self.action_combo.addItem("none", "none")
+        labels = {"fit": "curve fit", "roi": "ROI"}
+        offered = {"fit": bool(models), "roi": offers_roi}
+        for action in ANALYSIS_ACTIONS:
+            if offered.get(action):
+                self.action_combo.addItem(labels.get(action, action), action)
+        self.action_combo.setToolTip(
+            "What a drag-selection on this panel does:\n"
+            "  none      = just report the selected points"
+            + ("\n  curve fit = fit the chosen model to the selection (the result overlays the plot;\n"
+               "              a 2-D image centre fit ALSO publishes fit_x0/fit_y0/... as hub signals)"
+               if models else "")
+            + ("\n  ROI       = reduce the selected region to one scalar (publishes roi_value; also\n"
+               "              roi_frame -- an image crop, or a 1-D / distribution / site sub-view)"
+               if offers_roi else ""))
+        self.action_combo.currentIndexChanged.connect(self._on_action)
+        col.addWidget(FluentSettingRow("action", self.action_combo, label_width=label_w))
+        if models:
+            self.model_combo = FluentComboBox()
+            for model in models:
+                self.model_combo.addItem(model.formula, model.key)
+            self.model_combo.setToolTip(
+                "Curve-fit model for this panel's plot family (a 2d image offers the 2D-Gaussian\n"
+                "'2D center'; a 1d / monitor / distribution offers the peak/decay models).")
+            self.model_combo.currentIndexChanged.connect(self._on_model)
+            if self.surface == "edit":
+                # Edit adds explicit Fit / Clear buttons beside the picker (its historical entry); the
+                # action combo above is the SAME entry the Setting popup uses.
+                self.fit_button = FluentButton("Fit", color=ACCENT)
+                self.fit_button.clicked.connect(self.do_fit)
+                self.clear_button = FluentButton("Clear", color=GREY)
+                self.clear_button.clicked.connect(self.clear_fit)
+                host = QtWidgets.QWidget()
+                hl = QtWidgets.QHBoxLayout(host)
+                hl.setContentsMargins(0, 0, 0, 0)
+                hl.setSpacing(scaled_px(6, minimum=4))
+                hl.addWidget(self.model_combo, 0)
+                hl.addStretch(1)
+                hl.addWidget(self.fit_button, 0)
+                hl.addWidget(self.clear_button, 0)
+                col.addWidget(FluentSettingRow("model", host, label_width=label_w))
+            else:
+                col.addWidget(FluentSettingRow("model", self.model_combo, label_width=label_w))
+            self.fix_seed = _FitFixSeedEditor()
+            self.fix_seed.changed.connect(self._on_fix_seed)
+            col.addWidget(FluentSettingRow("fix / seed", self.fix_seed, label_width=label_w))
+            self.result_label = FluentLabel("not fitted")
+            self.result_label.setWordWrap(True)
+            self.result_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            col.addWidget(FluentSettingRow("result", self.result_label, label_width=label_w))
+        self.derive()
+
+    def derive(self) -> None:
+        """Re-seed every control from the card's state (fit_request presence + selection_action) -- the
+        ONE derive both surfaces share, so they stay pure views of the single source (#8)."""
+        _apply_analysis_state_to_widgets(
+            self.card, action_combo=self.action_combo, model_combo=self.model_combo,
+            fix_seed=self.fix_seed, result_label=self.result_label)
+
+    def set_result(self, text: str) -> None:
+        """Update the result line -- only on a real text change, so a per-tick push never thrashes the
+        label (and never re-lays-out an open Setting popup for an unchanged string)."""
+        if self.result_label is not None and self.result_label.text() != text:
+            self.result_label.setText(text)
+
+    # --------------------------------------------------------------- handlers (ONE copy, both surfaces)
+    def _on_action(self, _index: int) -> None:
+        if self.action_combo is not None:
+            self.card._select_analysis_action(
+                self.action_combo.currentData(), model_combo=self.model_combo, fix_seed=self.fix_seed)
+
+    def _on_model(self, _index: int) -> None:
+        if self.model_combo is None:
+            return
+        if self.fix_seed is not None:
+            self.fix_seed.set_model(str(self.model_combo.currentData() or ""))
+        if self.card.config.params.get("fit_request"):        # re-apply the active fit with the new model
+            self.card.set_fit_request(self.card._build_fit_request_from_widgets(
+                self.model_combo, self.fix_seed, self.card.current_selection()))
+
+    def _on_fix_seed(self) -> None:
+        if self.card.config.params.get("fit_request"):        # re-apply the active fit with the new fix/seed
+            self.card.set_fit_request(self.card._build_fit_request_from_widgets(
+                self.model_combo, self.fix_seed, self.card.current_selection()))
+
+    def do_fit(self) -> None:
+        """The Edit-tab explicit Fit action: build a request from THIS surface's model + fix/seed + the
+        current selection and land it through the ONE card mutator."""
+        if self.model_combo is None or not self.model_combo.currentData():
+            self.card.set_status("pick a fit model", error=True)
+            return
+        self.card.set_fit_request(self.card._build_fit_request_from_widgets(
+            self.model_combo, self.fix_seed, self.card.current_selection()))
+
+    def clear_fit(self) -> None:
+        self.card.set_fit_request(None)
 
 
 def _py_to_text(value) -> str:
@@ -2353,6 +2483,7 @@ class PanelCard(FluentGroupBox):
         self._sync_settings_param_rows()   # a grid's resolved kind may have changed since the last bake
         popup = self.settings_popup        # (the sync may have swapped in a fresh popup)
         self.refresh_on_show()          # Setting controls are a VIEW of config.params -- refresh on open (#6)
+        self._refresh_analysis_controls()   # the Analysis section derives on every open too (#6 result-row fix)
         self._refresh_signal_combo()
         self._refresh_facet_combo()     # facet choices re-derive from the CURRENT node structure
         self._refresh_sub_kind_combo()
@@ -3079,67 +3210,26 @@ class PanelCard(FluentGroupBox):
 
     # ---- Analysis (curve fit + ROI): ONE state, ONE mutator --------------------------------------
     def _build_analysis_section(self, section_box, label_w) -> None:
-        """Build the Setting popup's "Analysis" section (the fit + ROI umbrella).  A single ``action``
-        combo picks what a drag does -- ``none`` / ``curve fit`` / ``ROI`` (each gated by capability) --
-        followed, when a curve fit is offered, by the model chooser + the compact fix/seed editor + a
-        result line.  Every widget DERIVES its value from state (:meth:`_refresh_analysis_controls`); no
-        widget owns a private copy of "is fitting"."""
-        models = _general_fit_models_for_kind(self._param_kind())
-        # ROI is generic over EVERY plot kind whose value is a data array (kind_supports_roi -- the ONE
-        # source): an image rectangle, a 1-D x-range, a distribution count-range and a site-centre
-        # rectangle all reduce to roi_value + roi_frame.  (No longer gated on the y=view-axis image
-        # test, which wrongly restricted ROI to 2-D image panels.)
-        offers_roi = kind_supports_roi(self._param_kind())
-        self.analysis_combo = self.fit_model_combo = self.fit_fix_seed = self.fit_result_label = None
-        if not (models or offers_roi):
+        """Build the Setting popup's "Analysis" section through the ONE :class:`AnalysisControls` builder
+        (shared VERBATIM with the Edit tab, ``surface='setting'``).  The composite owns the action / model
+        / fix-seed / result widgets + their handlers; this only embeds it and aliases the test-keyed
+        attribute names so nothing that keys off ``analysis_combo`` / ``fit_model_combo`` / ``fit_fix_seed``
+        / ``fit_result_label`` has to change."""
+        controls = AnalysisControls(self, surface="setting", label_w=label_w)
+        # Kind offers neither a fit nor an ROI -> no Analysis section at all (empty controls discarded).
+        if controls.empty:
+            controls.deleteLater()
+            self._analysis_controls = None
+            self.analysis_combo = self.fit_model_combo = self.fit_fix_seed = self.fit_result_label = None
             return
-        ana = section_box("Analysis")
-        self.analysis_combo = FluentComboBox()
-        self.analysis_combo.addItem("none", "none")
-        # The action VOCABULARY is the AnalysisProcessor's own ANALYSIS_ACTIONS (single source: the
-        # combo's data values ARE the node's action values); each entry is gated by this panel kind's
-        # capability, and the human label stays a display string.
-        from ..neutral_atom.operations.processors.analysis import ANALYSIS_ACTIONS
-        labels = {"fit": "curve fit", "roi": "ROI"}
-        offered = {"fit": bool(models), "roi": offers_roi}
-        for action in ANALYSIS_ACTIONS:
-            if offered.get(action):
-                self.analysis_combo.addItem(labels.get(action, action), action)
-        self.analysis_combo.setToolTip(
-            "What a drag-selection on this panel does:\n"
-            "  none      = just report the selected points"
-            + ("\n  curve fit = fit the chosen model to the selection (the result overlays the plot;\n"
-               "              a 2-D image centre fit ALSO publishes fit_x0/fit_y0/... as hub signals)"
-               if models else "")
-            + ("\n  ROI       = reduce the selected region to one scalar (publishes roi_value; also\n"
-               "              roi_frame -- an image crop, or a 1-D / distribution / site sub-view)"
-               if offers_roi else ""))
-        self.analysis_combo.currentIndexChanged.connect(self._on_analysis_action_changed)
-        ana.addWidget(FluentSettingRow("action", self.analysis_combo, label_width=label_w))
-        self.fit_fix_seed_row = self.fit_result_row = None
-        if models:
-            self.fit_model_combo = FluentComboBox()
-            for model in models:
-                self.fit_model_combo.addItem(model.formula, model.key)
-            self.fit_model_combo.setToolTip(
-                "Curve-fit model for this panel's plot family (a 2d image offers the 2D-Gaussian\n"
-                "'2D center'; a 1d / monitor / distribution offers the peak/decay models).")
-            self.fit_model_combo.currentIndexChanged.connect(self._on_fit_model_changed)
-            ana.addWidget(FluentSettingRow("model", self.fit_model_combo, label_width=label_w))
-            # The compact per-parameter fix/seed editor + the result line only OCCUPY space while a
-            # curve fit is actually on -- their rows stay in the layout but hide when the action is not
-            # "fit" (the reveal-and-grow-down pattern the relim fixed lo/hi row uses), so the default
-            # popup stays short and grows only when the operator turns the fit on.
-            self.fit_fix_seed = _FitFixSeedEditor()
-            self.fit_fix_seed.changed.connect(self._on_fit_fix_seed_changed)
-            self.fit_fix_seed_row = FluentSettingRow("fix / seed", self.fit_fix_seed, label_width=label_w)
-            ana.addWidget(self.fit_fix_seed_row)
-            self.fit_result_label = FluentLabel("not fitted")
-            self.fit_result_label.setWordWrap(True)
-            self.fit_result_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            self.fit_result_row = FluentSettingRow("result", self.fit_result_label, label_width=label_w)
-            ana.addWidget(self.fit_result_row)
-        self._refresh_analysis_controls()
+        section_box("Analysis").addWidget(controls)
+        self._analysis_controls = controls
+        # The test-keyed aliases (single builder, unchanged public names): the card exposes the SAME
+        # attributes as before, now backed by the shared composite.
+        self.analysis_combo = controls.action_combo
+        self.fit_model_combo = controls.model_combo
+        self.fit_fix_seed = controls.fix_seed
+        self.fit_result_label = controls.result_label
 
     def _default_fit_model(self) -> str:
         """The model a fresh curve fit uses: the stored request's model FIRST (single source once fit
@@ -3208,53 +3298,19 @@ class PanelCard(FluentGroupBox):
         self._refresh_analysis_controls()
         self.changed.emit()
 
-    def _on_analysis_action_changed(self, _index: int) -> None:
-        combo = getattr(self, "analysis_combo", None)
-        if combo is not None:
-            self._select_analysis_action(combo.currentData(),
-                                         model_combo=getattr(self, "fit_model_combo", None),
-                                         fix_seed=getattr(self, "fit_fix_seed", None))
-
-    def _on_fit_model_changed(self, _index: int) -> None:
-        combo = getattr(self, "fit_model_combo", None)
-        if combo is None:
-            return
-        editor = getattr(self, "fit_fix_seed", None)
-        if editor is not None:
-            editor.set_model(str(combo.currentData() or ""))
-        if self.config.params.get("fit_request"):     # re-apply the active fit with the new model
-            self.set_fit_request(self._build_fit_request_from_widgets(
-                combo, editor, self.current_selection()))
-
-    def _on_fit_fix_seed_changed(self) -> None:
-        if self.config.params.get("fit_request"):     # re-apply the active fit with the new fix/seed
-            self.set_fit_request(self._build_fit_request_from_widgets(
-                getattr(self, "fit_model_combo", None), getattr(self, "fit_fix_seed", None),
-                self.current_selection()))
-
     def _refresh_analysis_controls(self) -> None:
         """Re-derive THIS card's Setting Analysis controls from state (fit_request presence +
-        selection_action) -- called from :meth:`set_fit_request`, the section build, and Setting show.
-        The Edit tab derives its OWN copy the same way on show, so both are pure views (#8)."""
-        _apply_analysis_state_to_widgets(
-            self,
-            action_combo=getattr(self, "analysis_combo", None),
-            model_combo=getattr(self, "fit_model_combo", None),
-            fix_seed=getattr(self, "fit_fix_seed", None),
-            result_label=getattr(self, "fit_result_label", None))
-        # The fix/seed editor + result line only take up space while a fit is on: reveal-and-grow-down
-        # (the SAME pattern as the relim fixed lo/hi row), so the default popup stays short.  Set
-        # visibility explicitly (isVisible() is unreliable before the popup is shown) and re-size only
-        # when the popup is on screen (the build path sizes the popup itself afterwards).
-        active = bool(self.config.params.get("fit_request"))
-        for row in (getattr(self, "fit_fix_seed_row", None), getattr(self, "fit_result_row", None)):
-            if row is not None:
-                row.setVisible(active)
+        selection_action) -- called from :meth:`set_fit_request`, the section build, and Setting open.
+        The Edit tab derives its OWN copy the same way, so both are pure views of the one source (#8)."""
+        controls = getattr(self, "_analysis_controls", None)
+        if controls is not None:
+            controls.derive()
         if getattr(self, "settings_popup", None) is not None and self.settings_popup.isVisible():
             self._size_settings_popup()
 
     def _fit_result_text(self, result=None) -> str:
-        """The one-line fit-result string (shared by the Setting result label + the Edit status)."""
+        """The one-line fit-result string -- shared VERBATIM by the Setting AND the Edit result label
+        (both surfaces are refreshed from it by :meth:`_set_fit_result_text` / the console's overlay push)."""
         result = result if result is not None else getattr(self.plotter, "_last_fit_result", None)
         if result is None:
             return "not fitted"
@@ -3265,9 +3321,11 @@ class PanelCard(FluentGroupBox):
         return f"invalid · {result.status}"
 
     def _set_fit_result_text(self, result=None) -> None:
-        label = getattr(self, "fit_result_label", None)
-        if label is not None:
-            label.setText(self._fit_result_text(result))
+        """Push the fit-result string to this card's Setting Analysis result line (change-gated).  The
+        Edit tab's copy is refreshed alongside by the console's overlay push (both surfaces, one source)."""
+        controls = getattr(self, "_analysis_controls", None)
+        if controls is not None:
+            controls.set_result(self._fit_result_text(result))
 
     def _set_param(self, key: str, value) -> None:
         """A declarative parameter edit: store, apply, mark dirty.
@@ -5164,40 +5222,25 @@ class PanelEditor(QtWidgets.QWidget):
                     row.addWidget(trailing, 0)
                 return host
 
-            # ---- Analysis: the SAME curve fit the Setting popup's Analysis section offers, listing ONLY
-            # the models that match this panel's plot family (a hist now offers the 1-D family ALONGSIDE
-            # its own bimodal knob -- they are two parallel fits).  Every action routes through the ONE
-            # card mutator (card.set_fit_request), so the Edit fit combo and the Setting Analysis combo
-            # are both views of config.params['fit_request'] and can never disagree (#8).  ``fit_combo``
-            # stays the attribute name the model picker + tests key off; ``do_fit`` no-ops when None.
-            fit_models = _general_fit_models_for_kind(
-                self.card._param_kind() if self.card is not None else self.config.kind)
+            # ---- Analysis: the SAME control set the Setting popup builds, through the ONE
+            # :class:`AnalysisControls` builder (``surface='edit'`` -- adds the explicit Fit / Clear
+            # buttons + gains the action combo incl. ROI + a result row).  Every action routes through the
+            # ONE card mutator (card.set_fit_request), so the Edit and Setting surfaces are both views of
+            # config.params['fit_request'] and can never disagree (#8).  ``fit_combo`` / ``ed_fix_seed``
+            # stay the attribute names tests key off; ``do_fit`` / ``clear_fit`` delegate to the composite.
             self.fit_combo = None
             self.ed_fix_seed = None
-            if fit_models:
-                section("Analysis")
-                self.fit_combo = FluentComboBox()
-                for model in fit_models:
-                    self.fit_combo.addItem(model.formula, model.key)
-                self.fit_combo.setFixedWidth(scaled_px(150, minimum=120))
-                self.fit_combo.setToolTip(
-                    "Curve-fit model for this panel's plot family.  A 2d image offers the 2D-Gaussian\n"
-                    "'2D center'; a 1d / monitor / distribution offers the peak/decay models.")
-                self.fit_combo.currentIndexChanged.connect(self._on_edit_fit_model_changed)
-                fit_btn = FluentButton("Fit", color=ACCENT)
-                fit_btn.clicked.connect(self.do_fit)
-                clear_btn = FluentButton("Clear", color=GREY)
-                clear_btn.clicked.connect(self.clear_fit)
-                # model row: the picker on the left, the Fit / Clear actions on the right.
-                model_row = _inline(self.fit_combo, trailing=fit_btn)
-                model_row.layout().addWidget(clear_btn, 0)
-                col.addWidget(FluentSettingRow("model", model_row, label_width=proc_lw))
-                # the compact typed per-parameter fix/seed editor (#1b): the SAME reusable widget the
-                # Setting popup builds, writing into the SAME FitRequest.fixed / .initial via build_fit_request.
-                self.ed_fix_seed = _FitFixSeedEditor()
-                self.ed_fix_seed.changed.connect(self._on_edit_fit_fix_seed_changed)
-                col.addWidget(FluentSettingRow("fix / seed", self.ed_fix_seed, label_width=proc_lw))
-                self._refresh_edit_analysis()
+            self._analysis_controls = None
+            if self.card is not None:
+                controls = AnalysisControls(self.card, surface="edit", label_w=proc_lw)
+                if controls.empty:
+                    controls.deleteLater()
+                else:
+                    section("Analysis")
+                    col.addWidget(controls)
+                    self._analysis_controls = controls
+                    self.fit_combo = controls.model_combo
+                    self.ed_fix_seed = controls.fix_seed
 
             # x/y-range pins (#3): the VIEW window, applied to the LIVE panel AND every grid cell (global,
             # not the snapshot only).  The boxes EDIT THE STORED PIN (``view_xlim``/``view_ylim``), NOT the
@@ -5806,43 +5849,31 @@ class PanelEditor(QtWidgets.QWidget):
         return self._df
 
     def do_fit(self) -> None:
-        """Apply a curve fit from the Edit tab through the ONE card mutator, so the live overlay (a
-        DISPLAY of the per-panel FitProcessor node's published params), the hub node, and the Setting
-        popup's Analysis controls all follow the same config.params['fit_request'] state."""
-        if self.fit_combo is None or self.card is None or not self.fit_combo.currentData():
+        """Apply a curve fit from the Edit tab through the ONE :class:`AnalysisControls` composite (which
+        funnels into card.set_fit_request), so the live overlay, the hub node, and the Setting popup's
+        Analysis controls all follow the same config.params['fit_request'] state.  No-op when the panel
+        family offers no fit (kept as a public method the tests + Fit button call)."""
+        controls = getattr(self, "_analysis_controls", None)
+        if controls is None:
             return
-        selection = self.card.current_selection()
-        request = self.card._build_fit_request_from_widgets(
-            self.fit_combo, getattr(self, "ed_fix_seed", None), selection)
-        self.card.set_fit_request(request)                 # per-panel fit node + live overlay + Setting widgets
-        self.status.setText(f"fit {self.fit_combo.currentText()}: applied (see panel)")
+        controls.do_fit()
+        if self.fit_combo is not None and self.fit_combo.currentData():
+            self.status.setText(f"fit {self.fit_combo.currentText()}: applied (see panel)")
 
     def clear_fit(self) -> None:
-        if self.card is not None:
-            self.card.set_fit_request(None)                # clears live overlay + removes the per-panel node
+        controls = getattr(self, "_analysis_controls", None)
+        if controls is not None:
+            controls.clear_fit()
+        elif self.card is not None:
+            self.card.set_fit_request(None)
         self.status.setText("fit cleared")
 
-    def _on_edit_fit_model_changed(self, _index: int) -> None:
-        if self.fit_combo is None:
-            return
-        if getattr(self, "ed_fix_seed", None) is not None:
-            self.ed_fix_seed.set_model(str(self.fit_combo.currentData() or ""))
-        if self.card is not None and self.card.config.params.get("fit_request"):
-            self.do_fit()                                   # re-apply the active fit with the new model
-
-    def _on_edit_fit_fix_seed_changed(self) -> None:
-        if self.card is not None and self.card.config.params.get("fit_request"):
-            self.do_fit()
-
     def _refresh_edit_analysis(self) -> None:
-        """Re-derive the Edit tab's Analysis controls (fit model combo + fix/seed) from the card's
-        stored ``fit_request`` -- so the Edit picker always shows the SAME fit the Setting popup set,
-        the two surfaces being pure views of the single source (#8)."""
-        if self.card is None or self.fit_combo is None:
-            return
-        _apply_analysis_state_to_widgets(
-            self.card, action_combo=None, model_combo=self.fit_combo,
-            fix_seed=getattr(self, "ed_fix_seed", None), result_label=None)
+        """Re-derive the Edit tab's Analysis controls from the card's stored state -- so the Edit surface
+        always shows the SAME fit the Setting popup set, the two being pure views of the single source (#8)."""
+        controls = getattr(self, "_analysis_controls", None)
+        if controls is not None:
+            controls.derive()
 
     def refresh_on_show(self) -> None:
         """When this panel's Edit tab becomes visible, refresh anything that may have changed
@@ -8079,9 +8110,11 @@ class TaskConsole(QtWidgets.QWidget):
 
     def _update_fit_overlays(self) -> None:
         """GUI thread (after each coherent present): push every fit panel's per-panel FitProcessor
-        PUBLISHED result to its plotter's DISPLAY-only overlay.  This is how a fit reaches the plot now --
-        the overlay reconstructs the curve/dot from published parameters, never solving on the Qt thread
-        (#6).  Gated on the node's published version so an unchanged fit costs nothing."""
+        PUBLISHED result to its plotter's DISPLAY-only overlay AND to the fit result line on BOTH surfaces
+        (the Setting popup + the open Edit tab).  This is how a fit reaches the plot now -- the overlay
+        reconstructs the curve/dot from published parameters, never solving on the Qt thread (#6).  Gated
+        on the node's published version so an unchanged fit costs nothing (and the result labels are
+        change-gated on top, so no per-tick setText thrash)."""
         from ..neutral_atom.operations.processors.fit import FitProcessor
         for card in self.cards:
             plotter = card.plotter
@@ -8103,7 +8136,16 @@ class TaskConsole(QtWidgets.QWidget):
                     and hasattr(plotter, "_fit_overlay_result"):
                 continue
             self._fit_overlay_pushed[id(card)] = version
-            plotter.apply_published_fit(self._published_fit_result(node))
+            result = self._published_fit_result(node)
+            plotter.apply_published_fit(result)
+            # #6 stale-result fix: the node's SOLVED result now reaches the fit result line on BOTH
+            # surfaces (previously only overlays updated, so the Setting result row said 'not fitted'
+            # forever).  Both writers change-gate, so this is free when the text is unchanged.
+            card._set_fit_result_text(result)
+            editor = self._panel_editors.get(id(card))
+            edit_controls = getattr(editor, "_analysis_controls", None) if editor is not None else None
+            if edit_controls is not None:
+                edit_controls.set_result(card._fit_result_text(result))
 
     def _apply_panel_analysis(self, card: "PanelCard", *, action: str, selection, extra_values=None,
                               node_params=None) -> None:
