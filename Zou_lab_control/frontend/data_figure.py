@@ -1366,8 +1366,9 @@ class SavedFigure:
         if recipe is None or str(recipe.get("kind") or "") != "pulse":
             return None
         from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+        from Zou_lab_control.neutral_atom.timing.legacy_pulse_upgrade import upgrade  # REMOVE-ME(legacy-pulse-upgrade)
 
-        state = PulseTableState.from_dict(self._pulse_state_dict(recipe))
+        state = PulseTableState.from_dict(upgrade(self._pulse_state_dict(recipe)))
         return state, bool(recipe.get("include_always_off", True))
 
     def _replay_pulse(self, recipe: Mapping[str, Any]) -> "DataFigure":

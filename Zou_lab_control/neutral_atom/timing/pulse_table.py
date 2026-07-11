@@ -2078,7 +2078,8 @@ class PulseTableState:
 
     @classmethod
     def load(cls, path: str | Path) -> "PulseTableState":
-        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+        from .legacy_pulse_upgrade import upgrade   # REMOVE-ME(legacy-pulse-upgrade)
+        return cls.from_dict(upgrade(json.loads(Path(path).read_text(encoding="utf-8"))))
 
     @classmethod
     def from_sequence(
