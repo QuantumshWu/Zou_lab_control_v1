@@ -3096,10 +3096,15 @@ class PanelCard(FluentGroupBox):
         ana = section_box("Analysis")
         self.analysis_combo = FluentComboBox()
         self.analysis_combo.addItem("none", "none")
-        if models:
-            self.analysis_combo.addItem("curve fit", "fit")
-        if offers_roi:
-            self.analysis_combo.addItem("ROI", "roi")
+        # The action VOCABULARY is the AnalysisProcessor's own ANALYSIS_ACTIONS (single source: the
+        # combo's data values ARE the node's action values); each entry is gated by this panel kind's
+        # capability, and the human label stays a display string.
+        from ..neutral_atom.operations.processors.analysis import ANALYSIS_ACTIONS
+        labels = {"fit": "curve fit", "roi": "ROI"}
+        offered = {"fit": bool(models), "roi": offers_roi}
+        for action in ANALYSIS_ACTIONS:
+            if offered.get(action):
+                self.analysis_combo.addItem(labels.get(action, action), action)
         self.analysis_combo.setToolTip(
             "What a drag-selection on this panel does:\n"
             "  none      = just report the selected points"
@@ -3696,12 +3701,17 @@ class PanelCard(FluentGroupBox):
         was_on = self._selectors_on
         self._selectors_on = bool(on)
         self._apply_selectors_state()
-        # Turning the Selectors switch OFF tears down this panel's analysis node (#1): the operator has
-        # stopped driving it, so its FitProcessor / RoiProcessor must not keep republishing.  Routed
-        # through the ONE console teardown seam (``selection_clear_sink`` -> ``_remove_panel_analysis``),
-        # symmetric with panel removal and an Analysis action change; a no-op if this panel owns no node.
-        if was_on and not on and callable(self.selection_clear_sink):
-            self.selection_clear_sink(self, "selectors")
+        # Turning the Selectors switch OFF tears down this panel's analysis whole (#1): the operator
+        # has stopped driving it, so its Analysis node must not keep republishing.  An armed FIT
+        # clears through the ONE fit mutator (:meth:`set_fit_request(None)`) so the persisted
+        # ``fit_request`` state dies WITH the node -- never a zombie "fit on but computing nothing"
+        # config the next save would replay (BUG-F).  Anything else (an armed ROI) goes straight
+        # through the teardown seam; both funnel into ``_remove_panel_analysis`` (idempotent).
+        if was_on and not on:
+            if self.config.params.get("fit_request"):
+                self.set_fit_request(None)
+            elif callable(self.selection_clear_sink):
+                self.selection_clear_sink(self, "selectors")
 
     def _apply_selectors_state(self) -> None:
         """Gate the current plotter's selector layer to the card's switch state (the ONE apply
@@ -4638,7 +4648,12 @@ class MeasurementPanel(QtWidgets.QWidget):
             return
         # the spec's declared params PLUS the auto-injected acquisition knob (repeat, 0 = ∞) --
         # ONE list so both the label-width and the widget loop see the same declarations.
-        decls = list(spec.params) + list(self._acquisition_params)
+        # ``display=False`` marks a NON-FORM payload (a structured value another surface injects --
+        # e.g. the Analysis spec's fit_request the panel's Analysis section round-trips): it is not
+        # renderable as a usable control, so the manual form skips it (its saved value still rides
+        # ``row.node.values`` untouched -- the _start_logic_node merge preserves non-form keys).
+        decls = [d for d in list(spec.params) + list(self._acquisition_params)
+                 if getattr(d, "display", True)]
         # ONE label-column width for this form: fit the widest SCALAR-row label (composites carry
         # their own section header, so they are not row labels).  Single rule via setting_label_width.
         scalar_labels = [
@@ -6450,16 +6465,12 @@ class TaskConsole(QtWidgets.QWidget):
         # `readout_fidelity`, a stopped camera's `frame`).  Cleared only on row removal.
         self._last_node: dict[int, object] = {}
         self._logic_editors: dict[int, "LogicNodeEditor"] = {}  # id(row) -> Edit tab
-        # id(card) -> the ONE analysis LogicNodeRow this panel owns (a FitProcessor XOR a RoiProcessor).
-        # An analysis node is keyed by the PANEL, never by the source signal: two panels on the SAME
-        # source therefore own DISTINCT nodes with distinct output names, and create/retarget/teardown all
-        # pivot on the card (the single fix for the old source-signal keying, which made every panel on one
-        # source share -- and asymmetrically fail to tear down -- one node).
-        self._panel_analysis: dict[int, "LogicNodeRow"] = {}
-        # id(card) -> the panel's ``<slug>_region`` hub signal name (the drawn Selection AS a signal).
-        # STABLE per panel: a re-drag republishes the SAME name, and the analysis node CONSUMES it, so a
-        # region is a real, reusable per-panel signal -- retarget is a republish, not a set_selection poke.
-        self._panel_region_name: dict[int, str] = {}
+        # The panel<->analysis association is a PERSISTED SINGLE SOURCE, never a runtime dict: the
+        # panel's config stores its region signal name (``params['region_signal']``, written once at
+        # creation and never re-derived) + the drawn region payload (``params['region']``), and its
+        # Analysis row is DERIVED as the row whose ``values['region']`` equals that name
+        # (:meth:`_panel_analysis_row`).  Save/load therefore re-associates for free, ids never leak,
+        # and two panels can never cross-link (a fresh name is deduped against every persisted name).
         # id(card) -> the published version of its fit node's params last pushed to the overlay, so an
         # unchanged fit re-draws nothing (the overlay is DISPLAY-only, driven by the node's publishes).
         self._fit_overlay_pushed: dict[int, int] = {}
@@ -6795,6 +6806,20 @@ class TaskConsole(QtWidgets.QWidget):
                 self._attach_card(self._new_panel_card(config))
             for node in state.logic:
                 self._attach_logic_node(node)    # always STOPPED -- Start is manual
+            # Replay every panel's persisted REGION as its control signal, so a loaded Analysis row
+            # (still STOPPED) sees the saved selection the moment the user Starts it -- never a silent
+            # whole-frame fallback -- and the derived panel<->row association is live immediately.
+            from ..neutral_atom.core.selection import Selection, region_bins, region_tensor
+            for card in self.cards:
+                name = str(card.config.params.get("region_signal") or "")
+                payload = card.config.params.get("region")
+                if not name or not isinstance(payload, Mapping):
+                    continue
+                selection = Selection.from_dict(payload)
+                tensor = region_tensor(selection, bins=region_bins(selection))
+                self.hub.register_signal(name, tensor.schema)   # idempotent: byte-stable schema
+                self.hub.publish({name: tensor})
+            self._fit_overlay_pushed.clear()   # loaded panels re-pull their overlays from scratch
             self._arrange()
         finally:
             self._building = False
@@ -7027,13 +7052,26 @@ class TaskConsole(QtWidgets.QWidget):
                     bucket.append(label)
         return providers
 
+    def _is_control_signal(self, name: str) -> bool:
+        """Whether ``name`` is a CONTROL-plane hub signal (a panel's drawn region) -- classified by
+        the schema role the ONE region encoder stamps (``core.selection.CONTROL_ROLE``), the single
+        choke point the picker pool filter AND the orphan-GC exemption both read."""
+        from ..neutral_atom.core.selection import CONTROL_ROLE
+        try:
+            schema = self.hub.schema(str(name))
+        except KeyError:
+            return False
+        return dict(getattr(schema, "metadata", None) or {}).get("role") == CONTROL_ROLE
+
     def _signal_names(self) -> list[str]:
         """Every signal a picker may offer: PUBLISHED hub signals UNION the DECLARED outputs
         of stopped Logic-tab nodes (the latter not on the hub yet).  The ONE name source for
-        every signal picker, so a not-yet-started node's output is selectable (#6)."""
+        every signal picker, so a not-yet-started node's output is selectable (#6).  CONTROL-plane
+        signals (a panel's region) are NOT bindable data and are filtered here -- one choke point,
+        so the flat combo, the tree combo, the expression popup and the pulse-scan y all agree (#7)."""
         names = {str(n) for n in self.hub.names()}
         names.update(self._signal_providers().keys())
-        return sorted(names)
+        return sorted(n for n in names if not self._is_control_signal(n))
 
     def _signal_formats(self) -> dict:
         """``name -> standardized array shape`` for every LIVE hub signal, read straight
@@ -7497,12 +7535,13 @@ class TaskConsole(QtWidgets.QWidget):
         # dropping frame_1/frame_2 from ``providers`` -> they are caught here (the eager purges in
         # _start/_remove_logic_node cover the rebuild / remove paths synchronously; THIS catches every
         # remaining path, switches included).
-        # The per-panel ``<slug>_region`` signals are published by the CONSOLE (a panel's drawn
-        # selection), not by a LogicNode, so they have no ``providers`` entry -- exempt them, else the GC
-        # would purge a live region out from under its analysis node (a SignalHistoryGap).  They are
-        # cleaned when their panel is removed (see _remove_panel).
-        region_names = set(self._panel_region_name.values())
-        orphans = [n for n in self.hub.names() if n not in providers and n not in region_names]
+        # CONTROL-plane signals (a panel's ``<slug>_region``) are published by the CONSOLE, not by a
+        # LogicNode, so they have no ``providers`` entry -- exempt them BY THEIR DECLARED ROLE
+        # (``schema.metadata['role'] == 'control'``, stamped by the ONE region encoder), never by a
+        # parallel name list.  Their lifecycle is explicit: _remove_panel_analysis removes them with
+        # the analysis (and _remove_panel with the panel), so nothing lingers.
+        orphans = [n for n in self.hub.names()
+                   if n not in providers and not self._is_control_signal(n)]
         if orphans:
             self.hub.remove_signals(orphans)
         for card in self.cards:
@@ -7746,10 +7785,7 @@ class TaskConsole(QtWidgets.QWidget):
             return
         self._render_loop.barrier()   # the worker must not be composing into the card we tear down
         if card in self.cards:
-            self._remove_panel_analysis(card)  # tear down the analysis node this panel owned (#1)
-            region = self._panel_region_name.pop(id(card), None)
-            if region:
-                self.hub.remove_signals([region])   # the panel's region signal is gone with the panel
+            self._remove_panel_analysis(card)  # analysis row + region signal go with the panel (#1/#7)
             card.settings_popup.hide()
             self._close_panel_editor(card)     # drop this card's Edit tab too
             self.cards.remove(card)
@@ -7907,65 +7943,86 @@ class TaskConsole(QtWidgets.QWidget):
             except Exception as exc:
                 card.set_status(f"selection invalid: {str(exc).splitlines()[0][:100]}", error=True)
 
-    def _analysis_node_title(self, card: "PanelCard", verb: str) -> str:
-        """A per-PANEL analysis-node title derived from the panel's OWN title (``"2D image #1 fit"``),
-        made unique among the Logic rows.  The node prefix derives from this title
+    def _analysis_node_title(self, card: "PanelCard") -> str:
+        """A per-PANEL analysis-node title derived from the panel's OWN title (``"2D image #1
+        analysis"``), made unique among the Logic rows.  The node prefix derives from this title
         (:meth:`_logic_node_prefix`), so two panels on the SAME source get DISTINCT nodes AND distinct
         published output names -- the root fix for the old one-node-per-source sharing (#3)."""
-        base = f"{card.config.title or 'panel'} {verb}"
+        base = f"{card.config.title or 'panel'} analysis"
         return indexed_unique_name(base, {str(r.node.title) for r in self.logic_nodes})
 
     def _panel_analysis_row(self, card: "PanelCard") -> "LogicNodeRow | None":
-        """This panel's ONE analysis row (a FitProcessor XOR a RoiProcessor), or ``None`` -- pruning a
-        stale handle whose row was removed from the Logic tab by hand."""
-        row = self._panel_analysis.get(id(card))
-        if row is not None and row not in self.logic_nodes:
-            self._panel_analysis.pop(id(card), None)
+        """This panel's ONE Analysis row, DERIVED from the persisted single source: the row whose
+        ``values['region']`` equals the panel's stored ``params['region_signal']``.  No runtime dict,
+        no id() key -- save/load re-associates for free, and a hand-removed row simply derives None."""
+        name = str(card.config.params.get("region_signal") or "")
+        if not name:
             return None
-        return row
+        for row in self.logic_nodes:
+            if str((row.node.values or {}).get("region") or "") == name:
+                return row
+        return None
 
     def _remove_panel_analysis(self, card: "PanelCard") -> None:
-        """Stop + remove the hub node THIS panel's analysis created (its FitProcessor or RoiProcessor),
-        keyed by the PANEL.  The ONE teardown seam every analysis-off path funnels through -- clearing a
-        fit, switching the Analysis action, turning the Selectors switch off, and panel removal -- so an
-        analysis node is never left republishing after its panel stopped driving it (#1: symmetric for
-        BOTH fit and ROI, unlike the old fit-only clear that left the ROI node consuming forever)."""
-        row = self._panel_analysis.pop(id(card), None)
-        if row is not None and row in self.logic_nodes:
+        """Tear down THIS panel's analysis whole: stop + remove its Analysis row, THEN remove its
+        region signal from the hub and drop the persisted association (``region_signal`` /
+        ``region``).  The ONE teardown seam every analysis-off path funnels through -- clearing a
+        fit, switching the Analysis action to none, turning the Selectors switch off, and panel
+        removal -- symmetric for fit and ROI, and symmetric for the region itself (#7: a cleared
+        analysis leaves NO orphan control signal behind).  Node first, region second: a running
+        consumer must never see its region vanish."""
+        row = self._panel_analysis_row(card)
+        if row is not None:
             self._remove_logic_node(row)
+        region = card.config.params.pop("region_signal", None)
+        card.config.params.pop("region", None)
+        if region:
+            self.hub.remove_signals([str(region)])
         self._fit_overlay_pushed.pop(id(card), None)   # a fresh fit re-pushes from version -1
         if card.plotter is not None and hasattr(card.plotter, "apply_published_fit"):
             card.plotter.apply_published_fit(None)     # drop any live fit overlay too
 
+    def _region_signal_names_in_use(self) -> set:
+        """Every region name that may NOT be handed to a new panel: live hub names, every Logic row's
+        consumed region (running or stopped, loaded or fresh), and every panel's persisted name.  The
+        dedup scope that makes cross-linking structurally impossible (two panels can never share a
+        region name, even across save/load/rename)."""
+        names = {str(n) for n in self.hub.registered_names()}
+        for row in self.logic_nodes:
+            region = str((row.node.values or {}).get("region") or "")
+            if region:
+                names.add(region)
+        for other in self.cards:
+            region = str(other.config.params.get("region_signal") or "")
+            if region:
+                names.add(region)
+        return names
+
     def _publish_region(self, card: "PanelCard", selection) -> str:
-        """Publish THIS panel's drawn Selection as its ``<slug>_region`` hub signal (the drawn bounds as
-        a tiny ``(K,2)`` tensor + the binding/frame/bins in the schema metadata), the ONE control input
-        an analysis node consumes.  A re-drag republishes the SAME name (stable per panel), so retarget
-        is a republish -- there is no ``set_selection`` plumbing.  Returns the region signal name."""
-        from ..neutral_atom.core.selection import encode_region
-        from ..neutral_atom.core.signals import SignalSchema, SignalTensor
+        """Publish THIS panel's drawn Selection as its ``<slug>_region`` hub CONTROL signal -- the ONE
+        control input its Analysis node consumes.  The name is minted ONCE (deduped against every
+        persisted region name -- :meth:`_region_signal_names_in_use`) and stored in
+        ``config.params['region_signal']``; the drawn payload is stored in ``config.params['region']``
+        (both persist with the panel, so save/load replays the region and re-associates the row).  A
+        re-drag republishes the SAME name with a byte-stable schema (:func:`region_tensor` -- fixed
+        shape, ``role='control'``), so a retarget can never fork the schema or gap a running consumer."""
+        from ..neutral_atom.core.selection import region_doc, region_tensor
         from ..neutral_atom.operations.measurement import measurement_slug
-        name = self._panel_region_name.get(id(card))
-        if name is None:
+        name = str(card.config.params.get("region_signal") or "")
+        if not name:
             slug = measurement_slug(card.config.title) or "panel"
-            existing = set(self.hub.registered_names())
+            taken = self._region_signal_names_in_use()
             name = f"{slug}_region"
             k = 2
-            while name in existing:
+            while name in taken:
                 name = f"{slug}_{k}_region"
                 k += 1
-            self._panel_region_name[id(card)] = name
+            card.config.params["region_signal"] = name
         bins = int(card.config.params.get("bins", 50)) if card.config.kind == "hist" else None
-        values, metadata = encode_region(selection, bins=bins)
-        rows = int(values.shape[0])
-        schema = SignalSchema(point_shape=(1,), data_shape=(rows, 2), dtype=np.float64,
-                              repeat_capacity=1, label="region", metadata=metadata)
-        try:
-            replace = not self.hub.schema(name).same_definition(schema)
-        except KeyError:
-            replace = False
-        self.hub.register_signal(name, schema, replace=replace)
-        self.hub.publish({name: SignalTensor(values.reshape(1, 1, rows, 2), schema)})
+        card.config.params["region"] = region_doc(selection, bins=bins)
+        tensor = region_tensor(selection, bins=bins)
+        self.hub.register_signal(name, tensor.schema)     # idempotent: the schema is byte-stable
+        self.hub.publish({name: tensor})
         return name
 
     def _published_fit_result(self, node):
@@ -8010,9 +8067,11 @@ class TaskConsole(QtWidgets.QWidget):
             plotter = card.plotter
             if plotter is None or not hasattr(plotter, "apply_published_fit"):
                 continue
-            row = self._panel_analysis.get(id(card))
+            row = self._panel_analysis_row(card)
             node = self._logic_nodes.get(id(row)) if row is not None else None
-            if not isinstance(node, FitProcessor):
+            # An Analysis node inherits BOTH strategies -- only its CURRENT action decides whether it
+            # publishes fit params (a bare FitProcessor without .action defaults to "fit").
+            if not isinstance(node, FitProcessor) or getattr(node, "action", "fit") != "fit":
                 continue
             version = self.hub.signal_versions().get(node.prefix + "fit_valid", -1)
             # Skip only when the version is unchanged AND this very plotter already carries the pushed
@@ -8026,15 +8085,71 @@ class TaskConsole(QtWidgets.QWidget):
             self._fit_overlay_pushed[id(card)] = version
             plotter.apply_published_fit(self._published_fit_result(node))
 
+    def _apply_panel_analysis(self, card: "PanelCard", *, action: str, selection, extra_values=None,
+                              node_params=None) -> None:
+        """The ONE create/retarget seam for BOTH analysis actions: publish the panel's region signal,
+        then land ``action`` (+ per-action values) on the panel's Analysis row.
+
+        * row exists -> RETARGET IT (running or stopped): update ``row.node.values`` (the persisted
+          truth) and, when the node is LIVE, queue ``set_acquisition_parameters`` so the worker
+          switches action / model between shots.  A STOPPED row is never deleted and never
+          auto-started -- stop means frozen; the status hints at the Logic tab (its lingering
+          outputs stay viewable, and Start replays the freshly republished region).
+        * no row -> CREATE one Analysis row (the single catalog spec) and Start it.
+
+        The old delete-and-recreate branches (which silently destroyed a user-stopped row, purged
+        its lingering signals, and re-started against their intent) are gone: fit<->roi is a
+        parameter switch on the SAME node/row/region."""
+        from ..neutral_atom.operations.processors.analysis import ANALYSIS_SPEC_NAME
+        from ..neutral_atom.operations.signal_expr import DEFAULT_SOURCE
+        signal = str(card.config.inputs[0]) if card.config.inputs else ""
+        if not signal:
+            card.set_status("pick a signal in Setting before an analysis", error=True)
+            return
+        if self._task_locked:
+            card.set_status("console is locked by a running task", error=True)
+            return
+        bound = region_binding(
+            card.config.kind, selection,
+            structure=card._bound_structure(),
+            coordinates=card._selection_coordinates_for_binding(),
+            origin=selection.metadata.get("origin", (0.0, 0.0)))
+        region_name = self._publish_region(card, bound)
+        values = {"action": str(action), "region": region_name, **dict(extra_values or {})}
+        verb = "fit" if action == "fit" else "ROI"
+        row = self._panel_analysis_row(card)
+        if row is not None:
+            row.node.values = {**dict(row.node.values or {}), **values}
+            editor = self._logic_editors.get(id(row))
+            if editor is not None and hasattr(getattr(editor, "form", None), "seed_values"):
+                editor.form.seed_values(values)
+            node = self._logic_nodes.get(id(row))
+            if node is not None:
+                node.apply_acquisition_parameters(**dict(node_params or {}), action=str(action))
+                card.set_status(f"{verb} -> {row.node.title}", error=False)
+            else:
+                card.set_status(f"{row.node.title} is stopped — Start it from the Logic tab",
+                                error=False)
+            self._mark_dirty()
+            return
+        cfg = LogicNodeConfig(
+            kind="processor", name=ANALYSIS_SPEC_NAME,
+            title=self._analysis_node_title(card),
+            values={"source": {"inputs": [signal], "source": DEFAULT_SOURCE}, **values})
+        new_row = self._add_logic_node(cfg, focus=False)   # stay on the Monitor board -- no tab jump
+        self._start_logic_node(new_row)
+        started = self._logic_nodes.get(id(new_row)) is not None
+        card.set_status(f"{verb} -> {cfg.title}" + ("" if started else " (start failed — see Logic tab)"),
+                        error=not started)
+
     def _sync_fit_node(self, card: "PanelCard", request) -> None:
-        """The console's ONE fit-node sink (wired to :attr:`PanelCard.fit_node_sink`): create OR retarget
-        a per-panel FitProcessor that fits on its WORKER and publishes its parameters as signals
-        (``fit_x0``/``fit_sigma``/... -- consumable by a Monitor or a scan loss, and read back by the
-        panel's DISPLAY-only overlay).  EVERY fit family becomes a node -- a 2-D image centre, a 1-D
-        peak, a hist gaussian -- so no fit ever solves on the Qt thread (#6).  The node is owned by THIS
-        PANEL (``_panel_analysis[id(card)]``), never keyed by the source signal (#3); its region rides on
-        the panel's ``<slug>_region`` signal (the drawn selection), republished here.  A grid focus fits
-        per-cell in place (no hub node).  The teardown counterpart is :meth:`_remove_panel_analysis`."""
+        """The console's ONE fit sink (wired to :attr:`PanelCard.fit_node_sink`): land the panel's fit
+        on its per-panel Analysis node, which solves on its WORKER and publishes the model's parameters
+        as signals (``fit_x0``/``fit_sigma``/... -- consumable by a Monitor or a scan loss, and read
+        back by the panel's DISPLAY-only overlay).  EVERY fit family is a node -- 2-D image centre,
+        1-D peak, hist gaussian -- so no fit ever solves on the Qt thread (#6).  The drawn selection
+        travels on the panel's region signal; the config request carries only model + fixed/initial.
+        A facet grid fits per-cell in place (no hub node)."""
         from ..neutral_atom.core.fitting import FitRequest
         from dataclasses import replace as _dc_replace
         from ..neutral_atom.core.selection import Selection
@@ -8043,100 +8158,39 @@ class TaskConsole(QtWidgets.QWidget):
             card._set_fit_result_text()      # a facet grid fits per-cell in place, not as a hub node
             self._remove_panel_analysis(card)
             return
-        signal = str(card.config.inputs[0]) if card.config.inputs else ""
-        if not signal or self._task_locked:
-            return
-        # The drawn selection travels as the region signal (annotated with this panel kind's binding +
-        # bins); the CONFIG request carries only the model + fixed/initial (its selection is stripped --
-        # the region is the single source of the selection).
-        bound = region_binding(
-            card.config.kind, req.selection,
-            structure=card._bound_structure(),
-            coordinates=card._selection_coordinates_for_binding(),
-            origin=req.selection.metadata.get("origin", (0.0, 0.0)))
-        region_name = self._publish_region(card, bound)
         payload = _dc_replace(req, selection=Selection()).to_dict()
-        from ..neutral_atom.operations.processors.fit import FIT_SPEC_NAME, FitProcessor
-        row = self._panel_analysis_row(card)
-        node = self._logic_nodes.get(id(row)) if row is not None else None
-        if isinstance(node, FitProcessor):
-            node.set_fit_request(payload)                      # retarget model/fixed; region republished
-            row.node.values = {**dict(row.node.values or {}), "fit_request": payload}
-            editor = self._logic_editors.get(id(row))
-            if editor is not None and hasattr(getattr(editor, "form", None), "seed_values"):
-                editor.form.seed_values({"fit_request": payload})
-            self._mark_dirty()
-            card.set_status(f"fit -> {row.node.title}", error=False)
-            return
-        self._remove_panel_analysis(card)                     # was a ROI node (fit <-> roi are exclusive)
-        from ..neutral_atom.operations.signal_expr import DEFAULT_SOURCE
-        cfg = LogicNodeConfig(
-            kind="processor", name=FIT_SPEC_NAME,
-            title=self._analysis_node_title(card, "fit"),
-            values={"source": {"inputs": [signal], "source": DEFAULT_SOURCE},
-                    "fit_request": payload, "region": region_name})
-        new_row = self._add_logic_node(cfg, focus=False)
-        self._panel_analysis[id(card)] = new_row
-        self._start_logic_node(new_row)
-        started = self._logic_nodes.get(id(new_row)) is not None
-        card.set_status(f"fit -> {cfg.title}" + ("" if started else " (start failed — see Logic tab)"),
-                        error=not started)
+        self._apply_panel_analysis(card, action="fit", selection=req.selection,
+                                   extra_values={"fit_request": payload},
+                                   node_params={"fit_request": payload})
 
     def _on_panel_selection_clear(self, card: "PanelCard", action: str) -> None:
-        """The ONE selection-teardown seam, symmetric for BOTH analyses (#1): leaving/clearing a panel's
-        analysis STOPS + REMOVES the hub node it created -- a FitProcessor (``fit_x0``/... stop
-        publishing) or a RoiProcessor (``roi_frame``/``roi_value`` stop updating).  Because the panel owns
-        AT MOST ONE analysis node keyed by the CARD (``_panel_analysis``), the removal is unambiguous and
-        symmetric: ``action`` (``"fit"`` / ``"roi"`` / ``"selectors"``) is informational only.  This is
-        the root fix for the old fit-only teardown that left the ROI node consuming forever, AND for the
-        old source-signal keying that removed EVERY panel's node on one source instead of just this one."""
+        """The ONE selection-teardown seam, symmetric for BOTH analyses AND the region itself: an
+        explicit CLEAR (Analysis action -> none, fit Clear, Selectors off, panel removal) stops +
+        removes the panel's Analysis row and its region control signal whole
+        (:meth:`_remove_panel_analysis`).  ``action`` is informational only.  (A re-drag on a STOPPED
+        row is NOT a clear -- it retargets in place, see :meth:`_apply_panel_analysis`.)"""
         self._remove_panel_analysis(card)
 
     def _apply_roi_selection(self, card: "PanelCard", selection) -> None:
-        """Turn a drag on ANY plot kind into a Selection-driven RoiProcessor owned by THIS panel.
+        """Turn a drag on ANY plot kind into the panel's ROI analysis.
 
         The region is bound to the consumed block's own axes through the ONE per-kind resolver
         (:func:`live.region_binding`, the inverse of ``coerce_panel_value``): an image rectangle, a 1-D
         x-range, a distribution count-range and a site-centre rectangle all become a serializable
         Selection whose ``metadata['binding']`` says which axes it spans.  That Selection -- NEVER pixel
-        endpoints -- travels to a RoiProcessor CREATED for or RETARGETED on this panel
-        (``_panel_analysis[id(card)]``), so two panels on the same source own DISTINCT ROI nodes with
+        endpoints -- rides the panel's region signal into its per-panel Analysis node
+        (:meth:`_apply_panel_analysis`), so two panels on the same source own DISTINCT nodes with
         distinct output names (#3) and the sealed seam holds (``neutral_atom`` never imports frontend)."""
         signal = str(card.config.inputs[0]) if card.config.inputs else ""
-        if not signal or self._task_locked:
-            return
-        try:
-            self.hub.schema(signal)
-        except KeyError:
-            card.set_status("ROI source has no registered signal schema", error=True)
-            return
-        bound = region_binding(
-            card.config.kind, selection,
-            structure=card._bound_structure(),
-            coordinates=card._selection_coordinates_for_binding(),
-            origin=selection.metadata.get("origin", (0.0, 0.0)))
-        region_name = self._publish_region(card, bound)             # the drawn region AS a per-panel signal
-        from ..neutral_atom.operations.processors.roi import ROI_SPEC_NAME, RoiProcessor
-        row = self._panel_analysis_row(card)
-        node = self._logic_nodes.get(id(row)) if row is not None else None
-        if isinstance(node, RoiProcessor):
-            # retarget = the republished region above; the reactive node re-computes on its worker.
-            self._mark_dirty()
-            card.set_status(f"ROI -> {row.node.title}", error=False)
-            return
-        self._remove_panel_analysis(card)                               # was a fit node (fit <-> roi exclusive)
-        from ..neutral_atom.operations.signal_expr import DEFAULT_SOURCE
-        cfg = LogicNodeConfig(
-            kind="processor", name=ROI_SPEC_NAME,
-            title=self._analysis_node_title(card, "ROI"),
-            values={"source": {"inputs": [signal], "source": DEFAULT_SOURCE},
-                    "region": region_name})
-        new_row = self._add_logic_node(cfg, focus=False)   # stay on the Monitor board -- no tab jump
-        self._panel_analysis[id(card)] = new_row
-        self._start_logic_node(new_row)
-        started = self._logic_nodes.get(id(new_row)) is not None
-        card.set_status(f"ROI -> {cfg.title}" + ("" if started else " (start failed -- see Logic tab)"),
-                        error=not started)
+        if signal:
+            try:
+                self.hub.schema(signal)
+            except KeyError:
+                card.set_status("ROI source has no registered signal schema", error=True)
+                return
+        reduce = str(card.config.params.get("roi_reduce") or "mean")
+        self._apply_panel_analysis(card, action="roi", selection=selection,
+                                   extra_values={"reduce": reduce}, node_params={"reduce": reduce})
 
     def _edit_logic_node(self, row: "LogicNodeRow") -> None:
         """Open (or focus) a logic node's OWN closable Edit tab (param form + Start/Stop)."""
@@ -8567,11 +8621,9 @@ class TaskConsole(QtWidgets.QWidget):
             editor.deleteLater()
         self._logic_nodes.pop(id(row), None)
         self._last_node.pop(id(row), None)
-        # Drop any per-panel analysis handle pointing at this row -- so a panel whose ROI/fit row is
-        # removed by hand (or by _remove_panel_analysis) re-creates a fresh node on the next drag
-        # instead of retargeting a dead handle (#3 ownership stays exact).
-        for card_id in [cid for cid, r in self._panel_analysis.items() if r is row]:
-            self._panel_analysis.pop(card_id, None)
+        # (No per-panel handle to drop: the panel<->analysis association is DERIVED from the row's
+        # values['region'] vs the panel's persisted region_signal -- removing the row derives None,
+        # and the next drag creates a fresh row consuming the SAME persisted region name.)
         if row in self.logic_nodes:
             self.logic_nodes.remove(row)
         self.logic_layout.removeWidget(row)

@@ -30,14 +30,10 @@ from typing import Mapping
 import numpy as np
 
 from ...core.fitting import FitRequest, FitResult, fit_data, fit_image, fit_model
-from ...core.params import ParamDecl
-from ..logic import FRAME_0, SignalSpec
-from ..processor import ProcessorSpec
-from ..processor_registry import processor
+from ..logic import SignalSpec
 from ._region import RegionProcessor
 
 
-FIT_SPEC_NAME = "Frame fit"
 FIT_STATUS_INVALID = np.int8(0)
 FIT_STATUS_OK = np.int8(1)
 
@@ -80,13 +76,18 @@ class FitProcessor(RegionProcessor):
     #: request's model so ``output_keys`` / ``_bare_output_specs`` / ``provides`` are one source.
     provides = _provided_keys(_DEFAULT_MODEL)
 
-    def __init__(self, hub, *, source_expr=None, region=None, fit_request=None, prefix: str = ""):
-        # Set the request BEFORE super().__init__: the base's self-loop guard calls output_keys() ->
-        # fit_request, so the model must be known before the LogicNode chain runs.
+    def __init__(self, hub, *, source_expr=None, region=None, selection=None,
+                 fit_request=None, prefix: str = ""):
+        self._init_fit_state(fit_request)
+        super().__init__(hub, source_expr=source_expr, region=region, selection=selection, prefix=prefix)
+
+    def _init_fit_state(self, fit_request) -> None:
+        """Seed the fit half's state (shared verbatim by AnalysisProcessor, whose merged __init__
+        cannot run this class's __init__ chain).  Runs BEFORE the LogicNode __init__ chain: the base's
+        self-loop guard calls output_keys() -> fit_request, so the model must be known first."""
         self._request_lock = Lock()
         self._fit_request = _request(fit_request)
         self.last_results: tuple[FitResult, ...] = ()
-        super().__init__(hub, source_expr=source_expr, region=region, prefix=prefix)
 
     @property
     def fit_request(self) -> FitRequest:
@@ -167,13 +168,13 @@ class FitProcessor(RegionProcessor):
     def _fit_2d(self, block, request, model) -> dict[str, object]:
         """Fit the 2-D image model to EVERY valid ``(R,P)`` image cell (``fit_image``)."""
         if not self._input_tensors:
-            raise ValueError("Frame fit requires a registered canonical image source.")
+            raise ValueError("a 2-D fit requires a registered canonical image source.")
         tensor = next(iter(self._input_tensors.values()))
         schema = tensor.schema
         if len(schema.data_shape) != 2 or tuple(schema.data_shape) != tuple(block.shape[2:]) \
                 or block.ndim != 4 or tuple(block.shape[:2]) != tuple(tensor.valid.shape):
             raise ValueError(
-                "Frame fit requires a canonical (R,P,H,W) image with schema data_shape=(H,W); "
+                "a 2-D fit requires a canonical (R,P,H,W) image with schema data_shape=(H,W); "
                 f"got shape {block.shape}, data_shape={schema.data_shape}.")
         input_valid = np.asarray(tensor.valid, dtype=bool)
         shape = (*block.shape[:2], 1)
@@ -274,38 +275,9 @@ class FitProcessor(RegionProcessor):
         )
 
 
-@processor(order=26)
-def frame_fit(readout) -> ProcessorSpec:
-    """Fit the request's model (2-D image centre / 1-D peak / hist) to a per-panel region, on the worker."""
-
-    default_request = FitRequest(_DEFAULT_MODEL).to_dict()
-    params = (
-        ParamDecl("source", "Fit source", "signal_expr",
-                  default={"inputs": [FRAME_0], "source": "value = signal"},
-                  tooltip="One registered signal to fit (an image frame, a 1-D curve, a distribution)."),
-        ParamDecl("fit_request", "Fit request", "json", default=default_request,
-                  tooltip="Structured FitRequest shared with the plot selector.", display=False),
-        # The per-panel region CONTROL signal the node consumes (drawn selection + bins).  Injected by
-        # the console when it creates the node; not a user-facing form field.
-        ParamDecl("region", "Region signal", "text", default="", display=False,
-                  tooltip="The per-panel <slug>_region hub signal carrying the drawn selection + bins."),
-    )
-
-    def make_node(hub, *, prefix: str = "", **values):
-        return FitProcessor(
-            hub, source_expr=values.get("source"), region=values.get("region"),
-            fit_request=values.get("fit_request"), prefix=prefix)
-
-    return ProcessorSpec(
-        name=FIT_SPEC_NAME,
-        params=params,
-        make_node=make_node,
-        result_keys=FitProcessor.provides,
-        default_kind="monitor",
-        default_value_key="fit_x0",   # the default ``center`` model's fitted centre x
-    )
-
+# The fit catalog entry lives in processors/analysis.py: the ONE "Analysis" spec whose ``action``
+# choice dispatches to this class as its fit strategy.  This module owns only the compute.
 
 __all__ = [
-    "FIT_SPEC_NAME", "FIT_STATUS_INVALID", "FIT_STATUS_OK", "FitProcessor", "frame_fit",
+    "FIT_STATUS_INVALID", "FIT_STATUS_OK", "FitProcessor",
 ]

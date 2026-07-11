@@ -28,9 +28,9 @@ if sys.path[0] != str(REPO_ROOT):
 
 from Zou_lab_control.frontend.live import (
     PLOT_KINDS, ROI_KINDS, coerce_panel_value, kind_supports_roi, region_binding)
-from Zou_lab_control.neutral_atom.core.selection import Selection, encode_region
+from Zou_lab_control.neutral_atom.core.selection import Selection, region_tensor
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
-from Zou_lab_control.neutral_atom.core.signal_tensor import SignalSchema, SignalTensor
+from Zou_lab_control.neutral_atom.core.signal_tensor import SignalSchema
 from Zou_lab_control.neutral_atom.operations.processors.roi import RoiProcessor
 
 
@@ -42,12 +42,9 @@ def _roi_value(block, bound):
         point_shape=(block.shape[1],), data_shape=block.shape[2:], dtype=block.dtype,
         repeat_capacity=block.shape[0]))
     hub.publish({"s": block})
-    values, metadata = encode_region(bound)
-    rows = int(values.shape[0])
-    rschema = SignalSchema(point_shape=(1,), data_shape=(rows, 2), dtype=np.float64,
-                           repeat_capacity=1, label="region", metadata=metadata)
-    hub.register_signal("s_region", rschema)
-    hub.publish({"s_region": SignalTensor(values.reshape(1, 1, rows, 2), rschema)})
+    tensor = region_tensor(bound)
+    hub.register_signal("s_region", tensor.schema)
+    hub.publish({"s_region": tensor})
     node = RoiProcessor(hub, source_expr={"inputs": ["s"], "source": "value = signal"},
                         region="s_region", reduce="mean")
     hub.publish({"s": block})

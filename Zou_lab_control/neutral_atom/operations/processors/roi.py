@@ -31,11 +31,8 @@ import warnings
 
 import numpy as np
 
-from ...core.params import ParamDecl
 from ...core.signal_tensor import SignalTensor
 from ..logic import IMAGE_STREAM_HISTORY, SignalSpec
-from ..processor import ProcessorSpec
-from ..processor_registry import processor
 from ._region import RegionProcessor
 
 #: The reduce verbs an ROI offers, in dropdown order -- ONE source for the node's dispatch, the
@@ -52,14 +49,20 @@ class RoiProcessor(RegionProcessor):
 
     provides = ("roi_frame", "roi_value")
 
-    def __init__(self, hub, *, source_expr=None, region=None, reduce: str = "mean", prefix: str = ""):
-        super().__init__(hub, source_expr=source_expr, region=region, prefix=prefix)
+    def __init__(self, hub, *, source_expr=None, region=None, selection=None,
+                 reduce: str = "mean", prefix: str = ""):
+        super().__init__(hub, source_expr=source_expr, region=region, selection=selection, prefix=prefix)
         if str(reduce) not in ROI_REDUCERS:
             raise ValueError(f"ROI reduce must be one of {tuple(ROI_REDUCERS)}; got {reduce!r}.")
         self.reduce = str(reduce)
-        # Output shapes are learned from the first block (and re-learned on a retarget, which the hub
-        # accepts because THIS node owns the schema -- replace=True).  Seed sensible whole-frame
-        # defaults from the source schema so the output specs are valid before any frame arrives.
+        self._init_roi_state(hub)
+
+    def _init_roi_state(self, hub) -> None:
+        """Seed the roi half's output-shape state (shared verbatim by AnalysisProcessor, whose merged
+        __init__ cannot run this class's __init__ chain).  Output shapes are learned from the first
+        block (and re-learned on a retarget, which the hub accepts because THIS node owns the schema --
+        replace=True); whole-frame defaults come from the source schema so the output specs are valid
+        before any frame arrives."""
         self._source_schema = None
         self._roi_frame_point: tuple[int, ...] = (1,)
         self._roi_frame_data: tuple[int, ...] = (1,)
@@ -255,44 +258,5 @@ class RoiProcessor(RegionProcessor):
         )
 
 
-#: The catalog/spec display name -- the ONE string a caller that creates a ROI row
-#: programmatically (the console's draw-a-box-on-a-live-panel gesture) resolves the spec by.
-ROI_SPEC_NAME = "ROI crop"
-
-
-@processor(order=25)
-def roi(readout) -> ProcessorSpec:
-    """Reduce a region of a live block to one scalar per shot + republish the region."""
-
-    from ..logic import FRAME_0
-
-    params = (
-        ParamDecl("source", "Signal source", "signal_expr",
-                  default={"inputs": [FRAME_0], "source": "value = signal"},
-                  tooltip="The block to reduce a region of (a camera frame, a 1-D scan curve, a "
-                          "distribution's samples, a site-map vector).  Draw a rectangle / range on a "
-                          "panel showing this node's output to set the region."),
-        ParamDecl("reduce", "Reduce", "choice", default="mean", choices=tuple(ROI_REDUCERS),
-                  tooltip="How roi_value collapses the selected cells each shot: mean / sum "
-                          "(total counts, e.g. a MOT loss signal) / max."),
-        # The per-panel region CONTROL signal the node consumes (the drawn Selection).  Injected by the
-        # console when it creates the node from a drag; not a user-facing form field.
-        ParamDecl("region", "Region signal", "text", default="", display=False,
-                  tooltip="The per-panel <slug>_region hub signal carrying the drawn selection."),
-    )
-
-    def make_node(hub, *, prefix: str = "", **values):
-        return RoiProcessor(
-            hub, source_expr=values.get("source"),
-            region=values.get("region"),
-            reduce=str(values.get("reduce", "mean") or "mean"),
-            prefix=prefix)
-
-    return ProcessorSpec(
-        name=ROI_SPEC_NAME,
-        params=params,
-        make_node=make_node,
-        # SINGLE SOURCE: the published keys live once on the node class (its ``provides``).
-        result_keys=RoiProcessor.provides,
-        default_kind="2d",               # the region itself is the natural first view
-    )
+# The ROI catalog entry lives in processors/analysis.py: the ONE "Analysis" spec whose ``action``
+# choice dispatches to this class as its roi strategy.  This module owns only the compute.

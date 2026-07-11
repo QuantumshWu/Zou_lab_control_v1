@@ -12,9 +12,8 @@ import numpy as np
 from Zou_lab_control._readout_math import gaussian2d_center
 from Zou_lab_control.neutral_atom.core.fitting import FitRequest, fit_image
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
-from Zou_lab_control.neutral_atom.operations.processors.fit import (
-    FIT_SPEC_NAME, FitProcessor)
-from Zou_lab_control.neutral_atom.operations.processors.roi import ROI_SPEC_NAME
+from Zou_lab_control.neutral_atom.operations.processors.analysis import ANALYSIS_SPEC_NAME
+from Zou_lab_control.neutral_atom.operations.processors.fit import FitProcessor
 
 from conftest import add_logic_row, make_console, tick
 
@@ -80,7 +79,7 @@ def test_explicit_roi_action_creates_then_retargets_a_roi_node():
         con._on_panel_area_select(card, Selection.rectangle(100.0, 400.0, 50.0, 250.0))
         assert len(con.logic_nodes) == n_rows + 1                       # one ROI row created...
         roi_row = con.logic_nodes[-1]
-        assert roi_row.node.name == ROI_SPEC_NAME
+        assert roi_row.node.name == ANALYSIS_SPEC_NAME
         roi_node = con._logic_nodes.get(id(roi_row))
         assert roi_node is not None                                     # ...and STARTED
         node.step(); roi_node.step()
@@ -127,7 +126,7 @@ def test_selector_wiring_converts_axis_coords_to_the_frames_own_pixels():
         src_card = _add_2d_panel(con, frame_sig, title="frame")
         src_card.config.params["selection_action"] = "roi"
         con._on_panel_area_select(src_card, Selection.rectangle(100.0, 400.0, 50.0, 250.0))
-        roi = con._logic_nodes[id(con._panel_analysis[id(src_card)])]
+        roi = con._logic_nodes[id(con._panel_analysis_row(src_card))]
         cam.step(); roi.step()                    # roi_frame on the hub, region consumed
         crop_sig = [s for s in roi.published_signals() if s.endswith("roi_frame")][0]
 
@@ -145,7 +144,7 @@ def test_selector_wiring_converts_axis_coords_to_the_frames_own_pixels():
 
         area.range = [150.0, 200.0, 80.0, 120.0]             # AXIS coords on the crop's panel
         area._call()                                          # the selector's own release dispatch
-        nested = con._logic_nodes[id(con._panel_analysis[id(card)])]
+        nested = con._logic_nodes[id(con._panel_analysis_row(card))]
         cam.step(); roi.step(); nested.step()
         crop = con.hub.latest([s for s in nested.published_signals()
                                if s.endswith("roi_frame")][0])
@@ -201,7 +200,7 @@ def test_stop_start_same_signal_keeps_plotter_view_and_selector():
         area = card.plotter.fig._zlc_tools.area
         area.range = [400.0, 900.0, 200.0, 700.0]
         area._call()                                   # real release dispatch -> per-panel ROI node
-        roi = con._logic_nodes[id(con._panel_analysis[id(card)])]
+        roi = con._logic_nodes[id(con._panel_analysis_row(card))]
         cam.step(); roi.step()
         tick(con)
         plotter = card.plotter
@@ -245,8 +244,8 @@ def test_two_panels_on_one_source_get_distinct_per_panel_analysis_nodes():
         con._on_panel_area_select(card_a, Selection.rectangle(100.0, 400.0, 50.0, 250.0))
         con._on_panel_area_select(card_b, Selection.rectangle(0.0, 60.0, 0.0, 40.0))
 
-        row_a = con._panel_analysis[id(card_a)]
-        row_b = con._panel_analysis[id(card_b)]
+        row_a = con._panel_analysis_row(card_a)
+        row_b = con._panel_analysis_row(card_b)
         assert row_a is not row_b                       # TWO distinct nodes, one per panel
         node_a = con._logic_nodes[id(row_a)]
         node_b = con._logic_nodes[id(row_b)]
@@ -280,17 +279,17 @@ def test_per_panel_teardown_removes_only_that_panels_node():
         card_b.config.params["selection_action"] = "roi"
         con._on_panel_area_select(card_a, Selection.rectangle(100.0, 400.0, 50.0, 250.0))
         con._on_panel_area_select(card_b, Selection.rectangle(0.0, 60.0, 0.0, 40.0))
-        row_a, row_b = con._panel_analysis[id(card_a)], con._panel_analysis[id(card_b)]
+        row_a, row_b = con._panel_analysis_row(card_a), con._panel_analysis_row(card_b)
 
         # clear ONLY panel A's analysis
         card_a.selection_clear_sink(card_a, "roi")
-        assert id(card_a) not in con._panel_analysis and row_a not in con.logic_nodes
-        assert con._panel_analysis.get(id(card_b)) is row_b and row_b in con.logic_nodes  # B survives
+        assert con._panel_analysis_row(card_a) is None and row_a not in con.logic_nodes
+        assert con._panel_analysis_row(card_b) is row_b and row_b in con.logic_nodes  # B survives
 
         # turning panel B's Selectors switch OFF tears B's node down (symmetric, ROI included)
         card_b.set_selectors_enabled(True)
         card_b.set_selectors_enabled(False)
-        assert id(card_b) not in con._panel_analysis and row_b not in con.logic_nodes
+        assert con._panel_analysis_row(card_b) is None and row_b not in con.logic_nodes
     finally:
         con.shutdown()
         exp.close()
@@ -316,8 +315,8 @@ def test_one_source_one_panel_fits_another_rois_distinct_nodes():
         roi_card.config.params["selection_action"] = "roi"
         con._on_panel_area_select(roi_card, Selection.rectangle(100.0, 400.0, 50.0, 250.0))
 
-        fit_node = con._logic_nodes[id(con._panel_analysis[id(fit_card)])]
-        roi_node = con._logic_nodes[id(con._panel_analysis[id(roi_card)])]
+        fit_node = con._logic_nodes[id(con._panel_analysis_row(fit_card))]
+        roi_node = con._logic_nodes[id(con._panel_analysis_row(roi_card))]
         assert isinstance(fit_node, FitProcessor) and isinstance(roi_node, RoiProcessor)
         fit_outs = set(fit_node.published_signals())
         roi_outs = set(roi_node.published_signals())
@@ -341,10 +340,10 @@ def test_removing_a_panel_removes_its_analysis_node():
         card = _add_2d_panel(con, sig, title="Panel A")
         card.config.params["selection_action"] = "roi"
         con._on_panel_area_select(card, Selection.rectangle(100.0, 400.0, 50.0, 250.0))
-        row = con._panel_analysis[id(card)]
+        row = con._panel_analysis_row(card)
         assert row in con.logic_nodes
         con._remove_panel(card)
-        assert id(card) not in con._panel_analysis and row not in con.logic_nodes
+        assert con._panel_analysis_row(card) is None and row not in con.logic_nodes
     finally:
         con.shutdown()
         exp.close()
@@ -356,6 +355,7 @@ def test_fit_center_spec_is_registered():
     exp = na.connect("virtual")
     try:
         names = {spec.name for spec in discovered_processor_specs(exp.readout)}
-        assert FIT_SPEC_NAME in names and ROI_SPEC_NAME in names
+        assert ANALYSIS_SPEC_NAME in names
+        assert "Frame fit" not in names and "ROI crop" not in names
     finally:
         exp.close()

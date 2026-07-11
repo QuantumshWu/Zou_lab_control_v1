@@ -21,24 +21,19 @@ if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
 from Zou_lab_control.neutral_atom.core.selection import (
-    Selection, axis_crop_binding, decode_region, encode_region, scatter_mask_binding, value_mask_binding)
+    Selection, axis_crop_binding, decode_region, encode_region, region_tensor,
+    scatter_mask_binding, value_mask_binding)
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
-from Zou_lab_control.neutral_atom.core.signal_tensor import SignalSchema, SignalTensor
+from Zou_lab_control.neutral_atom.core.signal_tensor import SignalSchema
 from Zou_lab_control.neutral_atom.operations.processors.roi import ROI_REDUCERS, RoiProcessor
 
 
 def _publish_region(hub, name, selection, *, bins=None):
-    """Publish a per-panel region signal the console produces from a drag (encode_region)."""
-    values, metadata = encode_region(selection, bins=bins)
-    rows = int(values.shape[0])
-    schema = SignalSchema(point_shape=(1,), data_shape=(rows, 2), dtype=np.float64,
-                          repeat_capacity=1, label="region", metadata=metadata)
-    try:
-        replace = not hub.schema(name).same_definition(schema)
-    except KeyError:
-        replace = False
-    hub.register_signal(name, schema, replace=replace)
-    hub.publish({name: SignalTensor(values.reshape(1, 1, rows, 2), schema)})
+    """Publish a per-panel region signal the console produces from a drag -- region_tensor is the ONE
+    publisher payload (byte-stable schema, so a republish never needs replace)."""
+    tensor = region_tensor(selection, bins=bins)
+    hub.register_signal(name, tensor.schema)
+    hub.publish({name: tensor})
     return name
 
 
@@ -179,7 +174,7 @@ def test_roi_region_signal_round_trips_the_selection():
     back the identical Selection, and a fresh node consuming it reproduces the crop + its pixel region."""
     hub = _hub_with("frame_0", _frame_block())
     sel = _image_selection(30, 40, 10, 20)
-    restored = decode_region(*encode_region(sel))
+    restored = decode_region(encode_region(sel))
     assert restored.bounds("x") == (30.0, 40.0) and restored.bounds("y") == (10.0, 20.0)
     assert restored.metadata["binding"]["mode"] == "axis-crop"
     node = _region_roi(hub, "frame_0", sel, reduce="sum")
@@ -190,11 +185,12 @@ def test_roi_region_signal_round_trips_the_selection():
     assert node.region_name == "frame_0_region" and "frame_0_region" in node.consumes
 
 
-def test_roi_registered_in_processor_catalog():
+def test_analysis_registered_in_processor_catalog():
     from Zou_lab_control.neutral_atom.operations.processor_registry import discovered_processor_specs
 
     class _Readout:                                        # the factory only needs an object handle
         current = None
 
     names = {spec.name for spec in discovered_processor_specs(_Readout())}
-    assert "ROI crop" in names
+    assert "Analysis" in names
+    assert "ROI crop" not in names and "Frame fit" not in names

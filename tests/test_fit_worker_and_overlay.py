@@ -28,19 +28,16 @@ if sys.path[0] != str(REPO_ROOT):
 from Zou_lab_control._readout_math import gaussian2d_center
 from Zou_lab_control.neutral_atom.core.fitting import FitRequest, FitResult, fit_model
 from Zou_lab_control.neutral_atom.core.selection import (
-    Selection, axis_crop_binding, encode_region, value_mask_binding)
+    Selection, axis_crop_binding, region_tensor, value_mask_binding)
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
-from Zou_lab_control.neutral_atom.core.signal_tensor import SignalSchema, SignalTensor
+from Zou_lab_control.neutral_atom.core.signal_tensor import SignalSchema
 from Zou_lab_control.neutral_atom.operations.processors.fit import FitProcessor
 
 
 def _publish_region(hub, name, selection, *, bins=None):
-    values, metadata = encode_region(selection, bins=bins)
-    rows = int(values.shape[0])
-    schema = SignalSchema(point_shape=(1,), data_shape=(rows, 2), dtype=np.float64,
-                          repeat_capacity=1, label="region", metadata=metadata)
-    hub.register_signal(name, schema)
-    hub.publish({name: SignalTensor(values.reshape(1, 1, rows, 2), schema)})
+    tensor = region_tensor(selection, bins=bins)
+    hub.register_signal(name, tensor.schema)
+    hub.publish({name: tensor})
 
 
 def _hub_with(name, block):

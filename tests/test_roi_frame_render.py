@@ -30,9 +30,9 @@ if sys.path[0] != str(REPO_ROOT):
 
 from Zou_lab_control.frontend.live import Live2DDis, _image_axes_px_budget, panel_plot_spec
 from Zou_lab_control.neutral_atom.core.raster import RegularRaster
-from Zou_lab_control.neutral_atom.core.selection import Selection, encode_region, value_mask_binding
+from Zou_lab_control.neutral_atom.core.selection import Selection, region_tensor, value_mask_binding
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
-from Zou_lab_control.neutral_atom.core.signal_tensor import SignalSchema, SignalTensor
+from Zou_lab_control.neutral_atom.core.signal_tensor import SignalSchema
 from Zou_lab_control.neutral_atom.operations.processors.roi import RoiProcessor
 
 # A frame just ABOVE the display sample cap (Live2DDis._DIST_SAMPLE_CAP = 200_000) so the colour-limit
@@ -58,11 +58,9 @@ def _value_mask_roi_frame(frame, lo, hi):
         point_shape=(1,), data_shape=frame.shape, dtype=block.dtype, repeat_capacity=1))
     hub.publish({"frame_0": block})
     sel = Selection.value(lo, hi, metadata={"binding": value_mask_binding()})
-    values, meta = encode_region(sel)
-    rschema = SignalSchema(point_shape=(1,), data_shape=(1, 2), dtype=np.float64,
-                           repeat_capacity=1, metadata=meta)
-    hub.register_signal("frame_0_region", rschema)
-    hub.publish({"frame_0_region": SignalTensor(values.reshape(1, 1, 1, 2), rschema)})
+    tensor = region_tensor(sel)
+    hub.register_signal("frame_0_region", tensor.schema)
+    hub.publish({"frame_0_region": tensor})
     node = RoiProcessor(hub, source_expr={"inputs": ["frame_0"], "source": "value = signal"},
                         region="frame_0_region")
     hub.publish({"frame_0": block})

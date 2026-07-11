@@ -30,8 +30,12 @@ def test_console_rejects_an_indirect_reactive_ring():
     exp = na.connect("virtual")
     con = make_console(exp)
     try:
-        row_a = add_logic_row(con, ("processor", "ROI crop"))
-        row_b = add_logic_row(con, ("processor", "Frame fit"))
+        row_a = add_logic_row(con, ("processor", "Analysis"))
+        row_b = add_logic_row(con, ("processor", "Analysis"))
+        # row_b runs the FIT action so the two rows' declared outputs differ (the declared_keys
+        # deriver reads values['action'] -- roi publishes roi_*, fit publishes fit_*).
+        con._logic_editors[id(row_b)].form.seed_values({"action": "fit"})
+        row_b.node.values = {**dict(row_b.node.values or {}), "action": "fit"}
         a_out = [k for k in con._declared_signal_keys(row_a) if k.endswith("roi_frame")][0]
         b_out = con._declared_signal_keys(row_b)[0]
         assert a_out != b_out
@@ -53,7 +57,7 @@ def test_processor_source_picker_excludes_own_outputs():
     exp = na.connect("virtual")
     con = make_console(exp)
     try:
-        row = add_logic_row(con, ("processor", "ROI crop"))
+        row = add_logic_row(con, ("processor", "Analysis"))
         editor = con._logic_editors[id(row)]
         own = set(con._declared_signal_keys(row))
         offered = set(editor.form._signals_provider())

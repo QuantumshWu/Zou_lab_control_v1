@@ -339,7 +339,7 @@ mot = exp2.capture(camera="monitor_camera", frames=1, display=True)
 task_console 里看图：`task_console.bat --config basler_monitor` 启动，
 Add Panel → Measurement → **Camera (live frames)**，把 `Camera` 下拉切到
 `monitor_camera`，Start——2d 面板实时显示 Basler 图像。在 2d 面板上打开
-Selectors、Analysis 选 ROI，围着 MOT 光斑框一个矩形——自动建一条 **ROI crop**
+Selectors、Analysis 选 ROI，围着 MOT 光斑框一个矩形——自动建一条 **Analysis** (ROI)
 行并发布 `<面板名>_roi_value` 标量，绑到 Rolling trace 就是 MOT 亮度实时曲线；
 扫线圈找最优磁场用 **Optimize MOT field** task（见 device manual"第二只相机"一章）。
 

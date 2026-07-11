@@ -36,7 +36,7 @@ class RegionProcessor(Processor):
     Subclasses implement :meth:`transform` using :meth:`current_region` (the latest
     :class:`Selection`) and :meth:`current_region_bins` (the panel's bins, for a hist fit)."""
 
-    def __init__(self, hub, *, source_expr=None, region=None, prefix: str = ""):
+    def __init__(self, hub, *, source_expr=None, region=None, selection=None, prefix: str = ""):
         expr = source_expr if isinstance(source_expr, SignalExpr) else SignalExpr.from_value(source_expr)
         if not expr.inputs:
             expr = SignalExpr([FRAME_0], DEFAULT_SOURCE)
@@ -50,20 +50,29 @@ class RegionProcessor(Processor):
         # source-only coherent subscription.
         self._input_subscription = self.hub.signal_cursors(self.source_names)
         self._last_source_provenance = NO_LINEAGE
-        # Seed the region from its LATEST value (the drag published it BEFORE this node was created),
-        # then subscribe for later re-drags.  Empty until a region exists -> the whole-frame default.
+        # The region: (a) a REGION SIGNAL (the console's drag path) -- seed from its LATEST value (the
+        # drag published it BEFORE this node was created), then subscribe for later re-drags; (b) an
+        # INLINE Selection (the manual catalog form's typed bounds -- no hub signal, fixed for the
+        # node's life); (c) neither -> the empty selection = the whole-frame default.
         self._region: Selection = Selection()
         self._region_bins: int | None = None
         self._region_subscription = None
         if self.region_name:
-            try:
-                tensor = self.hub.latest_tensor(self.region_name)
-            except KeyError:
-                tensor = None
-            if tensor is not None and tensor.version:
-                self._region = decode_region(tensor.data, tensor.schema.metadata)
-                self._region_bins = region_bins(tensor.schema.metadata)
+            self._seed_region_from_hub()
             self._region_subscription = self.hub.signal_cursors((self.region_name,))
+        elif selection is not None:
+            self._region = selection if isinstance(selection, Selection) else Selection.from_dict(selection)
+            self._region_bins = region_bins(self._region)
+
+    def _seed_region_from_hub(self) -> None:
+        """Adopt the region signal's LATEST value (also the gap self-heal re-seed)."""
+        try:
+            tensor = self.hub.latest_tensor(self.region_name)
+        except KeyError:
+            return
+        if tensor is not None and tensor.version:
+            self._region = decode_region(tensor.data)
+            self._region_bins = region_bins(self._region)
 
     # ------------------------------------------------------------------ region access
     def current_region(self) -> Selection:
@@ -77,19 +86,31 @@ class RegionProcessor(Processor):
 
     def _drain_region(self) -> bool:
         """Advance the region cursor to its LATEST published value (latest-wins).  Returns whether the
-        region moved this pass."""
+        region moved this pass.
+
+        SELF-HEALING on :class:`SignalHistoryGap` (the journal was overrun, or the signal was
+        removed/recreated under this subscription): the region is a latest-wins CONTROL input, so a
+        gap is never an error here -- re-seed from the signal's current latest value and open a fresh
+        subscription.  Without this the gap would propagate out of ``shot()`` into the worker's error
+        backoff loop and freeze the node forever."""
         if not self.region_name or self._region_subscription is None:
             return False
+        from ...core.signal_tensor import SignalHistoryGap
         moved = False
         while True:
-            update = self.hub.next_coherent_update(
-                (self.region_name,), self._region_subscription, timeout=0)
+            try:
+                update = self.hub.next_coherent_update(
+                    (self.region_name,), self._region_subscription, timeout=0)
+            except SignalHistoryGap:
+                self._seed_region_from_hub()                   # latest-wins: adopt whatever is current
+                self._region_subscription = self.hub.signal_cursors((self.region_name,))
+                return True
             if update is None:
                 break
             self._region_subscription = update.cursors
             tensor = update.tensors[self.region_name]
-            self._region = decode_region(tensor.data, tensor.schema.metadata)
-            self._region_bins = region_bins(tensor.schema.metadata)
+            self._region = decode_region(tensor.data)
+            self._region_bins = region_bins(self._region)
             moved = True
         return moved
 

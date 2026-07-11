@@ -9,7 +9,7 @@ optimum is the argmax refined by a local centre-of-mass; the report (a facet gri
 never imports frontend.*).
 
 For a MANUAL sweep with live plots, start a Camera measurement on ``monitor_camera``, draw a box
-around the MOT spot on its 2d panel (the drag creates a per-panel "ROI crop" row publishing
+around the MOT spot on its 2d panel (the drag creates a per-panel "Analysis" (ROI) row publishing
 ``<slug>_roi_value``), then run generic PulseScan with y bound to that scalar.  PulseScan still owns
 only the sequencer.  This task is the batch/one-click sibling.
 """

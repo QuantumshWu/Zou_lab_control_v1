@@ -26,7 +26,7 @@ from Zou_lab_control.frontend.live import Live2DDis, apply_fit_to_figure
 from Zou_lab_control.neutral_atom.core.fitting import FitRequest, fit_model
 from Zou_lab_control.neutral_atom.core.raster import RegularRaster
 from Zou_lab_control.neutral_atom.operations.processors.fit import (
-    FIT_SPEC_NAME, FitProcessor, _param_keys, _provided_keys)
+    FitProcessor, _param_keys, _provided_keys)
 
 
 def _image_plot(h=120, w=160):
@@ -67,6 +67,5 @@ def test_frame_fit_keys_derive_from_the_model_not_a_centre_layout():
         "fit_valid", "fit_rmse", "fit_r2", "fit_status", "fit_points"}
     # no hardwired centre-only 'fit_size' key survives the generic derivation
     assert "fit_size" not in FitProcessor.provides
-    # the spec + node label are type-agnostic (no longer named "center")
-    assert FIT_SPEC_NAME == "Frame fit"
+    # the node label is type-agnostic (never named after one model)
     assert "center" not in FitProcessor.node_label.lower()
