@@ -114,16 +114,19 @@ def test_processor_source_expression_gets_the_shared_helpers():
     """A reactive processor's source expression evaluates in the SAME helper namespace the help
     text promises (np/numpy/...): a numpy-using source works, it is not a silent no-op."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.operations.processors.mot_intensity import MotIntensityProcessor
+    from Zou_lab_control.neutral_atom.core.signal_tensor import SignalSchema
+    from Zou_lab_control.neutral_atom.operations.processors.roi import RoiProcessor
 
     hub = SignalHub()
     frame = np.zeros((24, 24), dtype=float)
     frame[10:14, 10:14] = 50.0                            # a bright square the ROI mean picks up
-    proc = MotIntensityProcessor(
+    hub.register_signal("f", SignalSchema(                # RoiProcessor requires a registered schema
+        point_shape=(1,), data_shape=(24, 24), dtype=frame.dtype, repeat_capacity=1))
+    proc = RoiProcessor(
         hub, source_expr={"inputs": ["f"], "source": "value = numpy.asarray(np.abs(signal))"})
     hub.publish({"f": frame})    # publish AFTER the processor subscribes at construction (reactive replay)
     out = proc.step()
-    assert "mot_intensity" in out                         # np AND the numpy alias both resolved
+    assert "roi_value" in out                             # np AND the numpy alias both resolved
 
 
 def test_occupancy_source_default_signal_expr_equals_single_frame_path():

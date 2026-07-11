@@ -31,7 +31,7 @@ def test_console_rejects_an_indirect_reactive_ring():
     con = make_console(exp)
     try:
         row_a = add_logic_row(con, ("processor", "ROI crop"))
-        row_b = add_logic_row(con, ("processor", "MOT intensity"))
+        row_b = add_logic_row(con, ("processor", "Frame fit"))
         a_out = [k for k in con._declared_signal_keys(row_a) if k.endswith("roi_frame")][0]
         b_out = con._declared_signal_keys(row_b)[0]
         assert a_out != b_out

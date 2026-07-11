@@ -1,10 +1,10 @@
 """MOT coil-field optimisation chain -- MECHANICAL contracts for every link.
 
 The chain: a pulse template with THREE named DAC scan slots -> one hardware table drives the coil
-buses as bit-channel pulses -> the monitor-camera measurement observes the fired levels -> the
-MOT-intensity processor publishes the scalar y consumed by Pulse Scan -> the 3-D tensor facets by
-its declared point shape.  The Optimize-MOT-field task uses the same scan-slot pulse semantics to
-find the optimum.  Each contract here pins one link so the whole chain cannot silently diverge:
+buses as bit-channel pulses -> the monitor-camera measurement observes the fired levels -> a
+2d-panel box drag creates a generic ROI crop row whose scalar y Pulse Scan consumes -> the 3-D
+tensor facets by its declared point shape.  The Optimize-MOT-field task uses the same scan-slot
+pulse semantics to find the optimum.  Each contract pins one link so the chain cannot diverge:
 
 * ``decode_analog_bus`` is the scan-slot resolver's inverse THROUGH the compiled artefact: resolving
   a DAC slot must bake the value into period states, or the virtual/real sequence would ignore it;
@@ -13,7 +13,7 @@ find the optimum.  Each contract here pins one link so the whole chain cannot si
 * the virtual monitor camera senses ONLY the sequence FIRED over its wired streamer (the
   ``sequencer`` construction parameter -- the simulated trigger cable); free-running (its
   ``Software`` default) it images the held/safe output state, never anyone's set-points;
-* the intensity primitive + processor shapes;
+* the intensity primitive (disc minus annulus -- the task's own math);
 * the hardware scan carries its declared ``scan_shape`` for generic tensor faceting;
 * the task converges on the SAME model the frames obey (no ground-truth peeking: the test talks
   to the public device model ``mot_efficiency``/``b0``, the task only ever sees frames).
@@ -35,11 +35,9 @@ if sys.path[0] != str(REPO_ROOT):
 
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
 from Zou_lab_control.neutral_atom.devices.registry import load_devices
-from Zou_lab_control.neutral_atom.operations.processors.mot_intensity import (
-    MotIntensityProcessor, mot_roi_intensity)
 from Zou_lab_control.neutral_atom.operations.measurement import triggered_frames
 from Zou_lab_control.neutral_atom.operations.tasks.mot_field import (
-    DEFAULT_MOT_TEMPLATE, OptimizeMotFieldTask)
+    DEFAULT_MOT_TEMPLATE, OptimizeMotFieldTask, mot_roi_intensity)
 from Zou_lab_control._clock import DEFAULT_CLOCK_HZ
 from Zou_lab_control.neutral_atom.timing import (
     BUS_SAFE_SIGNED_LEVEL, PulseTableState, resolve_fireable_template, single_imaging_template)
@@ -236,28 +234,6 @@ def test_mot_roi_intensity_is_disc_minus_annulus():
         mot_roi_intensity(np.zeros((2, 3, 4)), 1, 1, 1)  # not one (H, W) frame
 
 
-def test_mot_intensity_processor_preserves_every_repeat_point_cell():
-    """The processor maps canonical ``(R,P,H,W)`` to ``(R,P,1)`` without a node-level mode."""
-    assert MotIntensityProcessor.provides == ("mot_intensity",)
-    hub = SignalHub()
-    from Zou_lab_control.neutral_atom.core.signals import SignalSchema
-    hub.register_signal(
-        "frame_0",
-        SignalSchema(point_shape=(1,), data_shape=(32, 32), dtype=np.float64,
-                     repeat_capacity=2),
-    )
-    proc = MotIntensityProcessor(hub, source_expr={"inputs": ["frame_0"], "source": "value = signal"},
-                                 roi_radius=6.0)
-    frame = np.full((32, 32), 10.0)
-    hub.publish({"frame_0": np.stack([frame, frame])[:, None]})
-    proc.step()
-    block = hub.latest("mot_intensity")
-    assert block.shape == (2, 1, 1)
-    np.testing.assert_allclose(block, 0.0)             # flat frame: disc == annulus
-    with pytest.raises(ValueError):
-        proc.transform({"frame_0": np.zeros((2, 3, 4, 5, 6))})
-
-
 # --------------------------------------------------------------------------- hardware scan grid geometry
 def test_hardware_scan_carries_declared_scan_shape():
     """The semantic x/y/z hardware table carries its declared grid shape."""
@@ -451,13 +427,15 @@ def test_console_task_panel_is_a_live_facet_grid():
 
 # --------------------------------------------------------------------------- discovery
 def test_registries_discover_the_mot_chain():
-    """Console visibility: the task and processor are auto-discovered, while generic Pulse Scan
-    exposes the external y selector without owning a camera role."""
+    """Console visibility: the task is auto-discovered, while generic Pulse Scan exposes the
+    external y selector without owning a camera role.  The bespoke MOT-intensity processor is
+    GONE (its live-scalar role is the generic ROI crop chain; the optimiser's math lives on the
+    task) -- pinned so a stale copy cannot silently reappear in the catalog."""
     from Zou_lab_control import neutral_atom as na
     exp = na.connect("virtual")
     try:
         assert "Optimize MOT field" in {s.name for s in exp.readout.task_specs()}
-        assert "MOT intensity" in {s.name for s in exp.readout.processor_specs()}
+        assert "MOT intensity" not in {s.name for s in exp.readout.processor_specs()}
         spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
         assert not any(p.key == "camera" for p in spec.params)
         assert any(p.key == "y" for p in spec.params)

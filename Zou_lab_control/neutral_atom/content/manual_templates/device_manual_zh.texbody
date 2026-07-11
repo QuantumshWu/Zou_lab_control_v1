@@ -1065,11 +1065,11 @@ exp.capture(camera="monitor_camera", frames=1, display=True)  # notebook 直接�
 
 \subsection{MOT 光强：一条单源规则}
 
-MOT 亮度由 \pyapi{mot\_roi\_intensity} 单源定义。Live processor 读取 registered image \pyapi{SignalTensor=(R,P,H,W)}，对每个有效 cell 输出 canonical \pyapi{mot\_intensity=(R,P,1)}，保留 R/P 与 validity；一键 task 调同一个数学函数。
+MOT 亮度由 \pyapi{mot\_roi\_intensity} 单源定义（住在 \filepath{operations/tasks/mot\_field.py}，一键寻优 task 的内部数学）：圆形 ROI 内均值减去外环（$r..2r$）局部背景均值，环境光/相机 offset 漂移自然抵消。
 
-\subsection{手动扫：Camera measurement + processor + Pulse scan}
+\subsection{手动扫：Camera measurement + ROI 框选 + Pulse scan}
 
-先启动绑定 \pyapi{monitor\_camera} 的 Camera measurement，再启动消费其 \pyapi{frame\_0} 的 MOT-intensity processor；最后启动 PulseScan，y 选 \pyapi{mot\_intensity}。通用 PulseScan 支持 \pyapi{sweep\_kind=scan\_slot} 与 \pyapi{api\_slot}，但 MOT-field 模板的三条 DAC \tfocus{必须}绑定为有语义名的 hardware scan slots；因此这里选择 \pyapi{scan\_slot}，三维 \pyapi{program} 生成的 \pyapi{scan\_table}/\pyapi{point\_shape} 一次上传硬件。PulseScan 不采帧，只按 cursor 收集外部 y：
+先启动绑定 \pyapi{monitor\_camera} 的 Camera measurement；在其 2d 面板上打开 Selectors、Analysis 选 ROI，围着 MOT 光斑框一个矩形——控制台自动建一条 \tfocus{ROI crop} processor 行并发布该面板的 \pyapi{<slug>\_roi\_value} 标量（框内 mean/sum/max）；最后启动 PulseScan，y 选那个 \pyapi{roi\_value}。注意 ROI 的 mean/sum \tfocus{不做}外环背景扣除——环境光漂移会直接进 y；框选贴紧光斑、背景稳定时可忽略，需要严格背景扣除就用一键 task。通用 PulseScan 支持 \pyapi{sweep\_kind=scan\_slot} 与 \pyapi{api\_slot}，但 MOT-field 模板的三条 DAC \tfocus{必须}绑定为有语义名的 hardware scan slots；因此这里选择 \pyapi{scan\_slot}，三维 \pyapi{program} 生成的 \pyapi{scan\_table}/\pyapi{point\_shape} 一次上传硬件。PulseScan 不采帧，只按 cursor 收集外部 y：
 
 \begin{codeblock}[Python]
 import numpy as np
@@ -1090,7 +1090,7 @@ scan_shape = (len(a), len(b), len(c))  # program 输出；发布时写入 Signal
 \item task 报 "must expose exactly THREE dac scan slots"？——模板没把三路线圈绑定为 hardware scan slots；到 pulse GUI 把三个 DAC 单元格绑到三个有语义名字的 scan slots 后再保存。MOT-field 不接受 \pyapi{api\_slot} 策略。
 \item 扫描值被拒 "value must be between ..."？——DAC 码超出总线位宽的带符号范围（6 bit 即 $-32..31$）；网格取值要在范围内。
 \item 虚拟端 MOT 亮度不随扫描变化？——检查扫的是不是模板里真实绑定的那三个槽；\pyapi{VirtualMotCamera} 只认 fire 出去的序列里解码到的电平（\pyapi{snapshot()} 的 \pyapi{last\_levels} 可以直接看它感知到了什么）。
-\item 手动扫时 y 一直空？——先确认 Camera measurement 正在发布 \pyapi{frame\_0}，MOT intensity 的 source 指向它；Pulse scan 不发布 frame。
+\item 手动扫时 y 一直空？——先确认 Camera measurement 正在发布 \pyapi{frame\_0}，2d 面板确实框选出了 ROI crop 行（Logic 页应有 \tfocus{<面板名> ROI} 行在跑）；Pulse scan 不发布 frame。
 \end{itemize}
 \end{notebox}
 

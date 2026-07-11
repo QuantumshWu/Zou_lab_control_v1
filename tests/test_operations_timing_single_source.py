@@ -42,16 +42,15 @@ def test_default_frame_input_derives_from_camera_frame_keys():
     into a name), so a consumer default assuming a producer prefix would wait forever."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
     from Zou_lab_control.neutral_atom.operations.logic import FRAME_0, camera_frame_keys
-    from Zou_lab_control.neutral_atom.operations.processors.mot_intensity import (
-        MotIntensityProcessor, mot_intensity)
     from Zou_lab_control.neutral_atom.operations.processors.occupancy import judge_occupancy
+    from Zou_lab_control.neutral_atom.operations.processors.roi import RoiProcessor, roi
 
     assert FRAME_0 == camera_frame_keys(1)[0]          # derived, not a retyped literal
     # empty pick -> the node falls back to the ONE bare name (a publishable signal)
-    node = MotIntensityProcessor(SignalHub())
+    node = RoiProcessor(SignalHub())
     assert tuple(node.consumes) == (FRAME_0,)
     # both reactive processors' declared GUI defaults reference the same source
-    for factory in (mot_intensity, judge_occupancy):
+    for factory in (roi, judge_occupancy):
         spec = factory(object())                        # params need no live readout
         decl = next(p for p in spec.params if p.key == "source")
         assert decl.default["inputs"] == [FRAME_0], (

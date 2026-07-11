@@ -21,7 +21,7 @@ the inverse of ``coerce_panel_value``); it ships that knowledge as PLAIN DATA on
 ``metadata["binding"]``, so a drag on ANY panel kind writes the region back through the region signal,
 and ``neutral_atom`` never imports ``frontend``.
 
-Reactive and decoupled exactly like Judge occupancy / MOT intensity: it runs beside whatever
+Reactive and decoupled exactly like Judge occupancy: it runs beside whatever
 measurement publishes the block (virtual == real: only the data differ).
 """
 

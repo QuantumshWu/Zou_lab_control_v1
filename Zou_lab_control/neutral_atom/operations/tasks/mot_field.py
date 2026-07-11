@@ -3,16 +3,15 @@ optimum.
 
 The one-click flow uploads one 3-D (Bx, By, Bz) hardware scan table through the pulse template's
 three semantically named DAC scan slots, fires it once, and measures the resulting MONITOR-camera
-frames through the
-SAME :func:`~..processors.mot_intensity.mot_roi_intensity` primitive the live "MOT intensity"
-processor uses -- so the optimiser and the live view can never disagree.  The optimum is the
-argmax refined by a local centre-of-mass; the report (a facet grid of the Bz planes + the raw
-intensity block) lands in ``folder`` through the registered frontend plotter (this layer never
-imports frontend.*).
+frames through :func:`mot_roi_intensity` (defined here -- this task is its single consumer).  The
+optimum is the argmax refined by a local centre-of-mass; the report (a facet grid of the Bz planes
++ the raw intensity block) lands in ``folder`` through the registered frontend plotter (this layer
+never imports frontend.*).
 
-For a MANUAL sweep with live plots, start a Camera measurement on ``monitor_camera``, feed its
-frame into the "MOT intensity" processor, then run generic PulseScan with y bound to that scalar
-processor output.  PulseScan still owns only the sequencer.  This task is the batch/one-click sibling.
+For a MANUAL sweep with live plots, start a Camera measurement on ``monitor_camera``, draw a box
+around the MOT spot on its 2d panel (the drag creates a per-panel "ROI crop" row publishing
+``<slug>_roi_value``), then run generic PulseScan with y bound to that scalar.  PulseScan still owns
+only the sequencer.  This task is the batch/one-click sibling.
 """
 
 from __future__ import annotations
@@ -32,8 +31,25 @@ from ...timing import resolve_fireable_template, single_imaging_template
 from ..logic import SignalSpec, Task, TaskOutput
 from ..measurement import prepare_hardware_scan, program_completion_timeout
 from ..task import TaskSpec
-from ..processors.mot_intensity import mot_roi_intensity
 from ..task_registry import task
+
+
+def mot_roi_intensity(frame, cx: float, cy: float, radius: float) -> float:
+    """The ONE MOT-intensity rule: mean counts inside the circular ROI at ``(cx, cy)`` minus the
+    mean of the surrounding annulus (``radius``..``2*radius`` -- the local background), so the
+    number reads the MOT fluorescence itself, not the ambient/offset level."""
+    a = np.asarray(frame, dtype=float)
+    if a.ndim != 2:
+        raise ValueError(f"mot_roi_intensity takes one (H, W) frame; got shape {a.shape}.")
+    h, w = a.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    r2 = (xx - float(cx)) ** 2 + (yy - float(cy)) ** 2
+    disc = r2 <= float(radius) ** 2
+    ring = (r2 > float(radius) ** 2) & (r2 <= (2.0 * float(radius)) ** 2)
+    if not disc.any():
+        raise ValueError(f"the MOT ROI (cx={cx}, cy={cy}, r={radius}) lies outside the {h}x{w} frame.")
+    background = float(np.nanmean(a[ring])) if ring.any() else 0.0
+    return float(np.nanmean(a[disc]) - background)
 
 DEFAULT_MOT_TEMPLATE = "pulses/mot_field_template.json"
 MOT_SCAN_SLOTS = ("da_x", "da_y", "da_z")
