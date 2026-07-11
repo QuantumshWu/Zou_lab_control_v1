@@ -26,7 +26,7 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["Zou_lab_control*"]
+include = ["Zou_lab_control*", "zlc_data*", "zlc_storage*", "zlc_pulse*", "zlc_neutral_atom*", "zlc_frontend*", "zlc_workbench*"]
 
 [tool.setuptools.package-data]
 "Zou_lab_control.frontend" = ["assets/*.ttf", "templates/*.sty", "content/notebook_templates/*.cells.md", "content/manual_templates/*.texbody"]
