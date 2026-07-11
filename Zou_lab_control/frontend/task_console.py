@@ -5782,31 +5782,21 @@ class PanelEditor(QtWidgets.QWidget):
         return self._df
 
     def do_fit(self) -> None:
-        """Apply a curve fit from the Edit tab through the ONE card mutator, so the live overlay, the
-        hub node (a 2-D image fit), and the Setting popup's Analysis controls all follow the same
-        config.params['fit_request'] state -- then also draw the fit on THIS frozen snapshot."""
+        """Apply a curve fit from the Edit tab through the ONE card mutator, so the live overlay (a
+        DISPLAY of the per-panel FitProcessor node's published params), the hub node, and the Setting
+        popup's Analysis controls all follow the same config.params['fit_request'] state."""
         if self.fit_combo is None or self.card is None or not self.fit_combo.currentData():
             return
         selection = self.card.current_selection()
         request = self.card._build_fit_request_from_widgets(
             self.fit_combo, getattr(self, "ed_fix_seed", None), selection)
-        self.card.set_fit_request(request)                 # live overlay + hub node + Setting widgets
-        self._apply_fit_to_snapshot(request.to_dict())     # + this frozen Edit snapshot
-        self.status.setText(f"fit {self.fit_combo.currentText()}: {self.card._fit_result_text()}")
+        self.card.set_fit_request(request)                 # per-panel fit node + live overlay + Setting widgets
+        self.status.setText(f"fit {self.fit_combo.currentText()}: applied (see panel)")
 
     def clear_fit(self) -> None:
         if self.card is not None:
-            self.card.set_fit_request(None)                # clears live overlay + removes the hub node
-        self._apply_fit_to_snapshot(None)
+            self.card.set_fit_request(None)                # clears live overlay + removes the per-panel node
         self.status.setText("fit cleared")
-
-    def _apply_fit_to_snapshot(self, payload) -> None:
-        """Apply/clear the fit on THIS Edit page's frozen snapshot plotter (separate from the live one
-        the card mutator touches), then redraw the snapshot canvas."""
-        snap = getattr(self, "_plotter", None)
-        if snap is not None and snap.apply_param("fit_request", payload) \
-                and getattr(self, "_canvas", None) is not None:
-            self._canvas.draw_idle()
 
     def _on_edit_fit_model_changed(self, _index: int) -> None:
         if self.fit_combo is None:
@@ -6466,6 +6456,13 @@ class TaskConsole(QtWidgets.QWidget):
         # pivot on the card (the single fix for the old source-signal keying, which made every panel on one
         # source share -- and asymmetrically fail to tear down -- one node).
         self._panel_analysis: dict[int, "LogicNodeRow"] = {}
+        # id(card) -> the panel's ``<slug>_region`` hub signal name (the drawn Selection AS a signal).
+        # STABLE per panel: a re-drag republishes the SAME name, and the analysis node CONSUMES it, so a
+        # region is a real, reusable per-panel signal -- retarget is a republish, not a set_selection poke.
+        self._panel_region_name: dict[int, str] = {}
+        # id(card) -> the published version of its fit node's params last pushed to the overlay, so an
+        # unchanged fit re-draws nothing (the overlay is DISPLAY-only, driven by the node's publishes).
+        self._fit_overlay_pushed: dict[int, int] = {}
         self._building = False
         self._address: str | None = None
         # The folder the LAST panel "Save Fig" wrote into -- so a panel's Edit-tab save
@@ -7500,7 +7497,12 @@ class TaskConsole(QtWidgets.QWidget):
         # dropping frame_1/frame_2 from ``providers`` -> they are caught here (the eager purges in
         # _start/_remove_logic_node cover the rebuild / remove paths synchronously; THIS catches every
         # remaining path, switches included).
-        orphans = [n for n in self.hub.names() if n not in providers]
+        # The per-panel ``<slug>_region`` signals are published by the CONSOLE (a panel's drawn
+        # selection), not by a LogicNode, so they have no ``providers`` entry -- exempt them, else the GC
+        # would purge a live region out from under its analysis node (a SignalHistoryGap).  They are
+        # cleaned when their panel is removed (see _remove_panel).
+        region_names = set(self._panel_region_name.values())
+        orphans = [n for n in self.hub.names() if n not in providers and n not in region_names]
         if orphans:
             self.hub.remove_signals(orphans)
         for card in self.cards:
@@ -7745,6 +7747,9 @@ class TaskConsole(QtWidgets.QWidget):
         self._render_loop.barrier()   # the worker must not be composing into the card we tear down
         if card in self.cards:
             self._remove_panel_analysis(card)  # tear down the analysis node this panel owned (#1)
+            region = self._panel_region_name.pop(id(card), None)
+            if region:
+                self.hub.remove_signals([region])   # the panel's region signal is gone with the panel
             card.settings_popup.hide()
             self._close_panel_editor(card)     # drop this card's Edit tab too
             self.cards.remove(card)
@@ -7928,35 +7933,128 @@ class TaskConsole(QtWidgets.QWidget):
         row = self._panel_analysis.pop(id(card), None)
         if row is not None and row in self.logic_nodes:
             self._remove_logic_node(row)
+        self._fit_overlay_pushed.pop(id(card), None)   # a fresh fit re-pushes from version -1
+        if card.plotter is not None and hasattr(card.plotter, "apply_published_fit"):
+            card.plotter.apply_published_fit(None)     # drop any live fit overlay too
+
+    def _publish_region(self, card: "PanelCard", selection) -> str:
+        """Publish THIS panel's drawn Selection as its ``<slug>_region`` hub signal (the drawn bounds as
+        a tiny ``(K,2)`` tensor + the binding/frame/bins in the schema metadata), the ONE control input
+        an analysis node consumes.  A re-drag republishes the SAME name (stable per panel), so retarget
+        is a republish -- there is no ``set_selection`` plumbing.  Returns the region signal name."""
+        from ..neutral_atom.core.selection import encode_region
+        from ..neutral_atom.core.signals import SignalSchema, SignalTensor
+        from ..neutral_atom.operations.measurement import measurement_slug
+        name = self._panel_region_name.get(id(card))
+        if name is None:
+            slug = measurement_slug(card.config.title) or "panel"
+            existing = set(self.hub.registered_names())
+            name = f"{slug}_region"
+            k = 2
+            while name in existing:
+                name = f"{slug}_{k}_region"
+                k += 1
+            self._panel_region_name[id(card)] = name
+        bins = int(card.config.params.get("bins", 50)) if card.config.kind == "hist" else None
+        values, metadata = encode_region(selection, bins=bins)
+        rows = int(values.shape[0])
+        schema = SignalSchema(point_shape=(1,), data_shape=(rows, 2), dtype=np.float64,
+                              repeat_capacity=1, label="region", metadata=metadata)
+        try:
+            replace = not self.hub.schema(name).same_definition(schema)
+        except KeyError:
+            replace = False
+        self.hub.register_signal(name, schema, replace=replace)
+        self.hub.publish({name: SignalTensor(values.reshape(1, 1, rows, 2), schema)})
+        return name
+
+    def _published_fit_result(self, node):
+        """Build a :class:`FitResult` from a FitProcessor's PUBLISHED parameters on the hub (its first
+        cell) so the panel overlay DRAWS from solved params with no Qt-thread solve (#6).  ``None`` when
+        the node has no published result yet."""
+        from ..neutral_atom.core.fitting import FitResult, fit_model
+        model = fit_model(node.fit_request.model)
+        prefix = node.prefix
+
+        def _scalar(key):
+            return float(np.asarray(self.hub.latest(prefix + key)).reshape(-1)[0])
+
+        try:
+            params = np.array([_scalar(f"fit_{name}") for name in model.names], dtype=float)
+            valid = bool(np.asarray(self.hub.latest(prefix + "fit_valid")).reshape(-1)[0])
+        except Exception:
+            return None
+        if not np.isfinite(params).all():
+            valid = False
+        quality = {}
+        for qkey, sig in (("rmse", "fit_rmse"), ("r2", "fit_r2")):
+            try:
+                quality[qkey] = _scalar(sig)
+            except Exception:
+                quality[qkey] = float("nan")
+        try:
+            n_points = int(_scalar("fit_points"))
+        except Exception:
+            n_points = 0
+        return FitResult(model.key, model.names, params, None, valid,
+                         "ok" if valid else "invalid", quality, n_points,
+                         node.fit_request.coordinate_frame)
+
+    def _update_fit_overlays(self) -> None:
+        """GUI thread (after each coherent present): push every fit panel's per-panel FitProcessor
+        PUBLISHED result to its plotter's DISPLAY-only overlay.  This is how a fit reaches the plot now --
+        the overlay reconstructs the curve/dot from published parameters, never solving on the Qt thread
+        (#6).  Gated on the node's published version so an unchanged fit costs nothing."""
+        from ..neutral_atom.operations.processors.fit import FitProcessor
+        for card in self.cards:
+            plotter = card.plotter
+            if plotter is None or not hasattr(plotter, "apply_published_fit"):
+                continue
+            row = self._panel_analysis.get(id(card))
+            node = self._logic_nodes.get(id(row)) if row is not None else None
+            if not isinstance(node, FitProcessor):
+                continue
+            version = self.hub.signal_versions().get(node.prefix + "fit_valid", -1)
+            if self._fit_overlay_pushed.get(id(card)) == version:
+                continue
+            self._fit_overlay_pushed[id(card)] = version
+            plotter.apply_published_fit(self._published_fit_result(node))
 
     def _sync_fit_node(self, card: "PanelCard", request) -> None:
-        """The console's ONE fit-node sink (wired to :attr:`PanelCard.fit_node_sink`): create OR
-        retarget the hub FitProcessor that publishes a 2-D IMAGE fit's parameters as signals
-        (``fit_x0``/``fit_y0``/... -- consumable by a Monitor or a scan loss), the 'fit results become
-        signals' half of the selector chain, symmetric to ROI.  The node is owned by THIS PANEL
-        (``_panel_analysis[id(card)]``), never keyed by the source signal, so a second panel on the same
-        source gets its OWN node with its own output names (#3).  Only an image (2-D-family) fit on a flat
-        panel becomes a hub node; a 1-D / hist / grid fit is a display overlay only, so this removes any
-        lingering per-panel node instead.  Retargets THIS panel's node in place, never stacks a second
-        row.  The teardown counterpart is :meth:`_remove_panel_analysis`."""
-        from ..neutral_atom.core.fitting import FitRequest, fit_model
+        """The console's ONE fit-node sink (wired to :attr:`PanelCard.fit_node_sink`): create OR retarget
+        a per-panel FitProcessor that fits on its WORKER and publishes its parameters as signals
+        (``fit_x0``/``fit_sigma``/... -- consumable by a Monitor or a scan loss, and read back by the
+        panel's DISPLAY-only overlay).  EVERY fit family becomes a node -- a 2-D image centre, a 1-D
+        peak, a hist gaussian -- so no fit ever solves on the Qt thread (#6).  The node is owned by THIS
+        PANEL (``_panel_analysis[id(card)]``), never keyed by the source signal (#3); its region rides on
+        the panel's ``<slug>_region`` signal (the drawn selection), republished here.  A grid focus fits
+        per-cell in place (no hub node).  The teardown counterpart is :meth:`_remove_panel_analysis`."""
+        from ..neutral_atom.core.fitting import FitRequest
+        from dataclasses import replace as _dc_replace
+        from ..neutral_atom.core.selection import Selection
         req = FitRequest.from_dict(request) if isinstance(request, Mapping) else request
-        # A non-image fit (a 1-D peak / a hist gaussian) is a display overlay: its fitted params are
-        # not a per-shot hub tensor, so it never becomes a node.  Only a 2-D image fit does; if this
-        # panel HAD a fit node (its model just switched from 2-D to 1-D) tear it down.
-        if fit_model(req.model).family != "2d" or card.config.kind == "grid":
-            card._set_fit_result_text()
+        if card.config.kind == "grid":
+            card._set_fit_result_text()      # a facet grid fits per-cell in place, not as a hub node
             self._remove_panel_analysis(card)
             return
         signal = str(card.config.inputs[0]) if card.config.inputs else ""
         if not signal or self._task_locked:
             return
-        payload = req.to_dict()
+        # The drawn selection travels as the region signal (annotated with this panel kind's binding +
+        # bins); the CONFIG request carries only the model + fixed/initial (its selection is stripped --
+        # the region is the single source of the selection).
+        bound = region_binding(
+            card.config.kind, req.selection,
+            structure=card._bound_structure(),
+            coordinates=card._selection_coordinates_for_binding(),
+            origin=req.selection.metadata.get("origin", (0.0, 0.0)))
+        region_name = self._publish_region(card, bound)
+        payload = _dc_replace(req, selection=Selection()).to_dict()
         from ..neutral_atom.operations.processors.fit import FIT_SPEC_NAME, FitProcessor
         row = self._panel_analysis_row(card)
         node = self._logic_nodes.get(id(row)) if row is not None else None
         if isinstance(node, FitProcessor):
-            node.set_fit_request(req)                          # retarget THIS panel's node in place
+            node.set_fit_request(payload)                      # retarget model/fixed; region republished
             row.node.values = {**dict(row.node.values or {}), "fit_request": payload}
             editor = self._logic_editors.get(id(row))
             if editor is not None and hasattr(getattr(editor, "form", None), "seed_values"):
@@ -7970,7 +8068,7 @@ class TaskConsole(QtWidgets.QWidget):
             kind="processor", name=FIT_SPEC_NAME,
             title=self._analysis_node_title(card, "fit"),
             values={"source": {"inputs": [signal], "source": DEFAULT_SOURCE},
-                    "fit_request": payload})
+                    "fit_request": payload, "region": region_name})
         new_row = self._add_logic_node(cfg, focus=False)
         self._panel_analysis[id(card)] = new_row
         self._start_logic_node(new_row)
@@ -8011,14 +8109,13 @@ class TaskConsole(QtWidgets.QWidget):
             structure=card._bound_structure(),
             coordinates=card._selection_coordinates_for_binding(),
             origin=selection.metadata.get("origin", (0.0, 0.0)))
-        payload = bound.to_dict()
+        region_name = self._publish_region(card, bound)             # the drawn region AS a per-panel signal
         from ..neutral_atom.operations.processors.roi import ROI_SPEC_NAME, RoiProcessor
         row = self._panel_analysis_row(card)
         node = self._logic_nodes.get(id(row)) if row is not None else None
         if isinstance(node, RoiProcessor):
-            node.apply_acquisition_parameters(selection=bound)          # retarget THIS panel's node
-            row.node.values = {**dict(row.node.values or {}), "selection": payload}
-            self._mark_dirty()          # the retarget mutated persisted row values (save must see it)
+            # retarget = the republished region above; the reactive node re-computes on its worker.
+            self._mark_dirty()
             card.set_status(f"ROI -> {row.node.title}", error=False)
             return
         self._remove_panel_analysis(card)                               # was a fit node (fit <-> roi exclusive)
@@ -8027,7 +8124,7 @@ class TaskConsole(QtWidgets.QWidget):
             kind="processor", name=ROI_SPEC_NAME,
             title=self._analysis_node_title(card, "ROI"),
             values={"source": {"inputs": [signal], "source": DEFAULT_SOURCE},
-                    "selection": payload})
+                    "region": region_name})
         new_row = self._add_logic_node(cfg, focus=False)   # stay on the Monitor board -- no tab jump
         self._panel_analysis[id(card)] = new_row
         self._start_logic_node(new_row)
@@ -8609,7 +8706,22 @@ class TaskConsole(QtWidgets.QWidget):
         # layered on this view's snapshot -- a panel expression and a node-side expression (pulse-scan
         # y, processor source) can never diverge in capability (GUI == node).
         from Zou_lab_control.neutral_atom.operations.signal_expr import hub_namespace
-        tensors = self.hub.snapshot_at(disp, tensors=True)
+        from Zou_lab_control.neutral_atom.core.signal_tensor import SignalHistoryGap
+        try:
+            tensors = self.hub.snapshot_at(disp, tensors=True)
+        except SignalHistoryGap:
+            # A lagging DERIVED signal (a slow per-panel worker fit/roi) can drag ``disp`` below a fast
+            # frame's bounded history, so no coherent state exists at ``disp`` for that one signal.  Fall
+            # back to its LATEST for THAT signal only -- the documented "a producer not yet there falls
+            # back to its latest, never blanking a panel" behavior -- keeping every other signal
+            # shot-coherent.  Per-signal so one straggler can't blank the whole board.  Only reached when
+            # a gap actually occurs (a slow worker node behind the display shot), never on the happy path.
+            tensors = {}
+            for name in self.hub.names():
+                try:
+                    tensors.update(self.hub.snapshot_at(disp, tensors=True, names=[name]))
+                except SignalHistoryGap:
+                    tensors.update(self.hub.snapshot_at(None, tensors=True, names=[name]))
         namespace = hub_namespace(self.hub, {name: tensor.data for name, tensor in tensors.items()})
         valid = {name: tensor.valid for name, tensor in tensors.items()}
         task_tensor = self._task_card_tensor
@@ -8846,6 +8958,7 @@ class TaskConsole(QtWidgets.QWidget):
         for card, key in structural + composed:
             card._render_version = key
             card.present()
+        self._update_fit_overlays()   # push each fit panel's node params to its DISPLAY-only overlay (#6)
 
     def refresh_once(self) -> None:
         """Synchronous FULL refresh (tests / notebooks / Resume catch-up): COMPOSE every card from the
@@ -8866,6 +8979,7 @@ class TaskConsole(QtWidgets.QWidget):
             card._render_version = self._panel_frame_key(card, disp, sigvers)
         for card in self.cards:
             card.present()
+        self._update_fit_overlays()   # push each fit panel's node params to its DISPLAY-only overlay (#6)
         editor = self.tabs.currentWidget()
         if isinstance(editor, PanelEditor):
             editor.refresh_node_now_labels()

@@ -110,35 +110,25 @@ def test_explicit_roi_action_creates_then_retargets_a_roi_node():
 
 
 def test_selector_wiring_converts_axis_coords_to_the_frames_own_pixels():
-    """The REAL drag wiring, end to end: enabling selectors on a live 2d panel hooks the
-    console sink onto the area selector's callback, and a release on a panel whose axes
-    carry a nonzero region ORIGIN (an ROI crop's roi_frame) is translated into the
-    displayed frame's OWN pixels before it seeds the consumer (the ROI-of-ROI case --
-    unconverted axis pixels would clamp to a corner sliver)."""
+    """The REAL drag wiring, end to end, through the region-signal model: a drag on a live 2d panel
+    publishes its ``<slug>_region`` signal and creates a per-panel RoiProcessor consuming it; binding a
+    2d panel to that ``roi_frame`` gives axes carrying the crop's ORIGIN; and a release on THAT panel is
+    translated into the displayed frame's OWN pixels before its region is published (the ROI-of-ROI case
+    -- unconverted axis pixels would clamp to a corner sliver)."""
     import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.core.selection import Selection
     exp = na.connect("virtual")
     con = make_console(exp)
     try:
-        cam_row = add_logic_row(con, ("camera", "live"))
-        con._logic_editors[id(cam_row)].form.seed_values({"camera": "monitor_camera"})
-        con._start_logic_node(cam_row)
+        cam_row, frame_sig = _live_camera_signal(con)
         cam = con._logic_nodes[id(cam_row)]
-        cam.step()
-        frame_sig = sorted(cam.published_signals())[0]
 
-        roi_row = add_logic_row(con, ("processor", ROI_SPEC_NAME))
-        con._logic_editors[id(roi_row)].form.seed_values(
-            {"source": {"inputs": [frame_sig], "source": "value = signal"}})
-        # The region is a Selection with the 2-D image axis-binding -- exactly what the console's
-        # region_binding produces for a drag on a 2d panel.  It rides on the node values (DATA, not a
-        # form field); the _start_logic_node merge preserves it across the build.
-        from Zou_lab_control.frontend.live import region_binding
-        from Zou_lab_control.neutral_atom.core.selection import Selection
-        bound = region_binding("2d", Selection.rectangle(100.0, 400.0, 50.0, 250.0))
-        roi_row.node.values = {**dict(roi_row.node.values or {}), "selection": bound.to_dict()}
-        con._start_logic_node(roi_row)
-        roi = con._logic_nodes[id(roi_row)]
-        cam.step(); roi.step()                    # roi_frame on the hub, region learned
+        # A drag on the live frame panel: the console publishes the region signal + creates the ROI node.
+        src_card = _add_2d_panel(con, frame_sig, title="frame")
+        src_card.config.params["selection_action"] = "roi"
+        con._on_panel_area_select(src_card, Selection.rectangle(100.0, 400.0, 50.0, 250.0))
+        roi = con._logic_nodes[id(con._panel_analysis[id(src_card)])]
+        cam.step(); roi.step()                    # roi_frame on the hub, region consumed
         crop_sig = [s for s in roi.published_signals() if s.endswith("roi_frame")][0]
 
         from Zou_lab_control.frontend.task_console import PanelConfig
@@ -153,11 +143,9 @@ def test_selector_wiring_converts_axis_coords_to_the_frames_own_pixels():
         area = card.plotter.fig._zlc_tools.area
         assert area.callback == card._forward_area_select    # the sink IS wired on the selector
 
-        n_rows = len(con.logic_nodes)
         area.range = [150.0, 200.0, 80.0, 120.0]             # AXIS coords on the crop's panel
         area._call()                                          # the selector's own release dispatch
-        assert len(con.logic_nodes) == n_rows + 1
-        nested = con._logic_nodes[id(con.logic_nodes[-1])]
+        nested = con._logic_nodes[id(con._panel_analysis[id(card)])]
         cam.step(); roi.step(); nested.step()
         crop = con.hub.latest([s for s in nested.published_signals()
                                if s.endswith("roi_frame")][0])

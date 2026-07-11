@@ -1,12 +1,13 @@
-"""ROI processor: reduce a Selection-selected region of a live block through the stock func-node
-contract, GENERIC over plot kind.
+"""ROI processor: reduce a region of a live block through the stock func-node contract, GENERIC over
+plot kind, driven by a per-panel REGION signal.
 
 The user assembles "select a region -> watch its distribution / total counts" from stock parts
 (measurement -> ROI processor -> dis / monitor panels).  These tests pin the data contract: the ROI
-carries a plot-independent :class:`Selection` (+ its axis binding) -- NOT pixel endpoints -- so an
-image rectangle, a 1-D x-range, a distribution value-range and a site-centre rectangle all collapse
-to ONE finite ``roi_value`` with zero per-kind branch, plus a native crop / NaN-passthrough
-``roi_frame``.  All through the same Processor path the real console uses (virtual == real)."""
+consumes its source block PLUS a ``<slug>_region`` signal carrying a plot-independent
+:class:`Selection` (+ its axis binding) -- NOT pixel endpoints -- so an image rectangle, a 1-D x-range,
+a distribution value-range and a site-centre rectangle all collapse to ONE finite ``roi_value`` with
+zero per-kind branch, plus a native crop / NaN-passthrough ``roi_frame``.  A re-drag is just a
+republish of the region.  All through the same Processor path the real console uses (virtual == real)."""
 
 from __future__ import annotations
 
@@ -20,10 +21,25 @@ if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
 from Zou_lab_control.neutral_atom.core.selection import (
-    Selection, axis_crop_binding, scatter_mask_binding, value_mask_binding)
+    Selection, axis_crop_binding, decode_region, encode_region, scatter_mask_binding, value_mask_binding)
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
-from Zou_lab_control.neutral_atom.core.signal_tensor import SignalSchema
+from Zou_lab_control.neutral_atom.core.signal_tensor import SignalSchema, SignalTensor
 from Zou_lab_control.neutral_atom.operations.processors.roi import ROI_REDUCERS, RoiProcessor
+
+
+def _publish_region(hub, name, selection, *, bins=None):
+    """Publish a per-panel region signal the console produces from a drag (encode_region)."""
+    values, metadata = encode_region(selection, bins=bins)
+    rows = int(values.shape[0])
+    schema = SignalSchema(point_shape=(1,), data_shape=(rows, 2), dtype=np.float64,
+                          repeat_capacity=1, label="region", metadata=metadata)
+    try:
+        replace = not hub.schema(name).same_definition(schema)
+    except KeyError:
+        replace = False
+    hub.register_signal(name, schema, replace=replace)
+    hub.publish({name: SignalTensor(values.reshape(1, 1, rows, 2), schema)})
+    return name
 
 
 def _hub_with(name, block):
@@ -48,16 +64,18 @@ def _image_selection(x0, x1, y0, y1):
         metadata={"binding": axis_crop_binding([("x", -1, 0.0, 1.0), ("y", -2, 0.0, 1.0)])})
 
 
-def _roi(hub, source, selection=None, reduce="mean"):
+def _region_roi(hub, source, selection, *, reduce="mean", bins=None):
+    """Publish ``<source>_region`` from ``selection`` and build a RoiProcessor consuming (source, region)."""
+    region = _publish_region(hub, f"{source}_region", selection, bins=bins)
     return RoiProcessor(hub, source_expr={"inputs": [source], "source": "value = signal"},
-                        selection=selection, reduce=reduce)
+                        region=region, reduce=reduce)
 
 
 def test_roi_crop_is_native_dtype_and_value_matches_reduce():
     block = _frame_block()
     block[0, 0, 10:20, 30:40] = 100                       # a bright patch inside the region
     hub = _hub_with("frame_0", block)
-    node = RoiProcessor(hub, selection=_image_selection(30, 40, 10, 20), reduce="mean")
+    node = _region_roi(hub, "frame_0", _image_selection(30, 40, 10, 20), reduce="mean")
     hub.publish({"frame_0": block})    # react to a frame published AFTER the node subscribes
     node.step()
     crop, value = hub.latest("roi_frame"), hub.latest("roi_value")
@@ -77,7 +95,7 @@ def test_roi_crop_is_native_dtype_and_value_matches_reduce():
 def test_roi_defaults_to_full_frame_and_reduces_repeats():
     block = _frame_block(repeats=3)
     hub = _hub_with("frame_0", block)
-    node = RoiProcessor(hub)                               # empty selection = the whole frame
+    node = RoiProcessor(hub)                               # no region signal = the whole frame
     hub.publish({"frame_0": block})    # react to a frame published AFTER the node subscribes
     node.step()
     assert np.array_equal(hub.latest("roi_frame"), block)
@@ -87,14 +105,11 @@ def test_roi_defaults_to_full_frame_and_reduces_repeats():
 
 def test_roi_region_round_trips_with_the_plot_selector():
     hub = _hub_with("frame_0", _frame_block())
-    node = RoiProcessor(hub)
-    # a rectangle dragged on the roi_frame panel is a Selection with the image axis-binding; the node
-    # stores it atomically (mirrors FitProcessor.set_fit_request) and declares the SAME region back.
-    node.set_selection(_image_selection(30.2, 39.8, 10.1, 19.9))
+    # a rectangle dragged on the roi_frame panel is a Selection with the image axis-binding; the console
+    # publishes it as the region signal, and the node declares the SAME region back (real source pixels).
+    node = _region_roi(hub, "frame_0", _image_selection(30.2, 39.8, 10.1, 19.9))
     hub.publish({"frame_0": _frame_block()})
     node.step()
-    # the declared spatial region (real source pixels) drives the roi_frame panel's axes so a further
-    # drag on it round-trips through the same coordinates.
     assert node.acquisition_parameters()["region"] == [30, 40, 10, 20]
 
 
@@ -105,7 +120,7 @@ def test_roi_reduces_a_1d_vector_region():
     vec = np.arange(20, dtype=np.float64).reshape(1, 1, 20)      # one point, a 20-sample vector
     hub = _hub_with("y", vec)
     sel = Selection.x(5, 9, metadata={"binding": axis_crop_binding([("x", -1, 0.0, 1.0)])})
-    node = _roi(hub, "y", sel, reduce="sum")
+    node = _region_roi(hub, "y", sel, reduce="sum")
     hub.publish({"y": vec})
     node.step()
     assert hub.latest("roi_frame").shape == (1, 1, 4)           # indices 5,6,7,8 (half-open, pixel rule)
@@ -120,7 +135,7 @@ def test_roi_reduces_a_distribution_value_range():
     samples = np.array([[[1.0, 2.0, 3.0, 10.0, 11.0, 12.0]]])
     hub = _hub_with("s", samples)
     sel = Selection.value(9.0, 13.0, metadata={"binding": value_mask_binding()})
-    node = _roi(hub, "s", sel, reduce="mean")
+    node = _region_roi(hub, "s", sel, reduce="mean")
     hub.publish({"s": samples})
     node.step()
     assert hub.latest("roi_frame").shape == samples.shape       # stable shape (NaN outside the range)
@@ -137,7 +152,7 @@ def test_roi_reduces_a_site_centre_rectangle():
     hub = _hub_with("occ", occ)
     sel = Selection.rectangle(5, 35, -5, 5,
                               metadata={"binding": scatter_mask_binding(-1, {"x": cx, "y": cy})})
-    node = _roi(hub, "occ", sel, reduce="sum")
+    node = _region_roi(hub, "occ", sel, reduce="sum")
     hub.publish({"occ": occ})
     node.step()
     value = hub.latest("roi_value")
@@ -145,21 +160,34 @@ def test_roi_reduces_a_site_centre_rectangle():
     assert np.isfinite(value[0, 0, 0]) and value[0, 0, 0] == 2.0
 
 
-def test_roi_selection_round_trips_through_acquisition_parameters():
-    """The region persists as a serializable Selection (save/load + Edit reopen), NOT pixel params."""
+def test_roi_re_drag_republishes_the_region_and_retargets():
+    """A re-drag is a REPUBLISH of the region signal (no set_selection plumbing); the reactive node
+    re-computes on the next frame with the new region."""
+    block = _frame_block()
+    block[0, 0, 10:20, 30:40] = 100
+    hub = _hub_with("frame_0", block)
+    node = _region_roi(hub, "frame_0", _image_selection(30, 40, 10, 20))
+    hub.publish({"frame_0": block}); node.step()
+    assert hub.latest("roi_frame").shape == (1, 1, 10, 10)
+    _publish_region(hub, "frame_0_region", _image_selection(0, 60, 0, 40))   # re-drag: whole frame
+    hub.publish({"frame_0": block}); node.step()
+    assert hub.latest("roi_frame").shape == (1, 1, 40, 60)
+
+
+def test_roi_region_signal_round_trips_the_selection():
+    """The region persists as a serializable signal (save/load + Edit reopen): encode -> decode gives
+    back the identical Selection, and a fresh node consuming it reproduces the crop + its pixel region."""
     hub = _hub_with("frame_0", _frame_block())
-    node = RoiProcessor(hub, selection=_image_selection(30, 40, 10, 20), reduce="sum")
-    params = node.acquisition_parameters()
-    assert params["reduce"] == "sum"
-    restored = Selection.from_dict(params["selection"])
+    sel = _image_selection(30, 40, 10, 20)
+    restored = decode_region(*encode_region(sel))
     assert restored.bounds("x") == (30.0, 40.0) and restored.bounds("y") == (10.0, 20.0)
     assert restored.metadata["binding"]["mode"] == "axis-crop"
-    # a fresh node built from the stored dict reproduces the identical region
-    twin = RoiProcessor(hub, source_expr={"inputs": ["frame_0"], "source": "value = signal"},
-                        selection=params["selection"])
+    node = _region_roi(hub, "frame_0", sel, reduce="sum")
+    assert node.acquisition_parameters()["reduce"] == "sum"
     hub.publish({"frame_0": _frame_block()})
-    twin.step()
-    assert twin.acquisition_parameters()["region"] == [30, 40, 10, 20]
+    node.step()
+    assert node.acquisition_parameters()["region"] == [30, 40, 10, 20]
+    assert node.region_name == "frame_0_region" and "frame_0_region" in node.consumes
 
 
 def test_roi_registered_in_processor_catalog():

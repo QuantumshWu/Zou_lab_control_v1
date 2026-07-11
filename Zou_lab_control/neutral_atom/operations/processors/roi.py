@@ -1,6 +1,7 @@
-"""ROI = a Selection-driven region reducer -- the generic "look at a piece of the data" func node.
+"""ROI = a region reducer -- the generic "look at a piece of the data" func node.
 
-Consumes a signal block and republishes two DERIVED signals per shot, GENERIC over EVERY plot kind:
+Consumes a signal block PLUS its panel's ``<slug>_region`` control signal (a :class:`RegionProcessor`)
+and republishes two DERIVED signals per shot, GENERIC over EVERY plot kind:
 
 * ``roi_value`` -- ONE scalar per acquisition (the selected cells reduced by ``mean`` / ``sum`` /
   ``max``): an image rectangle, a 1-D x-range, a distribution's count-range, a site-centre rectangle
@@ -12,13 +13,13 @@ Consumes a signal block and republishes two DERIVED signals per shot, GENERIC ov
   passthrough block with out-of-region cells set to NaN (a STABLE-shape signal, since the
   SignalSchema contract forbids a variable-length republish).
 
-The ROI carries a :class:`~...core.selection.Selection` + a ``reduce`` verb -- exactly as a
-:class:`FitProcessor` carries a ``FitRequest`` -- so it is generic over plot kind WITHOUT any per-kind
-branch of its own.  WHAT the consumed block's cells mean (image pixels, a 1-D index, a sample value,
-site centres) is per-kind knowledge the FRONTEND owns (``live.region_binding``, the inverse of
-``coerce_panel_value``); it ships that knowledge to this node as PLAIN DATA on the Selection's
-``metadata["binding"]`` (a serializable axis-binding dict), so a drag on ANY panel kind writes the
-region straight back through :meth:`set_selection`, and ``neutral_atom`` never imports ``frontend``.
+The region is the panel's own :class:`~...core.selection.Selection`, read LATEST-WINS from the region
+signal each shot (a re-drag republishes it), so retarget is just a republish -- there is NO
+console-side ``set_selection`` plumbing.  WHAT the consumed block's cells mean (image pixels, a 1-D
+index, a sample value, site centres) is per-kind knowledge the FRONTEND owns (``live.region_binding``,
+the inverse of ``coerce_panel_value``); it ships that knowledge as PLAIN DATA on the Selection's
+``metadata["binding"]``, so a drag on ANY panel kind writes the region back through the region signal,
+and ``neutral_atom`` never imports ``frontend``.
 
 Reactive and decoupled exactly like Judge occupancy / MOT intensity: it runs beside whatever
 measurement publishes the block (virtual == real: only the data differ).
@@ -31,12 +32,11 @@ import warnings
 import numpy as np
 
 from ...core.params import ParamDecl
-from ...core.selection import Selection
 from ...core.signal_tensor import SignalTensor
-from ..logic import DEFAULT_SOURCE, FRAME_0, IMAGE_STREAM_HISTORY, Processor, SignalExpr, SignalSpec
+from ..logic import IMAGE_STREAM_HISTORY, SignalSpec
 from ..processor import ProcessorSpec
 from ..processor_registry import processor
-from ..signal_expr import hub_namespace
+from ._region import RegionProcessor
 
 #: The reduce verbs an ROI offers, in dropdown order -- ONE source for the node's dispatch, the
 #: ParamDecl choices and the tests, so a verb added here appears everywhere at once.
@@ -46,22 +46,14 @@ ROI_REDUCERS = {"mean": np.mean, "sum": np.sum, "max": np.max}
 _ROI_NAN_REDUCERS = {"mean": np.nanmean, "sum": np.nansum, "max": np.nanmax}
 
 
-class RoiProcessor(Processor):
-    """Reduce a Selection-selected region of a canonical signal block to one scalar, and republish
-    the region itself -- generic over plot kind because it carries a Selection, not pixels."""
+class RoiProcessor(RegionProcessor):
+    """Reduce a region of a canonical signal block to one scalar, and republish the region itself --
+    generic over plot kind because it carries a Selection (from the region signal), not pixels."""
 
     provides = ("roi_frame", "roi_value")
 
-    def __init__(self, hub, *, source_expr=None, selection=None, reduce: str = "mean", prefix: str = ""):
-        expr = source_expr if isinstance(source_expr, SignalExpr) else SignalExpr.from_value(source_expr)
-        if not expr.inputs:
-            expr = SignalExpr([FRAME_0], DEFAULT_SOURCE)
-        super().__init__(hub, consumes=tuple(expr.inputs), prefix=prefix)
-        self.source_expr = expr
-        # The region is ONE Selection in the consumed block's own coordinate frame (the SAME contract
-        # fit + DataFigure.selected_data use).  An EMPTY selection (no binding) means "the whole
-        # frame" -- a fresh node reduces every valid cell before any region is drawn.
-        self.set_selection(selection)
+    def __init__(self, hub, *, source_expr=None, region=None, reduce: str = "mean", prefix: str = ""):
+        super().__init__(hub, source_expr=source_expr, region=region, prefix=prefix)
         if str(reduce) not in ROI_REDUCERS:
             raise ValueError(f"ROI reduce must be one of {tuple(ROI_REDUCERS)}; got {reduce!r}.")
         self.reduce = str(reduce)
@@ -73,9 +65,9 @@ class RoiProcessor(Processor):
         self._roi_frame_data: tuple[int, ...] = (1,)
         self._roi_frame_dtype = None
         self._roi_value_point: tuple[int, ...] = (1,)
-        self._region = None
+        self._roi_region = None
         schemas = []
-        for name in self.consumes:
+        for name in self.source_names:
             try:
                 schemas.append(hub.schema(name))
             except KeyError:
@@ -95,33 +87,17 @@ class RoiProcessor(Processor):
         self._roi_frame_data = tuple(schema.data_shape)
         self._roi_value_point = tuple(schema.point_shape)
 
-    # ------------------------------------------------------------------ region (the ONE mutator)
-    def set_selection(self, selection) -> None:
-        """Atomically install the region as a :class:`Selection` (mirrors FitProcessor.set_fit_request):
-        a plot-independent set of bounds in the consumed block's coordinate frame, whose
-        ``metadata['binding']`` (supplied by the frontend) tells this node which block axes the
-        selection spans and how each coordinate is computed.  ``None`` / a dict / a Selection are all
-        accepted, so the console can hand it fresh from a drag OR replay it from a saved config."""
-        if selection is None:
-            self.selection = Selection()
-        elif isinstance(selection, Selection):
-            self.selection = selection
-        else:
-            self.selection = Selection.from_dict(selection)
-
     def acquisition_parameters(self) -> dict[str, object]:
-        """The editable source knobs (Edit tab) -- the region as a serializable Selection + the reduce
-        verb -- plus the declared spatial ``region`` of ``roi_frame`` (its source-pixel extent, for an
-        image crop), so a roi_frame 2-D panel draws real pixel axes and a FURTHER drag on it round-trips
-        through the same coordinates (the ROI-of-ROI case)."""
-        out: dict[str, object] = {"selection": self.selection.to_dict(), "reduce": self.reduce}
-        if self._region is not None:
-            out["region"] = list(self._region)
+        """The editable source knobs (Edit tab) -- the reduce verb -- plus the declared spatial
+        ``region`` of ``roi_frame`` (its source-pixel extent, for an image crop), so a roi_frame 2-D
+        panel draws real pixel axes and a FURTHER drag on it round-trips through the same coordinates
+        (the ROI-of-ROI case).  The Selection itself is NOT a param here: it lives on the region signal."""
+        out: dict[str, object] = {"reduce": self.reduce}
+        if self._roi_region is not None:
+            out["region"] = list(self._roi_region)
         return out
 
     def set_acquisition_parameters(self, **values) -> None:
-        if "selection" in values:
-            self.set_selection(values["selection"])
         if "reduce" in values:
             reduce = str(values["reduce"])
             if reduce not in ROI_REDUCERS:
@@ -130,6 +106,8 @@ class RoiProcessor(Processor):
 
     # ------------------------------------------------------------------ transform
     def transform(self, inputs: dict[str, object]) -> dict[str, object]:
+        from ..signal_expr import hub_namespace
+
         value = self.source_expr.evaluate(hub_namespace(self.hub, inputs))
         block = np.asarray(value)
         if not self._input_tensors:
@@ -159,7 +137,7 @@ class RoiProcessor(Processor):
         self._roi_frame_data = tuple(int(s) for s in frame.shape[2:]) or (1,)
         self._roi_frame_dtype = frame.dtype
         self._roi_value_point = (int(roi_value.shape[1]),)
-        self._region = region
+        self._roi_region = region
 
         specs = {spec.name: spec for spec in self._bare_output_specs()}
         return {
@@ -170,13 +148,14 @@ class RoiProcessor(Processor):
         }
 
     def _reduce_region(self, block, input_valid):
-        """Apply the carried Selection to the raw ``(R,P,*data)`` block through the ONE mode-driven
-        machinery -- returns ``(roi_frame, frame_valid, reduced, reduce_axes, region)``.  There is NO
-        per-kind branch here: the plot-side binding names WHICH axes the selection spans (``mode`` +
-        axis descriptors), so an image rectangle, a 1-D index range, a distribution value-range and a
-        site-centre rectangle all resolve identically."""
+        """Apply the carried Selection (from the region signal) to the raw ``(R,P,*data)`` block through
+        the ONE mode-driven machinery -- returns ``(roi_frame, frame_valid, reduced, reduce_axes,
+        region)``.  There is NO per-kind branch here: the plot-side binding names WHICH axes the
+        selection spans (``mode`` + axis descriptors), so an image rectangle, a 1-D index range, a
+        distribution value-range and a site-centre rectangle all resolve identically."""
+        selection = self.current_region()
         ndim = block.ndim
-        binding = dict(self.selection.metadata.get("binding") or {})
+        binding = dict(selection.metadata.get("binding") or {})
         mode = str(binding.get("mode") or "axis-crop")
         reducer = ROI_REDUCERS[self.reduce]
         nan_reducer = _ROI_NAN_REDUCERS[self.reduce]
@@ -184,7 +163,7 @@ class RoiProcessor(Processor):
         if mode == "value-mask":
             # The coordinate of every sample cell IS its value: mask out-of-range cells to NaN and pool
             # every sample per repeat.  roi_frame is the stable-shape NaN passthrough (P unchanged).
-            vb = self.selection.bounds("value")
+            vb = selection.bounds("value")
             work = np.asarray(block, dtype=np.float64)
             if vb is not None:
                 keep = np.isfinite(work) & (work >= vb[0]) & (work <= vb[1])
@@ -202,7 +181,7 @@ class RoiProcessor(Processor):
             n = int(block.shape[axis])
             coords = {name: np.asarray(vals, dtype=float)
                       for name, vals in (binding.get("coordinates") or {}).items()}
-            keep_cells = (self.selection.mask(coords, length=n) if coords
+            keep_cells = (selection.mask(coords, length=n) if coords
                           else np.ones(n, dtype=bool))
             broadcast_shape = [1] * ndim
             broadcast_shape[axis] = n
@@ -229,7 +208,7 @@ class RoiProcessor(Processor):
             size = int(block.shape[axis])
             origin = float(entry.get("origin", 0.0))
             step = float(entry.get("step", 1.0)) or 1.0
-            bounds = self.selection.bounds(entry.get("select")) if entry.get("select") else None
+            bounds = selection.bounds(entry.get("select")) if entry.get("select") else None
             if bounds is None:
                 i0, i1 = 0, size
             else:
@@ -283,7 +262,9 @@ ROI_SPEC_NAME = "ROI crop"
 
 @processor(order=25)
 def roi(readout) -> ProcessorSpec:
-    """Reduce a Selection-selected region of a live block to one scalar per shot + republish the region."""
+    """Reduce a region of a live block to one scalar per shot + republish the region."""
+
+    from ..logic import FRAME_0
 
     params = (
         ParamDecl("source", "Signal source", "signal_expr",
@@ -294,12 +275,16 @@ def roi(readout) -> ProcessorSpec:
         ParamDecl("reduce", "Reduce", "choice", default="mean", choices=tuple(ROI_REDUCERS),
                   tooltip="How roi_value collapses the selected cells each shot: mean / sum "
                           "(total counts, e.g. a MOT loss signal) / max."),
+        # The per-panel region CONTROL signal the node consumes (the drawn Selection).  Injected by the
+        # console when it creates the node from a drag; not a user-facing form field.
+        ParamDecl("region", "Region signal", "text", default="", display=False,
+                  tooltip="The per-panel <slug>_region hub signal carrying the drawn selection."),
     )
 
     def make_node(hub, *, prefix: str = "", **values):
         return RoiProcessor(
             hub, source_expr=values.get("source"),
-            selection=values.get("selection"),
+            region=values.get("region"),
             reduce=str(values.get("reduce", "mean") or "mean"),
             prefix=prefix)
 

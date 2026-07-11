@@ -1,49 +1,56 @@
 """Live fitting processor backed by the same headless engine as ``DataFigure``.
 
-The processor is an adapter only: it preserves the input tensor's physical
-``(R, P)`` cells, hands each image datum to :mod:`neutral_atom.core.fitting`,
-and publishes complete scalar result tensors.  A failed fit publishes NaN
-parameters plus explicit validity/quality/status fields; it never leaves stale
-values on the hub.
+The processor is a per-panel :class:`RegionProcessor`: it consumes the SOURCE block plus the panel's
+``<slug>_region`` signal (the drawn selection + the panel's bins), and publishes complete scalar fit
+result tensors -- so EVERY fit (2-D image centre, 1-D curve, hist) runs on the node's WORKER thread,
+never the Qt event loop.  A failed fit publishes NaN parameters plus explicit validity/quality/status
+fields; it never leaves stale values on the hub.
 
-The node is model-AGNOSTIC: it fits whatever 2-D model the request names and
-publishes THAT model's own parameters (``fit_<name>``) plus a fixed
-quality/validity suffix.  The published parameter keys therefore derive from the
-solved model's ``names`` (the single source), so the node name and its signals
-never lie -- a non-centre 2-D model would publish its own parameters, not a
-hardwired ``x0/y0/size`` centre layout.  The ``fit_`` prefix only namespaces the
-keys on the hub so a fitted parameter never collides with a raw signal.
+The node is model-AGNOSTIC and family-AGNOSTIC:
+
+* a 2-D image model fits EACH ``(R,P)`` image cell (``fit_image``) and publishes one result per cell;
+* a 1-D model over a DISTRIBUTION source (the region's ``value-mask`` binding) fits the BINNED
+  ``(bin_centers, counts)`` -- the SAME bins the panel displays, carried on the region -- NEVER the raw
+  per-pixel samples, so a hist fit is O(bins), instant;
+* a 1-D model over a CURVE source reconstructs ``x`` from the region binding and fits the per-point
+  reduced curve.
+
+Either way the published parameter keys derive from the solved model's ``names`` (the single source),
+so the node name and its signals never lie.  The ``fit_`` prefix only namespaces the keys on the hub so
+a fitted parameter never collides with a raw signal.
 """
 
 from __future__ import annotations
 
+import warnings
+from dataclasses import replace as _dc_replace
 from threading import Lock
 from typing import Mapping
 
 import numpy as np
 
-from ...core.fitting import FitRequest, FitResult, fit_image, fit_model
+from ...core.fitting import FitRequest, FitResult, fit_data, fit_image, fit_model
 from ...core.params import ParamDecl
-from ..logic import DEFAULT_SOURCE, FRAME_0, Processor, SignalExpr, SignalSpec
+from ..logic import FRAME_0, SignalSpec
 from ..processor import ProcessorSpec
 from ..processor_registry import processor
+from ._region import RegionProcessor
 
 
 FIT_SPEC_NAME = "Frame fit"
 FIT_STATUS_INVALID = np.int8(0)
 FIT_STATUS_OK = np.int8(1)
 
-#: The default image model.  Only a 2-D-family fit becomes a hub node, and ``center`` is the sole
-#: image model today, so the class-level ``provides`` derives from it.  A future 2-D model would
-#: publish ITS parameters through the same single-source derivation.
+#: The default fit model.  ``center`` is the default 2-D image model; the class-level ``provides``
+#: derives from it, and a per-panel node's ACTUAL keys derive from its own request's model.
 _DEFAULT_MODEL = "center"
-#: Fixed quality/validity keys every frame fit publishes alongside the model's own parameters.
+#: Fixed quality/validity keys every fit publishes alongside the model's own parameters.
 _QUALITY_KEYS: tuple[str, ...] = ("fit_valid", "fit_rmse", "fit_r2", "fit_status", "fit_points")
 
 
 def _param_keys(model) -> tuple[str, ...]:
     """The ``fit_<name>`` hub keys for a model's parameters -- derived from ``FitModel.names``
-    (the single source), never a hand-typed centre layout."""
+    (the single source), never a hand-typed layout."""
     return tuple(f"fit_{name}" for name in fit_model(model).names)
 
 
@@ -52,38 +59,34 @@ def _provided_keys(model) -> tuple[str, ...]:
 
 
 def _request(value=None) -> FitRequest:
+    """Parse a fit request from a model key / dict / FitRequest -- ANY family (2-D image, 1-D curve,
+    hist), since every fit is now a per-panel worker node."""
     if value is None or value == "":
         return FitRequest(_DEFAULT_MODEL)
     if isinstance(value, FitRequest):
-        request = value
-    elif isinstance(value, str):
-        request = FitRequest(value)
-    elif isinstance(value, Mapping):
-        request = FitRequest.from_dict(value)
-    else:
-        raise TypeError("fit request must be FitRequest, mapping, model key, or None")
-    if fit_model(request.model).family != "2d":
-        raise ValueError("Frame fit consumes image data and therefore requires a 2D fit model")
-    return request
+        return value
+    if isinstance(value, str):
+        return FitRequest(value)
+    if isinstance(value, Mapping):
+        return FitRequest.from_dict(value)
+    raise TypeError("fit request must be FitRequest, mapping, model key, or None")
 
 
-class FitProcessor(Processor):
-    """Fit every valid image cell in a canonical ``(R,P,H,W)`` signal."""
+class FitProcessor(RegionProcessor):
+    """Fit the request's model over a per-panel region of a canonical signal block, on the worker."""
 
-    node_label = "frame fit"
-    #: Class-level default (the ``center`` model); the instance derives its actual keys from the
-    #: request's model so ``transform`` / ``_bare_output_specs`` / ``provides`` are one source.
+    node_label = "fit"
+    #: Class-level default (the ``center`` model); the INSTANCE derives its actual keys from the
+    #: request's model so ``output_keys`` / ``_bare_output_specs`` / ``provides`` are one source.
     provides = _provided_keys(_DEFAULT_MODEL)
 
-    def __init__(self, hub, *, source_expr=None, fit_request=None, prefix: str = ""):
-        expr = source_expr if isinstance(source_expr, SignalExpr) else SignalExpr.from_value(source_expr)
-        if not expr.inputs:
-            expr = SignalExpr([FRAME_0], DEFAULT_SOURCE)
-        super().__init__(hub, consumes=tuple(expr.inputs), prefix=prefix)
-        self.source_expr = expr
+    def __init__(self, hub, *, source_expr=None, region=None, fit_request=None, prefix: str = ""):
+        # Set the request BEFORE super().__init__: the base's self-loop guard calls output_keys() ->
+        # fit_request, so the model must be known before the LogicNode chain runs.
         self._request_lock = Lock()
         self._fit_request = _request(fit_request)
         self.last_results: tuple[FitResult, ...] = ()
+        super().__init__(hub, source_expr=source_expr, region=region, prefix=prefix)
 
     @property
     def fit_request(self) -> FitRequest:
@@ -91,44 +94,90 @@ class FitProcessor(Processor):
             return self._fit_request
 
     def set_fit_request(self, request) -> None:
-        """Atomically replace the structured request between processor shots."""
-
+        """Atomically replace the structured request (model + fixed/initial) between shots.  The
+        SELECTION is not stored here -- it rides on the region signal, merged in per shot."""
         parsed = _request(request)
         with self._request_lock:
             self._fit_request = parsed
 
-    def _input_contract(self, value) -> tuple[np.ndarray, np.ndarray, tuple[int, ...], int | None]:
-        array = np.asarray(value)
-        if len(self._input_tensors) != 1:
-            raise ValueError(
-                "Frame fit requires exactly one registered canonical image source.")
-        tensor = next(iter(self._input_tensors.values()))
-        schema = tensor.schema
-        if tuple(schema.data_shape) != tuple(array.shape[2:]) or len(schema.data_shape) != 2:
-            raise ValueError(
-                "Frame fit requires schema data_shape=(H,W); "
-                f"got data_shape={schema.data_shape}, evaluated shape={array.shape}.")
-        if array.ndim != 4 or tuple(array.shape[:2]) != tuple(tensor.valid.shape):
-            raise ValueError(
-                "Fit expression must preserve canonical (R,P,H,W) axes; "
-                f"got {array.shape} for validity {tensor.valid.shape}.")
-        return array, np.asarray(tensor.valid, dtype=bool), schema.point_shape, schema.repeat_capacity
+    def acquisition_parameters(self) -> dict[str, object]:
+        return {"fit_request": self.fit_request.to_dict()}
 
+    def set_acquisition_parameters(self, **values) -> None:
+        if "fit_request" in values:
+            self.set_fit_request(values["fit_request"])
+
+    def output_keys(self) -> tuple[str, ...]:
+        """The bare published names derive from THIS node's model (the single source), so a gaussian
+        panel publishes ``fit_sigma`` and a centre panel ``fit_radius`` -- never a fixed layout."""
+        return _provided_keys(self.fit_request.model)
+
+    # ------------------------------------------------------------------ region -> request
+    def _request_with_region(self) -> tuple[FitRequest, object]:
+        """Merge the config request (model + fixed/initial) with the panel's LATEST region selection,
+        and return ``(request, model)``.  The region's frame is the fit's coordinate frame."""
+        base = self.fit_request
+        selection = self.current_region()
+        request = _dc_replace(
+            base, selection=selection,
+            coordinate_frame=(selection.frame or base.coordinate_frame))
+        return request, fit_model(request.model)
+
+    def _result_shape(self) -> tuple[tuple[int, ...], int | None]:
+        """The output (point_shape, repeat_capacity): a 2-D image fit is PER-CELL (the source's
+        geometry); a 1-D / hist fit is ONE result for the whole curve/distribution."""
+        if fit_model(self.fit_request.model).family != "2d":
+            return (1,), 1
+        if not self._input_tensors:
+            return (1,), 1
+        tensor = next(iter(self._input_tensors.values()))
+        return tuple(tensor.schema.point_shape), tensor.schema.repeat_capacity
+
+    # ------------------------------------------------------------------ transform
     def transform(self, inputs: dict[str, object]) -> dict[str, object]:
         from ..signal_expr import hub_namespace
 
         value = self.source_expr.evaluate(hub_namespace(self.hub, inputs))
-        block, input_valid, _point_shape, _repeat_capacity = self._input_contract(value)
-        shape = (*block.shape[:2], 1)
-        request = self.fit_request
-        names = fit_model(request.model).names        # the ONE source for the published parameter keys
+        block = np.asarray(value)
+        request, model = self._request_with_region()
+        if model.family == "2d":
+            return self._fit_2d(block, request, model)
+        return self._fit_1d(block, request, model)
+
+    def _empty_outputs(self, shape, request) -> dict[str, object]:
         outputs = {
             name: np.full(shape, np.nan, dtype=np.float64)
             for name in (*_param_keys(request.model), "fit_rmse", "fit_r2", "fit_points")
         }
         outputs["fit_valid"] = np.zeros(shape, dtype=np.bool_)
         outputs["fit_status"] = np.full(shape, FIT_STATUS_INVALID, dtype=np.int8)
+        return outputs
 
+    @staticmethod
+    def _store(outputs, index, model, result) -> None:
+        params = result.parameter_map()
+        for name in model.names:
+            outputs[f"fit_{name}"][index] = params.get(name, np.nan)
+        outputs["fit_valid"][index] = result.valid
+        outputs["fit_rmse"][index] = result.quality.get("rmse", np.nan)
+        outputs["fit_r2"][index] = result.quality.get("r2", np.nan)
+        outputs["fit_status"][index] = FIT_STATUS_OK if result.valid else FIT_STATUS_INVALID
+        outputs["fit_points"][index] = float(result.n_points)
+
+    def _fit_2d(self, block, request, model) -> dict[str, object]:
+        """Fit the 2-D image model to EVERY valid ``(R,P)`` image cell (``fit_image``)."""
+        if not self._input_tensors:
+            raise ValueError("Frame fit requires a registered canonical image source.")
+        tensor = next(iter(self._input_tensors.values()))
+        schema = tensor.schema
+        if len(schema.data_shape) != 2 or tuple(schema.data_shape) != tuple(block.shape[2:]) \
+                or block.ndim != 4 or tuple(block.shape[:2]) != tuple(tensor.valid.shape):
+            raise ValueError(
+                "Frame fit requires a canonical (R,P,H,W) image with schema data_shape=(H,W); "
+                f"got shape {block.shape}, data_shape={schema.data_shape}.")
+        input_valid = np.asarray(tensor.valid, dtype=bool)
+        shape = (*block.shape[:2], 1)
+        outputs = self._empty_outputs(shape, request)
         results: list[FitResult] = []
         for repeat, point in np.ndindex(block.shape[:2]):
             if input_valid[repeat, point]:
@@ -138,22 +187,65 @@ class FitProcessor(Processor):
                     request.model, "input tensor cell is invalid",
                     coordinate_frame=request.coordinate_frame)
             results.append(result)
-            params = result.parameter_map()
-            for name in names:                          # publish each fitted parameter under fit_<name>
-                outputs[f"fit_{name}"][repeat, point, 0] = params.get(name, np.nan)
-            outputs["fit_valid"][repeat, point, 0] = result.valid
-            outputs["fit_rmse"][repeat, point, 0] = result.quality.get("rmse", np.nan)
-            outputs["fit_r2"][repeat, point, 0] = result.quality.get("r2", np.nan)
-            outputs["fit_status"][repeat, point, 0] = FIT_STATUS_OK if result.valid else FIT_STATUS_INVALID
-            outputs["fit_points"][repeat, point, 0] = float(result.n_points)
+            self._store(outputs, (repeat, point, 0), model, result)
         self.last_results = tuple(results)
         return outputs
 
-    def _result_shape(self) -> tuple[tuple[int, ...], int | None]:
-        if not self._input_tensors:
-            return (1,), 1
-        tensor = next(iter(self._input_tensors.values()))
-        return tuple(tensor.schema.point_shape), tensor.schema.repeat_capacity
+    def _fit_1d(self, block, request, model) -> dict[str, object]:
+        """Fit a 1-D model ONCE over the region's reconstructed domain: a distribution's binned
+        ``(centers, counts)`` (value-mask) or a curve's ``(x, reduced y)``."""
+        binding = dict(self.current_region().metadata.get("binding") or {})
+        if str(binding.get("mode")) == "value-mask":
+            result = self._fit_histogram(block, request)
+        else:
+            x, y = self._curve_xy(block, binding)
+            result = fit_data({"x": x}, y, request)
+        self.last_results = (result,)
+        outputs = self._empty_outputs((1, 1, 1), request)
+        self._store(outputs, (0, 0, 0), model, result)
+        return outputs
+
+    def _fit_histogram(self, block, request) -> FitResult:
+        """Bin the pooled source samples with the panel's bins (single source, from the region) and fit
+        the 1-D model on ``(bin_centers, counts)`` -- NEVER the raw per-pixel samples (O(bins), instant).
+        The value-range selection restricts the fit to the selected band, exactly as the panel shows."""
+        samples = np.asarray(block, dtype=np.float64).reshape(-1)
+        finite = samples[np.isfinite(samples)]
+        if finite.size < 2:
+            return FitResult.invalid(
+                request.model, "distribution has too few finite samples",
+                coordinate_frame=request.coordinate_frame)
+        bins = self.current_region_bins() or 50
+        counts, edges = np.histogram(finite, bins=int(bins))
+        centers = (edges[:-1] + edges[1:]) / 2.0
+        # The value selection filters bin centres (matching the panel's displayed value-range fit); "x"
+        # and "value" are the SAME coordinate for a distribution (its x axis IS the sample value).
+        return fit_data({"x": centers, "value": centers}, counts.astype(np.float64), request)
+
+    def _curve_xy(self, block, binding) -> tuple[np.ndarray, np.ndarray]:
+        """Reconstruct a 1-D curve ``(x, y)`` from the block + the region binding: ``x`` over the curve
+        axis (a contiguous index for an axis-crop, or the explicit scatter coordinates), ``y`` the
+        block reduced (nan-mean) over every other axis -- the curve shape the panel displays."""
+        work = np.asarray(block, dtype=np.float64)
+        if str(binding.get("mode")) == "scatter-mask":
+            axis = int(binding.get("axis", -1)) % work.ndim
+            coords = binding.get("coordinates") or {}
+            x = (np.asarray(coords["x"], dtype=np.float64).reshape(-1)
+                 if "x" in coords else None)
+        else:  # axis-crop
+            entry = (list(binding.get("axes") or ()) or [{}])[0]
+            axis = int(entry.get("axis", -1)) % work.ndim
+            origin = float(entry.get("origin", 0.0))
+            step = float(entry.get("step", 1.0)) or 1.0
+            x = origin + step * np.arange(work.shape[axis], dtype=np.float64)
+        n = int(work.shape[axis])
+        if x is None or x.size != n:
+            x = np.arange(n, dtype=np.float64)
+        other = tuple(a for a in range(work.ndim) if a != axis)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)  # an all-NaN column -> NaN, dropped by the fit
+            y = np.nanmean(work, axis=other) if other else work
+        return x, np.asarray(y, dtype=np.float64).reshape(-1)
 
     def _bare_output_specs(self) -> tuple[SignalSpec, ...]:
         points, repeat_capacity = self._result_shape()
@@ -161,7 +253,7 @@ class FitProcessor(Processor):
                   "repeat_capacity": repeat_capacity}
         model = fit_model(self.fit_request.model)
         # One SignalSpec per fitted parameter -- name + description derive from the model (single
-        # source), so the published signals describe whatever model is fit, not a fixed centre layout.
+        # source), so the published signals describe whatever model is fit.
         param_specs = [
             SignalSpec(f"fit_{name}", f"fit {name}", "",
                        f"Fitted {model.formula} parameter {name}.", dtype=np.float64, **common)
@@ -184,20 +276,25 @@ class FitProcessor(Processor):
 
 @processor(order=26)
 def frame_fit(readout) -> ProcessorSpec:
-    """Fit the request's 2-D model (default: Gaussian centre) to every image tensor cell."""
+    """Fit the request's model (2-D image centre / 1-D peak / hist) to a per-panel region, on the worker."""
 
     default_request = FitRequest(_DEFAULT_MODEL).to_dict()
     params = (
-        ParamDecl("source", "Frame source", "signal_expr",
+        ParamDecl("source", "Fit source", "signal_expr",
                   default={"inputs": [FRAME_0], "source": "value = signal"},
-                  tooltip="One registered image signal with data_shape=(H,W)."),
+                  tooltip="One registered signal to fit (an image frame, a 1-D curve, a distribution)."),
         ParamDecl("fit_request", "Fit request", "json", default=default_request,
                   tooltip="Structured FitRequest shared with the plot selector.", display=False),
+        # The per-panel region CONTROL signal the node consumes (drawn selection + bins).  Injected by
+        # the console when it creates the node; not a user-facing form field.
+        ParamDecl("region", "Region signal", "text", default="", display=False,
+                  tooltip="The per-panel <slug>_region hub signal carrying the drawn selection + bins."),
     )
 
     def make_node(hub, *, prefix: str = "", **values):
         return FitProcessor(
-            hub, source_expr=values.get("source"), fit_request=values.get("fit_request"), prefix=prefix)
+            hub, source_expr=values.get("source"), region=values.get("region"),
+            fit_request=values.get("fit_request"), prefix=prefix)
 
     return ProcessorSpec(
         name=FIT_SPEC_NAME,

@@ -244,7 +244,69 @@ def scatter_mask_binding(axis: int, coordinates: Mapping[str, object]) -> dict[s
                             for name, values in dict(coordinates).items()}}
 
 
+# --------------------------------------------------------------------------- region as a signal
+# A plot PANEL publishes its drawn Selection as a tiny per-panel hub signal (``<slug>_region``) so an
+# analysis processor can CONSUME it (reacting to a re-drag) and so the region itself is reusable.  The
+# encoding splits the Selection into two parts: the BOUNDS ride as a small ``(K, 2)`` float tensor (K
+# ranges, each ``low``/``high``) that changes every drag, while the STRUCTURED part (axis names, frame,
+# scope, the reducer/fit binding, and the panel's ``bins``) rides in the SignalSchema metadata -- STABLE
+# across drags, so a re-drag republishes the same schema with new bounds (no schema churn).  Dependency
+# free: the frontend producer, the ``neutral_atom`` consumer and the tests share this ONE definition, so
+# ``neutral_atom`` never imports ``frontend`` (the sealed seam) and a saved region round-trips.
+
+REGION_META_AXES = "region_axes"
+REGION_META_FRAME = "region_frame"
+REGION_META_SCOPE = "region_scope"
+REGION_META_BINS = "region_bins"
+
+
+def encode_region(selection: "Selection", *, bins: int | None = None) -> tuple[np.ndarray, dict]:
+    """Encode a :class:`Selection` as ``(values, metadata)`` for a per-panel region signal.
+
+    ``values`` is a ``(K, 2)`` float64 array of the ranges' ``(low, high)``; ``metadata`` carries the
+    ordered axis names, the frame, the scope, the reducer/fit ``binding`` and (when supplied) the
+    panel's ``bins`` -- the single source a hist fit bins its samples by."""
+    ranges = tuple(selection.ranges)
+    values = (np.array([[r.low, r.high] for r in ranges], dtype=np.float64)
+              if ranges else np.zeros((1, 2), dtype=np.float64))
+    metadata: dict[str, object] = {
+        REGION_META_AXES: [r.axis for r in ranges],
+        REGION_META_FRAME: str(selection.frame),
+        REGION_META_SCOPE: [str(s) for s in selection.scope],
+        "binding": dict(selection.metadata.get("binding") or {}),
+    }
+    if "origin" in selection.metadata:
+        metadata["origin"] = list(selection.metadata["origin"])
+    if bins is not None:
+        metadata[REGION_META_BINS] = int(bins)
+    return values, metadata
+
+
+def decode_region(values, metadata) -> "Selection":
+    """Rebuild a :class:`Selection` from a region signal's ``(values, schema metadata)`` -- the exact
+    inverse of :func:`encode_region`.  Non-finite / unpaired rows are dropped (an empty region reduces
+    the whole frame), so the seed row an empty encode carries never becomes a spurious range."""
+    md = dict(metadata or {})
+    axes = list(md.get(REGION_META_AXES) or [])
+    arr = np.asarray(values, dtype=float).reshape(-1, 2)
+    ranges = tuple(AxisRange(str(axis), float(lo), float(hi))
+                   for axis, (lo, hi) in zip(axes, arr) if np.isfinite(lo) and np.isfinite(hi))
+    sel_meta: dict[str, object] = {"binding": dict(md.get("binding") or {})}
+    if "origin" in md:
+        sel_meta["origin"] = list(md["origin"])
+    return Selection(ranges, frame=str(md.get(REGION_META_FRAME, "data")),
+                     scope=tuple(str(s) for s in (md.get(REGION_META_SCOPE) or ())), metadata=sel_meta)
+
+
+def region_bins(metadata) -> int | None:
+    """The panel's ``bins`` carried on a region signal's metadata, or ``None`` (not a hist region)."""
+    md = dict(metadata or {})
+    return int(md[REGION_META_BINS]) if REGION_META_BINS in md else None
+
+
 __all__ = [
     "AxisRange", "Selection", "SelectedData", "select_rows",
     "axis_crop_binding", "value_mask_binding", "scatter_mask_binding",
+    "encode_region", "decode_region", "region_bins",
+    "REGION_META_AXES", "REGION_META_FRAME", "REGION_META_SCOPE", "REGION_META_BINS",
 ]

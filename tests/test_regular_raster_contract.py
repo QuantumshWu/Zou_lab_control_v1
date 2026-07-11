@@ -60,15 +60,14 @@ def test_live_2d_and_data_figure_keep_the_compact_grid(monkeypatch):
         adapted = plotter.selection_rows()
         assert adapted["raster"] is grid and adapted["coordinates"] == {}
 
-        # Fingerprinting and fitting must not call the explicit full-coordinate export.
+        # Fitting must not call the explicit full-coordinate export -- it reads the compact grid's
+        # origin/spacing directly (fit_image(grid=...)).
         monkeypatch.setattr(
             RegularRaster,
             "coordinates",
             lambda *args, **kwargs: (_ for _ in ()).throw(
                 AssertionError("dense coordinate table was materialized")),
         )
-        key = plotter._fit_data_fingerprint()
-        assert key[0] == ("regular_raster", grid.shape, grid.origin, grid.spacing)
         result = plotter.data_figure.fit("center", request=FitRequest("center"))
         assert result.valid, result.status
     finally:

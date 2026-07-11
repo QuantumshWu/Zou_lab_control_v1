@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-import hashlib
 from math import ceil
 import re
 from typing import Any, Mapping, Sequence
@@ -24,6 +23,7 @@ from ..neutral_atom.core.fitting import fit_histogram
 from ..neutral_atom.core.signal_tensor import canonical_physical_shape
 from .style import (
     DESIGN_DPI,
+    FIT_DIM_ALPHA,
     HIST_FILL_ALPHA,
     bimodal_fit_line_specs,
     PALETTE,
@@ -1219,96 +1219,120 @@ class BaseLivePlot:
                 self.draw()
             return True
         if str(key) == "fit_request":
-            self._fit_request = None if value in (None, "", "none") else dict(value)
-            self._reapply_general_fit()
-            self.draw()
+            # DISPLAY flag only: the fit itself is a per-panel worker NODE (a FitProcessor), never a
+            # solve on the Qt thread (#6).  The console pushes the node's PUBLISHED result through
+            # :meth:`apply_published_fit`; clearing the request just drops the overlay.
+            if value in (None, "", "none"):
+                self.apply_published_fit(None)
             return True
         return False
 
-    def _reapply_general_fit(self) -> None:
-        """Remove this plot's previous general-fit curve and apply its structured request to
-        ``self`` via the ONE :func:`apply_fit_to_figure` primitive -- the flat-panel counterpart of the
-        grid's :meth:`GridPlot._refit_axes`, so both surfaces fit through identical code.  Tracks the drawn
-        artists so the next re-fit removes exactly one curve.
+    # ---------------------------------------------------------------- fit overlay (DISPLAY only)
+    # A curve fit is a per-panel worker NODE (a FitProcessor); this plot never solves.  The console reads
+    # the node's PUBLISHED parameters off the hub and hands them here as a FitResult, and this reconstructs
+    # the model curve (1-D / hist) or centre dot+ring (2-D) -- no ``curve_fit``, no DataFigure
+    # reconstruction, no hash on the Qt event loop (#6).  The overlay's data-line dim/restore and the 2-D
+    # view-preserving snapshot are retained.
+    def _overlay_x(self) -> np.ndarray:
+        """The x-domain the 1-D fit overlay draws its model curve over -- the plot's OWN displayed x
+        (a distribution overrides this to its bin centres)."""
+        return np.asarray(getattr(self, "data_x", ()), dtype=float).reshape(-1)
 
-        Guarded by a data+request fingerprint (the flat-panel counterpart of
-        :class:`HistogramFigure`'s ``_fit_cache_key``): a live tick that did not move the data re-runs
-        NOTHING -- no solver call, no annotation repaint -- so a pinned live fit costs one fingerprint
-        per tick instead of a fresh fit + 6-candidate bbox search every frame."""
-        request = getattr(self, "_fit_request", None)
-        ax = getattr(self, "ax", None)
-        if not request or ax is None:
-            # fit cleared / never set: drop any stale curve + cache key (so a re-enable always re-fits)
-            # AND restore the data lines' ORIGINAL alpha through the ONE overlay owner (DataFigure.clear),
-            # so turning a fit off never leaves the data dimmed (#5).
-            for art in getattr(self, "_general_fit_artists", []):
-                try:
-                    art.remove()
-                except Exception:
-                    pass
-            self._general_fit_artists = []
-            self._general_fit_key = None
-            self._last_fit_result = None
-            if ax is not None:
-                self.to_data_figure().clear()
-            return
-        key = (self._fit_data_fingerprint(), repr(sorted(dict(request).items())))
-        arts = getattr(self, "_general_fit_artists", [])
-        # Skip only when nothing moved AND the drawn curve is still attached: a focus swap / axes
-        # rebuild that wiped the artists must re-fit even on identical data.
-        if key == getattr(self, "_general_fit_key", None) and arts and all(a in ax.get_children() for a in arts):
-            return
-        self._general_fit_key = key
-        for art in arts:
+    def apply_published_fit(self, result) -> None:
+        """DISPLAY-only fit overlay: draw the per-panel FitProcessor's PUBLISHED ``result`` (a
+        :class:`FitResult` the console read off the hub) by reconstructing the model curve / centre from
+        its parameters -- NEVER a solve on the Qt thread.  ``None`` clears the overlay.
+
+        Stores the result + refreshes the overlay ARTISTS on the axes; the next coherent present renders
+        them (and :meth:`_reapply_view_knobs` re-draws them into every subsequent compose), so this never
+        triggers a cross-thread canvas draw."""
+        self._fit_overlay_result = result
+        self._last_fit_result = result            # the Setting/Edit result label reads this
+        self._draw_fit_overlay(result)
+
+    def _clear_fit_overlay(self) -> None:
+        for art in getattr(self, "_fit_overlay_artists", []) or []:
             try:
                 art.remove()
             except Exception:
                 pass
-        self._general_fit_artists = []
-        # A flat panel is a FULL plot, so its fit shows the curve + the formula/parameter annotation
-        # (is_display defaults True in apply_fit_to_figure); track EVERY child the fit added (curve + text)
-        # so a re-fit removes it all -- the flat counterpart of the grid's :meth:`GridPlot._refit_axes`.
-        before = set(id(c) for c in ax.get_children())
-        self._last_fit_result = apply_fit_to_figure(self.to_data_figure(), request)
-        self._general_fit_artists = [c for c in ax.get_children() if id(c) not in before]
+        self._fit_overlay_artists = []
+        self._restore_overlay_lines()
 
-    def _fit_data_fingerprint(self):
-        """Cheap identity of the data the general fit runs on -- the same ``data_x``/``data_y``
-        ``apply_fit_to_figure`` reads via ``to_data_figure`` -- so ``_reapply_general_fit`` can skip a
-        re-fit when nothing moved.  The digest is streamed from contiguous array buffers: retaining
-        ``tobytes()`` in the cache duplicated a 1920x1200 image plus its coordinates by 55.3 MiB and
-        allocated the same amount again on every cache probe."""
-        parts = []
-        grid = getattr(self, "raster_grid", None)
-        if grid is not None:
-            parts.append(("regular_raster", grid.shape, grid.origin, grid.spacing))
-            arrays = (getattr(self, "data_y", None),)
+    def _dim_overlay_lines(self) -> None:
+        """Fade the data lines so the fit curve reads clearly, recording each line's ORIGINAL alpha ONCE
+        (a per-tick re-dim must not capture the already-dimmed value as the 'original')."""
+        for line in list(getattr(self, "lines", []) or []):
+            if not hasattr(line, "set_alpha"):
+                continue
+            if not hasattr(line, "_zlc_fit_pre_alpha"):
+                line._zlc_fit_pre_alpha = line.get_alpha()
+            line.set_alpha(FIT_DIM_ALPHA)
+
+    def _restore_overlay_lines(self) -> None:
+        """Put each data line back to the alpha the dim recorded, then drop the sentinel -- so clearing a
+        fit never leaves the data dimmed."""
+        for line in list(getattr(self, "lines", []) or []):
+            if not hasattr(line, "_zlc_fit_pre_alpha"):
+                continue
+            original = line._zlc_fit_pre_alpha
+            line.set_alpha(1.0 if original is None else original)
+            del line._zlc_fit_pre_alpha
+
+    def _draw_fit_overlay(self, result) -> None:
+        """Reconstruct the fit overlay from PUBLISHED parameters (no solve): a centre dot + radius ring
+        for a 2-D image (view-preserving), or the model curve for a 1-D / distribution (with the data
+        line dimmed).  Removes any prior overlay first, so a re-push replaces exactly one overlay."""
+        from .data_figure import _CENTER_DOT_SIZE, _CENTER_RING_LW, _CENTER_RING_ALPHA
+        from ..neutral_atom.core.fitting import fit_model
+        ax = getattr(self, "ax", None)
+        self._clear_fit_overlay()
+        if ax is None or result is None or not result.valid:
+            return
+        spec = fit_model(result.model)
+        if spec.family == "2d":
+            # #11: the centre dot + radius ring are a READOUT overlay on the image, NOT new data -- snapshot
+            # the view (xlim/ylim, both autoscale flags, image clim) and restore it, so the scatter/patch's
+            # dataLim can never expand the image's displayed range or drop its colour limit.
+            xlim, ylim = ax.get_xlim(), ax.get_ylim()
+            auto_x, auto_y = ax.get_autoscalex_on(), ax.get_autoscaley_on()
+            clims = [(im, im.get_clim()) for im in ax.get_images()]
+            params = result.parameter_map()
+            x0, y0, radius = params["x0"], params["y0"], abs(params["radius"])
+            dot = ax.scatter(x0, y0, color=PALETTE["fit_right"], s=_CENTER_DOT_SIZE, clip_on=True)
+            circle = matplotlib.patches.Circle(
+                (x0, y0), radius=radius, edgecolor=PALETTE["fit_right"], facecolor="none",
+                linewidth=_CENTER_RING_LW, alpha=_CENTER_RING_ALPHA, clip_on=True)
+            ax.add_patch(circle)
+            self._fit_overlay_artists = [dot, circle]
+            ax.set_xlim(*xlim)
+            ax.set_ylim(*ylim)
+            ax.set_autoscalex_on(auto_x)
+            ax.set_autoscaley_on(auto_y)
+            for image, clim in clims:
+                image.set_clim(*clim)
         else:
-            arrays = (getattr(self, "data_x", None), getattr(self, "data_y", None))
-        for arr in arrays:
-            a = np.asarray(arr)
-            if a.flags.c_contiguous:
-                payload = memoryview(a).cast("B")
-            else:
-                # Plot inputs are normally canonical C arrays.  Preserve exact
-                # logical C-order semantics for an unusual strided input.
-                payload = memoryview(np.ascontiguousarray(a)).cast("B")
-            parts.append((a.shape, a.dtype.str, hashlib.sha256(payload).digest()))
-        return tuple(parts)
+            x = np.asarray(self._overlay_x(), dtype=float)
+            if x.size == 0:
+                return
+            order = np.argsort(x)
+            yfit = spec.function(x[order], *result.parameters)
+            (line,) = ax.plot(x[order], yfit, color=PALETTE["fit_right"], linestyle="-",
+                              linewidth=2, alpha=0.5)
+            self._fit_overlay_artists = [line]
+            self._dim_overlay_lines()
 
     def _reapply_view_knobs(self) -> None:
-        """Re-apply this plot's stored VIEW knobs after each live tick -- the general curve fit (re-fit to the
-        fresh data) then the pinned x-window (``_view_xlim``) -- so an Edit-tab Fit / Apply-limits STICKS
-        instead of being wiped by the tick's re-autoscale.  This is the flat-panel counterpart of a grid's
-        :meth:`GridPlot._apply_view_knobs` (which re-applies the SAME knobs per cell inside
-        :meth:`update_cells`): the ONE physical rule -- a display knob only persists if ``draw`` re-applies it
-        every tick -- now holds on both surfaces.  A no-op unless a knob is set, so a plain plot and a grid
-        (which stores its knobs per cell, never here) pay nothing."""
+        """Re-apply this plot's stored VIEW knobs after each live tick -- redraw the DISPLAY fit overlay
+        from the last PUBLISHED result (so it survives the tick's data redraw) then the pinned x/y-window
+        (``_view_xlim``/``_view_ylim``) -- so an Edit-tab Fit / Apply-limits STICKS instead of being wiped
+        by the tick's re-autoscale.  The overlay redraw is a draw of already-solved parameters (no solve),
+        so a live tick pays no fit compute on the Qt thread.  A no-op unless a knob is set."""
         ax = getattr(self, "ax", None)
         if ax is None:
             return
-        if getattr(self, "_fit_request", None):
-            self._reapply_general_fit()
+        if getattr(self, "_fit_overlay_result", None) is not None:
+            self._draw_fit_overlay(self._fit_overlay_result)
         if getattr(self, "_view_xlim", None) is not None:
             ax.set_xlim(*self._view_xlim)
         if getattr(self, "_view_ylim", None) is not None:
@@ -1741,10 +1765,17 @@ class Live2DDis(BaseLivePlot):
     _DIST_SAMPLE_CAP = 200_000
 
     def _distribution_values(self):
-        vals = self.data_y[: self.points_done, 0]
-        if vals.size > self._DIST_SAMPLE_CAP:
-            vals = vals[:: vals.size // self._DIST_SAMPLE_CAP + 1]   # even stride -> unbiased sample
-        return vals[np.isfinite(vals)]
+        full = self.data_y[: self.points_done, 0]
+        if full.size > self._DIST_SAMPLE_CAP:
+            strided = full[:: full.size // self._DIST_SAMPLE_CAP + 1]   # even stride -> unbiased sample
+            finite = strided[np.isfinite(strided)]
+            if finite.size:
+                return finite
+            # A SPARSE value-mask roi_frame (a small hist ROI): the even stride missed the FEW in-band
+            # pixels, so the sample is all-NaN -> the colour limit would collapse to NaN and the image
+            # render BLANK (#4).  Fall back to ALL finite pixels of the full frame so the in-band pixels
+            # set the clim + side histogram; the out-of-band NaN pixels draw as the cmap's bad colour.
+        return full[np.isfinite(full)]
 
     def _init_distribution(self) -> None:
         vals = self._distribution_values()
@@ -3668,6 +3699,11 @@ class HistogramFigure(BaseLivePlot):
             self.stats_text.set_text(f"gauss mean={mu:.4g}\nsd={abs(sigma):.3g}{out_text}")
         else:
             self.stats_text.set_text(f"single peak (no split){out_text}")
+
+    def _overlay_x(self) -> np.ndarray:
+        """The fit overlay draws its model curve over the BIN CENTRES (a distribution's x is the sample
+        VALUE, not the sample index) -- so the published-parameter gaussian reads over the histogram."""
+        return (np.asarray(self.bins[:-1], dtype=float) + np.asarray(self.bins[1:], dtype=float)) / 2.0
 
     def selection_rows(self) -> dict[str, object]:
         """Distribution selection is a value range, not sample-index x."""
