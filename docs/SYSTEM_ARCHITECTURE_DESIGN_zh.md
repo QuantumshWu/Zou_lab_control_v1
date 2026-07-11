@@ -40,7 +40,7 @@
 - 非标量数据会自动得到一个可见、可改的默认视图；当选择或降维要进入 fit、scan y 或派生 artifact 等权威结果时，必须冻结为 CommittedTransform，不再暗中取第 0 项；
 - history gap、schema change、缺帧和硬件 mismatch 会明确失败，不再显示拼接结果；
 - qCMOS只有在E0证明目标工作点的确定性外触发/按序交付envelope、preflight trigger余量通过且整run EndAttestation一致时才可产出Formal ScanArtifact；否则只能monitor或整run INVALID重跑；
-- qCMOS 正式扫描一次 arm并由 FPGA 无缝执行完整冻结 scan table；仅 API-slot 无法无缝更新时沿用既有 segmented 路径，SCAN_SLOT/MOT 不允许退化为逐 cell host stepping；
+- qCMOS 正式扫描一次 arm整个run session、用按max-inflight定容的driver ring持续排空全部帧，并由 FPGA 无缝执行完整冻结 scan table；仅 API-slot 无法无缝更新时沿用既有 segmented 路径，SCAN_SLOT/MOT 不允许退化为逐 cell host stepping；
 - Stop 后若设备尚未确认退出，UI 显示 `CANCELLING`，不会提前宣称已停止；
 - 设备冲突会提示并等待原 owner 真正退出，而不是静默抢占；
 - 保存文件只接受当前 artifact schema；历史数据通过独立离线转换工具处理；
@@ -121,7 +121,7 @@ validity 不能只停在 `(R,P)`：readout fidelity 已经产生 `(group,site)` 
 
 多 signal `next_coherent_update` 当前会寻找下一个共同 provenance 并推进掉更快流的 unmatched 更新；这对 coherent monitor 可以接受，却不能自动代表 formal EXACT_KEY。JoinPolicy 必须在 pipeline 合同中显式区分“允许跳过并计数”与“缺 key 立即失败”。
 
-真 qCMOS 的 capture `nFrameCount` 是产出帧累计数；仓库 DCAM wrapper 还暴露 framestamp/camerastamp/timestamp，但当前 adapter 丢弃这些 metadata，也没有证明外触发工作区间内“一触发一帧、按序、无漏帧”。若只循环 `read_frames(1)` 并在 host 缓冲中取 latest，中间帧仍会被软件丢弃。近期修复不改变冻结 bitstream：E0 用真实相机和目标 exposure/ROI/readout/触发间距证明确定性外触发 envelope；preflight 用编译后 trigger schedule 与该 envelope 的最小帧间隔+安全余量拒绝过快 scan；运行时一次 arm完整帧预算、顺序保存全部 metadata，整 run结束后用现有 FPGA completion/progress回读、冻结计划的 trigger总数、相机产出数与 frame/camera stamp/timestamp连续性对账。任一不符使整个 run INVALID并重跑。该合同不能像逐沿硬件 tag那样定位具体错误，也不能绝对排除漏一帧同时多一帧的等量抵消；这是冻结硬件约束下明确接受的剩余风险，不能在文档中伪装成同等证明强度。
+真 qCMOS 的 capture `nFrameCount` 是产出帧累计数；仓库 DCAM wrapper 还暴露 framestamp/camerastamp/timestamp，但当前 adapter 丢弃这些 metadata，也没有证明外触发工作区间内“一触发一帧、按序、无漏帧”。若只循环 `read_frames(1)` 并在 host 缓冲中取 latest，中间帧仍会被软件丢弃。近期修复不改变冻结 bitstream：E0 用真实相机和目标 exposure/ROI/readout/触发间距证明确定性外触发 envelope；preflight 用编译后 trigger schedule 与该 envelope 的最小帧间隔+安全余量拒绝过快 scan；运行时一次 arm整个run session，DCAM ring只按max-inflight与排空延迟定容，dedicated drain顺序复制全部帧和metadata到exact retention，而不是按`total_frames`分配同样多的相机buffer。整 run结束后用现有 FPGA completion/progress回读、冻结计划的 trigger总数、相机产出数与 frame/camera stamp/timestamp连续性对账。任一不符使整个 run INVALID并重跑。该合同不能像逐沿硬件 tag那样定位具体错误，也不能绝对排除漏一帧同时多一帧的等量抵消；这是冻结硬件约束下明确接受的剩余风险，不能在文档中伪装成同等证明强度。
 
 ### 3.6 UI 与 render 所有权不清
 
@@ -1799,7 +1799,9 @@ Preflight
   从 camera envelope 得到 minimum safe frame interval
   验证每个相邻有效 trigger间距 >= minimum + configured margin
   验证 total frames/bytes <= qCMOS finite buffer/driver/device capacity
-  若table超过resident window，验证每chunk playback time >= refill p99 + margin
+  若table超过resident window，要求REFILLED_END_ATTESTED capability：单I/O owner、
+  chunk playback >= 已批准worst-case refill budget，并可用camera trigger timestamp
+  对完整schedule做chunk-seam residual attestation；否则fire前拒绝
   冻结 camera settings readback；不满足则不 arm
 
 Run
@@ -1913,6 +1915,8 @@ zlc_pulse 拥有：
 
 它不拥有 MOT/readout 等实验 template、DeviceBinding、RunPlan、ScanCellKey、Qt editor 或 panel。neutral template 产生 PulseDocument/scan binding request，workbench editor 产生 PulseDocument command，二者都通过 pulse public API；pulse 不为调用方反向增加字段。当前只有 FPGA 一个生产 target，因此 compiler 可以是清晰的 concrete implementation；只有第二个可运行 target 出现且共享 IR 经过验证后，才抽 `PulseTarget` Protocol，不能先建立 target plugin/registry。
 
+Pulse文件导入是本系统唯一明确的历史格式产品能力，不是runtime兼容层。当前authoring格式固定为`schema="zlc_pulse.PulseDocument"`、`version=1`，以显式`kind=table|sequence`区分可编辑table与raw sequence；所有save只写该格式，compiled artifact不作为同名`_program.json` sibling。`zlc_pulse.load()`只按封闭矩阵识别历史`PulseTableState v1-v4`与`PulseSequence v2`，由每个历史版本的直接parser构造当前PulseDocument，随后立即执行当前验证；不创建LegacyPulse对象、不使用v1->v2->v3逐级upgrade链，也不让`PulseDocument.from_dict`、RPyC、wire或runtime接受历史schema。缺失port topology、单位、signed convention或slot语义而无法唯一恢复时返回typed migration error并要求显式mapping，绝不按字段存在、shape或名字猜测。历史pulse golden fixture永久保留为load合同；该例外不扩展到Figure、Calibration、ScanArtifact或compiled `_program.json`。
+
 ### 15.2 Authoring spec 与 resolved manifest
 
 ```text
@@ -1991,7 +1995,7 @@ PreparedProgramRef 是 host/server软件 guard，不伪装成硬件 one-shot tok
 
 expected trigger count/schedule 来自compiler对实际配置的唯一camera output channel、active polarity、clock mux、相邻高段合并、channel delay和全部合法slot values的确定性展开；camera channel不能同时配置为clk_enable。该schedule用于preflight间距与末端映射，不声称是运行时逐沿回读。
 
-超过resident scan window时只使用当前bitstream/host已经支持并经过golden+真机验证的finite stream/ping-pong路径。preflight根据每chunk点数、最短point duration、transport/refill benchmark计算`chunk_playback_time >= refill_p99 + safety_margin`；无法证明时拒绝、减慢scan或缩小table，不能接受runtime underflow stall后仍称“无缝”。软件记录chunk seq/count/digest并在现有可读状态范围内fail closed，但不得假定RTL拥有尚未实现的CRC verifier、BANK_VERIFIED或新sticky fatal。若故障注入发现静默bank损坏/回放，这是现有RTL/协议问题证据，可触发最小修复评估；没有证据不重烧。
+当前冻结硬件提供两个证明等级，但物理执行都仍是一次fire完整冻结table的`AUTONOMOUS_STREAMED`，绝不host-step。`AUTONOMOUS_RESIDENT_FORMAL`要求table不超过`2 * scan_bank_size`（当前默认4096行），全部数据fire前resident，硬件时序不依赖host。超过resident window只可进入`AUTONOMOUS_REFILLED_END_ATTESTED`：一个final `FiniteScanStreamer` I/O owner同时负责status、cursor、bank refill、progress、cancel与completion，删除monitor thread和`wait_done()`争用同一transport的双owner；preflight必须证明`chunk_playback_time >= measured worst completed refill transaction + transport timeout budget + scheduler/GC safety allowance`，不能用p99冒充上界；E0还必须证明qCMOS timestamp是trigger相关时间且分辨率/漂移足以把每帧与完整compiled schedule比较，run末对所有chunk seam执行timestamp residual attestation。任何间隔偏移、状态/coverage错误或无法排除的underflow使整run INVALID。若transport或camera capability不能满足这些条件，preflight返回`FormalScanCapacityExceeded(resident_limit, capability_unavailable_reason)`并拒绝大表；这是冻结硬件的诚实能力边界，不是静默fallback。软件记录chunk seq/count/digest并在现有可读状态范围内fail closed，但不得假定RTL拥有尚未实现的CRC verifier、BANK_VERIFIED或新sticky fatal。
 
 任何prepare/upload/identity validation失败都不得调用FIRE。重连改变connection_generation，旧PreparedProgramRef在软件侧失效；即使设备仍保留旧active image也不能由正式路径误触发。API-slot segmented路径每段同样冻结自己的values与artifact lineage。
 
@@ -2085,7 +2089,7 @@ FigureArtifact 保存 ViewSpec、当次 EvaluatedFigureData 的 input revision/r
 
 ### 16.4 当前 schema 与离线转换
 
-正式 runtime 只接受当前 schema。历史转换使用独立离线工具。
+除`zlc_pulse`封闭支持矩阵内的历史pulse file importer外，正式runtime、wire和其它artifact只接受当前schema。pulse importer只产生当前PulseDocument且save永远写当前格式；它不是逐版本runtime upgrader。其它历史转换使用独立离线工具。
 
 转换工具读取明确指定的旧 artifact，输出新的当前-schema artifact，并记录 source digest、converter id/version 与转换 TransformRecords；它不覆盖原文件，也不把 legacy reader 链接进 runtime/GUI。无法无歧义恢复的 axis、unit 或 provenance 必须停止并要求用户提供映射，不能按 shape 猜。
 
@@ -2115,7 +2119,7 @@ PerformanceBudget 计算物理保留字节而不是简单 `payload × subscriber
 
 优化后 target IR/wire image 必须保持等价，时间和内存对点数近似线性。
 
-Formal Scan性能预算另包含两项硬门：展开repeat后的`total_frames × frame_bytes`必须同时满足qCMOS finite buffer、driver可分配容量、exact retention/consumer预算；超过resident FPGA scan window时，最坏chunk playback时间必须覆盖实测refill p99+margin。任何一项不能证明就preflight拒绝或降低scan rate，不能依靠运行时stall、内存swap或丢帧维持表面可运行。
+Formal Scan性能预算另包含两项硬门：展开repeat后的`total_frames × frame_bytes`必须满足host exact retention/consumer与artifact流写预算，qCMOS driver ring则按`max_inflight × frame_bytes`及实测drain latency独立定容，不能把总帧数误当driver buffer数；超过resident FPGA scan window时，最坏chunk playback时间必须覆盖批准的worst-case refill budget，且qCMOS timestamp residual能在run后检出chunk-seam stall。任何一项不能证明就preflight拒绝或降低scan rate，不能依靠运行时stall、内存swap或丢帧维持表面可运行。
 
 ### 17.3 UI 与 analysis
 
@@ -2242,8 +2246,8 @@ Stream：
 - E0报告保存样本量、观察loss/reorder率与统计上界；未达到PI批准的样本量/上界/margin不能发布envelope；
 - preflight从编译后有效trigger schedule计算所有相邻间距并要求`interval >= camera minimum + configured margin`；边界内/外、delay/polarity、重复trigger edge均有测试；
 - repeat axis确定性展开进finite table；Formal program强制`repeat_forever=False, scan_repeats=0`，任何`scan_repeats>0`/cursor-wrap stop在compile/preflight被拒绝；repeat/point/TriggerKey round-trip覆盖多repeat；
-- qCMOS一次arm完整scan frame budget，`total_frames/bytes`同时通过camera/driver buffer与exact reservation预算；超容量在arm/fire前拒绝；frame[i]只在匹配E0 envelope时映射frozen TriggerKey[i]；
-- 超resident table的chunk playback time与refill p99+margin通过preflight；故意慢refill必须在fire前拒绝，不能以underflow stall通过“无缝”测试；
+- qCMOS一次arm整个scan session，driver ring按max-inflight定容并由dedicated drain持续排空；`total_frames/bytes`通过host exact retention与artifact预算；超容量在arm/fire前拒绝；frame[i]只在匹配E0 envelope时映射frozen TriggerKey[i]；
+- resident table走`AUTONOMOUS_RESIDENT_FORMAL`；超resident table只有在单I/O owner、worst-case refill admission与全schedule timestamp residual均通过时走`AUTONOMOUS_REFILLED_END_ATTESTED`，故意慢refill或不可观察seam stall必须在fire前/attestation时拒绝；
 - EndAttestation比较existing FPGA completion/progress、计划/现有回读trigger总数、camera produced count、frame/camera stamp、timestamp容差、DatasetBuilder coverage和EOS；任一不符整run INVALID且无ScanArtifact；
 - 注入drop/reorder/duplicate/counter reset/metadata gap/short read使整epoch失败；系统不声称能定位具体point，也不声称能检测metadata仍合法的等量loss+extra抵消；该剩余风险在artifact proof_class中可见；
 - 所有scan数据在EndAttestation前为PROVISIONAL；只有`ORDERED_END_ATTESTED_RUN` VALID后才能commit；
@@ -2426,7 +2430,7 @@ S0.5 解决的是“新切片住在哪里”，不是预先重写 9000 行 UI；
 
 先建立PulseDocument/TargetIR/CompiledPulseArtifact canonical seam，并以当前已部署bitstream对应的host/model/wire golden bytes、现有xsim/真机回读保护语义。按consumer纵向切换：compiler/server -> neutral Sequencer adapter -> workbench PulsePreviewProjector；每切一个consumer删除其旧timing/compiler/reader，不维持自动fallback。整个H1默认不修改RTL、不生成新bitstream。
 
-H1完成现有`image.build_fingerprint`/几何/ABI握手、PreparedProgramRef软件guard、repeat轴展开的finite autonomous table与camera-trigger schedule digest、当前UART/AXI/JTAG容量/错误行为和existing DONE/status/progress语义的contract kit。Formal compiler明确强制`repeat_forever=False, scan_repeats=0`并拒绝host wrap-stop；超过resident window时保存refill p99/profile并生成可供preflight使用的margin。只测试现有RTL实际提供的能力，不增加ProgramToken/CellFireToken、ROM attestation、CRC verifier、PHYSICAL_DONE或telemetry。preview通过S0.5 workbench projector使用frontend FigureDocument，不制造frontend -> pulse反向边。
+H1完成现有`image.build_fingerprint`/几何/ABI握手、PreparedProgramRef软件guard、repeat轴展开的finite autonomous table与camera-trigger schedule digest、当前UART/AXI/JTAG容量/错误行为和existing DONE/status/progress语义的contract kit。Formal compiler明确强制`repeat_forever=False, scan_repeats=0`并拒绝host wrap-stop；resident table直接形成最强Formal capability。超过resident window时必须把finite scan收敛为单一I/O owner，保存worst completed refill transaction/timeout/scheduler allowance并由qCMOS timestamp schedule residual补足run后证明；不满足则明确拒绝大表。只测试现有RTL实际提供的能力，不增加ProgramToken/CellFireToken、ROM attestation、CRC verifier、PHYSICAL_DONE或telemetry。preview通过S0.5 workbench projector使用frontend FigureDocument，不制造frontend -> pulse反向边。
 
 ### H2：证据驱动的可选硬件修复门
 
@@ -2458,7 +2462,7 @@ H2默认不排期。只有以下任一证据成立才可创建提案：
 只有E0 CameraExternalTriggerEnvelope、H1冻结bitstream合同、S1 exact acquisition与S3 StreamProcessor/DatasetBuilder全部通过才开始：
 
 1. bind declared ExactSourcePipeline，fire 前建立全链 reservation/cursor/budget/ack；不得借用 monitor worker。
-2. repeat轴展开进`repeat_forever=False, scan_repeats=0`的finite table；preflight冻结camera readback与compiled trigger schedule，验证trigger interval、total frame/byte buffer和chunk refill margin；camera一次arm完整帧预算，FPGA一次fire完整SCAN_SLOT table并无缝自主执行。
+2. repeat轴展开进`repeat_forever=False, scan_repeats=0`的finite table；preflight冻结camera readback与compiled trigger schedule，验证trigger interval、host total frame/byte retention与camera max-inflight ring。resident table使用`AUTONOMOUS_RESIDENT_FORMAL`；大表只有单I/O refill owner、worst-case admission与timestamp schedule residual capability全部存在时使用`AUTONOMOUS_REFILLED_END_ATTESTED`。camera一次arm整个run session，FPGA一次fire完整SCAN_SLOT table并无缝自主执行。
 3. adapter按E0证明的delivery order将frame[i]映射为frozen TriggerKey[i]，全链数据保持PROVISIONAL；run末端比较existing FPGA completion/progress、expected/produced total、frame/camera stamps、timestamp容差、coverage/EOS，全部通过才VALID。
 4. 迁scan-slot/API-slot request、ScanOutputContract、multidimensional y和ScanArtifact Repository；MOT只允许SCAN_SLOT/AUTONOMOUS_STREAMED，不加API或host-stepped fallback。API_SLOT无法无缝更新时仅沿用`API_SLOT_SEGMENTED_EXISTING`，每segment及aggregate均对账。
 5. 对drop/reorder/duplicate/short read/counter reset/timestamp gap、camera总buffer或refill margin不足、旧`scan_repeats`多发point、schema generation、component invalidity、RemoteSequencer abort与provisional epoch做整runreject-and-redo真机测试；重试默认手动，自动策略必须显式有界并保存失败attempt。
@@ -2476,7 +2480,7 @@ H2默认不排期。只有以下任一证据成立才可创建提案：
 
 ### Z0：零残余审计
 
-- legacy path/symbol/fixture/reader、双 registry、双 codec、双 fit owner 为 0；
+- 除唯一`zlc_pulse`历史pulse file importer及其golden fixtures外，legacy path/symbol/reader、双 registry、双 codec、双 fit owner 为 0；
 - reverse import 为 0，FPGA domain key 泄漏为 0，stream 上的累计 DataBlock/DataPatch 为 0；
 - giant smoke/source-location/private-structure tests 删除；
 - docs/notebooks 只描述当前 public path；
@@ -2566,7 +2570,7 @@ apps/
 
 ## 21. 删除清单
 
-删除由**最后一个真实 consumer 消失的 dependency-closed 切片**负责。不得因为 S1/S2 首次建立替代品就提前删掉仍被 S3/S5 使用的能力，也不得以“还有别的 consumer”为由让已迁 use case 继续双写/双读。至少固定：camera live panel 的旧显示旁路 -> S1；共享旧 camera frame producer/LogicNode + Occupancy/ROI/readout/sitemap reactive chain -> S3；旧 fitting/selection/facet/raster -> 其最后一个 legacy frontend/processor consumer 所在的 S3/S5/Z0；session calibration fallback/旧 Occupancy outputs -> S3；旧 positional/latest-polling PulseScan -> S4；TaskOutput、LegacyPanelHost、LegacyRuntimeFence、SerializedLegacyAggBridge、剩余 TaskConsole god shell -> 最后 consumer 的 S5/Z0；legacy pulse upgrader/旧 compiler consumer -> 对应 H1 consumer切换提交。每项在路线图/PR checklist记录replacement、全部consumers、shared ResourceKeys、first migrated slice、last consumer slice与物理删除证据。
+删除由**最后一个真实 consumer 消失的 dependency-closed 切片**负责。不得因为 S1/S2 首次建立替代品就提前删掉仍被 S3/S5 使用的能力，也不得以“还有别的 consumer”为由让已迁 use case 继续双写/双读。至少固定：camera live panel 的旧显示旁路 -> S1；共享旧 camera frame producer/LogicNode + Occupancy/ROI/readout/sitemap reactive chain -> S3；旧 fitting/selection/facet/raster -> 其最后一个 legacy frontend/processor consumer 所在的 S3/S5/Z0；session calibration fallback/旧 Occupancy outputs -> S3；旧 positional/latest-polling PulseScan -> S4；TaskOutput、LegacyPanelHost、LegacyRuntimeFence、SerializedLegacyAggBridge、剩余 TaskConsole god shell -> 最后 consumer 的 S5/Z0；旧pulse多点upgrade call site、旧schema writer、runtime/wire reader、compiled sibling与逐版本upgrade链 -> H1，替代为唯一直接historical-file parser。每项在路线图/PR checklist记录replacement、全部consumers、shared ResourceKeys、first migrated slice、last consumer slice与物理删除证据。
 
 完成态不存在：
 
@@ -2599,7 +2603,7 @@ apps/
 - dynamic FQCN task/device import；
 - universal ArtifactRef；
 - FigureDocument 中的 LiveDataBlockRef、partial success artifact、manifest 前可见的半写文件；
-- legacy pulse upgrader/fixtures/readers；
+- pulse逐版本upgrade链、旧schema writer、多点legacy call site、runtime/wire旧reader与compiled `_program.json` sibling；唯一historical pulse file parser及其golden fixtures保留；
 - sibling `_program.json`；
 - tracked FPGA fallback literals；
 - 文档/host把当前RTL并不存在的CRC/BANK_VERIFIED/逐沿receipt冒充既有能力；
@@ -2668,7 +2672,7 @@ Pulse/FPGA：
 - 可观察的gap/duplicate/out-of-order/count/stamp/timestamp/EOS不一致使整run INVALID且不提交；accepted equal loss+extra residual risk在provenance可见；
 - TriggerKey/ScanCellKey/ScanArtifact 保留多维 point/output axes；
 - S4使用现有FPGA完整自主scan table；neutral按frozen schedule + ordered camera frames映射TriggerKey，末端验证后才转VALID；
-- camera总frame/byte buffer与超resident chunk refill p99 margin均在fire前证明；运行时underflow stall不算无缝成功；
+- camera max-inflight ring与host total frame/byte retention分别在fire前证明；resident/超resident证明等级可见，超resident需要单I/O owner、worst-case refill admission与全schedule timestamp residual，运行时underflow stall不算无缝成功；
 - MOT只使用SCAN_SLOT + AUTONOMOUS_STREAMED；无API或host-stepped fallback；
 - API segmented每segment和aggregate双层EndAttestation；INVALID attempt可见且不会被无限自动重试隐藏；
 - build/target digest 闭环；
