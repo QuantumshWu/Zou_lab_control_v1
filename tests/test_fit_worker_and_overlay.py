@@ -13,7 +13,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sys
-import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -69,10 +68,10 @@ def test_fit_processor_consumes_source_and_region_signals():
     assert abs(hub.latest("fit_y0")[0, 0, 0] - 60.0) < 2.0
 
 
-def test_hist_fit_uses_binned_data_and_is_instant():
+def test_hist_fit_uses_binned_data_not_raw_samples():
     """#5: a distribution fit runs on the BINNED (centers, counts) carried on the region -- finite
-    params, and O(bins) fast (< ~50 ms) even for a multi-megapixel sample source, because it never
-    fits the raw per-pixel samples."""
+    params -- and the solver sees ONLY the bins (fit_points <= bins), NEVER the millions of raw
+    per-pixel samples.  ``fit_points`` is the DETERMINISTIC proof the fit is O(bins), not a wall clock."""
     rng = np.random.default_rng(0)
     samples = rng.normal(600.0, 25.0, size=(1200, 1920)).astype(np.float64).reshape(1, 1, 1200, 1920)
     hub = _hub_with("frame_h", samples)
@@ -81,17 +80,14 @@ def test_hist_fit_uses_binned_data_and_is_instant():
     node = FitProcessor(hub, source_expr={"inputs": ["frame_h"], "source": "value = signal"},
                         region="h_region", fit_request={"model": "gaussian"})
     hub.publish({"frame_h": samples})
-    t0 = time.perf_counter()
     node.step()
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     params = {name: float(hub.latest(f"fit_{name}")[0, 0, 0]) for name in fit_model("gaussian").names}
     assert bool(hub.latest("fit_valid")[0, 0, 0])
     assert np.isfinite(list(params.values())).all()
     assert abs(params["x0"] - 600.0) < 5.0 and abs(params["sigma"] - 25.0) < 5.0
-    # the solver saw ONLY the binned points, not 2.3M samples
+    # the solver saw ONLY the binned points (<= bins), not the 2.3M raw samples -- the O(bins) proof
     assert int(hub.latest("fit_points")[0, 0, 0]) <= 60
-    assert elapsed_ms < 50.0, f"hist fit took {elapsed_ms:.1f} ms -- it must fit binned data, not raw samples"
 
 
 def test_hist_fit_output_names_derive_from_the_model():

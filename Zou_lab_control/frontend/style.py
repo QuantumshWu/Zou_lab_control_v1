@@ -251,7 +251,9 @@ _PALETTE: dict[str, Any] = {
     "pulse_name": "white",   # name drawn inside a coloured pulse bar
     "pulse_grid": "0.88",
     "pulse_repeat_note": "0.35",
-    "bad": "white",          # NaN / masked cell
+    "bad": "#9a9a9a",        # NaN / masked / not-yet-measured cell: a neutral mid-grey background so an
+                             # in-band value-mask silhouette (or a partly-filled scan grid) reads AGAINST
+                             # it -- white made a masked frame invisible (white-on-white blank, #4)
     "cmap_scan": "inferno",
     "cmap_camera": "gray",
 }

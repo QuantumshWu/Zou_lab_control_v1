@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from math import ceil
 import re
 from typing import Any, Mapping, Sequence
+import warnings
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -1654,7 +1655,20 @@ def _decimate_image_view(grid, extent, xlim, ylim, budget) -> tuple[np.ndarray, 
         small, ky, kx = sub, sy, sx
     else:
         ky, kx = (sy // fy) * fy, (sx // fx) * fx
-        small = sub[:ky, :kx].reshape(ky // fy, fy, kx // fx, fx).mean(axis=(1, 3))
+        blocks = sub[:ky, :kx].reshape(ky // fy, fy, kx // fx, fx)
+        # NaN-aware area-average.  A value-mask roi_frame (a hist count-band ROI) sets OUT-of-band pixels
+        # to NaN, so a plain block ``.mean()`` returns NaN for ANY block touching one NaN -> a sparse
+        # in-band frame decimates to ALL-NaN and the whole panel renders as the bad colour (blank) even
+        # with millions of in-band pixels (#4).  When the block CAN and DOES carry NaN, reduce with
+        # ``nanmean`` so a block with >=1 finite pixel shows its in-band mean; an all-out-of-band block
+        # stays NaN (-> bad colour).  Gated dtype-FIRST so an integer camera frame (native dtype, no NaN
+        # possible) short-circuits before ``np.isnan`` ever runs -> ZERO added cost on the 2.3 MP hot path.
+        if np.issubdtype(blocks.dtype, np.floating) and np.isnan(blocks).any():
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)   # all-NaN block -> NaN (bad colour), by design
+                small = np.nanmean(blocks, axis=(1, 3))
+        else:
+            small = blocks.mean(axis=(1, 3))
     sxp = (ex1 - ex0) / nx
     syp = (ey1 - ey0) / ny
     small_extent = (ex0 + jx0 * sxp, ex0 + (jx0 + kx) * sxp,

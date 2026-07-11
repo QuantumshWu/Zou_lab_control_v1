@@ -28,7 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
-from Zou_lab_control.frontend.live import Live2DDis
+from Zou_lab_control.frontend.live import Live2DDis, _image_axes_px_budget, panel_plot_spec
 from Zou_lab_control.neutral_atom.core.raster import RegularRaster
 from Zou_lab_control.neutral_atom.core.selection import Selection, encode_region, value_mask_binding
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
@@ -92,6 +92,37 @@ def test_small_hist_roi_frame_renders_in_band_pixels_not_blank():
         assert hi_c > 100.0, f"clim top {hi_c} collapsed -- the in-band pixels would render blank"
         # the displayed image carries finite in-band pixels; the rest is NaN -> the cmap's bad colour
         assert int(np.isfinite(np.asarray(plot.image.get_array(), dtype=float)).sum()) > 0
+    finally:
+        plt.close(plot.fig)
+
+
+def test_full_frame_value_mask_survives_panel_decimation_not_blank():
+    """The REAL bug the user saw: a FULL-frame (1920x1200) value-mask roi_frame on a 2x2 panel is
+    block-mean DECIMATED to the axes budget before imshow.  A plain block mean returns NaN for ANY
+    block touching one out-of-band NaN, so a sparse in-band frame decimates to ALL-NaN and the panel
+    renders 100% blank -- even with millions of in-band pixels.  NaN-aware decimation keeps every block
+    that holds >=1 finite pixel, so the in-band silhouette survives.  Driven through the REAL Live2DDis
+    display-refresh / decimation path at a realistic panel budget."""
+    H, W = 1200, 1920
+    rng = np.random.default_rng(0)
+    frame = np.where(rng.random((H, W)) < 0.5, rng.normal(600.0, 20.0, (H, W)), rng.normal(200.0, 12.0, (H, W)))
+    lo, hi = 590.0, 610.0                                      # a narrow band: a minority of pixels in-band
+    roi_frame = np.where((frame >= lo) & (frame <= hi), frame, np.nan)
+    in_band = int(np.isfinite(roi_frame).sum())
+    assert 0 < in_band < roi_frame.size
+
+    plot = Live2DDis(RegularRaster(shape=(H, W)), roi_frame.reshape(-1, 1),
+                     labels=["x", "y", "counts"], spec=panel_plot_spec("2x2")).show(display=False)
+    try:
+        bx, by = _image_axes_px_budget(plot.ax)
+        assert bx < W and by < H, "test setup: the 2x2 panel budget must force real decimation"
+        shown = np.asarray(plot.image.get_array(), dtype=float)   # what imshow actually rasterizes
+        assert shown.size < roi_frame.size                        # it WAS decimated (not the full frame)
+        finite = int(np.isfinite(shown).sum())
+        # WITHOUT the fix this is 0 (all-NaN -> blank).  With NaN-aware decimation a substantial fraction
+        # of cells carry an in-band mean -- the user's masked frame lights up instead of white-on-white.
+        assert finite > 0, "decimated roi_frame is all-NaN -> the panel renders blank (#4)"
+        assert finite > 0.3 * shown.size, f"only {finite}/{shown.size} cells finite -- too sparse to read"
     finally:
         plt.close(plot.fig)
 
