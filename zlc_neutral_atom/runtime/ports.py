@@ -9,7 +9,7 @@ from __future__ import annotations
 import threading
 import math
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass
 from enum import Enum
 from types import MappingProxyType
 from typing import Callable, Mapping, TypeVar
@@ -47,7 +47,6 @@ class SafetyOperation(str, Enum):
     SAFE_STATE = "SAFE_STATE"
     DISARM = "DISARM"
     READ_STATUS = "READ_STATUS"
-    CLOSE_SESSION = "CLOSE_SESSION"
 
 
 @dataclass(frozen=True)
@@ -70,6 +69,42 @@ class SafeStateAck:
     acknowledgement_digest: str
 
     def __post_init__(self) -> None:
+        _canonical_text(self.acknowledgement_digest, "acknowledgement_digest")
+
+
+@dataclass(frozen=True)
+class SessionCloseCommand:
+    session_id: str
+    timeout_seconds: float
+
+    def __post_init__(self) -> None:
+        _canonical_text(self.session_id, "session_id")
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, (int, float))
+            or not math.isfinite(float(self.timeout_seconds))
+            or float(self.timeout_seconds) <= 0
+        ):
+            raise ValueError("timeout_seconds must be finite and positive")
+        object.__setattr__(self, "timeout_seconds", float(self.timeout_seconds))
+
+
+@dataclass(frozen=True)
+class SessionClosedAck:
+    session_id: str
+    binding_id: str
+    connection_generation: str
+    source_stopped: bool
+    no_more_work: bool
+    joined: bool
+    acknowledgement_digest: str
+
+    def __post_init__(self) -> None:
+        for field in ("session_id", "binding_id", "connection_generation"):
+            _canonical_text(getattr(self, field), field)
+        for field in ("source_stopped", "no_more_work", "joined"):
+            if type(getattr(self, field)) is not bool:
+                raise TypeError(f"{field} must be bool")
         _canonical_text(self.acknowledgement_digest, "acknowledgement_digest")
 
 
@@ -109,6 +144,7 @@ _BOUND_DEVICE_TOKEN = object()
 _BROKER_OPEN_TOKEN = object()
 _SAFETY_PROOF_TOKEN = object()
 _VERIFIED_IDENTITY_TOKEN = object()
+_VERIFIED_CAPABILITY_TOKEN = object()
 
 
 @dataclass(frozen=True)
@@ -153,6 +189,40 @@ class SafetyProof:
     def receipt(self) -> SafeReceipt:
         return self._receipt
 
+
+class VerifiedDeviceCapability:
+    """Broker-minted immutable readback bound to one device generation."""
+
+    __slots__ = ("_broker", "_device", "_snapshot", "_nonce")
+
+    def __init__(
+        self,
+        token: object,
+        *,
+        broker: "DeviceBroker",
+        device: "BoundDevice",
+        snapshot: object,
+        nonce: object,
+    ) -> None:
+        if token is not _VERIFIED_CAPABILITY_TOKEN:
+            raise PermissionError(
+                "VerifiedDeviceCapability can only be minted by DeviceBroker"
+            )
+        object.__setattr__(self, "_broker", broker)
+        object.__setattr__(self, "_device", device)
+        object.__setattr__(self, "_snapshot", snapshot)
+        object.__setattr__(self, "_nonce", nonce)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("VerifiedDeviceCapability is immutable")
+
+    @property
+    def device(self) -> "BoundDevice":
+        return self._device
+
+    @property
+    def snapshot(self) -> object:
+        return self._snapshot
 
 class VerifiedBoundDeviceIdentity:
     """Opaque result of a broker-owned physical identity handshake."""
@@ -201,7 +271,9 @@ class _DeviceEndpoint:
     stable_device_identity: str
     connection_generation: str
     execute_command: Callable[[object], object]
+    capability_probe: Callable[[], object] | None
     cleanup_operations: Mapping[SafetyOperation, Callable[[], CleanupStepAck]]
+    close_session: Callable[[SessionCloseCommand], SessionClosedAck] | None
     verify_safe_state: Callable[[], SafeStateAck]
     interrupt_operations: Mapping[SafetyOperation, Callable[[], object]]
     recovery_probe: Callable[[], RecoveryAck] | None
@@ -217,6 +289,7 @@ class BoundDevice:
         "_binding_id",
         "_safety_capabilities",
         "_interrupt_capabilities",
+        "_session_cleanup_capable",
         "_broker",
     )
 
@@ -243,6 +316,11 @@ class BoundDevice:
         )
         object.__setattr__(
             self, "_interrupt_capabilities", frozenset(endpoint.interrupt_operations)
+        )
+        object.__setattr__(
+            self,
+            "_session_cleanup_capable",
+            endpoint.close_session is not None,
         )
         object.__setattr__(self, "_broker", broker)
 
@@ -273,6 +351,18 @@ class BoundDevice:
     def interrupt_capabilities(self) -> frozenset[SafetyOperation]:
         return self._interrupt_capabilities
 
+    @property
+    def session_cleanup_capable(self) -> bool:
+        return self._session_cleanup_capable
+
+    def validate_capability(
+        self,
+        proof: VerifiedDeviceCapability,
+    ) -> object:
+        """Return the snapshot only while this exact broker proof is current."""
+
+        return self._broker.validate_capability(proof, self)
+
 
 class DeviceBroker:
     """Composition authority that owns raw callbacks and active run bindings."""
@@ -283,6 +373,10 @@ class DeviceBroker:
         self._current_by_key: dict[ResourceKey, BoundDevice] = {}
         self._current_by_stable_identity: dict[str, BoundDevice] = {}
         self._verified_identities: dict[object, VerifiedBoundDeviceIdentity] = {}
+        self._verified_capabilities: dict[object, VerifiedDeviceCapability] = {}
+        self._capability_nonce_by_binding: dict[str, object] = {}
+        self._capability_probe_inflight: set[str] = set()
+        self._activity_epoch_by_binding: dict[str, int] = {}
         self._active: dict[str, str] = {}
         self._recovering: dict[ResourceKey, object] = {}
 
@@ -314,6 +408,8 @@ class DeviceBroker:
         execute_command: Callable[[object], object],
         cleanup_operations: Mapping[SafetyOperation, Callable[[], CleanupStepAck]],
         verify_safe_state: Callable[[], SafeStateAck],
+        capability_probe: Callable[[], object] | None = None,
+        close_session: Callable[[SessionCloseCommand], SessionClosedAck] | None = None,
         interrupt_operations: Mapping[SafetyOperation, Callable[[], object]] = MappingProxyType({}),
         recovery_probe: Callable[[], RecoveryAck] | None = None,
     ) -> BoundDevice:
@@ -323,6 +419,10 @@ class DeviceBroker:
             raise TypeError("DeviceBroker.bind requires its own VerifiedBoundDeviceIdentity")
         if not callable(execute_command):
             raise TypeError("execute_command must be callable")
+        if capability_probe is not None and not callable(capability_probe):
+            raise TypeError("capability_probe must be callable")
+        if close_session is not None and not callable(close_session):
+            raise TypeError("close_session must be callable")
         normalized_cleanup: dict[SafetyOperation, Callable[[], CleanupStepAck]] = {}
         for operation, callback in dict(cleanup_operations).items():
             if not isinstance(operation, SafetyOperation):
@@ -346,7 +446,9 @@ class DeviceBroker:
             stable_device_identity=identity.stable_device_identity,
             connection_generation=identity.connection_generation,
             execute_command=execute_command,
+            capability_probe=capability_probe,
             cleanup_operations=MappingProxyType(normalized_cleanup),
+            close_session=close_session,
             verify_safe_state=verify_safe_state,
             interrupt_operations=MappingProxyType(normalized_interrupt),
             recovery_probe=recovery_probe,
@@ -360,6 +462,11 @@ class DeviceBroker:
             previous = self._current_by_key.get(key)
             if previous is not None and previous.binding_id in self._active:
                 raise RuntimeError(f"cannot rebind active device {key}")
+            if (
+                previous is not None
+                and previous.binding_id in self._capability_probe_inflight
+            ):
+                raise RuntimeError(f"cannot rebind device {key} during capability probe")
             identity_owner = self._current_by_stable_identity.get(
                 identity.stable_device_identity
             )
@@ -375,6 +482,13 @@ class DeviceBroker:
                     "physical device replacement requires a new ResourceKey/asset mapping"
                 )
             if previous is not None:
+                previous_nonce = self._capability_nonce_by_binding.pop(
+                    previous.binding_id,
+                    None,
+                )
+                if previous_nonce is not None:
+                    self._verified_capabilities.pop(previous_nonce, None)
+                self._activity_epoch_by_binding.pop(previous.binding_id, None)
                 self._endpoints.pop(previous.binding_id, None)
             reference = BoundDevice(
                 _BOUND_DEVICE_TOKEN,
@@ -385,8 +499,80 @@ class DeviceBroker:
             self._endpoints[binding_id] = endpoint
             self._current_by_key[key] = reference
             self._current_by_stable_identity[identity.stable_device_identity] = reference
+            self._activity_epoch_by_binding[binding_id] = 0
             self._verified_identities.pop(identity._nonce)
             return reference
+
+    def verify_capability(
+        self,
+        device: BoundDevice,
+    ) -> VerifiedDeviceCapability:
+        """Freeze a device-owned capability readback for the current binding."""
+
+        if not isinstance(device, BoundDevice) or device._broker is not self:
+            raise TypeError("capability verification requires this broker's BoundDevice")
+        with self._lock:
+            if self._current_by_key.get(device.key) is not device:
+                raise RuntimeError(f"stale device binding for {device.key}")
+            if device.key in self._recovering:
+                raise RuntimeError("cannot probe capability during device recovery")
+            if device.binding_id in self._active:
+                raise RuntimeError("cannot probe capability while the device is active")
+            if device.binding_id in self._capability_probe_inflight:
+                raise RuntimeError("device capability probe is already in progress")
+            endpoint = self._endpoints[device.binding_id]
+            probe = endpoint.capability_probe
+            if probe is None:
+                raise RuntimeError("device binding has no broker-owned capability probe")
+            activity_epoch = self._activity_epoch_by_binding[device.binding_id]
+            self._capability_probe_inflight.add(device.binding_id)
+        try:
+            snapshot = probe()
+            parameters = getattr(type(snapshot), "__dataclass_params__", None)
+            if not is_dataclass(snapshot) or not parameters or not parameters.frozen:
+                raise TypeError("capability probe must return a frozen dataclass snapshot")
+            nonce = object()
+            proof = VerifiedDeviceCapability(
+                _VERIFIED_CAPABILITY_TOKEN,
+                broker=self,
+                device=device,
+                snapshot=snapshot,
+                nonce=nonce,
+            )
+            with self._lock:
+                if self._current_by_key.get(device.key) is not device:
+                    raise RuntimeError("device binding changed during capability probe")
+                if device.binding_id in self._active:
+                    raise RuntimeError("device became active during capability probe")
+                if self._activity_epoch_by_binding[device.binding_id] != activity_epoch:
+                    raise RuntimeError("a device Run crossed the capability probe")
+                previous_nonce = self._capability_nonce_by_binding.get(device.binding_id)
+                if previous_nonce is not None:
+                    self._verified_capabilities.pop(previous_nonce, None)
+                self._verified_capabilities[nonce] = proof
+                self._capability_nonce_by_binding[device.binding_id] = nonce
+            return proof
+        finally:
+            with self._lock:
+                self._capability_probe_inflight.discard(device.binding_id)
+
+    def validate_capability(
+        self,
+        proof: VerifiedDeviceCapability,
+        device: BoundDevice,
+    ) -> object:
+        if (
+            not isinstance(proof, VerifiedDeviceCapability)
+            or proof._broker is not self
+            or proof.device is not device
+        ):
+            raise TypeError("capability proof does not belong to this device binding")
+        with self._lock:
+            if self._verified_capabilities.get(proof._nonce) is not proof:
+                raise RuntimeError("capability proof is unknown or revoked")
+            if self._current_by_key.get(device.key) is not device:
+                raise RuntimeError("capability proof belongs to a stale device binding")
+        return proof.snapshot
 
     def _open(
         self,
@@ -399,6 +585,10 @@ class DeviceBroker:
         _canonical_text(run_id, "run_id")
         with self._lock:
             for binding in bindings:
+                if binding.binding_id in self._capability_probe_inflight:
+                    raise RuntimeError(
+                        f"device {binding.key} capability probe is in progress"
+                    )
                 if binding.key in self._recovering:
                     raise RuntimeError(f"device {binding.key} is undergoing recovery")
                 if binding._broker is not self:
@@ -409,6 +599,7 @@ class DeviceBroker:
                     raise RuntimeError(f"device binding {binding.key} is already active")
             for binding in bindings:
                 self._active[binding.binding_id] = run_id
+                self._activity_epoch_by_binding[binding.binding_id] += 1
         return _DeviceRunLease(self, run_id, bindings)
 
     def _endpoint_for(self, run_id: str, binding: BoundDevice) -> _DeviceEndpoint:
@@ -435,6 +626,10 @@ class DeviceBroker:
                 raise RuntimeError(f"no current device binding for recovery of {claim.key}")
             if binding.binding_id in self._active:
                 raise RuntimeError(f"device {claim.key} is active and cannot be recovered")
+            if binding.binding_id in self._capability_probe_inflight:
+                raise RuntimeError(
+                    f"device {claim.key} capability probe blocks recovery"
+                )
             if claim.key in self._recovering:
                 raise RuntimeError(f"device {claim.key} already has a recovery owner")
             endpoint = self._endpoints[binding.binding_id]
@@ -566,6 +761,28 @@ class _DeviceRunLease:
             )
         return acknowledgement
 
+    def close_session(
+        self,
+        binding: BoundDevice,
+        command: SessionCloseCommand,
+    ) -> SessionClosedAck:
+        endpoint = self._endpoint(binding)
+        callback = endpoint.close_session
+        if callback is None:
+            raise RuntimeError(f"device {binding.key} has no session cleanup capability")
+        acknowledgement = callback(command)
+        if not isinstance(acknowledgement, SessionClosedAck):
+            raise TypeError(
+                f"device {binding.key} session cleanup must return SessionClosedAck"
+            )
+        if acknowledgement.session_id != command.session_id:
+            raise ValueError("session cleanup acknowledgement belongs to another session")
+        if acknowledgement.binding_id != binding.binding_id:
+            raise ValueError("session cleanup acknowledgement binding differs")
+        if acknowledgement.connection_generation != binding.connection_generation:
+            raise ValueError("session cleanup acknowledgement generation differs")
+        return acknowledgement
+
     def verify_safe_state(self, binding: BoundDevice) -> SafeReceipt:
         endpoint = self._endpoint(binding)
         acknowledgement = endpoint.verify_safe_state()
@@ -636,6 +853,16 @@ class CleanupDevice:
         return self._context._execute_cleanup_step(  # type: ignore[attr-defined, no-any-return]
             self._binding,
             operation,
+        )
+
+    def close_session(
+        self,
+        session_id: str,
+        timeout_seconds: float,
+    ) -> SessionClosedAck:
+        return self._context._close_bound_device_session(  # type: ignore[attr-defined, no-any-return]
+            self._binding,
+            SessionCloseCommand(session_id, timeout_seconds),
         )
 
     def verify_safe_state(self) -> SafetyProof:

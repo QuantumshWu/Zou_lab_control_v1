@@ -482,6 +482,13 @@ class ExactReservation(Generic[PayloadT]):
         with self._stream._condition:
             return self._ack_sequence
 
+    @property
+    def materializer_bound(self) -> bool:
+        """Whether the exact reservation already has its single dataset owner."""
+
+        with self._stream._condition:
+            return self._materializer is not None
+
     def activate(self) -> "AcquisitionCursor[PayloadT]":
         with self._stream._condition:
             if self._state is not ReservationState.RESERVED:

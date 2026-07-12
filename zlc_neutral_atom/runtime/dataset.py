@@ -135,6 +135,7 @@ class SnapshotExpired(DatasetError):
 
 
 _SEALED_TOKEN = object()
+_READINESS_TOKEN = object()
 
 
 def _sha256_digest(value: str, field: str) -> str:
@@ -267,6 +268,42 @@ class DatasetPreviewSnapshot:
     def block(self) -> DataBlock:
         return self.snapshot.block
 
+
+class ExactDatasetReadiness:
+    """Opaque proof that one exact reservation has its frozen materializer owner."""
+
+    __slots__ = ("_builder",)
+
+    def __init__(self, authority: object, builder: "DatasetBuilder") -> None:
+        if authority is not _READINESS_TOKEN:
+            raise PermissionError("ExactDatasetReadiness is minted by DatasetBuilder")
+        object.__setattr__(self, "_builder", builder)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("ExactDatasetReadiness is immutable")
+
+    def validate(
+        self,
+        *,
+        reservation: ExactReservation,
+        schema: DatasetSchema,
+        event_adapter: DatasetEventAdapter,
+        expected_cells: tuple[DatasetCellAddress, ...],
+    ) -> None:
+        builder = self._builder
+        with builder._lock:
+            if builder._sealed or builder._aborted:
+                raise DatasetError("dataset materializer readiness is no longer active")
+            if builder._reservation is not reservation:
+                raise DatasetError("dataset readiness belongs to another reservation")
+            if builder.schema is not schema:
+                raise DatasetError("dataset readiness schema differs")
+            if builder._event_adapter is not event_adapter:
+                raise DatasetError("dataset readiness adapter differs")
+            if builder._expected_cells != tuple(expected_cells):
+                raise DatasetError("dataset readiness join schedule differs")
+            if not reservation.materializer_bound:
+                raise DatasetError("dataset readiness lost its materializer claim")
 
 @dataclass(frozen=True)
 class DatasetSealProvenance:
@@ -681,6 +718,34 @@ class DatasetBuilder(Generic[PayloadT]):
             return
         self._mark_aborted_locked()
 
+    def exact_readiness(self) -> ExactDatasetReadiness:
+        if self.mode is not DatasetMode.FINITE_EXACT or self._reservation is None:
+            raise DatasetError("only a finite exact DatasetBuilder can authorize capture")
+        with self._lock:
+            self._ensure_writable_locked()
+        return ExactDatasetReadiness(_READINESS_TOKEN, self)
+
+    def close(self) -> None:
+        """Idempotently abort if needed and release the exact reservation."""
+
+        if self._reservation is None:
+            with self._lock:
+                if not self._sealed and not self._aborted:
+                    self._mark_aborted_locked()
+            return
+        if self._reservation.state is ReservationState.RELEASED:
+            return
+        with self._lock:
+            needs_abort = not self._sealed and not self._aborted
+        if needs_abort:
+            self.abort()
+        if self._reservation.state in (
+            ReservationState.COMPLETED,
+            ReservationState.FAILED,
+            ReservationState.CANCELLED,
+        ):
+            self._reservation.release()
+
     def __enter__(self) -> "DatasetBuilder":
         return self
 
@@ -689,14 +754,7 @@ class DatasetBuilder(Generic[PayloadT]):
             return False
         cleanup_error: BaseException | None = None
         try:
-            if not self._sealed and not self._aborted:
-                self.abort()
-            if self._reservation.state in (
-                ReservationState.COMPLETED,
-                ReservationState.FAILED,
-                ReservationState.CANCELLED,
-            ):
-                self._reservation.release()
+            self.close()
         except BaseException as error:
             cleanup_error = error
         if cleanup_error is not None:

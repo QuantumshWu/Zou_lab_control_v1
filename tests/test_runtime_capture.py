@@ -1,0 +1,846 @@
+"""Capture authority, exact-retention, and physical terminal contracts."""
+
+from __future__ import annotations
+
+import hashlib
+import threading
+from dataclasses import dataclass
+
+import numpy as np
+import pytest
+
+from zlc_data import (
+    AxisId,
+    AxisSpec,
+    BlockId,
+    DatasetSchema,
+    PointLayout,
+    REPEAT,
+    SCAN_POINT,
+    SPATIAL_X,
+    SPATIAL_Y,
+    VALID,
+    ValidityContract,
+    Value,
+    ValueSchema,
+)
+from zlc_neutral_atom.runtime.capture import (
+    BoundCapturePort,
+    CaptureCapabilitySnapshot,
+    CapturePreparedAck,
+    CaptureRuntimeProfile,
+    CaptureSessionState,
+    CaptureStartedAck,
+    CaptureStreamContract,
+    CaptureTerminalAck,
+    CapturedPayloadAck,
+    CompleteCaptureCommand,
+    PrepareCaptureCommand,
+    ReadCaptureCommand,
+    StartCaptureCommand,
+)
+from zlc_neutral_atom.runtime.dataset import (
+    DatasetBuilder,
+    DatasetCellAddress,
+    DatasetMode,
+    SealedDatasetArtifact,
+)
+from zlc_neutral_atom.runtime.ports import (
+    DeviceBroker,
+    DeviceIdentityAck,
+    SafeStateAck,
+    SafetyOperation,
+    SessionCloseCommand,
+    SessionClosedAck,
+    VerifiedDeviceCapability,
+)
+from zlc_neutral_atom.runtime.resources import (
+    MemoryQuarantineJournal,
+    ResourceArbiter,
+    ResourceKey,
+)
+from zlc_neutral_atom.runtime.run import (
+    RunContext,
+    RunController,
+    CleanupReport,
+    RunFailed,
+    RunMode,
+    RunPlan,
+)
+from zlc_neutral_atom.runtime.streams import (
+    ProducerFlowControl,
+    SourceFailed,
+    StreamId,
+    TraceBinding,
+    ReservationState,
+)
+
+
+SHA_A = "a" * 64
+SHA_B = "b" * 64
+SHA_C = "c" * 64
+SHA_D = "d" * 64
+
+
+def axis(name: str, role, size: int) -> AxisSpec:
+    return AxisSpec(AxisId(name), name, role, size, tuple(range(size)))
+
+
+def schema(points: int = 2) -> DatasetSchema:
+    y = axis("camera.y", SPATIAL_Y, 2)
+    x = axis("camera.x", SPATIAL_X, 3)
+    return DatasetSchema(
+        axis("repeat", REPEAT, 1),
+        (axis("point", SCAN_POINT, points),),
+        PointLayout.rect_c((points,)),
+        ValueSchema((y, x), ValidityContract.value(), np.dtype("<u2"), "count"),
+    )
+
+
+@dataclass(frozen=True)
+class CameraPayload:
+    ordinal: int
+    captured_at: float
+    correlation_id: str
+    stamp: int
+    pixels: np.ndarray
+
+
+@dataclass(frozen=True)
+class CameraPayloadContract:
+    value_schema: ValueSchema
+    fingerprint: str = SHA_A
+    max_retained_nbytes: int = 64
+
+    def snapshot(self, payload: CameraPayload) -> CameraPayload:
+        if not isinstance(payload, CameraPayload):
+            raise TypeError("payload must be CameraPayload")
+        pixels = np.array(payload.pixels, dtype=np.uint16, copy=True, order="C")
+        pixels.setflags(write=False)
+        return CameraPayload(
+            int(payload.ordinal),
+            float(payload.captured_at),
+            str(payload.correlation_id),
+            int(payload.stamp),
+            pixels,
+        )
+
+    def validate(self, payload: CameraPayload) -> None:
+        if not isinstance(payload, CameraPayload):
+            raise TypeError("payload must be CameraPayload")
+        if payload.ordinal < 0 or payload.stamp < 0:
+            raise ValueError("payload counters must be non-negative")
+        if payload.pixels.shape != self.value_schema.data_shape:
+            raise ValueError("payload shape differs from ValueSchema")
+        if payload.pixels.dtype != self.value_schema.dtype:
+            raise ValueError("payload dtype differs from ValueSchema")
+        if payload.pixels.flags.writeable:
+            raise ValueError("payload snapshot must own a read-only array")
+
+    @staticmethod
+    def retained_nbytes(payload: CameraPayload) -> int:
+        return int(payload.pixels.nbytes) + 32
+
+    @staticmethod
+    def source_ordinal(payload: CameraPayload) -> int:
+        return payload.ordinal
+
+    @staticmethod
+    def captured_at(payload: CameraPayload) -> float:
+        return payload.captured_at
+
+    @staticmethod
+    def correlation_id(payload: CameraPayload) -> str:
+        return payload.correlation_id
+
+
+@dataclass(frozen=True)
+class FrameMetadata:
+    ordinal: int
+    stamp: int
+    captured_at: float
+
+
+@dataclass(frozen=True)
+class FrameMetadataContract:
+    fingerprint: str = SHA_B
+    max_retained_nbytes: int = 24
+
+    @staticmethod
+    def snapshot(payload: CameraPayload) -> FrameMetadata:
+        return FrameMetadata(payload.ordinal, payload.stamp, payload.captured_at)
+
+    @staticmethod
+    def validate(metadata: object) -> None:
+        if not isinstance(metadata, FrameMetadata):
+            raise TypeError("metadata must be FrameMetadata")
+
+    @staticmethod
+    def retained_nbytes(metadata: object) -> int:
+        FrameMetadataContract.validate(metadata)
+        return 24
+
+    @staticmethod
+    def digest(metadata: object) -> str:
+        FrameMetadataContract.validate(metadata)
+        assert isinstance(metadata, FrameMetadata)
+        return hashlib.sha256(
+            f"{metadata.ordinal}:{metadata.stamp}:{metadata.captured_at:.9f}".encode()
+        ).hexdigest()
+
+
+@dataclass(frozen=True)
+class CameraEventAdapter:
+    payload_contract: CameraPayloadContract
+    metadata_contract: FrameMetadataContract
+
+    @property
+    def value_schema(self) -> ValueSchema:
+        return self.payload_contract.value_schema
+
+    def value(self, payload: CameraPayload) -> Value:
+        self.payload_contract.validate(payload)
+        return Value(payload.pixels, VALID, self.value_schema)
+
+
+@dataclass(frozen=True)
+class CameraCaptureSpec:
+    exposure_us: int
+    expected_frames: int
+
+
+@dataclass(frozen=True)
+class CameraCaptureSpecContract:
+    fingerprint: str = SHA_C
+
+    @staticmethod
+    def snapshot(spec: object) -> CameraCaptureSpec:
+        if not isinstance(spec, CameraCaptureSpec):
+            raise TypeError("spec must be CameraCaptureSpec")
+        return CameraCaptureSpec(spec.exposure_us, spec.expected_frames)
+
+    @staticmethod
+    def validate(spec: object) -> None:
+        if not isinstance(spec, CameraCaptureSpec):
+            raise TypeError("spec must be CameraCaptureSpec")
+        if spec.exposure_us <= 0 or spec.expected_frames <= 0:
+            raise ValueError("capture settings must be positive")
+
+    @staticmethod
+    def digest(spec: object) -> str:
+        CameraCaptureSpecContract.validate(spec)
+        assert isinstance(spec, CameraCaptureSpec)
+        return hashlib.sha256(
+            f"camera-spec-v1:{spec.exposure_us}:{spec.expected_frames}".encode()
+        ).hexdigest()
+
+
+def cells(dataset_schema: DatasetSchema) -> tuple[DatasetCellAddress, ...]:
+    return tuple(
+        DatasetCellAddress(repeat, point)
+        for repeat in range(dataset_schema.repeat_axis.size)
+        for point in range(dataset_schema.point_layout.storage_size)
+    )
+
+
+def metadata_digest(payloads, contract, count: int) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(contract.fingerprint.encode("ascii"))
+    for payload in payloads[:count]:
+        frozen = payload if not payload.pixels.flags.writeable else np_payload_copy(payload)
+        metadata = contract.snapshot(frozen)
+        hasher.update(contract.digest(metadata).encode("ascii"))
+    return hasher.hexdigest()
+
+
+def np_payload_copy(payload: CameraPayload) -> CameraPayload:
+    pixels = np.array(payload.pixels, copy=True)
+    pixels.setflags(write=False)
+    return CameraPayload(
+        payload.ordinal,
+        payload.captured_at,
+        payload.correlation_id,
+        payload.stamp,
+        pixels,
+    )
+
+
+class FakeCamera:
+    def __init__(self, payloads: list[CameraPayload], metadata_contract):
+        self.payloads = payloads
+        self.metadata_contract = metadata_contract
+        self.binding_id = ""
+        self.generation = "camera-generation"
+        self.session_id = ""
+        self.read_count = 0
+        self.started = False
+        self.started_event = threading.Event()
+        self.read_entered = threading.Event()
+        self.closed = False
+        self.close_failure = False
+        self.close_session_id_override: str | None = None
+        self.close_joined = True
+        self.fail_prepare = False
+        self.fail_start = False
+        self.terminal_produced_delta = 0
+        self.terminal_drained_delta = 0
+        self.terminal_source_stopped = True
+        self.terminal_no_more = True
+        self.terminal_joined = True
+        self.terminal_digest_override: str | None = None
+        self.block_read = threading.Event()
+        self.release_read = threading.Event()
+        self.block_capability_probe = threading.Event()
+        self.capability_probe_entered = threading.Event()
+        self.release_capability_probe = threading.Event()
+        self.capability = None
+
+    def execute(self, command):
+        if isinstance(command, PrepareCaptureCommand):
+            assert command.timeout_seconds == 0.5
+            self.session_id = command.session_id
+            if self.fail_prepare:
+                raise RuntimeError("prepare failed after partial configuration")
+            return CapturePreparedAck(
+                command.session_id,
+                self.binding_id,
+                self.generation,
+                SHA_D,
+                SHA_C,
+                command.capture_spec_fingerprint,
+            )
+        if isinstance(command, StartCaptureCommand):
+            assert command.timeout_seconds == 0.5
+            self.started = True
+            self.started_event.set()
+            if self.fail_start:
+                raise RuntimeError("start failed after arm")
+            return CaptureStartedAck(
+                command.session_id,
+                self.binding_id,
+                self.generation,
+            )
+        if isinstance(command, ReadCaptureCommand):
+            assert command.timeout_seconds == 0.5
+            if self.block_read.is_set():
+                self.read_entered.set()
+                self.release_read.wait(2.0)
+                raise RuntimeError("read interrupted")
+            payload = self.payloads[self.read_count]
+            self.read_count += 1
+            return CapturedPayloadAck(
+                command.session_id,
+                self.binding_id,
+                self.generation,
+                payload,
+            )
+        if isinstance(command, CompleteCaptureCommand):
+            assert command.timeout_seconds == 0.5
+            digest = self.terminal_digest_override or metadata_digest(
+                self.payloads,
+                self.metadata_contract,
+                command.expected_total_events,
+            )
+            return CaptureTerminalAck(
+                command.session_id,
+                self.binding_id,
+                self.generation,
+                command.expected_total_events + self.terminal_produced_delta,
+                command.expected_total_events + self.terminal_drained_delta,
+                self.terminal_source_stopped,
+                self.terminal_no_more,
+                self.terminal_joined,
+                digest,
+                SHA_D,
+                SHA_C,
+                CameraCaptureSpecContract.digest(
+                    CameraCaptureSpec(10, command.expected_total_events)
+                ),
+            )
+        raise AssertionError(f"unexpected camera command {command!r}")
+
+    def interrupt(self):
+        self.release_read.set()
+        return "camera-interrupt-ack"
+
+    def probe_capability(self):
+        if self.block_capability_probe.is_set():
+            self.capability_probe_entered.set()
+            self.release_capability_probe.wait(2.0)
+        if self.capability is None:
+            raise RuntimeError("camera capability is not initialized")
+        return self.capability
+
+    def close_session(self, command: SessionCloseCommand):
+        assert command.timeout_seconds == 0.5
+        if self.close_failure:
+            raise RuntimeError("session join acknowledgement lost")
+        self.closed = True
+        self.release_read.set()
+        return SessionClosedAck(
+            self.close_session_id_override or command.session_id,
+            self.binding_id,
+            self.generation,
+            True,
+            True,
+            self.close_joined,
+            "camera-session-joined",
+        )
+
+    def safe_state(self):
+        if not self.closed:
+            raise RuntimeError("camera session is not closed")
+        return SafeStateAck("camera-safe-and-session-joined")
+
+
+@dataclass
+class CaptureHarness:
+    camera: FakeCamera
+    broker: DeviceBroker
+    port: BoundCapturePort
+    contract: CaptureStreamContract
+    spec: CameraCaptureSpec
+    holder: dict
+
+    def plan(
+        self,
+        *,
+        consume: bool = True,
+        build_materializer: bool = True,
+        materializer_cells=None,
+        materializer_adapter=None,
+    ) -> RunPlan:
+        def preflight(context: RunContext):
+            trace = TraceBinding(context.run_id.value, self.contract.source_id)
+            session = self.port.open_session(self.contract, trace, self.spec)
+            self.holder["session"] = session
+            reservation = session.reserve_exact()
+            cursor = reservation.activate()
+            self.holder.update(reservation=reservation, cursor=cursor)
+            builder = None
+            if build_materializer:
+                builder = DatasetBuilder(
+                    BlockId("capture"),
+                    reservation,
+                    self.contract.dataset_schema,
+                    DatasetMode.FINITE_EXACT,
+                    event_adapter=materializer_adapter or self.contract.event_adapter,
+                    expected_cells=materializer_cells or self.contract.expected_cells,
+                )
+                self.holder["builder"] = builder
+                session.bind_materializer(builder.exact_readiness())
+            self.holder["builder"] = builder
+            session.prepare(context)
+            return session, cursor, builder
+
+        def execute(context: RunContext, prepared):
+            session, cursor, builder = prepared
+            try:
+                session.start(context)
+                if not consume:
+                    return session
+                assert builder is not None
+                for _ in self.contract.expected_cells:
+                    session.capture_next(context)
+                    builder.consume(cursor.next())
+                completion = session.complete(context)
+                artifact = builder.seal(completion.eos)
+                assert (
+                    artifact.provenance.ordered_metadata_digest
+                    == completion.terminal.ordered_metadata_digest
+                )
+                return artifact, completion
+            except BaseException as error:
+                try:
+                    session.fail(error)
+                finally:
+                    if builder is not None:
+                        builder.abort()
+                raise
+
+        def cleanup(context: RunContext, _prepared, _primary):
+            session = self.holder.get("session")
+            builder = self.holder.get("builder")
+            software_errors = []
+            if builder is not None:
+                try:
+                    builder.close()
+                except BaseException as error:
+                    software_errors.append(error)
+            if session is None:
+                raise RuntimeError("capture cleanup lost its session owner")
+            report = session.cleanup(context)
+            if not software_errors:
+                return report
+            return CleanupReport(
+                safety_proofs=report.safety_proofs,
+                decisions=report.decisions,
+                errors=(*report.errors, *software_errors),
+            )
+
+        return RunPlan(
+            name="capture contract test",
+            mode=RunMode.FINITE_EXACT,
+            resource_claims=(self.port.resource_claim,),
+            hazard_claims=(self.port.hazard_claim,),
+            bound_devices=(self.port.device,),
+            preflight=preflight,
+            execute=execute,
+            cleanup=cleanup,
+            finalize=lambda _context, result: result,
+            interrupt_operations=self.port.interrupt_operations,
+        )
+
+
+def harness(points: int = 2) -> CaptureHarness:
+    dataset_schema = schema(points)
+    payload_contract = CameraPayloadContract(dataset_schema.cell_schema)
+    metadata_contract = FrameMetadataContract()
+    event_adapter = CameraEventAdapter(payload_contract, metadata_contract)
+    payloads = [
+        CameraPayload(
+            ordinal=index,
+            captured_at=float(index + 1),
+            correlation_id=f"frame-{index}",
+            stamp=100 + index,
+            pixels=np.full((2, 3), index + 1, dtype=np.uint16),
+        )
+        for index in range(points)
+    ]
+    camera = FakeCamera(payloads, metadata_contract)
+    key = ResourceKey.parse("device/camera/test")
+    broker = DeviceBroker()
+    identity = broker.verify_identity(
+        lambda: DeviceIdentityAck("camera-serial", camera.generation)
+    )
+    device = broker.bind(
+        key=key,
+        identity=identity,
+        execute_command=camera.execute,
+        capability_probe=camera.probe_capability,
+        cleanup_operations={},
+        close_session=camera.close_session,
+        verify_safe_state=camera.safe_state,
+        interrupt_operations={SafetyOperation.ABORT: camera.interrupt},
+    )
+    camera.binding_id = device.binding_id
+    capability = CaptureCapabilitySnapshot(
+        binding_id=device.binding_id,
+        stable_device_identity=device.stable_device_identity,
+        connection_generation=device.connection_generation,
+        capability_fingerprint=SHA_C,
+        settings_fingerprint=SHA_D,
+        payload_contract_fingerprint=payload_contract.fingerprint,
+        flow_control=ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
+        max_source_burst_events=points,
+        driver_ring_bytes=128,
+        max_blocking_call_seconds=0.5,
+    )
+    camera.capability = capability
+    attestation = broker.verify_capability(device)
+    port = BoundCapturePort(attestation, ())
+    contract = CaptureStreamContract(
+        stream_id=StreamId("camera.frames"),
+        source_id="camera",
+        dataset_schema=dataset_schema,
+        payload_contract=payload_contract,
+        event_adapter=event_adapter,
+        expected_cells=cells(dataset_schema),
+        capability=capability,
+        runtime_profile=CaptureRuntimeProfile(
+            required_consumer_lag_events=0,
+            transport_memory_limit_bytes=2048,
+        ),
+        capture_spec_contract=CameraCaptureSpecContract(),
+    )
+    return CaptureHarness(
+        camera,
+        broker,
+        port,
+        contract,
+        CameraCaptureSpec(10, points),
+        {},
+    )
+
+
+def run(harness_value: CaptureHarness, **plan_options):
+    controller = RunController(ResourceArbiter(MemoryQuarantineJournal()))
+    return controller.start(harness_value.plan(**plan_options))
+
+
+def test_capture_preserves_multidimensional_payload_and_co_seals_metadata():
+    item = harness()
+    artifact, completion = run(item).result(2.0)
+    assert isinstance(artifact, SealedDatasetArtifact)
+    assert artifact.block.values.shape == (1, 2, 2, 3)
+    assert np.all(artifact.block.values[0, 0] == 1)
+    assert np.all(artifact.block.values[0, 1] == 2)
+    assert completion.terminal.joined
+    assert item.camera.closed
+    assert item.holder["reservation"].state is ReservationState.RELEASED
+    assert not item.holder["session"].stream._reservations
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("terminal_produced_delta", 1),
+        ("terminal_drained_delta", -1),
+        ("terminal_source_stopped", False),
+        ("terminal_no_more", False),
+        ("terminal_joined", False),
+        ("terminal_digest_override", "f" * 64),
+    ],
+)
+def test_terminal_mismatch_poison_prevents_sealed_artifact(field, value):
+    item = harness()
+    setattr(item.camera, field, value)
+    handle = run(item)
+    with pytest.raises(RunFailed):
+        handle.result(2.0)
+    assert item.holder["session"].state is CaptureSessionState.FAILED
+    assert item.camera.closed
+    assert item.holder["reservation"].state is ReservationState.RELEASED
+    assert not item.holder["session"].stream._reservations
+
+
+def test_start_requires_active_reservation_with_materializer_owner():
+    item = harness()
+    handle = run(item, build_materializer=False, consume=False)
+    with pytest.raises(RunFailed):
+        handle.result(2.0)
+    assert not item.camera.started
+    assert item.camera.closed
+    assert item.holder["reservation"].state is ReservationState.RELEASED
+    assert not item.holder["session"].stream._reservations
+
+
+@pytest.mark.parametrize("mismatch", ["schedule", "adapter"])
+def test_materializer_mismatch_is_rejected_before_camera_prepare_or_start(mismatch):
+    item = harness()
+    options = {}
+    if mismatch == "schedule":
+        options["materializer_cells"] = tuple(reversed(item.contract.expected_cells))
+    else:
+        options["materializer_adapter"] = CameraEventAdapter(
+            item.contract.payload_contract,
+            FrameMetadataContract(),
+        )
+    with pytest.raises(RunFailed):
+        run(item, **options).result(2.0)
+    assert item.camera.session_id == ""
+    assert not item.camera.started
+    assert item.holder["reservation"].state is ReservationState.RELEASED
+    assert not item.holder["session"].stream._reservations
+
+
+@pytest.mark.parametrize("failure", ["fail_prepare", "fail_start"])
+def test_partial_prepare_or_start_failure_is_monotonic_and_cleanup_joins(failure):
+    item = harness()
+    setattr(item.camera, failure, True)
+    with pytest.raises(RunFailed):
+        run(item).result(2.0)
+    assert item.holder["session"].state is CaptureSessionState.FAILED
+    assert item.camera.closed
+    assert item.holder["reservation"].state is ReservationState.RELEASED
+    assert not item.holder["session"].stream._reservations
+
+
+def test_payload_snapshot_does_not_alias_mutated_driver_ring():
+    item = harness(points=1)
+    original = item.camera.payloads[0].pixels
+
+    def execute(context: RunContext, prepared):
+        session, cursor, builder = prepared
+        session.start(context)
+        session.capture_next(context)
+        original[:] = 999
+        builder.consume(cursor.next())
+        completion = session.complete(context)
+        artifact = builder.seal(completion.eos)
+        return artifact, completion
+
+    plan = item.plan()
+    plan = RunPlan(
+        **{
+            **plan.__dict__,
+            "execute": execute,
+        }
+    )
+    controller = RunController(ResourceArbiter(MemoryQuarantineJournal()))
+    artifact, _completion = controller.start(plan).result(2.0)
+    assert np.all(artifact.block.values == 1)
+
+
+def test_capture_refuses_extra_read_before_touching_device():
+    item = harness(points=1)
+
+    def execute(context: RunContext, prepared):
+        session, cursor, builder = prepared
+        session.start(context)
+        session.capture_next(context)
+        builder.consume(cursor.next())
+        with pytest.raises(RuntimeError, match="frozen event budget"):
+            session.capture_next(context)
+        assert item.camera.read_count == 1
+        completion = session.complete(context)
+        return builder.seal(completion.eos), completion
+
+    plan = item.plan()
+    plan = RunPlan(**{**plan.__dict__, "execute": execute})
+    controller = RunController(ResourceArbiter(MemoryQuarantineJournal()))
+    controller.start(plan).result(2.0)
+
+
+def test_cancel_uses_cleanup_capability_to_close_blocked_session():
+    item = harness(points=1)
+    item.camera.block_read.set()
+    handle = run(item)
+    assert item.camera.started_event.wait(1.0)
+    assert item.camera.read_entered.wait(1.0)
+    handle.cancel()
+    with pytest.raises(RunFailed):
+        handle.result(2.0)
+    assert item.camera.closed
+    assert item.holder["reservation"].state is ReservationState.RELEASED
+    assert not item.holder["session"].stream._reservations
+
+
+def test_cleanup_join_failure_prevents_success_and_quarantines_device():
+    item = harness(points=1)
+    item.camera.close_failure = True
+    arbiter = ResourceArbiter(MemoryQuarantineJournal())
+    handle = RunController(arbiter).start(item.plan())
+    with pytest.raises(RunFailed):
+        handle.result(2.0)
+    assert item.port.device.key in {record.key for record in arbiter.quarantine_records()}
+
+
+@pytest.mark.parametrize("wrong_session,joined", [(True, True), (False, False)])
+def test_cleanup_receipt_must_bind_this_session_and_prove_join(wrong_session, joined):
+    item = harness(points=1)
+    if wrong_session:
+        item.camera.close_session_id_override = "another-session"
+    item.camera.close_joined = joined
+    arbiter = ResourceArbiter(MemoryQuarantineJournal())
+    with pytest.raises(RunFailed):
+        RunController(arbiter).start(item.plan()).result(2.0)
+    assert item.port.device.key in {record.key for record in arbiter.quarantine_records()}
+
+
+def test_capture_device_operations_cannot_leave_owner_lane():
+    item = harness(points=1)
+
+    def execute(context: RunContext, prepared):
+        session, cursor, builder = prepared
+        failures = []
+
+        def wrong_thread():
+            try:
+                session.start(context)
+            except BaseException as error:
+                failures.append(error)
+
+        thread = threading.Thread(target=wrong_thread)
+        thread.start()
+        thread.join()
+        assert len(failures) == 1
+        assert "owner I/O lane" in str(failures[0])
+        assert not item.camera.started
+        session.start(context)
+        session.capture_next(context)
+        builder.consume(cursor.next())
+        completion = session.complete(context)
+        return builder.seal(completion.eos), completion
+
+    plan = item.plan()
+    plan = RunPlan(**{**plan.__dict__, "execute": execute})
+    RunController(ResourceArbiter(MemoryQuarantineJournal())).start(plan).result(2.0)
+
+
+def test_capture_capability_requires_broker_minted_attestation():
+    item = harness(points=1)
+    with pytest.raises(PermissionError):
+        VerifiedDeviceCapability(
+            object(),
+            broker=object(),
+            device=item.port.device,
+            snapshot=item.port.capability,
+            nonce=object(),
+        )
+
+
+def test_superseded_capability_attestation_fails_before_prepare_command():
+    item = harness(points=1)
+    item.broker.verify_capability(item.port.device)
+    with pytest.raises(RunFailed):
+        run(item).result(2.0)
+    assert item.camera.session_id == ""
+
+
+def test_capability_probe_excludes_run_open_for_its_entire_epoch():
+    item = harness(points=1)
+    item.camera.block_capability_probe.set()
+    failures = []
+
+    def probe():
+        try:
+            item.broker.verify_capability(item.port.device)
+        except BaseException as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=probe)
+    thread.start()
+    assert item.camera.capability_probe_entered.wait(1.0)
+    with pytest.raises(RuntimeError, match="capability probe is in progress"):
+        RunController(ResourceArbiter(MemoryQuarantineJournal())).start(item.plan())
+    item.camera.release_capability_probe.set()
+    thread.join(1.0)
+    assert not failures
+
+
+def test_terminal_ack_rejects_bool_counts_and_truthy_non_bool_flags():
+    with pytest.raises(ValueError):
+        CaptureTerminalAck(
+            "s", "b", "g", True, 1, True, True, True, SHA_A, SHA_B, SHA_C, SHA_D
+        )
+    with pytest.raises(TypeError):
+        CaptureTerminalAck(
+            "s", "b", "g", 1, 1, 1, True, True, SHA_A, SHA_B, SHA_C, SHA_D
+        )
+
+
+def test_transport_budget_rejects_before_any_run_or_hardware_prepare():
+    item = harness(points=1)
+    assert item.contract.estimated_transport_bytes == 128 + 64 + 64 + 24
+    with pytest.raises(MemoryError):
+        CaptureStreamContract(
+            stream_id=item.contract.stream_id,
+            source_id=item.contract.source_id,
+            dataset_schema=item.contract.dataset_schema,
+            payload_contract=item.contract.payload_contract,
+            event_adapter=item.contract.event_adapter,
+            expected_cells=item.contract.expected_cells,
+            capability=item.contract.capability,
+            runtime_profile=CaptureRuntimeProfile(0, 1),
+            capture_spec_contract=item.contract.capture_spec_contract,
+        )
+    assert item.camera.session_id == ""
+
+
+def test_failed_stream_reports_source_failure_to_exact_cursor():
+    item = harness(points=1)
+    item.camera.payloads[0] = CameraPayload(
+        9,
+        1.0,
+        "wrong-ordinal",
+        100,
+        np.ones((2, 3), dtype=np.uint16),
+    )
+    with pytest.raises(RunFailed):
+        run(item).result(2.0)
+    cursor = item.holder["cursor"]
+    with pytest.raises(SourceFailed):
+        cursor.next()
+    assert item.holder["reservation"].state is ReservationState.RELEASED
+    assert not item.holder["session"].stream._reservations

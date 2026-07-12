@@ -27,6 +27,7 @@ from .ports import (
     SafetyProof,
     SafetyInterrupt,
     SafetyOperation,
+    SessionClosedAck,
     _mint_safety_proof,
     _open_device_run,
 )
@@ -454,6 +455,26 @@ class RunContext:
             self._hardware_inflight += 1
         try:
             return self._device_lease.cleanup_step(binding, operation)
+        finally:
+            with self._hardware_condition:
+                self._hardware_inflight -= 1
+                self._hardware_condition.notify_all()
+
+    def _close_bound_device_session(
+        self,
+        binding: BoundDevice,
+        command: object,
+    ) -> SessionClosedAck:
+        with self._hardware_condition:
+            if not self._cleanup_enabled or self._hardware_revoked:
+                raise CapabilityRevoked(
+                    f"run {self.run_id} has no active cleanup hardware capability"
+                )
+            if self._devices.get(binding.key) is not binding:
+                raise CapabilityRevoked("device binding does not belong to this Run")
+            self._hardware_inflight += 1
+        try:
+            return self._device_lease.close_session(binding, command)
         finally:
             with self._hardware_condition:
                 self._hardware_inflight -= 1
