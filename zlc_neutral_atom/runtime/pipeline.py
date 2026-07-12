@@ -286,14 +286,6 @@ class PipelineResult:
         return self._memory_profile_fingerprint
 
 
-@dataclass
-class _PreparedPipeline:
-    session: CaptureSession
-    reservation: ExactReservation
-    cursor: AcquisitionCursor
-    builder: DatasetBuilder
-
-
 def _dataset_storage_bytes(schema: DatasetSchema) -> int:
     value_bytes = math.prod(schema.physical_shape) * int(schema.cell_schema.dtype.itemsize)
     leading = (
@@ -363,8 +355,85 @@ def _release_preflight_software(
             primary.add_note(f"preflight software teardown also failed: {error!r}")
 
 
-def compile_pipeline(spec: MinimalPipelineSpec) -> RunPlan:
-    """Compile the one supported finite exact path into one flat RunPlan."""
+@dataclass
+class ExactCaptureTransaction:
+    """Concrete reusable owner of one finite exact capture/materialization path."""
+
+    session: CaptureSession
+    reservation: ExactReservation
+    cursor: AcquisitionCursor
+    builder: DatasetBuilder
+    port: BoundCapturePort
+    contract: CaptureStreamContract
+    aggregate_peak_bytes: int
+    memory_profile_fingerprint: str
+
+    def start(self, context: RunContext) -> None:
+        self.session.prepare(context)
+        self.session.start(context)
+
+    def capture_all(self, context: RunContext) -> None:
+        for _cell in self.contract.expected_cells:
+            context.checkpoint()
+            self.session.capture_next(context)
+            self.builder.consume(
+                self.cursor.next(
+                    timeout=self.port.capability.max_blocking_call_seconds
+                )
+            )
+
+    def complete(self, context: RunContext) -> PipelineResult:
+        completion: CaptureCompletion = self.session.complete(context)
+        if not self.session.owns_completion(completion):
+            raise RuntimeError("capture completion does not belong to this session")
+        dataset = self.builder.seal(completion.eos)
+        provenance = dataset.provenance
+        if (
+            provenance.metadata_contract_fingerprint
+            != self.contract.event_adapter.metadata_contract.fingerprint
+        ):
+            raise RuntimeError("sealed dataset metadata contract differs from capture")
+        if (
+            provenance.ordered_metadata_digest
+            != completion.terminal.ordered_metadata_digest
+        ):
+            raise RuntimeError("sealed dataset metadata digest differs from capture")
+        return PipelineResult(
+            _PIPELINE_RESULT_TOKEN,
+            dataset,
+            completion.terminal,
+            self.aggregate_peak_bytes,
+            self.memory_profile_fingerprint,
+        )
+
+    def fail(self, error: BaseException) -> None:
+        try:
+            self.session.fail(error)
+        except BaseException as failure_error:
+            if hasattr(error, "add_note"):
+                error.add_note(f"capture poison also failed: {failure_error!r}")
+
+    def cleanup(self, context: RunContext) -> CleanupReport:
+        software_errors: list[BaseException] = []
+        try:
+            self.builder.close()
+        except BaseException as error:
+            software_errors.append(error)
+        report = self.session.cleanup(context)
+        if not software_errors:
+            return report
+        return CleanupReport(
+            safety_proofs=report.safety_proofs,
+            decisions=report.decisions,
+            errors=(*report.errors, *software_errors),
+        )
+
+
+def open_exact_capture(
+    spec: MinimalPipelineSpec,
+    context: RunContext,
+) -> ExactCaptureTransaction:
+    """Allocate the single reservation/materializer transaction without touching hardware."""
 
     if not isinstance(spec, MinimalPipelineSpec):
         raise TypeError("spec must be MinimalPipelineSpec")
@@ -377,95 +446,73 @@ def compile_pipeline(spec: MinimalPipelineSpec) -> RunPlan:
     measurement = spec.measurement
     port = measurement.capture_port
     contract = measurement.capture_contract
-
-    def preflight(context: RunContext) -> _PreparedPipeline:
-        session = port.open_session(
-            contract,
-            TraceBinding(context.run_id.value, contract.source_id),
-            measurement.capture_spec,
+    session = port.open_session(
+        contract,
+        TraceBinding(context.run_id.value, contract.source_id),
+        measurement.capture_spec,
+    )
+    reservation = None
+    builder = None
+    try:
+        reservation = session.reserve_exact()
+        cursor = reservation.activate()
+        builder = DatasetBuilder(
+            spec.materializer.block_id,
+            reservation,
+            contract.dataset_schema,
+            DatasetMode.FINITE_EXACT,
+            event_adapter=contract.event_adapter,
+            expected_cells=contract.expected_cells,
         )
-        reservation = None
-        builder = None
-        try:
-            reservation = session.reserve_exact()
-            cursor = reservation.activate()
-            builder = DatasetBuilder(
-                spec.materializer.block_id,
-                reservation,
-                contract.dataset_schema,
-                DatasetMode.FINITE_EXACT,
-                event_adapter=contract.event_adapter,
-                expected_cells=contract.expected_cells,
-            )
-            session.bind_materializer(builder.exact_readiness())
-            return _PreparedPipeline(session, reservation, cursor, builder)
-        except BaseException as error:
-            _release_preflight_software(session, reservation, builder, error)
-            raise
+        session.bind_materializer(builder.exact_readiness())
+        return ExactCaptureTransaction(
+            session,
+            reservation,
+            cursor,
+            builder,
+            port,
+            contract,
+            aggregate_peak,
+            spec.materializer.memory.overhead_profile_fingerprint,
+        )
+    except BaseException as error:
+        _release_preflight_software(session, reservation, builder, error)
+        raise
 
-    def execute(context: RunContext, prepared: _PreparedPipeline) -> PipelineResult:
-        session = prepared.session
+
+def compile_pipeline(spec: MinimalPipelineSpec) -> RunPlan:
+    """Compile the one supported finite exact path into one flat RunPlan."""
+
+    if not isinstance(spec, MinimalPipelineSpec):
+        raise TypeError("spec must be MinimalPipelineSpec")
+    aggregate_peak = estimate_pipeline_peak_bytes(spec)
+    if aggregate_peak > spec.materializer.memory.memory_limit_bytes:
+        raise MemoryError(
+            f"pipeline peak budget {aggregate_peak} exceeds "
+            f"limit {spec.materializer.memory.memory_limit_bytes}"
+        )
+    port = spec.measurement.capture_port
+
+    def preflight(context: RunContext) -> ExactCaptureTransaction:
+        return open_exact_capture(spec, context)
+
+    def execute(context: RunContext, prepared: ExactCaptureTransaction) -> PipelineResult:
         try:
-            session.prepare(context)
-            session.start(context)
-            for _cell in contract.expected_cells:
-                context.checkpoint()
-                session.capture_next(context)
-                prepared.builder.consume(
-                    prepared.cursor.next(
-                        timeout=port.capability.max_blocking_call_seconds
-                    )
-                )
-            completion: CaptureCompletion = session.complete(context)
-            if not session.owns_completion(completion):
-                raise RuntimeError("capture completion does not belong to this session")
-            dataset = prepared.builder.seal(completion.eos)
-            provenance = dataset.provenance
-            if (
-                provenance.metadata_contract_fingerprint
-                != contract.event_adapter.metadata_contract.fingerprint
-            ):
-                raise RuntimeError("sealed dataset metadata contract differs from capture")
-            if (
-                provenance.ordered_metadata_digest
-                != completion.terminal.ordered_metadata_digest
-            ):
-                raise RuntimeError("sealed dataset metadata digest differs from capture")
-            return PipelineResult(
-                _PIPELINE_RESULT_TOKEN,
-                dataset,
-                completion.terminal,
-                aggregate_peak,
-                spec.materializer.memory.overhead_profile_fingerprint,
-            )
+            prepared.start(context)
+            prepared.capture_all(context)
+            return prepared.complete(context)
         except BaseException as error:
-            try:
-                session.fail(error)
-            except BaseException as failure_error:
-                if hasattr(error, "add_note"):
-                    error.add_note(f"capture poison also failed: {failure_error!r}")
+            prepared.fail(error)
             raise
 
     def cleanup(
         context: RunContext,
-        prepared: _PreparedPipeline | None,
+        prepared: ExactCaptureTransaction | None,
         _primary: BaseException | None,
     ) -> CleanupReport:
         if prepared is None:
             return port.verify_idle(context)
-        software_errors: list[BaseException] = []
-        try:
-            prepared.builder.close()
-        except BaseException as error:
-            software_errors.append(error)
-        report = prepared.session.cleanup(context)
-        if not software_errors:
-            return report
-        return CleanupReport(
-            safety_proofs=report.safety_proofs,
-            decisions=report.decisions,
-            errors=(*report.errors, *software_errors),
-        )
+        return prepared.cleanup(context)
 
     return RunPlan(
         name=spec.name,
@@ -487,9 +534,11 @@ __all__ = [
     "BoundMeasurement",
     "compile_pipeline",
     "DatasetMaterializerSpec",
+    "ExactCaptureTransaction",
     "estimate_pipeline_peak_bytes",
     "MeasurementDefinition",
     "MinimalPipelineSpec",
+    "open_exact_capture",
     "PipelineMemoryProfile",
     "PipelineResult",
     "resolve_measurement_definition",
