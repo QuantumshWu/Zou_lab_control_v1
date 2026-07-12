@@ -41,6 +41,12 @@ from .artifact import (
     compiled_pulse_artifact_from_tree,
     compiled_pulse_artifact_to_tree,
 )
+from .compiler import (
+    COMPILER_ID,
+    COMPILER_VERSION,
+    compile_pulse_artifact,
+    compile_pulse_document,
+)
 
 from .target import (
     DAC_OFFSET_BINARY,
@@ -55,6 +61,8 @@ from .target import (
 
 __all__ = [
     "COMPILED_PULSE_ARTIFACT_SCHEMA",
+    "COMPILER_ID",
+    "COMPILER_VERSION",
     "CompiledPulseArtifact",
     "DAC_OFFSET_BINARY",
     "DigitalTriggerSchedule",
@@ -80,6 +88,8 @@ __all__ = [
     "bind_pulse_document_target",
     "compiled_pulse_artifact_from_tree",
     "compiled_pulse_artifact_to_tree",
+    "compile_pulse_artifact",
+    "compile_pulse_document",
     "digital_trigger_schedule_from_tree",
     "digital_trigger_schedule_to_tree",
     "load_pulse_document",
