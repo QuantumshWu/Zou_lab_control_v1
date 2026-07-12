@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 from numbers import Integral
+from typing import Generic, Protocol, TypeVar
 
 import numpy as np
 
@@ -27,6 +28,8 @@ from zlc_data import (
     Valid,
     ValidityMode,
     Value,
+    ValuePayloadContract,
+    ValueSchema,
 )
 
 from .streams import (
@@ -41,6 +44,73 @@ from .streams import (
     StreamId,
     TraceBinding,
 )
+
+
+PayloadT = TypeVar("PayloadT")
+
+
+class DatasetEventAdapter(Protocol[PayloadT]):
+    """Typed projection from one immutable stream payload into one dataset cell."""
+
+    payload_contract: object
+    value_schema: ValueSchema
+    metadata_contract: "DatasetMetadataContract[PayloadT]"
+
+    def value(self, payload: PayloadT) -> Value: ...
+
+
+
+class DatasetMetadataContract(Protocol[PayloadT]):
+    fingerprint: str
+    max_retained_nbytes: int
+
+    def snapshot(self, payload: PayloadT) -> object | None: ...
+
+    def validate(self, metadata: object | None) -> None: ...
+
+    def retained_nbytes(self, metadata: object | None) -> int: ...
+
+    def digest(self, metadata: object | None) -> str: ...
+
+
+@dataclass(frozen=True)
+class NoDatasetMetadataContract:
+    fingerprint: str = hashlib.sha256(b"zlc.dataset-metadata.none.v1").hexdigest()
+    max_retained_nbytes: int = 0
+
+    @staticmethod
+    def snapshot(_payload: object) -> None:
+        return None
+
+    @staticmethod
+    def validate(metadata: object | None) -> None:
+        if metadata is not None:
+            raise TypeError("no-metadata contract accepts only None")
+
+    @staticmethod
+    def retained_nbytes(metadata: object | None) -> int:
+        NoDatasetMetadataContract.validate(metadata)
+        return 0
+
+    @staticmethod
+    def digest(metadata: object | None) -> str:
+        NoDatasetMetadataContract.validate(metadata)
+        return hashlib.sha256(b"null").hexdigest()
+
+
+@dataclass(frozen=True)
+class ValueDatasetEventAdapter:
+    payload_contract: ValuePayloadContract
+    metadata_contract: NoDatasetMetadataContract = NoDatasetMetadataContract()
+
+    @property
+    def value_schema(self) -> ValueSchema:
+        return self.payload_contract.schema
+
+    def value(self, payload: Value) -> Value:
+        self.payload_contract.validate(payload)
+        return payload
+
 
 
 class DatasetMode(str, Enum):
@@ -65,6 +135,37 @@ class SnapshotExpired(DatasetError):
 
 
 _SEALED_TOKEN = object()
+
+
+def _sha256_digest(value: str, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _deeply_immutable_metadata(value: object, seen: set[int] | None = None) -> bool:
+    if value is None or type(value) in (bool, int, float, str, bytes):
+        return True
+    identity = id(value)
+    seen = set() if seen is None else seen
+    if identity in seen:
+        return False
+    seen.add(identity)
+    if isinstance(value, tuple):
+        return all(_deeply_immutable_metadata(item, seen) for item in value)
+    if isinstance(value, frozenset):
+        return all(_deeply_immutable_metadata(item, seen) for item in value)
+    if is_dataclass(value) and not isinstance(value, type):
+        parameters = getattr(type(value), "__dataclass_params__", None)
+        return bool(parameters and parameters.frozen) and all(
+            _deeply_immutable_metadata(getattr(value, field.name), seen)
+            for field in fields(value)
+        )
+    return False
 
 
 def dataset_cell_key_fingerprint(schema: DatasetSchema) -> str:
@@ -156,6 +257,7 @@ class DatasetPreviewSnapshot:
     snapshot: OwnedSnapshot
     coverage: DatasetCoverage
     mode: DatasetMode
+    cell_metadata: tuple[object | None, ...]
 
     @property
     def ref(self) -> DatasetRevisionRef:
@@ -174,16 +276,19 @@ class DatasetSealProvenance:
     end_sequence: int
     join_plan_digest: str
     ordered_event_digest: str
+    ordered_metadata_digest: str
+    metadata_contract_fingerprint: str
     trace_binding: TraceBinding
 
 
 class SealedDatasetArtifact:
-    """Opaque formal dataset capability minted only after exact terminal validation."""
+    """Opaque exact-transport capability; physical scans may require outer attestation."""
 
     __slots__ = (
         "_snapshot",
         "_coverage",
         "_provenance",
+        "_event_metadata",
     )
 
     def __init__(
@@ -198,7 +303,10 @@ class SealedDatasetArtifact:
         end_sequence: int,
         join_plan_digest: str,
         ordered_event_digest: str,
+        ordered_metadata_digest: str,
+        metadata_contract_fingerprint: str,
         trace_binding: TraceBinding,
+        event_metadata: tuple[object | None, ...],
     ) -> None:
         if authority is not _SEALED_TOKEN:
             raise PermissionError("SealedDatasetArtifact can only be minted by DatasetBuilder")
@@ -214,9 +322,12 @@ class SealedDatasetArtifact:
                 end_sequence=end_sequence,
                 join_plan_digest=join_plan_digest,
                 ordered_event_digest=ordered_event_digest,
+                ordered_metadata_digest=ordered_metadata_digest,
+                metadata_contract_fingerprint=metadata_contract_fingerprint,
                 trace_binding=trace_binding,
             ),
         )
+        object.__setattr__(self, "_event_metadata", tuple(event_metadata))
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("SealedDatasetArtifact is immutable")
@@ -241,17 +352,22 @@ class SealedDatasetArtifact:
     def provenance(self) -> DatasetSealProvenance:
         return self._provenance
 
+    @property
+    def event_metadata(self) -> tuple[object | None, ...]:
+        return self._event_metadata
 
-class DatasetBuilder:
+
+class DatasetBuilder(Generic[PayloadT]):
     """Private mutable materializer; public reads are immutable owned snapshots."""
 
     def __init__(
         self,
         block_id: BlockId,
-        source: ExactReservation[Value] | MonitorTap[Value],
+        source: ExactReservation[PayloadT] | MonitorTap[PayloadT],
         schema: DatasetSchema,
         mode: DatasetMode,
         *,
+        event_adapter: DatasetEventAdapter[PayloadT],
         expected_cells: tuple[DatasetCellAddress, ...] | None = None,
     ) -> None:
         if not isinstance(block_id, BlockId):
@@ -260,6 +376,14 @@ class DatasetBuilder:
             raise TypeError("schema must be DatasetSchema")
         if not isinstance(mode, DatasetMode):
             raise TypeError("mode must be DatasetMode")
+        if not all(
+            hasattr(event_adapter, member)
+            for member in ("payload_contract", "value_schema", "value", "metadata_contract")
+        ):
+            raise TypeError("event_adapter does not implement DatasetEventAdapter")
+        adapter_parameters = getattr(type(event_adapter), "__dataclass_params__", None)
+        if not is_dataclass(event_adapter) or not adapter_parameters or not adapter_parameters.frozen:
+            raise TypeError("DatasetEventAdapter must be a frozen dataclass value")
         if mode is DatasetMode.FINITE_EXACT and not isinstance(source, ExactReservation):
             raise TypeError("FINITE_EXACT DatasetBuilder must bind an ExactReservation")
         if mode is DatasetMode.ROLLING_MONITOR and not isinstance(source, MonitorTap):
@@ -267,11 +391,41 @@ class DatasetBuilder:
         self.block_id = block_id
         self._reservation = source if isinstance(source, ExactReservation) else None
         self._monitor = source if isinstance(source, MonitorTap) else None
-        self._source: AcquisitionStream[Value] = source._stream
+        self._source: AcquisitionStream[PayloadT] = source._stream
         self.stream_id = self._source.stream_id
         self.generation = self._source.generation
         self.schema = schema
         self.mode = mode
+        self._event_adapter = event_adapter
+        if event_adapter.payload_contract is not self._source._payload_contract:
+            raise DatasetError("DatasetEventAdapter must share the stream PayloadContract owner")
+        if event_adapter.value_schema is not schema.cell_schema:
+            raise DatasetError("DatasetEventAdapter must share DatasetSchema.cell_schema")
+        metadata_contract = event_adapter.metadata_contract
+        contract_parameters = getattr(type(metadata_contract), "__dataclass_params__", None)
+        if (
+            not is_dataclass(metadata_contract)
+            or not contract_parameters
+            or not contract_parameters.frozen
+        ):
+            raise TypeError("DatasetMetadataContract must be a frozen dataclass value")
+        self._metadata_contract = metadata_contract
+        _sha256_digest(metadata_contract.fingerprint, "metadata contract fingerprint")
+        if (
+            isinstance(metadata_contract.max_retained_nbytes, bool)
+            or not isinstance(metadata_contract.max_retained_nbytes, Integral)
+            or metadata_contract.max_retained_nbytes < 0
+        ):
+            raise ValueError("metadata contract max_retained_nbytes must be non-negative")
+        for member in ("snapshot", "validate", "retained_nbytes", "digest"):
+            if not callable(getattr(metadata_contract, member, None)):
+                raise TypeError(f"metadata_contract.{member} must be callable")
+        value_max_bytes = ValuePayloadContract(schema.cell_schema).max_retained_nbytes
+        payload_max_bytes = self._source._payload_contract.max_retained_nbytes
+        if value_max_bytes + metadata_contract.max_retained_nbytes > payload_max_bytes:
+            raise DatasetError(
+                "Value plus metadata worst-case bytes exceed the source PayloadContract"
+            )
         expected_key_fingerprint = dataset_cell_key_fingerprint(schema)
         if not isinstance(self._source._join_key_contract, DatasetCellKeyContract):
             raise DatasetError("dataset source must declare DatasetCellKeyContract")
@@ -302,6 +456,8 @@ class DatasetBuilder:
             join_hasher.update(f"{cell.repeat_index},{cell.point_storage_index};".encode("ascii"))
         self._join_plan_digest = join_hasher.hexdigest()
         self._ordered_event_hasher = hashlib.sha256()
+        self._ordered_metadata_hasher = hashlib.sha256()
+        self._ordered_metadata_hasher.update(metadata_contract.fingerprint.encode("ascii"))
         self._lock = threading.RLock()
         self._values = np.zeros(schema.physical_shape, dtype=schema.cell_schema.dtype)
         self._written = np.zeros(schema.physical_shape[:2], dtype=bool)
@@ -313,6 +469,8 @@ class DatasetBuilder:
         )
         self._last_monitor_sequence: int | None = None
         self._missed_events = 0
+        self._cell_metadata: list[object | None] = [None] * total_cells
+        self._ordered_event_metadata: list[object | None] = [None] * total_cells
         self._sealed = False
         self._aborted = False
         if self._reservation is not None:
@@ -333,7 +491,7 @@ class DatasetBuilder:
 
     def consume(
         self,
-        delivery: Delivery[Value],
+        delivery: Delivery[PayloadT],
     ) -> DatasetProgress:
         if self.mode is not DatasetMode.FINITE_EXACT:
             raise DatasetError("exact cursor consumption requires FINITE_EXACT mode")
@@ -343,16 +501,21 @@ class DatasetBuilder:
             raise DatasetError("delivery was already acknowledged")
         if self._reservation is None:
             raise DatasetError("exact DatasetBuilder has no bound reservation")
+        projected = self._project_payload(delivery.envelope.payload)
         return self._source._consume_exact(
             self._reservation,
             delivery,
             self,
-            lambda envelope: self._ingest(envelope, additional_missed=0),
+            lambda envelope: self._ingest(
+                envelope,
+                projected=projected,
+                additional_missed=0,
+            ),
         )
 
     def ingest_monitor(
         self,
-        update: MonitorUpdate[Value],
+        update: MonitorUpdate[PayloadT],
     ) -> DatasetProgress:
         if self.mode is not DatasetMode.ROLLING_MONITOR:
             raise DatasetError("monitor updates require ROLLING_MONITOR mode")
@@ -360,24 +523,29 @@ class DatasetBuilder:
             raise TypeError("update must be MonitorUpdate")
         if self._monitor is None or not self._monitor._owns_update(update):
             raise PermissionError("MonitorUpdate belongs to another monitor authority")
-        return self._ingest(update.envelope, additional_missed=update.missed)
+        projected = self._project_payload(update.envelope.payload)
+        return self._ingest(
+            update.envelope,
+            projected=projected,
+            additional_missed=update.missed,
+        )
 
     def _ingest(
         self,
-        envelope: Envelope[Value],
+        envelope: Envelope[PayloadT],
         *,
+        projected: tuple[Value, object | None, str],
         additional_missed: int,
     ) -> DatasetProgress:
         if not isinstance(envelope, Envelope):
             raise TypeError("envelope must be Envelope")
-        if not isinstance(envelope.payload, Value):
-            raise TypeError("DatasetBuilder currently materializes Value payloads")
         address = envelope.join_key
         if not isinstance(address, DatasetCellAddress):
             raise DatasetError("dataset event is missing its typed DatasetCellAddress")
         with self._lock:
             self._ensure_writable_locked()
-            self._validate_envelope_locked(envelope)
+            self._validate_envelope_identity_locked(envelope)
+            value, metadata, metadata_digest = projected
             self._validate_address_locked(address)
             cell = (address.repeat_index, address.point_storage_index)
             was_written = bool(self._written[cell])
@@ -407,8 +575,8 @@ class DatasetBuilder:
                 base_revision=base,
                 result_revision=result,
                 target_cells=(cell,),
-                values=envelope.payload.values.reshape((1, *self.schema.cell_schema.data_shape)),
-                validity_patch=(envelope.payload.validity,),
+                values=value.values.reshape((1, *self.schema.cell_schema.data_shape)),
+                validity_patch=(value.validity,),
                 schema_fingerprint=self.schema.fingerprint,
             )
             self._apply_patch_locked(
@@ -423,11 +591,20 @@ class DatasetBuilder:
             self._missed_events += additional_missed
             if self.mode is DatasetMode.FINITE_EXACT:
                 self._expected_sequence += 1
+                self._ordered_event_metadata[schedule_index] = metadata
+                self._ordered_metadata_hasher.update(metadata_digest.encode("ascii"))
                 self._ordered_event_hasher.update(
-                    f"{envelope.sequence}:{envelope.event_id.value};".encode("utf-8")
+                    f"{envelope.sequence}:{envelope.event_id.value}:{metadata_digest};".encode(
+                        "utf-8"
+                    )
                 )
             else:
                 self._last_monitor_sequence = envelope.sequence
+            flat_cell = (
+                address.repeat_index * self.schema.point_layout.storage_size
+                + address.point_storage_index
+            )
+            self._cell_metadata[flat_cell] = metadata
             return DatasetProgress(
                 ref=self._ref_locked(self._revision),
                 dirty_cells=(address,),
@@ -457,6 +634,7 @@ class DatasetBuilder:
                 snapshot=OwnedSnapshot(selected, block),
                 coverage=self._coverage_locked(),
                 mode=self.mode,
+                cell_metadata=tuple(self._cell_metadata),
             )
 
     def seal(self, eos: EndOfStream) -> SealedDatasetArtifact:
@@ -474,7 +652,10 @@ class DatasetBuilder:
             end_sequence=self._reservation.end_sequence,
             join_plan_digest=self._join_plan_digest,
             ordered_event_digest=self._ordered_event_hasher.copy().hexdigest(),
+            ordered_metadata_digest=self._ordered_metadata_hasher.copy().hexdigest(),
+            metadata_contract_fingerprint=self._metadata_contract.fingerprint,
             trace_binding=self._reservation.trace_binding,
+            event_metadata=tuple(self._ordered_event_metadata),
         )
 
     def _seal_locked(self) -> None:
@@ -547,13 +728,47 @@ class DatasetBuilder:
         if self._aborted:
             raise DatasetError("dataset is aborted")
 
-    def _validate_envelope_locked(self, envelope: Envelope[Value]) -> None:
+    def _validate_envelope_identity_locked(
+        self,
+        envelope: Envelope[PayloadT],
+    ) -> None:
         if envelope.stream_generation != self.generation:
             raise DatasetError("envelope stream generation differs from DatasetBuilder")
         if envelope.stream_id != self.stream_id:
             raise DatasetError("envelope stream id differs from DatasetBuilder")
-        if envelope.payload.schema.fingerprint != self.schema.cell_schema.fingerprint:
-            raise DatasetError("ValueSchema fingerprint differs from DatasetSchema cell contract")
+
+    def _project_payload(
+        self,
+        payload: PayloadT,
+    ) -> tuple[Value, object | None, str]:
+        value = self._event_adapter.value(payload)
+        if not isinstance(value, Value):
+            raise TypeError("DatasetEventAdapter.value must return Value")
+        if value.schema is not self.schema.cell_schema:
+            raise DatasetError("event ValueSchema differs from DatasetSchema cell contract")
+        contract = self._metadata_contract
+        metadata = contract.snapshot(payload)
+        contract.validate(metadata)
+        if not _deeply_immutable_metadata(metadata):
+            raise TypeError("metadata contract must return a deeply immutable snapshot")
+        retained = contract.retained_nbytes(metadata)
+        if (
+            isinstance(retained, bool)
+            or not isinstance(retained, Integral)
+            or retained < 0
+            or retained > contract.max_retained_nbytes
+        ):
+            raise ValueError("metadata retained bytes exceed the declared metadata bound")
+        payload_bytes = self._source._payload_contract.retained_nbytes(payload)
+        value_bytes = int(value.values.nbytes)
+        if isinstance(value.validity, ComponentValidity):
+            value_bytes += int(value.validity.mask.nbytes)
+        if value_bytes + retained > payload_bytes:
+            raise ValueError(
+                "Value plus metadata bytes exceed total payload retained bytes"
+            )
+        digest = _sha256_digest(contract.digest(metadata), "metadata digest")
+        return value, metadata, digest
 
     def _validate_address_locked(self, address: DatasetCellAddress) -> None:
         if address.repeat_index >= self.schema.repeat_axis.size:
@@ -638,6 +853,8 @@ __all__ = [
     "DatasetCellAddress",
     "DatasetCellKeyContract",
     "DatasetCoverage",
+    "DatasetEventAdapter",
+    "DatasetMetadataContract",
     "DatasetError",
     "DatasetMode",
     "DatasetProgress",
@@ -645,7 +862,9 @@ __all__ = [
     "DatasetSealProvenance",
     "DuplicateDatasetCell",
     "MissingDatasetCells",
+    "NoDatasetMetadataContract",
     "SnapshotExpired",
     "SealedDatasetArtifact",
+    "ValueDatasetEventAdapter",
     "dataset_cell_key_fingerprint",
 ]

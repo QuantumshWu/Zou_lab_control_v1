@@ -583,6 +583,8 @@ DatasetRevisionRef故意不携带Formal runtime provenance，避免zlc_data反�
 
 Measurement/StreamProcessor 不创建 DataBlock/DataPatch，也不读“当前累计 block”来决定下一条输出。它们只处理当前 Envelope payload 或声明的完整 key group。DatasetBuilder 是 sample stream -> dataset 的唯一边界；interactive/display Analysis 可显式消费 DatasetPreviewSnapshot 并保留 provisional provenance，权威 Fit/Calibration/Repository 只消费 SealedDatasetArtifact 或更强的 VALID EpochBoundDatasetRef。DatasetProgress 是状态通知，不是数据输入，consumer 不能从它重建权威值。
 
+DatasetBuilder 不假设 stream payload 必须是裸 Value；它绑定一个与同一 PayloadContract、同一 ValueSchema owner 对齐的 immutable `DatasetEventAdapter[T]`。adapter 从一次 frozen payload 中投影 `Value`，metadata 则由独立但同属该 adapter 的 `DatasetMetadataContract(snapshot/validate/retained_nbytes/max/fingerprint/digest)` 单源冻结；builder 机械拒绝 dict/list/可变 dataclass 等浅别名，把 metadata bytes 纳入 payload budget，并在同一 Delivery/ack 事务中写 cell、保存 ordered manifest 与 metadata digest。`CameraSample(image, metadata)` 因此不需要第二个 exact consumer、side-channel metadata stream 或 TraceContext 私有字段；seal 同时冻结 DataBlock 与不可变 ordered frame metadata。普通 Value stream 使用 `ValueDatasetEventAdapter + NoDatasetMetadataContract`。adapter 不能改变 key、sequence、TraceBinding 或 cell schedule。
+
 所有 AxisId 在一个 DatasetSchema 内唯一；coordinates 长度与 size 相等；`repeat_axis.size == R`；`values.shape[1] == point_layout.storage_size`；cell_schema.data_axes 顺序与 trailing ndarray 顺序完全一致。任何 public consumer 若要从 P 恢复多维 point index，必须调用 PointLayout，不能自行 `reshape` 猜 order。
 
 ### 6.4 标量
@@ -1203,6 +1205,8 @@ compile_pipeline(spec, immutable bindings) -> RunPlan[PipelineResult]
 REQUIRED source/processor/sink failure 使整个 Run 失败。BEST_EFFORT_MONITOR 只能出现在 monitor-only 叶子分支；其失败产生 panel/branch error、missed telemetry 和 Run diagnostic warning，但不反向终止仍健康的 formal exact run。required outputs 完整时 Run 仍是 SUCCEEDED，但 Result/Event snapshot 含 structured warnings，且失败 panel 不能标成成功。Compiler 禁止 BEST_EFFORT_MONITOR 输出再连接 exact、fit authority、calibration 或 artifact，也不自动 restart 失败 branch。
 
 编译结果仍是一个扁平顶层 RunPlan：一个 RunHandle 依次拥有 online acquisition graph、DatasetBuilder finalization、post-materialization Analyses、artifact commit 和 cleanup。节点不能嵌套 start Run、动态新增边或各自成为 terminal-state owner。PipelineSpec 是静态阶段合同，不是 child-plan workflow DAG。
+
+F0/S1 的首个 compiler 必须只接受 `1 BoundMeasurement -> 1 DatasetMaterializerSpec -> 1 BoundDatasetSink`：没有 processor、analysis、feedback、可选 child 或通用 node/edge DSL。它在 `RunController.start()` 取得 claim 之前完成 DefinitionKey/request/bindings、payload/adapter/schema、完整 cell permutation 与保守 event/byte budget 校验；RunPlan.preflight 才用真实 run_id mint TraceBinding 与 reservation。普通整数/字符串 `CaptureTerminalEvidence` 不构成物理证明；真正 camera 路径必须由 §10.3 的 BoundCapturePort 创建并私藏 producer 的 opaque CaptureSession，在 session 内核对 device generation、source ordinal、produced/drained/final counter、ordered metadata digest、no-more-frame 与真实 join 后 mint不可伪造的 CaptureCompletion/EOS。post-safety persistent sink只接受storage-owned staged FinalCommit，不接受“任意 callback + requires_commit bool”。后续 S3/S4 加 processor/analysis 时扩展静态 PipelineSpec 合同，不把这个最小直线偷偷演化成递归工作流引擎。
 
 PipelineResult 只汇总 required sink 的 typed results/artifact refs、structured warnings、event/missed metrics 和 terminal lineage；不暴露 worker、cursor、mutable buffer 或第二套 TaskOutput。
 

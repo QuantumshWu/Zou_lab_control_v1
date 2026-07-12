@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import hashlib
+from enum import Enum
+
 import numpy as np
 import pytest
 
@@ -33,6 +37,7 @@ from zlc_neutral_atom.runtime.dataset import (
     MissingDatasetCells,
     SnapshotExpired,
     SealedDatasetArtifact,
+    ValueDatasetEventAdapter,
     dataset_cell_key_fingerprint,
 )
 from zlc_neutral_atom.runtime.streams import (
@@ -111,6 +116,10 @@ def emit(producer, payload, address: DatasetCellAddress, sequence_value: int):
     )
 
 
+def event_adapter(stream) -> ValueDatasetEventAdapter:
+    return ValueDatasetEventAdapter(stream._payload_contract)
+
+
 def test_exact_builder_preserves_all_named_data_axes_and_snapshot_revisions():
     schema = dataset_schema(repeats=1, points=3)
     stream, producer = source(schema, events=3)
@@ -126,6 +135,7 @@ def test_exact_builder_preserves_all_named_data_axes_and_snapshot_revisions():
         reservation,
         schema,
         DatasetMode.FINITE_EXACT,
+        event_adapter=event_adapter(stream),
         expected_cells=cell_schedule(schema),
     )
 
@@ -169,6 +179,7 @@ def test_bound_builder_owns_reservation_completion():
         reservation,
         schema,
         DatasetMode.FINITE_EXACT,
+        event_adapter=event_adapter(stream),
         expected_cells=cell_schedule(schema),
     )
     emit(producer, value(1), DatasetCellAddress(0, 0), 0)
@@ -195,6 +206,7 @@ def test_builder_context_preserves_body_error_and_releases_claim():
             reservation,
             schema,
             DatasetMode.FINITE_EXACT,
+            event_adapter=event_adapter(stream),
             expected_cells=cell_schedule(schema),
         ):
             raise RuntimeError("body failure")
@@ -223,6 +235,7 @@ def test_exact_duplicate_and_missing_cells_fail_without_acknowledging_delivery()
         reservation,
         schema,
         DatasetMode.FINITE_EXACT,
+        event_adapter=event_adapter(stream),
         expected_cells=cell_schedule(schema),
     )
     emit(producer, value(1), DatasetCellAddress(0, 0), 0)
@@ -247,6 +260,7 @@ def test_exact_duplicate_and_missing_cells_fail_without_acknowledging_delivery()
         missing_reservation,
         schema,
         DatasetMode.FINITE_EXACT,
+        event_adapter=event_adapter(missing_stream),
         expected_cells=cell_schedule(schema),
     )
     emit(missing_producer, value(1), DatasetCellAddress(0, 0), 0)
@@ -277,6 +291,7 @@ def test_component_validity_is_aligned_by_axis_id_not_trailing_shape_guess():
         reservation,
         schema,
         DatasetMode.FINITE_EXACT,
+        event_adapter=event_adapter(stream),
         expected_cells=cell_schedule(schema),
     )
     emit(producer, value(7, component_validity=component), DatasetCellAddress(0, 0), 0)
@@ -300,6 +315,7 @@ def test_rolling_monitor_overwrite_expires_old_revision_without_formal_seal():
         tap,
         schema,
         DatasetMode.ROLLING_MONITOR,
+        event_adapter=event_adapter(stream),
     )
 
     emit(producer, value(1), DatasetCellAddress(0, 0), 0)
@@ -342,6 +358,7 @@ def test_exact_delivery_cannot_cross_source_authority_even_when_ids_match():
         reservation_a,
         schema,
         DatasetMode.FINITE_EXACT,
+        event_adapter=event_adapter(stream_a),
         expected_cells=cell_schedule(schema),
     )
     emit(producer_a, value(1), DatasetCellAddress(0, 0), 0)
@@ -372,6 +389,7 @@ def test_exact_join_key_must_match_the_frozen_plan_schedule():
         reservation,
         schema,
         DatasetMode.FINITE_EXACT,
+        event_adapter=event_adapter(stream),
         expected_cells=cell_schedule(schema),
     )
     emit(producer, value(10), DatasetCellAddress(0, 1), 0)
@@ -399,6 +417,7 @@ def test_exact_reservation_rejects_cross_run_trace_mixing():
         reservation,
         schema,
         DatasetMode.FINITE_EXACT,
+        event_adapter=event_adapter(stream),
         expected_cells=cell_schedule(schema),
     )
     payload = Value(value(7).values, VALID, schema.cell_schema)
@@ -424,7 +443,11 @@ def test_monitor_update_cannot_cross_tap_or_source_authority():
     tap_a = stream_a.monitor(max_events=1, max_bytes=12)
     tap_b = stream_b.monitor(max_events=1, max_bytes=12)
     builder = DatasetBuilder(
-        BlockId("monitor-authority"), tap_a, schema, DatasetMode.ROLLING_MONITOR
+        BlockId("monitor-authority"),
+        tap_a,
+        schema,
+        DatasetMode.ROLLING_MONITOR,
+        event_adapter=event_adapter(stream_a),
     )
     emit(producer_b, value(9), DatasetCellAddress(0, 0), 0)
     with pytest.raises(PermissionError, match="another monitor"):
@@ -482,6 +505,7 @@ def test_minted_generation_prevents_revision_ref_collision_across_sources():
             reservation,
             schema,
             DatasetMode.FINITE_EXACT,
+            event_adapter=event_adapter(stream),
             expected_cells=cell_schedule(schema),
         )
         emit(producer, value(number), DatasetCellAddress(0, 0), 0)
@@ -494,3 +518,370 @@ def test_minted_generation_prevents_revision_ref_collision_across_sources():
     second = capture(999)
     assert first.ref != second.ref
     assert first.provenance.generation != second.provenance.generation
+
+
+def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
+    schema = dataset_schema(points=1)
+
+    @dataclass(frozen=True)
+    class FrameMetadata:
+        physical_ordinal: int
+        frame_stamp: int
+
+    @dataclass(frozen=True)
+    class CameraSample:
+        image: Value
+        metadata: FrameMetadata
+
+    @dataclass(frozen=True)
+    class CameraSampleContract:
+        schema: ValueSchema
+        fingerprint: str = "4" * 64
+
+        @property
+        def max_retained_nbytes(self):
+            return int(np.prod(self.schema.data_shape)) * self.schema.dtype.itemsize + 16
+
+        def snapshot(self, payload):
+            self.validate(payload)
+            return payload
+
+        def validate(self, payload):
+            if not isinstance(payload, CameraSample) or payload.image.schema is not self.schema:
+                raise TypeError("invalid CameraSample")
+
+        def retained_nbytes(self, payload):
+            self.validate(payload)
+            return payload.image.values.nbytes + 16
+
+    @dataclass(frozen=True)
+    class FrameMetadataContract:
+        fingerprint: str = "5" * 64
+        max_retained_nbytes: int = 16
+
+        @staticmethod
+        def snapshot(payload):
+            return payload.metadata
+
+        @staticmethod
+        def validate(metadata):
+            if not isinstance(metadata, FrameMetadata):
+                raise TypeError("invalid FrameMetadata")
+
+        @staticmethod
+        def retained_nbytes(metadata):
+            FrameMetadataContract.validate(metadata)
+            return 16
+
+        @staticmethod
+        def digest(metadata):
+            FrameMetadataContract.validate(metadata)
+            encoded = f"{metadata.physical_ordinal}:{metadata.frame_stamp}".encode("ascii")
+            return hashlib.sha256(encoded).hexdigest()
+
+    @dataclass(frozen=True)
+    class CameraSampleAdapter:
+        payload_contract: CameraSampleContract
+        metadata_contract: FrameMetadataContract = FrameMetadataContract()
+
+        @property
+        def value_schema(self):
+            return self.payload_contract.schema
+
+        @staticmethod
+        def value(payload):
+            return payload.image
+
+    contract = CameraSampleContract(schema.cell_schema)
+    stream, producer = AcquisitionStream.create(
+        StreamId("camera.samples"),
+        contract,
+        flow_control=ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
+        retention_events=1,
+        retention_bytes=contract.max_retained_nbytes,
+        join_key_contract=DatasetCellKeyContract(schema),
+    )
+    reservation = stream.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=contract.max_retained_nbytes,
+        trace_binding=TRACE_BINDING,
+    )
+    cursor = reservation.activate()
+    builder = DatasetBuilder(
+        BlockId("camera-sample"),
+        reservation,
+        schema,
+        DatasetMode.FINITE_EXACT,
+        event_adapter=CameraSampleAdapter(contract),
+        expected_cells=cell_schedule(schema),
+    )
+    metadata = FrameMetadata(physical_ordinal=0, frame_stamp=101)
+    sample = CameraSample(Value(value(5).values, VALID, schema.cell_schema), metadata)
+    producer.emit(
+        sample,
+        captured_at=1.0,
+        trace=TraceContext("run", "camera", "capture"),
+        join_key=DatasetCellAddress(0, 0),
+    )
+    builder.consume(cursor.next())
+    assert builder.materialize().cell_metadata == (metadata,)
+    artifact = builder.seal(producer.finish())
+    assert artifact.block.values[0, 0, 0, 0] == 5
+    assert artifact.event_metadata == (metadata,)
+    assert len(artifact.provenance.ordered_metadata_digest) == 64
+    reservation.release()
+
+
+def test_metadata_contract_cannot_seal_a_mutable_alias():
+    schema = dataset_schema(points=1)
+    stream, producer = source(schema, events=1)
+
+    @dataclass(frozen=True)
+    class MutableMetadataContract:
+        shared: dict
+        fingerprint: str = "6" * 64
+        max_retained_nbytes: int = 0
+
+        def snapshot(self, _payload):
+            return self.shared
+
+        @staticmethod
+        def validate(metadata):
+            if not isinstance(metadata, dict):
+                raise TypeError("metadata must be dict")
+
+        @staticmethod
+        def retained_nbytes(_metadata):
+            return 0
+
+        @staticmethod
+        def digest(_metadata):
+            return "7" * 64
+
+    @dataclass(frozen=True)
+    class MutableMetadataAdapter:
+        payload_contract: ValuePayloadContract
+        metadata_contract: MutableMetadataContract
+
+        @property
+        def value_schema(self):
+            return self.payload_contract.schema
+
+        def value(self, payload):
+            self.payload_contract.validate(payload)
+            return payload
+
+    reservation = stream.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=12,
+        trace_binding=TRACE_BINDING,
+    )
+    cursor = reservation.activate()
+    with pytest.raises(Exception, match="worst-case bytes"):
+        DatasetBuilder(
+            BlockId("underbudget-metadata"),
+            reservation,
+            schema,
+            DatasetMode.FINITE_EXACT,
+            event_adapter=MutableMetadataAdapter(
+                stream._payload_contract,
+                MutableMetadataContract(
+                    {"frame": 0},
+                    max_retained_nbytes=1,
+                ),
+            ),
+            expected_cells=cell_schedule(schema),
+        )
+    builder = DatasetBuilder(
+        BlockId("mutable-metadata"),
+        reservation,
+        schema,
+        DatasetMode.FINITE_EXACT,
+        event_adapter=MutableMetadataAdapter(
+            stream._payload_contract,
+            MutableMetadataContract({"frame": 0}),
+        ),
+        expected_cells=cell_schedule(schema),
+    )
+    emit(producer, value(1), DatasetCellAddress(0, 0), 0)
+    delivery = cursor.next()
+    with pytest.raises(TypeError, match="deeply immutable"):
+        builder.consume(delivery)
+    assert not delivery.acknowledged
+    assert builder.revision.value == 0
+    builder.abort()
+    reservation.release()
+
+
+def test_builder_freezes_one_metadata_contract_identity_for_the_generation():
+    schema = dataset_schema(points=2)
+
+    @dataclass(frozen=True)
+    class BudgetedValueContract:
+        schema: ValueSchema
+        fingerprint: str = "8" * 64
+        max_retained_nbytes: int = 20
+
+        def snapshot(self, payload):
+            self.validate(payload)
+            return payload
+
+        def validate(self, payload):
+            if not isinstance(payload, Value) or payload.schema is not self.schema:
+                raise TypeError("invalid Value")
+
+        def retained_nbytes(self, payload):
+            self.validate(payload)
+            return payload.values.nbytes + 8
+
+    @dataclass(frozen=True)
+    class SwitchingMetadataContract:
+        fingerprint: str
+        as_text: bool
+        max_retained_nbytes: int = 8
+
+        def snapshot(self, payload):
+            number = int(payload.values[0, 0])
+            return str(number) if self.as_text else number
+
+        @staticmethod
+        def validate(metadata):
+            if type(metadata) not in (int, str):
+                raise TypeError("metadata must be canonical int or text")
+
+        @staticmethod
+        def retained_nbytes(_metadata):
+            return 8
+
+        @staticmethod
+        def digest(metadata):
+            return hashlib.sha256(str(metadata).encode("ascii")).hexdigest()
+
+    @dataclass(frozen=True)
+    class SwitchingAdapter:
+        payload_contract: BudgetedValueContract
+        metadata_contract: SwitchingMetadataContract
+
+        @property
+        def value_schema(self):
+            return self.payload_contract.schema
+
+        def value(self, payload):
+            self.payload_contract.validate(payload)
+            return payload
+
+    payload_contract = BudgetedValueContract(schema.cell_schema)
+    first_contract = SwitchingMetadataContract("9" * 64, False)
+    adapter = SwitchingAdapter(payload_contract, first_contract)
+    stream, producer = AcquisitionStream.create(
+        StreamId("metadata-contract-identity"),
+        payload_contract,
+        flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
+        retention_events=2,
+        retention_bytes=40,
+        join_key_contract=DatasetCellKeyContract(schema),
+    )
+    reservation = stream.reserve(
+        total_events=2,
+        max_inflight_events=2,
+        max_inflight_bytes=40,
+        trace_binding=TRACE_BINDING,
+    )
+    cursor = reservation.activate()
+    builder = DatasetBuilder(
+        BlockId("metadata-contract-identity"),
+        reservation,
+        schema,
+        DatasetMode.FINITE_EXACT,
+        event_adapter=adapter,
+        expected_cells=cell_schedule(schema),
+    )
+    for point, number in enumerate((1, 2)):
+        if point == 1:
+            object.__setattr__(
+                adapter,
+                "metadata_contract",
+                SwitchingMetadataContract("a" * 64, True),
+            )
+        payload = Value(
+            np.full((2, 3), number, dtype=np.uint16),
+            VALID,
+            schema.cell_schema,
+        )
+        producer.emit(
+            payload,
+            captured_at=float(point),
+            trace=TraceContext("run", "camera", f"capture-{point}"),
+            join_key=DatasetCellAddress(0, point),
+        )
+        builder.consume(cursor.next())
+    artifact = builder.seal(producer.finish())
+    assert artifact.event_metadata == (1, 2)
+    assert artifact.provenance.metadata_contract_fingerprint == "9" * 64
+    reservation.release()
+
+
+def test_metadata_rejects_enum_with_mutable_value():
+    class MutableEnum(Enum):
+        ITEM = []
+
+    assert MutableEnum.ITEM.value == []
+
+    @dataclass(frozen=True)
+    class EnumMetadataContract:
+        fingerprint: str = "b" * 64
+        max_retained_nbytes: int = 0
+
+        @staticmethod
+        def snapshot(_payload):
+            return MutableEnum.ITEM
+
+        @staticmethod
+        def validate(_metadata):
+            return None
+
+        @staticmethod
+        def retained_nbytes(_metadata):
+            return 0
+
+        @staticmethod
+        def digest(_metadata):
+            return "c" * 64
+
+    @dataclass(frozen=True)
+    class EnumMetadataAdapter:
+        payload_contract: ValuePayloadContract
+        metadata_contract: EnumMetadataContract = EnumMetadataContract()
+
+        @property
+        def value_schema(self):
+            return self.payload_contract.schema
+
+        def value(self, payload):
+            self.payload_contract.validate(payload)
+            return payload
+
+    schema = dataset_schema(points=1)
+    stream, producer = source(schema, events=1)
+    reservation = stream.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=12,
+        trace_binding=TRACE_BINDING,
+    )
+    cursor = reservation.activate()
+    builder = DatasetBuilder(
+        BlockId("enum-metadata"),
+        reservation,
+        schema,
+        DatasetMode.FINITE_EXACT,
+        event_adapter=EnumMetadataAdapter(stream._payload_contract),
+        expected_cells=cell_schedule(schema),
+    )
+    emit(producer, value(1), DatasetCellAddress(0, 0), 0)
+    with pytest.raises(TypeError, match="deeply immutable"):
+        builder.consume(cursor.next())
+    builder.abort()
+    reservation.release()
