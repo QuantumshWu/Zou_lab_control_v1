@@ -132,6 +132,10 @@ class RemotePulseExecutionClient:
     def connection_generation(self) -> str:
         return self._generation
 
+    @property
+    def transport_timeout_seconds(self) -> float:
+        return self._transport_timeout
+
     def snapshot(self) -> PulseServerSnapshot:
         self._require_open()
         snapshot = pulse_server_snapshot_from_tree(

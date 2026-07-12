@@ -1025,6 +1025,11 @@ class VivadoAxiStreamerSession:
             self._stream_stop.set()
         self._command(CMD_SAFE)
         self._stop_stream_thread()
+        thread = self._stream_thread
+        if thread is not None and thread.is_alive():
+            raise RuntimeError(
+                "pulse streamer entered CMD_SAFE but the refill owner thread did not terminate"
+            )
         # an EXPLICIT stop abandons any delayed tail on purpose -- the next prepare()
         # must not wait out a drain deadline the user just cancelled.
         self._drain_until = 0.0

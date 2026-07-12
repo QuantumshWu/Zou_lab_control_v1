@@ -24,7 +24,12 @@ from zlc_neutral_atom.timing import (
     PulseTerminalAck,
     SequencerCapabilitySnapshot,
 )
-from zlc_pulse import PulseTarget, build_pulse_playback
+from zlc_pulse import (
+    PreparedPulseRef,
+    PulseTarget,
+    RemotePulseExecutionClient,
+    build_pulse_playback,
+)
 from zlc_pulse.target import pulse_target_from_legacy_tree
 from zlc_storage import canonical_digest
 
@@ -67,6 +72,7 @@ class _EndpointSession:
     fired: bool = False
     completed: bool = False
     closed: bool = False
+    prepared_ref: PreparedPulseRef | None = None
 
 
 class VirtualSequencerExecutionEndpoint:
@@ -309,6 +315,257 @@ class VirtualSequencerExecutionEndpoint:
         return session
 
 
+class RemotePulseExecutionEndpoint:
+    """Typed target endpoint over one current, non-reconnecting pulse RPC owner."""
+
+    def __init__(
+        self,
+        client: RemotePulseExecutionClient,
+        *,
+        endpoint_label: str,
+        max_blocking_call_seconds: float | None = None,
+    ) -> None:
+        if not isinstance(client, RemotePulseExecutionClient):
+            raise TypeError("remote endpoint requires RemotePulseExecutionClient")
+        _text(endpoint_label, "endpoint_label")
+        limit = (
+            client.transport_timeout_seconds * 0.9
+            if max_blocking_call_seconds is None
+            else float(max_blocking_call_seconds)
+        )
+        if limit <= 0 or limit >= client.transport_timeout_seconds:
+            raise ValueError("max blocking call must be shorter than the client transport backstop")
+        snapshot = client.snapshot()
+        self._client = client
+        self._endpoint_label = endpoint_label
+        self._timeout = limit
+        self._target = snapshot.target
+        self._clock_hz = snapshot.clock_hz
+        self._geometry = snapshot.geometry_fingerprint
+        self._server_generation = snapshot.connection_generation
+        self._lock = threading.RLock()
+        self._binding_id: str | None = None
+        self._generation: str | None = None
+        self._capability_fingerprint: str | None = None
+        self._session: _EndpointSession | None = None
+        self._last_prepare_session_id: str | None = None
+
+    @property
+    def target_endpoint(self) -> TargetDeviceEndpoint:
+        return TargetDeviceEndpoint(
+            self.execute_command,
+            self.capability_probe,
+            self.close_session,
+            self.describe,
+            {SafetyOperation.SAFE_STATE: self.interrupt},
+        )
+
+    def describe(self, binding: BoundDevice) -> SequencerDescription:
+        with self._lock:
+            self._validate_binding(binding)
+            self._validate_remote_generation()
+            return SequencerDescription(self._target, self._clock_hz, self._geometry)
+
+    def capability_probe(self, binding: BoundDevice) -> SequencerCapabilitySnapshot:
+        with self._lock:
+            if self._session is not None and not self._session.closed:
+                raise RuntimeError("cannot probe sequencer capability during an active session")
+            snapshot = self._validate_remote_generation()
+            if snapshot.state not in {"IDLE", "SAFE", "DONE"}:
+                raise RuntimeError(
+                    f"remote pulse server is not ready for capability probe: {snapshot.state}"
+                )
+            fingerprint = canonical_digest(
+                {
+                    "contract": "zlc.remote-pulse-execution.v1",
+                    "endpoint_label": self._endpoint_label,
+                    "server_connection_generation": self._server_generation,
+                    "target_abi_fingerprint": self._target.abi_fingerprint,
+                    "clock_hz": self._clock_hz,
+                    "geometry_fingerprint": self._geometry,
+                    "max_blocking_call_seconds": self._timeout,
+                }
+            )
+            self._binding_id = binding.binding_id
+            self._generation = binding.connection_generation
+            self._capability_fingerprint = fingerprint
+            return SequencerCapabilitySnapshot(
+                binding.binding_id,
+                binding.stable_device_identity,
+                binding.connection_generation,
+                self._target,
+                self._clock_hz,
+                self._geometry,
+                self._timeout,
+                fingerprint,
+            )
+
+    def execute_command(self, binding: BoundDevice, command: object) -> object:
+        if isinstance(command, PreparePulseCommand):
+            return self._prepare(binding, command)
+        if isinstance(command, FirePulseCommand):
+            return self._fire(binding, command)
+        if isinstance(command, CompletePulseCommand):
+            return self._complete(binding, command)
+        raise TypeError(f"sequencer endpoint rejects command {type(command).__name__}")
+
+    def _prepare(self, binding: BoundDevice, command: PreparePulseCommand) -> PulsePreparedAck:
+        with self._lock:
+            self._validate_binding(binding)
+            self._validate_remote_generation()
+            self._last_prepare_session_id = command.session_id
+            if self._session is not None and not self._session.closed:
+                raise RuntimeError("sequencer endpoint already owns an active session")
+            if command.capability_fingerprint != self._capability_fingerprint:
+                raise ValueError("sequencer capability fingerprint differs")
+            if command.timeout_seconds > self._timeout:
+                raise ValueError("prepare timeout exceeds sequencer capability")
+            artifact = command.request.artifact
+            if artifact.target_abi_fingerprint != self._target.abi_fingerprint:
+                raise ValueError("compiled pulse target differs from remote sequencer")
+            if artifact.target_ir.clock_hz != self._clock_hz:
+                raise ValueError("compiled pulse clock differs from remote sequencer")
+            if artifact.wire_image.geometry_fingerprint != self._geometry:
+                raise ValueError("compiled wire geometry differs from remote sequencer")
+        reference = self._client.prepare(artifact)
+        with self._lock:
+            self._validate_binding(binding)
+            self._session = _EndpointSession(
+                command.session_id,
+                command.request.artifact_digest,
+                command.request,
+                prepared=True,
+                prepared_ref=reference,
+            )
+            return PulsePreparedAck(
+                command.session_id,
+                binding.binding_id,
+                binding.connection_generation,
+                command.request.artifact_digest,
+                self._capability_fingerprint,
+            )
+
+    def _fire(self, binding: BoundDevice, command: FirePulseCommand) -> PulseFiredAck:
+        with self._lock:
+            session = self._active_session(binding, command.session_id)
+            if not session.prepared or session.fired or session.prepared_ref is None:
+                raise RuntimeError("sequencer session is not ready for FIRE")
+            if command.artifact_digest != session.artifact_digest:
+                raise ValueError("FIRE artifact digest differs from prepared session")
+            reference = session.prepared_ref
+        self._client.fire(reference)
+        with self._lock:
+            session = self._active_session(binding, command.session_id)
+            session.fired = True
+            return PulseFiredAck(
+                command.session_id,
+                binding.binding_id,
+                binding.connection_generation,
+                session.artifact_digest,
+            )
+
+    def _complete(self, binding: BoundDevice, command: CompletePulseCommand) -> PulseTerminalAck:
+        with self._lock:
+            session = self._active_session(binding, command.session_id)
+            if not session.fired or session.completed or session.prepared_ref is None:
+                raise RuntimeError("sequencer session is not awaiting completion")
+            if command.artifact_digest != session.artifact_digest:
+                raise ValueError("completion artifact digest differs")
+            if command.timeout_seconds > self._timeout:
+                raise ValueError("completion timeout exceeds sequencer capability")
+            reference = session.prepared_ref
+            artifact = session.request.artifact
+        completion = self._client.complete(reference, timeout=command.timeout_seconds)
+        if not completion.logical_done:
+            raise TimeoutError("remote sequencer did not reach logical terminal")
+        configured_delay = (
+            artifact.max_configured_output_delay_ticks / artifact.target_ir.clock_hz
+        )
+        with self._lock:
+            session = self._active_session(binding, command.session_id)
+            session.completed = True
+            return PulseTerminalAck(
+                command.session_id,
+                binding.binding_id,
+                binding.connection_generation,
+                session.artifact_digest,
+                True,
+                completion.completed_schedule_trigger_counts,
+                configured_delay,
+            )
+
+    def close_session(self, binding: BoundDevice, command: SessionCloseCommand) -> SessionClosedAck:
+        with self._lock:
+            self._validate_binding(binding)
+            session = self._session
+            if session is None:
+                if command.session_id != self._last_prepare_session_id:
+                    raise RuntimeError("sequencer cleanup session id is unknown")
+            elif session.session_id != command.session_id:
+                raise RuntimeError("sequencer cleanup belongs to another session")
+        snapshot = self._client.safe_state()
+        with self._lock:
+            if self._session is not None:
+                self._session.closed = True
+            digest = canonical_digest(
+                {
+                    "session_id": command.session_id,
+                    "server_generation": self._server_generation,
+                    "state": snapshot.state,
+                    "backend": snapshot.backend,
+                }
+            )
+            return SessionClosedAck(
+                command.session_id,
+                binding.binding_id,
+                binding.connection_generation,
+                True,
+                True,
+                True,
+                digest,
+            )
+
+    def interrupt(self) -> str:
+        snapshot = self._client.safe_state()
+        with self._lock:
+            if self._session is not None:
+                self._session.closed = True
+        return canonical_digest(
+            {
+                "operation": "SAFE_STATE",
+                "server_generation": self._server_generation,
+                "state": snapshot.state,
+            }
+        )
+
+    def _validate_binding(self, binding: BoundDevice) -> None:
+        if not isinstance(binding, BoundDevice):
+            raise TypeError("sequencer endpoint requires BoundDevice")
+        if self._binding_id is None:
+            return
+        if binding.binding_id != self._binding_id or binding.connection_generation != self._generation:
+            raise RuntimeError("sequencer endpoint binding generation changed")
+
+    def _validate_remote_generation(self):
+        snapshot = self._client.snapshot()
+        if snapshot.connection_generation != self._server_generation:
+            raise RuntimeError("remote pulse server connection generation changed")
+        if (
+            snapshot.target != self._target
+            or snapshot.clock_hz != self._clock_hz
+            or snapshot.geometry_fingerprint != self._geometry
+        ):
+            raise RuntimeError("remote pulse server capability changed within one connection")
+        return snapshot
+
+    def _active_session(self, binding: BoundDevice, session_id: str) -> _EndpointSession:
+        self._validate_binding(binding)
+        session = self._session
+        if session is None or session.session_id != session_id or session.closed:
+            raise RuntimeError("sequencer command belongs to another or closed session")
+        return session
+
+
 def bind_sequencer_port(
     device_set: object,
     registry: LegacyDeviceRegistry,
@@ -351,5 +608,6 @@ __all__ = [
     "bind_sequencer_port",
     "SequencerBindingRequest",
     "SequencerDescription",
+    "RemotePulseExecutionEndpoint",
     "VirtualSequencerExecutionEndpoint",
 ]

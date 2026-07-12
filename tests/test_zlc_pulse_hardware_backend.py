@@ -160,3 +160,19 @@ def test_current_artifact_uses_the_same_contract_over_uart(tmp_path):
     transport.model.regfile[CtrlWords.STATUS] |= STATUS_DONE
     assert service.complete(reference, timeout=1.0).logical_done
     assert service.snapshot()["backend"]["transport"] == "uart"
+
+
+def test_safe_state_never_claims_a_live_refill_owner_terminated():
+    class LiveThread:
+        @staticmethod
+        def is_alive():
+            return True
+
+    session = VivadoAxiStreamerSession.__new__(VivadoAxiStreamerSession)
+    session._stream_stop = None
+    session._stream_thread = LiveThread()
+    session._command = lambda command: True
+    session._stop_stream_thread = lambda: None
+
+    with pytest.raises(RuntimeError, match="did not terminate"):
+        session.safe_state()
