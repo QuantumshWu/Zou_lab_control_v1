@@ -12,6 +12,14 @@ from .document import (
     save_pulse_document,
 )
 from .legacy import load_pulse_document
+from .ir import (
+    TARGET_IR_SCHEMA,
+    TargetBusDelay,
+    TargetBusSegment,
+    TargetIR,
+    target_ir_from_tree,
+    target_ir_to_tree,
+)
 
 from .target import (
     DAC_OFFSET_BINARY,
@@ -36,11 +44,17 @@ __all__ = [
     "PulseDocument",
     "PulsePeriod",
     "PulseTarget",
+    "TARGET_IR_SCHEMA",
     "ScanSlot",
+    "TargetBusDelay",
+    "TargetBusSegment",
+    "TargetIR",
     "load_pulse_document",
     "pulse_document_from_tree",
     "pulse_document_to_tree",
     "pulse_target_from_tree",
     "pulse_target_to_tree",
     "save_pulse_document",
+    "target_ir_from_tree",
+    "target_ir_to_tree",
 ]
