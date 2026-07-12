@@ -1029,6 +1029,10 @@ journal append 失败时，run 保持内部`SAFETY_JOURNAL_BLOCKED`非终态阶�
 
 Blocking I/O lane 的普通 command queue 有界并使用公平调度：同一 owner 的连续 monitor read 以小 transaction 重新排队，不能永久压住已获资源的 finite run/control apply；不同 ResourceKey 使用 round-robin 或等价的 bounded-wait 规则。safety interrupt/abort 不进入普通公平队列，走 §8.3 的 out-of-band 通道。公平只决定已合法排队工作的顺序，不允许绕过 ResourceClaim 或并发调用 thread-affine driver。
 
+公平不能只是一句 round-robin 意图。每条共享 lane 在 composition 时冻结一个带 `policy_revision` 的 `LaneFairnessPolicy`：`max_monitor_burst` 限制同一 ResourceKey 连续执行的 monitor transaction 数；`transaction_deadline_by_kind` 为 lane 上每种 blocking command 声明从真正进入 driver call 起的有限 deadline；`accepted_finite_max_queue_turns` 与 `accepted_control_max_queue_time` 分别限制已经 admission 的 finite/control command 最多被多少个其它 transaction 越过以及最多等待多久。scheduler 保存 accepted/start/finish monotonic time、实际等待 turns、deadline/timeout 原因和 policy revision，供 RunEvent、ControlTopic terminal ack 与 profile gate 使用。具体数值来自 adapter contract/profile 并随部署配置冻结，不能在运行中由 monitor 或 UI 放宽。
+
+真实 adapter 只有在 SDK/transport timeout、可验证 cancel/abort 或可终止的隔离 process 能让每个已声明 transaction deadline 成立时，才可把该 command kind 放入共享 lane；普通 Python worker thread 不能因“逻辑超时”被视为已经终止。`None`、无限 timeout 或“超时后留下仍可碰硬件的后台调用”不满足合同，preflight 必须拒绝或改用有独立 owner 且具备真实终止合同的隔离 lane/process。queue-wait 上限到期且 command 尚未开始时，scheduler 不执行迟到硬件动作，而是给 control revision 发唯一 `DEADLINE_EXCEEDED` terminal ack，或使 finite run 进入正常 cancellation/cleanup。已经进入 driver call 后超时则按 §8.3/§8.4 的 interrupt、真实 termination、safe proof/quarantine 处理；不得并发启动替代调用或提前释放 claim。
+
 ## 9. ResourceArbiter
 
 ```text
@@ -1312,9 +1316,9 @@ EvaluatedFigureData:               # evaluator 的 immutable transient DTO，不
 
 `zlc_data` 对外只有 `DataTransformSpec` 与 `CommittedTransform` 两种 transform 合同；不拥有 x/image/sample/facet、latest/navigation 等呈现语义，也不提供无上下文的 `default_projection(schema)`。同一个 schema 在 image、curve、histogram、meter 和 fit 中需要不同处理；把自动决策放进 data kernel 会让权威路径误用显示启发式。neutral_atom 只依赖 zlc_data，因此既不能调用显示层 auto policy，也不会看到 ViewSpec。
 
-ViewSpec 是 figure 唯一持久 presentation 类型；它不保存 authority seed、CommittedTransform、FitSpec 或 ScanOutputSpec。FigureEvaluator 根据当前 immutable DataBlock revision/validity 和 Selection snapshot，把 ViewSpec 直接求值为 `EvaluatedFigureData`。latest/navigation 每次解析都有明确 input revision/coordinate record；renderer DTO 不能进入 zlc_data authority path。`ViewSuggestion` 只是 ViewSpec 是否能被安全构造的解释性返回，不复制 axis bucket，不成为第四层 projection，也不进入 artifact。
+ViewSpec 是 figure 唯一持久 presentation 类型；它不保存 authority seed、CommittedTransform、FitSpec 或 ScanOutputContract。FigureEvaluator 根据当前 immutable DataBlock revision/validity 和 Selection snapshot，把 ViewSpec 直接求值为 `EvaluatedFigureData`。latest/navigation 每次解析都有明确 input revision/coordinate record；renderer DTO 不能进入 zlc_data authority path。`ViewSuggestion` 只是 ViewSpec 是否能被安全构造的解释性返回，不复制 axis bucket，不成为第四层 projection，也不进入 artifact。
 
-auto slice、latest、repeat mean 和鼠标刚画出的 ROI 都是 display state/candidate。用户从 Fit/Scan 动作接受某个候选时，Workbench 根据当前 Selection snapshot 在对应 FitSpec/ScanOutputSpec draft 中重新构造 DataTransformSpec，再交给 commit_transform；不存在把 ViewSpec 的 axis binding/display operation cast、unwrap 或复制成权威 transform 的通用函数。已保存的权威复用项是独立 AnalysisPreset/FitSpec/ScanOutputSpec，不藏在 workspace ViewSpec 中。
+auto slice、latest、repeat mean 和鼠标刚画出的 ROI 都是 display state/candidate。用户从 Fit/Scan 动作接受某个候选时，Workbench 根据当前 Selection snapshot 在对应 FitSpec/ScanOutputContract draft 中重新构造 DataTransformSpec，再交给 commit_transform；不存在把 ViewSpec 的 axis binding/display operation cast、unwrap 或复制成权威 transform 的通用函数。已保存的权威复用项是独立 AnalysisPreset/FitSpec/ScanOutputContract，不藏在 workspace ViewSpec 中。
 
 `suggest_view` 返回轻量 `ViewSuggestion` 供 UI 显示。算法只做三件事：优先把信息轴放入 ViewContract 允许的 display/facet/batch；其余轴给有坐标标签的 slider/select；只有 ViewContract 明确允许的 display reduction 才自动加入并始终显示标签。仍需压掉有物理信息的轴而没有唯一规则时返回 `NEEDS_INPUT`。baseline 因而只有一个可保存 ViewSpec、一个权威 CommittedTransform、一个瞬时 suggestion 和一个 renderer DTO；没有可互相转换的五层 projection 状态机。
 
@@ -1536,7 +1540,7 @@ Plot card AnalysisCommand[WorkbenchFitRequest]
 -> revision-checked overlay/ViewModel
 ```
 
-interactive Fit 使用 frontend application adapter 提供的独立 bounded Fit executor；同一 panel 的 stale queued request 可 coalesce、已运行的不可中断 solver 返回后按 revision 丢弃。它执行 zlc_data `bind_fit` 产生的同一个 BoundFit，不创建隐藏 StreamProcessor node、不发布正式 measurement signal，也不占用 exact `StreamProcessorWorker` 或 view-evaluation 队列。用户要让 fit result 进入下游正式 pipeline，必须显式添加 Fit AnalysisStep；保存 interactive 派生结果时按 §16 materialize 输入 revision 与完整 lineage。
+interactive Fit 使用 workbench application adapter 提供的独立 bounded Fit executor；frontend.figure 只拥有 Figure DTO、View 求值和 overlay 投影，不成为 executor/lifecycle owner。同一 panel 的 stale queued request 可 coalesce、已运行的不可中断 solver 返回后按 revision 丢弃。它执行 zlc_data `bind_fit` 产生的同一个 BoundFit，不创建隐藏 StreamProcessor node、不发布正式 measurement signal，也不占用 exact `StreamProcessorWorker` 或 view-evaluation 队列。用户要让 fit result 进入下游正式 pipeline，必须显式添加 Fit AnalysisStep；保存 interactive 派生结果时按 §16 materialize 输入 revision 与完整 lineage。
 
 interactive 只意味着 QoS/入口不同，不降低输入 integrity：若输入 DatasetRevisionRef 属于 Formal epoch 且仍为 PROVISIONAL，可以为即时观察运行临时 fit，但 overlay 必须带 `PROVISIONAL` 标记且不能保存为 FitResultArtifact、不能成为后续 authority input。epoch 转 INVALID 时相关queued/running result按epoch lifetime token丢弃并从正常overlay撤销；只有独立 EpochValidationRecord 证明该revision为 VALID 后，才允许 materialize为正式派生结果。
 
@@ -2509,7 +2513,7 @@ Thread/UI：
 - terminal snapshot与剩余claim释放对竞争acquire线性化；真实adapter bootstrap缺少persistent journal时拒绝启动，memory journal只用于virtual/unit test；
 - remote DeviceControlLease/journal/recovery authority位于硬件server；不同client本地journal不能洗白server quarantine，server不支持时contract明确拒绝多入口；
 - schema-affecting reconfigure 建新 generation/block_id，旧 cursor/view/fit terminal；每个 accepted ControlTopic revision 恰有一个 terminal ack；
-- I/O lane 满载下 finite/control command bounded-wait，monitor 不能 starvation，safety interrupt 不经普通队列；
+- I/O lane 饱和 monitor 负载下，测试按冻结的 LaneFairnessPolicy 验证 `max_monitor_burst`、accepted finite 最大越过 turns、control 最大排队时间与每类 transaction deadline；超限产生唯一 terminal ack/run failure，monitor 不能 starvation finite/control，超时 driver call 不能在后台继续碰硬件，safety interrupt 不经普通队列；
 - stale queued result 不更新 UI；
 - retained revision N 的 OwnedSnapshot 在 builder ingest N+1 后 digest/bytes 不变；mutable builder read-only view被 contract拒绝；SnapshotExpired 不返回 latest；
 - 默认 owned snapshot 无 lease；opt-in BorrowedSnapshot 在 stale discard、queued cancellation、panel close、monitor overwrite、artist/front-buffer replacement和shutdown后无 token 泄漏；
@@ -2709,7 +2713,7 @@ H2默认不排期。只有以下任一证据成立才可创建提案：
 ### S3：StreamProcessor、Calibration 与 Occupancy/readout
 
 1. 在已工作的 camera event 上加入最小 `StreamProcessorWorker`、typed record、join/cardinality/budget 和 exact propagation；不让 StreamProcessor 读取累计 DataBlock。
-2. 完成 CaptureArtifact -> CalibrationAnalysis -> CalibrationArtifact 的 live/offline 同路算法，以及 FrameContract/SiteMap/ReadoutModels。
+2. 完成 CaptureArtifact -> CalibrationAnalysis -> CalibrationArtifact 的 live/offline 同路算法，以及 FrameContract/SiteMap/ReadoutModel。
 3. 迁 `OccupancyStreamProcessor`，输出单个 `OccupancySample(occupied, counts, metadata)` typed record，并显式绑定 CalibrationArtifactRef/model。
 4. DatasetBuilder 把 occupancy events 物化为 dataset；frontend Figure 与 zlc_data Fit 直接消费该冻结 dataset，证明四平面边界贯通。
 5. integration 通过后删除旧 camera frame producer/LogicNode 与最后一个 Occupancy/ROI/readout reactive consumer组成的完整旧链，并删除 runtime/session calibration 回查 fallback、filesystem fallback、legacy search、拆散 scalar signals 和会碰硬件的旧 Processor；保留的只有 notebook/workbench composition 在 request 构造时按 ReadoutBindingKey 冻结显式 CalibrationArtifactRef/model 的可见 convenience pointer。
