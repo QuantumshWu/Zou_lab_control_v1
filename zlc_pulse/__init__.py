@@ -13,6 +13,7 @@ from .document import (
 )
 from .legacy import load_pulse_document
 from .binding import bind_pulse_document_target
+from .client import PulseServerSnapshot, RemotePulseExecutionClient, pulse_server_snapshot_from_tree
 from .ir import (
     TARGET_IR_SCHEMA,
     TargetBusDelay,
@@ -76,8 +77,10 @@ from .target import (
     PORT_DIGITAL,
     PulsePortSpec,
     PulseTarget,
+    load_pulse_target,
     pulse_target_from_tree,
     pulse_target_to_tree,
+    save_pulse_target,
 )
 
 __all__ = [
@@ -102,7 +105,9 @@ __all__ = [
     "PulseExecutionForm",
     "PulseExecutionBackend",
     "PulseExecutionService",
+    "PulseServerSnapshot",
     "PulseStreamerSessionBackend",
+    "RemotePulseExecutionClient",
     "PulseCompletion",
     "PlaybackPulse",
     "PulsePlayback",
@@ -131,6 +136,7 @@ __all__ = [
     "encode_completion_message",
     "encode_prepared_ref_message",
     "load_pulse_document",
+    "load_pulse_target",
     "pulse_document_from_tree",
     "pulse_document_to_tree",
     "pack_target_ir",
@@ -141,8 +147,10 @@ __all__ = [
     "pulse_target_from_tree",
     "pulse_target_to_tree",
     "save_pulse_document",
+    "save_pulse_target",
     "pulse_completion_from_tree",
     "pulse_completion_to_tree",
+    "pulse_server_snapshot_from_tree",
     "serve_pulse_execution_service",
     "target_ir_from_tree",
     "target_ir_to_tree",

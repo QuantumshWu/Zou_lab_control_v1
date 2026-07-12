@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
 import re
 
 from zlc_storage import canonical_digest
@@ -244,6 +246,30 @@ def pulse_target_from_tree(tree: object) -> PulseTarget:
     return target
 
 
+def load_pulse_target(path: str | Path) -> PulseTarget:
+    return pulse_target_from_tree(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+def save_pulse_target(target: PulseTarget, path: str | Path) -> Path:
+    if not isinstance(target, PulseTarget):
+        raise TypeError("target must be PulseTarget")
+    destination = Path(path)
+    if destination.suffix.lower() != ".json":
+        destination = destination.with_suffix(".json")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(
+            pulse_target_to_tree(target),
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return destination
+
+
 def pulse_target_from_legacy_tree(tree: object) -> PulseTarget:
     """Translate the one historical PortCatalog schema at a file-load boundary."""
 
@@ -369,10 +395,12 @@ __all__ = [
     "PULSE_TARGET_SCHEMA",
     "PulsePortSpec",
     "PulseTarget",
+    "load_pulse_target",
     "pulse_port_from_tree",
     "pulse_port_to_tree",
     "pulse_target_from_legacy_tree",
     "pulse_target_from_legacy_channels",
     "pulse_target_from_tree",
     "pulse_target_to_tree",
+    "save_pulse_target",
 ]
