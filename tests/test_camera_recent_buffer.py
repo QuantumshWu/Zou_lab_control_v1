@@ -202,6 +202,30 @@ def test_arm_rejects_inflight_capacity_larger_than_finite_cardinality():
     assert cam._recent_state()["armed"] is False
 
 
+def test_out_of_band_terminal_stop_is_joined_by_original_arm_owner():
+    import threading
+
+    cam, _seqr = _rig()
+    cam.arm(1)
+    cam._deliver_records([_record(1.0, 0)])
+    observed = {}
+
+    def interrupt():
+        observed["terminal"] = cam.finish_record_capture()
+
+    worker = threading.Thread(target=interrupt)
+    worker.start()
+    worker.join(2.0)
+    assert not worker.is_alive()
+    assert cam._recent_state()["armed"] is False
+
+    # The interrupt thread cannot release an RLock acquired by this thread.  The
+    # original owner consumes the cached terminal and releases that ownership.
+    assert cam.finish_record_capture() == observed["terminal"]
+    cam.arm(1, timeout=0.1)
+    cam.finish_record_capture()
+
+
 def test_lazy_state_and_lock_are_created_once_atomically():
     """F4: the lazily-created buffer state and acquisition lock are created ATOMICALLY (``setdefault``),
     so every touch returns the SAME object -- a check-then-set could build two divergent buffers /

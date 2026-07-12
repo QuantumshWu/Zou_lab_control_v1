@@ -908,6 +908,8 @@ class CameraDevice(BaseDevice):
             state["pending"].clear()
             state["armed"] = True
             state["armed_frames"] = frames
+            state["last_terminal"] = None
+            state["last_terminal_error"] = None
             state["pending_capacity"] = (
                 int(max_inflight_frames)
                 if max_inflight_frames is not None
@@ -1005,21 +1007,47 @@ class CameraDevice(BaseDevice):
         """
 
         state = self._recent_state()
+        with state["cond"]:
+            must_stop_source = bool(state["armed"])
+            previous_terminal = state["last_terminal"]
+            previous_error = state["last_terminal_error"]
         try:
-            terminal = self._finish_record_capture()
+            if must_stop_source:
+                terminal = self._finish_record_capture()
+            elif previous_error is not None:
+                raise RuntimeError(
+                    "camera arm epoch already failed terminal completion"
+                ) from previous_error
+            elif previous_terminal is not None:
+                terminal = previous_terminal
+            else:
+                terminal = CameraCaptureTerminalRecord(0, True, True, True)
             if not isinstance(terminal, CameraCaptureTerminalRecord):
                 raise TypeError(
                     "camera _finish_record_capture must return CameraCaptureTerminalRecord"
                 )
+            if must_stop_source:
+                with state["cond"]:
+                    state["last_terminal"] = terminal
             return terminal
+        except BaseException as error:
+            if must_stop_source:
+                with state["cond"]:
+                    state["last_terminal_error"] = error
+            raise
         finally:
-            with state["cond"]:
-                state["armed"] = False
-                state["pending"].clear()
+            if must_stop_source:
+                with state["cond"]:
+                    state["armed"] = False
+                    state["pending"].clear()
             try:
                 self._acquire_lock().release()
             except RuntimeError:
-                pass  # disarm without a matching arm -- defensive no-op
+                # An out-of-band interrupt may stop the source from a different
+                # thread.  The original owner calls this method during cleanup
+                # and releases its RLock then; a fully released/no-arm call is a
+                # defensive no-op.
+                pass
 
     def acquire(self, frames: int = 1, *, stop=None, **kwargs) -> list[np.ndarray]:
         """Convenience one-shot: ``arm(frames)`` + ``read_frames(frames)`` + ``disarm()``.
@@ -1114,6 +1142,8 @@ class CameraDevice(BaseDevice):
             "armed_frames": None,
             "pending_capacity": max(1, int(self.recent_capacity)),
             "source_ordinal": 0,
+            "last_terminal": None,
+            "last_terminal_error": None,
         }
         return self.__dict__.setdefault("_zlc_recent", fresh)
 
