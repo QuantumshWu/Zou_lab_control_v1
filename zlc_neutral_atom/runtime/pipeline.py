@@ -413,6 +413,16 @@ class ExactCaptureTransaction:
             if hasattr(error, "add_note"):
                 error.add_note(f"capture poison also failed: {failure_error!r}")
 
+    def abort_preflight(self, error: BaseException) -> None:
+        """Release software-only authority before any capture command was attempted."""
+
+        _release_preflight_software(
+            self.session,
+            self.reservation,
+            self.builder,
+            error,
+        )
+
     def cleanup(self, context: RunContext) -> CleanupReport:
         software_errors: list[BaseException] = []
         try:

@@ -1,0 +1,142 @@
+"""Camera arm and one finite FPGA fire share one flat exact RunPlan."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from Zou_lab_control.neutral_atom.devices.registry import DeviceSet
+from Zou_lab_control.neutral_atom.devices.virtual import (
+    VirtualCamera,
+    VirtualSequencer,
+    VirtualTrapArray,
+)
+from zlc_data import AxisId, AxisSpec, BlockId, PointLayout, REPEAT, SCAN_POINT
+from zlc_neutral_atom.acquisition import CameraAcquisitionMode
+from zlc_neutral_atom.runtime import (
+    DatasetMaterializerSpec,
+    MinimalPipelineSpec,
+    PipelineMemoryProfile,
+)
+from zlc_neutral_atom.timing import (
+    FinitePulseExecutionRequest,
+    TriggeredCaptureSpec,
+    compile_triggered_pipeline,
+)
+from zlc_pulse import PulseExecutionForm, load_pulse_document
+from zlc_workbench.camera_capture import CameraCaptureBindingRequest
+from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
+from zlc_workbench.pulse_compile_bridge import _legacy_compile_input, compile_pulse_artifact
+
+
+ROOT = Path(__file__).parents[1]
+
+
+def _axis(name, role, size):
+    return AxisSpec(AxisId(name), name, role, size, tuple(range(size)))
+
+
+def _runtime(point_count=3):
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    _state, catalog = _legacy_compile_input(document)
+    sequencer = VirtualSequencer(
+        channels=document.target.raw_lanes,
+        port_catalog=catalog,
+        sleep_scale=0,
+    )
+    trap = VirtualTrapArray(grid_shape=(2, 2), image_shape=(6, 8), seed=7)
+    camera = VirtualCamera(trap, exposure=1e-3, sequencer=sequencer)
+    device_set = DeviceSet(
+        {"trap": trap, "sequencer": sequencer, "readout": camera},
+        {
+            "trap": {"type": "VirtualTrapArray", "params": {}},
+            "sequencer": {"type": "VirtualSequencer", "params": {}},
+            "readout": {"type": "VirtualCamera", "params": {}},
+        },
+    )
+    runtime = LegacyNeutralAtomRuntime(device_set)
+    measurement = runtime.bind_camera_measurement(
+        CameraCaptureBindingRequest(
+            "readout",
+            _axis("repeat", REPEAT, 1),
+            (_axis("frame", SCAN_POINT, point_count),),
+            PointLayout.rect_c((point_count,)),
+            CameraAcquisitionMode.EXTERNAL_TRIGGERED,
+            0,
+            4 << 20,
+        )
+    )
+    capture = MinimalPipelineSpec(
+        "finite triggered capture",
+        measurement,
+        DatasetMaterializerSpec(
+            BlockId("triggered-capture"),
+            PipelineMemoryProfile.for_current_runtime(8 << 20),
+        ),
+        timeout_seconds=3.0,
+    )
+    pulse_port = runtime.bind_sequencer_port()
+    artifact = compile_pulse_artifact(
+        document,
+        clock_hz=sequencer.clock_hz,
+        execution_form=PulseExecutionForm.STATIC_ONCE,
+        trigger_channels=("emCCD",),
+        live_target=document.target,
+    )
+    return runtime, camera, sequencer, capture, document, pulse_port, artifact
+
+
+def test_camera_is_armed_before_one_fire_and_all_frames_are_exactly_materialized():
+    runtime, camera, sequencer, capture, document, pulse_port, artifact = _runtime()
+    armed_at_fire = []
+
+    def observe_fire(_program):
+        state = camera._recent_state()
+        with state["cond"]:
+            armed_at_fire.append(bool(state["armed"]))
+
+    sequencer.add_fire_listener(observe_fire)
+    spec = TriggeredCaptureSpec(
+        capture,
+        pulse_port,
+        FinitePulseExecutionRequest(document, artifact),
+        "emCCD",
+    )
+    try:
+        result = runtime.controller.run(compile_triggered_pipeline(spec))
+        assert armed_at_fire == [True]
+        assert result.dataset.block.values.shape == (1, 3, 6, 8)
+        assert np.all(result.dataset.block.validity)
+        assert [item.source_ordinal for item in result.dataset.event_metadata] == [0, 1, 2]
+        assert [item.produced_count for item in result.dataset.event_metadata] == [1, 2, 3]
+        assert result.capture_terminal.produced_count == 3
+        assert result.pulse_terminal.completed_schedule_trigger_counts == (("emCCD", 3),)
+        assert [item["action"] for item in sequencer.history] == [
+            "prepare",
+            "fire",
+            "wait_done",
+            "safe",
+        ]
+        assert dict(sequencer.snapshot())["state"] == "safe"
+        state = camera._recent_state()
+        with state["cond"]:
+            assert not state["armed"] and not state["pending"]
+    finally:
+        assert runtime.shutdown(timeout=2.0)
+
+
+def test_trigger_cardinality_mismatch_is_rejected_before_hardware_run():
+    runtime, _camera, sequencer, capture, document, pulse_port, artifact = _runtime(2)
+    try:
+        with pytest.raises(ValueError, match="trigger count 3"):
+            TriggeredCaptureSpec(
+                capture,
+                pulse_port,
+                FinitePulseExecutionRequest(document, artifact),
+                "emCCD",
+            )
+        assert sequencer.history == []
+    finally:
+        assert runtime.shutdown(timeout=2.0)

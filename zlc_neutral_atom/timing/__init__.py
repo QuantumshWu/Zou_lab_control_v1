@@ -1,5 +1,10 @@
 """Neutral-atom pulse execution contracts."""
 
+from .capture import (
+    compile_triggered_pipeline,
+    TriggeredCaptureSpec,
+    TriggeredPipelineResult,
+)
 from .pulse import (
     BoundPulsePort,
     CompletePulseCommand,
@@ -26,4 +31,7 @@ __all__ = [
     "PulseSessionState",
     "PulseTerminalAck",
     "SequencerCapabilitySnapshot",
+    "compile_triggered_pipeline",
+    "TriggeredCaptureSpec",
+    "TriggeredPipelineResult",
 ]
