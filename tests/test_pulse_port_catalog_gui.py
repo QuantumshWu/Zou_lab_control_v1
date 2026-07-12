@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from conftest import pulse_editor_for_test
 
 from Zou_lab_control.neutral_atom.ports import PortCatalog
 from Zou_lab_control.neutral_atom.timing import PulseTableState
@@ -16,10 +17,10 @@ def _dac_catalog() -> PortCatalog:
     )
 
 
-def test_editor_rebinds_same_raw_lanes_to_device_topology(monkeypatch):
+def test_editor_rejects_raw_lane_equality_without_semantic_topology(monkeypatch):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor, _display_rows, ensure_qt_app
+    from Zou_lab_control.frontend.pulse_gui import ensure_qt_app
 
     ensure_qt_app()
     catalog = _dac_catalog()
@@ -33,16 +34,8 @@ def test_editor_rebinds_same_raw_lanes_to_device_topology(monkeypatch):
         port_catalog = catalog
         channels = list(catalog.raw_lanes)
 
-    editor = PulseSequenceEditor(stale, sequencer=Sequencer())
-    try:
-        assert editor.state.port_catalog.fingerprint == catalog.fingerprint
-        rows = _display_rows(editor.state)
-        assert [(row["kind"], row["name"]) for row in rows] == [
-            ("bus", "da_x"), ("channel", "ttl")]
-        assert not ({"b0", "b1", "da_clk0"} & {str(row["name"]) for row in rows})
-        assert editor.read_state().port_catalog.fingerprint == catalog.fingerprint
-    finally:
-        editor.close()
+    with pytest.raises(ValueError, match="has no matching hardware port"):
+        pulse_editor_for_test(stale, sequencer=Sequencer())
 
 
 def test_new_dac_scan_axis_uses_semantic_port_name(monkeypatch):
@@ -62,55 +55,39 @@ def test_new_dac_scan_axis_uses_semantic_port_name(monkeypatch):
         editor.close()
 
 
-def test_remote_connection_binds_server_catalog_and_clock_before_adoption(monkeypatch):
+def test_connection_is_installation_owned_and_frontend_only_adopts_descriptor(monkeypatch):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor, ensure_qt_app
-    import Zou_lab_control.neutral_atom.devices.sequencer as sequencer_module
+    from zlc_workbench.pulse_control import PulseTargetDescriptor
 
     ensure_qt_app()
     server_catalog = _dac_catalog()
-    local_catalog = PortCatalog.from_channels(list(server_catalog.raw_lanes))
     state = PulseTableState(
-        port_catalog=local_catalog,
-        visible_ports=["b0", "b1", "ttl"],
+        port_catalog=server_catalog,
+        visible_ports=["da_x", "ttl"],
         time_step_ns=20,
     )
-    constructed = []
+    target = PulseTargetDescriptor(
+        "installation-a", 1, server_catalog, 100_000_000, "FPGA installation"
+    )
 
-    class Remote:
-        def __init__(self, *, host, port):
-            constructed.append((host, port))
-            self.host, self.port = host, port
-            self.port_catalog = None
-            self.channels = []
-            self.clock_hz = None
-            self.closed = False
+    class Port:
+        def __init__(self):
+            self.target = target
 
-        def open(self):
-            self.port_catalog = server_catalog
-            self.channels = list(server_catalog.raw_lanes)
-            self.clock_hz = 100_000_000
-            return self
-
-        def close(self):
-            self.closed = True
-            self.port_catalog = None
-            self.channels = []
-            self.clock_hz = None
-
-    monkeypatch.setattr(sequencer_module, "RemoteSequencer", Remote)
-    editor = PulseSequenceEditor(state)
+    editor = PulseSequenceEditor(
+        state, target_descriptor=target, command_port=Port()
+    )
     try:
-        editor.conn_target_combo.setCurrentIndex(
-            editor.conn_target_combo.findData("remote"))
-        editor.conn_addr_edit.setText("fpga-box:18861")
         editor._apply_connection()
 
-        assert constructed == [("fpga-box", 18861)]
-        assert isinstance(editor.sequencer, Remote)
         assert editor.state.port_catalog == server_catalog
         assert editor.state.time_step_ns == 10
         assert editor._clock_hz == 100_000_000
+        assert not hasattr(editor, "sequencer")
+        assert not editor.conn_target_combo.isEnabled()
+        assert not editor.conn_connect_button.isEnabled()
+        assert editor.conn_status.text() == "FPGA installation"
     finally:
         editor.close()

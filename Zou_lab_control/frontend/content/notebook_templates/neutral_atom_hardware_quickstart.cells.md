@@ -223,10 +223,9 @@ preflight.raise_if_failed()
 <!-- cell:markdown -->
 ## Optional: edit pulses with the PyQt pulse GUI
 
-GUI 只是 pulse 前端。它读取 `exp.devices.sequencer.port_catalog`，编辑
-引用同一不可变 catalog 的 `PulseTableState`，然后在 `On Pulse/Stop Pulse` 按钮里调用同一个
-sequencer。`On Pulse` 会先把当前 pulse state 上传到 sequencer，再立刻
-start；`Stop Pulse` 调用 safe/reset。
+GUI 只是 pulse 前端。Workbench 从 installation authority 注入 immutable
+`PulseTargetDescriptor` 与 generation-bound `PulseCommandPort`；frontend 不持有或构造
+sequencer。`On Pulse`/`Stop Pulse` 都通过同一托管 command port 执行。
 
 如果当前环境没有桌面/Qt，跳过这个 cell，继续用
 `exp.timing.configure_imaging(...)` 和 API 配置 pulse。
@@ -264,8 +263,7 @@ camera 等一个无限自由循环的 pulse；使用后面的 `exp.readout...` h
 
 <!-- cell:code -->
 # Uncomment on a desktop Python/Qt environment.
-# pulse_gui = zf.show_pulse_gui(
-#     experiment=exp,
+# pulse_gui = exp.pulse_gui(
 #     state=na.PulseTableState.load("pulses/camera_imaging_address_switch.json"),
 #     scale=0.82,
 #     window_ratio=0.90,
@@ -273,41 +271,22 @@ camera 等一个无限自由循环的 pulse；使用后面的 `exp.readout...` h
 # pulse_gui
 
 <!-- cell:markdown -->
-## Pulse API equivalent
+## Pulse preflight
 
-GUI 不是单独硬件层；下面的 API 和 GUI `On Pulse` 调的是同一个 sequencer。
-这段适合在真正拍照前做软件侧 preflight，或者在示波器上打一发 finite shot。
+GUI 不是单独硬件层。下面通过 session 的 timing facade 对同一个 installation
+target 做 preflight；普通 notebook 不取得 raw sequencer 或拆开的 prepare/fire。
 
 <!-- cell:code -->
 state = na.PulseTableState.load("pulses/camera_imaging_address_switch.json")
-program = state.compile(
-    clock_hz=exp.devices.sequencer.clock_hz,
-    repeat_forever=False,
-)
-# 数相机被触发几次（每次出一帧）是相机层的事：用 count_trigger_pulses，传相机
-# 自己持有的 capture_trigger_channels（哪条 TTL 线触发相机是相机的属性，序列器不感知）。
 imaging_seq = state.to_sequence()
-{
-    "ticks": program.ticks[:8],
-    "masks": program.masks[:8],
-    "trigger_count": na.count_trigger_pulses(
-        imaging_seq, trigger_channels=exp.camera.capture_trigger_channels),
-    "repeat_forever": program.repeat_forever,
-}
+state_preflight = exp.timing.preflight(sequence=imaging_seq, verilog=False)
+state_preflight.raise_if_failed()
+state_preflight.summary()
 
 <!-- cell:markdown -->
-To actually fire the finite test pulse, set `RUN_SCOPE_PULSE_TEST = True`.
-Keep it `False` while the camera is connected unless you are deliberately doing
-scope/debug work.
-
-<!-- cell:code -->
-RUN_SCOPE_PULSE_TEST = False
-
-scope_program = None
-if RUN_SCOPE_PULSE_TEST:
-    scope_program = exp.devices.sequencer.prepare(program)
-    exp.devices.sequencer.fire()
-scope_program
+For an intentional scope/debug pulse, use the managed `exp.pulse_gui(state=state)`
+entry and its `On Pulse` control. Finite camera acquisition should use `exp.capture`
+or a readout measurement so camera arm always precedes the hardware trigger schedule.
 
 <!-- cell:markdown -->
 ## Capture a camera image
@@ -393,29 +372,19 @@ Scan 页提供表；API 里 `bind_field` + `set_scan_table`）：
 所有值是 ns，会自动对齐到 20 ns tick。Preview 不展开所有 scan points，
 而是把被扫描的时间段用透明橙色 band + slot 编号标出来。
 
-传给 camera acquisition 时，`exp.readout.detection_time(..., pulse=pulse)`
-会用同一张 pulse 先拍 long-reference，再为每个扫描点临时生成刚好 `shots`
-个外部触发的有限序列，保证相机先 arm，再由同一个 sequencer fire。
+正式 camera acquisition 使用 `exp.readout.detection_time(...)`；subsystem 在
+installation authority 内冻结并绑定 readout pulse，为每个扫描点生成刚好 `shots`
+个外部触发的有限序列，保证相机先 arm，再由硬件执行 trigger schedule。
 
 <!-- cell:code -->
-pulse = exp.timing.bind_pulse("pulses/camera_imaging_address_switch.json")
-pulse.snapshot()
+pulse_state = na.PulseTableState.load("pulses/camera_imaging_address_switch.json")
+pulse_state.to_dict()
 
 # This does not fire hardware; it shows that the semantic exposure slot controls
 # the finite readout sequence duration before you run the scan.
 test_widths_ns = [2_000_000, 4_000_000, 8_000_000]
-[(width, pulse.frame_sequence(1, time_ns=width).duration) for width in test_widths_ns]
-
-RUN_SINGLE_PULSE_TEST = False
-
-single_program = None
-if RUN_SINGLE_PULSE_TEST:
-    pulse.set_slot("exposure", 2_000_000)  # semantic scan slot, ns
-    single_program = pulse.on_pulse(wait=True, timeout=10.0, repeat_forever=False)
-single_program
-
-# Free-running output is still explicit when you want it:
-# pulse.on_pulse(wait=False, repeat_forever=True)
+[(width, pulse_state.with_slots_resolved({"exposure": width}).to_sequence().duration)
+ for width in test_widths_ns]
 
 <!-- cell:markdown -->
 ## Analog bus notes
@@ -449,10 +418,8 @@ lasers, shutters, camera, and trigger TTLs.
 `pulse` 和 remote sequencer。
 
 <!-- cell:code -->
-clock_hz = exp.devices.sequencer.clock_hz
-time_ticks = np.linspace(int(round(0.2e-3 * clock_hz)), int(round(8e-3 * clock_hz)), 40, dtype=int)
-times = time_ticks / clock_hz
-scan = exp.readout.detection_time(times, shots=30, live=False, display=True, pulse=pulse)
+times = np.linspace(0.2e-3, 8e-3, 40)
+scan = exp.readout.detection_time(times, shots=30, live=False, display=True)
 fit_result = scan.data_figure.fit("decay")
 scan.summary(), fit_result, fit_result.popt
 
@@ -467,7 +434,7 @@ RUN_LIVE_READOUT_SCAN = False
 
 live_scan = None
 if RUN_LIVE_READOUT_SCAN:
-    live_scan = exp.readout.detection_time(times, shots=30, live=True, display=True, pulse=pulse)
+    live_scan = exp.readout.detection_time(times, shots=30, live=True, display=True)
 live_scan
 
 <!-- cell:markdown -->

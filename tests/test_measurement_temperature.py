@@ -14,6 +14,7 @@ import time
 
 import numpy as np
 import pytest
+from conftest import raw_device_set
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -218,7 +219,7 @@ def test_temperature_survival_reaches_zero_at_large_trap_off():
 
         # the PHYSICAL model itself drops to 0 occupancy (proves real dynamics, not a faked floor): at a
         # large trap-off EVERY atom ballistically escapes the capture radius before the recapture.
-        ta = exp.devices.trap_array
+        ta = raw_device_set(exp).trap_array
         ta.occupancy = np.ones(ta.n_sites, dtype=bool)
         assert int(ta.apply_recapture_loss(5e-3).sum()) == 0
     finally:
@@ -269,13 +270,8 @@ def _calibrated_virtual_session(grid=(3, 4), readout_exposure=2e-3):
 
 def test_temperature_scan_virtual_end_to_end_headless():
     exp = _calibrated_virtual_session()
-    state = build_release_recapture_pulse(
-        channels=list(exp.devices.sequencer.channels), exposure=2e-3, settle=2e-4, recapture=2e-4
-    )
-    pulse = na.bind_pulse(exp.devices.sequencer, state)
-
     t_off = np.array([0.0, 5e-6, 1e-5, 2e-5, 4e-5, 8e-5])
-    scan = exp.readout.temperature(t_off, pulse=pulse, shots=3, live=False, display=False)
+    scan = exp.readout.temperature(t_off, shots=3, live=False, display=False)
 
     # ScanResult contract fields.
     assert isinstance(scan, ScanResult)
@@ -314,9 +310,9 @@ def test_temperature_scan_virtual_survival_decays_with_t_off():
     # The default loss model (50 uK, 6 um capture radius) has its half-survival near
     # ~75 us, so sweep 0..300 us to see the full fall-off.
     state = build_release_recapture_pulse(
-        channels=list(exp.devices.sequencer.channels), exposure=20e-3, settle=2e-4, recapture=2e-4
+        channels=list(raw_device_set(exp).sequencer.channels), exposure=20e-3, settle=2e-4, recapture=2e-4
     )
-    pulse = na.bind_pulse(exp.devices.sequencer, state)
+    pulse = na.bind_pulse(raw_device_set(exp).sequencer, state)
 
     t_off = np.linspace(0.0, 300e-6, 13)
     # Many shots per point so the survival FRACTION is a low-noise estimate of the
@@ -345,11 +341,11 @@ def test_temperature_scan_virtual_survival_decays_with_t_off():
 
 def test_temperature_scan_virtual_per_site_returns_one_column_per_site():
     exp = _calibrated_virtual_session(grid=(2, 3))
-    n_sites = exp.devices.trap_array.n_sites
+    n_sites = raw_device_set(exp).trap_array.n_sites
     state = build_release_recapture_pulse(
-        channels=list(exp.devices.sequencer.channels), exposure=2e-3, settle=2e-4, recapture=2e-4
+        channels=list(raw_device_set(exp).sequencer.channels), exposure=2e-3, settle=2e-4, recapture=2e-4
     )
-    pulse = na.bind_pulse(exp.devices.sequencer, state)
+    pulse = na.bind_pulse(raw_device_set(exp).sequencer, state)
 
     t_off = np.array([0.0, 1e-5, 2e-5, 4e-5])
     scan = exp.readout.temperature(t_off, pulse=pulse, shots=2, per_site=True, live=False, display=False)
@@ -362,8 +358,8 @@ def test_temperature_scan_virtual_per_site_returns_one_column_per_site():
 def test_temperature_requires_thresholds():
     exp = na.connect("virtual", sitemap={"grid_shape": (2, 3), "image_shape": (48, 64)})
     exp.readout.sitemap(method="box", frames=4, display=False)   # no thresholds yet
-    state = build_release_recapture_pulse(channels=list(exp.devices.sequencer.channels))
-    pulse = na.bind_pulse(exp.devices.sequencer, state)
+    state = build_release_recapture_pulse(channels=list(raw_device_set(exp).sequencer.channels))
+    pulse = na.bind_pulse(raw_device_set(exp).sequencer, state)
     with pytest.raises(RuntimeError):
         exp.readout.temperature([0.0, 1e-5], pulse=pulse, live=False, display=False)
 
@@ -379,7 +375,7 @@ def test_temperature_rejects_pulse_without_t_off_slot():
         ],
         repeat_forever=False,
     )
-    pulse = na.bind_pulse(exp.devices.sequencer, state)
+    pulse = na.bind_pulse(raw_device_set(exp).sequencer, state)
     with pytest.raises(ValueError):
         exp.readout.temperature([0.0, 1e-5], pulse=pulse, live=False, display=False)
 
@@ -387,9 +383,9 @@ def test_temperature_rejects_pulse_without_t_off_slot():
 def test_temperature_scan_virtual_live_path_uses_frontend_session():
     exp = _calibrated_virtual_session(grid=(2, 3))
     state = build_release_recapture_pulse(
-        channels=list(exp.devices.sequencer.channels), exposure=2e-3, settle=2e-4, recapture=2e-4
+        channels=list(raw_device_set(exp).sequencer.channels), exposure=2e-3, settle=2e-4, recapture=2e-4
     )
-    pulse = na.bind_pulse(exp.devices.sequencer, state)
+    pulse = na.bind_pulse(raw_device_set(exp).sequencer, state)
 
     t_off = np.array([0.0, 1e-5, 2e-5, 4e-5])
     scan = exp.readout.temperature(t_off, pulse=pulse, shots=2, live=True, display=False, update_time=0.01)
@@ -429,7 +425,7 @@ def test_generic_scanned_measurement_drives_detection_axis_directly():
     times = np.array([2e-6, 4e-6, 8e-6])
     axis = ScanAxis(slot="exposure", values=times, label="Detection time (s)", unit="s", kind="duration")
     scan = ScannedMeasurement(
-        pulse, exp.devices.camera, sequencer, cal, axis,
+        pulse, raw_device_set(exp).camera, sequencer, cal, axis,
         NFramePlan(n_frames=4), OtsuFidelityReducer(site=None), shots_per_point=1,
     )
     result = scan.run(live=False, display=False)
@@ -475,7 +471,7 @@ def test_duration_axis_is_snapped_to_clock_grid():
 
     exp = na.connect("virtual", sitemap={"grid_shape": (1, 2), "image_shape": (32, 48)})
     exp.readout.sitemap(method="box", frames=4, display=False)
-    clock = float(exp.devices.sequencer.clock_hz)        # 50 MHz -> 20 ns tick
+    clock = float(raw_device_set(exp).sequencer.clock_hz)        # 50 MHz -> 20 ns tick
 
     # Deliberately off-grid times: a linspace whose points are not whole ticks.
     times = np.linspace(2.0e-6, 5000.0e-6, 12)

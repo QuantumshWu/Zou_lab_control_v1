@@ -126,10 +126,11 @@ class NeutralAtomSession:
         return open_task_console(self, task=task, **kwargs)
 
     def pulse_gui(self, *, state=None, **kwargs):
-        """Open the pulse-sequence editor GUI bound to this session, so a measurement can read
-        the edited program back.  To run the editor WITHOUT a session (it picks its own server
-        connection, needing no experiment) call ``Zou_lab_control.frontend.show_pulse_gui()``
-        directly."""
+        """Open the pulse editor through this installation's managed command port.
+
+        ``Zou_lab_control.frontend.show_pulse_gui(state=...)`` without a session is an
+        offline editor and never creates or discovers hardware.
+        """
         from ._gui import open_pulse_gui
         return open_pulse_gui(self, state=state, **kwargs)
 

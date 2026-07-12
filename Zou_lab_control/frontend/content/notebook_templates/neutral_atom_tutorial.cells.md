@@ -30,12 +30,12 @@ zf.apply_style()
 
 推荐调用边界：
 
-- `na.BaseDevice` / `na.CameraDevice` / `na.SequencerDevice` / `na.TrapArrayDevice`：硬件契约。真实 camera 至少要满足 `exposure`、`configure(...)` 和纯 grabber 三原语 `arm(frames)`（返回即硬件就绪等触发）/ `read_frames(n)`（从设备自有缓冲取帧，武装期间不丢帧）/ `disarm()`；`acquire(frames)` 是三者的免触发便捷组合。相机不感知时序——arm 之后到达的触发边沿产生帧，仅此而已。
-- `na.triggered_frames(camera, sequencer, sequence, frames)`：测量层**唯一**的 arm-before-fire 编排（arm 相机 → prepare+fire 序列 → 读回帧）。需要 sequencer 的是测量层，从来不是相机。
-- `na.load_devices(...)`：按 JSON/dict 构造 device graph，合并本次运行的 device 参数，并要求每个 device 继承对应 base class；需要时也可以统一 open。**接自己的硬件**：写一个继承 `CameraDevice` / `SequencerDevice` / `TrapArrayDevice` 的类，`na.register_device_class(名, 类)` 注册后按短名引用（或 `load_devices(..., lookup=globals())` 零注册直接用），可选给它一个 `discover()` 让 `na.discover_devices()` 扫到它——完整示例见 hardware quickstart 与 device manual。
-- `exp.camera`：默认（读出角色）camera device 本体；一键快照是会话级编排 `exp.capture()`。`camera=` 可指定自由运行相机并直接 `acquire`，不重建/触发读出 pulse；其它外触发相机必须走同时拥有该相机和 pulse template 的 measurement/task（MOT 用 Optimize-MOT-field），`capture` 会在 fire 前拒绝。
+- `na.connect(...) -> exp` 是普通用户唯一的 installation 入口；raw adapter graph 只在 composition/runtime owner 内部。
+- `exp.device_catalog` 只提供 immutable `DeviceInfo` 观察值，不提供 `configure/arm/acquire/prepare/fire/close`。
+- `exp.capture()`、`exp.readout.*`、`exp.timing.*` 是具名领域操作；camera arm-before-fire、sequencer prepare/fire、claims 与 generation 都在 authority 内组合。
+- adapter 作者使用独立 adapter SDK/contract kit；普通 notebook 不构造、注册或反向取得 concrete camera/sequencer。
 - `exp.device_manager()`：**设备管理 GUI（config 编辑器）**——`Config` tab 左栏按角色类型（Camera / Sequencer / Trap array / 未来的 RF …）逐台列出设备：名字、类型下拉（按角色过滤全部已注册设备类）、由设备类自声明的参数表单（`$device:` 交叉引用是下拉、容器参数是 JSON 字面量，永不 eval），可增删设备、改名、New/Load/Save 整份 config；右栏 “Scan hardware” 扫总线（发现行一键 “Add to config”）+ 已载实例列表（Snapshot / “Open devices” 初始化硬件 / 每台一个 “Control” 按钮开它的运行时控制页）。底栏 **Apply** 把编辑中的 config 应用到会话（对应 `exp.load_config(dict)`，坏 config 不伤现场；换设备时**先停引用被换设备的逻辑节点**，跑在没动设备上的节点继续）；改动未应用/未保存分别有状态点与星号提示。
-- **`na.device_manager()`：还没连硬件时的 init 入口**——没有会话时直接打开编辑器，配好点 “Init devices” 即 `na.connect(该 config)`；它**返回窗口**，连出的会话经 `window.session` 交回 notebook。所以 notebook 流程是 `mgr = na.device_manager("virtual")` → 编辑 + 点 Init → `exp = mgr.session`。它是 `na.load_devices` / `na.discover_devices` 的图形面。
+- **`na.device_manager()`：还没连硬件时的 init 入口**——没有会话时直接打开 installation config 编辑器，配好点 “Init devices” 即 `na.connect(该 config)`；它**返回窗口**，连出的会话经 `window.session` 交回 notebook。所以 notebook 流程是 `mgr = na.device_manager("virtual")` → 编辑 + 点 Init → `exp = mgr.session`。raw adapter 构造仍留在 composition 内。
 - **运行时控制（Control tab）**：设备管理器的 `Control` tab 是每台设备 `runtime_controls()` 声明的**运行时可调属性**目录（区别于构造期 config 参数）——相机 `exposure` 可写（经设备 setter 校验），其余（roi / sensor / 序列器 firing / scan 进度 …）是只读读回，每 200 ms 刷新。控件走与 config 表单同一个 `PARAM_WIDGETS`，永不 eval。
 - `exp.device_viewer()`：**只读设备查看器**——每台设备一个 tab，显示 snapshot + 运行时读回，**无 config 编辑 / 无增删 / 无 Apply**。task console 顶栏的 “Devices” 按钮开的就是它，方便实验正跑时安全地瞄设备状态而不会误改；要真正编辑/换设备走完整的 `exp.device_manager()` / `na.device_manager()`。
 - **按真正的 owner 选设备**：凡确实拥有相机的 measurement / task（如 *Camera (live frames)*、*Optimize MOT field*）表单里才有 **Camera 下拉**；其 spec 声明 `devices=["camera"]`，基类注入所选设备。`PulseScan` 只拥有 sequencer 与外部 y cursor：`scan_slot` 整表一次上传/fire，`api_slot` 则逐行解析 API handles 并运行有限 pulse；两者都没有 Camera 下拉、不采帧。其 slot 表单只保存 `{program_id, api, sweep_kind, program}`。加一台新设备域无需改 spec；读出/存活/保真类测量仍锁定科学相机。
@@ -134,7 +134,7 @@ detect 图显示 raw camera data：所有 sitemap site 有很浅的背景圆圈�
 
 <!-- cell:code -->
 shot = exp.readout.detect(display=True)
-occupancy_grid = shot.occupied.reshape(exp.devices.trap_array.grid_shape)
+occupancy_grid = shot.occupied.reshape(exp.resolve_grid_shape(None))
 occupancy_grid
 
 <!-- cell:markdown -->
@@ -143,12 +143,10 @@ occupancy_grid
 有些算法不应该绑死在 session 上。只给 images 和 calibration，也可以重算 sitemap、threshold 或 detect。
 
 <!-- cell:code -->
-standalone_sequence = na.imaging_sequence(exposure=exp.camera.exposure, load=True, name="sitemap")
-standalone_images = na.triggered_frames(
-    exp.devices.camera, exp.devices.sequencer, standalone_sequence, 4)
+standalone_images = exp.capture(frames=4, display=False).images
 standalone_sitemap = na.calibrate_sitemap_from_images(
     standalone_images,
-    grid_shape=exp.devices.trap_array.grid_shape,
+    grid_shape=exp.resolve_grid_shape(None),
     display=False,
 )
 standalone_threshold = na.calibrate_threshold_from_images(
@@ -167,15 +165,13 @@ standalone_shot.occupied.shape
 1. **从全亮模板图像提取 PSF**(`method="psf"`):`core.psf.fit_site_psfs` 对每个检测到的 site 裁框、扣环形背景、拟合 2D 高斯,得到**逐站点归一化 PSF 权重**;逐发提取改成 PSF 加权点积(已知形状 + 加性噪声下信噪比最优)。权重是**拟合出来的**,不是预设的——下面 `psf_cal.psf_weights.shape` 就是它。
 2. **从计数分布定阈值**(`method="bimodal"`):拟合暗/亮双高斯峰核,阈值放在两高斯总错判率最小处,并给出模型保真度。
 
-二者都接在同一套 `TrapCalibration.detect` 契约后面(box/otsu 仍是默认)。下面用 standalone 路径演示,不改动上面 session 的 box 标定。`psf_template_images` 这里由 `na.triggered_frames(...)` 拿到(armed 相机 + fired 成像序列,虚拟相机经触发线产帧);真机上同一行换成真相机即可,`calibrate_sitemap_from_images`/`calibrate_threshold_from_images` 一字不改。
+二者都接在同一套 `TrapCalibration.detect` 契约后面(box/otsu 仍是默认)。下面用 standalone array analysis 演示,不改动上面 session 的 box 标定。原始图像由 installation-owned `exp.capture(...)` 取得；之后的 `calibrate_sitemap_from_images`/`calibrate_threshold_from_images` 是相同的纯数组算法。
 
 <!-- cell:code -->
-psf_template_images = na.triggered_frames(
-    exp.devices.camera, exp.devices.sequencer,
-    na.imaging_sequence(exposure=exp.camera.exposure, load=True, name="sitemap"), 8)
+psf_template_images = exp.capture(frames=8, display=False).images
 psf_sitemap = na.calibrate_sitemap_from_images(
     psf_template_images,
-    grid_shape=exp.devices.trap_array.grid_shape,
+    grid_shape=exp.resolve_grid_shape(None),
     method="psf",
     display=False,
 )
@@ -204,13 +200,12 @@ na.detect_image(exp.capture(display=False).image, psf_cal, display=True).occupie
 <!-- cell:code -->
 # 数据文件夹(真机:相机/DAQ 把 PREFIX<n> 原始帧写到这里)。改成你的实验路径即可。
 data_dir = "results/rb87_run01"
-# 【仅虚拟】用 *同一台* 虚拟相机(trap_array=exp.devices.trap_array)渲染假原始帧,
-# 这样存盘数据与 live 会话的几何/信号完全一致(真机里本就是同一台相机在写盘)。真机:删除这一格。
+# 【仅虚拟】按与 live 会话相同的 grid shape 渲染假原始帧。真机:删除这一格。
 # 每次装载成像 shots_per_group=4 张:short_shot=3 是短读出,ref_shots=(1,2,4) 是高 SNR 参考。
 na.write_virtual_run(
     data_dir, prefix="img", groups=150, shots_per_group=4, short_shot=3, ref_shots=(1, 2, 4),
     short_exposure=3e-3, reference_exposure=20e-3,
-    trap_array=exp.devices.trap_array, seed=1,
+    grid_shape=exp.resolve_grid_shape(None), seed=1,
 )
 
 <!-- cell:code -->
@@ -229,7 +224,7 @@ values, occupied = report.per_site_arrays()
 hist_grid = zf.grid(
     values, sub_plot_kind="hist",
     occupied=occupied, thresholds=report.thresholds,
-    site_fidelities=report.site_fidelities, grid_shape=exp.devices.trap_array.grid_shape,
+    site_fidelities=report.site_fidelities, grid_shape=exp.resolve_grid_shape(None),
     labels=("PSF signal (counts)", "Shots"),
     title=f"Per-site readout histograms (held-out F={report.aggregate_fidelity:.3f})",
 )
@@ -253,9 +248,7 @@ for row in report.ablation:
 > 想交互观察：`detection_time(..., live=True)` 会后台采集并实时刷新前端图，`scan.stop()` 提前停止；停止后 `scan.fidelities` 里已采到的数据仍然可用。
 
 <!-- cell:code -->
-clock_hz = exp.devices.sequencer.clock_hz
-time_ticks = np.linspace(int(round(0.2e-3 * clock_hz)), int(round(10e-3 * clock_hz)), 30, dtype=int)
-times = time_ticks / clock_hz
+times = np.linspace(0.2e-3, 10e-3, 30)
 # live=False：一次跑完整条扫描，确定且可复现（live=True 则后台跑、前端实时刷新、scan.stop() 提前停）。
 scan = exp.readout.detection_time(times, shots=20, live=False, display=True)
 print("times (ms):", np.round(scan.times * 1e3, 2).tolist())
@@ -284,18 +277,14 @@ best
 
 测温与上面的读出时长扫描**是同一台通用扫描引擎**的另一个实例——只换扫描轴 / 每点采帧方式 / 约简器：两次成像之间把 trap 关掉 `t_off`，原子按热速度自由飞，再开 trap，看还有多少能被重捕。越热飞得越远，存活随 `t_off` 衰减越快——**survival-vs-`t_off` 曲线编码了温度**。曲线只定 `r_c/sqrt(T)`，所以**必须**从阱几何给出捕获半径 `capture_radius`（米）才能定出 T。
 
-下面的配方在实机上**基本一字不变**（唯一虚拟之处仍是相机）——`build_release_recapture_pulse` 直接接 sequencer 的不可变 `PortCatalog`，角色参数只负责把 trap/probe/trigger 映射到 catalog 内已有的 logical port，绝不另造一份 channel topology。它建一个 6 周期双触发序列，trap-off duration 绑定到公开名为 `t_off` 的 `ScanSlot`；`s0` 仅是编译器内部列 token。`exp.readout.temperature` 每点采两帧、按 `calibration.detect` 算逐点存活；`fit_temperature` 是纯后处理。
+下面的配方在实机上**基本一字不变**（唯一虚拟之处仍是相机）——`exp.readout.temperature` 在 subsystem 内从 installation target 的不可变 `PortCatalog` 构造并绑定 6 周期双触发序列；普通 notebook 不取得 sequencer 或 pulse drive controller。trap-off duration 的公开 slot 名为 `t_off`，每点采两帧并按 `calibration.detect` 算逐点存活；`fit_temperature` 是纯后处理。
 
 > **一键 GUI 路径**：同一测量在 Task 控制台里走 `zf.show_task_console(hub=SignalHub(), session=exp, measurements=exp.readout.measurement_specs())`——头部 **Add Panel** 选 `Temperature`，它作为一个 Logic 节点加入，在自己的 **Edit** 页填范围 `t_off`/`shots`/`per_site`、点 **Start**，再加一个 Monitor 面板指向 survival 信号看曲线。`capture_radius` **不在采集表单里**——它是把 survival 曲线变成温度的**后处理 fit 入参**（一个已知的阱几何，不改变发什么/读什么），所以拿到 survival 后用下面的 `fit_temperature(..., capture_radius=...)` 定 T。GUI 的 Start 与下面这行 API 调**同一个建器**，不会漂移。完整的控制台跑实验流程见 `task_console_tutorial.ipynb`。
 
 <!-- cell:code -->
-# 6 周期双触发序列：trap_off duration 的公开 scan slot 名为 t_off。
-rr_state = na.build_release_recapture_pulse(port_catalog=exp.devices.sequencer.port_catalog)
-rr_pulse = na.bind_pulse(exp.devices.sequencer, rr_state)
-
 # 扫 t_off(0..300us, 13 点),每点 shots=16 次装载求均存活。live=False 直接跑完。
 t_off_s = np.linspace(0, 300e-6, 13)
-temp_scan = exp.readout.temperature(t_off_s, pulse=rr_pulse, shots=16, live=False, display=True)
+temp_scan = exp.readout.temperature(t_off_s, shots=16, live=False, display=True)
 print("t_off (us):", np.round(temp_scan.x * 1e6, 1).tolist())
 print("survival  :", np.round(temp_scan.y, 3).tolist())
 
@@ -331,7 +320,7 @@ console
 <!-- cell:markdown -->
 ## 一键打开 pulse GUI(编辑 / 扫描脉冲)
 
-`exp.pulse_gui()` 打开绑定到本 session 的脉冲编辑器(等价于不带 session 的 `zf.show_pulse_gui()`,但绑了 session 后测量端能读回编辑后的程序)。在 period 卡里改 duration / DAC / delay；duration/DAC 字段可绑定为有语义 `ScanSlot.name` 的橙色 scan slot，或绑定为紫色 API handle `aN`；delay 只能是固定值或 API handle，不能成为 scan slot。**Scan** 页按语义列名写一张 `N×n_slots` 的 `scan_table`；`sN` 只在编译器内部定位列。换实机只改 `na.connect`,这一格不变。
+`exp.pulse_gui()` 打开绑定到本 installation session 的脉冲编辑器；frontend 只接收 immutable target descriptor 与 generation-bound command port，不持有 sequencer。无 session 的 `zf.show_pulse_gui(state=...)` 只是 offline 编辑器。在 period 卡里改 duration / DAC / delay；duration/DAC 字段可绑定为有语义 `ScanSlot.name` 的橙色 scan slot，或绑定为紫色 API handle `aN`；delay 只能是固定值或 API handle，不能成为 scan slot。**Scan** 页按语义列名写一张 `N×n_slots` 的 `scan_table`；`sN` 只在编译器内部定位列。换实机只改 `na.connect`,这一格不变。
 
 <!-- cell:code -->
 # 一键打开脉冲编辑器(绑定本 session,所以 exp.readout.* 测量能读回编辑后的时序):

@@ -19,6 +19,7 @@ from pathlib import Path
 import sys
 
 import pytest
+from conftest import pulse_command_port_for_test, pulse_editor_for_test
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
@@ -68,7 +69,21 @@ def _pulse_editor(sequencer=None):
     st = PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"]))
     st.bind_field("duration", "0", unit="us", name="exposure")
     st.set_scan_table([[10.0], [20.0], [30.0]])
-    return PulseSequenceEditor(st, sequencer=sequencer)
+    if sequencer is None:
+        return PulseSequenceEditor(st)
+    sequencer.port_catalog = st.port_catalog
+    return pulse_editor_for_test(st, sequencer=sequencer)
+
+
+def _attach_port(editor, sequencer):
+    if not hasattr(sequencer, "port_catalog"):
+        sequencer.port_catalog = editor.state.port_catalog
+    if not hasattr(sequencer, "clock_hz"):
+        sequencer.clock_hz = 1e9 / editor.state.time_step_ns
+    port = pulse_command_port_for_test(sequencer)
+    editor.target_descriptor = port.target
+    editor.command_port = port
+    return sequencer
 
 
 def test_scan_repeats_spin_writes_state_scan_repeats(_app):
@@ -115,7 +130,7 @@ def test_apply_scan_source_with_empty_generated_cache_keeps_the_loaded_table(_ap
 def test_poll_scan_progress_blank_without_sequencer(_app):
     ed = _pulse_editor()
     ed.tabs.setCurrentWidget(ed.scan_tab)             # Scan tab visible -> the poll actually runs
-    ed.sequencer = None
+    ed.command_port = None
     ed._poll_scan_progress()                          # must not raise
     assert ed.scan_progress_label.text() == ""
 
@@ -130,7 +145,7 @@ def test_poll_scan_progress_reads_connected_sequencer(_app):
         def scan_progress(self):
             return {"scanning": True, "point": 1, "n_points": 3, "sweep": 0, "n_repeats": 2}
 
-    ed.sequencer = _FakeSeq()
+    _attach_port(ed, _FakeSeq())
     ed._poll_scan_progress()
     # the live position PLUS the current point's values (#1 "show the current scan points"): the
     # editor's scan_table is [[10],[20],[30]], so point 1 appends its semantic identity.
@@ -176,7 +191,7 @@ def test_poll_scan_progress_skips_rpc_when_scan_tab_hidden(_app):
             type(self).calls += 1
             return {"scanning": True, "point": 0, "n_points": 3, "sweep": 0, "n_repeats": 0}
 
-    ed.sequencer = _CountingSeq()
+    _attach_port(ed, _CountingSeq())
     ed._poll_scan_progress()
     assert _CountingSeq.calls == 0                    # gated: no RPC while the Scan tab is hidden
 
@@ -191,7 +206,7 @@ def test_poll_scan_progress_swallows_reader_errors(_app):
         def scan_progress(self):
             raise RuntimeError("link dropped")
 
-    ed.sequencer = _BoomSeq()
+    _attach_port(ed, _BoomSeq())
     ed._poll_scan_progress()                          # must not raise
     assert ed.scan_progress_label.text() == ""
 
@@ -226,7 +241,7 @@ def test_on_pulse_routes_through_pulse_controller_and_is_cyclic(_app):
     ed = _pulse_editor()
     ed.state.repeat_forever = False                   # a loaded single-shot state -- On Pulse overrides
     seq = _RecordingSeq()
-    ed.sequencer = seq
+    _attach_port(ed, seq)
     ed.fire()                                         # the real On Pulse handler
     assert seq.fired == 1                             # it prepared AND fired through the controller seam
     payload = seq.prepared[-1]
@@ -240,7 +255,7 @@ def test_prepare_button_also_routes_cyclic_through_controller(_app):
     ed = _pulse_editor()
     ed.state.repeat_forever = False
     seq = _RecordingSeq()
-    ed.sequencer = seq
+    _attach_port(ed, seq)
     ed.prepare()                                      # the real Prepare handler
     assert seq.fired == 0                             # Prepare does NOT fire
     assert len(seq.prepared) == 1 and bool(seq.prepared[-1].repeat_forever) is True
@@ -258,7 +273,8 @@ def _three_period_scan_editor(seq):
     st.periods.append(PulsePeriod(1000, tuple(0 for _ in st.port_catalog.raw_lanes), unit="ns"))
     st.bind_field("duration", "0", unit="us")
     st.set_scan_table([[10.0], [20.0], [30.0]])
-    ed = PulseSequenceEditor(st, sequencer=seq)
+    seq.port_catalog = st.port_catalog
+    ed = pulse_editor_for_test(st, sequencer=seq)
     ed._scan_tables["generated"] = [[10.0], [20.0], [30.0]]   # the active generated source
     return ed
 

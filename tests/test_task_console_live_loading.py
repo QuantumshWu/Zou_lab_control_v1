@@ -646,7 +646,9 @@ def test_session_gui_is_a_singleton_that_reopens_the_same_window():
         e1 = exp.pulse_gui()
         e2 = exp.pulse_gui()
         assert e1 is e2                                         # pulse editor singleton too
-        assert e1.sequencer.managed_installation_authority
+        assert e1.command_port is not None
+        assert e1.target_descriptor == e1.command_port.target
+        assert not hasattr(e1, "sequencer")
         assert not e1.conn_target_combo.isEnabled()
         assert not e1.conn_connect_button.isEnabled()
         assert open_pulse_gui() is not open_pulse_gui()         # standalone (no session): per-call window
@@ -658,8 +660,8 @@ def test_session_gui_launchers_delegate_and_pulse_runs_standalone(monkeypatch):
     """``exp.task_console()`` / ``exp.pulse_gui()`` are confocal-style session sugar that
     delegate to the frontend launchers via the GUI-action module (``neutral_atom`` reaches the
     frontend ONLY here, lazily -- never on its analysis-path import).  task_console fills the
-    hub + the auto-discovered catalogs; pulse_gui binds the experiment.  The pulse editor also
-    runs STANDALONE with no session (``open_pulse_gui()`` -> no ``experiment`` kwarg)."""
+    hub + the auto-discovered catalogs; pulse_gui receives a managed target/command port.  The
+    pulse editor also runs STANDALONE offline with no session."""
     import Zou_lab_control.frontend.pulse_gui as pgmod
     import Zou_lab_control.frontend.task_console as tcmod
     import Zou_lab_control.neutral_atom._gui as gui
@@ -678,18 +680,24 @@ def test_session_gui_launchers_delegate_and_pulse_runs_standalone(monkeypatch):
         assert tc["session"] is exp and tc["task"] == "foo"
         assert {"hub", "measurements", "processors", "tasks"} <= set(tc)   # catalogs filled from session
         # Runtime authority, rather than QWidget callbacks, owns close/config-swap safety.
-        assert tc["runtime_fence"] is exp._zlc_runtime_services
-        assert tc["runtime_fence_provider"]() is exp._zlc_runtime_services
+        runtime = exp._require_runtime_services()
+        assert tc["runtime_fence"] is runtime
+        assert tc["runtime_fence_provider"]() is runtime
         assert not hasattr(exp, "_device_teardown_hooks")
         assert not hasattr(exp, "_device_change_hooks")
 
         assert exp.pulse_gui() == "EDITOR"
-        assert calls["pg"][-1]["experiment"] is exp                        # bound to the session
-        assert calls["pg"][-1]["sequencer"].managed_installation_authority
-        assert calls["pg"][-1]["sequencer"] is not exp.devices.sequencer
+        managed = calls["pg"][-1]
+        assert managed["command_port"] is not None
+        assert managed["target_descriptor"] == managed["command_port"].target
+        assert "experiment" not in managed
+        assert "sequencer" not in managed
 
         gui.open_pulse_gui()                                               # STANDALONE
-        assert "experiment" not in calls["pg"][-1]                         # no session needed
+        offline = calls["pg"][-1]
+        assert "experiment" not in offline
+        assert "sequencer" not in offline
+        assert "command_port" not in offline
     finally:
         exp.close()
 

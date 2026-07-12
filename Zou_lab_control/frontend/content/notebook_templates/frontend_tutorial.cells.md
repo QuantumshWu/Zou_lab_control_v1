@@ -170,32 +170,20 @@ single_program = single.compile(clock_hz=50_000_000)
 
 <!-- cell:markdown -->
 For real hardware, do not let the GUI invent hardware. Start the server on the
-FPGA/Vivado computer, then attach the same `RemoteSequencer` from GUI or API:
+FPGA/Vivado computer, create one installation-owned experiment session, and open
+the editor through that session:
 
 ```python
-pulse_state = na.PulseTableState.load("pulses/camera_imaging_address_switch.json")
-sequencer = na.RemoteSequencer(
-    host="FPGA_SERVER_IP",   # 改成你 FPGA/Vivado 电脑的 IP
-    port=18861,
+exp = na.connect(
+    "remote_template",
+    sequencer={"host": "FPGA_SERVER_IP", "port": 18861},
+    open_devices=True,
 )
-sequencer.open()  # PortCatalog 与 clock_hz 都只从 server snapshot 绑定
-pulse_state = pulse_state.aligned_to_catalog(sequencer.port_catalog).snapped(
-    time_step_ns=1e9 / sequencer.clock_hz)
 # 哪条线触发相机（emCCD/M13）是相机的属性（camera.capture_trigger_channels），
 # 不是序列器的——序列器是纯脉冲流送器，不感知谁被它触发。
-gui = zf.show_pulse_gui(
-    state=pulse_state,
-    sequencer=sequencer,
+gui = exp.pulse_gui(
+    state=na.PulseTableState.load("pulses/camera_imaging_address_switch.json"),
 )
-```
-
-The API equivalent of pressing `On Pulse` is:
-
-```python
-state = na.PulseTableState.load("pulses/camera_imaging_address_switch.json")
-program = state.compile(clock_hz=50_000_000)
-sequencer.prepare(program)
-sequencer.fire()
 ```
 
 In normal camera acquisition, prefer the higher-level readout helper because it

@@ -1,11 +1,8 @@
-"""Standalone launcher for the Zou_lab_control pulse GUI.
+"""Standalone composition launcher for the pulse GUI.
 
-This entrypoint is intentionally independent from experiment configs.  By
-default it opens with a VIRTUAL (in-memory) sequencer, and the GUI's in-window
-Connection control then lets you switch to a remote FPGA sequencer server
-(host:port) or to offline edit-only AFTER opening -- the backend is no longer
-fixed on the command line.  An explicit ``--remote-host`` still auto-connects at
-launch (for scripted / headless use), and ``--no-sequencer`` opens offline.
+Virtual and remote execution both use a complete installation authority.  The editor
+itself only receives a target descriptor and command port; ``--no-sequencer`` is the
+explicit offline authoring mode.
 """
 
 from __future__ import annotations
@@ -78,7 +75,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--clock-hz",
         type=_positive_float,
         default=50_000_000.0,
-        help="Virtual/offline authoring clock in Hz. A remote connection always uses the server clock.",
+        help="Offline authoring clock in Hz. Managed targets use installation readback.",
     )
     parser.add_argument(
         "--scale",
@@ -92,9 +89,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--remote-host",
         default=os.environ.get("ZLC_PS_REMOTE_HOST", "127.0.0.1"),
         help=(
-            "Connect to an already running FPGA sequencer server. "
-            "The default tries localhost and opens offline if no server is listening; "
-            "an explicit --remote-host is treated as required."
+            "Connect to an already running FPGA sequencer server when explicitly "
+            "selected. Without --remote-host the launcher uses the virtual installation."
         ),
     )
     parser.add_argument("--remote-port", type=int, default=18861, help="Remote sequencer server port.")
@@ -164,33 +160,6 @@ def _resolve_channel_pins(args, channels: Sequence[str]) -> dict[str, str]:
     }
 
 
-def _connect_remote_or_offline(args, state, na, *, explicit_remote: bool):
-    try:
-        sequencer = na.RemoteSequencer(
-            host=args.remote_host,
-            port=args.remote_port,
-            connect_on_init=True,
-        )
-    except Exception as exc:
-        if explicit_remote:
-            raise
-        notice = (
-            f"Could not connect to local sequencer server at {args.remote_host}:{args.remote_port}; "
-            "opened offline editor. Start fpga\\run_server.bat for hardware control, "
-            "or pass --remote-host for a required remote connection."
-        )
-        # No server listening is the normal offline case -- print a clean one-liner, not
-        # the raw ConnectionRefusedError traceback (it reads as a scary error otherwise).
-        print(f"ZLC pulse GUI: {notice}")
-        seed_channels = _resolve_channels(args, state)
-        seed_catalog = na.PortCatalog.from_channels(
-            seed_channels,
-            channel_labels=_resolve_channel_labels(args, seed_channels, state),
-        )
-        return None, seed_catalog, notice
-    return sequencer, sequencer.port_catalog, None
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     argv_list = list(sys.argv[1:] if argv is None else argv)
     args = _build_parser().parse_args(argv_list)
@@ -206,45 +175,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     import Zou_lab_control.neutral_atom as na
 
     state = na.PulseTableState.load(args.state) if args.state else None
-    sequencer = None
-    startup_notice = None
-    if not args.no_sequencer:
-        if explicit_remote:
-            sequencer, port_catalog, startup_notice = _connect_remote_or_offline(
-                args,
-                state,
-                na,
-                explicit_remote=explicit_remote,
-            )
-        else:
-            # Default: open with a VIRTUAL (in-memory) sequencer.  The GUI's
-            # Connection control lets you switch to a remote FPGA server
-            # (host:port) or offline AFTER opening -- the backend is no longer
-            # fixed on the command line.  An explicit --remote-host still
-            # auto-connects at launch for scripted/headless use.  The sequencer is
-            # a pure streamer; which line gates a camera is the CAMERA's property,
-            # so the pulse editor never seeds a trigger channel.
-            channels = _resolve_channels(args, state)
-            channel_labels = _resolve_channel_labels(args, channels, state)
-            port_catalog = na.PortCatalog.from_channels(
-                channels, channel_labels=channel_labels)
-            sequencer = na.VirtualSequencer(
-                port_catalog=port_catalog,
-                clock_hz=args.clock_hz,
-            )
-    else:
+    session = None
+    command_port = None
+    target_descriptor = None
+    if args.no_sequencer:
         channels = _resolve_channels(args, state)
         channel_labels = _resolve_channel_labels(args, channels, state)
         port_catalog = na.PortCatalog.from_channels(
             channels, channel_labels=channel_labels)
+    else:
+        if explicit_remote:
+            session = na.connect(
+                "remote_template",
+                sequencer={"host": args.remote_host, "port": args.remote_port},
+                open_devices=True,
+            )
+        else:
+            session = na.connect("virtual")
+        from zlc_workbench.pulse_control import managed_pulse_command_port
+
+        raw_sequencer = session._device_set.sequencer
+        command_port = managed_pulse_command_port(
+            session, session._require_runtime_services(), raw_sequencer
+        )
+        target_descriptor = command_port.target
+        port_catalog = target_descriptor.port_catalog
 
     if state is not None and state.port_catalog.fingerprint != port_catalog.fingerprint:
         try:
             state = state.aligned_to_catalog(port_catalog)
         except ValueError as exc:
             _build_parser().error(str(exc))
-    if state is not None and isinstance(sequencer, na.RemoteSequencer):
-        state = state.snapped(time_step_ns=1_000_000_000.0 / float(sequencer.clock_hz))
+    if state is not None and target_descriptor is not None:
+        state = state.snapped(time_step_ns=target_descriptor.time_step_ns)
     channels = list(port_catalog.raw_lanes)
     channel_pins = _resolve_channel_pins(args, channels)
 
@@ -254,27 +217,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         ][:4]
         state = na.PulseTableState(
             port_catalog=port_catalog,
-            time_step_ns=1_000_000_000.0 / float(getattr(sequencer, "clock_hz", args.clock_hz)),
+            time_step_ns=(
+                target_descriptor.time_step_ns
+                if target_descriptor is not None
+                else 1_000_000_000.0 / float(args.clock_hz)
+            ),
             visible_ports=visible_ports,
         )
 
     editor = zf.show_pulse_gui(
         state=state,
-        sequencer=sequencer,
+        target_descriptor=target_descriptor,
+        command_port=command_port,
         channel_pins=channel_pins,
         scale=args.scale,
         window_ratio=args.window_ratio,
     )
-    if startup_notice:
-        if hasattr(editor, "summary"):
-            editor.summary.setText(startup_notice)
-        if hasattr(editor, "preview_status"):
-            editor.preview_status.setText(startup_notice)
     app = QtWidgets.QApplication.instance()
     auto_close_ms = os.environ.get("ZLC_PULSE_GUI_AUTO_CLOSE_MS")
     if auto_close_ms:
         QtCore.QTimer.singleShot(max(0, int(auto_close_ms)), app.quit)
-    app.exec_()
+    try:
+        app.exec_()
+    finally:
+        if session is not None:
+            session.close()
     return 0
 
 

@@ -94,6 +94,33 @@ def raw_device_set(exp):
     return exp._device_set
 
 
+def pulse_command_port_for_test(sequencer, *, generation=1):
+    """Explicit testing adapter from a fake/simulated sequencer to the GUI port."""
+
+    from zlc_workbench.pulse_control import PulseCommandPort, PulseTargetDescriptor
+
+    target = PulseTargetDescriptor(
+        "test-installation",
+        int(generation),
+        sequencer.port_catalog,
+        float(sequencer.clock_hz),
+        "Test installation",
+    )
+    return PulseCommandPort(sequencer, target, lambda: int(generation))
+
+
+def pulse_editor_for_test(state=None, *, sequencer, **kwargs):
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+
+    port = pulse_command_port_for_test(sequencer)
+    return PulseSequenceEditor(
+        state,
+        target_descriptor=port.target,
+        command_port=port,
+        **kwargs,
+    )
+
+
 def make_console(exp, *, running_nodes=None, window_px=(900, 600)):
     """A real offscreen TaskConsole wired exactly like ``exp.task_console()`` -- the ONE
     console factory for lifecycle tests (build / start / stop / task flows), so every test

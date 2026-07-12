@@ -7,11 +7,10 @@ is LAZY and lives here, off the analysis / orchestration path: ``connect`` / ``s
 the sealed analysis directories (``core`` / ``operations`` / ``subsystems``) nor ``session.py``,
 so it may import the frontend -- exactly as ``notes.py`` imports the frontend's PDF renderer.
 
-The session's ``exp.task_console()`` / ``exp.pulse_gui()`` are thin sugar over these.  The
-pulse editor also runs STANDALONE with no session (``open_pulse_gui()`` / the frontend's
-``show_pulse_gui()``): the editor picks its OWN server connection and needs no experiment --
-a session is only required when something must read the edited program back (e.g. a
-measurement tuning a period duration).
+The session's ``exp.task_console()`` / ``exp.pulse_gui()`` are thin composition entrypoints.
+The pulse editor also runs without a session (``open_pulse_gui()`` / the frontend's
+``show_pulse_gui()``), but that form is deliberately offline and never constructs a device.
+Executable virtual or real use always enters through an installation-owned session.
 """
 
 from __future__ import annotations
@@ -84,11 +83,11 @@ def open_task_console(session: Any, *, task: str | None = None, **kwargs):
 def open_pulse_gui(session: Any = None, *, state=None, **kwargs):
     """Open the pulse-sequence editor.
 
-    With a ``session`` the editor binds to that experiment (channels / sequencer come from it,
-    and a measurement can later read the edited program back) and is a ONE-per-session singleton:
+    With a ``session`` the editor receives its immutable target descriptor and generation-bound
+    command port from the installation authority and is a ONE-per-session singleton:
     a later ``exp.pulse_gui()`` reshows the SAME editor (its loaded program + edits) instead of a
-    new window; closing it just hides it.  With ``session=None`` it runs STANDALONE -- the editor
-    picks its own server connection, needs no experiment, and each call is its own window."""
+    new window; closing it just hides it.  With ``session=None`` it is an offline editor and each
+    call is its own window."""
 
     from Zou_lab_control.frontend.pulse_gui import show_pulse_gui
 
@@ -108,11 +107,18 @@ def open_pulse_gui(session: Any = None, *, state=None, **kwargs):
 
     runtime_services = session._require_runtime_services()
     sequencer = getattr(session._device_set, "sequencer", None)
-    managed_sequencer = (
-        runtime_services.pulse_facade(sequencer) if sequencer is not None else None
-    )
+    command_port = None
+    target_descriptor = None
+    if sequencer is not None:
+        from zlc_workbench.pulse_control import managed_pulse_command_port
+
+        command_port = managed_pulse_command_port(
+            session, runtime_services, sequencer
+        )
+        target_descriptor = command_port.target
     editor = show_pulse_gui(
-        sequencer=managed_sequencer,
+        target_descriptor=target_descriptor,
+        command_port=command_port,
         state=state,
         hide_on_close=True,
         **kwargs,

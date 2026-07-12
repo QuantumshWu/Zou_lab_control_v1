@@ -13,6 +13,7 @@ import pytest
 
 import Zou_lab_control.frontend as zf
 import Zou_lab_control.neutral_atom as na
+from conftest import pulse_editor_for_test
 
 
 def assert_raises_contains(text, func, *args, **kwargs):
@@ -2583,7 +2584,7 @@ def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
             self.channels = channels
             self.port_catalog = PortCatalog.from_channels(channels)
 
-    editor = PulseSequenceEditor(sequencer=DummySequencer(channels))
+    editor = pulse_editor_for_test(sequencer=DummySequencer(channels))
     try:
         editor.resize(1280, 720)
         editor.show()
@@ -2594,7 +2595,7 @@ def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
         assert editor.state.time_step_ns == 20
         assert editor.state.visible_ports == ["ch00", "ch01", "ch02", "ch03"]
         assert editor.names_panel.port_labels["ch00"].text() == "ch00"
-        assert not editor.names_panel.port_labels["ch00"].isEnabled()
+        assert editor.names_panel.port_labels["ch00"].isEnabled()
         assert "4/62 ports visible" in editor.summary.text()
         assert "step 20 ns" in editor.summary.text()
         assert editor.add_channel_combo.count() == 58
@@ -2889,7 +2890,7 @@ def test_pulse_gui_controls_call_attached_address_switch_sequencer(monkeypatch):
     state = na.PulseTableState.load(
         Path(__file__).resolve().parents[1] / "pulses" / "camera_imaging_address_switch.json")
     sequencer = RecordingSequencer(state.port_catalog)
-    editor = PulseSequenceEditor(
+    editor = pulse_editor_for_test(
         state=state,
         sequencer=sequencer,
         channel_pins={"ch00": "F15", "ch11": "M13"},
@@ -2921,12 +2922,8 @@ def test_pulse_gui_controls_call_attached_address_switch_sequencer(monkeypatch):
         editor.close()
 
 
-def test_pulse_gui_runtime_connection_control(monkeypatch):
-    """The Connection control lets the user pick the sequencer backend AFTER
-    opening (Virtual / Remote / Offline), instead of fixing it on the command
-    line.  Virtual swaps in a VirtualSequencer built with the editor's OWN
-    channels; Offline detaches (the editor stays usable); a failed Remote
-    connect is reported and leaves the current connection untouched."""
+def test_pulse_gui_connection_is_installation_owned(monkeypatch):
+    """The frontend reports its target but cannot construct or replace adapters."""
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor, ensure_qt_app
@@ -2935,34 +2932,18 @@ def test_pulse_gui_runtime_connection_control(monkeypatch):
     ensure_qt_app()
     channels = [f"ch{i:02d}" for i in range(12)]
     seq = VirtualSequencer(channels=channels)
-    editor = PulseSequenceEditor(sequencer=seq)
+    editor = pulse_editor_for_test(sequencer=seq)
     try:
-        # opens reflecting the launch (virtual) sequencer; host:port disabled
         items = [editor.conn_target_combo.itemData(i) for i in range(editor.conn_target_combo.count())]
-        assert items == ["virtual", "remote", "offline"]
-        assert editor.conn_target_combo.currentData() == "virtual"
+        assert items == ["managed"]
+        assert editor.conn_target_combo.currentData() == "managed"
+        assert not editor.conn_target_combo.isEnabled()
         assert editor.conn_addr_edit.isEnabled() is False
-        assert editor.conn_status.text() == "Virtual (sim)"
-
-        # Offline -> detaches (None); a prepare still validates without a backend
-        editor.conn_target_combo.setCurrentIndex(editor.conn_target_combo.findData("offline"))
+        assert editor.conn_status.text() == "Test installation"
+        port = editor.command_port
         editor._apply_connection()
-        assert editor.sequencer is None
-        assert editor.conn_status.text() == "Offline (edit only)"
-        editor.prepare()  # must not raise with no sequencer attached
-
-        # Virtual -> swaps in a fresh VirtualSequencer with the editor's channels
-        editor.conn_target_combo.setCurrentIndex(editor.conn_target_combo.findData("virtual"))
-        editor._apply_connection()
-        assert type(editor.sequencer).__name__ == "VirtualSequencer"
-        assert list(editor.sequencer.channels) == channels
-
-        # Remote to a dead address -> reported, connection unchanged (stays virtual)
-        editor.conn_target_combo.setCurrentIndex(editor.conn_target_combo.findData("remote"))
-        assert editor.conn_addr_edit.isEnabled() is True
-        editor.conn_addr_edit.setText("127.0.0.1:1")
-        editor._apply_connection()
-        assert type(editor.sequencer).__name__ == "VirtualSequencer"
+        assert editor.command_port is port
+        assert not hasattr(editor, "sequencer")
     finally:
         editor.close()
 

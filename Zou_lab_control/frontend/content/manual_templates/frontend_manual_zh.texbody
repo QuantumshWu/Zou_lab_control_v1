@@ -1094,18 +1094,18 @@ zf.plot(coords_xy, signal.reshape(-1, 1), kind="2d", labels=("X", "Y", "Counts")
 \textbf{不可配置的边界}：\tfocus{尺寸是唯一旋钮}（只能从 \pyapi{PANEL_SIZES} 选）；所有面板共享同一 plot 区域和同一组边距，故 \pyapi{2x2} 主图恰好 360×360 方形、与 colorbar 顶底对齐，\pyapi{2x2}＝两张 \pyapi{1x2}＋间隙。普通用户用 Task 控制台 GUI 即可，这几个是给\tfocus{自定义宿主}程序化排版用的。
 
 \section{zf.show\_pulse\_gui() —— 脉冲编辑器入口}
-\textbf{一句话用途}：在独立 Fluent 窗口里打开脉冲编辑器；notebook 里编辑/上传脉冲的首选入口。
+\textbf{一句话用途}：在独立 Fluent 窗口里打开离线脉冲编辑器；需要执行虚拟或真实硬件时使用 installation-owned \pyapi{exp.pulse\_gui()}。
 
 \textbf{完整签名}：
 \begin{codeblock}[Python]
-zf.show_pulse_gui(*, state=None, port_catalog=None, sequencer=None,
-                  experiment=None, channel_pins=None,
+zf.show_pulse_gui(*, state=None, target_descriptor=None, command_port=None,
+                  channel_pins=None,
                   scale=None, window_ratio=...) -> PulseSequenceEditor
 \end{codeblock}
 
-\textbf{拓扑参数}：已有 \pyapi{state} 自带唯一 \pyapi{port\_catalog}；新建离线 state 必须给 \pyapi{port\_catalog}；连接 \pyapi{sequencer} 时直接使用设备 catalog 并校验 fingerprint。\pyapi{channel\_pins} 只补充 package-pin 展示，不改变逻辑端口。
+\textbf{拓扑参数}：已有 \pyapi{state} 自带唯一 \pyapi{port\_catalog}；\pyapi{target\_descriptor}/\pyapi{command\_port} 由 Workbench composition 注入，普通用户不自行构造。无 command port 时窗口严格离线。\pyapi{channel\_pins} 只补充 package-pin 展示，不改变逻辑端口。
 
-\textbf{示例}：\pyapi{ed = zf.show_pulse_gui(sequencer=exp.devices.sequencer)}；命令行入口是 \filepath{pulse\_gui.bat}。
+\textbf{示例}：离线 \pyapi{ed = zf.show\_pulse\_gui(state=state)}；installation 托管执行 \pyapi{ed = exp.pulse\_gui(state=state)}；命令行入口是 \filepath{pulse\_gui.bat}。
 
 \textbf{不可配置的边界}：\pyapi{scale=None} 时走\tfocus{唯一的 auto-scale 规则}（不要手动钉 scale，否则破坏高 DPI 视觉一致性）；窗口几何/Fluent 样式由 frontend 拥有。
 
@@ -1188,7 +1188,7 @@ zf.render_tex_pdf("notes/manual.tex", "notes/manual.pdf")
 \midrule
 画一维/二维/直方图/脉冲/站点图 & \pyapi{zf.plot(x, y, kind=...)} \\
 做仪表盘面板（嵌进宿主） & \pyapi{zf.panel_plot(x, y, kind=, size=)} \\
-打开脉冲编辑器 GUI & \pyapi{zf.show_pulse_gui(sequencer=)} \\
+打开脉冲编辑器 GUI & 离线 \pyapi{zf.show\_pulse\_gui(state=)}；托管执行 \pyapi{exp.pulse\_gui(state=)} \\
 打开实时监控台 & \pyapi{zf.show_task_console(hub=, task=)} \\
 打开设备管理器 GUI（编辑/换设备） & \pyapi{exp.device_manager()}（会话绑定）或 \pyapi{na.device_manager(config)}（先建配置再 Init） \\
 只读查看设备状态 & \pyapi{exp.device_viewer()}（监控台顶栏 \pyapi{Devices} 按钮即此） \\

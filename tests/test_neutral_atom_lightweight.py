@@ -442,47 +442,12 @@ def test_pulse_gui_launcher_uses_one_hardware_catalog(monkeypatch):
     explicit_args = types.SimpleNamespace(**{**args.__dict__, "channel_count": 4})
     assert pulse_gui_launcher._resolve_channels(explicit_args, state) == ["ch00", "ch01", "ch02", "ch03"]
 
-    remote_args = types.SimpleNamespace(
-        **{
-            **args.__dict__,
-            "remote_host": "127.0.0.1",
-            "remote_port": 18861,
-            "clock_hz": 50_000_000,
-        }
-    )
-
-    remote_ctor = {}
-
-    class FailingRemoteNa:
-        PortCatalog = PortCatalog
-
-        class RemoteSequencer:
-            def __init__(self, *, host, port, connect_on_init):
-                remote_ctor.update(
-                    host=host, port=port, connect_on_init=connect_on_init)
-                raise ConnectionRefusedError("server is not running")
-
-    sequencer, fallback_catalog, notice = pulse_gui_launcher._connect_remote_or_offline(
-        remote_args,
-        state,
-        FailingRemoteNa,
-        explicit_remote=False,
-    )
-    assert sequencer is None
-    assert fallback_catalog.fingerprint == target_catalog.fingerprint
-    assert "opened offline editor" in notice
-    assert remote_ctor == {
-        "host": "127.0.0.1", "port": 18861, "connect_on_init": True}
+    assert not hasattr(pulse_gui_launcher, "_connect_remote_or_offline")
+    parser = pulse_gui_launcher._build_parser()
+    assert parser.parse_args([]).no_sequencer is False
+    assert parser.parse_args(["--no-sequencer"]).no_sequencer is True
     assert pulse_gui_launcher._remote_host_was_requested([]) is False
     assert pulse_gui_launcher._remote_host_was_requested(["--remote-host", "192.168.0.20"]) is True
-
-    try:
-        pulse_gui_launcher._connect_remote_or_offline(
-            remote_args, state, FailingRemoteNa, explicit_remote=True)
-    except ConnectionRefusedError:
-        pass
-    else:
-        raise AssertionError("explicit --remote-host should not silently fall back to offline mode")
 
 
 def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():

@@ -30,6 +30,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pytest  # noqa: E402
+from conftest import pulse_editor_for_test  # noqa: E402
 
 
 @pytest.fixture
@@ -83,7 +84,10 @@ def _scan_editor(seq):
     st = PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"]))
     st.bind_field("duration", "0", unit="us", name="exposure")
     st.set_scan_table([[20.0], [40.0], [60.0], [80.0]])
-    return PulseSequenceEditor(st, sequencer=seq)
+    if seq is None:
+        return PulseSequenceEditor(st)
+    seq.port_catalog = st.port_catalog
+    return pulse_editor_for_test(st, sequencer=seq)
 
 
 def test_scan_tab_exposes_semantic_identity_and_demotes_compiler_token(_app):
@@ -167,7 +171,9 @@ def test_step_without_scan_table_is_a_harmless_noop(_app):
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
     seq = _StepSeq()
-    ed = PulseSequenceEditor(PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"])), sequencer=seq)   # no scan
+    state = PulseTableState(port_catalog=PortCatalog.from_channels(["probe", "trig"]))
+    seq.port_catalog = state.port_catalog
+    ed = pulse_editor_for_test(state, sequencer=seq)   # no scan
     ed.scan_step_forward_button.click()
     ed.scan_step_back_button.click()
     assert ed._held_scan_point is None                   # nothing held

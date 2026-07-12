@@ -30,7 +30,12 @@ from ..operations.measurement import (
     triggered_frames,
 )
 from ..operations.tasks.calibrate import CAL_TASK_PREFIX
-from ..operations.temperature import FixedReleaseRecapturePlan, ReleaseRecapturePlan, SurvivalReducer
+from ..operations.temperature import (
+    FixedReleaseRecapturePlan,
+    ReleaseRecapturePlan,
+    SurvivalReducer,
+    build_release_recapture_pulse,
+)
 from ..timing import PulseTableState
 from .base import ExperimentSubsystem
 
@@ -583,7 +588,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         self,
         t_off_s: Sequence[float] | None = None,
         *,
-        pulse: Any,
+        pulse: Any | None = None,
         shots: int = 1,
         per_site: bool = False,
         live: bool = True,
@@ -592,10 +597,12 @@ class ReadoutSubsystem(ExperimentSubsystem):
     ) -> ScanResult:
         """Release-recapture thermometry: sweep trap-off time, report survival.
 
-        Drives the bound release-recapture ``pulse`` (its trap-off period bound to
-        the primary time slot) over ``t_off_s`` (seconds), acquiring two frames per
-        point and reducing them to survival via ``calibration.detect``.  Requires a
-        thresholded calibration (survival is a binary occupancy comparison).
+        Drives a release-recapture pulse (its trap-off period bound to the primary
+        time slot) over ``t_off_s`` (seconds), acquiring two frames per point and
+        reducing them to survival via ``calibration.detect``.  When ``pulse`` is
+        omitted, the subsystem builds and binds the installation's canonical pulse
+        internally; the public notebook never needs a sequencer or drive controller.
+        Requires a thresholded calibration (survival is a binary occupancy comparison).
         Returns a :class:`ScanResult`; post-process with
         :func:`operations.temperature.fit_temperature` to recover the temperature."""
 
@@ -604,6 +611,21 @@ class ReadoutSubsystem(ExperimentSubsystem):
             t_off_s = s.defaults.get(
                 "release_recapture_t_off",
                 np.array([0.0, 5e-6, 1e-5, 2e-5, 4e-5, 8e-5, 1.6e-4, 3.2e-4]),
+            )
+        if pulse is None:
+            sequencer = getattr(s._device_set, "sequencer", None)
+            if sequencer is None:
+                raise RuntimeError(
+                    "release-recapture requires an installation sequencer"
+                )
+            s._require_runtime_services().ensure_connections((sequencer,))
+            port_catalog = getattr(sequencer, "port_catalog", None)
+            if port_catalog is None:
+                raise RuntimeError(
+                    "release-recapture requires an installation sequencer PortCatalog"
+                )
+            pulse = s.timing.bind_pulse(
+                build_release_recapture_pulse(port_catalog=port_catalog)
             )
         scan = self.build_temperature_scan(t_off_s, pulse=pulse, shots=shots, per_site=per_site)
         result = scan.run(

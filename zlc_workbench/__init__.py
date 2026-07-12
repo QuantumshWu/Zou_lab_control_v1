@@ -21,6 +21,7 @@ from .legacy_runtime import (
     LegacyStopReceipt,
     LegacyStopStatus,
 )
+from .pulse_control import PulseCommandPort, PulseTargetDescriptor
 from .workspace import (
     BoardController,
     BoardModel,
@@ -57,6 +58,8 @@ __all__ = [
     "LegacyStopStatus",
     "PanelHost",
     "PanelSlot",
+    "PulseCommandPort",
+    "PulseTargetDescriptor",
     "RunHandleStatusBinding",
     "RunStatusView",
     "SerializedLegacyAggBridge",

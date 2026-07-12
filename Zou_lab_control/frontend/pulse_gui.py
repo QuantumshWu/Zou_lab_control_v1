@@ -1,8 +1,7 @@
-"""Confocal-style PyQt pulse editor for neutral-atom ``PulseSequence``.
+"""Confocal-style PyQt editor for pulse values and previews.
 
-The GUI is a front-end only.  It edits ``PulseTableState`` and calls an
-optional existing sequencer/experiment; it does not introduce a separate
-hardware-control layer.
+Executable operations use an optional generation-bound command port supplied by the
+Workbench composition.  The editor never receives or constructs a sequencer adapter.
 """
 
 from __future__ import annotations
@@ -309,8 +308,8 @@ def _scan_slot_label(state: PulseTableState, index: int) -> str:
 def _format_scan_progress(progress: Mapping[str, object] | None) -> str:
     """SINGLE source for the live scan-progress label text (Task #4).
 
-    ``progress`` is the dict every ``sequencer.scan_progress()`` returns (the shape declared by
-    ``sequencer.SCAN_PROGRESS_IDLE``): ``{scanning, point, n_points, sweep, n_repeats}`` with
+    ``progress`` is the immutable mapping returned by the pulse command port:
+    ``{scanning, point, n_points, sweep, n_repeats}`` with
     ``point``/``sweep`` 0-based and ``n_repeats=0`` meaning ∞.  Returns:
 
     * ``""`` when idle (not scanning, no points, or ``progress is None``) -- the label blanks.
@@ -1624,8 +1623,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self,
         state: PulseTableState | None = None,
         *,
-        sequencer=None,
-        experiment=None,
+        target_descriptor=None,
+        command_port=None,
         channel_pins: Mapping[str, str] | None = None,
         scale: float | None = None,
         window_ratio: float = DEFAULT_WINDOW_RATIO,
@@ -1636,24 +1635,19 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.ui_scale = self._resolve_scale(scale, app=app)
         set_fluent_scale(self.ui_scale)
         self.window_ratio = max(0.45, min(1.0, float(window_ratio)))
-        if sequencer is None and experiment is not None and hasattr(experiment, "devices"):
-            sequencer = getattr(experiment.devices, "sequencer", None)
-        bound_sequencer = sequencer or (
-            getattr(getattr(experiment, "devices", None), "sequencer", None)
-            if experiment is not None else None)
-        # A RemoteSequencer is deliberately unbound until open(): do not let the
-        # editor fabricate a client-side catalog/clock while a real server is the
-        # authority.  Other sequencers already expose their immutable facts.
-        if (bound_sequencer is not None
-                and getattr(bound_sequencer, "port_catalog", None) is None
-                and hasattr(bound_sequencer, "open")):
-            bound_sequencer.open()
+        port_target = getattr(command_port, "target", None)
+        if target_descriptor is None:
+            target_descriptor = port_target
+        elif port_target is not None and port_target != target_descriptor:
+            raise ValueError("pulse command port belongs to another target descriptor")
+        self.target_descriptor = target_descriptor
+        self.command_port = command_port
         if state is None:
-            port_catalog = getattr(bound_sequencer, "port_catalog", None)
+            port_catalog = getattr(target_descriptor, "port_catalog", None)
             if port_catalog is None:
                 if not DEFAULT_CHANNEL_NAMES:
                     raise ValueError(
-                        "standalone Pulse GUI needs a sequencer PortCatalog or an explicit state")
+                        "offline Pulse GUI needs an explicit state or target descriptor")
                 port_catalog = PortCatalog.from_channels(DEFAULT_CHANNEL_NAMES)
             visible = [
                 port.key for port in port_catalog.ports if port.kind != PORT_CLOCK
@@ -1661,26 +1655,24 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             state = PulseTableState(
                 port_catalog=port_catalog,
                 visible_ports=visible,
-                time_step_ns=self._clock_step_ns(bound_sequencer) or DEFAULT_TIME_STEP_NS,
+                time_step_ns=self._clock_step_ns(target_descriptor) or DEFAULT_TIME_STEP_NS,
             )
-        device_catalog = getattr(bound_sequencer, "port_catalog", None)
+        device_catalog = getattr(target_descriptor, "port_catalog", None)
         if state is not None and device_catalog is not None \
                 and state.port_catalog.fingerprint != device_catalog.fingerprint:
             state = state.aligned_to_catalog(device_catalog)
-        device_step_ns = self._clock_step_ns(bound_sequencer)
+        device_step_ns = self._clock_step_ns(target_descriptor)
         if device_step_ns is not None and state.time_step_ns != device_step_ns:
             state = state.snapped(time_step_ns=device_step_ns)
         self.state = state
         self.channel_pins = {str(channel): str(pin) for channel, pin in dict(channel_pins or {}).items()}
-        self.sequencer = bound_sequencer
-        # Connection seeds for the runtime Connection control: a virtual or remote
-        # sequencer built later (the user picks the backend AFTER opening, instead
-        # of fixing it at launch) reuses the SAME channels the editor shows, so a
-        # transport swap never churns the channel layout.  The sequencer is a pure
-        # streamer now -- which line gates a camera is the CAMERA's property, not the
-        # sequencer's, so the editor never seeds a trigger channel.
-        self._clock_hz = float(getattr(self.sequencer, "clock_hz", None) or (1e9 / self.state.time_step_ns))
-        self._connection_label = ""
+        self._clock_hz = float(
+            getattr(target_descriptor, "clock_hz", None)
+            or (1e9 / self.state.time_step_ns)
+        )
+        self._connection_label = str(
+            getattr(target_descriptor, "connection_label", "Offline (edit only)")
+        )
         self.last_program = None
         # The HELD scan point (Stop ▸ hold point / ◀ step / step ▶): ``(index, raw row, table length)``,
         # or None when not holding.  Set only by _hold_at_point (the single hold seam); cleared by every
@@ -1911,11 +1903,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         control_col.addStretch(1)
         bar.addWidget(control_area, 1)
 
-        # --- Connection: pick the sequencer backend AFTER opening (Virtual sim /
-        # a remote FPGA server / Offline edit-only), instead of fixing it on the
-        # command line.  On Pulse / Stop / Sync already guard ``sequencer is None``
-        # so the editor stays fully usable while offline; this just swaps the
-        # transport the run controls talk to. ---
+        # --- Connection observation.  Backend selection belongs to the Workbench
+        # installation authority; this card reports the bound target and cannot
+        # construct or replace an adapter from the GUI. ---
         conn_area = FluentGroupBox("Connection")
         conn_area.setFixedWidth(_px(252, minimum=212))
         conn_col = QtWidgets.QVBoxLayout(conn_area)
@@ -1923,13 +1913,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         conn_col.setSpacing(_px(4, minimum=3))
         self.conn_target_combo = FluentComboBox()
         self.conn_target_combo.setFixedHeight(cb_h)
-        self.conn_target_combo.addItem("Virtual (sim)", "virtual")
-        self.conn_target_combo.addItem("Remote server", "remote")
-        self.conn_target_combo.addItem("Offline (edit only)", "offline")
+        if self.command_port is None:
+            self.conn_target_combo.addItem("Offline (edit only)", "offline")
+        else:
+            self.conn_target_combo.addItem("Installation managed", "managed")
         self.conn_target_combo.setToolTip(
-            "Virtual: a local in-memory sequencer (edit + fire in simulation).\n"
-            "Remote: connect to a running FPGA sequencer server (host:port).\n"
-            "Offline: edit only, no backend calls.")
+            "Hardware binding is owned by the Workbench installation authority.")
         self.conn_target_combo.currentIndexChanged.connect(self._on_conn_target_changed)
         conn_col.addWidget(self.conn_target_combo)
         conn_row = QtWidgets.QHBoxLayout()
@@ -1937,11 +1926,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         conn_row.setSpacing(_px(6, minimum=4))
         self.conn_addr_edit = FluentLineEdit("127.0.0.1:18861")
         self.conn_addr_edit.setFixedHeight(cb_h)
-        self.conn_addr_edit.setToolTip("Remote sequencer server address as host:port.")
-        self.conn_connect_button = FluentButton("Connect", color=ACCENT)
+        self.conn_addr_edit.setToolTip("Connection endpoints are installation configuration.")
+        self.conn_connect_button = FluentButton("Managed", color=ACCENT)
         self.conn_connect_button.setFixedHeight(cb_h)
         self.conn_connect_button.setMinimumWidth(_px(64, minimum=54))
-        self.conn_connect_button.setToolTip("Apply the selected connection.")
+        self.conn_connect_button.setToolTip("Change devices through the installation manager.")
         self.conn_connect_button.clicked.connect(self._apply_connection)
         conn_row.addWidget(self.conn_addr_edit, 1)
         conn_row.addWidget(self.conn_connect_button)
@@ -2938,9 +2927,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             step_button.setFixedHeight(_row_height())
             step_button.clicked.connect(lambda _checked=False, d=step_delta: self._step_held_scan_point(d))
             run_row.addWidget(step_button)
-        # Live scan-position readout (#4): a QTimer polls the connected sequencer's scan_progress()
+        # Live scan-position readout (#4): a QTimer polls the managed command port
         # while a scan runs and writes this label (single-source text via _format_scan_progress) PLUS the
-        # current point's VALUES (#1 "show the current scan points"); blank when idle / no sequencer.
+        # current point's VALUES (#1 "show the current scan points"); blank when offline/idle.
         self.scan_progress_label = FluentLabel("")
         run_row.addWidget(self.scan_progress_label, 1)
         info_layout.addLayout(run_row)
@@ -3030,9 +3019,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         return tab
 
     def _poll_scan_progress(self) -> None:
-        """Update the live scan-position label from the connected sequencer (#4).
+        """Update the live scan-position label from the managed target (#4).
 
-        Defensive by contract: no sequencer attached, or a sequencer without a ``scan_progress``
+        Defensive by contract: no command port, or a port without ``scan_progress``
         method, or any error reading it -> the label blanks and the poll never throws (a transient
         device/network blip must not crash the GUI timer).  ``_format_scan_progress`` is the SINGLE
         source of the text (blank when idle).  Only POLLS when the Scan tab is the current view: the
@@ -3045,9 +3034,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             return                                       # hidden (e.g. hide_on_close): no RPC for an unseen window
         if getattr(self, "tabs", None) is not None and self.tabs.currentWidget() is not getattr(self, "scan_tab", None):
             return                                       # Scan tab not visible -> skip the RPC poll
-        sequencer = getattr(self, "sequencer", None)
         progress = None
-        reader = getattr(sequencer, "scan_progress", None)
+        reader = getattr(self.command_port, "scan_progress", None)
         if callable(reader):
             try:
                 progress = reader()
@@ -3108,7 +3096,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         """The device's CURRENT scan-point index (0-based) from ``scan_progress()`` -- 0 when no
         sequencer / idle / unreadable, the same defensive read the Stop handler always did."""
         try:
-            progress = self.sequencer.scan_progress() if hasattr(self.sequencer, "scan_progress") else {}
+            progress = self.command_port.scan_progress() if self.command_port is not None else {}
         except Exception:
             progress = {}
         try:
@@ -3120,8 +3108,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         """HOLD scan point ``index`` (clamped into the table): reload a single-point program built from
         exactly that point's values and loop it forever (not seamless).  The SINGLE source of the hold
         mechanics -- Stop ▸ hold point and the ◀ step / step ▶ buttons all land here.  Re-Run to resume."""
-        if self.sequencer is None:
-            self._message("No sequencer attached.")
+        if self.command_port is None:
+            self._message("No installation command port is attached.")
             return
         state = self.read_state()
         table = list(getattr(state, "scan_table", None) or [])
@@ -3137,12 +3125,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         frozen_row = list(table[k])              # the raw row (for the readout); device gets the baked state
         frozen = self._freeze_state_to_scan_point(state, k)
         try:
-            # Hold = loop the frozen single point FOREVER, through the SAME PulseController seam as On
-            # Pulse (prepare + fire in one call, repeat_forever=True); the frozen state has no scan_table,
-            # so this is a continuous static pulse of exactly that point.
-            from Zou_lab_control.neutral_atom.devices.sequencer import bind_pulse
-
-            bind_pulse(self.sequencer, frozen).on_pulse(repeat_forever=True, wait=False)
+            # Hold is a semantic run request through the installation command port; the
+            # frozen state has no scan table, so it continuously plays exactly one point.
+            self.command_port.run(frozen)
             self.stateui_manager.runstate = PulseStateUIManager.RunState.RUNNING
             self._held_scan_point = (k, frozen_row, len(table))
             # No success popup: the held point is shown persistently in the scan-progress label
@@ -3786,46 +3771,30 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         # still matches the moved slot with the real values, no manual "re-run scan points" step.
         if state.scan_slots:
             state.set_scan_table(self._current_scan_table(state))
-        clock_step_ns = self._clock_step_ns(self.sequencer)
-        if self.sequencer is None:
+        clock_step_ns = self._clock_step_ns(self.target_descriptor)
+        if self.command_port is None:
             if clock_step_ns is not None:
                 state.to_sequence(time_step_ns=clock_step_ns)
             else:
                 state.to_sequence()
             self._applied_state_key = self._state_key(state)
             return None
-        # Route On Pulse / Prepare through the SAME PulseController seam the notebook and real hardware
-        # use (bind_pulse(...).on_pulse / .prepare), so GUI == notebook == real one interface -- the
-        # controller is the single owner of repeat_forever/scan_repeats/payload construction.  On Pulse
-        # means "run continuously until Stop", so it always asks for repeat_forever=True: a static pulse
-        # plays forever; a scan is cyclic, with scan_repeats (carried on the state) doing the stopping
-        # (0=sweep forever / K=stop after K).  That is the single source of the GUI scan's cyclic intent
-        # -- it does not depend on any global invariant in the data carrier.
-        from Zou_lab_control.neutral_atom.devices.sequencer import bind_pulse
-
-        controller = bind_pulse(self.sequencer, state)
         if fire:
-            program = controller.on_pulse(repeat_forever=True, wait=False)
+            program = self.command_port.run(state)
         else:
-            program = controller.prepare(repeat_forever=True)
+            program = self.command_port.prepare(state)
         # record what is now APPLIED on the device (the UNSYNCED baseline)
         self._applied_state_key = self._state_key(state)
         return program
 
-    # --- Run controls: SIMPLE + SYNCHRONOUS.  prepare/fire/safe_state just call the
-    # sequencer directly on the GUI thread.  With the FPGA STATUS-clear fix, a LOAD
-    # completes in microseconds and a small upload in well under a second, so there is
-    # no long blocking -- and the host action timeouts (load 5 s / action 30 s) turn
-    # any real hardware stall into a prompt error dialog instead of a hang.  (No worker
-    # threads: a per-op QThread crashed with "QThread: Destroyed while running"; the
-    # threading bought nothing once the real freeze -- the stuck-RUNNING STATUS bug --
-    # was fixed in RTL.)
+    # --- S0.6 ownership bridge.  prepare/run/stop cross one managed semantic
+    # command port; the frontend never receives the sequencer or a raw fire verb.
     def prepare(self) -> None:
         RunState = PulseStateUIManager.RunState
         try:
             self.last_program = self._prepare_to_device()
             if self.last_program is None:
-                self._message("No sequencer attached. Sequence validated only.")
+                self._message("Offline: sequence validated only.")
             self.stateui_manager.runstate = RunState.PREPARED
         except Exception as exc:
             self.stateui_manager.runstate = RunState.ERROR
@@ -3836,10 +3805,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         # (the HELD-point clear rides on _prepare_to_device -- the single "fresh upload" seam)
         try:
             # On Pulse = prepare + fire through the PulseController seam in ONE call (controller.on_pulse
-            # prepares then fires); no second self.sequencer.fire() here.
+            # prepares then fires); the GUI never holds a separate raw fire capability.
             self.last_program = self._prepare_to_device(fire=True)
-            if self.sequencer is None:
-                self._message("No sequencer attached. Sequence validated only.")
+            if self.command_port is None:
+                self._message("Offline: sequence validated only.")
                 self.stateui_manager.runstate = RunState.PREPARED
                 return
             self.stateui_manager.runstate = RunState.RUNNING
@@ -3851,31 +3820,28 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         RunState = PulseStateUIManager.RunState
         self._held_scan_point = None          # Stop Pulse ends the held single-point loop -> no longer HELD (#1)
         try:
-            if self.sequencer is not None:
-                if hasattr(self.sequencer, "set_safe_state"):
-                    self.sequencer.set_safe_state()
-                elif hasattr(self.sequencer, "abort"):
-                    self.sequencer.abort()
+            if self.command_port is not None:
+                self.command_port.stop()
             self.stateui_manager.runstate = RunState.SAFE
         except Exception as exc:
             self.stateui_manager.runstate = RunState.ERROR
             self._message(str(exc))
 
     def sync_from_device(self) -> None:
-        """Pull the pulse actually APPLIED on the sequencer into the editor.
+        """Pull the pulse actually applied to the managed target into the editor.
 
-        The sequencer service records the SOURCE payload (the PulseTableState
+        The command backend records the SOURCE payload (the PulseTableState
         JSON) of every successful prepare -- whether it came from this GUI or a
         notebook/raw-API call (``PulseController.on_pulse`` etc.).  Sync loads
         that state back into the editor so the GUI again reflects the device."""
         import json
 
         RunState = PulseStateUIManager.RunState
-        if self.sequencer is None:
-            self._message("No sequencer attached -- nothing to sync from.")
+        if self.command_port is None:
+            self._message("Offline: nothing to sync from.")
             return
         try:
-            snap = self.sequencer.snapshot() if hasattr(self.sequencer, "snapshot") else {}
+            snap = self.command_port.snapshot()
             payload = (snap or {}).get("last_payload_json")
             if not payload:
                 self._message("The sequencer has no applied pulse yet (nothing was prepared).")
@@ -3902,127 +3868,29 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             self.stateui_manager.runstate = RunState.ERROR
             self._message(str(exc))
 
-    # --- Connection control: pick the sequencer backend AFTER opening ----------
+    # --- Installation-owned connection observation -----------------------------
     def _on_conn_target_changed(self) -> None:
-        """Enable the host:port field only when the Remote target is selected."""
-        if bool(getattr(self.sequencer, "managed_installation_authority", False)):
-            self.conn_addr_edit.setEnabled(False)
-            return
-        self.conn_addr_edit.setEnabled(self.conn_target_combo.currentData() == "remote")
-
-    def _parse_addr(self, text: str) -> tuple[str, int]:
-        raw = str(text).strip()
-        if not raw:
-            raise ValueError("Enter the server address as host:port.")
-        if ":" in raw:
-            host, _, port_text = raw.rpartition(":")
-            host, port = host.strip(), int(port_text.strip())
-        else:
-            host, port = raw, 18861
-        if not host:
-            raise ValueError("Enter the server address as host:port.")
-        return host, port
+        self.conn_addr_edit.setEnabled(False)
 
     def _apply_connection(self) -> None:
-        """Swap the sequencer transport to the chosen backend.
-
-        Virtual uses the editor's immutable PortCatalog.  Remote opens first, then
-        the editor aligns to the server-owned PortCatalog and clock; the client
-        never supplies either hardware fact.  Offline detaches.  On
-        Pulse / Stop / Sync already guard a missing sequencer, so an offline
-        editor stays fully usable -- this only changes what the run controls talk
-        to."""
-        if bool(getattr(self.sequencer, "managed_installation_authority", False)):
-            self._message(
-                "This editor is bound to the experiment installation authority; "
-                "change devices through the session configuration."
-            )
-            return
-        target = self.conn_target_combo.currentData()
-        if target == "offline":
-            self._set_sequencer(None, label="Offline (edit only)")
+        if self.command_port is None:
             self._message("Offline: editing only, no backend calls.")
-            return
-        from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer
-        from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
-
-        candidate = None
-        try:
-            if target == "virtual":
-                candidate = VirtualSequencer(
-                    port_catalog=self.state.port_catalog,
-                    clock_hz=self._clock_hz,
-                )
-                self._set_sequencer(candidate, label="Virtual (sim)")
-                self._message("Connected to a virtual (in-memory) sequencer.")
-            else:
-                host, port = self._parse_addr(self.conn_addr_edit.text())
-                candidate = RemoteSequencer(host=host, port=port)
-                candidate.open()
-                state = self.read_state()
-                if state.port_catalog.fingerprint != candidate.port_catalog.fingerprint:
-                    state = state.aligned_to_catalog(candidate.port_catalog)
-                state = state.snapped(time_step_ns=1e9 / float(candidate.clock_hz))
-                self.load_state(state)
-                self._set_sequencer(candidate, label=f"{host}:{port}")
-                self._message(f"Connected to sequencer server at {host}:{port}.")
-            candidate = None  # ownership transferred to ``self.sequencer``
-        except Exception as exc:
-            if candidate is not None and candidate is not self.sequencer \
-                    and hasattr(candidate, "close"):
-                candidate.close()
-            # leave the current connection untouched; just report the failure
-            self._refresh_connection_label()
-            self._message(f"Connection failed: {exc}")
-
-    def _set_sequencer(self, sequencer, *, label: str) -> None:
-        RunState = PulseStateUIManager.RunState
-        old = self.sequencer
-        if old is not None and old is not sequencer and hasattr(old, "close"):
-            try:
-                old.close()
-            except Exception:
-                pass
-        self.sequencer = sequencer
-        if sequencer is not None:
-            clock_hz = getattr(sequencer, "clock_hz", None)
-            if clock_hz is not None:
-                self._clock_hz = float(clock_hz)
-        self._connection_label = label
-        self._refresh_connection_label()
-        # a fresh connection has nothing of ours applied yet -> the editor's pulse
-        # is "not on the device" (On Pulse* hint), or plain INIT when detached.
-        self._applied_state_key = None
-        self.stateui_manager.runstate = RunState.UNSYNCED if sequencer is not None else RunState.INIT
+        else:
+            self._message(
+                "This target is owned by the installation authority; "
+                "change devices through the installation manager."
+            )
 
     def _refresh_connection_label(self) -> None:
         if hasattr(self, "conn_status"):
             self.conn_status.setText(self._connection_label or "Offline (edit only)")
 
     def _init_connection_ui(self) -> None:
-        """Reflect the launch sequencer in the Connection control."""
-        seq = self.sequencer
-        if bool(getattr(seq, "managed_installation_authority", False)):
-            self.conn_target_combo.setEnabled(False)
-            self.conn_addr_edit.setEnabled(False)
-            self.conn_connect_button.setEnabled(False)
-            self._connection_label = "Session installation authority"
-            self._refresh_connection_label()
-            return
-        if seq is None:
-            target, label = "offline", "Offline (edit only)"
-        elif hasattr(seq, "host") and hasattr(seq, "port"):
-            target = "remote"
-            label = f"{getattr(seq, 'host', '')}:{getattr(seq, 'port', '')}"
-            self.conn_addr_edit.setText(label)
-        else:
-            target, label = "virtual", "Virtual (sim)"
-        index = self.conn_target_combo.findData(target)
-        if index >= 0:
-            with _signals_blocked(self.conn_target_combo):
-                self.conn_target_combo.setCurrentIndex(index)
-        self._connection_label = label
-        self._on_conn_target_changed()
+        """Reflect the immutable installation target; never construct a backend."""
+        self.conn_target_combo.setEnabled(False)
+        self.conn_addr_edit.setEnabled(False)
+        self.conn_connect_button.setEnabled(False)
+        self.conn_addr_edit.setText("")
         self._refresh_connection_label()
 
     def save_to_file(self) -> None:
@@ -4584,8 +4452,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         return self.read_state().to_sequence()
 
     @staticmethod
-    def _clock_step_ns(sequencer) -> float | None:
-        clock_hz = getattr(sequencer, "clock_hz", None)
+    def _clock_step_ns(target_descriptor) -> float | None:
+        clock_hz = getattr(target_descriptor, "clock_hz", None)
         if clock_hz is None:
             return None
         clock_hz = float(clock_hz)
@@ -4603,8 +4471,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 def show_pulse_gui(
     *,
     state: PulseTableState | None = None,
-    sequencer=None,
-    experiment=None,
+    target_descriptor=None,
+    command_port=None,
     channel_pins: Mapping[str, str] | None = None,
     scale: float | None = None,
     window_ratio: float = DEFAULT_WINDOW_RATIO,
@@ -4613,8 +4481,8 @@ def show_pulse_gui(
     ensure_qt_app()          # the editor is a QWidget: the app must exist BEFORE its ctor
     editor = PulseSequenceEditor(
         state=state,
-        sequencer=sequencer,
-        experiment=experiment,
+        target_descriptor=target_descriptor,
+        command_port=command_port,
         channel_pins=channel_pins,
         scale=scale,
         window_ratio=window_ratio,

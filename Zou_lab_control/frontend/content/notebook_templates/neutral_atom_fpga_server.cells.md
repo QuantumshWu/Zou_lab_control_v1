@@ -255,16 +255,13 @@ connected to the running server rather than offline mode.
 #
 # pulse_state = na.PulseTableState.load(
 #     PROJECT_ROOT / "pulses" / "camera_imaging_address_switch.json")
-# local_sequencer = na.RemoteSequencer(
-#     host="127.0.0.1",
-#     port=PORT,
+# local_exp = na.connect(
+#     "remote_template",
+#     sequencer={"host": "127.0.0.1", "port": PORT},
+#     open_devices=True,
 # )
-# local_sequencer.open()  # server snapshot is the only PortCatalog/clock source
-# pulse_state = pulse_state.aligned_to_catalog(local_sequencer.port_catalog).snapped(
-#     time_step_ns=1e9 / local_sequencer.clock_hz)
-# pulse_gui = zf.show_pulse_gui(
+# pulse_gui = local_exp.pulse_gui(
 #     state=pulse_state,
-#     sequencer=local_sequencer,
 #     scale=0.82,
 #     window_ratio=0.90,
 # )
