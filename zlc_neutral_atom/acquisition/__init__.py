@@ -9,6 +9,8 @@ from .camera import (
     CameraFrameMetadataContract,
     CameraSample,
     CameraSampleContract,
+    camera_frame_metadata_from_tree,
+    camera_frame_metadata_to_tree,
     decode_camera_capture_spec,
     freeze_camera_capture_spec,
 )
@@ -22,6 +24,8 @@ __all__ = [
     "CameraFrameMetadataContract",
     "CameraSample",
     "CameraSampleContract",
+    "camera_frame_metadata_from_tree",
+    "camera_frame_metadata_to_tree",
     "decode_camera_capture_spec",
     "freeze_camera_capture_spec",
 ]

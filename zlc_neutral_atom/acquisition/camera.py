@@ -195,6 +195,41 @@ class CameraFrameMetadata:
         return self.host_received_at_ns * 1e-9
 
 
+def camera_frame_metadata_to_tree(metadata: CameraFrameMetadata) -> dict[str, object]:
+    """Current canonical primitive form owned by the camera domain."""
+
+    if not isinstance(metadata, CameraFrameMetadata):
+        raise TypeError("metadata must be CameraFrameMetadata")
+    return {
+        "source_ordinal": metadata.source_ordinal,
+        "produced_count": metadata.produced_count,
+        "frame_stamp": metadata.frame_stamp,
+        "camera_stamp": metadata.camera_stamp,
+        "timestamp_seconds": metadata.timestamp_seconds,
+        "timestamp_microseconds": metadata.timestamp_microseconds,
+        "host_received_at_ns": metadata.host_received_at_ns,
+        "driver_buffer_index": metadata.driver_buffer_index,
+        "correlation_id": metadata.correlation_id,
+    }
+
+
+def camera_frame_metadata_from_tree(tree: object) -> CameraFrameMetadata:
+    fields = {
+        "source_ordinal",
+        "produced_count",
+        "frame_stamp",
+        "camera_stamp",
+        "timestamp_seconds",
+        "timestamp_microseconds",
+        "host_received_at_ns",
+        "driver_buffer_index",
+        "correlation_id",
+    }
+    if not isinstance(tree, dict) or set(tree) != fields:
+        raise ValueError("camera frame metadata has an unknown field set")
+    return CameraFrameMetadata(**tree)
+
+
 @dataclass(frozen=True)
 class CameraSample:
     image: Value
@@ -259,19 +294,7 @@ class CameraFrameMetadataContract:
     def digest(self, metadata: object) -> str:
         self.validate(metadata)
         assert isinstance(metadata, CameraFrameMetadata)
-        return canonical_digest(
-            {
-                "source_ordinal": metadata.source_ordinal,
-                "produced_count": metadata.produced_count,
-                "frame_stamp": metadata.frame_stamp,
-                "camera_stamp": metadata.camera_stamp,
-                "timestamp_seconds": metadata.timestamp_seconds,
-                "timestamp_microseconds": metadata.timestamp_microseconds,
-                "host_received_at_ns": metadata.host_received_at_ns,
-                "driver_buffer_index": metadata.driver_buffer_index,
-                "correlation_id": metadata.correlation_id,
-            }
-        )
+        return canonical_digest(camera_frame_metadata_to_tree(metadata))
 
 
 @dataclass(frozen=True)
@@ -362,6 +385,8 @@ __all__ = [
     "CameraFrameMetadataContract",
     "CameraSample",
     "CameraSampleContract",
+    "camera_frame_metadata_from_tree",
+    "camera_frame_metadata_to_tree",
     "decode_camera_capture_spec",
     "freeze_camera_capture_spec",
 ]
