@@ -20,7 +20,26 @@ from .ir import (
     target_ir_from_tree,
     target_ir_to_tree,
 )
-from .fpga import PulseWireImage, pack_target_ir
+from .fpga import (
+    PulseWireImage,
+    pack_target_ir,
+    pulse_wire_image_from_tree,
+    pulse_wire_image_to_tree,
+)
+from .schedule import (
+    DigitalTriggerSchedule,
+    TriggerEdge,
+    build_digital_trigger_schedules,
+    digital_trigger_schedule_from_tree,
+    digital_trigger_schedule_to_tree,
+)
+from .artifact import (
+    COMPILED_PULSE_ARTIFACT_SCHEMA,
+    CompiledPulseArtifact,
+    PulseExecutionForm,
+    compiled_pulse_artifact_from_tree,
+    compiled_pulse_artifact_to_tree,
+)
 
 from .target import (
     DAC_OFFSET_BINARY,
@@ -34,7 +53,10 @@ from .target import (
 )
 
 __all__ = [
+    "COMPILED_PULSE_ARTIFACT_SCHEMA",
+    "CompiledPulseArtifact",
     "DAC_OFFSET_BINARY",
+    "DigitalTriggerSchedule",
     "ApiSlot",
     "AnalogBusStep",
     "PULSE_DOCUMENT_SCHEMA",
@@ -44,6 +66,7 @@ __all__ = [
     "PulsePortSpec",
     "PulseDocument",
     "PulsePeriod",
+    "PulseExecutionForm",
     "PulseWireImage",
     "PulseTarget",
     "TARGET_IR_SCHEMA",
@@ -51,10 +74,18 @@ __all__ = [
     "TargetBusDelay",
     "TargetBusSegment",
     "TargetIR",
+    "TriggerEdge",
+    "build_digital_trigger_schedules",
+    "compiled_pulse_artifact_from_tree",
+    "compiled_pulse_artifact_to_tree",
+    "digital_trigger_schedule_from_tree",
+    "digital_trigger_schedule_to_tree",
     "load_pulse_document",
     "pulse_document_from_tree",
     "pulse_document_to_tree",
     "pack_target_ir",
+    "pulse_wire_image_from_tree",
+    "pulse_wire_image_to_tree",
     "pulse_target_from_tree",
     "pulse_target_to_tree",
     "save_pulse_document",

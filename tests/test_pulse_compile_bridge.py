@@ -7,11 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from zlc_pulse import load_pulse_document, target_ir_from_tree, target_ir_to_tree
-from zlc_workbench.pulse_compile_bridge import (
+from zlc_pulse import (
     PulseExecutionForm,
-    compile_pulse_document,
+    load_pulse_document,
+    target_ir_from_tree,
+    target_ir_to_tree,
 )
+from zlc_workbench.pulse_compile_bridge import compile_pulse_document
 
 
 ROOT = Path(__file__).parents[1]

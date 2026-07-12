@@ -12,12 +12,13 @@ from fpga.pulse_streamer.host.image import (
 )
 from zlc_storage import canonical_digest
 
-from .ir import TargetIR
+from .ir import TargetIR, target_ir_to_tree
 
 
 @dataclass(frozen=True)
 class PulseWireImage:
     geometry_fingerprint: int
+    source_ir_digest: str
     words: tuple[tuple[int, int], ...]
 
     def __post_init__(self) -> None:
@@ -26,6 +27,13 @@ class PulseWireImage:
             raise TypeError("geometry_fingerprint must be an integer")
         if fingerprint < 0 or fingerprint > 0xFFFFFFFF:
             raise ValueError("geometry_fingerprint must fit 32 bits")
+        source = self.source_ir_digest
+        if (
+            not isinstance(source, str)
+            or len(source) != 64
+            or any(character not in "0123456789abcdef" for character in source)
+        ):
+            raise ValueError("source_ir_digest must be a lowercase SHA-256 digest")
         words = tuple(self.words)
         previous = -1
         for address, value in words:
@@ -48,6 +56,7 @@ class PulseWireImage:
             {
                 "schema": "zlc_pulse.PulseWireImage/v1",
                 "geometry_fingerprint": self.geometry_fingerprint,
+                "source_ir_digest": self.source_ir_digest,
                 "words": [list(item) for item in self.words],
             }
         )
@@ -85,9 +94,57 @@ def pack_target_ir(
     )
     packed = pack_program(carrier, geometry)
     return PulseWireImage(
-        build_fingerprint(geometry) & 0xFFFFFFFF,
-        tuple(sorted((int(address), int(word) & 0xFFFFFFFF) for address, word in packed.items())),
+        geometry_fingerprint=build_fingerprint(geometry) & 0xFFFFFFFF,
+        source_ir_digest=canonical_digest(target_ir_to_tree(value)),
+        words=tuple(
+            sorted((int(address), int(word) & 0xFFFFFFFF) for address, word in packed.items())
+        ),
     )
 
 
-__all__ = ["PulseWireImage", "pack_target_ir"]
+def pulse_wire_image_to_tree(value: PulseWireImage) -> dict[str, object]:
+    if not isinstance(value, PulseWireImage):
+        raise TypeError("value must be PulseWireImage")
+    return {
+        "schema": "zlc_pulse.PulseWireImage/v1",
+        "geometry_fingerprint": value.geometry_fingerprint,
+        "source_ir_digest": value.source_ir_digest,
+        "words": [list(item) for item in value.words],
+        "digest": value.digest,
+    }
+
+
+def pulse_wire_image_from_tree(tree: object) -> PulseWireImage:
+    if not isinstance(tree, dict) or set(tree) != {
+        "schema",
+        "geometry_fingerprint",
+        "source_ir_digest",
+        "words",
+        "digest",
+    }:
+        raise ValueError("PulseWireImage has an unknown field set")
+    if tree["schema"] != "zlc_pulse.PulseWireImage/v1":
+        raise ValueError("PulseWireImage schema differs")
+    if not isinstance(tree["words"], list):
+        raise TypeError("PulseWireImage words must be a list")
+    words = []
+    for item in tree["words"]:
+        if not isinstance(item, list) or len(item) != 2:
+            raise ValueError("PulseWireImage word must be [address, value]")
+        words.append((item[0], item[1]))
+    value = PulseWireImage(
+        tree["geometry_fingerprint"],
+        tree["source_ir_digest"],
+        tuple(words),
+    )
+    if tree["digest"] != value.digest:
+        raise ValueError("PulseWireImage digest differs")
+    return value
+
+
+__all__ = [
+    "PulseWireImage",
+    "pack_target_ir",
+    "pulse_wire_image_from_tree",
+    "pulse_wire_image_to_tree",
+]

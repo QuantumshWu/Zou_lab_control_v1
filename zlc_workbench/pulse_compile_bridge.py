@@ -9,8 +9,7 @@ discards every historical object.
 
 from __future__ import annotations
 
-from enum import Enum
-
+from fpga.pulse_streamer.host.image import StreamerParams
 from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
     validate_pulse_streamer_program,
 )
@@ -26,19 +25,17 @@ from Zou_lab_control.neutral_atom.timing.pulse_table import (
     ScanSlot as LegacyScanSlot,
 )
 from zlc_pulse import (
+    CompiledPulseArtifact,
+    PORT_DIGITAL,
     PulseDocument,
+    PulseExecutionForm,
     PulseTarget,
     TargetBusDelay,
     TargetBusSegment,
     TargetIR,
+    build_digital_trigger_schedules,
+    pack_target_ir,
 )
-
-
-class PulseExecutionForm(str, Enum):
-    STATIC_ONCE = "STATIC_ONCE"
-    STATIC_REFERENCE_POINT = "STATIC_REFERENCE_POINT"
-    CONTINUOUS_MONITOR = "CONTINUOUS_MONITOR"
-    AUTONOMOUS_SCAN_ONCE = "AUTONOMOUS_SCAN_ONCE"
 
 
 def compile_pulse_document(
@@ -86,6 +83,62 @@ def compile_pulse_document(
         )
     validate_pulse_streamer_program(program)
     return _target_ir(program, document.target)
+
+
+def compile_pulse_artifact(
+    document: PulseDocument,
+    *,
+    clock_hz: float,
+    execution_form: PulseExecutionForm,
+    trigger_channels: tuple[str, ...] = (),
+    live_target: PulseTarget | None = None,
+    params: StreamerParams | None = None,
+) -> CompiledPulseArtifact:
+    """Compile one self-consistent artifact at the composition boundary.
+
+    ``trigger_channels`` are physical raw digital lanes.  DAC members and
+    clock-mux lanes cannot be camera triggers even when their textual names are
+    otherwise valid target lanes.
+    """
+
+    channels = tuple(trigger_channels)
+    if len(channels) != len(set(channels)):
+        raise ValueError("trigger_channels must be unique")
+    if execution_form is PulseExecutionForm.CONTINUOUS_MONITOR and channels:
+        raise ValueError("continuous monitor cannot publish a finite trigger schedule")
+    lane_owners = {
+        lane: port
+        for port in document.target.ports
+        for lane in port.lanes
+    }
+    for channel in channels:
+        owner = lane_owners.get(channel)
+        if owner is None:
+            raise ValueError(f"unknown physical trigger lane {channel!r}")
+        if owner.kind != PORT_DIGITAL:
+            raise ValueError(
+                f"trigger lane {channel!r} belongs to {owner.kind!r}, not a digital port"
+            )
+    ir = compile_pulse_document(
+        document,
+        clock_hz=clock_hz,
+        execution_form=execution_form,
+        live_target=live_target,
+    )
+    schedules = (
+        ()
+        if execution_form is PulseExecutionForm.CONTINUOUS_MONITOR
+        else build_digital_trigger_schedules(ir, channels)
+    )
+    return CompiledPulseArtifact(
+        source_document_digest=document.fingerprint,
+        compiler_id="zlc-installed-pulse-bridge",
+        compiler_version="1",
+        execution_form=execution_form,
+        target_ir=ir,
+        wire_image=pack_target_ir(ir, params),
+        trigger_schedules=schedules,
+    )
 
 
 def _legacy_compile_input(document: PulseDocument) -> tuple[PulseTableState, PortCatalog]:
@@ -219,4 +272,4 @@ def _target_ir(program, target: PulseTarget) -> TargetIR:
     )
 
 
-__all__ = ["PulseExecutionForm", "compile_pulse_document"]
+__all__ = ["compile_pulse_artifact", "compile_pulse_document"]
