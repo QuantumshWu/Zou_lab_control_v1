@@ -227,8 +227,6 @@ def test_remove_and_device_reference_unknown_both_fail_closed():
 
 
 def test_start_never_replaces_an_unconfirmed_conflicting_owner():
-    from Zou_lab_control.frontend.task_console import LogicNodeConfig
-
     device = object()
 
     class _ConflictingNode(_StubbornNode):
@@ -236,37 +234,10 @@ def test_start_never_replaces_an_unconfirmed_conflicting_owner():
             return (device,)
 
     old = _ConflictingNode()
-    console, window, _ = _open(node=old)
-    row = console._attach_logic_node(
-        LogicNodeConfig(kind="task", name="candidate", title="candidate")
-    )
-    assert row is not None
-
-    class _Candidate:
-        started = False
-        instance_label = ""
-
-        def occupied_devices(self):
-            return (device,)
-
-        def published_signals(self):
-            return ()
-
-        def start(self):
-            self.started = True
-
-        def stop(self, timeout=2.0):
-            self.started = False
-            return True
-
-    candidate = _Candidate()
-    console._build_logic_node = lambda _config, _values: candidate
-    console._reactive_ring = lambda _node: None
-    console._start_logic_node(row)
-    assert not candidate.started
-    assert old.running and old in console.running_nodes
-    old.allow_stop = True
-    window.close()
+    with pytest.raises(RuntimeError, match="runtime authority"):
+        _open(node=old)
+    assert not old.running
+    assert old.starts == 0
 
 
 def test_unbounded_injected_node_is_rejected_before_admission():

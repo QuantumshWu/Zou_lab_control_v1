@@ -53,9 +53,17 @@ def _calibrated_virtual_session(grid=(2, 3)):
 def _console(measurements, *, session=None):
     from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
 
+    runtime = None
+    if session is not None:
+        runtime = getattr(session, "_zlc_runtime_services", None)
+        if runtime is None or runtime.closed:
+            runtime = LegacyNeutralAtomRuntime(session.devices)
+            session._zlc_runtime_services = runtime
     console = TaskConsole(hub=SignalHub(), state=default_console_state(),
                           running_nodes=[], measurements=measurements, session=session,
+                          runtime_fence=None if runtime is None else runtime.fence,
                           window_px=(1200, 800))
     console._timer.stop()       # deterministic: drive refresh_once() / poll ourselves
     return console
@@ -152,8 +160,7 @@ def test_node_start_builds_node_and_streams_no_auto_plot():
         # display suppressed: starting a measurement made NO plot panel
         assert console.cards == []
 
-        node.stop()
-        node.run_to_completion()
+        console._legacy_handles[id(node)].run_handle.wait(10.0)
         console.refresh_once()
 
         # the console node publishes under the measurement slug: <key>_<quantity>.
@@ -188,7 +195,6 @@ def test_node_start_then_stop_releases_controls_and_stops_node():
         console._start_logic_node(row)
         node = console._logic_nodes[id(row)]
         console._stop_logic_node(row)
-        node.stop()
         assert node.running is False
         assert form.start_button.isEnabled()
         assert not form.stop_button.isEnabled()
@@ -377,11 +383,57 @@ def _camera_console(roi=(1648, 64, 1144, 64)):
     hub = SignalHub()
     cam = _RoiCamera(roi)
     node = CameraMeasurement(hub, cam)
+    from zlc_neutral_atom.runtime import (
+        CleanupStepAck,
+        DeviceBroker,
+        DeviceIdentityAck,
+        DeviceIdentityEvidenceKind,
+        MemoryQuarantineJournal,
+        ResourceArbiter,
+        ResourceKey,
+        RunController,
+        SafeStateAck,
+        SafetyOperation,
+    )
+    from zlc_workbench import (
+        LegacyDeviceRegistration,
+        LegacyDeviceRegistry,
+        LegacyRuntimeFence,
+    )
+
+    broker = DeviceBroker()
+    registry = LegacyDeviceRegistry(broker)
+    registry.register(
+        LegacyDeviceRegistration(
+            device=cam,
+            key=ResourceKey.parse("device/camera/roi-fixture"),
+            identity_probe=lambda: DeviceIdentityAck(
+                "fixture:roi-camera",
+                DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
+                "fixture:roi-camera:connection",
+                "test-assets-v1",
+            ),
+            cleanup_operations={
+                SafetyOperation.SAFE_STATE: lambda: CleanupStepAck(
+                    SafetyOperation.SAFE_STATE, "fixture-safe-command"
+                )
+            },
+            cleanup_order=(SafetyOperation.SAFE_STATE,),
+            verify_safe_state=lambda: SafeStateAck("fixture-safe-readback"),
+        )
+    )
+    fence = LegacyRuntimeFence(
+        RunController(ResourceArbiter(MemoryQuarantineJournal())), registry
+    )
     state = zf.TaskConsoleState(name="t", panels=[
         zf.PanelConfig(kind="2d", title="cam", size="2x2", source="value = frame_0")])
-    console = TaskConsole(hub=hub, state=state, running_nodes=[node])
+    console = TaskConsole(hub=hub, state=state, runtime_fence=fence)
     console._timer.stop()
     node.step()
+    handle = fence.start(node)
+    handle.wait_started(2.0)
+    console._legacy_handles[id(node)] = handle
+    console.running_nodes.append(node)
     console.refresh_once()
     card = console.cards[0]
     console._edit_card(card)
@@ -401,10 +453,22 @@ def test_edit_area_select_writes_camera_region_and_apply_restarts_monitor():
         editor._plotter.area.range = [1670.0, 1690.0, 1166.0, 1186.0]
         editor._plotter.area.callback()
         assert editor._node_widgets["region"].text() == "[1670, 1690, 1166, 1186]"
-        assert not node.running
+        assert node.running
+        apply_epoch = node.acquisition_epoch()
         editor._restart_node()
-        assert node.running                              # Apply made the source live
+        assert node.running                              # Apply kept the sole owner live
+        import time
+        deadline = time.monotonic() + 2.0
+        while (
+            (
+                cam.roi != (1670, 20, 1166, 20)
+                or node.acquisition_epoch() == apply_epoch
+            )
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
         assert cam.roi == (1670, 20, 1166, 20)           # device ROI = internal conversion
+        console.refresh_once()
         assert np.isclose(card.plotter.x_array[0], 1670)
         assert np.isclose(card.plotter.x_array[-1], 1670 + 20 - 1)
         assert editor._node_now_labels["region"].text() == "now: [1670, 1690, 1166, 1186]"
@@ -449,15 +513,25 @@ def test_show_task_console_auto_starts_passed_nodes():
     from Zou_lab_control.frontend.task_console import show_task_console
     from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
 
     hub = SignalHub()
-    node = CameraMeasurement(hub, na.connect("virtual").devices.camera)
+    experiment = na.connect("virtual")
+    runtime = LegacyNeutralAtomRuntime(experiment.devices)
+    node = CameraMeasurement(hub, experiment.devices.camera)
     assert not node.running
-    console = show_task_console(hub=hub, running_nodes=[node], title="autostart-test")
+    console = show_task_console(
+        hub=hub,
+        running_nodes=[node],
+        runtime_fence=runtime.fence,
+        title="autostart-test",
+    )
     try:
         assert node.running
     finally:
         console.shutdown()
+        runtime.shutdown(timeout=2.0)
+        experiment.devices.close()
     assert not node.running
 
 

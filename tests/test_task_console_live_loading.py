@@ -52,12 +52,18 @@ def _calibrated_virtual_session(grid=(3, 4)):
 def _console(exp):
     from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
 
+    runtime = getattr(exp, "_zlc_runtime_services", None)
+    if runtime is None or runtime.closed:
+        runtime = LegacyNeutralAtomRuntime(exp.devices)
+        exp._zlc_runtime_services = runtime
     console = TaskConsole(
         hub=SignalHub(), state=default_console_state(), session=exp,
         measurements=exp.readout.measurement_specs(),
         processors=exp.readout.processor_specs(),
-        tasks=exp.readout.task_specs(), window_px=(1200, 800))
+        tasks=exp.readout.task_specs(), window_px=(1200, 800),
+        runtime_fence=runtime.fence)
     console._timer.stop()
     return console
 
@@ -406,11 +412,9 @@ def test_task_logic_node_produces_calibration_off_the_hub_when_started():
         exp.close()
 
 
-def test_starting_a_task_stops_other_running_nodes():
-    """#5: a task drives the device (camera + sequencer) directly, so starting it
-    AUTO-STOPS every OTHER running logic node first -- otherwise the live camera / a
-    measurement / a reactive processor would collide on the shared device and can
-    deadlock.  Here a running camera measurement is stopped the moment a task starts."""
+def test_starting_a_task_reports_conflict_without_stopping_current_owner():
+    """A conflicting task is rejected and the current camera owner keeps running
+    until the operator explicitly stops it."""
     exp = _calibrated_virtual_session()
     console = _console(exp)
     task_row = None
@@ -424,10 +428,10 @@ def test_starting_a_task_stops_other_running_nodes():
         _pick(console, ("task", "Calibrate readout"))
         task_row = console.logic_nodes[-1]
         console._start_logic_node(task_row)
-        # the camera node was STOPPED the instant the task started (#5)
-        assert console._logic_nodes.get(id(cam_row)) is None
-        assert cam_node not in console.running_nodes
-        assert not getattr(cam_node, "running", True)        # its worker thread ended
+        assert console._logic_nodes.get(id(cam_row)) is cam_node
+        assert cam_node in console.running_nodes and cam_node.running
+        assert console._logic_nodes.get(id(task_row)) is None
+        assert "start failed" in task_row.status_label.text().lower()
     finally:
         if task_row is not None:
             console._stop_logic_node(task_row)               # release the lock + stop the task
@@ -435,10 +439,9 @@ def test_starting_a_task_stops_other_running_nodes():
         exp.close()
 
 
-def test_starting_a_measurement_stops_other_drivers_but_keeps_processors():
-    """#6: starting ANY device-driving node (camera / measurement / task) stops every
-    OTHER running device-driver (they share the camera + pulse streamer), but a REACTIVE
-    processor (judge-occupancy reads only hub signals) keeps running."""
+def test_starting_a_measurement_reports_driver_conflict_and_keeps_processors():
+    """A conflicting measurement is rejected; both the admitted camera owner and a
+    device-free reactive processor remain running."""
     exp = _calibrated_virtual_session()
     console = _console(exp)
     meas_row = None
@@ -453,14 +456,16 @@ def test_starting_a_measurement_stops_other_drivers_but_keeps_processors():
         proc_node = console._logic_nodes.get(id(proc_row))
         assert cam_node in console.running_nodes and proc_node in console.running_nodes
 
-        # start a SECOND device-driver: the camera (a driver) is stopped; the processor stays.
+        # A second driver is rejected; existing owners are never stopped implicitly.
         _pick(console, ("measurement", "Temperature"))
         meas_row = console.logic_nodes[-1]
         console._start_logic_node(meas_row)
-        assert console._logic_nodes.get(id(cam_row)) is None          # camera (driver) stopped
-        assert cam_node not in console.running_nodes
+        assert console._logic_nodes.get(id(cam_row)) is cam_node
+        assert cam_node in console.running_nodes
         assert console._logic_nodes.get(id(proc_row)) is proc_node     # processor SURVIVES
         assert proc_node in console.running_nodes
+        assert console._logic_nodes.get(id(meas_row)) is None
+        assert "start failed" in meas_row.status_label.text().lower()
     finally:
         if meas_row is not None:
             console._stop_logic_node(meas_row)
@@ -641,6 +646,9 @@ def test_session_gui_is_a_singleton_that_reopens_the_same_window():
         e1 = exp.pulse_gui()
         e2 = exp.pulse_gui()
         assert e1 is e2                                         # pulse editor singleton too
+        assert e1.sequencer.managed_installation_authority
+        assert not e1.conn_target_combo.isEnabled()
+        assert not e1.conn_connect_button.isEnabled()
         assert open_pulse_gui() is not open_pulse_gui()         # standalone (no session): per-call window
     finally:
         exp.close()
@@ -659,10 +667,7 @@ def test_session_gui_launchers_delegate_and_pulse_runs_standalone(monkeypatch):
     from types import SimpleNamespace
 
     calls: dict = {}
-    # The launcher registers TWO device seams -- ``stop_all_nodes`` (full teardown, close) and
-    # ``stop_nodes_using`` (fine-grained device-change, load_config) -- so the fake must expose
-    # both callables (a bare string would die with AttributeError).
-    fake_console = SimpleNamespace(stop_all_nodes=lambda: None, stop_nodes_using=lambda affected: None)
+    fake_console = SimpleNamespace()
     monkeypatch.setattr(tcmod, "show_task_console", lambda **kw: (calls.__setitem__("tc", kw), fake_console)[1])
     monkeypatch.setattr(pgmod, "show_pulse_gui", lambda **kw: (calls.setdefault("pg", []).append(kw), "EDITOR")[1])
 
@@ -672,14 +677,16 @@ def test_session_gui_launchers_delegate_and_pulse_runs_standalone(monkeypatch):
         tc = calls["tc"]
         assert tc["session"] is exp and tc["task"] == "foo"
         assert {"hub", "measurements", "processors", "tasks"} <= set(tc)   # catalogs filled from session
-        # #A1: opening the console registers its stops with the session seams, so exp.close()
-        # (full teardown) and load_config() (fine-grained device change) stop running nodes BEFORE
-        # the devices go away.
-        assert fake_console.stop_all_nodes in exp._device_teardown_hooks
-        assert fake_console.stop_nodes_using in exp._device_change_hooks
+        # Runtime authority, rather than QWidget callbacks, owns close/config-swap safety.
+        assert tc["runtime_fence"] is exp._zlc_runtime_services
+        assert tc["runtime_fence_provider"]() is exp._zlc_runtime_services
+        assert not hasattr(exp, "_device_teardown_hooks")
+        assert not hasattr(exp, "_device_change_hooks")
 
         assert exp.pulse_gui() == "EDITOR"
         assert calls["pg"][-1]["experiment"] is exp                        # bound to the session
+        assert calls["pg"][-1]["sequencer"].managed_installation_authority
+        assert calls["pg"][-1]["sequencer"] is not exp.devices.sequencer
 
         gui.open_pulse_gui()                                               # STANDALONE
         assert "experiment" not in calls["pg"][-1]                         # no session needed

@@ -3905,6 +3905,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
     # --- Connection control: pick the sequencer backend AFTER opening ----------
     def _on_conn_target_changed(self) -> None:
         """Enable the host:port field only when the Remote target is selected."""
+        if bool(getattr(self.sequencer, "managed_installation_authority", False)):
+            self.conn_addr_edit.setEnabled(False)
+            return
         self.conn_addr_edit.setEnabled(self.conn_target_combo.currentData() == "remote")
 
     def _parse_addr(self, text: str) -> tuple[str, int]:
@@ -3929,6 +3932,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         Pulse / Stop / Sync already guard a missing sequencer, so an offline
         editor stays fully usable -- this only changes what the run controls talk
         to."""
+        if bool(getattr(self.sequencer, "managed_installation_authority", False)):
+            self._message(
+                "This editor is bound to the experiment installation authority; "
+                "change devices through the session configuration."
+            )
+            return
         target = self.conn_target_combo.currentData()
         if target == "offline":
             self._set_sequencer(None, label="Offline (edit only)")
@@ -3993,6 +4002,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
     def _init_connection_ui(self) -> None:
         """Reflect the launch sequencer in the Connection control."""
         seq = self.sequencer
+        if bool(getattr(seq, "managed_installation_authority", False)):
+            self.conn_target_combo.setEnabled(False)
+            self.conn_addr_edit.setEnabled(False)
+            self.conn_connect_button.setEnabled(False)
+            self._connection_label = "Session installation authority"
+            self._refresh_connection_label()
+            return
         if seq is None:
             target, label = "offline", "Offline (edit only)"
         elif hasattr(seq, "host") and hasattr(seq, "port"):

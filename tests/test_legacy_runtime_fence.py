@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +10,7 @@ from zlc_neutral_atom.runtime import (
     CleanupStepAck,
     DeviceBroker,
     DeviceIdentityAck,
+    DeviceIdentityEvidenceKind,
     MemoryQuarantineJournal,
     ResourceArbiter,
     ResourceKey,
@@ -19,13 +21,43 @@ from zlc_neutral_atom.runtime import (
     SafetyOperation,
 )
 from zlc_workbench import (
+    InstallationAsset,
+    InstallationAssetMap,
     LegacyDeviceNotRegistered,
     LegacyDeviceRegistration,
     LegacyDeviceRegistry,
     LegacyNodeAlreadyManaged,
     LegacyRuntimeFence,
+    LegacyRuntimeTransition,
     LegacyStopStatus,
 )
+from zlc_workbench.asset_map import adapter_kind
+from Zou_lab_control.neutral_atom import connect
+from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
+from zlc_workbench.legacy_neutral_atom import registrations_for
+
+LegacyRuntimeServices = LegacyNeutralAtomRuntime
+
+
+def _asset_map_for(
+    role: str,
+    device: object,
+    *,
+    expected_identity: str,
+    evidence_kind: DeviceIdentityEvidenceKind,
+) -> InstallationAssetMap:
+    return InstallationAssetMap(
+        (
+            InstallationAsset(
+                asset_id=f"fixture-{role}",
+                role=role,
+                resource_key=ResourceKey.parse(f"device/{role}"),
+                adapter_kind=adapter_kind(device),
+                evidence_kind=evidence_kind,
+                expected_identity=expected_identity,
+            ),
+        )
+    )
 
 
 class _Device:
@@ -118,7 +150,10 @@ def _fence_for(*devices: _Device):
                 device=device,
                 key=key,
                 identity_probe=lambda device=device: DeviceIdentityAck(
-                    f"fixture:{device.name}", "generation-1"
+                    f"fixture:{device.name}",
+                    DeviceIdentityEvidenceKind.HARDWARE_IDENTITY_READBACK,
+                    f"fixture-evidence:{device.name}",
+                    "test-assets-v1",
                 ),
                 cleanup_operations={SafetyOperation.SAFE_STATE: cleanup},
                 cleanup_order=(SafetyOperation.SAFE_STATE,),
@@ -228,6 +263,81 @@ def test_conflicting_legacy_nodes_are_rejected_by_shared_resource_arbiter():
     assert fence.stop(second, timeout=1.0).terminated
 
 
+def test_lifecycle_reference_tracks_swap_without_creating_an_observe_claim():
+    camera = _Device("camera")
+    sequencer = _Device("sequencer")
+    fence, _resources, _journal = _fence_for(camera, sequencer)
+
+    class _WiredCameraNode(_Node):
+        def __init__(self):
+            super().__init__(camera)
+
+        def lifecycle_devices(self):
+            return (sequencer,)
+
+    monitor = _WiredCameraNode()
+    monitor_handle = fence.start(monitor)
+    monitor_handle.wait_started(1.0)
+    assert {claim.key for claim in monitor_handle.claims} == {
+        ResourceKey.parse("device/camera")
+    }
+    assert set(monitor_handle.reference_keys) == {
+        ResourceKey.parse("device/camera"),
+        ResourceKey.parse("device/sequencer"),
+    }
+
+    sequencer_owner = _Node(sequencer)
+    sequencer_handle = fence.start(sequencer_owner)
+    sequencer_handle.wait_started(1.0)
+    receipts = fence.stop_nodes_using((sequencer,), timeout=1.0)
+    assert len(receipts) == 2
+    assert all(receipt.terminated for receipt in receipts)
+
+
+def test_real_observe_reference_still_conflicts_with_an_exclusive_owner():
+    camera = _Device("camera")
+    sequencer = _Device("sequencer")
+    fence, _resources, _journal = _fence_for(camera, sequencer)
+
+    class _ObserverNode(_Node):
+        def __init__(self):
+            super().__init__(camera)
+
+        def referenced_devices(self):
+            return (camera, sequencer)
+
+    observer = _ObserverNode()
+    handle = fence.start(observer)
+    handle.wait_started(1.0)
+    with pytest.raises(RunStartRejected):
+        fence.start(_Node(sequencer))
+    assert fence.stop(observer, timeout=1.0).terminated
+
+
+def test_lifecycle_only_reference_blocks_generation_commit_until_termination():
+    sequencer = _Device("sequencer")
+    fence, _resources, _journal = _fence_for(sequencer)
+
+    class _WiringOnlyNode(_Node):
+        def __init__(self):
+            super().__init__(None)
+
+        def lifecycle_devices(self):
+            return (sequencer,)
+
+    node = _WiringOnlyNode()
+    handle = fence.start(node)
+    handle.wait_started(1.0)
+    assert handle.claims == ()
+    assert handle.reference_keys == (ResourceKey.parse("device/sequencer"),)
+
+    transition = fence.begin_device_transition()
+    with pytest.raises(RuntimeError, match="device-referencing Run is active"):
+        fence.commit_device_transition(transition, fence.devices)
+    assert fence.stop(node, timeout=1.0).terminated
+    fence.commit_device_transition(transition, fence.devices)
+
+
 def test_unregistered_or_already_running_nodes_fail_closed():
     device = _Device("camera")
     fence, _resources, _journal = _fence_for()
@@ -256,3 +366,871 @@ def test_device_free_legacy_processor_uses_same_run_lifecycle_without_hazard():
     finally:
         receipt = fence.stop(node, timeout=1.0)
     assert receipt.terminated
+
+
+def test_virtual_session_composition_binds_real_device_objects_and_safes_them():
+    experiment = connect("virtual")
+    services = LegacyRuntimeServices(experiment.devices)
+    node = _Node(experiment.devices.camera)
+    try:
+        assert services.persistent is False
+        handle = services.fence.start(node)
+        handle.wait_started(1.0)
+        assert services.resources.active_claims()
+        receipt = services.fence.stop(node, timeout=1.0)
+        assert receipt.terminated
+        assert receipt.snapshot is not None
+        assert receipt.snapshot.safety_bundle_id is not None
+        assert not services.resources.unresolved_hazards()
+    finally:
+        services.shutdown(timeout=1.0)
+        experiment.devices.close()
+
+
+def test_task_console_launcher_enrolls_passed_node_in_runtime_fence():
+    from Zou_lab_control.frontend.task_console import show_task_console
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+
+    ensure_qt_app()
+    experiment = connect("virtual")
+    services = LegacyRuntimeServices(experiment.devices)
+    node = _Node(experiment.devices.camera)
+    console = None
+    try:
+        console = show_task_console(
+            hub=SignalHub(),
+            running_nodes=[node],
+            session=experiment,
+            runtime_fence=services.fence,
+            title="legacy-fence-enrollment-test",
+        )
+        handle = services.fence.handle_for(node)
+        assert handle is not None
+        handle.wait_started(1.0)
+        assert node in console.running_nodes
+        assert console.stop_all_nodes(timeout=1.0)
+        assert handle.snapshot().state.terminal
+    finally:
+        if console is not None:
+            console.shutdown(timeout=1.0)
+            console.window().close()
+        services.shutdown(timeout=1.0)
+        experiment.devices.close()
+
+
+def test_task_console_logic_start_and_stop_use_the_injected_runtime_fence():
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    ensure_qt_app()
+    experiment = connect("virtual")
+    services = LegacyRuntimeServices(experiment.devices)
+    console = TaskConsole(
+        hub=SignalHub(),
+        state=default_console_state(),
+        session=experiment,
+        runtime_fence=services.fence,
+        measurements=experiment.readout.measurement_specs(),
+        processors=experiment.readout.processor_specs(),
+        tasks=experiment.readout.task_specs(),
+        window_px=(900, 600),
+    )
+    console._timer.stop()
+    try:
+        index = next(
+            i
+            for i in range(console.kind_combo.count())
+            if console.kind_combo.itemData(i) == ("camera", "live")
+        )
+        console.kind_combo.setCurrentIndex(index)
+        console._add_panel()
+        row = console.logic_nodes[-1]
+        console._start_logic_node(row)
+        node = console._logic_nodes.get(id(row)) or console._starting_nodes[id(row)]
+        handle = services.fence.handle_for(node)
+        assert handle is not None
+        handle.wait_started(1.0)
+        console._poll_logic_nodes()
+        assert console._logic_nodes[id(row)] is node
+        assert node in console.running_nodes
+        assert console._stop_logic_node(row, timeout=1.0)
+        assert handle.snapshot().state.terminal
+        assert node not in console.running_nodes
+    finally:
+        console.shutdown(timeout=1.0)
+        services.shutdown(timeout=1.0)
+        experiment.devices.close()
+
+
+def test_session_task_console_composes_one_shared_runtime_authority():
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+
+    ensure_qt_app()
+    experiment = connect("virtual")
+    console = experiment.task_console()
+    services = experiment._zlc_runtime_services
+    try:
+        assert console._current_runtime_fence() is services
+        assert services.fence.controller is services.controller
+        assert experiment.task_console() is console
+    finally:
+        console.shutdown(timeout=1.0)
+        experiment.close()
+        console.window().close()
+    assert services.closed
+
+
+def test_session_config_swap_rebinds_console_fence_after_old_owner_terminates():
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+
+    ensure_qt_app()
+    experiment = connect("virtual")
+    console = experiment.task_console()
+    services = experiment._zlc_runtime_services
+    try:
+        index = next(
+            i
+            for i in range(console.kind_combo.count())
+            if console.kind_combo.itemData(i) == ("camera", "live")
+        )
+        console.kind_combo.setCurrentIndex(index)
+        console._add_panel()
+        row = console.logic_nodes[-1]
+        console._start_logic_node(row)
+        old_node = console._logic_nodes.get(id(row)) or console._starting_nodes[id(row)]
+        old_handle = services.fence.handle_for(old_node)
+        assert old_handle is not None
+        old_handle.wait_started(1.0)
+
+        experiment.load_config("virtual")
+
+        assert old_handle.snapshot().state.terminal
+        console._poll_logic_nodes()
+        assert console._logic_nodes[id(row)] is None
+        assert console._current_runtime_fence() is experiment._zlc_runtime_services
+        console._start_logic_node(row)
+        new_node = console._logic_nodes.get(id(row)) or console._starting_nodes[id(row)]
+        assert new_node is not old_node
+        new_handle = services.fence.handle_for(new_node)
+        assert new_handle is not None
+        new_handle.wait_started(1.0)
+        assert console._stop_logic_node(row, timeout=1.0)
+    finally:
+        console.shutdown(timeout=1.0)
+        experiment.close()
+        console.window().close()
+
+
+def test_manual_sequencer_remains_a_nonhazardous_memory_authority(tmp_path, monkeypatch):
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+
+    ensure_qt_app()
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    experiment = connect("virtual")
+    console = experiment.task_console()
+    old_services = experiment._zlc_runtime_services
+    try:
+        experiment.load_config(
+            {
+                "sequencer": {
+                    "type": "ManualSequencer",
+                    "params": {"channels": ["ch00"]},
+                }
+            }
+        )
+        current_services = experiment._zlc_runtime_services
+        assert current_services is not old_services
+        assert old_services.closed
+        assert not current_services.closed
+        assert not current_services.persistent
+        assert console._current_runtime_fence() is current_services
+    finally:
+        console.shutdown(timeout=1.0)
+        experiment.close()
+        console.window().close()
+
+
+def test_irreversible_replacement_commit_failure_retains_recovery_authority(
+    tmp_path, monkeypatch
+):
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+
+    ensure_qt_app()
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    experiment = connect("virtual")
+    console = experiment.task_console()
+    old_services = experiment._zlc_runtime_services
+    replacements = []
+    real_stage = old_services.stage_replacement_authority
+
+    def stage(device_set):
+        replacement = real_stage(device_set)
+        assert replacement is not None
+        replacements.append(replacement)
+
+        def fail_commit(*_args, **_kwargs):
+            raise RuntimeError("injected replacement commit failure")
+
+        replacement.commit_device_transition = fail_commit
+        return replacement
+
+    old_services.stage_replacement_authority = stage
+    try:
+        with pytest.raises(RuntimeError, match="injected replacement commit failure"):
+            experiment.load_config(
+                {
+                    "sequencer": {
+                        "type": "ManualSequencer",
+                        "params": {"channels": ["ch00"]},
+                    }
+                }
+            )
+        replacement = replacements[0]
+        assert old_services.closed
+        assert experiment._zlc_runtime_services is replacement
+        assert not replacement.closed
+        with pytest.raises(RuntimeError, match="crossed the old-device close boundary"):
+            experiment.open_devices()
+    finally:
+        console.shutdown(timeout=1.0)
+        experiment.close()
+        if replacements:
+            assert replacements[0].closed
+        console.window().close()
+
+
+def test_terminal_before_node_start_rolls_console_registry_back_without_ghost():
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    ensure_qt_app()
+    experiment = connect("virtual")
+    services = LegacyRuntimeServices(experiment.devices)
+    console = TaskConsole(
+        hub=SignalHub(),
+        state=default_console_state(),
+        session=experiment,
+        runtime_fence=services.fence,
+        window_px=(900, 600),
+    )
+    console._timer.stop()
+
+    class _FailingNode:
+        instance_label = ""
+
+        def __init__(self, device):
+            self.device = device
+            self.running = False
+
+        def occupied_devices(self):
+            return (self.device,)
+
+        def referenced_devices(self):
+            return (self.device,)
+
+        def published_signals(self):
+            return frozenset({"never_published"})
+
+        def start(self):
+            raise RuntimeError("start boundary failed")
+
+        def stop(self, timeout=0.1):
+            return True
+
+    try:
+        index = next(
+            i
+            for i in range(console.kind_combo.count())
+            if console.kind_combo.itemData(i) == ("camera", "live")
+        )
+        console.kind_combo.setCurrentIndex(index)
+        console._add_panel()
+        row = console.logic_nodes[-1]
+        failing = _FailingNode(experiment.devices.camera)
+        console._build_logic_node = lambda *_args, **_kwargs: failing
+        console._start_logic_node(row)
+        handle = services.fence.handle_for(failing)
+        assert handle is not None
+        assert handle.run_handle.wait(1.0).state is RunState.FAILED
+        console._poll_logic_nodes()
+        assert console._logic_nodes[id(row)] is None
+        assert failing not in console.running_nodes
+        assert "never_published" not in console.hub.names()
+    finally:
+        console.shutdown(timeout=1.0)
+        services.shutdown(timeout=1.0)
+        experiment.devices.close()
+
+
+def test_slow_hazard_journal_keeps_starting_node_out_of_provider_registry():
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    class BlockingJournal(MemoryQuarantineJournal):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.allow = threading.Event()
+
+        def append_hazards(self, records):
+            self.entered.set()
+            assert self.allow.wait(2.0)
+            return super().append_hazards(records)
+
+    ensure_qt_app()
+    experiment = connect("virtual")
+    journal = BlockingJournal()
+    resources = ResourceArbiter(journal)
+    broker = DeviceBroker()
+    registry = LegacyDeviceRegistry(broker)
+    for registration in registrations_for(experiment.devices):
+        registry.register(registration)
+    fence = LegacyRuntimeFence(RunController(resources), registry)
+    console = TaskConsole(
+        hub=SignalHub(),
+        state=default_console_state(),
+        session=experiment,
+        runtime_fence=fence,
+        window_px=(900, 600),
+    )
+    console._timer.stop()
+    try:
+        index = next(
+            i
+            for i in range(console.kind_combo.count())
+            if console.kind_combo.itemData(i) == ("camera", "live")
+        )
+        console.kind_combo.setCurrentIndex(index)
+        console._add_panel()
+        row = console.logic_nodes[-1]
+        console._start_logic_node(row)
+        assert journal.entered.wait(1.0)
+        node = console._starting_nodes[id(row)]
+        assert console._logic_nodes[id(row)] is None
+        assert node not in console.running_nodes
+        assert console._node_for_signal("frame_0") is None
+
+        journal.allow.set()
+        fence.handle_for(node).wait_started(1.0)
+        console._poll_logic_nodes()
+        assert console._logic_nodes[id(row)] is node
+        assert node in console.running_nodes
+    finally:
+        journal.allow.set()
+        console.shutdown(timeout=1.0)
+        experiment.close()
+    resources.shutdown()
+
+
+def test_synchronous_hardware_call_uses_same_hazard_and_safe_authority():
+    device = _Device("camera")
+    fence, resources, journal = _fence_for(device)
+    observed = []
+
+    def operation():
+        observed.append(bool(journal.unresolved_hazards()))
+        device.safe = False
+        return "frame"
+
+    assert fence.call((device,), operation, name="capture") == "frame"
+    assert observed == [True]
+    assert device.cleanup_calls == 1
+    assert device.safe
+    assert resources.active_claims() == {}
+    resources.shutdown()
+
+
+def test_session_hardware_call_establishes_closed_connection_before_identity_bound_run(
+    monkeypatch,
+):
+    experiment = connect("virtual")
+    camera = experiment.devices.camera
+    state = {"open": False, "opens": 0}
+
+    monkeypatch.setattr(
+        type(camera),
+        "is_open",
+        property(lambda _self: state["open"]),
+    )
+
+    def open_camera():
+        state["opens"] += 1
+        state["open"] = True
+        return camera
+
+    monkeypatch.setattr(camera, "open", open_camera)
+    try:
+        assert not camera.is_open
+
+        def operation():
+            assert camera.is_open
+            assert experiment._zlc_runtime_services.resources.active_claims()
+            return "captured"
+
+        assert experiment._run_hardware_call(
+            (camera,), operation, name="lazy-open-capture"
+        ) == "captured"
+        assert state == {"open": True, "opens": 1}
+        assert experiment._zlc_runtime_services.resources.active_claims() == {}
+    finally:
+        experiment.close()
+
+
+def test_session_pulse_facade_holds_one_claim_from_prepare_through_stop():
+    experiment = connect("virtual")
+    try:
+        controller = experiment.timing.bind_pulse(experiment.sequence)
+        assert controller.sequencer.managed_installation_authority
+        controller.on_pulse(repeat_forever=True, wait=False)
+        runtime = experiment._zlc_runtime_services
+        assert runtime.resources.active_claims()
+        assert experiment.devices.sequencer.snapshot()["state"] == "running"
+        controller.stop()
+        assert runtime.resources.active_claims() == {}
+        assert experiment.devices.sequencer.snapshot()["state"] == "safe"
+    finally:
+        experiment.close()
+
+
+def test_quarantine_survives_registry_replacement_and_blocks_same_resource():
+    first = _Device("camera")
+    journal = MemoryQuarantineJournal()
+    resources = ResourceArbiter(journal)
+    broker = DeviceBroker()
+
+    def registry_for(device, *, verify_fails=False):
+        registry = LegacyDeviceRegistry(broker)
+        registry.register(
+            LegacyDeviceRegistration(
+                device=device,
+                key=ResourceKey(("device", "camera")),
+                identity_probe=lambda: DeviceIdentityAck(
+                    "fixture:camera",
+                    DeviceIdentityEvidenceKind.HARDWARE_IDENTITY_READBACK,
+                    f"fixture-evidence:{device.name}",
+                    "test-assets-v1",
+                ),
+                cleanup_operations={
+                    SafetyOperation.SAFE_STATE: lambda: CleanupStepAck(
+                        SafetyOperation.SAFE_STATE, "safe-requested"
+                    )
+                },
+                cleanup_order=(SafetyOperation.SAFE_STATE,),
+                verify_safe_state=(
+                    (lambda: (_ for _ in ()).throw(RuntimeError("readback failed")))
+                    if verify_fails
+                    else (lambda: SafeStateAck("safe-verified"))
+                ),
+            )
+        )
+        return registry
+
+    fence = LegacyRuntimeFence(
+        RunController(resources), registry_for(first, verify_fails=True)
+    )
+    node = _Node(first)
+    handle = fence.start(node)
+    handle.wait_started(1.0)
+    receipt = fence.stop(node, timeout=1.0)
+    assert receipt.snapshot is not None
+    assert receipt.snapshot.state is RunState.FAILED
+    assert resources.quarantine_records()
+
+    replacement = _Device("replacement")
+    transition = fence.begin_device_transition()
+    fence.commit_device_transition(transition, registry_for(replacement))
+    with pytest.raises(RunStartRejected) as rejected:
+        fence.start(_Node(replacement))
+    assert "ResourceQuarantined" in repr(rejected.value.outcome)
+
+
+def test_production_console_reports_device_conflict_without_stopping_first_owner():
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    ensure_qt_app()
+    experiment = connect("virtual")
+    services = LegacyRuntimeServices(experiment.devices)
+    console = TaskConsole(
+        hub=SignalHub(),
+        state=default_console_state(),
+        session=experiment,
+        runtime_fence=services.fence,
+        window_px=(900, 600),
+    )
+    console._timer.stop()
+
+    def add_camera_row():
+        index = next(
+            i
+            for i in range(console.kind_combo.count())
+            if console.kind_combo.itemData(i) == ("camera", "live")
+        )
+        console.kind_combo.setCurrentIndex(index)
+        console._add_panel()
+        return console.logic_nodes[-1]
+
+    try:
+        first_row = add_camera_row()
+        console._start_logic_node(first_row)
+        first = (
+            console._logic_nodes.get(id(first_row))
+            or console._starting_nodes[id(first_row)]
+        )
+        first_handle = services.fence.handle_for(first)
+        assert first_handle is not None
+        first_handle.wait_started(1.0)
+        console._poll_logic_nodes()
+
+        second_row = add_camera_row()
+        console._start_logic_node(second_row)
+
+        assert console._logic_nodes.get(id(second_row)) is None
+        assert first in console.running_nodes
+        assert first_handle.snapshot().state is RunState.RUNNING
+        assert "start failed" in second_row.status_label.text().lower()
+        assert console._stop_logic_node(first_row, timeout=1.0)
+    finally:
+        console.shutdown(timeout=1.0)
+        services.shutdown(timeout=1.0)
+        experiment.devices.close()
+
+
+def test_device_transition_closes_start_admission_until_commit_or_abort():
+    device = _Device("camera")
+    replacement = _Device("replacement")
+    fence, _resources, _journal = _fence_for(device)
+    transition = fence.begin_device_transition()
+
+    with pytest.raises(LegacyRuntimeTransition, match="start is closed"):
+        fence.start(_Node(device))
+
+    fence.abort_device_transition(transition)
+    handle = fence.start(_Node(device))
+    handle.wait_started(1.0)
+    assert fence.stop(handle.node, timeout=1.0).terminated
+
+    transition = fence.begin_device_transition()
+    replacement_fence, _resources, _journal = _fence_for(replacement)
+    fence.commit_device_transition(transition, replacement_fence.devices)
+    replacement_handle = fence.start(_Node(replacement))
+    replacement_handle.wait_started(1.0)
+    assert fence.stop(replacement_handle.node, timeout=1.0).terminated
+
+
+def test_session_swap_gate_blocks_concurrent_start_through_old_generation():
+    experiment = connect("virtual")
+    runtime = LegacyRuntimeServices(experiment.devices)
+    experiment._zlc_runtime_services = runtime
+    node = _Node(experiment.devices.camera)
+    handle = runtime.fence.start(node)
+    handle.wait_started(1.0)
+    old_devices = experiment.devices
+    real_close = old_devices.close
+    close_entered = threading.Event()
+    allow_close = threading.Event()
+    failures = []
+
+    def blocked_close():
+        close_entered.set()
+        assert allow_close.wait(2.0)
+        return real_close()
+
+    def swap():
+        try:
+            experiment.load_config("virtual")
+        except BaseException as exc:
+            failures.append(exc)
+
+    old_devices.close = blocked_close
+    worker = threading.Thread(target=swap)
+    worker.start()
+    assert close_entered.wait(1.0)
+    with pytest.raises(LegacyRuntimeTransition, match="start is closed"):
+        runtime.fence.start(_Node(old_devices.camera))
+    allow_close.set()
+    worker.join(3.0)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert handle.snapshot().state.terminal
+    experiment.close()
+
+
+def test_manual_sequencer_registration_has_claim_but_no_hazard_contract():
+    from Zou_lab_control.neutral_atom.devices.sequencer import ManualSequencer
+
+    sequencer = ManualSequencer(channels=("ch00",))
+    registration = registrations_for(
+        SimpleNamespace(
+            devices={"sequencer": sequencer},
+            config={
+                "sequencer": {
+                    "type": "ManualSequencer",
+                    "params": {"channels": ["ch00"]},
+                }
+            },
+        )
+    )[0]
+
+    assert registration.hazardous is False
+    assert registration.cleanup_operations == {}
+    assert registration.verify_safe_state is None
+
+
+def test_remote_sequencer_is_no_go_before_raw_hardware_safe_contract_exists():
+    from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer
+
+    sequencer = RemoteSequencer(host="127.0.0.1", port=18861)
+    asset_map = _asset_map_for(
+        "sequencer",
+        sequencer,
+        expected_identity="installation-endpoint:remote-sequencer:127.0.0.1:18861",
+        evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
+    )
+    registration = registrations_for(
+        SimpleNamespace(
+            devices={"sequencer": sequencer},
+            config={
+                "sequencer": {
+                    "type": "RemoteSequencer",
+                    "params": {"host": "127.0.0.1", "port": 18861},
+                }
+            },
+        ),
+        asset_map=asset_map,
+    )[0]
+    broker = DeviceBroker()
+    registry = LegacyDeviceRegistry(broker)
+    registry.register(registration)
+    fence = LegacyRuntimeFence(
+        RunController(ResourceArbiter(MemoryQuarantineJournal())), registry
+    )
+
+    with pytest.raises(RuntimeError, match="NO-GO"):
+        fence.start(_Node(sequencer))
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("resource_key", "stable_device_identity", "asset_map_revision"),
+)
+def test_experiment_config_cannot_override_installation_identity(field):
+    experiment = connect("virtual")
+    try:
+        experiment.devices.config["camera"][field] = "forged"
+        with pytest.raises(ValueError, match="installation-owned identity"):
+            registrations_for(experiment.devices)
+    finally:
+        experiment.devices.close()
+
+
+def test_unknown_concrete_camera_adapter_is_rejected_at_composition():
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera
+
+    class UnqualifiedVirtualCamera(VirtualCamera):
+        pass
+
+    camera = object.__new__(UnqualifiedVirtualCamera)
+    with pytest.raises(TypeError, match="no explicit identity/safety adapter"):
+        registrations_for(
+            SimpleNamespace(
+                devices={"camera": camera},
+                config={
+                    "camera": {
+                        "type": "UnqualifiedVirtualCamera",
+                        "params": {},
+                    }
+                },
+            )
+        )
+
+
+def test_unknown_non_camera_device_subclass_is_rejected_at_composition():
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualLaser
+
+    class UnqualifiedLaser(VirtualLaser):
+        pass
+
+    laser = UnqualifiedLaser()
+    with pytest.raises(TypeError, match="no explicit identity/safety adapter"):
+        registrations_for(
+            SimpleNamespace(
+                devices={"cooling_laser": laser},
+                config={"cooling_laser": {"type": "UnqualifiedLaser", "params": {}}},
+            )
+        )
+
+
+def test_virtual_device_set_has_explicit_registration_for_every_base_device():
+    experiment = connect("virtual")
+    try:
+        registrations = registrations_for(experiment.devices)
+        assert len(registrations) == len(experiment.devices.devices)
+        assert {id(registration.device) for registration in registrations} == {
+            id(device) for device in experiment.devices.devices.values()
+        }
+    finally:
+        experiment.devices.close()
+
+
+def test_real_adapter_requires_installation_asset_map(tmp_path, monkeypatch):
+    from Zou_lab_control.neutral_atom.devices.qcmos import QCMOSCamera
+
+    monkeypatch.setenv("ZLC_ASSET_MAP", str(tmp_path / "missing-asset-map.json"))
+    camera = QCMOSCamera()
+    with pytest.raises(RuntimeError, match="requires an installation AssetMap"):
+        registrations_for(
+            SimpleNamespace(
+                devices={"camera": camera},
+                config={"camera": {"type": "QCMOSCamera", "params": {}}},
+            )
+        )
+
+
+def test_asset_map_revision_is_canonical_content_digest():
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualLaser
+
+    camera = VirtualLaser()
+    first = _asset_map_for(
+        "camera",
+        camera,
+        expected_identity="installation-endpoint:virtual:camera",
+        evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
+    )
+    replay = InstallationAssetMap.from_mapping(first.to_dict())
+    changed = _asset_map_for(
+        "camera",
+        camera,
+        expected_identity="installation-endpoint:virtual:other-camera",
+        evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
+    )
+    assert replay.revision == first.revision
+    assert changed.revision != first.revision
+
+
+class _PylonNode:
+    def __init__(self, value):
+        self.value = value
+
+    def GetValue(self):
+        return self.value
+
+
+class _PylonLiveHandle:
+    def __init__(self, serial="PX-1", model="acA1920"):
+        self.DeviceSerialNumber = _PylonNode(serial)
+        self.DeviceModelName = _PylonNode(model)
+        self.removed = False
+        self.open = True
+        self.grabbing = False
+
+    def IsOpen(self):
+        return self.open
+
+    def IsCameraDeviceRemoved(self):
+        return self.removed
+
+    def IsGrabbing(self):
+        return self.grabbing
+
+
+def _qualified_pylon_registration():
+    from Zou_lab_control.neutral_atom.devices.pylon import PylonCamera
+
+    camera = PylonCamera(serial="PX-1", trigger_source="Software")
+    camera._camera = _PylonLiveHandle()
+    camera._connection_token = object()
+    asset_map = _asset_map_for(
+        "monitor_camera",
+        camera,
+        expected_identity="pylon:PX-1",
+        evidence_kind=DeviceIdentityEvidenceKind.HARDWARE_IDENTITY_READBACK,
+    )
+    registration = registrations_for(
+        SimpleNamespace(
+            devices={"monitor_camera": camera},
+            config={
+                "monitor_camera": {
+                    "type": "PylonCamera",
+                    "params": {"serial": "PX-1", "trigger_source": "Software"},
+                }
+            },
+        ),
+        asset_map=asset_map,
+    )[0]
+    return camera, registration
+
+
+def test_pylon_removed_handle_cannot_reuse_cached_identity_or_mint_safe():
+    camera, registration = _qualified_pylon_registration()
+    identity = registration.identity_probe()
+    assert identity.stable_device_identity == "pylon:PX-1"
+    camera._camera.removed = True
+    with pytest.raises(RuntimeError, match="removal|removed"):
+        registration.identity_probe()
+    with pytest.raises(RuntimeError, match="removal|removed"):
+        registration.verify_safe_state()
+
+
+def test_camera_cleanup_attempts_stop_after_disarm_failure():
+    camera, registration = _qualified_pylon_registration()
+    calls = []
+
+    def fail_disarm():
+        calls.append("disarm")
+        raise RuntimeError("disarm failed")
+
+    def stop():
+        calls.append("stop")
+
+    camera.disarm = fail_disarm
+    camera.stop = stop
+    with pytest.raises(RuntimeError, match="cleanup did not acknowledge every step"):
+        registration.cleanup_operations[SafetyOperation.DISARM]()
+    assert calls == ["disarm", "stop"]
+
+
+def test_device_bearing_logic_node_direct_start_is_mechanically_rejected():
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
+
+    experiment = connect("virtual")
+    node = CameraMeasurement(SignalHub(), experiment.devices.camera)
+    try:
+        with pytest.raises(RuntimeError, match="LegacyRuntimeFence authority"):
+            node.start()
+        assert not node.running
+    finally:
+        experiment.devices.close()
+
+
+def test_observe_only_logic_node_direct_start_is_mechanically_rejected():
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.logic import LogicNode, OBSERVE
+
+    class Observer(LogicNode):
+        _devices = {"camera": OBSERVE}
+
+        def __init__(self, camera):
+            super().__init__(SignalHub())
+            self.camera = camera
+
+        def shot(self):
+            return {}
+
+    experiment = connect("virtual")
+    node = Observer(experiment.devices.camera)
+    try:
+        assert node.occupied_devices() == ()
+        assert node.referenced_devices() == (experiment.devices.camera,)
+        with pytest.raises(RuntimeError, match="LegacyRuntimeFence authority"):
+            node.start()
+        assert not node.running
+    finally:
+        experiment.devices.close()

@@ -92,13 +92,20 @@ def make_console(exp, *, running_nodes=None, window_px=(900, 600)):
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
 
     ensure_qt_app()
+    runtime = getattr(exp, "_zlc_runtime_services", None)
+    if runtime is None or runtime.closed:
+        runtime = LegacyNeutralAtomRuntime(exp.devices)
+        exp._zlc_runtime_services = runtime
     con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
                       measurements=exp.readout.measurement_specs(),
                       processors=exp.readout.processor_specs(),
                       tasks=exp.readout.task_specs(), window_px=window_px,
-                      running_nodes=list(running_nodes or ()))
+                      running_nodes=list(running_nodes or ()),
+                      runtime_fence=runtime,
+                      runtime_fence_provider=lambda: exp._require_runtime_services())
     con._timer.stop()
     return con
 

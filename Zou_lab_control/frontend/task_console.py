@@ -165,11 +165,10 @@ COORD_FRAMES_KEY = "__coord_frames__"
 #: (never part of a hub name) -- one spelling shared by the declared and the running paths.
 MID_RUN_TAG = " (mid-run)"
 
-# WHICH hardware a logic node drives is the NODE's own ``occupied_devices()`` declaration
-# (operations/logic.py LogicNode, from its ``_occupies`` attribute names) -- the console's
-# device-occupancy mutual exclusion in ``_start_logic_node`` intersects it across every running
-# node, GUI rows and notebook-injected ``running_nodes=`` alike; nodes on disjoint hardware
-# coexist, so there is no second kind-string table here and no global "stop everything" rule.
+# WHICH hardware a logic node references is the NODE's own ``referenced_devices()`` declaration.
+# Every such node needs runtime authority; ``occupied_devices()`` is only the narrower subset the
+# authority turns into EXCLUSIVE claims while observe-only references receive OBSERVE claims.
+# There is no second frontend kind-string table and no global "stop everything" rule.
 
 # Console PANEL kinds.  EVERY plot kind in the ONE table ``live.PLOT_KINDS`` is a console panel
 # kind -- it renders through the SAME ``PanelCard`` (``_build_plot`` dispatches on the kind: a 2D
@@ -6509,6 +6508,8 @@ class TaskConsole(QtWidgets.QWidget):
         processors: Sequence[object] = (),
         tasks: Sequence[object] = (),
         session: object | None = None,
+        runtime_fence: object | None = None,
+        runtime_fence_provider=None,
         scale: float | None = None,
         window_ratio: float = WINDOW_SCREEN_FRACTION,
         window_px: tuple[int, int] | None = None,
@@ -6532,8 +6533,28 @@ class TaskConsole(QtWidgets.QWidget):
         # declaration that exists whether or not its node is running.
         adopted_nodes = list(running_nodes)
         self._require_bounded_stop_nodes(adopted_nodes)
-        self.running_nodes = adopted_nodes
+        if runtime_fence is None and any(
+            tuple(getattr(node, "referenced_devices", lambda: ())())
+            or tuple(getattr(node, "occupied_devices", lambda: ())())
+            or tuple(getattr(node, "lifecycle_devices", lambda: ())())
+            for node in adopted_nodes
+        ):
+            raise RuntimeError(
+                "device-bearing running_nodes require a runtime authority"
+            )
+        self.running_nodes = [] if runtime_fence is not None else adopted_nodes
         self._stop_attempts: dict[int, _StopAttempt] = {}
+        # Production session launchers inject zlc_workbench.LegacyRuntimeFence.  The
+        # frontend keeps it duck-typed so the target package DAG remains one-way:
+        # workbench composes frontend, frontend never imports workbench.
+        if runtime_fence_provider is not None and not callable(runtime_fence_provider):
+            raise TypeError("runtime_fence_provider must be callable or None")
+        self._legacy_runtime_fence = runtime_fence
+        self._runtime_fence_provider = runtime_fence_provider
+        self._legacy_handles: dict[int, object] = {}
+        self._legacy_handle_fences: dict[int, object] = {}
+        self._starting_nodes: dict[int, object] = {}
+        self._pending_fenced_starts: dict[int, set[str]] = {}
         self._panel_teardown_phases: dict[int, set[str]] = {}
         # The declarative measurement catalog: each becomes an addable LOGIC NODE
         # (a swept measurement) on the Logic tab; with none, only the camera /
@@ -7718,8 +7739,69 @@ class TaskConsole(QtWidgets.QWidget):
         # streams under the new params.  start() is idempotent, so a node that is
         # already running just keeps its loop (the edit was queued above).
         if not getattr(node, "running", False) and hasattr(node, "start"):
-            node.start()
+            fence = self._current_runtime_fence()
+            if fence is None:
+                if tuple(getattr(node, "referenced_devices", lambda: ())()):
+                    raise RuntimeError(
+                        "device-bearing nodes require a runtime authority"
+                    )
+                node.start()
+            else:
+                handle = fence.start(node)
+                self._legacy_handles[id(node)] = handle
+                self._legacy_handle_fences[id(node)] = fence
+                row = next(
+                    (
+                        candidate
+                        for candidate in self.logic_nodes
+                        if self._logic_nodes.get(id(candidate)) is node
+                        or self._last_node.get(id(candidate)) is node
+                    ),
+                    None,
+                )
+                if row is not None:
+                    self._starting_nodes[id(row)] = node
+                    self._pending_fenced_starts[id(node)] = set()
+                    try:
+                        handle.wait_started(0.05)
+                    except Exception:
+                        pass
+                    if handle.started:
+                        self._finalize_fenced_start(row, node)
+                else:
+                    # Row-less injected sources have no UI poll owner.  Their launcher
+                    # performs the admission wait; a stopped row-less source cannot be
+                    # restarted implicitly from a panel edit.
+                    try:
+                        handle.wait_started(0.05)
+                    except TimeoutError as exc:
+                        handle.cancel("row-less source start did not cross admission")
+                        raise RuntimeError(
+                            "row-less device source restart requires its composition launcher"
+                        ) from exc
+                    if node not in self.running_nodes:
+                        self.running_nodes.append(node)
         return node
+
+    def install_runtime_fence(self, runtime_fence: object) -> None:
+        """Replace a static stopped generation for non-provider test/standalone hosts."""
+
+        required = ("start", "stop", "handle_for")
+        if not all(callable(getattr(runtime_fence, name, None)) for name in required):
+            raise TypeError("runtime_fence must provide start(), stop(), and handle_for()")
+        if self.running_nodes or self._starting_nodes:
+            raise RuntimeError("cannot replace runtime fence while nodes are active")
+        self._legacy_runtime_fence = runtime_fence
+
+    def _current_runtime_fence(self):
+        provider = self._runtime_fence_provider
+        fence = provider() if provider is not None else self._legacy_runtime_fence
+        if fence is None:
+            return None
+        required = ("start", "stop", "handle_for")
+        if not all(callable(getattr(fence, name, None)) for name in required):
+            raise TypeError("runtime fence provider returned an invalid authority")
+        return fence
 
     def _edit_card(self, card: "PanelCard") -> None:
         """Open (or focus) this PLOT panel's OWN closable Edit tab (a PanelEditor); a
@@ -8509,37 +8591,20 @@ class TaskConsole(QtWidgets.QWidget):
                     "restart blocked: previous owner thread did not terminate", error=True
                 )
             return
-        claimed = {id(d) for d in getattr(node, "occupied_devices", lambda: ())()}
-        if claimed:
-            for other in list(self.running_nodes):
-                if other is node:
-                    continue
-                theirs = {id(d) for d in getattr(other, "occupied_devices", lambda: ())()}
-                if not (claimed & theirs):
-                    continue                             # disjoint hardware -> coexist
-                other_row = next((r for r in self.logic_nodes
-                                  if self._logic_nodes.get(id(r)) is other), None)
-                if other_row is not None:
-                    stopped = self._stop_logic_node(other_row)
-                else:
-                    # A row-less injected node uses the same confirmed termination rule.
-                    stopped = self._stop_node_confirmed(other)
-                    if stopped:
-                        try:
-                            self.running_nodes.remove(other)
-                        except ValueError:
-                            pass
-                if not stopped:
-                    row.set_state(
-                        "error", status="start blocked: conflicting owner still active"
-                    )
-                    if editor is not None:
-                        editor.set_running(False)
-                        editor.set_status(
-                            "start blocked: a conflicting device owner did not terminate",
-                            error=True,
-                        )
-                    return
+        referenced = tuple(getattr(node, "referenced_devices", lambda: ())())
+        fence = self._current_runtime_fence()
+        if referenced and fence is None:
+            row.set_state(
+                "error",
+                status="start failed: device-bearing nodes require a runtime authority",
+            )
+            if editor is not None:
+                editor.set_running(False)
+                editor.set_status(
+                    "start failed: device-bearing nodes require a runtime authority",
+                    error=True,
+                )
+            return
         if not self._timer.isActive():
             self._timer.start()
         try:
@@ -8552,7 +8617,12 @@ class TaskConsole(QtWidgets.QWidget):
             # compatibility and never reaches into the hub's schema internals.
             if _prev is not None:
                 node._inherit_output_schema_ownership(_prev)
-            node.start()
+            if fence is None:
+                node.start()
+            else:
+                handle = fence.start(node)
+                self._legacy_handles[id(node)] = handle
+                self._legacy_handle_fences[id(node)] = fence
         except Exception as exc:
             row.set_state("error", status=f"start failed: {str(exc).splitlines()[0][:80]}")
             if editor is not None:
@@ -8562,12 +8632,46 @@ class TaskConsole(QtWidgets.QWidget):
         # COMMIT: the node is genuinely running -- only now does it enter the registries, and only
         # now are the previous build's orphan signals unlinked (a failed start leaves the old
         # signals in the hub untouched, exactly like a plain Stop, so nothing is lost).
-        self._logic_nodes[id(row)] = node
-        self._last_node[id(row)] = node           # survives Stop, for signal-source labelling
-        if node not in self.running_nodes:
-            self.running_nodes.append(node)
         # #5: unlink any signal the PREVIOUS build published that this new build no longer does AND no
         # other running node owns -> a switched/rebuilt node leaves NO orphan "(unbound)" signal behind.
+        fenced = self._legacy_handles.get(id(node))
+        if fenced is None:
+            self._logic_nodes[id(row)] = node
+            if node not in self.running_nodes:
+                self.running_nodes.append(node)
+            self._last_node[id(row)] = node       # survives Stop, for signal-source labelling
+            self._remove_replaced_orphans(node, old_sigs)
+        else:
+            # Resource admission is authoritative immediately, but node.start() runs only
+            # after the hazard journal is durable on the Run owner.  Delay schema-owner
+            # replacement/orphan deletion and task takeover until that start receipt exists.
+            self._starting_nodes[id(row)] = node
+            self._pending_fenced_starts[id(node)] = set(old_sigs)
+            # The ordinary local-journal path crosses this boundary in a few milliseconds.
+            # Preserve the console's immediate Start feel with one strictly bounded handoff;
+            # a slow/failed journal remains an explicit asynchronous "starting" state and
+            # never becomes a provider merely because this budget elapsed.
+            try:
+                fenced.wait_started(0.05)
+            except TimeoutError:
+                pass
+            except Exception:
+                pass
+            if fenced.started:
+                self._finalize_fenced_start(row, node)
+        row.set_state("running", status="starting" if fenced is not None else "running")
+        self._update_row_publishes(row)            # now show the LIVE node's published shapes
+        if editor is not None:
+            editor.set_running(True)
+            editor.set_status("starting" if fenced is not None else "running", error=False)
+        self.status_dot.set_color(GREEN)
+        self._mark_dirty()
+        # A TASK (one-shot orchestration) TAKES OVER the console (confocal-style): show
+        # its mid-run output in a dedicated Monitor panel + LOCK every other action.
+        if fenced is None and getattr(node, "layer", "") == "task":
+            self._set_task_running(row, node)
+
+    def _remove_replaced_orphans(self, node, old_sigs: set[str]) -> None:
         try:
             keep = {str(s) for s in node.published_signals()}
         except Exception:
@@ -8579,18 +8683,23 @@ class TaskConsole(QtWidgets.QWidget):
                 keep.update(str(s) for s in other.published_signals())
             except Exception:
                 pass
-        orphan = old_sigs - keep
+        orphan = set(old_sigs) - keep
         if orphan:
             self.hub.remove_signals(orphan)
-        row.set_state("running", status="running")
-        self._update_row_publishes(row)            # now show the LIVE node's published shapes
-        if editor is not None:
-            editor.set_running(True)
-            editor.set_status("running", error=False)
-        self.status_dot.set_color(GREEN)
-        self._mark_dirty()
-        # A TASK (one-shot orchestration) TAKES OVER the console (confocal-style): show
-        # its mid-run output in a dedicated Monitor panel + LOCK every other action.
+
+    def _finalize_fenced_start(self, row: "LogicNodeRow", node) -> None:
+        pending = self._pending_fenced_starts.pop(id(node), None)
+        if pending is None:
+            return
+        if self._starting_nodes.get(id(row)) is not node:
+            raise RuntimeError("pending fenced node lost its row ownership")
+        self._starting_nodes.pop(id(row), None)
+        self._logic_nodes[id(row)] = node
+        if node not in self.running_nodes:
+            self.running_nodes.append(node)
+        old_sigs = pending
+        self._last_node[id(row)] = node
+        self._remove_replaced_orphans(node, old_sigs)
         if getattr(node, "layer", "") == "task":
             self._set_task_running(row, node)
 
@@ -8793,17 +8902,18 @@ class TaskConsole(QtWidgets.QWidget):
             # saved-data action (devices=(), e.g. Readout fidelity over a folder)
             # receives None for both, so it occupies nothing and starting it can never
             # stop an unrelated live node through the device-occupancy exclusion.
-            from Zou_lab_control.neutral_atom.devices.base import ReadOnlyDevice
             from Zou_lab_control.neutral_atom.operations.logic import ProcessorRun
 
             def _borrow(role: str):
-                # A ProcessorRun DRIVES its declared roles (EXCLUSIVE), so only a DRIVABLE
-                # instance qualifies: an OBSERVE record on a running node (e.g. a camera
-                # measurement's read-only sequencer proxy) would PermissionError on the
-                # first prepare/fire -- skip those, never unwrap them.
+                # A ProcessorRun DRIVES its declared roles.  Borrow only an instance the
+                # source node itself holds EXCLUSIVE; a lifecycle/wiring record or OBSERVE
+                # reference is not a drive capability even if stored as a raw object.
                 for n in self.running_nodes:
                     dev = getattr(n, role, None)
-                    if dev is not None and not isinstance(dev, ReadOnlyDevice):
+                    occupied = tuple(
+                        getattr(n, "occupied_devices", lambda: ())()
+                    )
+                    if dev is not None and any(dev is item for item in occupied):
                         return dev
                 return None
 
@@ -8847,6 +8957,23 @@ class TaskConsole(QtWidgets.QWidget):
     def _stop_node_confirmed(self, node, *, timeout: float = 2.0) -> bool:
         """Request stop without ever translating an unknown join into success."""
 
+        fence = self._legacy_handle_fences.get(id(node)) or self._current_runtime_fence()
+        if fence is not None:
+            handle = self._legacy_handles.get(id(node)) or fence.handle_for(node)
+            if handle is not None:
+                if handle.snapshot().state.terminal:
+                    return True
+                receipt = fence.stop(node, timeout=max(0.0, float(timeout)))
+                return bool(receipt.terminated)
+            # A production console never adopts an already-running raw node.  The
+            # launcher has one explicit enrollment boundary that first calls the
+            # unmanaged helper below and then restarts through the fence.
+            return not bool(getattr(node, "running", False))
+        return self._stop_unmanaged_node_confirmed(node, timeout=timeout)
+
+    def _stop_unmanaged_node_confirmed(self, node, *, timeout: float = 2.0) -> bool:
+        """One-time migration enrollment helper; never used after fenced start."""
+
         if not self._supports_bounded_stop(node):
             return False
         budget = max(0.0, float(timeout))
@@ -8876,7 +9003,7 @@ class TaskConsole(QtWidgets.QWidget):
     ) -> bool:
         """Stop a logic node's node (``node.stop()``) and grey its dot."""
         deadline = time.monotonic() + max(0.0, float(timeout))
-        node = self._logic_nodes.get(id(row))
+        node = self._logic_nodes.get(id(row)) or self._starting_nodes.get(id(row))
         if node is not None:
             if not self._stop_node_confirmed(
                 node, timeout=max(0.0, deadline - time.monotonic())
@@ -8892,6 +9019,10 @@ class TaskConsole(QtWidgets.QWidget):
                 return False
             if node in self.running_nodes:
                 self.running_nodes.remove(node)
+            self._legacy_handles.pop(id(node), None)
+            self._legacy_handle_fences.pop(id(node), None)
+            self._pending_fenced_starts.pop(id(node), None)
+            self._starting_nodes.pop(id(row), None)
         # A task's transient Figure is part of the same ownership handoff.  Ordinary Stop/finish
         # waits for a render barrier; whole-console shutdown explicitly defers it until the central
         # RenderLoop join.  A failed barrier keeps the task row/card references so the next tick or
@@ -8931,7 +9062,11 @@ class TaskConsole(QtWidgets.QWidget):
         # retained THROUGH stop) not ``_logic_nodes`` (None'd on stop): the common flow is STOP-then-
         # REMOVE, where the live ref is already gone but the lingering hub signals are precisely the
         # ones to purge.
-        gone = self._logic_nodes.get(id(row)) or self._last_node.get(id(row))
+        gone = (
+            self._logic_nodes.get(id(row))
+            or self._starting_nodes.get(id(row))
+            or self._last_node.get(id(row))
+        )
         gone_sigs: set[str] = set()
         if gone is not None and hasattr(gone, "published_signals"):
             try:
@@ -8949,6 +9084,7 @@ class TaskConsole(QtWidgets.QWidget):
             editor.setParent(None)
             editor.deleteLater()
         self._logic_nodes.pop(id(row), None)
+        self._starting_nodes.pop(id(row), None)
         self._last_node.pop(id(row), None)
         # (No per-panel handle to drop: the panel<->analysis association is DERIVED from the row's
         # values['region'] vs the panel's persisted region_signal -- removing the row derives None,
@@ -8981,10 +9117,57 @@ class TaskConsole(QtWidgets.QWidget):
         """Each tick: reflect each running node's state on its row + Edit (a
         one-shot that finished -> stopped; a node that errored -> red)."""
         for row in self.logic_nodes:
-            node = self._logic_nodes.get(id(row))
+            node = self._logic_nodes.get(id(row)) or self._starting_nodes.get(id(row))
             if node is None:
                 continue
             editor = self._logic_editors.get(id(row))
+            fenced = self._legacy_handles.get(id(node))
+            if fenced is not None:
+                snapshot = fenced.snapshot()
+                if not fenced.started and not snapshot.state.terminal:
+                    blocked = snapshot.recovery_instruction
+                    status = f"start blocked: {blocked}" if blocked else "starting"
+                    # The Run still owns claims and can still be cancelled/recovered, so
+                    # keep Stop enabled even when the journal failure is shown as an error.
+                    row.set_state("running", status=status[:90])
+                    if editor is not None:
+                        editor.set_running(True)
+                        editor.set_status(status[:140], error=bool(blocked))
+                    continue
+                if fenced.started:
+                    self._finalize_fenced_start(row, node)
+                else:
+                    # Terminal-before-start keeps the previous stopped provider and
+                    # its lingering signals exactly as an ordinary failed start does.
+                    self._pending_fenced_starts.pop(id(node), None)
+                    self._starting_nodes.pop(id(row), None)
+                if snapshot.state.name == "CANCELLING":
+                    row.set_state("running", status="stop pending: cleanup/safety not complete")
+                    if editor is not None:
+                        editor.set_running(True)
+                        editor.set_status(
+                            "stop pending: cleanup/safety not complete", error=True
+                        )
+                    continue
+                if snapshot.state.terminal:
+                    if snapshot.state.name == "FAILED":
+                        message = snapshot.primary_error or "runtime cleanup failed"
+                        row.set_state("error", status=f"error: {message[:60]}")
+                        if editor is not None:
+                            editor.set_running(False)
+                            editor.set_status(f"error: {message}", error=True)
+                    elif snapshot.state.name == "SUCCEEDED":
+                        row.set_state("stopped", status="done")
+                        if editor is not None:
+                            editor.set_running(False)
+                            editor.set_status("done", error=False)
+                    else:
+                        row.set_state("stopped", status="stopped")
+                        if editor is not None:
+                            editor.set_running(False)
+                            editor.set_status("stopped", error=False)
+                    self._stop_logic_node(row, _silent=True, timeout=0.0)
+                    continue
             error = getattr(node, "last_error", None)
             running = bool(getattr(node, "running", False))
             finished = bool(getattr(node, "finished", False))
@@ -9507,11 +9690,16 @@ class TaskConsole(QtWidgets.QWidget):
         row_node_ids = {
             id(node)
             for row in self.logic_nodes
-            for node in (self._logic_nodes.get(id(row)),)
+            for node in (
+                self._logic_nodes.get(id(row)) or self._starting_nodes.get(id(row)),
+            )
             if node is not None
         }
         for row in list(self.logic_nodes):
-            if self._logic_nodes.get(id(row)) is not None:
+            if (
+                self._logic_nodes.get(id(row)) is not None
+                or self._starting_nodes.get(id(row)) is not None
+            ):
                 remaining = max(0.0, deadline - time.monotonic())
                 stopped = self._stop_logic_node(row, timeout=remaining) and stopped
         # Row-less injected nodes (show_task_console(running_nodes=[...])) have no row to
@@ -9549,17 +9737,22 @@ class TaskConsole(QtWidgets.QWidget):
             return True
 
         def _touches(node) -> bool:
-            return any(id(d) in affected for d in node.referenced_devices())
+            references = tuple(node.referenced_devices()) + tuple(
+                getattr(node, "lifecycle_devices", lambda: ())()
+            )
+            return any(id(d) in affected for d in references)
 
         stopped = True
         row_node_ids = {
             id(node)
             for row in self.logic_nodes
-            for node in (self._logic_nodes.get(id(row)),)
+            for node in (
+                self._logic_nodes.get(id(row)) or self._starting_nodes.get(id(row)),
+            )
             if node is not None
         }
         for row in list(self.logic_nodes):
-            node = self._logic_nodes.get(id(row))
+            node = self._logic_nodes.get(id(row)) or self._starting_nodes.get(id(row))
             if node is not None:
                 try:
                     touches = _touches(node)
@@ -9719,6 +9912,8 @@ def show_task_console(
     processors: Sequence[object] = (),
     tasks: Sequence[object] = (),
     session: object | None = None,
+    runtime_fence: object | None = None,
+    runtime_fence_provider=None,
     scale: float | None = None,
     window_ratio: float = WINDOW_SCREEN_FRACTION,
     title: str = "TaskConsole@Zou lab",
@@ -9750,7 +9945,9 @@ def show_task_console(
     if state is None and task is not None:
         state = resolve_task_state(task)
     console = TaskConsole(hub=hub, state=state, running_nodes=running_nodes, measurements=measurements,
-                          processors=processors, tasks=tasks, session=session, scale=scale,
+                          processors=processors, tasks=tasks, session=session,
+                          runtime_fence=runtime_fence,
+                          runtime_fence_provider=runtime_fence_provider, scale=scale,
                           window_ratio=window_ratio)
     console._on_close = on_close
     # A passed-in node should stream the moment the window opens -- so the Monitor
@@ -9760,8 +9957,27 @@ def show_task_console(
     # here.  (TaskConsole.__init__ deliberately does NOT do this, so
     # tests/notebooks keep deterministic manual stepping.)
     for node in running_nodes:
-        if not getattr(node, "running", False) and hasattr(node, "start"):
-            node.start()
+        if not hasattr(node, "start"):
+            continue
+        if runtime_fence is None:
+            if tuple(getattr(node, "referenced_devices", lambda: ())()):
+                raise RuntimeError(
+                    "device-bearing running_nodes require a runtime authority"
+                )
+            if not getattr(node, "running", False):
+                node.start()
+            continue
+        if getattr(node, "running", False):
+            if not console._stop_unmanaged_node_confirmed(node, timeout=2.0):
+                raise RuntimeError(
+                    "passed running node could not terminate for LegacyRuntimeFence enrollment"
+                )
+        handle = runtime_fence.start(node)
+        console._legacy_handles[id(node)] = handle
+        console._legacy_handle_fences[id(node)] = runtime_fence
+        handle.wait_started(2.0)
+        if node not in console.running_nodes:
+            console.running_nodes.append(node)
     # Closing the window must stop the node owner threads (else they keep running, blocked in
     # camera.acquire holding the camera / RPyC link, wedging the kernel).  The console is a CHILD
     # of the window so its own closeEvent never fires on a window close -- we wire the window's

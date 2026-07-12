@@ -48,10 +48,17 @@ def open_task_console(session: Any, *, task: str | None = None, **kwargs):
     reopening restores the previous interface.  Closing its window (the X) STOPS every running
     node (releasing the camera / sequencer) but keeps the layout, since the window only hides."""
 
+    unavailable = getattr(session, "_hardware_unavailable_reason", None)
+    if unavailable is not None:
+        raise RuntimeError(
+            f"{unavailable}; create a new NeutralAtomSession to re-establish hardware"
+        )
+
     from Zou_lab_control.frontend.task_console import show_task_console
 
     from .core.signals import SignalHub
 
+    runtime_services = session._require_runtime_services()
     existing = getattr(session, "_zlc_task_console", None)
     if existing is not None and _alive(existing):
         _reshow(existing.window())          # singleton: reuse + restore, never a second window
@@ -65,19 +72,12 @@ def open_task_console(session: Any, *, task: str | None = None, **kwargs):
         measurements=readout.measurement_specs(),
         processors=readout.processor_specs(),
         tasks=readout.task_specs(),
+        runtime_fence=runtime_services,
+        runtime_fence_provider=lambda: session._require_runtime_services(),
         hide_on_close=True,                 # close = stop nodes + hide (reopen restores)
         **kwargs,
     )
     session._zlc_task_console = console
-    # The console's running logic nodes are device CONSUMERS (worker threads blocking inside
-    # camera.acquire): register their stop with BOTH session seams so the threads never keep old
-    # camera / RPyC handles alive and drive closed hardware.
-    #  * teardown (full): ``exp.close()`` stops EVERY node (the whole console is going away).
-    #  * change (fine-grained): the device manager's "Load config" / a device reinit stops only
-    #    the nodes riding the SWAPPED devices, so a camera swap leaves a scan on the untouched
-    #    sequencer running (the user's requirement: don't stop unrelated work).
-    session.add_device_teardown_hook(console.stop_all_nodes)
-    session.add_device_change_hook(console.stop_nodes_using)
     return console
 
 
@@ -95,14 +95,25 @@ def open_pulse_gui(session: Any = None, *, state=None, **kwargs):
     if session is None:
         return show_pulse_gui(state=state, **kwargs)
 
+    unavailable = getattr(session, "_hardware_unavailable_reason", None)
+    if unavailable is not None:
+        raise RuntimeError(
+            f"{unavailable}; create a new NeutralAtomSession to re-establish hardware"
+        )
+
     existing = getattr(session, "_zlc_pulse_gui", None)
     if existing is not None and _alive(existing):
         _reshow(getattr(existing, "_zlc_window", None) or existing.window())
         return existing
 
+    runtime_services = session._require_runtime_services()
+    sequencer = getattr(session.devices, "sequencer", None)
+    managed_sequencer = (
+        runtime_services.pulse_facade(sequencer) if sequencer is not None else None
+    )
     editor = show_pulse_gui(
         experiment=session,
-        sequencer=getattr(session, "sequencer", None),
+        sequencer=managed_sequencer,
         state=state,
         hide_on_close=True,
         **kwargs,
@@ -202,6 +213,11 @@ def open_device_viewer(session: Any, **kwargs):
 
     # a PROVIDER (not a snapshot of the set) so a re-open re-reads the session's CURRENT devices --
     # load_config replaces session.devices, and the viewer must never hold a stale set.
+    if kwargs.get("editable", False):
+        raise RuntimeError(
+            "runtime device editing is unavailable until the typed control facade owns every write"
+        )
+    kwargs["editable"] = False
     window = show_device_viewer(devices_provider=lambda: session.devices, **kwargs)
     window.session = session
     session._zlc_device_viewer = window

@@ -59,14 +59,16 @@ def test_nodes_on_disjoint_cameras_coexist():
         exp.close()
 
 
-def test_same_camera_rows_still_exclude_each_other():
+def test_same_camera_rows_report_conflict_without_preempting_the_owner():
     exp = na.connect("virtual")
     con = make_console(exp)
     try:
         _, first = _start_camera_row(con)
-        _, second = _start_camera_row(con)                   # same default sensor -> conflict
-        assert not first.running and first not in con.running_nodes
-        assert second.running
+        second_row, _second = _start_camera_row(con)         # same default sensor -> conflict
+        con._poll_logic_nodes()
+        assert first.running and first in con.running_nodes
+        assert con._logic_nodes[id(second_row)] is None
+        assert "start failed" in second_row.status_label.text().lower()
     finally:
         con.shutdown()
         exp.close()
@@ -79,12 +81,18 @@ def test_calibration_task_stops_only_the_conflicting_camera():
     con = make_console(exp)
     try:
         _, mon = _start_camera_row(con, camera_name="monitor_camera")
-        _, main = _start_camera_row(con)
+        main_row, main = _start_camera_row(con)
         taskrow = add_logic_row(con, ("task", "Calibrate readout"))
         con._start_logic_node(taskrow)
-        task = con._logic_nodes[id(taskrow)]
+        con._poll_logic_nodes()
+        assert con._logic_nodes[id(taskrow)] is None
+        assert main.running and main in con.running_nodes
+        assert mon.running and mon in con.running_nodes
+
+        assert con._stop_logic_node(main_row)
+        con._start_logic_node(taskrow)
+        task = con._logic_nodes.get(id(taskrow)) or con._starting_nodes.get(id(taskrow))
         assert task is not None
-        assert not main.running and main not in con.running_nodes   # shares the main camera
         assert mon.running and mon in con.running_nodes             # disjoint hardware -> survives
         devs = set(task.occupied_devices())
         assert exp.devices["camera"] in devs and exp.devices.sequencer in devs
@@ -94,28 +102,18 @@ def test_calibration_task_stops_only_the_conflicting_camera():
         exp.close()
 
 
-def test_observe_declaration_narrows_to_a_read_only_view():
-    """Declaration-as-capability: CameraMeasurement declares ``sequencer`` OBSERVE, so the
-    attribute IS the read-only view -- whitelisted reads pass through, driving or mutating
-    raises PermissionError -- while the EXCLUSIVE ``camera`` stays the raw device (the node
-    must drive it) and is the node's sole occupancy claim."""
-    import pytest
-
+def test_camera_trigger_wire_is_lifecycle_dependency_not_host_observation():
+    """The camera node never calls the sequencer API; it only rides its trigger wire."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.devices.base import ReadOnlyDevice
     from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
 
     exp = na.connect("virtual")
     try:
         node = CameraMeasurement(SignalHub(), exp.devices.camera, sequencer=exp.devices.sequencer)
-        assert isinstance(node.sequencer, ReadOnlyDevice)             # narrowed, not the raw device
-        assert node.sequencer.firing == exp.devices.sequencer.firing  # whitelisted read passes through
-        with pytest.raises(PermissionError):
-            node.sequencer.fire()                                     # driving an observed device
-        with pytest.raises(PermissionError):
-            node.sequencer.sleep_scale = 0.0                          # mutating an observed device
-        assert node.camera is exp.devices.camera                      # EXCLUSIVE = the raw device...
-        assert set(node.occupied_devices()) == {exp.devices.camera}   # ...and the only claim
+        assert node.sequencer is exp.devices.sequencer
+        assert set(node.occupied_devices()) == {exp.devices.camera}
+        assert set(node.referenced_devices()) == {exp.devices.camera}
+        assert set(node.lifecycle_devices()) == {exp.devices.sequencer}
     finally:
         exp.close()
 
@@ -165,19 +163,16 @@ def test_saved_dir_one_shot_neither_borrows_devices_nor_stops_live_nodes():
 
 def test_hardware_declaring_one_shot_borrows_only_drivable_devices():
     """A one-shot spec that DOES declare ctx roles receives the running nodes' device
-    instances -- but only DRIVABLE ones: a running CameraMeasurement records its sequencer
-    as an OBSERVE read-only proxy, which a ProcessorRun (EXCLUSIVE driver) must never be
-    handed (the first prepare/fire would PermissionError).  The read-only record is skipped,
-    never unwrapped."""
+    instances -- but only DRIVABLE ones.  CameraMeasurement's sequencer is trigger wiring,
+    not an EXCLUSIVE capability, so ProcessorRun must not borrow it."""
     from Zou_lab_control.frontend.task_console import LogicNodeConfig
-    from Zou_lab_control.neutral_atom.devices.base import ReadOnlyDevice
     from Zou_lab_control.neutral_atom.operations.processor import ProcessorSpec
 
     exp = na.connect("virtual")
     con = make_console(exp)
     try:
         _, cam = _start_camera_row(con)
-        assert isinstance(cam.sequencer, ReadOnlyDevice)          # the OBSERVE record (precondition)
+        assert cam.sequencer is exp.devices.sequencer
         live_spec = ProcessorSpec(name="Live grab probe", params=(), run=lambda ctx: {"ok": 1.0},
                                   result_keys=("ok",), devices=("camera", "sequencer"))
         con.processors.append(live_spec)
@@ -185,27 +180,24 @@ def test_hardware_declaring_one_shot_borrows_only_drivable_devices():
                                   focus=False)
         built = con._build_logic_node(row.node, {})
         assert built.camera is exp.devices["camera"]              # declared role -> the drivable instance
-        assert built.sequencer is None                            # the read-only proxy was skipped,
-        assert not isinstance(built.sequencer, ReadOnlyDevice)    # never passed through
+        assert built.sequencer is None                            # wiring record is not borrowed
         assert set(built.occupied_devices()) == {exp.devices["camera"]}   # honest claim = what it holds
     finally:
         con.shutdown()
         exp.close()
 
 
-def test_referenced_devices_covers_observe_records_unwrapped():
-    """``referenced_devices`` is the SUPERSET of ``occupied_devices``: it names the OBSERVE
-    records too, unwrapped to real identity.  A passive CameraMeasurement OCCUPIES only its
-    camera (EXCLUSIVE), but REFERENCES both the camera and the sequencer it observes -- so the
-    sequencer being reinitialised must be able to find and stop it."""
+def test_runtime_and_lifecycle_device_sets_are_distinct():
+    """Trigger wiring participates in generation replacement, not resource arbitration."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
     from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
 
     exp = na.connect("virtual")
     try:
         node = CameraMeasurement(SignalHub(), exp.devices.camera, sequencer=exp.devices.sequencer)
-        assert set(node.occupied_devices()) == {exp.devices.camera}              # EXCLUSIVE only
-        assert set(node.referenced_devices()) == {exp.devices.camera, exp.devices.sequencer}
+        assert set(node.occupied_devices()) == {exp.devices.camera}
+        assert set(node.referenced_devices()) == {exp.devices.camera}
+        assert set(node.lifecycle_devices()) == {exp.devices.sequencer}
     finally:
         exp.close()
 
@@ -237,17 +229,16 @@ def test_swapping_one_device_stops_only_its_nodes_exclusive_and_observe():
 
 
 def test_load_config_swap_stops_referencing_console_nodes_end_to_end():
-    """End-to-end through the REAL session seam: a running camera view is stopped when
-    ``load_config`` rebuilds the devices (the device manager's Apply path), because the console
-    registered ``stop_nodes_using`` as the session's device-change hook."""
+    """The runtime stops the old owner; the GUI only reconciles its terminal handle."""
     exp = na.connect("virtual")
     con = make_console(exp)
     try:
-        exp.add_device_change_hook(con.stop_nodes_using)   # what open_task_console wires
         _, cam = _start_camera_row(con)
         assert cam.running
         exp.load_config("virtual")                         # full rebuild -> every device swapped
+        con._poll_logic_nodes()                             # presentation-only Qt reconciliation
         assert not cam.running and cam not in con.running_nodes
+        assert con._current_runtime_fence() is exp._zlc_runtime_services
     finally:
         con.shutdown()
         exp.close()
