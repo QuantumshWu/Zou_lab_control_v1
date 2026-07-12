@@ -279,8 +279,6 @@ class PulseDocument:
 
     @classmethod
     def load(cls, path: str | Path) -> "PulseDocument":
-        from .legacy import load_pulse_document
-
         return load_pulse_document(path)
 
 
@@ -413,6 +411,14 @@ def save_pulse_document(document: PulseDocument, path: str | Path) -> Path:
     return destination
 
 
+def load_pulse_document(path: str | Path) -> PulseDocument:
+    source = Path(path)
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"pulse JSON in {source} must contain one object")
+    return pulse_document_from_tree(payload)
+
+
 def _period_to_tree(value: PulsePeriod) -> dict[str, object]:
     return {
         "duration": value.duration,
@@ -481,6 +487,7 @@ __all__ = [
     "SCAN_KINDS",
     "ScanSlot",
     "TIME_UNITS",
+    "load_pulse_document",
     "pulse_document_from_tree",
     "pulse_document_to_tree",
     "save_pulse_document",

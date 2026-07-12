@@ -1,10 +1,8 @@
 {
-  "schema": "Zou_lab_control.neutral_atom.PulseTableState",
-  "version": 4,
+  "schema": "zlc_pulse.PulseDocument/v1",
   "name": "camera_imaging_address_switch",
-  "port_catalog": {
-    "schema": "Zou_lab_control.neutral_atom.PortCatalog",
-    "version": 1,
+  "target": {
+    "schema": "zlc_pulse.PulseTarget/v1",
     "raw_lanes": [
       "ch00",
       "ch01",
@@ -445,21 +443,8 @@
         "latch_clock": null
       }
     ],
-    "fingerprint": "287d252a3521823f"
+    "abi_fingerprint": "d9ce9aea5da7380f0670ee89c5f936f5f32edfc00c98939b4dd06af32a8563c9"
   },
-  "scan_slots": [
-    {
-      "name": "exposure",
-      "kind": "duration",
-      "target": "3",
-      "label": "exposure",
-      "unit": "ns",
-      "nominal": 19980000.0
-    }
-  ],
-  "scan_table": [],
-  "scan_code": "",
-  "api_slots": [],
   "time_step_ns": 20.0,
   "periods": [
     {
@@ -671,7 +656,7 @@
     },
     {
       "duration": "s0",
-      "unit": "str (ns)",
+      "unit": "ns",
       "name": "camera_exposure",
       "states": [
         0,
@@ -808,18 +793,32 @@
       ]
     }
   ],
+  "scan_slots": [
+    {
+      "name": "exposure",
+      "kind": "duration",
+      "target": "3",
+      "label": "exposure",
+      "unit": "ns",
+      "nominal": 19980000.0
+    }
+  ],
+  "scan_table": [],
+  "scan_code": "",
+  "api_slots": [],
   "visible_ports": [
     "ch09",
     "ch00",
     "ch03",
     "ch11"
   ],
-  "analog_bus_modes": {},
-  "delays": {},
-  "delay_units": {},
-  "repeat_start": null,
-  "repeat_end": null,
-  "repeat_count": 1,
-  "repeat_forever": true,
+  "analog_bus_programs": [],
+  "delays": [],
+  "repeat": {
+    "start": null,
+    "end": null,
+    "count": 1,
+    "forever": true
+  },
   "scan_repeats": 0
 }

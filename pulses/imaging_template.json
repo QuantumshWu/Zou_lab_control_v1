@@ -1,10 +1,8 @@
 {
-  "schema": "Zou_lab_control.neutral_atom.PulseTableState",
-  "version": 4,
+  "schema": "zlc_pulse.PulseDocument/v1",
   "name": "imaging_template",
-  "port_catalog": {
-    "schema": "Zou_lab_control.neutral_atom.PortCatalog",
-    "version": 1,
+  "target": {
+    "schema": "zlc_pulse.PulseTarget/v1",
     "raw_lanes": [
       "trap",
       "cooling",
@@ -359,31 +357,8 @@
         "latch_clock": null
       }
     ],
-    "fingerprint": "191b700db7d12e77"
+    "abi_fingerprint": "005f432a1096c882839f5d685a1d9454c151361bb2a1de4b6cc0b450ed0462a3"
   },
-  "scan_slots": [],
-  "scan_table": [],
-  "scan_code": "",
-  "api_slots": [
-    {
-      "name": "a1",
-      "kind": "duration",
-      "target": "1",
-      "unit": "s"
-    },
-    {
-      "name": "a2",
-      "kind": "duration",
-      "target": "3",
-      "unit": "s"
-    },
-    {
-      "name": "a3",
-      "kind": "duration",
-      "target": "5",
-      "unit": "s"
-    }
-  ],
   "time_step_ns": 20.0,
   "periods": [
     {
@@ -579,18 +554,42 @@
       ]
     }
   ],
+  "scan_slots": [],
+  "scan_table": [],
+  "scan_code": "",
+  "api_slots": [
+    {
+      "name": "a1",
+      "kind": "duration",
+      "target": "1",
+      "unit": "s"
+    },
+    {
+      "name": "a2",
+      "kind": "duration",
+      "target": "3",
+      "unit": "s"
+    },
+    {
+      "name": "a3",
+      "kind": "duration",
+      "target": "5",
+      "unit": "s"
+    }
+  ],
   "visible_ports": [
     "trap",
     "cooling",
     "probe",
     "emCCD"
   ],
-  "analog_bus_modes": {},
-  "delays": {},
-  "delay_units": {},
-  "repeat_start": null,
-  "repeat_end": null,
-  "repeat_count": 1,
-  "repeat_forever": true,
+  "analog_bus_programs": [],
+  "delays": [],
+  "repeat": {
+    "start": null,
+    "end": null,
+    "count": 1,
+    "forever": true
+  },
   "scan_repeats": 0
 }

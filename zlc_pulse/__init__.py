@@ -7,11 +7,11 @@ from .document import (
     PulseDocument,
     PulsePeriod,
     ScanSlot,
+    load_pulse_document,
     pulse_document_from_tree,
     pulse_document_to_tree,
     save_pulse_document,
 )
-from .legacy import load_pulse_document
 from .binding import bind_pulse_document_target
 from .client import PulseServerSnapshot, RemotePulseExecutionClient, pulse_server_snapshot_from_tree
 from .ir import (

@@ -1,10 +1,8 @@
 {
-  "schema": "Zou_lab_control.neutral_atom.PulseTableState",
-  "version": 4,
+  "schema": "zlc_pulse.PulseDocument/v1",
   "name": "mot_field_scan",
-  "port_catalog": {
-    "schema": "Zou_lab_control.neutral_atom.PortCatalog",
-    "version": 1,
+  "target": {
+    "schema": "zlc_pulse.PulseTarget/v1",
     "raw_lanes": [
       "trap",
       "cooling",
@@ -179,8 +177,107 @@
         "latch_clock": null
       }
     ],
-    "fingerprint": "b7743d9e18950ce9"
+    "abi_fingerprint": "270b0f2174f012392e59b818bca0d4179f49dde878e7fd9372464566dcd8f89b"
   },
+  "time_step_ns": 20.0,
+  "periods": [
+    {
+      "duration": "100000000",
+      "unit": "ns",
+      "name": "settle",
+      "states": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "duration": "100000",
+      "unit": "ns",
+      "name": "",
+      "states": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "duration": "50000000",
+      "unit": "ns",
+      "name": "expose",
+      "states": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    }
+  ],
   "scan_slots": [
     {
       "name": "da_x",
@@ -216,97 +313,71 @@
   ],
   "scan_code": "",
   "api_slots": [],
-  "time_step_ns": 20.0,
-  "periods": [
-    {
-      "duration": "100000000",
-      "unit": "ns",
-      "name": "settle",
-      "states": [
-        0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 1,
-        0, 0, 0, 0, 0, 1,
-        0, 0, 0, 0, 0, 1
-      ]
-    },
-    {
-      "duration": "100000",
-      "unit": "ns",
-      "name": "",
-      "states": [
-        0, 0, 0, 0, 0, 0, 1,
-        0, 0, 0, 0, 0, 1,
-        0, 0, 0, 0, 0, 1,
-        0, 0, 0, 0, 0, 1
-      ]
-    },
-    {
-      "duration": "50000000",
-      "unit": "ns",
-      "name": "expose",
-      "states": [
-        0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 1,
-        0, 0, 0, 0, 0, 1,
-        0, 0, 0, 0, 0, 1
-      ]
-    }
-  ],
   "visible_ports": [
     "camera_trigger",
     "da_x",
     "da_y",
     "da_z"
   ],
-  "analog_bus_modes": {
-    "da_x": [
-      {
-        "mode": "edge",
-        "value": "s0"
-      },
-      {
-        "mode": "hold",
-        "value": null
-      },
-      {
-        "mode": "hold",
-        "value": null
-      }
-    ],
-    "da_y": [
-      {
-        "mode": "edge",
-        "value": "s1"
-      },
-      {
-        "mode": "hold",
-        "value": null
-      },
-      {
-        "mode": "hold",
-        "value": null
-      }
-    ],
-    "da_z": [
-      {
-        "mode": "edge",
-        "value": "s2"
-      },
-      {
-        "mode": "hold",
-        "value": null
-      },
-      {
-        "mode": "hold",
-        "value": null
-      }
-    ]
+  "analog_bus_programs": [
+    {
+      "port": "da_x",
+      "steps": [
+        {
+          "mode": "edge",
+          "value": "s0"
+        },
+        {
+          "mode": "hold",
+          "value": null
+        },
+        {
+          "mode": "hold",
+          "value": null
+        }
+      ]
+    },
+    {
+      "port": "da_y",
+      "steps": [
+        {
+          "mode": "edge",
+          "value": "s1"
+        },
+        {
+          "mode": "hold",
+          "value": null
+        },
+        {
+          "mode": "hold",
+          "value": null
+        }
+      ]
+    },
+    {
+      "port": "da_z",
+      "steps": [
+        {
+          "mode": "edge",
+          "value": "s2"
+        },
+        {
+          "mode": "hold",
+          "value": null
+        },
+        {
+          "mode": "hold",
+          "value": null
+        }
+      ]
+    }
+  ],
+  "delays": [],
+  "repeat": {
+    "start": null,
+    "end": null,
+    "count": 1,
+    "forever": true
   },
-  "delays": {},
-  "delay_units": {},
-  "repeat_start": null,
-  "repeat_end": null,
-  "repeat_count": 1,
-  "repeat_forever": true,
   "scan_repeats": 0
 }
