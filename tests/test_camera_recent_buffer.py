@@ -15,6 +15,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
@@ -82,6 +83,104 @@ def test_real_camera_inherits_the_same_buffer():
         assert getattr(QCMOSCamera, name) is getattr(CameraDevice, name), (
             f"QCMOSCamera overrides {name}; the recent-frames buffer must stay single-source on the base"
         )
+
+
+def _record(image_value, ordinal, *, produced_count=None):
+    from Zou_lab_control.neutral_atom.devices.base import CameraFrameRecord
+
+    return CameraFrameRecord(
+        image=np.full((2, 2), image_value, dtype=np.float64),
+        source_ordinal=ordinal,
+        produced_count=(ordinal + 1 if produced_count is None else produced_count),
+        frame_stamp=None,
+        camera_stamp=None,
+        timestamp_seconds=None,
+        timestamp_microseconds=None,
+        host_received_at_ns=1_000 + ordinal,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("source_ordinal", 1.5, TypeError),
+        ("source_ordinal", True, TypeError),
+        ("source_ordinal", -1, ValueError),
+        ("timestamp_microseconds", 1_000_000, ValueError),
+        ("host_received_at_ns", 1.5, TypeError),
+        ("host_received_at_ns", 0, ValueError),
+    ],
+)
+def test_camera_frame_record_rejects_ambiguous_metadata(field, value, error):
+    from Zou_lab_control.neutral_atom.devices.base import CameraFrameRecord
+
+    kwargs = dict(
+        image=np.zeros((2, 2)),
+        source_ordinal=0,
+        produced_count=1,
+        frame_stamp=None,
+        camera_stamp=None,
+        timestamp_seconds=0,
+        timestamp_microseconds=0,
+        host_received_at_ns=1,
+    )
+    kwargs[field] = value
+    with pytest.raises(error):
+        CameraFrameRecord(**kwargs)
+
+
+def test_record_and_array_readers_consume_one_armed_session_queue():
+    """The transitional ndarray reader is a view of the record queue, not a fork."""
+
+    cam, _seqr = _rig()
+    cam.arm(2)
+    try:
+        cam._deliver_records([_record(1.0, 0), _record(2.0, 1)])
+        first = cam.read_frame_records(1)
+        second = cam.read_frames(1)
+    finally:
+        cam.disarm()
+
+    assert [record.source_ordinal for record in first] == [0]
+    np.testing.assert_array_equal(first[0].image, np.full((2, 2), 1.0))
+    assert len(second) == 1
+    np.testing.assert_array_equal(second[0], np.full((2, 2), 2.0))
+    assert not cam._recent_state()["pending"]
+
+
+def test_record_batch_overrun_is_atomic_and_never_overwrites_pending_frames():
+    from Zou_lab_control.neutral_atom.devices.base import CameraBufferOverrun
+
+    cam, _seqr = _rig()
+    cam.arm(2)
+    try:
+        with pytest.raises(CameraBufferOverrun, match="arm budget"):
+            cam._deliver_records(
+                [_record(1.0, 0), _record(2.0, 1), _record(3.0, 2)]
+            )
+        state = cam._recent_state()
+        assert list(state["pending"]) == []
+        assert state["source_ordinal"] == 0
+        assert cam.recent_frame_records() == []
+    finally:
+        cam.disarm()
+
+
+def test_record_gap_is_atomic_and_preserves_existing_pending_data():
+    from Zou_lab_control.neutral_atom.devices.base import CameraBufferOverrun
+
+    cam, _seqr = _rig()
+    cam.arm(3)
+    try:
+        cam._deliver_records([_record(1.0, 0)])
+        with pytest.raises(CameraBufferOverrun, match="differs from expected 1"):
+            cam._deliver_records([_record(3.0, 2)])
+        state = cam._recent_state()
+        assert [record.source_ordinal for record in state["pending"]] == [0]
+        assert state["source_ordinal"] == 1
+        assert [record.source_ordinal for record in cam.recent_frame_records()] == [0]
+    finally:
+        cam.disarm()
 
 
 def test_lazy_state_and_lock_are_created_once_atomically():

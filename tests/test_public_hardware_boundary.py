@@ -42,6 +42,8 @@ def test_ordinary_neutral_atom_umbrella_has_no_raw_hardware(name):
 
 def test_adapter_sdk_has_contracts_but_no_concrete_or_registry_escape():
     assert adapter_sdk.CameraDevice is not None
+    assert adapter_sdk.CameraBufferOverrun is not None
+    assert adapter_sdk.CameraFrameRecord is not None
     assert adapter_sdk.SequencerDevice is not None
     for forbidden in (
         "QCMOSCamera",

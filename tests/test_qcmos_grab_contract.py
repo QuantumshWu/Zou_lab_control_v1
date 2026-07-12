@@ -387,3 +387,55 @@ def test_grab_within_ring_depth_does_not_raise():
     cam = _grab_camera(api, dcam)
     got = _read_via_contract(cam, 4, 2, timeout=0.3)
     assert len(got) == 2
+
+
+def test_qcmos_preserves_dcam_metadata_in_immutable_frame_records():
+    """The adapter must not throw away DCAMBUF_FRAME provenance.
+
+    ``nFrameCount`` is a transfer-time cumulative snapshot, so both records
+    drained from one availability observation deliberately carry the same
+    ``produced_count=2``.  It is not fabricated into per-frame 1, 2 values.
+    """
+
+    api = _FakeApi()
+    api.initialised = True
+
+    class _MetadataDcam(_FakeDcam):
+        def __init__(self, owner_api):
+            super().__init__(owner_api, frames_ready=[True], ring=[2])
+            self.returned_pixels = {}
+
+        def buf_getframedata(self, index):
+            pixels = np.full((2, 3), 10.0 + float(index))
+            self.returned_pixels[index] = pixels
+            frame_info = types.SimpleNamespace(
+                framestamp=100 + index,
+                camerastamp=200 + index,
+                timestamp=types.SimpleNamespace(sec=300 + index, microsec=400 + index),
+            )
+            return frame_info, pixels
+
+    dcam = _MetadataDcam(api)
+    cam = _grab_camera(api, dcam)
+    cam.arm(2)
+    try:
+        records = cam.read_frame_records(2, timeout=0.3)
+    finally:
+        cam.disarm()
+
+    assert [record.source_ordinal for record in records] == [0, 1]
+    assert [record.produced_count for record in records] == [2, 2]
+    assert [record.frame_stamp for record in records] == [100, 101]
+    assert [record.camera_stamp for record in records] == [200, 201]
+    assert [record.timestamp_seconds for record in records] == [300, 301]
+    assert [record.timestamp_microseconds for record in records] == [400, 401]
+    assert [record.driver_buffer_index for record in records] == [0, 1]
+    assert all(record.host_received_at_ns > 0 for record in records)
+    assert all(not record.image.flags.writeable for record in records)
+
+    # The DCAM wrapper/ring may reuse its source array immediately after drain.
+    # Published records own their bytes and must remain unchanged.
+    dcam.returned_pixels[0][:] = -1
+    dcam.returned_pixels[1][:] = -1
+    np.testing.assert_array_equal(records[0].image, np.full((2, 3), 10.0))
+    np.testing.assert_array_equal(records[1].image, np.full((2, 3), 11.0))

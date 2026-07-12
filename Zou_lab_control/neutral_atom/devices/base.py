@@ -191,6 +191,83 @@ class AcquisitionCancelled(Exception):
     recorded error / banner."""
 
 
+class CameraBufferOverrun(RuntimeError):
+    """A captured frame could not be retained without overwriting authority data."""
+
+
+@dataclass(frozen=True, eq=False)
+class CameraFrameRecord:
+    """One immutable frame plus the source metadata observed with it.
+
+    ``source_ordinal`` is zero-based within the current arm epoch.  Hardware
+    stamps are optional because not every camera exposes them; absence is explicit
+    and never fabricated from array position.  ``produced_count`` is the source's
+    cumulative count snapshot when the frame was drained, when available.
+    """
+
+    image: np.ndarray
+    source_ordinal: int
+    produced_count: int | None
+    frame_stamp: int | None
+    camera_stamp: int | None
+    timestamp_seconds: int | None
+    timestamp_microseconds: int | None
+    host_received_at_ns: int
+    driver_buffer_index: int | None = None
+    __hash__ = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.source_ordinal, bool) or not isinstance(
+            self.source_ordinal, (int, np.integer)
+        ):
+            raise TypeError("source_ordinal must be a non-negative integer")
+        ordinal = int(self.source_ordinal)
+        if ordinal < 0:
+            raise ValueError("source_ordinal must be a non-negative integer")
+        object.__setattr__(self, "source_ordinal", ordinal)
+        for name in (
+            "produced_count",
+            "frame_stamp",
+            "camera_stamp",
+            "timestamp_seconds",
+            "timestamp_microseconds",
+            "driver_buffer_index",
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise TypeError(f"{name} must be an integer or None")
+            value = int(value)
+            if name in {
+                "produced_count",
+                "timestamp_seconds",
+                "timestamp_microseconds",
+                "driver_buffer_index",
+            } and value < 0:
+                raise ValueError(f"{name} must be non-negative")
+            if name == "timestamp_microseconds" and value >= 1_000_000:
+                raise ValueError("timestamp_microseconds must be less than 1_000_000")
+            object.__setattr__(self, name, value)
+        if isinstance(self.host_received_at_ns, bool) or not isinstance(
+            self.host_received_at_ns, (int, np.integer)
+        ):
+            raise TypeError("host_received_at_ns must be a positive integer")
+        received = int(self.host_received_at_ns)
+        if received <= 0:
+            raise ValueError("host_received_at_ns must be positive")
+        object.__setattr__(self, "host_received_at_ns", received)
+        image = np.array(self.image, copy=True, order="C")
+        image.setflags(write=False)
+        object.__setattr__(self, "image", image)
+
+    @property
+    def captured_at(self) -> float:
+        if self.timestamp_seconds is not None and self.timestamp_microseconds is not None:
+            return float(self.timestamp_seconds) + float(self.timestamp_microseconds) * 1e-6
+        return float(self.host_received_at_ns) * 1e-9
+
+
 class BaseDevice(ABC):
     """Common device lifecycle.
 
@@ -563,7 +640,7 @@ class CameraDevice(BaseDevice):
     to -- a PASSIVE fact it exposes upward, never used to control the sequencer.
 
     Frame-loss protection is a DEVICE-OWNED buffer: every frame that arrives while the
-    camera is armed is queued LOSSLESSLY (unbounded ``pending`` queue) until
+    camera is armed is queued in a predeclared bounded ``pending`` queue until
     :meth:`read_frames` consumes it, so a fire that lands before the consumer starts
     reading ("late consumption") drops nothing.  Independently, a small RECENT-FRAMES ring
     (``recent_capacity``) keeps the newest frames for live viewers (:meth:`drain` /
@@ -795,6 +872,10 @@ class CameraDevice(BaseDevice):
             state["pending"].clear()
             state["armed"] = True
             state["armed_frames"] = frames
+            state["pending_capacity"] = (
+                int(frames) if frames is not None else max(1, int(self.recent_capacity))
+            )
+            state["source_ordinal"] = 0
         try:
             self._arm(frames)
         except BaseException:
@@ -803,6 +884,46 @@ class CameraDevice(BaseDevice):
                 state["pending"].clear()
             self._acquire_lock().release()
             raise
+
+    def _read_frame_records(
+        self,
+        n: int = 1,
+        *,
+        timeout: float | None = None,
+        stop=None,
+        **kwargs,
+    ) -> list[CameraFrameRecord]:
+        """Consume records from the sole armed-session queue."""
+
+        n = positive_int(n, "n")
+        state = self._recent_state()
+        if not state["armed"]:
+            raise RuntimeError(
+                "read_frame_records() requires arm() first; use acquire_records() "
+                "for a one-shot that arms internally."
+            )
+        out: list[CameraFrameRecord] = []
+        while len(out) < n:
+            with state["cond"]:
+                while state["pending"] and len(out) < n:
+                    out.append(state["pending"].popleft())
+            if len(out) >= n:
+                break
+            if not self._grab(n - len(out), timeout=timeout, stop=stop, **kwargs):
+                break
+        return out
+
+    def read_frame_records(
+        self,
+        n: int = 1,
+        *,
+        timeout: float | None = None,
+        stop=None,
+        **kwargs,
+    ) -> list[CameraFrameRecord]:
+        """Return immutable frame records including all adapter metadata."""
+
+        return self._read_frame_records(n, timeout=timeout, stop=stop, **kwargs)
 
     def read_frames(self, n: int = 1, *, timeout: float | None = None, stop=None, **kwargs) -> list[np.ndarray]:
         """Blockingly consume ``n`` frames from the device's own buffer (one numpy array each).
@@ -821,22 +942,12 @@ class CameraDevice(BaseDevice):
         ``_grab`` (e.g. the virtual trigger wire during a continuous firing) reports "more will
         arrive" -- an unbounded live-lock.  So an unarmed read is a programming error, raised
         loudly; use :meth:`acquire` for a one-shot (it arms internally)."""
-        n = positive_int(n, "n")
-        state = self._recent_state()
-        if not state["armed"]:
-            raise RuntimeError(
-                "read_frames() requires arm() first (the primitives are arm -> read -> disarm); "
-                "use acquire() for a one-shot that arms internally.")
-        out: list[np.ndarray] = []
-        while len(out) < n:
-            with state["cond"]:
-                while state["pending"] and len(out) < n:
-                    out.append(state["pending"].popleft())
-            if len(out) >= n:
-                break
-            if not self._grab(n - len(out), timeout=timeout, stop=stop, **kwargs):
-                break
-        return out
+        return [
+            record.image
+            for record in self._read_frame_records(
+                n, timeout=timeout, stop=stop, **kwargs
+            )
+        ]
 
     def disarm(self) -> None:
         """Stand the camera down and release the acquisition lock taken by :meth:`arm`."""
@@ -864,6 +975,18 @@ class CameraDevice(BaseDevice):
         self.arm(frames, stop=stop)          # cancellable arm too, so a Stop breaks a lock wait
         try:
             return self.read_frames(frames, stop=stop, **kwargs)
+        finally:
+            self.disarm()
+
+    def acquire_records(
+        self, frames: int = 1, *, stop=None, **kwargs
+    ) -> list[CameraFrameRecord]:
+        """One-shot acquisition preserving source metadata."""
+
+        frames = positive_int(frames, "frames")
+        self.arm(frames, stop=stop)
+        try:
+            return self.read_frame_records(frames, stop=stop, **kwargs)
         finally:
             self.disarm()
 
@@ -905,16 +1028,18 @@ class CameraDevice(BaseDevice):
         the SAME state, never two divergent buffers with acquisitions serialised against
         different locks.  The loser's freshly-built dict is discarded (harmless -- it holds
         no frames yet)."""
-        lock = threading.Lock()
+        lock = threading.RLock()
         fresh = {
             "frames": deque(maxlen=max(1, int(self.recent_capacity))),
             "lock": lock,
             "cond": threading.Condition(lock),
             "seq": 0,        # total frames ever retained
             "cursor": 0,     # drain watermark
-            "pending": deque(),  # LOSSLESS armed-session queue read_frames consumes
+            "pending": deque(),  # bounded CameraFrameRecord queue
             "armed": False,
             "armed_frames": None,
+            "pending_capacity": max(1, int(self.recent_capacity)),
+            "source_ordinal": 0,
         }
         return self.__dict__.setdefault("_zlc_recent", fresh)
 
@@ -965,41 +1090,116 @@ class CameraDevice(BaseDevice):
         armed) AND the recent-frames ring, then wake any waiting reader.  The ONE entry
         point every frame source uses (a real backend's grab hook, the virtual trigger
         wire), so buffering behaviour cannot drift between backends."""
-        state = self._recent_state()
         arrs = [np.asarray(image) for image in images]
+        state = self._recent_state()
+        with state["cond"]:
+            start = int(state["source_ordinal"] if state["armed"] else state["seq"])
+            records = [
+                CameraFrameRecord(
+                    image=image,
+                    source_ordinal=start + index,
+                    produced_count=start + index + 1,
+                    frame_stamp=None,
+                    camera_stamp=None,
+                    timestamp_seconds=None,
+                    timestamp_microseconds=None,
+                    host_received_at_ns=time.time_ns(),
+                )
+                for index, image in enumerate(arrs)
+            ]
+            return [record.image for record in self._deliver_records(records)]
+
+    def _deliver_records(
+        self, records
+    ) -> list[CameraFrameRecord]:
+        """Atomically retain typed records and enforce the arm-epoch budget."""
+
+        normalized = [
+            record
+            if isinstance(record, CameraFrameRecord)
+            else CameraFrameRecord(**dict(record))
+            for record in records
+        ]
+        state = self._recent_state()
         with state["cond"]:
             if state["armed"]:
-                state["pending"].extend(arrs)
-            self._retain_locked(state, arrs)
+                expected = int(state["source_ordinal"])
+                for record in normalized:
+                    if record.source_ordinal != expected:
+                        raise CameraBufferOverrun(
+                            f"camera source ordinal {record.source_ordinal} differs from "
+                            f"expected {expected}"
+                        )
+                    expected += 1
+                budget = state["armed_frames"]
+                if budget is not None and expected > int(budget):
+                    raise CameraBufferOverrun(
+                        f"camera produced {expected} frames for an arm budget of {budget}"
+                    )
+                if len(state["pending"]) + len(normalized) > int(
+                    state["pending_capacity"]
+                ):
+                    raise CameraBufferOverrun(
+                        "camera pending retention capacity exhausted before the consumer drained it"
+                    )
+                state["pending"].extend(normalized)
+                state["source_ordinal"] = expected
+            self._retain_locked(state, normalized)
             state["cond"].notify_all()
-        return arrs
+        return normalized
 
     @staticmethod
-    def _retain_locked(state: dict, images) -> None:
+    def _retain_locked(state: dict, records) -> None:
         """Append frames to the recent ring; caller holds ``state['lock']``."""
-        for image in images:
-            state["frames"].append(np.asarray(image))
+        for record in records:
+            if not isinstance(record, CameraFrameRecord):
+                raise TypeError("camera retention accepts CameraFrameRecord values")
+            state["frames"].append(record)
             state["seq"] += 1
 
     def _retain(self, images) -> Any:
         """Append frames to the recent-frames ring only (thread-safe); returns ``images``."""
+        arrs = [np.asarray(image) for image in images]
         state = self._recent_state()
         with state["lock"]:
-            self._retain_locked(state, images)
-        return images
+            start = int(state["seq"])
+            records = [
+                CameraFrameRecord(
+                    image=image,
+                    source_ordinal=start + index,
+                    produced_count=start + index + 1,
+                    frame_stamp=None,
+                    camera_stamp=None,
+                    timestamp_seconds=None,
+                    timestamp_microseconds=None,
+                    host_received_at_ns=time.time_ns(),
+                )
+                for index, image in enumerate(arrs)
+            ]
+            self._retain_locked(state, records)
+        return [record.image for record in records]
 
     def recent_frames(self, n: int | None = None) -> list[np.ndarray]:
         """The most-recent retained frames (newest last); all of them when ``n`` is None."""
         state = self._recent_state()
         with state["lock"]:
-            frames = list(state["frames"])
-        return frames if n is None else frames[-int(n):]
+            records = list(state["frames"])
+        records = records if n is None else records[-int(n):]
+        return [record.image for record in records]
+
+    def recent_frame_records(
+        self, n: int | None = None
+    ) -> list[CameraFrameRecord]:
+        state = self._recent_state()
+        with state["lock"]:
+            records = list(state["frames"])
+        return records if n is None else records[-int(n):]
 
     def latest(self) -> np.ndarray | None:
         """The single newest retained frame, or None if nothing has been acquired."""
         state = self._recent_state()
         with state["lock"]:
-            return state["frames"][-1] if state["frames"] else None
+            return state["frames"][-1].image if state["frames"] else None
 
     def drain(self) -> list[np.ndarray]:
         """Every frame retained since the previous ``drain`` (lossless up to capacity).
@@ -1008,10 +1208,18 @@ class CameraDevice(BaseDevice):
         so a multi-trigger shot's extra frames are never dropped on the floor."""
         state = self._recent_state()
         with state["lock"]:
-            frames = list(state["frames"])
-            n_new = max(0, min(len(frames), state["seq"] - state["cursor"]))
+            records = list(state["frames"])
+            n_new = max(0, min(len(records), state["seq"] - state["cursor"]))
             state["cursor"] = state["seq"]
-            return frames[-n_new:] if n_new else []
+            return [record.image for record in records[-n_new:]] if n_new else []
+
+    def drain_frame_records(self) -> list[CameraFrameRecord]:
+        state = self._recent_state()
+        with state["lock"]:
+            records = list(state["frames"])
+            n_new = max(0, min(len(records), state["seq"] - state["cursor"]))
+            state["cursor"] = state["seq"]
+            return records[-n_new:] if n_new else []
 
     def clear_recent(self) -> None:
         """Drop retained frames and reset the drain watermark (e.g. on reconfigure)."""
@@ -1261,7 +1469,9 @@ def snap_subarray(roi, *, step: int, max_w: int, max_h: int):
 
 __all__ = [
     "BaseDevice",
+    "CameraBufferOverrun",
     "CameraDevice",
+    "CameraFrameRecord",
     "EXCLUSIVE",
     "FULL_FRAME",
     "FULL_FRAME_DISPLAY",

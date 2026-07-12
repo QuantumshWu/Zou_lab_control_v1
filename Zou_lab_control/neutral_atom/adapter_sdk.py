@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from .devices.base import (
     BaseDevice,
+    CameraBufferOverrun,
+    CameraFrameRecord,
     CameraDevice,
     LaserDevice,
     RFSourceDevice,
@@ -22,7 +24,9 @@ from .devices.registry import validate_device_contract
 
 __all__ = [
     "BaseDevice",
+    "CameraBufferOverrun",
     "CameraDevice",
+    "CameraFrameRecord",
     "DiscoveredDevice",
     "LaserDevice",
     "RFSourceDevice",

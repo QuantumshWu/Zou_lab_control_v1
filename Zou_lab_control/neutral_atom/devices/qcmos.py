@@ -16,6 +16,7 @@ from .base import (
     ROI_CLEAR_SENTINELS,
     AcquisitionCancelled,
     CameraDevice,
+    CameraFrameRecord,
     config_param_decl,
     snap_subarray,
 )
@@ -422,7 +423,29 @@ class QCMOSCamera(CameraDevice):
                 data = dcam.buf_getframedata(self._next_frame % max(1, int(self._buf_alloc)))
                 if data is False:
                     raise RuntimeError(f"qCMOS buf_getframedata({self._next_frame}) failed: {dcam.lasterr()}")
-                self._deliver([np.asarray(data[1]).copy()])
+                frame_info, pixels = data
+                timestamp = getattr(frame_info, "timestamp", None)
+
+                def metadata_int(owner, name):
+                    value = getattr(owner, name, None) if owner is not None else None
+                    return None if value is None else int(value)
+
+                ring_index = self._next_frame % max(1, int(self._buf_alloc))
+                self._deliver_records(
+                    [
+                        CameraFrameRecord(
+                            image=np.asarray(pixels),
+                            source_ordinal=self._next_frame,
+                            produced_count=available,
+                            frame_stamp=metadata_int(frame_info, "framestamp"),
+                            camera_stamp=metadata_int(frame_info, "camerastamp"),
+                            timestamp_seconds=metadata_int(timestamp, "sec"),
+                            timestamp_microseconds=metadata_int(timestamp, "microsec"),
+                            host_received_at_ns=time.time_ns(),
+                            driver_buffer_index=ring_index,
+                        )
+                    ]
+                )
                 self._next_frame += 1
                 got += 1
                 deadline = time.monotonic() + timeout_ms / 1000.0   # per-trigger budget resets on delivery
