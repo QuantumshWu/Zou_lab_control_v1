@@ -922,7 +922,14 @@ class _TriggerWiredCamera(CameraDevice):
             with state["cond"]:
                 state["_finite_pace_until"] = time.monotonic() + pace
 
-    def _grab(self, n: int, *, timeout: float | None = None, stop=None) -> bool:
+    def _grab(
+        self,
+        n: int,
+        *,
+        timeout: float | None = None,
+        stop=None,
+        exact: bool = False,
+    ) -> bool:
         # The wire is authoritative about trigger edges: an idle (or absent) wire means no
         # edge can arrive, so the read returns immediately and the live view freezes -- the
         # data-source gate the live monitor relies on (no fabricated frames, no dead wait).
@@ -932,6 +939,13 @@ class _TriggerWiredCamera(CameraDevice):
             None if wire is None else wire.firing
         )
         if firing is None:
+            if exact:
+                return super()._grab(
+                    n,
+                    timeout=timeout,
+                    stop=stop,
+                    exact=True,
+                )
             return False
         # EDGE-FAITHFUL in whole cycles: a continuous firing delivers its trigger train one BASE
         # CYCLE at a time, so render the cycle's WHOLE block -- the same block path a finite fire
@@ -1387,9 +1401,21 @@ class VirtualMotCamera(_TriggerWiredCamera):
             self._producer = None
         super()._disarm()
 
-    def _grab(self, n: int, *, timeout: float | None = None, stop=None) -> bool:
+    def _grab(
+        self,
+        n: int,
+        *,
+        timeout: float | None = None,
+        stop=None,
+        exact: bool = False,
+    ) -> bool:
         if not self._free_run:
-            return super()._grab(n, timeout=timeout, stop=stop)
+            return super()._grab(
+                n,
+                timeout=timeout,
+                stop=stop,
+                exact=exact,
+            )
         if stop is not None and stop.is_set():
             return False
         if self._producer is not None:

@@ -226,6 +226,26 @@ def test_out_of_band_terminal_stop_is_joined_by_original_arm_owner():
     cam.finish_record_capture()
 
 
+def test_terminal_stop_wakes_an_unbounded_push_camera_read():
+    import threading
+    import time
+
+    cam, _seqr = _rig()
+    cam.arm(1)
+    observed = {}
+
+    def read():
+        observed["records"] = cam.read_frame_records(1)
+
+    reader = threading.Thread(target=read)
+    reader.start()
+    time.sleep(0.05)
+    cam.finish_record_capture()
+    reader.join(1.0)
+    assert not reader.is_alive()
+    assert observed["records"] == []
+
+
 def test_lazy_state_and_lock_are_created_once_atomically():
     """F4: the lazily-created buffer state and acquisition lock are created ATOMICALLY (``setdefault``),
     so every touch returns the SAME object -- a check-then-set could build two divergent buffers /

@@ -388,7 +388,14 @@ class QCMOSCamera(CameraDevice):
         self._buf_alloc = alloc
         self._next_frame = 0
 
-    def _grab(self, n: int, *, timeout: float | None = None, stop=None) -> bool:
+    def _grab(
+        self,
+        n: int,
+        *,
+        timeout: float | None = None,
+        stop=None,
+        exact: bool = False,
+    ) -> bool:
         """Wait for and transfer up to ``n`` externally triggered frames from the DCAM buffer
         into the base-class frame queue.  The qCMOS fault model is LOUD: a trigger that never
         comes raises ``TimeoutError`` after ``timeout`` (seconds; the config ``timeout_ms``

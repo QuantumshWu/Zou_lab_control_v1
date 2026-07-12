@@ -370,7 +370,14 @@ class PylonCamera(CameraDevice):
         self._armed_total = None if frames is None else int(frames)
         self._grabbed = 0
 
-    def _grab(self, n: int, *, timeout: float | None = None, stop=None) -> bool:
+    def _grab(
+        self,
+        n: int,
+        *,
+        timeout: float | None = None,
+        stop=None,
+        exact: bool = False,
+    ) -> bool:
         """Retrieve ONE frame from the running grab session into the base frame queue.
         Fault LOUDNESS follows the trigger mode (this is the single source for both):
 

@@ -906,7 +906,8 @@ class CameraDevice(BaseDevice):
         state = self._recent_state()
         with state["cond"]:
             state["pending"].clear()
-            state["armed"] = True
+            state["arming"] = True
+            state["armed"] = False
             state["armed_frames"] = frames
             state["last_terminal"] = None
             state["last_terminal_error"] = None
@@ -924,10 +925,16 @@ class CameraDevice(BaseDevice):
             self._arm(frames, max_inflight_frames=max_inflight_frames)
         except BaseException:
             with state["cond"]:
+                state["arming"] = False
                 state["armed"] = False
                 state["pending"].clear()
+                state["cond"].notify_all()
             self._acquire_lock().release()
             raise
+        with state["cond"]:
+            state["arming"] = False
+            state["armed"] = True
+            state["cond"].notify_all()
 
     def _read_frame_records(
         self,
@@ -1039,7 +1046,9 @@ class CameraDevice(BaseDevice):
             if must_stop_source:
                 with state["cond"]:
                     state["armed"] = False
+                    state["arming"] = False
                     state["pending"].clear()
+                    state["cond"].notify_all()
             try:
                 self._acquire_lock().release()
             except RuntimeError:
@@ -1088,7 +1097,14 @@ class CameraDevice(BaseDevice):
         ``max_inflight_frames`` is the separately proven driver-retention bound.
         Default: nothing to do (a push-fed source)."""
 
-    def _grab(self, n: int, *, timeout: float | None = None, stop=None) -> bool:
+    def _grab(
+        self,
+        n: int,
+        *,
+        timeout: float | None = None,
+        stop=None,
+        exact: bool = False,
+    ) -> bool:
         """Backend hook: produce or await at least one more frame for :meth:`read_frames`.
 
         Pull-based hardware fetches from its driver and feeds :meth:`_deliver`; a push-fed
@@ -1099,6 +1115,8 @@ class CameraDevice(BaseDevice):
         deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
         with state["cond"]:
             while not state["pending"]:
+                if not state["armed"]:
+                    return False
                 if stop is not None and stop.is_set():
                     return False
                 remaining = None if deadline is None else deadline - time.monotonic()
@@ -1139,6 +1157,7 @@ class CameraDevice(BaseDevice):
             "cursor": 0,     # drain watermark
             "pending": deque(),  # bounded CameraFrameRecord queue
             "armed": False,
+            "arming": False,
             "armed_frames": None,
             "pending_capacity": max(1, int(self.recent_capacity)),
             "source_ordinal": 0,
