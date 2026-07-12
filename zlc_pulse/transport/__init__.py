@@ -4,7 +4,6 @@ from .axi import VivadoAxiRegisterTransport
 from .lease import DeviceLease, InterprocessDeviceLease
 from .session import (
     DeployedStreamerSession,
-    PulseHardwareTerminal,
     RegisterTransport,
     TransportAborted,
 )
@@ -14,7 +13,6 @@ __all__ = [
     "DeployedStreamerSession",
     "DeviceLease",
     "InterprocessDeviceLease",
-    "PulseHardwareTerminal",
     "PySerialLink",
     "RegisterTransport",
     "TransportAborted",

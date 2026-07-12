@@ -5,6 +5,7 @@ import threading
 import time
 
 import pytest
+from conftest import pulse_backend_completion_for
 
 from zlc_pulse import (
     PulseExecutionForm,
@@ -37,9 +38,9 @@ class Backend:
     def fire(self, artifact):
         assert artifact is self.prepared
 
-    def wait_done(self, artifact, timeout):
+    def await_completion(self, artifact, timeout):
         assert artifact is self.prepared
-        return True
+        return pulse_backend_completion_for(artifact, transport_id="client-test")
 
     def safe_state(self):
         self.prepared = None
@@ -116,8 +117,8 @@ def test_remote_client_runs_one_current_generation_without_legacy_payloads():
     client.fire(reference)
     completion = client.complete(reference, timeout=1.0)
 
-    assert completion.logical_done
-    assert completion.completed_schedule_trigger_counts == (("ch11", 3),)
+    assert completion.expected_trigger_counts_from_completed_schedule == (("ch11", 3),)
+    assert completion.hardware_terminal.transport_id == "client-test"
     assert client.safe_state().state == "SAFE"
     client.close()
     assert connection.closed

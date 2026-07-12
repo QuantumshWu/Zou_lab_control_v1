@@ -195,8 +195,7 @@ def test_current_artifact_bytes_drive_the_existing_axi_transport_exactly(tmp_pat
     service.fire(reference)
     completion = service.complete(reference, timeout=1.0)
 
-    assert completion.logical_done
-    assert completion.completed_schedule_trigger_counts == (("ch11", 3),)
+    assert completion.expected_trigger_counts_from_completed_schedule == (("ch11", 3),)
     assert service.snapshot()["backend"]["prepared_artifact_digest"] == artifact.fingerprint
     service.safe_state()
     assert service.snapshot()["backend"]["prepared_artifact_digest"] is None
@@ -236,7 +235,7 @@ def test_current_artifact_uses_the_same_contract_over_uart(tmp_path):
         assert transport.writes[address] == value
     service.fire(reference)
     transport.model.regfile[CtrlWords.STATUS] |= STATUS_DONE
-    assert service.complete(reference, timeout=1.0).logical_done
+    assert service.complete(reference, timeout=1.0).prepared_ref == reference
     assert service.snapshot()["backend"]["transport"] == "uart"
 
 
@@ -288,7 +287,7 @@ def test_session_has_only_the_current_service_backend_vocabulary(tmp_path):
     assert all(callable(getattr(session, name)) for name in (
         "prepare",
         "fire",
-        "wait_done",
+        "await_completion",
         "safe_state",
         "request_interrupt",
         "snapshot",
@@ -298,7 +297,7 @@ def test_session_has_only_the_current_service_backend_vocabulary(tmp_path):
     assert hardware.words == {}
 
 
-def test_fire_and_wait_are_constant_time_identity_checks_after_prepare(
+def test_fire_and_await_are_constant_time_identity_checks_after_prepare(
     monkeypatch,
     tmp_path,
 ):
@@ -309,11 +308,11 @@ def test_fire_and_wait_are_constant_time_identity_checks_after_prepare(
     session.prepare(artifact)
 
     def forbidden_revalidation(*args, **kwargs):
-        raise AssertionError("FIRE/wait must not repack after prepare")
+        raise AssertionError("FIRE/await must not repack after prepare")
 
     monkeypatch.setattr(
         "zlc_pulse.transport.session.validate_artifact_for_deployment",
         forbidden_revalidation,
     )
     session.fire(artifact)
-    assert session.wait_done(artifact, timeout=1.0)
+    assert session.await_completion(artifact, timeout=1.0) is not None

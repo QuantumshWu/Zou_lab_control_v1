@@ -25,6 +25,7 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 import sys
+from conftest import pulse_backend_completion_for
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
@@ -76,8 +77,8 @@ def test_server_composition_defaults_to_image_clock(monkeypatch):
         def fire(self, artifact):
             pass
 
-        def wait_done(self, artifact, timeout=None):
-            return True
+        def await_completion(self, artifact, timeout=None):
+            return pulse_backend_completion_for(artifact)
 
         def safe_state(self):
             pass

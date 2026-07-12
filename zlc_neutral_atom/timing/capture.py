@@ -27,6 +27,7 @@ from .pulse import (
     FinitePulseExecutionRequest,
     PulseSession,
     PulseTerminalAck,
+    validate_pulse_terminal_for_artifact,
 )
 
 
@@ -117,9 +118,13 @@ class TriggeredPipelineResult:
         self.cell_plan.validate_dataset_schema(self.capture.dataset.block.schema)
         if self.cell_plan.cell_permutation_digest != self.capture.dataset.provenance.join_plan_digest:
             raise ValueError("cell plan and sealed dataset permutation differ")
-        if self.pulse_terminal.artifact_digest != self.compiled_artifact.fingerprint:
-            raise ValueError("pulse terminal and compiled artifact digest differ")
-        counts = dict(self.pulse_terminal.completed_schedule_trigger_counts)
+        validate_pulse_terminal_for_artifact(
+            self.pulse_terminal,
+            self.compiled_artifact,
+        )
+        counts = dict(
+            self.pulse_terminal.expected_trigger_counts_from_completed_schedule
+        )
         if self.trigger_channel not in counts:
             raise ValueError("pulse terminal omits the bound camera trigger channel")
         expected = counts[self.trigger_channel]

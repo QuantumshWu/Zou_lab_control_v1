@@ -58,6 +58,7 @@ from zlc_neutral_atom.timing import (
     PulseTerminalAck,
     pulse_terminal_ack_from_tree,
     pulse_terminal_ack_to_tree,
+    validate_pulse_terminal_for_artifact,
 )
 from zlc_pulse import (
     CompiledPulseArtifact,
@@ -67,7 +68,7 @@ from zlc_pulse import (
 )
 
 
-CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact/v3"
+CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact/v4"
 _CAPTURE_METADATA_SCHEMA = "zlc_neutral_atom.CameraFrameMetadataSequence/v1"
 _CAPTURE_NAMESPACE = "capture"
 
@@ -123,10 +124,10 @@ class PulseCaptureLineage:
             raise TypeError("terminal must be PulseTerminalAck")
         if not isinstance(self.cell_plan, CompiledCaptureCellPlan):
             raise TypeError("cell_plan must be CompiledCaptureCellPlan")
-        if not self.terminal.logical_done:
-            raise ValueError("pulse lineage requires logical terminal")
-        if self.terminal.artifact_digest != self.compiled_artifact.fingerprint:
-            raise ValueError("pulse terminal belongs to another compiled artifact")
+        validate_pulse_terminal_for_artifact(
+            self.terminal,
+            self.compiled_artifact,
+        )
         if (
             self.cell_plan.compiled_pulse_artifact_digest
             != self.compiled_artifact.fingerprint
@@ -136,7 +137,9 @@ class PulseCaptureLineage:
             raise ValueError("capture cell plan execution form differs from lineage")
         if self.cell_plan.trigger_channel != self.trigger_channel:
             raise ValueError("capture cell plan trigger channel differs from lineage")
-        counts = dict(self.terminal.completed_schedule_trigger_counts)
+        counts = dict(
+            self.terminal.expected_trigger_counts_from_completed_schedule
+        )
         if self.trigger_channel not in counts:
             raise ValueError("pulse terminal omits the capture trigger channel")
         if counts[self.trigger_channel] != self.cell_plan.total_events:

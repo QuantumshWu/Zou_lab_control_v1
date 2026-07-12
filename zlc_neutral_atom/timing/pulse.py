@@ -10,9 +10,15 @@ from enum import Enum
 
 from zlc_pulse import (
     CompiledPulseArtifact,
+    PulseBackendCompletion,
+    PulseCompletion,
     PulseDocument,
     PulseExecutionForm,
     PulseTarget,
+    build_pulse_playback,
+    pulse_completion_from_tree,
+    pulse_completion_to_tree,
+    validate_backend_completion_for_artifact,
     validate_target_ir_for_target,
 )
 
@@ -27,6 +33,9 @@ from zlc_neutral_atom.runtime import (
     SafetyOperation,
     VerifiedDeviceCapability,
 )
+
+
+PULSE_TERMINAL_ACK_SCHEMA = "zlc_neutral_atom.PulseTerminalAck/v1"
 
 
 def _text(value: object, field: str) -> str:
@@ -82,6 +91,11 @@ class FinitePulseExecutionRequest:
         return self.artifact.fingerprint
 
 
+class PulseTerminalEvidenceKind(str, Enum):
+    HARDWARE_RAW_REGISTERS = "HARDWARE_RAW_REGISTERS"
+    SIMULATED = "SIMULATED"
+
+
 @dataclass(frozen=True)
 class SequencerCapabilitySnapshot:
     binding_id: str
@@ -91,6 +105,7 @@ class SequencerCapabilitySnapshot:
     clock_hz: float
     geometry_fingerprint: int
     max_blocking_call_seconds: float
+    terminal_evidence_kind: "PulseTerminalEvidenceKind"
     capability_fingerprint: str
 
     def __post_init__(self) -> None:
@@ -110,6 +125,8 @@ class SequencerCapabilitySnapshot:
             "max_blocking_call_seconds",
             _positive_float(self.max_blocking_call_seconds, "max_blocking_call_seconds"),
         )
+        if not isinstance(self.terminal_evidence_kind, PulseTerminalEvidenceKind):
+            raise TypeError("terminal_evidence_kind must be PulseTerminalEvidenceKind")
         _sha256(self.capability_fingerprint, "capability_fingerprint")
 
     @property
@@ -193,89 +210,220 @@ class CompletePulseCommand:
 
 
 @dataclass(frozen=True)
+class SimulatedPulseReceipt:
+    """Honest virtual completion that cannot impersonate hardware registers."""
+
+    artifact_digest: str
+    simulator_id: str
+    expected_trigger_counts_from_completed_schedule: tuple[tuple[str, int], ...]
+    logical_duration_seconds: float
+    configured_output_tail_seconds: float
+
+    def __post_init__(self) -> None:
+        _sha256(self.artifact_digest, "artifact_digest")
+        _text(self.simulator_id, "simulator_id")
+        counts = tuple(self.expected_trigger_counts_from_completed_schedule)
+        if len({channel for channel, _count in counts}) != len(counts):
+            raise ValueError("simulated trigger channels must be unique")
+        for channel, count in counts:
+            _text(channel, "trigger channel")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ValueError("expected trigger count must be non-negative int")
+        object.__setattr__(
+            self,
+            "expected_trigger_counts_from_completed_schedule",
+            counts,
+        )
+        for field in ("logical_duration_seconds", "configured_output_tail_seconds"):
+            raw = getattr(self, field)
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, (int, float))
+                or not math.isfinite(float(raw))
+                or float(raw) < 0
+            ):
+                raise ValueError(f"{field} must be finite and non-negative")
+            object.__setattr__(self, field, float(raw))
+
+
+PulseTerminalReceipt = PulseCompletion | SimulatedPulseReceipt
+
+
+@dataclass(frozen=True)
 class PulseTerminalAck:
     session_id: str
     binding_id: str
     connection_generation: str
-    artifact_digest: str
-    logical_done: bool
-    completed_schedule_trigger_counts: tuple[tuple[str, int], ...]
-    configured_output_delay_wait_seconds: float
+    receipt: PulseTerminalReceipt
 
     def __post_init__(self) -> None:
         for field in ("session_id", "binding_id", "connection_generation"):
             _text(getattr(self, field), field)
-        _sha256(self.artifact_digest, "artifact_digest")
-        if type(self.logical_done) is not bool:
-            raise TypeError("logical_done must be bool")
-        counts = tuple(self.completed_schedule_trigger_counts)
-        seen: set[str] = set()
-        for channel, count in counts:
-            _text(channel, "trigger channel")
-            if channel in seen:
-                raise ValueError("completed trigger channels must be unique")
-            seen.add(channel)
-            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-                raise ValueError("completed trigger count must be non-negative int")
-        object.__setattr__(self, "completed_schedule_trigger_counts", counts)
-        wait = self.configured_output_delay_wait_seconds
+        if not isinstance(self.receipt, (PulseCompletion, SimulatedPulseReceipt)):
+            raise TypeError("receipt must be PulseCompletion or SimulatedPulseReceipt")
+
+    @property
+    def artifact_digest(self) -> str:
+        if isinstance(self.receipt, PulseCompletion):
+            return self.receipt.prepared_ref.artifact_digest
+        return self.receipt.artifact_digest
+
+    @property
+    def expected_trigger_counts_from_completed_schedule(
+        self,
+    ) -> tuple[tuple[str, int], ...]:
+        return self.receipt.expected_trigger_counts_from_completed_schedule
+
+    @property
+    def evidence_kind(self) -> PulseTerminalEvidenceKind:
+        return (
+            PulseTerminalEvidenceKind.HARDWARE_RAW_REGISTERS
+            if isinstance(self.receipt, PulseCompletion)
+            else PulseTerminalEvidenceKind.SIMULATED
+        )
+
+
+def validate_pulse_terminal_for_artifact(
+    acknowledgement: PulseTerminalAck,
+    artifact: CompiledPulseArtifact,
+) -> None:
+    """Revalidate a terminal receipt at every neutral/artifact trust boundary."""
+
+    if not isinstance(acknowledgement, PulseTerminalAck):
+        raise TypeError("acknowledgement must be PulseTerminalAck")
+    if not isinstance(artifact, CompiledPulseArtifact):
+        raise TypeError("artifact must be CompiledPulseArtifact")
+    if artifact.execution_form is PulseExecutionForm.CONTINUOUS_MONITOR:
+        raise ValueError("continuous monitor cannot have a finite terminal receipt")
+    if acknowledgement.artifact_digest != artifact.fingerprint:
+        raise ValueError("pulse terminal belongs to another compiled artifact")
+    expected_counts = tuple(
+        (schedule.channel, schedule.total)
+        for schedule in artifact.trigger_schedules
+    )
+    if (
+        acknowledgement.expected_trigger_counts_from_completed_schedule
+        != expected_counts
+    ):
+        raise ValueError("pulse terminal expected counts differ from compiled schedule")
+
+    receipt = acknowledgement.receipt
+    if isinstance(receipt, PulseCompletion):
+        reference = receipt.prepared_ref
         if (
-            isinstance(wait, bool)
-            or not isinstance(wait, (int, float))
-            or not math.isfinite(float(wait))
-            or float(wait) < 0
+            reference.source_ir_digest != artifact.target_ir.fingerprint
+            or reference.wire_image_digest != artifact.wire_image.digest
         ):
-            raise ValueError("configured output-delay wait must be finite and non-negative")
-        object.__setattr__(self, "configured_output_delay_wait_seconds", float(wait))
+            raise ValueError("hardware completion differs from compiled IR or wire image")
+        validate_backend_completion_for_artifact(
+            PulseBackendCompletion(
+                receipt.hardware_terminal,
+                receipt.post_terminal_tail,
+            ),
+            artifact,
+        )
+        return
+
+    playback = build_pulse_playback(artifact)
+    expected_tail = (
+        artifact.max_configured_output_delay_ticks / artifact.target_ir.clock_hz
+    )
+    if not math.isclose(
+        receipt.logical_duration_seconds,
+        playback.logical_duration,
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("simulated terminal duration differs from compiled pulse")
+    if not math.isclose(
+        receipt.configured_output_tail_seconds,
+        expected_tail,
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("simulated terminal tail differs from compiled pulse")
+
+
+def _simulated_receipt_to_tree(value: SimulatedPulseReceipt) -> dict[str, object]:
+    return {
+        "artifact_digest": value.artifact_digest,
+        "simulator_id": value.simulator_id,
+        "expected_trigger_counts_from_completed_schedule": [
+            [channel, count]
+            for channel, count in value.expected_trigger_counts_from_completed_schedule
+        ],
+        "logical_duration_seconds": value.logical_duration_seconds,
+        "configured_output_tail_seconds": value.configured_output_tail_seconds,
+    }
+
+
+def _simulated_receipt_from_tree(tree: object) -> SimulatedPulseReceipt:
+    fields = {
+        "artifact_digest",
+        "simulator_id",
+        "expected_trigger_counts_from_completed_schedule",
+        "logical_duration_seconds",
+        "configured_output_tail_seconds",
+    }
+    if not isinstance(tree, dict) or set(tree) != fields:
+        raise ValueError("SimulatedPulseReceipt has an unknown field set")
+    raw_counts = tree["expected_trigger_counts_from_completed_schedule"]
+    if not isinstance(raw_counts, list) or any(
+        not isinstance(item, list) or len(item) != 2 for item in raw_counts
+    ):
+        raise ValueError("simulated trigger counts must be [channel, count] rows")
+    return SimulatedPulseReceipt(
+        tree["artifact_digest"],
+        tree["simulator_id"],
+        tuple((item[0], item[1]) for item in raw_counts),
+        tree["logical_duration_seconds"],
+        tree["configured_output_tail_seconds"],
+    )
 
 
 def pulse_terminal_ack_to_tree(value: PulseTerminalAck) -> dict[str, object]:
     if not isinstance(value, PulseTerminalAck):
         raise TypeError("value must be PulseTerminalAck")
+    hardware = isinstance(value.receipt, PulseCompletion)
     return {
+        "schema": PULSE_TERMINAL_ACK_SCHEMA,
         "session_id": value.session_id,
         "binding_id": value.binding_id,
         "connection_generation": value.connection_generation,
-        "artifact_digest": value.artifact_digest,
-        "logical_done": value.logical_done,
-        "completed_schedule_trigger_counts": [
-            [channel, count]
-            for channel, count in value.completed_schedule_trigger_counts
-        ],
-        "configured_output_delay_wait_seconds": (
-            value.configured_output_delay_wait_seconds
+        "receipt_kind": "HARDWARE" if hardware else "SIMULATED",
+        "receipt": (
+            pulse_completion_to_tree(value.receipt)
+            if hardware
+            else _simulated_receipt_to_tree(value.receipt)
         ),
     }
 
 
 def pulse_terminal_ack_from_tree(tree: object) -> PulseTerminalAck:
     fields = {
+        "schema",
         "session_id",
         "binding_id",
         "connection_generation",
-        "artifact_digest",
-        "logical_done",
-        "completed_schedule_trigger_counts",
-        "configured_output_delay_wait_seconds",
+        "receipt_kind",
+        "receipt",
     }
     if not isinstance(tree, dict) or set(tree) != fields:
         raise ValueError("PulseTerminalAck has an unknown field set")
-    raw_counts = tree["completed_schedule_trigger_counts"]
-    if not isinstance(raw_counts, list):
-        raise TypeError("completed_schedule_trigger_counts must be a list")
-    counts = []
-    for item in raw_counts:
-        if not isinstance(item, list) or len(item) != 2:
-            raise ValueError("trigger count must be [channel, count]")
-        counts.append((item[0], item[1]))
+    if tree["schema"] != PULSE_TERMINAL_ACK_SCHEMA:
+        raise ValueError("PulseTerminalAck schema differs")
+    kind = tree["receipt_kind"]
+    if kind == "HARDWARE":
+        receipt = pulse_completion_from_tree(tree["receipt"])
+    elif kind == "SIMULATED":
+        receipt = _simulated_receipt_from_tree(tree["receipt"])
+    else:
+        raise ValueError("PulseTerminalAck receipt kind differs")
     return PulseTerminalAck(
         tree["session_id"],
         tree["binding_id"],
         tree["connection_generation"],
-        tree["artifact_digest"],
-        tree["logical_done"],
-        tuple(counts),
-        tree["configured_output_delay_wait_seconds"],
+        receipt,
     )
 
 
@@ -496,14 +644,9 @@ class PulseSession:
                 )
             )
             self._validate_ack(ack, PulseTerminalAck)
-            if not ack.logical_done or ack.artifact_digest != self._request.artifact_digest:
-                raise RuntimeError("pulse terminal acknowledgement is incomplete")
-            expected = tuple(
-                (schedule.channel, schedule.total)
-                for schedule in self._request.artifact.trigger_schedules
-            )
-            if ack.completed_schedule_trigger_counts != expected:
-                raise RuntimeError("pulse terminal trigger counts differ from compiled schedule")
+            if ack.evidence_kind is not self._port.capability.terminal_evidence_kind:
+                raise RuntimeError("pulse terminal evidence kind differs from capability")
+            validate_pulse_terminal_for_artifact(ack, self._request.artifact)
         except BaseException:
             self._state = PulseSessionState.FAILED
             raise
@@ -559,7 +702,12 @@ __all__ = [
     "PulseSession",
     "PulseSessionState",
     "PulseTerminalAck",
+    "PULSE_TERMINAL_ACK_SCHEMA",
+    "PulseTerminalEvidenceKind",
+    "PulseTerminalReceipt",
+    "SimulatedPulseReceipt",
     "pulse_terminal_ack_from_tree",
     "pulse_terminal_ack_to_tree",
+    "validate_pulse_terminal_for_artifact",
     "SequencerCapabilitySnapshot",
 ]

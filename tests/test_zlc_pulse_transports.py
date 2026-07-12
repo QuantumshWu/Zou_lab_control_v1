@@ -67,6 +67,7 @@ class TraceRegisterTransport:
         self.params = params
         self.words = {CtrlWords.LAYOUT_ID: build_fingerprint(params)}
         self.write_batches = []
+        self.read_addresses = []
         self.status = 0
         self.cursor = 0
         self.closed = False
@@ -97,6 +98,7 @@ class TraceRegisterTransport:
                     self.status = STATUS_RUNNING
 
     def read_word(self, address, *, stop=None, deadline=None):
+        self.read_addresses.append(address)
         if stop is not None and stop.is_set():
             from zlc_pulse.transport import TransportAborted
 
@@ -169,7 +171,7 @@ def test_public_service_rejects_nonresident_scan_before_backend_io():
     assert service.snapshot()["state"] == "IDLE"
 
 
-def test_resident_finite_terminal_owner_starts_at_fire_before_wait_done():
+def test_resident_finite_terminal_owner_starts_at_fire_before_await():
     params = replace(StreamerParams(), bank_size=2)
     document, artifact = _scan_artifact(params, count=4)
     transport = TraceRegisterTransport(params)
@@ -179,12 +181,74 @@ def test_resident_finite_terminal_owner_starts_at_fire_before_wait_done():
     session.fire(artifact)
     transport.cursor = 3
     transport.status = STATUS_DONE
-    assert session.wait_done(artifact, timeout=1.0)
+    completion = session.await_completion(artifact, timeout=1.0)
+    assert completion is not None
     terminal = session.snapshot()["terminal"]
     assert terminal["cursor_first"] == terminal["cursor_second"] == 3
-    assert terminal["expected_final_cursor"] == 3
-    assert terminal["continuity_evidence"] == "HARDWARE_RESIDENT"
-    assert terminal["logical_done"]
+    assert terminal["schema"] == "zlc_pulse.AutonomousTableTerminalEvidence/v1"
+    assert "expected_final_cursor" not in terminal
+    assert "logical_done" not in terminal
+    assert completion.post_terminal_tail.terminal_evidence_digest == (
+        completion.hardware_terminal.fingerprint
+    )
+
+
+def test_static_terminal_evidence_never_reads_semantically_empty_cursor():
+    params = StreamerParams()
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    artifact = compile_pulse_artifact(
+        document,
+        clock_hz=50e6,
+        execution_form=PulseExecutionForm.STATIC_ONCE,
+        trigger_channels=("ch11",),
+        params=params,
+    )
+    transport = TraceRegisterTransport(params)
+    session = _session(document, params, transport)
+    session.prepare(artifact)
+    session.fire(artifact)
+    transport.read_addresses.clear()
+    transport.status = STATUS_DONE
+
+    completion = session.await_completion(artifact, timeout=1.0)
+
+    assert completion is not None
+    assert CtrlWords.CURSOR not in transport.read_addresses
+    assert session.snapshot()["terminal"]["schema"] == (
+        "zlc_pulse.StaticOnceTerminalEvidence/v1"
+    )
+
+
+def test_autonomous_terminal_reads_the_frozen_register_recipe_exactly():
+    params = replace(StreamerParams(), bank_size=2)
+    document, artifact = _scan_artifact(params, count=4)
+
+    class ImmediateDoneTransport(TraceRegisterTransport):
+        def write_words(self, rows, *, stop=None, deadline=None):
+            rows = tuple(rows)
+            super().write_words(rows, stop=stop, deadline=deadline)
+            if any(
+                address == CtrlWords.COMMAND and value & CMD_FIRE
+                for address, value in rows
+            ):
+                self.status = STATUS_DONE
+                self.cursor = 3
+
+    transport = ImmediateDoneTransport(params)
+    session = _session(document, params, transport)
+    session.prepare(artifact)
+    transport.read_addresses.clear()
+
+    session.fire(artifact)
+    completion = session.await_completion(artifact, timeout=1.0)
+
+    assert completion is not None
+    assert transport.read_addresses == [
+        CtrlWords.STATUS,
+        CtrlWords.CURSOR,
+        CtrlWords.STATUS,
+        CtrlWords.CURSOR,
+    ]
 
 
 def test_safe_during_deployment_validation_cannot_revive_prepared_state(monkeypatch):
@@ -284,7 +348,7 @@ def test_safe_interrupts_tail_wait_without_republishing_a_drain_deadline():
 
     def wait():
         try:
-            session.wait_done(artifact, timeout=1.0)
+            session.await_completion(artifact, timeout=1.0)
         except BaseException as error:
             errors.append(error)
 
@@ -312,7 +376,7 @@ def test_any_observed_underflow_invalidates_the_whole_formal_run():
     transport.status = STATUS_RUNNING | STATUS_UNDERFLOW
 
     with pytest.raises(RuntimeError, match="underflowed"):
-        session.wait_done(artifact, timeout=1.0)
+        session.await_completion(artifact, timeout=1.0)
     assert session.state == "FAILED"
     assert any(
         address == CtrlWords.COMMAND and value == CMD_SAFE
@@ -331,8 +395,8 @@ def test_terminal_cursor_mismatch_is_rejected_even_when_done_is_set():
     transport.cursor = 1
     transport.status = STATUS_DONE
 
-    with pytest.raises(RuntimeError, match="terminal STATUS/CURSOR"):
-        session.wait_done(artifact, timeout=1.0)
+    with pytest.raises(ValueError, match="terminal CURSOR"):
+        session.await_completion(artifact, timeout=1.0)
 
 
 def test_short_wait_does_not_allow_next_prepare_to_cut_off_delay_tail():
@@ -351,7 +415,7 @@ def test_short_wait_does_not_allow_next_prepare_to_cut_off_delay_tail():
     session.fire(artifact)
     transport.status = STATUS_DONE
 
-    assert not session.wait_done(artifact, timeout=0.001)
+    assert session.await_completion(artifact, timeout=0.001) is None
     started = time.monotonic()
     session.prepare(artifact)
     assert time.monotonic() - started >= 0.012

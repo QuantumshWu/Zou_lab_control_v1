@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 import threading
 import time
-from dataclasses import dataclass
 from typing import Protocol, Sequence
 
 from fpga.pulse_streamer.host.image import (
@@ -23,8 +22,20 @@ from fpga.pulse_streamer.host.image import (
     region_bases,
 )
 
-from ..artifact import CompiledPulseArtifact
+from ..artifact import CompiledPulseArtifact, PulseExecutionForm
 from ..deployment import validate_artifact_for_deployment, validate_deployed_target
+from ..evidence import (
+    AUTONOMOUS_TABLE_READ_RECIPE,
+    POST_TERMINAL_TAIL_WAIT_RECIPE,
+    STATIC_STATUS_READ_RECIPE,
+    AutonomousTableTerminalEvidence,
+    PostTerminalTailEvidence,
+    PulseBackendCompletion,
+    PulseHardwareTerminalEvidence,
+    StaticOnceTerminalEvidence,
+    hardware_terminal_evidence_to_tree,
+    validate_terminal_for_artifact,
+)
 from ..target import PulseTarget
 from .lease import DeviceLease
 
@@ -58,50 +69,6 @@ class RegisterTransport(Protocol):
     ) -> int: ...
 
     def record_diagnostic(self, name: str, text: str) -> None: ...
-
-
-@dataclass(frozen=True)
-class PulseHardwareTerminal:
-    """Raw terminal proof retained at the hardware-owner boundary."""
-
-    artifact_digest: str
-    status_first: int
-    status_second: int
-    cursor_first: int | None
-    cursor_second: int | None
-    expected_final_cursor: int | None
-    underflow_observed: bool
-    continuity_evidence: str
-    observed_monotonic: float
-
-    @property
-    def logical_done(self) -> bool:
-        return bool(
-            (self.status_first & STATUS_DONE)
-            and (self.status_second & STATUS_DONE)
-            and not (self.status_first & (STATUS_ERROR | STATUS_UNDERFLOW))
-            and not (self.status_second & (STATUS_ERROR | STATUS_UNDERFLOW))
-            and not self.underflow_observed
-            and self.cursor_first == self.cursor_second
-            and (
-                self.expected_final_cursor is None
-                or self.cursor_first == self.expected_final_cursor
-            )
-        )
-
-    def to_tree(self) -> dict[str, object]:
-        return {
-            "artifact_digest": self.artifact_digest,
-            "status_first": self.status_first,
-            "status_second": self.status_second,
-            "cursor_first": self.cursor_first,
-            "cursor_second": self.cursor_second,
-            "expected_final_cursor": self.expected_final_cursor,
-            "underflow_observed": self.underflow_observed,
-            "continuity_evidence": self.continuity_evidence,
-            "observed_monotonic": self.observed_monotonic,
-            "logical_done": self.logical_done,
-        }
 
 
 class DeployedStreamerSession:
@@ -176,7 +143,9 @@ class DeployedStreamerSession:
         self._fire_gate: threading.Event | None = None
         self._terminal_event = threading.Event()
         self._terminal_error: BaseException | None = None
-        self._terminal: PulseHardwareTerminal | None = None
+        self._terminal: PulseHardwareTerminalEvidence | None = None
+        self._terminal_observed_monotonic_ns: int | None = None
+        self._status_sample_count = 0
         self._underflow_observed = False
         self._operation_stop = threading.Event()
 
@@ -387,6 +356,8 @@ class DeployedStreamerSession:
             self._terminal_event.clear()
             self._terminal_error = None
             self._terminal = None
+            self._terminal_observed_monotonic_ns = None
+            self._status_sample_count = 0
             self._underflow_observed = False
             self._state = "PREPARING"
 
@@ -434,6 +405,8 @@ class DeployedStreamerSession:
             self._terminal_event.clear()
             self._terminal_error = None
             self._terminal = None
+            self._terminal_observed_monotonic_ns = None
+            self._status_sample_count = 0
             self._underflow_observed = False
         operation_stop = self._operation_stop
         self.transport.write_words(
@@ -468,11 +441,11 @@ class DeployedStreamerSession:
             self._fire_gate.set()
         self.transport.record_diagnostic("fire_time", str(time.monotonic()))
 
-    def wait_done(
+    def await_completion(
         self,
         artifact: CompiledPulseArtifact,
         timeout: float | None = None,
-    ) -> bool:
+    ) -> PulseBackendCompletion | None:
         """Wait only; the FIRE-owned worker is the sole terminal-status I/O owner."""
 
         self._require_started()
@@ -486,14 +459,16 @@ class DeployedStreamerSession:
         deadline = None if timeout is None else time.monotonic() + float(timeout)
         wait_seconds = None if deadline is None else max(0.0, deadline - time.monotonic())
         if not self._terminal_event.wait(wait_seconds):
-            return False
+            return None
         error = self._terminal_error
         if error is not None:
             raise error
         terminal = self._terminal
-        if terminal is None or not terminal.logical_done:
-            raise RuntimeError("streamer terminal evidence is absent or inconsistent")
-        drain_until = terminal.observed_monotonic + self._tail_seconds
+        observed_ns = self._terminal_observed_monotonic_ns
+        if terminal is None or observed_ns is None:
+            raise RuntimeError("streamer terminal evidence is absent")
+        validate_terminal_for_artifact(terminal, artifact)
+        drain_until = observed_ns / 1_000_000_000 + self._tail_seconds
         remaining = drain_until - time.monotonic()
         if remaining > 0:
             if deadline is not None and time.monotonic() + remaining > deadline:
@@ -506,7 +481,7 @@ class DeployedStreamerSession:
                             "output-tail wait was superseded by interrupt-to-safe"
                         )
                     self._drain_until = drain_until
-                return False
+                return None
             if operation_stop.wait(remaining):
                 raise TransportAborted(
                     "output-tail wait was interrupted by safe_state"
@@ -520,7 +495,15 @@ class DeployedStreamerSession:
                     "output-tail completion was superseded by interrupt-to-safe"
                 )
             self._drain_until = 0.0
-        return True
+        elapsed_ns = max(0, time.monotonic_ns() - observed_ns)
+        tail = PostTerminalTailEvidence(
+            terminal.fingerprint,
+            POST_TERMINAL_TAIL_WAIT_RECIPE,
+            artifact.max_configured_output_delay_ticks,
+            artifact.target_ir.clock_hz,
+            elapsed_ns,
+        )
+        return PulseBackendCompletion(terminal, tail)
 
     def safe_state(self) -> None:
         """Abort immediately, invalidate the capability, and join the only I/O worker."""
@@ -598,7 +581,7 @@ class DeployedStreamerSession:
         with self._lock:
             terminal = self._terminal
             return {
-                "schema": "zlc_pulse.DeployedStreamerSessionSnapshot/v1",
+                "schema": "zlc_pulse.DeployedStreamerSessionSnapshot/v2",
                 "transport": self.transport.transport_id,
                 "geometry_fingerprint": build_fingerprint(self.params) & 0xFFFFFFFF,
                 "clock_hz": self.clock_hz,
@@ -606,7 +589,11 @@ class DeployedStreamerSession:
                 "prepared_artifact_digest": self._artifact_digest,
                 "scan_points": self._total_points,
                 "last_confirmed_cursor": self._last_cursor,
-                "terminal": None if terminal is None else terminal.to_tree(),
+                "terminal": (
+                    None
+                    if terminal is None
+                    else hardware_terminal_evidence_to_tree(terminal)
+                ),
             }
 
     def _command(
@@ -748,6 +735,7 @@ class DeployedStreamerSession:
         try:
             while not stop.is_set():
                 status = self.transport.read_word(CtrlWords.STATUS, stop=stop)
+                self._status_sample_count += 1
                 if status & STATUS_ERROR:
                     raise RuntimeError("pulse streamer reported STATUS_ERROR")
                 if status & STATUS_UNDERFLOW:
@@ -757,10 +745,11 @@ class DeployedStreamerSession:
                     )
                 if status & STATUS_DONE:
                     terminal = self._read_terminal_evidence(status, stop)
-                    if not terminal.logical_done:
-                        raise RuntimeError(
-                            "pulse streamer terminal STATUS/CURSOR evidence is inconsistent"
-                        )
+                    artifact = self._artifact
+                    if artifact is None:
+                        raise RuntimeError("terminal observer lost its compiled artifact")
+                    validate_terminal_for_artifact(terminal, artifact)
+                    observed_ns = time.monotonic_ns()
                     with self._lock:
                         if (
                             operation_epoch != self._operation_epoch
@@ -768,7 +757,10 @@ class DeployedStreamerSession:
                         ):
                             return
                         self._terminal = terminal
-                        self._drain_until = terminal.observed_monotonic + self._tail_seconds
+                        self._terminal_observed_monotonic_ns = observed_ns
+                        self._drain_until = (
+                            observed_ns / 1_000_000_000 + self._tail_seconds
+                        )
                         self._state = "DONE"
                     self._terminal_event.set()
                     return
@@ -800,31 +792,35 @@ class DeployedStreamerSession:
         self,
         first_status: int,
         stop: threading.Event,
-    ) -> PulseHardwareTerminal:
-        cursor_first = (
-            self.transport.read_word(CtrlWords.CURSOR, stop=stop)
-            if self._total_points
-            else None
-        )
+    ) -> PulseHardwareTerminalEvidence:
+        artifact = self._artifact
+        if artifact is None:
+            raise RuntimeError("terminal observer has no compiled artifact")
+        if artifact.execution_form is PulseExecutionForm.AUTONOMOUS_SCAN_ONCE:
+            cursor_first = self.transport.read_word(CtrlWords.CURSOR, stop=stop)
+            second_status = self.transport.read_word(CtrlWords.STATUS, stop=stop)
+            self._status_sample_count += 1
+            cursor_second = self.transport.read_word(CtrlWords.CURSOR, stop=stop)
+            self._last_cursor = cursor_second
+            return AutonomousTableTerminalEvidence(
+                AUTONOMOUS_TABLE_READ_RECIPE,
+                self.transport.transport_id,
+                first_status,
+                cursor_first,
+                second_status,
+                cursor_second,
+                self._underflow_observed,
+                self._status_sample_count,
+            )
         second_status = self.transport.read_word(CtrlWords.STATUS, stop=stop)
-        cursor_second = (
-            self.transport.read_word(CtrlWords.CURSOR, stop=stop)
-            if self._total_points
-            else None
-        )
-        expected = self._total_points - 1 if self._total_points else None
-        continuity_evidence = "HARDWARE_RESIDENT"
-        self._last_cursor = 0 if cursor_second is None else cursor_second
-        return PulseHardwareTerminal(
-            self._artifact_digest or "",
+        self._status_sample_count += 1
+        return StaticOnceTerminalEvidence(
+            STATIC_STATUS_READ_RECIPE,
+            self.transport.transport_id,
             first_status,
             second_status,
-            cursor_first,
-            cursor_second,
-            expected,
             self._underflow_observed,
-            continuity_evidence,
-            time.monotonic(),
+            self._status_sample_count,
         )
 
     def _stop_worker(self, *, timeout: float | None = None) -> None:
@@ -861,7 +857,6 @@ class DeployedStreamerSession:
 
 __all__ = [
     "DeployedStreamerSession",
-    "PulseHardwareTerminal",
     "RegisterTransport",
     "TransportAborted",
 ]

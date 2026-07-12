@@ -6,6 +6,7 @@ import threading
 import time
 
 import pytest
+from conftest import pulse_backend_completion_for
 
 from fpga.pulse_streamer.host.image import StreamerParams
 from zlc_pulse import (
@@ -42,10 +43,10 @@ class RecordingBackend:
         assert artifact is self.prepared
         self.actions.append(("fire", artifact.fingerprint))
 
-    def wait_done(self, artifact, timeout):
+    def await_completion(self, artifact, timeout):
         assert artifact is self.prepared
-        self.actions.append(("wait_done", artifact.fingerprint, timeout))
-        return self.done
+        self.actions.append(("await_completion", artifact.fingerprint, timeout))
+        return pulse_backend_completion_for(artifact) if self.done else None
 
     def safe_state(self):
         self.actions.append(("safe",))
@@ -85,10 +86,14 @@ def test_server_executes_one_exact_current_artifact_and_returns_schedule_receipt
     service.fire(reference)
     completion = service.complete(reference, timeout=3.0)
 
-    assert completion.logical_done
-    assert completion.completed_schedule_trigger_counts == (("ch11", 3),)
+    assert completion.expected_trigger_counts_from_completed_schedule == (("ch11", 3),)
+    assert completion.hardware_terminal.status_first == completion.hardware_terminal.status_second
     assert reference.artifact_digest == artifact.fingerprint
-    assert [action[0] for action in backend.actions] == ["prepare", "fire", "wait_done"]
+    assert [action[0] for action in backend.actions] == [
+        "prepare",
+        "fire",
+        "await_completion",
+    ]
     assert service.snapshot()["state"] == "DONE"
 
 
@@ -109,6 +114,30 @@ def test_server_messages_are_current_canonical_owner_codecs():
     service.fire(reference)
     completion = service.complete(reference, timeout=1.0)
     assert decode_completion_message(encode_completion_message(completion)) == completion
+
+
+def test_completed_receipt_is_replayed_without_reentering_the_backend():
+    artifact = _artifact()
+    backend = RecordingBackend()
+    service = PulseExecutionService(
+        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        clock_hz=50e6,
+        backend=backend,
+        connection_generation="server-generation-1",
+    )
+    reference = service.prepare(artifact)
+    service.fire(reference)
+
+    first = service.complete(reference, timeout=1.0)
+    second = service.complete(reference, timeout=1.0)
+
+    assert second is first
+    assert [action[0] for action in backend.actions].count("await_completion") == 1
+    with pytest.raises(RuntimeError, match="differs from cached completion"):
+        service.complete(
+            replace(reference, artifact_digest="0" * 64),
+            timeout=1.0,
+        )
 
 
 def test_stale_generation_and_geometry_fail_before_backend_prepare():
@@ -173,16 +202,14 @@ def test_timeout_is_not_reported_as_a_completed_schedule():
     reference = service.prepare(artifact)
     service.fire(reference)
 
-    completion = service.complete(reference, timeout=0.1)
-
-    assert not completion.logical_done
-    assert completion.completed_schedule_trigger_counts == ()
+    with pytest.raises(TimeoutError, match="validated terminal"):
+        service.complete(reference, timeout=0.1)
     assert service.snapshot()["state"] == "TIMEOUT"
 
     with pytest.raises(RuntimeError, match="requires completion or verified safe_state"):
         service.prepare(artifact)
     backend.done = True
-    assert service.complete(reference, timeout=0.1).logical_done
+    assert service.complete(reference, timeout=0.1).prepared_ref == reference
     assert service.prepare(artifact).artifact_digest == artifact.fingerprint
 
 
@@ -195,7 +222,7 @@ def test_independent_safe_interrupts_a_blocked_completion_without_waiting_for_it
             self.entered = threading.Event()
             self.interrupted = threading.Event()
 
-        def wait_done(self, artifact, timeout):
+        def await_completion(self, artifact, timeout):
             self.entered.set()
             self.interrupted.wait(2.0)
             raise RuntimeError("completion interrupted")

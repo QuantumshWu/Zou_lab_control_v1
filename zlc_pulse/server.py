@@ -19,12 +19,24 @@ from .artifact import (
 )
 from .fpga import pack_target_ir
 from .deployment import validate_resident_scan_capacity
+from .evidence import (
+    AutonomousTableTerminalEvidence,
+    PostTerminalTailEvidence,
+    PulseBackendCompletion,
+    StaticOnceTerminalEvidence,
+    hardware_terminal_evidence_from_tree,
+    hardware_terminal_evidence_to_tree,
+    post_terminal_tail_evidence_from_tree,
+    post_terminal_tail_evidence_to_tree,
+    validate_backend_completion_for_artifact,
+    validate_backend_completion_intrinsic,
+)
 from .target import PulseTarget, pulse_target_to_tree
 from .validation import validate_target_ir_for_target
 
 
 PREPARED_PULSE_REF_SCHEMA = "zlc_pulse.PreparedPulseRef/v1"
-PULSE_COMPLETION_SCHEMA = "zlc_pulse.PulseCompletion/v1"
+PULSE_COMPLETION_SCHEMA = "zlc_pulse.PulseCompletion/v2"
 
 
 class PulseExecutionBackend(Protocol):
@@ -34,7 +46,11 @@ class PulseExecutionBackend(Protocol):
 
     def fire(self, artifact: CompiledPulseArtifact) -> None: ...
 
-    def wait_done(self, artifact: CompiledPulseArtifact, timeout: float | None) -> bool: ...
+    def await_completion(
+        self,
+        artifact: CompiledPulseArtifact,
+        timeout: float | None,
+    ) -> PulseBackendCompletion | None: ...
 
     def safe_state(self) -> None: ...
 
@@ -63,22 +79,28 @@ class PreparedPulseRef:
 @dataclass(frozen=True)
 class PulseCompletion:
     prepared_ref: PreparedPulseRef
-    logical_done: bool
-    completed_schedule_trigger_counts: tuple[tuple[str, int], ...]
+    hardware_terminal: StaticOnceTerminalEvidence | AutonomousTableTerminalEvidence
+    post_terminal_tail: PostTerminalTailEvidence
+    expected_trigger_counts_from_completed_schedule: tuple[tuple[str, int], ...]
 
     def __post_init__(self) -> None:
         if not isinstance(self.prepared_ref, PreparedPulseRef):
             raise TypeError("prepared_ref must be PreparedPulseRef")
-        if type(self.logical_done) is not bool:
-            raise TypeError("logical_done must be bool")
-        counts = tuple(self.completed_schedule_trigger_counts)
+        validate_backend_completion_intrinsic(
+            PulseBackendCompletion(self.hardware_terminal, self.post_terminal_tail)
+        )
+        counts = tuple(self.expected_trigger_counts_from_completed_schedule)
         if len({channel for channel, _count in counts}) != len(counts):
             raise ValueError("completion trigger channels must be unique")
         for channel, count in counts:
             _text(channel, "trigger channel")
             if isinstance(count, bool) or not isinstance(count, int) or count < 0:
                 raise ValueError("trigger count must be a non-negative integer")
-        object.__setattr__(self, "completed_schedule_trigger_counts", counts)
+        object.__setattr__(
+            self,
+            "expected_trigger_counts_from_completed_schedule",
+            counts,
+        )
 
 
 class PulseExecutionService:
@@ -105,7 +127,7 @@ class PulseExecutionService:
         for method in (
             "prepare",
             "fire",
-            "wait_done",
+            "await_completion",
             "safe_state",
             "request_interrupt",
             "snapshot",
@@ -123,6 +145,7 @@ class PulseExecutionService:
         self._state = "IDLE"
         self._artifact: CompiledPulseArtifact | None = None
         self._prepared_ref: PreparedPulseRef | None = None
+        self._completion: PulseCompletion | None = None
         self._operation_epoch = 0
 
     @property
@@ -140,6 +163,7 @@ class PulseExecutionService:
             self._generation = uuid.uuid4().hex
             self._artifact = None
             self._prepared_ref = None
+            self._completion = None
             return self._generation
 
     def snapshot(self) -> dict[str, object]:
@@ -196,6 +220,7 @@ class PulseExecutionService:
                     self._state = "FAILED"
                     self._artifact = None
                     self._prepared_ref = None
+                    self._completion = None
             if not superseded:
                 self._best_effort_safe_after_failure(error)
             raise
@@ -215,6 +240,7 @@ class PulseExecutionService:
             )
             self._artifact = artifact
             self._prepared_ref = reference
+            self._completion = None
             self._state = "PREPARED"
             return reference
 
@@ -254,6 +280,12 @@ class PulseExecutionService:
         ):
             raise ValueError("timeout must be finite and positive or None")
         with self._lock:
+            if self._state == "DONE":
+                if reference != self._prepared_ref or self._completion is None:
+                    raise RuntimeError(
+                        "completed pulse reference differs from cached completion"
+                    )
+                return self._completion
             if self._state not in {"RUNNING", "TIMEOUT"}:
                 raise RuntimeError(
                     f"pulse service state is {self._state}, expected RUNNING or TIMEOUT"
@@ -267,7 +299,12 @@ class PulseExecutionService:
             self._state = "COMPLETING"
             operation_epoch = self._operation_epoch
         try:
-            done = bool(self._backend.wait_done(artifact, timeout))
+            backend_completion = self._backend.await_completion(artifact, timeout)
+            if backend_completion is not None:
+                validate_backend_completion_for_artifact(
+                    backend_completion,
+                    artifact,
+                )
         except BaseException as error:
             with self._lock:
                 superseded = operation_epoch != self._operation_epoch
@@ -275,6 +312,7 @@ class PulseExecutionService:
                     self._state = "FAILED"
                     self._artifact = None
                     self._prepared_ref = None
+                    self._completion = None
             if not superseded:
                 self._best_effort_safe_after_failure(error)
             raise
@@ -286,15 +324,23 @@ class PulseExecutionService:
                 raise RuntimeError(
                     "pulse completion was superseded by an interrupt-to-safe operation"
                 )
-            self._state = "DONE" if done else "TIMEOUT"
-            return PulseCompletion(
-                reference,
-                done,
-                tuple(
-                    (schedule.channel, schedule.total)
-                    for schedule in artifact.trigger_schedules
-                ) if done else (),
-            )
+            if backend_completion is None:
+                self._state = "TIMEOUT"
+            else:
+                self._state = "DONE"
+                completion = PulseCompletion(
+                    reference,
+                    backend_completion.hardware_terminal,
+                    backend_completion.post_terminal_tail,
+                    tuple(
+                        (schedule.channel, schedule.total)
+                        for schedule in artifact.trigger_schedules
+                    ),
+                )
+                self._completion = completion
+        if backend_completion is None:
+            raise TimeoutError("pulse backend did not reach a validated terminal before timeout")
+        return completion
 
     def safe_state(self) -> None:
         self._safe_state(expected_generation=None)
@@ -326,6 +372,7 @@ class PulseExecutionService:
                 if operation_epoch == self._operation_epoch:
                     self._artifact = None
                     self._prepared_ref = None
+                    self._completion = None
                     self._state = "SAFE_FAILED"
             raise
         with self._lock:
@@ -333,6 +380,7 @@ class PulseExecutionService:
                 raise RuntimeError("safe_state operation was superseded")
             self._artifact = None
             self._prepared_ref = None
+            self._completion = None
             self._state = "SAFE"
 
     def safe_state_for_generation(self, generation: str) -> dict[str, object]:
@@ -443,8 +491,16 @@ def pulse_completion_to_tree(value: PulseCompletion) -> dict[str, object]:
     return {
         "schema": PULSE_COMPLETION_SCHEMA,
         "prepared_ref": prepared_pulse_ref_to_tree(value.prepared_ref),
-        "logical_done": value.logical_done,
-        "completed_schedule_trigger_counts": [list(item) for item in value.completed_schedule_trigger_counts],
+        "hardware_terminal": hardware_terminal_evidence_to_tree(
+            value.hardware_terminal
+        ),
+        "post_terminal_tail": post_terminal_tail_evidence_to_tree(
+            value.post_terminal_tail
+        ),
+        "expected_trigger_counts_from_completed_schedule": [
+            list(item)
+            for item in value.expected_trigger_counts_from_completed_schedule
+        ],
     }
 
 
@@ -452,20 +508,22 @@ def pulse_completion_from_tree(tree: object) -> PulseCompletion:
     if not isinstance(tree, dict) or set(tree) != {
         "schema",
         "prepared_ref",
-        "logical_done",
-        "completed_schedule_trigger_counts",
+        "hardware_terminal",
+        "post_terminal_tail",
+        "expected_trigger_counts_from_completed_schedule",
     }:
         raise ValueError("PulseCompletion has an unknown field set")
     if tree["schema"] != PULSE_COMPLETION_SCHEMA:
         raise ValueError("PulseCompletion schema differs")
-    raw_counts = tree["completed_schedule_trigger_counts"]
+    raw_counts = tree["expected_trigger_counts_from_completed_schedule"]
     if not isinstance(raw_counts, list) or any(
         not isinstance(item, list) or len(item) != 2 for item in raw_counts
     ):
         raise ValueError("PulseCompletion trigger counts must be [channel, count] rows")
     return PulseCompletion(
         prepared_pulse_ref_from_tree(tree["prepared_ref"]),
-        tree["logical_done"],
+        hardware_terminal_evidence_from_tree(tree["hardware_terminal"]),
+        post_terminal_tail_evidence_from_tree(tree["post_terminal_tail"]),
         tuple((item[0], item[1]) for item in raw_counts),
     )
 

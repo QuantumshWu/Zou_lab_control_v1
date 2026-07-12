@@ -25,7 +25,12 @@ from zlc_neutral_atom.runtime import (
     SafeStateAck,
     SafetyOperation,
 )
-from zlc_neutral_atom.timing import FinitePulseExecutionRequest, PulseSessionState
+from zlc_neutral_atom.timing import (
+    FinitePulseExecutionRequest,
+    PulseSessionState,
+    PulseTerminalEvidenceKind,
+    SimulatedPulseReceipt,
+)
 from zlc_pulse import (
     PulseExecutionForm,
     bind_pulse_document_target,
@@ -150,8 +155,9 @@ def test_finite_pulse_runs_prepare_fire_terminal_then_verified_safe():
     plan, holder = _plan(port, FinitePulseExecutionRequest(document, artifact))
     terminal = RunController(ResourceArbiter(MemoryQuarantineJournal())).run(plan)
 
-    assert terminal.logical_done
-    assert terminal.completed_schedule_trigger_counts == (("ch11", 3),)
+    assert isinstance(terminal.receipt, SimulatedPulseReceipt)
+    assert terminal.evidence_kind is PulseTerminalEvidenceKind.SIMULATED
+    assert terminal.expected_trigger_counts_from_completed_schedule == (("ch11", 3),)
     assert terminal.artifact_digest == artifact.fingerprint
     assert holder["session"].state is PulseSessionState.COMPLETED
     assert dict(sequencer.snapshot())["state"] == "safe"
@@ -200,7 +206,7 @@ def test_reference_and_scan_forms_execute_the_exact_compiled_ir(
     )
     plan, _holder = _plan(port, FinitePulseExecutionRequest(document, artifact))
     terminal = RunController(ResourceArbiter(MemoryQuarantineJournal())).run(plan)
-    assert terminal.completed_schedule_trigger_counts == (
+    assert terminal.expected_trigger_counts_from_completed_schedule == (
         (trigger_channel, artifact.trigger_schedules[0].total),
     )
     assert dict(sequencer.snapshot())["state"] == "safe"

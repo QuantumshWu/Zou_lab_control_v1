@@ -22,7 +22,9 @@ from zlc_neutral_atom.timing import (
     PulseFiredAck,
     PulsePreparedAck,
     PulseTerminalAck,
+    PulseTerminalEvidenceKind,
     SequencerCapabilitySnapshot,
+    SimulatedPulseReceipt,
 )
 from zlc_pulse import (
     PreparedPulseRef,
@@ -133,6 +135,7 @@ class VirtualSequencerExecutionEndpoint:
                     "clock_hz": float(self._sequencer.clock_hz),
                     "geometry_fingerprint": self._geometry,
                     "max_blocking_call_seconds": self._timeout,
+                    "terminal_evidence_kind": PulseTerminalEvidenceKind.SIMULATED.value,
                 }
             )
             self._binding_id = binding.binding_id
@@ -146,6 +149,7 @@ class VirtualSequencerExecutionEndpoint:
                 float(self._sequencer.clock_hz),
                 self._geometry,
                 self._timeout,
+                PulseTerminalEvidenceKind.SIMULATED,
                 fingerprint,
             )
 
@@ -266,9 +270,10 @@ class VirtualSequencerExecutionEndpoint:
                 raise ValueError("completion artifact digest differs")
             artifact = session.request.artifact
             operation_epoch = session.operation_epoch
+        deadline = time.monotonic() + command.timeout_seconds
         if not self._sequencer.wait_compiled_playback(
             command.artifact_digest,
-            command.timeout_seconds,
+            max(0.0, deadline - time.monotonic()),
         ):
             raise TimeoutError("sequencer did not reach logical terminal")
         delay_wait = (
@@ -277,6 +282,10 @@ class VirtualSequencerExecutionEndpoint:
             * float(self._sequencer.sleep_scale)
         )
         if delay_wait > 0:
+            if delay_wait > max(0.0, deadline - time.monotonic()):
+                raise TimeoutError(
+                    "sequencer output-delay tail exceeds completion deadline"
+                )
             time.sleep(delay_wait)
         counts = tuple(
             (schedule.channel, schedule.total)
@@ -294,14 +303,19 @@ class VirtualSequencerExecutionEndpoint:
             self._sequencer.set_safe_state()
             raise RuntimeError("virtual pulse completion was superseded by interrupt")
         with self._lock:
+            playback = build_pulse_playback(artifact)
             return PulseTerminalAck(
                 command.session_id,
                 binding.binding_id,
                 binding.connection_generation,
-                session.artifact_digest,
-                True,
-                counts,
-                delay_wait,
+                SimulatedPulseReceipt(
+                    session.artifact_digest,
+                    "Zou_lab_control.VirtualSequencer/v1",
+                    counts,
+                    playback.logical_duration,
+                    artifact.max_configured_output_delay_ticks
+                    / artifact.target_ir.clock_hz,
+                ),
             )
 
     def close_session(
@@ -436,6 +450,9 @@ class RemotePulseExecutionEndpoint:
                     "clock_hz": self._clock_hz,
                     "geometry_fingerprint": self._geometry,
                     "max_blocking_call_seconds": self._timeout,
+                    "terminal_evidence_kind": (
+                        PulseTerminalEvidenceKind.HARDWARE_RAW_REGISTERS.value
+                    ),
                 }
             )
             self._binding_id = binding.binding_id
@@ -449,6 +466,7 @@ class RemotePulseExecutionEndpoint:
                 self._clock_hz,
                 self._geometry,
                 self._timeout,
+                PulseTerminalEvidenceKind.HARDWARE_RAW_REGISTERS,
                 fingerprint,
             )
 
@@ -556,14 +574,8 @@ class RemotePulseExecutionEndpoint:
             if command.timeout_seconds > self._timeout:
                 raise ValueError("completion timeout exceeds sequencer capability")
             reference = session.prepared_ref
-            artifact = session.request.artifact
             operation_epoch = session.operation_epoch
         completion = self._client.complete(reference, timeout=command.timeout_seconds)
-        if not completion.logical_done:
-            raise TimeoutError("remote sequencer did not reach logical terminal")
-        configured_delay = (
-            artifact.max_configured_output_delay_ticks / artifact.target_ir.clock_hz
-        )
         with self._lock:
             superseded = (
                 operation_epoch != self._operation_epoch
@@ -580,10 +592,7 @@ class RemotePulseExecutionEndpoint:
                 command.session_id,
                 binding.binding_id,
                 binding.connection_generation,
-                session.artifact_digest,
-                True,
-                completion.completed_schedule_trigger_counts,
-                configured_delay,
+                completion,
             )
 
     def close_session(self, binding: BoundDevice, command: SessionCloseCommand) -> SessionClosedAck:

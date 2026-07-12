@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from conftest import pulse_backend_completion_for
 
 from fpga.pulse_streamer.host.image import StreamerParams
 from zlc_pulse import (
@@ -66,9 +67,9 @@ class AppSession:
     def fire(self, artifact):
         self.events.append("fire")
 
-    def wait_done(self, artifact, timeout=None):
+    def await_completion(self, artifact, timeout=None):
         self.events.append("wait")
-        return True
+        return pulse_backend_completion_for(artifact)
 
     def snapshot(self):
         return {"transport": "test"}

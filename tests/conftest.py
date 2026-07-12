@@ -197,3 +197,54 @@ def add_logic_row(con, data):
     kc.setCurrentIndex(i)
     con._add_panel()
     return con.logic_nodes[-1]
+
+
+def pulse_backend_completion_for(artifact, *, transport_id="test-transport"):
+    """One valid typed hardware-backend receipt for current pulse unit tests."""
+
+    from fpga.pulse_streamer.host.image import STATUS_DONE
+    from zlc_pulse import (
+        AUTONOMOUS_TABLE_READ_RECIPE,
+        POST_TERMINAL_TAIL_WAIT_RECIPE,
+        STATIC_STATUS_READ_RECIPE,
+        AutonomousTableTerminalEvidence,
+        PostTerminalTailEvidence,
+        PulseBackendCompletion,
+        PulseExecutionForm,
+        StaticOnceTerminalEvidence,
+    )
+
+    if artifact.execution_form is PulseExecutionForm.AUTONOMOUS_SCAN_ONCE:
+        cursor = len(artifact.target_ir.scan_points) - 1
+        terminal = AutonomousTableTerminalEvidence(
+            AUTONOMOUS_TABLE_READ_RECIPE,
+            transport_id,
+            STATUS_DONE,
+            cursor,
+            STATUS_DONE,
+            cursor,
+            False,
+            2,
+        )
+    else:
+        terminal = StaticOnceTerminalEvidence(
+            STATIC_STATUS_READ_RECIPE,
+            transport_id,
+            STATUS_DONE,
+            STATUS_DONE,
+            False,
+            2,
+        )
+    required_ticks = artifact.max_configured_output_delay_ticks
+    elapsed_ns = int(
+        (required_ticks * 1_000_000_000 + artifact.target_ir.clock_hz - 1)
+        // artifact.target_ir.clock_hz
+    )
+    tail = PostTerminalTailEvidence(
+        terminal.fingerprint,
+        POST_TERMINAL_TAIL_WAIT_RECIPE,
+        required_ticks,
+        artifact.target_ir.clock_hz,
+        elapsed_ns,
+    )
+    return PulseBackendCompletion(terminal, tail)

@@ -16,6 +16,7 @@ from fpga.pulse_streamer.host.image import (
 
 from .artifact import CompiledPulseArtifact
 from .deployment import APPROVED_DEPLOYED_TARGET_ABI, validate_deployed_target
+from .evidence import PulseBackendCompletion
 from .server import PulseExecutionService, serve_pulse_execution_service
 from .target import PulseTarget, load_pulse_target
 from .transport import (
@@ -43,11 +44,11 @@ class DeployedStreamerSession(Protocol):
 
     def fire(self, artifact: CompiledPulseArtifact) -> None: ...
 
-    def wait_done(
+    def await_completion(
         self,
         artifact: CompiledPulseArtifact,
         timeout: float | None,
-    ) -> bool: ...
+    ) -> PulseBackendCompletion | None: ...
 
     def snapshot(self) -> dict[str, object]: ...
 

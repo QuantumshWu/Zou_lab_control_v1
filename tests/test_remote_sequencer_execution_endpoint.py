@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import threading
+from conftest import pulse_backend_completion_for
 
 from zlc_neutral_atom.runtime import (
     CleanupStepAck,
@@ -20,8 +21,10 @@ from zlc_neutral_atom.runtime import (
 from zlc_neutral_atom.timing import (
     FinitePulseExecutionRequest,
     PreparePulseCommand,
+    PulseTerminalEvidenceKind,
 )
 from zlc_pulse import (
+    PulseCompletion,
     PulseExecutionForm,
     PulseExecutionService,
     RemotePulseExecutionClient,
@@ -51,6 +54,7 @@ class Backend:
         self.actions: list[str] = []
         self.prepared = None
         self.safe = True
+        self.completion = None
 
     def prepare(self, artifact):
         self.actions.append("prepare")
@@ -61,10 +65,14 @@ class Backend:
         assert artifact is self.prepared
         self.actions.append("fire")
 
-    def wait_done(self, artifact, timeout):
+    def await_completion(self, artifact, timeout):
         assert artifact is self.prepared
         self.actions.append("wait")
-        return True
+        self.completion = pulse_backend_completion_for(
+            artifact,
+            transport_id="remote-test",
+        )
+        return self.completion
 
     def safe_state(self):
         self.actions.append("safe")
@@ -195,8 +203,12 @@ def test_remote_current_endpoint_runs_exact_artifact_and_closes_safe():
         _plan(port, FinitePulseExecutionRequest(document, artifact))
     )
 
-    assert terminal.logical_done
-    assert terminal.completed_schedule_trigger_counts == (("ch11", 3),)
+    assert isinstance(terminal.receipt, PulseCompletion)
+    assert terminal.evidence_kind is PulseTerminalEvidenceKind.HARDWARE_RAW_REGISTERS
+    assert terminal.expected_trigger_counts_from_completed_schedule == (("ch11", 3),)
+    assert terminal.receipt.hardware_terminal.transport_id == "remote-test"
+    assert terminal.receipt.hardware_terminal == backend.completion.hardware_terminal
+    assert terminal.receipt.post_terminal_tail == backend.completion.post_terminal_tail
     assert terminal.artifact_digest == artifact.fingerprint
     assert backend.actions == ["prepare", "fire", "wait", "safe"]
 

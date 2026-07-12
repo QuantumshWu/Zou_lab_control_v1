@@ -28,6 +28,8 @@ from zlc_neutral_atom.runtime import (
 )
 from zlc_neutral_atom.timing import (
     FinitePulseExecutionRequest,
+    PulseTerminalEvidenceKind,
+    SimulatedPulseReceipt,
     TriggeredCaptureSpec,
     compile_capture_cell_plan,
     compile_triggered_pipeline,
@@ -157,7 +159,11 @@ def test_camera_is_armed_before_one_fire_and_all_frames_are_exactly_materialized
         assert [item.source_ordinal for item in result.dataset.event_metadata] == [0, 1, 2]
         assert [item.produced_count for item in result.dataset.event_metadata] == [1, 2, 3]
         assert result.capture_terminal.produced_count == 3
-        assert result.pulse_terminal.completed_schedule_trigger_counts == (("ch11", 3),)
+        assert (
+            result.pulse_terminal.expected_trigger_counts_from_completed_schedule
+            == (("ch11", 3),)
+        )
+        assert result.pulse_terminal.evidence_kind is PulseTerminalEvidenceKind.SIMULATED
         assert [item["action"] for item in sequencer.history] == [
             "prepare",
             "fire",
@@ -215,7 +221,8 @@ def test_triggered_capture_artifact_persists_pulse_lineage(tmp_path):
         assert lineage.cell_plan == plan
         assert lineage.cell_plan.dataset_schema_fingerprint == stored.block.schema.fingerprint
         assert lineage.cell_plan.cell_permutation_digest == stored.provenance.join_plan_digest
-        assert lineage.terminal.logical_done
+        assert isinstance(lineage.terminal.receipt, SimulatedPulseReceipt)
+        assert lineage.terminal.evidence_kind is PulseTerminalEvidenceKind.SIMULATED
         assert stored.terminal.produced_count == lineage.expected_trigger_count
         assert dict(sequencer.snapshot())["state"] == "safe"
     finally:
