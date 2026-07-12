@@ -26,7 +26,7 @@
 
 以下条款是本文最高优先级的实现约束。若后文示例、类型草图、路线图或未来能力描述与本节冲突，以本节为准，冲突内容必须删除或降级，不能由实现者自行折中：
 
-1. **现有 RTL/bitstream 冻结。** baseline 不生成、不修改、不重烧 bitstream。只有 E0a/Q0 在已批准工作余量内证明真实 loss/reorder 且软件、相机配置和时序余量无法解决，或 golden/model/真机证据证明现有 RTL 有 bug、偏离既定设计时，才允许进入单独的 H2 硬件修复评审；架构想获得更漂亮或更强的证明，不构成改硬件理由。
+1. **现有 RTL/bitstream 冻结。** baseline 不生成、不修改、不重烧 bitstream；默认实现、迁移脚本和 CI 也不得隐式调用 Vivado synthesis/implementation/programming。只有 E0a/Q0 在已批准工作余量内证明真实 loss/reorder 且软件、相机配置和时序余量无法解决，或 golden/model/真机证据证明现有 RTL 有 bug、偏离既定设计时，才允许进入单独的 H2 硬件修复评审；架构想获得更漂亮或更强的证明，不构成改硬件理由。H2 只是新提案的准入门，不自动授权修改、构建或烧录，仍需 PI/硬件 owner 单独批准。
 2. **正常 PulseScan 只使用现有 FPGA 的无缝自主执行。** `AUTONOMOUS_STREAMED` 是正常执行方式族，近期装载方式基线是 fire 前全部物理 rows resident 的 `AUTONOMOUS_RESIDENT`。对 SCAN_SLOT/MOT，`HOST_STEPPED_GROUP`、逐 cell fire-and-wait、single-cell gate 和 host sleep edge scheduling 不得作为 baseline、首光方案、容量 fallback 或更强关联证明的替代品。
 3. **唯一已接受的非无缝例外是 API-slot 既有 segmented 路径。** 它只适用于 adapter 已证明一次自主 sweep 中无法更新的 API_SLOT 值；其 host 按 point/segment 发有限 pulse 并等待完成的事实必须如实标记为 `API_SLOT_SEGMENTED_EXISTING`，不得包装成 autonomous execution。SCAN_SLOT/MOT 不得借此退化为 host stepping。
 4. **能由现有硬件确定的精密时序必须由硬件确定。** FPGA 决定 pulse/trigger edge schedule，qCMOS 决定 exposure/readout/frame production；host 只冻结计划、验证工作 envelope、供应已冻结的获准 refill chunk、排空数据并做末端验证，不参与微秒/纳秒时序调度。
@@ -42,6 +42,38 @@
 | 逻辑 TriggerKey/ScanCellKey 顺序 | 冻结 CompiledPulse schedule/PointLayout | 在有效 Q0 qualification envelope 内按序建立 provisional mapping |
 | 完整 run 是否可成为权威 artifact | 现有 FPGA terminal/progress + qCMOS metadata + exact pipeline coverage 的 EndAttestation | 比对、拒绝、记录 provenance；不得补点或猜点 |
 | 部署身份 | 现有 `image.build_fingerprint`/geometry/ABI 握手与发布资产映射 | mismatch 时禁止 upload/fire；不得声称验证旧 bitstream 未暴露的内容/timing digest |
+
+为避免实现者从分散章节拼出不同结论，baseline 的四个判定只有以下一套：
+
+```text
+execution_allowed :=
+  AUTONOMOUS_RESIDENT
+  or (AUTONOMOUS_REFILLED and §15.4 capability 已真实发布)
+  or (API_SLOT_SEGMENTED_EXISTING and adapter 已证明 API value 无法无缝更新)
+
+fire_allowed :=
+  execution_allowed
+  and current image.build_fingerprint/geometry/ABI handshake 匹配
+  and frozen compiled schedule/settings/expected frame budget 完整
+  and 每个 formal physical source 的 qualification/capability 精确覆盖本设备、软件版本与冻结设置
+      （若 source 是 qCMOS：active Q0 还必须覆盖 camera settings 与 trigger interval margin）
+  and source-specific inflight buffer、host exact retention、consumer 与 artifact sink 预算通过
+      （若 source 是 qCMOS：driver ring 必须按 max-inflight 而非 total frames 定容）
+  and exact reservation/cursor/owner claims 已建立
+
+formal_commit_allowed :=
+  FIRE 线性化点为本 run/segment 生成的 authorization 仍可追溯
+  and existing FPGA terminal/progress 与完整冻结 schedule 一致
+  and 每个 formal source 的 produced/drained/terminal evidence 与冻结计划一致
+      （若 source 是 qCMOS：produced total、frame/camera stamp、timestamp 容差全部通过）
+  and processor/DatasetBuilder/coverage/EOS、source termination/join 与 safety disposition 全部通过
+
+hardware_change_review_allowed :=
+  批准余量内真实 loss/reorder 无法由 camera/software/margin 修正
+  or 现有 RTL bug/对既定设计的偏离已有 golden/model/真机证据
+```
+
+任一 `fire_allowed` 条件不成立都必须在 arm/FIRE 前拒绝。任一 `formal_commit_allowed` 条件不成立都使整个 attempt `INVALID`，不得提交成功 artifact、不得按已有数量补点、不得把显示中的 provisional 数据升级为权威结果。`hardware_change_review_allowed` 为假时，任何新寄存器、stamp FIFO、counter、ROM attestation、watchdog 或 bitstream 重建都不在本架构范围内。
 
 ## 2. 用户体验兼容目标
 
@@ -1941,8 +1973,10 @@ EndAttestation
   expected_trigger_total_from_completed_schedule == camera produced total
   frame/camera stamp按Q0语义连续，timestamp间隔在Q0容差内
   DatasetBuilder/processor/EOS coverage完整
-  任一不符 -> 整 run INVALID并丢弃；是否重跑只由用户或显式有限RetryPolicy决定；全部通过才提交
+  任一不符 -> 本 attempt 整体 INVALID并丢弃；是否重跑只由用户或显式有限RetryPolicy决定；全部通过才提交
 ```
+
+这里的“重跑”始终创建新的 `run_id/attempt_id`，重新执行 preflight、qualification FIRE gate、arm/FIRE、采集与 EndAttestation；失败 attempt 的 RunFailureRecord 和原始诊断 provenance 必须保留。禁止在原 attempt 中从失败位置续接、只补缺失 point、复用旧 authorization，或由 UI/adapter 在未声明 RetryPolicy 时静默重跑。即使 RetryPolicy 允许自动重试，也必须有明确次数/时间预算，且只有某个完整新 attempt 独立通过全部 commit 条件时才产生成功 ScanArtifact。
 
 通过 Q0 后，`frame[i] -> frozen trigger schedule[i] -> TriggerKey` 是该 qCMOS/工作区间的 adapter contract。Q0 是对一组冻结设备身份、firmware/SDK/driver/adapter、采集设置、buffer policy 和 trigger interval/margin 的发布资格证明，不要求每个 run 重做长时间统计实验；每个 run 只验证自己仍落在该 envelope 并执行 EndAttestation。上述任一身份/版本/语义字段改变、设置超出已批准集合、或归因完成后确认一次camera-envelope合同违例，都使该 qualification 对相应工作点失效，恢复 Formal capability 前必须重新Q0 qualification。这里依赖的是经真机验证的确定性外触发和顺序交付，不是运行时“取 latest”或两个自由流按 N zip；host侧 reservation/cursor仍保证相机已交付的每帧不会在软件缓冲中静默跳过。
 
