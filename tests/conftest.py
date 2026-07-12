@@ -140,6 +140,7 @@ def make_console(exp, *, running_nodes=None, window_px=(900, 600)):
                       running_nodes=list(running_nodes or ()),
                       runtime_fence=runtime,
                       runtime_fence_provider=lambda: exp._require_runtime_services())
+    con._enroll_composed_nodes(tuple(running_nodes or ()), runtime)
     con._timer.stop()
     return con
 

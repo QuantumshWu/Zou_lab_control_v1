@@ -23,6 +23,8 @@ NOT pin the frame signal's hub name (the non-default-camera prefix is owned else
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import os
 from pathlib import Path
 import sys
@@ -185,12 +187,12 @@ def test_console_monitor_camera_streams_with_no_pulse_running():
         con._logic_editors[id(row)].form.seed_values({"camera": "monitor_camera"})
         con._start_logic_node(row)
         node = con._logic_nodes[id(row)]
-        assert node.camera is exp.devices["monitor_camera"]
+        assert node.camera is raw_device_set(exp)["monitor_camera"]
         node.step()                                        # one synchronous cycle -- NO pulse fired
         sigs = sorted(node.published_signals())
         assert len(sigs) == 1                              # one frame signal for frames_per_cycle=1
         block = np.asarray(con.hub.latest(sigs[0]))
-        assert block.shape == (1, 1) + tuple(exp.devices["monitor_camera"].sensor_shape)
+        assert block.shape == (1, 1) + tuple(raw_device_set(exp)["monitor_camera"].sensor_shape)
     finally:
         con.shutdown()
         exp.close()

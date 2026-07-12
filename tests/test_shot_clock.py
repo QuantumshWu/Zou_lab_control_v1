@@ -24,6 +24,8 @@ These guards pin:
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 from pathlib import Path
 import sys
 
@@ -57,7 +59,7 @@ def test_snapshot_at_aligns_raw_frames_with_lagging_occupancy():
     back to the occupancy's shot)."""
     exp = _calibrated()
     hub = SignalHub()
-    cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+    cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                             frames_per_cycle=3, repeat=0)
     det = OccupancyProcessor(hub, calibration=exp.readout.current,
                              source_expr={"inputs": ["frame_1"], "source": "value = signal"},
@@ -154,7 +156,7 @@ def test_console_display_shot_holds_camera_to_lagging_occupancy():
     exp = _calibrated()
     console = _console(exp)
     hub = console.hub
-    cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+    cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                             frames_per_cycle=3, repeat=0)
     det = OccupancyProcessor(hub, calibration=exp.readout.current,
                              source_expr={"inputs": ["frame_1"], "source": "value = signal"},
@@ -197,7 +199,7 @@ def test_display_shot_excludes_a_faulted_nodes_frozen_signal():
     exp = _calibrated()
     console = _console(exp)
     hub = console.hub
-    cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+    cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                             frames_per_cycle=3, repeat=0)
     det = OccupancyProcessor(hub, calibration=exp.readout.current,
                              source_expr={"inputs": ["frame_1"], "source": "value = signal"},
@@ -234,7 +236,7 @@ def test_lone_camera_panel_is_not_held_back():
     exp = _calibrated()
     console = _console(exp)
     hub = console.hub
-    cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer, repeat=0)
+    cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer, repeat=0)
     try:
         _add_2d(console, ["frame_0"])
         console.running_nodes = [cam]

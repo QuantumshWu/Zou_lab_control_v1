@@ -15,6 +15,8 @@ cleared ROI through the same code path an open camera pushes to hardware.
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 from pathlib import Path
 import sys
 
@@ -96,9 +98,9 @@ def test_camera_measurement_declares_data_shape_at_build():
 
     exp = na.connect("virtual")
     try:
-        node = CameraMeasurement(SignalHub(), exp.devices.camera)
+        node = CameraMeasurement(SignalHub(), raw_device_set(exp).camera)
         frame_spec = next(spec for spec in node.output_specs() if spec.name == "frame_0")
-        assert frame_spec.data_shape == exp.devices.camera.frame_shape  # declared BEFORE any frame
+        assert frame_spec.data_shape == raw_device_set(exp).camera.frame_shape  # declared BEFORE any frame
     finally:
         exp.close()
 
@@ -114,10 +116,10 @@ def test_measurement_layer_blank_region_clears_the_roi_end_to_end():
 
     exp = na.connect("virtual")
     try:
-        node = CameraMeasurement(SignalHub(), exp.devices.camera)
+        node = CameraMeasurement(SignalHub(), raw_device_set(exp).camera)
         node.set_acquisition_parameters(region=[8, 24, 8, 24])
-        assert exp.devices.camera.roi is not None            # a real sub-array was applied
+        assert raw_device_set(exp).camera.roi is not None            # a real sub-array was applied
         node.set_acquisition_parameters(region="")           # blank box = back to full frame
-        assert exp.devices.camera.roi is None
+        assert raw_device_set(exp).camera.roi is None
     finally:
         exp.close()

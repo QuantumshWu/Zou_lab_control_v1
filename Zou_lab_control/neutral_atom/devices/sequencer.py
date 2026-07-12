@@ -1630,7 +1630,7 @@ class PulseController:
     """
 
     def __init__(self, sequencer: SequencerDevice, pulse: PulseSequence | PulseTableState):
-        self.sequencer = sequencer
+        self._sequencer = sequencer
         self.pulse = pulse
         self.scan_table = [list(row) for row in (getattr(pulse, "scan_table", []) or [])]
         self.slots: dict[str, float] = {}
@@ -1778,7 +1778,7 @@ class PulseController:
         repeat_forever: bool | None = None,
         scan_repeats: int | None = None,
     ) -> RuntimeSequenceProgram:
-        self.last_program = self.sequencer.prepare(
+        self.last_program = self._sequencer.prepare(
             self.payload(scan_table=scan_table, repeat_forever=repeat_forever, scan_repeats=scan_repeats))
         return self.last_program
 
@@ -1811,22 +1811,22 @@ class PulseController:
         # prepare is guaranteed to re-upload rather than hit the cache.  Notebook, GUI and real all go
         # through this one seam, so the API and the GUI cannot drift into different run semantics.
         self.stop()
-        self.last_program = self.sequencer.prepare(payload)
+        self.last_program = self._sequencer.prepare(payload)
         program = self.last_program
-        self.sequencer.fire()
+        self._sequencer.fire()
         if wait:
-            if not self.sequencer.wait_done(timeout=timeout):
+            if not self._sequencer.wait_done(timeout=timeout):
                 raise TimeoutError(f"sequencer did not report done for pulse {program.sequence_name!r}.")
         return program
 
     def wait_done(self, timeout: float | None = None, *, stop=None) -> bool:
-        return bool(self.sequencer.wait_done(timeout=timeout, stop=stop))
+        return bool(self._sequencer.wait_done(timeout=timeout, stop=stop))
 
     def stop(self) -> None:
-        if hasattr(self.sequencer, "set_safe_state"):
-            self.sequencer.set_safe_state()
-        elif hasattr(self.sequencer, "abort"):
-            self.sequencer.abort()
+        if hasattr(self._sequencer, "set_safe_state"):
+            self._sequencer.set_safe_state()
+        elif hasattr(self._sequencer, "abort"):
+            self._sequencer.abort()
 
     def off_pulse(self) -> None:
         """Stop playback and drive the safe state (alias of :meth:`stop`).
@@ -1898,7 +1898,7 @@ class PulseController:
         controller, the GUI, or any other raw-API caller).  This is the same
         source the GUI's "Sync" button uses, so notebook and GUI always agree
         on what is running."""
-        snap = self.sequencer.snapshot() if hasattr(self.sequencer, "snapshot") else {}
+        snap = self._sequencer.snapshot() if hasattr(self._sequencer, "snapshot") else {}
         payload = snap.get("last_payload_json")
         if not payload:
             return None
@@ -1925,9 +1925,9 @@ class PulseController:
             "pulse_type": type(self.pulse).__name__,
             "slots": dict(self.slots),
             "scan_table": [list(row) for row in self.scan_table],
-            "sequencer_type": type(self.sequencer).__name__,
-            "sequencer_channels": list(getattr(self.sequencer, "channels", [])),
-            "clock_hz": float(getattr(self.sequencer, "clock_hz", 0.0)),
+            "sequencer_type": type(self._sequencer).__name__,
+            "sequencer_channels": list(getattr(self._sequencer, "channels", [])),
+            "clock_hz": float(getattr(self._sequencer, "clock_hz", 0.0)),
             "last_program": last,
         }
 

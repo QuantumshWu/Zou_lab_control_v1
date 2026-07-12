@@ -8,7 +8,7 @@ results to the shared SignalHub.  ``run`` DRIVES
 through the current calibration's box/PSF method and runs the held-out
 characterization in ``operations.fidelity``); it re-implements NO math and reads no
 simulation ground truth -- the only data source is a saved frames folder, so a
-virtual run (``na.write_virtual_run`` output) and a real run traverse the identical
+virtual run (``na.simulation.write_virtual_run`` output) and a real run traverse the identical
 path, differing only in who wrote the frames.
 """
 
@@ -43,7 +43,7 @@ def readout_fidelity(readout) -> ProcessorSpec:
 
     params = (
         ParamDecl("data_dir", "Frames folder", "path", default="", path_mode="dir",
-                  required=True, tooltip="Folder of saved frames (na.write_virtual_run output, or a real run)."),
+                  required=True, tooltip="Folder of saved frames (na.simulation.write_virtual_run output, or a real run)."),
         ParamDecl("prefix", "Frame prefix", "text", default="img"),
         ParamDecl("shots_per_group", "Shots/group", "int", default=DEFAULT_SHOTS_PER_GROUP, lo=2,
                   hi=_MAX_SHOTS_PER_GROUP),

@@ -19,6 +19,8 @@ Each test pins one rule:
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import json
 from pathlib import Path
 import sys
@@ -229,7 +231,7 @@ def test_capture_routes_exposure_through_the_one_configure_imaging_path(monkeypa
     exp.capture(exposure=2e-3, display=False)
     assert calls and calls[0]["exposure"] == pytest.approx(2e-3)
     assert "camera" not in calls[0]                     # timing owns only the readout role
-    assert exp.camera_exposure() == pytest.approx(2e-3)   # the camera really got it
+    assert raw_device_set(exp).camera_exposure() == pytest.approx(2e-3)   # the camera really got it
     assert exp.sequence is not seq_before               # and the imaging sequence was rebuilt
 
 
@@ -242,10 +244,10 @@ def test_capture_free_running_camera_never_rebuilds_or_fires(monkeypatch):
 
     exp = na.connect("virtual")
     try:
-        monitor = exp.devices["monitor_camera"]
+        monitor = raw_device_set(exp)["monitor_camera"]
         assert monitor.effective_trigger_channels == ()
         sequence_before = exp.sequence
-        exp.devices.sequencer.history.clear()
+        raw_device_set(exp).sequencer.history.clear()
 
         def forbidden_rebuild(*args, **kwargs):
             raise AssertionError("free-running capture must not rebuild a readout pulse")
@@ -255,7 +257,7 @@ def test_capture_free_running_camera_never_rebuilds_or_fires(monkeypatch):
 
         assert monitor.exposure == pytest.approx(3e-3)
         assert exp.sequence is sequence_before
-        assert exp.devices.sequencer.history == []
+        assert raw_device_set(exp).sequencer.history == []
         assert result.sequence is None
         assert result.summary()["sequence"] is None
     finally:
@@ -269,11 +271,11 @@ def test_capture_rejects_non_readout_external_camera_before_hardware(monkeypatch
 
     exp = na.connect("virtual")
     try:
-        monitor = exp.devices["monitor_camera"]
+        monitor = raw_device_set(exp)["monitor_camera"]
         monitor.trigger_source = "mot_trigger"
         monitor.capture_trigger_channels = ("mot_trigger",)
         assert monitor.effective_trigger_channels == ("mot_trigger",)
-        sequencer = exp.devices.sequencer
+        sequencer = raw_device_set(exp).sequencer
         sequencer.history.clear()
 
         def forbidden(*args, **kwargs):

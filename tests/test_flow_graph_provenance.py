@@ -21,6 +21,8 @@ Runs headless (``QT_QPA_PLATFORM=offscreen``); virtual sleeps are fast-forwarded
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import os
 import sys
 from pathlib import Path
@@ -87,9 +89,9 @@ def test_multi_input_figure_captures_a_branching_graph():
     exp = na.connect("virtual")
     try:
         hub = SignalHub()
-        cam_a = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+        cam_a = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                                   prefix="a_", repeat=1)
-        cam_b = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+        cam_b = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                                   prefix="b_", repeat=1)
         # A processor whose source expression FUSES the two cameras' frames -> it consumes BOTH signals.
         proc = OccupancyProcessor(
@@ -134,7 +136,7 @@ def test_processor_chain_keeps_intermediate_identity():
     exp = na.connect("virtual")
     try:
         hub = SignalHub()
-        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                                 prefix="cam_", repeat=1)
         proc = OccupancyProcessor(hub, source_expr=SignalExpr(["cam_frame_0"], DEFAULT_SOURCE),
                                   prefix="occ_")
@@ -219,7 +221,7 @@ def test_source_node_is_marked_as_holding_devices():
     exp = na.connect("virtual")
     try:
         hub = SignalHub()
-        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                                 prefix="cam_", repeat=1)
         fire_live_imaging(exp)
         for _ in range(2):
@@ -243,7 +245,7 @@ def test_device_holding_source_expands_to_device_leaves():
     exp = na.connect("virtual")
     try:
         hub = SignalHub()
-        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                                 prefix="cam_", repeat=1)
         fire_live_imaging(exp)
         for _ in range(2):
@@ -380,9 +382,9 @@ def test_flow_graph_round_trips_through_the_console_save(tmp_path):
     console = None
     try:
         hub = SignalHub()
-        cam_a = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+        cam_a = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                                   prefix="a_", repeat=1)
-        cam_b = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+        cam_b = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                                   prefix="b_", repeat=1)
         proc = OccupancyProcessor(
             hub, source_expr=SignalExpr(["a_frame_0", "b_frame_0"], "value = (signal[0] + signal[1]) / 2"),
@@ -440,7 +442,7 @@ def test_grid_save_folds_the_flow_graph_like_a_single_panel(tmp_path):
     exp = na.connect("virtual")
     try:
         hub = SignalHub()
-        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                                 prefix="cam_", repeat=1)
         proc = OccupancyProcessor(hub, source_expr=SignalExpr(["cam_frame_0"], DEFAULT_SOURCE),
                                   prefix="occ_")

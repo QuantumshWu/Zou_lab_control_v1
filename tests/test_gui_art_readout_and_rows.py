@@ -14,6 +14,7 @@ import sys
 
 import numpy as np
 import pytest
+from conftest import raw_device_set
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
@@ -203,7 +204,7 @@ def test_device_manager_loaded_row_is_compact_and_cannot_overflow(qt):
     from Zou_lab_control.neutral_atom._gui import _session_device_binding
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
     try:
-        panel = DeviceManagerPanel(exp.devices, session_binding=_session_device_binding(exp))
+        panel = DeviceManagerPanel(raw_device_set(exp), session_binding=_session_device_binding(exp))
         loaded = panel._loaded_body
         # the Loaded body = the Open-devices button + one PLAIN row per device (the button is skipped).
         rows = [loaded.itemAt(i).widget() for i in range(loaded.count())

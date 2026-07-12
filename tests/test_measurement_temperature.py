@@ -40,6 +40,7 @@ from Zou_lab_control.neutral_atom.operations.temperature import (
     fit_temperature,
     release_recapture_survival,
 )
+from Zou_lab_control.neutral_atom.testing import VirtualSequencer, bind_test_pulse
 
 
 def wait_until_done(task, *, timeout=10.0):
@@ -232,13 +233,12 @@ def test_virtual_parses_trap_off_from_release_recapture_sequence():
     triggers.  Frame 0 has no preceding trap-off; frame 1 carries the bound t_off."""
 
     from Zou_lab_control.neutral_atom.devices.virtual import trap_off_durations_per_frame
-    from Zou_lab_control.neutral_atom.devices import bind_pulse
 
     state = build_release_recapture_pulse(
         channels=["trap", "probe", "emCCD"], exposure=2e-3, settle=2e-4, recapture=2e-4
     )
-    sequencer = na.VirtualSequencer(channels=["trap", "probe", "emCCD"])
-    pulse = bind_pulse(sequencer, state)
+    sequencer = VirtualSequencer(channels=["trap", "probe", "emCCD"])
+    pulse = bind_test_pulse(sequencer, state)
 
     for t_off in (0.0, 2e-5, 7.5e-5, 1.5e-4):
         seq = pulse.frame_sequence(2, time_ns=t_off * 1e9)
@@ -312,7 +312,7 @@ def test_temperature_scan_virtual_survival_decays_with_t_off():
     state = build_release_recapture_pulse(
         channels=list(raw_device_set(exp).sequencer.channels), exposure=20e-3, settle=2e-4, recapture=2e-4
     )
-    pulse = na.bind_pulse(raw_device_set(exp).sequencer, state)
+    pulse = bind_test_pulse(raw_device_set(exp).sequencer, state)
 
     t_off = np.linspace(0.0, 300e-6, 13)
     # Many shots per point so the survival FRACTION is a low-noise estimate of the
@@ -345,7 +345,7 @@ def test_temperature_scan_virtual_per_site_returns_one_column_per_site():
     state = build_release_recapture_pulse(
         channels=list(raw_device_set(exp).sequencer.channels), exposure=2e-3, settle=2e-4, recapture=2e-4
     )
-    pulse = na.bind_pulse(raw_device_set(exp).sequencer, state)
+    pulse = bind_test_pulse(raw_device_set(exp).sequencer, state)
 
     t_off = np.array([0.0, 1e-5, 2e-5, 4e-5])
     scan = exp.readout.temperature(t_off, pulse=pulse, shots=2, per_site=True, live=False, display=False)
@@ -359,7 +359,7 @@ def test_temperature_requires_thresholds():
     exp = na.connect("virtual", sitemap={"grid_shape": (2, 3), "image_shape": (48, 64)})
     exp.readout.sitemap(method="box", frames=4, display=False)   # no thresholds yet
     state = build_release_recapture_pulse(channels=list(raw_device_set(exp).sequencer.channels))
-    pulse = na.bind_pulse(raw_device_set(exp).sequencer, state)
+    pulse = bind_test_pulse(raw_device_set(exp).sequencer, state)
     with pytest.raises(RuntimeError):
         exp.readout.temperature([0.0, 1e-5], pulse=pulse, live=False, display=False)
 
@@ -375,7 +375,7 @@ def test_temperature_rejects_pulse_without_t_off_slot():
         ],
         repeat_forever=False,
     )
-    pulse = na.bind_pulse(raw_device_set(exp).sequencer, state)
+    pulse = bind_test_pulse(raw_device_set(exp).sequencer, state)
     with pytest.raises(ValueError):
         exp.readout.temperature([0.0, 1e-5], pulse=pulse, live=False, display=False)
 
@@ -385,7 +385,7 @@ def test_temperature_scan_virtual_live_path_uses_frontend_session():
     state = build_release_recapture_pulse(
         channels=list(raw_device_set(exp).sequencer.channels), exposure=2e-3, settle=2e-4, recapture=2e-4
     )
-    pulse = na.bind_pulse(raw_device_set(exp).sequencer, state)
+    pulse = bind_test_pulse(raw_device_set(exp).sequencer, state)
 
     t_off = np.array([0.0, 1e-5, 2e-5, 4e-5])
     scan = exp.readout.temperature(t_off, pulse=pulse, shots=2, live=True, display=False, update_time=0.01)
@@ -408,7 +408,7 @@ def test_generic_scanned_measurement_drives_detection_axis_directly():
     cal = exp.readout.current
 
     hardware_channels = [f"ch{i:02d}" for i in range(8)]
-    sequencer = na.VirtualSequencer(channels=hardware_channels, clock_hz=100_000_000)
+    sequencer = VirtualSequencer(channels=hardware_channels, clock_hz=100_000_000)
     state = na.PulseTableState(
         port_catalog=PortCatalog.from_channels(["ch00", "ch03"]),
         periods=[
@@ -420,7 +420,7 @@ def test_generic_scanned_measurement_drives_detection_axis_directly():
         time_step_ns=10,
         repeat_forever=True,
     )
-    pulse = na.bind_pulse(sequencer, state)
+    pulse = bind_test_pulse(sequencer, state)
 
     times = np.array([2e-6, 4e-6, 8e-6])
     axis = ScanAxis(slot="exposure", values=times, label="Detection time (s)", unit="s", kind="duration")

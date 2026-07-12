@@ -15,6 +15,8 @@ round-trippable config model.
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -51,7 +53,7 @@ def exp():
 
 
 def _bound_panel(session) -> DeviceManagerPanel:
-    return DeviceManagerPanel(session.devices, session_binding=_session_device_binding(session))
+    return DeviceManagerPanel(raw_device_set(session), session_binding=_session_device_binding(session))
 
 
 def _card(panel, name):
@@ -61,10 +63,10 @@ def _card(panel, name):
 def test_untouched_editor_round_trips_the_session_config(exp):
     panel = _bound_panel(exp)
     cfg = panel.working_config()
-    assert cfg == exp.devices.to_config()          # opening the editor rewrites NOTHING
+    assert cfg == raw_device_set(exp).to_config()          # opening the editor rewrites NOTHING
     rebuilt = load_devices(read_config(cfg))       # and the dict is the real config model
     try:
-        assert set(rebuilt.devices) == set(exp.devices.devices)
+        assert set(rebuilt.devices) == set(raw_device_set(exp).devices)
     finally:
         rebuilt.close()
 
@@ -96,18 +98,18 @@ def test_apply_routes_to_the_session(exp):
     panel = _bound_panel(exp)
     _card(panel, "camera").widgets["exposure"].setValue(0.007)
     panel._apply()
-    assert exp.devices["camera"].exposure == 0.007     # session.load_config really ran
+    assert raw_device_set(exp)["camera"].exposure == 0.007     # session.load_config really ran
     assert panel._applied == panel.working_config()    # dot state: synced
 
 
 def test_invalid_json_field_blocks_apply_by_name(exp):
     panel = _bound_panel(exp)
-    before = exp.devices
+    before = raw_device_set(exp)
     _card(panel, "camera").widgets["capture_trigger_channels"].setText("not json")
     problems = panel._validation_problems()
     assert any("camera.capture_trigger_channels" in p for p in problems)
     panel._apply()
-    assert exp.devices is before                       # blocked: session untouched
+    assert raw_device_set(exp) is before                       # blocked: session untouched
 
 
 def test_no_session_entry_inits_and_upgrades_in_place():
@@ -125,7 +127,7 @@ def test_no_session_entry_inits_and_upgrades_in_place():
         panel._apply()
         assert inited, "on_init_session must be called with the working config"
         assert panel._apply_btn.text() == "Apply"      # upgraded in place
-        assert inited[0].devices["camera"] is not None
+        assert raw_device_set(inited[0])["camera"] is not None
     finally:
         for session in inited:
             session.close()
@@ -143,7 +145,7 @@ def test_na_device_manager_hands_the_created_session_back_via_window():
         panel._apply()                                 # press "Init devices"
         exp = window.session
         assert exp is not None                         # the session is handed back on the window
-        assert exp.devices["camera"] is not None and hasattr(exp, "readout")
+        assert raw_device_set(exp)["camera"] is not None and hasattr(exp, "readout")
         exp.close()
     finally:
         window.close()

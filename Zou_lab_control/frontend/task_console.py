@@ -7793,6 +7793,44 @@ class TaskConsole(QtWidgets.QWidget):
             raise RuntimeError("cannot replace runtime fence while nodes are active")
         self._legacy_runtime_fence = runtime_fence
 
+    def _enroll_composed_nodes(
+        self,
+        nodes: Sequence[object],
+        runtime_fence: object | None,
+    ) -> None:
+        """Start composition-provided nodes through the same runtime authority.
+
+        A device-bearing node is never adopted while already running: it first has
+        to acknowledge termination, then the fence owns its fresh start.  The
+        launcher and offscreen composition tests call this one entry so enrollment
+        semantics cannot drift.
+        """
+
+        for node in nodes:
+            if not hasattr(node, "start"):
+                continue
+            if runtime_fence is None:
+                if tuple(getattr(node, "referenced_devices", lambda: ())()):
+                    raise RuntimeError(
+                        "device-bearing running_nodes require a runtime authority"
+                    )
+                if not getattr(node, "running", False):
+                    node.start()
+                if node not in self.running_nodes:
+                    self.running_nodes.append(node)
+                continue
+            if getattr(node, "running", False):
+                if not self._stop_unmanaged_node_confirmed(node, timeout=2.0):
+                    raise RuntimeError(
+                        "passed running node could not terminate for LegacyRuntimeFence enrollment"
+                    )
+            handle = runtime_fence.start(node)
+            self._legacy_handles[id(node)] = handle
+            self._legacy_handle_fences[id(node)] = runtime_fence
+            handle.wait_started(2.0)
+            if node not in self.running_nodes:
+                self.running_nodes.append(node)
+
     def _current_runtime_fence(self):
         provider = self._runtime_fence_provider
         fence = provider() if provider is not None else self._legacy_runtime_fence
@@ -9950,34 +9988,10 @@ def show_task_console(
                           runtime_fence_provider=runtime_fence_provider, scale=scale,
                           window_ratio=window_ratio)
     console._on_close = on_close
-    # A passed-in node should stream the moment the window opens -- so the Monitor
-    # is live without the caller having to remember node.start().  start() is
-    # idempotent, so a node the caller already started (e.g. bring-up's
-    # readout.start()) keeps its own loop; only NON-running nodes are launched
-    # here.  (TaskConsole.__init__ deliberately does NOT do this, so
-    # tests/notebooks keep deterministic manual stepping.)
-    for node in running_nodes:
-        if not hasattr(node, "start"):
-            continue
-        if runtime_fence is None:
-            if tuple(getattr(node, "referenced_devices", lambda: ())()):
-                raise RuntimeError(
-                    "device-bearing running_nodes require a runtime authority"
-                )
-            if not getattr(node, "running", False):
-                node.start()
-            continue
-        if getattr(node, "running", False):
-            if not console._stop_unmanaged_node_confirmed(node, timeout=2.0):
-                raise RuntimeError(
-                    "passed running node could not terminate for LegacyRuntimeFence enrollment"
-                )
-        handle = runtime_fence.start(node)
-        console._legacy_handles[id(node)] = handle
-        console._legacy_handle_fences[id(node)] = runtime_fence
-        handle.wait_started(2.0)
-        if node not in console.running_nodes:
-            console.running_nodes.append(node)
+    # A passed-in node should stream the moment the window opens.  Enrollment is
+    # centralized on the console body so every composition surface uses the same
+    # stop-unmanaged -> fenced-start transition.
+    console._enroll_composed_nodes(running_nodes, runtime_fence)
     # Closing the window must stop the node owner threads (else they keep running, blocked in
     # camera.acquire holding the camera / RPyC link, wedging the kernel).  The console is a CHILD
     # of the window so its own closeEvent never fires on a window close -- we wire the window's

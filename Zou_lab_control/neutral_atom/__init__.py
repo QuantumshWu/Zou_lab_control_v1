@@ -4,9 +4,9 @@ It connects devices (virtual or the real qCMOS + FPGA pulse streamer), captures
 camera images, calibrates the site map + per-site thresholds, detects occupancy,
 and runs swept measurements (detection time / fidelity / release-recapture).
 
-The public notebook entry point is ``connect``.  The lower-level device / timing /
-Verilog helpers are also exported, so a notebook can drive the hardware directly and
-the GUIs (pulse editor, task console) build on the same session.
+The public notebook entry point is ``connect``.  Raw adapters and drive verbs are
+deliberately absent from this umbrella; adapter authors use ``adapter_sdk``, tests use
+``testing``, and ordinary experiments act through the installation-owned session.
 """
 
 from .core.analysis import (
@@ -23,39 +23,13 @@ from .core.calibration import FrameContract, TrapCalibration
 from .core.params import ParamDecl
 from .core.psf import SitePSF, fit_site_psfs, psf_signals
 from .ports import PortCatalog, PortSpec
-from .devices import DEFAULT_DCAM_MODULE, QCMOSCamera, QCMOSConfig
-from .devices import (
-    BaseDevice,
-    CameraDevice,
-    DeviceSet,
-    ManualSequencer,
-    PulseController,
-    RemoteSequencer,
+from .devices.sequencer import (
     RuntimeSequenceProgram,
-    SequencerDevice,
-    SequencerService,
-    TrapArrayDevice,
-    apply_device_overrides,
-    available_device_configs,
-    bind_pulse,
-    compile_pulse_table_scan_runtime_program,
     compile_pulse_table_runtime_program,
+    compile_pulse_table_scan_runtime_program,
     compile_runtime_program,
     compile_runtime_program_for_payload,
-    device_class_registry,
-    device_config_dir,
-    discover_devices,
-    infer_xdc_channel_pins,
-    infer_xdc_trigger_channels,
-    load_devices,
-    register_device_class,
-    serve_runtime_sequencer,
-    validate_device_contract,
 )
-# The discovery protocol pieces a user's own hardware plugs into: a device class's
-# ``discover()`` classmethod returns ``DiscoveredDevice`` rows (``discovery_note`` for a
-# missing library / empty bus), and a class-less bus scanner registers as a named provider.
-from .devices.discovery import DiscoveredDevice, discovery_note, register_discovery_provider
 from .views import image_to_points, plot_detection_image, plot_detection_scan, plot_image, plot_site_values, plot_threshold_hist
 from .timing import (
     ANALOG_BUS_MODES,
@@ -75,7 +49,6 @@ from .timing import (
 # nothing about which channel gates a camera); re-exported here so notebooks keep `na.*` access.
 from .devices.camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS, count_trigger_pulses
 from .timing.verilog import VerilogBuild, VerilogFiles, generate_verilog, write_verilog_bundle
-from .devices import DEFAULT_CHANNELS, VirtualCamera, VirtualSequencer, VirtualTrapArray, virtual_config, write_virtual_run
 from .operations import (
     CameraMeasurement,
     MeasurementSpec,
@@ -111,11 +84,11 @@ from .operations import (
     release_recapture_survival,
     save_frame,
     task,
-    triggered_frames,
     unregister_measurement,
     unregister_processor,
     unregister_task,
 )
+from . import simulation
 from .session import (
     CaptureResult,
     DetectionResult,
@@ -136,14 +109,6 @@ from .session import (
 )
 
 
-def run_sequencer_server(*args, **kwargs):
-    """Start the FPGA/Vivado-computer sequencer server."""
-
-    from .devices.sequencer_server import run_server
-
-    return run_server(*args, **kwargs)
-
-
 _PULSE_STREAMER_EXPORTS = {
     "DEFAULT_FPGA_CHANNEL_COUNT",
     "DEFAULT_MAX_SCAN_POINTS",
@@ -161,10 +126,6 @@ _PULSE_STREAMER_EXPORTS = {
 
 
 def __getattr__(name: str):
-    if name == "CommandSequencerBackend":
-        from .devices.sequencer_server import CommandSequencerBackend
-
-        return CommandSequencerBackend
     if name == "load_figure":
         # Reopen a saved figure npz (``na.load_figure('scan.npz')``) -- reached LAZILY through the
         # GUI-action module so the frontend is not pulled onto the analysis import path.
@@ -198,77 +159,70 @@ except Exception:  # pragma: no cover - notes import should not block experiment
 
 
 __all__ = [
+    "ANALOG_BUS_MODES",
     "AtomDetection",
-    "BaseDevice",
     "BimodalFit",
+    "CameraMeasurement",
     "CaptureResult",
-    "CameraDevice",
-    "CommandSequencerBackend",
-    "DEFAULT_CHANNELS",
-    "DEFAULT_DCAM_MODULE",
     "DEFAULT_FPGA_CHANNEL_COUNT",
     "DEFAULT_MAX_SCAN_POINTS",
     "DEFAULT_SCAN_COEFF_FRAC_BITS",
     "DEFAULT_SCAN_COEFF_WIDTH",
     "DetectionResult",
     "DetectionTimeScanResult",
-    "DeviceSet",
-    "DiscoveredDevice",
-    "CameraMeasurement",
-    "LogicNode",
     "ExperimentSubsystem",
     "FidelityEstimate",
     "FrameContract",
+    "LogicNode",
     "MeasurementSpec",
-    "ManualSequencer",
     "MeasurementTaskResult",
+    "NFramePlan",
     "NeutralAtomSession",
-    "ANALOG_BUS_MODES",
+    "OtsuFidelityReducer",
+    "ParamDecl",
     "PortCatalog",
     "PortSpec",
     "PreflightReport",
+    "ProcessorSpec",
     "Pulse",
-    "PulseController",
     "PulsePeriod",
     "PulseSequence",
     "PulseTableState",
-    "QCMOSCamera",
-    "QCMOSConfig",
     "ReadoutSubsystem",
-    "RemoteSequencer",
+    "ReleaseRecapturePlan",
     "ResultObject",
     "RuntimeSequenceProgram",
-    "SequencerDevice",
-    "SequencerService",
+    "RunIndex",
+    "RunManifest",
+    "ScanAxis",
+    "ScanResult",
+    "ScannedMeasurement",
+    "ScannedMeasurementNode",
     "SitePSF",
     "SitemapResult",
+    "SurvivalReducer",
+    "TaskSpec",
+    "TemperatureFit",
     "ThresholdResult",
     "TimingSubsystem",
-    "TrapArrayDevice",
     "TrapCalibration",
     "VerilogBuild",
     "VerilogFiles",
-    "VirtualCamera",
-    "VirtualSequencer",
-    "VirtualTrapArray",
-    "apply_device_overrides",
-    "available_device_configs",
-    "bind_pulse",
+    "axis_range_tuple",
     "build_fpga_manual",
     "build_main_manual",
+    "build_release_recapture_pulse",
     "calibrate_sitemap_from_images",
     "calibrate_threshold_from_images",
     "capacity_estimate_text",
-    "compile_runtime_program",
+    "connect",
     "compile_pulse_table_runtime_program",
     "compile_pulse_table_scan_runtime_program",
+    "compile_runtime_program",
     "compile_runtime_program_for_payload",
-    "connect",
     "count_trigger_pulses",
     "default_pulse_name",
     "detect_image",
-    "device_class_registry",
-    "device_config_dir",
     "device_manager",
     "estimate_threshold_fidelity",
     "exposure_from_sequence",
@@ -277,18 +231,21 @@ __all__ = [
     "fit_bimodal",
     "fit_bimodal_per_site",
     "fit_site_psfs",
+    "fit_temperature",
+    "frame_files",
     "gaussian_fidelity",
     "generate_verilog",
     "hardware_channel_names",
     "image_to_points",
     "imaging_sequence",
-    "discover_devices",
-    "discovery_note",
+    "index_manifest",
+    "index_run",
     "infer_xdc_channel_count",
     "infer_xdc_channel_labels",
     "infer_xdc_channels",
-    "load_devices",
     "load_figure",
+    "load_frame",
+    "measurement",
     "otsu_threshold",
     "plot_detection_image",
     "plot_detection_scan",
@@ -297,54 +254,25 @@ __all__ = [
     "plot_site_values",
     "plot_threshold_hist",
     "positive_time_step_ns",
+    "processor",
     "psf_signals",
     "quantized_time_ns",
     "quantized_time_steps",
-    "roi_counts",
-    "register_device_class",
-    "register_discovery_provider",
-    "run_sequencer_server",
-    "serve_runtime_sequencer",
-    "sort_centers_grid",
-    "virtual_config",
-    "write_virtual_run",
-    "index_run",
-    "index_manifest",
-    "load_frame",
-    "save_frame",
-    "frame_files",
-    "RunIndex",
-    "RunManifest",
-    "build_release_recapture_pulse",
-    "fit_temperature",
-    "release_recapture_survival",
-    "axis_range_tuple",
-    "measurement",
     "register_measurement",
-    "registered_measurements",
-    "unregister_measurement",
-    "processor",
     "register_processor",
-    "registered_processors",
-    "unregister_processor",
-    "task",
-    "triggered_frames",
     "register_task",
+    "registered_measurements",
+    "registered_processors",
     "registered_tasks",
+    "release_recapture_survival",
+    "roi_counts",
+    "save_frame",
+    "simulation",
+    "sort_centers_grid",
+    "task",
+    "unregister_measurement",
+    "unregister_processor",
     "unregister_task",
-    "ProcessorSpec",
-    "TaskSpec",
-    "NFramePlan",
-    "OtsuFidelityReducer",
-    "ParamDecl",
-    "ReleaseRecapturePlan",
-    "ScanAxis",
-    "ScannedMeasurement",
-    "ScannedMeasurementNode",
-    "ScanResult",
-    "SurvivalReducer",
-    "TemperatureFit",
     "validate_pulse_streamer_program",
-    "validate_device_contract",
     "write_verilog_bundle",
 ]

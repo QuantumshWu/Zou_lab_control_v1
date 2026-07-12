@@ -12,6 +12,7 @@ from pathlib import Path
 import sys
 
 import pytest
+from conftest import raw_device_set
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
@@ -33,7 +34,7 @@ def test_devices_declare_writable_runtime_controls():
     import Zou_lab_control.neutral_atom as na
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
     try:
-        cam = exp.devices.camera
+        cam = raw_device_set(exp).camera
         cam_ctrls = {c.decl.key: c for c in cam.runtime_controls()}
         assert cam_ctrls["exposure"].writable and cam_ctrls["roi"].writable   # basic camera knobs edit like the API
         cam_ctrls["roi"].setter(cam, "10, 40, 12, 40")
@@ -41,7 +42,7 @@ def test_devices_declare_writable_runtime_controls():
         cam_ctrls["roi"].setter(cam, "full")
         assert cam.roi is None                                                # 'full' clears -- not "leave unchanged"
 
-        seq_ctrls = {c.decl.key: c for c in exp.devices.sequencer.runtime_controls()}
+        seq_ctrls = {c.decl.key: c for c in raw_device_set(exp).sequencer.runtime_controls()}
         assert seq_ctrls["sleep_scale"].writable       # the virtual sequencer's one live knob
     finally:
         exp.close()
@@ -67,7 +68,7 @@ def test_live_switch_writes_on_edit_without_apply(qt):
     from Zou_lab_control.frontend.device_manager import _DeviceControlPage
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
     try:
-        cam = exp.devices.camera
+        cam = raw_device_set(exp).camera
         page = _DeviceControlPage(cam, role="camera")
         widget, handler = page._editors["exposure"]
         switch = page._live_switches["exposure"]
@@ -99,7 +100,7 @@ def test_live_writes_are_rate_limited_leading_plus_trailing(qt):
     from Zou_lab_control.frontend.device_manager import _DeviceControlPage
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
     try:
-        cam = exp.devices.camera
+        cam = raw_device_set(exp).camera
         page = _DeviceControlPage(cam, role="camera")
         widget, handler = page._editors["exposure"]
         page._live_switches["exposure"].setChecked(True)      # Live ON
@@ -128,7 +129,7 @@ def test_current_and_set_rows_share_a_right_edge(qt):
     from Zou_lab_control.frontend.qt_fluent import FluentReadoutEdit, FluentDoubleSpinBox
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
     try:
-        page = _DeviceControlPage(exp.devices.camera, role="camera")
+        page = _DeviceControlPage(raw_device_set(exp).camera, role="camera")
         page.resize(1000, 760)
         page.show()
         widget, _ = page._editors["exposure"]
@@ -148,12 +149,12 @@ def test_device_viewer_editable_flag_toggles_write_rows(qt):
     from Zou_lab_control.frontend.device_manager import DeviceViewerPanel, _DeviceControlPage
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
     try:
-        editable = DeviceViewerPanel(exp.devices, editable=True)
+        editable = DeviceViewerPanel(raw_device_set(exp), editable=True)
         pages = editable._tabs.findChildren(_DeviceControlPage)
         assert pages and all(not p._read_only for p in pages)
         assert editable._status is not None                     # a status line to surface a rejected write
 
-        readonly = DeviceViewerPanel(exp.devices, editable=False)
+        readonly = DeviceViewerPanel(raw_device_set(exp), editable=False)
         ro_pages = readonly._tabs.findChildren(_DeviceControlPage)
         assert ro_pages and all(p._read_only for p in ro_pages)
         assert readonly._status is None

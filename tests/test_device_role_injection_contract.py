@@ -25,6 +25,7 @@ if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
+from conftest import raw_device_set
 
 OPS = REPO_ROOT / "Zou_lab_control" / "neutral_atom" / "operations"
 
@@ -75,7 +76,7 @@ def test_declared_camera_roles_become_real_choice_params(readout):
     dropdown from the resolved devices, not a hardcoded list."""
     from Zou_lab_control.neutral_atom.devices.base import CameraDevice
 
-    cams = readout.session.devices.device_names(CameraDevice)
+    cams = readout.raw_device_set(session).device_names(CameraDevice)
     assert cams, "virtual config must load at least one camera"
     specs = [*readout.measurement_specs(), *readout.task_specs(), readout.camera_spec()]
     saw_any = False

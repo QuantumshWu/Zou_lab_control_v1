@@ -26,6 +26,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+from conftest import raw_device_set
 
 pytest.importorskip("PyQt5")
 from PyQt5 import QtWidgets
@@ -63,7 +64,7 @@ def _ancestor_frame(widget):
 
 
 def test_config_body_lives_in_a_tab_widget_with_a_permanent_config_tab(exp):
-    panel = DeviceManagerPanel(exp.devices, session_binding=_session_device_binding(exp))
+    panel = DeviceManagerPanel(raw_device_set(exp), session_binding=_session_device_binding(exp))
     tabs = panel.findChildren(FluentTabWidget)
     assert tabs, "the config body must live in a FluentTabWidget"
     top = tabs[0]
@@ -73,7 +74,7 @@ def test_config_body_lives_in_a_tab_widget_with_a_permanent_config_tab(exp):
 def test_every_section_group_box_is_nested_in_a_white_frame(exp):
     """Each section FluentGroupBox sits inside a FluentFrame (white host) so its grey title
     pill is legible -- never straight on the grey window / a transparent scroll host (#5)."""
-    panel = DeviceManagerPanel(exp.devices, session_binding=_session_device_binding(exp))
+    panel = DeviceManagerPanel(raw_device_set(exp), session_binding=_session_device_binding(exp))
     boxes = _all_group_boxes(panel)
     assert boxes, "the editor must render section group boxes"
     for box in boxes:
@@ -88,7 +89,7 @@ def test_no_outermost_frame_is_bordered(exp):
     the tab pane / window edge is the boundary, so no inner card border doubles it (#5).  A
     nested per-entry card (``_DeviceEntryCard``) may still be bordered; this pins that the
     COLUMN-LEVEL hosts are not."""
-    panel = DeviceManagerPanel(exp.devices, session_binding=_session_device_binding(exp))
+    panel = DeviceManagerPanel(raw_device_set(exp), session_binding=_session_device_binding(exp))
     # the column hosts + button strip are the frames that are DIRECT layout children of the
     # config page (not nested inside a group box): none of them may be bordered.
     for frame in panel.findChildren(FluentFrame):

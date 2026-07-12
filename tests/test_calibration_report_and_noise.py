@@ -12,6 +12,8 @@ These pin two things the experimenter relies on:
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 from pathlib import Path
 import sys
 
@@ -84,7 +86,7 @@ def test_calibrate_writes_distribution_and_fidelity_report(tmp_path):
                      "site_map.png", "calibration.npz", "calibration.json", "summary.json"):
             assert (report_dir / name).exists(), name
         # the report carries a FINITE per-site fidelity (the distributions separate)
-        assert task.report["n_sites"] == exp.devices.trap_array.n_sites
+        assert task.report["n_sites"] == raw_device_set(exp).trap_array.n_sites
         assert 0.5 <= task.report["mean_fidelity"] <= 1.0
         bundle = np.load(report_dir / "calibration.npz")
         assert bundle["counts"].shape[0] == 40                  # the readout frames

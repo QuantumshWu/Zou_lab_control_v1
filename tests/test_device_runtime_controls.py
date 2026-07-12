@@ -15,7 +15,7 @@ config form uses (typed widgets, never an ``eval`` of typed text).  These contra
    rejects a non-positive value), not the GUI -- the ``_DeviceControlPage`` Apply path
    writes THROUGH the device setter and an out-of-range value is refused there;
 3. the task-console "Devices" viewer is READ-ONLY: every ``_DeviceControlPage`` it builds
-   has no editable controls and it cannot mutate ``session.devices`` (the full config
+   has no editable controls and it cannot mutate ``raw_device_set(session)`` (the full config
    editor stays the separate ``exp.device_manager()`` / ``na.device_manager()`` entry).
 """
 
@@ -33,6 +33,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+from conftest import raw_device_set
 
 pytest.importorskip("PyQt5")
 from PyQt5 import QtWidgets
@@ -44,6 +45,7 @@ from Zou_lab_control.neutral_atom.devices.base import (
     RuntimeControl,
     SequencerDevice,
 )
+from Zou_lab_control.neutral_atom.devices.registry import load_devices
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -53,7 +55,7 @@ def _app():
 
 @pytest.fixture()
 def devices():
-    devs = na.load_devices("virtual")
+    devs = load_devices("virtual")
     yield devs
     devs.close()
 
@@ -257,8 +259,8 @@ def test_device_viewer_is_editable_but_not_a_config_editor():
 
     exp = na.connect("virtual")
     try:
-        before = exp.devices
-        panel = DeviceViewerPanel(devices_provider=lambda: exp.devices)   # editable=True default
+        before = raw_device_set(exp)
+        panel = DeviceViewerPanel(devices_provider=lambda: raw_device_set(exp))   # editable=True default
         tab_pages = [panel._tabs.widget(i) for i in range(panel._tabs.count())]
         control_pages = [w for w in tab_pages if isinstance(w, _DeviceControlPage)]
         assert control_pages, "the viewer must render a device control page per device"
@@ -267,7 +269,7 @@ def test_device_viewer_is_editable_but_not_a_config_editor():
         # but it is a runtime-control view, NOT the config editor -- no add/remove/config surface
         for forbidden in ("_apply", "_add_entry", "_remove_entry", "working_config"):
             assert not hasattr(panel, forbidden), f"the viewer must not expose {forbidden}"
-        assert exp.devices is before                           # opening the viewer swapped nothing
+        assert raw_device_set(exp) is before                           # opening the viewer swapped nothing
     finally:
         exp.close()
 

@@ -11,6 +11,8 @@ panel's bound signal, falling back to the cache only for a stopped producer.
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import os
 import numpy as np
 import pytest
@@ -52,7 +54,7 @@ def test_rerender_uses_current_shot_not_stale_cache(tmp_path):
         twod = con.cards[-1]; twod.config.inputs = ["frame_judged"]
 
         con._start_logic_node(cam); con._start_logic_node(jud)
-        fire_live_imaging(exp, exposure=exp.devices.camera.exposure)
+        fire_live_imaging(exp, exposure=raw_device_set(exp).camera.exposure)
         camN = con._logic_nodes[id(cam)]; judN = con._logic_nodes[id(jud)]
         camN.step(); judN.step()
 

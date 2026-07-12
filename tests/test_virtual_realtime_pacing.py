@@ -13,6 +13,8 @@ tests construct the session with an EXPLICIT ``sleep_scale`` to exercise the rea
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 from pathlib import Path
 import sys
 import time
@@ -30,12 +32,12 @@ import Zou_lab_control.neutral_atom.devices.virtual as virtual
 def _live_frame_seconds(exp, exposure):
     """Fire a continuous imaging pulse of the given exposure and time ONE live frame.
     Returns (elapsed_seconds, pulse_cycle_duration_seconds)."""
-    seqr = exp.devices.sequencer
+    seqr = raw_device_set(exp).sequencer
     seq = na.imaging_sequence(exposure=exposure, load=True, name="live").forever()
     seqr.prepare(seq)
     seqr.fire(seq)
     t0 = time.monotonic()
-    exp.devices.camera.acquire(1)                 # the wired camera senses the firing itself
+    raw_device_set(exp).camera.acquire(1)                 # the wired camera senses the firing itself
     return time.monotonic() - t0, float(seq.duration)
 
 
@@ -73,13 +75,13 @@ def test_stop_pulse_freezes_the_live_image_immediately():
     at once -- the image freezes, it does not keep updating or block for a cycle."""
     exp = na.connect("virtual", sleep_scale=1.0, sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     try:
-        seqr = exp.devices.sequencer
+        seqr = raw_device_set(exp).sequencer
         seq = na.imaging_sequence(exposure=0.30, load=True, name="live").forever()
         seqr.prepare(seq)
         seqr.fire(seq)
         seqr.set_safe_state()
         t0 = time.monotonic()
-        frames = exp.devices.camera.acquire(1)
+        frames = raw_device_set(exp).camera.acquire(1)
         assert frames == []                                       # no trigger -> no frame
         assert time.monotonic() - t0 < 0.05                       # and it did NOT block a cycle
     finally:

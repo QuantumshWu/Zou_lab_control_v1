@@ -28,6 +28,7 @@ import sys
 
 import numpy as np
 import pytest
+from conftest import raw_device_set
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
@@ -373,7 +374,7 @@ def test_console_task_panel_is_a_live_facet_grid():
                           measurements=exp.readout.measurement_specs(),
                           processors=exp.readout.processor_specs(),
                           tasks=exp.readout.task_specs(), window_px=(1000, 700))
-        cam = exp.devices["monitor_camera"]
+        cam = raw_device_set(exp)["monitor_camera"]
         b0 = [cam.b0[bus] for bus in cam.coil_buses]
         con._add_logic_node(LogicNodeConfig(
             kind="task", name="Optimize MOT field", title="Optimize MOT field",

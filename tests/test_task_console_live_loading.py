@@ -29,7 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
-from conftest import fire_live_imaging, tick   # the live "On Pulse" the trigger-driven camera needs
+from conftest import fire_live_imaging, raw_device_set, tick   # explicit white-box hardware seam
 
 
 @pytest.fixture(autouse=True)
@@ -52,12 +52,7 @@ def _calibrated_virtual_session(grid=(3, 4)):
 def _console(exp):
     from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
-
-    runtime = getattr(exp, "_zlc_runtime_services", None)
-    if runtime is None or runtime.closed:
-        runtime = LegacyNeutralAtomRuntime(exp.devices)
-        exp._zlc_runtime_services = runtime
+    runtime = exp._require_runtime_services()
     console = TaskConsole(
         hub=SignalHub(), state=default_console_state(), session=exp,
         measurements=exp.readout.measurement_specs(),

@@ -18,12 +18,15 @@ Four findings from the whole-project review are pinned here:
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import os
 from pathlib import Path
 import sys
 
 import numpy as np
 import pytest
+from Zou_lab_control.neutral_atom.testing import VirtualSequencer
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -84,10 +87,10 @@ def test_detect_default_exposure_self_matches_the_calibration():
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (48, 60)})
     try:
         exp.readout.sitemap(method="box", frames=4, display=False)
-        exp.devices.camera.exposure = 0.020                 # stale default, different from the readout gate
+        raw_device_set(exp).camera.exposure = 0.020                 # stale default, different from the readout gate
         exp.readout.thresholds(frames=24, exposure=0.004, display=False)
         cal = exp.readout.current
-        assert cal.readout_exposure(fallback=exp.devices.camera.exposure) == pytest.approx(0.004)
+        assert cal.readout_exposure(fallback=raw_device_set(exp).camera.exposure) == pytest.approx(0.004)
         # the subsystem detect() reads at the accessor's exposure (not the stale 20 ms camera default)
         shot = exp.readout.detect(display=False)
         assert shot.occupied.shape == (12,)
@@ -285,7 +288,7 @@ def test_coupled_resolver_missing_policy_is_explicit_per_measurement():
         _resolve_imaging_template,
     )
 
-    seqr = na.VirtualSequencer(channels=["trap", "probe", "cooling", "emCCD"])
+    seqr = VirtualSequencer(channels=["trap", "probe", "cooling", "emCCD"])
 
     # temperature: a NAMED missing template fails loud
     with pytest.raises(FileNotFoundError):

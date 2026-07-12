@@ -381,9 +381,9 @@ def capture_figure_provenance(node, *, resolve_node: ResolveNode | None = None,
     stay at the top level too.  ``node`` is the producing node (already resolved by the caller);
     ``resolve_node`` is only needed for the upstream walk (skip it and a processor's devices simply stay
     empty).  When no node produces the signal (a derived expression, a loaded static figure) it falls
-    back to the whole-session device snapshot (``session.devices.snapshot()``) if a session is given, else
-    ``None`` -- so a save NEVER fails for lack of provenance.  Only public ``.snapshot()`` state is read
-    (no simulation ground truth)."""
+    back to the whole-session immutable ``session.device_catalog`` if a session is given, else
+    ``None`` -- so a save NEVER fails for lack of provenance.  Only public observation state is read
+    (no adapter, SDK handle, command capability, or simulation ground truth)."""
     if node is not None:
         try:
             prov = dict(node.provenance_snapshot())
@@ -398,11 +398,11 @@ def capture_figure_provenance(node, *, resolve_node: ResolveNode | None = None,
                 if hoisted:
                     prov.update(hoisted)                    # top-level devices + acquisition_parameters
             return prov
-    devices = getattr(session, "devices", None)
-    snap = getattr(devices, "snapshot", None)
-    if callable(snap):
+    catalog = getattr(session, "device_catalog", None)
+    to_dict = getattr(catalog, "to_dict", None)
+    if callable(to_dict):
         try:
-            return snap()
+            return {"devices": to_dict()}
         except Exception:
             return None
     return None

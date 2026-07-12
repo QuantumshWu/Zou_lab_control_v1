@@ -18,6 +18,8 @@ an operator finds the best grey-molasses detuning.
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 from pathlib import Path
 import sys
 
@@ -126,7 +128,7 @@ def test_connect_virtual_wires_laser_and_rf_into_the_trap_array():
 
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
     try:
-        laser, rf, trap = exp.devices.laser, exp.devices.rf, exp.devices.trap_array
+        laser, rf, trap = raw_device_set(exp).laser, raw_device_set(exp).rf, raw_device_set(exp).trap_array
         assert isinstance(laser, VirtualLaser) and isinstance(rf, VirtualRF)
         assert trap.laser is laser and trap.rf is rf
         rf_ctrls = {c.decl.key: c for c in rf.runtime_controls()}

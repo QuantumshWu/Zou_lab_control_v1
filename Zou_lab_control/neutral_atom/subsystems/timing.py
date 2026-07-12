@@ -95,7 +95,7 @@ class TimingSubsystem(ExperimentSubsystem):
             errors=errors,
             warnings=warnings,
             sequence_table=sequence.table(),
-            device_snapshot=s.devices.to_dict(),
+            device_snapshot=s.device_catalog.to_dict(),
             verilog=build,
         )
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -20,25 +22,25 @@ def test_close_stops_authoritative_runs_before_devices_close():
     exp = na.connect("virtual")
     controller = exp.timing.bind_pulse(exp.sequence)
     controller.on_pulse(repeat_forever=True, wait=False)
-    runtime = exp._zlc_runtime_services
+    runtime = exp._require_runtime_services()
     assert runtime.resources.active_claims()
 
     observed = []
-    real_close = exp.devices.close
+    real_close = raw_device_set(exp).close
 
     def tracked_close():
         observed.append((runtime.closed, bool(runtime.resources.active_claims())))
         return real_close()
 
-    exp.devices.close = tracked_close
+    raw_device_set(exp).close = tracked_close
     exp.close()
     assert observed == [(True, False)]
 
 
 def test_load_config_stops_affected_authority_before_old_device_close():
     exp = na.connect("virtual")
-    old_devices = exp.devices
-    old_runtime = exp._zlc_runtime_services
+    old_devices = raw_device_set(exp)
+    old_runtime = exp._require_runtime_services()
     controller = exp.timing.bind_pulse(exp.sequence)
     controller.on_pulse(repeat_forever=True, wait=False)
     assert old_runtime.resources.active_claims()
@@ -54,8 +56,8 @@ def test_load_config_stops_affected_authority_before_old_device_close():
     try:
         exp.load_config("virtual")
         assert observed == [False]
-        assert exp.devices is not old_devices
-        assert exp._zlc_runtime_services is old_runtime
+        assert raw_device_set(exp) is not old_devices
+        assert exp._require_runtime_services() is old_runtime
     finally:
         exp.close()
 
@@ -95,8 +97,8 @@ def test_load_config_open_devices_publishes_the_identity_verified_staged_registr
     monkeypatch.setattr(LegacyDeviceRegistry, "establish", establish)
     try:
         exp.load_config("virtual", open_devices=True)
-        camera = exp.devices.camera
-        runtime = exp._zlc_runtime_services
+        camera = raw_device_set(exp).camera
+        runtime = exp._require_runtime_services()
         assert events == ["open", "identity"]
         assert runtime.registry.has_binding(camera)
         assert runtime.registry.binding_for(camera) is established[0]
@@ -108,8 +110,8 @@ def test_shutdown_waits_for_inflight_connection_establishment(monkeypatch):
     from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera
 
     exp = na.connect("virtual")
-    runtime = exp._zlc_runtime_services
-    camera = exp.devices.camera
+    runtime = exp._require_runtime_services()
+    camera = raw_device_set(exp).camera
     entered = threading.Event()
     release = threading.Event()
     establish_done = threading.Event()
@@ -157,19 +159,19 @@ def test_shutdown_waits_for_inflight_connection_establishment(monkeypatch):
     assert results == {"establish": True, "shutdown": True}
     with pytest.raises(RuntimeError, match="shut down"):
         runtime.ensure_connections((camera,))
-    exp.devices.close()
+    raw_device_set(exp).close()
 
 
 def test_bad_config_leaves_active_authority_untouched():
     exp = na.connect("virtual")
     controller = exp.timing.bind_pulse(exp.sequence)
     controller.on_pulse(repeat_forever=True, wait=False)
-    runtime = exp._zlc_runtime_services
-    old_devices = exp.devices
+    runtime = exp._require_runtime_services()
+    old_devices = raw_device_set(exp)
     try:
         with pytest.raises(Exception):
             exp.load_config({"camera": {"type": "no_such_device_type"}})
-        assert exp.devices is old_devices
+        assert raw_device_set(exp) is old_devices
         assert runtime.resources.active_claims()
         assert old_devices.sequencer.snapshot()["state"] == "running"
     finally:
@@ -179,8 +181,8 @@ def test_bad_config_leaves_active_authority_untouched():
 
 def test_load_config_refuses_close_while_authority_reports_pending_owner(monkeypatch):
     exp = na.connect("virtual")
-    old_devices = exp.devices
-    runtime = exp._zlc_runtime_services
+    old_devices = raw_device_set(exp)
+    runtime = exp._require_runtime_services()
     monkeypatch.setattr(
         runtime.fence,
         "stop_nodes_using",
@@ -189,7 +191,7 @@ def test_load_config_refuses_close_while_authority_reports_pending_owner(monkeyp
     try:
         with pytest.raises(RuntimeError, match="runtime ownership is still cancelling"):
             exp.load_config("virtual")
-        assert exp.devices is old_devices
+        assert raw_device_set(exp) is old_devices
     finally:
         monkeypatch.undo()
         exp.close()
@@ -218,7 +220,7 @@ def test_load_config_from_non_qt_thread_does_not_call_qwidget_lifecycle_hooks():
     try:
         assert not worker.is_alive()
         assert result == ["ok"]
-        assert console._current_runtime_fence() is exp._zlc_runtime_services
+        assert console._current_runtime_fence() is exp._require_runtime_services()
     finally:
         console.shutdown(timeout=1.0)
         exp.close()
@@ -226,7 +228,7 @@ def test_load_config_from_non_qt_thread_does_not_call_qwidget_lifecycle_hooks():
 
 def test_load_config_becomes_unavailable_when_old_close_crosses_irreversible_boundary():
     exp = na.connect("virtual")
-    old_devices = exp.devices
+    old_devices = raw_device_set(exp)
     real_close = old_devices.close
 
     def fail_close():
@@ -236,9 +238,10 @@ def test_load_config_becomes_unavailable_when_old_close_crosses_irreversible_bou
     try:
         with pytest.raises(RuntimeError, match="old device close failed"):
             exp.load_config("virtual")
-        assert exp.devices is not old_devices
-        with pytest.raises(RuntimeError, match="crossed the old-device close boundary"):
-            _ = exp.camera
+        assert exp.device_catalog.availability.value == "recovery_required"
+        assert exp.device_catalog.recovery_status_ref is not None
+        with pytest.raises(RuntimeError, match="installation is recovery_required"):
+            raw_device_set(exp)
     finally:
         old_devices.close = real_close
         old_devices.close()
@@ -249,7 +252,7 @@ def test_load_config_stages_all_derived_state_before_publishing(monkeypatch):
     import Zou_lab_control.neutral_atom.devices as devices_module
 
     exp = na.connect("virtual")
-    old_devices = exp.devices
+    old_devices = raw_device_set(exp)
     old_sequence = exp.sequence
     old_readout = exp.readout
     old_timing = exp.timing
@@ -282,7 +285,7 @@ def test_load_config_stages_all_derived_state_before_publishing(monkeypatch):
     try:
         with pytest.raises(RuntimeError, match="sequence staging failed"):
             exp.load_config("virtual")
-        assert exp.devices is old_devices
+        assert raw_device_set(exp) is old_devices
         assert exp.sequence is old_sequence
         assert exp.readout is old_readout
         assert exp.timing is old_timing

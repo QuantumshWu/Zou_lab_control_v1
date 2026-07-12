@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sys
+import time
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
@@ -25,7 +26,7 @@ if sys.path[0] != str(REPO_ROOT):
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import Zou_lab_control.neutral_atom as na
-from conftest import add_logic_row, make_console
+from conftest import add_logic_row, make_console, raw_device_set
 
 
 def _camera_row(con):
@@ -47,6 +48,11 @@ class _FakeInjected:
 
     def published_signals(self):
         return frozenset()
+
+    def start(self):
+        self.stopped = False
+        self.running = True
+        return self
 
     def stop(self, timeout=2.0):
         self.stopped = True
@@ -95,7 +101,7 @@ def test_failed_start_registers_nothing_and_keeps_old_signals():
             def start(self, **k):
                 raise RuntimeError("wedged device")
 
-        con._build_logic_node = lambda *a, **k: _DeadNode(exp.devices["camera"])
+        con._build_logic_node = lambda *a, **k: _DeadNode(raw_device_set(exp)["camera"])
         con._start_logic_node(row)
         dead = [n for n in con.running_nodes if isinstance(n, _DeadNode)]
         assert not dead                                      # no half-started ghost (#A2 commit point)
@@ -106,16 +112,26 @@ def test_failed_start_registers_nothing_and_keeps_old_signals():
         exp.close()
 
 
-def test_injected_device_driver_obeys_the_same_exclusion():
+def test_injected_device_driver_keeps_ownership_when_a_conflicting_row_starts():
     exp = na.connect("virtual")
-    injected = _FakeInjected(exp.devices["camera"])      # claims the SAME sensor the row drives
+    injected = _FakeInjected(raw_device_set(exp)["camera"])      # claims the SAME sensor the row drives
     con = make_console(exp, running_nodes=[injected])
     try:
+        deadline = time.monotonic() + 1.0
+        while injected not in con.running_nodes and time.monotonic() < deadline:
+            con._poll_logic_nodes()
+            time.sleep(0.01)
         assert injected in con.running_nodes
         row = _camera_row(con)
-        con._start_logic_node(row)                           # a GUI device driver starts
-        assert injected.stopped                              # the row-less driver was stopped...
-        assert injected not in con.running_nodes             # ...and dropped from the registry (#A3)
+        con._start_logic_node(row)                           # conflicting claim is rejected
+        deadline = time.monotonic() + 1.0
+        while not row.status_label.text() and time.monotonic() < deadline:
+            con._poll_logic_nodes()
+            time.sleep(0.01)
+        assert not injected.stopped
+        assert injected in con.running_nodes
+        assert con._logic_nodes.get(id(row)) is None
+        assert "start failed" in row.status_label.text().lower()
     finally:
         con.shutdown()
         exp.close()

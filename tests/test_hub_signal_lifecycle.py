@@ -10,6 +10,8 @@ clobber an earlier (stopped, lingering) node's signals.
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import os
 import sys
 from pathlib import Path
@@ -149,12 +151,12 @@ def test_live_switch_that_drops_outputs_purges_orphans_without_a_rebuild():
     exp, console = _console()
     try:
         hub = console.hub
-        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                                 frames_per_cycle=3, repeat=0)
         console.running_nodes = [cam]
-        exp.devices.sequencer.prepare(
-            imaging_sequence(exposure=exp.devices.camera.exposure, load=True).forever())
-        exp.devices.sequencer.fire()
+        raw_device_set(exp).sequencer.prepare(
+            imaging_sequence(exposure=raw_device_set(exp).camera.exposure, load=True).forever())
+        raw_device_set(exp).sequencer.fire()
         cam.step()                                              # frame_0/1/2 published
         assert {"frame_0", "frame_1", "frame_2"} <= set(hub.names())
         console._refresh_signal_info()                          # cache the fpc=3 provider signature
@@ -196,8 +198,8 @@ def test_stop_then_remove_purges_a_lingering_nodes_signals():
     exp, console = _console()
     try:
         # imaging pulse on -> the trigger-driven camera streams frames
-        exp.devices.sequencer.prepare(imaging_sequence(exposure=exp.devices.camera.exposure, load=True).forever())
-        exp.devices.sequencer.fire()
+        raw_device_set(exp).sequencer.prepare(imaging_sequence(exposure=raw_device_set(exp).camera.exposure, load=True).forever())
+        raw_device_set(exp).sequencer.fire()
         cam = _add_node(console, lambda d: isinstance(d, tuple) and d and d[0] == "camera")
         console._start_logic_node(cam)
         deadline = time.monotonic() + 2.0

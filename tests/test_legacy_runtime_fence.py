@@ -5,6 +5,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from conftest import raw_device_set
 
 from zlc_neutral_atom.runtime import (
     CleanupStepAck,
@@ -370,8 +371,8 @@ def test_device_free_legacy_processor_uses_same_run_lifecycle_without_hazard():
 
 def test_virtual_session_composition_binds_real_device_objects_and_safes_them():
     experiment = connect("virtual")
-    services = LegacyRuntimeServices(experiment.devices)
-    node = _Node(experiment.devices.camera)
+    services = experiment._require_runtime_services()
+    node = _Node(raw_device_set(experiment).camera)
     try:
         assert services.persistent is False
         handle = services.fence.start(node)
@@ -384,7 +385,7 @@ def test_virtual_session_composition_binds_real_device_objects_and_safes_them():
         assert not services.resources.unresolved_hazards()
     finally:
         services.shutdown(timeout=1.0)
-        experiment.devices.close()
+        raw_device_set(experiment).close()
 
 
 def test_task_console_launcher_enrolls_passed_node_in_runtime_fence():
@@ -394,8 +395,8 @@ def test_task_console_launcher_enrolls_passed_node_in_runtime_fence():
 
     ensure_qt_app()
     experiment = connect("virtual")
-    services = LegacyRuntimeServices(experiment.devices)
-    node = _Node(experiment.devices.camera)
+    services = experiment._require_runtime_services()
+    node = _Node(raw_device_set(experiment).camera)
     console = None
     try:
         console = show_task_console(
@@ -416,7 +417,7 @@ def test_task_console_launcher_enrolls_passed_node_in_runtime_fence():
             console.shutdown(timeout=1.0)
             console.window().close()
         services.shutdown(timeout=1.0)
-        experiment.devices.close()
+        raw_device_set(experiment).close()
 
 
 def test_task_console_logic_start_and_stop_use_the_injected_runtime_fence():
@@ -426,7 +427,7 @@ def test_task_console_logic_start_and_stop_use_the_injected_runtime_fence():
 
     ensure_qt_app()
     experiment = connect("virtual")
-    services = LegacyRuntimeServices(experiment.devices)
+    services = experiment._require_runtime_services()
     console = TaskConsole(
         hub=SignalHub(),
         state=default_console_state(),
@@ -461,7 +462,7 @@ def test_task_console_logic_start_and_stop_use_the_injected_runtime_fence():
     finally:
         console.shutdown(timeout=1.0)
         services.shutdown(timeout=1.0)
-        experiment.devices.close()
+        raw_device_set(experiment).close()
 
 
 def test_session_task_console_composes_one_shared_runtime_authority():
@@ -470,7 +471,7 @@ def test_session_task_console_composes_one_shared_runtime_authority():
     ensure_qt_app()
     experiment = connect("virtual")
     console = experiment.task_console()
-    services = experiment._zlc_runtime_services
+    services = experiment._require_runtime_services()
     try:
         assert console._current_runtime_fence() is services
         assert services.fence.controller is services.controller
@@ -488,7 +489,7 @@ def test_session_config_swap_rebinds_console_fence_after_old_owner_terminates():
     ensure_qt_app()
     experiment = connect("virtual")
     console = experiment.task_console()
-    services = experiment._zlc_runtime_services
+    services = experiment._require_runtime_services()
     try:
         index = next(
             i
@@ -509,7 +510,7 @@ def test_session_config_swap_rebinds_console_fence_after_old_owner_terminates():
         assert old_handle.snapshot().state.terminal
         console._poll_logic_nodes()
         assert console._logic_nodes[id(row)] is None
-        assert console._current_runtime_fence() is experiment._zlc_runtime_services
+        assert console._current_runtime_fence() is experiment._require_runtime_services()
         console._start_logic_node(row)
         new_node = console._logic_nodes.get(id(row)) or console._starting_nodes[id(row)]
         assert new_node is not old_node
@@ -523,62 +524,17 @@ def test_session_config_swap_rebinds_console_fence_after_old_owner_terminates():
         console.window().close()
 
 
-def test_manual_sequencer_remains_a_nonhazardous_memory_authority(tmp_path, monkeypatch):
+def test_experiment_config_cannot_replace_installation_adapter_kind(tmp_path, monkeypatch):
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
 
     ensure_qt_app()
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     experiment = connect("virtual")
     console = experiment.task_console()
-    old_services = experiment._zlc_runtime_services
+    authority = experiment._require_runtime_services()
+    old_devices = raw_device_set(experiment)
     try:
-        experiment.load_config(
-            {
-                "sequencer": {
-                    "type": "ManualSequencer",
-                    "params": {"channels": ["ch00"]},
-                }
-            }
-        )
-        current_services = experiment._zlc_runtime_services
-        assert current_services is not old_services
-        assert old_services.closed
-        assert not current_services.closed
-        assert not current_services.persistent
-        assert console._current_runtime_fence() is current_services
-    finally:
-        console.shutdown(timeout=1.0)
-        experiment.close()
-        console.window().close()
-
-
-def test_irreversible_replacement_commit_failure_retains_recovery_authority(
-    tmp_path, monkeypatch
-):
-    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
-
-    ensure_qt_app()
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
-    experiment = connect("virtual")
-    console = experiment.task_console()
-    old_services = experiment._zlc_runtime_services
-    replacements = []
-    real_stage = old_services.stage_replacement_authority
-
-    def stage(device_set):
-        replacement = real_stage(device_set)
-        assert replacement is not None
-        replacements.append(replacement)
-
-        def fail_commit(*_args, **_kwargs):
-            raise RuntimeError("injected replacement commit failure")
-
-        replacement.commit_device_transition = fail_commit
-        return replacement
-
-    old_services.stage_replacement_authority = stage
-    try:
-        with pytest.raises(RuntimeError, match="injected replacement commit failure"):
+        with pytest.raises(RuntimeError, match="requires adapter"):
             experiment.load_config(
                 {
                     "sequencer": {
@@ -587,17 +543,13 @@ def test_irreversible_replacement_commit_failure_retains_recovery_authority(
                     }
                 }
             )
-        replacement = replacements[0]
-        assert old_services.closed
-        assert experiment._zlc_runtime_services is replacement
-        assert not replacement.closed
-        with pytest.raises(RuntimeError, match="crossed the old-device close boundary"):
-            experiment.open_devices()
+        assert experiment._require_runtime_services() is authority
+        assert raw_device_set(experiment) is old_devices
+        assert experiment.device_catalog.availability.value == "available"
+        assert console._current_runtime_fence() is authority
     finally:
         console.shutdown(timeout=1.0)
         experiment.close()
-        if replacements:
-            assert replacements[0].closed
         console.window().close()
 
 
@@ -608,7 +560,7 @@ def test_terminal_before_node_start_rolls_console_registry_back_without_ghost():
 
     ensure_qt_app()
     experiment = connect("virtual")
-    services = LegacyRuntimeServices(experiment.devices)
+    services = experiment._require_runtime_services()
     console = TaskConsole(
         hub=SignalHub(),
         state=default_console_state(),
@@ -649,7 +601,7 @@ def test_terminal_before_node_start_rolls_console_registry_back_without_ghost():
         console.kind_combo.setCurrentIndex(index)
         console._add_panel()
         row = console.logic_nodes[-1]
-        failing = _FailingNode(experiment.devices.camera)
+        failing = _FailingNode(raw_device_set(experiment).camera)
         console._build_logic_node = lambda *_args, **_kwargs: failing
         console._start_logic_node(row)
         handle = services.fence.handle_for(failing)
@@ -662,7 +614,7 @@ def test_terminal_before_node_start_rolls_console_registry_back_without_ghost():
     finally:
         console.shutdown(timeout=1.0)
         services.shutdown(timeout=1.0)
-        experiment.devices.close()
+        raw_device_set(experiment).close()
 
 
 def test_slow_hazard_journal_keeps_starting_node_out_of_provider_registry():
@@ -687,7 +639,7 @@ def test_slow_hazard_journal_keeps_starting_node_out_of_provider_registry():
     resources = ResourceArbiter(journal)
     broker = DeviceBroker()
     registry = LegacyDeviceRegistry(broker)
-    for registration in registrations_for(experiment.devices):
+    for registration in registrations_for(raw_device_set(experiment)):
         registry.register(registration)
     fence = LegacyRuntimeFence(RunController(resources), registry)
     console = TaskConsole(
@@ -748,7 +700,7 @@ def test_session_hardware_call_establishes_closed_connection_before_identity_bou
     monkeypatch,
 ):
     experiment = connect("virtual")
-    camera = experiment.devices.camera
+    camera = raw_device_set(experiment).camera
     state = {"open": False, "opens": 0}
 
     monkeypatch.setattr(
@@ -768,14 +720,14 @@ def test_session_hardware_call_establishes_closed_connection_before_identity_bou
 
         def operation():
             assert camera.is_open
-            assert experiment._zlc_runtime_services.resources.active_claims()
+            assert experiment._require_runtime_services().resources.active_claims()
             return "captured"
 
         assert experiment._run_hardware_call(
             (camera,), operation, name="lazy-open-capture"
         ) == "captured"
         assert state == {"open": True, "opens": 1}
-        assert experiment._zlc_runtime_services.resources.active_claims() == {}
+        assert experiment._require_runtime_services().resources.active_claims() == {}
     finally:
         experiment.close()
 
@@ -784,14 +736,14 @@ def test_session_pulse_facade_holds_one_claim_from_prepare_through_stop():
     experiment = connect("virtual")
     try:
         controller = experiment.timing.bind_pulse(experiment.sequence)
-        assert controller.sequencer.managed_installation_authority
+        assert not hasattr(controller, "sequencer")
         controller.on_pulse(repeat_forever=True, wait=False)
-        runtime = experiment._zlc_runtime_services
+        runtime = experiment._require_runtime_services()
         assert runtime.resources.active_claims()
-        assert experiment.devices.sequencer.snapshot()["state"] == "running"
+        assert raw_device_set(experiment).sequencer.snapshot()["state"] == "running"
         controller.stop()
         assert runtime.resources.active_claims() == {}
-        assert experiment.devices.sequencer.snapshot()["state"] == "safe"
+        assert raw_device_set(experiment).sequencer.snapshot()["state"] == "safe"
     finally:
         experiment.close()
 
@@ -855,7 +807,7 @@ def test_production_console_reports_device_conflict_without_stopping_first_owner
 
     ensure_qt_app()
     experiment = connect("virtual")
-    services = LegacyRuntimeServices(experiment.devices)
+    services = experiment._require_runtime_services()
     console = TaskConsole(
         hub=SignalHub(),
         state=default_console_state(),
@@ -898,7 +850,7 @@ def test_production_console_reports_device_conflict_without_stopping_first_owner
     finally:
         console.shutdown(timeout=1.0)
         services.shutdown(timeout=1.0)
-        experiment.devices.close()
+        raw_device_set(experiment).close()
 
 
 def test_device_transition_closes_start_admission_until_commit_or_abort():
@@ -925,12 +877,11 @@ def test_device_transition_closes_start_admission_until_commit_or_abort():
 
 def test_session_swap_gate_blocks_concurrent_start_through_old_generation():
     experiment = connect("virtual")
-    runtime = LegacyRuntimeServices(experiment.devices)
-    experiment._zlc_runtime_services = runtime
-    node = _Node(experiment.devices.camera)
+    runtime = experiment._require_runtime_services()
+    node = _Node(raw_device_set(experiment).camera)
     handle = runtime.fence.start(node)
     handle.wait_started(1.0)
-    old_devices = experiment.devices
+    old_devices = raw_device_set(experiment)
     real_close = old_devices.close
     close_entered = threading.Event()
     allow_close = threading.Event()
@@ -1023,11 +974,11 @@ def test_remote_sequencer_is_no_go_before_raw_hardware_safe_contract_exists():
 def test_experiment_config_cannot_override_installation_identity(field):
     experiment = connect("virtual")
     try:
-        experiment.devices.config["camera"][field] = "forged"
+        raw_device_set(experiment).config["camera"][field] = "forged"
         with pytest.raises(ValueError, match="installation-owned identity"):
-            registrations_for(experiment.devices)
+            registrations_for(raw_device_set(experiment))
     finally:
-        experiment.devices.close()
+        raw_device_set(experiment).close()
 
 
 def test_unknown_concrete_camera_adapter_is_rejected_at_composition():
@@ -1070,13 +1021,13 @@ def test_unknown_non_camera_device_subclass_is_rejected_at_composition():
 def test_virtual_device_set_has_explicit_registration_for_every_base_device():
     experiment = connect("virtual")
     try:
-        registrations = registrations_for(experiment.devices)
-        assert len(registrations) == len(experiment.devices.devices)
+        registrations = registrations_for(raw_device_set(experiment))
+        assert len(registrations) == len(raw_device_set(experiment).devices)
         assert {id(registration.device) for registration in registrations} == {
-            id(device) for device in experiment.devices.devices.values()
+            id(device) for device in raw_device_set(experiment).devices.values()
         }
     finally:
-        experiment.devices.close()
+        raw_device_set(experiment).close()
 
 
 def test_real_adapter_requires_installation_asset_map(tmp_path, monkeypatch):
@@ -1201,13 +1152,13 @@ def test_device_bearing_logic_node_direct_start_is_mechanically_rejected():
     from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
 
     experiment = connect("virtual")
-    node = CameraMeasurement(SignalHub(), experiment.devices.camera)
+    node = CameraMeasurement(SignalHub(), raw_device_set(experiment).camera)
     try:
         with pytest.raises(RuntimeError, match="LegacyRuntimeFence authority"):
             node.start()
         assert not node.running
     finally:
-        experiment.devices.close()
+        raw_device_set(experiment).close()
 
 
 def test_observe_only_logic_node_direct_start_is_mechanically_rejected():
@@ -1225,12 +1176,12 @@ def test_observe_only_logic_node_direct_start_is_mechanically_rejected():
             return {}
 
     experiment = connect("virtual")
-    node = Observer(experiment.devices.camera)
+    node = Observer(raw_device_set(experiment).camera)
     try:
         assert node.occupied_devices() == ()
-        assert node.referenced_devices() == (experiment.devices.camera,)
+        assert node.referenced_devices() == (raw_device_set(experiment).camera,)
         with pytest.raises(RuntimeError, match="LegacyRuntimeFence authority"):
             node.start()
         assert not node.running
     finally:
-        experiment.devices.close()
+        raw_device_set(experiment).close()

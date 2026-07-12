@@ -12,11 +12,13 @@ form from the spec's ParamDecls.  Two execution styles share the model:
 Either way display is suppressed (no auto plot); you add a Plot panel on the Monitor
 board pointed at a published signal to view it.
 
-Offscreen Qt + the virtual==real path (na.write_virtual_run / a virtual session); no
+Offscreen Qt + the virtual==real path (na.simulation.write_virtual_run / a virtual session); no
 demo GUI fixtures.
 """
 
 from __future__ import annotations
+
+from conftest import raw_device_set
 
 from pathlib import Path
 import sys
@@ -57,7 +59,7 @@ def test_processor_node_runs_and_publishes(tmp_path):
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
     data_dir = tmp_path / "run"
-    na.write_virtual_run(str(data_dir), prefix="img", groups=40, shots_per_group=4,
+    na.simulation.write_virtual_run(str(data_dir), prefix="img", groups=40, shots_per_group=4,
                          short_shot=3, ref_shots=(1, 2, 4), grid_shape=(4, 5),
                          loading_probability=0.5, seed=4)
     exp = na.connect("virtual", sitemap={"grid_shape": (4, 5)})
@@ -136,7 +138,7 @@ def test_judge_occupancy_node_reacts_to_frames(tmp_path):
         editor.form._widgets["calibration"].setText(str(cal_file))
 
         # a camera measurement publishes `frame`; the occupancy processor reacts to it
-        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
+        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer)
         fire_live_imaging(exp)                      # On Pulse: the trigger-driven camera streams
         cam.step()                                  # first frame on the hub
         console._start_logic_node(row)

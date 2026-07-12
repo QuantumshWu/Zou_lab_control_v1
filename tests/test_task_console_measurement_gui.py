@@ -23,9 +23,11 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import time
 
 import numpy as np
 import pytest
+from conftest import raw_device_set
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -53,14 +55,9 @@ def _calibrated_virtual_session(grid=(2, 3)):
 def _console(measurements, *, session=None):
     from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
-
     runtime = None
     if session is not None:
-        runtime = getattr(session, "_zlc_runtime_services", None)
-        if runtime is None or runtime.closed:
-            runtime = LegacyNeutralAtomRuntime(session.devices)
-            session._zlc_runtime_services = runtime
+        runtime = session._require_runtime_services()
     console = TaskConsole(hub=SignalHub(), state=default_console_state(),
                           running_nodes=[], measurements=measurements, session=session,
                           runtime_fence=None if runtime is None else runtime.fence,
@@ -501,6 +498,9 @@ def test_camera_frames_per_cycle_is_adjustable_in_the_gui():
         assert "frame_1" not in node.published_signals()
         editor._node_widgets["frames_per_cycle"].setText("2")
         editor._restart_node()
+        deadline = time.monotonic() + 1.0
+        while node.frames_per_cycle != 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert node.frames_per_cycle == 2
         assert "frame_1" in node.published_signals()
     finally:
@@ -517,8 +517,8 @@ def test_show_task_console_auto_starts_passed_nodes():
 
     hub = SignalHub()
     experiment = na.connect("virtual")
-    runtime = LegacyNeutralAtomRuntime(experiment.devices)
-    node = CameraMeasurement(hub, experiment.devices.camera)
+    runtime = experiment._require_runtime_services()
+    node = CameraMeasurement(hub, raw_device_set(experiment).camera)
     assert not node.running
     console = show_task_console(
         hub=hub,
@@ -531,7 +531,7 @@ def test_show_task_console_auto_starts_passed_nodes():
     finally:
         console.shutdown()
         runtime.shutdown(timeout=2.0)
-        experiment.devices.close()
+        raw_device_set(experiment).close()
     assert not node.running
 
 

@@ -10,11 +10,14 @@ sequencer side (the camera_trigger seam + the camera device own that notion inst
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import Zou_lab_control.neutral_atom as na
+from Zou_lab_control.neutral_atom.testing import VirtualSequencer
 
 
 def test_runtime_sequencer_has_no_trigger_channels_attr():
-    seq = na.VirtualSequencer(channels=["ch00", "ch11"], clock_hz=50e6)
+    seq = VirtualSequencer(channels=["ch00", "ch11"], clock_hz=50e6)
     assert not hasattr(seq, "trigger_channels")
 
 
@@ -35,8 +38,8 @@ def test_camera_owns_the_capture_trigger_channel_not_the_sequencer():
     exp = na.connect("virtual", open_devices=True)
     try:
         # The camera exposes which line gates it; the sequencer does not.
-        assert tuple(exp.devices.camera.capture_trigger_channels) == ("emCCD",)
-        assert not hasattr(exp.devices.sequencer, "trigger_channels")
+        assert tuple(raw_device_set(exp).camera.capture_trigger_channels) == ("emCCD",)
+        assert not hasattr(raw_device_set(exp).sequencer, "trigger_channels")
     finally:
         exp.close()
 
@@ -50,7 +53,7 @@ def test_firing_is_a_sequencer_contract_with_real_default_none():
     from Zou_lab_control.neutral_atom.devices.base import SequencerDevice
 
     assert "firing" in vars(SequencerDevice)               # declared on the abstract contract
-    seq = na.VirtualSequencer(channels=["ch00", "ch11"], clock_hz=50e6)
+    seq = VirtualSequencer(channels=["ch00", "ch11"], clock_hz=50e6)
     assert isinstance(seq, SequencerDevice)
     assert seq.firing is None                              # real backend default = correct semantics
 

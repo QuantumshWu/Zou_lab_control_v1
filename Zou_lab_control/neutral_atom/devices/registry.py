@@ -138,8 +138,8 @@ class DeviceSet:
         if not names:
             role = conventional or base_type.__name__      # the human role word ("camera") if known
             raise AttributeError(
-                f"this device config has no {role} -- add one (e.g. via na.discover_devices(); "
-                "each found device's row carries a ready config entry).")
+                f"this device config has no {role} -- add one through Device Manager "
+                "and save the installation config before connecting.")
         return conventional if (conventional and conventional in names) else names[0]
 
     def camera_names(self) -> tuple[str, ...]:

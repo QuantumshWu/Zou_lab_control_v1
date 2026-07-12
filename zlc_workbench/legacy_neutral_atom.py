@@ -454,30 +454,6 @@ class LegacyNeutralAtomRuntime:
             _registry_from(registrations, self.broker),
         )
 
-    def stage_replacement_authority(self, device_set):
-        """Return a new durability authority only when the safety domain changes."""
-
-        replacement_map = self.asset_map
-        try:
-            replacement_registrations = registrations_for(
-                device_set, asset_map=replacement_map
-            )
-        except RuntimeError:
-            # Virtual/offline maps are composition-scoped.  A transition into a real
-            # installation resolves the machine AssetMap; it never derives identity from config.
-            replacement_map = _resolve_asset_map(device_set, None)
-            replacement_registrations = registrations_for(
-                device_set, asset_map=replacement_map
-            )
-        required = _requires_persistent_safety(replacement_registrations)
-        if required == self.persistent and replacement_map.revision == self.asset_map.revision:
-            return None
-        return type(self)(
-            device_set,
-            safety_journal_path=self._safety_journal_path,
-            asset_map=replacement_map,
-        )
-
     def begin_device_transition(self) -> object:
         with self._lock:
             self._ensure_open()

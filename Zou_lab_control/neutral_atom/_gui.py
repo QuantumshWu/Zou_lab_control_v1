@@ -175,7 +175,7 @@ def open_device_manager(session: Any, **kwargs):
     The session's DEVICE-INIT entry: a config EDITOR over the round-trippable ``{role:
     {"type", "params"}}`` dict (typed per-class forms, New/Load/Save/Apply) plus the
     hardware panel (bus scan with add-to-config, the loaded instances with snapshots).
-    The GUI face of ``na.load_devices`` / ``na.discover_devices``; a later call RESHOWS
+    The installation-maintenance GUI; a later call RESHOWS
     the same window -- so a notebook never accumulates duplicates."""
 
     # Import the INTERNAL factory directly from the submodule: the widget factory is not a public

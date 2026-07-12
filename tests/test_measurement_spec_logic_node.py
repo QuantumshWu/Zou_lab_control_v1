@@ -15,6 +15,7 @@ import time
 
 import numpy as np
 import pytest
+from conftest import raw_device_set
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -228,7 +229,7 @@ def test_temperature_node_per_site_carries_the_per_site_dimension_in_the_raw_blo
     draws one line per site; a grid view reshapes a reduced point).  The node publishes only
     its coordinate and measured tensor; completion remains node control state."""
     exp = _calibrated_virtual_session(grid=(2, 3))
-    n_sites = exp.devices.trap_array.n_sites
+    n_sites = raw_device_set(exp).trap_array.n_sites
     hub = SignalHub()
     spec = exp.readout.measurement_specs()[0]
     measurement = spec.build(t_off=(0.0, 80.0, 4), shots=2, per_site=True)
@@ -243,7 +244,7 @@ def test_temperature_node_per_site_carries_the_per_site_dimension_in_the_raw_blo
     assert np.all((finite >= 0.0) & (finite <= 1.0))
     assert node.published_signals() == frozenset({spec.x_key, spec.y_key})
     # the latest point's per-site vector reshapes cleanly to the grid (the trap array owns the shape).
-    grid = exp.devices.trap_array.grid_shape
+    grid = raw_device_set(exp).trap_array.grid_shape
     assert reduced[-1].reshape(grid).shape == grid
 
 
@@ -274,10 +275,7 @@ def test_temperature_node_start_thread_auto_stops_when_scan_completes():
     hub = SignalHub()
     node, spec = _temperature_node(exp, hub, points=4, shots=2, t_max_us=80.0)
 
-    from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
-
-    runtime = LegacyNeutralAtomRuntime(exp.devices)
-    exp._zlc_runtime_services = runtime
+    runtime = exp._require_runtime_services()
     handle = runtime.fence.start(node)
     handle.wait_started(2.0)
     deadline = time.perf_counter() + 10.0
@@ -315,7 +313,7 @@ def test_virtual_camera_honors_roi_snaps_and_crops():
     contract a real qCMOS does (a ROI bug shows up in a virtual test; switching to
     real changes only connect())."""
     exp = na.connect("virtual", sitemap={"grid_shape": (2, 3), "image_shape": (64, 80)})
-    cam = exp.devices.camera
+    cam = raw_device_set(exp).camera
     assert cam.roi is None                                  # full frame by default (unchanged)
     cam.configure(roi=[10, 20, 6, 16])                      # x=10, y=6 are NOT multiples of 4
     assert cam.roi == (8, 20, 8, 16)                        # snapped to the grid, reported back
@@ -413,7 +411,7 @@ def test_region_to_acquisition_parameters_is_owned_by_the_source():
     frontend never encodes a device-specific shape."""
     exp = na.connect("virtual", sitemap={"grid_shape": (2, 3), "image_shape": (64, 80)})
     hub = SignalHub()
-    cam_node = na.CameraMeasurement(hub, exp.devices.camera)
+    cam_node = na.CameraMeasurement(hub, raw_device_set(exp).camera)
     # endpoints stay endpoints (NOT collapsed to position+size) -- plot format
     assert cam_node.region_to_acquisition_parameters(10, 30, 6, 22) == {"region": [10, 30, 6, 22]}
     # endpoints come in any order -> sorted endpoints
@@ -436,9 +434,9 @@ def test_camera_measurement_exposes_camera_params_and_applies_them_live():
     camera's exposure and set_acquisition_parameters() reconfigures the camera in place
     -- no rebuild, same measurement keeps publishing 'frame'."""
     exp = na.connect("virtual")
-    cam = exp.devices.camera
+    cam = raw_device_set(exp).camera
     hub = SignalHub()
-    cam_node = na.CameraMeasurement(hub, cam, sequencer=exp.devices.sequencer)
+    cam_node = na.CameraMeasurement(hub, cam, sequencer=raw_device_set(exp).sequencer)
     fire_live_imaging(exp)                                  # On Pulse: the trigger-driven camera streams
 
     # default frames_per_cycle=1 -> 'frame' = the (repeat, H, W) data array (a 2D panel reduces its

@@ -7,6 +7,8 @@ as ``camera image`` instead of ``frame``.
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import os
 import sys
 import time
@@ -43,8 +45,8 @@ def test_camera_nest_leaf_is_short_name_not_axis_label():
     exp = na.connect("virtual")
     console = None
     try:
-        seq = imaging_sequence(exposure=exp.devices.camera.exposure, load=True, name="live").forever()
-        exp.devices.sequencer.prepare(seq); exp.devices.sequencer.fire()   # On Pulse so the camera streams
+        seq = imaging_sequence(exposure=raw_device_set(exp).camera.exposure, load=True, name="live").forever()
+        raw_device_set(exp).sequencer.prepare(seq); raw_device_set(exp).sequencer.fire()   # On Pulse so the camera streams
         console = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
                               measurements=exp.readout.measurement_specs(), window_px=(900, 600))
         console._timer.stop()

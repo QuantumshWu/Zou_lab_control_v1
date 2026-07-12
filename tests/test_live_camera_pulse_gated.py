@@ -26,8 +26,9 @@ if sys.path[0] != str(REPO_ROOT):
 import Zou_lab_control.neutral_atom as na
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
 from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
+from Zou_lab_control.neutral_atom.operations.measurement import triggered_frames
 
-from conftest import fire_live_imaging   # the live "On Pulse" the trigger-driven camera needs
+from conftest import fire_live_imaging, raw_device_set
 
 
 def test_live_camera_streams_only_while_the_pulse_is_firing():
@@ -35,7 +36,7 @@ def test_live_camera_streams_only_while_the_pulse_is_firing():
     while firing, FROZEN on Stop Pulse, resuming on re-fire -- end-to-end through the node."""
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     hub = SignalHub()
-    cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
+    cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer)
     try:
         # 1) Nothing fired yet -> the streamer emits no camera trigger -> NO live frame.
         cam.step()
@@ -53,7 +54,7 @@ def test_live_camera_streams_only_while_the_pulse_is_firing():
 
         # 3) "Stop Pulse" (set_safe_state): no more triggers -> the live view FREEZES.
         #    Stepping the camera many more times never changes the last frame (NOT fabricated).
-        exp.devices.sequencer.set_safe_state()
+        raw_device_set(exp).sequencer.set_safe_state()
         frozen = np.asarray(hub.latest("frame_0")).copy()
         for _ in range(6):
             assert cam.step() == {}                           # no publish: the view holds
@@ -76,7 +77,7 @@ def test_virtual_camera_device_does_not_fabricate_a_frame_when_idle():
     (the camera's ``sequencer`` construction parameter) is the ONLY way a pulse reaches the
     sensor -- the acquiring code never hands the camera a sequence."""
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
-    cam, seqr = exp.devices.camera, exp.devices.sequencer
+    cam, seqr = raw_device_set(exp).camera, raw_device_set(exp).sequencer
     try:
         assert seqr.firing is None
         assert len(cam.acquire(1)) == 0          # idle wire -> no fabricated frame
@@ -101,11 +102,16 @@ def test_prepare_replaces_the_continuous_firing():
     keep rendering the STALE continuous program."""
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     try:
-        seqr = exp.devices.sequencer
+        seqr = raw_device_set(exp).sequencer
         fire_live_imaging(exp)                       # continuous On Pulse -> firing set
         assert seqr.firing is not None
         # a measurement's arm-before-fire shot uploads a FINITE program: prepare replaces the play
-        na.triggered_frames(exp.devices.camera, seqr, na.imaging_sequence(exposure=1e-3, load=True), 2)
+        triggered_frames(
+            raw_device_set(exp).camera,
+            seqr,
+            na.imaging_sequence(exposure=1e-3, load=True),
+            2,
+        )
         assert seqr.firing is None                   # the continuous On Pulse is no longer firing
     finally:
         exp.close()

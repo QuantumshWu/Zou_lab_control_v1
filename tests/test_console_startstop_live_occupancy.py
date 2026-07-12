@@ -14,6 +14,8 @@ gives a spurious ~0.5.  Routes through the same TaskConsole + calibration.detect
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import os
 import time
 import numpy as np
@@ -35,13 +37,13 @@ def test_console_three_startstop_cycles_stable_name_and_live_accuracy():
     exp = na.connect("virtual")
     con = None
     try:
-        trap = exp.devices.trap_array
-        exp.devices.camera.exposure = 0.020                      # stale default != readout gate
+        trap = raw_device_set(exp).trap_array
+        raw_device_set(exp).camera.exposure = 0.020                      # stale default != readout gate
         task = exp.readout.calibrate_task(SignalHub(), threshold_method="otsu",
                                           threshold_frames=200, readout_exposure=0.002)
         task.run_to_completion()
         exp.readout._session.calibration_data = task.calibration
-        assert exp.devices.camera.exposure == pytest.approx(0.002)   # #2 pin: live readout self-matches cal
+        assert raw_device_set(exp).camera.exposure == pytest.approx(0.002)   # #2 pin: live readout self-matches cal
 
         con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
                           measurements=exp.readout.measurement_specs(),
@@ -76,7 +78,7 @@ def test_console_three_startstop_cycles_stable_name_and_live_accuracy():
         from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement, OccupancyProcessor
         hub = SignalHub()
         camera = CameraMeasurement(
-            hub, exp.devices.camera, sequencer=exp.devices.sequencer, repeat=0)
+            hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer, repeat=0)
         judge = OccupancyProcessor(
             hub, calibration=task.calibration,
             source_expr={"inputs": ["frame_0"], "source": "value = signal"},

@@ -10,6 +10,8 @@ index convention.  This is a data-level invariant (the virtual frame goes throug
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import os
 import numpy as np
 import pytest
@@ -23,8 +25,8 @@ def test_checkerboard_occupancy_round_trips_through_detect():
 
     exp = na.connect("virtual")
     try:
-        trap = exp.devices.trap_array
-        exp.devices.camera.exposure = 20e-3                 # high SNR -> readout error is negligible
+        trap = raw_device_set(exp).trap_array
+        raw_device_set(exp).camera.exposure = 20e-3                 # high SNR -> readout error is negligible
         exp.readout.sitemap(method="box", frames=12, display=False)
         exp.readout.thresholds(frames=300, display=False)
         cal = exp.readout.current

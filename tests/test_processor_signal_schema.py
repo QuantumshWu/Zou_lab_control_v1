@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import numpy as np
 
 import Zou_lab_control.neutral_atom as na
@@ -18,7 +20,7 @@ def test_occupancy_preserves_every_physical_repeat_and_point_cell():
     exp.readout.thresholds(frames=20, display=False)
     hub = SignalHub()
     camera = CameraMeasurement(
-        hub, exp.camera, sequencer=exp.devices.sequencer, repeat=5)
+        hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer, repeat=5)
     processor = OccupancyProcessor(
         hub,
         calibration=exp.readout.current,

@@ -8,6 +8,8 @@ re-roll the rule.
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 from pathlib import Path
 import sys
 
@@ -151,7 +153,7 @@ def test_occupancy_source_default_signal_expr_equals_single_frame_path():
         # publish it, and judge it -- no simulation ground truth read.
         from tests.conftest import fire_live_imaging
         fire_live_imaging(exp)
-        img = exp.devices.camera.acquire(1)[0]                # the wired camera senses the firing itself
+        img = raw_device_set(exp).camera.acquire(1)[0]                # the wired camera senses the firing itself
         hub.publish({"frame": np.asarray(img, dtype=float)})
         out = occ.step()
         assert "occupied" in out and "rate" in out        # it judged the consumed frame

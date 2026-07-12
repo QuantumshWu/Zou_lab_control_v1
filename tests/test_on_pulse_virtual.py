@@ -10,6 +10,8 @@ VirtualSequencer -- so the SAME on_pulse code runs on both backends (only connec
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 from pathlib import Path
 import sys
 
@@ -18,6 +20,7 @@ if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
 import Zou_lab_control.neutral_atom as na
+from Zou_lab_control.neutral_atom.testing import bind_test_pulse
 
 
 def test_on_pulse_finite_and_continuous_on_virtual():
@@ -27,8 +30,8 @@ def test_on_pulse_finite_and_continuous_on_virtual():
     try:
         # build_release_recapture_pulse returns a PulseTableState (the GUI's pulse type).
         state = na.build_release_recapture_pulse(
-            port_catalog=exp.devices.sequencer.port_catalog)
-        pulse = na.bind_pulse(exp.devices.sequencer, state)
+            port_catalog=raw_device_set(exp).sequencer.port_catalog)
+        pulse = bind_test_pulse(raw_device_set(exp).sequencer, state)
 
         # finite shot, wait for done -> a real program (NOT None) with a name.
         prog = pulse.on_pulse(wait=True, timeout=10.0, repeat_forever=False)
@@ -37,11 +40,11 @@ def test_on_pulse_finite_and_continuous_on_virtual():
         # continuous (On Pulse) -> the streamer keeps firing (the live camera would stream).
         prog2 = pulse.on_pulse(wait=False, repeat_forever=True)
         assert prog2 is not None and prog2.sequence_name == state.name
-        assert exp.devices.sequencer.firing is not None
+        assert raw_device_set(exp).sequencer.firing is not None
 
         # Stop Pulse -> firing cleared.
         pulse.stop()
-        assert exp.devices.sequencer.firing is None
+        assert raw_device_set(exp).sequencer.firing is None
     finally:
         exp.close()
 

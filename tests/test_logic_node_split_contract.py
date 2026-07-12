@@ -12,6 +12,8 @@ detection is the production code path, as a distinct graph node.
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 from pathlib import Path
 import sys
 
@@ -37,7 +39,7 @@ def test_camera_measurement_plus_detect_processor_runs_real_pipeline():
     assert cal is not None and cal.thresholds is not None
 
     hub = SignalHub()
-    cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
+    cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer)
     det = OccupancyProcessor(hub, calibration=cal, source_expr={"inputs": ["frame_0"], "source": "value = signal"}, grid_shape=(3, 4))
     try:
         fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
@@ -91,7 +93,7 @@ def test_calibrate_task_produces_calibration_and_drives_detect_processor(tmp_pat
     hub = SignalHub()
     try:
         task = CalibrateReadoutTask(
-            hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=(3, 4),
+            hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer, grid_shape=(3, 4),
             threshold_frames=20, folder=str(tmp_path / "cal"))
         task.run_to_completion()
 
@@ -108,7 +110,7 @@ def test_calibrate_task_produces_calibration_and_drives_detect_processor(tmp_pat
 
         # composition: the task's calibration drives an OccupancyProcessor on live frames
         # -- THAT (a processor) is what lands occupancy on the hub.
-        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
+        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer)
         det = OccupancyProcessor(hub, calibration=task.calibration, grid_shape=(3, 4))
         fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
         cam.step()
@@ -137,13 +139,13 @@ def test_user_composed_loading_readout_streams_real_detect_off_camera_frames():
         # (The task publishes its mid-run output under its own cal_ prefix so its
         # template frames never clobber the live frame the user will stream next.)
         task = CalibrateReadoutTask(
-            hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=(3, 4),
+            hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer, grid_shape=(3, 4),
             threshold_frames=20, prefix="cal_")
         task.run_to_completion()
         assert task.calibration is not None
 
         # User composition step 2: a camera Measurement (publishes raw frames).
-        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
+        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer)
         # User composition step 3: an OccupancyProcessor running the REAL contract.
         det = OccupancyProcessor(hub, calibration=task.calibration, grid_shape=(3, 4))
 
@@ -229,7 +231,7 @@ def test_calibrate_task_output_stays_off_the_hub():
     hub = SignalHub()
     try:
         task = CalibrateReadoutTask(
-            hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=(3, 4),
+            hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer, grid_shape=(3, 4),
             threshold_frames=20, prefix="cal_")
         assert "frame_0" not in hub.names()              # nothing live yet
         task.run_to_completion()                       # runs the calibrate task
@@ -239,7 +241,7 @@ def test_calibrate_task_output_stays_off_the_hub():
 
         # The user adds the live camera measurement separately -- it publishes ``frame``
         # on the hub; the task's buffered frame never collided with it (no ``cal_*``).
-        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
+        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer)
         fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
         cam.step()
         assert "frame_0" in hub.names()

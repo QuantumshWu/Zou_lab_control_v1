@@ -21,6 +21,8 @@ Runs headless (``QT_QPA_PLATFORM=offscreen``); virtual sleeps are fast-forwarded
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import ast
 import os
 import sys
@@ -72,7 +74,7 @@ def _camera_hub_node(exp):
     from conftest import fire_live_imaging
 
     hub = SignalHub()
-    cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+    cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                             prefix="cam_", repeat=2)
     fire_live_imaging(exp)
     for _ in range(4):

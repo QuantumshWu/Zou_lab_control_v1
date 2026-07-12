@@ -17,7 +17,8 @@ asserted never to raise.  Expected names derive from the live device set, never 
 
 from __future__ import annotations
 
-import inspect
+from conftest import raw_device_set
+
 from pathlib import Path
 import sys
 
@@ -263,18 +264,21 @@ def test_register_discovery_provider_validates_inputs():
         register_discovery_provider("x", "not a callable")
 
 
-def test_discovery_protocol_is_public_at_the_package_level():
-    """Everything a user needs to wire their OWN hardware is importable from ``na``: the
-    row/note builders, both registration calls, and the lookup-capable loader."""
+def test_adapter_contracts_are_explicit_and_runtime_registry_is_not_public():
     import matplotlib
     matplotlib.use("Agg")
     from Zou_lab_control import neutral_atom as na
+    from Zou_lab_control.neutral_atom import adapter_sdk
 
-    assert na.DiscoveredDevice is DiscoveredDevice
-    assert na.discovery_note is discovery_note
-    assert na.register_discovery_provider is register_discovery_provider
-    assert na.register_device_class is register_device_class
-    assert "lookup" in inspect.signature(na.load_devices).parameters
+    assert adapter_sdk.DiscoveredDevice is DiscoveredDevice
+    assert adapter_sdk.discovery_note is discovery_note
+    for forbidden in (
+        "discover_devices",
+        "load_devices",
+        "register_device_class",
+        "register_discovery_provider",
+    ):
+        assert not hasattr(na, forbidden)
 
 
 def test_discover_devices_never_raises_and_always_reports():
@@ -297,7 +301,7 @@ def test_camera_measurement_choices_come_from_the_device_set():
 
     exp = na.connect("virtual")
     try:
-        names = exp.devices.camera_names()
+        names = raw_device_set(exp).camera_names()
         assert names == ("camera", "monitor_camera")
         cam_spec = exp.readout.camera_spec()
         assert next(p for p in cam_spec.params if p.key == "camera").choices == names
@@ -318,9 +322,9 @@ def test_camera_spec_builds_the_named_camera():
     exp = na.connect("virtual")
     try:
         node = exp.readout.camera_spec().build(SignalHub(), camera="monitor_camera")
-        assert node.camera is exp.devices["monitor_camera"]
+        assert node.camera is raw_device_set(exp)["monitor_camera"]
         default = exp.readout.camera_spec().build(SignalHub())
-        assert default.camera is exp.devices.camera
+        assert default.camera is raw_device_set(exp).camera
     finally:
         exp.close()
 
@@ -339,9 +343,9 @@ def test_camera_spec_exposure_is_per_selected_camera():
     try:
         spec = exp.readout.camera_spec()
         assert next(p for p in spec.params if p.key == "exposure").default is None
-        monitor = exp.devices["monitor_camera"]
+        monitor = raw_device_set(exp)["monitor_camera"]
         own = float(monitor.exposure)
-        assert own != float(exp.devices.camera.exposure)   # the two sensors genuinely differ
+        assert own != float(raw_device_set(exp).camera.exposure)
         spec.build(SignalHub(), camera="monitor_camera")   # blank exposure
         assert float(monitor.exposure) == own              # untouched
         spec.build(SignalHub(), camera="monitor_camera", exposure=2 * own)
@@ -372,7 +376,7 @@ def test_session_tolerates_missing_roles():
 
     # a bare monitor rig (the basler_monitor shape, camera not opened)
     session = NeutralAtomSession(load_devices("basler_monitor", open_devices=False))
-    assert session.devices.default_camera_name() == "monitor_camera"
+    assert raw_device_set(session).default_camera_name() == "monitor_camera"
     assert session.sequence is not None                    # imaging sequence composes w/o a readout camera
     # readout's camera spec picks the only camera as its default
     spec = session.readout.camera_spec()
@@ -383,9 +387,9 @@ def test_session_tolerates_missing_roles():
     # a config with NO camera at all is still a legal session; camera asks raise with guidance
     empty = NeutralAtomSession(load_devices({"sequencer": {"type": "VirtualSequencer"}},
                                             open_devices=False))
-    assert empty.devices.camera_names() == ()
+    assert raw_device_set(empty).camera_names() == ()
     with pytest.raises(AttributeError, match="no camera"):
-        empty.devices.default_camera_name()
+        raw_device_set(empty).default_camera_name()
 
 
 def test_pylon_camera_construction_needs_no_pylon_runtime():

@@ -14,6 +14,8 @@ pulse scan still keeps its grid_shape (covered by tests/test_pulse_param_scan.py
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import os
 import numpy as np
 import pytest
@@ -49,7 +51,7 @@ def test_occupied_structure_has_no_grid_shape_so_a_2d_panel_cannot_heatmap_it():
         camrow = add(("camera", "live"))
         judrow = add(("processor", "Judge occupancy"))
         con._start_logic_node(camrow); con._start_logic_node(judrow)
-        fire_live_imaging(exp, exposure=exp.devices.camera.exposure)
+        fire_live_imaging(exp, exposure=raw_device_set(exp).camera.exposure)
         con._logic_nodes[id(camrow)].step()
         con._logic_nodes[id(judrow)].step()
 

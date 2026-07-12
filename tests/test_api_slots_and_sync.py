@@ -12,6 +12,8 @@ contract (the two things the user demanded be impossible to regress):
 """
 
 from __future__ import annotations
+
+from conftest import raw_device_set
 from Zou_lab_control.neutral_atom.ports import PortCatalog
 
 import json
@@ -158,7 +160,7 @@ def test_every_fire_path_records_a_syncable_table():
 
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (48, 60)}, seed=1)
     try:
-        seqr = exp.devices.sequencer
+        seqr = raw_device_set(exp).sequencer
         # a Task fires a COMPILED bracket (no periods of its own)
         tpl = default_imaging_template()
         tpl.set_api("a1", 0.02)

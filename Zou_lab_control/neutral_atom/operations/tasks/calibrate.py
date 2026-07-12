@@ -48,7 +48,7 @@ CALIBRATE_PARAMS = (
                       "live = acquire now (camera + pulse template) and write the calibration; "
                       "saved frames = build the calibration from raw frames already on disk in "
                       "`folder` (named img1.npy, img2.npy, ... -- e.g. a prior real run, or "
-                      "na.write_virtual_run).  (To REUSE a finished calibration you do NOT "
+                      "na.simulation.write_virtual_run).  (To REUSE a finished calibration you do NOT "
                       "calibrate again: point the Judge-occupancy processor at its calibration.json.)"),
     ParamDecl("folder", "folder", "path", default=DEFAULT_DATA_DIR, required=True, path_mode="dir",
               base_dir=DEFAULT_DATA_DIR,

@@ -20,6 +20,8 @@ data_shape=(), grid_shape=()" because THREE independent defects lined up:
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import os
 from pathlib import Path
 import sys
@@ -80,7 +82,7 @@ def test_2d_panel_survives_calibration_task_and_camera_restart():
         con._start_logic_node(camrow)
         cam2 = con._logic_nodes[id(camrow)]
         frame_spec = next(spec for spec in cam2.output_specs() if spec.name == "frame_0")
-        assert frame_spec.data_shape == exp.devices.camera.frame_shape
+        assert frame_spec.data_shape == raw_device_set(exp).camera.frame_shape
         card._render_version = -1                     # force a recompose this tick
         tick(con)
         assert card._status_error is False, card._status_text

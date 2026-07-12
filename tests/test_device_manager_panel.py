@@ -23,7 +23,7 @@ import Zou_lab_control.neutral_atom as na
 import Zou_lab_control.frontend as zf
 from Zou_lab_control.frontend.device_manager import DeviceManagerPanel
 from Zou_lab_control.frontend.qt_fluent import FluentGroupBox
-from Zou_lab_control.neutral_atom.devices.registry import device_domains
+from Zou_lab_control.neutral_atom.devices.registry import device_domains, load_devices
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -37,7 +37,7 @@ def _editor_cards(panel):
 
 
 def test_editor_has_one_section_per_registered_domain():
-    devices = na.load_devices("virtual")
+    devices = load_devices("virtual")
     panel = DeviceManagerPanel(devices)
     titles = [c.title() for c in _editor_cards(panel)]
     # ONE editor card per domain -- type-generic, driven by the registry (add a domain -> a card)
@@ -48,7 +48,7 @@ def test_editor_has_one_section_per_registered_domain():
 
 
 def test_scan_populates_the_discovered_card_without_crashing():
-    devices = na.load_devices("virtual")
+    devices = load_devices("virtual")
     panel = DeviceManagerPanel(devices)
     panel._scan()                                          # scans real buses, must not raise
     assert panel._discovered_body.count() >= 1             # rows or the "nothing found" note

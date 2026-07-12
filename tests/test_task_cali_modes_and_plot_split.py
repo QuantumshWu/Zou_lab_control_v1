@@ -24,6 +24,8 @@ camera frames are simulated).
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import inspect
 from pathlib import Path
 import sys
@@ -83,7 +85,7 @@ def test_calibrate_task_computes_every_method_processor_picks(threshold_method):
         fire_live_imaging(exp)                 # On Pulse: the trigger-driven camera streams
         for m in ALL_READOUT_METHODS:
             hub = SignalHub()
-            cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
+            cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer)
             occ = OccupancyProcessor(hub, calibration=cal, source_expr={"inputs": ["frame_0"], "source": "value = signal"}, method=m)
             cam.step(); occ.step()
             occupied = np.asarray(hub.latest("occupied"))
@@ -107,24 +109,24 @@ def test_calibrate_task_pins_live_camera_exposure_to_the_readout_gate():
 
     exp = _calibrated()
     try:
-        exp.devices.camera.exposure = 0.020                  # stale default -- DIFFERENT from the readout gate
+        raw_device_set(exp).camera.exposure = 0.020                  # stale default -- DIFFERENT from the readout gate
         task = exp.readout.calibrate_task(
             SignalHub(), threshold_method="otsu", threshold_frames=24, readout_exposure=0.004)
         task.run_to_completion()
         # the live readout exposure is now the calibrated gate, not the stale 20 ms default
-        assert exp.devices.camera.exposure == pytest.approx(0.004), exp.devices.camera.exposure
+        assert raw_device_set(exp).camera.exposure == pytest.approx(0.004), raw_device_set(exp).camera.exposure
         assert task.calibration.readout_exposure() == pytest.approx(0.004)
         # and the live judge (camera frame at the pinned exposure) is accurate, not ~0.5 chance
         fire_live_imaging(exp)
         accs = []
         for _ in range(8):
             hub = SignalHub()
-            cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
+            cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer)
             occ = OccupancyProcessor(hub, calibration=task.calibration,
                                      source_expr={"inputs": ["frame_0"], "source": "value = signal"}, method="box")
             cam.step(); occ.step()
             pred = np.asarray(hub.latest("occupied"), dtype=bool).reshape(-1)
-            truth = np.asarray(exp.devices.trap_array.occupancy, dtype=bool).reshape(-1)
+            truth = np.asarray(raw_device_set(exp).trap_array.occupancy, dtype=bool).reshape(-1)
             accs.append(float((pred == truth).mean()))
         assert np.mean(accs) >= 0.75, f"live occupancy must match at the pinned exposure, got {np.mean(accs):.3f}"
     finally:
@@ -274,7 +276,7 @@ def test_calibrate_task_saved_frames_source(tmp_path):
     exp = _calibrated()
     try:
         folder = tmp_path / "run"
-        na.write_virtual_run(str(folder), groups=8, grid_shape=(3, 4), seed=0)
+        na.simulation.write_virtual_run(str(folder), groups=8, grid_shape=(3, 4), seed=0)
         task = exp.readout.calibrate_task(
             SignalHub(), source="saved frames", folder=str(folder))
         assert task.source == "saved frames"
@@ -302,7 +304,7 @@ def test_calibrate_task_saved_frames_uses_reference_brackets_for_held_out_fideli
         folder = tmp_path / "run"
         # a fidelity-LIMITED short readout (small exposure) so the methods genuinely separate;
         # many groups so every site gets both bright + dark labelled shots to train on.
-        na.write_virtual_run(str(folder), groups=160, grid_shape=(4, 5),
+        na.simulation.write_virtual_run(str(folder), groups=160, grid_shape=(4, 5),
                              short_exposure=5e-4, seed=5)
         task = exp.readout.calibrate_task(
             SignalHub(), source="saved frames", folder=str(folder))

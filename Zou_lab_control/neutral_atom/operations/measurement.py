@@ -695,15 +695,14 @@ class ScanResult(MeasurementTaskResult):
 def require_pulse_controller(pulse):
     """The ONE "is this a fireable pulse handle" gate: anything a scan is about to FIRE must
     be a ``PulseController`` (it exposes a callable ``frame_sequence``) -- the object
-    ``exp.timing.bind_pulse(...)`` / ``na.bind_pulse(...)`` returns.  Every entry point that
+    ``exp.timing.bind_pulse(...)`` returns.  Every entry point that
     accepts an operator-supplied ``pulse`` (the scan builders in ``subsystems.readout`` and
     :class:`ScannedMeasurement` itself) calls THIS, so the predicate and its user guidance
     are typed exactly once and a raw sequence/path always fails with the same clear text.
     Returns ``pulse`` so call sites can gate-and-use in one expression."""
     if not callable(getattr(pulse, "frame_sequence", None)):
         raise TypeError(
-            "pulse must be a PulseController returned by exp.timing.bind_pulse(...) "
-            "or na.bind_pulse(...)."
+            "pulse must be a PulseController returned by exp.timing.bind_pulse(...)."
         )
     return pulse
 
@@ -779,7 +778,7 @@ class ScannedMeasurement:
     def _sequencer(self):
         # Prefer the sequencer the pulse is bound to (single source of truth);
         # fall back to the one passed in (e.g. the session's default device).
-        return getattr(self.pulse, "sequencer", self.sequencer) or self.sequencer
+        return getattr(self.pulse, "_sequencer", self.sequencer) or self.sequencer
 
     def measure(self, value: float, index: int | None = None) -> np.ndarray:
         """Acquire + reduce one scan point.  The live engine calls this per point."""

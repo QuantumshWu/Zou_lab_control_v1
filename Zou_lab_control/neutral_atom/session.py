@@ -68,12 +68,6 @@ class NeutralAtomSession:
         self._timing_subsystem = TimingSubsystem(self)
 
     @property
-    def devices(self) -> DeviceCatalogView:
-        """Read-only configured-device metadata; never a hardware drive capability."""
-
-        return self._installation_supervisor.catalog
-
-    @property
     def device_catalog(self) -> DeviceCatalogView:
         """Immutable public installation observation."""
 
@@ -147,9 +141,8 @@ class NeutralAtomSession:
     def device_manager(self, **kwargs):
         """Open the device-manager GUI bound to this session: see every device the config loaded,
         grouped by device DOMAIN (Camera / Sequencer / Trap array / a future RF source -- the SAME
-        registry the per-measurement device dropdowns read), and a "Scan hardware" button that probes
-        the buses.  The GUI face of ``na.load_devices`` / ``na.discover_devices``; a ONE-per-session
-        window."""
+        catalog the per-measurement device dropdowns read), and a managed installation-admin action
+        that probes buses without exposing adapters to the session.  A ONE-per-session window."""
         from ._gui import open_device_manager
         return open_device_manager(self, **kwargs)
 
@@ -501,7 +494,7 @@ class NeutralAtomSession:
     def status(self) -> dict[str, Any]:
         return {
             "name": self.name,
-            "devices": self.devices.to_dict(),
+            "devices": self.device_catalog.to_dict(),
             "sequence": self.sequence.table(),
             "calibration": None if self._calibration is None else self._calibration.to_dict(),
             "history_length": len(self.history),
@@ -509,7 +502,7 @@ class NeutralAtomSession:
 
     def _repr_html_(self) -> str:
         calibration = "none" if self._calibration is None else f"{self._calibration.n_sites} sites"
-        devices = ", ".join(self.devices)
+        devices = ", ".join(self.device_catalog)
         return html_summary(
             "NeutralAtomSession",
             {

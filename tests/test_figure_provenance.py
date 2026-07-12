@@ -37,6 +37,8 @@ Runs headless (``QT_QPA_PLATFORM=offscreen``); virtual sleeps are fast-forwarded
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import os
 import sys
 from pathlib import Path
@@ -88,7 +90,7 @@ def test_provenance_snapshot_includes_held_camera_and_params():
     exp = na.connect("virtual")
     try:
         hub = SignalHub()
-        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer, repeat=2)
+        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer, repeat=2)
         fire_live_imaging(exp)
         for _ in range(4):
             cam.step()
@@ -100,7 +102,7 @@ def test_provenance_snapshot_includes_held_camera_and_params():
         # the held devices' PUBLIC snapshots (camera contract), keyed by role
         devices = prov["devices"]
         assert "camera" in devices and "sequencer" in devices
-        assert devices["camera"]["type"] == type(exp.devices.camera).__name__
+        assert devices["camera"]["type"] == type(raw_device_set(exp).camera).__name__
         assert "exposure" in devices["camera"]                       # a real snapshot key, not a placeholder
         # the node's own acquisition params travelled too (the exposure / frames the operator set)
         assert "acquisition_parameters" in prov
@@ -131,7 +133,7 @@ def test_provenance_is_captured_once_per_run_not_per_shot():
     exp = na.connect("virtual")
     try:
         hub = SignalHub()
-        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer, repeat=2)
+        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer, repeat=2)
         fire_live_imaging(exp)
         cam.refresh_provenance()                 # what start() does -- capture the run's base state ONCE
         first = cam.provenance_snapshot()
@@ -155,7 +157,7 @@ def _camera_console(exp):
     from Zou_lab_control.frontend import panel_plot
 
     hub = SignalHub()
-    cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+    cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                             prefix="cam_", repeat=2)
     fire_live_imaging(exp)
     for _ in range(4):
@@ -189,7 +191,7 @@ def test_console_save_writes_producing_node_provenance(tmp_path):
         editor.rebuild()
         # the console-side resolution: the panel's signal -> its producing node -> the node's snapshot
         prov = _console_provenance(editor)
-        assert prov is not None and prov["devices"]["camera"]["type"] == type(exp.devices.camera).__name__
+        assert prov is not None and prov["devices"]["camera"]["type"] == type(raw_device_set(exp).camera).__name__
 
         # drive the REAL Save into tmp (auto-name off = verbatim path) and read the npz back
         editor.save_dir_edit.setText(str(tmp_path / "frame"))
@@ -201,7 +203,7 @@ def test_console_save_writes_producing_node_provenance(tmp_path):
         saved = load_figure(npz)
         stored = saved.info.get("provenance")
         assert isinstance(stored, dict), "info['provenance'] round-trips through the npz"
-        assert stored["devices"]["camera"]["type"] == type(exp.devices.camera).__name__
+        assert stored["devices"]["camera"]["type"] == type(raw_device_set(exp).camera).__name__
         assert "exposure" in stored["devices"]["camera"]
         assert "acquisition_parameters" in stored and "exposure" in stored["acquisition_parameters"]
     finally:
@@ -232,7 +234,7 @@ def test_console_save_chains_upstream_measurement_provenance():
     console = None
     try:
         hub = SignalHub()
-        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                                 prefix="cam_", repeat=2)
         # the processor CONSUMES cam_frame_0 (its provenance says so) but holds NO device
         proc = OccupancyProcessor(hub, source_expr=SignalExpr(["cam_frame_0"], DEFAULT_SOURCE),
@@ -261,7 +263,7 @@ def test_console_save_chains_upstream_measurement_provenance():
         # panel's provenance carries devices in EXACTLY the same place a direct camera panel does
         assert isinstance(prov.get("devices"), dict) and "camera" in prov["devices"], \
             "a processed panel hoists the upstream camera's devices to the top level"
-        assert prov["devices"]["camera"]["type"] == type(exp.devices.camera).__name__
+        assert prov["devices"]["camera"]["type"] == type(raw_device_set(exp).camera).__name__
         assert "sequencer" in prov["devices"], "both held devices travel up (camera + sequencer)"
         # the upstream node's acquisition params were hoisted too
         assert "acquisition_parameters" in prov and "exposure" in prov["acquisition_parameters"]
@@ -288,7 +290,7 @@ def test_measurement_and_processor_panels_record_the_same_flat_devices_shape():
     console = None
     try:
         hub = SignalHub()
-        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+        cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                                 prefix="cam_", repeat=2)
         proc = OccupancyProcessor(hub, source_expr=SignalExpr(["cam_frame_0"], DEFAULT_SOURCE),
                                   prefix="occ_")

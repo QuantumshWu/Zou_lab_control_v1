@@ -15,7 +15,7 @@ hub-ready dict.  This pins:
    (they would clobber each other on the shared SignalHub).
 
 Virtual == real: the only data source is a saved frames folder
-(na.write_virtual_run output); switching to hardware changes only who wrote the
+(na.simulation.write_virtual_run output); switching to hardware changes only who wrote the
 frames, not this path.
 """
 
@@ -38,7 +38,7 @@ from Zou_lab_control.neutral_atom.operations import processor_registry as R
 
 def test_readout_fidelity_processor_drives_characterize(tmp_path):
     data_dir = tmp_path / "run01"
-    na.write_virtual_run(str(data_dir), prefix="img", groups=80, shots_per_group=4,
+    na.simulation.write_virtual_run(str(data_dir), prefix="img", groups=80, shots_per_group=4,
                          short_shot=3, ref_shots=(1, 2, 4), short_exposure=5e-3,
                          reference_exposure=20e-3, grid_shape=(5, 7),
                          loading_probability=0.55, seed=9)
@@ -73,7 +73,7 @@ def test_processor_run_once_and_publishes_to_hub(tmp_path):
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
     data_dir = tmp_path / "run02"
-    na.write_virtual_run(str(data_dir), prefix="img", groups=60, shots_per_group=4,
+    na.simulation.write_virtual_run(str(data_dir), prefix="img", groups=60, shots_per_group=4,
                          short_shot=3, ref_shots=(1, 2, 4), grid_shape=(4, 5),
                          loading_probability=0.5, seed=3)
     exp = na.connect("virtual", sitemap={"grid_shape": (4, 5)})

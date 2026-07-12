@@ -12,6 +12,8 @@ same acquire(n) contract.
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 from pathlib import Path
 import sys
 
@@ -24,6 +26,7 @@ if sys.path[0] != str(REPO_ROOT):
 
 import Zou_lab_control.neutral_atom as na
 from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement, OccupancyProcessor
+from Zou_lab_control.neutral_atom.operations.measurement import triggered_frames
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
 from conftest import fire_live_imaging   # the live "On Pulse" the trigger-driven camera needs
@@ -32,7 +35,7 @@ from conftest import fire_live_imaging   # the live "On Pulse" the trigger-drive
 def test_two_triggers_publish_frame_0_and_frame_1():
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     hub = SignalHub()
-    cam_node = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer,
+    cam_node = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                                  frames_per_cycle=2, repeat=4)
     fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
     for _ in range(2):
@@ -55,7 +58,7 @@ def test_two_triggers_publish_frame_0_and_frame_1():
 
 def test_default_is_single_event_frame_0_only():
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
-    cam_node = CameraMeasurement(SignalHub(), exp.camera)        # frames_per_cycle defaults to 1
+    cam_node = CameraMeasurement(SignalHub(), raw_device_set(exp).camera)        # frames_per_cycle defaults to 1
     cam_node.step()
     assert set(cam_node.published_signals()) == {"frame_0"}      # one event -> just frame_0; no lumped frame
 
@@ -116,11 +119,11 @@ def test_long_short_long_imaging_bracket_shows_distinct_per_window_exposures():
 
     exp = na.connect("virtual")
     try:
-        atoms = exp.devices.trap_array
+        atoms = raw_device_set(exp).trap_array
         seq = PulseTableState.load(str(REPO_ROOT / "pulses" / "imaging_template.json")).to_sequence().forever()
         assert seq.repeat_forever and base_cycle_trigger_pulses(seq) == 3   # ONE cycle, 3 emCCD windows
         imgs = atoms.image_frames(seq, 3, capture_trigger_channels=("emCCD",),
-                                  exposure=exp.devices.camera.exposure)
+                                  exposure=raw_device_set(exp).camera.exposure)
         bright = [float(np.mean(im)) for im in imgs]
         # long, SHORT, long -> the short middle frame is dimmer than BOTH long frames (not all equal).
         assert bright[1] < bright[0] and bright[1] < bright[2], bright
@@ -144,11 +147,11 @@ def test_live_camera_measurement_shows_the_bracket_exposures_window_for_window()
 
     exp = na.connect("virtual")
     try:
-        seqr = exp.devices.sequencer
+        seqr = raw_device_set(exp).sequencer
         seq = PulseTableState.load(str(REPO_ROOT / "pulses" / "imaging_template.json")).to_sequence().forever()
         seqr.prepare(seq)
         seqr.fire()                                   # the pulse GUI's "On Pulse"
-        node = CameraMeasurement(SignalHub(), exp.devices.camera, sequencer=seqr, frames_per_cycle=3)
+        node = CameraMeasurement(SignalHub(), raw_device_set(exp).camera, sequencer=seqr, frames_per_cycle=3)
         for _ in range(2):                            # TWO cycles: brightness AND phase stability
             out = node.shot()
             assert set(out) == {"frame_0", "frame_1", "frame_2"}
@@ -167,7 +170,7 @@ def test_camera_frame_keys_is_the_single_source_for_published_and_declared_names
     from Zou_lab_control.neutral_atom.operations.logic import camera_frame_keys
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     for n in (1, 2, 3):
-        cam = CameraMeasurement(SignalHub(), exp.camera, frames_per_cycle=n)
+        cam = CameraMeasurement(SignalHub(), raw_device_set(exp).camera, frames_per_cycle=n)
         assert set(camera_frame_keys(n)) == set(cam.published_signals())     # helper == live publish
         assert "frame" not in camera_frame_keys(n)                            # never the lumped residue
         assert camera_frame_keys(n) == [f"frame_{i}" for i in range(n)]       # ordered, frame_0..frame_{n-1}
@@ -183,7 +186,7 @@ def test_readout_image_frame_judged_is_synced_with_occupancy():
     exp.readout.thresholds(frames=20, display=False)
     cal = exp.readout.current
     hub = SignalHub()
-    cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer)
+    cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer)
     det = OccupancyProcessor(hub, calibration=cal, source_expr={"inputs": ["frame_0"], "source": "value = signal"}, method="box", grid_shape=(3, 4))
     fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
     for _ in range(4):
@@ -215,7 +218,7 @@ def test_2d_frame_panel_shows_camera_average_decoupled_from_judge():
     exp.readout.sitemap(frames=4, display=False)
     exp.readout.thresholds(frames=20, display=False)
     hub = SignalHub()
-    cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer, repeat=5)  # 0=∞; 5 = a 5-deep block
+    cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer, repeat=5)  # 0=∞; 5 = a 5-deep block
     det = OccupancyProcessor(hub, calibration=exp.readout.current,
                              source_expr={"inputs": ["frame_0"], "source": "value = signal"}, method="box", grid_shape=(3, 4))
     fire_live_imaging(exp)
@@ -255,7 +258,7 @@ def test_occupancy_falls_back_to_session_calibration_on_shape_mismatch():
     det = OccupancyProcessor(hub, calibration=stale_cal, session_calibration=lambda: session_cal,
                              source_expr={"inputs": ["frame_0"], "source": "value = signal"}, grid_shape=(3, 4))
     fire_live_imaging(exp)
-    img = exp.devices.camera.acquire(1)[0]                # the wired camera senses the firing itself
+    img = raw_device_set(exp).camera.acquire(1)[0]                # the wired camera senses the firing itself
     hub.publish({"frame_0": np.asarray(img, dtype=float)})
     out = det.step()                                     # stale cal mismatches (48,60) -> falls back
     assert "occupied" in out and "rate" in out           # readout keeps flowing (not wedged)
@@ -305,7 +308,7 @@ def test_occupancy_nodes_publish_short_names_and_disambiguate_on_collision():
 
 def test_frames_per_cycle_is_live_editable():
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
-    cam_node = CameraMeasurement(SignalHub(), exp.camera)
+    cam_node = CameraMeasurement(SignalHub(), raw_device_set(exp).camera)
     assert cam_node.acquisition_parameters()["frames_per_cycle"] == 1
     cam_node.set_acquisition_parameters(frames_per_cycle=3)     # the owner-thread apply path uses this
     assert cam_node.frames_per_cycle == 3
@@ -319,14 +322,14 @@ def test_region_is_always_exposed_even_at_full_frame():
     editing AND the plot's area-select / zoom writeback has a field to fill.  (Regression: when
     ``region`` was emitted only for a set ROI, a full-frame camera showed no ROI field at all.)"""
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
-    assert exp.camera.roi is None                                  # default: full frame, no sub-array
-    assert tuple(exp.camera.sensor_shape) == (40, 50)              # (height, width)
-    cam_node = CameraMeasurement(SignalHub(), exp.camera)
+    assert raw_device_set(exp).camera.roi is None                                  # default: full frame, no sub-array
+    assert tuple(raw_device_set(exp).camera.sensor_shape) == (40, 50)              # (height, width)
+    cam_node = CameraMeasurement(SignalHub(), raw_device_set(exp).camera)
     params = cam_node.acquisition_parameters()
     assert params["region"] == [0, 50, 0, 40]                      # full sensor endpoints [x0,x1,y0,y1]
     # and the endpoints round-trip back to a real sub-array when applied (crop on Apply)
     cam_node.set_acquisition_parameters(region=[10, 30, 5, 25])
-    assert exp.camera.roi is not None
+    assert raw_device_set(exp).camera.roi is not None
 
 
 def _camera_classes():
@@ -341,7 +344,9 @@ def _camera_classes():
 def test_device_type_hints_resolve_no_missing_import():
     """F5: every device class's method annotations RESOLVE (``get_type_hints`` succeeds) -- a name
     used in an annotation (e.g. ``Mapping`` on ``VirtualMotCamera.__init__``) must be imported, not
-    left to survive only as a frozen string under ``from __future__ import annotations``.  A missing
+    left to survive only as a frozen string under ``from __future__ import annotations
+
+from conftest import raw_device_set``.  A missing
     import is silent until something evaluates the hints (get_type_hints / eval_str); this pins it."""
     import inspect
     import typing
@@ -383,7 +388,7 @@ def test_arm_fire_read_yields_the_armed_frame_count_end_to_end():
     one frame per edge and would otherwise time out waiting for edge 2."""
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     try:
-        cam, seqr = exp.devices.camera, exp.devices.sequencer
+        cam, seqr = raw_device_set(exp).camera, raw_device_set(exp).sequencer
         seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")
         program = seq.repeated(2)                    # emit TWO camera-trigger edges (two shots)
         cam.arm(2)
@@ -395,7 +400,7 @@ def test_arm_fire_read_yields_the_armed_frame_count_end_to_end():
             cam.disarm()
         assert len(frames) == 2 and all(np.asarray(f).shape == (40, 50) for f in frames)
         # the single helper is the same story in one call: it repeats the single-trigger pulse to N edges
-        assert len(na.triggered_frames(cam, seqr, seq, 3)) == 3
+        assert len(triggered_frames(cam, seqr, seq, 3)) == 3
     finally:
         exp.close()
 
@@ -407,7 +412,7 @@ def test_armed_buffer_is_lossless_for_late_consumption():
     ``repeated(5)`` program (N frames = N edges)."""
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     try:
-        cam, seqr = exp.devices.camera, exp.devices.sequencer
+        cam, seqr = raw_device_set(exp).camera, raw_device_set(exp).sequencer
         cam.recent_capacity = 2                     # tiny live-view ring (set before first frame)
         seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")
         program = seq.repeated(5)                   # FIVE camera-trigger edges in one fired program
@@ -434,7 +439,7 @@ def test_single_trigger_armed_for_more_raises_timeout_edge_faithful():
     path raises, so a mis-built pulse fails identically on sim and hardware.)"""
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     try:
-        cam, seqr = exp.devices.camera, exp.devices.sequencer
+        cam, seqr = raw_device_set(exp).camera, raw_device_set(exp).sequencer
         seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")   # ONE emCCD edge
         cam.arm(20)                                  # arm generously ...
         try:
@@ -456,10 +461,10 @@ def test_triggered_frames_repeats_single_trigger_to_n_edges():
     from Zou_lab_control.neutral_atom.devices.camera_trigger import count_trigger_pulses
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     try:
-        cam, seqr = exp.devices.camera, exp.devices.sequencer
+        cam, seqr = raw_device_set(exp).camera, raw_device_set(exp).sequencer
         seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")
         assert count_trigger_pulses(seq.repeated(20)) == 20          # the repeated program carries 20 edges
-        frames = na.triggered_frames(cam, seqr, seq, 20)
+        frames = triggered_frames(cam, seqr, seq, 20)
         assert len(frames) == 20 and all(np.asarray(f).shape == (40, 50) for f in frames)
     finally:
         exp.close()
@@ -472,7 +477,7 @@ def test_read_frames_requires_arm():
     the one-shot that does not need a manual arm."""
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     try:
-        cam = exp.devices.camera
+        cam = raw_device_set(exp).camera
         with pytest.raises(RuntimeError, match="arm"):
             cam.read_frames(1)
     finally:
@@ -484,7 +489,7 @@ def test_unarmed_camera_misses_the_trigger_like_hardware():
     gone, exactly like real hardware (arming after the fact cannot recover it)."""
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     try:
-        cam, seqr = exp.devices.camera, exp.devices.sequencer
+        cam, seqr = raw_device_set(exp).camera, raw_device_set(exp).sequencer
         seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")
         seqr.prepare(seq)
         seqr.fire(seq)                              # nobody armed -> the edge is lost
@@ -530,8 +535,8 @@ def test_camera_exposure_setter_round_trips_on_every_backend():
     assert CameraDevice.exposure.fset is not None                  # the contract declares a setter
 
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
-    exp.camera.exposure = 5e-3                                       # virtual backend
-    assert exp.camera.exposure == 5e-3
+    raw_device_set(exp).camera.exposure = 5e-3                                       # virtual backend
+    assert raw_device_set(exp).camera.exposure == 5e-3
 
     cam = QCMOSCamera()                                             # NOT opened -> configure skips DCAM
     roi_before = cam.roi

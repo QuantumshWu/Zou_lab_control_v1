@@ -7,6 +7,7 @@ shape, primary-signal exception, control sentinel, or ndim inference exists.
 
 import numpy as np
 import pytest
+from conftest import raw_device_set
 
 import Zou_lab_control.neutral_atom as na
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
@@ -45,7 +46,7 @@ def test_camera_schema_is_repeat_one_point_image():
     try:
         hub = SignalHub()
         camera = CameraMeasurement(
-            hub, exp.devices.camera, sequencer=exp.devices.sequencer, repeat=4)
+            hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer, repeat=4)
         fire_live_imaging(exp)
         for _ in range(6):
             camera.step()
@@ -53,7 +54,7 @@ def test_camera_schema_is_repeat_one_point_image():
         schema = hub.schema("frame_0")
         frame = hub.latest("frame_0")
         assert schema.point_shape == (1,)
-        assert schema.data_shape == exp.devices.camera.frame_shape
+        assert schema.data_shape == raw_device_set(exp).camera.frame_shape
         assert schema.repeat_capacity == 4
         assert frame.shape == (4, 1, *schema.data_shape)
         assert camera.finished and camera.points_done == 4
@@ -66,12 +67,12 @@ def test_camera_repeat_zero_is_bounded_live_ring():
     try:
         hub = SignalHub()
         camera = CameraMeasurement(
-            hub, exp.devices.camera, sequencer=exp.devices.sequencer, repeat=0)
+            hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer, repeat=0)
         fire_live_imaging(exp)
         for _ in range(6):
             camera.step()
         assert hub.latest("frame_0").shape == (
-            1, 1, *exp.devices.camera.frame_shape)
+            1, 1, *raw_device_set(exp).camera.frame_shape)
         assert hub.schema("frame_0").repeat_capacity == 1
         assert not camera.finished and camera.total_points == 0
     finally:
@@ -245,7 +246,7 @@ def test_occupancy_declares_every_output_without_static_exceptions():
         exp.readout.thresholds(frames=20, display=False)
         hub = SignalHub()
         camera = CameraMeasurement(
-            hub, exp.devices.camera, sequencer=exp.devices.sequencer)
+            hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer)
         occupancy = OccupancyProcessor(
             hub,
             calibration=exp.readout.current,

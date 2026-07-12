@@ -215,7 +215,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         workflow): index ``PREFIX<n>`` frames, average the reference frames into an
         all-sites template, DETECT site centers from it, and (``method='psf'``) fit
         per-site PSF weights.  Identical on real hardware -- only who wrote the
-        folder differs (see ``na.write_virtual_run`` for the virtual writer)."""
+        folder differs (see ``na.simulation.write_virtual_run`` for the virtual writer)."""
 
         s = self._session
         grid_shape = s.resolve_grid_shape(grid_shape)
@@ -256,7 +256,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         held-out fidelity characterization, writes results to ``results_dir``
         (default ``<data_dir>_results``), and optionally stores the trained
         thresholds back into the calibration.  This is the SAME code a real run
-        uses -- only the frames' author (real camera vs ``na.write_virtual_run``)
+        uses -- only the frames' author (real camera vs ``na.simulation.write_virtual_run``)
         differs."""
 
         s = self._session
@@ -403,7 +403,8 @@ class ReadoutSubsystem(ExperimentSubsystem):
         # this specific result object, not of the generic scan loop.
         reference_controller = self._scan_pulse(pulse, name="reference_threshold")
         reference_sequence = reference_controller.frame_sequence(reference_shots, time_ns=float(reference_exposure) * 1e9)
-        ref_seqr = reference_controller.sequencer
+        ref_seqr = reference_controller._sequencer
+        ref_authority_seqr = getattr(ref_seqr, "_authority_device", ref_seqr)
 
         def acquire_reference():
             configure = getattr(s._device_set.camera, "configure", None)
@@ -414,7 +415,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
             )
 
         reference_images = s._run_hardware_call(
-            (s._device_set.camera, ref_seqr),
+            (s._device_set.camera, ref_authority_seqr),
             acquire_reference,
             name="readout-reference-threshold",
         )
@@ -905,7 +906,7 @@ class _SessionImagingController:
     def __init__(self, session, *, name: str):
         self._session = session
         self._name = str(name)
-        self.sequencer = getattr(session._device_set, "sequencer", None)
+        self._sequencer = getattr(session._device_set, "sequencer", None)
         self.pulse = None
 
     def set_time(self, value_ns: float) -> "_SessionImagingController":

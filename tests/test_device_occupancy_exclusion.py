@@ -20,6 +20,8 @@ each other (a camera cannot be armed twice).
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import os
 from pathlib import Path
 import sys
@@ -52,8 +54,8 @@ def test_nodes_on_disjoint_cameras_coexist():
         _, main = _start_camera_row(con)                     # main camera row starts AFTER
         assert mon.running and mon in con.running_nodes      # ...and the monitor keeps running
         assert main.running and main in con.running_nodes
-        assert set(mon.occupied_devices()) == {exp.devices["monitor_camera"]}
-        assert set(main.occupied_devices()) == {exp.devices["camera"]}
+        assert set(mon.occupied_devices()) == {raw_device_set(exp)["monitor_camera"]}
+        assert set(main.occupied_devices()) == {raw_device_set(exp)["camera"]}
     finally:
         con.shutdown()
         exp.close()
@@ -95,7 +97,7 @@ def test_calibration_task_stops_only_the_conflicting_camera():
         assert task is not None
         assert mon.running and mon in con.running_nodes             # disjoint hardware -> survives
         devs = set(task.occupied_devices())
-        assert exp.devices["camera"] in devs and exp.devices.sequencer in devs
+        assert raw_device_set(exp)["camera"] in devs and raw_device_set(exp).sequencer in devs
         con._stop_logic_node(taskrow)                               # tidy: don't leave the cali running
     finally:
         con.shutdown()
@@ -109,11 +111,11 @@ def test_camera_trigger_wire_is_lifecycle_dependency_not_host_observation():
 
     exp = na.connect("virtual")
     try:
-        node = CameraMeasurement(SignalHub(), exp.devices.camera, sequencer=exp.devices.sequencer)
-        assert node.sequencer is exp.devices.sequencer
-        assert set(node.occupied_devices()) == {exp.devices.camera}
-        assert set(node.referenced_devices()) == {exp.devices.camera}
-        assert set(node.lifecycle_devices()) == {exp.devices.sequencer}
+        node = CameraMeasurement(SignalHub(), raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer)
+        assert node.sequencer is raw_device_set(exp).sequencer
+        assert set(node.occupied_devices()) == {raw_device_set(exp).camera}
+        assert set(node.referenced_devices()) == {raw_device_set(exp).camera}
+        assert set(node.lifecycle_devices()) == {raw_device_set(exp).sequencer}
     finally:
         exp.close()
 
@@ -172,16 +174,16 @@ def test_hardware_declaring_one_shot_borrows_only_drivable_devices():
     con = make_console(exp)
     try:
         _, cam = _start_camera_row(con)
-        assert cam.sequencer is exp.devices.sequencer
+        assert cam.sequencer is raw_device_set(exp).sequencer
         live_spec = ProcessorSpec(name="Live grab probe", params=(), run=lambda ctx: {"ok": 1.0},
                                   result_keys=("ok",), devices=("camera", "sequencer"))
         con.processors.append(live_spec)
         row = con._add_logic_node(LogicNodeConfig(kind="processor", name="Live grab probe"),
                                   focus=False)
         built = con._build_logic_node(row.node, {})
-        assert built.camera is exp.devices["camera"]              # declared role -> the drivable instance
+        assert built.camera is raw_device_set(exp)["camera"]              # declared role -> the drivable instance
         assert built.sequencer is None                            # wiring record is not borrowed
-        assert set(built.occupied_devices()) == {exp.devices["camera"]}   # honest claim = what it holds
+        assert set(built.occupied_devices()) == {raw_device_set(exp)["camera"]}   # honest claim = what it holds
     finally:
         con.shutdown()
         exp.close()
@@ -194,10 +196,10 @@ def test_runtime_and_lifecycle_device_sets_are_distinct():
 
     exp = na.connect("virtual")
     try:
-        node = CameraMeasurement(SignalHub(), exp.devices.camera, sequencer=exp.devices.sequencer)
-        assert set(node.occupied_devices()) == {exp.devices.camera}
-        assert set(node.referenced_devices()) == {exp.devices.camera}
-        assert set(node.lifecycle_devices()) == {exp.devices.sequencer}
+        node = CameraMeasurement(SignalHub(), raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer)
+        assert set(node.occupied_devices()) == {raw_device_set(exp).camera}
+        assert set(node.referenced_devices()) == {raw_device_set(exp).camera}
+        assert set(node.lifecycle_devices()) == {raw_device_set(exp).sequencer}
     finally:
         exp.close()
 
@@ -215,14 +217,14 @@ def test_swapping_one_device_stops_only_its_nodes_exclusive_and_observe():
         _, mon = _start_camera_row(con, camera_name="monitor_camera")
         _, main = _start_camera_row(con)
         assert mon.running and main.running
-        seq_before = exp.devices["sequencer"]
+        seq_before = raw_device_set(exp)["sequencer"]
 
         # the change-hook path the session drives when ONLY the main camera is swapped
-        con.stop_nodes_using({id(exp.devices["camera"])})
+        con.stop_nodes_using({id(raw_device_set(exp)["camera"])})
 
         assert not main.running and main not in con.running_nodes   # references the swapped camera
         assert mon.running and mon in con.running_nodes             # disjoint camera -> survives
-        assert exp.devices["sequencer"] is seq_before               # (nothing actually swapped here)
+        assert raw_device_set(exp)["sequencer"] is seq_before               # (nothing actually swapped here)
     finally:
         con.shutdown()
         exp.close()
@@ -238,7 +240,7 @@ def test_load_config_swap_stops_referencing_console_nodes_end_to_end():
         exp.load_config("virtual")                         # full rebuild -> every device swapped
         con._poll_logic_nodes()                             # presentation-only Qt reconciliation
         assert not cam.running and cam not in con.running_nodes
-        assert con._current_runtime_fence() is exp._zlc_runtime_services
+        assert con._current_runtime_fence() is exp._require_runtime_services()
     finally:
         con.shutdown()
         exp.close()

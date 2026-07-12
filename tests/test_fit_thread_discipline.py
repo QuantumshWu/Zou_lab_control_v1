@@ -19,6 +19,7 @@ import time
 
 import numpy as np
 import pytest
+from conftest import raw_device_set
 
 import Zou_lab_control.neutral_atom as na
 from Zou_lab_control.frontend.task_console import PANEL_PARAMS
@@ -199,7 +200,7 @@ def _facet_grid_console(exp):
                       processors=exp.readout.processor_specs(),
                       tasks=exp.readout.task_specs(), window_px=(1000, 700))
     con._timer.stop()
-    cam = CameraMeasurement(con.hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+    cam = CameraMeasurement(con.hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                             frames_per_cycle=1, repeat=4)
     con.running_nodes = [cam]
     fire_live_imaging(exp)

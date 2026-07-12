@@ -14,6 +14,8 @@ through the REAL sites-plot consumption path (``PanelCard._signal_then_repeat`` 
 
 from __future__ import annotations
 
+from conftest import raw_device_set
+
 import sys
 from pathlib import Path
 
@@ -44,7 +46,7 @@ def _calibrated_occupancy(hub):
     exp = na.connect("virtual", sitemap={"grid_shape": GRID})
     exp.readout.sitemap(frames=4, display=False)
     exp.readout.thresholds(frames=20, display=False)
-    cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+    cam = CameraMeasurement(hub, raw_device_set(exp).camera, sequencer=raw_device_set(exp).sequencer,
                             repeat=REPEAT)                       # 0=∞; REPEAT = a REPEAT-deep block
     det = OccupancyProcessor(hub, calibration=exp.readout.current,
                              source_expr={"inputs": ["frame_0"], "source": "value = signal"},
