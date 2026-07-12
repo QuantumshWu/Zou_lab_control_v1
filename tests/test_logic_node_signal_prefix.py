@@ -35,6 +35,10 @@ def _start_with_camera(con, row, camera_name=None):
     if camera_name is not None:
         con._logic_editors[id(row)].form.seed_values({"camera": camera_name})
     con._start_logic_node(row)
+    pending = con._starting_nodes.get(id(row))
+    if pending is not None:
+        con._legacy_handles[id(pending)].wait_started(2.0)
+        con._poll_logic_nodes()
     return con._logic_nodes[id(row)]
 
 

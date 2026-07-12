@@ -95,7 +95,13 @@ class ReadoutSubsystem(ExperimentSubsystem):
         exposure = s.defaults.get("sitemap_exposure", s.camera_exposure())
         sequence = s.build_imaging_sequence(exposure=exposure, load=True, name="sitemap")
         seq_dev = getattr(s.devices, "sequencer", None)
-        images = triggered_frames(s.devices.camera, seq_dev, sequence, positive_int(frames, "frames"))
+        images = s._run_hardware_call(
+            (s.devices.camera, seq_dev),
+            lambda: triggered_frames(
+                s.devices.camera, seq_dev, sequence, positive_int(frames, "frames")
+            ),
+            name="readout-sitemap",
+        )
         result = calibrate_sitemap_from_images(
             images, grid_shape=grid_shape, ordering=ordering, roi_radius=roi_radius, reducer=reducer,
             method=method, psf_half_width=psf_half_width, display=display,
@@ -123,7 +129,13 @@ class ReadoutSubsystem(ExperimentSubsystem):
         expo = s.camera_exposure() if exposure is None else float(exposure)
         sequence = s.build_imaging_sequence(exposure=expo, load=True, name="threshold")
         seq_dev = getattr(s.devices, "sequencer", None)
-        images = triggered_frames(s.devices.camera, seq_dev, sequence, positive_int(frames, "frames"))
+        images = s._run_hardware_call(
+            (s.devices.camera, seq_dev),
+            lambda: triggered_frames(
+                s.devices.camera, seq_dev, sequence, positive_int(frames, "frames")
+            ),
+            name="readout-thresholds",
+        )
         # The exposure these thresholds are learnt at is stamped INSIDE calibrate_threshold_from_images
         # (the single source every threshold path routes through, #H3w-3) so a later readout -- e.g. the
         # release-recapture survival frames -- self-matches it and never floors/sticks (#H3v-2).
@@ -160,7 +172,11 @@ class ReadoutSubsystem(ExperimentSubsystem):
             exposure = calibration.readout_exposure(fallback=s.camera_exposure())
         sequence = s.build_imaging_sequence(exposure=float(exposure), load=True, name="detect")
         seq_dev = getattr(s.devices, "sequencer", None)
-        images = triggered_frames(s.devices.camera, seq_dev, sequence, 1)
+        images = s._run_hardware_call(
+            (s.devices.camera, seq_dev),
+            lambda: triggered_frames(s.devices.camera, seq_dev, sequence, 1),
+            name="readout-detect",
+        )
         result = detect_image(images[-1], calibration, sequence=sequence, display=display, what=what)
         s.history.append(result)
         return result
@@ -381,12 +397,22 @@ class ReadoutSubsystem(ExperimentSubsystem):
         # engine.  The reference-threshold acquisition stays here -- it is part of
         # this specific result object, not of the generic scan loop.
         reference_controller = self._scan_pulse(pulse, name="reference_threshold")
-        configure = getattr(s.devices.camera, "configure", None)
-        if pulse is not None and callable(configure):
-            configure(exposure=float(reference_exposure))
         reference_sequence = reference_controller.frame_sequence(reference_shots, time_ns=float(reference_exposure) * 1e9)
         ref_seqr = reference_controller.sequencer
-        reference_images = triggered_frames(s.devices.camera, ref_seqr, reference_sequence, reference_shots)
+
+        def acquire_reference():
+            configure = getattr(s.devices.camera, "configure", None)
+            if pulse is not None and callable(configure):
+                configure(exposure=float(reference_exposure))
+            return triggered_frames(
+                s.devices.camera, ref_seqr, reference_sequence, reference_shots
+            )
+
+        reference_images = s._run_hardware_call(
+            (s.devices.camera, ref_seqr),
+            acquire_reference,
+            name="readout-reference-threshold",
+        )
         # Extract through the calibration's own method (box or PSF) and Otsu-split + score via the
         # ONE shared pipeline -- so the held-out reference uses the SAME signals/threshold/fidelity
         # the live OtsuFidelityReducer does, the same quantity detect() compares (#C3).
@@ -472,7 +498,9 @@ class ReadoutSubsystem(ExperimentSubsystem):
         sequencer = getattr(controller, "sequencer", getattr(s.devices, "sequencer", None))
         return ScannedMeasurement(
             controller, s.devices.camera, sequencer, calibration,
-            axis, plan, reducer, shots_per_point=positive_int(shots_per_point, "shots_per_point"),
+            axis, plan, reducer,
+            shots_per_point=positive_int(shots_per_point, "shots_per_point"),
+            run_hardware=s._run_hardware_call,
         )
 
     def build_temperature_scan(

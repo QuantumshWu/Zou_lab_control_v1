@@ -308,6 +308,7 @@ class LogicNode:
         # replacement (for example a camera ROI or calibration-site change).
         self._registered_output_schemas: dict[str, SignalSchema] = {}
         self._registered_output_history: dict[str, int | None] = {}
+        self._runtime_start_authority: object | None = None
 
     @property
     def display_label(self) -> str:
@@ -469,7 +470,29 @@ class LogicNode:
             self._registered_output_schemas[name] = schema
             self._registered_output_history[name] = previous._registered_output_history.get(name)
 
+    def _bind_runtime_start_authority(self, authority: object) -> None:
+        """Bind this instance to the one migration runtime allowed to start it."""
+
+        if authority is None:
+            raise ValueError("runtime start authority cannot be None")
+        current = self._runtime_start_authority
+        if current is not None and current is not authority:
+            raise RuntimeError("LogicNode is already bound to another runtime authority")
+        self._runtime_start_authority = authority
+
+    def _start_from_runtime(self, authority: object) -> "LogicNode":
+        if self._runtime_start_authority is not authority:
+            raise RuntimeError("LogicNode start capability does not match its runtime authority")
+        return self._start_impl()
+
     def start(self) -> "LogicNode":
+        if tuple(self.referenced_devices()):
+            raise RuntimeError(
+                "device-bearing LogicNode.start() requires LegacyRuntimeFence authority"
+            )
+        return self._start_impl()
+
+    def _start_impl(self) -> "LogicNode":
         """Publish shots from a daemon thread AS FAST AS THE HARDWARE ALLOWS until ``stop()``.
 
         The loop is DATA-paced, never rate-capped: an acquiring shot blocks on the device read and loops
@@ -574,13 +597,12 @@ class LogicNode:
                      if d is not None)
 
     def referenced_devices(self) -> tuple:
-        """EVERY real device instance this node touches -- ``EXCLUSIVE`` drivers AND ``OBSERVE``
-        records -- with each OBSERVE proxy unwrapped back to its underlying hardware identity.
-        This is the SUPERSET of :meth:`occupied_devices` (which is only the mutual-exclusion
-        set): it answers "if THIS device is swapped or closed, is this node now running on dead
-        hardware?".  A node that merely OBSERVES a sequencer (e.g. a passive camera view reading
-        its scan progress) must ALSO stop when that sequencer is reinitialised, so the device
-        lifecycle drives the node lifecycle for every reference, not just the driving one."""
+        """Real devices whose host API this node accesses while running.
+
+        EXCLUSIVE entries drive; OBSERVE entries use an explicitly read-only host surface.
+        Wiring or generation dependencies that the node never calls belong in
+        :meth:`lifecycle_devices`, not in an artificial OBSERVE claim.
+        """
         from ..devices.base import underlying_device
         out: list = []
         seen: set[int] = set()
@@ -590,6 +612,11 @@ class LogicNode:
                 seen.add(id(dev))
                 out.append(dev)
         return tuple(out)
+
+    def lifecycle_devices(self) -> tuple:
+        """Devices whose replacement invalidates this node without being host API access."""
+
+        return ()
 
     def _bare_published_signals(self) -> frozenset:
         """The SHORT (un-prefixed) signal names this node emits -- exactly the keys its
@@ -1938,16 +1965,13 @@ class CameraMeasurement(Measurement):
 
     The node is PASSIVE: the streamer runs independently (the pulse GUI's On Pulse) and the
     camera just reads what its trigger input gates -- no frames means the view freezes.
-    ``sequencer`` is the RECORD of which streamer this live view rides on (the console reads
-    it off the running node, e.g. for the scan-progress readout); the node itself never
-    drives or reads it."""
+    ``sequencer`` records the physical/virtual trigger wiring only.  The node never calls its
+    host API, so it is a lifecycle dependency rather than an OBSERVE resource claim."""
 
     node_label = "camera"
-    # Drives ONLY its sensor: the node arms the camera (exclusive acquire lock).  The
-    # sequencer is OBSERVE -- a passive record (see class docstring) that the base narrows
-    # to its read-only view, so this node PHYSICALLY cannot prepare/fire it: a camera view
-    # and a sequencer-driving scan on DIFFERENT sensors coexist, machine-enforced.
-    _devices = {"camera": EXCLUSIVE, "sequencer": OBSERVE}
+    # Drives only its sensor.  Sequencer is the trigger-wire lifecycle dependency below,
+    # not a host-side observation permission.
+    _devices = {"camera": EXCLUSIVE}
 
     def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
                  frames_per_cycle: int = 1, prefix: str = "", repeat: int = 0):
@@ -1990,6 +2014,12 @@ class CameraMeasurement(Measurement):
         self._set_repeat_ring(repeat)                    # block depth: K for finite, 1 for the live view
         self._rings = None
         self._filled = 0
+
+    def lifecycle_devices(self) -> tuple:
+        from ..devices.base import underlying_device
+
+        sequencer = underlying_device(self.sequencer)
+        return () if sequencer is None else (sequencer,)
 
     @property
     def total_points(self) -> int:
@@ -2344,6 +2374,23 @@ class ScannedMeasurementNode(_SweptBlockMeasurement):
     ):
         super().__init__(hub, prefix=prefix)
         self.measurement = measurement
+        # A notebook ScannedMeasurement fences each point itself.  This LogicNode is
+        # already the long-lived fenced owner, so disable the nested adapter and, when
+        # a notebook PulseController carries a managed sequencer facade, clone only that
+        # controller with its authority-owned raw endpoint.  The raw endpoint never escapes
+        # this node; LegacyRuntimeFence still owns the complete lifetime and claims.
+        if hasattr(self.measurement, "run_hardware"):
+            self.measurement.run_hardware = None
+        pulse = getattr(self.measurement, "pulse", None)
+        pulse_sequencer = getattr(pulse, "sequencer", None)
+        raw_sequencer = getattr(pulse_sequencer, "_authority_device", None)
+        if raw_sequencer is not None:
+            import copy
+
+            node_pulse = copy.copy(pulse)
+            node_pulse.sequencer = raw_sequencer
+            self.measurement.pulse = node_pulse
+            self.measurement.sequencer = raw_sequencer
         # UNIFORM contract (#H3n): the physical block is ``(R,P,*data_shape)``; for this reducer
         # the reducer's complete ``data_shape``.  ONE knob ``repeat``, 0 = ∞ (no free-run toggle): repeat=K keeps a
         # K-deep block (K passes averaged) then STOPS; repeat=0 rolls a 1-deep ring forever (a live scan
@@ -2372,8 +2419,10 @@ class ScannedMeasurementNode(_SweptBlockMeasurement):
         set live on the measurement, never mirrored onto the wrapper as a second copy."""
         m = self.measurement
         from ..devices.base import underlying_device
+        sequencer = getattr(m, "sequencer", None)
+        sequencer = getattr(sequencer, "_authority_device", sequencer)
         return tuple(d for d in (underlying_device(getattr(m, "camera", None)),
-                                 underlying_device(getattr(m, "sequencer", None)))
+                                 underlying_device(sequencer))
                      if d is not None)
 
     def occupied_devices(self) -> tuple:

@@ -274,7 +274,12 @@ def test_temperature_node_start_thread_auto_stops_when_scan_completes():
     hub = SignalHub()
     node, spec = _temperature_node(exp, hub, points=4, shots=2, t_max_us=80.0)
 
-    node.start()
+    from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
+
+    runtime = LegacyNeutralAtomRuntime(exp.devices)
+    exp._zlc_runtime_services = runtime
+    handle = runtime.fence.start(node)
+    handle.wait_started(2.0)
     deadline = time.perf_counter() + 10.0
     while node.running and time.perf_counter() < deadline:
         time.sleep(0.02)
@@ -526,7 +531,50 @@ def test_running_node_applies_params_in_owner_thread_no_concurrent_acquire():
     hub = SignalHub()
     cam = _BlockingCam()
     cam_node = na.CameraMeasurement(hub, cam)
-    cam_node.start()
+    from zlc_neutral_atom.runtime import (
+        CleanupStepAck,
+        DeviceBroker,
+        DeviceIdentityAck,
+        DeviceIdentityEvidenceKind,
+        MemoryQuarantineJournal,
+        ResourceArbiter,
+        ResourceKey,
+        RunController,
+        SafeStateAck,
+        SafetyOperation,
+    )
+    from zlc_workbench import (
+        LegacyDeviceRegistration,
+        LegacyDeviceRegistry,
+        LegacyRuntimeFence,
+    )
+
+    broker = DeviceBroker()
+    registry = LegacyDeviceRegistry(broker)
+    registry.register(
+        LegacyDeviceRegistration(
+            device=cam,
+            key=ResourceKey.parse("device/camera/blocking-fixture"),
+            identity_probe=lambda: DeviceIdentityAck(
+                "fixture:blocking-camera",
+                DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
+                "fixture:blocking-camera:connection",
+                "test-assets-v1",
+            ),
+            cleanup_operations={
+                SafetyOperation.SAFE_STATE: lambda: CleanupStepAck(
+                    SafetyOperation.SAFE_STATE, "fixture-safe-command"
+                )
+            },
+            cleanup_order=(SafetyOperation.SAFE_STATE,),
+            verify_safe_state=lambda: SafeStateAck("fixture-safe-readback"),
+        )
+    )
+    fence = LegacyRuntimeFence(
+        RunController(ResourceArbiter(MemoryQuarantineJournal())), registry
+    )
+    run_handle = fence.start(cam_node)
+    run_handle.wait_started(2.0)
     try:
         deadline = time.monotonic() + 2.0
         while cam_node.shots < 2 and time.monotonic() < deadline:
@@ -543,7 +591,7 @@ def test_running_node_applies_params_in_owner_thread_no_concurrent_acquire():
         assert cam_node._thread is thread_before         # SAME thread -- no restart
         assert cam.max_depth == 1                         # never two acquire() at once
     finally:
-        cam_node.stop()
+        assert fence.stop(cam_node, timeout=2.0).terminated
 
 
 # The old monolithic loading-readout in-place re-calibration test was removed: the

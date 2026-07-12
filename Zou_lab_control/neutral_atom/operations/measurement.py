@@ -728,6 +728,7 @@ class ScannedMeasurement:
     plan: ShotPlan
     reducer: PointReducer
     shots_per_point: int = 1
+    run_hardware: Callable[..., object] | None = None
     data_shape: tuple[int, ...] = field(init=False)
 
     def __post_init__(self) -> None:
@@ -782,6 +783,22 @@ class ScannedMeasurement:
 
     def measure(self, value: float, index: int | None = None) -> np.ndarray:
         """Acquire + reduce one scan point.  The live engine calls this per point."""
+
+        if self.run_hardware is not None:
+            sequencer = self._sequencer()
+            authority_sequencer = getattr(sequencer, "_authority_device", sequencer)
+            return np.asarray(
+                self.run_hardware(
+                    (self.camera, authority_sequencer),
+                    lambda: self._measure_owned(value, index),
+                    name="scanned-measurement-point",
+                ),
+                dtype=float,
+            )
+        return self._measure_owned(value, index)
+
+    def _measure_owned(self, value: float, index: int | None = None) -> np.ndarray:
+        """Measure one point after the caller has established device ownership."""
 
         self.axis.apply(self.pulse, float(value))
         sequence = self.plan.sequence_for(self.pulse, self.axis, float(value))

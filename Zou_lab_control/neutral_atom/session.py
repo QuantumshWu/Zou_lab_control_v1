@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Sequence
 import json
+import threading
 
 import numpy as np
 
@@ -32,6 +33,35 @@ from .timing import DEFAULT_EXPOSURE_S, PulseSequence, imaging_channel_kwargs, i
 from .subsystems import ExperimentSubsystem, ReadoutSubsystem, TimingSubsystem
 
 
+class _UnavailableDeviceSet:
+    """Fail-closed terminal state after an irreversible device swap failure."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = str(reason)
+        self.devices: dict[str, object] = {}
+
+    def _raise(self):
+        raise RuntimeError(self.reason)
+
+    def __getattr__(self, _name: str):
+        self._raise()
+
+    def __getitem__(self, _name: str):
+        self._raise()
+
+    def require(self, *_args, **_kwargs):
+        self._raise()
+
+    def open(self):
+        self._raise()
+
+    def close(self) -> None:
+        return None
+
+    def snapshot(self) -> dict[str, object]:
+        return {"unavailable": self.reason}
+
+
 class NeutralAtomSession:
     """Notebook-facing experiment session.
 
@@ -41,27 +71,22 @@ class NeutralAtomSession:
     real hardware and future GUI frontends.
     """
 
-    def __init__(self, devices: DeviceSet, *, name: str = "neutral_atom", defaults: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        devices: DeviceSet,
+        *,
+        name: str = "neutral_atom",
+        defaults: dict[str, Any] | None = None,
+        _runtime_services: object | None = None,
+    ):
         self.devices = devices
+        self._zlc_runtime_services = _runtime_services
+        self._hardware_authority_local = threading.local()
         self.name = str(name)
         self.defaults = dict(defaults or {})
         self.sequence = self.build_imaging_sequence(exposure=self.camera_exposure(), load=True)
         self._calibration: TrapCalibration | None = None
         self.history: list[Any] = []
-        # Device CONSUMER teardown hooks: callables invoked BEFORE this session's devices are
-        # closed (:meth:`close`) or swapped (:meth:`load_config`), so long-lived consumers --
-        # the task console's running logic nodes, whose worker threads block inside
-        # ``camera.acquire`` and hold camera / RPyC handles -- are stopped FIRST and can never
-        # keep a closed/replaced device alive.  Duck-typed callables so the frontend registers
-        # ``console.stop_all_nodes`` here without the session ever importing the frontend
-        # (the one-way na -> frontend boundary stays intact).
-        self._device_teardown_hooks: list[Any] = []
-        # A FINER seam than the full teardown above: hooks here are told exactly which device
-        # INSTANCES are being replaced/closed (their ``id()`` set), so a consumer stops only the
-        # work that rides the affected hardware -- swapping the camera leaves a scan on the
-        # untouched sequencer running.  ``load_config`` (a per-role instance swap) notifies here;
-        # ``close`` still runs the full-teardown hooks (everything goes).
-        self._device_change_hooks: list[Any] = []
         # Devices stay session-blind: a camera is a pure grabber and a sequencer a pure
         # streamer; ALL cross-device orchestration (capture / readout / scans) lives on the
         # session + subsystems, which reach devices only through their contracts.
@@ -185,10 +210,19 @@ class NeutralAtomSession:
         The device manager's "Load config" button routes here.  Returns ``self``."""
         from .devices import load_devices, read_config
 
+        unavailable = getattr(self, "_hardware_unavailable_reason", None)
+        if unavailable is not None:
+            raise RuntimeError(
+                f"{unavailable}; create a new NeutralAtomSession to re-establish hardware"
+            )
+
         # Build/validate replacement objects first, but never OPEN the new physical set while
         # the old owner is still live.  Hardware opening happens only after consumers stop and
         # the old DeviceSet has confirmed close.
         new_devices = load_devices(read_config(config), open_devices=False)
+        runtime_services = self._require_runtime_services()
+        prepared_runtime_devices = None
+        runtime_replacement = None
         try:
             staged_sequence = self._build_imaging_sequence_for_devices(
                 new_devices,
@@ -197,7 +231,12 @@ class NeutralAtomSession:
             )
             staged_readout = ReadoutSubsystem(self)
             staged_timing = TimingSubsystem(self)
+            runtime_replacement = runtime_services.stage_replacement_authority(new_devices)
+            target_runtime = runtime_replacement or runtime_services
+            prepared_runtime_devices = target_runtime.prepare_device_set(new_devices)
         except BaseException:
+            if runtime_replacement is not None:
+                runtime_replacement.shutdown(timeout=0.0)
             new_devices.close()
             raise
         # The new set built OK -- NOW stop the consumers that ride the devices ABOUT TO BE
@@ -214,43 +253,115 @@ class NeutralAtomSession:
             for role, old_dev in dict(getattr(old_devices, "devices", {}) or {}).items():
                 if old_dev is not None and new_by_role.get(role) is not old_dev:
                     affected.add(id(old_dev))
+        transition_token = None
+        replacement_token = None
+        irreversible = False
         try:
-            self._notify_device_change(affected)
-        except BaseException as consumer_error:
-            try:
-                new_devices.close()
-            except BaseException as new_close_error:
+            transition_token = runtime_services.begin_device_transition()
+            if runtime_replacement is not None:
+                replacement_token = runtime_replacement.begin_device_transition()
+
+            # Hardware quiescence belongs solely to the runtime authority.  GUI models
+            # observe terminal handles later; no QWidget hook participates in this proof.
+            affected_devices = tuple(
+                device
+                for device in dict(getattr(old_devices, "devices", {}) or {}).values()
+                if id(device) in affected
+            )
+            receipts = (
+                runtime_services.fence.stop_all(timeout=2.0)
+                if runtime_replacement is not None
+                else runtime_services.fence.stop_nodes_using(
+                    affected_devices,
+                    timeout=2.0,
+                )
+            )
+            if any(not receipt.terminated for receipt in receipts):
                 raise RuntimeError(
-                    "consumer stop failed and the staged replacement devices also failed to close: "
-                    f"{type(new_close_error).__name__}: {new_close_error}"
-                ) from consumer_error
-            raise
-        if old_devices is not None and old_devices is not new_devices:
-            try:
+                    "device config swap refused because runtime ownership is still cancelling"
+                )
+
+            if old_devices is not None and old_devices is not new_devices:
+                irreversible = True
                 old_devices.close()
-            except BaseException as old_close_error:
+            else:
+                irreversible = True
+
+            if open_devices:
+                target_runtime.ensure_prepared_device_set_connections(
+                    prepared_runtime_devices
+                )
+                staged_sequence = self._build_imaging_sequence_for_devices(
+                    new_devices,
+                    exposure=self._camera_exposure_for_devices(new_devices),
+                    load=True,
+                )
+
+            def publish_session() -> None:
+                (
+                    self.devices,
+                    self.sequence,
+                    self._calibration,
+                    self._readout_subsystem,
+                    self._timing_subsystem,
+                ) = (new_devices, staged_sequence, None, staged_readout, staged_timing)
+
+            if runtime_replacement is not None:
+                if not runtime_services.shutdown(timeout=2.0):
+                    raise RuntimeError(
+                        "prior runtime authority did not release all claims"
+                    )
+
+                def publish_replacement() -> None:
+                    publish_session()
+                    self._zlc_runtime_services = runtime_replacement
+
+                runtime_replacement.commit_device_transition(
+                    replacement_token,
+                    new_devices,
+                    prepared_runtime_devices,
+                    publish=publish_replacement,
+                )
+                replacement_token = None
+            elif runtime_services is not None:
+                runtime_services.commit_device_transition(
+                    transition_token,
+                    new_devices,
+                    prepared_runtime_devices,
+                    publish=publish_session,
+                )
+                transition_token = None
+            else:
+                publish_session()
+        except BaseException as swap_error:
+            if not irreversible:
+                if transition_token is not None:
+                    runtime_services.abort_device_transition(transition_token)
+                if replacement_token is not None:
+                    runtime_replacement.abort_device_transition(replacement_token)
+                if runtime_replacement is not None:
+                    runtime_replacement.shutdown(timeout=0.0)
+                new_devices.close()
+            else:
+                reason = (
+                    "device config swap crossed the old-device close boundary and failed: "
+                    f"{type(swap_error).__name__}: {swap_error}"
+                )
+                # The replacement authority may already own the persistent journal lock and
+                # the only transition token capable of explaining this failed swap.  Keep that
+                # owner attached to the now-UNAVAILABLE session so close()/recovery can release
+                # it deterministically; never orphan a machine safety authority in a local.
+                if runtime_replacement is not None:
+                    self._zlc_runtime_services = runtime_replacement
+                elif runtime_services is not None:
+                    self._zlc_runtime_services = runtime_services
+                self.devices = _UnavailableDeviceSet(reason)
+                self._hardware_unavailable_reason = reason
                 try:
                     new_devices.close()
-                except BaseException as new_close_error:
-                    raise RuntimeError(
-                        "previous devices failed to close and staged replacement cleanup also failed: "
-                        f"{type(new_close_error).__name__}: {new_close_error}"
-                    ) from old_close_error
-                raise RuntimeError(
-                    "device config swap refused because the previous device set did not close"
-                ) from old_close_error
-        # Publish all session-visible derived state together.  No constructor or sequence compilation
-        # remains on the far side of this boundary, so an exception cannot expose new devices with an
-        # old sequence/calibration/subsystem graph.
-        (
-            self.devices,
-            self.sequence,
-            self._calibration,
-            self._readout_subsystem,
-            self._timing_subsystem,
-        ) = (new_devices, staged_sequence, None, staged_readout, staged_timing)
-        if open_devices:
-            self.open_devices()
+                except BaseException:
+                    pass
+            raise
         return self
 
     def open_devices(self):
@@ -258,7 +369,13 @@ class NeutralAtomSession:
         LAST, so they bind to an already-open sequencer / trigger source).  A no-op-safe convenience over
         ``self.devices.open()`` for the notebook and the device manager's "Open devices" button; on the
         virtual backend the opens are trivial.  Returns ``self``."""
-        self.devices.open()
+        unavailable = getattr(self, "_hardware_unavailable_reason", None)
+        if unavailable is not None:
+            raise RuntimeError(
+                f"{unavailable}; create a new NeutralAtomSession to re-establish hardware"
+            )
+        runtime_services = self._require_runtime_services()
+        runtime_services.ensure_device_set_connections(self.devices)
         # A remote sequencer binds its sole PortCatalog while opening.  Rebuild
         # the session's convenience imaging sequence only after that boundary,
         # so an offline semantic placeholder can never survive as the program
@@ -266,6 +383,43 @@ class NeutralAtomSession:
         self.sequence = self.build_imaging_sequence(
             exposure=self.camera_exposure(), load=True)
         return self
+
+    def _require_runtime_services(self):
+        runtime_services = getattr(self, "_zlc_runtime_services", None)
+        if runtime_services is None or runtime_services.closed:
+            raise RuntimeError(
+                "this session has no live installation hardware authority; construct it through connect()"
+            )
+        return runtime_services
+
+    def _run_hardware_call(self, devices, callback, *, name: str):
+        """Run one legacy device operation under the installation authority.
+
+        Nested orchestration on the same owner thread (for example capture -> timing
+        configure -> triggered_frames) reuses the already-held claim, but it may not
+        smuggle in a device absent from the outer declaration.
+        """
+
+        requested = tuple(dict.fromkeys(id(device) for device in devices if device is not None))
+        active = getattr(self._hardware_authority_local, "device_ids", None)
+        if active is not None:
+            if not set(requested).issubset(active):
+                raise RuntimeError("nested hardware operation requested an undeclared device")
+            return callback()
+
+        def owned_call():
+            self._hardware_authority_local.device_ids = frozenset(requested)
+            try:
+                return callback()
+            finally:
+                del self._hardware_authority_local.device_ids
+
+        concrete = tuple(device for device in devices if device is not None)
+        return self._require_runtime_services()._run_hardware_call(
+            concrete,
+            owned_call,
+            name=name,
+        )
 
     def capture(self, frames: int = 1, *, camera: str | None = None, exposure: float | None = None,
                 display: bool = True) -> CaptureResult:
@@ -295,10 +449,13 @@ class NeutralAtomSession:
             # A free-running sensor owns its exposure clock.  Configuring it must not mutate the
             # readout sequence (which may belong to a different camera), and there is no trigger
             # edge for the session to fire.
-            if exposure is not None:
-                cam.configure(exposure=float(exposure))
-            sequence = None
-            images = cam.acquire(int(frames))
+            def acquire_free_running():
+                if exposure is not None:
+                    cam.configure(exposure=float(exposure))
+                return cam.acquire(int(frames)), None
+
+            call_devices = (cam,)
+            hardware_call = acquire_free_running
         elif not readout_owned:
             # Reject BEFORE configure/arm/prepare/fire: the session readout pulse does not own this
             # camera's trigger wire, so trying it and inspecting an empty buffer afterwards is too
@@ -314,10 +471,20 @@ class NeutralAtomSession:
                 raise RuntimeError(
                     f"camera {name!r} is externally triggered on {trigger_channels}, but this "
                     f"device config has no sequencer to drive the readout pulse.")
-            if exposure is not None:
-                self.timing.configure_imaging(exposure=float(exposure))
-            sequence = self.sequence
-            images = triggered_frames(cam, sequencer, sequence, int(frames))
+            def acquire_triggered():
+                if exposure is not None:
+                    self.timing.configure_imaging(exposure=float(exposure))
+                sequence = self.sequence
+                return triggered_frames(cam, sequencer, sequence, int(frames)), sequence
+
+            call_devices = (cam, sequencer)
+            hardware_call = acquire_triggered
+
+        images, sequence = self._run_hardware_call(
+            call_devices,
+            hardware_call,
+            name=f"capture-{name}",
+        )
 
         if not images:
             raise RuntimeError(
@@ -404,63 +571,12 @@ class NeutralAtomSession:
         path.write_text(json.dumps(json_ready(self.status()), indent=2, ensure_ascii=False), encoding="utf-8")
         return path
 
-    def add_device_teardown_hook(self, hook) -> None:
-        """Register a callable run BEFORE this session's devices are closed (:meth:`close`) or
-        swapped (:meth:`load_config`) -- the seam a long-lived device CONSUMER uses to be stopped
-        first.  The task console registers its ``stop_all_nodes`` here when it opens, so a
-        notebook's ``exp.close()`` / device-manager "Load config" can never pull devices out from
-        under running acquisition threads (which would otherwise keep old camera / RPyC handles
-        alive and keep driving closed hardware).  Idempotent: re-registering the same callable is
-        a no-op (the singleton console re-opens without stacking duplicates)."""
-        if hook not in self._device_teardown_hooks:
-            self._device_teardown_hooks.append(hook)
-
-    def _release_device_consumers(self) -> None:
-        """Prove every registered consumer stopped before closing its devices."""
-
-        failures = []
-        for hook in tuple(self._device_teardown_hooks):
-            try:
-                result = hook()
-                if result is False:
-                    failures.append(f"{hook!r} reported unresolved ownership")
-            except BaseException as exc:
-                failures.append(f"{hook!r} failed: {type(exc).__name__}: {exc}")
-        if failures:
-            raise RuntimeError(
-                "device close refused because consumers did not terminate: "
-                + "; ".join(failures)
-            )
-
-    def add_device_change_hook(self, hook) -> None:
-        """Register a callable ``hook(affected_ids: set[int])`` run BEFORE specific device
-        INSTANCES are replaced (:meth:`load_config`) -- the fine-grained sibling of
-        :meth:`add_device_teardown_hook`.  ``affected_ids`` is the ``id()`` set of the devices
-        being swapped out, so a consumer stops only the work riding THOSE devices (the console
-        registers ``stop_nodes_using`` here: swapping the camera stops camera nodes, but a scan
-        on the untouched sequencer keeps running).  Idempotent."""
-        if hook not in self._device_change_hooks:
-            self._device_change_hooks.append(hook)
-
-    def _notify_device_change(self, affected_ids: set) -> None:
-        """Stop affected consumers; an unconfirmed stop vetoes the device swap."""
-
-        failures = []
-        for hook in tuple(self._device_change_hooks):
-            try:
-                result = hook(set(affected_ids))
-                if result is False:
-                    failures.append(f"{hook!r} reported unresolved ownership")
-            except BaseException as exc:
-                failures.append(f"{hook!r} failed: {type(exc).__name__}: {exc}")
-        if failures:
-            raise RuntimeError(
-                "device swap refused because consumers did not terminate: "
-                + "; ".join(failures)
-            )
-
     def close(self) -> None:
-        self._release_device_consumers()   # stop consumers (running GUI nodes) BEFORE the devices go
+        runtime_services = getattr(self, "_zlc_runtime_services", None)
+        if runtime_services is not None and not runtime_services.shutdown(timeout=2.0):
+            raise RuntimeError(
+                "device close refused because runtime ownership is still cancelling"
+            )
         self.devices.close()
 
     def camera_exposure(self) -> float:
@@ -514,11 +630,29 @@ def connect(
         params=virtual_params,
     )
     default_values.update(inferred_defaults)
-    return NeutralAtomSession(
-        load_devices(device_config, overrides=device_overrides, open_devices=open_devices),
-        name=name,
-        defaults=default_values,
-    )
+    devices = load_devices(device_config, overrides=device_overrides, open_devices=False)
+    # Temporary S0.5 composition bridge.  The final notebook facade owns this import and the
+    # neutral domain receives only typed ports; until that cut, every old notebook/GUI entry gets
+    # the same installation authority instead of lazily creating a second one in each window.
+    from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
+
+    runtime_services = None
+    try:
+        runtime_services = LegacyNeutralAtomRuntime(devices)
+        session = NeutralAtomSession(
+            devices,
+            name=name,
+            defaults=default_values,
+            _runtime_services=runtime_services,
+        )
+        if open_devices:
+            session.open_devices()
+        return session
+    except BaseException:
+        if runtime_services is not None:
+            runtime_services.shutdown(timeout=0.0)
+        devices.close()
+        raise
 
 
 __all__ = [
