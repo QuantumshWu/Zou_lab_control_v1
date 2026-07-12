@@ -886,7 +886,7 @@ bind -> RunPlan
 
 preflight 或 reservation 失败时不得 arm/fire，并释放已创建 reservation。CaptureSession 固定拥有 disarm；长期 device connection 的 close 属于 DeviceSet/application lifecycle，只有 CaptureSession 自己创建临时 handle 时才负责 close。
 
-device/session 的 create/open/configure/read/disarm/close 必须在其 ThreadAffinityKey 对应 lane 执行；composition root 只能在外部构造不接触 driver 的轻量 adapter/factory。CaptureSession 在 owner lane 创建并在同一 lane 销毁，不能在 run-owner thread 创建后交给 I/O lane 使用。
+device/session 的 create/open/configure/read/disarm/close 必须在其 ThreadAffinityKey 对应 lane 执行；composition root 只能在外部构造不接触 driver 的轻量 adapter/factory。真正raw SDK/driver对象只在allowlisted DeviceSet/DeviceBroker owner lane内部创建、保存和销毁；public `bind`/Definition/RunPlan/finalize不得接受或保留任意raw driver callback、bound method或可回调到driver的adapter object。CaptureSession 在 owner lane 创建并在同一 lane 销毁，不能在 run-owner thread 创建后交给 I/O lane 使用。
 
 外部权威状态：
 
@@ -895,9 +895,13 @@ RUNNING -> SUCCEEDED | FAILED
 RUNNING -> CANCELLING -> CANCELLED | FAILED
 ```
 
-waiting resource、arming、capturing、fitting、saving、finalizing 是 phase，不是通用工作流状态。
+waiting resource、arming、capturing、fitting、saving、finalizing、commit-reconciliation-blocked 是 phase，不是通用工作流状态。
 
-最终 artifact 的可见提交与 cancellation 使用同一个短原子 gate。`finalize` 可以在 gate 外构造和校验临时 artifact，但最后的 manifest/rename publish 必须通过 `commit_final(publish)`：cancel 先取得 gate，则 publish 不执行且 run 不能产生成功 artifact；publish 先取得 gate，则之后的 cancel 明确返回 `TOO_LATE_ALREADY_COMMITTED`（若 run 已 terminal 则为 `ALREADY_TERMINAL`），不得把已经可见的成功 artifact 报成 CANCELLED。该 gate 只覆盖最后的原子可见操作，不把长时间序列化或 fsync 放进临界区。
+最终 artifact 的可见提交与 cancellation 使用同一个短原子 gate。`finalize` 可以在 gate 外构造和校验临时 artifact；`commit_final(FinalCommit)`只能使用owner Repository的`RepositoryCommitCoordinator`在startup reconciliation成功后铸造的opaque、不可变、单次 `CommitAuthority`。公开authority是无副作用handle：除冻结CommitTarget外不暴露`publish()`、journal、recover或callback；真正的`target/journal/publish/recover`快照只存在coordinator私有registry。普通plan只能携带handle，RunController通过内部consumer token原子pop签发快照；同一authority跨run/commit_id复用直接拒绝。lost-ack重试使用RunController已经持有的快照与稳定commit_id做reconciliation，不重新开放publish capability。随后在该Repository同一durability域持久化`CommitIntent(commit_id, run_id, safety_bundle_id, CommitTarget)`。`CommitTarget`至少冻结repository_id、artifact_kind、schema_version、target_ref与expected_manifest_digest，使重启后无需内存closure即可路由到唯一owner并验证目标内容。repository publish必须返回typed `PublishedManifest(target_ref, manifest_digest, result)`，owner快照逐字段匹配CommitTarget后才允许写COMMITTED，正常成功路径也不能跳过digest验证。返回类型错误、target/digest不符及其它确定性合同违例直接写ABORTED并失败，绝不能调用recover“洗白”；只有Repository明确抛出`PublishVisibilityUnknown`，表示atomic replace后可见性确实无法判定，才进入inspection-only recovery。intent fsync期间cancellation仍可受理。intent完成后在短内存gate内做最后一次CancellationToken checkpoint并关闭cancel gate，随后才允许manifest/rename publish：cancel先取得gate，则把intent幂等标为`ABORTED`、publish调用次数必须为0，run不能产生成功artifact；publish先取得gate，则之后的cancel明确返回`TOO_LATE_ALREADY_COMMITTED`（若run已terminal则为`ALREADY_TERMINAL`），不得把已经可见的成功artifact报成CANCELLED。长时间序列化、blob写入和intent fsync不在不可取消gate内；gate只保护最终可见发布及其结果判定。
+
+manifest atomic replace成功但调用方因I/O/进程故障没有收到确认时，Repository必须把这一特定歧义归类为`PublishVisibilityUnknown`，不能用裸`OSError`把所有错误混成未知，也不能把确定性manifest校验错误送入recovery。每种Repository必须按稳定`commit_id`提供权威、幂等的`recover()`：确认已提交时返回`CommitRecovery(committed=True, PublishedManifest(target_ref, manifest_digest, result))`，RunController再次逐字段匹配冻结CommitTarget后才追加`COMMITTED`并完成SUCCEEDED；确认未提交则追加`ABORTED`并按原publish error失败。错误target/digest、无typed manifest evidence或任意字符串result不能证明恢复成功。Repository或commit journal暂时不可判定时，Run保持非terminal `RUNNING/commit-reconciliation-failed` phase、关闭cancel gate、持有resource claims并给出显式重试指令。`COMMITTED`与`ABORTED`在跨进程文件锁内互斥验证，二者都清除pending；commit marker自身写确认丢失也走同一reconciliation，不能重复发布或提前释放claim。startup在接受新run前枚举所有pending CommitIntent并调用对应owner Repository的reconciler；无法找到owner/schema或仍无法判定时fail closed，不重新fire、不把temp文件当成功artifact。
+
+pending reconciliation必须冻结“事实是否已经确定”，不能每次重试重新询问可变callback：`FORCE_ABORT`用于确定性publish/validation失败或validated recovery已确认未提交，重试只幂等写ABORTED；`RECOVER_VISIBILITY`只用于尚未判定的PublishVisibilityUnknown，只有此态调用recover；`FORCE_COMMIT`用于publish已返回并验证成功或validated recovery已给出匹配manifest，持有已验证result并只幂等写COMMITTED。marker写入/确认失败只重试相同resolution，不得让wrong digest经一次abort-marker故障反转成成功，也不得让已可见artifact经一次commit-marker故障反转成ABORTED。
 
 `run(plan)` 内部也使用同一个 RunHandle。Notebook/test 遇到 KeyboardInterrupt 时先 cancel 该 RunHandle、等待 cleanup acknowledgement，再重新抛出或返回取消结果。若等待超过 join deadline，抛出携带 run_id/RunHandle lookup 的 `RunStillCancelling`，RunController registry 继续持有 handle/claims；不能丢掉 handle 后把 cell 当成已经停止。notebook 可继续 `status()/wait()/recovery_instructions()`。
 
@@ -941,11 +945,23 @@ resource release
 
 一旦最后一个硬件 sample 已取得且不再需要设备，正常路径立即退出 CaptureSession、disarm/safe，再进行长时间 fit/calibration/artifact commit；`finally` 是异常兜底，不是把安全动作拖到所有磁盘/CPU 工作之后。硬件 safe acknowledgement 失败时不得提交宣称整个 Run 成功的最终 artifact。
 
+cleanup command ACK与物理安全证明必须分型。`abort/disarm/close-session/read-status/safe-state-command`只产生`CleanupStepAck`，表示该步骤返回，不能直接解除hazard；尤其`READ_STATUS`、`CLOSE_SESSION`或仅发送过`ABORT`绝不等于设备已安全。只有adapter声明的终态verification recipe完成所需步骤并对真实safe-state/no-more-trigger/readback作肯定验证后，DeviceBroker才铸run-scoped、单次消费的`VerifiedSafeStateProof`。CleanupReport的SAFE分支只接受该opaque proof；公开可构造的receipt、普通step ACK或低层ResourceLease便利方法均不能提交SAFE disposition。
+
+所有会改变安全、物理所有权或最终提交事实的 capability——至少包括`VerifiedBoundDeviceIdentity`、`BoundDevice`、`VerifiedSafeStateProof`、`VerifiedRecoveryProof`、RecoveryBindingLease与`CommitAuthority`——统一遵守同一签发合同：只能由owner构造；公开对象不可变；带opaque nonce并在owner私有registry保存签发时的原始identity/receipt/target快照；默认单次消费，确需重试者必须声明稳定id下的幂等语义；消费时核对registry快照、run_id、ResourceKey、stable DeviceIdentity与connection generation，绝不相信调用方可写payload。受限构造但签发后字段可改，不算capability安全。测试威胁模型覆盖普通进程内协作代码的赋值、复用和跨设备替换；恶意反射/`object.__setattr__`不作为Python进程内安全边界，真实隔离依赖进程/服务边界与DeviceControlLease。
+
+同样地，closure introspection、扫描`__closure__`或检查finalize函数签名不是capability confinement：它既漏掉global/container/bound-method引用，也会误伤普通纯函数。post-safety“不能再碰硬件”的证明由构造边界完成——raw driver从未离开owner lane，plan只拿可撤销RunDevice/CleanupDevice代理，SafetyDispositionBundle后broker撤销其nonce。若任意application模块仍可持有raw SDK对象并在finalize直接调用，系统只能被视为违反composition contract，不能宣称CapabilityRevoked已覆盖该路径；迁移验收必须通过import/constructor allowlist与真实入口E2E把这种泄漏降为0。
+
 只有 worker/session 已退出且 safe/disarm 得到肯定 acknowledgement，RunController 才释放对应 ResourceClaim。若 join 超时，Run 保持 CANCELLING 且 claim 仍由原 run 持有；若 worker 已退出但 safe/disarm 明确失败，Run进入内部`FINALIZING_SAFETY`并准备FAILED disposition，ResourceArbiter将设备标记为待QUARANTINE；只有SafetyDispositionBundle durable后才同时发布外部FAILED、安装QUARANTINED并释放claims。QUARANTINED资源不能被普通acquire，只有用户通过§9的RecoveryPlan执行adapter声明的recovery action、随后identity/health/safe验证通过并显式确认，才可解除；不能在finally中无条件release。
 
 ResourceArbiter 使用 machine/device-installation 级稳定安全目录中的 append-only `QuarantineJournal`，不能放在用户可切换的 artifact RepositoryRoot 中。journal 记录 stable DeviceIdentity、connection generation、run_id、prepared artifact/table digest、原因、required recovery、首次/最近时间和解除证明。每个 hazardous control-lease/run epoch 在**第一次 arm/fire 前**原子追加一次 `HAZARD_ACTIVE` write-ahead record，不为每个 trigger做磁盘fsync。只有整个hazard epoch通过现有safe/status回读、正常completion+保守drain合同或人工recovery验证后才追加`RESOLVED`。这样进程在fire后直接崩溃也会留下未解除事实，又不要求新硬件receipt。FPGA identity使用板卡DNA/serial（若现有接口可读）或稳定部署endpoint+人工资产映射，qCMOS使用model/serial，不能只用device_index或枚举顺序。
 
+HazardClaim、HazardRecord、quarantine与RecoveryClaim必须逐项携带同一个stable DeviceIdentity；key相同但physical identity不同的替换设备不能解除旧设备记录，真正换机建立新ResourceKey/资产映射并保留旧记录待人工处置。任何新HAZARD_ACTIVE若与未解决hazard或quarantine的ResourceKey层级重叠，journal在同一个跨进程锁内拒绝，ResourceArbiter不得只信启动时内存projection。
+
 该journal的权威位置必须与能全局执行`DeviceControlLease`的owner共置，而不是笼统等于“启动client的本机目录”。本机直连设备由唯一adapter host在设备安装目录持有lease+journal；RemoteSequencer由硬件server持有权威owner token、hazard index、journal与Recovery gate，client本地记录只作缓存/诊断，不能决定AVAILABLE。server必须在允许危险输出前确认HAZARD_ACTIVE durable，并在bundle提交前拒绝其它client接管。若当前server尚不能提供这一闭环，只能声明一个固定真实控制入口并禁止其它机器/launcher并发控制，不能宣称跨机器EXCLUSIVE或靠各client自己的journal拼出安全性。
+
+持久SafetyJournal启动时必须取得覆盖整个进程生命周期的installation-owner文件锁；第二个arbiter/recovery authority直接拒绝启动，而不是各持一份stale projection。已绑定ResourceArbiter的journal不能被外部提前close；只能由arbiter在确认无active claim、pending journal I/O或recovery lease后执行shutdown并释放owner lock。RecoveryController取得Resource RecoveryClaim后，还必须在DeviceBroker取得同key的RecoveryBindingLease；该lease从probe开始一直覆盖到RecoveryBundle durable complete/abort，期间rebind、普通run open和第二个recovery全部拒绝。probe返回后仍重验binding object、stable identity与generation。lost-ack重试若发现同一HAZARD_ACTIVE已被durable RESOLVED，返回`ALREADY_RESOLVED`并使旧run失败；绝不能在本地“复活”旧epoch或再次启硬件，只有重新acquire生成新hazard id才可开始新run。
+
+DeviceBroker的只读identity/health probe只铸一次性`VerifiedBoundDeviceIdentity`；bind成功即消费nonce，并在broker registry维护`stable DeviceIdentity -> ResourceKey + generation`唯一映射。同一receipt不得复用，同一物理identity不得通过两个逻辑key并发绑定，同一key也不能在未显式换机流程中悄悄换成另一physical identity。换机必须建立新的ResourceKey/资产映射并保留旧hazard事实。Recovery proof同样不可变并由签发registry绑定原RecoveryClaim；仅比较公开字段或`isinstance`不足以解除quarantine。
 
 每个新 device connection generation 初始为 UNVERIFIED；若同一 DeviceIdentity 有未解除 journal entry，则初始为 QUARANTINED_PENDING_VERIFY，而不是因进程重启回到 AVAILABLE。adapter 完成 identity/layout/fatal-status/health/safe handshake 只能提供解除证明，不能自行删除记录；用户确认 recovery 后追加 RESOLVED。设备确实更换且 stable identity 不同时建立新资源记录，不继承另一个物理设备的 quarantine。journal 的写入失败本身使安全相关 resource 保持 unavailable。
 
@@ -2170,6 +2186,8 @@ F0 第一日即建立 cross-package golden/property contract：同一 primitive 
 
 各 owner context 的 typed Repository 委托 `zlc_storage` 的同一个 `BlobStore/ManifestCommitter` 实现 immutable content-addressed bytes、锁、fsync 与 atomic replace；owner Repository 仍负责 typed Ref、schema、canonical codec、lineage 和 load validation。`zlc_storage` 不 import AxisSpec、FigureArtifactRef、ScanArtifactRef 或任何领域类型，也不提供“万能 artifact repository”。commit point 是最后原子发布的 owner canonical manifest：
 
+SafetyJournal与CommitJournal共享`zlc_storage.FramedJournal`的纯存储机制，但记录schema与状态机仍分别由neutral runtime owner定义。frame使用canonical bytes、稳定record id与SHA-256，append在同一跨进程文件锁内先重放并验证prospective state，再写入、file fsync并同步parent directory；Windows必须真实调用可验证的directory-handle `FlushFileBuffers`或在root probe时拒绝该backend，不能把directory durability静默降成no-op。仅允许修复校验明确失败的最后一个torn frame；中间frame损坏、冲突duplicate id或非法COMMITTED/ABORTED、HAZARD/RESOLVED跃迁均fail closed，不能截断历史继续启动。
+
 ```text
 write blobs to temporary names
 -> fsync/close
@@ -2184,9 +2202,9 @@ temporary 与 final path 必须位于同一 Repository backend/filesystem。Loca
 
 manifest 出现前的 blob 都不是成功 artifact；baseline maintenance 只识别有 age/lock 证明的 stale temp，并提供 dry-run/list + 显式清理，不自动删除任意 unreferenced content blob。load 先验证 kind/schema/manifest digest，再验证所有 blob digest、shape/dtype/length 和交叉合同，全部通过后才返回 immutable/memory-mapped payload。index/最近文件列表只是可重建缓存，不是 artifact 存在性的权威。
 
-每个 manifest atomic replace 是该 artifact 的 commit linearization point；Run 声明的 final result manifest 是其 SUCCEEDED commit point。CancellationToken 在 final replace 前最后检查：此前取消则删除 final temp、不发布 final manifest 并进入 CANCELLED/FAILED(cleanup error)；replace 成功后 final artifact 已是事实，后到 cancel 返回 `TOO_LATE_ALREADY_COMMITTED`，Run 完成 SUCCEEDED 并可记录 late-cancel warning，不能删除 artifact 后谎报取消。更早独立提交的 upstream artifact 遵守自己的 commit point，不随父 Run 回滚。
+每个 manifest atomic replace 是该 artifact 的 commit linearization point；Run 声明的 final result manifest 是其 SUCCEEDED commit point。Repository在replace前已有durable CommitIntent；CancellationToken在intent之后、final replace之前最后检查：此前取消则删除final temp、不发布final manifest并把intent标为ABORTED，进入CANCELLED/FAILED(cleanup error)；replace成功后final artifact已是事实，后到cancel返回`TOO_LATE_ALREADY_COMMITTED`，Run完成SUCCEEDED并可记录late-cancel warning，不能删除artifact后谎报取消。replace返回异常不等于未提交，必须由owner Repository按commit_id检查最终manifest/digest后才能写COMMITTED或ABORTED。更早独立提交的upstream artifact遵守自己的commit point，不随父Run回滚。
 
-hazardous Run还必须先完成§8.4的SafetyDispositionBundle；任一UNSAFE key禁止发布成功final manifest，全部SAFE时manifest写入bundle id。SafetyDispositionBundle、manifest replace与Run terminal是三个有顺序但不伪装成跨文件原子事务的linearization points，startup按bundle id/manifest digest执行确定性reconciliation。普通Repository不得跳过这个outer RunController gate直接保存“成功run artifact”。
+hazardous Run还必须先完成§8.4的SafetyDispositionBundle；任一UNSAFE key禁止发布成功final manifest，全部SAFE时manifest写入bundle id。SafetyDispositionBundle、CommitIntent、manifest replace/COMMITTED-or-ABORTED resolution与Run terminal是有顺序但不伪装成跨文件原子事务的linearization points，startup按bundle id、commit_id和manifest digest执行确定性reconciliation。普通Repository不得跳过这个outer RunController gate直接保存“成功run artifact”。
 
 content-addressed blob 允许并发 writer 幂等复用；manifest publish 使用 digest/id 冲突检查，不能覆盖不同内容。只有 repository 规模证明 unreferenced blob 回收是实际问题、且所有 owner 能提供已验证 committed-manifest roots 后，才增加 maintenance-lock 下的 mark-and-sweep；storage 不自行解析产品 manifest。这样 baseline 先共享崩溃安全机制和 canonical bytes，不为尚未出现的多 backend/复杂 GC 建一套存储平台。
 
@@ -2394,11 +2412,17 @@ Thread/UI：
 - 新 connection generation 在 UNVERIFIED handshake 完成前不可 acquire，应用重启不洗白 sticky fatal；
 - ConnectionEstablishmentClaim只允许open/identity/health且与普通/recovery claim互斥；成功后同一live connection转交DeviceSet，close/disconnect使binding失效；verified generation变化使已bind RunPlan拒绝，不能在普通preflight偷偷reconnect；
 - RecoveryClaim只针对既有unresolved refs，和普通claim完全互斥且只能执行allowlisted identity/status/safe/reset/reconnect；recovery中崩溃/超时/journal失败后仍quarantined；
+- `VerifiedBoundDeviceIdentity`不可变且一次性消费；同一receipt复用、同一stable physical identity绑定两个ResourceKey、同key静默换physical identity全部拒绝；
+- `VerifiedSafeStateProof`与`VerifiedRecoveryProof`不可变，owner按nonce消费签发快照；字段赋值、proof复用、设备A proof替换设备B receipt以及跨run/key/generation substitution全部拒绝，且未调用B verifier时B绝不转SAFE；
 - 每个hazardous run epoch首次arm/fire前HAZARD_ACTIVE write-ahead（非逐cell fsync），crash-after-fire-before-safe重启后恢复QUARANTINED_PENDING_VERIFY；只有现有safe/status或recovery验证 + 用户确认追加RESOLVED；切换artifact repository root不洗白machine/device safety ledger；
 - safe、unsafe与同run多device mixed disposition通过一个稳定id的SafetyDispositionBundle原子幂等提交；partial-write/restart/retry重放同bundle，safe key只resolve、failed key只quarantine；journal失败保持claim，safe retry不能误走quarantine分支；
 - SafetyDispositionBundle durable前RunHandle不发布FAILED/CANCELLED/SUCCEEDED，只显示FINALIZING_SAFETY/SAFETY_JOURNAL_BLOCKED phase；全部safe时bundle后继续artifact commit，unsafe时禁止成功artifact；最终terminal与剩余claim release一次可见；
 - bundle构造前session/interrupt全部退出；durable后PreparedRun只转换为无device Port的PostSafetyContext，claims仅保留排他性；注入旧session/closure或late cancel硬件调用必须得到CapabilityRevoked且调用计数为0；
-- crash发生在safety bundle、artifact manifest和terminal三者任意相邻边界时，startup用bundle id+manifest确定性恢复SUCCEEDED或FAILED/ABANDONED，不重新fire、不把temp当成功；
+- raw SDK/driver只在allowlisted owner lane构造和保存；RunPlan/Definition/finalize的对象图、global、container与bound method均不存在driver或可直达driver的callback，验收不以closure introspection冒充隔离；
+- cancellation在CommitIntent fsync期间仍可受理；intent后取消写ABORTED且publish调用次数为0；manifest replace确认丢失、COMMITTED marker确认丢失和Repository暂时不可达均保持非terminal/claim，不重复publish；startup用bundle id+commit id+manifest digest把pending intent唯一解析为COMMITTED或ABORTED；
+- `CommitAuthority`只能由startup-reconciled RepositoryCommitCoordinator签发，是不含public publish/journal/recover的无副作用opaque handle且单次消费；直接发布、替换payload、重复/跨run消费、ephemeral journal生产签发与绕过startup pending gate全部拒绝；错误PublishedManifest类型/target/digest直接ABORTED且recover调用次数为0，只有typed PublishVisibilityUnknown进入recover，recovered PublishedManifest仍须再次匹配target/digest；
+- commit reconciliation三态不可反转：wrong digest + abort-marker failure仍FORCE_ABORT且recover为0；visibility recovery已判uncommitted + marker failure仍FORCE_ABORT；validated publish/recovery + commit-marker failure仍FORCE_COMMIT且不再调用recover；
+- crash发生在safety bundle、commit intent、artifact manifest、commit resolution和terminal任意相邻边界时，startup确定性恢复SUCCEEDED或FAILED/ABANDONED，不重新fire、不把temp当成功；
 - terminal snapshot与剩余claim释放对竞争acquire线性化；真实adapter bootstrap缺少persistent journal时拒绝启动，memory journal只用于virtual/unit test；
 - remote DeviceControlLease/journal/recovery authority位于硬件server；不同client本地journal不能洗白server quarantine，server不支持时contract明确拒绝多入口；
 - schema-affecting reconfigure 建新 generation/block_id，旧 cursor/view/fit terminal；每个 accepted ControlTopic revision 恰有一个 terminal ack；
