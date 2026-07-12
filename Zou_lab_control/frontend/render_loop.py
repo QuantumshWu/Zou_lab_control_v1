@@ -164,17 +164,22 @@ class RenderLoop(QtCore.QObject):
                 return False
             self._published.wait(remaining)
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def stop(self, timeout: float = 5.0) -> bool:
         """Stop the worker (console shutdown).  Any in-flight job finishes first; a
         finished-but-undelivered batch is DISCARDED (its only effect would be painting
-        panels that are about to be torn down)."""
+        panels that are about to be torn down).  Return True only after the worker has
+        actually terminated.  A timeout keeps ownership unresolved: pending state is
+        not cleared and callers must not touch or destroy the shared Figures."""
         self._stopping = True
         self._wake.set()
         self._thread.join(timeout)
+        if self._thread.is_alive():
+            return False
         with self._lock:
             self._result, self._has_result = None, False
             self._published.clear()
         self._idle.set()
+        return True
 
     # --------------------------------------------------------------- worker side
     def _loop(self) -> None:

@@ -74,6 +74,25 @@ def test_busy_holds_until_the_gui_consumes_and_barrier_delivers():
         loop.stop()
 
 
+def test_stop_timeout_never_claims_idle_or_discards_live_worker_ownership():
+    ensure_qt_app()
+    loop = RenderLoop(lambda _r: None)
+    started = threading.Event()
+    release = threading.Event()
+
+    def wedged_job():
+        started.set()
+        release.wait(5.0)
+
+    assert loop.submit(wedged_job)
+    assert started.wait(5.0)
+    assert loop.stop(0.01) is False
+    assert loop.busy
+    release.set()
+    assert loop.stop(5.0) is True
+    assert not loop.busy
+
+
 def _live_2d_setup(con):
     from Zou_lab_control.frontend.task_console import PanelConfig
     row = add_logic_row(con, ("camera", "live"))
