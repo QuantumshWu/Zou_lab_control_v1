@@ -195,6 +195,13 @@ def test_virtual_record_terminal_reports_the_arm_epoch_delivery_count():
     assert terminal.joined
 
 
+def test_arm_rejects_inflight_capacity_larger_than_finite_cardinality():
+    cam, _seqr = _rig()
+    with pytest.raises(ValueError, match="cannot exceed"):
+        cam.arm(2, max_inflight_frames=3)
+    assert cam._recent_state()["armed"] is False
+
+
 def test_lazy_state_and_lock_are_created_once_atomically():
     """F4: the lazily-created buffer state and acquisition lock are created ATOMICALLY (``setdefault``),
     so every touch returns the SAME object -- a check-then-set could build two divergent buffers /

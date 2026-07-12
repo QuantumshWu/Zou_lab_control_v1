@@ -335,7 +335,12 @@ class PylonCamera(CameraDevice):
     # base; this adapter implements only the pylon-facing hooks.  ``_free_run`` (software-trigger
     # predicate) is inherited from CameraDevice -- the ONE copy both backends share.
 
-    def _arm(self, frames: int | None) -> None:
+    def _arm(
+        self,
+        frames: int | None,
+        *,
+        max_inflight_frames: int | None = None,
+    ) -> None:
         """Start the grab session for an armed request.  Two modes, each with the strategy its
         semantics need:
 

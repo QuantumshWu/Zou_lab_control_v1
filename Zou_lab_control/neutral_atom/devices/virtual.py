@@ -869,7 +869,12 @@ class _TriggerWiredCamera(CameraDevice):
     def _pace(self, sequence, stop) -> None:
         """Optional per-frame wall-clock pacing for a continuous firing (subclass hook)."""
 
-    def _arm(self, frames: int | None) -> None:
+    def _arm(
+        self,
+        frames: int | None,
+        *,
+        max_inflight_frames: int | None = None,
+    ) -> None:
         # Fresh armed session: forget any finite fire recorded under a previous arm, so the
         # loud-fault check in read_frames only ever sees THIS session's trigger edges.
         state = self._recent_state()
@@ -1350,8 +1355,13 @@ class VirtualMotCamera(_TriggerWiredCamera):
                 self._latest_seq += 1
                 self._latest_cond.notify_all()
 
-    def _arm(self, frames: int | None) -> None:
-        super()._arm(frames)
+    def _arm(
+        self,
+        frames: int | None,
+        *,
+        max_inflight_frames: int | None = None,
+    ) -> None:
+        super()._arm(frames, max_inflight_frames=max_inflight_frames)
         self._scan_render_index = 0
         # FREE-RUN with real pacing: start the resident sensor stream (the virtual StartGrabbing).
         # pace == 0 (pytest fast-forward, sleep_scale = 0) keeps the deterministic render-on-demand

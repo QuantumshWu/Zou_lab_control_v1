@@ -97,6 +97,7 @@ class _FakeDcam:
         self._count = 0
         self.cap_stop_ok = True
         self.buf_release_ok = True
+        self.buf_alloc_calls = []
 
     # --- lifecycle
     def dev_open(self):
@@ -113,6 +114,7 @@ class _FakeDcam:
 
     # --- acquisition
     def buf_alloc(self, n):
+        self.buf_alloc_calls.append(int(n))
         return self._alive()
 
     def cap_start(self, bSequence=True):
@@ -494,3 +496,19 @@ def test_qcmos_terminal_failure_still_releases_common_arm_ownership():
     # cannot remain wedged merely because terminal evidence failed.
     assert cam._acquire_lock().acquire(blocking=False)
     cam._acquire_lock().release()
+
+
+def test_qcmos_driver_ring_uses_max_inflight_not_total_frame_budget():
+    api = _FakeApi()
+    api.initialised = True
+    dcam = _FakeDcam(api)
+    cam = _grab_camera(api, dcam)
+    cam.arm(100, max_inflight_frames=4)
+    try:
+        assert dcam.buf_alloc_calls == [4]
+        assert cam._buf_alloc == 4
+        state = cam._recent_state()
+        assert state["armed_frames"] == 100
+        assert state["pending_capacity"] == 4
+    finally:
+        cam.disarm()

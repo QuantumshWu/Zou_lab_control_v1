@@ -355,12 +355,25 @@ class QCMOSCamera(CameraDevice):
     # that needs an external fire between arm and read goes through the single helper
     # ``operations.measurement.triggered_frames``.
 
-    def _arm(self, frames: int | None) -> None:
+    def _arm(
+        self,
+        frames: int | None,
+        *,
+        max_inflight_frames: int | None = None,
+    ) -> None:
         """Allocate the DCAM frame buffer and start capture -- the hardware is then armed and
         waiting for FPGA trigger edges.  ``frames=None`` (continuous) allocates a
         ``recent_capacity``-deep ring the sequence capture cycles through."""
         dcam = self._dcam                        # arm() ensured the DCAM handle is open (base ensure_open)
-        alloc = int(frames) if frames is not None else max(1, int(self.recent_capacity))
+        alloc = (
+            int(max_inflight_frames)
+            if max_inflight_frames is not None
+            else (
+                int(frames)
+                if frames is not None
+                else max(1, int(self.recent_capacity))
+            )
+        )
         if dcam.buf_alloc(alloc) is False:
             raise RuntimeError(f"qCMOS buf_alloc({alloc}) failed: {dcam.lasterr()}")
         try:

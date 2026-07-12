@@ -866,7 +866,14 @@ class CameraDevice(BaseDevice):
                 f"unknown configure option(s) {unknown}; configurable: {sorted(allowed)}")
 
     # ------------------------------------------------------------- acquisition
-    def arm(self, frames: int | None = None, *, timeout: float | None = None, stop=None) -> None:
+    def arm(
+        self,
+        frames: int | None = None,
+        *,
+        max_inflight_frames: int | None = None,
+        timeout: float | None = None,
+        stop=None,
+    ) -> None:
         """Ready the camera for ``frames`` externally triggered frames (None = continuous).
 
         When this method RETURNS the hardware is armed and waiting for triggers, so a fire
@@ -889,6 +896,12 @@ class CameraDevice(BaseDevice):
                                     # never raises "arm before open", it just gets opened.
         if frames is not None:
             frames = positive_int(frames, "frames")
+        if max_inflight_frames is not None:
+            max_inflight_frames = positive_int(
+                max_inflight_frames, "max_inflight_frames"
+            )
+            if frames is not None and max_inflight_frames > frames:
+                raise ValueError("max_inflight_frames cannot exceed finite frame budget")
         self._acquire_session_lock(timeout=timeout, stop=stop)
         state = self._recent_state()
         with state["cond"]:
@@ -896,11 +909,17 @@ class CameraDevice(BaseDevice):
             state["armed"] = True
             state["armed_frames"] = frames
             state["pending_capacity"] = (
-                int(frames) if frames is not None else max(1, int(self.recent_capacity))
+                int(max_inflight_frames)
+                if max_inflight_frames is not None
+                else (
+                    int(frames)
+                    if frames is not None
+                    else max(1, int(self.recent_capacity))
+                )
             )
             state["source_ordinal"] = 0
         try:
-            self._arm(frames)
+            self._arm(frames, max_inflight_frames=max_inflight_frames)
         except BaseException:
             with state["cond"]:
                 state["armed"] = False
@@ -1030,9 +1049,16 @@ class CameraDevice(BaseDevice):
             self.disarm()
 
     # --------------------------------------------------- backend hooks (subclass seam)
-    def _arm(self, frames: int | None) -> None:
+    def _arm(
+        self,
+        frames: int | None,
+        *,
+        max_inflight_frames: int | None = None,
+    ) -> None:
         """Backend hook: ready the hardware (``buf_alloc`` + ``cap_start`` on a qCMOS,
-        ``StartGrabbing`` on a pylon camera).  Default: nothing to do (a push-fed source)."""
+        ``StartGrabbing`` on a pylon camera).  ``frames`` is total cardinality;
+        ``max_inflight_frames`` is the separately proven driver-retention bound.
+        Default: nothing to do (a push-fed source)."""
 
     def _grab(self, n: int, *, timeout: float | None = None, stop=None) -> bool:
         """Backend hook: produce or await at least one more frame for :meth:`read_frames`.
