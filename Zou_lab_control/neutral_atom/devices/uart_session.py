@@ -206,6 +206,7 @@ class UartStreamerSession(VivadoAxiStreamerSession):
         self._seq = 0
         self._tail_seconds = 0.0; self._drain_until = 0.0; self._repeat_forever = False
         self._program = None; self._total_points = 0; self._total_chunks = 1; self._scan_repeats = 0
+        self._prepared_artifact_digest = None; self._prepared_duration_seconds = 0.0
         self._scan_point = 0; self._scan_sweep = 0; self._scan_finished = False
         self._next_chunk = 2; self._bank_ready = 0b11
         self._stream_thread = None; self._stream_stop = None
@@ -281,3 +282,8 @@ class UartStreamerSession(VivadoAxiStreamerSession):
         if not ok:
             raise UartError("uart link self-test read-back mismatch (baud / framing / wiring).")
         return True
+
+    def current_snapshot(self) -> dict[str, object]:
+        snapshot = super().current_snapshot()
+        snapshot["transport"] = "uart"
+        return snapshot

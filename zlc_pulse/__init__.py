@@ -35,6 +35,7 @@ from .schedule import (
     digital_trigger_schedule_to_tree,
 )
 from .simulation import PlaybackPulse, PulsePlayback, build_pulse_playback
+from .session_backend import CompiledPulseSession, PulseStreamerSessionBackend
 from .server import (
     PREPARED_PULSE_REF_SCHEMA,
     PULSE_COMPLETION_SCHEMA,
@@ -84,6 +85,7 @@ __all__ = [
     "COMPILER_ID",
     "COMPILER_VERSION",
     "CompiledPulseArtifact",
+    "CompiledPulseSession",
     "DAC_OFFSET_BINARY",
     "DigitalTriggerSchedule",
     "ApiSlot",
@@ -100,6 +102,7 @@ __all__ = [
     "PulseExecutionForm",
     "PulseExecutionBackend",
     "PulseExecutionService",
+    "PulseStreamerSessionBackend",
     "PulseCompletion",
     "PlaybackPulse",
     "PulsePlayback",

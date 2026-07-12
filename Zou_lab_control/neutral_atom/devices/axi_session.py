@@ -55,6 +55,8 @@ from fpga.pulse_streamer.host.image import (
     STATUS_ERROR,
     build_fingerprint,
 )
+from zlc_pulse.artifact import CompiledPulseArtifact
+from zlc_pulse.fpga import pack_target_ir
 
 # Runtime clock + geometry default come from the single config file
 # (fpga/board_config/streamer_config.json via host.image).  The clock default has
@@ -170,6 +172,8 @@ class VivadoAxiStreamerSession:
         self._drain_until: float = 0.0       # monotonic deadline of the previous finite run
         self._repeat_forever = False
         self._program = None          # last prepared program (for streaming refills)
+        self._prepared_artifact_digest: str | None = None
+        self._prepared_duration_seconds = 0.0
         self._total_points = 0
         self._total_chunks = 1
         self._scan_repeats = 0        # 0 = sweep forever; K>=1 = stop after K whole sweeps
@@ -477,7 +481,7 @@ class VivadoAxiStreamerSession:
         write would silently land in the wrong registers.  Two real silent-corruption failures
         this catches: CLK_ENABLE 46->20 (clk mask into dead words -> garbled first-frame DA); and
         bus_seg_addr_width 6->5 (R_DELAY region shifted down 896 words -> every DAC-scan value and
-        delay wrong even with NO delay programmed).  Fail FAST and tell the user to rebuild."""
+                delay wrong even with NO delay programmed).  Fail FAST without modifying hardware."""
 
         expected = build_fingerprint(self.params)
         got = self._read_word(CtrlWords.LAYOUT_ID)
@@ -488,9 +492,9 @@ class VivadoAxiStreamerSession:
                 "The programmed bitstream was built from a DIFFERENT streamer_config.json geometry "
                 "than this host packs for -- register structure OR any geometry field (max_edges, "
                 "bank_size, bus_seg_addr_width, evt_fifo_depth, ...; an old .bit returns 0 here). "
-                "Rebuild the bitstream (fpga/build_and_program.bat) and restart the server TOGETHER "
-                "-- running a mismatched pair silently writes the wrong registers (e.g. shifts the "
-                "R_DELAY region or the DAC clk mask)."
+                "Select the host configuration matching the approved frozen deployment, or restore "
+                "the approved host/bitstream pair through the hardware-owner SOP. Do not rebuild or "
+                "reprogram automatically: running a mismatched pair silently writes the wrong registers."
             )
 
     def prepare(self, program) -> None:
@@ -501,6 +505,7 @@ class VivadoAxiStreamerSession:
         p = self.params
         points = list(getattr(program, "scan_points", []) or [])
         self._program = program
+        self._prepared_artifact_digest = None
         self._total_points = len(points)
         self._total_chunks = max(1, math.ceil(self._total_points / p.bank_size)) if self._total_points else 1
         self._repeat_forever = bool(getattr(program, "repeat_forever", False))
@@ -563,6 +568,7 @@ class VivadoAxiStreamerSession:
         tail_ticks = [int(d) for d in (getattr(program, "channel_delays", None) or [])]
         tail_ticks += [int(getattr(bd, "delay", 0)) for bd in (getattr(program, "bus_delays", None) or [])]
         self._tail_seconds = (max(tail_ticks) / clock) if tail_ticks else 0.0
+        self._prepared_duration_seconds = float(getattr(program, "duration", 0.0) or 0.0) * 1e-9
         # Halt + reset first so a prior run cannot drive outputs while we rewrite BRAM.
         self._command(CMD_SAFE)
         for word_offset in sorted(image):
@@ -582,6 +588,63 @@ class VivadoAxiStreamerSession:
                 f"(STATUS=0x{status:08X}; check the .bit/.ltx, the JTAG cable, and that "
                 "run_server programmed the current bitstream)."
             )
+
+    def prepare_compiled_artifact(self, artifact: CompiledPulseArtifact) -> None:
+        """Upload one exact current artifact without rebuilding a legacy runtime program."""
+
+        if not isinstance(artifact, CompiledPulseArtifact):
+            raise TypeError("artifact must be CompiledPulseArtifact")
+        ir = artifact.target_ir
+        if ir.clock_hz != self.clock_hz:
+            raise ValueError("compiled artifact clock differs from hardware session clock")
+        expected_geometry = build_fingerprint(self.params) & 0xFFFFFFFF
+        if artifact.wire_image.geometry_fingerprint != expected_geometry:
+            raise ValueError("compiled artifact geometry differs from hardware session geometry")
+        if artifact.wire_image != pack_target_ir(ir, self.params):
+            raise ValueError("compiled artifact wire image differs from deterministic TargetIR packing")
+
+        self._stop_stream_thread()
+        points = ir.scan_points
+        self._program = ir
+        self._prepared_artifact_digest = None
+        self._total_points = len(points)
+        self._total_chunks = (
+            max(1, math.ceil(self._total_points / self.params.bank_size))
+            if self._total_points
+            else 1
+        )
+        self._repeat_forever = ir.repeat_forever
+        self._scan_repeats = 0
+        self._scan_point = 0
+        self._scan_sweep = 0
+        self._scan_finished = False
+
+        self.check_register_layout()
+        if self._drain_until > 0.0:
+            remaining = self._drain_until - time.monotonic()
+            if remaining > 0:
+                try:
+                    status = int(self._read_word(CtrlWords.STATUS))
+                except Exception:
+                    status = 0
+                if status & STATUS_DONE:
+                    time.sleep(min(remaining, self._tail_seconds))
+            self._drain_until = 0.0
+
+        self._tail_seconds = artifact.max_configured_output_delay_ticks / ir.clock_hz
+        self._prepared_duration_seconds = ir.duration_seconds
+        self._command(CMD_SAFE)
+        for word_offset, word in artifact.wire_image.words:
+            self._queue_word(word_offset, word)
+        self._queue_word(CtrlWords.BANK_READY, 0b11)
+        self._flush()
+        if not self._command(CMD_LOAD, wait_mask=STATUS_LOADED, timeout=self.load_timeout):
+            status = self._read_word(CtrlWords.STATUS)
+            raise RuntimeError(
+                "pulse streamer did not report LOADED after the current artifact upload "
+                f"(STATUS=0x{status:08X})"
+            )
+        self._prepared_artifact_digest = artifact.fingerprint
 
     def axi_self_test(self, *, count: int = 16) -> bool:
         """Bring-up check for the AXI4 burst path: burst-write a known ramp into a SCRATCH
@@ -627,8 +690,8 @@ class VivadoAxiStreamerSession:
                 "empty, so the burst -data byte order is wrong or the bitstream is not the "
                 "current AXI4 build (an AXI4-Lite or stale bitstream ignores -len / the new "
                 f"address map).  wrote={[hex(v) for v in pattern[:4]]}... "
-                f"read={[hex(v) for v in read[:4]]}...  If read is all-zero, re-run "
-                "build_and_program to load the CURRENT bitstream, then restart the server."
+                f"read={[hex(v) for v in read[:4]]}...  If read is all-zero, restore the approved "
+                "frozen host/bitstream pair through the hardware-owner SOP, then restart the server."
             )
         # leave the register file as we found it (all-zero scratch)
         for offset in range(n):
@@ -713,8 +776,9 @@ class VivadoAxiStreamerSession:
         # duration + tail) so a back-to-back prepare() cannot chop the delayed tail.
         # repeat_forever has no natural end -- switching programs is an explicit stop.
         if not self._repeat_forever and self._tail_seconds > 0:
-            dur_s = float(getattr(self._program, "duration", 0.0) or 0.0) * 1e-9
-            self._drain_until = time.monotonic() + dur_s + self._tail_seconds
+            self._drain_until = (
+                time.monotonic() + self._prepared_duration_seconds + self._tail_seconds
+            )
         # a repeat_forever STREAMED scan (> 2 banks) must be fed continuously while it
         # re-sweeps; a background thread keeps the ping-pong banks loaded.  Start it FIRST,
         # then read STATUS (a plain read, no sleep) so the diagnostic never delays streaming.
@@ -726,6 +790,13 @@ class VivadoAxiStreamerSession:
                   flush=True)
         except Exception as exc:
             print(f"ZLC FIRE diag: STATUS read failed: {exc}", flush=True)
+
+    def fire_compiled_artifact(self, artifact: CompiledPulseArtifact) -> None:
+        if not isinstance(artifact, CompiledPulseArtifact):
+            raise TypeError("artifact must be CompiledPulseArtifact")
+        if self._prepared_artifact_digest != artifact.fingerprint:
+            self.prepare_compiled_artifact(artifact)
+        self.fire()
 
     # --- streaming refill primitive -----------------------------------------
     def _load_chunk(self, mono: int, bank_ready: int, *, stop: "threading.Event | None" = None) -> int:
@@ -810,6 +881,17 @@ class VivadoAxiStreamerSession:
             if time.monotonic() >= deadline:
                 return False
             time.sleep(self.stream_poll_interval if self._next_chunk < total_chunks else 0.01)
+
+    def wait_done_compiled_artifact(
+        self,
+        artifact: CompiledPulseArtifact,
+        timeout: float | None = None,
+    ) -> bool:
+        if not isinstance(artifact, CompiledPulseArtifact):
+            raise TypeError("artifact must be CompiledPulseArtifact")
+        if self._prepared_artifact_digest != artifact.fingerprint:
+            raise RuntimeError("compiled artifact is not the program prepared in this session")
+        return self.wait_done(timeout=timeout)
 
     # --- repeat_forever streamed re-sweep: background CONTINUOUS CYCLIC refill ----
     def _stream_refill_loop(self) -> None:
@@ -946,6 +1028,17 @@ class VivadoAxiStreamerSession:
         # an EXPLICIT stop abandons any delayed tail on purpose -- the next prepare()
         # must not wait out a drain deadline the user just cancelled.
         self._drain_until = 0.0
+        self._prepared_artifact_digest = None
+
+    def current_snapshot(self) -> dict[str, object]:
+        return {
+            "schema": "zlc_pulse.PulseStreamerSessionSnapshot/v1",
+            "transport": "vivado-axi",
+            "geometry_fingerprint": build_fingerprint(self.params) & 0xFFFFFFFF,
+            "clock_hz": self.clock_hz,
+            "prepared_artifact_digest": self._prepared_artifact_digest,
+            "scan_points": self._total_points,
+        }
 
     # ------------------------------------------------------------------ mailbox
     def _command(self, command: int, *, wait_mask: int | None = None,

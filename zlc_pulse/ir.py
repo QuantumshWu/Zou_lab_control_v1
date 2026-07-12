@@ -117,6 +117,10 @@ class TargetIR:
     channel_delays: tuple[int, ...] = ()
     clk_enable: int = 0
 
+    @property
+    def slot_count(self) -> int:
+        return len(self.slot_kinds)
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "clock_hz", _positive_float(self.clock_hz, "clock_hz"))
         _sha256(self.target_abi_fingerprint, "target_abi_fingerprint")
