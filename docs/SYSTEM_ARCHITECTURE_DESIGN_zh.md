@@ -19,7 +19,7 @@
 11. 精密 pulse/trigger 时序始终由现有 FPGA/qCMOS 等硬件执行；软件不得用 host sleep 调度微秒/纳秒事件。与此同时，bitstream/RTL 是冻结部署资产：架构不得为了获得更强证明而要求重烧；只有 E0a/Q0/真机证据发现现有 RTL bug、与既定设计不符或在已批准工作区间确实无法正确运行时，才单独评估硬件修复。
 12. raw hardware graph 只存在于 installation composition/runtime owner 的封闭内部；普通 Experiment、领域对象、frontend、教程和公共 umbrella 只能取得 immutable observation、typed descriptor 与经 authority 的窄 command facade，不能反向找回 adapter 或 DeviceSet。
 
-本文同时区分三种东西：终态不变量、当前冻结硬件上的 baseline capability、以及有明确删除点的迁移脚手架。正常 PulseScan 的执行方式族是现有 bitstream 的 `AUTONOMOUS_STREAMED`，其装载方式分为 fire前全部rows resident的`AUTONOMOUS_RESIDENT`与条件性的`AUTONOMOUS_REFILLED`；近期baseline只开放resident，refilled默认拒绝，只有§15.4强证明后才成为条件capability。Formal资格不是装载方式名称的一部分，而是 execution mode、有效Q0 qualification、association proof、软件exact链和本run EndAttestation共同评估的结果。唯一允许的非自主执行例外是 API-slot 无法在运行中无缝更新时已经存在并被接受的 `API_SLOT_SEGMENTED_EXISTING` 路径；segment之间的host gap属于该历史API语义，必须显式记录且不能称为连续或autonomous。除该例外外，`HOST_STEPPED_GROUP`/逐 cell fire-and-wait 不属于设计。逐沿 stamp、额外 ROM attestation、trigger-return 或新 watchdog 等需要重烧的增强只可在真机证据触发后作为独立硬件修复/升级提案，不能成为软件架构的前置要求。
+本文同时区分三种东西：终态不变量、当前冻结硬件上的 baseline capability、以及有明确删除点的迁移脚手架。正常 PulseScan 的执行方式族是现有 bitstream 的 `AUTONOMOUS_STREAMED`，其装载方式分为 fire前全部rows resident的`AUTONOMOUS_RESIDENT`与条件性的`AUTONOMOUS_REFILLED`；近期baseline只开放resident，refilled默认拒绝，只有§15.4强证明后才成为条件capability。Formal资格不是装载方式名称的一部分，而是 execution mode、有效Q0 qualification、association proof、软件exact链和本run EndAttestation共同评估的结果。唯一允许的非自主执行例外是 API-slot 无法在运行中无缝更新时已经存在并被接受的 `API_SLOT_SEGMENTED_EXISTING` 路径；segment之间的host gap属于该历史API语义，必须显式记录且不能称为连续或autonomous。除该例外外，`HOST_STEPPED_GROUP`/逐 cell fire-and-wait 不属于设计。逐沿 stamp、额外 ROM attestation、trigger-return 或新 watchdog 等需要重烧的增强只可在§1.1/H2的证据条件、因果证明与独立批准全部满足后作为硬件修复候选，不能成为软件架构的前置要求。
 
 这里的“硬件时序优先”不是把领域 key、工作流或新观测电路塞进 FPGA。当前 baseline 使用现有硬件已经提供的 pulse execution、mode-specific raw terminal/build fingerprint回读，以及 qCMOS 外触发、frame counter/stamp/timestamp；neutral runtime 用冻结计划、Q0资格化的经验性ordered-trigger合同、preflight时序余量和整 run末端对账映射 TriggerKey/ScanCellKey。它明确弱于逐沿硬件证明，但在 PI 接受的风险边界内 fail closed：任何可见不一致使整个 run INVALID并按显式有限策略重跑，不能提交部分或猜测性结果。
 
@@ -184,7 +184,7 @@ validity 不能只停在 `(R,P)`：readout fidelity 已经产生 `(group,site)` 
 
 多 signal `next_coherent_update` 当前会寻找下一个共同 provenance 并推进掉更快流的 unmatched 更新；这对 coherent monitor 可以接受，却不能自动代表 formal EXACT_KEY。JoinPolicy 必须在 pipeline 合同中显式区分“允许跳过并计数”与“缺 key 立即失败”。
 
-真 qCMOS 的 capture `nFrameCount` 是产出帧累计数；仓库 DCAM wrapper 还暴露 framestamp/camerastamp/timestamp，但当前 adapter 丢弃这些 metadata，也没有证明外触发工作区间内“一触发一帧、按序、无漏帧”。若只循环 `read_frames(1)` 并在 host 缓冲中取 latest，中间帧仍会被软件丢弃。近期修复不改变冻结 bitstream：E0a先用现有系统探索目标 exposure/ROI/readout/触发间距，S1/H1稳定后Q0再用最终adapter建立可发布的经验性ordered-trigger qualification；preflight 用编译后 trigger schedule 与该 qualification envelope 的最小帧间隔+安全余量拒绝过快 scan；autonomous运行一次arm整个run session，API segmented则每段独立arm/FIRE/attest；DCAM ring只按max-inflight与排空延迟定容，dedicated drain顺序复制全部帧和metadata到exact retention，而不是按`total_frames`分配同样多的相机buffer。对应autonomous run结束后由唯一I/O owner读取现有raw FPGA STATUS/CURSOR证明冻结table logical terminal；API segment则读取其stable raw DONE/STATUS且CURSOR明确N/A。两者都保持camera/drain运行并形成compiled/H1 `PostTerminalTailEvidence`，再把各自terminal evidence推导的expected trigger total与按Q0 reset/rollover语义计算的本session相机产出增量及frame/camera stamp/timestamp连续性对账。任一不符使整个 run INVALID，重跑只能由用户或显式有限RetryPolicy发起。该合同不能像逐沿硬件 tag那样定位具体错误，也不能绝对排除漏一帧同时多一帧的等量抵消；这是冻结硬件约束下明确接受的剩余风险，不能在文档中伪装成同等证明强度。
+真 qCMOS 的 capture `nFrameCount` 是产出帧累计数；仓库 DCAM wrapper 还暴露 framestamp/camerastamp/timestamp。当前 adapter 已完成一块正确的迁移首付：它从同一次 `buf_getframedata` 构造有界 `CameraFrameRecord`，保留 produced count、frame/camera stamp、timestamp 与 driver ring index，并在 ring overrun 时明确失败。但这仍没有证明外触发工作区间内“一触发一帧、按序、无漏帧”，旧 `read_frames()/acquire()` array-only consumer 也会在 record 边界后丢掉 metadata；若旧上层继续取 latest 或累计重发布，软件仍可能跳帧或形成第二套真相源。近期完成路径不改变冻结 bitstream：E0a先用现有系统探索目标 exposure/ROI/readout/触发间距，S1/H1稳定后Q0再用最终adapter、CaptureSession与buffer/drain policy建立可发布的经验性ordered-trigger qualification；preflight 用编译后 trigger schedule 与该 qualification envelope 的最小帧间隔+安全余量拒绝过快 scan；autonomous运行一次arm整个run session，API segmented则每段独立arm/FIRE/attest；DCAM ring只按max-inflight与排空延迟定容，dedicated drain顺序复制全部帧和metadata到exact retention，而不是按`total_frames`分配同样多的相机buffer。对应autonomous run结束后由唯一I/O owner读取现有raw FPGA STATUS/CURSOR证明冻结table logical terminal；API segment则读取其stable raw DONE/STATUS且CURSOR明确N/A。两者都保持camera/drain运行并形成compiled/H1 `PostTerminalTailEvidence`，再把各自terminal evidence推导的expected trigger total与按Q0 reset/rollover语义计算的本session相机产出增量及frame/camera stamp/timestamp连续性对账。任一不符使整个 run INVALID，重跑只能由用户或显式有限RetryPolicy发起。该合同不能像逐沿硬件 tag那样定位具体错误，也不能绝对排除漏一帧同时多一帧的等量抵消；这是冻结硬件约束下明确接受的剩余风险，不能在文档中伪装成同等证明强度。
 
 ### 3.6 UI 与 render 所有权不清
 
@@ -2186,7 +2186,7 @@ raw terminal也不能证明内部delay scheduler已经排空。`CompiledPulseArt
 
 对 SCAN_SLOT/MOT，`HOST_STEPPED_GROUP`、逐 cell arm/fire/wait、single-cell fire gate、per-cell `PHYSICAL_DONE` receipt 均不属于 baseline，也不能作为 qCMOS 首光、容量或证明 fallback。SCAN_SLOT/MOT 必须使用现有 FPGA 的完整逻辑table自主执行：近期无缝装载方式baseline为`AUTONOMOUS_RESIDENT`全量预装，`AUTONOMOUS_REFILLED`只有经§15.4强证明后才可成为条件execution capability。唯一非自主例外是既有adapter确实不能在一次自主sweep中更新API值时的`API_SLOT_SEGMENTED_EXISTING`；它必须按host point/segment execution如实记录、逐段attest，不能称为autonomous。Formal eligibility仍由Q0、exact链、association proof与EndAttestation联合决定。架构不得为了获得逐cell证明而要求新bitstream。
 
-`AUTONOMOUS_STREAMED` 是当前冻结bitstream的正式执行方式族，`AUTONOMOUS_RESIDENT`是不依赖下述增强的近期装载方式baseline；refilled的条件门见§15.4。只有 E0a/Q0 在批准工作余量内、正确配置和充分软件reservation下仍实测发现丢帧/乱序且无法通过降低trigger rate/扩大margin解决，或发现现有 RTL 真 bug/与既定设计不符时，才可提出证据驱动的 bitstream变更。仅仅metadata语义不清、样本量不足或无法建立qualification时，结果是不开启Formal capability，不构成硬件修改授权。届时可选增强之一是在真正 camera-trigger输出沿记录：
+`AUTONOMOUS_STREAMED` 是当前冻结bitstream的正式执行方式族，`AUTONOMOUS_RESIDENT`是不依赖下述增强的近期装载方式baseline；refilled的条件门见§15.4。只有 E0a/Q0 在批准工作余量内、正确camera配置和充分软件reservation下仍实测发现丢帧/乱序，且已经证明camera设置、软件保留/排空策略、降低trigger rate与扩大margin均不能修正；或发现现有 RTL 真 bug/与既定设计不符时，才可提出证据驱动的 bitstream变更。仅仅metadata语义不清、样本量不足、一次未归因异常或无法建立qualification时，结果是不开启Formal capability，不构成硬件修改授权。届时可选增强之一是在真正 camera-trigger输出沿记录：
 
 ```text
 HardwareTriggerStamp:
@@ -2201,7 +2201,7 @@ HardwareTriggerStamp:
 
 未来若证据触发逐沿 FIFO方案，其容量、overflow sticky fatal与排空带宽必须共同设计和真机验证，不能先写架构再要求重烧。未触发时不实现、不预留、不把它列为当前 Formal Scan gate；当前 UART/JTAG也不被假定具有尚不存在的高带宽 telemetry能力。
 
-相机 adapter 每帧保留 DCAMBUF_FRAME 的 `framestamp`、`camerastamp`、`timestamp`，并把`cap_transferinfo().nFrameCount`作为带读取位置/时间的session累计快照保存，不能像当前 adapter 一样只返回 ndarray，也不能伪装成per-frame metadata；这些字段的语义必须按具体 qCMOS 型号实测，字段存在本身不等于 TAGGED。
+相机 adapter 每帧保留 DCAMBUF_FRAME 的 `framestamp`、`camerastamp`、`timestamp`，并把`cap_transferinfo().nFrameCount`作为带读取位置/时间的session累计快照保存。当前 `CameraFrameRecord` 边界已经做到这一点；S1必须让最终 CameraPort/CaptureSession、exact retention、Q0 与 EndAttestation 端到端消费同一record语义，并在S3删除会解包成纯ndarray的旧public consumer，不能重新退化为array-only路径，也不能把累计`nFrameCount`伪装成per-frame metadata。这些字段的语义必须按具体 qCMOS 型号实测，字段存在本身不等于 TAGGED。
 
 每个run的camera start boundary也是关联合同的一部分：adapter必须在arm前排空/拒绝旧software pending与driver residual并保存`pre_arm_residual_observation`；随后在`cap_start`/arm-ready后、FIRE前按Q0 reset epoch建立`session_counter_baseline`。若counter或stamp只在首帧存在，Q0必须定义implicit initial、first-snapshot与first-frame successor rule，否则该工作点不具备Formal capability。必须证明arm本身是否可能产生frame，禁止跨cap_start reset把旧epoch绝对值带入delta。任何未声明的pre-fire frame、reset epoch不符、首帧不满足规则或stop后late frame都使整个epoch INVALID；不能只依赖“最终总数恰好相等”来掩盖开头混入旧帧、末尾少一帧的错位。
 
@@ -2215,7 +2215,7 @@ API segmented不使用上述“一次arm/一次FIRE”描述，而按§14.7逐se
 
 INVALID必须形成可查询的RunFailureRecord，保存失败原因、工作点、counter/stamp摘要和累计失败率。系统不得无限或静默自动重试直到“碰巧成功”；重试只能由用户发起，或由request中显式、有限、可审计的RetryPolicy发起，每次attempt具有独立run_id/provenance，最终artifact记录失败attempt refs。这样reject-and-redo不会掩盖硬件不稳定或造成不可见的选择偏差。
 
-只有 E0a/Q0 在目标工作余量内观察到真实丢帧/乱序，或代码/RTL证据证明现有实现与既定设计不符，才重开bitstream评估；候选可以是bug fix、HardwareTriggerStamp、trigger-return或其它最小修复。触发条件、证据、替代的软件/相机配置方案和重烧风险必须单独评审，不能由本架构自动授权。
+只有 E0a/Q0 在目标工作余量、正确camera配置和充分软件reservation下观察到真实丢帧/乱序，且软件保留/排空、camera设置、trigger rate与margin调整均无法修正；或代码/RTL证据证明现有实现与既定设计不符，才重开bitstream评估。候选可以是bug fix、HardwareTriggerStamp、trigger-return或其它最小修复；先证明问题与候选改动之间的因果关系，不能因为相机侧异常就默认修改FPGA。触发条件、证据、替代的软件/相机配置方案和重烧风险必须单独评审，不能由本架构自动授权。
 
 ### 14.6 非标量 y
 
@@ -2413,7 +2413,7 @@ expected trigger count/schedule 来自compiler对实际配置的唯一camera out
 - upload/fire沿用当前已工作的UART/AXI/JTAG协议。host/server通过PreparedProgramRef、connection generation、artifact/table digest防止软件层旧程序误触发；若transport error或readback异常，禁止提交并按现有safe/reset路径处理；
 - RemoteSequencer通过现有软件/transport能力提供bounded timeout、cancel/abort和safe调用；共享backend的第二socket不冒充硬件独立性。无法确认safe时resource quarantine，但baseline不因此要求新增watchdog/SAFE寄存器；
 - runtime identity近期只要求现有`image.build_fingerprint`/几何/ABI握手一致；installation-owned deployment record可以保存已批准`.bit`文件的content digest与release/timing记录作为SOP provenance，但它不证明endpoint此刻实际运行的内容。需要新RTL才能提供的runtime `design_build_id`、timing-signoff ROM或programmed-bitstream content attestation均不是baseline；
-- 逐沿counter/FIFO、per-fire count、PHYSICAL_DONE、BANK_VERIFIED/RTL CRC等均不作为当前合同。只有E0a/Q0/故障注入证实真实问题或现有RTL偏离既定设计时，才提出证据驱动的最小硬件修复；
+- 逐沿counter/FIFO、per-fire count、PHYSICAL_DONE、BANK_VERIFIED/RTL CRC等均不作为当前合同。只有E0a/Q0/故障注入在已批准工作余量、正确camera配置和充分软件reservation下证实真实loss/reorder且非硬件替代方案均不能修正，或现有RTL偏离既定设计时，才提出与已证实根因有因果关系的最小硬件修复；
 - 若未来合法重建bitstream，build仍必须满足unconstrained paths=0、WNS>=0、TNS>=0，并审查generated clocks、CDC、IP property和critical warnings；这约束未来修复质量，不授权为架构偏好重烧。
 
 ## 16. Artifact 与持久化
@@ -2869,8 +2869,8 @@ S1/S2/S3/S4 -> S5 remaining use cases -> Z0 zero-residual audit
 - **GO NOW**：E0a中的代码/metadata只读探测、离线分析与profile、import-DAG ratchet、F0绿地data/storage/stream/catalog、S0.5 Workbench三surface与三个legacy containment bridge可立即开始。E0a主动真机触发实验不是“只读”，只能通过已批准的现有实验SOP与唯一设备owner执行，或等待F0最小safety spine后执行。
 - **GO PER DEPENDENCY-CLOSED SLICE**：S1/S2/S3 只有在 LegacyRuntimeFence 生效、consumer matrix确认且每个切片不提前删除共享 producer时开始。
 - **GO FOR S4 IMPLEMENTATION**：H1 current-bitstream合同、S1 exact acquisition与S3 processor/materializer接口稳定后可以实现S4；这不等于用户可启用Formal。
-- **GO FOR FORMAL ENABLEMENT**：必须再有当前最终adapter/driver/buffer policy上的active Q0 qualification、active ProgrammedImageDeploymentRecordRef、compiled physical waveform/arm/edge/camera-tail margin、对应execution mode的现有bitstream raw terminal语义与稳定读规则、adapter-specific SafeStateContract、deployment-bound compiled/H1 post-terminal output-tail bound和`PostTerminalTailEvidence`、全部BoundSourceAssociationContracts、exact链与EndAttestation E2E。近期只评估恰好一个Q0-qualified qCMOS source的`AUTONOMOUS_RESIDENT` execution mode；refilled仅在§15.4条件能力发布后评估，API segmented按§14.7另行逐段资格化。contract kit、deployment record与qualification本身不要求新RTL，但若冻结硬件证据不能通过任一gate，Formal capability继续NO-GO，不能以软件state补证，也不因此自动授权重烧。
-- **HARDWARE CHANGE NO-GO BY DEFAULT**：HardwareTriggerStamp、新ROM attestation、per-fire counter/PHYSICAL_DONE、trigger-return、watchdog或RTL CRC均不得由路线图自动启动。只有E0a/Q0测得工作余量内真实丢帧/乱序，或现有RTL bug/设计偏离被证实，才进入H2评审。
+- **GO FOR FORMAL ENABLEMENT**：必须再有当前最终adapter/driver/buffer policy上的active Q0 qualification、active ProgrammedImageDeploymentRecordRef、compiled physical waveform/arm/edge/camera-tail margin、对应execution mode的现有bitstream raw terminal语义与稳定读规则、adapter-specific SafeStateContract、deployment-bound compiled/H1 post-terminal output-tail bound和`PostTerminalTailEvidence`、全部BoundSourceAssociationContracts、exact链与EndAttestation E2E。近期只评估恰好一个Q0-qualified qCMOS source，并先开放`AUTONOMOUS_STREAMED`方式族中的`AUTONOMOUS_RESIDENT`装载形态；refilled仅在§15.4条件能力发布后评估，API segmented按§14.7另行逐段资格化。contract kit、deployment record与qualification本身不要求新RTL，但若冻结硬件证据不能通过任一gate，Formal capability继续NO-GO，不能以软件state补证，也不因此自动授权重烧。
+- **HARDWARE CHANGE NO-GO BY DEFAULT**：HardwareTriggerStamp、新ROM attestation、per-fire counter/PHYSICAL_DONE、trigger-return、watchdog或RTL CRC均不得由路线图自动启动。只有E0a/Q0在已批准工作余量、正确camera配置和充分软件reservation下仍测得真实丢帧/乱序，且已经证明无法通过camera设置、软件保留/排空策略、降低trigger rate或扩大时序margin修正；或现有RTL bug/设计偏离被证实，才进入H2评审。发现一次异常、qualification证据不足或架构希望获得更强证明，都不满足该条件。
 
 ### E0a：迁移前 characterization，不授予发布资格
 
@@ -3231,7 +3231,7 @@ Pulse/FPGA：
 - PreparedProgramRef + connection generation + artifact/table digest使旧软件引用不能进入正式FIRE，完整自主table在fire前冻结；
 - current resident/streamed bank按现有RTL真实能力完成golden/真机验证，不要求不存在的RTL CRC；
 - RemoteSequencer现有timeout/cancel/abort/safe与故障时quarantine通过真机测试；不要求新watchdog/独立SAFE硬件；
-- RTL/bitstream保持冻结；只有E0a/Q0实测工作区间内loss/reorder或已证实RTL bug/设计偏离，才允许H2硬件修复评审。
+- RTL/bitstream保持冻结；只有E0a/Q0在已批准工作余量、正确camera配置和充分软件reservation下仍实测loss/reorder，且camera设置、软件保留/排空策略、降低trigger rate与扩大margin均不能修正；或已证实RTL bug/设计偏离，才允许H2硬件修复评审。
 
 性能：
 
@@ -3270,8 +3270,8 @@ Pulse/FPGA：
 
 扩展性来自稳定数据与能力边界、显式组合和机械 contract tests，而不是更多继承层、Protocol、Service 或动态注册。
 
-近期最重要的落地顺序不是先拆完五个namespace，而是先让lifecycle/resource状态诚实、建立Workbench/render宿主、跑通Camera event -> DatasetBuilder -> live/save，并用E0a真qCMOS characterization确定工作点；S1最终adapter与H1 schedule语义稳定后重新执行Q0 release qualification。随后在冻结bitstream上以`AUTONOMOUS_RESIDENT`运行近期无缝装载方式基线，用active qualification + preflight margin + ordered metadata + per-run EndAttestation共同授予Formal eligibility；refilled仍默认拒绝。逐沿stamp、新ROM、trigger-return等只有真机证据触发硬件修复时才评估。
+近期最重要的落地顺序不是先拆完五个namespace，而是先让lifecycle/resource状态诚实、建立Workbench/render宿主、跑通Camera event -> DatasetBuilder -> live/save，并用E0a真qCMOS characterization确定工作点；S1最终adapter与H1 schedule语义稳定后重新执行Q0 release qualification。随后在冻结bitstream上以`AUTONOMOUS_RESIDENT`运行近期无缝装载方式基线，用active qualification + preflight margin + ordered metadata + per-run EndAttestation共同授予Formal eligibility；refilled仍默认拒绝。逐沿stamp、新ROM、trigger-return等只有§1.1/H2的证据条件、根因因果关系和独立批准全部满足后才评估。
 
-终版GO/NO-GO裁决分开写：顶层架构与E0a只读/离线部分、F0、S0.5 **GO**；S0.6的值对象、原子InstallationState、内部consumer与frontend窄port迁移 **GO**，但新增任何普通用户真实设备入口在public object-graph/umbrella/docs gates清零前 **NO-GO**；S1-S3按dependency-closed cut **GO**；S4代码实现于H1/S1/S3接口稳定后 **GO**。除§19明文限定的H1前`DIAGNOSTIC_CHARACTERIZATION`迁移例外（批准legacy SOP、唯一owner、现有fingerprint/ABI、observed live identity/endpoint与旧SOP safety evidence齐全，且绝不产生target runtime/AssetMap/Q0/Formal authority）外，任何target runtime或普通实验真实设备drive capability在installation AssetMap（canonical内容digest、exact adapter kind、expected live matcher）生效、该adapter的identity/disconnect/SafeStateContract真机recipe通过前均为 **NO-GO**；Pylon尤其必须通过removed+live readback拔线测试，不能以`IsOpen/IsGrabbing/GetDeviceInfo`缓存组合放行。用户可用Formal PulseScan capability仍为 **NO-GO**，直到current deployment有active ProgrammedImageDeploymentRecordRef、当前最终adapter的Q0 qualification active、完整physical waveform/arm/edge/camera-tail margin、mode-specific raw terminal稳定读语义、adapter-specific SafeStateContract、deployment-bound compiled/H1 post-terminal output-tail bound与`PostTerminalTailEvidence`、近期单qCMOS BoundSourceAssociationContract、软件exact链和EndAttestation E2E全部通过。deployment record/H1/Q0/contract-kit评估本身不要求重烧，也不冒充runtime content attestation；冻结硬件最终能否通过这些gate由真机证据决定，不能预先承诺。硬件改变默认 **NO-GO**；唯一解锁条件是E0a/Q0在批准余量内实测loss/reorder，或现有RTL bug/既定设计偏离被证实，并经PI/硬件owner单独批准。
+终版GO/NO-GO裁决分开写：顶层架构与E0a只读/离线部分、F0、S0.5 **GO**；S0.6的值对象、原子InstallationState、内部consumer与frontend窄port迁移 **GO**，但新增任何普通用户真实设备入口在public object-graph/umbrella/docs gates清零前 **NO-GO**；S1-S3按dependency-closed cut **GO**；S4代码实现于H1/S1/S3接口稳定后 **GO**。除§19明文限定的H1前`DIAGNOSTIC_CHARACTERIZATION`迁移例外（批准legacy SOP、唯一owner、现有fingerprint/ABI、observed live identity/endpoint与旧SOP safety evidence齐全，且绝不产生target runtime/AssetMap/Q0/Formal authority）外，任何target runtime或普通实验真实设备drive capability在installation AssetMap（canonical内容digest、exact adapter kind、expected live matcher）生效、该adapter的identity/disconnect/SafeStateContract真机recipe通过前均为 **NO-GO**；Pylon尤其必须通过removed+live readback拔线测试，不能以`IsOpen/IsGrabbing/GetDeviceInfo`缓存组合放行。用户可用Formal PulseScan capability仍为 **NO-GO**，直到current deployment有active ProgrammedImageDeploymentRecordRef、当前最终adapter的Q0 qualification active、完整physical waveform/arm/edge/camera-tail margin、mode-specific raw terminal稳定读语义、adapter-specific SafeStateContract、deployment-bound compiled/H1 post-terminal output-tail bound与`PostTerminalTailEvidence`、近期单qCMOS BoundSourceAssociationContract、软件exact链和EndAttestation E2E全部通过。deployment record/H1/Q0/contract-kit评估本身不要求重烧，也不冒充runtime content attestation；冻结硬件最终能否通过这些gate由真机证据决定，不能预先承诺。硬件改变默认 **NO-GO**；唯一解锁条件是E0a/Q0在已批准余量、正确camera配置和充分软件reservation下仍实测loss/reorder，并且camera设置、软件保留/排空、trigger rate与margin调整均无法修正；或现有RTL bug/既定设计偏离被证实；之后仍须PI/硬件owner单独批准。
 
-最终实现应让用户继续使用熟悉的TaskConsole、PulseGUI和notebook工作流；重型board保持下线程raster性能，notebook保持短路径，MOT保持SCAN_SLOT自主扫描。resident/refilled只标记execution mode；只有active Q0 qualification、exact链、`ORDERED_END_ATTESTED_RUN`和本run EndAttestation共同通过时才标记Formal eligible。内部消除软件缓冲跳帧、线程竞态、隐式降维和重复算法；相机↔point的物理保证明确采用整run末端证明而非逐沿硬件tag，任何不一致整run拒绝，所有迁移bridge在Z0物理删除。
+最终实现应让用户继续使用熟悉的TaskConsole、PulseGUI和notebook工作流；重型board保持下线程raster性能，notebook保持短路径，MOT保持SCAN_SLOT自主扫描。resident/refilled只标记同一`AUTONOMOUS_STREAMED`方式族下的装载方式，不能单独授予Formal资格；只有active Q0 qualification、exact链、`ORDERED_END_ATTESTED_RUN`和本run EndAttestation共同通过时才标记Formal eligible。内部消除软件缓冲跳帧、线程竞态、隐式降维和重复算法；相机↔point的物理保证明确采用整run末端证明而非逐沿硬件tag，任何不一致整run拒绝，所有迁移bridge在Z0物理删除。
