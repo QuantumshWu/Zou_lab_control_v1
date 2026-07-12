@@ -90,9 +90,11 @@ class _FakeCamera:
         self.TriggerSource = _StrNode()
         self._grabbing = False
         self._opened = False
+        self.open_calls = 0
         self._retrieve = retrieve            # callable(timeout_ms) -> result-or-None
 
     def Open(self):
+        self.open_calls += 1
         self._opened = True
 
     def Close(self):
@@ -100,6 +102,12 @@ class _FakeCamera:
 
     def IsGrabbing(self):
         return self._grabbing
+
+    def IsOpen(self):
+        return self._opened
+
+    def IsCameraDeviceRemoved(self):
+        return False
 
     def StartGrabbing(self, *a):
         self._grabbing = True
@@ -178,6 +186,18 @@ def test_open_applies_roi_configured_before_open(fake_pylon):
     assert camera.OffsetY.value == 80
     # and the adapter reports the granted window, consistent with the hardware.
     assert cam.roi == (100, 640, 80, 480)
+
+
+def test_open_is_idempotent_for_one_live_sdk_handle(fake_pylon):
+    camera = _FakeCamera()
+    fake_pylon(camera)
+    cam = PylonCamera(trigger_source="Software")
+
+    assert cam.open() is cam
+    assert cam.open() is cam
+
+    assert camera.open_calls == 1
+    assert cam.is_open
 
 
 def test_reopen_reapplies_roi(fake_pylon):

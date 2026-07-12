@@ -79,8 +79,18 @@ def test_ensure_open_is_the_single_source_no_backend_arm_raises_on_unopened():
     # is_open predicate is wired to the handle attribute (unopened -> False).
     cam = pylon.PylonCamera.__new__(pylon.PylonCamera)
     cam._camera = None
+    cam._connection_token = None
     assert cam.is_open is False
-    cam._camera = object()
+    class _LivePylonHandle:
+        def IsOpen(self):
+            return True
+
+        def IsCameraDeviceRemoved(self):
+            return False
+
+    cam._camera = _LivePylonHandle()
+    assert cam.is_open is False
+    cam._connection_token = object()
     assert cam.is_open is True
 
 

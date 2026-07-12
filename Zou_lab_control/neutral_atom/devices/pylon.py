@@ -82,6 +82,7 @@ class PylonCamera(CameraDevice):
         # increments (Width.Inc / OffsetX.Inc) own the legal grid -- never a hardcoded step.
         self.subarray_step = int(subarray_step)
         self._camera = None                     # the pypylon InstantCamera, created in open()
+        self._connection_token = None           # published only after Open + all settings succeed
         self._roi: tuple[int, int, int, int] | None = None
         # Armed-session bookkeeping so a triggered-mode fault names WHICH frame of HOW MANY was
         # awaited (the qCMOS message style); reset per arm, meaningless in free-run.
@@ -151,36 +152,65 @@ class PylonCamera(CameraDevice):
             for i in infos]
 
     # ------------------------------------------------------------------ lifecycle
-    def open(self) -> None:
+    def open(self) -> "PylonCamera":
         from pypylon import pylon               # lazy: only a machine with the Basler runtime needs it
 
+        if self._camera is not None or self._connection_token is not None:
+            camera = self._camera
+            try:
+                if (
+                    camera is not None
+                    and self._connection_token is not None
+                    and bool(camera.IsOpen())
+                    and not bool(camera.IsCameraDeviceRemoved())
+                ):
+                    return self
+            except BaseException:
+                pass
+            self.close()
         factory = pylon.TlFactory.GetInstance()
         if self.serial:
             info = next((d for d in factory.EnumerateDevices()
                          if d.GetSerialNumber() == self.serial), None)
             if info is None:
                 raise RuntimeError(f"pylon camera with serial {self.serial!r} not found.")
-            self._camera = pylon.InstantCamera(factory.CreateDevice(info))
+            camera = pylon.InstantCamera(factory.CreateDevice(info))
         else:
-            self._camera = pylon.InstantCamera(factory.CreateFirstDevice())
-        self._camera.Open()
-        # A single "push every configured setting" path -- so no setting made BEFORE open (a
-        # configure(roi=) before the device set opens cameras, or a close->reopen) can be dropped.
-        # ROI is applied LAST: it snaps against the now-live GenICam Width/Offset increments.
-        self._camera.PixelFormat.SetValue(self.pixel_format)
-        self._apply_exposure()
-        self._apply_trigger()
-        self._apply_roi()
+            camera = pylon.InstantCamera(factory.CreateFirstDevice())
+        try:
+            camera.Open()
+            # Configure the local handle completely before publishing it as the live connection.
+            camera.PixelFormat.SetValue(self.pixel_format)
+            self._apply_exposure(camera)
+            self._apply_trigger(camera)
+            self._apply_roi(camera)
+        except BaseException:
+            try:
+                camera.Close()
+            finally:
+                self._camera = None
+                self._connection_token = None
+            raise
+        self._camera = camera
+        self._connection_token = object()
+        return self
 
     @property
     def is_open(self) -> bool:
         """Live once :meth:`open` has created the InstantCamera handle -- the predicate the base
         ``ensure_open`` reads to lazily open the grabber on first ``arm`` (this camera is a pure
         grabber; it no longer raises 'arm before open')."""
-        return self._camera is not None
+        camera = self._camera
+        if camera is None or getattr(self, "_connection_token", None) is None:
+            return False
+        try:
+            return bool(camera.IsOpen()) and not bool(camera.IsCameraDeviceRemoved())
+        except BaseException:
+            return False
 
     def close(self) -> None:
         if self._camera is not None:
+            self._connection_token = None
             try:
                 self.stop()
             finally:
@@ -188,15 +218,17 @@ class PylonCamera(CameraDevice):
                     self._camera.Close()
                 finally:
                     self._camera = None
+        else:
+            self._connection_token = None
 
     def stop(self) -> None:
         if self._camera is not None and self._camera.IsGrabbing():
             self._camera.StopGrabbing()
 
-    def _paused_stream(self):
+    def _paused_stream(self, camera=None):
         """Context manager: stop the resident grab stream around a sensor reconfiguration
         (GenICam rejects ROI/format writes while grabbing) and resume it afterwards."""
-        camera = self._camera
+        camera = self._camera if camera is None else camera
 
         class _Pause:
             def __enter__(self_inner):
@@ -256,12 +288,14 @@ class PylonCamera(CameraDevice):
                                               max_w=w, max_h=h)
             self._apply_roi()
 
-    def _apply_exposure(self) -> None:
+    def _apply_exposure(self, camera=None) -> None:
         # Basler exposes ExposureTime in microseconds; legal while grabbing (no stream pause)
-        self._camera.ExposureTime.SetValue(float(self._exposure) * 1e6)
+        (self._camera if camera is None else camera).ExposureTime.SetValue(
+            float(self._exposure) * 1e6
+        )
 
-    def _apply_trigger(self) -> None:
-        cam = self._camera
+    def _apply_trigger(self, camera=None) -> None:
+        cam = self._camera if camera is None else camera
         cam.TriggerSelector.SetValue("FrameStart")
         if self._free_run:
             cam.TriggerMode.SetValue("Off")     # free-run: each RetrieveResult grabs the next frame
@@ -269,16 +303,16 @@ class PylonCamera(CameraDevice):
             cam.TriggerMode.SetValue("On")
             cam.TriggerSource.SetValue(self.trigger_source)
 
-    def _apply_roi(self) -> None:
+    def _apply_roi(self, camera=None) -> None:
         """Push the ROI in the GenICam-safe order: pause the stream, zero the offsets, size the
         window, then place it.  Setting Width/Height while a stale OffsetX/Y is still active can
         violate ``Offset + Width <= SensorWidth`` and the camera rejects the write (the same
         zero-offsets-first dance the qCMOS subarray code does).  Every value is clamped/aligned
         to the CAMERA'S own Min/Max/Inc -- the hardware owns its legal grid."""
-        if self._camera is None:
+        cam = self._camera if camera is None else camera
+        if cam is None:
             return
-        cam = self._camera
-        with self._paused_stream():
+        with self._paused_stream(cam):
             cam.OffsetX.SetValue(int(cam.OffsetX.GetMin()))
             cam.OffsetY.SetValue(int(cam.OffsetY.GetMin()))
             if self._roi is None:               # blank -> the FULL sensor, not a stale window

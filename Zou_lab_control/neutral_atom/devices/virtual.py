@@ -856,7 +856,11 @@ class _TriggerWiredCamera(CameraDevice):
         path set the sequencer's scale, the camera honours it with no separate mirror to keep in
         sync).  No wire -> the module default."""
         wire = getattr(self, "sequencer", None)
-        scale = getattr(wire, "sleep_scale", None)
+        snapshot = getattr(wire, "trigger_snapshot", None)
+        if callable(snapshot):
+            _firing, scale = snapshot()
+        else:
+            scale = getattr(wire, "sleep_scale", None)
         return float(DEFAULT_SLEEP_SCALE if scale is None else scale)
 
     def _render_frames(self, sequence, frames: int) -> list[np.ndarray]:
@@ -918,7 +922,10 @@ class _TriggerWiredCamera(CameraDevice):
         # edge can arrive, so the read returns immediately and the live view freezes -- the
         # data-source gate the live monitor relies on (no fabricated frames, no dead wait).
         wire = getattr(self, "sequencer", None)
-        firing = None if wire is None else wire.firing
+        snapshot = None if wire is None else getattr(wire, "trigger_snapshot", None)
+        firing = snapshot()[0] if callable(snapshot) else (
+            None if wire is None else wire.firing
+        )
         if firing is None:
             return False
         # EDGE-FAITHFUL in whole cycles: a continuous firing delivers its trigger train one BASE
@@ -1360,8 +1367,13 @@ class VirtualMotCamera(_TriggerWiredCamera):
 
     def _disarm(self) -> None:
         if self._producer is not None:
+            producer = self._producer
             self._producer_stop.set()
-            self._producer.join(timeout=2.0)
+            producer.join(timeout=2.0)
+            if producer.is_alive():
+                raise RuntimeError(
+                    "virtual MOT camera producer did not terminate during disarm"
+                )
             self._producer = None
         super()._disarm()
 
@@ -1470,6 +1482,7 @@ class VirtualSequencer(SequencerDevice):
         # The compiled program of the last prepare() the camera reads as ``firing`` -- a
         # PulseSequence (not the service's compiled RuntimeSequenceProgram), because the camera
         # needs its ``base_pulses()`` to detect the capture-trigger channel + its physics.
+        self._wire_lock = threading.RLock()
         self._prepared: PulseSequence | None = None
         # The compiled RuntimeSequenceProgram of the last prepare() (what on_pulse /
         # sync-to-device read for .sequence_name etc.).
@@ -1530,7 +1543,14 @@ class VirtualSequencer(SequencerDevice):
         """The repeat_forever program this in-process streamer is continuously playing, or None
         when idle/safe -- the override of :attr:`SequencerDevice.firing` (which defaults None for a
         real/remote streamer with no host-side firing flag)."""
-        return self._firing
+        with self._wire_lock:
+            return self._firing
+
+    def trigger_snapshot(self) -> tuple[PulseSequence | None, float]:
+        """Atomically expose the virtual trigger-line state to wired cameras."""
+
+        with self._wire_lock:
+            return self._firing, float(self.service.sleep_scale)
 
     @property
     def last_fired(self) -> PulseSequence | None:
@@ -1542,7 +1562,8 @@ class VirtualSequencer(SequencerDevice):
         Distinct from :attr:`firing` (a repeat_forever program still PLAYING now) and from the
         merely-prepared program (uploaded, driving nothing yet): prepare does NOT clear this -- an
         upload replaces the next program but leaves the pins holding the last fired word."""
-        return self._last_fired
+        with self._wire_lock:
+            return self._last_fired
 
     def prepare(self, sequence: PulseSequence | PulseTableState):
         # Uploading a new program REPLACES whatever the streamer was playing: on real hardware a
@@ -1552,7 +1573,8 @@ class VirtualSequencer(SequencerDevice):
         # Stop -- does not leave the wired camera rendering against the STALE continuous program.
         # ``fire`` re-sets ``_firing`` iff the freshly prepared program is itself repeat_forever, so
         # the firing lifecycle is owned entirely by prepare (clear) / fire (set) / stop (clear).
-        self._firing = None
+        with self._wire_lock:
+            self._firing = None
         # Accept either a PulseSequence or a GUI PulseTableState (what bind_pulse/on_pulse and a
         # loaded pulse .json pass).  Compile a table to a PulseSequence so fire()/firing/acquire
         # all work on ONE type, carrying repeat_forever for a continuous (On Pulse) program.
@@ -1631,10 +1653,12 @@ class VirtualSequencer(SequencerDevice):
         # firing (and must not make a later live read see a stale finite shot).
         # Whatever fired now owns the output pins: record it as the held steady state a
         # free-running monitor images between fires (see ``last_fired``).
-        self._last_fired = self._prepared
-        if bool(getattr(self._prepared, "repeat_forever", False)):
-            self._firing = self._prepared
-        else:
+        with self._wire_lock:
+            self._last_fired = self._prepared
+            if bool(getattr(self._prepared, "repeat_forever", False)):
+                self._firing = self._prepared
+            listeners = tuple(self._fire_listeners)
+        if not bool(getattr(self._prepared, "repeat_forever", False)):
             # Anchor the finite program's play deadline AT FIRE: every waiter (the wired camera's
             # finite read pacing and wait_done below) waits to this same absolute instant, so a
             # measurement that reads its frames and THEN waits for program completion pays the
@@ -1652,7 +1676,7 @@ class VirtualSequencer(SequencerDevice):
         # Emit the trigger edges: every wired camera (the virtual trigger cables) sees this
         # fire.  An ARMED camera renders the frames a finite program's edges gate; a
         # continuous program is instead consumed at the firing cadence via ``firing``.
-        for listener in tuple(self._fire_listeners):
+        for listener in listeners:
             listener(self._prepared)
 
     # ------------------------------------------------------------------ trigger cables
@@ -1660,15 +1684,17 @@ class VirtualSequencer(SequencerDevice):
         """Plug a virtual trigger cable in: ``listener(program)`` is invoked on every fire.
         Registered by a wired camera at construction (``sequencer="$device:sequencer"`` in the
         device config) -- the simulation of the physical trigger wire, device layer only."""
-        if listener not in self._fire_listeners:
-            self._fire_listeners.append(listener)
+        with self._wire_lock:
+            if listener not in self._fire_listeners:
+                self._fire_listeners.append(listener)
 
     def remove_fire_listener(self, listener) -> None:
         """Unplug a trigger cable (no error if it was never plugged in)."""
-        try:
-            self._fire_listeners.remove(listener)
-        except ValueError:
-            pass
+        with self._wire_lock:
+            try:
+                self._fire_listeners.remove(listener)
+            except ValueError:
+                pass
 
     def _scan_progress(self) -> dict:
         """Where the streamed scan is now -- the real-time-paced reading wired into the service as
@@ -1684,23 +1710,27 @@ class VirtualSequencer(SequencerDevice):
             return dict(SCAN_PROGRESS_IDLE)
         n = int(self._scan_info["n_points"])
         k = int(self._scan_info["scan_repeats"])
-        if self._scan_done:              # finite scan finished -> latch the SATURATED done reading (== real)
+        with self._wire_lock:
+            scan_done = self._scan_done
+            scan_fire_time = self._scan_fire_time
+        if scan_done:                    # finite scan finished -> latch the SATURATED done reading (== real)
             return scan_progress_fields(max(1, k) * n, n, k)
         # Scanning is judged by whether a streamed scan has been FIRED (``_scan_fire_time``), NOT by the
         # ``_firing`` (repeat_forever) handle: a finite SINGLE-PASS streamed scan (repeat_forever=False +
         # scan_points) advances its progress too, exactly like the real backend, and ``_firing`` is only
         # set for a cyclic repeat_forever sweep.  Prepared-but-not-yet-fired (fire time 0) reads idle.
-        if self._scan_fire_time <= 0.0:
+        if scan_fire_time <= 0.0:
             return dict(SCAN_PROGRESS_IDLE)
         dt = float(self._scan_info["base_dt"]) * self.sleep_scale
         if dt <= 0:                      # fast-forward: a finite scan is instantly done, an infinite one sits at point 0
             total = k * n if k > 0 else 0
         else:
-            total = int((time.monotonic() - self._scan_fire_time) / dt)
+            total = int((time.monotonic() - scan_fire_time) / dt)
         fields = scan_progress_fields(total, n, k)
         if not fields["scanning"]:       # finite scan reached K sweeps -> the streamer halts (camera stops),
-            self._scan_done = True       # but the reading stays latched at done until the next prepare/stop
-            self._firing = None
+            with self._wire_lock:
+                self._scan_done = True   # but the reading stays latched at done until the next prepare/stop
+                self._firing = None
         return fields
 
     def scan_progress(self) -> dict:
@@ -1735,8 +1765,9 @@ class VirtualSequencer(SequencerDevice):
                     self._sleep_interruptible(delay, stop)          # cooperatively cancellable, like settle
                 if stop is not None and stop.is_set():
                     return self._record_wait(False)                 # cancelled mid-sweep -> not done, do NOT latch
-                self._scan_done = True       # latch the saturated done reading (matches the real backend)
-                self._firing = None
+                with self._wire_lock:
+                    self._scan_done = True   # latch the saturated done reading (matches the real backend)
+                    self._firing = None
                 return self._record_wait(True)
             if timeout is None:
                 from .sequencer import WAIT_FOREVER_MESSAGE
@@ -1781,14 +1812,16 @@ class VirtualSequencer(SequencerDevice):
         parks the outputs whatever was running) -- not only when a repeat_forever ``_firing`` was
         set.  A finite single-pass streamed scan leaves ``_firing`` None yet still must be parked
         on Stop, and a redundant safe-state on an already-idle streamer is a harmless no-op."""
+        with self._wire_lock:
+            self._firing = None
         self.service.set_safe_state()
-        self._firing = None
         # Safe state PARKS the output pins (DAC mid-code = signed 0): the held word of the last
         # fire is gone, so a free-running monitor now images the safe-state (all-zero) levels.
-        self._last_fired = None
-        self._scan_info = None
-        self._scan_done = False
-        self._scan_fire_time = 0.0
+        with self._wire_lock:
+            self._last_fired = None
+            self._scan_info = None
+            self._scan_done = False
+            self._scan_fire_time = 0.0
 
     def snapshot(self) -> dict[str, object]:
         # The composed service's snapshot carries the PROTOCOL state (state / cache_prepared /
@@ -1798,6 +1831,8 @@ class VirtualSequencer(SequencerDevice):
         # compiler lanes have separate keys; ``channels`` no longer changes
         # meaning between backends.
         out = {**self.service.snapshot(), **super().snapshot()}
+        with self._wire_lock:
+            firing = self._firing
         out.update({
             "raw_channels": list(self.port_catalog.raw_lanes),
             "port_catalog": self.port_catalog.to_dict(),
@@ -1805,7 +1840,7 @@ class VirtualSequencer(SequencerDevice):
             "clock_hz": self.clock_hz,
             "sleep_scale": self.sleep_scale,
             "runs": sum(1 for row in self.history if row["action"] == "fire"),
-            "firing": None if self._firing is None else self._firing.name,
+            "firing": None if firing is None else firing.name,
         })
         return out
 

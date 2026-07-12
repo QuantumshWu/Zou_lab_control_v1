@@ -95,6 +95,8 @@ class _FakeDcam:
         self._ring = ring                       # nFrameCount schedule for cap_transferinfo (B4)
         self._ready = list(frames_ready or [])   # per-wait: True = a frame is ready
         self._count = 0
+        self.cap_stop_ok = True
+        self.buf_release_ok = True
 
     # --- lifecycle
     def dev_open(self):
@@ -117,10 +119,10 @@ class _FakeDcam:
         return self._alive()
 
     def cap_stop(self):
-        return True
+        return self.cap_stop_ok
 
     def buf_release(self):
-        return True
+        return self.buf_release_ok
 
     def wait_capevent_frameready(self, timeout_ms):
         if not self._alive():
@@ -198,6 +200,33 @@ def test_discover_while_camera_open_keeps_camera_alive():
     assert api.uninit_calls == 1
 
 
+def test_open_settings_failure_rolls_back_handle_and_runtime_reference(monkeypatch):
+    _fresh_refcount()
+    api = _FakeApi()
+    dcam = _FakeDcam(api)
+    fake_module = types.SimpleNamespace(
+        Dcamapi=api,
+        Dcam=lambda index=0: dcam,
+    )
+    monkeypatch.setattr(qcmos_mod.importlib, "import_module", lambda _name: fake_module)
+    cam = QCMOSCamera()
+    monkeypatch.setattr(
+        cam,
+        "_write_settings",
+        lambda: (_ for _ in ()).throw(RuntimeError("injected settings failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="injected settings failure"):
+        cam.open()
+
+    assert cam._dcam is None
+    assert cam._api is None
+    assert cam._module is None
+    assert not dcam._opened
+    assert api.uninit_calls == 1
+    assert id(api) not in qcmos_mod._DCAM_API_REFCOUNT
+
+
 def test_discover_adopts_already_initialised_runtime_without_uninit():
     """An ALREADYINITIALIZED runtime (initialised outside this counter -- an external script that
     owns it) is ADOPTED, not reported as a failure: discovery enumerates, and its release-to-zero
@@ -259,6 +288,23 @@ def _grab_camera(api, dcam):
     cam._api = api
     cam._dcam = dcam
     return cam
+
+
+@pytest.mark.parametrize("failed_step", ("cap_stop", "buf_release"))
+def test_qcmos_disarm_requires_both_driver_acknowledgements(failed_step):
+    api = _FakeApi(already_initialised=True)
+    dcam = _FakeDcam(api)
+    cam = _grab_camera(api, dcam)
+    cam.arm(1)
+    if failed_step == "cap_stop":
+        dcam.cap_stop_ok = False
+    else:
+        dcam.buf_release_ok = False
+
+    with pytest.raises(RuntimeError, match=failed_step):
+        cam.disarm()
+
+    assert cam._recent_state()["armed"] is False
 
 
 def _read_via_contract(cam, frames, n, *, timeout, stop=None):

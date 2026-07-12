@@ -1515,12 +1515,30 @@ class RemoteSequencer(SequencerDevice):
         self.clock_hz = remote_clock_hz
         return self
 
+    @property
+    def is_open(self) -> bool:
+        connection = self._conn
+        return bool(
+            connection is not None
+            and not getattr(connection, "closed", False)
+            and self.port_catalog is not None
+            and self.clock_hz is not None
+        )
+
+    def _require_live_connection(self):
+        if not self.is_open:
+            raise RuntimeError(
+                "RemoteSequencer connection is not established; reconnect only through "
+                "the installation ConnectionEstablishmentClaim/RecoveryClaim"
+            )
+        return self._conn
+
     def prepare(self, sequence: PulseSequence | PulseTableState) -> RuntimeSequenceProgram:
-        self.open()
+        connection = self._require_live_connection()
         step = 1e9 / float(self.clock_hz)
         head, blobs = encode_wire_payload(
             timing_payload_to_dict(sequence, time_step_ns=step), _WIRE_ARRAY_FIELDS_PAYLOAD)
-        prog_head, prog_blobs = self._conn.root.prepare(head, blobs)
+        prog_head, prog_blobs = connection.root.prepare(head, blobs)
         self._last_program = RuntimeSequenceProgram.from_dict(decode_wire_payload(prog_head, prog_blobs))
         if self._last_program.port_catalog_fingerprint != self.port_catalog.fingerprint:
             raise RuntimeError(
@@ -1530,40 +1548,34 @@ class RemoteSequencer(SequencerDevice):
         return self._last_program
 
     def fire(self, sequence: PulseSequence | PulseTableState | None = None) -> None:
-        self.open()
+        connection = self._require_live_connection()
         step = 1e9 / float(self.clock_hz)
         if sequence is None:
-            self._conn.root.fire(None, None)
+            connection.root.fire(None, None)
         else:
             head, blobs = encode_wire_payload(
                 timing_payload_to_dict(sequence, time_step_ns=step), _WIRE_ARRAY_FIELDS_PAYLOAD)
-            self._conn.root.fire(head, blobs)
+            connection.root.fire(head, blobs)
 
     def wait_done(self, timeout: float | None = None, *, stop=None) -> bool:
-        self.open()
+        connection = self._require_live_connection()
         # ``stop`` is accepted for the uniform sequencer contract; the actual wait is server-side (the AXI
         # backend's wait_done_callback), bounded by ``timeout`` + the RPyC transport, so cancellation across
         # the RPyC boundary is not threaded here -- a Stop lands when the bounded remote call returns.
-        return bool(self._conn.root.wait_done(timeout))
+        return bool(connection.root.wait_done(timeout))
 
     def scan_progress(self) -> dict:
         # Lightweight poll for the GUI's live scan progress.  This is a required
         # server capability: pretending an old/incompatible server is idle hides
         # both version skew and a running experiment.
-        self.open()
-        return dict(self._conn.root.scan_progress())
+        connection = self._require_live_connection()
+        return dict(connection.root.scan_progress())
 
     def abort(self) -> None:
-        # Reconnect first, exactly like fire/wait_done/set_safe_state.  abort runs
-        # on the error / safing path -- precisely when a server restart or network
-        # drop may have killed the link.  A bare "if self._conn is not None" would
-        # silently no-op on a dropped connection and leave the FPGA outputs running.
-        self.open()
-        self._conn.root.abort()
+        self._require_live_connection().root.abort()
 
     def set_safe_state(self) -> None:
-        self.open()
-        self._conn.root.set_safe_state()
+        self._require_live_connection().root.set_safe_state()
 
     def snapshot(self) -> dict[str, object]:
         out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot

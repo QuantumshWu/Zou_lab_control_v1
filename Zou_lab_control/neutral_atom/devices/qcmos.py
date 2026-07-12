@@ -319,14 +319,33 @@ class QCMOSCamera(CameraDevice):
         self._module = mod
         self._api = api
         self._dcam = dcam
-        self._write_settings()
+        try:
+            self._write_settings()
+        except BaseException:
+            try:
+                dcam.dev_close()
+            finally:
+                self._dcam = None
+                self._module = None
+                self._api = None
+                _dcam_release(api)
+            raise
         return self
 
     @property
     def is_open(self) -> bool:
         """Live once :meth:`open` holds a DCAM handle -- the predicate the base ``ensure_open`` reads
         to lazily open on first ``arm`` (single-sourced with the pylon / virtual camera invariant)."""
-        return self._dcam is not None
+        dcam = self._dcam
+        if dcam is None:
+            return False
+        check = getattr(dcam, "is_opened", None)
+        if callable(check):
+            try:
+                return bool(check())
+            except BaseException:
+                return False
+        return True
 
     # ------------------------------------------------------------------ acquisition hooks
     # The public acquisition surface (arm / read_frames / disarm / acquire) lives on the
@@ -413,13 +432,21 @@ class QCMOSCamera(CameraDevice):
         dcam = self._dcam
         if dcam is None:
             return
+        stop_ok = False
+        release_ok = False
         try:
-            dcam.cap_stop()
+            stop_ok = dcam.cap_stop() is True
         finally:
-            try:
-                dcam.buf_release()
-            except Exception:
-                pass
+            release_ok = dcam.buf_release() is True
+        if not stop_ok or not release_ok:
+            failed = []
+            if not stop_ok:
+                failed.append("cap_stop")
+            if not release_ok:
+                failed.append("buf_release")
+            raise RuntimeError(
+                "qCMOS disarm did not acknowledge " + " and ".join(failed)
+            )
 
     def _set_prop(self, idprop, value, name: str, *, verify: bool = False) -> None:
         """Write a DCAM property and FAIL LOUDLY if the camera rejects it.
@@ -534,6 +561,7 @@ class QCMOSCamera(CameraDevice):
                 _dcam_release(self._api)
             finally:
                 self._api = None
+        self._module = None
 
     def stop(self) -> None:
         if self._dcam is not None:
