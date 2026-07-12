@@ -11,11 +11,14 @@ from .canonical import (
     encode,
     sha256_digest,
 )
+from .framed_journal import FramedJournal, JournalCorruptionError
 
 __all__ = [
     "CANONICAL_MEDIA_TYPE",
     "CanonicalEncodingError",
     "canonical_digest",
+    "FramedJournal",
+    "JournalCorruptionError",
     "decode",
     "encode",
     "sha256_digest",
