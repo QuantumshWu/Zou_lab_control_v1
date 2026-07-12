@@ -197,12 +197,20 @@ class CameraCaptureDescription:
     source_id: str
     payload_contract: CameraSampleContract
     settings_fingerprint: str
+    trigger_channels: tuple[str, ...]
 
     def __post_init__(self) -> None:
         _canonical_text(self.source_id, "source_id")
         if not isinstance(self.payload_contract, CameraSampleContract):
             raise TypeError("payload_contract must be CameraSampleContract")
         _sha256(self.settings_fingerprint, "settings_fingerprint")
+        channels = tuple(
+            _canonical_text(channel, "trigger channel")
+            for channel in self.trigger_channels
+        )
+        if not channels or len(channels) != len(set(channels)):
+            raise ValueError("camera trigger channels must be unique and non-empty")
+        object.__setattr__(self, "trigger_channels", channels)
 
 
 @dataclass(frozen=True)
@@ -313,6 +321,7 @@ class CameraCaptureEndpoint:
             self._source_id,
             self.payload_contract(binding),
             self.settings_fingerprint(binding),
+            tuple(self._camera.effective_trigger_channels),
         )
 
     def payload_contract(self, binding: BoundDevice) -> CameraSampleContract:

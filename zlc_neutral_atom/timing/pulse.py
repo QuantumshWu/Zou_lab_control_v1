@@ -8,7 +8,12 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 
-from zlc_pulse import CompiledPulseArtifact, PulseDocument, PulseExecutionForm
+from zlc_pulse import (
+    CompiledPulseArtifact,
+    PulseDocument,
+    PulseExecutionForm,
+    PulseTarget,
+)
 
 from zlc_neutral_atom.runtime import (
     BoundDevice,
@@ -77,7 +82,7 @@ class SequencerCapabilitySnapshot:
     binding_id: str
     stable_device_identity: str
     connection_generation: str
-    target_abi_fingerprint: str
+    target: PulseTarget
     clock_hz: float
     geometry_fingerprint: int
     max_blocking_call_seconds: float
@@ -86,7 +91,8 @@ class SequencerCapabilitySnapshot:
     def __post_init__(self) -> None:
         for field in ("binding_id", "stable_device_identity", "connection_generation"):
             _text(getattr(self, field), field)
-        _sha256(self.target_abi_fingerprint, "target_abi_fingerprint")
+        if not isinstance(self.target, PulseTarget):
+            raise TypeError("target must be PulseTarget")
         object.__setattr__(self, "clock_hz", _positive_float(self.clock_hz, "clock_hz"))
         if (
             isinstance(self.geometry_fingerprint, bool)
@@ -100,6 +106,10 @@ class SequencerCapabilitySnapshot:
             _positive_float(self.max_blocking_call_seconds, "max_blocking_call_seconds"),
         )
         _sha256(self.capability_fingerprint, "capability_fingerprint")
+
+    @property
+    def target_abi_fingerprint(self) -> str:
+        return self.target.abi_fingerprint
 
 
 @dataclass(frozen=True)

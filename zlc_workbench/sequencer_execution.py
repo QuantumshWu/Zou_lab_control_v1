@@ -135,7 +135,7 @@ class VirtualSequencerExecutionEndpoint:
                 binding.binding_id,
                 binding.stable_device_identity,
                 binding.connection_generation,
-                self._target.abi_fingerprint,
+                self._target,
                 float(self._sequencer.clock_hz),
                 self._geometry,
                 self._timeout,
@@ -344,7 +344,7 @@ def bind_sequencer_port(
     if not isinstance(capability, SequencerCapabilitySnapshot):
         raise TypeError("sequencer capability attestation has the wrong snapshot type")
     if (
-        capability.target_abi_fingerprint != description.target.abi_fingerprint
+        capability.target != description.target
         or capability.clock_hz != description.clock_hz
         or capability.geometry_fingerprint != description.geometry_fingerprint
     ):

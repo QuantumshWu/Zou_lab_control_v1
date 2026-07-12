@@ -562,6 +562,31 @@ class LegacyNeutralAtomRuntime:
         )
         return _bind_camera_measurement(device_set, registry, request)
 
+    def describe_camera(self, role: str):
+        if not isinstance(role, str) or not role or role.strip() != role:
+            raise ValueError("camera role must be canonical non-empty text")
+        with self._lock:
+            self._ensure_open()
+            device_set = self._device_set
+            registry = self.registry
+            devices = dict(getattr(device_set, "devices", {}) or {})
+            try:
+                camera = devices[role]
+            except KeyError as exc:
+                raise KeyError(f"camera role {role!r} is absent from installation") from exc
+        self._ensure_connections(
+            (camera,),
+            registry=registry,
+            device_set=device_set,
+        )
+        registration = registry.registration_for(camera)
+        target = registration.target_endpoint
+        if target is None:
+            raise RuntimeError(f"camera role {role!r} has no target capture endpoint")
+        binding = registry.binding_for(camera)
+        registry.broker.verify_capability(binding)
+        return target.describe(binding)
+
     def bind_sequencer_port(
         self,
         request: SequencerBindingRequest = SequencerBindingRequest(),
