@@ -50,8 +50,10 @@ class PulseStreamerSessionBackend:
         self._target = target
         self._params = params
         self._clock_hz = float(clock_hz)
+        self._prepared_artifact: CompiledPulseArtifact | None = None
 
     def prepare(self, artifact: CompiledPulseArtifact) -> None:
+        self._prepared_artifact = None
         validate_artifact_for_deployment(
             artifact,
             self._target,
@@ -59,15 +61,27 @@ class PulseStreamerSessionBackend:
             self._clock_hz,
         )
         self._session.prepare_compiled_artifact(artifact)
+        self._prepared_artifact = artifact
 
     def fire(self, artifact: CompiledPulseArtifact) -> None:
+        if artifact is not self._prepared_artifact:
+            raise RuntimeError(
+                "FIRE artifact is not the exact immutable artifact prepared by this backend"
+            )
         self._session.fire_compiled_artifact(artifact)
 
     def wait_done(self, artifact: CompiledPulseArtifact, timeout: float | None) -> bool:
+        if artifact is not self._prepared_artifact:
+            raise RuntimeError(
+                "completion artifact is not the exact immutable prepared artifact"
+            )
         return bool(self._session.wait_done_compiled_artifact(artifact, timeout))
 
     def safe_state(self) -> None:
-        self._session.safe_state()
+        try:
+            self._session.safe_state()
+        finally:
+            self._prepared_artifact = None
 
     def snapshot(self) -> dict[str, object]:
         return dict(self._session.current_snapshot())

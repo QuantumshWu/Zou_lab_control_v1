@@ -347,6 +347,47 @@ def test_public_backend_rejects_a_permissive_wrong_deployment_session():
     assert session.prepared == []
 
 
+def test_public_backend_cannot_swap_artifacts_after_successful_prepare():
+    params = StreamerParams()
+    document, artifact = _artifact(params)
+
+    class PermissiveSession:
+        def __init__(self):
+            self.events = []
+
+        def prepare_compiled_artifact(self, value):
+            self.events.append(("prepare", value))
+
+        def fire_compiled_artifact(self, value):
+            self.events.append(("fire", value))
+
+        def wait_done_compiled_artifact(self, value, timeout=None):
+            self.events.append(("wait", value))
+            return True
+
+        def safe_state(self):
+            self.events.append(("safe", None))
+
+        def current_snapshot(self):
+            return {}
+
+    session = PermissiveSession()
+    backend = PulseStreamerSessionBackend(
+        session,
+        document.target,
+        params,
+        50e6,
+    )
+    backend.prepare(artifact)
+    equal_but_unprepared = replace(artifact)
+
+    with pytest.raises(RuntimeError, match="exact immutable artifact"):
+        backend.fire(equal_but_unprepared)
+    with pytest.raises(RuntimeError, match="exact immutable prepared artifact"):
+        backend.wait_done(equal_but_unprepared, 1.0)
+    assert [event for event, _value in session.events] == ["prepare"]
+
+
 def test_safe_state_never_claims_a_live_refill_owner_terminated():
     class LiveThread:
         @staticmethod
