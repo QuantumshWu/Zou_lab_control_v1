@@ -13,9 +13,11 @@ from zlc_storage import canonical_digest, decode, encode
 
 from .artifact import (
     CompiledPulseArtifact,
+    PulseExecutionForm,
     compiled_pulse_artifact_from_tree,
     compiled_pulse_artifact_to_tree,
 )
+from .fpga import pack_target_ir
 from .target import PulseTarget, pulse_target_to_tree
 
 
@@ -199,6 +201,8 @@ class PulseExecutionService:
             raise ValueError("timeout must be finite and positive or None")
         with self._lock:
             artifact = self._require_prepared(reference, expected_state="RUNNING")
+            if artifact.execution_form is PulseExecutionForm.CONTINUOUS_MONITOR:
+                raise RuntimeError("continuous pulse execution has no logical completion; use safe_state")
             self._state = "COMPLETING"
             try:
                 done = bool(self._backend.wait_done(artifact, timeout))
@@ -247,6 +251,8 @@ class PulseExecutionService:
             raise ValueError("compiled artifact clock differs from deployed clock")
         if artifact.wire_image.geometry_fingerprint != self._geometry_fingerprint:
             raise ValueError("compiled artifact geometry differs from deployed geometry")
+        if artifact.wire_image != pack_target_ir(artifact.target_ir, self._params):
+            raise ValueError("compiled artifact wire image differs from deterministic TargetIR packing")
 
     def _require_prepared(
         self,

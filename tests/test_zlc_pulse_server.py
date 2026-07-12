@@ -7,6 +7,8 @@ import pytest
 
 from fpga.pulse_streamer.host.image import StreamerParams
 from zlc_pulse import (
+    CompiledPulseArtifact,
+    PulseWireImage,
     PulseExecutionForm,
     PulseExecutionService,
     compile_pulse_artifact,
@@ -53,13 +55,13 @@ class RecordingBackend:
         return {"prepared": self.prepared is not None}
 
 
-def _artifact(params=None):
+def _artifact(params=None, execution_form=PulseExecutionForm.STATIC_ONCE):
     document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     return compile_pulse_artifact(
         document,
         clock_hz=50e6,
-        execution_form=PulseExecutionForm.STATIC_ONCE,
-        trigger_channels=("emCCD",),
+        execution_form=execution_form,
+        trigger_channels=() if execution_form is PulseExecutionForm.CONTINUOUS_MONITOR else ("emCCD",),
         params=params,
     )
 
@@ -124,6 +126,36 @@ def test_stale_generation_and_geometry_fail_before_backend_prepare():
     assert [action[0] for action in backend.actions] == ["prepare", "safe"]
 
 
+def test_wire_image_must_equal_the_deterministic_current_ir_packing():
+    artifact = _artifact()
+    words = list(artifact.wire_image.words)
+    address, value = words[-1]
+    words[-1] = (address, value ^ 1)
+    tampered = CompiledPulseArtifact(
+        artifact.source_document_digest,
+        artifact.compiler_id,
+        artifact.compiler_version,
+        artifact.execution_form,
+        artifact.target_ir,
+        PulseWireImage(
+            artifact.wire_image.geometry_fingerprint,
+            artifact.wire_image.source_ir_digest,
+            tuple(words),
+        ),
+        artifact.trigger_schedules,
+    )
+    backend = RecordingBackend()
+    service = PulseExecutionService(
+        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        clock_hz=50e6,
+        backend=backend,
+    )
+
+    with pytest.raises(ValueError, match="deterministic TargetIR packing"):
+        service.prepare(tampered)
+    assert backend.actions == []
+
+
 def test_timeout_is_not_reported_as_a_completed_schedule():
     artifact = _artifact()
     backend = RecordingBackend()
@@ -146,6 +178,23 @@ def test_timeout_is_not_reported_as_a_completed_schedule():
         service.prepare(artifact)
     service.safe_state()
     assert service.prepare(artifact).artifact_digest == artifact.fingerprint
+
+
+def test_continuous_execution_has_no_false_logical_completion():
+    artifact = _artifact(execution_form=PulseExecutionForm.CONTINUOUS_MONITOR)
+    backend = RecordingBackend()
+    service = PulseExecutionService(
+        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        clock_hz=50e6,
+        backend=backend,
+    )
+    reference = service.prepare(artifact)
+    service.fire(reference)
+
+    with pytest.raises(RuntimeError, match="no logical completion"):
+        service.complete(reference, timeout=1.0)
+    assert [action[0] for action in backend.actions] == ["prepare", "fire"]
+    assert service.snapshot()["state"] == "RUNNING"
 
 
 def test_failed_safe_is_never_published_as_safe():
