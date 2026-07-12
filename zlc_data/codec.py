@@ -9,7 +9,7 @@ import numpy as np
 from zlc_storage.canonical import canonical_digest, decode, encode
 
 from .axis import AxisId, AxisRoleId, AxisSpec, CoordinateFrameId
-from .layout import PointLayout, PointLayoutMode
+from .layout import AxisLayout, AxisLayoutMode, PointLayout
 from .schema import DatasetSchema, ValueSchema
 from .validity import (
     INVALID,
@@ -156,11 +156,19 @@ def dataset_schema_from_tree(tree: Any) -> DatasetSchema:
     )
 
 
-def point_layout_to_tree(layout: PointLayout) -> dict[str, Any]:
-    """Project a PointLayout using its zlc_data-owned canonical field model."""
+def axis_layout_to_tree(layout: AxisLayout) -> dict[str, Any]:
+    """Project any zlc_data axis layout using its single canonical field model."""
 
-    if not isinstance(layout, PointLayout):
-        raise TypeError("layout must be PointLayout")
+    if not isinstance(layout, AxisLayout):
+        raise TypeError("layout must be AxisLayout")
+    if layout.mode is AxisLayoutMode.PRODUCT:
+        assert layout.factors is not None
+        return {
+            "logical_shape": list(layout.logical_shape),
+            "mode": layout.mode.value,
+            "storage_size": layout.storage_size,
+            "factors": [axis_layout_to_tree(factor) for factor in layout.factors],
+        }
     return {
         "logical_shape": list(layout.logical_shape),
         "mode": layout.mode.value,
@@ -171,9 +179,50 @@ def point_layout_to_tree(layout: PointLayout) -> dict[str, Any]:
     }
 
 
-def point_layout_from_tree(tree: Any) -> PointLayout:
-    """Reconstruct a PointLayout from its exact owner-defined field set."""
+def axis_layout_from_tree(tree: Any) -> AxisLayout:
+    """Reconstruct a generic axis layout from its exact owner-defined fields."""
 
+    if isinstance(tree, dict) and tree.get("mode") == AxisLayoutMode.PRODUCT.value:
+        if set(tree) != {"logical_shape", "mode", "storage_size", "factors"}:
+            raise ValueError("invalid PRODUCT AxisLayout field set")
+        factors = tree["factors"]
+        shape = tree["logical_shape"]
+        if not isinstance(factors, list) or not isinstance(shape, list):
+            raise ValueError("PRODUCT AxisLayout factors/shape must be lists")
+        layout = AxisLayout.product(*(axis_layout_from_tree(item) for item in factors))
+        if layout.mode is not AxisLayoutMode.PRODUCT:
+            raise ValueError("PRODUCT AxisLayout has a non-canonical factorization")
+        if layout.logical_shape != tuple(_integer(item, "logical shape") for item in shape):
+            raise ValueError("PRODUCT AxisLayout logical_shape is non-canonical")
+        if layout.storage_size != _integer(tree["storage_size"], "storage_size"):
+            raise ValueError("PRODUCT AxisLayout storage_size is non-canonical")
+        if axis_layout_to_tree(layout) != tree:
+            raise ValueError("PRODUCT AxisLayout tree is non-canonical")
+        return layout
+    shape, mode, storage_size, mapping = _axis_layout_fields(tree)
+    return AxisLayout(shape, mode, storage_size, mapping)
+
+
+def point_layout_to_tree(layout: PointLayout) -> dict[str, Any]:
+    """Project a dataset PointLayout through the generic owner serializer."""
+
+    if not isinstance(layout, PointLayout):
+        raise TypeError("layout must be PointLayout")
+    return axis_layout_to_tree(layout)
+
+
+def point_layout_from_tree(tree: Any) -> PointLayout:
+    """Reconstruct the non-empty dataset specialization of AxisLayout."""
+
+    shape, mode, storage_size, mapping = _axis_layout_fields(tree)
+    if mode is AxisLayoutMode.PRODUCT:
+        raise ValueError("PointLayout cannot be PRODUCT")
+    return PointLayout(shape, mode, storage_size, mapping)
+
+
+def _axis_layout_fields(
+    tree: Any,
+) -> tuple[tuple[int, ...], AxisLayoutMode, int, tuple[tuple[int, ...], ...] | None]:
     if not isinstance(tree, dict) or set(tree) != {
         "logical_shape",
         "mode",
@@ -187,11 +236,11 @@ def point_layout_from_tree(tree: Any) -> PointLayout:
         raise ValueError("point layout logical_shape must be a list")
     if mapping_data is not None and not isinstance(mapping_data, list):
         raise ValueError("point layout storage_to_multi must be a list or null")
-    return PointLayout(
-        logical_shape=tuple(_integer(size, "logical shape") for size in shape_data),
-        mode=PointLayoutMode(_text(tree["mode"], "layout mode")),
-        storage_size=_integer(tree["storage_size"], "storage_size"),
-        storage_to_multi=None
+    return (
+        tuple(_integer(size, "logical shape") for size in shape_data),
+        AxisLayoutMode(_text(tree["mode"], "layout mode")),
+        _integer(tree["storage_size"], "storage_size"),
+        None
         if mapping_data is None
         else tuple(
             tuple(_integer(index, "multi-index") for index in item)
