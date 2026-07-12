@@ -34,6 +34,7 @@ from Zou_lab_control.neutral_atom.devices.virtual import (
     VirtualTrapArray,
 )
 from zlc_neutral_atom.runtime import (
+    BoundMeasurement,
     CleanupStepAck,
     ConnectionEstablishmentLease,
     DeviceBroker,
@@ -52,6 +53,11 @@ from zlc_neutral_atom.runtime import (
 from zlc_storage import canonical_digest
 
 from .asset_map import InstallationAsset, InstallationAssetMap
+from .camera_capture import (
+    CameraCaptureBindingRequest,
+    CameraCaptureEndpoint,
+    bind_camera_measurement as _bind_camera_measurement,
+)
 from .legacy_runtime import (
     LegacyDeviceRegistration,
     LegacyDeviceRegistry,
@@ -525,6 +531,32 @@ class LegacyNeutralAtomRuntime:
             device_set=self._device_set,
         )
 
+    def bind_camera_measurement(
+        self,
+        request: CameraCaptureBindingRequest,
+    ) -> BoundMeasurement:
+        """Resolve a typed camera request without exposing the installation raw graph."""
+
+        if not isinstance(request, CameraCaptureBindingRequest):
+            raise TypeError("request must be CameraCaptureBindingRequest")
+        with self._lock:
+            self._ensure_open()
+            device_set = self._device_set
+            registry = self.registry
+            devices = dict(getattr(device_set, "devices", {}) or {})
+            try:
+                camera = devices[request.role]
+            except KeyError as exc:
+                raise KeyError(
+                    f"camera role {request.role!r} is absent from installation"
+                ) from exc
+        self._ensure_connections(
+            (camera,),
+            registry=registry,
+            device_set=device_set,
+        )
+        return _bind_camera_measurement(device_set, registry, request)
+
     def _ensure_connections(self, devices, *, registry, device_set) -> bool:
         if not isinstance(registry, LegacyDeviceRegistry):
             raise TypeError("registry must be LegacyDeviceRegistry")
@@ -854,6 +886,7 @@ def _registration_for(
     if type(device) is QCMOSCamera:
         identity_probe = _qcmos_identity_probe(device, asset, asset_map_revision)
         cleanup, verify = _qcmos_safe_contract(device, key)
+        endpoint = CameraCaptureEndpoint(device, role)
         return LegacyDeviceRegistration(
             device,
             key,
@@ -861,10 +894,12 @@ def _registration_for(
             {SafetyOperation.DISARM: cleanup},
             (SafetyOperation.DISARM,),
             verify,
+            target_endpoint=endpoint.target_endpoint,
         )
     if type(device) is PylonCamera:
         identity_probe = _pylon_identity_probe(device, asset, asset_map_revision)
         cleanup, verify = _pylon_safe_contract(device, key)
+        endpoint = CameraCaptureEndpoint(device, role)
         return LegacyDeviceRegistration(
             device,
             key,
@@ -872,10 +907,12 @@ def _registration_for(
             {SafetyOperation.DISARM: cleanup},
             (SafetyOperation.DISARM,),
             verify,
+            target_endpoint=endpoint.target_endpoint,
         )
     if type(device) in {VirtualCamera, VirtualMotCamera}:
         identity_probe = _installation_identity_probe(asset, asset_map_revision)
         cleanup, verify = _virtual_camera_safe_contract(device, key)
+        endpoint = CameraCaptureEndpoint(device, role)
         return LegacyDeviceRegistration(
             device,
             key,
@@ -883,6 +920,7 @@ def _registration_for(
             {SafetyOperation.DISARM: cleanup},
             (SafetyOperation.DISARM,),
             verify,
+            target_endpoint=endpoint.target_endpoint,
         )
     if type(device) is VirtualSequencer:
         identity_probe = _installation_identity_probe(asset, asset_map_revision)

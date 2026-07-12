@@ -73,6 +73,49 @@ class LegacyRuntimeTransition(RuntimeError):
 
 
 @dataclass(frozen=True)
+class TargetDeviceEndpoint:
+    """Typed target-runtime callbacks for one composition-owned raw device.
+
+    The registry supplies the exact :class:`BoundDevice` from a private closure,
+    so an adapter never needs a mutable post-bind locator and cannot publish its
+    raw driver through a capability snapshot.
+    """
+
+    execute_command: Callable[[BoundDevice, object], object]
+    capability_probe: Callable[[BoundDevice], object]
+    close_session: Callable[[BoundDevice, object], object]
+    describe: Callable[[BoundDevice], object]
+    interrupt_operations: Mapping[SafetyOperation, Callable[[], object]]
+
+    def __post_init__(self) -> None:
+        for field in (
+            "execute_command",
+            "capability_probe",
+            "close_session",
+            "describe",
+        ):
+            if not callable(getattr(self, field)):
+                raise TypeError(f"target endpoint {field} must be callable")
+        operations = dict(self.interrupt_operations)
+        for operation, callback in operations.items():
+            if operation not in (
+                SafetyOperation.ABORT,
+                SafetyOperation.DISARM,
+                SafetyOperation.SAFE_STATE,
+            ):
+                raise ValueError(
+                    "target endpoint interrupt must be ABORT, DISARM, or SAFE_STATE"
+                )
+            if not callable(callback):
+                raise TypeError("target endpoint interrupt callback must be callable")
+        object.__setattr__(
+            self,
+            "interrupt_operations",
+            MappingProxyType(operations),
+        )
+
+
+@dataclass(frozen=True)
 class LegacyDeviceRegistration:
     """Composition-owned mapping from one raw old device to target runtime facts.
 
@@ -89,6 +132,7 @@ class LegacyDeviceRegistration:
     verify_safe_state: Callable[[], SafeStateAck] | None
     hazardous: bool = True
     admission_check: Callable[[], None] | None = None
+    target_endpoint: TargetDeviceEndpoint | None = None
 
     def __post_init__(self) -> None:
         if self.device is None:
@@ -110,6 +154,10 @@ class LegacyDeviceRegistration:
             raise TypeError("hazardous must be bool")
         if self.admission_check is not None and not callable(self.admission_check):
             raise TypeError("admission_check must be callable or None")
+        if self.target_endpoint is not None and not isinstance(
+            self.target_endpoint, TargetDeviceEndpoint
+        ):
+            raise TypeError("target_endpoint must be TargetDeviceEndpoint or None")
         if self.hazardous:
             if not callable(self.verify_safe_state):
                 raise TypeError("hazardous legacy devices require verify_safe_state")
@@ -208,17 +256,53 @@ class LegacyDeviceRegistry:
         lookup = id(registration.device)
         with self._lock:
             identity = self._broker.verify_identity(registration.identity_probe)
+            target = registration.target_endpoint
+            holder: dict[str, BoundDevice] = {}
+
+            def current_binding() -> BoundDevice:
+                try:
+                    return holder["binding"]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        "target endpoint was invoked before broker publication"
+                    ) from exc
+
+            execute_command = (
+                _reject_direct_legacy_command
+                if target is None
+                else lambda command: target.execute_command(
+                    current_binding(), command
+                )
+            )
+            capability_probe = (
+                None
+                if target is None
+                else lambda: target.capability_probe(current_binding())
+            )
+            close_session = (
+                None
+                if target is None
+                else lambda command: target.close_session(
+                    current_binding(), command
+                )
+            )
             try:
                 binding = self._broker.bind(
                     key=registration.key,
                     identity=identity,
-                    execute_command=_reject_direct_legacy_command,
+                    execute_command=execute_command,
+                    capability_probe=capability_probe,
                     cleanup_operations=registration.cleanup_operations,
+                    close_session=close_session,
                     verify_safe_state=registration.verify_safe_state,
+                    interrupt_operations=(
+                        {} if target is None else target.interrupt_operations
+                    ),
                 )
             except BaseException:
                 self._broker.discard_verified_identity(identity)
                 raise
+            holder["binding"] = binding
             self._bindings[lookup] = binding
             return binding
 
@@ -953,4 +1037,5 @@ __all__ = [
     "LegacyRuntimeFence",
     "LegacyStopReceipt",
     "LegacyStopStatus",
+    "TargetDeviceEndpoint",
 ]
