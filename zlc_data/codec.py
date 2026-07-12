@@ -129,19 +129,11 @@ def value_schema_from_tree(tree: Any) -> ValueSchema:
 
 
 def dataset_schema_to_tree(schema: DatasetSchema) -> dict[str, Any]:
-    layout = schema.point_layout
     return {
         "schema": DATASET_SCHEMA,
         "repeat_axis": axis_to_tree(schema.repeat_axis),
         "point_axes": [axis_to_tree(axis) for axis in schema.point_axes],
-        "point_layout": {
-            "logical_shape": list(layout.logical_shape),
-            "mode": layout.mode.value,
-            "storage_size": layout.storage_size,
-            "storage_to_multi": None
-            if layout.storage_to_multi is None
-            else [list(index) for index in layout.storage_to_multi],
-        },
+        "point_layout": point_layout_to_tree(schema.point_layout),
         "cell_schema": value_schema_to_tree(schema.cell_schema),
     }
 
@@ -155,33 +147,56 @@ def dataset_schema_from_tree(tree: Any) -> DatasetSchema:
     point_axes = data["point_axes"]
     if not isinstance(point_axes, list):
         raise ValueError("DatasetSchema point_axes must be a list")
-    layout_data = data["point_layout"]
-    if not isinstance(layout_data, dict) or set(layout_data) != {
-        "logical_shape",
-        "mode",
-        "storage_size",
-        "storage_to_multi",
-    }:
-        raise ValueError("invalid DatasetSchema point_layout")
-    shape_data = layout_data["logical_shape"]
-    mapping_data = layout_data["storage_to_multi"]
-    if not isinstance(shape_data, list):
-        raise ValueError("point layout logical_shape must be a list")
-    if mapping_data is not None and not isinstance(mapping_data, list):
-        raise ValueError("point layout storage_to_multi must be a list or null")
-    layout = PointLayout(
-        logical_shape=tuple(_integer(size, "logical shape") for size in shape_data),
-        mode=PointLayoutMode(_text(layout_data["mode"], "layout mode")),
-        storage_size=_integer(layout_data["storage_size"], "storage_size"),
-        storage_to_multi=None
-        if mapping_data is None
-        else tuple(tuple(_integer(index, "multi-index") for index in item) for item in mapping_data),
-    )
+    layout = point_layout_from_tree(data["point_layout"])
     return DatasetSchema(
         repeat_axis=axis_from_tree(data["repeat_axis"]),
         point_axes=tuple(axis_from_tree(axis) for axis in point_axes),
         point_layout=layout,
         cell_schema=value_schema_from_tree(data["cell_schema"]),
+    )
+
+
+def point_layout_to_tree(layout: PointLayout) -> dict[str, Any]:
+    """Project a PointLayout using its zlc_data-owned canonical field model."""
+
+    if not isinstance(layout, PointLayout):
+        raise TypeError("layout must be PointLayout")
+    return {
+        "logical_shape": list(layout.logical_shape),
+        "mode": layout.mode.value,
+        "storage_size": layout.storage_size,
+        "storage_to_multi": None
+        if layout.storage_to_multi is None
+        else [list(index) for index in layout.storage_to_multi],
+    }
+
+
+def point_layout_from_tree(tree: Any) -> PointLayout:
+    """Reconstruct a PointLayout from its exact owner-defined field set."""
+
+    if not isinstance(tree, dict) or set(tree) != {
+        "logical_shape",
+        "mode",
+        "storage_size",
+        "storage_to_multi",
+    }:
+        raise ValueError("invalid PointLayout field set")
+    shape_data = tree["logical_shape"]
+    mapping_data = tree["storage_to_multi"]
+    if not isinstance(shape_data, list):
+        raise ValueError("point layout logical_shape must be a list")
+    if mapping_data is not None and not isinstance(mapping_data, list):
+        raise ValueError("point layout storage_to_multi must be a list or null")
+    return PointLayout(
+        logical_shape=tuple(_integer(size, "logical shape") for size in shape_data),
+        mode=PointLayoutMode(_text(tree["mode"], "layout mode")),
+        storage_size=_integer(tree["storage_size"], "storage_size"),
+        storage_to_multi=None
+        if mapping_data is None
+        else tuple(
+            tuple(_integer(index, "multi-index") for index in item)
+            for item in mapping_data
+        ),
     )
 
 

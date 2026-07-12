@@ -2,6 +2,7 @@
 
 from .axis import (
     COMPONENT,
+    READOUT_EVENT,
     REPEAT,
     SCAN_POINT,
     SITE,
@@ -27,6 +28,8 @@ from .codec import (
     encode_dataset_schema,
     encode_data_block,
     encode_value,
+    point_layout_from_tree,
+    point_layout_to_tree,
     value_schema_fingerprint,
     value_schema_from_tree,
     value_schema_to_tree,
@@ -79,6 +82,7 @@ __all__ = [
     "OwnedSnapshot",
     "PointLayout",
     "PointLayoutMode",
+    "READOUT_EVENT",
     "REPEAT",
     "SCAN_POINT",
     "SITE",
@@ -110,6 +114,8 @@ __all__ = [
     "encode_value",
     "expand_dataset_validity",
     "expand_value_validity",
+    "point_layout_from_tree",
+    "point_layout_to_tree",
     "value_schema_fingerprint",
     "value_schema_from_tree",
     "value_schema_to_tree",

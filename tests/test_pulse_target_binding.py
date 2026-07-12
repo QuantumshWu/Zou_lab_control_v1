@@ -13,8 +13,8 @@ from zlc_pulse import (
     PulseTarget,
     bind_pulse_document_target,
     compile_pulse_artifact,
+    load_deployed_pulse_target,
     load_pulse_document,
-    load_pulse_target,
 )
 from zlc_pulse.deployment import APPROVED_DEPLOYED_TARGET_ABI
 
@@ -22,15 +22,9 @@ from zlc_pulse.deployment import APPROVED_DEPLOYED_TARGET_ABI
 ROOT = Path(__file__).parents[1]
 
 
-def test_every_shipped_document_and_board_manifest_share_one_target_tree():
-    target = load_pulse_target(ROOT / "pulses" / "deployed_target.json")
-    board_target = load_pulse_target(
-        ROOT / "fpga" / "board_config" / "pulse_target.json"
-    )
-    assert board_target == target
+def test_every_shipped_document_matches_the_packaged_deployment_target():
+    target = load_deployed_pulse_target()
     for path in sorted((ROOT / "pulses").glob("*.json")):
-        if path.name == "deployed_target.json":
-            continue
         assert load_pulse_document(path).target == target, path.name
 
 
@@ -48,7 +42,7 @@ def test_shipped_hardware_documents_embed_the_approved_deployment_target(
     form,
     trigger_channel,
 ):
-    target = load_pulse_target(ROOT / "pulses" / "deployed_target.json")
+    target = load_deployed_pulse_target()
     document = load_pulse_document(ROOT / "pulses" / filename)
 
     assert document.target == target
@@ -66,7 +60,7 @@ def test_shipped_hardware_documents_embed_the_approved_deployment_target(
 
 
 def test_binding_rekeys_referenced_ports_only_by_exact_physical_ownership():
-    live_target = load_pulse_target(ROOT / "pulses" / "deployed_target.json")
+    live_target = load_deployed_pulse_target()
     document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     authored_target = PulseTarget(
         live_target.raw_lanes,

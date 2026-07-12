@@ -20,7 +20,6 @@ from zlc_data import (
     DatasetSchema,
     PointLayout,
     REPEAT,
-    SCAN_POINT,
     SPATIAL_X,
     SPATIAL_Y,
     VALID,
@@ -221,6 +220,7 @@ class CameraCaptureBindingRequest:
     repeat_axis: AxisSpec
     point_axes: tuple[AxisSpec, ...]
     point_layout: PointLayout
+    expected_cells: tuple[DatasetCellAddress, ...]
     mode: CameraAcquisitionMode
     required_consumer_lag_events: int
     transport_memory_limit_bytes: int
@@ -232,13 +232,24 @@ class CameraCaptureBindingRequest:
         points = tuple(self.point_axes)
         if any(not isinstance(axis, AxisSpec) for axis in points):
             raise TypeError("point_axes must contain AxisSpec values")
-        if any(axis.role != SCAN_POINT for axis in points):
-            raise ValueError("every point axis must have the scan-point role")
         object.__setattr__(self, "point_axes", points)
         if not isinstance(self.point_layout, PointLayout):
             raise TypeError("point_layout must be PointLayout")
         if self.point_layout.logical_shape != tuple(axis.size for axis in points):
             raise ValueError("point_layout shape differs from point axes")
+        cells = tuple(self.expected_cells)
+        expected_domain = {
+            DatasetCellAddress(repeat, point)
+            for repeat in range(self.repeat_axis.size)
+            for point in range(self.point_layout.storage_size)
+        }
+        if len(cells) != len(expected_domain):
+            raise ValueError("expected_cells length differs from the dataset domain")
+        if any(not isinstance(cell, DatasetCellAddress) for cell in cells):
+            raise TypeError("expected_cells must contain DatasetCellAddress values")
+        if set(cells) != expected_domain:
+            raise ValueError("expected_cells must be a complete unique dataset permutation")
+        object.__setattr__(self, "expected_cells", cells)
         if not isinstance(self.mode, CameraAcquisitionMode):
             raise TypeError("mode must be CameraAcquisitionMode")
         lag = self.required_consumer_lag_events
@@ -703,11 +714,7 @@ def bind_camera_measurement(
         request.point_layout,
         payload_contract.value_schema,
     )
-    expected_cells = tuple(
-        DatasetCellAddress(repeat, point)
-        for repeat in range(dataset_schema.repeat_axis.size)
-        for point in range(dataset_schema.point_layout.storage_size)
-    )
+    expected_cells = request.expected_cells
     capture_contract = CaptureStreamContract(
         StreamId(f"camera.{request.role}.frames"),
         request.role,

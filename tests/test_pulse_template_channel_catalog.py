@@ -31,7 +31,7 @@ import sys
 
 import pytest
 from conftest import pulse_editor_for_test
-from zlc_pulse import load_pulse_document, load_pulse_target
+from zlc_pulse import load_deployed_pulse_target, load_pulse_document
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
@@ -43,7 +43,7 @@ from Zou_lab_control.neutral_atom.timing import (
     PulseTableState, resolve_fireable_template, single_imaging_template)
 
 CATALOG = list(DEFAULT_CHANNELS)
-DEPLOYED_TARGET = load_pulse_target(REPO_ROOT / "pulses" / "deployed_target.json")
+DEPLOYED_TARGET = load_deployed_pulse_target()
 TEMPLATE_FILES = (
     "mot_field_template.json",
     "imaging_template.json",

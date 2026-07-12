@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from zlc_pulse.target import (
@@ -12,9 +10,9 @@ from zlc_pulse.target import (
     PORT_DIGITAL,
     PulsePortSpec,
     PulseTarget,
+    load_deployed_pulse_target,
     pulse_target_from_tree,
     pulse_target_to_tree,
-    load_pulse_target,
 )
 
 
@@ -54,9 +52,7 @@ def test_target_current_tree_round_trips_and_labels_do_not_change_abi():
 
 
 def test_shipped_current_target_loads_without_neutral_import():
-    value = load_pulse_target(
-        Path(__file__).parents[1] / "pulses" / "deployed_target.json"
-    )
+    value = load_deployed_pulse_target()
     assert len(value.raw_lanes) == 62
     assert value.by_key["ch11"].kind == PORT_DIGITAL
     assert value.by_key["ch11"].label == "emCCD"

@@ -18,6 +18,7 @@ from zlc_neutral_atom.artifacts import (
     compile_capture_artifact_pipeline,
 )
 from zlc_neutral_atom.runtime import (
+    DatasetCellAddress,
     DatasetMaterializerSpec,
     MinimalPipelineSpec,
     PipelineMemoryProfile,
@@ -48,6 +49,7 @@ def _runtime_and_spec():
             _axis("repeat", REPEAT, 1),
             (_axis("point", SCAN_POINT, 2),),
             PointLayout.rect_c((2,)),
+            (DatasetCellAddress(0, 0), DatasetCellAddress(0, 1)),
             CameraAcquisitionMode.EXTERNAL_TRIGGERED,
             0,
             4 << 20,

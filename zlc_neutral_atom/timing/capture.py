@@ -18,7 +18,9 @@ from zlc_neutral_atom.runtime import (
     RunPlan,
     open_exact_capture,
 )
-from zlc_pulse import PulseExecutionForm
+from zlc_pulse import CompiledPulseArtifact, PulseExecutionForm
+
+from .capture_plan import CompiledCaptureCellPlan
 
 from .pulse import (
     BoundPulsePort,
@@ -34,6 +36,7 @@ class TriggeredCaptureSpec:
     pulse_port: BoundPulsePort
     pulse_request: FinitePulseExecutionRequest
     trigger_channel: str
+    cell_plan: CompiledCaptureCellPlan
 
     def __post_init__(self) -> None:
         if not isinstance(self.capture, MinimalPipelineSpec):
@@ -48,6 +51,8 @@ class TriggeredCaptureSpec:
             or self.trigger_channel.strip() != self.trigger_channel
         ):
             raise ValueError("trigger_channel must be canonical non-empty text")
+        if not isinstance(self.cell_plan, CompiledCaptureCellPlan):
+            raise TypeError("cell_plan must be CompiledCaptureCellPlan")
         camera_spec = decode_camera_capture_spec(
             self.capture.measurement.capture_spec
         )
@@ -60,8 +65,18 @@ class TriggeredCaptureSpec:
         )
         if len(schedules) != 1:
             raise ValueError("triggered capture requires exactly one compiled camera schedule")
+        plan = self.cell_plan
+        if plan.trigger_channel != self.trigger_channel:
+            raise ValueError("capture cell plan trigger channel differs")
+        contract = self.capture.measurement.capture_contract
+        plan.validate_against(
+            self.pulse_request.artifact,
+            contract.dataset_schema,
+        )
+        if plan.expected_cells != contract.expected_cells:
+            raise ValueError("capture cell plan permutation differs from capture contract")
         expected = self.capture.measurement.capture_contract.total_events
-        if schedules[0].total != expected:
+        if schedules[0].total != expected or plan.total_events != expected:
             raise ValueError(
                 f"compiled trigger count {schedules[0].total} differs from "
                 f"camera event budget {expected}"
@@ -81,28 +96,28 @@ class TriggeredPipelineResult:
     capture: PipelineResult
     pulse_terminal: PulseTerminalAck
     trigger_channel: str
-    compiled_artifact_digest: str
-    source_document_digest: str
-    execution_form: PulseExecutionForm
+    compiled_artifact: CompiledPulseArtifact
+    cell_plan: CompiledCaptureCellPlan
 
     def __post_init__(self) -> None:
         if not isinstance(self.capture, PipelineResult):
             raise TypeError("capture must be PipelineResult")
         if not isinstance(self.pulse_terminal, PulseTerminalAck):
             raise TypeError("pulse_terminal must be PulseTerminalAck")
-        for value, field in (
-            (self.compiled_artifact_digest, "compiled_artifact_digest"),
-            (self.source_document_digest, "source_document_digest"),
-        ):
-            if (
-                not isinstance(value, str)
-                or len(value) != 64
-                or any(character not in "0123456789abcdef" for character in value)
-            ):
-                raise ValueError(f"{field} must be a lowercase SHA-256 digest")
-        if not isinstance(self.execution_form, PulseExecutionForm):
-            raise TypeError("execution_form must be PulseExecutionForm")
-        if self.pulse_terminal.artifact_digest != self.compiled_artifact_digest:
+        if not isinstance(self.compiled_artifact, CompiledPulseArtifact):
+            raise TypeError("compiled_artifact must be CompiledPulseArtifact")
+        if not isinstance(self.cell_plan, CompiledCaptureCellPlan):
+            raise TypeError("cell_plan must be CompiledCaptureCellPlan")
+        if self.cell_plan.compiled_pulse_artifact_digest != self.compiled_artifact.fingerprint:
+            raise ValueError("cell plan and compiled artifact digest differ")
+        if self.cell_plan.execution_form is not self.compiled_artifact.execution_form:
+            raise ValueError("cell plan and execution form differ")
+        if self.cell_plan.trigger_channel != self.trigger_channel:
+            raise ValueError("cell plan and trigger channel differ")
+        self.cell_plan.validate_dataset_schema(self.capture.dataset.block.schema)
+        if self.cell_plan.cell_permutation_digest != self.capture.dataset.provenance.join_plan_digest:
+            raise ValueError("cell plan and sealed dataset permutation differ")
+        if self.pulse_terminal.artifact_digest != self.compiled_artifact.fingerprint:
             raise ValueError("pulse terminal and compiled artifact digest differ")
         counts = dict(self.pulse_terminal.completed_schedule_trigger_counts)
         if self.trigger_channel not in counts:
@@ -121,6 +136,18 @@ class TriggeredPipelineResult:
     @property
     def capture_terminal(self):
         return self.capture.capture_terminal
+
+    @property
+    def compiled_artifact_digest(self) -> str:
+        return self.compiled_artifact.fingerprint
+
+    @property
+    def source_document_digest(self) -> str:
+        return self.compiled_artifact.source_document_digest
+
+    @property
+    def execution_form(self) -> PulseExecutionForm:
+        return self.compiled_artifact.execution_form
 
 
 @dataclass
@@ -177,9 +204,8 @@ def compile_triggered_pipeline(spec: TriggeredCaptureSpec) -> RunPlan:
                 capture_result,
                 pulse_terminal,
                 spec.trigger_channel,
-                spec.pulse_request.artifact_digest,
-                spec.pulse_request.artifact.source_document_digest,
-                spec.pulse_request.artifact.execution_form,
+                spec.pulse_request.artifact,
+                spec.cell_plan,
             )
         except BaseException as error:
             prepared.capture.fail(error)

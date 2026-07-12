@@ -26,9 +26,11 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["Zou_lab_control*", "zlc_data*", "zlc_storage*", "zlc_pulse*", "zlc_neutral_atom*", "zlc_frontend*", "zlc_workbench*"]
+include = ["Zou_lab_control*", "zlc_data*", "zlc_storage*", "zlc_pulse*", "zlc_neutral_atom*", "zlc_frontend*", "zlc_workbench*", "fpga*"]
 
 [tool.setuptools.package-data]
+"zlc_pulse" = ["assets/*.json"]
+"fpga" = ["board_config/*.json"]
 "Zou_lab_control.frontend" = ["assets/*.ttf", "templates/*.sty", "content/notebook_templates/*.cells.md", "content/manual_templates/*.texbody"]
 "Zou_lab_control.neutral_atom" = ["configs/*.json", "content/manual_templates/*.texbody"]
 

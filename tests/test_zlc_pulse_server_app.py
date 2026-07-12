@@ -11,6 +11,7 @@ from zlc_pulse import (
     PORT_DIGITAL,
     PulsePortSpec,
     PulseTarget,
+    load_deployed_pulse_target,
     load_pulse_target,
 )
 from zlc_pulse.server_app import (
@@ -74,7 +75,7 @@ class AppSession:
 
 
 def _target():
-    return load_pulse_target(ROOT / "pulses" / "deployed_target.json")
+    return load_deployed_pulse_target()
 
 
 def test_target_file_loader_accepts_only_the_current_canonical_schema(tmp_path):

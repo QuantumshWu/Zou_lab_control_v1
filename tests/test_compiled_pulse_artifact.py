@@ -15,6 +15,8 @@ from zlc_pulse import (
     compile_pulse_artifact,
     compiled_pulse_artifact_from_tree,
     compiled_pulse_artifact_to_tree,
+    decode_compiled_pulse_artifact,
+    encode_compiled_pulse_artifact,
     freeze_scan_table,
     load_pulse_document,
 )
@@ -39,6 +41,9 @@ def test_static_artifact_binds_source_ir_wire_and_trigger_schedule():
     assert artifact.target_abi_fingerprint == document.target.abi_fingerprint
     assert compiled_pulse_artifact_from_tree(
         compiled_pulse_artifact_to_tree(artifact)
+    ) == artifact
+    assert decode_compiled_pulse_artifact(
+        encode_compiled_pulse_artifact(artifact)
     ) == artifact
 
 

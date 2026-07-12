@@ -38,7 +38,7 @@ def test_camera_owns_the_capture_trigger_channel_not_the_sequencer():
     exp = na.connect("virtual", open_devices=True)
     try:
         # The camera exposes which line gates it; the sequencer does not.
-        assert tuple(raw_device_set(exp).camera.capture_trigger_channels) == ("emCCD",)
+        assert tuple(raw_device_set(exp).camera.capture_trigger_channels) == ("ch11",)
         assert not hasattr(raw_device_set(exp).sequencer, "trigger_channels")
     finally:
         exp.close()

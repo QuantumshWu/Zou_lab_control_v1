@@ -55,6 +55,8 @@ from .dataset import (
     SealedDatasetArtifact,
     ValueDatasetEventAdapter,
     dataset_cell_key_fingerprint,
+    dataset_cell_permutation_digest,
+    dataset_cell_permutation_fingerprint,
 )
 from .ports import (
     BoundDevice,
@@ -218,6 +220,8 @@ __all__ = [
     "DatasetPreviewSnapshot",
     "DatasetSealProvenance",
     "dataset_cell_key_fingerprint",
+    "dataset_cell_permutation_digest",
+    "dataset_cell_permutation_fingerprint",
     "DuplicateDatasetCell",
     "EndOfStream",
     "Envelope",

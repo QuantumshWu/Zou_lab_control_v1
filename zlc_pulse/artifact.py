@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from zlc_storage import canonical_digest
+from zlc_storage import canonical_digest, decode, encode
 
 from .fpga import (
     PulseWireImage,
@@ -164,10 +164,23 @@ def compiled_pulse_artifact_from_tree(tree: object) -> CompiledPulseArtifact:
     )
 
 
+def encode_compiled_pulse_artifact(value: CompiledPulseArtifact) -> bytes:
+    return encode(compiled_pulse_artifact_to_tree(value))
+
+
+def decode_compiled_pulse_artifact(payload: bytes) -> CompiledPulseArtifact:
+    value = compiled_pulse_artifact_from_tree(decode(payload))
+    if encode_compiled_pulse_artifact(value) != bytes(payload):
+        raise ValueError("CompiledPulseArtifact payload is not canonical")
+    return value
+
+
 __all__ = [
     "COMPILED_PULSE_ARTIFACT_SCHEMA",
     "CompiledPulseArtifact",
     "PulseExecutionForm",
     "compiled_pulse_artifact_from_tree",
     "compiled_pulse_artifact_to_tree",
+    "decode_compiled_pulse_artifact",
+    "encode_compiled_pulse_artifact",
 ]

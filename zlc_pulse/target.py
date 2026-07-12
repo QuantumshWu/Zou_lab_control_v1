@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from importlib.resources import files
 from pathlib import Path
 import re
 
@@ -254,6 +255,13 @@ def load_pulse_target(path: str | Path) -> PulseTarget:
     return pulse_target_from_tree(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
+def load_deployed_pulse_target() -> PulseTarget:
+    """Load the packaged installation target shared by real and virtual composition."""
+
+    resource = files("zlc_pulse").joinpath("assets", "deployed_target.json")
+    return pulse_target_from_tree(json.loads(resource.read_text(encoding="utf-8")))
+
+
 def save_pulse_target(target: PulseTarget, path: str | Path) -> Path:
     if not isinstance(target, PulseTarget):
         raise TypeError("target must be PulseTarget")
@@ -400,6 +408,7 @@ __all__ = [
     "PulsePortSpec",
     "PulseTarget",
     "load_pulse_target",
+    "load_deployed_pulse_target",
     "pulse_port_from_tree",
     "pulse_port_to_tree",
     "pulse_target_from_legacy_tree",

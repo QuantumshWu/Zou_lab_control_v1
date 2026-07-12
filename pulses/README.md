@@ -7,7 +7,7 @@ parameter identities, literal nominal values, and optional frozen scan rows.
 
 ## Physical target
 
-`deployed_target.json` is the standalone canonical target used by the server.
+`zlc_pulse/assets/deployed_target.json` is the packaged canonical target used by the server.
 Every checked-in hardware document embeds that same complete 62-lane target;
 `visible_ports` alone selects the small authoring view appropriate to a task.
 Raw lanes remain in bitstream order while logical ports own their physical

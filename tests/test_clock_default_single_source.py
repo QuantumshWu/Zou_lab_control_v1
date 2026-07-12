@@ -37,7 +37,7 @@ from Zou_lab_control.neutral_atom.devices import virtual as virt
 from Zou_lab_control.neutral_atom.timing import sequence as seq_mod
 from Zou_lab_control.neutral_atom.timing import verilog as verilog_mod
 from Zou_lab_control.neutral_atom.timing import pulse_table as pt_mod
-from zlc_pulse import load_pulse_target
+from zlc_pulse import load_deployed_pulse_target
 from zlc_pulse import server_app
 from zlc_pulse.transport import DeployedStreamerSession
 
@@ -63,7 +63,7 @@ def test_server_composition_defaults_to_image_clock(monkeypatch):
     configured_clock = 61_000_123.0
     monkeypatch.setattr(server_app, "default_clock_hz", lambda: configured_clock)
     params = server_app.default_params()
-    target = load_pulse_target(REPO_ROOT / "pulses" / "deployed_target.json")
+    target = load_deployed_pulse_target()
 
     class _Session:
         def __init__(self):

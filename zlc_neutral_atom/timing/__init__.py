@@ -5,6 +5,17 @@ from .capture import (
     TriggeredCaptureSpec,
     TriggeredPipelineResult,
 )
+from .capture_plan import (
+    COMPILED_CAPTURE_CELL_PLAN_SCHEMA,
+    CaptureCellAssignment,
+    CompiledCaptureCellPlan,
+    compile_capture_cell_plan,
+    compiled_capture_cell_plan_from_tree,
+    compiled_capture_cell_plan_to_tree,
+    decode_compiled_capture_cell_plan,
+    encode_compiled_capture_cell_plan,
+    repeat_major_capture_grouping,
+)
 from .pulse import (
     BoundPulsePort,
     CompletePulseCommand,
@@ -23,6 +34,9 @@ from .pulse import (
 
 __all__ = [
     "BoundPulsePort",
+    "COMPILED_CAPTURE_CELL_PLAN_SCHEMA",
+    "CaptureCellAssignment",
+    "CompiledCaptureCellPlan",
     "CompletePulseCommand",
     "FinitePulseExecutionRequest",
     "FirePulseCommand",
@@ -36,6 +50,12 @@ __all__ = [
     "pulse_terminal_ack_to_tree",
     "SequencerCapabilitySnapshot",
     "compile_triggered_pipeline",
+    "compile_capture_cell_plan",
+    "compiled_capture_cell_plan_from_tree",
+    "compiled_capture_cell_plan_to_tree",
+    "decode_compiled_capture_cell_plan",
+    "encode_compiled_capture_cell_plan",
+    "repeat_major_capture_grouping",
     "TriggeredCaptureSpec",
     "TriggeredPipelineResult",
 ]

@@ -35,7 +35,7 @@ if errorlevel 1 exit /b 1
 if not defined ZLC_PS_HOST set "ZLC_PS_HOST=0.0.0.0"
 if not defined ZLC_PS_PORT set "ZLC_PS_PORT=18861"
 if not defined ZLC_PS_SERVER_BACKEND set "ZLC_PS_SERVER_BACKEND=jtag-axi"
-if not defined ZLC_PS_TARGET set "ZLC_PS_TARGET=%FPGA_DIR%board_config\pulse_target.json"
+if not defined ZLC_PS_TARGET set "ZLC_PS_TARGET=%REPO_ROOT%\zlc_pulse\assets\deployed_target.json"
 if not defined ZLC_PS_STATE_DIR set "ZLC_PS_STATE_DIR=%FPGA_DIR%build\state"
 if not defined ZLC_PS_PROJECT_DIR set "ZLC_PS_PROJECT_DIR=%FPGA_DIR%build\ps"
 

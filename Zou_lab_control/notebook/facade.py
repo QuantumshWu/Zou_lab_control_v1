@@ -16,7 +16,16 @@ from Zou_lab_control.neutral_atom.devices import (
     load_devices,
     resolve_connect_config,
 )
-from zlc_data import AxisId, AxisSpec, BlockId, PointLayout, REPEAT, SCAN_POINT
+from zlc_data import (
+    AxisId,
+    AxisSpec,
+    BlockId,
+    DatasetSchema,
+    PointLayout,
+    READOUT_EVENT,
+    REPEAT,
+    SCAN_POINT,
+)
 from zlc_neutral_atom.acquisition import CameraAcquisitionMode
 from zlc_neutral_atom.artifacts import (
     CaptureArtifact,
@@ -34,6 +43,7 @@ from zlc_neutral_atom.runtime import (
 from zlc_neutral_atom.timing import (
     FinitePulseExecutionRequest,
     TriggeredCaptureSpec,
+    compile_capture_cell_plan,
 )
 from zlc_pulse import (
     PulseDocument,
@@ -67,6 +77,9 @@ class CaptureRequest:
     camera_role: str
     sequencer_role: str
     trigger_channel: str | None = None
+    repeat_count: int = 1
+    readout_events_per_repeat: int | None = None
+    within_point_grouping: tuple[tuple[int, int], ...] | None = None
     transport_memory_limit_bytes: int = 64 << 20
     pipeline_memory_limit_bytes: int = 256 << 20
     timeout_seconds: float = 30.0
@@ -82,6 +95,41 @@ class CaptureRequest:
         _text(self.sequencer_role, "sequencer_role")
         if self.trigger_channel is not None:
             _text(self.trigger_channel, "trigger_channel")
+        object.__setattr__(
+            self,
+            "repeat_count",
+            _positive_int(self.repeat_count, "repeat_count"),
+        )
+        if self.readout_events_per_repeat is not None:
+            object.__setattr__(
+                self,
+                "readout_events_per_repeat",
+                _positive_int(
+                    self.readout_events_per_repeat,
+                    "readout_events_per_repeat",
+                ),
+            )
+        if self.within_point_grouping is not None:
+            try:
+                grouping = tuple(tuple(pair) for pair in self.within_point_grouping)
+            except TypeError as exc:
+                raise TypeError(
+                    "within_point_grouping must contain integer (repeat, event) pairs"
+                ) from exc
+            if any(
+                len(pair) != 2
+                or any(
+                    isinstance(index, bool)
+                    or not isinstance(index, int)
+                    or index < 0
+                    for index in pair
+                )
+                for pair in grouping
+            ):
+                raise ValueError(
+                    "within_point_grouping must contain non-negative two-item pairs"
+                )
+            object.__setattr__(self, "within_point_grouping", grouping)
         object.__setattr__(
             self,
             "transport_memory_limit_bytes",
@@ -222,6 +270,9 @@ class ReadoutFacade:
         camera_role: str | None = None,
         sequencer_role: str | None = None,
         trigger_channel: str | None = None,
+        repeat_count: int = 1,
+        readout_events_per_repeat: int | None = None,
+        within_point_grouping: tuple[tuple[int, int], ...] | None = None,
         transport_memory_limit_bytes: int = 64 << 20,
         pipeline_memory_limit_bytes: int = 256 << 20,
         timeout_seconds: float = 30.0,
@@ -244,6 +295,9 @@ class ReadoutFacade:
                 ("sequencer",),
             ),
             trigger_channel,
+            repeat_count,
+            readout_events_per_repeat,
+            within_point_grouping,
             transport_memory_limit_bytes,
             pipeline_memory_limit_bytes,
             timeout_seconds,
@@ -367,12 +421,60 @@ def _compile(token: object, request: CaptureRequest):
         schedule = artifact.trigger_schedules[0]
         if schedule.total < 1:
             raise ValueError("compiled pulse emits no camera trigger edge")
+        mutable_counts = [0] * schedule.point_count
+        for edge in schedule.edges:
+            mutable_counts[edge.point_index] += 1
+        per_point_counts = tuple(mutable_counts)
+        if len(set(per_point_counts)) != 1:
+            raise ValueError("camera trigger count must be uniform across scan points")
+        per_point = per_point_counts[0]
+        events_per_repeat = request.readout_events_per_repeat
+        if events_per_repeat is None:
+            if request.repeat_count != 1:
+                raise ValueError(
+                    "readout_events_per_repeat is required when repeat_count exceeds one"
+                )
+            events_per_repeat = per_point
+        if request.repeat_count * events_per_repeat != per_point:
+            raise ValueError(
+                "declared repeat/event layout differs from per-point trigger count"
+            )
+        repeat_axis = _axis("capture.repeat", REPEAT, request.repeat_count)
+        scan_axes = (
+            (_axis("capture.scan_row", SCAN_POINT, schedule.point_count),)
+            if schedule.point_count > 1
+            else ()
+        )
+        event_axis = _axis(
+            "capture.readout_event",
+            READOUT_EVENT,
+            events_per_repeat,
+        )
+        point_axes = (*scan_axes, event_axis)
+        point_layout = PointLayout.rect_c(tuple(axis.size for axis in point_axes))
+        dataset_schema = DatasetSchema(
+            repeat_axis,
+            point_axes,
+            point_layout,
+            camera_description.payload_contract.value_schema,
+        )
+        cell_plan = compile_capture_cell_plan(
+            artifact,
+            trigger_channel,
+            dataset_schema,
+            readout_event_axis_id=event_axis.axis_id,
+            scan_point_layout=PointLayout.rect_c(
+                tuple(axis.size for axis in scan_axes)
+            ),
+            within_point_grouping=request.within_point_grouping,
+        )
         measurement = services.runtime.bind_camera_measurement(
             CameraCaptureBindingRequest(
                 request.camera_role,
-                _axis("capture.repeat", REPEAT, 1),
-                (_axis("capture.frame", SCAN_POINT, schedule.total),),
-                PointLayout.rect_c((schedule.total,)),
+                repeat_axis,
+                point_axes,
+                point_layout,
+                cell_plan.expected_cells,
                 CameraAcquisitionMode.EXTERNAL_TRIGGERED,
                 0,
                 request.transport_memory_limit_bytes,
@@ -394,6 +496,7 @@ def _compile(token: object, request: CaptureRequest):
             pulse_port,
             FinitePulseExecutionRequest(document, artifact),
             trigger_channel,
+            cell_plan,
         )
         plan = compile_capture_artifact_pipeline(triggered, services.repository)
         descriptor = PlanDescriptor(

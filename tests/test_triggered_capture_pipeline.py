@@ -14,13 +14,14 @@ from Zou_lab_control.neutral_atom.devices.virtual import (
     VirtualTrapArray,
 )
 from Zou_lab_control.neutral_atom.ports import PortCatalog, PortSpec
-from zlc_data import AxisId, AxisSpec, BlockId, PointLayout, REPEAT, SCAN_POINT
+from zlc_data import AxisId, AxisSpec, BlockId, PointLayout, READOUT_EVENT, REPEAT
 from zlc_neutral_atom.acquisition import CameraAcquisitionMode
 from zlc_neutral_atom.artifacts import (
     CaptureRepository,
     compile_capture_artifact_pipeline,
 )
 from zlc_neutral_atom.runtime import (
+    DatasetCellAddress,
     DatasetMaterializerSpec,
     MinimalPipelineSpec,
     PipelineMemoryProfile,
@@ -28,6 +29,7 @@ from zlc_neutral_atom.runtime import (
 from zlc_neutral_atom.timing import (
     FinitePulseExecutionRequest,
     TriggeredCaptureSpec,
+    compile_capture_cell_plan,
     compile_triggered_pipeline,
 )
 from zlc_pulse import (
@@ -92,8 +94,9 @@ def _runtime(point_count=3):
         CameraCaptureBindingRequest(
             "readout",
             _axis("repeat", REPEAT, 1),
-            (_axis("frame", SCAN_POINT, point_count),),
+            (_axis("frame", READOUT_EVENT, point_count),),
             PointLayout.rect_c((point_count,)),
+            tuple(DatasetCellAddress(0, point) for point in range(point_count)),
             CameraAcquisitionMode.EXTERNAL_TRIGGERED,
             0,
             4 << 20,
@@ -116,11 +119,21 @@ def _runtime(point_count=3):
         trigger_channels=("ch11",),
         live_target=document.target,
     )
-    return runtime, camera, sequencer, capture, document, pulse_port, artifact
+    plan = None
+    if artifact.trigger_schedules[0].total == point_count:
+        plan = compile_capture_cell_plan(
+            artifact,
+            "ch11",
+            measurement.capture_contract.dataset_schema,
+            readout_event_axis_id=AxisId("frame"),
+            scan_point_layout=PointLayout.rect_c(()),
+        )
+    return runtime, camera, sequencer, capture, document, pulse_port, artifact, plan
 
 
 def test_camera_is_armed_before_one_fire_and_all_frames_are_exactly_materialized():
-    runtime, camera, sequencer, capture, document, pulse_port, artifact = _runtime()
+    runtime, camera, sequencer, capture, document, pulse_port, artifact, plan = _runtime()
+    assert plan is not None
     armed_at_fire = []
 
     def observe_fire(_program):
@@ -134,6 +147,7 @@ def test_camera_is_armed_before_one_fire_and_all_frames_are_exactly_materialized
         pulse_port,
         FinitePulseExecutionRequest(document, artifact),
         "ch11",
+        plan,
     )
     try:
         result = runtime.controller.run(compile_triggered_pipeline(spec))
@@ -159,14 +173,16 @@ def test_camera_is_armed_before_one_fire_and_all_frames_are_exactly_materialized
 
 
 def test_trigger_cardinality_mismatch_is_rejected_before_hardware_run():
-    runtime, _camera, sequencer, capture, document, pulse_port, artifact = _runtime(2)
+    runtime, _camera, sequencer, capture, document, pulse_port, artifact, plan = _runtime(2)
+    assert plan is None
     try:
-        with pytest.raises(ValueError, match="trigger count 3"):
-            TriggeredCaptureSpec(
-                capture,
-                pulse_port,
-                FinitePulseExecutionRequest(document, artifact),
+        with pytest.raises(ValueError, match=r"R \* E"):
+            compile_capture_cell_plan(
+                artifact,
                 "ch11",
+                capture.measurement.capture_contract.dataset_schema,
+                readout_event_axis_id=AxisId("frame"),
+                scan_point_layout=PointLayout.rect_c(()),
             )
         assert sequencer.history == []
     finally:
@@ -174,13 +190,15 @@ def test_trigger_cardinality_mismatch_is_rejected_before_hardware_run():
 
 
 def test_triggered_capture_artifact_persists_pulse_lineage(tmp_path):
-    runtime, _camera, sequencer, capture, document, pulse_port, artifact = _runtime()
+    runtime, _camera, sequencer, capture, document, pulse_port, artifact, plan = _runtime()
+    assert plan is not None
     repository = CaptureRepository(tmp_path / "captures")
     spec = TriggeredCaptureSpec(
         capture,
         pulse_port,
         FinitePulseExecutionRequest(document, artifact),
         "ch11",
+        plan,
     )
     try:
         reference = runtime.controller.run(
@@ -194,6 +212,9 @@ def test_triggered_capture_artifact_persists_pulse_lineage(tmp_path):
         assert lineage.execution_form is PulseExecutionForm.STATIC_ONCE
         assert lineage.trigger_channel == "ch11"
         assert lineage.expected_trigger_count == 3
+        assert lineage.cell_plan == plan
+        assert lineage.cell_plan.dataset_schema_fingerprint == stored.block.schema.fingerprint
+        assert lineage.cell_plan.cell_permutation_digest == stored.provenance.join_plan_digest
         assert lineage.terminal.logical_done
         assert stored.terminal.produced_count == lineage.expected_trigger_count
         assert dict(sequencer.snapshot())["state"] == "safe"

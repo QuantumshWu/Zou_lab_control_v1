@@ -99,6 +99,8 @@ from .artifact import (
     PulseExecutionForm,
     compiled_pulse_artifact_from_tree,
     compiled_pulse_artifact_to_tree,
+    decode_compiled_pulse_artifact,
+    encode_compiled_pulse_artifact,
 )
 from .compiler import (
     COMPILER_ID,
@@ -114,6 +116,7 @@ from .target import (
     PORT_DIGITAL,
     PulsePortSpec,
     PulseTarget,
+    load_deployed_pulse_target,
     load_pulse_target,
     pulse_target_from_tree,
     pulse_target_to_tree,
@@ -178,6 +181,8 @@ __all__ = [
     "bind_pulse_document_target",
     "compiled_pulse_artifact_from_tree",
     "compiled_pulse_artifact_to_tree",
+    "decode_compiled_pulse_artifact",
+    "encode_compiled_pulse_artifact",
     "compile_pulse_artifact",
     "compile_pulse_document",
     "digital_trigger_schedule_from_tree",
@@ -192,6 +197,7 @@ __all__ = [
     "insert_period",
     "inspect_remove_period",
     "load_pulse_document",
+    "load_deployed_pulse_target",
     "load_pulse_target",
     "pulse_document_from_tree",
     "pulse_document_to_tree",

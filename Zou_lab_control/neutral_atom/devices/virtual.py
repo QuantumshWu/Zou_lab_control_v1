@@ -22,7 +22,7 @@ from Zou_lab_control._clock import DEFAULT_CLOCK_HZ
 # imported lazily where used (keeping devices->operations off the import graph, as elsewhere here).
 from Zou_lab_control._readout_math import normal_cdf
 from ..core.utils import site_index
-from ..ports import PortCatalog, coerce_port_catalog
+from ..ports import PortCatalog, PortSpec, coerce_port_catalog
 from .base import (
     ROI_CLEAR_SENTINELS, SOFTWARE_TRIGGER, CameraDevice, DeviceProperty, LaserDevice, RFSourceDevice,
     SequencerDevice, TrapArrayDevice, snap_subarray)
@@ -38,7 +38,7 @@ from ..timing import (
     DEFAULT_EXPOSURE_S,
     PulseSequence,
     PulseTableState,
-    probe_channel_set,
+    channel_names,
 )
 
 
@@ -84,6 +84,41 @@ DEFAULT_CHANNELS = (
     "mot_trigger",
     *(channel for members in MOT_COIL_BUSES.values() for channel in members),
 )
+
+# The legacy virtual-device classes can still be constructed with a small, friendly
+# channel vocabulary for isolated device tests.  The current composed virtual
+# installation, however, models the deployed board's physical wiring exactly.  These
+# declarations are installation wiring, not aliases: current Pulse documents compile to
+# chNN lanes and the virtual camera/atom model observes those same wires.
+DEPLOYED_CAMERA_TRIGGER_CHANNELS = ("ch11",)
+DEPLOYED_COOLING_CHANNELS = ("ch00", "ch01")
+DEPLOYED_PROBE_CHANNELS = ("ch03",)
+DEPLOYED_TRAP_CHANNELS = ("ch09",)
+
+# Channels whose ON pulse (re)LOADS a fresh, PGC-cooled atom array.  These are
+# the friendly defaults for a directly-constructed legacy simulator; a composed
+# installation injects its physical wiring explicitly.
+COOLING_CHANNELS = ("cooling", "mot", "pgc", "load")
+DEFAULT_TRAP_CHANNELS = ("trap", "tweezer", "dipole")
+DEFAULT_PROBE_CHANNELS = ("probe",)
+
+
+def _deployed_board_port_catalog() -> PortCatalog:
+    """Load the one checked-in target used by both real and composed virtual rigs.
+
+    ``PulseTarget`` owns the canonical resource and file schema.  This device-boundary
+    projection delegates every embedded port value to the pulse owner's codec rather
+    than reconstructing board topology or labels here.
+    """
+
+    from zlc_pulse import load_deployed_pulse_target
+    from zlc_pulse.target import pulse_port_to_tree
+
+    target = load_deployed_pulse_target()
+    return PortCatalog(
+        target.raw_lanes,
+        tuple(PortSpec.from_dict(pulse_port_to_tree(port)) for port in target.ports),
+    )
 
 # The virtual backend is a REAL-TIME hardware simulator: firing a pulse program TAKES its
 # real wall-clock duration, exactly like the FPGA + externally-triggered camera.  So a live
@@ -244,6 +279,9 @@ class VirtualTrapArray(TrapArrayDevice):
 
     grid_shape: tuple[int, int] = (5, 7)
     image_shape: tuple[int, int] = (96, 128)
+    cooling_channels: tuple[str, ...] = COOLING_CHANNELS
+    probe_channels: tuple[str, ...] = DEFAULT_PROBE_CHANNELS
+    trap_channels: tuple[str, ...] = DEFAULT_TRAP_CHANNELS
     # Site pitch (px).  The real Rb87 v16 3 ms data has a tweezer pitch of ~9.2 px on the
     # 5x7 grid (dx 8.9 / dy 9.5 px); 9.0 matches it to <2%.
     spacing_px: float = 9.0
@@ -397,6 +435,15 @@ class VirtualTrapArray(TrapArrayDevice):
     def __post_init__(self) -> None:
         self.grid_shape = grid_shape_tuple(self.grid_shape)
         self.image_shape = grid_shape_tuple(self.image_shape, "image_shape")
+        self.cooling_channels = channel_names(
+            self.cooling_channels, "cooling_channels", allow_empty=False
+        )
+        self.probe_channels = channel_names(
+            self.probe_channels, "probe_channels", allow_empty=False
+        )
+        self.trap_channels = channel_names(
+            self.trap_channels, "trap_channels", allow_empty=False
+        )
         self.spacing_px = positive_float(self.spacing_px, "spacing_px")
         self.loading_probability = probability(self.loading_probability, "loading_probability")
         self.atom_rate = positive_float(self.atom_rate, "atom_rate")
@@ -724,12 +771,27 @@ class VirtualTrapArray(TrapArrayDevice):
         # bound pulse carries no trigger of its own.
         if getattr(sequence, "repeat_forever", False) and base_windows <= 0:
             return []
-        probe_set = probe_channel_set("probe")
+        probe_set = self.probe_channels
         exposures = exposures_per_frame(sequence, frames, default=exposure,
                                         trigger_channels=trig, probe_channels=probe_set)
-        cooling_durations = cooling_durations_per_frame(sequence, frames, trigger_channels=trig)
-        trap_off_per_frame = trap_off_durations_per_frame(sequence, frames, trigger_channels=trig)
-        trap_hold_per_frame = trap_hold_durations_per_frame(sequence, frames, trigger_channels=trig)
+        cooling_durations = cooling_durations_per_frame(
+            sequence,
+            frames,
+            trigger_channels=trig,
+            cooling_channels=self.cooling_channels,
+        )
+        trap_off_per_frame = trap_off_durations_per_frame(
+            sequence,
+            frames,
+            trigger_channels=trig,
+            trap_channels=self.trap_channels,
+        )
+        trap_hold_per_frame = trap_hold_durations_per_frame(
+            sequence,
+            frames,
+            trigger_channels=trig,
+            trap_channels=self.trap_channels,
+        )
         # Does ONE BASE CYCLE carry a camera-trigger window for EVERY frame?  If so this shot is a
         # single-loading BRACKET -- a release-recapture bracket (2 windows around a readout) or a
         # long-short-long imaging bracket (3 windows) -- and the SAME atoms are imaged through each
@@ -2057,15 +2119,29 @@ def virtual_config() -> dict[str, object]:
     # into the trap array: its cooled (PGC) temperature floor is set by how well those two
     # are tuned (laser detuning + two-photon RF resonance), exactly like the real bench where
     # a mis-set detuning or off-resonant RF warms the cloud (see _cooling_floor_K).
+    board_catalog = _deployed_board_port_catalog()
     return {
         "laser": {"type": "VirtualLaser"},
         "rf": {"type": "VirtualRF"},
         "trap_array": {"type": "VirtualTrapArray",
-                       "params": {"laser": "$device:laser", "rf": "$device:rf"}},
+                       "params": {
+                           "laser": "$device:laser",
+                           "rf": "$device:rf",
+                           "cooling_channels": list(DEPLOYED_COOLING_CHANNELS),
+                           "probe_channels": list(DEPLOYED_PROBE_CHANNELS),
+                           "trap_channels": list(DEPLOYED_TRAP_CHANNELS),
+                       }},
         "camera": {"type": "VirtualCamera",
-                   "params": {"trap_array": "$device:trap_array", "sequencer": "$device:sequencer"}},
+                   "params": {
+                       "trap_array": "$device:trap_array",
+                       "sequencer": "$device:sequencer",
+                       "capture_trigger_channels": list(DEPLOYED_CAMERA_TRIGGER_CHANNELS),
+                   }},
         "monitor_camera": {"type": "VirtualMotCamera", "params": {"sequencer": "$device:sequencer"}},
-        "sequencer": {"type": "VirtualSequencer"},
+        "sequencer": {
+            "type": "VirtualSequencer",
+            "params": {"port_catalog": board_catalog.to_dict()},
+        },
     }
 
 
@@ -2138,17 +2214,6 @@ def virtual_config_with_overrides(
     cfg["camera"].setdefault("params", {}).update(camera_params)
     cfg["sequencer"].setdefault("params", {}).update(sequencer_params)
     return cfg, defaults
-
-
-# Channels whose ON pulse (re)LOADS a fresh, PGC-cooled atom array -- the cooling /
-# MOT / PGC light.  A frame window that contains one of these starts an INDEPENDENT
-# loading (aliases cover the names a user might give the loading light in a pulse table).
-COOLING_CHANNELS = ("cooling", "mot", "pgc", "load")
-
-# The trap channel whose OFF gaps drive the release-recapture loss model.  The
-# release-recapture pulse (operations/temperature.build_release_recapture_pulse)
-# and the virtual config both name it "trap"; aliases cover common variants.
-DEFAULT_TRAP_CHANNELS = ("trap", "tweezer", "dipole")
 
 
 def cooling_durations_per_frame(

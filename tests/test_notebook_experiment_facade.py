@@ -25,7 +25,7 @@ def test_virtual_connect_capture_load_is_a_short_current_api(tmp_path):
         descriptor = exp.inspect(request)
         assert descriptor.camera_role == "camera"
         assert descriptor.sequencer_role == "sequencer"
-        assert descriptor.trigger_channel == "emCCD"
+        assert descriptor.trigger_channel == "ch11"
         assert descriptor.expected_frames == 3
         assert descriptor.output_shape == (1, 3, 96, 128)
         assert descriptor.resource_claims == ("device/sequencer", "device/camera")

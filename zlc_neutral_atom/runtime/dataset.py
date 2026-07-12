@@ -10,6 +10,7 @@ from numbers import Integral
 from typing import Generic, Protocol, TypeVar
 
 import numpy as np
+from zlc_storage import canonical_digest
 
 from zlc_data import (
     BlockId,
@@ -189,6 +190,55 @@ class DatasetCellAddress:
             if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
                 raise ValueError(f"{field} must be a non-negative integer")
             object.__setattr__(self, field, int(value))
+
+
+def dataset_cell_permutation_digest(
+    schema: DatasetSchema,
+    cells: tuple[DatasetCellAddress, ...],
+) -> str:
+    """Canonical identity of one complete event-ordinal to dataset-cell plan."""
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    ordered = tuple(cells)
+    total = schema.repeat_axis.size * schema.point_layout.storage_size
+    if len(ordered) != total:
+        raise ValueError("cell permutation length differs from DatasetSchema")
+    if any(not isinstance(cell, DatasetCellAddress) for cell in ordered):
+        raise TypeError("cell permutation must contain DatasetCellAddress values")
+    expected = {
+        DatasetCellAddress(repeat, point)
+        for repeat in range(schema.repeat_axis.size)
+        for point in range(schema.point_layout.storage_size)
+    }
+    if set(ordered) != expected:
+        raise ValueError("cell permutation must cover every dataset cell exactly once")
+    return dataset_cell_permutation_fingerprint(schema.fingerprint, ordered)
+
+
+def dataset_cell_permutation_fingerprint(
+    dataset_schema_fingerprint: str,
+    cells: tuple[DatasetCellAddress, ...],
+) -> str:
+    if (
+        not isinstance(dataset_schema_fingerprint, str)
+        or len(dataset_schema_fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in dataset_schema_fingerprint)
+    ):
+        raise ValueError("dataset_schema_fingerprint must be a lowercase SHA-256 digest")
+    ordered = tuple(cells)
+    if any(not isinstance(cell, DatasetCellAddress) for cell in ordered):
+        raise TypeError("cells must contain DatasetCellAddress values")
+    return canonical_digest(
+        {
+            "contract": "zlc_neutral_atom.DatasetCellPermutation/v1",
+            "dataset_schema_fingerprint": dataset_schema_fingerprint,
+            "cells": [
+                [cell.repeat_index, cell.point_storage_index]
+                for cell in ordered
+            ],
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -487,11 +537,16 @@ class DatasetBuilder(Generic[PayloadT]):
         elif expected_cells is not None:
             raise DatasetError("rolling monitor materialization has no formal cell schedule")
         self._expected_cells = expected_cells
-        join_hasher = hashlib.sha256()
-        join_hasher.update(f"{schema.fingerprint}:".encode("ascii"))
-        for cell in expected_cells or ():
-            join_hasher.update(f"{cell.repeat_index},{cell.point_storage_index};".encode("ascii"))
-        self._join_plan_digest = join_hasher.hexdigest()
+        self._join_plan_digest = (
+            dataset_cell_permutation_digest(schema, expected_cells)
+            if expected_cells is not None
+            else canonical_digest(
+                {
+                    "contract": "zlc_neutral_atom.RollingDatasetJoin/v1",
+                    "dataset_schema_fingerprint": schema.fingerprint,
+                }
+            )
+        )
         self._ordered_event_hasher = hashlib.sha256()
         self._ordered_metadata_hasher = hashlib.sha256()
         self._ordered_metadata_hasher.update(metadata_contract.fingerprint.encode("ascii"))
@@ -925,4 +980,6 @@ __all__ = [
     "SealedDatasetArtifact",
     "ValueDatasetEventAdapter",
     "dataset_cell_key_fingerprint",
+    "dataset_cell_permutation_digest",
+    "dataset_cell_permutation_fingerprint",
 ]
