@@ -549,6 +549,7 @@ def harness(points: int = 2) -> CaptureHarness:
         flow_control=ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
         max_source_burst_events=points,
         driver_ring_bytes=128,
+        adapter_record_retention_bytes=128,
         max_blocking_call_seconds=0.5,
         max_capture_spec_bytes=1024,
     )
@@ -854,7 +855,7 @@ def test_terminal_ack_rejects_bool_counts_and_truthy_non_bool_flags():
 
 def test_transport_budget_rejects_before_any_run_or_hardware_prepare():
     item = harness(points=1)
-    assert item.contract.estimated_transport_bytes == 128 + 64 + 64 + 24 + 1024
+    assert item.contract.estimated_transport_bytes == 128 + 128 + 64 + 64 + 24 + 1024
     with pytest.raises(MemoryError):
         CaptureStreamContract(
             stream_id=item.contract.stream_id,

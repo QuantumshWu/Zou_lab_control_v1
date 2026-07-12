@@ -187,6 +187,7 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
         flow_control=ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
         max_source_burst_events=2,
         driver_ring_bytes=1 << 20,
+        adapter_record_retention_bytes=1 << 20,
         max_blocking_call_seconds=1.0,
         max_capture_spec_bytes=4096,
     )
@@ -198,7 +199,7 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
         event_adapter,
         cells,
         capability,
-        CaptureRuntimeProfile(0, 2 << 20),
+        CaptureRuntimeProfile(0, 3 << 20),
         CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
     )
 

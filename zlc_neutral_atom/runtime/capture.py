@@ -136,6 +136,7 @@ class CaptureCapabilitySnapshot:
     flow_control: ProducerFlowControl
     max_source_burst_events: int
     driver_ring_bytes: int
+    adapter_record_retention_bytes: int
     max_blocking_call_seconds: float
     max_capture_spec_bytes: int
 
@@ -164,6 +165,14 @@ class CaptureCapabilitySnapshot:
             self,
             "driver_ring_bytes",
             _positive_int(self.driver_ring_bytes, "driver_ring_bytes"),
+        )
+        object.__setattr__(
+            self,
+            "adapter_record_retention_bytes",
+            _nonnegative_int(
+                self.adapter_record_retention_bytes,
+                "adapter_record_retention_bytes",
+            ),
         )
         object.__setattr__(
             self,
@@ -322,6 +331,7 @@ class CaptureStreamContract:
     def estimated_transport_bytes(self) -> int:
         return (
             self.capability.driver_ring_bytes
+            + self.capability.adapter_record_retention_bytes
             + self.max_inflight_bytes
             + self.payload_contract.max_retained_nbytes
             + self.event_adapter.metadata_contract.max_retained_nbytes
