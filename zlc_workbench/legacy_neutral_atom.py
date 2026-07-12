@@ -58,6 +58,11 @@ from .camera_capture import (
     CameraCaptureEndpoint,
     bind_camera_measurement as _bind_camera_measurement,
 )
+from .sequencer_execution import (
+    SequencerBindingRequest,
+    VirtualSequencerExecutionEndpoint,
+    bind_sequencer_port as _bind_sequencer_port,
+)
 from .legacy_runtime import (
     LegacyDeviceRegistration,
     LegacyDeviceRegistry,
@@ -557,6 +562,30 @@ class LegacyNeutralAtomRuntime:
         )
         return _bind_camera_measurement(device_set, registry, request)
 
+    def bind_sequencer_port(
+        self,
+        request: SequencerBindingRequest = SequencerBindingRequest(),
+    ):
+        if not isinstance(request, SequencerBindingRequest):
+            raise TypeError("request must be SequencerBindingRequest")
+        with self._lock:
+            self._ensure_open()
+            device_set = self._device_set
+            registry = self.registry
+            devices = dict(getattr(device_set, "devices", {}) or {})
+            try:
+                sequencer = devices[request.role]
+            except KeyError as exc:
+                raise KeyError(
+                    f"sequencer role {request.role!r} is absent from installation"
+                ) from exc
+        self._ensure_connections(
+            (sequencer,),
+            registry=registry,
+            device_set=device_set,
+        )
+        return _bind_sequencer_port(device_set, registry, request)
+
     def _ensure_connections(self, devices, *, registry, device_set) -> bool:
         if not isinstance(registry, LegacyDeviceRegistry):
             raise TypeError("registry must be LegacyDeviceRegistry")
@@ -925,6 +954,7 @@ def _registration_for(
     if type(device) is VirtualSequencer:
         identity_probe = _installation_identity_probe(asset, asset_map_revision)
         cleanup, verify = _virtual_sequencer_safe_contract(device, key)
+        endpoint = VirtualSequencerExecutionEndpoint(device)
         return LegacyDeviceRegistration(
             device,
             key,
@@ -932,6 +962,7 @@ def _registration_for(
             {SafetyOperation.SAFE_STATE: cleanup},
             (SafetyOperation.SAFE_STATE,),
             verify,
+            target_endpoint=endpoint.target_endpoint,
         )
     if type(device) is ManualSequencer:
         return LegacyDeviceRegistration(
