@@ -40,11 +40,11 @@ from zlc_pulse import (
     PulseExecutionForm,
     PulseTarget,
     bind_pulse_document_target,
+    compile_pulse_artifact,
     load_pulse_document,
 )
 from zlc_workbench.camera_capture import CameraCaptureBindingRequest
 from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
-from zlc_workbench.pulse_compile_bridge import compile_pulse_artifact
 from zlc_workbench.sequencer_execution import SequencerBindingRequest
 
 

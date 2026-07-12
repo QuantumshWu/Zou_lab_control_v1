@@ -12,9 +12,9 @@ from fpga.pulse_streamer.host.engine_model import reference_play
 from zlc_pulse import (
     PulseExecutionForm,
     build_digital_trigger_schedules,
+    compile_pulse_document,
     load_pulse_document,
 )
-from zlc_workbench.pulse_compile_bridge import compile_pulse_document
 
 
 ROOT = Path(__file__).parents[1]

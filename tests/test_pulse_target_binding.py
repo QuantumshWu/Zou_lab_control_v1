@@ -11,10 +11,10 @@ from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
 from zlc_pulse import (
     PulseExecutionForm,
     bind_pulse_document_target,
+    compile_pulse_artifact,
     load_pulse_document,
 )
 from zlc_pulse.target import pulse_target_from_legacy_tree
-from zlc_workbench.pulse_compile_bridge import compile_pulse_artifact
 
 
 ROOT = Path(__file__).parents[1]

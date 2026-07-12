@@ -29,10 +29,10 @@ from zlc_neutral_atom.timing import (
     TriggeredCaptureSpec,
     compile_triggered_pipeline,
 )
-from zlc_pulse import PulseExecutionForm, load_pulse_document
+from zlc_pulse import PulseExecutionForm, compile_pulse_artifact, load_pulse_document
 from zlc_workbench.camera_capture import CameraCaptureBindingRequest
 from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
-from zlc_workbench.pulse_compile_bridge import _legacy_compile_input, compile_pulse_artifact
+from zlc_workbench.pulse_compile_bridge import _legacy_compile_input
 
 
 ROOT = Path(__file__).parents[1]

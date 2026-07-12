@@ -25,9 +25,9 @@ from zlc_neutral_atom.runtime import (
     SafetyOperation,
 )
 from zlc_neutral_atom.timing import FinitePulseExecutionRequest, PulseSessionState
-from zlc_pulse import PulseExecutionForm, load_pulse_document
+from zlc_pulse import PulseExecutionForm, compile_pulse_artifact, load_pulse_document
 from zlc_workbench.legacy_runtime import LegacyDeviceRegistration, LegacyDeviceRegistry
-from zlc_workbench.pulse_compile_bridge import _legacy_compile_input, compile_pulse_artifact
+from zlc_workbench.pulse_compile_bridge import _legacy_compile_input
 from zlc_workbench.sequencer_execution import (
     SequencerBindingRequest,
     VirtualSequencerExecutionEndpoint,

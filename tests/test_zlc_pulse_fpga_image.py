@@ -11,10 +11,14 @@ from Zou_lab_control.neutral_atom.devices.sequencer import (
     compile_pulse_table_runtime_program,
     compile_pulse_table_scan_runtime_program,
 )
-from zlc_pulse import PulseExecutionForm, load_pulse_document, pack_target_ir
+from zlc_pulse import (
+    PulseExecutionForm,
+    compile_pulse_document,
+    load_pulse_document,
+    pack_target_ir,
+)
 from zlc_workbench.pulse_compile_bridge import (
     _legacy_compile_input,
-    compile_pulse_document,
 )
 
 

@@ -12,11 +12,11 @@ from zlc_pulse import (
     PORT_DAC,
     CompiledPulseArtifact,
     PulseExecutionForm,
+    compile_pulse_artifact,
     compiled_pulse_artifact_from_tree,
     compiled_pulse_artifact_to_tree,
     load_pulse_document,
 )
-from zlc_workbench.pulse_compile_bridge import compile_pulse_artifact
 
 
 ROOT = Path(__file__).parents[1]
