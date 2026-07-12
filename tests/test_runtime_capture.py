@@ -49,6 +49,7 @@ from zlc_neutral_atom.runtime.dataset import (
 from zlc_neutral_atom.runtime.ports import (
     DeviceBroker,
     DeviceIdentityAck,
+    DeviceIdentityEvidenceKind,
     SafeStateAck,
     SafetyOperation,
     SessionCloseCommand,
@@ -514,10 +515,16 @@ def harness(points: int = 2) -> CaptureHarness:
         for index in range(points)
     ]
     camera = FakeCamera(payloads, metadata_contract)
+    identity_evidence_digest = camera.generation
     key = ResourceKey.parse("device/camera/test")
     broker = DeviceBroker()
     identity = broker.verify_identity(
-        lambda: DeviceIdentityAck("camera-serial", camera.generation)
+        lambda: DeviceIdentityAck(
+            "camera-serial",
+            DeviceIdentityEvidenceKind.HARDWARE_IDENTITY_READBACK,
+            identity_evidence_digest,
+            "test-assets-v1",
+        )
     )
     device = broker.bind(
         key=key,
@@ -530,6 +537,7 @@ def harness(points: int = 2) -> CaptureHarness:
         interrupt_operations={SafetyOperation.ABORT: camera.interrupt},
     )
     camera.binding_id = device.binding_id
+    camera.generation = device.connection_generation
     capability = CaptureCapabilitySnapshot(
         binding_id=device.binding_id,
         stable_device_identity=device.stable_device_identity,

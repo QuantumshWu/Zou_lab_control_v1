@@ -49,6 +49,13 @@ class SafetyOperation(str, Enum):
     READ_STATUS = "READ_STATUS"
 
 
+class DeviceIdentityEvidenceKind(str, Enum):
+    """What the live adapter actually proved about the connected asset."""
+
+    HARDWARE_IDENTITY_READBACK = "HARDWARE_IDENTITY_READBACK"
+    INSTALLATION_ASSERTED_ENDPOINT = "INSTALLATION_ASSERTED_ENDPOINT"
+
+
 @dataclass(frozen=True)
 class CleanupStepAck:
     """Adapter acknowledgement for one declared cleanup operation."""
@@ -130,11 +137,16 @@ class RecoveryAck:
 @dataclass(frozen=True)
 class DeviceIdentityAck:
     stable_device_identity: str
-    connection_generation: str
+    evidence_kind: DeviceIdentityEvidenceKind
+    evidence_digest: str
+    asset_map_revision: str
 
     def __post_init__(self) -> None:
         _canonical_text(self.stable_device_identity, "stable_device_identity")
-        _canonical_text(self.connection_generation, "connection_generation")
+        if not isinstance(self.evidence_kind, DeviceIdentityEvidenceKind):
+            raise TypeError("evidence_kind must be DeviceIdentityEvidenceKind")
+        _canonical_text(self.evidence_digest, "evidence_digest")
+        _canonical_text(self.asset_map_revision, "asset_map_revision")
 
 
 _INTERRUPT_OPERATIONS = frozenset(
@@ -230,7 +242,11 @@ class VerifiedBoundDeviceIdentity:
     __slots__ = (
         "_stable_device_identity",
         "_connection_generation",
+        "_evidence_kind",
+        "_evidence_digest",
+        "_asset_map_revision",
         "_broker",
+        "_probe",
         "_nonce",
     )
 
@@ -240,6 +256,8 @@ class VerifiedBoundDeviceIdentity:
         *,
         broker: "DeviceBroker",
         acknowledgement: DeviceIdentityAck,
+        connection_generation: str,
+        probe: Callable[[], DeviceIdentityAck],
         nonce: object,
     ) -> None:
         if token is not _VERIFIED_IDENTITY_TOKEN:
@@ -248,9 +266,13 @@ class VerifiedBoundDeviceIdentity:
             self, "_stable_device_identity", acknowledgement.stable_device_identity
         )
         object.__setattr__(
-            self, "_connection_generation", acknowledgement.connection_generation
+            self, "_connection_generation", connection_generation
         )
+        object.__setattr__(self, "_evidence_kind", acknowledgement.evidence_kind)
+        object.__setattr__(self, "_evidence_digest", acknowledgement.evidence_digest)
+        object.__setattr__(self, "_asset_map_revision", acknowledgement.asset_map_revision)
         object.__setattr__(self, "_broker", broker)
+        object.__setattr__(self, "_probe", probe)
         object.__setattr__(self, "_nonce", nonce)
 
     def __setattr__(self, _name: str, _value: object) -> None:
@@ -264,12 +286,28 @@ class VerifiedBoundDeviceIdentity:
     def connection_generation(self) -> str:
         return self._connection_generation
 
+    @property
+    def evidence_kind(self) -> DeviceIdentityEvidenceKind:
+        return self._evidence_kind
+
+    @property
+    def evidence_digest(self) -> str:
+        return self._evidence_digest
+
+    @property
+    def asset_map_revision(self) -> str:
+        return self._asset_map_revision
+
 
 @dataclass(frozen=True)
 class _DeviceEndpoint:
     key: ResourceKey
     stable_device_identity: str
     connection_generation: str
+    identity_evidence_kind: DeviceIdentityEvidenceKind
+    identity_evidence_digest: str
+    asset_map_revision: str
+    identity_probe: Callable[[], DeviceIdentityAck]
     execute_command: Callable[[object], object]
     capability_probe: Callable[[], object] | None
     cleanup_operations: Mapping[SafetyOperation, Callable[[], CleanupStepAck]]
@@ -279,6 +317,32 @@ class _DeviceEndpoint:
     recovery_probe: Callable[[], RecoveryAck] | None
 
 
+def _verify_live_identity(
+    binding: "BoundDevice",
+    endpoint: _DeviceEndpoint,
+) -> DeviceIdentityAck:
+    acknowledgement = endpoint.identity_probe()
+    if not isinstance(acknowledgement, DeviceIdentityAck):
+        raise TypeError("live identity probe must return DeviceIdentityAck")
+    expected = (
+        endpoint.stable_device_identity,
+        endpoint.identity_evidence_kind,
+        endpoint.identity_evidence_digest,
+        endpoint.asset_map_revision,
+    )
+    observed = (
+        acknowledgement.stable_device_identity,
+        acknowledgement.evidence_kind,
+        acknowledgement.evidence_digest,
+        acknowledgement.asset_map_revision,
+    )
+    if observed != expected:
+        raise RuntimeError(
+            f"live device identity changed for {binding.key}; explicit re-establishment is required"
+        )
+    return acknowledgement
+
+
 class BoundDevice:
     """Opaque binding reference; it contains no raw adapter callback."""
 
@@ -286,6 +350,9 @@ class BoundDevice:
         "_key",
         "_stable_device_identity",
         "_connection_generation",
+        "_identity_evidence_kind",
+        "_identity_evidence_digest",
+        "_asset_map_revision",
         "_binding_id",
         "_safety_capabilities",
         "_interrupt_capabilities",
@@ -310,6 +377,13 @@ class BoundDevice:
         object.__setattr__(
             self, "_connection_generation", endpoint.connection_generation
         )
+        object.__setattr__(
+            self, "_identity_evidence_kind", endpoint.identity_evidence_kind
+        )
+        object.__setattr__(
+            self, "_identity_evidence_digest", endpoint.identity_evidence_digest
+        )
+        object.__setattr__(self, "_asset_map_revision", endpoint.asset_map_revision)
         object.__setattr__(self, "_binding_id", binding_id)
         object.__setattr__(
             self, "_safety_capabilities", frozenset(endpoint.cleanup_operations)
@@ -338,6 +412,18 @@ class BoundDevice:
     @property
     def connection_generation(self) -> str:
         return self._connection_generation
+
+    @property
+    def identity_evidence_kind(self) -> DeviceIdentityEvidenceKind:
+        return self._identity_evidence_kind
+
+    @property
+    def identity_evidence_digest(self) -> str:
+        return self._identity_evidence_digest
+
+    @property
+    def asset_map_revision(self) -> str:
+        return self._asset_map_revision
 
     @property
     def binding_id(self) -> str:
@@ -376,6 +462,7 @@ class DeviceBroker:
         self._verified_capabilities: dict[object, VerifiedDeviceCapability] = {}
         self._capability_nonce_by_binding: dict[str, object] = {}
         self._capability_probe_inflight: set[str] = set()
+        self._identity_probe_inflight: set[str] = set()
         self._activity_epoch_by_binding: dict[str, int] = {}
         self._active: dict[str, str] = {}
         self._recovering: dict[ResourceKey, object] = {}
@@ -394,6 +481,8 @@ class DeviceBroker:
             _VERIFIED_IDENTITY_TOKEN,
             broker=self,
             acknowledgement=acknowledgement,
+            connection_generation=uuid.uuid4().hex,
+            probe=probe,
             nonce=nonce,
         )
         with self._lock:
@@ -445,6 +534,10 @@ class DeviceBroker:
             key=key,
             stable_device_identity=identity.stable_device_identity,
             connection_generation=identity.connection_generation,
+            identity_evidence_kind=identity.evidence_kind,
+            identity_evidence_digest=identity.evidence_digest,
+            asset_map_revision=identity.asset_map_revision,
+            identity_probe=identity._probe,
             execute_command=execute_command,
             capability_probe=capability_probe,
             cleanup_operations=MappingProxyType(normalized_cleanup),
@@ -467,6 +560,11 @@ class DeviceBroker:
                 and previous.binding_id in self._capability_probe_inflight
             ):
                 raise RuntimeError(f"cannot rebind device {key} during capability probe")
+            if (
+                previous is not None
+                and previous.binding_id in self._identity_probe_inflight
+            ):
+                raise RuntimeError(f"cannot rebind device {key} during identity probe")
             identity_owner = self._current_by_stable_identity.get(
                 identity.stable_device_identity
             )
@@ -520,6 +618,8 @@ class DeviceBroker:
                 raise RuntimeError("cannot probe capability while the device is active")
             if device.binding_id in self._capability_probe_inflight:
                 raise RuntimeError("device capability probe is already in progress")
+            if device.binding_id in self._identity_probe_inflight:
+                raise RuntimeError("device identity probe is already in progress")
             endpoint = self._endpoints[device.binding_id]
             probe = endpoint.capability_probe
             if probe is None:
@@ -556,6 +656,17 @@ class DeviceBroker:
             with self._lock:
                 self._capability_probe_inflight.discard(device.binding_id)
 
+    def current_binding(self, key: ResourceKey) -> BoundDevice:
+        """Return the broker-owned reference for the currently established endpoint."""
+
+        if not isinstance(key, ResourceKey):
+            raise TypeError("DeviceBroker key must be ResourceKey")
+        with self._lock:
+            binding = self._current_by_key.get(key)
+            if binding is None:
+                raise RuntimeError(f"no current device binding for {key}")
+            return binding
+
     def validate_capability(
         self,
         proof: VerifiedDeviceCapability,
@@ -583,11 +694,16 @@ class DeviceBroker:
         if token is not _BROKER_OPEN_TOKEN:
             raise PermissionError("device run leases are opened by RunController")
         _canonical_text(run_id, "run_id")
+        endpoints: list[tuple[BoundDevice, _DeviceEndpoint, int]] = []
         with self._lock:
             for binding in bindings:
                 if binding.binding_id in self._capability_probe_inflight:
                     raise RuntimeError(
                         f"device {binding.key} capability probe is in progress"
+                    )
+                if binding.binding_id in self._identity_probe_inflight:
+                    raise RuntimeError(
+                        f"device {binding.key} identity probe is already in progress"
                     )
                 if binding.key in self._recovering:
                     raise RuntimeError(f"device {binding.key} is undergoing recovery")
@@ -597,9 +713,39 @@ class DeviceBroker:
                     raise RuntimeError(f"stale device binding for {binding.key}")
                 if binding.binding_id in self._active:
                     raise RuntimeError(f"device binding {binding.key} is already active")
-            for binding in bindings:
-                self._active[binding.binding_id] = run_id
-                self._activity_epoch_by_binding[binding.binding_id] += 1
+                endpoints.append(
+                    (
+                        binding,
+                        self._endpoints[binding.binding_id],
+                        self._activity_epoch_by_binding[binding.binding_id],
+                    )
+                )
+            for binding, _endpoint, _epoch in endpoints:
+                self._identity_probe_inflight.add(binding.binding_id)
+        try:
+            for binding, endpoint, _epoch in endpoints:
+                _verify_live_identity(binding, endpoint)
+            with self._lock:
+                for binding, endpoint, epoch in endpoints:
+                    if self._current_by_key.get(binding.key) is not binding:
+                        raise RuntimeError(f"stale device binding for {binding.key}")
+                    if self._endpoints.get(binding.binding_id) is not endpoint:
+                        raise RuntimeError(f"device endpoint changed for {binding.key}")
+                    if self._activity_epoch_by_binding[binding.binding_id] != epoch:
+                        raise RuntimeError(
+                            f"device activity changed during identity probe for {binding.key}"
+                        )
+                    if binding.key in self._recovering or binding.binding_id in self._active:
+                        raise RuntimeError(
+                            f"device {binding.key} became unavailable during identity probe"
+                        )
+                for binding, _endpoint, _epoch in endpoints:
+                    self._active[binding.binding_id] = run_id
+                    self._activity_epoch_by_binding[binding.binding_id] += 1
+        finally:
+            with self._lock:
+                for binding, _endpoint, _epoch in endpoints:
+                    self._identity_probe_inflight.discard(binding.binding_id)
         return _DeviceRunLease(self, run_id, bindings)
 
     def _endpoint_for(self, run_id: str, binding: BoundDevice) -> _DeviceEndpoint:
@@ -629,6 +775,10 @@ class DeviceBroker:
             if binding.binding_id in self._capability_probe_inflight:
                 raise RuntimeError(
                     f"device {claim.key} capability probe blocks recovery"
+                )
+            if binding.binding_id in self._identity_probe_inflight:
+                raise RuntimeError(
+                    f"device {claim.key} identity probe blocks recovery"
                 )
             if claim.key in self._recovering:
                 raise RuntimeError(f"device {claim.key} already has a recovery owner")
@@ -785,6 +935,7 @@ class _DeviceRunLease:
 
     def verify_safe_state(self, binding: BoundDevice) -> SafeReceipt:
         endpoint = self._endpoint(binding)
+        _verify_live_identity(binding, endpoint)
         acknowledgement = endpoint.verify_safe_state()
         if not isinstance(acknowledgement, SafeStateAck):
             raise TypeError(

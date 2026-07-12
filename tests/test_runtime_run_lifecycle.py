@@ -16,6 +16,7 @@ from zlc_neutral_atom.runtime import (
     CommitTarget,
     DeviceBroker,
     DeviceIdentityAck,
+    DeviceIdentityEvidenceKind,
     CleanupReport,
     HazardClaim,
     MemoryCommitJournal,
@@ -82,10 +83,15 @@ def new_arbiter() -> ResourceArbiter:
 def verified_identity(
     broker: DeviceBroker,
     key: ResourceKey,
-    generation: str,
+    evidence_digest: str,
 ):
     return broker.verify_identity(
-        lambda: DeviceIdentityAck(str(key), generation)
+        lambda: DeviceIdentityAck(
+            str(key),
+            DeviceIdentityEvidenceKind.HARDWARE_IDENTITY_READBACK,
+            evidence_digest,
+            "test-assets-v1",
+        )
     )
 
 
@@ -161,23 +167,22 @@ def plan(
     if cleanup is None:
         cleanup = lambda context, _prepared, _primary: safe_cleanup_report(context, key)
     broker = DeviceBroker()
+    device = broker.bind(
+        key=key,
+        identity=verified_identity(broker, key, generation),
+        execute_command=lambda command: command,
+        cleanup_operations={SafetyOperation.SAFE_STATE: cleanup_ack},
+        verify_safe_state=lambda: SafeStateAck("test-safe-state-readback"),
+        interrupt_operations=safety_operations,
+    )
     return RunPlan(
         name="test run",
         mode=RunMode.FINITE_EXACT,
         resource_claims=(ResourceClaim(key),),
-        hazard_claims=(HazardClaim(key, str(key), generation),),
-        bound_devices=(
-            broker.bind(
-                key=key,
-                identity=verified_identity(broker, key, generation),
-                execute_command=lambda command: command,
-                cleanup_operations={
-                    SafetyOperation.SAFE_STATE: cleanup_ack
-                },
-                verify_safe_state=lambda: SafeStateAck("test-safe-state-readback"),
-                interrupt_operations=safety_operations,
-            ),
+        hazard_claims=(
+            HazardClaim(key, str(key), device.connection_generation),
         ),
+        bound_devices=(device,),
         preflight=preflight,
         execute=execute,
         cleanup=cleanup,
@@ -742,39 +747,36 @@ def test_mixed_cleanup_releases_safe_device_and_quarantines_only_failed_device()
         )
 
     broker = DeviceBroker()
+    camera_device = broker.bind(
+        key=camera,
+        identity=verified_identity(broker, camera, "camera-generation"),
+        execute_command=lambda command: command,
+        cleanup_operations={
+            SafetyOperation.SAFE_STATE: lambda: safe_ack(digest="camera-safe")
+        },
+        verify_safe_state=lambda: SafeStateAck("camera-safe-readback"),
+    )
+    fpga_device = broker.bind(
+        key=fpga,
+        identity=verified_identity(broker, fpga, "fpga-generation"),
+        execute_command=lambda command: command,
+        cleanup_operations={
+            SafetyOperation.SAFE_STATE: lambda: safe_ack(digest="fpga-safe")
+        },
+        verify_safe_state=lambda: SafeStateAck("fpga-safe-readback"),
+    )
     run_plan = RunPlan(
         name="mixed cleanup",
         mode=RunMode.FINITE_EXACT,
         resource_claims=(ResourceClaim(camera), ResourceClaim(fpga)),
         hazard_claims=(
-            HazardClaim(camera, str(camera), "camera-generation"),
-            HazardClaim(fpga, str(fpga), "fpga-generation"),
+            HazardClaim(camera, str(camera), camera_device.connection_generation),
+            HazardClaim(fpga, str(fpga), fpga_device.connection_generation),
         ),
         preflight=lambda _ctx: "prepared",
         execute=lambda _ctx, _prepared: "result",
         cleanup=cleanup,
-        bound_devices=(
-            broker.bind(
-                key=camera,
-                identity=verified_identity(broker, camera, "camera-generation"),
-                execute_command=lambda command: command,
-                cleanup_operations={
-                    SafetyOperation.SAFE_STATE: lambda: safe_ack(
-                        digest="camera-safe"
-                    )
-                },
-                verify_safe_state=lambda: SafeStateAck("camera-safe-readback"),
-            ),
-            broker.bind(
-                key=fpga,
-                identity=verified_identity(broker, fpga, "fpga-generation"),
-                execute_command=lambda command: command,
-                cleanup_operations={
-                    SafetyOperation.SAFE_STATE: lambda: safe_ack(digest="fpga-safe")
-                },
-                verify_safe_state=lambda: SafeStateAck("fpga-safe-readback"),
-            ),
-        ),
+        bound_devices=(camera_device, fpga_device),
         finalize=lambda _ctx, result: finalized.set() or result,
     )
     handle = controller.start(run_plan)
@@ -967,7 +969,9 @@ def test_read_status_ack_cannot_be_used_as_verified_safe_state():
             name="status is not safety proof",
             mode=RunMode.FINITE_EXACT,
             resource_claims=(ResourceClaim(key),),
-            hazard_claims=(HazardClaim(key, str(key), "generation"),),
+            hazard_claims=(
+                HazardClaim(key, str(key), device.connection_generation),
+            ),
             bound_devices=(device,),
             preflight=lambda _context: None,
             execute=lambda _context, _prepared: None,
@@ -987,6 +991,20 @@ def test_safety_proof_is_immutable_and_cannot_substitute_another_device():
     camera_verified = threading.Event()
     fpga_verified = threading.Event()
     broker = DeviceBroker()
+    camera_device = broker.bind(
+        key=camera,
+        identity=verified_identity(broker, camera, "camera-generation"),
+        execute_command=lambda command: command,
+        cleanup_operations={SafetyOperation.SAFE_STATE: safe_ack},
+        verify_safe_state=lambda: camera_verified.set() or SafeStateAck("camera-safe"),
+    )
+    fpga_device = broker.bind(
+        key=fpga,
+        identity=verified_identity(broker, fpga, "fpga-generation"),
+        execute_command=lambda command: command,
+        cleanup_operations={SafetyOperation.SAFE_STATE: safe_ack},
+        verify_safe_state=lambda: fpga_verified.set() or SafeStateAck("fpga-safe"),
+    )
 
     def cleanup(context, _prepared, _primary):
         camera_device = context.cleanup_device(camera)
@@ -1012,27 +1030,10 @@ def test_safety_proof_is_immutable_and_cannot_substitute_another_device():
         mode=RunMode.FINITE_EXACT,
         resource_claims=(ResourceClaim(camera), ResourceClaim(fpga)),
         hazard_claims=(
-            HazardClaim(camera, str(camera), "camera-generation"),
-            HazardClaim(fpga, str(fpga), "fpga-generation"),
+            HazardClaim(camera, str(camera), camera_device.connection_generation),
+            HazardClaim(fpga, str(fpga), fpga_device.connection_generation),
         ),
-        bound_devices=(
-            broker.bind(
-                key=camera,
-                identity=verified_identity(broker, camera, "camera-generation"),
-                execute_command=lambda command: command,
-                cleanup_operations={SafetyOperation.SAFE_STATE: safe_ack},
-                verify_safe_state=lambda: camera_verified.set()
-                or SafeStateAck("camera-safe"),
-            ),
-            broker.bind(
-                key=fpga,
-                identity=verified_identity(broker, fpga, "fpga-generation"),
-                execute_command=lambda command: command,
-                cleanup_operations={SafetyOperation.SAFE_STATE: safe_ack},
-                verify_safe_state=lambda: fpga_verified.set()
-                or SafeStateAck("fpga-safe"),
-            ),
-        ),
+        bound_devices=(camera_device, fpga_device),
         preflight=lambda _context: None,
         execute=lambda _context, _prepared: "result",
         cleanup=cleanup,
@@ -1126,7 +1127,9 @@ def test_interrupt_capability_must_be_declared_thread_safe_separately():
             name="missing interrupt capability",
             mode=RunMode.FINITE_EXACT,
             resource_claims=(ResourceClaim(key),),
-            hazard_claims=(HazardClaim(key, str(key), "generation"),),
+            hazard_claims=(
+                HazardClaim(key, str(key), device.connection_generation),
+            ),
             bound_devices=(device,),
             preflight=lambda _ctx: None,
             execute=lambda _ctx, _prepared: None,
@@ -1169,32 +1172,31 @@ def test_multi_device_interrupt_attempts_every_device_after_one_failure():
         return CleanupReport.safe(receipts)
 
     broker = DeviceBroker()
+    camera_device = broker.bind(
+        key=camera,
+        identity=verified_identity(broker, camera, "camera-generation"),
+        execute_command=lambda command: command,
+        cleanup_operations={SafetyOperation.SAFE_STATE: safe_ack},
+        verify_safe_state=lambda: SafeStateAck("camera-safe-readback"),
+        interrupt_operations={SafetyOperation.ABORT: camera_interrupt},
+    )
+    fpga_device = broker.bind(
+        key=fpga,
+        identity=verified_identity(broker, fpga, "fpga-generation"),
+        execute_command=lambda command: command,
+        cleanup_operations={SafetyOperation.SAFE_STATE: safe_ack},
+        verify_safe_state=lambda: SafeStateAck("fpga-safe-readback"),
+        interrupt_operations={SafetyOperation.ABORT: fpga_interrupt},
+    )
     run_plan = RunPlan(
         name="all interrupts",
         mode=RunMode.FINITE_EXACT,
         resource_claims=(ResourceClaim(camera), ResourceClaim(fpga)),
         hazard_claims=(
-            HazardClaim(camera, str(camera), "camera-generation"),
-            HazardClaim(fpga, str(fpga), "fpga-generation"),
+            HazardClaim(camera, str(camera), camera_device.connection_generation),
+            HazardClaim(fpga, str(fpga), fpga_device.connection_generation),
         ),
-        bound_devices=(
-            broker.bind(
-                key=camera,
-                identity=verified_identity(broker, camera, "camera-generation"),
-                execute_command=lambda command: command,
-                cleanup_operations={SafetyOperation.SAFE_STATE: safe_ack},
-                verify_safe_state=lambda: SafeStateAck("camera-safe-readback"),
-                interrupt_operations={SafetyOperation.ABORT: camera_interrupt},
-            ),
-            broker.bind(
-                key=fpga,
-                identity=verified_identity(broker, fpga, "fpga-generation"),
-                execute_command=lambda command: command,
-                cleanup_operations={SafetyOperation.SAFE_STATE: safe_ack},
-                verify_safe_state=lambda: SafeStateAck("fpga-safe-readback"),
-                interrupt_operations={SafetyOperation.ABORT: fpga_interrupt},
-            ),
-        ),
+        bound_devices=(camera_device, fpga_device),
         preflight=lambda _ctx: None,
         execute=execute,
         cleanup=cleanup,
@@ -1687,7 +1689,9 @@ def test_captured_bound_device_reference_has_no_hardware_invocation_surface():
         name="captured binding reference",
         mode=RunMode.FINITE_EXACT,
         resource_claims=(ResourceClaim(key),),
-        hazard_claims=(HazardClaim(key, str(key), "generation"),),
+        hazard_claims=(
+            HazardClaim(key, str(key), device.connection_generation),
+        ),
         bound_devices=(device,),
         preflight=lambda _ctx: None,
         execute=execute,
@@ -1698,6 +1702,96 @@ def test_captured_bound_device_reference_has_no_hardware_invocation_surface():
     )
     controller = RunController(new_arbiter())
     assert controller.run(run_plan) is device
+
+
+def test_live_identity_change_rejects_start_before_any_hardware_command():
+    key = camera_key("identity-changed-before-start")
+    evidence = {"digest": "readback-at-bind"}
+    commands = []
+    broker = DeviceBroker()
+    identity = broker.verify_identity(
+        lambda: DeviceIdentityAck(
+            str(key),
+            DeviceIdentityEvidenceKind.HARDWARE_IDENTITY_READBACK,
+            evidence["digest"],
+            "test-assets-v1",
+        )
+    )
+    device = broker.bind(
+        key=key,
+        identity=identity,
+        execute_command=lambda command: commands.append(command),
+        cleanup_operations={SafetyOperation.SAFE_STATE: safe_ack},
+        verify_safe_state=lambda: SafeStateAck("safe-readback"),
+    )
+    evidence["digest"] = "different-live-readback"
+    run_plan = RunPlan(
+        name="identity must still match before run",
+        mode=RunMode.FINITE_EXACT,
+        resource_claims=(ResourceClaim(key),),
+        hazard_claims=(HazardClaim(key, str(key), device.connection_generation),),
+        bound_devices=(device,),
+        preflight=lambda _context: None,
+        execute=lambda context, _prepared: context.device(key).execute("fire"),
+        cleanup=lambda context, _prepared, _primary: safe_cleanup_report(context, key),
+        finalize=lambda _context, result: result,
+    )
+    arbiter = new_arbiter()
+
+    with pytest.raises(RuntimeError, match="explicit re-establishment"):
+        RunController(arbiter).start(run_plan)
+
+    assert commands == []
+    assert not arbiter.active_claims()
+
+
+def test_identity_change_during_run_cannot_authorize_safe_release():
+    key = camera_key("identity-changed-during-run")
+    evidence = {"digest": "readback-at-bind"}
+    broker = DeviceBroker()
+    identity = broker.verify_identity(
+        lambda: DeviceIdentityAck(
+            str(key),
+            DeviceIdentityEvidenceKind.HARDWARE_IDENTITY_READBACK,
+            evidence["digest"],
+            "test-assets-v1",
+        )
+    )
+    device = broker.bind(
+        key=key,
+        identity=identity,
+        execute_command=lambda command: command,
+        cleanup_operations={SafetyOperation.SAFE_STATE: safe_ack},
+        verify_safe_state=lambda: SafeStateAck("safe-readback"),
+    )
+
+    def execute(context, _prepared):
+        context.device(key).execute("fire")
+        evidence["digest"] = "different-live-readback"
+        return "data"
+
+    run_plan = RunPlan(
+        name="identity must still match for safe proof",
+        mode=RunMode.FINITE_EXACT,
+        resource_claims=(ResourceClaim(key),),
+        hazard_claims=(HazardClaim(key, str(key), device.connection_generation),),
+        bound_devices=(device,),
+        preflight=lambda _context: None,
+        execute=execute,
+        cleanup=lambda context, _prepared, _primary: safe_cleanup_report(context, key),
+        finalize=lambda _context, result: result,
+    )
+    arbiter = new_arbiter()
+    handle = RunController(arbiter).start(run_plan)
+
+    with pytest.raises(RunFailed):
+        handle.result(2.0)
+
+    assert "explicit re-establishment" in handle.snapshot().cleanup_errors[0]
+    assert isinstance(
+        arbiter.acquire_all("retry", (ResourceClaim(key),)),
+        ResourceQuarantined,
+    )
 
 
 def test_terminal_history_callback_runs_after_claim_release_and_keeps_owner_truthful():

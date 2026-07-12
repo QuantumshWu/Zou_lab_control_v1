@@ -13,6 +13,7 @@ from zlc_neutral_atom.runtime import (
     ClaimMode,
     DeviceBroker,
     DeviceIdentityAck,
+    DeviceIdentityEvidenceKind,
     HazardClaim,
     HazardRecord,
     MemoryQuarantineJournal,
@@ -68,10 +69,15 @@ def hazard(key: ResourceKey, generation: str) -> HazardClaim:
 def verified_identity(
     broker: DeviceBroker,
     stable_device_identity: str,
-    generation: str,
+    evidence_digest: str,
 ):
     return broker.verify_identity(
-        lambda: DeviceIdentityAck(stable_device_identity, generation)
+        lambda: DeviceIdentityAck(
+            stable_device_identity,
+            DeviceIdentityEvidenceKind.HARDWARE_IDENTITY_READBACK,
+            evidence_digest,
+            "test-assets-v1",
+        )
     )
 
 
@@ -159,7 +165,7 @@ def complete_recovery(
         verify_safe_state=lambda: SafeStateAck("verified-safe-state"),
         recovery_probe=lambda: RecoveryAck(
             stable_device_identity=str(key),
-            connection_generation=generation,
+            connection_generation=devices.current_binding(key).connection_generation,
             health_digest="verified-health",
             safe_state_digest="verified-safe-state",
             verified_at=time.time(),
@@ -581,6 +587,31 @@ def test_device_binding_requires_a_typed_identity_handshake():
         )
 
 
+def test_broker_mints_a_fresh_generation_for_each_endpoint_establishment():
+    broker = DeviceBroker()
+    key = ResourceKey.parse("device/camera/reconnect-generation")
+
+    first = broker.bind(
+        key=key,
+        identity=verified_identity(broker, "camera-serial", "readback-one"),
+        execute_command=lambda command: command,
+        cleanup_operations={},
+        verify_safe_state=lambda: SafeStateAck("safe"),
+    )
+    second = broker.bind(
+        key=key,
+        identity=verified_identity(broker, "camera-serial", "readback-two"),
+        execute_command=lambda command: command,
+        cleanup_operations={},
+        verify_safe_state=lambda: SafeStateAck("safe"),
+    )
+
+    assert first.connection_generation != second.connection_generation
+    assert first.connection_generation not in {"readback-one", "readback-two"}
+    assert second.connection_generation not in {"readback-one", "readback-two"}
+    assert broker.current_binding(key) is second
+
+
 def test_mixed_safety_bundle_is_atomic_idempotent_and_keeps_claim_until_terminal():
     class LostAcknowledgementJournal(MemoryQuarantineJournal):
         fail_once = True
@@ -664,7 +695,7 @@ def test_recovery_bundle_retry_is_one_atomic_idempotent_record():
         verify_safe_state=lambda: SafeStateAck("verified-safe-state"),
         recovery_probe=lambda: RecoveryAck(
             stable_device_identity=str(key),
-            connection_generation="recovered-generation",
+            connection_generation=devices.current_binding(key).connection_generation,
             health_digest="verified-health",
             safe_state_digest="verified-safe-state",
             verified_at=time.time(),
@@ -727,7 +758,7 @@ def test_recovery_probe_identity_mismatch_keeps_quarantine():
         verify_safe_state=lambda: SafeStateAck("verified-safe-state"),
         recovery_probe=lambda: RecoveryAck(
             stable_device_identity="different-camera-serial",
-            connection_generation="current-generation",
+            connection_generation=devices.current_binding(key).connection_generation,
             health_digest="verified-health",
             safe_state_digest="verified-safe-state",
             verified_at=time.time(),
@@ -763,7 +794,7 @@ def test_different_physical_device_cannot_clear_old_device_hazard():
         verify_safe_state=lambda: SafeStateAck("safe"),
         recovery_probe=lambda: RecoveryAck(
             stable_device_identity="different-physical-serial",
-            connection_generation="new-generation",
+            connection_generation=devices.current_binding(key).connection_generation,
             health_digest="healthy",
             safe_state_digest="safe",
             verified_at=time.time(),
@@ -794,7 +825,7 @@ def test_recovery_binding_lease_blocks_rebind_until_complete_or_abort():
         assert allow.wait(2.0)
         return RecoveryAck(
             stable_device_identity=str(key),
-            connection_generation="recovery-generation",
+            connection_generation=devices.current_binding(key).connection_generation,
             health_digest="healthy",
             safe_state_digest="safe",
             verified_at=time.time(),
@@ -865,7 +896,7 @@ def test_recovery_evidence_must_postdate_the_records_it_clears():
         verify_safe_state=lambda: SafeStateAck("verified-safe-state"),
         recovery_probe=lambda: RecoveryAck(
             stable_device_identity=str(key),
-            connection_generation="current-generation",
+            connection_generation=devices.current_binding(key).connection_generation,
             health_digest="verified-health",
             safe_state_digest="verified-safe-state",
             verified_at=1.0,
