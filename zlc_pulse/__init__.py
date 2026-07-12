@@ -12,6 +12,7 @@ from .document import (
     save_pulse_document,
 )
 from .legacy import load_pulse_document
+from .binding import bind_pulse_document_target
 from .ir import (
     TARGET_IR_SCHEMA,
     TargetBusDelay,
@@ -76,6 +77,7 @@ __all__ = [
     "TargetIR",
     "TriggerEdge",
     "build_digital_trigger_schedules",
+    "bind_pulse_document_target",
     "compiled_pulse_artifact_from_tree",
     "compiled_pulse_artifact_to_tree",
     "digital_trigger_schedule_from_tree",
