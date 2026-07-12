@@ -177,15 +177,29 @@ class NeutralAtomSession:
         hardware the session drives (do it before running measurements, not mid-acquisition).
 
         ``config`` takes the SAME forms as :func:`connect` (``"virtual"``, a bundled config name, a JSON
-        path, or a ``{role: {type, params}}`` dict).  The NEW set is built FIRST (so a bad config leaves
-        the current session untouched), then swapped in and every device-derived piece of state -- the
-        imaging sequence, the calibration, the readout / timing subsystems -- is re-derived so the
-        session is consistent with the new hardware; the OLD devices are then closed.  ``open_devices``
+        path, or a ``{role: {type, params}}`` dict).  The NEW set and every purely-derived replacement
+        object are built FIRST (so a bad config leaves the current session untouched); consumers then
+        stop, the OLD devices confirm close, and the complete new state is published in one assignment
+        boundary.  ``open_devices``
         opens the real hardware immediately (else it stays lazy, opened on first use / :meth:`open_devices`).
         The device manager's "Load config" button routes here.  Returns ``self``."""
         from .devices import load_devices, read_config
 
-        new_devices = load_devices(read_config(config), open_devices=open_devices)
+        # Build/validate replacement objects first, but never OPEN the new physical set while
+        # the old owner is still live.  Hardware opening happens only after consumers stop and
+        # the old DeviceSet has confirmed close.
+        new_devices = load_devices(read_config(config), open_devices=False)
+        try:
+            staged_sequence = self._build_imaging_sequence_for_devices(
+                new_devices,
+                exposure=self._camera_exposure_for_devices(new_devices),
+                load=True,
+            )
+            staged_readout = ReadoutSubsystem(self)
+            staged_timing = TimingSubsystem(self)
+        except BaseException:
+            new_devices.close()
+            raise
         # The new set built OK -- NOW stop the consumers that ride the devices ABOUT TO BE
         # REPLACED, before the swap, so nothing keeps driving hardware that is about to be closed.
         # Ordered after the build on purpose: a bad config leaves the whole session -- including
@@ -200,22 +214,43 @@ class NeutralAtomSession:
             for role, old_dev in dict(getattr(old_devices, "devices", {}) or {}).items():
                 if old_dev is not None and new_by_role.get(role) is not old_dev:
                     affected.add(id(old_dev))
-        self._notify_device_change(affected)
-        self.devices = new_devices
-        self.sequence = self.build_imaging_sequence(exposure=self.camera_exposure(), load=True)
-        self._calibration = None                          # the old calibration was for the old camera
-        self._readout_subsystem = ReadoutSubsystem(self)  # subsystems read devices through the session
-        self._timing_subsystem = TimingSubsystem(self)
+        try:
+            self._notify_device_change(affected)
+        except BaseException as consumer_error:
+            try:
+                new_devices.close()
+            except BaseException as new_close_error:
+                raise RuntimeError(
+                    "consumer stop failed and the staged replacement devices also failed to close: "
+                    f"{type(new_close_error).__name__}: {new_close_error}"
+                ) from consumer_error
+            raise
         if old_devices is not None and old_devices is not new_devices:
             try:
                 old_devices.close()
-            except Exception:
-                # A failed close (dead RPyC / camera handle -- common on real hardware) must be
-                # SURFACED, not silently swallowed: an un-closed device lingers on the hardware.
-                # Log it like every other teardown path here, never a bare ``pass``.
-                import logging
-                logging.getLogger(__name__).warning(
-                    "closing the previous device set after load_config failed", exc_info=True)
+            except BaseException as old_close_error:
+                try:
+                    new_devices.close()
+                except BaseException as new_close_error:
+                    raise RuntimeError(
+                        "previous devices failed to close and staged replacement cleanup also failed: "
+                        f"{type(new_close_error).__name__}: {new_close_error}"
+                    ) from old_close_error
+                raise RuntimeError(
+                    "device config swap refused because the previous device set did not close"
+                ) from old_close_error
+        # Publish all session-visible derived state together.  No constructor or sequence compilation
+        # remains on the far side of this boundary, so an exception cannot expose new devices with an
+        # old sequence/calibration/subsystem graph.
+        (
+            self.devices,
+            self.sequence,
+            self._calibration,
+            self._readout_subsystem,
+            self._timing_subsystem,
+        ) = (new_devices, staged_sequence, None, staged_readout, staged_timing)
+        if open_devices:
+            self.open_devices()
         return self
 
     def open_devices(self):
@@ -301,7 +336,14 @@ class NeutralAtomSession:
         ``pre_trigger``): the channel wiring (which line gates the frame) is filled
         in from the ONE source ``_imaging_channel_kwargs`` so every imaging path --
         sitemap, thresholds, detect, ``capture`` -- gates identically."""
-        return imaging_sequence(**kwargs, **self._imaging_channel_kwargs())
+        return self._build_imaging_sequence_for_devices(self.devices, **kwargs)
+
+    @staticmethod
+    def _build_imaging_sequence_for_devices(devices: DeviceSet, **kwargs) -> PulseSequence:
+        return imaging_sequence(
+            **kwargs,
+            **NeutralAtomSession._imaging_channel_kwargs_for_devices(devices),
+        )
 
     def _imaging_channel_kwargs(self) -> dict[str, str]:
         # Single source of truth lives in timing.imaging_channel_kwargs so the
@@ -309,9 +351,15 @@ class NeutralAtomSession:
         # The CAMERA owns which line gates a frame, so the imaging pulse triggers THAT channel --
         # read through the one derived fact (CameraDevice.primary_trigger_channel: the first
         # active counting line, None for a free-running sensor / no camera in the config).
-        cam = getattr(self.devices, "camera", None)
-        return imaging_channel_kwargs(getattr(self.devices, "sequencer", None),
-                                      trigger_channel=getattr(cam, "primary_trigger_channel", None))
+        return self._imaging_channel_kwargs_for_devices(self.devices)
+
+    @staticmethod
+    def _imaging_channel_kwargs_for_devices(devices: DeviceSet) -> dict[str, str]:
+        cam = getattr(devices, "camera", None)
+        return imaging_channel_kwargs(
+            getattr(devices, "sequencer", None),
+            trigger_channel=getattr(cam, "primary_trigger_channel", None),
+        )
 
     def load_calibration(self, path: str | Path) -> TrapCalibration:
         self._calibration = TrapCalibration.load(path)
@@ -368,16 +416,21 @@ class NeutralAtomSession:
             self._device_teardown_hooks.append(hook)
 
     def _release_device_consumers(self) -> None:
-        """Run every registered teardown hook (stop running consumers), never letting one broken
-        hook block the device close/swap itself -- teardown must always complete."""
-        import logging
+        """Prove every registered consumer stopped before closing its devices."""
 
+        failures = []
         for hook in tuple(self._device_teardown_hooks):
             try:
-                hook()
-            except Exception:
-                logging.getLogger(__name__).warning(
-                    "device teardown hook %r failed; continuing teardown", hook, exc_info=True)
+                result = hook()
+                if result is False:
+                    failures.append(f"{hook!r} reported unresolved ownership")
+            except BaseException as exc:
+                failures.append(f"{hook!r} failed: {type(exc).__name__}: {exc}")
+        if failures:
+            raise RuntimeError(
+                "device close refused because consumers did not terminate: "
+                + "; ".join(failures)
+            )
 
     def add_device_change_hook(self, hook) -> None:
         """Register a callable ``hook(affected_ids: set[int])`` run BEFORE specific device
@@ -390,16 +443,21 @@ class NeutralAtomSession:
             self._device_change_hooks.append(hook)
 
     def _notify_device_change(self, affected_ids: set) -> None:
-        """Tell every change hook which device instances are going away -- a broken hook never
-        blocks the swap."""
-        import logging
+        """Stop affected consumers; an unconfirmed stop vetoes the device swap."""
 
+        failures = []
         for hook in tuple(self._device_change_hooks):
             try:
-                hook(set(affected_ids))
-            except Exception:
-                logging.getLogger(__name__).warning(
-                    "device change hook %r failed; continuing swap", hook, exc_info=True)
+                result = hook(set(affected_ids))
+                if result is False:
+                    failures.append(f"{hook!r} reported unresolved ownership")
+            except BaseException as exc:
+                failures.append(f"{hook!r} failed: {type(exc).__name__}: {exc}")
+        if failures:
+            raise RuntimeError(
+                "device swap refused because consumers did not terminate: "
+                + "; ".join(failures)
+            )
 
     def close(self) -> None:
         self._release_device_consumers()   # stop consumers (running GUI nodes) BEFORE the devices go
@@ -409,7 +467,11 @@ class NeutralAtomSession:
         """The readout camera's current exposure (seconds) -- the PUBLIC seam the
         readout / timing subsystems read to gate a frame.  A camera-less config still
         composes imaging sequences with the stock default (no fabricated device needed)."""
-        camera = getattr(self.devices, "camera", None)
+        return self._camera_exposure_for_devices(self.devices)
+
+    @staticmethod
+    def _camera_exposure_for_devices(devices: DeviceSet) -> float:
+        camera = getattr(devices, "camera", None)
         if camera is None:
             return DEFAULT_EXPOSURE_S
         return float(getattr(camera, "exposure", getattr(getattr(camera, "config", None), "exposure", DEFAULT_EXPOSURE_S)))

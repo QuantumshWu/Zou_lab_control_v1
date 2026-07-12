@@ -281,7 +281,11 @@ def retain_window(window: QtWidgets.QWidget, *extras) -> None:
     window.destroyed.connect(_prune)
     closed = getattr(window, "closed", None)
     if closed is not None and not getattr(window, "_hide_on_close", False):
-        closed.connect(_prune)
+        def _prune_committed_close(*_args) -> None:
+            if getattr(window, "_zlc_close_committed", True):
+                _prune()
+
+        closed.connect(_prune_committed_close)
 
 
 def fluent_font_size() -> int:
@@ -2820,7 +2824,7 @@ class FluentWindow(FramelessWindow):
     """
 
     hidden = QtCore.pyqtSignal()   # fires on close OR hide/minimize (event-loop quit)
-    closed = QtCore.pyqtSignal()   # fires ONLY on a genuine close, never on hide/minimize
+    closed = QtCore.pyqtSignal()   # notification AFTER a committed close; never a close command
     close_requested = QtCore.pyqtSignal()  # fires on the X/close (before hide-or-destroy), NOT on minimize
 
     def __init__(
@@ -2833,6 +2837,9 @@ class FluentWindow(FramelessWindow):
     ):
         super().__init__(parent)
         self._hide_on_close = bool(hide_on_close)
+        self._zlc_close_guard = None
+        self._zlc_hide_guard = None
+        self._zlc_close_committed = False
         self.setObjectName("FluentWindow")
         self.setStyleSheet(f"QWidget#FluentWindow {{ background: {BG}; }}")
 
@@ -2921,15 +2928,44 @@ class FluentWindow(FramelessWindow):
         super().resizeEvent(event)
         self._position_window_title()
 
+    def set_close_guard(self, guard) -> None:
+        """Install an internal lifecycle guard evaluated before a real close.
+
+        The guard returns True only after child workers/resources are confirmed
+        terminated.  False or an exception keeps the window and its children alive,
+        allowing a later close attempt to retry instead of tearing down live owners.
+        """
+
+        if guard is not None and not callable(guard):
+            raise TypeError("close guard must be callable or None")
+        self._zlc_close_guard = guard
+
+    def set_hide_guard(self, guard) -> None:
+        """Install the equivalent owner-termination guard for X-to-hide windows."""
+
+        if guard is not None and not callable(guard):
+            raise TypeError("hide guard must be callable or None")
+        self._zlc_hide_guard = guard
+
     def closeEvent(self, event):
+        guard = self._zlc_hide_guard if self._hide_on_close else self._zlc_close_guard
+        if guard is not None:
+            try:
+                ready = guard() is True
+            except BaseException:
+                ready = False
+            if not ready:
+                event.ignore()
+                return
         self.close_requested.emit()   # the X was pressed (NOT a minimize); fires whether we hide or destroy
-        self.hidden.emit()
         if self._hide_on_close:
             event.ignore()
             self.hide()
             return
-        self.closed.emit()   # a genuine close (NOT hide/minimize): hosts release resources here
         super().closeEvent(event)
+        if event.isAccepted():
+            self._zlc_close_committed = True
+            self.closed.emit()   # notification after a genuine committed close
 
     def hideEvent(self, event):
         self.hidden.emit()

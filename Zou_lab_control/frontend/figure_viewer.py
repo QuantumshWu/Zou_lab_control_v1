@@ -674,15 +674,37 @@ class FigureViewer(QtWidgets.QWidget):
             self.status.show_message(f"could not load: {str(exc).splitlines()[0][:160]}",
                                      severity="error")
             return
+        # EVERY figure -- array OR pulse -- takes the SAME path: publish as ``fig_value``, seed ONE panel
+        # of the saved kind that reproduces it.  A pulse figure seeds a ``kind="pulse"`` panel exactly as
+        # a hist seeds a ``kind="hist"`` panel; the console / Monitor tab are never replaced.
+        try:
+            self._build_console(saved)
+        except BaseException as exc:
+            activation_lost = (
+                self.node is None
+                and self.console is not None
+                and self.console.state.name == "figure-load-failed"
+            )
+            if activation_lost:
+                self.saved = None
+                self._current_path = None
+                self._clear_info()
+            with _signals_blocked(self.path_edit.edit):
+                self.path_edit.setText(
+                    "" if self._current_path is None else str(self._current_path)
+                )
+            self.status.show_message(
+                f"could not activate figure: {str(exc).splitlines()[0][:160]}",
+                severity="error",
+            )
+            return
+        # Metadata and the info/path UI are part of the same generation commit.  They move only after
+        # node/Hub/console activation succeeds; a render-barrier veto leaves the complete old viewer.
         self.saved = saved
         self._current_path = path
         with _signals_blocked(self.path_edit.edit):
             self.path_edit.setText(str(path))
         self._fill_info(saved)
-        # EVERY figure -- array OR pulse -- takes the SAME path: publish as ``fig_value``, seed ONE panel
-        # of the saved kind that reproduces it.  A pulse figure seeds a ``kind="pulse"`` panel exactly as
-        # a hist seeds a ``kind="hist"`` panel; the console / Monitor tab are never replaced.
-        self._build_console(saved)
         self.status.show_message(
             f"loaded {display_path(str(path))} -> fig_value signal; the seeded {saved.kind or 'figure'} "
             "panel reproduces it -- Add Panel to view it another way.")
@@ -693,6 +715,13 @@ class FigureViewer(QtWidgets.QWidget):
             w = item.widget()
             if w is not None:
                 w.deleteLater()
+
+    def _clear_info(self) -> None:
+        for layout in (self.plot_layout, self.meas_layout, self.info_layout):
+            self._clear_layout(layout)
+        self.flow_view.set_graph(None)
+        self.raw_info.clear()
+        self.raw_info.setToolTip("")
 
     def _fill_info(self, saved: SavedFigure) -> None:
         for layout in (self.plot_layout, self.meas_layout, self.info_layout):
@@ -851,28 +880,14 @@ class FigureViewer(QtWidgets.QWidget):
         # this one does not (a prior site-map's ``fig_centers``/``fig_frame`` must not linger on a bare
         # 1-D curve).  The console reuses the same hub, so it follows the new schema version seamlessly.
         prev = self.node
-        if prev is not None:
-            try:
-                prev.stop()
-            except Exception:
-                pass
-        self.node = None
+        candidate = None
         if saved is not None:
-            self.node = LoadedFigureNode(self.hub, saved)
-            if prev is not None:
-                try:
-                    self.node._inherit_output_schema_ownership(prev)
-                except Exception:
-                    pass
-            self.node.step()                   # publish once so the signal is on the hub immediately
-            if prev is not None and hasattr(prev, "published_signals"):
-                try:
-                    self.hub.remove_signals(
-                        set(prev.published_signals()) - set(self.node.published_signals()))
-                except Exception:
-                    pass
-            state = _seed_state(saved, self.node)
-            running: list = [self.node]
+            # Construct and validate the replacement without touching the shared Hub.  Publication is
+            # the generation commit and therefore happens only after the old panel's render ownership
+            # has been acknowledged by ``console.reseed`` below.
+            candidate = LoadedFigureNode(self.hub, saved)
+            state = _seed_state(saved, candidate)
+            running: list = [candidate]
         else:
             state = TaskConsoleState(name="figure", panels=[])
             running = []
@@ -886,9 +901,17 @@ class FigureViewer(QtWidgets.QWidget):
             console_w = max(scaled_px(520, minimum=380),
                             fit.width() - self._info_col_w - self._pane_gap)
             console_h = max(scaled_px(360, minimum=280), fit.height() - 2 * self._pane_pad)
-            self.console = TaskConsole(hub=self.hub, state=state, running_nodes=running,
-                                       session=None, scale=self._scale,
-                                       window_px=(console_w, console_h), embedded=True)
+            if candidate is not None:
+                candidate.step()
+            self.console = TaskConsole(
+                hub=self.hub,
+                state=state,
+                running_nodes=running,
+                session=None,
+                scale=self._scale,
+                window_px=(console_w, console_h),
+                embedded=True,
+            )
             self._console_holder.addWidget(self.console)
         else:
             # RESEED in place: reuse the WHOLE console widget tree (chrome / board / hub / refresh
@@ -896,31 +919,68 @@ class FigureViewer(QtWidgets.QWidget):
             # and construct a fresh one every load -- re-realizing the entire Qt widget tree (~0.35 s of
             # the perceived load) despite this docstring always claiming it "reseeds".  This IS that
             # reseed, so a re-load only pays for the ONE panel changing, not the console chrome.
+            if prev is not None:
+                try:
+                    stopped = prev.stop(timeout=5.0) is True and not prev.running
+                except BaseException:
+                    stopped = False
+                if not stopped:
+                    raise RuntimeError(
+                        "cannot replace the loaded figure while its source node is still active"
+                    )
+            if candidate is not None and prev is not None:
+                candidate._inherit_output_schema_ownership(prev)
+            # This is the prepare boundary: barrier/teardown failure leaves the old registry, Hub and
+            # ``self.node`` untouched.  The candidate has not published anything yet.
             self.console.reseed(state, running_nodes=running)
+            try:
+                if candidate is not None:
+                    candidate.step()
+                if prev is not None and hasattr(prev, "published_signals"):
+                    previous = set(prev.published_signals())
+                    current = set(candidate.published_signals()) if candidate is not None else set()
+                    self.hub.remove_signals(previous - current)
+            except BaseException:
+                # The old panels are already safely torn down, so rollback means an explicit empty
+                # diagnostic board rather than re-exposing old UI against a partially changed Hub.
+                self.console.reseed(
+                    TaskConsoleState(name="figure-load-failed", panels=[]), running_nodes=[]
+                )
+                failed_names = set(candidate.published_signals()) if candidate is not None else set()
+                if prev is not None and hasattr(prev, "published_signals"):
+                    failed_names.update(prev.published_signals())
+                if failed_names:
+                    self.hub.remove_signals(failed_names)
+                self.node = None
+                raise
+        self.node = candidate
         if saved is not None:
             # A LOADED figure is STATIC: render its seeded panel NOW (synchronously) rather than waiting
             # for the console's first refresh-timer beat (~DEFAULT_UPDATE_MS) to first-draw it -- that
             # dead wait is why the panel sat BLANK for ~0.4 s after Load before the figure appeared.
             self.console.refresh_once()
 
-    def _teardown_console(self) -> None:
+    def _teardown_console(self) -> bool:
         if self.console is not None:
             try:
-                self.console.shutdown()
-            except Exception:
-                pass
+                if self.console.shutdown() is not True:
+                    return False
+            except BaseException:
+                return False
             self._console_holder.removeWidget(self.console)
             self.console.deleteLater()
             self.console = None
         if self.node is not None:
             try:
-                self.node.stop()
-            except Exception:
-                pass
+                if self.node.stop(timeout=5.0) is not True or self.node.running:
+                    return False
+            except BaseException:
+                return False
             self.node = None
+        return True
 
-    def teardown(self) -> None:
-        self._teardown_console()
+    def teardown(self) -> bool:
+        return self._teardown_console()
 
     # ---------------------------------------------------------------- sizing
     def sizeHint(self) -> QtCore.QSize:  # noqa: N802 - Qt API name
@@ -949,10 +1009,19 @@ def show_figure_viewer(path: str | Path | None = None, *, scale: float | None = 
     viewer = FigureViewer(path, scale=scale, window_ratio=window_ratio)
     # ONE launcher sequence (launch_fluent_window: wrap -> wire -> size -> centre -> show ->
     # retain), shared with every other show_* GUI so the steps cannot drift per-launcher.
+    def _wire(window):
+        # ``closed`` is a post-commit notification and cannot veto destruction.  A genuine close
+        # therefore uses the acknowledgement-bearing guard; hide-on-close intentionally preserves
+        # the static viewer exactly as before.
+        if not hide_on_close:
+            window.set_close_guard(viewer.teardown)
+
     window = launch_fluent_window(
-        viewer, title="FigureViewer@Zou lab", hide_on_close=hide_on_close,
-        # a genuine close tears the embedded console down (refresh timer + loaded-figure node)
-        wire=lambda w: w.closed.connect(viewer.teardown))
+        viewer,
+        title="FigureViewer@Zou lab",
+        hide_on_close=hide_on_close,
+        wire=_wire,
+    )
     # The embedded console's scroll viewport only has its REAL width AFTER the window is shown (0 during
     # construction).  Re-pack its board now so it lays out against the true pane width immediately,
     # rather than waiting for the first resize event.

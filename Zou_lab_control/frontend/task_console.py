@@ -36,9 +36,11 @@ from __future__ import annotations
 
 import json
 import hashlib
+import inspect
 import math as _math
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -6465,6 +6467,35 @@ class LogicNodeEditor(QtWidgets.QWidget):
 
 
 # ====================================================================== console
+class _StopAttempt:
+    """One console-owned invocation of an arbitrary node's cooperative stop method.
+
+    The node may violate its timeout contract.  Running it on this private daemon thread keeps the
+    Qt owner deadline authoritative; an overdue attempt remains attached to the node and can only
+    resolve ownership when this exact invocation actually returns and the node reports not running.
+    """
+
+    def __init__(self, node, timeout: float):
+        self.node = node
+        self.timeout = max(0.0, float(timeout))
+        self.result = None
+        self.error: BaseException | None = None
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"TaskConsoleStop-{type(node).__name__}-{id(node):x}",
+            daemon=True,
+        )
+
+    def _run(self) -> None:
+        try:
+            self.result = self.node.stop(timeout=self.timeout)
+        except BaseException as exc:
+            self.error = exc
+
+    def start(self) -> None:
+        self.thread.start()
+
+
 class TaskConsole(QtWidgets.QWidget):
     """The dashboard window body: header bar + drag-and-snap panel board."""
 
@@ -6499,7 +6530,11 @@ class TaskConsole(QtWidgets.QWidget):
         # an externally-supplied, already-running node may be adopted here too.
         # This is DISTINCT from ``self.logic_nodes`` (the Logic-tab ROWS): a row is a
         # declaration that exists whether or not its node is running.
-        self.running_nodes = list(running_nodes)
+        adopted_nodes = list(running_nodes)
+        self._require_bounded_stop_nodes(adopted_nodes)
+        self.running_nodes = adopted_nodes
+        self._stop_attempts: dict[int, _StopAttempt] = {}
+        self._panel_teardown_phases: dict[int, set[str]] = {}
         # The declarative measurement catalog: each becomes an addable LOGIC NODE
         # (a swept measurement) on the Logic tab; with none, only the camera /
         # processors / tasks are offered (and only plot kinds without a session).
@@ -6563,6 +6598,11 @@ class TaskConsole(QtWidgets.QWidget):
         self._task_output_node = None          # running Task whose typed TaskOutput feeds the panel
         self._task_card_tensor = None          # immutable latest SignalTensor, including validity
         self._task_locked = False              # True while a task runs -> all other actions blocked
+        # During whole-console shutdown a task panel cannot be destroyed while the render worker may
+        # still own its Figure.  Node termination therefore detaches the task state and parks the card
+        # here; only a confirmed RenderLoop join permits the UI-teardown phase to remove it.
+        self._defer_task_card_teardown = False
+        self._deferred_task_card: "PanelCard | None" = None
 
         # Multi-rate refresh: the timer ticks at the BASE interval (the smallest panel
         # update_ms, which divides every other so the rates co-align); each panel redraws
@@ -6852,18 +6892,45 @@ class TaskConsole(QtWidgets.QWidget):
             logic=[row.node for row in self.logic_nodes],
         )
 
-    def load_state(self, state: TaskConsoleState) -> None:
+    def load_state(
+        self,
+        state: TaskConsoleState,
+        *,
+        timeout: float = 5.0,
+        _replacement_running_nodes: Sequence[object] | None = None,
+    ) -> None:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
+            raise ValueError("state-load timeout must be a non-negative number")
+        replacement_nodes = None
+        if _replacement_running_nodes is not None:
+            replacement_nodes = list(_replacement_running_nodes)
+            self._require_bounded_stop_nodes(replacement_nodes)
+        deadline = time.monotonic() + float(timeout)
         self._building = True
         try:
-            self.state = state
-            for card in list(self.cards):
-                self._close_panel_editor(card)   # drop any open Edit tab for this card
-                card.shutdown()
-                card.setParent(None)
-                card.deleteLater()
-            self.cards = []
             for row in list(self.logic_nodes):
-                self._remove_logic_node(row, _rebuild=False)
+                if not self._stop_logic_node(
+                    row,
+                    _silent=True,
+                    timeout=max(0.0, deadline - time.monotonic()),
+                ):
+                    raise RuntimeError(
+                        "cannot load a new console state while a logic-node owner is still active"
+                    )
+            for row in list(self.logic_nodes):
+                if not self._remove_logic_node(row, _rebuild=False):
+                    raise RuntimeError("stopped logic node could not be removed")
+            for card in list(self.cards):
+                if not self._remove_panel(
+                    card,
+                    timeout=max(0.0, deadline - time.monotonic()),
+                ):
+                    raise RuntimeError(
+                        "cannot load a new console state while a render worker still owns a panel"
+                    )
+            if replacement_nodes is not None:
+                self.running_nodes = replacement_nodes
+            self.state = state
             self.name_edit.setText(state.name)
             for config in state.panels:
                 self._attach_card(self._new_panel_card(config))
@@ -6899,8 +6966,7 @@ class TaskConsole(QtWidgets.QWidget):
         the console down and construct a fresh one, which re-realizes the entire Qt widget tree (~0.35 s
         of the perceived load).  The caller owns STOPPING the previous nodes (the console only reads the
         hub); a reused hub's stale signals are overwritten by same-named republishes or GC'd as orphans."""
-        self.running_nodes = list(running_nodes)
-        self.load_state(state)
+        self.load_state(state, _replacement_running_nodes=running_nodes)
 
     def _new_panel_card(self, config: PanelConfig) -> PanelCard:
         """Build a PanelCard wired to the console's signal providers -- the ONE place the
@@ -7844,23 +7910,58 @@ class TaskConsole(QtWidgets.QWidget):
         self._arrange()
         self._mark_dirty()
 
-    def _remove_panel(self, card: PanelCard) -> None:
-        # blocked while a task owns the console (the lock is released BEFORE
-        # _clear_task_running drops the transient task panel, so this never blocks that).
-        if self._task_locked:
-            return
-        self._render_loop.barrier()   # the worker must not be composing into the card we tear down
-        if card in self.cards:
+    def _remove_panel(
+        self,
+        card: PanelCard,
+        *,
+        timeout: float = 5.0,
+        render_already_stopped: bool = False,
+        allow_task_owned: bool = False,
+    ) -> bool:
+        # User removal is blocked while a task owns the console.  The task lifecycle uses the
+        # explicit ``allow_task_owned`` capability; it never temporarily unlocks the UI merely to
+        # obtain teardown authority.
+        if self._task_locked and not allow_task_owned:
+            return False
+        phases = self._panel_teardown_phases.setdefault(id(card), set())
+        if "detached" in phases:
+            return True
+        if card not in self.cards and "removed" not in phases:
+            return False
+        if not render_already_stopped:
+            try:
+                if self._render_loop.barrier(max(0.0, float(timeout))) is not True:
+                    return False
+            except BaseException:
+                return False
+        if "analysis" not in phases:
             self._remove_panel_analysis(card)  # analysis row + region signal go with the panel (#1/#7)
+            phases.add("analysis")
+        if "editor" not in phases:
             card.settings_popup.hide()
             self._close_panel_editor(card)     # drop this card's Edit tab too
-            self.cards.remove(card)
+            phases.add("editor")
+        # Shutdown is the acknowledgement that the card no longer owns render/selector resources.
+        # It must succeed before the card disappears from the registry; otherwise a retry would see
+        # "not in cards" and falsely report completion while teardown never happened.
+        if "shutdown" not in phases:
             card.shutdown()
+            phases.add("shutdown")
+        if "removed" not in phases:
+            self.cards.remove(card)
+            phases.add("removed")
+        if "qt_detached" not in phases:
             card.setParent(None)
             card.deleteLater()
+            phases.add("qt_detached")
+        if "arranged" not in phases:
             self._arrange()
             self._recompute_tick_interval()    # removing the fastest panel can slow the base
             self._mark_dirty()
+            phases.add("arranged")
+        phases.add("detached")
+        self._panel_teardown_phases.pop(id(card), None)
+        return True
 
     # ====================================================================== logic nodes
     def _spec_for_logic(self, node: LogicNodeConfig):
@@ -8039,7 +8140,10 @@ class TaskConsole(QtWidgets.QWidget):
         consumer must never see its region vanish."""
         row = self._panel_analysis_row(card)
         if row is not None:
-            self._remove_logic_node(row)
+            if not self._remove_logic_node(row):
+                raise RuntimeError(
+                    "cannot remove analysis while its owner thread is still active"
+                )
         region = card.config.params.pop("region_signal", None)
         card.config.params.pop("region", None)
         if region:
@@ -8351,6 +8455,7 @@ class TaskConsole(QtWidgets.QWidget):
         # so a failed start can never leave a half-started ghost in running_nodes / the hub.
         try:
             node = self._build_logic_node(row.node, values)
+            self._require_bounded_stop_nodes([node])
         except Exception as exc:
             row.set_state("error", status=f"build failed: {str(exc).splitlines()[0][:80]}")
             if editor is not None:
@@ -8396,7 +8501,14 @@ class TaskConsole(QtWidgets.QWidget):
         # calibration or measurement starts.  Declared on the NODE, so a notebook-injected
         # ``running_nodes=`` node (which has no row) obeys the SAME rule as a GUI row; a
         # reactive processor occupies nothing and is never stopped.
-        self._stop_logic_node(row, _silent=True)
+        if not self._stop_logic_node(row, _silent=True):
+            row.set_state("running", status="restart blocked: previous owner still active")
+            if editor is not None:
+                editor.set_running(True)
+                editor.set_status(
+                    "restart blocked: previous owner thread did not terminate", error=True
+                )
+            return
         claimed = {id(d) for d in getattr(node, "occupied_devices", lambda: ())()}
         if claimed:
             for other in list(self.running_nodes):
@@ -8408,17 +8520,26 @@ class TaskConsole(QtWidgets.QWidget):
                 other_row = next((r for r in self.logic_nodes
                                   if self._logic_nodes.get(id(r)) is other), None)
                 if other_row is not None:
-                    self._stop_logic_node(other_row)     # full UI path: dot / editor / registry
+                    stopped = self._stop_logic_node(other_row)
                 else:
-                    # a row-less injected node: stop it directly and drop it from the registry
-                    try:
-                        other.stop()
-                    except Exception:
-                        pass
-                    try:
-                        self.running_nodes.remove(other)
-                    except ValueError:
-                        pass
+                    # A row-less injected node uses the same confirmed termination rule.
+                    stopped = self._stop_node_confirmed(other)
+                    if stopped:
+                        try:
+                            self.running_nodes.remove(other)
+                        except ValueError:
+                            pass
+                if not stopped:
+                    row.set_state(
+                        "error", status="start blocked: conflicting owner still active"
+                    )
+                    if editor is not None:
+                        editor.set_running(False)
+                        editor.set_status(
+                            "start blocked: a conflicting device owner did not terminate",
+                            error=True,
+                        )
+                    return
         if not self._timer.isActive():
             self._timer.start()
         try:
@@ -8553,18 +8674,29 @@ class TaskConsole(QtWidgets.QWidget):
         if row is not None:
             self._stop_logic_node(row)
 
-    def _clear_task_running(self) -> None:
+    def _clear_task_running(self, *, timeout: float = 2.0) -> bool:
         """Leave task-run mode (task finished OR stopped): drop the lock + banner and REMOVE the
         transient mid-run panel the task owned.  Finish and Stop take the SAME path (#C) -- a task's
         plot panel is transient (it only showed the work in progress), so it is auto-removed when the
         task ends; the operator's own panels are never touched (only ``_task_card`` is removed)."""
-        self._running_task_row = None
-        card, self._task_card = self._task_card, None
-        self._apply_task_lock(False)                          # unlock BEFORE remove (remove no-ops while locked)
+        card = self._task_card
         if card is not None and card in self.cards:
-            self._remove_panel(card)
+            if self._defer_task_card_teardown:
+                if self._deferred_task_card not in (None, card):
+                    raise RuntimeError("more than one task card was deferred during shutdown")
+                self._deferred_task_card = card
+            elif not self._remove_panel(
+                card,
+                timeout=timeout,
+                allow_task_owned=True,
+            ):
+                return False
+        self._running_task_row = None
+        self._task_card = None
+        self._apply_task_lock(False)
         self._task_card_tensor = None
         self._task_output_node = None
+        return True
 
     def _refresh_task_panel(self) -> None:
         """Pump the running task's mid-run output (from its OWN buffer) into the
@@ -8685,16 +8817,96 @@ class TaskConsole(QtWidgets.QWidget):
             return spec.build(self.hub, **values)
         raise RuntimeError(f"unknown logic kind {kind!r}")
 
-    def _stop_logic_node(self, row: "LogicNodeRow", *, _silent: bool = False) -> None:
+    @staticmethod
+    def _supports_bounded_stop(node) -> bool:
+        """Whether ``node.stop(timeout=...)`` is a callable, bounded ownership handoff."""
+
+        stop = getattr(node, "stop", None)
+        if not callable(stop):
+            return False
+        try:
+            parameters = inspect.signature(stop).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.name == "timeout"
+            and parameter.kind is not inspect.Parameter.POSITIONAL_ONLY
+            for parameter in parameters
+        )
+
+    @classmethod
+    def _require_bounded_stop_nodes(cls, nodes: Sequence[object]) -> None:
+        invalid = [node for node in nodes if not cls._supports_bounded_stop(node)]
+        if invalid:
+            names = ", ".join(type(node).__name__ for node in invalid)
+            raise TypeError(
+                "running nodes must implement stop(*, timeout=...) with confirmed termination; "
+                f"unbounded nodes: {names}"
+            )
+
+    def _stop_node_confirmed(self, node, *, timeout: float = 2.0) -> bool:
+        """Request stop without ever translating an unknown join into success."""
+
+        if not self._supports_bounded_stop(node):
+            return False
+        budget = max(0.0, float(timeout))
+        key = id(node)
+        attempt = self._stop_attempts.get(key)
+        if attempt is None or attempt.node is not node:
+            attempt = _StopAttempt(node, budget)
+            self._stop_attempts[key] = attempt
+            attempt.start()
+        attempt.thread.join(budget)
+        if attempt.thread.is_alive():
+            return False
+        self._stop_attempts.pop(key, None)
+        if attempt.error is not None or attempt.result is False:
+            return False
+        try:
+            return not bool(node.running)
+        except BaseException:
+            return attempt.result is True
+
+    def _stop_logic_node(
+        self,
+        row: "LogicNodeRow",
+        *,
+        _silent: bool = False,
+        timeout: float = 2.0,
+    ) -> bool:
         """Stop a logic node's node (``node.stop()``) and grey its dot."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
         node = self._logic_nodes.get(id(row))
         if node is not None:
-            try:
-                node.stop()
-            except Exception:
-                pass
+            if not self._stop_node_confirmed(
+                node, timeout=max(0.0, deadline - time.monotonic())
+            ):
+                editor = self._logic_editors.get(id(row))
+                if not _silent:
+                    row.set_state("running", status="stop pending: owner thread still active")
+                    if editor is not None:
+                        editor.set_running(True)
+                        editor.set_status(
+                            "stop pending: owner thread still active", error=True
+                        )
+                return False
             if node in self.running_nodes:
                 self.running_nodes.remove(node)
+        # A task's transient Figure is part of the same ownership handoff.  Ordinary Stop/finish
+        # waits for a render barrier; whole-console shutdown explicitly defers it until the central
+        # RenderLoop join.  A failed barrier keeps the task row/card references so the next tick or
+        # close retry can finish the handoff instead of destroying a Figure still in use.
+        if row is self._running_task_row and not self._clear_task_running(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            row.set_state("stopped", status="panel teardown pending: render worker still active")
+            editor = self._logic_editors.get(id(row))
+            if editor is not None:
+                editor.set_running(False)
+                editor.set_status(
+                    "panel teardown pending: render worker still owns the Figure", error=True
+                )
+            return False
         self._logic_nodes[id(row)] = None
         editor = self._logic_editors.get(id(row))
         if not _silent:
@@ -8703,17 +8915,15 @@ class TaskConsole(QtWidgets.QWidget):
             if editor is not None:
                 editor.set_running(False)
                 editor.set_status("stopped", error=False)
-        # Leaving task-run mode when the running task is stopped (releases the lockout).
-        if row is self._running_task_row:
-            self._clear_task_running()
+        return True
 
-    def _remove_logic_node(self, row: "LogicNodeRow", *, _rebuild: bool = True) -> None:
+    def _remove_logic_node(self, row: "LogicNodeRow", *, _rebuild: bool = True) -> bool:
         """Stop + remove a logic node (its node is stopped, its row + Edit drop)."""
         # a running task locks the console: the per-row Remove button must no-op too
         # (every other mutating entry guards on this).  Internal teardown (load_state)
         # passes _rebuild=False and is never reached while locked.
         if self._task_locked and _rebuild:
-            return
+            return False
         # Capture this node's published signals so REMOVE can PURGE them from the hub -- a removed
         # node's signals are stale and must leave, else they pile up run-after-run as "多余 signal" in
         # every picker (#2).  STOPPING keeps them (a finished scan stays plottable / a panel can be
@@ -8728,7 +8938,8 @@ class TaskConsole(QtWidgets.QWidget):
                 gone_sigs = {str(s) for s in gone.published_signals()}
             except Exception:
                 gone_sigs = set()
-        self._stop_logic_node(row, _silent=True)
+        if not self._stop_logic_node(row, _silent=True):
+            return False
         editor = self._logic_editors.pop(id(row), None)
         if editor is not None:
             idx = self.tabs.indexOf(editor)
@@ -8764,6 +8975,7 @@ class TaskConsole(QtWidgets.QWidget):
                 self.hub.remove_signals(purge)
         if _rebuild:
             self._mark_dirty()
+        return True
 
     def _poll_logic_nodes(self) -> None:
         """Each tick: reflect each running node's state on its row + Edit (a
@@ -9274,7 +9486,7 @@ class TaskConsole(QtWidgets.QWidget):
         fluent_message(self, "Task console", str(text), kind="info")  # pragma: no cover
 
     # ------------------------------------------------------------------ teardown
-    def stop_all_nodes(self) -> None:
+    def stop_all_nodes(self, timeout: float = 2.0) -> bool:
         """Stop every running node through THE lifecycle endpoint (``_stop_logic_node``) but KEEP
         the panels + editors intact.  This is the notebook close = "hide" path: closing the window
         halts all running processes, yet the layout is preserved so reopening the session-bound
@@ -9286,20 +9498,40 @@ class TaskConsole(QtWidgets.QWidget):
         zombie then freezes the WHOLE board's shot clock (``_display_shot`` takes the min over
         bound-and-live signals, and a dead node's provenance never advances) and the reopened
         window shows live-looking rows whose images never update."""
+        if QtCore.QThread.currentThread() is not self.thread():
+            raise RuntimeError("node shutdown must run on the TaskConsole Qt owner thread")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
+            raise ValueError("node shutdown timeout must be a non-negative number")
+        deadline = time.monotonic() + float(timeout)
+        stopped = True
+        row_node_ids = {
+            id(node)
+            for row in self.logic_nodes
+            for node in (self._logic_nodes.get(id(row)),)
+            if node is not None
+        }
         for row in list(self.logic_nodes):
             if self._logic_nodes.get(id(row)) is not None:
-                self._stop_logic_node(row)
+                remaining = max(0.0, deadline - time.monotonic())
+                stopped = self._stop_logic_node(row, timeout=remaining) and stopped
         # Row-less injected nodes (show_task_console(running_nodes=[...])) have no row to
         # repaint but must leave the shot clock's live set all the same.
         for node in list(self.running_nodes):
-            try:
-                node.stop()
-            except Exception:
-                pass
-            if node in self.running_nodes:
+            if id(node) in row_node_ids:
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            confirmed = self._stop_node_confirmed(node, timeout=remaining)
+            stopped = confirmed and stopped
+            if confirmed and node in self.running_nodes:
                 self.running_nodes.remove(node)
+        if not stopped:
+            self.status_strip.show_message(
+                "Close delayed: a logic-node owner thread is still active",
+                severity="error",
+            )
+        return stopped
 
-    def stop_nodes_using(self, affected_ids) -> None:
+    def stop_nodes_using(self, affected_ids, timeout: float = 2.0) -> bool:
         """Stop exactly the running nodes that reference one of the ``affected_ids`` devices --
         the session's fine-grained device-change hook (``load_config`` swapping specific device
         INSTANCES).  A node is affected iff its :meth:`~LogicNode.referenced_devices` (EXCLUSIVE
@@ -9307,75 +9539,173 @@ class TaskConsole(QtWidgets.QWidget):
         reinitialising the camera stops every camera view / occupancy path riding it while a scan
         on the untouched sequencer keeps running.  Goes through the SAME ``_stop_logic_node``
         endpoint as every other stop (no zombie left to freeze the shot clock, #close-reopen)."""
+        if QtCore.QThread.currentThread() is not self.thread():
+            raise RuntimeError("node shutdown must run on the TaskConsole Qt owner thread")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
+            raise ValueError("node shutdown timeout must be a non-negative number")
+        deadline = time.monotonic() + float(timeout)
         affected = {int(i) for i in affected_ids}
         if not affected:
-            return
+            return True
 
         def _touches(node) -> bool:
-            try:
-                return any(id(d) in affected for d in node.referenced_devices())
-            except Exception:
-                return False
+            return any(id(d) in affected for d in node.referenced_devices())
 
+        stopped = True
+        row_node_ids = {
+            id(node)
+            for row in self.logic_nodes
+            for node in (self._logic_nodes.get(id(row)),)
+            if node is not None
+        }
         for row in list(self.logic_nodes):
             node = self._logic_nodes.get(id(row))
-            if node is not None and _touches(node):
-                self._stop_logic_node(row)
-        for node in list(self.running_nodes):        # row-less injected nodes
-            if _touches(node):
+            if node is not None:
                 try:
-                    node.stop()
-                except Exception:
-                    pass
-                if node in self.running_nodes:
+                    touches = _touches(node)
+                except BaseException:
+                    stopped = False
+                    continue
+                if touches:
+                    remaining = max(0.0, deadline - time.monotonic())
+                    stopped = self._stop_logic_node(row, timeout=remaining) and stopped
+        for node in list(self.running_nodes):        # row-less injected nodes
+            if id(node) in row_node_ids:
+                continue
+            try:
+                touches = _touches(node)
+            except BaseException:
+                stopped = False
+                continue
+            if touches:
+                remaining = max(0.0, deadline - time.monotonic())
+                confirmed = self._stop_node_confirmed(node, timeout=remaining)
+                stopped = confirmed and stopped
+                if confirmed and node in self.running_nodes:
                     self.running_nodes.remove(node)
+        return stopped
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float = 5.0) -> bool:
         """Stop the refresh timer and every running node's owner thread, then release
         the editors/cards.  IDEMPOTENT -- it is reached from both the window close
-        (``show_task_console`` wires ``window.hidden`` here) and an explicit
+        (``show_task_console`` installs it as the pre-close guard) and an explicit
         ``with show_task_console(...)`` / re-run, which can both fire.
 
         Stopping a node sets its cooperative-cancel event (M5), so a node thread
         blocked in ``camera.acquire`` unwinds and the camera is released -- this is
         what keeps a closed dashboard from leaving a live acquire thread (and a held
-        camera / RPyC connection) behind, which previously wedged the kernel."""
-        if getattr(self, "_shut", False):
-            return
-        self._shut = True
+        camera / RPyC connection) behind, which previously wedged the kernel.  True
+        means all render ownership is joined and teardown completed; False keeps the
+        window alive so a later close can retry the unresolved handoff."""
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ValueError("shutdown timeout must be positive")
+        if QtCore.QThread.currentThread() is not self.thread():
+            raise RuntimeError("TaskConsole shutdown must run on its Qt owner thread")
+        state = getattr(self, "_shutdown_state", "RUNNING")
+        if state == "TERMINATED" or getattr(self, "_shut", False):
+            return True
+        if state in {
+            "STOPPING_NODES",
+            "WAITING_RENDER",
+            "CLOSING_RESOURCES",
+            "TEARING_DOWN_UI",
+        }:
+            return False
+        deadline = time.monotonic() + float(timeout)
         self._timer.stop()
-        for node in list(self.running_nodes):
-            try:
-                node.stop()
-            except Exception:
-                pass
-        for editor in list(self._panel_editors.values()):
-            editor.teardown()
-        self._panel_editors.clear()
-        for editor in list(self._logic_editors.values()):
-            editor.teardown()
-        self._logic_editors.clear()
-        # Stop the render worker BEFORE tearing panels down: any in-flight batch finishes against
-        # still-alive figures, and no further batch can start touching a torn-down card.
-        self._render_loop.stop()
-        for card in self.cards:
-            card.shutdown()
-        on_close = getattr(self, "_on_close", None)
-        if on_close is not None:
-            try:
-                on_close()
-            except Exception:
-                pass
+        if state in {"RUNNING", "BLOCKED_NODE_OWNERSHIP"}:
+            self._shutdown_state = "STOPPING_NODES"
+            self._defer_task_card_teardown = True
+            if not self.stop_all_nodes(timeout=max(0.0, deadline - time.monotonic())):
+                self._shutdown_state = "BLOCKED_NODE_OWNERSHIP"
+                return False
+        # Figure-owning editors/cards remain intact until the render worker's real thread
+        # termination is confirmed.  A timed-out join is OWNERSHIP_UNRESOLVED, not permission
+        # to clear pending state and destroy the Figure underneath the worker.
+        self._shutdown_state = "WAITING_RENDER"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            self._shutdown_state = "BLOCKED_RENDER_OWNERSHIP"
+            return False
+        try:
+            render_stopped = self._render_loop.stop(remaining) is True
+        except BaseException as exc:
+            render_stopped = False
+            self._shutdown_error = exc
+        if not render_stopped:
+            self._shutdown_state = "BLOCKED_RENDER_OWNERSHIP"
+            self.status_strip.show_message(
+                "Close delayed: render worker still owns a Figure; retry after it stops",
+                severity="error",
+            )
+            return False
+        if not getattr(self, "_on_close_done", False):
+            self._shutdown_state = "CLOSING_RESOURCES"
+            on_close = getattr(self, "_on_close", None)
+            if on_close is not None:
+                try:
+                    close_result = on_close()
+                    if close_result is False:
+                        raise RuntimeError("resource close reported unresolved ownership")
+                except BaseException as exc:
+                    self._shutdown_error = exc
+                    self._shutdown_state = "BLOCKED_RESOURCE_CLOSE"
+                    self.status_strip.show_message(
+                        f"Close delayed: device/resource release failed: {exc}",
+                        severity="error",
+                    )
+                    return False
+            self._on_close_done = True
+        self._shutdown_state = "TEARING_DOWN_UI"
+        try:
+            deferred_task_card = self._deferred_task_card
+            if deferred_task_card is not None:
+                if not self._remove_panel(
+                    deferred_task_card,
+                    timeout=0.0,
+                    render_already_stopped=True,
+                    allow_task_owned=True,
+                ):
+                    raise RuntimeError("deferred task panel teardown was not acknowledged")
+                self._deferred_task_card = None
+            for key, editor in list(self._panel_editors.items()):
+                editor.teardown()
+                self._panel_editors.pop(key, None)
+            for key, editor in list(self._logic_editors.items()):
+                editor.teardown()
+                self._logic_editors.pop(key, None)
+            completed_cards = getattr(self, "_shutdown_cards_done", set())
+            self._shutdown_cards_done = completed_cards
+            for card in self.cards:
+                if id(card) in completed_cards:
+                    continue
+                card.shutdown()
+                completed_cards.add(id(card))
+        except BaseException as exc:
+            self._shutdown_error = exc
+            self._shutdown_state = "BLOCKED_UI_TEARDOWN"
+            self.status_strip.show_message(
+                f"Close delayed: UI teardown failed: {exc}", severity="error"
+            )
+            return False
+        self._shutdown_state = "TERMINATED"
+        self._shut = True
+        return True
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        self.shutdown()
+        if not self.shutdown():
+            event.ignore()
+            return
         super().closeEvent(event)
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
-        self.shutdown()
+        if not self.shutdown():
+            raise RuntimeError(
+                "TaskConsole shutdown is blocked because the render worker still owns a Figure"
+            )
         return False
 
 
@@ -9440,11 +9770,11 @@ def show_task_console(
         if hide_on_close:
             # Session-bound (notebook) console: the X HIDES the window (keeps the panel layout so a
             # later exp.task_console() restores the SAME interface) and stops every running node so
-            # the devices are released.  close_requested fires on the X, not on minimize.
-            window.close_requested.connect(console.stop_all_nodes)
+            # the devices are released.  The hide guard runs on X, never on minimize.
+            window.set_hide_guard(console.stop_all_nodes)
         else:
             # Standalone window (.bat / explicit): the X fully tears the console down.
-            window.closed.connect(console.shutdown)
+            window.set_close_guard(console.shutdown)
     # ONE launcher sequence (launch_fluent_window: wrap -> wire -> size -> centre -> show ->
     # retain), shared with every other show_* GUI so the steps cannot drift per-launcher.
     launch_fluent_window(console, title=title, hide_on_close=hide_on_close, wire=_wire_close)

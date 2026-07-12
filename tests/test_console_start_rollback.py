@@ -48,9 +48,10 @@ class _FakeInjected:
     def published_signals(self):
         return frozenset()
 
-    def stop(self):
+    def stop(self, timeout=2.0):
         self.stopped = True
         self.running = False
+        return True
 
 
 def test_failed_build_leaves_the_running_node_untouched():

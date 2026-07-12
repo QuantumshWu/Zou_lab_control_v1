@@ -44,6 +44,10 @@ def test_load_config_notifies_change_hook_after_build_but_before_swap():
     exp = na.connect("virtual")
     try:
         old_devices = exp.devices
+        old_sequence = exp.sequence
+        old_readout = exp.readout
+        old_timing = exp.timing
+        exp._calibration = object()
         old_ids = {id(d) for d in old_devices.devices.values()}
         seen: list[tuple] = []
         # At notify time the session must still hold the OLD devices (consumers are stopped while
@@ -56,6 +60,9 @@ def test_load_config_notifies_change_hook_after_build_but_before_swap():
         assert seen_devices is old_devices           # notified BEFORE the swap
         assert seen_affected == frozenset(old_ids)   # every old instance flagged (whole set swapped)
         assert exp.devices is not old_devices        # then the new set went in
+        assert exp.sequence is not old_sequence
+        assert exp.readout is not old_readout and exp.timing is not old_timing
+        assert exp.calibration_data is None
     finally:
         exp.close()
 
@@ -72,16 +79,107 @@ def test_bad_config_leaves_consumers_untouched():
         exp.close()
 
 
-def test_hook_registration_is_idempotent_and_survives_a_failing_hook():
+def test_hook_registration_is_idempotent_and_failure_blocks_device_close_until_retry():
     exp = na.connect("virtual")
     calls: list[str] = []
+    fail = [True]
+    device_closes = []
+    real_close = exp.devices.close
+    exp.devices.close = lambda: (device_closes.append(1), real_close())[1]
 
     def _boom():
         calls.append("boom")
-        raise RuntimeError("broken consumer")
+        if fail[0]:
+            raise RuntimeError("broken consumer")
 
     exp.add_device_teardown_hook(_boom)
     exp.add_device_teardown_hook(_boom)              # duplicate registration is a no-op
     exp.add_device_teardown_hook(lambda: calls.append("after"))
-    exp.close()                                      # a broken hook never blocks the close
+    with pytest.raises(RuntimeError, match="consumers did not terminate"):
+        exp.close()
     assert calls == ["boom", "after"]
+    assert device_closes == []
+    fail[0] = False
+    exp.close()
+    assert device_closes == [1]
+
+
+def test_load_config_refuses_swap_when_affected_consumer_is_unresolved():
+    exp = na.connect("virtual")
+    old_devices = exp.devices
+    exp.add_device_change_hook(lambda _affected: False)
+    try:
+        with pytest.raises(RuntimeError, match="device swap refused"):
+            exp.load_config("virtual")
+        assert exp.devices is old_devices
+    finally:
+        exp._device_change_hooks.clear()
+        exp.close()
+
+
+def test_load_config_keeps_old_binding_when_previous_devices_do_not_close():
+    exp = na.connect("virtual")
+    old_devices = exp.devices
+    real_close = old_devices.close
+
+    def fail_close():
+        raise RuntimeError("old device close failed")
+
+    old_devices.close = fail_close
+    try:
+        with pytest.raises(RuntimeError, match="previous device set did not close"):
+            exp.load_config("virtual")
+        assert exp.devices is old_devices
+    finally:
+        old_devices.close = real_close
+        exp.close()
+
+
+def test_load_config_stages_all_derived_state_before_publishing(monkeypatch):
+    import Zou_lab_control.neutral_atom.devices as devices_module
+
+    exp = na.connect("virtual")
+    old_devices = exp.devices
+    old_sequence = exp.sequence
+    old_readout = exp.readout
+    old_timing = exp.timing
+    old_calibration = object()
+    exp._calibration = old_calibration
+    change_calls = []
+    exp.add_device_change_hook(lambda affected: change_calls.append(affected))
+
+    real_load_devices = devices_module.load_devices
+    staged = []
+
+    def tracked_load_devices(*args, **kwargs):
+        replacement = real_load_devices(*args, **kwargs)
+        close_calls = []
+        real_close = replacement.close
+
+        def tracked_close():
+            close_calls.append(1)
+            return real_close()
+
+        replacement.close = tracked_close
+        staged.append((replacement, close_calls))
+        return replacement
+
+    monkeypatch.setattr(devices_module, "load_devices", tracked_load_devices)
+
+    def fail_derived_state(devices, **_kwargs):
+        assert devices is staged[0][0]
+        raise RuntimeError("sequence staging failed")
+
+    monkeypatch.setattr(exp, "_build_imaging_sequence_for_devices", fail_derived_state)
+    try:
+        with pytest.raises(RuntimeError, match="sequence staging failed"):
+            exp.load_config("virtual")
+        assert exp.devices is old_devices
+        assert exp.sequence is old_sequence
+        assert exp.readout is old_readout
+        assert exp.timing is old_timing
+        assert exp._calibration is old_calibration
+        assert change_calls == []
+        assert len(staged) == 1 and staged[0][1] == [1]
+    finally:
+        exp.close()

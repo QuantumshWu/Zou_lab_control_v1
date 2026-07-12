@@ -534,12 +534,17 @@ class LogicNode:
         self._thread.start()
         return self
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 2.0) -> bool:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
+            raise ValueError("stop timeout must be a non-negative number")
         self._stop.set()
         thread = self._thread
         if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
+            thread.join(timeout=float(timeout))
+        if thread is not None and thread.is_alive():
+            return False
         self._thread = None
+        return True
 
     @property
     def running(self) -> bool:
@@ -2796,31 +2801,39 @@ class PulseScanNode(_SweptBlockMeasurement):
         if reservation is not None:
             reservation.release()
 
-    def _abort_execution(self, *, force: bool = False) -> None:
-        """Immediately put the sequencer safe after any collection failure."""
+    def _request_execution_abort(self, *, force: bool = False) -> None:
+        """Request hardware safe without mutating state still owned by the live node thread."""
 
         should_abort = force or (self._run_started and not self.finished)
+        if should_abort and self.sequencer is not None:
+            callbacks = []
+            for method in ("set_safe_state", "abort"):
+                callback = getattr(self.sequencer, method, None)
+                if callable(callback) and callback not in callbacks:
+                    callbacks.append(callback)
+            last_error = None
+            for callback in callbacks:
+                try:
+                    callback()
+                    return
+                except Exception as exc:
+                    last_error = exc
+            if last_error is not None:
+                raise RuntimeError(
+                    "every sequencer safe-state callback failed") from last_error
+
+    def _clear_execution_state(self) -> None:
+        self._run_started = False
+        self._run_program = None
+        self._point_program = None
+
+    def _abort_execution(self, *, force: bool = False) -> None:
+        """Immediately put the sequencer safe, then clear owner-local execution state."""
+
         try:
-            if should_abort and self.sequencer is not None:
-                callbacks = []
-                for method in ("set_safe_state", "abort"):
-                    callback = getattr(self.sequencer, method, None)
-                    if callable(callback) and callback not in callbacks:
-                        callbacks.append(callback)
-                last_error = None
-                for callback in callbacks:
-                    try:
-                        callback()
-                        return
-                    except Exception as exc:
-                        last_error = exc
-                if last_error is not None:
-                    raise RuntimeError(
-                        "every sequencer safe-state callback failed") from last_error
+            self._request_execution_abort(force=force)
         finally:
-            self._run_started = False
-            self._run_program = None
-            self._point_program = None
+            self._clear_execution_state()
 
     def _y_input_names(self) -> list[str]:
         """Hub signals whose next coherent publish constitutes one scan point."""
@@ -2893,12 +2906,22 @@ class PulseScanNode(_SweptBlockMeasurement):
                 "is required per scan point.  Select a repeat/point or reduce explicitly in SignalExpr.")
         return float(array[..., 0][valid][0])
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 2.0) -> bool:
         """Stop collection and stop unfinished pulse playback."""
 
-        super().stop()
+        self._stop.set()
+        try:
+            self._request_execution_abort(force=True)
+        except BaseException:
+            # Still join the software owner, but retain all execution/reservation state so
+            # a later recovery can retry safe without a fabricated clean terminal state.
+            super().stop(timeout=timeout)
+            raise
+        if not super().stop(timeout=timeout):
+            return False
+        self._clear_execution_state()
         self._release_y_history()
-        self._abort_execution()
+        return True
 
 
 class ProcessorRun(OneShotNode):

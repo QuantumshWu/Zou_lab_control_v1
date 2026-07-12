@@ -31,12 +31,17 @@ class _FakeProducer:
     """Declares the live signals + their structure (frames are 2-D images, occupancy a scalar); the test
     publishes to the hub manually so it can control each signal's source-shot provenance."""
     last_error = None
+    running = True
 
     def published_signals(self):
         return ["frame_0", "frame_1", "frame_2", "occupancy"]
 
     def signal_spec(self, name):
         return _Spec(() if name == "occupancy" else (8, 8))
+
+    def stop(self, timeout=2.0):
+        self.running = False
+        return True
 
 
 def _img(shot):

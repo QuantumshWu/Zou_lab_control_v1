@@ -103,6 +103,48 @@ def viewer(tmp_path):
         plt.close("all")
 
 
+def test_window_close_waits_for_embedded_console_shutdown_acknowledgement():
+    v = show_figure_viewer(path=None)
+    window = v._zlc_window
+    console = v.console
+    assert console is not None
+    real_shutdown = console.shutdown
+    console.shutdown = lambda timeout=5.0: False
+    try:
+        assert not window.close()
+        assert v.console is console and window.isVisible()
+        console.shutdown = real_shutdown
+        assert window.close()
+        assert v.console is None
+    finally:
+        if v.console is not None:
+            console.shutdown = real_shutdown
+            v.teardown()
+        window.deleteLater()
+
+
+def test_reload_barrier_veto_preserves_one_complete_viewer_generation(viewer, tmp_path):
+    v, old_path = viewer
+    new_path = _saved_1d_npz(tmp_path)
+    old_node = v.node
+    old_saved = v.saved
+    old_registry = list(v.console.running_nodes)
+    old_cards = list(v.console.cards)
+    old_value = np.array(v.hub.latest(FIG_SIGNAL), copy=True)
+    real_barrier = v.console._render_loop.barrier
+    v.console._render_loop.barrier = lambda timeout=5.0: False
+    try:
+        v._load_npz(new_path)
+        assert v.node is old_node
+        assert v.saved is old_saved and v._current_path == old_path
+        assert v.console.running_nodes == old_registry
+        assert v.console.cards == old_cards
+        np.testing.assert_array_equal(v.hub.latest(FIG_SIGNAL), old_value)
+        assert "could not activate figure" in v.status.text().lower()
+    finally:
+        v.console._render_loop.barrier = real_barrier
+
+
 def test_load_publishes_signal_and_seeds_reproduction_panel(viewer):
     v, _ = viewer
     con = v.console

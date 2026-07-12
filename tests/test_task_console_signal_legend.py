@@ -45,8 +45,9 @@ class _LogicNode:
         self.running = True
         return self
 
-    def stop(self):
+    def stop(self, timeout=2.0):
         self.running = False
+        return True
 
 
 def _console(nodes):

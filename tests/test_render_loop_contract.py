@@ -18,7 +18,9 @@ import threading
 import time
 
 import Zou_lab_control.neutral_atom as na
-from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+from PyQt5 import QtGui, QtWidgets
+
+from Zou_lab_control.frontend.qt_fluent import FluentWindow, ensure_qt_app
 from Zou_lab_control.frontend.render_loop import RenderLoop
 
 from conftest import add_logic_row, make_console, tick
@@ -91,6 +93,108 @@ def test_stop_timeout_never_claims_idle_or_discards_live_worker_ownership():
     release.set()
     assert loop.stop(5.0) is True
     assert not loop.busy
+
+
+def test_task_console_shutdown_retries_join_before_tearing_down_figures():
+    exp = na.connect("virtual")
+    con = make_console(exp)
+    original = con._render_loop
+    assert original.stop() is True
+
+    class _JoinGate:
+        def __init__(self):
+            self.results = [False, True]
+
+        def stop(self, _timeout=5.0):
+            return self.results.pop(0)
+
+    con._render_loop = _JoinGate()
+    try:
+        assert con.shutdown(0.01) is False
+        assert con._shutdown_state == "BLOCKED_RENDER_OWNERSHIP"
+        assert not getattr(con, "_shut", False)
+        assert con.shutdown(0.01) is True
+        assert con._shutdown_state == "TERMINATED" and con._shut
+    finally:
+        if not getattr(con, "_shut", False):
+            con._render_loop.results = [True]
+            con.shutdown()
+        exp.close()
+
+
+def test_task_console_ui_teardown_retry_does_not_repeat_resource_close():
+    exp = na.connect("virtual")
+    con = make_console(exp)
+    resource_closes = []
+    con._on_close = lambda: resource_closes.append(1)
+
+    class _FlakyEditor:
+        def __init__(self):
+            self.calls = 0
+
+        def teardown(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("editor teardown failed")
+
+    editor = _FlakyEditor()
+    con._panel_editors[object()] = editor
+    try:
+        assert con.shutdown() is False
+        assert con._shutdown_state == "BLOCKED_UI_TEARDOWN"
+        assert resource_closes == [1] and not getattr(con, "_shut", False)
+        assert con.shutdown() is True
+        assert editor.calls == 2 and resource_closes == [1]
+    finally:
+        if not getattr(con, "_shut", False):
+            con.shutdown()
+        exp.close()
+
+
+def test_task_console_shutdown_timeout_is_one_total_node_and_render_deadline():
+    exp = na.connect("virtual")
+
+    class _TimedStubbornNode:
+        running = True
+
+        def __init__(self):
+            self.timeouts = []
+
+        def stop(self, timeout=2.0):
+            self.timeouts.append(timeout)
+            time.sleep(min(float(timeout), 0.02))
+            return False
+
+    nodes = [_TimedStubbornNode(), _TimedStubbornNode()]
+    con = make_console(exp, running_nodes=nodes)
+    started = time.monotonic()
+    try:
+        assert con.shutdown(timeout=0.03) is False
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.12
+        assert sum(sum(node.timeouts) for node in nodes) <= 0.05
+        assert con._shutdown_state == "BLOCKED_NODE_OWNERSHIP"
+    finally:
+        for node in nodes:
+            node.running = False
+            node.stop = lambda timeout=0: True
+        con.shutdown()
+        exp.close()
+
+
+def test_fluent_window_close_guard_rejects_teardown_until_owner_is_ready():
+    ensure_qt_app()
+    window = FluentWindow(widget=QtWidgets.QWidget(), title="guard")
+    closed = []
+    window.closed.connect(lambda: closed.append(True))
+    window.set_close_guard(lambda: False)
+    event = QtGui.QCloseEvent()
+    window.closeEvent(event)
+    assert not event.isAccepted() and closed == []
+    window.set_close_guard(lambda: True)
+    event = QtGui.QCloseEvent()
+    window.closeEvent(event)
+    assert event.isAccepted() and closed == [True]
 
 
 def _live_2d_setup(con):
