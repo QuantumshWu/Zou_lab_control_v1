@@ -294,7 +294,7 @@ def _render_device_manager_shot(path: Path) -> Path:
             from Zou_lab_control.neutral_atom._gui import _session_device_binding
 
             panel = DeviceManagerPanel(
-                exp.devices, session_binding=_session_device_binding(exp),
+                exp._device_set, session_binding=_session_device_binding(exp),
                 config_dir=str(device_config_dir()))
             panel.resize(960, 660)
             panel.show()

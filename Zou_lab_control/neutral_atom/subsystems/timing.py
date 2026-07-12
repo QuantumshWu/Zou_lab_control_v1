@@ -47,7 +47,7 @@ class TimingSubsystem(ExperimentSubsystem):
         """
 
         s = self._session
-        cam = getattr(s.devices, "camera", None)
+        cam = getattr(s._device_set, "camera", None)
 
         def configure_and_build():
             if exposure is not None and hasattr(cam, "configure"):
@@ -78,7 +78,7 @@ class TimingSubsystem(ExperimentSubsystem):
         sequence = sequence or s.sequence
         errors: list[str] = []
         warnings: list[str] = []
-        sequencer = getattr(s.devices, "sequencer", None)
+        sequencer = getattr(s._device_set, "sequencer", None)
         clock = getattr(sequencer, "clock_hz", DEFAULT_CLOCK_HZ)
         channels = getattr(sequencer, "channels", None)
         pulse_report = sequence.validate(clock_hz=clock, channels=channels)
@@ -95,7 +95,7 @@ class TimingSubsystem(ExperimentSubsystem):
             errors=errors,
             warnings=warnings,
             sequence_table=sequence.table(),
-            device_snapshot=s.devices.snapshot(),
+            device_snapshot=s.devices.to_dict(),
             verilog=build,
         )
 
@@ -105,7 +105,7 @@ class TimingSubsystem(ExperimentSubsystem):
         from ..devices import bind_pulse
 
         s = self._session
-        sequencer = getattr(s.devices, "sequencer", None)
+        sequencer = getattr(s._device_set, "sequencer", None)
         if sequencer is None:
             raise RuntimeError("This session has no sequencer device to bind a pulse to.")
         payload = s.sequence if pulse is None else load_pulse_payload(pulse)
@@ -118,7 +118,7 @@ class TimingSubsystem(ExperimentSubsystem):
 
         s = self._session
         sequence = sequence or s.sequence
-        sequencer = getattr(s.devices, "sequencer", None)
+        sequencer = getattr(s._device_set, "sequencer", None)
         channels = getattr(sequencer, "channels", sequence.channels)
         clock = getattr(sequencer, "clock_hz", DEFAULT_CLOCK_HZ)
         pin_map = getattr(sequencer, "pin_map", None)

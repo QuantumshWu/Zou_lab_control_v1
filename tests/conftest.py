@@ -75,12 +75,23 @@ def fire_imaging_pulse(sequencer, *, exposure=20e-3, cooling=2e-3):
 def fire_live_imaging(exp, *, exposure=None):
     """Fire the live imaging pulse on a session's sequencer (see :func:`fire_imaging_pulse`).
     Mirrors the user clicking "On Pulse" in the pulse GUI so the session's live camera streams."""
-    devs = exp.devices
+    devs = raw_device_set(exp)
     cooling = getattr(getattr(devs, "trap_array", None), "mot_load_s", None)
     kw = {} if cooling is None else {"cooling": float(cooling)}
     if exposure is None:
         exposure = devs.camera.exposure
     return fire_imaging_pulse(devs.sequencer, exposure=exposure, **kw)
+
+
+def raw_device_set(exp):
+    """White-box fixture seam for adapter/runtime tests.
+
+    Public experiment code must use typed facades and ``device_catalog``.  A test that
+    needs a raw spy keeps that intent explicit instead of teaching production callers to
+    recover hardware from the public catalog.
+    """
+
+    return exp._device_set
 
 
 def make_console(exp, *, running_nodes=None, window_px=(900, 600)):
@@ -92,13 +103,9 @@ def make_console(exp, *, running_nodes=None, window_px=(900, 600)):
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
 
     ensure_qt_app()
-    runtime = getattr(exp, "_zlc_runtime_services", None)
-    if runtime is None or runtime.closed:
-        runtime = LegacyNeutralAtomRuntime(exp.devices)
-        exp._zlc_runtime_services = runtime
+    runtime = exp._require_runtime_services()
     con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
                       measurements=exp.readout.measurement_specs(),
                       processors=exp.readout.processor_specs(),

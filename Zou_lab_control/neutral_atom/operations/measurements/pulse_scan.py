@@ -307,7 +307,7 @@ def pulse_scan(readout) -> MeasurementSpec:
 
     def build(*, template: str = DEFAULT_PROBE_TEMPLATE, pulse_slots: Mapping | None = None,
               y=None, y_name: str = "signal") -> PulseScanPlan:
-        state = _resolve_probe_template(template, sequencer=s.devices.sequencer)
+        state = _resolve_probe_template(template, sequencer=s._device_set.sequencer)
         spec = dict(pulse_slots or {})
         unknown = sorted(set(spec) - {"program_id", "api", "sweep_kind", "program"})
         if unknown:
@@ -336,7 +336,7 @@ def pulse_scan(readout) -> MeasurementSpec:
             axis_label, axis_unit = _label_for_first_api_slot(state)
         y_expr = SignalExpr.from_value(y if y is not None else DEFAULT_Y_SOURCE)
         return PulseScanPlan(
-            state, scan_names, scan_arrays, s.devices.sequencer,
+            state, scan_names, scan_arrays, s._device_set.sequencer,
             axis_label=axis_label, axis_unit=axis_unit, y_key=y_name, y_expr=y_expr,
             scan_shape=scan_shape, sweep_kind=sweep_kind, api_handles=api_handles)
 

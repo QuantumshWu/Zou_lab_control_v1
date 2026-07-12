@@ -290,11 +290,8 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=Non
     # camera actually streams frames.  The camera is gated on ``sequencer.firing`` (exactly
     # like hardware), so WITHOUT this the live 2D would correctly stay frozen -- the demo
     # mirrors the running state the operator is in after clicking On Pulse.
-    from Zou_lab_control.neutral_atom.timing import imaging_sequence
-    _live_pulse = imaging_sequence(exposure=exp.devices.camera.exposure, load=True, name="live",
-                                   cooling=exp.devices.trap_array.mot_load_s).forever()
-    exp.devices.sequencer.prepare(_live_pulse)
-    exp.devices.sequencer.fire()
+    _live_pulse = exp.build_imaging_sequence(name="live", load=True).forever()
+    exp.timing.bind_pulse(_live_pulse).on_pulse(repeat_forever=True, wait=False)
 
     # The layout: an explicit state overrides the default six-kind board; either
     # way the panels are pure views wired to the signals the nodes below publish.

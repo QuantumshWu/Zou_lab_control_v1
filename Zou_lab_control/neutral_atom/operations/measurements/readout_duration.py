@@ -74,14 +74,14 @@ def readout_duration_fidelity(readout) -> MeasurementSpec:
         # INTENTIONALLY pinned to the readout (science) camera -- readout-fidelity imaging needs the
         # science sensor, not a MOT monitor -- so it declares NO ``devices=[...]`` role.  The generic
         # pulse scan is a separate sequencer consumer and carries no camera role at all.
-        cam = getattr(s.devices, "camera", None)
+        cam = getattr(s._device_set, "camera", None)
         state = _resolve_imaging_template(
-            template, s.devices.sequencer,
+            template, s._device_set.sequencer,
             trigger_channel=getattr(cam, "primary_trigger_channel", None),
         )
         from ...devices import bind_pulse  # lazy: keep operations->devices off the import-time graph
 
-        pulse = bind_pulse(s.devices.sequencer, state)
+        pulse = bind_pulse(s._device_set.sequencer, state)
         return readout.build_detection_scan(
             times, shots=positive_int(shots, "shots"), site=site_val, pulse=pulse,
         )

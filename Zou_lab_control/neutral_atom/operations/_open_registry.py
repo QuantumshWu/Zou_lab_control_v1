@@ -139,7 +139,7 @@ class OpenRegistry:
             # its build closure (``readout.session.devices`` is only in scope HERE).  A
             # spec with no roles is untouched.
             if roles:
-                spec = spec.with_devices_bound(readout.session.devices, roles)
+                spec = spec.with_devices_bound(readout.session._device_set, roles)
             name = spec.name
             if name in pos:
                 out[pos[name]] = spec  # later registration overrides, same slot

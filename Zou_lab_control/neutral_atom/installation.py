@@ -96,6 +96,14 @@ class _UnavailableInstallationState:
 _InstallationState = _AvailableInstallationState | _UnavailableInstallationState
 
 
+@dataclass(frozen=True, slots=True)
+class _SwapRecoveryContext:
+    transition_token: object
+    candidate_device_set: object
+    prepared_binding_state: object
+    reason: str
+
+
 class DeviceCatalogReader:
     """Public snapshot/watch port; it never returns the private installation state."""
 
@@ -125,6 +133,8 @@ class InstallationSupervisor:
         "_next_state_revision",
         "_next_catalog_revision",
         "_catalog_reader",
+        "_retained_raw_graphs",
+        "_recovery_context",
     )
 
     def __init__(
@@ -154,6 +164,8 @@ class InstallationSupervisor:
             catalog, device_set
         )
         self._catalog_reader = DeviceCatalogReader(self)
+        self._retained_raw_graphs: tuple[object, ...] = ()
+        self._recovery_context: object | None = None
 
     @property
     def catalog_reader(self) -> DeviceCatalogReader:
@@ -204,6 +216,65 @@ class InstallationSupervisor:
     def _runtime(self):
         return self._runtime_authority
 
+    def _retain_recovery_context(self, context: object) -> None:
+        if context is None:
+            raise TypeError("recovery context cannot be None")
+        with self._condition:
+            if isinstance(self._state, _AvailableInstallationState):
+                raise RuntimeError("an available installation cannot retain swap recovery")
+            if self._recovery_context is not None:
+                raise RuntimeError("installation already owns swap recovery context")
+            self._recovery_context = context
+
+    def _retain_swap_recovery(
+        self,
+        *,
+        transition_token: object,
+        candidate_device_set: object,
+        prepared_binding_state: object,
+        reason: str,
+    ) -> None:
+        normalized_reason = str(reason)
+        if not normalized_reason:
+            raise ValueError("swap recovery reason cannot be empty")
+        context = _SwapRecoveryContext(
+            transition_token,
+            candidate_device_set,
+            prepared_binding_state,
+            normalized_reason,
+        )
+        with self._condition:
+            if isinstance(self._state, _AvailableInstallationState):
+                raise RuntimeError("an available installation cannot retain swap recovery")
+            if self._recovery_context is not None:
+                raise RuntimeError("installation already owns swap recovery context")
+            self._recovery_context = context
+            if all(
+                candidate_device_set is not item
+                for item in self._retained_raw_graphs
+            ):
+                self._retained_raw_graphs = (
+                    *self._retained_raw_graphs,
+                    candidate_device_set,
+                )
+
+    def _recovery(self) -> object | None:
+        with self._condition:
+            return self._recovery_context
+
+    def _device_sets_for_shutdown(self) -> tuple[object, ...]:
+        with self._condition:
+            values = list(self._retained_raw_graphs)
+            if isinstance(self._state, _AvailableInstallationState):
+                values.append(self._state.device_set)
+            unique: list[object] = []
+            seen: set[int] = set()
+            for value in values:
+                if id(value) not in seen:
+                    seen.add(id(value))
+                    unique.append(value)
+            return tuple(unique)
+
     def _publish_swapping(self) -> PublicInstallationSnapshot:
         with self._condition:
             if not isinstance(self._state, _AvailableInstallationState):
@@ -216,6 +287,7 @@ class InstallationSupervisor:
                 revision=catalog_revision,
                 availability=InstallationAvailability.SWAPPING,
             )
+            self._retained_raw_graphs = (self._state.device_set,)
             self._state = _UnavailableInstallationState(catalog, None)
             self._condition.notify_all()
             return self._public_snapshot_locked()
@@ -256,6 +328,8 @@ class InstallationSupervisor:
                 revision=catalog_revision,
             )
             self._state = _AvailableInstallationState(catalog, device_set)
+            self._retained_raw_graphs = ()
+            self._recovery_context = None
             self._condition.notify_all()
             return self._public_snapshot_locked()
 

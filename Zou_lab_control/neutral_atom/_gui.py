@@ -107,12 +107,11 @@ def open_pulse_gui(session: Any = None, *, state=None, **kwargs):
         return existing
 
     runtime_services = session._require_runtime_services()
-    sequencer = getattr(session.devices, "sequencer", None)
+    sequencer = getattr(session._device_set, "sequencer", None)
     managed_sequencer = (
         runtime_services.pulse_facade(sequencer) if sequencer is not None else None
     )
     editor = show_pulse_gui(
-        experiment=session,
         sequencer=managed_sequencer,
         state=state,
         hide_on_close=True,
@@ -150,18 +149,18 @@ def open_figure_viewer(session: Any = None, *, path=None, **kwargs):
 def _session_device_binding(session: Any) -> dict:
     """Bundle a session's device actions into the plain-callback dict the device-manager
     panel consumes (the panel stays session-agnostic; it never imports the session).  The
-    ``devices`` GETTER matters: ``load_config`` REPLACES ``session.devices``, so the panel
+    ``devices`` GETTER matters: ``load_config`` replaces the private device set, so the panel
     must re-read it after every apply rather than hold a stale set."""
 
     def _apply(cfg):
         session.load_config(cfg)     # builds the NEW set first: a bad config is a no-op
-        return session.devices
+        return session._device_set
 
     def _open():
         session.open_devices()
-        return session.devices
+        return session._device_set
 
-    return {"devices": lambda: session.devices, "apply_config": _apply, "open_devices": _open}
+    return {"devices": lambda: session._device_set, "apply_config": _apply, "open_devices": _open}
 
 
 def open_device_manager(session: Any, **kwargs):
@@ -186,7 +185,7 @@ def open_device_manager(session: Any, **kwargs):
         return existing
 
     window = show_device_manager(
-        session.devices, session_binding=_session_device_binding(session),
+        session._device_set, session_binding=_session_device_binding(session),
         config_dir=str(device_config_dir()), **kwargs)
     window.session = session          # the notebook can read back the bound session off the window
     session._zlc_device_manager = window
@@ -212,13 +211,13 @@ def open_device_viewer(session: Any, **kwargs):
         return existing
 
     # a PROVIDER (not a snapshot of the set) so a re-open re-reads the session's CURRENT devices --
-    # load_config replaces session.devices, and the viewer must never hold a stale set.
+    # load_config replaces the private set, and the viewer must never hold a stale set.
     if kwargs.get("editable", False):
         raise RuntimeError(
             "runtime device editing is unavailable until the typed control facade owns every write"
         )
     kwargs["editable"] = False
-    window = show_device_viewer(devices_provider=lambda: session.devices, **kwargs)
+    window = show_device_viewer(devices_provider=lambda: session._device_set, **kwargs)
     window.session = session
     session._zlc_device_viewer = window
     return window

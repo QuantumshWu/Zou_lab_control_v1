@@ -72,9 +72,9 @@ def temperature_release_recapture(readout) -> MeasurementSpec:
         # This measurement is INTENTIONALLY pinned to the readout (science) camera -- it images
         # single-atom survival, which a MOT monitor cannot do -- so it declares NO ``devices=[...]``
         # role.  The generic pulse scan is a separate sequencer consumer and carries no camera role.
-        cam = getattr(s.devices, "camera", None)
+        cam = getattr(s._device_set, "camera", None)
         state = _resolve_release_recapture_template(
-            template, s.devices.sequencer,
+            template, s._device_set.sequencer,
             trigger_channel=getattr(cam, "primary_trigger_channel", None),
         )
         # Image the survival frames at the SAME exposure the thresholds were calibrated at (recorded on
@@ -89,7 +89,7 @@ def temperature_release_recapture(readout) -> MeasurementSpec:
             _match_imaging_exposure(state, float(expo))
         from ...devices import bind_pulse  # lazy: keep operations->devices off import-time graph
 
-        pulse = bind_pulse(s.devices.sequencer, state)
+        pulse = bind_pulse(s._device_set.sequencer, state)
         return readout.build_temperature_scan(
             t_off_s, pulse=pulse, shots=positive_int(shots, "shots"), per_site=bool(per_site),
         )

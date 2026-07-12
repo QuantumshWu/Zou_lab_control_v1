@@ -713,10 +713,10 @@ class LegacyNeutralAtomRuntime:
 
             def publish_all() -> None:
                 try:
-                    publish()
                     self.registry = registry
                     self._device_set = device_set
                     self._pulse_facades = {}
+                    publish()
                 except BaseException:
                     self.registry = previous_registry
                     self._device_set = previous_device_set

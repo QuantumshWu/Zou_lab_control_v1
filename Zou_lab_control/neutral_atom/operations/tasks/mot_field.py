@@ -327,7 +327,7 @@ def optimize_mot_field(readout) -> TaskSpec:
     s = readout.session
 
     def build(hub, *, prefix: str = MOT_TASK_PREFIX, camera=None, **values):
-        return OptimizeMotFieldTask(hub, camera, s.devices.sequencer, prefix=prefix, **values)
+        return OptimizeMotFieldTask(hub, camera, s._device_set.sequencer, prefix=prefix, **values)
 
     return TaskSpec(name="Optimize MOT field", build=build, params=MOT_FIELD_PARAMS,
                     mid_run_key="grid", default_kind="grid", prefix=MOT_TASK_PREFIX)

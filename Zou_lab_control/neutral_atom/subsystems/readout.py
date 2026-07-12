@@ -94,11 +94,11 @@ class ReadoutSubsystem(ExperimentSubsystem):
         roi_radius = int(s.defaults.get("roi_radius", 1) if roi_radius is None else roi_radius)
         exposure = s.defaults.get("sitemap_exposure", s.camera_exposure())
         sequence = s.build_imaging_sequence(exposure=exposure, load=True, name="sitemap")
-        seq_dev = getattr(s.devices, "sequencer", None)
+        seq_dev = getattr(s._device_set, "sequencer", None)
         images = s._run_hardware_call(
-            (s.devices.camera, seq_dev),
+            (s._device_set.camera, seq_dev),
             lambda: triggered_frames(
-                s.devices.camera, seq_dev, sequence, positive_int(frames, "frames")
+                s._device_set.camera, seq_dev, sequence, positive_int(frames, "frames")
             ),
             name="readout-sitemap",
         )
@@ -128,11 +128,11 @@ class ReadoutSubsystem(ExperimentSubsystem):
         calibration = s.require_calibration(require_thresholds=False)
         expo = s.camera_exposure() if exposure is None else float(exposure)
         sequence = s.build_imaging_sequence(exposure=expo, load=True, name="threshold")
-        seq_dev = getattr(s.devices, "sequencer", None)
+        seq_dev = getattr(s._device_set, "sequencer", None)
         images = s._run_hardware_call(
-            (s.devices.camera, seq_dev),
+            (s._device_set.camera, seq_dev),
             lambda: triggered_frames(
-                s.devices.camera, seq_dev, sequence, positive_int(frames, "frames")
+                s._device_set.camera, seq_dev, sequence, positive_int(frames, "frames")
             ),
             name="readout-thresholds",
         )
@@ -171,10 +171,10 @@ class ReadoutSubsystem(ExperimentSubsystem):
             # back to the camera's current exposure when it is unspecified.
             exposure = calibration.readout_exposure(fallback=s.camera_exposure())
         sequence = s.build_imaging_sequence(exposure=float(exposure), load=True, name="detect")
-        seq_dev = getattr(s.devices, "sequencer", None)
+        seq_dev = getattr(s._device_set, "sequencer", None)
         images = s._run_hardware_call(
-            (s.devices.camera, seq_dev),
-            lambda: triggered_frames(s.devices.camera, seq_dev, sequence, 1),
+            (s._device_set.camera, seq_dev),
+            lambda: triggered_frames(s._device_set.camera, seq_dev, sequence, 1),
             name="readout-detect",
         )
         result = detect_image(images[-1], calibration, sequence=sequence, display=display, what=what)
@@ -360,7 +360,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
                     "a bound detection-scan pulse must have a duration scan slot "
                     "(bind one via the GUI scan dot or state.bind_field('duration', ...)).")
             # Configure the real camera exposure per point, matching the prior path.
-            plan = _ExposureConfiguringPlan(plan, s.devices.camera)
+            plan = _ExposureConfiguringPlan(plan, s._device_set.camera)
         return self._build_slot_scan(
             controller, calibration, slot=slot, values=times, label="Detection time",
             plan=plan, reducer=reducer, shots_per_point=1,
@@ -401,15 +401,15 @@ class ReadoutSubsystem(ExperimentSubsystem):
         ref_seqr = reference_controller.sequencer
 
         def acquire_reference():
-            configure = getattr(s.devices.camera, "configure", None)
+            configure = getattr(s._device_set.camera, "configure", None)
             if pulse is not None and callable(configure):
                 configure(exposure=float(reference_exposure))
             return triggered_frames(
-                s.devices.camera, ref_seqr, reference_sequence, reference_shots
+                s._device_set.camera, ref_seqr, reference_sequence, reference_shots
             )
 
         reference_images = s._run_hardware_call(
-            (s.devices.camera, ref_seqr),
+            (s._device_set.camera, ref_seqr),
             acquire_reference,
             name="readout-reference-threshold",
         )
@@ -495,9 +495,9 @@ class ReadoutSubsystem(ExperimentSubsystem):
         (:meth:`build_device_survival_scan`) build through here, so the engine wiring + sequencer
         fallback are spelled ONCE (the duplication the audit flagged) -- they differ only in axis/plan."""
         s = self._session
-        sequencer = getattr(controller, "sequencer", getattr(s.devices, "sequencer", None))
+        sequencer = getattr(controller, "sequencer", getattr(s._device_set, "sequencer", None))
         return ScannedMeasurement(
-            controller, s.devices.camera, sequencer, calibration,
+            controller, s._device_set.camera, sequencer, calibration,
             axis, plan, reducer,
             shots_per_point=positive_int(shots_per_point, "shots_per_point"),
             run_hardware=s._run_hardware_call,
@@ -705,10 +705,10 @@ class ReadoutSubsystem(ExperimentSubsystem):
         if isinstance(camera, CameraDevice):
             device = camera                                    # already resolved (spec injection)
         else:
-            name = str(camera) if camera else s.devices.default_camera_name()
-            device = s.devices[name]                           # a name (notebook convenience)
+            name = str(camera) if camera else s._device_set.default_camera_name()
+            device = s._device_set[name]                       # a name (notebook convenience)
         return CameraMeasurement(hub, device,
-                                 sequencer=getattr(s.devices, "sequencer", None),
+                                 sequencer=getattr(s._device_set, "sequencer", None),
                                  frames_per_cycle=frames_per_cycle, prefix=prefix, repeat=repeat)
 
     def camera_spec(self) -> MeasurementSpec:
@@ -798,7 +798,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         # discovery funnel binds), so it wires its device role through the SAME base mechanism
         # by hand: the "camera" dropdown is appended + the resolved device injected into _build.
         return spec.with_devices_bound(
-            s.devices,
+            s._device_set,
             [("camera", {"tooltip": "Which sensor streams (every camera in the device config is "
                                     "listed; a free-running sensor shows an image with no pulse "
                                     "wiring at all)."})])
@@ -822,7 +822,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         # ``camera`` is the RESOLVED device the calibrate-readout task's device-role injection
         # passes (the operator's dropdown choice); the notebook path calls with camera=None and
         # gets the conventional readout camera.  ONE camera drives the whole calibration.
-        cam = camera if camera is not None else s.devices.camera
+        cam = camera if camera is not None else s._device_set.camera
 
         def _adopt(calibration):
             # The finished calibration BECOMES the session calibration (``readout.current``),
@@ -857,7 +857,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
                         "(occupancy will read low)", exc)
 
         return CalibrateReadoutTask(hub, cam,
-                                    sequencer=getattr(s.devices, "sequencer", None),
+                                    sequencer=getattr(s._device_set, "sequencer", None),
                                     calibration_sink=_adopt, prefix=prefix, **params)
 
     # ------------------------------------------------------------- persistence
@@ -883,7 +883,7 @@ class _SessionImagingController:
     def __init__(self, session, *, name: str):
         self._session = session
         self._name = str(name)
-        self.sequencer = getattr(session.devices, "sequencer", None)
+        self.sequencer = getattr(session._device_set, "sequencer", None)
         self.pulse = None
 
     def set_time(self, value_ns: float) -> "_SessionImagingController":

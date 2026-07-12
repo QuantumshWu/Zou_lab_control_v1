@@ -59,9 +59,9 @@ def grey_molasses_detuning(readout) -> MeasurementSpec:
         # The SAME release-recapture pulse the Temperature measurement fires, channel-mapped to this
         # sequencer and imaged at the calibration exposure (a mismatch floors survival, #H3v-2).  Its
         # trap-off is held FIXED here (the plan) -- the RF detuning is what sweeps.
-        cam = getattr(s.devices, "camera", None)
+        cam = getattr(s._device_set, "camera", None)
         state = _resolve_release_recapture_template(
-            template, s.devices.sequencer,
+            template, s._device_set.sequencer,
             trigger_channel=getattr(cam, "primary_trigger_channel", None),
         )
         cal = s.require_calibration(require_thresholds=True)
@@ -70,7 +70,7 @@ def grey_molasses_detuning(readout) -> MeasurementSpec:
             _match_imaging_exposure(state, float(expo))
         from ...devices import bind_pulse  # lazy: keep operations->devices off import-time graph
 
-        pulse = bind_pulse(s.devices.sequencer, state)
+        pulse = bind_pulse(s._device_set.sequencer, state)
         return readout.build_device_survival_scan(
             detuning_gamma, write, pulse=pulse, t_off_s=float(t_off) * 1e-6,
             label="Two-photon detuning", unit="Γ", y_label="Recapture rate",
