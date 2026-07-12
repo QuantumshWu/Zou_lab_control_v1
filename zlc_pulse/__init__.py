@@ -20,6 +20,7 @@ from .ir import (
     target_ir_from_tree,
     target_ir_to_tree,
 )
+from .fpga import PulseWireImage, pack_target_ir
 
 from .target import (
     DAC_OFFSET_BINARY,
@@ -43,6 +44,7 @@ __all__ = [
     "PulsePortSpec",
     "PulseDocument",
     "PulsePeriod",
+    "PulseWireImage",
     "PulseTarget",
     "TARGET_IR_SCHEMA",
     "ScanSlot",
@@ -52,6 +54,7 @@ __all__ = [
     "load_pulse_document",
     "pulse_document_from_tree",
     "pulse_document_to_tree",
+    "pack_target_ir",
     "pulse_target_from_tree",
     "pulse_target_to_tree",
     "save_pulse_document",
