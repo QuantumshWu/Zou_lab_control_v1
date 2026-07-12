@@ -48,9 +48,18 @@ from zlc_neutral_atom.runtime.pipeline import (
 )
 from zlc_neutral_atom.runtime.run import PostSafetyContext, RunPlan
 from zlc_neutral_atom.runtime.streams import StreamId, TraceBinding
+from zlc_neutral_atom.timing import (
+    TriggeredCaptureSpec,
+    TriggeredPipelineResult,
+    compile_triggered_pipeline,
+    PulseTerminalAck,
+    pulse_terminal_ack_from_tree,
+    pulse_terminal_ack_to_tree,
+)
+from zlc_pulse import PulseExecutionForm
 
 
-CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact/v1"
+CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact/v2"
 _CAPTURE_METADATA_SCHEMA = "zlc_neutral_atom.CameraFrameMetadataSequence/v1"
 _CAPTURE_NAMESPACE = "capture"
 
@@ -92,6 +101,35 @@ class CaptureArtifactRef:
 
 
 @dataclass(frozen=True)
+class PulseCaptureLineage:
+    compiled_artifact_digest: str
+    source_document_digest: str
+    execution_form: PulseExecutionForm
+    trigger_channel: str
+    terminal: PulseTerminalAck
+
+    def __post_init__(self) -> None:
+        _sha256(self.compiled_artifact_digest, "compiled_artifact_digest")
+        _sha256(self.source_document_digest, "source_document_digest")
+        if not isinstance(self.execution_form, PulseExecutionForm):
+            raise TypeError("execution_form must be PulseExecutionForm")
+        _canonical_text(self.trigger_channel, "trigger_channel")
+        if not isinstance(self.terminal, PulseTerminalAck):
+            raise TypeError("terminal must be PulseTerminalAck")
+        if not self.terminal.logical_done:
+            raise ValueError("pulse lineage requires logical terminal")
+        if self.terminal.artifact_digest != self.compiled_artifact_digest:
+            raise ValueError("pulse terminal belongs to another compiled artifact")
+        counts = dict(self.terminal.completed_schedule_trigger_counts)
+        if self.trigger_channel not in counts:
+            raise ValueError("pulse terminal omits the capture trigger channel")
+
+    @property
+    def expected_trigger_count(self) -> int:
+        return dict(self.terminal.completed_schedule_trigger_counts)[self.trigger_channel]
+
+
+@dataclass(frozen=True)
 class CaptureArtifact:
     ref: CaptureArtifactRef
     block: DataBlock
@@ -101,6 +139,7 @@ class CaptureArtifact:
     terminal: CaptureTerminalAck
     aggregate_peak_bytes: int
     memory_profile_fingerprint: str
+    pulse_lineage: PulseCaptureLineage | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.ref, CaptureArtifactRef):
@@ -122,6 +161,11 @@ class CaptureArtifact:
             raise ValueError("aggregate_peak_bytes must be positive")
         object.__setattr__(self, "aggregate_peak_bytes", peak)
         _sha256(self.memory_profile_fingerprint, "memory_profile_fingerprint")
+        if self.pulse_lineage is not None and not isinstance(
+            self.pulse_lineage,
+            PulseCaptureLineage,
+        ):
+            raise TypeError("pulse_lineage must be PulseCaptureLineage or None")
         count = len(metadata)
         physical_cells = (
             self.block.schema.repeat_axis.size
@@ -153,6 +197,11 @@ class CaptureArtifact:
             or not self.terminal.joined
         ):
             raise ValueError("capture terminal evidence differs from persisted dataset")
+        if (
+            self.pulse_lineage is not None
+            and self.pulse_lineage.expected_trigger_count != count
+        ):
+            raise ValueError("pulse trigger count differs from persisted capture")
 
 
 class CaptureRepository:
@@ -198,6 +247,7 @@ class CaptureRepository:
                 "terminal",
                 "aggregate_peak_bytes",
                 "memory_profile_fingerprint",
+                "pulse_lineage",
             },
             CAPTURE_ARTIFACT_SCHEMA,
         )
@@ -224,6 +274,7 @@ class CaptureRepository:
             _terminal_from_tree(data["terminal"]),
             data["aggregate_peak_bytes"],
             data["memory_profile_fingerprint"],
+            _pulse_lineage_from_tree(data["pulse_lineage"]),
         )
         # Enforce one canonical current representation, not merely a decodable one.
         rebuilt_payload = _manifest_payload(artifact, block_ref, metadata_ref)
@@ -237,12 +288,12 @@ class CaptureRepository:
     def final_commit(
         self,
         context: PostSafetyContext,
-        result: PipelineResult,
+        result: PipelineResult | TriggeredPipelineResult,
     ) -> FinalCommit[CaptureArtifactRef]:
         if not isinstance(context, PostSafetyContext):
             raise TypeError("final_commit requires PostSafetyContext")
-        if not isinstance(result, PipelineResult):
-            raise TypeError("final_commit requires PipelineResult")
+        if not isinstance(result, (PipelineResult, TriggeredPipelineResult)):
+            raise TypeError("final_commit requires an exact pipeline result")
         reference, manifest_payload = self._stage_pipeline_result(result)
         target = CommitTarget(
             self.repository_id,
@@ -299,17 +350,30 @@ class CaptureRepository:
 
     def _stage_pipeline_result(
         self,
-        result: PipelineResult,
+        result: PipelineResult | TriggeredPipelineResult,
     ) -> tuple[CaptureArtifactRef, bytes]:
+        lineage = None
+        if isinstance(result, TriggeredPipelineResult):
+            lineage = PulseCaptureLineage(
+                result.compiled_artifact_digest,
+                result.source_document_digest,
+                result.execution_form,
+                result.trigger_channel,
+                result.pulse_terminal,
+            )
+            base = result.capture
+        else:
+            base = result
         provisional = CaptureArtifact(
             CaptureArtifactRef(self.repository_id, "0" * 64),
-            result.dataset.block,
-            tuple(result.dataset.event_metadata),
-            result.dataset.coverage,
-            result.dataset.provenance,
-            result.capture_terminal,
-            result.aggregate_peak_bytes,
-            result.memory_profile_fingerprint,
+            base.dataset.block,
+            tuple(base.dataset.event_metadata),
+            base.dataset.coverage,
+            base.dataset.provenance,
+            base.capture_terminal,
+            base.aggregate_peak_bytes,
+            base.memory_profile_fingerprint,
+            lineage,
         )
         return self._stage_manifest(provisional)
 
@@ -343,21 +407,25 @@ class CaptureRepository:
 
 
 def compile_capture_artifact_pipeline(
-    spec: MinimalPipelineSpec,
+    spec: MinimalPipelineSpec | TriggeredCaptureSpec,
     repository: CaptureRepository,
 ) -> RunPlan:
     """Add one post-safety CaptureArtifact commit to the exact pipeline."""
 
     if not isinstance(repository, CaptureRepository):
         raise TypeError("repository must be CaptureRepository")
-    base = compile_pipeline(spec)
+    base = (
+        compile_triggered_pipeline(spec)
+        if isinstance(spec, TriggeredCaptureSpec)
+        else compile_pipeline(spec)
+    )
 
     def finalize(
         context: PostSafetyContext,
-        result: PipelineResult,
+        result: PipelineResult | TriggeredPipelineResult,
     ) -> CaptureArtifactRef:
         finalized = base.finalize(context, result)
-        if not isinstance(finalized, PipelineResult):
+        if not isinstance(finalized, (PipelineResult, TriggeredPipelineResult)):
             raise TypeError("base exact pipeline changed its result contract")
         return context.commit_final(repository.final_commit(context, finalized))
 
@@ -403,7 +471,43 @@ def _manifest_payload(
             "terminal": _terminal_to_tree(artifact.terminal),
             "aggregate_peak_bytes": artifact.aggregate_peak_bytes,
             "memory_profile_fingerprint": artifact.memory_profile_fingerprint,
+            "pulse_lineage": _pulse_lineage_to_tree(artifact.pulse_lineage),
         }
+    )
+
+
+def _pulse_lineage_to_tree(
+    value: PulseCaptureLineage | None,
+) -> dict[str, object] | None:
+    if value is None:
+        return None
+    return {
+        "compiled_artifact_digest": value.compiled_artifact_digest,
+        "source_document_digest": value.source_document_digest,
+        "execution_form": value.execution_form.value,
+        "trigger_channel": value.trigger_channel,
+        "terminal": pulse_terminal_ack_to_tree(value.terminal),
+    }
+
+
+def _pulse_lineage_from_tree(tree: object) -> PulseCaptureLineage | None:
+    if tree is None:
+        return None
+    fields = {
+        "compiled_artifact_digest",
+        "source_document_digest",
+        "execution_form",
+        "trigger_channel",
+        "terminal",
+    }
+    if not isinstance(tree, dict) or set(tree) != fields:
+        raise ValueError("PulseCaptureLineage has an unknown field set")
+    return PulseCaptureLineage(
+        tree["compiled_artifact_digest"],
+        tree["source_document_digest"],
+        PulseExecutionForm(tree["execution_form"]),
+        tree["trigger_channel"],
+        pulse_terminal_ack_from_tree(tree["terminal"]),
     )
 
 
@@ -525,5 +629,6 @@ __all__ = [
     "CaptureArtifact",
     "CaptureArtifactRef",
     "CaptureRepository",
+    "PulseCaptureLineage",
     "compile_capture_artifact_pipeline",
 ]

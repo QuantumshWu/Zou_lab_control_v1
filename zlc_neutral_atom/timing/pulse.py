@@ -214,6 +214,56 @@ class PulseTerminalAck:
         object.__setattr__(self, "configured_output_delay_wait_seconds", float(wait))
 
 
+def pulse_terminal_ack_to_tree(value: PulseTerminalAck) -> dict[str, object]:
+    if not isinstance(value, PulseTerminalAck):
+        raise TypeError("value must be PulseTerminalAck")
+    return {
+        "session_id": value.session_id,
+        "binding_id": value.binding_id,
+        "connection_generation": value.connection_generation,
+        "artifact_digest": value.artifact_digest,
+        "logical_done": value.logical_done,
+        "completed_schedule_trigger_counts": [
+            [channel, count]
+            for channel, count in value.completed_schedule_trigger_counts
+        ],
+        "configured_output_delay_wait_seconds": (
+            value.configured_output_delay_wait_seconds
+        ),
+    }
+
+
+def pulse_terminal_ack_from_tree(tree: object) -> PulseTerminalAck:
+    fields = {
+        "session_id",
+        "binding_id",
+        "connection_generation",
+        "artifact_digest",
+        "logical_done",
+        "completed_schedule_trigger_counts",
+        "configured_output_delay_wait_seconds",
+    }
+    if not isinstance(tree, dict) or set(tree) != fields:
+        raise ValueError("PulseTerminalAck has an unknown field set")
+    raw_counts = tree["completed_schedule_trigger_counts"]
+    if not isinstance(raw_counts, list):
+        raise TypeError("completed_schedule_trigger_counts must be a list")
+    counts = []
+    for item in raw_counts:
+        if not isinstance(item, list) or len(item) != 2:
+            raise ValueError("trigger count must be [channel, count]")
+        counts.append((item[0], item[1]))
+    return PulseTerminalAck(
+        tree["session_id"],
+        tree["binding_id"],
+        tree["connection_generation"],
+        tree["artifact_digest"],
+        tree["logical_done"],
+        tuple(counts),
+        tree["configured_output_delay_wait_seconds"],
+    )
+
+
 @dataclass(frozen=True)
 class BoundPulsePort:
     capability_attestation: VerifiedDeviceCapability
@@ -494,5 +544,7 @@ __all__ = [
     "PulseSession",
     "PulseSessionState",
     "PulseTerminalAck",
+    "pulse_terminal_ack_from_tree",
+    "pulse_terminal_ack_to_tree",
     "SequencerCapabilitySnapshot",
 ]

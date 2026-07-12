@@ -16,6 +16,8 @@ from .pulse import (
     PulseSession,
     PulseSessionState,
     PulseTerminalAck,
+    pulse_terminal_ack_from_tree,
+    pulse_terminal_ack_to_tree,
     SequencerCapabilitySnapshot,
 )
 
@@ -30,6 +32,8 @@ __all__ = [
     "PulseSession",
     "PulseSessionState",
     "PulseTerminalAck",
+    "pulse_terminal_ack_from_tree",
+    "pulse_terminal_ack_to_tree",
     "SequencerCapabilitySnapshot",
     "compile_triggered_pipeline",
     "TriggeredCaptureSpec",

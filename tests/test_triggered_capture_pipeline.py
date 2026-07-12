@@ -15,6 +15,10 @@ from Zou_lab_control.neutral_atom.devices.virtual import (
 )
 from zlc_data import AxisId, AxisSpec, BlockId, PointLayout, REPEAT, SCAN_POINT
 from zlc_neutral_atom.acquisition import CameraAcquisitionMode
+from zlc_neutral_atom.artifacts import (
+    CaptureRepository,
+    compile_capture_artifact_pipeline,
+)
 from zlc_neutral_atom.runtime import (
     DatasetMaterializerSpec,
     MinimalPipelineSpec,
@@ -138,5 +142,33 @@ def test_trigger_cardinality_mismatch_is_rejected_before_hardware_run():
                 "emCCD",
             )
         assert sequencer.history == []
+    finally:
+        assert runtime.shutdown(timeout=2.0)
+
+
+def test_triggered_capture_artifact_persists_pulse_lineage(tmp_path):
+    runtime, _camera, sequencer, capture, document, pulse_port, artifact = _runtime()
+    repository = CaptureRepository(tmp_path / "captures")
+    spec = TriggeredCaptureSpec(
+        capture,
+        pulse_port,
+        FinitePulseExecutionRequest(document, artifact),
+        "emCCD",
+    )
+    try:
+        reference = runtime.controller.run(
+            compile_capture_artifact_pipeline(spec, repository)
+        )
+        stored = repository.load(reference)
+        lineage = stored.pulse_lineage
+        assert lineage is not None
+        assert lineage.compiled_artifact_digest == artifact.fingerprint
+        assert lineage.source_document_digest == document.fingerprint
+        assert lineage.execution_form is PulseExecutionForm.STATIC_ONCE
+        assert lineage.trigger_channel == "emCCD"
+        assert lineage.expected_trigger_count == 3
+        assert lineage.terminal.logical_done
+        assert stored.terminal.produced_count == lineage.expected_trigger_count
+        assert dict(sequencer.snapshot())["state"] == "safe"
     finally:
         assert runtime.shutdown(timeout=2.0)

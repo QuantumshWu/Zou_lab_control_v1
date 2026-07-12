@@ -114,6 +114,7 @@ def test_exact_pipeline_commits_and_reloads_capture_artifact(tmp_path):
         assert artifact.coverage.complete
         assert artifact.terminal.produced_count == 2
         assert artifact.terminal.drained_count == 2
+        assert artifact.pulse_lineage is None
         assert artifact.provenance.trace_binding.run_id == handle.snapshot().run_id.value
         assert not hasattr(artifact, "camera")
         assert not hasattr(reference, "repository")

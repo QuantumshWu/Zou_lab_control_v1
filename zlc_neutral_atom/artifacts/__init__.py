@@ -6,6 +6,7 @@ from .capture import (
     CaptureArtifactRef,
     CaptureRepository,
     compile_capture_artifact_pipeline,
+    PulseCaptureLineage,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "CaptureArtifactRef",
     "CaptureRepository",
     "compile_capture_artifact_pipeline",
+    "PulseCaptureLineage",
 ]

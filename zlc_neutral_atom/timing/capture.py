@@ -18,6 +18,7 @@ from zlc_neutral_atom.runtime import (
     RunPlan,
     open_exact_capture,
 )
+from zlc_pulse import PulseExecutionForm
 
 from .pulse import (
     BoundPulsePort,
@@ -80,12 +81,29 @@ class TriggeredPipelineResult:
     capture: PipelineResult
     pulse_terminal: PulseTerminalAck
     trigger_channel: str
+    compiled_artifact_digest: str
+    source_document_digest: str
+    execution_form: PulseExecutionForm
 
     def __post_init__(self) -> None:
         if not isinstance(self.capture, PipelineResult):
             raise TypeError("capture must be PipelineResult")
         if not isinstance(self.pulse_terminal, PulseTerminalAck):
             raise TypeError("pulse_terminal must be PulseTerminalAck")
+        for value, field in (
+            (self.compiled_artifact_digest, "compiled_artifact_digest"),
+            (self.source_document_digest, "source_document_digest"),
+        ):
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(f"{field} must be a lowercase SHA-256 digest")
+        if not isinstance(self.execution_form, PulseExecutionForm):
+            raise TypeError("execution_form must be PulseExecutionForm")
+        if self.pulse_terminal.artifact_digest != self.compiled_artifact_digest:
+            raise ValueError("pulse terminal and compiled artifact digest differ")
         counts = dict(self.pulse_terminal.completed_schedule_trigger_counts)
         if self.trigger_channel not in counts:
             raise ValueError("pulse terminal omits the bound camera trigger channel")
@@ -159,6 +177,9 @@ def compile_triggered_pipeline(spec: TriggeredCaptureSpec) -> RunPlan:
                 capture_result,
                 pulse_terminal,
                 spec.trigger_channel,
+                spec.pulse_request.artifact_digest,
+                spec.pulse_request.artifact.source_document_digest,
+                spec.pulse_request.artifact.execution_form,
             )
         except BaseException as error:
             prepared.capture.fail(error)
