@@ -15,6 +15,7 @@ from ..timing import DEFAULT_EXPOSURE_S
 from .base import (
     ROI_CLEAR_SENTINELS,
     AcquisitionCancelled,
+    CameraCaptureTerminalRecord,
     CameraDevice,
     CameraFrameRecord,
     config_param_decl,
@@ -452,24 +453,63 @@ class QCMOSCamera(CameraDevice):
         return True
 
     def _disarm(self) -> None:
+        self._finish_record_capture()
+
+    def _finish_record_capture(self) -> CameraCaptureTerminalRecord:
+        """Stop DCAM, freeze its final frame count, then release the driver ring."""
+
         dcam = self._dcam
         if dcam is None:
-            return
+            return CameraCaptureTerminalRecord(0, True, True, True)
         stop_ok = False
         release_ok = False
+        produced_count: int | None = None
+        stop_error: BaseException | None = None
+        transfer_error: BaseException | None = None
         try:
             stop_ok = dcam.cap_stop() is True
-        finally:
+        except BaseException as exc:
+            stop_error = exc
+        if stop_ok:
+            try:
+                info = dcam.cap_transferinfo()
+                if info is False:
+                    raise RuntimeError(
+                        f"qCMOS final cap_transferinfo failed: {dcam.lasterr()}"
+                    )
+                produced_count = int(info.nFrameCount)
+                if produced_count < 0:
+                    raise RuntimeError("qCMOS final nFrameCount is negative")
+            except BaseException as exc:
+                transfer_error = exc
+        release_error: BaseException | None = None
+        try:
             release_ok = dcam.buf_release() is True
-        if not stop_ok or not release_ok:
+        except BaseException as exc:
+            release_error = exc
+        if (
+            not stop_ok
+            or stop_error is not None
+            or transfer_error is not None
+            or not release_ok
+            or release_error is not None
+        ):
             failed = []
-            if not stop_ok:
+            if not stop_ok or stop_error is not None:
                 failed.append("cap_stop")
-            if not release_ok:
+            if transfer_error is not None:
+                failed.append("cap_transferinfo")
+            if not release_ok or release_error is not None:
                 failed.append("buf_release")
-            raise RuntimeError(
+            error = RuntimeError(
                 "qCMOS disarm did not acknowledge " + " and ".join(failed)
             )
+            cause = stop_error or transfer_error or release_error
+            if cause is not None:
+                raise error from cause
+            raise error
+        assert produced_count is not None
+        return CameraCaptureTerminalRecord(produced_count, True, True, True)
 
     def _set_prop(self, idprop, value, name: str, *, verify: bool = False) -> None:
         """Write a DCAM property and FAIL LOUDLY if the camera rejects it.

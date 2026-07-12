@@ -439,3 +439,58 @@ def test_qcmos_preserves_dcam_metadata_in_immutable_frame_records():
     dcam.returned_pixels[1][:] = -1
     np.testing.assert_array_equal(records[0].image, np.full((2, 3), 10.0))
     np.testing.assert_array_equal(records[1].image, np.full((2, 3), 11.0))
+
+
+def test_qcmos_terminal_stops_then_freezes_final_count_before_buffer_release():
+    """Terminal truth must be observed in the only safe DCAM ordering."""
+
+    api = _FakeApi()
+    api.initialised = True
+
+    class _OrderedTerminalDcam(_FakeDcam):
+        def __init__(self, owner_api):
+            super().__init__(owner_api, frames_ready=[True, True], ring=[1, 2, 3])
+            self.calls = []
+
+        def cap_stop(self):
+            self.calls.append("cap_stop")
+            return super().cap_stop()
+
+        def cap_transferinfo(self):
+            self.calls.append("cap_transferinfo")
+            return super().cap_transferinfo()
+
+        def buf_release(self):
+            self.calls.append("buf_release")
+            return super().buf_release()
+
+    dcam = _OrderedTerminalDcam(api)
+    cam = _grab_camera(api, dcam)
+    cam.arm(3)
+    records = cam.read_frame_records(2, timeout=0.3)
+    assert len(records) == 2
+    terminal = cam.finish_record_capture()
+
+    # The third production observation exists only at terminal.  A caller that
+    # expected two frames must reject it instead of committing a shifted run.
+    assert terminal.produced_count == 3
+    assert terminal.source_stopped and terminal.no_more_frames and terminal.joined
+    assert dcam.calls[-3:] == ["cap_stop", "cap_transferinfo", "buf_release"]
+    assert cam._recent_state()["armed"] is False
+
+
+def test_qcmos_terminal_failure_still_releases_common_arm_ownership():
+    api = _FakeApi()
+    api.initialised = True
+    dcam = _FakeDcam(api)
+    dcam.buf_release_ok = False
+    cam = _grab_camera(api, dcam)
+    cam.arm(1)
+    with pytest.raises(RuntimeError, match="buf_release"):
+        cam.finish_record_capture()
+    assert cam._recent_state()["armed"] is False
+
+    # The RLock owner was released in the common finally path, so the adapter
+    # cannot remain wedged merely because terminal evidence failed.
+    assert cam._acquire_lock().acquire(blocking=False)
+    cam._acquire_lock().release()

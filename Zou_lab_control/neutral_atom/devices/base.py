@@ -195,6 +195,29 @@ class CameraBufferOverrun(RuntimeError):
     """A captured frame could not be retained without overwriting authority data."""
 
 
+@dataclass(frozen=True)
+class CameraCaptureTerminalRecord:
+    """Adapter observation after capture stop and before session ownership release."""
+
+    produced_count: int
+    source_stopped: bool
+    no_more_frames: bool
+    joined: bool
+
+    def __post_init__(self) -> None:
+        if isinstance(self.produced_count, bool) or not isinstance(
+            self.produced_count, (int, np.integer)
+        ):
+            raise TypeError("produced_count must be a non-negative integer")
+        produced = int(self.produced_count)
+        if produced < 0:
+            raise ValueError("produced_count must be a non-negative integer")
+        object.__setattr__(self, "produced_count", produced)
+        for field in ("source_stopped", "no_more_frames", "joined"):
+            if type(getattr(self, field)) is not bool:
+                raise TypeError(f"{field} must be bool")
+
+
 @dataclass(frozen=True, eq=False)
 class CameraFrameRecord:
     """One immutable frame plus the source metadata observed with it.
@@ -951,9 +974,25 @@ class CameraDevice(BaseDevice):
 
     def disarm(self) -> None:
         """Stand the camera down and release the acquisition lock taken by :meth:`arm`."""
+        self.finish_record_capture()
+
+    def finish_record_capture(self) -> CameraCaptureTerminalRecord:
+        """Stop one armed epoch, freeze terminal facts, then release its owner lock.
+
+        Concrete hardware may override :meth:`_finish_record_capture` to read a
+        final production counter after the source has stopped but before its driver
+        buffer is released.  This method owns the common state/lock teardown exactly
+        once; callers must never reproduce it around backend hooks.
+        """
+
         state = self._recent_state()
         try:
-            self._disarm()
+            terminal = self._finish_record_capture()
+            if not isinstance(terminal, CameraCaptureTerminalRecord):
+                raise TypeError(
+                    "camera _finish_record_capture must return CameraCaptureTerminalRecord"
+                )
+            return terminal
         finally:
             with state["cond"]:
                 state["armed"] = False
@@ -1016,6 +1055,15 @@ class CameraDevice(BaseDevice):
 
     def _disarm(self) -> None:
         """Backend hook: stand the hardware down (``cap_stop`` / ``StopGrabbing``)."""
+
+    def _finish_record_capture(self) -> CameraCaptureTerminalRecord:
+        """Backend terminal hook; subclasses with counters override this atomically."""
+
+        self._disarm()
+        state = self._recent_state()
+        with state["cond"]:
+            produced = int(state["source_ordinal"])
+        return CameraCaptureTerminalRecord(produced, True, True, True)
 
     # ----------------------------------------------------------- frame buffers
     def _recent_state(self) -> dict:
@@ -1470,6 +1518,7 @@ def snap_subarray(roi, *, step: int, max_w: int, max_h: int):
 __all__ = [
     "BaseDevice",
     "CameraBufferOverrun",
+    "CameraCaptureTerminalRecord",
     "CameraDevice",
     "CameraFrameRecord",
     "EXCLUSIVE",

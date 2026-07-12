@@ -183,6 +183,18 @@ def test_record_gap_is_atomic_and_preserves_existing_pending_data():
         cam.disarm()
 
 
+def test_virtual_record_terminal_reports_the_arm_epoch_delivery_count():
+    cam, _seqr = _rig()
+    cam.arm(2)
+    cam._deliver_records([_record(1.0, 0), _record(2.0, 1)])
+    assert len(cam.read_frame_records(2)) == 2
+    terminal = cam.finish_record_capture()
+    assert terminal.produced_count == 2
+    assert terminal.source_stopped
+    assert terminal.no_more_frames
+    assert terminal.joined
+
+
 def test_lazy_state_and_lock_are_created_once_atomically():
     """F4: the lazily-created buffer state and acquisition lock are created ATOMICALLY (``setdefault``),
     so every touch returns the SAME object -- a check-then-set could build two divergent buffers /
