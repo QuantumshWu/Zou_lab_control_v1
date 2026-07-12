@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
 import numpy as np
@@ -91,6 +92,52 @@ class Value:
             shape=self.schema.data_shape,
         )
         object.__setattr__(self, "values", array)
+
+
+@dataclass(frozen=True)
+class ValuePayloadContract:
+    """Single owner for Value snapshot, schema validation, and retained-byte accounting."""
+
+    schema: ValueSchema
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.schema, ValueSchema):
+            raise TypeError("schema must be ValueSchema")
+
+    @property
+    def fingerprint(self) -> str:
+        source = f"zlc.value-payload.v1:{self.schema.fingerprint}".encode("ascii")
+        return hashlib.sha256(source).hexdigest()
+
+    @property
+    def max_retained_nbytes(self) -> int:
+        value_bytes = int(np.prod(self.schema.data_shape, dtype=np.int64)) * self.schema.dtype.itemsize
+        validity = self.schema.validity_contract
+        if validity.mode is not ValidityMode.COMPONENTS:
+            return value_bytes
+        component_shape = tuple(self.schema.axis(axis_id).size for axis_id in validity.component_axis_ids)
+        return value_bytes + int(np.prod(component_shape, dtype=np.int64))
+
+    def snapshot(self, payload: Value) -> Value:
+        self.validate(payload)
+        return payload
+
+    def validate(self, payload: Value) -> None:
+        if not isinstance(payload, Value):
+            raise TypeError("ValuePayloadContract accepts only Value payloads")
+        if payload.schema is not self.schema:
+            raise TypeError(
+                "Value payload must share the generation-owned ValueSchema instance"
+            )
+
+    def retained_nbytes(self, payload: Value) -> int:
+        self.validate(payload)
+        validity_bytes = (
+            payload.validity.mask.nbytes
+            if isinstance(payload.validity, ComponentValidity)
+            else 0
+        )
+        return int(payload.values.nbytes + validity_bytes)
 
 
 @dataclass(frozen=True, eq=False)
@@ -245,6 +292,7 @@ __all__ = [
     "StreamGenerationId",
     "VALID",
     "Value",
+    "ValuePayloadContract",
     "expand_dataset_validity",
     "expand_value_validity",
 ]

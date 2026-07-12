@@ -35,6 +35,7 @@ from .codec import (
     TypedCodecError,
 )
 from .layout import PointLayout, PointLayoutMode
+from .patch import DataPatch, ValueValidity
 from .schema import DatasetSchema, ValueSchema
 from .validity import (
     INVALID,
@@ -54,6 +55,7 @@ from .value import (
     OwnedSnapshot,
     StreamGenerationId,
     Value,
+    ValuePayloadContract,
     expand_dataset_validity,
     expand_value_validity,
 )
@@ -68,6 +70,7 @@ __all__ = [
     "ComponentValidity",
     "CoordinateFrameId",
     "DataBlock",
+    "DataPatch",
     "DatasetRevision",
     "DatasetRevisionRef",
     "DatasetSchema",
@@ -89,6 +92,8 @@ __all__ = [
     "ValidityContract",
     "ValidityMode",
     "Value",
+    "ValuePayloadContract",
+    "ValueValidity",
     "ValueSchema",
     "axis_from_tree",
     "axis_to_tree",
