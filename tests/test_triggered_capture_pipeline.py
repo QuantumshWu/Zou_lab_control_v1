@@ -29,10 +29,15 @@ from zlc_neutral_atom.timing import (
     TriggeredCaptureSpec,
     compile_triggered_pipeline,
 )
-from zlc_pulse import PulseExecutionForm, compile_pulse_artifact, load_pulse_document
+from zlc_pulse import (
+    PulseExecutionForm,
+    bind_pulse_document_target,
+    compile_pulse_artifact,
+    load_pulse_document,
+)
+from zlc_pulse.target import pulse_target_from_legacy_tree
 from zlc_workbench.camera_capture import CameraCaptureBindingRequest
 from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
-from zlc_workbench.pulse_compile_bridge import _legacy_compile_input
 
 
 ROOT = Path(__file__).parents[1]
@@ -44,11 +49,10 @@ def _axis(name, role, size):
 
 def _runtime(point_count=3):
     document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
-    _state, catalog = _legacy_compile_input(document)
-    sequencer = VirtualSequencer(
-        channels=document.target.raw_lanes,
-        port_catalog=catalog,
-        sleep_scale=0,
+    sequencer = VirtualSequencer(sleep_scale=0)
+    document = bind_pulse_document_target(
+        document,
+        pulse_target_from_legacy_tree(sequencer.port_catalog.to_dict()),
     )
     trap = VirtualTrapArray(grid_shape=(2, 2), image_shape=(6, 8), seed=7)
     camera = VirtualCamera(trap, exposure=1e-3, sequencer=sequencer)

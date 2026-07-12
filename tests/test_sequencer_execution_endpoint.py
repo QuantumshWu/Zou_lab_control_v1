@@ -25,9 +25,14 @@ from zlc_neutral_atom.runtime import (
     SafetyOperation,
 )
 from zlc_neutral_atom.timing import FinitePulseExecutionRequest, PulseSessionState
-from zlc_pulse import PulseExecutionForm, compile_pulse_artifact, load_pulse_document
+from zlc_pulse import (
+    PulseExecutionForm,
+    bind_pulse_document_target,
+    compile_pulse_artifact,
+    load_pulse_document,
+)
+from zlc_pulse.target import pulse_target_from_legacy_tree
 from zlc_workbench.legacy_runtime import LegacyDeviceRegistration, LegacyDeviceRegistry
-from zlc_workbench.pulse_compile_bridge import _legacy_compile_input
 from zlc_workbench.sequencer_execution import (
     SequencerBindingRequest,
     VirtualSequencerExecutionEndpoint,
@@ -39,11 +44,10 @@ ROOT = Path(__file__).parents[1]
 
 
 def _bound_virtual_sequencer(document):
-    _state, catalog = _legacy_compile_input(document)
-    sequencer = VirtualSequencer(
-        channels=document.target.raw_lanes,
-        port_catalog=catalog,
-        sleep_scale=0,
+    sequencer = VirtualSequencer(sleep_scale=0)
+    document = bind_pulse_document_target(
+        document,
+        pulse_target_from_legacy_tree(sequencer.port_catalog.to_dict()),
     )
     broker = DeviceBroker()
     registry = LegacyDeviceRegistry(broker)
@@ -81,7 +85,7 @@ def _bound_virtual_sequencer(document):
         registry,
         SequencerBindingRequest(),
     )
-    return sequencer, port
+    return sequencer, port, document
 
 
 def _plan(port, request):
@@ -117,7 +121,7 @@ def _plan(port, request):
 
 def test_finite_pulse_runs_prepare_fire_terminal_then_verified_safe():
     document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
-    sequencer, port = _bound_virtual_sequencer(document)
+    sequencer, port, document = _bound_virtual_sequencer(document)
     artifact = compile_pulse_artifact(
         document,
         clock_hz=sequencer.clock_hz,
@@ -143,7 +147,7 @@ def test_finite_pulse_runs_prepare_fire_terminal_then_verified_safe():
 
 def test_live_target_mismatch_is_rejected_before_prepare_or_fire():
     document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
-    sequencer, port = _bound_virtual_sequencer(document)
+    sequencer, port, document = _bound_virtual_sequencer(document)
     artifact = compile_pulse_artifact(
         document,
         clock_hz=sequencer.clock_hz,
@@ -168,7 +172,7 @@ def test_reference_and_scan_forms_execute_the_exact_compiled_ir(
     trigger_channel,
 ):
     document = load_pulse_document(ROOT / "pulses" / filename)
-    sequencer, port = _bound_virtual_sequencer(document)
+    sequencer, port, document = _bound_virtual_sequencer(document)
     artifact = compile_pulse_artifact(
         document,
         clock_hz=sequencer.clock_hz,

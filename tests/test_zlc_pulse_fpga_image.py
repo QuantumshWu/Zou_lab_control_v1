@@ -6,19 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from fpga.pulse_streamer.host.image import StreamerParams, pack_program
-from Zou_lab_control.neutral_atom.devices.sequencer import (
-    compile_pulse_table_runtime_program,
-    compile_pulse_table_scan_runtime_program,
-)
+from fpga.pulse_streamer.host.image import StreamerParams
 from zlc_pulse import (
     PulseExecutionForm,
     compile_pulse_document,
     load_pulse_document,
     pack_target_ir,
-)
-from zlc_workbench.pulse_compile_bridge import (
-    _legacy_compile_input,
 )
 
 
@@ -26,37 +19,21 @@ ROOT = Path(__file__).parents[1]
 
 
 @pytest.mark.parametrize(
-    ("name", "form"),
+    ("name", "form", "expected_digest"),
     [
-        ("imaging_template.json", PulseExecutionForm.STATIC_ONCE),
-        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE),
-        ("pulse_test.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE),
-        ("T.json", PulseExecutionForm.STATIC_ONCE),
+        ("imaging_template.json", PulseExecutionForm.STATIC_ONCE, "3f3100880aee3be52141ffc1cdda477db38644835ecd6deb361c5e9fcde7c3cb"),
+        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "7e32834207c74fd646e4f9012ae5fc0aceec12dec9c5a5546882a43784b1420a"),
+        ("pulse_test.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "e5410fce0ff366390ea56feb74bd7f7fc8e640264d5b5906d95fefb083d3d355"),
+        ("T.json", PulseExecutionForm.STATIC_ONCE, "a31cedfa143c00571fbb8ebd882ddc45ae6bfd36774aa44368f66b99df5eb270"),
     ],
 )
-def test_target_ir_wire_image_equals_existing_proven_path(name, form):
+def test_target_ir_wire_image_matches_the_frozen_wire_golden(name, form, expected_digest):
     document = load_pulse_document(ROOT / "pulses" / name)
     params = StreamerParams()
     ir = compile_pulse_document(document, clock_hz=50e6, execution_form=form)
     current = pack_target_ir(ir, params)
 
-    state, catalog = _legacy_compile_input(document)
-    if form is PulseExecutionForm.AUTONOMOUS_SCAN_ONCE:
-        legacy = compile_pulse_table_scan_runtime_program(
-            state,
-            clock_hz=50e6,
-            repeat_forever=False,
-            port_catalog=catalog,
-        )
-    else:
-        legacy = compile_pulse_table_runtime_program(
-            state,
-            clock_hz=50e6,
-            repeat_forever=False,
-            port_catalog=catalog,
-        )
-    assert current.as_dict() == pack_program(legacy, params)
-    assert len(current.digest) == 64
+    assert current.digest == expected_digest
 
 
 def test_wire_image_is_immutable_and_geometry_bound():

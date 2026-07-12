@@ -14,41 +14,31 @@ from zlc_pulse import (
     compile_pulse_document,
     load_pulse_document,
 )
-from zlc_workbench.pulse_compile_bridge import (
-    compile_pulse_document as compile_with_migration_oracle,
-)
-
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize(
-    ("filename", "form"),
+    ("filename", "form", "expected_ir_digest"),
     (
-        ("camera_imaging_address_switch.json", PulseExecutionForm.STATIC_REFERENCE_POINT),
-        ("imaging_template.json", PulseExecutionForm.STATIC_ONCE),
-        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE),
-        ("probe_template.json", PulseExecutionForm.STATIC_ONCE),
-        ("pulse_test.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE),
-        ("release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT),
-        ("T.json", PulseExecutionForm.STATIC_ONCE),
+        ("camera_imaging_address_switch.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "1c8f05d640be640f22a72a516ddb2d6c1d08274cdf9c640b160328e0fd042d52"),
+        ("imaging_template.json", PulseExecutionForm.STATIC_ONCE, "3b49211b15c50d0cbdb9f61e35dc8594070c1d6fe8daca058fb18e380a47e67d"),
+        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "36934f9e37e3ed785d4144e37b520e2d52e36229aa604229d3eeebc3589dad26"),
+        ("probe_template.json", PulseExecutionForm.STATIC_ONCE, "376609a880f39cc65f9b928e38fdaeaa3ee0355d376330f83ad941b369575564"),
+        ("pulse_test.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "4720f17f31aa6421da65dfff7b1ac05a236a7a26f93ccdb36577e98706724b0e"),
+        ("release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "0bacd7db575bb5e830ccb12872c13fb3231bb58be8f2c93e389a58abeee054a7"),
+        ("T.json", PulseExecutionForm.STATIC_ONCE, "a1ec95ee70ac18ab421b865682bacf18251a1d71b766f2ba7cd0d4970b8aea2e"),
     ),
 )
-def test_native_compiler_is_target_ir_identical_to_the_one_time_oracle(filename, form):
+def test_native_compiler_matches_the_frozen_migration_golden(filename, form, expected_ir_digest):
     document = load_pulse_document(ROOT / "pulses" / filename)
 
-    expected = compile_with_migration_oracle(
-        document,
-        clock_hz=50e6,
-        execution_form=form,
-    )
     actual = compile_pulse_document(
         document,
         clock_hz=50e6,
         execution_form=form,
     )
 
-    assert actual == expected
+    assert actual.fingerprint == expected_ir_digest
 
 
 def test_native_compiler_preserves_compact_and_delay_unrolled_repeat_semantics():
@@ -82,16 +72,8 @@ def test_native_compiler_preserves_compact_and_delay_unrolled_repeat_semantics()
         execution_form=PulseExecutionForm.STATIC_ONCE,
     )
 
-    assert compact_ir == compile_with_migration_oracle(
-        compact,
-        clock_hz=50e6,
-        execution_form=PulseExecutionForm.STATIC_ONCE,
-    )
-    assert delayed_ir == compile_with_migration_oracle(
-        delayed,
-        clock_hz=50e6,
-        execution_form=PulseExecutionForm.STATIC_ONCE,
-    )
+    assert compact_ir.fingerprint == "38d96258e9bc011aea54ef270254a311b87e2168771b55d56389071bcfd9a0ec"
+    assert delayed_ir.fingerprint == "5c43d993a8ea26f2fa686a2ae7899eca9f995885d9abac69c7de4cfc01505060"
     assert compact_ir.loop_count == 3
     assert delayed_ir.loop_count == 1
 
@@ -117,11 +99,7 @@ def test_native_compiler_folds_digital_and_dac_delays_in_one_physical_schedule()
         execution_form=PulseExecutionForm.STATIC_ONCE,
     )
 
-    assert actual == compile_with_migration_oracle(
-        delayed,
-        clock_hz=50e6,
-        execution_form=PulseExecutionForm.STATIC_ONCE,
-    )
+    assert actual.fingerprint == "6a1eac76d5f571e7b4302d4fec1cf26727da7a6c3c13c3e0759202365cfdd538"
     assert any(actual.channel_delays)
     assert any(delay.delay_ticks for delay in actual.bus_delays)
 

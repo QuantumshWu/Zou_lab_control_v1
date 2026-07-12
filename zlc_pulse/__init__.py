@@ -34,6 +34,7 @@ from .schedule import (
     digital_trigger_schedule_from_tree,
     digital_trigger_schedule_to_tree,
 )
+from .simulation import PlaybackPulse, PulsePlayback, build_pulse_playback
 from .artifact import (
     COMPILED_PULSE_ARTIFACT_SCHEMA,
     CompiledPulseArtifact,
@@ -76,6 +77,8 @@ __all__ = [
     "PulseDocument",
     "PulsePeriod",
     "PulseExecutionForm",
+    "PlaybackPulse",
+    "PulsePlayback",
     "PulseWireImage",
     "PulseTarget",
     "TARGET_IR_SCHEMA",
@@ -85,6 +88,7 @@ __all__ = [
     "TargetIR",
     "TriggerEdge",
     "build_digital_trigger_schedules",
+    "build_pulse_playback",
     "bind_pulse_document_target",
     "compiled_pulse_artifact_from_tree",
     "compiled_pulse_artifact_to_tree",

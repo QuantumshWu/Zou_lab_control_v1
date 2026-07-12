@@ -1523,6 +1523,7 @@ class VirtualSequencer(SequencerDevice):
         # The compiled RuntimeSequenceProgram of the last prepare() (what on_pulse /
         # sync-to-device read for .sequence_name etc.).
         self.last_program = None
+        self._current_artifact_digest: str | None = None
         # The program the streamer is CONTINUOUSLY firing (a repeat_forever pulse), or None when
         # idle/safe -- the virtual camera's gate; see the class docstring.
         self._firing: PulseSequence | None = None
@@ -1544,6 +1545,7 @@ class VirtualSequencer(SequencerDevice):
         # so read_frames + wait_done back to back cost the play time ONCE, never twice.  None =
         # not fired yet (wait_done then anchors at its own call, the bare prepare+wait semantics).
         self._finite_play_deadline: float | None = None
+        self._current_logical_deadline: float | None = None
         # The virtual TRIGGER CABLES plugged into this streamer's output lines: each wired
         # camera registers a callback (see _TriggerWiredCamera._wire_to) that fire() invokes
         # with the fired program -- the software mirror of the electrical trigger edges the
@@ -1671,6 +1673,98 @@ class VirtualSequencer(SequencerDevice):
             self._scan_info = None
         return self.last_program
 
+    def prepare_compiled_playback(self, artifact, playback):
+        """Prepare a current zlc_pulse artifact without rebuilding a legacy payload.
+
+        This is the virtual-device adapter seam used by the typed execution port.
+        ``artifact.target_ir`` remains authoritative; ``playback`` is its pulse-owned
+        read-only digital projection for the virtual trigger cable and atom model.
+        """
+
+        from zlc_pulse import CompiledPulseArtifact, PulsePlayback
+
+        if not isinstance(artifact, CompiledPulseArtifact):
+            raise TypeError("artifact must be CompiledPulseArtifact")
+        if not isinstance(playback, PulsePlayback):
+            raise TypeError("playback must be PulsePlayback")
+        if playback.repeat_forever != artifact.target_ir.repeat_forever:
+            raise ValueError("playback cyclic intent differs from TargetIR")
+        with self._wire_lock:
+            self._firing = None
+            self._prepared = playback
+            self._current_artifact_digest = artifact.fingerprint
+        self.last_program = artifact.target_ir
+        self._scan_done = False
+        self._scan_fire_time = 0.0
+        self._finite_play_deadline = None
+        self._current_logical_deadline = None
+        if artifact.target_ir.scan_points:
+            durations = artifact.target_ir.scan_point_durations
+            self._scan_info = {
+                "n_points": float(len(durations)),
+                "scan_repeats": 1.0,
+                "base_dt": float(max(sum(durations) / len(durations), 1e-9)),
+            }
+        else:
+            self._scan_info = None
+        with self.service._lock:
+            self.service.prepared_program = None
+            self.service.state = "prepared"
+            self.service.history.append(
+                {
+                    "action": "prepare",
+                    "sequence_id": artifact.fingerprint,
+                    "sequence": playback.name,
+                    "duration": playback.duration,
+                    "cached": False,
+                }
+            )
+        return artifact.target_ir
+
+    def fire_compiled_playback(self, artifact_digest: str) -> None:
+        with self._wire_lock:
+            if self._prepared is None:
+                raise RuntimeError("VirtualSequencer.fire_compiled_playback() called before prepare")
+            if artifact_digest != self._current_artifact_digest:
+                raise RuntimeError("compiled FIRE does not match the prepared artifact")
+        with self.service._lock:
+            self.service.state = "running"
+            self.service.history.append(
+                {
+                    "action": "fire",
+                    "sequence_id": artifact_digest,
+                    "sequence": self._prepared.name,
+                }
+            )
+        self._publish_prepared_fire()
+        with self._wire_lock:
+            if self._finite_play_deadline is None:
+                self._current_logical_deadline = None
+            else:
+                tail = max(0.0, self._prepared.duration - self._prepared.logical_duration)
+                self._current_logical_deadline = self._finite_play_deadline - tail * self.sleep_scale
+
+    def wait_compiled_playback(self, artifact_digest: str, timeout: float | None) -> bool:
+        with self._wire_lock:
+            if self._prepared is None or artifact_digest != self._current_artifact_digest:
+                raise RuntimeError("compiled wait does not match the prepared artifact")
+            if self._prepared.repeat_forever:
+                raise RuntimeError("cannot wait indefinitely for a cyclic compiled playback")
+            deadline = self._current_logical_deadline
+        remaining = 0.0 if deadline is None else max(0.0, deadline - time.monotonic())
+        if timeout is not None and remaining > float(timeout):
+            ok = False
+        else:
+            if remaining:
+                time.sleep(remaining)
+            ok = True
+        with self.service._lock:
+            self.service.state = "done" if ok else "timeout"
+            self.service.history.append(
+                {"action": "wait_done", "sequence_id": artifact_digest, "ok": ok}
+            )
+        return ok
+
     def fire(self, sequence: PulseSequence | None = None) -> None:
         if self._prepared is None:
             raise RuntimeError("VirtualSequencer.fire() called before prepare().")
@@ -1683,6 +1777,11 @@ class VirtualSequencer(SequencerDevice):
         # never here.  So a continuous (repeat_forever) On Pulse returns at once and the live camera
         # then paces at the firing cadence.
         self.service.fire()
+        self._publish_prepared_fire()
+
+    def _publish_prepared_fire(self) -> None:
+        """Publish one already-prepared playback to the virtual output wire."""
+
         # A repeat_forever program keeps the streamer firing (continuous camera triggers) until
         # set_safe_state.  A finite program plays ONCE -- the measurement arms the camera, fires
         # here, then reads the frames back -- so it does NOT leave the streamer continuously
@@ -1855,9 +1954,13 @@ class VirtualSequencer(SequencerDevice):
         # fire is gone, so a free-running monitor now images the safe-state (all-zero) levels.
         with self._wire_lock:
             self._last_fired = None
+            self._prepared = None
+            self._current_artifact_digest = None
             self._scan_info = None
             self._scan_done = False
             self._scan_fire_time = 0.0
+            self._finite_play_deadline = None
+            self._current_logical_deadline = None
 
     def snapshot(self) -> dict[str, object]:
         # The composed service's snapshot carries the PROTOCOL state (state / cache_prepared /

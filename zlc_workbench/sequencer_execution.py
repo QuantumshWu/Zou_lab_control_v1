@@ -24,12 +24,11 @@ from zlc_neutral_atom.timing import (
     PulseTerminalAck,
     SequencerCapabilitySnapshot,
 )
-from zlc_pulse import PulseExecutionForm, PulseTarget
+from zlc_pulse import PulseTarget, build_pulse_playback
 from zlc_pulse.target import pulse_target_from_legacy_tree
 from zlc_storage import canonical_digest
 
 from .legacy_runtime import LegacyDeviceRegistry, TargetDeviceEndpoint
-from .pulse_compile_bridge import _legacy_compile_input, _target_ir
 
 
 def _text(value: object, field: str) -> str:
@@ -164,27 +163,17 @@ class VirtualSequencerExecutionEndpoint:
             if command.capability_fingerprint != self._capability_fingerprint:
                 raise ValueError("sequencer capability fingerprint differs")
             artifact = command.request.artifact
-            document = command.request.document
             if artifact.target_abi_fingerprint != self._target.abi_fingerprint:
                 raise ValueError("compiled pulse target differs from live sequencer")
             if artifact.target_ir.clock_hz != float(self._sequencer.clock_hz):
                 raise ValueError("compiled pulse clock differs from live sequencer")
             if artifact.wire_image.geometry_fingerprint != self._geometry:
                 raise ValueError("compiled wire geometry differs from live sequencer")
-            payload, _catalog = _legacy_compile_input(document)
-            data = payload.to_dict()
-            data["repeat_forever"] = False
-            data["scan_repeats"] = 0
-            payload = type(payload).from_dict(data)
-            if artifact.execution_form is PulseExecutionForm.STATIC_REFERENCE_POINT:
-                payload = payload.with_slots_resolved(
-                    {slot.name: slot.nominal for slot in payload.scan_slots}
-                )
-        prepared_program = self._sequencer.prepare(payload)
-        rebuilt = _target_ir(prepared_program, document.target)
-        if rebuilt != artifact.target_ir:
+        playback = build_pulse_playback(artifact, name=command.request.document.name)
+        prepared_program = self._sequencer.prepare_compiled_playback(artifact, playback)
+        if prepared_program is not artifact.target_ir:
             self._sequencer.set_safe_state()
-            raise RuntimeError("installed virtual prepare differs from CompiledPulseArtifact")
+            raise RuntimeError("virtual adapter did not retain the exact compiled TargetIR")
         with self._lock:
             self._validate_binding(binding)
             self._session = _EndpointSession(
@@ -208,7 +197,7 @@ class VirtualSequencerExecutionEndpoint:
                 raise RuntimeError("sequencer session is not ready for FIRE")
             if command.artifact_digest != session.artifact_digest:
                 raise ValueError("FIRE artifact digest differs from prepared session")
-        self._sequencer.fire()
+        self._sequencer.fire_compiled_playback(command.artifact_digest)
         with self._lock:
             session = self._active_session(binding, command.session_id)
             session.fired = True
@@ -231,7 +220,10 @@ class VirtualSequencerExecutionEndpoint:
             if command.artifact_digest != session.artifact_digest:
                 raise ValueError("completion artifact digest differs")
             artifact = session.request.artifact
-        if not self._sequencer.wait_done(timeout=command.timeout_seconds):
+        if not self._sequencer.wait_compiled_playback(
+            command.artifact_digest,
+            command.timeout_seconds,
+        ):
             raise TimeoutError("sequencer did not reach logical terminal")
         delay_wait = (
             artifact.max_configured_output_delay_ticks
