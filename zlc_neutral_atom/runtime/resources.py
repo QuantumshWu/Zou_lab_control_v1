@@ -86,6 +86,24 @@ class ResourceClaim:
 
 
 @dataclass(frozen=True)
+class ConnectionEstablishmentClaim:
+    """Exclusive, non-hazardous ownership for open + identity + generation bind."""
+
+    attempt_id: str
+    keys: tuple[ResourceKey, ...]
+
+    def __post_init__(self) -> None:
+        _canonical_segment(self.attempt_id, "connection establishment attempt id")
+        if not isinstance(self.keys, tuple) or not self.keys:
+            raise ValueError("connection establishment requires at least one ResourceKey")
+        if any(not isinstance(key, ResourceKey) for key in self.keys):
+            raise TypeError("connection establishment keys must be ResourceKey values")
+        canonical = tuple(sorted(set(self.keys)))
+        if canonical != self.keys:
+            raise ValueError("connection establishment keys must be unique canonical order")
+
+
+@dataclass(frozen=True)
 class ResourceBusy:
     requested: ResourceClaim
     conflicting_run_id: str
@@ -916,6 +934,46 @@ class ResourceLease:
         return self.release_after_safety(disposition="UNARMED")
 
 
+class ConnectionEstablishmentLease:
+    """Resource capability for a connection transaction that never changes outputs."""
+
+    __slots__ = ("_arbiter", "_capability", "claim", "_released", "_lock")
+
+    def __init__(
+        self,
+        arbiter: "ResourceArbiter",
+        capability: object,
+        claim: ConnectionEstablishmentClaim,
+    ) -> None:
+        self._arbiter = arbiter
+        self._capability = capability
+        self.claim = claim
+        self._released = False
+        self._lock = threading.Lock()
+
+    @property
+    def released(self) -> bool:
+        with self._lock:
+            return self._released
+
+    def close(self) -> bool:
+        with self._lock:
+            if self._released:
+                return False
+            self._arbiter._release_connection_establishment(
+                self._capability, self.claim
+            )
+            self._released = True
+            return True
+
+    def __enter__(self) -> "ConnectionEstablishmentLease":
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> bool:
+        self.close()
+        return False
+
+
 _UNSET = object()
 
 
@@ -985,6 +1043,9 @@ class RecoveryLease:
 
 AcquireResult = ResourceLease | ResourceBusy | ResourceQuarantined
 RecoveryAcquireResult = RecoveryLease | ResourceBusy | None
+ConnectionEstablishmentAcquireResult = (
+    ConnectionEstablishmentLease | ResourceBusy | ResourceQuarantined
+)
 
 
 class ResourceArbiter:
@@ -1122,6 +1183,50 @@ class ResourceArbiter:
             self._active[capability] = _ActiveLease(run_id, (requested,))
             self._active_by_run[run_id] = capability
             return RecoveryLease(self, capability, claim)
+
+    def begin_connection_establishment(
+        self,
+        keys: tuple[ResourceKey, ...],
+    ) -> ConnectionEstablishmentAcquireResult:
+        """Atomically exclude Runs/recovery while adapters establish live connections."""
+
+        normalized_keys = tuple(sorted(set(keys)))
+        if not normalized_keys:
+            raise ValueError("connection establishment requires at least one ResourceKey")
+        if any(not isinstance(key, ResourceKey) for key in normalized_keys):
+            raise TypeError("connection establishment keys must be ResourceKey values")
+        claims = tuple(ResourceClaim(key, ClaimMode.EXCLUSIVE) for key in normalized_keys)
+        attempt_id = uuid.uuid4().hex
+        claim = ConnectionEstablishmentClaim(attempt_id, normalized_keys)
+        capability = object()
+        run_id = f"connection:{attempt_id}"
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("ResourceArbiter is shut down")
+            for requested in claims:
+                hazard = self._matching_hazard(requested.key)
+                if hazard is not None:
+                    return ResourceQuarantined(
+                        requested=requested,
+                        reason=f"unresolved hazardous run {hazard.run_id}",
+                        recovery_action=(
+                            "use RecoveryClaim before reconnecting this device"
+                        ),
+                    )
+                quarantined = self._matching_quarantine(requested.key)
+                if quarantined is not None:
+                    return ResourceQuarantined(
+                        requested=requested,
+                        reason=quarantined.reason,
+                        recovery_action=quarantined.recovery_action,
+                    )
+                for active in self._active.values():
+                    for held in active.claims:
+                        if _claims_conflict(requested, held):
+                            return ResourceBusy(requested, active.run_id, held)
+            self._active[capability] = _ActiveLease(run_id, claims)
+            self._active_by_run[run_id] = capability
+        return ConnectionEstablishmentLease(self, capability, claim)
 
     def active_claims(self) -> Mapping[str, tuple[ResourceClaim, ...]]:
         with self._lock:
@@ -1467,6 +1572,23 @@ class ResourceArbiter:
                 raise RuntimeError("recovery capability is no longer active")
             if capability in self._journal_pending:
                 raise RuntimeError("cannot abort while recovery journal I/O is pending")
+            del self._active[capability]
+            del self._active_by_run[active.run_id]
+
+    def _release_connection_establishment(
+        self,
+        capability: object,
+        claim: ConnectionEstablishmentClaim,
+    ) -> None:
+        with self._lock:
+            active = self._active.get(capability)
+            expected = tuple(
+                ResourceClaim(key, ClaimMode.EXCLUSIVE) for key in claim.keys
+            )
+            if active is None or active.claims != expected:
+                raise RuntimeError("connection establishment capability is no longer active")
+            if capability in self._journal_pending:
+                raise RuntimeError("connection establishment cannot own journal I/O")
             del self._active[capability]
             del self._active_by_run[active.run_id]
 

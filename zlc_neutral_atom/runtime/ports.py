@@ -489,6 +489,17 @@ class DeviceBroker:
             self._verified_identities[nonce] = identity
         return identity
 
+    def discard_verified_identity(self, identity: VerifiedBoundDeviceIdentity) -> bool:
+        """Revoke an unconsumed identity proof when establishment rolls back."""
+
+        if not isinstance(identity, VerifiedBoundDeviceIdentity) or identity._broker is not self:
+            raise TypeError("identity proof does not belong to this DeviceBroker")
+        with self._lock:
+            if self._verified_identities.get(identity._nonce) is not identity:
+                return False
+            self._verified_identities.pop(identity._nonce, None)
+            return True
+
     def bind(
         self,
         *,

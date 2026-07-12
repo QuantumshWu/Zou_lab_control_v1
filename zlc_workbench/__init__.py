@@ -1,5 +1,6 @@
 """Desktop composition contracts; importing this package does not import Qt."""
 
+from .asset_map import InstallationAsset, InstallationAssetMap
 from .legacy import (
     CatalogEntry,
     CatalogRoute,
@@ -14,6 +15,7 @@ from .legacy_runtime import (
     LegacyNodeAlreadyManaged,
     LegacyNodeStartFailed,
     LegacyNodeStarted,
+    LegacyRuntimeTransition,
     LegacyRunHandle,
     LegacyRuntimeFence,
     LegacyStopReceipt,
@@ -39,6 +41,8 @@ __all__ = [
     "CatalogRoute",
     "CatalogRouter",
     "CoherenceSourceBinding",
+    "InstallationAsset",
+    "InstallationAssetMap",
     "LegacyHandoffTimeout",
     "LegacyDeviceNotRegistered",
     "LegacyDeviceRegistration",
@@ -46,6 +50,7 @@ __all__ = [
     "LegacyNodeAlreadyManaged",
     "LegacyNodeStartFailed",
     "LegacyNodeStarted",
+    "LegacyRuntimeTransition",
     "LegacyRunHandle",
     "LegacyRuntimeFence",
     "LegacyStopReceipt",

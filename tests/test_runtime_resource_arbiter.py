@@ -11,6 +11,7 @@ from zlc_neutral_atom.runtime import (
     CancellationRequested,
     CancellationToken,
     ClaimMode,
+    ConnectionEstablishmentLease,
     DeviceBroker,
     DeviceIdentityAck,
     DeviceIdentityEvidenceKind,
@@ -189,6 +190,40 @@ def test_acquire_all_is_atomic_when_one_claim_conflicts():
     active = arbiter.active_claims()
     assert len(active) == 1
     assert "run-b" not in active
+
+
+def test_connection_establishment_is_exclusive_with_normal_runs():
+    arbiter = new_arbiter()
+    key = ResourceKey.parse("device/camera")
+    establishment = arbiter.begin_connection_establishment((key,))
+    assert isinstance(establishment, ConnectionEstablishmentLease)
+    blocked = arbiter.acquire_all("capture", (ResourceClaim(key),))
+    assert isinstance(blocked, ResourceBusy)
+    assert establishment.close()
+    assert isinstance(
+        arbiter.acquire_all("capture", (ResourceClaim(key),)), ResourceLease
+    )
+
+
+def test_connection_establishment_cannot_bypass_quarantine():
+    arbiter = new_arbiter()
+    key = ResourceKey.parse("device/camera")
+    lease = arbiter.acquire_all("unsafe", (ResourceClaim(key),))
+    assert isinstance(lease, ResourceLease)
+    lease.activate_hazards((hazard(key, "generation-a"),))
+    lease._commit_safety(
+        (
+            SafetyDecision(
+                key,
+                SafetyOutcome.UNSAFE,
+                reason="disconnect",
+                recovery_action="manual recovery",
+            ),
+        )
+    )
+    lease.release_after_safety(disposition="FAILED")
+    blocked = arbiter.begin_connection_establishment((key,))
+    assert isinstance(blocked, ResourceQuarantined)
 
 
 def test_hierarchical_exclusive_claim_conflicts_with_child():

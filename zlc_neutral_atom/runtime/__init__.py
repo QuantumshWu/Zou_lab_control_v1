@@ -89,6 +89,8 @@ from .pipeline import (
 )
 from .resources import (
     ClaimMode,
+    ConnectionEstablishmentClaim,
+    ConnectionEstablishmentLease,
     HazardClaim,
     HazardAppendStatus,
     HazardEpochExpired,
@@ -193,6 +195,8 @@ __all__ = [
     "CaptureTerminalAck",
     "CapturedPayloadAck",
     "ClaimMode",
+    "ConnectionEstablishmentClaim",
+    "ConnectionEstablishmentLease",
     "CleanupDevice",
     "CleanupReport",
     "DeviceBroker",

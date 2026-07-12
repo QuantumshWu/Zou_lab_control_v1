@@ -68,6 +68,10 @@ class LegacyNodeStartFailed(RuntimeError):
     """The authoritative Run terminated before the old node worker started."""
 
 
+class LegacyRuntimeTransition(RuntimeError):
+    """Starts are closed while composition replaces a device generation."""
+
+
 @dataclass(frozen=True)
 class LegacyDeviceRegistration:
     """Composition-owned mapping from one raw old device to target runtime facts.
@@ -82,7 +86,9 @@ class LegacyDeviceRegistration:
     identity_probe: Callable[[], DeviceIdentityAck]
     cleanup_operations: Mapping[SafetyOperation, Callable[[], CleanupStepAck]]
     cleanup_order: tuple[SafetyOperation, ...]
-    verify_safe_state: Callable[[], SafeStateAck]
+    verify_safe_state: Callable[[], SafeStateAck] | None
+    hazardous: bool = True
+    admission_check: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         if self.device is None:
@@ -93,19 +99,32 @@ class LegacyDeviceRegistration:
             raise ValueError("legacy hardware ResourceKeys must live below device/")
         if not callable(self.identity_probe):
             raise TypeError("identity_probe must be callable")
-        if not callable(self.verify_safe_state):
-            raise TypeError("verify_safe_state must be callable")
         operations = dict(self.cleanup_operations)
-        if not operations:
-            raise ValueError("hazardous legacy devices require at least one cleanup operation")
         for operation, callback in operations.items():
             if not isinstance(operation, SafetyOperation):
                 raise TypeError("cleanup operation keys must be SafetyOperation")
             if not callable(callback):
                 raise TypeError("cleanup operation callbacks must be callable")
         order = tuple(self.cleanup_order)
-        if not order or len(set(order)) != len(order) or set(order) != set(operations):
-            raise ValueError("cleanup_order must list every cleanup operation exactly once")
+        if not isinstance(self.hazardous, bool):
+            raise TypeError("hazardous must be bool")
+        if self.admission_check is not None and not callable(self.admission_check):
+            raise TypeError("admission_check must be callable or None")
+        if self.hazardous:
+            if not callable(self.verify_safe_state):
+                raise TypeError("hazardous legacy devices require verify_safe_state")
+            if not operations:
+                raise ValueError(
+                    "hazardous legacy devices require at least one cleanup operation"
+                )
+            if not order or len(set(order)) != len(order) or set(order) != set(operations):
+                raise ValueError(
+                    "cleanup_order must list every cleanup operation exactly once"
+                )
+        elif operations or order or self.verify_safe_state is not None:
+            raise ValueError(
+                "non-hazardous legacy resources cannot declare cleanup or safety proof callbacks"
+            )
         object.__setattr__(self, "cleanup_operations", MappingProxyType(operations))
         object.__setattr__(self, "cleanup_order", order)
 
@@ -150,8 +169,18 @@ class LegacyDeviceRegistry:
             )
         return registration
 
+    def is_registered(self, device: object) -> bool:
+        lookup = id(device)
+        with self._lock:
+            registration = self._registrations.get(lookup)
+            return registration is not None and registration.device is device
+
     def binding_for(self, device: object) -> BoundDevice:
         registration = self.registration_for(device)
+        if not registration.hazardous:
+            raise RuntimeError(
+                f"non-hazardous legacy resource {registration.key} has no device binding"
+            )
         lookup = id(registration.device)
         # Identity probing and broker binding are serialized so two simultaneous starts
         # cannot create competing bindings for one old raw handle.
@@ -159,14 +188,37 @@ class LegacyDeviceRegistry:
             existing = self._bindings.get(lookup)
             if existing is not None:
                 return existing
+        binding = self.establish(device)
+        assert binding is not None
+        return binding
+
+    def has_binding(self, device: object) -> bool:
+        registration = self.registration_for(device)
+        if not registration.hazardous:
+            return True
+        with self._lock:
+            return id(registration.device) in self._bindings
+
+    def establish(self, device: object) -> BoundDevice | None:
+        """Verify live identity and publish a fresh broker generation for one connection."""
+
+        registration = self.registration_for(device)
+        if not registration.hazardous:
+            return None
+        lookup = id(registration.device)
+        with self._lock:
             identity = self._broker.verify_identity(registration.identity_probe)
-            binding = self._broker.bind(
-                key=registration.key,
-                identity=identity,
-                execute_command=_reject_direct_legacy_command,
-                cleanup_operations=registration.cleanup_operations,
-                verify_safe_state=registration.verify_safe_state,
-            )
+            try:
+                binding = self._broker.bind(
+                    key=registration.key,
+                    identity=identity,
+                    execute_command=_reject_direct_legacy_command,
+                    cleanup_operations=registration.cleanup_operations,
+                    verify_safe_state=registration.verify_safe_state,
+                )
+            except BaseException:
+                self._broker.discard_verified_identity(identity)
+                raise
             self._bindings[lookup] = binding
             return binding
 
@@ -242,11 +294,13 @@ class LegacyRunHandle:
         handle: RunHandle[object],
         latch: _StartLatch,
         claims: tuple[ResourceClaim, ...],
+        reference_keys: tuple[ResourceKey, ...],
     ) -> None:
         self._node = node
         self._handle = handle
         self._latch = latch
         self._claims = claims
+        self._reference_keys = reference_keys
 
     @property
     def node(self) -> object:
@@ -259,6 +313,10 @@ class LegacyRunHandle:
     @property
     def claims(self) -> tuple[ResourceClaim, ...]:
         return self._claims
+
+    @property
+    def reference_keys(self) -> tuple[ResourceKey, ...]:
+        return self._reference_keys
 
     @property
     def started(self) -> bool:
@@ -296,6 +354,106 @@ class LegacyRunHandle:
         return self._handle.cancel(reason)
 
 
+class _LegacyHardwareCall:
+    """One synchronous legacy hardware operation represented as a finite authoritative Run."""
+
+    _legacy_run_mode = RunMode.FINITE_EXACT
+
+    def __init__(
+        self,
+        name: str,
+        devices: tuple[object, ...],
+        callback: Callable[[], object],
+        *,
+        exclusive: bool,
+    ) -> None:
+        self.name = _canonical_text(name, "legacy hardware call name")
+        self._devices = _unique_devices(devices)
+        if not self._devices:
+            raise ValueError("legacy hardware call must declare at least one device")
+        if not callable(callback):
+            raise TypeError("legacy hardware call callback must be callable")
+        self._callback = callback
+        self._exclusive = bool(exclusive)
+        self._authority: object | None = None
+        self._thread: threading.Thread | None = None
+        self._done = threading.Event()
+        self._result: object | None = None
+        self._error: BaseException | None = None
+
+    def occupied_devices(self) -> tuple[object, ...]:
+        return self._devices if self._exclusive else ()
+
+    def referenced_devices(self) -> tuple[object, ...]:
+        return self._devices
+
+    @property
+    def running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    @property
+    def _execution_error(self) -> BaseException | None:
+        return self._error
+
+    def _bind_runtime_start_authority(self, authority: object) -> None:
+        if authority is None:
+            raise ValueError("runtime start authority cannot be None")
+        if self._authority is not None and self._authority is not authority:
+            raise RuntimeError("legacy hardware call is bound to another authority")
+        self._authority = authority
+
+    def _start_from_runtime(self, authority: object):
+        if self._authority is not authority:
+            raise RuntimeError("legacy hardware call start capability is not current")
+        return self._start_impl()
+
+    def start(self):
+        raise RuntimeError("legacy hardware calls require LegacyRuntimeFence authority")
+
+    def _start_impl(self):
+        if self.running:
+            raise LegacyNodeAlreadyManaged("legacy hardware call is already running")
+        self._done.clear()
+
+        def invoke() -> None:
+            try:
+                self._result = self._callback()
+            except BaseException as exc:
+                self._error = exc
+            finally:
+                self._done.set()
+
+        self._thread = threading.Thread(
+            target=invoke,
+            name=f"zlc-legacy-call-{self.name}",
+            daemon=False,
+        )
+        self._thread.start()
+        return self
+
+    def stop(self, timeout: float = 2.0) -> bool:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise TypeError("legacy hardware call stop timeout must be non-negative")
+        timeout = float(timeout)
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("legacy hardware call stop timeout must be non-negative")
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout)
+        if thread is not None and thread.is_alive():
+            return False
+        self._thread = None
+        return True
+
+    def result(self) -> object:
+        if not self._done.is_set() or self.running:
+            raise RuntimeError("legacy hardware call has not terminated")
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+
 class LegacyRuntimeFence:
     """Adapt old LogicNodes to the target runtime without becoming a lifecycle owner."""
 
@@ -319,6 +477,8 @@ class LegacyRuntimeFence:
         self._poll_interval = _positive_timeout(poll_interval, "poll_interval")
         self._lock = threading.RLock()
         self._handles: dict[int, LegacyRunHandle] = {}
+        self._transition_token: object | None = None
+        self._node_start_authority = object()
 
     @property
     def controller(self) -> RunController:
@@ -327,6 +487,14 @@ class LegacyRuntimeFence:
     @property
     def devices(self) -> LegacyDeviceRegistry:
         return self._devices
+
+    @property
+    def has_active_claims(self) -> bool:
+        with self._lock:
+            return any(
+                handle.claims and not handle.snapshot().state.terminal
+                for handle in self._handles.values()
+            )
 
     def start(self, node: object) -> LegacyRunHandle:
         if not callable(getattr(node, "start", None)):
@@ -339,13 +507,23 @@ class LegacyRuntimeFence:
             )
         lookup = id(node)
         with self._lock:
+            if self._transition_token is not None:
+                raise LegacyRuntimeTransition(
+                    "legacy runtime device generation is changing; start is closed"
+                )
             previous = self._handles.get(lookup)
             if previous is not None and previous.node is node:
                 if not previous.snapshot().state.terminal:
                     raise LegacyNodeAlreadyManaged("legacy node already has an active Run")
                 self._handles.pop(lookup, None)
 
-            claims, hazards, bindings, registrations = self._resolve_node_resources(node)
+            bind_start = getattr(node, "_bind_runtime_start_authority", None)
+            if callable(bind_start):
+                bind_start(self._node_start_authority)
+
+            claims, reference_keys, hazards, bindings, registrations = (
+                self._resolve_node_resources(node)
+            )
             latch = _StartLatch()
             plan = self._plan_for(
                 node,
@@ -361,6 +539,7 @@ class LegacyRuntimeFence:
                 handle=handle,
                 latch=latch,
                 claims=claims,
+                reference_keys=reference_keys,
             )
             self._handles[lookup] = wrapped
             return wrapped
@@ -369,6 +548,82 @@ class LegacyRuntimeFence:
         with self._lock:
             handle = self._handles.get(id(node))
             return handle if handle is not None and handle.node is node else None
+
+    def call(
+        self,
+        devices: Sequence[object],
+        callback: Callable[[], object],
+        *,
+        name: str = "hardware-call",
+        observe: bool = False,
+    ) -> object:
+        """Execute one old synchronous hardware callback through the same Run authority."""
+
+        if not isinstance(observe, bool):
+            raise TypeError("observe must be bool")
+        node = _LegacyHardwareCall(
+            name,
+            tuple(devices),
+            callback,
+            exclusive=not observe,
+        )
+        handle = self.start(node)
+        handle.wait_started()
+        handle.run_handle.result()
+        return node.result()
+
+    def begin_device_transition(self) -> object:
+        """Close admission and return the sole capability that may finish the swap."""
+
+        with self._lock:
+            if self._transition_token is not None:
+                raise LegacyRuntimeTransition("a legacy runtime transition is already active")
+            token = object()
+            self._transition_token = token
+            return token
+
+    def commit_device_transition(
+        self,
+        token: object,
+        devices: LegacyDeviceRegistry,
+        *,
+        publish: Callable[[], None] | None = None,
+    ) -> None:
+        """Publish one stopped device generation and reopen admission atomically."""
+
+        if not isinstance(devices, LegacyDeviceRegistry):
+            raise TypeError("devices must be LegacyDeviceRegistry")
+        with self._lock:
+            if self._transition_token is not token:
+                raise LegacyRuntimeTransition("device transition capability is not current")
+            active_hardware = tuple(
+                handle
+                for handle in self._handles.values()
+                if not handle.snapshot().state.terminal and handle.reference_keys
+            )
+            if active_hardware:
+                raise RuntimeError(
+                    "cannot replace legacy device registry while a device-referencing Run is active"
+                )
+            previous = self._devices
+            self._devices = devices
+            try:
+                if publish is not None:
+                    if not callable(publish):
+                        raise TypeError("publish must be callable or None")
+                    publish()
+            except BaseException:
+                self._devices = previous
+                raise
+            self._transition_token = None
+
+    def abort_device_transition(self, token: object) -> None:
+        """Keep the current registry and reopen admission after staging failed."""
+
+        with self._lock:
+            if self._transition_token is not token:
+                raise LegacyRuntimeTransition("device transition capability is not current")
+            self._transition_token = None
 
     def stop(
         self,
@@ -425,7 +680,11 @@ class LegacyRuntimeFence:
         *,
         timeout: float = 2.0,
     ) -> tuple[LegacyStopReceipt, ...]:
-        keys = tuple(self._devices.key_for(device) for device in devices)
+        keys = tuple(
+            self._devices.key_for(device)
+            for device in devices
+            if self._devices.is_registered(device)
+        )
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
             raise TypeError("stop_nodes_using timeout must be a finite non-negative number")
         timeout = float(timeout)
@@ -439,8 +698,8 @@ class LegacyRuntimeFence:
             for handle in handles
             if not handle.snapshot().state.terminal
             and any(
-                claim.key.overlaps(key)
-                for claim in handle.claims
+                reference_key.overlaps(key)
+                for reference_key in handle.reference_keys
                 for key in keys
             )
         )
@@ -458,20 +717,31 @@ class LegacyRuntimeFence:
         node: object,
     ) -> tuple[
         tuple[ResourceClaim, ...],
+        tuple[ResourceKey, ...],
         tuple[HazardClaim, ...],
         tuple[BoundDevice, ...],
         tuple[LegacyDeviceRegistration, ...],
     ]:
         occupied = _unique_devices(_call_device_set(node, "occupied_devices"))
         referenced = _unique_devices(_call_device_set(node, "referenced_devices"))
+        lifecycle = _unique_devices(_call_device_set(node, "lifecycle_devices"))
         registrations = tuple(self._devices.registration_for(device) for device in occupied)
-        bindings = tuple(self._devices.binding_for(device) for device in occupied)
+        for registration in registrations:
+            if registration.admission_check is not None:
+                registration.admission_check()
+        hazardous_registrations = tuple(
+            registration for registration in registrations if registration.hazardous
+        )
+        bindings = tuple(
+            self._devices.binding_for(registration.device)
+            for registration in hazardous_registrations
+        )
         exclusive_keys = {registration.key for registration in registrations}
-        observe_keys = {
-            self._devices.key_for(device)
-            for device in referenced
-            if self._devices.key_for(device) not in exclusive_keys
-        }
+        observe_keys = set()
+        for device in referenced:
+            registration = self._devices.registration_for(device)
+            if registration.key not in exclusive_keys:
+                observe_keys.add(registration.key)
         claims = tuple(
             sorted(
                 (ResourceClaim(key, ClaimMode.EXCLUSIVE) for key in exclusive_keys),
@@ -490,9 +760,18 @@ class LegacyRuntimeFence:
                 stable_device_identity=by_key[registration.key].stable_device_identity,
                 connection_generation=by_key[registration.key].connection_generation,
             )
-            for registration in sorted(registrations, key=lambda value: value.key)
+            for registration in sorted(
+                hazardous_registrations, key=lambda value: value.key
+            )
         )
-        return claims, hazards, bindings, registrations
+        reference_keys = tuple(
+            sorted(
+                set(exclusive_keys)
+                | set(observe_keys)
+                | {self._devices.key_for(device) for device in lifecycle}
+            )
+        )
+        return claims, reference_keys, hazards, bindings, hazardous_registrations
 
     def _plan_for(
         self,
@@ -515,7 +794,11 @@ class LegacyRuntimeFence:
 
         def execute(context: RunContext, _prepared: None) -> object:
             try:
-                node.start()
+                managed_start = getattr(node, "_start_from_runtime", None)
+                if callable(managed_start):
+                    managed_start(self._node_start_authority)
+                else:
+                    node.start()
                 latch.started(
                     LegacyNodeStarted(
                         run_id=context.run_id.value,
@@ -530,6 +813,9 @@ class LegacyRuntimeFence:
                             stop_event.set()
                         context.checkpoint()
                     time.sleep(self._poll_interval)
+                execution_error = getattr(node, "_execution_error", None)
+                if isinstance(execution_error, BaseException):
+                    raise execution_error
                 return node
             except BaseException as exc:
                 latch.failed(exc)
@@ -580,7 +866,7 @@ class LegacyRuntimeFence:
 
         return RunPlan(
             name=f"legacy:{type(node).__name__}",
-            mode=RunMode.CONTINUOUS_MONITOR,
+            mode=getattr(node, "_legacy_run_mode", RunMode.CONTINUOUS_MONITOR),
             resource_claims=claims,
             hazard_claims=hazards,
             bound_devices=tuple(binding_by_key[key] for key in sorted(binding_by_key)),
@@ -662,6 +948,7 @@ __all__ = [
     "LegacyNodeAlreadyManaged",
     "LegacyNodeStartFailed",
     "LegacyNodeStarted",
+    "LegacyRuntimeTransition",
     "LegacyRunHandle",
     "LegacyRuntimeFence",
     "LegacyStopReceipt",
