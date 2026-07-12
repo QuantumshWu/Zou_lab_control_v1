@@ -45,31 +45,31 @@ class AppSession:
         if self.fail_layout:
             raise RuntimeError("layout mismatch")
 
-    def axi_self_test(self):
-        self.events.append("axi-self-test")
+    def transport_self_test(self):
+        self.events.append("transport-self-test")
         if self.fail_self_test:
             raise RuntimeError("self test failed")
-
-    def link_self_test(self):
-        self.events.append("uart-self-test")
 
     def safe_state(self):
         self.events.append("safe")
 
+    def request_interrupt(self):
+        pass
+
     def close(self):
         self.events.append("close")
 
-    def prepare_compiled_artifact(self, artifact):
+    def prepare(self, artifact):
         self.events.append("prepare")
 
-    def fire_compiled_artifact(self, artifact):
+    def fire(self, artifact):
         self.events.append("fire")
 
-    def wait_done_compiled_artifact(self, artifact, timeout=None):
+    def wait_done(self, artifact, timeout=None):
         self.events.append("wait")
         return True
 
-    def current_snapshot(self):
+    def snapshot(self):
         return {"transport": "test"}
 
 
@@ -90,15 +90,15 @@ def test_target_file_loader_accepts_only_the_current_canonical_schema(tmp_path):
 
 def test_frozen_bringup_is_safe_and_never_programs_hardware():
     session = AppSession(StreamerParams())
-    bring_up_frozen_session(session, "jtag-axi")
-    assert session.events == ["start", "layout", "clear", "axi-self-test", "safe"]
+    bring_up_frozen_session(session)
+    assert session.events == ["start", "layout", "clear", "transport-self-test", "safe"]
 
 
 def test_failed_bringup_attempts_safe_then_closes():
     session = AppSession(StreamerParams())
     session.fail_self_test = True
     with pytest.raises(RuntimeError, match="self test failed"):
-        bring_up_frozen_session(session, "jtag-axi")
+        bring_up_frozen_session(session)
     assert session.events[-2:] == ["safe", "close"]
 
 
@@ -106,15 +106,8 @@ def test_layout_mismatch_closes_without_any_geometry_dependent_write():
     session = AppSession(StreamerParams())
     session.fail_layout = True
     with pytest.raises(RuntimeError, match="layout mismatch"):
-        bring_up_frozen_session(session, "jtag-axi")
+        bring_up_frozen_session(session)
     assert session.events == ["start", "layout", "close"]
-
-
-def test_invalid_backend_is_rejected_before_session_start_or_io():
-    session = AppSession(StreamerParams())
-    with pytest.raises(ValueError, match="backend"):
-        bring_up_frozen_session(session, "invalid")
-    assert session.events == []
 
 
 def test_server_rejects_target_or_session_geometry_drift():
@@ -200,6 +193,9 @@ def test_server_runtime_composes_only_the_current_service(monkeypatch, tmp_path)
     runtime.close()
     assert calls[-1] == ("close", None)
     assert session.events[-2:] == ["safe", "close"]
+    events = list(session.events)
+    runtime.close()
+    assert session.events == events
 
 
 def test_rpc_server_construction_failure_closes_the_hardware_owner(monkeypatch, tmp_path):
@@ -226,3 +222,48 @@ def test_rpc_server_construction_failure_closes_the_hardware_owner(monkeypatch, 
             clock_hz=50e6,
         )
     assert session.events[-2:] == ["safe", "close"]
+
+
+def test_runtime_close_failure_is_not_latched_as_success():
+    from zlc_pulse.server_app import PulseServerRuntime
+
+    class FlakySession(AppSession):
+        def __init__(self):
+            super().__init__(StreamerParams())
+            self.fail_once = True
+            self.close_fail_once = True
+
+        def safe_state(self):
+            self.events.append("safe")
+            if self.fail_once:
+                self.fail_once = False
+                raise RuntimeError("safe verification failed")
+
+        def close(self):
+            self.events.append("close")
+            if self.close_fail_once:
+                self.close_fail_once = False
+                raise RuntimeError("transport revocation failed")
+
+    class RPCServer:
+        def __init__(self):
+            self.close_count = 0
+
+        def close(self):
+            self.close_count += 1
+
+    session = FlakySession()
+    rpc_server = RPCServer()
+
+    class Service:
+        def safe_state(self):
+            session.safe_state()
+
+    runtime = PulseServerRuntime(Service(), rpc_server, session)
+
+    with pytest.raises(RuntimeError, match="transport revocation failed"):
+        runtime.close()
+    assert not runtime._closed
+    runtime.close()
+    assert runtime._closed
+    assert rpc_server.close_count == 1

@@ -60,18 +60,6 @@ _PULSE_STREAMER_EXPORTS = {
 
 
 def __getattr__(name: str):
-    if name == "CommandSequencerBackend":
-        from .sequencer_server import CommandSequencerBackend
-
-        return CommandSequencerBackend
-    if name == "run_sequencer_server":
-        from .sequencer_server import run_server
-
-        return run_server
-    if name == "build_sequencer_server_arg_parser":
-        from .sequencer_server import build_arg_parser
-
-        return build_arg_parser
     if name in _DISCOVERY_EXPORTS:
         from . import discovery
 
@@ -89,7 +77,6 @@ def __getattr__(name: str):
 __all__ = [
     "BaseDevice",
     "CameraDevice",
-    "CommandSequencerBackend",
     "DEFAULT_CHANNELS",
     "DEFAULT_DCAM_MODULE",
     "DEFAULT_FPGA_CHANNEL_COUNT",
@@ -117,7 +104,6 @@ __all__ = [
     "apply_device_overrides",
     "available_device_configs",
     "bind_pulse",
-    "build_sequencer_server_arg_parser",
     "device_class_registry",
     "device_config_dir",
     "device_domains",
@@ -132,7 +118,6 @@ __all__ = [
     "read_config",
     "register_device_class",
     "resolve_class",
-    "run_sequencer_server",
     "validate_pulse_streamer_program",
     "validate_device_contract",
     "virtual_config",

@@ -33,16 +33,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
-from Zou_lab_control.neutral_atom.devices.axi_session import (
-    VivadoAxiStreamerSession,
-    _AXI_BURST_BOUNDARY_BYTES,
-)
 from fpga.pulse_streamer.host import image as im
+from zlc_pulse.transport import VivadoAxiRegisterTransport
+
+
+_AXI_BURST_BOUNDARY_BYTES = 4096
 
 
 # --------------------------------------------------------------------------- helpers
 def _make_session(tmp_path, burst_max):
-    return VivadoAxiStreamerSession(
+    return VivadoAxiRegisterTransport(
         state_dir=tmp_path, tcl_executor=lambda *a: "ok\n", burst_max=burst_max
     )
 

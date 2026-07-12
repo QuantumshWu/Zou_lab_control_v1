@@ -2,6 +2,6 @@
 
 Kept OUT of the Python device-driver package on purpose: everything FPGA-specific
 (the BRAM image layout, the cycle-accurate RTL behavioural models, the capacity
-solver) lives under ``fpga/`` next to the Verilog it describes.  The host device
-driver (``...devices.axi_session``) imports from here.
+solver) lives under ``fpga/`` next to the Verilog it describes.  The owning
+``zlc_pulse.transport`` implementation imports this frozen wire contract.
 """

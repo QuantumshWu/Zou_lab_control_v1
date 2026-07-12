@@ -5,7 +5,6 @@ matplotlib.use("Agg")
 
 import importlib.util
 import json
-import queue
 from pathlib import Path
 import re
 import socket
@@ -39,7 +38,6 @@ from Zou_lab_control.neutral_atom.devices.sequencer import (
     SequencerService,
     serve_runtime_sequencer,
 )
-from Zou_lab_control.neutral_atom.devices.sequencer_server import CommandSequencerBackend
 from Zou_lab_control.neutral_atom.operations.measurement import triggered_frames
 from Zou_lab_control.neutral_atom.testing import (
     VirtualCamera,
@@ -47,33 +45,9 @@ from Zou_lab_control.neutral_atom.testing import (
     VirtualTrapArray,
     bind_test_pulse,
 )
-from Zou_lab_control.neutral_atom.devices.virtual import virtual_config
 from Zou_lab_control.frontend.content.tutorials import neutral_atom_fpga_server_cells, neutral_atom_hardware_tutorial_cells
-from fpga.pulse_streamer.host import image as _im
-
-# The bitstream's CTRL word-63 readback is the geometry fingerprint (image.build_fingerprint of the
-# shipped config).  Mock hardware serves it DERIVED from that single source, never a stale literal,
-# so a config change that shifts the fingerprint updates every fake in lock-step.
-_LAYOUT_HEX = f"{_im.REGISTER_LAYOUT_ID:08X}"
 
 
-def _decode_axi_writes(text: str) -> list[tuple[int, int]]:
-    """Decode ``create_hw_axi_txn ... -type write`` transactions (single-beat OR INCR
-    burst) into ``(word_addr, value)`` pairs -- the mock-hardware counterpart of
-    ``axi_session._write_burst_tcl`` (burst ``-data`` is one concatenated hex value,
-    high-address word first, so we reverse to put the base-address word first)."""
-
-    out: list[tuple[int, int]] = []
-    for addr_hex, data_hex, n_str in re.findall(
-        r"-address ([0-9A-Fa-f]+) -data ([0-9A-Fa-f]+) -len (\d+) -type write", text
-    ):
-        base = int(addr_hex, 16) // 4
-        n = int(n_str)
-        words = [int(data_hex[i * 8:(i + 1) * 8], 16) for i in range(n)]
-        words.reverse()
-        for k, value in enumerate(words):
-            out.append((base + k, value))
-    return out
 
 
 def wait_until_done(task, *, timeout=10.0):
@@ -666,18 +640,19 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert "LOCALAPPDATA" not in build_bat and "LOCALAPPDATA" not in server_bat
     assert r"%FPGA_DIR%build" in build_bat                # build root stays in fpga\build
     assert r"%FPGA_DIR%build" in server_bat
-    # run_server.bat starts the FINAL JTAG-to-AXI server (no loader/variant residue).
-    # The FPGA clock is NOT hardcoded in the bat -- it is single-sourced from
-    # fpga/board_config/streamer_config.json (the server reads it via --xdc); ZLC_PS_CLOCK_HZ stays
-    # an OPTIONAL explicit override, passed only when the operator sets it.
+    # run_server.bat is only the composition root for the current frozen-bitstream
+    # owner. Geometry and clock come from streamer_config.json; the launcher cannot
+    # override them, auto-select a transport, build, or program hardware.
     assert "ZLC_PS_CLOCK_HZ=50000000" not in server_bat
-    assert 'set "ZLC_PS_CLOCK_HZ_ARG=--clock-hz %ZLC_PS_CLOCK_HZ%"' in server_bat
+    assert "--clock-hz" not in server_bat
     assert "streamer_config.json" in server_bat
-    assert "zlc_verify_sources" in server_bat
+    assert "-m zlc_pulse.server_app" in server_bat
+    assert "--target" in server_bat and "--state-dir" in server_bat
     assert "zlc_verify_loader_sources" not in server_bat
-    # default control link is AUTO (probe fastest verified transport: uart > jtag-axi), not a fixed backend
-    assert "ZLC_PS_SERVER_BACKEND=auto" in server_bat
-    assert "zlc_pulse_streamer_top.ltx" in server_bat
+    assert 'ZLC_PS_SERVER_BACKEND set "ZLC_PS_SERVER_BACKEND=jtag-axi"' in server_bat
+    assert "ZLC_PS_SERVER_BACKEND must be jtag-axi or uart" in server_bat
+    assert "never auto-guessed" in server_bat
+    assert "ZLC_PS_SERVER_BACKEND=auto" not in server_bat
     assert "zlc_pulse_streamer_loader_top" not in server_bat
     assert "ZLC_PS_VARIANT" not in server_bat
     assert "fpga\\build\\address_switch" not in server_bat
@@ -711,9 +686,6 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
         assert f"zlc_pulse_streamer_{legacy_width}" not in text
         assert legacy_xdc_env not in text
         assert "fpga\\build\\p40" not in text
-
-    assert "camera_imaging_address_switch.json" in pulses_readme
-    assert "ch11" in pulses_readme
 
     # The 50 MHz / 20 ns clock fact moved from the deleted runbook into the
     # consolidated maintainer note and is also taught in the main manual.
@@ -2109,22 +2081,6 @@ def test_build_fingerprint_covers_geometry_and_ignores_host_caps():
             assert changed, f"geometry field {f.name} MUST change the fingerprint, else its drift is silent"
 
 
-def test_axi_session_refuses_mismatched_register_layout(tmp_path):
-    """prepare() and axi_self_test() must FAIL FAST with a rebuild instruction when the bitstream's
-    geometry fingerprint (CTRL word 63) differs from the host's build_fingerprint(self.params) --
-    e.g. an old .bit returning 0, or any geometry drift (bus_seg_addr_width, evt_fifo_depth, ...)."""
-
-    import pytest
-    from Zou_lab_control.neutral_atom.devices import axi_session as ax
-
-    session = ax.VivadoAxiStreamerSession.__new__(ax.VivadoAxiStreamerSession)
-    session.params = ax.DEFAULT_PARAMS
-    session._read_word = lambda off, **kw: 0  # old bitstream: ctrl_reg[63] powers up 0
-    with pytest.raises(RuntimeError, match=r"geometry/layout mismatch.*[Rr]ebuild"):
-        session.check_register_layout()
-    # the bitstream advertising THIS host's config fingerprint -> no raise (single source)
-    session._read_word = lambda off, **kw: _im.build_fingerprint(session.params)
-    session.check_register_layout()
 
 
 def _minimal_runtime_program():
@@ -2153,85 +2109,8 @@ def test_final_status_bits_match_host():
         assert v != im.STATUS_ERROR, "a STATUS bit collides with host STATUS_ERROR (bit 3)"
 
 
-def test_close_releases_the_jtag_lock_then_force_reaps_a_hung_process():
-    """#5b-B (debug-core-on-reopen): close() must hand the JTAG / dbg_hub lock back to the hw_server
-    (close_hw_target + disconnect_hw_server) BEFORE the Tcl process exits -- otherwise a REOPEN finds
-    the target still held and get_hw_axis comes back empty ("No JTAG-to-AXI core found").  And a
-    process that ignores `exit` must be force-reaped (terminate -> kill), never left lingering on the
-    lock.  Both invariants are deterministic and host-testable with a fake process."""
-    import io
-    import subprocess as _sp
-    from types import SimpleNamespace
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    session = VivadoAxiStreamerSession.__new__(VivadoAxiStreamerSession)
-    session._closed = False
-    session._external_executor = None
-    session._stop_stream_thread = lambda join_timeout=2.0: None
-    captured = io.StringIO()
-    calls = {"terminate": 0, "kill": 0}
-    def _wait(timeout=None):
-        raise _sp.TimeoutExpired(cmd="vivado", timeout=timeout)         # a hung process: never exits on its own
-    session._process = SimpleNamespace(
-        stdin=SimpleNamespace(write=captured.write, flush=lambda: None),
-        wait=_wait,
-        terminate=lambda: calls.__setitem__("terminate", calls["terminate"] + 1),
-        kill=lambda: calls.__setitem__("kill", calls["kill"] + 1))
-    session.close()
-    tcl = captured.getvalue()
-    assert "close_hw_target" in tcl and "disconnect_hw_server" in tcl   # lock handed back...
-    assert tcl.rstrip().endswith("exit")                               # ...before exit
-    assert calls["terminate"] == 1 and calls["kill"] == 1              # hung process force-reaped, not left
-    assert session._process is None
 
 
-def test_vivado_axi_session_tolerates_transient_underflow(tmp_path):
-    """STATUS_UNDERFLOW (bit 4) is a transient streaming stall, a DISTINCT bit from
-    the fatal STATUS_ERROR (bit 3).  wait_done must keep polling and complete on the
-    later DONE -- it must NEVER raise on an underflow."""
-
-    import re as _re
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from fpga.pulse_streamer.host.image import (
-        StreamerParams, CtrlWords, STATUS_RUNNING, STATUS_DONE, STATUS_UNDERFLOW, STATUS_LOADED, CMD_LOAD, CMD_FIRE,
-    )
-    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
-
-    params = StreamerParams(max_edges=16, bank_size=4)
-    program = RuntimeSequenceProgram(
-        sequence_id="u", sequence_name="u", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 100, 200], masks=[1, 0, 0], duration=4e-6,
-        repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1, slot_count=0,
-    )
-
-    class Hw:
-        def __init__(self):
-            self.bram = {}; self.status = 0; self.fired = False; self.polls = 0
-        def __call__(self, lines, action, timeout):
-            text = "\n".join(lines)
-            for w, v in _decode_axi_writes(text):
-                self.bram[w] = v
-                if w == CtrlWords.COMMAND and v & CMD_LOAD: self.status = STATUS_LOADED
-                if w == CtrlWords.COMMAND and v & CMD_FIRE: self.fired = True; self.status = STATUS_RUNNING
-            m = _re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
-            if m:
-                w = int(m.group(1), 16) // 4
-                if w == CtrlWords.STATUS:
-                    if self.fired:
-                        self.polls += 1
-                        if self.polls <= 3:   # transient stall: RUNNING + UNDERFLOW
-                            return f"ZLCDATA {STATUS_RUNNING | STATUS_UNDERFLOW:08X}\n"
-                        return f"ZLCDATA {STATUS_RUNNING | STATUS_DONE:08X}\n"
-                    return f"ZLCDATA {self.status:08X}\n"
-                if w == 63:   # geometry fingerprint of the params this mock bitstream is built for
-                    return f"ZLCDATA {_im.build_fingerprint(params):08X}\n"
-                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
-            return "ok\n"
-
-    hw = Hw()
-    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
-    session.prepare(program); session.fire()
-    assert session.wait_done(timeout=2.0) is True   # underflow tolerated, completes on DONE
 
 
 def test_edge_streamer_repeat_streaming_structure():
@@ -2255,191 +2134,12 @@ def test_edge_streamer_repeat_streaming_structure():
     assert "bank_chunk0(ctrl_reg[C_BANK0_CHUNK]" in top and "bank_chunk1(ctrl_reg[C_BANK1_CHUNK]" in top
 
 
-def test_vivado_axi_session_rejects_dac_value_over_bus_width(tmp_path):
-    """A scanned DAC code wider than bus_width (would silently truncate on hardware)
-    is rejected at prepare."""
-
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from fpga.pulse_streamer.host.image import StreamerParams
-    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
-
-    params = StreamerParams(max_edges=16, bank_size=4, bus_width=10)
-    program = RuntimeSequenceProgram(
-        sequence_id="dh", sequence_name="dh", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 50, 200], masks=[0, 1, 0], duration=4e-6,
-        repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1,
-        slot_count=1, slot_kinds=["dac"], loop_end_slot_coeffs=[0],
-        tick_slot_coeffs=[[0], [0], [0]], scan_points=[[100], [2000]], scan_coeff_frac_bits=8,  # 2000 > 1023
-    )
-    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=lambda *a: "ok\n")
-    with pytest.raises(ValueError, match="does not fit 10 bits"):
-        session.prepare(program)
 
 
-def test_vivado_axi_session_wait_done_is_reentrant(tmp_path):
-    """A finite streamed scan whose wait_done returns early (timeout) must RESUME on
-    the next call -- it must NOT reload from chunk 2 over the bank that now holds a
-    later chunk.  Each chunk is loaded exactly once, in order, across the two calls."""
-
-    import re as _re
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from fpga.pulse_streamer.host.image import (
-        StreamerParams, CtrlWords, STATUS_RUNNING, STATUS_DONE, STATUS_LOADED, CMD_LOAD, CMD_FIRE,
-    )
-    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
-
-    N = 10
-    params = StreamerParams(max_edges=16, bank_size=2)   # 5 chunks; chunks 2,3,4 streamed
-    program = RuntimeSequenceProgram(
-        sequence_id="re", sequence_name="re", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 5, 40], masks=[0, 1, 0], duration=4e-6,
-        repeat_forever=False, loop_start_index=0, loop_end_tick=40, loop_count=1,
-        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
-        tick_slot_coeffs=[[0], [256], [0]], scan_points=[[k] for k in range(N)], scan_coeff_frac_bits=8,
-    )
-
-    class Hw:
-        def __init__(self):
-            self.bram = {}; self.status = 0; self.fired = False; self.cursor = 0; self.cap = 0
-            self.chunk_writes = []     # order of (BANK*_CHUNK) values written after fire
-        def __call__(self, lines, action, timeout):
-            text = "\n".join(lines)
-            for w, v in _decode_axi_writes(text):
-                self.bram[w] = v
-                if w == CtrlWords.COMMAND and v & CMD_LOAD: self.status = STATUS_LOADED
-                if w == CtrlWords.COMMAND and v & CMD_FIRE: self.fired = True; self.status = STATUS_RUNNING
-                if self.fired and w in (CtrlWords.BANK0_CHUNK, CtrlWords.BANK1_CHUNK):
-                    self.chunk_writes.append(v)
-            m = _re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
-            if m:
-                w = int(m.group(1), 16) // 4
-                if w == CtrlWords.CURSOR:
-                    return f"ZLCDATA {self.cursor:08X}\n"
-                if w == CtrlWords.STATUS:
-                    if self.fired:               # advance toward the allowed cap, then DONE at N
-                        self.cursor = min(self.cap, self.cursor + params.bank_size)
-                        if self.cursor >= N:
-                            self.status |= STATUS_DONE
-                    return f"ZLCDATA {self.status:08X}\n"
-                if w == 63:   # geometry fingerprint of the params this mock bitstream is built for
-                    return f"ZLCDATA {_im.build_fingerprint(params):08X}\n"
-                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
-            return "ok\n"
-
-    hw = Hw()
-    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
-    session.prepare(program)
-    session.fire()
-    hw.cap = 6                                   # only let the engine reach cursor 6 this call
-    assert session.wait_done(timeout=0.3) is False   # not done yet; some chunks streamed
-    partial = list(hw.chunk_writes)
-    assert partial == sorted(partial) and partial[0] == 2   # loaded 2,3,... in order, none repeated
-    hw.cap = N                                   # allow it to finish
-    assert session.wait_done(timeout=1.0) is True
-    # every streamed chunk loaded exactly once, strictly increasing across BOTH calls
-    assert hw.chunk_writes == [2, 3, 4], hw.chunk_writes
 
 
-def test_vivado_axi_session_rejects_nonmonotonic_program(tmp_path):
-    """The host validates the program before upload (defence in depth): an affine
-    scan that makes the effective edge ticks non-monotonic (an edge would overtake a
-    later one and be silently dropped on hardware) is rejected at prepare, not
-    uploaded."""
-
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from fpga.pulse_streamer.host.image import StreamerParams
-    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
-
-    params = StreamerParams(max_edges=16, bank_size=4)
-    # edge 1 has a large positive slot coeff, so at slot=1000 it lands at tick
-    # 100+1000=1100, OVERTAKING the fixed edge 2 at 200 -> non-monotonic.
-    program = RuntimeSequenceProgram(
-        sequence_id="bad", sequence_name="bad", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 100, 200], masks=[0, 1, 0], duration=4e-6,
-        repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1,
-        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
-        tick_slot_coeffs=[[0], [256], [0]], scan_points=[[0], [1000]], scan_coeff_frac_bits=8,
-    )
-    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=lambda *a: "ok\n")
-    with pytest.raises(ValueError, match="non-increasing"):
-        session.prepare(program)
 
 
-def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
-    """repeat_forever over a FINITE STREAMED scan (N > 2*bank_size) re-sweeps SEAMLESSLY
-    via CONTINUOUS CYCLIC ping-pong: the background thread streams monotonic chunks
-    2,3,4,.. (data = mono%K into bank mono%2) ONE-AHEAD forever, so the engine wraps
-    0->N-1->0 with no reactive reload.  Models the cyclic engine: cursor wraps on its
-    own each sweep; asserts the engine re-sweeps and the host keeps reloading data
-    chunk 0 across sweeps.  Never raises; safe_state stops it."""
-
-    import re as _re, time as _time
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from fpga.pulse_streamer.host.image import (
-        StreamerParams, CtrlWords, STATUS_RUNNING, STATUS_LOADED, CMD_LOAD, CMD_FIRE, CMD_SAFE,
-    )
-    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
-
-    N = 12
-    params = StreamerParams(max_edges=16, bank_size=2)   # total_chunks = 6 (streamed)
-    program = RuntimeSequenceProgram(
-        sequence_id="rs", sequence_name="rs", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 5, 40], masks=[0, 1, 0], duration=4e-6,
-        repeat_forever=True, loop_start_index=0, loop_end_tick=40, loop_count=1,
-        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
-        tick_slot_coeffs=[[0], [256], [0]], scan_points=[[k] for k in range(N)], scan_coeff_frac_bits=8,
-    )
-
-    class Hw:
-        def __init__(self):
-            self.bram = {}; self.status = 0; self.fired = False; self.cursor = 0
-            self.sweeps = 0; self.chunk0_reloads = 0
-        def __call__(self, lines, action, timeout):
-            text = "\n".join(lines)
-            for w, v in _decode_axi_writes(text):
-                self.bram[w] = v
-                if w == CtrlWords.COMMAND and v & CMD_LOAD: self.status = STATUS_LOADED
-                if w == CtrlWords.COMMAND and v & CMD_FIRE: self.fired = True; self.status = STATUS_RUNNING; self.cursor = 0
-                if w == CtrlWords.COMMAND and v & CMD_SAFE: self.status = 0; self.fired = False
-                # count the host (re)loading DATA chunk 0 into either bank AFTER fire -- the
-                # cyclic stream keeps reloading chunk 0 (mono = K, 2K, ..) across sweeps.
-                if self.fired and w in (CtrlWords.BANK0_CHUNK, CtrlWords.BANK1_CHUNK) and v == 0:
-                    self.chunk0_reloads += 1
-            m = _re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
-            if m:
-                w = int(m.group(1), 16) // 4
-                if w == CtrlWords.STATUS:
-                    return f"ZLCDATA {self.status:08X}\n"
-                if w == CtrlWords.CURSOR:
-                    # the engine plays a chunk's worth of points per poll and WRAPS on its
-                    # own at N (seamless cyclic re-sweep -- no reactive reload needed).
-                    if self.fired:
-                        self.cursor += params.bank_size
-                        if self.cursor >= N:
-                            self.cursor -= N; self.sweeps += 1
-                    return f"ZLCDATA {self.cursor:08X}\n"
-                if w == 63:   # geometry fingerprint of the params this mock bitstream is built for
-                    return f"ZLCDATA {_im.build_fingerprint(params):08X}\n"
-                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
-            return "ok\n"
-
-    hw = Hw()
-    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
-    try:
-        session.prepare(program)
-        session.fire()
-        assert session.wait_done(timeout=1.0) is True       # RUNNING -> returns; thread streams
-        deadline = _time.monotonic() + 3.0
-        while (hw.sweeps < 3 or hw.chunk0_reloads < 1) and _time.monotonic() < deadline:
-            _time.sleep(0.02)
-    finally:
-        session.safe_state()
-    assert hw.sweeps >= 3, f"expected the streamed scan to re-sweep, got {hw.sweeps} sweeps"
-    assert hw.chunk0_reloads >= 1, f"expected the cyclic host to reload chunk 0, got {hw.chunk0_reloads}"
 
 
 def test_pulse_table_state_compiles_pair_array_scan_to_full_40ch_template():
@@ -3721,140 +3421,10 @@ def test_timing_payload_to_dict_snaps_pulse_table():
     assert payload["periods"][1]["duration"] == 120
 
 
-def test_axi_session_burst_coalesces_contiguous_and_preserves_order(tmp_path):
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-
-    s = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=lambda *a: "ok\n", burst_max=4)
-    # an address-contiguous run is coalesced and split at burst_max (4): 6 words -> 4+2
-    pending = [(0x40 + 4 * i, i) for i in range(6)]
-    assert s._burst_runs(pending) == [(0x40, [0, 1, 2, 3]), (0x50, [4, 5])]
-    # an order-dependent same-address sequence (COMMAND 0 then cmd) must NOT be merged
-    # or reordered -- it stays two len-1 writes in order.
-    assert s._burst_runs([(0x4, 0), (0x4, 2)]) == [(0x4, [0]), (0x4, [2])]
-    # non-contiguous addresses stay separate len-1 writes
-    assert s._burst_runs([(0x0, 9), (0x10, 8)]) == [(0x0, [9]), (0x10, [8])]
-    # the burst Tcl encodes one INCR transaction whose data round-trips to the SAME
-    # words at consecutive addresses (writer/decoder agree on the high-addr-first order)
-    lines = s._write_burst_tcl(0x40, [0xAA, 0xBB, 0xCC])
-    text = "\n".join(lines)
-    assert "-len 3 -type write" in text and text.count("run_hw_axi") == 1
-    assert _decode_axi_writes(text) == [(16, 0xAA), (17, 0xBB), (18, 0xCC)]
 
 
-def test_axi_session_self_test_catches_scrambled_burst(tmp_path):
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-
-    params = _im.default_params()   # the mock bitstream advertises the default-config fingerprint
-
-    class Hw:
-        def __init__(self, scramble=False):
-            self.bram = {}; self.scramble = scramble
-        def __call__(self, lines, action, timeout):
-            text = "\n".join(lines)
-            writes = _decode_axi_writes(text)
-            if self.scramble and len(writes) > 1:   # simulate wrong burst data ordering
-                addrs = [w for w, _ in writes]; vals = [v for _, v in writes]
-                writes = list(zip(addrs, list(reversed(vals))))
-            for w, v in writes:
-                self.bram[w] = v
-            m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
-            if m:
-                w = int(m.group(1), 16) // 4
-                if w == 63:   # geometry fingerprint of the params this mock bitstream is built for
-                    return f"ZLCDATA {_im.build_fingerprint(params):08X}\n"
-                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
-            return "ok\n"
-
-    good = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=Hw(scramble=False))
-    assert good.axi_self_test(count=8) is True
-    bad = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=Hw(scramble=True))
-    with pytest.raises(RuntimeError):
-        bad.axi_self_test(count=8)
 
 
-def test_axi_self_test_scratch_sits_above_all_defined_ctrl_words(tmp_path):
-    """HARDWARE REGRESSION: the self-test used a stale hard-coded scratch base of 32 --
-    'above all CtrlWords' when the highest was 19 -- but the delay redesign later defined
-    word 20..21 (CLK_ENABLE).  At
-    run_server bring-up the 0xC0DE.. test burst landed in CLK_ENABLE and clk-enabled
-    random channels: their pins ran at 50 MHz before any on_pulse, and off_pulse
-    (CMD_SAFE only, no config rewrite) could not clear it.  Lock: the scratch base is
-    derived from the layout, sits ABOVE every defined word, the self-test never writes
-    below it, and it zeroes the scratch afterwards."""
-
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from fpga.pulse_streamer.host.image import CTRL_WORDS, CtrlWords, default_params
-
-    p = params = default_params()   # the mock bitstream advertises the default-config fingerprint
-    assert p.ctrl_scratch_base == CtrlWords.CLK_ENABLE + p.clk_enable_words == 22
-    assert p.ctrl_scratch_base + 2 <= CTRL_WORDS
-
-    class Hw:
-        def __init__(self):
-            self.bram = {}
-        def __call__(self, lines, action, timeout):
-            text = "\n".join(lines)
-            for w, v in _decode_axi_writes(text):
-                self.bram[w] = v
-            m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
-            if m:
-                w = int(m.group(1), 16) // 4
-                if w == 63:   # geometry fingerprint of the params this mock bitstream is built for
-                    return f"ZLCDATA {_im.build_fingerprint(params):08X}\n"
-                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
-            return "ok\n"
-
-    hw = Hw()
-    session = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=hw)
-    assert session.axi_self_test() is True
-    # every word it touched is at/above the scratch base -- CLK_ENABLE untouched
-    assert hw.bram and min(hw.bram) >= 22 and max(hw.bram) < CTRL_WORDS
-    assert 20 not in hw.bram and 21 not in hw.bram
-    # and the register file is left as found: all scratch words zeroed
-    assert all(v == 0 for v in hw.bram.values())
-
-
-def test_clear_host_config_zeroes_delays_and_clk_mask(tmp_path):
-    """Server bring-up self-heal must be LAYOUT-AGNOSTIC: clear_host_config() zeroes the
-    WHOLE host-owned CTRL config span (words 20..63 -- NOT just the words the current
-    CtrlWords map calls config) plus the entire R_DELAY register region, then halts
-    (CMD_SAFE).  Regression guard for the real garbled-DA incident: the old loop cleared
-    only the v2 map's words (20..21), so a bitstream built for the v1 layout kept its
-    STALE clk mask at words 46/47 live -> uncontrolled da_clk strobes."""
-
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from fpga.pulse_streamer.host.image import CMD_SAFE, CtrlWords, region_bases
-
-    class Hw:
-        def __init__(self, delay_base):
-            # a polluted board: garbage in the v2 clk-mask words (20/21), in the v1
-            # clk-mask words (46/47, what the incident left live), in dense-delay-era
-            # words, AND a stale bus delay in the R_DELAY region.
-            self.bram = {20: 0xC0DE000E, 21: 0xC0DE000F,
-                         30: 0x00000FFF, 46: 0x10000000, 47: 0x20040080,
-                         delay_base + 5: 100_000_000}
-        def __call__(self, lines, action, timeout):
-            text = "\n".join(lines)
-            for w, v in _decode_axi_writes(text):
-                self.bram[w] = v
-            m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
-            if m:
-                w = int(m.group(1), 16) // 4
-                if w == 63:   # geometry fingerprint of the params this mock bitstream is built for
-                    return f"ZLCDATA {_im.build_fingerprint(params):08X}\n"
-                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
-            return "ok\n"
-
-    session = VivadoAxiStreamerSession(state_dir=tmp_path)
-    bases = region_bases(session.params)
-    hw = Hw(bases["delay"])
-    session = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=hw)
-    session.clear_host_config()
-    for word in range(20, 64):
-        assert hw.bram.get(word, 0) == 0, f"ctrl word {word} not cleared (layout-agnostic sweep)"
-    for word in range(session.params.delay_region_words):
-        assert hw.bram.get(bases["delay"] + word, 0) == 0, f"R_DELAY word {word} not cleared"
-    assert hw.bram.get(CtrlWords.COMMAND) == CMD_SAFE   # engine halted afterwards
 
 
 def test_pulse_sequence_clock_validation_rejects_off_tick_edges():
@@ -3964,42 +3534,6 @@ def _simulate_pulse_streamer_program_steps(program, *, steps: int) -> list[int]:
                 time_count += 1
         history.append(state_mask)
     return history
-
-
-def test_command_sequencer_backend_writes_program_and_runs_fire_command(tmp_path):
-    marker = tmp_path / "fire_marker.txt"
-    command = (
-        f'"{sys.executable}" -c '
-        f'"import os, pathlib; pathlib.Path(r\'{marker}\').write_text(os.environ[\'ZLC_SEQUENCE_ID\'])"'
-    )
-    seq = na.imaging_sequence(exposure=1e-4, load=True)
-    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "emCCD"])
-    backend = CommandSequencerBackend(tmp_path, fire_command=command)
-
-    backend.fire(program)
-
-    assert marker.read_text(encoding="utf-8") == program.sequence_id
-    payload = json.loads((tmp_path / "prepared_program.json").read_text(encoding="utf-8"))
-    assert payload["source_sequence"]["name"] == seq.name
-
-
-def test_command_sequencer_backend_error_includes_log_tail(tmp_path):
-    command = f'"{sys.executable}" -c "print(\'prepare failed detail\'); raise SystemExit(7)"'
-    seq = na.imaging_sequence(exposure=1e-4, load=True)
-    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "emCCD"])
-    backend = CommandSequencerBackend(tmp_path, prepare_command=command)
-
-    try:
-        backend.prepare(program)
-    except RuntimeError as exc:
-        message = str(exc)
-    else:
-        raise AssertionError("prepare command should have failed")
-
-    assert "failed with code 7" in message
-    assert "prepare.log tail" in message
-    assert "prepare failed detail" in message
-    assert "prepare failed detail" in (tmp_path / "prepare.log").read_text(encoding="utf-8")
 
 
 def test_sequencer_service_skips_duplicate_prepare_uploads():
@@ -4126,527 +3660,6 @@ def test_rejected_streamed_prepare_safes_backend_then_recovers(monkeypatch):
     assert safe_calls == [True]          # a SUCCESSFUL prepare does not extra-safe
 
 
-def test_axi_session_recovers_from_close_without_server_restart(tmp_path, monkeypatch):
-    """The persistent Vivado session must SELF-HEAL after a close() (action timeout /
-    broken pipe): (1) _io_lock is reentrant so the auto-restart start()->_run_tcl does not
-    deadlock under the lock it already holds; (2) _ensure_process retries the hw/debug-core
-    reconnect so a transient 'debug core' failure recovers instead of needing a server
-    restart."""
-    import threading
-    from Zou_lab_control.neutral_atom.devices import axi_session as axi_mod
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-
-    s = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=lambda *a: "ok\n")
-    # reentrant: the SAME thread can acquire twice (a plain Lock would fail the 2nd).
-    assert s._io_lock.acquire(blocking=False)
-    assert s._io_lock.acquire(blocking=False)
-    s._io_lock.release()
-    s._io_lock.release()
-    assert isinstance(s._io_lock, type(threading.RLock()))
-
-    # reconnect retry: a real (executor-less) session whose first 2 starts fail with a
-    # debug-core error must retry and succeed on the 3rd, leaving a live process.
-    s2 = VivadoAxiStreamerSession(state_dir=tmp_path)
-    monkeypatch.setattr(axi_mod.time, "sleep", lambda *_a, **_k: None)
-    calls = {"n": 0}
-
-    def flaky_start():
-        calls["n"] += 1
-        s2._process = object()           # a process spawned...
-        if calls["n"] < 3:
-            raise RuntimeError("failed to connect to debug core / No JTAG-to-AXI core")
-        return s2                        # ...and the 3rd reconnect succeeds
-
-    monkeypatch.setattr(s2, "start", flaky_start)
-    s2._ensure_process()
-    assert calls["n"] == 3
-    assert s2._process is not None
-
-
-class _FakeVivadoStdout:
-    def __init__(self):
-        self.items: queue.Queue[str | None] = queue.Queue()
-
-    def push(self, line: str) -> None:
-        self.items.put(line)
-
-    def close(self) -> None:
-        self.items.put(None)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self) -> str:
-        item = self.items.get(timeout=5)
-        if item is None:
-            raise StopIteration
-        return item
-
-
-class _FakeVivadoStdin:
-    def __init__(self, stdout: _FakeVivadoStdout):
-        self.stdout = stdout
-        self.writes: list[str] = []
-
-    def write(self, text: str) -> int:
-        self.writes.append(text)
-        match = re.search(r"ZLC_SESSION_(\d{6})_END", text)
-        if match:
-            marker = f"ZLC_SESSION_{match.group(1)}"
-            self.stdout.push(f"{marker}_OK\n")
-            self.stdout.push(f"{marker}_END\n")
-        return len(text)
-
-    def flush(self) -> None:
-        return None
-
-
-class _FakeVivadoProcess:
-    def __init__(self, args, **_kwargs):
-        self.args = args
-        self.stdout = _FakeVivadoStdout()
-        self.stdin = _FakeVivadoStdin(self.stdout)
-        self.returncode = None
-
-    def wait(self, timeout=None):
-        self.returncode = 0
-        self.stdout.close()
-        return 0
-
-    def terminate(self):
-        self.returncode = -15
-        self.stdout.close()
-
-
-def test_sequencer_server_jtag_axi_backend_warm_starts_axi_session(tmp_path, monkeypatch):
-    """The default 'jtag-axi' backend brings up the run-length VivadoAxiStreamerSession
-    and wires its prepare/fire/wait_done/safe_state into the RPyC service."""
-
-    from Zou_lab_control.neutral_atom.devices import axi_session
-    from Zou_lab_control.neutral_atom.devices import sequencer_server
-
-    events: list[str] = []
-
-    class FakeAxiSession:
-        def __init__(self, **kwargs):
-            events.append(f"init:{Path(kwargs['state_dir']).name}:clk={int(kwargs['clock_hz'])}")
-
-        def start(self):
-            events.append("start")
-            return self
-
-        def clear_host_config(self):
-            events.append("clear_config")
-
-        def axi_self_test(self, **kwargs):
-            events.append("self_test")
-            return True
-
-        def prepare(self, program):
-            events.append("prepare")
-
-        def fire(self, program=None):
-            events.append("fire")
-
-        def wait_done(self, program=None, timeout=None):
-            events.append("wait")
-            return True
-
-        def safe_state(self):
-            events.append("safe")
-
-        def scan_progress(self):     # the session interface the server wires for the GUI's scan poll
-            from Zou_lab_control.neutral_atom.devices.sequencer import SCAN_PROGRESS_IDLE
-            return dict(SCAN_PROGRESS_IDLE)
-
-    def fake_serve(service, *, host, port, start):
-        events.append(f"serve:{host}:{port}")
-        return object()
-
-    monkeypatch.setattr(axi_session, "VivadoAxiStreamerSession", FakeAxiSession)
-    monkeypatch.setattr(sequencer_server, "serve_runtime_sequencer", fake_serve)
-
-    service = sequencer_server.run_server(
-        channels=[f"ch{i:02d}" for i in range(62)],
-        host="127.0.0.1",
-        port=18861,
-        clock_hz=50_000_000,
-        state_dir=tmp_path / "state_loader",
-        backend="jtag-axi",
-        warm_start=True,
-    )
-
-    # warm start: construct -> start the Vivado session -> AXI burst self-test (fail-fast
-    # bring-up check) -> serve.
-    # bring-up ORDER matters: clear the host config (delays + clk mask) BEFORE the
-    # self-test so the boot state is clean even if the self-test raises.
-    assert events[:5] == ["init:state_loader:clk=50000000", "start", "clear_config", "self_test", "serve:127.0.0.1:18861"]
-    assert service is not None
-
-
-class _FakeStreamerHardware:
-    """In-memory stand-in for the programmed FPGA running the FINAL design: a BRAM
-    dict + the CTRL COMMAND/STATUS/CURSOR/BANK_READY mailbox.  On LOAD it verifies
-    the uploaded image round-trips through host.image.unpack_program (so the test
-    exercises the full host->upload->decode path).  On FIRE it advances a CURSOR so
-    the host's streaming refill loop runs; it records each BANK_READY write so the
-    streaming handshake can be asserted.  ``forever`` => RUNNING but never DONE."""
-
-    def __init__(self, params, *, forever=False, total_points=0):
-        from fpga.pulse_streamer.host.image import CtrlWords
-        self.params = params
-        self.CtrlWords = CtrlWords
-        self.forever = bool(forever)
-        self.total_points = int(total_points)
-        self.bram: dict[int, int] = {}
-        self.status = 0
-        self.load_ok = False
-        self.fired = False
-        self.cursor = 0
-        self.bank_ready_writes: list[int] = []   # post-fire BANK_READY values
-
-    def __call__(self, lines, action, timeout):
-        from fpga.pulse_streamer.host.image import (
-            unpack_program, CtrlWords, CMD_LOAD, CMD_FIRE, CMD_SAFE,
-            STATUS_LOADED, STATUS_RUNNING, STATUS_DONE,
-        )
-        text = "\n".join(lines)
-        for word, value in _decode_axi_writes(text):
-            self.bram[word] = value
-            if word == CtrlWords.BANK_READY and self.fired:
-                self.bank_ready_writes.append(value)
-            if word == CtrlWords.COMMAND and value != 0:
-                if value & CMD_SAFE:
-                    self.status = 0; self.load_ok = False
-                if value & CMD_LOAD:
-                    decoded = unpack_program(self.bram, self.params)
-                    self.load_ok = (decoded["ticks"] and decoded["masks"]
-                                    and len(decoded["ticks"]) == self.bram.get(CtrlWords.PROG_COUNT, 0))
-                    self.status = STATUS_LOADED if self.load_ok else 0x8
-                if value & CMD_FIRE:
-                    self.fired = True; self.cursor = 0
-                    self.status = (self.status | STATUS_RUNNING) & ~0x8
-        m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
-        if m:
-            word = int(m.group(1), 16) // 4
-            if word == CtrlWords.CURSOR:
-                # report progress only; the engine (STATUS poll) drives the cursor.
-                return f"ZLCDATA {self.cursor:08X}\n"
-            if word == CtrlWords.STATUS:
-                if self.fired and not self.forever:
-                    if self.total_points:
-                        # advance one bank per status poll (the engine's pace), giving
-                        # the host a full bank to refill ahead -> gapless streaming.
-                        self.cursor = min(self.total_points, self.cursor + self.params.bank_size)
-                        if self.cursor >= self.total_points:
-                            self.status |= STATUS_DONE
-                    else:
-                        self.status |= STATUS_DONE
-                return f"ZLCDATA {self.status:08X}\n"
-            if word == 63:   # geometry fingerprint of the params this mock bitstream is built for
-                return f"ZLCDATA {_im.build_fingerprint(self.params):08X}\n"
-            return f"ZLCDATA {self.bram.get(word, 0):08X}\n"
-        return "ok\n"
-
-
-def test_vivado_axi_session_loads_and_fires_edge_table_program(tmp_path):
-    """prepare/fire/wait_done/safe_state drive the CTRL COMMAND/STATUS mailbox over
-    create_hw_axi_txn writes/reads, and the uploaded image round-trips through the
-    final host packer/unpacker (no Vivado, no hardware)."""
-
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from fpga.pulse_streamer.host.image import StreamerParams, CtrlWords
-    from Zou_lab_control.neutral_atom.devices.sequencer import (
-        RuntimeSequenceProgram, RuntimeBusSegment,
-    )
-
-    program = RuntimeSequenceProgram(
-        sequence_id="abc", sequence_name="t", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 50, 120, 400], masks=[0, (1 << 0) | (1 << 5), (1 << 61), 0],
-        duration=8e-6,
-        repeat_forever=False, loop_start_index=0, loop_end_tick=400, loop_count=1,
-        slot_count=2, slot_kinds=["delay", "dac"], loop_end_slot_coeffs=[0, 0],
-        tick_slot_coeffs=[[0, 0], [256, 0], [256, 0], [256, 0]],
-        scan_points=[[0, 0], [256, 256], [512, 768]], scan_coeff_frac_bits=8,
-        bus_names=["da0"],
-        bus_segments=[
-            RuntimeBusSegment(bus_index=0, start_tick=50, stop_tick=120, start_value=0,
-                              stop_value=0, mode="edge", value_select=2,
-                              start_tick_coeffs=[256, 0], stop_tick_coeffs=[256, 0]),
-        ],
-    )
-
-    params = StreamerParams(max_edges=16, bank_size=4)
-    hw = _FakeStreamerHardware(params)
-    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
-
-    session.prepare(program)
-    assert hw.load_ok, "final unpacker must accept the uploaded image"
-    # banks 0,1 armed at prepare (3 points fit in 2 banks of 4).
-    assert hw.bram[CtrlWords.BANK_READY] == 0b11
-    session.fire()
-    assert hw.fired
-    assert session.wait_done(timeout=1.0) is True
-    session.safe_state()
-
-    assert hw.bram[CtrlWords.PROG_COUNT] == 4  # edges uploaded
-    assert hw.bram[CtrlWords.SCAN_COUNT] == 3  # scan points uploaded
-
-
-def test_fire_survives_a_fire_time_write_error(tmp_path, monkeypatch):
-    """fire() writes a diagnostic ``fire_time.txt`` AFTER ``CMD_FIRE`` has already started the FPGA;
-    a disk error on that best-effort breadcrumb must NOT bubble (which would make the caller believe
-    the already-running fire failed and retry / safe it).  The pulse is fired regardless."""
-    import pathlib
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from fpga.pulse_streamer.host.image import StreamerParams
-    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
-
-    params = StreamerParams(max_edges=16, bank_size=4)
-    program = RuntimeSequenceProgram(
-        sequence_id="s", sequence_name="s", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 50, 400], masks=[0, 1, 0], duration=8e-6,
-        repeat_forever=False, loop_start_index=0, loop_end_tick=400, loop_count=1,
-        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
-        tick_slot_coeffs=[[0], [256], [0]], scan_points=[[0]], scan_coeff_frac_bits=8,
-    )
-    hw = _FakeStreamerHardware(params)
-    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
-    session.prepare(program)
-    real_write = pathlib.Path.write_text
-
-    def boom(self, *a, **k):
-        if self.name == "fire_time.txt":
-            raise OSError("No space left on device")
-        return real_write(self, *a, **k)
-
-    monkeypatch.setattr(pathlib.Path, "write_text", boom)
-    try:
-        session.fire()                              # must NOT raise despite the breadcrumb write error
-        assert hw.fired                             # ... and the FPGA really fired
-    finally:
-        monkeypatch.undo()
-        session.safe_state()
-
-
-def test_vivado_axi_session_streams_unbounded_scan(tmp_path):
-    """A scan with more points than the 2-bank window (N > 2*bank_size) STREAMS:
-    wait_done polls CURSOR and refills each freed ping-pong bank with the next
-    chunk, re-arming its BANK_READY bit, until the whole N-point sweep is played."""
-
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from fpga.pulse_streamer.host.image import StreamerParams, CtrlWords, region_bases
-    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
-
-    N = 9                      # 9 points, bank_size 2 -> 5 chunks (chunks 2,3,4 streamed)
-    params = StreamerParams(max_edges=16, bank_size=2)
-    program = RuntimeSequenceProgram(
-        sequence_id="s", sequence_name="s", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 5, 25, 40], masks=[0, 1, 2, 0], duration=4e-6,
-        repeat_forever=False, loop_start_index=0, loop_end_tick=40, loop_count=1,
-        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
-        tick_slot_coeffs=[[0], [256], [0], [0]],
-        scan_points=[[k] for k in range(N)], scan_coeff_frac_bits=8,
-    )
-    hw = _FakeStreamerHardware(params, total_points=N)
-    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
-    session.prepare(program)
-    assert hw.bram[CtrlWords.BANK_READY] == 0b11      # banks 0,1 resident
-    session.fire()
-    assert session.wait_done(timeout=2.0) is True
-
-    # chunks 2,3,4 were streamed in: each refill de-arms then re-arms its bank, so
-    # exactly 2*(total_chunks-2) post-fire BANK_READY writes occurred.
-    total_chunks = -(-N // params.bank_size)          # ceil
-    assert total_chunks == 5
-    assert len(hw.bank_ready_writes) == 2 * (total_chunks - 2)
-    # the last write re-armed both banks ready.
-    assert hw.bank_ready_writes[-1] == 0b11
-    # the streamed chunks actually landed in their (alternating) banks.
-    bases = region_bases(params)
-    scan_base = bases["scan"]
-    bank0_word = scan_base + 0 * params.bank_size * params.scan_words
-    bank1_word = scan_base + 1 * params.bank_size * params.scan_words
-    # chunk 4 (even) -> bank 0 first slot value == point 8
-    assert hw.bram[bank0_word] == 8
-    # chunk 3 (odd) -> bank 1 first slot value == point 6
-    assert hw.bram[bank1_word] == 6
-
-
-def test_vivado_axi_session_repeat_forever_treats_running_as_done(tmp_path):
-    """A repeat_forever program never asserts DONE; wait_done must return once RUNNING
-    is seen instead of blocking for the whole timeout."""
-
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from fpga.pulse_streamer.host.image import StreamerParams
-    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
-
-    program = RuntimeSequenceProgram(
-        sequence_id="p", sequence_name="p", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 100, 200], masks=[1, 0, 0],
-        duration=4e-6,
-        repeat_forever=True, loop_start_index=0, loop_end_tick=200, loop_count=1,
-        slot_count=0,
-    )
-    params = StreamerParams(max_edges=16, bank_size=4)
-    hw = _FakeStreamerHardware(params, forever=True)
-    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
-    session.prepare(program)
-    session.fire()
-    # DONE never sets, but wait_done returns True because RUNNING is observed.
-    assert session.wait_done(timeout=1.0) is True
-
-
-class _CursorScanHardware:
-    """A streamed-scan FPGA stand-in whose CURSOR advances on every CURSOR read (one point per
-    read), wrapping at N -- so the scan-progress monitor thread observes a real moving cursor.  This
-    is what pins the user-reported bug: a streamed scan's progress must ADVANCE (not stick at 1/0)."""
-
-    def __init__(self, params, *, n_points, forever=True):
-        from fpga.pulse_streamer.host.image import CtrlWords, STATUS_LOADED, STATUS_RUNNING
-        self.params = params
-        self.CtrlWords = CtrlWords
-        self.STATUS_LOADED = STATUS_LOADED
-        self.STATUS_RUNNING = STATUS_RUNNING
-        self.n_points = int(n_points)
-        self.forever = bool(forever)
-        self.bram: dict[int, int] = {}
-        self.status = 0
-        self.fired = False
-        self.cursor = 0
-
-    def __call__(self, lines, action, timeout):
-        from fpga.pulse_streamer.host.image import (
-            CtrlWords, CMD_LOAD, CMD_FIRE, CMD_SAFE, STATUS_LOADED, STATUS_RUNNING, STATUS_DONE,
-        )
-        text = "\n".join(lines)
-        for word, value in _decode_axi_writes(text):
-            self.bram[word] = value
-            if word == CtrlWords.COMMAND and value != 0:
-                if value & CMD_SAFE:
-                    self.status = 0; self.fired = False
-                if value & CMD_LOAD:
-                    self.status = STATUS_LOADED
-                if value & CMD_FIRE:
-                    self.fired = True; self.cursor = 0
-                    self.status = (self.status | STATUS_RUNNING)
-        m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
-        if m:
-            word = int(m.group(1), 16) // 4
-            if word == CtrlWords.CURSOR:
-                cur = self.cursor
-                if self.fired:                       # advance one point per read; wrap at N (a sweep)
-                    self.cursor = (self.cursor + 1) % max(1, self.n_points)
-                return f"ZLCDATA {cur:08X}\n"
-            if word == CtrlWords.STATUS:
-                if self.fired and not self.forever and self.cursor >= self.n_points - 1:
-                    self.status |= STATUS_DONE
-                return f"ZLCDATA {self.status:08X}\n"
-            if word == 63:   # geometry fingerprint of the params this mock bitstream is built for
-                return f"ZLCDATA {_im.build_fingerprint(self.params):08X}\n"
-            return f"ZLCDATA {self.bram.get(word, 0):08X}\n"
-        return "ok\n"
-
-
-def _scan_program(n_points, *, repeat_forever, scan_repeats=0):
-    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
-    return RuntimeSequenceProgram(
-        sequence_id="g", sequence_name="g", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 5, 25, 40], masks=[0, 1, 2, 0], duration=4e-6,
-        repeat_forever=repeat_forever, loop_start_index=0, loop_end_tick=40, loop_count=1,
-        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
-        tick_slot_coeffs=[[0], [256], [0], [0]],
-        scan_points=[[k] for k in range(n_points)], scan_coeff_frac_bits=8,
-        scan_repeats=scan_repeats,
-    )
-
-
-def test_real_cyclic_scan_progress_advances(tmp_path):
-    """#1 (the user's real-device report): a CYCLIC streamed scan (repeat_forever, 0=inf) reports
-    scanning=True and its point ADVANCES on the real backend -- it must not stick at point 1/0.  The
-    progress gate now keys off scan_points (a streamed scan), not the repeat_forever flag."""
-
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from fpga.pulse_streamer.host.image import StreamerParams
-
-    N = 6
-    params = StreamerParams(max_edges=16, bank_size=2)
-    hw = _CursorScanHardware(params, n_points=N, forever=True)
-    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
-    session.prepare(_scan_program(N, repeat_forever=True, scan_repeats=0))
-    session.fire()                          # starts the streaming monitor thread
-    try:
-        seen = []
-        deadline = time.monotonic() + 2.0
-        while len(seen) < 3 and time.monotonic() < deadline:
-            prog = session.scan_progress()
-            assert prog["scanning"] is True and prog["n_points"] == N
-            point_total = int(prog["sweep"]) * N + int(prog["point"])
-            if not seen or point_total != seen[-1]:
-                seen.append(point_total)
-            time.sleep(0.005)
-        assert len(seen) >= 3, f"scan point never advanced (stuck reading): {seen}"
-        assert seen == sorted(seen), f"scan point must advance monotonically, got {seen}"
-    finally:
-        session.safe_state()
-
-
-def test_real_single_pass_scan_progress_advances(tmp_path):
-    """A FINITE single-pass scan (repeat_forever=False + scan_points) streams too: its progress must
-    advance, not idle.  Decoupling the monitor from repeat_forever (start it for any streamed scan)
-    is what makes single-pass progress live (and keeps virtual==real)."""
-
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from fpga.pulse_streamer.host.image import StreamerParams
-
-    N = 6
-    params = StreamerParams(max_edges=16, bank_size=2)
-    hw = _CursorScanHardware(params, n_points=N, forever=False)
-    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
-    session.prepare(_scan_program(N, repeat_forever=False, scan_repeats=0))
-    session.fire()
-    try:
-        first = session.scan_progress()
-        assert first["scanning"] is True and first["n_points"] == N
-        seen = {int(first["point"])}
-        deadline = time.monotonic() + 2.0
-        while len(seen) < 2 and time.monotonic() < deadline:
-            seen.add(int(session.scan_progress()["point"]))
-            time.sleep(0.005)
-        assert len(seen) >= 2, f"single-pass scan point never advanced: {seen}"
-    finally:
-        session.safe_state()
-
-
-def test_real_non_scan_repeat_forever_does_not_report_scan(tmp_path):
-    """A repeat_forever STATIC pulse (no scan_points -> _total_points==0) must not be treated as a
-    scan: scan_progress idles and no monitor thread is spawned."""
-
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from fpga.pulse_streamer.host.image import StreamerParams
-    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, SCAN_PROGRESS_IDLE
-
-    program = RuntimeSequenceProgram(
-        sequence_id="p", sequence_name="p", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 100, 200], masks=[1, 0, 0], duration=4e-6,
-        repeat_forever=True, loop_start_index=0, loop_end_tick=200, loop_count=1, slot_count=0,
-    )
-    params = StreamerParams(max_edges=16, bank_size=4)
-    hw = _FakeStreamerHardware(params, forever=True)
-    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
-    session.prepare(program)
-    session.fire()
-    try:
-        assert session.scan_progress() == SCAN_PROGRESS_IDLE
-        assert session._stream_thread is None        # no scan -> no monitor thread
-    finally:
-        session.safe_state()
 
 
 def test_virtual_equals_real_scan_progress_same_dict():
@@ -4711,44 +3724,6 @@ def test_virtual_stop_unconditionally_drives_safe_state():
     assert seq.firing is None
     assert seq.scan_progress()["scanning"] is False    # scan state cleared -> idle
     assert seq.service.history[-1]["action"] == "safe"  # the streamer was parked safe
-
-
-def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
-    try:
-        import rpyc  # noqa: F401
-    except ImportError:
-        return
-
-    backend = CommandSequencerBackend(tmp_path)
-    service = SequencerService(
-        channels=["trap", "cooling", "probe", "emCCD"],
-        clock_hz=50_000_000,
-        prepare_callback=backend.prepare,
-        fire_callback=backend.fire,
-        wait_done_callback=backend.wait_done,
-    )
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    server = serve_runtime_sequencer(service, host="127.0.0.1", port=port, start=False)
-    thread = threading.Thread(target=server.start, daemon=True)
-    thread.start()
-    time.sleep(0.2)
-    remote = RemoteSequencer(host="127.0.0.1", port=port)
-    seq = na.imaging_sequence(exposure=12e-6, load=True).repeated(4)
-    assert na.count_trigger_pulses(seq) == 4
-    try:
-        remote.open()
-        program = remote.prepare(seq)
-        remote.fire(seq)
-        assert remote.wait_done(timeout=1.0)
-    finally:
-        remote.close()
-        server.close()
-
-    payload = json.loads((tmp_path / "prepared_program.json").read_text(encoding="utf-8"))
-    assert payload["source_sequence"]["name"] == seq.name
 
 
 def test_remote_pulse_controller_sends_pulse_table_x_over_json_protocol(tmp_path):
@@ -4900,32 +3875,6 @@ def test_unregistered_remote_controller_cannot_enter_session_scan(tmp_path):
     assert fired_programs == []
 
 
-def test_hardware_tutorial_is_real_hardware_not_virtual_demo():
-    hardware_text = "\n".join(cell["source"] for cell in neutral_atom_hardware_tutorial_cells())
-    fpga_text = "\n".join(cell["source"] for cell in neutral_atom_fpga_server_cells())
-
-    assert 'na.connect("virtual")' not in hardware_text
-    assert "VirtualCamera" not in hardware_text
-    assert "VirtualSequencer" not in hardware_text
-    assert '"remote_template"' in hardware_text
-    assert "open_devices=True" in hardware_text
-    assert "zf.require_attrs" not in hardware_text
-    assert "isinstance(" not in hardware_text
-    assert "raw_device_set(exp).camera.open()" not in hardware_text
-    assert "raw_device_set(exp).sequencer.open()" not in hardware_text
-    assert "results_real_hardware" not in hardware_text
-    assert "neutral_atom.devices.sequencer_server" in fpga_text
-    assert "axi_session" in fpga_text                    # final JTAG-to-AXI backend
-    assert "legacy_address_switch" not in fpga_text
-    assert "devices.sequencer_server" in fpga_text
-    # final design: jtag-axi backend + the short in-repo build dir (no VIO project)
-    assert "jtag-axi" in fpga_text
-    assert "fpga\\build\\ps" in fpga_text
-    assert "fpga\\build\\pulse_streamer" not in fpga_text
-    assert "address_switch.xpr" not in fpga_text
-    assert "vivado-session" not in fpga_text
-    assert "qCMOS.py" not in hardware_text + fpga_text
-    assert "pxie_control" not in hardware_text + fpga_text
 
 
 def test_real_device_templates_load_without_hardware_connection():
@@ -5027,19 +3976,6 @@ def test_load_devices_can_open_device_graph(monkeypatch):
     assert TrackingCamera.events == ["sequencer.open", "camera.open", "camera.close", "sequencer.close"]
 
 
-def test_sequencer_server_reports_client_endpoints(monkeypatch, capsys):
-    from Zou_lab_control.neutral_atom.devices import sequencer_server
-
-    assert sequencer_server._client_addresses("192.168.0.20") == ["192.168.0.20"]
-
-    monkeypatch.setattr(sequencer_server, "_client_addresses", lambda host: ["192.168.0.20", "10.0.0.5"])
-    sequencer_server._print_client_endpoints("0.0.0.0", 18861)
-    output = capsys.readouterr().out
-
-    assert "Client endpoints:" in output
-    assert "192.168.0.20:18861" in output
-    assert "10.0.0.5:18861" in output
-    assert 'sequencer={"host": "192.168.0.20", "port": 18861}' in output
 
 
 def test_qcmos_camera_acquire_reads_n_frames(monkeypatch):
@@ -6952,27 +5888,6 @@ def test_slot_ref_helpers_are_the_single_parser():
     assert slot_ref_index("s3") == 3 and slot_ref_index("sX") is None and slot_ref_index(7) is None
 
 
-def test_streamer_config_is_single_source_for_host_geometry():
-    """The reconfigurable geometry comes from fpga/board_config/streamer_config.json; the
-    host validator constants and the AXI runtime default are SOURCED from it (no scattered
-    literals), and the shipped values match the synthesized RTL (zlc_pulse_streamer_top.v)."""
-
-    from fpga.pulse_streamer.host import image as im
-
-    cfg = im.load_streamer_config()
-    p = cfg["params"]
-    assert cfg["warnings"] == []                      # the shipped config file loads cleanly
-    assert (p.max_edges, p.bank_size) == (4096, 2048)
-    assert (p.channel_count, p.num_slots, p.bus_count, p.bus_width) == (62, 4, 4, 10)
-
-    from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
-    assert fps.DEFAULT_MAX_EDGES == p.max_edges
-    assert fps.DEFAULT_NUM_SLOTS == p.num_slots
-    assert fps.DEFAULT_BUS_WIDTH == p.bus_width
-    assert fps.DEFAULT_FPGA_CHANNEL_COUNT == p.channel_count
-
-    from Zou_lab_control.neutral_atom.devices import axi_session as ax
-    assert ax.DEFAULT_PARAMS.max_edges == p.max_edges and ax.DEFAULT_PARAMS.bank_size == p.bank_size
 
 
 def test_estimate_resources_matches_solve_capacity_and_reports_pass_fail():
@@ -7749,122 +6664,8 @@ def test_streamer_params_defaults_match_config():
             f"streamer_config.json {getattr(cfg, f.name)!r} -- update the dataclass default")
 
 
-def test_wait_done_drains_the_delayed_tail_and_prepare_does_not_chop_it(tmp_path):
-    """DONE asserts when the UNDELAYED stream ends; the event schedulers keep emitting the
-    queued tail for max(delay) more.  wait_done() must not return until that tail has
-    physically played, and a back-to-back prepare() must wait out the previous run's drain
-    deadline before CMD_SAFE (an explicit safe_state() stays immediate) -- otherwise a
-    chained shot chops the last d ticks of every delayed channel (e.g. a -2 s emCCD)."""
-
-    import re as _re
-    import time as _time
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeBusDelay
-
-    class Hw:
-        def __init__(self):
-            self.bram = {2: 0b101}     # STATUS: LOADED|DONE immediately
-        def __call__(self, lines, action, timeout):
-            text = "\n".join(lines)
-            for w, v in _decode_axi_writes(text):
-                self.bram[w] = v
-                if w == 1 and v == 1:      # CMD_LOAD -> LOADED
-                    self.bram[2] = 0b101
-            m = _re.search(r"-address ([0-9a-fA-F]+) -len 1 -type read", text)
-            if m:
-                w = int(m.group(1), 16) // 4
-                if w == 63:
-                    return f"ZLCDATA {_LAYOUT_HEX}\n"
-                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
-            return "ok\n"
-
-    session = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=Hw())
-    prog = na.RuntimeSequenceProgram(
-        sequence_id=1, sequence_name="d", clock_hz=50e6, channels=["a"],
-        ticks=[0, 10], masks=[1, 0], duration=200.0,
-        channel_delays=[2_500_000],                      # 50 ms tail
-        bus_delays=[RuntimeBusDelay(0, 1_000_000)])
-    session.prepare(prog)
-    assert abs(session._tail_seconds - 0.05) < 1e-9      # max(50 ms, 20 ms)
-
-    session.fire()
-    t0 = _time.monotonic()
-    assert session.wait_done(timeout=5.0)
-    waited = _time.monotonic() - t0
-    assert waited >= 0.05, f"wait_done returned {waited*1e3:.0f} ms after DONE; must drain the 50 ms tail"
-    assert session._drain_until == 0.0                   # drained: next prepare is instant
-
-    # chop guard: fire again and immediately prepare -- prepare must wait the deadline out
-    session.fire()
-    t1 = _time.monotonic()
-    session.prepare(prog)
-    assert _time.monotonic() - t1 >= 0.05, "prepare must not CMD_SAFE before the tail drains"
-
-    # explicit stop abandons the tail on purpose -> instant next prepare
-    session.fire()
-    session.safe_state()
-    assert session._drain_until == 0.0
 
 
-def test_drain_tail_short_budget_keeps_guard_and_running_prepare_aborts_instantly(tmp_path):
-    """Two drain-tail edge cases.
-
-    1. wait_done() with a budget SHORTER than the tail returns True on DONE but must
-       leave the drain deadline ARMED, so the next prepare() still waits out the
-       un-drained remainder (clearing it unconditionally would chop the tail).
-    2. prepare() over a still-RUNNING program (no DONE) is an explicit program switch
-       and must NOT wait -- the abort-immediately semantics; only DONE-with-pending-tail
-       blocks it.
-    """
-
-    import re as _re
-    import time as _time
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-
-    class Hw:
-        def __init__(self, status):
-            self.status = status
-            self.bram = {2: status}
-        def __call__(self, lines, action, timeout):
-            text = "\n".join(lines)
-            for w, v in _decode_axi_writes(text):
-                self.bram[w] = v
-                if w == 1:                 # any COMMAND keeps the scripted STATUS
-                    self.bram[2] = self.status
-            m = _re.search(r"-address ([0-9a-fA-F]+) -len 1 -type read", text)
-            if m:
-                w = int(m.group(1), 16) // 4
-                if w == 63:
-                    return f"ZLCDATA {_LAYOUT_HEX}\n"
-                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
-            return "ok\n"
-
-    # --- case 1: DONE, 100 ms tail, but only a 20 ms wait_done budget -----------------
-    session = VivadoAxiStreamerSession(state_dir=tmp_path / "done", tcl_executor=Hw(0b101))
-    prog = na.RuntimeSequenceProgram(
-        sequence_id=1, sequence_name="d", clock_hz=50e6, channels=["a"],
-        ticks=[0, 10], masks=[1, 0], duration=200.0,
-        channel_delays=[5_000_000])                      # 100 ms tail
-    session.prepare(prog)
-    session.fire()
-    assert session.wait_done(timeout=0.02)               # budget < tail: returns on DONE
-    assert session._drain_until > 0.0, "under-drained tail must keep the guard armed"
-    t0 = _time.monotonic()
-    session.prepare(prog)                                # must wait out the remainder
-    assert _time.monotonic() - t0 >= 0.05, "prepare chopped an under-drained tail"
-
-    # --- case 2: still RUNNING (never DONE) -> prepare aborts immediately -------------
-    session2 = VivadoAxiStreamerSession(state_dir=tmp_path / "run", tcl_executor=Hw(0b011))
-    prog2 = na.RuntimeSequenceProgram(
-        sequence_id=2, sequence_name="r", clock_hz=50e6, channels=["a"],
-        ticks=[0, 10], masks=[1, 0], duration=200.0,
-        channel_delays=[10_000_000])                     # 200 ms tail
-    session2.prepare(prog2)
-    session2.fire()
-    assert session2._drain_until > 0.0
-    t1 = _time.monotonic()
-    session2.prepare(prog2)                              # program switch: no tail wait
-    assert _time.monotonic() - t1 < 0.1, "prepare must not stall on a RUNNING program"
 
 
 def test_signal_hub_publish_latest_history_and_versioning():
@@ -7966,135 +6767,6 @@ def test_user_composed_loading_readout_publishes_standard_signals():
         det_b.step()
     diff = np.asarray(hub.latest("occupied")) - np.asarray(hub.latest("b_occupied"))
     assert diff.shape[-1] == n
-
-
-class _FakeVivadoProc:
-    """In-process stand-in for the persistent ``vivado -mode tcl`` child.
-
-    ``stdin.write`` receives one whole wrapped script per transaction; the fake parses
-    its unique marker and synthesises the marker protocol on ``stdout`` (BEGIN / an
-    optional ZLCDATA reply for reads / OK / END).  ``exit``/kill/terminate end the
-    process: stdout EOFs, so the session's reader thread enqueues its None sentinel
-    exactly like a real dead Vivado."""
-
-    def __init__(self):
-        import queue as _queue
-        self._out: "_queue.Queue[str | None]" = _queue.Queue()
-        self.stdin = self
-        self.stdout = self
-        self.returncode = None
-
-    # --- stdin side -------------------------------------------------------------
-    def write(self, text: str) -> None:
-        import re as _re
-        m = _re.search(r"(ZLC_AXI_\d+)_BEGIN", text)
-        if m is None:
-            if text.strip() == "exit":
-                self._exit()
-            return
-        marker = m.group(1)
-        self._out.put(f"{marker}_BEGIN\n")
-        if "-type read" in text:
-            self._out.put(f"ZLCDATA {_LAYOUT_HEX}\n")          # REGISTER_LAYOUT_ID readback
-        self._out.put(f"{marker}_OK\n")
-        self._out.put(f"{marker}_END\n")
-
-    def flush(self) -> None:
-        pass
-
-    # --- stdout side (iterated by the session's reader thread) -------------------
-    def __iter__(self):
-        while True:
-            item = self._out.get()
-            if item is None:
-                return
-            yield item
-
-    # --- process control ----------------------------------------------------------
-    def _exit(self) -> None:
-        if self.returncode is None:
-            self.returncode = 0
-            self._out.put(None)                          # EOF for the reader thread
-
-    def wait(self, timeout=None):
-        self._exit()
-        return 0
-
-    def terminate(self) -> None:
-        self._exit()
-
-    def kill(self) -> None:
-        self._exit()
-
-
-def test_axi_session_self_heals_after_close_restart(monkeypatch, tmp_path):
-    """A close() -> restart cycle must be CLEAN: the dead generation's reader thread
-    EOF-sentinels its OWN queue, never the new generation's.
-
-    With the queue shared across generations (the old code), the stale ``None``
-    poisoned every restart: the next transaction raised "process exited
-    unexpectedly", the retry killed its fresh process (whose reader enqueued the
-    next sentinel), and so on forever -- after ONE transient failure (e.g. a delay
-    error followed by an action timeout) no pulse could ever be applied again and
-    the whole server had to be restarted."""
-
-    from Zou_lab_control.neutral_atom.devices import axi_session as ax
-
-    made = []
-
-    def fake_popen(cmd, **kwargs):
-        proc = _FakeVivadoProc()
-        made.append(proc)
-        return proc
-
-    monkeypatch.setattr(ax.subprocess, "Popen", fake_popen)
-    session = ax.VivadoAxiStreamerSession(state_dir=tmp_path, vivado="fake-vivado")
-    session.start()
-    assert session._read_word(63) == _im.REGISTER_LAYOUT_ID
-
-    old_reader = session._reader
-    session.close()                       # generation 1 dies; its reader EOF-sentinels its queue
-    old_reader.join(timeout=2.0)
-    assert not old_reader.is_alive()
-
-    # the next transaction must transparently restart a fresh Vivado and SUCCEED
-    assert session._read_word(63) == _im.REGISTER_LAYOUT_ID
-    assert len(made) == 2, "expected exactly one transparent restart"
-    session.close()
-
-
-def test_axi_session_init_tcl_never_uses_raw_jtag_mode(tmp_path):
-    """`open_hw_target -jtag_mode on` must never be the reconnect fallback: raw JTAG
-    mode does not enumerate debug cores, so get_hw_axis comes back empty and every
-    restart then fails with a "no debug core" error until the server is rebooted."""
-
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-
-    session = VivadoAxiStreamerSession(
-        state_dir=tmp_path, vivado="fake-vivado", tcl_executor=lambda lines, a, t: "ok\n")
-    tcl = "\n".join(session._init_tcl())
-    assert "-jtag_mode" not in tcl
-    assert "open_hw_target" in tcl
-
-
-def test_torn_down_stream_transaction_never_spawns_a_new_vivado(monkeypatch, tmp_path):
-    """A transaction whose stop event is already set (the streaming-refill thread being
-    torn down by Off/prepare) must abort BEFORE the restart machinery -- a dying stream
-    thread spawning a competing Vivado would fight the main thread over the JTAG target."""
-
-    import threading as _threading
-    from Zou_lab_control.neutral_atom.devices import axi_session as ax
-
-    def explode(*args, **kwargs):
-        raise AssertionError("a stopped transaction must not spawn a new Vivado")
-
-    monkeypatch.setattr(ax.subprocess, "Popen", explode)
-    session = ax.VivadoAxiStreamerSession(state_dir=tmp_path, vivado="fake-vivado")
-    stop = _threading.Event()
-    stop.set()
-    with pytest.raises(ax._AxiAborted):
-        session._run_tcl(["puts hi"], action="x", timeout=1.0, stop=stop)
-
 
 # --------------------------------------------------------------------------- #
 # Rb87-style PSF + bimodal readout (decision 2): the matched-filter extraction

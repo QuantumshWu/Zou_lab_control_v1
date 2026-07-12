@@ -274,11 +274,12 @@ class RuntimeSequenceProgram:
     def __post_init__(self) -> None:
         # repeat_forever and scan_points are ORTHOGONAL here, and this pure data contract does NOT
         # decide one from the other.  ``repeat_forever`` is the host-side CYCLIC intent: 0-repeat
-        # seamless forever / K whole sweeps then stop.  ``scan_points`` is the STREAMING fact: any
-        # bound scan still streams its points.  A program can legitimately be a FINITE single-pass
-        # streamed scan (repeat_forever=False + scan_points: play N points once to STATUS_DONE -- the
-        # axi_session wait_done streaming-refill path), so this carrier must never force one value
-        # from the other.  The CYCLIC intent for a GUI/notebook scan is owned by the fire seam
+        # seamless forever / K whole sweeps then stop.  ``scan_points`` is the table fact: any bound
+        # scan carries its physical points.  A program can legitimately be a finite single-pass scan
+        # (repeat_forever=False + scan_points), so this carrier must never force one value from the
+        # other.  The current hardware owner admits only fully resident autonomous tables; this
+        # legacy carrier does not decide deployment capacity.  The CYCLIC intent for a GUI/notebook
+        # scan is owned by the fire seam
         # (PulseController.on_pulse passes repeat_forever for On Pulse "continuous until Stop"); the
         # streaming/progress gate downstream keys off scan_points, not this flag.
         # A finite K-sweep streamed scan (scan_repeats>0) needs >= 2 scan points: the host counts whole

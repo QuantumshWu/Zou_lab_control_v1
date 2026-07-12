@@ -10,12 +10,13 @@ Memory map (32-bit AXI words; the top decodes one axi_bram_ctrl port to regions)
   TICK   edge base ticks      (1 word/edge,  engine reads 32b)
   COEFF  edge slot coeffs     (2 words/edge, engine reads 64b)
   MASK   edge 62-bit masks    (2 words/edge, engine reads 64b: low 62 used)
-  SCAN   2-bank ping-pong window: 2 * bank_size points * num_slots words
+  SCAN   2-bank resident window: 2 * bank_size points * num_slots words
   BUS    bus-segment image    (7 words/seg, copied into engine LUTRAM by the top)
 
 The edge fields are separate BRAMs read in PARALLEL (one whole edge per access,
-no width padding) so max_edges is large; the scan window is small (2 banks) and
-the host streams the rest -> UNBOUNDED scan points.  Bus tables stay LUTRAM.
+no width padding) so max_edges is large.  The current qualified deployment loads
+both scan banks before FIRE and rejects larger scans; host refill is not part of
+the execution contract.  Bus tables stay LUTRAM.
 
 The per-channel / per-bus OUTPUT delay is EVENT-SCHEDULED (queued toggles against a
 free-running counter, 32-bit delay bound) for BOTH the TTL channels and the DAC buses; both
@@ -52,7 +53,7 @@ IMAGE_MAGIC = 0x5A4C4532   # "ZLE2"
 # ------------------------------------------------------------------------------------------------
 # HOST<->BITSTREAM COMPATIBILITY FINGERPRINT (CTRL word 63, image.build_fingerprint).
 #
-# The top exposes this 32-bit value on every read of CTRL word 63; axi_session verifies it at
+# The top exposes this 32-bit value on every read of CTRL word 63; the pulse transport verifies it at
 # connect and refuses a mismatched pair.  It folds the register-STRUCTURE version with EVERY
 # bitstream-affecting geometry field, so a host that packs for one geometry can never silently
 # mis-drive a bitstream built for another.  Two real silent-corruption failures this now catches
@@ -107,7 +108,7 @@ class CtrlWords:
     COMMAND = 1            # host -> top: LOAD/FIRE/RESET/SAFE (rising-edge)
     STATUS = 2            # top -> host: LOADED/RUNNING/DONE/ERROR/UNDERFLOW
     PROG_COUNT = 3        # number of edges
-    SCAN_COUNT = 4        # TOTAL scan points N (may exceed the resident window)
+    SCAN_COUNT = 4        # total resident scan points N for the current deployment
     SCAN_ENABLE = 5
     REPEAT_FOREVER = 6
     LOOP_START = 7

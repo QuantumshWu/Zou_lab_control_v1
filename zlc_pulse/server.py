@@ -18,6 +18,7 @@ from .artifact import (
     compiled_pulse_artifact_to_tree,
 )
 from .fpga import pack_target_ir
+from .deployment import validate_resident_scan_capacity
 from .target import PulseTarget, pulse_target_to_tree
 from .validation import validate_target_ir_for_target
 
@@ -36,6 +37,8 @@ class PulseExecutionBackend(Protocol):
     def wait_done(self, artifact: CompiledPulseArtifact, timeout: float | None) -> bool: ...
 
     def safe_state(self) -> None: ...
+
+    def request_interrupt(self) -> None: ...
 
     def snapshot(self) -> dict[str, object]: ...
 
@@ -99,7 +102,14 @@ class PulseExecutionService:
             raise TypeError("target must be PulseTarget")
         if not isinstance(clock_hz, (int, float)) or not math.isfinite(float(clock_hz)) or clock_hz <= 0:
             raise ValueError("clock_hz must be finite and positive")
-        for method in ("prepare", "fire", "wait_done", "safe_state", "snapshot"):
+        for method in (
+            "prepare",
+            "fire",
+            "wait_done",
+            "safe_state",
+            "request_interrupt",
+            "snapshot",
+        ):
             if not callable(getattr(backend, method, None)):
                 raise TypeError(f"pulse backend is missing {method}()")
         self._target = target
@@ -113,6 +123,7 @@ class PulseExecutionService:
         self._state = "IDLE"
         self._artifact: CompiledPulseArtifact | None = None
         self._prepared_ref: PreparedPulseRef | None = None
+        self._operation_epoch = 0
 
     @property
     def connection_generation(self) -> str:
@@ -122,7 +133,7 @@ class PulseExecutionService:
         """Invalidate every prepared reference before admitting a new RPC owner."""
 
         with self._lock:
-            if self._state not in {"IDLE", "SAFE", "SAFE_FAILED"}:
+            if self._state not in {"IDLE", "SAFE"}:
                 raise RuntimeError(
                     f"cannot renew connection generation while pulse service is {self._state}"
                 )
@@ -148,22 +159,54 @@ class PulseExecutionService:
             }
 
     def prepare(self, artifact: CompiledPulseArtifact) -> PreparedPulseRef:
-        self._validate_artifact(artifact)
         with self._lock:
             if self._state not in {"IDLE", "SAFE", "DONE"}:
                 raise RuntimeError(
                     f"pulse service state {self._state} requires completion or verified safe_state "
                     "before another prepare"
                 )
+            prior_state = self._state
+            operation_epoch = self._operation_epoch
+            self._state = "VALIDATING"
+        try:
+            self._validate_artifact(artifact)
+        except BaseException:
+            with self._lock:
+                if (
+                    operation_epoch == self._operation_epoch
+                    and self._state == "VALIDATING"
+                ):
+                    self._state = prior_state
+            raise
+        with self._lock:
+            if (
+                operation_epoch != self._operation_epoch
+                or self._state != "VALIDATING"
+            ):
+                raise RuntimeError(
+                    "pulse prepare validation was superseded by interrupt-to-safe"
+                )
             self._state = "PREPARING"
-            try:
-                self._backend.prepare(artifact)
-            except BaseException as error:
+        try:
+            self._backend.prepare(artifact)
+        except BaseException as error:
+            with self._lock:
+                superseded = operation_epoch != self._operation_epoch
+                if not superseded:
+                    self._state = "FAILED"
+                    self._artifact = None
+                    self._prepared_ref = None
+            if not superseded:
                 self._best_effort_safe_after_failure(error)
-                self._state = "FAILED"
-                self._artifact = None
-                self._prepared_ref = None
-                raise
+            raise
+        with self._lock:
+            if (
+                operation_epoch != self._operation_epoch
+                or self._state != "PREPARING"
+            ):
+                raise RuntimeError(
+                    "pulse prepare was superseded by an interrupt-to-safe operation"
+                )
             reference = PreparedPulseRef(
                 self._generation,
                 artifact.fingerprint,
@@ -179,12 +222,22 @@ class PulseExecutionService:
         with self._lock:
             artifact = self._require_prepared(reference, expected_state="PREPARED")
             self._state = "FIRING"
-            try:
-                self._backend.fire(artifact)
-            except BaseException as error:
+            operation_epoch = self._operation_epoch
+        try:
+            self._backend.fire(artifact)
+        except BaseException as error:
+            with self._lock:
+                superseded = operation_epoch != self._operation_epoch
+                if not superseded:
+                    self._state = "FAILED"
+            if not superseded:
                 self._best_effort_safe_after_failure(error)
-                self._state = "FAILED"
-                raise
+            raise
+        with self._lock:
+            if operation_epoch != self._operation_epoch or self._state != "FIRING":
+                raise RuntimeError(
+                    "pulse FIRE was superseded by an interrupt-to-safe operation"
+                )
             self._state = "RUNNING"
 
     def complete(
@@ -201,16 +254,38 @@ class PulseExecutionService:
         ):
             raise ValueError("timeout must be finite and positive or None")
         with self._lock:
-            artifact = self._require_prepared(reference, expected_state="RUNNING")
+            if self._state not in {"RUNNING", "TIMEOUT"}:
+                raise RuntimeError(
+                    f"pulse service state is {self._state}, expected RUNNING or TIMEOUT"
+                )
+            artifact = self._require_prepared(
+                reference,
+                expected_state=self._state,
+            )
             if artifact.execution_form is PulseExecutionForm.CONTINUOUS_MONITOR:
                 raise RuntimeError("continuous pulse execution has no logical completion; use safe_state")
             self._state = "COMPLETING"
-            try:
-                done = bool(self._backend.wait_done(artifact, timeout))
-            except BaseException as error:
+            operation_epoch = self._operation_epoch
+        try:
+            done = bool(self._backend.wait_done(artifact, timeout))
+        except BaseException as error:
+            with self._lock:
+                superseded = operation_epoch != self._operation_epoch
+                if not superseded:
+                    self._state = "FAILED"
+                    self._artifact = None
+                    self._prepared_ref = None
+            if not superseded:
                 self._best_effort_safe_after_failure(error)
-                self._state = "FAILED"
-                raise
+            raise
+        with self._lock:
+            if (
+                operation_epoch != self._operation_epoch
+                or self._state != "COMPLETING"
+            ):
+                raise RuntimeError(
+                    "pulse completion was superseded by an interrupt-to-safe operation"
+                )
             self._state = "DONE" if done else "TIMEOUT"
             return PulseCompletion(
                 reference,
@@ -222,19 +297,62 @@ class PulseExecutionService:
             )
 
     def safe_state(self) -> None:
+        self._safe_state(expected_generation=None)
+
+    def _safe_state(self, *, expected_generation: str | None) -> None:
         with self._lock:
-            try:
-                self._backend.safe_state()
-            except BaseException:
-                self._artifact = None
-                self._prepared_ref = None
-                self._state = "SAFE_FAILED"
-                raise
+            if (
+                expected_generation is not None
+                and expected_generation != self._generation
+            ):
+                raise RuntimeError("interrupt connection generation is stale")
+            self._operation_epoch += 1
+            operation_epoch = self._operation_epoch
+            self._state = "INTERRUPTING"
+        interrupt_error: BaseException | None = None
+        try:
+            self._backend.request_interrupt()
+        except BaseException as error:
+            interrupt_error = error
+        try:
+            self._backend.safe_state()
+        except BaseException as error:
+            if interrupt_error is not None:
+                error.add_note(
+                    "non-blocking interrupt request also failed before safe_state: "
+                    f"{type(interrupt_error).__name__}: {interrupt_error}"
+                )
+            with self._lock:
+                if operation_epoch == self._operation_epoch:
+                    self._artifact = None
+                    self._prepared_ref = None
+                    self._state = "SAFE_FAILED"
+            raise
+        with self._lock:
+            if operation_epoch != self._operation_epoch:
+                raise RuntimeError("safe_state operation was superseded")
             self._artifact = None
             self._prepared_ref = None
             self._state = "SAFE"
 
+    def safe_state_for_generation(self, generation: str) -> dict[str, object]:
+        """Authorize a separate abort connection without granting normal control."""
+
+        _text(generation, "connection_generation")
+        self._safe_state(expected_generation=generation)
+        with self._lock:
+            if generation != self._generation:
+                raise RuntimeError(
+                    "interrupt connection generation changed before safe receipt"
+                )
+            return self.snapshot()
+
     def _best_effort_safe_after_failure(self, primary: BaseException) -> None:
+        interrupt_error: BaseException | None = None
+        try:
+            self._backend.request_interrupt()
+        except BaseException as error:
+            interrupt_error = error
         try:
             self._backend.safe_state()
         except BaseException as safety_error:
@@ -242,6 +360,17 @@ class PulseExecutionService:
                 "pulse backend safe_state also failed after the primary operation: "
                 f"{type(safety_error).__name__}: {safety_error}"
             )
+            if interrupt_error is not None:
+                primary.add_note(
+                    "pulse backend request_interrupt also failed: "
+                    f"{type(interrupt_error).__name__}: {interrupt_error}"
+                )
+        else:
+            if interrupt_error is not None:
+                primary.add_note(
+                    "pulse backend request_interrupt failed, but safe_state succeeded: "
+                    f"{type(interrupt_error).__name__}: {interrupt_error}"
+                )
 
     def _validate_artifact(self, artifact: CompiledPulseArtifact) -> None:
         if not isinstance(artifact, CompiledPulseArtifact):
@@ -251,6 +380,7 @@ class PulseExecutionService:
         validate_target_ir_for_target(artifact.target_ir, self._target)
         if artifact.target_ir.clock_hz != self._clock_hz:
             raise ValueError("compiled artifact clock differs from deployed clock")
+        validate_resident_scan_capacity(artifact, self._params)
         if artifact.wire_image.geometry_fingerprint != self._geometry_fingerprint:
             raise ValueError("compiled artifact geometry differs from deployed geometry")
         if artifact.wire_image != pack_target_ir(artifact.target_ir, self._params):
@@ -387,9 +517,12 @@ def serve_pulse_execution_service(
     class RPyCCurrentPulseService(rpyc.Service):
         def on_connect(self, conn):
             with connection_lock:
-                if active_connection:
-                    raise RuntimeError("pulse execution service already has an active control owner")
-                active_connection.append(conn)
+                owns_connection = not active_connection
+                if owns_connection:
+                    active_connection.append(conn)
+            self._owner_connection = conn if owns_connection else None
+            if not owns_connection:
+                return
             try:
                 service.renew_connection_generation()
             except BaseException:
@@ -397,7 +530,6 @@ def serve_pulse_execution_service(
                     if active_connection and active_connection[0] is conn:
                         active_connection.clear()
                 raise
-            self._owner_connection = conn
 
         def on_disconnect(self, conn):
             with connection_lock:
@@ -443,10 +575,10 @@ def serve_pulse_execution_service(
                 )
             )
 
-        def exposed_current_safe_state(self):
-            self._require_owner()
-            service.safe_state()
-            return True
+        def exposed_current_interrupt_safe_state(self, connection_generation):
+            return encode(
+                service.safe_state_for_generation(str(connection_generation))
+            )
 
     server = ThreadedServer(
         RPyCCurrentPulseService,

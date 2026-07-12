@@ -8,7 +8,7 @@ address) and ``READ`` (a run of words back).  Everything else -- a COMMAND risin
 step, a layout/PING check -- is COMPOSED by the host from WRITE/READ frames, so this codec and the
 RTL bridge FSM stay tiny and ``image.py`` remains the single source.
 
-This module is imported by BOTH the host (``devices/uart_session.py``) and the behavioural model
+This module is imported by BOTH ``zlc_pulse.transport`` and the behavioural model
 (``uart_bridge_model.py``) and drives the xsim test-vector generator, so the encoder, the decoder,
 the Python oracle and the Verilog testbench can never disagree on a byte.
 

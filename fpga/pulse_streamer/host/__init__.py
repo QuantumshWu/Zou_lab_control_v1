@@ -1,2 +1,5 @@
-"""Host-side Python for the edge-table streamer (BRAM image, capacity solver,
-cycle-accurate RTL models). Imported by Zou_lab_control...devices.axi_session."""
+"""Frozen edge-streamer wire image, capacity solver, and RTL reference models.
+
+The hardware owner is :mod:`zlc_pulse.transport`; this package only describes
+the already-programmed bitstream's word-level contract.
+"""

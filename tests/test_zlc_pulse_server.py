@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import threading
+import time
 
 import pytest
 
@@ -50,6 +52,9 @@ class RecordingBackend:
         if self.fail_safe:
             raise RuntimeError("safe readback failed")
         self.prepared = None
+
+    def request_interrupt(self):
+        pass
 
     def snapshot(self):
         return {"prepared": self.prepared is not None}
@@ -176,8 +181,95 @@ def test_timeout_is_not_reported_as_a_completed_schedule():
 
     with pytest.raises(RuntimeError, match="requires completion or verified safe_state"):
         service.prepare(artifact)
-    service.safe_state()
+    backend.done = True
+    assert service.complete(reference, timeout=0.1).logical_done
     assert service.prepare(artifact).artifact_digest == artifact.fingerprint
+
+
+def test_independent_safe_interrupts_a_blocked_completion_without_waiting_for_its_lock():
+    artifact = _artifact()
+
+    class BlockingBackend(RecordingBackend):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.interrupted = threading.Event()
+
+        def wait_done(self, artifact, timeout):
+            self.entered.set()
+            self.interrupted.wait(2.0)
+            raise RuntimeError("completion interrupted")
+
+        def request_interrupt(self):
+            self.interrupted.set()
+
+    backend = BlockingBackend()
+    service = PulseExecutionService(
+        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        clock_hz=50e6,
+        backend=backend,
+    )
+    reference = service.prepare(artifact)
+    service.fire(reference)
+    errors = []
+
+    def complete():
+        try:
+            service.complete(reference, timeout=1.0)
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=complete)
+    worker.start()
+    assert backend.entered.wait(1.0)
+    started = time.monotonic()
+    service.safe_state()
+    elapsed = time.monotonic() - started
+    worker.join(1.0)
+
+    assert elapsed < 0.5
+    assert not worker.is_alive()
+    assert errors and "completion interrupted" in str(errors[0])
+    assert service.snapshot()["state"] == "SAFE"
+
+
+def test_safe_during_artifact_validation_is_a_terminal_admission_fence(monkeypatch):
+    artifact = _artifact()
+    backend = RecordingBackend()
+    service = PulseExecutionService(
+        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        clock_hz=50e6,
+        backend=backend,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    original = service._validate_artifact
+
+    def blocked_validation(value):
+        entered.set()
+        assert release.wait(1.0)
+        original(value)
+
+    monkeypatch.setattr(service, "_validate_artifact", blocked_validation)
+    errors = []
+
+    def prepare():
+        try:
+            service.prepare(artifact)
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=prepare)
+    worker.start()
+    assert entered.wait(1.0)
+    service.safe_state()
+    release.set()
+    worker.join(1.0)
+
+    assert not worker.is_alive()
+    assert errors and "superseded" in str(errors[0])
+    assert [action[0] for action in backend.actions] == ["safe"]
+    assert service.snapshot()["state"] == "SAFE"
 
 
 def test_continuous_execution_has_no_false_logical_completion():
@@ -235,3 +327,26 @@ def test_new_connection_generation_permanently_invalidates_old_prepared_refs():
 
     with pytest.raises(RuntimeError, match="stale"):
         service.fire(old_reference)
+
+
+def test_interrupt_receipt_never_leaks_a_new_connection_generation(monkeypatch):
+    artifact = _artifact()
+    backend = RecordingBackend()
+    service = PulseExecutionService(
+        load_pulse_document(ROOT / "pulses" / "imaging_template.json").target,
+        clock_hz=50e6,
+        backend=backend,
+        connection_generation="old-generation",
+    )
+    service.prepare(artifact)
+    original = service._safe_state
+
+    def disconnect_and_replace_owner(*, expected_generation):
+        original(expected_generation=expected_generation)
+        service.renew_connection_generation()
+
+    monkeypatch.setattr(service, "_safe_state", disconnect_and_replace_owner)
+
+    with pytest.raises(RuntimeError, match="changed before safe receipt"):
+        service.safe_state_for_generation("old-generation")
+    assert service.connection_generation != "old-generation"

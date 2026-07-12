@@ -2,8 +2,8 @@
 
 A streamed scan used to sweep its points then repeat FOREVER.  ``scan_repeats=K`` makes it play
 K whole sweeps then stop; ``scan_progress()`` reports where the scan is now (point K / N, sweep r).
-The point/sweep math is single-sourced in ``scan_progress_fields`` and the VIRTUAL backend mirrors
-the real streamer (same method + semantics), so the GUI poll works with no real hardware.
+The point/sweep math is single-sourced in ``scan_progress_fields`` and the legacy VIRTUAL backend
+provides the progress seam used by the remaining GUI tests without requiring real hardware.
 """
 from Zou_lab_control.neutral_atom.ports import PortCatalog
 
@@ -14,7 +14,6 @@ from Zou_lab_control.neutral_atom.devices.sequencer import (
     PulseController, RuntimeSequenceProgram, SCAN_PROGRESS_IDLE, scan_progress_fields,
 )
 from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
-from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
 
 
 def _scan_state() -> PulseTableState:
@@ -125,12 +124,6 @@ def test_virtual_infinite_scan_keeps_scanning():
 def test_virtual_idle_when_not_scanning():
     seq = VirtualSequencer(channels=["probe", "trig"], sleep_scale=0.0)
     assert seq.scan_progress() == SCAN_PROGRESS_IDLE
-
-
-# ---- both backends expose the SAME scan-progress contract -----------------------------------
-def test_both_backends_expose_scan_progress():
-    for cls in (VirtualSequencer, VivadoAxiStreamerSession):
-        assert hasattr(cls, "scan_progress"), f"{cls.__name__} must expose scan_progress()"
 
 
 # ---- VirtualSequencer COMPOSES the single SequencerService state machine (no second copy) ----

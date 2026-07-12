@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -13,10 +14,16 @@ from fpga.pulse_streamer.host.image import (
     default_params,
 )
 
+from .artifact import CompiledPulseArtifact
 from .deployment import APPROVED_DEPLOYED_TARGET_ABI, validate_deployed_target
 from .server import PulseExecutionService, serve_pulse_execution_service
-from .session_backend import PulseStreamerSessionBackend
 from .target import PulseTarget, load_pulse_target
+from .transport import (
+    DeployedStreamerSession as CurrentDeployedStreamerSession,
+    InterprocessDeviceLease,
+    UartRegisterTransport,
+    VivadoAxiRegisterTransport,
+)
 
 
 class DeployedStreamerSession(Protocol):
@@ -26,7 +33,23 @@ class DeployedStreamerSession(Protocol):
 
     def check_register_layout(self) -> None: ...
 
+    def transport_self_test(self) -> None: ...
+
     def safe_state(self) -> None: ...
+
+    def request_interrupt(self) -> None: ...
+
+    def prepare(self, artifact: CompiledPulseArtifact) -> None: ...
+
+    def fire(self, artifact: CompiledPulseArtifact) -> None: ...
+
+    def wait_done(
+        self,
+        artifact: CompiledPulseArtifact,
+        timeout: float | None,
+    ) -> bool: ...
+
+    def snapshot(self) -> dict[str, object]: ...
 
     def close(self) -> None: ...
 
@@ -36,17 +59,57 @@ class PulseServerRuntime:
     service: PulseExecutionService
     rpc_server: object
     session: DeployedStreamerSession
+    _closed: bool = field(default=False, init=False, repr=False)
+    _rpc_closed: bool = field(default=False, init=False, repr=False)
+    _session_closed: bool = field(default=False, init=False, repr=False)
+    _close_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        init=False,
+        repr=False,
+    )
 
     def close(self) -> None:
-        close_server = getattr(self.rpc_server, "close", None)
-        try:
-            if callable(close_server):
-                close_server()
-        finally:
-            try:
-                self.session.safe_state()
-            finally:
-                self.session.close()
+        with self._close_lock:
+            if self._closed:
+                return
+            close_server = getattr(self.rpc_server, "close", None)
+            failure: BaseException | None = None
+            if not self._rpc_closed:
+                try:
+                    if callable(close_server):
+                        close_server()
+                    self._rpc_closed = True
+                except BaseException as error:
+                    failure = error
+            if not self._session_closed:
+                safety_error: BaseException | None = None
+                try:
+                    self.service.safe_state()
+                except BaseException as error:
+                    safety_error = error
+                try:
+                    # A successful session.close() is itself a verified SAFE retry
+                    # followed by transport revocation, so it recovers a transient
+                    # first safe_state failure.
+                    self.session.close()
+                    self._session_closed = True
+                    safety_error = None
+                except BaseException as error:
+                    if safety_error is not None:
+                        error.add_note(
+                            "the preceding explicit safe_state also failed: "
+                            f"{type(safety_error).__name__}: {safety_error}"
+                        )
+                    if failure is None:
+                        failure = error
+                    else:
+                        failure.add_note(
+                            "pulse session close also failed: "
+                            f"{type(error).__name__}: {error}"
+                        )
+            self._closed = self._rpc_closed and self._session_closed
+            if failure is not None:
+                raise failure
 
 
 def build_service_for_session(
@@ -66,26 +129,21 @@ def build_service_for_session(
     return PulseExecutionService(
         target,
         clock_hz=clock,
-        backend=PulseStreamerSessionBackend(session, target, geometry, clock),
+        backend=session,
         params=geometry,
     )
 
 
-def bring_up_frozen_session(session: DeployedStreamerSession, backend: str) -> None:
+def bring_up_frozen_session(session: DeployedStreamerSession) -> None:
     """Verify the approved deployment without synthesizing or programming hardware."""
 
-    if backend not in {"jtag-axi", "uart"}:
-        raise ValueError("backend must be 'jtag-axi' or 'uart'")
     session.start()
     layout_verified = False
     try:
         session.check_register_layout()
         layout_verified = True
         session.clear_host_config()
-        if backend == "jtag-axi":
-            session.axi_self_test()
-        elif backend == "uart":
-            session.link_self_test()
+        session.transport_self_test()
         session.safe_state()
     except BaseException:
         if layout_verified:
@@ -108,29 +166,26 @@ def open_deployed_session(
     uart_baud: int,
 ) -> DeployedStreamerSession:
     if backend == "jtag-axi":
-        from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-
-        return VivadoAxiStreamerSession(
+        transport = VivadoAxiRegisterTransport(
             state_dir=state_dir,
-            params=params,
-            clock_hz=clock_hz,
-            deployed_target=target,
-            program_on_start=False,
         )
-    if backend == "uart":
+    elif backend == "uart":
         if not uart_port:
             raise ValueError("--uart-port is required for the uart backend")
-        from Zou_lab_control.neutral_atom.devices.uart_session import UartStreamerSession
-
-        return UartStreamerSession(
+        transport = UartRegisterTransport(
             state_dir=state_dir,
-            params=params,
-            clock_hz=clock_hz,
-            deployed_target=target,
             port=uart_port,
             baud=uart_baud,
         )
-    raise ValueError("backend must be 'jtag-axi' or 'uart'")
+    else:
+        raise ValueError("backend must be 'jtag-axi' or 'uart'")
+    return CurrentDeployedStreamerSession(
+        transport,
+        device_lease=InterprocessDeviceLease(),
+        deployed_target=target,
+        params=params,
+        clock_hz=clock_hz,
+    )
 
 
 def build_server_runtime(
@@ -168,7 +223,7 @@ def build_server_runtime(
     except BaseException:
         session.close()
         raise
-    bring_up_frozen_session(session, backend)
+    bring_up_frozen_session(session)
     try:
         rpc_server = serve_pulse_execution_service(
             service,

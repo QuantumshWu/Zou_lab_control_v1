@@ -4,15 +4,16 @@ The FPGA tick rate is configured in exactly one place --
 ``fpga/board_config/streamer_config.json`` (``clock_hz``), read by
 ``fpga.pulse_streamer.host.image.default_clock_hz`` and re-exposed through the
 dependency-free ``Zou_lab_control._clock`` seam.  Every default that once spelled
-``50_000_000.0`` as a bare literal -- the timing compilers, the runtime sequencer +
-AXI session, the session-facade fallback, the virtual sequencer, the pulse GUI --
+``50_000_000.0`` as a bare literal -- the timing compilers, the runtime sequencer,
+the server composition root, the virtual sequencer, and the pulse GUI --
 must now resolve to THAT value, or the compile clock and the AXI runtime clock can
 silently diverge the moment someone edits the config.
 
 These tests pin that single source:
   * the seam value == the config reader (no second definition);
-  * sequencer + axi_session expose ONE ``DEFAULT_RUNTIME_CLOCK_HZ`` object, both
-    equal to the config clock;
+  * the legacy sequencer default remains equal to the config clock;
+  * the compiled-only hardware session requires an explicit clock, while the
+    server composition root supplies the config clock when its argument is omitted;
   * every previously-hardcoded default (timing edges/verilog/from_sequence,
     session fallbacks, virtual sequencer ctor, pulse GUI) equals the config clock;
   * a repo-wide grep finds ``50_000_000`` only in the config-fallback constant in
@@ -32,11 +33,13 @@ if sys.path[0] != str(REPO_ROOT):
 from fpga.pulse_streamer.host.image import default_clock_hz
 from Zou_lab_control import _clock
 from Zou_lab_control.neutral_atom.devices import sequencer as sq
-from Zou_lab_control.neutral_atom.devices import axi_session as axi
 from Zou_lab_control.neutral_atom.devices import virtual as virt
 from Zou_lab_control.neutral_atom.timing import sequence as seq_mod
 from Zou_lab_control.neutral_atom.timing import verilog as verilog_mod
 from Zou_lab_control.neutral_atom.timing import pulse_table as pt_mod
+from zlc_pulse import load_pulse_target
+from zlc_pulse import server_app
+from zlc_pulse.transport import DeployedStreamerSession
 
 
 # --------------------------------------------------------------------------- the one authority
@@ -46,11 +49,47 @@ def test_clock_seam_equals_config_reader():
     assert _clock.DEFAULT_CLOCK_HZ == default_clock_hz()
 
 
-def test_sequencer_and_axi_share_one_runtime_clock_object():
-    """Both device modules expose the SAME constant object (axi imports it from
-    sequencer), so there is exactly one ``DEFAULT_RUNTIME_CLOCK_HZ`` in the package."""
+def test_legacy_sequencer_runtime_clock_uses_the_config_source():
     assert sq.DEFAULT_RUNTIME_CLOCK_HZ == default_clock_hz()
-    assert axi.DEFAULT_RUNTIME_CLOCK_HZ == sq.DEFAULT_RUNTIME_CLOCK_HZ
+
+
+def test_compiled_hardware_session_requires_an_explicit_clock():
+    """The transport owner may not invent a deployment clock behind the server's back."""
+    assert _default(DeployedStreamerSession.__init__, "clock_hz") is inspect.Parameter.empty
+
+
+def test_server_composition_defaults_to_image_clock(monkeypatch):
+    """Omitting ``clock_hz`` at the composition root resolves through image.default_clock_hz."""
+    configured_clock = 61_000_123.0
+    monkeypatch.setattr(server_app, "default_clock_hz", lambda: configured_clock)
+    params = server_app.default_params()
+    target = load_pulse_target(REPO_ROOT / "pulses" / "deployed_target.json")
+
+    class _Session:
+        def __init__(self):
+            self.clock_hz = configured_clock
+            self.params = params
+
+        def prepare(self, artifact):
+            pass
+
+        def fire(self, artifact):
+            pass
+
+        def wait_done(self, artifact, timeout=None):
+            return True
+
+        def safe_state(self):
+            pass
+
+        def request_interrupt(self):
+            pass
+
+        def snapshot(self):
+            return {}
+
+    service = server_app.build_service_for_session(target, _Session())
+    assert service._clock_hz == configured_clock
 
 
 def _default(callable_or_func, name: str):
@@ -68,8 +107,6 @@ def test_every_clock_default_resolves_to_the_config_clock():
     assert _default(pt_mod.PulseTableState.from_sequence, "clock_hz") == cfg
     # device layer
     assert _default(virt.VirtualSequencer.__init__, "clock_hz") == cfg
-    # the AXI session ctor default is the shared runtime constant
-    assert _default(axi.VivadoAxiStreamerSession.__init__, "clock_hz") == cfg
 
 
 def test_pulse_gui_hardware_clock_default_is_the_config_clock():

@@ -1,12 +1,10 @@
 """FPGA host helpers: board-XDC channel/trigger inference + program validation.
 
-The FINAL pulse streamer is driven over JTAG-to-AXI by
-``axi_session.VivadoAxiStreamerSession`` (which packs the BRAM image from
-``fpga.pulse_streamer.host.image`` and uploads it).  This module keeps only the
-host-side helpers shared by the server + GUI launcher: inferring channel names,
-labels, pins and the camera trigger from a board XDC, and validating a compiled
-``RuntimeSequenceProgram`` before upload.  (The old VIO/Vivado-Tcl HDL generator +
-session were removed with the rest of the legacy control path.)
+Current deployed hardware is owned by
+``zlc_pulse.transport.DeployedStreamerSession`` and accepts compiled artifacts
+only.  This transitional module retains the board-XDC inference and old
+``RuntimeSequenceProgram`` validation still consumed by unmigrated GUI code; it
+does not own a hardware session or an upload path.
 """
 
 from __future__ import annotations
@@ -1030,9 +1028,11 @@ __all__ = [
 
 
 def build_arg_parser() -> ArgumentParser:
-    """Infer-only CLI used by run_server.bat.  The final design has NO HDL/VIO
-    generator (the host drives the bitstream over JTAG-to-AXI via axi_session),
-    so the only CLI actions are reading channel/trigger info from a board XDC."""
+    """Infer-only CLI for reading channel/trigger information from a board XDC.
+
+    Pulse deployment is owned by :mod:`zlc_pulse.transport`; this neutral-atom
+    helper neither generates HDL nor owns a hardware session.
+    """
 
     parser = ArgumentParser(description="Infer FPGA channel/trigger info from a board XDC.")
     sub = parser.add_subparsers(dest="action", required=True)

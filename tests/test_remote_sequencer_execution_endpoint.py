@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
 from zlc_neutral_atom.runtime import (
     CleanupStepAck,
@@ -16,7 +17,10 @@ from zlc_neutral_atom.runtime import (
     SafeStateAck,
     SafetyOperation,
 )
-from zlc_neutral_atom.timing import FinitePulseExecutionRequest
+from zlc_neutral_atom.timing import (
+    FinitePulseExecutionRequest,
+    PreparePulseCommand,
+)
 from zlc_pulse import (
     PulseExecutionForm,
     PulseExecutionService,
@@ -67,6 +71,9 @@ class Backend:
         self.prepared = None
         self.safe = True
 
+    def request_interrupt(self):
+        pass
+
     def snapshot(self):
         return {"safe": self.safe}
 
@@ -94,9 +101,8 @@ class Root:
             )
         )
 
-    def current_safe_state(self):
-        self.service.safe_state()
-        return True
+    def current_interrupt_safe_state(self, generation):
+        return encode(self.service.safe_state_for_generation(generation))
 
 
 class Connection:
@@ -144,7 +150,11 @@ def test_remote_current_endpoint_runs_exact_artifact_and_closes_safe():
     )
     backend = Backend()
     service = PulseExecutionService(document.target, clock_hz=50e6, backend=backend)
-    client = RemotePulseExecutionClient(Connection(service), transport_timeout_seconds=10.0)
+    client = RemotePulseExecutionClient(
+        Connection(service),
+        Connection(service),
+        transport_timeout_seconds=10.0,
+    )
     endpoint = RemotePulseExecutionEndpoint(client, endpoint_label="test-fpga", max_blocking_call_seconds=5.0)
     broker = DeviceBroker()
     registry = LegacyDeviceRegistry(broker)
@@ -189,3 +199,98 @@ def test_remote_current_endpoint_runs_exact_artifact_and_closes_safe():
     assert terminal.completed_schedule_trigger_counts == (("ch11", 3),)
     assert terminal.artifact_digest == artifact.fingerprint
     assert backend.actions == ["prepare", "fire", "wait", "safe"]
+
+
+def test_interrupt_fences_a_provisional_remote_prepare_before_it_can_fire():
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    artifact = compile_pulse_artifact(
+        document,
+        clock_hz=50e6,
+        execution_form=PulseExecutionForm.STATIC_ONCE,
+        trigger_channels=("ch11",),
+    )
+
+    class BlockingBeforeServiceRoot(Root):
+        def __init__(self, service):
+            super().__init__(service)
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def current_prepare(self, payload):
+            self.entered.set()
+            assert self.release.wait(1.0)
+            return super().current_prepare(payload)
+
+    backend = Backend()
+    service = PulseExecutionService(document.target, clock_hz=50e6, backend=backend)
+    control_connection = Connection(service)
+    blocking_root = BlockingBeforeServiceRoot(service)
+    control_connection.root = blocking_root
+    client = RemotePulseExecutionClient(
+        control_connection,
+        Connection(service),
+        transport_timeout_seconds=10.0,
+    )
+    endpoint = RemotePulseExecutionEndpoint(
+        client,
+        endpoint_label="test-fpga",
+        max_blocking_call_seconds=5.0,
+    )
+    broker = DeviceBroker()
+    registry = LegacyDeviceRegistry(broker)
+    key = ResourceKey.parse("device/sequencer/remote-race")
+    registry.register(
+        LegacyDeviceRegistration(
+            client,
+            key,
+            lambda: DeviceIdentityAck(
+                "installation-endpoint:test-fpga-race",
+                DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
+                "remote-current-connection",
+                "test-assets-v1",
+            ),
+            {
+                SafetyOperation.SAFE_STATE: lambda: (
+                    client.safe_state(),
+                    CleanupStepAck(SafetyOperation.SAFE_STATE, "remote-safe-command"),
+                )[1]
+            },
+            (SafetyOperation.SAFE_STATE,),
+            lambda: SafeStateAck("test-qualified-remote-safe"),
+            target_endpoint=endpoint.target_endpoint,
+        )
+    )
+    port = bind_sequencer_port(
+        type("DeviceSet", (), {"devices": {"sequencer": client}})(),
+        registry,
+        SequencerBindingRequest(),
+    )
+    request = FinitePulseExecutionRequest(document, artifact)
+    command = PreparePulseCommand(
+        "race-session",
+        "race-run",
+        request,
+        port.capability.capability_fingerprint,
+        5.0,
+    )
+    errors = []
+
+    def prepare():
+        try:
+            endpoint.execute_command(port.device, command)
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=prepare)
+    worker.start()
+    assert blocking_root.entered.wait(1.0), errors
+    endpoint.interrupt()
+    blocking_root.release.set()
+    worker.join(1.0)
+
+    assert not worker.is_alive()
+    assert errors
+    assert "superseded by interrupt" in str(errors[0])
+    assert backend.actions == ["safe", "prepare", "safe"]
+    assert service.snapshot()["state"] == "SAFE"
+    assert endpoint._session is not None and endpoint._session.closed

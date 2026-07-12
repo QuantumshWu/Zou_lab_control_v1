@@ -1,201 +1,152 @@
-"""End-to-end guard: the UART session runs the REAL prepare/fire/wait_done protocol (inherited from
-the AXI session) over the serial link and writes the BYTE-IDENTICAL pack_program image.
+"""Regression tests for the real pyserial link boundary.
 
-Uses ``FakeUartTransport`` backed by the RTL-mirroring ``uart_bridge_model`` -- no serial port, no
-Vivado -- so the whole host path (image pack -> UART frames -> bridge model -> register map) is proven
-in pure Python.  The load-bearing invariant: every pack_program word lands in the model's regfile at
-the same value the AXI path would write, and the LOAD/FIRE STATUS handshakes complete.  Real 3 Mbaud
-baud-lock + FT2232 wiring are the rig steps (this cannot prove those).
+The deployed UART register transport is covered separately.  These tests stay at
+the byte-stream boundary where pyserial's timeout semantics and the frozen RTL
+decoder's inter-frame idle requirement matter.
 """
 
 from __future__ import annotations
-from Zou_lab_control.neutral_atom.ports import PortCatalog
 
-from pathlib import Path
-import sys
+from collections import deque
+import time
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if sys.path[0] != str(REPO_ROOT):
-    sys.path.insert(0, str(REPO_ROOT))
-
-from fpga.pulse_streamer.host import image as im
-from Zou_lab_control.neutral_atom.devices.uart_session import UartStreamerSession, FakeUartTransport
+from fpga.pulse_streamer.host import uart_frame as framing
+from fpga.pulse_streamer.host.uart_bridge_model import UartBridgeModel
+from zlc_pulse.transport import PySerialLink
 
 
-def _program():
-    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState, PulsePeriod
-    from Zou_lab_control.neutral_atom.devices.sequencer import compile_runtime_program_for_payload
-    chans = [f"ch{i:02d}" for i in range(62)]
-    st = PulseTableState(port_catalog=PortCatalog.from_channels(chans))
-    st.periods = [PulsePeriod(10.0, tuple(1 if i == 0 else 0 for i in range(62)), unit="us", name="MOT"),
-                  PulsePeriod(3.0, tuple(1 if i == 3 else 0 for i in range(62)), unit="ms", name="image")]
-    return compile_runtime_program_for_payload(st, channels=chans, clock_hz=50e6)
+class _ModelSerial:
+    """Small pyserial stand-in backed by the RTL-mirroring bridge model."""
+
+    def __init__(self) -> None:
+        self.timeout = 0.05
+        self.model = UartBridgeModel()
+        self.written = b""
+        self._rx = bytearray()
+
+    def reset_input_buffer(self) -> None:
+        self._rx.clear()
+
+    def write(self, data: bytes) -> None:
+        wire = bytes(data)
+        self.written += wire
+        self._rx.extend(
+            b"".join(
+                event.reply
+                for event in self.model.feed(wire)
+                if event.op == "write"
+            )
+        )
+
+    def flush(self) -> None:
+        pass
+
+    @property
+    def in_waiting(self) -> int:
+        return len(self._rx)
+
+    def read(self, size: int) -> bytes:
+        result = bytes(self._rx[:size])
+        del self._rx[:size]
+        return result
 
 
-def _session():
-    fake = FakeUartTransport()
-    sess = UartStreamerSession(state_dir=Path(_tmp()), params=im.default_params(), transport=fake,
-                               load_timeout=1.0, action_timeout=2.0)
-    sess.start()
-    return sess, fake
+def test_write_batch_pads_frame_boundaries_and_collects_every_ack() -> None:
+    """Back-to-back writes retain the idle bytes required by the RTL decoder."""
+
+    requests = [
+        bytes(framing.encode_write(40 + index, [0x100 + index], seq=index + 1))
+        for index in range(3)
+    ]
+    serial_port = _ModelSerial()
+    link = PySerialLink("COM_TEST")
+    link._serial = serial_port
+
+    replies = link.write_batch(requests, deadline=time.monotonic() + 1.0)
+
+    assert len(replies) == len(requests)
+    assert all(
+        framing.decode_reply(reply)[1] == framing.ST_OK for reply in replies
+    )
+    assert serial_port.written == (b"\xff" * 8).join(requests)
+    assert [serial_port.model.regfile[address] for address in range(40, 43)] == [
+        0x100,
+        0x101,
+        0x102,
+    ]
 
 
-_TMP = []
-def _tmp():
-    import tempfile
-    d = tempfile.mkdtemp(prefix="zlc_uart_")
-    _TMP.append(d)
-    return d
+class _IncrementalSerial:
+    """Expose one reply fragment at a time and emulate total-timeout reads."""
+
+    def __init__(self, fragments: list[bytes]) -> None:
+        self.timeout = 0.05
+        self._fragments = deque(bytearray(fragment) for fragment in fragments)
+        self.stalled = 0.0
+        self.max_read = 0
+
+    def reset_input_buffer(self) -> None:
+        pass
+
+    def write(self, _data: bytes) -> None:
+        pass
+
+    def flush(self) -> None:
+        pass
+
+    @property
+    def in_waiting(self) -> int:
+        return len(self._fragments[0]) if self._fragments else 0
+
+    def read(self, size: int) -> bytes:
+        self.max_read = max(self.max_read, int(size))
+        fragment = self._fragments[0]
+        count = min(int(size), len(fragment))
+        if count < int(size):
+            self.stalled += self.timeout
+        result = bytes(fragment[:count])
+        del fragment[:count]
+        if not fragment:
+            self._fragments.popleft()
+        return result
 
 
-def test_prepare_writes_the_byte_identical_pack_program_image_and_reaches_loaded():
-    """prepare() over UART commits EXACTLY the AXI pack_program image into the register map (byte-
-    identical transport swap), and the inherited LOAD handshake reaches STATUS.LOADED."""
-    prog = _program()
-    p = im.default_params()
-    image = im.pack_program(prog, p)
-    sess, fake = _session()
-    sess.prepare(prog)
-    # every image word landed at the same value the AXI path would write
-    for word, val in image.items():
-        assert fake.writes.get(word) == val, f"UART wrote word {word} != AXI image"
-    # the inherited CMD_LOAD poll saw STATUS.LOADED (else prepare would have raised)
-    assert fake.writes[im.CtrlWords.STATUS] & im.STATUS_LOADED
+def test_exchange_assembles_incremental_reply_without_oversized_reads() -> None:
+    """Only currently available bytes are read, avoiding pyserial timeout stalls."""
+
+    request = bytes(framing.encode_read(0, 1, seq=7))
+    reply = [
+        event.reply
+        for event in UartBridgeModel().feed(request)
+        if event.op == "read"
+    ][-1]
+    fragments = [bytes(reply[:1]), bytes(reply[1:6]), bytes(reply[6:])]
+    serial_port = _IncrementalSerial(fragments)
+    link = PySerialLink("COM_TEST")
+    link._serial = serial_port
+
+    received = link.exchange(request, deadline=time.monotonic() + 1.0)
+
+    assert received == bytes(reply)
+    assert serial_port.stalled == 0.0
+    assert serial_port.max_read <= max(map(len, fragments))
 
 
-def test_fire_sets_running_and_wait_done_returns():
-    prog = _program()
-    sess, fake = _session()
-    sess.fire(prog)                                   # prepare + fire
-    assert fake.writes[im.CtrlWords.COMMAND] == im.CMD_FIRE
-    assert fake.writes[im.CtrlWords.STATUS] & im.STATUS_RUNNING
-    # a repeat_forever program: wait_done returns once RUNNING is observed
-    assert sess.wait_done(timeout=1.0) is True
+def test_exchange_times_out_when_no_complete_reply_arrives() -> None:
+    """A truncated serial response is never accepted as a complete reply."""
 
+    request = bytes(framing.encode_read(0, 1, seq=9))
+    reply = [
+        event.reply
+        for event in UartBridgeModel().feed(request)
+        if event.op == "read"
+    ][-1]
+    link = PySerialLink("COM_TEST")
+    link._serial = _IncrementalSerial([bytes(reply[:-1])])
 
-def test_command_is_a_zero_then_cmd_frame_pair():
-    """A COMMAND over UART is composed as WRITE(COMMAND,0) then WRITE(COMMAND,cmd) -- the 0->cmd rising
-    edge the bridge/loader edge-detects, identical to the AXI path."""
-    sess, fake = _session()
-    sess._command(im.CMD_SAFE)
-    assert fake.writes[im.CtrlWords.COMMAND] == im.CMD_SAFE
-    assert fake.writes[im.CtrlWords.STATUS] == 0     # CMD_SAFE clears STATUS (simulated)
-
-
-def test_read_word_round_trips_status_and_layout():
-    sess, fake = _session()
-    fake.model.regfile[im.CtrlWords.STATUS] = im.STATUS_LOADED
-    assert sess._read_word(im.CtrlWords.STATUS) == im.STATUS_LOADED
-    assert sess._read_word(im.CtrlWords.LAYOUT_ID) == im.REGISTER_LAYOUT_ID
-
-
-def test_check_register_layout_accepts_matching_bitstream():
-    """The inherited layout guard reads LAYOUT_ID over UART and accepts the matching id (an old/wrong
-    bitstream would return 0 and be refused -- same handshake as AXI)."""
-    sess, fake = _session()
-    sess.check_register_layout()                      # must not raise (fake serves REGISTER_LAYOUT_ID)
-
-
-def test_link_self_test_writes_and_reads_scratch_then_cleans():
-    sess, fake = _session()
-    assert sess.link_self_test(count=8) is True
-    base = im.region_bases(im.default_params())["ctrl"] + im.default_params().ctrl_scratch_base
-    assert all(fake.writes.get(base + i, 0) == 0 for i in range(8)), "scratch left dirty after self-test"
-
-
-def test_writes_are_word_addressed_not_byte():
-    """The UART bridge is WORD-addressed (matches pack_program keys directly); a plain scan-point write
-    lands at the scan region's WORD base, not base*4 (the AXI byte-addr is transport-internal)."""
-    p = im.default_params()
-    sess, fake = _session()
-    scan_base = im.region_bases(p)["scan"]
-    sess._queue_word(scan_base, 0x1234)
-    sess._flush()
-    assert fake.writes.get(scan_base) == 0x1234 and fake.writes.get(scan_base * 4) is None
-
-
-def test_pyserial_write_batch_pads_boundaries_and_collects_all_acks():
-    """PERF: the program upload PIPELINES its write frames (write all back-to-back, collect all acks)
-    instead of a blocking ACK round-trip per frame.  write_batch must (a) pad each frame boundary with
-    idle 0xFF -- the bridge decoder cannot consume RX while it commits a multi-word frame (D_COMMIT
-    loops f_count cycles), so a zero-gap next frame loses its leading SYNC and never acks (verified on
-    real hardware: 26/41 acks without the gap, 47/47 with it) -- and (b) return one reply per frame."""
-    from Zou_lab_control.neutral_atom.devices.uart_session import PySerialTransport
-    from fpga.pulse_streamer.host.uart_bridge_model import UartBridgeModel
-    from fpga.pulse_streamer.host import uart_frame as uf
-    m = UartBridgeModel()
-    frames = [bytes(uf.encode_write(40 + i, [0x100 + i], seq=i + 1)) for i in range(3)]
-    acks = [e.reply for f in frames for e in m.feed(f) if e.op == "write"]
-
-    class FakeSerial:
-        def __init__(self): self.timeout = 0.05; self._rx = bytearray(); self.written = b""
-        def reset_input_buffer(self): pass
-        def write(self, d): self.written += bytes(d); self._rx += b"".join(acks)  # bridge acks each frame
-        def flush(self): pass
-        @property
-        def in_waiting(self): return len(self._rx)
-        def read(self, n): out = bytes(self._rx[:n]); del self._rx[:n]; return out
-
-    link = PySerialTransport("COM_TEST"); link._ser = FakeSerial()
-    replies = link.write_batch(frames, timeout=1.0)
-    assert len(replies) == 3 and all(uf.decode_reply(r)[1] == uf.ST_OK for r in replies)
-    assert b"\xff" * 8 in link._ser.written, "inter-frame idle gap missing (multi-word frames would drop)"
-    assert m.regfile[40] == 0x100 and m.regfile[41] == 0x101 and m.regfile[42] == 0x102
-
-
-def test_fire_does_not_reupload_the_already_prepared_program():
-    """PERF REGRESSION: fire(program) must NOT re-upload a program that was JUST prepared.
-    SequencerService.fire() passes the already-prepared program to the backend's fire callback; a
-    blind ``self.prepare(program)`` there re-sent the ENTIRE BRAM image a second time on every fire
-    (~250 ms of redundant UART transport for a 2000-point scan -- HALF of fire's cost, on JTAG too).
-    Firing the resident program must be prepare-free (like ManualSequencer.fire); a DIFFERENT program
-    still (re)prepares."""
-    prog = _program()
-    sess, fake = _session()
-    sess.prepare(prog)
-    calls = []
-    orig = sess.prepare
-    sess.prepare = lambda p: (calls.append(getattr(p, "sequence_id", None)), orig(p))[1]  # spy
-    sess.fire(prog)                                    # fire the SAME prepared program (what the service does)
-    assert calls == [], "fire() re-uploaded the already-prepared program (double-upload bug)"
-    assert fake.writes.get(im.CtrlWords.COMMAND) == im.CMD_FIRE   # but it DID fire
-
-
-def test_pyserial_exchange_reads_incrementally_never_a_fixed_oversized_read():
-    """PERF REGRESSION: PySerialTransport.exchange must read only what is AVAILABLE (in_waiting),
-    NEVER a fixed large count.  pyserial's read(n) on a total-timeout port blocks the WHOLE timeout
-    whenever fewer than n bytes arrive, and a reply is only 9-13 bytes -- so the old `read(64)` stalled
-    the full ~50 ms on EVERY transaction (~30 round-trips per pulse apply => ~1.5 s, SLOWER than JTAG).
-    A FakeSerial mimicking that timeout semantics proves the fix incurs ZERO such stall."""
-    from Zou_lab_control.neutral_atom.devices.uart_session import PySerialTransport
-    from fpga.pulse_streamer.host.uart_bridge_model import UartBridgeModel
-    from fpga.pulse_streamer.host import uart_frame as uf
-
-    req = bytes(uf.encode_read(im.CtrlWords.LAYOUT_ID, 1, seq=1))
-    reply = [e.reply for e in UartBridgeModel().feed(req) if e.op == "read"][-1]
-
-    class FakeSerial:
-        def __init__(self, reply):
-            self.timeout = 0.05; self._buf = b""; self._reply = bytes(reply)
-            self.stalled = 0.0; self.max_read = 0
-        def reset_input_buffer(self): pass
-        def write(self, data): self._buf = self._reply     # the bridge's reply is now buffered to read
-        def flush(self): pass
-        @property
-        def in_waiting(self): return len(self._buf)
-        def read(self, size):
-            self.max_read = max(self.max_read, int(size))
-            n = min(int(size), len(self._buf))
-            if n < int(size):                              # pyserial: waits the FULL timeout for the rest
-                self.stalled += self.timeout
-            out, self._buf = self._buf[:n], self._buf[n:]
-            return out
-
-    link = PySerialTransport("COM_TEST")
-    link._ser = FakeSerial(reply)
-    got = link.exchange(req, timeout=1.0)
-    assert got == bytes(reply)
-    assert link._ser.stalled == 0.0, "exchange stalled on a fixed oversized read (the read(64) 50 ms bug)"
-    assert link._ser.max_read <= len(reply), "exchange must not request more bytes than a reply can hold"
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="0/1"):
+        link.exchange(request, deadline=time.monotonic() + 0.01)
+    assert time.monotonic() - started < 0.04

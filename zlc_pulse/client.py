@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import threading
 from dataclasses import dataclass
 
 from zlc_storage import decode
@@ -81,7 +82,13 @@ def pulse_server_snapshot_from_tree(tree: object) -> PulseServerSnapshot:
 class RemotePulseExecutionClient:
     """One non-reconnecting control owner for one server connection generation."""
 
-    def __init__(self, connection: object, *, transport_timeout_seconds: float = 120.0) -> None:
+    def __init__(
+        self,
+        connection: object,
+        interrupt_connection: object,
+        *,
+        transport_timeout_seconds: float = 120.0,
+    ) -> None:
         timeout = float(transport_timeout_seconds)
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("transport_timeout_seconds must be finite and positive")
@@ -93,13 +100,26 @@ class RemotePulseExecutionClient:
             "current_prepare",
             "current_fire",
             "current_complete",
-            "current_safe_state",
         ):
             if not callable(getattr(root, method, None)):
                 raise TypeError(f"pulse server connection is missing {method}()")
+        if interrupt_connection is connection:
+            raise ValueError(
+                "pulse control and interrupt paths require distinct connections"
+            )
+        interrupt_root = getattr(interrupt_connection, "root", None)
+        if interrupt_root is None or not callable(
+            getattr(interrupt_root, "current_interrupt_safe_state", None)
+        ):
+            raise TypeError(
+                "pulse interrupt connection is missing current_interrupt_safe_state()"
+            )
         self._connection = connection
+        self._interrupt_connection = interrupt_connection
         self._root = root
+        self._interrupt_root = interrupt_root
         self._transport_timeout = timeout
+        self._close_lock = threading.Lock()
         self._closed = False
         snapshot = self.snapshot()
         self._generation = snapshot.connection_generation
@@ -122,10 +142,22 @@ class RemotePulseExecutionClient:
             int(port),
             config={"allow_public_attrs": True, "sync_request_timeout": timeout},
         )
+        interrupt_connection = None
         try:
-            return cls(connection, transport_timeout_seconds=timeout)
+            interrupt_connection = rpyc.connect(
+                host,
+                int(port),
+                config={"allow_public_attrs": True, "sync_request_timeout": timeout},
+            )
+            return cls(
+                connection,
+                interrupt_connection,
+                transport_timeout_seconds=timeout,
+            )
         except BaseException:
             connection.close()
+            if interrupt_connection is not None:
+                interrupt_connection.close()
             raise
 
     @property
@@ -189,23 +221,41 @@ class RemotePulseExecutionClient:
 
     def safe_state(self) -> PulseServerSnapshot:
         self._require_open()
-        if self._root.current_safe_state() is not True:
-            raise RuntimeError("pulse server did not acknowledge safe_state")
-        snapshot = self.snapshot()
+        snapshot = pulse_server_snapshot_from_tree(
+            decode(
+                bytes(
+                    self._interrupt_root.current_interrupt_safe_state(
+                        self._generation
+                    )
+                )
+            )
+        )
+        if snapshot.connection_generation != self._generation:
+            raise RuntimeError("interrupt safe_state returned another connection generation")
         if snapshot.state != "SAFE" or snapshot.prepared_ref is not None:
             raise RuntimeError("pulse server acknowledged safe_state without publishing SAFE")
         return snapshot
 
     def close(self) -> None:
-        if self._closed:
-            return
-        try:
-            self.safe_state()
-        finally:
-            self._closed = True
-            close = getattr(self._connection, "close", None)
-            if callable(close):
-                close()
+        with self._close_lock:
+            if self._closed:
+                return
+            try:
+                self.safe_state()
+            finally:
+                self._closed = True
+                close = getattr(self._connection, "close", None)
+                try:
+                    if callable(close):
+                        close()
+                finally:
+                    close_interrupt = getattr(
+                        self._interrupt_connection,
+                        "close",
+                        None,
+                    )
+                    if callable(close_interrupt):
+                        close_interrupt()
 
     def _validate_reference(self, reference: PreparedPulseRef) -> None:
         self._require_open()

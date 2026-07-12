@@ -17,22 +17,36 @@ from fpga.pulse_streamer.host.image import (
     StreamerParams,
     build_fingerprint,
 )
+from fpga.pulse_streamer.host import uart_frame
+from fpga.pulse_streamer.host.uart_bridge_model import UartBridgeModel
 from zlc_pulse import (
-    PORT_DIGITAL,
-    PulsePortSpec,
-    PulseTarget,
     PulseExecutionForm,
     PulseExecutionService,
-    PulseStreamerSessionBackend,
     pack_target_ir,
     compile_pulse_artifact,
     load_pulse_document,
 )
-from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-from Zou_lab_control.neutral_atom.devices.uart_session import FakeUartTransport, UartStreamerSession
+from zlc_pulse.transport import (
+    DeployedStreamerSession,
+    UartRegisterTransport,
+    VivadoAxiRegisterTransport,
+)
 
 
 ROOT = Path(__file__).parents[1]
+
+
+class MemoryDeviceLease:
+    def __init__(self):
+        self.acquired = False
+
+    def acquire(self):
+        if self.acquired:
+            raise RuntimeError("test device lease is already held")
+        self.acquired = True
+
+    def release(self):
+        self.acquired = False
 
 
 def _decode_axi_writes(text: str) -> list[tuple[int, int]]:
@@ -86,6 +100,72 @@ class CurrentStreamerHardware:
         return "ok\n"
 
 
+class ModelUartLink:
+    """Test-only UART link backed by the cycle-faithful register model."""
+
+    def __init__(self, layout_id):
+        self.model = UartBridgeModel(layout_id=layout_id)
+        self.writes = self.model.regfile
+
+    def open(self):
+        pass
+
+    def close(self):
+        pass
+
+    def exchange(self, request, *, deadline, stop=None):
+        events = [
+            event
+            for event in self.model.feed(request)
+            if event.op in {"write", "read"}
+        ]
+        if not events:
+            raise RuntimeError("UART model received a corrupt frame")
+        for event in events:
+            if (
+                event.op == "write"
+                and event.base == CtrlWords.COMMAND
+                and event.values
+            ):
+                command = event.values[-1] & 0xF
+                if command == CMD_LOAD:
+                    self.model.regfile[CtrlWords.STATUS] = STATUS_LOADED
+                elif command == CMD_FIRE:
+                    self.model.regfile[CtrlWords.STATUS] = STATUS_RUNNING
+                elif command == CMD_SAFE:
+                    self.model.regfile[CtrlWords.STATUS] = 0
+        return events[-1].reply
+
+    def write_batch(self, requests, *, deadline, stop=None):
+        return [
+            self.exchange(request, deadline=deadline, stop=stop)
+            for request in requests
+        ]
+
+
+def _axi_session(tmp_path, target, params, hardware, *, clock_hz=50e6):
+    return DeployedStreamerSession(
+        VivadoAxiRegisterTransport(
+            state_dir=tmp_path,
+            tcl_executor=hardware,
+        ),
+        device_lease=MemoryDeviceLease(),
+        deployed_target=target,
+        params=params,
+        clock_hz=clock_hz,
+    ).start()
+
+
+def _uart_session(tmp_path, target, params, link):
+    return DeployedStreamerSession(
+        UartRegisterTransport(state_dir=tmp_path, link=link),
+        device_lease=MemoryDeviceLease(),
+        deployed_target=target,
+        params=params,
+        clock_hz=50e6,
+    ).start()
+
+
 def _artifact(params: StreamerParams):
     document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     return document, compile_pulse_artifact(
@@ -101,18 +181,11 @@ def test_current_artifact_bytes_drive_the_existing_axi_transport_exactly(tmp_pat
     params = StreamerParams()
     document, artifact = _artifact(params)
     hardware = CurrentStreamerHardware(params)
-    session = VivadoAxiStreamerSession(
-        state_dir=tmp_path,
-        params=params,
-        deployed_target=document.target,
-        tcl_executor=hardware,
-    )
+    session = _axi_session(tmp_path, document.target, params, hardware)
     service = PulseExecutionService(
         document.target,
         clock_hz=50e6,
-        backend=PulseStreamerSessionBackend(
-            session, document.target, params, 50e6
-        ),
+        backend=session,
         params=params,
     )
 
@@ -133,35 +206,28 @@ def test_current_session_rejects_clock_mismatch_before_hardware_access(tmp_path)
     params = StreamerParams()
     document, artifact = _artifact(params)
     hardware = CurrentStreamerHardware(params)
-    session = VivadoAxiStreamerSession(
-        state_dir=tmp_path,
-        params=params,
+    session = _axi_session(
+        tmp_path,
+        document.target,
+        params,
+        hardware,
         clock_hz=40e6,
-        deployed_target=document.target,
-        tcl_executor=hardware,
     )
 
     with pytest.raises(ValueError, match="clock"):
-        session.prepare_compiled_artifact(artifact)
+        session.prepare(artifact)
     assert hardware.words == {}
 
 
 def test_current_artifact_uses_the_same_contract_over_uart(tmp_path):
     params = StreamerParams()
     document, artifact = _artifact(params)
-    transport = FakeUartTransport(layout_id=build_fingerprint(params))
-    session = UartStreamerSession(
-        state_dir=tmp_path,
-        params=params,
-        deployed_target=document.target,
-        transport=transport,
-    )
+    transport = ModelUartLink(build_fingerprint(params))
+    session = _uart_session(tmp_path, document.target, params, transport)
     service = PulseExecutionService(
         document.target,
         clock_hz=50e6,
-        backend=PulseStreamerSessionBackend(
-            session, document.target, params, 50e6
-        ),
+        backend=session,
         params=params,
     )
 
@@ -195,63 +261,40 @@ def test_axi_rejects_self_attested_wrong_topology_before_any_write(tmp_path):
     params = StreamerParams()
     document, artifact = _self_attested_wrong_topology_artifact(params)
     hardware = CurrentStreamerHardware(params)
-    session = VivadoAxiStreamerSession(
-        state_dir=tmp_path,
-        params=params,
-        deployed_target=document.target,
-        tcl_executor=hardware,
-    )
+    session = _axi_session(tmp_path, document.target, params, hardware)
 
     with pytest.raises(ValueError, match="non-digital"):
-        session.prepare_compiled_artifact(artifact)
+        session.prepare(artifact)
     assert hardware.words == {}
 
 
 def test_uart_rejects_self_attested_wrong_topology_before_any_write(tmp_path):
     params = StreamerParams()
     document, artifact = _self_attested_wrong_topology_artifact(params)
-    transport = FakeUartTransport(layout_id=build_fingerprint(params))
-    session = UartStreamerSession(
-        state_dir=tmp_path,
-        params=params,
-        deployed_target=document.target,
-        transport=transport,
-    )
+    transport = ModelUartLink(build_fingerprint(params))
+    session = _uart_session(tmp_path, document.target, params, transport)
 
     with pytest.raises(ValueError, match="non-digital"):
-        session.prepare_compiled_artifact(artifact)
+        session.prepare(artifact)
     assert transport.writes == {}
 
 
-def test_raw_legacy_prepare_rejects_current_target_ir_before_any_write(tmp_path):
+def test_session_has_only_the_current_service_backend_vocabulary(tmp_path):
     params = StreamerParams()
     document, artifact = _artifact(params)
     hardware = CurrentStreamerHardware(params)
-    session = VivadoAxiStreamerSession(
-        state_dir=tmp_path,
-        params=params,
-        deployed_target=document.target,
-        tcl_executor=hardware,
-    )
+    session = _axi_session(tmp_path, document.target, params, hardware)
 
-    with pytest.raises(RuntimeError, match="prepare_compiled_artifact"):
-        session.prepare(artifact.target_ir)
-    assert hardware.words == {}
-
-
-def test_deployment_bound_session_rejects_every_raw_legacy_program(tmp_path):
-    params = StreamerParams()
-    document, _artifact_value = _artifact(params)
-    hardware = CurrentStreamerHardware(params)
-    session = VivadoAxiStreamerSession(
-        state_dir=tmp_path,
-        params=params,
-        deployed_target=document.target,
-        tcl_executor=hardware,
-    )
-
-    with pytest.raises(RuntimeError, match="only prepare_compiled_artifact"):
-        session.prepare(object())
+    assert all(callable(getattr(session, name)) for name in (
+        "prepare",
+        "fire",
+        "wait_done",
+        "safe_state",
+        "request_interrupt",
+        "snapshot",
+    ))
+    assert not hasattr(session, "prepare_compiled_artifact")
+    assert not hasattr(session, "scan_progress")
     assert hardware.words == {}
 
 
@@ -262,143 +305,15 @@ def test_fire_and_wait_are_constant_time_identity_checks_after_prepare(
     params = StreamerParams()
     document, artifact = _artifact(params)
     hardware = CurrentStreamerHardware(params)
-    session = VivadoAxiStreamerSession(
-        state_dir=tmp_path,
-        params=params,
-        deployed_target=document.target,
-        tcl_executor=hardware,
-    )
-    session.prepare_compiled_artifact(artifact)
+    session = _axi_session(tmp_path, document.target, params, hardware)
+    session.prepare(artifact)
 
     def forbidden_revalidation(*args, **kwargs):
         raise AssertionError("FIRE/wait must not repack after prepare")
 
     monkeypatch.setattr(
-        "Zou_lab_control.neutral_atom.devices.axi_session.validate_artifact_for_deployment",
+        "zlc_pulse.transport.session.validate_artifact_for_deployment",
         forbidden_revalidation,
     )
-    session.fire_compiled_artifact(artifact)
-    assert session.wait_done_compiled_artifact(artifact, timeout=1.0)
-
-
-def test_public_backend_rejects_a_permissive_wrong_deployment_session():
-    params = StreamerParams()
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
-    wrong_target = PulseTarget(
-        document.target.raw_lanes,
-        tuple(
-            PulsePortSpec(
-                lane,
-                PORT_DIGITAL,
-                (lane,),
-                lane,
-                None,
-                1,
-                "binary",
-                0,
-                None,
-            )
-            for lane in document.target.raw_lanes
-        ),
-    )
-    wrong_document = replace(document, target=wrong_target)
-    artifact = compile_pulse_artifact(
-        wrong_document,
-        clock_hz=50e6,
-        execution_form=PulseExecutionForm.STATIC_ONCE,
-        trigger_channels=("ch11",),
-        params=params,
-    )
-
-    class PermissiveSession:
-        def __init__(self):
-            self.prepared = []
-
-        def prepare_compiled_artifact(self, value):
-            self.prepared.append(value)
-
-        def fire_compiled_artifact(self, value):
-            pass
-
-        def wait_done_compiled_artifact(self, value, timeout=None):
-            return True
-
-        def safe_state(self):
-            pass
-
-        def current_snapshot(self):
-            return {}
-
-    session = PermissiveSession()
-    service = PulseExecutionService(
-        wrong_target,
-        clock_hz=50e6,
-        backend=PulseStreamerSessionBackend(
-            session,
-            wrong_target,
-            params,
-            50e6,
-        ),
-        params=params,
-    )
-
-    with pytest.raises(ValueError, match="digital-port count"):
-        service.prepare(artifact)
-    assert session.prepared == []
-
-
-def test_public_backend_cannot_swap_artifacts_after_successful_prepare():
-    params = StreamerParams()
-    document, artifact = _artifact(params)
-
-    class PermissiveSession:
-        def __init__(self):
-            self.events = []
-
-        def prepare_compiled_artifact(self, value):
-            self.events.append(("prepare", value))
-
-        def fire_compiled_artifact(self, value):
-            self.events.append(("fire", value))
-
-        def wait_done_compiled_artifact(self, value, timeout=None):
-            self.events.append(("wait", value))
-            return True
-
-        def safe_state(self):
-            self.events.append(("safe", None))
-
-        def current_snapshot(self):
-            return {}
-
-    session = PermissiveSession()
-    backend = PulseStreamerSessionBackend(
-        session,
-        document.target,
-        params,
-        50e6,
-    )
-    backend.prepare(artifact)
-    equal_but_unprepared = replace(artifact)
-
-    with pytest.raises(RuntimeError, match="exact immutable artifact"):
-        backend.fire(equal_but_unprepared)
-    with pytest.raises(RuntimeError, match="exact immutable prepared artifact"):
-        backend.wait_done(equal_but_unprepared, 1.0)
-    assert [event for event, _value in session.events] == ["prepare"]
-
-
-def test_safe_state_never_claims_a_live_refill_owner_terminated():
-    class LiveThread:
-        @staticmethod
-        def is_alive():
-            return True
-
-    session = VivadoAxiStreamerSession.__new__(VivadoAxiStreamerSession)
-    session._stream_stop = None
-    session._stream_thread = LiveThread()
-    session._command = lambda command: True
-    session._stop_stream_thread = lambda: None
-
-    with pytest.raises(RuntimeError, match="did not terminate"):
-        session.safe_state()
+    session.fire(artifact)
+    assert session.wait_done(artifact, timeout=1.0)

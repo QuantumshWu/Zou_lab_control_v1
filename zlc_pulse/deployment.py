@@ -92,6 +92,7 @@ def validate_artifact_for_deployment(
     validate_deployed_target(target, params)
     if artifact.target_ir.clock_hz != float(clock_hz):
         raise ValueError("compiled artifact clock differs from deployed hardware clock")
+    validate_resident_scan_capacity(artifact, params)
     validate_target_ir_for_target(artifact.target_ir, target)
     expected = pack_target_ir(artifact.target_ir, params)
     if artifact.wire_image != expected:
@@ -100,9 +101,25 @@ def validate_artifact_for_deployment(
         )
 
 
+def validate_resident_scan_capacity(
+    artifact: CompiledPulseArtifact,
+    params: StreamerParams,
+) -> None:
+    """Reject scans whose timing would depend on unqualified host refill."""
+
+    total_points = len(artifact.target_ir.scan_points)
+    resident_capacity = 2 * params.bank_size
+    if total_points > resident_capacity:
+        raise ValueError(
+            "formal autonomous scan exceeds the frozen bitstream's fully resident "
+            f"capacity: {total_points} points > {resident_capacity}"
+        )
+
+
 __all__ = [
     "APPROVED_DEPLOYED_TARGET_ABI",
     "require_approved_target_abi",
     "validate_artifact_for_deployment",
     "validate_deployed_target",
+    "validate_resident_scan_capacity",
 ]

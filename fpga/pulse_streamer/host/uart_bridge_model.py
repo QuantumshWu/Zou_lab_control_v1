@@ -10,8 +10,8 @@ opcode, CRC fail, truncation) it resynchronises by advancing one byte and re-hun
 Two uses:
   * the equivalence oracle -- feed the host's encoded byte stream, get the committed ``{word:value}``
     map, compare to ``image.pack_program`` (proves the UART path is a byte-identical transport swap);
-  * the backing store of ``FakeUartTransport`` in tests -- apply writes into a register file and
-    serve READ replies, so ``UartStreamerSession`` runs end-to-end with no serial port (virtual==real).
+  * a test-only backing store for the current UART register transport -- apply
+    writes into a register file and serve READ replies without a serial port.
 
 Mirrors the role of ``engine_model.py`` for the engine: one Python truth the RTL is checked against.
 """

@@ -68,6 +68,7 @@ class _EndpointSession:
     session_id: str
     artifact_digest: str
     request: object
+    operation_epoch: int
     prepared: bool = False
     fired: bool = False
     completed: bool = False
@@ -100,6 +101,7 @@ class VirtualSequencerExecutionEndpoint:
         self._capability_fingerprint: str | None = None
         self._session: _EndpointSession | None = None
         self._last_prepare_session_id: str | None = None
+        self._operation_epoch = 0
 
     @property
     def target_endpoint(self) -> TargetDeviceEndpoint:
@@ -175,19 +177,46 @@ class VirtualSequencerExecutionEndpoint:
                 raise ValueError("compiled pulse clock differs from live sequencer")
             if artifact.wire_image.geometry_fingerprint != self._geometry:
                 raise ValueError("compiled wire geometry differs from live sequencer")
-        playback = build_pulse_playback(artifact, name=command.request.document.name)
-        prepared_program = self._sequencer.prepare_compiled_playback(artifact, playback)
-        if prepared_program is not artifact.target_ir:
-            self._sequencer.set_safe_state()
-            raise RuntimeError("virtual adapter did not retain the exact compiled TargetIR")
-        with self._lock:
-            self._validate_binding(binding)
-            self._session = _EndpointSession(
+            self._operation_epoch += 1
+            operation_epoch = self._operation_epoch
+            provisional = _EndpointSession(
                 command.session_id,
                 command.request.artifact_digest,
                 command.request,
-                prepared=True,
+                operation_epoch,
             )
+            self._session = provisional
+        try:
+            playback = build_pulse_playback(
+                artifact,
+                name=command.request.document.name,
+            )
+            prepared_program = self._sequencer.prepare_compiled_playback(
+                artifact,
+                playback,
+            )
+            if prepared_program is not artifact.target_ir:
+                raise RuntimeError(
+                    "virtual adapter did not retain the exact compiled TargetIR"
+                )
+        except BaseException:
+            self._sequencer.set_safe_state()
+            with self._lock:
+                provisional.closed = True
+            raise
+        with self._lock:
+            self._validate_binding(binding)
+            superseded = (
+                operation_epoch != self._operation_epoch
+                or self._session is not provisional
+                or provisional.closed
+            )
+            if not superseded:
+                provisional.prepared = True
+        if superseded:
+            self._sequencer.set_safe_state()
+            raise RuntimeError("virtual pulse prepare was superseded by interrupt")
+        with self._lock:
             return PulsePreparedAck(
                 command.session_id,
                 binding.binding_id,
@@ -203,10 +232,20 @@ class VirtualSequencerExecutionEndpoint:
                 raise RuntimeError("sequencer session is not ready for FIRE")
             if command.artifact_digest != session.artifact_digest:
                 raise ValueError("FIRE artifact digest differs from prepared session")
+            operation_epoch = session.operation_epoch
         self._sequencer.fire_compiled_playback(command.artifact_digest)
         with self._lock:
-            session = self._active_session(binding, command.session_id)
-            session.fired = True
+            superseded = (
+                operation_epoch != self._operation_epoch
+                or self._session is not session
+                or session.closed
+            )
+            if not superseded:
+                session.fired = True
+        if superseded:
+            self._sequencer.set_safe_state()
+            raise RuntimeError("virtual pulse FIRE was superseded by interrupt")
+        with self._lock:
             return PulseFiredAck(
                 command.session_id,
                 binding.binding_id,
@@ -226,6 +265,7 @@ class VirtualSequencerExecutionEndpoint:
             if command.artifact_digest != session.artifact_digest:
                 raise ValueError("completion artifact digest differs")
             artifact = session.request.artifact
+            operation_epoch = session.operation_epoch
         if not self._sequencer.wait_compiled_playback(
             command.artifact_digest,
             command.timeout_seconds,
@@ -243,8 +283,17 @@ class VirtualSequencerExecutionEndpoint:
             for schedule in artifact.trigger_schedules
         )
         with self._lock:
-            session = self._active_session(binding, command.session_id)
-            session.completed = True
+            superseded = (
+                operation_epoch != self._operation_epoch
+                or self._session is not session
+                or session.closed
+            )
+            if not superseded:
+                session.completed = True
+        if superseded:
+            self._sequencer.set_safe_state()
+            raise RuntimeError("virtual pulse completion was superseded by interrupt")
+        with self._lock:
             return PulseTerminalAck(
                 command.session_id,
                 binding.binding_id,
@@ -268,10 +317,11 @@ class VirtualSequencerExecutionEndpoint:
                     raise RuntimeError("sequencer cleanup session id is unknown")
             elif session.session_id != command.session_id:
                 raise RuntimeError("sequencer cleanup belongs to another session")
+            self._operation_epoch += 1
+            if session is not None:
+                session.closed = True
         self._sequencer.set_safe_state()
         with self._lock:
-            if self._session is not None:
-                self._session.closed = True
             snapshot = dict(self._sequencer.snapshot())
             safe = snapshot.get("state") == "safe"
             return SessionClosedAck(
@@ -290,10 +340,11 @@ class VirtualSequencerExecutionEndpoint:
             )
 
     def interrupt(self) -> str:
-        self._sequencer.set_safe_state()
         with self._lock:
+            self._operation_epoch += 1
             if self._session is not None:
                 self._session.closed = True
+        self._sequencer.set_safe_state()
         return canonical_digest({"operation": "SAFE_STATE", "state": "safe"})
 
     def _validate_binding(self, binding: BoundDevice) -> None:
@@ -349,6 +400,7 @@ class RemotePulseExecutionEndpoint:
         self._capability_fingerprint: str | None = None
         self._session: _EndpointSession | None = None
         self._last_prepare_session_id: str | None = None
+        self._operation_epoch = 0
 
     @property
     def target_endpoint(self) -> TargetDeviceEndpoint:
@@ -427,16 +479,36 @@ class RemotePulseExecutionEndpoint:
                 raise ValueError("compiled pulse clock differs from remote sequencer")
             if artifact.wire_image.geometry_fingerprint != self._geometry:
                 raise ValueError("compiled wire geometry differs from remote sequencer")
-        reference = self._client.prepare(artifact)
-        with self._lock:
-            self._validate_binding(binding)
-            self._session = _EndpointSession(
+            self._operation_epoch += 1
+            operation_epoch = self._operation_epoch
+            provisional = _EndpointSession(
                 command.session_id,
                 command.request.artifact_digest,
                 command.request,
-                prepared=True,
-                prepared_ref=reference,
+                operation_epoch,
             )
+            self._session = provisional
+        try:
+            reference = self._client.prepare(artifact)
+        except BaseException:
+            self._client.safe_state()
+            with self._lock:
+                provisional.closed = True
+            raise
+        with self._lock:
+            self._validate_binding(binding)
+            superseded = (
+                operation_epoch != self._operation_epoch
+                or self._session is not provisional
+                or provisional.closed
+            )
+            if not superseded:
+                provisional.prepared = True
+                provisional.prepared_ref = reference
+        if superseded:
+            self._client.safe_state()
+            raise RuntimeError("remote pulse prepare was superseded by interrupt")
+        with self._lock:
             return PulsePreparedAck(
                 command.session_id,
                 binding.binding_id,
@@ -453,10 +525,20 @@ class RemotePulseExecutionEndpoint:
             if command.artifact_digest != session.artifact_digest:
                 raise ValueError("FIRE artifact digest differs from prepared session")
             reference = session.prepared_ref
+            operation_epoch = session.operation_epoch
         self._client.fire(reference)
         with self._lock:
-            session = self._active_session(binding, command.session_id)
-            session.fired = True
+            superseded = (
+                operation_epoch != self._operation_epoch
+                or self._session is not session
+                or session.closed
+            )
+            if not superseded:
+                session.fired = True
+        if superseded:
+            self._client.safe_state()
+            raise RuntimeError("remote pulse FIRE was superseded by interrupt")
+        with self._lock:
             return PulseFiredAck(
                 command.session_id,
                 binding.binding_id,
@@ -475,6 +557,7 @@ class RemotePulseExecutionEndpoint:
                 raise ValueError("completion timeout exceeds sequencer capability")
             reference = session.prepared_ref
             artifact = session.request.artifact
+            operation_epoch = session.operation_epoch
         completion = self._client.complete(reference, timeout=command.timeout_seconds)
         if not completion.logical_done:
             raise TimeoutError("remote sequencer did not reach logical terminal")
@@ -482,8 +565,17 @@ class RemotePulseExecutionEndpoint:
             artifact.max_configured_output_delay_ticks / artifact.target_ir.clock_hz
         )
         with self._lock:
-            session = self._active_session(binding, command.session_id)
-            session.completed = True
+            superseded = (
+                operation_epoch != self._operation_epoch
+                or self._session is not session
+                or session.closed
+            )
+            if not superseded:
+                session.completed = True
+        if superseded:
+            self._client.safe_state()
+            raise RuntimeError("remote pulse completion was superseded by interrupt")
+        with self._lock:
             return PulseTerminalAck(
                 command.session_id,
                 binding.binding_id,
@@ -503,10 +595,11 @@ class RemotePulseExecutionEndpoint:
                     raise RuntimeError("sequencer cleanup session id is unknown")
             elif session.session_id != command.session_id:
                 raise RuntimeError("sequencer cleanup belongs to another session")
+            self._operation_epoch += 1
+            if session is not None:
+                session.closed = True
         snapshot = self._client.safe_state()
         with self._lock:
-            if self._session is not None:
-                self._session.closed = True
             digest = canonical_digest(
                 {
                     "session_id": command.session_id,
@@ -526,10 +619,11 @@ class RemotePulseExecutionEndpoint:
             )
 
     def interrupt(self) -> str:
-        snapshot = self._client.safe_state()
         with self._lock:
+            self._operation_epoch += 1
             if self._session is not None:
                 self._session.closed = True
+        snapshot = self._client.safe_state()
         return canonical_digest(
             {
                 "operation": "SAFE_STATE",

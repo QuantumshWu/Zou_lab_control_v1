@@ -40,9 +40,10 @@ def _task(**kw):
     return na.TaskSpec(**base)
 
 
-def test_catalog_specs_have_no_kw_only_so_the_server_runs_on_old_python():
-    """The FPGA sequencer SERVER (``python -m ...devices.sequencer_server``) imports the whole
-    ``neutral_atom`` package, which pulls in these catalog specs.  ``@dataclass(kw_only=True)`` needs
+def test_catalog_specs_have_no_kw_only_for_lab_python():
+    """Lab-side deployments import the whole ``neutral_atom`` package, including catalog specs.
+
+    ``@dataclass(kw_only=True)`` needs
     Python >= 3.10 -- on the lab server's older Python the import CRASHED with 'dataclass() got an
     unexpected keyword argument kw_only'.  Required fields now default to the ``REQUIRED`` sentinel and
     are enforced in ``__post_init__`` instead, so NO catalog spec may use ``kw_only`` again."""

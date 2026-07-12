@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
+import time
 
 import pytest
 
@@ -43,6 +45,9 @@ class Backend:
         self.prepared = None
         self.safe = True
 
+    def request_interrupt(self):
+        pass
+
     def snapshot(self):
         return {"safe": self.safe}
 
@@ -71,9 +76,8 @@ class Root:
             )
         )
 
-    def current_safe_state(self):
-        self.service.safe_state()
-        return True
+    def current_interrupt_safe_state(self, generation):
+        return encode(self.service.safe_state_for_generation(generation))
 
 
 class Connection:
@@ -101,7 +105,12 @@ def _fixture():
 
 def test_remote_client_runs_one_current_generation_without_legacy_payloads():
     artifact, _service, connection = _fixture()
-    client = RemotePulseExecutionClient(connection, transport_timeout_seconds=10.0)
+    interrupt_connection = Connection(_service)
+    client = RemotePulseExecutionClient(
+        connection,
+        interrupt_connection,
+        transport_timeout_seconds=10.0,
+    )
 
     reference = client.prepare(artifact)
     client.fire(reference)
@@ -112,11 +121,16 @@ def test_remote_client_runs_one_current_generation_without_legacy_payloads():
     assert client.safe_state().state == "SAFE"
     client.close()
     assert connection.closed
+    assert interrupt_connection.closed
 
 
 def test_remote_client_rejects_unbounded_or_stale_completion():
     artifact, service, connection = _fixture()
-    client = RemotePulseExecutionClient(connection, transport_timeout_seconds=2.0)
+    client = RemotePulseExecutionClient(
+        connection,
+        Connection(service),
+        transport_timeout_seconds=2.0,
+    )
     reference = client.prepare(artifact)
     client.fire(reference)
 
@@ -134,7 +148,10 @@ def test_remote_client_rejects_non_current_snapshot_schema():
         def current_snapshot(self):
             return encode({"schema": "old-server"})
 
-        current_prepare = current_fire = current_complete = current_safe_state = lambda *args: True
+        current_prepare = current_fire = current_complete = lambda *args: True
+
+        def current_interrupt_safe_state(self, generation):
+            return encode({"schema": "old-server"})
 
     class BadConnection:
         root = BadRoot()
@@ -143,4 +160,52 @@ def test_remote_client_rejects_non_current_snapshot_schema():
             pass
 
     with pytest.raises(ValueError, match="unknown field set"):
-        RemotePulseExecutionClient(BadConnection())
+        RemotePulseExecutionClient(BadConnection(), BadConnection())
+
+
+def test_remote_client_requires_a_physically_distinct_interrupt_connection():
+    _artifact, service, connection = _fixture()
+    with pytest.raises(ValueError, match="distinct connections"):
+        RemotePulseExecutionClient(connection, connection)
+
+
+def test_remote_client_serializes_concurrent_close_to_one_safe_request():
+    _artifact, service, connection = _fixture()
+    interrupt_connection = Connection(service)
+    client = RemotePulseExecutionClient(connection, interrupt_connection)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+    original = interrupt_connection.root.current_interrupt_safe_state
+
+    def blocking_safe(generation):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        assert release.wait(1.0)
+        return original(generation)
+
+    interrupt_connection.root.current_interrupt_safe_state = blocking_safe
+    errors = []
+
+    def close():
+        try:
+            client.close()
+        except BaseException as error:
+            errors.append(error)
+
+    first = threading.Thread(target=close)
+    second = threading.Thread(target=close)
+    first.start()
+    assert entered.wait(1.0)
+    second.start()
+    time.sleep(0.02)
+    assert calls == 1
+    release.set()
+    first.join(1.0)
+    second.join(1.0)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert calls == 1
+    assert connection.closed and interrupt_connection.closed

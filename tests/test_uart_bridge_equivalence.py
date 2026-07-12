@@ -30,7 +30,7 @@ from fpga.pulse_streamer.host.uart_bridge_model import UartBridgeModel, committe
 # --------------------------------------------------------------- helpers
 def _encode_image(image: dict[int, int], *, max_words: int = 4096, seq0: int = 0) -> bytes:
     """The host's upload byte stream: sorted image words -> contiguous runs -> one WRITE frame each
-    (this is exactly what UartStreamerSession._flush emits for a program upload)."""
+    (the current ``UartRegisterTransport.write_words`` emits the same frames)."""
     pairs = sorted(image.items())
     out = bytearray()
     seq = seq0
