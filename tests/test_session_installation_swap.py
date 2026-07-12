@@ -10,7 +10,7 @@ def test_session_publishes_catalog_not_raw_devices():
     experiment = connect("virtual")
     try:
         catalog = experiment.device_catalog
-        assert experiment.devices is catalog
+        assert not hasattr(experiment, "devices")
         assert catalog.availability is InstallationAvailability.AVAILABLE
         assert catalog.roles() == (
             "camera",
