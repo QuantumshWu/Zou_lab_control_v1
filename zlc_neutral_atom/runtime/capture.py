@@ -6,14 +6,13 @@ import hashlib
 import math
 import threading
 import uuid
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, is_dataclass
 from enum import Enum
 from numbers import Integral
 from typing import Protocol, TypeVar
 
-import numpy as np
-
 from zlc_data import DatasetSchema, ValuePayloadContract
+from zlc_neutral_atom.catalog import is_declarative_value
 
 from .dataset import (
     DatasetCellAddress,
@@ -88,41 +87,6 @@ def _positive_finite(value: float, field: str) -> float:
     return float(value)
 
 
-def _data_only(value: object, active: set[int] | None = None) -> bool:
-    if value is None or type(value) in (bool, int, float, str, bytes):
-        return True
-    if isinstance(value, np.dtype):
-        return True
-    if isinstance(value, Enum):
-        return _data_only(value.value, active)
-    identity = id(value)
-    active = set() if active is None else active
-    if identity in active:
-        return False
-    if isinstance(value, tuple):
-        active.add(identity)
-        result = all(_data_only(item, active) for item in value)
-        active.remove(identity)
-        return result
-    if isinstance(value, frozenset):
-        active.add(identity)
-        result = all(_data_only(item, active) for item in value)
-        active.remove(identity)
-        return result
-    if is_dataclass(value) and not isinstance(value, type):
-        parameters = getattr(type(value), "__dataclass_params__", None)
-        if not parameters or not parameters.frozen:
-            return False
-        active.add(identity)
-        result = all(
-            _data_only(getattr(value, field.name), active)
-            for field in fields(value)
-        )
-        active.remove(identity)
-        return result
-    return False
-
-
 class CapturePayloadContract(Protocol[PayloadT]):
     fingerprint: str
     max_retained_nbytes: int
@@ -140,16 +104,24 @@ class CapturePayloadContract(Protocol[PayloadT]):
     def correlation_id(self, payload: PayloadT) -> str: ...
 
 
-class CaptureSpecContract(Protocol):
-    """Owner codec for one immutable, adapter-specific capture request."""
+@dataclass(frozen=True)
+class FrozenCaptureSpec:
+    """Canonical owner bytes; runtime never executes an arbitrary spec codec."""
 
-    fingerprint: str
+    owner_fingerprint: str
+    payload: bytes
+    digest: str = ""
 
-    def snapshot(self, capture_spec: object) -> object: ...
-
-    def validate(self, capture_spec: object) -> None: ...
-
-    def digest(self, capture_spec: object) -> str: ...
+    def __post_init__(self) -> None:
+        _sha256(self.owner_fingerprint, "capture spec owner fingerprint")
+        if not isinstance(self.payload, bytes) or not self.payload:
+            raise ValueError("capture spec payload must be non-empty immutable bytes")
+        payload = bytes(self.payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        if self.digest and self.digest != digest:
+            raise ValueError("capture spec digest differs from canonical payload")
+        object.__setattr__(self, "payload", payload)
+        object.__setattr__(self, "digest", digest)
 
 
 @dataclass(frozen=True)
@@ -160,10 +132,12 @@ class CaptureCapabilitySnapshot:
     capability_fingerprint: str
     settings_fingerprint: str
     payload_contract_fingerprint: str
+    capture_spec_owner_fingerprint: str
     flow_control: ProducerFlowControl
     max_source_burst_events: int
     driver_ring_bytes: int
     max_blocking_call_seconds: float
+    max_capture_spec_bytes: int
 
     def __post_init__(self) -> None:
         for field in (
@@ -176,6 +150,7 @@ class CaptureCapabilitySnapshot:
             "capability_fingerprint",
             "settings_fingerprint",
             "payload_contract_fingerprint",
+            "capture_spec_owner_fingerprint",
         ):
             _sha256(getattr(self, field), field)
         if not isinstance(self.flow_control, ProducerFlowControl):
@@ -189,6 +164,11 @@ class CaptureCapabilitySnapshot:
             self,
             "driver_ring_bytes",
             _positive_int(self.driver_ring_bytes, "driver_ring_bytes"),
+        )
+        object.__setattr__(
+            self,
+            "max_capture_spec_bytes",
+            _positive_int(self.max_capture_spec_bytes, "max_capture_spec_bytes"),
         )
         object.__setattr__(
             self,
@@ -234,7 +214,7 @@ class CaptureStreamContract:
     expected_cells: tuple[DatasetCellAddress, ...]
     capability: CaptureCapabilitySnapshot
     runtime_profile: CaptureRuntimeProfile
-    capture_spec_contract: CaptureSpecContract
+    capture_spec_owner_fingerprint: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.stream_id, StreamId):
@@ -250,16 +230,20 @@ class CaptureStreamContract:
             if not hasattr(self.event_adapter, member):
                 raise TypeError(f"event_adapter.{member} is required")
         _sha256(self.payload_contract.fingerprint, "payload contract fingerprint")
-        _sha256(self.capture_spec_contract.fingerprint, "capture spec fingerprint")
+        _sha256(
+            self.capture_spec_owner_fingerprint,
+            "capture spec owner fingerprint",
+        )
         for name, owner in (
             ("payload_contract", self.payload_contract),
             ("event_adapter", self.event_adapter),
             ("metadata_contract", self.event_adapter.metadata_contract),
-            ("capture_spec_contract", self.capture_spec_contract),
         ):
             parameters = getattr(type(owner), "__dataclass_params__", None)
             if not is_dataclass(owner) or not parameters or not parameters.frozen:
                 raise TypeError(f"{name} must be a frozen dataclass value")
+            if not is_declarative_value(owner):
+                raise TypeError(f"{name} fields must be recursively declarative data")
         for member in (
             "snapshot",
             "validate",
@@ -274,9 +258,6 @@ class CaptureStreamContract:
             self.payload_contract.max_retained_nbytes,
             "payload contract max_retained_nbytes",
         )
-        for member in ("snapshot", "validate", "digest"):
-            if not callable(getattr(self.capture_spec_contract, member, None)):
-                raise TypeError(f"capture_spec_contract.{member} must be callable")
         metadata_contract = self.event_adapter.metadata_contract
         _sha256(metadata_contract.fingerprint, "metadata contract fingerprint")
         _nonnegative_int(
@@ -297,6 +278,11 @@ class CaptureStreamContract:
             )
         if self.capability.payload_contract_fingerprint != self.payload_contract.fingerprint:
             raise ValueError("capture capability and payload contract fingerprints differ")
+        if (
+            self.capability.capture_spec_owner_fingerprint
+            != self.capture_spec_owner_fingerprint
+        ):
+            raise ValueError("capture capability and spec owner fingerprints differ")
         if self.event_adapter.payload_contract is not self.payload_contract:
             raise ValueError("DatasetEventAdapter must share CapturePayloadContract owner")
         if self.event_adapter.value_schema is not self.dataset_schema.cell_schema:
@@ -339,6 +325,7 @@ class CaptureStreamContract:
             + self.max_inflight_bytes
             + self.payload_contract.max_retained_nbytes
             + self.event_adapter.metadata_contract.max_retained_nbytes
+            + self.capability.max_capture_spec_bytes
         )
 
 
@@ -347,8 +334,8 @@ class PrepareCaptureCommand:
     session_id: str
     run_id: str
     source_id: str
-    capture_spec: object
-    capture_spec_contract_fingerprint: str
+    capture_spec_payload: bytes
+    capture_spec_owner_fingerprint: str
     capture_spec_fingerprint: str
     capability_fingerprint: str
     settings_fingerprint: str
@@ -359,12 +346,16 @@ class PrepareCaptureCommand:
         for name in ("session_id", "run_id", "source_id"):
             _canonical_text(getattr(self, name), name)
         for name in (
-            "capture_spec_contract_fingerprint",
+            "capture_spec_owner_fingerprint",
             "capture_spec_fingerprint",
             "capability_fingerprint",
             "settings_fingerprint",
         ):
             _sha256(getattr(self, name), name)
+        if not isinstance(self.capture_spec_payload, bytes) or not self.capture_spec_payload:
+            raise ValueError("capture_spec_payload must be non-empty bytes")
+        if hashlib.sha256(self.capture_spec_payload).hexdigest() != self.capture_spec_fingerprint:
+            raise ValueError("capture spec payload digest differs")
         object.__setattr__(
             self,
             "expected_total_events",
@@ -625,7 +616,7 @@ class BoundCapturePort:
         self,
         contract: CaptureStreamContract,
         trace_binding: TraceBinding,
-        capture_spec: object,
+        capture_spec: FrozenCaptureSpec,
     ) -> "CaptureSession":
         if contract.capability is not self.capability:
             raise ValueError("CaptureStreamContract must share BoundCapturePort capability")
@@ -666,6 +657,20 @@ class BoundCapturePort:
             )
         return CleanupReport.safe((proof,))
 
+    def verify_idle(self, context: RunContext) -> CleanupReport:
+        """Verify safety when no physical capture prepare was ever attempted."""
+
+        try:
+            proof = context.cleanup_device(self.device.key).verify_safe_state()
+        except BaseException as error:
+            return CleanupReport.unsafe(
+                (self.device.key,),
+                reason="unopened capture device safe-state verification failed",
+                recovery_action="inspect and recover the camera before reuse",
+                errors=(error,),
+            )
+        return CleanupReport.safe((proof,))
+
 class CaptureSession:
     """One owner of producer, device session id, ordinal, and terminal receipt."""
 
@@ -674,23 +679,23 @@ class CaptureSession:
         port: BoundCapturePort,
         contract: CaptureStreamContract,
         trace_binding: TraceBinding,
-        capture_spec: object,
+        capture_spec: FrozenCaptureSpec,
     ) -> None:
         if not isinstance(trace_binding, TraceBinding):
             raise TypeError("trace_binding must be TraceBinding")
         if trace_binding.source_id != contract.source_id:
             raise ValueError("TraceBinding source differs from CaptureStreamContract")
-        spec_contract = contract.capture_spec_contract
-        frozen_spec = spec_contract.snapshot(capture_spec)
-        spec_contract.validate(frozen_spec)
-        if not _data_only(frozen_spec):
-            raise TypeError("capture spec contract must return recursively data-only data")
-        spec_digest = _sha256(spec_contract.digest(frozen_spec), "capture spec digest")
+        if not isinstance(capture_spec, FrozenCaptureSpec):
+            raise TypeError("capture_spec must be FrozenCaptureSpec")
+        if capture_spec.owner_fingerprint != contract.capture_spec_owner_fingerprint:
+            raise ValueError("capture spec owner differs from CaptureStreamContract")
+        if len(capture_spec.payload) > contract.capability.max_capture_spec_bytes:
+            raise MemoryError("capture spec exceeds device capability byte bound")
         self._port = port
         self._contract = contract
         self._trace_binding = trace_binding
-        self._capture_spec = frozen_spec
-        self._capture_spec_digest = spec_digest
+        self._capture_spec = capture_spec
+        self._capture_spec_digest = capture_spec.digest
         self._session_id = uuid.uuid4().hex
         stream, producer = AcquisitionStream.create(
             contract.stream_id,
@@ -714,6 +719,7 @@ class CaptureSession:
         self._lock = threading.RLock()
         self._operation_lock = threading.Lock()
         self._owner_thread_id = threading.get_ident()
+        self._hardware_prepare_attempted = False
 
     @property
     def stream(self) -> AcquisitionStream:
@@ -781,6 +787,7 @@ class CaptureSession:
             with self._lock:
                 if self._state is not CaptureSessionState.NEW:
                     raise RuntimeError("capture session can only be prepared once")
+                self._hardware_prepare_attempted = True
                 self._state = CaptureSessionState.PREPARING
             try:
                 ack = context.device(self._port.device.key).execute(
@@ -788,10 +795,10 @@ class CaptureSession:
                         session_id=self._session_id,
                         run_id=context.run_id.value,
                         source_id=self._contract.source_id,
-                        capture_spec=self._capture_spec,
-                        capture_spec_contract_fingerprint=(
-                            self._contract.capture_spec_contract.fingerprint
-                        ),
+                    capture_spec_payload=self._capture_spec.payload,
+                    capture_spec_owner_fingerprint=(
+                        self._capture_spec.owner_fingerprint
+                    ),
                         capture_spec_fingerprint=self._capture_spec_digest,
                         capability_fingerprint=self._port.capability.capability_fingerprint,
                         settings_fingerprint=self._port.capability.settings_fingerprint,
@@ -1005,7 +1012,11 @@ class CaptureSession:
             report: CleanupReport | None = None
             port_error: BaseException | None = None
             try:
-                report = self._port.cleanup(context, self._session_id)
+                report = (
+                    self._port.cleanup(context, self._session_id)
+                    if self._hardware_prepare_attempted
+                    else self._port.verify_idle(context)
+                )
             except BaseException as error:
                 port_error = error
             release_errors: list[BaseException] = []
@@ -1094,7 +1105,7 @@ __all__ = [
     "CapturePayloadContract",
     "CapturePreparedAck",
     "CaptureRuntimeProfile",
-    "CaptureSpecContract",
+    "FrozenCaptureSpec",
     "CaptureSession",
     "CaptureSessionState",
     "CaptureStartedAck",

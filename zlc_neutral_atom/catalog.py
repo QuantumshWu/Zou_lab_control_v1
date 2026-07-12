@@ -2,13 +2,57 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
+from enum import Enum
+import math
 from numbers import Integral
 from types import MappingProxyType
 from typing import Mapping, TypeVar
 
+import numpy as np
+
 
 DefinitionT = TypeVar("DefinitionT")
+
+
+def is_declarative_value(value: object, active: set[int] | None = None) -> bool:
+    if value is None or type(value) in (bool, int, str, bytes):
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    if isinstance(value, np.dtype):
+        return True
+    if isinstance(value, Enum):
+        return is_declarative_value(value.value, active)
+    identity = id(value)
+    active = set() if active is None else active
+    if identity in active:
+        return False
+    if isinstance(value, (tuple, frozenset)):
+        active.add(identity)
+        result = all(is_declarative_value(item, active) for item in value)
+        active.remove(identity)
+        return result
+    if isinstance(value, MappingProxyType):
+        active.add(identity)
+        result = all(
+            is_declarative_value(key, active) and is_declarative_value(item, active)
+            for key, item in value.items()
+        )
+        active.remove(identity)
+        return result
+    if is_dataclass(value) and not isinstance(value, type):
+        parameters = getattr(type(value), "__dataclass_params__", None)
+        if not parameters or not parameters.frozen:
+            return False
+        active.add(identity)
+        result = all(
+            is_declarative_value(getattr(value, field.name), active)
+            for field in fields(value)
+        )
+        active.remove(identity)
+        return result
+    return False
 
 
 def _canonical_text(value: str, field: str) -> str:
@@ -67,6 +111,10 @@ class DefinitionCatalog:
             parameters = getattr(type(definition), "__dataclass_params__", None)
             if not is_dataclass(definition) or not parameters or not parameters.frozen:
                 raise TypeError("catalog definitions must be frozen dataclass values")
+            if not is_declarative_value(definition):
+                raise TypeError(
+                    "catalog definition fields must be recursively declarative data"
+                )
             if key in by_key:
                 raise ValueError(f"duplicate DefinitionKey {key}")
             previous = logical_ids.get(key.logical_id)
@@ -120,4 +168,4 @@ class DefinitionCatalog:
         return iter(self._definitions)
 
 
-__all__ = ["DefinitionCatalog", "DefinitionKey"]
+__all__ = ["DefinitionCatalog", "DefinitionKey", "is_declarative_value"]

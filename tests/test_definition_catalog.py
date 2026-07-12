@@ -54,6 +54,23 @@ def test_catalog_rejects_implicit_or_mutable_definitions():
         DefinitionCatalog((object(),))
 
 
+def test_catalog_rejects_callable_state_hidden_in_frozen_definition():
+    @dataclass(frozen=True)
+    class CallbackDefinition:
+        key: DefinitionKey
+        callback: object
+
+    with pytest.raises(TypeError, match="declarative data"):
+        DefinitionCatalog(
+            (
+                CallbackDefinition(
+                    DefinitionKey("tests", "callback", 1),
+                    lambda: None,
+                ),
+            )
+        )
+
+
 def test_catalog_resolution_is_typed_and_missing_is_loud():
     item = definition("capture")
     catalog = DefinitionCatalog((item,))

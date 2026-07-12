@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pytest
@@ -38,6 +38,7 @@ from zlc_neutral_atom.runtime.capture import (
     PrepareCaptureCommand,
     ReadCaptureCommand,
     StartCaptureCommand,
+    FrozenCaptureSpec,
 )
 from zlc_neutral_atom.runtime.dataset import (
     DatasetBuilder,
@@ -64,8 +65,20 @@ from zlc_neutral_atom.runtime.run import (
     RunController,
     CleanupReport,
     RunFailed,
+    RunCancelled,
     RunMode,
     RunPlan,
+    RunStartRejected,
+)
+from zlc_neutral_atom.runtime.pipeline import (
+    BoundMeasurement,
+    compile_pipeline,
+    DatasetMaterializerSpec,
+    MeasurementDefinition,
+    MinimalPipelineSpec,
+    PipelineMemoryProfile,
+    PipelineResult,
+    resolve_measurement_definition,
 )
 from zlc_neutral_atom.runtime.streams import (
     ProducerFlowControl,
@@ -74,6 +87,7 @@ from zlc_neutral_atom.runtime.streams import (
     TraceBinding,
     ReservationState,
 )
+from zlc_neutral_atom.catalog import DefinitionCatalog, DefinitionKey
 
 
 SHA_A = "a" * 64
@@ -209,30 +223,15 @@ class CameraCaptureSpec:
     expected_frames: int
 
 
-@dataclass(frozen=True)
-class CameraCaptureSpecContract:
-    fingerprint: str = SHA_C
-
-    @staticmethod
-    def snapshot(spec: object) -> CameraCaptureSpec:
-        if not isinstance(spec, CameraCaptureSpec):
-            raise TypeError("spec must be CameraCaptureSpec")
-        return CameraCaptureSpec(spec.exposure_us, spec.expected_frames)
-
-    @staticmethod
-    def validate(spec: object) -> None:
-        if not isinstance(spec, CameraCaptureSpec):
-            raise TypeError("spec must be CameraCaptureSpec")
-        if spec.exposure_us <= 0 or spec.expected_frames <= 0:
-            raise ValueError("capture settings must be positive")
-
-    @staticmethod
-    def digest(spec: object) -> str:
-        CameraCaptureSpecContract.validate(spec)
-        assert isinstance(spec, CameraCaptureSpec)
-        return hashlib.sha256(
-            f"camera-spec-v1:{spec.exposure_us}:{spec.expected_frames}".encode()
-        ).hexdigest()
+def frozen_camera_spec(spec: CameraCaptureSpec) -> FrozenCaptureSpec:
+    if not isinstance(spec, CameraCaptureSpec):
+        raise TypeError("spec must be CameraCaptureSpec")
+    if spec.exposure_us <= 0 or spec.expected_frames <= 0:
+        raise ValueError("capture settings must be positive")
+    return FrozenCaptureSpec(
+        SHA_C,
+        f"camera-spec-v1:{spec.exposure_us}:{spec.expected_frames}".encode(),
+    )
 
 
 def cells(dataset_schema: DatasetSchema) -> tuple[DatasetCellAddress, ...]:
@@ -278,6 +277,7 @@ class FakeCamera:
         self.read_entered = threading.Event()
         self.closed = False
         self.close_failure = False
+        self.close_attempted = False
         self.close_session_id_override: str | None = None
         self.close_joined = True
         self.fail_prepare = False
@@ -298,7 +298,12 @@ class FakeCamera:
     def execute(self, command):
         if isinstance(command, PrepareCaptureCommand):
             assert command.timeout_seconds == 0.5
+            assert command.capture_spec_owner_fingerprint == SHA_C
+            assert command.capture_spec_payload.startswith(b"camera-spec-v1:")
             self.session_id = command.session_id
+            self.read_count = 0
+            self.started = False
+            self.closed = False
             if self.fail_prepare:
                 raise RuntimeError("prepare failed after partial configuration")
             return CapturePreparedAck(
@@ -353,9 +358,9 @@ class FakeCamera:
                 digest,
                 SHA_D,
                 SHA_C,
-                CameraCaptureSpecContract.digest(
+                frozen_camera_spec(
                     CameraCaptureSpec(10, command.expected_total_events)
-                ),
+                ).digest,
             )
         raise AssertionError(f"unexpected camera command {command!r}")
 
@@ -373,6 +378,7 @@ class FakeCamera:
 
     def close_session(self, command: SessionCloseCommand):
         assert command.timeout_seconds == 0.5
+        self.close_attempted = True
         if self.close_failure:
             raise RuntimeError("session join acknowledgement lost")
         self.closed = True
@@ -388,7 +394,7 @@ class FakeCamera:
         )
 
     def safe_state(self):
-        if not self.closed:
+        if self.session_id and not self.closed:
             raise RuntimeError("camera session is not closed")
         return SafeStateAck("camera-safe-and-session-joined")
 
@@ -399,7 +405,7 @@ class CaptureHarness:
     broker: DeviceBroker
     port: BoundCapturePort
     contract: CaptureStreamContract
-    spec: CameraCaptureSpec
+    spec: FrozenCaptureSpec
     holder: dict
 
     def plan(
@@ -531,10 +537,12 @@ def harness(points: int = 2) -> CaptureHarness:
         capability_fingerprint=SHA_C,
         settings_fingerprint=SHA_D,
         payload_contract_fingerprint=payload_contract.fingerprint,
+        capture_spec_owner_fingerprint=SHA_C,
         flow_control=ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
         max_source_burst_events=points,
         driver_ring_bytes=128,
         max_blocking_call_seconds=0.5,
+        max_capture_spec_bytes=1024,
     )
     camera.capability = capability
     attestation = broker.verify_capability(device)
@@ -551,14 +559,14 @@ def harness(points: int = 2) -> CaptureHarness:
             required_consumer_lag_events=0,
             transport_memory_limit_bytes=2048,
         ),
-        capture_spec_contract=CameraCaptureSpecContract(),
+        capture_spec_owner_fingerprint=SHA_C,
     )
     return CaptureHarness(
         camera,
         broker,
         port,
         contract,
-        CameraCaptureSpec(10, points),
+        frozen_camera_spec(CameraCaptureSpec(10, points)),
         {},
     )
 
@@ -566,6 +574,31 @@ def harness(points: int = 2) -> CaptureHarness:
 def run(harness_value: CaptureHarness, **plan_options):
     controller = RunController(ResourceArbiter(MemoryQuarantineJournal()))
     return controller.start(harness_value.plan(**plan_options))
+
+
+def minimal_pipeline(item: CaptureHarness, *, memory_limit: int = 4 << 20):
+    definition = MeasurementDefinition(
+        DefinitionKey("tests", "camera-capture", 1),
+        "Camera capture",
+        "tests.camera-request.v1",
+        "tests.camera-binding.v1",
+        SHA_C,
+        item.contract.dataset_schema.fingerprint,
+    )
+    bound = BoundMeasurement(
+        definition,
+        item.port,
+        item.contract,
+        item.spec,
+    )
+    return MinimalPipelineSpec(
+        "minimal camera pipeline",
+        bound,
+        DatasetMaterializerSpec(
+            BlockId("pipeline-capture"),
+            PipelineMemoryProfile.for_current_runtime(memory_limit),
+        ),
+    )
 
 
 def test_capture_preserves_multidimensional_payload_and_co_seals_metadata():
@@ -630,6 +663,7 @@ def test_materializer_mismatch_is_rejected_before_camera_prepare_or_start(mismat
         run(item, **options).result(2.0)
     assert item.camera.session_id == ""
     assert not item.camera.started
+    assert not item.camera.closed
     assert item.holder["reservation"].state is ReservationState.RELEASED
     assert not item.holder["session"].stream._reservations
 
@@ -812,7 +846,7 @@ def test_terminal_ack_rejects_bool_counts_and_truthy_non_bool_flags():
 
 def test_transport_budget_rejects_before_any_run_or_hardware_prepare():
     item = harness(points=1)
-    assert item.contract.estimated_transport_bytes == 128 + 64 + 64 + 24
+    assert item.contract.estimated_transport_bytes == 128 + 64 + 64 + 24 + 1024
     with pytest.raises(MemoryError):
         CaptureStreamContract(
             stream_id=item.contract.stream_id,
@@ -823,9 +857,34 @@ def test_transport_budget_rejects_before_any_run_or_hardware_prepare():
             expected_cells=item.contract.expected_cells,
             capability=item.contract.capability,
             runtime_profile=CaptureRuntimeProfile(0, 1),
-            capture_spec_contract=item.contract.capture_spec_contract,
+            capture_spec_owner_fingerprint=item.contract.capture_spec_owner_fingerprint,
         )
     assert item.camera.session_id == ""
+
+
+def test_capture_contract_rejects_mutable_state_hidden_in_frozen_owner():
+    item = harness(points=1)
+
+    @dataclass(frozen=True)
+    class StatefulPayloadContract(CameraPayloadContract):
+        cache: list = field(default_factory=list)
+
+    payload = StatefulPayloadContract(item.contract.dataset_schema.cell_schema)
+    adapter = CameraEventAdapter(payload, FrameMetadataContract())
+    with pytest.raises(TypeError, match="declarative data"):
+        CaptureStreamContract(
+            stream_id=item.contract.stream_id,
+            source_id=item.contract.source_id,
+            dataset_schema=item.contract.dataset_schema,
+            payload_contract=payload,
+            event_adapter=adapter,
+            expected_cells=item.contract.expected_cells,
+            capability=item.contract.capability,
+            runtime_profile=item.contract.runtime_profile,
+            capture_spec_owner_fingerprint=(
+                item.contract.capture_spec_owner_fingerprint
+            ),
+        )
 
 
 def test_failed_stream_reports_source_failure_to_exact_cursor():
@@ -844,3 +903,121 @@ def test_failed_stream_reports_source_failure_to_exact_cursor():
         cursor.next()
     assert item.holder["reservation"].state is ReservationState.RELEASED
     assert not item.holder["session"].stream._reservations
+
+
+def test_minimal_pipeline_compiles_to_one_flat_run_and_returns_typed_result():
+    item = harness(points=2)
+    plan = compile_pipeline(minimal_pipeline(item))
+    result = RunController(ResourceArbiter(MemoryQuarantineJournal())).start(plan).result(2.0)
+    assert isinstance(result, PipelineResult)
+    assert result.dataset.block.values.shape == (1, 2, 2, 3)
+    assert np.all(result.dataset.block.values[0, 0] == 1)
+    assert np.all(result.dataset.block.values[0, 1] == 2)
+    assert result.capture_terminal.joined
+    assert len(result.memory_profile_fingerprint) == 64
+    assert item.camera.closed
+    with pytest.raises(PermissionError):
+        PipelineResult(
+            object(),
+            result.dataset,
+            result.capture_terminal,
+            result.aggregate_peak_bytes,
+            result.memory_profile_fingerprint,
+        )
+
+
+def test_pipeline_budget_rejects_before_run_or_hardware_prepare():
+    item = harness(points=1)
+    with pytest.raises(PermissionError):
+        PipelineMemoryProfile(object(), 1024)
+    with pytest.raises(MemoryError):
+        compile_pipeline(minimal_pipeline(item, memory_limit=1))
+    assert item.camera.session_id == ""
+    assert not item.camera.started
+
+
+def test_pipeline_terminal_mismatch_fails_and_releases_every_authority():
+    item = harness(points=1)
+    item.camera.terminal_joined = False
+    plan = compile_pipeline(minimal_pipeline(item))
+    with pytest.raises(RunFailed):
+        RunController(ResourceArbiter(MemoryQuarantineJournal())).start(plan).result(2.0)
+    assert item.camera.closed
+
+
+def test_measurement_definition_resolution_is_pure_catalog_composition():
+    item = harness(points=1)
+    bound = minimal_pipeline(item).measurement
+    catalog = DefinitionCatalog((bound.definition,))
+    assert resolve_measurement_definition(catalog, bound.definition_key) is bound.definition
+
+
+def test_pipeline_cancel_after_software_preflight_never_closes_unknown_session():
+    item = harness(points=1)
+    plan = compile_pipeline(minimal_pipeline(item))
+    ready = threading.Event()
+    release = threading.Event()
+    original_preflight = plan.preflight
+
+    def paused_preflight(context):
+        prepared = original_preflight(context)
+        ready.set()
+        release.wait(1.0)
+        return prepared
+
+    plan = RunPlan(**{**plan.__dict__, "preflight": paused_preflight})
+    arbiter = ResourceArbiter(MemoryQuarantineJournal())
+    handle = RunController(arbiter).start(plan)
+    assert ready.wait(1.0)
+    handle.cancel()
+    release.set()
+    with pytest.raises(RunCancelled):
+        handle.result(2.0)
+    assert item.camera.session_id == ""
+    assert not item.camera.closed
+    assert not arbiter.quarantine_records()
+
+
+def test_compiled_pipeline_plan_is_reusable_sequentially():
+    item = harness(points=1)
+    plan = compile_pipeline(minimal_pipeline(item))
+    controller = RunController(ResourceArbiter(MemoryQuarantineJournal()))
+    first = controller.start(plan).result(2.0)
+    second = controller.start(plan).result(2.0)
+    assert isinstance(first, PipelineResult) and isinstance(second, PipelineResult)
+    assert np.array_equal(first.dataset.block.values, second.dataset.block.values)
+    assert first.dataset.provenance.generation != second.dataset.provenance.generation
+
+
+def test_compiled_pipeline_contends_on_one_physical_device():
+    item = harness(points=1)
+    item.camera.block_read.set()
+    plan = compile_pipeline(minimal_pipeline(item))
+    controller = RunController(ResourceArbiter(MemoryQuarantineJournal()))
+    first = controller.start(plan)
+    assert item.camera.read_entered.wait(1.0)
+    with pytest.raises(RunStartRejected):
+        controller.start(plan)
+    first.cancel()
+    with pytest.raises(RunFailed):
+        first.result(2.0)
+
+
+def test_pipeline_attempts_physical_cleanup_when_builder_close_also_fails(monkeypatch):
+    item = harness(points=1)
+    item.camera.terminal_joined = False
+    item.camera.close_failure = True
+    close_calls = []
+
+    def fail_builder_close(_builder):
+        close_calls.append(True)
+        raise RuntimeError("builder close failed")
+
+    monkeypatch.setattr(DatasetBuilder, "close", fail_builder_close)
+    arbiter = ResourceArbiter(MemoryQuarantineJournal())
+    plan = compile_pipeline(minimal_pipeline(item))
+    with pytest.raises(RunFailed):
+        RunController(arbiter).start(plan).result(2.0)
+    assert close_calls
+    assert item.camera.close_attempted
+    assert item.port.device.key in {record.key for record in arbiter.quarantine_records()}

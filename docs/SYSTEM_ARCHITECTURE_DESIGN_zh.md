@@ -839,7 +839,7 @@ RunController.start(plan) -> RunHandle   # 后台，workbench
 
 ```text
 TaskDefinition.bind(request, immutable bindings) -> RunPlan[Result]
-MeasurementDefinition.bind(request, immutable bindings) -> BoundMeasurement
+resolve MeasurementDefinition metadata + domain composition -> BoundMeasurement
 StreamProcessorDefinition.bind(config) -> BoundStreamProcessor
 DomainAnalysisDefinition.bind(config, typed input slots/refs) -> AnalysisStep
 zlc_data.bind_fit(FitSpec, expected DatasetSchema) -> BoundFit
@@ -848,7 +848,7 @@ neutral.bind_analysis(BoundFit, DatasetInputSlot) -> AnalysisStep
 
 Measurement、StreamProcessor 与 AnalysisStep 都不是独立 lifecycle owner，不直接返回 RunPlan；它们由静态 PipelineSpec 编译进一个顶层 RunPlan。用户“单独 Start Measurement”也编译成一个 source + DatasetBuilder/明确 sink 的最小 PipelineSpec，而不是特殊启动路径。这样不会为了统一方法签名而让它们冒充 Task。
 
-bind/compile_pipeline 是无硬件 I/O 的确定性构造，可做 request validation、纯 pulse compile 和静态预算。Notebook 可以在调用线程直接构造；Workbench 把同一个同步函数投递给其普通 application worker，结果再交给 RunController.start。runtime 不定义专用 command/build lane、第二套队列协议或额外 Service；若 profiling 证明某个编译器本身很重，只把该纯函数放入现有 bounded CPU worker，不改变领域合同。RunController.start 只接收已经构造好的 RunPlan，因此不会持有 ResourceClaims 等待纯编译。
+MeasurementDefinition只含DefinitionKey、request/binding schema id、capture-spec owner fingerprint与output schema fingerprint等递归声明式字段；DefinitionCatalog机械拒绝callback、raw driver、mutable cache或其它非声明式field。generic runtime不调用Definition.bind，也不接收任意`request: object/bindings: object`；各领域composition在自己的typed request/typed bindings边界完成纯验证并直接构造BoundMeasurement，bindings只含Bound Port和immutable config。compile_pipeline 是无硬件 I/O 的确定性构造，可做schema、owner、完整schedule和静态预算校验。Notebook 可以在调用线程直接构造；Workbench 把同一个同步函数投递给其普通 application worker，结果再交给 RunController.start。runtime 不定义专用 command/build lane、第二套队列协议或额外 Service；若 profiling 证明某个编译器本身很重，只把该纯函数放入现有 bounded CPU worker，不改变领域合同。RunController.start 只接收已经构造好的 RunPlan，因此不会持有 ResourceClaims 等待纯编译。
 
 `RunPlan` 是扁平静态计划：
 
@@ -1087,23 +1087,20 @@ Task 的中途数值/图像显示不重新建立 `TaskOutput`。需要 live fram
 ```text
 MeasurementDefinition:
   stable DefinitionKey
-  request/capture plan builder
-  required Device Ports
-  output_payload_contract(request, DeviceCapabilitySnapshot)
-    -> ValueSchema 或 frozen typed record schema
-  delivery class
-  expected events/samples/grouping
-  bind(request, bindings) -> BoundMeasurement
+  request_schema_id / binding_schema_id
+  capture_spec_owner_fingerprint
+  output_schema_fingerprint
+  display metadata
 
 BoundMeasurement:
-  capture_spec
+  FrozenCaptureSpec(owner fingerprint, canonical bytes, digest)
   bound Device Ports
   output/cardinality/budget contracts
   ResourceClaims
 ```
 
 ```python
-capture_spec = build_capture_spec(request)  # 整段在 owner I/O lane 中执行
+capture_spec = domain_build_frozen_capture_spec(typed_request)  # 纯函数，不碰设备
 with capture_factory.open(ctx, capture_spec) as capture:
     sample = capture.read_next(timeout)
 ```
@@ -1112,7 +1109,7 @@ Measurement 从外部世界取数据，可以访问 Device Port；它不 fit、�
 
 DeviceCapabilitySnapshot 是 connection generation health handshake 后得到的 immutable、versioned descriptor。bind/UI 用它纯解析 expected payload/ValueSchema，preflight 再读取硬件实际设置并要求 fingerprint 相符。formal run 不允许 fire 后才发现 shape/axis；无法预先确定 schema 的 adapter 只能提供 monitor 或先执行独立 probe/config Task 后重新 bind。
 
-绑定阶段构造 immutable BoundMeasurement/CaptureSpec；Pipeline Run execute 在 owner I/O lane 打开 CaptureSession。Task 若需要同一种采集，复用 CaptureSpec builder/CaptureSession，而不是启动一个 child Measurement Run。
+领域composition构造 immutable BoundMeasurement/FrozenCaptureSpec；runtime只验证owner fingerprint与canonical bytes SHA-256，不执行任意spec snapshot/validate/digest回调，也不会在session中二次freeze。Pipeline Run preflight只建立software CaptureSession/reservation/materializer，execute才在owner I/O lane发送prepare/start。Task 若需要同一种采集，复用同一FrozenCaptureSpec构造器/CaptureSession，而不是启动一个 child Measurement Run。
 
 ### 10.4 StreamProcessor
 
@@ -1206,9 +1203,9 @@ REQUIRED source/processor/sink failure 使整个 Run 失败。BEST_EFFORT_MONITO
 
 编译结果仍是一个扁平顶层 RunPlan：一个 RunHandle 依次拥有 online acquisition graph、DatasetBuilder finalization、post-materialization Analyses、artifact commit 和 cleanup。节点不能嵌套 start Run、动态新增边或各自成为 terminal-state owner。PipelineSpec 是静态阶段合同，不是 child-plan workflow DAG。
 
-F0/S1 的首个 compiler 必须只接受 `1 BoundMeasurement -> 1 DatasetMaterializerSpec -> 1 BoundDatasetSink`：没有 processor、analysis、feedback、可选 child 或通用 node/edge DSL。它在 `RunController.start()` 取得 claim 之前完成 DefinitionKey/request/bindings、payload/adapter/schema、完整 cell permutation 与保守 event/byte budget 校验；RunPlan.preflight 才用真实 run_id 创建TraceBinding、CaptureSession、唯一exact reservation、cursor和DatasetBuilder。CaptureSession自己从冻结`expected_cells[source_ordinal]`派生join key，不接受execute层传入另一个key；只有该reservation已经ACTIVE且被唯一DatasetBuilder claim后，start才可触达设备。
+F0/S1 的首个 compiler 只接受 `1 BoundMeasurement -> 1 DatasetMaterializerSpec -> opaque in-memory PipelineResult`：没有 processor、analysis、feedback、持久sink callback、可选 child 或通用 node/edge DSL。它在 `RunController.start()` 取得 claim 之前完成 DefinitionKey、FrozenCaptureSpec owner、payload/adapter/schema、完整 cell permutation 与保守 event/byte budget 校验；RunPlan.preflight只用真实run_id创建software TraceBinding、CaptureSession、唯一exact reservation、cursor和DatasetBuilder，不发送任何device command；execute在prepared state完整返回后才prepare/start。CaptureSession自己从冻结`expected_cells[source_ordinal]`派生join key，不接受execute层传入另一个key；只有该reservation已经ACTIVE且持有绑定schema/adapter/完整schedule的ExactDatasetReadiness后，start才可触达设备。
 
-`BoundCapturePort`只接受DeviceBroker针对当前BoundDevice/binding/generation执行endpoint-owned capability probe后mint的opaque attestation，不能把普通`CaptureCapabilitySnapshot`拼到真实设备上；probe全程持有broker probing token并与Run open/rebind/recovery互斥，跨过任何activity epoch的结果不得发布。CaptureSpec由owner codec在session创建时snapshot/validate/digest，prepare阶段没有替换入口。CaptureSession创建线程就是其owner I/O lane，prepare/start/read/complete/termination/cleanup跨线程调用一律拒绝。普通整数、字符串或任意格式正确的digest不构成物理证明；正常terminal必须同时核对generation、spec/settings/capability binding、全部source ordinal、produced/drained、ordered metadata digest、source stopped、no-more-frame和真实join，才可mint不可伪造的CaptureCompletion。取消后普通execution capability会被撤销，因此BoundCapturePort必须提供thread-safe ABORT/DISARM与有限blocking-call bound；该bound写入每个prepare/start/read/complete/session-close command，adapter必须把它交给SDK wait/poll或自己的有界等待，不能只把它留作描述字段。cleanup phase发送绑定本session的`SessionCloseCommand`；wrong-session、stop/drain/join未知或超时都返回UNSAFE/quarantine，不能靠safe-state布尔值跳过join。formal compiler只消费该session拥有的CaptureCompletion，再取其中EOS交给DatasetBuilder seal，并交叉验证sealed artifact与terminal的metadata fingerprint/digest；裸EOS不构成pipeline成功。DatasetBuilder是exact reservation teardown的唯一owner：success seal、preflight/execute/cancel失败都在独立finally中close，最终reservation必须RELEASED且registry为空，前一步cleanup失败不能阻止它。post-safety persistent sink只接受storage-owned staged FinalCommit，不接受“任意 callback + requires_commit bool”。后续 S3/S4 加 processor/analysis 时扩展静态 PipelineSpec 合同，不把这个最小直线偷偷演化成递归工作流引擎。
+`BoundCapturePort`只接受DeviceBroker针对当前BoundDevice/binding/generation执行endpoint-owned capability probe后mint的opaque attestation，不能把普通`CaptureCapabilitySnapshot`拼到真实设备上；probe全程持有broker probing token并与Run open/rebind/recovery互斥，跨过任何activity epoch的结果不得发布。FrozenCaptureSpec在进入runtime前已由领域owner生成canonical bytes，runtime自行重算SHA-256并要求definition/contract/capability/spec owner fingerprint四者一致，prepare阶段没有替换或回调入口。CaptureSession创建线程就是其owner I/O lane，prepare/start/read/complete/termination/cleanup跨线程调用一律拒绝。普通整数、字符串或任意格式正确的digest不构成物理证明；正常terminal必须同时核对generation、spec/settings/capability binding、全部source ordinal、produced/drained、ordered metadata digest、source stopped、no-more-frame和真实join，才可mint不可伪造的CaptureCompletion。取消后普通execution capability会被撤销，因此BoundCapturePort必须提供thread-safe ABORT/DISARM与有限blocking-call bound；该bound写入每个prepare/start/read/complete/session-close command，adapter必须把它交给SDK wait/poll或自己的有界等待，不能只把它留作描述字段。cleanup phase发送绑定本session的`SessionCloseCommand`；wrong-session、stop/drain/join未知或超时都返回UNSAFE/quarantine，不能靠safe-state布尔值跳过join。formal compiler只消费该session拥有的CaptureCompletion，再取其中EOS交给DatasetBuilder seal，并交叉验证sealed artifact与terminal的metadata fingerprint/digest；PipelineResult由compiler私有authority mint并再次核对coverage/count/digest，调用方不能拼接另一个terminal伪造成功。裸EOS不构成pipeline成功。DatasetBuilder是exact reservation teardown的唯一owner：success seal、preflight/execute/cancel失败都在独立finally中close，最终reservation必须RELEASED且registry为空，前一步cleanup失败不能阻止它。未来post-safety persistent sink只接受storage-owned staged FinalCommit，不接受“任意 callback + requires_commit bool”。后续 S3/S4 加 processor/analysis 时扩展静态 PipelineSpec 合同，不把这个最小直线偷偷演化成递归工作流引擎。
 
 PipelineResult 只汇总 required sink 的 typed results/artifact refs、structured warnings、event/missed metrics 和 terminal lineage；不暴露 worker、cursor、mutable buffer 或第二套 TaskOutput。
 
@@ -2258,7 +2255,7 @@ CaptureSession queue 禁止 list `pop(0)` 的 O(n²) 路径，使用 deque/ring�
 - monitor overwrite/missed count；
 - exact 与 monitor fan-out 不复制不必要的大帧。
 
-capture层的预算只覆盖device driver ring、exact transport retention和单event冻结scratch。当前raw payload进入session后先生成owned snapshot，stream publish再生成自己的retained snapshot，因此保守预算至少额外包含`payload_contract.max_retained_nbytes + metadata_contract.max_retained_nbytes`；只有以后增加不公开、由同一contract authority mint的already-frozen emit路径并证明不发生第二份copy，才能删掉这项。DatasetBuilder current storage、immutable preview/front buffer、metadata index、render snapshot和artifact staging由扁平pipeline compiler统一做aggregate budget，不能塞回CaptureStreamContract形成UI反向依赖。所有大小乘法使用Python无界整数并在arm前与实际RAM上限比较，不允许固定宽度乘法溢出后得到较小预算。
+capture层的预算只覆盖device driver ring、exact transport retention和单event冻结scratch。当前raw payload进入session后先生成owned snapshot，stream publish再生成自己的retained snapshot，因此保守预算至少额外包含`payload_contract.max_retained_nbytes + metadata_contract.max_retained_nbytes`；只有以后增加不公开、由同一contract authority mint的already-frozen emit路径并证明不发生第二份copy，才能删掉这项。DatasetBuilder current storage、immutable result copy与metadata retention由扁平pipeline compiler统一计入。Python Envelope/dict/deque/list/tuple与allocator headroom不接受调用方自报；PipelineMemoryProfile只能由当前Python implementation/version/pointer width对应的runtime policy mint，强制固定reserve与per-event conservative minimum，并把profile fingerprint固化进opaque PipelineResult。UI preview/render snapshot属于后续Workbench aggregate profile，不塞回CaptureStreamContract形成反向依赖。所有大小乘法使用Python无界整数并在arm前与实际RAM上限比较，不允许固定宽度乘法溢出后得到较小预算。
 
 PerformanceBudget 计算物理保留字节而不是简单 `payload × subscriber`：分别统计稳定 BufferId 去重后的 unique retained buffers、每 edge queue/ref overhead、monitor front buffers、builder chunks、in-flight Owned/BorrowedSnapshot、processor output和render front buffers。共享 immutable frame只计一次 payload但每个引用有自己的生命周期开销；monitor虽不参与 exact ack，也必须有独立上限，不能靠持有 Python ref阻止大帧释放。
 
@@ -2412,12 +2409,15 @@ Stream：
 - qCMOS autonomous mode一次arm整个scan session；API segmented每segment独立arm/FIRE；driver ring按max-inflight定容并由dedicated drain持续排空，`total_frames/bytes`通过host exact retention与artifact预算；超容量在arm/fire前拒绝；frame[i]只在匹配active Q0 qualification envelope时映射frozen TriggerKey[i]；
 - qCMOS stream声明NON_BACKPRESSURE_CAPTURED；故障注入证明物理帧B publish失败后generation立即RetentionOverrun，物理帧C不能占B的sequence，任何capture后的decode/copy/schema/trace/key/publish异常统一SourceFailed且不可继续formal collection；
 - BoundCapturePort拒绝普通/伪造/stale capability值，只接受DeviceBroker对同一BoundDevice generation mint的attestation；prepare/terminal必须回显并匹配spec/settings/capability digests；
+- MeasurementDefinition/catalog fields递归只允许declarative values，runtime不执行Definition.bind或spec codec；FrozenCaptureSpec payload/digest篡改、owner/schema mismatch在claim前拒绝；
 - CaptureSession start在没有自己mint的ACTIVE exact reservation、没有唯一DatasetBuilder claim、reservation已失败/释放或来自其它stream时均不得触达设备；join key只由`expected_cells[source_ordinal]`派生，delivered达到预算后额外read在I/O前拒绝；
 - DatasetBuilder mint的ExactDatasetReadiness必须同时绑定reservation/stream generation、schema、同一event adapter与完整expected-cell permutation；只检查`materializer_bound=True`不构成arm authority；所有terminal路径断言reservation为RELEASED且stream registry为空；
 - driver ring mutable alias在capture进入session后的第一步被snapshot，ordinal/captured_at/correlation/metadata/value都只读该frozen payload；原ring随后复用或改写不改变delivery；
 - arm前清空software pending/driver residual并冻结counter/stamp baseline与rollover语义；注入pre-fire frame、baseline reset、非法首帧successor或stop后late frame使整epoch失败；
 - EndOfStream只能由CaptureSession在disable trigger、保守drain、最终counter/stamp冻结、capture thread/session join ack与no-more-frame证明之后mint；达到expected N但session未终止时禁止finish/seal；
 - 用户cancel撤销普通execution capability后，thread-safe interrupt必须先解除blocked read，capture cleanup再用绑定session id/binding/generation的SessionCloseCommand/Ack完成stop/drain/join；测试不得由测试线程手动release read。partial prepare/start、wrong-session、join=false/timeout、cleanup ack失败和late worker均不能返回SAFE成功或留下可seal EOS；
+- minimal pipeline在software preflight完成、prepare前被cancel时只走verify-idle，不发送unknown-session close且不quarantine；同一compiled plan可顺序复用并为每run mint新generation，同时并发run在ResourceClaim处拒绝；builder.close与session cleanup双故障仍分别尝试；
+- PipelineMemoryProfile不可由调用者构造或低报，runtime profile fingerprint进入opaque PipelineResult；调用方不能把dataset A与terminal B拼成新的PipelineResult；
 - resident table走`AUTONOMOUS_RESIDENT`；超resident table默认拒绝，只有单I/O owner、保守refill硬上界以及对**每个潜在seam**的足分辨率硬件时间观测/全schedule residual均通过时才发布`AUTONOMOUS_REFILLED`；无camera edge区段、tail seam或非sticky underflow无法证明时必须在fire前拒绝；
 - EndAttestation比较existing FPGA completion/progress、`expected_trigger_total_from_completed_schedule`推导值、camera produced count、frame/camera stamp、timestamp容差、DatasetBuilder coverage和EOS；测试/manifest不得命名成硬件measured emitted count；任一不符整run INVALID且无ScanArtifact；
 - 注入drop/reorder/duplicate/counter reset/metadata gap/short read使整epoch失败；系统不声称能定位具体point，也不声称能检测metadata仍合法的等量loss+extra抵消；该剩余风险在artifact proof_class中可见；
@@ -2837,7 +2837,7 @@ apps/
 - scalar 语义明确；
 - 已 materialize 的 owned DataBlock 内容稳定 immutable，builder 后续 ingest 不改变该 snapshot；未显式冻结的旧 progress ref 返回 SnapshotExpired，不回 latest；patch revision/duplicate 规则正确；
 - exact source/reservation/Delivery/EOS authority、single materializer、TraceBinding、frozen cell schedule、pin/ack、broker-minted generation 与真实 byte budget 正确；
-- CaptureCapability由broker probe attestation绑定device generation；CaptureSpec由owner codec冻结且prepare无替换入口；CaptureSession所有device operation保持同一owner I/O lane；
+- CaptureCapability由broker endpoint probe attestation绑定device generation；FrozenCaptureSpec只含owner canonical bytes/digest且prepare无替换/codec回调入口；CaptureSession所有device operation保持同一owner I/O lane；
 - BACKPRESSURE_CAPABLE 可零副作用拒绝后重试；NON_BACKPRESSURE_CAPTURED 首次 overrun 或 capture 后处理失败永久 poison epoch，后续 frame 不得补占旧 sequence；
 - qCMOS AUTONOMOUS_STREAMED只在active Q0 CameraExternalTriggerQualification与preflight margin内运行；qualification mutation与每次FIRE共用跨进程线性化gate，suspension/revocation写失败保持claim并fail closed；所有数据在EndAttestation前provisional，不一致整run拒绝；artifact分别记录execution_mode、run级authorization或有序segment_authorizations、required/achieved association proof与formal eligibility及其非逐沿剩余风险；
 - formal epoch的PROVISIONAL/VALID/INVALID由独立immutable validation record解析；PROVISIONAL只可带徽标显示，不能经普通Figure/Fit/derived save逃逸为成功权威artifact；
