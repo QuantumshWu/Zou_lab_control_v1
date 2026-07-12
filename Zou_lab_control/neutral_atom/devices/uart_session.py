@@ -187,6 +187,7 @@ class UartStreamerSession(VivadoAxiStreamerSession):
 
     def __init__(self, *, state_dir, port: str | None = None, baud: int = 3_000_000,
                  clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ, params=None,
+                 deployed_target=None,
                  action_timeout: float | None = 5.0, load_timeout: float = 1.0,
                  stream_poll_interval: float = 0.001, write_words_max: int = uf.MAX_FRAME_WORDS,
                  transport: UartTransport | None = None):
@@ -194,6 +195,11 @@ class UartStreamerSession(VivadoAxiStreamerSession):
         # inherited protocol methods use.  A cross-transport contract test guards against drift.
         self.state_dir = Path(state_dir); self.state_dir.mkdir(parents=True, exist_ok=True)
         self.params = params or DEFAULT_PARAMS
+        if deployed_target is not None:
+            from zlc_pulse.deployment import validate_deployed_target
+
+            validate_deployed_target(deployed_target, self.params)
+        self._deployed_target = deployed_target
         self.clock_hz = float(clock_hz)
         self.action_timeout = action_timeout
         self.load_timeout = float(load_timeout)
@@ -205,7 +211,8 @@ class UartStreamerSession(VivadoAxiStreamerSession):
         self._io_lock = threading.RLock()
         self._seq = 0
         self._tail_seconds = 0.0; self._drain_until = 0.0; self._repeat_forever = False
-        self._program = None; self._total_points = 0; self._total_chunks = 1; self._scan_repeats = 0
+        self._program = None; self._prepared_artifact = None
+        self._total_points = 0; self._total_chunks = 1; self._scan_repeats = 0
         self._prepared_artifact_digest = None; self._prepared_duration_seconds = 0.0
         self._scan_point = 0; self._scan_sweep = 0; self._scan_finished = False
         self._next_chunk = 2; self._bank_ready = 0b11

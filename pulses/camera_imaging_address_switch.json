@@ -1,5 +1,5 @@
 {
-  "schema": "zlc_pulse.PulseDocument/v1",
+  "schema": "zlc_pulse.PulseDocument/v2",
   "name": "camera_imaging_address_switch",
   "target": {
     "schema": "zlc_pulse.PulseTarget/v1",
@@ -448,6 +448,7 @@
   "time_step_ns": 20.0,
   "periods": [
     {
+      "period_id": "p1",
       "duration": 2,
       "unit": "ms",
       "name": "load_cooling",
@@ -514,9 +515,11 @@
         0,
         0,
         0
-      ]
+      ],
+      "analog_steps": []
     },
     {
+      "period_id": "p2",
       "duration": 100,
       "unit": "us",
       "name": "pre_trigger",
@@ -583,9 +586,11 @@
         0,
         0,
         0
-      ]
+      ],
+      "analog_steps": []
     },
     {
+      "period_id": "p3",
       "duration": 20,
       "unit": "us",
       "name": "camera_trigger",
@@ -652,10 +657,12 @@
         0,
         0,
         0
-      ]
+      ],
+      "analog_steps": []
     },
     {
-      "duration": "s0",
+      "period_id": "p4",
+      "duration": 19980000,
       "unit": "ns",
       "name": "camera_exposure",
       "states": [
@@ -721,9 +728,11 @@
         0,
         0,
         0
-      ]
+      ],
+      "analog_steps": []
     },
     {
+      "period_id": "p5",
       "duration": 20,
       "unit": "us",
       "name": "post_exposure_hold",
@@ -790,35 +799,31 @@
         0,
         0,
         0
-      ]
+      ],
+      "analog_steps": []
     }
   ],
-  "scan_slots": [
+  "scan_parameters": [
     {
-      "name": "exposure",
-      "kind": "duration",
-      "target": "3",
+      "parameter_id": "exposure",
+      "field": {
+        "kind": "duration",
+        "period_id": "p4",
+        "port": null
+      },
       "label": "exposure",
-      "unit": "ns",
-      "nominal": 19980000.0
+      "unit": "ns"
     }
   ],
-  "scan_table": [],
-  "scan_code": "",
-  "api_slots": [],
+  "scan_table": null,
+  "scan_recipe": null,
+  "api_parameters": [],
   "visible_ports": [
     "ch09",
     "ch00",
     "ch03",
     "ch11"
   ],
-  "analog_bus_programs": [],
   "delays": [],
-  "repeat": {
-    "start": null,
-    "end": null,
-    "count": 1,
-    "forever": true
-  },
-  "scan_repeats": 0
+  "repeat": null
 }

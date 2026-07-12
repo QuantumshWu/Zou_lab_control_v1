@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from fpga.pulse_streamer.host.image import StreamerParams
+
 from .artifact import CompiledPulseArtifact
+from .deployment import validate_artifact_for_deployment
+from .target import PulseTarget
 
 
 class CompiledPulseSession(Protocol):
@@ -26,7 +30,13 @@ class CompiledPulseSession(Protocol):
 class PulseStreamerSessionBackend:
     """Bind the current server contract to one concrete hardware-session owner."""
 
-    def __init__(self, session: CompiledPulseSession) -> None:
+    def __init__(
+        self,
+        session: CompiledPulseSession,
+        target: PulseTarget,
+        params: StreamerParams,
+        clock_hz: float,
+    ) -> None:
         for method in (
             "prepare_compiled_artifact",
             "fire_compiled_artifact",
@@ -37,8 +47,17 @@ class PulseStreamerSessionBackend:
             if not callable(getattr(session, method, None)):
                 raise TypeError(f"compiled pulse session is missing {method}()")
         self._session = session
+        self._target = target
+        self._params = params
+        self._clock_hz = float(clock_hz)
 
     def prepare(self, artifact: CompiledPulseArtifact) -> None:
+        validate_artifact_for_deployment(
+            artifact,
+            self._target,
+            self._params,
+            self._clock_hz,
+        )
         self._session.prepare_compiled_artifact(artifact)
 
     def fire(self, artifact: CompiledPulseArtifact) -> None:

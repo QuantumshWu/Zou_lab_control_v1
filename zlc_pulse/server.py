@@ -19,6 +19,7 @@ from .artifact import (
 )
 from .fpga import pack_target_ir
 from .target import PulseTarget, pulse_target_to_tree
+from .validation import validate_target_ir_for_target
 
 
 PREPARED_PULSE_REF_SCHEMA = "zlc_pulse.PreparedPulseRef/v1"
@@ -247,6 +248,7 @@ class PulseExecutionService:
             raise TypeError("artifact must be CompiledPulseArtifact")
         if artifact.target_abi_fingerprint != self._target.abi_fingerprint:
             raise ValueError("compiled artifact target differs from deployed target")
+        validate_target_ir_for_target(artifact.target_ir, self._target)
         if artifact.target_ir.clock_hz != self._clock_hz:
             raise ValueError("compiled artifact clock differs from deployed clock")
         if artifact.wire_image.geometry_fingerprint != self._geometry_fingerprint:
@@ -268,8 +270,8 @@ class PulseExecutionService:
             if reference != self._prepared_ref or reference.connection_generation != self._generation:
                 raise RuntimeError("prepared pulse reference is stale or belongs to another connection")
             artifact = self._artifact
-            if artifact is None or artifact.fingerprint != reference.artifact_digest:
-                raise RuntimeError("prepared pulse artifact is absent or changed")
+            if artifact is None:
+                raise RuntimeError("prepared pulse artifact is absent")
             return artifact
 
 

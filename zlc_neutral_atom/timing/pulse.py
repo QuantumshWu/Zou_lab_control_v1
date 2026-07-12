@@ -13,6 +13,7 @@ from zlc_pulse import (
     PulseDocument,
     PulseExecutionForm,
     PulseTarget,
+    validate_target_ir_for_target,
 )
 
 from zlc_neutral_atom.runtime import (
@@ -71,6 +72,10 @@ class FinitePulseExecutionRequest:
             raise ValueError("compiled artifact belongs to another PulseDocument")
         if self.artifact.target_abi_fingerprint != self.document.target.abi_fingerprint:
             raise ValueError("compiled artifact target differs from PulseDocument")
+        validate_target_ir_for_target(
+            self.artifact.target_ir,
+            self.document.target,
+        )
 
     @property
     def artifact_digest(self) -> str:

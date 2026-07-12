@@ -31,6 +31,7 @@ import sys
 
 import pytest
 from conftest import pulse_editor_for_test
+from zlc_pulse import load_pulse_document, load_pulse_target
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
@@ -42,6 +43,7 @@ from Zou_lab_control.neutral_atom.timing import (
     PulseTableState, resolve_fireable_template, single_imaging_template)
 
 CATALOG = list(DEFAULT_CHANNELS)
+DEPLOYED_TARGET = load_pulse_target(REPO_ROOT / "pulses" / "deployed_target.json")
 TEMPLATE_FILES = (
     "mot_field_template.json",
     "imaging_template.json",
@@ -93,28 +95,41 @@ def test_virtual_catalog_and_mot_camera_coil_buses_share_one_source():
     assert len(CATALOG) == len(set(CATALOG))
 
 
-# ------------------------------------------- (2) shipped templates carry the full virtual catalog
+# ------------------------------- (2) shipped hardware documents carry the deployed target
 @pytest.mark.parametrize("name", TEMPLATE_FILES)
-def test_shipped_template_channels_are_the_full_virtual_catalog(name):
-    state = PulseTableState.load(REPO_ROOT / "pulses" / name)
-    assert list(state.port_catalog.raw_lanes) == CATALOG, f"{name}: raw lanes must match the device catalog"
+def test_shipped_template_channels_are_the_full_deployed_catalog(name):
+    document = load_pulse_document(REPO_ROOT / "pulses" / name)
+    assert document.target == DEPLOYED_TARGET
     # the saved default VIEW stays the original driving subset -- load looks unchanged,
     # only Show All spreads to the whole catalog
     programmable = [
-        port.key for port in state.port_catalog.ports if port.kind != "clock"
+        port.key for port in document.target.ports if port.kind != "clock"
     ]
-    assert set(state.visible_ports) <= set(programmable)
-    assert state.visible_ports == [key for key in programmable if key in set(state.visible_ports)]
+    assert set(document.visible_ports) <= set(programmable)
+    assert len(document.visible_ports) == len(set(document.visible_ports))
     # the expansion added OFF rows only: the template does not drive the whole catalog
-    assert len(state.period_active_channels()) < len(state.port_catalog.raw_lanes)
+    active = {
+        lane
+        for lane_index, lane in enumerate(document.target.raw_lanes)
+        if any(period.states[lane_index] for period in document.periods)
+    }
+    assert len(active) < len(document.target.raw_lanes)
 
 
 def test_regenerated_mot_template_kept_its_semantic_dac_scan_slots_and_buses():
     """The MOT task streams one named hardware-scan slot per coil bus."""
-    mot = PulseTableState.load(REPO_ROOT / "pulses" / "mot_field_template.json")
-    assert mot.scan_names == ["da_x", "da_y", "da_z"]
-    assert mot.api_slots == []
-    assert mot.port_catalog.analog_buses == {k: list(v) for k, v in MOT_COIL_BUSES.items()}
+    mot = load_pulse_document(REPO_ROOT / "pulses" / "mot_field_template.json")
+    assert [item.parameter_id for item in mot.scan_parameters] == [
+        "da_x",
+        "da_y",
+        "da_z",
+    ]
+    assert [item.field.port for item in mot.scan_parameters] == [
+        "da_bias_x",
+        "da_bias_y",
+        "da_bias_z",
+    ]
+    assert mot.api_parameters == ()
 
 
 # --------------------------------- (3) resolve_fireable_template expands a subset, equivalently

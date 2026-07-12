@@ -91,7 +91,7 @@ def _fixture():
         document,
         clock_hz=50e6,
         execution_form=PulseExecutionForm.STATIC_ONCE,
-        trigger_channels=("emCCD",),
+        trigger_channels=("ch11",),
     )
     backend = Backend()
     service = PulseExecutionService(document.target, clock_hz=50e6, backend=backend)
@@ -108,7 +108,7 @@ def test_remote_client_runs_one_current_generation_without_legacy_payloads():
     completion = client.complete(reference, timeout=1.0)
 
     assert completion.logical_done
-    assert completion.completed_schedule_trigger_counts == (("emCCD", 3),)
+    assert completion.completed_schedule_trigger_counts == (("ch11", 3),)
     assert client.safe_state().state == "SAFE"
     client.close()
     assert connection.closed

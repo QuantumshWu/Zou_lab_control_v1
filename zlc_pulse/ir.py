@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from zlc_storage import canonical_digest
 
 
-TARGET_IR_SCHEMA = "zlc_pulse.TargetIR/v1"
-BUS_MODES = frozenset(("hold", "edge", "ramp"))
+TARGET_IR_SCHEMA = "zlc_pulse.TargetIR/v2"
+BUS_MODES = frozenset(("edge", "ramp"))
 SLOT_KINDS = frozenset(("duration", "dac"))
 
 
@@ -110,7 +110,6 @@ class TargetIR:
     scan_points: tuple[tuple[int, ...], ...] = ()
     scan_point_durations: tuple[float, ...] = ()
     scan_coeff_frac_bits: int = 0
-    scan_repeats: int = 0
     bus_names: tuple[str, ...] = ()
     bus_segments: tuple[TargetBusSegment, ...] = ()
     bus_delays: tuple[TargetBusDelay, ...] = ()
@@ -137,6 +136,8 @@ class TargetIR:
         mask_limit = 1 << len(channels)
         if any(mask >= mask_limit for mask in masks):
             raise ValueError("TargetIR edge mask exceeds channel width")
+        if masks[-1] != 0:
+            raise ValueError("TargetIR final mask must be zero for a safe terminal state")
         object.__setattr__(self, "ticks", ticks)
         object.__setattr__(self, "masks", masks)
         object.__setattr__(
@@ -149,7 +150,7 @@ class TargetIR:
         loop_start = _integer(self.loop_start_index, "loop_start_index", nonnegative=True)
         loop_end = _integer(self.loop_end_tick, "loop_end_tick", nonnegative=True)
         loop_count = _integer(self.loop_count, "loop_count", nonnegative=True)
-        if loop_start >= len(ticks) or loop_end < ticks[loop_start] or loop_count < 1:
+        if loop_start >= len(ticks) or loop_count < 1:
             raise ValueError("TargetIR loop metadata is outside its edge table")
         object.__setattr__(self, "loop_start_index", loop_start)
         object.__setattr__(self, "loop_end_tick", loop_end)
@@ -164,6 +165,7 @@ class TargetIR:
         )
         if len(loop_coeffs) != slot_count:
             raise ValueError("loop-end coefficient width differs from slot count")
+        _validate_time_coefficients(loop_coeffs, slot_kinds, "loop end")
         object.__setattr__(self, "loop_end_slot_coeffs", loop_coeffs)
         coeff_rows = tuple(
             tuple(_integer(value, "edge coefficient") for value in row)
@@ -171,6 +173,8 @@ class TargetIR:
         )
         if len(coeff_rows) != len(ticks) or any(len(row) != slot_count for row in coeff_rows):
             raise ValueError("edge coefficient matrix shape differs from ticks/slots")
+        for row in coeff_rows:
+            _validate_time_coefficients(row, slot_kinds, "edge tick")
         object.__setattr__(self, "tick_slot_coeffs", coeff_rows)
         points = tuple(
             tuple(_integer(value, "scan point slot") for value in point)
@@ -191,11 +195,9 @@ class TargetIR:
             raise ValueError("scan point duration count differs from scan points")
         object.__setattr__(self, "scan_point_durations", durations)
         frac = _integer(self.scan_coeff_frac_bits, "scan_coeff_frac_bits", nonnegative=True)
-        repeats = _integer(self.scan_repeats, "scan_repeats", nonnegative=True)
-        if not points and (frac != 0 or repeats != 0):
+        if not points and frac != 0:
             raise ValueError("scan-only metadata cannot appear on a static TargetIR")
         object.__setattr__(self, "scan_coeff_frac_bits", frac)
-        object.__setattr__(self, "scan_repeats", repeats)
         bus_names = tuple(_text(value, "bus name") for value in self.bus_names)
         if len(bus_names) != len(set(bus_names)):
             raise ValueError("bus names must be unique")
@@ -213,7 +215,45 @@ class TargetIR:
                 raise ValueError("bus segment coefficient width differs from slot count")
             if segment.value_select > slot_count or segment.stop_value_select > slot_count:
                 raise ValueError("bus segment value selector exceeds slot count")
+            _validate_time_coefficients(
+                segment.start_tick_coeffs,
+                slot_kinds,
+                "bus segment start",
+            )
+            _validate_time_coefficients(
+                segment.stop_tick_coeffs,
+                slot_kinds,
+                "bus segment stop",
+            )
+            for selector in (segment.value_select, segment.stop_value_select):
+                if selector and slot_kinds[selector - 1] != "dac":
+                    raise ValueError(
+                        "bus segment value selector must reference a DAC slot"
+                    )
+            if segment.value_select and segment.start_value != 0:
+                raise ValueError(
+                    "a selected bus start value requires a canonical zero literal"
+                )
+            if segment.stop_value_select and segment.stop_value != 0:
+                raise ValueError(
+                    "a selected bus stop value requires a canonical zero literal"
+                )
+            if segment.mode == "ramp" and segment.start_value != 0:
+                raise ValueError(
+                    "ramp start_value is physically live-state driven and must be zero"
+                )
+            if segment.mode == "edge" and (
+                segment.start_tick != segment.stop_tick
+                or segment.start_tick_coeffs != segment.stop_tick_coeffs
+                or segment.start_value != segment.stop_value
+                or segment.value_select != segment.stop_value_select
+            ):
+                raise ValueError("edge bus segment must describe one instantaneous value")
         object.__setattr__(self, "bus_segments", segments)
+        if segments and loop_count > 1 and loop_start != 0:
+            raise ValueError(
+                "DAC bus segments do not support a compact finite inner repeat bracket"
+            )
         delays = tuple(self.bus_delays)
         if any(not isinstance(value, TargetBusDelay) for value in delays):
             raise TypeError("bus_delays must contain TargetBusDelay values")
@@ -245,8 +285,66 @@ class TargetIR:
                     f"scan point {point_index} produces non-increasing effective ticks"
                 )
             effective_loop_end = _effective_tick(loop_end, loop_coeffs, point, frac)
-            if effective_loop_end < effective[loop_start]:
+            if not effective[loop_start] < effective_loop_end <= effective[-1]:
                 raise ValueError(f"scan point {point_index} produces an invalid loop end")
+            expected_duration = (
+                effective[-1]
+                + (loop_count - 1)
+                * (effective_loop_end - effective[loop_start])
+            ) / self.clock_hz
+            if not _same_duration(durations[point_index], expected_duration):
+                raise ValueError(
+                    f"scan point {point_index} duration disagrees with loop metadata"
+                )
+        if points:
+            expected_total = sum(durations)
+        else:
+            if not ticks[loop_start] < loop_end <= ticks[-1]:
+                raise ValueError("static TargetIR produces an invalid loop end")
+            expected_total = (
+                ticks[-1]
+                + (loop_count - 1) * (loop_end - ticks[loop_start])
+            ) / self.clock_hz
+        if not _same_duration(self.duration_seconds, expected_total):
+            raise ValueError("TargetIR duration disagrees with its executable schedule")
+        for point_index, point in enumerate(points or ((),)):
+            effective_final = _effective_tick(
+                ticks[-1],
+                coeff_rows[-1],
+                point,
+                frac,
+            )
+            previous_by_bus: dict[int, tuple[int, int]] = {}
+            for segment in segments:
+                start = _effective_tick(
+                    segment.start_tick,
+                    segment.start_tick_coeffs,
+                    point,
+                    frac,
+                )
+                stop = _effective_tick(
+                    segment.stop_tick,
+                    segment.stop_tick_coeffs,
+                    point,
+                    frac,
+                )
+                valid_shape = start == stop if segment.mode == "edge" else start < stop
+                if (
+                    not valid_shape
+                    or not 0 <= start < effective_final
+                    or stop > effective_final
+                ):
+                    raise ValueError(
+                        f"bus segment is outside scan point {point_index} timing bounds"
+                    )
+                previous = previous_by_bus.get(segment.bus_index)
+                if previous is not None and (
+                    start <= previous[0] or start < previous[1]
+                ):
+                    raise ValueError(
+                        f"bus segment order overlaps or regresses at scan point {point_index}"
+                    )
+                previous_by_bus[segment.bus_index] = (start, stop)
 
     @property
     def scan_enabled(self) -> bool:
@@ -259,6 +357,23 @@ class TargetIR:
 
 def _effective_tick(base: int, coeffs: tuple[int, ...], point: tuple[int, ...], frac: int) -> int:
     return int(base) + (sum(coefficient * value for coefficient, value in zip(coeffs, point)) >> frac)
+
+
+def _same_duration(left: float, right: float) -> bool:
+    tolerance = max(1e-15, 4 * math.ulp(float(right)))
+    return math.isclose(float(left), float(right), rel_tol=0.0, abs_tol=tolerance)
+
+
+def _validate_time_coefficients(
+    coefficients: tuple[int, ...],
+    slot_kinds: tuple[str, ...],
+    field: str,
+) -> None:
+    if any(
+        coefficient and kind != "duration"
+        for coefficient, kind in zip(coefficients, slot_kinds)
+    ):
+        raise ValueError(f"{field} coefficients must reference duration slots")
 
 
 def target_ir_to_tree(value: TargetIR) -> dict[str, object]:
@@ -282,7 +397,6 @@ def target_ir_to_tree(value: TargetIR) -> dict[str, object]:
         "scan_points": [list(row) for row in value.scan_points],
         "scan_point_durations": list(value.scan_point_durations),
         "scan_coeff_frac_bits": value.scan_coeff_frac_bits,
-        "scan_repeats": value.scan_repeats,
         "bus_names": list(value.bus_names),
         "bus_segments": [_bus_segment_to_tree(segment) for segment in value.bus_segments],
         "bus_delays": [
@@ -313,7 +427,6 @@ def target_ir_from_tree(tree: object) -> TargetIR:
         "scan_points",
         "scan_point_durations",
         "scan_coeff_frac_bits",
-        "scan_repeats",
         "bus_names",
         "bus_segments",
         "bus_delays",
@@ -357,7 +470,6 @@ def target_ir_from_tree(tree: object) -> TargetIR:
         tuple(_row(row, "scan_points") for row in tree["scan_points"]),
         tuple(tree["scan_point_durations"]),
         tree["scan_coeff_frac_bits"],
-        tree["scan_repeats"],
         tuple(tree["bus_names"]),
         tuple(_bus_segment_from_tree(item) for item in tree["bus_segments"]),
         tuple(_bus_delay_from_tree(item) for item in tree["bus_delays"]),

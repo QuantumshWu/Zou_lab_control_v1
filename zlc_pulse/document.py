@@ -1,25 +1,43 @@
-"""Immutable current pulse authoring document and current-only codec."""
+"""Immutable current pulse authoring model and strict current-only codec.
+
+Authoring uses stable identities and typed field references.  Dense ``sN`` scan
+variables are a compiler-lowering detail and can never appear in a saved pulse
+document, so the UI target and the physical field cannot diverge.
+"""
 
 from __future__ import annotations
 
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from fractions import Fraction
 from pathlib import Path
 
 from zlc_storage import canonical_digest
 
-from .target import PORT_DAC, PulseTarget, pulse_target_from_tree, pulse_target_to_tree
+from .target import (
+    PORT_CLOCK,
+    PORT_DAC,
+    PORT_DIGITAL,
+    PulseTarget,
+    pulse_target_from_tree,
+    pulse_target_to_tree,
+)
 
 
-PULSE_DOCUMENT_SCHEMA = "zlc_pulse.PulseDocument/v1"
+PULSE_DOCUMENT_SCHEMA = "zlc_pulse.PulseDocument/v2"
+SCAN_TABLE_SCHEMA = "zlc_pulse.FrozenScanTable/v1"
+SCAN_NORMALIZER_ID = "zlc-pulse-scan-freeze/v1"
 TIME_UNITS = frozenset(("s", "ms", "us", "ns"))
-SCAN_KINDS = frozenset(("duration", "dac"))
-API_KINDS = frozenset(("duration", "delay", "dac"))
-ANALOG_MODES = frozenset(("hold", "edge", "ramp"))
+TIME_UNIT_TO_NS = {"s": 1e9, "ms": 1e6, "us": 1e3, "ns": 1.0}
+FIELD_DURATION = "duration"
+FIELD_DAC = "dac"
+FIELD_DELAY = "delay"
+FIELD_KINDS = frozenset((FIELD_DURATION, FIELD_DAC, FIELD_DELAY))
+SCAN_FIELD_KINDS = frozenset((FIELD_DURATION, FIELD_DAC))
+ANALOG_MODES = frozenset(("edge", "ramp"))
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-_API_NAME = re.compile(r"a[1-9][0-9]*\Z")
 
 
 def _text(value: object, field: str, *, empty: bool = False) -> str:
@@ -29,21 +47,11 @@ def _text(value: object, field: str, *, empty: bool = False) -> str:
     return value
 
 
-def _integer(
-    value: object,
-    field: str,
-    *,
-    optional: bool = False,
-    nonnegative: bool = False,
-) -> int | None:
-    if optional and value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int):
-        suffix = " or None" if optional else ""
-        raise TypeError(f"{field} must be an integer{suffix}")
-    if nonnegative and value < 0:
-        raise ValueError(f"{field} must be non-negative")
-    return value
+def _identifier(value: object, field: str) -> str:
+    result = _text(value, field)
+    if _IDENTIFIER.fullmatch(result) is None:
+        raise ValueError(f"{field} must be an identifier")
+    return result
 
 
 def _number(value: object, field: str) -> int | float:
@@ -51,104 +59,273 @@ def _number(value: object, field: str) -> int | float:
         raise TypeError(f"{field} must be numeric")
     if not math.isfinite(float(value)):
         raise ValueError(f"{field} must be finite")
+    if isinstance(value, int) or float(value).is_integer():
+        return int(value)
+    return float(value)
+
+
+def _integer(value: object, field: str, *, minimum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field} must be an integer")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{field} must be at least {minimum}")
     return value
 
 
-def _expression(value: object, field: str) -> int | float | str:
-    if isinstance(value, str):
-        return _text(value, field)
-    return _number(value, field)
+def _time_unit(value: object, field: str) -> str:
+    unit = _text(value, field)
+    if unit not in TIME_UNITS:
+        raise ValueError(f"{field} is unsupported")
+    return unit
+
+
+def _integral_code(value: object, field: str) -> int:
+    number = float(_number(value, field))
+    rounded = round(number)
+    if not math.isclose(number, rounded, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError(f"{field} must be an integral DAC code")
+    return int(rounded)
+
+
+def _time_tick_ratio(value: int | float, unit: str, step_ns: float) -> Fraction:
+    return (
+        Fraction(str(_number(value, "time value")))
+        * Fraction(str(TIME_UNIT_TO_NS[unit]))
+        / Fraction(str(_number(step_ns, "time step")))
+    )
+
+
+def _exact_ticks(
+    value: int | float,
+    unit: str,
+    step_ns: float,
+    field: str,
+    *,
+    minimum: int | None = 1,
+) -> int:
+    raw = _time_tick_ratio(value, unit, step_ns)
+    if raw.denominator != 1:
+        raise ValueError(f"{field} is not frozen to the document clock grid")
+    ticks = raw.numerator
+    if minimum is not None and ticks < minimum:
+        raise ValueError(f"{field} must be at least one target clock tick")
+    return ticks
+
+
+@dataclass(frozen=True)
+class PulseFieldRef:
+    """One typed, stable reference to a physical authoring field."""
+
+    kind: str
+    period_id: str | None = None
+    port: str | None = None
+
+    def __post_init__(self) -> None:
+        kind = _text(self.kind, "pulse field kind")
+        if kind not in FIELD_KINDS:
+            raise ValueError(f"unsupported pulse field kind {kind!r}")
+        period_id = self.period_id
+        port = self.port
+        if kind == FIELD_DURATION:
+            if period_id is None or port is not None:
+                raise ValueError("duration fields require only period_id")
+            period_id = _identifier(period_id, "duration field period_id")
+        elif kind == FIELD_DAC:
+            if period_id is None or port is None:
+                raise ValueError("DAC fields require period_id and port")
+            period_id = _identifier(period_id, "DAC field period_id")
+            port = _text(port, "DAC field port")
+        else:
+            if period_id is not None or port is None:
+                raise ValueError("delay fields require only port")
+            port = _text(port, "delay field port")
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "period_id", period_id)
+        object.__setattr__(self, "port", port)
+
+
+@dataclass(frozen=True)
+class AnalogStep:
+    """One explicit DAC action; absence from a period means hold."""
+
+    port: str
+    mode: str
+    value: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "port", _text(self.port, "analog step port"))
+        mode = _text(self.mode, "analog step mode")
+        if mode not in ANALOG_MODES:
+            raise ValueError(f"unsupported analog step mode {mode!r}")
+        object.__setattr__(self, "mode", mode)
+        object.__setattr__(self, "value", _integral_code(self.value, "analog step value"))
 
 
 @dataclass(frozen=True)
 class PulsePeriod:
-    duration: int | float | str
+    period_id: str
+    duration: int | float
     unit: str
     name: str
     states: tuple[int, ...]
+    analog_steps: tuple[AnalogStep, ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "duration", _expression(self.duration, "period duration"))
-        unit = _text(self.unit, "period unit")
-        if unit not in TIME_UNITS:
-            raise ValueError(f"unsupported period unit {unit!r}")
-        object.__setattr__(self, "unit", unit)
+        object.__setattr__(self, "period_id", _identifier(self.period_id, "period_id"))
+        duration = _number(self.duration, "period duration")
+        if float(duration) <= 0:
+            raise ValueError("period duration must be positive")
+        object.__setattr__(self, "duration", duration)
+        object.__setattr__(self, "unit", _time_unit(self.unit, "period unit"))
         object.__setattr__(self, "name", _text(self.name, "period name", empty=True))
         states = tuple(self.states)
         if any(type(value) not in (bool, int) or int(value) not in (0, 1) for value in states):
             raise ValueError("period states must contain only boolean/0/1 values")
         object.__setattr__(self, "states", tuple(int(bool(value)) for value in states))
+        steps = tuple(self.analog_steps)
+        if any(not isinstance(step, AnalogStep) for step in steps):
+            raise TypeError("period analog_steps must contain AnalogStep values")
+        if len({step.port for step in steps}) != len(steps):
+            raise ValueError("a period can contain at most one analog step per port")
+        object.__setattr__(self, "analog_steps", steps)
 
 
 @dataclass(frozen=True)
-class ScanSlot:
-    name: str
-    kind: str
-    target: str
+class ScanParameter:
+    parameter_id: str
+    field: PulseFieldRef
     label: str
     unit: str
-    nominal: int | float
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "name", _text(self.name, "scan slot name"))
-        if _IDENTIFIER.fullmatch(self.name) is None:
-            raise ValueError("scan slot name must be an identifier")
-        kind = _text(self.kind, "scan slot kind")
-        if kind not in SCAN_KINDS:
-            raise ValueError(f"unsupported scan slot kind {kind!r}")
-        object.__setattr__(self, "kind", kind)
-        object.__setattr__(self, "target", _text(self.target, "scan slot target"))
-        object.__setattr__(self, "label", _text(self.label, "scan slot label", empty=True))
-        unit = _text(self.unit, "scan slot unit")
-        expected = "value" if kind == "dac" else None
-        if (expected is not None and unit != expected) or (
-            expected is None and unit not in TIME_UNITS
-        ):
-            raise ValueError("scan slot unit is incompatible with its kind")
+        object.__setattr__(
+            self,
+            "parameter_id",
+            _identifier(self.parameter_id, "scan parameter_id"),
+        )
+        if not isinstance(self.field, PulseFieldRef):
+            raise TypeError("scan parameter field must be PulseFieldRef")
+        if self.field.kind not in SCAN_FIELD_KINDS:
+            raise ValueError("only duration and DAC fields can be scanned")
+        object.__setattr__(self, "label", _text(self.label, "scan label", empty=True))
+        unit = _text(self.unit, "scan parameter unit")
+        if self.field.kind == FIELD_DURATION:
+            unit = _time_unit(unit, "duration scan unit")
+        elif unit != "value":
+            raise ValueError("DAC scan parameters use unit 'value'")
         object.__setattr__(self, "unit", unit)
-        object.__setattr__(self, "nominal", _number(self.nominal, "scan slot nominal"))
 
 
 @dataclass(frozen=True)
-class ApiSlot:
-    name: str
-    kind: str
-    target: str
+class ApiParameter:
+    parameter_id: str
+    field: PulseFieldRef
     unit: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "name", _text(self.name, "API slot name"))
-        if _API_NAME.fullmatch(self.name) is None:
-            raise ValueError("API slot name must look like a1/a2")
-        kind = _text(self.kind, "API slot kind")
-        if kind not in API_KINDS:
-            raise ValueError(f"unsupported API slot kind {kind!r}")
-        object.__setattr__(self, "kind", kind)
-        object.__setattr__(self, "target", _text(self.target, "API slot target"))
-        unit = _text(self.unit, "API slot unit")
-        if kind == "dac":
-            unit = "value"
-        elif unit not in TIME_UNITS:
-            raise ValueError("time API slots require a supported time unit")
+        object.__setattr__(
+            self,
+            "parameter_id",
+            _identifier(self.parameter_id, "API parameter_id"),
+        )
+        if not isinstance(self.field, PulseFieldRef):
+            raise TypeError("API parameter field must be PulseFieldRef")
+        unit = _text(self.unit, "API parameter unit")
+        if self.field.kind in (FIELD_DURATION, FIELD_DELAY):
+            unit = _time_unit(unit, "time API unit")
+        elif unit != "value":
+            raise ValueError("DAC API parameters use unit 'value'")
         object.__setattr__(self, "unit", unit)
 
 
 @dataclass(frozen=True)
-class AnalogBusStep:
-    mode: str
-    value: int | float | str | None
+class FrozenScanTable:
+    """Clock-normalized scan rows whose columns carry stable ParameterIds."""
+
+    columns: tuple[str, ...]
+    rows: tuple[tuple[int | float, ...], ...]
 
     def __post_init__(self) -> None:
-        mode = _text(self.mode, "analog bus mode")
-        if mode not in ANALOG_MODES:
-            raise ValueError(f"unsupported analog bus mode {mode!r}")
-        if mode == "hold" and self.value is not None:
-            raise ValueError("hold analog bus steps cannot carry a value")
-        if mode != "hold" and self.value is None:
-            raise ValueError(f"{mode} analog bus steps require a value")
-        object.__setattr__(self, "mode", mode)
-        if self.value is not None:
-            object.__setattr__(self, "value", _expression(self.value, "analog bus value"))
+        columns = tuple(_identifier(item, "scan table column") for item in self.columns)
+        if not columns or len(set(columns)) != len(columns):
+            raise ValueError("scan table columns must be unique and non-empty")
+        rows = tuple(
+            tuple(_number(value, "scan table value") for value in row)
+            for row in self.rows
+        )
+        if not rows:
+            raise ValueError("a frozen scan table must contain at least one row")
+        if any(len(row) != len(columns) for row in rows):
+            raise ValueError("every scan table row must match its named columns")
+        object.__setattr__(self, "columns", columns)
+        object.__setattr__(self, "rows", rows)
+
+    @property
+    def fingerprint(self) -> str:
+        return canonical_digest(frozen_scan_table_to_tree(self))
+
+
+@dataclass(frozen=True)
+class ScanRecipeProvenance:
+    language: str
+    source: str
+    columns: tuple[str, ...]
+    normalizer_id: str
+    frozen_definition_digest: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "language", _text(self.language, "scan recipe language"))
+        if not isinstance(self.source, str) or not self.source.strip():
+            raise ValueError("scan recipe source must be non-empty text")
+        columns = tuple(_identifier(item, "scan recipe column") for item in self.columns)
+        if not columns or len(set(columns)) != len(columns):
+            raise ValueError("scan recipe columns must be unique and non-empty")
+        object.__setattr__(self, "columns", columns)
+        normalizer = _text(self.normalizer_id, "scan recipe normalizer_id")
+        if normalizer != SCAN_NORMALIZER_ID:
+            raise ValueError("scan recipe normalizer differs from the current owner")
+        object.__setattr__(self, "normalizer_id", normalizer)
+        digest = _text(
+            self.frozen_definition_digest,
+            "scan recipe frozen_definition_digest",
+        )
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError(
+                "scan recipe frozen_definition_digest must be lowercase SHA-256"
+            )
+        object.__setattr__(self, "frozen_definition_digest", digest)
+
+
+@dataclass(frozen=True)
+class OutputDelay:
+    port: str
+    value: int | float
+    unit: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "port", _text(self.port, "delay port"))
+        object.__setattr__(self, "value", _number(self.value, "delay value"))
+        object.__setattr__(self, "unit", _time_unit(self.unit, "delay unit"))
+
+
+@dataclass(frozen=True)
+class RepeatRegion:
+    start_period_id: str
+    end_period_id: str
+    count: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "start_period_id",
+            _identifier(self.start_period_id, "repeat start_period_id"),
+        )
+        object.__setattr__(
+            self,
+            "end_period_id",
+            _identifier(self.end_period_id, "repeat end_period_id"),
+        )
+        object.__setattr__(self, "count", _integer(self.count, "repeat count", minimum=2))
 
 
 @dataclass(frozen=True)
@@ -157,122 +334,274 @@ class PulseDocument:
     target: PulseTarget
     time_step_ns: float
     periods: tuple[PulsePeriod, ...]
-    scan_slots: tuple[ScanSlot, ...] = ()
-    scan_table: tuple[tuple[float, ...], ...] = ()
-    scan_code: str = ""
-    api_slots: tuple[ApiSlot, ...] = ()
+    scan_parameters: tuple[ScanParameter, ...] = ()
+    scan_table: FrozenScanTable | None = None
+    scan_recipe: ScanRecipeProvenance | None = None
+    api_parameters: tuple[ApiParameter, ...] = ()
     visible_ports: tuple[str, ...] = ()
-    analog_bus_programs: tuple[tuple[str, tuple[AnalogBusStep, ...]], ...] = ()
-    delays: tuple[tuple[str, int | float | str], ...] = ()
-    delay_units: tuple[tuple[str, str], ...] = ()
-    repeat_start: int | None = None
-    repeat_end: int | None = None
-    repeat_count: int = 1
-    repeat_forever: bool = False
-    scan_repeats: int = 0
+    delays: tuple[OutputDelay, ...] = ()
+    repeat: RepeatRegion | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _text(self.name, "pulse document name"))
         if not isinstance(self.target, PulseTarget):
             raise TypeError("target must be PulseTarget")
-        step = float(_number(self.time_step_ns, "time_step_ns"))
-        if step <= 0:
+        step_ns = float(_number(self.time_step_ns, "time_step_ns"))
+        if step_ns <= 0:
             raise ValueError("time_step_ns must be positive")
-        object.__setattr__(self, "time_step_ns", step)
+        object.__setattr__(self, "time_step_ns", step_ns)
+
         periods = tuple(self.periods)
         if not periods or any(not isinstance(period, PulsePeriod) for period in periods):
             raise ValueError("periods must contain PulsePeriod values")
-        if any(len(period.states) != len(self.target.raw_lanes) for period in periods):
-            raise ValueError("every period state vector must match target raw lanes")
+        period_ids = tuple(period.period_id for period in periods)
+        if len(set(period_ids)) != len(period_ids):
+            raise ValueError("period_id values must be unique")
+        lane_owner = {
+            lane: port for port in self.target.ports for lane in port.lanes
+        }
+        port_order = {port.key: index for index, port in enumerate(self.target.ports)}
+        normalized_periods: list[PulsePeriod] = []
+        for period in periods:
+            if len(period.states) != len(self.target.raw_lanes):
+                raise ValueError("every period state vector must match target raw lanes")
+            _exact_ticks(period.duration, period.unit, step_ns, f"period {period.period_id} duration")
+            for lane, state in zip(self.target.raw_lanes, period.states):
+                if state and lane_owner[lane].kind != PORT_DIGITAL:
+                    raise ValueError(
+                        f"period {period.period_id} stores a digital state on non-digital lane {lane!r}"
+                    )
+            for analog in period.analog_steps:
+                port = self.target.by_key.get(analog.port)
+                if port is None or port.kind != PORT_DAC:
+                    raise ValueError(
+                        f"period {period.period_id} analog step references unknown DAC {analog.port!r}"
+                    )
+                assert port.signed_range is not None
+                if not port.signed_range[0] <= analog.value <= port.signed_range[1]:
+                    raise ValueError(
+                        f"period {period.period_id} analog value is outside {analog.port!r} range"
+                    )
+            ordered_steps = tuple(
+                sorted(period.analog_steps, key=lambda item: port_order[item.port])
+            )
+            normalized_periods.append(
+                period
+                if ordered_steps == period.analog_steps
+                else replace(period, analog_steps=ordered_steps)
+            )
+        periods = tuple(normalized_periods)
         object.__setattr__(self, "periods", periods)
-        slots = tuple(self.scan_slots)
-        if any(not isinstance(slot, ScanSlot) for slot in slots):
-            raise TypeError("scan_slots must contain ScanSlot values")
-        if len({slot.name for slot in slots}) != len(slots):
-            raise ValueError("scan slot names must be unique")
-        object.__setattr__(self, "scan_slots", slots)
-        rows = tuple(
-            tuple(float(_number(value, "scan table value")) for value in row)
-            for row in self.scan_table
-        )
-        if any(len(row) != len(slots) for row in rows):
-            raise ValueError("every scan table row must match scan slot cardinality")
-        if rows and not slots:
-            raise ValueError("a scan table requires bound scan slots")
-        object.__setattr__(self, "scan_table", rows)
-        if not isinstance(self.scan_code, str):
-            raise TypeError("scan_code must be text")
-        api = tuple(self.api_slots)
-        if any(not isinstance(slot, ApiSlot) for slot in api):
-            raise TypeError("api_slots must contain ApiSlot values")
-        if len({slot.name for slot in api}) != len(api):
-            raise ValueError("API slot names must be unique")
-        object.__setattr__(self, "api_slots", api)
+
         visible = tuple(_text(key, "visible port") for key in self.visible_ports)
         if len(set(visible)) != len(visible) or any(
             key not in self.target.by_key for key in visible
         ):
             raise ValueError("visible_ports must be unique keys in the PulseTarget")
         object.__setattr__(self, "visible_ports", visible)
-        programs = tuple(
-            (_text(key, "analog bus program key"), tuple(steps))
-            for key, steps in self.analog_bus_programs
-        )
-        if len({key for key, _steps in programs}) != len(programs):
-            raise ValueError("analog bus program keys must be unique")
-        for key, steps in programs:
-            port = self.target.by_key.get(key)
-            if port is None or port.kind != PORT_DAC:
-                raise ValueError(f"analog bus program {key!r} is not a target DAC")
-            if len(steps) != len(periods) or any(
-                not isinstance(item, AnalogBusStep) for item in steps
-            ):
-                raise ValueError("each analog bus program must define one step per period")
-        object.__setattr__(self, "analog_bus_programs", programs)
-        delays = tuple(
-            (_text(key, "delay lane"), _expression(value, "delay value"))
-            for key, value in self.delays
-        )
-        units = tuple(
-            (_text(key, "delay unit lane"), _text(unit, "delay unit"))
-            for key, unit in self.delay_units
-        )
-        delay_keys = tuple(key for key, _value in delays)
-        unit_keys = tuple(key for key, _unit in units)
-        if (
-            len(set(delay_keys)) != len(delays)
-            or len(set(unit_keys)) != len(units)
-            or set(delay_keys) != set(unit_keys)
-        ):
-            raise ValueError("delays and delay_units must have the same unique lane keys")
-        if any(key not in self.target.raw_lanes for key in delay_keys):
-            raise ValueError("delay keys must name target raw lanes")
-        if any(unit not in TIME_UNITS for _key, unit in units):
-            raise ValueError("delay unit is unsupported")
+
+        delays = tuple(self.delays)
+        if any(not isinstance(delay, OutputDelay) for delay in delays):
+            raise TypeError("delays must contain OutputDelay values")
+        if len({delay.port for delay in delays}) != len(delays):
+            raise ValueError("at most one delay may be declared per logical port")
+        for delay in delays:
+            port = self.target.by_key.get(delay.port)
+            if port is None or port.kind not in (PORT_DIGITAL, PORT_DAC):
+                raise ValueError(f"delay references unsupported port {delay.port!r}")
+            _exact_ticks(
+                delay.value,
+                delay.unit,
+                step_ns,
+                f"delay {delay.port!r}",
+                minimum=None,
+            )
+        delays = tuple(sorted(delays, key=lambda item: port_order[item.port]))
         object.__setattr__(self, "delays", delays)
-        object.__setattr__(self, "delay_units", units)
-        start = _integer(self.repeat_start, "repeat_start", optional=True, nonnegative=True)
-        end = _integer(self.repeat_end, "repeat_end", optional=True, nonnegative=True)
-        if (start is None) != (end is None):
-            raise ValueError("repeat_start and repeat_end must be set together")
-        if start is not None and (end < start or end >= len(periods)):
-            raise ValueError("repeat bracket is outside the period table")
-        count = _integer(self.repeat_count, "repeat_count", nonnegative=True)
-        assert count is not None
-        if count < 1:
-            raise ValueError("repeat_count must be at least one")
-        if type(self.repeat_forever) is not bool:
-            raise TypeError("repeat_forever must be bool")
-        scan_repeats = _integer(self.scan_repeats, "scan_repeats", nonnegative=True)
-        assert scan_repeats is not None
-        object.__setattr__(self, "repeat_start", start)
-        object.__setattr__(self, "repeat_end", end)
-        object.__setattr__(self, "repeat_count", count)
-        object.__setattr__(self, "scan_repeats", scan_repeats)
+
+        repeat = self.repeat
+        if repeat is not None:
+            if not isinstance(repeat, RepeatRegion):
+                raise TypeError("repeat must be RepeatRegion or None")
+            try:
+                start = period_ids.index(repeat.start_period_id)
+                end = period_ids.index(repeat.end_period_id)
+            except ValueError as exc:
+                raise ValueError("repeat region references a missing period_id") from exc
+            if end < start:
+                raise ValueError("repeat region end precedes its start")
+
+        scan_parameters = tuple(self.scan_parameters)
+        if any(not isinstance(item, ScanParameter) for item in scan_parameters):
+            raise TypeError("scan_parameters must contain ScanParameter values")
+        scan_ids = tuple(item.parameter_id for item in scan_parameters)
+        if len(set(scan_ids)) != len(scan_ids):
+            raise ValueError("scan parameter_id values must be unique")
+
+        api_parameters = tuple(self.api_parameters)
+        if any(not isinstance(item, ApiParameter) for item in api_parameters):
+            raise TypeError("api_parameters must contain ApiParameter values")
+        api_ids = tuple(item.parameter_id for item in api_parameters)
+        if len(set(api_ids)) != len(api_ids):
+            raise ValueError("API parameter_id values must be unique")
+        if set(scan_ids) & set(api_ids):
+            raise ValueError("scan and API parameters share one document-level identity namespace")
+
+        scan_fields = tuple(item.field for item in scan_parameters)
+        api_fields = tuple(item.field for item in api_parameters)
+        if len(set(scan_fields)) != len(scan_fields):
+            raise ValueError("a physical field cannot own multiple scan parameters")
+        if len(set(api_fields)) != len(api_fields):
+            raise ValueError("a physical field cannot own multiple API parameters")
+        if set(scan_fields) & set(api_fields):
+            raise ValueError("a physical field cannot be both scan- and API-bound")
+
+        for parameter in (*scan_parameters, *api_parameters):
+            self._validate_field_ref(parameter.field)
+        object.__setattr__(self, "scan_parameters", scan_parameters)
+        object.__setattr__(self, "api_parameters", api_parameters)
+
+        table = self.scan_table
+        if table is not None:
+            if not isinstance(table, FrozenScanTable):
+                raise TypeError("scan_table must be FrozenScanTable or None")
+            if set(table.columns) != set(scan_ids) or len(table.columns) != len(scan_ids):
+                raise ValueError("scan table columns must identify every scan parameter exactly once")
+            by_id = {item.parameter_id: item for item in scan_parameters}
+            for row_index, row in enumerate(table.rows):
+                for parameter_id, value in zip(table.columns, row):
+                    self._validate_frozen_scan_value(
+                        by_id[parameter_id],
+                        value,
+                        field=f"scan row {row_index} column {parameter_id!r}",
+                    )
+        elif self.scan_recipe is not None:
+            raise ValueError("scan recipe provenance requires a frozen scan table")
+
+        recipe = self.scan_recipe
+        if recipe is not None:
+            if not isinstance(recipe, ScanRecipeProvenance):
+                raise TypeError("scan_recipe must be ScanRecipeProvenance or None")
+            assert table is not None
+            if recipe.columns != table.columns:
+                raise ValueError("scan recipe columns differ from the frozen scan table")
+            if recipe.frozen_definition_digest != self.scan_definition_digest:
+                raise ValueError(
+                    "scan recipe digest differs from the frozen scan definition"
+                )
+
+    def _validate_field_ref(self, reference: PulseFieldRef) -> None:
+        periods = {period.period_id: period for period in self.periods}
+        if reference.kind == FIELD_DURATION:
+            if reference.period_id not in periods:
+                raise ValueError(f"duration field references missing period {reference.period_id!r}")
+            return
+        if reference.kind == FIELD_DELAY:
+            port = self.target.by_key.get(reference.port)
+            if port is None or port.kind not in (PORT_DIGITAL, PORT_DAC):
+                raise ValueError(f"delay field references unsupported port {reference.port!r}")
+            if reference.port not in {delay.port for delay in self.delays}:
+                raise ValueError("a delay parameter requires an explicit nominal OutputDelay")
+            return
+        period = periods.get(reference.period_id)
+        port = self.target.by_key.get(reference.port)
+        if period is None:
+            raise ValueError(f"DAC field references missing period {reference.period_id!r}")
+        if port is None or port.kind != PORT_DAC:
+            raise ValueError(f"DAC field references unknown DAC port {reference.port!r}")
+        if reference.port not in {step.port for step in period.analog_steps}:
+            raise ValueError("a DAC parameter must reference an explicit edge/ramp step")
+
+    def _validate_frozen_scan_value(
+        self,
+        parameter: ScanParameter,
+        value: float,
+        *,
+        field: str,
+    ) -> None:
+        if parameter.field.kind == FIELD_DURATION:
+            _exact_ticks(value, parameter.unit, self.time_step_ns, field)
+            return
+        port = self.target.by_key[parameter.field.port]
+        assert port.signed_range is not None
+        code = _integral_code(value, field)
+        if not port.signed_range[0] <= code <= port.signed_range[1]:
+            raise ValueError(f"{field} is outside DAC range")
 
     @property
     def fingerprint(self) -> str:
         return canonical_digest(pulse_document_to_tree(self))
+
+    @property
+    def period_by_id(self) -> dict[str, PulsePeriod]:
+        return {period.period_id: period for period in self.periods}
+
+    @property
+    def scan_parameter_by_id(self) -> dict[str, ScanParameter]:
+        return {parameter.parameter_id: parameter for parameter in self.scan_parameters}
+
+    @property
+    def api_parameter_by_id(self) -> dict[str, ApiParameter]:
+        return {parameter.parameter_id: parameter for parameter in self.api_parameters}
+
+    @property
+    def scan_definition_digest(self) -> str:
+        if self.scan_table is None:
+            raise ValueError("a scan definition digest requires a frozen scan table")
+        by_id = self.scan_parameter_by_id
+        parameters = []
+        for parameter_id in self.scan_table.columns:
+            parameter = by_id[parameter_id]
+            reference = parameter.field
+            if reference.port is None:
+                physical_port = None
+            else:
+                port = self.target.by_key[reference.port]
+                latch_lanes = (
+                    None
+                    if port.latch_clock is None
+                    else list(self.target.by_key[port.latch_clock].lanes)
+                )
+                physical_port = {
+                    "kind": port.kind,
+                    "lanes": list(port.lanes),
+                    "bus_index": port.bus_index,
+                    "width": port.width,
+                    "encoding": port.encoding,
+                    "safe_value": port.safe_value,
+                    "latch_clock_lanes": latch_lanes,
+                }
+            parameters.append(
+                {
+                    "parameter_id": parameter.parameter_id,
+                    "field_kind": reference.kind,
+                    "period_id": reference.period_id,
+                    "physical_port": physical_port,
+                    "unit": parameter.unit,
+                }
+            )
+        return canonical_digest(
+            {
+                "schema": "zlc_pulse.FrozenScanDefinition/v1",
+                "time_step_ns": self.time_step_ns,
+                "parameters": parameters,
+                "table": frozen_scan_table_to_tree(self.scan_table),
+            }
+        )
+
+    def field_value(self, reference: PulseFieldRef) -> tuple[int | float, str]:
+        if not isinstance(reference, PulseFieldRef):
+            raise TypeError("reference must be PulseFieldRef")
+        self._validate_field_ref(reference)
+        if reference.kind == FIELD_DURATION:
+            period = self.period_by_id[reference.period_id]
+            return period.duration, period.unit
+        if reference.kind == FIELD_DELAY:
+            delay = next(item for item in self.delays if item.port == reference.port)
+            return delay.value, delay.unit
+        period = self.period_by_id[reference.period_id]
+        analog = next(item for item in period.analog_steps if item.port == reference.port)
+        return analog.value, "value"
 
     def save(self, path: str | Path) -> Path:
         return save_pulse_document(self, path)
@@ -280,6 +609,29 @@ class PulseDocument:
     @classmethod
     def load(cls, path: str | Path) -> "PulseDocument":
         return load_pulse_document(path)
+
+
+def frozen_scan_table_to_tree(table: FrozenScanTable) -> dict[str, object]:
+    if not isinstance(table, FrozenScanTable):
+        raise TypeError("table must be FrozenScanTable")
+    return {
+        "schema": SCAN_TABLE_SCHEMA,
+        "columns": list(table.columns),
+        "rows": [list(row) for row in table.rows],
+    }
+
+
+def frozen_scan_table_from_tree(tree: object) -> FrozenScanTable:
+    if not isinstance(tree, dict) or set(tree) != {"schema", "columns", "rows"}:
+        raise ValueError("FrozenScanTable has an unknown field set")
+    if tree["schema"] != SCAN_TABLE_SCHEMA:
+        raise ValueError("FrozenScanTable schema differs")
+    if not isinstance(tree["columns"], list) or not isinstance(tree["rows"], list):
+        raise TypeError("FrozenScanTable columns and rows must be lists")
+    rows = tree["rows"]
+    if any(not isinstance(row, list) for row in rows):
+        raise TypeError("FrozenScanTable rows must contain lists")
+    return FrozenScanTable(tuple(tree["columns"]), tuple(tuple(row) for row in rows))
 
 
 def pulse_document_to_tree(document: PulseDocument) -> dict[str, object]:
@@ -291,31 +643,17 @@ def pulse_document_to_tree(document: PulseDocument) -> dict[str, object]:
         "target": pulse_target_to_tree(document.target),
         "time_step_ns": document.time_step_ns,
         "periods": [_period_to_tree(period) for period in document.periods],
-        "scan_slots": [_scan_slot_to_tree(slot) for slot in document.scan_slots],
-        "scan_table": [list(row) for row in document.scan_table],
-        "scan_code": document.scan_code,
-        "api_slots": [_api_slot_to_tree(slot) for slot in document.api_slots],
+        "scan_parameters": [_scan_parameter_to_tree(item) for item in document.scan_parameters],
+        "scan_table": (
+            None if document.scan_table is None else frozen_scan_table_to_tree(document.scan_table)
+        ),
+        "scan_recipe": (
+            None if document.scan_recipe is None else _scan_recipe_to_tree(document.scan_recipe)
+        ),
+        "api_parameters": [_api_parameter_to_tree(item) for item in document.api_parameters],
         "visible_ports": list(document.visible_ports),
-        "analog_bus_programs": [
-            {
-                "port": key,
-                "steps": [
-                    {"mode": step.mode, "value": step.value} for step in steps
-                ],
-            }
-            for key, steps in document.analog_bus_programs
-        ],
-        "delays": [
-            {"lane": key, "value": value, "unit": dict(document.delay_units)[key]}
-            for key, value in document.delays
-        ],
-        "repeat": {
-            "start": document.repeat_start,
-            "end": document.repeat_end,
-            "count": document.repeat_count,
-            "forever": document.repeat_forever,
-        },
-        "scan_repeats": document.scan_repeats,
+        "delays": [_delay_to_tree(item) for item in document.delays],
+        "repeat": None if document.repeat is None else _repeat_to_tree(document.repeat),
     }
 
 
@@ -326,15 +664,13 @@ def pulse_document_from_tree(tree: object) -> PulseDocument:
         "target",
         "time_step_ns",
         "periods",
-        "scan_slots",
+        "scan_parameters",
         "scan_table",
-        "scan_code",
-        "api_slots",
+        "scan_recipe",
+        "api_parameters",
         "visible_ports",
-        "analog_bus_programs",
         "delays",
         "repeat",
-        "scan_repeats",
     }
     if not isinstance(tree, dict) or set(tree) != fields:
         raise ValueError("PulseDocument has an unknown field set")
@@ -342,151 +678,225 @@ def pulse_document_from_tree(tree: object) -> PulseDocument:
         raise ValueError("PulseDocument schema differs")
     for field in (
         "periods",
-        "scan_slots",
-        "scan_table",
-        "api_slots",
+        "scan_parameters",
+        "api_parameters",
         "visible_ports",
-        "analog_bus_programs",
         "delays",
     ):
         if not isinstance(tree[field], list):
             raise TypeError(f"PulseDocument {field} must be a list")
+    table = tree["scan_table"]
+    recipe = tree["scan_recipe"]
     repeat = tree["repeat"]
-    if not isinstance(repeat, dict) or set(repeat) != {"start", "end", "count", "forever"}:
-        raise ValueError("PulseDocument repeat has an unknown field set")
-    programs = []
-    for item in tree["analog_bus_programs"]:
-        if not isinstance(item, dict) or set(item) != {"port", "steps"}:
-            raise ValueError("analog bus program has an unknown field set")
-        if not isinstance(item["steps"], list):
-            raise TypeError("analog bus steps must be a list")
-        steps = []
-        for step in item["steps"]:
-            if not isinstance(step, dict) or set(step) != {"mode", "value"}:
-                raise ValueError("analog bus step has an unknown field set")
-            steps.append(AnalogBusStep(step["mode"], step["value"]))
-        programs.append((item["port"], tuple(steps)))
-    delays = []
-    units = []
-    for item in tree["delays"]:
-        if not isinstance(item, dict) or set(item) != {"lane", "value", "unit"}:
-            raise ValueError("delay has an unknown field set")
-        delays.append((item["lane"], item["value"]))
-        units.append((item["lane"], item["unit"]))
     return PulseDocument(
-        tree["name"],
-        pulse_target_from_tree(tree["target"]),
-        tree["time_step_ns"],
-        tuple(_period_from_tree(item) for item in tree["periods"]),
-        tuple(_scan_slot_from_tree(item) for item in tree["scan_slots"]),
-        tuple(_scan_row(row) for row in tree["scan_table"]),
-        tree["scan_code"],
-        tuple(_api_slot_from_tree(item) for item in tree["api_slots"]),
-        tuple(tree["visible_ports"]),
-        tuple(programs),
-        tuple(delays),
-        tuple(units),
-        repeat["start"],
-        repeat["end"],
-        repeat["count"],
-        repeat["forever"],
-        tree["scan_repeats"],
+        name=tree["name"],
+        target=pulse_target_from_tree(tree["target"]),
+        time_step_ns=tree["time_step_ns"],
+        periods=tuple(_period_from_tree(item) for item in tree["periods"]),
+        scan_parameters=tuple(
+            _scan_parameter_from_tree(item) for item in tree["scan_parameters"]
+        ),
+        scan_table=None if table is None else frozen_scan_table_from_tree(table),
+        scan_recipe=None if recipe is None else _scan_recipe_from_tree(recipe),
+        api_parameters=tuple(
+            _api_parameter_from_tree(item) for item in tree["api_parameters"]
+        ),
+        visible_ports=tuple(tree["visible_ports"]),
+        delays=tuple(_delay_from_tree(item) for item in tree["delays"]),
+        repeat=None if repeat is None else _repeat_from_tree(repeat),
     )
 
 
 def save_pulse_document(document: PulseDocument, path: str | Path) -> Path:
     if not isinstance(document, PulseDocument):
-        raise TypeError("save requires PulseDocument")
+        raise TypeError("document must be PulseDocument")
     destination = Path(path)
     if destination.suffix.lower() != ".json":
         destination = destination.with_suffix(".json")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(
-        pulse_document_to_tree(document),
-        indent=2,
-        ensure_ascii=False,
-        allow_nan=False,
-    ) + "\n"
-    destination.write_text(payload, encoding="utf-8")
+    destination.write_text(
+        json.dumps(
+            pulse_document_to_tree(document),
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return destination
 
 
 def load_pulse_document(path: str | Path) -> PulseDocument:
-    source = Path(path)
-    payload = json.loads(source.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError(f"pulse JSON in {source} must contain one object")
-    return pulse_document_from_tree(payload)
+    return pulse_document_from_tree(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+def _field_ref_to_tree(value: PulseFieldRef) -> dict[str, object]:
+    return {"kind": value.kind, "period_id": value.period_id, "port": value.port}
+
+
+def _field_ref_from_tree(tree: object) -> PulseFieldRef:
+    if not isinstance(tree, dict) or set(tree) != {"kind", "period_id", "port"}:
+        raise ValueError("PulseFieldRef has an unknown field set")
+    return PulseFieldRef(tree["kind"], tree["period_id"], tree["port"])
 
 
 def _period_to_tree(value: PulsePeriod) -> dict[str, object]:
     return {
+        "period_id": value.period_id,
         "duration": value.duration,
         "unit": value.unit,
         "name": value.name,
         "states": list(value.states),
+        "analog_steps": [
+            {"port": item.port, "mode": item.mode, "value": item.value}
+            for item in value.analog_steps
+        ],
     }
 
 
 def _period_from_tree(tree: object) -> PulsePeriod:
-    if not isinstance(tree, dict) or set(tree) != {"duration", "unit", "name", "states"}:
-        raise ValueError("pulse period has an unknown field set")
-    if not isinstance(tree["states"], list):
-        raise TypeError("pulse period states must be a list")
-    return PulsePeriod(tree["duration"], tree["unit"], tree["name"], tuple(tree["states"]))
+    fields = {"period_id", "duration", "unit", "name", "states", "analog_steps"}
+    if not isinstance(tree, dict) or set(tree) != fields:
+        raise ValueError("PulsePeriod has an unknown field set")
+    if not isinstance(tree["states"], list) or not isinstance(tree["analog_steps"], list):
+        raise TypeError("PulsePeriod states and analog_steps must be lists")
+    steps = []
+    for item in tree["analog_steps"]:
+        if not isinstance(item, dict) or set(item) != {"port", "mode", "value"}:
+            raise ValueError("AnalogStep has an unknown field set")
+        steps.append(AnalogStep(item["port"], item["mode"], item["value"]))
+    return PulsePeriod(
+        tree["period_id"],
+        tree["duration"],
+        tree["unit"],
+        tree["name"],
+        tuple(tree["states"]),
+        tuple(steps),
+    )
 
 
-def _scan_slot_to_tree(value: ScanSlot) -> dict[str, object]:
+def _scan_parameter_to_tree(value: ScanParameter) -> dict[str, object]:
     return {
-        "name": value.name,
-        "kind": value.kind,
-        "target": value.target,
+        "parameter_id": value.parameter_id,
+        "field": _field_ref_to_tree(value.field),
         "label": value.label,
         "unit": value.unit,
-        "nominal": value.nominal,
     }
 
 
-def _scan_slot_from_tree(tree: object) -> ScanSlot:
+def _scan_parameter_from_tree(tree: object) -> ScanParameter:
+    if not isinstance(tree, dict) or set(tree) != {"parameter_id", "field", "label", "unit"}:
+        raise ValueError("ScanParameter has an unknown field set")
+    return ScanParameter(
+        tree["parameter_id"],
+        _field_ref_from_tree(tree["field"]),
+        tree["label"],
+        tree["unit"],
+    )
+
+
+def _api_parameter_to_tree(value: ApiParameter) -> dict[str, object]:
+    return {
+        "parameter_id": value.parameter_id,
+        "field": _field_ref_to_tree(value.field),
+        "unit": value.unit,
+    }
+
+
+def _api_parameter_from_tree(tree: object) -> ApiParameter:
+    if not isinstance(tree, dict) or set(tree) != {"parameter_id", "field", "unit"}:
+        raise ValueError("ApiParameter has an unknown field set")
+    return ApiParameter(
+        tree["parameter_id"],
+        _field_ref_from_tree(tree["field"]),
+        tree["unit"],
+    )
+
+
+def _scan_recipe_to_tree(value: ScanRecipeProvenance) -> dict[str, object]:
+    return {
+        "language": value.language,
+        "source": value.source,
+        "columns": list(value.columns),
+        "normalizer_id": value.normalizer_id,
+        "frozen_definition_digest": value.frozen_definition_digest,
+    }
+
+
+def _scan_recipe_from_tree(tree: object) -> ScanRecipeProvenance:
+    fields = {
+        "language",
+        "source",
+        "columns",
+        "normalizer_id",
+        "frozen_definition_digest",
+    }
+    if not isinstance(tree, dict) or set(tree) != fields:
+        raise ValueError("ScanRecipeProvenance has an unknown field set")
+    if not isinstance(tree["columns"], list):
+        raise TypeError("ScanRecipeProvenance columns must be a list")
+    return ScanRecipeProvenance(
+        tree["language"],
+        tree["source"],
+        tuple(tree["columns"]),
+        tree["normalizer_id"],
+        tree["frozen_definition_digest"],
+    )
+
+
+def _delay_to_tree(value: OutputDelay) -> dict[str, object]:
+    return {"port": value.port, "value": value.value, "unit": value.unit}
+
+
+def _delay_from_tree(tree: object) -> OutputDelay:
+    if not isinstance(tree, dict) or set(tree) != {"port", "value", "unit"}:
+        raise ValueError("OutputDelay has an unknown field set")
+    return OutputDelay(tree["port"], tree["value"], tree["unit"])
+
+
+def _repeat_to_tree(value: RepeatRegion) -> dict[str, object]:
+    return {
+        "start_period_id": value.start_period_id,
+        "end_period_id": value.end_period_id,
+        "count": value.count,
+    }
+
+
+def _repeat_from_tree(tree: object) -> RepeatRegion:
     if not isinstance(tree, dict) or set(tree) != {
-        "name",
-        "kind",
-        "target",
-        "label",
-        "unit",
-        "nominal",
+        "start_period_id",
+        "end_period_id",
+        "count",
     }:
-        raise ValueError("scan slot has an unknown field set")
-    return ScanSlot(**tree)
-
-
-def _api_slot_to_tree(value: ApiSlot) -> dict[str, object]:
-    return {"name": value.name, "kind": value.kind, "target": value.target, "unit": value.unit}
-
-
-def _api_slot_from_tree(tree: object) -> ApiSlot:
-    if not isinstance(tree, dict) or set(tree) != {"name", "kind", "target", "unit"}:
-        raise ValueError("API slot has an unknown field set")
-    return ApiSlot(**tree)
-
-
-def _scan_row(row: object) -> tuple[object, ...]:
-    if not isinstance(row, list):
-        raise TypeError("scan table rows must be lists")
-    return tuple(row)
+        raise ValueError("RepeatRegion has an unknown field set")
+    return RepeatRegion(tree["start_period_id"], tree["end_period_id"], tree["count"])
 
 
 __all__ = [
     "ANALOG_MODES",
-    "API_KINDS",
-    "ApiSlot",
-    "AnalogBusStep",
+    "ApiParameter",
+    "AnalogStep",
+    "FIELD_DAC",
+    "FIELD_DELAY",
+    "FIELD_DURATION",
+    "FIELD_KINDS",
+    "FrozenScanTable",
+    "OutputDelay",
     "PULSE_DOCUMENT_SCHEMA",
     "PulseDocument",
+    "PulseFieldRef",
     "PulsePeriod",
-    "SCAN_KINDS",
-    "ScanSlot",
+    "RepeatRegion",
+    "SCAN_FIELD_KINDS",
+    "SCAN_NORMALIZER_ID",
+    "SCAN_TABLE_SCHEMA",
+    "ScanParameter",
+    "ScanRecipeProvenance",
     "TIME_UNITS",
+    "TIME_UNIT_TO_NS",
+    "frozen_scan_table_from_tree",
+    "frozen_scan_table_to_tree",
     "load_pulse_document",
     "pulse_document_from_tree",
     "pulse_document_to_tree",

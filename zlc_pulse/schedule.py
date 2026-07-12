@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from .ir import TargetIR
 
 
+MAX_MATERIALIZED_TRIGGER_EDGES = 1_000_000
+
+
 @dataclass(frozen=True)
 class TriggerEdge:
     channel: str
@@ -85,11 +88,13 @@ def build_digital_trigger_schedules(
 
     if not isinstance(ir, TargetIR):
         raise TypeError("ir must be TargetIR")
-    if ir.repeat_forever:
-        raise ValueError("a cyclic TargetIR has no finite trigger schedule")
     requested = tuple(channels)
     if len(set(requested)) != len(requested):
         raise ValueError("trigger channels must be unique")
+    if not requested:
+        return ()
+    if ir.repeat_forever:
+        raise ValueError("a cyclic TargetIR has no finite trigger schedule")
     indices = []
     for channel in requested:
         if not isinstance(channel, str) or channel not in ir.channels:
@@ -99,65 +104,104 @@ def build_digital_trigger_schedules(
             raise ValueError(f"clock-mux channel {channel!r} has no finite pulse trigger schedule")
         indices.append(index)
     points = ir.scan_points or ((),)
-    transitions: list[tuple[int, int, int]] = []
-    run_offset = 0
-    for point_index, point in enumerate(points):
-        effective = tuple(
-            _effective_tick(base, coeffs, point, ir.scan_coeff_frac_bits)
-            for base, coeffs in zip(ir.ticks, ir.tick_slot_coeffs)
-        )
-        final_tick = effective[-1]
-        loop_start_tick = effective[ir.loop_start_index]
-        loop_end_tick = _effective_tick(
-            ir.loop_end_tick,
-            ir.loop_end_slot_coeffs,
-            point,
-            ir.scan_coeff_frac_bits,
-        )
-        loop_span = loop_end_tick - loop_start_tick
-        if loop_span < 0:
-            raise ValueError("compiled loop end precedes loop start")
-        for index in range(ir.loop_start_index):
-            if effective[index] < final_tick:
-                transitions.append((run_offset + effective[index], point_index, ir.masks[index]))
-        for iteration in range(ir.loop_count):
-            shift = iteration * loop_span
-            for index in range(ir.loop_start_index, len(ir.ticks)):
-                tick = effective[index]
-                if tick >= loop_end_tick or tick >= final_tick:
-                    break
-                transitions.append((run_offset + tick + shift, point_index, ir.masks[index]))
-        tail_shift = (ir.loop_count - 1) * loop_span
-        for index in range(ir.loop_start_index, len(ir.ticks)):
-            tick = effective[index]
-            if loop_end_tick <= tick < final_tick:
-                transitions.append((run_offset + tick + tail_shift, point_index, ir.masks[index]))
-        run_offset += final_tick + tail_shift
-    transitions.sort(key=lambda item: item[0])
     schedules = []
+    remaining_budget = MAX_MATERIALIZED_TRIGGER_EDGES
     for channel, bit_index in zip(requested, indices):
         previous = 0
-        ordinal = 0
-        point_ordinals: dict[int, int] = {}
-        edges = []
-        for tick, point_index, mask in transitions:
-            current = (mask >> bit_index) & 1
-            if current and not previous:
-                point_ordinal = point_ordinals.get(point_index, 0)
-                edges.append(
-                    TriggerEdge(
-                        channel,
-                        point_index,
-                        ordinal,
-                        point_ordinal,
-                        tick + ir.channel_delays[bit_index],
+        run_offset = 0
+        edges: list[TriggerEdge] = []
+        for point_index, point in enumerate(points):
+            effective = tuple(
+                _effective_tick(base, coeffs, point, ir.scan_coeff_frac_bits)
+                for base, coeffs in zip(ir.ticks, ir.tick_slot_coeffs)
+            )
+            final_tick = effective[-1]
+            loop_start_tick = effective[ir.loop_start_index]
+            loop_end_tick = _effective_tick(
+                ir.loop_end_tick,
+                ir.loop_end_slot_coeffs,
+                point,
+                ir.scan_coeff_frac_bits,
+            )
+            loop_span = loop_end_tick - loop_start_tick
+            prefix = tuple(
+                (effective[index], ir.masks[index])
+                for index in range(ir.loop_start_index)
+                if effective[index] < final_tick
+            )
+            body = tuple(
+                (effective[index], ir.masks[index])
+                for index in range(ir.loop_start_index, len(ir.ticks))
+                if effective[index] < loop_end_tick
+                and effective[index] < final_tick
+            )
+            tail = tuple(
+                (effective[index], ir.masks[index])
+                for index in range(ir.loop_start_index, len(ir.ticks))
+                if loop_end_tick <= effective[index] < final_tick
+            )
+            point_ordinal = 0
+
+            def append_rises(rises: tuple[int, ...], shift: int = 0) -> None:
+                nonlocal point_ordinal
+                if len(edges) + len(rises) > remaining_budget:
+                    raise ValueError(
+                        "digital trigger schedule exceeds the materialization limit "
+                        f"of {MAX_MATERIALIZED_TRIGGER_EDGES} edges"
                     )
-                )
-                ordinal += 1
-                point_ordinals[point_index] = point_ordinal + 1
-            previous = current
+                for tick in rises:
+                    edges.append(
+                        TriggerEdge(
+                            channel,
+                            point_index,
+                            len(edges),
+                            point_ordinal,
+                            run_offset
+                            + tick
+                            + shift
+                            + ir.channel_delays[bit_index],
+                        )
+                    )
+                    point_ordinal += 1
+
+            rises, previous = _rising_ticks(prefix, bit_index, previous)
+            append_rises(rises)
+            rises, previous = _rising_ticks(body, bit_index, previous)
+            append_rises(rises)
+            if ir.loop_count > 1:
+                steady_rises, steady_end = _rising_ticks(body, bit_index, previous)
+                repeat_edges = len(steady_rises) * (ir.loop_count - 1)
+                if len(edges) + repeat_edges > remaining_budget:
+                    raise ValueError(
+                        "digital trigger schedule exceeds the materialization limit "
+                        f"of {MAX_MATERIALIZED_TRIGGER_EDGES} edges"
+                    )
+                if steady_rises:
+                    for iteration in range(1, ir.loop_count):
+                        append_rises(steady_rises, iteration * loop_span)
+                previous = steady_end
+            tail_shift = (ir.loop_count - 1) * loop_span
+            rises, previous = _rising_ticks(tail, bit_index, previous)
+            append_rises(rises, tail_shift)
+            run_offset += final_tick + tail_shift
         schedules.append(DigitalTriggerSchedule(channel, tuple(edges), len(points)))
+        remaining_budget -= len(edges)
     return tuple(schedules)
+
+
+def _rising_ticks(
+    assignments: tuple[tuple[int, int], ...],
+    bit_index: int,
+    previous: int,
+) -> tuple[tuple[int, ...], int]:
+    rises = []
+    state = int(previous)
+    for tick, mask in assignments:
+        current = (int(mask) >> bit_index) & 1
+        if current and not state:
+            rises.append(int(tick))
+        state = current
+    return tuple(rises), state
 
 
 def _effective_tick(
@@ -213,6 +257,7 @@ def digital_trigger_schedule_from_tree(tree: object) -> DigitalTriggerSchedule:
 
 __all__ = [
     "DigitalTriggerSchedule",
+    "MAX_MATERIALIZED_TRIGGER_EDGES",
     "TriggerEdge",
     "build_digital_trigger_schedules",
     "digital_trigger_schedule_from_tree",

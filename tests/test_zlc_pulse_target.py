@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -13,9 +12,9 @@ from zlc_pulse.target import (
     PORT_DIGITAL,
     PulsePortSpec,
     PulseTarget,
-    pulse_target_from_legacy_tree,
     pulse_target_from_tree,
     pulse_target_to_tree,
+    load_pulse_target,
 )
 
 
@@ -54,15 +53,13 @@ def test_target_current_tree_round_trips_and_labels_do_not_change_abi():
     assert len(value.abi_fingerprint) == 64
 
 
-def test_shipped_legacy_port_catalog_translates_without_neutral_import():
-    payload = json.loads(
-        (Path(__file__).parents[1] / "pulses" / "imaging_template.json").read_text(
-            encoding="utf-8"
-        )
+def test_shipped_current_target_loads_without_neutral_import():
+    value = load_pulse_target(
+        Path(__file__).parents[1] / "pulses" / "deployed_target.json"
     )
-    value = pulse_target_from_legacy_tree(payload["port_catalog"])
-    assert len(value.raw_lanes) == 25
-    assert value.by_key["emCCD"].kind == PORT_DIGITAL
+    assert len(value.raw_lanes) == 62
+    assert value.by_key["ch11"].kind == PORT_DIGITAL
+    assert value.by_key["ch11"].label == "emCCD"
     assert len(value.abi_fingerprint) == 64
 
 
@@ -81,6 +78,33 @@ def test_target_rejects_double_owned_lanes_and_bad_latch_clock():
             (
                 PulsePortSpec("dac", PORT_DAC, ("d0", "d1"), "dac", 0, 2, "offset_binary", 2, "missing"),
             ),
+        )
+
+
+def test_port_safe_values_are_the_frozen_engine_states():
+    with pytest.raises(ValueError, match="low safe state"):
+        PulsePortSpec(
+            "ttl",
+            PORT_DIGITAL,
+            ("ttl",),
+            "TTL",
+            None,
+            1,
+            "binary",
+            1,
+            None,
+        )
+    with pytest.raises(ValueError, match="offset-binary midpoint"):
+        PulsePortSpec(
+            "dac",
+            PORT_DAC,
+            ("d0", "d1"),
+            "DAC",
+            0,
+            2,
+            "offset_binary",
+            0,
+            "clk",
         )
 
 

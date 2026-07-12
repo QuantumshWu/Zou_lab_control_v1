@@ -1,54 +1,78 @@
 {
-  "schema": "zlc_pulse.PulseDocument/v1",
+  "schema": "zlc_pulse.PulseDocument/v2",
   "name": "release_recapture",
   "target": {
     "schema": "zlc_pulse.PulseTarget/v1",
     "raw_lanes": [
-      "trap",
-      "cooling",
-      "probe",
-      "emCCD",
-      "pushout",
-      "microwave",
-      "mot_trigger",
-      "dx0",
-      "dx1",
-      "dx2",
-      "dx3",
-      "dx4",
-      "dx5",
-      "dy0",
-      "dy1",
-      "dy2",
-      "dy3",
-      "dy4",
-      "dy5",
-      "dz0",
-      "dz1",
-      "dz2",
-      "dz3",
-      "dz4",
-      "dz5"
+      "ch00",
+      "ch01",
+      "ch02",
+      "ch03",
+      "ch04",
+      "ch05",
+      "ch06",
+      "ch07",
+      "ch08",
+      "ch09",
+      "ch10",
+      "ch11",
+      "ch12",
+      "ch13",
+      "ch14",
+      "ch15",
+      "ch16",
+      "ch17",
+      "ch18",
+      "ch19",
+      "ch20",
+      "ch21",
+      "ch22",
+      "ch23",
+      "ch24",
+      "ch25",
+      "ch26",
+      "ch27",
+      "ch28",
+      "ch29",
+      "ch30",
+      "ch31",
+      "ch32",
+      "ch33",
+      "ch34",
+      "ch35",
+      "ch36",
+      "ch37",
+      "ch38",
+      "ch39",
+      "ch40",
+      "ch41",
+      "ch42",
+      "ch43",
+      "ch44",
+      "ch45",
+      "ch46",
+      "ch47",
+      "ch48",
+      "ch49",
+      "ch50",
+      "ch51",
+      "ch52",
+      "ch53",
+      "ch54",
+      "ch55",
+      "ch56",
+      "ch57",
+      "ch58",
+      "ch59",
+      "ch60",
+      "ch61"
     ],
     "ports": [
       {
-        "key": "trap",
+        "key": "ch00",
         "kind": "digital",
         "lanes": [
-          "trap"
-        ],
-        "label": "trap",
-        "bus_index": null,
-        "width": 1,
-        "encoding": "binary",
-        "safe_value": 0,
-        "latch_clock": null
-      },
-      {
-        "key": "cooling",
-        "kind": "digital",
-        "lanes": [
-          "cooling"
+          "ch00"
         ],
         "label": "cooling",
         "bus_index": null,
@@ -58,10 +82,36 @@
         "latch_clock": null
       },
       {
-        "key": "probe",
+        "key": "ch01",
         "kind": "digital",
         "lanes": [
-          "probe"
+          "ch01"
+        ],
+        "label": "cooling_pgc",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch02",
+        "kind": "digital",
+        "lanes": [
+          "ch02"
+        ],
+        "label": "repump",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch03",
+        "kind": "digital",
+        "lanes": [
+          "ch03"
         ],
         "label": "probe",
         "bus_index": null,
@@ -71,23 +121,10 @@
         "latch_clock": null
       },
       {
-        "key": "emCCD",
+        "key": "ch04",
         "kind": "digital",
         "lanes": [
-          "emCCD"
-        ],
-        "label": "emCCD",
-        "bus_index": null,
-        "width": 1,
-        "encoding": "binary",
-        "safe_value": 0,
-        "latch_clock": null
-      },
-      {
-        "key": "pushout",
-        "kind": "digital",
-        "lanes": [
-          "pushout"
+          "ch04"
         ],
         "label": "pushout",
         "bus_index": null,
@@ -97,10 +134,101 @@
         "latch_clock": null
       },
       {
-        "key": "microwave",
+        "key": "ch05",
         "kind": "digital",
         "lanes": [
-          "microwave"
+          "ch05"
+        ],
+        "label": "state_pre",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch06",
+        "kind": "digital",
+        "lanes": [
+          "ch06"
+        ],
+        "label": "trig",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch07",
+        "kind": "digital",
+        "lanes": [
+          "ch07"
+        ],
+        "label": "coil",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch08",
+        "kind": "digital",
+        "lanes": [
+          "ch08"
+        ],
+        "label": "grey_cooling",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch09",
+        "kind": "digital",
+        "lanes": [
+          "ch09"
+        ],
+        "label": "trap",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch10",
+        "kind": "digital",
+        "lanes": [
+          "ch10"
+        ],
+        "label": "UV",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch11",
+        "kind": "digital",
+        "lanes": [
+          "ch11"
+        ],
+        "label": "emCCD",
+        "bus_index": null,
+        "width": 1,
+        "encoding": "binary",
+        "safe_value": 0,
+        "latch_clock": null
+      },
+      {
+        "key": "ch12",
+        "kind": "digital",
+        "lanes": [
+          "ch12"
         ],
         "label": "microwave",
         "bus_index": null,
@@ -110,12 +238,12 @@
         "latch_clock": null
       },
       {
-        "key": "mot_trigger",
+        "key": "ch13",
         "kind": "digital",
         "lanes": [
-          "mot_trigger"
+          "ch13"
         ],
-        "label": "mot_trigger",
+        "label": "address",
         "bus_index": null,
         "width": 1,
         "encoding": "binary",
@@ -123,12 +251,12 @@
         "latch_clock": null
       },
       {
-        "key": "dx0",
+        "key": "ch14",
         "kind": "digital",
         "lanes": [
-          "dx0"
+          "ch14"
         ],
-        "label": "dx0",
+        "label": "cooling_shutter",
         "bus_index": null,
         "width": 1,
         "encoding": "binary",
@@ -136,12 +264,12 @@
         "latch_clock": null
       },
       {
-        "key": "dx1",
+        "key": "ch15",
         "kind": "digital",
         "lanes": [
-          "dx1"
+          "ch15"
         ],
-        "label": "dx1",
+        "label": "repump_shutter",
         "bus_index": null,
         "width": 1,
         "encoding": "binary",
@@ -149,12 +277,12 @@
         "latch_clock": null
       },
       {
-        "key": "dx2",
+        "key": "ch16",
         "kind": "digital",
         "lanes": [
-          "dx2"
+          "ch16"
         ],
-        "label": "dx2",
+        "label": "probe_shutter",
         "bus_index": null,
         "width": 1,
         "encoding": "binary",
@@ -162,12 +290,12 @@
         "latch_clock": null
       },
       {
-        "key": "dx3",
+        "key": "ch17",
         "kind": "digital",
         "lanes": [
-          "dx3"
+          "ch17"
         ],
-        "label": "dx3",
+        "label": "bias",
         "bus_index": null,
         "width": 1,
         "encoding": "binary",
@@ -175,12 +303,34 @@
         "latch_clock": null
       },
       {
-        "key": "dx4",
-        "kind": "digital",
+        "key": "da_dipole",
+        "kind": "dac",
         "lanes": [
-          "dx4"
+          "ch18",
+          "ch19",
+          "ch20",
+          "ch21",
+          "ch22",
+          "ch23",
+          "ch24",
+          "ch25",
+          "ch26",
+          "ch27"
         ],
-        "label": "dx4",
+        "label": "da_dipole",
+        "bus_index": 0,
+        "width": 10,
+        "encoding": "offset_binary",
+        "safe_value": 512,
+        "latch_clock": "da_clk0"
+      },
+      {
+        "key": "da_clk0",
+        "kind": "clock",
+        "lanes": [
+          "ch28"
+        ],
+        "label": "da_clk0",
         "bus_index": null,
         "width": 1,
         "encoding": "binary",
@@ -188,12 +338,34 @@
         "latch_clock": null
       },
       {
-        "key": "dx5",
-        "kind": "digital",
+        "key": "da_bias_y",
+        "kind": "dac",
         "lanes": [
-          "dx5"
+          "ch38",
+          "ch37",
+          "ch36",
+          "ch35",
+          "ch34",
+          "ch33",
+          "ch32",
+          "ch31",
+          "ch30",
+          "ch29"
         ],
-        "label": "dx5",
+        "label": "da_bias_y",
+        "bus_index": 1,
+        "width": 10,
+        "encoding": "offset_binary",
+        "safe_value": 512,
+        "latch_clock": "da_clk1"
+      },
+      {
+        "key": "da_clk1",
+        "kind": "clock",
+        "lanes": [
+          "ch39"
+        ],
+        "label": "da_clk1",
         "bus_index": null,
         "width": 1,
         "encoding": "binary",
@@ -201,12 +373,34 @@
         "latch_clock": null
       },
       {
-        "key": "dy0",
-        "kind": "digital",
+        "key": "da_bias_x",
+        "kind": "dac",
         "lanes": [
-          "dy0"
+          "ch40",
+          "ch41",
+          "ch42",
+          "ch43",
+          "ch44",
+          "ch45",
+          "ch46",
+          "ch47",
+          "ch48",
+          "ch49"
         ],
-        "label": "dy0",
+        "label": "da_bias_x",
+        "bus_index": 2,
+        "width": 10,
+        "encoding": "offset_binary",
+        "safe_value": 512,
+        "latch_clock": "da_clk2"
+      },
+      {
+        "key": "da_clk2",
+        "kind": "clock",
+        "lanes": [
+          "ch50"
+        ],
+        "label": "da_clk2",
         "bus_index": null,
         "width": 1,
         "encoding": "binary",
@@ -214,142 +408,34 @@
         "latch_clock": null
       },
       {
-        "key": "dy1",
-        "kind": "digital",
+        "key": "da_bias_z",
+        "kind": "dac",
         "lanes": [
-          "dy1"
+          "ch60",
+          "ch59",
+          "ch58",
+          "ch57",
+          "ch56",
+          "ch55",
+          "ch54",
+          "ch53",
+          "ch52",
+          "ch51"
         ],
-        "label": "dy1",
-        "bus_index": null,
-        "width": 1,
-        "encoding": "binary",
-        "safe_value": 0,
-        "latch_clock": null
+        "label": "da_bias_z",
+        "bus_index": 3,
+        "width": 10,
+        "encoding": "offset_binary",
+        "safe_value": 512,
+        "latch_clock": "da_clk3"
       },
       {
-        "key": "dy2",
-        "kind": "digital",
+        "key": "da_clk3",
+        "kind": "clock",
         "lanes": [
-          "dy2"
+          "ch61"
         ],
-        "label": "dy2",
-        "bus_index": null,
-        "width": 1,
-        "encoding": "binary",
-        "safe_value": 0,
-        "latch_clock": null
-      },
-      {
-        "key": "dy3",
-        "kind": "digital",
-        "lanes": [
-          "dy3"
-        ],
-        "label": "dy3",
-        "bus_index": null,
-        "width": 1,
-        "encoding": "binary",
-        "safe_value": 0,
-        "latch_clock": null
-      },
-      {
-        "key": "dy4",
-        "kind": "digital",
-        "lanes": [
-          "dy4"
-        ],
-        "label": "dy4",
-        "bus_index": null,
-        "width": 1,
-        "encoding": "binary",
-        "safe_value": 0,
-        "latch_clock": null
-      },
-      {
-        "key": "dy5",
-        "kind": "digital",
-        "lanes": [
-          "dy5"
-        ],
-        "label": "dy5",
-        "bus_index": null,
-        "width": 1,
-        "encoding": "binary",
-        "safe_value": 0,
-        "latch_clock": null
-      },
-      {
-        "key": "dz0",
-        "kind": "digital",
-        "lanes": [
-          "dz0"
-        ],
-        "label": "dz0",
-        "bus_index": null,
-        "width": 1,
-        "encoding": "binary",
-        "safe_value": 0,
-        "latch_clock": null
-      },
-      {
-        "key": "dz1",
-        "kind": "digital",
-        "lanes": [
-          "dz1"
-        ],
-        "label": "dz1",
-        "bus_index": null,
-        "width": 1,
-        "encoding": "binary",
-        "safe_value": 0,
-        "latch_clock": null
-      },
-      {
-        "key": "dz2",
-        "kind": "digital",
-        "lanes": [
-          "dz2"
-        ],
-        "label": "dz2",
-        "bus_index": null,
-        "width": 1,
-        "encoding": "binary",
-        "safe_value": 0,
-        "latch_clock": null
-      },
-      {
-        "key": "dz3",
-        "kind": "digital",
-        "lanes": [
-          "dz3"
-        ],
-        "label": "dz3",
-        "bus_index": null,
-        "width": 1,
-        "encoding": "binary",
-        "safe_value": 0,
-        "latch_clock": null
-      },
-      {
-        "key": "dz4",
-        "kind": "digital",
-        "lanes": [
-          "dz4"
-        ],
-        "label": "dz4",
-        "bus_index": null,
-        "width": 1,
-        "encoding": "binary",
-        "safe_value": 0,
-        "latch_clock": null
-      },
-      {
-        "key": "dz5",
-        "kind": "digital",
-        "lanes": [
-          "dz5"
-        ],
-        "label": "dz5",
+        "label": "da_clk3",
         "bus_index": null,
         "width": 1,
         "encoding": "binary",
@@ -357,19 +443,57 @@
         "latch_clock": null
       }
     ],
-    "abi_fingerprint": "005f432a1096c882839f5d685a1d9454c151361bb2a1de4b6cc0b450ed0462a3"
+    "abi_fingerprint": "d9ce9aea5da7380f0670ee89c5f936f5f32edfc00c98939b4dd06af32a8563c9"
   },
   "time_step_ns": 20.0,
   "periods": [
     {
-      "duration": 20000000.0,
+      "period_id": "p1",
+      "duration": 20000000,
       "unit": "ns",
       "name": "image1_expose",
       "states": [
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
         1,
         0,
         1,
-        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
         0,
         0,
         0,
@@ -391,13 +515,24 @@
         0,
         0,
         0
-      ]
+      ],
+      "analog_steps": []
     },
     {
-      "duration": 1000000.0,
+      "period_id": "p2",
+      "duration": 1000000,
       "unit": "ns",
       "name": "image1_settle",
       "states": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
         1,
         0,
         0,
@@ -422,11 +557,41 @@
         0,
         0,
         0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
         0
-      ]
+      ],
+      "analog_steps": []
     },
     {
-      "duration": "s0",
+      "period_id": "p3",
+      "duration": 20000,
       "unit": "ns",
       "name": "trap_off",
       "states": [
@@ -454,14 +619,62 @@
         0,
         0,
         0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
         0
-      ]
+      ],
+      "analog_steps": []
     },
     {
-      "duration": 1000000.0,
+      "period_id": "p4",
+      "duration": 1000000,
       "unit": "ns",
       "name": "trap_recapture",
       "states": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
         1,
         0,
         0,
@@ -486,18 +699,85 @@
         0,
         0,
         0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
         0
-      ]
+      ],
+      "analog_steps": []
     },
     {
-      "duration": 20000000.0,
+      "period_id": "p5",
+      "duration": 20000000,
       "unit": "ns",
       "name": "image2_expose",
       "states": [
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
         1,
         0,
         1,
-        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
         0,
         0,
         0,
@@ -519,13 +799,24 @@
         0,
         0,
         0
-      ]
+      ],
+      "analog_steps": []
     },
     {
-      "duration": 1000000.0,
+      "period_id": "p6",
+      "duration": 1000000,
       "unit": "ns",
       "name": "image2_settle",
       "states": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
         1,
         0,
         0,
@@ -550,36 +841,60 @@
         0,
         0,
         0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
         0
-      ]
+      ],
+      "analog_steps": []
     }
   ],
-  "scan_slots": [
+  "scan_parameters": [
     {
-      "name": "t_off",
-      "kind": "duration",
-      "target": "2",
+      "parameter_id": "t_off",
+      "field": {
+        "kind": "duration",
+        "period_id": "p3",
+        "port": null
+      },
       "label": "t_off",
-      "unit": "ns",
-      "nominal": 20000.0
+      "unit": "ns"
     }
   ],
-  "scan_table": [],
-  "scan_code": "",
-  "api_slots": [],
+  "scan_table": null,
+  "scan_recipe": null,
+  "api_parameters": [],
   "visible_ports": [
-    "trap",
-    "cooling",
-    "probe",
-    "emCCD"
+    "ch09",
+    "ch00",
+    "ch03",
+    "ch11"
   ],
-  "analog_bus_programs": [],
   "delays": [],
-  "repeat": {
-    "start": null,
-    "end": null,
-    "count": 1,
-    "forever": false
-  },
-  "scan_repeats": 0
+  "repeat": null
 }

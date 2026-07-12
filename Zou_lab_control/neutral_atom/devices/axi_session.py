@@ -56,7 +56,12 @@ from fpga.pulse_streamer.host.image import (
     build_fingerprint,
 )
 from zlc_pulse.artifact import CompiledPulseArtifact
-from zlc_pulse.fpga import pack_target_ir
+from zlc_pulse.deployment import (
+    validate_artifact_for_deployment,
+    validate_deployed_target,
+)
+from zlc_pulse.ir import TargetIR
+from zlc_pulse.target import PulseTarget
 
 # Runtime clock + geometry default come from the single config file
 # (fpga/board_config/streamer_config.json via host.image).  The clock default has
@@ -127,6 +132,7 @@ class VivadoAxiStreamerSession:
         program_on_start: bool = False,
         clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
         params: StreamerParams | None = None,
+        deployed_target: PulseTarget | None = None,
         startup_timeout: float = 180.0,
         # Per-transaction ceiling.  Generous on purpose: JTAG ops normally finish in
         # well under a second, but ONE transient slow transaction (USB hiccup, busy
@@ -148,6 +154,9 @@ class VivadoAxiStreamerSession:
         self.program_on_start = bool(program_on_start)
         self.clock_hz = float(clock_hz)
         self.params = params or DEFAULT_PARAMS
+        if deployed_target is not None:
+            validate_deployed_target(deployed_target, self.params)
+        self._deployed_target = deployed_target
         self.startup_timeout = float(startup_timeout)
         self.action_timeout = action_timeout
         self.load_timeout = float(load_timeout)
@@ -172,6 +181,7 @@ class VivadoAxiStreamerSession:
         self._drain_until: float = 0.0       # monotonic deadline of the previous finite run
         self._repeat_forever = False
         self._program = None          # last prepared program (for streaming refills)
+        self._prepared_artifact: CompiledPulseArtifact | None = None
         self._prepared_artifact_digest: str | None = None
         self._prepared_duration_seconds = 0.0
         self._total_points = 0
@@ -501,10 +511,21 @@ class VivadoAxiStreamerSession:
         """Pack the program into the BRAM image, upload it over AXI, then command
         the top's mini-loader to copy the bus image into the engine (LOAD)."""
 
+        if self._deployed_target is not None:
+            raise RuntimeError(
+                "deployment-bound sessions accept only prepare_compiled_artifact()"
+            )
+        if isinstance(program, (TargetIR, CompiledPulseArtifact)):
+            raise TypeError(
+                "current pulse values require prepare_compiled_artifact(); "
+                "the raw legacy prepare path cannot attest their deployment target"
+            )
+
         self._stop_stream_thread()             # any prior streaming refill must end first
         p = self.params
         points = list(getattr(program, "scan_points", []) or [])
         self._program = program
+        self._prepared_artifact = None
         self._prepared_artifact_digest = None
         self._total_points = len(points)
         self._total_chunks = max(1, math.ceil(self._total_points / p.bank_size)) if self._total_points else 1
@@ -592,20 +613,22 @@ class VivadoAxiStreamerSession:
     def prepare_compiled_artifact(self, artifact: CompiledPulseArtifact) -> None:
         """Upload one exact current artifact without rebuilding a legacy runtime program."""
 
-        if not isinstance(artifact, CompiledPulseArtifact):
-            raise TypeError("artifact must be CompiledPulseArtifact")
+        if self._deployed_target is None:
+            raise RuntimeError(
+                "compiled pulse hardware session has no bound deployed PulseTarget"
+            )
+        validate_artifact_for_deployment(
+            artifact,
+            self._deployed_target,
+            self.params,
+            self.clock_hz,
+        )
         ir = artifact.target_ir
-        if ir.clock_hz != self.clock_hz:
-            raise ValueError("compiled artifact clock differs from hardware session clock")
-        expected_geometry = build_fingerprint(self.params) & 0xFFFFFFFF
-        if artifact.wire_image.geometry_fingerprint != expected_geometry:
-            raise ValueError("compiled artifact geometry differs from hardware session geometry")
-        if artifact.wire_image != pack_target_ir(ir, self.params):
-            raise ValueError("compiled artifact wire image differs from deterministic TargetIR packing")
 
         self._stop_stream_thread()
         points = ir.scan_points
         self._program = ir
+        self._prepared_artifact = None
         self._prepared_artifact_digest = None
         self._total_points = len(points)
         self._total_chunks = (
@@ -644,6 +667,7 @@ class VivadoAxiStreamerSession:
                 "pulse streamer did not report LOADED after the current artifact upload "
                 f"(STATUS=0x{status:08X})"
             )
+        self._prepared_artifact = artifact
         self._prepared_artifact_digest = artifact.fingerprint
 
     def axi_self_test(self, *, count: int = 16) -> bool:
@@ -792,10 +816,10 @@ class VivadoAxiStreamerSession:
             print(f"ZLC FIRE diag: STATUS read failed: {exc}", flush=True)
 
     def fire_compiled_artifact(self, artifact: CompiledPulseArtifact) -> None:
-        if not isinstance(artifact, CompiledPulseArtifact):
-            raise TypeError("artifact must be CompiledPulseArtifact")
-        if self._prepared_artifact_digest != artifact.fingerprint:
-            self.prepare_compiled_artifact(artifact)
+        if artifact is not self._prepared_artifact:
+            raise RuntimeError(
+                "FIRE artifact is not the exact immutable artifact prepared in this session"
+            )
         self.fire()
 
     # --- streaming refill primitive -----------------------------------------
@@ -887,9 +911,7 @@ class VivadoAxiStreamerSession:
         artifact: CompiledPulseArtifact,
         timeout: float | None = None,
     ) -> bool:
-        if not isinstance(artifact, CompiledPulseArtifact):
-            raise TypeError("artifact must be CompiledPulseArtifact")
-        if self._prepared_artifact_digest != artifact.fingerprint:
+        if artifact is not self._prepared_artifact:
             raise RuntimeError("compiled artifact is not the program prepared in this session")
         return self.wait_done(timeout=timeout)
 
@@ -1033,6 +1055,7 @@ class VivadoAxiStreamerSession:
         # an EXPLICIT stop abandons any delayed tail on purpose -- the next prepare()
         # must not wait out a drain deadline the user just cancelled.
         self._drain_until = 0.0
+        self._prepared_artifact = None
         self._prepared_artifact_digest = None
 
     def current_snapshot(self) -> dict[str, object]:

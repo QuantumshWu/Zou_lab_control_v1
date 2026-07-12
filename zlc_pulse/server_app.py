@@ -13,9 +13,10 @@ from fpga.pulse_streamer.host.image import (
     default_params,
 )
 
+from .deployment import APPROVED_DEPLOYED_TARGET_ABI, validate_deployed_target
 from .server import PulseExecutionService, serve_pulse_execution_service
 from .session_backend import PulseStreamerSessionBackend
-from .target import PORT_DAC, PulseTarget, load_pulse_target
+from .target import PulseTarget, load_pulse_target
 
 
 class DeployedStreamerSession(Protocol):
@@ -48,25 +49,6 @@ class PulseServerRuntime:
                 self.session.close()
 
 
-def validate_deployed_target(target: PulseTarget, params: StreamerParams) -> None:
-    if not isinstance(target, PulseTarget):
-        raise TypeError("target must be PulseTarget")
-    if not isinstance(params, StreamerParams):
-        raise TypeError("params must be StreamerParams")
-    if len(target.raw_lanes) != params.channel_count:
-        raise ValueError(
-            "deployed PulseTarget raw lane count differs from frozen streamer channel_count"
-        )
-    dac_ports = tuple(port for port in target.ports if port.kind == PORT_DAC)
-    if len(dac_ports) > params.bus_count:
-        raise ValueError("deployed PulseTarget declares more DAC buses than the frozen streamer")
-    for port in dac_ports:
-        if port.bus_index is None or port.bus_index >= params.bus_count:
-            raise ValueError(f"DAC port {port.key!r} bus index exceeds frozen streamer geometry")
-        if port.width > params.bus_width:
-            raise ValueError(f"DAC port {port.key!r} width exceeds frozen streamer bus width")
-
-
 def build_service_for_session(
     target: PulseTarget,
     session: DeployedStreamerSession,
@@ -84,7 +66,7 @@ def build_service_for_session(
     return PulseExecutionService(
         target,
         clock_hz=clock,
-        backend=PulseStreamerSessionBackend(session),
+        backend=PulseStreamerSessionBackend(session, target, geometry, clock),
         params=geometry,
     )
 
@@ -92,22 +74,25 @@ def build_service_for_session(
 def bring_up_frozen_session(session: DeployedStreamerSession, backend: str) -> None:
     """Verify the approved deployment without synthesizing or programming hardware."""
 
+    if backend not in {"jtag-axi", "uart"}:
+        raise ValueError("backend must be 'jtag-axi' or 'uart'")
     session.start()
+    layout_verified = False
     try:
-        session.clear_host_config()
         session.check_register_layout()
+        layout_verified = True
+        session.clear_host_config()
         if backend == "jtag-axi":
             session.axi_self_test()
         elif backend == "uart":
             session.link_self_test()
-        else:
-            raise ValueError("backend must be 'jtag-axi' or 'uart'")
         session.safe_state()
     except BaseException:
-        try:
-            session.safe_state()
-        except BaseException:
-            pass
+        if layout_verified:
+            try:
+                session.safe_state()
+            except BaseException:
+                pass
         session.close()
         raise
 
@@ -115,6 +100,7 @@ def bring_up_frozen_session(session: DeployedStreamerSession, backend: str) -> N
 def open_deployed_session(
     backend: str,
     *,
+    target: PulseTarget,
     state_dir: str | Path,
     params: StreamerParams,
     clock_hz: float,
@@ -128,6 +114,7 @@ def open_deployed_session(
             state_dir=state_dir,
             params=params,
             clock_hz=clock_hz,
+            deployed_target=target,
             program_on_start=False,
         )
     if backend == "uart":
@@ -139,6 +126,7 @@ def open_deployed_session(
             state_dir=state_dir,
             params=params,
             clock_hz=clock_hz,
+            deployed_target=target,
             port=uart_port,
             baud=uart_baud,
         )
@@ -163,15 +151,37 @@ def build_server_runtime(
     validate_deployed_target(target, geometry)
     session = open_deployed_session(
         backend,
+        target=target,
         state_dir=state_dir,
         params=geometry,
         clock_hz=clock,
         uart_port=uart_port,
         uart_baud=uart_baud,
     )
+    try:
+        service = build_service_for_session(
+            target,
+            session,
+            params=geometry,
+            clock_hz=clock,
+        )
+    except BaseException:
+        session.close()
+        raise
     bring_up_frozen_session(session, backend)
-    service = build_service_for_session(target, session, params=geometry, clock_hz=clock)
-    rpc_server = serve_pulse_execution_service(service, host=host, port=port, start=False)
+    try:
+        rpc_server = serve_pulse_execution_service(
+            service,
+            host=host,
+            port=port,
+            start=False,
+        )
+    except BaseException:
+        try:
+            session.safe_state()
+        finally:
+            session.close()
+        raise
     runtime = PulseServerRuntime(service, rpc_server, session)
     if start:
         try:
@@ -214,6 +224,7 @@ if __name__ == "__main__":  # pragma: no cover - CLI boundary
 
 
 __all__ = [
+    "APPROVED_DEPLOYED_TARGET_ABI",
     "PulseServerRuntime",
     "bring_up_frozen_session",
     "build_arg_parser",

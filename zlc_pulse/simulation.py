@@ -9,6 +9,9 @@ from .artifact import CompiledPulseArtifact
 from .ir import TargetIR
 
 
+MAX_MATERIALIZED_PLAYBACK_TRANSITIONS = 1_000_000
+
+
 @dataclass(frozen=True)
 class PlaybackPulse:
     channel: str
@@ -160,21 +163,43 @@ def _expanded_mask_transitions(ir: TargetIR) -> tuple[list[tuple[int, int]], int
             ir.scan_coeff_frac_bits,
         )
         loop_span = loop_end_tick - loop_start_tick
-        for index in range(ir.loop_start_index):
-            if effective[index] < final_tick:
-                transitions.append((run_offset + effective[index], ir.masks[index]))
+        prefix_indices = tuple(
+            index
+            for index in range(ir.loop_start_index)
+            if effective[index] < final_tick
+        )
+        body_indices = tuple(
+            index
+            for index in range(ir.loop_start_index, len(ir.ticks))
+            if effective[index] < loop_end_tick and effective[index] < final_tick
+        )
+        tail_indices = tuple(
+            index
+            for index in range(ir.loop_start_index, len(ir.ticks))
+            if loop_end_tick <= effective[index] < final_tick
+        )
+        projected = (
+            len(transitions)
+            + len(prefix_indices)
+            + len(body_indices) * ir.loop_count
+            + len(tail_indices)
+        )
+        if projected > MAX_MATERIALIZED_PLAYBACK_TRANSITIONS:
+            raise ValueError(
+                "pulse playback exceeds the materialization limit of "
+                f"{MAX_MATERIALIZED_PLAYBACK_TRANSITIONS} transitions"
+            )
+        for index in prefix_indices:
+            transitions.append((run_offset + effective[index], ir.masks[index]))
         for iteration in range(ir.loop_count):
             shift = iteration * loop_span
-            for index in range(ir.loop_start_index, len(ir.ticks)):
+            for index in body_indices:
                 tick = effective[index]
-                if tick >= loop_end_tick or tick >= final_tick:
-                    break
                 transitions.append((run_offset + tick + shift, ir.masks[index]))
         tail_shift = (ir.loop_count - 1) * loop_span
-        for index in range(ir.loop_start_index, len(ir.ticks)):
+        for index in tail_indices:
             tick = effective[index]
-            if loop_end_tick <= tick < final_tick:
-                transitions.append((run_offset + tick + tail_shift, ir.masks[index]))
+            transitions.append((run_offset + tick + tail_shift, ir.masks[index]))
         run_offset += final_tick + tail_shift
     transitions.append((run_offset, 0))
     transitions.sort(key=lambda item: item[0])
@@ -199,4 +224,9 @@ def _effective_tick(
     )
 
 
-__all__ = ["PlaybackPulse", "PulsePlayback", "build_pulse_playback"]
+__all__ = [
+    "MAX_MATERIALIZED_PLAYBACK_TRANSITIONS",
+    "PlaybackPulse",
+    "PulsePlayback",
+    "build_pulse_playback",
+]

@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 
 from fpga.pulse_streamer.host.image import StreamerParams
-from zlc_pulse import load_pulse_document, load_pulse_target
+from zlc_pulse import (
+    PORT_DIGITAL,
+    PulsePortSpec,
+    PulseTarget,
+    load_pulse_target,
+)
 from zlc_pulse.server_app import (
     bring_up_frozen_session,
     build_server_runtime,
@@ -26,6 +31,7 @@ class AppSession:
         self.clock_hz = clock_hz
         self.events: list[str] = []
         self.fail_self_test = False
+        self.fail_layout = False
 
     def start(self):
         self.events.append("start")
@@ -36,6 +42,8 @@ class AppSession:
 
     def check_register_layout(self):
         self.events.append("layout")
+        if self.fail_layout:
+            raise RuntimeError("layout mismatch")
 
     def axi_self_test(self):
         self.events.append("axi-self-test")
@@ -66,7 +74,7 @@ class AppSession:
 
 
 def _target():
-    return load_pulse_document(ROOT / "pulses" / "camera_imaging_address_switch.json").target
+    return load_pulse_target(ROOT / "pulses" / "deployed_target.json")
 
 
 def test_target_file_loader_accepts_only_the_current_canonical_schema(tmp_path):
@@ -83,7 +91,7 @@ def test_target_file_loader_accepts_only_the_current_canonical_schema(tmp_path):
 def test_frozen_bringup_is_safe_and_never_programs_hardware():
     session = AppSession(StreamerParams())
     bring_up_frozen_session(session, "jtag-axi")
-    assert session.events == ["start", "clear", "layout", "axi-self-test", "safe"]
+    assert session.events == ["start", "layout", "clear", "axi-self-test", "safe"]
 
 
 def test_failed_bringup_attempts_safe_then_closes():
@@ -94,14 +102,63 @@ def test_failed_bringup_attempts_safe_then_closes():
     assert session.events[-2:] == ["safe", "close"]
 
 
+def test_layout_mismatch_closes_without_any_geometry_dependent_write():
+    session = AppSession(StreamerParams())
+    session.fail_layout = True
+    with pytest.raises(RuntimeError, match="layout mismatch"):
+        bring_up_frozen_session(session, "jtag-axi")
+    assert session.events == ["start", "layout", "close"]
+
+
+def test_invalid_backend_is_rejected_before_session_start_or_io():
+    session = AppSession(StreamerParams())
+    with pytest.raises(ValueError, match="backend"):
+        bring_up_frozen_session(session, "invalid")
+    assert session.events == []
+
+
 def test_server_rejects_target_or_session_geometry_drift():
     params = StreamerParams()
     target = _target()
     validate_deployed_target(target, params)
 
-    short_target = load_pulse_document(ROOT / "pulses" / "imaging_template.json").target
+    short_target = PulseTarget(
+        ("only",),
+        (
+            PulsePortSpec(
+                "only", PORT_DIGITAL, ("only",), "only", None, 1, "binary", 0, None
+            ),
+        ),
+    )
     with pytest.raises(ValueError, match="raw lane count"):
         validate_deployed_target(short_target, params)
+
+    all_digital = PulseTarget(
+        target.raw_lanes,
+        tuple(
+            PulsePortSpec(
+                lane,
+                PORT_DIGITAL,
+                (lane,),
+                lane,
+                None,
+                1,
+                "binary",
+                0,
+                None,
+            )
+            for lane in target.raw_lanes
+        ),
+    )
+    with pytest.raises(ValueError, match="digital-port count"):
+        validate_deployed_target(all_digital, params)
+
+    renamed = PulseTarget(
+        target.raw_lanes,
+        (replace(target.ports[0], key="renamed-ch00"), *target.ports[1:]),
+    )
+    with pytest.raises(ValueError, match="approved deployed topology"):
+        validate_deployed_target(renamed, params)
 
     session = AppSession(replace(params, bank_size=1024))
     with pytest.raises(ValueError, match="session geometry"):
@@ -142,4 +199,30 @@ def test_server_runtime_composes_only_the_current_service(monkeypatch, tmp_path)
     assert runtime.service.snapshot()["backend"]["transport"] == "test"
     runtime.close()
     assert calls[-1] == ("close", None)
+    assert session.events[-2:] == ["safe", "close"]
+
+
+def test_rpc_server_construction_failure_closes_the_hardware_owner(monkeypatch, tmp_path):
+    params = StreamerParams()
+    session = AppSession(params)
+    monkeypatch.setattr(
+        "zlc_pulse.server_app.open_deployed_session",
+        lambda *args, **kwargs: session,
+    )
+
+    def fail_serve(*args, **kwargs):
+        raise RuntimeError("cannot bind rpc socket")
+
+    monkeypatch.setattr(
+        "zlc_pulse.server_app.serve_pulse_execution_service",
+        fail_serve,
+    )
+    with pytest.raises(RuntimeError, match="cannot bind"):
+        build_server_runtime(
+            _target(),
+            backend="jtag-axi",
+            state_dir=tmp_path,
+            params=params,
+            clock_hz=50e6,
+        )
     assert session.events[-2:] == ["safe", "close"]

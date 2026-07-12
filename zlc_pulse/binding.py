@@ -4,49 +4,71 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from .authoring import _map_field_ref_ports
 from .document import PulseDocument
-from .target import PulsePortSpec, PulseTarget
+from .target import PORT_CLOCK, PulsePortSpec, PulseTarget
 
 
 def bind_pulse_document_target(
     document: PulseDocument,
     target: PulseTarget,
 ) -> PulseDocument:
-    """Re-key declared logical ports by exact physical ownership.
-
-    Raw state vectors and delay lanes are already physical and remain unchanged.
-    Only referenced logical keys are rebound.  A referenced port must have one
-    live port with the same kind and exact ordered lane tuple; names, labels,
-    widths, and singleton shapes are never used to guess ownership.
-    """
+    """Re-key logical ports by exact physical ownership, never by name or shape."""
 
     if not isinstance(document, PulseDocument):
         raise TypeError("document must be PulseDocument")
     if not isinstance(target, PulseTarget):
         raise TypeError("target must be PulseTarget")
     if document.target.abi_fingerprint == target.abi_fingerprint:
-        return document
+        return document if document.target is target else replace(document, target=target)
     if document.target.raw_lanes != target.raw_lanes:
         raise ValueError("PulseDocument raw lane order differs from live target")
 
-    by_physical: dict[tuple[str, tuple[str, ...]], list[PulsePortSpec]] = {}
+    source_clock_lanes = {
+        port.lanes for port in document.target.ports if port.kind == PORT_CLOCK
+    }
+    live_clock_lanes = {
+        port.lanes for port in target.ports if port.kind == PORT_CLOCK
+    }
+    if source_clock_lanes != live_clock_lanes:
+        raise ValueError(
+            "live target clock-mux outputs differ from the authored physical topology"
+        )
+
+    by_physical: dict[tuple[object, ...], list[PulsePortSpec]] = {}
     for port in target.ports:
-        by_physical.setdefault((port.kind, port.lanes), []).append(port)
+        by_physical.setdefault(_physical_signature(target, port), []).append(port)
 
     referenced = set(document.visible_ports)
     referenced.update(
-        _dac_target_key(slot.target) for slot in document.scan_slots if slot.kind == "dac"
+        parameter.field.port
+        for parameter in (*document.scan_parameters, *document.api_parameters)
+        if parameter.field.port is not None
     )
     referenced.update(
-        _dac_target_key(slot.target) for slot in document.api_slots if slot.kind == "dac"
+        step.port for period in document.periods for step in period.analog_steps
     )
-    referenced.update(key for key, _steps in document.analog_bus_programs)
+    referenced.update(delay.port for delay in document.delays)
+    source_owner = {
+        lane: port for port in document.target.ports for lane in port.lanes
+    }
+    referenced.update(
+        source_owner[lane].key
+        for lane_index, lane in enumerate(document.target.raw_lanes)
+        if any(period.states[lane_index] for period in document.periods)
+    )
+    referenced.update(
+        port.key for port in document.target.ports if port.kind == PORT_CLOCK
+    )
     mapping: dict[str, str] = {}
     for key in referenced:
         source = document.target.by_key.get(key)
         if source is None:
             raise ValueError(f"PulseDocument references unknown source port {key!r}")
-        candidates = by_physical.get((source.kind, source.lanes), ())
+        candidates = by_physical.get(
+            _physical_signature(document.target, source),
+            (),
+        )
         if len(candidates) != 1:
             raise ValueError(
                 f"referenced port {key!r} has no unique physically equivalent live owner"
@@ -59,43 +81,54 @@ def bind_pulse_document_target(
         document,
         target=target,
         visible_ports=rebound_visible,
-        scan_slots=tuple(
+        periods=tuple(
             replace(
-                slot,
-                target=_rebind_slot_target(slot.kind, slot.target, mapping),
+                period,
+                analog_steps=tuple(
+                    replace(step, port=mapping[step.port])
+                    for step in period.analog_steps
+                ),
             )
-            for slot in document.scan_slots
+            for period in document.periods
         ),
-        api_slots=tuple(
+        scan_parameters=tuple(
             replace(
-                slot,
-                target=_rebind_slot_target(slot.kind, slot.target, mapping),
+                parameter,
+                field=_map_field_ref_ports(parameter.field, mapping),
             )
-            for slot in document.api_slots
+            for parameter in document.scan_parameters
         ),
-        analog_bus_programs=tuple(
-            (mapping[key], steps)
-            for key, steps in document.analog_bus_programs
+        api_parameters=tuple(
+            replace(
+                parameter,
+                field=_map_field_ref_ports(parameter.field, mapping),
+            )
+            for parameter in document.api_parameters
+        ),
+        delays=tuple(
+            replace(delay, port=mapping[delay.port]) for delay in document.delays
         ),
     )
 
 
-def _dac_target_key(target: str) -> str:
-    key, separator, period = target.partition("@")
-    if not separator or not key or not period:
-        raise ValueError("DAC slot target must be port@period")
-    return key
-
-
-def _rebind_slot_target(
-    kind: str,
-    target: str,
-    mapping: dict[str, str],
-) -> str:
-    if kind != "dac":
-        return target
-    key = _dac_target_key(target)
-    return f"{mapping[key]}@{target.split('@', 1)[1]}"
+def _physical_signature(
+    target: PulseTarget,
+    port: PulsePortSpec,
+) -> tuple[object, ...]:
+    latch_lanes = (
+        None
+        if port.latch_clock is None
+        else target.by_key[port.latch_clock].lanes
+    )
+    return (
+        port.kind,
+        port.lanes,
+        port.bus_index,
+        port.width,
+        port.encoding,
+        port.safe_value,
+        latch_lanes,
+    )
 
 
 __all__ = ["bind_pulse_document_target"]

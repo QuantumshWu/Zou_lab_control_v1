@@ -13,6 +13,7 @@ from Zou_lab_control.neutral_atom.devices.virtual import (
     VirtualSequencer,
     VirtualTrapArray,
 )
+from Zou_lab_control.neutral_atom.ports import PortCatalog, PortSpec
 from zlc_data import AxisId, AxisSpec, BlockId, PointLayout, REPEAT, SCAN_POINT
 from zlc_neutral_atom.acquisition import CameraAcquisitionMode
 from zlc_neutral_atom.artifacts import (
@@ -49,13 +50,35 @@ def _axis(name, role, size):
 
 def _runtime(point_count=3):
     document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
-    sequencer = VirtualSequencer(sleep_scale=0)
+    catalog = PortCatalog(
+        document.target.raw_lanes,
+        tuple(
+            PortSpec(
+                port.key,
+                port.kind,
+                port.lanes,
+                port.label,
+                port.bus_index,
+                port.width,
+                port.encoding,
+                port.safe_value,
+                port.latch_clock,
+            )
+            for port in document.target.ports
+        ),
+    )
+    sequencer = VirtualSequencer(sleep_scale=0, port_catalog=catalog)
     document = bind_pulse_document_target(
         document,
         pulse_target_from_legacy_tree(sequencer.port_catalog.to_dict()),
     )
     trap = VirtualTrapArray(grid_shape=(2, 2), image_shape=(6, 8), seed=7)
-    camera = VirtualCamera(trap, exposure=1e-3, sequencer=sequencer)
+    camera = VirtualCamera(
+        trap,
+        exposure=1e-3,
+        capture_trigger_channels=("ch11",),
+        sequencer=sequencer,
+    )
     device_set = DeviceSet(
         {"trap": trap, "sequencer": sequencer, "readout": camera},
         {
@@ -90,7 +113,7 @@ def _runtime(point_count=3):
         document,
         clock_hz=sequencer.clock_hz,
         execution_form=PulseExecutionForm.STATIC_ONCE,
-        trigger_channels=("emCCD",),
+        trigger_channels=("ch11",),
         live_target=document.target,
     )
     return runtime, camera, sequencer, capture, document, pulse_port, artifact
@@ -110,7 +133,7 @@ def test_camera_is_armed_before_one_fire_and_all_frames_are_exactly_materialized
         capture,
         pulse_port,
         FinitePulseExecutionRequest(document, artifact),
-        "emCCD",
+        "ch11",
     )
     try:
         result = runtime.controller.run(compile_triggered_pipeline(spec))
@@ -120,7 +143,7 @@ def test_camera_is_armed_before_one_fire_and_all_frames_are_exactly_materialized
         assert [item.source_ordinal for item in result.dataset.event_metadata] == [0, 1, 2]
         assert [item.produced_count for item in result.dataset.event_metadata] == [1, 2, 3]
         assert result.capture_terminal.produced_count == 3
-        assert result.pulse_terminal.completed_schedule_trigger_counts == (("emCCD", 3),)
+        assert result.pulse_terminal.completed_schedule_trigger_counts == (("ch11", 3),)
         assert [item["action"] for item in sequencer.history] == [
             "prepare",
             "fire",
@@ -143,7 +166,7 @@ def test_trigger_cardinality_mismatch_is_rejected_before_hardware_run():
                 capture,
                 pulse_port,
                 FinitePulseExecutionRequest(document, artifact),
-                "emCCD",
+                "ch11",
             )
         assert sequencer.history == []
     finally:
@@ -157,7 +180,7 @@ def test_triggered_capture_artifact_persists_pulse_lineage(tmp_path):
         capture,
         pulse_port,
         FinitePulseExecutionRequest(document, artifact),
-        "emCCD",
+        "ch11",
     )
     try:
         reference = runtime.controller.run(
@@ -169,7 +192,7 @@ def test_triggered_capture_artifact_persists_pulse_lineage(tmp_path):
         assert lineage.compiled_artifact_digest == artifact.fingerprint
         assert lineage.source_document_digest == document.fingerprint
         assert lineage.execution_form is PulseExecutionForm.STATIC_ONCE
-        assert lineage.trigger_channel == "emCCD"
+        assert lineage.trigger_channel == "ch11"
         assert lineage.expected_trigger_count == 3
         assert lineage.terminal.logical_done
         assert stored.terminal.produced_count == lineage.expected_trigger_count

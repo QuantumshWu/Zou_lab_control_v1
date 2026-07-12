@@ -13,6 +13,7 @@ from fpga.pulse_streamer.host.image import (
 from zlc_storage import canonical_digest
 
 from .ir import TargetIR, target_ir_to_tree
+from .validation import validate_target_ir_for_geometry
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,7 @@ def pack_target_ir(
     if not isinstance(value, TargetIR):
         raise TypeError("pack_target_ir requires TargetIR")
     geometry = params or StreamerParams()
+    validate_target_ir_for_geometry(value, geometry)
     carrier = SimpleNamespace(
         ticks=value.ticks,
         masks=value.masks,

@@ -65,8 +65,10 @@ class PulsePortSpec:
         if kind in (PORT_DIGITAL, PORT_CLOCK):
             if width != 1 or bus_index is not None:
                 raise ValueError("digital/clock ports require width one and no bus_index")
-            if self.encoding != "binary" or safe not in (0, 1):
-                raise ValueError("digital/clock ports require binary safe state")
+            if self.encoding != "binary" or safe != 0:
+                raise ValueError(
+                    "digital/clock ports require the frozen engine's low safe state"
+                )
             if self.latch_clock is not None:
                 raise ValueError("digital/clock ports cannot reference a latch clock")
         else:
@@ -74,8 +76,10 @@ class PulsePortSpec:
                 raise ValueError("DAC ports require width >= 2 and non-negative bus_index")
             if self.encoding != DAC_OFFSET_BINARY:
                 raise ValueError("only offset-binary DAC encoding is supported")
-            if safe < 0 or safe >= 1 << width:
-                raise ValueError("DAC safe value does not fit its wire width")
+            if safe != 1 << (width - 1):
+                raise ValueError(
+                    "DAC safe value must be the frozen engine's offset-binary midpoint"
+                )
         object.__setattr__(self, "key", key)
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "lanes", lanes)

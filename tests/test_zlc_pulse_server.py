@@ -61,7 +61,7 @@ def _artifact(params=None, execution_form=PulseExecutionForm.STATIC_ONCE):
         document,
         clock_hz=50e6,
         execution_form=execution_form,
-        trigger_channels=() if execution_form is PulseExecutionForm.CONTINUOUS_MONITOR else ("emCCD",),
+        trigger_channels=() if execution_form is PulseExecutionForm.CONTINUOUS_MONITOR else ("ch11",),
         params=params,
     )
 
@@ -81,7 +81,7 @@ def test_server_executes_one_exact_current_artifact_and_returns_schedule_receipt
     completion = service.complete(reference, timeout=3.0)
 
     assert completion.logical_done
-    assert completion.completed_schedule_trigger_counts == (("emCCD", 3),)
+    assert completion.completed_schedule_trigger_counts == (("ch11", 3),)
     assert reference.artifact_digest == artifact.fingerprint
     assert [action[0] for action in backend.actions] == ["prepare", "fire", "wait_done"]
     assert service.snapshot()["state"] == "DONE"

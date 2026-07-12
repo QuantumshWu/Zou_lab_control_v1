@@ -9,6 +9,7 @@ import pytest
 
 from fpga.pulse_streamer.host.image import StreamerParams
 from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
+from Zou_lab_control.neutral_atom.ports import PortCatalog, PortSpec
 from zlc_neutral_atom.runtime import (
     CleanupReport,
     CleanupStepAck,
@@ -44,7 +45,24 @@ ROOT = Path(__file__).parents[1]
 
 
 def _bound_virtual_sequencer(document):
-    sequencer = VirtualSequencer(sleep_scale=0)
+    catalog = PortCatalog(
+        document.target.raw_lanes,
+        tuple(
+            PortSpec(
+                port.key,
+                port.kind,
+                port.lanes,
+                port.label,
+                port.bus_index,
+                port.width,
+                port.encoding,
+                port.safe_value,
+                port.latch_clock,
+            )
+            for port in document.target.ports
+        ),
+    )
+    sequencer = VirtualSequencer(sleep_scale=0, port_catalog=catalog)
     document = bind_pulse_document_target(
         document,
         pulse_target_from_legacy_tree(sequencer.port_catalog.to_dict()),
@@ -126,14 +144,14 @@ def test_finite_pulse_runs_prepare_fire_terminal_then_verified_safe():
         document,
         clock_hz=sequencer.clock_hz,
         execution_form=PulseExecutionForm.STATIC_ONCE,
-        trigger_channels=("emCCD",),
+        trigger_channels=("ch11",),
         live_target=document.target,
     )
     plan, holder = _plan(port, FinitePulseExecutionRequest(document, artifact))
     terminal = RunController(ResourceArbiter(MemoryQuarantineJournal())).run(plan)
 
     assert terminal.logical_done
-    assert terminal.completed_schedule_trigger_counts == (("emCCD", 3),)
+    assert terminal.completed_schedule_trigger_counts == (("ch11", 3),)
     assert terminal.artifact_digest == artifact.fingerprint
     assert holder["session"].state is PulseSessionState.COMPLETED
     assert dict(sequencer.snapshot())["state"] == "safe"
@@ -162,8 +180,8 @@ def test_live_target_mismatch_is_rejected_before_prepare_or_fire():
 @pytest.mark.parametrize(
     ("filename", "form", "trigger_channel"),
     [
-        ("release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "emCCD"),
-        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "mot_trigger"),
+        ("release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "ch11"),
+        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "ch11"),
     ],
 )
 def test_reference_and_scan_forms_execute_the_exact_compiled_ir(

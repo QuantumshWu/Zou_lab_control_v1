@@ -135,7 +135,7 @@ def _plan(port, request):
 
 
 def test_remote_current_endpoint_runs_exact_artifact_and_closes_safe():
-    document = load_pulse_document(ROOT / "pulses" / "T.json")
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     artifact = compile_pulse_artifact(
         document,
         clock_hz=50e6,
@@ -186,6 +186,6 @@ def test_remote_current_endpoint_runs_exact_artifact_and_closes_safe():
     )
 
     assert terminal.logical_done
-    assert terminal.completed_schedule_trigger_counts == (("ch11", 2),)
+    assert terminal.completed_schedule_trigger_counts == (("ch11", 3),)
     assert terminal.artifact_digest == artifact.fingerprint
     assert backend.actions == ["prepare", "fire", "wait", "safe"]

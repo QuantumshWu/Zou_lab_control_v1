@@ -15,6 +15,7 @@ from zlc_pulse import (
     compile_pulse_artifact,
     compiled_pulse_artifact_from_tree,
     compiled_pulse_artifact_to_tree,
+    freeze_scan_table,
     load_pulse_document,
 )
 
@@ -26,14 +27,14 @@ def test_static_artifact_binds_source_ir_wire_and_trigger_schedule():
     document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     artifact = compile_pulse_artifact(
         document,
-        clock_hz=100e6,
+        clock_hz=50e6,
         execution_form=PulseExecutionForm.STATIC_ONCE,
-        trigger_channels=("emCCD",),
+        trigger_channels=("ch11",),
         live_target=document.target,
     )
     assert artifact.source_document_digest == document.fingerprint
     assert artifact.wire_image.source_ir_digest
-    assert artifact.trigger_schedules[0].channel == "emCCD"
+    assert artifact.trigger_schedules[0].channel == "ch11"
     assert artifact.trigger_schedules[0].total > 0
     assert artifact.target_abi_fingerprint == document.target.abi_fingerprint
     assert compiled_pulse_artifact_from_tree(
@@ -42,15 +43,18 @@ def test_static_artifact_binds_source_ir_wire_and_trigger_schedule():
 
 
 def test_scan_artifact_preserves_each_physical_point_in_trigger_provenance():
-    document = replace(
-        load_pulse_document(ROOT / "pulses" / "mot_field_template.json"),
-        scan_table=((0.0, 0.0, 0.0), (20.0, -10.0, 5.0), (-30.0, 15.0, 10.0)),
+    document = load_pulse_document(ROOT / "pulses" / "mot_field_template.json")
+    table, _report = freeze_scan_table(
+        document,
+        ("da_x", "da_y", "da_z"),
+        ((0.0, 0.0, 0.0), (20.0, -10.0, 5.0), (-30.0, 15.0, 10.0)),
     )
+    document = replace(document, scan_table=table)
     artifact = compile_pulse_artifact(
         document,
-        clock_hz=100e6,
+        clock_hz=50e6,
         execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
-        trigger_channels=("mot_trigger",),
+        trigger_channels=("ch11",),
     )
     schedule = artifact.trigger_schedules[0]
     assert schedule.point_count == 3
@@ -62,9 +66,9 @@ def test_artifact_rejects_wire_or_schedule_from_another_compilation():
     document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     artifact = compile_pulse_artifact(
         document,
-        clock_hz=100e6,
+        clock_hz=50e6,
         execution_form=PulseExecutionForm.STATIC_ONCE,
-        trigger_channels=("emCCD",),
+        trigger_channels=("ch11",),
     )
     with pytest.raises(ValueError, match="wire image"):
         replace(
@@ -84,7 +88,7 @@ def test_continuous_artifact_has_no_finite_trigger_schedule():
     document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     artifact = compile_pulse_artifact(
         document,
-        clock_hz=100e6,
+        clock_hz=50e6,
         execution_form=PulseExecutionForm.CONTINUOUS_MONITOR,
     )
     assert artifact.target_ir.repeat_forever
@@ -92,21 +96,23 @@ def test_continuous_artifact_has_no_finite_trigger_schedule():
     with pytest.raises(ValueError, match="continuous monitor"):
         compile_pulse_artifact(
             document,
-            clock_hz=100e6,
+            clock_hz=50e6,
             execution_form=PulseExecutionForm.CONTINUOUS_MONITOR,
-            trigger_channels=("emCCD",),
+            trigger_channels=("ch11",),
         )
 
 
 @pytest.mark.parametrize("kind", [PORT_DAC, PORT_CLOCK])
 def test_only_physical_digital_lanes_can_be_declared_as_triggers(kind):
-    document = load_pulse_document(ROOT / "pulses" / "pulse_test.json")
+    document = load_pulse_document(
+        ROOT / "pulses" / "camera_imaging_address_switch.json"
+    )
     port = next(port for port in document.target.ports if port.kind == kind)
     with pytest.raises(ValueError, match="not a digital port"):
         compile_pulse_artifact(
             document,
-            clock_hz=100e6,
-            execution_form=PulseExecutionForm.STATIC_ONCE,
+            clock_hz=50e6,
+            execution_form=PulseExecutionForm.STATIC_REFERENCE_POINT,
             trigger_channels=(port.lanes[0],),
         )
 
@@ -115,7 +121,7 @@ def test_compiled_artifact_requires_exact_current_schema():
     document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     artifact = compile_pulse_artifact(
         document,
-        clock_hz=100e6,
+        clock_hz=50e6,
         execution_form=PulseExecutionForm.STATIC_ONCE,
     )
     tree = compiled_pulse_artifact_to_tree(artifact)

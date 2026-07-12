@@ -92,6 +92,7 @@ class CompiledPulseArtifact:
             raise ValueError("trigger schedule point count differs from TargetIR")
         if (
             not self.target_ir.repeat_forever
+            and bool(schedules)
             and schedules
             != build_digital_trigger_schedules(
                 self.target_ir,

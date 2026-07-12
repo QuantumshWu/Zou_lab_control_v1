@@ -10,14 +10,28 @@ import pytest
 
 from fpga.pulse_streamer.host.engine_model import reference_play
 from zlc_pulse import (
+    CompiledPulseArtifact,
     PulseExecutionForm,
+    TargetIR,
     build_digital_trigger_schedules,
     compile_pulse_document,
+    freeze_scan_table,
     load_pulse_document,
+    pack_target_ir,
 )
+from zlc_pulse.schedule import MAX_MATERIALIZED_TRIGGER_EDGES
 
 
 ROOT = Path(__file__).parents[1]
+
+
+def _compact(document):
+    return replace(
+        document,
+        periods=tuple(
+            replace(period, duration=20, unit="ns") for period in document.periods
+        ),
+    )
 
 
 def _model_rising_ticks(ir, channel):
@@ -63,29 +77,34 @@ def _model_rising_ticks(ir, channel):
 @pytest.mark.parametrize(
     ("name", "form", "channel"),
     [
-        ("imaging_template.json", PulseExecutionForm.STATIC_ONCE, "emCCD"),
-        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "emCCD"),
-        ("release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "emCCD"),
+        ("imaging_template.json", PulseExecutionForm.STATIC_ONCE, "ch11"),
+        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "ch11"),
+        ("release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "ch11"),
     ],
 )
 def test_schedule_rising_ticks_equal_cycle_accurate_model(name, form, channel):
-    document = load_pulse_document(ROOT / "pulses" / name)
-    ir = compile_pulse_document(document, clock_hz=1e6, execution_form=form)
+    document = _compact(load_pulse_document(ROOT / "pulses" / name))
+    ir = compile_pulse_document(document, clock_hz=50e6, execution_form=form)
     schedule = build_digital_trigger_schedules(ir, (channel,))[0]
     assert [edge.tick_from_run_start for edge in schedule.edges] == _model_rising_ticks(ir, channel)
 
 
 def test_scan_schedule_keeps_point_identity_before_output_delay():
-    document = replace(
-        load_pulse_document(ROOT / "pulses" / "mot_field_template.json"),
-        scan_table=((0.0, 0.0, 0.0), (20.0, -10.0, 5.0), (-30.0, 15.0, 10.0)),
+    document = _compact(
+        load_pulse_document(ROOT / "pulses" / "mot_field_template.json")
     )
+    table, _report = freeze_scan_table(
+        document,
+        ("da_x", "da_y", "da_z"),
+        ((0.0, 0.0, 0.0), (20.0, -10.0, 5.0), (-30.0, 15.0, 10.0)),
+    )
+    document = replace(document, scan_table=table)
     ir = compile_pulse_document(
         document,
-        clock_hz=1e6,
+        clock_hz=50e6,
         execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
     )
-    trigger_channel = "mot_trigger"
+    trigger_channel = "ch11"
     bit = ir.channels.index(trigger_channel)
     delayed = replace(
         ir,
@@ -101,11 +120,65 @@ def test_scan_schedule_keeps_point_identity_before_output_delay():
 
 
 def test_cyclic_and_clock_mux_channels_have_no_finite_schedule():
-    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    document = _compact(load_pulse_document(ROOT / "pulses" / "imaging_template.json"))
     cyclic = compile_pulse_document(
         document,
-        clock_hz=1e6,
+        clock_hz=50e6,
         execution_form=PulseExecutionForm.CONTINUOUS_MONITOR,
     )
     with pytest.raises(ValueError, match="cyclic"):
-        build_digital_trigger_schedules(cyclic, ("emCCD",))
+        build_digital_trigger_schedules(cyclic, ("ch11",))
+    assert build_digital_trigger_schedules(cyclic, ()) == ()
+
+
+def _large_compact_ir(*, loop_count, rising_each_loop):
+    if rising_each_loop:
+        ticks = (0, 1, 3)
+        masks = (1, 0, 0)
+        loop_end = 2
+    else:
+        ticks = (0, 10)
+        masks = (0, 0)
+        loop_end = 10
+    wall_ticks = ticks[-1] + (loop_count - 1) * loop_end
+    return TargetIR(
+        clock_hz=50e6,
+        target_abi_fingerprint="8" * 64,
+        channels=("trigger",),
+        ticks=ticks,
+        masks=masks,
+        duration_seconds=wall_ticks / 50e6,
+        repeat_forever=False,
+        loop_start_index=0,
+        loop_end_tick=loop_end,
+        loop_count=loop_count,
+        tick_slot_coeffs=tuple(() for _ in ticks),
+        channel_delays=(0,),
+    )
+
+
+def test_compact_trigger_projection_is_bounded_without_expanding_loop_count():
+    no_rises = _large_compact_ir(
+        loop_count=(1 << 32) - 1,
+        rising_each_loop=False,
+    )
+    schedule = build_digital_trigger_schedules(no_rises, ("trigger",))[0]
+    assert schedule.edges == ()
+
+    artifact = CompiledPulseArtifact(
+        "9" * 64,
+        "test-compiler",
+        "1",
+        PulseExecutionForm.STATIC_ONCE,
+        no_rises,
+        pack_target_ir(no_rises),
+        (),
+    )
+    assert artifact.trigger_schedules == ()
+
+    too_many = _large_compact_ir(
+        loop_count=MAX_MATERIALIZED_TRIGGER_EDGES + 1,
+        rising_each_loop=True,
+    )
+    with pytest.raises(ValueError, match="materialization limit"):
+        build_digital_trigger_schedules(too_many, ("trigger",))
