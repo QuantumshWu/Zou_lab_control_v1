@@ -24,6 +24,12 @@ from zlc_neutral_atom.artifacts import (
     CaptureRepository,
     compile_capture_artifact_pipeline,
 )
+from zlc_neutral_atom.readout import (
+    CalibrationArtifact,
+    CalibrationArtifactRef,
+    CalibrationRepository,
+    ReadoutBindingKey,
+)
 from zlc_neutral_atom.runtime import (
     DatasetMaterializerSpec,
     MinimalPipelineSpec,
@@ -57,6 +63,40 @@ def _positive_int(value: object, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{field} must be a positive integer")
     return value
+
+
+class _ResourceCleanupError(RuntimeError):
+    """Python-3.9-compatible report retaining every ordinary cleanup failure."""
+
+    def __init__(
+        self,
+        message: str,
+        failures: tuple[Exception, ...],
+    ) -> None:
+        if not failures:
+            raise ValueError("cleanup error requires at least one failure")
+        self.failures = failures
+        details = "; ".join(
+            f"{type(error).__name__}: {error}" for error in failures
+        )
+        super().__init__(f"{message}: {details}")
+
+
+def _cleanup_failures(*actions) -> list[Exception]:
+    failures: list[Exception] = []
+    for action in actions:
+        if action is None:
+            continue
+        try:
+            action()
+        except Exception as error:
+            failures.append(error)
+    return failures
+
+
+def _require_runtime_shutdown(runtime, *, timeout: float) -> None:
+    if not runtime.shutdown(timeout=timeout):
+        raise RuntimeError("runtime did not terminate within the cleanup deadline")
 
 
 @dataclass(frozen=True)
@@ -179,10 +219,30 @@ class _ExperimentServices:
     name: str
     runtime: LegacyNeutralAtomRuntime
     devices: object
-    repository: CaptureRepository
+    capture_repository: CaptureRepository
+    calibration_repository: CalibrationRepository
     catalog: DeviceCatalogView
     operation_lock: threading.RLock
+    composite_lock: threading.RLock
+    current_calibrations: dict[ReadoutBindingKey, "_CurrentCalibrationEntry"]
     closed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _CurrentCalibrationEntry:
+    revision: int
+    reference: CalibrationArtifactRef | None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.revision, bool) or not isinstance(self.revision, int):
+            raise TypeError("current calibration revision must be int")
+        if self.revision < 0:
+            raise ValueError("current calibration revision cannot be negative")
+        if self.reference is not None and not isinstance(
+            self.reference,
+            CalibrationArtifactRef,
+        ):
+            raise TypeError("current calibration reference must be typed")
 
 
 _AUTHORITY_LOCK = threading.RLock()
@@ -224,26 +284,86 @@ class TimingFacade:
 
 
 class ReadoutFacade:
-    __slots__ = ("_token", "_current_calibration_refs")
+    __slots__ = ("_token", "_binding")
 
-    def __init__(self, token: object) -> None:
+    def __init__(
+        self,
+        token: object,
+        binding: ReadoutBindingKey | None = None,
+    ) -> None:
         self._token = token
-        self._current_calibration_refs: dict[str, object] = {}
+        if binding is not None and not isinstance(binding, ReadoutBindingKey):
+            raise TypeError("binding must be ReadoutBindingKey or None")
+        self._binding = binding
+
+    def _binding_key(self) -> ReadoutBindingKey:
+        services = _services(self._token)
+        if self._binding is not None:
+            info = services.catalog.require(self._binding.value)
+            if info.domain != "camera":
+                raise ValueError(
+                    f"readout binding {self._binding.value!r} is not a camera"
+                )
+            return self._binding
+        roles = services.catalog.roles("camera")
+        if len(roles) != 1:
+            raise ValueError(
+                f"installation has {len(roles)} readout bindings; use for_binding()"
+            )
+        return ReadoutBindingKey(roles[0])
+
+    def for_binding(
+        self,
+        binding: ReadoutBindingKey | str,
+    ) -> "ReadoutFacade":
+        key = (
+            binding
+            if isinstance(binding, ReadoutBindingKey)
+            else ReadoutBindingKey(binding)
+        )
+        if self._binding is not None and key != self._binding:
+            raise ValueError("a bound readout facade cannot switch bindings")
+        services = _services(self._token)
+        info = services.catalog.require(key.value)
+        if info.domain != "camera":
+            raise ValueError(f"readout binding {key.value!r} is not a camera")
+        return ReadoutFacade(self._token, key)
 
     @property
-    def current_calibration_ref(self):
+    def current_calibration_ref(self) -> CalibrationArtifactRef | None:
         services = _services(self._token)
-        role = _resolve_role(services.catalog, None, "camera", ("readout", "camera"))
-        return self._current_calibration_refs.get(role)
+        binding = self._binding_key()
+        with services.operation_lock:
+            entry = services.current_calibrations.get(binding)
+            return None if entry is None else entry.reference
 
     @current_calibration_ref.setter
-    def current_calibration_ref(self, value) -> None:
+    def current_calibration_ref(
+        self,
+        value: CalibrationArtifactRef | None,
+    ) -> None:
         services = _services(self._token)
-        role = _resolve_role(services.catalog, None, "camera", ("readout", "camera"))
-        if value is None:
-            self._current_calibration_refs.pop(role, None)
-        else:
-            self._current_calibration_refs[role] = value
+        binding = self._binding_key()
+        if value is not None and not isinstance(value, CalibrationArtifactRef):
+            raise TypeError(
+                "current_calibration_ref must be CalibrationArtifactRef or None"
+            )
+        with services.operation_lock:
+            if value is not None:
+                admitted = services.calibration_repository.admit(
+                    value,
+                    services.capture_repository,
+                )
+                if admitted.artifact.frame_contract.binding != binding:
+                    raise ValueError(
+                        "calibration artifact belongs to another readout binding"
+                    )
+            previous = services.current_calibrations.get(binding)
+            revision = 1 if previous is None else previous.revision + 1
+            services.current_calibrations[binding] = _CurrentCalibrationEntry(
+                revision,
+                value,
+            )
 
     def capture_request(
         self,
@@ -262,6 +382,10 @@ class ReadoutFacade:
     ) -> CaptureRequest:
         services = _services(self._token)
         document = pulse if isinstance(pulse, PulseDocument) else load_pulse_document(pulse)
+        if self._binding is not None:
+            if camera_role is not None and camera_role != self._binding.value:
+                raise ValueError("bound readout facade cannot target another camera")
+            camera_role = self._binding.value
         return CaptureRequest(
             document,
             execution_form,
@@ -292,8 +416,14 @@ class ReadoutFacade:
     def start_capture(self, pulse: PulseDocument | str | Path, **kwargs) -> RunHandle:
         return _start(self._token, self.capture_request(pulse, **kwargs))
 
-    def load(self, reference: CaptureArtifactRef) -> CaptureArtifact:
-        return _services(self._token).repository.load(reference)
+    def load_capture(self, reference: CaptureArtifactRef) -> CaptureArtifact:
+        return _services(self._token).capture_repository.load(reference)
+
+    def load_calibration(
+        self,
+        reference: CalibrationArtifactRef,
+    ) -> CalibrationArtifact:
+        return _services(self._token).calibration_repository.load(reference)
 
 
 class Experiment:
@@ -331,13 +461,30 @@ class Experiment:
             services = _AUTHORITIES.get(self._authority_token)
         if services is None or services.closed:
             return
-        with services.operation_lock:
-            if not services.runtime.shutdown(timeout=2.0):
-                raise RuntimeError("Experiment close is waiting for an active Run to terminate")
-            services.devices.close()
+        failures: list[Exception] = []
+        with services.composite_lock, services.operation_lock:
+            if services.closed:
+                return
+            shutdown = services.runtime.shutdown(timeout=2.0)
+            if not shutdown:
+                raise RuntimeError(
+                    "Experiment close is waiting for an active Run to terminate"
+                )
+            failures.extend(
+                _cleanup_failures(
+                    services.devices.close,
+                    services.calibration_repository.close,
+                    services.capture_repository.close,
+                )
+            )
             services.closed = True
         with _AUTHORITY_LOCK:
             _AUTHORITIES.pop(self._authority_token, None)
+        if failures:
+            raise _ResourceCleanupError(
+                "Experiment close failed",
+                tuple(failures),
+            )
 
     def __enter__(self) -> "Experiment":
         return self
@@ -412,7 +559,10 @@ def _compile(token: object, request: CaptureRequest):
             binding.trigger_channel,
             binding.cell_plan,
         )
-        plan = compile_capture_artifact_pipeline(triggered, services.repository)
+        plan = compile_capture_artifact_pipeline(
+            triggered,
+            services.capture_repository,
+        )
         descriptor = PlanDescriptor(
             plan.name,
             request.camera_ref.role,
@@ -443,7 +593,7 @@ def _run(token: object, request: CaptureRequest) -> CaptureArtifactRef:
 def connect(
     config: str | Path | Mapping[str, object] = "virtual",
     *,
-    repository: CaptureRepository | str | Path,
+    repository: str | Path,
     name: str = "neutral_atom",
     asset_map=None,
     safety_journal_path: str | Path | None = None,
@@ -456,20 +606,39 @@ def connect(
 ) -> Experiment:
     """Compose one notebook Experiment; raw devices remain authority-private."""
 
-    if repository is None:
-        raise TypeError("connect requires an explicit CaptureRepository or repository root")
-    repo = repository if isinstance(repository, CaptureRepository) else CaptureRepository(repository)
-    device_config, device_overrides, _defaults = resolve_connect_config(
-        config,
-        trap_array=trap_array,
-        sitemap=sitemap,
-        camera=camera,
-        sequencer=sequencer,
-        params=virtual_params,
-    )
-    devices = load_devices(device_config, overrides=device_overrides, open_devices=False)
+    if not isinstance(repository, (str, Path)):
+        raise TypeError("repository must be an explicit experiment workspace root")
+    repository_root = Path(repository).expanduser().resolve()
+    capture_repository = CaptureRepository(repository_root / "captures")
+    calibration_repository = None
+    devices = None
     runtime = None
     try:
+        calibration_repository = CalibrationRepository(
+            repository_root / "calibrations"
+        )
+    except BaseException as error:
+        failures = _cleanup_failures(capture_repository.close)
+        if failures and isinstance(error, Exception):
+            raise _ResourceCleanupError(
+                "calibration repository creation cleanup failed",
+                tuple(failures),
+            ) from error
+        raise
+    try:
+        device_config, device_overrides, _defaults = resolve_connect_config(
+            config,
+            trap_array=trap_array,
+            sitemap=sitemap,
+            camera=camera,
+            sequencer=sequencer,
+            params=virtual_params,
+        )
+        devices = load_devices(
+            device_config,
+            overrides=device_overrides,
+            open_devices=False,
+        )
         runtime = LegacyNeutralAtomRuntime(
             devices,
             asset_map=asset_map,
@@ -489,16 +658,31 @@ def connect(
             _text(name, "experiment name"),
             runtime,
             devices,
-            repo,
+            capture_repository,
+            calibration_repository,
             catalog,
             threading.RLock(),
+            threading.RLock(),
+            {},
         )
         token = _register(services)
         return Experiment(token, name=name, device_catalog=catalog)
-    except BaseException:
-        if runtime is not None:
-            runtime.shutdown(timeout=0.0)
-        devices.close()
+    except BaseException as error:
+        failures = _cleanup_failures(
+            (
+                None
+                if runtime is None
+                else lambda: _require_runtime_shutdown(runtime, timeout=2.0)
+            ),
+            None if devices is None else devices.close,
+            calibration_repository.close,
+            capture_repository.close,
+        )
+        if failures and isinstance(error, Exception):
+            raise _ResourceCleanupError(
+                "Experiment composition cleanup failed",
+                tuple(failures),
+            ) from error
         raise
 
 
