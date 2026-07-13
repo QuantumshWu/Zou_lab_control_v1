@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pytest
@@ -11,19 +12,36 @@ import pytest
 from Zou_lab_control.neutral_atom.devices.registry import DeviceSet
 from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualTrapArray
 from zlc_data import AxisId, AxisSpec, BlockId, PointLayout, REPEAT, SCAN_POINT
-from zlc_neutral_atom.acquisition import CameraAcquisitionMode
+from zlc_neutral_atom.acquisition import (
+    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
+    CameraAcquisitionMode,
+    CameraCaptureSpec,
+    freeze_camera_capture_spec,
+)
 from zlc_neutral_atom.artifacts import (
     CaptureArtifactRef,
     CaptureRepository,
     compile_capture_artifact_pipeline,
 )
+from zlc_neutral_atom.capture_reference import (
+    capture_artifact_ref_from_tree,
+    decode_capture_artifact_ref,
+    encode_capture_artifact_ref,
+)
 from zlc_neutral_atom.runtime import (
+    CancellationToken,
+    compile_pipeline,
     DatasetCellAddress,
     DatasetMaterializerSpec,
     MinimalPipelineSpec,
     PipelineMemoryProfile,
+    PostSafetyContext,
     RunFailed,
+    RunId,
 )
+from zlc_neutral_atom.runtime.capture import camera_physical_facts_from_tree
+from zlc_neutral_atom.runtime.capture import FrozenCaptureSpec
+from zlc_storage import decode, encode
 from zlc_workbench.camera_capture import CameraCaptureBindingRequest
 from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
 
@@ -118,6 +136,18 @@ def test_exact_pipeline_commits_and_reloads_capture_artifact(tmp_path):
         assert artifact.terminal.drained_count == 2
         assert artifact.pulse_lineage is None
         assert artifact.provenance.trace_binding.run_id == handle.snapshot().run_id.value
+        assert artifact.run_id == handle.snapshot().run_id.value
+        assert artifact.safety_bundle_id == handle.snapshot().safety_bundle_id
+        assert (
+            artifact.camera_provenance
+            == spec.measurement.capture_contract.camera_provenance
+        )
+        assert artifact.source_cell_schedule == (
+            DatasetCellAddress(0, 0),
+            DatasetCellAddress(0, 1),
+        )
+        assert len(artifact.chain_contract_digest) == 64
+        assert artifact.chain_contract_digest != artifact.memory_profile_fingerprint
         assert not hasattr(artifact, "camera")
         assert not hasattr(reference, "repository")
 
@@ -126,6 +156,241 @@ def test_exact_pipeline_commits_and_reloads_capture_artifact(tmp_path):
         reloaded = reopened.load(reference)
         assert np.array_equal(reloaded.block.values, artifact.block.values)
         assert reloaded.event_metadata == artifact.event_metadata
+
+        # Current-only codec: a content-addressed manifest with even one legacy
+        # or unknown field is not treated as a compatible CaptureArtifact.
+        manifest = decode(
+            repository._store.read_manifest("capture", reference.manifest_digest)
+        )
+        assert "readout_event_index" not in manifest["camera_provenance"]
+        assert "frame_contract" not in manifest["camera_provenance"]
+        assert "source_dataset_schema_blob" not in manifest
+        assert (
+            manifest["camera_capability_evidence"]["physical_facts_fingerprint"]
+            == artifact.camera_capability_evidence.physical_facts.fingerprint
+        )
+        assert (
+            artifact.camera_capability_evidence.fingerprint
+            == artifact.terminal.capability_fingerprint
+        )
+        assert artifact.camera_arm_spec.digest == artifact.terminal.capture_spec_fingerprint
+        assert artifact.camera_arm_spec == spec.measurement.capture_spec
+
+        opaque_digest = "f" * 64
+        opaque_provenance = replace(
+            artifact.camera_provenance,
+            descriptor=replace(
+                artifact.camera_provenance.descriptor,
+                camera_arm_spec_fingerprint=opaque_digest,
+            ),
+        )
+        with pytest.raises(ValueError, match="canonical camera arm spec"):
+            replace(
+                artifact,
+                camera_provenance=opaque_provenance,
+                terminal=replace(
+                    artifact.terminal,
+                    capture_spec_fingerprint=opaque_digest,
+                ),
+            )
+
+        opaque_manifest = decode(encode(manifest))
+        opaque_manifest["camera_provenance"][
+            "camera_arm_spec_fingerprint"
+        ] = opaque_digest
+        opaque_manifest["camera_provenance"]["descriptor"][
+            "camera_arm_spec_fingerprint"
+        ] = opaque_digest
+        opaque_manifest["terminal"]["capture_spec_fingerprint"] = opaque_digest
+        invalid_opaque = repository._store.publish_manifest(
+            "capture",
+            encode(opaque_manifest),
+        )
+        with pytest.raises(ValueError, match="canonical camera arm spec"):
+            repository.load(
+                CaptureArtifactRef(
+                    repository.repository_id,
+                    invalid_opaque.content.digest,
+                )
+            )
+
+        def rebound_fields(frozen):
+            return {
+                "camera_arm_spec": frozen,
+                "camera_provenance": replace(
+                    artifact.camera_provenance,
+                    descriptor=replace(
+                        artifact.camera_provenance.descriptor,
+                        camera_arm_spec_fingerprint=frozen.digest,
+                    ),
+                ),
+                "terminal": replace(
+                    artifact.terminal,
+                    capture_spec_fingerprint=frozen.digest,
+                ),
+            }
+
+        def arm_tree(frozen):
+            tree = decode(encode(manifest))
+            tree["camera_arm_spec"] = {
+                "owner_fingerprint": frozen.owner_fingerprint,
+                "payload": frozen.payload,
+                "digest": frozen.digest,
+            }
+            tree["camera_provenance"][
+                "camera_arm_spec_fingerprint"
+            ] = frozen.digest
+            tree["camera_provenance"]["descriptor"][
+                "camera_arm_spec_fingerprint"
+            ] = frozen.digest
+            tree["terminal"]["capture_spec_fingerprint"] = frozen.digest
+            return tree
+
+        invalid_arm_specs = (
+            (
+                FrozenCaptureSpec(
+                    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
+                    b"not-a-canonical-camera-capture-spec",
+                ),
+                "canonical",
+            ),
+            (
+                replace(artifact.camera_arm_spec, owner_fingerprint="e" * 64),
+                "unknown owner",
+            ),
+            (
+                freeze_camera_capture_spec(
+                    CameraCaptureSpec(
+                        CameraAcquisitionMode.FREE_RUNNING,
+                        len(artifact.event_metadata),
+                        artifact.terminal.settings_fingerprint,
+                    )
+                ),
+                "EXTERNAL_TRIGGERED",
+            ),
+            (
+                freeze_camera_capture_spec(
+                    CameraCaptureSpec(
+                        CameraAcquisitionMode.EXTERNAL_TRIGGERED,
+                        len(artifact.event_metadata) + 1,
+                        artifact.terminal.settings_fingerprint,
+                    )
+                ),
+                "expected_frames",
+            ),
+            (
+                freeze_camera_capture_spec(
+                    CameraCaptureSpec(
+                        CameraAcquisitionMode.EXTERNAL_TRIGGERED,
+                        len(artifact.event_metadata),
+                        "d" * 64,
+                    )
+                ),
+                "arm settings",
+            ),
+        )
+        for invalid_arm, message in invalid_arm_specs:
+            with pytest.raises(ValueError, match=message):
+                replace(artifact, **rebound_fields(invalid_arm))
+            invalid_arm_manifest = repository._store.publish_manifest(
+                "capture",
+                encode(arm_tree(invalid_arm)),
+            )
+            with pytest.raises(ValueError, match=message):
+                repository.load(
+                    CaptureArtifactRef(
+                        repository.repository_id,
+                        invalid_arm_manifest.content.digest,
+                    )
+                )
+
+        forged_setting = replace(
+            artifact.camera_provenance.descriptor.event_settings[0],
+            exposure_seconds=0.017,
+        )
+        forged_provenance = replace(
+            artifact.camera_provenance,
+            descriptor=replace(
+                artifact.camera_provenance.descriptor,
+                event_settings=(forged_setting,),
+            ),
+        )
+        with pytest.raises(ValueError, match="attested physical facts"):
+            replace(artifact, camera_provenance=forged_provenance)
+
+        descriptor_only_forge = decode(encode(manifest))
+        descriptor_only_forge["camera_provenance"]["descriptor"][
+            "event_settings"
+        ][0]["exposure_seconds"] = 0.017
+        invalid_descriptor = repository._store.publish_manifest(
+            "capture",
+            encode(descriptor_only_forge),
+        )
+        with pytest.raises(ValueError, match="attested physical facts"):
+            repository.load(
+                CaptureArtifactRef(
+                    repository.repository_id,
+                    invalid_descriptor.content.digest,
+                )
+            )
+
+        descriptor_and_facts_forge = decode(encode(descriptor_only_forge))
+        physical_tree = descriptor_and_facts_forge["camera_capability_evidence"][
+            "physical_facts"
+        ]
+        physical_tree["exposure_seconds"] = 0.017
+        forged_facts = camera_physical_facts_from_tree(physical_tree)
+        descriptor_and_facts_forge["camera_capability_evidence"][
+            "physical_facts_fingerprint"
+        ] = forged_facts.fingerprint
+        invalid_evidence = repository._store.publish_manifest(
+            "capture",
+            encode(descriptor_and_facts_forge),
+        )
+        with pytest.raises(ValueError, match="canonical camera capability evidence"):
+            repository.load(
+                CaptureArtifactRef(
+                    repository.repository_id,
+                    invalid_evidence.content.digest,
+                )
+            )
+
+        wrong_schedule = dict(manifest)
+        wrong_schedule["source_cell_schedule"] = list(
+            reversed(manifest["source_cell_schedule"])
+        )
+        invalid_schedule = repository._store.publish_manifest(
+            "capture",
+            encode(wrong_schedule),
+        )
+        with pytest.raises(ValueError, match="sealed join plan"):
+            repository.load(
+                CaptureArtifactRef(
+                    repository.repository_id,
+                    invalid_schedule.content.digest,
+                )
+            )
+
+        processor_like = dict(manifest)
+        processor_like["chain_contract_digest"] = "f" * 64
+        invalid_chain = repository._store.publish_manifest(
+            "capture",
+            encode(processor_like),
+        )
+        with pytest.raises(ValueError, match="direct source-to-DatasetBuilder"):
+            repository.load(
+                CaptureArtifactRef(
+                    repository.repository_id,
+                    invalid_chain.content.digest,
+                )
+            )
+
+        manifest["legacy_camera_settings"] = {"exposure": 1e-3}
+        invalid = repository._store.publish_manifest("capture", encode(manifest))
+        with pytest.raises(ValueError, match="unknown field set"):
+            repository.load(
+                CaptureArtifactRef(repository.repository_id, invalid.content.digest)
+            )
     finally:
         if thread.is_alive():
             camera.finish_record_capture()
@@ -150,6 +415,138 @@ def test_failed_capture_never_publishes_a_manifest(tmp_path):
         assert runtime.shutdown(timeout=2.0)
 
 
+def test_capture_commit_rejects_a_post_safety_context_from_another_run(tmp_path):
+    camera, runtime, spec = _runtime_and_spec()
+    repository = CaptureRepository(tmp_path / "captures")
+    thread, source_failure = _deliver_when_armed(
+        camera,
+        [
+            np.full((6, 8), 3, dtype=np.uint16),
+            np.full((6, 8), 5, dtype=np.uint16),
+        ],
+    )
+    try:
+        result = runtime.controller.run(compile_pipeline(spec))
+        thread.join(2.0)
+        assert not thread.is_alive() and source_failure == []
+        wrong_context = PostSafetyContext(
+            run_id=RunId("different-run"),
+            cancellation=CancellationToken(),
+            deadline=None,
+            safety_bundle_id="different-safety-bundle",
+            handle=object(),
+        )
+        with pytest.raises(ValueError, match="run_id differs"):
+            repository.final_commit(wrong_context, result)
+        manifest_root = (
+            tmp_path / "captures" / "content" / "manifests" / "capture"
+        )
+        assert not manifest_root.exists()
+    finally:
+        if thread.is_alive():
+            camera.finish_record_capture()
+            thread.join(2.0)
+        assert runtime.shutdown(timeout=2.0)
+
+
+def test_camera_provenance_is_bound_to_frozen_capability_and_capture_spec():
+    _camera, runtime, spec = _runtime_and_spec()
+    try:
+        measurement = spec.measurement
+        contract = measurement.capture_contract
+        provenance = contract.camera_provenance
+        facts = measurement.capture_port.capability.camera_physical_facts
+        assert provenance is not None and facts is not None
+        assert provenance.descriptor.camera_identity == facts.camera_identity
+        assert provenance.descriptor.event_settings == (facts.event_setting(0),)
+        assert provenance.active_settings_fingerprint == (
+            measurement.capture_port.capability.settings_fingerprint
+        )
+        assert provenance.camera_arm_spec_fingerprint == measurement.capture_spec.digest
+
+        forged_setting = replace(
+            provenance.descriptor.event_settings[0],
+            exposure_seconds=0.017,
+        )
+        forged_descriptor = replace(
+            provenance.descriptor,
+            event_settings=(forged_setting,),
+        )
+        with pytest.raises(ValueError, match="attested physical facts"):
+            replace(
+                contract,
+                camera_provenance=replace(
+                    provenance,
+                    descriptor=forged_descriptor,
+                ),
+            )
+    finally:
+        assert runtime.shutdown(timeout=2.0)
+
+
+def test_custom_value_projection_cannot_masquerade_as_raw_camera_capture(tmp_path):
+    @dataclass(frozen=True)
+    class OffsetAdapter:
+        payload_contract: object
+        operator_fingerprint: str = "e" * 64
+
+        @property
+        def value_schema(self):
+            return self.payload_contract.value_schema
+
+        @property
+        def metadata_contract(self):
+            return self.payload_contract.metadata_contract
+
+        def value(self, payload):
+            self.payload_contract.validate(payload)
+            return replace(
+                payload.image,
+                values=payload.image.values + np.uint16(100),
+            )
+
+    camera, runtime, spec = _runtime_and_spec()
+    raw_contract = spec.measurement.capture_contract
+    offset = OffsetAdapter(raw_contract.payload_contract)
+    with pytest.raises(ValueError, match="owner identity event adapter"):
+        replace(raw_contract, event_adapter=offset)
+
+    derived_contract = replace(
+        raw_contract,
+        event_adapter=offset,
+        camera_provenance=None,
+    )
+    derived_spec = replace(
+        spec,
+        measurement=replace(
+            spec.measurement,
+            capture_contract=derived_contract,
+        ),
+    )
+    thread, source_failure = _deliver_when_armed(
+        camera,
+        [
+            np.full((6, 8), 1, dtype=np.uint16),
+            np.full((6, 8), 2, dtype=np.uint16),
+        ],
+    )
+    try:
+        result = runtime.controller.run(compile_pipeline(derived_spec))
+        thread.join(2.0)
+        assert not thread.is_alive() and source_failure == []
+        assert np.all(result.dataset.block.values[0, 0] == 101)
+        assert np.all(result.dataset.block.values[0, 1] == 102)
+        assert not result.is_direct_raw_capture
+        repository = CaptureRepository(tmp_path / "captures")
+        with pytest.raises(ValueError, match="raw camera provenance"):
+            compile_capture_artifact_pipeline(derived_spec, repository)
+    finally:
+        if thread.is_alive():
+            camera.finish_record_capture()
+            thread.join(2.0)
+        assert runtime.shutdown(timeout=2.0)
+
+
 def test_capture_ref_cannot_be_loaded_from_another_repository(tmp_path):
     first = CaptureRepository(tmp_path / "first", repository_id="first")
     second = CaptureRepository(tmp_path / "second", repository_id="second")
@@ -157,3 +554,21 @@ def test_capture_ref_cannot_be_loaded_from_another_repository(tmp_path):
     with pytest.raises(ValueError, match="another repository"):
         second.load(reference)
     assert first.startup_reconciliations == ()
+
+
+def test_capture_ref_has_one_leaf_owner_and_a_strict_current_codec():
+    reference = CaptureArtifactRef("capture-repository", "a" * 64)
+    assert decode_capture_artifact_ref(encode_capture_artifact_ref(reference)) == reference
+    with pytest.raises(ValueError, match="unknown field set"):
+        capture_artifact_ref_from_tree(
+            {
+                "schema": "zlc_neutral_atom.capture-artifact-ref.v1",
+                "repository_id": reference.repository_id,
+                "manifest_digest": reference.manifest_digest,
+                "source_capture_ref": reference.manifest_digest,
+            }
+        )
+
+    from zlc_neutral_atom.artifacts.capture import CaptureArtifactRef as repository_ref
+
+    assert repository_ref is CaptureArtifactRef

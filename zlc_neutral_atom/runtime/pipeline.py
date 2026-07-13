@@ -12,16 +12,26 @@ from numbers import Integral
 from zlc_data import BlockId, DatasetSchema, ValidityMode
 
 from zlc_neutral_atom.catalog import DefinitionCatalog, DefinitionKey
+from zlc_neutral_atom.camera_operator import (
+    CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
+)
 
 from .capture import (
     BoundCapturePort,
+    CameraCapabilityEvidence,
+    CameraCaptureProvenance,
     CaptureCompletion,
     CaptureSession,
     FrozenCaptureSpec,
     CaptureStreamContract,
     CaptureTerminalAck,
 )
-from .dataset import DatasetBuilder, DatasetMode, SealedDatasetArtifact
+from .dataset import (
+    DatasetBuilder,
+    DatasetCellAddress,
+    DatasetMode,
+    SealedDatasetArtifact,
+)
 from .run import CleanupReport, RunContext, RunMode, RunPlan
 from .streams import AcquisitionCursor, ExactReservation, ReservationState, TraceBinding
 
@@ -104,6 +114,14 @@ class BoundMeasurement:
             != self.capture_contract.dataset_schema.fingerprint
         ):
             raise ValueError("measurement definition output schema differs")
+        camera_provenance = self.capture_contract.camera_provenance
+        if (
+            camera_provenance is not None
+            and camera_provenance.camera_arm_spec_fingerprint != self.capture_spec.digest
+        ):
+            raise ValueError(
+                "camera provenance arm spec differs from FrozenCaptureSpec"
+            )
 
     @property
     def definition_key(self) -> DefinitionKey:
@@ -217,16 +235,24 @@ class PipelineResult:
 
     __slots__ = (
         "_dataset",
+        "_capture_completion",
         "_capture_terminal",
         "_aggregate_peak_bytes",
         "_memory_profile_fingerprint",
+        "_source_dataset_schema",
+        "_camera_provenance",
+        "_camera_capability_evidence",
+        "_camera_arm_spec",
+        "_source_cell_schedule",
+        "_chain_contract_digest",
+        "_direct_raw_capture",
     )
 
     def __init__(
         self,
         authority: object,
         dataset: SealedDatasetArtifact,
-        capture_terminal: CaptureTerminalAck,
+        capture_completion: CaptureCompletion,
         aggregate_peak_bytes: int,
         memory_profile_fingerprint: str,
     ) -> None:
@@ -234,8 +260,15 @@ class PipelineResult:
             raise PermissionError("PipelineResult can only be minted by compile_pipeline")
         if not isinstance(dataset, SealedDatasetArtifact):
             raise TypeError("dataset must be SealedDatasetArtifact")
-        if not isinstance(capture_terminal, CaptureTerminalAck):
-            raise TypeError("capture_terminal must be CaptureTerminalAck")
+        if not isinstance(capture_completion, CaptureCompletion):
+            raise TypeError("capture_completion must be CaptureCompletion")
+        capture_terminal = capture_completion.terminal
+        if not dataset._belongs_to_terminal_reservation(
+            capture_completion._terminal_reservation
+        ):
+            raise RuntimeError(
+                "sealed dataset belongs to another exact terminal consumer"
+            )
         peak = _positive_int(aggregate_peak_bytes, "aggregate_peak_bytes")
         if (
             not isinstance(memory_profile_fingerprint, str)
@@ -247,6 +280,8 @@ class PipelineResult:
         ):
             raise ValueError("memory profile fingerprint must be a lowercase SHA-256")
         provenance = dataset.provenance
+        if provenance.trace_binding.run_id != capture_completion.trace_binding.run_id:
+            raise RuntimeError("pipeline dataset and capture completion run_id differ")
         count = provenance.end_sequence - provenance.start_sequence
         if not dataset.coverage.complete or dataset.coverage.total_cells != count:
             raise RuntimeError("pipeline dataset coverage differs from event interval")
@@ -258,12 +293,53 @@ class PipelineResult:
         ):
             raise RuntimeError("pipeline terminal and dataset provenance differ")
         object.__setattr__(self, "_dataset", dataset)
+        object.__setattr__(self, "_capture_completion", capture_completion)
         object.__setattr__(self, "_capture_terminal", capture_terminal)
         object.__setattr__(self, "_aggregate_peak_bytes", peak)
         object.__setattr__(
             self,
             "_memory_profile_fingerprint",
             memory_profile_fingerprint,
+        )
+        object.__setattr__(
+            self,
+            "_source_dataset_schema",
+            capture_completion.source_dataset_schema,
+        )
+        object.__setattr__(
+            self,
+            "_camera_provenance",
+            capture_completion.camera_provenance,
+        )
+        object.__setattr__(
+            self,
+            "_camera_capability_evidence",
+            capture_completion.camera_capability_evidence,
+        )
+        object.__setattr__(
+            self,
+            "_camera_arm_spec",
+            capture_completion.camera_arm_spec,
+        )
+        object.__setattr__(
+            self,
+            "_source_cell_schedule",
+            capture_completion.source_cell_schedule,
+        )
+        object.__setattr__(
+            self,
+            "_chain_contract_digest",
+            capture_completion.chain_contract_digest,
+        )
+        object.__setattr__(
+            self,
+            "_direct_raw_capture",
+            capture_completion.direct_terminal_consumer
+            and capture_completion.camera_provenance is not None
+            and capture_completion.camera_capability_evidence is not None
+            and dataset.block.schema == capture_completion.source_dataset_schema
+            and capture_completion.source_event_adapter_operator_fingerprint
+            == CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
         )
 
     def __setattr__(self, _name: str, _value: object) -> None:
@@ -276,6 +352,38 @@ class PipelineResult:
     @property
     def capture_terminal(self) -> CaptureTerminalAck:
         return self._capture_terminal
+
+    @property
+    def run_id(self) -> str:
+        return self._capture_completion.trace_binding.run_id
+
+    @property
+    def source_dataset_schema(self) -> DatasetSchema:
+        return self._source_dataset_schema
+
+    @property
+    def camera_provenance(self) -> CameraCaptureProvenance | None:
+        return self._camera_provenance
+
+    @property
+    def camera_capability_evidence(self) -> CameraCapabilityEvidence | None:
+        return self._camera_capability_evidence
+
+    @property
+    def camera_arm_spec(self) -> FrozenCaptureSpec:
+        return self._camera_arm_spec
+
+    @property
+    def source_cell_schedule(self) -> tuple[DatasetCellAddress, ...]:
+        return self._source_cell_schedule
+
+    @property
+    def chain_contract_digest(self) -> str:
+        return self._chain_contract_digest
+
+    @property
+    def is_direct_raw_capture(self) -> bool:
+        return self._direct_raw_capture
 
     @property
     def aggregate_peak_bytes(self) -> int:
@@ -401,7 +509,7 @@ class ExactCaptureTransaction:
         return PipelineResult(
             _PIPELINE_RESULT_TOKEN,
             dataset,
-            completion.terminal,
+            completion,
             self.aggregate_peak_bytes,
             self.memory_profile_fingerprint,
         )

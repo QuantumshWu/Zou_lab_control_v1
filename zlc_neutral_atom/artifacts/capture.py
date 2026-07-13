@@ -1,9 +1,11 @@
 """Current CaptureArtifact schema, codec, and crash-safe repository.
 
-CaptureArtifact is the durable boundary between acquisition and every offline
-consumer.  It stores the full multidimensional DataBlock, ordered camera
-metadata, exact-stream provenance, and terminal capture evidence.  It does not
-store a driver, Port, RunPlan, or mutable builder alias.
+CaptureArtifact is the durable RAW acquisition boundary.  It stores the full
+multidimensional camera DataBlock, the ordinal-to-cell schedule, ordered camera
+metadata, owner-derived physical descriptor, exact direct-consumer provenance,
+and terminal capture evidence.  It never stores processor output and it never
+selects a calibration/readout event; those belong to later derived artifacts.
+It also does not store a driver, Port, RunPlan, or mutable builder alias.
 """
 
 from __future__ import annotations
@@ -12,7 +14,12 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
-from zlc_data import DataBlock, StreamGenerationId, decode_data_block, encode_data_block
+from zlc_data import (
+    DataBlock,
+    StreamGenerationId,
+    decode_data_block,
+    encode_data_block,
+)
 from zlc_storage import (
     ContentAddressedStore,
     ContentRef,
@@ -22,10 +29,22 @@ from zlc_storage import (
 )
 
 from zlc_neutral_atom.acquisition import (
+    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
+    CameraAcquisitionMode,
     CameraFrameMetadata,
     CameraFrameMetadataContract,
+    CameraSampleContract,
+    decode_camera_capture_spec,
+    freeze_camera_capture_spec,
     camera_frame_metadata_from_tree,
     camera_frame_metadata_to_tree,
+)
+from zlc_neutral_atom.camera_operator import (
+    CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
+)
+from zlc_neutral_atom.capture_reference import (
+    CAPTURE_ARTIFACT_NAMESPACE,
+    CaptureArtifactRef,
 )
 from zlc_neutral_atom.runtime.commit import (
     CommitIntent,
@@ -36,10 +55,26 @@ from zlc_neutral_atom.runtime.commit import (
     PublishedManifest,
     RepositoryCommitCoordinator,
 )
-from zlc_neutral_atom.runtime.capture import CaptureTerminalAck
+from zlc_neutral_atom.readout.codec import (
+    camera_capture_descriptor_from_tree,
+    camera_capture_descriptor_to_tree,
+    readout_binding_key_from_tree,
+    readout_binding_key_to_tree,
+)
+from zlc_neutral_atom.runtime.capture import (
+    CameraCapabilityEvidence,
+    CameraCaptureProvenance,
+    CaptureTerminalAck,
+    FrozenCaptureSpec,
+    camera_capability_evidence_from_tree,
+    camera_capability_evidence_to_tree,
+)
 from zlc_neutral_atom.runtime.dataset import (
+    DatasetCellAddress,
     DatasetCoverage,
     DatasetSealProvenance,
+    dataset_cell_permutation_digest,
+    dataset_consumer_contract_digest,
 )
 from zlc_neutral_atom.runtime.pipeline import (
     MinimalPipelineSpec,
@@ -68,9 +103,9 @@ from zlc_pulse import (
 )
 
 
-CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact/v4"
+CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact/v7"
 _CAPTURE_METADATA_SCHEMA = "zlc_neutral_atom.CameraFrameMetadataSequence/v1"
-_CAPTURE_NAMESPACE = "capture"
+_CAPTURE_NAMESPACE = CAPTURE_ARTIFACT_NAMESPACE
 
 
 def _canonical_text(value: object, field: str) -> str:
@@ -93,20 +128,6 @@ def _integer(value: object, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{field} must be a non-negative integer")
     return value
-
-
-@dataclass(frozen=True)
-class CaptureArtifactRef:
-    repository_id: str
-    manifest_digest: str
-
-    def __post_init__(self) -> None:
-        _canonical_text(self.repository_id, "repository_id")
-        _sha256(self.manifest_digest, "manifest_digest")
-
-    @property
-    def target_ref(self) -> str:
-        return f"{_CAPTURE_NAMESPACE}/{self.manifest_digest}"
 
 
 @dataclass(frozen=True)
@@ -172,6 +193,13 @@ class CaptureArtifact:
     terminal: CaptureTerminalAck
     aggregate_peak_bytes: int
     memory_profile_fingerprint: str
+    camera_provenance: CameraCaptureProvenance
+    camera_capability_evidence: CameraCapabilityEvidence
+    camera_arm_spec: FrozenCaptureSpec
+    source_cell_schedule: tuple[DatasetCellAddress, ...]
+    run_id: str
+    safety_bundle_id: str
+    chain_contract_digest: str
     pulse_lineage: PulseCaptureLineage | None = None
 
     def __post_init__(self) -> None:
@@ -194,6 +222,115 @@ class CaptureArtifact:
             raise ValueError("aggregate_peak_bytes must be positive")
         object.__setattr__(self, "aggregate_peak_bytes", peak)
         _sha256(self.memory_profile_fingerprint, "memory_profile_fingerprint")
+        if not isinstance(self.camera_provenance, CameraCaptureProvenance):
+            raise TypeError("camera_provenance must be CameraCaptureProvenance")
+        self.camera_provenance.validate_schema(self.block.schema)
+        if not isinstance(
+            self.camera_capability_evidence,
+            CameraCapabilityEvidence,
+        ):
+            raise TypeError(
+                "camera_capability_evidence must be CameraCapabilityEvidence"
+            )
+        capability_evidence = self.camera_capability_evidence
+        if not isinstance(self.camera_arm_spec, FrozenCaptureSpec):
+            raise TypeError("camera_arm_spec must be FrozenCaptureSpec")
+        arm_spec = self.camera_arm_spec
+        if arm_spec.owner_fingerprint != CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT:
+            raise ValueError("camera arm spec belongs to an unknown owner")
+        decoded_arm_spec = decode_camera_capture_spec(arm_spec.payload)
+        if freeze_camera_capture_spec(decoded_arm_spec) != arm_spec:
+            raise ValueError("camera arm spec is not the canonical owner encoding")
+        if decoded_arm_spec.mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
+            raise ValueError(
+                "finite raw CaptureArtifact requires EXTERNAL_TRIGGERED camera mode"
+            )
+        if capability_evidence.fingerprint != self.terminal.capability_fingerprint:
+            raise ValueError(
+                "canonical camera capability evidence differs from terminal evidence"
+            )
+        if (
+            capability_evidence.fingerprint
+            != self.camera_provenance.capability_fingerprint
+        ):
+            raise ValueError(
+                "canonical camera capability evidence differs from provenance"
+            )
+        if (
+            capability_evidence.settings_fingerprint
+            != self.terminal.settings_fingerprint
+        ):
+            raise ValueError(
+                "camera capability settings differ from terminal evidence"
+            )
+        capability_evidence.physical_facts.validate_descriptor(
+            self.camera_provenance.descriptor
+        )
+        expected_payload_contract = CameraSampleContract(self.block.schema.cell_schema)
+        if (
+            capability_evidence.payload_contract_fingerprint
+            != expected_payload_contract.fingerprint
+        ):
+            raise ValueError(
+                "camera capability payload contract differs from persisted DataBlock"
+            )
+        if (
+            capability_evidence.capture_spec_owner_fingerprint
+            != CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT
+        ):
+            raise ValueError(
+                "camera capability capture-spec owner is not the current camera owner"
+            )
+        if (
+            self.camera_provenance.active_settings_fingerprint
+            != self.terminal.settings_fingerprint
+        ):
+            raise ValueError(
+                "camera readout settings differ from terminal capture evidence"
+            )
+        if (
+            self.camera_provenance.camera_arm_spec_fingerprint
+            != self.terminal.capture_spec_fingerprint
+        ):
+            raise ValueError(
+                "camera arm spec differs from terminal capture evidence"
+            )
+        if arm_spec.digest != self.terminal.capture_spec_fingerprint:
+            raise ValueError(
+                "canonical camera arm spec differs from terminal capture evidence"
+            )
+        if self.camera_provenance.binding_id != self.terminal.binding_id:
+            raise ValueError("camera binding_id differs from terminal evidence")
+        if (
+            self.camera_provenance.connection_generation
+            != self.terminal.connection_generation
+        ):
+            raise ValueError(
+                "camera connection generation differs from terminal evidence"
+            )
+        if (
+            self.camera_provenance.capability_fingerprint
+            != self.terminal.capability_fingerprint
+        ):
+            raise ValueError(
+                "camera capability fingerprint differs from terminal evidence"
+            )
+        _canonical_text(self.run_id, "run_id")
+        _canonical_text(self.safety_bundle_id, "safety_bundle_id")
+        _sha256(self.chain_contract_digest, "chain_contract_digest")
+        if self.provenance.trace_binding.run_id != self.run_id:
+            raise ValueError("capture run_id differs from sealed dataset provenance")
+        if (
+            self.camera_provenance.binding.value
+            != self.provenance.trace_binding.source_id
+        ):
+            raise ValueError(
+                "camera binding differs from sealed dataset source lineage"
+            )
+        if capability_evidence.source_id != self.provenance.trace_binding.source_id:
+            raise ValueError(
+                "camera capability evidence differs from sealed dataset source"
+            )
         if self.pulse_lineage is not None and not isinstance(
             self.pulse_lineage,
             PulseCaptureLineage,
@@ -206,8 +343,53 @@ class CaptureArtifact:
         )
         if self.coverage.total_cells != physical_cells or count != physical_cells:
             raise ValueError("capture metadata cardinality differs from DataBlock cells")
+        if decoded_arm_spec.expected_frames != count:
+            raise ValueError(
+                "camera arm expected_frames differs from persisted capture count"
+            )
+        if len(
+            {
+                decoded_arm_spec.settings_fingerprint,
+                capability_evidence.settings_fingerprint,
+                self.terminal.settings_fingerprint,
+                self.camera_provenance.active_settings_fingerprint,
+            }
+        ) != 1:
+            raise ValueError(
+                "camera arm settings differ from capability and terminal evidence"
+            )
         if self.provenance.end_sequence - self.provenance.start_sequence != count:
             raise ValueError("capture provenance interval differs from metadata cardinality")
+        schedule = tuple(self.source_cell_schedule)
+        if any(not isinstance(cell, DatasetCellAddress) for cell in schedule):
+            raise TypeError("source_cell_schedule must contain DatasetCellAddress")
+        if len(schedule) != count:
+            raise ValueError("source cell schedule cardinality differs from capture")
+        expected_domain = {
+            DatasetCellAddress(repeat, point)
+            for repeat in range(self.block.schema.repeat_axis.size)
+            for point in range(self.block.schema.point_layout.storage_size)
+        }
+        if len(set(schedule)) != len(schedule) or set(schedule) != expected_domain:
+            raise ValueError(
+                "source_cell_schedule must cover the raw dataset exactly once"
+            )
+        object.__setattr__(self, "source_cell_schedule", schedule)
+        if (
+            dataset_cell_permutation_digest(self.block.schema, schedule)
+            != self.provenance.join_plan_digest
+        ):
+            raise ValueError("source cell schedule differs from sealed join plan")
+        expected_direct_chain = dataset_consumer_contract_digest(
+            self.block.schema,
+            schedule,
+            self.provenance.metadata_contract_fingerprint,
+            CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
+        )
+        if self.chain_contract_digest != expected_direct_chain:
+            raise ValueError(
+                "CaptureArtifact requires a direct source-to-DatasetBuilder chain"
+            )
         if tuple(item.source_ordinal for item in metadata) != tuple(range(count)):
             raise ValueError("capture source ordinals are not contiguous from zero")
         metadata_contract = CameraFrameMetadataContract()
@@ -245,6 +427,10 @@ class CaptureArtifact:
                 raise ValueError("capture cell plan differs from sealed cell permutation")
             if plan.total_events != count:
                 raise ValueError("capture cell plan count differs from persisted capture")
+            if tuple(plan.expected_cells) != schedule:
+                raise ValueError(
+                    "triggered capture cell plan differs from source cell schedule"
+                )
 
 
 class CaptureRepository:
@@ -292,6 +478,13 @@ class CaptureRepository:
                 "terminal",
                 "aggregate_peak_bytes",
                 "memory_profile_fingerprint",
+                "camera_provenance",
+                "camera_capability_evidence",
+                "camera_arm_spec",
+                "source_cell_schedule",
+                "run_id",
+                "safety_bundle_id",
+                "chain_contract_digest",
                 "pulse_lineage",
             },
             CAPTURE_ARTIFACT_SCHEMA,
@@ -339,15 +532,30 @@ class CaptureRepository:
             if plan_ref.digest != cell_plan.fingerprint:
                 raise ValueError("cell-plan blob digest differs from plan fingerprint")
         artifact = CaptureArtifact(
-            reference,
-            block,
-            tuple(camera_frame_metadata_from_tree(item) for item in items),
-            _coverage_from_tree(data["coverage"]),
-            _provenance_from_tree(data["provenance"]),
-            _terminal_from_tree(data["terminal"]),
-            data["aggregate_peak_bytes"],
-            data["memory_profile_fingerprint"],
-            _pulse_lineage_from_tree(
+            ref=reference,
+            block=block,
+            event_metadata=tuple(
+                camera_frame_metadata_from_tree(item) for item in items
+            ),
+            coverage=_coverage_from_tree(data["coverage"]),
+            provenance=_provenance_from_tree(data["provenance"]),
+            terminal=_terminal_from_tree(data["terminal"]),
+            aggregate_peak_bytes=data["aggregate_peak_bytes"],
+            memory_profile_fingerprint=data["memory_profile_fingerprint"],
+            camera_provenance=_camera_provenance_from_tree(
+                data["camera_provenance"]
+            ),
+            camera_capability_evidence=camera_capability_evidence_from_tree(
+                data["camera_capability_evidence"]
+            ),
+            camera_arm_spec=_frozen_capture_spec_from_tree(data["camera_arm_spec"]),
+            source_cell_schedule=_cell_schedule_from_tree(
+                data["source_cell_schedule"]
+            ),
+            run_id=data["run_id"],
+            safety_bundle_id=data["safety_bundle_id"],
+            chain_contract_digest=data["chain_contract_digest"],
+            pulse_lineage=_pulse_lineage_from_tree(
                 data["pulse_lineage"],
                 compiled_pulse,
                 cell_plan,
@@ -377,7 +585,7 @@ class CaptureRepository:
             raise TypeError("final_commit requires PostSafetyContext")
         if not isinstance(result, (PipelineResult, TriggeredPipelineResult)):
             raise TypeError("final_commit requires an exact pipeline result")
-        reference, manifest_payload = self._stage_pipeline_result(result)
+        reference, manifest_payload = self._stage_pipeline_result(result, context)
         target = CommitTarget(
             self.repository_id,
             "capture",
@@ -425,7 +633,13 @@ class CaptureRepository:
         if not self._store.has_manifest(_CAPTURE_NAMESPACE, digest):
             return CommitRecovery(False)
         reference = CaptureArtifactRef(self.repository_id, digest)
-        self.load(reference)
+        artifact = self.load(reference)
+        if artifact.run_id != intent.run_id:
+            raise ValueError("capture manifest run_id differs from commit intent")
+        if artifact.safety_bundle_id != intent.safety_bundle_id:
+            raise ValueError(
+                "capture manifest safety bundle differs from commit intent"
+            )
         return CommitRecovery(
             True,
             PublishedManifest(reference.target_ref, digest, reference),
@@ -434,6 +648,7 @@ class CaptureRepository:
     def _stage_pipeline_result(
         self,
         result: PipelineResult | TriggeredPipelineResult,
+        context: PostSafetyContext,
     ) -> tuple[CaptureArtifactRef, bytes]:
         lineage = None
         if isinstance(result, TriggeredPipelineResult):
@@ -446,16 +661,39 @@ class CaptureRepository:
             base = result.capture
         else:
             base = result
+        if base.run_id != context.run_id.value:
+            raise ValueError("PostSafetyContext run_id differs from pipeline result")
+        if context.safety_bundle_id is None:
+            raise ValueError("CaptureArtifact requires a durable safety bundle id")
+        if not base.is_direct_raw_capture:
+            raise ValueError(
+                "CaptureArtifact only accepts direct raw camera datasets"
+            )
+        if base.camera_provenance is None:
+            raise ValueError(
+                "CaptureArtifact requires frozen CameraCaptureDescriptor provenance"
+            )
+        if base.camera_capability_evidence is None:
+            raise ValueError(
+                "CaptureArtifact requires broker camera capability evidence"
+            )
         provisional = CaptureArtifact(
-            CaptureArtifactRef(self.repository_id, "0" * 64),
-            base.dataset.block,
-            tuple(base.dataset.event_metadata),
-            base.dataset.coverage,
-            base.dataset.provenance,
-            base.capture_terminal,
-            base.aggregate_peak_bytes,
-            base.memory_profile_fingerprint,
-            lineage,
+            ref=CaptureArtifactRef(self.repository_id, "0" * 64),
+            block=base.dataset.block,
+            event_metadata=tuple(base.dataset.event_metadata),
+            coverage=base.dataset.coverage,
+            provenance=base.dataset.provenance,
+            terminal=base.capture_terminal,
+            aggregate_peak_bytes=base.aggregate_peak_bytes,
+            memory_profile_fingerprint=base.memory_profile_fingerprint,
+            camera_provenance=base.camera_provenance,
+            camera_capability_evidence=base.camera_capability_evidence,
+            camera_arm_spec=base.camera_arm_spec,
+            source_cell_schedule=base.source_cell_schedule,
+            run_id=base.run_id,
+            safety_bundle_id=context.safety_bundle_id,
+            chain_contract_digest=base.chain_contract_digest,
+            pulse_lineage=lineage,
         )
         return self._stage_manifest(provisional)
 
@@ -518,6 +756,13 @@ def compile_capture_artifact_pipeline(
 
     if not isinstance(repository, CaptureRepository):
         raise TypeError("repository must be CaptureRepository")
+    capture_spec = spec.capture if isinstance(spec, TriggeredCaptureSpec) else spec
+    if not isinstance(capture_spec, MinimalPipelineSpec):
+        raise TypeError("capture artifact pipeline requires MinimalPipelineSpec")
+    if capture_spec.measurement.capture_contract.camera_provenance is None:
+        raise ValueError(
+            "CaptureArtifact requires frozen raw camera provenance"
+        )
     base = (
         compile_triggered_pipeline(spec)
         if isinstance(spec, TriggeredCaptureSpec)
@@ -590,9 +835,126 @@ def _manifest_payload(
             "terminal": _terminal_to_tree(artifact.terminal),
             "aggregate_peak_bytes": artifact.aggregate_peak_bytes,
             "memory_profile_fingerprint": artifact.memory_profile_fingerprint,
+            "camera_provenance": _camera_provenance_to_tree(
+                artifact.camera_provenance
+            ),
+            "camera_capability_evidence": camera_capability_evidence_to_tree(
+                artifact.camera_capability_evidence
+            ),
+            "camera_arm_spec": _frozen_capture_spec_to_tree(
+                artifact.camera_arm_spec
+            ),
+            "source_cell_schedule": _cell_schedule_to_tree(
+                artifact.source_cell_schedule
+            ),
+            "run_id": artifact.run_id,
+            "safety_bundle_id": artifact.safety_bundle_id,
+            "chain_contract_digest": artifact.chain_contract_digest,
             "pulse_lineage": _pulse_lineage_to_tree(artifact.pulse_lineage),
         }
     )
+
+
+def _camera_provenance_to_tree(
+    value: CameraCaptureProvenance,
+) -> dict[str, object]:
+    if not isinstance(value, CameraCaptureProvenance):
+        raise TypeError("value must be CameraCaptureProvenance")
+    return {
+        "descriptor": camera_capture_descriptor_to_tree(value.descriptor),
+        "camera_arm_spec_fingerprint": value.camera_arm_spec_fingerprint,
+        "binding": readout_binding_key_to_tree(value.binding),
+        "active_settings_fingerprint": value.active_settings_fingerprint,
+        "binding_id": value.binding_id,
+        "connection_generation": value.connection_generation,
+        "capability_fingerprint": value.capability_fingerprint,
+    }
+
+
+def _frozen_capture_spec_to_tree(value: FrozenCaptureSpec) -> dict[str, object]:
+    if not isinstance(value, FrozenCaptureSpec):
+        raise TypeError("value must be FrozenCaptureSpec")
+    return {
+        "owner_fingerprint": value.owner_fingerprint,
+        "payload": value.payload,
+        "digest": value.digest,
+    }
+
+
+def _frozen_capture_spec_from_tree(tree: object) -> FrozenCaptureSpec:
+    fields = {"owner_fingerprint", "payload", "digest"}
+    if not isinstance(tree, dict) or set(tree) != fields:
+        raise ValueError("camera arm spec has an unknown field set")
+    return FrozenCaptureSpec(
+        owner_fingerprint=_sha256(
+            tree["owner_fingerprint"],
+            "camera arm spec owner_fingerprint",
+        ),
+        payload=tree["payload"],
+        digest=_sha256(tree["digest"], "camera arm spec digest"),
+    )
+
+
+def _camera_provenance_from_tree(tree: object) -> CameraCaptureProvenance:
+    fields = {
+        "descriptor",
+        "camera_arm_spec_fingerprint",
+        "binding",
+        "active_settings_fingerprint",
+        "binding_id",
+        "connection_generation",
+        "capability_fingerprint",
+    }
+    if not isinstance(tree, dict) or set(tree) != fields:
+        raise ValueError("camera capture provenance has an unknown field set")
+    descriptor = camera_capture_descriptor_from_tree(tree["descriptor"])
+    arm_spec = _sha256(
+        tree["camera_arm_spec_fingerprint"],
+        "camera_arm_spec_fingerprint",
+    )
+    if descriptor.camera_arm_spec_fingerprint != arm_spec:
+        raise ValueError(
+            "camera arm-spec fingerprint differs from descriptor owner field"
+        )
+    return CameraCaptureProvenance(
+        descriptor=descriptor,
+        binding=readout_binding_key_from_tree(tree["binding"]),
+        active_settings_fingerprint=_sha256(
+            tree["active_settings_fingerprint"],
+            "active_settings_fingerprint",
+        ),
+        binding_id=_canonical_text(tree["binding_id"], "binding_id"),
+        connection_generation=_canonical_text(
+            tree["connection_generation"],
+            "connection_generation",
+        ),
+        capability_fingerprint=_sha256(
+            tree["capability_fingerprint"],
+            "capability_fingerprint",
+        ),
+    )
+
+
+def _cell_schedule_to_tree(
+    schedule: tuple[DatasetCellAddress, ...],
+) -> list[list[int]]:
+    return [[cell.repeat_index, cell.point_storage_index] for cell in schedule]
+
+
+def _cell_schedule_from_tree(tree: object) -> tuple[DatasetCellAddress, ...]:
+    if not isinstance(tree, list):
+        raise ValueError("source_cell_schedule must be a list")
+    cells: list[DatasetCellAddress] = []
+    for item in tree:
+        if not isinstance(item, list) or len(item) != 2:
+            raise ValueError("source cell address must be a two-item list")
+        cells.append(
+            DatasetCellAddress(
+                _integer(item[0], "repeat_index"),
+                _integer(item[1], "point_storage_index"),
+            )
+        )
+    return tuple(cells)
 
 
 def _pulse_lineage_to_tree(

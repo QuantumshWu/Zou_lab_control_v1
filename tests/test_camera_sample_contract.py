@@ -204,7 +204,11 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
     )
 
     assert contract.dataset_schema.physical_shape == (2, 2, 3, 4)
-    assert contract.event_adapter.value(_sample(value_schema)).values.shape == (3, 4)
+    sample = _sample(value_schema)
+    projected = contract.event_adapter.value(sample)
+    assert projected is sample.image
+    assert projected.values.shape == (3, 4)
+    assert np.array_equal(projected.values, sample.image.values)
     assert contract.payload_contract.max_retained_nbytes == (
         ValuePayloadContract(value_schema).max_retained_nbytes
         + contract.event_adapter.metadata_contract.max_retained_nbytes

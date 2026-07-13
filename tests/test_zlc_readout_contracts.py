@@ -84,7 +84,7 @@ def _descriptor(**changes: object) -> CameraCaptureDescriptor:
         count_unit="camera-count",
         readout_event_axis_id=EVENT,
         event_settings=_event_settings(),
-        capture_schedule_fingerprint="a" * 64,
+        camera_arm_spec_fingerprint="a" * 64,
     )
     return replace(value, **changes)
 
@@ -111,8 +111,24 @@ def _schema(
     if data_axes is None:
         height, width = descriptor.output_shape_yx
         data_axes = (
-            AxisSpec(Y, "sensor y", SPATIAL_Y, height, coordinate_frame=FRAME),
-            AxisSpec(X, "sensor x", SPATIAL_X, width, coordinate_frame=FRAME),
+            AxisSpec(
+                Y,
+                "ROI-local y",
+                SPATIAL_Y,
+                height,
+                coordinates=tuple(range(height)),
+                unit="pixel",
+                coordinate_frame=FRAME,
+            ),
+            AxisSpec(
+                X,
+                "ROI-local x",
+                SPATIAL_X,
+                width,
+                coordinates=tuple(range(width)),
+                unit="pixel",
+                coordinate_frame=FRAME,
+            ),
         )
     if point_layout is None:
         point_layout = PointLayout.rect_c(tuple(axis.size for axis in point_axes))
@@ -149,6 +165,86 @@ def _contract() -> FrameContract:
     )
 
 
+def test_frame_axes_are_explicit_roi_local_output_pixel_coordinates() -> None:
+    descriptor = _descriptor()
+    height, width = descriptor.output_shape_yx
+    wrong_unit = _schema(
+        descriptor=descriptor,
+        data_axes=(
+            AxisSpec(
+                Y,
+                "ROI-local y",
+                SPATIAL_Y,
+                height,
+                coordinates=tuple(range(height)),
+                unit="px",
+                coordinate_frame=FRAME,
+            ),
+            AxisSpec(
+                X,
+                "ROI-local x",
+                SPATIAL_X,
+                width,
+                coordinates=tuple(range(width)),
+                unit="pixel",
+                coordinate_frame=FRAME,
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="canonical 'pixel' unit"):
+        descriptor.validate_schema(wrong_unit)
+    shifted = _schema(
+        descriptor=descriptor,
+        data_axes=(
+            AxisSpec(
+                Y,
+                "sensor-global y",
+                SPATIAL_Y,
+                height,
+                coordinates=tuple(range(10, 10 + height)),
+                unit="pixel",
+                coordinate_frame=FRAME,
+            ),
+            AxisSpec(
+                X,
+                "ROI-local x",
+                SPATIAL_X,
+                width,
+                coordinates=tuple(range(width)),
+                unit="pixel",
+                coordinate_frame=FRAME,
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="ROI-local"):
+        descriptor.validate_schema(shifted)
+    float_spelling = _schema(
+        descriptor=descriptor,
+        data_axes=(
+            AxisSpec(
+                Y,
+                "ROI-local y",
+                SPATIAL_Y,
+                height,
+                coordinates=tuple(float(index) for index in range(height)),
+                unit="pixel",
+                coordinate_frame=FRAME,
+            ),
+            AxisSpec(
+                X,
+                "ROI-local x",
+                SPATIAL_X,
+                width,
+                coordinates=tuple(range(width)),
+                unit="pixel",
+                coordinate_frame=FRAME,
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="ROI-local"):
+        descriptor.validate_schema(float_spelling)
+
+
 def _single_event_descriptor(
     *,
     exposure: float = 0.002,
@@ -168,7 +264,7 @@ def _single_event_descriptor(
                 frame_fingerprint,
             ),
         ),
-        capture_schedule_fingerprint="b" * 64,
+        camera_arm_spec_fingerprint="b" * 64,
         **changes,
     )
 
@@ -225,7 +321,7 @@ def test_reference_schedule_and_capture_fingerprint_do_not_leak_into_frame_appli
                 "7" * 64,
             ),
         ),
-        capture_schedule_fingerprint="c" * 64,
+        camera_arm_spec_fingerprint="c" * 64,
     )
     schema = _schema(descriptor=descriptor)
     assert FrameContract.from_calibration_capture(

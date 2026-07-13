@@ -16,6 +16,7 @@ from zlc_data import (
     AxisSpec,
     BlockId,
     PointLayout,
+    READOUT_EVENT,
     REPEAT,
     SCAN_POINT,
 )
@@ -107,8 +108,22 @@ def _bound_endpoint(camera: VirtualCamera):
     description = endpoint.target_endpoint.describe(binding)
     assert isinstance(description, CameraCaptureDescription)
     capability = attestation.snapshot
-    assert capability.driver_ring_bytes == 2 * 6 * 8 * 2
-    assert capability.adapter_record_retention_bytes == 16 * 6 * 8 * 2
+    assert description.physical_facts is capability.camera_physical_facts
+    assert description.physical_facts.camera_identity == binding.stable_device_identity
+    assert description.physical_facts.output_shape_yx == camera.frame_shape
+    assert description.physical_facts.exposure_seconds == camera.exposure
+    with pytest.raises(PermissionError):
+        CameraCaptureDescription(
+            object(),
+            description.source_id,
+            description.payload_contract,
+            description.settings_fingerprint,
+            description.trigger_channels,
+            description.physical_facts,
+        )
+    frame_bytes = int(np.prod(camera.frame_shape)) * 2
+    assert capability.driver_ring_bytes == 2 * frame_bytes
+    assert capability.adapter_record_retention_bytes == 16 * frame_bytes
     return broker, registry, endpoint, binding, attestation, description
 
 
@@ -228,6 +243,34 @@ def test_target_endpoint_description_contains_no_raw_camera():
     assert len(canonical_digest(description.settings_fingerprint)) == 64
 
 
+def test_capability_physical_facts_use_applied_roi_and_payload_geometry():
+    camera = _camera()
+    camera.configure(roi=(4, 4, 0, 4))
+    _broker, _registry, _endpoint, _binding, attestation, description = (
+        _bound_endpoint(camera)
+    )
+    facts = attestation.snapshot.camera_physical_facts
+    assert facts is description.physical_facts
+    assert facts.sensor_shape_yx == (6, 8)
+    assert facts.roi_origin_yx == (0, 4)
+    assert facts.roi_shape_yx == (4, 4)
+    assert facts.binning_yx == (1, 1)
+    assert facts.output_shape_yx == description.payload_contract.value_schema.data_shape
+    y_axis, x_axis = description.payload_contract.value_schema.data_axes
+    assert y_axis.name == "ROI-local output y"
+    assert x_axis.name == "ROI-local output x"
+    assert y_axis.coordinates == tuple(range(4))
+    assert x_axis.coordinates == tuple(range(4))
+    assert y_axis.coordinate_frame == x_axis.coordinate_frame == facts.coordinate_frame
+    assert facts.coordinate_frame.value == "readout.roi-local-output-pixels"
+    assert "sensor" not in facts.coordinate_frame.value
+    evidence = attestation.snapshot.camera_capability_evidence
+    assert evidence is not None
+    assert evidence.physical_facts is facts
+    assert evidence.fingerprint == attestation.snapshot.capability_fingerprint
+    assert evidence.source_id == "readout"
+
+
 def test_installation_runtime_binds_camera_role_without_returning_raw_graph():
     camera = _camera()
     device_set = DeviceSet(
@@ -258,6 +301,48 @@ def test_installation_runtime_binds_camera_role_without_returning_raw_graph():
         assert measurement.capture_port.device is runtime.registry.binding_for(camera)
         assert not hasattr(measurement, "camera")
         assert not hasattr(measurement.capture_port.device, "adapter")
+    finally:
+        assert runtime.shutdown(timeout=2.0)
+
+
+def test_multi_event_binding_requires_explicit_attested_event_settings():
+    camera = _camera()
+    runtime = LegacyNeutralAtomRuntime(
+        DeviceSet(
+            {"readout": camera},
+            {"readout": {"type": "VirtualCamera", "params": {}}},
+        )
+    )
+    cells = (DatasetCellAddress(0, 0), DatasetCellAddress(0, 1))
+    base = (
+        "readout",
+        _axis("repeat", REPEAT, 1),
+        (_axis("event", READOUT_EVENT, 2),),
+        PointLayout.rect_c((2,)),
+        cells,
+        CameraAcquisitionMode.EXTERNAL_TRIGGERED,
+        0,
+        4 << 20,
+    )
+    try:
+        with pytest.raises(ValueError, match="explicit event_settings"):
+            runtime.bind_camera_measurement(CameraCaptureBindingRequest(*base))
+        description = runtime.describe_camera("readout")
+        measurement = runtime.bind_camera_measurement(
+            CameraCaptureBindingRequest(
+                *base,
+                tuple(description.event_setting(index) for index in range(2)),
+            )
+        )
+        descriptor = measurement.capture_contract.camera_provenance.descriptor
+        assert descriptor.event_settings == tuple(
+            description.event_setting(index) for index in range(2)
+        )
+        assert not hasattr(measurement.capture_contract.camera_provenance, "frame_contract")
+        assert not hasattr(
+            measurement.capture_contract.camera_provenance,
+            "readout_event_index",
+        )
     finally:
         assert runtime.shutdown(timeout=2.0)
 

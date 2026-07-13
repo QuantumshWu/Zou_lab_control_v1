@@ -478,6 +478,13 @@ def _compile(token: object, request: CaptureRequest):
                 CameraAcquisitionMode.EXTERNAL_TRIGGERED,
                 0,
                 request.transport_memory_limit_bytes,
+                # Baseline cameras expose one attested hardware setting for the
+                # whole armed run.  Repeat it explicitly for every raw event;
+                # this names no calibration/readout role and chooses no event.
+                tuple(
+                    camera_description.event_setting(index)
+                    for index in range(events_per_repeat)
+                ),
             )
         )
         pipeline = MinimalPipelineSpec(

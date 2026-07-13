@@ -16,6 +16,9 @@ from zlc_data import VALID, Valid, Value, ValuePayloadContract, ValueSchema
 from zlc_storage import canonical_digest, decode, encode
 
 from zlc_neutral_atom.runtime.capture import FrozenCaptureSpec
+from zlc_neutral_atom.camera_operator import (
+    CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
+)
 
 
 _CAMERA_CAPTURE_SPEC_SCHEMA = "zlc_neutral_atom.camera-capture-spec.v1"
@@ -25,8 +28,6 @@ CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT = canonical_digest(
         "schema": _CAMERA_CAPTURE_SPEC_SCHEMA,
     }
 )
-
-
 def _canonical_text(value: object, field: str) -> str:
     if not isinstance(value, str) or not value or value.strip() != value:
         raise ValueError(f"{field} must be canonical non-empty text")
@@ -358,10 +359,15 @@ class CameraSampleContract:
 @dataclass(frozen=True)
 class CameraDatasetEventAdapter:
     payload_contract: CameraSampleContract
+    operator_fingerprint: str = CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT
 
     def __post_init__(self) -> None:
         if not isinstance(self.payload_contract, CameraSampleContract):
             raise TypeError("payload_contract must be CameraSampleContract")
+        if self.operator_fingerprint != CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT:
+            raise ValueError(
+                "CameraDatasetEventAdapter operator identity cannot be overridden"
+            )
 
     @property
     def value_schema(self) -> ValueSchema:
@@ -378,6 +384,7 @@ class CameraDatasetEventAdapter:
 
 __all__ = [
     "CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT",
+    "CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT",
     "CameraAcquisitionMode",
     "CameraCaptureSpec",
     "CameraDatasetEventAdapter",

@@ -165,6 +165,20 @@ def _validate_frame_schema_facts(
         raise ValueError("frame data-axis sizes differ from ROI/binning output geometry")
     if any(axis.coordinate_frame != coordinate_frame for axis in axes):
         raise ValueError("frame spatial axes differ from the descriptor coordinate frame")
+    if any(axis.unit != "pixel" for axis in axes):
+        raise ValueError("frame spatial axes must use the canonical 'pixel' unit")
+    if any(
+        axis.coordinates is None
+        or len(axis.coordinates) != axis.size
+        or any(
+            type(coordinate) is not int or coordinate != index
+            for index, coordinate in enumerate(axis.coordinates)
+        )
+        for axis in axes
+    ):
+        raise ValueError(
+            "frame spatial axes must use ROI-local output-pixel coordinates 0..N-1"
+        )
     if frame_schema.dtype != dtype:
         raise ValueError("frame dtype differs from the camera descriptor")
     if frame_schema.value_unit != count_unit:
@@ -215,8 +229,8 @@ class CameraCaptureDescriptor:
     """Complete camera geometry and per-event schedule retained in capture lineage.
 
     ROI origin/shape and sensor shape use unbinned sensor pixels in Y,X order.
-    ``capture_schedule_fingerprint`` is evidence about the complete acquisition
-    schedule, not one frame's model applicability.  Per-event untyped evidence
+    ``camera_arm_spec_fingerprint`` is the exact frozen camera arm/capture-spec
+    digest.  It is not an FPGA pulse-schedule digest.  Per-event untyped evidence
     lives on :class:`CameraEventReadoutSetting` instead.
     """
 
@@ -234,7 +248,7 @@ class CameraCaptureDescriptor:
     count_unit: str
     readout_event_axis_id: AxisId | None
     event_settings: tuple[CameraEventReadoutSetting, ...]
-    capture_schedule_fingerprint: str | None = None
+    camera_arm_spec_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("camera_identity", "sensor_identity", "optical_path"):
@@ -277,8 +291,8 @@ class CameraCaptureDescriptor:
             raise ValueError("a capture without a readout-event axis requires event index 0")
         object.__setattr__(self, "event_settings", settings)
         _sha256(
-            self.capture_schedule_fingerprint,
-            "capture_schedule_fingerprint",
+            self.camera_arm_spec_fingerprint,
+            "camera_arm_spec_fingerprint",
             optional=True,
         )
 

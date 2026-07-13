@@ -2,6 +2,7 @@
 
 from .camera import (
     CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
+    CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
     CameraAcquisitionMode,
     CameraCaptureSpec,
     CameraDatasetEventAdapter,
@@ -17,6 +18,7 @@ from .camera import (
 
 __all__ = [
     "CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT",
+    "CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT",
     "CameraAcquisitionMode",
     "CameraCaptureSpec",
     "CameraDatasetEventAdapter",

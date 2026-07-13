@@ -211,7 +211,7 @@ _CAPTURE_FIELDS = {
     "count_unit",
     "readout_event_axis_id",
     "event_settings",
-    "capture_schedule_fingerprint",
+    "camera_arm_spec_fingerprint",
 }
 
 
@@ -238,14 +238,14 @@ def camera_capture_descriptor_to_tree(value: CameraCaptureDescriptor) -> dict[st
         "event_settings": [
             camera_event_readout_setting_to_tree(item) for item in value.event_settings
         ],
-        "capture_schedule_fingerprint": value.capture_schedule_fingerprint,
+        "camera_arm_spec_fingerprint": value.camera_arm_spec_fingerprint,
     }
 
 
 def camera_capture_descriptor_from_tree(tree: Any) -> CameraCaptureDescriptor:
     data = _exact_map(tree, _CAPTURE_FIELDS, CAMERA_CAPTURE_DESCRIPTOR_SCHEMA)
     event_axis = data["readout_event_axis_id"]
-    schedule_fingerprint = data["capture_schedule_fingerprint"]
+    arm_spec_fingerprint = data["camera_arm_spec_fingerprint"]
     value = CameraCaptureDescriptor(
         camera_identity=_text(data["camera_identity"], "camera_identity"),
         sensor_identity=_text(data["sensor_identity"], "sensor_identity"),
@@ -270,10 +270,10 @@ def camera_capture_descriptor_from_tree(tree: Any) -> CameraCaptureDescriptor:
             camera_event_readout_setting_from_tree(item)
             for item in _list(data["event_settings"], "event_settings")
         ),
-        capture_schedule_fingerprint=(
+        camera_arm_spec_fingerprint=(
             None
-            if schedule_fingerprint is None
-            else _text(schedule_fingerprint, "capture_schedule_fingerprint")
+            if arm_spec_fingerprint is None
+            else _text(arm_spec_fingerprint, "camera_arm_spec_fingerprint")
         ),
     )
     _canonical_tree(

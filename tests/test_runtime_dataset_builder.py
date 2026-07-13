@@ -643,6 +643,7 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
     class CameraSampleAdapter:
         payload_contract: CameraSampleContract
         metadata_contract: FrameMetadataContract = FrameMetadataContract()
+        operator_fingerprint: str = "a" * 64
 
         @property
         def value_schema(self):
@@ -723,6 +724,7 @@ def test_metadata_contract_cannot_seal_a_mutable_alias():
     class MutableMetadataAdapter:
         payload_contract: ValuePayloadContract
         metadata_contract: MutableMetadataContract
+        operator_fingerprint: str = "b" * 64
 
         @property
         def value_schema(self):
@@ -823,6 +825,7 @@ def test_builder_freezes_one_metadata_contract_identity_for_the_generation():
     class SwitchingAdapter:
         payload_contract: BudgetedValueContract
         metadata_contract: SwitchingMetadataContract
+        operator_fingerprint: str = "c" * 64
 
         @property
         def value_schema(self):
@@ -914,6 +917,7 @@ def test_metadata_rejects_enum_with_mutable_value():
     class EnumMetadataAdapter:
         payload_contract: ValuePayloadContract
         metadata_contract: EnumMetadataContract = EnumMetadataContract()
+        operator_fingerprint: str = "d" * 64
 
         @property
         def value_schema(self):

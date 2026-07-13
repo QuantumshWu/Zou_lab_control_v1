@@ -38,6 +38,13 @@ def test_virtual_connect_capture_load_is_a_short_current_api(tmp_path):
         assert artifact.pulse_lineage is not None
         assert artifact.pulse_lineage.compiled_artifact_digest == descriptor.compiled_pulse_digest
         assert artifact.pulse_lineage.expected_trigger_count == 3
+        assert artifact.source_cell_schedule == artifact.pulse_lineage.cell_plan.expected_cells
+        assert tuple(
+            setting.event_index
+            for setting in artifact.camera_provenance.descriptor.event_settings
+        ) == (0, 1, 2)
+        assert not hasattr(artifact.camera_provenance, "readout_event_index")
+        assert not hasattr(artifact.camera_provenance, "frame_contract")
     finally:
         exp.close()
         exp.close()

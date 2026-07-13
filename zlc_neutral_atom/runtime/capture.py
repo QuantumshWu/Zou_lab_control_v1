@@ -11,8 +11,21 @@ from enum import Enum
 from numbers import Integral
 from typing import Protocol, TypeVar
 
-from zlc_data import DatasetSchema, ValuePayloadContract
+import numpy as np
+from zlc_storage import canonical_digest
+
+from zlc_data import (
+    AxisId,
+    CoordinateFrameId,
+    DatasetSchema,
+    ValuePayloadContract,
+)
 from zlc_neutral_atom.catalog import is_declarative_value
+from zlc_neutral_atom.readout.contracts import (
+    CameraCaptureDescriptor,
+    CameraEventReadoutSetting,
+    ReadoutBindingKey,
+)
 
 from .dataset import (
     DatasetCellAddress,
@@ -90,6 +103,372 @@ def _positive_finite(value: float, field: str) -> float:
     return float(value)
 
 
+def _integer_pair(
+    value: object,
+    field: str,
+    *,
+    positive: bool,
+) -> tuple[int, int]:
+    try:
+        pair = tuple(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise TypeError(f"{field} must be a two-integer tuple") from exc
+    if len(pair) != 2:
+        raise ValueError(f"{field} must contain exactly two integers")
+    normalized = tuple(_nonnegative_int(item, field) for item in pair)
+    if positive and any(item == 0 for item in normalized):
+        raise ValueError(f"{field} entries must be positive")
+    return normalized  # type: ignore[return-value]
+
+
+@dataclass(frozen=True)
+class CameraPhysicalFacts:
+    """Typed camera facts minted inside a broker capability probe.
+
+    These facts and the opaque settings fingerprint are frozen from one adapter
+    snapshot.  A later binding may name event indices, but it cannot change the
+    exposure, gain, readout mode, geometry, identity, dtype, or unit attested by
+    this capability.
+    """
+
+    camera_identity: str
+    sensor_identity: str
+    optical_path: str
+    sensor_shape_yx: tuple[int, int]
+    roi_origin_yx: tuple[int, int]
+    roi_shape_yx: tuple[int, int]
+    binning_yx: tuple[int, int]
+    spatial_y_axis_id: AxisId
+    spatial_x_axis_id: AxisId
+    coordinate_frame: CoordinateFrameId
+    dtype: np.dtype
+    count_unit: str
+    exposure_seconds: float
+    gain: float
+    readout_mode: str
+    opaque_frame_settings_fingerprint: str
+
+    def __post_init__(self) -> None:
+        for name in ("camera_identity", "sensor_identity", "optical_path"):
+            _canonical_text(getattr(self, name), name)
+        sensor = _integer_pair(self.sensor_shape_yx, "sensor_shape_yx", positive=True)
+        origin = _integer_pair(self.roi_origin_yx, "roi_origin_yx", positive=False)
+        roi = _integer_pair(self.roi_shape_yx, "roi_shape_yx", positive=True)
+        binning = _integer_pair(self.binning_yx, "binning_yx", positive=True)
+        if any(start + extent > limit for start, extent, limit in zip(origin, roi, sensor)):
+            raise ValueError("camera ROI lies outside sensor geometry")
+        if any(extent % factor for extent, factor in zip(roi, binning)):
+            raise ValueError("camera ROI must be divisible by binning")
+        object.__setattr__(self, "sensor_shape_yx", sensor)
+        object.__setattr__(self, "roi_origin_yx", origin)
+        object.__setattr__(self, "roi_shape_yx", roi)
+        object.__setattr__(self, "binning_yx", binning)
+        if not isinstance(self.spatial_y_axis_id, AxisId):
+            raise TypeError("spatial_y_axis_id must be AxisId")
+        if not isinstance(self.spatial_x_axis_id, AxisId):
+            raise TypeError("spatial_x_axis_id must be AxisId")
+        if self.spatial_y_axis_id == self.spatial_x_axis_id:
+            raise ValueError("camera spatial axis ids must differ")
+        if not isinstance(self.coordinate_frame, CoordinateFrameId):
+            raise TypeError("coordinate_frame must be CoordinateFrameId")
+        dtype = np.dtype(self.dtype).newbyteorder("<")
+        if dtype.hasobject or dtype.fields is not None or dtype.kind not in "iuf":
+            raise TypeError("camera dtype must be a real numeric scalar dtype")
+        object.__setattr__(self, "dtype", dtype)
+        _canonical_text(self.count_unit, "count_unit")
+        object.__setattr__(
+            self,
+            "exposure_seconds",
+            _positive_finite(self.exposure_seconds, "exposure_seconds"),
+        )
+        if (
+            isinstance(self.gain, bool)
+            or not isinstance(self.gain, (int, float))
+            or not math.isfinite(float(self.gain))
+            or float(self.gain) < 0
+        ):
+            raise ValueError("gain must be finite and non-negative")
+        object.__setattr__(self, "gain", float(self.gain))
+        _canonical_text(self.readout_mode, "readout_mode")
+        _sha256(
+            self.opaque_frame_settings_fingerprint,
+            "opaque_frame_settings_fingerprint",
+        )
+
+    @property
+    def output_shape_yx(self) -> tuple[int, int]:
+        return tuple(
+            extent // factor
+            for extent, factor in zip(self.roi_shape_yx, self.binning_yx)
+        )  # type: ignore[return-value]
+
+    def event_setting(self, event_index: int) -> CameraEventReadoutSetting:
+        return CameraEventReadoutSetting(
+            _nonnegative_int(event_index, "event_index"),
+            self.exposure_seconds,
+            self.gain,
+            self.readout_mode,
+            self.opaque_frame_settings_fingerprint,
+        )
+
+    def validate_descriptor(self, descriptor: CameraCaptureDescriptor) -> None:
+        if not isinstance(descriptor, CameraCaptureDescriptor):
+            raise TypeError("descriptor must be CameraCaptureDescriptor")
+        expected = {
+            "camera_identity": self.camera_identity,
+            "sensor_identity": self.sensor_identity,
+            "optical_path": self.optical_path,
+            "sensor_shape_yx": self.sensor_shape_yx,
+            "roi_origin_yx": self.roi_origin_yx,
+            "roi_shape_yx": self.roi_shape_yx,
+            "binning_yx": self.binning_yx,
+            "spatial_y_axis_id": self.spatial_y_axis_id,
+            "spatial_x_axis_id": self.spatial_x_axis_id,
+            "coordinate_frame": self.coordinate_frame,
+            "dtype": self.dtype,
+            "count_unit": self.count_unit,
+        }
+        mismatches = tuple(
+            name for name, value in expected.items() if getattr(descriptor, name) != value
+        )
+        for setting in descriptor.event_settings:
+            if setting != self.event_setting(setting.event_index):
+                mismatches += (f"event_settings[{setting.event_index}]",)
+        if mismatches:
+            raise ValueError(
+                "camera descriptor differs from attested physical facts: "
+                + ", ".join(mismatches)
+            )
+
+    @property
+    def fingerprint(self) -> str:
+        """Digest of this owner-minted physical-facts value."""
+
+        return canonical_digest(camera_physical_facts_to_tree(self))
+
+
+_CAMERA_PHYSICAL_FACTS_SCHEMA = "zlc_neutral_atom.CameraPhysicalFacts/v1"
+_CAMERA_CAPABILITY_EVIDENCE_SCHEMA = "zlc_neutral_atom.CameraCapabilityEvidence/v1"
+
+
+def camera_physical_facts_to_tree(value: CameraPhysicalFacts) -> dict[str, object]:
+    if not isinstance(value, CameraPhysicalFacts):
+        raise TypeError("value must be CameraPhysicalFacts")
+    return {
+        "schema": _CAMERA_PHYSICAL_FACTS_SCHEMA,
+        "camera_identity": value.camera_identity,
+        "sensor_identity": value.sensor_identity,
+        "optical_path": value.optical_path,
+        "sensor_shape_yx": list(value.sensor_shape_yx),
+        "roi_origin_yx": list(value.roi_origin_yx),
+        "roi_shape_yx": list(value.roi_shape_yx),
+        "binning_yx": list(value.binning_yx),
+        "spatial_y_axis_id": value.spatial_y_axis_id.value,
+        "spatial_x_axis_id": value.spatial_x_axis_id.value,
+        "coordinate_frame": value.coordinate_frame.value,
+        "dtype": value.dtype.str,
+        "count_unit": value.count_unit,
+        "exposure_seconds": value.exposure_seconds,
+        "gain": value.gain,
+        "readout_mode": value.readout_mode,
+        "opaque_frame_settings_fingerprint": (
+            value.opaque_frame_settings_fingerprint
+        ),
+    }
+
+
+def _exact_tree(tree: object, fields: set[str], schema: str) -> dict[str, object]:
+    if not isinstance(tree, dict) or set(tree) != fields:
+        raise ValueError(f"{schema} has an unknown field set")
+    if tree["schema"] != schema:
+        raise ValueError(f"expected {schema}, got {tree['schema']!r}")
+    return tree
+
+
+def camera_physical_facts_from_tree(tree: object) -> CameraPhysicalFacts:
+    fields = {
+        "schema",
+        "camera_identity",
+        "sensor_identity",
+        "optical_path",
+        "sensor_shape_yx",
+        "roi_origin_yx",
+        "roi_shape_yx",
+        "binning_yx",
+        "spatial_y_axis_id",
+        "spatial_x_axis_id",
+        "coordinate_frame",
+        "dtype",
+        "count_unit",
+        "exposure_seconds",
+        "gain",
+        "readout_mode",
+        "opaque_frame_settings_fingerprint",
+    }
+    data = _exact_tree(tree, fields, _CAMERA_PHYSICAL_FACTS_SCHEMA)
+    return CameraPhysicalFacts(
+        camera_identity=data["camera_identity"],
+        sensor_identity=data["sensor_identity"],
+        optical_path=data["optical_path"],
+        sensor_shape_yx=data["sensor_shape_yx"],
+        roi_origin_yx=data["roi_origin_yx"],
+        roi_shape_yx=data["roi_shape_yx"],
+        binning_yx=data["binning_yx"],
+        spatial_y_axis_id=AxisId(data["spatial_y_axis_id"]),
+        spatial_x_axis_id=AxisId(data["spatial_x_axis_id"]),
+        coordinate_frame=CoordinateFrameId(data["coordinate_frame"]),
+        dtype=np.dtype(data["dtype"]),
+        count_unit=data["count_unit"],
+        exposure_seconds=data["exposure_seconds"],
+        gain=data["gain"],
+        readout_mode=data["readout_mode"],
+        opaque_frame_settings_fingerprint=data[
+            "opaque_frame_settings_fingerprint"
+        ],
+    )
+
+
+@dataclass(frozen=True)
+class CameraCapabilityEvidence:
+    """Canonical facts whose digest is the broker capability fingerprint.
+
+    This value is minted from the same frozen adapter snapshot as
+    :class:`CameraPhysicalFacts`.  Persisting it lets the durable boundary
+    recompute the terminal capability fingerprint instead of trusting a second
+    caller-provided digest.
+    """
+
+    adapter_type: str
+    source_id: str
+    settings_fingerprint: str
+    payload_contract_fingerprint: str
+    capture_spec_owner_fingerprint: str
+    flow_control: ProducerFlowControl
+    max_source_burst_events: int
+    driver_ring_bytes: int
+    adapter_record_retention_bytes: int
+    max_blocking_call_seconds: float
+    max_capture_spec_bytes: int
+    physical_facts: CameraPhysicalFacts
+
+    def __post_init__(self) -> None:
+        _canonical_text(self.adapter_type, "adapter_type")
+        _canonical_text(self.source_id, "source_id")
+        for name in (
+            "settings_fingerprint",
+            "payload_contract_fingerprint",
+            "capture_spec_owner_fingerprint",
+        ):
+            _sha256(getattr(self, name), name)
+        if not isinstance(self.flow_control, ProducerFlowControl):
+            raise TypeError("flow_control must be ProducerFlowControl")
+        object.__setattr__(
+            self,
+            "max_source_burst_events",
+            _positive_int(self.max_source_burst_events, "max_source_burst_events"),
+        )
+        object.__setattr__(
+            self,
+            "driver_ring_bytes",
+            _positive_int(self.driver_ring_bytes, "driver_ring_bytes"),
+        )
+        object.__setattr__(
+            self,
+            "adapter_record_retention_bytes",
+            _nonnegative_int(
+                self.adapter_record_retention_bytes,
+                "adapter_record_retention_bytes",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "max_blocking_call_seconds",
+            _positive_finite(
+                self.max_blocking_call_seconds,
+                "max_blocking_call_seconds",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "max_capture_spec_bytes",
+            _positive_int(self.max_capture_spec_bytes, "max_capture_spec_bytes"),
+        )
+        if not isinstance(self.physical_facts, CameraPhysicalFacts):
+            raise TypeError("physical_facts must be CameraPhysicalFacts")
+        if (
+            self.physical_facts.opaque_frame_settings_fingerprint
+            != self.settings_fingerprint
+        ):
+            raise ValueError("camera physical facts differ from capability settings")
+
+    @property
+    def fingerprint(self) -> str:
+        return canonical_digest(camera_capability_evidence_to_tree(self))
+
+
+def camera_capability_evidence_to_tree(
+    value: CameraCapabilityEvidence,
+) -> dict[str, object]:
+    if not isinstance(value, CameraCapabilityEvidence):
+        raise TypeError("value must be CameraCapabilityEvidence")
+    return {
+        "schema": _CAMERA_CAPABILITY_EVIDENCE_SCHEMA,
+        "adapter_type": value.adapter_type,
+        "source_id": value.source_id,
+        "settings_fingerprint": value.settings_fingerprint,
+        "payload_contract_fingerprint": value.payload_contract_fingerprint,
+        "capture_spec_owner_fingerprint": value.capture_spec_owner_fingerprint,
+        "flow_control": value.flow_control.value,
+        "max_source_burst_events": value.max_source_burst_events,
+        "driver_ring_bytes": value.driver_ring_bytes,
+        "adapter_record_retention_bytes": value.adapter_record_retention_bytes,
+        "max_blocking_call_seconds": value.max_blocking_call_seconds,
+        "max_capture_spec_bytes": value.max_capture_spec_bytes,
+        "physical_facts_fingerprint": value.physical_facts.fingerprint,
+        "physical_facts": camera_physical_facts_to_tree(value.physical_facts),
+    }
+
+
+def camera_capability_evidence_from_tree(tree: object) -> CameraCapabilityEvidence:
+    fields = {
+        "schema",
+        "adapter_type",
+        "source_id",
+        "settings_fingerprint",
+        "payload_contract_fingerprint",
+        "capture_spec_owner_fingerprint",
+        "flow_control",
+        "max_source_burst_events",
+        "driver_ring_bytes",
+        "adapter_record_retention_bytes",
+        "max_blocking_call_seconds",
+        "max_capture_spec_bytes",
+        "physical_facts_fingerprint",
+        "physical_facts",
+    }
+    data = _exact_tree(tree, fields, _CAMERA_CAPABILITY_EVIDENCE_SCHEMA)
+    facts = camera_physical_facts_from_tree(data["physical_facts"])
+    if facts.fingerprint != _sha256(
+        data["physical_facts_fingerprint"],
+        "physical_facts_fingerprint",
+    ):
+        raise ValueError("camera physical-facts fingerprint differs from evidence")
+    return CameraCapabilityEvidence(
+        adapter_type=data["adapter_type"],
+        source_id=data["source_id"],
+        settings_fingerprint=data["settings_fingerprint"],
+        payload_contract_fingerprint=data["payload_contract_fingerprint"],
+        capture_spec_owner_fingerprint=data["capture_spec_owner_fingerprint"],
+        flow_control=ProducerFlowControl(data["flow_control"]),
+        max_source_burst_events=data["max_source_burst_events"],
+        driver_ring_bytes=data["driver_ring_bytes"],
+        adapter_record_retention_bytes=data["adapter_record_retention_bytes"],
+        max_blocking_call_seconds=data["max_blocking_call_seconds"],
+        max_capture_spec_bytes=data["max_capture_spec_bytes"],
+        physical_facts=facts,
+    )
+
+
 class CapturePayloadContract(Protocol[PayloadT]):
     fingerprint: str
     max_retained_nbytes: int
@@ -142,6 +521,7 @@ class CaptureCapabilitySnapshot:
     adapter_record_retention_bytes: int
     max_blocking_call_seconds: float
     max_capture_spec_bytes: int
+    camera_capability_evidence: CameraCapabilityEvidence | None = None
 
     def __post_init__(self) -> None:
         for field in (
@@ -190,6 +570,43 @@ class CaptureCapabilitySnapshot:
                 "max_blocking_call_seconds",
             ),
         )
+        evidence = self.camera_capability_evidence
+        if evidence is not None:
+            if not isinstance(evidence, CameraCapabilityEvidence):
+                raise TypeError(
+                    "camera_capability_evidence must be CameraCapabilityEvidence or None"
+                )
+            if evidence.fingerprint != self.capability_fingerprint:
+                raise ValueError(
+                    "camera capability fingerprint differs from canonical evidence"
+                )
+            if evidence.physical_facts.camera_identity != self.stable_device_identity:
+                raise ValueError(
+                    "camera physical identity differs from capability stable identity"
+                )
+            for snapshot_field, evidence_field in (
+                ("settings_fingerprint", "settings_fingerprint"),
+                ("payload_contract_fingerprint", "payload_contract_fingerprint"),
+                ("capture_spec_owner_fingerprint", "capture_spec_owner_fingerprint"),
+                ("flow_control", "flow_control"),
+                ("max_source_burst_events", "max_source_burst_events"),
+                ("driver_ring_bytes", "driver_ring_bytes"),
+                (
+                    "adapter_record_retention_bytes",
+                    "adapter_record_retention_bytes",
+                ),
+                ("max_blocking_call_seconds", "max_blocking_call_seconds"),
+                ("max_capture_spec_bytes", "max_capture_spec_bytes"),
+            ):
+                if getattr(self, snapshot_field) != getattr(evidence, evidence_field):
+                    raise ValueError(
+                        f"camera capability {snapshot_field} differs from evidence"
+                    )
+
+    @property
+    def camera_physical_facts(self) -> CameraPhysicalFacts | None:
+        evidence = self.camera_capability_evidence
+        return None if evidence is None else evidence.physical_facts
 
 
 @dataclass(frozen=True)
@@ -217,6 +634,60 @@ class CaptureRuntimeProfile:
 
 
 @dataclass(frozen=True)
+class CameraCaptureProvenance:
+    """Owner-derived physical facts for one raw camera capture binding.
+
+    No readout event is selected here.  A later calibration/analysis request
+    combines this raw descriptor with an explicit ``CalibrationCaptureLayout``
+    to derive a ``FrameContract``.  ``camera_arm_spec_fingerprint`` is only the
+    frozen camera arm/capture-spec digest; it is not an FPGA pulse-schedule digest.
+    """
+
+    descriptor: CameraCaptureDescriptor
+    binding: ReadoutBindingKey
+    active_settings_fingerprint: str
+    binding_id: str
+    connection_generation: str
+    capability_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.descriptor, CameraCaptureDescriptor):
+            raise TypeError("descriptor must be CameraCaptureDescriptor")
+        if not isinstance(self.binding, ReadoutBindingKey):
+            raise TypeError("binding must be ReadoutBindingKey")
+        _sha256(
+            self.active_settings_fingerprint,
+            "active_settings_fingerprint",
+        )
+        if any(
+            setting.opaque_frame_settings_fingerprint
+            != self.active_settings_fingerprint
+            for setting in self.descriptor.event_settings
+        ):
+            raise ValueError(
+                "descriptor event settings differ from active settings evidence"
+            )
+        if self.descriptor.camera_arm_spec_fingerprint is None:
+            raise ValueError(
+                "camera descriptor requires camera_arm_spec_fingerprint"
+            )
+        _canonical_text(self.binding_id, "binding_id")
+        _canonical_text(self.connection_generation, "connection_generation")
+        _sha256(self.capability_fingerprint, "capability_fingerprint")
+
+    @property
+    def camera_arm_spec_fingerprint(self) -> str:
+        value = self.descriptor.camera_arm_spec_fingerprint
+        assert value is not None
+        return value
+
+    def validate_schema(self, schema: DatasetSchema) -> None:
+        if not isinstance(schema, DatasetSchema):
+            raise TypeError("schema must be DatasetSchema")
+        self.descriptor.validate_schema(schema)
+
+
+@dataclass(frozen=True)
 class CaptureStreamContract:
     stream_id: StreamId
     source_id: str
@@ -227,6 +698,7 @@ class CaptureStreamContract:
     capability: CaptureCapabilitySnapshot
     runtime_profile: CaptureRuntimeProfile
     capture_spec_owner_fingerprint: str
+    camera_provenance: CameraCaptureProvenance | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.stream_id, StreamId):
@@ -238,7 +710,13 @@ class CaptureStreamContract:
             raise TypeError("capability must be CaptureCapabilitySnapshot")
         if not isinstance(self.runtime_profile, CaptureRuntimeProfile):
             raise TypeError("runtime_profile must be CaptureRuntimeProfile")
-        for member in ("payload_contract", "value_schema", "metadata_contract", "value"):
+        for member in (
+            "payload_contract",
+            "value_schema",
+            "metadata_contract",
+            "operator_fingerprint",
+            "value",
+        ):
             if not hasattr(self.event_adapter, member):
                 raise TypeError(f"event_adapter.{member} is required")
         _sha256(self.payload_contract.fingerprint, "payload contract fingerprint")
@@ -272,6 +750,10 @@ class CaptureStreamContract:
         )
         metadata_contract = self.event_adapter.metadata_contract
         _sha256(metadata_contract.fingerprint, "metadata contract fingerprint")
+        _sha256(
+            self.event_adapter.operator_fingerprint,
+            "event adapter operator fingerprint",
+        )
         _nonnegative_int(
             metadata_contract.max_retained_nbytes,
             "metadata contract max_retained_nbytes",
@@ -299,6 +781,74 @@ class CaptureStreamContract:
             raise ValueError("DatasetEventAdapter must share CapturePayloadContract owner")
         if self.event_adapter.value_schema is not self.dataset_schema.cell_schema:
             raise ValueError("DatasetEventAdapter schema differs from DatasetSchema")
+        if self.camera_provenance is not None:
+            # A raw camera CaptureArtifact is defined by the acquisition owner,
+            # not by schema equality.  A caller-defined adapter may preserve the
+            # same schema while numerically changing every pixel, so require the
+            # exact owner implementation as well as its canonical operator id.
+            from zlc_neutral_atom.acquisition.camera import CameraDatasetEventAdapter
+            from zlc_neutral_atom.camera_operator import (
+                CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
+            )
+
+            if type(self.event_adapter) is not CameraDatasetEventAdapter or (
+                self.event_adapter.operator_fingerprint
+                != CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT
+            ):
+                raise ValueError(
+                    "raw camera provenance requires the owner identity event adapter"
+                )
+            if not isinstance(self.camera_provenance, CameraCaptureProvenance):
+                raise TypeError(
+                    "camera_provenance must be CameraCaptureProvenance or None"
+                )
+            self.camera_provenance.validate_schema(self.dataset_schema)
+            if self.camera_provenance.binding.value != self.source_id:
+                raise ValueError(
+                    "camera provenance binding differs from capture source_id"
+                )
+            if (
+                self.camera_provenance.active_settings_fingerprint
+                != self.capability.settings_fingerprint
+            ):
+                raise ValueError(
+                    "camera readout active settings differ from capture capability"
+                )
+            if (
+                self.camera_provenance.descriptor.camera_identity
+                != self.capability.stable_device_identity
+            ):
+                raise ValueError(
+                    "camera readout identity differs from capture capability"
+                )
+            if self.camera_provenance.binding_id != self.capability.binding_id:
+                raise ValueError("camera provenance binding_id differs from capability")
+            if (
+                self.camera_provenance.connection_generation
+                != self.capability.connection_generation
+            ):
+                raise ValueError(
+                    "camera provenance connection generation differs from capability"
+                )
+            if (
+                self.camera_provenance.capability_fingerprint
+                != self.capability.capability_fingerprint
+            ):
+                raise ValueError(
+                    "camera provenance capability fingerprint differs from capability"
+                )
+            physical_facts = self.capability.camera_physical_facts
+            if physical_facts is None:
+                raise ValueError(
+                    "camera provenance requires broker-attested physical facts"
+                )
+            physical_facts.validate_descriptor(self.camera_provenance.descriptor)
+            evidence = self.capability.camera_capability_evidence
+            assert evidence is not None
+            if evidence.source_id != self.source_id:
+                raise ValueError(
+                    "camera capability evidence source differs from capture source_id"
+                )
         cells = tuple(self.expected_cells)
         domain = {
             DatasetCellAddress(repeat, point)
@@ -518,7 +1068,21 @@ class CaptureSessionState(str, Enum):
 
 
 class CaptureCompletion:
-    __slots__ = ("_session", "_eos", "_terminal")
+    __slots__ = (
+        "_session",
+        "_eos",
+        "_terminal",
+        "_trace_binding",
+        "_source_dataset_schema",
+        "_source_cell_schedule",
+        "_camera_provenance",
+        "_camera_capability_evidence",
+        "_camera_arm_spec",
+        "_source_event_adapter_operator_fingerprint",
+        "_chain_contract_digest",
+        "_terminal_reservation",
+        "_direct_terminal_consumer",
+    )
 
     def __init__(
         self,
@@ -529,9 +1093,57 @@ class CaptureCompletion:
     ) -> None:
         if authority is not _COMPLETION_TOKEN:
             raise PermissionError("CaptureCompletion can only be minted by CaptureSession")
+        readiness = session._exact_consumer_readiness
+        if readiness is None:
+            raise RuntimeError("capture completion has no exact consumer readiness")
         object.__setattr__(self, "_session", session)
         object.__setattr__(self, "_eos", None)
         object.__setattr__(self, "_terminal", terminal)
+        object.__setattr__(self, "_trace_binding", session._trace_binding)
+        object.__setattr__(
+            self,
+            "_source_dataset_schema",
+            session._contract.dataset_schema,
+        )
+        object.__setattr__(
+            self,
+            "_source_cell_schedule",
+            session._contract.expected_cells,
+        )
+        object.__setattr__(
+            self,
+            "_camera_provenance",
+            session._contract.camera_provenance,
+        )
+        object.__setattr__(
+            self,
+            "_camera_capability_evidence",
+            session._contract.capability.camera_capability_evidence,
+        )
+        object.__setattr__(self, "_camera_arm_spec", session._capture_spec)
+        object.__setattr__(
+            self,
+            "_source_event_adapter_operator_fingerprint",
+            session._contract.event_adapter.operator_fingerprint,
+        )
+        object.__setattr__(
+            self,
+            "_chain_contract_digest",
+            readiness.chain_contract_digest,
+        )
+        # Process-local identity capability.  PipelineResult uses it to prove
+        # that its SealedDatasetArtifact came from this readiness chain's live
+        # terminal DatasetBuilder, including through processor chains.
+        object.__setattr__(
+            self,
+            "_terminal_reservation",
+            readiness._terminal_reservation,
+        )
+        object.__setattr__(
+            self,
+            "_direct_terminal_consumer",
+            readiness._source_reservation is readiness._terminal_reservation,
+        )
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("CaptureCompletion is immutable")
@@ -545,6 +1157,42 @@ class CaptureCompletion:
     @property
     def terminal(self) -> CaptureTerminalAck:
         return self._terminal
+
+    @property
+    def trace_binding(self) -> TraceBinding:
+        return self._trace_binding
+
+    @property
+    def source_dataset_schema(self) -> DatasetSchema:
+        return self._source_dataset_schema
+
+    @property
+    def source_cell_schedule(self) -> tuple[DatasetCellAddress, ...]:
+        return self._source_cell_schedule
+
+    @property
+    def camera_provenance(self) -> CameraCaptureProvenance | None:
+        return self._camera_provenance
+
+    @property
+    def camera_capability_evidence(self) -> CameraCapabilityEvidence | None:
+        return self._camera_capability_evidence
+
+    @property
+    def camera_arm_spec(self) -> FrozenCaptureSpec:
+        return self._camera_arm_spec
+
+    @property
+    def source_event_adapter_operator_fingerprint(self) -> str:
+        return self._source_event_adapter_operator_fingerprint
+
+    @property
+    def chain_contract_digest(self) -> str:
+        return self._chain_contract_digest
+
+    @property
+    def direct_terminal_consumer(self) -> bool:
+        return self._direct_terminal_consumer
 
 
 @dataclass(frozen=True)
@@ -888,6 +1536,7 @@ class CaptureSession:
                 self._contract.dataset_schema,
                 self._contract.expected_cells,
                 self._contract.event_adapter.metadata_contract.fingerprint,
+                self._contract.event_adapter.operator_fingerprint,
             ),
             source_schedule_digest=dataset_cell_permutation_digest(
                 self._contract.dataset_schema,
@@ -1147,6 +1796,13 @@ __all__ = [
     "CaptureStartedAck",
     "CaptureStreamContract",
     "CaptureTerminalAck",
+    "CameraCapabilityEvidence",
+    "CameraCaptureProvenance",
+    "CameraPhysicalFacts",
+    "camera_capability_evidence_from_tree",
+    "camera_capability_evidence_to_tree",
+    "camera_physical_facts_from_tree",
+    "camera_physical_facts_to_tree",
     "CapturedPayloadAck",
     "CompleteCaptureCommand",
     "PrepareCaptureCommand",

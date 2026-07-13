@@ -19,6 +19,7 @@ from zlc_data import (
     CoordinateFrameId,
     DatasetSchema,
     PointLayout,
+    READOUT_EVENT,
     REPEAT,
     SPATIAL_X,
     SPATIAL_Y,
@@ -37,6 +38,11 @@ from zlc_neutral_atom.acquisition import (
     CameraSampleContract,
     decode_camera_capture_spec,
     freeze_camera_capture_spec,
+)
+from zlc_neutral_atom.readout.contracts import (
+    CameraCaptureDescriptor,
+    CameraEventReadoutSetting,
+    ReadoutBindingKey,
 )
 from zlc_neutral_atom.runtime import (
     BoundCapturePort,
@@ -62,6 +68,11 @@ from zlc_neutral_atom.runtime import (
     StreamId,
 )
 from zlc_neutral_atom.catalog import DefinitionKey
+from zlc_neutral_atom.runtime.capture import (
+    CameraCapabilityEvidence,
+    CameraCaptureProvenance,
+    CameraPhysicalFacts,
+)
 from zlc_storage import canonical_digest
 
 from .legacy_runtime import LegacyDeviceRegistry, TargetDeviceEndpoint
@@ -132,6 +143,11 @@ def _settings_tree(camera: CameraDevice) -> dict[str, object]:
         {
             "adapter_type": f"{type(camera).__module__}.{type(camera).__qualname__}",
             "frame_shape": tuple(int(size) for size in shape),
+            "sensor_shape": (
+                None
+                if camera.sensor_shape is None
+                else tuple(int(size) for size in camera.sensor_shape)
+            ),
             "frame_dtype": _camera_dtype(camera).str,
             "acquisition_mode": _camera_mode(camera).value,
             "effective_trigger_channels": tuple(camera.effective_trigger_channels),
@@ -147,6 +163,76 @@ def _settings_tree(camera: CameraDevice) -> dict[str, object]:
     return snapshot
 
 
+def _readout_mode_from_settings(
+    camera: CameraDevice,
+    settings: dict[str, object],
+) -> str:
+    if type(camera) is QCMOSCamera:
+        return (
+            f"qcmos:readout-speed={int(settings['readout_speed'])}:"
+            f"sensor-mode={settings.get('sensor_mode')}:"
+            f"global-exposure={settings.get('trigger_global_exposure')}"
+        )
+    if type(camera) is PylonCamera:
+        return (
+            f"pylon:pixel-format={settings['pixel_format']}:"
+            f"trigger-source={settings['trigger_source']}"
+        )
+    return f"{type(camera).__name__}:mode={settings['acquisition_mode']}"
+
+
+def _physical_facts(
+    camera: CameraDevice,
+    binding: BoundDevice,
+    source_id: str,
+    payload_contract: CameraSampleContract,
+    settings_tree: dict[str, object],
+    settings_fingerprint: str,
+) -> CameraPhysicalFacts:
+    sensor = settings_tree.get("sensor_shape")
+    if sensor is None:
+        raise RuntimeError(
+            "camera sensor geometry is unavailable during capability probe"
+        )
+    sensor_y, sensor_x = (int(size) for size in sensor)
+    roi = settings_tree.get("roi")
+    if roi is None:
+        origin_yx = (0, 0)
+        roi_shape_yx = (sensor_y, sensor_x)
+    else:
+        x, width, y, height = (int(value) for value in roi)
+        origin_yx = (y, x)
+        roi_shape_yx = (height, width)
+    y_axis, x_axis = payload_contract.value_schema.data_axes
+    gain_value = settings_tree.get("gain", 1.0)
+    gain = float(gain_value)
+    facts = CameraPhysicalFacts(
+        camera_identity=binding.stable_device_identity,
+        sensor_identity=f"{binding.stable_device_identity}/sensor",
+        optical_path=f"installation-role/{source_id}",
+        sensor_shape_yx=(sensor_y, sensor_x),
+        roi_origin_yx=origin_yx,
+        roi_shape_yx=roi_shape_yx,
+        binning_yx=(1, 1),
+        spatial_y_axis_id=y_axis.axis_id,
+        spatial_x_axis_id=x_axis.axis_id,
+        coordinate_frame=y_axis.coordinate_frame,
+        dtype=payload_contract.value_schema.dtype,
+        count_unit=payload_contract.value_schema.value_unit,
+        exposure_seconds=float(settings_tree["exposure"]),
+        # These adapters expose no independent gain control; unity is their
+        # explicit digital-count gain policy, frozen into the same snapshot.
+        gain=gain,
+        readout_mode=_readout_mode_from_settings(camera, settings_tree),
+        opaque_frame_settings_fingerprint=settings_fingerprint,
+    )
+    if facts.output_shape_yx != payload_contract.value_schema.data_shape:
+        raise RuntimeError(
+            "camera physical geometry differs from the frozen payload schema"
+        )
+    return facts
+
+
 def _value_schema(camera: CameraDevice, source_id: str) -> ValueSchema:
     shape = camera.frame_shape
     if shape is None:
@@ -154,21 +240,25 @@ def _value_schema(camera: CameraDevice, source_id: str) -> ValueSchema:
     height, width = (int(size) for size in shape)
     y = AxisSpec(
         AxisId(f"{source_id}.y"),
-        "sensor y",
+        "ROI-local output y",
         SPATIAL_Y,
         height,
         tuple(range(height)),
         unit="pixel",
-        coordinate_frame=CoordinateFrameId(f"{source_id}.sensor"),
+        coordinate_frame=CoordinateFrameId(
+            f"{source_id}.roi-local-output-pixels"
+        ),
     )
     x = AxisSpec(
         AxisId(f"{source_id}.x"),
-        "sensor x",
+        "ROI-local output x",
         SPATIAL_X,
         width,
         tuple(range(width)),
         unit="pixel",
-        coordinate_frame=CoordinateFrameId(f"{source_id}.sensor"),
+        coordinate_frame=CoordinateFrameId(
+            f"{source_id}.roi-local-output-pixels"
+        ),
     )
     return ValueSchema(
         (y, x),
@@ -191,14 +281,23 @@ class _EndpointSession:
     closed: bool = False
 
 
+_DESCRIPTION_TOKEN = object()
+
+
 @dataclass(frozen=True)
 class CameraCaptureDescription:
+    _authority: object
     source_id: str
     payload_contract: CameraSampleContract
     settings_fingerprint: str
     trigger_channels: tuple[str, ...]
+    physical_facts: CameraPhysicalFacts
 
     def __post_init__(self) -> None:
+        if self._authority is not _DESCRIPTION_TOKEN:
+            raise PermissionError(
+                "CameraCaptureDescription can only be minted by CameraCaptureEndpoint"
+            )
         _canonical_text(self.source_id, "source_id")
         if not isinstance(self.payload_contract, CameraSampleContract):
             raise TypeError("payload_contract must be CameraSampleContract")
@@ -210,6 +309,70 @@ class CameraCaptureDescription:
         if not channels or len(channels) != len(set(channels)):
             raise ValueError("camera trigger channels must be unique and non-empty")
         object.__setattr__(self, "trigger_channels", channels)
+        if not isinstance(self.physical_facts, CameraPhysicalFacts):
+            raise TypeError("physical_facts must be CameraPhysicalFacts")
+        if (
+            self.physical_facts.opaque_frame_settings_fingerprint
+            != self.settings_fingerprint
+        ):
+            raise ValueError("physical facts and settings fingerprint differ")
+
+    def event_setting(self, event_index: int) -> CameraEventReadoutSetting:
+        return self.physical_facts.event_setting(event_index)
+
+    def mint_descriptor(
+        self,
+        schema: DatasetSchema,
+        event_settings: tuple[CameraEventReadoutSetting, ...],
+        *,
+        camera_arm_spec_fingerprint: str,
+    ) -> CameraCaptureDescriptor:
+        if not isinstance(schema, DatasetSchema):
+            raise TypeError("schema must be DatasetSchema")
+        settings = tuple(event_settings)
+        if any(not isinstance(item, CameraEventReadoutSetting) for item in settings):
+            raise TypeError("event_settings must contain CameraEventReadoutSetting")
+        readout_axes = tuple(
+            axis for axis in schema.point_axes if axis.role == READOUT_EVENT
+        )
+        if len(readout_axes) > 1:
+            raise ValueError("camera schema has multiple READOUT_EVENT axes")
+        event_axis = readout_axes[0] if readout_axes else None
+        expected_indices = (
+            (0,) if event_axis is None else tuple(range(event_axis.size))
+        )
+        if tuple(item.event_index for item in settings) != expected_indices:
+            raise ValueError(
+                "event_settings must explicitly cover every READOUT_EVENT index"
+            )
+        for setting in settings:
+            if setting != self.physical_facts.event_setting(setting.event_index):
+                raise ValueError(
+                    "event setting differs from broker-attested camera settings"
+                )
+        facts = self.physical_facts
+        descriptor = CameraCaptureDescriptor(
+            camera_identity=facts.camera_identity,
+            sensor_identity=facts.sensor_identity,
+            optical_path=facts.optical_path,
+            sensor_shape_yx=facts.sensor_shape_yx,
+            roi_origin_yx=facts.roi_origin_yx,
+            roi_shape_yx=facts.roi_shape_yx,
+            binning_yx=facts.binning_yx,
+            spatial_y_axis_id=facts.spatial_y_axis_id,
+            spatial_x_axis_id=facts.spatial_x_axis_id,
+            coordinate_frame=facts.coordinate_frame,
+            dtype=facts.dtype,
+            count_unit=facts.count_unit,
+            readout_event_axis_id=(None if event_axis is None else event_axis.axis_id),
+            event_settings=settings,
+            camera_arm_spec_fingerprint=_sha256(
+                camera_arm_spec_fingerprint,
+                "camera_arm_spec_fingerprint",
+            ),
+        )
+        descriptor.validate_schema(schema)
+        return descriptor
 
 
 @dataclass(frozen=True)
@@ -224,6 +387,7 @@ class CameraCaptureBindingRequest:
     mode: CameraAcquisitionMode
     required_consumer_lag_events: int
     transport_memory_limit_bytes: int
+    event_settings: tuple[CameraEventReadoutSetting, ...] | None = None
 
     def __post_init__(self) -> None:
         _canonical_text(self.role, "camera role")
@@ -264,6 +428,19 @@ class CameraCaptureBindingRequest:
                 "transport_memory_limit_bytes",
             ),
         )
+        if self.event_settings is not None:
+            settings = tuple(self.event_settings)
+            if any(
+                not isinstance(item, CameraEventReadoutSetting) for item in settings
+            ):
+                raise TypeError(
+                    "event_settings must contain CameraEventReadoutSetting values"
+                )
+            if tuple(item.event_index for item in settings) != tuple(
+                sorted(item.event_index for item in settings)
+            ):
+                raise ValueError("event_settings must use canonical event-index order")
+            object.__setattr__(self, "event_settings", settings)
 
 
 class CameraCaptureEndpoint:
@@ -306,6 +483,7 @@ class CameraCaptureEndpoint:
         self._capability_fingerprint: str | None = None
         self._binding_id: str | None = None
         self._generation: str | None = None
+        self._description: CameraCaptureDescription | None = None
         self._session: _EndpointSession | None = None
         self._last_prepare_session_id: str | None = None
 
@@ -328,12 +506,11 @@ class CameraCaptureEndpoint:
         )
 
     def describe(self, binding: BoundDevice) -> CameraCaptureDescription:
-        return CameraCaptureDescription(
-            self._source_id,
-            self.payload_contract(binding),
-            self.settings_fingerprint(binding),
-            tuple(self._camera.effective_trigger_channels),
-        )
+        with self._lock:
+            self._validate_binding(binding)
+            if self._description is None:
+                raise RuntimeError("camera capability has not been probed")
+            return self._description
 
     def payload_contract(self, binding: BoundDevice) -> CameraSampleContract:
         with self._lock:
@@ -353,31 +530,55 @@ class CameraCaptureEndpoint:
         with self._lock:
             if self._session is not None and not self._session.closed:
                 raise RuntimeError("cannot probe camera capability during a capture session")
-            settings = canonical_digest(_settings_tree(self._camera))
+            settings_tree = _settings_tree(self._camera)
+            settings = canonical_digest(settings_tree)
             payload_contract = CameraSampleContract(
                 _value_schema(self._camera, self._source_id)
             )
             frame_bytes = int(np.prod(payload_contract.value_schema.data_shape)) * int(
                 payload_contract.value_schema.dtype.itemsize
             )
-            capability = canonical_digest(
-                {
-                    "contract": "zlc.camera-capture-endpoint.v1",
-                    "adapter_type": type(self._camera).__qualname__,
-                    "source_id": self._source_id,
-                    "settings_fingerprint": settings,
-                    "payload_contract_fingerprint": payload_contract.fingerprint,
-                    "max_inflight_frames": self._max_inflight_frames,
-                    "max_blocking_call_seconds": self._max_blocking_call_seconds,
-                    "max_capture_spec_bytes": self._max_capture_spec_bytes,
-                }
+            physical_facts = _physical_facts(
+                self._camera,
+                binding,
+                self._source_id,
+                payload_contract,
+                settings_tree,
+                settings,
             )
+            driver_ring_bytes = self._max_inflight_frames * frame_bytes
+            adapter_record_retention_bytes = max(
+                self._max_inflight_frames,
+                int(self._camera.recent_capacity),
+            ) * frame_bytes
+            capability_evidence = CameraCapabilityEvidence(
+                adapter_type=(
+                    f"{type(self._camera).__module__}."
+                    f"{type(self._camera).__qualname__}"
+                ),
+                source_id=self._source_id,
+                settings_fingerprint=settings,
+                payload_contract_fingerprint=payload_contract.fingerprint,
+                capture_spec_owner_fingerprint=(
+                    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT
+                ),
+                flow_control=ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
+                max_source_burst_events=self._max_inflight_frames,
+                driver_ring_bytes=driver_ring_bytes,
+                adapter_record_retention_bytes=(
+                    adapter_record_retention_bytes
+                ),
+                max_blocking_call_seconds=self._max_blocking_call_seconds,
+                max_capture_spec_bytes=self._max_capture_spec_bytes,
+                physical_facts=physical_facts,
+            )
+            capability = capability_evidence.fingerprint
             self._payload_contract = payload_contract
             self._settings_fingerprint = settings
             self._capability_fingerprint = capability
             self._binding_id = binding.binding_id
             self._generation = binding.connection_generation
-            return CaptureCapabilitySnapshot(
+            snapshot = CaptureCapabilitySnapshot(
                 binding.binding_id,
                 binding.stable_device_identity,
                 binding.connection_generation,
@@ -387,15 +588,21 @@ class CameraCaptureEndpoint:
                 CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
                 ProducerFlowControl.NON_BACKPRESSURE_CAPTURED,
                 self._max_inflight_frames,
-                self._max_inflight_frames * frame_bytes,
-                max(
-                    self._max_inflight_frames,
-                    int(self._camera.recent_capacity),
-                )
-                * frame_bytes,
+                driver_ring_bytes,
+                adapter_record_retention_bytes,
                 self._max_blocking_call_seconds,
                 self._max_capture_spec_bytes,
+                capability_evidence,
             )
+            self._description = CameraCaptureDescription(
+                _DESCRIPTION_TOKEN,
+                self._source_id,
+                payload_contract,
+                settings,
+                tuple(self._camera.effective_trigger_channels),
+                physical_facts,
+            )
+            return snapshot
 
     def execute_command(self, binding: BoundDevice, command: object) -> object:
         if isinstance(command, PrepareCaptureCommand):
@@ -707,6 +914,10 @@ def bind_camera_measurement(
         raise TypeError("camera capability attestation has the wrong snapshot type")
     if capability.settings_fingerprint != description.settings_fingerprint:
         raise RuntimeError("camera description and capability settings differ")
+    if capability.camera_physical_facts is not description.physical_facts:
+        raise RuntimeError(
+            "camera description does not share broker-attested physical facts"
+        )
     payload_contract = description.payload_contract
     dataset_schema = DatasetSchema(
         request.repeat_axis,
@@ -715,6 +926,40 @@ def bind_camera_measurement(
         payload_contract.value_schema,
     )
     expected_cells = request.expected_cells
+    capture_spec = freeze_camera_capture_spec(
+        CameraCaptureSpec(
+            request.mode,
+            len(expected_cells),
+            description.settings_fingerprint,
+        )
+    )
+    readout_axes = tuple(
+        axis for axis in dataset_schema.point_axes if axis.role == READOUT_EVENT
+    )
+    if len(readout_axes) > 1:
+        raise ValueError("camera dataset has multiple READOUT_EVENT axes")
+    event_count = 1 if not readout_axes else readout_axes[0].size
+    if request.event_settings is None:
+        if event_count != 1:
+            raise ValueError(
+                "multi-event camera capture requires explicit event_settings"
+            )
+        event_settings = (description.event_setting(0),)
+    else:
+        event_settings = request.event_settings
+    descriptor = description.mint_descriptor(
+        dataset_schema,
+        event_settings,
+        camera_arm_spec_fingerprint=capture_spec.digest,
+    )
+    camera_provenance = CameraCaptureProvenance(
+        descriptor=descriptor,
+        binding=ReadoutBindingKey(request.role),
+        active_settings_fingerprint=description.settings_fingerprint,
+        binding_id=capability.binding_id,
+        connection_generation=capability.connection_generation,
+        capability_fingerprint=capability.capability_fingerprint,
+    )
     capture_contract = CaptureStreamContract(
         StreamId(f"camera.{request.role}.frames"),
         request.role,
@@ -728,13 +973,7 @@ def bind_camera_measurement(
             request.transport_memory_limit_bytes,
         ),
         CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
-    )
-    capture_spec = freeze_camera_capture_spec(
-        CameraCaptureSpec(
-            request.mode,
-            len(expected_cells),
-            description.settings_fingerprint,
-        )
+        camera_provenance,
     )
     definition = MeasurementDefinition(
         DefinitionKey(

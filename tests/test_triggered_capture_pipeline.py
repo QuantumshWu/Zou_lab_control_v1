@@ -92,6 +92,7 @@ def _runtime(point_count=3):
         },
     )
     runtime = LegacyNeutralAtomRuntime(device_set)
+    description = runtime.describe_camera("readout")
     measurement = runtime.bind_camera_measurement(
         CameraCaptureBindingRequest(
             "readout",
@@ -102,6 +103,7 @@ def _runtime(point_count=3):
             CameraAcquisitionMode.EXTERNAL_TRIGGERED,
             0,
             4 << 20,
+            tuple(description.event_setting(index) for index in range(point_count)),
         )
     )
     capture = MinimalPipelineSpec(
@@ -224,6 +226,14 @@ def test_triggered_capture_artifact_persists_pulse_lineage(tmp_path):
         assert isinstance(lineage.terminal.receipt, SimulatedPulseReceipt)
         assert lineage.terminal.evidence_kind is PulseTerminalEvidenceKind.SIMULATED
         assert stored.terminal.produced_count == lineage.expected_trigger_count
+        assert (
+            stored.camera_provenance
+            == capture.measurement.capture_contract.camera_provenance
+        )
+        assert stored.source_cell_schedule == plan.expected_cells
+        assert stored.run_id == stored.provenance.trace_binding.run_id
+        assert stored.safety_bundle_id is not None
+        assert len(stored.chain_contract_digest) == 64
         assert dict(sequencer.snapshot())["state"] == "safe"
     finally:
         assert runtime.shutdown(timeout=2.0)

@@ -253,10 +253,12 @@ def chain(
         "synthetic-processor",
         operator,
     )
+    source_adapter = ValueDatasetEventAdapter(payload)
     source_contract = dataset_consumer_contract_digest(
         data_schema,
         schedule,
-        ValueDatasetEventAdapter(payload).metadata_contract.fingerprint,
+        source_adapter.metadata_contract.fingerprint,
+        source_adapter.operator_fingerprint,
     )
     source_schedule = dataset_cell_permutation_digest(data_schema, schedule)
     if tamper_output_cursor_owner:
@@ -315,10 +317,12 @@ def test_exact_chain_preserves_keys_provenance_and_all_cells_before_input_ack():
     item = chain()
     item.worker.start()
     readiness = item.worker.exact_readiness()
+    source_adapter = ValueDatasetEventAdapter(item.source._payload_contract)
     source_contract = dataset_consumer_contract_digest(
         item.schema,
         item.schedule,
-        ValueDatasetEventAdapter(item.source._payload_contract).metadata_contract.fingerprint,
+        source_adapter.metadata_contract.fingerprint,
+        source_adapter.operator_fingerprint,
     )
     readiness.validate_source(
         reservation=item.reservation,

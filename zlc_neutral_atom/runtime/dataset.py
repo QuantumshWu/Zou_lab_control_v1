@@ -62,6 +62,7 @@ class DatasetEventAdapter(Protocol[PayloadT]):
     payload_contract: object
     value_schema: ValueSchema
     metadata_contract: "DatasetMetadataContract[PayloadT]"
+    operator_fingerprint: str
 
     def value(self, payload: PayloadT) -> Value: ...
 
@@ -109,6 +110,13 @@ class NoDatasetMetadataContract:
 class ValueDatasetEventAdapter:
     payload_contract: ValuePayloadContract
     metadata_contract: NoDatasetMetadataContract = NoDatasetMetadataContract()
+    operator_fingerprint: str = canonical_digest(
+        {
+            "owner": "zlc_neutral_atom.runtime.dataset.ValueDatasetEventAdapter",
+            "operator": "identity-value",
+            "schema": "v1",
+        }
+    )
 
     @property
     def value_schema(self) -> ValueSchema:
@@ -303,18 +311,26 @@ def dataset_consumer_contract_digest(
     schema: DatasetSchema,
     cells: tuple[DatasetCellAddress, ...],
     metadata_contract_fingerprint: str,
+    event_adapter_operator_fingerprint: str,
 ) -> str:
-    """Bind a formal sink to its full value schema, ordering, and metadata semantics."""
+    """Bind a sink to schema, ordering, metadata, and value-projection semantics."""
 
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
     _sha256_digest(metadata_contract_fingerprint, "metadata contract fingerprint")
+    _sha256_digest(
+        event_adapter_operator_fingerprint,
+        "event adapter operator fingerprint",
+    )
     return canonical_digest(
         {
-            "contract": "zlc_neutral_atom.DatasetConsumerContract/v1",
+            "contract": "zlc_neutral_atom.DatasetConsumerContract/v2",
             "dataset_schema_fingerprint": schema.fingerprint,
             "join_plan_digest": dataset_cell_permutation_digest(schema, cells),
             "metadata_contract_fingerprint": metadata_contract_fingerprint,
+            "event_adapter_operator_fingerprint": (
+                event_adapter_operator_fingerprint
+            ),
         }
     )
 
@@ -424,6 +440,7 @@ class SealedDatasetArtifact:
         "_coverage",
         "_provenance",
         "_event_metadata",
+        "_terminal_reservation",
     )
 
     def __init__(
@@ -442,6 +459,7 @@ class SealedDatasetArtifact:
         metadata_contract_fingerprint: str,
         trace_binding: TraceBinding,
         event_metadata: tuple[object | None, ...],
+        terminal_reservation: ExactReservation,
     ) -> None:
         if authority is not _SEALED_TOKEN:
             raise PermissionError("SealedDatasetArtifact can only be minted by DatasetBuilder")
@@ -463,6 +481,7 @@ class SealedDatasetArtifact:
             ),
         )
         object.__setattr__(self, "_event_metadata", tuple(event_metadata))
+        object.__setattr__(self, "_terminal_reservation", terminal_reservation)
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("SealedDatasetArtifact is immutable")
@@ -491,6 +510,11 @@ class SealedDatasetArtifact:
     def event_metadata(self) -> tuple[object | None, ...]:
         return self._event_metadata
 
+    def _belongs_to_terminal_reservation(self, reservation: object) -> bool:
+        """Process-local ownership proof used only by PipelineResult minting."""
+
+        return self._terminal_reservation is reservation
+
 
 class DatasetBuilder(Generic[PayloadT]):
     """Private mutable materializer; public reads are immutable owned snapshots."""
@@ -513,7 +537,13 @@ class DatasetBuilder(Generic[PayloadT]):
             raise TypeError("mode must be DatasetMode")
         if not all(
             hasattr(event_adapter, member)
-            for member in ("payload_contract", "value_schema", "value", "metadata_contract")
+            for member in (
+                "payload_contract",
+                "value_schema",
+                "value",
+                "metadata_contract",
+                "operator_fingerprint",
+            )
         ):
             raise TypeError("event_adapter does not implement DatasetEventAdapter")
         adapter_parameters = getattr(type(event_adapter), "__dataclass_params__", None)
@@ -532,6 +562,10 @@ class DatasetBuilder(Generic[PayloadT]):
         self.schema = schema
         self.mode = mode
         self._event_adapter = event_adapter
+        _sha256_digest(
+            event_adapter.operator_fingerprint,
+            "event adapter operator fingerprint",
+        )
         if event_adapter.payload_contract is not self._source._payload_contract:
             raise DatasetError("DatasetEventAdapter must share the stream PayloadContract owner")
         if event_adapter.value_schema is not schema.cell_schema:
@@ -619,6 +653,7 @@ class DatasetBuilder(Generic[PayloadT]):
                 self.schema,
                 self._expected_cells,
                 self._metadata_contract.fingerprint,
+                self._event_adapter.operator_fingerprint,
             )
             self._exact_readiness = self._source._claim_consumer(
                 self._reservation,
@@ -809,6 +844,7 @@ class DatasetBuilder(Generic[PayloadT]):
             metadata_contract_fingerprint=self._metadata_contract.fingerprint,
             trace_binding=self._reservation.trace_binding,
             event_metadata=tuple(self._ordered_event_metadata),
+            terminal_reservation=self._reservation,
         )
 
     def _seal_locked(self) -> None:

@@ -238,6 +238,7 @@ class FrameMetadataContract:
 class CameraEventAdapter:
     payload_contract: CameraPayloadContract
     metadata_contract: FrameMetadataContract
+    operator_fingerprint: str = SHA_A
 
     @property
     def value_schema(self) -> ValueSchema:
@@ -685,6 +686,7 @@ def processor_capture_harness(
             item.contract.dataset_schema,
             item.contract.expected_cells,
             item.contract.event_adapter.metadata_contract.fingerprint,
+            item.contract.event_adapter.operator_fingerprint,
         ),
         source_schedule_digest=dataset_cell_permutation_digest(
             item.contract.dataset_schema,
@@ -1244,6 +1246,22 @@ def test_compiled_pipeline_plan_is_reusable_sequentially():
     assert isinstance(first, PipelineResult) and isinstance(second, PipelineResult)
     assert np.array_equal(first.dataset.block.values, second.dataset.block.values)
     assert first.dataset.provenance.generation != second.dataset.provenance.generation
+    assert first.run_id != second.run_id
+    assert len(first.chain_contract_digest) == 64
+    assert first.chain_contract_digest == second.chain_contract_digest
+
+    # Equal cardinality/content cannot authorize cross-run dataset substitution:
+    # the result mint checks the opaque terminal reservation owned by readiness.
+    from zlc_neutral_atom.runtime.pipeline import _PIPELINE_RESULT_TOKEN
+
+    with pytest.raises(RuntimeError, match="another exact terminal consumer"):
+        PipelineResult(
+            _PIPELINE_RESULT_TOKEN,
+            first.dataset,
+            second._capture_completion,
+            first.aggregate_peak_bytes,
+            first.memory_profile_fingerprint,
+        )
 
 
 def test_compiled_pipeline_contends_on_one_physical_device():
