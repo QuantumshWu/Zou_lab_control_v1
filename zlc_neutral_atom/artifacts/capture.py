@@ -105,7 +105,7 @@ from zlc_pulse import (
 )
 
 
-CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact/v7"
+CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact/v8"
 _CAPTURE_METADATA_SCHEMA = "zlc_neutral_atom.CameraFrameMetadataSequence/v1"
 _CAPTURE_NAMESPACE = CAPTURE_ARTIFACT_NAMESPACE
 
@@ -217,6 +217,10 @@ class CaptureArtifact:
             raise ValueError("CaptureArtifact requires complete dataset coverage")
         if not isinstance(self.provenance, DatasetSealProvenance):
             raise TypeError("provenance must be DatasetSealProvenance")
+        if self.provenance.derivation is not None:
+            raise ValueError(
+                "CaptureArtifact is the raw boundary and cannot persist processor output"
+            )
         if not isinstance(self.terminal, CaptureTerminalAck):
             raise TypeError("terminal must be CaptureTerminalAck")
         peak = _integer(self.aggregate_peak_bytes, "aggregate_peak_bytes")
@@ -1077,6 +1081,7 @@ def _provenance_to_tree(provenance: DatasetSealProvenance) -> dict[str, object]:
             "run_id": provenance.trace_binding.run_id,
             "source_id": provenance.trace_binding.source_id,
         },
+        "derivation": None,
     }
 
 
@@ -1091,12 +1096,17 @@ def _provenance_from_tree(tree: object) -> DatasetSealProvenance:
         "ordered_metadata_digest",
         "metadata_contract_fingerprint",
         "trace_binding",
+        "derivation",
     }
     if not isinstance(tree, dict) or set(tree) != fields:
         raise ValueError("dataset provenance has an unknown field set")
     trace = tree["trace_binding"]
     if not isinstance(trace, dict) or set(trace) != {"run_id", "source_id"}:
         raise ValueError("trace binding has an unknown field set")
+    if tree["derivation"] is not None:
+        raise ValueError(
+            "raw CaptureArtifact provenance cannot contain processor derivation"
+        )
     return DatasetSealProvenance(
         StreamId(tree["stream_id"]),
         StreamGenerationId(tree["generation"]),

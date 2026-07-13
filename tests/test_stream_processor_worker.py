@@ -9,6 +9,8 @@ import time
 
 import numpy as np
 import pytest
+import zlc_neutral_atom.processing.stream.contract as stream_contract
+from zlc_storage import encode
 
 from zlc_data import (
     AxisId,
@@ -38,18 +40,21 @@ from zlc_neutral_atom.runtime.dataset import (
     DatasetCellAddress,
     DatasetCellKeyContract,
     DatasetMode,
+    FrozenDatasetEdge,
     ValueDatasetEventAdapter,
     dataset_cell_key_fingerprint,
-    dataset_cell_permutation_digest,
-    dataset_consumer_contract_digest,
 )
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionStream,
+    ArtifactInputRef,
     ProducerFlowControl,
+    ProcessorStageProvenance,
     ReservationState,
     RetentionOverrun,
     SourceFailed,
     SchemaChanged,
+    StreamEndedEarly,
+    StreamError,
     StreamGap,
     StreamId,
     TraceBinding,
@@ -113,6 +118,10 @@ def generator_operator(payload: object, config: object):
 
 OPERATOR_ENTERED = threading.Event()
 OPERATOR_RELEASE = threading.Event()
+CHAIN_OPERATOR_ENTERED = threading.Event()
+CHAIN_OPERATOR_RELEASE = threading.Event()
+CHAIN_CURSOR_ENTERED = threading.Event()
+CHAIN_CURSOR_RELEASE = threading.Event()
 
 
 def cancellable_blocking_operator(payload: object, config: object) -> object:
@@ -122,16 +131,29 @@ def cancellable_blocking_operator(payload: object, config: object) -> object:
     return scale_value(payload, config)
 
 
+def chain_blocking_operator(payload: object, config: object) -> object:
+    CHAIN_OPERATOR_ENTERED.set()
+    if not CHAIN_OPERATOR_RELEASE.wait(1.0):
+        raise TimeoutError("test did not release chained operator")
+    return scale_value(payload, config)
+
+
 def axis(name: str, role, size: int) -> AxisSpec:
     return AxisSpec(AxisId(name), name, role, size, tuple(range(size)))
 
 
-def schema(points: int) -> DatasetSchema:
+def schema(points: int, *, cell_schema: ValueSchema | None = None) -> DatasetSchema:
     return DatasetSchema(
         axis("repeat", REPEAT, 1),
         (axis("point", SCAN_POINT, points),),
         PointLayout.rect_c((points,)),
-        ValueSchema((), ValidityContract.value(), np.dtype("<i8"), value_unit="count"),
+        cell_schema
+        or ValueSchema(
+            (),
+            ValidityContract.value(),
+            np.dtype("<i8"),
+            value_unit="count",
+        ),
     )
 
 
@@ -139,6 +161,27 @@ def cells(schema: DatasetSchema) -> tuple[DatasetCellAddress, ...]:
     return tuple(
         DatasetCellAddress(0, point)
         for point in range(schema.point_layout.storage_size)
+    )
+
+
+def artifact_ref(seed: str) -> ArtifactInputRef:
+    schema_id = "tests.synthetic-artifact-ref.v1"
+    return ArtifactInputRef(
+        schema_id,
+        encode({"schema": schema_id, "id": seed}),
+        seed * 64,
+    )
+
+
+def edge(
+    data_schema: DatasetSchema,
+    payload: ValuePayloadContract,
+    schedule: tuple[DatasetCellAddress, ...],
+) -> FrozenDatasetEdge:
+    return FrozenDatasetEdge(
+        data_schema,
+        ValueDatasetEventAdapter(payload),
+        schedule,
     )
 
 
@@ -157,6 +200,239 @@ class Chain:
     output_cursor: object
 
 
+@dataclass
+class TwoStageChain:
+    schema: DatasetSchema
+    schedule: tuple[DatasetCellAddress, ...]
+    source: AcquisitionStream
+    producer: object
+    source_reservation: object
+    first: ExactStreamProcessorWorker
+    intermediate: AcquisitionStream
+    intermediate_monitor: object
+    intermediate_reservation: object
+    second: ExactStreamProcessorWorker
+    output: AcquisitionStream
+    monitor: object
+    builder: DatasetBuilder
+
+
+def _processor_binding(
+    *,
+    name: str,
+    factor: int,
+    payload: ValuePayloadContract,
+    key_contract: DatasetCellKeyContract,
+    output: AcquisitionStream,
+    output_source_id: str,
+    operator=scale_value,
+    operator_deadline_seconds: float = 1.0,
+    artifact_inputs: tuple[ArtifactInputRef, ...] = (),
+) -> BoundStreamProcessor:
+    definition = StreamProcessorDefinition(
+        DefinitionKey("test", name, 1),
+        name,
+        f"test.{name}-config.v1",
+        payload.fingerprint,
+        payload.fingerprint,
+        key_contract.fingerprint,
+        operator_deadline_seconds=operator_deadline_seconds,
+        terminal_wait_seconds=1.0,
+    )
+    return BoundStreamProcessor(
+        definition,
+        ScaleConfig(factor),
+        payload,
+        payload,
+        key_contract,
+        output.stream_id,
+        output_source_id,
+        operator,
+        artifact_inputs,
+    )
+
+
+def two_stage_chain(
+    *,
+    points: int = 3,
+    second_operator=scale_value,
+    intermediate_retention: int | None = None,
+    cancellation=None,
+    start_first: bool = True,
+    gate_second_cursor: bool = False,
+    second_operator_deadline_seconds: float = 1.0,
+    first_artifact_inputs: tuple[ArtifactInputRef, ...] = (),
+    second_artifact_inputs: tuple[ArtifactInputRef, ...] = (),
+    source_pair: tuple[AcquisitionStream, object] | None = None,
+) -> TwoStageChain:
+    data_schema = schema(points)
+    schedule = cells(data_schema)
+    if source_pair is None:
+        payload = ValuePayloadContract(data_schema.cell_schema)
+        key_contract = DatasetCellKeyContract(data_schema)
+    else:
+        source, producer = source_pair
+        payload = source._payload_contract
+        if not isinstance(payload, ValuePayloadContract):
+            raise TypeError("source_pair must use ValuePayloadContract")
+        data_schema = schema(points, cell_schema=payload.schema)
+        schedule = cells(data_schema)
+        key_contract = source._join_key_contract
+        if not isinstance(key_contract, DatasetCellKeyContract):
+            raise TypeError("source_pair must use DatasetCellKeyContract")
+    budget = points * payload.max_retained_nbytes
+    deadline = time.monotonic() + 3.0
+
+    if source_pair is None:
+        source, producer = AcquisitionStream.create(
+            StreamId("synthetic.chain.raw"),
+            payload,
+            flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
+            retention_events=points,
+            retention_bytes=budget,
+            join_key_contract=key_contract,
+        )
+    source_reservation = source.reserve(
+        total_events=points,
+        max_inflight_events=points,
+        max_inflight_bytes=budget,
+        trace_binding=TraceBinding("synthetic-chain-run", "chain-source"),
+    )
+    source_cursor = source_reservation.activate()
+
+    retained = points if intermediate_retention is None else intermediate_retention
+    intermediate, intermediate_producer = AcquisitionStream.create(
+        StreamId("synthetic.chain.first"),
+        payload,
+        flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
+        retention_events=retained,
+        retention_bytes=retained * payload.max_retained_nbytes,
+        join_key_contract=key_contract,
+    )
+    intermediate_reservation = intermediate.reserve(
+        total_events=points,
+        max_inflight_events=retained,
+        max_inflight_bytes=retained * payload.max_retained_nbytes,
+        trace_binding=TraceBinding("synthetic-chain-run", "chain-first"),
+    )
+    intermediate_cursor = intermediate_reservation.activate()
+    if gate_second_cursor:
+        original_next = intermediate_cursor.next
+
+        def gated_next(timeout=None):
+            CHAIN_CURSOR_ENTERED.set()
+            if not CHAIN_CURSOR_RELEASE.wait(1.0):
+                raise TimeoutError("test did not release chained cursor")
+            return original_next(timeout)
+
+        intermediate_cursor.next = gated_next
+
+    output, output_producer = AcquisitionStream.create(
+        StreamId("synthetic.chain.second"),
+        payload,
+        flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
+        retention_events=points,
+        retention_bytes=budget,
+        join_key_contract=key_contract,
+    )
+    output_reservation = output.reserve(
+        total_events=points,
+        max_inflight_events=points,
+        max_inflight_bytes=budget,
+        trace_binding=TraceBinding("synthetic-chain-run", "chain-second"),
+    )
+    output_cursor = output_reservation.activate()
+    dataset_edge = edge(data_schema, payload, schedule)
+    builder = DatasetBuilder(
+        BlockId("synthetic-chain-output"),
+        output_reservation,
+        dataset_edge,
+        DatasetMode.FINITE_EXACT,
+    )
+
+    second = ExactStreamProcessorWorker(
+        _processor_binding(
+            name="chain-second",
+            factor=3,
+            payload=payload,
+            key_contract=key_contract,
+            output=output,
+            output_source_id="chain-second",
+            operator=second_operator,
+            operator_deadline_seconds=second_operator_deadline_seconds,
+            artifact_inputs=second_artifact_inputs,
+        ),
+        intermediate_reservation,
+        intermediate_cursor,
+        input_edge=dataset_edge,
+        output_producer=output_producer,
+        output_cursor=output_cursor,
+        output_builder=builder,
+        deadline_monotonic=deadline,
+        cancellation=cancellation,
+    )
+    second.start()
+    downstream_readiness = second.exact_readiness()
+    first = ExactStreamProcessorWorker(
+        _processor_binding(
+            name="chain-first",
+            factor=2,
+            payload=payload,
+            key_contract=key_contract,
+            output=intermediate,
+            output_source_id="chain-first",
+            artifact_inputs=first_artifact_inputs,
+        ),
+        source_reservation,
+        source_cursor,
+        input_edge=dataset_edge,
+        output_producer=intermediate_producer,
+        downstream_readiness=downstream_readiness,
+        deadline_monotonic=deadline,
+    )
+    monitor = output.monitor(max_events=points, max_bytes=budget)
+    intermediate_monitor = intermediate.monitor(
+        max_events=points,
+        max_bytes=budget,
+    )
+    if start_first:
+        first.start()
+    return TwoStageChain(
+        data_schema,
+        schedule,
+        source,
+        producer,
+        source_reservation,
+        first,
+        intermediate,
+        intermediate_monitor,
+        intermediate_reservation,
+        second,
+        output,
+        monitor,
+        builder,
+    )
+
+
+def emit_two_stage(item: TwoStageChain, ordinal: int) -> object:
+    return item.producer.emit(
+        Value(
+            np.array(ordinal + 1, dtype=np.int64),
+            VALID,
+            item.schema.cell_schema,
+        ),
+        captured_at=20.0 + ordinal,
+        trace=TraceContext(
+            "synthetic-chain-run",
+            "chain-source",
+            f"chain-shot-{ordinal}",
+            config_revision=17,
+            control_revision=23,
+        ),
+        join_key=item.schedule[ordinal],
+    )
+
+
 def chain(
     points: int = 3,
     *,
@@ -168,13 +444,13 @@ def chain(
     terminal_wait_seconds: float = 1.0,
     operator_deadline_seconds: float = 1.0,
     share_join_owner: bool = True,
-    expected_keys_override: tuple[DatasetCellAddress, ...] | None = None,
-    source_schedule_digest_override: str | None = None,
+    input_schedule: tuple[DatasetCellAddress, ...] | None = None,
     builder_schedule: tuple[DatasetCellAddress, ...] | None = None,
     tamper_output_cursor_owner: bool = False,
     output_trace_run_id: str = "synthetic-run",
     output_trace_source_id: str = "synthetic-processor",
     absolute_deadline_seconds: float = 2.0,
+    artifact_inputs: tuple[ArtifactInputRef, ...] = (),
 ) -> Chain:
     data_schema = schema(points)
     result_schema = (
@@ -224,13 +500,21 @@ def chain(
         trace_binding=TraceBinding(output_trace_run_id, output_trace_source_id),
     )
     output_cursor = output_reservation.activate()
+    input_edge = edge(
+        data_schema,
+        payload,
+        schedule if input_schedule is None else input_schedule,
+    )
+    output_edge = edge(
+        result_schema,
+        output_payload,
+        schedule if builder_schedule is None else builder_schedule,
+    )
     builder = DatasetBuilder(
         BlockId("synthetic-output"),
         output_reservation,
-        result_schema,
+        output_edge,
         DatasetMode.FINITE_EXACT,
-        event_adapter=ValueDatasetEventAdapter(output_payload),
-        expected_cells=schedule if builder_schedule is None else builder_schedule,
     )
     definition = StreamProcessorDefinition(
         DefinitionKey("test", "scale", 1),
@@ -252,29 +536,15 @@ def chain(
         output.stream_id,
         "synthetic-processor",
         operator,
+        artifact_inputs,
     )
-    source_adapter = ValueDatasetEventAdapter(payload)
-    source_contract = dataset_consumer_contract_digest(
-        data_schema,
-        schedule,
-        source_adapter.metadata_contract.fingerprint,
-        source_adapter.operator_fingerprint,
-    )
-    source_schedule = dataset_cell_permutation_digest(data_schema, schedule)
     if tamper_output_cursor_owner:
         output_reservation._cursor = object()
     worker = ExactStreamProcessorWorker(
         bound,
         reservation,
         cursor,
-        source_schema=data_schema,
-        source_contract_digest=source_contract,
-        source_schedule_digest=(
-            source_schedule
-            if source_schedule_digest_override is None
-            else source_schedule_digest_override
-        ),
-        expected_keys=(schedule if expected_keys_override is None else expected_keys_override),
+        input_edge=input_edge,
         output_producer=output_producer,
         output_cursor=output_cursor,
         output_builder=builder,
@@ -317,23 +587,15 @@ def test_exact_chain_preserves_keys_provenance_and_all_cells_before_input_ack():
     item = chain()
     item.worker.start()
     readiness = item.worker.exact_readiness()
-    source_adapter = ValueDatasetEventAdapter(item.source._payload_contract)
-    source_contract = dataset_consumer_contract_digest(
-        item.schema,
-        item.schedule,
-        source_adapter.metadata_contract.fingerprint,
-        source_adapter.operator_fingerprint,
-    )
+    source_edge = edge(item.schema, item.source._payload_contract, item.schedule)
     readiness.validate_source(
         reservation=item.reservation,
         trace_binding=item.reservation.trace_binding,
         payload_contract_fingerprint=item.source.payload_contract_fingerprint,
         join_key_contract_fingerprint=dataset_cell_key_fingerprint(item.schema),
-        source_contract_digest=source_contract,
-        source_schedule_digest=dataset_cell_permutation_digest(
-            item.schema,
-            item.schedule,
-        ),
+        source_contract_digest=source_edge.consumer_contract_digest,
+        source_schedule_digest=source_edge.schedule_digest,
+        source_key_sequence_digest=source_edge.key_sequence_digest,
         total_events=len(item.schedule),
     )
     inputs = [emit(item, ordinal) for ordinal in range(3)]
@@ -366,6 +628,14 @@ def test_processor_changes_value_schema_without_changing_cell_key_domain():
     assert item.schema.fingerprint != item.output_schema.fingerprint
     assert dataset_cell_key_fingerprint(item.schema) == dataset_cell_key_fingerprint(
         item.output_schema
+    )
+    assert (
+        item.worker._input_edge.exact_key_sequence_digest
+        == item.builder.edge.exact_key_sequence_digest
+    )
+    assert (
+        item.worker._input_edge.consumer_contract_digest
+        != item.builder.edge.consumer_contract_digest
     )
     item.worker.start()
     emit(item, 0)
@@ -413,8 +683,16 @@ def test_early_eos_fails_chain_without_sealing_partial_dataset():
     item = chain(points=2)
     item.worker.start()
     emit(item, 0)
+    deadline = time.monotonic() + 1.0
+    while item.reservation.acknowledged_sequence < 1 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert item.reservation.acknowledged_sequence == 1
+    with pytest.raises(StreamEndedEarly, match="frozen interval"):
+        item.producer.finish()
+    item.producer.fail(SourceFailed("synthetic source stopped before formal end"))
+    item.worker.wait(2.0)
     with pytest.raises(StreamProcessorError):
-        item.worker.finish(item.producer.finish(), 2.0)
+        item.worker.raise_if_failed()
     assert item.reservation.acknowledged_sequence == 1
     assert item.reservation.state is ReservationState.RELEASED
 
@@ -515,11 +793,9 @@ def test_missing_terminal_and_late_operator_fail_with_declared_deadlines():
 def test_pass_through_preflight_cross_binds_owners_schedules_and_cursor():
     with pytest.raises(ValueError, match="output join-key contract owner"):
         chain(points=1, share_join_owner=False)
-    with pytest.raises(ValueError, match="source_schedule_digest"):
-        chain(points=2, source_schedule_digest_override="f" * 64)
-    with pytest.raises(ValueError, match="source_schedule_digest"):
+    with pytest.raises(ValueError, match="output builder schedule"):
         item_schema = schema(2)
-        chain(points=2, expected_keys_override=tuple(reversed(cells(item_schema))))
+        chain(points=2, input_schedule=tuple(reversed(cells(item_schema))))
     with pytest.raises(ValueError, match="output builder schedule"):
         item_schema = schema(2)
         chain(points=2, builder_schedule=tuple(reversed(cells(item_schema))))
@@ -603,6 +879,14 @@ def test_config_mapping_keys_must_be_canonical_strings():
     first.worker.close(2.0)
     second.worker.close(2.0)
 
+    caller_owned = {"a": 1}
+    detached = chain(points=1, config=MappingProxyType(caller_owned))
+    frozen_fingerprint = detached.worker._bound.fingerprint
+    caller_owned["a"] = 999
+    assert detached.worker._bound.config["a"] == 1
+    assert detached.worker._bound.fingerprint == frozen_fingerprint
+    detached.worker.close(2.0)
+
     cross_type_pairs = (
         (b"\x01", MappingProxyType({"bytes_hex": "01"})),
         (np.dtype("<i8"), "<i8"),
@@ -622,6 +906,203 @@ def test_config_mapping_keys_must_be_canonical_strings():
         assert left.worker._bound.fingerprint != right.worker._bound.fingerprint
         left.worker.close(2.0)
         right.worker.close(2.0)
+
+
+def test_bound_processor_owner_copies_declarative_inputs():
+    data_schema = schema(1)
+    payload = ValuePayloadContract(data_schema.cell_schema)
+    key_contract = DatasetCellKeyContract(data_schema)
+    definition_key = DefinitionKey("test", "owned-binding", 1)
+    definition = StreamProcessorDefinition(
+        definition_key,
+        "Owned binding",
+        "test.owned-binding-config.v1",
+        payload.fingerprint,
+        payload.fingerprint,
+        key_contract.fingerprint,
+        operator_deadline_seconds=1.0,
+        terminal_wait_seconds=1.0,
+    )
+    caller_config = ScaleConfig(2)
+    caller_reference = artifact_ref("a")
+    caller_stream_id = StreamId("synthetic.owned-binding")
+    bound = BoundStreamProcessor(
+        definition,
+        caller_config,
+        payload,
+        payload,
+        key_contract,
+        caller_stream_id,
+        "synthetic-owned-binding",
+        scale_value,
+        (caller_reference,),
+    )
+    frozen_fingerprint = bound.fingerprint
+
+    assert bound.definition is not definition
+    assert bound.definition.key is not definition_key
+    assert bound.config is not caller_config
+    assert bound.artifact_inputs[0] is not caller_reference
+    assert bound.output_stream_id is not caller_stream_id
+
+    object.__setattr__(definition_key, "stable_definition_id", "rewritten")
+    object.__setattr__(definition, "operator_deadline_seconds", 1e-12)
+    object.__setattr__(caller_config, "factor", 99)
+    object.__setattr__(caller_reference, "content_digest", "b" * 64)
+    object.__setattr__(caller_stream_id, "value", "rewritten-output")
+
+    assert bound.definition.key.stable_definition_id == "owned-binding"
+    assert bound.definition.operator_deadline_seconds == 1.0
+    assert bound.config == ScaleConfig(2)
+    assert bound.artifact_inputs[0].content_digest == "a" * 64
+    assert bound.output_stream_id.value == "synthetic.owned-binding"
+    assert bound.fingerprint == frozen_fingerprint
+
+
+def test_processor_stage_owner_copies_direct_artifact_references():
+    caller_reference = artifact_ref("c")
+    stage = ProcessorStageProvenance("d" * 64, (caller_reference,))
+    assert stage.direct_artifact_inputs[0] is not caller_reference
+    object.__setattr__(caller_reference, "content_digest", "e" * 64)
+    assert stage.direct_artifact_inputs[0].content_digest == "c" * 64
+
+
+def test_artifact_input_ref_snapshots_only_canonical_owner_bytes():
+    schema_id = "tests.owner-ref.v1"
+    payload = encode({"schema": schema_id, "id": "calibration-1"})
+    reference = ArtifactInputRef(schema_id, payload, "c" * 64)
+    assert reference.canonical_reference is payload
+    assert len(reference.reference_digest) == 64
+
+    with pytest.raises(TypeError, match="immutable bytes"):
+        ArtifactInputRef(schema_id, bytearray(payload), "c" * 64)
+    with pytest.raises(ValueError, match="schema"):
+        ArtifactInputRef("tests.other-ref.v1", payload, "c" * 64)
+    with pytest.raises(ValueError, match="canonical owner data"):
+        ArtifactInputRef(schema_id, payload + b"\x00", "c" * 64)
+    oversized = encode({"schema": schema_id, "blob": "x" * (64 * 1024)})
+    with pytest.raises(ValueError, match="at most 64 KiB"):
+        ArtifactInputRef(schema_id, oversized, "c" * 64)
+    with pytest.raises(ValueError, match="must not repeat"):
+        chain(points=1, artifact_inputs=(reference, reference))
+
+    many = tuple(
+        ArtifactInputRef(
+            schema_id,
+            encode({"schema": schema_id, "id": index}),
+            f"{index:064x}",
+        )
+        for index in range(33)
+    )
+    with pytest.raises(ValueError, match="too many direct artifact inputs"):
+        ProcessorStageProvenance("d" * 64, many)
+
+    large = tuple(
+        ArtifactInputRef(
+            schema_id,
+            encode(
+                {
+                    "schema": schema_id,
+                    "id": index,
+                    "blob": "x" * (60 * 1024),
+                }
+            ),
+            f"{index + 100:064x}",
+        )
+        for index in range(18)
+    )
+    with pytest.raises(ValueError, match="byte budget"):
+        ProcessorStageProvenance("d" * 64, large)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        np.dtype(object),
+        np.dtype([("field", "<i4")]),
+        np.dtype(("<i4", (2,))),
+        np.dtype("V4"),
+        np.dtype(">i4"),
+    ],
+)
+def test_config_rejects_non_scalar_or_noncanonical_dtypes(dtype):
+    with pytest.raises(TypeError, match="recursively frozen binding data"):
+        chain(points=1, config=dtype)
+
+
+def test_config_text_and_bytes_have_per_item_and_total_byte_budgets(monkeypatch):
+    monkeypatch.setattr(stream_contract, "_PROCESSOR_BINDING_MAX_SINGLE_TEXT_BYTES", 8)
+    monkeypatch.setattr(stream_contract, "_PROCESSOR_BINDING_MAX_TOTAL_TEXT_BYTES", 12)
+    with pytest.raises(TypeError, match="recursively frozen binding data"):
+        chain(points=1, config="123456789")
+    with pytest.raises(TypeError, match="recursively frozen binding data"):
+        chain(points=1, config=(b"12345678", b"abcde"))
+
+
+def test_config_budget_memoizes_shared_frozen_objects_but_rejects_cycles(monkeypatch):
+    monkeypatch.setattr(stream_contract, "_PROCESSOR_BINDING_MAX_NODES", 8)
+    shared = (1, 2, 3, 4, 5)
+    accepted = chain(points=1, config=(shared, shared, shared))
+    accepted.worker.close(2.0)
+
+    backing = {}
+    recursive = MappingProxyType(backing)
+    backing["self"] = recursive
+    with pytest.raises(TypeError, match="recursively frozen binding data"):
+        chain(points=1, config=recursive)
+
+
+def test_config_alias_expansion_and_integer_encoding_fail_before_digest_dos():
+    shared: object = (0,)
+    for _ in range(20):
+        shared = (shared, shared)
+    started = time.perf_counter()
+    with pytest.raises(TypeError, match="recursively frozen binding data"):
+        chain(points=1, config=shared)
+    assert time.perf_counter() - started < 1.0
+
+    with pytest.raises(TypeError, match="recursively frozen binding data"):
+        chain(points=1, config=1 << 5000)
+
+
+def test_worker_revalidates_formal_trace_before_operator_or_ack():
+    item = chain(points=1)
+    published = emit(item, 0)
+    object.__setattr__(
+        published,
+        "trace",
+        TraceContext("synthetic-run", "wrong-source", "capture"),
+    )
+    item.worker.start()
+    item.producer.finish()
+    item.worker.wait(2.0)
+    with pytest.raises(StreamProcessorError) as caught:
+        item.worker.raise_if_failed()
+    assert isinstance(caught.value.__cause__, StreamError)
+    assert item.output.next_sequence == 0
+    assert item.reservation.acknowledged_sequence == 0
+    assert item.reservation.state is ReservationState.RELEASED
+    assert not item.worker.is_alive
+
+
+def test_thread_start_failure_synchronously_releases_the_exact_graph(monkeypatch):
+    item = chain(points=1)
+    failure = RuntimeError("synthetic thread start failure")
+
+    def fail_start(_thread):
+        raise failure
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(RuntimeError) as caught:
+        item.worker.start()
+    assert caught.value is failure
+    assert item.worker.error is failure
+    assert item.reservation.state is ReservationState.RELEASED
+    assert not item.source._reservations
+    assert not item.output._reservations
+    assert item.source._formal_rebind_required
+    assert not item.worker.is_alive
+    item.worker.close(0.05)
 
 
 def test_readiness_is_stable_but_single_bind_and_stale_proofs_are_rejected():
@@ -739,9 +1220,375 @@ def test_finish_rejects_foreign_eos_even_after_autonomous_success():
     item.worker.wait(2.0)
 
     foreign = chain(points=1)
+    emit(foreign, 0)
     foreign_eos = foreign.producer.finish()
     with pytest.raises(PermissionError, match="another source authority"):
         item.worker.finish(foreign_eos, 2.0)
     artifact = item.worker.finish(owned_eos, 2.0)
     assert int(artifact.block.values[0, 0]) == 10
     foreign.worker.close(2.0)
+
+
+def test_two_live_processor_stages_reach_one_terminal_dataset_with_full_lineage():
+    item = two_stage_chain(points=3, intermediate_retention=1)
+    inputs = tuple(emit_two_stage(item, ordinal) for ordinal in range(3))
+    artifact = item.first.finish(item.producer.finish(), 2.0)
+
+    assert tuple(int(value) for value in artifact.block.values[0, :]) == (6, 12, 18)
+    outputs = tuple(item.monitor.next().envelope for _ in range(3))
+    intermediate = tuple(
+        item.intermediate_monitor.next().envelope for _ in range(3)
+    )
+    assert tuple(output.join_key for output in outputs) == item.schedule
+    assert tuple(output.captured_at for output in outputs) == (20.0, 21.0, 22.0)
+    assert all(output.trace.config_revision == 17 for output in outputs)
+    assert all(output.trace.control_revision == 23 for output in outputs)
+    assert [event.trace.causation_refs[0] for event in intermediate] == [
+        event.ref for event in inputs
+    ]
+    assert [event.trace.causation_refs[0] for event in outputs] == [
+        event.ref for event in intermediate
+    ]
+    assert all(len(event.trace.causation_refs) == 1 for event in outputs)
+    derivation = artifact.provenance.derivation
+    assert derivation is not None
+    assert derivation.root_input_span.stream_id == item.source.stream_id
+    assert derivation.root_input_span.generation == item.source.generation
+    assert derivation.root_input_span.start_sequence == 0
+    assert derivation.root_input_span.end_sequence == len(inputs)
+    assert tuple(stage.processor_binding_digest for stage in derivation.stages) == (
+        item.first._bound.fingerprint,
+        item.second._bound.fingerprint,
+    )
+    assert item.source_reservation.state is ReservationState.RELEASED
+    assert item.intermediate_reservation.state is ReservationState.RELEASED
+    assert not item.first.is_alive
+    assert not item.second.is_alive
+
+
+def test_artifact_causation_is_direct_while_sealed_derivation_is_root_complete():
+    shared = artifact_ref("a")
+    tail_only = artifact_ref("b")
+    item = two_stage_chain(
+        points=2,
+        first_artifact_inputs=(shared,),
+        second_artifact_inputs=(shared, tail_only),
+    )
+    inputs = tuple(emit_two_stage(item, ordinal) for ordinal in range(2))
+    artifact = item.first.finish(item.producer.finish(), 2.0)
+    intermediate = tuple(
+        item.intermediate_monitor.next().envelope for _ in range(2)
+    )
+    outputs = tuple(item.monitor.next().envelope for _ in range(2))
+
+    assert [event.trace.causation_refs for event in intermediate] == [
+        (source.ref, shared) for source in inputs
+    ]
+    assert [event.trace.causation_refs for event in outputs] == [
+        (source.ref, shared, tail_only) for source in intermediate
+    ]
+    derivation = artifact.provenance.derivation
+    assert derivation is not None
+    assert derivation.stages[0].direct_artifact_inputs == (shared,)
+    assert derivation.stages[1].direct_artifact_inputs == (shared, tail_only)
+    assert derivation.artifact_inputs == (shared, tail_only)
+
+
+def test_upstream_ack_waits_for_real_downstream_processing_and_ack():
+    CHAIN_OPERATOR_ENTERED.clear()
+    CHAIN_OPERATOR_RELEASE.clear()
+    item = two_stage_chain(points=1, second_operator=chain_blocking_operator)
+    emit_two_stage(item, 0)
+    assert CHAIN_OPERATOR_ENTERED.wait(1.0)
+    assert item.source_reservation.acknowledged_sequence == 0
+    assert item.intermediate_reservation.acknowledged_sequence == 0
+
+    CHAIN_OPERATOR_RELEASE.set()
+    artifact = item.first.finish(item.producer.finish(), 2.0)
+    assert int(artifact.block.values[0, 0]) == 6
+    assert item.source_reservation.acknowledged_sequence == 1
+
+
+def test_downstream_operator_failure_propagates_without_upstream_ack():
+    item = two_stage_chain(points=2, second_operator=fail_on_two)
+    emit_two_stage(item, 0)
+    item.first.wait(2.0)
+
+    with pytest.raises(StreamProcessorError) as caught:
+        item.first.raise_if_failed()
+    causes = []
+    error = caught.value
+    while error is not None:
+        causes.append(error)
+        error = error.__cause__
+    assert any(isinstance(error, ArithmeticError) for error in causes)
+    assert item.source_reservation.acknowledged_sequence == 0
+    assert item.intermediate_reservation.acknowledged_sequence == 0
+    assert item.source_reservation.state is ReservationState.RELEASED
+    assert item.intermediate_reservation.state is ReservationState.RELEASED
+    assert not item.first.is_alive
+    assert not item.second.is_alive
+
+
+def test_downstream_cancel_propagates_and_does_not_ack_pending_input():
+    CHAIN_OPERATOR_ENTERED.clear()
+    CHAIN_OPERATOR_RELEASE.clear()
+    item = two_stage_chain(points=1, second_operator=chain_blocking_operator)
+    emit_two_stage(item, 0)
+    assert CHAIN_OPERATOR_ENTERED.wait(1.0)
+    item.second.cancel("cancel downstream stage")
+    CHAIN_OPERATOR_RELEASE.set()
+    item.first.wait(2.0)
+
+    with pytest.raises(StreamProcessorError):
+        item.first.raise_if_failed()
+    assert item.source_reservation.acknowledged_sequence == 0
+    assert item.intermediate_reservation.acknowledged_sequence == 0
+    assert not item.first.is_alive
+    assert not item.second.is_alive
+
+
+def test_downstream_operator_deadline_propagates_without_upstream_ack():
+    item = two_stage_chain(
+        points=1,
+        second_operator=slow_value,
+        second_operator_deadline_seconds=0.005,
+    )
+    emit_two_stage(item, 0)
+    item.first.wait(2.0)
+
+    with pytest.raises(StreamProcessorError) as caught:
+        item.first.raise_if_failed()
+    causes = []
+    error = caught.value
+    while error is not None:
+        causes.append(error)
+        error = error.__cause__
+    assert any(isinstance(error, TimeoutError) for error in causes)
+    assert item.source_reservation.acknowledged_sequence == 0
+    assert item.intermediate_reservation.acknowledged_sequence == 0
+    assert not item.first.is_alive
+    assert not item.second.is_alive
+
+
+def test_downstream_gap_propagates_without_acknowledging_upstream_input():
+    CHAIN_CURSOR_ENTERED.clear()
+    CHAIN_CURSOR_RELEASE.clear()
+    item = two_stage_chain(points=1, gate_second_cursor=True)
+    assert CHAIN_CURSOR_ENTERED.wait(1.0)
+    emit_two_stage(item, 0)
+    deadline = time.monotonic() + 1.0
+    while item.intermediate.next_sequence == 0 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert item.intermediate.next_sequence == 1
+    with item.intermediate._condition:
+        item.intermediate._records.clear()
+        item.intermediate._order.clear()
+        item.intermediate._retained_bytes = 0
+    CHAIN_CURSOR_RELEASE.set()
+    item.first.wait(2.0)
+
+    with pytest.raises(StreamProcessorError) as caught:
+        item.first.raise_if_failed()
+    causes = []
+    error = caught.value
+    while error is not None:
+        causes.append(error)
+        error = error.__cause__
+    assert any(isinstance(error, StreamGap) for error in causes)
+    assert item.source_reservation.acknowledged_sequence == 0
+    assert item.intermediate_reservation.acknowledged_sequence == 0
+    assert not item.first.is_alive
+    assert not item.second.is_alive
+
+
+def test_terminal_seal_failure_prevents_every_processor_completion(monkeypatch):
+    item = two_stage_chain(points=1)
+    root_completions: list[object] = []
+    intermediate_completions: list[object] = []
+    original_root_complete = item.source._complete_consumer
+    original_intermediate_complete = item.intermediate._complete_consumer
+
+    def record_root(*args, **kwargs):
+        root_completions.append(args)
+        return original_root_complete(*args, **kwargs)
+
+    def record_intermediate(*args, **kwargs):
+        intermediate_completions.append(args)
+        return original_intermediate_complete(*args, **kwargs)
+
+    def fail_seal():
+        raise RuntimeError("synthetic terminal seal failure")
+
+    monkeypatch.setattr(item.source, "_complete_consumer", record_root)
+    monkeypatch.setattr(item.intermediate, "_complete_consumer", record_intermediate)
+    monkeypatch.setattr(item.builder, "_seal_locked", fail_seal)
+    emit_two_stage(item, 0)
+    with pytest.raises(StreamProcessorError):
+        item.first.finish(item.producer.finish(), 2.0)
+
+    assert root_completions == []
+    assert intermediate_completions == []
+    assert item.source_reservation.state is ReservationState.RELEASED
+    assert item.intermediate_reservation.state is ReservationState.RELEASED
+    assert not item.first.is_alive
+    assert not item.second.is_alive
+
+
+def test_stale_downstream_readiness_cannot_bind_an_upstream_worker():
+    data_schema = schema(1)
+    schedule = cells(data_schema)
+    payload = ValuePayloadContract(data_schema.cell_schema)
+    key_contract = DatasetCellKeyContract(data_schema)
+    budget = payload.max_retained_nbytes
+    deadline = time.monotonic() + 2.0
+    intermediate, intermediate_producer = AcquisitionStream.create(
+        StreamId("synthetic.stale.intermediate"),
+        payload,
+        flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
+        retention_events=1,
+        retention_bytes=budget,
+        join_key_contract=key_contract,
+    )
+    intermediate_reservation = intermediate.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=budget,
+        trace_binding=TraceBinding("synthetic-chain-run", "chain-first"),
+    )
+    intermediate_cursor = intermediate_reservation.activate()
+    output, output_producer = AcquisitionStream.create(
+        StreamId("synthetic.stale.output"),
+        payload,
+        flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
+        retention_events=1,
+        retention_bytes=budget,
+        join_key_contract=key_contract,
+    )
+    output_reservation = output.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=budget,
+        trace_binding=TraceBinding("synthetic-chain-run", "chain-second"),
+    )
+    output_cursor = output_reservation.activate()
+    dataset_edge = edge(data_schema, payload, schedule)
+    builder = DatasetBuilder(
+        BlockId("synthetic-stale-output"),
+        output_reservation,
+        dataset_edge,
+        DatasetMode.FINITE_EXACT,
+    )
+    second = ExactStreamProcessorWorker(
+        _processor_binding(
+            name="stale-second",
+            factor=3,
+            payload=payload,
+            key_contract=key_contract,
+            output=output,
+            output_source_id="chain-second",
+        ),
+        intermediate_reservation,
+        intermediate_cursor,
+        input_edge=dataset_edge,
+        output_producer=output_producer,
+        output_cursor=output_cursor,
+        output_builder=builder,
+        deadline_monotonic=deadline,
+    )
+    second.start()
+    stale = second.exact_readiness()
+    second.cancel("make readiness stale")
+    second.wait(2.0)
+
+    raw, _raw_producer = AcquisitionStream.create(
+        StreamId("synthetic.stale.raw"),
+        payload,
+        flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
+        retention_events=1,
+        retention_bytes=budget,
+        join_key_contract=key_contract,
+    )
+    raw_reservation = raw.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=budget,
+        trace_binding=TraceBinding("synthetic-chain-run", "chain-source"),
+    )
+    raw_cursor = raw_reservation.activate()
+    with pytest.raises(Exception, match="not registered|not ACTIVE|no longer live"):
+        ExactStreamProcessorWorker(
+            _processor_binding(
+                name="stale-first",
+                factor=2,
+                payload=payload,
+                key_contract=key_contract,
+                output=intermediate,
+                output_source_id="chain-first",
+            ),
+            raw_reservation,
+            raw_cursor,
+            input_edge=dataset_edge,
+            output_producer=intermediate_producer,
+            downstream_readiness=stale,
+            deadline_monotonic=deadline,
+        )
+    raw_reservation.abort(cancelled=True)
+    raw_reservation.release()
+
+
+def test_prestart_close_of_root_tears_down_started_tail_without_leaks():
+    item = two_stage_chain(points=1, start_first=False)
+    item.first.close(2.0)
+
+    assert item.source_reservation.state is ReservationState.RELEASED
+    assert item.intermediate_reservation.state is ReservationState.RELEASED
+    assert item.first.error is not None
+    assert item.second.error is not None
+    assert not item.first.is_alive
+    assert not item.second.is_alive
+    item.first.close(2.0)
+
+
+def test_zero_event_multistage_preflight_can_rebuild_root_and_complete():
+    abandoned = two_stage_chain(points=2, start_first=False)
+    source_pair = (abandoned.source, abandoned.producer)
+    abandoned.first.close(2.0)
+
+    assert abandoned.source.next_sequence == 0
+    assert not abandoned.source._reservations
+    assert not abandoned.source._formal_consumer_claimed
+    assert abandoned.intermediate._closed
+    assert abandoned.output._closed
+    assert not abandoned.intermediate._reservations
+    assert not abandoned.output._reservations
+    with pytest.raises(Exception, match="not live|not registered|no longer live"):
+        abandoned.second.exact_readiness()
+    abandoned.monitor.close()
+    abandoned.intermediate_monitor.close()
+
+    rebuilt = two_stage_chain(points=2, source_pair=source_pair)
+    emit_two_stage(rebuilt, 0)
+    emit_two_stage(rebuilt, 1)
+    artifact = rebuilt.first.finish(rebuilt.producer.finish(), 2.0)
+    assert tuple(int(value) for value in artifact.block.values[0, :]) == (6, 12)
+    assert rebuilt.source_reservation.state is ReservationState.RELEASED
+    assert rebuilt.intermediate_reservation.state is ReservationState.RELEASED
+    assert not rebuilt.first.is_alive
+    assert not rebuilt.second.is_alive
+    rebuilt.monitor.close()
+    rebuilt.intermediate_monitor.close()
+
+
+def test_downstream_readiness_is_rechecked_at_upstream_start():
+    item = two_stage_chain(points=1, start_first=False)
+    item.second.cancel("tail failed between bind and upstream start")
+    item.second.wait(2.0)
+
+    with pytest.raises(Exception, match="not registered|not live"):
+        item.first.start()
+    item.first.close(2.0)
+    assert item.source_reservation.state is ReservationState.RELEASED
+    assert item.intermediate_reservation.state is ReservationState.RELEASED
+    assert not item.first.is_alive
+    assert not item.second.is_alive

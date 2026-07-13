@@ -71,6 +71,20 @@ def encode_calibration_artifact_ref(value: CalibrationArtifactRef) -> bytes:
     return encode(calibration_artifact_ref_to_tree(value))
 
 
+def calibration_artifact_input_ref(value: CalibrationArtifactRef):
+    """Mint the runtime dependency edge through this reference owner's codec."""
+
+    from zlc_neutral_atom.runtime.streams import ArtifactInputRef
+
+    if not isinstance(value, CalibrationArtifactRef):
+        raise TypeError("value must be CalibrationArtifactRef")
+    return ArtifactInputRef(
+        CALIBRATION_ARTIFACT_REF_SCHEMA,
+        encode_calibration_artifact_ref(value),
+        value.manifest_digest,
+    )
+
+
 def decode_calibration_artifact_ref(
     payload: bytes | bytearray | memoryview,
 ) -> CalibrationArtifactRef:
@@ -87,6 +101,7 @@ __all__ = [
     "CALIBRATION_ARTIFACT_REF_SCHEMA",
     "CalibrationArtifactRef",
     "calibration_artifact_ref_from_tree",
+    "calibration_artifact_input_ref",
     "calibration_artifact_ref_to_tree",
     "decode_calibration_artifact_ref",
     "encode_calibration_artifact_ref",

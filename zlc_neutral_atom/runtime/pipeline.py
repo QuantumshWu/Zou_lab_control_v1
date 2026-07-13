@@ -282,6 +282,27 @@ class PipelineResult:
         provenance = dataset.provenance
         if provenance.trace_binding.run_id != capture_completion.trace_binding.run_id:
             raise RuntimeError("pipeline dataset and capture completion run_id differ")
+        derivation = provenance.derivation
+        if capture_completion.direct_terminal_consumer:
+            if derivation is not None or capture_completion.processor_stages:
+                raise RuntimeError(
+                    "direct capture cannot carry processor derivation provenance"
+                )
+        else:
+            if derivation is None:
+                raise RuntimeError(
+                    "processed capture is missing root derivation provenance"
+                )
+            if (
+                derivation.chain_contract_digest
+                != capture_completion.chain_contract_digest
+                or derivation.stages != capture_completion.processor_stages
+                or derivation.root_input_span
+                != capture_completion.source_event_span
+            ):
+                raise RuntimeError(
+                    "processed dataset derivation differs from capture readiness chain"
+                )
         count = provenance.end_sequence - provenance.start_sequence
         if not dataset.coverage.complete or dataset.coverage.total_cells != count:
             raise RuntimeError("pipeline dataset coverage differs from event interval")
@@ -419,7 +440,7 @@ def estimate_pipeline_peak_bytes(spec: MinimalPipelineSpec) -> int:
     events = contract.total_events
     dataset_bytes = _dataset_storage_bytes(contract.dataset_schema)
     metadata_bytes = (
-        events * contract.event_adapter.metadata_contract.max_retained_nbytes
+        events * contract.dataset_edge.metadata_max_retained_nbytes
     )
     memory = spec.materializer.memory
     return (
@@ -498,7 +519,7 @@ class ExactCaptureTransaction:
         provenance = dataset.provenance
         if (
             provenance.metadata_contract_fingerprint
-            != self.contract.event_adapter.metadata_contract.fingerprint
+            != self.contract.dataset_edge.metadata_contract_fingerprint
         ):
             raise RuntimeError("sealed dataset metadata contract differs from capture")
         if (
@@ -577,10 +598,8 @@ def open_exact_capture(
         builder = DatasetBuilder(
             spec.materializer.block_id,
             reservation,
-            contract.dataset_schema,
+            contract.dataset_edge,
             DatasetMode.FINITE_EXACT,
-            event_adapter=contract.event_adapter,
-            expected_cells=contract.expected_cells,
         )
         session.bind_exact_consumer(builder.exact_readiness())
         return ExactCaptureTransaction(

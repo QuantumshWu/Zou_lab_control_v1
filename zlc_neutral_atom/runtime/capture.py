@@ -6,7 +6,7 @@ import hashlib
 import math
 import threading
 import uuid
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from numbers import Integral
 from typing import Protocol, TypeVar
@@ -18,9 +18,9 @@ from zlc_data import (
     AxisId,
     CoordinateFrameId,
     DatasetSchema,
+    StreamGenerationId,
     ValuePayloadContract,
 )
-from zlc_neutral_atom.catalog import is_declarative_value
 from zlc_neutral_atom.readout.contracts import (
     CameraCaptureDescriptor,
     CameraEventReadoutSetting,
@@ -31,9 +31,8 @@ from .dataset import (
     DatasetCellAddress,
     DatasetCellKeyContract,
     DatasetEventAdapter,
+    FrozenDatasetEdge,
     dataset_cell_key_fingerprint,
-    dataset_cell_permutation_digest,
-    dataset_consumer_contract_digest,
 )
 from .ports import (
     BoundDevice,
@@ -47,8 +46,11 @@ from .streams import (
     AcquisitionProducer,
     AcquisitionStream,
     EndOfStream,
+    EventSpanRef,
     ExactConsumerReadiness,
     ExactReservation,
+    OrderedEventSpanHasher,
+    ProcessorStageProvenance,
     ProducerFlowControl,
     ReservationState,
     SourceFailed,
@@ -699,6 +701,7 @@ class CaptureStreamContract:
     runtime_profile: CaptureRuntimeProfile
     capture_spec_owner_fingerprint: str
     camera_provenance: CameraCaptureProvenance | None = None
+    dataset_edge: FrozenDatasetEdge = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.stream_id, StreamId):
@@ -710,30 +713,28 @@ class CaptureStreamContract:
             raise TypeError("capability must be CaptureCapabilitySnapshot")
         if not isinstance(self.runtime_profile, CaptureRuntimeProfile):
             raise TypeError("runtime_profile must be CaptureRuntimeProfile")
-        for member in (
-            "payload_contract",
-            "value_schema",
-            "metadata_contract",
-            "operator_fingerprint",
-            "value",
-        ):
-            if not hasattr(self.event_adapter, member):
-                raise TypeError(f"event_adapter.{member} is required")
-        _sha256(self.payload_contract.fingerprint, "payload contract fingerprint")
+        cells = tuple(self.expected_cells)
+        domain = {
+            DatasetCellAddress(repeat, point)
+            for repeat in range(self.dataset_schema.repeat_axis.size)
+            for point in range(self.dataset_schema.point_layout.storage_size)
+        }
+        if len(cells) != len(domain) or set(cells) != domain:
+            raise ValueError("expected_cells must be a complete unique dataset permutation")
+        edge = FrozenDatasetEdge(self.dataset_schema, self.event_adapter, cells)
+        object.__setattr__(self, "expected_cells", edge.expected_cells)
+        object.__setattr__(self, "dataset_edge", edge)
+        object.__setattr__(self, "event_adapter", edge.event_adapter)
+        if edge.source_payload_contract is not self.payload_contract:
+            raise ValueError("DatasetEventAdapter must share CapturePayloadContract owner")
+        object.__setattr__(self, "payload_contract", edge.payload_contract)
+        if edge.value_schema is not self.dataset_schema.cell_schema:
+            raise ValueError("DatasetEventAdapter schema differs from DatasetSchema")
+        _sha256(edge.payload_contract_fingerprint, "payload contract fingerprint")
         _sha256(
             self.capture_spec_owner_fingerprint,
             "capture spec owner fingerprint",
         )
-        for name, owner in (
-            ("payload_contract", self.payload_contract),
-            ("event_adapter", self.event_adapter),
-            ("metadata_contract", self.event_adapter.metadata_contract),
-        ):
-            parameters = getattr(type(owner), "__dataclass_params__", None)
-            if not is_dataclass(owner) or not parameters or not parameters.frozen:
-                raise TypeError(f"{name} must be a frozen dataclass value")
-            if not is_declarative_value(owner):
-                raise TypeError(f"{name} fields must be recursively declarative data")
         for member in (
             "snapshot",
             "validate",
@@ -745,42 +746,26 @@ class CaptureStreamContract:
             if not callable(getattr(self.payload_contract, member, None)):
                 raise TypeError(f"payload_contract.{member} must be callable")
         _positive_int(
-            self.payload_contract.max_retained_nbytes,
+            edge.payload_max_retained_nbytes,
             "payload contract max_retained_nbytes",
         )
-        metadata_contract = self.event_adapter.metadata_contract
-        _sha256(metadata_contract.fingerprint, "metadata contract fingerprint")
-        _sha256(
-            self.event_adapter.operator_fingerprint,
-            "event adapter operator fingerprint",
-        )
+        metadata_contract = edge.metadata_contract
+        _sha256(edge.metadata_contract_fingerprint, "metadata contract fingerprint")
+        _sha256(edge.operator_fingerprint, "event adapter operator fingerprint")
         _nonnegative_int(
-            metadata_contract.max_retained_nbytes,
+            edge.metadata_max_retained_nbytes,
             "metadata contract max_retained_nbytes",
         )
         for member in ("snapshot", "validate", "retained_nbytes", "digest"):
             if not callable(getattr(metadata_contract, member, None)):
                 raise TypeError(f"metadata_contract.{member} must be callable")
-        value_bytes = ValuePayloadContract(
-            self.dataset_schema.cell_schema
-        ).max_retained_nbytes
-        if value_bytes + metadata_contract.max_retained_nbytes > (
-            self.payload_contract.max_retained_nbytes
-        ):
-            raise ValueError(
-                "payload retained-byte bound must cover value plus metadata"
-            )
-        if self.capability.payload_contract_fingerprint != self.payload_contract.fingerprint:
+        if self.capability.payload_contract_fingerprint != edge.payload_contract_fingerprint:
             raise ValueError("capture capability and payload contract fingerprints differ")
         if (
             self.capability.capture_spec_owner_fingerprint
             != self.capture_spec_owner_fingerprint
         ):
             raise ValueError("capture capability and spec owner fingerprints differ")
-        if self.event_adapter.payload_contract is not self.payload_contract:
-            raise ValueError("DatasetEventAdapter must share CapturePayloadContract owner")
-        if self.event_adapter.value_schema is not self.dataset_schema.cell_schema:
-            raise ValueError("DatasetEventAdapter schema differs from DatasetSchema")
         if self.camera_provenance is not None:
             # A raw camera CaptureArtifact is defined by the acquisition owner,
             # not by schema equality.  A caller-defined adapter may preserve the
@@ -792,8 +777,7 @@ class CaptureStreamContract:
             )
 
             if type(self.event_adapter) is not CameraDatasetEventAdapter or (
-                self.event_adapter.operator_fingerprint
-                != CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT
+                edge.operator_fingerprint != CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT
             ):
                 raise ValueError(
                     "raw camera provenance requires the owner identity event adapter"
@@ -849,15 +833,6 @@ class CaptureStreamContract:
                 raise ValueError(
                     "camera capability evidence source differs from capture source_id"
                 )
-        cells = tuple(self.expected_cells)
-        domain = {
-            DatasetCellAddress(repeat, point)
-            for repeat in range(self.dataset_schema.repeat_axis.size)
-            for point in range(self.dataset_schema.point_layout.storage_size)
-        }
-        if len(cells) != len(domain) or set(cells) != domain:
-            raise ValueError("expected_cells must be a complete unique dataset permutation")
-        object.__setattr__(self, "expected_cells", cells)
         if self.estimated_transport_bytes > self.runtime_profile.transport_memory_limit_bytes:
             raise MemoryError(
                 f"capture transport budget {self.estimated_transport_bytes} exceeds "
@@ -878,7 +853,7 @@ class CaptureStreamContract:
 
     @property
     def max_inflight_bytes(self) -> int:
-        return self.max_inflight_events * int(self.payload_contract.max_retained_nbytes)
+        return self.max_inflight_events * self.dataset_edge.payload_max_retained_nbytes
 
     @property
     def estimated_transport_bytes(self) -> int:
@@ -886,8 +861,8 @@ class CaptureStreamContract:
             self.capability.driver_ring_bytes
             + self.capability.adapter_record_retention_bytes
             + self.max_inflight_bytes
-            + self.payload_contract.max_retained_nbytes
-            + self.event_adapter.metadata_contract.max_retained_nbytes
+            + self.dataset_edge.payload_max_retained_nbytes
+            + self.dataset_edge.metadata_max_retained_nbytes
             + self.capability.max_capture_spec_bytes
         )
 
@@ -1080,6 +1055,8 @@ class CaptureCompletion:
         "_camera_arm_spec",
         "_source_event_adapter_operator_fingerprint",
         "_chain_contract_digest",
+        "_source_event_span",
+        "_processor_stages",
         "_terminal_reservation",
         "_direct_terminal_consumer",
     )
@@ -1124,13 +1101,33 @@ class CaptureCompletion:
         object.__setattr__(
             self,
             "_source_event_adapter_operator_fingerprint",
-            session._contract.event_adapter.operator_fingerprint,
+            session._contract.dataset_edge.operator_fingerprint,
         )
         object.__setattr__(
             self,
             "_chain_contract_digest",
             readiness.chain_contract_digest,
         )
+        source_reservation = readiness._source_reservation
+        if source_reservation._stream is not session._stream:
+            raise RuntimeError(
+                "capture completion readiness belongs to another source stream"
+            )
+        source_event_span_hasher = session._source_event_span_hasher
+        if source_event_span_hasher is None:
+            raise RuntimeError("capture completion has no source event span owner")
+        source_event_span = source_event_span_hasher.seal(
+            source_reservation.end_sequence
+        )
+        if (
+            source_event_span.stream_id != session._stream.stream_id
+            or source_event_span.generation != session._stream.generation
+            or source_event_span.start_sequence != source_reservation.start_sequence
+            or source_event_span.end_sequence != source_reservation.end_sequence
+        ):
+            raise RuntimeError("capture source event span differs from its reservation")
+        object.__setattr__(self, "_source_event_span", source_event_span)
+        object.__setattr__(self, "_processor_stages", readiness.processor_stages)
         # Process-local identity capability.  PipelineResult uses it to prove
         # that its SealedDatasetArtifact came from this readiness chain's live
         # terminal DatasetBuilder, including through processor chains.
@@ -1139,11 +1136,14 @@ class CaptureCompletion:
             "_terminal_reservation",
             readiness._terminal_reservation,
         )
-        object.__setattr__(
-            self,
-            "_direct_terminal_consumer",
-            readiness._source_reservation is readiness._terminal_reservation,
+        direct_terminal = (
+            readiness._source_reservation is readiness._terminal_reservation
         )
+        if direct_terminal != (not readiness.processor_stages):
+            raise RuntimeError(
+                "capture readiness terminal identity differs from its stage chain"
+            )
+        object.__setattr__(self, "_direct_terminal_consumer", direct_terminal)
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("CaptureCompletion is immutable")
@@ -1193,6 +1193,30 @@ class CaptureCompletion:
     @property
     def direct_terminal_consumer(self) -> bool:
         return self._direct_terminal_consumer
+
+    @property
+    def source_stream_id(self) -> StreamId:
+        return self._source_event_span.stream_id
+
+    @property
+    def source_generation(self) -> StreamGenerationId:
+        return self._source_event_span.generation
+
+    @property
+    def source_start_sequence(self) -> int:
+        return self._source_event_span.start_sequence
+
+    @property
+    def source_end_sequence(self) -> int:
+        return self._source_event_span.end_sequence
+
+    @property
+    def source_event_span(self) -> EventSpanRef:
+        return self._source_event_span
+
+    @property
+    def processor_stages(self) -> tuple[ProcessorStageProvenance, ...]:
+        return self._processor_stages
 
 
 @dataclass(frozen=True)
@@ -1372,10 +1396,11 @@ class CaptureSession:
         self._delivered = 0
         self._metadata_hasher = hashlib.sha256()
         self._metadata_hasher.update(
-            contract.event_adapter.metadata_contract.fingerprint.encode("ascii")
+            contract.dataset_edge.metadata_contract_fingerprint.encode("ascii")
         )
         self._completion: CaptureCompletion | None = None
         self._reservation: ExactReservation | None = None
+        self._source_event_span_hasher: OrderedEventSpanHasher | None = None
         self._exact_consumer_readiness: ExactConsumerReadiness | None = None
         self._lock = threading.RLock()
         self._operation_lock = threading.Lock()
@@ -1411,8 +1436,14 @@ class CaptureSession:
                 max_inflight_bytes=self._contract.max_inflight_bytes,
                 trace_binding=self._trace_binding,
             )
+            source_event_span_hasher = OrderedEventSpanHasher(
+                self._stream.stream_id,
+                self._stream.generation,
+                reservation.start_sequence,
+            )
             with self._lock:
                 self._reservation = reservation
+                self._source_event_span_hasher = source_event_span_hasher
             return reservation
 
     def bind_exact_consumer(self, readiness: ExactConsumerReadiness) -> None:
@@ -1528,19 +1559,16 @@ class CaptureSession:
         readiness.validate_source(
             reservation=reservation,
             trace_binding=self._trace_binding,
-            payload_contract_fingerprint=self._contract.payload_contract.fingerprint,
+            payload_contract_fingerprint=(
+                self._contract.dataset_edge.payload_contract_fingerprint
+            ),
             join_key_contract_fingerprint=dataset_cell_key_fingerprint(
                 self._contract.dataset_schema
             ),
-            source_contract_digest=dataset_consumer_contract_digest(
-                self._contract.dataset_schema,
-                self._contract.expected_cells,
-                self._contract.event_adapter.metadata_contract.fingerprint,
-                self._contract.event_adapter.operator_fingerprint,
-            ),
-            source_schedule_digest=dataset_cell_permutation_digest(
-                self._contract.dataset_schema,
-                self._contract.expected_cells,
+            source_contract_digest=self._contract.dataset_edge.consumer_contract_digest,
+            source_schedule_digest=self._contract.dataset_edge.schedule_digest,
+            source_key_sequence_digest=(
+                self._contract.dataset_edge.exact_key_sequence_digest
             ),
             total_events=self._contract.total_events,
         )
@@ -1593,6 +1621,10 @@ class CaptureSession:
                     ),
                     join_key=join_key,
                 )
+                source_event_span_hasher = self._source_event_span_hasher
+                if source_event_span_hasher is None:
+                    raise RuntimeError("capture has no source event span owner")
+                source_event_span_hasher.update(envelope.ref)
                 stored = envelope.payload
                 if _nonnegative_int(
                     payload_contract.source_ordinal(stored),
@@ -1603,7 +1635,7 @@ class CaptureSession:
                     raise StreamError("payload snapshot changed captured_at")
                 if payload_contract.correlation_id(stored) != correlation_id:
                     raise StreamError("payload snapshot changed correlation_id")
-                metadata_contract = self._contract.event_adapter.metadata_contract
+                metadata_contract = self._contract.dataset_edge.metadata_contract
                 metadata = metadata_contract.snapshot(stored)
                 metadata_contract.validate(metadata)
                 metadata_digest = _sha256(

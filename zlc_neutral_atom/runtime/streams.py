@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import threading
 import time
@@ -13,6 +14,7 @@ from numbers import Integral
 from typing import Callable, Generic, Protocol, TypeVar
 
 from zlc_data import DataBlock, DataPatch, StreamGenerationId
+from zlc_storage import canonical_digest, decode, encode, sha256_digest
 
 
 PayloadT = TypeVar("PayloadT")
@@ -25,6 +27,13 @@ _MONITOR_UPDATE_TOKEN = object()
 _STREAM_TOKEN = object()
 _PRODUCER_TOKEN = object()
 _READINESS_TOKEN = object()
+_MAX_ARTIFACT_REFERENCE_BYTES = 64 * 1024
+_MAX_DIRECT_ARTIFACT_INPUTS = 32
+_MAX_DIRECT_ARTIFACT_INPUT_BYTES = 1024 * 1024
+_MAX_EXACT_PROCESSOR_STAGES = 64
+_MAX_CHAIN_ARTIFACT_INPUT_OCCURRENCES = 256
+_MAX_CHAIN_ARTIFACT_INPUT_BYTES = 4 * 1024 * 1024
+_MAX_TRACE_CAUSATION_REFS = 1 + _MAX_DIRECT_ARTIFACT_INPUTS
 
 
 class PayloadContract(Protocol[PayloadT]):
@@ -171,13 +180,174 @@ class EventSpanRef:
         object.__setattr__(self, "count", count)
 
 
+class OrderedEventSpanHasher:
+    """Shared O(1)-memory owner for one contiguous ordered EventRef span."""
+
+    __slots__ = (
+        "_stream_id",
+        "_generation",
+        "_start_sequence",
+        "_next_sequence",
+        "_hasher",
+        "_sealed",
+    )
+
+    def __init__(
+        self,
+        stream_id: StreamId,
+        generation: StreamGenerationId,
+        start_sequence: int,
+    ) -> None:
+        if not isinstance(stream_id, StreamId):
+            raise TypeError("stream_id must be StreamId")
+        if not isinstance(generation, StreamGenerationId):
+            raise TypeError("generation must be StreamGenerationId")
+        start = _nonnegative_int(start_sequence, "start_sequence")
+        self._stream_id = stream_id
+        self._generation = generation
+        self._start_sequence = start
+        self._next_sequence = start
+        self._hasher = hashlib.sha256()
+        self._hasher.update(b"zlc_neutral_atom.OrderedEventRefs/v1\x00")
+        self._sealed = False
+
+    def update(self, reference: EventRef) -> None:
+        if self._sealed:
+            raise RuntimeError("ordered event span is already sealed")
+        if not isinstance(reference, EventRef):
+            raise TypeError("reference must be EventRef")
+        if (
+            reference.stream_id != self._stream_id
+            or reference.generation != self._generation
+            or reference.sequence != self._next_sequence
+        ):
+            raise ValueError(
+                "EventRef differs from the ordered span stream/generation/sequence"
+            )
+        encoded = encode(
+            {
+                "stream_id": reference.stream_id.value,
+                "generation": reference.generation.value,
+                "sequence": reference.sequence,
+                "event_id": reference.event_id.value,
+            }
+        )
+        self._hasher.update(len(encoded).to_bytes(8, "big"))
+        self._hasher.update(encoded)
+        self._next_sequence += 1
+
+    def seal(self, end_sequence: int) -> EventSpanRef:
+        if self._sealed:
+            raise RuntimeError("ordered event span is already sealed")
+        end = _nonnegative_int(end_sequence, "end_sequence")
+        if end != self._next_sequence:
+            raise ValueError("ordered event span does not cover the requested interval")
+        self._sealed = True
+        return EventSpanRef(
+            self._stream_id,
+            self._generation,
+            self._start_sequence,
+            end,
+            end - self._start_sequence,
+            self._hasher.hexdigest(),
+        )
+
+
 @dataclass(frozen=True)
 class ArtifactInputRef:
-    typed_ref: object
+    """Immutable, owner-encoded identity of one direct artifact dependency.
+
+    Runtime deliberately does not interpret foreign artifact reference types.
+    The owning domain serializes its typed reference with its canonical codec;
+    this value snapshots those bytes and binds both their schema and content.
+    """
+
+    reference_schema_id: str
+    canonical_reference: bytes
     content_digest: str
 
     def __post_init__(self) -> None:
+        schema_id = _canonical_text(self.reference_schema_id, "reference_schema_id")
+        if not isinstance(self.canonical_reference, bytes):
+            raise TypeError("canonical_reference must be immutable bytes")
+        raw = self.canonical_reference
+        if not raw or len(raw) > _MAX_ARTIFACT_REFERENCE_BYTES:
+            raise ValueError("canonical_reference must contain at most 64 KiB")
+        try:
+            tree = decode(raw)
+        except Exception as error:
+            raise ValueError("canonical_reference is not canonical owner data") from error
+        if not isinstance(tree, dict) or tree.get("schema") != schema_id:
+            raise ValueError(
+                "canonical_reference schema does not match reference_schema_id"
+            )
+        if encode(tree) != raw:
+            raise ValueError("canonical_reference is not byte-canonical")
+        object.__setattr__(self, "reference_schema_id", schema_id)
         _digest(self.content_digest, "content_digest")
+
+    @property
+    def reference_digest(self) -> str:
+        return sha256_digest(self.canonical_reference)
+
+    @property
+    def fingerprint(self) -> str:
+        return canonical_digest(
+            {
+                "contract": "zlc_neutral_atom.ArtifactInputRef/v2",
+                "reference_schema_id": self.reference_schema_id,
+                "reference_digest": self.reference_digest,
+                "content_digest": self.content_digest,
+            }
+        )
+
+
+def _owned_artifact_input_ref(reference: ArtifactInputRef) -> ArtifactInputRef:
+    """Reconstruct a direct dependency so caller reflection cannot rewrite history."""
+
+    if not isinstance(reference, ArtifactInputRef):
+        raise TypeError("artifact input must be ArtifactInputRef")
+    return ArtifactInputRef(
+        reference.reference_schema_id,
+        reference.canonical_reference,
+        reference.content_digest,
+    )
+
+
+@dataclass(frozen=True)
+class ProcessorStageProvenance:
+    """Bounded, inspectable identity of one direct processor dependency set."""
+
+    processor_binding_digest: str
+    direct_artifact_inputs: tuple[ArtifactInputRef, ...] = ()
+
+    def __post_init__(self) -> None:
+        _digest(self.processor_binding_digest, "processor_binding_digest")
+        if not isinstance(self.direct_artifact_inputs, tuple):
+            raise TypeError("direct_artifact_inputs must be an immutable tuple")
+        inputs = tuple(item for item in self.direct_artifact_inputs)
+        if any(not isinstance(item, ArtifactInputRef) for item in inputs):
+            raise TypeError(
+                "direct_artifact_inputs must contain ArtifactInputRef values"
+            )
+        if len(inputs) > _MAX_DIRECT_ARTIFACT_INPUTS:
+            raise ValueError("processor stage has too many direct artifact inputs")
+        if (
+            sum(len(item.canonical_reference) for item in inputs)
+            > _MAX_DIRECT_ARTIFACT_INPUT_BYTES
+        ):
+            raise ValueError("processor stage artifact inputs exceed the byte budget")
+        identities = tuple(item.fingerprint for item in inputs)
+        if len(set(identities)) != len(identities):
+            raise ValueError("processor stage repeats an artifact input")
+        # Frozen dataclasses are an API contract, not a security boundary:
+        # ``object.__setattr__`` can still rewrite a caller-owned instance.  The
+        # provenance owner therefore retains reconstructed references only.
+        object.__setattr__(
+            self,
+            "direct_artifact_inputs",
+            tuple(_owned_artifact_input_ref(item) for item in inputs),
+        )
 
 
 CausationRef = EventRef | EventSpanRef | ArtifactInputRef
@@ -200,6 +370,8 @@ class TraceContext:
         refs = tuple(self.causation_refs)
         if any(not isinstance(ref, (EventRef, EventSpanRef, ArtifactInputRef)) for ref in refs):
             raise TypeError("causation_refs contains an unsupported reference")
+        if len(refs) > _MAX_TRACE_CAUSATION_REFS:
+            raise ValueError("causation_refs exceeds the direct lineage budget")
         object.__setattr__(self, "causation_refs", refs)
         for field in ("config_revision", "control_revision"):
             value = getattr(self, field)
@@ -537,8 +709,10 @@ class ExactConsumerReadiness:
     """Opaque proof that a source reaches one live terminal DatasetBuilder.
 
     The proof is identity-bound to both the source consumer and the terminal
-    dataset consumer.  Every intermediate processor contributes a private
-    owner-liveness capability which is rechecked at bind, prepare, and start.
+    dataset consumer.  Every intermediate processor contributes private
+    liveness, completion, and cancellation capabilities.  Liveness is
+    rechecked at bind, prepare, and start; completion recursively means the
+    one terminal dataset has sealed, not merely that one stage emitted EOS.
     This is a process-local preflight capability, not a serializable plan flag
     and not a user-constructible ``is_exact`` boolean.
     """
@@ -548,11 +722,15 @@ class ExactConsumerReadiness:
         "_source_consumer",
         "_source_contract_digest",
         "_source_schedule_digest",
+        "_source_key_sequence_digest",
         "_chain_contract_digest",
         "_terminal_reservation",
         "_terminal_consumer",
         "_binding_owner",
         "_owner_liveness",
+        "_owner_completion",
+        "_owner_cancel",
+        "_processor_stages",
     )
 
     def __init__(
@@ -563,10 +741,14 @@ class ExactConsumerReadiness:
         source_consumer: object,
         source_contract_digest: str,
         source_schedule_digest: str,
+        source_key_sequence_digest: str,
         chain_contract_digest: str,
         terminal_reservation: ExactReservation,
         terminal_consumer: object,
         owner_liveness: tuple[Callable[[], None], ...],
+        owner_completion: Callable[[float], object] | None,
+        owner_cancel: Callable[[str | None], bool] | None,
+        processor_stages: tuple[ProcessorStageProvenance, ...],
     ) -> None:
         if authority is not _READINESS_TOKEN:
             raise PermissionError(
@@ -574,16 +756,42 @@ class ExactConsumerReadiness:
             )
         _digest(source_contract_digest, "source contract digest")
         _digest(source_schedule_digest, "source schedule digest")
+        _digest(source_key_sequence_digest, "source key-sequence digest")
         _digest(chain_contract_digest, "chain contract digest")
         object.__setattr__(self, "_source_reservation", source_reservation)
         object.__setattr__(self, "_source_consumer", source_consumer)
         object.__setattr__(self, "_source_contract_digest", source_contract_digest)
         object.__setattr__(self, "_source_schedule_digest", source_schedule_digest)
+        object.__setattr__(
+            self,
+            "_source_key_sequence_digest",
+            source_key_sequence_digest,
+        )
         object.__setattr__(self, "_chain_contract_digest", chain_contract_digest)
         object.__setattr__(self, "_terminal_reservation", terminal_reservation)
         object.__setattr__(self, "_terminal_consumer", terminal_consumer)
         object.__setattr__(self, "_binding_owner", None)
         object.__setattr__(self, "_owner_liveness", owner_liveness)
+        object.__setattr__(self, "_owner_completion", owner_completion)
+        object.__setattr__(self, "_owner_cancel", owner_cancel)
+        stages = tuple(processor_stages)
+        if any(not isinstance(stage, ProcessorStageProvenance) for stage in stages):
+            raise TypeError("processor_stages contains an unsupported value")
+        if len(stages) > _MAX_EXACT_PROCESSOR_STAGES:
+            raise ValueError("exact processor chain exceeds the stage budget")
+        chain_inputs = tuple(
+            reference
+            for stage in stages
+            for reference in stage.direct_artifact_inputs
+        )
+        if len(chain_inputs) > _MAX_CHAIN_ARTIFACT_INPUT_OCCURRENCES:
+            raise ValueError("exact processor chain has too many artifact input edges")
+        if (
+            sum(len(reference.canonical_reference) for reference in chain_inputs)
+            > _MAX_CHAIN_ARTIFACT_INPUT_BYTES
+        ):
+            raise ValueError("exact processor chain artifact inputs exceed the byte budget")
+        object.__setattr__(self, "_processor_stages", stages)
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("ExactConsumerReadiness is immutable")
@@ -591,6 +799,10 @@ class ExactConsumerReadiness:
     @property
     def chain_contract_digest(self) -> str:
         return self._chain_contract_digest
+
+    @property
+    def processor_stages(self) -> tuple[ProcessorStageProvenance, ...]:
+        return self._processor_stages
 
     def _claim_binding(self, owner: object) -> None:
         """Consume this process-local proof for exactly one enclosing owner."""
@@ -620,6 +832,7 @@ class ExactConsumerReadiness:
         join_key_contract_fingerprint: str,
         source_contract_digest: str,
         source_schedule_digest: str,
+        source_key_sequence_digest: str,
         total_events: int,
     ) -> None:
         """Revalidate every source identity plus the live terminal sink."""
@@ -630,6 +843,7 @@ class ExactConsumerReadiness:
         _digest(join_key_contract_fingerprint, "join key contract fingerprint")
         _digest(source_contract_digest, "source contract digest")
         _digest(source_schedule_digest, "source schedule digest")
+        _digest(source_key_sequence_digest, "source key-sequence digest")
         expected_total = _positive_int(total_events, "total_events")
         stream = reservation._stream
         with stream._condition:
@@ -654,6 +868,8 @@ class ExactConsumerReadiness:
                 raise ReservationStateError("exact readiness source contract differs")
             if self._source_schedule_digest != source_schedule_digest:
                 raise ReservationStateError("exact readiness source schedule differs")
+            if self._source_key_sequence_digest != source_key_sequence_digest:
+                raise ReservationStateError("exact readiness source key sequence differs")
         self._validate_terminal_sink()
 
     def _validate_terminal_sink(self) -> None:
@@ -673,6 +889,168 @@ class ExactConsumerReadiness:
                 raise ReservationStateError("terminal dataset stream is no longer live")
         for validate_liveness in self._owner_liveness:
             validate_liveness()
+
+    def _validate_emitter(
+        self,
+        *,
+        stream: "AcquisitionStream",
+        trace_binding: TraceBinding,
+        payload_contract_fingerprint: str,
+        join_key_contract_fingerprint: str,
+        source_key_sequence_digest: str,
+        total_events: int,
+    ) -> None:
+        """Cross-bind one producer to this proof's immediate source interval."""
+
+        _digest(payload_contract_fingerprint, "payload contract fingerprint")
+        _digest(join_key_contract_fingerprint, "join key contract fingerprint")
+        _digest(source_key_sequence_digest, "source key-sequence digest")
+        expected_total = _positive_int(total_events, "total_events")
+        reservation = self._source_reservation
+        if reservation._stream is not stream:
+            raise ReservationStateError(
+                "downstream readiness belongs to another output stream"
+            )
+        with stream._condition:
+            if stream._reservations.get(reservation._token) is not reservation:
+                raise ReservationStateError(
+                    "downstream readiness reservation is not registered"
+                )
+            if reservation._consumer_owner is not self._source_consumer:
+                raise ReservationStateError(
+                    "downstream readiness lost its immediate source consumer"
+                )
+            if reservation._state is not ReservationState.ACTIVE:
+                raise ReservationStateError(
+                    "downstream readiness source is not ACTIVE"
+                )
+            if stream._terminal_error is not None or stream._closed:
+                raise ReservationStateError(
+                    "downstream readiness source is no longer live"
+                )
+            if reservation.trace_binding != trace_binding:
+                raise ReservationStateError(
+                    "downstream readiness trace binding differs from output producer"
+                )
+            if reservation.end_sequence - reservation.start_sequence != expected_total:
+                raise ReservationStateError(
+                    "downstream readiness event interval differs"
+                )
+            if stream.payload_contract_fingerprint != payload_contract_fingerprint:
+                raise ReservationStateError(
+                    "downstream readiness payload contract differs"
+                )
+            key_contract = stream._join_key_contract
+            if (
+                key_contract is None
+                or key_contract.fingerprint != join_key_contract_fingerprint
+            ):
+                raise ReservationStateError(
+                    "downstream readiness join-key contract differs"
+                )
+            if self._source_key_sequence_digest != source_key_sequence_digest:
+                raise ReservationStateError(
+                    "downstream readiness source key sequence differs"
+                )
+        self._validate_terminal_sink()
+
+    def _await_source_ack(
+        self,
+        owner: object,
+        event_ref: EventRef,
+        *,
+        deadline_monotonic: float,
+        checkpoint: Callable[[], None],
+    ) -> None:
+        """Wait until the immediate consumer really acknowledges one emitted event."""
+
+        if not isinstance(event_ref, EventRef):
+            raise TypeError("event_ref must be EventRef")
+        if not callable(checkpoint):
+            raise TypeError("checkpoint must be callable")
+        deadline = _finite_time(deadline_monotonic, "deadline_monotonic")
+        reservation = self._source_reservation
+        stream = reservation._stream
+        if (
+            event_ref.stream_id != stream.stream_id
+            or event_ref.generation != stream.generation
+            or event_ref.sequence < reservation.start_sequence
+            or event_ref.sequence >= reservation.end_sequence
+        ):
+            raise ReservationStateError(
+                "emitted event is outside downstream readiness source interval"
+            )
+        while True:
+            checkpoint()
+            terminal_before_ack = False
+            with stream._condition:
+                if self._binding_owner is not owner:
+                    raise PermissionError(
+                        "downstream acknowledgement belongs to another bound owner"
+                    )
+                if reservation._ack_sequence > event_ref.sequence:
+                    return
+                registered = stream._reservations.get(reservation._token) is reservation
+                terminal_before_ack = (
+                    not registered
+                    or reservation._state
+                    not in (ReservationState.ACTIVE, ReservationState.DRAINING)
+                    or stream._terminal_error is not None
+                )
+                if not terminal_before_ack:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            "downstream processor did not acknowledge output before deadline"
+                        )
+                    stream._condition.wait(min(0.05, remaining))
+            if terminal_before_ack:
+                # The completion callback preserves the downstream worker's real
+                # exception instead of reducing it to a reservation-state symptom.
+                self._await_bound_completion(owner, deadline_monotonic=deadline)
+                raise ReservationStateError(
+                    "downstream processor completed without acknowledging output"
+                )
+
+    def _await_bound_completion(
+        self,
+        owner: object,
+        *,
+        deadline_monotonic: float,
+    ) -> object:
+        """Await the immediate processor, which itself includes terminal completion."""
+
+        deadline = _finite_time(deadline_monotonic, "deadline_monotonic")
+        reservation = self._source_reservation
+        stream = reservation._stream
+        with stream._condition:
+            if self._binding_owner is not owner:
+                raise PermissionError(
+                    "downstream completion belongs to another bound owner"
+                )
+            completion = self._owner_completion
+        if completion is None:
+            raise ReservationStateError(
+                "terminal readiness has no intermediate processor completion"
+            )
+        return completion(deadline)
+
+    def _cancel_bound_owner(self, owner: object, reason: str | None) -> bool:
+        """Propagate fail-closed teardown to the immediate downstream processor."""
+
+        reservation = self._source_reservation
+        stream = reservation._stream
+        with stream._condition:
+            if self._binding_owner is not owner:
+                raise PermissionError(
+                    "downstream cancellation belongs to another bound owner"
+                )
+            cancel = self._owner_cancel
+        if cancel is None:
+            raise ReservationStateError(
+                "terminal readiness has no intermediate processor cancellation"
+            )
+        return cancel(reason)
 
 class AcquisitionCursor(Generic[PayloadT]):
     """Opaque cursor with at most one unacknowledged delivery."""
@@ -1011,6 +1389,10 @@ class AcquisitionStream(Generic[PayloadT]):
         self._next_sequence = 0
         self._event_namespace = f"{self.stream_id.value}:{self.generation.value}"
         self._reservations: dict[object, ExactReservation[PayloadT]] = {}
+        self._formal_consumer_claimed = False
+        self._formal_rebind_required = False
+        self._formal_interval_start: int | None = None
+        self._formal_interval_end: int | None = None
         self._monitors: set[MonitorTap[PayloadT]] = set()
         self._closed = False
         self._terminal_error: StreamError | None = None
@@ -1084,6 +1466,10 @@ class AcquisitionStream(Generic[PayloadT]):
                 raise ReservationCapacityExceeded(
                     "one stream generation has exactly one formal exact consumer"
                 )
+            if self._formal_consumer_claimed:
+                raise ReservationCapacityExceeded(
+                    "this stream generation already had its formal exact consumer"
+                )
             token = object()
             reservation = ExactReservation(
                 _RESERVATION_TOKEN,
@@ -1156,6 +1542,43 @@ class AcquisitionStream(Generic[PayloadT]):
                     raise self._terminal_error
                 raise StreamEndedEarly("cannot emit after end-of-stream")
             sequence = self._next_sequence
+            if self._formal_consumer_claimed or self._formal_rebind_required:
+                covering = tuple(
+                    reservation
+                    for reservation in self._reservations.values()
+                    if reservation._state
+                    in (ReservationState.ACTIVE, ReservationState.DRAINING)
+                    and reservation._consumer_owner is not None
+                    and reservation.start_sequence <= sequence < reservation.end_sequence
+                )
+                if len(covering) != 1:
+                    raise ReservationStateError(
+                        "formal stream emission requires one live bound reservation "
+                        "covering the next sequence"
+                    )
+                reservation = covering[0]
+                if (
+                    self._formal_interval_start != reservation.start_sequence
+                    or self._formal_interval_end != reservation.end_sequence
+                ):
+                    raise ReservationStateError(
+                        "formal stream reservation differs from its frozen interval"
+                    )
+                reservation.trace_binding.validate(trace)
+            for reservation in self._reservations.values():
+                if (
+                    reservation._state
+                    in (
+                        ReservationState.RESERVED,
+                        ReservationState.ACTIVE,
+                        ReservationState.DRAINING,
+                    )
+                    and reservation.start_sequence <= sequence < reservation.end_sequence
+                    and reservation._consumer_owner is None
+                ):
+                    raise ReservationStateError(
+                        "exact data cannot be emitted before its formal consumer is bound"
+                    )
             selected_event_id = EventId(f"{self._event_namespace}:{sequence}")
             envelope = Envelope(
                 event_id=selected_event_id,
@@ -1237,6 +1660,17 @@ class AcquisitionStream(Generic[PayloadT]):
                 raise self._terminal_error
             if self._eos is not None:
                 return self._eos
+            if self._formal_rebind_required:
+                raise StreamEndedEarly(
+                    "formal stream cannot finish while replacement binding is required"
+                )
+            if (
+                self._formal_interval_end is not None
+                and self._next_sequence != self._formal_interval_end
+            ):
+                raise StreamEndedEarly(
+                    "formal stream terminal sequence differs from its frozen interval"
+                )
             nonce = object()
             self._eos = EndOfStream(
                 _EOS_TOKEN,
@@ -1335,24 +1769,48 @@ class AcquisitionStream(Generic[PayloadT]):
         """Atomically validate authority, commit one cell, then advance its watermark."""
 
         with self._condition:
-            registered = self._reservations.get(reservation._token)
-            if registered is not reservation:
-                raise ReservationStateError("exact consumer reservation is not registered")
-            if reservation._consumer_owner is not consumer:
-                raise PermissionError("reservation belongs to another exact consumer")
-            if reservation._state not in (ReservationState.ACTIVE, ReservationState.DRAINING):
-                raise ReservationStateError("exact consumer reservation is not active")
-            cursor = reservation._cursor
-            if cursor is None or delivery._cursor is not cursor:
-                raise PermissionError("Delivery belongs to another exact reservation")
-            if cursor._stream is not self or cursor._inflight is not delivery:
-                raise PermissionError("Delivery belongs to another stream authority")
-            if delivery.acknowledged:
-                raise ReservationStateError("Delivery was already acknowledged")
-            reservation.trace_binding.validate(delivery.envelope.trace)
+            cursor = self._validate_consumer_delivery_locked(
+                reservation,
+                delivery,
+                consumer,
+            )
             result = commit(delivery.envelope)
             cursor._ack_delivery(delivery, consumer)
             return result
+
+    def _validate_consumer_delivery(
+        self,
+        reservation: ExactReservation[PayloadT],
+        delivery: Delivery[PayloadT],
+        consumer: object,
+    ) -> None:
+        """Validate one delivery without committing or advancing its watermark."""
+
+        with self._condition:
+            self._validate_consumer_delivery_locked(reservation, delivery, consumer)
+
+    def _validate_consumer_delivery_locked(
+        self,
+        reservation: ExactReservation[PayloadT],
+        delivery: Delivery[PayloadT],
+        consumer: object,
+    ) -> AcquisitionCursor[PayloadT]:
+        registered = self._reservations.get(reservation._token)
+        if registered is not reservation:
+            raise ReservationStateError("exact consumer reservation is not registered")
+        if reservation._consumer_owner is not consumer:
+            raise PermissionError("reservation belongs to another exact consumer")
+        if reservation._state not in (ReservationState.ACTIVE, ReservationState.DRAINING):
+            raise ReservationStateError("exact consumer reservation is not active")
+        cursor = reservation._cursor
+        if cursor is None or delivery._cursor is not cursor:
+            raise PermissionError("Delivery belongs to another exact reservation")
+        if cursor._stream is not self or cursor._inflight is not delivery:
+            raise PermissionError("Delivery belongs to another stream authority")
+        if delivery.acknowledged:
+            raise ReservationStateError("Delivery was already acknowledged")
+        reservation.trace_binding.validate(delivery.envelope.trace)
+        return cursor
 
     def _ack_consumer(
         self,
@@ -1363,13 +1821,11 @@ class AcquisitionStream(Generic[PayloadT]):
         """Advance an exact watermark only for its identity-bound consumer."""
 
         with self._condition:
-            if self._reservations.get(reservation._token) is not reservation:
-                raise ReservationStateError("exact consumer reservation is not registered")
-            if reservation._consumer_owner is not consumer:
-                raise PermissionError("reservation belongs to another exact consumer")
-            cursor = reservation._cursor
-            if cursor is None or delivery._cursor is not cursor:
-                raise PermissionError("Delivery belongs to another exact reservation")
+            cursor = self._validate_consumer_delivery_locked(
+                reservation,
+                delivery,
+                consumer,
+            )
             cursor._ack_delivery(delivery, consumer)
 
     def _complete_consumer(
@@ -1428,51 +1884,98 @@ class AcquisitionStream(Generic[PayloadT]):
         *,
         source_contract_digest: str,
         source_schedule_digest: str,
+        source_key_sequence_digest: str,
         chain_contract_digest: str,
         terminal: bool = False,
         downstream: ExactConsumerReadiness | None = None,
         owner_liveness: Callable[[], None] | None = None,
+        owner_completion: Callable[[float], object] | None = None,
+        owner_cancel: Callable[[str | None], bool] | None = None,
+        processor_stage: ProcessorStageProvenance | None = None,
     ) -> ExactConsumerReadiness:
         _digest(source_contract_digest, "source contract digest")
         _digest(source_schedule_digest, "source schedule digest")
+        _digest(source_key_sequence_digest, "source key-sequence digest")
         _digest(chain_contract_digest, "chain contract digest")
         if terminal == (downstream is not None):
             raise ValueError(
                 "exact consumer must be either a terminal dataset sink or bind one downstream"
             )
-        if terminal and owner_liveness is not None:
-            raise ValueError("terminal dataset sink does not accept processor liveness")
-        if downstream is not None and not callable(owner_liveness):
-            raise TypeError("processor exact consumer requires owner_liveness")
+        if terminal and any(
+            callback is not None
+            for callback in (owner_liveness, owner_completion, owner_cancel)
+        ):
+            raise ValueError(
+                "terminal dataset sink does not accept processor lifecycle callbacks"
+            )
+        if terminal and processor_stage is not None:
+            raise ValueError("terminal dataset sink does not declare a processor stage")
+        if downstream is not None and not all(
+            callable(callback)
+            for callback in (owner_liveness, owner_completion, owner_cancel)
+        ):
+            raise TypeError(
+                "processor exact consumer requires liveness, completion, and cancel callbacks"
+            )
+        if downstream is not None and not isinstance(
+            processor_stage,
+            ProcessorStageProvenance,
+        ):
+            raise TypeError("processor exact consumer requires processor_stage")
         with self._condition:
             if self._reservations.get(reservation._token) is not reservation:
                 raise ReservationStateError("exact consumer reservation is not registered")
             if reservation._consumer_owner is not None:
                 raise ReservationStateError("reservation already has an exact consumer")
+            if self._formal_consumer_claimed:
+                raise ReservationStateError(
+                    "stream generation already claimed its formal exact consumer"
+                )
             if reservation._state is not ReservationState.ACTIVE:
                 raise ReservationStateError("exact consumer requires an ACTIVE reservation")
             if downstream is not None:
                 downstream._validate_terminal_sink()
-                downstream._claim_binding(consumer)
                 terminal_reservation = downstream._terminal_reservation
                 terminal_consumer = downstream._terminal_consumer
                 owner_liveness = (owner_liveness, *downstream._owner_liveness)
+                processor_stages = (
+                    processor_stage,
+                    *downstream._processor_stages,
+                )
             else:
                 terminal_reservation = reservation
                 terminal_consumer = consumer
                 owner_liveness = ()
-            reservation._consumer_owner = consumer
-            return ExactConsumerReadiness(
+                owner_completion = None
+                owner_cancel = None
+                processor_stages = ()
+            readiness = ExactConsumerReadiness(
                 _READINESS_TOKEN,
                 source_reservation=reservation,
                 source_consumer=consumer,
                 source_contract_digest=source_contract_digest,
                 source_schedule_digest=source_schedule_digest,
+                source_key_sequence_digest=source_key_sequence_digest,
                 chain_contract_digest=chain_contract_digest,
                 terminal_reservation=terminal_reservation,
                 terminal_consumer=terminal_consumer,
                 owner_liveness=owner_liveness,
+                owner_completion=owner_completion,
+                owner_cancel=owner_cancel,
+                processor_stages=processor_stages,
             )
+            if downstream is not None:
+                downstream._claim_binding(consumer)
+            # Final no-fail authority commit.  Failed validation before this
+            # point is retryable.  A later zero-event failed preflight may also
+            # release the claim; publishing the first event makes it a permanent
+            # generation-lifetime tombstone.
+            reservation._consumer_owner = consumer
+            self._formal_consumer_claimed = True
+            self._formal_rebind_required = False
+            self._formal_interval_start = reservation.start_sequence
+            self._formal_interval_end = reservation.end_sequence
+            return readiness
 
     def _abort_consumer(
         self,
@@ -1529,8 +2032,21 @@ class AcquisitionStream(Generic[PayloadT]):
                 ReservationState.CANCELLED,
             ):
                 raise ReservationStateError("reservation must complete or abort before release")
+            retryable_zero_event_preflight = (
+                reservation._consumer_owner is not None
+                and reservation._state
+                in (ReservationState.FAILED, ReservationState.CANCELLED)
+                and self._next_sequence == reservation.start_sequence
+            )
             reservation._state = ReservationState.RELEASED
             self._reservations.pop(token)
+            if retryable_zero_event_preflight:
+                # A fully bound graph that failed before publishing its first
+                # event never became the generation's data consumer.  Reusing
+                # that still-empty generation is safe; any emitted event makes
+                # the lifetime tombstone permanent, even if it was never acked.
+                self._formal_consumer_claimed = False
+                self._formal_rebind_required = True
             self._trim_locked()
             self._condition.notify_all()
 
@@ -1597,8 +2113,10 @@ __all__ = [
     "JoinKeyContract",
     "MonitorTap",
     "MonitorUpdate",
+    "OrderedEventSpanHasher",
     "PayloadContract",
     "ProducerFlowControl",
+    "ProcessorStageProvenance",
     "ReservationCapacityExceeded",
     "RetentionOverrun",
     "ReservationState",

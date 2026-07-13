@@ -24,6 +24,7 @@ from zlc_neutral_atom.artifacts import (
     compile_capture_artifact_pipeline,
 )
 from zlc_neutral_atom.capture_reference import (
+    capture_artifact_input_ref,
     capture_artifact_ref_from_tree,
     decode_capture_artifact_ref,
     encode_capture_artifact_ref,
@@ -132,6 +133,7 @@ def test_exact_pipeline_commits_and_reloads_capture_artifact(tmp_path):
         assert np.all(artifact.block.values[0, 1] == 29)
         assert [item.source_ordinal for item in artifact.event_metadata] == [0, 1]
         assert artifact.coverage.complete
+        assert artifact.provenance.derivation is None
         assert artifact.terminal.produced_count == 2
         assert artifact.terminal.drained_count == 2
         assert artifact.pulse_lineage is None
@@ -165,6 +167,7 @@ def test_exact_pipeline_commits_and_reloads_capture_artifact(tmp_path):
         assert "readout_event_index" not in manifest["camera_provenance"]
         assert "frame_contract" not in manifest["camera_provenance"]
         assert "source_dataset_schema_blob" not in manifest
+        assert manifest["provenance"]["derivation"] is None
         assert (
             manifest["camera_capability_evidence"]["physical_facts_fingerprint"]
             == artifact.camera_capability_evidence.physical_facts.fingerprint
@@ -385,6 +388,21 @@ def test_exact_pipeline_commits_and_reloads_capture_artifact(tmp_path):
                 )
             )
 
+        derived_raw = dict(manifest)
+        derived_raw["provenance"] = dict(manifest["provenance"])
+        derived_raw["provenance"]["derivation"] = {"forged": True}
+        invalid_derivation = repository._store.publish_manifest(
+            "capture",
+            encode(derived_raw),
+        )
+        with pytest.raises(ValueError, match="cannot contain processor derivation"):
+            repository.load(
+                CaptureArtifactRef(
+                    repository.repository_id,
+                    invalid_derivation.content.digest,
+                )
+            )
+
         manifest["legacy_camera_settings"] = {"exposure": 1e-3}
         invalid = repository._store.publish_manifest("capture", encode(manifest))
         with pytest.raises(ValueError, match="unknown field set"):
@@ -558,6 +576,10 @@ def test_capture_ref_cannot_be_loaded_from_another_repository(tmp_path):
 def test_capture_ref_has_one_leaf_owner_and_a_strict_current_codec():
     reference = CaptureArtifactRef("capture-repository", "a" * 64)
     assert decode_capture_artifact_ref(encode_capture_artifact_ref(reference)) == reference
+    dependency = capture_artifact_input_ref(reference)
+    assert dependency.reference_schema_id.endswith("capture-artifact-ref.v1")
+    assert dependency.content_digest == reference.manifest_digest
+    assert decode_capture_artifact_ref(dependency.canonical_reference) == reference
     with pytest.raises(ValueError, match="unknown field set"):
         capture_artifact_ref_from_tree(
             {

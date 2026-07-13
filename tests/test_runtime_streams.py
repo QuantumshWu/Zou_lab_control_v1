@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 import pytest
 
@@ -25,13 +27,18 @@ from zlc_data import (
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionStream,
     ReservationCapacityExceeded,
+    ReservationStateError,
     ReservationState,
     SchemaChanged,
     StreamBackpressure,
     StreamGap,
     StreamEndedEarly,
+    StreamError,
     AcquisitionCursor,
     EndOfStream,
+    EventId,
+    EventRef,
+    OrderedEventSpanHasher,
     ProducerFlowControl,
     RetentionOverrun,
     SourceFailed,
@@ -45,6 +52,42 @@ PAYLOAD_FINGERPRINT = "1" * 64
 JOIN_FINGERPRINT = "2" * 64
 SCALAR_SCHEMA = ValueSchema((), ValidityContract.value(), np.dtype("<f8"))
 TRACE_BINDING = TraceBinding("run-one", "camera-one")
+
+
+def test_ordered_event_span_hasher_is_canonical_contiguous_and_owner_independent():
+    stream_id = StreamId("camera.exact")
+    generation = StreamGenerationId("generation-one")
+    references = tuple(
+        EventRef(stream_id, generation, sequence, EventId(f"event-{sequence}"))
+        for sequence in range(3)
+    )
+
+    producer_owner = OrderedEventSpanHasher(stream_id, generation, 0)
+    consumer_owner = OrderedEventSpanHasher(stream_id, generation, 0)
+    changed_owner = OrderedEventSpanHasher(stream_id, generation, 0)
+    for reference in references:
+        producer_owner.update(reference)
+        consumer_owner.update(reference)
+        changed_owner.update(
+            EventRef(
+                stream_id,
+                generation,
+                reference.sequence,
+                EventId("changed-event")
+                if reference.sequence == 1
+                else reference.event_id,
+            )
+        )
+
+    producer_span = producer_owner.seal(3)
+    assert consumer_owner.seal(3) == producer_span
+    assert changed_owner.seal(3).ordered_digest != producer_span.ordered_digest
+
+    discontinuous = OrderedEventSpanHasher(stream_id, generation, 0)
+    with pytest.raises(ValueError, match="stream/generation/sequence"):
+        discontinuous.update(references[1])
+    with pytest.raises(RuntimeError, match="already sealed"):
+        producer_owner.update(references[-1])
 
 
 class TupleJoinContract:
@@ -102,6 +145,28 @@ def emit(producer, value: float):
     )
 
 
+def bind_terminal_consumer(source, reservation):
+    owner = object()
+    source._claim_consumer(
+        reservation,
+        owner,
+        source_contract_digest="3" * 64,
+        source_schedule_digest="4" * 64,
+        source_key_sequence_digest="5" * 64,
+        chain_contract_digest="6" * 64,
+        terminal=True,
+    )
+    return owner
+
+
+def acknowledge(source, reservation, delivery, owner) -> None:
+    source._ack_consumer(reservation, delivery, owner)
+
+
+def abort_consumer(source, reservation, owner) -> None:
+    source._abort_consumer(reservation, owner, lambda: None)
+
+
 def test_exact_reservation_retains_every_event_until_ordered_ack():
     source, producer = stream(events=4)
     reservation = source.reserve(
@@ -111,16 +176,18 @@ def test_exact_reservation_retains_every_event_until_ordered_ack():
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
+    owner = bind_terminal_consumer(source, reservation)
     emitted = [emit(producer, float(index)) for index in range(4)]
 
     assert cursor.next().envelope.event_id == emitted[0].event_id
     for expected in emitted:
         delivery = cursor.next(timeout=0.1)
         assert delivery.envelope is expected
-        delivery.ack()
+        acknowledge(source, reservation, delivery, owner)
     with pytest.raises(StopIteration):
         cursor.next()
-    reservation.complete()
+    eos = producer.finish()
+    source._complete_consumer(reservation, eos, owner, lambda: None)
     assert reservation.state is ReservationState.COMPLETED
     reservation.release()
     assert source.retained_bytes <= 32
@@ -146,6 +213,7 @@ def test_exact_backlog_fails_before_overwrite_and_monitor_still_overwrites():
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
+    owner = bind_terminal_consumer(source, reservation)
     monitor = source.monitor(max_events=2, max_bytes=16)
     for index in range(3):
         emit(producer, float(index))
@@ -153,12 +221,12 @@ def test_exact_backlog_fails_before_overwrite_and_monitor_still_overwrites():
         emit(producer, 3.0)
 
     first = cursor.next()
-    first.ack()
+    acknowledge(source, reservation, first, owner)
     fourth = emit(producer, 3.0)
     update = monitor.latest()
     assert update.envelope is fourth
     assert update.missed == 3
-    reservation.abort()
+    abort_consumer(source, reservation, owner)
     reservation.release()
     monitor.close()
 
@@ -188,6 +256,247 @@ def test_reservation_admission_is_atomic_over_event_and_byte_capacity():
             max_inflight_bytes=8,
             trace_binding=TRACE_BINDING,
         )
+
+
+def test_unbound_exact_emit_is_side_effect_free_and_zero_event_preflight_is_retryable():
+    source, producer = stream(events=1)
+    reservation = source.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=8,
+        trace_binding=TRACE_BINDING,
+    )
+    reservation.activate()
+    with pytest.raises(ReservationStateError, match="formal consumer"):
+        emit(producer, 0.0)
+    assert source.retained_events == 0
+    assert source._next_sequence == 0
+    assert reservation.acknowledged_sequence == 0
+    reservation.abort()
+    reservation.release()
+
+    replacement = source.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=8,
+        trace_binding=TRACE_BINDING,
+    )
+    replacement.abort()
+    replacement.release()
+
+
+def test_failed_preclaim_is_retryable_but_first_data_tombstones_generation():
+    source, producer = stream(events=1)
+    reservation = source.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=8,
+        trace_binding=TRACE_BINDING,
+    )
+    reservation.activate()
+    with pytest.raises(ValueError, match="digest"):
+        source._claim_consumer(
+            reservation,
+            object(),
+            source_contract_digest="not-a-digest",
+            source_schedule_digest="4" * 64,
+            source_key_sequence_digest="5" * 64,
+            chain_contract_digest="6" * 64,
+            terminal=True,
+        )
+    reservation.abort()
+    reservation.release()
+
+    claimed = source.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=8,
+        trace_binding=TRACE_BINDING,
+    )
+    claimed.activate()
+    owner = bind_terminal_consumer(source, claimed)
+    emit(producer, 0.0)
+    abort_consumer(source, claimed, owner)
+    claimed.release()
+    with pytest.raises(
+        ReservationCapacityExceeded,
+        match="already had its formal exact consumer",
+    ):
+        source.reserve(
+            total_events=1,
+            max_inflight_events=1,
+            max_inflight_bytes=8,
+            trace_binding=TRACE_BINDING,
+        )
+
+
+def test_zero_event_rebind_gate_blocks_loose_emit_and_survives_failed_replacement():
+    source, producer = stream(events=1)
+    abandoned = source.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=8,
+        trace_binding=TRACE_BINDING,
+    )
+    abandoned.activate()
+    owner = bind_terminal_consumer(source, abandoned)
+    abort_consumer(source, abandoned, owner)
+    abandoned.release()
+
+    assert source._formal_rebind_required
+    with pytest.raises(ReservationStateError, match="live bound reservation"):
+        emit(producer, 0.0)
+    with pytest.raises(StreamEndedEarly, match="replacement binding"):
+        producer.finish()
+
+    failed = source.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=8,
+        trace_binding=TRACE_BINDING,
+    )
+    failed.activate()
+    with pytest.raises(ValueError, match="digest"):
+        source._claim_consumer(
+            failed,
+            object(),
+            source_contract_digest="not-a-digest",
+            source_schedule_digest="4" * 64,
+            source_key_sequence_digest="5" * 64,
+            chain_contract_digest="6" * 64,
+            terminal=True,
+        )
+    failed.abort()
+    failed.release()
+    assert source._formal_rebind_required
+    with pytest.raises(ReservationStateError, match="live bound reservation"):
+        emit(producer, 0.0)
+
+    replacement = source.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=8,
+        trace_binding=TRACE_BINDING,
+    )
+    replacement.activate()
+    replacement_owner = bind_terminal_consumer(source, replacement)
+    assert not source._formal_rebind_required
+    assert emit(producer, 0.0).sequence == 0
+    abort_consumer(source, replacement, replacement_owner)
+    replacement.release()
+    assert producer.finish().end_sequence == 1
+
+
+def test_zero_event_release_and_emit_are_serialized_without_an_authority_gap():
+    source, producer = stream(events=1)
+    reservation = source.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=8,
+        trace_binding=TRACE_BINDING,
+    )
+    reservation.activate()
+    owner = bind_terminal_consumer(source, reservation)
+    abort_consumer(source, reservation, owner)
+
+    barrier = threading.Barrier(3)
+    emit_errors: list[BaseException] = []
+    release_errors: list[BaseException] = []
+
+    def release() -> None:
+        barrier.wait()
+        try:
+            reservation.release()
+        except BaseException as error:
+            release_errors.append(error)
+
+    def publish() -> None:
+        barrier.wait()
+        try:
+            emit(producer, 0.0)
+        except BaseException as error:
+            emit_errors.append(error)
+
+    release_thread = threading.Thread(target=release)
+    emit_thread = threading.Thread(target=publish)
+    release_thread.start()
+    emit_thread.start()
+    barrier.wait()
+    release_thread.join(2.0)
+    emit_thread.join(2.0)
+
+    assert not release_thread.is_alive() and not emit_thread.is_alive()
+    assert release_errors == []
+    assert len(emit_errors) == 1
+    assert isinstance(emit_errors[0], ReservationStateError)
+    assert source.next_sequence == 0
+    assert source._formal_rebind_required
+
+
+def test_formal_interval_rejects_extra_or_post_failure_emit_and_short_finish():
+    source, producer = stream(events=2)
+    reservation = source.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=8,
+        trace_binding=TRACE_BINDING,
+    )
+    reservation.activate()
+    owner = bind_terminal_consumer(source, reservation)
+    assert emit(producer, 0.0).sequence == 0
+    with pytest.raises(ReservationStateError, match="live bound reservation"):
+        emit(producer, 1.0)
+    abort_consumer(source, reservation, owner)
+    reservation.release()
+    with pytest.raises(ReservationStateError, match="live bound reservation"):
+        emit(producer, 1.0)
+    assert producer.finish().end_sequence == 1
+
+    short_source, short_producer = stream(events=2)
+    short = short_source.reserve(
+        total_events=2,
+        max_inflight_events=2,
+        max_inflight_bytes=16,
+        trace_binding=TRACE_BINDING,
+    )
+    short.activate()
+    short_owner = bind_terminal_consumer(short_source, short)
+    emit(short_producer, 0.0)
+    with pytest.raises(StreamEndedEarly, match="frozen interval"):
+        short_producer.finish()
+    abort_consumer(short_source, short, short_owner)
+    short.release()
+
+
+@pytest.mark.parametrize(
+    "wrong_trace",
+    (
+        TraceContext("wrong-run", "camera-one", "capture"),
+        TraceContext("run-one", "wrong-source", "capture"),
+    ),
+)
+def test_formal_emit_rejects_wrong_trace_without_publication(wrong_trace):
+    source, producer = stream(events=1)
+    reservation = source.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=8,
+        trace_binding=TRACE_BINDING,
+    )
+    reservation.activate()
+    owner = bind_terminal_consumer(source, reservation)
+    with pytest.raises(StreamError, match="formal run/source"):
+        producer.emit(
+            scalar_value(0.0),
+            captured_at=0.0,
+            trace=wrong_trace,
+            join_key=(0, 0),
+        )
+    assert source.next_sequence == 0
+    assert source.retained_events == 0
+    assert reservation.acknowledged_sequence == 0
+    abort_consumer(source, reservation, owner)
+    reservation.release()
 
 
 def test_stream_rejects_materialized_dataset_payloads():
@@ -331,6 +640,7 @@ def test_non_backpressure_overrun_permanently_poisons_generation():
         trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
+    bind_terminal_consumer(source, reservation)
     emit(producer, 10.0)
     with pytest.raises(RetentionOverrun):
         emit(producer, 20.0)

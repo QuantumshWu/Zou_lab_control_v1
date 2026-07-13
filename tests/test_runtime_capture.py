@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pytest
@@ -46,10 +46,9 @@ from zlc_neutral_atom.runtime.dataset import (
     DatasetCellAddress,
     DatasetCellKeyContract,
     DatasetMode,
+    FrozenDatasetEdge,
     SealedDatasetArtifact,
     dataset_cell_key_fingerprint,
-    dataset_cell_permutation_digest,
-    dataset_consumer_contract_digest,
 )
 from zlc_neutral_atom.runtime.ports import (
     DeviceBroker,
@@ -457,13 +456,20 @@ class CaptureHarness:
             self.holder.update(reservation=reservation, cursor=cursor)
             builder = None
             if build_materializer:
+                materializer_edge = (
+                    self.contract.dataset_edge
+                    if materializer_cells is None and materializer_adapter is None
+                    else FrozenDatasetEdge(
+                        self.contract.dataset_schema,
+                        materializer_adapter or self.contract.event_adapter,
+                        materializer_cells or self.contract.expected_cells,
+                    )
+                )
                 builder = DatasetBuilder(
                     BlockId("capture"),
                     reservation,
-                    self.contract.dataset_schema,
+                    materializer_edge,
                     DatasetMode.FINITE_EXACT,
-                    event_adapter=materializer_adapter or self.contract.event_adapter,
-                    expected_cells=materializer_cells or self.contract.expected_cells,
                 )
                 self.holder["builder"] = builder
                 session.bind_exact_consumer(builder.exact_readiness())
@@ -623,8 +629,9 @@ def processor_capture_harness(
     item: CaptureHarness,
     *,
     operator=identity_camera_payload,
+    run_id: str = "processor-capture-run",
 ) -> ProcessorCaptureHarness:
-    trace = TraceBinding("processor-capture-run", item.contract.source_id)
+    trace = TraceBinding(run_id, item.contract.source_id)
     session = item.port.open_session(item.contract, trace, item.spec)
     reservation = session.reserve_exact()
     input_cursor = reservation.activate()
@@ -648,16 +655,14 @@ def processor_capture_harness(
             item.contract.total_events
             * item.contract.payload_contract.max_retained_nbytes
         ),
-        trace_binding=TraceBinding("processor-capture-run", "camera-processor"),
+        trace_binding=TraceBinding(run_id, "camera-processor"),
     )
     output_cursor = output_reservation.activate()
     builder = DatasetBuilder(
         BlockId("processed-camera"),
         output_reservation,
-        item.contract.dataset_schema,
+        item.contract.dataset_edge,
         DatasetMode.FINITE_EXACT,
-        event_adapter=item.contract.event_adapter,
-        expected_cells=item.contract.expected_cells,
     )
     definition = StreamProcessorDefinition(
         DefinitionKey("tests", "identity-camera", 1),
@@ -681,18 +686,7 @@ def processor_capture_harness(
         bound,
         reservation,
         input_cursor,
-        source_schema=item.contract.dataset_schema,
-        source_contract_digest=dataset_consumer_contract_digest(
-            item.contract.dataset_schema,
-            item.contract.expected_cells,
-            item.contract.event_adapter.metadata_contract.fingerprint,
-            item.contract.event_adapter.operator_fingerprint,
-        ),
-        source_schedule_digest=dataset_cell_permutation_digest(
-            item.contract.dataset_schema,
-            item.contract.expected_cells,
-        ),
-        expected_keys=item.contract.expected_cells,
+        input_edge=item.contract.dataset_edge,
         output_producer=output_producer,
         output_cursor=output_cursor,
         output_builder=builder,
@@ -710,7 +704,7 @@ def emit_processor_capture_source(
             payload,
             captured_at=payload.captured_at,
             trace=TraceContext(
-                "processor-capture-run",
+                processor.session._trace_binding.run_id,
                 item.contract.source_id,
                 payload.correlation_id,
             ),
@@ -811,10 +805,8 @@ def test_prepare_revalidates_stale_readiness_before_hardware_command(invalidatio
         builder = DatasetBuilder(
             BlockId("stale-readiness"),
             reservation,
-            item.contract.dataset_schema,
+            item.contract.dataset_edge,
             DatasetMode.FINITE_EXACT,
-            event_adapter=item.contract.event_adapter,
-            expected_cells=item.contract.expected_cells,
         )
         item.holder["builder"] = builder
         session.bind_exact_consumer(builder.exact_readiness())
@@ -1130,7 +1122,7 @@ def test_capture_contract_rejects_mutable_state_hidden_in_frozen_owner():
 
     payload = StatefulPayloadContract(item.contract.dataset_schema.cell_schema)
     adapter = CameraEventAdapter(payload, FrameMetadataContract())
-    with pytest.raises(TypeError, match="declarative data"):
+    with pytest.raises(TypeError, match="intrinsically immutable"):
         CaptureStreamContract(
             stream_id=item.contract.stream_id,
             source_id=item.contract.source_id,
@@ -1180,6 +1172,86 @@ def test_minimal_pipeline_compiles_to_one_flat_run_and_returns_typed_result():
             object(),
             result.dataset,
             result.capture_terminal,
+            result.aggregate_peak_bytes,
+            result.memory_profile_fingerprint,
+        )
+
+
+def test_pipeline_result_cross_binds_processed_root_span_and_stage_chain():
+    from zlc_neutral_atom.runtime.pipeline import _PIPELINE_RESULT_TOKEN
+
+    item = harness(points=2)
+    holder = {}
+    base = item.plan()
+
+    def preflight(context: RunContext):
+        processor = processor_capture_harness(item, run_id=context.run_id.value)
+        processor.worker.start()
+        processor.session.bind_exact_consumer(processor.worker.exact_readiness())
+        holder["processor"] = processor
+        return processor
+
+    def execute(context: RunContext, processor: ProcessorCaptureHarness):
+        try:
+            processor.session.prepare(context)
+            processor.session.start(context)
+            for _ in item.contract.expected_cells:
+                processor.session.capture_next(context)
+            completion = processor.session.complete(context)
+            dataset = processor.worker.finish(completion.eos, 2.0)
+            return PipelineResult(
+                _PIPELINE_RESULT_TOKEN,
+                dataset,
+                completion,
+                1,
+                "e" * 64,
+            )
+        except BaseException as error:
+            processor.session.fail(error)
+            raise
+
+    def cleanup(context: RunContext, processor, _primary):
+        if processor is None:
+            return item.port.verify_idle(context)
+        processor.worker.close(2.0)
+        return processor.session.cleanup(context)
+
+    plan = RunPlan(
+        **{
+            **base.__dict__,
+            "preflight": preflight,
+            "execute": execute,
+            "cleanup": cleanup,
+            "finalize": lambda _context, result: result,
+        }
+    )
+    result = RunController(ResourceArbiter(MemoryQuarantineJournal())).start(plan).result(2.0)
+    assert not result.is_direct_raw_capture
+    derivation = result.dataset.provenance.derivation
+    assert derivation is not None
+    assert derivation.chain_contract_digest == result.chain_contract_digest
+    assert derivation.root_input_span == result._capture_completion.source_event_span
+    assert derivation.root_input_span.stream_id == holder["processor"].session.stream.stream_id
+    assert derivation.root_input_span.count == item.contract.total_events
+    assert len(derivation.stages) == 1
+
+    wrong_digest = (
+        "0" * 64 if derivation.root_input_span.ordered_digest != "0" * 64 else "1" * 64
+    )
+    readiness = holder["processor"].session._exact_consumer_readiness
+    assert readiness is not None
+    forged_dataset = result.dataset._with_derivation(
+        readiness,
+        replace(derivation.root_input_span, ordered_digest=wrong_digest),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="derivation differs from capture readiness chain",
+    ):
+        PipelineResult(
+            _PIPELINE_RESULT_TOKEN,
+            forged_dataset,
+            result._capture_completion,
             result.aggregate_peak_bytes,
             result.memory_profile_fingerprint,
         )
