@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-import math
 
 import numpy as np
 
@@ -26,7 +25,12 @@ from zlc_data import (
     ValuePayloadContract,
     ValueSchema,
 )
-from zlc_storage import canonical_digest
+from zlc_storage import (
+    canonical_digest,
+    canonical_text as _canonical_text,
+    positive_real as _positive_seconds,
+    sha256_text as _sha256,
+)
 
 from zlc_neutral_atom.acquisition.camera import (
     CameraDatasetEventAdapter,
@@ -98,37 +102,10 @@ _OCCUPANCY_EXECUTION_GUARD_SCHEMA = (
 )
 
 
-def _canonical_text(value: object, field_name: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field_name} must be canonical non-empty text")
-    return value
-
-
 def _optional_canonical_text(value: object, field_name: str) -> str | None:
     if value is None:
         return None
     return _canonical_text(value, field_name)
-
-
-def _sha256(value: object, field_name: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{field_name} must be a lowercase SHA-256 digest")
-    return value
-
-
-def _positive_seconds(value: object, field_name: str) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-        or float(value) <= 0.0
-    ):
-        raise ValueError(f"{field_name} must be finite and positive")
-    return float(value)
 
 
 def _model(value: object) -> ReadoutModel:

@@ -9,18 +9,24 @@ import uuid
 import weakref
 from dataclasses import dataclass, field
 from enum import Enum
-from numbers import Integral
 from typing import Protocol, TypeVar
 
 import numpy as np
-from zlc_storage import canonical_digest
+from zlc_storage import (
+    canonical_digest,
+    canonical_text as _canonical_text,
+    exact_mapping as _exact_tree,
+    nonnegative_integer as _nonnegative_int,
+    positive_integer as _positive_int,
+    positive_real as _positive_finite,
+    sha256_text as _sha256,
+)
 
 from zlc_data import (
     AxisId,
     CoordinateFrameId,
     DatasetSchema,
     StreamGenerationId,
-    ValuePayloadContract,
 )
 from zlc_neutral_atom.readout.contracts import (
     CameraCaptureDescriptor,
@@ -68,46 +74,6 @@ from .streams import (
 PayloadT = TypeVar("PayloadT")
 _COMPLETION_TOKEN = object()
 _PROCESSOR_INPUT_BINDING_TOKEN = object()
-
-
-def _canonical_text(value: str, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
-
-
-def _sha256(value: str, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
-    return value
-
-
-def _nonnegative_int(value: int, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
-        raise ValueError(f"{field} must be a non-negative integer")
-    return int(value)
-
-
-def _positive_int(value: int, field: str) -> int:
-    value = _nonnegative_int(value, field)
-    if value == 0:
-        raise ValueError(f"{field} must be positive")
-    return value
-
-
-def _positive_finite(value: float, field: str) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-        or float(value) <= 0
-    ):
-        raise ValueError(f"{field} must be finite and positive")
-    return float(value)
 
 
 def _integer_pair(
@@ -325,14 +291,6 @@ def camera_physical_facts_to_tree(value: CameraPhysicalFacts) -> dict[str, objec
             value.opaque_frame_settings_fingerprint
         ),
     }
-
-
-def _exact_tree(tree: object, fields: set[str], schema: str) -> dict[str, object]:
-    if not isinstance(tree, dict) or set(tree) != fields:
-        raise ValueError(f"{schema} has an unknown field set")
-    if tree["schema"] != schema:
-        raise ValueError(f"expected {schema}, got {tree['schema']!r}")
-    return tree
 
 
 def camera_physical_facts_from_tree(tree: object) -> CameraPhysicalFacts:

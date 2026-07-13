@@ -8,12 +8,7 @@ from numbers import Integral
 from typing import Any
 
 import numpy as np
-
-
-def _nonempty_text(value: str, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be non-empty text without surrounding whitespace")
-    return value
+from zlc_storage.canonical import canonical_text as _nonempty_text
 
 
 @dataclass(frozen=True, order=True)

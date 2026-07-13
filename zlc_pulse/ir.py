@@ -5,45 +5,18 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from zlc_storage import canonical_digest
+from zlc_storage import (
+    canonical_digest,
+    canonical_text as _text,
+    integer as _integer,
+    positive_real as _positive_float,
+    sha256_text as _sha256,
+)
 
 
 TARGET_IR_SCHEMA = "zlc_pulse.TargetIR/v2"
 BUS_MODES = frozenset(("edge", "ramp"))
 SLOT_KINDS = frozenset(("duration", "dac"))
-
-
-def _text(value: object, field: str, *, empty: bool = False) -> str:
-    if not isinstance(value, str) or value.strip() != value or (not empty and not value):
-        raise ValueError(f"{field} must be canonical text")
-    return value
-
-
-def _integer(value: object, field: str, *, nonnegative: bool = False) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"{field} must be an integer")
-    if nonnegative and value < 0:
-        raise ValueError(f"{field} must be non-negative")
-    return value
-
-
-def _positive_float(value: object, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{field} must be numeric")
-    normalized = float(value)
-    if not math.isfinite(normalized) or normalized <= 0:
-        raise ValueError(f"{field} must be finite and positive")
-    return normalized
-
-
-def _sha256(value: object, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
-    return value
 
 
 @dataclass(frozen=True)

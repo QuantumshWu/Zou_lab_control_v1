@@ -46,24 +46,13 @@ from zlc_pulse import (
     PulseTarget,
     load_pulse_document,
 )
+from zlc_storage import canonical_text as _text
+from zlc_storage import positive_integer as _positive_int
 from zlc_workbench._triggered_camera import (
     _TriggeredCameraLayout,
     _bind_triggered_camera_acquisition,
 )
 from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
-
-
-def _text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
-
-
-def _positive_int(value: object, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"{field} must be a positive integer")
-    return value
-
 
 class _ResourceCleanupError(RuntimeError):
     """Python-3.9-compatible report retaining every ordinary cleanup failure."""

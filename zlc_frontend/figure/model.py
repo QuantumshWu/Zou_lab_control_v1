@@ -9,34 +9,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from numbers import Integral, Number
+from numbers import Number
 from typing import Any
 
 import numpy as np
 
 from zlc_data import AxisId, AxisRoleId, DatasetRevisionRef, Selection
-
-
-def _text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be non-empty text without surrounding whitespace")
-    return value
-
-
-def _nonnegative(value: object, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
-        raise ValueError(f"{field} must be a non-negative integer")
-    return int(value)
-
-
-def _digest(value: object, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
-    return value
+from zlc_storage.canonical import (
+    canonical_text as _text,
+    nonnegative_integer as _nonnegative,
+    sha256_text as _digest,
+)
 
 
 def readonly_array(value: object, *, ndim: int | None = None) -> np.ndarray:

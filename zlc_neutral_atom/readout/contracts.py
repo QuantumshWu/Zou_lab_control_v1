@@ -9,8 +9,7 @@ row order is never treated as semantic correspondence.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-import math
-from numbers import Integral, Real
+from numbers import Integral
 
 import numpy as np
 
@@ -24,35 +23,14 @@ from zlc_data import (
     DatasetSchema,
     ValueSchema,
 )
-
-
-def _canonical_text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
-
-
-def _sha256(value: object, field: str, *, optional: bool = False) -> str | None:
-    if optional and value is None:
-        return None
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        suffix = " or None" if optional else ""
-        raise ValueError(f"{field} must be a lowercase SHA-256 digest{suffix}")
-    return value
-
-
-def _integer(value: object, field: str, *, positive: bool = False) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral):
-        raise TypeError(f"{field} must be an integer")
-    result = int(value)
-    if result < (1 if positive else 0):
-        comparison = "positive" if positive else "non-negative"
-        raise ValueError(f"{field} must be {comparison}")
-    return result
+from zlc_storage import (
+    canonical_text as _canonical_text,
+    nonnegative_integer as _nonnegative_integer,
+    nonnegative_real as _nonnegative_real,
+    positive_integer as _positive_integer,
+    positive_real as _positive_real,
+    sha256_text as _sha256,
+)
 
 
 def _pair(value: object, field: str, *, positive: bool) -> tuple[int, int]:
@@ -62,27 +40,11 @@ def _pair(value: object, field: str, *, positive: bool) -> tuple[int, int]:
         raise TypeError(f"{field} must be a two-integer tuple") from exc
     if len(pair) != 2:
         raise ValueError(f"{field} must have exactly two entries in Y,X order")
+    validator = _positive_integer if positive else _nonnegative_integer
     return tuple(
-        _integer(item, f"{field}[{index}]", positive=positive)
+        validator(item, f"{field}[{index}]")
         for index, item in enumerate(pair)
     )  # type: ignore[return-value]
-
-
-def _finite_real(
-    value: object,
-    field: str,
-    *,
-    positive: bool = False,
-) -> float:
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise TypeError(f"{field} must be a real number")
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{field} must be finite")
-    if (positive and result <= 0.0) or (not positive and result < 0.0):
-        comparison = "> 0" if positive else ">= 0"
-        raise ValueError(f"{field} must be {comparison}")
-    return result
 
 
 def _real_count_dtype(value: object, field: str) -> np.dtype:
@@ -209,13 +171,17 @@ class CameraEventReadoutSetting:
     opaque_frame_settings_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "event_index", _integer(self.event_index, "event_index"))
+        object.__setattr__(
+            self,
+            "event_index",
+            _nonnegative_integer(self.event_index, "event_index"),
+        )
         object.__setattr__(
             self,
             "exposure_seconds",
-            _finite_real(self.exposure_seconds, "exposure_seconds", positive=True),
+            _positive_real(self.exposure_seconds, "exposure_seconds"),
         )
-        object.__setattr__(self, "gain", _finite_real(self.gain, "gain"))
+        object.__setattr__(self, "gain", _nonnegative_real(self.gain, "gain"))
         _canonical_text(self.readout_mode, "readout_mode")
         _sha256(
             self.opaque_frame_settings_fingerprint,
@@ -301,7 +267,7 @@ class CameraCaptureDescriptor:
         return _output_shape(self.roi_shape_yx, self.binning_yx)
 
     def setting(self, event_index: int) -> CameraEventReadoutSetting:
-        index = _integer(event_index, "event_index")
+        index = _nonnegative_integer(event_index, "event_index")
         for setting in self.event_settings:
             if setting.event_index == index:
                 return setting
@@ -373,8 +339,8 @@ class CalibrationCaptureBracket:
             raise ValueError("context_key axis ids must be unique")
         references = tuple(
             (
-                _integer(event_index, "reference event index"),
-                _integer(storage_row, "reference point storage row"),
+                _nonnegative_integer(event_index, "reference event index"),
+                _nonnegative_integer(storage_row, "reference point storage row"),
             )
             for event_index, storage_row in self.reference_point_storage_rows
         )
@@ -389,7 +355,10 @@ class CalibrationCaptureBracket:
         object.__setattr__(
             self,
             "readout_point_storage_row",
-            _integer(self.readout_point_storage_row, "readout point storage row"),
+            _nonnegative_integer(
+                self.readout_point_storage_row,
+                "readout point storage row",
+            ),
         )
 
 
@@ -405,7 +374,7 @@ class CalibrationCaptureLayout:
         if not isinstance(self.readout_event_axis_id, AxisId):
             raise TypeError("readout_event_axis_id must be AxisId")
         references = tuple(
-            _integer(index, "reference_event_indices entry")
+            _nonnegative_integer(index, "reference_event_indices entry")
             for index in self.reference_event_indices
         )
         if not references:
@@ -413,7 +382,10 @@ class CalibrationCaptureLayout:
         if len(set(references)) != len(references):
             raise ValueError("reference_event_indices must be unique")
         references = tuple(sorted(references))
-        readout = _integer(self.readout_event_index, "readout_event_index")
+        readout = _nonnegative_integer(
+            self.readout_event_index,
+            "readout_event_index",
+        )
         if readout in references:
             raise ValueError("reference and readout event indices must be disjoint")
         object.__setattr__(self, "reference_event_indices", references)
@@ -527,7 +499,7 @@ class CalibrationCaptureLayout:
         """Return raw rows for diagnostics only; this is not a pairing interface."""
 
         event_position, axis = self._axis_position(schema)
-        index = _integer(event_index, "event_index")
+        index = _nonnegative_integer(event_index, "event_index")
         if index >= axis.size:
             raise ValueError("event_index is outside the READOUT_EVENT axis")
         return tuple(
@@ -586,9 +558,9 @@ class FrameContract:
         object.__setattr__(
             self,
             "exposure_seconds",
-            _finite_real(self.exposure_seconds, "exposure_seconds", positive=True),
+            _positive_real(self.exposure_seconds, "exposure_seconds"),
         )
-        object.__setattr__(self, "gain", _finite_real(self.gain, "gain"))
+        object.__setattr__(self, "gain", _nonnegative_real(self.gain, "gain"))
         _canonical_text(self.readout_mode, "readout_mode")
         _sha256(
             self.opaque_frame_settings_fingerprint,
@@ -656,7 +628,10 @@ class FrameContract:
         if not isinstance(descriptor, CameraCaptureDescriptor):
             raise TypeError("descriptor must be CameraCaptureDescriptor")
         descriptor.validate_schema(schema)
-        index = _integer(readout_event_index, "readout_event_index")
+        index = _nonnegative_integer(
+            readout_event_index,
+            "readout_event_index",
+        )
         event_axis = descriptor._event_axis(schema)
         if event_axis is None:
             if index != 0:

@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
-from numbers import Integral, Real
+from numbers import Real
 from typing import Any
 
 import numpy as np
 
-from zlc_storage.canonical import decode, encode
+from zlc_storage.canonical import (
+    canonical_text as _text,
+    decode,
+    encode,
+    exact_mapping as _exact_map,
+    integer as _integer,
+)
 
 from .axis import AxisId
 from .codec import TypedCodecError, axis_from_tree, axis_layout_from_tree, axis_layout_to_tree, axis_to_tree
@@ -327,29 +333,9 @@ def _revision_ref_from_tree(tree: Any) -> DatasetRevisionRef:
     )
 
 
-def _exact_map(tree: Any, fields: set[str], schema_id: str) -> dict[str, Any]:
-    if not isinstance(tree, dict) or set(tree) != fields:
-        raise ValueError(f"{schema_id} must contain exactly {sorted(fields)}")
-    if tree["schema"] != schema_id:
-        raise ValueError(f"expected schema {schema_id!r}")
-    return tree
-
-
 def _require_canonical(got: bytes, expected: bytes, schema_id: str) -> None:
     if bytes(got) != expected:
         raise TypedCodecError(f"{schema_id} payload uses a non-canonical typed representation")
-
-
-def _text(value: Any, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
-
-
-def _integer(value: Any, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral):
-        raise ValueError(f"{field} must be an integer")
-    return int(value)
 
 
 def _real(value: Any, field: str) -> float:

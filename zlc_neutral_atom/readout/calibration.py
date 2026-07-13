@@ -12,7 +12,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 import math
-from numbers import Integral, Real
 from typing import TypeAlias
 
 import numpy as np
@@ -29,7 +28,12 @@ from zlc_data import (
     expand_value_validity,
 )
 from zlc_data.codec import validity_to_tree
-from zlc_storage import canonical_digest
+from zlc_storage import (
+    canonical_digest,
+    canonical_text as _canonical_text,
+    nonnegative_integer as _nonnegative_integer,
+    sha256_text as _sha256,
+)
 
 from zlc_neutral_atom.capture_reference import CaptureArtifactRef
 
@@ -39,40 +43,6 @@ from .contracts import (
     FrameContract,
     ReadoutBindingKey,
 )
-
-
-def _canonical_text(value: object, field_name: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field_name} must be canonical non-empty text")
-    return value
-
-
-def _sha256(value: object, field_name: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{field_name} must be a lowercase SHA-256 digest")
-    return value
-
-
-def _nonnegative_integer(value: object, field_name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral):
-        raise TypeError(f"{field_name} must be an integer")
-    result = int(value)
-    if result < 0:
-        raise ValueError(f"{field_name} must be non-negative")
-    return result
-
-
-def _finite_float(value: object, field_name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise TypeError(f"{field_name} must be a real number")
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{field_name} must be finite")
-    return result
 
 
 def _immutable_array(

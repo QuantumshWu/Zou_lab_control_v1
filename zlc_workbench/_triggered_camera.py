@@ -39,17 +39,11 @@ from zlc_pulse import (
     bind_pulse_document_target,
     compile_pulse_artifact,
 )
+from zlc_storage import positive_integer as _positive_int
 
 from .camera_capture import CameraCaptureBindingRequest
 from .legacy_neutral_atom import LegacyNeutralAtomRuntime
 from .sequencer_execution import SequencerBindingRequest
-
-
-def _positive_int(value: object, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"{field} must be a positive integer")
-    return value
-
 
 def _canonical_grouping(
     value: tuple[tuple[int, int], ...] | None,

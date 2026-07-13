@@ -13,10 +13,49 @@ from zlc_storage.canonical import (
     CanonicalDecodeLimits,
     CanonicalEncodingError,
     CanonicalListEvent,
+    canonical_text,
     canonical_digest,
     decode,
     encode,
+    exact_mapping,
+    finite_real,
+    integer,
+    positive_integer,
+    sha256_text,
 )
+
+
+def test_canonical_scalar_validators_are_the_single_primitive_boundary():
+    digest = "ab" * 32
+
+    assert canonical_text("owner-id", "owner") == "owner-id"
+    assert canonical_text("", "optional label", empty=True) == ""
+    assert sha256_text(digest, "digest") == digest
+    assert sha256_text(None, "digest", optional=True) is None
+    assert integer(np.int64(3), "count") == 3
+    assert positive_integer(2, "count") == 2
+    assert finite_real(np.float64(-0.0), "value") == 0.0
+
+    with pytest.raises(ValueError):
+        canonical_text(" padded ", "owner")
+    with pytest.raises(ValueError):
+        sha256_text(digest.upper(), "digest")
+    with pytest.raises(TypeError):
+        integer(True, "count")
+    with pytest.raises(ValueError):
+        positive_integer(0, "count")
+    with pytest.raises(ValueError):
+        finite_real(float("nan"), "value")
+
+
+def test_exact_mapping_owns_field_and_discriminator_admission():
+    value = {"schema": "owner-format", "payload": 3}
+    assert exact_mapping(value, {"schema", "payload"}, "owner-format") is value
+
+    with pytest.raises(ValueError, match="exactly"):
+        exact_mapping({**value, "extra": 4}, {"schema", "payload"}, "owner-format")
+    with pytest.raises(ValueError, match="expected schema"):
+        exact_mapping(value, {"schema", "payload"}, "other-format")
 
 
 def test_mapping_order_and_sequence_container_do_not_change_bytes():

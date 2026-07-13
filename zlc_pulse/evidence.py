@@ -16,7 +16,12 @@ from fpga.pulse_streamer.host.image import (
     STATUS_ERROR,
     STATUS_UNDERFLOW,
 )
-from zlc_storage import canonical_digest
+from zlc_storage import (
+    canonical_digest,
+    canonical_text as _text,
+    nonnegative_integer as _nonnegative_int,
+    sha256_text as _sha256,
+)
 
 from .artifact import CompiledPulseArtifact, PulseExecutionForm
 
@@ -36,12 +41,6 @@ AUTONOMOUS_TABLE_READ_RECIPE = "STATUS_CURSOR_STATUS_CURSOR/v1"
 POST_TERMINAL_TAIL_WAIT_RECIPE = "HOST_MONOTONIC_AFTER_TERMINAL/v1"
 
 
-def _text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
-
-
 def _u32(value: object, field: str) -> int:
     if (
         isinstance(value, bool)
@@ -49,22 +48,6 @@ def _u32(value: object, field: str) -> int:
         or not 0 <= value <= 0xFFFFFFFF
     ):
         raise ValueError(f"{field} must be an unsigned 32-bit integer")
-    return value
-
-
-def _nonnegative_int(value: object, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{field} must be a non-negative integer")
-    return value
-
-
-def _sha256(value: object, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
     return value
 
 

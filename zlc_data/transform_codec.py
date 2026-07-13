@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from numbers import Integral
 from typing import Any
 
 import numpy as np
 
-from zlc_storage.canonical import decode, encode
+from zlc_storage.canonical import (
+    canonical_text as _text,
+    decode,
+    encode,
+    integer as _integer,
+)
 
 from .axis import AxisId
 from .codec import axis_from_tree, axis_layout_from_tree, axis_layout_to_tree, axis_to_tree
@@ -242,18 +246,6 @@ def decode_transform_record(payload: bytes) -> TransformRecord:
     if bytes(payload) != encode_transform_record(record):
         raise ValueError("TransformRecord payload uses a non-canonical typed representation")
     return record
-
-
-def _text(value: Any, field: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{field} must be non-empty text")
-    return value
-
-
-def _integer(value: Any, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral):
-        raise ValueError(f"{field} must be an integer")
-    return int(value)
 
 
 __all__ = [

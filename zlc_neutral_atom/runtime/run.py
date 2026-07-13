@@ -9,6 +9,7 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Generic, TypeVar
+from zlc_storage import canonical_text as _canonical_text
 
 from ._failure import (
     clear_exception_traceback,
@@ -66,12 +67,6 @@ PreparedT = TypeVar("PreparedT")
 ResultT = TypeVar("ResultT")
 CommitT = TypeVar("CommitT")
 _MISSING = object()
-
-
-def _canonical_text(value: str, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be non-empty text without surrounding whitespace")
-    return value
 
 
 def _validate_timeout(value: float | None, field: str) -> float | None:

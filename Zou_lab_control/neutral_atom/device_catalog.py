@@ -12,21 +12,8 @@ from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
 
-
-def _text(value: object, field: str) -> str:
-    normalized = str(value)
-    if not normalized or normalized.strip() != normalized:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return normalized
-
-
-def _positive_int(value: object, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"{field} must be int")
-    if value < 1:
-        raise ValueError(f"{field} must be positive")
-    return value
-
+from zlc_storage import canonical_text as _text
+from zlc_storage import positive_integer as _positive_int
 
 class InstallationAvailability(str, Enum):
     AVAILABLE = "available"

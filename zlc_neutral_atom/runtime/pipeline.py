@@ -7,9 +7,13 @@ import hashlib
 import struct
 import sys
 from dataclasses import dataclass
-from numbers import Integral
 
 from zlc_data import BlockId, DatasetSchema, ValidityMode
+from zlc_storage import (
+    canonical_text as _canonical_text,
+    positive_integer as _positive_int,
+    sha256_text,
+)
 
 from zlc_neutral_atom.catalog import DefinitionCatalog, DefinitionKey
 from zlc_neutral_atom.camera_operator import (
@@ -44,25 +48,6 @@ from .streams import (
 )
 
 
-def _canonical_text(value: str, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
-
-
-def _nonnegative_int(value: int, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
-        raise ValueError(f"{field} must be a non-negative integer")
-    return int(value)
-
-
-def _positive_int(value: int, field: str) -> int:
-    normalized = _nonnegative_int(value, field)
-    if normalized == 0:
-        raise ValueError(f"{field} must be positive")
-    return normalized
-
-
 @dataclass(frozen=True)
 class MeasurementDefinition:
     """Pure catalog metadata; domain composition constructs BoundMeasurement."""
@@ -83,13 +68,7 @@ class MeasurementDefinition:
             "capture_spec_owner_fingerprint",
             "output_schema_fingerprint",
         ):
-            value = getattr(self, field)
-            if (
-                not isinstance(value, str)
-                or len(value) != 64
-                or any(character not in "0123456789abcdef" for character in value)
-            ):
-                raise ValueError(f"{field} must be a lowercase SHA-256 digest")
+            sha256_text(getattr(self, field), field)
 
 
 @dataclass(frozen=True)

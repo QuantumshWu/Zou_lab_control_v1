@@ -14,17 +14,10 @@ from types import MappingProxyType
 from typing import Mapping
 
 from zlc_neutral_atom.runtime import DeviceIdentityEvidenceKind, ResourceKey
-from zlc_storage import canonical_digest
+from zlc_storage import canonical_digest, canonical_text as _canonical_text
 
 
 ASSET_MAP_SCHEMA_VERSION = 1
-
-
-def _canonical_text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
-
 
 def adapter_kind(device: object) -> str:
     cls = type(device)

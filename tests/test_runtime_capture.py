@@ -1318,7 +1318,7 @@ def test_capability_probe_excludes_run_open_for_its_entire_epoch():
 
 
 def test_terminal_ack_rejects_bool_counts_and_truthy_non_bool_flags():
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError):
         CaptureTerminalAck(
             "s", "b", "g", True, 1, True, True, True, SHA_A, SHA_B, SHA_C, SHA_D
         )

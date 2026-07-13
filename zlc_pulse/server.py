@@ -9,7 +9,13 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from fpga.pulse_streamer.host.image import StreamerParams, build_fingerprint
-from zlc_storage import canonical_digest, decode, encode
+from zlc_storage import (
+    canonical_digest,
+    canonical_text as _text,
+    decode,
+    encode,
+    sha256_text as _sha256,
+)
 
 from .artifact import (
     CompiledPulseArtifact,
@@ -647,22 +653,6 @@ def serve_pulse_execution_service(
     if start:
         server.start()
     return server
-
-
-def _text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
-
-
-def _sha256(value: object, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
-    return value
 
 
 __all__ = [

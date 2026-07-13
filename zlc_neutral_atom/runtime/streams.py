@@ -11,11 +11,19 @@ import weakref
 from collections import deque
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
-from numbers import Integral
 from typing import Callable, Generic, Protocol, TypeVar
 
 from zlc_data import DataBlock, DataPatch, StreamGenerationId
-from zlc_storage import canonical_digest, decode, encode, sha256_digest
+from zlc_storage import (
+    canonical_digest,
+    canonical_text as _canonical_text,
+    decode,
+    encode,
+    nonnegative_integer as _nonnegative_int,
+    positive_integer as _positive_int,
+    sha256_digest,
+    sha256_text as _digest,
+)
 
 
 PayloadT = TypeVar("PayloadT")
@@ -56,32 +64,6 @@ class JoinKeyContract(Protocol):
     def snapshot(self, key: object) -> object: ...
 
     def validate(self, key: object) -> None: ...
-
-
-def _canonical_text(value: str, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
-
-
-def _digest(value: str, field: str) -> str:
-    value = _canonical_text(value, field)
-    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
-        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
-    return value
-
-
-def _nonnegative_int(value: int, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
-        raise ValueError(f"{field} must be a non-negative integer")
-    return int(value)
-
-
-def _positive_int(value: int, field: str) -> int:
-    value = _nonnegative_int(value, field)
-    if value == 0:
-        raise ValueError(f"{field} must be positive")
-    return value
 
 
 def _finite_time(value: float, field: str) -> float:

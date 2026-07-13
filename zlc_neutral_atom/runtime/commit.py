@@ -11,23 +11,15 @@ from pathlib import Path
 from typing import Callable, Generic, Protocol, TypeVar
 
 from zlc_storage.framed_journal import FramedJournal
-from zlc_storage import RepositoryRootLease, RepositoryRootLeaseBorrow
+from zlc_storage import (
+    RepositoryRootLease,
+    RepositoryRootLeaseBorrow,
+    canonical_text as _canonical,
+    sha256_text as _sha256,
+)
 
 
 CommitT = TypeVar("CommitT")
-
-
-def _canonical(value: str, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
-
-
-def _sha256(value: str, field: str) -> str:
-    value = _canonical(value, field)
-    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
-        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
-    return value
 
 
 class CommitKind(str, Enum):

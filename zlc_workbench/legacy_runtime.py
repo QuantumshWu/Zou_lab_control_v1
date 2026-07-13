@@ -33,27 +33,12 @@ from zlc_neutral_atom.runtime import (
     RunMode,
     RunPlan,
     RunSnapshot,
-    RunStartRejected,
-    RunState,
     SafeStateAck,
     SafetyDecision,
     SafetyOperation,
 )
-
-
-def _positive_timeout(value: object, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{field} must be a finite positive number")
-    normalized = float(value)
-    if not math.isfinite(normalized) or normalized <= 0:
-        raise ValueError(f"{field} must be a finite positive number")
-    return normalized
-
-
-def _canonical_text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
+from zlc_storage import canonical_text as _canonical_text
+from zlc_storage import positive_real as _positive_timeout
 
 
 class LegacyDeviceNotRegistered(RuntimeError):

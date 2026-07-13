@@ -8,7 +8,11 @@ from importlib.resources import files
 from pathlib import Path
 import re
 
-from zlc_storage import canonical_digest
+from zlc_storage import (
+    canonical_digest,
+    canonical_text as _text,
+    integer as _integer,
+)
 
 
 PULSE_TARGET_SCHEMA = "zlc_pulse.PulseTarget/v1"
@@ -19,21 +23,6 @@ PORT_KINDS = (PORT_DIGITAL, PORT_DAC, PORT_CLOCK)
 DAC_OFFSET_BINARY = "offset_binary"
 _BUS_LABEL = re.compile(r"(?P<base>.+)\[(?P<bit>\d+)\]")
 _DAC_CLOCK = re.compile(r"da_clk(?P<index>\d+)", re.IGNORECASE)
-
-
-def _text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
-
-
-def _integer(value: object, field: str, *, optional: bool = False) -> int | None:
-    if optional and value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int):
-        suffix = " or None" if optional else ""
-        raise TypeError(f"{field} must be an integer{suffix}")
-    return value
 
 
 @dataclass(frozen=True)

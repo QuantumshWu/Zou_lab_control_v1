@@ -14,10 +14,13 @@ from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 
-from zlc_storage import canonical_digest
+from zlc_storage import (
+    canonical_digest,
+    canonical_text as _text,
+    integer as _integer,
+)
 
 from .target import (
-    PORT_CLOCK,
     PORT_DAC,
     PORT_DIGITAL,
     PulseTarget,
@@ -40,13 +43,6 @@ ANALOG_MODES = frozenset(("edge", "ramp"))
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
-def _text(value: object, field: str, *, empty: bool = False) -> str:
-    if not isinstance(value, str) or value.strip() != value or (not empty and not value):
-        qualifier = "canonical text" if empty else "canonical non-empty text"
-        raise ValueError(f"{field} must be {qualifier}")
-    return value
-
-
 def _identifier(value: object, field: str) -> str:
     result = _text(value, field)
     if _IDENTIFIER.fullmatch(result) is None:
@@ -62,14 +58,6 @@ def _number(value: object, field: str) -> int | float:
     if isinstance(value, int) or float(value).is_integer():
         return int(value)
     return float(value)
-
-
-def _integer(value: object, field: str, *, minimum: int | None = None) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"{field} must be an integer")
-    if minimum is not None and value < minimum:
-        raise ValueError(f"{field} must be at least {minimum}")
-    return value
 
 
 def _time_unit(value: object, field: str) -> str:

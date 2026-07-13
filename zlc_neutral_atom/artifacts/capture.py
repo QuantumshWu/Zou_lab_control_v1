@@ -35,9 +35,13 @@ from zlc_storage import (
     ContentSizeLimitError,
     ContentStoreAuthority,
     RepositoryRootLease,
+    canonical_text as _canonical_text,
     decode,
     encode,
+    exact_mapping as _exact_map,
+    nonnegative_integer as _integer,
     sha256_digest,
+    sha256_text as _sha256,
 )
 
 from zlc_neutral_atom.acquisition import (
@@ -293,28 +297,6 @@ class AdmittedCapture:
     def evidence_digest(self) -> str:
         self._require_authority()
         return self._evidence_digest
-
-
-def _canonical_text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
-
-
-def _sha256(value: object, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
-    return value
-
-
-def _integer(value: object, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{field} must be a non-negative integer")
-    return value
 
 
 @dataclass(frozen=True)
@@ -1937,14 +1919,6 @@ def _terminal_from_tree(tree: object) -> CaptureTerminalAck:
     if not isinstance(tree, dict) or set(tree) != fields:
         raise ValueError("capture terminal has an unknown field set")
     return CaptureTerminalAck(**tree)
-
-
-def _exact_map(tree: object, fields: set[str], schema: str) -> dict:
-    if not isinstance(tree, dict) or set(tree) != fields:
-        raise ValueError(f"{schema} has an unknown field set")
-    if tree["schema"] != schema:
-        raise ValueError(f"expected {schema}, got {tree['schema']!r}")
-    return tree
 
 
 __all__ = [

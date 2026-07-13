@@ -9,7 +9,6 @@ separate ScanOutputContract for those physical x-axis semantics.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from numbers import Integral
 
 from zlc_data import (
     AxisId,
@@ -25,7 +24,14 @@ from zlc_pulse import (
     PulseExecutionForm,
     digital_trigger_schedule_to_tree,
 )
-from zlc_storage import canonical_digest, decode, encode
+from zlc_storage import (
+    canonical_digest,
+    canonical_text as _text,
+    decode,
+    encode,
+    nonnegative_integer as _index,
+    sha256_text as _digest,
+)
 
 from zlc_neutral_atom.runtime.dataset import (
     DatasetCellAddress,
@@ -36,28 +42,6 @@ from zlc_neutral_atom.runtime.dataset import (
 COMPILED_CAPTURE_CELL_PLAN_SCHEMA = (
     "zlc_neutral_atom.CompiledCaptureCellPlan/v1"
 )
-
-
-def _digest(value: object, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
-    return value
-
-
-def _text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
-
-
-def _index(value: object, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
-        raise ValueError(f"{field} must be a non-negative integer")
-    return int(value)
 
 
 @dataclass(frozen=True)

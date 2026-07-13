@@ -7,7 +7,13 @@ from typing import Any, Callable, TypeVar
 import numpy as np
 
 from zlc_data import AxisId, CoordinateFrameId, value_schema_from_tree, value_schema_to_tree
-from zlc_storage import decode, encode
+from zlc_storage import (
+    canonical_text as _text,
+    decode,
+    encode,
+    exact_mapping as _exact_map,
+    integer as _integer,
+)
 
 from .contracts import (
     CalibrationCaptureLayout,
@@ -30,26 +36,6 @@ class ReadoutCodecError(ValueError):
 
 
 T = TypeVar("T")
-
-
-def _exact_map(tree: Any, fields: set[str], schema_id: str) -> dict[str, Any]:
-    if not isinstance(tree, dict) or set(tree) != fields:
-        raise ValueError(f"{schema_id} must contain exactly {sorted(fields)}")
-    if tree["schema"] != schema_id:
-        raise ValueError(f"expected schema {schema_id!r}, got {tree['schema']!r}")
-    return tree
-
-
-def _text(value: Any, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
-
-
-def _integer(value: Any, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{field} must be an integer")
-    return value
 
 
 def _float(value: Any, field: str) -> float:

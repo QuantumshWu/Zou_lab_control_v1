@@ -7,7 +7,7 @@ import math
 from numbers import Integral, Real
 from typing import Any
 
-from zlc_storage.canonical import decode, encode
+from zlc_storage.canonical import canonical_text as _text, decode, encode
 
 from .axis import AxisId, CoordinateFrameId
 
@@ -250,12 +250,6 @@ def decode_selection(payload: bytes) -> Selection:
     if bytes(payload) != encode_selection(selection):
         raise ValueError("Selection payload uses a non-canonical typed representation")
     return selection
-
-
-def _text(value: Any, field: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{field} must be non-empty text")
-    return value
 
 
 __all__ = [

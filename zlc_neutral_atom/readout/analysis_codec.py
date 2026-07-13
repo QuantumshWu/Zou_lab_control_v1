@@ -11,7 +11,15 @@ from __future__ import annotations
 
 from typing import Any, Callable, TypeVar
 
-from zlc_storage import CanonicalArrayEvent, CanonicalListEvent, decode, encode
+from zlc_storage import (
+    CanonicalArrayEvent,
+    CanonicalListEvent,
+    canonical_text as _text,
+    decode,
+    encode,
+    exact_mapping as _exact_map,
+    integer as _integer,
+)
 from zlc_storage.canonical import CanonicalDecodeLimits
 
 from .analysis import (
@@ -174,14 +182,6 @@ _MODEL_KIND_COUNT = len(ReadoutModelKind)
 T = TypeVar("T")
 
 
-def _exact_map(tree: Any, fields: set[str], schema: str) -> dict[str, Any]:
-    if not isinstance(tree, dict) or set(tree) != fields:
-        raise ValueError(f"{schema} must contain exactly {sorted(fields)}")
-    if tree["schema"] != schema:
-        raise ValueError(f"expected schema {schema!r}, got {tree['schema']!r}")
-    return tree
-
-
 def _exact_nested_map(tree: Any, fields: set[str], schema: str) -> dict[str, Any]:
     return _exact_map(tree, fields | {"schema"}, schema)
 
@@ -189,12 +189,6 @@ def _exact_nested_map(tree: Any, fields: set[str], schema: str) -> dict[str, Any
 def _list(value: Any, field: str) -> list[Any]:
     if not isinstance(value, list):
         raise ValueError(f"{field} must be a canonical list")
-    return value
-
-
-def _integer(value: Any, field: str) -> int:
-    if type(value) is not int:
-        raise ValueError(f"{field} must use the canonical integer representation")
     return value
 
 
@@ -207,12 +201,6 @@ def _float(value: Any, field: str) -> float:
 def _bool(value: Any, field: str) -> bool:
     if type(value) is not bool:
         raise ValueError(f"{field} must be bool")
-    return value
-
-
-def _text(value: Any, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
     return value
 
 

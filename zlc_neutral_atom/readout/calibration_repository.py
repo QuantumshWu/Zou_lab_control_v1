@@ -23,9 +23,11 @@ from zlc_storage import (
     ContentStoreAuthority,
     RepositoryRootLease,
     canonical_digest,
+    canonical_text as _canonical_text,
     decode,
     encode,
     sha256_digest,
+    sha256_text as _sha256,
 )
 
 from zlc_neutral_atom.capture_reference import (
@@ -208,26 +210,10 @@ def _capture_types():
     return AdmittedCapture, CaptureArtifact, CaptureRepository
 
 
-def _canonical_text(value: object, field_name: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field_name} must be canonical non-empty text")
-    return value
-
-
 def _optional_canonical_text(value: object, field_name: str) -> str | None:
     if value is None:
         return None
     return _canonical_text(value, field_name)
-
-
-def _sha256(value: object, field_name: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{field_name} must be a lowercase SHA-256 digest")
-    return value
 
 
 def _parameter_digest(artifact: CalibrationArtifact, name: str) -> str:

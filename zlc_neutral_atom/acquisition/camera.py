@@ -10,12 +10,10 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import Enum
-from numbers import Integral
 
 import numpy as np
 
 from zlc_data import (
-    VALID,
     ComponentValidity,
     Invalid,
     Valid,
@@ -23,7 +21,14 @@ from zlc_data import (
     ValuePayloadContract,
     ValueSchema,
 )
-from zlc_storage import canonical_digest, decode, encode
+from zlc_storage import (
+    canonical_digest,
+    canonical_text as _canonical_text,
+    decode,
+    encode,
+    integer as _integer,
+    sha256_text as _sha256,
+)
 
 from zlc_neutral_atom.runtime.capture import FrozenCaptureSpec
 from zlc_neutral_atom.camera_operator import (
@@ -38,40 +43,6 @@ CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT = canonical_digest(
         "schema": _CAMERA_CAPTURE_SPEC_SCHEMA,
     }
 )
-def _canonical_text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
-
-
-def _sha256(value: object, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
-    return value
-
-
-def _integer(
-    value: object,
-    field: str,
-    *,
-    optional: bool = False,
-    nonnegative: bool = False,
-) -> int | None:
-    if optional and value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, Integral):
-        suffix = " or None" if optional else ""
-        raise TypeError(f"{field} must be an integer{suffix}")
-    normalized = int(value)
-    if nonnegative and normalized < 0:
-        raise ValueError(f"{field} must be non-negative")
-    return normalized
-
-
 class CameraAcquisitionMode(str, Enum):
     EXTERNAL_TRIGGERED = "EXTERNAL_TRIGGERED"
     FREE_RUNNING = "FREE_RUNNING"

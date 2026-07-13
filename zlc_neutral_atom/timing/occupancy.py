@@ -7,6 +7,7 @@ one pulse session gates one already-bound camera/processor/materializer chain.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from zlc_storage import canonical_text as _text
 
 from zlc_neutral_atom.readout.occupancy_pipeline import (
     OccupancyPipelineResult,
@@ -38,12 +39,6 @@ from .pulse import (
     PulseTerminalAck,
     validate_pulse_terminal_for_artifact,
 )
-
-
-def _text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
 
 
 @dataclass(frozen=True)

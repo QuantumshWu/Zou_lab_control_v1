@@ -13,6 +13,7 @@ from dataclasses import dataclass, is_dataclass
 from enum import Enum
 from types import MappingProxyType
 from typing import Callable, Mapping, TypeVar
+from zlc_storage import canonical_text as _canonical_text
 
 from .resources import (
     RecoveryAcquireResult,
@@ -30,16 +31,6 @@ from .resources import (
 
 CommandT = TypeVar("CommandT")
 ResponseT = TypeVar("ResponseT")
-
-
-def _canonical_text(value: str, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or not value
-        or value.strip() != value
-    ):
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
 
 
 class SafetyOperation(str, Enum):

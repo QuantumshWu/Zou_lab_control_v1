@@ -33,17 +33,19 @@ from scipy.spatial import cKDTree
 from scipy.stats import beta as beta_distribution, binomtest
 
 from zlc_data import (
-    INVALID,
-    VALID,
     SITE,
     AxisId,
     AxisSpec,
     ComponentValidity,
     DataBlock,
-    DatasetSchema,
     expand_dataset_validity,
 )
-from zlc_storage import canonical_digest
+from zlc_storage import (
+    canonical_digest,
+    finite_real as _finite_real,
+    nonnegative_integer as _nonnegative_integer,
+    positive_integer as _positive_integer,
+)
 
 from .calibration import (
     BackgroundMode,
@@ -187,28 +189,6 @@ class CalibrationAnalysisPlanningAssumption(str, Enum):
     PRECOMMITTED_BEFORE_SOURCE_INSPECTION = (
         "PRECOMMITTED_BEFORE_SOURCE_INSPECTION"
     )
-
-
-def _finite_real(value: object, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise TypeError(f"{name} must be a real number")
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be finite")
-    return 0.0 if result == 0.0 else result
-
-
-def _nonnegative_integer(value: object, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
-        raise ValueError(f"{name} must be a non-negative integer")
-    return int(value)
-
-
-def _positive_integer(value: object, name: str) -> int:
-    result = _nonnegative_integer(value, name)
-    if result == 0:
-        raise ValueError(f"{name} must be positive")
-    return result
 
 
 def _same_typed_scalar(actual: object, expected: object) -> bool:

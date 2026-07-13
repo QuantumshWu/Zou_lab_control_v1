@@ -9,12 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol
-
-
-def _canonical_text(value: str, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be non-empty text without surrounding whitespace")
-    return value
+from zlc_storage import canonical_text as _canonical_text
 
 
 def _canonical_segment(value: str, field: str) -> str:

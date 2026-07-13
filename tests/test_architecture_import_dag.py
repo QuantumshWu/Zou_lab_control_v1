@@ -18,6 +18,36 @@ FORBIDDEN = {
     "zlc_neutral_atom": ("Zou_lab_control", "zlc_frontend", "zlc_workbench"),
 }
 
+CANONICAL_HELPER_NAMES = frozenset(
+    {
+        "_canonical_nonempty_text",
+        "_canonical_text",
+        "_exact_map",
+        "_exact_tree",
+        "_finite_real",
+        "_integer",
+        "_nonempty_text",
+        "_nonnegative_int",
+        "_positive_finite",
+        "_positive_float",
+        "_positive_int",
+        "_positive_seconds",
+        "_positive_timeout",
+        "_sha256",
+        "_text",
+    }
+)
+
+# These helpers normalize human-entered labels.  They intentionally strip text
+# and therefore are not the strict persisted-value invariant owned by storage.
+TEXT_NORMALIZER_ALLOWLIST = frozenset(
+    {
+        Path("zlc_frontend/render.py"),
+        Path("zlc_workbench/legacy.py"),
+        Path("zlc_workbench/workspace.py"),
+    }
+)
+
 
 def _imports(path: Path) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -48,3 +78,25 @@ def test_target_package_has_no_reverse_imports(package, forbidden):
                         f"{path.relative_to(ROOT)} imports storage I/O boundary {imported}"
                     )
     assert not violations, "reverse package dependencies:\n" + "\n".join(violations)
+
+
+def test_canonical_primitive_validators_have_one_owner():
+    violations = []
+    for package in FORBIDDEN:
+        for path in (ROOT / package).rglob("*.py"):
+            relative = path.relative_to(ROOT)
+            if relative == Path("zlc_storage/canonical.py"):
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in tree.body:
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if node.name not in CANONICAL_HELPER_NAMES:
+                    continue
+                if node.name == "_text" and relative in TEXT_NORMALIZER_ALLOWLIST:
+                    continue
+                violations.append(f"{relative}:{node.lineno} defines {node.name}")
+    assert not violations, (
+        "canonical primitive validators belong to zlc_storage.canonical; "
+        "domain modules must import and alias them:\n" + "\n".join(violations)
+    )

@@ -11,7 +11,7 @@ from numbers import Integral
 from typing import Callable, Generic, Protocol, TypeVar
 
 import numpy as np
-from zlc_storage import canonical_digest, encode
+from zlc_storage import canonical_digest, encode, sha256_text as _sha256_digest
 
 from zlc_data import (
     BlockId,
@@ -23,13 +23,11 @@ from zlc_data import (
     DatasetRevision,
     DatasetRevisionRef,
     DatasetSchema,
-    INVALID,
     Invalid,
     OwnedSnapshot,
     StreamGenerationId,
     PointLayout,
     REPEAT,
-    VALID,
     Valid,
     ValidityMode,
     Value,
@@ -159,16 +157,6 @@ class SnapshotExpired(DatasetError):
 
 
 _SEALED_TOKEN = object()
-
-
-def _sha256_digest(value: str, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
-    return value
 
 
 def _intrinsically_bytes_backed_array(value: object) -> bool:

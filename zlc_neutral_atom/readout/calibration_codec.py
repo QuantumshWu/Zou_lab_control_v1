@@ -8,7 +8,14 @@ import numpy as np
 
 from zlc_data import AxisId, ComponentValidity, CoordinateFrameId
 from zlc_data.codec import axis_from_tree, axis_to_tree, validity_from_tree, validity_to_tree
-from zlc_storage import CanonicalArrayEvent, CanonicalListEvent, decode, encode
+from zlc_storage import (
+    CanonicalArrayEvent,
+    CanonicalListEvent,
+    canonical_text as _text,
+    decode,
+    encode,
+    exact_mapping as _exact_map,
+)
 from zlc_neutral_atom.capture_reference import (
     capture_artifact_ref_from_tree,
     capture_artifact_ref_to_tree,
@@ -61,23 +68,9 @@ class CalibrationCodecError(ValueError):
 T = TypeVar("T")
 
 
-def _exact_map(tree: Any, fields: set[str], schema: str) -> dict[str, Any]:
-    if not isinstance(tree, dict) or set(tree) != fields:
-        raise ValueError(f"{schema} must contain exactly {sorted(fields)}")
-    if tree["schema"] != schema:
-        raise ValueError(f"expected schema {schema!r}, got {tree['schema']!r}")
-    return tree
-
-
 def _list(value: Any, field_name: str) -> list[Any]:
     if not isinstance(value, list):
         raise ValueError(f"{field_name} must be a list")
-    return value
-
-
-def _text(value: Any, field_name: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field_name} must be canonical non-empty text")
     return value
 
 

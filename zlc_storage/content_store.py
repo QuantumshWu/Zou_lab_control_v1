@@ -15,7 +15,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from .canonical import sha256_digest
+from .canonical import sha256_digest, sha256_text as _sha256
 from . import durability
 
 
@@ -28,17 +28,6 @@ def _canonical_namespace(value: object) -> str:
             "manifest namespace must match [a-z0-9][a-z0-9._-]*"
         )
     return value
-
-
-def _sha256(value: object, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
-    return value
-
 
 def _payload(value: object, field: str) -> bytes:
     if not isinstance(value, (bytes, bytearray, memoryview)):

@@ -9,11 +9,14 @@ counts and occupied as two ordinary immutable snapshots from that same execution
 
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import dataclass
 
 import numpy as np
+from zlc_storage import (
+    canonical_text as _canonical_text,
+    positive_real as _positive_seconds,
+)
 
 from zlc_data import (
     BlockId,
@@ -80,23 +83,6 @@ from .occupancy import (
     OccupancyStreamProcessorSpec,
     bind_occupancy_stream_processor,
 )
-
-
-def _canonical_text(value: object, field_name: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field_name} must be canonical non-empty text")
-    return value
-
-
-def _positive_seconds(value: object, field_name: str) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-        or float(value) <= 0.0
-    ):
-        raise ValueError(f"{field_name} must be finite and positive")
-    return float(value)
 
 
 @dataclass(frozen=True)

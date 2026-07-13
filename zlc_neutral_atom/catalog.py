@@ -10,6 +10,7 @@ from types import MappingProxyType
 from typing import Mapping, TypeVar
 
 import numpy as np
+from zlc_storage import canonical_text as _canonical_text
 
 
 DefinitionT = TypeVar("DefinitionT")
@@ -53,12 +54,6 @@ def is_declarative_value(value: object, active: set[int] | None = None) -> bool:
         active.remove(identity)
         return result
     return False
-
-
-def _canonical_text(value: str, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
 
 
 @dataclass(frozen=True, order=True)

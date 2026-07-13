@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from typing import Mapping, Sequence
 
 from fpga.pulse_streamer.host.image import StreamerParams
+from zlc_storage import positive_real as _positive_float
 
 from .artifact import CompiledPulseArtifact, PulseExecutionForm
 from .document import (
@@ -876,15 +877,6 @@ def _validate_target_geometry(target: PulseTarget, params: StreamerParams) -> No
         raise ValueError("PulseTarget has more DAC buses than the frozen streamer geometry")
     if any(port.width > int(params.bus_width) for port in dac):
         raise ValueError("PulseTarget DAC width exceeds the frozen streamer geometry")
-
-
-def _positive_float(value: object, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{field} must be numeric")
-    result = float(value)
-    if not math.isfinite(result) or result <= 0:
-        raise ValueError(f"{field} must be finite and positive")
-    return result
 
 
 def _exact_integer(value: object, field: str) -> int:

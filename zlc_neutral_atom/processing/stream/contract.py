@@ -13,7 +13,11 @@ from typing import Callable
 
 import numpy as np
 
-from zlc_storage import canonical_digest
+from zlc_storage import (
+    canonical_digest,
+    canonical_text as _text,
+    sha256_text as _digest,
+)
 
 from zlc_neutral_atom.catalog import DefinitionKey
 from zlc_neutral_atom.runtime.streams import (
@@ -23,22 +27,6 @@ from zlc_neutral_atom.runtime.streams import (
     ProcessorStageProvenance,
     StreamId,
 )
-
-
-def _digest(value: str, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
-    return value
-
-
-def _text(value: str, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
 
 
 def _canonical_dtype_tree(value: np.dtype) -> dict[str, object]:

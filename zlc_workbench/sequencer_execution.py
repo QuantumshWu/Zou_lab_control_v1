@@ -33,16 +33,9 @@ from zlc_pulse import (
     build_pulse_playback,
 )
 from zlc_pulse.target import pulse_target_from_legacy_tree
-from zlc_storage import canonical_digest
+from zlc_storage import canonical_digest, canonical_text as _text
 
 from .legacy_runtime import LegacyDeviceRegistry, TargetDeviceEndpoint
-
-
-def _text(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be canonical non-empty text")
-    return value
-
 
 @dataclass(frozen=True)
 class SequencerBindingRequest:

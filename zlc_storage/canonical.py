@@ -14,6 +14,7 @@ import math
 import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Integral, Real
 from typing import Any, Callable, TypeAlias
 
 import numpy as np
@@ -25,6 +26,119 @@ _FRAME = b"ZLC-CANONICAL-1\n"
 
 class CanonicalEncodingError(ValueError):
     """Raised when a value is outside the closed canonical primitive model."""
+
+
+def canonical_text(
+    value: object,
+    field: str,
+    *,
+    empty: bool = False,
+) -> str:
+    """Validate the one canonical text invariant used by all value owners."""
+
+    if not isinstance(value, str) or value.strip() != value or (not empty and not value):
+        qualifier = "canonical text" if empty else "canonical non-empty text"
+        raise ValueError(f"{field} must be {qualifier}")
+    return value
+
+
+def sha256_text(value: object, field: str, *, optional: bool = False) -> str | None:
+    """Validate a lowercase SHA-256 text value without recomputing its content."""
+
+    if optional and value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        suffix = " or None" if optional else ""
+        raise ValueError(f"{field} must be a lowercase SHA-256 digest{suffix}")
+    return value
+
+
+def integer(
+    value: object,
+    field: str,
+    *,
+    optional: bool = False,
+    minimum: int | None = None,
+    nonnegative: bool = False,
+) -> int | None:
+    """Validate an integer once and normalize ``numbers.Integral`` to ``int``."""
+
+    if optional and value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        suffix = " or None" if optional else ""
+        raise TypeError(f"{field} must be an integer{suffix}")
+    normalized = int(value)
+    lower_bound = 0 if nonnegative and minimum is None else minimum
+    if lower_bound is not None and normalized < lower_bound:
+        raise ValueError(f"{field} must be at least {lower_bound}")
+    return normalized
+
+
+def nonnegative_integer(value: object, field: str) -> int:
+    result = integer(value, field, minimum=0)
+    assert result is not None
+    return result
+
+
+def positive_integer(value: object, field: str) -> int:
+    result = integer(value, field, minimum=1)
+    assert result is not None
+    return result
+
+
+def finite_real(
+    value: object,
+    field: str,
+    *,
+    minimum: float | None = None,
+    positive: bool = False,
+    normalize_zero: bool = True,
+) -> float:
+    """Validate a finite real number under one shared numeric boundary rule."""
+
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{field} must be a real number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{field} must be finite")
+    if positive and result <= 0.0:
+        raise ValueError(f"{field} must be positive")
+    if minimum is not None and result < minimum:
+        raise ValueError(f"{field} must be at least {minimum}")
+    return 0.0 if normalize_zero and result == 0.0 else result
+
+
+def nonnegative_real(value: object, field: str) -> float:
+    return finite_real(value, field, minimum=0.0)
+
+
+def positive_real(value: object, field: str) -> float:
+    return finite_real(value, field, positive=True)
+
+
+def exact_mapping(
+    value: object,
+    fields: set[str] | frozenset[str],
+    format_name: str,
+    *,
+    discriminator: str = "schema",
+) -> dict[str, Any]:
+    """Admit one exact owner mapping and its format discriminator."""
+
+    expected = set(fields)
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError(f"{format_name} must contain exactly {sorted(expected)}")
+    if value.get(discriminator) != format_name:
+        raise ValueError(
+            f"expected {discriminator} {format_name!r}, "
+            f"got {value.get(discriminator)!r}"
+        )
+    return value
 
 
 @dataclass(frozen=True)

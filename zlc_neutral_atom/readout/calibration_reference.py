@@ -5,27 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from zlc_storage import decode, encode
+from zlc_storage import (
+    canonical_text as _canonical_text,
+    decode,
+    encode,
+    sha256_text as _sha256,
+)
 
 
 CALIBRATION_ARTIFACT_REF_SCHEMA = "zlc_neutral_atom.calibration-artifact-ref.v1"
 _CALIBRATION_NAMESPACE = "calibration"
-
-
-def _canonical_text(value: object, field_name: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field_name} must be canonical non-empty text")
-    return value
-
-
-def _sha256(value: object, field_name: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{field_name} must be a lowercase SHA-256 digest")
-    return value
 
 
 @dataclass(frozen=True, order=True)

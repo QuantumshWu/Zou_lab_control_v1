@@ -13,6 +13,8 @@ import threading
 import time
 import uuid
 
+from zlc_storage import canonical_text, positive_integer as _positive_int
+
 from .device_catalog import (
     DeviceCatalogView,
     InstallationAvailability,
@@ -20,24 +22,16 @@ from .device_catalog import (
     unavailable_catalog,
 )
 
-
-def _positive_int(value: object, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"{field} must be int")
-    if value < 1:
-        raise ValueError(f"{field} must be positive")
-    return value
-
-
 @dataclass(frozen=True, slots=True)
 class RecoveryStatusRef:
     value: str
 
     def __post_init__(self) -> None:
-        normalized = str(self.value)
-        if not normalized or normalized.strip() != normalized:
-            raise ValueError("recovery status ref must be canonical non-empty text")
-        object.__setattr__(self, "value", normalized)
+        object.__setattr__(
+            self,
+            "value",
+            canonical_text(self.value, "recovery status ref"),
+        )
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,7 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 from zlc_data import AxisId, selection_from_tree, selection_to_tree
-from zlc_storage.canonical import decode, encode
+from zlc_storage.canonical import (
+    canonical_text as _text,
+    decode,
+    encode,
+    integer as _integer,
+)
 
 from .model import (
     AxisViewBinding,
@@ -32,18 +37,6 @@ def _exact(tree: Any, fields: set[str], context: str) -> dict[str, Any]:
     if not isinstance(tree, dict) or set(tree) != fields:
         raise ValueError(f"{context} has an invalid field set")
     return tree
-
-
-def _text(value: Any, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(f"{field} must be non-empty text without surrounding whitespace")
-    return value
-
-
-def _integer(value: Any, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{field} must be an integer")
-    return value
 
 
 def _selector_to_tree(selector) -> dict[str, Any] | None:
