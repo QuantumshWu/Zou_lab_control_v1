@@ -856,6 +856,10 @@ def test_frozen_edge_owner_copies_projection_adapter_before_binding_operator():
     np.testing.assert_array_equal(projected.values, np.full((2, 3), 2))
     assert edge.operator_fingerprint == frozen_operator == "e" * 64
 
+    object.__setattr__(edge, "_value_operator", lambda value: value)
+    with pytest.raises(runtime_dataset.DatasetError, match="projection binding changed"):
+        edge.project_value(payload)
+
 
 def test_builder_freezes_one_metadata_contract_identity_for_the_generation():
     schema = dataset_schema(points=2)

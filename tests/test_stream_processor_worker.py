@@ -31,6 +31,7 @@ from zlc_neutral_atom.catalog import DefinitionCatalog, DefinitionKey
 from zlc_neutral_atom.processing.stream import (
     BoundStreamProcessor,
     ExactStreamProcessorWorker,
+    ProcessorExecutionGuard,
     StreamProcessorDefinition,
     StreamProcessorError,
 )
@@ -70,6 +71,60 @@ class ScaleConfig:
 @dataclass(frozen=True)
 class ConvertConfig:
     output_schema: ValueSchema
+
+
+class RecordingExecutionGuard(ProcessorExecutionGuard):
+    def __init__(
+        self,
+        *,
+        schema_id: str = "test.processor-execution-guard.v1",
+        binding_fingerprint: str = "e" * 64,
+        reject: bool = False,
+    ) -> None:
+        self._schema_id = schema_id
+        self._binding_fingerprint = binding_fingerprint
+        self.reject = reject
+        self.calls: list[dict[str, object]] = []
+
+    @property
+    def schema_id(self) -> str:
+        return self._schema_id
+
+    @property
+    def binding_fingerprint(self) -> str:
+        return self._binding_fingerprint
+
+    def authorize_exact_worker(
+        self,
+        *,
+        bound: BoundStreamProcessor,
+        input_reservation: object,
+        input_cursor: object,
+        input_edge: object,
+        output_producer: object,
+        deadline_monotonic: float,
+        output_cursor: object | None,
+        output_builder: object | None,
+        downstream_readiness: object | None,
+        cancellation: object | None,
+    ) -> None:
+        self.calls.append(
+            {
+                "bound": bound,
+                "input_reservation": input_reservation,
+                "input_cursor": input_cursor,
+                "input_edge": input_edge,
+                "output_producer": output_producer,
+                "deadline_monotonic": deadline_monotonic,
+                "output_cursor": output_cursor,
+                "output_builder": output_builder,
+                "downstream_readiness": downstream_readiness,
+                "cancellation": cancellation,
+                "consumer_was_claimed": input_reservation._stream._formal_consumer_claimed,
+            }
+        )
+        if self.reject:
+            raise PermissionError("synthetic execution guard rejection")
 
 
 def scale_value(payload: object, config: object) -> object:
@@ -451,6 +506,8 @@ def chain(
     output_trace_source_id: str = "synthetic-processor",
     absolute_deadline_seconds: float = 2.0,
     artifact_inputs: tuple[ArtifactInputRef, ...] = (),
+    execution_guard_schema_id: str | None = None,
+    execution_guard: ProcessorExecutionGuard | None = None,
 ) -> Chain:
     data_schema = schema(points)
     result_schema = (
@@ -525,6 +582,7 @@ def chain(
         dataset_cell_key_fingerprint(data_schema),
         operator_deadline_seconds=operator_deadline_seconds,
         terminal_wait_seconds=terminal_wait_seconds,
+        execution_guard_schema_id=execution_guard_schema_id,
     )
     assert DefinitionCatalog((definition,)).resolve(definition.key) is definition
     bound = BoundStreamProcessor(
@@ -537,6 +595,7 @@ def chain(
         "synthetic-processor",
         operator,
         artifact_inputs,
+        execution_guard,
     )
     if tamper_output_cursor_owner:
         output_reservation._cursor = object()
@@ -581,6 +640,81 @@ def emit(item: Chain, ordinal: int, *, key: DatasetCellAddress | None = None) ->
         ),
         join_key=item.schedule[ordinal] if key is None else key,
     )
+
+
+def test_execution_guard_definition_and_binding_must_match_exactly():
+    schema_id = "test.processor-execution-guard.v1"
+    with pytest.raises(ValueError, match="requires an execution_guard"):
+        chain(execution_guard_schema_id=schema_id)
+
+    extra = RecordingExecutionGuard()
+    with pytest.raises(ValueError, match="requires execution_guard_schema_id"):
+        chain(execution_guard=extra)
+
+    wrong = RecordingExecutionGuard(schema_id="test.another-guard.v1")
+    with pytest.raises(ValueError, match="schema differs from definition"):
+        chain(
+            execution_guard_schema_id=schema_id,
+            execution_guard=wrong,
+        )
+
+    invalid_digest = RecordingExecutionGuard(binding_fingerprint="not-a-digest")
+    with pytest.raises(ValueError, match="lowercase SHA-256 digest"):
+        chain(
+            execution_guard_schema_id=schema_id,
+            execution_guard=invalid_digest,
+        )
+
+
+def test_raw_worker_cannot_bypass_guard_and_guard_runs_before_consumer_claim():
+    guard = RecordingExecutionGuard(reject=True)
+    with pytest.raises(PermissionError, match="synthetic execution guard rejection"):
+        chain(
+            execution_guard_schema_id=guard.schema_id,
+            execution_guard=guard,
+        )
+
+    assert len(guard.calls) == 1
+    call = guard.calls[0]
+    assert call["consumer_was_claimed"] is False
+    reservation = call["input_reservation"]
+    assert reservation._stream._formal_consumer_claimed is False
+    assert call["input_cursor"] is reservation._cursor
+    assert call["input_edge"].expected_cells is not None
+    assert call["output_producer"] is not None
+    assert call["output_cursor"] is not None
+    assert call["output_builder"] is not None
+    assert call["downstream_readiness"] is None
+    assert call["cancellation"] is None
+    assert call["bound"].execution_guard is guard
+
+
+def test_bound_processor_rejects_execution_guard_identity_drift():
+    guard = RecordingExecutionGuard()
+    item = chain(
+        execution_guard_schema_id=guard.schema_id,
+        execution_guard=guard,
+    )
+    bound = item.worker._bound
+    original_fingerprint = bound.fingerprint
+    assert len(original_fingerprint) == 64
+
+    guard._binding_fingerprint = "f" * 64
+    with pytest.raises(ValueError, match="binding fingerprint changed"):
+        _ = bound.fingerprint
+
+    guard._binding_fingerprint = "e" * 64
+    guard._schema_id = "test.mutated-guard.v1"
+    with pytest.raises(ValueError, match="schema changed"):
+        bound._validated_execution_guard()
+    guard._schema_id = "test.processor-execution-guard.v1"
+
+    replacement = RecordingExecutionGuard()
+    object.__setattr__(bound, "execution_guard", replacement)
+    with pytest.raises(ValueError, match="owner changed"):
+        bound._validated_execution_guard()
+    object.__setattr__(bound, "execution_guard", guard)
+    item.worker.close(2.0)
 
 
 def test_exact_chain_preserves_keys_provenance_and_all_cells_before_input_ack():

@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import inspect
 import math
-from dataclasses import dataclass, fields, is_dataclass, replace
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 from types import MappingProxyType
 from typing import Callable
@@ -493,6 +494,43 @@ class JoinKeyTransform(str, Enum):
     PASS_THROUGH = "PASS_THROUGH"
 
 
+class ProcessorExecutionGuard(ABC):
+    """Process-local authority consulted before an exact worker claims input.
+
+    The stable definition records only :attr:`schema_id`; one runtime binding
+    supplies the matching authority and commits its immutable
+    :attr:`binding_fingerprint` into processor lineage.  The guard itself is
+    deliberately neither snapshotted nor serialized.
+    """
+
+    @property
+    @abstractmethod
+    def schema_id(self) -> str:
+        """Return the stable schema understood by this execution authority."""
+
+    @property
+    @abstractmethod
+    def binding_fingerprint(self) -> str:
+        """Return the digest of the exact process-local authority binding."""
+
+    @abstractmethod
+    def authorize_exact_worker(
+        self,
+        *,
+        bound: BoundStreamProcessor,
+        input_reservation: object,
+        input_cursor: object,
+        input_edge: object,
+        output_producer: object,
+        deadline_monotonic: float,
+        output_cursor: object | None,
+        output_builder: object | None,
+        downstream_readiness: object | None,
+        cancellation: object | None,
+    ) -> None:
+        """Authorize one fully validated exact-worker construction."""
+
+
 @dataclass(frozen=True)
 class StreamProcessorDefinition:
     """Catalog-safe declaration; it deliberately contains no Python callable."""
@@ -508,6 +546,7 @@ class StreamProcessorDefinition:
     join_key_transform: JoinKeyTransform = JoinKeyTransform.PASS_THROUGH
     operator_deadline_seconds: float = 1.0
     terminal_wait_seconds: float = 1.0
+    execution_guard_schema_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, DefinitionKey):
@@ -536,6 +575,8 @@ class StreamProcessorDefinition:
             ):
                 raise ValueError(f"{field} must be finite and positive")
             object.__setattr__(self, field, float(value))
+        if self.execution_guard_schema_id is not None:
+            _text(self.execution_guard_schema_id, "execution_guard_schema_id")
 
 
 @dataclass(frozen=True)
@@ -562,6 +603,25 @@ class BoundStreamProcessor:
     output_source_id: str
     operator: Callable[[object, object], object]
     artifact_inputs: tuple[ArtifactInputRef, ...] = ()
+    _execution_guard_schema_id: str | None = field(
+        init=False,
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _execution_guard_binding_fingerprint: str | None = field(
+        init=False,
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _execution_guard_owner: ProcessorExecutionGuard | None = field(
+        init=False,
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    execution_guard: ProcessorExecutionGuard | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.definition, StreamProcessorDefinition):
@@ -642,6 +702,34 @@ class BoundStreamProcessor:
             "artifact_inputs",
             provenance.direct_artifact_inputs,
         )
+        guard_schema_id = self.definition.execution_guard_schema_id
+        guard = self.execution_guard
+        guard_binding_fingerprint = None
+        if guard_schema_id is None:
+            if guard is not None:
+                raise ValueError(
+                    "execution_guard requires execution_guard_schema_id in definition"
+                )
+        else:
+            if guard is None:
+                raise ValueError("definition requires an execution_guard")
+            if not isinstance(guard, ProcessorExecutionGuard):
+                raise TypeError("execution_guard must be ProcessorExecutionGuard")
+            actual_schema_id = guard.schema_id
+            _text(actual_schema_id, "execution_guard.schema_id")
+            if actual_schema_id != guard_schema_id:
+                raise ValueError("execution_guard schema differs from definition")
+            guard_binding_fingerprint = _digest(
+                guard.binding_fingerprint,
+                "execution_guard.binding_fingerprint",
+            )
+        object.__setattr__(self, "_execution_guard_schema_id", guard_schema_id)
+        object.__setattr__(
+            self,
+            "_execution_guard_binding_fingerprint",
+            guard_binding_fingerprint,
+        )
+        object.__setattr__(self, "_execution_guard_owner", guard)
         operator = self.operator
         if (
             not inspect.isfunction(operator)
@@ -667,12 +755,41 @@ class BoundStreamProcessor:
         ):
             raise TypeError("operator must accept exactly payload and frozen config")
 
+    def _validated_execution_guard(self) -> ProcessorExecutionGuard | None:
+        """Return the frozen guard only while its authority identity is stable."""
+
+        expected_schema_id = self._execution_guard_schema_id
+        expected_binding_fingerprint = self._execution_guard_binding_fingerprint
+        guard = self.execution_guard
+        if guard is not self._execution_guard_owner:
+            raise ValueError("execution_guard owner changed after construction")
+        if expected_schema_id is None:
+            if guard is not None or expected_binding_fingerprint is not None:
+                raise ValueError("execution_guard binding changed after construction")
+            return None
+        if not isinstance(guard, ProcessorExecutionGuard):
+            raise TypeError("execution_guard must be ProcessorExecutionGuard")
+        actual_schema_id = guard.schema_id
+        _text(actual_schema_id, "execution_guard.schema_id")
+        if actual_schema_id != expected_schema_id:
+            raise ValueError("execution_guard schema changed after construction")
+        actual_binding_fingerprint = _digest(
+            guard.binding_fingerprint,
+            "execution_guard.binding_fingerprint",
+        )
+        if actual_binding_fingerprint != expected_binding_fingerprint:
+            raise ValueError(
+                "execution_guard binding fingerprint changed after construction"
+            )
+        return guard
+
     @property
     def fingerprint(self) -> str:
         definition = self.definition
+        self._validated_execution_guard()
         return canonical_digest(
             {
-                "contract": "zlc_neutral_atom.BoundStreamProcessor/v1",
+                "contract": "zlc_neutral_atom.BoundStreamProcessor/v2",
                 "definition_key": str(definition.key),
                 "definition": _tree(definition),
                 "config": _tree(self.config),
@@ -680,6 +797,9 @@ class BoundStreamProcessor:
                 "output_source_id": self.output_source_id,
                 "operator": f"{self.operator.__module__}.{self.operator.__qualname__}",
                 "artifact_inputs": [item.fingerprint for item in self.artifact_inputs],
+                "execution_guard_binding_fingerprint": (
+                    self._execution_guard_binding_fingerprint
+                ),
             }
         )
 
@@ -687,6 +807,7 @@ class BoundStreamProcessor:
 __all__ = [
     "BoundStreamProcessor",
     "JoinKeyTransform",
+    "ProcessorExecutionGuard",
     "StreamCardinality",
     "StreamJoinPolicy",
     "StreamProcessorDefinition",

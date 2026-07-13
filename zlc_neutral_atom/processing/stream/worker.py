@@ -322,6 +322,22 @@ class ExactStreamProcessorWorker:
         )
         if cancellation is not None and not isinstance(cancellation, CancellationToken):
             raise TypeError("cancellation must be CancellationToken or None")
+        guard = bound._validated_execution_guard()
+        if guard is not None:
+            authorization = guard.authorize_exact_worker(
+                bound=bound,
+                input_reservation=input_reservation,
+                input_cursor=input_cursor,
+                input_edge=input_edge,
+                output_producer=output_producer,
+                deadline_monotonic=deadline_monotonic,
+                output_cursor=output_cursor,
+                output_builder=output_builder,
+                downstream_readiness=downstream_readiness,
+                cancellation=cancellation,
+            )
+            if authorization is not None:
+                raise TypeError("execution guard authorization must return None")
         # Initialize every callback-visible field before the final authority
         # claim.  After _claim_consumer succeeds there are no ordinary
         # construction steps left that could strand a half-built owner.

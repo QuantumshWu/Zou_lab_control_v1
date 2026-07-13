@@ -71,6 +71,7 @@ from .calibration import (
     validate_calibration_artifact_resources,
     validate_calibration_artifact_source_compatibility,
     validate_calibration_resource_summary,
+    validate_readout_feature_spec_model,
     validate_readout_model_resources,
 )
 from .calibration_codec import (
@@ -101,7 +102,9 @@ from .calibration_codec import (
 )
 from .calibration_repository import (
     CALIBRATION_MANIFEST_SCHEMA,
+    AdmittedCalibration,
     CalibrationRepository,
+    compile_calibration_artifact_plan,
 )
 from .calibration_reference import (
     CALIBRATION_ARTIFACT_REF_SCHEMA,
@@ -166,6 +169,7 @@ __all__ = [
     "CalibrationResourceSummary",
     "CalibrationSourceBinding",
     "CalibrationRepository",
+    "AdmittedCalibration",
     "CalibrationStage",
     "DEFAULT_CALIBRATION_RESOURCE_POLICY",
     "DEFAULT_MODEL_POLICY_SCHEMA",
@@ -235,7 +239,9 @@ __all__ = [
     "validate_calibration_artifact_resources",
     "validate_calibration_artifact_source_compatibility",
     "validate_calibration_resource_summary",
+    "validate_readout_feature_spec_model",
     "validate_readout_model_resources",
+    "compile_calibration_artifact_plan",
     "frame_contract_from_tree",
     "frame_contract_to_tree",
     "readout_binding_key_from_tree",

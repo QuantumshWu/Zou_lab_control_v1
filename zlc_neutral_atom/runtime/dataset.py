@@ -800,6 +800,7 @@ class FrozenDatasetEdge(Generic[PayloadT]):
 
     @property
     def payload_contract(self) -> object:
+        self._validate_projection_binding()
         return self._payload_contract
 
     @property
@@ -816,6 +817,7 @@ class FrozenDatasetEdge(Generic[PayloadT]):
 
     @property
     def metadata_contract(self) -> DatasetMetadataContract:
+        self._validate_projection_binding()
         return self._metadata_contract
 
     @property
@@ -828,14 +830,44 @@ class FrozenDatasetEdge(Generic[PayloadT]):
 
     @property
     def value_schema(self) -> ValueSchema:
+        self._validate_projection_binding()
         return self._value_schema
 
     @property
     def operator_fingerprint(self) -> str:
+        self._validate_projection_binding()
         return self._operator_fingerprint
 
     def project_value(self, payload: PayloadT) -> Value:
+        self._validate_projection_binding()
         return self._value_operator(payload)
+
+    def _validate_projection_binding(self) -> None:
+        """Reject reflective drift between the adapter and cached hot-path owners."""
+
+        adapter = self.event_adapter
+        try:
+            payload_contract = adapter.payload_contract
+            metadata_contract = adapter.metadata_contract
+            value_schema = adapter.value_schema
+            operator_fingerprint = adapter.operator_fingerprint
+            current_operator = adapter.value
+        except AttributeError as error:
+            raise DatasetError("dataset event adapter binding changed") from error
+        if (
+            payload_contract is not self._payload_contract
+            or metadata_contract is not self._metadata_contract
+            or value_schema is not self._value_schema
+            or operator_fingerprint != self._operator_fingerprint
+        ):
+            raise DatasetError("dataset event adapter binding changed")
+        cached_operator = self._value_operator
+        cached_owner = getattr(cached_operator, "__self__", None)
+        current_owner = getattr(current_operator, "__self__", None)
+        cached_function = getattr(cached_operator, "__func__", cached_operator)
+        current_function = getattr(current_operator, "__func__", current_operator)
+        if cached_owner is not current_owner or cached_function is not current_function:
+            raise DatasetError("dataset value projection binding changed")
 
     @property
     def key_contract_fingerprint(self) -> str:
@@ -848,6 +880,7 @@ class FrozenDatasetEdge(Generic[PayloadT]):
         return self.key_sequence_digest
 
     def validate_stream(self, stream: AcquisitionStream[PayloadT]) -> None:
+        self._validate_projection_binding()
         if not isinstance(stream, AcquisitionStream):
             raise TypeError("stream must be AcquisitionStream")
         if (

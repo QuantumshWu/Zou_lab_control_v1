@@ -27,6 +27,7 @@ from zlc_data import (
     Value,
     expand_value_validity,
 )
+from zlc_data.codec import validity_to_tree
 from zlc_storage import canonical_digest
 
 from zlc_neutral_atom.capture_reference import CaptureArtifactRef
@@ -814,6 +815,7 @@ class ReadoutFeatureSpec:
     uniform_kernel: np.ndarray | None = None
     background: BackgroundMode = BackgroundMode.NONE
     background_padding: int = 0
+    _fingerprint: str = field(init=False, repr=False, compare=False)
     __hash__ = None
 
     @classmethod
@@ -853,6 +855,11 @@ class ReadoutFeatureSpec:
             model.background_padding
             if isinstance(model, (PerSitePsfReadoutModel, UniformPsfReadoutModel))
             else 0,
+        )
+        object.__setattr__(
+            result,
+            "_fingerprint",
+            canonical_digest(_readout_feature_spec_to_tree(result)),
         )
         return result
 
@@ -917,6 +924,53 @@ class ReadoutFeatureSpec:
         object.__setattr__(self, "boxes_xywh", boxes)
         object.__setattr__(self, "site_validity", validity)
         object.__setattr__(self, "background_padding", padding)
+        object.__setattr__(
+            self,
+            "_fingerprint",
+            canonical_digest(_readout_feature_spec_to_tree(self)),
+        )
+
+    @property
+    def fingerprint(self) -> str:
+        """Canonical identity of every field that changes extracted signals."""
+
+        current = canonical_digest(_readout_feature_spec_to_tree(self))
+        if current != self._fingerprint:
+            raise ValueError("readout feature spec changed after construction")
+        return current
+
+
+def _readout_feature_spec_to_tree(spec: ReadoutFeatureSpec) -> dict[str, object]:
+    """Project the closed feature-math contract to its owner-defined tree."""
+
+    if not isinstance(spec, ReadoutFeatureSpec):
+        raise TypeError("spec must be ReadoutFeatureSpec")
+    return {
+        "schema": "zlc_neutral_atom.readout-feature-spec.v1",
+        "kind": spec.kind.value,
+        "site_axis_id": spec.site_axis_id.value,
+        "boxes_xywh": spec.boxes_xywh,
+        "site_validity": validity_to_tree(spec.site_validity),
+        "box_reducer": None if spec.box_reducer is None else spec.box_reducer.value,
+        "per_site_kernels": spec.per_site_kernels,
+        "uniform_kernel": spec.uniform_kernel,
+        "background": spec.background.value,
+        "background_padding": spec.background_padding,
+    }
+
+
+def validate_readout_feature_spec_model(
+    spec: ReadoutFeatureSpec,
+    model: ReadoutModel,
+) -> None:
+    """Fail closed unless ``spec`` is exactly the model's feature-math contract."""
+
+    if not isinstance(spec, ReadoutFeatureSpec):
+        raise TypeError("spec must be ReadoutFeatureSpec")
+    model = _model(model)
+    expected = ReadoutFeatureSpec._from_validated_model(model)
+    if spec.fingerprint != expected.fingerprint:
+        raise ValueError("readout feature spec does not match the selected model")
 
 
 class CalibrationResourceExceeded(ValueError):
@@ -1795,5 +1849,6 @@ __all__ = [
     "validate_calibration_artifact_resources",
     "validate_calibration_artifact_source_compatibility",
     "validate_calibration_resource_summary",
+    "validate_readout_feature_spec_model",
     "validate_readout_model_resources",
 ]

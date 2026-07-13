@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import pickle
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -29,6 +30,7 @@ from zlc_neutral_atom.runtime.capture import (
     BoundCapturePort,
     CaptureCapabilitySnapshot,
     CapturePreparedAck,
+    CaptureProcessorInputBinding,
     CaptureRuntimeProfile,
     CaptureSessionState,
     CaptureStartedAck,
@@ -44,7 +46,6 @@ from zlc_neutral_atom.runtime.capture import (
 from zlc_neutral_atom.runtime.dataset import (
     DatasetBuilder,
     DatasetCellAddress,
-    DatasetCellKeyContract,
     DatasetMode,
     FrozenDatasetEdge,
     SealedDatasetArtifact,
@@ -635,8 +636,8 @@ def processor_capture_harness(
     session = item.port.open_session(item.contract, trace, item.spec)
     reservation = session.reserve_exact()
     input_cursor = reservation.activate()
-    key_contract = session.stream._join_key_contract
-    assert isinstance(key_contract, DatasetCellKeyContract)
+    processor_input = session.processor_input_binding
+    key_contract = processor_input.join_key_contract
     output_stream, output_producer = AcquisitionStream.create(
         StreamId("camera.processed"),
         item.contract.payload_contract,
@@ -693,6 +694,195 @@ def processor_capture_harness(
         deadline_monotonic=time.monotonic() + 2.0,
     )
     return ProcessorCaptureHarness(session, reservation, worker, builder)
+
+
+def test_capture_session_exposes_one_atomic_processor_input_binding():
+    item = harness(points=1)
+    session = item.port.open_session(
+        item.contract,
+        TraceBinding("processor-input-binding", item.contract.source_id),
+        item.spec,
+    )
+
+    binding = session.processor_input_binding
+
+    assert session.processor_input_binding is binding
+    assert binding.capture_contract is item.contract
+    assert binding.stream is session.stream
+    assert binding.payload_contract is item.contract.payload_contract
+    assert binding.input_edge is item.contract.dataset_edge
+    assert (
+        binding.join_key_contract.fingerprint
+        == item.contract.dataset_edge.key_contract_fingerprint
+    )
+    assert (
+        binding.stream.payload_contract_fingerprint
+        == binding.input_edge.payload_contract_fingerprint
+        == binding.payload_contract.fingerprint
+    )
+    binding.input_edge.validate_stream(binding.stream)
+    reservation = session.reserve_exact()
+    reservation.activate()
+    assert session.state is CaptureSessionState.NEW
+    assert session.processor_input_binding is binding
+    assert binding.require_reservation(reservation) is None
+    reservation.abort(cancelled=True)
+    reservation.release()
+    with pytest.raises(RuntimeError, match="no longer registered"):
+        binding.require_reservation(reservation)
+
+    import zlc_neutral_atom.runtime as runtime_api
+
+    assert runtime_api.CaptureProcessorInputBinding is CaptureProcessorInputBinding
+
+
+def test_capture_session_stops_dispensing_processor_input_after_prepare():
+    item = harness(points=1)
+    plan = item.plan(consume=False)
+    original_execute = plan.execute
+
+    def execute(context: RunContext, prepared):
+        session, _cursor, _builder = prepared
+        assert session.state is CaptureSessionState.PREPARED
+        with pytest.raises(RuntimeError, match="only available.*NEW"):
+            session.processor_input_binding
+        return original_execute(context, prepared)
+
+    guarded_plan = RunPlan(**{**plan.__dict__, "execute": execute})
+    RunController(ResourceArbiter(MemoryQuarantineJournal())).start(
+        guarded_plan
+    ).result(2.0)
+
+
+def test_processor_input_binding_rejects_clone_stream_reservation():
+    item = harness(points=1)
+    session = item.port.open_session(
+        item.contract,
+        TraceBinding("processor-input-clone", item.contract.source_id),
+        item.spec,
+    )
+    binding = session.processor_input_binding
+    clone_stream, _clone_producer = AcquisitionStream.create(
+        binding.stream.stream_id,
+        binding.payload_contract,
+        flow_control=binding.stream.flow_control,
+        retention_events=binding.stream.retention_events,
+        retention_bytes=binding.stream.retention_bytes,
+        join_key_contract=binding.join_key_contract,
+    )
+    clone_reservation = clone_stream.reserve(
+        total_events=item.contract.total_events,
+        max_inflight_events=item.contract.max_inflight_events,
+        max_inflight_bytes=item.contract.max_inflight_bytes,
+        trace_binding=TraceBinding(
+            "processor-input-clone",
+            item.contract.source_id,
+        ),
+    )
+
+    assert clone_stream is not binding.stream
+    assert clone_stream.stream_id == binding.stream.stream_id
+    assert (
+        clone_stream.payload_contract_fingerprint
+        == binding.stream.payload_contract_fingerprint
+    )
+    binding.input_edge.validate_stream(clone_stream)
+    with pytest.raises(PermissionError, match="not minted by this CaptureSession"):
+        binding.require_reservation(clone_reservation)
+
+    clone_reservation.abort(cancelled=True)
+    clone_reservation.release()
+
+
+def test_processor_input_rejects_caller_reserved_interval_on_the_same_stream():
+    item = harness(points=1)
+    session = item.port.open_session(
+        item.contract,
+        TraceBinding("processor-input-rogue-reservation", item.contract.source_id),
+        item.spec,
+    )
+    binding = session.processor_input_binding
+    rogue = binding.stream.reserve(
+        total_events=item.contract.total_events,
+        max_inflight_events=item.contract.max_inflight_events,
+        max_inflight_bytes=item.contract.max_inflight_bytes,
+        trace_binding=TraceBinding(
+            "processor-input-rogue-reservation",
+            item.contract.source_id,
+        ),
+    )
+    rogue.activate()
+
+    with pytest.raises(PermissionError, match="not minted by this CaptureSession"):
+        binding.require_reservation(rogue)
+    with pytest.raises(AttributeError):
+        object.__setattr__(binding, "_session_reservation", rogue)
+
+    rogue.abort(cancelled=True)
+    rogue.release()
+
+
+def test_processor_input_binding_rejects_a_copied_clone_generation():
+    item = harness(points=1)
+    session = item.port.open_session(
+        item.contract,
+        TraceBinding("processor-input-forged-clone", item.contract.source_id),
+        item.spec,
+    )
+    binding = session.processor_input_binding
+    reservation = session.reserve_exact()
+    reservation.activate()
+    clone_stream, _clone_producer = AcquisitionStream.create(
+        binding.stream.stream_id,
+        binding.payload_contract,
+        flow_control=binding.stream.flow_control,
+        retention_events=binding.stream.retention_events,
+        retention_bytes=binding.stream.retention_bytes,
+        join_key_contract=binding.join_key_contract,
+    )
+    forged = object.__new__(CaptureProcessorInputBinding)
+    for slot in CaptureProcessorInputBinding.__slots__:
+        if slot == "__weakref__":
+            continue
+        object.__setattr__(forged, slot, object.__getattribute__(binding, slot))
+    object.__setattr__(forged, "_stream", clone_stream)
+
+    with pytest.raises(PermissionError, match="not registered"):
+        forged.require_reservation(reservation)
+
+    reservation.abort(cancelled=True)
+    reservation.release()
+
+
+def test_capture_processor_input_binding_is_sealed_immutable_and_process_local():
+    item = harness(points=1)
+    session = item.port.open_session(
+        item.contract,
+        TraceBinding("sealed-processor-input", item.contract.source_id),
+        item.spec,
+    )
+    binding = session.processor_input_binding
+
+    with pytest.raises(TypeError, match="exact ExactReservation"):
+        binding.require_reservation(object())
+    with pytest.raises(PermissionError, match="only be minted by CaptureSession"):
+        CaptureProcessorInputBinding(
+            object(),
+            capture_contract=item.contract,
+            stream=session.stream,
+        )
+    with pytest.raises(PermissionError, match="not minted by CaptureSession"):
+        object.__new__(CaptureProcessorInputBinding).stream
+    with pytest.raises(TypeError, match="sealed"):
+        type(
+            "ForgedCaptureProcessorInputBinding",
+            (CaptureProcessorInputBinding,),
+            {},
+        )
+    with pytest.raises(AttributeError, match="immutable"):
+        binding.stream = session.stream
+    with pytest.raises(TypeError, match="process-local"):
+        pickle.dumps(binding)
 
 
 def emit_processor_capture_source(

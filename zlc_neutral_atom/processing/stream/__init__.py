@@ -3,6 +3,7 @@
 from .contract import (
     BoundStreamProcessor,
     JoinKeyTransform,
+    ProcessorExecutionGuard,
     StreamCardinality,
     StreamJoinPolicy,
     StreamProcessorDefinition,
@@ -13,6 +14,7 @@ __all__ = [
     "BoundStreamProcessor",
     "ExactStreamProcessorWorker",
     "JoinKeyTransform",
+    "ProcessorExecutionGuard",
     "StreamCardinality",
     "StreamJoinPolicy",
     "StreamProcessorDefinition",

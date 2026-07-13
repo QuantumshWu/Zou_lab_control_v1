@@ -1,4 +1,4 @@
-"""Closed calibration domain: invariants, application, codecs, and repository."""
+"""Closed calibration value domain: invariants, application, and codecs."""
 
 from __future__ import annotations
 
@@ -36,10 +36,10 @@ from zlc_neutral_atom.readout import (
     BoxReadoutModel,
     BoxReducer,
     CalibrationArtifact,
+    CalibrationArtifactRef,
     CalibrationCaptureLayout,
     CalibrationCodecError,
     CalibrationParameter,
-    CalibrationRepository,
     CalibrationResourceExceeded,
     CalibrationResourcePolicy,
     CalibrationSourceBinding,
@@ -71,6 +71,13 @@ from zlc_neutral_atom.readout import (
     encode_site_map,
     extract_readout_features,
     extract_readout_signals,
+    calibration_resource_summary,
+    validate_calibration_artifact_resources,
+    validate_calibration_artifact_source_compatibility,
+    validate_calibration_resource_summary,
+)
+from zlc_neutral_atom.readout.calibration import (
+    validate_readout_feature_spec_model,
 )
 
 
@@ -336,6 +343,38 @@ def test_site_map_and_models_are_intrinsically_immutable_and_uniform_stores_one_
     assert per_site_spec.site_validity is per_site.header.quality.usable_sites
     assert uniform_spec.boxes_xywh is uniform.boxes_xywh
     assert uniform_spec.uniform_kernel is uniform.kernel
+
+
+def test_feature_spec_fingerprint_is_canonical_and_rejects_another_models_math():
+    contract, site_map, quality, boxes = _contracts()
+    selected_model = _models(contract, site_map, quality, boxes)[0]
+    bound_spec = bind_readout_feature_spec(selected_model, site_map)
+    constructed_spec = ReadoutFeatureSpec(
+        selected_model.kind,
+        selected_model.header.site_axis_id,
+        selected_model.boxes_xywh,
+        selected_model.header.quality.usable_sites,
+        box_reducer=selected_model.reducer,
+    )
+
+    assert len(bound_spec.fingerprint) == 64
+    assert bound_spec.fingerprint == constructed_spec.fingerprint
+    validate_readout_feature_spec_model(bound_spec, selected_model)
+    validate_readout_feature_spec_model(constructed_spec, selected_model)
+
+    other_model = BoxReadoutModel(
+        _header("mean-box-v1", contract, site_map, quality),
+        boxes,
+        BoxReducer.MEAN,
+    )
+    replacement_spec = bind_readout_feature_spec(other_model, site_map)
+    assert replacement_spec.fingerprint != bound_spec.fingerprint
+    with pytest.raises(ValueError, match="does not match the selected model"):
+        validate_readout_feature_spec_model(replacement_spec, selected_model)
+
+    object.__setattr__(constructed_spec, "box_reducer", BoxReducer.MEAN)
+    with pytest.raises(ValueError, match="changed after construction"):
+        _ = constructed_spec.fingerprint
 
 
 def test_box_application_propagates_site_and_nonfinite_validity_without_dark_coercion():
@@ -750,7 +789,7 @@ def test_source_binding_factory_rejects_axis_index_and_sparse_layout_attacks():
         derive_calibration_source_binding(sparse, _capture_layout())
 
 
-def test_artifact_rejects_unbound_frame_and_source_verified_load_rederives_source(tmp_path):
+def test_artifact_rejects_unbound_frame_and_source_validation_rederives_source():
     artifact = _artifact()
     with pytest.raises(ValueError, match="fingerprints differ"):
         replace(
@@ -761,23 +800,21 @@ def test_artifact_rejects_unbound_frame_and_source_verified_load_rederives_sourc
             ),
         )
 
-    repository = CalibrationRepository(tmp_path / "source-verified")
-    reference = repository.put(artifact)
     capture = _resolved_capture()
-    loaded = repository.load_source_verified(
-        reference,
+    resolved = validate_calibration_artifact_source_compatibility(
+        artifact,
         capture_resolver=lambda requested: capture
         if requested == capture.ref
         else pytest.fail("repository requested another source capture"),
     )
-    assert loaded.fingerprint == artifact.fingerprint
+    assert resolved is capture
 
     reordered = _resolved_capture(
         point_layout=PointLayout.explicit((3,), ((2,), (1,), (0,))),
     )
     with pytest.raises(ValueError, match="source binding differs"):
-        repository.load_source_verified(
-            reference,
+        validate_calibration_artifact_source_compatibility(
+            artifact,
             capture_resolver=lambda _requested: reordered,
         )
 
@@ -1054,7 +1091,7 @@ def test_negative_zero_and_invalid_coordinate_payloads_have_one_identity():
         )
 
 
-def test_resource_policy_rejects_before_apply_or_repository_blob_decode(tmp_path, monkeypatch):
+def test_resource_policy_rejects_before_apply_or_blob_decode():
     artifact = _artifact()
     frame = _value(
         artifact.frame_contract,
@@ -1070,10 +1107,16 @@ def test_resource_policy_rejects_before_apply_or_repository_blob_decode(tmp_path
             resource_policy=tiny_work,
         )
     with pytest.raises(CalibrationResourceExceeded, match="model count"):
-        CalibrationRepository(
-            tmp_path / "model-limit",
-            resource_policy=CalibrationResourcePolicy(max_models=2),
-        ).put(artifact)
+        validate_calibration_artifact_resources(
+            artifact,
+            CalibrationResourcePolicy(max_models=2),
+        )
+    summary = calibration_resource_summary(artifact)
+    with pytest.raises(CalibrationResourceExceeded, match="model count"):
+        validate_calibration_resource_summary(
+            summary,
+            CalibrationResourcePolicy(max_models=2),
+        )
     payload = encode_calibration_artifact(artifact)
     with pytest.raises(CalibrationResourceExceeded, match="payload"):
         decode_calibration_artifact(
@@ -1082,75 +1125,6 @@ def test_resource_policy_rejects_before_apply_or_repository_blob_decode(tmp_path
         )
     with pytest.raises(TypeError, match="bytes-like"):
         decode_calibration_artifact(10_000_000)  # type: ignore[arg-type]
-
-    root = tmp_path / "blob-limit"
-    permissive = CalibrationRepository(root)
-    reference = permissive.put(artifact)
-    summary_limited = CalibrationRepository(
-        root,
-        resource_policy=CalibrationResourcePolicy(max_models=2),
-    )
-    monkeypatch.setattr(
-        summary_limited._store,
-        "read_blob",
-        lambda _reference, **_kwargs: pytest.fail("summary admission read the artifact blob"),
-    )
-    with pytest.raises(CalibrationResourceExceeded, match="model count"):
-        summary_limited.load(reference)
-    restrictive = CalibrationRepository(
-        root,
-        resource_policy=CalibrationResourcePolicy(max_artifact_blob_bytes=1),
-    )
-    monkeypatch.setattr(
-        restrictive._store,
-        "read_blob",
-        lambda _reference, **_kwargs: pytest.fail("oversized blob was read before size admission"),
-    )
-    with pytest.raises(CalibrationResourceExceeded, match="blob"):
-        restrictive.load(reference)
-    manifest_limited = CalibrationRepository(
-        root,
-        resource_policy=CalibrationResourcePolicy(max_manifest_bytes=1),
-    )
-    with pytest.raises(CalibrationResourceExceeded, match="manifest"):
-        manifest_limited.load(reference)
-
-
-def test_repository_recomputes_manifest_resource_summary_and_rejects_forgery(tmp_path):
-    artifact = _artifact()
-    repository = CalibrationRepository(tmp_path / "summary-forgery")
-    reference = repository.put(artifact)
-    manifest = decode(
-        repository._store.read_manifest("calibration", reference.manifest_digest)
-    )
-    manifest["resource_summary"]["site_count"] += 1
-    forged_payload = encode(manifest)
-    forged = repository._store.publish_manifest("calibration", forged_payload)
-    forged_reference = type(reference)(repository.repository_id, forged.content.digest)
-    with pytest.raises(ValueError, match="summary differs"):
-        repository.load(forged_reference)
-
-
-def test_repository_blob_limit_uses_physical_size_not_forged_manifest_size(tmp_path):
-    artifact = _artifact()
-    root = tmp_path / "physical-blob-limit"
-    repository = CalibrationRepository(root)
-    reference = repository.put(artifact)
-    manifest = decode(
-        repository._store.read_manifest("calibration", reference.manifest_digest)
-    )
-    actual_size = manifest["artifact_blob"]["size"]
-    manifest["artifact_blob"]["size"] = 1
-    forged = repository._store.publish_manifest("calibration", encode(manifest))
-    forged_reference = type(reference)(repository.repository_id, forged.content.digest)
-    restricted = CalibrationRepository(
-        root,
-        resource_policy=CalibrationResourcePolicy(
-            max_artifact_blob_bytes=actual_size - 1,
-        ),
-    )
-    with pytest.raises(CalibrationResourceExceeded, match="blob"):
-        restricted.load(forged_reference)
 
 
 @pytest.mark.parametrize(
@@ -1269,20 +1243,12 @@ def test_quality_codec_v2_is_exact_and_carries_per_class_confidence_evidence():
         decode_calibration_artifact(encode(unknown))
 
 
-def test_content_addressed_repository_round_trip_is_stable_and_namespace_typed(tmp_path):
-    artifact = _artifact()
-    repository = CalibrationRepository(tmp_path / "calibrations", repository_id="lab-a")
-    first = repository.put(artifact)
-    second = repository.put(_artifact(model_order=(0, 1, 2)))
-    assert first == second
-    assert repository.has(first)
-    assert decode_calibration_artifact_ref(encode_calibration_artifact_ref(first)) == first
-    loaded = repository.load(first)
-    assert encode_calibration_artifact(loaded) == encode_calibration_artifact(artifact)
-
-    other = CalibrationRepository(tmp_path / "other", repository_id="lab-b")
-    with pytest.raises(ValueError, match="another repository"):
-        other.load(first)
+def test_calibration_reference_codec_is_stable_and_namespace_typed():
+    reference = CalibrationArtifactRef("lab-a", "a" * 64)
+    assert decode_calibration_artifact_ref(
+        encode_calibration_artifact_ref(reference)
+    ) == reference
+    assert CalibrationArtifactRef("lab-b", reference.manifest_digest) != reference
 
 
 def test_out_of_frame_geometry_is_rejected_at_application_not_silently_clipped():

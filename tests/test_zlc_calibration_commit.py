@@ -342,6 +342,19 @@ def test_flat_run_commits_reopens_and_admits_only_after_exact_source_reload(
         class _ForgedAdmission(AdmittedCalibration):
             pass
 
+    forged = object.__new__(AdmittedCalibration)
+    for slot in AdmittedCalibration.__slots__:
+        if slot == "__weakref__":
+            continue
+        object.__setattr__(forged, slot, object.__getattribute__(admitted, slot))
+    object.__setattr__(
+        forged,
+        "_reference",
+        CalibrationArtifactRef(reference.repository_id, "0" * 64),
+    )
+    with pytest.raises(PermissionError, match="authority is invalid"):
+        forged.artifact
+
     copied_root = tmp_path / "reopened-calibrations"
     _copy_calibration_repository(repository, copied_root, include_journal=True)
     reopened = CalibrationRepository(
@@ -513,6 +526,14 @@ def test_manifest_and_derivation_tampering_are_rejected_current_only(committed):
             committed.calibration_ref.manifest_digest,
         )
     )
+
+    forged_manifest = decode(encode(manifest))
+    forged_manifest["resource_summary"]["site_count"] += 1
+    stored = repository._store.publish_manifest("calibration", encode(forged_manifest))
+    with pytest.raises(ValueError, match="summary differs"):
+        repository.load(
+            CalibrationArtifactRef(repository.repository_id, stored.content.digest)
+        )
 
     forged_manifest = decode(encode(manifest))
     forged_manifest["request_fingerprint"] = "0" * 64

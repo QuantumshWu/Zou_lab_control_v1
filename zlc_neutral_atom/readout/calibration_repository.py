@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import threading
 from typing import TYPE_CHECKING, Any
+import weakref
 
 from zlc_storage import (
     CanonicalDecodeLimits,
@@ -110,6 +112,9 @@ _CALIBRATION_PLAN_BINDING_SCHEMA = "zlc_neutral_atom.CalibrationPlanBinding/v1"
 _CALIBRATION_ANALYSIS_RESULT_SCHEMA = "zlc_neutral_atom.CalibrationAnalysisResult/v1"
 _ADMITTED_CALIBRATION_EVIDENCE_SCHEMA = (
     "zlc_neutral_atom.AdmittedCalibrationEvidence/v1"
+)
+_ADMITTED_CALIBRATION_INTEGRITY_SCHEMA = (
+    "zlc_neutral_atom.AdmittedCalibrationIntegrity/v1"
 )
 _CALIBRATION_NAMESPACE = "calibration"
 _EXECUTED_TOKEN = object()
@@ -383,6 +388,38 @@ def _admitted_calibration_evidence_digest(
     )
 
 
+def _admitted_calibration_integrity_digest(
+    *,
+    repository_token: object,
+    reference: CalibrationArtifactRef,
+    artifact: CalibrationArtifact,
+    commit_kind: CommitKind,
+    commit_id: str,
+    evidence_digest: str,
+) -> str:
+    """Bind every public admission fact to its process-local repository owner."""
+
+    if repository_token is None:
+        raise ValueError("AdmittedCalibration repository authority is absent")
+    if not isinstance(reference, CalibrationArtifactRef):
+        raise TypeError("reference must be CalibrationArtifactRef")
+    if not isinstance(artifact, CalibrationArtifact):
+        raise TypeError("artifact must be CalibrationArtifact")
+    if commit_kind is not CommitKind.FINAL:
+        raise ValueError("AdmittedCalibration requires FINAL commit evidence")
+    return canonical_digest(
+        {
+            "schema": _ADMITTED_CALIBRATION_INTEGRITY_SCHEMA,
+            "repository_authority_identity": id(repository_token),
+            "reference": calibration_artifact_ref_to_tree(reference),
+            "artifact_fingerprint": artifact.fingerprint,
+            "commit_kind": commit_kind.value,
+            "commit_id": _canonical_text(commit_id, "commit_id"),
+            "evidence_digest": _sha256(evidence_digest, "evidence_digest"),
+        }
+    )
+
+
 @dataclass(frozen=True)
 class _PreparedCalibrationAnalysis:
     capture_admission: AdmittedCapture
@@ -517,6 +554,21 @@ class _LoadedCalibration:
     evidence_digest: str
 
 
+@dataclass(frozen=True)
+class _AdmittedCalibrationAuthority:
+    repository_token: object
+    reference: CalibrationArtifactRef
+    artifact: CalibrationArtifact
+    commit_kind: CommitKind
+    commit_id: str
+    evidence_digest: str
+    integrity_digest: str
+
+
+_ADMITTED_CALIBRATION_AUTHORITIES = weakref.WeakKeyDictionary()
+_ADMITTED_CALIBRATION_AUTHORITIES_LOCK = threading.RLock()
+
+
 class AdmittedCalibration:
     """Non-serializable process-local proof of source-verified calibration admission."""
 
@@ -528,6 +580,8 @@ class AdmittedCalibration:
         "_commit_kind",
         "_commit_id",
         "_evidence_digest",
+        "_integrity_digest",
+        "__weakref__",
     )
 
     def __init_subclass__(cls, **_kwargs) -> None:
@@ -565,6 +619,25 @@ class AdmittedCalibration:
         object.__setattr__(self, "_commit_kind", commit_kind)
         object.__setattr__(self, "_commit_id", commit_id)
         object.__setattr__(self, "_evidence_digest", evidence_digest)
+        integrity_digest = _admitted_calibration_integrity_digest(
+            repository_token=repository_token,
+            reference=reference,
+            artifact=artifact,
+            commit_kind=commit_kind,
+            commit_id=commit_id,
+            evidence_digest=evidence_digest,
+        )
+        object.__setattr__(self, "_integrity_digest", integrity_digest)
+        with _ADMITTED_CALIBRATION_AUTHORITIES_LOCK:
+            _ADMITTED_CALIBRATION_AUTHORITIES[self] = _AdmittedCalibrationAuthority(
+                repository_token,
+                reference,
+                artifact,
+                commit_kind,
+                commit_id,
+                evidence_digest,
+                integrity_digest,
+            )
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("AdmittedCalibration is immutable")
@@ -576,12 +649,46 @@ class AdmittedCalibration:
         raise TypeError("AdmittedCalibration is process-local and cannot be serialized")
 
     def _require_authority(self) -> None:
-        if (
-            type(self) is not AdmittedCalibration
-            or self._token is not _ADMISSION_TOKEN
-            or self._repository_token is None
-        ):
+        with _ADMITTED_CALIBRATION_AUTHORITIES_LOCK:
+            authority = _ADMITTED_CALIBRATION_AUTHORITIES.get(self)
+        if not isinstance(authority, _AdmittedCalibrationAuthority):
             raise PermissionError("AdmittedCalibration authority is invalid")
+        try:
+            token = self._token
+            repository_token = self._repository_token
+            reference = self._reference
+            artifact = self._artifact
+            commit_kind = self._commit_kind
+            commit_id = self._commit_id
+            evidence_digest = self._evidence_digest
+            integrity_digest = self._integrity_digest
+        except AttributeError:
+            raise PermissionError("AdmittedCalibration authority is invalid") from None
+        if type(self) is not AdmittedCalibration or token is not _ADMISSION_TOKEN:
+            raise PermissionError("AdmittedCalibration authority is invalid")
+        if (
+            repository_token is not authority.repository_token
+            or reference is not authority.reference
+            or artifact is not authority.artifact
+            or commit_kind is not authority.commit_kind
+            or commit_id != authority.commit_id
+            or evidence_digest != authority.evidence_digest
+            or integrity_digest != authority.integrity_digest
+        ):
+            raise PermissionError("AdmittedCalibration authority binding changed")
+        try:
+            expected = _admitted_calibration_integrity_digest(
+                repository_token=repository_token,
+                reference=reference,
+                artifact=artifact,
+                commit_kind=commit_kind,
+                commit_id=commit_id,
+                evidence_digest=evidence_digest,
+            )
+        except (TypeError, ValueError) as error:
+            raise PermissionError("AdmittedCalibration authority is invalid") from error
+        if integrity_digest != expected:
+            raise PermissionError("AdmittedCalibration integrity binding changed")
 
     @property
     def reference(self) -> CalibrationArtifactRef:
