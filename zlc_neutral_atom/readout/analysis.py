@@ -290,15 +290,9 @@ class CalibrationWorkPlan:
 
     @property
     def fingerprint(self) -> str:
-        return canonical_digest(
-            {
-                "schema": "zlc_neutral_atom.CalibrationWorkPlan/v1",
-                **{
-                    name: getattr(self, name)
-                    for name in self.__dataclass_fields__
-                },
-            }
-        )
+        from .analysis_codec import calibration_work_plan_to_tree
+
+        return canonical_digest(calibration_work_plan_to_tree(self))
 
 
 @dataclass(frozen=True)
@@ -421,62 +415,9 @@ class CalibrationAnalysisRequest:
 
     @property
     def fingerprint(self) -> str:
-        artifact = self.resource_policy.artifact_policy
-        return canonical_digest(
-            {
-                "schema": "zlc_neutral_atom.CalibrationAnalysisRequest/v3",
-                "layout": {
-                    "axis_id": self.layout.readout_event_axis_id.value,
-                    "references": list(self.layout.reference_event_indices),
-                    "readout": self.layout.readout_event_index,
-                },
-                "grid_shape_yx": list(self.grid_shape_yx),
-                "grid_order": self.grid_order.value,
-                "box": {
-                    "half_width": self.box.half_width,
-                    "reducer": self.box.reducer.value,
-                },
-                "model_kinds": [kind.value for kind in self.model_kinds],
-                "default_model_kind": (
-                    None
-                    if self.default_model_kind is None
-                    else self.default_model_kind.value
-                ),
-                "psf": (
-                    None
-                    if self.psf is None
-                    else {
-                        "half_width": self.psf.half_width,
-                        "background": self.psf.background.value,
-                        "background_padding": self.psf.background_padding,
-                    }
-                ),
-                "detection": {
-                    name: getattr(self.detection, name)
-                    for name in self.detection.__dataclass_fields__
-                },
-                "train_fraction": self.train_fraction,
-                "random_seed": self.random_seed,
-                "minimum_train_samples_per_class": self.minimum_train_samples_per_class,
-                "minimum_test_samples_per_class": self.minimum_test_samples_per_class,
-                "held_out_confidence_level": self.held_out_confidence_level,
-                "minimum_held_out_class_accuracy_lower_bound": (
-                    self.minimum_held_out_class_accuracy_lower_bound
-                ),
-                "usable_site_acceptance": self.usable_site_acceptance.value,
-                "minimum_usable_site_fraction": self.minimum_usable_site_fraction,
-                "reference_occupied_above": self.reference_occupied_above,
-                "resource_policy": {
-                    name: getattr(self.resource_policy, name)
-                    for name in self.resource_policy.__dataclass_fields__
-                    if name != "artifact_policy"
-                },
-                "artifact_policy": {
-                    name: getattr(artifact, name)
-                    for name in artifact.__dataclass_fields__
-                },
-            }
-        )
+        from .analysis_codec import calibration_analysis_request_to_tree
+
+        return canonical_digest(calibration_analysis_request_to_tree(self))
 
 
 @dataclass(frozen=True)
