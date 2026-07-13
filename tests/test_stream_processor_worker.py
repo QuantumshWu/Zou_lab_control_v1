@@ -1239,6 +1239,21 @@ def test_thread_start_failure_synchronously_releases_the_exact_graph(monkeypatch
     item.worker.close(0.05)
 
 
+def test_pre_start_deadline_failure_synchronously_releases_the_exact_graph():
+    item = chain(points=1)
+    item.worker._deadline_monotonic = time.monotonic() - 1.0
+
+    with pytest.raises(TimeoutError, match="deadline expired") as caught:
+        item.worker.start()
+    assert item.worker.error is caught.value
+    assert item.reservation.state is ReservationState.RELEASED
+    assert not item.source._reservations
+    assert not item.output._reservations
+    assert item.source._formal_rebind_required
+    assert not item.worker.is_alive
+    item.worker.close(0.05)
+
+
 def test_readiness_is_stable_but_single_bind_and_stale_proofs_are_rejected():
     item = chain(points=1)
     with pytest.raises(StreamProcessorError, match="has not started"):

@@ -416,28 +416,30 @@ class ExactStreamProcessorWorker:
             return self._error
 
     def start(self) -> None:
-        self._checkpoint()
-        # Recheck the immediate downstream after construction and before this
-        # thread becomes observable.  The worker's own readiness cannot be
-        # checked until its thread is alive, but the already-started tail can.
-        self._output_sink.readiness._validate_terminal_sink()
         start_failure: BaseException | None = None
         failure_traceback = None
         with self._condition:
             if self._thread is not None or self._done or self._closing:
                 raise StreamProcessorError("processor worker can start only once")
-            thread = threading.Thread(
-                target=self._run,
-                name=f"stream-processor:{self._bound.definition.key}",
-                daemon=False,
-            )
-            self._thread = thread
             try:
+                self._checkpoint()
+                # Recheck the immediate downstream after construction and
+                # before this thread becomes observable.  Construction has
+                # already claimed both exact reservations, so every failure
+                # from this point must synchronously tear down the graph.
+                self._output_sink.readiness._validate_terminal_sink()
+                thread = threading.Thread(
+                    target=self._run,
+                    name=f"stream-processor:{self._bound.definition.key}",
+                    daemon=False,
+                )
+                self._thread = thread
                 thread.start()
             except BaseException as error:
-                # Thread.start is the worker's atomic liveness commit.  An OS
-                # failure must not leave a non-running Thread object owning an
-                # ACTIVE exact graph that close() can never join.
+                # Thread.start is the atomic liveness commit.  Deadline,
+                # cancellation, stale-downstream, and OS start failures all
+                # happen after construction claimed the exact graph and must
+                # therefore share the same synchronous rollback.
                 self._thread = None
                 self._error = error
                 self._closing = True
