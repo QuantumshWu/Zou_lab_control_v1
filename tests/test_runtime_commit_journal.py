@@ -7,7 +7,9 @@ import pytest
 from zlc_neutral_atom.runtime import (
     CheckpointCommit,
     CommitIntent,
+    CommitKind,
     CommitRecovery,
+    CommitSubject,
     CommitTarget,
     MemoryCommitJournal,
     PersistentCommitJournal,
@@ -23,6 +25,7 @@ REPOSITORY_ID = "test-repository"
 
 def intent(commit_id: str) -> CommitIntent:
     return CommitIntent(
+        kind=CommitKind.FINAL,
         commit_id=commit_id,
         run_id="test-run",
         safety_bundle_id="test-safety-bundle",
@@ -86,6 +89,7 @@ def test_persistent_commit_journal_rejects_conflicting_intent(tmp_path):
     with pytest.raises(ValueError, match="conflicting content"):
         journal.begin(
             CommitIntent(
+                kind=CommitKind.FINAL,
                 commit_id="same-id",
                 run_id="another-run",
                 safety_bundle_id="test-safety-bundle",
@@ -201,6 +205,9 @@ def test_commit_authority_payload_is_immutable():
     )
     target = intent("immutable-authority").target
     authority = coordinator.prepare(
+        CommitKind.FINAL,
+        "immutable-authority",
+        CommitSubject("test-run", "test-safety-bundle"),
         target,
         lambda: PublishedManifest(
             target_ref=target.target_ref,
@@ -210,6 +217,10 @@ def test_commit_authority_payload_is_immutable():
     )
 
     replacements = {
+        "kind": CommitKind.CHECKPOINT,
+        "commit_id": "rogue-id",
+        "run_id": "rogue-run",
+        "safety_bundle_id": "rogue-safety",
         "target": intent("rogue-target").target,
         "journal": MemoryCommitJournal(REPOSITORY_ID),
         "recover": lambda value: CommitRecovery(
@@ -231,6 +242,10 @@ def test_commit_authority_payload_is_immutable():
             setattr(authority, name, replacement)
 
     assert authority.target == target
+    assert authority.kind is CommitKind.FINAL
+    assert authority.commit_id == "immutable-authority"
+    assert authority.run_id == "test-run"
+    assert authority.safety_bundle_id == "test-safety-bundle"
     assert not hasattr(authority, "publish")
     assert not hasattr(authority, "journal")
     assert not hasattr(authority, "recover")
@@ -246,9 +261,10 @@ def test_checkpoint_commit_is_a_distinct_typed_operation_not_a_final_flag():
     )
     target = intent("typed-checkpoint").target
     checkpoint = CheckpointCommit(
-        "typed-checkpoint",
-        "test-safety-bundle",
         coordinator.prepare(
+            CommitKind.CHECKPOINT,
+            "typed-checkpoint",
+            CommitSubject("test-run", "test-safety-bundle"),
             target,
             lambda: PublishedManifest(
                 target.target_ref,
@@ -259,5 +275,10 @@ def test_checkpoint_commit_is_a_distinct_typed_operation_not_a_final_flag():
     )
     assert not isinstance(checkpoint, FinalCommit)
     assert checkpoint.target == target
+    assert checkpoint.commit_id == "typed-checkpoint"
+    assert checkpoint.run_id == "test-run"
+    assert checkpoint.safety_bundle_id == "test-safety-bundle"
+    with pytest.raises(TypeError, match="FINAL commit authority"):
+        FinalCommit(checkpoint.authority)
     with pytest.raises(AttributeError, match="cannot assign"):
         checkpoint.commit_id = "mutated"

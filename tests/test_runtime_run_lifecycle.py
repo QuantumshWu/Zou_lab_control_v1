@@ -20,6 +20,8 @@ from zlc_neutral_atom.runtime import (
     CapabilityRevoked,
     CommitRecovery,
     CommitIntent,
+    CommitKind,
+    CommitSubject,
     CommitTarget,
     DeviceBroker,
     DeviceIdentityAck,
@@ -146,11 +148,16 @@ def commit(
             result=publish(),
         )
 
+    subject = context.authorize_commit_preparation(CommitKind.FINAL)
     return context.commit_final(
         FinalCommit(
-            commit_id=commit_id,
-            safety_bundle_id=context.safety_bundle_id,
-            authority=coordinator.prepare(target, publish_manifest),
+            coordinator.prepare(
+                CommitKind.FINAL,
+                commit_id,
+                subject,
+                target,
+                publish_manifest,
+            )
         )
     )
 
@@ -185,13 +192,33 @@ def checkpoint_commit(
             result=publish(),
         )
 
+    subject = context.authorize_commit_preparation(CommitKind.CHECKPOINT)
     return context.commit_checkpoint(
         CheckpointCommit(
-            commit_id=commit_id,
-            safety_bundle_id=context.safety_bundle_id,
-            authority=coordinator.prepare(target, publish_manifest),
+            coordinator.prepare(
+                CommitKind.CHECKPOINT,
+                commit_id,
+                subject,
+                target,
+                publish_manifest,
+            )
         )
     )
+
+
+def prepared_authority(
+    context: PostSafetyContext,
+    coordinator: RepositoryCommitCoordinator,
+    kind: CommitKind,
+    commit_id: str,
+    target: CommitTarget,
+    publish,
+    *,
+    subject: CommitSubject | None = None,
+):
+    if subject is None:
+        subject = context.authorize_commit_preparation(kind)
+    return coordinator.prepare(kind, commit_id, subject, target, publish)
 
 
 def plan(
@@ -1439,9 +1466,11 @@ def test_cancel_before_checkpoint_call_writes_no_intent_and_discards_authority()
             "0" * 64,
         )
         operation = CheckpointCommit(
-            "cancel-before-checkpoint-call",
-            context.safety_bundle_id,
-            coordinator.prepare(
+            prepared_authority(
+                context,
+                coordinator,
+                CommitKind.CHECKPOINT,
+                "cancel-before-checkpoint-call",
                 target,
                 lambda: PublishedManifest(
                     target.target_ref,
@@ -1795,9 +1824,11 @@ def test_second_checkpoint_is_rejected_and_its_authority_is_discarded():
             "0" * 64,
         )
         return CheckpointCommit(
-            f"checkpoint-{suffix}",
-            context.safety_bundle_id,
-            coordinator.prepare(
+            prepared_authority(
+                context,
+                coordinator,
+                CommitKind.CHECKPOINT,
+                f"checkpoint-{suffix}",
                 target,
                 lambda: PublishedManifest(
                     target.target_ref,
@@ -1844,14 +1875,20 @@ def test_checkpoint_wrong_safety_bundle_discards_authority_before_intent():
         )
         return context.commit_checkpoint(
             CheckpointCommit(
-                "wrong-checkpoint-safety",
-                "wrong-safety-bundle",
-                coordinator.prepare(
+                prepared_authority(
+                    context,
+                    coordinator,
+                    CommitKind.CHECKPOINT,
+                    "wrong-checkpoint-safety",
                     target,
                     lambda: PublishedManifest(
                         target.target_ref,
                         target.expected_manifest_digest,
                         "raw-ref",
+                    ),
+                    subject=CommitSubject(
+                        context.run_id.value,
+                        "wrong-safety-bundle",
                     ),
                 ),
             )
@@ -1889,9 +1926,11 @@ def test_cancelled_final_commit_rejection_discards_unconsumed_authority():
             "0" * 64,
         )
         operation = FinalCommit(
-            "cancelled-final-authority",
-            context.safety_bundle_id,
-            coordinator.prepare(
+            prepared_authority(
+                context,
+                coordinator,
+                CommitKind.FINAL,
+                "cancelled-final-authority",
                 target,
                 lambda: PublishedManifest(
                     target.target_ref,
@@ -1942,9 +1981,11 @@ def test_nonowner_inflight_rejection_preserves_authority_for_owner_gate():
             for index in (1, 2)
         )
         second_operation = FinalCommit(
-            "inflight-final-2",
-            context.safety_bundle_id,
-            coordinator.prepare(
+            prepared_authority(
+                context,
+                coordinator,
+                CommitKind.FINAL,
+                "inflight-final-2",
                 targets[1],
                 lambda: PublishedManifest(
                     targets[1].target_ref,
@@ -1972,9 +2013,14 @@ def test_nonowner_inflight_rejection_preserves_authority_for_owner_gate():
             )
 
         first_operation = FinalCommit(
-            "inflight-final-1",
-            context.safety_bundle_id,
-            coordinator.prepare(targets[0], publish_first),
+            prepared_authority(
+                context,
+                coordinator,
+                CommitKind.FINAL,
+                "inflight-final-1",
+                targets[0],
+                publish_first,
+            ),
         )
         result = context.commit_final(first_operation)
         assert len(coordinator._authorities) == 1
@@ -2019,9 +2065,11 @@ def test_final_already_committed_rejection_discards_second_authority():
             "0" * 64,
         )
         return FinalCommit(
-            f"already-final-{index}",
-            context.safety_bundle_id,
-            coordinator.prepare(
+            prepared_authority(
+                context,
+                coordinator,
+                CommitKind.FINAL,
+                f"already-final-{index}",
                 target,
                 lambda: PublishedManifest(
                     target.target_ref,
@@ -2077,10 +2125,15 @@ def test_running_nonowner_rejection_preserves_same_operation_for_owner(kind):
             "0" * 64,
         )
         operation_type = CheckpointCommit if kind == "checkpoint" else FinalCommit
+        operation_kind = (
+            CommitKind.CHECKPOINT if kind == "checkpoint" else CommitKind.FINAL
+        )
         operation = operation_type(
-            f"nonowner-first-{kind}",
-            context.safety_bundle_id,
-            coordinator.prepare(
+            prepared_authority(
+                context,
+                coordinator,
+                operation_kind,
+                f"nonowner-first-{kind}",
                 target,
                 lambda: published.set()
                 or PublishedManifest(
@@ -2147,9 +2200,11 @@ def test_escaped_final_context_cannot_mutate_terminal_run_and_burns_authority():
         )
         escaped["context"] = context
         escaped["operation"] = FinalCommit(
-            "terminal-escape",
-            context.safety_bundle_id,
-            coordinator.prepare(
+            prepared_authority(
+                context,
+                coordinator,
+                CommitKind.FINAL,
+                "terminal-escape",
                 target,
                 lambda: published.set()
                 or PublishedManifest(
@@ -2215,9 +2270,14 @@ def test_same_final_operation_loser_cannot_consume_authority_from_owner_winner()
             )
 
         operation_box["operation"] = FinalCommit(
-            "same-operation-race",
-            context.safety_bundle_id,
-            coordinator.prepare(target, publish_manifest),
+            prepared_authority(
+                context,
+                coordinator,
+                CommitKind.FINAL,
+                "same-operation-race",
+                target,
+                publish_manifest,
+            ),
         )
         return context.commit_final(operation_box["operation"])
 
@@ -2413,10 +2473,12 @@ def test_pending_checkpoint_reconciliation_rejects_and_discards_final_commit():
                 "artifacts/rejected-final-after-checkpoint",
                 "0" * 64,
             )
-            operation = FinalCommit(
-                "rejected-final-after-checkpoint",
-                context.safety_bundle_id,
-                final_coordinator.prepare(
+            with pytest.raises(RuntimeError, match="reconciliation is pending"):
+                prepared_authority(
+                    context,
+                    final_coordinator,
+                    CommitKind.FINAL,
+                    "rejected-final-after-checkpoint",
                     target,
                     lambda: final_published.set()
                     or PublishedManifest(
@@ -2424,10 +2486,7 @@ def test_pending_checkpoint_reconciliation_rejects_and_discards_final_commit():
                         target.expected_manifest_digest,
                         "final-ref",
                     ),
-                ),
-            )
-            with pytest.raises(RuntimeError, match="reconciliation is pending"):
-                context.commit_final(operation)
+                )
             return "swallowed"
 
     handle = RunController(new_arbiter()).start(
@@ -2473,6 +2532,7 @@ def test_conflicting_existing_intent_is_never_aborted_by_begin_failure():
         "1" * 64,
     )
     old_intent = CommitIntent(
+        CommitKind.CHECKPOINT,
         "conflicting-intent-id",
         "old-run",
         "old-safety",
@@ -2491,9 +2551,11 @@ def test_conflicting_existing_intent_is_never_aborted_by_begin_failure():
         )
         return context.commit_checkpoint(
             CheckpointCommit(
-                "conflicting-intent-id",
-                context.safety_bundle_id,
-                coordinator.prepare(
+                prepared_authority(
+                    context,
+                    coordinator,
+                    CommitKind.CHECKPOINT,
+                    "conflicting-intent-id",
                     new_target,
                     lambda: PublishedManifest(
                         new_target.target_ref,
@@ -2536,10 +2598,15 @@ def test_admit_rechecks_deadline_after_outer_validation_before_any_io(kind):
             "0" * 64,
         )
         operation_type = CheckpointCommit if kind == "checkpoint" else FinalCommit
+        operation_kind = (
+            CommitKind.CHECKPOINT if kind == "checkpoint" else CommitKind.FINAL
+        )
         operation = operation_type(
-            f"deadline-toctou-{kind}",
-            context.safety_bundle_id,
-            coordinator.prepare(
+            prepared_authority(
+                context,
+                coordinator,
+                operation_kind,
+                f"deadline-toctou-{kind}",
                 target,
                 lambda: published.set()
                 or PublishedManifest(
@@ -2644,9 +2711,11 @@ def test_publish_digest_must_match_repository_commit_target():
     def finalize(context: PostSafetyContext, _result):
         return context.commit_final(
             FinalCommit(
-                commit_id="digest-mismatch",
-                safety_bundle_id=context.safety_bundle_id,
-                authority=coordinator.prepare(
+                prepared_authority(
+                    context,
+                    coordinator,
+                    CommitKind.FINAL,
+                    "digest-mismatch",
                     target,
                     lambda: PublishedManifest(
                         target_ref=target.target_ref,
@@ -2699,9 +2768,11 @@ def test_wrong_digest_remains_force_abort_after_abort_marker_failure():
     def finalize(context: PostSafetyContext, _result):
         return context.commit_final(
             FinalCommit(
-                commit_id="wrong-digest-marker-failure",
-                safety_bundle_id=context.safety_bundle_id,
-                authority=coordinator.prepare(
+                prepared_authority(
+                    context,
+                    coordinator,
+                    CommitKind.FINAL,
+                    "wrong-digest-marker-failure",
                     target,
                     lambda: PublishedManifest(
                         target_ref=target.target_ref,
@@ -2910,7 +2981,7 @@ def test_required_final_commit_cannot_be_bypassed_by_plain_finalize_result():
     assert "requires a final artifact commit" in handle.snapshot().primary_error
 
 
-def test_commit_authority_is_single_use_across_runs():
+def test_commit_authority_is_single_use_and_bound_to_its_minting_run():
     journal = MemoryCommitJournal("test-repository")
     target = CommitTarget(
         repository_id="test-repository",
@@ -2925,19 +2996,25 @@ def test_commit_authority_is_single_use_across_runs():
         lambda _intent: CommitRecovery(committed=False),
         allow_ephemeral=True,
     )
-    authority = coordinator.prepare(
-        target,
-        lambda: PublishedManifest(
-            target_ref=target.target_ref,
-            manifest_digest=target.expected_manifest_digest,
-            result=publish_calls.append("published") or "artifact-ref",
-        ),
-    )
-    operation = FinalCommit(
-        commit_id="single-use-authority",
-        safety_bundle_id=None,
-        authority=authority,
-    )
+    operation_box = {}
+
+    def finalize(context: PostSafetyContext, _result):
+        if "operation" not in operation_box:
+            operation_box["operation"] = FinalCommit(
+                prepared_authority(
+                    context,
+                    coordinator,
+                    CommitKind.FINAL,
+                    "single-use-authority",
+                    target,
+                    lambda: PublishedManifest(
+                        target_ref=target.target_ref,
+                        manifest_digest=target.expected_manifest_digest,
+                        result=publish_calls.append("published") or "artifact-ref",
+                    ),
+                )
+            )
+        return context.commit_final(operation_box["operation"])
 
     def run_plan():
         return RunPlan(
@@ -2949,13 +3026,13 @@ def test_commit_authority_is_single_use_across_runs():
             preflight=lambda _context: None,
             execute=lambda _context, _prepared: "staged",
             cleanup=lambda _context, _prepared, _primary: CleanupReport(),
-            finalize=lambda context, _result: context.commit_final(operation),
+            finalize=finalize,
             requires_final_commit=True,
         )
 
     controller = RunController(new_arbiter())
     assert controller.run(run_plan()) == "artifact-ref"
-    with pytest.raises(RunFailed, match="already consumed"):
+    with pytest.raises(RunFailed, match="another Run"):
         controller.run(run_plan())
     assert publish_calls == ["published"]
 
@@ -2979,14 +3056,20 @@ def test_final_commit_must_reference_this_runs_safety_bundle():
         )
         return context.commit_final(
             FinalCommit(
-                commit_id="wrong-safety-bundle-commit",
-                safety_bundle_id="another-safety-bundle",
-                authority=coordinator.prepare(
+                prepared_authority(
+                    context,
+                    coordinator,
+                    CommitKind.FINAL,
+                    "wrong-safety-bundle-commit",
                     target,
                     lambda: PublishedManifest(
                         target_ref=target.target_ref,
                         manifest_digest=target.expected_manifest_digest,
                         result="artifact-ref",
+                    ),
+                    subject=CommitSubject(
+                        context.run_id.value,
+                        "another-safety-bundle",
                     ),
                 ),
             )
@@ -3002,7 +3085,7 @@ def test_final_commit_must_reference_this_runs_safety_bundle():
     )
     with pytest.raises(RunFailed):
         handle.result(2.0)
-    assert "does not match this Run" in handle.snapshot().primary_error
+    assert "safety bundle differs from this Run" in handle.snapshot().primary_error
 
 
 def test_captured_bound_device_reference_has_no_hardware_invocation_surface():

@@ -415,7 +415,7 @@ def test_failed_capture_never_publishes_a_manifest(tmp_path):
         assert runtime.shutdown(timeout=2.0)
 
 
-def test_capture_commit_rejects_a_post_safety_context_from_another_run(tmp_path):
+def test_post_safety_context_cannot_be_forged_for_capture_staging(tmp_path):
     camera, runtime, spec = _runtime_and_spec()
     repository = CaptureRepository(tmp_path / "captures")
     thread, source_failure = _deliver_when_armed(
@@ -429,15 +429,14 @@ def test_capture_commit_rejects_a_post_safety_context_from_another_run(tmp_path)
         result = runtime.controller.run(compile_pipeline(spec))
         thread.join(2.0)
         assert not thread.is_alive() and source_failure == []
-        wrong_context = PostSafetyContext(
-            run_id=RunId("different-run"),
-            cancellation=CancellationToken(),
-            deadline=None,
-            safety_bundle_id="different-safety-bundle",
-            handle=object(),
-        )
-        with pytest.raises(ValueError, match="run_id differs"):
-            repository.final_commit(wrong_context, result)
+        with pytest.raises(PermissionError, match="minted by RunController"):
+            PostSafetyContext(
+                run_id=RunId("different-run"),
+                cancellation=CancellationToken(),
+                deadline=None,
+                safety_bundle_id="different-safety-bundle",
+                handle=object(),
+            )
         manifest_root = (
             tmp_path / "captures" / "content" / "manifests" / "capture"
         )

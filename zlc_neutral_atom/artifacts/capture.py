@@ -47,7 +47,9 @@ from zlc_neutral_atom.capture_reference import (
     CaptureArtifactRef,
 )
 from zlc_neutral_atom.runtime.commit import (
+    CheckpointCommit,
     CommitIntent,
+    CommitKind,
     CommitRecovery,
     CommitTarget,
     FinalCommit,
@@ -581,11 +583,46 @@ class CaptureRepository:
         context: PostSafetyContext,
         result: PipelineResult | TriggeredPipelineResult,
     ) -> FinalCommit[CaptureArtifactRef]:
+        operation = self._commit_operation(context, result, checkpoint=False)
+        assert isinstance(operation, FinalCommit)
+        return operation
+
+    def checkpoint_commit(
+        self,
+        context: PostSafetyContext,
+        result: PipelineResult | TriggeredPipelineResult,
+    ) -> CheckpointCommit[CaptureArtifactRef]:
+        """Prepare one typed raw-capture checkpoint without committing the Run.
+
+        Checkpoints and final commits intentionally share the exact staging,
+        target, publication, and recovery path.  This factory only chooses the
+        runtime operation type and a collision-free intent id; the caller still
+        has to submit the returned operation through its PostSafetyContext.
+        """
+
+        operation = self._commit_operation(context, result, checkpoint=True)
+        assert isinstance(operation, CheckpointCommit)
+        return operation
+
+    def _commit_operation(
+        self,
+        context: PostSafetyContext,
+        result: PipelineResult | TriggeredPipelineResult,
+        *,
+        checkpoint: bool,
+    ) -> FinalCommit[CaptureArtifactRef] | CheckpointCommit[CaptureArtifactRef]:
         if not isinstance(context, PostSafetyContext):
-            raise TypeError("final_commit requires PostSafetyContext")
+            raise TypeError("capture commit requires PostSafetyContext")
         if not isinstance(result, (PipelineResult, TriggeredPipelineResult)):
-            raise TypeError("final_commit requires an exact pipeline result")
+            raise TypeError("capture commit requires an exact pipeline result")
+        if not isinstance(checkpoint, bool):
+            raise TypeError("checkpoint selector must be bool")
+        kind = CommitKind.CHECKPOINT if checkpoint else CommitKind.FINAL
+        subject = context.authorize_commit_preparation(kind)
         reference, manifest_payload = self._stage_pipeline_result(result, context)
+        confirmed_subject = context.authorize_commit_preparation(kind)
+        if confirmed_subject != subject:
+            raise RuntimeError("capture commit subject changed while staging")
         target = CommitTarget(
             self.repository_id,
             "capture",
@@ -608,13 +645,20 @@ class CaptureRepository:
                 reference,
             )
 
+        operation_type = CheckpointCommit if checkpoint else FinalCommit
+        operation_kind = "checkpoint" if checkpoint else "final"
         commit_id = (
-            f"capture-{context.run_id.value}-{reference.manifest_digest[:20]}"
+            f"capture-{operation_kind}-{subject.run_id}-"
+            f"{reference.manifest_digest}"
         )
-        return FinalCommit(
-            commit_id,
-            context.safety_bundle_id,
-            self._coordinator.prepare(target, publish),
+        return operation_type(
+            self._coordinator.prepare(
+                kind,
+                commit_id,
+                subject,
+                target,
+                publish,
+            )
         )
 
     def _recover(self, intent: CommitIntent) -> CommitRecovery[CaptureArtifactRef]:

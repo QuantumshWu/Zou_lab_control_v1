@@ -6,6 +6,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Generic, Protocol, TypeVar
 
@@ -28,6 +29,24 @@ def _sha256(value: str, field: str) -> str:
     return value
 
 
+class CommitKind(str, Enum):
+    CHECKPOINT = "CHECKPOINT"
+    FINAL = "FINAL"
+
+
+@dataclass(frozen=True)
+class CommitSubject:
+    """Run identity bound into a repository-minted commit authority."""
+
+    run_id: str
+    safety_bundle_id: str | None
+
+    def __post_init__(self) -> None:
+        _canonical(self.run_id, "commit subject run_id")
+        if self.safety_bundle_id is not None:
+            _canonical(self.safety_bundle_id, "commit subject safety_bundle_id")
+
+
 @dataclass(frozen=True)
 class CommitTarget:
     repository_id: str
@@ -46,6 +65,7 @@ class CommitTarget:
 
 @dataclass(frozen=True)
 class CommitIntent:
+    kind: CommitKind
     commit_id: str
     run_id: str
     safety_bundle_id: str | None
@@ -53,6 +73,8 @@ class CommitIntent:
     created_at: float
 
     def __post_init__(self) -> None:
+        if not isinstance(self.kind, CommitKind):
+            raise TypeError("commit intent kind must be CommitKind")
         _canonical(self.commit_id, "commit_id")
         _canonical(self.run_id, "run_id")
         if self.safety_bundle_id is not None:
@@ -141,10 +163,27 @@ def _validate_commit_recovery(
 _COMMIT_AUTHORITY_TOKEN = object()
 
 
+@dataclass(frozen=True)
+class _CommitPreparation:
+    kind: CommitKind
+    commit_id: str
+    subject: CommitSubject
+    target: CommitTarget
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, CommitKind):
+            raise TypeError("commit preparation kind must be CommitKind")
+        _canonical(self.commit_id, "commit preparation commit_id")
+        if not isinstance(self.subject, CommitSubject):
+            raise TypeError("commit preparation subject must be CommitSubject")
+        if not isinstance(self.target, CommitTarget):
+            raise TypeError("commit preparation target must be CommitTarget")
+
+
 class CommitAuthority(Generic[CommitT]):
     """Side-effect-free handle to coordinator-owned commit capabilities."""
 
-    __slots__ = ("_coordinator", "_nonce", "_target")
+    __slots__ = ("_coordinator", "_nonce", "_preparation")
 
     def __init__(
         self,
@@ -152,39 +191,74 @@ class CommitAuthority(Generic[CommitT]):
         *,
         coordinator: "RepositoryCommitCoordinator[CommitT]",
         nonce: object,
-        target: CommitTarget,
+        preparation: _CommitPreparation,
     ) -> None:
         if token is not _COMMIT_AUTHORITY_TOKEN:
             raise PermissionError(
                 "CommitAuthority must be minted by RepositoryCommitCoordinator"
             )
-        if not isinstance(target, CommitTarget):
-            raise TypeError("CommitAuthority.target must be CommitTarget")
+        if not isinstance(preparation, _CommitPreparation):
+            raise TypeError("CommitAuthority preparation is invalid")
         if not isinstance(coordinator, RepositoryCommitCoordinator):
             raise TypeError("CommitAuthority coordinator is invalid")
         object.__setattr__(self, "_coordinator", coordinator)
         object.__setattr__(self, "_nonce", nonce)
-        object.__setattr__(self, "_target", target)
+        object.__setattr__(self, "_preparation", preparation)
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("CommitAuthority is immutable")
 
     @property
     def target(self) -> CommitTarget:
-        return self._target
+        return self._preparation.target
+
+    @property
+    def kind(self) -> CommitKind:
+        return self._preparation.kind
+
+    @property
+    def commit_id(self) -> str:
+        return self._preparation.commit_id
+
+    @property
+    def run_id(self) -> str:
+        return self._preparation.subject.run_id
+
+    @property
+    def safety_bundle_id(self) -> str | None:
+        return self._preparation.subject.safety_bundle_id
 
 
 @dataclass(frozen=True)
 class _CommitAuthoritySnapshot(Generic[CommitT]):
-    target: CommitTarget
+    preparation: _CommitPreparation
     journal: CommitJournal
     publish_callback: Callable[[], PublishedManifest[CommitT]]
     recover_callback: Callable[[CommitIntent], CommitRecovery[CommitT]]
 
-    def publish_validated(self) -> CommitT:
+    @property
+    def target(self) -> CommitTarget:
+        return self.preparation.target
+
+    def _validate_intent(self, intent: CommitIntent) -> None:
+        if not isinstance(intent, CommitIntent):
+            raise TypeError("commit authority requires CommitIntent")
+        preparation = self.preparation
+        if (
+            intent.kind is not preparation.kind
+            or intent.commit_id != preparation.commit_id
+            or intent.run_id != preparation.subject.run_id
+            or intent.safety_bundle_id != preparation.subject.safety_bundle_id
+            or intent.target != preparation.target
+        ):
+            raise ValueError("CommitIntent differs from authority preparation")
+
+    def publish_validated(self, intent: CommitIntent) -> CommitT:
+        self._validate_intent(intent)
         return _validate_published_manifest(self.publish_callback(), self.target)
 
     def recover_validated(self, intent: CommitIntent) -> CommitRecovery[CommitT]:
+        self._validate_intent(intent)
         return _validate_commit_recovery(self.recover_callback(intent), self.target)
 
 
@@ -210,16 +284,25 @@ def _discard_commit_authority(authority: CommitAuthority[object]) -> None:
 
 @dataclass(frozen=True)
 class FinalCommit(Generic[CommitT]):
-    commit_id: str
-    safety_bundle_id: str | None
     authority: CommitAuthority[CommitT]
 
     def __post_init__(self) -> None:
-        _canonical(self.commit_id, "final commit_id")
-        if self.safety_bundle_id is not None:
-            _canonical(self.safety_bundle_id, "final commit safety_bundle_id")
         if not isinstance(self.authority, CommitAuthority):
             raise TypeError("FinalCommit.authority must be CommitAuthority")
+        if self.authority.kind is not CommitKind.FINAL:
+            raise TypeError("FinalCommit requires FINAL commit authority")
+
+    @property
+    def commit_id(self) -> str:
+        return self.authority.commit_id
+
+    @property
+    def run_id(self) -> str:
+        return self.authority.run_id
+
+    @property
+    def safety_bundle_id(self) -> str | None:
+        return self.authority.safety_bundle_id
 
     @property
     def target(self) -> CommitTarget:
@@ -230,16 +313,25 @@ class FinalCommit(Generic[CommitT]):
 class CheckpointCommit(Generic[CommitT]):
     """One typed intermediate artifact commit; never a final-commit policy flag."""
 
-    commit_id: str
-    safety_bundle_id: str | None
     authority: CommitAuthority[CommitT]
 
     def __post_init__(self) -> None:
-        _canonical(self.commit_id, "checkpoint commit_id")
-        if self.safety_bundle_id is not None:
-            _canonical(self.safety_bundle_id, "checkpoint commit safety_bundle_id")
         if not isinstance(self.authority, CommitAuthority):
             raise TypeError("CheckpointCommit.authority must be CommitAuthority")
+        if self.authority.kind is not CommitKind.CHECKPOINT:
+            raise TypeError("CheckpointCommit requires CHECKPOINT commit authority")
+
+    @property
+    def commit_id(self) -> str:
+        return self.authority.commit_id
+
+    @property
+    def run_id(self) -> str:
+        return self.authority.run_id
+
+    @property
+    def safety_bundle_id(self) -> str | None:
+        return self.authority.safety_bundle_id
 
     @property
     def target(self) -> CommitTarget:
@@ -310,9 +402,13 @@ class RepositoryCommitCoordinator(Generic[CommitT]):
 
     def prepare(
         self,
+        kind: CommitKind,
+        commit_id: str,
+        subject: CommitSubject,
         target: CommitTarget,
         publish: Callable[[], PublishedManifest[CommitT]],
     ) -> CommitAuthority[CommitT]:
+        preparation = _CommitPreparation(kind, commit_id, subject, target)
         if not isinstance(target, CommitTarget):
             raise TypeError("target must be CommitTarget")
         if target.repository_id != self.repository_id:
@@ -320,7 +416,7 @@ class RepositoryCommitCoordinator(Generic[CommitT]):
         if not callable(publish):
             raise TypeError("publish must be callable")
         snapshot = _CommitAuthoritySnapshot(
-            target=target,
+            preparation=preparation,
             journal=self._journal,
             publish_callback=publish,
             recover_callback=self._recover,
@@ -332,7 +428,7 @@ class RepositoryCommitCoordinator(Generic[CommitT]):
             _COMMIT_AUTHORITY_TOKEN,
             coordinator=self,
             nonce=nonce,
-            target=target,
+            preparation=preparation,
         )
 
     def _consume_authority(
@@ -349,8 +445,8 @@ class RepositoryCommitCoordinator(Generic[CommitT]):
                 snapshot = self._authorities.pop(authority._nonce)  # noqa: SLF001
             except KeyError as exc:
                 raise RuntimeError("commit authority was already consumed") from exc
-        if snapshot.target != authority.target:
-            raise RuntimeError("commit authority target snapshot mismatch")
+        if snapshot.preparation != authority._preparation:  # noqa: SLF001
+            raise RuntimeError("commit authority preparation snapshot mismatch")
         return snapshot
 
 
@@ -427,6 +523,7 @@ class PersistentCommitJournal:
             raise ValueError("commit intent belongs to another repository")
         value = {
             "kind": "INTENT",
+            "operation_kind": intent.kind.value,
             "commit_id": intent.commit_id,
             "run_id": intent.run_id,
             "safety_bundle_id": intent.safety_bundle_id,
@@ -512,6 +609,7 @@ class PersistentCommitJournal:
             elif kind == "INTENT":
                 if set(value) != {
                     "kind",
+                    "operation_kind",
                     "commit_id",
                     "run_id",
                     "safety_bundle_id",
@@ -529,6 +627,7 @@ class PersistentCommitJournal:
                 }:
                     raise ValueError("invalid commit target fields")
                 intent = CommitIntent(
+                    kind=CommitKind(value["operation_kind"]),
                     commit_id=value["commit_id"],
                     run_id=value["run_id"],
                     safety_bundle_id=value["safety_bundle_id"],
