@@ -43,7 +43,7 @@ __all__ = [
     "STATUS_LOADED", "STATUS_RUNNING", "STATUS_DONE", "STATUS_ERROR", "STATUS_UNDERFLOW",
     "IMAGE_MAGIC", "REGISTER_LAYOUT_ID", "LAYOUT_STRUCT_VERSION", "build_fingerprint",
     "DEFAULT_CONFIG_PATH", "load_streamer_config", "params_from_config", "default_params",
-    "default_part", "default_target_pct", "default_clock_hz",
+    "default_clock_hz",
     "default_coeff_frac_bits", "default_slot_mul_width",
     "check_config_capacity", "format_capacity_report",
 ]
@@ -1034,14 +1034,6 @@ def default_params(path: str | Path | None = None) -> StreamerParams:
 # connect-check uses build_fingerprint(session.params) so a custom-geometry session is verified
 # against ITS OWN geometry, not the default.
 REGISTER_LAYOUT_ID = build_fingerprint(StreamerParams())
-
-
-def default_part(path: str | Path | None = None) -> str:
-    return load_streamer_config(path)["fpga_part"]
-
-
-def default_target_pct(path: str | Path | None = None) -> float:
-    return load_streamer_config(path)["target_pct"]
 
 
 def default_clock_hz(path: str | Path | None = None) -> float:

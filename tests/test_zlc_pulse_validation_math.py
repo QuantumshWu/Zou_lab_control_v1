@@ -12,7 +12,6 @@ from zlc_pulse.validation import (
     _CapacityExceeded,
     _CapacityTracker,
     _max_finite_periodic_window,
-    _max_periodic_window,
     validate_target_ir_for_geometry,
 )
 
@@ -26,40 +25,9 @@ def _brute_window(events, width):
     )
 
 
-def _quadratic_periodic(phases, period, width):
-    worst = 0
-    for terminal in phases:
-        count = 0
-        for phase in phases:
-            high = (terminal - phase) // period
-            low = -((width - terminal + phase) // period)
-            if high >= low:
-                count += high - low + 1
-        worst = max(worst, count)
-    return worst
-
-
-def test_linear_periodic_window_matches_small_quadratic_oracle():
-    randomizer = random.Random(0x5A17)
-    for _ in range(500):
-        period = randomizer.randrange(1, 20)
-        phases = tuple(
-            sorted(
-                randomizer.randrange(period)
-                for _ in range(randomizer.randrange(1, 10))
-            )
-        )
-        width = randomizer.randrange(0, 100)
-        assert _max_periodic_window(phases, period, width) == _quadratic_periodic(
-            phases,
-            period,
-            width,
-        )
+def test_compressed_finite_tracker_matches_expanded_random_streams():
     assert _max_finite_periodic_window((0,), 7, 447, (1 << 32) - 1) == 64
     assert _max_finite_periodic_window((0,), 7, 448, (1 << 32) - 1) == 65
-
-
-def test_compressed_finite_tracker_matches_expanded_random_streams():
     randomizer = random.Random(0xC0DE)
     for _ in range(500):
         width = randomizer.randrange(0, 60)

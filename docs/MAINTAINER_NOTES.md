@@ -828,7 +828,7 @@ skeleton, contracts, and docs are the deliverable.
 ### Single user-editable config: `fpga/board_config/streamer_config.json`
 The reconfigurable, **compile-affecting** specifics (part, clock, edge/scan/delay/bus
 geometry) now live in ONE JSON. `fpga/pulse_streamer/host/image.py` owns the loader
-(`load_streamer_config` / `params_from_config` / `default_params` / `default_part` /
+(`load_streamer_config` / `params_from_config` / `default_params` /
 `default_clock_hz`) with a robust fallback to built-in defaults if the file is missing.
 Re-sourced from it (no more scattered literals):
 - `axi_session.DEFAULT_PARAMS` + `DEFAULT_RUNTIME_CLOCK_HZ`,

@@ -470,18 +470,6 @@ def _is_processor_binding_value(
     return result
 
 
-class StreamJoinPolicy(str, Enum):
-    EXACT_KEY = "EXACT_KEY"
-
-
-class StreamCardinality(str, Enum):
-    ONE_TO_ONE = "ONE_TO_ONE"
-
-
-class JoinKeyTransform(str, Enum):
-    PASS_THROUGH = "PASS_THROUGH"
-
-
 class ProcessorExecutionGuard(ABC):
     """Process-local authority consulted before an exact worker claims input.
 
@@ -529,9 +517,6 @@ class StreamProcessorDefinition:
     input_payload_contract_fingerprint: str
     output_payload_contract_fingerprint: str
     join_key_contract_fingerprint: str
-    join_policy: StreamJoinPolicy = StreamJoinPolicy.EXACT_KEY
-    cardinality: StreamCardinality = StreamCardinality.ONE_TO_ONE
-    join_key_transform: JoinKeyTransform = JoinKeyTransform.PASS_THROUGH
     operator_deadline_seconds: float = 1.0
     terminal_wait_seconds: float = 1.0
     execution_guard_schema_id: str | None = None
@@ -547,12 +532,6 @@ class StreamProcessorDefinition:
             "join_key_contract_fingerprint",
         ):
             _digest(getattr(self, field), field)
-        if self.join_policy is not StreamJoinPolicy.EXACT_KEY:
-            raise ValueError("baseline supports only EXACT_KEY")
-        if self.cardinality is not StreamCardinality.ONE_TO_ONE:
-            raise ValueError("baseline supports only ONE_TO_ONE")
-        if self.join_key_transform is not JoinKeyTransform.PASS_THROUGH:
-            raise ValueError("baseline supports only PASS_THROUGH")
         for field in ("operator_deadline_seconds", "terminal_wait_seconds"):
             value = getattr(self, field)
             if (
@@ -794,9 +773,6 @@ class BoundStreamProcessor:
 
 __all__ = [
     "BoundStreamProcessor",
-    "JoinKeyTransform",
     "ProcessorExecutionGuard",
-    "StreamCardinality",
-    "StreamJoinPolicy",
     "StreamProcessorDefinition",
 ]

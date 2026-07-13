@@ -40,7 +40,7 @@ from .codec import (
     value_to_tree,
     TypedCodecError,
 )
-from .layout import AxisLayout, AxisLayoutMode, PointLayout, PointLayoutMode
+from .layout import AxisLayout, AxisLayoutMode, PointLayout
 from .patch import DataPatch, ValueValidity
 from .schema import DatasetSchema, ValueSchema
 from .validity import (
@@ -184,7 +184,6 @@ __all__ = [
     "PreviewTransformedData",
     "OwnedSnapshot",
     "PointLayout",
-    "PointLayoutMode",
     "ParameterUnitRelation",
     "Reduce",
     "READOUT_EVENT",

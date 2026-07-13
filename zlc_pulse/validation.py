@@ -630,31 +630,6 @@ def _periodic_event_at(
     )
 
 
-def _max_in_window(events: Sequence[int], width: int) -> int:
-    worst = 0
-    left = 0
-    for right, value in enumerate(events):
-        while value - events[left] > width:
-            left += 1
-        worst = max(worst, right - left + 1)
-    return worst
-
-
-def _max_periodic_window(events: Sequence[int], period: int, width: int) -> int:
-    phases = tuple(sorted(int(event) % int(period) for event in events))
-    if not phases:
-        return 0
-    full_periods, residual_width = divmod(int(width), int(period))
-    doubled = (*phases, *(phase + int(period) for phase in phases))
-    left = 0
-    residual = 0
-    for right in range(len(phases), len(doubled)):
-        while doubled[right] - doubled[left] > residual_width:
-            left += 1
-        residual = max(residual, right - left + 1)
-    return full_periods * len(phases) + residual
-
-
 def _max_finite_periodic_window(
     phases: Sequence[int],
     period: int,

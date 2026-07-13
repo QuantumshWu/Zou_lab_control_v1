@@ -19,11 +19,6 @@ class AxisLayoutMode(str, Enum):
     PRODUCT = "PRODUCT"
 
 
-# Dataset schemas retain the domain-specific spelling while transforms and fit
-# results use the same single layout-mode implementation.
-PointLayoutMode = AxisLayoutMode
-
-
 @dataclass(frozen=True)
 class AxisLayout:
     """A finite physical row table over a logical Cartesian axis space.
@@ -335,4 +330,4 @@ class PointLayout(AxisLayout):
         raise TypeError("PointLayout does not support PRODUCT composition")
 
 
-__all__ = ["AxisLayout", "AxisLayoutMode", "PointLayout", "PointLayoutMode"]
+__all__ = ["AxisLayout", "AxisLayoutMode", "PointLayout"]

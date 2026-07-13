@@ -3,9 +3,6 @@
 from .stream import (
     BoundStreamProcessor,
     ExactStreamProcessorWorker,
-    JoinKeyTransform,
-    StreamCardinality,
-    StreamJoinPolicy,
     StreamProcessorDefinition,
     StreamProcessorError,
 )
@@ -13,9 +10,6 @@ from .stream import (
 __all__ = [
     "BoundStreamProcessor",
     "ExactStreamProcessorWorker",
-    "JoinKeyTransform",
-    "StreamCardinality",
-    "StreamJoinPolicy",
     "StreamProcessorDefinition",
     "StreamProcessorError",
 ]

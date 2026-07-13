@@ -45,7 +45,7 @@ from typing import Sequence
 
 __all__ = [
     "EngineProgram", "effective_tick", "reference_play", "prefetch_play",
-    "streaming_scan_play", "rtl_mirror_play", "bus_play", "min_edge_spacing",
+    "streaming_scan_play", "rtl_mirror_play", "bus_play",
     "PrefetchStall", "ScanUnderflow", "DelayTooLargeError",
     "delay_line_reference", "bus_delay_line_reference",
     "rtl_delay_line_mirror", "rtl_bus_segment_delay_mirror",
@@ -293,24 +293,6 @@ def _zero(p: EngineProgram) -> list[int]:
 
 def _first_values(p: EngineProgram) -> list[int]:
     return list(p.scan_points[0]) if p.scan_points else _zero(p)
-
-
-def min_edge_spacing(program) -> int:
-    """Smallest gap (ticks) between consecutive effective edge ticks over all scan
-    points (edge 0 exempt).  The FINAL FIFO engine handles 1-tick spacing, so this
-    is informational; a value < 1 would indicate a non-monotonic program bug."""
-    p = program if isinstance(program, EngineProgram) else EngineProgram.from_program(program)
-    if len(p.ticks) < 2:
-        return 1 << 30
-    points = p.scan_points or [_zero(p)]
-    worst = 1 << 30
-    for slots in points:
-        prev = effective_tick(p.ticks[0], p.tick_slot_coeffs[0], slots, p.frac_bits)
-        for i in range(1, len(p.ticks)):
-            e = effective_tick(p.ticks[i], p.tick_slot_coeffs[i], slots, p.frac_bits)
-            worst = min(worst, e - prev)
-            prev = e
-    return worst
 
 
 # ----------------------------------------------------------------------------
