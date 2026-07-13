@@ -963,7 +963,6 @@ def bind_camera_measurement(
         DefinitionKey(
             "zlc_neutral_atom",
             f"camera-{request.role}",
-            1,
         ),
         f"Camera {request.role}",
         "zlc.camera-capture-request",

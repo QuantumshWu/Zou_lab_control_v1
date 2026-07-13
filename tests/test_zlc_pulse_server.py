@@ -168,7 +168,6 @@ def test_wire_image_must_equal_the_deterministic_current_ir_packing():
     tampered = CompiledPulseArtifact(
         artifact.source_document_digest,
         artifact.compiler_id,
-        artifact.compiler_version,
         artifact.execution_form,
         artifact.target_ir,
         PulseWireImage(

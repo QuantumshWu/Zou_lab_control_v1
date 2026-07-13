@@ -17,7 +17,7 @@ from zlc_neutral_atom.runtime import DeviceIdentityEvidenceKind, ResourceKey
 from zlc_storage import canonical_digest, canonical_text as _canonical_text
 
 
-ASSET_MAP_SCHEMA_VERSION = 1
+ASSET_MAP_FORMAT = "zlc_workbench.InstallationAssetMap"
 
 def adapter_kind(device: object) -> str:
     cls = type(device)
@@ -79,7 +79,7 @@ class InstallationAssetMap:
             asset_ids.add(asset.asset_id)
             keys.add(asset.resource_key)
         canonical = {
-            "schema_version": ASSET_MAP_SCHEMA_VERSION,
+            "format": ASSET_MAP_FORMAT,
             "assets": [asset.canonical_value() for asset in normalized],
         }
         self._assets = normalized
@@ -110,7 +110,7 @@ class InstallationAssetMap:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "schema_version": ASSET_MAP_SCHEMA_VERSION,
+            "format": ASSET_MAP_FORMAT,
             "assets": [asset.canonical_value() for asset in self._assets],
         }
 
@@ -118,12 +118,10 @@ class InstallationAssetMap:
     def from_mapping(cls, value: Mapping[str, object]) -> "InstallationAssetMap":
         if not isinstance(value, Mapping):
             raise TypeError("installation AssetMap must be a mapping")
-        if set(value) != {"schema_version", "assets"}:
-            raise ValueError("installation AssetMap must contain only schema_version and assets")
-        if value["schema_version"] != ASSET_MAP_SCHEMA_VERSION:
-            raise ValueError(
-                f"unsupported installation AssetMap schema {value['schema_version']!r}"
-            )
+        if set(value) != {"format", "assets"}:
+            raise ValueError("installation AssetMap must contain only format and assets")
+        if value["format"] != ASSET_MAP_FORMAT:
+            raise ValueError(f"unsupported installation AssetMap format {value['format']!r}")
         rows = value["assets"]
         if not isinstance(rows, list):
             raise TypeError("installation AssetMap assets must be a list")
@@ -196,7 +194,7 @@ class InstallationAssetMap:
 
 
 __all__ = [
-    "ASSET_MAP_SCHEMA_VERSION",
+    "ASSET_MAP_FORMAT",
     "InstallationAsset",
     "InstallationAssetMap",
     "adapter_kind",

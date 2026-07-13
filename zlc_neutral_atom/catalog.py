@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 import math
-from numbers import Integral
 from types import MappingProxyType
 from typing import Mapping, TypeVar
 
@@ -60,28 +59,13 @@ def is_declarative_value(value: object, active: set[int] | None = None) -> bool:
 class DefinitionKey:
     owner_package: str
     stable_definition_id: str
-    schema_version: int
 
     def __post_init__(self) -> None:
         _canonical_text(self.owner_package, "owner_package")
         _canonical_text(self.stable_definition_id, "stable_definition_id")
-        if (
-            isinstance(self.schema_version, bool)
-            or not isinstance(self.schema_version, Integral)
-            or self.schema_version < 1
-        ):
-            raise ValueError("schema_version must be a positive integer")
-        object.__setattr__(self, "schema_version", int(self.schema_version))
-
-    @property
-    def logical_id(self) -> tuple[str, str]:
-        return (self.owner_package, self.stable_definition_id)
 
     def __str__(self) -> str:
-        return (
-            f"{self.owner_package}:{self.stable_definition_id}"
-            f"@{self.schema_version}"
-        )
+        return f"{self.owner_package}:{self.stable_definition_id}"
 
 
 class DefinitionCatalog:
@@ -98,7 +82,6 @@ class DefinitionCatalog:
         if not isinstance(definitions, tuple):
             raise TypeError("definitions must be an explicit immutable tuple")
         by_key: dict[DefinitionKey, object] = {}
-        logical_ids: dict[tuple[str, str], DefinitionKey] = {}
         for definition in definitions:
             key = getattr(definition, "key", None)
             if not isinstance(key, DefinitionKey):
@@ -112,14 +95,7 @@ class DefinitionCatalog:
                 )
             if key in by_key:
                 raise ValueError(f"duplicate DefinitionKey {key}")
-            previous = logical_ids.get(key.logical_id)
-            if previous is not None:
-                raise ValueError(
-                    f"definition logical id {key.logical_id!r} appears as both "
-                    f"schema versions {previous.schema_version} and {key.schema_version}"
-                )
             by_key[key] = definition
-            logical_ids[key.logical_id] = key
         self._definitions = definitions
         self._by_key: Mapping[DefinitionKey, object] = MappingProxyType(by_key)
 

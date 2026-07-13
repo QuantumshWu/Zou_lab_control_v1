@@ -109,7 +109,6 @@ from .artifact import (
 )
 from .compiler import (
     COMPILER_ID,
-    COMPILER_VERSION,
     compile_pulse_artifact,
     compile_pulse_document,
 )
@@ -150,7 +149,6 @@ __all__ = [
     "APPROVED_DEPLOYED_TARGET_ABI",
     "AUTONOMOUS_TABLE_READ_RECIPE",
     "COMPILER_ID",
-    "COMPILER_VERSION",
     "CompiledPulseArtifact",
     "AutonomousTableTerminalEvidence",
     "DAC_OFFSET_BINARY",

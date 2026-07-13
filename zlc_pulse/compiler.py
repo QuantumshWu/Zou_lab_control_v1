@@ -34,7 +34,6 @@ from .validation import validate_target_ir_for_target
 
 
 COMPILER_ID = "zlc-pulse-native"
-COMPILER_VERSION = "3"
 
 
 @dataclass(frozen=True)
@@ -183,7 +182,6 @@ def compile_pulse_artifact(
     return CompiledPulseArtifact(
         source_document_digest=document.fingerprint,
         compiler_id=COMPILER_ID,
-        compiler_version=COMPILER_VERSION,
         execution_form=execution_form,
         target_ir=target_ir,
         wire_image=pack_target_ir(target_ir, geometry),
@@ -911,7 +909,6 @@ def _apply_affine(
 
 __all__ = [
     "COMPILER_ID",
-    "COMPILER_VERSION",
     "compile_pulse_artifact",
     "compile_pulse_document",
 ]

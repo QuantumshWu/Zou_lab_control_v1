@@ -303,7 +303,7 @@ def _processor_binding(
     artifact_inputs: tuple[ArtifactInputRef, ...] = (),
 ) -> BoundStreamProcessor:
     definition = StreamProcessorDefinition(
-        DefinitionKey("test", name, 1),
+        DefinitionKey("test", name),
         name,
         f"test.{name}-config",
         payload.fingerprint,
@@ -592,7 +592,7 @@ def chain(
         DatasetMode.FINITE_EXACT,
     )
     definition = StreamProcessorDefinition(
-        DefinitionKey("test", "scale", 1),
+        DefinitionKey("test", "scale"),
         "Scale",
         "test.scale-config",
         payload.fingerprint,
@@ -1089,7 +1089,7 @@ def test_bound_processor_owner_copies_declarative_inputs():
     data_schema = schema(1)
     payload = ValuePayloadContract(data_schema.cell_schema)
     key_contract = DatasetCellKeyContract(data_schema)
-    definition_key = DefinitionKey("test", "owned-binding", 1)
+    definition_key = DefinitionKey("test", "owned-binding")
     definition = StreamProcessorDefinition(
         definition_key,
         "Owned binding",

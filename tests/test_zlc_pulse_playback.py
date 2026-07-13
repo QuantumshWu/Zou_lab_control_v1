@@ -202,7 +202,6 @@ def test_playback_rejects_an_unbounded_materialized_compact_projection():
     artifact = CompiledPulseArtifact(
         "b" * 64,
         "test-compiler",
-        "1",
         PulseExecutionForm.STATIC_ONCE,
         ir,
         pack_target_ir(ir),

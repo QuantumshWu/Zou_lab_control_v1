@@ -86,7 +86,6 @@ from .contracts import FrameContract, ReadoutBindingKey
 OCCUPANCY_STREAM_PROCESSOR_KEY = DefinitionKey(
     "zlc_neutral_atom.readout",
     "occupancy-stream",
-    1,
 )
 _OCCUPANCY_CONFIG_SCHEMA = "zlc_neutral_atom.occupancy-stream-config"
 _READOUT_MODELS = (

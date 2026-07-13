@@ -32,7 +32,7 @@ from zlc_workbench import (
     LegacyRuntimeTransition,
     LegacyStopStatus,
 )
-from zlc_workbench.asset_map import adapter_kind
+from zlc_workbench.asset_map import ASSET_MAP_FORMAT, adapter_kind
 from Zou_lab_control.neutral_atom import connect
 from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
 from zlc_workbench.legacy_neutral_atom import registrations_for
@@ -1054,7 +1054,13 @@ def test_asset_map_revision_is_canonical_content_digest():
         expected_identity="installation-endpoint:virtual:camera",
         evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
     )
-    replay = InstallationAssetMap.from_mapping(first.to_dict())
+    current = first.to_dict()
+    assert current["format"] == ASSET_MAP_FORMAT
+    replay = InstallationAssetMap.from_mapping(current)
+    with pytest.raises(ValueError, match="unsupported.*format"):
+        InstallationAssetMap.from_mapping(
+            {**current, "format": "unsupported-installation-asset-map"}
+        )
     changed = _asset_map_for(
         "camera",
         camera,

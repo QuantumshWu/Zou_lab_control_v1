@@ -13,8 +13,8 @@ class DemoDefinition:
     label: str
 
 
-def definition(name: str, *, version: int = 1) -> DemoDefinition:
-    return DemoDefinition(DefinitionKey("tests.demo", name, version), name)
+def definition(name: str) -> DemoDefinition:
+    return DemoDefinition(DefinitionKey("tests.demo", name), name)
 
 
 def test_catalog_composes_explicit_tuples_without_mutation_or_discovery():
@@ -31,12 +31,10 @@ def test_catalog_composes_explicit_tuples_without_mutation_or_discovery():
         catalog.by_key[first.key] = second
 
 
-def test_catalog_rejects_duplicate_key_and_parallel_schema_versions():
+def test_catalog_rejects_duplicate_keys():
     first = definition("capture")
     with pytest.raises(ValueError, match="duplicate DefinitionKey"):
         DefinitionCatalog((first, first))
-    with pytest.raises(ValueError, match="schema versions"):
-        DefinitionCatalog((first, definition("capture", version=2)))
 
 
 def test_catalog_rejects_implicit_or_mutable_definitions():
@@ -48,7 +46,7 @@ def test_catalog_rejects_implicit_or_mutable_definitions():
         key: DefinitionKey
 
     with pytest.raises(TypeError, match="frozen dataclass"):
-        DefinitionCatalog((MutableDefinition(DefinitionKey("tests", "mutable", 1)),))
+        DefinitionCatalog((MutableDefinition(DefinitionKey("tests", "mutable")),))
 
     with pytest.raises(TypeError, match="DefinitionKey"):
         DefinitionCatalog((object(),))
@@ -64,7 +62,7 @@ def test_catalog_rejects_callable_state_hidden_in_frozen_definition():
         DefinitionCatalog(
             (
                 CallbackDefinition(
-                    DefinitionKey("tests", "callback", 1),
+                    DefinitionKey("tests", "callback"),
                     lambda: None,
                 ),
             )
@@ -77,4 +75,4 @@ def test_catalog_resolution_is_typed_and_missing_is_loud():
     with pytest.raises(TypeError, match="not str"):
         catalog.resolve(item.key, str)
     with pytest.raises(KeyError, match="absent"):
-        catalog.resolve(DefinitionKey("tests.demo", "missing", 1))
+        catalog.resolve(DefinitionKey("tests.demo", "missing"))

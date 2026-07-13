@@ -168,7 +168,6 @@ def test_compact_trigger_projection_is_bounded_without_expanding_loop_count():
     artifact = CompiledPulseArtifact(
         "9" * 64,
         "test-compiler",
-        "1",
         PulseExecutionForm.STATIC_ONCE,
         no_rises,
         pack_target_ir(no_rises),

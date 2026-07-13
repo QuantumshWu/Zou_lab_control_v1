@@ -41,7 +41,6 @@ class PulseExecutionForm(str, Enum):
 class CompiledPulseArtifact:
     source_document_digest: str
     compiler_id: str
-    compiler_version: str
     execution_form: PulseExecutionForm
     target_ir: TargetIR
     wire_image: PulseWireImage
@@ -50,7 +49,6 @@ class CompiledPulseArtifact:
     def __post_init__(self) -> None:
         _sha256(self.source_document_digest, "source_document_digest")
         object.__setattr__(self, "compiler_id", _text(self.compiler_id, "compiler_id"))
-        object.__setattr__(self, "compiler_version", _text(self.compiler_version, "compiler_version"))
         if not isinstance(self.execution_form, PulseExecutionForm):
             raise TypeError("execution_form must be PulseExecutionForm")
         if not isinstance(self.target_ir, TargetIR):
@@ -143,7 +141,6 @@ def compiled_pulse_artifact_to_tree(value: CompiledPulseArtifact) -> dict[str, o
         "schema": COMPILED_PULSE_ARTIFACT_SCHEMA,
         "source_document_digest": value.source_document_digest,
         "compiler_id": value.compiler_id,
-        "compiler_version": value.compiler_version,
         "execution_form": value.execution_form.value,
         "target_ir": target_ir_to_tree(value.target_ir),
         "wire_image": pulse_wire_image_to_tree(value.wire_image),
@@ -158,7 +155,6 @@ def compiled_pulse_artifact_from_tree(tree: object) -> CompiledPulseArtifact:
         "schema",
         "source_document_digest",
         "compiler_id",
-        "compiler_version",
         "execution_form",
         "target_ir",
         "wire_image",
@@ -173,7 +169,6 @@ def compiled_pulse_artifact_from_tree(tree: object) -> CompiledPulseArtifact:
     return CompiledPulseArtifact(
         tree["source_document_digest"],
         tree["compiler_id"],
-        tree["compiler_version"],
         PulseExecutionForm(tree["execution_form"]),
         target_ir_from_tree(tree["target_ir"]),
         pulse_wire_image_from_tree(tree["wire_image"]),
