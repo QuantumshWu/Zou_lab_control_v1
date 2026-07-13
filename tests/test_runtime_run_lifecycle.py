@@ -4,15 +4,22 @@ from __future__ import annotations
 
 import math
 import threading
+import time
+from dataclasses import fields
 from itertools import count
 
 import pytest
 
 from zlc_neutral_atom.runtime import (
     CancelOutcome,
+    CheckpointCommit,
+    CheckpointDisposition,
+    CheckpointReconciliationRequired,
+    CheckpointSnapshot,
     BoundDevice,
     CapabilityRevoked,
     CommitRecovery,
+    CommitIntent,
     CommitTarget,
     DeviceBroker,
     DeviceIdentityAck,
@@ -22,6 +29,7 @@ from zlc_neutral_atom.runtime import (
     MemoryCommitJournal,
     MemoryQuarantineJournal,
     FinalCommit,
+    FinalCommitReconciliationRequired,
     PostSafetyContext,
     PublishVisibilityUnknown,
     PublishedManifest,
@@ -147,6 +155,45 @@ def commit(
     )
 
 
+def checkpoint_commit(
+    context: PostSafetyContext,
+    publish,
+    recover=lambda _intent: CommitRecovery(committed=False),
+    *,
+    journal=None,
+    commit_id=None,
+):
+    commit_id = commit_id or f"test-checkpoint-{next(_COMMIT_IDS)}"
+    journal = journal or MemoryCommitJournal("test-repository")
+    target = CommitTarget(
+        repository_id="test-repository",
+        artifact_kind="test-checkpoint",
+        schema_version="1",
+        target_ref=f"artifacts/{commit_id}",
+        expected_manifest_digest="0" * 64,
+    )
+    coordinator = RepositoryCommitCoordinator(
+        journal,
+        recover,
+        allow_ephemeral=True,
+    )
+
+    def publish_manifest():
+        return PublishedManifest(
+            target_ref=target.target_ref,
+            manifest_digest=target.expected_manifest_digest,
+            result=publish(),
+        )
+
+    return context.commit_checkpoint(
+        CheckpointCommit(
+            commit_id=commit_id,
+            safety_bundle_id=context.safety_bundle_id,
+            authority=coordinator.prepare(target, publish_manifest),
+        )
+    )
+
+
 def plan(
     *,
     key: ResourceKey,
@@ -157,6 +204,7 @@ def plan(
     interrupt=None,
     cleanup_ack=safe_ack,
     requires_final_commit=False,
+    timeout_seconds=None,
 ) -> RunPlan:
     generation = "test-connection-generation"
     safety_operations = {}
@@ -189,6 +237,7 @@ def plan(
         finalize=finalize,
         interrupt_operations=interrupt_operations,
         requires_final_commit=requires_final_commit,
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -1239,6 +1288,1293 @@ def test_finalize_receives_no_device_capability():
     assert observed == [False, False]
 
 
+def test_checkpoint_is_durable_but_later_finalize_failure_keeps_run_failed():
+    journal = MemoryCommitJournal("test-repository")
+
+    def finalize(context: PostSafetyContext, _result):
+        raw_ref = checkpoint_commit(
+            context,
+            lambda: "raw-capture-ref",
+            journal=journal,
+            commit_id="raw-before-analysis-failure",
+        )
+        assert raw_ref == "raw-capture-ref"
+        snapshot = context._handle.snapshot()
+        assert not snapshot.final_committed
+        assert snapshot.committed_checkpoint is not None
+        raise ArithmeticError("calibration failed after raw checkpoint")
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("checkpoint-analysis-failure"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+            requires_final_commit=True,
+        )
+    )
+    with pytest.raises(RunFailed, match="calibration failed"):
+        handle.result(2.0)
+    snapshot = handle.snapshot()
+    assert snapshot.state is RunState.FAILED
+    assert not snapshot.final_committed
+    assert snapshot.committed_checkpoint.commit_id == "raw-before-analysis-failure"
+    assert snapshot.committed_checkpoint.target.target_ref == (
+        "artifacts/raw-before-analysis-failure"
+    )
+    assert snapshot.committed_checkpoint.disposition is CheckpointDisposition.COMMITTED
+    assert journal.pending() == ()
+
+
+def test_checkpoint_does_not_satisfy_required_final_commit():
+    def finalize(context: PostSafetyContext, _result):
+        return checkpoint_commit(
+            context,
+            lambda: "raw-only-ref",
+            commit_id="raw-without-final",
+        )
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("checkpoint-is-not-final"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+            requires_final_commit=True,
+        )
+    )
+    with pytest.raises(RunFailed, match="requires a final artifact commit"):
+        handle.result(2.0)
+    snapshot = handle.snapshot()
+    assert snapshot.state is RunState.FAILED
+    assert not snapshot.final_committed
+    assert snapshot.committed_checkpoint is not None
+    assert snapshot.committed_checkpoint.target.target_ref == "artifacts/raw-without-final"
+    assert snapshot.committed_checkpoint.disposition is CheckpointDisposition.COMMITTED
+
+
+def test_checkpoint_then_final_commit_has_two_distinct_authority_boundaries():
+    def finalize(context: PostSafetyContext, _result):
+        raw = checkpoint_commit(
+            context,
+            lambda: "raw-ref",
+            commit_id="raw-then-final",
+        )
+        assert raw == "raw-ref"
+        context.checkpoint()
+        return commit(
+            context,
+            lambda: "calibration-ref",
+            commit_id="calibration-final",
+        )
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("checkpoint-then-final"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+            requires_final_commit=True,
+        )
+    )
+    assert handle.result(2.0) == "calibration-ref"
+    snapshot = handle.snapshot()
+    assert snapshot.final_committed
+    assert snapshot.committed_checkpoint.commit_id == "raw-then-final"
+    assert snapshot.committed_checkpoint.disposition is CheckpointDisposition.COMMITTED
+
+
+def test_cancel_before_checkpoint_publish_aborts_intent_and_never_publishes():
+    controller = RunController(new_arbiter())
+    intent_started = threading.Event()
+    allow_intent = threading.Event()
+    published = threading.Event()
+
+    class BlockingCheckpointIntentJournal(MemoryCommitJournal):
+        def begin(self, value):
+            intent_started.set()
+            allow_intent.wait()
+            super().begin(value)
+
+    journal = BlockingCheckpointIntentJournal("test-repository")
+
+    def finalize(context: PostSafetyContext, _result):
+        return checkpoint_commit(
+            context,
+            lambda: published.set() or "raw-ref",
+            journal=journal,
+            commit_id="cancel-before-checkpoint-publish",
+        )
+
+    handle = controller.start(
+        plan(
+            key=camera_key("cancel-before-checkpoint-publish"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+        )
+    )
+    assert intent_started.wait(1.0)
+    assert handle.cancel() is CancelOutcome.REQUESTED
+    allow_intent.set()
+    with pytest.raises(RunCancelled):
+        handle.result(2.0)
+    assert not published.is_set()
+    assert journal.pending() == ()
+    assert handle.snapshot().committed_checkpoint is None
+
+
+def test_cancel_before_checkpoint_call_writes_no_intent_and_discards_authority():
+    journal = MemoryCommitJournal("test-repository")
+    coordinator = RepositoryCommitCoordinator(
+        journal,
+        lambda _intent: CommitRecovery(committed=False),
+        allow_ephemeral=True,
+    )
+    operation_ready = threading.Event()
+    try_checkpoint = threading.Event()
+
+    def finalize(context: PostSafetyContext, _result):
+        target = CommitTarget(
+            "test-repository",
+            "test-checkpoint",
+            "1",
+            "artifacts/cancel-before-checkpoint-call",
+            "0" * 64,
+        )
+        operation = CheckpointCommit(
+            "cancel-before-checkpoint-call",
+            context.safety_bundle_id,
+            coordinator.prepare(
+                target,
+                lambda: PublishedManifest(
+                    target.target_ref,
+                    target.expected_manifest_digest,
+                    "must-not-publish",
+                ),
+            ),
+        )
+        operation_ready.set()
+        try_checkpoint.wait()
+        return context.commit_checkpoint(operation)
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("cancel-before-checkpoint-call"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+        )
+    )
+    assert operation_ready.wait(1.0)
+    assert handle.cancel() is CancelOutcome.REQUESTED
+    try_checkpoint.set()
+    with pytest.raises(RunCancelled):
+        handle.result(2.0)
+    assert journal._intents == {}
+    assert coordinator._authorities == {}
+    assert handle.snapshot().committed_checkpoint is None
+
+
+def test_cancel_during_checkpoint_publish_preserves_raw_but_blocks_analysis():
+    controller = RunController(new_arbiter())
+    publish_started = threading.Event()
+    allow_publish = threading.Event()
+    analysis_started = threading.Event()
+
+    def publish():
+        publish_started.set()
+        allow_publish.wait()
+        return "raw-ref"
+
+    def finalize(context: PostSafetyContext, _result):
+        checkpoint_commit(
+            context,
+            publish,
+            commit_id="cancel-during-checkpoint-publish",
+        )
+        analysis_started.set()
+        return "should-not-return"
+
+    handle = controller.start(
+        plan(
+            key=camera_key("cancel-during-checkpoint-publish"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+        )
+    )
+    assert publish_started.wait(1.0)
+    assert handle.cancel() is CancelOutcome.REQUESTED
+    allow_publish.set()
+    with pytest.raises(RunCancelled):
+        handle.result(2.0)
+    assert not analysis_started.is_set()
+    snapshot = handle.snapshot()
+    assert not snapshot.final_committed
+    assert snapshot.committed_checkpoint.disposition is CheckpointDisposition.COMMITTED
+
+
+def test_checkpoint_lost_ack_is_synchronously_recovered_before_analysis():
+    visible = []
+    analysis_saw_checkpoint = []
+
+    def publish():
+        visible.append("raw-ref")
+        raise PublishVisibilityUnknown("checkpoint fsync acknowledgement lost")
+
+    def recover(intent):
+        return CommitRecovery(
+            committed=True,
+            result=PublishedManifest(
+                target_ref=intent.target.target_ref,
+                manifest_digest=intent.target.expected_manifest_digest,
+                result=visible[-1],
+            ),
+        )
+
+    def finalize(context: PostSafetyContext, _result):
+        raw = checkpoint_commit(
+            context,
+            publish,
+            recover,
+            commit_id="checkpoint-sync-recovery",
+        )
+        analysis_saw_checkpoint.append(context._handle.snapshot().committed_checkpoint)
+        raise RuntimeError(f"analysis failed after {raw}")
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("checkpoint-sync-recovery"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+        )
+    )
+    with pytest.raises(RunFailed, match="analysis failed"):
+        handle.result(2.0)
+    assert analysis_saw_checkpoint[0].disposition is CheckpointDisposition.COMMITTED
+    assert "fsync acknowledgement lost" in handle.snapshot().commit_recovery_warning
+
+
+def test_checkpoint_visibility_absent_is_durably_aborted_and_run_fails():
+    journal = MemoryCommitJournal("test-repository")
+
+    def finalize(context: PostSafetyContext, _result):
+        return checkpoint_commit(
+            context,
+            lambda: (_ for _ in ()).throw(PublishVisibilityUnknown("raw replace lost")),
+            lambda _intent: CommitRecovery(committed=False),
+            journal=journal,
+            commit_id="checkpoint-definitively-absent",
+        )
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("checkpoint-definitively-absent"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+        )
+    )
+    with pytest.raises(RunFailed, match="raw replace lost"):
+        handle.result(2.0)
+    assert journal.pending() == ()
+    assert handle.snapshot().committed_checkpoint is None
+
+
+def test_unknown_checkpoint_holds_claim_then_retry_commits_without_reentering_finalize():
+    arbiter = new_arbiter()
+    journal = MemoryCommitJournal("test-repository")
+    finalize_calls = []
+    analysis_calls = []
+    recover_calls = 0
+    second_recovery_failed = threading.Event()
+
+    def recover(intent):
+        nonlocal recover_calls
+        recover_calls += 1
+        if recover_calls <= 2:
+            if recover_calls == 2:
+                second_recovery_failed.set()
+            raise OSError("checkpoint repository unavailable")
+        return CommitRecovery(
+            committed=True,
+            result=PublishedManifest(
+                target_ref=intent.target.target_ref,
+                manifest_digest=intent.target.expected_manifest_digest,
+                result="recovered-raw-ref",
+            ),
+        )
+
+    def finalize(context: PostSafetyContext, _result):
+        finalize_calls.append("entered")
+        raw = checkpoint_commit(
+            context,
+            lambda: (_ for _ in ()).throw(
+                PublishVisibilityUnknown("checkpoint visibility unknown")
+            ),
+            recover,
+            journal=journal,
+            commit_id="unknown-checkpoint",
+        )
+        analysis_calls.append(raw)
+        return raw
+
+    key = camera_key("unknown-checkpoint")
+    handle = RunController(arbiter).start(
+        plan(key=key, execute=lambda *_: "staged", finalize=finalize)
+    )
+    snapshot = handle.wait_for(
+        lambda value: value.phase == "checkpoint-reconciliation-failed",
+        2.0,
+    )
+    assert snapshot.state is RunState.RUNNING
+    assert snapshot.committed_checkpoint.disposition is (
+        CheckpointDisposition.RECONCILIATION_REQUIRED
+    )
+    assert not hasattr(snapshot.committed_checkpoint, "ref")
+    assert len(arbiter.active_claims()) == 1
+    assert tuple(value.commit_id for value in journal.pending()) == (
+        "unknown-checkpoint",
+    )
+    assert handle.retry_recovery()
+    assert second_recovery_failed.wait(1.0)
+    handle.wait_for(
+        lambda value: value.phase == "checkpoint-reconciliation-failed",
+        2.0,
+    )
+    assert len(arbiter.active_claims()) == 1
+    assert handle.retry_recovery()
+    with pytest.raises(RunFailed, match="restart analysis"):
+        handle.result(2.0)
+    snapshot = handle.snapshot()
+    assert snapshot.committed_checkpoint.disposition is CheckpointDisposition.COMMITTED
+    assert snapshot.committed_checkpoint.target.target_ref == "artifacts/unknown-checkpoint"
+    assert finalize_calls == ["entered"]
+    assert analysis_calls == []
+    assert recover_calls == 3
+    assert journal.pending() == ()
+    assert not arbiter.active_claims()
+
+
+def test_unknown_checkpoint_retry_absent_fails_and_clears_checkpoint_record():
+    journal = MemoryCommitJournal("test-repository")
+    recover_calls = 0
+
+    def recover(_intent):
+        nonlocal recover_calls
+        recover_calls += 1
+        if recover_calls == 1:
+            raise OSError("repository unavailable")
+        return CommitRecovery(committed=False)
+
+    def finalize(context: PostSafetyContext, _result):
+        return checkpoint_commit(
+            context,
+            lambda: (_ for _ in ()).throw(PublishVisibilityUnknown("unknown raw")),
+            recover,
+            journal=journal,
+            commit_id="absent-checkpoint-retry",
+        )
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("absent-checkpoint-retry"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+        )
+    )
+    pending_snapshot = handle.wait_for(
+        lambda value: value.phase == "checkpoint-reconciliation-failed",
+        2.0,
+    )
+    assert not hasattr(pending_snapshot.committed_checkpoint, "ref")
+    assert handle.retry_recovery()
+    with pytest.raises(RunFailed, match="unknown raw"):
+        handle.result(2.0)
+    assert handle.snapshot().committed_checkpoint is None
+    assert journal.pending() == ()
+
+
+def test_cancel_while_checkpoint_reconciliation_pending_ends_cancelled_with_raw_ref():
+    journal = MemoryCommitJournal("test-repository")
+    recover_calls = 0
+
+    def recover(intent):
+        nonlocal recover_calls
+        recover_calls += 1
+        if recover_calls == 1:
+            raise OSError("repository unavailable")
+        return CommitRecovery(
+            committed=True,
+            result=PublishedManifest(
+                target_ref=intent.target.target_ref,
+                manifest_digest=intent.target.expected_manifest_digest,
+                result="raw-ref",
+            ),
+        )
+
+    def finalize(context: PostSafetyContext, _result):
+        return checkpoint_commit(
+            context,
+            lambda: (_ for _ in ()).throw(PublishVisibilityUnknown("raw unknown")),
+            recover,
+            journal=journal,
+            commit_id="cancel-pending-checkpoint",
+        )
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("cancel-pending-checkpoint"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+        )
+    )
+    handle.wait_for(
+        lambda value: value.phase == "checkpoint-reconciliation-failed",
+        2.0,
+    )
+    assert handle.cancel() is CancelOutcome.REQUESTED
+    assert handle.retry_recovery()
+    with pytest.raises(RunCancelled):
+        handle.result(2.0)
+    snapshot = handle.snapshot()
+    assert snapshot.committed_checkpoint.disposition is CheckpointDisposition.COMMITTED
+    assert snapshot.committed_checkpoint.target.target_ref == (
+        "artifacts/cancel-pending-checkpoint"
+    )
+
+
+def test_checkpoint_commit_marker_retry_fails_original_run_without_recovery_publish():
+    journal = FailFirstCommitMarkerJournal(fail_commit=True)
+    recover_calls = []
+    finalize_calls = []
+
+    def finalize(context: PostSafetyContext, _result):
+        finalize_calls.append("entered")
+        return checkpoint_commit(
+            context,
+            lambda: "raw-ref",
+            lambda intent: recover_calls.append(intent) or CommitRecovery(committed=False),
+            journal=journal,
+            commit_id="checkpoint-marker-retry",
+        )
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("checkpoint-marker-retry"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+        )
+    )
+    pending_snapshot = handle.wait_for(
+        lambda value: value.phase == "checkpoint-reconciliation-failed",
+        2.0,
+    )
+    assert pending_snapshot.committed_checkpoint.target.target_ref == (
+        "artifacts/checkpoint-marker-retry"
+    )
+    assert handle.retry_recovery()
+    with pytest.raises(RunFailed, match="restart analysis"):
+        handle.result(2.0)
+    assert recover_calls == []
+    assert finalize_calls == ["entered"]
+    assert handle.snapshot().committed_checkpoint.disposition is (
+        CheckpointDisposition.COMMITTED
+    )
+
+
+def test_second_checkpoint_is_rejected_and_its_authority_is_discarded():
+    journal = MemoryCommitJournal("test-repository")
+    coordinator = RepositoryCommitCoordinator(
+        journal,
+        lambda _intent: CommitRecovery(committed=False),
+        allow_ephemeral=True,
+    )
+    published = []
+
+    def operation(context, suffix):
+        target = CommitTarget(
+            "test-repository",
+            "test-checkpoint",
+            "1",
+            f"artifacts/checkpoint-{suffix}",
+            "0" * 64,
+        )
+        return CheckpointCommit(
+            f"checkpoint-{suffix}",
+            context.safety_bundle_id,
+            coordinator.prepare(
+                target,
+                lambda: PublishedManifest(
+                    target.target_ref,
+                    target.expected_manifest_digest,
+                    published.append(suffix) or target.target_ref,
+                ),
+            ),
+        )
+
+    def finalize(context: PostSafetyContext, _result):
+        context.commit_checkpoint(operation(context, "first"))
+        context.commit_checkpoint(operation(context, "second"))
+        return "unreachable"
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("two-checkpoints"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+        )
+    )
+    with pytest.raises(RunFailed, match="only once"):
+        handle.result(2.0)
+    assert published == ["first"]
+    assert coordinator._authorities == {}
+    assert handle.snapshot().committed_checkpoint.commit_id == "checkpoint-first"
+
+
+def test_checkpoint_wrong_safety_bundle_discards_authority_before_intent():
+    journal = MemoryCommitJournal("test-repository")
+    coordinator = RepositoryCommitCoordinator(
+        journal,
+        lambda _intent: CommitRecovery(committed=False),
+        allow_ephemeral=True,
+    )
+
+    def finalize(context: PostSafetyContext, _result):
+        target = CommitTarget(
+            "test-repository",
+            "test-checkpoint",
+            "1",
+            "artifacts/wrong-checkpoint-safety",
+            "0" * 64,
+        )
+        return context.commit_checkpoint(
+            CheckpointCommit(
+                "wrong-checkpoint-safety",
+                "wrong-safety-bundle",
+                coordinator.prepare(
+                    target,
+                    lambda: PublishedManifest(
+                        target.target_ref,
+                        target.expected_manifest_digest,
+                        "raw-ref",
+                    ),
+                ),
+            )
+        )
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("wrong-checkpoint-safety"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+        )
+    )
+    with pytest.raises(RunFailed, match="safety bundle"):
+        handle.result(2.0)
+    assert coordinator._authorities == {}
+    assert journal._intents == {}
+
+
+def test_cancelled_final_commit_rejection_discards_unconsumed_authority():
+    journal = MemoryCommitJournal("test-repository")
+    coordinator = RepositoryCommitCoordinator(
+        journal,
+        lambda _intent: CommitRecovery(committed=False),
+        allow_ephemeral=True,
+    )
+    operation_ready = threading.Event()
+    try_commit = threading.Event()
+
+    def finalize(context: PostSafetyContext, _result):
+        target = CommitTarget(
+            "test-repository",
+            "final",
+            "1",
+            "artifacts/cancelled-final-authority",
+            "0" * 64,
+        )
+        operation = FinalCommit(
+            "cancelled-final-authority",
+            context.safety_bundle_id,
+            coordinator.prepare(
+                target,
+                lambda: PublishedManifest(
+                    target.target_ref,
+                    target.expected_manifest_digest,
+                    "must-not-publish",
+                ),
+            ),
+        )
+        operation_ready.set()
+        try_commit.wait()
+        return context.commit_final(operation)
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("cancelled-final-authority"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+            requires_final_commit=True,
+        )
+    )
+    assert operation_ready.wait(1.0)
+    assert handle.cancel() is CancelOutcome.REQUESTED
+    try_commit.set()
+    with pytest.raises(RunCancelled):
+        handle.result(2.0)
+    assert coordinator._authorities == {}
+    assert journal.pending() == ()
+
+
+def test_nonowner_inflight_rejection_preserves_authority_for_owner_gate():
+    journal = MemoryCommitJournal("test-repository")
+    coordinator = RepositoryCommitCoordinator(
+        journal,
+        lambda _intent: CommitRecovery(committed=False),
+        allow_ephemeral=True,
+    )
+    second_errors = []
+
+    def finalize(context: PostSafetyContext, _result):
+        targets = tuple(
+            CommitTarget(
+                "test-repository",
+                "final",
+                "1",
+                f"artifacts/inflight-final-{index}",
+                "0" * 64,
+            )
+            for index in (1, 2)
+        )
+        second_operation = FinalCommit(
+            "inflight-final-2",
+            context.safety_bundle_id,
+            coordinator.prepare(
+                targets[1],
+                lambda: PublishedManifest(
+                    targets[1].target_ref,
+                    targets[1].expected_manifest_digest,
+                    "second",
+                ),
+            ),
+        )
+
+        def publish_first():
+            thread = threading.Thread(
+                target=lambda: _call_second_final(
+                    context,
+                    second_operation,
+                    second_errors,
+                )
+            )
+            thread.start()
+            thread.join(1.0)
+            assert not thread.is_alive()
+            return PublishedManifest(
+                targets[0].target_ref,
+                targets[0].expected_manifest_digest,
+                "first",
+            )
+
+        first_operation = FinalCommit(
+            "inflight-final-1",
+            context.safety_bundle_id,
+            coordinator.prepare(targets[0], publish_first),
+        )
+        result = context.commit_final(first_operation)
+        assert len(coordinator._authorities) == 1
+        with pytest.raises(RuntimeError, match="only once"):
+            context.commit_final(second_operation)
+        return result
+
+    def _call_second_final(context, operation, errors):
+        try:
+            context.commit_final(operation)
+        except BaseException as error:
+            errors.append(error)
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("inflight-final-authority"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+            requires_final_commit=True,
+        )
+    )
+    assert handle.result(2.0) == "first"
+    assert len(second_errors) == 1
+    assert "authoritative Run owner thread" in str(second_errors[0])
+    assert coordinator._authorities == {}
+
+
+def test_final_already_committed_rejection_discards_second_authority():
+    journal = MemoryCommitJournal("test-repository")
+    coordinator = RepositoryCommitCoordinator(
+        journal,
+        lambda _intent: CommitRecovery(committed=False),
+        allow_ephemeral=True,
+    )
+
+    def operation(context, index):
+        target = CommitTarget(
+            "test-repository",
+            "final",
+            "1",
+            f"artifacts/already-final-{index}",
+            "0" * 64,
+        )
+        return FinalCommit(
+            f"already-final-{index}",
+            context.safety_bundle_id,
+            coordinator.prepare(
+                target,
+                lambda: PublishedManifest(
+                    target.target_ref,
+                    target.expected_manifest_digest,
+                    f"final-{index}",
+                ),
+            ),
+        )
+
+    def finalize(context: PostSafetyContext, _result):
+        result = context.commit_final(operation(context, 1))
+        with pytest.raises(RuntimeError, match="only once"):
+            context.commit_final(operation(context, 2))
+        return result
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("already-final-authority"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+            requires_final_commit=True,
+        )
+    )
+    assert handle.result(2.0) == "final-1"
+    assert coordinator._authorities == {}
+
+
+def test_checkpoint_snapshot_contains_only_durable_repository_fact():
+    assert {field.name for field in fields(CheckpointSnapshot)} == {
+        "commit_id",
+        "target",
+        "disposition",
+    }
+
+
+@pytest.mark.parametrize("kind", ("checkpoint", "final"))
+def test_running_nonowner_rejection_preserves_same_operation_for_owner(kind):
+    journal = MemoryCommitJournal("test-repository")
+    published = threading.Event()
+    errors = []
+    coordinator = RepositoryCommitCoordinator(
+        journal,
+        lambda _intent: CommitRecovery(committed=False),
+        allow_ephemeral=True,
+    )
+
+    def finalize(context: PostSafetyContext, result):
+        target = CommitTarget(
+            "test-repository",
+            kind,
+            "1",
+            f"artifacts/nonowner-first-{kind}",
+            "0" * 64,
+        )
+        operation_type = CheckpointCommit if kind == "checkpoint" else FinalCommit
+        operation = operation_type(
+            f"nonowner-first-{kind}",
+            context.safety_bundle_id,
+            coordinator.prepare(
+                target,
+                lambda: published.set()
+                or PublishedManifest(
+                    target.target_ref,
+                    target.expected_manifest_digest,
+                    "owner-ref",
+                ),
+            ),
+        )
+        commit_operation = (
+            context.commit_checkpoint if kind == "checkpoint" else context.commit_final
+        )
+
+        def escaped_commit():
+            try:
+                commit_operation(operation)
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=escaped_commit)
+        thread.start()
+        thread.join(1.0)
+        assert not thread.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], CapabilityRevoked)
+        assert not published.is_set()
+        assert journal.pending() == ()
+        assert len(coordinator._authorities) == 1
+        return commit_operation(operation)
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key(f"nonowner-first-{kind}"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+            requires_final_commit=kind == "final",
+        )
+    )
+    assert handle.result(2.0) == "owner-ref"
+    assert published.is_set()
+    assert journal.pending() == ()
+    assert coordinator._authorities == {}
+    assert handle.snapshot().final_committed is (kind == "final")
+    assert (handle.snapshot().committed_checkpoint is not None) is (kind == "checkpoint")
+
+
+def test_escaped_final_context_cannot_mutate_terminal_run_and_burns_authority():
+    journal = MemoryCommitJournal("test-repository")
+    coordinator = RepositoryCommitCoordinator(
+        journal,
+        lambda _intent: CommitRecovery(committed=False),
+        allow_ephemeral=True,
+    )
+    escaped = {}
+    published = threading.Event()
+
+    def finalize(context: PostSafetyContext, result):
+        target = CommitTarget(
+            "test-repository",
+            "final",
+            "1",
+            "artifacts/terminal-escape",
+            "0" * 64,
+        )
+        escaped["context"] = context
+        escaped["operation"] = FinalCommit(
+            "terminal-escape",
+            context.safety_bundle_id,
+            coordinator.prepare(
+                target,
+                lambda: published.set()
+                or PublishedManifest(
+                    target.target_ref,
+                    target.expected_manifest_digest,
+                    "late-ref",
+                ),
+            ),
+        )
+        return result
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("terminal-escape"),
+            execute=lambda *_: "terminal-result",
+            finalize=finalize,
+        )
+    )
+    assert handle.result(2.0) == "terminal-result"
+    before = handle.snapshot()
+    with pytest.raises(CapabilityRevoked, match="terminal"):
+        escaped["context"].commit_final(escaped["operation"])
+    assert handle.snapshot() == before
+    assert not published.is_set()
+    assert journal.pending() == ()
+    assert coordinator._authorities == {}
+
+
+def test_same_final_operation_loser_cannot_consume_authority_from_owner_winner():
+    journal = MemoryCommitJournal("test-repository")
+    coordinator = RepositoryCommitCoordinator(
+        journal,
+        lambda _intent: CommitRecovery(committed=False),
+        allow_ephemeral=True,
+    )
+    loser_errors = []
+
+    def finalize(context: PostSafetyContext, _result):
+        target = CommitTarget(
+            "test-repository",
+            "final",
+            "1",
+            "artifacts/same-operation-race",
+            "0" * 64,
+        )
+        operation_box = {}
+
+        def publish_manifest():
+            def loser():
+                try:
+                    context.commit_final(operation_box["operation"])
+                except BaseException as error:
+                    loser_errors.append(error)
+
+            thread = threading.Thread(target=loser)
+            thread.start()
+            thread.join(1.0)
+            assert not thread.is_alive()
+            return PublishedManifest(
+                target.target_ref,
+                target.expected_manifest_digest,
+                "winner-ref",
+            )
+
+        operation_box["operation"] = FinalCommit(
+            "same-operation-race",
+            context.safety_bundle_id,
+            coordinator.prepare(target, publish_manifest),
+        )
+        return context.commit_final(operation_box["operation"])
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("same-operation-race"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+            requires_final_commit=True,
+        )
+    )
+    assert handle.result(2.0) == "winner-ref"
+    assert len(loser_errors) == 1
+    assert isinstance(loser_errors[0], CapabilityRevoked)
+    assert coordinator._authorities == {}
+
+
+def test_swallowed_checkpoint_reconciliation_return_cannot_publish_success():
+    recover_calls = 0
+
+    def recover(intent):
+        nonlocal recover_calls
+        recover_calls += 1
+        if recover_calls == 1:
+            raise OSError("checkpoint fact unavailable")
+        return CommitRecovery(
+            committed=True,
+            result=PublishedManifest(
+                intent.target.target_ref,
+                intent.target.expected_manifest_digest,
+                "raw-ref",
+            ),
+        )
+
+    def finalize(context: PostSafetyContext, _result):
+        try:
+            checkpoint_commit(
+                context,
+                lambda: (_ for _ in ()).throw(PublishVisibilityUnknown("raw unknown")),
+                recover,
+                commit_id="swallowed-checkpoint-return",
+            )
+        except CheckpointReconciliationRequired:
+            return "pretend-success"
+        raise AssertionError("checkpoint reconciliation should have interrupted finalize")
+
+    arbiter = new_arbiter()
+    handle = RunController(arbiter).start(
+        plan(
+            key=camera_key("swallowed-checkpoint-return"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+        )
+    )
+    snapshot = handle.wait_for(
+        lambda value: value.phase == "checkpoint-reconciliation-failed",
+        2.0,
+    )
+    assert not snapshot.state.terminal
+    assert len(arbiter.active_claims()) == 1
+    assert handle.retry_recovery()
+    with pytest.raises(RunFailed, match="restart analysis"):
+        handle.result(2.0)
+
+
+def test_swallowed_final_reconciliation_return_waits_for_fact_before_success():
+    recover_calls = 0
+
+    def recover(intent):
+        nonlocal recover_calls
+        recover_calls += 1
+        if recover_calls == 1:
+            raise OSError("final fact unavailable")
+        return CommitRecovery(
+            committed=True,
+            result=PublishedManifest(
+                intent.target.target_ref,
+                intent.target.expected_manifest_digest,
+                "final-ref",
+            ),
+        )
+
+    def finalize(context: PostSafetyContext, _result):
+        try:
+            commit(
+                context,
+                lambda: (_ for _ in ()).throw(PublishVisibilityUnknown("final unknown")),
+                recover,
+                commit_id="swallowed-final-return",
+            )
+        except FinalCommitReconciliationRequired:
+            return "pretend-success"
+        raise AssertionError("final reconciliation should have interrupted finalize")
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("swallowed-final-return"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+            requires_final_commit=True,
+        )
+    )
+    snapshot = handle.wait_for(
+        lambda value: value.phase == "final-commit-reconciliation-failed",
+        2.0,
+    )
+    assert not snapshot.state.terminal
+    assert handle.retry_recovery()
+    assert handle.result(2.0) == "final-ref"
+
+
+def test_swallowed_checkpoint_then_finalize_error_reconciles_before_failure():
+    recover_calls = 0
+
+    def recover(intent):
+        nonlocal recover_calls
+        recover_calls += 1
+        if recover_calls == 1:
+            raise OSError("checkpoint fact unavailable")
+        return CommitRecovery(
+            committed=True,
+            result=PublishedManifest(
+                intent.target.target_ref,
+                intent.target.expected_manifest_digest,
+                "raw-ref",
+            ),
+        )
+
+    def finalize(context: PostSafetyContext, _result):
+        try:
+            checkpoint_commit(
+                context,
+                lambda: (_ for _ in ()).throw(PublishVisibilityUnknown("raw unknown")),
+                recover,
+                commit_id="swallowed-checkpoint-error",
+            )
+        except CheckpointReconciliationRequired:
+            raise ArithmeticError("analysis failed after swallowing checkpoint")
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("swallowed-checkpoint-error"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+        )
+    )
+    handle.wait_for(
+        lambda value: value.phase == "checkpoint-reconciliation-failed",
+        2.0,
+    )
+    assert handle.retry_recovery()
+    with pytest.raises(RunFailed, match="analysis failed after swallowing"):
+        handle.result(2.0)
+
+
+def test_pending_checkpoint_reconciliation_rejects_and_discards_final_commit():
+    checkpoint_recover_calls = 0
+    final_published = threading.Event()
+    final_journal = MemoryCommitJournal("test-repository")
+    final_coordinator = RepositoryCommitCoordinator(
+        final_journal,
+        lambda _intent: CommitRecovery(committed=False),
+        allow_ephemeral=True,
+    )
+
+    def recover(intent):
+        nonlocal checkpoint_recover_calls
+        checkpoint_recover_calls += 1
+        if checkpoint_recover_calls == 1:
+            raise OSError("checkpoint fact unavailable")
+        return CommitRecovery(
+            committed=True,
+            result=PublishedManifest(
+                intent.target.target_ref,
+                intent.target.expected_manifest_digest,
+                "raw-ref",
+            ),
+        )
+
+    def finalize(context: PostSafetyContext, _result):
+        try:
+            checkpoint_commit(
+                context,
+                lambda: (_ for _ in ()).throw(PublishVisibilityUnknown("raw unknown")),
+                recover,
+                commit_id="checkpoint-blocks-final",
+            )
+        except CheckpointReconciliationRequired:
+            target = CommitTarget(
+                "test-repository",
+                "final",
+                "1",
+                "artifacts/rejected-final-after-checkpoint",
+                "0" * 64,
+            )
+            operation = FinalCommit(
+                "rejected-final-after-checkpoint",
+                context.safety_bundle_id,
+                final_coordinator.prepare(
+                    target,
+                    lambda: final_published.set()
+                    or PublishedManifest(
+                        target.target_ref,
+                        target.expected_manifest_digest,
+                        "final-ref",
+                    ),
+                ),
+            )
+            with pytest.raises(RuntimeError, match="reconciliation is pending"):
+                context.commit_final(operation)
+            return "swallowed"
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("checkpoint-blocks-final"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+        )
+    )
+    handle.wait_for(
+        lambda value: value.phase == "checkpoint-reconciliation-failed",
+        2.0,
+    )
+    assert not final_published.is_set()
+    assert final_journal.pending() == ()
+    assert final_coordinator._authorities == {}
+    assert handle.retry_recovery()
+    with pytest.raises(RunFailed, match="restart analysis"):
+        handle.result(2.0)
+
+
+def test_conflicting_existing_intent_is_never_aborted_by_begin_failure():
+    class TrackingJournal(MemoryCommitJournal):
+        def __init__(self):
+            super().__init__("test-repository")
+            self.aborted_ids = []
+
+        def mark_aborted(self, commit_id):
+            self.aborted_ids.append(commit_id)
+            super().mark_aborted(commit_id)
+
+    journal = TrackingJournal()
+    coordinator = RepositoryCommitCoordinator(
+        journal,
+        lambda _intent: CommitRecovery(committed=False),
+        allow_ephemeral=True,
+    )
+    old_target = CommitTarget(
+        "test-repository",
+        "old-kind",
+        "1",
+        "artifacts/old-owner",
+        "1" * 64,
+    )
+    old_intent = CommitIntent(
+        "conflicting-intent-id",
+        "old-run",
+        "old-safety",
+        old_target,
+        1.0,
+    )
+    journal.begin(old_intent)
+
+    def finalize(context: PostSafetyContext, _result):
+        new_target = CommitTarget(
+            "test-repository",
+            "new-kind",
+            "1",
+            "artifacts/new-owner",
+            "2" * 64,
+        )
+        return context.commit_checkpoint(
+            CheckpointCommit(
+                "conflicting-intent-id",
+                context.safety_bundle_id,
+                coordinator.prepare(
+                    new_target,
+                    lambda: PublishedManifest(
+                        new_target.target_ref,
+                        new_target.expected_manifest_digest,
+                        "new-ref",
+                    ),
+                ),
+            )
+        )
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key("conflicting-intent"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+        )
+    )
+    with pytest.raises(RunFailed, match="conflicting intent"):
+        handle.result(2.0)
+    assert journal.pending() == (old_intent,)
+    assert journal.aborted_ids == []
+
+
+@pytest.mark.parametrize("kind", ("checkpoint", "final"))
+def test_admit_rechecks_deadline_after_outer_validation_before_any_io(kind):
+    journal = MemoryCommitJournal("test-repository")
+    coordinator = RepositoryCommitCoordinator(
+        journal,
+        lambda _intent: CommitRecovery(committed=False),
+        allow_ephemeral=True,
+    )
+    published = threading.Event()
+
+    def finalize(context: PostSafetyContext, _result):
+        target = CommitTarget(
+            "test-repository",
+            kind,
+            "1",
+            f"artifacts/deadline-toctou-{kind}",
+            "0" * 64,
+        )
+        operation_type = CheckpointCommit if kind == "checkpoint" else FinalCommit
+        operation = operation_type(
+            f"deadline-toctou-{kind}",
+            context.safety_bundle_id,
+            coordinator.prepare(
+                target,
+                lambda: published.set()
+                or PublishedManifest(
+                    target.target_ref,
+                    target.expected_manifest_digest,
+                    "raw-ref",
+                ),
+            ),
+        )
+        context._validate_commit_entry(operation)
+        assert context.deadline is not None
+        while time.monotonic() < context.deadline:
+            time.sleep(0.001)
+        if kind == "checkpoint":
+            return context._handle._commit_checkpoint(
+                operation,
+                deadline=context.deadline,
+            )
+        return context._handle._commit_final(operation, deadline=context.deadline)
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key(f"deadline-toctou-{kind}"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+            timeout_seconds=0.25,
+        )
+    )
+    with pytest.raises(RunFailed, match="monotonic deadline"):
+        handle.result(2.0)
+    assert not published.is_set()
+    assert journal.pending() == ()
+    assert coordinator._authorities == {}
+
+
 def test_final_commit_recovers_visible_manifest_after_lost_acknowledgement():
     controller = RunController(new_arbiter())
     visible_manifest = []
@@ -1385,7 +2721,7 @@ def test_wrong_digest_remains_force_abort_after_abort_marker_failure():
         )
     )
     handle.wait_for(
-        lambda value: value.phase == "commit-reconciliation-failed",
+        lambda value: value.phase == "final-commit-reconciliation-failed",
         2.0,
     )
     assert recovery_calls == []
@@ -1425,7 +2761,7 @@ def test_uncommitted_visibility_resolution_remains_force_abort_after_marker_fail
         )
     )
     handle.wait_for(
-        lambda value: value.phase == "commit-reconciliation-failed",
+        lambda value: value.phase == "final-commit-reconciliation-failed",
         2.0,
     )
     assert len(recovery_calls) == 1
@@ -1462,7 +2798,7 @@ def test_validated_publish_remains_force_commit_after_commit_marker_failure():
         )
     )
     handle.wait_for(
-        lambda value: value.phase == "commit-reconciliation-failed",
+        lambda value: value.phase == "final-commit-reconciliation-failed",
         2.0,
     )
     assert recovery_calls == []
@@ -1513,7 +2849,7 @@ def test_unknown_final_commit_visibility_holds_claim_until_retry_reconciles():
         )
     )
     snapshot = handle.wait_for(
-        lambda value: value.phase == "commit-reconciliation-failed",
+        lambda value: value.phase == "final-commit-reconciliation-failed",
         2.0,
     )
     assert snapshot.state is RunState.RUNNING

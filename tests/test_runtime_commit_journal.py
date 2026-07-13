@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from zlc_neutral_atom.runtime import (
+    CheckpointCommit,
     CommitIntent,
     CommitRecovery,
     CommitTarget,
@@ -12,6 +13,7 @@ from zlc_neutral_atom.runtime import (
     PersistentCommitJournal,
     PublishedManifest,
     RepositoryCommitCoordinator,
+    FinalCommit,
     reconcile_pending_commits,
 )
 
@@ -233,3 +235,29 @@ def test_commit_authority_payload_is_immutable():
     assert not hasattr(authority, "journal")
     assert not hasattr(authority, "recover")
     assert not hasattr(authority, "_publish")
+
+
+def test_checkpoint_commit_is_a_distinct_typed_operation_not_a_final_flag():
+    journal = MemoryCommitJournal(REPOSITORY_ID)
+    coordinator = RepositoryCommitCoordinator(
+        journal,
+        lambda _intent: CommitRecovery(committed=False),
+        allow_ephemeral=True,
+    )
+    target = intent("typed-checkpoint").target
+    checkpoint = CheckpointCommit(
+        "typed-checkpoint",
+        "test-safety-bundle",
+        coordinator.prepare(
+            target,
+            lambda: PublishedManifest(
+                target.target_ref,
+                target.expected_manifest_digest,
+                "raw-ref",
+            ),
+        ),
+    )
+    assert not isinstance(checkpoint, FinalCommit)
+    assert checkpoint.target == target
+    with pytest.raises(AttributeError, match="cannot assign"):
+        checkpoint.commit_id = "mutated"

@@ -195,11 +195,17 @@ def _consume_commit_authority(
     authority: CommitAuthority[CommitT],
 ) -> _CommitAuthoritySnapshot[CommitT]:
     if not isinstance(authority, CommitAuthority):
-        raise TypeError("final commit authority is invalid")
+        raise TypeError("commit authority is invalid")
     return authority._coordinator._consume_authority(  # noqa: SLF001
         _COMMIT_AUTHORITY_CONSUMER_TOKEN,
         authority,
     )
+
+
+def _discard_commit_authority(authority: CommitAuthority[object]) -> None:
+    """Consume an operation rejected before an intent so its capability cannot leak."""
+
+    _consume_commit_authority(authority)
 
 
 @dataclass(frozen=True)
@@ -214,6 +220,26 @@ class FinalCommit(Generic[CommitT]):
             _canonical(self.safety_bundle_id, "final commit safety_bundle_id")
         if not isinstance(self.authority, CommitAuthority):
             raise TypeError("FinalCommit.authority must be CommitAuthority")
+
+    @property
+    def target(self) -> CommitTarget:
+        return self.authority.target
+
+
+@dataclass(frozen=True)
+class CheckpointCommit(Generic[CommitT]):
+    """One typed intermediate artifact commit; never a final-commit policy flag."""
+
+    commit_id: str
+    safety_bundle_id: str | None
+    authority: CommitAuthority[CommitT]
+
+    def __post_init__(self) -> None:
+        _canonical(self.commit_id, "checkpoint commit_id")
+        if self.safety_bundle_id is not None:
+            _canonical(self.safety_bundle_id, "checkpoint commit safety_bundle_id")
+        if not isinstance(self.authority, CommitAuthority):
+            raise TypeError("CheckpointCommit.authority must be CommitAuthority")
 
     @property
     def target(self) -> CommitTarget:

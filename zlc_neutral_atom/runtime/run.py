@@ -12,11 +12,14 @@ from typing import Callable, Generic, TypeVar
 
 from .cancellation import CancellationRequested, CancellationToken
 from .commit import (
+    CheckpointCommit,
     CommitIntent,
+    CommitTarget,
     FinalCommit,
     PublishVisibilityUnknown,
     _CommitAuthoritySnapshot,
     _consume_commit_authority,
+    _discard_commit_authority,
     commit_now,
 )
 from .ports import (
@@ -119,6 +122,27 @@ class CancelOutcome(str, Enum):
     ALREADY_TERMINAL = "ALREADY_TERMINAL"
 
 
+class CheckpointDisposition(str, Enum):
+    COMMITTED = "COMMITTED"
+    RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
+
+
+@dataclass(frozen=True)
+class CheckpointSnapshot:
+    """Public checkpoint fact; repository-native typed refs stay behind CommitTarget."""
+
+    commit_id: str
+    target: CommitTarget
+    disposition: CheckpointDisposition
+
+    def __post_init__(self) -> None:
+        _canonical_text(self.commit_id, "checkpoint commit_id")
+        if not isinstance(self.target, CommitTarget):
+            raise TypeError("checkpoint target must be CommitTarget")
+        if not isinstance(self.disposition, CheckpointDisposition):
+            raise TypeError("checkpoint disposition must be CheckpointDisposition")
+
+
 @dataclass(frozen=True)
 class RunSnapshot:
     run_id: RunId
@@ -126,6 +150,7 @@ class RunSnapshot:
     state: RunState
     phase: str
     final_committed: bool
+    committed_checkpoint: CheckpointSnapshot | None
     safety_bundle_id: str | None
     commit_recovery_warning: str | None
     primary_error: str | None
@@ -305,7 +330,11 @@ class RunPlan(Generic[PreparedT, ResultT]):
 
 
 class CapabilityRevoked(RuntimeError):
-    """A post-safety closure attempted to call a hardware capability."""
+    """A caller attempted to use a process-local Run capability outside its scope."""
+
+
+class _PermanentCommitRejection(CapabilityRevoked):
+    """The operation can never become eligible later in this Run."""
 
 
 class _CommitResolutionMode(Enum):
@@ -314,10 +343,27 @@ class _CommitResolutionMode(Enum):
     FORCE_COMMIT = "force-commit"
 
 
+class _CommitKind(Enum):
+    CHECKPOINT = "checkpoint"
+    FINAL = "final"
+
+
 _NO_COMMITTED_RESULT = object()
 
 
-class CommitReconciliationRequired(RuntimeError):
+@dataclass(frozen=True)
+class _DurableCommitOutcome(Generic[CommitT]):
+    result: CommitT
+    recovered_error: BaseException | None = None
+
+
+@dataclass(frozen=True)
+class _DurableReconciliationOutcome:
+    committed: bool
+    result: object = _NO_COMMITTED_RESULT
+
+
+class FinalCommitReconciliationRequired(RuntimeError):
     def __init__(
         self,
         operation: FinalCommit,
@@ -337,6 +383,30 @@ class CommitReconciliationRequired(RuntimeError):
         self._committed_result = committed_result
         super().__init__(
             "final commit state is unresolved; durable reconciliation is required: "
+            f"{type(recovery_error).__name__}: {recovery_error}"
+        )
+
+
+class CheckpointReconciliationRequired(RuntimeError):
+    def __init__(
+        self,
+        operation: CheckpointCommit,
+        authority_snapshot: _CommitAuthoritySnapshot,
+        intent: CommitIntent,
+        publish_error: BaseException,
+        recovery_error: BaseException,
+        resolution_mode: _CommitResolutionMode,
+        committed_result: object = _NO_COMMITTED_RESULT,
+    ) -> None:
+        self.operation = operation
+        self._authority_snapshot = authority_snapshot
+        self.intent = intent
+        self.publish_error = publish_error
+        self.recovery_error = recovery_error
+        self._resolution_mode = resolution_mode
+        self._committed_result = committed_result
+        super().__init__(
+            "checkpoint commit state is unresolved; durable reconciliation is required: "
             f"{type(recovery_error).__name__}: {recovery_error}"
         )
 
@@ -640,12 +710,35 @@ class PostSafetyContext:
         if self.deadline is not None and time.monotonic() >= self.deadline:
             raise TimeoutError(f"run {self.run_id} exceeded its monotonic deadline")
 
+    def _validate_commit_entry(
+        self,
+        operation: CheckpointCommit[object] | FinalCommit[object],
+    ) -> None:
+        if operation.safety_bundle_id != self.safety_bundle_id:
+            rejection = ValueError("commit safety bundle id does not match this Run")
+            self._handle._discard_rejected_commit(operation, rejection)
+            raise rejection
+        try:
+            self._handle._validate_commit_caller(self.deadline)
+        except BaseException as rejection:
+            if isinstance(
+                rejection,
+                (_PermanentCommitRejection, CancellationRequested, TimeoutError),
+            ):
+                self._handle._discard_rejected_commit(operation, rejection)
+            raise
+
     def commit_final(self, operation: FinalCommit[CommitT]) -> CommitT:
         if not isinstance(operation, FinalCommit):
             raise TypeError("commit_final requires a FinalCommit operation")
-        if operation.safety_bundle_id != self.safety_bundle_id:
-            raise ValueError("final manifest safety bundle id does not match this Run")
-        return self._handle._commit_final(operation)
+        self._validate_commit_entry(operation)
+        return self._handle._commit_final(operation, deadline=self.deadline)
+
+    def commit_checkpoint(self, operation: CheckpointCommit[CommitT]) -> CommitT:
+        if not isinstance(operation, CheckpointCommit):
+            raise TypeError("commit_checkpoint requires a CheckpointCommit operation")
+        self._validate_commit_entry(operation)
+        return self._handle._commit_checkpoint(operation, deadline=self.deadline)
 
 
 class RunStartRejected(RuntimeError):
@@ -690,9 +783,12 @@ class RunHandle(Generic[ResultT]):
         self._state = RunState.RUNNING
         self._phase = "starting"
         self._final_committed = False
+        self._checkpoint_attempted = False
+        self._committed_checkpoint: CheckpointSnapshot | None = None
         self._commit_inflight = False
         self._commit_recovery_warning: str | None = None
-        self._pending_commit: CommitReconciliationRequired | None = None
+        self._pending_final_commit: FinalCommitReconciliationRequired | None = None
+        self._pending_checkpoint: CheckpointReconciliationRequired | None = None
         self._safety_bundle_id: str | None = None
         self._primary: BaseException | None = None
         self._cleanup_errors: tuple[BaseException, ...] = ()
@@ -826,6 +922,11 @@ class RunHandle(Generic[ResultT]):
                 previous_errors = self._cleanup_errors
                 retry_phase = self._retry_phase
                 retry_state = self._retry_state
+                if (
+                    retry_phase == "checkpoint-reconciliation-failed"
+                    and self._token.is_cancelled
+                ):
+                    retry_state = RunState.CANCELLING
 
             def retry_owner() -> None:
                 try:
@@ -846,9 +947,15 @@ class RunHandle(Generic[ResultT]):
             )
             self._replace_owner_for_recovery(thread)
             self._resume_after_recovery(
-                "retrying-final-commit-reconciliation"
-                if retry_phase == "commit-reconciliation-failed"
-                else "retrying-safety-recovery",
+                (
+                    "retrying-final-commit-reconciliation"
+                    if retry_phase == "final-commit-reconciliation-failed"
+                    else (
+                        "retrying-checkpoint-reconciliation"
+                        if retry_phase == "checkpoint-reconciliation-failed"
+                        else "retrying-safety-recovery"
+                    )
+                ),
                 state=retry_state,
             )
             try:
@@ -875,6 +982,7 @@ class RunHandle(Generic[ResultT]):
             state=self._state,
             phase=self._phase,
             final_committed=self._final_committed,
+            committed_checkpoint=self._committed_checkpoint,
             safety_bundle_id=self._safety_bundle_id,
             commit_recovery_warning=self._commit_recovery_warning,
             primary_error=None if self._primary is None else _format_error(self._primary),
@@ -942,7 +1050,21 @@ class RunHandle(Generic[ResultT]):
             self._revision += 1
             self._condition.notify_all()
 
-    def _pause_commit_reconciliation(
+    def _validate_commit_caller(self, deadline: float | None) -> None:
+        with self._condition:
+            if self._state.terminal:
+                raise _PermanentCommitRejection(
+                    "post-safety commit capability is terminal"
+                )
+            self._token.checkpoint()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"run {self.run_id} exceeded its monotonic deadline")
+            if threading.current_thread() is not self._owner_thread:
+                raise CapabilityRevoked(
+                    "post-safety commit capability belongs to the authoritative Run owner thread"
+                )
+
+    def _pause_final_commit_reconciliation(
         self,
         operation: FinalCommit,
         authority_snapshot: _CommitAuthoritySnapshot,
@@ -951,8 +1073,8 @@ class RunHandle(Generic[ResultT]):
         reconciliation_error: BaseException,
         resolution_mode: _CommitResolutionMode,
         committed_result: object = _NO_COMMITTED_RESULT,
-    ) -> CommitReconciliationRequired:
-        pending = CommitReconciliationRequired(
+    ) -> FinalCommitReconciliationRequired:
+        pending = FinalCommitReconciliationRequired(
             operation,
             authority_snapshot,
             intent,
@@ -963,33 +1085,191 @@ class RunHandle(Generic[ResultT]):
         )
         with self._condition:
             self._commit_inflight = False
-            self._pending_commit = pending
-            self._phase = "commit-reconciliation-failed"
+            self._pending_final_commit = pending
+            self._phase = "final-commit-reconciliation-failed"
             self._revision += 1
             self._condition.notify_all()
         return pending
 
-    def _commit_final(self, operation: FinalCommit[CommitT]) -> CommitT:
+    def _pause_checkpoint_reconciliation(
+        self,
+        operation: CheckpointCommit,
+        authority_snapshot: _CommitAuthoritySnapshot,
+        intent: CommitIntent,
+        primary_error: BaseException,
+        reconciliation_error: BaseException,
+        resolution_mode: _CommitResolutionMode,
+        committed_result: object = _NO_COMMITTED_RESULT,
+    ) -> CheckpointReconciliationRequired:
+        pending = CheckpointReconciliationRequired(
+            operation,
+            authority_snapshot,
+            intent,
+            primary_error,
+            reconciliation_error,
+            resolution_mode,
+            committed_result,
+        )
         with self._condition:
-            self._token.checkpoint()
-            if self._final_committed:
-                raise RuntimeError("final commit marker may be set only once")
-            if self._commit_inflight:
-                raise RuntimeError("another final commit operation is already in flight")
-            if self._cancel_gate_closed:
-                raise RuntimeError("run is already publishing terminal state")
-            self._commit_inflight = True
-            self._phase = "preparing-commit-intent"
+            self._commit_inflight = False
+            self._pending_checkpoint = pending
+            self._committed_checkpoint = CheckpointSnapshot(
+                operation.commit_id,
+                authority_snapshot.target,
+                CheckpointDisposition.RECONCILIATION_REQUIRED,
+            )
+            self._phase = "checkpoint-reconciliation-failed"
             self._revision += 1
             self._condition.notify_all()
+        return pending
+
+    @staticmethod
+    def _discard_rejected_commit(
+        operation: CheckpointCommit | FinalCommit,
+        rejection: BaseException,
+    ) -> None:
         try:
-            authority = _consume_commit_authority(operation.authority)
-        except BaseException:
-            with self._condition:
-                self._commit_inflight = False
-                self._revision += 1
-                self._condition.notify_all()
-            raise
+            _discard_commit_authority(operation.authority)
+        except BaseException as discard_error:
+            if hasattr(rejection, "add_note"):
+                rejection.add_note(
+                    f"rejected commit authority discard also failed: {discard_error!r}"
+                )
+
+    def _admit_commit(
+        self,
+        operation: CheckpointCommit[CommitT] | FinalCommit[CommitT],
+        kind: _CommitKind,
+        deadline: float | None,
+    ) -> _CommitAuthoritySnapshot[CommitT]:
+        """Atomically validate the Run gate, consume authority, and reserve commit I/O."""
+
+        rejection: BaseException | None = None
+        discard_on_rejection = True
+        authority: _CommitAuthoritySnapshot[CommitT] | None = None
+        with self._condition:
+            if self._state.terminal:
+                rejection = _PermanentCommitRejection(
+                    "commit operation cannot run after terminal state"
+                )
+            else:
+                try:
+                    self._token.checkpoint()
+                except BaseException as error:
+                    rejection = error
+            if (
+                rejection is None
+                and deadline is not None
+                and time.monotonic() >= deadline
+            ):
+                rejection = TimeoutError(
+                    f"run {self.run_id} exceeded its monotonic deadline"
+                )
+            if rejection is None and threading.current_thread() is not self._owner_thread:
+                rejection = CapabilityRevoked(
+                    "commit operation belongs to the authoritative Run owner thread"
+                )
+                discard_on_rejection = False
+            if (
+                rejection is None
+                and (
+                    self._pending_checkpoint is not None
+                    or self._pending_final_commit is not None
+                )
+            ):
+                rejection = RuntimeError(
+                    "cannot start a commit while durable reconciliation is pending"
+                )
+            if (
+                rejection is None
+                and kind is _CommitKind.CHECKPOINT
+                and self._checkpoint_attempted
+            ):
+                rejection = RuntimeError("checkpoint commit may be attempted only once per Run")
+            if rejection is None and kind is _CommitKind.FINAL and self._final_committed:
+                rejection = RuntimeError("final commit marker may be set only once")
+            if rejection is None and self._commit_inflight:
+                rejection = RuntimeError("another commit operation is already in flight")
+            if rejection is None and self._cancel_gate_closed:
+                rejection = RuntimeError("run is already publishing terminal state")
+            if (
+                rejection is None
+                and deadline is not None
+                and time.monotonic() >= deadline
+            ):
+                rejection = TimeoutError(
+                    f"run {self.run_id} exceeded its monotonic deadline"
+                )
+            if rejection is None:
+                try:
+                    authority = _consume_commit_authority(operation.authority)
+                except BaseException as error:
+                    rejection = error
+                else:
+                    if kind is _CommitKind.CHECKPOINT:
+                        self._checkpoint_attempted = True
+                        self._phase = "preparing-checkpoint-intent"
+                    else:
+                        self._phase = "preparing-commit-intent"
+                    self._commit_inflight = True
+                    self._revision += 1
+                    self._condition.notify_all()
+        if rejection is not None:
+            if discard_on_rejection:
+                self._discard_rejected_commit(operation, rejection)
+            raise rejection
+        assert authority is not None
+        return authority
+
+    def _pause_durable_commit(
+        self,
+        kind: _CommitKind,
+        operation: CheckpointCommit | FinalCommit,
+        authority: _CommitAuthoritySnapshot,
+        intent: CommitIntent,
+        publish_error: BaseException,
+        recovery_error: BaseException,
+        resolution_mode: _CommitResolutionMode,
+        committed_result: object = _NO_COMMITTED_RESULT,
+    ) -> CheckpointReconciliationRequired | FinalCommitReconciliationRequired:
+        if kind is _CommitKind.CHECKPOINT:
+            assert isinstance(operation, CheckpointCommit)
+            return self._pause_checkpoint_reconciliation(
+                operation,
+                authority,
+                intent,
+                publish_error,
+                recovery_error,
+                resolution_mode,
+                committed_result,
+            )
+        assert isinstance(operation, FinalCommit)
+        return self._pause_final_commit_reconciliation(
+            operation,
+            authority,
+            intent,
+            publish_error,
+            recovery_error,
+            resolution_mode,
+            committed_result,
+        )
+
+    def _clear_commit_inflight_after_error(self) -> None:
+        with self._condition:
+            if not self._commit_inflight:
+                return
+            self._commit_inflight = False
+            self._revision += 1
+            self._condition.notify_all()
+
+    def _execute_durable_commit(
+        self,
+        operation: CheckpointCommit[CommitT] | FinalCommit[CommitT],
+        authority: _CommitAuthoritySnapshot[CommitT],
+        kind: _CommitKind,
+    ) -> _DurableCommitOutcome[CommitT]:
+        """Run one intent/publish/recover/marker transaction after atomic admission."""
+
         intent = CommitIntent(
             commit_id=operation.commit_id,
             run_id=self.run_id.value,
@@ -1001,14 +1281,11 @@ class RunHandle(Generic[ResultT]):
             authority.journal.begin(intent)
         except BaseException as begin_error:
             try:
-                is_pending = any(
-                    value.commit_id == operation.commit_id
-                    for value in authority.journal.pending()
-                )
-                if is_pending:
+                if any(value == intent for value in authority.journal.pending()):
                     authority.journal.mark_aborted(operation.commit_id)
             except BaseException as reconciliation_error:
-                pending = self._pause_commit_reconciliation(
+                pending = self._pause_durable_commit(
+                    kind,
                     operation,
                     authority,
                     intent,
@@ -1017,23 +1294,24 @@ class RunHandle(Generic[ResultT]):
                     _CommitResolutionMode.FORCE_ABORT,
                 )
                 raise pending from reconciliation_error
-            with self._condition:
-                self._commit_inflight = False
-                self._revision += 1
-                self._condition.notify_all()
             raise
+
         try:
             with self._condition:
                 self._token.checkpoint()
-                self._cancel_gate_closed = True
-                self._phase = "committing"
+                if kind is _CommitKind.FINAL:
+                    self._cancel_gate_closed = True
+                    self._phase = "committing"
+                else:
+                    self._phase = "publishing-checkpoint"
                 self._revision += 1
                 self._condition.notify_all()
         except BaseException as gate_error:
             try:
                 authority.journal.mark_aborted(operation.commit_id)
             except BaseException as reconciliation_error:
-                pending = self._pause_commit_reconciliation(
+                pending = self._pause_durable_commit(
+                    kind,
                     operation,
                     authority,
                     intent,
@@ -1042,103 +1320,86 @@ class RunHandle(Generic[ResultT]):
                     _CommitResolutionMode.FORCE_ABORT,
                 )
                 raise pending from reconciliation_error
-            with self._condition:
-                self._commit_inflight = False
-                self._revision += 1
-                self._condition.notify_all()
             raise
+
         publish_error: BaseException | None = None
-        recovered = False
+        recovered_error: BaseException | None = None
         try:
+            committed = authority.publish_validated()
+        except PublishVisibilityUnknown as visibility_error:
+            publish_error = visibility_error
             try:
-                committed = authority.publish_validated()
-            except PublishVisibilityUnknown as visibility_error:
-                publish_error = visibility_error
-                try:
-                    recovery = authority.recover_validated(intent)
-                except BaseException as recovery_error:
-                    pending = self._pause_commit_reconciliation(
-                        operation,
-                        authority,
-                        intent,
-                        publish_error,
-                        recovery_error,
-                        _CommitResolutionMode.RECOVER_VISIBILITY,
-                    )
-                    raise pending from recovery_error
-                if not recovery.committed:
-                    try:
-                        authority.journal.mark_aborted(operation.commit_id)
-                    except BaseException as journal_error:
-                        pending = self._pause_commit_reconciliation(
-                            operation,
-                            authority,
-                            intent,
-                            publish_error,
-                            journal_error,
-                            _CommitResolutionMode.FORCE_ABORT,
-                        )
-                        raise pending from journal_error
-                    raise publish_error
-                assert recovery.result is not None
-                committed = recovery.result.result
-                recovered = True
-            except BaseException as deterministic_publish_error:
-                publish_error = deterministic_publish_error
-                try:
-                    authority.journal.mark_aborted(operation.commit_id)
-                except BaseException as journal_error:
-                    pending = self._pause_commit_reconciliation(
-                        operation,
-                        authority,
-                        intent,
-                        deterministic_publish_error,
-                        journal_error,
-                        _CommitResolutionMode.FORCE_ABORT,
-                    )
-                    raise pending from journal_error
-                raise
-            try:
-                authority.journal.mark_committed(operation.commit_id)
-            except BaseException as journal_error:
-                pending = self._pause_commit_reconciliation(
+                recovery = authority.recover_validated(intent)
+            except BaseException as recovery_error:
+                pending = self._pause_durable_commit(
+                    kind,
                     operation,
                     authority,
                     intent,
-                    publish_error or journal_error,
-                    journal_error,
-                    _CommitResolutionMode.FORCE_COMMIT,
-                    committed,
+                    visibility_error,
+                    recovery_error,
+                    _CommitResolutionMode.RECOVER_VISIBILITY,
                 )
-                raise pending from journal_error
-        except BaseException:
-            with self._condition:
-                self._commit_inflight = False
-                self._revision += 1
-                self._condition.notify_all()
+                raise pending from recovery_error
+            if not recovery.committed:
+                try:
+                    authority.journal.mark_aborted(operation.commit_id)
+                except BaseException as marker_error:
+                    pending = self._pause_durable_commit(
+                        kind,
+                        operation,
+                        authority,
+                        intent,
+                        visibility_error,
+                        marker_error,
+                        _CommitResolutionMode.FORCE_ABORT,
+                    )
+                    raise pending from marker_error
+                if kind is _CommitKind.CHECKPOINT:
+                    self._token.checkpoint()
+                raise visibility_error
+            assert recovery.result is not None
+            committed = recovery.result.result
+            recovered_error = visibility_error
+        except BaseException as deterministic_publish_error:
+            try:
+                authority.journal.mark_aborted(operation.commit_id)
+            except BaseException as marker_error:
+                pending = self._pause_durable_commit(
+                    kind,
+                    operation,
+                    authority,
+                    intent,
+                    deterministic_publish_error,
+                    marker_error,
+                    _CommitResolutionMode.FORCE_ABORT,
+                )
+                raise pending from marker_error
             raise
-        with self._condition:
-            self._commit_inflight = False
-            self._final_committed = True
-            self._pending_commit = None
-            self._result = committed
-            if recovered and publish_error is not None:
-                self._commit_recovery_warning = _format_error(publish_error)
-            self._revision += 1
-            self._condition.notify_all()
-            return committed
 
-    def _reconcile_final_commit(self) -> object:
-        with self._condition:
-            pending = self._pending_commit
-            if pending is None:
-                raise RuntimeError("Run has no pending final commit reconciliation")
-            if self._commit_inflight:
-                raise RuntimeError("final commit reconciliation is already in flight")
-            self._commit_inflight = True
-            self._phase = "reconciling-final-commit"
-            self._revision += 1
-            self._condition.notify_all()
+        try:
+            authority.journal.mark_committed(operation.commit_id)
+        except BaseException as marker_error:
+            pending = self._pause_durable_commit(
+                kind,
+                operation,
+                authority,
+                intent,
+                publish_error or marker_error,
+                marker_error,
+                _CommitResolutionMode.FORCE_COMMIT,
+                committed,
+            )
+            raise pending from marker_error
+        return _DurableCommitOutcome(committed, recovered_error)
+
+    def _reconcile_durable_commit(
+        self,
+        pending: CheckpointReconciliationRequired | FinalCommitReconciliationRequired,
+        kind: _CommitKind,
+    ) -> _DurableReconciliationOutcome:
+        """Resolve repository fact and its durable marker without re-running publish/finalize."""
+
         operation = pending.operation
         authority = pending._authority_snapshot
         mode = pending._resolution_mode
@@ -1147,7 +1408,8 @@ class RunHandle(Generic[ResultT]):
             try:
                 recovery = authority.recover_validated(pending.intent)
             except BaseException as recovery_error:
-                refreshed = self._pause_commit_reconciliation(
+                refreshed = self._pause_durable_commit(
+                    kind,
                     operation,
                     authority,
                     pending.intent,
@@ -1167,14 +1429,15 @@ class RunHandle(Generic[ResultT]):
             authority.journal.begin(pending.intent)
             if mode is _CommitResolutionMode.FORCE_COMMIT:
                 if committed_result is _NO_COMMITTED_RESULT:
-                    raise RuntimeError("committed reconciliation lost its validated result")
+                    raise RuntimeError("commit reconciliation lost its validated result")
                 authority.journal.mark_committed(operation.commit_id)
             elif mode is _CommitResolutionMode.FORCE_ABORT:
                 authority.journal.mark_aborted(operation.commit_id)
             else:  # pragma: no cover - exhaustive enum guard
                 raise RuntimeError(f"unknown commit resolution mode {mode!r}")
         except BaseException as marker_error:
-            refreshed = self._pause_commit_reconciliation(
+            refreshed = self._pause_durable_commit(
+                kind,
                 operation,
                 authority,
                 pending.intent,
@@ -1184,23 +1447,148 @@ class RunHandle(Generic[ResultT]):
                 committed_result,
             )
             raise refreshed from marker_error
+        return _DurableReconciliationOutcome(
+            committed=mode is _CommitResolutionMode.FORCE_COMMIT,
+            result=committed_result,
+        )
 
-        if mode is _CommitResolutionMode.FORCE_ABORT:
+    def _commit_checkpoint(
+        self,
+        operation: CheckpointCommit[CommitT],
+        *,
+        deadline: float | None,
+    ) -> CommitT:
+        authority = self._admit_commit(operation, _CommitKind.CHECKPOINT, deadline)
+        try:
+            outcome = self._execute_durable_commit(
+                operation,
+                authority,
+                _CommitKind.CHECKPOINT,
+            )
+        except BaseException:
+            self._clear_commit_inflight_after_error()
+            raise
+
+        with self._condition:
+            self._commit_inflight = False
+            self._pending_checkpoint = None
+            self._committed_checkpoint = CheckpointSnapshot(
+                operation.commit_id,
+                authority.target,
+                CheckpointDisposition.COMMITTED,
+            )
+            self._phase = "post-checkpoint-analysis"
+            if outcome.recovered_error is not None:
+                self._commit_recovery_warning = _format_error(outcome.recovered_error)
+            self._revision += 1
+            self._condition.notify_all()
+        self._token.checkpoint()
+        return outcome.result
+
+    def _commit_final(
+        self,
+        operation: FinalCommit[CommitT],
+        *,
+        deadline: float | None,
+    ) -> CommitT:
+        authority = self._admit_commit(operation, _CommitKind.FINAL, deadline)
+        try:
+            outcome = self._execute_durable_commit(
+                operation,
+                authority,
+                _CommitKind.FINAL,
+            )
+        except BaseException:
+            self._clear_commit_inflight_after_error()
+            raise
+        with self._condition:
+            self._commit_inflight = False
+            self._final_committed = True
+            self._pending_final_commit = None
+            self._result = outcome.result
+            if outcome.recovered_error is not None:
+                self._commit_recovery_warning = _format_error(outcome.recovered_error)
+            self._revision += 1
+            self._condition.notify_all()
+            return outcome.result
+
+    def _reconcile_final_commit(self) -> object:
+        with self._condition:
+            if threading.current_thread() is not self._owner_thread:
+                raise CapabilityRevoked(
+                    "final commit reconciliation belongs to the authoritative Run owner thread"
+                )
+            pending = self._pending_final_commit
+            if pending is None:
+                raise RuntimeError("Run has no pending final commit reconciliation")
+            if self._commit_inflight:
+                raise RuntimeError("final commit reconciliation is already in flight")
+            self._commit_inflight = True
+            self._phase = "reconciling-final-commit"
+            self._revision += 1
+            self._condition.notify_all()
+        try:
+            outcome = self._reconcile_durable_commit(pending, _CommitKind.FINAL)
+        except BaseException:
+            self._clear_commit_inflight_after_error()
+            raise
+        if not outcome.committed:
             with self._condition:
                 self._commit_inflight = False
-                self._pending_commit = None
+                self._pending_final_commit = None
                 self._revision += 1
                 self._condition.notify_all()
             raise pending.publish_error
         with self._condition:
             self._commit_inflight = False
-            self._pending_commit = None
+            self._pending_final_commit = None
             self._final_committed = True
-            self._result = committed_result
+            self._result = outcome.result
             self._commit_recovery_warning = _format_error(pending.publish_error)
             self._revision += 1
             self._condition.notify_all()
-            return committed_result
+            return outcome.result
+
+    def _reconcile_checkpoint(self) -> object:
+        with self._condition:
+            if threading.current_thread() is not self._owner_thread:
+                raise CapabilityRevoked(
+                    "checkpoint reconciliation belongs to the authoritative Run owner thread"
+                )
+            pending = self._pending_checkpoint
+            if pending is None:
+                raise RuntimeError("Run has no pending checkpoint reconciliation")
+            if self._commit_inflight:
+                raise RuntimeError("checkpoint reconciliation is already in flight")
+            self._commit_inflight = True
+            self._phase = "reconciling-checkpoint"
+            self._revision += 1
+            self._condition.notify_all()
+        try:
+            outcome = self._reconcile_durable_commit(pending, _CommitKind.CHECKPOINT)
+        except BaseException:
+            self._clear_commit_inflight_after_error()
+            raise
+        if not outcome.committed:
+            with self._condition:
+                self._commit_inflight = False
+                self._pending_checkpoint = None
+                self._committed_checkpoint = None
+                self._revision += 1
+                self._condition.notify_all()
+            raise pending.publish_error
+        with self._condition:
+            self._commit_inflight = False
+            self._pending_checkpoint = None
+            self._committed_checkpoint = CheckpointSnapshot(
+                pending.operation.commit_id,
+                pending._authority_snapshot.target,
+                CheckpointDisposition.COMMITTED,
+            )
+            self._commit_recovery_warning = _format_error(pending.publish_error)
+            self._revision += 1
+            self._condition.notify_all()
+            return outcome.result
 
     def _begin_cleanup_after_interrupt(self) -> None:
         with self._condition:
@@ -1250,6 +1638,15 @@ class RunHandle(Generic[ResultT]):
             self._revision += 1
             self._condition.notify_all()
 
+    def _pending_reconciliation_snapshot(
+        self,
+    ) -> tuple[
+        CheckpointReconciliationRequired | None,
+        FinalCommitReconciliationRequired | None,
+    ]:
+        with self._condition:
+            return self._pending_checkpoint, self._pending_final_commit
+
     def _terminal_publication(
         self,
         *,
@@ -1282,6 +1679,14 @@ class RunHandle(Generic[ResultT]):
         with self._condition:
             if self._state.terminal:
                 raise RuntimeError("run terminal state may be published only once")
+            if (
+                self._commit_inflight
+                or self._pending_checkpoint is not None
+                or self._pending_final_commit is not None
+            ):
+                raise RuntimeError(
+                    "cannot publish terminal state while durable commit reconciliation is pending"
+                )
             self._cancel_gate_closed = True
             if self._final_committed:
                 if primary is not None:
@@ -1556,37 +1961,99 @@ class RunController:
             if primary is None and handle._token.is_cancelled and not handle.snapshot().final_committed:
                 primary = CancellationRequested(handle._token.snapshot().reason)
             if primary is None and not cleanup_errors and not unsafe:
+                finalize_error: BaseException | None = None
                 try:
                     context.set_phase("finalize")
                     post_safety.checkpoint()
                     result = plan.finalize(post_safety, result)  # type: ignore[arg-type, assignment]
-                    if plan.requires_final_commit and not handle.snapshot().final_committed:
-                        raise RuntimeError(
-                            "RunPlan requires a final artifact commit but finalize published none"
-                        )
-                except CommitReconciliationRequired as reconciliation:
+                except BaseException as exc:
+                    finalize_error = exc
+
+                checkpoint_pending, final_pending = handle._pending_reconciliation_snapshot()
+                if checkpoint_pending is not None and final_pending is not None:
+                    primary = RuntimeError(
+                        "Run has conflicting checkpoint and final commit reconciliations"
+                    )
+                elif checkpoint_pending is not None:
+                    preserved_finalize_error = (
+                        None
+                        if isinstance(finalize_error, CheckpointReconciliationRequired)
+                        else finalize_error
+                    )
+
+                    def retry_checkpoint_reconciliation() -> None:
+                        nonlocal primary
+                        try:
+                            handle._reconcile_checkpoint()
+                        except CheckpointReconciliationRequired:
+                            raise
+                        except BaseException as definitive_failure:
+                            primary = (
+                                CancellationRequested(handle._token.snapshot().reason)
+                                if handle._token.is_cancelled
+                                else preserved_finalize_error or definitive_failure
+                            )
+                        else:
+                            primary = (
+                                CancellationRequested(handle._token.snapshot().reason)
+                                if handle._token.is_cancelled
+                                else (
+                                    preserved_finalize_error
+                                    or RuntimeError(
+                                        "checkpoint reconciliation completed after finalize was "
+                                        "interrupted; restart analysis from the committed checkpoint"
+                                    )
+                                )
+                            )
+                        finish_terminal()
+
+                    checkpoint_state = (
+                        RunState.CANCELLING
+                        if handle._token.is_cancelled
+                        else RunState.RUNNING
+                    )
+                    handle._install_retry(
+                        retry_checkpoint_reconciliation,
+                        "reconcile checkpoint visibility only; finalize will not be re-entered",
+                        cleanup_errors + (checkpoint_pending.recovery_error,),
+                        phase="checkpoint-reconciliation-failed",
+                        state=checkpoint_state,
+                    )
+                    return
+                elif final_pending is not None:
+                    preserved_finalize_error = (
+                        None
+                        if isinstance(finalize_error, FinalCommitReconciliationRequired)
+                        else finalize_error
+                    )
 
                     def retry_commit_reconciliation() -> None:
                         nonlocal primary, result
                         if primary is None and not handle.snapshot().final_committed:
                             try:
                                 result = handle._reconcile_final_commit()
-                            except CommitReconciliationRequired:
+                            except FinalCommitReconciliationRequired:
                                 raise
                             except BaseException as definitive_failure:
-                                primary = definitive_failure
+                                primary = preserved_finalize_error or definitive_failure
+                            else:
+                                primary = preserved_finalize_error
                         finish_terminal()
 
                     handle._install_retry(
                         retry_commit_reconciliation,
                         "reconcile final artifact visibility with the repository, then publish terminal state",
-                        cleanup_errors + (reconciliation.recovery_error,),
-                        phase="commit-reconciliation-failed",
+                        cleanup_errors + (final_pending.recovery_error,),
+                        phase="final-commit-reconciliation-failed",
                         state=RunState.RUNNING,
                     )
                     return
-                except BaseException as finalize_exc:
-                    primary = finalize_exc
+                elif finalize_error is not None:
+                    primary = finalize_error
+                elif plan.requires_final_commit and not handle.snapshot().final_committed:
+                    primary = RuntimeError(
+                        "RunPlan requires a final artifact commit but finalize published none"
+                    )
             finish_terminal()
 
         try:
