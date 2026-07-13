@@ -30,6 +30,7 @@ from zlc_data import (
 from zlc_neutral_atom.runtime.dataset import (
     DatasetBuilder,
     DatasetCellAddress,
+    DatasetCellDomain,
     DatasetCellKeyContract,
     DatasetMode,
     DatasetPreviewSnapshot,
@@ -39,6 +40,7 @@ from zlc_neutral_atom.runtime.dataset import (
     SealedDatasetArtifact,
     ValueDatasetEventAdapter,
     dataset_cell_key_fingerprint,
+    dataset_cell_permutation_digest,
 )
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionStream,
@@ -120,6 +122,61 @@ def event_adapter(stream) -> ValueDatasetEventAdapter:
     return ValueDatasetEventAdapter(stream._payload_contract)
 
 
+def test_cell_key_domain_excludes_value_schema_but_formal_permutation_does_not():
+    first = dataset_schema(points=2)
+    alternate_cell = ValueSchema(
+        first.cell_schema.data_axes,
+        first.cell_schema.validity_contract,
+        np.dtype("<f4"),
+        value_unit="probability",
+    )
+    second = DatasetSchema(
+        first.repeat_axis,
+        first.point_axes,
+        first.point_layout,
+        alternate_cell,
+    )
+    cells = cell_schedule(first)
+    assert first.fingerprint != second.fingerprint
+    assert dataset_cell_key_fingerprint(first) == dataset_cell_key_fingerprint(second)
+    assert dataset_cell_permutation_digest(first, cells) != (
+        dataset_cell_permutation_digest(second, cells)
+    )
+
+
+def test_cell_domain_fingerprint_is_cached_for_large_explicit_layout(monkeypatch):
+    size = 2000
+    source = dataset_schema(points=size)
+    explicit = DatasetSchema(
+        source.repeat_axis,
+        source.point_axes,
+        PointLayout.explicit((size,), tuple((index,) for index in reversed(range(size)))),
+        source.cell_schema,
+    )
+    domain = DatasetCellDomain.from_schema(explicit)
+    fingerprint = domain.fingerprint
+
+    def forbidden(_layout):
+        raise AssertionError("cached fingerprint reserialized the explicit layout")
+
+    monkeypatch.setattr(
+        "zlc_neutral_atom.runtime.dataset.point_layout_to_tree",
+        forbidden,
+    )
+    assert domain.fingerprint == fingerprint
+    assert dataset_cell_key_fingerprint(domain) == fingerprint
+
+
+def test_cell_domain_rejects_non_repeat_repeat_axis():
+    point = axis("point", SCAN_POINT, 1)
+    with pytest.raises(ValueError, match="role 'repeat'"):
+        DatasetCellDomain(
+            axis("not-repeat", SCAN_POINT, 1),
+            (point,),
+            PointLayout.rect_c((1,)),
+        )
+
+
 def test_exact_builder_preserves_all_named_data_axes_and_snapshot_revisions():
     schema = dataset_schema(repeats=1, points=3)
     stream, producer = source(schema, events=3)
@@ -183,8 +240,11 @@ def test_bound_builder_owns_reservation_completion():
         expected_cells=cell_schedule(schema),
     )
     emit(producer, value(1), DatasetCellAddress(0, 0), 0)
-    builder.consume(cursor.next())
-    with pytest.raises(Exception, match="belongs to its bound DatasetBuilder"):
+    delivery = cursor.next()
+    with pytest.raises(PermissionError, match="bound exact consumer"):
+        delivery.ack()
+    builder.consume(delivery)
+    with pytest.raises(Exception, match="belongs to its bound exact consumer"):
         reservation.complete()
     builder.seal(producer.finish())
     reservation.release()

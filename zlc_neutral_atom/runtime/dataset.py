@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 from numbers import Integral
 from typing import Generic, Protocol, TypeVar
@@ -14,6 +14,7 @@ from zlc_storage import canonical_digest
 
 from zlc_data import (
     BlockId,
+    AxisSpec,
     CellValidity,
     ComponentValidity,
     DataBlock,
@@ -25,12 +26,16 @@ from zlc_data import (
     Invalid,
     OwnedSnapshot,
     StreamGenerationId,
+    PointLayout,
+    REPEAT,
     VALID,
     Valid,
     ValidityMode,
     Value,
     ValuePayloadContract,
     ValueSchema,
+    axis_to_tree,
+    point_layout_to_tree,
 )
 
 from .streams import (
@@ -38,6 +43,7 @@ from .streams import (
     Delivery,
     EndOfStream,
     Envelope,
+    ExactConsumerReadiness,
     ExactReservation,
     MonitorTap,
     MonitorUpdate,
@@ -136,7 +142,6 @@ class SnapshotExpired(DatasetError):
 
 
 _SEALED_TOKEN = object()
-_READINESS_TOKEN = object()
 
 
 def _sha256_digest(value: str, field: str) -> str:
@@ -170,13 +175,66 @@ def _deeply_immutable_metadata(value: object, seen: set[int] | None = None) -> b
     return False
 
 
-def dataset_cell_key_fingerprint(schema: DatasetSchema) -> str:
-    """Bind repeat/point storage keys to one frozen DatasetSchema."""
+@dataclass(frozen=True)
+class DatasetCellDomain:
+    """Sampling-cell identity independent of the value stored in each cell."""
 
-    if not isinstance(schema, DatasetSchema):
-        raise TypeError("schema must be DatasetSchema")
-    contract = f"zlc.dataset-cell-address.v1:{schema.fingerprint}".encode("ascii")
-    return hashlib.sha256(contract).hexdigest()
+    repeat_axis: AxisSpec
+    point_axes: tuple[AxisSpec, ...]
+    point_layout: PointLayout
+    _fingerprint: str = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.repeat_axis, AxisSpec) or self.repeat_axis.role != REPEAT:
+            raise ValueError("repeat_axis must be an AxisSpec with role 'repeat'")
+        axes = tuple(self.point_axes)
+        if not axes or any(not isinstance(axis, AxisSpec) for axis in axes):
+            raise ValueError("point_axes must contain AxisSpec values")
+        if len({axis.axis_id for axis in axes}) != len(axes):
+            raise ValueError("point_axes must have unique AxisId values")
+        if self.repeat_axis.axis_id in {axis.axis_id for axis in axes}:
+            raise ValueError("repeat and point axes must be distinct")
+        if not isinstance(self.point_layout, PointLayout):
+            raise TypeError("point_layout must be PointLayout")
+        if self.point_layout.logical_shape != tuple(axis.size for axis in axes):
+            raise ValueError("point_layout shape differs from point_axes")
+        object.__setattr__(self, "point_axes", axes)
+        object.__setattr__(
+            self,
+            "_fingerprint",
+            canonical_digest(
+                {
+                    "contract": "zlc_neutral_atom.DatasetCellDomain/v1",
+                    "repeat_axis": axis_to_tree(self.repeat_axis),
+                    "point_axes": [axis_to_tree(axis) for axis in axes],
+                    "point_layout": point_layout_to_tree(self.point_layout),
+                }
+            ),
+        )
+
+    @classmethod
+    def from_schema(cls, schema: DatasetSchema) -> "DatasetCellDomain":
+        if not isinstance(schema, DatasetSchema):
+            raise TypeError("schema must be DatasetSchema")
+        return cls(schema.repeat_axis, schema.point_axes, schema.point_layout)
+
+    @property
+    def fingerprint(self) -> str:
+        return self._fingerprint
+
+
+def dataset_cell_key_fingerprint(
+    schema_or_domain: DatasetSchema | DatasetCellDomain,
+) -> str:
+    """Bind cell keys to sampling axes/layout, never the cell ValueSchema."""
+
+    if isinstance(schema_or_domain, DatasetSchema):
+        domain = DatasetCellDomain.from_schema(schema_or_domain)
+    elif isinstance(schema_or_domain, DatasetCellDomain):
+        domain = schema_or_domain
+    else:
+        raise TypeError("value must be DatasetSchema or DatasetCellDomain")
+    return domain.fingerprint
 
 
 @dataclass(frozen=True, order=True)
@@ -241,15 +299,41 @@ def dataset_cell_permutation_fingerprint(
     )
 
 
+def dataset_consumer_contract_digest(
+    schema: DatasetSchema,
+    cells: tuple[DatasetCellAddress, ...],
+    metadata_contract_fingerprint: str,
+) -> str:
+    """Bind a formal sink to its full value schema, ordering, and metadata semantics."""
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    _sha256_digest(metadata_contract_fingerprint, "metadata contract fingerprint")
+    return canonical_digest(
+        {
+            "contract": "zlc_neutral_atom.DatasetConsumerContract/v1",
+            "dataset_schema_fingerprint": schema.fingerprint,
+            "join_plan_digest": dataset_cell_permutation_digest(schema, cells),
+            "metadata_contract_fingerprint": metadata_contract_fingerprint,
+        }
+    )
+
+
 @dataclass(frozen=True)
 class DatasetCellKeyContract:
     """Immutable join-key owner bound to one DatasetSchema storage domain."""
 
-    schema: DatasetSchema
+    domain: DatasetCellDomain
+
+    def __post_init__(self) -> None:
+        if isinstance(self.domain, DatasetSchema):
+            object.__setattr__(self, "domain", DatasetCellDomain.from_schema(self.domain))
+        elif not isinstance(self.domain, DatasetCellDomain):
+            raise TypeError("domain must be DatasetCellDomain or DatasetSchema")
 
     @property
     def fingerprint(self) -> str:
-        return dataset_cell_key_fingerprint(self.schema)
+        return self.domain.fingerprint
 
     def snapshot(self, key: object) -> DatasetCellAddress:
         self.validate(key)
@@ -258,9 +342,9 @@ class DatasetCellKeyContract:
     def validate(self, key: object) -> None:
         if not isinstance(key, DatasetCellAddress):
             raise TypeError("join key must be DatasetCellAddress")
-        if key.repeat_index >= self.schema.repeat_axis.size:
+        if key.repeat_index >= self.domain.repeat_axis.size:
             raise IndexError("join key repeat index is outside DatasetSchema")
-        if key.point_storage_index >= self.schema.point_layout.storage_size:
+        if key.point_storage_index >= self.domain.point_layout.storage_size:
             raise IndexError("join key point index is outside PointLayout")
 
 
@@ -318,42 +402,6 @@ class DatasetPreviewSnapshot:
     def block(self) -> DataBlock:
         return self.snapshot.block
 
-
-class ExactDatasetReadiness:
-    """Opaque proof that one exact reservation has its frozen materializer owner."""
-
-    __slots__ = ("_builder",)
-
-    def __init__(self, authority: object, builder: "DatasetBuilder") -> None:
-        if authority is not _READINESS_TOKEN:
-            raise PermissionError("ExactDatasetReadiness is minted by DatasetBuilder")
-        object.__setattr__(self, "_builder", builder)
-
-    def __setattr__(self, _name: str, _value: object) -> None:
-        raise AttributeError("ExactDatasetReadiness is immutable")
-
-    def validate(
-        self,
-        *,
-        reservation: ExactReservation,
-        schema: DatasetSchema,
-        event_adapter: DatasetEventAdapter,
-        expected_cells: tuple[DatasetCellAddress, ...],
-    ) -> None:
-        builder = self._builder
-        with builder._lock:
-            if builder._sealed or builder._aborted:
-                raise DatasetError("dataset materializer readiness is no longer active")
-            if builder._reservation is not reservation:
-                raise DatasetError("dataset readiness belongs to another reservation")
-            if builder.schema is not schema:
-                raise DatasetError("dataset readiness schema differs")
-            if builder._event_adapter is not event_adapter:
-                raise DatasetError("dataset readiness adapter differs")
-            if builder._expected_cells != tuple(expected_cells):
-                raise DatasetError("dataset readiness join schedule differs")
-            if not reservation.materializer_bound:
-                raise DatasetError("dataset readiness lost its materializer claim")
 
 @dataclass(frozen=True)
 class DatasetSealProvenance:
@@ -565,8 +613,21 @@ class DatasetBuilder(Generic[PayloadT]):
         self._ordered_event_metadata: list[object | None] = [None] * total_cells
         self._sealed = False
         self._aborted = False
+        self._exact_readiness: ExactConsumerReadiness | None = None
         if self._reservation is not None:
-            self._source._claim_materializer(self._reservation, self)
+            source_contract_digest = dataset_consumer_contract_digest(
+                self.schema,
+                self._expected_cells,
+                self._metadata_contract.fingerprint,
+            )
+            self._exact_readiness = self._source._claim_consumer(
+                self._reservation,
+                self,
+                source_contract_digest=source_contract_digest,
+                source_schedule_digest=self._join_plan_digest,
+                chain_contract_digest=source_contract_digest,
+                terminal=True,
+            )
 
     @property
     def revision(self) -> DatasetRevision:
@@ -732,7 +793,7 @@ class DatasetBuilder(Generic[PayloadT]):
     def seal(self, eos: EndOfStream) -> SealedDatasetArtifact:
         if self.mode is not DatasetMode.FINITE_EXACT or self._reservation is None:
             raise DatasetError("rolling monitor datasets cannot become formal sealed datasets")
-        self._source._seal_exact(self._reservation, eos, self, self._seal_locked)
+        self._source._complete_consumer(self._reservation, eos, self, self._seal_locked)
         preview = self.materialize()
         return SealedDatasetArtifact(
             _SEALED_TOKEN,
@@ -765,7 +826,7 @@ class DatasetBuilder(Generic[PayloadT]):
 
     def abort(self) -> None:
         if self._reservation is not None:
-            self._source._abort_materializer(
+            self._source._abort_consumer(
                 self._reservation,
                 self,
                 self._mark_aborted_locked,
@@ -773,12 +834,16 @@ class DatasetBuilder(Generic[PayloadT]):
             return
         self._mark_aborted_locked()
 
-    def exact_readiness(self) -> ExactDatasetReadiness:
+    def exact_readiness(self) -> ExactConsumerReadiness:
         if self.mode is not DatasetMode.FINITE_EXACT or self._reservation is None:
             raise DatasetError("only a finite exact DatasetBuilder can authorize capture")
         with self._lock:
             self._ensure_writable_locked()
-        return ExactDatasetReadiness(_READINESS_TOKEN, self)
+            readiness = self._exact_readiness
+        if readiness is None:
+            raise DatasetError("finite exact DatasetBuilder lost its readiness proof")
+        readiness._validate_terminal_sink()
+        return readiness
 
     def close(self) -> None:
         """Idempotently abort if needed and release the exact reservation."""
@@ -964,6 +1029,7 @@ class DatasetBuilder(Generic[PayloadT]):
 __all__ = [
     "DatasetBuilder",
     "DatasetCellAddress",
+    "DatasetCellDomain",
     "DatasetCellKeyContract",
     "DatasetCoverage",
     "DatasetEventAdapter",
@@ -980,6 +1046,7 @@ __all__ = [
     "SealedDatasetArtifact",
     "ValueDatasetEventAdapter",
     "dataset_cell_key_fingerprint",
+    "dataset_consumer_contract_digest",
     "dataset_cell_permutation_digest",
     "dataset_cell_permutation_fingerprint",
 ]

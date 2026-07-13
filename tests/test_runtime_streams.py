@@ -171,7 +171,7 @@ def test_reservation_admission_is_atomic_over_event_and_byte_capacity():
         max_inflight_bytes=24,
         trace_binding=TRACE_BINDING,
     )
-    with pytest.raises(ReservationCapacityExceeded, match="one formal materializer"):
+    with pytest.raises(ReservationCapacityExceeded, match="one formal exact consumer"):
         source.reserve(
             total_events=2,
             max_inflight_events=2,

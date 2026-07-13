@@ -18,7 +18,9 @@ from .dataset import (
     DatasetCellAddress,
     DatasetCellKeyContract,
     DatasetEventAdapter,
-    ExactDatasetReadiness,
+    dataset_cell_key_fingerprint,
+    dataset_cell_permutation_digest,
+    dataset_consumer_contract_digest,
 )
 from .ports import (
     BoundDevice,
@@ -32,6 +34,7 @@ from .streams import (
     AcquisitionProducer,
     AcquisitionStream,
     EndOfStream,
+    ExactConsumerReadiness,
     ExactReservation,
     ProducerFlowControl,
     ReservationState,
@@ -725,7 +728,7 @@ class CaptureSession:
         )
         self._completion: CaptureCompletion | None = None
         self._reservation: ExactReservation | None = None
-        self._materializer_readiness: ExactDatasetReadiness | None = None
+        self._exact_consumer_readiness: ExactConsumerReadiness | None = None
         self._lock = threading.RLock()
         self._operation_lock = threading.Lock()
         self._owner_thread_id = threading.get_ident()
@@ -764,39 +767,43 @@ class CaptureSession:
                 self._reservation = reservation
             return reservation
 
-    def bind_materializer(self, readiness: ExactDatasetReadiness) -> None:
-        """Bind the one owner-minted exact materializer proof before prepare."""
+    def bind_exact_consumer(self, readiness: ExactConsumerReadiness) -> None:
+        """Bind a complete required exact chain before any capture command."""
 
         with self._operation_lock:
             self._assert_owner_thread()
-            if not isinstance(readiness, ExactDatasetReadiness):
-                raise TypeError("readiness must be ExactDatasetReadiness")
+            if not isinstance(readiness, ExactConsumerReadiness):
+                raise TypeError("readiness must be ExactConsumerReadiness")
             with self._lock:
                 if self._state is not CaptureSessionState.NEW:
-                    raise RuntimeError("materializer readiness must precede capture prepare")
+                    raise RuntimeError("exact consumer readiness must precede capture prepare")
                 reservation = self._reservation
                 if reservation is None:
                     raise RuntimeError("capture session has no exact reservation")
-                if self._materializer_readiness is not None:
-                    raise RuntimeError("capture session already has materializer readiness")
-            readiness.validate(
-                reservation=reservation,
-                schema=self._contract.dataset_schema,
-                event_adapter=self._contract.event_adapter,
-                expected_cells=self._contract.expected_cells,
-            )
+                if self._exact_consumer_readiness is not None:
+                    raise RuntimeError("capture session already has exact consumer readiness")
+            self._validate_readiness(readiness, reservation)
+            readiness._claim_binding(self)
             with self._lock:
-                self._materializer_readiness = readiness
+                self._exact_consumer_readiness = readiness
 
     def prepare(self, context: RunContext) -> None:
         with self._operation_lock:
             self._assert_owner_thread()
             if context.run_id.value != self._trace_binding.run_id:
                 raise ValueError("RunContext differs from the frozen TraceBinding")
-            self._validate_current_capability()
             with self._lock:
                 if self._state is not CaptureSessionState.NEW:
                     raise RuntimeError("capture session can only be prepared once")
+                reservation = self._reservation
+                readiness = self._exact_consumer_readiness
+            if reservation is None:
+                raise RuntimeError("capture cannot prepare without its exact reservation")
+            if readiness is None:
+                raise RuntimeError("capture has no exact consumer readiness proof")
+            self._validate_readiness(readiness, reservation)
+            self._validate_current_capability()
+            with self._lock:
                 self._hardware_prepare_attempted = True
                 self._state = CaptureSessionState.PREPARING
             try:
@@ -846,15 +853,10 @@ class CaptureSession:
                     raise RuntimeError("capture cannot start without its exact reservation")
                 if reservation.state is not ReservationState.ACTIVE:
                     raise RuntimeError("capture exact reservation is not active")
-                readiness = self._materializer_readiness
+                readiness = self._exact_consumer_readiness
                 if readiness is None:
-                    raise RuntimeError("capture has no exact materializer readiness proof")
-                readiness.validate(
-                    reservation=reservation,
-                    schema=self._contract.dataset_schema,
-                    event_adapter=self._contract.event_adapter,
-                    expected_cells=self._contract.expected_cells,
-                )
+                    raise RuntimeError("capture has no exact consumer readiness proof")
+                self._validate_readiness(readiness, reservation)
                 self._state = CaptureSessionState.STARTING
             try:
                 ack = context.device(self._port.device.key).execute(
@@ -869,6 +871,30 @@ class CaptureSession:
                 raise
             with self._lock:
                 self._state = CaptureSessionState.STARTED
+
+    def _validate_readiness(
+        self,
+        readiness: ExactConsumerReadiness,
+        reservation: ExactReservation,
+    ) -> None:
+        readiness.validate_source(
+            reservation=reservation,
+            trace_binding=self._trace_binding,
+            payload_contract_fingerprint=self._contract.payload_contract.fingerprint,
+            join_key_contract_fingerprint=dataset_cell_key_fingerprint(
+                self._contract.dataset_schema
+            ),
+            source_contract_digest=dataset_consumer_contract_digest(
+                self._contract.dataset_schema,
+                self._contract.expected_cells,
+                self._contract.event_adapter.metadata_contract.fingerprint,
+            ),
+            source_schedule_digest=dataset_cell_permutation_digest(
+                self._contract.dataset_schema,
+                self._contract.expected_cells,
+            ),
+            total_events=self._contract.total_events,
+        )
 
     def capture_next(
         self,
@@ -1033,7 +1059,7 @@ class CaptureSession:
             reservation = self._reservation
             if reservation is not None and reservation.state is not ReservationState.RELEASED:
                 try:
-                    if not reservation.materializer_bound:
+                    if not reservation.consumer_bound:
                         if reservation.state is not ReservationState.COMPLETED:
                             reservation.abort(cancelled=context.cancellation.is_cancelled)
                         reservation.release()
@@ -1045,7 +1071,7 @@ class CaptureSession:
                         reservation.release()
                     else:
                         raise RuntimeError(
-                            "DatasetBuilder did not terminate its exact reservation"
+                            "exact consumer did not terminate its reservation"
                         )
                 except BaseException as error:
                     release_errors.append(error)

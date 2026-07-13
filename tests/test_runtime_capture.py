@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -43,8 +44,12 @@ from zlc_neutral_atom.runtime.capture import (
 from zlc_neutral_atom.runtime.dataset import (
     DatasetBuilder,
     DatasetCellAddress,
+    DatasetCellKeyContract,
     DatasetMode,
     SealedDatasetArtifact,
+    dataset_cell_key_fingerprint,
+    dataset_cell_permutation_digest,
+    dataset_consumer_contract_digest,
 )
 from zlc_neutral_atom.runtime.ports import (
     DeviceBroker,
@@ -82,13 +87,21 @@ from zlc_neutral_atom.runtime.pipeline import (
     resolve_measurement_definition,
 )
 from zlc_neutral_atom.runtime.streams import (
+    AcquisitionStream,
     ProducerFlowControl,
     SourceFailed,
     StreamId,
     TraceBinding,
+    TraceContext,
     ReservationState,
 )
 from zlc_neutral_atom.catalog import DefinitionCatalog, DefinitionKey
+from zlc_neutral_atom.processing.stream import (
+    BoundStreamProcessor,
+    ExactStreamProcessorWorker,
+    StreamProcessorDefinition,
+    StreamProcessorError,
+)
 
 
 SHA_A = "a" * 64
@@ -110,6 +123,23 @@ def schema(points: int = 2) -> DatasetSchema:
         PointLayout.rect_c((points,)),
         ValueSchema((y, x), ValidityContract.value(), np.dtype("<u2"), "count"),
     )
+
+
+def identity_camera_payload(payload: object, config: object) -> object:
+    assert config is None
+    return payload
+
+
+CAPTURE_PROCESSOR_ENTERED = threading.Event()
+CAPTURE_PROCESSOR_RELEASE = threading.Event()
+
+
+def blocking_camera_payload(payload: object, config: object) -> object:
+    assert config is None
+    CAPTURE_PROCESSOR_ENTERED.set()
+    if not CAPTURE_PROCESSOR_RELEASE.wait(1.0):
+        raise TimeoutError("test did not release camera processor")
+    return payload
 
 
 @dataclass(frozen=True)
@@ -435,7 +465,7 @@ class CaptureHarness:
                     expected_cells=materializer_cells or self.contract.expected_cells,
                 )
                 self.holder["builder"] = builder
-                session.bind_materializer(builder.exact_readiness())
+                session.bind_exact_consumer(builder.exact_readiness())
             self.holder["builder"] = builder
             session.prepare(context)
             return session, cursor, builder
@@ -580,6 +610,112 @@ def harness(points: int = 2) -> CaptureHarness:
     )
 
 
+@dataclass
+class ProcessorCaptureHarness:
+    session: object
+    reservation: object
+    worker: ExactStreamProcessorWorker
+    builder: DatasetBuilder
+
+
+def processor_capture_harness(
+    item: CaptureHarness,
+    *,
+    operator=identity_camera_payload,
+) -> ProcessorCaptureHarness:
+    trace = TraceBinding("processor-capture-run", item.contract.source_id)
+    session = item.port.open_session(item.contract, trace, item.spec)
+    reservation = session.reserve_exact()
+    input_cursor = reservation.activate()
+    key_contract = session.stream._join_key_contract
+    assert isinstance(key_contract, DatasetCellKeyContract)
+    output_stream, output_producer = AcquisitionStream.create(
+        StreamId("camera.processed"),
+        item.contract.payload_contract,
+        flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
+        retention_events=item.contract.total_events,
+        retention_bytes=(
+            item.contract.total_events
+            * item.contract.payload_contract.max_retained_nbytes
+        ),
+        join_key_contract=key_contract,
+    )
+    output_reservation = output_stream.reserve(
+        total_events=item.contract.total_events,
+        max_inflight_events=item.contract.total_events,
+        max_inflight_bytes=(
+            item.contract.total_events
+            * item.contract.payload_contract.max_retained_nbytes
+        ),
+        trace_binding=TraceBinding("processor-capture-run", "camera-processor"),
+    )
+    output_cursor = output_reservation.activate()
+    builder = DatasetBuilder(
+        BlockId("processed-camera"),
+        output_reservation,
+        item.contract.dataset_schema,
+        DatasetMode.FINITE_EXACT,
+        event_adapter=item.contract.event_adapter,
+        expected_cells=item.contract.expected_cells,
+    )
+    definition = StreamProcessorDefinition(
+        DefinitionKey("tests", "identity-camera", 1),
+        "Identity camera",
+        "tests.identity-camera.v1",
+        item.contract.payload_contract.fingerprint,
+        item.contract.payload_contract.fingerprint,
+        dataset_cell_key_fingerprint(item.contract.dataset_schema),
+    )
+    bound = BoundStreamProcessor(
+        definition,
+        None,
+        item.contract.payload_contract,
+        item.contract.payload_contract,
+        key_contract,
+        output_stream.stream_id,
+        "camera-processor",
+        operator,
+    )
+    worker = ExactStreamProcessorWorker(
+        bound,
+        reservation,
+        input_cursor,
+        source_schema=item.contract.dataset_schema,
+        source_contract_digest=dataset_consumer_contract_digest(
+            item.contract.dataset_schema,
+            item.contract.expected_cells,
+            item.contract.event_adapter.metadata_contract.fingerprint,
+        ),
+        source_schedule_digest=dataset_cell_permutation_digest(
+            item.contract.dataset_schema,
+            item.contract.expected_cells,
+        ),
+        expected_keys=item.contract.expected_cells,
+        output_producer=output_producer,
+        output_cursor=output_cursor,
+        output_builder=builder,
+        deadline_monotonic=time.monotonic() + 2.0,
+    )
+    return ProcessorCaptureHarness(session, reservation, worker, builder)
+
+
+def emit_processor_capture_source(
+    processor: ProcessorCaptureHarness,
+    item: CaptureHarness,
+) -> None:
+    for payload, cell in zip(item.camera.payloads, item.contract.expected_cells):
+        processor.session._producer.emit(
+            payload,
+            captured_at=payload.captured_at,
+            trace=TraceContext(
+                "processor-capture-run",
+                item.contract.source_id,
+                payload.correlation_id,
+            ),
+            join_key=cell,
+        )
+
+
 def run(harness_value: CaptureHarness, **plan_options):
     controller = RunController(ResourceArbiter(MemoryQuarantineJournal()))
     return controller.start(harness_value.plan(**plan_options))
@@ -646,15 +782,127 @@ def test_terminal_mismatch_poison_prevents_sealed_artifact(field, value):
     assert not item.holder["session"].stream._reservations
 
 
-def test_start_requires_active_reservation_with_materializer_owner():
+def test_prepare_requires_live_exact_consumer_before_any_hardware_command():
     item = harness()
     handle = run(item, build_materializer=False, consume=False)
     with pytest.raises(RunFailed):
         handle.result(2.0)
     assert not item.camera.started
-    assert item.camera.closed
+    assert item.camera.session_id == ""
+    assert not item.camera.close_attempted
+    assert not item.camera.closed
     assert item.holder["reservation"].state is ReservationState.RELEASED
     assert not item.holder["session"].stream._reservations
+
+
+@pytest.mark.parametrize("invalidation", ["closed-consumer", "failed-source"])
+def test_prepare_revalidates_stale_readiness_before_hardware_command(invalidation):
+    item = harness(points=1)
+    base = item.plan()
+
+    def preflight(context: RunContext):
+        trace = TraceBinding(context.run_id.value, item.contract.source_id)
+        session = item.port.open_session(item.contract, trace, item.spec)
+        item.holder["session"] = session
+        reservation = session.reserve_exact()
+        cursor = reservation.activate()
+        builder = DatasetBuilder(
+            BlockId("stale-readiness"),
+            reservation,
+            item.contract.dataset_schema,
+            DatasetMode.FINITE_EXACT,
+            event_adapter=item.contract.event_adapter,
+            expected_cells=item.contract.expected_cells,
+        )
+        item.holder["builder"] = builder
+        session.bind_exact_consumer(builder.exact_readiness())
+        if invalidation == "closed-consumer":
+            builder.close()
+        else:
+            session._producer.fail(SourceFailed("failed before hardware prepare"))
+        session.prepare(context)
+        return session, cursor, builder
+
+    plan = RunPlan(**{**base.__dict__, "preflight": preflight})
+    controller = RunController(ResourceArbiter(MemoryQuarantineJournal()))
+    with pytest.raises(RunFailed):
+        controller.start(plan).result(2.0)
+    assert item.camera.session_id == ""
+    assert not item.camera.close_attempted
+    assert not item.camera.started
+    item.holder["builder"].close()
+
+
+def test_processor_readiness_requires_started_live_worker_before_capture_binding():
+    item = harness(points=1)
+    processor = processor_capture_harness(item)
+    with pytest.raises(StreamProcessorError, match="has not started"):
+        processor.worker.exact_readiness()
+    assert item.camera.session_id == ""
+    processor.worker.start()
+    readiness = processor.worker.exact_readiness()
+    processor.session.bind_exact_consumer(readiness)
+    processor.session._validate_readiness(readiness, processor.reservation)
+    assert item.camera.session_id == ""
+    assert not item.camera.close_attempted
+    processor.worker.close(2.0)
+
+
+@pytest.mark.parametrize("terminal_state", ["failed", "done"])
+def test_dead_processor_readiness_is_rejected_before_any_hardware_command(terminal_state):
+    item = harness(points=1)
+    processor = processor_capture_harness(item)
+    processor.worker.start()
+    readiness = processor.worker.exact_readiness()
+    processor.session.bind_exact_consumer(readiness)
+    if terminal_state == "failed":
+        processor.worker.cancel("processor failed before capture prepare")
+    else:
+        emit_processor_capture_source(processor, item)
+        processor.session._producer.finish()
+    processor.worker.wait(2.0)
+    with pytest.raises(Exception):
+        processor.session._validate_readiness(readiness, processor.reservation)
+    with pytest.raises(StreamProcessorError, match="not live"):
+        processor.worker.exact_readiness()
+    assert item.camera.session_id == ""
+    assert not item.camera.close_attempted
+
+
+def test_closing_processor_readiness_is_rejected_before_any_hardware_command():
+    CAPTURE_PROCESSOR_ENTERED.clear()
+    CAPTURE_PROCESSOR_RELEASE.clear()
+    item = harness(points=1)
+    processor = processor_capture_harness(item, operator=blocking_camera_payload)
+    processor.worker.start()
+    readiness = processor.worker.exact_readiness()
+    processor.session.bind_exact_consumer(readiness)
+    emit_processor_capture_source(processor, item)
+    assert CAPTURE_PROCESSOR_ENTERED.wait(1.0)
+    close_errors: list[BaseException] = []
+
+    def close_worker():
+        try:
+            processor.worker.close(2.0)
+        except BaseException as error:
+            close_errors.append(error)
+
+    closer = threading.Thread(target=close_worker)
+    closer.start()
+    deadline = time.monotonic() + 1.0
+    while not processor.worker._closing and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert processor.worker._closing
+    with pytest.raises(Exception):
+        processor.session._validate_readiness(readiness, processor.reservation)
+    with pytest.raises(StreamProcessorError, match="not live"):
+        readiness._validate_terminal_sink()
+    assert item.camera.session_id == ""
+    assert not item.camera.close_attempted
+    CAPTURE_PROCESSOR_RELEASE.set()
+    closer.join(2.0)
+    assert not closer.is_alive()
+    assert close_errors == []
 
 
 @pytest.mark.parametrize("mismatch", ["schedule", "adapter"])
@@ -666,7 +914,7 @@ def test_materializer_mismatch_is_rejected_before_camera_prepare_or_start(mismat
     else:
         options["materializer_adapter"] = CameraEventAdapter(
             item.contract.payload_contract,
-            FrameMetadataContract(),
+            FrameMetadataContract(fingerprint=SHA_A),
         )
     with pytest.raises(RunFailed):
         run(item, **options).result(2.0)

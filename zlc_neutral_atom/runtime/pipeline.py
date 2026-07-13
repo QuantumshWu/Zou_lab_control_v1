@@ -474,7 +474,7 @@ def open_exact_capture(
             event_adapter=contract.event_adapter,
             expected_cells=contract.expected_cells,
         )
-        session.bind_materializer(builder.exact_readiness())
+        session.bind_exact_consumer(builder.exact_readiness())
         return ExactCaptureTransaction(
             session,
             reservation,
