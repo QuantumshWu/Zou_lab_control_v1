@@ -420,7 +420,7 @@ neutral_atom 只依赖 `zlc_data`，不依赖 frontend 的任何层。
 
 例如 ROI processor 使用自己声明的 `RoiBinding(selection, source_axis_ids, coordinate_transform, reducer)`，Figure facet 使用 `PanelSelectionBinding(selection, layer_id, facet_coordinate)`；二者共享 Selection，但不会把 processor reducer 或 panel cell path 写回 Selection。这样保存/复用选择不需要 frontend 与 neutral 约定一个隐藏 metadata vocabulary。
 
-`BoundFit` 是由 FitSpec 与预期 DatasetSchema 确定性绑定的进程内执行值，不进入 artifact、pickle 或 FQCN import。持久化只保存 FitSpec/CommittedTransform、model/algorithm version、numeric policy 与 input lineage；重放时调用当前 zlc_data `bind_fit` 并验证版本/digest。zlc_data 不提供可变全局 model/analysis registry，也不扫描 entry point。
+`BoundFit` 是由 FitSpec 与预期 DatasetSchema 确定性绑定的进程内执行值，不进入 artifact、pickle 或 FQCN import。持久化只保存 FitSpec/CommittedTransform、不可变语义 `model_id`、描述性 `initializer_id`/`solver_contract_id`、numeric policy 与 input lineage；重放时调用当前 zlc_data `bind_fit` 并验证这些 exact identity 与 digest。fit codec 只接受当前字段集合，未知 identity 直接拒绝，不维护 model/algorithm 版本号或升级器。zlc_data 不提供可变全局 model/analysis registry，也不扫描 entry point。
 
 ### 4.4 Pulse Preview 边界
 
@@ -514,7 +514,7 @@ fit_ref = fit.save()  # headless zlc_data FitResultArtifactRef，不要求 rende
 |---|---|
 | fit/DataBlock/Selection 全放 frontend | 否决。neutral headless 必须依赖一个 presentation context，且 UI policy 容易泄漏进权威分析；当前 frontend 反向导入问题也会换方向重现。 |
 | 通用 fit/Selection 全放 neutral_atom | 否决。DataFigure/notebook 为复用通用算法必须依赖中性原子领域；calibration/readout 与普通数学 fit 再次混进同一个 `core`。 |
-| 为 fit、axis、selection 各拆独立包 | 否决。三者共同维护同一个 DataBlock/validity/transform 不变量，过细拆分会制造 codec、version 和 import ceremony。 |
+| 为 fit、axis、selection 各拆独立包 | 否决。三者共同维护同一个 DataBlock/validity/transform 不变量，过细拆分会制造 codec 和 import ceremony。 |
 | 小型 zlc_data kernel | 采纳。它有 frontend 与 neutral 两个真实消费者，内部围绕“具名多维数据上的纯、可复现操作”高度内聚，并能用准入规则防止变成 common。 |
 | FitAnalysisDescriptor/DataAnalysisProgram 通用层 | baseline 否决。当前 Fit 只需 FitSpec -> BoundFit；FitResultBatch 因 gridplot/per-site 是真实用例而保留。第二个通用 Analysis 出现后再提取共同 descriptor。 |
 | 把 pulse/FPGA 全并入 neutral | 否决逻辑合并。FPGA server、sim/build、GUI preview projector 与 neutral adapter 是不同消费者，反向 import 已证明会污染边界。 |
@@ -1316,7 +1316,7 @@ StreamProcessor 只处理当前 Envelope payload 或声明的完整 key group，
 
 每个 StreamProcessor invocation 原则上发布一个 frozen typed payload。多个同 shot 结果组成一个 record，例如 `OccupancySample(occupied, counts, source_metadata)`；UI/下游通过 field projection 读取字段，不把同一物理结果拆成多个需要分布式原子提交的 signal。只有字段具有不同 cardinality、key 或生命周期时才拆成独立节点。
 
-operator 不读 wall clock、module global config 或 global RNG；需要随机算法时 seed/RNG algorithm 是 immutable config 与 lineage 的一部分。相同 input/config/model version 必须可重放，允许的浮点容差由 operator contract 声明。
+operator 不读 wall clock、module global config 或 global RNG；需要随机算法时 seed/RNG algorithm 是 immutable config 与 lineage 的一部分。相同 input/config/immutable model identity 必须可重放，允许的浮点容差由 operator contract 声明。
 
 StreamProcessorDefinition 必须声明 output join_key 是 pass-through、typed compose 还是 intentionally absent；`StreamProcessorWorker` 按声明生成/验证，operator 不能从 payload 猜 key。Formal exact pipeline 中在最后一次所需 EXACT_KEY join 之前不得丢弃 key。
 
@@ -1614,42 +1614,59 @@ FitSpec:
   committed_transform: optional CommittedTransform
   fit_axes: tuple[AxisId, ...]
   batch_axes: tuple[AxisId, ...]
-  model_id + model_version
-  initial_parameters
-  bounds
-  weighting/mask policy
+  model_id
+  initializer_id
+  solver_contract_id
+  constraints: tuple[initial/lower/upper/fixed]
+  numeric_policy: evaluation/time/batch/per-cell-sample/total-packed/covariance budgets
 
 WorkbenchFitRequest / FigureFitRequest:
   input_ref + input_revision
   spec: FitSpec
 
 FitProblem:
-  x arrays + coordinates/units
-  observations
-  validity/weights
-  fit_axes
-  batch_axes
-  resolved model/parameters/bounds
+  packed used coordinates + per-batch/per-axis effective sampling quantum
+  packed authoritative observations + per-batch offsets/counts
+  fit_axis_specs（coordinate source 由 AxisSpec 唯一派生）
+  batch_axis_specs + sparse/rectangular batch layout
+  resolved closed-catalog model + mathematical/user bounds
 
 FitResultBatch:
   batch_axis_specs
   batch_layout: RECT_C | RECT_F | EXPLICIT
-  parameter_schema
+  parameter_schema/unit（由 FitSpec model_id + fit AxisSpec + value unit 唯一派生）
   parameter_values: (B, parameter)
   covariance/uncertainty
-  goodness_of_fit
-  per_batch_status/error
-  input_schema_fingerprint
-  optional transform_digest(identity if absent) + model id/version + numeric policy record
+  RSS + derived RMSE + R²
+  per_batch numeric status/error
+  per_batch scientific acceptance/reason
+  source_ref + FitSpec（包含 input/transform/model/initializer/solver/numeric policy identity）
+  scipy_version（仅 producer lineage）
 ```
 
-FitModel 声明 independent-variable/observation/parameter 的 canonical unit id 和允许的 coordinate frame；initial/bounds 先通过封闭 UnitConversionTable 转换/验证再进入 solver，FitResultBatch 参数携带 canonical unit。单位或 frame 不兼容是 request error，不能把裸数值直接拟合后只改 label。
+`model_id` 是不可原地改写的完整数学语义身份，覆盖公式、参数顺序/命名/约定、axis requirement 与参数静态 domain；任何一项语义改变都创建新的描述性 model id，不能 bump 一个数字。initializer 与 solver/acceptance 是独立执行策略，因此各有描述性 identity 并进入 FitSpec digest；当前 solver contract 固定 SciPy least-squares 的 two-point Jacobian、TRF、linear loss、exact trust-region solve、显式容差，以及下述 `cond1e8 + local-support + baseband` 验收语义。改变求解或验收语义时必须更换能描述新内容的 identity，不能使用 `_v2` 一类改稿后缀。`scipy_version` 只是结果的被动 producer lineage，不是环境证明、签名或 attestation。
+
+FitModel 声明 axis role requirement、参数顺序、相对 unit relation 与数学静态 domain；BoundFit 验证有效 axis 的 unit/frame compatibility，FitResultBatch 从实际轴派生参数 unit。当前 `FitParameterConstraint` 的 initial/lower/upper/fixed 数值信任边界是“caller 已提供绑定后有效 axis/value 的 canonical unit”；core/codec 不按 label、数量级或裸数值猜单位。未来若 notebook/UI 接受非 canonical 输入，unit slice 必须先交付 zlc_data owner 的显式转换入口及测试，再允许 adapter 构造 FitSpec；在该入口存在前 UI 不能声称已自动转换。单位或 frame 不兼容是 request error，不能先拟合再只改 label。
+
+initializer 只提供有限 seed，不拥有 hard bound。唯一 hard bound 来源是参数数学 domain（例如 positive、nonnegative、phase 主值区间）和用户显式 constraint；data range、选区 span、观测 contrast 等启发式绝不能变成无法扩宽的物理边界。全部参数都已有 fixed 或 explicit initial 时，执行直接使用 caller seed，不调用 data-derived initializer。最少 observation 也不是 model catalog 常量：每个 bound request 按 `max(2, free_parameter_count + 1)` 派生，固定参数是 caller 提供的 hypothesis，不再要求数据重新识别它；局部 support、Jacobian、covariance 与 acceptance 仍独立 fail-closed。时间模型可用 selection window 改善 seed，但 artifact 参数仍保持 absolute-coordinate 定义。自由约束与静态 domain 必须有至少一个可表示的内部浮点值；phase 使用唯一主值表示 `[-π, π)`，不能同时保存 `+π/-π` 两个等价 artifact。资源合同同时限制每个 batch cell 的抽样数和整个 FitProblem 的 packed observation 总数；默认总量 2,000,000，在当前最多二维独立变量下把 observation + coordinate 主体限制在约 48 MB。builder 必须在 append/concatenate 大数组前累计拒绝超限请求，FitProblem 构造器再次验证；已知有更大内存预算的调用方可在 FitSpec 中显式提高该值，不能让 `max_batch_cells * sample_budget_per_batch` 隐式放大到十亿级观测。
+
+数值执行与科学可用性是两个正交状态。`FitBatchStatus.CONVERGED` 只表示求解完成；随后同一 closed-catalog acceptance owner 给出 `FitAcceptance.ACCEPTED | REJECTED`。被拒绝的收敛结果仍保留参数、RSS/R² 与可用 covariance，供 UI 诊断和 overlay；formal consumer 只能消费 `CONVERGED + ACCEPTED`。执行失败使用其它 typed status、非空 execution error、canonical-zero 数值和 `NOT_EVALUATED`，不能把不可辨识伪装成 solver failure。
+
+通用 acceptance 使用实际 used observations/prediction 的无量纲浮点可见变化、distinct coordinate tuples、多维仿射 geometry、按列归一化的 free-parameter Jacobian（最大条件数 `1e8`）、winning solve 的 authoritative active-bound 标记、可识别 covariance 与非负有效 R²。它只判浮点退化/局部可辨识，不在没有噪声模型时伪造 SNR 或 `R²>0.9` 一类科学阈值。Gaussian/Lorentzian/radial 的封闭 model-local support check 只在对应 location 参数自由、确实要从本批数据推断位置时生效，要求其 component basis 大于统一 `64ε` 的实际样本出现在位置两侧；doublet 在 center 或 splitting 任一自由时，要求至少一个可见 component 两侧有样本。fixed location/shape hypothesis 不受该门重新识别，仍由通用 geometry/Jacobian/covariance 检查其余自由参数。不再规定“2 sigma / 1 FWHM / 2 radius”这类会误拒精确可辨识数据的宽度倍数。exponential 也不要求任意的“一 tau span”，其可辨识性由通用 geometry/Jacobian/covariance 门判断。不建立可扩张的通用“参数宽度对全局步长”metadata DSL，也不再用全局 median gap 代表局部分辨率。
+
+damped-sine 的 alias gate 只能消费可证明的采样 provenance。packing owner 对完整 AxisSpec 做 affine float-lattice 检查：encoded coordinates 必须先严格单调且无 duplicate，再要求每个编码坐标在局部四个 float64 ULP 内符合同一仿射重建，不能使用会随巨大坐标 offset 放大的相对 `allclose`；之后把被选 logical-index 差值的整数 gcd 与源 quantum 相乘。FitProblem 只保留每个 batch/axis 的这个充分统计量，不为每个 observation 复制 int64 index。sample budget、missing validity 或稀疏 layout 删除点都已反映在 gcd 中，solver 不能从 used coordinate 的最小 gap 猜 lattice。参数明确命名为 `baseband_frequency`，必须严格低于有效 Nyquist；自由参数还要求 used span 至少覆盖一个周期。源 AxisSpec 不能证明 lattice 时可以数值收敛和显示，但必须 `REJECTED`。该合同只声明 canonical baseband 解；`ACCEPTED` 不能证明真实物理信号原本在 baseband。formal 物理频率 consumer 还必须持有领域 owner 的 typed band-limit prior（或实验设计提高采样率），软件不能从已 alias 的样本反推出“真实高频”。
+
+时间模型继承当前真机验证过的 absolute-coordinate 语义：decay amplitude 仍表示 x=0 的幅度，damped-sine phase 仍相对 absolute x；Selection/CommittedTransform 只筛选观测，不偷偷用选区最小值重定相位或幅度。若未来确有“从选区起点计时”的物理需求，必须使用显式权威坐标变换或新的描述性 model id。`FitResultBatch.evaluate_batch()` 是 overlay/replay 的唯一结果求值入口，使用相同 absolute coordinates 与 catalog evaluator。damped-sine 将 amplitude 约束为非负、phase 约束在主值区间，消除 `(A, φ) == (-A, φ+π)` 的 artifact 歧义。
+
+领域中立的一维数学模型接受具名有限数值轴，包括 scan、spectral、spatial lineout 与 `histogram-bin`；axis role 用于 UI 推荐，不能让迁移后的 histogram/lineout 能力消失。二维 radial Gaussian 仍严格要求 spatial-x/spatial-y、共同 unit/frame，并把第三参数明确命名为 `one_over_e_radius`。原 neutral 层“Zeeman”标签对应的通用数学模型在 zlc_data 中命名为 `symmetric_lorentzian_doublet`；neutral UI 可以显示领域标签，但不得让通用公式冒充所有 Zeeman 物理选择规则。
 
 DataTransform 后仍存活的每根 axis 必须恰好属于 fit、batch 或模型明确声明的 observation component；不能留给 solver 猜。FitModel 从首版显式声明 independent-variable arity/roles，支持当前已有的 1D 与 2D model；不能把 2D Gaussian 当作未来功能删除，也不能通过数组 rank 推断 arity。
 
 WorkbenchFitRequest 是 workbench Command DTO，可持 app-local LiveDataBlockRef；FigureFitRequest 是 frontend figure DTO，只持 DatasetId。各 adapter 先解析为 immutable DataBlock revision，再调用 zlc_data `build_fit_problem(block, FitSpec)`；zlc_data 不定义 universal InputRef/FitRequest，也不看到 neutral live ref。artifact 保存 FitSpec 与已解析 input lineage，不保存 application request DTO。
 
-batch cell 独立失败时保留其它成功结果并记录 typed status；输入整体 schema/model 不兼容、transform 无效或 cancellation 才使整个 Fit Analysis 失败。FitResultBatch 不包含 runtime EventRef、LiveDataBlockRef 或 ArtifactRef；formal Analysis/figure repository adapter 在外层附加 input lineage。它不拆成多个 scalar signal，overlay 从同一个 result 与外层 lineage 派生。
+batch cell 独立执行；预先列举的数值初始化/solver/evaluation-limit/timeout/浮点或线性代数失败只使该格产生 typed status，某格失败或收敛后被拒绝时仍保留其它格结果。输入整体 schema/model 不兼容、transform 无效、cancellation，以及 AssertionError/TypeError/MemoryError 等未知实现或资源异常必须中止整个 Fit Analysis，不能被 broad `except Exception` 伪装成单格 solver failure。FitResultBatch 不包含 runtime EventRef、LiveDataBlockRef 或 ArtifactRef；formal Analysis/figure repository adapter 在外层附加 input lineage。它不拆成多个 scalar signal，overlay 从同一个 result 与外层 lineage 派生。
+
+FitResultBatch 是 compact solver-issued report，不是把原始坐标、observation、Jacobian 重复塞进去的 proof-carrying result。构造器/strict codec 验证状态机、静态 domain/constraint、计数、RSS、R²、covariance 的有限性/对称/PSD/fixed-row与 canonical zero；RMSE、effective schema fingerprint、coordinate source、parameter schema/unit、initializer/solver identity 都由已保存的 FitSpec/AxisSpec/catalog 唯一派生，不在 payload 再存第二份真相。动态 geometry/Jacobian/alias acceptance 由可信 solver path 唯一拥有，单凭一段自称 `ACCEPTED` 的任意 bytes 不能获得权威性。raw codec decode 只能得到 untrusted report；formal 保存必须经 composition-owned fit executor 把 result digest、source_ref、FitSpec digest 与 producer contract 写入 repository manifest，formal consumer 只接受 repository 验证后返回的 authoritative artifact view，不能直接接收 FitResultBatch/任意 bytes。若 manifest/producer/source revision 无法验证，则只能显示诊断或从源 revision 重算。
 
 FitResultBatch 是当前一等需求，不延后：gridplot、site grid 和任何保留 site/component axis 的 fit 都要求“一组共享 model/parameter schema + 按具名 batch axes 排列的每格结果”。`BatchLayout` 复用 PointLayout 的 RECT_C/RECT_F/EXPLICIT 映射思想；稀疏 batch 只保存实际 B 个 cell，missing coordinate 与 fit failure 是不同状态，不能强行 densify 后混成 NaN。grid 的 cell label/coordinate 由 batch_axis_specs + BatchLayout/axis coordinates 派生，不能用 list index 充当永久 identity。ComponentValidity 在 build_fit_problem 时按 batch cell 切片；某个 site 无效只使对应 per_batch_status 失败，不污染其它 cell，也不允许先对 site 轴平均成一个 FitResult。`build_fit_problem` 是 fit densify/packing 的唯一 owner；若某 solver 只接受 dense layout，它必须显式 materialize mapping+validity或在 bind 时拒绝，不由 renderer/collector 猜 reshape。
 
@@ -1670,6 +1687,8 @@ PipelineSpec post-materialization FitAnalysis(FitSpec)
 ```
 
 FitSpec 必须包含 input_schema_fingerprint 与显式 fit/batch axes；发生选择/降维时 committed_transform 必须存在，identity path 可以为空。Fit Analysis 只在 DatasetBuilder 完成 EOS/key/validity coverage 并冻结输入 revision 后运行，验证 schema fingerprint、解析 FitProblem 后执行相同的 zlc_data transform/reduction/fit 函数。它不在每个 sample/patch 到达时把累计 DataBlock 重新拟合一遍。
+
+Formal Fit step 可以返回包含 per-cell REJECTED 诊断的完整 FitResultBatch，但下游参数引用、校准更新、scan 决策或“成功物理结论”只能解析 ACCEPTED cell；pipeline 对“允许部分 batch 被拒绝、要求全体接受、或指定具名 cell 必须接受”的 policy 必须显式写入领域 AnalysisSpec，不能把 `CONVERGED` 当作默认通过。
 
 ### 11.9 Interactive Fit 路径
 
@@ -3195,6 +3214,9 @@ apps/
 - 自动视图只按 axis metadata + ViewIntent 决策，不读 values 猜语义；
 - 显示投影始终可见、可改、可复现，且不修改原始 DataBlock；
 - DataTransformSpec/CommittedTransform 与 figure ViewSpec 分层，display-only step 不能进入 fit、正式 scan y、calibration 或派生 artifact；
+- Fit batch 的数值 `CONVERGED` 与科学 `ACCEPTED/REJECTED` 正交；被拒绝结果保留诊断，只有 `CONVERGED+ACCEPTED` 可成为权威参数输入；
+- fit initializer只产seed，数学domain/用户constraint才产hard bound；absolute-time参数不被选区contrast截断，phase只有`[-π,π)`单一表示；
+- FitProblem把完整均匀AxisSpec与selected-index gcd压缩为per-batch/axis sampling quantum，不复制逐样本logical index；damped-sine只输出`baseband_frequency`，formal物理解释另需typed band-limit prior；RMSE及其它可派生metadata不重复持久化；
 - histogram pool、image repeat、fit batch 等语义由 ViewContract 声明，没有 render 特例或全局 repeat mean。
 
 执行与线程：

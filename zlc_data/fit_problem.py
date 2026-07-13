@@ -65,7 +65,6 @@ def build_fit_problem(
             snapshot.block.validity,
             snapshot.block.schema,
         ).reshape(schema.physical_shape)
-        effective_fingerprint = bound.spec.input_schema_fingerprint
     else:
         transformed = apply_transform(snapshot, bound.spec.committed_transform)
         schema = transformed.schema
@@ -73,12 +72,15 @@ def build_fit_problem(
             raise RuntimeError("fit binding and transform execution schemas disagree")
         values = transformed.values
         validity = transformed.expanded_validity()
-        effective_fingerprint = bound.spec.committed_transform.output_schema_fingerprint
     _check_abort(abort_check)
 
     fit_axes = tuple(schema.axis(axis_id) for axis_id in bound.spec.fit_axis_ids)
     batch_axes = tuple(schema.axis(axis_id) for axis_id in bound.spec.batch_axis_ids)
     coordinate_sources = tuple(_coordinate_source_for_axis(axis) for axis in fit_axes)
+    source_sampling_quanta = tuple(
+        _source_sampling_quantum(axis, source)
+        for axis, source in zip(fit_axes, coordinate_sources)
+    )
 
     cell_ids = tuple(axis.axis_id for axis in schema.cell_axes)
     data_ids = tuple(axis.axis_id for axis in schema.data_axes)
@@ -134,9 +136,11 @@ def build_fit_problem(
     mapping: list[tuple[int, ...]] = []
     observations_parts: list[np.ndarray] = []
     coordinate_parts: list[list[np.ndarray]] = [list() for _ in fit_axes]
+    sampling_quanta: list[tuple[float, ...]] = []
     present_counts: list[int] = []
     valid_counts: list[int] = []
     used_counts: list[int] = []
+    packed_observation_count = 0
 
     data_combinations = tuple(np.ndindex(data_batch_shape))
     for cell_batch_key, row_list in row_groups.items():
@@ -147,6 +151,17 @@ def build_fit_problem(
             cell_ids[position]: cell_batch_key[index]
             for index, position in enumerate(cell_batch_positions)
         }
+        (
+            dimension_order,
+            dimension_indices,
+            compressed_fit_coordinates,
+        ) = _canonical_observation_order(
+            schema,
+            row_ids,
+            axis_indices,
+            data_fit_positions,
+            bound.spec.fit_axis_ids,
+        )
         for data_multi in data_combinations:
             _check_abort(abort_check)
             data_batch_values = {
@@ -167,17 +182,6 @@ def build_fit_problem(
             selection = (row_selector, *data_selectors)
             observation_view = values[selection]
             validity_view = validity[selection]
-            (
-                dimension_order,
-                dimension_indices,
-                compressed_fit_coordinates,
-            ) = _canonical_observation_order(
-                schema,
-                row_ids,
-                axis_indices,
-                data_fit_positions,
-                bound.spec.fit_axis_ids,
-            )
             selected, present_count, valid_count = _sample_valid_positions(
                 observation_view,
                 validity_view,
@@ -188,6 +192,16 @@ def build_fit_problem(
             )
             _check_abort(abort_check)
             used_count = int(selected.size)
+            next_packed_observation_count = packed_observation_count + used_count
+            if (
+                next_packed_observation_count
+                > bound.spec.numeric_policy.max_packed_observations
+            ):
+                raise ValueError(
+                    "fit request exceeds max_packed_observations="
+                    f"{bound.spec.numeric_policy.max_packed_observations}"
+                )
+            packed_observation_count = next_packed_observation_count
             observations_parts.append(
                 _float64_observations(np.take(observation_view, selected))
             )
@@ -202,7 +216,10 @@ def build_fit_problem(
             )
             selected_row_offsets = packed_indices[0]
             selected_rows = row_ids[selected_row_offsets]
-            for fit_position, (axis, source) in enumerate(zip(fit_axes, coordinate_sources)):
+            cell_quanta: list[float] = []
+            for fit_position, (axis, source, source_quantum) in enumerate(
+                zip(fit_axes, coordinate_sources, source_sampling_quanta)
+            ):
                 if axis.axis_id in cell_ids:
                     logical = axis_indices[cell_ids.index(axis.axis_id)][selected_rows]
                 else:
@@ -212,6 +229,8 @@ def build_fit_problem(
                 coordinate_parts[fit_position].append(
                     _coordinates_for_indices(axis, source, logical)
                 )
+                cell_quanta.append(_sampling_quantum(source_quantum, logical))
+            sampling_quanta.append(tuple(cell_quanta))
 
     batch_shape = tuple(axis.size for axis in batch_axes)
     batch_layout = _batch_layout_from_mapping(batch_shape, tuple(mapping))
@@ -227,14 +246,16 @@ def build_fit_problem(
     return FitProblem(
         source_ref=snapshot.ref,
         spec=bound.spec,
-        effective_schema_fingerprint=effective_fingerprint,
         fit_axis_specs=fit_axes,
-        coordinate_sources=coordinate_sources,
         batch_axis_specs=batch_axes,
         batch_layout=batch_layout,
         value_unit=schema.value_unit,
         batch_offsets=offsets,
         independent_values=packed_coordinates,
+        sampling_quanta=np.asarray(sampling_quanta, dtype=np.dtype("<f8")).reshape(
+            len(mapping),
+            len(fit_axes),
+        ),
         observations=packed_observations,
         present_observation_counts=np.asarray(present_counts, dtype=np.dtype("<i8")),
         valid_observation_counts=np.asarray(valid_counts, dtype=np.dtype("<i8")),
@@ -275,6 +296,59 @@ def _coordinates_for_indices(
     assert axis.coordinates is not None
     declared = np.asarray(axis.coordinates, dtype=np.float64)
     return np.asarray(declared[logical_indices], dtype=np.float64)
+
+
+def _source_sampling_quantum(
+    axis: AxisSpec,
+    source: FitCoordinateSource,
+) -> float:
+    if source is FitCoordinateSource.LOGICAL_INDEX:
+        return 1.0
+    if axis.coordinates is None:  # pragma: no cover - coordinate source invariant
+        return 0.0
+    return _uniform_source_quantum(np.asarray(axis.coordinates, dtype=np.float64))
+
+
+def _sampling_quantum(source_quantum: float, logical_indices: np.ndarray) -> float:
+    """Compress exact source-lattice provenance to the used stride quantum."""
+
+    if source_quantum == 0.0:
+        return 0.0
+    unique = np.unique(np.asarray(logical_indices, dtype=np.int64))
+    differences = np.diff(unique)
+    if differences.size == 0:
+        return 0.0
+    stride_gcd = int(np.gcd.reduce(differences))
+    if stride_gcd <= 0:  # pragma: no cover - unique sorted indices make this impossible
+        return 0.0
+    return float(source_quantum * stride_gcd)
+
+
+def _uniform_source_quantum(values: np.ndarray) -> float:
+    """Prove an affine float lattice to representation-scale precision.
+
+    A relative tolerance would become physically huge for axes with a large
+    coordinate offset.  Here every encoded coordinate must agree with one affine
+    reconstruction within four local float64 ULPs; anything looser is unproven.
+    """
+
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 1 or values.size < 2 or np.any(~np.isfinite(values)):
+        return 0.0
+    differences = np.diff(values)
+    if np.any(differences == 0.0) or not (
+        np.all(differences > 0.0) or np.all(differences < 0.0)
+    ):
+        return 0.0
+    step = float((values[-1] - values[0]) / (values.size - 1))
+    if not np.isfinite(step) or step == 0.0:
+        return 0.0
+    expected = values[0] + np.arange(values.size, dtype=np.float64) * step
+    ulp = np.spacing(np.maximum(np.abs(values), np.abs(expected)))
+    tolerance = np.maximum(4.0 * ulp, np.finfo(np.float64).tiny)
+    if np.any(np.abs(values - expected) > tolerance):
+        return 0.0
+    return abs(step)
 
 
 def _compact_row_selector(row_ids: np.ndarray) -> slice | np.ndarray:

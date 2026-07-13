@@ -50,6 +50,7 @@ READOUT_EVENT = AxisRoleId("readout-event")
 SPATIAL_X = AxisRoleId("spatial-x")
 SPATIAL_Y = AxisRoleId("spatial-y")
 SPECTRAL = AxisRoleId("spectral")
+HISTOGRAM_BIN = AxisRoleId("histogram-bin")
 SITE = AxisRoleId("site")
 COMPONENT = AxisRoleId("component")
 

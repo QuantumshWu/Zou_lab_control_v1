@@ -12,6 +12,7 @@ from .fit_codec import (
 )
 from .fit_contract import (
     BoundFit,
+    FitAcceptance,
     FitBatchStatus,
     FitCancelled,
     FitCoordinateSource,
@@ -25,8 +26,8 @@ from .fit_contract import (
 )
 from .fit_model import (
     FitAxisRequirement,
-    FitFamily,
     FitModelDefinition,
+    FitParameterDomain,
     FitParameterDefinition,
     ParameterUnitRelation,
     evaluate_fit_model,
@@ -57,15 +58,16 @@ def fit_analysis(
 
 __all__ = [
     "BoundFit",
+    "FitAcceptance",
     "FitAxisRequirement",
     "FitBatchStatus",
     "FitCancelled",
     "FitCoordinateSource",
     "FitDeadlineExceeded",
-    "FitFamily",
     "FitModelDefinition",
     "FitNumericPolicy",
     "FitParameterConstraint",
+    "FitParameterDomain",
     "FitParameterDefinition",
     "FitProblem",
     "FitResultBatch",

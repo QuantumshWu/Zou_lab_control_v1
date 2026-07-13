@@ -126,14 +126,14 @@ def exact_mapping(
     fields: set[str] | frozenset[str],
     format_name: str,
     *,
-    discriminator: str = "schema",
+    discriminator: str | None = "schema",
 ) -> dict[str, Any]:
-    """Admit one exact owner mapping and its format discriminator."""
+    """Admit one exact owner mapping and, when present, its discriminator."""
 
     expected = set(fields)
     if not isinstance(value, dict) or set(value) != expected:
         raise ValueError(f"{format_name} must contain exactly {sorted(expected)}")
-    if value.get(discriminator) != format_name:
+    if discriminator is not None and value.get(discriminator) != format_name:
         raise ValueError(
             f"expected {discriminator} {format_name!r}, "
             f"got {value.get(discriminator)!r}"

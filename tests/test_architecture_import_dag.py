@@ -6,6 +6,7 @@ import ast
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 import pytest
 
@@ -35,6 +36,7 @@ CANONICAL_HELPER_NAMES = frozenset(
         "_positive_int",
         "_positive_seconds",
         "_positive_timeout",
+        "_require_digest",
         "_sha256",
         "_text",
     }
@@ -80,6 +82,32 @@ def test_target_package_has_no_reverse_imports(package, forbidden):
                         f"{path.relative_to(ROOT)} imports storage I/O boundary {imported}"
                     )
     assert not violations, "reverse package dependencies:\n" + "\n".join(violations)
+
+
+def test_zlc_data_import_does_not_initialize_storage_backends():
+    code = """
+import sys
+import zlc_data
+
+forbidden = (
+    'zlc_storage.content_store',
+    'zlc_storage.durability',
+    'zlc_storage.framed_journal',
+    'zlc_storage.repository_lease',
+)
+loaded = tuple(name for name in forbidden if name in sys.modules)
+if loaded:
+    raise SystemExit('storage backends loaded through zlc_data: ' + ', '.join(loaded))
+if 'zlc_storage.canonical' not in sys.modules:
+    raise SystemExit('zlc_data did not load its only permitted storage primitive module')
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_canonical_primitive_validators_have_one_owner():

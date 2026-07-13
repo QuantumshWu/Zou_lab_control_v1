@@ -1,4 +1,4 @@
-"""Closed, versioned model catalogue for generic named-axis fitting.
+"""Closed model catalogue for generic named-axis fitting.
 
 The catalogue contains only domain-neutral curve/image models.  Readout
 mixtures, calibration PSFs and histogram decisions deliberately remain in
@@ -14,12 +14,16 @@ from typing import Mapping
 
 import numpy as np
 
-from .axis import AxisRoleId, SCAN_POINT, SPATIAL_X, SPATIAL_Y, SPECTRAL
+from zlc_storage.canonical import canonical_text
 
-
-class FitFamily(str, Enum):
-    CURVE_1D = "CURVE_1D"
-    IMAGE_2D = "IMAGE_2D"
+from .axis import (
+    HISTOGRAM_BIN,
+    AxisRoleId,
+    SCAN_POINT,
+    SPATIAL_X,
+    SPATIAL_Y,
+    SPECTRAL,
+)
 
 
 class ParameterUnitRelation(str, Enum):
@@ -30,16 +34,63 @@ class ParameterUnitRelation(str, Enum):
     RADIAN = "RADIAN"
 
 
+class FitParameterDomain(str, Enum):
+    REAL = "REAL"
+    POSITIVE = "POSITIVE"
+    NONNEGATIVE = "NONNEGATIVE"
+    PHASE_RADIANS = "PHASE_RADIANS"
+
+
 @dataclass(frozen=True)
 class FitParameterDefinition:
     name: str
     unit_relation: ParameterUnitRelation
+    domain: FitParameterDomain = FitParameterDomain.REAL
 
     def __post_init__(self) -> None:
-        if not isinstance(self.name, str) or not self.name or self.name.strip() != self.name:
-            raise ValueError("fit parameter name must be non-empty canonical text")
+        canonical_text(self.name, "fit parameter name")
         if not isinstance(self.unit_relation, ParameterUnitRelation):
             raise TypeError("unit_relation must be ParameterUnitRelation")
+        if not isinstance(self.domain, FitParameterDomain):
+            raise TypeError("domain must be FitParameterDomain")
+
+    def accepts(self, value: float) -> bool:
+        value = float(value)
+        if not np.isfinite(value):
+            return False
+        if self.domain is FitParameterDomain.REAL:
+            return True
+        if self.domain is FitParameterDomain.POSITIVE:
+            return value > 0.0
+        if self.domain is FitParameterDomain.NONNEGATIVE:
+            return value >= 0.0
+        if self.domain is FitParameterDomain.PHASE_RADIANS:
+            return -np.pi <= value < np.pi
+        raise RuntimeError("unsupported fit parameter domain")
+
+    def has_free_interval(self, lower: float | None, upper: float | None) -> bool:
+        """Whether static/user bounds contain a representable free solver value."""
+
+        domain_lower, domain_upper = self.solver_bounds
+        effective_lower = max(domain_lower, -np.inf if lower is None else lower)
+        effective_upper = min(domain_upper, np.inf if upper is None else upper)
+        if not effective_lower < effective_upper:
+            return False
+        return bool(np.nextafter(effective_lower, effective_upper) < effective_upper)
+
+    @property
+    def solver_bounds(self) -> tuple[float, float]:
+        """Static mathematical domain; data heuristics never become hard bounds."""
+
+        if self.domain is FitParameterDomain.REAL:
+            return (-np.inf, np.inf)
+        if self.domain is FitParameterDomain.POSITIVE:
+            return (float(np.nextafter(0.0, np.inf)), np.inf)
+        if self.domain is FitParameterDomain.NONNEGATIVE:
+            return (0.0, np.inf)
+        if self.domain is FitParameterDomain.PHASE_RADIANS:
+            return (-np.pi, float(np.nextafter(np.pi, -np.inf)))
+        raise RuntimeError("unsupported fit parameter domain")
 
 
 @dataclass(frozen=True)
@@ -58,50 +109,31 @@ class FitAxisRequirement:
 @dataclass(frozen=True)
 class FitModelDefinition:
     model_id: str
-    version: int
     display_name: str
-    family: FitFamily
-    independent_arity: int
     axis_requirements: tuple[FitAxisRequirement, ...]
     parameters: tuple[FitParameterDefinition, ...]
-    minimum_observations: int
     initializer_id: str
     require_common_axis_unit: bool = False
     require_common_coordinate_frame: bool = False
-    solver_contract_id: str = "scipy_least_squares_trf_v1"
 
     def __post_init__(self) -> None:
         for field, value in (
             ("model_id", self.model_id),
             ("display_name", self.display_name),
             ("initializer_id", self.initializer_id),
-            ("solver_contract_id", self.solver_contract_id),
         ):
-            if not isinstance(value, str) or not value or value.strip() != value:
-                raise ValueError(f"{field} must be non-empty canonical text")
-        if not isinstance(self.version, int) or isinstance(self.version, bool) or self.version <= 0:
-            raise ValueError("model version must be a positive integer")
-        if not isinstance(self.family, FitFamily):
-            raise TypeError("family must be FitFamily")
-        if self.independent_arity not in (1, 2):
-            raise ValueError("generic fit models support one or two independent axes")
+            canonical_text(value, field)
         requirements = tuple(self.axis_requirements)
-        if len(requirements) != self.independent_arity or any(
+        if len(requirements) not in (1, 2) or any(
             not isinstance(item, FitAxisRequirement) for item in requirements
         ):
-            raise ValueError("axis_requirements must describe every independent axis")
+            raise ValueError("axis_requirements must describe one or two independent axes")
         parameters = tuple(self.parameters)
         if not parameters or any(not isinstance(item, FitParameterDefinition) for item in parameters):
             raise ValueError("model requires FitParameterDefinition values")
         names = tuple(item.name for item in parameters)
         if len(set(names)) != len(names):
             raise ValueError("model parameter names must be unique")
-        if (
-            not isinstance(self.minimum_observations, int)
-            or isinstance(self.minimum_observations, bool)
-            or self.minimum_observations <= len(parameters)
-        ):
-            raise ValueError("minimum_observations must exceed the parameter count")
         if not isinstance(self.require_common_axis_unit, bool):
             raise TypeError("require_common_axis_unit must be bool")
         if not isinstance(self.require_common_coordinate_frame, bool):
@@ -113,31 +145,9 @@ class FitModelDefinition:
     def parameter_names(self) -> tuple[str, ...]:
         return tuple(item.name for item in self.parameters)
 
-
-@dataclass(frozen=True)
-class ModelInitialization:
-    seeds: tuple[tuple[float, ...], ...]
-    lower_bounds: tuple[float, ...]
-    upper_bounds: tuple[float, ...]
-
-    def __post_init__(self) -> None:
-        seeds = tuple(tuple(float(value) for value in seed) for seed in self.seeds)
-        lower = tuple(float(value) for value in self.lower_bounds)
-        upper = tuple(float(value) for value in self.upper_bounds)
-        if not seeds:
-            raise ValueError("model initialization requires at least one seed")
-        width = len(lower)
-        if width == 0 or len(upper) != width or any(len(seed) != width for seed in seeds):
-            raise ValueError("model initialization dimensions disagree")
-        if any(not np.isfinite(value) for seed in seeds for value in seed):
-            raise ValueError("model seeds must be finite")
-        if any(not np.isfinite(value) for value in lower + upper):
-            raise ValueError("model bounds must be finite")
-        if any(not low < high for low, high in zip(lower, upper)):
-            raise ValueError("every model lower bound must be below its upper bound")
-        object.__setattr__(self, "seeds", seeds)
-        object.__setattr__(self, "lower_bounds", lower)
-        object.__setattr__(self, "upper_bounds", upper)
+    @property
+    def independent_arity(self) -> int:
+        return len(self.axis_requirements)
 
 
 VALUE = ParameterUnitRelation.VALUE
@@ -145,8 +155,12 @@ AXIS_0 = ParameterUnitRelation.AXIS_0
 AXIS_1 = ParameterUnitRelation.AXIS_1
 INVERSE_AXIS_0 = ParameterUnitRelation.INVERSE_AXIS_0
 RADIAN = ParameterUnitRelation.RADIAN
-SPECTRAL_OR_SCAN = FitAxisRequirement((SCAN_POINT, SPECTRAL))
-SCAN = FitAxisRequirement((SCAN_POINT,))
+POSITIVE = FitParameterDomain.POSITIVE
+NONNEGATIVE = FitParameterDomain.NONNEGATIVE
+PHASE_RADIANS = FitParameterDomain.PHASE_RADIANS
+GENERIC_CURVE = FitAxisRequirement(
+    (HISTOGRAM_BIN, SCAN_POINT, SPATIAL_X, SPATIAL_Y, SPECTRAL)
+)
 SPACE_X = FitAxisRequirement((SPATIAL_X,))
 SPACE_Y = FitAxisRequirement((SPATIAL_Y,))
 
@@ -154,108 +168,84 @@ SPACE_Y = FitAxisRequirement((SPATIAL_Y,))
 _MODELS = (
     FitModelDefinition(
         "lorentzian",
-        1,
         "Lorentzian",
-        FitFamily.CURVE_1D,
-        1,
-        (SPECTRAL_OR_SCAN,),
+        (GENERIC_CURVE,),
         (
             FitParameterDefinition("center", AXIS_0),
-            FitParameterDefinition("full_width", AXIS_0),
+            FitParameterDefinition("fwhm", AXIS_0, POSITIVE),
             FitParameterDefinition("amplitude", VALUE),
             FitParameterDefinition("offset", VALUE),
         ),
-        5,
-        "lorentzian_extrema_v1",
+        "lorentzian-signed-extrema",
     ),
     FitModelDefinition(
         "gaussian_offset",
-        1,
         "Gaussian with offset",
-        FitFamily.CURVE_1D,
-        1,
-        (SPECTRAL_OR_SCAN,),
+        (GENERIC_CURVE,),
         (
             FitParameterDefinition("amplitude", VALUE),
             FitParameterDefinition("offset", VALUE),
-            FitParameterDefinition("sigma", AXIS_0),
+            FitParameterDefinition("sigma", AXIS_0, POSITIVE),
             FitParameterDefinition("center", AXIS_0),
         ),
-        5,
-        "gaussian_extrema_v2",
+        "gaussian-signed-extrema",
     ),
     FitModelDefinition(
-        "zeeman_double_lorentzian",
-        1,
-        "Zeeman double Lorentzian",
-        FitFamily.CURVE_1D,
-        1,
-        (SPECTRAL_OR_SCAN,),
+        "symmetric_lorentzian_doublet",
+        "Symmetric Lorentzian doublet",
+        (GENERIC_CURVE,),
         (
             FitParameterDefinition("center", AXIS_0),
-            FitParameterDefinition("full_width", AXIS_0),
-            FitParameterDefinition("amplitude", VALUE),
+            FitParameterDefinition("common_fwhm", AXIS_0, POSITIVE),
+            FitParameterDefinition("component_amplitude", VALUE),
             FitParameterDefinition("offset", VALUE),
-            FitParameterDefinition("splitting", AXIS_0),
+            FitParameterDefinition("center_splitting", AXIS_0, NONNEGATIVE),
         ),
-        6,
-        "zeeman_peak_and_dip_v2",
+        "symmetric-doublet-peak-dip-pair",
     ),
     FitModelDefinition(
         "damped_sine",
-        1,
         "Damped sine",
-        FitFamily.CURVE_1D,
-        1,
-        (SCAN,),
+        (GENERIC_CURVE,),
         (
-            FitParameterDefinition("amplitude", VALUE),
+            FitParameterDefinition("amplitude", VALUE, NONNEGATIVE),
             FitParameterDefinition("offset", VALUE),
-            FitParameterDefinition("frequency", INVERSE_AXIS_0),
-            FitParameterDefinition("decay_time", AXIS_0),
-            FitParameterDefinition("phase", RADIAN),
+            FitParameterDefinition("baseband_frequency", INVERSE_AXIS_0, POSITIVE),
+            FitParameterDefinition("decay_time", AXIS_0, POSITIVE),
+            FitParameterDefinition("phase", RADIAN, PHASE_RADIANS),
         ),
-        7,
-        "damped_sine_fft_or_span_v1",
+        "damped-sine-uniform-rfft-or-span",
     ),
     FitModelDefinition(
         "exponential_decay",
-        1,
         "Exponential decay",
-        FitFamily.CURVE_1D,
-        1,
-        (SCAN,),
+        (GENERIC_CURVE,),
         (
             FitParameterDefinition("amplitude", VALUE),
             FitParameterDefinition("offset", VALUE),
-            FitParameterDefinition("decay_time", AXIS_0),
+            FitParameterDefinition("decay_time", AXIS_0, POSITIVE),
         ),
-        4,
-        "exponential_extrema_v1",
+        "exponential-signed-extrema",
     ),
     FitModelDefinition(
         "radial_gaussian_center",
-        1,
         "Radial Gaussian center",
-        FitFamily.IMAGE_2D,
-        2,
         (SPACE_X, SPACE_Y),
         (
             FitParameterDefinition("amplitude", VALUE),
             FitParameterDefinition("offset", VALUE),
-            FitParameterDefinition("radius", AXIS_0),
+            FitParameterDefinition("one_over_e_radius", AXIS_0, POSITIVE),
             FitParameterDefinition("center_x", AXIS_0),
             FitParameterDefinition("center_y", AXIS_1),
         ),
-        6,
-        "radial_centroid_v1",
-        True,
-        True,
+        "radial-signed-centroid",
+        require_common_axis_unit=True,
+        require_common_coordinate_frame=True,
     ),
 )
 
-_MODEL_BY_KEY: Mapping[tuple[str, int], FitModelDefinition] = MappingProxyType(
-    {(model.model_id, model.version): model for model in _MODELS}
+_MODEL_BY_ID: Mapping[str, FitModelDefinition] = MappingProxyType(
+    {model.model_id: model for model in _MODELS}
 )
 
 
@@ -263,27 +253,26 @@ def fit_model_catalog() -> tuple[FitModelDefinition, ...]:
     return _MODELS
 
 
-def fit_model_definition(model_id: str, version: int = 1) -> FitModelDefinition:
-    if not isinstance(model_id, str) or not model_id or model_id.strip() != model_id:
-        raise ValueError("model_id must be canonical non-empty text")
-    if not isinstance(version, int) or isinstance(version, bool):
-        raise TypeError("model version must be an integer")
+def fit_model_definition(model_id: str) -> FitModelDefinition:
+    canonical_text(model_id, "model_id")
     try:
-        return _MODEL_BY_KEY[(model_id, version)]
+        return _MODEL_BY_ID[model_id]
     except KeyError as exc:
-        raise ValueError(f"unknown fit model version {(model_id, version)!r}") from exc
+        raise ValueError(f"unknown fit model {model_id!r}") from exc
 
 
 def evaluate_fit_model(
     model: FitModelDefinition | str,
     coordinates: tuple[np.ndarray, ...],
     parameters: np.ndarray | tuple[float, ...],
-    *,
-    version: int = 1,
 ) -> np.ndarray:
-    definition = fit_model_definition(model, version) if isinstance(model, str) else model
+    """Evaluate a closed-catalog model on the supplied absolute coordinates."""
+
+    definition = fit_model_definition(model) if isinstance(model, str) else model
     if not isinstance(definition, FitModelDefinition):
         raise TypeError("model must be FitModelDefinition or canonical model id")
+    if definition != fit_model_definition(definition.model_id):
+        raise ValueError("model definition does not belong to the closed fit catalog")
     coords = tuple(np.asarray(value, dtype=np.float64) for value in coordinates)
     if len(coords) != definition.independent_arity:
         raise ValueError("coordinate arity does not match model")
@@ -292,13 +281,18 @@ def evaluate_fit_model(
     params = np.asarray(parameters, dtype=np.float64).reshape(-1)
     if params.size != len(definition.parameters):
         raise ValueError("parameter count does not match model")
+    for parameter, value in zip(definition.parameters, params):
+        if not parameter.accepts(float(value)):
+            raise ValueError(
+                f"parameter {parameter.name!r} violates its {parameter.domain.value} domain"
+            )
     key = definition.model_id
     if key == "lorentzian":
         result = _lorentzian(coords[0], *params)
     elif key == "gaussian_offset":
         result = _gaussian_offset(coords[0], *params)
-    elif key == "zeeman_double_lorentzian":
-        result = _zeeman_double_lorentzian(coords[0], *params)
+    elif key == "symmetric_lorentzian_doublet":
+        result = _symmetric_lorentzian_doublet(coords[0], *params)
     elif key == "damped_sine":
         result = _damped_sine(coords[0], *params)
     elif key == "exponential_decay":
@@ -314,33 +308,40 @@ def initialize_fit_model(
     model: FitModelDefinition,
     coordinates: tuple[np.ndarray, ...],
     observations: np.ndarray,
-) -> ModelInitialization:
+) -> tuple[tuple[float, ...], ...]:
     if not isinstance(model, FitModelDefinition):
         raise TypeError("model must be FitModelDefinition")
+    if model != fit_model_definition(model.model_id):
+        raise ValueError("model definition does not belong to the closed fit catalog")
     coords = tuple(np.asarray(value, dtype=np.float64).reshape(-1) for value in coordinates)
     y = np.asarray(observations, dtype=np.float64).reshape(-1)
     if len(coords) != model.independent_arity or any(item.shape != y.shape for item in coords):
         raise ValueError("initializer coordinate/observation shapes disagree")
-    if y.size < model.minimum_observations:
-        raise ValueError(
-            f"{model.model_id} requires at least {model.minimum_observations} observations"
-        )
+    if y.size < 2:
+        raise ValueError("model initialization requires at least two observations")
     if not np.all(np.isfinite(y)) or any(not np.all(np.isfinite(item)) for item in coords):
         raise ValueError("fit initialization requires finite authoritative observations")
     key = model.model_id
     if key == "lorentzian":
-        return _init_lorentzian(coords[0], y)
-    if key == "gaussian_offset":
-        return _init_gaussian(coords[0], y)
-    if key == "zeeman_double_lorentzian":
-        return _init_zeeman(coords[0], y)
-    if key == "damped_sine":
-        return _init_damped_sine(coords[0], y)
-    if key == "exponential_decay":
-        return _init_exponential(coords[0], y)
-    if key == "radial_gaussian_center":
-        return _init_center(coords[0], coords[1], y)
-    raise RuntimeError(f"no initializer for {key}")  # pragma: no cover
+        seeds = _init_lorentzian(coords[0], y)
+    elif key == "gaussian_offset":
+        seeds = _init_gaussian(coords[0], y)
+    elif key == "symmetric_lorentzian_doublet":
+        seeds = _init_symmetric_lorentzian_doublet(coords[0], y)
+    elif key == "damped_sine":
+        seeds = _init_damped_sine(coords[0], y)
+    elif key == "exponential_decay":
+        seeds = _init_exponential(coords[0], y)
+    elif key == "radial_gaussian_center":
+        seeds = _init_center(coords[0], coords[1], y)
+    else:  # pragma: no cover - closed catalog
+        raise RuntimeError(f"no initializer for {key}")
+    canonical = tuple(tuple(float(value) for value in seed) for seed in seeds)
+    if not canonical or any(len(seed) != len(model.parameters) for seed in canonical):
+        raise ValueError("model initializer returned an invalid seed shape")
+    if any(not np.isfinite(value) for seed in canonical for value in seed):
+        raise ValueError("model initializer returned a non-finite seed")
+    return canonical
 
 
 def _span(values: np.ndarray) -> float:
@@ -352,8 +353,16 @@ def _positive_floor(scale: float) -> float:
     return max(abs(float(scale)) * 1e-12, np.finfo(np.float64).tiny)
 
 
-def _lorentzian(x, center, full_width, amplitude, offset):
-    half_squared = (full_width / 2.0) ** 2
+def _safe_exp(value: float) -> float:
+    return float(np.exp(np.clip(float(value), -700.0, 700.0)))
+
+
+def _principal_phase(value: float) -> float:
+    return float((float(value) + np.pi) % (2.0 * np.pi) - np.pi)
+
+
+def _lorentzian(x, center, fwhm, amplitude, offset):
+    half_squared = (fwhm / 2.0) ** 2
     return amplitude * half_squared / ((x - center) ** 2 + half_squared) + offset
 
 
@@ -361,10 +370,29 @@ def _gaussian_offset(x, amplitude, offset, sigma, center):
     return amplitude * np.exp(-((x - center) ** 2) / (2.0 * sigma**2)) + offset
 
 
-def _zeeman_double_lorentzian(x, center, full_width, amplitude, offset, splitting):
+def _symmetric_lorentzian_doublet(
+    x,
+    center,
+    common_fwhm,
+    component_amplitude,
+    offset,
+    center_splitting,
+):
     return (
-        _lorentzian(x - splitting / 2.0, center, full_width, amplitude, 0.0)
-        + _lorentzian(x + splitting / 2.0, center, full_width, amplitude, 0.0)
+        _lorentzian(
+            x - center_splitting / 2.0,
+            center,
+            common_fwhm,
+            component_amplitude,
+            0.0,
+        )
+        + _lorentzian(
+            x + center_splitting / 2.0,
+            center,
+            common_fwhm,
+            component_amplitude,
+            0.0,
+        )
         + offset
     )
 
@@ -379,11 +407,20 @@ def _exponential_decay(x, amplitude, offset, decay_time):
     return amplitude * np.exp(-x / decay_time) + offset
 
 
-def _radial_gaussian_center(x, y, amplitude, offset, radius, center_x, center_y):
-    return amplitude * np.exp(-((x - center_x) ** 2 + (y - center_y) ** 2) / radius**2) + offset
+def _radial_gaussian_center(
+    x,
+    y,
+    amplitude,
+    offset,
+    one_over_e_radius,
+    center_x,
+    center_y,
+):
+    squared_radius = (x - center_x) ** 2 + (y - center_y) ** 2
+    return amplitude * np.exp(-squared_radius / one_over_e_radius**2) + offset
 
 
-def _init_lorentzian(x: np.ndarray, y: np.ndarray) -> ModelInitialization:
+def _init_lorentzian(x: np.ndarray, y: np.ndarray) -> tuple[tuple[float, ...], ...]:
     width = _span(x) / 4.0
     y_range = _span(y)
     low_y, high_y = float(np.min(y)), float(np.max(y))
@@ -391,14 +428,10 @@ def _init_lorentzian(x: np.ndarray, y: np.ndarray) -> ModelInitialization:
         (float(x[np.argmax(y)]), width, y_range, low_y),
         (float(x[np.argmin(y)]), width, -y_range, high_y),
     )
-    return ModelInitialization(
-        seeds,
-        (float(np.min(x)), _positive_floor(width), -10 * y_range, low_y - 10 * y_range),
-        (float(np.max(x)), width * 10, 10 * y_range, high_y + 10 * y_range),
-    )
+    return seeds
 
 
-def _init_gaussian(x: np.ndarray, y: np.ndarray) -> ModelInitialization:
+def _init_gaussian(x: np.ndarray, y: np.ndarray) -> tuple[tuple[float, ...], ...]:
     low_y, high_y = float(np.min(y)), float(np.max(y))
     amplitude = high_y - low_y or 1.0
     sigma = _span(x) / 6.0
@@ -406,15 +439,13 @@ def _init_gaussian(x: np.ndarray, y: np.ndarray) -> ModelInitialization:
         (amplitude, low_y, sigma, float(x[np.argmax(y)])),
         (-amplitude, high_y, sigma, float(x[np.argmin(y)])),
     )
-    y_range = _span(y)
-    return ModelInitialization(
-        seeds,
-        (-10 * y_range, low_y - 10 * y_range, _positive_floor(sigma), float(np.min(x))),
-        (10 * y_range, high_y + 10 * y_range, sigma * 20, float(np.max(x))),
-    )
+    return seeds
 
 
-def _init_zeeman(x: np.ndarray, y: np.ndarray) -> ModelInitialization:
+def _init_symmetric_lorentzian_doublet(
+    x: np.ndarray,
+    y: np.ndarray,
+) -> tuple[tuple[float, ...], ...]:
     from scipy.signal import find_peaks
 
     order = np.argsort(x, kind="stable")
@@ -425,7 +456,6 @@ def _init_zeeman(x: np.ndarray, y: np.ndarray) -> ModelInitialization:
     step = float(np.median(np.abs(np.diff(np.sort(np.unique(x)))))) if np.unique(x).size > 1 else 1.0
     step = step or 1.0
     seeds: list[tuple[float, ...]] = []
-    widths_seen: list[float] = []
     for sign in (1.0, -1.0):
         signed = sign * y
         peaks, properties = find_peaks(signed, width=1, prominence=y_range / 8.0)
@@ -438,7 +468,6 @@ def _init_zeeman(x: np.ndarray, y: np.ndarray) -> ModelInitialization:
         for second_raw in order:
             second = int(second_raw)
             width = width_by_peak[first]
-            widths_seen.append(width)
             seeds.append(
                 (
                     float((x[first] + x[second]) / 2.0),
@@ -454,18 +483,11 @@ def _init_zeeman(x: np.ndarray, y: np.ndarray) -> ModelInitialization:
             (float(x[np.argmax(y)]), width, y_range, float(np.min(y)), width * 2.0),
             (float(x[np.argmin(y)]), width, -y_range, float(np.max(y)), width * 2.0),
         ]
-        widths_seen.append(width)
-    width = max(widths_seen) if widths_seen else x_span / 8.0
-    low_y, high_y = float(np.min(y)), float(np.max(y))
-    return ModelInitialization(
-        tuple(seeds),
-        (float(np.min(x)), _positive_floor(width), -10 * y_range, low_y - 10 * y_range, 0.0),
-        (float(np.max(x)), width * 10, 10 * y_range, high_y + 10 * y_range, 2 * x_span),
-    )
+    return tuple(seeds)
 
 
-def _init_damped_sine(x: np.ndarray, y: np.ndarray) -> ModelInitialization:
-    amplitude = _span(y) / 2.0
+def _init_damped_sine(x: np.ndarray, y: np.ndarray) -> tuple[tuple[float, ...], ...]:
+    local_amplitude = _span(y) / 2.0
     offset = float(np.mean(y))
     x_span = _span(x)
     ordered = np.argsort(x, kind="stable")
@@ -486,46 +508,39 @@ def _init_damped_sine(x: np.ndarray, y: np.ndarray) -> ModelInitialization:
     else:
         frequency = 1.0 / x_span
     frequency = max(abs(frequency), _positive_floor(1.0 / x_span))
-    seeds = (
-        (amplitude, offset, frequency, x_span, np.pi / 2.0),
-        (-amplitude, offset, frequency, x_span, np.pi / 2.0),
+    reference = float(sorted_x[0])
+    amplitude = max(
+        local_amplitude * _safe_exp(reference / x_span),
+        _positive_floor(local_amplitude),
     )
-    y_range = _span(y)
-    return ModelInitialization(
-        seeds,
+    seeds = tuple(
         (
-            -5 * abs(amplitude or 1.0),
-            offset - 2 * y_range,
-            _positive_floor(frequency),
-            _positive_floor(x_span),
-            -np.pi,
-        ),
-        (
-            5 * abs(amplitude or 1.0),
-            offset + 2 * y_range,
-            frequency * 10,
-            x_span * 20,
-            2 * np.pi,
-        ),
+            amplitude,
+            offset,
+            frequency,
+            x_span,
+            _principal_phase(local_phase - 2.0 * np.pi * frequency * reference),
+        )
+        for local_phase in (-np.pi / 2.0, 0.0, np.pi / 2.0)
     )
+    return seeds
 
 
-def _init_exponential(x: np.ndarray, y: np.ndarray) -> ModelInitialization:
+def _init_exponential(x: np.ndarray, y: np.ndarray) -> tuple[tuple[float, ...], ...]:
     y_range = _span(y)
     offset = float(np.mean(y))
     decay_time = _span(x) / 2.0
-    return ModelInitialization(
-        ((y_range, offset, decay_time), (-y_range, offset, decay_time)),
-        (-4 * y_range, offset - y_range, _positive_floor(decay_time)),
-        (4 * y_range, offset + y_range, decay_time * 10),
-    )
+    amplitude = y_range * _safe_exp(float(np.min(x)) / decay_time)
+    return ((amplitude, offset, decay_time), (-amplitude, offset, decay_time))
 
 
-def _init_center(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> ModelInitialization:
+def _init_center(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+) -> tuple[tuple[float, ...], ...]:
     offset = float(np.median(z))
-    z_range = _span(z)
     seeds: list[tuple[float, ...]] = []
-    radii: list[float] = []
     for sign in (1.0, -1.0):
         weights = np.clip(sign * (z - offset), 0.0, None)
         total = float(np.sum(weights))
@@ -533,48 +548,29 @@ def _init_center(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> ModelInitializa
             continue
         center_x = float(np.sum(weights * x) / total)
         center_y = float(np.sum(weights * y) / total)
-        radius = float(
+        one_over_e_radius = float(
             np.sqrt(
                 np.sum(weights * ((x - center_x) ** 2 + (y - center_y) ** 2))
                 / total
             )
         )
-        radius = radius or 1.0
+        one_over_e_radius = one_over_e_radius or 1.0
         amplitude = (
             float(np.max(z) - offset)
             if sign > 0
             else float(np.min(z) - offset)
         )
-        seeds.append((amplitude, offset, radius, center_x, center_y))
-        radii.append(radius)
+        seeds.append((amplitude, offset, one_over_e_radius, center_x, center_y))
     if not seeds:
         raise ValueError("radial center fit requires non-flat contrast")
-    radius_scale = max(radii)
-    return ModelInitialization(
-        tuple(seeds),
-        (
-            -5 * z_range,
-            float(np.min(z)) - z_range,
-            _positive_floor(radius_scale),
-            float(np.min(x)),
-            float(np.min(y)),
-        ),
-        (
-            5 * z_range,
-            float(np.max(z)) + z_range,
-            radius_scale * 20,
-            float(np.max(x)),
-            float(np.max(y)),
-        ),
-    )
+    return tuple(seeds)
 
 
 __all__ = [
-    "FitFamily",
     "FitAxisRequirement",
     "FitModelDefinition",
+    "FitParameterDomain",
     "FitParameterDefinition",
-    "ModelInitialization",
     "ParameterUnitRelation",
     "evaluate_fit_model",
     "fit_model_catalog",

@@ -9,7 +9,7 @@ import math
 from numbers import Integral
 import numpy as np
 
-from zlc_storage.canonical import canonical_digest
+from zlc_storage.canonical import canonical_digest, canonical_text, sha256_text
 
 from ._arrays import canonical_dtype, immutable_array
 from .axis import AxisId, AxisSpec
@@ -182,12 +182,8 @@ class TransformedSchema:
             raise ValueError("validity axis is absent from transformed data axes") from exc
         if validity_positions != tuple(sorted(validity_positions)):
             raise ValueError("validity axes must follow transformed data-axis order")
-        if self.value_unit is not None and (
-            not isinstance(self.value_unit, str)
-            or not self.value_unit
-            or self.value_unit.strip() != self.value_unit
-        ):
-            raise ValueError("value_unit must be non-empty text or None")
+        if self.value_unit is not None:
+            canonical_text(self.value_unit, "value_unit")
         object.__setattr__(self, "cell_axes", cell_axes)
         object.__setattr__(self, "data_axes", data_axes)
         object.__setattr__(self, "validity_axis_ids", validity_axis_ids)
@@ -242,7 +238,7 @@ class TransformRecord:
             ("input_schema_fingerprint", self.input_schema_fingerprint),
             ("output_schema_fingerprint", self.output_schema_fingerprint),
         ):
-            _require_digest(value, field)
+            sha256_text(value, field)
         for field, value in (
             ("input_present_cells", self.input_present_cells),
             ("output_present_cells", self.output_present_cells),
@@ -266,7 +262,7 @@ class TransformedData:
     def __post_init__(self) -> None:
         if not isinstance(self.source_ref, DatasetRevisionRef):
             raise TypeError("source_ref must be DatasetRevisionRef")
-        _require_digest(self.transform_digest, "transform_digest")
+        sha256_text(self.transform_digest, "transform_digest")
         if not isinstance(self.transform_revision, TransformRevision):
             raise TypeError("transform_revision must be TransformRevision")
         if not isinstance(self.transform_origin, TransformOrigin):
@@ -308,7 +304,7 @@ class PreviewTransformedData:
             raise TypeError("source_block_id must be BlockId")
         if not isinstance(self.source_revision, DatasetRevision):
             raise TypeError("source_revision must be DatasetRevision")
-        _require_digest(self.source_schema_fingerprint, "source_schema_fingerprint")
+        sha256_text(self.source_schema_fingerprint, "source_schema_fingerprint")
         if not isinstance(self.schema, TransformedSchema):
             raise TypeError("schema must be TransformedSchema")
         records = tuple(self.records)
@@ -336,9 +332,9 @@ class CommittedTransform:
     transform_digest: str
 
     def __post_init__(self) -> None:
-        _require_digest(self.input_schema_fingerprint, "input_schema_fingerprint")
-        _require_digest(self.output_schema_fingerprint, "output_schema_fingerprint")
-        _require_digest(self.transform_digest, "transform_digest")
+        sha256_text(self.input_schema_fingerprint, "input_schema_fingerprint")
+        sha256_text(self.output_schema_fingerprint, "output_schema_fingerprint")
+        sha256_text(self.transform_digest, "transform_digest")
         if not isinstance(self.revision, TransformRevision):
             raise TypeError("revision must be TransformRevision")
         if not isinstance(self.origin, TransformOrigin):
@@ -1233,15 +1229,6 @@ def _layout_from_mapping(
     mapping: tuple[tuple[int, ...], ...],
 ) -> AxisLayout:
     return AxisLayout.from_mapping(logical_shape, mapping)
-
-
-def _require_digest(value: str, field: str) -> None:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
 
 
 __all__ = [

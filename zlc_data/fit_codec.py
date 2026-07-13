@@ -18,14 +18,13 @@ from zlc_storage.canonical import (
 from .axis import AxisId
 from .codec import TypedCodecError, axis_from_tree, axis_layout_from_tree, axis_layout_to_tree, axis_to_tree
 from .fit_contract import (
+    FitAcceptance,
     FitBatchStatus,
-    FitCoordinateSource,
     FitNumericPolicy,
     FitParameterConstraint,
     FitResultBatch,
     FitSpec,
 )
-from .fit_model import FitParameterDefinition, ParameterUnitRelation
 from .transform_codec import committed_transform_from_tree, committed_transform_to_tree
 from .value import BlockId, DatasetRevision, DatasetRevisionRef, StreamGenerationId
 
@@ -47,9 +46,10 @@ def fit_spec_to_tree(spec: FitSpec) -> dict[str, Any]:
         "fit_axis_ids": [axis_id.value for axis_id in spec.fit_axis_ids],
         "batch_axis_ids": [axis_id.value for axis_id in spec.batch_axis_ids],
         "model_id": spec.model_id,
-        "model_version": spec.model_version,
         "constraints": [_constraint_to_tree(item) for item in spec.constraints],
         "numeric_policy": _numeric_policy_to_tree(spec.numeric_policy),
+        "solver_contract_id": spec.solver_contract_id,
+        "initializer_id": spec.initializer_id,
     }
 
 
@@ -63,9 +63,10 @@ def fit_spec_from_tree(tree: Any) -> FitSpec:
             "fit_axis_ids",
             "batch_axis_ids",
             "model_id",
-            "model_version",
             "constraints",
             "numeric_policy",
+            "solver_contract_id",
+            "initializer_id",
         },
         FIT_SPEC_SCHEMA,
     )
@@ -76,14 +77,21 @@ def fit_spec_from_tree(tree: Any) -> FitSpec:
         raise ValueError("FitSpec axes and constraints must be lists")
     transform = data["committed_transform"]
     return FitSpec(
-        _text(data["input_schema_fingerprint"], "input_schema_fingerprint"),
-        None if transform is None else committed_transform_from_tree(transform),
-        tuple(AxisId(_text(value, "fit_axis_id")) for value in fit_axes),
-        tuple(AxisId(_text(value, "batch_axis_id")) for value in batch_axes),
-        _text(data["model_id"], "model_id"),
-        _integer(data["model_version"], "model_version"),
-        tuple(_constraint_from_tree(value) for value in constraints),
-        _numeric_policy_from_tree(data["numeric_policy"]),
+        input_schema_fingerprint=_text(
+            data["input_schema_fingerprint"], "input_schema_fingerprint"
+        ),
+        committed_transform=(
+            None if transform is None else committed_transform_from_tree(transform)
+        ),
+        fit_axis_ids=tuple(AxisId(_text(value, "fit_axis_id")) for value in fit_axes),
+        batch_axis_ids=tuple(
+            AxisId(_text(value, "batch_axis_id")) for value in batch_axes
+        ),
+        model_id=_text(data["model_id"], "model_id"),
+        constraints=tuple(_constraint_from_tree(value) for value in constraints),
+        numeric_policy=_numeric_policy_from_tree(data["numeric_policy"]),
+        solver_contract_id=_text(data["solver_contract_id"], "solver_contract_id"),
+        initializer_id=_text(data["initializer_id"], "initializer_id"),
     )
 
 
@@ -104,30 +112,25 @@ def fit_result_batch_to_tree(result: FitResultBatch) -> dict[str, Any]:
         "schema": FIT_RESULT_BATCH_SCHEMA,
         "source_ref": _revision_ref_to_tree(result.source_ref),
         "fit_spec": fit_spec_to_tree(result.spec),
-        "effective_schema_fingerprint": result.effective_schema_fingerprint,
         "fit_axis_specs": [axis_to_tree(axis) for axis in result.fit_axis_specs],
-        "coordinate_sources": [value.value for value in result.coordinate_sources],
         "batch_axis_specs": [axis_to_tree(axis) for axis in result.batch_axis_specs],
         "batch_layout": axis_layout_to_tree(result.batch_layout),
         "value_unit": result.value_unit,
-        "parameter_definitions": [_parameter_definition_to_tree(value) for value in result.parameter_definitions],
-        "parameter_units": list(result.parameter_units),
         "parameter_values": result.parameter_values,
         "covariance": result.covariance,
         "covariance_valid": result.covariance_valid,
         "statuses": [value.value for value in result.statuses],
         "errors": list(result.errors),
+        "acceptances": [value.value for value in result.acceptances],
+        "acceptance_reasons": list(result.acceptance_reasons),
         "present_observation_counts": result.present_observation_counts,
         "valid_observation_counts": result.valid_observation_counts,
         "used_observation_counts": result.used_observation_counts,
         "evaluation_counts": result.evaluation_counts,
         "residual_sum_squares": result.residual_sum_squares,
-        "rmse": result.rmse,
         "r_squared": result.r_squared,
         "r_squared_valid": result.r_squared_valid,
-        "solver_contract_id": result.solver_contract_id,
         "scipy_version": result.scipy_version,
-        "initializer_id": result.initializer_id,
     }
 
 
@@ -136,40 +139,34 @@ def fit_result_batch_from_tree(tree: Any) -> FitResultBatch:
         "schema",
         "source_ref",
         "fit_spec",
-        "effective_schema_fingerprint",
         "fit_axis_specs",
-        "coordinate_sources",
         "batch_axis_specs",
         "batch_layout",
         "value_unit",
-        "parameter_definitions",
-        "parameter_units",
         "parameter_values",
         "covariance",
         "covariance_valid",
         "statuses",
         "errors",
+        "acceptances",
+        "acceptance_reasons",
         "present_observation_counts",
         "valid_observation_counts",
         "used_observation_counts",
         "evaluation_counts",
         "residual_sum_squares",
-        "rmse",
         "r_squared",
         "r_squared_valid",
-        "solver_contract_id",
         "scipy_version",
-        "initializer_id",
     }
     data = _exact_map(tree, fields, FIT_RESULT_BATCH_SCHEMA)
     for field in (
         "fit_axis_specs",
-        "coordinate_sources",
         "batch_axis_specs",
-        "parameter_definitions",
-        "parameter_units",
         "statuses",
         "errors",
+        "acceptances",
+        "acceptance_reasons",
     ):
         if not isinstance(data[field], list):
             raise ValueError(f"FitResultBatch {field} must be a list")
@@ -182,35 +179,26 @@ def fit_result_batch_from_tree(tree: Any) -> FitResultBatch:
         "used_observation_counts",
         "evaluation_counts",
         "residual_sum_squares",
-        "rmse",
         "r_squared",
         "r_squared_valid",
     )
     if any(not isinstance(data[field], np.ndarray) for field in arrays):
         raise ValueError("FitResultBatch numeric fields must be ndarrays")
     errors = tuple(None if value is None else _text(value, "fit error") for value in data["errors"])
+    acceptance_reasons = tuple(
+        None if value is None else _text(value, "fit acceptance reason")
+        for value in data["acceptance_reasons"]
+    )
     value_unit = data["value_unit"]
     if value_unit is not None:
         value_unit = _text(value_unit, "value_unit")
-    parameter_units = tuple(_text(value, "parameter unit") for value in data["parameter_units"])
     return FitResultBatch(
         source_ref=_revision_ref_from_tree(data["source_ref"]),
         spec=fit_spec_from_tree(data["fit_spec"]),
-        effective_schema_fingerprint=_text(
-            data["effective_schema_fingerprint"], "effective_schema_fingerprint"
-        ),
         fit_axis_specs=tuple(axis_from_tree(value) for value in data["fit_axis_specs"]),
-        coordinate_sources=tuple(
-            FitCoordinateSource(_text(value, "coordinate_source"))
-            for value in data["coordinate_sources"]
-        ),
         batch_axis_specs=tuple(axis_from_tree(value) for value in data["batch_axis_specs"]),
         batch_layout=axis_layout_from_tree(data["batch_layout"]),
         value_unit=value_unit,
-        parameter_definitions=tuple(
-            _parameter_definition_from_tree(value) for value in data["parameter_definitions"]
-        ),
-        parameter_units=parameter_units,
         parameter_values=data["parameter_values"],
         covariance=data["covariance"],
         covariance_valid=data["covariance_valid"],
@@ -218,17 +206,19 @@ def fit_result_batch_from_tree(tree: Any) -> FitResultBatch:
             FitBatchStatus(_text(value, "fit_status")) for value in data["statuses"]
         ),
         errors=errors,
+        acceptances=tuple(
+            FitAcceptance(_text(value, "fit_acceptance"))
+            for value in data["acceptances"]
+        ),
+        acceptance_reasons=acceptance_reasons,
         present_observation_counts=data["present_observation_counts"],
         valid_observation_counts=data["valid_observation_counts"],
         used_observation_counts=data["used_observation_counts"],
         evaluation_counts=data["evaluation_counts"],
         residual_sum_squares=data["residual_sum_squares"],
-        rmse=data["rmse"],
         r_squared=data["r_squared"],
         r_squared_valid=data["r_squared_valid"],
-        solver_contract_id=_text(data["solver_contract_id"], "solver_contract_id"),
         scipy_version=_text(data["scipy_version"], "scipy_version"),
-        initializer_id=_text(data["initializer_id"], "initializer_id"),
     )
 
 
@@ -253,14 +243,18 @@ def _constraint_to_tree(value: FitParameterConstraint) -> dict[str, Any]:
 
 
 def _constraint_from_tree(tree: Any) -> FitParameterConstraint:
-    if not isinstance(tree, dict) or set(tree) != {"parameter_name", "initial", "lower", "upper", "fixed"}:
-        raise ValueError("invalid FitParameterConstraint fields")
+    data = _exact_map(
+        tree,
+        {"parameter_name", "initial", "lower", "upper", "fixed"},
+        "FitParameterConstraint",
+        discriminator=None,
+    )
     return FitParameterConstraint(
-        _text(tree["parameter_name"], "parameter_name"),
-        _optional_real(tree["initial"], "initial"),
-        _optional_real(tree["lower"], "lower"),
-        _optional_real(tree["upper"], "upper"),
-        _optional_real(tree["fixed"], "fixed"),
+        _text(data["parameter_name"], "parameter_name"),
+        _optional_real(data["initial"], "initial"),
+        _optional_real(data["lower"], "lower"),
+        _optional_real(data["upper"], "upper"),
+        _optional_real(data["fixed"], "fixed"),
     )
 
 
@@ -271,6 +265,7 @@ def _numeric_policy_to_tree(value: FitNumericPolicy) -> dict[str, Any]:
         "max_total_seconds": value.max_total_seconds,
         "max_batch_cells": value.max_batch_cells,
         "sample_budget_per_batch": value.sample_budget_per_batch,
+        "max_packed_observations": value.max_packed_observations,
         "covariance_rcond": value.covariance_rcond,
     }
 
@@ -282,30 +277,29 @@ def _numeric_policy_from_tree(tree: Any) -> FitNumericPolicy:
         "max_total_seconds",
         "max_batch_cells",
         "sample_budget_per_batch",
+        "max_packed_observations",
         "covariance_rcond",
     }
-    if not isinstance(tree, dict) or set(tree) != fields:
-        raise ValueError("invalid FitNumericPolicy fields")
-    return FitNumericPolicy(
-        _integer(tree["max_evaluations"], "max_evaluations"),
-        _real(tree["max_seconds_per_batch"], "max_seconds_per_batch"),
-        _real(tree["max_total_seconds"], "max_total_seconds"),
-        _integer(tree["max_batch_cells"], "max_batch_cells"),
-        _integer(tree["sample_budget_per_batch"], "sample_budget_per_batch"),
-        _real(tree["covariance_rcond"], "covariance_rcond"),
+    data = _exact_map(
+        tree,
+        fields,
+        "FitNumericPolicy",
+        discriminator=None,
     )
-
-
-def _parameter_definition_to_tree(value: FitParameterDefinition) -> dict[str, Any]:
-    return {"name": value.name, "unit_relation": value.unit_relation.value}
-
-
-def _parameter_definition_from_tree(tree: Any) -> FitParameterDefinition:
-    if not isinstance(tree, dict) or set(tree) != {"name", "unit_relation"}:
-        raise ValueError("invalid FitParameterDefinition fields")
-    return FitParameterDefinition(
-        _text(tree["name"], "parameter name"),
-        ParameterUnitRelation(_text(tree["unit_relation"], "parameter unit relation")),
+    return FitNumericPolicy(
+        max_evaluations=_integer(data["max_evaluations"], "max_evaluations"),
+        max_seconds_per_batch=_real(
+            data["max_seconds_per_batch"], "max_seconds_per_batch"
+        ),
+        max_total_seconds=_real(data["max_total_seconds"], "max_total_seconds"),
+        max_batch_cells=_integer(data["max_batch_cells"], "max_batch_cells"),
+        sample_budget_per_batch=_integer(
+            data["sample_budget_per_batch"], "sample_budget_per_batch"
+        ),
+        max_packed_observations=_integer(
+            data["max_packed_observations"], "max_packed_observations"
+        ),
+        covariance_rcond=_real(data["covariance_rcond"], "covariance_rcond"),
     )
 
 

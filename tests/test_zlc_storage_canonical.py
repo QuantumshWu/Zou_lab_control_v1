@@ -57,6 +57,21 @@ def test_exact_mapping_owns_field_and_discriminator_admission():
     with pytest.raises(ValueError, match="expected schema"):
         exact_mapping(value, {"schema", "payload"}, "other-format")
 
+    nested = {"name": "center", "fixed": None}
+    assert exact_mapping(
+        nested,
+        {"name", "fixed"},
+        "nested constraint",
+        discriminator=None,
+    ) is nested
+    with pytest.raises(ValueError, match="exactly"):
+        exact_mapping(
+            {**nested, "extra": 1},
+            {"name", "fixed"},
+            "nested constraint",
+            discriminator=None,
+        )
+
 
 def test_mapping_order_and_sequence_container_do_not_change_bytes():
     left = {"unicode": "原子", "items": (1, True, None), "z": -0.0}
