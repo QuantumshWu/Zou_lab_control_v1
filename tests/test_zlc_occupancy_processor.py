@@ -68,12 +68,11 @@ from zlc_neutral_atom.readout.contracts import (
 from zlc_neutral_atom.readout.occupancy import (
     BoundOccupancyStreamProcessor,
     OccupancyDatasetEventAdapter,
-    OccupancyDatasetField,
     OccupancyDatasetMetadata,
     OccupancyModelSelection,
     OccupancySample,
     OccupancySampleContract,
-    OccupancyStreamProcessorBindRequest,
+    OccupancyStreamProcessorSpec,
     bind_occupancy_stream_processor,
     resolve_occupancy_model_selection,
 )
@@ -359,20 +358,18 @@ def _bind(
     session,
     *,
     selection: OccupancyModelSelection | None = None,
-    output_field: OccupancyDatasetField = OccupancyDatasetField.OCCUPIED,
 ):
     if selection is None:
         selection = resolve_occupancy_model_selection(trusted.admitted)
     return bind_occupancy_stream_processor(
-        OccupancyStreamProcessorBindRequest(
-            trusted.admitted,
-            session.processor_input_binding,
-            ReadoutBindingKey("readout"),
-            selection,
-            StreamId(f"occupancy.output.{output_field.value.lower()}"),
-            f"occupancy-{output_field.value.lower()}",
-            output_field,
-        )
+        OccupancyStreamProcessorSpec(
+            calibration=trusted.admitted,
+            readout_binding=ReadoutBindingKey("readout"),
+            model=selection,
+            output_stream_id=StreamId("occupancy.output"),
+            output_source_id="occupancy",
+        ),
+        session.processor_input_binding,
     )
 
 
@@ -448,13 +445,12 @@ def test_bind_requires_admitted_calibration_and_freezes_default_model(trusted_ca
 
     artifact = trusted_calibration.admitted.artifact
     with pytest.raises(TypeError, match="AdmittedCalibration"):
-        OccupancyStreamProcessorBindRequest(
-            artifact,
-            session.processor_input_binding,
-            ReadoutBindingKey("readout"),
-            selection,
-            StreamId("bad.raw-artifact"),
-            "bad-raw-artifact",
+        OccupancyStreamProcessorSpec(
+            calibration=artifact,
+            readout_binding=ReadoutBindingKey("readout"),
+            model=selection,
+            output_stream_id=StreamId("bad.raw-artifact"),
+            output_source_id="bad-raw-artifact",
         )
     with pytest.raises(TypeError, match="AdmittedCalibration"):
         resolve_occupancy_model_selection(trusted_calibration.calibration_ref)
@@ -478,15 +474,45 @@ def test_bind_requires_admitted_calibration_and_freezes_default_model(trusted_ca
     )
     with pytest.raises(PermissionError, match="authority is invalid"):
         bind_occupancy_stream_processor(
-            OccupancyStreamProcessorBindRequest(
-                forged,
-                session.processor_input_binding,
-                ReadoutBindingKey("readout"),
-                selection,
-                StreamId("bad-forged-admission"),
-                "bad-forged-admission",
-            )
+            OccupancyStreamProcessorSpec(
+                calibration=forged,
+                readout_binding=ReadoutBindingKey("readout"),
+                model=selection,
+                output_stream_id=StreamId("bad-forged-admission"),
+                output_source_id="bad-forged-admission",
+            ),
+            session.processor_input_binding,
         )
+
+
+def test_reusable_processor_spec_binds_each_capture_session_generation(
+    trusted_calibration,
+):
+    selection = resolve_occupancy_model_selection(trusted_calibration.admitted)
+    spec = OccupancyStreamProcessorSpec(
+        calibration=trusted_calibration.admitted,
+        readout_binding=ReadoutBindingKey("readout"),
+        model=selection,
+        output_stream_id=StreamId("occupancy.reusable-output"),
+        output_source_id="occupancy-reusable",
+    )
+    first_session = _source_session(trusted_calibration, points=1)
+    second_session = _source_session(trusted_calibration, points=1)
+
+    first = bind_occupancy_stream_processor(
+        spec,
+        first_session.processor_input_binding,
+    )
+    second = bind_occupancy_stream_processor(
+        spec,
+        second_session.processor_input_binding,
+    )
+
+    assert first.model_selection == second.model_selection == selection
+    assert first.output_payload_contract.fingerprint == (
+        second.output_payload_contract.fingerprint
+    )
+    assert first.fingerprint != second.fingerprint
 
 
 def test_bind_rejects_mixed_physical_readout_events(trusted_calibration):
@@ -507,14 +533,14 @@ def test_bind_rejects_binding_model_version_and_resource_drift(trusted_calibrati
     selection = resolve_occupancy_model_selection(trusted_calibration.admitted)
     with pytest.raises(ValueError, match="another readout binding"):
         bind_occupancy_stream_processor(
-            OccupancyStreamProcessorBindRequest(
-                trusted_calibration.admitted,
-                session.processor_input_binding,
-                ReadoutBindingKey("another-readout"),
-                selection,
-                StreamId("occupancy.wrong-binding"),
-                "occupancy-wrong-binding",
-            )
+            OccupancyStreamProcessorSpec(
+                calibration=trusted_calibration.admitted,
+                readout_binding=ReadoutBindingKey("another-readout"),
+                model=selection,
+                output_stream_id=StreamId("occupancy.wrong-binding"),
+                output_source_id="occupancy-wrong-binding",
+            ),
+            session.processor_input_binding,
         )
     with pytest.raises(ValueError, match="version/kind"):
         _bind(
@@ -528,15 +554,15 @@ def test_bind_rejects_binding_model_version_and_resource_drift(trusted_calibrati
     )
     with pytest.raises(CalibrationResourceExceeded, match="site count"):
         bind_occupancy_stream_processor(
-            OccupancyStreamProcessorBindRequest(
-                trusted_calibration.admitted,
-                session.processor_input_binding,
-                ReadoutBindingKey("readout"),
-                selection,
-                StreamId("occupancy.resource-reject"),
-                "occupancy-resource-reject",
+            OccupancyStreamProcessorSpec(
+                calibration=trusted_calibration.admitted,
+                readout_binding=ReadoutBindingKey("readout"),
+                model=selection,
+                output_stream_id=StreamId("occupancy.resource-reject"),
+                output_source_id="occupancy-resource-reject",
                 resource_policy=restrictive,
-            )
+            ),
+            session.processor_input_binding,
         )
 
 
@@ -581,6 +607,13 @@ def test_occupancy_payload_digest_binds_both_fields_and_physical_metadata(
     output = bound.evaluate(_sample(session, _frame(0, 1, 0), 0))
     contract = bound.output_payload_contract
     baseline = contract.digest(output)
+    assert contract.digest_components(
+        output.occupied.values,
+        output.occupied.validity,
+        output.counts.values,
+        output.counts.validity,
+        output.metadata,
+    ) == baseline
     valid_indices = np.flatnonzero(output.occupied.validity.mask)
     assert valid_indices.size
     site = int(valid_indices[0])
@@ -618,53 +651,48 @@ def test_occupancy_payload_digest_binds_both_fields_and_physical_metadata(
     assert all(contract.digest(variant) != baseline for variant in variants)
 
 
-def test_field_adapters_preserve_companion_value_and_bind_projection_identity(
+def test_dataset_adapter_has_one_canonical_counts_projection_and_occupied_metadata(
     trusted_calibration,
 ):
     session = _source_session(trusted_calibration, points=1)
-    occupied_bound = _bind(trusted_calibration, session)
-    counts_session = _source_session(trusted_calibration, points=1)
-    counts_bound = _bind(
-        trusted_calibration,
-        counts_session,
-        output_field=OccupancyDatasetField.COUNTS,
-    )
-    assert occupied_bound.output_schema.cell_schema.dtype == np.dtype(bool)
-    assert counts_bound.output_schema.cell_schema.dtype == np.dtype("<f8")
-    assert (
-        occupied_bound.output_edge.operator_fingerprint
-        != counts_bound.output_edge.operator_fingerprint
-    )
-    assert (
-        occupied_bound.output_edge.metadata_contract_fingerprint
-        != counts_bound.output_edge.metadata_contract_fingerprint
-    )
-    assert occupied_bound.fingerprint != counts_bound.fingerprint
-    assert occupied_bound.output_payload_contract is occupied_bound.output_edge.payload_contract
-    assert counts_bound.output_payload_contract is counts_bound.output_edge.payload_contract
+    bound = _bind(trusted_calibration, session)
+    assert bound.output_schema.cell_schema.dtype == np.dtype("<f8")
+    assert bound.output_payload_contract is bound.output_edge.payload_contract
 
     sample = _sample(session, _frame(0, 1, 0), 0)
-    output = occupied_bound.evaluate(sample)
-    metadata = occupied_bound.output_edge.metadata_contract.snapshot(output)
+    output = bound.evaluate(sample)
+    assert bound.output_adapter.value(output) is output.counts
+    metadata = bound.output_edge.metadata_contract.snapshot(output)
     assert isinstance(metadata, OccupancyDatasetMetadata)
-    assert metadata.companion_field is OccupancyDatasetField.COUNTS
-    assert metadata.companion_value is output.counts
+    assert metadata.occupied is output.occupied
     assert metadata.source_metadata is output.metadata
-    digest = occupied_bound.output_edge.metadata_contract.digest(metadata)
-    changed_counts = Value(
-        output.counts.values + 1.0,
-        output.counts.validity,
-        output.counts.schema,
+    digest = bound.output_edge.metadata_contract.digest(metadata)
+    assert bound.output_edge.metadata_contract.digest_components(
+        output.occupied.values,
+        output.occupied.validity,
+        output.metadata,
+    ) == digest
+    changed_occupied = Value(
+        ~output.occupied.values,
+        output.occupied.validity,
+        output.occupied.schema,
     )
     changed = OccupancyDatasetMetadata(
-        OccupancyDatasetField.COUNTS,
-        changed_counts,
+        changed_occupied,
         output.metadata,
     )
-    assert occupied_bound.output_edge.metadata_contract.digest(changed) != digest
+    assert bound.output_edge.metadata_contract.digest(changed) != digest
+    scalar_validity_metadata = OccupancyDatasetMetadata(
+        Value(output.occupied.values, VALID, output.occupied.schema),
+        output.metadata,
+    )
+    with pytest.raises(TypeError, match="ComponentValidity"):
+        bound.output_edge.metadata_contract.validate(scalar_validity_metadata)
+    with pytest.raises(TypeError, match="ComponentValidity"):
+        bound.output_edge.metadata_contract.digest(scalar_validity_metadata)
 
 
-def test_bound_authority_is_sealed_and_rejects_cross_field_config_drift(
+def test_bound_authority_is_sealed_and_rejects_config_drift(
     trusted_calibration,
 ):
     session = _source_session(trusted_calibration, points=1)
@@ -679,7 +707,6 @@ def test_bound_authority_is_sealed_and_rejects_cross_field_config_drift(
             processor=processor,
             capture_input=session.processor_input_binding,
             output_edge=bundle.output_edge,
-            selected_field=OccupancyDatasetField.OCCUPIED,
         )
     with pytest.raises(TypeError, match="final"):
         type("ForgedOccupancyBinding", (BoundOccupancyStreamProcessor,), {})
@@ -818,7 +845,7 @@ def test_raw_generic_worker_cannot_bypass_capture_session_reservation_authority(
         clone_reservation.release()
 
 
-def test_raw_generic_worker_cannot_substitute_another_authoritative_projection(
+def test_raw_generic_worker_cannot_substitute_an_equivalent_cloned_output_edge(
     trusted_calibration,
 ):
     session = _source_session(trusted_calibration, points=1)
@@ -827,12 +854,9 @@ def test_raw_generic_worker_cannot_substitute_another_authoritative_projection(
     processor = object.__getattribute__(bundle, "_processor")
     input_reservation = session.reserve_exact()
     input_cursor = input_reservation.activate()
-    wrong_adapter = OccupancyDatasetEventAdapter(
-        bundle.output_payload_contract,
-        OccupancyDatasetField.COUNTS,
-    )
+    wrong_adapter = OccupancyDatasetEventAdapter(bundle.output_payload_contract)
     wrong_edge = FrozenDatasetEdge(
-        replace(bundle.output_schema, cell_schema=wrong_adapter.value_schema),
+        bundle.output_schema,
         wrong_adapter,
         bundle.output_edge.expected_cells,
     )
@@ -948,7 +972,7 @@ def test_occupancy_worker_failure_releases_both_exact_reservations(
     assert output_reservation.state is ReservationState.RELEASED
 
 
-def test_real_exact_worker_materializes_r_p_site_without_losing_companion_data(
+def test_real_exact_worker_materializes_both_fields_by_frozen_cell_schedule(
     trusted_calibration,
 ):
     repeats = 2
@@ -1103,6 +1127,7 @@ def test_real_exact_worker_materializes_r_p_site_without_losing_companion_data(
     assert sealed.block.schema.repeat_axis == contract.dataset_schema.repeat_axis
     assert sealed.block.schema.point_axes == contract.dataset_schema.point_axes
     assert sealed.block.schema.point_layout == layout
+    assert sealed.block.schema.cell_schema.dtype == np.dtype("<f8")
     assert sealed.block.values.shape == (repeats, layout.storage_size, 4)
     assert sealed.block.validity.mask.shape == (repeats, layout.storage_size, 4)
     assert all(
@@ -1110,7 +1135,7 @@ def test_real_exact_worker_materializes_r_p_site_without_losing_companion_data(
         for metadata in sealed.event_metadata
     )
     assert all(
-        metadata.companion_value.values.shape == (4,)
+        metadata.occupied.values.shape == (4,)
         and metadata.source_metadata.correlation_id
         for metadata in sealed.event_metadata
     )
@@ -1121,9 +1146,34 @@ def test_real_exact_worker_materializes_r_p_site_without_losing_companion_data(
     keys = contract.expected_cells
     assert [envelope.join_key for envelope in envelopes] == list(keys)
     assert all(isinstance(envelope.payload, OccupancySample) for envelope in envelopes)
-    for index, envelope in enumerate(envelopes):
-        metadata = sealed.event_metadata[index]
+    for key, envelope, metadata in zip(
+        keys,
+        envelopes,
+        sealed.event_metadata,
+        strict=True,
+    ):
         assert isinstance(metadata, OccupancyDatasetMetadata)
+        payload = envelope.payload
+        assert isinstance(payload, OccupancySample)
+        np.testing.assert_array_equal(
+            sealed.block.values[key.repeat_index, key.point_storage_index],
+            payload.counts.values,
+        )
+        np.testing.assert_array_equal(
+            sealed.block.validity.mask[
+                key.repeat_index,
+                key.point_storage_index,
+            ],
+            payload.counts.validity.mask,
+        )
+        np.testing.assert_array_equal(
+            metadata.occupied.values,
+            payload.occupied.values,
+        )
+        np.testing.assert_array_equal(
+            metadata.occupied.validity.mask,
+            payload.occupied.validity.mask,
+        )
         assert envelope.trace.source_id == bundle.output_source_id
         assert envelope.trace.correlation_id == metadata.source_metadata.correlation_id
         assert envelope.trace.causation_refs[1] == calibration_artifact_input_ref(
@@ -1154,6 +1204,14 @@ def test_contract_rejects_divergent_validity_and_noncanonical_invalid_fillers(
     )
     with pytest.raises(ValueError, match="canonical zero"):
         contract.validate(OccupancySample(occupied, bad_counts, _metadata(0)))
+    with pytest.raises(ValueError, match="canonical zero"):
+        contract.digest_components(
+            occupied.values,
+            occupied.validity,
+            bad_counts.values,
+            bad_counts.validity,
+            _metadata(0),
+        )
     negative_zero_counts = Value(
         np.array([1.0, -0.0, 3.0, 4.0]),
         validity,
@@ -1171,6 +1229,27 @@ def test_contract_rejects_divergent_validity_and_noncanonical_invalid_fillers(
     with pytest.raises(ValueError, match="must be finite"):
         contract.validate(
             OccupancySample(occupied, nonfinite_counts, _metadata(0))
+        )
+    with pytest.raises(ValueError, match="must be finite"):
+        contract.digest_components(
+            occupied.values,
+            occupied.validity,
+            nonfinite_counts.values,
+            nonfinite_counts.validity,
+            _metadata(0),
+        )
+    bad_occupied = Value(
+        np.array([True, True, False, True]),
+        validity,
+        contract.occupied_schema,
+    )
+    with pytest.raises(ValueError, match="canonical False"):
+        contract.digest_components(
+            bad_occupied.values,
+            bad_occupied.validity,
+            np.array([1.0, 0.0, 3.0, 4.0]),
+            validity,
+            _metadata(0),
         )
     other_validity = ComponentValidity(
         (site_axis.axis_id,),
@@ -1198,6 +1277,9 @@ def test_site_axis_cannot_collide_with_capture_sampling_axes(trusted_calibration
 def test_public_processor_surface_has_no_two_stage_api():
     import zlc_neutral_atom.readout.occupancy as occupancy
 
+    assert not hasattr(occupancy, "OccupancyStreamProcessorBindRequest")
+    assert "capture_input" not in occupancy.OccupancyStreamProcessorSpec.__dataclass_fields__
+    assert "output_field" not in occupancy.OccupancyStreamProcessorSpec.__dataclass_fields__
     assert not hasattr(occupancy, "ReadoutSignalProcessorBindRequest")
     assert not hasattr(occupancy, "bind_readout_signal_processor")
     assert not hasattr(occupancy, "bind_occupancy_processor")

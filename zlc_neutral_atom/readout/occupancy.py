@@ -140,6 +140,51 @@ def _validity_equal(left: ComponentValidity, right: ComponentValidity) -> bool:
     return left.axis_ids == right.axis_ids and np.array_equal(left.mask, right.mask)
 
 
+def _validate_occupied_component_semantics(
+    values: np.ndarray,
+    validity: object,
+) -> ComponentValidity:
+    if not isinstance(validity, ComponentValidity):
+        raise TypeError("occupied requires ComponentValidity")
+    invalid = ~validity.mask
+    if np.any(np.asarray(values)[invalid]):
+        raise ValueError("invalid occupied components require canonical False fillers")
+    return validity
+
+
+def _validate_counts_component_semantics(
+    values: np.ndarray,
+    validity: object,
+) -> ComponentValidity:
+    if not isinstance(validity, ComponentValidity):
+        raise TypeError("counts requires ComponentValidity")
+    array = np.asarray(values)
+    if not np.all(np.isfinite(array)):
+        raise ValueError("occupancy counts must be finite")
+    invalid_counts = array[~validity.mask]
+    if np.any(invalid_counts != 0.0) or np.any(np.signbit(invalid_counts)):
+        raise ValueError("invalid count components require canonical zero fillers")
+    return validity
+
+
+def _validate_occupancy_component_semantics(
+    occupied_values: np.ndarray,
+    occupied_validity: object,
+    counts_values: np.ndarray,
+    counts_validity: object,
+) -> None:
+    occupied_components = _validate_occupied_component_semantics(
+        occupied_values,
+        occupied_validity,
+    )
+    counts_components = _validate_counts_component_semantics(
+        counts_values,
+        counts_validity,
+    )
+    if not _validity_equal(occupied_components, counts_components):
+        raise ValueError("occupied and counts must have identical component validity")
+
+
 @dataclass(frozen=True, eq=False)
 class OccupancySample:
     """Atomic readout result for one physical camera frame."""
@@ -243,23 +288,12 @@ class OccupancySampleContract:
         self._occupied_contract.validate(payload.occupied)
         self._counts_contract.validate(payload.counts)
         self.metadata_contract.validate(payload.metadata)
-        occupied_validity = payload.occupied.validity
-        counts_validity = payload.counts.validity
-        if not isinstance(occupied_validity, ComponentValidity) or not isinstance(
-            counts_validity,
-            ComponentValidity,
-        ):
-            raise TypeError("occupancy payload requires component validity")
-        if not _validity_equal(occupied_validity, counts_validity):
-            raise ValueError("occupancy fields have different component validity")
-        if not np.all(np.isfinite(payload.counts.values)):
-            raise ValueError("occupancy counts must be finite")
-        invalid = ~occupied_validity.mask
-        if np.any(payload.occupied.values[invalid]):
-            raise ValueError("invalid occupied components require canonical False fillers")
-        invalid_counts = payload.counts.values[invalid]
-        if np.any(invalid_counts != 0.0) or np.any(np.signbit(invalid_counts)):
-            raise ValueError("invalid count components require canonical zero fillers")
+        _validate_occupancy_component_semantics(
+            payload.occupied.values,
+            payload.occupied.validity,
+            payload.counts.values,
+            payload.counts.validity,
+        )
 
     def retained_nbytes(self, payload: OccupancySample) -> int:
         self.validate(payload)
@@ -274,12 +308,45 @@ class OccupancySampleContract:
         """Canonical identity of both fields and their physical frame metadata."""
 
         self.validate(payload)
+        return self.digest_components(
+            payload.occupied.values,
+            payload.occupied.validity,
+            payload.counts.values,
+            payload.counts.validity,
+            payload.metadata,
+        )
+
+    def digest_components(
+        self,
+        occupied_values: np.ndarray,
+        occupied_validity: ComponentValidity,
+        counts_values: np.ndarray,
+        counts_validity: ComponentValidity,
+        metadata: CameraFrameMetadata,
+    ) -> str:
+        """Digest materialized cell content through the transient payload owner."""
+
+        occupied_digest = self._occupied_contract.digest_content(
+            occupied_values,
+            occupied_validity,
+        )
+        counts_digest = self._counts_contract.digest_content(
+            counts_values,
+            counts_validity,
+        )
+        self.metadata_contract.validate(metadata)
+        _validate_occupancy_component_semantics(
+            occupied_values,
+            occupied_validity,
+            counts_values,
+            counts_validity,
+        )
         return canonical_digest(
             {
                 "schema": "zlc_neutral_atom.OccupancySampleContent/v2",
-                "occupied": self._occupied_contract.digest(payload.occupied),
-                "counts": self._counts_contract.digest(payload.counts),
-                "metadata": self.metadata_contract.digest(payload.metadata),
+                "occupied": occupied_digest,
+                "counts": counts_digest,
+                "metadata": self.metadata_contract.digest(metadata),
             }
         )
 
@@ -301,29 +368,18 @@ class OccupancyDatasetField(str, Enum):
     COUNTS = "COUNTS"
 
 
-def _opposite_field(field_value: OccupancyDatasetField) -> OccupancyDatasetField:
-    return (
-        OccupancyDatasetField.COUNTS
-        if field_value is OccupancyDatasetField.OCCUPIED
-        else OccupancyDatasetField.OCCUPIED
-    )
-
-
 @dataclass(frozen=True, eq=False)
 class OccupancyDatasetMetadata:
-    """The non-primary field plus the original physical frame metadata."""
+    """Canonical occupied field plus the original physical frame metadata."""
 
-    companion_field: OccupancyDatasetField
-    companion_value: Value
+    occupied: Value
     source_metadata: CameraFrameMetadata
 
     __hash__ = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.companion_field, OccupancyDatasetField):
-            raise TypeError("companion_field must be OccupancyDatasetField")
-        if not isinstance(self.companion_value, Value):
-            raise TypeError("companion_value must be Value")
+        if not isinstance(self.occupied, Value):
+            raise TypeError("occupied must be Value")
         if not isinstance(self.source_metadata, CameraFrameMetadata):
             raise TypeError("source_metadata must be CameraFrameMetadata")
 
@@ -331,31 +387,22 @@ class OccupancyDatasetMetadata:
 @dataclass(frozen=True)
 class OccupancyDatasetMetadataContract:
     payload_contract: OccupancySampleContract
-    selected_field: OccupancyDatasetField
-    _companion_contract: ValuePayloadContract = field(init=False, repr=False)
+    _occupied_contract: ValuePayloadContract = field(init=False, repr=False)
     _fingerprint: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.payload_contract, OccupancySampleContract):
             raise TypeError("payload_contract must be OccupancySampleContract")
-        if not isinstance(self.selected_field, OccupancyDatasetField):
-            raise TypeError("selected_field must be OccupancyDatasetField")
-        companion_schema = (
-            self.payload_contract.counts_schema
-            if self.selected_field is OccupancyDatasetField.OCCUPIED
-            else self.payload_contract.occupied_schema
-        )
-        companion_contract = ValuePayloadContract(companion_schema)
-        object.__setattr__(self, "_companion_contract", companion_contract)
+        occupied_contract = ValuePayloadContract(self.payload_contract.occupied_schema)
+        object.__setattr__(self, "_occupied_contract", occupied_contract)
         object.__setattr__(
             self,
             "_fingerprint",
             canonical_digest(
                 {
-                    "contract": "zlc_neutral_atom.OccupancyDatasetMetadata/v1",
+                    "contract": "zlc_neutral_atom.OccupancyDatasetMetadata/v2",
                     "payload": self.payload_contract.fingerprint,
-                    "selected_field": self.selected_field.value,
-                    "companion": companion_contract.fingerprint,
+                    "occupied": occupied_contract.fingerprint,
                     "source_metadata": self.payload_contract.metadata_contract.fingerprint,
                 }
             ),
@@ -369,29 +416,25 @@ class OccupancyDatasetMetadataContract:
     def max_retained_nbytes(self) -> int:
         return (
             _RECORD_CONTAINER_BYTES
-            + self._companion_contract.max_retained_nbytes
+            + self._occupied_contract.max_retained_nbytes
             + self.payload_contract.metadata_contract.max_retained_nbytes
         )
 
     def snapshot(self, payload: OccupancySample) -> OccupancyDatasetMetadata:
         self.payload_contract.validate(payload)
-        companion = (
-            payload.counts
-            if self.selected_field is OccupancyDatasetField.OCCUPIED
-            else payload.occupied
-        )
         return OccupancyDatasetMetadata(
-            _opposite_field(self.selected_field),
-            companion,
+            payload.occupied,
             payload.metadata,
         )
 
     def validate(self, metadata: object | None) -> None:
         if not isinstance(metadata, OccupancyDatasetMetadata):
             raise TypeError("metadata must be OccupancyDatasetMetadata")
-        if metadata.companion_field is not _opposite_field(self.selected_field):
-            raise ValueError("occupancy dataset metadata names the wrong companion field")
-        self._companion_contract.validate(metadata.companion_value)
+        self._occupied_contract.validate(metadata.occupied)
+        _validate_occupied_component_semantics(
+            metadata.occupied.values,
+            metadata.occupied.validity,
+        )
         self.payload_contract.metadata_contract.validate(metadata.source_metadata)
 
     def retained_nbytes(self, metadata: object | None) -> int:
@@ -399,7 +442,7 @@ class OccupancyDatasetMetadataContract:
         assert isinstance(metadata, OccupancyDatasetMetadata)
         return (
             _RECORD_CONTAINER_BYTES
-            + self._companion_contract.retained_nbytes(metadata.companion_value)
+            + self._occupied_contract.retained_nbytes(metadata.occupied)
             + self.payload_contract.metadata_contract.retained_nbytes(
                 metadata.source_metadata
             )
@@ -408,15 +451,33 @@ class OccupancyDatasetMetadataContract:
     def digest(self, metadata: object | None) -> str:
         self.validate(metadata)
         assert isinstance(metadata, OccupancyDatasetMetadata)
+        return self.digest_components(
+            metadata.occupied.values,
+            metadata.occupied.validity,
+            metadata.source_metadata,
+        )
+
+    def digest_components(
+        self,
+        occupied_values: np.ndarray,
+        occupied_validity: ComponentValidity,
+        source_metadata: CameraFrameMetadata,
+    ) -> str:
+        occupied_digest = self._occupied_contract.digest_content(
+            occupied_values,
+            occupied_validity,
+        )
+        _validate_occupied_component_semantics(
+            occupied_values,
+            occupied_validity,
+        )
+        self.payload_contract.metadata_contract.validate(source_metadata)
         return canonical_digest(
             {
-                "schema": "zlc_neutral_atom.OccupancyDatasetMetadataDigest/v1",
-                "companion_field": metadata.companion_field.value,
-                "companion_value": self._companion_contract.digest(
-                    metadata.companion_value
-                ),
+                "schema": "zlc_neutral_atom.OccupancyDatasetMetadataDigest/v2",
+                "occupied": occupied_digest,
                 "source_metadata": self.payload_contract.metadata_contract.digest(
-                    metadata.source_metadata
+                    source_metadata
                 ),
             }
         )
@@ -424,10 +485,9 @@ class OccupancyDatasetMetadataContract:
 
 @dataclass(frozen=True)
 class OccupancyDatasetEventAdapter:
-    """Explicit authoritative projection of one atomic record into a DataBlock."""
+    """Canonical counts projection; occupied remains co-sealed metadata."""
 
     payload_contract: OccupancySampleContract
-    selected_field: OccupancyDatasetField = OccupancyDatasetField.OCCUPIED
     metadata_contract: OccupancyDatasetMetadataContract = field(
         init=False,
         repr=False,
@@ -437,15 +497,10 @@ class OccupancyDatasetEventAdapter:
     def __post_init__(self) -> None:
         if not isinstance(self.payload_contract, OccupancySampleContract):
             raise TypeError("payload_contract must be OccupancySampleContract")
-        if not isinstance(self.selected_field, OccupancyDatasetField):
-            raise TypeError("selected_field must be OccupancyDatasetField")
         object.__setattr__(
             self,
             "metadata_contract",
-            OccupancyDatasetMetadataContract(
-                self.payload_contract,
-                self.selected_field,
-            ),
+            OccupancyDatasetMetadataContract(self.payload_contract),
         )
         object.__setattr__(
             self,
@@ -453,28 +508,19 @@ class OccupancyDatasetEventAdapter:
             canonical_digest(
                 {
                     "owner": "zlc_neutral_atom.readout.OccupancyDatasetEventAdapter",
-                    "schema": "v1",
+                    "schema": "v2",
                     "payload": self.payload_contract.fingerprint,
-                    "selected_field": self.selected_field.value,
                 }
             ),
         )
 
     @property
     def value_schema(self) -> ValueSchema:
-        return (
-            self.payload_contract.occupied_schema
-            if self.selected_field is OccupancyDatasetField.OCCUPIED
-            else self.payload_contract.counts_schema
-        )
+        return self.payload_contract.counts_schema
 
     def value(self, payload: OccupancySample) -> Value:
         self.payload_contract.validate(payload)
-        return (
-            payload.occupied
-            if self.selected_field is OccupancyDatasetField.OCCUPIED
-            else payload.counts
-        )
+        return payload.counts
 
 
 @dataclass(frozen=True)
@@ -515,14 +561,14 @@ def resolve_occupancy_model_selection(
 
 
 @dataclass(frozen=True)
-class OccupancyStreamProcessorBindRequest:
+class OccupancyStreamProcessorSpec:
+    """Reusable semantics; a CaptureSession supplies run-local input authority."""
+
     calibration: AdmittedCalibration
-    capture_input: CaptureProcessorInputBinding
     readout_binding: ReadoutBindingKey
     model: OccupancyModelSelection
     output_stream_id: StreamId
     output_source_id: str
-    output_field: OccupancyDatasetField = OccupancyDatasetField.OCCUPIED
     resource_policy: CalibrationResourcePolicy = DEFAULT_CALIBRATION_RESOURCE_POLICY
     operator_deadline_seconds: float = 1.0
     terminal_wait_seconds: float = 1.0
@@ -530,8 +576,6 @@ class OccupancyStreamProcessorBindRequest:
     def __post_init__(self) -> None:
         if type(self.calibration) is not AdmittedCalibration:
             raise TypeError("calibration must be an exact AdmittedCalibration")
-        if type(self.capture_input) is not CaptureProcessorInputBinding:
-            raise TypeError("capture_input must be CaptureProcessorInputBinding")
         if not isinstance(self.readout_binding, ReadoutBindingKey):
             raise TypeError("readout_binding must be ReadoutBindingKey")
         if not isinstance(self.model, OccupancyModelSelection):
@@ -539,8 +583,6 @@ class OccupancyStreamProcessorBindRequest:
         if not isinstance(self.output_stream_id, StreamId):
             raise TypeError("output_stream_id must be StreamId")
         _canonical_text(self.output_source_id, "output_source_id")
-        if not isinstance(self.output_field, OccupancyDatasetField):
-            raise TypeError("output_field must be OccupancyDatasetField")
         if not isinstance(self.resource_policy, CalibrationResourcePolicy):
             raise TypeError("resource_policy must be CalibrationResourcePolicy")
         object.__setattr__(
@@ -868,7 +910,6 @@ class BoundOccupancyStreamProcessor:
         "_processor",
         "_capture_input",
         "_output_edge",
-        "_selected_field",
     )
 
     def __init_subclass__(cls, **_kwargs) -> None:
@@ -881,7 +922,6 @@ class BoundOccupancyStreamProcessor:
         processor: BoundStreamProcessor,
         capture_input: CaptureProcessorInputBinding,
         output_edge: FrozenDatasetEdge[OccupancySample],
-        selected_field: OccupancyDatasetField,
     ) -> None:
         if authority is not _BOUND_OCCUPANCY_TOKEN:
             raise PermissionError(
@@ -893,13 +933,10 @@ class BoundOccupancyStreamProcessor:
             raise TypeError("capture_input must be CaptureProcessorInputBinding")
         if not isinstance(output_edge, FrozenDatasetEdge):
             raise TypeError("output_edge must be FrozenDatasetEdge")
-        if not isinstance(selected_field, OccupancyDatasetField):
-            raise TypeError("selected_field must be OccupancyDatasetField")
         object.__setattr__(self, "_authority", authority)
         object.__setattr__(self, "_processor", processor)
         object.__setattr__(self, "_capture_input", capture_input)
         object.__setattr__(self, "_output_edge", output_edge)
-        object.__setattr__(self, "_selected_field", selected_field)
         self._validate_identity()
 
     def __setattr__(self, _name: str, _value: object) -> None:
@@ -931,7 +968,6 @@ class BoundOccupancyStreamProcessor:
         processor = object.__getattribute__(self, "_processor")
         capture_input = object.__getattribute__(self, "_capture_input")
         output_edge = object.__getattribute__(self, "_output_edge")
-        selected_field = object.__getattribute__(self, "_selected_field")
         # Reading these properties revalidates the CaptureSession-minted owner
         # graph before every authority-sensitive operation.
         input_contract = capture_input.payload_contract
@@ -940,8 +976,6 @@ class BoundOccupancyStreamProcessor:
         adapter = output_edge.event_adapter
         if not isinstance(adapter, OccupancyDatasetEventAdapter):
             raise TypeError("output_edge must use OccupancyDatasetEventAdapter")
-        if adapter.selected_field is not selected_field:
-            raise ValueError("output edge and bundle select different fields")
         if processor.input_payload_contract is not input_contract:
             raise ValueError("processor and capture input must share PayloadContract owner")
         if processor.join_key_contract is not join_key_contract:
@@ -981,13 +1015,12 @@ class BoundOccupancyStreamProcessor:
         self._validate_identity()
         return canonical_digest(
             {
-                "contract": "zlc_neutral_atom.BoundOccupancyStreamProcessor/v1",
+                "contract": "zlc_neutral_atom.BoundOccupancyStreamProcessor/v2",
                 "processor": self._processor.fingerprint,
                 "output_consumer_contract": (
                     self._output_edge.consumer_contract_digest
                 ),
                 "output_schedule": self._output_edge.schedule_digest,
-                "selected_field": self._selected_field.value,
             }
         )
 
@@ -1205,35 +1238,37 @@ def _occupancy_stream_operator(payload: object, config: object) -> object:
 
 
 def bind_occupancy_stream_processor(
-    request: OccupancyStreamProcessorBindRequest,
+    spec: OccupancyStreamProcessorSpec,
+    capture_input: CaptureProcessorInputBinding,
 ) -> BoundOccupancyStreamProcessor:
     """Bind one admitted calibration to one physically uniform camera generation."""
 
-    if not isinstance(request, OccupancyStreamProcessorBindRequest):
-        raise TypeError("request must be OccupancyStreamProcessorBindRequest")
-    calibration = request.calibration
+    if not isinstance(spec, OccupancyStreamProcessorSpec):
+        raise TypeError("spec must be OccupancyStreamProcessorSpec")
+    if type(capture_input) is not CaptureProcessorInputBinding:
+        raise TypeError("capture_input must be CaptureProcessorInputBinding")
+    calibration = spec.calibration
     artifact = calibration.artifact
-    capture_input = request.capture_input
     contract = capture_input.capture_contract
-    if request.output_stream_id == contract.stream_id:
+    if spec.output_stream_id == contract.stream_id:
         raise ValueError("occupancy output stream must differ from camera input stream")
-    if request.output_source_id == contract.source_id:
+    if spec.output_source_id == contract.source_id:
         raise ValueError("occupancy output source must differ from camera source")
     _validate_source_frame_contract(
         capture_input,
         artifact.frame_contract,
-        request.readout_binding,
+        spec.readout_binding,
     )
-    model = _model(artifact.select_model(model_id=request.model.model_id))
+    model = _model(artifact.select_model(model_id=spec.model.model_id))
     if (
-        model.header.model_version != request.model.model_version
-        or model.kind is not request.model.model_kind
+        model.header.model_version != spec.model.model_version
+        or model.kind is not spec.model.model_kind
     ):
-        raise ValueError("selected model version/kind differs from the frozen request")
+        raise ValueError("selected model version/kind differs from the frozen spec")
     validate_readout_model_resources(
         model,
         image_shape_yx=artifact.frame_contract.frame_schema.data_shape,
-        resource_policy=request.resource_policy,
+        resource_policy=spec.resource_policy,
     )
     feature_spec = bind_readout_feature_spec(model, artifact.site_map)
     input_contract = capture_input.payload_contract
@@ -1257,10 +1292,7 @@ def bind_occupancy_stream_processor(
         counts_schema,
         input_contract.metadata_contract,
     )
-    candidate_adapter = OccupancyDatasetEventAdapter(
-        candidate_output_contract,
-        request.output_field,
-    )
+    candidate_adapter = OccupancyDatasetEventAdapter(candidate_output_contract)
     output_schema = DatasetSchema(
         contract.dataset_schema.repeat_axis,
         contract.dataset_schema.point_axes,
@@ -1287,14 +1319,14 @@ def bind_occupancy_stream_processor(
         _capture_input_contract_digest(capture_input),
         artifact.frame_contract,
         artifact.site_map,
-        request.readout_binding,
-        request.model,
+        spec.readout_binding,
+        spec.model,
         input_contract.value_schema,
         output_contract.occupied_schema,
         output_contract.counts_schema,
         feature_spec,
         model,
-        request.resource_policy,
+        spec.resource_policy,
     )
     definition = StreamProcessorDefinition(
         OCCUPANCY_STREAM_PROCESSOR_KEY,
@@ -1303,8 +1335,8 @@ def bind_occupancy_stream_processor(
         input_contract.fingerprint,
         output_contract.fingerprint,
         capture_input.join_key_contract.fingerprint,
-        operator_deadline_seconds=request.operator_deadline_seconds,
-        terminal_wait_seconds=request.terminal_wait_seconds,
+        operator_deadline_seconds=spec.operator_deadline_seconds,
+        terminal_wait_seconds=spec.terminal_wait_seconds,
         execution_guard_schema_id=_OCCUPANCY_EXECUTION_GUARD_SCHEMA,
     )
     execution_guard = _OccupancyExecutionGuard(
@@ -1318,8 +1350,8 @@ def bind_occupancy_stream_processor(
         input_contract,
         output_contract,
         capture_input.join_key_contract,
-        request.output_stream_id,
-        request.output_source_id,
+        spec.output_stream_id,
+        spec.output_source_id,
         _occupancy_stream_operator,
         (calibration_artifact_input_ref(calibration.reference),),
         execution_guard,
@@ -1333,7 +1365,6 @@ def bind_occupancy_stream_processor(
         processor=processor,
         capture_input=capture_input,
         output_edge=output_edge,
-        selected_field=request.output_field,
     )
 
 
@@ -1347,7 +1378,7 @@ __all__ = [
     "OccupancyModelSelection",
     "OccupancySample",
     "OccupancySampleContract",
-    "OccupancyStreamProcessorBindRequest",
+    "OccupancyStreamProcessorSpec",
     "bind_occupancy_stream_processor",
     "resolve_occupancy_model_selection",
 ]
