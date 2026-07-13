@@ -200,6 +200,93 @@ class PipelineMemoryProfile:
         return self._per_event_reference_overhead_bytes
 
 
+_MEMORY_ADMISSION_TOKEN = object()
+
+
+class PipelineMemoryAdmission:
+    """Process-local proof that one exact chain passed its memory policy."""
+
+    __slots__ = (
+        "_aggregate_peak_bytes",
+        "_memory_profile_fingerprint",
+        "_chain_contract_digest",
+    )
+
+    def __init__(
+        self,
+        authority: object,
+        *,
+        aggregate_peak_bytes: int,
+        memory_profile: PipelineMemoryProfile,
+        chain_contract_digest: str,
+    ) -> None:
+        if authority is not _MEMORY_ADMISSION_TOKEN:
+            raise PermissionError(
+                "PipelineMemoryAdmission must be minted by admit_pipeline_memory"
+            )
+        if not isinstance(memory_profile, PipelineMemoryProfile):
+            raise TypeError("memory_profile must be PipelineMemoryProfile")
+        peak = _positive_int(aggregate_peak_bytes, "aggregate_peak_bytes")
+        if peak > memory_profile.memory_limit_bytes:
+            raise MemoryError(
+                f"pipeline peak budget {peak} exceeds "
+                f"limit {memory_profile.memory_limit_bytes}"
+            )
+        if (
+            not isinstance(chain_contract_digest, str)
+            or len(chain_contract_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in chain_contract_digest
+            )
+        ):
+            raise ValueError("chain_contract_digest must be a lowercase SHA-256")
+        object.__setattr__(self, "_aggregate_peak_bytes", peak)
+        object.__setattr__(
+            self,
+            "_memory_profile_fingerprint",
+            memory_profile.overhead_profile_fingerprint,
+        )
+        object.__setattr__(self, "_chain_contract_digest", chain_contract_digest)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("PipelineMemoryAdmission is immutable")
+
+    def __reduce__(self):
+        raise TypeError("PipelineMemoryAdmission is process-local")
+
+    def __reduce_ex__(self, _protocol: int):
+        raise TypeError("PipelineMemoryAdmission is process-local")
+
+    @property
+    def aggregate_peak_bytes(self) -> int:
+        return self._aggregate_peak_bytes
+
+    @property
+    def memory_profile_fingerprint(self) -> str:
+        return self._memory_profile_fingerprint
+
+    @property
+    def chain_contract_digest(self) -> str:
+        return self._chain_contract_digest
+
+
+def admit_pipeline_memory(
+    *,
+    aggregate_peak_bytes: int,
+    memory_profile: PipelineMemoryProfile,
+    chain_contract_digest: str,
+) -> PipelineMemoryAdmission:
+    """Admit a compiler-derived peak before its exact chain touches hardware."""
+
+    return PipelineMemoryAdmission(
+        _MEMORY_ADMISSION_TOKEN,
+        aggregate_peak_bytes=aggregate_peak_bytes,
+        memory_profile=memory_profile,
+        chain_contract_digest=chain_contract_digest,
+    )
+
+
 @dataclass(frozen=True)
 class DatasetMaterializerSpec:
     block_id: BlockId
@@ -237,6 +324,7 @@ class PipelineResult:
         "_dataset",
         "_capture_completion",
         "_capture_terminal",
+        "_memory_admission",
         "_aggregate_peak_bytes",
         "_memory_profile_fingerprint",
         "_source_dataset_schema",
@@ -253,11 +341,12 @@ class PipelineResult:
         authority: object,
         dataset: SealedDatasetArtifact,
         capture_completion: CaptureCompletion,
-        aggregate_peak_bytes: int,
-        memory_profile_fingerprint: str,
+        memory_admission: PipelineMemoryAdmission,
     ) -> None:
         if authority is not _PIPELINE_RESULT_TOKEN:
-            raise PermissionError("PipelineResult can only be minted by compile_pipeline")
+            raise PermissionError(
+                "PipelineResult can only be minted by finalize_pipeline_result"
+            )
         if not isinstance(dataset, SealedDatasetArtifact):
             raise TypeError("dataset must be SealedDatasetArtifact")
         if not isinstance(capture_completion, CaptureCompletion):
@@ -269,16 +358,10 @@ class PipelineResult:
             raise RuntimeError(
                 "sealed dataset belongs to another exact terminal consumer"
             )
-        peak = _positive_int(aggregate_peak_bytes, "aggregate_peak_bytes")
-        if (
-            not isinstance(memory_profile_fingerprint, str)
-            or len(memory_profile_fingerprint) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in memory_profile_fingerprint
-            )
-        ):
-            raise ValueError("memory profile fingerprint must be a lowercase SHA-256")
+        if type(memory_admission) is not PipelineMemoryAdmission:
+            raise TypeError("memory_admission must be an exact PipelineMemoryAdmission")
+        if memory_admission.chain_contract_digest != capture_completion.chain_contract_digest:
+            raise RuntimeError("memory admission belongs to another exact chain")
         provenance = dataset.provenance
         if provenance.trace_binding.run_id != capture_completion.trace_binding.run_id:
             raise RuntimeError("pipeline dataset and capture completion run_id differ")
@@ -309,18 +392,34 @@ class PipelineResult:
         if (
             capture_terminal.produced_count != count
             or capture_terminal.drained_count != count
-            or capture_terminal.ordered_metadata_digest
-            != provenance.ordered_metadata_digest
         ):
             raise RuntimeError("pipeline terminal and dataset provenance differ")
+        # A direct materializer projects the source event, so its dataset
+        # metadata is exactly the metadata acknowledged by the physical source.
+        # A processor is allowed (and normally expected) to define a different
+        # output-metadata contract.  Its source binding is instead proven by the
+        # identity-bound terminal reservation plus the exact derivation/root
+        # event span validated above.  Equating source and derived metadata
+        # digests would make every non-identity processor impossible to compose.
+        if (
+            capture_completion.direct_terminal_consumer
+            and capture_terminal.ordered_metadata_digest
+            != provenance.ordered_metadata_digest
+        ):
+            raise RuntimeError("direct pipeline metadata differs from capture terminal")
         object.__setattr__(self, "_dataset", dataset)
         object.__setattr__(self, "_capture_completion", capture_completion)
         object.__setattr__(self, "_capture_terminal", capture_terminal)
-        object.__setattr__(self, "_aggregate_peak_bytes", peak)
+        object.__setattr__(self, "_memory_admission", memory_admission)
+        object.__setattr__(
+            self,
+            "_aggregate_peak_bytes",
+            memory_admission.aggregate_peak_bytes,
+        )
         object.__setattr__(
             self,
             "_memory_profile_fingerprint",
-            memory_profile_fingerprint,
+            memory_admission.memory_profile_fingerprint,
         )
         object.__setattr__(
             self,
@@ -415,7 +514,11 @@ class PipelineResult:
         return self._memory_profile_fingerprint
 
 
-def _dataset_storage_bytes(schema: DatasetSchema) -> int:
+def dataset_storage_nbytes(schema: DatasetSchema) -> int:
+    """Return exact value-plus-validity bytes for one materialized DataBlock."""
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
     value_bytes = math.prod(schema.physical_shape) * int(schema.cell_schema.dtype.itemsize)
     leading = (
         schema.repeat_axis.size,
@@ -438,7 +541,7 @@ def estimate_pipeline_peak_bytes(spec: MinimalPipelineSpec) -> int:
         raise TypeError("spec must be MinimalPipelineSpec")
     contract = spec.measurement.capture_contract
     events = contract.total_events
-    dataset_bytes = _dataset_storage_bytes(contract.dataset_schema)
+    dataset_bytes = dataset_storage_nbytes(contract.dataset_schema)
     metadata_bytes = (
         events * contract.dataset_edge.metadata_max_retained_nbytes
     )
@@ -494,8 +597,7 @@ class ExactCaptureTransaction:
     builder: DatasetBuilder
     port: BoundCapturePort
     contract: CaptureStreamContract
-    aggregate_peak_bytes: int
-    memory_profile_fingerprint: str
+    memory_admission: PipelineMemoryAdmission
 
     def start(self, context: RunContext) -> None:
         self.session.prepare(context)
@@ -527,12 +629,10 @@ class ExactCaptureTransaction:
             != completion.terminal.ordered_metadata_digest
         ):
             raise RuntimeError("sealed dataset metadata digest differs from capture")
-        return PipelineResult(
-            _PIPELINE_RESULT_TOKEN,
-            dataset,
-            completion,
-            self.aggregate_peak_bytes,
-            self.memory_profile_fingerprint,
+        return finalize_pipeline_result(
+            dataset=dataset,
+            capture_completion=completion,
+            memory_admission=self.memory_admission,
         )
 
     def fail(self, error: BaseException) -> None:
@@ -601,7 +701,13 @@ def open_exact_capture(
             contract.dataset_edge,
             DatasetMode.FINITE_EXACT,
         )
-        session.bind_exact_consumer(builder.exact_readiness())
+        readiness = builder.exact_readiness()
+        memory_admission = admit_pipeline_memory(
+            aggregate_peak_bytes=aggregate_peak,
+            memory_profile=spec.materializer.memory,
+            chain_contract_digest=readiness.chain_contract_digest,
+        )
+        session.bind_exact_consumer(readiness)
         return ExactCaptureTransaction(
             session,
             reservation,
@@ -609,8 +715,7 @@ def open_exact_capture(
             builder,
             port,
             contract,
-            aggregate_peak,
-            spec.materializer.memory.overhead_profile_fingerprint,
+            memory_admission,
         )
     except BaseException as error:
         _release_preflight_software(session, reservation, builder, error)
@@ -667,16 +772,42 @@ def compile_pipeline(spec: MinimalPipelineSpec) -> RunPlan:
     )
 
 
+def finalize_pipeline_result(
+    *,
+    dataset: SealedDatasetArtifact,
+    capture_completion: CaptureCompletion,
+    memory_admission: PipelineMemoryAdmission,
+) -> PipelineResult:
+    """Validate and mint the result of a direct or processed exact pipeline.
+
+    Domain-specific compilers use this owner API after their live exact chain
+    seals.  The public entry point does not weaken authority: ``PipelineResult``
+    still proves that ``dataset`` belongs to the opaque terminal reservation in
+    ``capture_completion`` and revalidates the complete derivation chain.
+    """
+
+    return PipelineResult(
+        _PIPELINE_RESULT_TOKEN,
+        dataset,
+        capture_completion,
+        memory_admission,
+    )
+
+
 __all__ = [
+    "admit_pipeline_memory",
     "BoundMeasurement",
     "compile_pipeline",
+    "dataset_storage_nbytes",
     "DatasetMaterializerSpec",
     "ExactCaptureTransaction",
     "estimate_pipeline_peak_bytes",
+    "finalize_pipeline_result",
     "MeasurementDefinition",
     "MinimalPipelineSpec",
     "open_exact_capture",
     "PipelineMemoryProfile",
+    "PipelineMemoryAdmission",
     "PipelineResult",
     "resolve_measurement_definition",
 ]

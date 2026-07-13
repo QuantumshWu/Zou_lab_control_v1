@@ -85,14 +85,18 @@ from .ports import (
     VerifiedBoundDeviceIdentity,
 )
 from .pipeline import (
+    admit_pipeline_memory,
     BoundMeasurement,
     compile_pipeline,
+    dataset_storage_nbytes,
     DatasetMaterializerSpec,
     ExactCaptureTransaction,
     estimate_pipeline_peak_bytes,
+    finalize_pipeline_result,
     MeasurementDefinition,
     MinimalPipelineSpec,
     PipelineMemoryProfile,
+    PipelineMemoryAdmission,
     PipelineResult,
     open_exact_capture,
     resolve_measurement_definition,
@@ -189,6 +193,7 @@ from .streams import (
 )
 
 __all__ = [
+    "admit_pipeline_memory",
     "BoundDevice",
     "BoundCapturePort",
     "BoundMeasurement",
@@ -245,6 +250,7 @@ __all__ = [
     "dataset_cell_permutation_digest",
     "dataset_cell_permutation_fingerprint",
     "dataset_key_sequence_digest",
+    "dataset_storage_nbytes",
     "DuplicateDatasetCell",
     "FrozenDatasetEdge",
     "EndOfStream",
@@ -257,6 +263,7 @@ __all__ = [
     "ExactReservation",
     "ExactConsumerReadiness",
     "estimate_pipeline_peak_bytes",
+    "finalize_pipeline_result",
     "JoinKeyContract",
     "CleanupStepAck",
     "CommitAuthority",
@@ -291,6 +298,7 @@ __all__ = [
     "PostSafetyContext",
     "PipelineMemoryProfile",
     "PipelineResult",
+    "PipelineMemoryAdmission",
     "open_exact_capture",
     "PublishVisibilityUnknown",
     "PublishedManifest",

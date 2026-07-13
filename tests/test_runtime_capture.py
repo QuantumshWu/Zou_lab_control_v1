@@ -77,9 +77,11 @@ from zlc_neutral_atom.runtime.run import (
     RunStartRejected,
 )
 from zlc_neutral_atom.runtime.pipeline import (
+    admit_pipeline_memory,
     BoundMeasurement,
     compile_pipeline,
     DatasetMaterializerSpec,
+    finalize_pipeline_result,
     MeasurementDefinition,
     MinimalPipelineSpec,
     PipelineMemoryProfile,
@@ -246,6 +248,18 @@ class FrameMetadataContract:
         return hashlib.sha256(
             f"{metadata.ordinal}:{metadata.stamp}:{metadata.captured_at:.9f}".encode()
         ).hexdigest()
+
+
+@dataclass(frozen=True)
+class DerivedFrameMetadataContract(FrameMetadataContract):
+    """Same immutable value, deliberately different processed semantics."""
+
+    fingerprint: str = "f" * 64
+
+    @staticmethod
+    def digest(metadata: object) -> str:
+        source_digest = FrameMetadataContract.digest(metadata)
+        return hashlib.sha256(f"derived:{source_digest}".encode("ascii")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -645,6 +659,7 @@ def processor_capture_harness(
     *,
     operator=identity_camera_payload,
     run_id: str = "processor-capture-run",
+    output_metadata_contract: FrameMetadataContract | None = None,
 ) -> ProcessorCaptureHarness:
     trace = TraceBinding(run_id, item.contract.source_id)
     session = item.port.open_session(item.contract, trace, item.spec)
@@ -652,14 +667,26 @@ def processor_capture_harness(
     input_cursor = reservation.activate()
     processor_input = session.processor_input_binding
     key_contract = processor_input.join_key_contract
+    output_edge = item.contract.dataset_edge
+    if output_metadata_contract is not None:
+        output_edge = FrozenDatasetEdge(
+            item.contract.dataset_schema,
+            CameraEventAdapter(
+                item.contract.payload_contract,
+                output_metadata_contract,
+                "f" * 64,
+            ),
+            item.contract.expected_cells,
+        )
+    output_payload_contract = output_edge.payload_contract
     output_stream, output_producer = AcquisitionStream.create(
         StreamId("camera.processed"),
-        item.contract.payload_contract,
+        output_payload_contract,
         flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
         retention_events=item.contract.total_events,
         retention_bytes=(
             item.contract.total_events
-            * item.contract.payload_contract.max_retained_nbytes
+            * output_payload_contract.max_retained_nbytes
         ),
         join_key_contract=key_contract,
     )
@@ -668,7 +695,7 @@ def processor_capture_harness(
         max_inflight_events=item.contract.total_events,
         max_inflight_bytes=(
             item.contract.total_events
-            * item.contract.payload_contract.max_retained_nbytes
+            * output_payload_contract.max_retained_nbytes
         ),
         trace_binding=TraceBinding(run_id, "camera-processor"),
     )
@@ -676,7 +703,7 @@ def processor_capture_harness(
     builder = DatasetBuilder(
         BlockId("processed-camera"),
         output_reservation,
-        item.contract.dataset_edge,
+        output_edge,
         DatasetMode.FINITE_EXACT,
     )
     definition = StreamProcessorDefinition(
@@ -684,14 +711,14 @@ def processor_capture_harness(
         "Identity camera",
         "tests.identity-camera.v1",
         item.contract.payload_contract.fingerprint,
-        item.contract.payload_contract.fingerprint,
+        output_payload_contract.fingerprint,
         dataset_cell_key_fingerprint(item.contract.dataset_schema),
     )
     bound = BoundStreamProcessor(
         definition,
         None,
         item.contract.payload_contract,
-        item.contract.payload_contract,
+        output_payload_contract,
         key_contract,
         output_stream.stream_id,
         "camera-processor",
@@ -1375,9 +1402,8 @@ def test_minimal_pipeline_compiles_to_one_flat_run_and_returns_typed_result():
         PipelineResult(
             object(),
             result.dataset,
-            result.capture_terminal,
-            result.aggregate_peak_bytes,
-            result.memory_profile_fingerprint,
+            result._capture_completion,
+            result._memory_admission,
         )
 
 
@@ -1389,9 +1415,19 @@ def test_pipeline_result_cross_binds_processed_root_span_and_stage_chain():
     base = item.plan()
 
     def preflight(context: RunContext):
-        processor = processor_capture_harness(item, run_id=context.run_id.value)
+        processor = processor_capture_harness(
+            item,
+            run_id=context.run_id.value,
+            output_metadata_contract=DerivedFrameMetadataContract(),
+        )
         processor.worker.start()
-        processor.session.bind_exact_consumer(processor.worker.exact_readiness())
+        readiness = processor.worker.exact_readiness()
+        processor.session.bind_exact_consumer(readiness)
+        holder["memory_admission"] = admit_pipeline_memory(
+            aggregate_peak_bytes=1,
+            memory_profile=PipelineMemoryProfile.for_current_runtime(1024),
+            chain_contract_digest=readiness.chain_contract_digest,
+        )
         holder["processor"] = processor
         return processor
 
@@ -1403,12 +1439,10 @@ def test_pipeline_result_cross_binds_processed_root_span_and_stage_chain():
                 processor.session.capture_next(context)
             completion = processor.session.complete(context)
             dataset = processor.worker.finish(completion.eos, 2.0)
-            return PipelineResult(
-                _PIPELINE_RESULT_TOKEN,
-                dataset,
-                completion,
-                1,
-                "e" * 64,
+            return finalize_pipeline_result(
+                dataset=dataset,
+                capture_completion=completion,
+                memory_admission=holder["memory_admission"],
             )
         except BaseException as error:
             processor.session.fail(error)
@@ -1438,6 +1472,10 @@ def test_pipeline_result_cross_binds_processed_root_span_and_stage_chain():
     assert derivation.root_input_span.stream_id == holder["processor"].session.stream.stream_id
     assert derivation.root_input_span.count == item.contract.total_events
     assert len(derivation.stages) == 1
+    assert (
+        result.capture_terminal.ordered_metadata_digest
+        != result.dataset.provenance.ordered_metadata_digest
+    )
 
     wrong_digest = (
         "0" * 64 if derivation.root_input_span.ordered_digest != "0" * 64 else "1" * 64
@@ -1456,8 +1494,7 @@ def test_pipeline_result_cross_binds_processed_root_span_and_stage_chain():
             _PIPELINE_RESULT_TOKEN,
             forged_dataset,
             result._capture_completion,
-            result.aggregate_peak_bytes,
-            result.memory_profile_fingerprint,
+            result._memory_admission,
         )
 
 
@@ -1535,8 +1572,7 @@ def test_compiled_pipeline_plan_is_reusable_sequentially():
             _PIPELINE_RESULT_TOKEN,
             first.dataset,
             second._capture_completion,
-            first.aggregate_peak_bytes,
-            first.memory_profile_fingerprint,
+            first._memory_admission,
         )
 
 
