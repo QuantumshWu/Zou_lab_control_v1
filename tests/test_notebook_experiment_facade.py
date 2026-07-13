@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 import Zou_lab_control.notebook as zlc
 from Zou_lab_control.neutral_atom.devices.base import BaseDevice
 from Zou_lab_control.neutral_atom.devices.registry import DeviceSet
+from Zou_lab_control.neutral_atom.device_catalog import DeviceRef
 from zlc_neutral_atom.artifacts import CaptureArtifactRef
 from zlc_neutral_atom.runtime import BoundDevice, RunPlan
 
@@ -22,6 +24,8 @@ def test_virtual_connect_capture_load_is_a_short_current_api(tmp_path):
         request = exp.readout.capture_request(
             ROOT / "pulses" / "imaging_template.json"
         )
+        assert request.camera_ref == exp.device_catalog["camera"].ref
+        assert request.sequencer_ref == exp.device_catalog["sequencer"].ref
         descriptor = exp.inspect(request)
         assert descriptor.camera_role == "camera"
         assert descriptor.sequencer_role == "sequencer"
@@ -96,3 +100,23 @@ def test_camera_wiring_mismatch_fails_before_start(tmp_path):
         assert exp.device_catalog.availability.value == "available"
     finally:
         exp.close()
+
+
+def test_capture_request_rejects_wrong_domain_and_stale_device_generation(tmp_path):
+    with zlc.connect("virtual", repository=tmp_path / "captures") as exp:
+        with pytest.raises(ValueError, match="not 'camera'"):
+            exp.readout.capture_request(
+                ROOT / "pulses" / "imaging_template.json",
+                camera_role="sequencer",
+            )
+
+        request = exp.readout.capture_request(
+            ROOT / "pulses" / "imaging_template.json"
+        )
+        stale = DeviceRef(
+            request.camera_ref.installation_id,
+            request.camera_ref.installation_generation + 1,
+            request.camera_ref.role,
+        )
+        with pytest.raises(RuntimeError, match="stale installation generation"):
+            exp.inspect(replace(request, camera_ref=stale))

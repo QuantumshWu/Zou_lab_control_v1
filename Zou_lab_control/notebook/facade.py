@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Mapping
 
 from Zou_lab_control.neutral_atom.device_catalog import (
+    DeviceRef,
     DeviceCatalogView,
     _catalog_from_device_set,
 )
@@ -16,17 +17,7 @@ from Zou_lab_control.neutral_atom.devices import (
     load_devices,
     resolve_connect_config,
 )
-from zlc_data import (
-    AxisId,
-    AxisSpec,
-    BlockId,
-    DatasetSchema,
-    PointLayout,
-    READOUT_EVENT,
-    REPEAT,
-    SCAN_POINT,
-)
-from zlc_neutral_atom.acquisition import CameraAcquisitionMode
+from zlc_data import AxisId, BlockId
 from zlc_neutral_atom.artifacts import (
     CaptureArtifact,
     CaptureArtifactRef,
@@ -41,21 +32,19 @@ from zlc_neutral_atom.runtime import (
     estimate_pipeline_peak_bytes,
 )
 from zlc_neutral_atom.timing import (
-    FinitePulseExecutionRequest,
     TriggeredCaptureSpec,
-    compile_capture_cell_plan,
 )
 from zlc_pulse import (
     PulseDocument,
     PulseExecutionForm,
     PulseTarget,
-    bind_pulse_document_target,
-    compile_pulse_artifact,
     load_pulse_document,
 )
-from zlc_workbench.camera_capture import CameraCaptureBindingRequest
+from zlc_workbench._triggered_camera import (
+    _TriggeredCameraLayout,
+    _bind_triggered_camera_acquisition,
+)
 from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
-from zlc_workbench.sequencer_execution import SequencerBindingRequest
 
 
 def _text(value: object, field: str) -> str:
@@ -74,8 +63,8 @@ def _positive_int(value: object, field: str) -> int:
 class CaptureRequest:
     pulse_document: PulseDocument
     execution_form: PulseExecutionForm
-    camera_role: str
-    sequencer_role: str
+    camera_ref: DeviceRef
+    sequencer_ref: DeviceRef
     trigger_channel: str | None = None
     repeat_count: int = 1
     readout_events_per_repeat: int | None = None
@@ -91,8 +80,10 @@ class CaptureRequest:
             raise TypeError("execution_form must be PulseExecutionForm")
         if self.execution_form is PulseExecutionForm.CONTINUOUS_MONITOR:
             raise ValueError("CaptureRequest requires a finite pulse execution form")
-        _text(self.camera_role, "camera_role")
-        _text(self.sequencer_role, "sequencer_role")
+        if not isinstance(self.camera_ref, DeviceRef):
+            raise TypeError("camera_ref must be DeviceRef")
+        if not isinstance(self.sequencer_ref, DeviceRef):
+            raise TypeError("sequencer_ref must be DeviceRef")
         if self.trigger_channel is not None:
             _text(self.trigger_channel, "trigger_channel")
         object.__setattr__(
@@ -109,27 +100,19 @@ class CaptureRequest:
                     "readout_events_per_repeat",
                 ),
             )
-        if self.within_point_grouping is not None:
-            try:
-                grouping = tuple(tuple(pair) for pair in self.within_point_grouping)
-            except TypeError as exc:
-                raise TypeError(
-                    "within_point_grouping must contain integer (repeat, event) pairs"
-                ) from exc
-            if any(
-                len(pair) != 2
-                or any(
-                    isinstance(index, bool)
-                    or not isinstance(index, int)
-                    or index < 0
-                    for index in pair
-                )
-                for pair in grouping
-            ):
-                raise ValueError(
-                    "within_point_grouping must contain non-negative two-item pairs"
-                )
-            object.__setattr__(self, "within_point_grouping", grouping)
+        canonical_layout = _TriggeredCameraLayout(
+            AxisId("capture.repeat"),
+            AxisId("capture.scan_row"),
+            AxisId("capture.readout_event"),
+            self.repeat_count,
+            self.readout_events_per_repeat,
+            self.within_point_grouping,
+        )
+        object.__setattr__(
+            self,
+            "within_point_grouping",
+            canonical_layout.within_point_grouping,
+        )
         object.__setattr__(
             self,
             "transport_memory_limit_bytes",
@@ -282,18 +265,18 @@ class ReadoutFacade:
         return CaptureRequest(
             document,
             execution_form,
-            _resolve_role(
+            services.catalog.require(_resolve_role(
                 services.catalog,
                 camera_role,
                 "camera",
                 ("readout", "camera"),
-            ),
-            _resolve_role(
+            )).ref,
+            services.catalog.require(_resolve_role(
                 services.catalog,
                 sequencer_role,
                 "sequencer",
                 ("sequencer",),
-            ),
+            )).ref,
             trigger_channel,
             repeat_count,
             readout_events_per_repeat,
@@ -370,10 +353,15 @@ def _resolve_role(
     preferred: tuple[str, ...],
 ) -> str:
     if requested is not None:
-        catalog.require(requested)
+        info = catalog.require(requested)
+        if info.domain != domain:
+            raise ValueError(
+                f"device role {requested!r} is {info.domain!r}, not {domain!r}"
+            )
         return requested
     for role in preferred:
-        if catalog.find(role) is not None:
+        info = catalog.find(role)
+        if info is not None and info.domain == domain:
             return role
     candidates = catalog.roles(domain)
     if len(candidates) != 1:
@@ -383,115 +371,34 @@ def _resolve_role(
     return candidates[0]
 
 
-def _axis(name: str, role, size: int) -> AxisSpec:
-    return AxisSpec(AxisId(name), name, role, size, tuple(range(size)))
-
-
 def _compile(token: object, request: CaptureRequest):
     if not isinstance(request, CaptureRequest):
         raise TypeError("Experiment only accepts declarative CaptureRequest values")
     services = _services(token)
     with services.operation_lock:
-        pulse_port = services.runtime.bind_sequencer_port(
-            SequencerBindingRequest(request.sequencer_role)
-        )
-        document = bind_pulse_document_target(
-            request.pulse_document,
-            pulse_port.capability.target,
-        )
-        camera_description = services.runtime.describe_camera(request.camera_role)
-        trigger_channel = request.trigger_channel
-        if trigger_channel is None:
-            if len(camera_description.capture_trigger_channels) != 1:
-                raise ValueError(
-                    "exact capture requires exactly one physical camera trigger channel"
-                )
-            trigger_channel = camera_description.capture_trigger_channels[0]
-        if trigger_channel not in camera_description.capture_trigger_channels:
-            raise ValueError(
-                f"camera {request.camera_role!r} is not wired to {trigger_channel!r}"
-            )
-        artifact = compile_pulse_artifact(
-            document,
-            clock_hz=pulse_port.capability.clock_hz,
+        binding = _bind_triggered_camera_acquisition(
+            services.runtime,
+            services.catalog,
+            pulse_document=request.pulse_document,
             execution_form=request.execution_form,
-            trigger_channels=(trigger_channel,),
-            live_target=pulse_port.capability.target,
-        )
-        schedule = artifact.trigger_schedules[0]
-        if schedule.total < 1:
-            raise ValueError("compiled pulse emits no camera trigger edge")
-        mutable_counts = [0] * schedule.point_count
-        for edge in schedule.edges:
-            mutable_counts[edge.point_index] += 1
-        per_point_counts = tuple(mutable_counts)
-        if len(set(per_point_counts)) != 1:
-            raise ValueError("camera trigger count must be uniform across scan points")
-        per_point = per_point_counts[0]
-        events_per_repeat = request.readout_events_per_repeat
-        if events_per_repeat is None:
-            if request.repeat_count != 1:
-                raise ValueError(
-                    "readout_events_per_repeat is required when repeat_count exceeds one"
-                )
-            events_per_repeat = per_point
-        if request.repeat_count * events_per_repeat != per_point:
-            raise ValueError(
-                "declared repeat/event layout differs from per-point trigger count"
-            )
-        repeat_axis = _axis("capture.repeat", REPEAT, request.repeat_count)
-        scan_axes = (
-            (_axis("capture.scan_row", SCAN_POINT, schedule.point_count),)
-            if schedule.point_count > 1
-            else ()
-        )
-        event_axis = _axis(
-            "capture.readout_event",
-            READOUT_EVENT,
-            events_per_repeat,
-        )
-        point_axes = (*scan_axes, event_axis)
-        point_layout = PointLayout.rect_c(tuple(axis.size for axis in point_axes))
-        dataset_schema = DatasetSchema(
-            repeat_axis,
-            point_axes,
-            point_layout,
-            camera_description.payload_contract.value_schema,
-        )
-        cell_plan = compile_capture_cell_plan(
-            artifact,
-            trigger_channel,
-            dataset_schema,
-            readout_event_axis_id=event_axis.axis_id,
-            scan_point_layout=PointLayout.rect_c(
-                tuple(axis.size for axis in scan_axes)
+            camera_ref=request.camera_ref,
+            sequencer_ref=request.sequencer_ref,
+            trigger_channel=request.trigger_channel,
+            layout=_TriggeredCameraLayout(
+                AxisId("capture.repeat"),
+                AxisId("capture.scan_row"),
+                AxisId("capture.readout_event"),
+                request.repeat_count,
+                request.readout_events_per_repeat,
+                request.within_point_grouping,
             ),
-            within_point_grouping=request.within_point_grouping,
-        )
-        measurement = services.runtime.bind_camera_measurement(
-            CameraCaptureBindingRequest(
-                request.camera_role,
-                repeat_axis,
-                point_axes,
-                point_layout,
-                cell_plan.expected_cells,
-                CameraAcquisitionMode.EXTERNAL_TRIGGERED,
-                0,
-                request.transport_memory_limit_bytes,
-                # Baseline cameras expose one attested hardware setting for the
-                # whole armed run.  Repeat it explicitly for every raw event;
-                # this names no calibration/readout role and chooses no event.
-                tuple(
-                    camera_description.event_setting(index)
-                    for index in range(events_per_repeat)
-                ),
-            )
+            transport_memory_limit_bytes=request.transport_memory_limit_bytes,
         )
         pipeline = MinimalPipelineSpec(
-            f"Capture {document.name}",
-            measurement,
+            f"Capture {binding.pulse_request.document.name}",
+            binding.measurement,
             DatasetMaterializerSpec(
-                BlockId(f"capture-{artifact.fingerprint[:20]}"),
+                BlockId(f"capture-{binding.compiled_artifact.fingerprint[:20]}"),
                 PipelineMemoryProfile.for_current_runtime(
                     request.pipeline_memory_limit_bytes
                 ),
@@ -500,22 +407,22 @@ def _compile(token: object, request: CaptureRequest):
         )
         triggered = TriggeredCaptureSpec(
             pipeline,
-            pulse_port,
-            FinitePulseExecutionRequest(document, artifact),
-            trigger_channel,
-            cell_plan,
+            binding.pulse_port,
+            binding.pulse_request,
+            binding.trigger_channel,
+            binding.cell_plan,
         )
         plan = compile_capture_artifact_pipeline(triggered, services.repository)
         descriptor = PlanDescriptor(
             plan.name,
-            request.camera_role,
-            request.sequencer_role,
+            request.camera_ref.role,
+            request.sequencer_ref.role,
             request.execution_form,
-            trigger_channel,
-            schedule.total,
-            measurement.capture_contract.dataset_schema.physical_shape,
-            measurement.capture_contract.dataset_schema.fingerprint,
-            artifact.fingerprint,
+            binding.trigger_channel,
+            binding.expected_frames,
+            binding.measurement.capture_contract.dataset_schema.physical_shape,
+            binding.measurement.capture_contract.dataset_schema.fingerprint,
+            binding.compiled_artifact.fingerprint,
             tuple(str(claim.key) for claim in plan.resource_claims),
             estimate_pipeline_peak_bytes(pipeline),
         )
