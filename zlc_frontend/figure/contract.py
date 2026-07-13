@@ -1,0 +1,384 @@
+"""Declarative contracts and validation for headless presentation views."""
+
+from __future__ import annotations
+
+from numbers import Real
+from typing import Sequence
+
+from zlc_data import (
+    COMPONENT,
+    READOUT_EVENT,
+    REPEAT,
+    SCAN_POINT,
+    SITE,
+    SPATIAL_X,
+    SPATIAL_Y,
+    SPECTRAL,
+    AxisSpec,
+    CoordinateRangeSelection,
+    DatasetSchema,
+    IndexRangeSelection,
+    IndexSelection,
+    Selection,
+)
+
+from .model import (
+    AxisRolePolicy,
+    AxisViewRole,
+    DisplayReductionMethod,
+    DisplaySlot,
+    FixedIndex,
+    LatestNonempty,
+    RepeatViewMode,
+    ViewContract,
+    ViewIntent,
+    ViewSpec,
+)
+
+
+IMAGE_CONTRACT = ViewContract(
+    ViewIntent.IMAGE,
+    (
+        DisplaySlot(AxisViewRole.IMAGE_X, (SPATIAL_X, SCAN_POINT)),
+        DisplaySlot(AxisViewRole.IMAGE_Y, (SPATIAL_Y, SCAN_POINT)),
+    ),
+    (
+        AxisRolePolicy(SCAN_POINT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
+        AxisRolePolicy(SPECTRAL, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
+        AxisRolePolicy(READOUT_EVENT, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
+        AxisRolePolicy(SITE, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
+        AxisRolePolicy(COMPONENT, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
+        AxisRolePolicy(SPATIAL_X, ()),
+        AxisRolePolicy(SPATIAL_Y, ()),
+    ),
+    (RepeatViewMode.MEAN, RepeatViewMode.LATEST, RepeatViewMode.SUM),
+    RepeatViewMode.MEAN,
+    (REPEAT,),
+    maximum_batch_series=1,
+    maximum_facet_cells=36,
+)
+
+
+CURVE_CONTRACT = ViewContract(
+    ViewIntent.CURVE,
+    (DisplaySlot(AxisViewRole.X, (SPECTRAL, SCAN_POINT)),),
+    (
+        AxisRolePolicy(SCAN_POINT, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
+        AxisRolePolicy(SPECTRAL, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
+        AxisRolePolicy(READOUT_EVENT, (AxisViewRole.BATCH, AxisViewRole.FACET)),
+        AxisRolePolicy(SITE, (AxisViewRole.BATCH, AxisViewRole.FACET)),
+        AxisRolePolicy(COMPONENT, (AxisViewRole.BATCH, AxisViewRole.FACET)),
+        # A spatial curve requires an explicit pixel/ROI selection.  It is
+        # never made scalar by an automatic mean.
+        AxisRolePolicy(SPATIAL_X, ()),
+        AxisRolePolicy(SPATIAL_Y, ()),
+    ),
+    (
+        RepeatViewMode.MEAN,
+        RepeatViewMode.LATEST,
+        RepeatViewMode.SUM,
+        RepeatViewMode.BATCH,
+    ),
+    RepeatViewMode.MEAN,
+    (REPEAT, SPATIAL_X, SPATIAL_Y),
+    maximum_batch_series=32,
+    maximum_facet_cells=36,
+)
+
+
+HISTOGRAM_CONTRACT = ViewContract(
+    ViewIntent.HISTOGRAM,
+    (),
+    (
+        AxisRolePolicy(READOUT_EVENT, (AxisViewRole.SAMPLE,)),
+        AxisRolePolicy(SITE, (AxisViewRole.FACET, AxisViewRole.BATCH)),
+        AxisRolePolicy(COMPONENT, (AxisViewRole.FACET, AxisViewRole.BATCH)),
+        AxisRolePolicy(SCAN_POINT, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
+        AxisRolePolicy(SPECTRAL, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
+        AxisRolePolicy(SPATIAL_X, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
+        AxisRolePolicy(SPATIAL_Y, (AxisViewRole.FACET, AxisViewRole.SLIDER)),
+    ),
+    (
+        RepeatViewMode.SAMPLE,
+        RepeatViewMode.BATCH,
+        RepeatViewMode.MEAN,
+        RepeatViewMode.SUM,
+        RepeatViewMode.LATEST,
+    ),
+    RepeatViewMode.SAMPLE,
+    (REPEAT,),
+    maximum_batch_series=32,
+    maximum_facet_cells=36,
+)
+
+
+METER_CONTRACT = ViewContract(
+    ViewIntent.METER,
+    (),
+    (
+        AxisRolePolicy(SCAN_POINT, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
+        AxisRolePolicy(SPECTRAL, (AxisViewRole.SLIDER, AxisViewRole.FACET)),
+        AxisRolePolicy(READOUT_EVENT, (AxisViewRole.FACET,)),
+        AxisRolePolicy(SITE, (AxisViewRole.FACET,)),
+        AxisRolePolicy(COMPONENT, (AxisViewRole.FACET,)),
+        AxisRolePolicy(SPATIAL_X, ()),
+        AxisRolePolicy(SPATIAL_Y, ()),
+    ),
+    (RepeatViewMode.LATEST, RepeatViewMode.MEAN, RepeatViewMode.SUM),
+    RepeatViewMode.LATEST,
+    (REPEAT, SPATIAL_X, SPATIAL_Y),
+    maximum_batch_series=1,
+    maximum_facet_cells=36,
+)
+
+
+VIEW_CONTRACTS = {
+    ViewIntent.IMAGE: IMAGE_CONTRACT,
+    ViewIntent.CURVE: CURVE_CONTRACT,
+    ViewIntent.HISTOGRAM: HISTOGRAM_CONTRACT,
+    ViewIntent.METER: METER_CONTRACT,
+}
+
+
+def contract_for(intent: ViewIntent) -> ViewContract:
+    if not isinstance(intent, ViewIntent):
+        raise TypeError("intent must be ViewIntent")
+    return VIEW_CONTRACTS[intent]
+
+
+def dataset_axes(schema: DatasetSchema):
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    return (schema.repeat_axis, *schema.point_axes, *schema.cell_schema.data_axes)
+
+
+def display_axis_indices(
+    axis: AxisSpec,
+    selections: Sequence[Selection],
+) -> Sequence[int]:
+    """Resolve the one optional display selection for an axis."""
+
+    if not isinstance(axis, AxisSpec):
+        raise TypeError("axis must be zlc_data.AxisSpec")
+    selections = tuple(selections)
+    if any(not isinstance(selection, Selection) for selection in selections):
+        raise TypeError("selections must contain zlc_data.Selection values")
+    terms = tuple(
+        term
+        for selection in selections
+        for term in selection.terms
+        if term.axis_id == axis.axis_id
+    )
+    if len(terms) > 1:
+        raise ValueError(f"axis {axis.axis_id} has multiple display selection terms")
+    term = terms[0] if terms else None
+    if term is None:
+        return range(axis.size)
+    if isinstance(term, IndexSelection):
+        if term.index >= axis.size:
+            raise IndexError(f"selection index is outside axis {axis.axis_id}")
+        return (term.index,)
+    if isinstance(term, IndexRangeSelection):
+        if term.stop > axis.size:
+            raise IndexError(f"selection range is outside axis {axis.axis_id}")
+        return range(term.start, term.stop)
+    if not isinstance(term, CoordinateRangeSelection):
+        raise TypeError("unsupported display selection term")
+    if axis.coordinates is None:
+        raise ValueError(f"coordinate selection axis {axis.axis_id} has no coordinates")
+    if axis.coordinate_frame != term.coordinate_frame:
+        raise ValueError(f"coordinate selection frame mismatch for axis {axis.axis_id}")
+    if any(
+        isinstance(coordinate, bool) or not isinstance(coordinate, Real)
+        for coordinate in axis.coordinates
+    ):
+        raise ValueError(f"coordinate selection axis {axis.axis_id} is not numeric")
+    indices = tuple(
+        index
+        for index, coordinate in enumerate(axis.coordinates)
+        if term.lower <= coordinate <= term.upper
+    )
+    if not indices:
+        raise ValueError(f"coordinate selection is empty for axis {axis.axis_id}")
+    return indices
+
+
+def _display_axis_cardinality(axis, selections) -> int:
+    """Return the visible cardinality after one optional display selection."""
+
+    return len(display_axis_indices(axis, selections))
+
+
+def _repeat_mode_for_binding(binding) -> RepeatViewMode:
+    if binding.role is AxisViewRole.REDUCED:
+        assert binding.reduction is not None
+        return (
+            RepeatViewMode.MEAN
+            if binding.reduction.method is DisplayReductionMethod.MEAN
+            else RepeatViewMode.SUM
+        )
+    if binding.role is AxisViewRole.BATCH:
+        return RepeatViewMode.BATCH
+    if binding.role is AxisViewRole.SAMPLE:
+        return RepeatViewMode.SAMPLE
+    if binding.role is AxisViewRole.SELECTED:
+        return RepeatViewMode.LATEST
+    raise ValueError("repeat axis has an unsupported presentation binding")
+
+
+def validate_view_spec(
+    schema: DatasetSchema,
+    spec: ViewSpec,
+    contract: ViewContract | None = None,
+) -> None:
+    """Validate total axis coverage and intent-specific presentation safety."""
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    if not isinstance(spec, ViewSpec):
+        raise TypeError("spec must be ViewSpec")
+    contract = contract_for(spec.intent) if contract is None else contract
+    if not isinstance(contract, ViewContract) or contract.intent is not spec.intent:
+        raise ValueError("view contract does not match ViewSpec intent")
+    if spec.schema_fingerprint != schema.fingerprint:
+        raise ValueError("ViewSpec schema fingerprint is stale")
+    axes = dataset_axes(schema)
+    expected_ids = tuple(axis.axis_id for axis in axes)
+    actual_ids = tuple(binding.axis_id for binding in spec.axis_bindings)
+    if set(actual_ids) != set(expected_ids):
+        missing = tuple(axis_id for axis_id in expected_ids if axis_id not in actual_ids)
+        extra = tuple(axis_id for axis_id in actual_ids if axis_id not in expected_ids)
+        raise ValueError(
+            "ViewSpec must bind every dataset AxisId exactly once; "
+            f"missing={missing}, extra={extra}"
+        )
+    axis_by_id = {axis.axis_id: axis for axis in axes}
+    selected_axis_ids = {
+        term.axis_id
+        for selection in spec.display_selections
+        for term in selection.terms
+    }
+    unknown_selection_axes = selected_axis_ids - set(axis_by_id)
+    if unknown_selection_axes:
+        raise ValueError(
+            f"display selection references absent axes: {tuple(sorted(unknown_selection_axes))}"
+        )
+    allowed_indices = {
+        axis.axis_id: display_axis_indices(axis, spec.display_selections)
+        for axis in axes
+    }
+    effective_cardinality = {
+        axis_id: len(indices) for axis_id, indices in allowed_indices.items()
+    }
+    roles = tuple(binding.role for binding in spec.axis_bindings)
+    expected_display = tuple(slot.binding_role for slot in contract.display_slots)
+    actual_display = tuple(role for role in roles if role in {
+        AxisViewRole.X, AxisViewRole.IMAGE_X, AxisViewRole.IMAGE_Y
+    })
+    if sorted(role.value for role in actual_display) != sorted(role.value for role in expected_display):
+        raise ValueError("ViewSpec display axes do not satisfy its ViewContract")
+    for slot in contract.display_slots:
+        binding = next(item for item in spec.axis_bindings if item.role is slot.binding_role)
+        axis = axis_by_id[binding.axis_id]
+        if axis.role not in slot.preferred_axis_roles:
+            raise ValueError(
+                f"axis {axis.axis_id} role {axis.role} is not allowed for {slot.binding_role.value}"
+            )
+    if spec.intent is ViewIntent.HISTOGRAM and AxisViewRole.SAMPLE not in roles:
+        raise ValueError("HISTOGRAM ViewSpec requires at least one SAMPLE axis")
+    if spec.intent is not ViewIntent.HISTOGRAM and AxisViewRole.SAMPLE in roles:
+        raise ValueError("SAMPLE axes are valid only for HISTOGRAM")
+
+    latest_count = 0
+    batch_size = 1
+    facet_size = 1
+    for binding in spec.axis_bindings:
+        axis = axis_by_id[binding.axis_id]
+        policy = contract.policy_for(axis.role)
+        if axis.role == REPEAT:
+            repeat_mode = _repeat_mode_for_binding(binding)
+            if repeat_mode not in contract.repeat_modes:
+                raise ValueError(
+                    f"repeat mode {repeat_mode.value} is not allowed by this ViewContract"
+                )
+        if isinstance(binding.selector, FixedIndex):
+            if binding.selector.index not in allowed_indices[axis.axis_id]:
+                raise IndexError(
+                    f"selector index is outside the display selection on axis {axis.axis_id}"
+                )
+        if isinstance(binding.selector, LatestNonempty):
+            latest_count += 1
+        if binding.role is AxisViewRole.REDUCED:
+            assert binding.reduction is not None
+            if axis.role not in contract.reducible_axis_roles:
+                raise ValueError(f"axis role {axis.role} cannot be display-reduced by this contract")
+            if axis.role != REPEAT and axis.axis_id not in selected_axis_ids:
+                raise ValueError(
+                    f"axis {axis.axis_id} may be display-reduced only after an explicit selection"
+                )
+            if binding.reduction.method not in (
+                DisplayReductionMethod.MEAN,
+                DisplayReductionMethod.SUM,
+            ):
+                raise ValueError("unsupported display reduction method")
+        elif binding.role in (AxisViewRole.BATCH, AxisViewRole.FACET, AxisViewRole.SLIDER, AxisViewRole.SAMPLE):
+            if axis.role == REPEAT:
+                pass
+            elif policy is None or binding.role not in policy.automatic_roles:
+                # Explicit SAMPLE is permitted for histogram axes only; it is
+                # review-required at suggestion time but still a valid spec.
+                if not (
+                    spec.intent is ViewIntent.HISTOGRAM
+                    and binding.role is AxisViewRole.SAMPLE
+                ):
+                    raise ValueError(
+                        f"{binding.role.value} is not allowed for axis role {axis.role}"
+                    )
+        if binding.role is AxisViewRole.BATCH:
+            batch_size *= effective_cardinality[axis.axis_id]
+        if binding.role is AxisViewRole.FACET:
+            facet_size *= effective_cardinality[axis.axis_id]
+    reduction_methods = {
+        binding.reduction.method
+        for binding in spec.axis_bindings
+        if binding.role is AxisViewRole.REDUCED
+    }
+    if len(reduction_methods) > 1:
+        raise ValueError("joint display reductions must use one common method")
+    if latest_count > 1:
+        raise ValueError("baseline ViewSpec permits only one global LatestNonempty selector")
+    if batch_size > contract.maximum_batch_series:
+        raise ValueError(
+            f"batch product {batch_size} exceeds contract limit {contract.maximum_batch_series}"
+        )
+    if facet_size > contract.maximum_facet_cells:
+        raise ValueError(
+            f"facet product {facet_size} exceeds contract limit {contract.maximum_facet_cells}"
+        )
+    if spec.intent is ViewIntent.METER:
+        unresolved = tuple(
+            binding.axis_id
+            for binding in spec.axis_bindings
+            if binding.role not in (
+                AxisViewRole.FACET,
+                AxisViewRole.BATCH,
+                AxisViewRole.SELECTED,
+                AxisViewRole.SLIDER,
+                AxisViewRole.REDUCED,
+            )
+        )
+        if unresolved:
+            raise ValueError(f"METER has unresolved axes: {unresolved}")
+
+
+__all__ = [
+    "CURVE_CONTRACT",
+    "HISTOGRAM_CONTRACT",
+    "IMAGE_CONTRACT",
+    "METER_CONTRACT",
+    "VIEW_CONTRACTS",
+    "contract_for",
+    "dataset_axes",
+    "display_axis_indices",
+    "validate_view_spec",
+]
