@@ -133,11 +133,9 @@ from zlc_neutral_atom.timing import (
 )
 from zlc_pulse import (
     PulseExecutionForm,
-    bind_pulse_document_target,
     compile_pulse_artifact,
     load_pulse_document,
 )
-from zlc_pulse.target import pulse_target_from_legacy_tree
 from zlc_workbench.camera_capture import CameraCaptureBindingRequest
 from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
 
@@ -502,10 +500,7 @@ def _single_trigger_document(
         periods.append(replace(period, states=tuple(states)))
     assert kept_trigger
     return replace(
-        bind_pulse_document_target(
-            document,
-            pulse_target_from_legacy_tree(trusted.sequencer.port_catalog.to_dict()),
-        ),
+        document,
         name="occupancy-single-trigger",
         periods=tuple(periods),
         repeat=None,

@@ -33,11 +33,9 @@ from zlc_neutral_atom.timing import (
 )
 from zlc_pulse import (
     PulseExecutionForm,
-    bind_pulse_document_target,
     compile_pulse_artifact,
     load_pulse_document,
 )
-from zlc_pulse.target import pulse_target_from_legacy_tree
 from zlc_workbench.legacy_runtime import LegacyDeviceRegistration, LegacyDeviceRegistry
 from zlc_workbench.sequencer_execution import (
     SequencerBindingRequest,
@@ -68,10 +66,6 @@ def _bound_virtual_sequencer(document):
         ),
     )
     sequencer = VirtualSequencer(sleep_scale=0, port_catalog=catalog)
-    document = bind_pulse_document_target(
-        document,
-        pulse_target_from_legacy_tree(sequencer.port_catalog.to_dict()),
-    )
     broker = DeviceBroker()
     registry = LegacyDeviceRegistry(broker)
     endpoint = VirtualSequencerExecutionEndpoint(sequencer)

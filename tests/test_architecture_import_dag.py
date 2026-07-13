@@ -110,6 +110,27 @@ if 'zlc_storage.canonical' not in sys.modules:
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_zlc_pulse_has_no_historical_target_importer():
+    forbidden = (
+        "pulse_target_from_legacy",
+        "Zou_lab_control.neutral_atom.PortCatalog",
+        "channel_labels",
+        "analog_buses",
+        "clk_channels",
+    )
+    violations = []
+    for path in (ROOT / "zlc_pulse").rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for token in forbidden:
+            if token in text:
+                violations.append(f"{path.relative_to(ROOT)} contains {token}")
+    assert not violations, (
+        "zlc_pulse owns only the current PulseTarget contract; installed legacy "
+        "device topology may be projected only at the composition boundary:\n"
+        + "\n".join(violations)
+    )
+
+
 def test_canonical_primitive_validators_have_one_owner():
     violations = []
     for package in FORBIDDEN:

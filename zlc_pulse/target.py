@@ -6,11 +6,11 @@ from dataclasses import dataclass
 import json
 from importlib.resources import files
 from pathlib import Path
-import re
 
 from zlc_storage import (
     canonical_digest,
     canonical_text as _text,
+    exact_mapping,
     integer as _integer,
 )
 
@@ -21,8 +21,6 @@ PORT_DAC = "dac"
 PORT_CLOCK = "clock"
 PORT_KINDS = (PORT_DIGITAL, PORT_DAC, PORT_CLOCK)
 DAC_OFFSET_BINARY = "offset_binary"
-_BUS_LABEL = re.compile(r"(?P<base>.+)\[(?P<bit>\d+)\]")
-_DAC_CLOCK = re.compile(r"da_clk(?P<index>\d+)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -188,8 +186,7 @@ def pulse_port_from_tree(tree: object) -> PulsePortSpec:
         "safe_value",
         "latch_clock",
     }
-    if not isinstance(tree, dict) or set(tree) != fields:
-        raise ValueError("pulse port has an unknown field set")
+    tree = exact_mapping(tree, fields, "pulse port", discriminator=None)
     lanes = tree["lanes"]
     if not isinstance(lanes, list):
         raise TypeError("pulse port lanes must be a list")
@@ -218,15 +215,11 @@ def pulse_target_to_tree(target: PulseTarget) -> dict[str, object]:
 
 
 def pulse_target_from_tree(tree: object) -> PulseTarget:
-    if not isinstance(tree, dict) or set(tree) != {
-        "schema",
-        "raw_lanes",
-        "ports",
-        "abi_fingerprint",
-    }:
-        raise ValueError("PulseTarget has an unknown field set")
-    if tree["schema"] != PULSE_TARGET_SCHEMA:
-        raise ValueError("PulseTarget schema differs")
+    tree = exact_mapping(
+        tree,
+        {"schema", "raw_lanes", "ports", "abi_fingerprint"},
+        PULSE_TARGET_SCHEMA,
+    )
     raw = tree["raw_lanes"]
     ports = tree["ports"]
     if not isinstance(raw, list) or not isinstance(ports, list):
@@ -271,122 +264,6 @@ def save_pulse_target(target: PulseTarget, path: str | Path) -> Path:
     return destination
 
 
-def pulse_target_from_legacy_tree(tree: object) -> PulseTarget:
-    """Translate the one historical PortCatalog schema at a file-load boundary."""
-
-    if not isinstance(tree, dict) or set(tree) != {
-        "schema",
-        "version",
-        "raw_lanes",
-        "ports",
-        "fingerprint",
-    }:
-        raise ValueError("legacy PortCatalog has an unknown field set")
-    if tree["schema"] != "Zou_lab_control.neutral_atom.PortCatalog" or tree["version"] != 1:
-        raise ValueError("unsupported legacy PortCatalog schema/version")
-    raw = tree["raw_lanes"]
-    ports = tree["ports"]
-    if not isinstance(raw, list) or not isinstance(ports, list):
-        raise TypeError("legacy PortCatalog arrays are invalid")
-    # The old 16-character fingerprint was not a file-load gate; structural
-    # reconstruction remains the authority and the live target is checked later.
-    return PulseTarget(
-        tuple(raw),
-        tuple(pulse_port_from_tree(port) for port in ports),
-    )
-
-
-def pulse_target_from_legacy_channels(
-    channels: object,
-    *,
-    channel_labels: object = None,
-    analog_buses: object = None,
-    clk_channels: object = None,
-) -> PulseTarget:
-    """Reconstruct v1-v3 topology fields without importing the old owner."""
-
-    if not isinstance(channels, (list, tuple)):
-        raise TypeError("legacy channels must be an ordered array")
-    raw = tuple(_text(item, "legacy raw lane") for item in channels)
-    if not isinstance(channel_labels or {}, dict):
-        raise TypeError("legacy channel_labels must be an object")
-    if not isinstance(analog_buses or {}, dict):
-        raise TypeError("legacy analog_buses must be an object")
-    if not isinstance(clk_channels or (), (list, tuple)):
-        raise TypeError("legacy clk_channels must be an ordered array")
-    labels = {str(key): str(value) for key, value in (channel_labels or {}).items()}
-    explicit: dict[str, tuple[str, ...]] = {}
-    for key, lanes in (analog_buses or {}).items():
-        if not isinstance(lanes, (list, tuple)):
-            raise TypeError("legacy analog bus lanes must be an ordered array")
-        explicit[str(key)] = tuple(str(lane) for lane in lanes)
-    inferred: dict[str, dict[int, str]] = {}
-    for lane in raw:
-        match = _BUS_LABEL.fullmatch(labels.get(lane, lane).strip())
-        if match is not None:
-            inferred.setdefault(match.group("base"), {})[int(match.group("bit"))] = lane
-    buses: dict[str, tuple[str, ...]] = {}
-    for key, bits in inferred.items():
-        order = sorted(bits)
-        if len(order) >= 2 and order == list(range(order[0], order[-1] + 1)):
-            buses[key] = tuple(bits[index] for index in order)
-    buses.update(explicit)
-    position = {lane: index for index, lane in enumerate(raw)}
-    ordered_buses = sorted(
-        buses.items(), key=lambda item: min(position[lane] for lane in item[1])
-    )
-    members = {lane for _key, lanes in ordered_buses for lane in lanes}
-    clocks = {str(item) for item in (clk_channels or ())}
-    for lane in raw:
-        if _DAC_CLOCK.fullmatch(labels.get(lane, lane).strip()):
-            clocks.add(lane)
-    clock_key_by_index: dict[int, str] = {}
-    ports: list[PulsePortSpec] = []
-    for lane in raw:
-        if lane not in clocks:
-            continue
-        label = labels.get(lane, lane)
-        match = _DAC_CLOCK.fullmatch(label)
-        if match is not None:
-            clock_key_by_index[int(match.group("index"))] = label
-        ports.append(
-            PulsePortSpec(label, PORT_CLOCK, (lane,), label, None, 1, "binary", 0, None)
-        )
-    for bus_index, (key, lanes) in enumerate(ordered_buses):
-        width = len(lanes)
-        ports.append(
-            PulsePortSpec(
-                key,
-                PORT_DAC,
-                lanes,
-                key,
-                bus_index,
-                width,
-                DAC_OFFSET_BINARY,
-                1 << (width - 1),
-                clock_key_by_index.get(bus_index),
-            )
-        )
-    occupied = members | clocks
-    for lane in raw:
-        if lane not in occupied:
-            ports.append(
-                PulsePortSpec(
-                    lane,
-                    PORT_DIGITAL,
-                    (lane,),
-                    labels.get(lane, lane),
-                    None,
-                    1,
-                    "binary",
-                    0,
-                    None,
-                )
-            )
-    ports.sort(key=lambda port: min(position[lane] for lane in port.lanes))
-    return PulseTarget(raw, tuple(ports))
-
-
 __all__ = [
     "DAC_OFFSET_BINARY",
     "PORT_CLOCK",
@@ -400,8 +277,6 @@ __all__ = [
     "load_deployed_pulse_target",
     "pulse_port_from_tree",
     "pulse_port_to_tree",
-    "pulse_target_from_legacy_tree",
-    "pulse_target_from_legacy_channels",
     "pulse_target_from_tree",
     "pulse_target_to_tree",
     "save_pulse_target",

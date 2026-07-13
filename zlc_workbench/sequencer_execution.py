@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from fpga.pulse_streamer.host.image import StreamerParams, build_fingerprint
 from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
+from Zou_lab_control.neutral_atom.ports import PortCatalog
 from zlc_neutral_atom.runtime import (
     BoundDevice,
     SafetyOperation,
@@ -28,14 +29,39 @@ from zlc_neutral_atom.timing import (
 )
 from zlc_pulse import (
     PreparedPulseRef,
+    PulsePortSpec,
     PulseTarget,
     RemotePulseExecutionClient,
     build_pulse_playback,
 )
-from zlc_pulse.target import pulse_target_from_legacy_tree
 from zlc_storage import canonical_digest, canonical_text as _text
 
 from .legacy_runtime import LegacyDeviceRegistry, TargetDeviceEndpoint
+
+
+def _pulse_target_from_port_catalog(catalog: PortCatalog) -> PulseTarget:
+    """Project the installed sequencer's typed topology at the composition boundary."""
+
+    if not isinstance(catalog, PortCatalog):
+        raise TypeError("virtual sequencer port_catalog must be PortCatalog")
+    return PulseTarget(
+        tuple(catalog.raw_lanes),
+        tuple(
+            PulsePortSpec(
+                key=port.key,
+                kind=port.kind,
+                lanes=tuple(port.lanes),
+                label=port.label,
+                bus_index=port.bus_index,
+                width=port.width,
+                encoding=port.encoding,
+                safe_value=port.safe_value,
+                latch_clock=port.latch_clock,
+            )
+            for port in catalog.ports
+        ),
+    )
+
 
 @dataclass(frozen=True)
 class SequencerBindingRequest:
@@ -88,7 +114,7 @@ class VirtualSequencerExecutionEndpoint:
         self._sequencer = sequencer
         self._timeout = float(max_blocking_call_seconds)
         self._params = params or StreamerParams()
-        self._target = pulse_target_from_legacy_tree(sequencer.port_catalog.to_dict())
+        self._target = _pulse_target_from_port_catalog(sequencer.port_catalog)
         self._geometry = build_fingerprint(self._params) & 0xFFFFFFFF
         self._lock = threading.RLock()
         self._binding_id: str | None = None

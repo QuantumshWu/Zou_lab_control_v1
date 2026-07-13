@@ -47,11 +47,9 @@ from zlc_neutral_atom.timing import (
 from zlc_pulse import (
     PulseExecutionForm,
     RepeatRegion,
-    bind_pulse_document_target,
     compile_pulse_artifact,
     load_pulse_document,
 )
-from zlc_pulse.target import pulse_target_from_legacy_tree
 from zlc_storage import decode, encode
 from zlc_workbench.camera_capture import CameraCaptureBindingRequest
 from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
@@ -117,10 +115,6 @@ def _runtime(
         ),
     )
     sequencer = VirtualSequencer(sleep_scale=0, port_catalog=catalog)
-    document = bind_pulse_document_target(
-        document,
-        pulse_target_from_legacy_tree(sequencer.port_catalog.to_dict()),
-    )
     trap = VirtualTrapArray(grid_shape=(2, 2), image_shape=(6, 8), seed=7)
     camera = VirtualCamera(
         trap,
