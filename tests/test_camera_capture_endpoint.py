@@ -295,7 +295,7 @@ def test_capability_physical_facts_use_applied_roi_and_payload_geometry():
     assert evidence.source_id == "readout"
 
 
-def test_trigger_wiring_has_one_physical_owner_and_v2_canonical_round_trip():
+def test_trigger_wiring_has_one_physical_owner_and_current_canonical_round_trip():
     camera = _camera()
     camera.capture_trigger_channels = ("ch11", "ch12")
     _broker, _registry, _endpoint, _binding, attestation, description = (
@@ -315,7 +315,7 @@ def test_trigger_wiring_has_one_physical_owner_and_v2_canonical_round_trip():
         facts.require_single_capture_trigger_channel("ch12")
 
     facts_tree = camera_physical_facts_to_tree(facts)
-    assert facts_tree["schema"] == "zlc_neutral_atom.CameraPhysicalFacts/v2"
+    assert facts_tree["schema"] == "zlc_neutral_atom.CameraPhysicalFacts"
     assert facts_tree["capture_trigger_channels"] == ["ch11", "ch12"]
     assert camera_physical_facts_from_tree(facts_tree) == facts
     single_tree = dict(facts_tree)
@@ -324,18 +324,16 @@ def test_trigger_wiring_has_one_physical_owner_and_v2_canonical_round_trip():
     single_facts.require_single_capture_trigger_channel("ch11")
 
     evidence_tree = camera_capability_evidence_to_tree(evidence)
-    assert evidence_tree["schema"] == "zlc_neutral_atom.CameraCapabilityEvidence/v2"
+    assert evidence_tree["schema"] == "zlc_neutral_atom.CameraCapabilityEvidence"
     assert camera_capability_evidence_from_tree(evidence_tree) == evidence
-    legacy_facts_tree = dict(facts_tree)
-    legacy_facts_tree["schema"] = "zlc_neutral_atom.CameraPhysicalFacts/v1"
-    with pytest.raises(ValueError, match="expected.*v2"):
-        camera_physical_facts_from_tree(legacy_facts_tree)
-    legacy_evidence_tree = dict(evidence_tree)
-    legacy_evidence_tree["schema"] = (
-        "zlc_neutral_atom.CameraCapabilityEvidence/v1"
-    )
-    with pytest.raises(ValueError, match="expected.*v2"):
-        camera_capability_evidence_from_tree(legacy_evidence_tree)
+    unknown_facts_tree = dict(facts_tree)
+    unknown_facts_tree["schema"] = "unsupported-camera-physical-facts"
+    with pytest.raises(ValueError, match="expected.*CameraPhysicalFacts"):
+        camera_physical_facts_from_tree(unknown_facts_tree)
+    unknown_evidence_tree = dict(evidence_tree)
+    unknown_evidence_tree["schema"] = "unsupported-camera-capability-evidence"
+    with pytest.raises(ValueError, match="expected.*CameraCapabilityEvidence"):
+        camera_capability_evidence_from_tree(unknown_evidence_tree)
 
     empty_tree = dict(facts_tree)
     empty_tree["capture_trigger_channels"] = []

@@ -1,6 +1,6 @@
 # Pulse documents
 
-The checked-in JSON files are immutable `zlc_pulse.PulseDocument/v2`
+The checked-in JSON files are immutable `zlc_pulse.PulseDocument`
 authoring documents. They are source data, not FPGA projects or runtime
 snapshots. A document owns one explicit `PulseTarget`, stable period and
 parameter identities, literal nominal values, and optional frozen scan rows.

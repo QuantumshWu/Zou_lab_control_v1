@@ -118,7 +118,7 @@ docs/**/*.sty
 # Scratch GUI verification screenshots (devtools output, not deliverables)
 /_gui_shots/
 
-# Pulse presets (pulses/): checked-in PulseDocument/v2 authoring JSON is committable.
+# Pulse presets (pulses/): checked-in PulseDocument authoring JSON is committable.
 # Ignore only scratch files, unnamed timestamp saves, and local real-machine debug programs.
 pulses/_test_*
 pulses/pulse_[0-9]*.json

@@ -106,7 +106,7 @@ class ValuePayloadContract:
 
     @property
     def fingerprint(self) -> str:
-        source = f"zlc.value-payload.v2:{self.schema.fingerprint}".encode("ascii")
+        source = f"zlc.value-payload:{self.schema.fingerprint}".encode("ascii")
         return hashlib.sha256(source).hexdigest()
 
     @property
@@ -171,7 +171,7 @@ class ValuePayloadContract:
         _validate_value_validity(validity, self.schema)
 
         hasher = hashlib.sha256()
-        hasher.update(b"zlc_data.ValuePayloadContent/v2\x00")
+        hasher.update(b"zlc_data.ValuePayloadContent\x00")
 
         def update(part: bytes | memoryview) -> None:
             hasher.update(len(part).to_bytes(8, "big"))

@@ -29,9 +29,9 @@ from .target import (
 )
 
 
-PULSE_DOCUMENT_SCHEMA = "zlc_pulse.PulseDocument/v2"
-SCAN_TABLE_SCHEMA = "zlc_pulse.FrozenScanTable/v1"
-SCAN_NORMALIZER_ID = "zlc-pulse-scan-freeze/v1"
+PULSE_DOCUMENT_SCHEMA = "zlc_pulse.PulseDocument"
+SCAN_TABLE_SCHEMA = "zlc_pulse.FrozenScanTable"
+SCAN_NORMALIZER_ID = "zlc-pulse-scan-freeze"
 TIME_UNITS = frozenset(("s", "ms", "us", "ns"))
 TIME_UNIT_TO_NS = {"s": 1e9, "ms": 1e6, "us": 1e3, "ns": 1.0}
 FIELD_DURATION = "duration"
@@ -570,7 +570,7 @@ class PulseDocument:
             )
         return canonical_digest(
             {
-                "schema": "zlc_pulse.FrozenScanDefinition/v1",
+                "schema": "zlc_pulse.FrozenScanDefinition",
                 "time_step_ns": self.time_step_ns,
                 "parameters": parameters,
                 "table": frozen_scan_table_to_tree(self.scan_table),

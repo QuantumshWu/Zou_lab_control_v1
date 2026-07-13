@@ -150,7 +150,7 @@ class PipelineMemoryProfile:
         fixed = 1 << 20
         per_event = max(2048, 128 * pointer_bytes)
         identity = (
-            f"zlc.pipeline-memory-overhead.v1|{sys.implementation.name}|"
+            f"zlc.pipeline-memory-overhead|{sys.implementation.name}|"
             f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|"
             f"ptr={pointer_bytes}|fixed={fixed}|per_event={per_event}"
         )

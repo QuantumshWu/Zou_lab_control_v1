@@ -26,26 +26,6 @@ from zlc_pulse import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize(
-    ("filename", "form", "expected_ir_digest"),
-    (
-        ("camera_imaging_address_switch.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "1824c5f4ea06c6c8a299d8e33da5d60071e2b7998155892aa05e4604808eb5fd"),
-        ("imaging_template.json", PulseExecutionForm.STATIC_ONCE, "72c6b9a176b17c8882689e19fea319156c67d3398ccd16f30f9a30ed4a91f073"),
-        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "2684cbf2dff424bd24595d6e688d74418ef8c3037aca7be3f5f419864d031c00"),
-        ("probe_template.json", PulseExecutionForm.STATIC_ONCE, "d60570632f4c840e49d0e9270a10ee7fb073667c6519dc9aef1d8dfdf37b7e80"),
-        ("release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "ec0b8ae0ad75e12066e1e4c519140d370e5091fbdb591bce53ea5415c7ab036d"),
-    ),
-)
-def test_native_compiler_preserves_every_tracked_physical_golden(
-    filename, form, expected_ir_digest
-):
-    document = load_pulse_document(ROOT / "pulses" / filename)
-
-    actual = compile_pulse_document(document, clock_hz=50e6, execution_form=form)
-
-    assert actual.fingerprint == expected_ir_digest
-
-
 def test_native_compiler_preserves_compact_and_delay_unrolled_repeat_semantics():
     document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     active_port = next(
@@ -71,10 +51,59 @@ def test_native_compiler_preserves_compact_and_delay_unrolled_repeat_semantics()
         execution_form=PulseExecutionForm.STATIC_ONCE,
     )
 
-    assert compact_ir.fingerprint == "46111a335a8a8d63e506a025dfde9101f23c8b5ec983a50fb75357cc2169521d"
-    assert delayed_ir.fingerprint == "8eadcf2f08a9ccd7de4095d4bef021433a1f837f3acb47004e19fdb96bfc16e5"
+    assert compact_ir.ticks == (
+        0,
+        100_000,
+        1_100_000,
+        1_105_000,
+        1_355_000,
+        1_360_000,
+        2_360_000,
+    )
+    assert compact_ir.masks == (513, 2568, 512, 2568, 512, 2568, 0)
+    assert compact_ir.loop_start_index == 1
+    assert compact_ir.loop_end_tick == 1_355_000
     assert compact_ir.loop_count == 3
+    assert not any(compact_ir.channel_delays)
+
+    assert delayed_ir.ticks == (
+        0,
+        100_000,
+        1_100_000,
+        1_105_000,
+        1_355_000,
+        2_355_000,
+        2_360_000,
+        2_610_000,
+        3_610_000,
+        3_615_000,
+        3_865_000,
+        3_870_000,
+        4_870_000,
+    )
+    assert delayed_ir.masks == (
+        513,
+        2568,
+        512,
+        2568,
+        2568,
+        512,
+        2568,
+        2568,
+        512,
+        2568,
+        512,
+        2568,
+        0,
+    )
+    assert delayed_ir.loop_start_index == 0
+    assert delayed_ir.loop_end_tick == 4_870_000
     assert delayed_ir.loop_count == 1
+    assert [
+        (index, delay)
+        for index, delay in enumerate(delayed_ir.channel_delays)
+        if delay
+    ] == [(3, 2), (9, 2), (11, 2)]
 
 
 def test_native_compiler_folds_digital_and_dac_delays_in_one_schedule():

@@ -40,7 +40,7 @@ from zlc_neutral_atom.runtime import (
 )
 
 
-PULSE_TERMINAL_ACK_SCHEMA = "zlc_neutral_atom.PulseTerminalAck/v1"
+PULSE_TERMINAL_ACK_SCHEMA = "zlc_neutral_atom.PulseTerminalAck"
 
 
 @dataclass(frozen=True)

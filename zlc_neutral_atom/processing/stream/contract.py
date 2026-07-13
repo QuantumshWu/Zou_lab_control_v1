@@ -777,7 +777,7 @@ class BoundStreamProcessor:
         self._validated_execution_guard()
         return canonical_digest(
             {
-                "contract": "zlc_neutral_atom.BoundStreamProcessor/v2",
+                "contract": "zlc_neutral_atom.BoundStreamProcessor",
                 "definition_key": str(definition.key),
                 "definition": _tree(definition),
                 "config": _tree(self.config),

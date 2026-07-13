@@ -15,7 +15,7 @@ from zlc_storage import (
 )
 
 
-PULSE_TARGET_SCHEMA = "zlc_pulse.PulseTarget/v1"
+PULSE_TARGET_SCHEMA = "zlc_pulse.PulseTarget"
 PORT_DIGITAL = "digital"
 PORT_DAC = "dac"
 PORT_CLOCK = "clock"

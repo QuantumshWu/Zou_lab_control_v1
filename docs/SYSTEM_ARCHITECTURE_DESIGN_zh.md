@@ -2291,7 +2291,7 @@ zlc_pulse 拥有：
 
 它不拥有 MOT/readout 等实验 template、DeviceBinding、RunPlan、ScanCellKey、Qt editor 或 panel。neutral template 产生 PulseDocument/scan binding request，workbench editor 产生 PulseDocument command，二者都通过 pulse public API；pulse 不为调用方反向增加字段。当前只有 FPGA 一个生产 target，因此 compiler 可以是清晰的 concrete implementation；只有第二个可运行 target 出现且共享 IR 经过验证后，才抽 `PulseTarget` Protocol，不能先建立 target plugin/registry。
 
-Pulse authoring 与加载只保留一个当前合同：`schema="zlc_pulse.PulseDocument"`、`version=1`，并以显式`kind=table|sequence`区分可编辑table与raw sequence。`zlc_pulse.load()`和`PulseDocument.from_dict`只接受这一schema/version；所有save也只写这一格式，compiled artifact不作为同名`_program.json` sibling。迁移切片必须在删除旧实现前，把仓库中受版本控制的pulse JSON资产一次性转换为当前PulseDocument并用当前codec重新生成golden；转换脚本只服务该次repository migration，转换完成后与历史fixture、旧parser、旧schema、旧compiler bridge和逐版本upgrade链一并删除，不能安装为CLI、library或GUI能力。仓库外历史文件不属于终态产品合同；当前loader遇到旧schema必须返回明确的`UnsupportedPulseSchema`，不得按字段存在、shape或名字猜测，也不得提示一个runtime fallback。
+Pulse authoring 与加载只保留一个当前合同：`schema="zlc_pulse.PulseDocument"`，并以显式`kind=table|sequence`区分可编辑table与raw sequence。`zlc_pulse.load()`和`PulseDocument.from_dict`只接受这一格式名；所有save也只写这一格式，compiled artifact不作为同名`_program.json` sibling。仓库中受版本控制的 pulse JSON 资产与当前 codec 同步提交并通过 round-trip/golden；不存在历史 fixture、旧 parser、逐版本 upgrader 或一次性转换器。仓库外旧文件不属于终态产品合同；loader 遇到未知格式名必须返回明确的`UnsupportedPulseSchema`，不得按字段存在、shape或名字猜测，也不得提示 runtime fallback。
 
 ### 15.2 Authoring spec 与 resolved manifest
 
@@ -2505,11 +2505,13 @@ LiveDataBlockRef 只在进程内有效，由 neutral runtime broker/snapshot sto
 
 FigureArtifact 保存 ViewSpec、当次 EvaluatedFigureData 的 input revision/resolution records、Selection snapshot、layer/model/fit lineage 和所引用 dataset digests；重开默认复现保存时的 concrete selection，用户明确切回 dynamic latest policy 后才重新解析，不进行新的 axis auto 推断。若用户只保存 workspace layout 而不 materialize live data，文件必须明确标为 session-only workspace，并在数据 lifetime 结束后显示 missing binding，不能假装是自包含 FigureArtifact。
 
-### 16.4 当前 schema 与离线转换
+### 16.4 当前格式名与重跑策略
 
-正式runtime、authoring load/save、wire和全部artifact只接受各owner的当前schema；`zlc_pulse`没有历史格式例外。仓库内pulse资产的格式变化只能作为版本迁移中的一次性、可审计内容转换完成，并在同一dependency-closed切片删除转换器和全部旧fixture。其它确有长期保存义务的历史实验artifact可使用独立离线转换工具，但该工具不能被runtime/GUI自动调用，也不能成为owner codec的第二条reader路径。
+正式runtime、authoring load/save、wire和全部artifact只接受各owner的一个当前格式名。真正长期落盘、跨会话读取的值保留朴素、无改稿序号的格式名（例如 `zlc_pulse.PulseDocument`、`zlc_neutral_atom.calibration-artifact`）；临时进程内摘要只保留用途明确的 domain separator。未知格式名清晰失败，不存在版本比较、旧 reader、upgrade chain、转换 CLI 或 GUI fallback。
 
-转换工具读取明确指定的旧 artifact，输出新的当前-schema artifact，并记录 source digest、converter id/version 与转换 TransformRecords；它不覆盖原文件，也不把 legacy reader 链接进 runtime/GUI。无法无歧义恢复的 axis、unit 或 provenance 必须停止并要求用户提供映射，不能按 shape 猜。
+当前系统尚无必须保存的旧格式生产数据；标定、capture、analysis 等实验 artifact 的策略是重新采集/重跑，不维护档案迁移器。只有已部署且被硬件/外部协议真实消费的 wire/ABI 结构版本可以保留独立版本号；该例外必须有双端 consumer 和部署证据，不能由软件改稿次数推导。终态 allowlist 只有 FPGA `LAYOUT_STRUCT_VERSION=3` 与已批准部署拓扑的 `zlc_pulse.PulseTargetABI/v1` hash domain；普通 PulseTarget/PulseDocument/RPyC artifact 格式不在例外内。`ZLC-CANONICAL-1\n` 字节前缀是生成后者获批 digest 的冻结 canonical hash 原语，不是第三个可协商格式身份；它必须随该 ABI 一起保持逐字节不变。仅改变软件格式名不得重签这些硬件事实。旧树 `RuntimeSequenceProgram` 的 wire version 4 在最后一个 legacy sequencer consumer 删除前属于迁移期部署事实，必须保持原值并 dependency-closed 删除，不能误归入终态 allowlist，也不能提前改写。
+
+控制进程与 FPGA server 的当前 RPyC payload 是同一软件 release 的一个协议闭包，必须原子部署；字段或格式不一致时 fail closed，不提供 mixed-release reader、协商或 fallback。该部署约束不把软件 payload 的改稿次数提升为硬件 ABI。
 
 ## 17. 性能约束
 
@@ -2798,7 +2800,7 @@ Artifact/Calibration：
 
 Pulse/FPGA：
 
-- 仓库内每个tracked pulse JSON均只使用当前`zlc_pulse.PulseDocument/v1`并通过当前codec round-trip/golden；历史schema输入确定性返回`UnsupportedPulseSchema`，package/CLI/GUI中不存在历史parser、fixture、upgrade chain或迁移转换器；
+- 仓库内每个tracked pulse JSON均只使用当前`zlc_pulse.PulseDocument`并通过当前codec round-trip/golden；未知schema输入确定性返回`UnsupportedPulseSchema`，package/CLI/GUI中不存在历史parser、fixture、upgrade chain或迁移转换器；
 - duplicate/out-of-order/gap/EOS incomplete 均 safe；
 - upstream exact edge gap 使正式 scan 失败；
 - multi-axis TriggerKey -> ScanCellKey -> PointLayout round-trip，non-scalar y axes 完整且 transform explicit；
@@ -3109,7 +3111,7 @@ apps/
 
 ## 21. 删除清单
 
-删除由**最后一个真实 consumer 消失的 dependency-closed 切片**负责。不得因为 S1/S2 首次建立替代品就提前删掉仍被 S3/S5 使用的能力，也不得以“还有别的 consumer”为由让已迁 use case 继续双写/双读。至少固定：已迁standalone camera use case的旧显示路径 -> S1；共享旧 camera frame producer/LogicNode + legacy live-image panel + Occupancy/ROI/readout/sitemap reactive chain -> S3；旧 fitting/selection/facet/raster -> 其最后一个 legacy frontend/processor consumer 所在的 S3/S5/Z0；session calibration fallback/旧 Occupancy outputs -> S3；旧 positional/latest-polling PulseScan -> S4；TaskOutput、LegacyPanelHost、LegacyRuntimeFence、SerializedLegacyAggBridge、剩余 TaskConsole god shell -> 最后 consumer 的 S5/Z0；旧pulse多点upgrade call site、旧schema writer、runtime/wire reader、compiled sibling与逐版本upgrade链 -> H1，在该切片先一次性转换全部tracked pulse JSON，再删除历史parser/fixture、转换器和旧compiler/runtime payload路径，终态只剩当前PulseDocument codec。每项在路线图/PR checklist记录replacement、全部consumers、shared ResourceKeys、first migrated slice、last consumer slice与物理删除证据。
+删除由**最后一个真实 consumer 消失的 dependency-closed 切片**负责。不得因为 S1/S2 首次建立替代品就提前删掉仍被 S3/S5 使用的能力，也不得以“还有别的 consumer”为由让已迁 use case 继续双写/双读。至少固定：已迁standalone camera use case的旧显示路径 -> S1；共享旧 camera frame producer/LogicNode + legacy live-image panel + Occupancy/ROI/readout/sitemap reactive chain -> S3；旧 fitting/selection/facet/raster -> 其最后一个 legacy frontend/processor consumer 所在的 S3/S5/Z0；session calibration fallback/旧 Occupancy outputs -> S3；旧 positional/latest-polling PulseScan -> S4；TaskOutput、LegacyPanelHost、LegacyRuntimeFence、SerializedLegacyAggBridge、剩余 TaskConsole god shell -> 最后 consumer 的 S5/Z0；旧pulse upgrade call site、旧schema writer、runtime/wire reader、compiled sibling与upgrade链 -> H1，直接删除历史parser/fixture、转换器和旧compiler/runtime payload路径，终态只剩当前PulseDocument codec。所有 tracked pulse JSON 已是当前格式，不建立转换阶段。每项在路线图/PR checklist记录replacement、全部consumers、shared ResourceKeys、first migrated slice、last consumer slice与物理删除证据。
 
 完成态不存在：
 

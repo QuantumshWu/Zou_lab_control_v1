@@ -79,7 +79,7 @@ class RecordingExecutionGuard(ProcessorExecutionGuard):
     def __init__(
         self,
         *,
-        schema_id: str = "test.processor-execution-guard.v1",
+        schema_id: str = "test.processor-execution-guard",
         binding_fingerprint: str = "e" * 64,
         reject: bool = False,
     ) -> None:
@@ -222,7 +222,7 @@ def cells(schema: DatasetSchema) -> tuple[DatasetCellAddress, ...]:
 
 
 def artifact_ref(seed: str) -> ArtifactInputRef:
-    schema_id = "tests.synthetic-artifact-ref.v1"
+    schema_id = "tests.synthetic-artifact-ref"
     return ArtifactInputRef(
         schema_id,
         encode({"schema": schema_id, "id": seed}),
@@ -305,7 +305,7 @@ def _processor_binding(
     definition = StreamProcessorDefinition(
         DefinitionKey("test", name, 1),
         name,
-        f"test.{name}-config.v1",
+        f"test.{name}-config",
         payload.fingerprint,
         payload.fingerprint,
         key_contract.fingerprint,
@@ -594,7 +594,7 @@ def chain(
     definition = StreamProcessorDefinition(
         DefinitionKey("test", "scale", 1),
         "Scale",
-        "test.scale-config.v1",
+        "test.scale-config",
         payload.fingerprint,
         output_payload.fingerprint,
         dataset_cell_key_fingerprint(data_schema),
@@ -661,7 +661,7 @@ def emit(item: Chain, ordinal: int, *, key: DatasetCellAddress | None = None) ->
 
 
 def test_execution_guard_definition_and_binding_must_match_exactly():
-    schema_id = "test.processor-execution-guard.v1"
+    schema_id = "test.processor-execution-guard"
     with pytest.raises(ValueError, match="requires an execution_guard"):
         chain(execution_guard_schema_id=schema_id)
 
@@ -669,7 +669,7 @@ def test_execution_guard_definition_and_binding_must_match_exactly():
     with pytest.raises(ValueError, match="requires execution_guard_schema_id"):
         chain(execution_guard=extra)
 
-    wrong = RecordingExecutionGuard(schema_id="test.another-guard.v1")
+    wrong = RecordingExecutionGuard(schema_id="test.another-guard")
     with pytest.raises(ValueError, match="schema differs from definition"):
         chain(
             execution_guard_schema_id=schema_id,
@@ -722,10 +722,10 @@ def test_bound_processor_rejects_execution_guard_identity_drift():
         _ = bound.fingerprint
 
     guard._binding_fingerprint = "e" * 64
-    guard._schema_id = "test.mutated-guard.v1"
+    guard._schema_id = "test.mutated-guard"
     with pytest.raises(ValueError, match="schema changed"):
         bound._validated_execution_guard()
-    guard._schema_id = "test.processor-execution-guard.v1"
+    guard._schema_id = "test.processor-execution-guard"
 
     replacement = RecordingExecutionGuard()
     object.__setattr__(bound, "execution_guard", replacement)
@@ -1093,7 +1093,7 @@ def test_bound_processor_owner_copies_declarative_inputs():
     definition = StreamProcessorDefinition(
         definition_key,
         "Owned binding",
-        "test.owned-binding-config.v1",
+        "test.owned-binding-config",
         payload.fingerprint,
         payload.fingerprint,
         key_contract.fingerprint,
@@ -1145,7 +1145,7 @@ def test_processor_stage_owner_copies_direct_artifact_references():
 
 
 def test_artifact_input_ref_snapshots_only_canonical_owner_bytes():
-    schema_id = "tests.owner-ref.v1"
+    schema_id = "tests.owner-ref"
     payload = encode({"schema": schema_id, "id": "calibration-1"})
     reference = ArtifactInputRef(schema_id, payload, "c" * 64)
     assert reference.canonical_reference is payload
@@ -1154,7 +1154,7 @@ def test_artifact_input_ref_snapshots_only_canonical_owner_bytes():
     with pytest.raises(TypeError, match="immutable bytes"):
         ArtifactInputRef(schema_id, bytearray(payload), "c" * 64)
     with pytest.raises(ValueError, match="schema"):
-        ArtifactInputRef("tests.other-ref.v1", payload, "c" * 64)
+        ArtifactInputRef("tests.other-ref", payload, "c" * 64)
     with pytest.raises(ValueError, match="canonical owner data"):
         ArtifactInputRef(schema_id, payload + b"\x00", "c" * 64)
     oversized = encode({"schema": schema_id, "blob": "x" * (64 * 1024)})

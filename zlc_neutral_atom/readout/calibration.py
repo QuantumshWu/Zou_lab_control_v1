@@ -234,7 +234,7 @@ def _derive_calibration_source_binding_with_resolved_brackets(
     )
     witness = canonical_digest(
         {
-            "schema": "zlc_neutral_atom.calibration-bracket-witness.v1",
+            "schema": "zlc_neutral_atom.calibration-bracket-witness",
             "brackets": [
                 {
                     "context_key": [
@@ -943,7 +943,7 @@ def _readout_feature_spec_to_tree(spec: ReadoutFeatureSpec) -> dict[str, object]
     if not isinstance(spec, ReadoutFeatureSpec):
         raise TypeError("spec must be ReadoutFeatureSpec")
     return {
-        "schema": "zlc_neutral_atom.readout-feature-spec.v1",
+        "schema": "zlc_neutral_atom.readout-feature-spec",
         "kind": spec.kind.value,
         "site_axis_id": spec.site_axis_id.value,
         "boxes_xywh": spec.boxes_xywh,

@@ -41,8 +41,8 @@ from .target import PulseTarget, pulse_target_to_tree
 from .validation import validate_target_ir_for_target
 
 
-PREPARED_PULSE_REF_SCHEMA = "zlc_pulse.PreparedPulseRef/v1"
-PULSE_COMPLETION_SCHEMA = "zlc_pulse.PulseCompletion/v2"
+PREPARED_PULSE_REF_SCHEMA = "zlc_pulse.PreparedPulseRef"
+PULSE_COMPLETION_SCHEMA = "zlc_pulse.PulseCompletion"
 
 
 class PulseExecutionBackend(Protocol):
@@ -178,7 +178,7 @@ class PulseExecutionService:
             state = self._state
             backend = dict(self._backend.snapshot())
             return {
-                "schema": "zlc_pulse.PulseExecutionSnapshot/v1",
+                "schema": "zlc_pulse.PulseExecutionSnapshot",
                 "connection_generation": self._generation,
                 "target": pulse_target_to_tree(self._target),
                 "clock_hz": self._clock_hz,

@@ -581,7 +581,7 @@ class DeployedStreamerSession:
         with self._lock:
             terminal = self._terminal
             return {
-                "schema": "zlc_pulse.DeployedStreamerSessionSnapshot/v2",
+                "schema": "zlc_pulse.DeployedStreamerSessionSnapshot",
                 "transport": self.transport.transport_id,
                 "geometry_fingerprint": build_fingerprint(self.params) & 0xFFFFFFFF,
                 "clock_hz": self.clock_hz,

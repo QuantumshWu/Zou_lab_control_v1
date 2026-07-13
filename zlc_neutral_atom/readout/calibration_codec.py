@@ -52,13 +52,13 @@ from .codec import (
 from .contracts import FrameContract
 
 
-CALIBRATION_SOURCE_BINDING_SCHEMA = "zlc_neutral_atom.calibration-source-binding.v1"
-SITE_MAP_SCHEMA = "zlc_neutral_atom.site-map.v1"
-READOUT_MODEL_QUALITY_SCHEMA = "zlc_neutral_atom.readout-model-quality.v3"
-READOUT_MODEL_HEADER_SCHEMA = "zlc_neutral_atom.readout-model-header.v1"
-READOUT_MODEL_SCHEMA = "zlc_neutral_atom.readout-model.v1"
-DEFAULT_MODEL_POLICY_SCHEMA = "zlc_neutral_atom.default-model-policy.v1"
-CALIBRATION_ARTIFACT_SCHEMA = "zlc_neutral_atom.calibration-artifact.v1"
+CALIBRATION_SOURCE_BINDING_SCHEMA = "zlc_neutral_atom.calibration-source-binding"
+SITE_MAP_SCHEMA = "zlc_neutral_atom.site-map"
+READOUT_MODEL_QUALITY_SCHEMA = "zlc_neutral_atom.readout-model-quality"
+READOUT_MODEL_HEADER_SCHEMA = "zlc_neutral_atom.readout-model-header"
+READOUT_MODEL_SCHEMA = "zlc_neutral_atom.readout-model"
+DEFAULT_MODEL_POLICY_SCHEMA = "zlc_neutral_atom.default-model-policy"
+CALIBRATION_ARTIFACT_SCHEMA = "zlc_neutral_atom.calibration-artifact"
 
 
 class CalibrationCodecError(ValueError):

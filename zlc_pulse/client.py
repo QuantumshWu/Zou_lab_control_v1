@@ -45,7 +45,7 @@ def pulse_server_snapshot_from_tree(tree: object) -> PulseServerSnapshot:
     }
     if not isinstance(tree, dict) or set(tree) != fields:
         raise ValueError("PulseExecutionSnapshot has an unknown field set")
-    if tree["schema"] != "zlc_pulse.PulseExecutionSnapshot/v1":
+    if tree["schema"] != "zlc_pulse.PulseExecutionSnapshot":
         raise ValueError("PulseExecutionSnapshot schema differs")
     generation = tree["connection_generation"]
     state = tree["state"]

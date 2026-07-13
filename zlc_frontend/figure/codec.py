@@ -29,8 +29,8 @@ from .model import (
 )
 
 
-VIEW_SPEC_SCHEMA = "zlc_frontend.ViewSpec/v1"
-FIGURE_DOCUMENT_SCHEMA = "zlc_frontend.FigureDocument/v1"
+VIEW_SPEC_SCHEMA = "zlc_frontend.ViewSpec"
+FIGURE_DOCUMENT_SCHEMA = "zlc_frontend.FigureDocument"
 
 
 def _exact(tree: Any, fields: set[str], context: str) -> dict[str, Any]:

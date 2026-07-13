@@ -1,8 +1,8 @@
 {
-  "schema": "zlc_pulse.PulseDocument/v2",
+  "schema": "zlc_pulse.PulseDocument",
   "name": "probe_template",
   "target": {
-    "schema": "zlc_pulse.PulseTarget/v1",
+    "schema": "zlc_pulse.PulseTarget",
     "raw_lanes": [
       "ch00",
       "ch01",

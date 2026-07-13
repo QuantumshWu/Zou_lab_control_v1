@@ -30,9 +30,9 @@ from .transform_codec import committed_transform_from_tree, committed_transform_
 from .value import BlockId, DatasetRevision, DatasetRevisionRef, StreamGenerationId
 
 
-FIT_SPEC_SCHEMA = "zlc_data.FitSpec/v1"
-FIT_RESULT_BATCH_SCHEMA = "zlc_data.FitResultBatch/v1"
-DATASET_REVISION_REF_SCHEMA = "zlc_data.DatasetRevisionRef/v1"
+FIT_SPEC_SCHEMA = "zlc_data.FitSpec"
+FIT_RESULT_BATCH_SCHEMA = "zlc_data.FitResultBatch"
+DATASET_REVISION_REF_SCHEMA = "zlc_data.DatasetRevisionRef"
 
 
 def fit_spec_to_tree(spec: FitSpec) -> dict[str, Any]:

@@ -88,7 +88,7 @@ OCCUPANCY_STREAM_PROCESSOR_KEY = DefinitionKey(
     "occupancy-stream",
     1,
 )
-_OCCUPANCY_CONFIG_SCHEMA = "zlc_neutral_atom.occupancy-stream-config.v1"
+_OCCUPANCY_CONFIG_SCHEMA = "zlc_neutral_atom.occupancy-stream-config"
 _READOUT_MODELS = (
     BoxReadoutModel,
     PerSitePsfReadoutModel,
@@ -98,7 +98,7 @@ _RECORD_CONTAINER_BYTES = 128
 _BOUND_OCCUPANCY_TOKEN = object()
 _OCCUPANCY_EXECUTION_GUARD_TOKEN = object()
 _OCCUPANCY_EXECUTION_GUARD_SCHEMA = (
-    "zlc_neutral_atom.occupancy-exact-execution-guard.v1"
+    "zlc_neutral_atom.occupancy-exact-execution-guard"
 )
 
 
@@ -235,7 +235,7 @@ class OccupancySampleContract:
             "_fingerprint",
             canonical_digest(
                 {
-                    "contract": "zlc_neutral_atom.OccupancySample/v2",
+                    "contract": "zlc_neutral_atom.OccupancySample",
                     "occupied": occupied_contract.fingerprint,
                     "counts": counts_contract.fingerprint,
                     "metadata": self.metadata_contract.fingerprint,
@@ -331,7 +331,7 @@ class OccupancySampleContract:
         )
         return canonical_digest(
             {
-                "schema": "zlc_neutral_atom.OccupancySampleContent/v2",
+                "schema": "zlc_neutral_atom.OccupancySampleContent",
                 "occupied": occupied_digest,
                 "counts": counts_digest,
                 "metadata": self.metadata_contract.digest(metadata),
@@ -388,7 +388,7 @@ class OccupancyDatasetMetadataContract:
             "_fingerprint",
             canonical_digest(
                 {
-                    "contract": "zlc_neutral_atom.OccupancyDatasetMetadata/v2",
+                    "contract": "zlc_neutral_atom.OccupancyDatasetMetadata",
                     "payload": self.payload_contract.fingerprint,
                     "occupied": occupied_contract.fingerprint,
                     "source_metadata": self.payload_contract.metadata_contract.fingerprint,
@@ -462,7 +462,7 @@ class OccupancyDatasetMetadataContract:
         self.payload_contract.metadata_contract.validate(source_metadata)
         return canonical_digest(
             {
-                "schema": "zlc_neutral_atom.OccupancyDatasetMetadataDigest/v2",
+                "schema": "zlc_neutral_atom.OccupancyDatasetMetadataDigest",
                 "occupied": occupied_digest,
                 "source_metadata": self.payload_contract.metadata_contract.digest(
                     source_metadata
@@ -496,7 +496,6 @@ class OccupancyDatasetEventAdapter:
             canonical_digest(
                 {
                     "owner": "zlc_neutral_atom.readout.OccupancyDatasetEventAdapter",
-                    "schema": "v2",
                     "payload": self.payload_contract.fingerprint,
                 }
             ),
@@ -1002,7 +1001,7 @@ class BoundOccupancyStreamProcessor:
         self._validate_identity()
         return canonical_digest(
             {
-                "contract": "zlc_neutral_atom.BoundOccupancyStreamProcessor/v2",
+                "contract": "zlc_neutral_atom.BoundOccupancyStreamProcessor",
                 "processor": self._processor.fingerprint,
                 "output_consumer_contract": (
                     self._output_edge.consumer_contract_digest
@@ -1204,7 +1203,7 @@ def _capture_input_contract_digest(
         raise ValueError("camera provenance is required")
     return canonical_digest(
         {
-            "schema": "zlc_neutral_atom.OccupancyCaptureInput/v1",
+            "schema": "zlc_neutral_atom.OccupancyCaptureInput",
             "stream_id": contract.stream_id.value,
             "source_id": contract.source_id,
             "dataset_schema": contract.dataset_schema.fingerprint,

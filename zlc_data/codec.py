@@ -38,11 +38,11 @@ from .value import (
 )
 
 
-AXIS_SCHEMA = "zlc_data.AxisSpec/v1"
-VALUE_SCHEMA = "zlc_data.ValueSchema/v1"
-DATASET_SCHEMA = "zlc_data.DatasetSchema/v1"
-VALUE = "zlc_data.Value/v1"
-DATA_BLOCK = "zlc_data.DataBlock/v1"
+AXIS_SCHEMA = "zlc_data.AxisSpec"
+VALUE_SCHEMA = "zlc_data.ValueSchema"
+DATASET_SCHEMA = "zlc_data.DatasetSchema"
+VALUE = "zlc_data.Value"
+DATA_BLOCK = "zlc_data.DataBlock"
 
 
 class TypedCodecError(ValueError):

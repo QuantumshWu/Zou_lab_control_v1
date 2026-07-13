@@ -40,7 +40,7 @@ from zlc_neutral_atom.runtime.dataset import (
 
 
 COMPILED_CAPTURE_CELL_PLAN_SCHEMA = (
-    "zlc_neutral_atom.CompiledCaptureCellPlan/v1"
+    "zlc_neutral_atom.CompiledCaptureCellPlan"
 )
 
 

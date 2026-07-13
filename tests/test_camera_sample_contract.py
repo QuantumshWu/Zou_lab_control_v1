@@ -109,7 +109,7 @@ def test_camera_capture_spec_has_one_current_canonical_encoding():
         decode_camera_capture_spec(encode(tree))
     with pytest.raises(ValueError, match="schema differs"):
         decode_camera_capture_spec(
-            encode({**decode(frozen.payload), "schema": "camera-spec.v0"})
+            encode({**decode(frozen.payload), "schema": "unsupported-camera-spec"})
         )
 
 

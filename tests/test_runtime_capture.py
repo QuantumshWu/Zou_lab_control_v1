@@ -711,7 +711,7 @@ def processor_capture_harness(
     definition = StreamProcessorDefinition(
         DefinitionKey("tests", "identity-camera", 1),
         "Identity camera",
-        "tests.identity-camera.v1",
+        "tests.identity-camera",
         item.contract.payload_contract.fingerprint,
         output_payload_contract.fingerprint,
         dataset_cell_key_fingerprint(item.contract.dataset_schema),
@@ -954,8 +954,8 @@ def minimal_pipeline(item: CaptureHarness, *, memory_limit: int = 4 << 20):
     definition = MeasurementDefinition(
         DefinitionKey("tests", "camera-capture", 1),
         "Camera capture",
-        "tests.camera-request.v1",
-        "tests.camera-binding.v1",
+        "tests.camera-request",
+        "tests.camera-binding",
         SHA_C,
         item.contract.dataset_schema.fingerprint,
     )

@@ -113,13 +113,13 @@ else:
 
 CALIBRATION_MANIFEST_SCHEMA = "zlc_neutral_atom.calibration-manifest"
 _CALIBRATION_DERIVATION_SCHEMA = "zlc_neutral_atom.CalibrationDerivation"
-_CALIBRATION_PLAN_BINDING_SCHEMA = "zlc_neutral_atom.CalibrationPlanBinding/v1"
-_CALIBRATION_ANALYSIS_RESULT_SCHEMA = "zlc_neutral_atom.CalibrationAnalysisResult/v1"
+_CALIBRATION_PLAN_BINDING_SCHEMA = "zlc_neutral_atom.CalibrationPlanBinding"
+_CALIBRATION_ANALYSIS_RESULT_SCHEMA = "zlc_neutral_atom.CalibrationAnalysisResult"
 _ADMITTED_CALIBRATION_EVIDENCE_SCHEMA = (
-    "zlc_neutral_atom.AdmittedCalibrationEvidence/v1"
+    "zlc_neutral_atom.AdmittedCalibrationEvidence"
 )
 _ADMITTED_CALIBRATION_INTEGRITY_SCHEMA = (
-    "zlc_neutral_atom.AdmittedCalibrationIntegrity/v1"
+    "zlc_neutral_atom.AdmittedCalibrationIntegrity"
 )
 _CALIBRATION_NAMESPACE = "calibration"
 _EXECUTED_TOKEN = object()
@@ -175,7 +175,7 @@ def _resource_policy_digest(policy: CalibrationResourcePolicy) -> str:
     snapshot = _resource_policy_snapshot(policy)
     return canonical_digest(
         {
-            "schema": "zlc_neutral_atom.CalibrationRepositoryResourcePolicy/v1",
+            "schema": "zlc_neutral_atom.CalibrationRepositoryResourcePolicy",
             "max_manifest_bytes": snapshot.max_manifest_bytes,
             "max_artifact_blob_bytes": snapshot.max_artifact_blob_bytes,
             "max_models": snapshot.max_models,

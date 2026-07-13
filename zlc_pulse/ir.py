@@ -14,7 +14,7 @@ from zlc_storage import (
 )
 
 
-TARGET_IR_SCHEMA = "zlc_pulse.TargetIR/v2"
+TARGET_IR_SCHEMA = "zlc_pulse.TargetIR"
 BUS_MODES = frozenset(("edge", "ramp"))
 SLOT_KINDS = frozenset(("duration", "dac"))
 

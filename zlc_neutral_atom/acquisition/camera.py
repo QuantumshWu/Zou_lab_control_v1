@@ -36,7 +36,7 @@ from zlc_neutral_atom.camera_operator import (
 )
 
 
-_CAMERA_CAPTURE_SPEC_SCHEMA = "zlc_neutral_atom.camera-capture-spec.v1"
+_CAMERA_CAPTURE_SPEC_SCHEMA = "zlc_neutral_atom.camera-capture-spec"
 CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT = canonical_digest(
     {
         "owner": "zlc_neutral_atom.acquisition.camera",
@@ -243,7 +243,7 @@ class CameraFrameMetadataContract:
     def fingerprint(self) -> str:
         return canonical_digest(
             {
-                "contract": "zlc.camera-frame-metadata.v1",
+                "contract": "zlc.camera-frame-metadata",
                 "correlation_id_max_bytes": self.correlation_id_max_bytes,
             }
         )
@@ -294,7 +294,7 @@ class CameraSampleContract:
     def fingerprint(self) -> str:
         return canonical_digest(
             {
-                "contract": "zlc.camera-sample.v2",
+                "contract": "zlc.camera-sample",
                 "value_schema_fingerprint": self.value_schema.fingerprint,
                 "metadata_contract_fingerprint": self.metadata_contract.fingerprint,
             }
@@ -345,7 +345,7 @@ class CameraSampleContract:
         self.metadata_contract.validate(metadata)
         return canonical_digest(
             {
-                "schema": "zlc.camera-sample-content.v2",
+                "schema": "zlc.camera-sample-content",
                 "image": ValuePayloadContract(self.value_schema).digest_content(
                     image_values,
                     image_validity,

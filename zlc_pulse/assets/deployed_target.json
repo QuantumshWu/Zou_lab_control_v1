@@ -1,5 +1,5 @@
 {
-  "schema": "zlc_pulse.PulseTarget/v1",
+  "schema": "zlc_pulse.PulseTarget",
   "raw_lanes": [
     "ch00",
     "ch01",

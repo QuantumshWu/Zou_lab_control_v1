@@ -13,7 +13,7 @@ from zlc_storage import (
 )
 
 
-CALIBRATION_ARTIFACT_REF_SCHEMA = "zlc_neutral_atom.calibration-artifact-ref.v1"
+CALIBRATION_ARTIFACT_REF_SCHEMA = "zlc_neutral_atom.calibration-artifact-ref"
 _CALIBRATION_NAMESPACE = "calibration"
 
 

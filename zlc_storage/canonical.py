@@ -20,7 +20,7 @@ from typing import Any, Callable, TypeAlias
 import numpy as np
 
 
-CANONICAL_MEDIA_TYPE = "application/vnd.zlc.canonical-v1+json"
+CANONICAL_MEDIA_TYPE = "application/vnd.zlc.canonical+json"
 _FRAME = b"ZLC-CANONICAL-1\n"
 
 

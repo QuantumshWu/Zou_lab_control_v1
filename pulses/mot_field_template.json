@@ -1,8 +1,8 @@
 {
-  "schema": "zlc_pulse.PulseDocument/v2",
+  "schema": "zlc_pulse.PulseDocument",
   "name": "mot_field_scan",
   "target": {
-    "schema": "zlc_pulse.PulseTarget/v1",
+    "schema": "zlc_pulse.PulseTarget",
     "raw_lanes": [
       "ch00",
       "ch01",
@@ -710,7 +710,7 @@
     }
   ],
   "scan_table": {
-    "schema": "zlc_pulse.FrozenScanTable/v1",
+    "schema": "zlc_pulse.FrozenScanTable",
     "columns": [
       "da_x",
       "da_y",

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+import re
+import subprocess
 
 import pytest
 
@@ -161,4 +163,69 @@ def test_calibration_numeric_versions_are_not_admission_authority():
     assert len(calls) == 1, (
         "numeric version notes must be sampled once, only when constructing "
         "the top-level CalibrationArtifact"
+    )
+
+
+def test_current_format_names_do_not_encode_edit_counters():
+    pattern = re.compile(
+        r"(?:\.v|/v)\d+"
+        r"|[\"']schema[\"']\s*:\s*[\"'](?:v\d+|[^\"']*[-_]v\d+)[\"']"
+        r"|application/vnd\.zlc\.[^\"']*-v\d+"
+        r"|ZLC-CANONICAL-\d+"
+    )
+    hardware_protocol_allowlist = {
+        Path("zlc_pulse/target.py"): ("zlc_pulse.PulseTargetABI/v1",),
+        Path("zlc_storage/canonical.py"): ("ZLC-CANONICAL-1",),
+        Path("tests/test_zlc_storage_canonical.py"): ("ZLC-CANONICAL-1",),
+        Path("docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md"): (
+            "zlc_pulse.PulseTargetABI/v1",
+            "ZLC-CANONICAL-1",
+        ),
+    }
+    ratchet_path = Path(__file__).resolve().relative_to(ROOT)
+    roots = (
+        "zlc_data",
+        "zlc_storage",
+        "zlc_pulse",
+        "zlc_neutral_atom",
+        "zlc_frontend",
+        "zlc_workbench",
+        "tests",
+        "docs",
+        "pulses",
+    )
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z", "--", *roots, ".gitignore"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout.decode("utf-8")
+    violations = []
+    for item in tracked.split("\0"):
+        if not item:
+            continue
+        relative = Path(item)
+        path = ROOT / relative
+        if relative == ratchet_path:
+            continue
+        if path.name != ".gitignore" and path.suffix not in {
+            ".py",
+            ".md",
+            ".json",
+            ".toml",
+        }:
+            continue
+        for line_number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(),
+            start=1,
+        ):
+            candidate = line
+            for allowed in hardware_protocol_allowlist.get(relative, ()):
+                candidate = candidate.replace(allowed, "")
+            if pattern.search(candidate):
+                violations.append(f"{relative}:{line_number}: {line.strip()}")
+    assert not violations, (
+        "current-only format and framing names are plain identities; encoded "
+        "edit counters are forbidden:\n"
+        + "\n".join(violations)
     )

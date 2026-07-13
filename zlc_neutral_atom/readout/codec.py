@@ -24,11 +24,11 @@ from .contracts import (
 )
 
 
-READOUT_BINDING_KEY_SCHEMA = "zlc_neutral_atom.readout-binding-key.v1"
-CAMERA_EVENT_READOUT_SETTING_SCHEMA = "zlc_neutral_atom.camera-event-readout-setting.v1"
-CAMERA_CAPTURE_DESCRIPTOR_SCHEMA = "zlc_neutral_atom.camera-capture-descriptor.v1"
-FRAME_CONTRACT_SCHEMA = "zlc_neutral_atom.frame-contract.v1"
-CALIBRATION_CAPTURE_LAYOUT_SCHEMA = "zlc_neutral_atom.calibration-capture-layout.v1"
+READOUT_BINDING_KEY_SCHEMA = "zlc_neutral_atom.readout-binding-key"
+CAMERA_EVENT_READOUT_SETTING_SCHEMA = "zlc_neutral_atom.camera-event-readout-setting"
+CAMERA_CAPTURE_DESCRIPTOR_SCHEMA = "zlc_neutral_atom.camera-capture-descriptor"
+FRAME_CONTRACT_SCHEMA = "zlc_neutral_atom.frame-contract"
+CALIBRATION_CAPTURE_LAYOUT_SCHEMA = "zlc_neutral_atom.calibration-capture-layout"
 
 
 class ReadoutCodecError(ValueError):

@@ -222,7 +222,7 @@ class OrderedEventSpanHasher:
         self._start_sequence = start
         self._next_sequence = start
         self._hasher = hashlib.sha256()
-        self._hasher.update(b"zlc_neutral_atom.OrderedEventRefs/v2\x00")
+        self._hasher.update(b"zlc_neutral_atom.OrderedEventRefs\x00")
         self._sealed = False
 
     def update(self, reference: EventRef) -> None:
@@ -301,7 +301,7 @@ class ArtifactInputRef:
     def fingerprint(self) -> str:
         return canonical_digest(
             {
-                "contract": "zlc_neutral_atom.ArtifactInputRef/v2",
+                "contract": "zlc_neutral_atom.ArtifactInputRef",
                 "reference_schema_id": self.reference_schema_id,
                 "reference_digest": self.reference_digest,
                 "content_digest": self.content_digest,

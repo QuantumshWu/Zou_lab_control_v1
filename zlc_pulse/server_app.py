@@ -249,7 +249,7 @@ def build_server_runtime(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the current-only pulse execution server")
-    parser.add_argument("--target", required=True, help="canonical zlc_pulse.PulseTarget/v1 file")
+    parser.add_argument("--target", required=True, help="canonical zlc_pulse.PulseTarget file")
     parser.add_argument("--backend", required=True, choices=("jtag-axi", "uart"))
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--host", default="0.0.0.0")

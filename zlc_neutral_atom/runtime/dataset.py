@@ -90,7 +90,7 @@ class DatasetMetadataContract(Protocol[PayloadT]):
 
 @dataclass(frozen=True)
 class NoDatasetMetadataContract:
-    fingerprint: str = hashlib.sha256(b"zlc.dataset-metadata.none.v1").hexdigest()
+    fingerprint: str = hashlib.sha256(b"zlc.dataset-metadata.none").hexdigest()
     max_retained_nbytes: int = 0
 
     @staticmethod
@@ -121,7 +121,6 @@ class ValueDatasetEventAdapter:
         {
             "owner": "zlc_neutral_atom.runtime.dataset.ValueDatasetEventAdapter",
             "operator": "identity-value",
-            "schema": "v1",
         }
     )
 
@@ -412,7 +411,7 @@ class DatasetCellDomain:
             "_fingerprint",
             canonical_digest(
                 {
-                    "contract": "zlc_neutral_atom.DatasetCellDomain/v1",
+                    "contract": "zlc_neutral_atom.DatasetCellDomain",
                     "repeat_axis": axis_to_tree(self.repeat_axis),
                     "point_axes": [axis_to_tree(axis) for axis in axes],
                     "point_layout": point_layout_to_tree(self.point_layout),
@@ -497,7 +496,7 @@ def dataset_cell_permutation_fingerprint(
         raise TypeError("cells must contain DatasetCellAddress values")
     return canonical_digest(
         {
-            "contract": "zlc_neutral_atom.DatasetCellPermutation/v1",
+            "contract": "zlc_neutral_atom.DatasetCellPermutation",
             "dataset_schema_fingerprint": dataset_schema_fingerprint,
             "cells": [
                 [cell.repeat_index, cell.point_storage_index]
@@ -519,7 +518,7 @@ def dataset_key_sequence_digest(
     dataset_cell_permutation_digest(schema, ordered)
     return canonical_digest(
         {
-            "contract": "zlc_neutral_atom.DatasetKeySequence/v1",
+            "contract": "zlc_neutral_atom.DatasetKeySequence",
             "key_contract_fingerprint": dataset_cell_key_fingerprint(schema),
             "cells": [
                 [cell.repeat_index, cell.point_storage_index]
@@ -546,7 +545,7 @@ def dataset_consumer_contract_digest(
     )
     return canonical_digest(
         {
-            "contract": "zlc_neutral_atom.DatasetConsumerContract/v2",
+            "contract": "zlc_neutral_atom.DatasetConsumerContract",
             "dataset_schema_fingerprint": schema.fingerprint,
             "join_plan_digest": dataset_cell_permutation_digest(schema, cells),
             "metadata_contract_fingerprint": metadata_contract_fingerprint,
@@ -752,13 +751,13 @@ class FrozenDatasetEdge(Generic[PayloadT]):
         if cells is None:
             schedule_digest = canonical_digest(
                 {
-                    "contract": "zlc_neutral_atom.RollingDatasetJoin/v1",
+                    "contract": "zlc_neutral_atom.RollingDatasetJoin",
                     "dataset_schema_fingerprint": schema.fingerprint,
                 }
             )
             consumer_digest = canonical_digest(
                 {
-                    "contract": "zlc_neutral_atom.RollingDatasetConsumer/v1",
+                    "contract": "zlc_neutral_atom.RollingDatasetConsumer",
                     "dataset_schema_fingerprint": schema.fingerprint,
                     "metadata_contract_fingerprint": metadata_fingerprint,
                     "event_adapter_operator_fingerprint": operator_fingerprint,
@@ -1167,7 +1166,7 @@ class OrderedDatasetEventHasher:
         self._next_sequence = int(start_sequence)
         self._hasher = hashlib.sha256()
         self._hasher.update(
-            b"zlc_neutral_atom.DatasetOrderedPayloadEvents/v2\x00"
+            b"zlc_neutral_atom.DatasetOrderedPayloadEvents\x00"
         )
 
     def update(self, reference: EventRef, metadata_digest: str) -> None:

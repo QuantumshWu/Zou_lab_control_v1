@@ -185,7 +185,7 @@ def test_resident_finite_terminal_owner_starts_at_fire_before_await():
     assert completion is not None
     terminal = session.snapshot()["terminal"]
     assert terminal["cursor_first"] == terminal["cursor_second"] == 3
-    assert terminal["schema"] == "zlc_pulse.AutonomousTableTerminalEvidence/v1"
+    assert terminal["schema"] == "zlc_pulse.AutonomousTableTerminalEvidence"
     assert "expected_final_cursor" not in terminal
     assert "logical_done" not in terminal
     assert completion.post_terminal_tail.terminal_evidence_digest == (
@@ -215,7 +215,7 @@ def test_static_terminal_evidence_never_reads_semantically_empty_cursor():
     assert completion is not None
     assert CtrlWords.CURSOR not in transport.read_addresses
     assert session.snapshot()["terminal"]["schema"] == (
-        "zlc_pulse.StaticOnceTerminalEvidence/v1"
+        "zlc_pulse.StaticOnceTerminalEvidence"
     )
 
 

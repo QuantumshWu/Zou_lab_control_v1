@@ -114,7 +114,7 @@ def test_neutral_terminal_ack_codec_preserves_hardware_and_simulated_receipts():
         "generation-2",
         SimulatedPulseReceipt(
             artifact.fingerprint,
-            "test-simulator/v1",
+            "test-simulator",
             counts,
             0.25,
             0.01,
@@ -184,7 +184,7 @@ def test_neutral_boundary_rejects_simulated_duration_or_tail_not_derived_from_ar
         (
             SimulatedPulseReceipt(
                 artifact.fingerprint,
-                "test-simulator/v1",
+                "test-simulator",
                 counts,
                 999.0,
                 artifact.max_configured_output_delay_ticks
@@ -195,7 +195,7 @@ def test_neutral_boundary_rejects_simulated_duration_or_tail_not_derived_from_ar
         (
             SimulatedPulseReceipt(
                 artifact.fingerprint,
-                "test-simulator/v1",
+                "test-simulator",
                 counts,
                 logical_duration,
                 999.0,

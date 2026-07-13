@@ -2167,7 +2167,7 @@ def _freeze_partition(
     test = tuple(sorted(ordered[test_start:]))
     digest = canonical_digest(
         {
-            "schema": "zlc_neutral_atom.CalibrationBracketPartition/v3",
+            "schema": "zlc_neutral_atom.CalibrationBracketPartition",
             "source_schema": request.layout.readout_event_axis_id.value,
             "partition_policy": "ALGORITHM_FIXED_HASH_ORDER_V1",
             "train": [_context_tree(brackets[index].context_key) for index in train],

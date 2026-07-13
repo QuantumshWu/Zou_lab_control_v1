@@ -81,7 +81,7 @@ class CoordinateRangeSelection:
 
 
 SelectionTerm = IndexSelection | IndexRangeSelection | CoordinateRangeSelection
-SELECTION_SCHEMA = "zlc_data.Selection/v1"
+SELECTION_SCHEMA = "zlc_data.Selection"
 
 
 @dataclass(frozen=True)

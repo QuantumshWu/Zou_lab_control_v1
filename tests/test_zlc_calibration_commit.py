@@ -798,6 +798,17 @@ def test_manifest_and_derivation_tampering_are_rejected_current_only(committed):
         )
     )
 
+    unsupported_manifest = decode(encode(manifest))
+    unsupported_manifest["schema"] = "unsupported-calibration-manifest"
+    stored = repository._store.publish_manifest(
+        "calibration",
+        encode(unsupported_manifest),
+    )
+    with pytest.raises(ValueError, match="unsupported.*manifest schema"):
+        repository.load(
+            CalibrationArtifactRef(repository.repository_id, stored.content.digest)
+        )
+
     forged_manifest = decode(encode(manifest))
     forged_manifest["resource_summary"]["site_count"] += 1
     stored = repository._store.publish_manifest("calibration", encode(forged_manifest))
@@ -836,23 +847,6 @@ def test_manifest_and_derivation_tampering_are_rejected_current_only(committed):
     stored = repository._store.publish_manifest("calibration", encode(derivation_only))
     with pytest.raises(ValueError, match="analysis_run_id differs"):
         repository.load(CalibrationArtifactRef(repository.repository_id, stored.content.digest))
-
-    artifact_ref = ContentRef(
-        manifest["artifact_blob"]["digest"],
-        manifest["artifact_blob"]["size"],
-    )
-    legacy = {
-        "schema": "zlc_neutral_atom.calibration-manifest.v1",
-        "repository_id": repository.repository_id,
-        "artifact_schema": manifest["artifact_schema"],
-        "artifact_blob": {"digest": artifact_ref.digest, "size": artifact_ref.size},
-        "artifact_fingerprint": manifest["artifact_fingerprint"],
-        "resource_summary": manifest["resource_summary"],
-    }
-    stored = repository._store.publish_manifest("calibration", encode(legacy))
-    with pytest.raises(ValueError, match="unknown field set|unsupported"):
-        repository.load(CalibrationArtifactRef(repository.repository_id, stored.content.digest))
-
 
 def test_admission_requires_the_concrete_exact_source_repository(
     committed,

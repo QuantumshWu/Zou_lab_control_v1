@@ -55,7 +55,7 @@ class PulseWireImage:
     def digest(self) -> str:
         return canonical_digest(
             {
-                "schema": "zlc_pulse.PulseWireImage/v1",
+                "schema": "zlc_pulse.PulseWireImage",
                 "geometry_fingerprint": self.geometry_fingerprint,
                 "source_ir_digest": self.source_ir_digest,
                 "words": [list(item) for item in self.words],
@@ -108,7 +108,7 @@ def pulse_wire_image_to_tree(value: PulseWireImage) -> dict[str, object]:
     if not isinstance(value, PulseWireImage):
         raise TypeError("value must be PulseWireImage")
     return {
-        "schema": "zlc_pulse.PulseWireImage/v1",
+        "schema": "zlc_pulse.PulseWireImage",
         "geometry_fingerprint": value.geometry_fingerprint,
         "source_ir_digest": value.source_ir_digest,
         "words": [list(item) for item in value.words],
@@ -125,7 +125,7 @@ def pulse_wire_image_from_tree(tree: object) -> PulseWireImage:
         "digest",
     }:
         raise ValueError("PulseWireImage has an unknown field set")
-    if tree["schema"] != "zlc_pulse.PulseWireImage/v1":
+    if tree["schema"] != "zlc_pulse.PulseWireImage":
         raise ValueError("PulseWireImage schema differs")
     if not isinstance(tree["words"], list):
         raise TypeError("PulseWireImage words must be a list")

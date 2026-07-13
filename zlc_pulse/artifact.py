@@ -27,7 +27,7 @@ from .schedule import (
 )
 
 
-COMPILED_PULSE_ARTIFACT_SCHEMA = "zlc_pulse.CompiledPulseArtifact/v2"
+COMPILED_PULSE_ARTIFACT_SCHEMA = "zlc_pulse.CompiledPulseArtifact"
 
 
 class PulseExecutionForm(str, Enum):

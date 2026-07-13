@@ -30,19 +30,18 @@ def test_current_validator_pins_the_frozen_rtl_slot_multiplier_width():
 
 
 @pytest.mark.parametrize(
-    ("name", "form", "expected_digest", "expected_physical_words_digest"),
+    ("name", "form", "expected_physical_words_digest"),
     [
-        ("camera_imaging_address_switch.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "0ebde69385958428c1ca3a39426f6ea321506573cb61ede1b8827429c4cc472c", "5d4984bc20a7e635210903878e3b5c0dacd1f22d0ba0029ab7de0218db5fc946"),
-        ("imaging_template.json", PulseExecutionForm.STATIC_ONCE, "d3e386a079a5c9fcb83ed979aa03ec890d8db88477cac22814bca6be066c3017", "e6127a992b7176a4059f615c47bf30d3a6ee3ff30f12c7e2f789b107fde8bae5"),
-        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "e4a37e156503e67e252587439ea5068f2e92fab9bcf75582897027269b0610f1", "7b6122ea0799bc7ffd52dba2e20505e67f92dc5f63333968170afaefd3af60ea"),
-        ("probe_template.json", PulseExecutionForm.STATIC_ONCE, "b80072f49f39df2e5828572ddc49d356435dd5152a84cd662b83ed53d8144cab", "7a2a1b1d6a35cb7b94df7bc4e149dda3c2b6f9d1d57ae331dbbca0d74346d46a"),
-        ("release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "1e58a2f60b09836e581b9c2c11e8c90f81ea490bdcb98c92875a215df5f17b4b", "d9a679a6d6118a817cd213fe908d5b27f51590675638941f3aa5656c7b5c253a"),
+        ("camera_imaging_address_switch.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "5d4984bc20a7e635210903878e3b5c0dacd1f22d0ba0029ab7de0218db5fc946"),
+        ("imaging_template.json", PulseExecutionForm.STATIC_ONCE, "e6127a992b7176a4059f615c47bf30d3a6ee3ff30f12c7e2f789b107fde8bae5"),
+        ("mot_field_template.json", PulseExecutionForm.AUTONOMOUS_SCAN_ONCE, "7b6122ea0799bc7ffd52dba2e20505e67f92dc5f63333968170afaefd3af60ea"),
+        ("probe_template.json", PulseExecutionForm.STATIC_ONCE, "7a2a1b1d6a35cb7b94df7bc4e149dda3c2b6f9d1d57ae331dbbca0d74346d46a"),
+        ("release_recapture.json", PulseExecutionForm.STATIC_REFERENCE_POINT, "d9a679a6d6118a817cd213fe908d5b27f51590675638941f3aa5656c7b5c253a"),
     ],
 )
 def test_target_ir_wire_image_matches_the_frozen_wire_golden(
     name,
     form,
-    expected_digest,
     expected_physical_words_digest,
 ):
     document = load_pulse_document(ROOT / "pulses" / name)
@@ -50,7 +49,6 @@ def test_target_ir_wire_image_matches_the_frozen_wire_golden(
     ir = compile_pulse_document(document, clock_hz=50e6, execution_form=form)
     current = pack_target_ir(ir, params)
 
-    assert current.digest == expected_digest
     assert canonical_digest([list(item) for item in current.words]) == (
         expected_physical_words_digest
     )

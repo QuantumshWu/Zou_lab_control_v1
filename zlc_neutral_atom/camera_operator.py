@@ -7,7 +7,6 @@ CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT = canonical_digest(
     {
         "owner": "zlc_neutral_atom.acquisition.camera.CameraDatasetEventAdapter",
         "operator": "camera-sample.image-identity",
-        "schema": "v1",
     }
 )
 

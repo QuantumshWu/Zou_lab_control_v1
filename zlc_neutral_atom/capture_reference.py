@@ -18,7 +18,7 @@ from zlc_storage import (
 )
 
 
-CAPTURE_ARTIFACT_REF_SCHEMA = "zlc_neutral_atom.capture-artifact-ref.v1"
+CAPTURE_ARTIFACT_REF_SCHEMA = "zlc_neutral_atom.capture-artifact-ref"
 CAPTURE_ARTIFACT_NAMESPACE = "capture"
 
 

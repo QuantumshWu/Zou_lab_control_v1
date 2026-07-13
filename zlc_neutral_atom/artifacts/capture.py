@@ -120,10 +120,10 @@ from zlc_pulse import (
 )
 
 
-CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact/v10"
-_CAPTURE_METADATA_SCHEMA = "zlc_neutral_atom.CameraFrameMetadataSequence/v1"
+CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact"
+_CAPTURE_METADATA_SCHEMA = "zlc_neutral_atom.CameraFrameMetadataSequence"
 _CAPTURE_NAMESPACE = CAPTURE_ARTIFACT_NAMESPACE
-_ADMITTED_CAPTURE_EVIDENCE_SCHEMA = "zlc_neutral_atom.AdmittedCaptureEvidence/v1"
+_ADMITTED_CAPTURE_EVIDENCE_SCHEMA = "zlc_neutral_atom.AdmittedCaptureEvidence"
 _ADMITTED_CAPTURE_TOKEN = object()
 
 

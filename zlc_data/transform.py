@@ -41,9 +41,9 @@ from .value import (
 )
 
 
-TRANSFORM_SPEC_SCHEMA = "zlc_data.DataTransformSpec/v1"
-COMMITTED_TRANSFORM_SCHEMA = "zlc_data.CommittedTransform/v1"
-TRANSFORMED_SCHEMA_SCHEMA = "zlc_data.TransformedSchema/v1"
+TRANSFORM_SPEC_SCHEMA = "zlc_data.DataTransformSpec"
+COMMITTED_TRANSFORM_SCHEMA = "zlc_data.CommittedTransform"
+TRANSFORMED_SCHEMA_SCHEMA = "zlc_data.TransformedSchema"
 
 
 class ReductionMethod(str, Enum):

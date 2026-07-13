@@ -341,7 +341,7 @@ class ExactStreamProcessorWorker:
             downstream = downstream_readiness
         chain_digest = canonical_digest(
             {
-                "contract": "zlc_neutral_atom.ExactStreamProcessorChain/v1",
+                "contract": "zlc_neutral_atom.ExactStreamProcessorChain",
                 "processor": bound.fingerprint,
                 "source_contract": input_edge.consumer_contract_digest,
                 "source_schedule": input_edge.schedule_digest,

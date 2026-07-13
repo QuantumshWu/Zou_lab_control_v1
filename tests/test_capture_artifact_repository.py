@@ -192,17 +192,17 @@ def test_exact_pipeline_commits_and_reloads_capture_artifact(tmp_path):
         assert artifact.camera_arm_spec.digest == artifact.terminal.capture_spec_fingerprint
         assert artifact.camera_arm_spec == spec.measurement.capture_spec
 
-        legacy_manifest = decode(encode(manifest))
-        legacy_manifest["schema"] = "zlc_neutral_atom.CaptureArtifact/v9"
-        legacy = repository._store.publish_manifest(
+        unsupported_manifest = decode(encode(manifest))
+        unsupported_manifest["schema"] = "unsupported-capture-artifact"
+        unsupported = repository._store.publish_manifest(
             "capture",
-            encode(legacy_manifest),
+            encode(unsupported_manifest),
         )
-        with pytest.raises(ValueError, match="CaptureArtifact/v10"):
+        with pytest.raises(ValueError, match="CaptureArtifact"):
             repository.load(
                 CaptureArtifactRef(
                     repository.repository_id,
-                    legacy.content.digest,
+                    unsupported.content.digest,
                 )
             )
 
@@ -672,13 +672,13 @@ def test_capture_ref_has_one_leaf_owner_and_a_strict_current_codec():
     reference = CaptureArtifactRef("capture-repository", "a" * 64)
     assert decode_capture_artifact_ref(encode_capture_artifact_ref(reference)) == reference
     dependency = capture_artifact_input_ref(reference)
-    assert dependency.reference_schema_id.endswith("capture-artifact-ref.v1")
+    assert dependency.reference_schema_id.endswith("capture-artifact-ref")
     assert dependency.content_digest == reference.manifest_digest
     assert decode_capture_artifact_ref(dependency.canonical_reference) == reference
     with pytest.raises(ValueError, match="unknown field set"):
         capture_artifact_ref_from_tree(
             {
-                "schema": "zlc_neutral_atom.capture-artifact-ref.v1",
+                "schema": "zlc_neutral_atom.capture-artifact-ref",
                 "repository_id": reference.repository_id,
                 "manifest_digest": reference.manifest_digest,
                 "source_capture_ref": reference.manifest_digest,

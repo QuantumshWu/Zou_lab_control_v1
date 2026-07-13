@@ -36,7 +36,7 @@ from .transform import (
 )
 
 
-TRANSFORM_RECORD_SCHEMA = "zlc_data.TransformRecord/v1"
+TRANSFORM_RECORD_SCHEMA = "zlc_data.TransformRecord"
 
 
 def transformed_schema_to_tree(schema: TransformedSchema) -> dict[str, Any]:

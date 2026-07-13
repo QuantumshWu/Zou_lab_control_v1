@@ -535,17 +535,17 @@ def test_present_infinite_reference_separation_round_trips_and_legacy_schemas_re
     with pytest.raises(ValueError, match="missing proposal"):
         decode_calibration_analysis_diagnostics(encode(absent_proposal))
 
-    legacy_nested = deepcopy(tree)
-    legacy_nested["reference_valleys"][0]["schema"] = (
-        "zlc_neutral_atom.reference-valley-diagnostic.v2"
+    unknown_nested = deepcopy(tree)
+    unknown_nested["reference_valleys"][0]["schema"] = (
+        "unsupported-reference-valley-diagnostic"
     )
     with pytest.raises(ValueError, match="expected schema"):
-        decode_calibration_analysis_diagnostics(encode(legacy_nested))
+        decode_calibration_analysis_diagnostics(encode(unknown_nested))
 
-    legacy_outer = deepcopy(tree)
-    legacy_outer["schema"] = "zlc_neutral_atom.calibration-analysis-diagnostics.v3"
+    unknown_outer = deepcopy(tree)
+    unknown_outer["schema"] = "unsupported-calibration-analysis-diagnostics"
     with pytest.raises(ValueError, match="expected schema"):
-        decode_calibration_analysis_diagnostics(encode(legacy_outer))
+        decode_calibration_analysis_diagnostics(encode(unknown_outer))
 
     assert tree["reference_valleys"][0]["schema"] == (
         REFERENCE_VALLEY_DIAGNOSTIC_SCHEMA

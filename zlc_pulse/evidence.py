@@ -27,18 +27,18 @@ from .artifact import CompiledPulseArtifact, PulseExecutionForm
 
 
 STATIC_TERMINAL_EVIDENCE_SCHEMA = (
-    "zlc_pulse.StaticOnceTerminalEvidence/v1"
+    "zlc_pulse.StaticOnceTerminalEvidence"
 )
 AUTONOMOUS_TERMINAL_EVIDENCE_SCHEMA = (
-    "zlc_pulse.AutonomousTableTerminalEvidence/v1"
+    "zlc_pulse.AutonomousTableTerminalEvidence"
 )
 POST_TERMINAL_TAIL_EVIDENCE_SCHEMA = (
-    "zlc_pulse.PostTerminalTailEvidence/v1"
+    "zlc_pulse.PostTerminalTailEvidence"
 )
 
-STATIC_STATUS_READ_RECIPE = "STATUS_THEN_STATUS/v1"
-AUTONOMOUS_TABLE_READ_RECIPE = "STATUS_CURSOR_STATUS_CURSOR/v1"
-POST_TERMINAL_TAIL_WAIT_RECIPE = "HOST_MONOTONIC_AFTER_TERMINAL/v1"
+STATIC_STATUS_READ_RECIPE = "STATUS_THEN_STATUS"
+AUTONOMOUS_TABLE_READ_RECIPE = "STATUS_CURSOR_STATUS_CURSOR"
+POST_TERMINAL_TAIL_WAIT_RECIPE = "HOST_MONOTONIC_AFTER_TERMINAL"
 
 
 def _u32(value: object, field: str) -> int:

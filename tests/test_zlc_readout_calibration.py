@@ -1352,10 +1352,10 @@ def test_all_persistent_values_have_strict_current_canonical_codecs():
         decode_calibration_artifact(encode(tree))
 
 
-def test_quality_codec_v3_is_exact_and_carries_adverse_per_class_evidence():
+def test_quality_codec_is_exact_and_carries_adverse_per_class_evidence():
     tree = decode(encode_calibration_artifact(_artifact()))
     quality = tree["models"][0]["header"]["quality"]
-    assert quality["schema"] == "zlc_neutral_atom.readout-model-quality.v3"
+    assert quality["schema"] == "zlc_neutral_atom.readout-model-quality"
     assert set(quality) == {
         "schema",
         "site_axis_id",

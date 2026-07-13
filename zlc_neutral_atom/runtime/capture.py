@@ -262,8 +262,8 @@ class CameraPhysicalFacts:
         return canonical_digest(camera_physical_facts_to_tree(self))
 
 
-_CAMERA_PHYSICAL_FACTS_SCHEMA = "zlc_neutral_atom.CameraPhysicalFacts/v2"
-_CAMERA_CAPABILITY_EVIDENCE_SCHEMA = "zlc_neutral_atom.CameraCapabilityEvidence/v2"
+_CAMERA_PHYSICAL_FACTS_SCHEMA = "zlc_neutral_atom.CameraPhysicalFacts"
+_CAMERA_CAPABILITY_EVIDENCE_SCHEMA = "zlc_neutral_atom.CameraCapabilityEvidence"
 
 
 def camera_physical_facts_to_tree(value: CameraPhysicalFacts) -> dict[str, object]:

@@ -55,31 +55,31 @@ from .codec import (
 
 
 CALIBRATION_ANALYSIS_REQUEST_SCHEMA = (
-    "zlc_neutral_atom.calibration-analysis-request.v8"
+    "zlc_neutral_atom.calibration-analysis-request"
 )
-CALIBRATION_WORK_PLAN_SCHEMA = "zlc_neutral_atom.calibration-work-plan.v5"
+CALIBRATION_WORK_PLAN_SCHEMA = "zlc_neutral_atom.calibration-work-plan"
 CALIBRATION_ANALYSIS_DIAGNOSTICS_SCHEMA = (
-    "zlc_neutral_atom.calibration-analysis-diagnostics.v4"
+    "zlc_neutral_atom.calibration-analysis-diagnostics"
 )
 
-BOX_ANALYSIS_CONFIG_SCHEMA = "zlc_neutral_atom.box-analysis-config.v1"
-PSF_ANALYSIS_CONFIG_SCHEMA = "zlc_neutral_atom.psf-analysis-config.v1"
-SITE_DETECTION_POLICY_SCHEMA = "zlc_neutral_atom.site-detection-policy.v1"
-CALIBRATION_RESOURCE_POLICY_SCHEMA = "zlc_neutral_atom.calibration-resource-policy.v1"
+BOX_ANALYSIS_CONFIG_SCHEMA = "zlc_neutral_atom.box-analysis-config"
+PSF_ANALYSIS_CONFIG_SCHEMA = "zlc_neutral_atom.psf-analysis-config"
+SITE_DETECTION_POLICY_SCHEMA = "zlc_neutral_atom.site-detection-policy"
+CALIBRATION_RESOURCE_POLICY_SCHEMA = "zlc_neutral_atom.calibration-resource-policy"
 CALIBRATION_ANALYSIS_RESOURCE_POLICY_SCHEMA = (
-    "zlc_neutral_atom.calibration-analysis-resource-policy.v2"
+    "zlc_neutral_atom.calibration-analysis-resource-policy"
 )
 SITE_DETECTION_DIAGNOSTIC_SCHEMA = (
-    "zlc_neutral_atom.site-detection-diagnostic.v1"
+    "zlc_neutral_atom.site-detection-diagnostic"
 )
 MODEL_ANALYSIS_DIAGNOSTIC_SCHEMA = (
-    "zlc_neutral_atom.model-analysis-diagnostic.v1"
+    "zlc_neutral_atom.model-analysis-diagnostic"
 )
 REFERENCE_VALLEY_DIAGNOSTIC_SCHEMA = (
-    "zlc_neutral_atom.reference-valley-diagnostic.v3"
+    "zlc_neutral_atom.reference-valley-diagnostic"
 )
 REFERENCE_VALLEY_EVIDENCE_SCHEMA = (
-    "zlc_neutral_atom.reference-valley-evidence.v2"
+    "zlc_neutral_atom.reference-valley-evidence"
 )
 
 
@@ -109,7 +109,7 @@ def calibration_analysis_diagnostics_encoding_upper_bound(
 ) -> int:
     """Conservative current-schema canonical wire bound without materializing it.
 
-    This codec-owned estimate follows the v3 diagnostics projection.  It
+    This codec-owned estimate follows the current diagnostics projection.  It
     budgets the largest optional reference-valley form (proposal plus both
     nested evidence records), fixed JSON/tag/key overhead, all scalar digit
     widths, site vectors, model diagnostics, and a generous top-level envelope.
@@ -163,7 +163,7 @@ def calibration_analysis_diagnostics_encoding_working_upper_bound(
     """Bound the current non-streaming projection/tag/JSON encode phase.
 
     The encoder simultaneously retains the domain graph, primitive projection,
-    canonical tagged tree, and final bytes.  Measurements of the maximal v3
+    canonical tagged tree, and final bytes.  Measurements of the maximal current
     valley shape exceed eight times payload size; twelve times the conservative
     wire bound plus a fixed envelope leaves headroom across Python allocators.
     """

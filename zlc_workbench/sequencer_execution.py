@@ -123,7 +123,7 @@ class VirtualSequencerExecutionEndpoint:
                 raise RuntimeError("cannot probe sequencer capability during an active session")
             fingerprint = canonical_digest(
                 {
-                    "contract": "zlc.virtual-sequencer-execution.v1",
+                    "contract": "zlc.virtual-sequencer-execution",
                     "target_abi_fingerprint": self._target.abi_fingerprint,
                     "clock_hz": float(self._sequencer.clock_hz),
                     "geometry_fingerprint": self._geometry,
@@ -303,7 +303,7 @@ class VirtualSequencerExecutionEndpoint:
                 binding.connection_generation,
                 SimulatedPulseReceipt(
                     session.artifact_digest,
-                    "Zou_lab_control.VirtualSequencer/v1",
+                    "Zou_lab_control.VirtualSequencer",
                     counts,
                     playback.logical_duration,
                     artifact.max_configured_output_delay_ticks
@@ -436,7 +436,7 @@ class RemotePulseExecutionEndpoint:
                 )
             fingerprint = canonical_digest(
                 {
-                    "contract": "zlc.remote-pulse-execution.v1",
+                    "contract": "zlc.remote-pulse-execution",
                     "endpoint_label": self._endpoint_label,
                     "server_connection_generation": self._server_generation,
                     "target_abi_fingerprint": self._target.abi_fingerprint,

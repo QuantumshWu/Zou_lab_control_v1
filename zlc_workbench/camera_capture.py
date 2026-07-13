@@ -966,8 +966,8 @@ def bind_camera_measurement(
             1,
         ),
         f"Camera {request.role}",
-        "zlc.camera-capture-request.v1",
-        "zlc.camera-capture-binding.v1",
+        "zlc.camera-capture-request",
+        "zlc.camera-capture-binding",
         CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
         dataset_schema.fingerprint,
     )

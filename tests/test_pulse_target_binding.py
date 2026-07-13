@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -24,7 +25,15 @@ ROOT = Path(__file__).parents[1]
 
 def test_every_shipped_document_matches_the_packaged_deployment_target():
     target = load_deployed_pulse_target()
-    for path in sorted((ROOT / "pulses").glob("*.json")):
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z", "--", ":(glob)pulses/*.json"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout.decode("utf-8")
+    paths = tuple(ROOT / item for item in tracked.split("\0") if item)
+    assert paths, "the repository must ship at least one pulse document"
+    for path in sorted(paths):
         assert load_pulse_document(path).target == target, path.name
 
 
