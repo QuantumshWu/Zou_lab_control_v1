@@ -2642,6 +2642,77 @@ def test_admit_rechecks_deadline_after_outer_validation_before_any_io(kind):
     assert coordinator._authorities == {}
 
 
+@pytest.mark.parametrize("kind", ("checkpoint", "final"))
+def test_durable_commit_rechecks_deadline_after_journal_begin_before_publish(kind):
+    deadline_box = {}
+
+    class BeginAcrossDeadlineJournal(MemoryCommitJournal):
+        def begin(self, intent):
+            super().begin(intent)
+            deadline = deadline_box["deadline"]
+            while time.monotonic() <= deadline:
+                time.sleep(0.001)
+
+    journal = BeginAcrossDeadlineJournal("test-repository")
+    coordinator = RepositoryCommitCoordinator(
+        journal,
+        lambda _intent: CommitRecovery(committed=False),
+        allow_ephemeral=True,
+    )
+    published = threading.Event()
+    commit_id = f"deadline-after-journal-begin-{kind}"
+
+    def finalize(context: PostSafetyContext, _result):
+        assert context.deadline is not None
+        deadline_box["deadline"] = context.deadline
+        target = CommitTarget(
+            "test-repository",
+            kind,
+            "1",
+            f"artifacts/{commit_id}",
+            "0" * 64,
+        )
+        operation_type = CheckpointCommit if kind == "checkpoint" else FinalCommit
+        operation_kind = (
+            CommitKind.CHECKPOINT if kind == "checkpoint" else CommitKind.FINAL
+        )
+        operation = operation_type(
+            prepared_authority(
+                context,
+                coordinator,
+                operation_kind,
+                commit_id,
+                target,
+                lambda: published.set()
+                or PublishedManifest(
+                    target.target_ref,
+                    target.expected_manifest_digest,
+                    "raw-ref",
+                ),
+            )
+        )
+        if kind == "checkpoint":
+            return context.commit_checkpoint(operation)
+        return context.commit_final(operation)
+
+    handle = RunController(new_arbiter()).start(
+        plan(
+            key=camera_key(f"deadline-after-journal-begin-{kind}"),
+            execute=lambda *_: "staged",
+            finalize=finalize,
+            timeout_seconds=0.25,
+            requires_final_commit=kind == "final",
+        )
+    )
+    with pytest.raises(RunFailed, match="monotonic deadline"):
+        handle.result(2.0)
+    assert not published.is_set()
+    assert journal.pending() == ()
+    assert set(journal._intents) == {commit_id}
+    assert journal._aborted == {commit_id}
+    assert coordinator._authorities == {}
+
+
 def test_final_commit_recovers_visible_manifest_after_lost_acknowledgement():
     controller = RunController(new_arbiter())
     visible_manifest = []

@@ -410,3 +410,56 @@ def test_capture_staging_crossing_deadline_cannot_mint_commit_authority(
     assert any(path.is_file() for path in blob_root.rglob("*"))
     manifest_root = tmp_path / "captures" / "content" / "manifests" / "capture"
     assert not manifest_root.exists() or tuple(manifest_root.iterdir()) == ()
+
+
+def test_capture_journal_begin_crossing_deadline_aborts_before_manifest_publish(
+    tmp_path,
+    capture_runtime,
+    monkeypatch,
+):
+    camera, runtime, spec = capture_runtime
+    repository = CaptureRepository(tmp_path / "captures")
+    real_begin = repository._journal.begin
+    deadline_box = {}
+
+    def begin_then_expire(intent):
+        real_begin(intent)
+        deadline = deadline_box["deadline"]
+        while time.monotonic() <= deadline:
+            time.sleep(0.001)
+
+    monkeypatch.setattr(repository._journal, "begin", begin_then_expire)
+    base = compile_pipeline(spec)
+
+    def finalize(context, result):
+        assert context.deadline is not None
+        deadline_box["deadline"] = context.deadline
+        return context.commit_checkpoint(repository.checkpoint_commit(context, result))
+
+    plan = replace(
+        base,
+        name="expire after capture intent before manifest publish",
+        finalize=finalize,
+        timeout_seconds=0.25,
+    )
+    thread, failures = _deliver_when_armed(camera, _images())
+    try:
+        handle = runtime.controller.start(plan)
+        with pytest.raises(RunFailed, match="monotonic deadline"):
+            handle.result(3.0)
+        thread.join(2.0)
+        assert not thread.is_alive()
+        assert failures == []
+    finally:
+        if thread.is_alive():
+            camera.finish_record_capture()
+            thread.join(2.0)
+
+    assert repository._coordinator._authorities == {}
+    assert repository._journal.pending() == ()
+    assert set(repository._journal._intents) == repository._journal._aborted
+    assert len(repository._journal._intents) == 1
+    blob_root = tmp_path / "captures" / "content" / "blobs"
+    assert any(path.is_file() for path in blob_root.rglob("*"))
+    manifest_root = tmp_path / "captures" / "content" / "manifests" / "capture"
+    assert not manifest_root.exists() or tuple(manifest_root.iterdir()) == ()

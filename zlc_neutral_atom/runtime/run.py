@@ -1180,7 +1180,9 @@ class RunHandle(Generic[ResultT]):
         with self._condition:
             self._commit_inflight = False
             self._pending_final_commit = pending
-            self._phase = "final-commit-reconciliation-failed"
+            # Do not publish the externally retryable phase until
+            # ``_install_retry`` has atomically installed its capability.
+            self._phase = "final-commit-reconciliation-pending"
             self._revision += 1
             self._condition.notify_all()
         return pending
@@ -1212,7 +1214,9 @@ class RunHandle(Generic[ResultT]):
                 authority_snapshot.target,
                 CheckpointDisposition.RECONCILIATION_REQUIRED,
             )
-            self._phase = "checkpoint-reconciliation-failed"
+            # Do not publish the externally retryable phase until
+            # ``_install_retry`` has atomically installed its capability.
+            self._phase = "checkpoint-reconciliation-pending"
             self._revision += 1
             self._condition.notify_all()
         return pending
@@ -1328,6 +1332,7 @@ class RunHandle(Generic[ResultT]):
         operation: CheckpointCommit[CommitT] | FinalCommit[CommitT],
         authority: _CommitAuthoritySnapshot[CommitT],
         kind: CommitKind,
+        deadline: float | None,
     ) -> _DurableCommitOutcome[CommitT]:
         """Run one intent/publish/recover/marker transaction after atomic admission."""
 
@@ -1364,6 +1369,10 @@ class RunHandle(Generic[ResultT]):
         try:
             with self._condition:
                 self._token.checkpoint()
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"run {self.run_id} exceeded its monotonic deadline"
+                    )
                 if kind is CommitKind.FINAL:
                     self._cancel_gate_closed = True
                     self._phase = "committing"
@@ -1529,6 +1538,7 @@ class RunHandle(Generic[ResultT]):
                 operation,
                 authority,
                 CommitKind.CHECKPOINT,
+                deadline,
             )
         except BaseException:
             self._clear_commit_inflight_after_error()
@@ -1562,6 +1572,7 @@ class RunHandle(Generic[ResultT]):
                 operation,
                 authority,
                 CommitKind.FINAL,
+                deadline,
             )
         except BaseException:
             self._clear_commit_inflight_after_error()
