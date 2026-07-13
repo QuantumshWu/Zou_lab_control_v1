@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from numbers import Integral
 
 import numpy as np
+from zlc_storage import sha256_text
 
 from ._arrays import immutable_array
 from .validity import ComponentValidity, Invalid, Valid
@@ -58,12 +59,7 @@ class DataPatch:
             raise ValueError("validity_patch must contain one validity value per target cell")
         if any(not isinstance(item, (Valid, Invalid, ComponentValidity)) for item in validity):
             raise TypeError("validity_patch contains an unsupported validity value")
-        if (
-            not isinstance(self.schema_fingerprint, str)
-            or len(self.schema_fingerprint) != 64
-            or any(character not in "0123456789abcdef" for character in self.schema_fingerprint)
-        ):
-            raise ValueError("schema_fingerprint must be a lowercase SHA-256 digest")
+        sha256_text(self.schema_fingerprint, "schema_fingerprint")
         array = np.asarray(self.values)
         if array.shape[0:1] != (len(cells),):
             raise ValueError("values leading dimension must match target_cells")

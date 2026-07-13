@@ -39,7 +39,7 @@ from zlc_pulse import (
     bind_pulse_document_target,
     compile_pulse_artifact,
 )
-from zlc_storage import positive_integer as _positive_int
+from zlc_storage import canonical_text, positive_integer as _positive_int
 
 from .camera_capture import CameraCaptureBindingRequest
 from .legacy_neutral_atom import LegacyNeutralAtomRuntime
@@ -215,13 +215,7 @@ def _bind_triggered_camera_acquisition(
             )
         selected_trigger = camera_description.capture_trigger_channels[0]
     else:
-        if (
-            not isinstance(trigger_channel, str)
-            or not trigger_channel
-            or trigger_channel.strip() != trigger_channel
-        ):
-            raise ValueError("trigger_channel must be canonical non-empty text")
-        selected_trigger = trigger_channel
+        selected_trigger = canonical_text(trigger_channel, "trigger_channel")
     camera_description.physical_facts.require_single_capture_trigger_channel(
         selected_trigger
     )

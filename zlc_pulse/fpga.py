@@ -10,7 +10,7 @@ from fpga.pulse_streamer.host.image import (
     build_fingerprint,
     pack_program,
 )
-from zlc_storage import canonical_digest
+from zlc_storage import canonical_digest, sha256_text
 
 from .ir import TargetIR, target_ir_to_tree
 from .validation import validate_target_ir_for_geometry
@@ -28,13 +28,7 @@ class PulseWireImage:
             raise TypeError("geometry_fingerprint must be an integer")
         if fingerprint < 0 or fingerprint > 0xFFFFFFFF:
             raise ValueError("geometry_fingerprint must fit 32 bits")
-        source = self.source_ir_digest
-        if (
-            not isinstance(source, str)
-            or len(source) != 64
-            or any(character not in "0123456789abcdef" for character in source)
-        ):
-            raise ValueError("source_ir_digest must be a lowercase SHA-256 digest")
+        sha256_text(self.source_ir_digest, "source_ir_digest")
         words = tuple(self.words)
         previous = -1
         for address, value in words:

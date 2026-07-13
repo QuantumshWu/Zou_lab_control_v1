@@ -6,6 +6,7 @@ import os
 import threading
 from pathlib import Path
 
+from .canonical import canonical_text
 from .durability import durable_mkdir, flush_directory
 
 
@@ -80,8 +81,7 @@ class RepositoryRootLease:
         *,
         owner: str,
     ) -> None:
-        if not isinstance(owner, str) or not owner or owner.strip() != owner:
-            raise ValueError("repository lease owner must be canonical non-empty text")
+        canonical_text(owner, "repository lease owner")
         resolved = Path(root).expanduser().resolve()
         durable_mkdir(resolved)
         # This is also the construction-time backend preflight for an already

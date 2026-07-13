@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from .canonical import decode, encode
+from .canonical import canonical_text, decode, encode
 from . import durability
 
 
@@ -24,9 +24,7 @@ class JournalCorruptionError(RuntimeError):
 
 
 def _record_id(value: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError("journal record_id must be canonical non-empty text")
-    return value
+    return canonical_text(value, "journal record_id")
 
 
 @contextmanager

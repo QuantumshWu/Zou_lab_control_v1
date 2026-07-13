@@ -485,12 +485,7 @@ def dataset_cell_permutation_fingerprint(
     dataset_schema_fingerprint: str,
     cells: tuple[DatasetCellAddress, ...],
 ) -> str:
-    if (
-        not isinstance(dataset_schema_fingerprint, str)
-        or len(dataset_schema_fingerprint) != 64
-        or any(character not in "0123456789abcdef" for character in dataset_schema_fingerprint)
-    ):
-        raise ValueError("dataset_schema_fingerprint must be a lowercase SHA-256 digest")
+    _sha256_digest(dataset_schema_fingerprint, "dataset_schema_fingerprint")
     ordered = tuple(cells)
     if any(not isinstance(cell, DatasetCellAddress) for cell in ordered):
         raise TypeError("cells must contain DatasetCellAddress values")

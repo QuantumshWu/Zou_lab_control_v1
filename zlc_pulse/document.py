@@ -18,6 +18,7 @@ from zlc_storage import (
     canonical_digest,
     canonical_text as _text,
     integer as _integer,
+    sha256_text,
 )
 
 from .target import (
@@ -273,15 +274,10 @@ class ScanRecipeProvenance:
         if normalizer != SCAN_NORMALIZER_ID:
             raise ValueError("scan recipe normalizer differs from the current owner")
         object.__setattr__(self, "normalizer_id", normalizer)
-        digest = _text(
+        sha256_text(
             self.frozen_definition_digest,
             "scan recipe frozen_definition_digest",
         )
-        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
-            raise ValueError(
-                "scan recipe frozen_definition_digest must be lowercase SHA-256"
-            )
-        object.__setattr__(self, "frozen_definition_digest", digest)
 
 
 @dataclass(frozen=True)

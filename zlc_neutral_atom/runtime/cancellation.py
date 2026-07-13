@@ -6,6 +6,8 @@ import threading
 import time
 from dataclasses import dataclass
 
+from zlc_storage import canonical_text
+
 
 @dataclass(frozen=True)
 class CancellationSnapshot:
@@ -39,8 +41,7 @@ class CancellationToken:
         """Request cancellation once; return True only for the first request."""
 
         if reason is not None:
-            if not isinstance(reason, str) or not reason or reason.strip() != reason:
-                raise ValueError("cancellation reason must be non-empty canonical text or None")
+            canonical_text(reason, "cancellation reason")
         with self._lock:
             if self._event.is_set():
                 return False

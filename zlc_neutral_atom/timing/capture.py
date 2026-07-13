@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from zlc_storage import canonical_text
+
 from zlc_neutral_atom.runtime import (
     CleanupReport,
     ExactCaptureTransaction,
@@ -47,12 +49,7 @@ class TriggeredCaptureSpec:
             raise TypeError("pulse_port must be BoundPulsePort")
         if not isinstance(self.pulse_request, FinitePulseExecutionRequest):
             raise TypeError("pulse_request must be FinitePulseExecutionRequest")
-        if (
-            not isinstance(self.trigger_channel, str)
-            or not self.trigger_channel
-            or self.trigger_channel.strip() != self.trigger_channel
-        ):
-            raise ValueError("trigger_channel must be canonical non-empty text")
+        canonical_text(self.trigger_channel, "trigger_channel")
         if not isinstance(self.cell_plan, CompiledCaptureCellPlan):
             raise TypeError("cell_plan must be CompiledCaptureCellPlan")
         contract = self.capture.measurement.capture_contract
@@ -121,12 +118,7 @@ class TriggeredPipelineResult:
             )
         if not isinstance(capture, PipelineResult):
             raise TypeError("capture must be PipelineResult")
-        if (
-            not isinstance(pulse_session_id, str)
-            or not pulse_session_id
-            or pulse_session_id.strip() != pulse_session_id
-        ):
-            raise ValueError("pulse_session_id must be canonical non-empty text")
+        canonical_text(pulse_session_id, "pulse_session_id")
         if not isinstance(pulse_terminal, PulseTerminalAck):
             raise TypeError("pulse_terminal must be PulseTerminalAck")
         if pulse_terminal.session_id != pulse_session_id:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
+from zlc_storage import canonical_text
 
 from ._arrays import canonical_dtype
 from .axis import AxisId, AxisSpec, REPEAT
@@ -46,12 +47,7 @@ class ValueSchema:
             raise TypeError("validity_contract must be ValidityContract")
         object.__setattr__(self, "dtype", canonical_dtype(self.dtype))
         if self.value_unit is not None:
-            if (
-                not isinstance(self.value_unit, str)
-                or not self.value_unit
-                or self.value_unit.strip() != self.value_unit
-            ):
-                raise ValueError("value_unit must be non-empty text or None")
+            canonical_text(self.value_unit, "value_unit")
         available = tuple(axis.axis_id for axis in axes)
         declared = self.validity_contract.component_axis_ids
         if self.validity_contract.mode is ValidityMode.COMPONENTS and not _ordered_subset(

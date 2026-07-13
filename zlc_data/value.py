@@ -6,6 +6,7 @@ import hashlib
 from dataclasses import dataclass
 
 import numpy as np
+from zlc_storage import canonical_text, sha256_text
 
 from ._arrays import immutable_array
 from .axis import AxisId
@@ -26,8 +27,7 @@ class BlockId:
     value: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.value, str) or not self.value or self.value.strip() != self.value:
-            raise ValueError("BlockId must be non-empty text without surrounding whitespace")
+        canonical_text(self.value, "BlockId")
 
     def __str__(self) -> str:
         return self.value
@@ -47,10 +47,7 @@ class StreamGenerationId:
     value: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.value, str) or not self.value or self.value.strip() != self.value:
-            raise ValueError(
-                "StreamGenerationId must be non-empty text without surrounding whitespace"
-            )
+        canonical_text(self.value, "StreamGenerationId")
 
 
 @dataclass(frozen=True)
@@ -65,12 +62,7 @@ class DatasetRevisionRef:
             raise TypeError("block_id must be BlockId")
         if not isinstance(self.stream_generation, StreamGenerationId):
             raise TypeError("stream_generation must be StreamGenerationId")
-        if (
-            not isinstance(self.schema_fingerprint, str)
-            or len(self.schema_fingerprint) != 64
-            or any(ch not in "0123456789abcdef" for ch in self.schema_fingerprint)
-        ):
-            raise ValueError("schema_fingerprint must be a lowercase SHA-256 digest")
+        sha256_text(self.schema_fingerprint, "schema_fingerprint")
         if not isinstance(self.revision, DatasetRevision):
             raise TypeError("revision must be DatasetRevision")
 

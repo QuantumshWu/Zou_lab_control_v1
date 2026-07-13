@@ -50,7 +50,7 @@ from zlc_neutral_atom.runtime import (
     SafeStateAck,
     SafetyOperation,
 )
-from zlc_storage import canonical_digest
+from zlc_storage import canonical_digest, canonical_text
 
 from .asset_map import InstallationAsset, InstallationAssetMap
 from .camera_capture import (
@@ -563,8 +563,7 @@ class LegacyNeutralAtomRuntime:
         return _bind_camera_measurement(device_set, registry, request)
 
     def describe_camera(self, role: str):
-        if not isinstance(role, str) or not role or role.strip() != role:
-            raise ValueError("camera role must be canonical non-empty text")
+        canonical_text(role, "camera role")
         with self._lock:
             self._ensure_open()
             device_set = self._device_set

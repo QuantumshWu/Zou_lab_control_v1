@@ -219,15 +219,7 @@ class PipelineMemoryAdmission:
                 f"pipeline peak budget {peak} exceeds "
                 f"limit {memory_profile.memory_limit_bytes}"
             )
-        if (
-            not isinstance(chain_contract_digest, str)
-            or len(chain_contract_digest) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in chain_contract_digest
-            )
-        ):
-            raise ValueError("chain_contract_digest must be a lowercase SHA-256")
+        sha256_text(chain_contract_digest, "chain_contract_digest")
         object.__setattr__(self, "_aggregate_peak_bytes", peak)
         object.__setattr__(
             self,

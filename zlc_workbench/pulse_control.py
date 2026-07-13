@@ -12,6 +12,7 @@ import math
 
 from Zou_lab_control.neutral_atom.ports import PortCatalog
 from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+from zlc_storage import canonical_text
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,9 +24,7 @@ class PulseTargetDescriptor:
     connection_label: str
 
     def __post_init__(self) -> None:
-        installation_id = str(self.installation_id)
-        if not installation_id or installation_id.strip() != installation_id:
-            raise ValueError("installation id must be canonical non-empty text")
+        installation_id = canonical_text(self.installation_id, "installation id")
         object.__setattr__(self, "installation_id", installation_id)
         if (
             isinstance(self.installation_generation, bool)
