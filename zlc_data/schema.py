@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
-from zlc_storage import canonical_text
+from zlc_storage.canonical import canonical_text
 
 from ._arrays import canonical_dtype
 from .axis import AxisId, AxisSpec, REPEAT

@@ -6,7 +6,7 @@ import hashlib
 from dataclasses import dataclass
 
 import numpy as np
-from zlc_storage import canonical_text, sha256_text
+from zlc_storage.canonical import canonical_text, sha256_text
 
 from ._arrays import immutable_array
 from .axis import AxisId

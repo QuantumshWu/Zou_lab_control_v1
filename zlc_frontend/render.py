@@ -12,22 +12,11 @@ from enum import Enum
 import threading
 from typing import Protocol, runtime_checkable
 
-
-def _text(value: object, field: str) -> str:
-    if not isinstance(value, str):
-        raise TypeError(f"{field} must be a string")
-    normalized = value.strip()
-    if not normalized:
-        raise ValueError(f"{field} cannot be empty")
-    return normalized
-
-
-def _nonnegative(value: object, field: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise TypeError(f"{field} must be an integer")
-    if value < 0:
-        raise ValueError(f"{field} cannot be negative")
-    return value
+from zlc_storage import (
+    canonical_text as _text,
+    nonnegative_integer as _nonnegative,
+    sha256_text,
+)
 
 
 class RenderSurface(Enum):
@@ -76,7 +65,7 @@ class FrameIdentity:
         object.__setattr__(
             self,
             "schema_fingerprint",
-            _text(self.schema_fingerprint, "schema_fingerprint"),
+            sha256_text(self.schema_fingerprint, "schema_fingerprint"),
         )
         object.__setattr__(self, "revision", _nonnegative(self.revision, "revision"))
         object.__setattr__(

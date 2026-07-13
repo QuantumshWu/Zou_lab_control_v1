@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from numbers import Integral
 
 import numpy as np
-from zlc_storage import sha256_text
+from zlc_storage.canonical import sha256_text
 
 from ._arrays import immutable_array
 from .validity import ComponentValidity, Invalid, Valid

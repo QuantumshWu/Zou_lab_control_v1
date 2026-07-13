@@ -42,13 +42,16 @@ CANONICAL_HELPER_NAMES = frozenset(
     }
 )
 
-# These helpers normalize human-entered labels.  They intentionally strip text
-# and therefore are not the strict persisted-value invariant owned by storage.
-TEXT_NORMALIZER_ALLOWLIST = frozenset(
+ALLOWED_STRIP_CONTEXTS = frozenset(
     {
-        Path("zlc_frontend/render.py"),
-        Path("zlc_workbench/legacy.py"),
-        Path("zlc_workbench/workspace.py"),
+        (Path("zlc_pulse/document.py"), "ScanRecipeProvenance.__post_init__"),
+        (Path("zlc_pulse/transport/axi.py"), "VivadoAxiRegisterTransport._parse_read"),
+        (Path("zlc_neutral_atom/readout/analysis.py"), "_bounded_numeric_version"),
+        (Path("zlc_workbench/camera_capture.py"), "_camera_dtype"),
+        (Path("zlc_workbench/legacy.py"), "_normalize_human_text"),
+        (Path("zlc_workbench/legacy_neutral_atom.py"), "_qcmos_identity_probe.probe"),
+        (Path("zlc_workbench/legacy_neutral_atom.py"), "_pylon_live_identity"),
+        (Path("zlc_workbench/workspace.py"), "_normalize_human_text"),
     }
 )
 
@@ -144,12 +147,52 @@ def test_canonical_primitive_validators_have_one_owner():
                     continue
                 if node.name not in CANONICAL_HELPER_NAMES:
                     continue
-                if node.name == "_text" and relative in TEXT_NORMALIZER_ALLOWLIST:
-                    continue
                 violations.append(f"{relative}:{node.lineno} defines {node.name}")
     assert not violations, (
         "canonical primitive validators belong to zlc_storage.canonical; "
         "domain modules must import and alias them:\n" + "\n".join(violations)
+    )
+
+
+def test_text_normalization_is_confined_to_named_input_adapters():
+    violations = []
+
+    class StripVisitor(ast.NodeVisitor):
+        def __init__(self, relative: Path) -> None:
+            self.relative = relative
+            self.context: list[str] = []
+
+        def visit_ClassDef(self, node):
+            self.context.append(node.name)
+            self.generic_visit(node)
+            self.context.pop()
+
+        def visit_FunctionDef(self, node):
+            self.context.append(node.name)
+            self.generic_visit(node)
+            self.context.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node):
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "strip":
+                location = (self.relative, ".".join(self.context))
+                if location not in ALLOWED_STRIP_CONTEXTS:
+                    violations.append(
+                        f"{self.relative}:{node.lineno} strips text in {location[1]}"
+                    )
+            self.generic_visit(node)
+
+    for package in FORBIDDEN:
+        for path in (ROOT / package).rglob("*.py"):
+            relative = path.relative_to(ROOT)
+            if relative == Path("zlc_storage/canonical.py"):
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            StripVisitor(relative).visit(tree)
+    assert not violations, (
+        "machine identities must reject non-canonical text; .strip() is reserved "
+        "for explicitly named human/external input adapters:\n" + "\n".join(violations)
     )
 
 

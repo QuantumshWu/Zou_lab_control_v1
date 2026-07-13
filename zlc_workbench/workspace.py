@@ -7,9 +7,14 @@ import threading
 from typing import Protocol, runtime_checkable
 
 from zlc_frontend import BoardFrame, BoardPresenter, RenderSurface
+from zlc_storage import (
+    canonical_text as _text,
+    nonnegative_integer,
+    sha256_text,
+)
 
 
-def _text(value: object, field: str) -> str:
+def _normalize_human_text(value: object, field: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field} must be a string")
     normalized = value.strip()
@@ -47,12 +52,11 @@ class BoardModel:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "board_id", _text(self.board_id, "board_id"))
-        if not isinstance(self.layout_generation, int) or isinstance(
-            self.layout_generation, bool
-        ):
-            raise TypeError("layout_generation must be an integer")
-        if self.layout_generation < 0:
-            raise ValueError("layout_generation cannot be negative")
+        object.__setattr__(
+            self,
+            "layout_generation",
+            nonnegative_integer(self.layout_generation, "layout_generation"),
+        )
         if self.surface is not RenderSurface.WORKER_RASTER_LIVE:
             raise ValueError("BoardController boards require WORKER_RASTER_LIVE")
         panels = tuple(self.panels)
@@ -88,10 +92,11 @@ class WorkspaceModel:
         object.__setattr__(
             self, "workspace_id", _text(self.workspace_id, "workspace_id")
         )
-        if not isinstance(self.revision, int) or isinstance(self.revision, bool):
-            raise TypeError("revision must be an integer")
-        if self.revision < 0:
-            raise ValueError("revision cannot be negative")
+        object.__setattr__(
+            self,
+            "revision",
+            nonnegative_integer(self.revision, "revision"),
+        )
         boards = tuple(self.boards)
         if any(not isinstance(board, BoardModel) for board in boards):
             raise TypeError("boards must contain BoardModel values")
@@ -144,16 +149,15 @@ class CoherenceSourceBinding:
             "coherence_group",
             _text(self.coherence_group, "coherence_group"),
         )
-        if not isinstance(self.producer_generation, int) or isinstance(
-            self.producer_generation, bool
-        ):
-            raise TypeError("producer_generation must be an integer")
-        if self.producer_generation < 0:
-            raise ValueError("producer_generation cannot be negative")
+        object.__setattr__(
+            self,
+            "producer_generation",
+            nonnegative_integer(self.producer_generation, "producer_generation"),
+        )
         object.__setattr__(
             self,
             "schema_fingerprint",
-            _text(self.schema_fingerprint, "schema_fingerprint"),
+            sha256_text(self.schema_fingerprint, "schema_fingerprint"),
         )
 
 
@@ -380,7 +384,7 @@ class RunHandleStatusBinding:
         )
 
     def cancel(self, reason: str = "user requested stop") -> object:
-        return self._handle.cancel(_text(reason, "cancel reason"))
+        return self._handle.cancel(_normalize_human_text(reason, "cancel reason"))
 
 
 __all__ = [

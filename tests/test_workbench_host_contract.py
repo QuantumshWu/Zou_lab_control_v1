@@ -33,8 +33,12 @@ from zlc_workbench import (
 )
 
 
+SCHEMA_A = "a" * 64
+SCHEMA_B = "b" * 64
+
+
 def _identity(revision: int = 1) -> FrameIdentity:
-    return FrameIdentity("run-1", "data-1", 3, "schema-a", revision, f"shot-{revision}")
+    return FrameIdentity("run-1", "data-1", 3, SCHEMA_A, revision, f"shot-{revision}")
 
 
 def _raster(value: int = 0) -> RasterBuffer:
@@ -78,7 +82,7 @@ def _controller(presenter=None):
     callbacks = []
     controller = BoardController(_board(), presenter or _Presenter(), callbacks.append)
     port = controller.open_publish_port(
-        (CoherenceSourceBinding("shot", 3, "schema-a"),)
+        (CoherenceSourceBinding("shot", 3, SCHEMA_A),)
     )
     return controller, port, callbacks
 
@@ -99,9 +103,18 @@ def test_board_frame_rejects_mixed_identity_and_mutable_pixels():
         )
 
 
+def test_frame_and_source_machine_identities_reject_normalized_or_fake_values():
+    with pytest.raises(ValueError, match="canonical"):
+        FrameIdentity(" run-1 ", "data-1", 3, SCHEMA_A, 1, "shot-1")
+    with pytest.raises(ValueError, match="SHA-256"):
+        FrameIdentity("run-1", "data-1", 3, "schema-a", 1, "shot-1")
+    with pytest.raises(ValueError, match="SHA-256"):
+        CoherenceSourceBinding("shot", 3, "schema-a")
+
+
 def test_board_frame_allows_explicitly_independent_coherence_groups():
     first = _identity(1)
-    second = FrameIdentity("run-2", "data-2", 8, "schema-b", 9, "temperature-9")
+    second = FrameIdentity("run-2", "data-2", 8, SCHEMA_B, 9, "temperature-9")
     frame = BoardFrame(
         "board",
         0,
@@ -141,12 +154,12 @@ def test_board_controller_rejects_stale_layout_and_wrong_thread_present():
     controller = BoardController(_board(), _Presenter(), callbacks.append)
     controller.reconfigure(_board(1))
     old_port = controller.open_publish_port(
-        (CoherenceSourceBinding("shot", 3, "schema-a"),)
+        (CoherenceSourceBinding("shot", 3, SCHEMA_A),)
     )
     controller.reconfigure(_board(2))
     assert not old_port.publish(_frame(1, generation=1))
     port = controller.open_publish_port(
-        (CoherenceSourceBinding("shot", 3, "schema-a"),)
+        (CoherenceSourceBinding("shot", 3, SCHEMA_A),)
     )
     assert port.publish(_frame(1, generation=2))
     errors = []
@@ -198,7 +211,7 @@ def test_present_inflight_cannot_accept_an_older_sequence():
 
 def test_publish_port_is_revoked_on_close_and_rejects_wrong_source_generation():
     controller, port, _callbacks = _controller()
-    wrong = FrameIdentity("run-1", "data-1", 4, "schema-a", 1, "shot-1")
+    wrong = FrameIdentity("run-1", "data-1", 4, SCHEMA_A, 1, "shot-1")
     frame = BoardFrame(
         "board",
         0,

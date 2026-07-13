@@ -7,8 +7,10 @@ from enum import Enum
 import threading
 from typing import Callable
 
+from zlc_storage import canonical_text as _text
 
-def _text(value: object, field: str) -> str:
+
+def _normalize_human_text(value: object, field: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field} must be a string")
     normalized = value.strip()
@@ -37,7 +39,9 @@ class CatalogEntry:
             raise TypeError("route must be CatalogRoute")
         if self.route is CatalogRoute.HIDDEN:
             object.__setattr__(
-                self, "hidden_reason", _text(self.hidden_reason, "hidden_reason")
+                self,
+                "hidden_reason",
+                _normalize_human_text(self.hidden_reason, "hidden_reason"),
             )
         elif self.hidden_reason is not None:
             raise ValueError("hidden_reason is only valid for HIDDEN routes")
