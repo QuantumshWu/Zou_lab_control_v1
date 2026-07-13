@@ -49,6 +49,7 @@ from zlc_neutral_atom.readout import (
     readout_binding_key_from_tree,
     readout_binding_key_to_tree,
 )
+from zlc_neutral_atom.runtime.capture import CameraPhysicalFacts
 
 
 Y = AxisId("camera-y")
@@ -163,6 +164,89 @@ def _contract() -> FrameContract:
         schema,
         _calibration_layout(schema),
     )
+
+
+def _physical_facts() -> CameraPhysicalFacts:
+    descriptor = _descriptor()
+    setting = descriptor.setting(0)
+    return CameraPhysicalFacts(
+        camera_identity=descriptor.camera_identity,
+        sensor_identity=descriptor.sensor_identity,
+        optical_path=descriptor.optical_path,
+        capture_trigger_channels=("camera-trigger",),
+        sensor_shape_yx=descriptor.sensor_shape_yx,
+        roi_origin_yx=descriptor.roi_origin_yx,
+        roi_shape_yx=descriptor.roi_shape_yx,
+        binning_yx=descriptor.binning_yx,
+        spatial_y_axis_id=descriptor.spatial_y_axis_id,
+        spatial_x_axis_id=descriptor.spatial_x_axis_id,
+        coordinate_frame=descriptor.coordinate_frame,
+        dtype=descriptor.dtype,
+        count_unit=descriptor.count_unit,
+        exposure_seconds=setting.exposure_seconds,
+        gain=setting.gain,
+        readout_mode=setting.readout_mode,
+        opaque_frame_settings_fingerprint="f" * 64,
+    )
+
+
+def test_camera_frame_values_share_geometry_and_count_dtype_normalization() -> None:
+    changes = {
+        "sensor_shape_yx": [np.int64(100), np.int64(120)],
+        "roi_origin_yx": [np.int64(10), np.int64(20)],
+        "roi_shape_yx": [np.int64(40), np.int64(60)],
+        "binning_yx": [np.int64(2), np.int64(3)],
+        "dtype": np.dtype(">u2"),
+    }
+    descriptor = replace(_descriptor(), **changes)
+    contract = replace(_contract(), **changes)
+    physical_facts = replace(_physical_facts(), **changes)
+
+    expected_geometry = ((100, 120), (10, 20), (40, 60), (2, 3))
+    for value in (descriptor, contract, physical_facts):
+        assert (
+            value.sensor_shape_yx,
+            value.roi_origin_yx,
+            value.roi_shape_yx,
+            value.binning_yx,
+        ) == expected_geometry
+        assert value.dtype == np.dtype("<u2")
+    assert descriptor.output_shape_yx == physical_facts.output_shape_yx == (20, 20)
+
+
+@pytest.mark.parametrize(
+    ("changes", "error_type", "message"),
+    [
+        (
+            {"roi_origin_yx": (70, 20)},
+            ValueError,
+            "camera ROI lies outside the declared sensor geometry",
+        ),
+        (
+            {"roi_shape_yx": (41, 60)},
+            ValueError,
+            "roi_shape_yx must be exactly divisible by binning_yx",
+        ),
+        (
+            {"binning_yx": (0, 3)},
+            ValueError,
+            "binning_yx\\[0\\] must be at least 1",
+        ),
+        (
+            {"dtype": np.dtype("complex64")},
+            TypeError,
+            "dtype must be a real integer or floating dtype",
+        ),
+    ],
+)
+def test_camera_frame_values_reject_the_same_invalid_primitives(
+    changes: dict[str, object],
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    for value in (_descriptor(), _contract(), _physical_facts()):
+        with pytest.raises(error_type, match=message):
+            replace(value, **changes)
 
 
 def test_frame_axes_are_explicit_roi_local_output_pixel_coordinates() -> None:

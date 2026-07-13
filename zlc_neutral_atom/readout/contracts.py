@@ -47,7 +47,9 @@ def _pair(value: object, field: str, *, positive: bool) -> tuple[int, int]:
     )  # type: ignore[return-value]
 
 
-def _real_count_dtype(value: object, field: str) -> np.dtype:
+def normalize_camera_count_dtype(value: object, field: str) -> np.dtype:
+    """Return the canonical little-endian dtype admitted for camera counts."""
+
     try:
         dtype = np.dtype(value)
     except (TypeError, ValueError) as exc:
@@ -61,13 +63,15 @@ def _real_count_dtype(value: object, field: str) -> np.dtype:
     return dtype.newbyteorder("<")
 
 
-def _normalize_geometry(
+def normalize_camera_geometry(
     *,
     sensor_shape_yx: object,
     roi_origin_yx: object,
     roi_shape_yx: object,
     binning_yx: object,
 ) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]]:
+    """Validate and normalize one unbinned sensor/ROI/binning geometry."""
+
     sensor = _pair(sensor_shape_yx, "sensor_shape_yx", positive=True)
     origin = _pair(roi_origin_yx, "roi_origin_yx", positive=False)
     roi = _pair(roi_shape_yx, "roi_shape_yx", positive=True)
@@ -79,11 +83,13 @@ def _normalize_geometry(
     return sensor, origin, roi, binning
 
 
-def _validate_axis_facts(
+def validate_camera_spatial_axes(
     spatial_y_axis_id: object,
     spatial_x_axis_id: object,
     coordinate_frame: object,
 ) -> None:
+    """Validate the named spatial-axis facts shared by camera frame values."""
+
     if not isinstance(spatial_y_axis_id, AxisId):
         raise TypeError("spatial_y_axis_id must be AxisId")
     if not isinstance(spatial_x_axis_id, AxisId):
@@ -94,10 +100,12 @@ def _validate_axis_facts(
         raise TypeError("coordinate_frame must be CoordinateFrameId")
 
 
-def _output_shape(
+def camera_output_shape_yx(
     roi_shape_yx: tuple[int, int],
     binning_yx: tuple[int, int],
 ) -> tuple[int, int]:
+    """Derive output-pixel geometry from a previously validated ROI/binning."""
+
     return tuple(
         extent // factor for extent, factor in zip(roi_shape_yx, binning_yx)
     )  # type: ignore[return-value]
@@ -219,7 +227,7 @@ class CameraCaptureDescriptor:
     def __post_init__(self) -> None:
         for name in ("camera_identity", "sensor_identity", "optical_path"):
             _canonical_text(getattr(self, name), name)
-        sensor, origin, roi, binning = _normalize_geometry(
+        sensor, origin, roi, binning = normalize_camera_geometry(
             sensor_shape_yx=self.sensor_shape_yx,
             roi_origin_yx=self.roi_origin_yx,
             roi_shape_yx=self.roi_shape_yx,
@@ -229,7 +237,7 @@ class CameraCaptureDescriptor:
         object.__setattr__(self, "roi_origin_yx", origin)
         object.__setattr__(self, "roi_shape_yx", roi)
         object.__setattr__(self, "binning_yx", binning)
-        _validate_axis_facts(
+        validate_camera_spatial_axes(
             self.spatial_y_axis_id,
             self.spatial_x_axis_id,
             self.coordinate_frame,
@@ -241,7 +249,11 @@ class CameraCaptureDescriptor:
             raise TypeError("readout_event_axis_id must be AxisId or None")
         if self.readout_event_axis_id in {self.spatial_y_axis_id, self.spatial_x_axis_id}:
             raise ValueError("readout-event and spatial axes must have different identities")
-        object.__setattr__(self, "dtype", _real_count_dtype(self.dtype, "dtype"))
+        object.__setattr__(
+            self,
+            "dtype",
+            normalize_camera_count_dtype(self.dtype, "dtype"),
+        )
         _canonical_text(self.count_unit, "count_unit")
         settings = tuple(self.event_settings)
         if not settings:
@@ -264,7 +276,7 @@ class CameraCaptureDescriptor:
 
     @property
     def output_shape_yx(self) -> tuple[int, int]:
-        return _output_shape(self.roi_shape_yx, self.binning_yx)
+        return camera_output_shape_yx(self.roi_shape_yx, self.binning_yx)
 
     def setting(self, event_index: int) -> CameraEventReadoutSetting:
         index = _nonnegative_integer(event_index, "event_index")
@@ -537,7 +549,7 @@ class FrameContract:
             raise TypeError("binding must be ReadoutBindingKey")
         for name in ("camera_identity", "sensor_identity", "optical_path"):
             _canonical_text(getattr(self, name), name)
-        sensor, origin, roi, binning = _normalize_geometry(
+        sensor, origin, roi, binning = normalize_camera_geometry(
             sensor_shape_yx=self.sensor_shape_yx,
             roi_origin_yx=self.roi_origin_yx,
             roi_shape_yx=self.roi_shape_yx,
@@ -547,12 +559,12 @@ class FrameContract:
         object.__setattr__(self, "roi_origin_yx", origin)
         object.__setattr__(self, "roi_shape_yx", roi)
         object.__setattr__(self, "binning_yx", binning)
-        _validate_axis_facts(
+        validate_camera_spatial_axes(
             self.spatial_y_axis_id,
             self.spatial_x_axis_id,
             self.coordinate_frame,
         )
-        dtype = _real_count_dtype(self.dtype, "dtype")
+        dtype = normalize_camera_count_dtype(self.dtype, "dtype")
         object.__setattr__(self, "dtype", dtype)
         _canonical_text(self.count_unit, "count_unit")
         object.__setattr__(
@@ -571,7 +583,7 @@ class FrameContract:
             spatial_y_axis_id=self.spatial_y_axis_id,
             spatial_x_axis_id=self.spatial_x_axis_id,
             coordinate_frame=self.coordinate_frame,
-            output_shape_yx=_output_shape(roi, binning),
+            output_shape_yx=camera_output_shape_yx(roi, binning),
             dtype=dtype,
             count_unit=self.count_unit,
             frame_schema=self.frame_schema,
@@ -729,4 +741,8 @@ __all__ = [
     "CameraEventReadoutSetting",
     "FrameContract",
     "ReadoutBindingKey",
+    "camera_output_shape_yx",
+    "normalize_camera_count_dtype",
+    "normalize_camera_geometry",
+    "validate_camera_spatial_axes",
 ]

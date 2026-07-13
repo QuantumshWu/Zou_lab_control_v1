@@ -1951,6 +1951,8 @@ SiteMap:
   detection/selection lineage
 ```
 
+Camera geometry、ROI/binning 整除、output shape、spatial axis 与 real-count dtype 的纯规则只由 `zlc_neutral_atom.readout.contracts` 拥有；`CameraCaptureDescriptor`、`FrameContract` 与 runtime `CameraPhysicalFacts` 各自仍验证本对象的完整合同，但必须委托同一组规则，不能复制第二套物理公式。
+
 所有会改变数值解释的采集设置都进入 FrameContract fingerprint。CalibrationRequest 明确列出 required_model_kinds；所有 required model 成功且通过质量 gate 才原子提交 CalibrationArtifact，不能把部分失败 artifact 当成功。每个 model 保存自己的参数 schema、适用 FrameContract/SiteMap fingerprint 和质量指标。
 
 ### 13.2 输入

@@ -32,6 +32,10 @@ from zlc_neutral_atom.readout.contracts import (
     CameraCaptureDescriptor,
     CameraEventReadoutSetting,
     ReadoutBindingKey,
+    camera_output_shape_yx,
+    normalize_camera_count_dtype,
+    normalize_camera_geometry,
+    validate_camera_spatial_axes,
 )
 
 from ._failure import record_secondary_failure, safe_error_summary
@@ -74,24 +78,6 @@ from .streams import (
 PayloadT = TypeVar("PayloadT")
 _COMPLETION_TOKEN = object()
 _PROCESSOR_INPUT_BINDING_TOKEN = object()
-
-
-def _integer_pair(
-    value: object,
-    field: str,
-    *,
-    positive: bool,
-) -> tuple[int, int]:
-    try:
-        pair = tuple(value)  # type: ignore[arg-type]
-    except TypeError as exc:
-        raise TypeError(f"{field} must be a two-integer tuple") from exc
-    if len(pair) != 2:
-        raise ValueError(f"{field} must contain exactly two integers")
-    normalized = tuple(_nonnegative_int(item, field) for item in pair)
-    if positive and any(item == 0 for item in normalized):
-        raise ValueError(f"{field} entries must be positive")
-    return normalized  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -144,29 +130,22 @@ class CameraPhysicalFacts:
             "capture_trigger_channels",
             trigger_channels,
         )
-        sensor = _integer_pair(self.sensor_shape_yx, "sensor_shape_yx", positive=True)
-        origin = _integer_pair(self.roi_origin_yx, "roi_origin_yx", positive=False)
-        roi = _integer_pair(self.roi_shape_yx, "roi_shape_yx", positive=True)
-        binning = _integer_pair(self.binning_yx, "binning_yx", positive=True)
-        if any(start + extent > limit for start, extent, limit in zip(origin, roi, sensor)):
-            raise ValueError("camera ROI lies outside sensor geometry")
-        if any(extent % factor for extent, factor in zip(roi, binning)):
-            raise ValueError("camera ROI must be divisible by binning")
+        sensor, origin, roi, binning = normalize_camera_geometry(
+            sensor_shape_yx=self.sensor_shape_yx,
+            roi_origin_yx=self.roi_origin_yx,
+            roi_shape_yx=self.roi_shape_yx,
+            binning_yx=self.binning_yx,
+        )
         object.__setattr__(self, "sensor_shape_yx", sensor)
         object.__setattr__(self, "roi_origin_yx", origin)
         object.__setattr__(self, "roi_shape_yx", roi)
         object.__setattr__(self, "binning_yx", binning)
-        if not isinstance(self.spatial_y_axis_id, AxisId):
-            raise TypeError("spatial_y_axis_id must be AxisId")
-        if not isinstance(self.spatial_x_axis_id, AxisId):
-            raise TypeError("spatial_x_axis_id must be AxisId")
-        if self.spatial_y_axis_id == self.spatial_x_axis_id:
-            raise ValueError("camera spatial axis ids must differ")
-        if not isinstance(self.coordinate_frame, CoordinateFrameId):
-            raise TypeError("coordinate_frame must be CoordinateFrameId")
-        dtype = np.dtype(self.dtype).newbyteorder("<")
-        if dtype.hasobject or dtype.fields is not None or dtype.kind not in "iuf":
-            raise TypeError("camera dtype must be a real numeric scalar dtype")
+        validate_camera_spatial_axes(
+            self.spatial_y_axis_id,
+            self.spatial_x_axis_id,
+            self.coordinate_frame,
+        )
+        dtype = normalize_camera_count_dtype(self.dtype, "dtype")
         object.__setattr__(self, "dtype", dtype)
         _canonical_text(self.count_unit, "count_unit")
         object.__setattr__(
@@ -190,10 +169,7 @@ class CameraPhysicalFacts:
 
     @property
     def output_shape_yx(self) -> tuple[int, int]:
-        return tuple(
-            extent // factor
-            for extent, factor in zip(self.roi_shape_yx, self.binning_yx)
-        )  # type: ignore[return-value]
+        return camera_output_shape_yx(self.roi_shape_yx, self.binning_yx)
 
     def event_setting(self, event_index: int) -> CameraEventReadoutSetting:
         return CameraEventReadoutSetting(
