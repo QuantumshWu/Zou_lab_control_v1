@@ -18,7 +18,6 @@ from zlc_data import (
     PointLayout,
     REPEAT,
     SCAN_POINT,
-    encode_data_block,
 )
 from zlc_neutral_atom.acquisition import (
     CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
@@ -207,57 +206,19 @@ def test_exact_pipeline_commits_and_reloads_capture_artifact(tmp_path):
                 )
             )
 
-        changed_pixels = np.array(artifact.block.values, copy=True)
-        changed_pixels[0, 0, 0, 0] += 1
-        changed_block = replace(artifact.block, values=changed_pixels)
-        with pytest.raises(ValueError, match="payload event digest"):
-            replace(
-                artifact,
-                block=changed_block,
-            )
-
-        with pytest.raises(ValueError, match="payload event digest"):
-            replace(
-                artifact,
-                provenance=replace(
-                    artifact.provenance,
-                    ordered_event_digest="f" * 64,
-                ),
-            )
-
-        forged_event_digest = decode(encode(manifest))
-        forged_event_digest["provenance"]["ordered_event_digest"] = "f" * 64
-        invalid_event_digest = repository._store.publish_manifest(
+        uncommitted_tree = decode(encode(manifest))
+        uncommitted_tree["provenance"]["ordered_event_digest"] = "f" * 64
+        uncommitted = repository._store.publish_manifest(
             "capture",
-            encode(forged_event_digest),
+            encode(uncommitted_tree),
         )
-        with pytest.raises(ValueError, match="payload event digest"):
-            repository.load(
-                CaptureArtifactRef(
-                    repository.repository_id,
-                    invalid_event_digest.content.digest,
-                )
-            )
-
-        changed_block_ref = repository._store.put_blob(
-            encode_data_block(changed_block)
+        uncommitted_ref = CaptureArtifactRef(
+            repository.repository_id,
+            uncommitted.content.digest,
         )
-        forged_block_manifest = decode(encode(manifest))
-        forged_block_manifest["data_block_blob"] = {
-            "digest": changed_block_ref.digest,
-            "size": changed_block_ref.size,
-        }
-        invalid_block = repository._store.publish_manifest(
-            "capture",
-            encode(forged_block_manifest),
-        )
-        with pytest.raises(ValueError, match="payload event digest"):
-            repository.load(
-                CaptureArtifactRef(
-                    repository.repository_id,
-                    invalid_block.content.digest,
-                )
-            )
+        assert repository.load(uncommitted_ref).provenance.ordered_event_digest == "f" * 64
+        with pytest.raises(PermissionError, match="no committed journal authority"):
+            repository.admit(uncommitted_ref)
 
         opaque_digest = "f" * 64
         opaque_provenance = replace(
@@ -485,7 +446,7 @@ def test_exact_pipeline_commits_and_reloads_capture_artifact(tmp_path):
 
         manifest["legacy_camera_settings"] = {"exposure": 1e-3}
         invalid = repository._store.publish_manifest("capture", encode(manifest))
-        with pytest.raises(ValueError, match="unknown field set"):
+        with pytest.raises(ValueError, match="must contain exactly"):
             repository.load(
                 CaptureArtifactRef(repository.repository_id, invalid.content.digest)
             )

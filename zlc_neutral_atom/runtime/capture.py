@@ -485,8 +485,6 @@ class CapturePayloadContract(Protocol[PayloadT]):
 
     def snapshot(self, payload: PayloadT) -> PayloadT: ...
 
-    def validate(self, payload: PayloadT) -> None: ...
-
     def retained_nbytes(self, payload: PayloadT) -> int: ...
 
     def digest(self, payload: PayloadT) -> str: ...
@@ -747,7 +745,6 @@ class CaptureStreamContract:
         )
         for member in (
             "snapshot",
-            "validate",
             "retained_nbytes",
             "digest",
             "source_ordinal",
@@ -1907,8 +1904,7 @@ class CaptureSession:
                 )
                 self._validate_ack(ack, CapturedPayloadAck)
                 payload_contract = self._contract.payload_contract
-                payload = payload_contract.snapshot(ack.payload)
-                payload_contract.validate(payload)
+                payload = ack.payload
                 actual_ordinal = _nonnegative_int(
                     payload_contract.source_ordinal(payload),
                     "payload source ordinal",

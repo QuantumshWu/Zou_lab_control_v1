@@ -389,7 +389,6 @@ class CameraDatasetEventAdapter:
         return self.payload_contract.metadata_contract
 
     def value(self, payload: CameraSample) -> Value:
-        self.payload_contract.validate(payload)
         return payload.image
 
 

@@ -51,8 +51,6 @@ class PayloadContract(Protocol[PayloadT]):
 
     def snapshot(self, payload: PayloadT) -> PayloadT: ...
 
-    def validate(self, payload: PayloadT) -> None: ...
-
     def retained_nbytes(self, payload: PayloadT) -> int: ...
 
     def digest(self, payload: PayloadT) -> str: ...
@@ -408,14 +406,10 @@ class TraceBinding:
 
 @dataclass(frozen=True)
 class Envelope(Generic[PayloadT]):
-    event_id: EventId
-    stream_id: StreamId
-    stream_generation: StreamGenerationId
-    sequence: int
+    event_ref: EventRef
     emitted_at: float
     captured_at: float
     payload_contract_fingerprint: str
-    payload_digest: str
     trace: TraceContext
     payload: PayloadT
     join_key: object | None = None
@@ -424,17 +418,11 @@ class Envelope(Generic[PayloadT]):
     def __post_init__(self) -> None:
         if _contains_materialization(self.payload):
             raise TypeError("DataBlock/DataPatch are materialization values, not stream payloads")
-        if not isinstance(self.event_id, EventId):
-            raise TypeError("event_id must be EventId")
-        if not isinstance(self.stream_id, StreamId):
-            raise TypeError("stream_id must be StreamId")
-        if not isinstance(self.stream_generation, StreamGenerationId):
-            raise TypeError("stream_generation must be StreamGenerationId")
-        object.__setattr__(self, "sequence", _nonnegative_int(self.sequence, "sequence"))
+        if not isinstance(self.event_ref, EventRef):
+            raise TypeError("event_ref must be EventRef")
         object.__setattr__(self, "emitted_at", _finite_time(self.emitted_at, "emitted_at"))
         object.__setattr__(self, "captured_at", _finite_time(self.captured_at, "captured_at"))
         _digest(self.payload_contract_fingerprint, "payload_contract_fingerprint")
-        _digest(self.payload_digest, "payload_digest")
         if not isinstance(self.trace, TraceContext):
             raise TypeError("trace must be TraceContext")
         if (self.join_key is None) != (self.join_key_schema_fingerprint is None):
@@ -448,13 +436,27 @@ class Envelope(Generic[PayloadT]):
 
     @property
     def ref(self) -> EventRef:
-        return EventRef(
-            self.stream_id,
-            self.stream_generation,
-            self.sequence,
-            self.event_id,
-            self.payload_digest,
-        )
+        return self.event_ref
+
+    @property
+    def event_id(self) -> EventId:
+        return self.event_ref.event_id
+
+    @property
+    def stream_id(self) -> StreamId:
+        return self.event_ref.stream_id
+
+    @property
+    def stream_generation(self) -> StreamGenerationId:
+        return self.event_ref.generation
+
+    @property
+    def sequence(self) -> int:
+        return self.event_ref.sequence
+
+    @property
+    def payload_digest(self) -> str:
+        return self.event_ref.payload_digest
 
 
 class EndOfStream:
@@ -590,7 +592,6 @@ class ProducerFlowControl(str, Enum):
 class _Stored(Generic[PayloadT]):
     envelope: Envelope[PayloadT]
     payload_bytes: int
-    event_ref: EventRef
 
 
 class Delivery(Generic[PayloadT]):
@@ -1640,7 +1641,6 @@ class AcquisitionStream(Generic[PayloadT]):
         join_key: object | None = None,
     ) -> Envelope[PayloadT]:
         payload = self._payload_contract.snapshot(payload)
-        self._payload_contract.validate(payload)
         payload_digest = _digest(
             self._payload_contract.digest(payload),
             "payload digest",
@@ -1709,15 +1709,18 @@ class AcquisitionStream(Generic[PayloadT]):
                 self.generation,
                 sequence,
             )
+            event_ref = EventRef(
+                self.stream_id,
+                self.generation,
+                sequence,
+                selected_event_id,
+                payload_digest,
+            )
             envelope = Envelope(
-                event_id=selected_event_id,
-                stream_id=self.stream_id,
-                stream_generation=self.generation,
-                sequence=sequence,
+                event_ref=event_ref,
                 emitted_at=time.time(),
                 captured_at=captured_at,
                 payload_contract_fingerprint=self.payload_contract_fingerprint,
-                payload_digest=payload_digest,
                 trace=trace,
                 payload=payload,
                 join_key=join_key,
@@ -1763,7 +1766,7 @@ class AcquisitionStream(Generic[PayloadT]):
                     monitor._source_ended(overrun)
                 self._condition.notify_all()
                 raise overrun from error
-            stored = _Stored(envelope, size, envelope.ref)
+            stored = _Stored(envelope, size)
             self._records[sequence] = stored
             self._order.append(sequence)
             self._retained_bytes += size
@@ -1943,14 +1946,6 @@ class AcquisitionStream(Generic[PayloadT]):
         stored = self._records.get(envelope.sequence)
         if stored is None or stored.envelope is not envelope:
             raise PermissionError("Delivery no longer names its retained stream event")
-        if envelope.ref != stored.event_ref:
-            raise StreamError("retained event identity changed after publication")
-        current_payload_digest = _digest(
-            self._payload_contract.digest(envelope.payload),
-            "payload digest",
-        )
-        if current_payload_digest != stored.event_ref.payload_digest:
-            raise StreamError("retained event payload changed after publication")
         reservation.trace_binding.validate(envelope.trace)
         return cursor
 

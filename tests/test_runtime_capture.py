@@ -1190,6 +1190,38 @@ def test_payload_snapshot_does_not_alias_mutated_driver_ring():
     assert np.all(artifact.block.values == 1)
 
 
+def test_capture_publication_snapshots_and_digests_each_frame_once(monkeypatch):
+    calls = {"snapshot": 0, "digest": 0, "retained_nbytes": 0}
+    original_snapshot = CameraPayloadContract.snapshot
+    original_digest = CameraPayloadContract.digest
+    original_retained_nbytes = CameraPayloadContract.retained_nbytes
+
+    def counted_snapshot(contract, payload):
+        calls["snapshot"] += 1
+        return original_snapshot(contract, payload)
+
+    def counted_digest(contract, payload):
+        calls["digest"] += 1
+        return original_digest(contract, payload)
+
+    def counted_retained_nbytes(payload):
+        calls["retained_nbytes"] += 1
+        return original_retained_nbytes(payload)
+
+    monkeypatch.setattr(CameraPayloadContract, "snapshot", counted_snapshot)
+    monkeypatch.setattr(CameraPayloadContract, "digest", counted_digest)
+    monkeypatch.setattr(
+        CameraPayloadContract,
+        "retained_nbytes",
+        staticmethod(counted_retained_nbytes),
+    )
+
+    item = harness(points=2)
+    run(item).result(2.0)
+
+    assert calls == {"snapshot": 2, "digest": 2, "retained_nbytes": 2}
+
+
 def test_capture_refuses_extra_read_before_touching_device():
     item = harness(points=1)
 

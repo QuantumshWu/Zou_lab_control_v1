@@ -42,7 +42,6 @@ from zlc_neutral_atom.runtime.dataset import (
     DatasetCellAddress,
     DatasetMode,
     DatasetSealProvenance,
-    OrderedDatasetEventHasher,
     OrderedDatasetMetadataHasher,
     SealedDatasetArtifact,
 )
@@ -64,12 +63,10 @@ from zlc_neutral_atom.runtime.run import (
 )
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionStream,
-    EventRef,
     ExactReservation,
     ProducerFlowControl,
     ReservationState,
     TraceBinding,
-    event_id_for_sequence,
 )
 
 from .calibration import calibration_retained_array_nbytes
@@ -79,7 +76,6 @@ from .occupancy import (
     OccupancyDatasetField,
     OccupancyDatasetMetadata,
     OccupancyModelSelection,
-    OccupancySampleContract,
     OccupancyStreamProcessorSpec,
     bind_occupancy_stream_processor,
 )
@@ -767,7 +763,6 @@ def _validate_terminal_identity(
     executed: _ExecutedOccupancyPipeline,
 ) -> tuple[
     SealedDatasetArtifact,
-    OccupancySampleContract,
     tuple[DatasetCellAddress, ...],
 ]:
     spec = executed.spec
@@ -851,15 +846,14 @@ def _validate_terminal_identity(
         raise RuntimeError("occupancy derivation names another calibration input")
     if len(terminal.event_metadata) != len(expected_cells):
         raise RuntimeError("occupancy terminal metadata length differs from schedule")
-    payload_contract = bound.output_payload_contract
-    return terminal, payload_contract, tuple(expected_cells)
+    return terminal, tuple(expected_cells)
 
 
 def _finalize_occupancy_result(
     context: PostSafetyContext,
     executed: _ExecutedOccupancyPipeline,
 ) -> OccupancyPipelineResult:
-    terminal, payload_contract, expected_cells = _validate_terminal_identity(executed)
+    terminal, expected_cells = _validate_terminal_identity(executed)
     bound = executed.bound
     pipeline = executed.pipeline
     counts = terminal.snapshot
@@ -869,18 +863,12 @@ def _finalize_occupancy_result(
     occupied_schema = _occupied_dataset_schema(bound)
     occupied_values = np.zeros(occupied_schema.physical_shape, dtype=bool)
     metadata_contract = bound.output_edge.metadata_contract
-    metadata_hasher = OrderedDatasetMetadataHasher(metadata_contract.fingerprint)
     source_edge = executed.spec.measurement.capture_contract.dataset_edge
     source_contract = source_edge.metadata_contract
     source_metadata_hasher = OrderedDatasetMetadataHasher(
         source_edge.metadata_contract_fingerprint
     )
     provenance = terminal.provenance
-    event_hasher = OrderedDatasetEventHasher(
-        provenance.stream_id,
-        provenance.generation,
-        provenance.start_sequence,
-    )
     source_metadata: list[CameraFrameMetadata] = []
 
     for ordinal, (cell, metadata) in enumerate(
@@ -904,32 +892,8 @@ def _finalize_occupancy_result(
             or not np.array_equal(counts_validity.mask, occupied.validity.mask)
         ):
             raise RuntimeError("counts and occupied validity differ at one dataset cell")
-        metadata_digest = metadata_contract.digest(metadata)
         source_contract.validate(metadata.source_metadata)
         source_metadata_hasher.update(source_contract.digest(metadata.source_metadata))
-        payload_digest = payload_contract.digest_components(
-            occupied.values,
-            occupied.validity,
-            counts_values,
-            counts_validity,
-            metadata.source_metadata,
-        )
-        sequence = provenance.start_sequence + ordinal
-        event_hasher.update(
-            EventRef(
-                provenance.stream_id,
-                provenance.generation,
-                sequence,
-                event_id_for_sequence(
-                    provenance.stream_id,
-                    provenance.generation,
-                    sequence,
-                ),
-                payload_digest,
-            ),
-            metadata_digest,
-        )
-        metadata_hasher.update(metadata_digest)
         occupied_values[location] = occupied.values
         source_metadata.append(metadata.source_metadata)
 
@@ -939,14 +903,6 @@ def _finalize_occupancy_result(
         != pipeline.capture_terminal.ordered_metadata_digest
     ):
         raise RuntimeError("occupancy source metadata differs from physical capture")
-    if metadata_hasher.digest() != provenance.ordered_metadata_digest:
-        raise RuntimeError("recomputed occupancy metadata digest differs from terminal")
-    if (
-        event_hasher.digest(provenance.end_sequence)
-        != provenance.ordered_event_digest
-    ):
-        raise RuntimeError("recomputed occupancy event digest differs from terminal")
-
     occupied_block = DataBlock(
         executed.spec.materializer.occupied_block_id,
         counts_block.revision,

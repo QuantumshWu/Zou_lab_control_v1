@@ -130,7 +130,6 @@ class ValueDatasetEventAdapter:
         return self.payload_contract.schema
 
     def value(self, payload: Value) -> Value:
-        self.payload_contract.validate(payload)
         return payload
 
 
@@ -689,7 +688,7 @@ class FrozenDatasetEdge(Generic[PayloadT]):
             operator_fingerprint,
             "event adapter operator fingerprint",
         )
-        for member in ("snapshot", "validate", "retained_nbytes", "digest"):
+        for member in ("snapshot", "retained_nbytes", "digest"):
             if not callable(getattr(payload_contract, member, None)):
                 raise TypeError(f"event_adapter.payload_contract.{member} must be callable")
         metadata_fingerprint = _sha256_digest(
@@ -1622,14 +1621,6 @@ class DatasetBuilder(Generic[PayloadT]):
             or retained > self._metadata_max_retained_nbytes
         ):
             raise ValueError("metadata retained bytes exceed the declared metadata bound")
-        payload_bytes = self._source._payload_contract.retained_nbytes(payload)
-        value_bytes = int(value.values.nbytes)
-        if isinstance(value.validity, ComponentValidity):
-            value_bytes += int(value.validity.mask.nbytes)
-        if value_bytes + retained > payload_bytes:
-            raise ValueError(
-                "Value plus metadata bytes exceed total payload retained bytes"
-            )
         digest = _sha256_digest(contract.digest(metadata), "metadata digest")
         return value, metadata, digest
 

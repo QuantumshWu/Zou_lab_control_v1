@@ -685,8 +685,7 @@ class ExactStreamProcessorWorker:
                 f"input key at ordinal {index} differs from frozen exact schedule"
             )
         self._ordered_input_refs.update(envelope.ref)
-        invocation_payload = self._bound.input_payload_contract.snapshot(envelope.payload)
-        self._bound.input_payload_contract.validate(invocation_payload)
+        invocation_payload = envelope.payload
         started = time.monotonic()
         output_payload = self._bound.operator(invocation_payload, self._bound.config)
         elapsed = time.monotonic() - started

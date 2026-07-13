@@ -100,3 +100,25 @@ def test_canonical_primitive_validators_have_one_owner():
         "canonical primitive validators belong to zlc_storage.canonical; "
         "domain modules must import and alias them:\n" + "\n".join(violations)
     )
+
+
+def test_artifact_finalizers_do_not_replay_published_payload_digests():
+    violations = []
+    for relative in (
+        Path("zlc_neutral_atom/artifacts/capture.py"),
+        Path("zlc_neutral_atom/readout/occupancy_pipeline.py"),
+    ):
+        path = ROOT / relative
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "digest_components"
+            ):
+                violations.append(f"{relative}:{node.lineno}")
+    assert not violations, (
+        "payload content digest belongs to stream publication; artifact/finalizer "
+        "code must consume EventRef provenance instead of re-reading arrays:\n"
+        + "\n".join(violations)
+    )

@@ -891,6 +891,8 @@ stream_generation/payload contract fingerprint 改变时，旧 exact cursor 终�
 
 一个 StreamProcessor invocation 只原子发布一个 typed payload；同 shot 多字段装进同一 frozen record，成功 enqueue 后才 ack 输入。baseline 不支持把一次 invocation 拆成多个 exact stream 再实现跨 stream transaction；确有不同 cardinality/key 的结果应拆成独立节点。DatasetBuilder 在 Value 已按 frozen schedule 原子写入 values+validity 后 ack；storage 与权威 processor 只接受 SealedDatasetArtifact 或 VALID EpochBoundDatasetRef，不能退回接受裸 DataBlock/OwnedSnapshot/DatasetPreviewSnapshot。Repository sink 的 ack 点是临时 blob fsync/校验完成且 manifest 原子提交之后，不是刚开始写文件。
 
+payload 内容 digest 的唯一运行时 owner 是 `AcquisitionStream` 发布点：payload contract 先产生 owned immutable snapshot，stream 对该 snapshot 计算一次语义 digest 并铸造唯一 `EventRef`；Envelope 只保存这一份 EventRef。exact consumer、worker ack、DatasetBuilder 和 artifact/finalizer 只验证各自的 authority/sequence/cell/terminal 事实并流式累计小型 EventRef，不重新扫描 payload 或从 DataBlock 重建逐帧 digest。持久化时 ContentStore 对最终 blob bytes 另做一次 CAS hash，读取时按同一 ref 校验；CAS hash 与 EventRef digest 生命周期不同，二者都保留但不得互相重复冒充。同进程 `object.__setattr__`/手工伪造新 manifest 不是安全边界，不得以此为理由把每帧 SHA 放回 consume/load 热路径。
+
 ### 7.4 JoinPolicy
 
 当前实际需要四种：

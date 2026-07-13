@@ -215,7 +215,16 @@ def test_exact_reservation_retains_every_event_until_ordered_ack():
     assert source.retained_bytes <= 32
 
 
-def test_exact_consumer_revalidates_published_payload_content_and_identity():
+def test_exact_consumer_reuses_the_publication_event_ref_without_rehash(monkeypatch):
+    digest_calls = 0
+    original_digest = ValuePayloadContract.digest
+
+    def counted_digest(contract, payload):
+        nonlocal digest_calls
+        digest_calls += 1
+        return original_digest(contract, payload)
+
+    monkeypatch.setattr(ValuePayloadContract, "digest", counted_digest)
     source, producer = stream(events=1)
     reservation = source.reserve(
         total_events=1,
@@ -227,20 +236,12 @@ def test_exact_consumer_revalidates_published_payload_content_and_identity():
     owner = bind_terminal_consumer(source, reservation)
     emitted = emit(producer, 1.0)
     delivery = cursor.next()
-    original_payload = emitted.payload
-    original_digest = emitted.payload_digest
-
-    object.__setattr__(emitted, "payload", scalar_value(2.0))
-    with pytest.raises(StreamError, match="payload changed after publication"):
-        source._validate_consumer_delivery(reservation, delivery, owner)
-
-    object.__setattr__(emitted, "payload", original_payload)
-    object.__setattr__(emitted, "payload_digest", "f" * 64)
-    with pytest.raises(StreamError, match="identity changed after publication"):
-        source._validate_consumer_delivery(reservation, delivery, owner)
-
-    object.__setattr__(emitted, "payload_digest", original_digest)
+    assert emitted.ref is emitted.event_ref
+    assert emitted.payload_digest == emitted.event_ref.payload_digest
+    assert digest_calls == 1
+    source._validate_consumer_delivery(reservation, delivery, owner)
     acknowledge(source, reservation, delivery, owner)
+    assert digest_calls == 1
     eos = producer.finish()
     source._complete_consumer(reservation, eos, owner, lambda: None)
     reservation.release()

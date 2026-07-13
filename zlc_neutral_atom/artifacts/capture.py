@@ -15,14 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from zlc_data import (
-    INVALID,
-    VALID,
-    CellValidity,
-    ComponentValidity,
     DataBlock,
-    Invalid,
     StreamGenerationId,
-    Valid,
     data_block_from_tree,
     encode_data_block,
 )
@@ -93,7 +87,6 @@ from zlc_neutral_atom.runtime.dataset import (
     DatasetCellAddress,
     DatasetCoverage,
     DatasetSealProvenance,
-    OrderedDatasetEventHasher,
     dataset_cell_permutation_digest,
     dataset_consumer_contract_digest,
 )
@@ -104,10 +97,8 @@ from zlc_neutral_atom.runtime.pipeline import (
 )
 from zlc_neutral_atom.runtime.run import PostSafetyContext, RunPlan
 from zlc_neutral_atom.runtime.streams import (
-    EventRef,
     StreamId,
     TraceBinding,
-    event_id_for_sequence,
 )
 from zlc_neutral_atom.timing import (
     CompiledCaptureCellPlan,
@@ -352,25 +343,6 @@ class PulseCaptureLineage:
         return self.cell_plan.total_events
 
 
-def _capture_cell_validity(
-    block: DataBlock,
-    address: DatasetCellAddress,
-) -> Valid | Invalid | ComponentValidity:
-    """Project dataset validity onto one durable source cell without copying it."""
-
-    cell = (address.repeat_index, address.point_storage_index)
-    validity = block.validity
-    if isinstance(validity, (Valid, Invalid)):
-        cell_validity = validity
-    elif isinstance(validity, CellValidity):
-        cell_validity = VALID if bool(validity.mask[cell]) else INVALID
-    elif isinstance(validity, ComponentValidity):
-        cell_validity = ComponentValidity(validity.axis_ids, validity.mask[cell])
-    else:  # pragma: no cover - DataBlock already closes this union
-        raise TypeError("capture DataBlock has unsupported validity")
-    return cell_validity
-
-
 @dataclass(frozen=True)
 class CaptureArtifact:
     ref: CaptureArtifactRef
@@ -589,45 +561,12 @@ class CaptureArtifact:
             raise ValueError("capture metadata contract is not the current camera contract")
         hasher = hashlib.sha256()
         hasher.update(metadata_contract.fingerprint.encode("ascii"))
-        metadata_digests = []
         for item in metadata:
             metadata_contract.validate(item)
             metadata_digest = metadata_contract.digest(item)
-            metadata_digests.append(metadata_digest)
             hasher.update(metadata_digest.encode("ascii"))
         if hasher.hexdigest() != self.provenance.ordered_metadata_digest:
             raise ValueError("capture metadata sequence digest differs from provenance")
-        event_hasher = OrderedDatasetEventHasher(
-            self.provenance.stream_id,
-            self.provenance.generation,
-            self.provenance.start_sequence,
-        )
-        for offset, (address, item, metadata_digest) in enumerate(
-            zip(schedule, metadata, metadata_digests)
-        ):
-            sequence = self.provenance.start_sequence + offset
-            cell = (address.repeat_index, address.point_storage_index)
-            reference = EventRef(
-                self.provenance.stream_id,
-                self.provenance.generation,
-                sequence,
-                event_id_for_sequence(
-                    self.provenance.stream_id,
-                    self.provenance.generation,
-                    sequence,
-                ),
-                expected_payload_contract.digest_components(
-                    self.block.values[cell],
-                    _capture_cell_validity(self.block, address),
-                    item,
-                ),
-            )
-            event_hasher.update(reference, metadata_digest)
-        if (
-            event_hasher.digest(self.provenance.end_sequence)
-            != self.provenance.ordered_event_digest
-        ):
-            raise ValueError("capture payload event digest differs from provenance")
         if (
             self.terminal.produced_count != count
             or self.terminal.drained_count != count

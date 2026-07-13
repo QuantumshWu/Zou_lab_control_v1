@@ -507,7 +507,6 @@ class OccupancyDatasetEventAdapter:
         return self.payload_contract.counts_schema
 
     def value(self, payload: OccupancySample) -> Value:
-        self.payload_contract.validate(payload)
         return payload.counts
 
 
