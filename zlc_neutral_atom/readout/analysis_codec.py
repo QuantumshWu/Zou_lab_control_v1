@@ -17,12 +17,18 @@ from zlc_storage.canonical import CanonicalDecodeLimits
 from .analysis import (
     BoxAnalysisConfig,
     CalibrationAnalysisDiagnostics,
+    CalibrationAnalysisPlanningAssumption,
     CalibrationAnalysisRequest,
     CalibrationAnalysisResourcePolicy,
+    CalibrationBracketSamplingAssumption,
     CalibrationWorkPlan,
     GridOrder,
     ModelAnalysisDiagnostic,
     PsfAnalysisConfig,
+    ReferenceClassOrientation,
+    ReferenceLabelSource,
+    ReferenceValleyDiagnostic,
+    ReferenceValleyEvidence,
     SiteDetectionDiagnostic,
     SiteDetectionPolicy,
     UsableSiteAcceptance,
@@ -41,11 +47,11 @@ from .codec import (
 
 
 CALIBRATION_ANALYSIS_REQUEST_SCHEMA = (
-    "zlc_neutral_atom.calibration-analysis-request.v3"
+    "zlc_neutral_atom.calibration-analysis-request.v8"
 )
-CALIBRATION_WORK_PLAN_SCHEMA = "zlc_neutral_atom.calibration-work-plan.v1"
+CALIBRATION_WORK_PLAN_SCHEMA = "zlc_neutral_atom.calibration-work-plan.v5"
 CALIBRATION_ANALYSIS_DIAGNOSTICS_SCHEMA = (
-    "zlc_neutral_atom.calibration-analysis-diagnostics.v1"
+    "zlc_neutral_atom.calibration-analysis-diagnostics.v4"
 )
 
 BOX_ANALYSIS_CONFIG_SCHEMA = "zlc_neutral_atom.box-analysis-config.v1"
@@ -53,13 +59,19 @@ PSF_ANALYSIS_CONFIG_SCHEMA = "zlc_neutral_atom.psf-analysis-config.v1"
 SITE_DETECTION_POLICY_SCHEMA = "zlc_neutral_atom.site-detection-policy.v1"
 CALIBRATION_RESOURCE_POLICY_SCHEMA = "zlc_neutral_atom.calibration-resource-policy.v1"
 CALIBRATION_ANALYSIS_RESOURCE_POLICY_SCHEMA = (
-    "zlc_neutral_atom.calibration-analysis-resource-policy.v1"
+    "zlc_neutral_atom.calibration-analysis-resource-policy.v2"
 )
 SITE_DETECTION_DIAGNOSTIC_SCHEMA = (
     "zlc_neutral_atom.site-detection-diagnostic.v1"
 )
 MODEL_ANALYSIS_DIAGNOSTIC_SCHEMA = (
     "zlc_neutral_atom.model-analysis-diagnostic.v1"
+)
+REFERENCE_VALLEY_DIAGNOSTIC_SCHEMA = (
+    "zlc_neutral_atom.reference-valley-diagnostic.v3"
+)
+REFERENCE_VALLEY_EVIDENCE_SCHEMA = (
+    "zlc_neutral_atom.reference-valley-evidence.v2"
 )
 
 
@@ -76,6 +88,85 @@ MAX_ANALYSIS_WORK_PLAN_BYTES = 64 * 1024
 MAX_ANALYSIS_DIAGNOSTICS_BYTES = 64 * 1024 * 1024
 MAX_LAYOUT_REFERENCE_EVENT_INDICES = 200_000
 MAX_DIAGNOSTIC_VECTOR_ENTRIES = 100_000
+
+
+def calibration_analysis_diagnostics_encoding_upper_bound(
+    *,
+    site_count: int,
+    reference_count: int,
+    bracket_upper_bound: int,
+    train_bracket_upper_bound: int,
+    reference_evidence_bracket_upper_bound: int,
+    model_count: int,
+) -> int:
+    """Conservative current-schema canonical wire bound without materializing it.
+
+    This codec-owned estimate follows the v3 diagnostics projection.  It
+    budgets the largest optional reference-valley form (proposal plus both
+    nested evidence records), fixed JSON/tag/key overhead, all scalar digit
+    widths, site vectors, model diagnostics, and a generous top-level envelope.
+    Tests compare boundary-shaped real encodings against this formula so a
+    future schema change cannot silently invalidate preflight.
+    """
+
+    values = {
+        "site_count": site_count,
+        "reference_count": reference_count,
+        "bracket_upper_bound": bracket_upper_bound,
+        "train_bracket_upper_bound": train_bracket_upper_bound,
+        "reference_evidence_bracket_upper_bound": (
+            reference_evidence_bracket_upper_bound
+        ),
+        "model_count": model_count,
+    }
+    for name, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be an integer")
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative")
+
+    def digits(value: int) -> int:
+        # ceil(bit_length * log10(2)); this is an allocation-free upper bound
+        # and remains defined beyond Python's decimal-string safety limit.
+        return max(
+            1,
+            (max(1, value).bit_length() * 30_103 + 99_999) // 100_000,
+        )
+
+    valley_count = site_count * reference_count
+    per_valley = (
+        2_048
+        + digits(reference_count - 1)
+        + digits(site_count - 1)
+        + 2 * digits(train_bracket_upper_bound)
+        + 18 * digits(reference_evidence_bracket_upper_bound)
+    )
+    return (
+        64 * 1024
+        + 2 * site_count * (32 + digits(bracket_upper_bound))
+        + model_count * 2_048
+        + valley_count * per_valley
+    )
+
+
+def calibration_analysis_diagnostics_encoding_working_upper_bound(
+    wire_upper_bound: int,
+) -> int:
+    """Bound the current non-streaming projection/tag/JSON encode phase.
+
+    The encoder simultaneously retains the domain graph, primitive projection,
+    canonical tagged tree, and final bytes.  Measurements of the maximal v3
+    valley shape exceed eight times payload size; twelve times the conservative
+    wire bound plus a fixed envelope leaves headroom across Python allocators.
+    """
+
+    if isinstance(wire_upper_bound, bool) or not isinstance(
+        wire_upper_bound, int
+    ):
+        raise TypeError("wire_upper_bound must be an integer")
+    if wire_upper_bound < 0:
+        raise ValueError("wire_upper_bound must be non-negative")
+    return 12 * wire_upper_bound + 1024 * 1024
 
 
 _DEFAULT_ANALYSIS_RESOURCE_POLICY = CalibrationAnalysisResourcePolicy()
@@ -397,6 +488,10 @@ def _analysis_resource_policy_to_tree(
         "max_reference_frames": value.max_reference_frames,
         "max_image_pixels": value.max_image_pixels,
         "max_signal_evaluations": value.max_signal_evaluations,
+        "max_modality_test_work_units": value.max_modality_test_work_units,
+        "max_reference_valley_diagnostics": (
+            value.max_reference_valley_diagnostics
+        ),
         "max_sampled_pixel_operations": value.max_sampled_pixel_operations,
         "max_working_bytes": value.max_working_bytes,
         "max_lattice_sites": value.max_lattice_sites,
@@ -415,6 +510,8 @@ def _analysis_resource_policy_from_tree(
         "max_reference_frames",
         "max_image_pixels",
         "max_signal_evaluations",
+        "max_modality_test_work_units",
+        "max_reference_valley_diagnostics",
         "max_sampled_pixel_operations",
         "max_working_bytes",
         "max_lattice_sites",
@@ -452,6 +549,10 @@ def calibration_analysis_request_to_tree(
         "schema": CALIBRATION_ANALYSIS_REQUEST_SCHEMA,
         "layout": calibration_capture_layout_to_tree(value.layout),
         "grid_shape_yx": list(value.grid_shape_yx),
+        "reference_label_source": value.reference_label_source.value,
+        "reference_class_orientation": value.reference_class_orientation.value,
+        "bracket_sampling_assumption": value.bracket_sampling_assumption.value,
+        "analysis_planning_assumption": value.analysis_planning_assumption.value,
         "grid_order": value.grid_order.value,
         "box": _box_config_to_tree(value.box),
         "model_kinds": [kind.value for kind in value.model_kinds],
@@ -461,16 +562,21 @@ def calibration_analysis_request_to_tree(
         "psf": None if value.psf is None else _psf_config_to_tree(value.psf),
         "detection": _site_detection_policy_to_tree(value.detection),
         "train_fraction": value.train_fraction,
-        "random_seed": value.random_seed,
+        "reference_evidence_fraction": value.reference_evidence_fraction,
         "minimum_train_samples_per_class": value.minimum_train_samples_per_class,
         "minimum_test_samples_per_class": value.minimum_test_samples_per_class,
+        "minimum_reference_cluster_separation_rss": (
+            value.minimum_reference_cluster_separation_rss
+        ),
+        "reference_valley_familywise_error_rate": (
+            value.reference_valley_familywise_error_rate
+        ),
         "held_out_confidence_level": value.held_out_confidence_level,
         "minimum_held_out_class_accuracy_lower_bound": (
             value.minimum_held_out_class_accuracy_lower_bound
         ),
         "usable_site_acceptance": value.usable_site_acceptance.value,
         "minimum_usable_site_fraction": value.minimum_usable_site_fraction,
-        "reference_occupied_above": value.reference_occupied_above,
         "resource_policy": _analysis_resource_policy_to_tree(value.resource_policy),
     }
 
@@ -480,6 +586,10 @@ def calibration_analysis_request_from_tree(tree: Any) -> CalibrationAnalysisRequ
         "schema",
         "layout",
         "grid_shape_yx",
+        "reference_label_source",
+        "reference_class_orientation",
+        "bracket_sampling_assumption",
+        "analysis_planning_assumption",
         "grid_order",
         "box",
         "model_kinds",
@@ -487,14 +597,15 @@ def calibration_analysis_request_from_tree(tree: Any) -> CalibrationAnalysisRequ
         "psf",
         "detection",
         "train_fraction",
-        "random_seed",
+        "reference_evidence_fraction",
         "minimum_train_samples_per_class",
         "minimum_test_samples_per_class",
+        "minimum_reference_cluster_separation_rss",
+        "reference_valley_familywise_error_rate",
         "held_out_confidence_level",
         "minimum_held_out_class_accuracy_lower_bound",
         "usable_site_acceptance",
         "minimum_usable_site_fraction",
-        "reference_occupied_above",
         "resource_policy",
     }
     data = _exact_map(tree, fields, CALIBRATION_ANALYSIS_REQUEST_SCHEMA)
@@ -506,6 +617,26 @@ def calibration_analysis_request_from_tree(tree: Any) -> CalibrationAnalysisRequ
         layout=calibration_capture_layout_from_tree(data["layout"]),
         grid_shape_yx=tuple(
             _integer(item, "grid_shape_yx entry") for item in shape
+        ),
+        reference_label_source=_enum(
+            ReferenceLabelSource,
+            data["reference_label_source"],
+            "reference_label_source",
+        ),
+        reference_class_orientation=_enum(
+            ReferenceClassOrientation,
+            data["reference_class_orientation"],
+            "reference_class_orientation",
+        ),
+        bracket_sampling_assumption=_enum(
+            CalibrationBracketSamplingAssumption,
+            data["bracket_sampling_assumption"],
+            "bracket_sampling_assumption",
+        ),
+        analysis_planning_assumption=_enum(
+            CalibrationAnalysisPlanningAssumption,
+            data["analysis_planning_assumption"],
+            "analysis_planning_assumption",
         ),
         grid_order=_enum(GridOrder, data["grid_order"], "grid_order"),
         box=_box_config_from_tree(data["box"]),
@@ -520,7 +651,10 @@ def calibration_analysis_request_from_tree(tree: Any) -> CalibrationAnalysisRequ
         psf=None if psf is None else _psf_config_from_tree(psf),
         detection=_site_detection_policy_from_tree(data["detection"]),
         train_fraction=_float(data["train_fraction"], "train_fraction"),
-        random_seed=_integer(data["random_seed"], "random_seed"),
+        reference_evidence_fraction=_float(
+            data["reference_evidence_fraction"],
+            "reference_evidence_fraction",
+        ),
         minimum_train_samples_per_class=_integer(
             data["minimum_train_samples_per_class"],
             "minimum_train_samples_per_class",
@@ -528,6 +662,14 @@ def calibration_analysis_request_from_tree(tree: Any) -> CalibrationAnalysisRequ
         minimum_test_samples_per_class=_integer(
             data["minimum_test_samples_per_class"],
             "minimum_test_samples_per_class",
+        ),
+        minimum_reference_cluster_separation_rss=_float(
+            data["minimum_reference_cluster_separation_rss"],
+            "minimum_reference_cluster_separation_rss",
+        ),
+        reference_valley_familywise_error_rate=_float(
+            data["reference_valley_familywise_error_rate"],
+            "reference_valley_familywise_error_rate",
         ),
         held_out_confidence_level=_float(
             data["held_out_confidence_level"], "held_out_confidence_level"
@@ -544,9 +686,6 @@ def calibration_analysis_request_from_tree(tree: Any) -> CalibrationAnalysisRequ
         minimum_usable_site_fraction=_float(
             data["minimum_usable_site_fraction"],
             "minimum_usable_site_fraction",
-        ),
-        reference_occupied_above=_bool(
-            data["reference_occupied_above"], "reference_occupied_above"
         ),
         resource_policy=_analysis_resource_policy_from_tree(data["resource_policy"]),
     )
@@ -600,12 +739,20 @@ _WORK_PLAN_FIELDS = (
     "source_cell_count",
     "bracket_upper_bound",
     "train_bracket_upper_bound",
+    "reference_evidence_bracket_upper_bound",
     "reference_frame_upper_bound",
     "image_pixel_count",
     "full_frame_read_count",
     "feature_pixel_operations",
     "signal_evaluations",
+    "modality_test_work_units",
+    "reference_valley_diagnostic_count",
+    "diagnostics_encoding_upper_bound_bytes",
     "planned_kernel_elements",
+    "maximum_model_sampled_pixels",
+    "total_model_sampled_pixels",
+    "artifact_metadata_encoding_upper_bound_bytes",
+    "artifact_encoding_upper_bound_bytes",
     "layout_working_bytes",
     "detector_working_bytes",
     "assignment_scratch_bytes",
@@ -810,6 +957,138 @@ def _model_diagnostic_from_tree(tree: Any) -> ModelAnalysisDiagnostic:
     return value
 
 
+def _reference_valley_evidence_to_tree(
+    value: ReferenceValleyEvidence,
+) -> dict[str, Any]:
+    if not isinstance(value, ReferenceValleyEvidence):
+        raise TypeError("value must be ReferenceValleyEvidence")
+    return {
+        "schema": REFERENCE_VALLEY_EVIDENCE_SCHEMA,
+        "sample_count": value.sample_count,
+        "left_count": value.left_count,
+        "middle_count": value.middle_count,
+        "right_count": value.right_count,
+        "outside_count": value.outside_count,
+        "invalid_count": value.invalid_count,
+    }
+
+
+def _reference_valley_evidence_from_tree(tree: Any) -> ReferenceValleyEvidence:
+    fields = {
+        "sample_count",
+        "left_count",
+        "middle_count",
+        "right_count",
+        "outside_count",
+        "invalid_count",
+    }
+    data = _exact_nested_map(
+        tree,
+        fields,
+        REFERENCE_VALLEY_EVIDENCE_SCHEMA,
+    )
+    value = ReferenceValleyEvidence(
+        sample_count=_integer(data["sample_count"], "sample_count"),
+        left_count=_integer(data["left_count"], "left_count"),
+        middle_count=_integer(data["middle_count"], "middle_count"),
+        right_count=_integer(data["right_count"], "right_count"),
+        outside_count=_integer(data["outside_count"], "outside_count"),
+        invalid_count=_integer(data["invalid_count"], "invalid_count"),
+    )
+    _canonical_tree(
+        tree,
+        _reference_valley_evidence_to_tree(value),
+        REFERENCE_VALLEY_EVIDENCE_SCHEMA,
+    )
+    return value
+
+
+def _reference_valley_diagnostic_to_tree(
+    value: ReferenceValleyDiagnostic,
+) -> dict[str, Any]:
+    if not isinstance(value, ReferenceValleyDiagnostic):
+        raise TypeError("value must be ReferenceValleyDiagnostic")
+    return {
+        "schema": REFERENCE_VALLEY_DIAGNOSTIC_SCHEMA,
+        "reference_index": value.reference_index,
+        "site_index": value.site_index,
+        "proposal_threshold": value.proposal_threshold,
+        "proposal_lower_sample_count": value.proposal_lower_sample_count,
+        "proposal_upper_sample_count": value.proposal_upper_sample_count,
+        "cluster_separation_rss": value.cluster_separation_rss,
+        "evidence": _reference_valley_evidence_to_tree(value.evidence),
+        "lower_cluster_evidence": (
+            None
+            if value.lower_cluster_evidence is None
+            else _reference_valley_evidence_to_tree(value.lower_cluster_evidence)
+        ),
+        "upper_cluster_evidence": (
+            None
+            if value.upper_cluster_evidence is None
+            else _reference_valley_evidence_to_tree(value.upper_cluster_evidence)
+        ),
+        "site_accepted": value.site_accepted,
+    }
+
+
+def _reference_valley_diagnostic_from_tree(
+    tree: Any,
+) -> ReferenceValleyDiagnostic:
+    fields = {
+        "reference_index",
+        "site_index",
+        "proposal_threshold",
+        "proposal_lower_sample_count",
+        "proposal_upper_sample_count",
+        "cluster_separation_rss",
+        "evidence",
+        "lower_cluster_evidence",
+        "upper_cluster_evidence",
+        "site_accepted",
+    }
+    data = _exact_nested_map(
+        tree,
+        fields,
+        REFERENCE_VALLEY_DIAGNOSTIC_SCHEMA,
+    )
+    lower = data["lower_cluster_evidence"]
+    upper = data["upper_cluster_evidence"]
+    value = ReferenceValleyDiagnostic(
+        reference_index=_integer(data["reference_index"], "reference_index"),
+        site_index=_integer(data["site_index"], "site_index"),
+        proposal_threshold=_optional_float(
+            data["proposal_threshold"],
+            "proposal_threshold",
+        ),
+        proposal_lower_sample_count=_integer(
+            data["proposal_lower_sample_count"],
+            "proposal_lower_sample_count",
+        ),
+        proposal_upper_sample_count=_integer(
+            data["proposal_upper_sample_count"],
+            "proposal_upper_sample_count",
+        ),
+        cluster_separation_rss=_optional_float(
+            data["cluster_separation_rss"],
+            "cluster_separation_rss",
+        ),
+        evidence=_reference_valley_evidence_from_tree(data["evidence"]),
+        lower_cluster_evidence=(
+            None if lower is None else _reference_valley_evidence_from_tree(lower)
+        ),
+        upper_cluster_evidence=(
+            None if upper is None else _reference_valley_evidence_from_tree(upper)
+        ),
+        site_accepted=_bool(data["site_accepted"], "site_accepted"),
+    )
+    _canonical_tree(
+        tree,
+        _reference_valley_diagnostic_to_tree(value),
+        REFERENCE_VALLEY_DIAGNOSTIC_SCHEMA,
+    )
+    return value
+
+
 def _diagnostic_site_limit(policy: CalibrationAnalysisResourcePolicy) -> int:
     return min(
         policy.artifact_policy.max_sites,
@@ -822,6 +1101,15 @@ def _diagnostic_model_limit(policy: CalibrationAnalysisResourcePolicy) -> int:
     return min(policy.artifact_policy.max_models, _MODEL_KIND_COUNT)
 
 
+def _reference_valley_diagnostic_limit(
+    policy: CalibrationAnalysisResourcePolicy,
+) -> int:
+    return min(
+        policy.max_reference_valley_diagnostics,
+        MAX_DIAGNOSTIC_VECTOR_ENTRIES,
+    )
+
+
 def _validate_diagnostics_resources(
     value: CalibrationAnalysisDiagnostics,
     policy: CalibrationAnalysisResourcePolicy,
@@ -830,6 +1118,15 @@ def _validate_diagnostics_resources(
         raise TypeError("resource_policy must be CalibrationAnalysisResourcePolicy")
     site_limit = _diagnostic_site_limit(policy)
     model_limit = _diagnostic_model_limit(policy)
+    valley_limit = _reference_valley_diagnostic_limit(policy)
+    if value.bracket_count > policy.max_brackets:
+        raise CalibrationResourceExceeded(
+            "calibration diagnostic bracket count exceeds resource policy"
+        )
+    if value.reference_frame_count > policy.max_reference_frames:
+        raise CalibrationResourceExceeded(
+            "calibration diagnostic reference-frame count exceeds resource policy"
+        )
     if len(value.consensus_dark_counts) > site_limit:
         raise CalibrationResourceExceeded(
             "calibration diagnostic vectors exceed site resource policy"
@@ -837,6 +1134,10 @@ def _validate_diagnostics_resources(
     if len(value.models) > model_limit:
         raise CalibrationResourceExceeded(
             "calibration diagnostic models exceed model resource policy"
+        )
+    if len(value.reference_valleys) > valley_limit:
+        raise CalibrationResourceExceeded(
+            "reference-valley diagnostics exceed resource policy"
         )
     if value.detection.candidate_count > site_limit:
         raise CalibrationResourceExceeded(
@@ -866,6 +1167,9 @@ def calibration_analysis_diagnostics_to_tree(
         "schema": CALIBRATION_ANALYSIS_DIAGNOSTICS_SCHEMA,
         "bracket_count": value.bracket_count,
         "train_bracket_count": value.train_bracket_count,
+        "reference_evidence_bracket_count": (
+            value.reference_evidence_bracket_count
+        ),
         "test_bracket_count": value.test_bracket_count,
         "partition_digest": value.partition_digest,
         "reference_frame_count": value.reference_frame_count,
@@ -874,6 +1178,10 @@ def calibration_analysis_diagnostics_to_tree(
         ),
         "consensus_dark_counts": list(value.consensus_dark_counts),
         "consensus_bright_counts": list(value.consensus_bright_counts),
+        "reference_valleys": [
+            _reference_valley_diagnostic_to_tree(item)
+            for item in value.reference_valleys
+        ],
         "detection": _site_detection_diagnostic_to_tree(value.detection),
         "models": [_model_diagnostic_to_tree(item) for item in value.models],
     }
@@ -890,12 +1198,14 @@ def calibration_analysis_diagnostics_from_tree(
         "schema",
         "bracket_count",
         "train_bracket_count",
+        "reference_evidence_bracket_count",
         "test_bracket_count",
         "partition_digest",
         "reference_frame_count",
         "valid_training_reference_pixel_fraction",
         "consensus_dark_counts",
         "consensus_bright_counts",
+        "reference_valleys",
         "detection",
         "models",
     }
@@ -903,10 +1213,15 @@ def calibration_analysis_diagnostics_from_tree(
     dark = _list(data["consensus_dark_counts"], "consensus_dark_counts")
     bright = _list(data["consensus_bright_counts"], "consensus_bright_counts")
     models = _list(data["models"], "models")
+    reference_valleys = _list(data["reference_valleys"], "reference_valleys")
     value = CalibrationAnalysisDiagnostics(
         bracket_count=_integer(data["bracket_count"], "bracket_count"),
         train_bracket_count=_integer(
             data["train_bracket_count"], "train_bracket_count"
+        ),
+        reference_evidence_bracket_count=_integer(
+            data["reference_evidence_bracket_count"],
+            "reference_evidence_bracket_count",
         ),
         test_bracket_count=_integer(
             data["test_bracket_count"], "test_bracket_count"
@@ -924,6 +1239,10 @@ def calibration_analysis_diagnostics_from_tree(
         ),
         consensus_bright_counts=tuple(
             _integer(item, "consensus_bright_counts entry") for item in bright
+        ),
+        reference_valleys=tuple(
+            _reference_valley_diagnostic_from_tree(item)
+            for item in reference_valleys
         ),
         detection=_site_detection_diagnostic_from_tree(data["detection"]),
         models=tuple(_model_diagnostic_from_tree(item) for item in models),
@@ -974,14 +1293,25 @@ def decode_calibration_analysis_diagnostics(
         raise TypeError("resource_policy must be CalibrationAnalysisResourcePolicy")
     site_limit = _diagnostic_site_limit(resource_policy)
     model_limit = _diagnostic_model_limit(resource_policy)
+    valley_limit = _reference_valley_diagnostic_limit(resource_policy)
     max_bytes = min(
         MAX_ANALYSIS_DIAGNOSTICS_BYTES,
         resource_policy.artifact_policy.max_artifact_blob_bytes,
     )
     limits = CanonicalDecodeLimits(
         max_depth=24,
-        max_nodes=2 * site_limit + 16 * model_limit + 128,
-        max_container_entries=2 * site_limit + 16 * model_limit + 128,
+        max_nodes=(
+            2 * site_limit
+            + 16 * model_limit
+            + 64 * valley_limit
+            + 128
+        ),
+        max_container_entries=(
+            2 * site_limit
+            + 16 * model_limit
+            + 64 * valley_limit
+            + 128
+        ),
         max_arrays=0,
         max_total_array_bytes=0,
     )
@@ -989,6 +1319,7 @@ def decode_calibration_analysis_diagnostics(
         ("consensus_dark_counts",): site_limit,
         ("consensus_bright_counts",): site_limit,
         ("models",): model_limit,
+        ("reference_valleys",): valley_limit,
     }
     parser = lambda tree: calibration_analysis_diagnostics_from_tree(
         tree,
@@ -1027,9 +1358,13 @@ __all__ = [
     "MAX_LAYOUT_REFERENCE_EVENT_INDICES",
     "MODEL_ANALYSIS_DIAGNOSTIC_SCHEMA",
     "PSF_ANALYSIS_CONFIG_SCHEMA",
+    "REFERENCE_VALLEY_DIAGNOSTIC_SCHEMA",
+    "REFERENCE_VALLEY_EVIDENCE_SCHEMA",
     "SITE_DETECTION_DIAGNOSTIC_SCHEMA",
     "SITE_DETECTION_POLICY_SCHEMA",
     "CalibrationAnalysisCodecError",
+    "calibration_analysis_diagnostics_encoding_upper_bound",
+    "calibration_analysis_diagnostics_encoding_working_upper_bound",
     "calibration_analysis_diagnostics_from_tree",
     "calibration_analysis_diagnostics_to_tree",
     "calibration_analysis_request_from_tree",

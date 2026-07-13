@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
+import math
 
 import numpy as np
 import pytest
@@ -9,12 +11,18 @@ from zlc_data import AxisId
 from zlc_neutral_atom.readout.analysis import (
     BoxAnalysisConfig,
     CalibrationAnalysisDiagnostics,
+    CalibrationAnalysisPlanningAssumption,
     CalibrationAnalysisRequest,
     CalibrationAnalysisResourcePolicy,
+    CalibrationBracketSamplingAssumption,
     CalibrationWorkPlan,
     GridOrder,
     ModelAnalysisDiagnostic,
     PsfAnalysisConfig,
+    ReferenceClassOrientation,
+    ReferenceLabelSource,
+    ReferenceValleyDiagnostic,
+    ReferenceValleyEvidence,
     SiteDetectionDiagnostic,
     SiteDetectionPolicy,
     UsableSiteAcceptance,
@@ -24,7 +32,9 @@ from zlc_neutral_atom.readout.analysis_codec import (
     CALIBRATION_ANALYSIS_DIAGNOSTICS_SCHEMA,
     CALIBRATION_ANALYSIS_REQUEST_SCHEMA,
     CALIBRATION_WORK_PLAN_SCHEMA,
+    REFERENCE_VALLEY_DIAGNOSTIC_SCHEMA,
     CalibrationAnalysisCodecError,
+    calibration_analysis_diagnostics_encoding_upper_bound,
     calibration_analysis_diagnostics_to_tree,
     calibration_analysis_request_to_tree,
     calibration_work_plan_to_tree,
@@ -63,6 +73,8 @@ def _resource_policy(*, max_sites: int = 64) -> CalibrationAnalysisResourcePolic
         max_reference_frames=2_000,
         max_image_pixels=100_000,
         max_signal_evaluations=1_000_000,
+        max_modality_test_work_units=2_000_000,
+        max_reference_valley_diagnostics=2_000,
         max_sampled_pixel_operations=2_000_000,
         max_working_bytes=4_000_000,
         max_lattice_sites=max_sites,
@@ -79,6 +91,18 @@ def _request() -> CalibrationAnalysisRequest:
             3,
         ),
         grid_shape_yx=(2, 3),
+        reference_label_source=(
+            ReferenceLabelSource.UNSUPERVISED_REFERENCE_VALLEY
+        ),
+        reference_class_orientation=(
+            ReferenceClassOrientation.BELOW_IS_OCCUPIED
+        ),
+        bracket_sampling_assumption=(
+            CalibrationBracketSamplingAssumption.INDEPENDENT_STATIONARY_BRACKETS
+        ),
+        analysis_planning_assumption=(
+            CalibrationAnalysisPlanningAssumption.PRECOMMITTED_BEFORE_SOURCE_INSPECTION
+        ),
         grid_order=GridOrder.COLUMN_MAJOR,
         box=BoxAnalysisConfig(3, BoxReducer.MEAN),
         model_kinds=(
@@ -101,15 +125,14 @@ def _request() -> CalibrationAnalysisRequest:
             maximum_affine_condition_number=8.0,
             minimum_assignment_cost_gap_pixels_squared=5.0,
         ),
-        train_fraction=0.65,
-        random_seed=123,
+        train_fraction=0.30,
+        reference_evidence_fraction=0.30,
         minimum_train_samples_per_class=5,
         minimum_test_samples_per_class=6,
         held_out_confidence_level=0.975,
         minimum_held_out_class_accuracy_lower_bound=0.7,
         usable_site_acceptance=UsableSiteAcceptance.MINIMUM_FRACTION,
         minimum_usable_site_fraction=0.8,
-        reference_occupied_above=False,
         resource_policy=_resource_policy(),
     )
 
@@ -118,36 +141,76 @@ def _work_plan() -> CalibrationWorkPlan:
     return CalibrationWorkPlan(
         source_cell_count=60,
         bracket_upper_bound=20,
-        train_bracket_upper_bound=13,
+        train_bracket_upper_bound=6,
+        reference_evidence_bracket_upper_bound=6,
         reference_frame_upper_bound=60,
         image_pixel_count=4_096,
         full_frame_read_count=120,
         feature_pixel_operations=200_000,
         signal_evaluations=50_000,
+        modality_test_work_units=60_000,
+        reference_valley_diagnostic_count=18,
+        diagnostics_encoding_upper_bound_bytes=8_000,
         planned_kernel_elements=1_000,
+        maximum_model_sampled_pixels=4_000,
+        total_model_sampled_pixels=9_000,
+        artifact_metadata_encoding_upper_bound_bytes=100_000,
+        artifact_encoding_upper_bound_bytes=2_000_000,
         layout_working_bytes=10_000,
         detector_working_bytes=20_000,
         assignment_scratch_bytes=5_000,
         feature_working_bytes=30_000,
         psf_working_bytes=40_000,
         artifact_array_bytes=20_000,
-        canonical_encoding_scratch_bytes=10_000,
-        working_peak_bytes=70_000,
+        canonical_encoding_scratch_bytes=3_000_000,
+        working_peak_bytes=3_100_000,
         detector_graph_work_units=80_000,
         dense_assignment_work_units=90_000,
     )
 
 
+def _reference_valleys(
+    reference_count: int,
+    site_count: int,
+    evidence_count: int = 2,
+) -> tuple[ReferenceValleyDiagnostic, ...]:
+    return tuple(
+        ReferenceValleyDiagnostic(
+            reference_index=reference,
+            site_index=site,
+            proposal_threshold=None,
+            proposal_lower_sample_count=0,
+            proposal_upper_sample_count=0,
+            cluster_separation_rss=None,
+            evidence=ReferenceValleyEvidence(
+                evidence_count,
+                0,
+                0,
+                0,
+                evidence_count,
+                0,
+            ),
+            lower_cluster_evidence=None,
+            upper_cluster_evidence=None,
+            site_accepted=False,
+        )
+        for reference in range(reference_count)
+        for site in range(site_count)
+    )
+
+
 def _diagnostics() -> CalibrationAnalysisDiagnostics:
     return CalibrationAnalysisDiagnostics(
-        bracket_count=5,
-        train_bracket_count=3,
+        bracket_count=6,
+        train_bracket_count=2,
+        reference_evidence_bracket_count=2,
         test_bracket_count=2,
         partition_digest="a" * 64,
-        reference_frame_count=15,
+        reference_frame_count=18,
         valid_training_reference_pixel_fraction=0.875,
-        consensus_dark_counts=(4, 5, 6),
-        consensus_bright_counts=(7, 8, 9),
+        consensus_dark_counts=(1, 2, 3),
+        consensus_bright_counts=(4, 3, 2),
+        reference_valleys=_reference_valleys(3, 3),
         detection=SiteDetectionDiagnostic(
             candidate_count=3,
             minimum_peak_to_saddle_prominence=12.5,
@@ -220,6 +283,21 @@ def test_current_values_round_trip_to_deterministic_canonical_bytes(
     assert encoder(restored) == first
 
 
+def test_work_plan_rejects_wire_only_canonical_scratch_budget():
+    plan = _work_plan()
+    artifact_array_bytes = 32 * 1024 * 1024
+    wire_only_scratch = 2 * artifact_array_bytes
+
+    with pytest.raises(ValueError, match="owner encoding working bound"):
+        replace(
+            plan,
+            artifact_array_bytes=artifact_array_bytes,
+            artifact_encoding_upper_bound_bytes=wire_only_scratch,
+            canonical_encoding_scratch_bytes=wire_only_scratch,
+            working_peak_bytes=artifact_array_bytes + wire_only_scratch,
+        )
+
+
 def test_request_delegates_layout_to_its_owner_codec(monkeypatch):
     request = _request()
     expected = calibration_capture_layout_to_tree(request.layout)
@@ -278,6 +356,14 @@ def test_request_delegates_layout_to_its_owner_codec(monkeypatch):
         (
             lambda: decode(encode_calibration_analysis_diagnostics(_diagnostics())),
             ("models", 0),
+        ),
+        (
+            lambda: decode(encode_calibration_analysis_diagnostics(_diagnostics())),
+            ("reference_valleys", 0),
+        ),
+        (
+            lambda: decode(encode_calibration_analysis_diagnostics(_diagnostics())),
+            ("reference_valleys", 0, "evidence"),
         ),
     ),
 )
@@ -344,6 +430,14 @@ def test_every_current_schema_rejects_unknown_and_missing_fields(tree_factory, p
             lambda: decode(encode_calibration_analysis_diagnostics(_diagnostics())),
             ("models", 0),
         ),
+        (
+            lambda: decode(encode_calibration_analysis_diagnostics(_diagnostics())),
+            ("reference_valleys", 0),
+        ),
+        (
+            lambda: decode(encode_calibration_analysis_diagnostics(_diagnostics())),
+            ("reference_valleys", 0, "evidence"),
+        ),
     ),
 )
 def test_every_schema_rejects_an_unknown_version(tree_factory, schema_path):
@@ -385,6 +479,14 @@ def test_request_rejects_noncanonical_sequence_order_and_scalar_spelling():
         decode_calibration_analysis_request(encode(tree))
 
 
+def test_request_rejects_unknown_analysis_planning_assumption():
+    tree = decode(encode_calibration_analysis_request(_request()))
+    tree["analysis_planning_assumption"] = "POST_HOC"
+
+    with pytest.raises(ValueError, match="unknown value"):
+        decode_calibration_analysis_request(encode(tree))
+
+
 def test_work_plan_and_diagnostics_reject_bool_integer_and_nonfinite_float():
     plan = decode(encode_calibration_work_plan(_work_plan()))
     plan["source_cell_count"] = True
@@ -397,6 +499,90 @@ def test_work_plan_and_diagnostics_reject_bool_integer_and_nonfinite_float():
         decode_calibration_analysis_diagnostics(encode(diagnostics))
 
 
+def test_present_infinite_reference_separation_round_trips_and_legacy_schemas_reject():
+    evidence = ReferenceValleyEvidence(2, 1, 0, 1, 0, 0)
+    present = ReferenceValleyDiagnostic(
+        reference_index=0,
+        site_index=0,
+        proposal_threshold=0.5,
+        proposal_lower_sample_count=1,
+        proposal_upper_sample_count=1,
+        cluster_separation_rss=math.inf,
+        evidence=evidence,
+        lower_cluster_evidence=ReferenceValleyEvidence(1, 1, 0, 0, 0, 0),
+        upper_cluster_evidence=ReferenceValleyEvidence(1, 0, 0, 1, 0, 0),
+        site_accepted=False,
+    )
+    diagnostics = replace(
+        _diagnostics(),
+        reference_valleys=(present,) + _diagnostics().reference_valleys[1:],
+    )
+    payload = encode_calibration_analysis_diagnostics(diagnostics)
+    restored = decode_calibration_analysis_diagnostics(payload)
+    assert restored == diagnostics
+    assert math.isinf(restored.reference_valleys[0].cluster_separation_rss)
+
+    tree = decode(payload)
+    missing_separation = deepcopy(tree)
+    missing_separation["reference_valleys"][0]["cluster_separation_rss"] = None
+    with pytest.raises(ValueError, match="requires cluster_separation_rss"):
+        decode_calibration_analysis_diagnostics(encode(missing_separation))
+
+    absent_proposal = deepcopy(tree)
+    absent_proposal["reference_valleys"][0]["proposal_threshold"] = None
+    absent_proposal["reference_valleys"][0]["proposal_lower_sample_count"] = 0
+    absent_proposal["reference_valleys"][0]["proposal_upper_sample_count"] = 0
+    with pytest.raises(ValueError, match="missing proposal"):
+        decode_calibration_analysis_diagnostics(encode(absent_proposal))
+
+    legacy_nested = deepcopy(tree)
+    legacy_nested["reference_valleys"][0]["schema"] = (
+        "zlc_neutral_atom.reference-valley-diagnostic.v2"
+    )
+    with pytest.raises(ValueError, match="expected schema"):
+        decode_calibration_analysis_diagnostics(encode(legacy_nested))
+
+    legacy_outer = deepcopy(tree)
+    legacy_outer["schema"] = "zlc_neutral_atom.calibration-analysis-diagnostics.v3"
+    with pytest.raises(ValueError, match="expected schema"):
+        decode_calibration_analysis_diagnostics(encode(legacy_outer))
+
+    assert tree["reference_valleys"][0]["schema"] == (
+        REFERENCE_VALLEY_DIAGNOSTIC_SCHEMA
+    )
+
+
+def test_diagnostics_wire_estimator_covers_maximal_optional_valley_shape():
+    evidence = ReferenceValleyEvidence(2, 1, 0, 1, 0, 0)
+    valleys = tuple(
+        ReferenceValleyDiagnostic(
+            reference,
+            site,
+            0.5,
+            1,
+            1,
+            math.inf,
+            evidence,
+            ReferenceValleyEvidence(1, 1, 0, 0, 0, 0),
+            ReferenceValleyEvidence(1, 0, 0, 1, 0, 0),
+            False,
+        )
+        for reference in range(3)
+        for site in range(3)
+    )
+    diagnostics = replace(_diagnostics(), reference_valleys=valleys)
+    payload = encode_calibration_analysis_diagnostics(diagnostics)
+    upper = calibration_analysis_diagnostics_encoding_upper_bound(
+        site_count=3,
+        reference_count=3,
+        bracket_upper_bound=6,
+        train_bracket_upper_bound=2,
+        reference_evidence_bracket_upper_bound=2,
+        model_count=2,
+    )
+    assert len(payload) <= upper
+
+
 def test_closed_enums_reject_type_names_and_future_members():
     tree = decode(encode_calibration_analysis_request(_request()))
     tree["grid_order"] = "zlc_neutral_atom.readout.analysis.GridOrder.ROW_MAJOR"
@@ -405,6 +591,11 @@ def test_closed_enums_reject_type_names_and_future_members():
 
     tree = decode(encode_calibration_analysis_request(_request()))
     tree["model_kinds"][0] = "FUTURE_MODEL"
+    with pytest.raises(ValueError, match="unknown value"):
+        decode_calibration_analysis_request(encode(tree))
+
+    tree = decode(encode_calibration_analysis_request(_request()))
+    tree["reference_label_source"] = "KNOWN_OCCUPIED"
     with pytest.raises(ValueError, match="unknown value"):
         decode_calibration_analysis_request(encode(tree))
 
@@ -419,6 +610,10 @@ def test_constructors_and_decoders_isolate_caller_owned_sequences():
     request = CalibrationAnalysisRequest(
         layout,
         [1, 1],
+        ReferenceLabelSource.UNSUPERVISED_REFERENCE_VALLEY,
+        ReferenceClassOrientation.ABOVE_IS_OCCUPIED,
+        CalibrationBracketSamplingAssumption.INDEPENDENT_STATIONARY_BRACKETS,
+        CalibrationAnalysisPlanningAssumption.PRECOMMITTED_BEFORE_SOURCE_INSPECTION,
         model_kinds=model_kinds,
         default_model_kind=ReadoutModelKind.BOX,
     )
@@ -428,19 +623,21 @@ def test_constructors_and_decoders_isolate_caller_owned_sequences():
     assert request.model_kinds == (ReadoutModelKind.BOX,)
 
     dark = [1, 2]
-    bright = [3, 4]
+    bright = [2, 1]
     models = [
         ModelAnalysisDiagnostic(ReadoutModelKind.BOX, 2, 0, 0.8, 0.9, 0.7, 0.8)
     ]
     diagnostics = CalibrationAnalysisDiagnostics(
-        2,
+        3,
+        1,
         1,
         1,
         "b" * 64,
-        4,
+        6,
         1.0,
         dark,
         bright,
+        _reference_valleys(2, 2, 1),
         SiteDetectionDiagnostic(2, 1.0, 1, 0.0, None, None, None, None),
         models,
     )
@@ -448,7 +645,7 @@ def test_constructors_and_decoders_isolate_caller_owned_sequences():
     bright[0] = 99
     models.clear()
     assert diagnostics.consensus_dark_counts == (1, 2)
-    assert diagnostics.consensus_bright_counts == (3, 4)
+    assert diagnostics.consensus_bright_counts == (2, 1)
     assert len(diagnostics.models) == 1
 
     wire = bytearray(encode_calibration_analysis_diagnostics(diagnostics))

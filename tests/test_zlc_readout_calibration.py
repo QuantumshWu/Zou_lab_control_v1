@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
+import tracemalloc
 
 import numpy as np
 import pytest
@@ -72,6 +73,7 @@ from zlc_neutral_atom.readout import (
     extract_readout_features,
     extract_readout_signals,
     readout_application_scratch_nbytes,
+    calibration_retained_array_nbytes,
     calibration_resource_summary,
     validate_calibration_artifact_resources,
     validate_calibration_artifact_source_compatibility,
@@ -80,13 +82,19 @@ from zlc_neutral_atom.readout import (
 from zlc_neutral_atom.readout.calibration import (
     validate_readout_feature_spec_model,
 )
+from zlc_neutral_atom.readout.calibration_codec import (
+    calibration_artifact_encoding_upper_bound,
+    calibration_artifact_encoding_working_upper_bound,
+    calibration_artifact_metadata_encoding_upper_bound,
+)
 
 
-def _contracts():
+def _contracts(*, axis_name_padding: int = 0):
     frame = CoordinateFrameId("qcam-roi-pixels")
+    padding = "m" * axis_name_padding
     y_axis = AxisSpec(
         AxisId("camera-y"),
-        "ROI-local y",
+        f"ROI-local y{padding}",
         SPATIAL_Y,
         4,
         coordinates=tuple(range(4)),
@@ -95,7 +103,7 @@ def _contracts():
     )
     x_axis = AxisSpec(
         AxisId("camera-x"),
-        "ROI-local x",
+        f"ROI-local x{padding}",
         SPATIAL_X,
         5,
         coordinates=tuple(range(5)),
@@ -149,7 +157,9 @@ def _contracts():
         np.array([10, 0, 9], dtype="<u8"),
         np.array([10, 0, 10], dtype="<u8"),
         np.array([10, 0, 10], dtype="<u8"),
+        np.array([10, 0, 10], dtype="<u8"),
         np.array([9, 0, 9], dtype="<u8"),
+        np.array([10, 0, 9], dtype="<u8"),
         np.array([10, 0, 9], dtype="<u8"),
         np.array([0.70, 0.0, 0.70], dtype="<f8"),
         np.array([0.60, 0.0, 0.70], dtype="<f8"),
@@ -203,15 +213,16 @@ def _capture_layout():
 
 def _source_binding(contract):
     binding, derived_contract = derive_calibration_source_binding(
-        _resolved_capture(),
+        _resolved_capture(contract=contract),
         _capture_layout(),
     )
     assert derived_contract.fingerprint == contract.fingerprint
     return binding
 
 
-def _resolved_capture(*, point_layout=None):
-    contract, _, _, _ = _contracts()
+def _resolved_capture(*, point_layout=None, contract=None):
+    if contract is None:
+        contract, _, _, _ = _contracts()
     event_axis = AxisSpec(AxisId("readout-event"), "readout event", READOUT_EVENT, 3)
     layout = PointLayout.rect_c((3,)) if point_layout is None else point_layout
     schema = DatasetSchema(
@@ -346,8 +357,10 @@ def test_readout_application_scratch_bound_matches_serial_operator_allocations()
         readout_application_scratch_nbytes(box_spec, complex_schema)
 
 
-def _artifact(*, model_order=(2, 0, 1)):
-    contract, site_map, quality, boxes = _contracts()
+def _artifact(*, model_order=(2, 0, 1), axis_name_padding: int = 0):
+    contract, site_map, quality, boxes = _contracts(
+        axis_name_padding=axis_name_padding
+    )
     models = _models(contract, site_map, quality, boxes)
     artifact = CalibrationArtifact(
         _source_binding(contract),
@@ -381,8 +394,10 @@ def test_site_map_and_models_are_intrinsically_immutable_and_uniform_stores_one_
         quality.bright_training_sample_counts,
         quality.held_out_dark_success_counts,
         quality.held_out_dark_total_counts,
+        quality.held_out_dark_labeled_counts,
         quality.held_out_bright_success_counts,
         quality.held_out_bright_total_counts,
+        quality.held_out_bright_labeled_counts,
         quality.held_out_dark_accuracy_lower_bounds,
         quality.held_out_bright_accuracy_lower_bounds,
         quality.held_out_fidelity,
@@ -1065,7 +1080,9 @@ def test_standalone_model_cannot_bypass_site_count_applicability():
         np.array([5, 5], dtype="<u8"),
         np.array([9, 9], dtype="<u8"),
         np.array([10, 10], dtype="<u8"),
+        np.array([10, 10], dtype="<u8"),
         np.array([9, 9], dtype="<u8"),
+        np.array([10, 10], dtype="<u8"),
         np.array([10, 10], dtype="<u8"),
         np.array([0.6, 0.6], dtype="<f8"),
         np.array([0.6, 0.6], dtype="<f8"),
@@ -1187,13 +1204,78 @@ def test_resource_policy_rejects_before_apply_or_blob_decode():
         decode_calibration_artifact(10_000_000)  # type: ignore[arg-type]
 
 
+def _artifact_encoding_bounds(artifact):
+    summary = calibration_resource_summary(artifact)
+    metadata_bound = calibration_artifact_metadata_encoding_upper_bound(
+        source_binding=artifact.source_binding,
+        frame_contract=artifact.frame_contract,
+        artifact_parameters=artifact.parameters,
+        model_parameters=tuple(
+            model.header.parameters for model in artifact.models
+        ),
+        model_kinds=tuple(model.kind for model in artifact.models),
+        default_model_policy=artifact.default_model_policy,
+        algorithm_id=artifact.algorithm_id,
+        algorithm_version=artifact.algorithm_version,
+    )
+    wire_bound = calibration_artifact_encoding_upper_bound(
+        site_count=summary.site_count,
+        model_count=summary.model_count,
+        kernel_elements=summary.kernel_elements,
+        metadata_encoding_upper_bound_bytes=metadata_bound,
+    )
+    return metadata_bound, wire_bound
+
+
+def test_artifact_wire_and_profiled_canonical_working_memory_fit_owner_bounds():
+    artifact = _artifact()
+    payload = encode_calibration_artifact(artifact)
+    metadata_bound, wire_bound = _artifact_encoding_bounds(artifact)
+    assert len(payload) <= wire_bound
+    assert wire_bound <= 4 * len(payload)
+
+    kernel = np.zeros((1024, 1024), dtype="<f8")
+    tracemalloc.start()
+    try:
+        encoded = encode({"kernel": kernel})
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert len(encoded) > kernel.nbytes
+    assert peak <= calibration_artifact_encoding_working_upper_bound(
+        kernel.nbytes,
+        0,
+    )
+
+
+def test_artifact_bounds_include_adversarial_long_frame_schema_metadata():
+    artifact = _artifact(axis_name_padding=30_000)
+    metadata_bound, wire_bound = _artifact_encoding_bounds(artifact)
+    retained = calibration_retained_array_nbytes(artifact)
+
+    tracemalloc.start()
+    try:
+        payload = encode_calibration_artifact(artifact)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert len(payload) <= wire_bound
+    assert peak <= calibration_artifact_encoding_working_upper_bound(
+        retained,
+        metadata_bound,
+    )
+
+
 @pytest.mark.parametrize(
     "field_name",
     (
         "held_out_dark_success_counts",
         "held_out_dark_total_counts",
+        "held_out_dark_labeled_counts",
         "held_out_bright_success_counts",
         "held_out_bright_total_counts",
+        "held_out_bright_labeled_counts",
         "held_out_dark_accuracy_lower_bounds",
         "held_out_bright_accuracy_lower_bounds",
     ),
@@ -1270,10 +1352,10 @@ def test_all_persistent_values_have_strict_current_canonical_codecs():
         decode_calibration_artifact(encode(tree))
 
 
-def test_quality_codec_v2_is_exact_and_carries_per_class_confidence_evidence():
+def test_quality_codec_v3_is_exact_and_carries_adverse_per_class_evidence():
     tree = decode(encode_calibration_artifact(_artifact()))
     quality = tree["models"][0]["header"]["quality"]
-    assert quality["schema"] == "zlc_neutral_atom.readout-model-quality.v2"
+    assert quality["schema"] == "zlc_neutral_atom.readout-model-quality.v3"
     assert set(quality) == {
         "schema",
         "site_axis_id",
@@ -1282,8 +1364,10 @@ def test_quality_codec_v2_is_exact_and_carries_per_class_confidence_evidence():
         "bright_training_sample_counts",
         "held_out_dark_success_counts",
         "held_out_dark_total_counts",
+        "held_out_dark_labeled_counts",
         "held_out_bright_success_counts",
         "held_out_bright_total_counts",
+        "held_out_bright_labeled_counts",
         "held_out_dark_accuracy_lower_bounds",
         "held_out_bright_accuracy_lower_bounds",
         "held_out_fidelity",

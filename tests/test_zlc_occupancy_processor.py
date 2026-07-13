@@ -50,8 +50,12 @@ from zlc_neutral_atom.processing.stream import (
 )
 from zlc_neutral_atom.readout.analysis import (
     BoxAnalysisConfig,
+    CalibrationAnalysisPlanningAssumption,
     CalibrationAnalysisRequest,
+    CalibrationBracketSamplingAssumption,
     PsfAnalysisConfig,
+    ReferenceClassOrientation,
+    ReferenceLabelSource,
 )
 from zlc_neutral_atom.readout.calibration import (
     BackgroundMode,
@@ -154,6 +158,10 @@ def _analysis_request() -> CalibrationAnalysisRequest:
     return CalibrationAnalysisRequest(
         CalibrationCaptureLayout(AxisId("readout-event"), (0, 2), 1),
         (2, 2),
+        ReferenceLabelSource.UNSUPERVISED_REFERENCE_VALLEY,
+        ReferenceClassOrientation.ABOVE_IS_OCCUPIED,
+        CalibrationBracketSamplingAssumption.INDEPENDENT_STATIONARY_BRACKETS,
+        CalibrationAnalysisPlanningAssumption.PRECOMMITTED_BEFORE_SOURCE_INSPECTION,
         box=BoxAnalysisConfig(1, BoxReducer.SUM),
         model_kinds=(
             ReadoutModelKind.UNIFORM_PSF,
@@ -162,8 +170,7 @@ def _analysis_request() -> CalibrationAnalysisRequest:
         ),
         default_model_kind=ReadoutModelKind.BOX,
         psf=PsfAnalysisConfig(1, BackgroundMode.NONE, 0),
-        train_fraction=0.6,
-        random_seed=3817,
+        train_fraction=0.35,
         minimum_train_samples_per_class=1,
         minimum_test_samples_per_class=1,
         minimum_held_out_class_accuracy_lower_bound=0.0,
@@ -247,7 +254,7 @@ def trusted_calibration(tmp_path_factory):
         capture_trigger_channels=("ch11",),
         sequencer=sequencer,
     )
-    camera.recent_capacity = 64
+    camera.recent_capacity = 256
     runtime = LegacyNeutralAtomRuntime(
         DeviceSet(
             {"trap": trap, "readout": camera, "sequencer": sequencer},
@@ -259,7 +266,7 @@ def trusted_calibration(tmp_path_factory):
         )
     )
     description = runtime.describe_camera("readout")
-    repeat_axis = _axis("repeat", REPEAT, 10)
+    repeat_axis = _axis("repeat", REPEAT, 32)
     event_axis = _axis("readout-event", READOUT_EVENT, 3)
     context_axis = _axis("context", SCAN_POINT, 2)
     layout = PointLayout.rect_c((3, 2))
@@ -666,8 +673,10 @@ def test_calibration_memory_owner_counts_every_unique_array(trusted_calibration)
         "bright_training_sample_counts",
         "held_out_dark_success_counts",
         "held_out_dark_total_counts",
+        "held_out_dark_labeled_counts",
         "held_out_bright_success_counts",
         "held_out_bright_total_counts",
+        "held_out_bright_labeled_counts",
         "held_out_dark_accuracy_lower_bounds",
         "held_out_bright_accuracy_lower_bounds",
         "held_out_fidelity",

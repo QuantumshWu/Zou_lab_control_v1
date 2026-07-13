@@ -32,17 +32,25 @@ from zlc_neutral_atom.artifacts import (
 )
 from zlc_neutral_atom.readout.analysis import (
     BoxAnalysisConfig,
+    CalibrationAnalysisResult,
+    CalibrationAnalysisPlanningAssumption,
     CalibrationAnalysisRequest,
+    CalibrationBracketSamplingAssumption,
     PsfAnalysisConfig,
+    ReferenceClassOrientation,
+    ReferenceLabelSource,
+    build_calibration_work_plan,
 )
 from zlc_neutral_atom.readout.calibration import (
     BackgroundMode,
     BoxReducer,
     CalibrationResourceExceeded,
     CalibrationResourcePolicy,
+    CalibrationParameter,
     ReadoutModelKind,
 )
 from zlc_neutral_atom.readout.contracts import CalibrationCaptureLayout
+import zlc_neutral_atom.readout.analysis as analysis_impl
 import zlc_neutral_atom.readout.calibration_repository as repository_impl
 import zlc_storage.content_store as content_store_impl
 from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
@@ -95,6 +103,10 @@ def _request(**changes) -> CalibrationAnalysisRequest:
     base = CalibrationAnalysisRequest(
         CalibrationCaptureLayout(AxisId("readout-event"), (0, 2), 1),
         (2, 2),
+        ReferenceLabelSource.UNSUPERVISED_REFERENCE_VALLEY,
+        ReferenceClassOrientation.ABOVE_IS_OCCUPIED,
+        CalibrationBracketSamplingAssumption.INDEPENDENT_STATIONARY_BRACKETS,
+        CalibrationAnalysisPlanningAssumption.PRECOMMITTED_BEFORE_SOURCE_INSPECTION,
         box=BoxAnalysisConfig(1, BoxReducer.SUM),
         model_kinds=(
             ReadoutModelKind.UNIFORM_PSF,
@@ -103,8 +115,7 @@ def _request(**changes) -> CalibrationAnalysisRequest:
         ),
         default_model_kind=ReadoutModelKind.BOX,
         psf=PsfAnalysisConfig(1, BackgroundMode.NONE, 0),
-        train_fraction=0.6,
-        random_seed=3817,
+        train_fraction=0.35,
         minimum_train_samples_per_class=1,
         minimum_test_samples_per_class=1,
         minimum_held_out_class_accuracy_lower_bound=0.0,
@@ -169,7 +180,7 @@ def committed(tmp_path_factory):
     # This fixture deliberately injects the entire finite hardware burst at
     # once.  Its concrete driver-retention proof must therefore cover that
     # burst; production adapters derive the same bound from hardware facts.
-    camera.recent_capacity = 64
+    camera.recent_capacity = 256
     runtime = LegacyNeutralAtomRuntime(
         DeviceSet(
             {"readout": camera},
@@ -177,7 +188,7 @@ def committed(tmp_path_factory):
         )
     )
     description = runtime.describe_camera("readout")
-    repeat_axis = _axis("repeat", REPEAT, 10)
+    repeat_axis = _axis("repeat", REPEAT, 32)
     event_axis = _axis("readout-event", READOUT_EVENT, 3)
     context_axis = _axis("context", SCAN_POINT, 2)
     layout = PointLayout.rect_c((3, 2))
@@ -263,6 +274,11 @@ def _manifest_root(repository: CalibrationRepository):
 def _assert_no_manifest(repository: CalibrationRepository) -> None:
     root = _manifest_root(repository)
     assert not root.exists() or tuple(root.iterdir()) == ()
+
+
+def _assert_no_content_blobs(repository: CalibrationRepository) -> None:
+    root = repository.root / "content" / "blobs"
+    assert not root.exists() or tuple(path for path in root.rglob("*") if path.is_file()) == ()
 
 
 def _copy_calibration_repository(
@@ -380,6 +396,33 @@ def test_flat_run_commits_reopens_and_admits_only_after_exact_source_reload(
         reopened.close()
 
 
+def test_admission_replays_the_frozen_backend_after_environment_upgrade(
+    committed,
+    monkeypatch,
+):
+    artifact = committed.calibration_repository.load(committed.calibration_ref)
+    parameters = {item.name: item.value for item in artifact.parameters}
+    current_backend_calls = 0
+
+    def changed_environment():
+        nonlocal current_backend_calls
+        current_backend_calls += 1
+        return (
+            str(parameters["numpy-version"]) + ".future-with-longer-text",
+            str(parameters["scipy-version"]) + ".future-with-longer-text",
+            "a" * 64,
+        )
+
+    monkeypatch.setattr(analysis_impl, "_numeric_backend", changed_environment)
+    admitted = committed.calibration_repository.admit(
+        committed.calibration_ref,
+        committed.capture_repository,
+    )
+
+    assert admitted.reference == committed.calibration_ref
+    assert current_backend_calls == 0
+
+
 def test_visible_calibration_without_final_intent_is_inspectable_not_admitted(
     committed,
     tmp_path,
@@ -433,7 +476,10 @@ def test_preflight_loaded_capture_is_the_same_object_analyzed_and_request_is_sna
         committed.root / "same-object-calibrations",
         repository_id="same-object-calibrations",
     )
-    request = replace(committed.request, random_seed=4812)
+    request = replace(
+        committed.request,
+        minimum_reference_cluster_separation_rss=2.5,
+    )
     frozen_fingerprint = request.fingerprint
     plan = compile_calibration_artifact_plan(
         committed.capture_ref,
@@ -441,7 +487,7 @@ def test_preflight_loaded_capture_is_the_same_object_analyzed_and_request_is_sna
         calibration_repository,
         request,
     )
-    object.__setattr__(request, "random_seed", 9999)
+    object.__setattr__(request, "minimum_reference_cluster_separation_rss", 3.0)
     assert request.fingerprint != frozen_fingerprint
 
     admitted_artifact_ids: list[int] = []
@@ -521,6 +567,182 @@ def test_cancel_and_analysis_failure_publish_no_calibration_manifest(
     assert committed.capture_repository.load(committed.capture_ref).ref == (
         committed.capture_ref
     )
+
+
+def test_target_repository_budgets_reject_in_preflight_without_analysis_or_blobs(
+    committed,
+    monkeypatch,
+):
+    capture = committed.capture_repository.admit(committed.capture_ref).artifact
+    work_plan = build_calibration_work_plan(capture, committed.request)
+    base = CalibrationResourcePolicy()
+    cases = (
+        ("sites", replace(base, max_sites=3)),
+        ("models", replace(base, max_models=2)),
+        (
+            "kernels",
+            replace(base, max_kernel_elements=work_plan.planned_kernel_elements - 1),
+        ),
+        (
+            "per-model-samples",
+            replace(
+                base,
+                max_sampled_pixels_per_model=(
+                    work_plan.maximum_model_sampled_pixels - 1
+                ),
+            ),
+        ),
+        (
+            "total-samples",
+            replace(
+                base,
+                max_total_sampled_pixels_all_models=(
+                    work_plan.total_model_sampled_pixels - 1
+                ),
+            ),
+        ),
+        (
+            "artifact-wire",
+            replace(
+                base,
+                max_artifact_blob_bytes=(
+                    work_plan.artifact_encoding_upper_bound_bytes - 1
+                ),
+            ),
+        ),
+        (
+            "derivation-wire",
+            replace(
+                base,
+                max_artifact_blob_bytes=(
+                    work_plan.artifact_encoding_upper_bound_bytes + 1
+                ),
+            ),
+        ),
+        ("manifest-wire", replace(base, max_manifest_bytes=128)),
+    )
+    analyze_calls = 0
+
+    def forbidden_analysis(*_args, **_kwargs):
+        nonlocal analyze_calls
+        analyze_calls += 1
+        pytest.fail("target policy reached numerical calibration analysis")
+
+    monkeypatch.setattr(repository_impl, "analyze_calibration", forbidden_analysis)
+    for label, policy in cases:
+        repository = CalibrationRepository(
+            committed.root / f"preflight-{label}",
+            repository_id=f"preflight-{label}",
+            resource_policy=policy,
+        )
+        try:
+            handle = committed.runtime.controller.start(
+                compile_calibration_artifact_plan(
+                    committed.capture_ref,
+                    committed.capture_repository,
+                    repository,
+                    committed.request,
+                )
+            )
+            with pytest.raises(RunFailed, match="target repository policy"):
+                handle.result(20.0)
+            _assert_no_manifest(repository)
+            _assert_no_content_blobs(repository)
+        finally:
+            repository.close()
+    assert analyze_calls == 0
+
+
+def test_dishonest_analysis_request_parameters_are_rejected_before_staging(
+    committed,
+    monkeypatch,
+):
+    repository = CalibrationRepository(
+        committed.root / "dishonest-analysis",
+        repository_id="dishonest-analysis",
+    )
+    real_analyze = repository_impl.analyze_calibration
+
+    def dishonest(capture, request):
+        result = real_analyze(capture, request)
+        parameters = tuple(
+            CalibrationParameter(
+                item.name,
+                0.25
+                if item.name == "reference-valley-familywise-error-rate"
+                else item.value,
+            )
+            for item in result.artifact.parameters
+        )
+        artifact = replace(result.artifact, parameters=parameters)
+        return CalibrationAnalysisResult(artifact, result.diagnostics)
+
+    monkeypatch.setattr(repository_impl, "analyze_calibration", dishonest)
+    try:
+        handle = committed.runtime.controller.start(
+            compile_calibration_artifact_plan(
+                committed.capture_ref,
+                committed.capture_repository,
+                repository,
+                committed.request,
+            )
+        )
+        with pytest.raises(RunFailed, match="parameters differ"):
+            handle.result(20.0)
+        _assert_no_manifest(repository)
+        _assert_no_content_blobs(repository)
+    finally:
+        repository.close()
+
+
+def test_commit_encodes_diagnostics_once_and_load_or_admit_replays_result_once(
+    committed,
+    monkeypatch,
+):
+    repository = CalibrationRepository(
+        committed.root / "single-encode-replay",
+        repository_id="single-encode-replay",
+    )
+    real_encode = repository_impl.encode_calibration_analysis_diagnostics
+    encode_calls = 0
+
+    def counted_encode(*args, **kwargs):
+        nonlocal encode_calls
+        encode_calls += 1
+        return real_encode(*args, **kwargs)
+
+    monkeypatch.setattr(
+        repository_impl,
+        "encode_calibration_analysis_diagnostics",
+        counted_encode,
+    )
+    try:
+        reference = committed.runtime.controller.start(
+            compile_calibration_artifact_plan(
+                committed.capture_ref,
+                committed.capture_repository,
+                repository,
+                committed.request,
+            )
+        ).result(20.0)
+        assert encode_calls == 1
+
+        real_result = repository_impl.CalibrationAnalysisResult
+        result_calls = 0
+
+        def counted_result(*args, **kwargs):
+            nonlocal result_calls
+            result_calls += 1
+            return real_result(*args, **kwargs)
+
+        monkeypatch.setattr(repository_impl, "CalibrationAnalysisResult", counted_result)
+        assert repository.load_analysis_result(reference).artifact.fingerprint
+        assert result_calls == 1
+        result_calls = 0
+        assert repository.admit(reference, committed.capture_repository).reference == reference
+        assert result_calls == 1
+    finally:
+        repository.close()
 
 
 def test_manifest_and_derivation_tampering_are_rejected_current_only(committed):
@@ -605,17 +827,34 @@ def test_admission_requires_the_concrete_exact_source_repository(
             committed.calibration_ref,
             lambda _reference: committed.capture_repository.load(committed.capture_ref),
         )
-    real_build = repository_impl.build_calibration_work_plan
+    real_prepare = repository_impl._prepare_calibration_work
     capture = committed.capture_repository.load(committed.capture_ref)
-    expected_work_plan = real_build(capture.block.schema, committed.request)
-    drifted_work_plan = replace(
-        expected_work_plan,
-        source_cell_count=expected_work_plan.source_cell_count + 1,
+    artifact = committed.calibration_repository.load(committed.calibration_ref)
+    parameters = {item.name: item.value for item in artifact.parameters}
+    expected_preparation = real_prepare(
+        capture,
+        committed.request,
+        frozen_numeric_backend=(
+            parameters["numpy-version"],
+            parameters["scipy-version"],
+            parameters["numeric-backend-digest"],
+        ),
     )
+    drifted_work_plan = replace(
+        expected_preparation.plan,
+        source_cell_count=expected_preparation.plan.source_cell_count + 1,
+    )
+
+    def drifted_prepare(*args, **kwargs):
+        return replace(
+            real_prepare(*args, **kwargs),
+            plan=drifted_work_plan,
+        )
+
     monkeypatch.setattr(
         repository_impl,
-        "build_calibration_work_plan",
-        lambda *_args, **_kwargs: drifted_work_plan,
+        "_prepare_calibration_work",
+        drifted_prepare,
     )
     with pytest.raises(ValueError, match="work plan differs"):
         committed.calibration_repository.admit(
@@ -623,7 +862,7 @@ def test_admission_requires_the_concrete_exact_source_repository(
             committed.capture_repository,
         )
 
-    monkeypatch.setattr(repository_impl, "build_calibration_work_plan", real_build)
+    monkeypatch.setattr(repository_impl, "_prepare_calibration_work", real_prepare)
     uncommitted_root = tmp_path / "visible-uncommitted-captures"
     shutil.copytree(
         committed.capture_repository.root / "content",

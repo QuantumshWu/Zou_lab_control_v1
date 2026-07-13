@@ -412,8 +412,10 @@ class ReadoutModelQuality:
     bright_training_sample_counts: np.ndarray
     held_out_dark_success_counts: np.ndarray
     held_out_dark_total_counts: np.ndarray
+    held_out_dark_labeled_counts: np.ndarray
     held_out_bright_success_counts: np.ndarray
     held_out_bright_total_counts: np.ndarray
+    held_out_bright_labeled_counts: np.ndarray
     held_out_dark_accuracy_lower_bounds: np.ndarray
     held_out_bright_accuracy_lower_bounds: np.ndarray
     held_out_fidelity: np.ndarray
@@ -482,6 +484,10 @@ class ReadoutModelQuality:
             self.held_out_dark_total_counts,
             "held_out_dark_total_counts",
         )
+        dark_labeled = evidence_counts(
+            self.held_out_dark_labeled_counts,
+            "held_out_dark_labeled_counts",
+        )
         bright_success = evidence_counts(
             self.held_out_bright_success_counts,
             "held_out_bright_success_counts",
@@ -489,6 +495,10 @@ class ReadoutModelQuality:
         bright_total = evidence_counts(
             self.held_out_bright_total_counts,
             "held_out_bright_total_counts",
+        )
+        bright_labeled = evidence_counts(
+            self.held_out_bright_labeled_counts,
+            "held_out_bright_labeled_counts",
         )
         dark_lower = _float64_array(
             self.held_out_dark_accuracy_lower_bounds,
@@ -508,17 +518,31 @@ class ReadoutModelQuality:
             (bright_lower < 0.0) | (bright_lower > 1.0)
         ):
             raise ValueError("held-out class lower bounds must lie in [0, 1]")
-        if np.any(dark_success > dark_total) or np.any(bright_success > bright_total):
-            raise ValueError("held-out successes cannot exceed held-out totals")
+        if np.any(dark_success > dark_labeled) or np.any(
+            bright_success > bright_labeled
+        ):
+            raise ValueError("held-out successes cannot exceed labeled counts")
+        if np.any(dark_labeled > dark_total) or np.any(
+            bright_labeled > bright_total
+        ):
+            raise ValueError("held-out labeled counts cannot exceed adverse totals")
+        if np.any(
+            dark_total - dark_labeled != bright_total - bright_labeled
+        ):
+            raise ValueError(
+                "unknown held-out labels must be adverse to both class totals"
+            )
         evidence = fidelity_validity.mask
-        if np.any(evidence & ((dark_total == 0) | (bright_total == 0))):
-            raise ValueError("valid held-out evidence requires both class totals")
+        if np.any(evidence & ((dark_labeled == 0) | (bright_labeled == 0))):
+            raise ValueError("valid held-out evidence requires both labeled classes")
         invalid_evidence = ~evidence
         for values, field_name in (
             (dark_success, "dark successes"),
             (dark_total, "dark totals"),
+            (dark_labeled, "dark labeled counts"),
             (bright_success, "bright successes"),
             (bright_total, "bright totals"),
+            (bright_labeled, "bright labeled counts"),
             (dark_lower, "dark lower bounds"),
             (bright_lower, "bright lower bounds"),
             (fidelity, "held-out fidelity"),
@@ -557,8 +581,10 @@ class ReadoutModelQuality:
         object.__setattr__(self, "usable_sites", usable)
         object.__setattr__(self, "held_out_dark_success_counts", dark_success)
         object.__setattr__(self, "held_out_dark_total_counts", dark_total)
+        object.__setattr__(self, "held_out_dark_labeled_counts", dark_labeled)
         object.__setattr__(self, "held_out_bright_success_counts", bright_success)
         object.__setattr__(self, "held_out_bright_total_counts", bright_total)
+        object.__setattr__(self, "held_out_bright_labeled_counts", bright_labeled)
         object.__setattr__(self, "held_out_dark_accuracy_lower_bounds", dark_lower)
         object.__setattr__(self, "held_out_bright_accuracy_lower_bounds", bright_lower)
         object.__setattr__(self, "held_out_fidelity", fidelity)

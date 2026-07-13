@@ -2,14 +2,16 @@
 
 The only durable input is a raw CaptureArtifact-shaped value plus an explicit
 CalibrationCaptureLayout.  A bracket partition is frozen before any learned
-quantity: site detection, reference thresholds, PSF kernels, and short-readout
-thresholds see training brackets only; test references produce oracle labels
-and test short frames only score the frozen model.
+quantity.  Training brackets propose site geometry, reference thresholds, PSF
+kernels, and short-readout thresholds; an independent reference-evidence
+partition tests the frozen statistical valleys; held-out reference frames then
+produce explicitly unsupervised pseudo-labels used only to score frozen
+short-readout models.  No reference observation is called a physical oracle.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import hashlib
 import math
@@ -28,7 +30,7 @@ from scipy.optimize import linear_sum_assignment
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import minimum_spanning_tree
 from scipy.spatial import cKDTree
-from scipy.stats import beta as beta_distribution
+from scipy.stats import beta as beta_distribution, binomtest
 
 from zlc_data import (
     INVALID,
@@ -51,6 +53,7 @@ from .calibration import (
     CalibrationParameter,
     CalibrationResourceExceeded,
     CalibrationResourcePolicy,
+    CalibrationSourceBinding,
     CalibrationStage,
     DEFAULT_CALIBRATION_RESOURCE_POLICY,
     DefaultModelPolicy,
@@ -71,9 +74,12 @@ from .calibration import (
 from .contracts import CalibrationCaptureBracket, CalibrationCaptureLayout, FrameContract
 
 
-_ALGORITHM_ID = "zlc-readout-calibration-analysis"
-_ALGORITHM_VERSION = "3"
-_MAX_SEED = (1 << 64) - 1
+CALIBRATION_ANALYSIS_ALGORITHM_ID = "zlc-readout-calibration-analysis"
+CALIBRATION_ANALYSIS_ALGORITHM_VERSION = "7"
+# The partition is an algorithm decision, not a post-capture tuning knob.  A
+# public seed would let callers repeatedly repartition one observed capture
+# until a nominal familywise gate happened to pass.
+_PARTITION_SEED = 3817
 _MAX_AFFINE_ASSIGNMENT_ITERATIONS = 8
 _ASSIGNMENT_WORK_FACTOR = _MAX_AFFINE_ASSIGNMENT_ITERATIONS + 2
 _ASSIGNMENT_SCRATCH_BYTES_PER_PAIR = 64
@@ -84,6 +90,28 @@ _ASSIGNMENT_SCRATCH_BYTES_PER_PAIR = 64
 # sequential and reuse those arrays; they are not concurrent phase peaks.
 _DETECTOR_WORKING_BYTES_PER_PIXEL = 384
 _TOPOGRAPHIC_EDGE_COUNT_PER_PIXEL = 4
+_DEFAULT_MODEL_POLICY_ID = "analysis-request"
+_DEFAULT_MODEL_POLICY_VERSION = "4"
+_MODEL_VERSION = "5"
+_MODEL_ID_BY_KIND = {
+    ReadoutModelKind.BOX: "box-v5",
+    ReadoutModelKind.PER_SITE_PSF: "per-site-psf-v5",
+    ReadoutModelKind.UNIFORM_PSF: "uniform-psf-v5",
+}
+_QUALITY_GATE_ID = (
+    "precommitted-frozen-bracket-adverse-missingness-exact-binomial-"
+    "iut-artifact-model-site-holm"
+)
+_QUALITY_GATE_VERSION = "2"
+_REFERENCE_VALLEY_GATE_ID = (
+    "independent-stationary-complete-three-bin-exact-binomial-iut-holm"
+)
+_REFERENCE_VALLEY_GATE_VERSION = "3"
+_REFERENCE_AMBIGUITY_GATE_ID = "one-level-nested-valley-screen-holm"
+_REFERENCE_AMBIGUITY_GATE_VERSION = "1"
+_REFERENCE_EVIDENCE_ASSUMPTION = (
+    "INDEPENDENT_STATIONARY_BRACKETS_COMPLETE_REFERENCE_FEATURES"
+)
 
 
 class CalibrationAnalysisError(ValueError):
@@ -98,6 +126,67 @@ class GridOrder(str, Enum):
 class UsableSiteAcceptance(str, Enum):
     ALL = "ALL"
     MINIMUM_FRACTION = "MINIMUM_FRACTION"
+
+
+class ReferenceLabelSource(str, Enum):
+    """The physical authority available for calibration labels.
+
+    The current protocol observes the same unknown state twice; it can admit a
+    reproducible dominant binary valley under the declared screens, but it
+    cannot turn that statistical evidence into a known physical preparation
+    or prove that exactly two physical populations exist.  Its exact-binomial
+    claim requires independently prepared, gate-stationary brackets as
+    statistical units.  Invalid or non-finite reference features are never
+    dropped: they are persisted separately as adverse evidence, and any such
+    training/evidence observation prevents that site from acquiring
+    reference-label authority.
+    """
+
+    UNSUPERVISED_REFERENCE_VALLEY = "UNSUPERVISED_REFERENCE_VALLEY"
+
+
+class ReferenceClassOrientation(str, Enum):
+    """Explicit physical interpretation supplied by the experiment protocol.
+
+    Valley analysis can distinguish a lower and an upper statistical class;
+    it cannot infer which class physically means an occupied atom.  Requiring
+    this closed value prevents a convenience default from silently upgrading
+    unsupervised evidence into an occupancy claim.
+    """
+
+    ABOVE_IS_OCCUPIED = "ABOVE_IS_OCCUPIED"
+    BELOW_IS_OCCUPIED = "BELOW_IS_OCCUPIED"
+
+
+class CalibrationBracketSamplingAssumption(str, Enum):
+    """Protocol authority required by both finite-sample exact gates.
+
+    Independence and stationarity are properties of how experimental brackets
+    are prepared; neither can be proven by re-examining one captured value
+    sequence.  For every pooled exact gate, the corresponding Bernoulli
+    indicator must have one common, predeclared generating probability across
+    the frozen bracket population.  Context-dependent level shifts may not be
+    pooled under this assertion.  Exchangeability alone is intentionally not
+    offered because correlated blocks invalidate the binomial and
+    Clopper--Pearson guarantees.
+    """
+
+    INDEPENDENT_STATIONARY_BRACKETS = "INDEPENDENT_STATIONARY_BRACKETS"
+
+
+class CalibrationAnalysisPlanningAssumption(str, Enum):
+    """Protocol authority required for nominal post-selection guarantees.
+
+    The analysis request must be frozen before inspecting the source capture.
+    Repeatedly changing partitions, geometry, models, or quality gates on one
+    observed capture until a calibration passes invalidates the declared
+    familywise error rate.  Software persists and replays this assertion but
+    cannot infer a caller's pre-inspection intent from the captured values.
+    """
+
+    PRECOMMITTED_BEFORE_SOURCE_INSPECTION = (
+        "PRECOMMITTED_BEFORE_SOURCE_INSPECTION"
+    )
 
 
 def _finite_real(value: object, name: str) -> float:
@@ -120,6 +209,20 @@ def _positive_integer(value: object, name: str) -> int:
     if result == 0:
         raise ValueError(f"{name} must be positive")
     return result
+
+
+def _same_typed_scalar(actual: object, expected: object) -> bool:
+    return type(actual) is type(expected) and actual == expected
+
+
+def _typed_parameter_maps_equal(
+    actual: dict[str, object],
+    expected: dict[str, object],
+) -> bool:
+    return set(actual) == set(expected) and all(
+        _same_typed_scalar(actual[name], value)
+        for name, value in expected.items()
+    )
 
 
 @dataclass(frozen=True)
@@ -226,6 +329,8 @@ class CalibrationAnalysisResourcePolicy:
     max_reference_frames: int = 1_000_000
     max_image_pixels: int = 20_000_000
     max_signal_evaluations: int = 100_000_000
+    max_modality_test_work_units: int = 20_000_000_000
+    max_reference_valley_diagnostics: int = 100_000
     max_sampled_pixel_operations: int = 5_000_000_000
     max_working_bytes: int = 2_000_000_000
     max_lattice_sites: int = 2_048
@@ -241,6 +346,8 @@ class CalibrationAnalysisResourcePolicy:
             "max_reference_frames",
             "max_image_pixels",
             "max_signal_evaluations",
+            "max_modality_test_work_units",
+            "max_reference_valley_diagnostics",
             "max_sampled_pixel_operations",
             "max_working_bytes",
             "max_lattice_sites",
@@ -255,12 +362,20 @@ class CalibrationWorkPlan:
     source_cell_count: int
     bracket_upper_bound: int
     train_bracket_upper_bound: int
+    reference_evidence_bracket_upper_bound: int
     reference_frame_upper_bound: int
     image_pixel_count: int
     full_frame_read_count: int
     feature_pixel_operations: int
     signal_evaluations: int
+    modality_test_work_units: int
+    reference_valley_diagnostic_count: int
+    diagnostics_encoding_upper_bound_bytes: int
     planned_kernel_elements: int
+    maximum_model_sampled_pixels: int
+    total_model_sampled_pixels: int
+    artifact_metadata_encoding_upper_bound_bytes: int
+    artifact_encoding_upper_bound_bytes: int
     layout_working_bytes: int
     detector_working_bytes: int
     assignment_scratch_bytes: int
@@ -278,12 +393,52 @@ class CalibrationWorkPlan:
             object.__setattr__(self, name, value)
         if self.source_cell_count == 0 or self.image_pixel_count == 0:
             raise ValueError("calibration work plan requires non-empty source geometry")
+        from .analysis_codec import (
+            calibration_analysis_diagnostics_encoding_working_upper_bound,
+        )
+        from .calibration_codec import (
+            calibration_artifact_encoding_working_upper_bound,
+        )
+
+        required_canonical_scratch = max(
+            calibration_analysis_diagnostics_encoding_working_upper_bound(
+                self.diagnostics_encoding_upper_bound_bytes
+            ),
+            calibration_artifact_encoding_working_upper_bound(
+                self.artifact_array_bytes,
+                self.artifact_metadata_encoding_upper_bound_bytes,
+            ),
+        )
+        if self.canonical_encoding_scratch_bytes < required_canonical_scratch:
+            raise ValueError(
+                "canonical scratch is lower than an owner encoding working bound"
+            )
+        if (
+            self.canonical_encoding_scratch_bytes
+            < self.diagnostics_encoding_upper_bound_bytes
+        ):
+            raise ValueError(
+                "canonical scratch is lower than diagnostics encoding bound"
+            )
+        if self.total_model_sampled_pixels < self.maximum_model_sampled_pixels:
+            raise ValueError(
+                "total model sampled pixels are lower than the per-model maximum"
+            )
+        if (
+            self.canonical_encoding_scratch_bytes
+            < self.artifact_encoding_upper_bound_bytes
+        ):
+            raise ValueError(
+                "canonical scratch is lower than artifact encoding bound"
+            )
         if self.working_peak_bytes < max(
             self.layout_working_bytes,
             self.detector_working_bytes + self.assignment_scratch_bytes,
             self.assignment_scratch_bytes,
-            self.feature_working_bytes,
-            self.psf_working_bytes + self.feature_working_bytes,
+            self.artifact_array_bytes + self.feature_working_bytes,
+            self.artifact_array_bytes
+            + self.psf_working_bytes
+            + self.feature_working_bytes,
             self.artifact_array_bytes + self.canonical_encoding_scratch_bytes,
         ):
             raise ValueError("working_peak_bytes is lower than a declared phase peak")
@@ -299,21 +454,26 @@ class CalibrationWorkPlan:
 class CalibrationAnalysisRequest:
     layout: CalibrationCaptureLayout
     grid_shape_yx: tuple[int, int]
+    reference_label_source: ReferenceLabelSource
+    reference_class_orientation: ReferenceClassOrientation
+    bracket_sampling_assumption: CalibrationBracketSamplingAssumption
+    analysis_planning_assumption: CalibrationAnalysisPlanningAssumption
     grid_order: GridOrder = GridOrder.ROW_MAJOR
     box: BoxAnalysisConfig = BoxAnalysisConfig()
     model_kinds: tuple[ReadoutModelKind, ...] = (ReadoutModelKind.BOX,)
     default_model_kind: ReadoutModelKind | None = ReadoutModelKind.BOX
     psf: PsfAnalysisConfig | None = None
     detection: SiteDetectionPolicy = SiteDetectionPolicy()
-    train_fraction: float = 0.7
-    random_seed: int = 0
+    train_fraction: float = 0.35
+    reference_evidence_fraction: float = 0.35
     minimum_train_samples_per_class: int = 4
     minimum_test_samples_per_class: int = 4
+    minimum_reference_cluster_separation_rss: float = 2.0
+    reference_valley_familywise_error_rate: float = 0.01
     held_out_confidence_level: float = 0.95
     minimum_held_out_class_accuracy_lower_bound: float = 0.60
     usable_site_acceptance: UsableSiteAcceptance = UsableSiteAcceptance.ALL
     minimum_usable_site_fraction: float = 1.0
-    reference_occupied_above: bool = True
     resource_policy: CalibrationAnalysisResourcePolicy = CalibrationAnalysisResourcePolicy()
 
     def __post_init__(self) -> None:
@@ -324,6 +484,28 @@ class CalibrationAnalysisRequest:
             raise ValueError("grid_shape_yx must have two entries")
         shape = tuple(_positive_integer(value, "grid_shape_yx entry") for value in shape)
         object.__setattr__(self, "grid_shape_yx", shape)
+        if not isinstance(self.reference_label_source, ReferenceLabelSource):
+            raise TypeError("reference_label_source must be ReferenceLabelSource")
+        if not isinstance(self.reference_class_orientation, ReferenceClassOrientation):
+            raise TypeError(
+                "reference_class_orientation must be ReferenceClassOrientation"
+            )
+        if not isinstance(
+            self.bracket_sampling_assumption,
+            CalibrationBracketSamplingAssumption,
+        ):
+            raise TypeError(
+                "bracket_sampling_assumption must be "
+                "CalibrationBracketSamplingAssumption"
+            )
+        if not isinstance(
+            self.analysis_planning_assumption,
+            CalibrationAnalysisPlanningAssumption,
+        ):
+            raise TypeError(
+                "analysis_planning_assumption must be "
+                "CalibrationAnalysisPlanningAssumption"
+            )
         if not isinstance(self.grid_order, GridOrder):
             raise TypeError("grid_order must be GridOrder")
         if not isinstance(self.box, BoxAnalysisConfig):
@@ -351,10 +533,23 @@ class CalibrationAnalysisRequest:
         if not 0.0 < fraction < 1.0:
             raise ValueError("train_fraction must lie strictly between zero and one")
         object.__setattr__(self, "train_fraction", fraction)
-        seed = _nonnegative_integer(self.random_seed, "random_seed")
-        if seed > _MAX_SEED:
-            raise ValueError("random_seed must fit unsigned 64-bit canonical encoding")
-        object.__setattr__(self, "random_seed", seed)
+        evidence_fraction = _finite_real(
+            self.reference_evidence_fraction,
+            "reference_evidence_fraction",
+        )
+        if not 0.0 < evidence_fraction < 1.0:
+            raise ValueError(
+                "reference_evidence_fraction must lie strictly between zero and one"
+            )
+        if fraction + evidence_fraction >= 1.0:
+            raise ValueError(
+                "train_fraction plus reference_evidence_fraction must be below one"
+            )
+        object.__setattr__(
+            self,
+            "reference_evidence_fraction",
+            evidence_fraction,
+        )
         for name in (
             "minimum_train_samples_per_class",
             "minimum_test_samples_per_class",
@@ -364,6 +559,32 @@ class CalibrationAnalysisRequest:
                 name,
                 _positive_integer(getattr(self, name), name),
             )
+        reference_separation = _finite_real(
+            self.minimum_reference_cluster_separation_rss,
+            "minimum_reference_cluster_separation_rss",
+        )
+        if reference_separation <= 0.0:
+            raise ValueError(
+                "minimum_reference_cluster_separation_rss must be positive"
+            )
+        object.__setattr__(
+            self,
+            "minimum_reference_cluster_separation_rss",
+            reference_separation,
+        )
+        familywise_error_rate = _finite_real(
+            self.reference_valley_familywise_error_rate,
+            "reference_valley_familywise_error_rate",
+        )
+        if not 0.0 < familywise_error_rate < 1.0:
+            raise ValueError(
+                "reference_valley_familywise_error_rate must lie inside (0, 1)"
+            )
+        object.__setattr__(
+            self,
+            "reference_valley_familywise_error_rate",
+            familywise_error_rate,
+        )
         confidence = _finite_real(
             self.held_out_confidence_level,
             "held_out_confidence_level",
@@ -398,8 +619,6 @@ class CalibrationAnalysisRequest:
         ):
             raise ValueError("ALL usable-site acceptance requires canonical fraction 1.0")
         object.__setattr__(self, "minimum_usable_site_fraction", usable_fraction)
-        if not isinstance(self.reference_occupied_above, bool):
-            raise TypeError("reference_occupied_above must be bool")
         if not isinstance(self.resource_policy, CalibrationAnalysisResourcePolicy):
             raise TypeError("resource_policy must be CalibrationAnalysisResourcePolicy")
         if self.site_count > self.resource_policy.artifact_policy.max_sites:
@@ -512,15 +731,158 @@ class ModelAnalysisDiagnostic:
 
 
 @dataclass(frozen=True)
+class ReferenceValleyEvidence:
+    """Finite-sample exact evidence for one frozen three-bin valley."""
+
+    sample_count: int
+    left_count: int
+    middle_count: int
+    right_count: int
+    outside_count: int
+    invalid_count: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "sample_count",
+            "left_count",
+            "middle_count",
+            "right_count",
+            "outside_count",
+            "invalid_count",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _nonnegative_integer(getattr(self, name), name),
+            )
+        if (
+            self.left_count
+            + self.middle_count
+            + self.right_count
+            + self.outside_count
+            + self.invalid_count
+            != self.sample_count
+        ):
+            raise ValueError("reference-valley bin counts must cover all evidence")
+
+
+    def _outer_vs_adverse_pvalue(self, outer_count: int) -> float:
+        # Every valid evidence sample participates.  Values outside the three
+        # frozen bins are adverse evidence, not silently renormalized away.
+        adverse_count = (
+            self.middle_count + self.outside_count + self.invalid_count
+        )
+        pair_count = outer_count + adverse_count
+        if pair_count == 0:
+            return 1.0
+        return float(
+            binomtest(
+                outer_count,
+                pair_count,
+                0.5,
+                alternative="greater",
+            ).pvalue
+        )
+
+    @property
+    def left_vs_adverse_pvalue(self) -> float:
+        return self._outer_vs_adverse_pvalue(self.left_count)
+
+    @property
+    def right_vs_adverse_pvalue(self) -> float:
+        return self._outer_vs_adverse_pvalue(self.right_count)
+
+    @property
+    def valley_pvalue(self) -> float:
+        return max(
+            self.left_vs_adverse_pvalue,
+            self.right_vs_adverse_pvalue,
+        )
+
+
+@dataclass(frozen=True)
+class ReferenceValleyDiagnostic:
+    """Auditable evidence for one reference-event/site label proposal.
+
+    ``site_accepted`` means only that the independently proposed statistical
+    valley passed the declared familywise gates.  It does not assert that the
+    two populations are physically prepared empty/occupied states.
+    """
+
+    reference_index: int
+    site_index: int
+    proposal_threshold: float | None
+    proposal_lower_sample_count: int
+    proposal_upper_sample_count: int
+    cluster_separation_rss: float | None
+    evidence: ReferenceValleyEvidence
+    lower_cluster_evidence: ReferenceValleyEvidence | None
+    upper_cluster_evidence: ReferenceValleyEvidence | None
+    site_accepted: bool
+
+    def __post_init__(self) -> None:
+        for name in (
+            "reference_index",
+            "site_index",
+            "proposal_lower_sample_count",
+            "proposal_upper_sample_count",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _nonnegative_integer(getattr(self, name), name),
+            )
+        threshold = self.proposal_threshold
+        separation = self.cluster_separation_rss
+        if threshold is None:
+            if (
+                self.proposal_lower_sample_count != 0
+                or self.proposal_upper_sample_count != 0
+                or separation is not None
+            ):
+                raise ValueError("missing proposal must not carry proposal evidence")
+        else:
+            threshold = _finite_real(threshold, "proposal_threshold")
+            if (
+                self.proposal_lower_sample_count == 0
+                or self.proposal_upper_sample_count == 0
+            ):
+                raise ValueError("proposal requires samples in both classes")
+            if (
+                separation is None
+                or isinstance(separation, bool)
+                or not isinstance(separation, Real)
+            ):
+                raise ValueError(
+                    "present proposal requires cluster_separation_rss"
+                )
+            separation = float(separation)
+            if math.isnan(separation) or separation <= 0.0:
+                raise ValueError("cluster_separation_rss must be positive")
+        object.__setattr__(self, "proposal_threshold", threshold)
+        object.__setattr__(self, "cluster_separation_rss", separation)
+        if not isinstance(self.evidence, ReferenceValleyEvidence):
+            raise TypeError("evidence must be ReferenceValleyEvidence")
+        for name in ("lower_cluster_evidence", "upper_cluster_evidence"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, ReferenceValleyEvidence):
+                raise TypeError(f"{name} must be ReferenceValleyEvidence or None")
+        if not isinstance(self.site_accepted, bool):
+            raise TypeError("site_accepted must be bool")
+
+
+@dataclass(frozen=True)
 class CalibrationAnalysisDiagnostics:
     bracket_count: int
     train_bracket_count: int
+    reference_evidence_bracket_count: int
     test_bracket_count: int
     partition_digest: str
     reference_frame_count: int
     valid_training_reference_pixel_fraction: float
     consensus_dark_counts: tuple[int, ...]
     consensus_bright_counts: tuple[int, ...]
+    reference_valleys: tuple[ReferenceValleyDiagnostic, ...]
     detection: SiteDetectionDiagnostic
     models: tuple[ModelAnalysisDiagnostic, ...]
 
@@ -528,6 +890,7 @@ class CalibrationAnalysisDiagnostics:
         for name in (
             "bracket_count",
             "train_bracket_count",
+            "reference_evidence_bracket_count",
             "test_bracket_count",
             "reference_frame_count",
         ):
@@ -538,10 +901,23 @@ class CalibrationAnalysisDiagnostics:
             )
         if self.bracket_count == 0:
             raise ValueError("bracket_count must be positive")
-        if self.train_bracket_count == 0 or self.test_bracket_count == 0:
-            raise ValueError("diagnostics require non-empty train and test partitions")
-        if self.train_bracket_count + self.test_bracket_count != self.bracket_count:
-            raise ValueError("train/test bracket counts must sum to bracket_count")
+        if self.reference_frame_count == 0:
+            raise ValueError("reference_frame_count must be positive")
+        if (
+            self.train_bracket_count == 0
+            or self.reference_evidence_bracket_count == 0
+            or self.test_bracket_count == 0
+        ):
+            raise ValueError(
+                "diagnostics require non-empty train, reference-evidence, and test partitions"
+            )
+        if (
+            self.train_bracket_count
+            + self.reference_evidence_bracket_count
+            + self.test_bracket_count
+            != self.bracket_count
+        ):
+            raise ValueError("diagnostic partition counts must sum to bracket_count")
         if (
             not isinstance(self.partition_digest, str)
             or len(self.partition_digest) != 64
@@ -569,15 +945,90 @@ class CalibrationAnalysisDiagnostics:
         )
         if not dark or len(dark) != len(bright):
             raise ValueError("consensus count vectors must be non-empty and equal length")
+        valleys = tuple(self.reference_valleys)
+        if self.reference_frame_count % self.bracket_count != 0:
+            raise ValueError("reference-frame count is not divisible by bracket count")
+        reference_count = self.reference_frame_count // self.bracket_count
+        expected_valley_count = reference_count * len(dark)
+        if len(valleys) != expected_valley_count or any(
+            not isinstance(item, ReferenceValleyDiagnostic) for item in valleys
+        ):
+            raise ValueError(
+                "reference_valleys must contain one diagnostic per reference and site"
+            )
+        for reference in range(reference_count):
+            for site in range(len(dark)):
+                item = valleys[reference * len(dark) + site]
+                if item.reference_index != reference or item.site_index != site:
+                    raise ValueError("reference-valley diagnostic order is not canonical")
+                if (
+                    item.proposal_lower_sample_count
+                    + item.proposal_upper_sample_count
+                    > self.train_bracket_count
+                ):
+                    raise ValueError("reference proposal exceeds training partition")
+                if item.evidence.sample_count != self.reference_evidence_bracket_count:
+                    raise ValueError(
+                        "reference evidence must cover every scheduled evidence bracket"
+                    )
+                for nested in (
+                    item.lower_cluster_evidence,
+                    item.upper_cluster_evidence,
+                ):
+                    if (
+                        nested is not None
+                        and nested.sample_count
+                        > self.reference_evidence_bracket_count
+                    ):
+                        raise ValueError("nested evidence exceeds evidence partition")
+                if item.proposal_threshold is None and (
+                    item.evidence.left_count != 0
+                    or item.evidence.middle_count != 0
+                    or item.evidence.right_count != 0
+                    or (
+                        item.evidence.outside_count
+                        + item.evidence.invalid_count
+                        != item.evidence.sample_count
+                    )
+                    or item.evidence.valley_pvalue != 1.0
+                    or item.lower_cluster_evidence is not None
+                    or item.upper_cluster_evidence is not None
+                    or item.site_accepted
+                ):
+                    raise ValueError("missing proposal cannot carry valley authority")
+        for site in range(len(dark)):
+            site_items = valleys[site::len(dark)]
+            accepted = site_items[0].site_accepted
+            if any(
+                item.site_accepted is not accepted
+                for item in site_items
+            ):
+                raise ValueError("reference-valley site decisions are inconsistent")
+            if dark[site] + bright[site] > self.bracket_count:
+                raise ValueError(
+                    "consensus class counts exceed the bracket population"
+                )
         if not isinstance(self.detection, SiteDetectionDiagnostic):
             raise TypeError("detection must be SiteDetectionDiagnostic")
+        if self.detection.candidate_count != len(dark):
+            raise ValueError("site-detection diagnostic count differs from site vectors")
         models = tuple(self.models)
         if not models or any(not isinstance(item, ModelAnalysisDiagnostic) for item in models):
             raise ValueError("models must contain ModelAnalysisDiagnostic values")
         if len({item.kind for item in models}) != len(models):
             raise ValueError("diagnostic model kinds must be unique")
+        if tuple(item.kind for item in models) != tuple(
+            sorted((item.kind for item in models), key=lambda kind: kind.value)
+        ):
+            raise ValueError("diagnostic model kinds must use canonical order")
+        if any(
+            item.usable_site_count + item.rejected_site_count != len(dark)
+            for item in models
+        ):
+            raise ValueError("diagnostic model site counts differ from site vectors")
         object.__setattr__(self, "consensus_dark_counts", dark)
         object.__setattr__(self, "consensus_bright_counts", bright)
+        object.__setattr__(self, "reference_valleys", valleys)
         object.__setattr__(self, "models", models)
 
 
@@ -592,8 +1043,8 @@ class CalibrationAnalysisResult:
         if not isinstance(self.diagnostics, CalibrationAnalysisDiagnostics):
             raise TypeError("diagnostics must be CalibrationAnalysisDiagnostics")
         if (
-            self.artifact.algorithm_id != _ALGORITHM_ID
-            or self.artifact.algorithm_version != _ALGORITHM_VERSION
+            self.artifact.algorithm_id != CALIBRATION_ANALYSIS_ALGORITHM_ID
+            or self.artifact.algorithm_version != CALIBRATION_ANALYSIS_ALGORITHM_VERSION
         ):
             raise ValueError("analysis result artifact names another algorithm")
         site_count = self.artifact.site_map.site_axis.size
@@ -632,7 +1083,166 @@ class CalibrationAnalysisResult:
                 or any(character not in "0123456789abcdef" for character in value)
             ):
                 raise ValueError(f"artifact omits canonical {name}")
+        expected_analysis_parameters = {
+            "analysis-planning-assumption": (
+                CalibrationAnalysisPlanningAssumption
+                .PRECOMMITTED_BEFORE_SOURCE_INSPECTION.value
+            ),
+            "held-out-family-scope": "ARTIFACT_MODEL_SITE",
+            "held-out-family-model-count": len(self.artifact.models),
+            "held-out-family-hypothesis-count": (
+                len(self.artifact.models) * site_count
+            ),
+        }
+        for name, expected in expected_analysis_parameters.items():
+            if not _same_typed_scalar(artifact_parameters.get(name), expected):
+                raise ValueError(f"artifact analysis parameter {name} differs")
+        expected_reference_parameters = {
+            "bracket-sampling-assumption": (
+                CalibrationBracketSamplingAssumption.INDEPENDENT_STATIONARY_BRACKETS.value
+            ),
+            "reference-label-source": (
+                ReferenceLabelSource.UNSUPERVISED_REFERENCE_VALLEY.value
+            ),
+            "reference-valley-gate-id": (
+                _REFERENCE_VALLEY_GATE_ID
+            ),
+            "reference-valley-gate-version": _REFERENCE_VALLEY_GATE_VERSION,
+            "reference-ambiguity-gate-id": _REFERENCE_AMBIGUITY_GATE_ID,
+            "reference-ambiguity-gate-version": _REFERENCE_AMBIGUITY_GATE_VERSION,
+            "reference-statistical-unit": "BRACKET",
+            "reference-evidence-assumption": (
+                _REFERENCE_EVIDENCE_ASSUMPTION
+            ),
+            "train-bracket-count": self.diagnostics.train_bracket_count,
+            "reference-evidence-bracket-count": (
+                self.diagnostics.reference_evidence_bracket_count
+            ),
+            "test-bracket-count": self.diagnostics.test_bracket_count,
+        }
+        for name, expected in expected_reference_parameters.items():
+            if not _same_typed_scalar(artifact_parameters.get(name), expected):
+                raise ValueError(f"artifact reference-label parameter {name} differs")
+        familywise_error_rate = artifact_parameters.get(
+            "reference-valley-familywise-error-rate"
+        )
+        if (
+            isinstance(familywise_error_rate, bool)
+            or not isinstance(familywise_error_rate, Real)
+            or not math.isfinite(float(familywise_error_rate))
+            or not 0.0 < float(familywise_error_rate) < 1.0
+        ):
+            raise ValueError("artifact omits reference-valley familywise error rate")
+        familywise_error_rate = float(familywise_error_rate)
+        separation_gate = artifact_parameters.get(
+            "minimum-reference-cluster-separation-rss"
+        )
+        if (
+            isinstance(separation_gate, bool)
+            or not isinstance(separation_gate, Real)
+            or not math.isfinite(float(separation_gate))
+            or float(separation_gate) <= 0.0
+        ):
+            raise ValueError("artifact omits positive reference separation gate")
+        separation_gate = float(separation_gate)
+        minimum_reference_samples = artifact_parameters.get(
+            "minimum-reference-proposal-samples-per-class"
+        )
+        if (
+            isinstance(minimum_reference_samples, bool)
+            or not isinstance(minimum_reference_samples, Integral)
+            or minimum_reference_samples <= 0
+        ):
+            raise ValueError("artifact omits reference proposal sample gate")
+        orientation = artifact_parameters.get("reference-class-orientation")
+        if orientation not in {"ABOVE_IS_OCCUPIED", "BELOW_IS_OCCUPIED"}:
+            raise ValueError("artifact omits reference class orientation")
+        for item in self.diagnostics.reference_valleys:
+            if item.proposal_threshold is None:
+                continue
+            if (
+                item.proposal_lower_sample_count < minimum_reference_samples
+                or item.proposal_upper_sample_count < minimum_reference_samples
+            ):
+                raise ValueError("reference proposal violates minimum sample gate")
+            if (
+                item.cluster_separation_rss is not None
+                and item.cluster_separation_rss < separation_gate
+            ):
+                raise ValueError("reference proposal violates separation gate")
+
+        reference_count = len(
+            self.artifact.source_binding.layout.reference_event_indices
+        )
+        valley_matrix = np.asarray(
+            [
+                item.evidence.valley_pvalue
+                for item in self.diagnostics.reference_valleys
+            ],
+            dtype=np.float64,
+        ).reshape(reference_count, site_count)
+        expected_primary = _holm_rejections(
+            np.max(valley_matrix, axis=0),
+            familywise_error_rate,
+        )
+        nested_matrix = np.asarray(
+            [
+                1.0 if value is None else value
+                for item in self.diagnostics.reference_valleys
+                for evidence in (
+                    item.lower_cluster_evidence,
+                    item.upper_cluster_evidence,
+                )
+                for value in (
+                    None if evidence is None else evidence.valley_pvalue,
+                )
+            ],
+            dtype=np.float64,
+        ).reshape(reference_count, site_count, 2)
+        expected_ambiguous = np.any(
+            _holm_rejections(
+                nested_matrix.reshape(-1),
+                familywise_error_rate,
+            ).reshape(nested_matrix.shape),
+            axis=(0, 2),
+        )
+        complete_reference_sites = np.ones(site_count, dtype=bool)
+        for site in range(site_count):
+            for reference in range(reference_count):
+                item = self.diagnostics.reference_valleys[
+                    reference * site_count + site
+                ]
+                if (
+                    item.proposal_lower_sample_count
+                    + item.proposal_upper_sample_count
+                    != self.diagnostics.train_bracket_count
+                    or item.evidence.invalid_count != 0
+                    or any(
+                        nested is not None and nested.invalid_count != 0
+                        for nested in (
+                            item.lower_cluster_evidence,
+                            item.upper_cluster_evidence,
+                        )
+                    )
+                ):
+                    complete_reference_sites[site] = False
+                    break
+        expected_reference_sites = (
+            expected_primary
+            & ~expected_ambiguous
+            & complete_reference_sites
+        )
+        reported_reference_sites = np.asarray(
+            [
+                self.diagnostics.reference_valleys[site].site_accepted
+                for site in range(site_count)
+            ],
+            dtype=bool,
+        )
+        if not np.array_equal(expected_reference_sites, reported_reference_sites):
+            raise ValueError("reference-valley decision differs from persisted evidence")
         declared_gate_policy: tuple[int, int, float, float, str, float] | None = None
+        held_out_records: list[_HeldOutReplayRecord] = []
         for model, diagnostic in zip(
             self.artifact.models,
             self.diagnostics.models,
@@ -649,29 +1259,65 @@ class CalibrationAnalysisResult:
                 "analysis-request-fingerprint",
                 "analysis-work-plan-fingerprint",
                 "numeric-backend-digest",
+                "bracket-sampling-assumption",
+                "analysis-planning-assumption",
+                "held-out-family-scope",
+                "held-out-family-model-count",
+                "held-out-family-hypothesis-count",
             ):
-                if model_parameters.get(name) != artifact_parameters[name]:
+                if not _same_typed_scalar(
+                    model_parameters.get(name),
+                    artifact_parameters.get(name),
+                ):
                     raise ValueError(f"model {name} differs from artifact")
             if (
                 model_parameters.get("train-bracket-count")
                 != self.diagnostics.train_bracket_count
+                or model_parameters.get("reference-evidence-bracket-count")
+                != self.diagnostics.reference_evidence_bracket_count
                 or model_parameters.get("test-bracket-count")
                 != self.diagnostics.test_bracket_count
             ):
                 raise ValueError("model partition counts differ from diagnostics")
             quality = model.header.quality
             if (
-                quality.quality_gate_id != "frozen-bracket-clopper-pearson"
-                or quality.quality_gate_version != "3"
+                quality.quality_gate_id != _QUALITY_GATE_ID
+                or quality.quality_gate_version != _QUALITY_GATE_VERSION
                 or not quality.gate_passed
             ):
                 raise ValueError("model quality gate differs from analysis contract")
             usable = quality.usable_sites.mask
-            usable_count = int(np.count_nonzero(usable))
-            if diagnostic.usable_site_count != usable_count or (
-                diagnostic.rejected_site_count != site_count - usable_count
+            if any(
+                int(dark_count) + int(bright_count)
+                > self.diagnostics.train_bracket_count
+                for dark_count, bright_count in zip(
+                    quality.dark_training_sample_counts,
+                    quality.bright_training_sample_counts,
+                    strict=True,
+                )
             ):
-                raise ValueError("model site-count diagnostic differs from quality")
+                raise ValueError("model training evidence exceeds train partition")
+            evidence_sites = quality.held_out_validity.mask
+            for site in np.flatnonzero(evidence_sites):
+                dark_unknown = int(
+                    quality.held_out_dark_total_counts[site]
+                    - quality.held_out_dark_labeled_counts[site]
+                )
+                bright_unknown = int(
+                    quality.held_out_bright_total_counts[site]
+                    - quality.held_out_bright_labeled_counts[site]
+                )
+                if dark_unknown != bright_unknown or (
+                    int(quality.held_out_dark_labeled_counts[site])
+                    + int(quality.held_out_bright_labeled_counts[site])
+                    + dark_unknown
+                    != self.diagnostics.test_bracket_count
+                ):
+                    raise ValueError(
+                        "model held-out evidence does not cover the test partition"
+                    )
+            if np.any(usable & ~expected_reference_sites):
+                raise ValueError("model uses a site rejected by reference-label evidence")
 
             def positive_integer_parameter(name: str) -> int:
                 value = model_parameters.get(name)
@@ -733,26 +1379,48 @@ class CalibrationAnalysisResult:
                 raise ValueError(
                     "model Clopper-Pearson evidence differs from success/total counts"
                 )
-            if np.any(
-                quality.dark_training_sample_counts[usable] < minimum_train
-            ) or np.any(
-                quality.bright_training_sample_counts[usable] < minimum_train
-            ):
-                raise ValueError("usable site violates minimum training evidence")
-            if np.any(
-                quality.held_out_dark_total_counts[usable] < minimum_test
-            ) or np.any(
-                quality.held_out_bright_total_counts[usable] < minimum_test
-            ):
-                raise ValueError("usable site violates minimum held-out evidence")
-            if np.any(
-                quality.held_out_dark_accuracy_lower_bounds[usable]
-                < lower_gate - 1e-12
-            ) or np.any(
-                quality.held_out_bright_accuracy_lower_bounds[usable]
-                < lower_gate - 1e-12
-            ):
-                raise ValueError("usable site violates class confidence gate")
+            site_pvalues = np.ones(site_count, dtype=np.float64)
+            for site in np.flatnonzero(evidence):
+                site_pvalues[site] = max(
+                    _one_sided_binomial_superiority_pvalue(
+                        int(quality.held_out_dark_success_counts[site]),
+                        int(quality.held_out_dark_total_counts[site]),
+                        lower_gate,
+                    ),
+                    _one_sided_binomial_superiority_pvalue(
+                        int(quality.held_out_bright_success_counts[site]),
+                        int(quality.held_out_bright_total_counts[site]),
+                        lower_gate,
+                    ),
+                )
+            candidate_sites = (
+                expected_reference_sites
+                & evidence
+                & (
+                    quality.dark_training_sample_counts
+                    >= minimum_train
+                )
+                & (
+                    quality.bright_training_sample_counts
+                    >= minimum_train
+                )
+                & (
+                    quality.held_out_dark_labeled_counts
+                    >= minimum_test
+                )
+                & (
+                    quality.held_out_bright_labeled_counts
+                    >= minimum_test
+                )
+                & (
+                    quality.held_out_dark_accuracy_lower_bounds
+                    >= lower_gate - 1e-12
+                )
+                & (
+                    quality.held_out_bright_accuracy_lower_bounds
+                    >= lower_gate - 1e-12
+                )
+            )
             acceptance = model_parameters.get("usable-site-acceptance")
             fraction = model_parameters.get("minimum-usable-site-fraction")
             if acceptance == UsableSiteAcceptance.ALL.value:
@@ -783,7 +1451,67 @@ class CalibrationAnalysisResult:
                 declared_gate_policy = gate_policy
             elif gate_policy != declared_gate_policy:
                 raise ValueError("models declare inconsistent calibration gate policies")
-            if usable_count < required_usable:
+            held_out_records.append(
+                _HeldOutReplayRecord(
+                    diagnostic=diagnostic,
+                    quality=quality,
+                    usable=usable,
+                    candidate_sites=candidate_sites,
+                    site_pvalues=site_pvalues,
+                    minimum_train=minimum_train,
+                    minimum_test=minimum_test,
+                    lower_gate=lower_gate,
+                    required_usable=required_usable,
+                )
+            )
+
+        if declared_gate_policy is None or not held_out_records:
+            raise ValueError("calibration result omits held-out model evidence")
+        confidence = declared_gate_policy[2]
+        joint_certified = _artifact_wide_held_out_rejections(
+            np.stack([item.site_pvalues for item in held_out_records], axis=0),
+            1.0 - confidence,
+        )
+        for record, model_certified in zip(
+            held_out_records,
+            joint_certified,
+            strict=True,
+        ):
+            quality = record.quality
+            usable = record.usable
+            expected_usable = record.candidate_sites & model_certified
+            if not np.array_equal(usable, expected_usable):
+                raise ValueError(
+                    "model usable sites differ from replayed artifact-wide "
+                    "familywise evidence"
+                )
+            usable_count = int(np.count_nonzero(usable))
+            diagnostic = record.diagnostic
+            if diagnostic.usable_site_count != usable_count or (
+                diagnostic.rejected_site_count != site_count - usable_count
+            ):
+                raise ValueError("model site-count diagnostic differs from quality")
+            if np.any(
+                quality.dark_training_sample_counts[usable] < record.minimum_train
+            ) or np.any(
+                quality.bright_training_sample_counts[usable] < record.minimum_train
+            ):
+                raise ValueError("usable site violates minimum training evidence")
+            if np.any(
+                quality.held_out_dark_labeled_counts[usable] < record.minimum_test
+            ) or np.any(
+                quality.held_out_bright_labeled_counts[usable] < record.minimum_test
+            ):
+                raise ValueError("usable site violates minimum held-out evidence")
+            if np.any(
+                quality.held_out_dark_accuracy_lower_bounds[usable]
+                < record.lower_gate - 1e-12
+            ) or np.any(
+                quality.held_out_bright_accuracy_lower_bounds[usable]
+                < record.lower_gate - 1e-12
+            ):
+                raise ValueError("usable site violates class confidence gate")
+            if usable_count < record.required_usable:
                 raise ValueError("model quality violates usable-site acceptance")
             fidelity = quality.held_out_fidelity[usable]
             class_lower = np.minimum(
@@ -809,8 +1537,31 @@ class CalibrationAnalysisResult:
 @dataclass(frozen=True)
 class _BracketPartition:
     train_indices: tuple[int, ...]
+    reference_evidence_indices: tuple[int, ...]
     test_indices: tuple[int, ...]
     digest: str
+
+
+@dataclass(frozen=True)
+class _CalibrationWorkPreparation:
+    plan: CalibrationWorkPlan
+    brackets: tuple[CalibrationCaptureBracket, ...]
+    source_binding: CalibrationSourceBinding
+    frame_contract: FrameContract
+    partition: _BracketPartition
+    numpy_version: str
+    scipy_version: str
+    backend_digest: str
+
+
+@dataclass(frozen=True)
+class _ReferenceThresholdProposal:
+    threshold: float
+    left_center: float
+    center_spacing: float
+    lower_sample_count: int
+    upper_sample_count: int
+    cluster_separation_rss: float
 
 
 @dataclass(frozen=True)
@@ -831,16 +1582,33 @@ class _TrainingResult:
     thresholds: np.ndarray
     occupied_above: np.ndarray
     usable: np.ndarray
+    candidate_sites: np.ndarray
+    site_pvalues: np.ndarray
     dark_training_counts: np.ndarray
     bright_training_counts: np.ndarray
     held_out_dark_success_counts: np.ndarray
     held_out_dark_total_counts: np.ndarray
+    held_out_dark_labeled_counts: np.ndarray
     held_out_bright_success_counts: np.ndarray
     held_out_bright_total_counts: np.ndarray
+    held_out_bright_labeled_counts: np.ndarray
     held_out_dark_lower_bounds: np.ndarray
     held_out_bright_lower_bounds: np.ndarray
     held_out_validity: np.ndarray
     held_out_fidelity: np.ndarray
+
+
+@dataclass(frozen=True)
+class _HeldOutReplayRecord:
+    diagnostic: ModelAnalysisDiagnostic
+    quality: ReadoutModelQuality
+    usable: np.ndarray
+    candidate_sites: np.ndarray
+    site_pvalues: np.ndarray
+    minimum_train: int
+    minimum_test: int
+    lower_gate: float
+    required_usable: int
 
 
 class _RawCapture(Protocol):
@@ -904,16 +1672,102 @@ def _numeric_backend() -> tuple[str, str, str]:
     return numpy_version, scipy_version, digest
 
 
-def build_calibration_work_plan(
-    schema: DatasetSchema,
+def _validate_partition_capacity(
+    train_count: int,
+    evidence_count: int,
+    test_count: int,
     request: CalibrationAnalysisRequest,
-) -> CalibrationWorkPlan:
-    """Derive and enforce the complete pre-allocation analysis work contract."""
+    *,
+    label: str,
+) -> None:
+    if train_count < 1 or evidence_count < 1 or test_count < 1:
+        raise CalibrationResourceExceeded(
+            f"{label} cannot populate train, reference-evidence, and test partitions"
+        )
+    if train_count < 2 * request.minimum_train_samples_per_class:
+        raise CalibrationResourceExceeded(
+            f"{label} cannot satisfy minimum train samples per class"
+        )
+    if test_count < 2 * request.minimum_test_samples_per_class:
+        raise CalibrationResourceExceeded(
+            f"{label} cannot satisfy minimum test samples per class"
+        )
+    minimum_outer_evidence = math.ceil(
+        math.log2(request.site_count / request.reference_valley_familywise_error_rate)
+    )
+    if evidence_count // 2 < minimum_outer_evidence:
+        raise CalibrationResourceExceeded(
+            f"{label} cannot possibly pass the declared familywise "
+            "exact-binomial gate"
+        )
+    minimum_accuracy = request.minimum_held_out_class_accuracy_lower_bound
+    smallest_balanced_class = test_count // 2
+    held_out_alpha = 1.0 - request.held_out_confidence_level
+    held_out_family_size = request.site_count * len(request.model_kinds)
+    if minimum_accuracy == 1.0 or (
+        minimum_accuracy > 0.0
+        and smallest_balanced_class * math.log(minimum_accuracy)
+        > math.log(held_out_alpha / held_out_family_size)
+    ):
+        raise CalibrationResourceExceeded(
+            f"{label} cannot possibly pass the held-out familywise "
+            "exact-binomial gate"
+        )
 
-    if not isinstance(schema, DatasetSchema):
-        raise TypeError("schema must be DatasetSchema")
+
+def _planned_model_resources(
+    request: CalibrationAnalysisRequest,
+) -> tuple[int, int, int]:
+    """Return per-model samples, total samples, and persisted kernel elements."""
+
+    box_area = (2 * request.box.half_width + 1) ** 2
+    maximum_sampled = 0
+    total_sampled = 0
+    kernel_elements = 0
+    for kind in request.model_kinds:
+        if kind is ReadoutModelKind.BOX:
+            sample_area = box_area
+        else:
+            assert request.psf is not None
+            sample_extent = 2 * request.psf.half_width + 1
+            if request.psf.background is BackgroundMode.ANNULUS_MEDIAN:
+                sample_extent += 2 * request.psf.background_padding
+            sample_area = sample_extent**2
+            kernel_extent = 2 * request.psf.half_width + 1
+            kernel_elements += (
+                request.site_count * kernel_extent**2
+                if kind is ReadoutModelKind.PER_SITE_PSF
+                else kernel_extent**2
+            )
+        sampled = request.site_count * sample_area
+        maximum_sampled = max(maximum_sampled, sampled)
+        total_sampled += sampled
+    return maximum_sampled, total_sampled, kernel_elements
+
+
+def _prepare_calibration_work(
+    capture: _RawCapture,
+    request: CalibrationAnalysisRequest,
+    *,
+    frozen_numeric_backend: tuple[str, str, str] | None = None,
+) -> _CalibrationWorkPreparation:
+    """Freeze source-specific work, lineage metadata, and resource bounds.
+
+    A persistent replay supplies the backend identity frozen in the artifact.
+    Resource-plan reconstruction must not depend on the package versions of
+    the process performing admission: those versions are lineage of the
+    original analysis, not a compatibility policy for reading its evidence.
+    """
+
     if not isinstance(request, CalibrationAnalysisRequest):
         raise TypeError("request must be CalibrationAnalysisRequest")
+    try:
+        block = capture.block
+    except AttributeError as exc:
+        raise TypeError("capture must expose a DataBlock") from exc
+    if not isinstance(block, DataBlock):
+        raise TypeError("capture.block must be DataBlock")
+    schema = block.schema
     policy = request.resource_policy
     source_cells = schema.repeat_axis.size * schema.point_layout.storage_size
     if source_cells > policy.max_source_cells:
@@ -933,22 +1787,85 @@ def build_calibration_work_plan(
     reference_upper = bracket_upper * reference_count
     if reference_upper > policy.max_reference_frames:
         raise CalibrationResourceExceeded("reference-frame upper bound exceeds budget")
-    if bracket_upper >= 2:
+    if bracket_upper >= 3:
         train_upper = int(math.floor(bracket_upper * request.train_fraction))
-        train_upper = min(bracket_upper - 1, max(1, train_upper))
+        evidence_upper = int(
+            math.floor(bracket_upper * request.reference_evidence_fraction)
+        )
     else:
         train_upper = bracket_upper
-    test_upper = bracket_upper - train_upper
-    if train_upper < 2 * request.minimum_train_samples_per_class:
-        raise CalibrationResourceExceeded(
-            "bracket upper bound cannot satisfy minimum train samples per class"
+        evidence_upper = 0
+    test_upper = bracket_upper - train_upper - evidence_upper
+    _validate_partition_capacity(
+        train_upper,
+        evidence_upper,
+        test_upper,
+        request,
+        label="bracket upper bound",
+    )
+    modality_work = request.site_count * reference_count * (
+        2 * train_upper * max(1, train_upper.bit_length())
+        + 3 * evidence_upper
+    )
+    modality_work += request.site_count * max(1, request.site_count.bit_length())
+    nested_test_count = 2 * request.site_count * reference_count
+    modality_work += nested_test_count * max(1, nested_test_count.bit_length())
+    model_statistical_work = len(request.model_kinds) * request.site_count * (
+        2 * train_upper * max(1, train_upper.bit_length())
+        + test_upper
+        + 256
+    )
+    held_out_hypothesis_count = len(request.model_kinds) * request.site_count
+    model_statistical_work += held_out_hypothesis_count * max(
+        1,
+        held_out_hypothesis_count.bit_length(),
+    )
+    modality_work += model_statistical_work
+    if modality_work > policy.max_modality_test_work_units:
+        raise CalibrationResourceExceeded("reference-modality work exceeds budget")
+    reference_valley_diagnostic_count = request.site_count * reference_count
+    from .analysis_codec import (
+        MAX_ANALYSIS_DIAGNOSTICS_BYTES,
+        MAX_DIAGNOSTIC_VECTOR_ENTRIES,
+        calibration_analysis_diagnostics_encoding_upper_bound,
+        calibration_analysis_diagnostics_encoding_working_upper_bound,
+    )
+    from .calibration_codec import (
+        calibration_artifact_metadata_encoding_upper_bound,
+        calibration_artifact_encoding_upper_bound,
+        calibration_artifact_encoding_working_upper_bound,
+    )
+
+    if (
+        reference_valley_diagnostic_count
+        > min(
+            policy.max_reference_valley_diagnostics,
+            MAX_DIAGNOSTIC_VECTOR_ENTRIES,
         )
-    if test_upper < 2 * request.minimum_test_samples_per_class:
+    ):
         raise CalibrationResourceExceeded(
-            "bracket upper bound cannot satisfy minimum test samples per class"
+            "reference-valley diagnostics exceed analysis budget"
+        )
+    diagnostics_encoding_upper_bound = (
+        calibration_analysis_diagnostics_encoding_upper_bound(
+            site_count=request.site_count,
+            reference_count=reference_count,
+            bracket_upper_bound=bracket_upper,
+            train_bracket_upper_bound=train_upper,
+            reference_evidence_bracket_upper_bound=evidence_upper,
+            model_count=len(request.model_kinds),
+        )
+    )
+    if diagnostics_encoding_upper_bound > min(
+        MAX_ANALYSIS_DIAGNOSTICS_BYTES,
+        policy.artifact_policy.max_artifact_blob_bytes,
+    ):
+        raise CalibrationResourceExceeded(
+            "calibration diagnostics canonical encoding exceeds persistence budget"
         )
     signal_evaluations = request.site_count * (
         train_upper * reference_count
+        + evidence_upper * reference_count
         + bracket_upper * reference_count
         + bracket_upper * len(request.model_kinds)
     )
@@ -958,12 +1875,13 @@ def build_calibration_work_plan(
     full_frame_reads = (
         train_upper * reference_count
         + train_upper * reference_count
+        + evidence_upper * reference_count
         + bracket_upper * reference_count
         + bracket_upper * len(request.model_kinds)
     )
     sampled = train_upper * reference_count * image_pixels
     sampled += (
-        train_upper + bracket_upper
+        train_upper + evidence_upper + bracket_upper
     ) * reference_count * request.site_count * box_area
     psf_sample_area = 0
     if request.psf is not None:
@@ -972,8 +1890,11 @@ def build_calibration_work_plan(
             extent += 2 * request.psf.background_padding
         psf_sample_area = extent**2
         sampled += request.site_count * psf_sample_area
-    total_model_sampled = 0
-    max_model_sampled = 0
+    (
+        max_model_sampled,
+        total_model_sampled,
+        planned_kernel_elements,
+    ) = _planned_model_resources(request)
     for kind in request.model_kinds:
         if kind is ReadoutModelKind.BOX:
             area = box_area
@@ -984,8 +1905,6 @@ def build_calibration_work_plan(
                 extent += 2 * request.psf.background_padding
             area = extent**2
         model_sampled = request.site_count * area
-        max_model_sampled = max(max_model_sampled, model_sampled)
-        total_model_sampled += model_sampled
         sampled += bracket_upper * model_sampled
     if sampled > policy.max_sampled_pixel_operations:
         raise CalibrationResourceExceeded("sampled-pixel upper bound exceeds budget")
@@ -1000,11 +1919,6 @@ def build_calibration_work_plan(
         )
     psf_extent = 0 if request.psf is None else 2 * request.psf.half_width + 1
     psf_elements = psf_extent**2
-    planned_kernel_elements = 0
-    if ReadoutModelKind.PER_SITE_PSF in request.model_kinds:
-        planned_kernel_elements += request.site_count * psf_elements
-    if ReadoutModelKind.UNIFORM_PSF in request.model_kinds:
-        planned_kernel_elements += psf_elements
     if planned_kernel_elements > artifact_policy.max_kernel_elements:
         raise CalibrationResourceExceeded(
             "planned calibration kernels exceed artifact resource policy"
@@ -1026,50 +1940,213 @@ def build_calibration_work_plan(
         _ASSIGNMENT_SCRATCH_BYTES_PER_PAIR * request.site_count**2
     )
     detector_bytes = _DETECTOR_WORKING_BYTES_PER_PIXEL * image_pixels
+    layout_bytes = source_cells + bracket_upper * 768
+    if max(
+        layout_bytes,
+        detector_bytes + assignment_scratch,
+    ) > policy.max_working_bytes:
+        raise CalibrationResourceExceeded("working-byte lower bound exceeds budget")
+
+    # Only after every schema/count/algorithmic bound passes may the planner
+    # resolve the bounded layout and measure source-owned metadata.  A schema-
+    # only plan cannot truthfully bound arbitrary canonical camera/source text.
+    brackets = request.layout.brackets(schema)
+    if len(brackets) > bracket_upper:
+        raise CalibrationAnalysisError(
+            "resolved brackets exceed frozen work-plan bound"
+        )
+    source_binding, frame_contract = (
+        _derive_calibration_source_binding_with_resolved_brackets(
+            capture,
+            request.layout,
+            resolved_brackets=brackets,
+        )
+    )
+    partition = _freeze_partition(brackets, request)
+    _validate_partition_capacity(
+        len(partition.train_indices),
+        len(partition.reference_evidence_indices),
+        len(partition.test_indices),
+        request,
+        label="resolved bracket partition",
+    )
+    if frozen_numeric_backend is None:
+        numpy_version, scipy_version, backend_digest = _numeric_backend()
+    else:
+        if (
+            type(frozen_numeric_backend) is not tuple
+            or len(frozen_numeric_backend) != 3
+        ):
+            raise TypeError(
+                "frozen_numeric_backend must be a three-text tuple"
+            )
+        numpy_version, scipy_version, backend_digest = frozen_numeric_backend
+        for name, value in (
+            ("numpy_version", numpy_version),
+            ("scipy_version", scipy_version),
+        ):
+            if type(value) is not str or not value:
+                raise ValueError(f"{name} must be non-empty text")
+        if (
+            type(backend_digest) is not str
+            or len(backend_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in backend_digest
+            )
+        ):
+            raise ValueError(
+                "backend_digest must be a lowercase SHA-256 digest"
+            )
+    placeholder_digest = "f" * 64
+    artifact_parameters = tuple(
+        CalibrationParameter(name, value)
+        for name, value in _artifact_parameter_values(
+            request,
+            partition_digest=partition.digest,
+            train_count=len(partition.train_indices),
+            reference_evidence_count=len(partition.reference_evidence_indices),
+            test_count=len(partition.test_indices),
+            work_plan_digest=placeholder_digest,
+            backend_digest=backend_digest,
+            numpy_version=numpy_version,
+            scipy_version=scipy_version,
+        ).items()
+    )
+    model_parameters = tuple(
+        CalibrationParameter(name, value)
+        for name, value in _model_parameter_values(
+            request,
+            partition_digest=partition.digest,
+            train_count=len(partition.train_indices),
+            reference_evidence_count=len(partition.reference_evidence_indices),
+            test_count=len(partition.test_indices),
+            backend_digest=backend_digest,
+            work_plan_digest=placeholder_digest,
+        ).items()
+    )
+    artifact_metadata_encoding_upper_bound = (
+        calibration_artifact_metadata_encoding_upper_bound(
+            source_binding=source_binding,
+            frame_contract=frame_contract,
+            artifact_parameters=artifact_parameters,
+            model_parameters=tuple(
+                model_parameters for _kind in request.model_kinds
+            ),
+            model_kinds=request.model_kinds,
+            default_model_policy=DefaultModelPolicy(
+                _DEFAULT_MODEL_POLICY_ID,
+                _DEFAULT_MODEL_POLICY_VERSION,
+                default_kind=request.default_model_kind,
+            ),
+            algorithm_id=CALIBRATION_ANALYSIS_ALGORITHM_ID,
+            algorithm_version=CALIBRATION_ANALYSIS_ALGORITHM_VERSION,
+        )
+    )
+    artifact_encoding_upper_bound = calibration_artifact_encoding_upper_bound(
+        site_count=request.site_count,
+        model_count=len(request.model_kinds),
+        kernel_elements=planned_kernel_elements,
+        metadata_encoding_upper_bound_bytes=(
+            artifact_metadata_encoding_upper_bound
+        ),
+    )
+    if artifact_encoding_upper_bound > artifact_policy.max_artifact_blob_bytes:
+        raise CalibrationResourceExceeded(
+            "calibration artifact canonical encoding exceeds persistence budget"
+        )
+    reference_feature_bytes = (
+        (train_upper + evidence_upper)
+        * reference_count
+        * request.site_count
+        * 9
+    )
+    reference_gate_state_bytes = (
+        reference_count * request.site_count * 1536
+    )
+    reference_sort_scratch_bytes = max(train_upper, evidence_upper) * 128
     feature_bytes = max(
-        train_upper * reference_count * request.site_count * 9,
+        reference_feature_bytes
+        + reference_gate_state_bytes
+        + reference_sort_scratch_bytes,
         bracket_upper * request.site_count * 20,
-    ) + request.site_count * 256
+    )
     psf_bytes = 4 * planned_kernel_elements * 8 + 8 * psf_elements * 4
     artifact_array_bytes = (
         request.site_count * 24
         + len(request.model_kinds) * request.site_count * 160
+        + reference_valley_diagnostic_count * 1024
         + planned_kernel_elements * 8
         + 64 * 1024
     )
-    canonical_scratch = 4 * artifact_array_bytes + 1024 * 1024
-    layout_bytes = source_cells + bracket_upper * 768
+    canonical_scratch = max(
+        calibration_artifact_encoding_working_upper_bound(
+            artifact_array_bytes,
+            artifact_metadata_encoding_upper_bound,
+        ),
+        calibration_analysis_diagnostics_encoding_working_upper_bound(
+            diagnostics_encoding_upper_bound
+        ),
+    )
     working_peak = max(
         layout_bytes,
         detector_bytes + assignment_scratch,
-        feature_bytes,
-        psf_bytes + feature_bytes,
+        artifact_array_bytes + feature_bytes,
+        artifact_array_bytes + psf_bytes + feature_bytes,
         artifact_array_bytes + canonical_scratch,
     )
     plan = CalibrationWorkPlan(
-        source_cells,
-        bracket_upper,
-        train_upper,
-        reference_upper,
-        image_pixels,
-        full_frame_reads,
-        sampled,
-        signal_evaluations,
-        planned_kernel_elements,
-        layout_bytes,
-        detector_bytes,
-        assignment_scratch,
-        feature_bytes,
-        psf_bytes,
-        artifact_array_bytes,
-        canonical_scratch,
-        working_peak,
-        detector_graph_work,
-        dense_work,
+        source_cell_count=source_cells,
+        bracket_upper_bound=bracket_upper,
+        train_bracket_upper_bound=train_upper,
+        reference_evidence_bracket_upper_bound=evidence_upper,
+        reference_frame_upper_bound=reference_upper,
+        image_pixel_count=image_pixels,
+        full_frame_read_count=full_frame_reads,
+        feature_pixel_operations=sampled,
+        signal_evaluations=signal_evaluations,
+        modality_test_work_units=modality_work,
+        reference_valley_diagnostic_count=reference_valley_diagnostic_count,
+        diagnostics_encoding_upper_bound_bytes=diagnostics_encoding_upper_bound,
+        planned_kernel_elements=planned_kernel_elements,
+        maximum_model_sampled_pixels=max_model_sampled,
+        total_model_sampled_pixels=total_model_sampled,
+        artifact_metadata_encoding_upper_bound_bytes=(
+            artifact_metadata_encoding_upper_bound
+        ),
+        artifact_encoding_upper_bound_bytes=artifact_encoding_upper_bound,
+        layout_working_bytes=layout_bytes,
+        detector_working_bytes=detector_bytes,
+        assignment_scratch_bytes=assignment_scratch,
+        feature_working_bytes=feature_bytes,
+        psf_working_bytes=psf_bytes,
+        artifact_array_bytes=artifact_array_bytes,
+        canonical_encoding_scratch_bytes=canonical_scratch,
+        working_peak_bytes=working_peak,
+        detector_graph_work_units=detector_graph_work,
+        dense_assignment_work_units=dense_work,
     )
     if plan.working_peak_bytes > policy.max_working_bytes:
         raise CalibrationResourceExceeded("working-byte upper bound exceeds budget")
-    return plan
+    return _CalibrationWorkPreparation(
+        plan=plan,
+        brackets=brackets,
+        source_binding=source_binding,
+        frame_contract=frame_contract,
+        partition=partition,
+        numpy_version=numpy_version,
+        scipy_version=scipy_version,
+        backend_digest=backend_digest,
+    )
+
+
+def build_calibration_work_plan(
+    capture: _RawCapture,
+    request: CalibrationAnalysisRequest,
+) -> CalibrationWorkPlan:
+    """Derive the complete source-specific pre-allocation work contract."""
+
+    return _prepare_calibration_work(capture, request).plan
 
 
 def _validate_source_schedule(capture: _RawCapture) -> None:
@@ -1153,30 +2230,46 @@ def _freeze_partition(
     brackets: tuple[CalibrationCaptureBracket, ...],
     request: CalibrationAnalysisRequest,
 ) -> _BracketPartition:
-    if len(brackets) < 2:
-        raise CalibrationAnalysisError("calibration requires distinct train and test brackets")
+    if len(brackets) < 3:
+        raise CalibrationAnalysisError(
+            "calibration requires distinct train, reference-evidence, and test brackets"
+        )
 
     def key(index: int) -> bytes:
         context = ";".join(
             f"{axis_id.value}={value}" for axis_id, value in brackets[index].context_key
         )
-        return hashlib.sha256(f"{request.random_seed}|{context}".encode("utf-8")).digest()
+        return hashlib.sha256(f"{_PARTITION_SEED}|{context}".encode("utf-8")).digest()
 
     ordered = tuple(sorted(range(len(brackets)), key=key))
     train_count = int(math.floor(len(ordered) * request.train_fraction))
-    train_count = min(len(ordered) - 1, max(1, train_count))
+    evidence_count = int(
+        math.floor(len(ordered) * request.reference_evidence_fraction)
+    )
+    if train_count < 1 or evidence_count < 1:
+        raise CalibrationAnalysisError(
+            "partition policy leaves train or reference-evidence empty"
+        )
+    test_start = train_count + evidence_count
+    if test_start >= len(ordered):
+        raise CalibrationAnalysisError("partition policy leaves held-out test empty")
     train = tuple(sorted(ordered[:train_count]))
-    test = tuple(sorted(ordered[train_count:]))
+    reference_evidence = tuple(sorted(ordered[train_count:test_start]))
+    test = tuple(sorted(ordered[test_start:]))
     digest = canonical_digest(
         {
-            "schema": "zlc_neutral_atom.CalibrationBracketPartition/v1",
+            "schema": "zlc_neutral_atom.CalibrationBracketPartition/v3",
             "source_schema": request.layout.readout_event_axis_id.value,
-            "seed": request.random_seed,
+            "partition_policy": "ALGORITHM_FIXED_HASH_ORDER_V1",
             "train": [_context_tree(brackets[index].context_key) for index in train],
+            "reference_evidence": [
+                _context_tree(brackets[index].context_key)
+                for index in reference_evidence
+            ],
             "test": [_context_tree(brackets[index].context_key) for index in test],
         }
     )
-    return _BracketPartition(train, test, digest)
+    return _BracketPartition(train, reference_evidence, test, digest)
 
 
 def _training_reference_template(
@@ -1922,12 +3015,30 @@ def _feature_spec(
     )
 
 
-def _exact_split_threshold(values: np.ndarray) -> float | None:
+def _reference_threshold_proposal(
+    values: np.ndarray,
+    minimum_samples_per_class: int,
+    minimum_separation_rss: float,
+) -> _ReferenceThresholdProposal | None:
     ordered = np.sort(np.asarray(values, dtype=np.float64))
     ordered = ordered[np.isfinite(ordered)]
-    if ordered.size < 4 or ordered[0] == ordered[-1]:
+    minimum_samples_per_class = _positive_integer(
+        minimum_samples_per_class,
+        "minimum_samples_per_class",
+    )
+    minimum_separation_rss = _finite_real(
+        minimum_separation_rss,
+        "minimum_separation_rss",
+    )
+    if minimum_separation_rss <= 0.0:
+        raise ValueError("minimum_separation_rss must be positive")
+    if (
+        ordered.size < 2 * minimum_samples_per_class
+        or ordered[0] == ordered[-1]
+    ):
         return None
-    cumulative = np.cumsum(ordered, dtype=np.float64)
+    normalized = (ordered - ordered[0]) / (ordered[-1] - ordered[0])
+    cumulative = np.cumsum(normalized, dtype=np.float64)
     left_count = np.arange(1, ordered.size, dtype=np.float64)
     right_count = ordered.size - left_count
     distinct = ordered[:-1] < ordered[1:]
@@ -1940,29 +3051,127 @@ def _exact_split_threshold(values: np.ndarray) -> float | None:
     if not np.isfinite(score[index]):
         return None
     left, right = ordered[: index + 1], ordered[index + 1 :]
-    if len(left) < 2 or len(right) < 2:
+    if (
+        len(left) < minimum_samples_per_class
+        or len(right) < minimum_samples_per_class
+    ):
         return None
     left_median, right_median = float(np.median(left)), float(np.median(right))
-    scale = 1.4826 * (
-        float(np.median(np.abs(left - left_median)))
-        + float(np.median(np.abs(right - right_median)))
+    left_scatter = 1.4826 * float(np.median(np.abs(left - left_median)))
+    right_scatter = 1.4826 * float(np.median(np.abs(right - right_median)))
+    combined_scatter = math.hypot(left_scatter, right_scatter)
+    separation = (
+        math.inf
+        if combined_scatter == 0.0
+        else (right_median - left_median) / combined_scatter
     )
-    if right_median - left_median <= 5.0 * max(scale, np.finfo(float).eps):
+    if separation < minimum_separation_rss:
         return None
-    return float(0.5 * (ordered[index] + ordered[index + 1]))
+    center_spacing = 0.5 * (right_median - left_median)
+    threshold = float(
+        ordered[index] + 0.5 * (ordered[index + 1] - ordered[index])
+    )
+    if (
+        not math.isfinite(center_spacing)
+        or center_spacing <= 0.0
+        or not math.isfinite(threshold)
+    ):
+        return None
+    return _ReferenceThresholdProposal(
+        threshold,
+        left_median,
+        center_spacing,
+        len(left),
+        len(right),
+        separation,
+    )
 
 
-def _learn_reference_thresholds(
+def _reference_valley_evidence(
+    values: np.ndarray,
+    proposal: _ReferenceThresholdProposal,
+    validity: np.ndarray | None = None,
+) -> ReferenceValleyEvidence:
+    observed = np.asarray(values, dtype=np.float64)
+    if observed.ndim != 1:
+        raise ValueError("reference evidence must be one-dimensional")
+    if validity is None:
+        valid = np.ones(observed.shape, dtype=bool)
+    else:
+        valid = np.asarray(validity)
+        if valid.dtype != np.dtype(bool) or valid.shape != observed.shape:
+            raise ValueError("reference evidence validity must align to values")
+    finite_valid = valid & np.isfinite(observed)
+    selected = observed[finite_valid]
+    normalized = (selected - proposal.left_center) / proposal.center_spacing
+    # One boundary vector and a single (a, b] convention prevent overlaps,
+    # gaps, and double-counting when an observation lands on a boundary.
+    boundaries = np.asarray((-0.5, 0.5, 1.5, 2.5), dtype=np.float64)
+    counts = tuple(
+        int(np.count_nonzero((normalized > lower) & (normalized <= upper)))
+        for lower, upper in zip(boundaries[:-1], boundaries[1:], strict=True)
+    )
+    left_count, middle_count, right_count = counts
+    outside_count = int(selected.size) - sum(counts)
+    invalid_count = int(observed.size - selected.size)
+
+    return ReferenceValleyEvidence(
+        int(observed.size),
+        left_count,
+        middle_count,
+        right_count,
+        outside_count,
+        invalid_count,
+    )
+
+
+def _holm_rejections(pvalues: np.ndarray, familywise_error_rate: float) -> np.ndarray:
+    values = np.asarray(pvalues, dtype=np.float64)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("Holm pvalues must be a non-empty vector")
+    if np.any(~np.isfinite(values)) or np.any((values < 0.0) | (values > 1.0)):
+        raise ValueError("Holm pvalues must be finite probabilities")
+    alpha = _finite_real(familywise_error_rate, "familywise_error_rate")
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("familywise_error_rate must lie inside (0, 1)")
+    indices = np.arange(values.size, dtype=np.int64)
+    order = np.lexsort((indices, values))
+    rejected = np.zeros(values.size, dtype=bool)
+    for rank, index in enumerate(order):
+        if values[index] > alpha / (values.size - rank):
+            break
+        rejected[index] = True
+    return rejected
+
+
+def _artifact_wide_held_out_rejections(
+    pvalues: np.ndarray,
+    familywise_error_rate: float,
+) -> np.ndarray:
+    """Certify the single persisted model-by-site hypothesis family."""
+
+    values = np.asarray(pvalues, dtype=np.float64)
+    if values.ndim != 2 or 0 in values.shape:
+        raise ValueError(
+            "artifact-wide held-out pvalues must be a non-empty model-by-site matrix"
+        )
+    return _holm_rejections(
+        values.reshape(-1),
+        familywise_error_rate,
+    ).reshape(values.shape)
+
+
+def _reference_feature_values(
     accessor: _FrameAccessor,
     brackets: tuple[CalibrationCaptureBracket, ...],
-    partition: _BracketPartition,
+    indices: tuple[int, ...],
     spec: ReadoutFeatureSpec,
 ) -> tuple[np.ndarray, np.ndarray]:
     reference_count = len(brackets[0].reference_point_storage_rows)
     site_count = spec.boxes_xywh.shape[0]
-    values = np.zeros((len(partition.train_indices), reference_count, site_count))
+    values = np.zeros((len(indices), reference_count, site_count))
     validity = np.zeros(values.shape, dtype=bool)
-    for train_position, bracket_index in enumerate(partition.train_indices):
+    for position, bracket_index in enumerate(indices):
         bracket = brackets[bracket_index]
         for reference_position, (_event, row) in enumerate(
             bracket.reference_point_storage_rows
@@ -1973,18 +3182,197 @@ def _learn_reference_thresholds(
                 image,
                 pixel_validity,
             )
-            values[train_position, reference_position] = features.values
-            validity[train_position, reference_position] = features.validity.mask
+            values[position, reference_position] = features.values
+            validity[position, reference_position] = features.validity.mask
+    return values, validity
+
+
+def _learn_reference_thresholds(
+    accessor: _FrameAccessor,
+    brackets: tuple[CalibrationCaptureBracket, ...],
+    partition: _BracketPartition,
+    spec: ReadoutFeatureSpec,
+    minimum_samples_per_class: int,
+    minimum_separation_rss: float,
+    familywise_error_rate: float,
+) -> tuple[np.ndarray, np.ndarray, tuple[ReferenceValleyDiagnostic, ...]]:
+    reference_count = len(brackets[0].reference_point_storage_rows)
+    site_count = spec.boxes_xywh.shape[0]
+    train_values, train_validity = _reference_feature_values(
+        accessor,
+        brackets,
+        partition.train_indices,
+        spec,
+    )
+    evidence_values, evidence_validity = _reference_feature_values(
+        accessor,
+        brackets,
+        partition.reference_evidence_indices,
+        spec,
+    )
+    complete_reference_sites = np.all(
+        train_validity & np.isfinite(train_values),
+        axis=(0, 1),
+    ) & np.all(
+        evidence_validity & np.isfinite(evidence_values),
+        axis=(0, 1),
+    )
     thresholds = np.zeros((reference_count, site_count), dtype=np.float64)
     threshold_validity = np.zeros((reference_count, site_count), dtype=bool)
+    proposals: list[list[_ReferenceThresholdProposal | None]] = [
+        [None] * site_count for _reference in range(reference_count)
+    ]
+    evidences: list[list[ReferenceValleyEvidence]] = [
+        [
+            ReferenceValleyEvidence(0, 0, 0, 0, 0, 0)
+            for _site in range(site_count)
+        ]
+        for _reference in range(reference_count)
+    ]
+    pvalues = np.ones((reference_count, site_count), dtype=np.float64)
     for reference in range(reference_count):
         for site in range(site_count):
-            selected = values[:, reference, site][validity[:, reference, site]]
-            threshold = _exact_split_threshold(selected)
-            if threshold is not None:
-                thresholds[reference, site] = threshold
-                threshold_validity[reference, site] = True
-    return thresholds, threshold_validity
+            selected = train_values[:, reference, site][
+                train_validity[:, reference, site]
+            ]
+            proposal = _reference_threshold_proposal(
+                selected,
+                minimum_samples_per_class,
+                minimum_separation_rss,
+            )
+            proposals[reference][site] = proposal
+            evidence = evidence_values[:, reference, site]
+            evidence_mask = evidence_validity[:, reference, site]
+            if proposal is None:
+                finite_valid_count = int(
+                    np.count_nonzero(evidence_mask & np.isfinite(evidence))
+                )
+                evidences[reference][site] = ReferenceValleyEvidence(
+                    int(evidence.size),
+                    0,
+                    0,
+                    0,
+                    finite_valid_count,
+                    int(evidence.size) - finite_valid_count,
+                )
+                continue
+            valley = _reference_valley_evidence(
+                evidence,
+                proposal,
+                evidence_mask,
+            )
+            evidences[reference][site] = valley
+            pvalues[reference, site] = valley.valley_pvalue
+    # A site may supply a frozen binary pseudo-label only when every reference
+    # event independently shows the dominant valley.  max(p_ref) is the IUT
+    # p-value under arbitrary reference correlation; Holm then controls the
+    # family of site decisions without assuming site independence.
+    site_pvalues = np.max(pvalues, axis=0)
+    primary_sites = _holm_rejections(
+        site_pvalues,
+        familywise_error_rate,
+    )
+    # A third physical population can also manufacture a very strong binary
+    # Otsu split.  For sites that passed the primary gate, independently freeze
+    # one nested proposal inside each outer training cluster and test it on the
+    # same untouched evidence partition.  These tests only remove sites, never
+    # create authority; Holm therefore makes the availability loss controlled
+    # without weakening the primary familywise false-admission guarantee.
+    nested_pvalues = np.ones(
+        (reference_count, site_count, 2),
+        dtype=np.float64,
+    )
+    nested_evidences: list[list[list[ReferenceValleyEvidence | None]]] = [
+        [[None, None] for _site in range(site_count)]
+        for _reference in range(reference_count)
+    ]
+    for reference in range(reference_count):
+        for site in np.flatnonzero(primary_sites):
+            site = int(site)
+            proposal = proposals[reference][site]
+            if proposal is None:
+                continue
+            training = train_values[:, reference, site][
+                train_validity[:, reference, site]
+            ]
+            evidence = evidence_values[:, reference, site]
+            evidence_valid = (
+                evidence_validity[:, reference, site]
+                & np.isfinite(evidence)
+            )
+            evidence_invalid = ~evidence_valid
+            for cluster, (training_mask, evidence_member) in enumerate(
+                (
+                    (
+                        training <= proposal.threshold,
+                        evidence_valid & (evidence <= proposal.threshold),
+                    ),
+                    (
+                        training > proposal.threshold,
+                        evidence_valid & (evidence > proposal.threshold),
+                    ),
+                )
+            ):
+                nested = _reference_threshold_proposal(
+                    training[training_mask],
+                    minimum_samples_per_class,
+                    minimum_separation_rss,
+                )
+                if nested is None:
+                    continue
+                # An invalid evidence bracket has unknown parent-cluster
+                # membership.  It therefore contributes adverse evidence to
+                # both nested screens; double accounting here can only make
+                # this reject-only ambiguity screen more conservative.
+                nested_members = evidence_member | evidence_invalid
+                nested_evidence = _reference_valley_evidence(
+                    evidence[nested_members],
+                    nested,
+                    evidence_validity[:, reference, site][nested_members],
+                )
+                nested_evidences[reference][site][cluster] = nested_evidence
+                nested_pvalues[reference, site, cluster] = (
+                    nested_evidence.valley_pvalue
+                )
+    nested_rejections = _holm_rejections(
+        nested_pvalues.reshape(-1),
+        familywise_error_rate,
+    ).reshape(nested_pvalues.shape)
+    ambiguous_sites = np.any(nested_rejections, axis=(0, 2))
+    accepted_sites = (
+        primary_sites & ~ambiguous_sites & complete_reference_sites
+    )
+    for reference in range(reference_count):
+        for site in np.flatnonzero(accepted_sites):
+            proposal = proposals[reference][int(site)]
+            if proposal is None:
+                continue
+            thresholds[reference, site] = proposal.threshold
+            threshold_validity[reference, site] = True
+    diagnostics: list[ReferenceValleyDiagnostic] = []
+    for reference in range(reference_count):
+        for site in range(site_count):
+            proposal = proposals[reference][site]
+            evidence = evidences[reference][site]
+            diagnostics.append(
+                ReferenceValleyDiagnostic(
+                    reference,
+                    site,
+                    None if proposal is None else proposal.threshold,
+                    0 if proposal is None else proposal.lower_sample_count,
+                    0 if proposal is None else proposal.upper_sample_count,
+                    (
+                        None
+                        if proposal is None
+                        else proposal.cluster_separation_rss
+                    ),
+                    evidence,
+                    nested_evidences[reference][site][0],
+                    nested_evidences[reference][site][1],
+                    bool(accepted_sites[site]),
+                )
+            )
+    return thresholds, threshold_validity, tuple(diagnostics)
 
 
 def _reference_labels(
@@ -2011,7 +3399,8 @@ def _reference_labels(
             valid[reference] &= features.validity.mask
             decisions[reference] = (
                 features.values > thresholds[reference]
-                if request.reference_occupied_above
+                if request.reference_class_orientation
+                is ReferenceClassOrientation.ABOVE_IS_OCCUPIED
                 else features.values < thresholds[reference]
             )
         all_valid = np.all(valid, axis=0)
@@ -2059,12 +3448,16 @@ def _train_and_score_thresholds(
     thresholds = np.zeros(site_count, dtype=np.float64)
     occupied_above = np.zeros(site_count, dtype=bool)
     usable = np.zeros(site_count, dtype=bool)
+    candidate = np.zeros(site_count, dtype=bool)
+    site_pvalues = np.ones(site_count, dtype=np.float64)
     dark_counts = np.zeros(site_count, dtype="<u8")
     bright_counts = np.zeros(site_count, dtype="<u8")
     dark_success_counts = np.zeros(site_count, dtype="<u8")
     dark_total_counts = np.zeros(site_count, dtype="<u8")
+    dark_labeled_counts = np.zeros(site_count, dtype="<u8")
     bright_success_counts = np.zeros(site_count, dtype="<u8")
     bright_total_counts = np.zeros(site_count, dtype="<u8")
+    bright_labeled_counts = np.zeros(site_count, dtype="<u8")
     dark_lower_bounds = np.zeros(site_count, dtype=np.float64)
     bright_lower_bounds = np.zeros(site_count, dtype=np.float64)
     held_out_validity = np.zeros(site_count, dtype=bool)
@@ -2074,12 +3467,13 @@ def _train_and_score_thresholds(
     for site in range(site_count):
         if not geometry_validity[site]:
             continue
-        train_valid = label_validity[train, site] & feature_validity[train, site]
-        test_valid = label_validity[test, site] & feature_validity[test, site]
+        train_feature_valid = (
+            feature_validity[train, site]
+            & np.isfinite(values[train, site])
+        )
+        train_valid = label_validity[train, site] & train_feature_valid
         train_dark = train[train_valid & ~labels[train, site]]
         train_bright = train[train_valid & labels[train, site]]
-        test_dark = test[test_valid & ~labels[test, site]]
-        test_bright = test[test_valid & labels[test, site]]
         dark_counts[site] = len(train_dark)
         bright_counts[site] = len(train_bright)
         if (
@@ -2093,18 +3487,36 @@ def _train_and_score_thresholds(
             continue
         above = bright_median > dark_median
         threshold = 0.5 * (dark_median + bright_median)
-        if len(test_dark) == 0 or len(test_bright) == 0:
+        test_label_valid = label_validity[test, site]
+        test_feature_valid = (
+            feature_validity[test, site]
+            & np.isfinite(values[test, site])
+        )
+        known_dark_mask = test_label_valid & ~labels[test, site]
+        known_bright_mask = test_label_valid & labels[test, site]
+        unknown_count = int(np.count_nonzero(~test_label_valid))
+        dark_labeled = int(np.count_nonzero(known_dark_mask))
+        bright_labeled = int(np.count_nonzero(known_bright_mask))
+        if dark_labeled == 0 or bright_labeled == 0:
             continue
+        dark_labeled_counts[site] = dark_labeled
+        bright_labeled_counts[site] = bright_labeled
+        dark_total = dark_labeled + unknown_count
+        bright_total = bright_labeled + unknown_count
+        dark_evaluable = known_dark_mask & test_feature_valid
+        bright_evaluable = known_bright_mask & test_feature_valid
         if above:
-            dark_correct = values[test_dark, site] <= threshold
-            bright_correct = values[test_bright, site] > threshold
+            dark_correct = dark_evaluable & (values[test, site] <= threshold)
+            bright_correct = bright_evaluable & (values[test, site] > threshold)
         else:
-            dark_correct = values[test_dark, site] >= threshold
-            bright_correct = values[test_bright, site] < threshold
+            dark_correct = dark_evaluable & (values[test, site] >= threshold)
+            bright_correct = bright_evaluable & (values[test, site] < threshold)
         dark_success = int(np.count_nonzero(dark_correct))
         bright_success = int(np.count_nonzero(bright_correct))
-        dark_total = len(test_dark)
-        bright_total = len(test_bright)
+        # Known-label invalid/non-finite features are class failures.  An
+        # invalid or disagreeing reference label is unknown and therefore a
+        # failure in both class denominators.  Selective missingness can only
+        # reduce admission evidence; it can never hide a misclassification.
         held_out = 0.5 * (
             dark_success / dark_total + bright_success / bright_total
         )
@@ -2128,31 +3540,83 @@ def _train_and_score_thresholds(
         bright_lower_bounds[site] = bright_lower
         held_out_validity[site] = True
         fidelity[site] = held_out
+        site_pvalues[site] = max(
+            _one_sided_binomial_superiority_pvalue(
+                dark_success,
+                dark_total,
+                request.minimum_held_out_class_accuracy_lower_bound,
+            ),
+            _one_sided_binomial_superiority_pvalue(
+                bright_success,
+                bright_total,
+                request.minimum_held_out_class_accuracy_lower_bound,
+            ),
+        )
         if (
-            dark_total < request.minimum_test_samples_per_class
-            or bright_total < request.minimum_test_samples_per_class
+            dark_labeled < request.minimum_test_samples_per_class
+            or bright_labeled < request.minimum_test_samples_per_class
             or dark_lower < request.minimum_held_out_class_accuracy_lower_bound
             or bright_lower < request.minimum_held_out_class_accuracy_lower_bound
         ):
             continue
-        usable[site] = True
+        candidate[site] = True
         thresholds[site] = threshold
         occupied_above[site] = above
     return _TrainingResult(
-        thresholds,
-        occupied_above,
-        usable,
-        dark_counts,
-        bright_counts,
-        dark_success_counts,
-        dark_total_counts,
-        bright_success_counts,
-        bright_total_counts,
-        dark_lower_bounds,
-        bright_lower_bounds,
-        held_out_validity,
-        fidelity,
+        thresholds=thresholds,
+        occupied_above=occupied_above,
+        usable=usable,
+        candidate_sites=candidate,
+        site_pvalues=site_pvalues,
+        dark_training_counts=dark_counts,
+        bright_training_counts=bright_counts,
+        held_out_dark_success_counts=dark_success_counts,
+        held_out_dark_total_counts=dark_total_counts,
+        held_out_dark_labeled_counts=dark_labeled_counts,
+        held_out_bright_success_counts=bright_success_counts,
+        held_out_bright_total_counts=bright_total_counts,
+        held_out_bright_labeled_counts=bright_labeled_counts,
+        held_out_dark_lower_bounds=dark_lower_bounds,
+        held_out_bright_lower_bounds=bright_lower_bounds,
+        held_out_validity=held_out_validity,
+        held_out_fidelity=fidelity,
     )
+
+
+def _certify_artifact_wide_training_results(
+    results: tuple[_TrainingResult, ...],
+    *,
+    familywise_error_rate: float,
+) -> tuple[_TrainingResult, ...]:
+    if not results:
+        raise ValueError("artifact-wide certification requires model evidence")
+    site_count = results[0].site_pvalues.size
+    if any(
+        item.site_pvalues.shape != (site_count,)
+        or item.candidate_sites.shape != (site_count,)
+        for item in results
+    ):
+        raise ValueError("model evidence has inconsistent site geometry")
+    certified = _artifact_wide_held_out_rejections(
+        np.stack([item.site_pvalues for item in results], axis=0),
+        familywise_error_rate,
+    )
+    admitted: list[_TrainingResult] = []
+    for item, model_certified in zip(results, certified, strict=True):
+        usable = item.candidate_sites & model_certified
+        thresholds = item.thresholds.copy()
+        occupied_above = item.occupied_above.copy()
+        thresholds[~usable] = 0.0
+        occupied_above[~usable] = False
+        admitted.append(
+            replace(
+                item,
+                thresholds=thresholds,
+                occupied_above=occupied_above,
+                usable=usable,
+            )
+        )
+    return tuple(admitted)
 
 
 def _one_sided_clopper_pearson_lower_bound(
@@ -2182,6 +3646,125 @@ def _one_sided_clopper_pearson_lower_bound(
     if not math.isfinite(result) or not 0.0 <= result <= 1.0:
         raise CalibrationAnalysisError("binomial confidence bound is not finite")
     return 0.0 if result == 0.0 else result
+
+
+def _one_sided_binomial_superiority_pvalue(
+    successes: int,
+    total: int,
+    null_probability: float,
+) -> float:
+    """Exact p-value for H0: success probability <= declared minimum."""
+
+    successes = _nonnegative_integer(successes, "successes")
+    total = _positive_integer(total, "total")
+    if successes > total:
+        raise ValueError("successes cannot exceed total")
+    probability = _finite_real(null_probability, "null_probability")
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("null_probability must lie in [0, 1]")
+    return float(
+        binomtest(
+            successes,
+            total,
+            probability,
+            alternative="greater",
+        ).pvalue
+    )
+
+
+def _model_parameter_values(
+    request: CalibrationAnalysisRequest,
+    *,
+    partition_digest: str,
+    train_count: int,
+    reference_evidence_count: int,
+    test_count: int,
+    backend_digest: str,
+    work_plan_digest: str,
+) -> dict[str, bool | int | float | str]:
+    return {
+        "analysis-request-fingerprint": request.fingerprint,
+        "bracket-partition-digest": partition_digest,
+        "numeric-backend-digest": backend_digest,
+        "analysis-work-plan-fingerprint": work_plan_digest,
+        "bracket-sampling-assumption": request.bracket_sampling_assumption.value,
+        "analysis-planning-assumption": (
+            request.analysis_planning_assumption.value
+        ),
+        "held-out-family-scope": "ARTIFACT_MODEL_SITE",
+        "held-out-family-model-count": len(request.model_kinds),
+        "held-out-family-hypothesis-count": (
+            len(request.model_kinds) * request.site_count
+        ),
+        "train-bracket-count": train_count,
+        "reference-evidence-bracket-count": reference_evidence_count,
+        "test-bracket-count": test_count,
+        "minimum-train-samples-per-class": (
+            request.minimum_train_samples_per_class
+        ),
+        "minimum-test-samples-per-class": request.minimum_test_samples_per_class,
+        "held-out-confidence-level": request.held_out_confidence_level,
+        "minimum-held-out-class-accuracy-lower-bound": (
+            request.minimum_held_out_class_accuracy_lower_bound
+        ),
+        "usable-site-acceptance": request.usable_site_acceptance.value,
+        "minimum-usable-site-fraction": request.minimum_usable_site_fraction,
+    }
+
+
+def _artifact_parameter_values(
+    request: CalibrationAnalysisRequest,
+    *,
+    partition_digest: str,
+    train_count: int,
+    reference_evidence_count: int,
+    test_count: int,
+    work_plan_digest: str,
+    backend_digest: str,
+    numpy_version: str,
+    scipy_version: str,
+) -> dict[str, bool | int | float | str]:
+    return {
+        "analysis-request-fingerprint": request.fingerprint,
+        "bracket-partition-digest": partition_digest,
+        "analysis-work-plan-fingerprint": work_plan_digest,
+        "grid-rows": request.grid_shape_yx[0],
+        "grid-columns": request.grid_shape_yx[1],
+        "grid-order": request.grid_order.value,
+        "numeric-backend-digest": backend_digest,
+        "numpy-version": numpy_version,
+        "scipy-version": scipy_version,
+        "strict-reference-consensus": True,
+        "bracket-sampling-assumption": request.bracket_sampling_assumption.value,
+        "analysis-planning-assumption": (
+            request.analysis_planning_assumption.value
+        ),
+        "held-out-family-scope": "ARTIFACT_MODEL_SITE",
+        "held-out-family-model-count": len(request.model_kinds),
+        "held-out-family-hypothesis-count": (
+            len(request.model_kinds) * request.site_count
+        ),
+        "reference-label-source": request.reference_label_source.value,
+        "reference-class-orientation": request.reference_class_orientation.value,
+        "reference-valley-gate-id": _REFERENCE_VALLEY_GATE_ID,
+        "reference-valley-gate-version": _REFERENCE_VALLEY_GATE_VERSION,
+        "reference-statistical-unit": "BRACKET",
+        "reference-evidence-assumption": _REFERENCE_EVIDENCE_ASSUMPTION,
+        "reference-ambiguity-gate-id": _REFERENCE_AMBIGUITY_GATE_ID,
+        "reference-ambiguity-gate-version": _REFERENCE_AMBIGUITY_GATE_VERSION,
+        "train-bracket-count": train_count,
+        "reference-evidence-bracket-count": reference_evidence_count,
+        "test-bracket-count": test_count,
+        "minimum-reference-cluster-separation-rss": (
+            request.minimum_reference_cluster_separation_rss
+        ),
+        "minimum-reference-proposal-samples-per-class": (
+            request.minimum_train_samples_per_class
+        ),
+        "reference-valley-familywise-error-rate": (
+            request.reference_valley_familywise_error_rate
+        ),
+    }
 
 
 def _model_header(
@@ -2215,61 +3798,41 @@ def _model_header(
         training.bright_training_counts,
         training.held_out_dark_success_counts,
         training.held_out_dark_total_counts,
+        training.held_out_dark_labeled_counts,
         training.held_out_bright_success_counts,
         training.held_out_bright_total_counts,
+        training.held_out_bright_labeled_counts,
         training.held_out_dark_lower_bounds,
         training.held_out_bright_lower_bounds,
         training.held_out_fidelity,
         ComponentValidity((axis_id,), training.held_out_validity),
-        "frozen-bracket-clopper-pearson",
-        "3",
+        _QUALITY_GATE_ID,
+        _QUALITY_GATE_VERSION,
         True,
     )
-    model_id = {
-        ReadoutModelKind.BOX: "box-v3",
-        ReadoutModelKind.PER_SITE_PSF: "per-site-psf-v3",
-        ReadoutModelKind.UNIFORM_PSF: "uniform-psf-v3",
-    }[kind]
+    model_id = _MODEL_ID_BY_KIND[kind]
     return ReadoutModelHeader(
         model_id,
-        "3",
+        _MODEL_VERSION,
         frame_contract.fingerprint,
         site_map.fingerprint,
         axis_id,
         training.thresholds,
         training.occupied_above,
         quality,
-        (
-            CalibrationParameter("analysis-request-fingerprint", request.fingerprint),
-            CalibrationParameter("bracket-partition-digest", partition.digest),
-            CalibrationParameter("numeric-backend-digest", backend_digest),
-            CalibrationParameter("analysis-work-plan-fingerprint", work_plan_digest),
-            CalibrationParameter("train-bracket-count", len(partition.train_indices)),
-            CalibrationParameter("test-bracket-count", len(partition.test_indices)),
-            CalibrationParameter(
-                "minimum-train-samples-per-class",
-                request.minimum_train_samples_per_class,
-            ),
-            CalibrationParameter(
-                "minimum-test-samples-per-class",
-                request.minimum_test_samples_per_class,
-            ),
-            CalibrationParameter(
-                "held-out-confidence-level",
-                request.held_out_confidence_level,
-            ),
-            CalibrationParameter(
-                "minimum-held-out-class-accuracy-lower-bound",
-                request.minimum_held_out_class_accuracy_lower_bound,
-            ),
-            CalibrationParameter(
-                "usable-site-acceptance",
-                request.usable_site_acceptance.value,
-            ),
-            CalibrationParameter(
-                "minimum-usable-site-fraction",
-                request.minimum_usable_site_fraction,
-            ),
+        tuple(
+            CalibrationParameter(name, value)
+            for name, value in _model_parameter_values(
+                request,
+                partition_digest=partition.digest,
+                train_count=len(partition.train_indices),
+                reference_evidence_count=len(
+                    partition.reference_evidence_indices
+                ),
+                test_count=len(partition.test_indices),
+                backend_digest=backend_digest,
+                work_plan_digest=work_plan_digest,
+            ).items()
         ),
     )
 
@@ -2284,31 +3847,260 @@ def _canonical_boxes(boxes: np.ndarray, usable: np.ndarray, *, psf: bool) -> np.
     return result
 
 
+def validate_calibration_analysis_contract(
+    result: CalibrationAnalysisResult,
+    request: CalibrationAnalysisRequest,
+    work_plan: CalibrationWorkPlan,
+    *,
+    source_brackets: tuple[CalibrationCaptureBracket, ...] | None = None,
+) -> CalibrationAnalysisResult:
+    """Replay every request-owned declaration at a repository trust boundary."""
+
+    if not isinstance(result, CalibrationAnalysisResult):
+        raise TypeError("result must be CalibrationAnalysisResult")
+    if not isinstance(request, CalibrationAnalysisRequest):
+        raise TypeError("request must be CalibrationAnalysisRequest")
+    if not isinstance(work_plan, CalibrationWorkPlan):
+        raise TypeError("work_plan must be CalibrationWorkPlan")
+    artifact = result.artifact
+    diagnostics = result.diagnostics
+    if artifact.source_binding.layout != request.layout:
+        raise ValueError("artifact capture layout differs from analysis request")
+    site_count = request.site_count
+    reference_count = len(request.layout.reference_event_indices)
+    if artifact.site_map.site_axis.size != site_count:
+        raise ValueError("artifact site count differs from requested grid")
+    if diagnostics.bracket_count != artifact.source_binding.bracket_count:
+        raise ValueError("diagnostic bracket count differs from source binding")
+
+    train_count = int(math.floor(diagnostics.bracket_count * request.train_fraction))
+    evidence_count = int(
+        math.floor(
+            diagnostics.bracket_count * request.reference_evidence_fraction
+        )
+    )
+    test_count = diagnostics.bracket_count - train_count - evidence_count
+    _validate_partition_capacity(
+        train_count,
+        evidence_count,
+        test_count,
+        request,
+        label="persisted bracket population",
+    )
+    if (
+        diagnostics.train_bracket_count != train_count
+        or diagnostics.reference_evidence_bracket_count != evidence_count
+        or diagnostics.test_bracket_count != test_count
+    ):
+        raise ValueError("diagnostic partition counts differ from request policy")
+    if source_brackets is not None:
+        validate_calibration_partition_against_source(
+            diagnostics,
+            request,
+            source_brackets,
+        )
+
+    if work_plan.reference_valley_diagnostic_count != site_count * reference_count:
+        raise ValueError("work plan reference diagnostic count differs from request")
+    from .analysis_codec import (
+        calibration_analysis_diagnostics_encoding_upper_bound,
+    )
+
+    expected_diagnostics_bound = (
+        calibration_analysis_diagnostics_encoding_upper_bound(
+            site_count=site_count,
+            reference_count=reference_count,
+            bracket_upper_bound=work_plan.bracket_upper_bound,
+            train_bracket_upper_bound=work_plan.train_bracket_upper_bound,
+            reference_evidence_bracket_upper_bound=(
+                work_plan.reference_evidence_bracket_upper_bound
+            ),
+            model_count=len(request.model_kinds),
+        )
+    )
+    if work_plan.diagnostics_encoding_upper_bound_bytes != (
+        expected_diagnostics_bound
+    ):
+        raise ValueError("work plan diagnostics encoding bound is not canonical")
+    (
+        expected_maximum_sampled,
+        expected_total_sampled,
+        expected_kernel_elements,
+    ) = _planned_model_resources(request)
+    if work_plan.maximum_model_sampled_pixels != expected_maximum_sampled:
+        raise ValueError("work plan per-model sampled pixels are not canonical")
+    if work_plan.total_model_sampled_pixels != expected_total_sampled:
+        raise ValueError("work plan total sampled pixels are not canonical")
+    if work_plan.planned_kernel_elements != expected_kernel_elements:
+        raise ValueError("work plan kernel elements are not canonical")
+    artifact_values = {item.name: item.value for item in artifact.parameters}
+    backend_digest = artifact_values.get("numeric-backend-digest")
+    numpy_version = artifact_values.get("numpy-version")
+    scipy_version = artifact_values.get("scipy-version")
+    if not isinstance(backend_digest, str):
+        raise ValueError("artifact omits numeric backend digest")
+    if not isinstance(numpy_version, str) or not isinstance(scipy_version, str):
+        raise ValueError("artifact omits numeric backend versions")
+    expected_artifact_values = _artifact_parameter_values(
+        request,
+        partition_digest=diagnostics.partition_digest,
+        train_count=train_count,
+        reference_evidence_count=evidence_count,
+        test_count=test_count,
+        work_plan_digest=work_plan.fingerprint,
+        backend_digest=backend_digest,
+        numpy_version=numpy_version,
+        scipy_version=scipy_version,
+    )
+    if not _typed_parameter_maps_equal(artifact_values, expected_artifact_values):
+        raise ValueError("artifact parameters differ from frozen analysis request")
+
+    expected_policy = DefaultModelPolicy(
+        _DEFAULT_MODEL_POLICY_ID,
+        _DEFAULT_MODEL_POLICY_VERSION,
+        default_kind=request.default_model_kind,
+    )
+    if artifact.default_model_policy != expected_policy:
+        raise ValueError("artifact default model policy differs from request")
+    if artifact.required_model_kinds != request.model_kinds:
+        raise ValueError("artifact required model kinds differ from request")
+    if tuple(model.kind for model in artifact.models) != request.model_kinds:
+        raise ValueError("artifact model kinds differ from request")
+
+    box_geometry = _boxes_for_centers(
+        artifact.site_map.coordinates_xy,
+        half_width=request.box.half_width,
+        image_shape_yx=artifact.frame_contract.frame_schema.data_shape,
+    )
+    psf_geometry = None
+    if request.psf is not None:
+        psf_geometry = _boxes_for_centers(
+            artifact.site_map.coordinates_xy,
+            half_width=request.psf.half_width,
+            image_shape_yx=artifact.frame_contract.frame_schema.data_shape,
+        )
+    expected_model_values = _model_parameter_values(
+        request,
+        partition_digest=diagnostics.partition_digest,
+        train_count=train_count,
+        reference_evidence_count=evidence_count,
+        test_count=test_count,
+        backend_digest=backend_digest,
+        work_plan_digest=work_plan.fingerprint,
+    )
+    from .calibration_codec import (
+        calibration_artifact_encoding_upper_bound,
+        calibration_artifact_metadata_encoding_upper_bound,
+    )
+
+    expected_metadata_bound = calibration_artifact_metadata_encoding_upper_bound(
+        source_binding=artifact.source_binding,
+        frame_contract=artifact.frame_contract,
+        artifact_parameters=tuple(
+            CalibrationParameter(name, value)
+            for name, value in expected_artifact_values.items()
+        ),
+        model_parameters=tuple(
+            tuple(
+                CalibrationParameter(name, value)
+                for name, value in expected_model_values.items()
+            )
+            for _kind in request.model_kinds
+        ),
+        model_kinds=request.model_kinds,
+        default_model_policy=expected_policy,
+        algorithm_id=CALIBRATION_ANALYSIS_ALGORITHM_ID,
+        algorithm_version=CALIBRATION_ANALYSIS_ALGORITHM_VERSION,
+    )
+    if work_plan.artifact_metadata_encoding_upper_bound_bytes != (
+        expected_metadata_bound
+    ):
+        raise ValueError("work plan artifact metadata bound is not canonical")
+    expected_artifact_bound = calibration_artifact_encoding_upper_bound(
+        site_count=site_count,
+        model_count=len(request.model_kinds),
+        kernel_elements=expected_kernel_elements,
+        metadata_encoding_upper_bound_bytes=expected_metadata_bound,
+    )
+    if work_plan.artifact_encoding_upper_bound_bytes != expected_artifact_bound:
+        raise ValueError("work plan artifact encoding bound is not canonical")
+    for model in artifact.models:
+        if (
+            model.header.model_id != _MODEL_ID_BY_KIND[model.kind]
+            or model.header.model_version != _MODEL_VERSION
+        ):
+            raise ValueError("model identity differs from current analysis contract")
+        model_values = {
+            item.name: item.value for item in model.header.parameters
+        }
+        if not _typed_parameter_maps_equal(model_values, expected_model_values):
+            raise ValueError("model parameters differ from frozen analysis request")
+        usable = model.header.quality.usable_sites.mask
+        if isinstance(model, BoxReadoutModel):
+            if model.reducer is not request.box.reducer:
+                raise ValueError("BOX reducer differs from analysis request")
+            expected_boxes = _canonical_boxes(box_geometry, usable, psf=False)
+        else:
+            if request.psf is None or psf_geometry is None:
+                raise ValueError("PSF model exists without requested PSF configuration")
+            if (
+                model.background is not request.psf.background
+                or model.background_padding != request.psf.background_padding
+            ):
+                raise ValueError("PSF background differs from analysis request")
+            expected_boxes = _canonical_boxes(psf_geometry, usable, psf=True)
+            extent = 2 * request.psf.half_width + 1
+            if isinstance(model, PerSitePsfReadoutModel):
+                if model.kernels.shape[1:] != (extent, extent):
+                    raise ValueError("per-site PSF kernel shape differs from request")
+            elif isinstance(model, UniformPsfReadoutModel):
+                if model.kernel.shape != (extent, extent):
+                    raise ValueError("uniform PSF kernel shape differs from request")
+            else:  # pragma: no cover - CalibrationArtifact already closes the union
+                raise TypeError("artifact contains an unknown readout model")
+        if not np.array_equal(model.boxes_xywh, expected_boxes):
+            raise ValueError("model extraction geometry differs from analysis request")
+    return result
+
+
+def validate_calibration_partition_against_source(
+    diagnostics: CalibrationAnalysisDiagnostics,
+    request: CalibrationAnalysisRequest,
+    source_brackets: tuple[CalibrationCaptureBracket, ...],
+) -> None:
+    """Rejoin persisted partition lineage to one resolved source capture.
+
+    Scientific replay belongs to :func:`validate_calibration_analysis_contract`.
+    Admission has already performed that replay while loading persistent
+    evidence, so its source join needs only this bounded partition witness.
+    """
+
+    if not isinstance(diagnostics, CalibrationAnalysisDiagnostics):
+        raise TypeError("diagnostics must be CalibrationAnalysisDiagnostics")
+    if not isinstance(request, CalibrationAnalysisRequest):
+        raise TypeError("request must be CalibrationAnalysisRequest")
+    if not isinstance(source_brackets, tuple) or any(
+        not isinstance(item, CalibrationCaptureBracket) for item in source_brackets
+    ):
+        raise TypeError("source_brackets must be a tuple of CalibrationCaptureBracket")
+    if len(source_brackets) != diagnostics.bracket_count:
+        raise ValueError("source bracket population differs from diagnostics")
+    if _freeze_partition(source_brackets, request).digest != diagnostics.partition_digest:
+        raise ValueError("persisted partition differs from source brackets")
+
+
 def _build_model(
     kind: ReadoutModelKind,
     *,
     feature_spec: ReadoutFeatureSpec,
+    training: _TrainingResult,
     frame_contract: FrameContract,
     site_map: SiteMap,
     request: CalibrationAnalysisRequest,
-    accessor: _FrameAccessor,
-    brackets: tuple[CalibrationCaptureBracket, ...],
     partition: _BracketPartition,
-    labels: np.ndarray,
-    label_validity: np.ndarray,
     backend_digest: str,
     work_plan_digest: str,
 ) -> tuple[ReadoutModel, ModelAnalysisDiagnostic]:
-    values, validity = _extract_short_features(accessor, brackets, feature_spec)
-    training = _train_and_score_thresholds(
-        values=values,
-        feature_validity=validity,
-        labels=labels,
-        label_validity=label_validity,
-        partition=partition,
-        geometry_validity=feature_spec.site_validity.mask,
-        request=request,
-    )
     header = _model_header(
         kind,
         training=training,
@@ -2377,21 +4169,15 @@ def analyze_calibration(
     if not isinstance(block, DataBlock):
         raise TypeError("capture.block must be DataBlock")
 
-    # No layout map, witness tuple, frame copy, or learned value exists before
-    # these cheap schema-only bounds pass.
-    work_plan = build_calibration_work_plan(block.schema, request)
-    brackets = request.layout.brackets(block.schema)
-    if len(brackets) > work_plan.bracket_upper_bound:
-        raise CalibrationAnalysisError("resolved brackets exceed frozen work-plan bound")
-    if len(brackets) > request.resource_policy.max_brackets:
-        raise CalibrationResourceExceeded("resolved brackets exceed analysis budget")
+    # Preparation performs every cheap schema/count bound before resolving the
+    # bounded layout or measuring source-owned metadata.
+    preparation = _prepare_calibration_work(capture, request)
+    work_plan = preparation.plan
+    brackets = preparation.brackets
     _validate_source_schedule(capture)
-    source_binding, frame_contract = _derive_calibration_source_binding_with_resolved_brackets(
-        capture,
-        request.layout,
-        resolved_brackets=brackets,
-    )
-    partition = _freeze_partition(brackets, request)
+    source_binding = preparation.source_binding
+    frame_contract = preparation.frame_contract
+    partition = preparation.partition
     accessor = _FrameAccessor(block)
     average, average_validity, valid_fraction = _training_reference_template(
         accessor,
@@ -2407,7 +4193,9 @@ def analyze_calibration(
         request.site_count,
         coordinates=tuple(range(request.site_count)),
     )
-    numpy_version, scipy_version, backend_digest = _numeric_backend()
+    numpy_version = preparation.numpy_version
+    scipy_version = preparation.scipy_version
+    backend_digest = preparation.backend_digest
     template_hasher = hashlib.sha256()
     template_hasher.update(np.ascontiguousarray(average, dtype="<f8").tobytes())
     template_hasher.update(
@@ -2422,8 +4210,8 @@ def analyze_calibration(
             "template_digest": template_hasher.hexdigest(),
             "numeric_backend": backend_digest,
             "work_plan": work_plan.fingerprint,
-            "algorithm": _ALGORITHM_ID,
-            "version": _ALGORITHM_VERSION,
+            "algorithm": CALIBRATION_ANALYSIS_ALGORITHM_ID,
+            "version": CALIBRATION_ANALYSIS_ALGORITHM_VERSION,
         }
     )
     site_map = SiteMap(
@@ -2446,11 +4234,18 @@ def analyze_calibration(
         geometry_validity=all_sites,
         request=request,
     )
-    reference_thresholds, reference_threshold_validity = _learn_reference_thresholds(
+    (
+        reference_thresholds,
+        reference_threshold_validity,
+        reference_valley_diagnostics,
+    ) = _learn_reference_thresholds(
         accessor,
         brackets,
         partition,
         reference_spec,
+        request.minimum_train_samples_per_class,
+        request.minimum_reference_cluster_separation_rss,
+        request.reference_valley_familywise_error_rate,
     )
     labels, label_validity = _reference_labels(
         accessor,
@@ -2478,8 +4273,9 @@ def analyze_calibration(
             request.psf,
         )
 
-    models: list[ReadoutModel] = []
-    diagnostics: list[ModelAnalysisDiagnostic] = []
+    prepared_models: list[
+        tuple[ReadoutModelKind, ReadoutFeatureSpec, _TrainingResult]
+    ] = []
     for kind in request.model_kinds:
         if kind is ReadoutModelKind.BOX:
             spec = reference_spec
@@ -2499,17 +4295,37 @@ def analyze_calibration(
                 per_site_kernels=per_site_kernels,
                 uniform_kernel=uniform_kernel,
             )
+        values, validity = _extract_short_features(accessor, brackets, spec)
+        training = _train_and_score_thresholds(
+            values=values,
+            feature_validity=validity,
+            labels=labels,
+            label_validity=label_validity,
+            partition=partition,
+            geometry_validity=spec.site_validity.mask,
+            request=request,
+        )
+        prepared_models.append((kind, spec, training))
+
+    admitted_training = _certify_artifact_wide_training_results(
+        tuple(item[2] for item in prepared_models),
+        familywise_error_rate=1.0 - request.held_out_confidence_level,
+    )
+    models: list[ReadoutModel] = []
+    diagnostics: list[ModelAnalysisDiagnostic] = []
+    for (kind, spec, _evidence), training in zip(
+        prepared_models,
+        admitted_training,
+        strict=True,
+    ):
         model, diagnostic = _build_model(
             kind,
             feature_spec=spec,
+            training=training,
             frame_contract=frame_contract,
             site_map=site_map,
             request=request,
-            accessor=accessor,
-            brackets=brackets,
             partition=partition,
-            labels=labels,
-            label_validity=label_validity,
             backend_digest=backend_digest,
             work_plan_digest=work_plan.fingerprint,
         )
@@ -2524,26 +4340,27 @@ def analyze_calibration(
         CalibrationStage.COMPLETE,
         request.model_kinds,
         DefaultModelPolicy(
-            "analysis-request",
-            "3",
+            _DEFAULT_MODEL_POLICY_ID,
+            _DEFAULT_MODEL_POLICY_VERSION,
             default_kind=request.default_model_kind,
         ),
-        _ALGORITHM_ID,
-        _ALGORITHM_VERSION,
-        (
-            CalibrationParameter("analysis-request-fingerprint", request.fingerprint),
-            CalibrationParameter("bracket-partition-digest", partition.digest),
-            CalibrationParameter(
-                "analysis-work-plan-fingerprint",
-                work_plan.fingerprint,
-            ),
-            CalibrationParameter("grid-rows", request.grid_shape_yx[0]),
-            CalibrationParameter("grid-columns", request.grid_shape_yx[1]),
-            CalibrationParameter("grid-order", request.grid_order.value),
-            CalibrationParameter("numeric-backend-digest", backend_digest),
-            CalibrationParameter("numpy-version", numpy_version),
-            CalibrationParameter("scipy-version", scipy_version),
-            CalibrationParameter("strict-reference-consensus", True),
+        CALIBRATION_ANALYSIS_ALGORITHM_ID,
+        CALIBRATION_ANALYSIS_ALGORITHM_VERSION,
+        tuple(
+            CalibrationParameter(name, value)
+            for name, value in _artifact_parameter_values(
+                request,
+                partition_digest=partition.digest,
+                train_count=len(partition.train_indices),
+                reference_evidence_count=len(
+                    partition.reference_evidence_indices
+                ),
+                test_count=len(partition.test_indices),
+                work_plan_digest=work_plan.fingerprint,
+                backend_digest=backend_digest,
+                numpy_version=numpy_version,
+                scipy_version=scipy_version,
+            ).items()
         ),
     )
     validate_calibration_artifact_resources(
@@ -2561,12 +4378,14 @@ def analyze_calibration(
     result_diagnostics = CalibrationAnalysisDiagnostics(
         len(brackets),
         len(partition.train_indices),
+        len(partition.reference_evidence_indices),
         len(partition.test_indices),
         partition.digest,
         len(brackets) * len(request.layout.reference_event_indices),
         valid_fraction,
         dark_counts,
         bright_counts,
+        reference_valley_diagnostics,
         lattice.diagnostic,
         tuple(diagnostics),
     )
@@ -2578,15 +4397,25 @@ __all__ = [
     "CalibrationAnalysisDiagnostics",
     "CalibrationAnalysisError",
     "CalibrationAnalysisRequest",
+    "CalibrationAnalysisPlanningAssumption",
     "CalibrationAnalysisResourcePolicy",
     "CalibrationAnalysisResult",
+    "CalibrationBracketSamplingAssumption",
+    "CALIBRATION_ANALYSIS_ALGORITHM_ID",
+    "CALIBRATION_ANALYSIS_ALGORITHM_VERSION",
     "CalibrationWorkPlan",
     "GridOrder",
     "ModelAnalysisDiagnostic",
     "PsfAnalysisConfig",
+    "ReferenceClassOrientation",
+    "ReferenceLabelSource",
+    "ReferenceValleyDiagnostic",
+    "ReferenceValleyEvidence",
     "SiteDetectionDiagnostic",
     "SiteDetectionPolicy",
     "UsableSiteAcceptance",
     "analyze_calibration",
     "build_calibration_work_plan",
+    "validate_calibration_analysis_contract",
+    "validate_calibration_partition_against_source",
 ]

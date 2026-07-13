@@ -42,11 +42,12 @@ from .codec import (
     frame_contract_from_tree,
     frame_contract_to_tree,
 )
+from .contracts import FrameContract
 
 
 CALIBRATION_SOURCE_BINDING_SCHEMA = "zlc_neutral_atom.calibration-source-binding.v1"
 SITE_MAP_SCHEMA = "zlc_neutral_atom.site-map.v1"
-READOUT_MODEL_QUALITY_SCHEMA = "zlc_neutral_atom.readout-model-quality.v2"
+READOUT_MODEL_QUALITY_SCHEMA = "zlc_neutral_atom.readout-model-quality.v3"
 READOUT_MODEL_HEADER_SCHEMA = "zlc_neutral_atom.readout-model-header.v1"
 READOUT_MODEL_SCHEMA = "zlc_neutral_atom.readout-model.v1"
 DEFAULT_MODEL_POLICY_SCHEMA = "zlc_neutral_atom.default-model-policy.v1"
@@ -269,8 +270,10 @@ def readout_model_quality_to_tree(value: ReadoutModelQuality) -> dict[str, Any]:
         "bright_training_sample_counts": value.bright_training_sample_counts,
         "held_out_dark_success_counts": value.held_out_dark_success_counts,
         "held_out_dark_total_counts": value.held_out_dark_total_counts,
+        "held_out_dark_labeled_counts": value.held_out_dark_labeled_counts,
         "held_out_bright_success_counts": value.held_out_bright_success_counts,
         "held_out_bright_total_counts": value.held_out_bright_total_counts,
+        "held_out_bright_labeled_counts": value.held_out_bright_labeled_counts,
         "held_out_dark_accuracy_lower_bounds": (
             value.held_out_dark_accuracy_lower_bounds
         ),
@@ -296,8 +299,10 @@ def readout_model_quality_from_tree(tree: Any) -> ReadoutModelQuality:
             "bright_training_sample_counts",
             "held_out_dark_success_counts",
             "held_out_dark_total_counts",
+            "held_out_dark_labeled_counts",
             "held_out_bright_success_counts",
             "held_out_bright_total_counts",
+            "held_out_bright_labeled_counts",
             "held_out_dark_accuracy_lower_bounds",
             "held_out_bright_accuracy_lower_bounds",
             "held_out_fidelity",
@@ -315,8 +320,13 @@ def readout_model_quality_from_tree(tree: Any) -> ReadoutModelQuality:
         _ndarray(data["bright_training_sample_counts"], "bright_training_sample_counts"),
         _ndarray(data["held_out_dark_success_counts"], "held_out_dark_success_counts"),
         _ndarray(data["held_out_dark_total_counts"], "held_out_dark_total_counts"),
+        _ndarray(data["held_out_dark_labeled_counts"], "held_out_dark_labeled_counts"),
         _ndarray(data["held_out_bright_success_counts"], "held_out_bright_success_counts"),
         _ndarray(data["held_out_bright_total_counts"], "held_out_bright_total_counts"),
+        _ndarray(
+            data["held_out_bright_labeled_counts"],
+            "held_out_bright_labeled_counts",
+        ),
         _ndarray(
             data["held_out_dark_accuracy_lower_bounds"],
             "held_out_dark_accuracy_lower_bounds",
@@ -627,8 +637,10 @@ def _resource_admission(resource_policy: CalibrationResourcePolicy):
             "bright_training_sample_counts",
             "held_out_dark_success_counts",
             "held_out_dark_total_counts",
+            "held_out_dark_labeled_counts",
             "held_out_bright_success_counts",
             "held_out_bright_total_counts",
+            "held_out_bright_labeled_counts",
             "held_out_dark_accuracy_lower_bounds",
             "held_out_bright_accuracy_lower_bounds",
             "held_out_fidelity",
@@ -721,6 +733,159 @@ def encode_calibration_artifact(value: CalibrationArtifact) -> bytes:
     return _encode_typed(value, calibration_artifact_to_tree)
 
 
+def calibration_artifact_metadata_encoding_upper_bound(
+    *,
+    source_binding: CalibrationSourceBinding,
+    frame_contract: FrameContract,
+    artifact_parameters: tuple[CalibrationParameter, ...],
+    model_parameters: tuple[tuple[CalibrationParameter, ...], ...],
+    model_kinds: tuple[ReadoutModelKind, ...],
+    default_model_policy: DefaultModelPolicy,
+    algorithm_id: str,
+    algorithm_version: str,
+) -> int:
+    """Bound every non-array artifact byte from its frozen owner values.
+
+    External camera/schema/source text is deliberately measured from the
+    owner projections instead of hidden behind a fixed allowance.  The small
+    fixed envelopes cover only codec-owned field names, schemas, fixed model
+    identities, quality-gate identifiers, and scalar wrappers.
+    """
+
+    if not isinstance(source_binding, CalibrationSourceBinding):
+        raise TypeError("source_binding must be CalibrationSourceBinding")
+    if not isinstance(frame_contract, FrameContract):
+        raise TypeError("frame_contract must be FrameContract")
+    if not isinstance(default_model_policy, DefaultModelPolicy):
+        raise TypeError("default_model_policy must be DefaultModelPolicy")
+    artifact_parameters = tuple(artifact_parameters)
+    model_parameters = tuple(tuple(items) for items in model_parameters)
+    model_kinds = tuple(model_kinds)
+    if any(not isinstance(item, CalibrationParameter) for item in artifact_parameters):
+        raise TypeError("artifact_parameters must contain CalibrationParameter")
+    if not model_kinds or any(
+        not isinstance(item, ReadoutModelKind) for item in model_kinds
+    ):
+        raise TypeError("model_kinds must contain ReadoutModelKind")
+    if len(model_parameters) != len(model_kinds) or any(
+        any(not isinstance(item, CalibrationParameter) for item in items)
+        for items in model_parameters
+    ):
+        raise TypeError(
+            "model_parameters must contain one CalibrationParameter tuple per model"
+        )
+    algorithm_id = _text(algorithm_id, "algorithm_id")
+    algorithm_version = _text(algorithm_version, "algorithm_version")
+    projected = {
+        "source_binding": calibration_source_binding_to_tree(source_binding),
+        "frame_contract": frame_contract_to_tree(frame_contract),
+        "site_coordinate_frame": frame_contract.coordinate_frame.value,
+        "artifact_parameters": [
+            _parameter_to_tree(item) for item in artifact_parameters
+        ],
+        "models": [
+            {
+                "kind": kind.value,
+                "parameters": [
+                    _parameter_to_tree(item) for item in parameters
+                ],
+            }
+            for kind, parameters in zip(
+                model_kinds,
+                model_parameters,
+                strict=True,
+            )
+        ],
+        "required_model_kinds": [kind.value for kind in model_kinds],
+        "default_model_policy": default_model_policy_to_tree(
+            default_model_policy
+        ),
+        "algorithm_id": algorithm_id,
+        "algorithm_version": algorithm_version,
+    }
+    return len(encode(projected)) + 16 * 1024 + 8 * 1024 * len(model_kinds)
+
+
+def calibration_artifact_encoding_upper_bound(
+    *,
+    site_count: int,
+    model_count: int,
+    kernel_elements: int,
+    metadata_encoding_upper_bound_bytes: int,
+) -> int:
+    """Conservatively bound the current artifact wire representation.
+
+    The calibration codec owns this estimate because it owns both the closed
+    artifact tree and its canonical encoding.  The raw-array term includes the
+    SiteMap, every per-site model/quality vector, extraction boxes, and all PSF
+    kernels.  Two wire bytes per raw byte cover base64 expansion plus canonical
+    array framing.
+    The fixed and per-model envelopes cover axes, parameters, schemas, and
+    scalar metadata.  Boundary tests compare real encodings with
+    this estimate so schema growth cannot silently outrun repository preflight.
+    """
+
+    values = {
+        "site_count": site_count,
+        "model_count": model_count,
+        "kernel_elements": kernel_elements,
+        "metadata_encoding_upper_bound_bytes": (
+            metadata_encoding_upper_bound_bytes
+        ),
+    }
+    for name, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be an integer")
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative")
+    # SiteMap coordinates+validity: 17 bytes/site.  Each model carries
+    # thresholds, direction, eight uint64 evidence vectors, three float64
+    # quality vectors, two validity masks, and four int64 box coordinates:
+    # 131 bytes/site/model.  Kernels are canonical little-endian float64.
+    raw_array_bytes = (
+        17 * site_count
+        + 131 * site_count * model_count
+        + 8 * kernel_elements
+    )
+    return metadata_encoding_upper_bound_bytes + 2 * raw_array_bytes
+
+
+def calibration_artifact_encoding_working_upper_bound(
+    retained_array_bytes: int,
+    metadata_encoding_upper_bound_bytes: int,
+) -> int:
+    """Bound transient canonical-encoding memory above retained artifact arrays.
+
+    Canonical ndarray encoding can simultaneously hold a normalized byte copy,
+    base64 text, the tagged JSON tree, its rendered string, and final UTF-8
+    bytes.  Profiling across power-of-two float64 kernels measures roughly
+    4.67x raw transient memory.  Six times retained bytes plus a fixed envelope
+    is the current fail-closed owner contract.
+    """
+
+    if isinstance(retained_array_bytes, bool) or not isinstance(
+        retained_array_bytes,
+        int,
+    ):
+        raise TypeError("retained_array_bytes must be an integer")
+    if retained_array_bytes < 0:
+        raise ValueError("retained_array_bytes must be non-negative")
+    if isinstance(metadata_encoding_upper_bound_bytes, bool) or not isinstance(
+        metadata_encoding_upper_bound_bytes,
+        int,
+    ):
+        raise TypeError("metadata_encoding_upper_bound_bytes must be an integer")
+    if metadata_encoding_upper_bound_bytes < 0:
+        raise ValueError(
+            "metadata_encoding_upper_bound_bytes must be non-negative"
+        )
+    return (
+        6 * retained_array_bytes
+        + 12 * metadata_encoding_upper_bound_bytes
+        + 1024 * 1024
+    )
+
+
 def decode_calibration_artifact(
     payload: bytes | bytearray | memoryview,
     *,
@@ -748,6 +913,9 @@ __all__ = [
     "SITE_MAP_SCHEMA",
     "CalibrationCodecError",
     "calibration_artifact_from_tree",
+    "calibration_artifact_metadata_encoding_upper_bound",
+    "calibration_artifact_encoding_upper_bound",
+    "calibration_artifact_encoding_working_upper_bound",
     "calibration_artifact_to_tree",
     "calibration_source_binding_from_tree",
     "calibration_source_binding_to_tree",

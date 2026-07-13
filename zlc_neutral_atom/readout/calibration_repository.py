@@ -53,12 +53,16 @@ from zlc_neutral_atom.runtime.run import (
 )
 
 from .analysis import (
+    CALIBRATION_ANALYSIS_ALGORITHM_ID,
+    CALIBRATION_ANALYSIS_ALGORITHM_VERSION,
     CalibrationAnalysisDiagnostics,
     CalibrationAnalysisRequest,
     CalibrationAnalysisResult,
     CalibrationWorkPlan,
+    _prepare_calibration_work,
     analyze_calibration,
-    build_calibration_work_plan,
+    validate_calibration_analysis_contract,
+    validate_calibration_partition_against_source,
 )
 from .analysis_codec import (
     decode_calibration_analysis_diagnostics,
@@ -76,7 +80,6 @@ from .calibration import (
     CalibrationResourceSummary,
     CalibrationSourceBinding,
     calibration_resource_summary,
-    derive_calibration_source_binding,
     validate_calibration_artifact_resources,
     validate_calibration_resource_summary,
 )
@@ -230,6 +233,16 @@ def _sha256(value: object, field_name: str) -> str:
 def _parameter_digest(artifact: CalibrationArtifact, name: str) -> str:
     parameters = {item.name: item.value for item in artifact.parameters}
     return _sha256(parameters.get(name), f"calibration artifact {name}")
+
+
+def _parameter_text(artifact: CalibrationArtifact, name: str) -> str:
+    parameters = {item.name: item.value for item in artifact.parameters}
+    value = parameters.get(name)
+    if type(value) is not str or not value:
+        raise ValueError(
+            f"calibration artifact {name} must be non-empty text"
+        )
+    return value
 
 
 def _source_binding_fingerprint(binding: CalibrationSourceBinding) -> str:
@@ -552,6 +565,7 @@ class _LoadedCalibration:
     artifact: CalibrationArtifact
     derivation: _CalibrationDerivation
     evidence_digest: str
+    analysis_result: CalibrationAnalysisResult
 
 
 @dataclass(frozen=True)
@@ -892,10 +906,7 @@ class CalibrationRepository:
 
         self._assert_authority_integrity()
         loaded = self._load_record(reference)
-        return CalibrationAnalysisResult(
-            loaded.artifact,
-            loaded.derivation.diagnostics,
-        )
+        return loaded.analysis_result
 
     def admit(
         self,
@@ -1010,7 +1021,14 @@ class CalibrationRepository:
             )
         if prepared.run_id != context.run_id.value:
             raise ValueError("calibration candidate belongs to another Run")
-        _validate_analysis_result(prepared, executed.result)
+        if context.safety_bundle_id is not None:
+            raise RuntimeError(
+                "software-only calibration analysis unexpectedly acquired a safety bundle"
+            )
+        # ``_ExecutedCalibrationAnalysis`` is minted only after execute has
+        # replayed the complete request/result contract.  Its closed result is
+        # immutable, so finalize need not pay the same O(site * evidence)
+        # statistical replay a second time before encoding it.
         subject = context.authorize_commit_preparation(CommitKind.FINAL)
         reference, manifest_payload = self._stage_execution(
             executed,
@@ -1104,15 +1122,27 @@ class CalibrationRepository:
         validate_calibration_artifact_resources(artifact, authority.resource_policy)
         resource_summary = calibration_resource_summary(artifact)
         artifact_payload = encode_calibration_artifact(artifact)
+        if len(artifact_payload) > prepared.work_plan.artifact_encoding_upper_bound_bytes:
+            raise RuntimeError(
+                "calibration artifact encoding exceeded its frozen work-plan bound"
+            )
         if len(artifact_payload) > authority.resource_policy.max_artifact_blob_bytes:
             raise CalibrationResourceExceeded(
                 "calibration artifact blob exceeds repository resource policy"
             )
-        artifact_blob = authority.store_authority.put_blob(artifact_payload)
+        request_payload = encode_calibration_analysis_request(prepared.request)
+        work_plan_payload = encode_calibration_work_plan(prepared.work_plan)
         diagnostics_payload = encode_calibration_analysis_diagnostics(
             result.diagnostics,
             resource_policy=prepared.request.resource_policy,
         )
+        if (
+            len(diagnostics_payload)
+            > prepared.work_plan.diagnostics_encoding_upper_bound_bytes
+        ):
+            raise RuntimeError(
+                "calibration diagnostics encoding exceeded its frozen work-plan bound"
+            )
         diagnostics_digest = sha256_digest(diagnostics_payload)
         derivation = _CalibrationDerivation(
             request=prepared.request,
@@ -1147,12 +1177,24 @@ class CalibrationRepository:
             analysis_run_id=prepared.run_id,
             analysis_safety_bundle_id=analysis_safety_bundle_id,
         )
-        derivation_payload = _derivation_payload(derivation)
+        derivation_payload = _derivation_payload(
+            derivation,
+            request_payload=request_payload,
+            work_plan_payload=work_plan_payload,
+            diagnostics_payload=diagnostics_payload,
+        )
         if len(derivation_payload) > authority.resource_policy.max_artifact_blob_bytes:
             raise CalibrationResourceExceeded(
                 "calibration derivation blob exceeds repository resource policy"
             )
-        derivation_blob = authority.store_authority.put_blob(derivation_payload)
+        artifact_blob = ContentRef(
+            sha256_digest(artifact_payload),
+            len(artifact_payload),
+        )
+        derivation_blob = ContentRef(
+            sha256_digest(derivation_payload),
+            len(derivation_payload),
+        )
         manifest_payload = _manifest_payload(
             repository_id=authority.repository_id,
             artifact_blob=artifact_blob,
@@ -1164,6 +1206,10 @@ class CalibrationRepository:
             raise CalibrationResourceExceeded(
                 "calibration manifest exceeds repository resource policy"
             )
+        stored_artifact = authority.store_authority.put_blob(artifact_payload)
+        stored_derivation = authority.store_authority.put_blob(derivation_payload)
+        if stored_artifact != artifact_blob or stored_derivation != derivation_blob:
+            raise RuntimeError("calibration content address changed while staging")
         reference = CalibrationArtifactRef(
             authority.repository_id,
             sha256_digest(manifest_payload),
@@ -1248,10 +1294,16 @@ class CalibrationRepository:
             artifact_payload,
             resource_policy=policy,
         )
-        derivation = _derivation_from_payload(derivation_payload)
-        _validate_persistent_record(
+        (
+            derivation,
+            _request_payload,
+            _work_plan_payload,
+            diagnostics_payload,
+        ) = _derivation_from_payload(derivation_payload)
+        analysis_result = _validate_persistent_record(
             artifact,
             derivation,
+            diagnostics_payload=diagnostics_payload,
             calibration_repository_id=repository_id,
         )
         computed_summary = calibration_resource_summary(artifact)
@@ -1267,7 +1319,12 @@ class CalibrationRepository:
         )
         if rebuilt != manifest_payload or sha256_digest(rebuilt) != reference.manifest_digest:
             raise ValueError("CalibrationArtifact manifest is not canonical")
-        return _LoadedCalibration(artifact, derivation, derivation_blob.digest)
+        return _LoadedCalibration(
+            artifact,
+            derivation,
+            derivation_blob.digest,
+            analysis_result,
+        )
 
     def _recover(self, intent: CommitIntent) -> CommitRecovery[CalibrationArtifactRef]:
         authority = self._assert_authority_integrity()
@@ -1340,6 +1397,257 @@ class CalibrationRepository:
             raise ValueError("CalibrationArtifactRef belongs to another repository")
 
 
+_DERIVATION_METADATA_FIELDS = frozenset(
+    {
+        "source_capture_ref",
+        "source_capture_run_id",
+        "source_capture_safety_bundle_id",
+        "source_capture_evidence_digest",
+        "source_capture_commit_kind",
+        "source_capture_commit_id",
+        "source_binding_fingerprint",
+        "artifact_fingerprint",
+        "request_fingerprint",
+        "work_plan_fingerprint",
+        "diagnostics_digest",
+        "numeric_backend_digest",
+        "analysis_result_digest",
+        "plan_binding_digest",
+        "algorithm_id",
+        "algorithm_version",
+        "analysis_run_id",
+        "analysis_safety_bundle_id",
+    }
+)
+
+
+def _derivation_metadata_values(
+    *,
+    source_capture_ref: CaptureArtifactRef,
+    source_capture_run_id: str,
+    source_capture_safety_bundle_id: str,
+    source_capture_evidence_digest: str,
+    source_capture_commit_kind: CommitKind,
+    source_capture_commit_id: str,
+    source_binding_fingerprint: str,
+    artifact_fingerprint: str,
+    request_fingerprint: str,
+    work_plan_fingerprint: str,
+    diagnostics_digest: str,
+    numeric_backend_digest: str,
+    analysis_result_digest: str,
+    plan_binding_digest: str,
+    algorithm_id: str,
+    algorithm_version: str,
+    analysis_run_id: str,
+    analysis_safety_bundle_id: str | None,
+) -> dict[str, object]:
+    return {
+        "source_capture_ref": capture_artifact_ref_to_tree(source_capture_ref),
+        "source_capture_run_id": source_capture_run_id,
+        "source_capture_safety_bundle_id": source_capture_safety_bundle_id,
+        "source_capture_evidence_digest": source_capture_evidence_digest,
+        "source_capture_commit_kind": source_capture_commit_kind.value,
+        "source_capture_commit_id": source_capture_commit_id,
+        "source_binding_fingerprint": source_binding_fingerprint,
+        "artifact_fingerprint": artifact_fingerprint,
+        "request_fingerprint": request_fingerprint,
+        "work_plan_fingerprint": work_plan_fingerprint,
+        "diagnostics_digest": diagnostics_digest,
+        "numeric_backend_digest": numeric_backend_digest,
+        "analysis_result_digest": analysis_result_digest,
+        "plan_binding_digest": plan_binding_digest,
+        "algorithm_id": algorithm_id,
+        "algorithm_version": algorithm_version,
+        "analysis_run_id": analysis_run_id,
+        "analysis_safety_bundle_id": analysis_safety_bundle_id,
+    }
+
+
+def _derivation_envelope_tree(
+    metadata: dict[str, object],
+    *,
+    request_payload: bytes,
+    work_plan_payload: bytes,
+    diagnostics_payload: bytes,
+) -> dict[str, object]:
+    if set(metadata) != _DERIVATION_METADATA_FIELDS:
+        raise ValueError("derivation metadata field set is not current")
+    if any(
+        not isinstance(value, bytes)
+        for value in (request_payload, work_plan_payload, diagnostics_payload)
+    ):
+        raise TypeError("derivation owner payloads must be bytes")
+    return {
+        "schema": _CALIBRATION_DERIVATION_SCHEMA,
+        "request_payload": request_payload,
+        "work_plan_payload": work_plan_payload,
+        "diagnostics_payload": diagnostics_payload,
+        **metadata,
+    }
+
+
+def _manifest_tree_from_metadata(
+    *,
+    repository_id: str,
+    artifact_blob: ContentRef,
+    derivation_blob: ContentRef,
+    metadata: dict[str, object],
+    resource_summary: CalibrationResourceSummary,
+) -> dict[str, object]:
+    if set(metadata) != _DERIVATION_METADATA_FIELDS:
+        raise ValueError("manifest derivation metadata field set is not current")
+    return {
+        "schema": CALIBRATION_MANIFEST_SCHEMA,
+        "repository_id": repository_id,
+        "artifact_schema": CALIBRATION_ARTIFACT_SCHEMA,
+        "artifact_blob": _content_ref_to_tree(artifact_blob),
+        "derivation_blob": _content_ref_to_tree(derivation_blob),
+        "artifact_fingerprint": metadata["artifact_fingerprint"],
+        "source_capture_ref": metadata["source_capture_ref"],
+        "source_capture_run_id": metadata["source_capture_run_id"],
+        "source_capture_safety_bundle_id": metadata[
+            "source_capture_safety_bundle_id"
+        ],
+        "source_capture_evidence_digest": metadata[
+            "source_capture_evidence_digest"
+        ],
+        "source_capture_commit_kind": metadata["source_capture_commit_kind"],
+        "source_capture_commit_id": metadata["source_capture_commit_id"],
+        "source_binding_fingerprint": metadata["source_binding_fingerprint"],
+        "request_fingerprint": metadata["request_fingerprint"],
+        "work_plan_fingerprint": metadata["work_plan_fingerprint"],
+        "diagnostics_digest": metadata["diagnostics_digest"],
+        "numeric_backend_digest": metadata["numeric_backend_digest"],
+        "analysis_result_digest": metadata["analysis_result_digest"],
+        "plan_binding_digest": metadata["plan_binding_digest"],
+        "algorithm_id": metadata["algorithm_id"],
+        "algorithm_version": metadata["algorithm_version"],
+        "analysis_run_id": metadata["analysis_run_id"],
+        "analysis_safety_bundle_id": metadata["analysis_safety_bundle_id"],
+        "evidence_digest": derivation_blob.digest,
+        "resource_summary": _resource_summary_to_tree(resource_summary),
+    }
+
+
+def _canonical_bytes_wire_growth(size: int) -> int:
+    if isinstance(size, bool) or not isinstance(size, int):
+        raise TypeError("canonical byte payload size must be an integer")
+    if size < 0:
+        raise ValueError("canonical byte payload size must be non-negative")
+    return 4 * ((size + 2) // 3)
+
+
+def _validate_prepared_repository_resources(
+    prepared: _PreparedCalibrationAnalysis,
+    policy: CalibrationResourcePolicy,
+) -> None:
+    """Reject a target repository budget before numerical analysis starts."""
+
+    if not isinstance(prepared, _PreparedCalibrationAnalysis):
+        raise TypeError("prepared must be _PreparedCalibrationAnalysis")
+    if not isinstance(policy, CalibrationResourcePolicy):
+        raise TypeError("policy must be CalibrationResourcePolicy")
+    plan = prepared.work_plan
+    request = prepared.request
+    if request.site_count > policy.max_sites:
+        raise CalibrationResourceExceeded(
+            "planned calibration sites exceed target repository policy"
+        )
+    if len(request.model_kinds) > policy.max_models:
+        raise CalibrationResourceExceeded(
+            "planned calibration models exceed target repository policy"
+        )
+    if plan.planned_kernel_elements > policy.max_kernel_elements:
+        raise CalibrationResourceExceeded(
+            "planned calibration kernels exceed target repository policy"
+        )
+    if plan.maximum_model_sampled_pixels > policy.max_sampled_pixels_per_model:
+        raise CalibrationResourceExceeded(
+            "planned per-model sampled pixels exceed target repository policy"
+        )
+    if (
+        plan.total_model_sampled_pixels
+        > policy.max_total_sampled_pixels_all_models
+    ):
+        raise CalibrationResourceExceeded(
+            "planned total sampled pixels exceed target repository policy"
+        )
+    if plan.artifact_encoding_upper_bound_bytes > policy.max_artifact_blob_bytes:
+        raise CalibrationResourceExceeded(
+            "planned calibration artifact encoding exceeds target repository policy"
+        )
+
+    request_payload = encode_calibration_analysis_request(request)
+    work_plan_payload = encode_calibration_work_plan(plan)
+    capture = prepared.capture
+    admission = prepared.capture_admission
+    digest = "f" * 64
+    metadata = _derivation_metadata_values(
+        source_capture_ref=capture.ref,
+        source_capture_run_id=capture.run_id,
+        source_capture_safety_bundle_id=capture.safety_bundle_id,
+        source_capture_evidence_digest=admission.evidence_digest,
+        source_capture_commit_kind=admission.commit_kind,
+        source_capture_commit_id=admission.commit_id,
+        source_binding_fingerprint=_source_binding_fingerprint(
+            prepared.source_binding
+        ),
+        artifact_fingerprint=digest,
+        request_fingerprint=request.fingerprint,
+        work_plan_fingerprint=plan.fingerprint,
+        diagnostics_digest=digest,
+        numeric_backend_digest=digest,
+        analysis_result_digest=digest,
+        plan_binding_digest=prepared.plan_binding_digest,
+        algorithm_id=CALIBRATION_ANALYSIS_ALGORITHM_ID,
+        algorithm_version=CALIBRATION_ANALYSIS_ALGORITHM_VERSION,
+        analysis_run_id=prepared.run_id,
+        # This software-only plan has no resource/hazard claims.  Finalize
+        # asserts that runtime preserved the corresponding absent bundle.
+        analysis_safety_bundle_id=None,
+    )
+    derivation_base_tree = _derivation_envelope_tree(
+        metadata,
+        request_payload=b"",
+        work_plan_payload=b"",
+        diagnostics_payload=b"",
+    )
+    derivation_upper_bound = len(encode(derivation_base_tree)) + sum(
+        _canonical_bytes_wire_growth(size)
+        for size in (
+            len(request_payload),
+            len(work_plan_payload),
+            plan.diagnostics_encoding_upper_bound_bytes,
+        )
+    )
+    if derivation_upper_bound > policy.max_artifact_blob_bytes:
+        raise CalibrationResourceExceeded(
+            "planned calibration derivation encoding exceeds target repository policy"
+        )
+
+    summary = CalibrationResourceSummary(
+        request.site_count,
+        len(request.model_kinds),
+        plan.planned_kernel_elements,
+        plan.maximum_model_sampled_pixels,
+        plan.total_model_sampled_pixels,
+    )
+    artifact_blob = ContentRef(digest, plan.artifact_encoding_upper_bound_bytes)
+    derivation_blob = ContentRef(digest, derivation_upper_bound)
+    manifest_upper_tree = _manifest_tree_from_metadata(
+        repository_id=prepared.calibration_repository_id,
+        artifact_blob=artifact_blob,
+        derivation_blob=derivation_blob,
+        metadata=metadata,
+        resource_summary=summary,
+    )
+    if len(encode(manifest_upper_tree)) > policy.max_manifest_bytes:
+        raise CalibrationResourceExceeded(
+            "planned calibration manifest exceeds target repository policy"
+        )
+
+
 def compile_calibration_artifact_plan(
     source_capture_ref: CaptureArtifactRef,
     capture_repository: CaptureRepository,
@@ -1388,11 +1696,10 @@ def compile_calibration_artifact_plan(
         if capture_admission.reference != frozen_ref:
             raise ValueError("CaptureRepository admitted another CaptureArtifact")
         capture = capture_admission.artifact
-        work_plan = build_calibration_work_plan(capture.block.schema, frozen_request)
-        source_binding, frame_contract = derive_calibration_source_binding(
-            capture,
-            frozen_request.layout,
-        )
+        work_preparation = _prepare_calibration_work(capture, frozen_request)
+        work_plan = work_preparation.plan
+        source_binding = work_preparation.source_binding
+        frame_contract = work_preparation.frame_contract
         plan_binding = _plan_binding_digest(
             frozen_ref,
             capture_repository_id=capture_repository_id,
@@ -1402,7 +1709,7 @@ def compile_calibration_artifact_plan(
             calibration_repository_id=calibration_repository_id,
             request_fingerprint=frozen_request.fingerprint,
         )
-        return _PreparedCalibrationAnalysis(
+        prepared = _PreparedCalibrationAnalysis(
             capture_admission,
             frozen_request,
             work_plan,
@@ -1414,6 +1721,11 @@ def compile_calibration_artifact_plan(
             calibration_authority.token,
             context.run_id.value,
         )
+        _validate_prepared_repository_resources(
+            prepared,
+            calibration_authority.resource_policy,
+        )
+        return prepared
 
     def execute(
         context: RunContext,
@@ -1466,9 +1778,14 @@ def _validate_analysis_result(
 ) -> None:
     if not isinstance(result, CalibrationAnalysisResult):
         raise TypeError("calibration analysis returned another result type")
-    # Reconstructing the closed result repeats its cross-field quality/evidence
-    # checks at the trust boundary without rerunning the numerical analysis.
-    CalibrationAnalysisResult(result.artifact, result.diagnostics)
+    validate_calibration_analysis_contract(
+        result,
+        prepared.request,
+        prepared.work_plan,
+        source_brackets=prepared.request.layout.brackets(
+            prepared.capture.block.schema
+        ),
+    )
     artifact = result.artifact
     if artifact.source_binding != prepared.source_binding:
         raise ValueError("analysis source binding differs from preflight")
@@ -1491,9 +1808,17 @@ def _validate_persistent_record(
     artifact: CalibrationArtifact,
     derivation: _CalibrationDerivation,
     *,
+    diagnostics_payload: bytes,
     calibration_repository_id: str,
-) -> None:
-    CalibrationAnalysisResult(artifact, derivation.diagnostics)
+) -> CalibrationAnalysisResult:
+    if not isinstance(diagnostics_payload, bytes):
+        raise TypeError("diagnostics_payload must be bytes")
+    result = CalibrationAnalysisResult(artifact, derivation.diagnostics)
+    validate_calibration_analysis_contract(
+        result,
+        derivation.request,
+        derivation.work_plan,
+    )
     if artifact.fingerprint != derivation.artifact_fingerprint:
         raise ValueError("artifact fingerprint differs from derivation")
     if artifact.source_binding.source_capture_ref != derivation.source_capture_ref:
@@ -1514,10 +1839,6 @@ def _validate_persistent_record(
         derivation.numeric_backend_digest
     ):
         raise ValueError("artifact numeric backend differs from derivation")
-    diagnostics_payload = encode_calibration_analysis_diagnostics(
-        derivation.diagnostics,
-        resource_policy=derivation.request.resource_policy,
-    )
     if sha256_digest(diagnostics_payload) != derivation.diagnostics_digest:
         raise ValueError("diagnostics digest differs from derivation")
     if _analysis_result_digest(artifact, derivation.diagnostics_digest) != (
@@ -1542,6 +1863,7 @@ def _validate_persistent_record(
     )
     if expected_plan_binding != derivation.plan_binding_digest:
         raise ValueError("calibration plan binding differs from persistent evidence")
+    return result
 
 
 def _validate_source_capture(
@@ -1569,20 +1891,22 @@ def _validate_source_capture(
         raise ValueError("resolved source capture run_id differs from derivation")
     if capture.safety_bundle_id != derivation.source_capture_safety_bundle_id:
         raise ValueError("resolved source capture safety bundle differs from derivation")
-    binding, frame_contract = derive_calibration_source_binding(
+    preparation = _prepare_calibration_work(
         capture,
-        derivation.request.layout,
+        derivation.request,
+        frozen_numeric_backend=(
+            _parameter_text(artifact, "numpy-version"),
+            _parameter_text(artifact, "scipy-version"),
+            _parameter_digest(artifact, "numeric-backend-digest"),
+        ),
     )
-    if binding != artifact.source_binding:
+    if preparation.source_binding != artifact.source_binding:
         raise ValueError("calibration source binding differs from resolved capture")
-    if encode_frame_contract(frame_contract) != encode_frame_contract(
+    if encode_frame_contract(preparation.frame_contract) != encode_frame_contract(
         artifact.frame_contract
     ):
         raise ValueError("calibration FrameContract differs from resolved capture")
-    expected_work_plan = build_calibration_work_plan(
-        capture.block.schema,
-        derivation.request,
-    )
+    expected_work_plan = preparation.plan
     if (
         expected_work_plan != derivation.work_plan
         or expected_work_plan.fingerprint != derivation.work_plan_fingerprint
@@ -1590,6 +1914,11 @@ def _validate_source_capture(
         raise ValueError(
             "calibration work plan differs from resolved source and request"
         )
+    validate_calibration_partition_against_source(
+        derivation.diagnostics,
+        derivation.request,
+        preparation.brackets,
+    )
 
 
 def _content_ref_to_tree(reference: ContentRef) -> dict[str, object]:
@@ -1602,53 +1931,72 @@ def _content_ref_from_tree(tree: Any) -> ContentRef:
     return ContentRef(tree["digest"], tree["size"])
 
 
-def _derivation_payload(derivation: _CalibrationDerivation) -> bytes:
+def _derivation_tree(
+    derivation: _CalibrationDerivation,
+    *,
+    request_payload: bytes,
+    work_plan_payload: bytes,
+    diagnostics_payload: bytes,
+) -> dict[str, object]:
     if not isinstance(derivation, _CalibrationDerivation):
         raise TypeError("derivation must be _CalibrationDerivation")
-    return encode(
-        {
-            "schema": _CALIBRATION_DERIVATION_SCHEMA,
-            "request_payload": encode_calibration_analysis_request(
-                derivation.request
-            ),
-            "work_plan_payload": encode_calibration_work_plan(
-                derivation.work_plan
-            ),
-            "diagnostics_payload": encode_calibration_analysis_diagnostics(
-                derivation.diagnostics,
-                resource_policy=derivation.request.resource_policy,
-            ),
-            "source_capture_ref": capture_artifact_ref_to_tree(
-                derivation.source_capture_ref
-            ),
-            "source_capture_run_id": derivation.source_capture_run_id,
-            "source_capture_safety_bundle_id": (
-                derivation.source_capture_safety_bundle_id
-            ),
-            "source_capture_evidence_digest": (
-                derivation.source_capture_evidence_digest
-            ),
-            "source_capture_commit_kind": (
-                derivation.source_capture_commit_kind.value
-            ),
-            "source_capture_commit_id": derivation.source_capture_commit_id,
-            "source_binding_fingerprint": derivation.source_binding_fingerprint,
-            "artifact_fingerprint": derivation.artifact_fingerprint,
-            "request_fingerprint": derivation.request_fingerprint,
-            "work_plan_fingerprint": derivation.work_plan_fingerprint,
-            "diagnostics_digest": derivation.diagnostics_digest,
-            "numeric_backend_digest": derivation.numeric_backend_digest,
-            "analysis_result_digest": derivation.analysis_result_digest,
-            "plan_binding_digest": derivation.plan_binding_digest,
-            "algorithm_id": derivation.algorithm_id,
-            "algorithm_version": derivation.algorithm_version,
-            "analysis_run_id": derivation.analysis_run_id,
-            "analysis_safety_bundle_id": derivation.analysis_safety_bundle_id,
-        }
+    metadata = _derivation_metadata_values(
+        source_capture_ref=derivation.source_capture_ref,
+        source_capture_run_id=derivation.source_capture_run_id,
+        source_capture_safety_bundle_id=derivation.source_capture_safety_bundle_id,
+        source_capture_evidence_digest=derivation.source_capture_evidence_digest,
+        source_capture_commit_kind=derivation.source_capture_commit_kind,
+        source_capture_commit_id=derivation.source_capture_commit_id,
+        source_binding_fingerprint=derivation.source_binding_fingerprint,
+        artifact_fingerprint=derivation.artifact_fingerprint,
+        request_fingerprint=derivation.request_fingerprint,
+        work_plan_fingerprint=derivation.work_plan_fingerprint,
+        diagnostics_digest=derivation.diagnostics_digest,
+        numeric_backend_digest=derivation.numeric_backend_digest,
+        analysis_result_digest=derivation.analysis_result_digest,
+        plan_binding_digest=derivation.plan_binding_digest,
+        algorithm_id=derivation.algorithm_id,
+        algorithm_version=derivation.algorithm_version,
+        analysis_run_id=derivation.analysis_run_id,
+        analysis_safety_bundle_id=derivation.analysis_safety_bundle_id,
+    )
+    return _derivation_envelope_tree(
+        metadata,
+        request_payload=request_payload,
+        work_plan_payload=work_plan_payload,
+        diagnostics_payload=diagnostics_payload,
     )
 
 
-def _derivation_from_payload(payload: bytes) -> _CalibrationDerivation:
+def _derivation_payload(
+    derivation: _CalibrationDerivation,
+    *,
+    request_payload: bytes | None = None,
+    work_plan_payload: bytes | None = None,
+    diagnostics_payload: bytes | None = None,
+) -> bytes:
+    if request_payload is None:
+        request_payload = encode_calibration_analysis_request(derivation.request)
+    if work_plan_payload is None:
+        work_plan_payload = encode_calibration_work_plan(derivation.work_plan)
+    if diagnostics_payload is None:
+        diagnostics_payload = encode_calibration_analysis_diagnostics(
+            derivation.diagnostics,
+            resource_policy=derivation.request.resource_policy,
+        )
+    return encode(
+        _derivation_tree(
+            derivation,
+            request_payload=request_payload,
+            work_plan_payload=work_plan_payload,
+            diagnostics_payload=diagnostics_payload,
+        )
+    )
+
+
+def _derivation_from_payload(
+    payload: bytes,
+) -> tuple[_CalibrationDerivation, bytes, bytes, bytes]:
     fields = {
         "schema",
         "request_payload",
@@ -1719,9 +2067,14 @@ def _derivation_from_payload(payload: bytes) -> _CalibrationDerivation:
         tree["analysis_run_id"],
         tree["analysis_safety_bundle_id"],
     )
-    if _derivation_payload(derivation) != payload:
+    if _derivation_payload(
+        derivation,
+        request_payload=request_payload,
+        work_plan_payload=work_plan_payload,
+        diagnostics_payload=diagnostics_payload,
+    ) != payload:
         raise ValueError("CalibrationDerivation is not canonical")
-    return derivation
+    return derivation, request_payload, work_plan_payload, diagnostics_payload
 
 
 def _manifest_payload(
@@ -1732,42 +2085,34 @@ def _manifest_payload(
     derivation: _CalibrationDerivation,
     resource_summary: CalibrationResourceSummary,
 ) -> bytes:
+    metadata = _derivation_metadata_values(
+        source_capture_ref=derivation.source_capture_ref,
+        source_capture_run_id=derivation.source_capture_run_id,
+        source_capture_safety_bundle_id=derivation.source_capture_safety_bundle_id,
+        source_capture_evidence_digest=derivation.source_capture_evidence_digest,
+        source_capture_commit_kind=derivation.source_capture_commit_kind,
+        source_capture_commit_id=derivation.source_capture_commit_id,
+        source_binding_fingerprint=derivation.source_binding_fingerprint,
+        artifact_fingerprint=derivation.artifact_fingerprint,
+        request_fingerprint=derivation.request_fingerprint,
+        work_plan_fingerprint=derivation.work_plan_fingerprint,
+        diagnostics_digest=derivation.diagnostics_digest,
+        numeric_backend_digest=derivation.numeric_backend_digest,
+        analysis_result_digest=derivation.analysis_result_digest,
+        plan_binding_digest=derivation.plan_binding_digest,
+        algorithm_id=derivation.algorithm_id,
+        algorithm_version=derivation.algorithm_version,
+        analysis_run_id=derivation.analysis_run_id,
+        analysis_safety_bundle_id=derivation.analysis_safety_bundle_id,
+    )
     return encode(
-        {
-            "schema": CALIBRATION_MANIFEST_SCHEMA,
-            "repository_id": repository_id,
-            "artifact_schema": CALIBRATION_ARTIFACT_SCHEMA,
-            "artifact_blob": _content_ref_to_tree(artifact_blob),
-            "derivation_blob": _content_ref_to_tree(derivation_blob),
-            "artifact_fingerprint": derivation.artifact_fingerprint,
-            "source_capture_ref": capture_artifact_ref_to_tree(
-                derivation.source_capture_ref
-            ),
-            "source_capture_run_id": derivation.source_capture_run_id,
-            "source_capture_safety_bundle_id": (
-                derivation.source_capture_safety_bundle_id
-            ),
-            "source_capture_evidence_digest": (
-                derivation.source_capture_evidence_digest
-            ),
-            "source_capture_commit_kind": (
-                derivation.source_capture_commit_kind.value
-            ),
-            "source_capture_commit_id": derivation.source_capture_commit_id,
-            "source_binding_fingerprint": derivation.source_binding_fingerprint,
-            "request_fingerprint": derivation.request_fingerprint,
-            "work_plan_fingerprint": derivation.work_plan_fingerprint,
-            "diagnostics_digest": derivation.diagnostics_digest,
-            "numeric_backend_digest": derivation.numeric_backend_digest,
-            "analysis_result_digest": derivation.analysis_result_digest,
-            "plan_binding_digest": derivation.plan_binding_digest,
-            "algorithm_id": derivation.algorithm_id,
-            "algorithm_version": derivation.algorithm_version,
-            "analysis_run_id": derivation.analysis_run_id,
-            "analysis_safety_bundle_id": derivation.analysis_safety_bundle_id,
-            "evidence_digest": derivation_blob.digest,
-            "resource_summary": _resource_summary_to_tree(resource_summary),
-        }
+        _manifest_tree_from_metadata(
+            repository_id=repository_id,
+            artifact_blob=artifact_blob,
+            derivation_blob=derivation_blob,
+            metadata=metadata,
+            resource_summary=resource_summary,
+        )
     )
 
 

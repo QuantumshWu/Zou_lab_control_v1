@@ -39,16 +39,22 @@ from zlc_neutral_atom.readout import (
     BoxReadoutModel,
     BoxReducer,
     CalibrationAnalysisError,
+    CalibrationAnalysisPlanningAssumption,
     CalibrationAnalysisRequest,
+    CalibrationAnalysisResult,
     CalibrationAnalysisResourcePolicy,
+    CalibrationBracketSamplingAssumption,
     CalibrationWorkPlan,
     CalibrationCaptureLayout,
     CalibrationResourceExceeded,
+    CalibrationParameter,
     CameraCaptureDescriptor,
     CameraEventReadoutSetting,
     GridOrder,
     PerSitePsfReadoutModel,
     PsfAnalysisConfig,
+    ReferenceClassOrientation,
+    ReferenceLabelSource,
     ReadoutBindingKey,
     ReadoutModelKind,
     SiteDetectionPolicy,
@@ -58,6 +64,7 @@ from zlc_neutral_atom.readout import (
     build_calibration_work_plan,
     decode_calibration_artifact,
     encode_calibration_artifact,
+    validate_calibration_analysis_contract,
 )
 from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
 
@@ -77,6 +84,10 @@ def _request(**changes):
     base = CalibrationAnalysisRequest(
         CalibrationCaptureLayout(AxisId("readout-event"), (0, 2), 1),
         (2, 2),
+        ReferenceLabelSource.UNSUPERVISED_REFERENCE_VALLEY,
+        ReferenceClassOrientation.ABOVE_IS_OCCUPIED,
+        CalibrationBracketSamplingAssumption.INDEPENDENT_STATIONARY_BRACKETS,
+        CalibrationAnalysisPlanningAssumption.PRECOMMITTED_BEFORE_SOURCE_INSPECTION,
         box=BoxAnalysisConfig(1, BoxReducer.SUM),
         model_kinds=(
             ReadoutModelKind.UNIFORM_PSF,
@@ -85,8 +96,7 @@ def _request(**changes):
         ),
         default_model_kind=ReadoutModelKind.BOX,
         psf=PsfAnalysisConfig(1, BackgroundMode.NONE, 0),
-        train_fraction=0.6,
-        random_seed=3817,
+        train_fraction=0.35,
         minimum_held_out_class_accuracy_lower_bound=0.60,
     )
     if "model_kinds" in changes and all(
@@ -99,7 +109,7 @@ def _request(**changes):
 def _capture(
     *,
     mapping_seed: int = 4,
-    repeats: int = 10,
+    repeats: int = 24,
     inverted_readout: bool = False,
     mixed_readout_directions: bool = False,
     ambiguous_reference: bool = False,
@@ -279,6 +289,21 @@ def _replace_block(capture, values):
     )
 
 
+def _replace_block_and_validity(capture, values, validity):
+    return SimpleNamespace(
+        **{
+            **capture.__dict__,
+            "block": DataBlock(
+                capture.block.block_id,
+                capture.block.revision,
+                values,
+                ComponentValidity(capture.block.validity.axis_ids, validity),
+                capture.block.schema,
+            ),
+        }
+    )
+
+
 def _mutate_partition_test_only(capture, request):
     brackets = request.layout.brackets(capture.block.schema)
     partition = analysis_impl._freeze_partition(brackets, request)
@@ -298,6 +323,20 @@ def _mutate_partition_test_only(capture, request):
     return _replace_block(capture, values)
 
 
+def _mutate_partition_reference_evidence_only(capture, request):
+    brackets = request.layout.brackets(capture.block.schema)
+    partition = analysis_impl._freeze_partition(brackets, request)
+    values = capture.block.values.copy()
+    repeat_axis = capture.block.schema.repeat_axis.axis_id
+    for bracket_index in partition.reference_evidence_indices:
+        bracket = brackets[bracket_index]
+        repeat = dict(bracket.context_key)[repeat_axis]
+        for _event, row in bracket.reference_point_storage_rows:
+            for x, y in _CENTERS:
+                _paint_spot(values[repeat, row], x, y, 44.0)
+    return _replace_block(capture, values)
+
+
 def _replace_all_reference_images(capture, painter):
     values = capture.block.values.copy()
     schema = capture.block.schema
@@ -314,8 +353,38 @@ def _replace_all_reference_images(capture, painter):
     return _replace_block(capture, values)
 
 
+def _replace_bracket_levels(capture, request, levels):
+    values = capture.block.values.copy()
+    brackets = request.layout.brackets(capture.block.schema)
+    repeat_axis_id = capture.block.schema.repeat_axis.axis_id
+    levels = tuple(levels)
+    assert len(levels) == len(brackets)
+    for bracket, (reference_levels, readout_level) in zip(
+        brackets,
+        levels,
+        strict=True,
+    ):
+        repeat = dict(bracket.context_key)[repeat_axis_id]
+        assert len(reference_levels) == len(bracket.reference_point_storage_rows)
+        for (_event, row), level in zip(
+            bracket.reference_point_storage_rows,
+            reference_levels,
+            strict=True,
+        ):
+            for x, y in _CENTERS:
+                _paint_spot(values[repeat, row], x, y, level)
+        for x, y in _CENTERS:
+            _paint_spot(
+                values[repeat, bracket.readout_point_storage_row],
+                x,
+                y,
+                readout_level,
+            )
+    return _replace_block(capture, values)
+
+
 def test_one_path_builds_all_closed_models_with_shared_map_and_real_quality_evidence():
-    capture = _capture()
+    capture = _capture(invalid_sample=False)
     result = analyze_calibration(capture, _request())
     artifact = result.artifact
 
@@ -332,10 +401,34 @@ def test_one_path_builds_all_closed_models_with_shared_map_and_real_quality_evid
         model.header.site_map_fingerprint == artifact.site_map.fingerprint
         for model in artifact.models
     )
-    assert result.diagnostics.bracket_count == 40
-    assert result.diagnostics.reference_frame_count == 80
+    assert result.diagnostics.bracket_count == 96
+    assert result.diagnostics.train_bracket_count == 33
+    assert result.diagnostics.reference_evidence_bracket_count == 33
+    assert result.diagnostics.test_bracket_count == 30
+    assert result.diagnostics.reference_frame_count == 192
+    parameters = {item.name: item.value for item in artifact.parameters}
+    assert parameters["reference-label-source"] == "UNSUPERVISED_REFERENCE_VALLEY"
+    assert parameters["reference-class-orientation"] == "ABOVE_IS_OCCUPIED"
+    assert parameters["reference-statistical-unit"] == "BRACKET"
+    assert parameters["reference-evidence-assumption"] == (
+        "INDEPENDENT_STATIONARY_BRACKETS_COMPLETE_REFERENCE_FEATURES"
+    )
+    assert parameters["bracket-sampling-assumption"] == (
+        "INDEPENDENT_STATIONARY_BRACKETS"
+    )
+    assert parameters["analysis-planning-assumption"] == (
+        "PRECOMMITTED_BEFORE_SOURCE_INSPECTION"
+    )
+    assert parameters["held-out-family-scope"] == "ARTIFACT_MODEL_SITE"
+    assert parameters["held-out-family-model-count"] == 3
+    assert parameters["held-out-family-hypothesis-count"] == 12
+    assert parameters["reference-evidence-bracket-count"] == 33
     for model in artifact.models:
         usable = model.header.quality.usable_sites.mask
+        model_parameters = {
+            item.name: item.value for item in model.header.parameters
+        }
+        assert model_parameters["reference-evidence-bracket-count"] == 33
         assert np.all(model.header.quality.dark_training_sample_counts[usable] > 0)
         assert np.all(model.header.quality.bright_training_sample_counts[usable] > 0)
         assert np.all(model.header.quality.held_out_fidelity[usable] == 1.0)
@@ -364,12 +457,15 @@ def test_named_brackets_ignore_non_row_major_storage_and_reversed_source_ordinal
 def test_sparse_multiaxis_context_is_preserved_as_independent_brackets():
     result = analyze_calibration(
         _capture(sparse_context=True),
-        _request(minimum_held_out_class_accuracy_lower_bound=0.50),
+        _request(
+            minimum_held_out_class_accuracy_lower_bound=0.50,
+            reference_valley_familywise_error_rate=0.05,
+        ),
     )
-    assert result.diagnostics.bracket_count == 30
-    assert result.artifact.source_binding.bracket_count == 30
-    assert result.diagnostics.consensus_dark_counts == (15, 15, 15, 15)
-    assert result.diagnostics.consensus_bright_counts == (15, 15, 15, 15)
+    assert result.diagnostics.bracket_count == 72
+    assert result.artifact.source_binding.bracket_count == 72
+    assert result.diagnostics.consensus_dark_counts == (36, 36, 36, 36)
+    assert result.diagnostics.consensus_bright_counts == (36, 36, 36, 36)
 
 
 def test_component_invalid_nan_and_reference_disagreement_remove_samples_not_make_dark_labels():
@@ -382,7 +478,8 @@ def test_component_invalid_nan_and_reference_disagreement_remove_samples_not_mak
         + clean.diagnostics.consensus_dark_counts[0]
         - 1
     )
-    # The invalid NaN readout is excluded; every admitted count/fidelity remains real.
+    # Invalid short-readout evidence is an adverse class failure whenever it
+    # lands in heldout; it is never converted to a dark label or a NaN score.
     box = ambiguous.artifact.select_model(kind=ReadoutModelKind.BOX)
     assert box.header.quality.usable_sites.mask[0]
     assert box.header.quality.held_out_validity.mask[0]
@@ -394,14 +491,14 @@ def test_reference_events_are_classified_on_their_own_declared_scale_before_cons
         _capture(reference_scale_mismatch=True),
         _request(model_kinds=(ReadoutModelKind.BOX,), default_model_kind=ReadoutModelKind.BOX),
     )
-    assert result.diagnostics.consensus_dark_counts == (20, 20, 20, 20)
-    assert result.diagnostics.consensus_bright_counts == (20, 20, 20, 20)
+    assert result.diagnostics.consensus_dark_counts == (48, 48, 48, 48)
+    assert result.diagnostics.consensus_bright_counts == (48, 48, 48, 48)
     assert np.all(result.artifact.select_model().header.quality.usable_sites.mask)
 
 
 def test_inverted_readout_direction_is_explicit_per_site():
     result = analyze_calibration(
-        _capture(inverted_readout=True),
+        _capture(inverted_readout=True, invalid_sample=False),
         _request(model_kinds=(ReadoutModelKind.BOX,), default_model_kind=ReadoutModelKind.BOX),
     )
     model = result.artifact.select_model()
@@ -432,7 +529,7 @@ def test_low_quality_site_uses_domain_canonical_fillers_in_every_closed_model():
         assert quality.dark_training_sample_counts[0] > 0
         assert quality.bright_training_sample_counts[0] > 0
         assert quality.held_out_validity.mask[0]
-        assert quality.held_out_fidelity[0] < 0.5
+        assert quality.held_out_fidelity[0] < 0.6
         assert min(
             quality.held_out_dark_accuracy_lower_bounds[0],
             quality.held_out_bright_accuracy_lower_bounds[0],
@@ -455,12 +552,450 @@ def test_missing_class_or_heldout_evidence_fails_closed_instead_of_admitting_fil
         )
     with pytest.raises(
         (CalibrationAnalysisError, CalibrationResourceExceeded),
-        match="samples per class|prominence|admitted",
+        match="samples per class|populate train|prominence|admitted",
     ):
         analyze_calibration(
             _capture(repeats=1, context_count=2, invalid_sample=False),
             _request(model_kinds=(ReadoutModelKind.BOX,), default_model_kind=ReadoutModelKind.BOX),
         )
+
+
+def test_reference_valley_uses_independent_proposal_and_exact_evidence():
+    separated = np.array(
+        (-1.4, -1.3, -1.2, -1.1, -1.0, -0.9, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4)
+    )
+    proposal = analysis_impl._reference_threshold_proposal(separated, 4, 2.0)
+    assert proposal is not None
+    assert -0.9 < proposal.threshold < 0.9
+
+    evidence = np.repeat((-1.1, 1.1), 20)
+    valley = analysis_impl._reference_valley_evidence(evidence, proposal)
+    assert valley.middle_count == 0
+    assert valley.outside_count == 0
+    assert valley.valley_pvalue == pytest.approx(2.0**-20)
+
+    transformed = 17.0 + 9.0 * separated
+    transformed_proposal = analysis_impl._reference_threshold_proposal(
+        np.concatenate((transformed, (np.nan,))),
+        4,
+        2.0,
+    )
+    assert transformed_proposal is not None
+    assert transformed_proposal.threshold == pytest.approx(
+        17.0 + 9.0 * proposal.threshold
+    )
+    transformed_valley = analysis_impl._reference_valley_evidence(
+        17.0 + 9.0 * evidence,
+        transformed_proposal,
+    )
+    assert transformed_valley == valley
+
+
+def test_reference_valley_rejects_continuous_middle_mass():
+    proposal = analysis_impl._reference_threshold_proposal(
+        np.repeat((-1.0, 1.0), 12),
+        4,
+        2.0,
+    )
+    assert proposal is not None
+    evidence = np.concatenate(
+        (np.repeat(-1.0, 5), np.repeat(0.0, 20), np.repeat(1.0, 5))
+    )
+    valley = analysis_impl._reference_valley_evidence(evidence, proposal)
+    assert valley.valley_pvalue > 0.5
+
+
+def test_reference_valley_treats_evidence_only_third_population_as_adverse():
+    proposal = analysis_impl._reference_threshold_proposal(
+        np.repeat((-1.0, 1.0), 20),
+        4,
+        2.0,
+    )
+    assert proposal is not None
+    evidence = np.concatenate(
+        (np.repeat(-1.0, 20), np.repeat(1.0, 20), np.repeat(10.0, 100))
+    )
+    valley = analysis_impl._reference_valley_evidence(evidence, proposal)
+    assert valley.outside_count == 100
+    assert valley.valley_pvalue > 0.99
+
+
+def test_reference_valley_rejects_standard_single_mode_families():
+    proposal = analysis_impl._reference_threshold_proposal(
+        np.repeat((-1.0, 1.0), 30),
+        4,
+        2.0,
+    )
+    assert proposal is not None
+    rng = np.random.default_rng(123)
+    distributions = {
+        "normal": rng.normal(0.0, 0.7, 400),
+        "uniform": rng.uniform(-1.5, 1.5, 400),
+        "exponential": rng.exponential(0.5, 400) - 0.5,
+        "lognormal": rng.lognormal(0.0, 0.4, 400) - math.exp(0.08),
+    }
+    for name, evidence in distributions.items():
+        valley = analysis_impl._reference_valley_evidence(evidence, proposal)
+        assert valley.valley_pvalue > 0.05, name
+
+
+def test_full_pipeline_rejects_one_class_common_mode_drift():
+    request = _request(
+        model_kinds=(ReadoutModelKind.BOX,),
+        default_model_kind=ReadoutModelKind.BOX,
+        minimum_reference_cluster_separation_rss=1.0,
+        reference_valley_familywise_error_rate=0.05,
+    )
+    capture = _capture(one_class=True, invalid_sample=False)
+    bracket_count = len(request.layout.brackets(capture.block.schema))
+    rng = np.random.default_rng(3)
+    drift = rng.uniform(-1.0, 1.0, size=bracket_count)
+    mutated = _replace_bracket_levels(
+        capture,
+        request,
+        (
+            ((80.0 + 20.0 * value,) * 2, 30.0 + 7.5 * value)
+            for value in drift
+        ),
+    )
+    with pytest.raises(CalibrationAnalysisError, match="admitted 0/4"):
+        analyze_calibration(mutated, request)
+
+
+def test_full_pipeline_rejects_three_level_reference_and_readout_state():
+    request = _request(
+        model_kinds=(ReadoutModelKind.BOX,),
+        default_model_kind=ReadoutModelKind.BOX,
+        reference_valley_familywise_error_rate=0.05,
+    )
+    capture = _capture(invalid_sample=False)
+    bracket_count = len(request.layout.brackets(capture.block.schema))
+    reference_levels = (8.0, 44.0, 80.0)
+    readout_levels = (3.0, 16.0, 30.0)
+    mutated = _replace_bracket_levels(
+        capture,
+        request,
+        (
+            (
+                (reference_levels[index % 3],) * 2,
+                readout_levels[index % 3],
+            )
+            for index in range(bracket_count)
+        ),
+    )
+    with pytest.raises(CalibrationAnalysisError, match="admitted 0/4"):
+        analyze_calibration(mutated, request)
+
+
+def test_full_pipeline_requires_every_reference_event_to_pass_the_valley_gate():
+    request = _request(
+        model_kinds=(ReadoutModelKind.BOX,),
+        default_model_kind=ReadoutModelKind.BOX,
+        reference_valley_familywise_error_rate=0.05,
+    )
+    capture = _capture(invalid_sample=False)
+    bracket_count = len(request.layout.brackets(capture.block.schema))
+    mutated = _replace_bracket_levels(
+        capture,
+        request,
+        (
+            (
+                ((8.0 if index % 2 == 0 else 80.0), 44.0),
+                (3.0 if index % 2 == 0 else 30.0),
+            )
+            for index in range(bracket_count)
+        ),
+    )
+    with pytest.raises(CalibrationAnalysisError, match="admitted 0/4"):
+        analyze_calibration(mutated, request)
+
+
+def test_selectively_invalid_reference_middle_mass_remains_adverse_full_pipeline(
+    monkeypatch,
+):
+    request = _request(
+        model_kinds=(ReadoutModelKind.BOX,),
+        default_model_kind=ReadoutModelKind.BOX,
+        usable_site_acceptance=UsableSiteAcceptance.MINIMUM_FRACTION,
+        minimum_usable_site_fraction=0.75,
+        reference_valley_familywise_error_rate=0.05,
+    )
+    capture = _capture(invalid_sample=False)
+    brackets = request.layout.brackets(capture.block.schema)
+    partition = analysis_impl._freeze_partition(brackets, request)
+    train_positions = {index: position for position, index in enumerate(partition.train_indices)}
+    evidence_positions = {
+        index: position
+        for position, index in enumerate(partition.reference_evidence_indices)
+    }
+
+    def levels(index):
+        if index in train_positions:
+            level = 8.0 if train_positions[index] % 2 == 0 else 80.0
+        elif index in evidence_positions:
+            level = (8.0, 44.0, 80.0)[evidence_positions[index] % 3]
+        else:
+            level = 8.0 if index % 2 == 0 else 80.0
+        return (level, level), (3.0 if level < 44.0 else 30.0)
+
+    complete = _replace_bracket_levels(
+        capture,
+        request,
+        (levels(index) for index in range(len(brackets))),
+    )
+    with pytest.raises(CalibrationAnalysisError, match="admitted 0/4"):
+        analyze_calibration(complete, request)
+
+    values = complete.block.values.copy()
+    validity = complete.block.validity.mask.copy()
+    repeat_axis_id = complete.block.schema.repeat_axis.axis_id
+    for bracket_index, position in evidence_positions.items():
+        if position % 3 != 1:
+            continue
+        bracket = brackets[bracket_index]
+        repeat = dict(bracket.context_key)[repeat_axis_id]
+        for _event, row in bracket.reference_point_storage_rows:
+            for x, y in _CENTERS:
+                validity[repeat, row, y - 1 : y + 2, x - 1 : x + 2] = False
+    selectively_invalid = _replace_block_and_validity(complete, values, validity)
+    recorded = []
+    original = analysis_impl._learn_reference_thresholds
+
+    def capture_diagnostics(*args, **kwargs):
+        result = original(*args, **kwargs)
+        recorded.extend(result[2])
+        return result
+
+    monkeypatch.setattr(
+        analysis_impl,
+        "_learn_reference_thresholds",
+        capture_diagnostics,
+    )
+    with pytest.raises(CalibrationAnalysisError, match="admitted 0/4"):
+        analyze_calibration(selectively_invalid, request)
+    assert recorded
+    assert all(
+        item.evidence.sample_count == len(partition.reference_evidence_indices)
+        for item in recorded
+    )
+    assert all(item.evidence.invalid_count > 0 for item in recorded)
+
+
+def test_selectively_invalid_third_reference_cluster_cannot_remove_nested_rejection():
+    request = _request(
+        model_kinds=(ReadoutModelKind.BOX,),
+        default_model_kind=ReadoutModelKind.BOX,
+        reference_valley_familywise_error_rate=0.05,
+    )
+    capture = _capture(invalid_sample=False)
+    brackets = request.layout.brackets(capture.block.schema)
+    levels = (8.0, 44.0, 80.0)
+    mutated = _replace_bracket_levels(
+        capture,
+        request,
+        (
+            ((levels[index % 3],) * 2, (3.0, 16.0, 30.0)[index % 3])
+            for index in range(len(brackets))
+        ),
+    )
+    partition = analysis_impl._freeze_partition(brackets, request)
+    validity = mutated.block.validity.mask.copy()
+    repeat_axis_id = mutated.block.schema.repeat_axis.axis_id
+    for bracket_index in partition.reference_evidence_indices:
+        if bracket_index % 3 != 2:
+            continue
+        bracket = brackets[bracket_index]
+        repeat = dict(bracket.context_key)[repeat_axis_id]
+        for _event, row in bracket.reference_point_storage_rows:
+            for x, y in _CENTERS:
+                validity[repeat, row, y - 1 : y + 2, x - 1 : x + 2] = False
+    selectively_invalid = _replace_block_and_validity(
+        mutated,
+        mutated.block.values.copy(),
+        validity,
+    )
+    with pytest.raises(CalibrationAnalysisError, match="admitted 0/4"):
+        analyze_calibration(selectively_invalid, request)
+
+
+def test_selectively_invalid_heldout_misclassifications_remain_class_failures():
+    request = _request(
+        model_kinds=(ReadoutModelKind.BOX,),
+        default_model_kind=ReadoutModelKind.BOX,
+        usable_site_acceptance=UsableSiteAcceptance.MINIMUM_FRACTION,
+        minimum_usable_site_fraction=0.75,
+    )
+    capture = _capture(invalid_sample=False)
+    brackets = request.layout.brackets(capture.block.schema)
+    partition = analysis_impl._freeze_partition(brackets, request)
+    repeat_axis_id = capture.block.schema.repeat_axis.axis_id
+    values = capture.block.values.copy()
+    for bracket_index in partition.test_indices:
+        bracket = brackets[bracket_index]
+        repeat = dict(bracket.context_key)[repeat_axis_id]
+        x, y = _CENTERS[0]
+        reference_row = bracket.reference_point_storage_rows[0][1]
+        occupied = values[repeat, reference_row, y, x] > 40.0
+        _paint_spot(
+            values[repeat, bracket.readout_point_storage_row],
+            x,
+            y,
+            3.0 if occupied else 30.0,
+        )
+    wrong = _replace_block(capture, values)
+    wrong_quality = analyze_calibration(wrong, request).artifact.select_model().header.quality
+    assert wrong_quality.usable_sites.mask.tolist() == [False, True, True, True]
+
+    validity = wrong.block.validity.mask.copy()
+    x, y = _CENTERS[0]
+    for bracket_index in partition.test_indices:
+        bracket = brackets[bracket_index]
+        repeat = dict(bracket.context_key)[repeat_axis_id]
+        validity[
+            repeat,
+            bracket.readout_point_storage_row,
+            y - 1 : y + 2,
+            x - 1 : x + 2,
+        ] = False
+    masked = _replace_block_and_validity(wrong, wrong.block.values.copy(), validity)
+    masked_quality = (
+        analyze_calibration(masked, request).artifact.select_model().header.quality
+    )
+    assert masked_quality.usable_sites.mask.tolist() == [False, True, True, True]
+    for name in (
+        "held_out_dark_success_counts",
+        "held_out_dark_total_counts",
+        "held_out_dark_labeled_counts",
+        "held_out_bright_success_counts",
+        "held_out_bright_total_counts",
+        "held_out_bright_labeled_counts",
+    ):
+        assert np.array_equal(getattr(masked_quality, name), getattr(wrong_quality, name))
+
+
+def test_reference_valley_accepts_quantized_two_level_statistical_evidence_only():
+    values = np.repeat((-3.0, 4.0), 12)
+    proposal = analysis_impl._reference_threshold_proposal(values, 4, 2.0)
+    assert proposal is not None
+    assert proposal.threshold == 0.5
+    assert proposal.cluster_separation_rss == math.inf
+    assert (
+        _request().reference_label_source
+        is ReferenceLabelSource.UNSUPERVISED_REFERENCE_VALLEY
+    )
+
+
+def test_holm_step_down_is_deterministic_for_order_and_ties():
+    pvalues = np.array((0.002, 0.002, 0.02, 0.8))
+    expected = np.array((True, True, False, False))
+    assert np.array_equal(analysis_impl._holm_rejections(pvalues, 0.01), expected)
+    order = np.array((2, 0, 3, 1))
+    permuted = analysis_impl._holm_rejections(pvalues[order], 0.01)
+    restored = np.zeros_like(permuted)
+    restored[order] = permuted
+    assert np.array_equal(restored, expected)
+
+
+def test_held_out_holm_controls_one_artifact_model_site_family():
+    pvalues = np.full((2, 2), 0.02, dtype=np.float64)
+    assert np.all(
+        analysis_impl._holm_rejections(pvalues[0], 0.05)
+    )
+    assert np.all(
+        analysis_impl._holm_rejections(pvalues[1], 0.05)
+    )
+    assert not np.any(
+        analysis_impl._artifact_wide_held_out_rejections(pvalues, 0.05)
+    )
+
+
+def test_full_pipeline_rejects_models_that_only_pass_separate_holm_families():
+    with pytest.raises(CalibrationAnalysisError, match="admitted 0/4"):
+        analyze_calibration(
+            _capture(repeats=22, invalid_sample=False),
+            _request(),
+        )
+
+
+def test_result_replay_rejects_per_model_holm_evidence_after_model_shopping():
+    result = analyze_calibration(_capture(invalid_sample=False), _request())
+    site_count = result.artifact.site_map.site_axis.size
+    success_count = 14
+    total_count = 15
+    lower = analysis_impl._one_sided_clopper_pearson_lower_bound(
+        success_count,
+        total_count,
+        0.95,
+    )
+    fidelity = success_count / total_count
+    forged_models = []
+    forged_diagnostics = []
+    for model, diagnostic in zip(
+        result.artifact.models,
+        result.diagnostics.models,
+        strict=True,
+    ):
+        quality = model.header.quality
+        counts = np.full(site_count, total_count, dtype="<u8")
+        successes = np.full(site_count, success_count, dtype="<u8")
+        lower_bounds = np.full(site_count, lower, dtype="<f8")
+        fidelities = np.full(site_count, fidelity, dtype="<f8")
+        forged_quality = replace(
+            quality,
+            held_out_dark_success_counts=successes,
+            held_out_dark_total_counts=counts,
+            held_out_dark_labeled_counts=counts,
+            held_out_bright_success_counts=successes,
+            held_out_bright_total_counts=counts,
+            held_out_bright_labeled_counts=counts,
+            held_out_dark_accuracy_lower_bounds=lower_bounds,
+            held_out_bright_accuracy_lower_bounds=lower_bounds,
+            held_out_fidelity=fidelities,
+        )
+        forged_models.append(
+            replace(model, header=replace(model.header, quality=forged_quality))
+        )
+        forged_diagnostics.append(
+            replace(
+                diagnostic,
+                minimum_fidelity=fidelity,
+                mean_fidelity=fidelity,
+                minimum_class_accuracy_lower_bound=lower,
+                mean_class_accuracy_lower_bound=lower,
+            )
+        )
+
+    with pytest.raises(ValueError, match="artifact-wide familywise evidence"):
+        CalibrationAnalysisResult(
+            replace(result.artifact, models=tuple(forged_models)),
+            replace(result.diagnostics, models=tuple(forged_diagnostics)),
+        )
+
+
+def test_reference_split_policy_is_fingerprinted_and_round_trips_current_only():
+    from zlc_neutral_atom.readout.analysis_codec import (
+        decode_calibration_analysis_request,
+        encode_calibration_analysis_request,
+    )
+
+    request = replace(
+        _request(),
+        minimum_reference_cluster_separation_rss=2.75,
+        reference_valley_familywise_error_rate=0.025,
+        reference_evidence_fraction=0.30,
+    )
+    decoded = decode_calibration_analysis_request(
+        encode_calibration_analysis_request(request)
+    )
+    assert decoded == request
+    assert decoded.fingerprint == request.fingerprint
+    assert decoded.minimum_reference_cluster_separation_rss == 2.75
+    assert decoded.reference_valley_familywise_error_rate == 0.025
+    assert decoded.reference_evidence_fraction == 0.30
+    assert (
+        decoded.reference_label_source
+        is ReferenceLabelSource.UNSUPERVISED_REFERENCE_VALLEY
+    )
 
 
 def test_same_request_is_byte_deterministic_and_declared_order_is_canonical():
@@ -479,6 +1014,156 @@ def test_same_request_is_byte_deterministic_and_declared_order_is_canonical():
     assert _request().fingerprint == reordered.fingerprint
     decoded = decode_calibration_artifact(encode_calibration_artifact(first.artifact))
     assert decoded.fingerprint == first.artifact.fingerprint
+
+
+def test_repository_contract_rejects_coordinated_request_and_geometry_drift():
+    capture = _capture(invalid_sample=False)
+    request = _request()
+    result = analyze_calibration(capture, request)
+    plan = build_calibration_work_plan(capture, request)
+    brackets = request.layout.brackets(capture.block.schema)
+    assert (
+        validate_calibration_analysis_contract(
+            result,
+            request,
+            plan,
+            source_brackets=brackets,
+        )
+        is result
+    )
+
+    def changed_parameters(parameters, name, value):
+        return tuple(
+            CalibrationParameter(item.name, value if item.name == name else item.value)
+            for item in parameters
+        )
+
+    artifact_parameter_drifts = (
+        ("grid-rows", 99),
+        ("reference-class-orientation", "BELOW_IS_OCCUPIED"),
+        ("reference-valley-familywise-error-rate", 0.25),
+    )
+    for name, value in artifact_parameter_drifts:
+        artifact = replace(
+            result.artifact,
+            parameters=changed_parameters(result.artifact.parameters, name, value),
+        )
+        forged = CalibrationAnalysisResult(artifact, result.diagnostics)
+        with pytest.raises(ValueError, match="parameters differ"):
+            validate_calibration_analysis_contract(forged, request, plan)
+
+    sampling_drift = replace(
+        result.artifact,
+        parameters=changed_parameters(
+            result.artifact.parameters,
+            "bracket-sampling-assumption",
+            "UNDECLARED_CONTEXT_MIXTURE",
+        ),
+    )
+    with pytest.raises(ValueError, match="bracket-sampling-assumption differs"):
+        CalibrationAnalysisResult(sampling_drift, result.diagnostics)
+
+    for name, value in (
+        ("analysis-planning-assumption", "POST_HOC_MODEL_SHOPPING"),
+        ("held-out-family-scope", "PER_MODEL"),
+        ("held-out-family-model-count", 1),
+        ("held-out-family-hypothesis-count", request.site_count),
+    ):
+        coordinated_models = tuple(
+            replace(
+                model,
+                header=replace(
+                    model.header,
+                    parameters=changed_parameters(
+                        model.header.parameters,
+                        name,
+                        value,
+                    ),
+                ),
+            )
+            for model in result.artifact.models
+        )
+        coordinated_artifact = replace(
+            result.artifact,
+            models=coordinated_models,
+            parameters=changed_parameters(result.artifact.parameters, name, value),
+        )
+        with pytest.raises(ValueError, match="artifact analysis parameter"):
+            CalibrationAnalysisResult(coordinated_artifact, result.diagnostics)
+
+    box_result = analyze_calibration(
+        capture,
+        _request(
+            model_kinds=(ReadoutModelKind.BOX,),
+            default_model_kind=ReadoutModelKind.BOX,
+        ),
+    )
+    box_model = box_result.artifact.models[0]
+    bool_count_artifact = replace(
+        box_result.artifact,
+        models=(
+            replace(
+                box_model,
+                header=replace(
+                    box_model.header,
+                    parameters=changed_parameters(
+                        box_model.header.parameters,
+                        "held-out-family-model-count",
+                        True,
+                    ),
+                ),
+            ),
+        ),
+        parameters=changed_parameters(
+            box_result.artifact.parameters,
+            "held-out-family-model-count",
+            True,
+        ),
+    )
+    with pytest.raises(ValueError, match="artifact analysis parameter"):
+        CalibrationAnalysisResult(bool_count_artifact, box_result.diagnostics)
+
+    box_index = next(
+        index
+        for index, model in enumerate(result.artifact.models)
+        if isinstance(model, BoxReadoutModel)
+    )
+    box_model = result.artifact.models[box_index]
+    changed_header = replace(
+        box_model.header,
+        parameters=changed_parameters(
+            box_model.header.parameters,
+            "minimum-train-samples-per-class",
+            999,
+        ),
+    )
+    changed_model = replace(box_model, header=changed_header)
+    models = list(result.artifact.models)
+    models[box_index] = changed_model
+    with pytest.raises(ValueError, match="inconsistent calibration gate policies"):
+        CalibrationAnalysisResult(
+            replace(result.artifact, models=tuple(models)),
+            result.diagnostics,
+        )
+
+    models = list(result.artifact.models)
+    shifted_boxes = box_model.boxes_xywh.copy()
+    shifted_boxes[:, 0] -= 1
+    models[box_index] = replace(box_model, boxes_xywh=shifted_boxes)
+    forged = CalibrationAnalysisResult(
+        replace(result.artifact, models=tuple(models)),
+        result.diagnostics,
+    )
+    with pytest.raises(ValueError, match="extraction geometry differs"):
+        validate_calibration_analysis_contract(forged, request, plan)
+
+    models[box_index] = replace(box_model, reducer=BoxReducer.MEAN)
+    forged = CalibrationAnalysisResult(
+        replace(result.artifact, models=tuple(models)),
+        result.diagnostics,
+    )
+    with pytest.raises(ValueError, match="BOX reducer differs"):
+        validate_calibration_analysis_contract(forged, request, plan)
 
 
 def test_explicit_no_default_policy_keeps_multi_model_selection_fail_closed():
@@ -522,8 +1207,8 @@ def test_missing_typed_cell_address_and_resource_overruns_are_rejected_before_an
             _request(resource_policy=pixel_policy),
         )
 
-    # These bounds exceed the old single-reference-pass estimate but not the
-    # actual train-template + train-threshold + all-label streaming passes.
+    # Every proposal/evidence/model pass and exact-test work unit is admitted
+    # before layout resolution or detector allocation.
     with pytest.raises(CalibrationResourceExceeded, match="signal-evaluation"):
         analyze_calibration(
             _capture(),
@@ -542,6 +1227,42 @@ def test_missing_typed_cell_address_and_resource_overruns_are_rejected_before_an
                 )
             ),
         )
+    with pytest.raises(CalibrationResourceExceeded, match="modality"):
+        analyze_calibration(
+            _capture(),
+            _request(
+                resource_policy=CalibrationAnalysisResourcePolicy(
+                    max_modality_test_work_units=1,
+                )
+            ),
+        )
+    with pytest.raises(CalibrationResourceExceeded, match="diagnostics"):
+        analyze_calibration(
+            _capture(),
+            _request(
+                resource_policy=CalibrationAnalysisResourcePolicy(
+                    max_reference_valley_diagnostics=1,
+                )
+            ),
+        )
+
+
+def test_preflight_rejects_an_evidence_partition_that_cannot_pass_holm():
+    capture = _capture(repeats=10, invalid_sample=False)
+    with pytest.raises(CalibrationResourceExceeded, match="cannot possibly pass"):
+        build_calibration_work_plan(capture, _request())
+
+
+def test_preflight_accounts_for_every_persisted_model_site_hypothesis():
+    capture = _capture(repeats=60, context_count=1, invalid_sample=False)
+    one_model = _request(
+        model_kinds=(ReadoutModelKind.BOX,),
+        default_model_kind=ReadoutModelKind.BOX,
+    )
+    build_calibration_work_plan(capture, one_model)
+
+    with pytest.raises(CalibrationResourceExceeded, match="held-out familywise"):
+        build_calibration_work_plan(capture, _request())
 
 
 def test_box_only_analysis_has_canonical_absent_psf_configuration():
@@ -563,6 +1284,10 @@ def test_request_rejects_implicit_model_or_background_ambiguity():
         CalibrationAnalysisRequest(
             _request().layout,
             (2, 2),
+            ReferenceLabelSource.UNSUPERVISED_REFERENCE_VALLEY,
+            ReferenceClassOrientation.ABOVE_IS_OCCUPIED,
+            CalibrationBracketSamplingAssumption.INDEPENDENT_STATIONARY_BRACKETS,
+            CalibrationAnalysisPlanningAssumption.PRECOMMITTED_BEFORE_SOURCE_INSPECTION,
             model_kinds=(ReadoutModelKind.BOX,),
             default_model_kind=ReadoutModelKind.UNIFORM_PSF,
         )
@@ -572,23 +1297,33 @@ def test_request_rejects_implicit_model_or_background_ambiguity():
         CalibrationAnalysisRequest(
             _request().layout,
             (2, 2),
+            ReferenceLabelSource.UNSUPERVISED_REFERENCE_VALLEY,
+            ReferenceClassOrientation.ABOVE_IS_OCCUPIED,
+            CalibrationBracketSamplingAssumption.INDEPENDENT_STATIONARY_BRACKETS,
+            CalibrationAnalysisPlanningAssumption.PRECOMMITTED_BEFORE_SOURCE_INSPECTION,
             model_kinds=(ReadoutModelKind.BOX,),
             psf=PsfAnalysisConfig(),
         )
-    with pytest.raises(ValueError, match="unsigned 64-bit"):
-        replace(_request(), random_seed=1 << 64)
+    with pytest.raises(ValueError, match="cluster_separation_rss must be positive"):
+        replace(_request(), minimum_reference_cluster_separation_rss=0.0)
+    with pytest.raises(ValueError, match="familywise_error_rate must be finite"):
+        replace(_request(), reference_valley_familywise_error_rate=float("nan"))
+    with pytest.raises(ValueError, match="must be below one"):
+        replace(_request(), reference_evidence_fraction=0.70)
 
 
 def test_frozen_test_partition_cannot_influence_any_learned_parameter(monkeypatch):
     """Held-out frames may change evidence, never the learned calibration state."""
 
     learned_reference_splits = []
+    learned_reference_diagnostics = []
     original = analysis_impl._learn_reference_thresholds
 
     def record_reference_split(*args, **kwargs):
-        thresholds, validity = original(*args, **kwargs)
+        thresholds, validity, diagnostics = original(*args, **kwargs)
         learned_reference_splits.append((thresholds.copy(), validity.copy()))
-        return thresholds, validity
+        learned_reference_diagnostics.append(diagnostics)
+        return thresholds, validity, diagnostics
 
     monkeypatch.setattr(
         analysis_impl,
@@ -609,9 +1344,12 @@ def test_frozen_test_partition_cannot_influence_any_learned_parameter(monkeypatc
         learned_reference_splits[0][1],
         learned_reference_splits[1][1],
     )
+    assert learned_reference_diagnostics[0] == learned_reference_diagnostics[1]
     assert baseline.diagnostics.partition_digest == mutated.diagnostics.partition_digest
     assert baseline.diagnostics.train_bracket_count == mutated.diagnostics.train_bracket_count
     assert baseline.diagnostics.test_bracket_count == mutated.diagnostics.test_bracket_count
+
+
     assert baseline.artifact.site_map.fingerprint == mutated.artifact.site_map.fingerprint
     assert np.array_equal(
         baseline.artifact.site_map.coordinates_xy,
@@ -649,6 +1387,41 @@ def test_frozen_test_partition_cannot_influence_any_learned_parameter(monkeypatc
         else:
             assert first.reducer is second.reducer
         assert np.array_equal(first.boxes_xywh, second.boxes_xywh)
+
+
+def test_reference_evidence_can_reject_but_cannot_relearn_sites_or_proposals(
+    monkeypatch,
+):
+    request = _request(
+        model_kinds=(ReadoutModelKind.BOX,),
+        default_model_kind=ReadoutModelKind.BOX,
+    )
+    capture = _capture(invalid_sample=False)
+    proposals = []
+    detected_sites = []
+    original_learn = analysis_impl._learn_reference_thresholds
+    original_detect = analysis_impl._detect_sites
+
+    def record_learn(*args, **kwargs):
+        result = original_learn(*args, **kwargs)
+        proposals.append(tuple(item.proposal_threshold for item in result[2]))
+        return result
+
+    def record_detect(*args, **kwargs):
+        result = original_detect(*args, **kwargs)
+        detected_sites.append(result.coordinates_xy.copy())
+        return result
+
+    monkeypatch.setattr(analysis_impl, "_learn_reference_thresholds", record_learn)
+    monkeypatch.setattr(analysis_impl, "_detect_sites", record_detect)
+    analyze_calibration(capture, request)
+    with pytest.raises(CalibrationAnalysisError, match="admitted 0/4"):
+        analyze_calibration(
+            _mutate_partition_reference_evidence_only(capture, request),
+            request,
+        )
+    assert proposals[0] == proposals[1]
+    assert np.array_equal(detected_sites[0], detected_sites[1])
 
 
 def test_site_detector_rejects_one_plateau_instead_of_manufacturing_a_grid():
@@ -744,7 +1517,7 @@ def test_resource_preflight_precedes_layout_and_layout_is_resolved_exactly_once(
     assert axis_index_calls == []
 
     result = analyze_calibration(capture, _request())
-    assert result.diagnostics.bracket_count == 40
+    assert result.diagnostics.bracket_count == 96
     assert len(bracket_calls) == 1
     assert len(layout_scan_calls) == 1
     assert axis_index_calls == []
@@ -777,10 +1550,13 @@ def test_analysis_routes_reference_and_every_model_through_shared_feature_owner(
 def test_frozen_work_plan_accounts_every_streaming_pass_and_dense_phase():
     capture = _capture(invalid_sample=False)
     request = _request()
-    plan = build_calibration_work_plan(capture.block.schema, request)
+    plan = build_calibration_work_plan(capture, request)
 
     assert isinstance(plan, CalibrationWorkPlan)
-    assert plan.full_frame_read_count == 296
+    assert plan.full_frame_read_count == 678
+    assert plan.reference_evidence_bracket_upper_bound == 33
+    assert plan.reference_valley_diagnostic_count == 8
+    assert plan.modality_test_work_units > 0
     assert plan.planned_kernel_elements == 45
     assert plan.assignment_scratch_bytes == 64 * request.site_count**2
     assert plan.dense_assignment_work_units == 10 * request.site_count**3
@@ -791,7 +1567,7 @@ def test_frozen_work_plan_accounts_every_streaming_pass_and_dense_phase():
         plan.psf_working_bytes + plan.feature_working_bytes
     )
     assert len(plan.fingerprint) == 64
-    assert plan == build_calibration_work_plan(capture.block.schema, request)
+    assert plan == build_calibration_work_plan(capture, request)
     with pytest.raises(AttributeError):
         plan.full_frame_read_count = 0
 
@@ -800,12 +1576,15 @@ def test_resource_rejection_precedes_layout_detector_assignment_and_templates(mo
     capture = _capture(invalid_sample=False)
     kernel_heavy = _request(
         grid_shape_yx=(40, 50),
+        reference_valley_familywise_error_rate=0.99,
+        minimum_held_out_class_accuracy_lower_bound=0.0,
         model_kinds=(ReadoutModelKind.PER_SITE_PSF,),
         default_model_kind=ReadoutModelKind.PER_SITE_PSF,
         psf=PsfAnalysisConfig(50, BackgroundMode.NONE, 0),
     )
     dense_heavy = _request(
         grid_shape_yx=(8, 8),
+        minimum_held_out_class_accuracy_lower_bound=0.0,
         model_kinds=(ReadoutModelKind.BOX,),
         default_model_kind=ReadoutModelKind.BOX,
         resource_policy=CalibrationAnalysisResourcePolicy(
@@ -831,7 +1610,7 @@ def test_resource_rejection_precedes_layout_detector_assignment_and_templates(mo
 def test_analysis_borrows_every_frame_without_constructing_a_value_snapshot(monkeypatch):
     capture = _capture(invalid_sample=False)
     request = _request()
-    plan = build_calibration_work_plan(capture.block.schema, request)
+    plan = build_calibration_work_plan(capture, request)
     borrowed = 0
     original = analysis_impl._FrameAccessor.arrays
 
@@ -1166,8 +1945,21 @@ def test_clopper_pearson_gate_uses_per_class_evidence_and_defaults_to_all_sites(
 
     with pytest.raises(CalibrationAnalysisError, match="requires at least 4"):
         analyze_calibration(_capture(bad_readout_site=0), _request())
+
+    capture = _capture(invalid_sample=False)
+    request = _request()
+    brackets = request.layout.brackets(capture.block.schema)
+    partition = analysis_impl._freeze_partition(brackets, request)
+    values = capture.block.values.copy()
+    repeat_axis = capture.block.schema.repeat_axis.axis_id
+    for bracket_index in partition.test_indices:
+        bracket = brackets[bracket_index]
+        repeat = dict(bracket.context_key)[repeat_axis]
+        frame = values[repeat, bracket.readout_point_storage_row]
+        for x, y in _CENTERS:
+            _paint_spot(frame, x, y, 16.0)
     with pytest.raises(CalibrationAnalysisError, match="admitted 0/4"):
-        analyze_calibration(_capture(sparse_context=True), _request())
+        analyze_calibration(_replace_block(capture, values), request)
 
 
 def test_numeric_backend_identity_excludes_build_paths_and_unstable_metadata():
