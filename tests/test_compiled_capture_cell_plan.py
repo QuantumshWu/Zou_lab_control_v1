@@ -63,14 +63,20 @@ def image_schema(*, component_count: int | None = None):
     )
 
 
-def scanned_artifact(template: str, *, points: int, four_edges: bool = False):
-    document = load_pulse_document(
-        ROOT / "pulses" / ("imaging_template.json" if four_edges else template)
-    )
+def scanned_artifact(*, points: int, four_edges: bool = False):
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    periods = document.periods[:5]
     if four_edges:
-        low = replace(document.periods[2], period_id="p7")
-        high = replace(document.periods[5], period_id="p8")
-        document = replace(document, periods=(*document.periods, low, high))
+        high = document.periods[5]
+        low = document.periods[4]
+        periods = (
+            *periods,
+            high,
+            replace(low, period_id="p7"),
+            replace(high, period_id="p8"),
+            replace(low, period_id="p9"),
+        )
+    document = replace(document, periods=periods, api_parameters=())
     first = min(document.periods, key=lambda period: float(period.duration))
     parameter = ScanParameter(
         "capture_scan",
@@ -128,7 +134,7 @@ def test_static_three_frame_capture_uses_readout_event_not_fake_scan_axis():
 
 
 def test_r2_p3_e1_uses_physical_point_major_order_without_row_shift():
-    artifact = scanned_artifact("T.json", points=3)
+    artifact = scanned_artifact(points=3)
     scan = axis("capture.scan", SCAN_POINT, 3)
     event = axis("capture.event", READOUT_EVENT, 1)
     schema = DatasetSchema(
@@ -157,7 +163,7 @@ def test_r2_p3_e1_uses_physical_point_major_order_without_row_shift():
 
 
 def test_event_axis_position_and_explicit_scan_layout_drive_storage_mapping():
-    artifact = scanned_artifact("T.json", points=3, four_edges=True)
+    artifact = scanned_artifact(points=3, four_edges=True)
     event = axis("capture.event", READOUT_EVENT, 2)
     scan_y = axis("capture.scan_y", SCAN_POINT, 1)
     scan_x = axis("capture.scan_x", SCAN_POINT, 3)
@@ -191,7 +197,7 @@ def test_event_axis_position_and_explicit_scan_layout_drive_storage_mapping():
 
 
 def test_per_point_cardinality_mismatch_is_rejected_even_when_total_can_match():
-    artifact = scanned_artifact("T.json", points=3)
+    artifact = scanned_artifact(points=3)
     scan = axis("capture.scan", SCAN_POINT, 3)
     event = axis("capture.event", READOUT_EVENT, 3)
     schema = DatasetSchema(
@@ -211,7 +217,7 @@ def test_per_point_cardinality_mismatch_is_rejected_even_when_total_can_match():
 
 
 def test_plan_codec_is_canonical_and_rejects_assignment_reordering():
-    artifact = scanned_artifact("T.json", points=3)
+    artifact = scanned_artifact(points=3)
     scan = axis("capture.scan", SCAN_POINT, 3)
     event = axis("capture.event", READOUT_EVENT, 1)
     schema = DatasetSchema(
@@ -275,7 +281,7 @@ def test_plan_codec_is_canonical_and_rejects_assignment_reordering():
 
 
 def test_r2_e2_requires_an_explicit_non_guessed_within_point_grouping():
-    artifact = scanned_artifact("T.json", points=1, four_edges=True)
+    artifact = scanned_artifact(points=1, four_edges=True)
     event = axis("capture.event", READOUT_EVENT, 2)
     schema = DatasetSchema(
         axis("capture.repeat", REPEAT, 2),
@@ -294,7 +300,7 @@ def test_r2_e2_requires_an_explicit_non_guessed_within_point_grouping():
 
 
 def test_explicit_repeat_major_and_event_major_groupings_remain_distinct():
-    artifact = scanned_artifact("T.json", points=1, four_edges=True)
+    artifact = scanned_artifact(points=1, four_edges=True)
     event = axis("capture.event", READOUT_EVENT, 2)
     schema = DatasetSchema(
         axis("capture.repeat", REPEAT, 2),
@@ -346,7 +352,7 @@ def test_explicit_repeat_major_and_event_major_groupings_remain_distinct():
     ],
 )
 def test_grouping_must_be_a_complete_unique_r_by_e_permutation(grouping):
-    artifact = scanned_artifact("T.json", points=1, four_edges=True)
+    artifact = scanned_artifact(points=1, four_edges=True)
     event = axis("capture.event", READOUT_EVENT, 2)
     schema = DatasetSchema(
         axis("capture.repeat", REPEAT, 2),
@@ -366,7 +372,7 @@ def test_grouping_must_be_a_complete_unique_r_by_e_permutation(grouping):
 
 
 def test_persisted_scan_layout_is_revalidated_not_only_hashed():
-    artifact = scanned_artifact("T.json", points=3)
+    artifact = scanned_artifact(points=3)
     scan = axis("capture.scan", SCAN_POINT, 3)
     event = axis("capture.event", READOUT_EVENT, 1)
     schema = DatasetSchema(
