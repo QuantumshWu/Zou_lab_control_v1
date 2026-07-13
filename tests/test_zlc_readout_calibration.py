@@ -50,12 +50,14 @@ from zlc_neutral_atom.readout import (
     FrameContract,
     PerSitePsfReadoutModel,
     ReadoutBindingKey,
+    ReadoutFeatureSpec,
     ReadoutModelHeader,
     ReadoutModelKind,
     ReadoutModelQuality,
     SiteMap,
     UniformPsfReadoutModel,
     apply_readout_model,
+    bind_readout_feature_spec,
     decode_calibration_artifact,
     decode_calibration_artifact_ref,
     decode_calibration_source_binding,
@@ -67,6 +69,7 @@ from zlc_neutral_atom.readout import (
     encode_calibration_source_binding,
     encode_readout_model,
     encode_site_map,
+    extract_readout_features,
     extract_readout_signals,
 )
 
@@ -136,10 +139,16 @@ def _contracts():
         ComponentValidity((site_axis.axis_id,), np.array([True, False, True])),
         np.array([10, 0, 11], dtype="<u8"),
         np.array([10, 0, 9], dtype="<u8"),
-        np.array([0.99, 0.0, 0.98], dtype="<f8"),
+        np.array([10, 0, 10], dtype="<u8"),
+        np.array([10, 0, 10], dtype="<u8"),
+        np.array([9, 0, 9], dtype="<u8"),
+        np.array([10, 0, 9], dtype="<u8"),
+        np.array([0.70, 0.0, 0.70], dtype="<f8"),
+        np.array([0.60, 0.0, 0.70], dtype="<f8"),
+        np.array([0.95, 0.0, 1.0], dtype="<f8"),
         ComponentValidity((site_axis.axis_id,), np.array([True, False, True])),
         "held-out-balanced-fidelity",
-        "1",
+        "2",
         True,
     )
     boxes = np.array([[0, 0, 1, 1], [0, 0, 1, 1], [4, 3, 1, 1]], dtype="<i8")
@@ -303,6 +312,12 @@ def test_site_map_and_models_are_intrinsically_immutable_and_uniform_stores_one_
         site_map.validity.mask,
         quality.dark_training_sample_counts,
         quality.bright_training_sample_counts,
+        quality.held_out_dark_success_counts,
+        quality.held_out_dark_total_counts,
+        quality.held_out_bright_success_counts,
+        quality.held_out_bright_total_counts,
+        quality.held_out_dark_accuracy_lower_bounds,
+        quality.held_out_bright_accuracy_lower_bounds,
         quality.held_out_fidelity,
         box.boxes_xywh,
         per_site.kernels,
@@ -313,6 +328,14 @@ def test_site_map_and_models_are_intrinsically_immutable_and_uniform_stores_one_
             array.flat[0] = array.flat[0]
     assert uniform.kernel.shape == (1, 1)
     assert not hasattr(uniform, "kernels")
+
+    per_site_spec = bind_readout_feature_spec(per_site, site_map)
+    uniform_spec = bind_readout_feature_spec(uniform, site_map)
+    assert per_site_spec.boxes_xywh is per_site.boxes_xywh
+    assert per_site_spec.per_site_kernels is per_site.kernels
+    assert per_site_spec.site_validity is per_site.header.quality.usable_sites
+    assert uniform_spec.boxes_xywh is uniform.boxes_xywh
+    assert uniform_spec.uniform_kernel is uniform.kernel
 
 
 def test_box_application_propagates_site_and_nonfinite_validity_without_dark_coercion():
@@ -434,6 +457,200 @@ def test_annulus_nonfinite_pixel_invalidates_only_the_affected_site():
     assert result.validity.mask.tolist() == [False, False, True]
 
 
+@pytest.mark.parametrize("dtype", ("<u2", "<f4", "<f8"))
+@pytest.mark.parametrize("model_index", (0, 1, 2))
+@pytest.mark.parametrize("validity_case", ("valid", "invalid", "component"))
+def test_training_and_runtime_feature_paths_are_identical_for_all_models_dtypes_and_validity(
+    dtype,
+    model_index,
+    validity_case,
+):
+    base_contract, site_map, quality, boxes = _contracts()
+    dtype = np.dtype(dtype)
+    frame_schema = ValueSchema(
+        base_contract.frame_schema.data_axes,
+        base_contract.frame_schema.validity_contract,
+        dtype,
+        base_contract.frame_schema.value_unit,
+    )
+    contract = replace(base_contract, dtype=dtype, frame_schema=frame_schema)
+    model = _models(contract, site_map, quality, boxes)[model_index]
+    image = np.arange(1, 21, dtype=dtype).reshape(4, 5)
+    if validity_case == "valid":
+        validity = VALID
+    elif validity_case == "invalid":
+        validity = INVALID
+    else:
+        mask = np.ones((4, 5), dtype=bool)
+        mask[0, 0] = False
+        validity = ComponentValidity(
+            tuple(axis.axis_id for axis in frame_schema.data_axes),
+            mask,
+        )
+    frame = Value(image, validity, frame_schema)
+
+    training_path = extract_readout_features(
+        bind_readout_feature_spec(model, site_map),
+        frame,
+    )
+    runtime_path = extract_readout_signals(
+        model,
+        frame_contract=contract,
+        site_map=site_map,
+        frame=frame,
+    )
+    assert np.array_equal(training_path.values, runtime_path.values)
+    assert np.array_equal(training_path.validity.mask, runtime_path.validity.mask)
+
+
+@pytest.mark.parametrize(
+    "model_kind",
+    (ReadoutModelKind.PER_SITE_PSF, ReadoutModelKind.UNIFORM_PSF),
+)
+def test_training_and_runtime_feature_paths_share_annulus_background_and_invalid_ring(
+    model_kind,
+):
+    contract, site_map, quality, boxes = _contracts()
+    header = _header(f"{model_kind.value.lower()}-annulus", contract, site_map, quality)
+    if model_kind is ReadoutModelKind.PER_SITE_PSF:
+        model = PerSitePsfReadoutModel(
+            header,
+            boxes,
+            np.ones((3, 1, 1), dtype="<f8"),
+            BackgroundMode.ANNULUS_MEDIAN,
+            1,
+        )
+    else:
+        model = UniformPsfReadoutModel(
+            header,
+            boxes,
+            np.ones((1, 1), dtype="<f8"),
+            BackgroundMode.ANNULUS_MEDIAN,
+            1,
+        )
+    image = np.full((4, 5), 2.0, dtype="<f8")
+    image[0, 0] = 8.0
+    image[3, 4] = 10.0
+    pixel_validity = np.ones((4, 5), dtype=bool)
+    pixel_validity[0, 1] = False
+    frame = _value(
+        contract,
+        image,
+        ComponentValidity(
+            tuple(axis.axis_id for axis in contract.frame_schema.data_axes),
+            pixel_validity,
+        ),
+    )
+
+    training_path = extract_readout_features(
+        bind_readout_feature_spec(model, site_map),
+        frame,
+    )
+    runtime_path = extract_readout_signals(
+        model,
+        frame_contract=contract,
+        site_map=site_map,
+        frame=frame,
+    )
+    assert np.array_equal(training_path.values, runtime_path.values)
+    assert np.array_equal(training_path.validity.mask, runtime_path.validity.mask)
+    assert runtime_path.validity.mask.tolist() == [False, False, True]
+
+
+@pytest.mark.parametrize("model_index", (0, 1, 2))
+def test_training_and_runtime_feature_paths_share_nonfinite_rejection(model_index):
+    contract, site_map, quality, boxes = _contracts()
+    model = _models(contract, site_map, quality, boxes)[model_index]
+    image = np.zeros((4, 5), dtype="<f8")
+    image[0, 0] = np.nan
+    image[3, 4] = 7.0
+    frame = _value(contract, image)
+
+    training_path = extract_readout_features(
+        bind_readout_feature_spec(model, site_map),
+        frame,
+    )
+    runtime_path = extract_readout_signals(
+        model,
+        frame_contract=contract,
+        site_map=site_map,
+        frame=frame,
+    )
+    assert np.array_equal(training_path.values, runtime_path.values)
+    assert np.array_equal(training_path.validity.mask, runtime_path.validity.mask)
+    assert runtime_path.validity.mask.tolist() == [False, False, True]
+
+
+def test_shared_feature_core_matches_an_independent_nontrivial_psf_oracle():
+    axis_id = AxisId("oracle-site")
+    boxes = np.array([[2, 2, 3, 3], [5, 4, 3, 3]], dtype="<i8")
+    kernels = np.array(
+        (
+            ((1.0, 2.0, 1.0), (2.0, 4.0, 2.0), (1.0, 2.0, 1.0)),
+            ((1.0, 1.0, 1.0), (1.0, 8.0, 1.0), (1.0, 1.0, 1.0)),
+        ),
+        dtype="<f8",
+    )
+    kernels /= np.sum(kernels, axis=(1, 2), keepdims=True)
+    spec = ReadoutFeatureSpec(
+        ReadoutModelKind.PER_SITE_PSF,
+        axis_id,
+        boxes,
+        ComponentValidity((axis_id,), np.array([True, True])),
+        per_site_kernels=kernels,
+        background=BackgroundMode.ANNULUS_MEDIAN,
+        background_padding=1,
+    )
+    frame = CoordinateFrameId("oracle-frame")
+    y_axis = AxisSpec(
+        AxisId("oracle-y"),
+        "oracle y",
+        SPATIAL_Y,
+        8,
+        tuple(range(8)),
+        "pixel",
+        frame,
+    )
+    x_axis = AxisSpec(
+        AxisId("oracle-x"),
+        "oracle x",
+        SPATIAL_X,
+        9,
+        tuple(range(9)),
+        "pixel",
+        frame,
+    )
+    schema = ValueSchema(
+        (y_axis, x_axis),
+        ValidityContract.components(y_axis.axis_id, x_axis.axis_id),
+        np.dtype("<f8"),
+        "count",
+    )
+    image = 5.0 + np.arange(72, dtype="<f8").reshape(8, 9) / 10.0
+    image[2:5, 2:5] += np.array(
+        [[1.0, 2.0, 1.0], [2.0, 8.0, 2.0], [1.0, 2.0, 1.0]]
+    )
+    pixel_validity = np.ones(image.shape, dtype=bool)
+    pixel_validity[7, 8] = False  # site 1 annulus only
+    value = Value(
+        image,
+        ComponentValidity((y_axis.axis_id, x_axis.axis_id), pixel_validity),
+        schema,
+    )
+
+    observed = extract_readout_features(spec, value)
+    outer = image[1:6, 1:6]
+    ring_mask = np.ones((5, 5), dtype=bool)
+    ring_mask[1:4, 1:4] = False
+    independent_background = float(np.median(outer[ring_mask]))
+    independent_site_zero = float(
+        np.sum(kernels[0] * (image[2:5, 2:5] - independent_background))
+    )
+    assert observed.values[0] == pytest.approx(independent_site_zero)
+    assert observed.validity.mask.tolist() == [True, False]
+    assert observed.values[1] == 0.0
+
+
 def test_application_requires_named_value_schema_and_rejects_fingerprint_drift():
     contract, site_map, quality, boxes = _contracts()
     model = _models(contract, site_map, quality, boxes)[0]
@@ -458,6 +675,8 @@ def test_application_requires_named_value_schema_and_rejects_fingerprint_drift()
             frame=Value(np.zeros((4, 5), dtype="<f4"), VALID, wrong_schema),
         )
     moved = replace(site_map, detection_lineage_digest="3" * 64)
+    with pytest.raises(ValueError, match="does not apply"):
+        bind_readout_feature_spec(model, moved)
     with pytest.raises(ValueError, match="does not apply"):
         extract_readout_signals(
             model,
@@ -612,13 +831,19 @@ def test_invalid_sites_require_explicit_validity_and_canonical_zero_fillers():
     bad_thresholds = np.array([5.0, 6.0, 5.0], dtype="<f8")
     with pytest.raises(ValueError, match="zero threshold"):
         _header("bad", contract, site_map, quality, thresholds=bad_thresholds)
-    with pytest.raises(ValueError, match="zero per-class"):
-        replace(
-            quality,
-            dark_training_sample_counts=np.array([10, 1, 11], dtype="<u8"),
-        )
+    retained_diagnostic = replace(
+        quality,
+        dark_training_sample_counts=np.array([10, 1, 11], dtype="<u8"),
+    )
+    assert retained_diagnostic.dark_training_sample_counts[1] == 1
     with pytest.raises(ValueError, match="finite"):
-        replace(site_map, coordinates_xy=np.array([[0.0, 0.0], [np.nan, 0.0], [4.0, 3.0]], dtype="<f8"))
+        replace(
+            site_map,
+            coordinates_xy=np.array(
+                [[0.0, 0.0], [np.nan, 0.0], [4.0, 3.0]],
+                dtype="<f8",
+            ),
+        )
     with pytest.raises(ValueError, match="zero fillers"):
         replace(
             site_map,
@@ -680,6 +905,24 @@ def test_quality_requires_both_classes_and_held_out_evidence_for_every_usable_si
                 np.array([True, False, False]),
             ),
         )
+    with pytest.raises(ValueError, match="cannot exceed"):
+        replace(
+            quality,
+            held_out_dark_success_counts=np.array([11, 0, 10], dtype="<u8"),
+        )
+    with pytest.raises(ValueError, match="differs from per-class evidence"):
+        replace(
+            quality,
+            held_out_fidelity=np.array([0.90, 0.0, 1.0], dtype="<f8"),
+        )
+    with pytest.raises(ValueError, match="lower bound exceeds"):
+        replace(
+            quality,
+            held_out_bright_accuracy_lower_bounds=np.array(
+                [0.95, 0.0, 0.70],
+                dtype="<f8",
+            ),
+        )
 
 
 def test_checked_box_geometry_blocks_int64_wrap_empty_slice_and_center_mismatch():
@@ -723,6 +966,12 @@ def test_standalone_model_cannot_bypass_site_count_applicability():
         ComponentValidity((axis_id,), np.array([True, True])),
         np.array([5, 5], dtype="<u8"),
         np.array([5, 5], dtype="<u8"),
+        np.array([9, 9], dtype="<u8"),
+        np.array([10, 10], dtype="<u8"),
+        np.array([9, 9], dtype="<u8"),
+        np.array([10, 10], dtype="<u8"),
+        np.array([0.6, 0.6], dtype="<f8"),
+        np.array([0.6, 0.6], dtype="<f8"),
         np.array([0.9, 0.9], dtype="<f8"),
         ComponentValidity((axis_id,), np.array([True, True])),
         "gate",
@@ -904,8 +1153,26 @@ def test_repository_blob_limit_uses_physical_size_not_forged_manifest_size(tmp_p
         restricted.load(forged_reference)
 
 
-def test_direct_decode_site_budget_rejects_before_ndarray_materialization(monkeypatch):
-    payload = encode_calibration_artifact(_artifact())
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "held_out_dark_success_counts",
+        "held_out_dark_total_counts",
+        "held_out_bright_success_counts",
+        "held_out_bright_total_counts",
+        "held_out_dark_accuracy_lower_bounds",
+        "held_out_bright_accuracy_lower_bounds",
+    ),
+)
+def test_direct_decode_site_budget_rejects_before_ndarray_materialization(
+    monkeypatch,
+    field_name,
+):
+    tree = decode(encode_calibration_artifact(_artifact()))
+    quality = tree["models"][0]["header"]["quality"]
+    source = quality[field_name]
+    quality[field_name] = np.zeros(4, dtype=source.dtype)
+    payload = encode(tree)
     import zlc_storage.canonical as canonical
 
     materializations = 0
@@ -920,7 +1187,7 @@ def test_direct_decode_site_budget_rejects_before_ndarray_materialization(monkey
     with pytest.raises(CalibrationResourceExceeded, match="site count"):
         decode_calibration_artifact(
             payload,
-            resource_policy=CalibrationResourcePolicy(max_sites=1),
+            resource_policy=CalibrationResourcePolicy(max_sites=3),
         )
     assert materializations == 0
 
@@ -967,6 +1234,39 @@ def test_all_persistent_values_have_strict_current_canonical_codecs():
     tree["unknown"] = 1
     with pytest.raises(ValueError, match="exactly"):
         decode_calibration_artifact(encode(tree))
+
+
+def test_quality_codec_v2_is_exact_and_carries_per_class_confidence_evidence():
+    tree = decode(encode_calibration_artifact(_artifact()))
+    quality = tree["models"][0]["header"]["quality"]
+    assert quality["schema"] == "zlc_neutral_atom.readout-model-quality.v2"
+    assert set(quality) == {
+        "schema",
+        "site_axis_id",
+        "usable_sites",
+        "dark_training_sample_counts",
+        "bright_training_sample_counts",
+        "held_out_dark_success_counts",
+        "held_out_dark_total_counts",
+        "held_out_bright_success_counts",
+        "held_out_bright_total_counts",
+        "held_out_dark_accuracy_lower_bounds",
+        "held_out_bright_accuracy_lower_bounds",
+        "held_out_fidelity",
+        "held_out_validity",
+        "quality_gate_id",
+        "quality_gate_version",
+        "gate_passed",
+    }
+
+    missing = decode(encode_calibration_artifact(_artifact()))
+    del missing["models"][0]["header"]["quality"]["held_out_dark_total_counts"]
+    with pytest.raises(ValueError, match="exactly"):
+        decode_calibration_artifact(encode(missing))
+    unknown = decode(encode_calibration_artifact(_artifact()))
+    unknown["models"][0]["header"]["quality"]["legacy_fidelity_gate"] = 0.9
+    with pytest.raises(ValueError, match="exactly"):
+        decode_calibration_artifact(encode(unknown))
 
 
 def test_content_addressed_repository_round_trip_is_stable_and_namespace_typed(tmp_path):

@@ -614,6 +614,43 @@ class FrameContract:
         *,
         readout_event_index: int,
     ) -> "FrameContract":
+        return cls._from_schema_impl(
+            binding,
+            descriptor,
+            schema,
+            readout_event_index=readout_event_index,
+            require_physical_event_witness=True,
+        )
+
+    @classmethod
+    def _from_witnessed_schema(
+        cls,
+        binding: ReadoutBindingKey,
+        descriptor: CameraCaptureDescriptor,
+        schema: DatasetSchema,
+        *,
+        readout_event_index: int,
+    ) -> "FrameContract":
+        """Build after a CalibrationCaptureLayout join witnessed this event row."""
+
+        return cls._from_schema_impl(
+            binding,
+            descriptor,
+            schema,
+            readout_event_index=readout_event_index,
+            require_physical_event_witness=False,
+        )
+
+    @classmethod
+    def _from_schema_impl(
+        cls,
+        binding: ReadoutBindingKey,
+        descriptor: CameraCaptureDescriptor,
+        schema: DatasetSchema,
+        *,
+        readout_event_index: int,
+        require_physical_event_witness: bool,
+    ) -> "FrameContract":
         if not isinstance(binding, ReadoutBindingKey):
             raise TypeError("binding must be ReadoutBindingKey")
         if not isinstance(descriptor, CameraCaptureDescriptor):
@@ -627,8 +664,9 @@ class FrameContract:
         else:
             if index >= event_axis[1].size:
                 raise ValueError("readout_event_index is outside the READOUT_EVENT axis")
-            indices = schema.point_layout.axis_indices(event_axis[0])
-            if not np.any(indices == index):
+            if require_physical_event_witness and not np.any(
+                schema.point_layout.axis_indices(event_axis[0]) == index
+            ):
                 raise ValueError("selected readout event is absent from the physical PointLayout")
         setting = descriptor.setting(index)
         return cls(
@@ -667,7 +705,7 @@ class FrameContract:
         layout.validate_schema(schema)
         if descriptor.readout_event_axis_id != layout.readout_event_axis_id:
             raise ValueError("capture descriptor and calibration layout name different event axes")
-        return cls.from_schema(
+        return cls._from_witnessed_schema(
             binding,
             descriptor,
             schema,

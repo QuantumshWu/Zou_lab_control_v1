@@ -88,12 +88,29 @@ def _immutable_array(
         )
     if shape is not None and source.shape != shape:
         raise ValueError(f"{field_name} shape {source.shape} does not match {shape}")
+    if (
+        source.dtype == expected_dtype
+        and source.flags.c_contiguous
+        and _is_bytes_backed_read_only(source)
+    ):
+        return source
     normalized = np.ascontiguousarray(source.astype(expected_dtype, copy=False))
     result = np.frombuffer(normalized.tobytes(order="C"), dtype=expected_dtype).reshape(
         normalized.shape
     )
     result.setflags(write=False)
     return result
+
+
+def _is_bytes_backed_read_only(array: np.ndarray) -> bool:
+    """Recognize the intrinsically immutable representation owned by this domain."""
+
+    owner: object = array
+    while isinstance(owner, np.ndarray):
+        if owner.flags.writeable:
+            return False
+        owner = owner.base
+    return isinstance(owner, bytes)
 
 
 def _float64_array(
@@ -135,7 +152,10 @@ def _validity(
         raise ValueError(f"{field_name} must name exactly the site axis")
     if value.mask.shape != (site_count,):
         raise ValueError(f"{field_name} mask must have shape ({site_count},)")
-    return ComponentValidity(value.axis_ids, value.mask)
+    # ComponentValidity itself canonicalizes onto immutable bytes.  Returning
+    # the already validated value avoids a second O(site) copy at every model
+    # bind while preserving the same ownership guarantee.
+    return value
 
 
 @dataclass(frozen=True)
@@ -174,6 +194,21 @@ def derive_calibration_source_binding(
     back into readout and creating a package cycle.
     """
 
+    return _derive_calibration_source_binding_with_resolved_brackets(
+        capture,
+        layout,
+        resolved_brackets=None,
+    )
+
+
+def _derive_calibration_source_binding_with_resolved_brackets(
+    capture: object,
+    layout: CalibrationCaptureLayout,
+    *,
+    resolved_brackets: tuple[object, ...] | None,
+) -> tuple[CalibrationSourceBinding, FrameContract]:
+    """Internal one-join path for a caller that just resolved ``layout`` itself."""
+
     if not isinstance(layout, CalibrationCaptureLayout):
         raise TypeError("layout must be CalibrationCaptureLayout")
     try:
@@ -195,14 +230,35 @@ def derive_calibration_source_binding(
         raise TypeError("capture camera descriptor must be CameraCaptureDescriptor")
     if not isinstance(binding, ReadoutBindingKey):
         raise TypeError("capture readout binding must be ReadoutBindingKey")
-    descriptor.validate_schema(block.schema)
-    layout.validate_schema(block.schema)
-    brackets = layout.brackets(block.schema)
-    frame_contract = FrameContract.from_calibration_capture(
+    if resolved_brackets is None:
+        brackets = layout.brackets(block.schema)
+    else:
+        from .contracts import CalibrationCaptureBracket
+
+        brackets = tuple(resolved_brackets)
+        if not brackets or any(
+            not isinstance(bracket, CalibrationCaptureBracket)
+            for bracket in brackets
+        ):
+            raise TypeError(
+                "resolved_brackets must be non-empty CalibrationCaptureBracket values"
+            )
+        if len({bracket.context_key for bracket in brackets}) != len(brackets):
+            raise ValueError("resolved calibration brackets have duplicate context keys")
+    if descriptor.readout_event_axis_id != layout.readout_event_axis_id:
+        raise ValueError(
+            "capture descriptor and calibration layout name different event axes"
+        )
+    # ``layout.brackets`` (or the caller-supplied resolved brackets) is the one
+    # authoritative join.  Re-entering ``from_calibration_capture`` here would
+    # scan the entire sparse PointLayout a second time merely to validate the
+    # same join.  ``from_schema`` still validates every camera/schema fact and
+    # the selected readout-event index without rebuilding the bracket map.
+    frame_contract = FrameContract._from_witnessed_schema(
         binding,
         descriptor,
         block.schema,
-        layout,
+        readout_event_index=layout.readout_event_index,
     )
     witness = canonical_digest(
         {
@@ -352,6 +408,12 @@ class ReadoutModelQuality:
     usable_sites: ComponentValidity
     dark_training_sample_counts: np.ndarray
     bright_training_sample_counts: np.ndarray
+    held_out_dark_success_counts: np.ndarray
+    held_out_dark_total_counts: np.ndarray
+    held_out_bright_success_counts: np.ndarray
+    held_out_bright_total_counts: np.ndarray
+    held_out_dark_accuracy_lower_bounds: np.ndarray
+    held_out_bright_accuracy_lower_bounds: np.ndarray
     held_out_fidelity: np.ndarray
     held_out_validity: ComponentValidity
     quality_gate_id: str
@@ -402,20 +464,86 @@ class ReadoutModelQuality:
             site_count=site_count,
             field_name="held_out_validity",
         )
-        if np.any(fidelity_validity.mask & ~usable.mask):
-            raise ValueError("held-out fidelity cannot be valid for an unusable site")
+        def evidence_counts(values: object, field_name: str) -> np.ndarray:
+            return _immutable_array(
+                values,
+                dtype=np.dtype("<u8"),
+                shape=(site_count,),
+                field_name=field_name,
+            )
+
+        dark_success = evidence_counts(
+            self.held_out_dark_success_counts,
+            "held_out_dark_success_counts",
+        )
+        dark_total = evidence_counts(
+            self.held_out_dark_total_counts,
+            "held_out_dark_total_counts",
+        )
+        bright_success = evidence_counts(
+            self.held_out_bright_success_counts,
+            "held_out_bright_success_counts",
+        )
+        bright_total = evidence_counts(
+            self.held_out_bright_total_counts,
+            "held_out_bright_total_counts",
+        )
+        dark_lower = _float64_array(
+            self.held_out_dark_accuracy_lower_bounds,
+            shape=(site_count,),
+            field_name="held_out_dark_accuracy_lower_bounds",
+        )
+        bright_lower = _float64_array(
+            self.held_out_bright_accuracy_lower_bounds,
+            shape=(site_count,),
+            field_name="held_out_bright_accuracy_lower_bounds",
+        )
+        if np.any(usable.mask & ~fidelity_validity.mask):
+            raise ValueError("usable sites require held-out evidence")
         if np.any((fidelity < 0.0) | (fidelity > 1.0)):
             raise ValueError("held_out_fidelity must lie in [0, 1]")
+        if np.any((dark_lower < 0.0) | (dark_lower > 1.0)) or np.any(
+            (bright_lower < 0.0) | (bright_lower > 1.0)
+        ):
+            raise ValueError("held-out class lower bounds must lie in [0, 1]")
+        if np.any(dark_success > dark_total) or np.any(bright_success > bright_total):
+            raise ValueError("held-out successes cannot exceed held-out totals")
+        evidence = fidelity_validity.mask
+        if np.any(evidence & ((dark_total == 0) | (bright_total == 0))):
+            raise ValueError("valid held-out evidence requires both class totals")
+        invalid_evidence = ~evidence
+        for values, field_name in (
+            (dark_success, "dark successes"),
+            (dark_total, "dark totals"),
+            (bright_success, "bright successes"),
+            (bright_total, "bright totals"),
+            (dark_lower, "dark lower bounds"),
+            (bright_lower, "bright lower bounds"),
+            (fidelity, "held-out fidelity"),
+        ):
+            if np.any(values[invalid_evidence] != 0):
+                raise ValueError(
+                    f"invalid held-out evidence requires canonical zero {field_name}"
+                )
+        if np.any(evidence):
+            dark_empirical = dark_success[evidence] / dark_total[evidence]
+            bright_empirical = bright_success[evidence] / bright_total[evidence]
+            expected_fidelity = 0.5 * (dark_empirical + bright_empirical)
+            if not np.allclose(
+                fidelity[evidence],
+                expected_fidelity,
+                rtol=1e-12,
+                atol=1e-12,
+            ):
+                raise ValueError("held_out_fidelity differs from per-class evidence")
+            if np.any(dark_lower[evidence] > dark_empirical + 1e-12) or np.any(
+                bright_lower[evidence] > bright_empirical + 1e-12
+            ):
+                raise ValueError("class lower bound exceeds empirical class accuracy")
         if np.any(dark_counts[usable.mask] == 0) or np.any(
             bright_counts[usable.mask] == 0
         ):
             raise ValueError("usable sites require both dark and bright training samples")
-        if np.any(dark_counts[~usable.mask] != 0) or np.any(
-            bright_counts[~usable.mask] != 0
-        ):
-            raise ValueError("unusable sites require canonical zero per-class counts")
-        if np.any(fidelity[~fidelity_validity.mask] != 0.0):
-            raise ValueError("invalid fidelity entries require canonical zero payloads")
         if self.gate_passed and not np.any(usable.mask):
             raise ValueError("a passed quality gate requires at least one usable site")
         if self.gate_passed and np.any(usable.mask & ~fidelity_validity.mask):
@@ -425,6 +553,12 @@ class ReadoutModelQuality:
         object.__setattr__(self, "dark_training_sample_counts", dark_counts)
         object.__setattr__(self, "bright_training_sample_counts", bright_counts)
         object.__setattr__(self, "usable_sites", usable)
+        object.__setattr__(self, "held_out_dark_success_counts", dark_success)
+        object.__setattr__(self, "held_out_dark_total_counts", dark_total)
+        object.__setattr__(self, "held_out_bright_success_counts", bright_success)
+        object.__setattr__(self, "held_out_bright_total_counts", bright_total)
+        object.__setattr__(self, "held_out_dark_accuracy_lower_bounds", dark_lower)
+        object.__setattr__(self, "held_out_bright_accuracy_lower_bounds", bright_lower)
         object.__setattr__(self, "held_out_fidelity", fidelity)
         object.__setattr__(self, "held_out_validity", fidelity_validity)
 
@@ -659,6 +793,130 @@ def _validate_normalized_kernels(kernels: np.ndarray, field_name: str) -> None:
 ReadoutModel: TypeAlias = (
     BoxReadoutModel | PerSitePsfReadoutModel | UniformPsfReadoutModel
 )
+
+
+@dataclass(frozen=True, eq=False)
+class ReadoutFeatureSpec:
+    """Closed, threshold-free frame feature extraction contract.
+
+    Calibration training and runtime application both bind one of these values
+    and execute :func:`extract_readout_features`.  The pixel/background/
+    validity math therefore has exactly one owner and cannot drift between the
+    learned and applied signal scales.
+    """
+
+    kind: ReadoutModelKind
+    site_axis_id: AxisId
+    boxes_xywh: np.ndarray
+    site_validity: ComponentValidity
+    box_reducer: BoxReducer | None = None
+    per_site_kernels: np.ndarray | None = None
+    uniform_kernel: np.ndarray | None = None
+    background: BackgroundMode = BackgroundMode.NONE
+    background_padding: int = 0
+    __hash__ = None
+
+    @classmethod
+    def _from_validated_model(cls, model: ReadoutModel) -> "ReadoutFeatureSpec":
+        """Zero-copy bind after the closed model's invariants were already checked."""
+
+        result = object.__new__(cls)
+        object.__setattr__(result, "kind", model.kind)
+        object.__setattr__(result, "site_axis_id", model.header.site_axis_id)
+        object.__setattr__(result, "boxes_xywh", model.boxes_xywh)
+        object.__setattr__(result, "site_validity", model.header.quality.usable_sites)
+        object.__setattr__(
+            result,
+            "box_reducer",
+            model.reducer if isinstance(model, BoxReadoutModel) else None,
+        )
+        object.__setattr__(
+            result,
+            "per_site_kernels",
+            model.kernels if isinstance(model, PerSitePsfReadoutModel) else None,
+        )
+        object.__setattr__(
+            result,
+            "uniform_kernel",
+            model.kernel if isinstance(model, UniformPsfReadoutModel) else None,
+        )
+        object.__setattr__(
+            result,
+            "background",
+            model.background
+            if isinstance(model, (PerSitePsfReadoutModel, UniformPsfReadoutModel))
+            else BackgroundMode.NONE,
+        )
+        object.__setattr__(
+            result,
+            "background_padding",
+            model.background_padding
+            if isinstance(model, (PerSitePsfReadoutModel, UniformPsfReadoutModel))
+            else 0,
+        )
+        return result
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ReadoutModelKind):
+            raise TypeError("kind must be ReadoutModelKind")
+        if not isinstance(self.site_axis_id, AxisId):
+            raise TypeError("site_axis_id must be AxisId")
+        source_boxes = np.asarray(self.boxes_xywh)
+        if source_boxes.ndim != 2 or source_boxes.shape[1:] != (4,):
+            raise ValueError("boxes_xywh must have shape (site, 4)")
+        boxes = _boxes(source_boxes, site_count=source_boxes.shape[0])
+        validity = _validity(
+            self.site_validity,
+            site_axis_id=self.site_axis_id,
+            site_count=boxes.shape[0],
+            field_name="feature site_validity",
+        )
+        padding = _nonnegative_integer(
+            self.background_padding,
+            "background_padding",
+        )
+        if not isinstance(self.background, BackgroundMode):
+            raise TypeError("background must be BackgroundMode")
+        if self.kind is ReadoutModelKind.BOX:
+            if not isinstance(self.box_reducer, BoxReducer):
+                raise TypeError("BOX feature spec requires BoxReducer")
+            if self.per_site_kernels is not None or self.uniform_kernel is not None:
+                raise ValueError("BOX feature spec cannot carry PSF kernels")
+            if self.background is not BackgroundMode.NONE or padding != 0:
+                raise ValueError("BOX feature spec requires canonical no-background state")
+        else:
+            if self.box_reducer is not None:
+                raise ValueError("PSF feature spec cannot carry a box reducer")
+            if len({tuple(item) for item in boxes[:, 2:]}) != 1:
+                raise ValueError("PSF feature boxes must share one kernel shape")
+            width, height = (int(value) for value in boxes[0, 2:])
+            if self.kind is ReadoutModelKind.PER_SITE_PSF:
+                if self.uniform_kernel is not None:
+                    raise ValueError("per-site PSF feature spec cannot carry uniform kernel")
+                kernels = _float64_array(
+                    self.per_site_kernels,
+                    shape=(boxes.shape[0], height, width),
+                    field_name="per_site_kernels",
+                )
+                _validate_normalized_kernels(kernels, "per_site_kernels")
+                object.__setattr__(self, "per_site_kernels", kernels)
+            else:
+                if self.per_site_kernels is not None:
+                    raise ValueError("uniform PSF feature spec cannot carry per-site kernels")
+                kernel = _float64_array(
+                    self.uniform_kernel,
+                    shape=(height, width),
+                    field_name="uniform_kernel",
+                )
+                _validate_normalized_kernels(kernel[None, ...], "uniform_kernel")
+                object.__setattr__(self, "uniform_kernel", kernel)
+            if self.background is BackgroundMode.ANNULUS_MEDIAN and padding == 0:
+                raise ValueError("ANNULUS_MEDIAN requires positive background_padding")
+            if self.background is BackgroundMode.NONE and padding != 0:
+                raise ValueError("NONE background requires canonical zero padding")
+        object.__setattr__(self, "boxes_xywh", boxes)
+        object.__setattr__(self, "site_validity", validity)
+        object.__setattr__(self, "background_padding", padding)
 
 
 class CalibrationResourceExceeded(ValueError):
@@ -1204,6 +1462,172 @@ class OccupancyDecision:
         object.__setattr__(self, "validity", validity)
 
 
+def bind_readout_feature_spec(
+    model: ReadoutModel,
+    site_map: SiteMap,
+) -> ReadoutFeatureSpec:
+    """Bind model geometry and admitted sites without copying classifier state."""
+
+    model = _model(model)
+    if not isinstance(site_map, SiteMap):
+        raise TypeError("site_map must be SiteMap")
+    if not model.header.quality.gate_passed:
+        raise ValueError("readout model did not pass its quality gate")
+    if model.header.site_map_fingerprint != site_map.fingerprint:
+        raise ValueError("readout model does not apply to this SiteMap")
+    if model.header.site_axis_id != site_map.site_axis.axis_id:
+        raise ValueError("readout model and SiteMap name different site axes")
+    usable = model.header.quality.usable_sites
+    if np.any(usable.mask & ~site_map.validity.mask):
+        raise ValueError("readout model marks an invalid SiteMap site usable")
+    return ReadoutFeatureSpec._from_validated_model(model)
+
+
+def extract_readout_features(
+    spec: ReadoutFeatureSpec,
+    frame: Value,
+) -> ReadoutSignals:
+    """Strict public Value boundary over the one feature-math implementation."""
+
+    if not isinstance(spec, ReadoutFeatureSpec):
+        raise TypeError("spec must be ReadoutFeatureSpec")
+    if not isinstance(frame, Value):
+        raise TypeError(
+            "frame must be zlc_data.Value so named axes and validity cannot be discarded"
+        )
+    return _extract_readout_features_arrays(
+        spec,
+        frame.values,
+        expand_value_validity(frame.validity, frame.schema),
+    )
+
+
+def _extract_readout_features_arrays(
+    spec: ReadoutFeatureSpec,
+    image: np.ndarray,
+    pixel_validity: np.ndarray,
+) -> ReadoutSignals:
+    """Package-private array core shared by strict runtime and borrowed analysis."""
+
+    if not isinstance(spec, ReadoutFeatureSpec):
+        raise TypeError("spec must be ReadoutFeatureSpec")
+    image = np.asarray(image)
+    validity_source = np.asarray(pixel_validity)
+    if image.ndim != 2:
+        raise ValueError("readout features require one two-dimensional Y,X Value")
+    if validity_source.dtype != np.dtype(bool) or validity_source.shape != image.shape:
+        raise ValueError("pixel_validity must be a bool mask matching the Y,X image")
+    valid = spec.site_validity.mask.copy()
+    values = np.zeros(spec.boxes_xywh.shape[0], dtype="<f8")
+    for index, box in enumerate(spec.boxes_xywh):
+        if not valid[index]:
+            continue
+        y_slice, x_slice = _checked_box_slices(
+            box,
+            image_shape_yx=image.shape,
+            site_index=index,
+        )
+        cut = image[y_slice, x_slice]
+        cut_validity = validity_source[y_slice, x_slice]
+        if not np.all(cut_validity) or not np.all(np.isfinite(cut)):
+            valid[index] = False
+            continue
+        if spec.kind is ReadoutModelKind.BOX:
+            result = (
+                np.sum(cut, dtype=np.float64)
+                if spec.box_reducer is BoxReducer.SUM
+                else np.mean(cut, dtype=np.float64)
+            )
+        else:
+            background = _background_value(
+                image,
+                validity_source,
+                y_slice,
+                x_slice,
+                mode=spec.background,
+                padding=spec.background_padding,
+            )
+            if background is None:
+                valid[index] = False
+                continue
+            kernel = (
+                spec.per_site_kernels[index]
+                if spec.kind is ReadoutModelKind.PER_SITE_PSF
+                else spec.uniform_kernel
+            )
+            assert kernel is not None
+            result = np.sum(
+                kernel * (cut.astype(np.float64) - background),
+                dtype=np.float64,
+            )
+        if not np.isfinite(result):
+            valid[index] = False
+            continue
+        values[index] = float(result)
+    values[~valid] = 0.0
+    return ReadoutSignals(
+        spec.site_axis_id,
+        values,
+        ComponentValidity((spec.site_axis_id,), valid),
+    )
+
+
+def readout_background_value(
+    frame: Value,
+    box_xywh: np.ndarray | tuple[int, int, int, int],
+    *,
+    mode: BackgroundMode,
+    padding: int,
+) -> float | None:
+    """Public owner primitive for calibration-time PSF template preparation."""
+
+    if not isinstance(frame, Value):
+        raise TypeError("frame must be zlc_data.Value")
+    return _readout_background_from_arrays(
+        frame.values,
+        expand_value_validity(frame.validity, frame.schema),
+        box_xywh,
+        mode=mode,
+        padding=padding,
+    )
+
+
+def _readout_background_from_arrays(
+    image: np.ndarray,
+    pixel_validity: np.ndarray,
+    box_xywh: np.ndarray | tuple[int, int, int, int],
+    *,
+    mode: BackgroundMode,
+    padding: int,
+) -> float | None:
+    """Package-private array owner used by training-only averaged templates."""
+
+    image = np.asarray(image)
+    validity = np.asarray(pixel_validity, dtype=bool)
+    if image.ndim != 2 or validity.shape != image.shape:
+        raise ValueError("background image and validity must share one Y,X shape")
+    if not isinstance(mode, BackgroundMode):
+        raise TypeError("mode must be BackgroundMode")
+    pad = _nonnegative_integer(padding, "padding")
+    if mode is BackgroundMode.ANNULUS_MEDIAN and pad == 0:
+        raise ValueError("ANNULUS_MEDIAN requires positive padding")
+    if mode is BackgroundMode.NONE and pad != 0:
+        raise ValueError("NONE requires canonical zero padding")
+    y_slice, x_slice = _checked_box_slices(
+        np.asarray(box_xywh),
+        image_shape_yx=image.shape,
+        site_index=0,
+    )
+    return _background_value(
+        image,
+        validity,
+        y_slice,
+        x_slice,
+        mode=mode,
+        padding=pad,
+    )
+
+
 def extract_readout_signals(
     model: ReadoutModel,
     *,
@@ -1229,62 +1653,7 @@ def extract_readout_signals(
         )
     if frame.schema.fingerprint != frame_contract.frame_schema.fingerprint:
         raise ValueError("frame ValueSchema differs from the FrameContract schema")
-    image = frame.values
-    if image.ndim != 2:  # FrameContract construction already requires named Y,X axes.
-        raise ValueError("readout model requires one two-dimensional Y,X Value")
-    pixel_validity = expand_value_validity(frame.validity, frame.schema)
-    height, width = image.shape
-    boxes = model.boxes_xywh
-    valid = (
-        site_map.validity.mask & model.header.quality.usable_sites.mask
-    ).copy()
-    values = np.zeros(model.header.site_count, dtype="<f8")
-    for index, box in enumerate(boxes):
-        if not valid[index]:
-            continue
-        y_slice, x_slice = _checked_box_slices(
-            box,
-            image_shape_yx=(height, width),
-            site_index=index,
-        )
-        cut = image[y_slice, x_slice]
-        cut_validity = pixel_validity[y_slice, x_slice]
-        if not np.all(cut_validity) or not np.all(np.isfinite(cut)):
-            valid[index] = False
-            continue
-        if isinstance(model, BoxReadoutModel):
-            if model.reducer is BoxReducer.SUM:
-                result = np.sum(cut, dtype=np.float64)
-            else:
-                result = np.mean(cut, dtype=np.float64)
-        else:
-            background = _background_value(
-                image,
-                pixel_validity,
-                y_slice,
-                x_slice,
-                mode=model.background,
-                padding=model.background_padding,
-            )
-            if background is None:
-                valid[index] = False
-                continue
-            kernel = (
-                model.kernels[index]
-                if isinstance(model, PerSitePsfReadoutModel)
-                else model.kernel
-            )
-            result = np.sum(kernel * (cut.astype(np.float64) - background), dtype=np.float64)
-        if not np.isfinite(result):
-            valid[index] = False
-            continue
-        values[index] = float(result)
-    values[~valid] = 0.0
-    return ReadoutSignals(
-        model.header.site_axis_id,
-        values,
-        ComponentValidity((model.header.site_axis_id,), valid),
-    )
+    return extract_readout_features(bind_readout_feature_spec(model, site_map), frame)
 
 
 def classify_occupancy(model: ReadoutModel, signals: ReadoutSignals) -> OccupancyDecision:
@@ -1411,14 +1780,18 @@ __all__ = [
     "ReadoutModelHeader",
     "ReadoutModelKind",
     "ReadoutModelQuality",
+    "ReadoutFeatureSpec",
     "ReadoutSignals",
     "SiteMap",
     "UniformPsfReadoutModel",
     "apply_readout_model",
+    "bind_readout_feature_spec",
     "calibration_resource_summary",
     "derive_calibration_source_binding",
     "classify_occupancy",
     "extract_readout_signals",
+    "extract_readout_features",
+    "readout_background_value",
     "validate_calibration_artifact_resources",
     "validate_calibration_artifact_source_compatibility",
     "validate_calibration_resource_summary",

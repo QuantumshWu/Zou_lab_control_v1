@@ -46,7 +46,7 @@ from .codec import (
 
 CALIBRATION_SOURCE_BINDING_SCHEMA = "zlc_neutral_atom.calibration-source-binding.v1"
 SITE_MAP_SCHEMA = "zlc_neutral_atom.site-map.v1"
-READOUT_MODEL_QUALITY_SCHEMA = "zlc_neutral_atom.readout-model-quality.v1"
+READOUT_MODEL_QUALITY_SCHEMA = "zlc_neutral_atom.readout-model-quality.v2"
 READOUT_MODEL_HEADER_SCHEMA = "zlc_neutral_atom.readout-model-header.v1"
 READOUT_MODEL_SCHEMA = "zlc_neutral_atom.readout-model.v1"
 DEFAULT_MODEL_POLICY_SCHEMA = "zlc_neutral_atom.default-model-policy.v1"
@@ -267,6 +267,16 @@ def readout_model_quality_to_tree(value: ReadoutModelQuality) -> dict[str, Any]:
         "usable_sites": validity_to_tree(value.usable_sites),
         "dark_training_sample_counts": value.dark_training_sample_counts,
         "bright_training_sample_counts": value.bright_training_sample_counts,
+        "held_out_dark_success_counts": value.held_out_dark_success_counts,
+        "held_out_dark_total_counts": value.held_out_dark_total_counts,
+        "held_out_bright_success_counts": value.held_out_bright_success_counts,
+        "held_out_bright_total_counts": value.held_out_bright_total_counts,
+        "held_out_dark_accuracy_lower_bounds": (
+            value.held_out_dark_accuracy_lower_bounds
+        ),
+        "held_out_bright_accuracy_lower_bounds": (
+            value.held_out_bright_accuracy_lower_bounds
+        ),
         "held_out_fidelity": value.held_out_fidelity,
         "held_out_validity": validity_to_tree(value.held_out_validity),
         "quality_gate_id": value.quality_gate_id,
@@ -284,6 +294,12 @@ def readout_model_quality_from_tree(tree: Any) -> ReadoutModelQuality:
             "usable_sites",
             "dark_training_sample_counts",
             "bright_training_sample_counts",
+            "held_out_dark_success_counts",
+            "held_out_dark_total_counts",
+            "held_out_bright_success_counts",
+            "held_out_bright_total_counts",
+            "held_out_dark_accuracy_lower_bounds",
+            "held_out_bright_accuracy_lower_bounds",
             "held_out_fidelity",
             "held_out_validity",
             "quality_gate_id",
@@ -297,6 +313,18 @@ def readout_model_quality_from_tree(tree: Any) -> ReadoutModelQuality:
         _component_validity(data["usable_sites"], "usable_sites"),
         _ndarray(data["dark_training_sample_counts"], "dark_training_sample_counts"),
         _ndarray(data["bright_training_sample_counts"], "bright_training_sample_counts"),
+        _ndarray(data["held_out_dark_success_counts"], "held_out_dark_success_counts"),
+        _ndarray(data["held_out_dark_total_counts"], "held_out_dark_total_counts"),
+        _ndarray(data["held_out_bright_success_counts"], "held_out_bright_success_counts"),
+        _ndarray(data["held_out_bright_total_counts"], "held_out_bright_total_counts"),
+        _ndarray(
+            data["held_out_dark_accuracy_lower_bounds"],
+            "held_out_dark_accuracy_lower_bounds",
+        ),
+        _ndarray(
+            data["held_out_bright_accuracy_lower_bounds"],
+            "held_out_bright_accuracy_lower_bounds",
+        ),
         _ndarray(data["held_out_fidelity"], "held_out_fidelity"),
         _component_validity(data["held_out_validity"], "held_out_validity"),
         _text(data["quality_gate_id"], "quality_gate_id"),
@@ -597,6 +625,12 @@ def _resource_admission(resource_policy: CalibrationResourcePolicy):
             "occupied_above_thresholds",
             "dark_training_sample_counts",
             "bright_training_sample_counts",
+            "held_out_dark_success_counts",
+            "held_out_dark_total_counts",
+            "held_out_bright_success_counts",
+            "held_out_bright_total_counts",
+            "held_out_dark_accuracy_lower_bounds",
+            "held_out_bright_accuracy_lower_bounds",
             "held_out_fidelity",
             "boxes_xywh",
             "kernels",
