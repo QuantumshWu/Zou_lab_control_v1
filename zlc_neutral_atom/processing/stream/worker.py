@@ -7,6 +7,12 @@ import time
 import math
 
 from zlc_storage import canonical_digest
+from zlc_neutral_atom.runtime._failure import (
+    clear_exception_traceback,
+    detach_exception_graph,
+    record_secondary_failure,
+    safe_error_summary,
+)
 from zlc_neutral_atom.runtime.cancellation import CancellationRequested, CancellationToken
 from zlc_neutral_atom.runtime.dataset import (
     DatasetBuilder,
@@ -38,6 +44,29 @@ from .contract import BoundStreamProcessor
 
 class StreamProcessorError(RuntimeError):
     pass
+
+
+def _drop_exception_tracebacks(error: BaseException | None) -> BaseException | None:
+    """Retain bounded failure location evidence without retaining stack frames."""
+
+    return detach_exception_graph(
+        error,
+        note_prefix="detached processor traceback",
+        sever_chaining=True,
+        replace_with_evidence=True,
+    )
+
+
+def _compact_failure(error: BaseException | None) -> BaseException | None:
+    try:
+        return _drop_exception_tracebacks(error)
+    except BaseException:
+        if error is not None:
+            try:
+                clear_exception_traceback(error)
+            except BaseException:
+                pass
+        return error
 
 
 class _TerminalDatasetOutput:
@@ -417,7 +446,6 @@ class ExactStreamProcessorWorker:
 
     def start(self) -> None:
         start_failure: BaseException | None = None
-        failure_traceback = None
         with self._condition:
             if self._thread is not None or self._done or self._closing:
                 raise StreamProcessorError("processor worker can start only once")
@@ -444,14 +472,42 @@ class ExactStreamProcessorWorker:
                 self._error = error
                 self._closing = True
                 start_failure = error
-                failure_traceback = error.__traceback__
         if start_failure is not None:
-            self._propagate_output_failure(start_failure)
-            self._cleanup(False)
+            failure_summary = safe_error_summary(start_failure)
+            cancelled = isinstance(start_failure, CancellationRequested)
+            detached_failure = _compact_failure(start_failure)
+            assert detached_failure is not None
             with self._condition:
-                self._done = True
-                self._condition.notify_all()
-            raise start_failure.with_traceback(failure_traceback)
+                self._error = detached_failure
+            try:
+                self._propagate_output_failure(detached_failure)
+            except BaseException as propagation_error:
+                record_secondary_failure(
+                    detached_failure,
+                    "output failure propagation also failed",
+                    propagation_error,
+                )
+            finally:
+                try:
+                    self._cleanup(False, cancelled=cancelled)
+                except BaseException as cleanup_error:
+                    record_secondary_failure(
+                        detached_failure,
+                        "processor start rollback also failed",
+                        cleanup_error,
+                    )
+                finally:
+                    with self._condition:
+                        self._error = _compact_failure(self._error)
+                        self._done = True
+                        self._condition.notify_all()
+            # The original failure is retained as detached worker evidence.
+            # Raising that same object would attach this frame again and form
+            # worker -> error -> start-frame -> worker when cyclic GC is off.
+            raise StreamProcessorError(
+                "exact stream processor failed before its worker thread started: "
+                + failure_summary
+            ) from None
 
     def finish(self, eos: EndOfStream, timeout: float | None = None) -> SealedDatasetArtifact:
         if not isinstance(eos, EndOfStream):
@@ -537,19 +593,25 @@ class ExactStreamProcessorWorker:
                     preflight_only = False
         if wait_for_existing_close:
             self.wait(timeout)
+            self._drop_stored_error_tracebacks()
             return
         if preflight_only:
-            self._propagate_output_failure(self._error)
-            self._cleanup(False)
+            with self._condition:
+                self._error = _compact_failure(self._error)
+                error = self._error
+            self._propagate_output_failure(error)
+            self._cleanup(False, cancelled=True)
             with self._condition:
                 self._done = True
                 self._condition.notify_all()
             return
         self.cancel("processor closed")
         self.wait(timeout)
+        self._drop_stored_error_tracebacks()
 
     def _run(self) -> None:
         succeeded = False
+        cancelled = False
         try:
             for index, expected_key in enumerate(self._expected_keys):
                 self._checkpoint()
@@ -587,14 +649,21 @@ class ExactStreamProcessorWorker:
                 self._result = result
             succeeded = True
         except BaseException as error:
+            cancelled = isinstance(error, CancellationRequested)
+            error = _compact_failure(error) or error
             with self._condition:
                 self._error = error
             self._propagate_output_failure(error)
         finally:
-            self._cleanup(succeeded)
+            self._cleanup(succeeded, cancelled=cancelled)
             with self._condition:
+                self._error = _compact_failure(self._error)
                 self._done = True
                 self._condition.notify_all()
+
+    def _drop_stored_error_tracebacks(self) -> None:
+        with self._condition:
+            self._error = _compact_failure(self._error)
 
     def _next_input(self) -> Delivery:
         while True:
@@ -695,14 +764,21 @@ class ExactStreamProcessorWorker:
         self._remaining()
 
     def _propagate_output_failure(self, error: BaseException | None) -> None:
-        reason = "processor failed" if error is None else f"processor failed: {error}"
+        reason = (
+            "processor failed"
+            if error is None
+            else f"processor failed: {safe_error_summary(error)}"
+        )
         try:
             self._output_producer.fail(SourceFailed(reason))
         except StreamEndedEarly:
             pass
         except BaseException as cleanup_error:
-            if error is not None:
-                error.add_note(f"output stream failure also failed: {cleanup_error!r}")
+            record_secondary_failure(
+                error,
+                "output stream failure also failed",
+                cleanup_error,
+            )
         teardown_deadline = max(self._deadline_monotonic, time.monotonic()) + 1.0
         try:
             self._output_sink.cancel_and_join(
@@ -711,13 +787,13 @@ class ExactStreamProcessorWorker:
                 deadline_monotonic=teardown_deadline,
             )
         except BaseException as cleanup_error:
-            if error is not None:
-                error.add_note(
-                    f"downstream processor teardown also failed: {cleanup_error!r}"
-                )
+            record_secondary_failure(
+                error,
+                "downstream processor teardown also failed",
+                cleanup_error,
+            )
 
-    def _cleanup(self, succeeded: bool) -> None:
-        cancelled = isinstance(self._error, CancellationRequested)
+    def _cleanup(self, succeeded: bool, *, cancelled: bool = False) -> None:
         if not succeeded and self._input_reservation.state in (
             ReservationState.ACTIVE,
             ReservationState.DRAINING,
@@ -730,17 +806,22 @@ class ExactStreamProcessorWorker:
                     cancelled=cancelled,
                 )
             except BaseException as cleanup_error:
-                if self._error is not None:
-                    self._error.add_note(
-                        f"input reservation abort also failed: {cleanup_error!r}"
-                    )
+                record_secondary_failure(
+                    self._error,
+                    "input reservation abort also failed",
+                    cleanup_error,
+                )
         try:
             self._output_sink.close()
         except BaseException as cleanup_error:
             if self._error is None:
                 self._error = cleanup_error
             else:
-                self._error.add_note(f"output builder close also failed: {cleanup_error!r}")
+                record_secondary_failure(
+                    self._error,
+                    "output builder close also failed",
+                    cleanup_error,
+                )
         if self._input_reservation.state in (
             ReservationState.COMPLETED,
             ReservationState.FAILED,
@@ -752,8 +833,10 @@ class ExactStreamProcessorWorker:
                 if self._error is None:
                     self._error = cleanup_error
                 else:
-                    self._error.add_note(
-                        f"input reservation release also failed: {cleanup_error!r}"
+                    record_secondary_failure(
+                        self._error,
+                        "input reservation release also failed",
+                        cleanup_error,
                     )
 
 

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass
 from types import MappingProxyType
 import threading
 import time
+import weakref
 
 import numpy as np
 import pytest
@@ -225,6 +227,22 @@ def artifact_ref(seed: str) -> ArtifactInputRef:
         schema_id,
         encode({"schema": schema_id, "id": seed}),
         seed * 64,
+    )
+
+
+def assert_failure_evidence(error: BaseException | None, expected_type: type) -> None:
+    assert error is not None
+    assert error.original_type == expected_type.__name__
+    assert error.__traceback__ is None
+
+
+def evidence_contains(error: BaseException | None, expected_type: type) -> bool:
+    if error is None:
+        return False
+    prefix = expected_type.__name__ + ":"
+    return any(
+        type(summary) is str and summary.startswith(prefix)
+        for summary in error.related_summaries
     )
 
 
@@ -786,10 +804,35 @@ def test_operator_failure_leaves_failing_input_unacknowledged_and_joins():
     item.worker.wait(2.0)
     with pytest.raises(StreamProcessorError) as caught:
         item.worker.raise_if_failed()
-    assert isinstance(caught.value.__cause__, ArithmeticError)
+    assert_failure_evidence(caught.value.__cause__, ArithmeticError)
     assert item.reservation.acknowledged_sequence == 1
     assert item.reservation.state is ReservationState.RELEASED
     assert not item.worker.is_alive
+
+
+def test_failed_processor_graph_releases_without_cyclic_gc():
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        item = chain(operator=fail_on_two)
+        source_reference = weakref.ref(item.source)
+        cursor_reference = weakref.ref(item.worker._input_cursor)
+        worker_reference = weakref.ref(item.worker)
+        item.worker.start()
+        emit(item, 0)
+        emit(item, 1)
+        item.worker.wait(2.0)
+        assert_failure_evidence(item.worker.error, ArithmeticError)
+        assert item.reservation.state is ReservationState.RELEASED
+
+        del item
+
+        assert source_reference() is None
+        assert cursor_reference() is None
+        assert worker_reference() is None
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def test_cancellation_while_waiting_is_bounded_and_joins():
@@ -799,7 +842,7 @@ def test_cancellation_while_waiting_is_bounded_and_joins():
     item.worker.wait(2.0)
     with pytest.raises(StreamProcessorError) as caught:
         item.worker.raise_if_failed()
-    assert isinstance(caught.value.__cause__, CancellationRequested)
+    assert_failure_evidence(caught.value.__cause__, CancellationRequested)
     assert item.reservation.state is ReservationState.RELEASED
     assert not item.worker.is_alive
 
@@ -838,7 +881,7 @@ def test_source_failure_and_retention_overrun_propagate_and_join():
     item.worker.wait(2.0)
     with pytest.raises(StreamProcessorError) as caught:
         item.worker.raise_if_failed()
-    assert isinstance(caught.value.__cause__, SourceFailed)
+    assert_failure_evidence(caught.value.__cause__, SourceFailed)
 
     overrun = chain(
         points=2,
@@ -852,7 +895,7 @@ def test_source_failure_and_retention_overrun_propagate_and_join():
     overrun.worker.wait(2.0)
     with pytest.raises(StreamProcessorError) as caught:
         overrun.worker.raise_if_failed()
-    assert isinstance(caught.value.__cause__, RetentionOverrun)
+    assert_failure_evidence(caught.value.__cause__, RetentionOverrun)
 
 
 def test_gap_and_join_key_mismatch_are_fail_closed():
@@ -866,7 +909,7 @@ def test_gap_and_join_key_mismatch_are_fail_closed():
     gap.worker.wait(2.0)
     with pytest.raises(StreamProcessorError) as caught:
         gap.worker.raise_if_failed()
-    assert isinstance(caught.value.__cause__, StreamGap)
+    assert_failure_evidence(caught.value.__cause__, StreamGap)
 
     mismatch = chain(points=2)
     mismatch.worker.start()
@@ -874,7 +917,7 @@ def test_gap_and_join_key_mismatch_are_fail_closed():
     mismatch.worker.wait(2.0)
     with pytest.raises(StreamProcessorError, match="failed") as caught:
         mismatch.worker.raise_if_failed()
-    assert isinstance(caught.value.__cause__, StreamProcessorError)
+    assert_failure_evidence(caught.value.__cause__, StreamProcessorError)
     assert mismatch.reservation.acknowledged_sequence == 0
 
 
@@ -886,7 +929,7 @@ def test_terminal_failure_and_supersede_after_last_event_wake_worker():
     failed.worker.wait(2.0)
     with pytest.raises(StreamProcessorError) as caught:
         failed.worker.raise_if_failed()
-    assert isinstance(caught.value.__cause__, SourceFailed)
+    assert_failure_evidence(caught.value.__cause__, SourceFailed)
     assert not failed.worker.is_alive
 
     superseded = chain(points=1)
@@ -896,7 +939,7 @@ def test_terminal_failure_and_supersede_after_last_event_wake_worker():
     superseded.worker.wait(2.0)
     with pytest.raises(StreamProcessorError) as caught:
         superseded.worker.raise_if_failed()
-    assert isinstance(caught.value.__cause__, SchemaChanged)
+    assert_failure_evidence(caught.value.__cause__, SchemaChanged)
     assert not superseded.worker.is_alive
 
 
@@ -907,7 +950,7 @@ def test_missing_terminal_and_late_operator_fail_with_declared_deadlines():
     missing.worker.wait(2.0)
     with pytest.raises(StreamProcessorError) as caught:
         missing.worker.raise_if_failed()
-    assert isinstance(caught.value.__cause__, TimeoutError)
+    assert_failure_evidence(caught.value.__cause__, TimeoutError)
     assert not missing.worker.is_alive
 
     late = chain(
@@ -920,7 +963,7 @@ def test_missing_terminal_and_late_operator_fail_with_declared_deadlines():
     late.worker.wait(2.0)
     with pytest.raises(StreamProcessorError) as caught:
         late.worker.raise_if_failed()
-    assert isinstance(caught.value.__cause__, TimeoutError)
+    assert_failure_evidence(caught.value.__cause__, TimeoutError)
     assert late.reservation.acknowledged_sequence == 0
 
 
@@ -983,7 +1026,7 @@ def test_downstream_seal_crossing_absolute_deadline_cannot_complete_upstream(mon
     emit(item, 0)
     with pytest.raises(StreamProcessorError) as caught:
         item.worker.finish(item.producer.finish(), 1.0)
-    assert isinstance(caught.value.__cause__, TimeoutError)
+    assert_failure_evidence(caught.value.__cause__, TimeoutError)
     assert upstream_completions == []
     assert item.reservation.state is ReservationState.RELEASED
     assert not item.worker.is_alive
@@ -1212,7 +1255,7 @@ def test_worker_revalidates_formal_trace_before_operator_or_ack():
     item.worker.wait(2.0)
     with pytest.raises(StreamProcessorError) as caught:
         item.worker.raise_if_failed()
-    assert isinstance(caught.value.__cause__, StreamError)
+    assert_failure_evidence(caught.value.__cause__, StreamError)
     assert item.output.next_sequence == 0
     assert item.reservation.acknowledged_sequence == 0
     assert item.reservation.state is ReservationState.RELEASED
@@ -1227,10 +1270,14 @@ def test_thread_start_failure_synchronously_releases_the_exact_graph(monkeypatch
         raise failure
 
     monkeypatch.setattr(threading.Thread, "start", fail_start)
-    with pytest.raises(RuntimeError) as caught:
+    with pytest.raises(StreamProcessorError, match="before its worker thread started"):
         item.worker.start()
-    assert caught.value is failure
-    assert item.worker.error is failure
+    assert_failure_evidence(item.worker.error, RuntimeError)
+    assert failure.__traceback__ is None
+    assert any(
+        note.startswith("detached processor traceback: ")
+        for note in getattr(item.worker.error, "__notes__", ())
+    )
     assert item.reservation.state is ReservationState.RELEASED
     assert not item.source._reservations
     assert not item.output._reservations
@@ -1239,13 +1286,132 @@ def test_thread_start_failure_synchronously_releases_the_exact_graph(monkeypatch
     item.worker.close(0.05)
 
 
+def test_thread_start_failure_releases_worker_graph_without_cyclic_gc(monkeypatch):
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        item = chain(points=1)
+        source_reference = weakref.ref(item.source)
+        worker_reference = weakref.ref(item.worker)
+        failure = RuntimeError("failure embeds worker", item.worker)
+
+        def fail_start(_thread):
+            raise failure
+
+        monkeypatch.setattr(threading.Thread, "start", fail_start)
+        try:
+            item.worker.start()
+        except StreamProcessorError:
+            pass
+        else:
+            raise AssertionError("worker start failure was not propagated")
+
+        assert item.reservation.state is ReservationState.RELEASED
+        assert_failure_evidence(item.worker.error, RuntimeError)
+        monkeypatch.undo()
+        del failure
+        del fail_start
+        del item
+
+        assert source_reference() is None
+        assert worker_reference() is None
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def test_hostile_start_exception_cannot_interrupt_worker_rollback(monkeypatch):
+    class HostileStartError(RuntimeError):
+        def __str__(self):
+            raise ValueError("hostile __str__")
+
+        def __repr__(self):
+            raise ValueError("hostile __repr__")
+
+    item = chain(points=1)
+    failure = HostileStartError()
+
+    def fail_start(_thread):
+        raise failure
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(StreamProcessorError, match="HostileStartError"):
+        item.worker.start()
+
+    assert_failure_evidence(item.worker.error, HostileStartError)
+    assert failure.__traceback__ is None
+    assert item.worker._done
+    assert item.reservation.state is ReservationState.RELEASED
+    assert not item.source._reservations
+    assert not item.output._reservations
+    assert item.source._formal_rebind_required
+    item.worker.close(0.05)
+
+
+def test_blocking_exception_hooks_are_never_called_during_worker_rollback(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingStartError(RuntimeError):
+        @property
+        def args(self):
+            entered.set()
+            release.wait(1.0)
+            return ("blocked args",)
+
+        @property
+        def __notes__(self):
+            entered.set()
+            release.wait(1.0)
+            return []
+
+        def __str__(self):
+            entered.set()
+            release.wait(1.0)
+            return "blocked str"
+
+    item = chain(points=1)
+    failure = BlockingStartError("safe base args")
+    original_start = threading.Thread.start
+
+    def fail_processor_start(thread):
+        if thread.name.startswith("stream-processor:"):
+            raise failure
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_processor_start)
+    outcome = []
+
+    def invoke_start():
+        try:
+            item.worker.start()
+        except BaseException as error:
+            outcome.append(error)
+
+    caller = threading.Thread(target=invoke_start, name="test-worker-start-caller")
+    caller.start()
+    caller.join(0.5)
+    try:
+        assert not caller.is_alive()
+        assert not entered.is_set()
+        assert len(outcome) == 1
+        assert isinstance(outcome[0], StreamProcessorError)
+        assert item.worker._done
+        assert item.reservation.state is ReservationState.RELEASED
+        assert not item.source._reservations
+        assert not item.output._reservations
+    finally:
+        release.set()
+        caller.join(1.0)
+
+
 def test_pre_start_deadline_failure_synchronously_releases_the_exact_graph():
     item = chain(points=1)
     item.worker._deadline_monotonic = time.monotonic() - 1.0
 
-    with pytest.raises(TimeoutError, match="deadline expired") as caught:
+    with pytest.raises(StreamProcessorError, match="before its worker thread started"):
         item.worker.start()
-    assert item.worker.error is caught.value
+    assert_failure_evidence(item.worker.error, TimeoutError)
     assert item.reservation.state is ReservationState.RELEASED
     assert not item.source._reservations
     assert not item.output._reservations
@@ -1344,7 +1510,7 @@ def test_cancel_arriving_inside_operator_prevents_output_emit_and_input_ack():
     item.worker.wait(2.0)
     with pytest.raises(StreamProcessorError) as caught:
         item.worker.raise_if_failed()
-    assert isinstance(caught.value.__cause__, CancellationRequested)
+    assert_failure_evidence(caught.value.__cause__, CancellationRequested)
     assert item.output.next_sequence == 0
     assert item.reservation.acknowledged_sequence == 0
     assert not item.worker.is_alive
@@ -1356,7 +1522,7 @@ def test_absolute_deadline_bounds_input_wait_and_thread_teardown():
     item.worker.wait(1.0)
     with pytest.raises(StreamProcessorError) as caught:
         item.worker.raise_if_failed()
-    assert isinstance(caught.value.__cause__, TimeoutError)
+    assert_failure_evidence(caught.value.__cause__, TimeoutError)
     assert item.reservation.state is ReservationState.RELEASED
     assert not item.worker.is_alive
 
@@ -1415,6 +1581,27 @@ def test_two_live_processor_stages_reach_one_terminal_dataset_with_full_lineage(
     assert not item.second.is_alive
 
 
+def test_exact_reservation_owns_downstream_stage_only_until_release_without_gc():
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        item = two_stage_chain(points=2)
+        second_reference = weakref.ref(item.second)
+        item.second = None
+
+        assert second_reference() is not None
+        emit_two_stage(item, 0)
+        emit_two_stage(item, 1)
+        artifact = item.first.finish(item.producer.finish(), 2.0)
+
+        assert tuple(int(value) for value in artifact.block.values[0, :]) == (6, 12)
+        assert item.intermediate_reservation.state is ReservationState.RELEASED
+        assert second_reference() is None
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
 def test_artifact_causation_is_direct_while_sealed_derivation_is_root_complete():
     shared = artifact_ref("a")
     tail_only = artifact_ref("b")
@@ -1465,12 +1652,7 @@ def test_downstream_operator_failure_propagates_without_upstream_ack():
 
     with pytest.raises(StreamProcessorError) as caught:
         item.first.raise_if_failed()
-    causes = []
-    error = caught.value
-    while error is not None:
-        causes.append(error)
-        error = error.__cause__
-    assert any(isinstance(error, ArithmeticError) for error in causes)
+    assert evidence_contains(caught.value.__cause__, ArithmeticError)
     assert item.source_reservation.acknowledged_sequence == 0
     assert item.intermediate_reservation.acknowledged_sequence == 0
     assert item.source_reservation.state is ReservationState.RELEASED
@@ -1508,12 +1690,7 @@ def test_downstream_operator_deadline_propagates_without_upstream_ack():
 
     with pytest.raises(StreamProcessorError) as caught:
         item.first.raise_if_failed()
-    causes = []
-    error = caught.value
-    while error is not None:
-        causes.append(error)
-        error = error.__cause__
-    assert any(isinstance(error, TimeoutError) for error in causes)
+    assert evidence_contains(caught.value.__cause__, TimeoutError)
     assert item.source_reservation.acknowledged_sequence == 0
     assert item.intermediate_reservation.acknowledged_sequence == 0
     assert not item.first.is_alive
@@ -1539,12 +1716,7 @@ def test_downstream_gap_propagates_without_acknowledging_upstream_input():
 
     with pytest.raises(StreamProcessorError) as caught:
         item.first.raise_if_failed()
-    causes = []
-    error = caught.value
-    while error is not None:
-        causes.append(error)
-        error = error.__cause__
-    assert any(isinstance(error, StreamGap) for error in causes)
+    assert evidence_contains(caught.value.__cause__, StreamGap)
     assert item.source_reservation.acknowledged_sequence == 0
     assert item.intermediate_reservation.acknowledged_sequence == 0
     assert not item.first.is_alive

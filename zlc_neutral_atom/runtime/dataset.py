@@ -40,6 +40,8 @@ from zlc_data import (
     point_layout_to_tree,
 )
 
+from ._failure import record_secondary_failure
+
 from .streams import (
     AcquisitionStream,
     ArtifactInputRef,
@@ -1093,7 +1095,7 @@ class SealedDatasetArtifact:
     def _belongs_to_terminal_reservation(self, reservation: object) -> bool:
         """Process-local ownership proof used only by PipelineResult minting."""
 
-        return self._terminal_reservation is reservation
+        return reservation is not None and self._terminal_reservation is reservation
 
     def _with_derivation(
         self,
@@ -1572,8 +1574,11 @@ class DatasetBuilder(Generic[PayloadT]):
         if cleanup_error is not None:
             if exc is None:
                 raise cleanup_error
-            if hasattr(exc, "add_note"):
-                exc.add_note(f"DatasetBuilder teardown also failed: {cleanup_error!r}")
+            record_secondary_failure(
+                exc,
+                "DatasetBuilder teardown also failed",
+                cleanup_error,
+            )
         return False
 
     def _mark_aborted_locked(self) -> None:

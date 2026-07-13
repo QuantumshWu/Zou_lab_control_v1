@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import pickle
 import threading
 import time
+import weakref
 from dataclasses import dataclass, field, replace
 
 import numpy as np
@@ -1402,7 +1404,7 @@ def test_minimal_pipeline_compiles_to_one_flat_run_and_returns_typed_result():
         PipelineResult(
             object(),
             result.dataset,
-            result._capture_completion,
+            object(),
             result._memory_admission,
         )
 
@@ -1428,7 +1430,6 @@ def test_pipeline_result_cross_binds_processed_root_span_and_stage_chain():
             memory_profile=PipelineMemoryProfile.for_current_runtime(1024),
             chain_contract_digest=readiness.chain_contract_digest,
         )
-        holder["processor"] = processor
         return processor
 
     def execute(context: RunContext, processor: ProcessorCaptureHarness):
@@ -1439,11 +1440,42 @@ def test_pipeline_result_cross_binds_processed_root_span_and_stage_chain():
                 processor.session.capture_next(context)
             completion = processor.session.complete(context)
             dataset = processor.worker.finish(completion.eos, 2.0)
-            return finalize_pipeline_result(
+            derivation = dataset.provenance.derivation
+            assert derivation is not None
+            wrong_digest = (
+                "0" * 64
+                if derivation.root_input_span.ordered_digest != "0" * 64
+                else "1" * 64
+            )
+            readiness = processor.session._exact_consumer_readiness
+            assert readiness is not None
+            forged_dataset = dataset._with_derivation(
+                readiness,
+                replace(derivation.root_input_span, ordered_digest=wrong_digest),
+            )
+            with pytest.raises(
+                RuntimeError,
+                match="derivation differs from capture readiness chain",
+            ):
+                PipelineResult(
+                    _PIPELINE_RESULT_TOKEN,
+                    forged_dataset,
+                    completion,
+                    holder["memory_admission"],
+                )
+            result = finalize_pipeline_result(
                 dataset=dataset,
                 capture_completion=completion,
                 memory_admission=holder["memory_admission"],
             )
+            with pytest.raises(RuntimeError, match="already consumed"):
+                PipelineResult(
+                    _PIPELINE_RESULT_TOKEN,
+                    dataset,
+                    completion,
+                    holder["memory_admission"],
+                )
+            return result
         except BaseException as error:
             processor.session.fail(error)
             raise
@@ -1468,8 +1500,7 @@ def test_pipeline_result_cross_binds_processed_root_span_and_stage_chain():
     derivation = result.dataset.provenance.derivation
     assert derivation is not None
     assert derivation.chain_contract_digest == result.chain_contract_digest
-    assert derivation.root_input_span == result._capture_completion.source_event_span
-    assert derivation.root_input_span.stream_id == holder["processor"].session.stream.stream_id
+    assert derivation.root_input_span == result.source_event_span
     assert derivation.root_input_span.count == item.contract.total_events
     assert len(derivation.stages) == 1
     assert (
@@ -1477,25 +1508,9 @@ def test_pipeline_result_cross_binds_processed_root_span_and_stage_chain():
         != result.dataset.provenance.ordered_metadata_digest
     )
 
-    wrong_digest = (
-        "0" * 64 if derivation.root_input_span.ordered_digest != "0" * 64 else "1" * 64
-    )
-    readiness = holder["processor"].session._exact_consumer_readiness
-    assert readiness is not None
-    forged_dataset = result.dataset._with_derivation(
-        readiness,
-        replace(derivation.root_input_span, ordered_digest=wrong_digest),
-    )
-    with pytest.raises(
-        RuntimeError,
-        match="derivation differs from capture readiness chain",
-    ):
-        PipelineResult(
-            _PIPELINE_RESULT_TOKEN,
-            forged_dataset,
-            result._capture_completion,
-            result._memory_admission,
-        )
+    assert result.processor_stages == derivation.stages
+    assert not hasattr(result, "_capture_completion")
+    assert result.dataset._terminal_reservation is None
 
 
 def test_pipeline_budget_rejects_before_run_or_hardware_prepare():
@@ -1563,17 +1578,87 @@ def test_compiled_pipeline_plan_is_reusable_sequentially():
     assert len(first.chain_contract_digest) == 64
     assert first.chain_contract_digest == second.chain_contract_digest
 
-    # Equal cardinality/content cannot authorize cross-run dataset substitution:
-    # the result mint checks the opaque terminal reservation owned by readiness.
-    from zlc_neutral_atom.runtime.pipeline import _PIPELINE_RESULT_TOKEN
+    # Returned values carry immutable evidence, not reusable live authority;
+    # cross-run substitution therefore has no capability with which to mint.
+    assert first.dataset._terminal_reservation is None
+    assert second.dataset._terminal_reservation is None
+    assert not hasattr(first, "_capture_completion")
+    assert not hasattr(second, "_capture_completion")
 
-    with pytest.raises(RuntimeError, match="another exact terminal consumer"):
-        PipelineResult(
-            _PIPELINE_RESULT_TOKEN,
-            first.dataset,
-            second._capture_completion,
-            first._memory_admission,
+
+def test_completed_pipeline_releases_live_graph_without_cyclic_gc():
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        item = harness(points=1)
+        base = compile_pipeline(minimal_pipeline(item))
+        references = {}
+        original_preflight = base.preflight
+
+        def observed_preflight(context: RunContext):
+            prepared = original_preflight(context)
+            references.update(
+                session=weakref.ref(prepared.session),
+                reservation=weakref.ref(prepared.reservation),
+                cursor=weakref.ref(prepared.cursor),
+                builder=weakref.ref(prepared.builder),
+            )
+            return prepared
+
+        plan = RunPlan(**{**base.__dict__, "preflight": observed_preflight})
+        result = RunController(ResourceArbiter(MemoryQuarantineJournal())).start(plan).result(
+            2.0
         )
+
+        assert isinstance(result, PipelineResult)
+        assert all(reference() is None for reference in references.values())
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def test_cancelled_pipeline_detaches_failure_graph_without_cyclic_gc():
+    from zlc_neutral_atom.runtime.run import _MISSING
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        item = harness(points=1)
+        item.camera.block_read.set()
+        base = compile_pipeline(minimal_pipeline(item))
+        references = {}
+        original_preflight = base.preflight
+
+        def observed_preflight(context: RunContext):
+            prepared = original_preflight(context)
+            references.update(
+                session=weakref.ref(prepared.session),
+                reservation=weakref.ref(prepared.reservation),
+                cursor=weakref.ref(prepared.cursor),
+                builder=weakref.ref(prepared.builder),
+            )
+            return prepared
+
+        plan = RunPlan(**{**base.__dict__, "preflight": observed_preflight})
+        controller = RunController(ResourceArbiter(MemoryQuarantineJournal()))
+        handle = controller.start(plan)
+        assert item.camera.read_entered.wait(1.0)
+        handle.cancel("test cancellation")
+        with pytest.raises((RunCancelled, RunFailed)) as caught:
+            handle.result(3.0)
+
+        primary = handle._primary
+        if primary is not None:
+            assert primary.__traceback__ is None
+            assert any(
+                note.startswith("detached run traceback: ")
+                for note in getattr(primary, "__notes__", ())
+            )
+        assert handle._result is _MISSING
+        assert all(reference() is None for reference in references.values())
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def test_compiled_pipeline_contends_on_one_physical_device():

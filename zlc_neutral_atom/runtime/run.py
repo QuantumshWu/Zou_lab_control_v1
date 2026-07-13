@@ -10,6 +10,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Generic, TypeVar
 
+from ._failure import (
+    clear_exception_traceback,
+    detach_exception_graph,
+    record_secondary_failure,
+    safe_error_summary,
+)
 from .cancellation import CancellationRequested, CancellationToken
 from .commit import (
     CheckpointCommit,
@@ -380,7 +386,7 @@ class FinalCommitReconciliationRequired(RuntimeError):
         self._committed_result = committed_result
         super().__init__(
             "final commit state is unresolved; durable reconciliation is required: "
-            f"{type(recovery_error).__name__}: {recovery_error}"
+            + safe_error_summary(recovery_error)
         )
 
 
@@ -404,7 +410,7 @@ class CheckpointReconciliationRequired(RuntimeError):
         self._committed_result = committed_result
         super().__init__(
             "checkpoint commit state is unresolved; durable reconciliation is required: "
-            f"{type(recovery_error).__name__}: {recovery_error}"
+            + safe_error_summary(recovery_error)
         )
 
 
@@ -412,10 +418,64 @@ class InterruptFailures(RuntimeError):
     def __init__(self, failures: tuple[tuple[SafetyInterrupt, BaseException], ...]) -> None:
         self.failures = failures
         detail = "; ".join(
-            f"{item.key}:{item.operation.value} -> {type(error).__name__}: {error}"
+            f"{item.key}:{item.operation.value} -> {safe_error_summary(error)}"
             for item, error in failures
         )
         super().__init__(f"one or more hardware interrupts failed: {detail}")
+
+
+def _interrupt_nested_errors(error: BaseException) -> tuple[BaseException, ...]:
+    if type(error) is not InterruptFailures:
+        return ()
+    failures = object.__getattribute__(error, "failures")
+    return tuple(failure for _operation, failure in failures)
+
+
+def _detach_run_exception(
+    error: BaseException | None,
+    *,
+    as_evidence: bool = False,
+) -> BaseException | None:
+    """No-fail conversion from live stack graph to terminal diagnostics."""
+
+    try:
+        return detach_exception_graph(
+            error,
+            note_prefix="detached run traceback",
+            sever_chaining=True,
+            replace_with_evidence=as_evidence,
+            nested_errors=_interrupt_nested_errors,
+        )
+    except BaseException:
+        if error is not None:
+            try:
+                clear_exception_traceback(error)
+            except BaseException:
+                pass
+        return error
+
+
+def _detach_run_errors(
+    primary: BaseException | None,
+    cleanup_errors: tuple[BaseException, ...],
+    interrupt_errors: tuple[BaseException, ...] = (),
+    *,
+    as_evidence: bool = False,
+) -> tuple[
+    BaseException | None,
+    tuple[BaseException, ...],
+    tuple[BaseException, ...],
+]:
+    detached_primary = _detach_run_exception(primary, as_evidence=as_evidence)
+    detached_cleanup = tuple(
+        _detach_run_exception(error, as_evidence=as_evidence) or error
+        for error in cleanup_errors
+    )
+    detached_interrupt = tuple(
+        _detach_run_exception(error, as_evidence=as_evidence) or error
+        for error in interrupt_errors
+    )
+    return detached_primary, detached_cleanup, detached_interrupt
 
 
 class RunContext:
@@ -779,10 +839,11 @@ class PostSafetyContext:
         if errors:
             primary = errors[0]
             for additional in errors[1:]:
-                if hasattr(primary, "add_note"):
-                    primary.add_note(
-                        f"additional prepared commit abandonment failed: {additional!r}"
-                    )
+                record_secondary_failure(
+                    primary,
+                    "additional prepared commit abandonment failed",
+                    additional,
+                )
             raise primary
 
     def _validate_commit_entry(
@@ -848,7 +909,7 @@ class RunHandle(Generic[ResultT]):
     ) -> None:
         self.run_id = run_id
         self._token = token
-        self._on_terminal = on_terminal
+        self._on_terminal: Callable[["RunHandle"], None] | None = on_terminal
         self._condition = threading.Condition(threading.RLock())
         self._revision = 0
         self._state = RunState.RUNNING
@@ -1045,6 +1106,21 @@ class RunHandle(Generic[ResultT]):
     def owner_thread_alive(self) -> bool:
         thread = self._owner_thread
         return thread is not None and thread.is_alive()
+
+    def _discard_unreturned_terminal_state(self) -> None:
+        """Break the never-started Thread graph after its snapshot is handed off."""
+
+        with self._condition:
+            if not self._state.terminal:
+                raise RuntimeError("only an unreturned terminal Run may be discarded")
+            self._primary = None
+            self._cleanup_errors = ()
+            self._result = _MISSING
+            self._interrupt_errors.clear()
+            self._owner_thread = None
+            self._interrupt = None
+            self._cancel_sealer = None
+            self._on_terminal = None
 
     def _snapshot_locked(self) -> RunSnapshot:
         return RunSnapshot(
@@ -1265,10 +1341,11 @@ class RunHandle(Generic[ResultT]):
         try:
             _discard_commit_authority(operation.authority)
         except BaseException as discard_error:
-            if hasattr(rejection, "add_note"):
-                rejection.add_note(
-                    f"rejected commit authority discard also failed: {discard_error!r}"
-                )
+            record_secondary_failure(
+                rejection,
+                "rejected commit authority discard also failed",
+                discard_error,
+            )
 
     def _admit_commit(
         self,
@@ -1793,7 +1870,19 @@ class RunHandle(Generic[ResultT]):
                 cleanup_errors=cleanup_errors,
             )
 
-        return _mint_terminal_publication(publish, lambda: self._on_terminal(self))
+        def after_resource_release() -> None:
+            with self._condition:
+                callback = self._on_terminal
+            if callback is None:
+                raise RuntimeError("Run terminal observer was already released")
+            try:
+                callback(self)
+            finally:
+                with self._condition:
+                    if self._on_terminal is callback:
+                        self._on_terminal = None
+
+        return _mint_terminal_publication(publish, after_resource_release)
 
     def _publish_terminal(
         self,
@@ -1823,11 +1912,21 @@ class RunHandle(Generic[ResultT]):
                 result = self._result
             elif state is RunState.SUCCEEDED and self._token.is_cancelled:
                 state = RunState.CANCELLED
+            if state is not RunState.SUCCEEDED:
+                result = _MISSING
+            interrupt_errors = tuple(self._interrupt_errors)
+            primary, cleanup_errors, _detached_interrupt = _detach_run_errors(
+                primary,
+                cleanup_errors,
+                interrupt_errors,
+                as_evidence=True,
+            )
             self._state = state
             self._phase = "terminal"
             self._result = result
             self._primary = primary
             self._cleanup_errors = cleanup_errors
+            self._interrupt_errors.clear()
             self._retry_disposition = None
             self._recovery_instruction = None
             self._interrupt = None
@@ -1894,6 +1993,7 @@ class RunController:
         handle._bind_owner(thread, interrupt)
         with self._lock:
             self._handles[run_id] = handle
+        start_failure: str | None = None
         try:
             thread.start()
         except BaseException as start_exc:
@@ -1908,7 +2008,22 @@ class RunController:
                     cleanup_errors=(),
             )
             acquired.release_terminal(publication, disposition="FAILED")
-            raise
+            start_failure = _format_error(start_exc)
+            handle._discard_unreturned_terminal_state()
+            _detach_run_exception(start_exc)
+            # Thread.run never got the chance to clear its target/args.  Remove
+            # every local edge to that graph before raising a diagnostic-only
+            # replacement from a frame that contains no live Run authority.
+            plan = None  # type: ignore[assignment]
+            acquired = None  # type: ignore[assignment]
+            token = None  # type: ignore[assignment]
+            context = None  # type: ignore[assignment]
+            handle = None  # type: ignore[assignment]
+            thread = None  # type: ignore[assignment]
+            interrupt = None
+            self = None  # type: ignore[assignment]
+        if start_failure is not None:
+            raise RuntimeError(f"Run owner thread failed to start: {start_failure}")
         return handle
 
     def run(
@@ -1993,7 +2108,9 @@ class RunController:
         except QuarantineJournalError as exc:
             def retry_start() -> None:
                 lease.activate_hazards(plan.hazard_claims)
-                RunController._run_after_hazards(plan, lease, handle, context)
+                RunController._run_after_hazards_guarded(
+                    plan, lease, handle, context
+                )
 
             handle._install_retry(
                 retry_start,
@@ -2001,7 +2118,109 @@ class RunController:
                 (exc,),
             )
             return
-        RunController._run_after_hazards(plan, lease, handle, context)
+        RunController._run_after_hazards_guarded(plan, lease, handle, context)
+
+    @staticmethod
+    def _run_after_hazards_guarded(
+        plan: RunPlan[PreparedT, ResultT],
+        lease: ResourceLease,
+        handle: RunHandle[ResultT],
+        context: RunContext,
+    ) -> None:
+        try:
+            RunController._run_after_hazards(plan, lease, handle, context)
+        except BaseException as unexpected:
+            RunController._fail_closed_internal_error(
+                plan, lease, handle, context, unexpected
+            )
+
+    @staticmethod
+    def _fail_closed_internal_error(
+        plan: RunPlan[PreparedT, ResultT],
+        lease: ResourceLease,
+        handle: RunHandle[ResultT],
+        context: RunContext,
+        unexpected: BaseException,
+    ) -> None:
+        """Last-resort owner-lane terminalization for lifecycle implementation faults."""
+
+        if lease.released or handle.snapshot().state.terminal:
+            return
+        try:
+            context.set_phase("internal-fail-closed")
+        except BaseException as phase_error:
+            record_secondary_failure(
+                unexpected, "recording internal fail-closed phase failed", phase_error
+            )
+        try:
+            handle._begin_cleanup_after_interrupt()
+        except BaseException as interrupt_error:
+            record_secondary_failure(
+                unexpected, "quiescing interrupt lane failed", interrupt_error
+            )
+        if not lease.safety_committed:
+            try:
+                context._revoke_hardware_before_safety()
+            except BaseException as revoke_error:
+                record_secondary_failure(
+                    unexpected, "revoking hardware authority failed", revoke_error
+                )
+            decisions = tuple(
+                SafetyDecision.unsafe(
+                    hazard.key,
+                    reason="runtime lifecycle failed before safe-state proof completed",
+                    recovery_action=(
+                        "verify device identity, generation, health, and physical safe state"
+                    ),
+                )
+                for hazard in plan.hazard_claims
+            )
+            try:
+                bundle = lease._commit_safety(decisions)
+            except QuarantineJournalError as journal_error:
+                journal_error = _detach_run_exception(journal_error) or journal_error
+                unexpected = _detach_run_exception(unexpected) or unexpected
+
+                def retry_internal_safety() -> None:
+                    committed = lease._commit_safety(decisions)
+                    RunController._publish_internal_failure(
+                        lease, handle, context, unexpected, committed
+                    )
+
+                handle._install_retry(
+                    retry_internal_safety,
+                    "repair the authoritative safety journal, then finish fail-closed termination",
+                    (unexpected, journal_error),
+                )
+                return
+        else:
+            bundle = lease.safety_bundle
+        RunController._publish_internal_failure(
+            lease, handle, context, unexpected, bundle
+        )
+
+    @staticmethod
+    def _publish_internal_failure(
+        lease: ResourceLease,
+        handle: RunHandle,
+        context: RunContext,
+        unexpected: BaseException,
+        bundle: SafetyDispositionBundle | None,
+    ) -> None:
+        try:
+            context._mark_safety_durable(bundle)
+        except BaseException as mark_error:
+            record_secondary_failure(
+                unexpected, "recording durable safety disposition failed", mark_error
+            )
+        handle._mark_post_safety(bundle)
+        publication = handle._terminal_publication(
+            state=RunState.FAILED,
+            result=_MISSING,
+            primary=unexpected,
+            cleanup_errors=(),
+        )
+        lease.release_terminal(publication, disposition=RunState.FAILED.value)
 
     @staticmethod
     def _run_after_hazards(
@@ -2054,28 +2273,35 @@ class RunController:
             + coverage_errors
             + handle._interrupt_error_snapshot()
         )
+        # Cleanup is the last authorized consumer of the live prepared graph.
+        # Drop it before safety journaling/retry closures can retain it.
+        prepared = None
         if primary is None and handle._token.is_cancelled and not handle.snapshot().final_committed:
             primary = CancellationRequested(handle._token.snapshot().reason)
+        unsafe = tuple(
+            decision.key
+            for decision in decisions
+            if decision.outcome is SafetyOutcome.UNSAFE
+        )
+        primary, cleanup_errors, _ = _detach_run_errors(primary, cleanup_errors)
+        if primary is not None or cleanup_errors or unsafe:
+            result = _MISSING
 
         def continue_after_safety(bundle: SafetyDispositionBundle | None) -> None:
             nonlocal primary, result
             context._mark_safety_durable(bundle)
             handle._mark_post_safety(bundle)
             post_safety = context._post_safety_context()
-            unsafe = tuple(
-                decision.key
-                for decision in decisions
-                if decision.outcome is SafetyOutcome.UNSAFE
-            )
 
             def finish_terminal() -> None:
-                nonlocal primary
+                nonlocal primary, result
                 if (
                     primary is None
                     and handle._token.is_cancelled
                     and not handle.snapshot().final_committed
                 ):
                     primary = CancellationRequested(handle._token.snapshot().reason)
+                    result = _MISSING
                 state = _terminal_state(primary, cleanup_errors, unsafe)
                 publication = handle._terminal_publication(
                     state=state,
@@ -2087,6 +2313,7 @@ class RunController:
 
             if primary is None and handle._token.is_cancelled and not handle.snapshot().final_committed:
                 primary = CancellationRequested(handle._token.snapshot().reason)
+                result = _MISSING
             if primary is None and not cleanup_errors and not unsafe:
                 finalize_error: BaseException | None = None
                 try:
@@ -2095,17 +2322,21 @@ class RunController:
                     result = plan.finalize(post_safety, result)  # type: ignore[arg-type, assignment]
                 except BaseException as exc:
                     finalize_error = exc
+                    result = _MISSING
                 finally:
                     try:
                         post_safety._abandon_unconsumed_commits()
                     except BaseException as abandonment_error:
                         if finalize_error is None:
                             finalize_error = abandonment_error
-                        elif hasattr(finalize_error, "add_note"):
-                            finalize_error.add_note(
-                                "prepared commit abandonment also failed: "
-                                f"{abandonment_error!r}"
+                        else:
+                            record_secondary_failure(
+                                finalize_error,
+                                "prepared commit abandonment also failed",
+                                abandonment_error,
                             )
+
+                finalize_error = _detach_run_exception(finalize_error)
 
                 checkpoint_pending, final_pending = handle._pending_reconciliation_snapshot()
                 if checkpoint_pending is not None and final_pending is not None:
@@ -2199,6 +2430,7 @@ class RunController:
             context._revoke_hardware_before_safety()
             bundle = lease._commit_safety(decisions)
         except QuarantineJournalError as exc:
+            exc = _detach_run_exception(exc) or exc
             errors = cleanup_errors + (exc,)
 
             def retry_safety() -> None:
@@ -2275,4 +2507,4 @@ def _terminal_state(
 
 
 def _format_error(error: BaseException) -> str:
-    return f"{type(error).__name__}: {error}"
+    return safe_error_summary(error)

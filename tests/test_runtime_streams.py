@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import gc
 import threading
+import weakref
 
 import numpy as np
 import pytest
@@ -754,3 +756,38 @@ def test_first_terminal_fact_cannot_be_replaced():
         producer2.fail(SourceFailed("late failure"))
     with pytest.raises(SchemaChanged):
         source2.subscribe(start_sequence=0).next()
+
+
+def test_producer_owns_stream_but_terminal_receipt_does_not_create_a_cycle():
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        source, producer = stream()
+        source_reference = weakref.ref(source)
+
+        del source
+        assert source_reference() is producer._stream
+        eos = producer.finish()
+        del producer
+
+        assert source_reference() is None
+        assert eos._owner is None
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def test_dead_weak_authority_never_matches_none():
+    from zlc_neutral_atom.runtime.streams import _ObjectReference
+
+    class Owner:
+        pass
+
+    owner = Owner()
+    reference = _ObjectReference(owner)
+    owner_reference = weakref.ref(owner)
+    del owner
+
+    assert owner_reference() is None
+    assert reference.get() is None
+    assert not reference.matches(None)

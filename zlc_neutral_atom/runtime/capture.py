@@ -28,12 +28,14 @@ from zlc_neutral_atom.readout.contracts import (
     ReadoutBindingKey,
 )
 
+from ._failure import record_secondary_failure, safe_error_summary
 from .dataset import (
     DatasetCellAddress,
     DatasetCellKeyContract,
     DatasetEventAdapter,
     FrozenDatasetEdge,
     OrderedDatasetMetadataHasher,
+    SealedDatasetArtifact,
     dataset_cell_key_fingerprint,
 )
 from .ports import (
@@ -1224,6 +1226,28 @@ class CaptureCompletion:
     def processor_stages(self) -> tuple[ProcessorStageProvenance, ...]:
         return self._processor_stages
 
+    def _commit_pipeline_result(self, dataset: SealedDatasetArtifact) -> None:
+        """Atomically consume dataset and completion live authority."""
+
+        session = self._session
+        if session is None:
+            raise RuntimeError("capture completion authority was already consumed")
+        session._commit_pipeline_authority(self, dataset)
+
+    def _validate_pipeline_authority(
+        self,
+    ) -> tuple["CaptureSession", ExactReservation]:
+        """Validate the final no-fail authority commit before any owner mutates."""
+
+        session = self._session
+        reservation = self._terminal_reservation
+        if session is None or reservation is None:
+            raise RuntimeError("capture completion authority was already consumed")
+        session._assert_owner_thread()
+        if not session.owns_completion(self):
+            raise RuntimeError("capture completion authority is absent or differs")
+        return session, reservation
+
 
 @dataclass(frozen=True)
 class BoundCapturePort:
@@ -1797,7 +1821,9 @@ class CaptureSession:
                         "capture prepare acknowledgement differs from frozen contract"
                     )
             except BaseException as error:
-                self._poison(SourceFailed(f"capture prepare failed: {error}"))
+                self._poison(
+                    SourceFailed(f"capture prepare failed: {safe_error_summary(error)}")
+                )
                 raise
             with self._lock:
                 self._state = CaptureSessionState.PREPARED
@@ -1827,7 +1853,9 @@ class CaptureSession:
                 )
                 self._validate_ack(ack, CaptureStartedAck)
             except BaseException as error:
-                self._poison(SourceFailed(f"capture start failed: {error}"))
+                self._poison(
+                    SourceFailed(f"capture start failed: {safe_error_summary(error)}")
+                )
                 raise
             with self._lock:
                 self._state = CaptureSessionState.STARTED
@@ -1925,7 +1953,10 @@ class CaptureSession:
                 )
             except BaseException as error:
                 self._poison(
-                    SourceFailed(f"captured payload failed validation/publish: {error}")
+                    SourceFailed(
+                        "captured payload failed validation/publish: "
+                        + safe_error_summary(error)
+                    )
                 )
                 raise
             with self._lock:
@@ -1981,7 +2012,12 @@ class CaptureSession:
                 eos = self._producer.finish()
                 object.__setattr__(completion, "_eos", eos)
             except BaseException as error:
-                self._poison(SourceFailed(f"capture terminal validation failed: {error}"))
+                self._poison(
+                    SourceFailed(
+                        "capture terminal validation failed: "
+                        + safe_error_summary(error)
+                    )
+                )
                 raise
             with self._lock:
                 self._state = CaptureSessionState.COMPLETED
@@ -1994,7 +2030,7 @@ class CaptureSession:
         with self._operation_lock:
             self._assert_owner_thread()
             failure = SourceFailed(
-                f"capture session aborted: {type(error).__name__}: {error}"
+                "capture session aborted: " + safe_error_summary(error)
             )
             self._poison(failure)
 
@@ -2037,12 +2073,24 @@ class CaptureSession:
                         )
                 except BaseException as error:
                     release_errors.append(error)
+            if reservation is None or reservation.state is ReservationState.RELEASED:
+                completion = self._completion
+                if completion is not None:
+                    try:
+                        self._consume_completion_authority(completion)
+                    except BaseException as error:
+                        release_errors.append(error)
+                with self._lock:
+                    self._reservation = None
+                    self._exact_consumer_readiness = None
+                    self._source_event_span_hasher = None
             if port_error is not None:
                 for error in release_errors:
-                    if hasattr(port_error, "add_note"):
-                        port_error.add_note(
-                            f"exact reservation teardown also failed: {error!r}"
-                        )
+                    record_secondary_failure(
+                        port_error,
+                        "exact reservation teardown also failed",
+                        error,
+                    )
                 raise port_error
             assert report is not None
             if not release_errors:
@@ -2069,6 +2117,56 @@ class CaptureSession:
                 and completion._session is self
                 and self._completion is completion
             )
+
+    def _consume_completion_authority(
+        self,
+        completion: CaptureCompletion,
+    ) -> None:
+        """Single no-allocation commit that breaks the completed owner graph."""
+
+        self._assert_owner_thread()
+        with self._lock:
+            if (
+                not isinstance(completion, CaptureCompletion)
+                or completion._session is not self
+                or completion._terminal_reservation is None
+                or self._completion is not completion
+            ):
+                raise RuntimeError("capture completion authority is absent or differs")
+            self._completion = None
+            self._exact_consumer_readiness = None
+            self._source_event_span_hasher = None
+            object.__setattr__(completion, "_session", None)
+            object.__setattr__(completion, "_terminal_reservation", None)
+
+    def _commit_pipeline_authority(
+        self,
+        completion: CaptureCompletion,
+        dataset: SealedDatasetArtifact,
+    ) -> None:
+        """One owner-lane commit for all process-local result capabilities."""
+
+        self._assert_owner_thread()
+        if not isinstance(dataset, SealedDatasetArtifact):
+            raise TypeError("dataset must be SealedDatasetArtifact")
+        with self._lock:
+            reservation = completion._terminal_reservation
+            if (
+                completion._session is not self
+                or reservation is None
+                or self._completion is not completion
+                or not dataset._belongs_to_terminal_reservation(reservation)
+            ):
+                raise RuntimeError("pipeline result authority is absent or differs")
+            # Final no-fail ownership commit.  All type, identity, and graph
+            # checks precede these direct reference clears under the one
+            # CaptureSession owner lock.
+            object.__setattr__(dataset, "_terminal_reservation", None)
+            self._completion = None
+            self._exact_consumer_readiness = None
+            self._source_event_span_hasher = None
+            object.__setattr__(completion, "_session", None)
+            object.__setattr__(completion, "_terminal_reservation", None)
 
     def _poison(self, error: StreamError) -> None:
         with self._lock:

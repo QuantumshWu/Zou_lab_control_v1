@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import gc
 import math
 import threading
 import time
+import weakref
 from dataclasses import fields
 from itertools import count
 
@@ -58,6 +60,7 @@ from zlc_neutral_atom.runtime import (
     SafetyOperation,
 )
 from zlc_neutral_atom.runtime.commit import RepositoryCommitCoordinator
+from zlc_neutral_atom.runtime.run import RunHandle, _MISSING
 
 
 _COMMIT_IDS = count()
@@ -353,10 +356,227 @@ def test_execute_error_is_primary_and_cleanup_error_is_additional():
     handle = controller.start(plan(key=camera_key(), execute=execute, cleanup=cleanup))
     with pytest.raises(RunFailed) as caught:
         handle.result(2.0)
-    assert isinstance(caught.value.primary, ValueError)
+    assert caught.value.primary is not None
+    assert caught.value.primary.original_type == "ValueError"
     snapshot = handle.snapshot()
     assert snapshot.primary_error == "ValueError: physics failed"
     assert snapshot.cleanup_errors == ("OSError: close failed",)
+
+
+def test_finalize_failure_drops_partial_result_and_traceback_graph_without_gc():
+    class PartialResult:
+        pass
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        result_reference = None
+
+        def execute(_context, _prepared):
+            nonlocal result_reference
+            result = PartialResult()
+            result_reference = weakref.ref(result)
+            return result
+
+        def finalize(_context, partial_result):
+            raise RuntimeError("synthetic finalize failure", partial_result)
+
+        handle = RunController(new_arbiter()).start(
+            plan(key=camera_key("partial-result"), execute=execute, finalize=finalize)
+        )
+        with pytest.raises(RunFailed) as caught:
+            handle.result(2.0)
+
+        assert result_reference is not None and result_reference() is None
+        assert handle._result is _MISSING
+        assert caught.value.primary is handle._primary
+        assert caught.value.primary is not None
+        assert caught.value.primary.original_type == "RuntimeError"
+        assert caught.value.primary.__traceback__ is None
+        assert any(
+            note.startswith("detached run traceback: ")
+            for note in getattr(caught.value.primary, "__notes__", ())
+        )
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def test_terminal_failure_evidence_cannot_retain_prepared_exception_payload():
+    class Prepared:
+        pass
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        prepared_reference = None
+
+        def preflight(_context):
+            nonlocal prepared_reference
+            prepared = Prepared()
+            prepared_reference = weakref.ref(prepared)
+            return prepared
+
+        def execute(_context, prepared):
+            raise RuntimeError("failure embeds prepared", prepared)
+
+        handle = RunController(new_arbiter()).start(
+            plan(
+                key=camera_key("prepared-payload"),
+                preflight=preflight,
+                execute=execute,
+            )
+        )
+        with pytest.raises(RunFailed) as caught:
+            handle.result(2.0)
+
+        assert prepared_reference is not None and prepared_reference() is None
+        assert caught.value.primary is not None
+        assert caught.value.primary.original_type == "RuntimeError"
+        assert all(type(argument) is str for argument in caught.value.primary.args)
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def test_oversized_exception_group_keeps_root_identity_in_bounded_evidence():
+    try:
+        exception_group_type = ExceptionGroup
+    except NameError:
+        pytest.skip("ExceptionGroup requires Python 3.11+")
+    failures = tuple(RuntimeError(f"child-{index}") for index in range(40))
+
+    def execute(_context, _prepared):
+        raise exception_group_type("many failures", failures)
+
+    handle = RunController(new_arbiter()).start(
+        plan(key=camera_key("large-exception-group"), execute=execute)
+    )
+    with pytest.raises(RunFailed) as caught:
+        handle.result(2.0)
+
+    assert caught.value.primary is not None
+    assert caught.value.primary.original_type == "ExceptionGroup"
+    assert caught.value.primary.truncated
+    assert "exception graph exceeded 32 nodes" in str(caught.value.primary)
+
+
+def test_hostile_exception_hooks_cannot_delay_terminal_publication(monkeypatch):
+    import zlc_neutral_atom.runtime.run as run_module
+
+    class HostileFailure(RuntimeError):
+        @property
+        def args(self):
+            raise AssertionError("subclass args descriptor must not run")
+
+        def __str__(self):
+            raise AssertionError("subclass __str__ must not run")
+
+        def __repr__(self):
+            raise AssertionError("subclass __repr__ must not run")
+
+        def add_note(self, _note):
+            raise AssertionError("subclass add_note must not run")
+
+    primary = HostileFailure("hostile primary")
+
+    def finalize(_context, _result):
+        raise primary
+
+    def fail_abandonment(_context):
+        raise HostileFailure("hostile secondary")
+
+    monkeypatch.setattr(
+        run_module.PostSafetyContext,
+        "_abandon_unconsumed_commits",
+        fail_abandonment,
+    )
+    arbiter = new_arbiter()
+    handle = RunController(arbiter).start(
+        plan(
+            key=camera_key("hostile-terminal"),
+            execute=lambda *_: "partial",
+            finalize=finalize,
+        )
+    )
+    with pytest.raises(RunFailed) as caught:
+        handle.result(2.0)
+
+    assert caught.value.primary is not None
+    assert caught.value.primary.original_type == "HostileFailure"
+    assert handle.snapshot().state is RunState.FAILED
+    assert not arbiter.active_claims()
+
+
+def test_internal_lifecycle_fault_uses_fail_closed_terminal_fallback(monkeypatch):
+    import zlc_neutral_atom.runtime.run as run_module
+
+    def fail_terminal_classification(*_args):
+        raise RuntimeError("synthetic lifecycle implementation fault")
+
+    monkeypatch.setattr(run_module, "_terminal_state", fail_terminal_classification)
+    arbiter = new_arbiter()
+    handle = RunController(arbiter).start(
+        plan(key=camera_key("fail-closed-owner"), execute=lambda *_: "result")
+    )
+    with pytest.raises(RunFailed, match="synthetic lifecycle implementation fault"):
+        handle.result(2.0)
+
+    assert handle.snapshot().state is RunState.FAILED
+    assert not arbiter.active_claims()
+
+
+def test_terminal_handle_does_not_retain_controller_without_gc():
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        controller = RunController(new_arbiter())
+        controller_reference = weakref.ref(controller)
+        handle = controller.start(
+            plan(key=camera_key("observer-release"), execute=lambda *_: "done")
+        )
+        assert handle.result(2.0) == "done"
+        assert handle._on_terminal is None
+
+        del controller
+        assert controller_reference() is None
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def test_thread_start_failure_does_not_retain_hidden_run_graph_without_gc(monkeypatch):
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        references = {}
+        original_init = RunHandle.__init__
+
+        def observed_init(handle, *args, **kwargs):
+            original_init(handle, *args, **kwargs)
+            references["handle"] = weakref.ref(handle)
+
+        def fail_start(thread):
+            references["thread"] = weakref.ref(thread)
+            raise OSError("synthetic Run owner start failure")
+
+        monkeypatch.setattr(RunHandle, "__init__", observed_init)
+        monkeypatch.setattr(threading.Thread, "start", fail_start)
+        controller = RunController(new_arbiter())
+        controller_reference = weakref.ref(controller)
+
+        with pytest.raises(RuntimeError, match="Run owner thread failed to start"):
+            controller.start(
+                plan(key=camera_key("owner-start-failure"), execute=lambda *_: None)
+            )
+
+        del controller
+        assert controller_reference() is None
+        assert references["handle"]() is None
+        assert references["thread"]() is None
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def test_unconfirmed_safe_state_quarantines_only_declared_failed_resource():
@@ -501,8 +721,8 @@ def test_commit_callback_and_marker_share_one_gate_against_cancel():
     allow_replace.set()
     cancel_thread.join()
     assert cancel_outcomes[0] is CancelOutcome.TOO_LATE_FINALIZING
-    assert artifact_exists.is_set()
     assert handle.result(2.0) == "committed-ref"
+    assert artifact_exists.is_set()
 
 
 def test_cancel_during_cleanup_cannot_be_reported_as_success():

@@ -16,6 +16,7 @@ from zlc_neutral_atom.camera_operator import (
     CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
 )
 
+from ._failure import record_secondary_failure
 from .capture import (
     BoundCapturePort,
     CameraCapabilityEvidence,
@@ -33,7 +34,14 @@ from .dataset import (
     SealedDatasetArtifact,
 )
 from .run import CleanupReport, RunContext, RunMode, RunPlan
-from .streams import AcquisitionCursor, ExactReservation, ReservationState, TraceBinding
+from .streams import (
+    AcquisitionCursor,
+    EventSpanRef,
+    ExactReservation,
+    ProcessorStageProvenance,
+    ReservationState,
+    TraceBinding,
+)
 
 
 def _canonical_text(value: str, field: str) -> str:
@@ -322,16 +330,18 @@ class PipelineResult:
 
     __slots__ = (
         "_dataset",
-        "_capture_completion",
         "_capture_terminal",
         "_memory_admission",
         "_aggregate_peak_bytes",
         "_memory_profile_fingerprint",
+        "_run_id",
         "_source_dataset_schema",
         "_camera_provenance",
         "_camera_capability_evidence",
         "_camera_arm_spec",
         "_source_cell_schedule",
+        "_source_event_span",
+        "_processor_stages",
         "_chain_contract_digest",
         "_direct_raw_capture",
     )
@@ -352,9 +362,10 @@ class PipelineResult:
         if not isinstance(capture_completion, CaptureCompletion):
             raise TypeError("capture_completion must be CaptureCompletion")
         capture_terminal = capture_completion.terminal
-        if not dataset._belongs_to_terminal_reservation(
-            capture_completion._terminal_reservation
-        ):
+        _session, terminal_reservation = (
+            capture_completion._validate_pipeline_authority()
+        )
+        if not dataset._belongs_to_terminal_reservation(terminal_reservation):
             raise RuntimeError(
                 "sealed dataset belongs to another exact terminal consumer"
             )
@@ -408,7 +419,6 @@ class PipelineResult:
         ):
             raise RuntimeError("direct pipeline metadata differs from capture terminal")
         object.__setattr__(self, "_dataset", dataset)
-        object.__setattr__(self, "_capture_completion", capture_completion)
         object.__setattr__(self, "_capture_terminal", capture_terminal)
         object.__setattr__(self, "_memory_admission", memory_admission)
         object.__setattr__(
@@ -421,6 +431,7 @@ class PipelineResult:
             "_memory_profile_fingerprint",
             memory_admission.memory_profile_fingerprint,
         )
+        object.__setattr__(self, "_run_id", capture_completion.trace_binding.run_id)
         object.__setattr__(
             self,
             "_source_dataset_schema",
@@ -448,6 +459,16 @@ class PipelineResult:
         )
         object.__setattr__(
             self,
+            "_source_event_span",
+            capture_completion.source_event_span,
+        )
+        object.__setattr__(
+            self,
+            "_processor_stages",
+            capture_completion.processor_stages,
+        )
+        object.__setattr__(
+            self,
             "_chain_contract_digest",
             capture_completion.chain_contract_digest,
         )
@@ -461,6 +482,11 @@ class PipelineResult:
             and capture_completion.source_event_adapter_operator_fingerprint
             == CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
         )
+        # Every validation and value copy above must succeed before the one
+        # CaptureSession-owned commit consumes dataset and completion authority
+        # together.  Public results retain immutable evidence, never the live
+        # CaptureSession/stream graph.
+        capture_completion._commit_pipeline_result(dataset)
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("PipelineResult is immutable")
@@ -475,7 +501,7 @@ class PipelineResult:
 
     @property
     def run_id(self) -> str:
-        return self._capture_completion.trace_binding.run_id
+        return self._run_id
 
     @property
     def source_dataset_schema(self) -> DatasetSchema:
@@ -496,6 +522,14 @@ class PipelineResult:
     @property
     def source_cell_schedule(self) -> tuple[DatasetCellAddress, ...]:
         return self._source_cell_schedule
+
+    @property
+    def source_event_span(self) -> EventSpanRef:
+        return self._source_event_span
+
+    @property
+    def processor_stages(self) -> tuple[ProcessorStageProvenance, ...]:
+        return self._processor_stages
 
     @property
     def chain_contract_digest(self) -> str:
@@ -583,8 +617,11 @@ def _release_preflight_software(
         except BaseException as error:
             cleanup_errors.append(error)
     for error in cleanup_errors:
-        if hasattr(primary, "add_note"):
-            primary.add_note(f"preflight software teardown also failed: {error!r}")
+        record_secondary_failure(
+            primary,
+            "preflight software teardown also failed",
+            error,
+        )
 
 
 @dataclass
@@ -639,8 +676,11 @@ class ExactCaptureTransaction:
         try:
             self.session.fail(error)
         except BaseException as failure_error:
-            if hasattr(error, "add_note"):
-                error.add_note(f"capture poison also failed: {failure_error!r}")
+            record_secondary_failure(
+                error,
+                "capture poison also failed",
+                failure_error,
+            )
 
     def abort_preflight(self, error: BaseException) -> None:
         """Release software-only authority before any capture command was attempted."""

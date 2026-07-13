@@ -7,6 +7,7 @@ import math
 import threading
 import time
 import uuid
+import weakref
 from collections import deque
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
@@ -482,7 +483,7 @@ class EndOfStream:
         "_stream_generation",
         "_end_sequence",
         "_ended_at",
-        "_owner",
+        "_owner_ref",
         "_nonce",
     )
 
@@ -507,7 +508,7 @@ class EndOfStream:
         object.__setattr__(self, "_stream_generation", stream_generation)
         object.__setattr__(self, "_end_sequence", _nonnegative_int(end_sequence, "end_sequence"))
         object.__setattr__(self, "_ended_at", _finite_time(ended_at, "ended_at"))
-        object.__setattr__(self, "_owner", owner)
+        object.__setattr__(self, "_owner_ref", weakref.ref(owner))
         object.__setattr__(self, "_nonce", nonce)
 
     def __setattr__(self, _name: str, _value: object) -> None:
@@ -528,6 +529,12 @@ class EndOfStream:
     @property
     def ended_at(self) -> float:
         return self._ended_at
+
+    @property
+    def _owner(self) -> object | None:
+        """Return the live stream owner without making the receipt own it."""
+
+        return self._owner_ref()
 
 
 class StreamError(RuntimeError):
@@ -735,6 +742,62 @@ class ExactReservation(Generic[PayloadT]):
         self._stream._release_reservation(self._token)
 
 
+class _ObjectReference:
+    """Weak reverse ownership when possible, identity-preserving otherwise.
+
+    Runtime owners such as DatasetBuilder, CaptureSession, and processor workers
+    are weak-referenceable.  Keeping only a weak reverse edge prevents the
+    authority proof from extending their lifetime after a reservation is
+    released.  The strong fallback preserves the low-level stream API for
+    identity tokens such as ``object()``, which cannot participate in a cycle.
+    """
+
+    __slots__ = ("_weak", "_strong")
+
+    def __init__(self, owner: object) -> None:
+        try:
+            reference = weakref.ref(owner)
+        except TypeError:
+            reference = None
+        self._weak = reference
+        self._strong = owner if reference is None else None
+
+    def get(self) -> object | None:
+        return self._strong if self._weak is None else self._weak()
+
+    def matches(self, owner: object) -> bool:
+        current = self.get()
+        return current is not None and current is owner
+
+
+class _CallbackReference:
+    """Weakly retain bound owner callbacks used only while a graph is live."""
+
+    __slots__ = ("_weak", "_strong")
+
+    def __init__(self, callback: Callable) -> None:
+        if not callable(callback):
+            raise TypeError("exact owner callback must be callable")
+        bound_owner = getattr(callback, "__self__", None)
+        if bound_owner is not None:
+            try:
+                reference = weakref.WeakMethod(callback)
+            except TypeError:
+                reference = None
+        else:
+            reference = None
+        self._weak = reference
+        # Free functions have no reverse owner edge and must remain live for
+        # the duration of the proof.  Bound methods use WeakMethod above.
+        self._strong = callback if reference is None else None
+
+    def resolve(self) -> Callable:
+        callback = self._strong if self._weak is None else self._weak()
+        if callback is None:
+            raise ReservationStateError("exact chain owner is no longer live")
+        return callback
+
+
 class ExactConsumerReadiness:
     """Opaque proof that a source reaches one live terminal DatasetBuilder.
 
@@ -789,7 +852,11 @@ class ExactConsumerReadiness:
         _digest(source_key_sequence_digest, "source key-sequence digest")
         _digest(chain_contract_digest, "chain contract digest")
         object.__setattr__(self, "_source_reservation", source_reservation)
-        object.__setattr__(self, "_source_consumer", source_consumer)
+        object.__setattr__(
+            self,
+            "_source_consumer",
+            _ObjectReference(source_consumer),
+        )
         object.__setattr__(self, "_source_contract_digest", source_contract_digest)
         object.__setattr__(self, "_source_schedule_digest", source_schedule_digest)
         object.__setattr__(
@@ -799,11 +866,27 @@ class ExactConsumerReadiness:
         )
         object.__setattr__(self, "_chain_contract_digest", chain_contract_digest)
         object.__setattr__(self, "_terminal_reservation", terminal_reservation)
-        object.__setattr__(self, "_terminal_consumer", terminal_consumer)
+        object.__setattr__(
+            self,
+            "_terminal_consumer",
+            _ObjectReference(terminal_consumer),
+        )
         object.__setattr__(self, "_binding_owner", None)
-        object.__setattr__(self, "_owner_liveness", owner_liveness)
-        object.__setattr__(self, "_owner_completion", owner_completion)
-        object.__setattr__(self, "_owner_cancel", owner_cancel)
+        object.__setattr__(
+            self,
+            "_owner_liveness",
+            tuple(_CallbackReference(callback) for callback in owner_liveness),
+        )
+        object.__setattr__(
+            self,
+            "_owner_completion",
+            None if owner_completion is None else _CallbackReference(owner_completion),
+        )
+        object.__setattr__(
+            self,
+            "_owner_cancel",
+            None if owner_cancel is None else _CallbackReference(owner_cancel),
+        )
         stages = tuple(processor_stages)
         if any(not isinstance(stage, ProcessorStageProvenance) for stage in stages):
             raise TypeError("processor_stages contains an unsupported value")
@@ -834,6 +917,9 @@ class ExactConsumerReadiness:
     def processor_stages(self) -> tuple[ProcessorStageProvenance, ...]:
         return self._processor_stages
 
+    def _resolved_owner_liveness(self) -> tuple[Callable[[], None], ...]:
+        return tuple(reference.resolve() for reference in self._owner_liveness)
+
     def _claim_binding(self, owner: object) -> None:
         """Consume this process-local proof for exactly one enclosing owner."""
 
@@ -844,14 +930,14 @@ class ExactConsumerReadiness:
             reservation = self._source_reservation
             if stream._reservations.get(reservation._token) is not reservation:
                 raise ReservationStateError("exact readiness source is not registered")
-            if reservation._consumer_owner is not self._source_consumer:
+            if not self._source_consumer.matches(reservation._consumer_owner):
                 raise ReservationStateError("exact readiness lost its source consumer")
             if reservation._state is not ReservationState.ACTIVE:
                 raise ReservationStateError("exact readiness source is not ACTIVE")
             if stream._terminal_error is not None or stream._closed:
                 raise ReservationStateError("exact readiness source is no longer live")
             self._validate_terminal_sink()
-            object.__setattr__(self, "_binding_owner", owner)
+            object.__setattr__(self, "_binding_owner", _ObjectReference(owner))
 
     def validate_source(
         self,
@@ -879,7 +965,7 @@ class ExactConsumerReadiness:
         with stream._condition:
             if stream._reservations.get(reservation._token) is not reservation:
                 raise ReservationStateError("exact readiness reservation is not registered")
-            if reservation._consumer_owner is not self._source_consumer:
+            if not self._source_consumer.matches(reservation._consumer_owner):
                 raise ReservationStateError("exact readiness lost its source consumer")
             if reservation._state is not ReservationState.ACTIVE:
                 raise ReservationStateError("exact readiness source is not ACTIVE")
@@ -908,7 +994,7 @@ class ExactConsumerReadiness:
         with stream._condition:
             if stream._reservations.get(reservation._token) is not reservation:
                 raise ReservationStateError("terminal dataset reservation is not registered")
-            if reservation._consumer_owner is not self._terminal_consumer:
+            if not self._terminal_consumer.matches(reservation._consumer_owner):
                 raise ReservationStateError("exact chain lost its terminal dataset consumer")
             if reservation._state not in (
                 ReservationState.ACTIVE,
@@ -917,7 +1003,7 @@ class ExactConsumerReadiness:
                 raise ReservationStateError("terminal dataset consumer is not live")
             if stream._terminal_error is not None or stream._closed:
                 raise ReservationStateError("terminal dataset stream is no longer live")
-        for validate_liveness in self._owner_liveness:
+        for validate_liveness in self._resolved_owner_liveness():
             validate_liveness()
 
     def _validate_emitter(
@@ -946,7 +1032,7 @@ class ExactConsumerReadiness:
                 raise ReservationStateError(
                     "downstream readiness reservation is not registered"
                 )
-            if reservation._consumer_owner is not self._source_consumer:
+            if not self._source_consumer.matches(reservation._consumer_owner):
                 raise ReservationStateError(
                     "downstream readiness lost its immediate source consumer"
                 )
@@ -1014,7 +1100,8 @@ class ExactConsumerReadiness:
             checkpoint()
             terminal_before_ack = False
             with stream._condition:
-                if self._binding_owner is not owner:
+                binding_owner = self._binding_owner
+                if binding_owner is None or not binding_owner.matches(owner):
                     raise PermissionError(
                         "downstream acknowledgement belongs to another bound owner"
                     )
@@ -1054,15 +1141,17 @@ class ExactConsumerReadiness:
         reservation = self._source_reservation
         stream = reservation._stream
         with stream._condition:
-            if self._binding_owner is not owner:
+            binding_owner = self._binding_owner
+            if binding_owner is None or not binding_owner.matches(owner):
                 raise PermissionError(
                     "downstream completion belongs to another bound owner"
                 )
-            completion = self._owner_completion
-        if completion is None:
+            completion_reference = self._owner_completion
+        if completion_reference is None:
             raise ReservationStateError(
                 "terminal readiness has no intermediate processor completion"
             )
+        completion = completion_reference.resolve()
         return completion(deadline)
 
     def _cancel_bound_owner(self, owner: object, reason: str | None) -> bool:
@@ -1071,15 +1160,17 @@ class ExactConsumerReadiness:
         reservation = self._source_reservation
         stream = reservation._stream
         with stream._condition:
-            if self._binding_owner is not owner:
+            binding_owner = self._binding_owner
+            if binding_owner is None or not binding_owner.matches(owner):
                 raise PermissionError(
                     "downstream cancellation belongs to another bound owner"
                 )
-            cancel = self._owner_cancel
-        if cancel is None:
+            cancel_reference = self._owner_cancel
+        if cancel_reference is None:
             raise ReservationStateError(
                 "terminal readiness has no intermediate processor cancellation"
             )
+        cancel = cancel_reference.resolve()
         return cancel(reason)
 
 class AcquisitionCursor(Generic[PayloadT]):
@@ -1332,7 +1423,7 @@ class MonitorTap(Generic[PayloadT]):
 class AcquisitionProducer(Generic[PayloadT]):
     """Exclusive write/terminal authority retained by the source owner lane."""
 
-    __slots__ = ("_stream",)
+    __slots__ = ("_stream", "__weakref__")
 
     def __init__(self, authority: object, stream: "AcquisitionStream[PayloadT]") -> None:
         if authority is not _PRODUCER_TOKEN:
@@ -1426,7 +1517,12 @@ class AcquisitionStream(Generic[PayloadT]):
         self._closed = False
         self._terminal_error: StreamError | None = None
         self._eos: EndOfStream | None = None
-        self._producer = AcquisitionProducer(_PRODUCER_TOKEN, self)
+        producer = AcquisitionProducer(_PRODUCER_TOKEN, self)
+        # Keep construction authority alive until create() can return it; the
+        # public factory then replaces this temporary edge with a weak reverse
+        # reference so producer -> stream remains the sole ownership direction.
+        self._producer_owner: AcquisitionProducer[PayloadT] | None = producer
+        self._producer_ref: weakref.ReferenceType | None = None
 
     @classmethod
     def create(
@@ -1449,7 +1545,21 @@ class AcquisitionStream(Generic[PayloadT]):
             retention_bytes=retention_bytes,
             join_key_contract=join_key_contract,
         )
-        return stream, stream._producer
+        producer = stream._producer_owner
+        assert producer is not None
+        stream._producer_ref = weakref.ref(producer)
+        stream._producer_owner = None
+        return stream, producer
+
+    @property
+    def _producer(self) -> AcquisitionProducer[PayloadT] | None:
+        """Observe the live producer authority without creating an owner cycle."""
+
+        owner = self._producer_owner
+        if owner is not None:
+            return owner
+        reference = self._producer_ref
+        return None if reference is None else reference()
 
     @property
     def next_sequence(self) -> int:
@@ -1986,8 +2096,15 @@ class AcquisitionStream(Generic[PayloadT]):
             if downstream is not None:
                 downstream._validate_terminal_sink()
                 terminal_reservation = downstream._terminal_reservation
-                terminal_consumer = downstream._terminal_consumer
-                owner_liveness = (owner_liveness, *downstream._owner_liveness)
+                terminal_consumer = downstream._terminal_consumer.get()
+                if terminal_consumer is None:
+                    raise ReservationStateError(
+                        "downstream terminal consumer is no longer live"
+                    )
+                owner_liveness = (
+                    owner_liveness,
+                    *downstream._resolved_owner_liveness(),
+                )
                 processor_stages = (
                     processor_stage,
                     *downstream._processor_stages,
@@ -2097,6 +2214,15 @@ class AcquisitionStream(Generic[PayloadT]):
                 # the lifetime tombstone permanent, even if it was never acked.
                 self._formal_consumer_claimed = False
                 self._formal_rebind_required = True
+            # A released capability remains inspectable as a tombstone, but it
+            # must no longer retain the live consumer graph or cursor/Delivery
+            # chain.  All identity checks above happen before this no-fail
+            # lifetime commit.
+            cursor = reservation._cursor
+            if cursor is not None:
+                cursor._inflight = None
+            reservation._consumer_owner = None
+            reservation._cursor = None
             self._trim_locked()
             self._condition.notify_all()
 
