@@ -150,6 +150,10 @@ def _settings_tree(camera: CameraDevice) -> dict[str, object]:
             ),
             "frame_dtype": _camera_dtype(camera).str,
             "acquisition_mode": _camera_mode(camera).value,
+            # Passive installation wiring remains authoritative even while a
+            # camera is temporarily free-running and therefore has no active
+            # trigger channel.
+            "capture_trigger_channels": tuple(camera.capture_trigger_channels),
             "effective_trigger_channels": tuple(camera.effective_trigger_channels),
         }
     )
@@ -210,6 +214,7 @@ def _physical_facts(
         camera_identity=binding.stable_device_identity,
         sensor_identity=f"{binding.stable_device_identity}/sensor",
         optical_path=f"installation-role/{source_id}",
+        capture_trigger_channels=settings_tree["capture_trigger_channels"],
         sensor_shape_yx=(sensor_y, sensor_x),
         roi_origin_yx=origin_yx,
         roi_shape_yx=roi_shape_yx,
@@ -290,7 +295,6 @@ class CameraCaptureDescription:
     source_id: str
     payload_contract: CameraSampleContract
     settings_fingerprint: str
-    trigger_channels: tuple[str, ...]
     physical_facts: CameraPhysicalFacts
 
     def __post_init__(self) -> None:
@@ -302,13 +306,6 @@ class CameraCaptureDescription:
         if not isinstance(self.payload_contract, CameraSampleContract):
             raise TypeError("payload_contract must be CameraSampleContract")
         _sha256(self.settings_fingerprint, "settings_fingerprint")
-        channels = tuple(
-            _canonical_text(channel, "trigger channel")
-            for channel in self.trigger_channels
-        )
-        if not channels or len(channels) != len(set(channels)):
-            raise ValueError("camera trigger channels must be unique and non-empty")
-        object.__setattr__(self, "trigger_channels", channels)
         if not isinstance(self.physical_facts, CameraPhysicalFacts):
             raise TypeError("physical_facts must be CameraPhysicalFacts")
         if (
@@ -316,6 +313,12 @@ class CameraCaptureDescription:
             != self.settings_fingerprint
         ):
             raise ValueError("physical facts and settings fingerprint differ")
+
+    @property
+    def capture_trigger_channels(self) -> tuple[str, ...]:
+        """The one broker-attested physical trigger-wiring tuple."""
+
+        return self.physical_facts.capture_trigger_channels
 
     def event_setting(self, event_index: int) -> CameraEventReadoutSetting:
         return self.physical_facts.event_setting(event_index)
@@ -599,7 +602,6 @@ class CameraCaptureEndpoint:
                 self._source_id,
                 payload_contract,
                 settings,
-                tuple(self._camera.effective_trigger_channels),
                 physical_facts,
             )
             return snapshot

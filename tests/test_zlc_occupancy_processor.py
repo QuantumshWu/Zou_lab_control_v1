@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 from dataclasses import dataclass, replace
+from pathlib import Path
 import pickle
 import threading
 import time
@@ -13,7 +14,12 @@ import numpy as np
 import pytest
 
 from Zou_lab_control.neutral_atom.devices.registry import DeviceSet
-from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualTrapArray
+from Zou_lab_control.neutral_atom.devices.virtual import (
+    VirtualCamera,
+    VirtualSequencer,
+    VirtualTrapArray,
+)
+from Zou_lab_control.neutral_atom.ports import PortCatalog, PortSpec
 from zlc_data import (
     READOUT_EVENT,
     REPEAT,
@@ -114,10 +120,25 @@ from zlc_neutral_atom.runtime.streams import (
     TraceBinding,
     TraceContext,
 )
+from zlc_neutral_atom.timing import (
+    FinitePulseExecutionRequest,
+    TriggeredOccupancyPipelineResult,
+    TriggeredOccupancySpec,
+    compile_capture_cell_plan,
+    compile_triggered_occupancy_pipeline,
+)
+from zlc_pulse import (
+    PulseExecutionForm,
+    bind_pulse_document_target,
+    compile_pulse_artifact,
+    load_pulse_document,
+)
+from zlc_pulse.target import pulse_target_from_legacy_tree
 from zlc_workbench.camera_capture import CameraCaptureBindingRequest
 from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
 
 
+ROOT = Path(__file__).parents[1]
 _CENTERS = ((7, 7), (24, 7), (7, 24), (24, 24))
 _SPOT = np.array(
     ((0.42, 0.60, 0.42), (0.60, 1.00, 0.60), (0.42, 0.60, 0.42)),
@@ -189,6 +210,7 @@ def _deliver_when_armed(camera: VirtualCamera, images: list[np.ndarray]):
 class _TrustedCalibration:
     runtime: LegacyNeutralAtomRuntime
     camera: VirtualCamera
+    sequencer: VirtualSequencer
     capture_repository: CaptureRepository
     capture_ref: CaptureArtifactRef
     calibration_repository: CalibrationRepository
@@ -199,15 +221,41 @@ class _TrustedCalibration:
 @pytest.fixture(scope="module")
 def trusted_calibration(tmp_path_factory):
     root = tmp_path_factory.mktemp("occupancy-trusted-calibration")
+    pulse_document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    pulse_catalog = PortCatalog(
+        pulse_document.target.raw_lanes,
+        tuple(
+            PortSpec(
+                port.key,
+                port.kind,
+                port.lanes,
+                port.label,
+                port.bus_index,
+                port.width,
+                port.encoding,
+                port.safe_value,
+                port.latch_clock,
+            )
+            for port in pulse_document.target.ports
+        ),
+    )
+    sequencer = VirtualSequencer(sleep_scale=0, port_catalog=pulse_catalog)
+    trap = VirtualTrapArray(grid_shape=(2, 2), image_shape=(32, 32), seed=11)
     camera = VirtualCamera(
-        VirtualTrapArray(grid_shape=(2, 2), image_shape=(32, 32), seed=11),
+        trap,
         exposure=1e-3,
+        capture_trigger_channels=("ch11",),
+        sequencer=sequencer,
     )
     camera.recent_capacity = 64
     runtime = LegacyNeutralAtomRuntime(
         DeviceSet(
-            {"readout": camera},
-            {"readout": {"type": "VirtualCamera", "params": {}}},
+            {"trap": trap, "readout": camera, "sequencer": sequencer},
+            {
+                "trap": {"type": "VirtualTrapArray", "params": {}},
+                "readout": {"type": "VirtualCamera", "params": {}},
+                "sequencer": {"type": "VirtualSequencer", "params": {}},
+            },
         )
     )
     description = runtime.describe_camera("readout")
@@ -275,6 +323,7 @@ def trusted_calibration(tmp_path_factory):
         yield _TrustedCalibration(
             runtime,
             camera,
+            sequencer,
             capture_repository,
             capture_ref,
             calibration_repository,
@@ -423,6 +472,72 @@ def _occupancy_pipeline_spec(
             PipelineMemoryProfile.for_current_runtime(memory_limit),
         ),
         timeout_seconds=12.0,
+    )
+
+
+def _single_trigger_document(
+    trusted: _TrustedCalibration,
+    trigger_channel: str = "ch11",
+):
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    source_index = document.target.raw_lanes.index("ch11")
+    trigger_index = document.target.raw_lanes.index(trigger_channel)
+    kept_trigger = False
+    periods = []
+    for period in document.periods:
+        states = list(period.states)
+        source_high = bool(states[source_index])
+        states[source_index] = 0
+        states[trigger_index] = 0
+        if source_high and not kept_trigger:
+            states[trigger_index] = 1
+            kept_trigger = True
+        periods.append(replace(period, states=tuple(states)))
+    assert kept_trigger
+    return replace(
+        bind_pulse_document_target(
+            document,
+            pulse_target_from_legacy_tree(trusted.sequencer.port_catalog.to_dict()),
+        ),
+        name="occupancy-single-trigger",
+        periods=tuple(periods),
+        repeat=None,
+    )
+
+
+def _triggered_occupancy_spec(
+    trusted: _TrustedCalibration,
+    *,
+    trigger_channel: str = "ch11",
+) -> TriggeredOccupancySpec:
+    measurement = _source_measurement(
+        trusted,
+        readout_events=1,
+        points=1,
+    )
+    occupancy = _occupancy_pipeline_spec(trusted, measurement)
+    pulse_port = trusted.runtime.bind_sequencer_port()
+    document = _single_trigger_document(trusted, trigger_channel)
+    artifact = compile_pulse_artifact(
+        document,
+        clock_hz=pulse_port.capability.clock_hz,
+        execution_form=PulseExecutionForm.STATIC_ONCE,
+        trigger_channels=(trigger_channel,),
+        live_target=pulse_port.capability.target,
+    )
+    cell_plan = compile_capture_cell_plan(
+        artifact,
+        trigger_channel,
+        measurement.capture_contract.dataset_schema,
+        readout_event_axis_id=AxisId("occupancy-readout-event"),
+        scan_point_layout=PointLayout.rect_c((1,)),
+    )
+    return TriggeredOccupancySpec(
+        occupancy,
+        pulse_port,
+        FinitePulseExecutionRequest(document, artifact),
+        trigger_channel,
+        cell_plan,
     )
 
 
@@ -1439,6 +1554,313 @@ def test_compiled_occupancy_pipeline_returns_two_coherent_standard_snapshots(
         expected[above] = counts.values[location][above] > model.header.thresholds[above]
         expected[below] = counts.values[location][below] < model.header.thresholds[below]
         np.testing.assert_array_equal(occupied.values[location], expected)
+
+
+def test_triggered_occupancy_arms_full_chain_before_fire_and_retains_lineage(
+    trusted_calibration,
+):
+    spec = _triggered_occupancy_spec(trusted_calibration)
+    artifact = spec.pulse_request.artifact
+    cell_plan = spec.cell_plan
+    armed_at_fire = []
+
+    def observe_fire(_playback):
+        state = trusted_calibration.camera._recent_state()
+        with state["cond"]:
+            armed_at_fire.append(bool(state["armed"]))
+
+    trusted_calibration.sequencer.history.clear()
+    trusted_calibration.sequencer.add_fire_listener(observe_fire)
+    try:
+        result = trusted_calibration.runtime.controller.start(
+            compile_triggered_occupancy_pipeline(spec)
+        ).result(15.0)
+    finally:
+        trusted_calibration.sequencer.remove_fire_listener(observe_fire)
+
+    assert type(result) is TriggeredOccupancyPipelineResult
+    assert type(result.occupancy) is OccupancyPipelineResult
+    assert armed_at_fire == [True]
+    assert result.dataset.counts.block.values.shape == (1, 1, 4)
+    assert result.dataset.occupied.block.values.shape == (1, 1, 4)
+    assert result.dataset.cell_schedule == cell_plan.expected_cells
+    assert result.compiled_artifact is artifact
+    assert result.compiled_artifact_digest == artifact.fingerprint
+    assert (
+        result.pulse_terminal.expected_trigger_counts_from_completed_schedule
+        == (("ch11", 1),)
+    )
+    assert result.capture_terminal.produced_count == 1
+    assert result.capture_terminal.drained_count == 1
+    assert [item["action"] for item in trusted_calibration.sequencer.history] == [
+        "prepare",
+        "fire",
+        "wait_done",
+        "safe",
+    ]
+    with pytest.raises(TypeError, match="process-local"):
+        pickle.dumps(result)
+    with pytest.raises(PermissionError, match="only be minted"):
+        TriggeredOccupancyPipelineResult(
+            object(),
+            occupancy=result.occupancy,
+            pulse_terminal=result.pulse_terminal,
+            trigger_channel=result.trigger_channel,
+            compiled_artifact=result.compiled_artifact,
+            cell_plan=result.cell_plan,
+        )
+    with pytest.raises(AttributeError, match="immutable"):
+        result._trigger_channel = "other"
+
+
+def test_triggered_occupancy_rejects_an_unwired_camera_channel_before_run(
+    trusted_calibration,
+):
+    trusted_calibration.sequencer.history.clear()
+    with pytest.raises(ValueError, match="not.*wired"):
+        _triggered_occupancy_spec(
+            trusted_calibration,
+            trigger_channel="ch12",
+        )
+    assert trusted_calibration.sequencer.history == []
+
+
+def test_triggered_occupancy_camera_start_failure_never_fires_and_cleans_both(
+    trusted_calibration,
+    monkeypatch,
+):
+    spec = _triggered_occupancy_spec(trusted_calibration)
+    camera = trusted_calibration.camera
+    sequencer = trusted_calibration.sequencer
+    original_finish = camera.finish_record_capture
+    camera_cleanup_after_actions = []
+
+    def fail_arm(*_args, **_kwargs):
+        raise RuntimeError("injected camera arm failure")
+
+    def observed_finish():
+        camera_cleanup_after_actions.append(
+            tuple(item["action"] for item in sequencer.history)
+        )
+        return original_finish()
+
+    monkeypatch.setattr(camera, "arm", fail_arm)
+    monkeypatch.setattr(camera, "finish_record_capture", observed_finish)
+    sequencer.history.clear()
+
+    with pytest.raises(RunFailed) as failure:
+        trusted_calibration.runtime.controller.start(
+            compile_triggered_occupancy_pipeline(spec)
+        ).result(10.0)
+
+    assert failure.value.primary is not None
+    assert failure.value.primary.original_type == "RuntimeError"
+    actions = [item["action"] for item in sequencer.history]
+    assert actions == ["prepare", "safe"]
+    assert "fire" not in actions
+    assert camera_cleanup_after_actions
+    assert camera_cleanup_after_actions[-1][-1] == "safe"
+    state = camera._recent_state()
+    with state["cond"]:
+        assert not state["armed"] and not state["pending"]
+
+
+def test_triggered_occupancy_cancel_after_fire_cleans_pulse_before_camera(
+    trusted_calibration,
+    monkeypatch,
+):
+    import zlc_neutral_atom.timing.occupancy as timing_occupancy
+
+    spec = _triggered_occupancy_spec(trusted_calibration)
+    entered_capture = threading.Event()
+    cleanup_order = []
+    original_pulse_cleanup = timing_occupancy.PulseSession.cleanup
+    original_occupancy_cleanup = timing_occupancy._OccupancyTransaction.cleanup
+
+    def blocked_capture_all(self, context):
+        entered_capture.set()
+        while True:
+            context.checkpoint()
+            time.sleep(0.005)
+
+    def observed_pulse_cleanup(self, context):
+        cleanup_order.append("pulse")
+        return original_pulse_cleanup(self, context)
+
+    def observed_occupancy_cleanup(self, context):
+        cleanup_order.append("occupancy")
+        return original_occupancy_cleanup(self, context)
+
+    monkeypatch.setattr(
+        timing_occupancy._OccupancyTransaction,
+        "capture_all",
+        blocked_capture_all,
+    )
+    monkeypatch.setattr(
+        timing_occupancy.PulseSession,
+        "cleanup",
+        observed_pulse_cleanup,
+    )
+    monkeypatch.setattr(
+        timing_occupancy._OccupancyTransaction,
+        "cleanup",
+        observed_occupancy_cleanup,
+    )
+    trusted_calibration.sequencer.history.clear()
+    handle = trusted_calibration.runtime.controller.start(
+        compile_triggered_occupancy_pipeline(spec)
+    )
+    assert entered_capture.wait(3.0)
+    handle.cancel("cancel after occupancy FIRE")
+    with pytest.raises(RunCancelled):
+        handle.result(10.0)
+
+    assert cleanup_order == ["pulse", "occupancy"]
+    assert "fire" in {
+        item["action"] for item in trusted_calibration.sequencer.history
+    }
+    state = trusted_calibration.camera._recent_state()
+    with state["cond"]:
+        assert not state["armed"] and not state["pending"]
+    assert dict(trusted_calibration.sequencer.snapshot())["state"] == "safe"
+
+
+def test_triggered_occupancy_rejects_tampered_pulse_terminal_before_publication(
+    trusted_calibration,
+    monkeypatch,
+):
+    import zlc_neutral_atom.timing.occupancy as timing_occupancy
+
+    spec = _triggered_occupancy_spec(trusted_calibration)
+    original_complete = timing_occupancy.PulseSession.complete
+
+    def tampering_complete(self, context):
+        terminal = original_complete(self, context)
+        receipt = replace(
+            terminal.receipt,
+            expected_trigger_counts_from_completed_schedule=(("ch11", 2),),
+        )
+        forged = replace(terminal, receipt=receipt)
+        # Deliberately bypass session identity so this test still exercises the
+        # independent artifact/count validation at the result boundary.
+        self._terminal = forged
+        return forged
+
+    monkeypatch.setattr(
+        timing_occupancy.PulseSession,
+        "complete",
+        tampering_complete,
+    )
+    trusted_calibration.sequencer.history.clear()
+    with pytest.raises(RunFailed) as failure:
+        trusted_calibration.runtime.controller.start(
+            compile_triggered_occupancy_pipeline(spec)
+        ).result(15.0)
+
+    assert failure.value.primary is not None
+    assert failure.value.primary.original_type == "ValueError"
+    assert "expected counts differ" in str(failure.value.primary)
+
+
+def test_triggered_occupancy_rejects_a_terminal_from_another_run(
+    trusted_calibration,
+    monkeypatch,
+):
+    import zlc_neutral_atom.timing.occupancy as timing_occupancy
+
+    spec = _triggered_occupancy_spec(trusted_calibration)
+    first = trusted_calibration.runtime.controller.run(
+        compile_triggered_occupancy_pipeline(spec)
+    )
+    original_complete = timing_occupancy.PulseSession.complete
+
+    def stale_complete(self, context):
+        current = original_complete(self, context)
+        assert current.session_id != first.pulse_terminal.session_id
+        return first.pulse_terminal
+
+    monkeypatch.setattr(
+        timing_occupancy.PulseSession,
+        "complete",
+        stale_complete,
+    )
+    with pytest.raises(RunFailed) as failure:
+        trusted_calibration.runtime.controller.run(
+            compile_triggered_occupancy_pipeline(spec)
+        )
+
+    assert failure.value.primary is not None
+    assert failure.value.primary.original_type == "PermissionError"
+    assert "not minted" in str(failure.value.primary)
+
+
+def test_triggered_occupancy_rejects_a_stale_receipt_rebadged_to_current_session(
+    trusted_calibration,
+    monkeypatch,
+):
+    import zlc_neutral_atom.timing.occupancy as timing_occupancy
+
+    spec = _triggered_occupancy_spec(trusted_calibration)
+    first = trusted_calibration.runtime.controller.run(
+        compile_triggered_occupancy_pipeline(spec)
+    )
+    original_complete = timing_occupancy.PulseSession.complete
+
+    def rebadged_complete(self, context):
+        current = original_complete(self, context)
+        return replace(
+            first.pulse_terminal,
+            session_id=current.session_id,
+        )
+
+    monkeypatch.setattr(
+        timing_occupancy.PulseSession,
+        "complete",
+        rebadged_complete,
+    )
+    with pytest.raises(RunFailed) as failure:
+        trusted_calibration.runtime.controller.run(
+            compile_triggered_occupancy_pipeline(spec)
+        )
+
+    assert failure.value.primary is not None
+    assert failure.value.primary.original_type == "PermissionError"
+    assert "not minted" in str(failure.value.primary)
+
+
+def test_triggered_occupancy_rejects_an_executed_value_from_another_run(
+    trusted_calibration,
+):
+    spec = _triggered_occupancy_spec(trusted_calibration)
+    plan = compile_triggered_occupancy_pipeline(spec)
+    original_execute = plan.execute
+    executed_values = []
+
+    def recording_execute(context, prepared):
+        executed = original_execute(context, prepared)
+        executed_values.append(executed)
+        return executed
+
+    trusted_calibration.runtime.controller.run(
+        replace(plan, execute=recording_execute)
+    )
+    assert len(executed_values) == 1
+
+    def stale_execute(context, prepared):
+        original_execute(context, prepared)
+        return executed_values[0]
+
+    with pytest.raises(RunFailed) as failure:
+        trusted_calibration.runtime.controller.run(
+            replace(
+                plan,
+                execute=stale_execute,
+            )
+        )
+
+    assert failure.value.primary is not None
+    assert failure.value.primary.original_type == "ValueError"
+    assert "another Run" in str(failure.value.primary)
 
 
 def test_occupancy_pipeline_memory_rejects_before_camera_prepare(

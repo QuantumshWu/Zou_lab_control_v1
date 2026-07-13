@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import pickle
+import threading
+import time
 
 import numpy as np
 import pytest
@@ -18,20 +21,26 @@ from Zou_lab_control.neutral_atom.ports import PortCatalog, PortSpec
 from zlc_data import AxisId, AxisSpec, BlockId, PointLayout, READOUT_EVENT, REPEAT
 from zlc_neutral_atom.acquisition import CameraAcquisitionMode
 from zlc_neutral_atom.artifacts import (
+    CaptureArtifactRef,
     CaptureRepository,
     compile_capture_artifact_pipeline,
 )
 from zlc_neutral_atom.runtime import (
+    CleanupReport,
     DatasetCellAddress,
     DatasetMaterializerSpec,
     MinimalPipelineSpec,
     PipelineMemoryProfile,
+    RunCancelled,
+    RunFailed,
 )
+from zlc_neutral_atom.timing._coordination import run_cleanup_steps
 from zlc_neutral_atom.timing import (
     FinitePulseExecutionRequest,
     PulseTerminalEvidenceKind,
     SimulatedPulseReceipt,
     TriggeredCaptureSpec,
+    TriggeredPipelineResult,
     compile_capture_cell_plan,
     compile_triggered_pipeline,
 )
@@ -43,6 +52,7 @@ from zlc_pulse import (
     load_pulse_document,
 )
 from zlc_pulse.target import pulse_target_from_legacy_tree
+from zlc_storage import decode, encode
 from zlc_workbench.camera_capture import CameraCaptureBindingRequest
 from zlc_workbench.legacy_neutral_atom import LegacyNeutralAtomRuntime
 
@@ -54,7 +64,31 @@ def _axis(name, role, size):
     return AxisSpec(AxisId(name), name, role, size, tuple(range(size)))
 
 
-def _runtime(point_count=3, repeat_count=1):
+def test_ordered_cleanup_runs_later_physical_steps_after_an_earlier_exception():
+    calls = []
+    failure = RuntimeError("sequencer cleanup failed")
+    later_failure = RuntimeError("camera cleanup reported an error")
+
+    def pulse_cleanup():
+        calls.append("pulse")
+        raise failure
+
+    def camera_cleanup():
+        calls.append("camera")
+        return CleanupReport(errors=(later_failure,))
+
+    report = run_cleanup_steps(pulse_cleanup, camera_cleanup)
+
+    assert calls == ["pulse", "camera"]
+    assert report.errors == (failure, later_failure)
+
+
+def _runtime(
+    point_count=3,
+    repeat_count=1,
+    *,
+    capture_trigger_channels=("ch11",),
+):
     document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
     if repeat_count > 1:
         document = replace(
@@ -91,7 +125,7 @@ def _runtime(point_count=3, repeat_count=1):
     camera = VirtualCamera(
         trap,
         exposure=1e-3,
-        capture_trigger_channels=("ch11",),
+        capture_trigger_channels=capture_trigger_channels,
         sequencer=sequencer,
     )
     device_set = DeviceSet(
@@ -196,6 +230,199 @@ def test_camera_is_armed_before_one_fire_and_all_frames_are_exactly_materialized
             "wait_done",
             "safe",
         ]
+        with pytest.raises(TypeError, match="process-local"):
+            pickle.dumps(result)
+        with pytest.raises(PermissionError, match="only be minted"):
+            TriggeredPipelineResult(
+                object(),
+                capture=result.capture,
+                pulse_session_id=result.pulse_session_id,
+                pulse_terminal=result.pulse_terminal,
+                trigger_channel=result.trigger_channel,
+                compiled_artifact=result.compiled_artifact,
+                cell_plan=result.cell_plan,
+            )
+        assert dict(sequencer.snapshot())["state"] == "safe"
+        state = camera._recent_state()
+        with state["cond"]:
+            assert not state["armed"] and not state["pending"]
+    finally:
+        assert runtime.shutdown(timeout=2.0)
+
+
+def test_triggered_capture_rejects_a_result_from_another_run():
+    runtime, _camera, _sequencer, capture, document, pulse_port, artifact, plan = (
+        _runtime()
+    )
+    assert plan is not None
+    spec = TriggeredCaptureSpec(
+        capture,
+        pulse_port,
+        FinitePulseExecutionRequest(document, artifact),
+        "ch11",
+        plan,
+    )
+    compiled = compile_triggered_pipeline(spec)
+    try:
+        first = runtime.controller.run(compiled)
+        stale_plan = replace(
+            compiled,
+            execute=lambda _context, _prepared: first,
+        )
+        with pytest.raises(RunFailed) as failure:
+            runtime.controller.run(stale_plan)
+
+        assert failure.value.primary is not None
+        assert failure.value.primary.original_type == "ValueError"
+        assert "another Run" in str(failure.value.primary)
+    finally:
+        assert runtime.shutdown(timeout=2.0)
+
+
+def test_triggered_capture_rejects_a_terminal_from_another_pulse_session(
+    monkeypatch,
+):
+    import zlc_neutral_atom.timing.capture as timing_capture
+
+    runtime, _camera, _sequencer, capture, document, pulse_port, artifact, plan = (
+        _runtime()
+    )
+    assert plan is not None
+    spec = TriggeredCaptureSpec(
+        capture,
+        pulse_port,
+        FinitePulseExecutionRequest(document, artifact),
+        "ch11",
+        plan,
+    )
+    compiled = compile_triggered_pipeline(spec)
+    try:
+        first = runtime.controller.run(compiled)
+        original_complete = timing_capture.PulseSession.complete
+
+        def stale_complete(self, context):
+            current = original_complete(self, context)
+            assert current.session_id != first.pulse_terminal.session_id
+            return first.pulse_terminal
+
+        monkeypatch.setattr(
+            timing_capture.PulseSession,
+            "complete",
+            stale_complete,
+        )
+        with pytest.raises(RunFailed) as failure:
+            runtime.controller.run(compiled)
+
+        assert failure.value.primary is not None
+        assert failure.value.primary.original_type == "PermissionError"
+        assert "not minted" in str(failure.value.primary)
+    finally:
+        assert runtime.shutdown(timeout=2.0)
+
+
+def test_triggered_capture_rejects_a_stale_receipt_rebadged_to_current_session(
+    monkeypatch,
+):
+    import zlc_neutral_atom.timing.capture as timing_capture
+
+    runtime, _camera, _sequencer, capture, document, pulse_port, artifact, plan = (
+        _runtime()
+    )
+    assert plan is not None
+    spec = TriggeredCaptureSpec(
+        capture,
+        pulse_port,
+        FinitePulseExecutionRequest(document, artifact),
+        "ch11",
+        plan,
+    )
+    compiled = compile_triggered_pipeline(spec)
+    try:
+        first = runtime.controller.run(compiled)
+        original_complete = timing_capture.PulseSession.complete
+
+        def rebadged_complete(self, context):
+            current = original_complete(self, context)
+            return replace(
+                first.pulse_terminal,
+                session_id=current.session_id,
+            )
+
+        monkeypatch.setattr(
+            timing_capture.PulseSession,
+            "complete",
+            rebadged_complete,
+        )
+        with pytest.raises(RunFailed) as failure:
+            runtime.controller.run(compiled)
+
+        assert failure.value.primary is not None
+        assert failure.value.primary.original_type == "PermissionError"
+        assert "not minted" in str(failure.value.primary)
+    finally:
+        assert runtime.shutdown(timeout=2.0)
+
+
+def test_triggered_capture_cancel_after_fire_cleans_pulse_before_camera(
+    monkeypatch,
+):
+    import zlc_neutral_atom.timing.capture as timing_capture
+
+    runtime, camera, sequencer, capture, document, pulse_port, artifact, plan = (
+        _runtime()
+    )
+    assert plan is not None
+    spec = TriggeredCaptureSpec(
+        capture,
+        pulse_port,
+        FinitePulseExecutionRequest(document, artifact),
+        "ch11",
+        plan,
+    )
+    entered_capture = threading.Event()
+    cleanup_order = []
+    original_pulse_cleanup = timing_capture.PulseSession.cleanup
+    original_capture_cleanup = timing_capture.ExactCaptureTransaction.cleanup
+
+    def blocked_capture_all(self, context):
+        entered_capture.set()
+        while True:
+            context.checkpoint()
+            time.sleep(0.005)
+
+    def observed_pulse_cleanup(self, context):
+        cleanup_order.append("pulse")
+        return original_pulse_cleanup(self, context)
+
+    def observed_capture_cleanup(self, context):
+        cleanup_order.append("camera")
+        return original_capture_cleanup(self, context)
+
+    monkeypatch.setattr(
+        timing_capture.ExactCaptureTransaction,
+        "capture_all",
+        blocked_capture_all,
+    )
+    monkeypatch.setattr(
+        timing_capture.PulseSession,
+        "cleanup",
+        observed_pulse_cleanup,
+    )
+    monkeypatch.setattr(
+        timing_capture.ExactCaptureTransaction,
+        "cleanup",
+        observed_capture_cleanup,
+    )
+    sequencer.history.clear()
+    try:
+        handle = runtime.controller.start(compile_triggered_pipeline(spec))
+        assert entered_capture.wait(3.0)
+        handle.cancel("cancel raw exact capture after FIRE")
+        with pytest.raises(RunCancelled):
+            handle.result(10.0)
+
+        assert cleanup_order == ["pulse", "camera"]
+        assert "fire" in {item["action"] for item in sequencer.history}
         assert dict(sequencer.snapshot())["state"] == "safe"
         state = camera._recent_state()
         with state["cond"]:
@@ -255,6 +482,66 @@ def test_trigger_cardinality_mismatch_is_rejected_before_hardware_run():
         assert runtime.shutdown(timeout=2.0)
 
 
+def test_triggered_capture_rejects_a_schedule_on_an_unwired_camera_channel():
+    runtime, _camera, sequencer, capture, document, pulse_port, _artifact, _plan = (
+        _runtime()
+    )
+    source_index = document.target.raw_lanes.index("ch11")
+    unwired_index = document.target.raw_lanes.index("ch12")
+    periods = []
+    for period in document.periods:
+        states = list(period.states)
+        states[unwired_index] = states[source_index]
+        states[source_index] = 0
+        periods.append(replace(period, states=tuple(states)))
+    unwired_document = replace(document, periods=tuple(periods))
+    unwired_artifact = compile_pulse_artifact(
+        unwired_document,
+        clock_hz=sequencer.clock_hz,
+        execution_form=PulseExecutionForm.STATIC_ONCE,
+        trigger_channels=("ch12",),
+        live_target=unwired_document.target,
+    )
+    unwired_plan = compile_capture_cell_plan(
+        unwired_artifact,
+        "ch12",
+        capture.measurement.capture_contract.dataset_schema,
+        readout_event_axis_id=AxisId("frame"),
+        scan_point_layout=PointLayout.rect_c(()),
+    )
+    try:
+        with pytest.raises(ValueError, match="not.*wired"):
+            TriggeredCaptureSpec(
+                capture,
+                pulse_port,
+                FinitePulseExecutionRequest(unwired_document, unwired_artifact),
+                "ch12",
+                unwired_plan,
+            )
+        assert sequencer.history == []
+    finally:
+        assert runtime.shutdown(timeout=2.0)
+
+
+def test_exact_triggered_capture_rejects_multi_line_camera_wiring():
+    runtime, _camera, sequencer, capture, document, pulse_port, artifact, plan = (
+        _runtime(capture_trigger_channels=("ch11", "ch12"))
+    )
+    assert plan is not None
+    try:
+        with pytest.raises(ValueError, match="exactly one"):
+            TriggeredCaptureSpec(
+                capture,
+                pulse_port,
+                FinitePulseExecutionRequest(document, artifact),
+                "ch11",
+                plan,
+            )
+        assert sequencer.history == []
+    finally:
+        assert runtime.shutdown(timeout=2.0)
+
+
 def test_triggered_capture_artifact_persists_pulse_lineage(tmp_path):
     runtime, _camera, sequencer, capture, document, pulse_port, artifact, plan = _runtime()
     assert plan is not None
@@ -293,5 +580,54 @@ def test_triggered_capture_artifact_persists_pulse_lineage(tmp_path):
         assert stored.safety_bundle_id is not None
         assert len(stored.chain_contract_digest) == 64
         assert dict(sequencer.snapshot())["state"] == "safe"
+
+        forged_facts = replace(
+            stored.camera_capability_evidence.physical_facts,
+            capture_trigger_channels=("ch12",),
+        )
+        forged_evidence = replace(
+            stored.camera_capability_evidence,
+            physical_facts=forged_facts,
+        )
+        with pytest.raises(ValueError, match="not.*wired"):
+            replace(
+                stored,
+                camera_capability_evidence=forged_evidence,
+                terminal=replace(
+                    stored.terminal,
+                    capability_fingerprint=forged_evidence.fingerprint,
+                ),
+                camera_provenance=replace(
+                    stored.camera_provenance,
+                    capability_fingerprint=forged_evidence.fingerprint,
+                ),
+            )
+
+        manifest = decode(
+            repository._store.read_manifest("capture", reference.manifest_digest)
+        )
+        manifest["camera_capability_evidence"]["physical_facts"][
+            "capture_trigger_channels"
+        ] = ["ch12"]
+        manifest["camera_capability_evidence"][
+            "physical_facts_fingerprint"
+        ] = forged_facts.fingerprint
+        manifest["terminal"][
+            "capability_fingerprint"
+        ] = forged_evidence.fingerprint
+        manifest["camera_provenance"][
+            "capability_fingerprint"
+        ] = forged_evidence.fingerprint
+        forged_manifest = repository._store.publish_manifest(
+            "capture",
+            encode(manifest),
+        )
+        with pytest.raises(ValueError, match="not.*wired"):
+            repository.load(
+                CaptureArtifactRef(
+                    repository.repository_id,
+                    forged_manifest.content.digest,
+                )
+            )
     finally:
         assert runtime.shutdown(timeout=2.0)

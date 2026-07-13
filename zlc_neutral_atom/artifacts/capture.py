@@ -125,7 +125,7 @@ from zlc_pulse import (
 )
 
 
-CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact/v9"
+CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact/v10"
 _CAPTURE_METADATA_SCHEMA = "zlc_neutral_atom.CameraFrameMetadataSequence/v1"
 _CAPTURE_NAMESPACE = CAPTURE_ARTIFACT_NAMESPACE
 _ADMITTED_CAPTURE_EVIDENCE_SCHEMA = "zlc_neutral_atom.AdmittedCaptureEvidence/v1"
@@ -662,6 +662,9 @@ class CaptureArtifact:
         ):
             raise ValueError("pulse trigger count differs from persisted capture")
         if self.pulse_lineage is not None:
+            capability_evidence.physical_facts.require_single_capture_trigger_channel(
+                self.pulse_lineage.trigger_channel
+            )
             plan = self.pulse_lineage.cell_plan
             plan.validate_against(
                 self.pulse_lineage.compiled_artifact,

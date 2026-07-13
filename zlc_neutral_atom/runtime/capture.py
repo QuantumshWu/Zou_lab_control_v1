@@ -134,13 +134,14 @@ class CameraPhysicalFacts:
 
     These facts and the opaque settings fingerprint are frozen from one adapter
     snapshot.  A later binding may name event indices, but it cannot change the
-    exposure, gain, readout mode, geometry, identity, dtype, or unit attested by
-    this capability.
+    physical trigger wiring, exposure, gain, readout mode, geometry, identity,
+    dtype, or unit attested by this capability.
     """
 
     camera_identity: str
     sensor_identity: str
     optical_path: str
+    capture_trigger_channels: tuple[str, ...]
     sensor_shape_yx: tuple[int, int]
     roi_origin_yx: tuple[int, int]
     roi_shape_yx: tuple[int, int]
@@ -158,6 +159,25 @@ class CameraPhysicalFacts:
     def __post_init__(self) -> None:
         for name in ("camera_identity", "sensor_identity", "optical_path"):
             _canonical_text(getattr(self, name), name)
+        if isinstance(self.capture_trigger_channels, (str, bytes)):
+            raise TypeError("capture_trigger_channels must be a tuple of channel names")
+        try:
+            trigger_channels = tuple(self.capture_trigger_channels)
+        except TypeError as exc:
+            raise TypeError(
+                "capture_trigger_channels must be a tuple of channel names"
+            ) from exc
+        trigger_channels = tuple(
+            _canonical_text(channel, "capture trigger channel")
+            for channel in trigger_channels
+        )
+        if len(trigger_channels) != len(set(trigger_channels)):
+            raise ValueError("capture_trigger_channels must be unique")
+        object.__setattr__(
+            self,
+            "capture_trigger_channels",
+            trigger_channels,
+        )
         sensor = _integer_pair(self.sensor_shape_yx, "sensor_shape_yx", positive=True)
         origin = _integer_pair(self.roi_origin_yx, "roi_origin_yx", positive=False)
         roi = _integer_pair(self.roi_shape_yx, "roi_shape_yx", positive=True)
@@ -218,6 +238,28 @@ class CameraPhysicalFacts:
             self.opaque_frame_settings_fingerprint,
         )
 
+    def validate_capture_trigger_channel(self, channel: str) -> None:
+        """Require one selected pulse channel to belong to this physical wiring."""
+
+        channel = _canonical_text(channel, "capture trigger channel")
+        if channel not in self.capture_trigger_channels:
+            raise ValueError(
+                f"capture trigger channel {channel!r} is not wired to camera "
+                f"{self.camera_identity!r}; attested channels are "
+                f"{self.capture_trigger_channels!r}"
+            )
+
+    def require_single_capture_trigger_channel(self, channel: str) -> None:
+        """Require exact capture to have one, and only one, physical edge source."""
+
+        self.validate_capture_trigger_channel(channel)
+        if self.capture_trigger_channels != (channel,):
+            raise ValueError(
+                "exact triggered capture requires the camera to have exactly one "
+                f"attested trigger channel {channel!r}; physical wiring is "
+                f"{self.capture_trigger_channels!r}"
+            )
+
     def validate_descriptor(self, descriptor: CameraCaptureDescriptor) -> None:
         if not isinstance(descriptor, CameraCaptureDescriptor):
             raise TypeError("descriptor must be CameraCaptureDescriptor")
@@ -254,8 +296,8 @@ class CameraPhysicalFacts:
         return canonical_digest(camera_physical_facts_to_tree(self))
 
 
-_CAMERA_PHYSICAL_FACTS_SCHEMA = "zlc_neutral_atom.CameraPhysicalFacts/v1"
-_CAMERA_CAPABILITY_EVIDENCE_SCHEMA = "zlc_neutral_atom.CameraCapabilityEvidence/v1"
+_CAMERA_PHYSICAL_FACTS_SCHEMA = "zlc_neutral_atom.CameraPhysicalFacts/v2"
+_CAMERA_CAPABILITY_EVIDENCE_SCHEMA = "zlc_neutral_atom.CameraCapabilityEvidence/v2"
 
 
 def camera_physical_facts_to_tree(value: CameraPhysicalFacts) -> dict[str, object]:
@@ -266,6 +308,7 @@ def camera_physical_facts_to_tree(value: CameraPhysicalFacts) -> dict[str, objec
         "camera_identity": value.camera_identity,
         "sensor_identity": value.sensor_identity,
         "optical_path": value.optical_path,
+        "capture_trigger_channels": list(value.capture_trigger_channels),
         "sensor_shape_yx": list(value.sensor_shape_yx),
         "roi_origin_yx": list(value.roi_origin_yx),
         "roi_shape_yx": list(value.roi_shape_yx),
@@ -298,6 +341,7 @@ def camera_physical_facts_from_tree(tree: object) -> CameraPhysicalFacts:
         "camera_identity",
         "sensor_identity",
         "optical_path",
+        "capture_trigger_channels",
         "sensor_shape_yx",
         "roi_origin_yx",
         "roi_shape_yx",
@@ -317,6 +361,7 @@ def camera_physical_facts_from_tree(tree: object) -> CameraPhysicalFacts:
         camera_identity=data["camera_identity"],
         sensor_identity=data["sensor_identity"],
         optical_path=data["optical_path"],
+        capture_trigger_channels=data["capture_trigger_channels"],
         sensor_shape_yx=data["sensor_shape_yx"],
         roi_origin_yx=data["roi_origin_yx"],
         roi_shape_yx=data["roi_shape_yx"],

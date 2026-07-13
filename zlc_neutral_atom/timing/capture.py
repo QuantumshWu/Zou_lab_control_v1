@@ -4,15 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from zlc_neutral_atom.acquisition import (
-    CameraAcquisitionMode,
-    decode_camera_capture_spec,
-)
 from zlc_neutral_atom.runtime import (
     CleanupReport,
     ExactCaptureTransaction,
     MinimalPipelineSpec,
     PipelineResult,
+    PostSafetyContext,
     RunContext,
     RunMode,
     RunPlan,
@@ -21,6 +18,10 @@ from zlc_neutral_atom.runtime import (
 from zlc_pulse import CompiledPulseArtifact, PulseExecutionForm
 
 from .capture_plan import CompiledCaptureCellPlan
+from ._coordination import (
+    run_cleanup_steps,
+    validate_single_trigger_capture_binding,
+)
 
 from .pulse import (
     BoundPulsePort,
@@ -54,22 +55,16 @@ class TriggeredCaptureSpec:
             raise ValueError("trigger_channel must be canonical non-empty text")
         if not isinstance(self.cell_plan, CompiledCaptureCellPlan):
             raise TypeError("cell_plan must be CompiledCaptureCellPlan")
-        camera_spec = decode_camera_capture_spec(
-            self.capture.measurement.capture_spec
+        contract = self.capture.measurement.capture_contract
+        schedule = validate_single_trigger_capture_binding(
+            capture_spec=self.capture.measurement.capture_spec,
+            contract=contract,
+            artifact=self.pulse_request.artifact,
+            trigger_channel=self.trigger_channel,
         )
-        if camera_spec.mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
-            raise ValueError("triggered capture requires an external-trigger camera")
-        schedules = tuple(
-            schedule
-            for schedule in self.pulse_request.artifact.trigger_schedules
-            if schedule.channel == self.trigger_channel
-        )
-        if len(schedules) != 1:
-            raise ValueError("triggered capture requires exactly one compiled camera schedule")
         plan = self.cell_plan
         if plan.trigger_channel != self.trigger_channel:
             raise ValueError("capture cell plan trigger channel differs")
-        contract = self.capture.measurement.capture_contract
         plan.validate_against(
             self.pulse_request.artifact,
             contract.dataset_schema,
@@ -77,9 +72,9 @@ class TriggeredCaptureSpec:
         if plan.expected_cells != contract.expected_cells:
             raise ValueError("capture cell plan permutation differs from capture contract")
         expected = self.capture.measurement.capture_contract.total_events
-        if schedules[0].total != expected or plan.total_events != expected:
+        if schedule.total != expected or plan.total_events != expected:
             raise ValueError(
-                f"compiled trigger count {schedules[0].total} differs from "
+                f"compiled trigger count {schedule.total} differs from "
                 f"camera event budget {expected}"
             )
 
@@ -92,47 +87,136 @@ class TriggeredCaptureSpec:
         )
 
 
-@dataclass(frozen=True)
-class TriggeredPipelineResult:
-    capture: PipelineResult
-    pulse_terminal: PulseTerminalAck
-    trigger_channel: str
-    compiled_artifact: CompiledPulseArtifact
-    cell_plan: CompiledCaptureCellPlan
+_TRIGGERED_RESULT_TOKEN = object()
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.capture, PipelineResult):
+
+class TriggeredPipelineResult:
+    __slots__ = (
+        "_authority",
+        "_capture",
+        "_pulse_session_id",
+        "_pulse_terminal",
+        "_trigger_channel",
+        "_compiled_artifact",
+        "_cell_plan",
+    )
+
+    def __init_subclass__(cls, **_kwargs) -> None:
+        raise TypeError("TriggeredPipelineResult is final")
+
+    def __init__(
+        self,
+        authority: object,
+        *,
+        capture: PipelineResult,
+        pulse_session_id: str,
+        pulse_terminal: PulseTerminalAck,
+        trigger_channel: str,
+        compiled_artifact: CompiledPulseArtifact,
+        cell_plan: CompiledCaptureCellPlan,
+    ) -> None:
+        if authority is not _TRIGGERED_RESULT_TOKEN:
+            raise PermissionError(
+                "TriggeredPipelineResult can only be minted by its compiler"
+            )
+        if not isinstance(capture, PipelineResult):
             raise TypeError("capture must be PipelineResult")
-        if not isinstance(self.pulse_terminal, PulseTerminalAck):
+        if (
+            not isinstance(pulse_session_id, str)
+            or not pulse_session_id
+            or pulse_session_id.strip() != pulse_session_id
+        ):
+            raise ValueError("pulse_session_id must be canonical non-empty text")
+        if not isinstance(pulse_terminal, PulseTerminalAck):
             raise TypeError("pulse_terminal must be PulseTerminalAck")
-        if not isinstance(self.compiled_artifact, CompiledPulseArtifact):
+        if pulse_terminal.session_id != pulse_session_id:
+            raise ValueError("pulse terminal belongs to another pulse session")
+        if not isinstance(compiled_artifact, CompiledPulseArtifact):
             raise TypeError("compiled_artifact must be CompiledPulseArtifact")
-        if not isinstance(self.cell_plan, CompiledCaptureCellPlan):
+        if not isinstance(cell_plan, CompiledCaptureCellPlan):
             raise TypeError("cell_plan must be CompiledCaptureCellPlan")
-        if self.cell_plan.compiled_pulse_artifact_digest != self.compiled_artifact.fingerprint:
+        if (
+            cell_plan.compiled_pulse_artifact_digest
+            != compiled_artifact.fingerprint
+        ):
             raise ValueError("cell plan and compiled artifact digest differ")
-        if self.cell_plan.execution_form is not self.compiled_artifact.execution_form:
+        if cell_plan.execution_form is not compiled_artifact.execution_form:
             raise ValueError("cell plan and execution form differ")
-        if self.cell_plan.trigger_channel != self.trigger_channel:
+        if cell_plan.trigger_channel != trigger_channel:
             raise ValueError("cell plan and trigger channel differ")
-        self.cell_plan.validate_dataset_schema(self.capture.dataset.block.schema)
-        if self.cell_plan.cell_permutation_digest != self.capture.dataset.provenance.join_plan_digest:
+        evidence = capture.camera_capability_evidence
+        if evidence is None:
+            raise ValueError(
+                "triggered result requires broker-attested camera physical facts"
+            )
+        evidence.physical_facts.require_single_capture_trigger_channel(
+            trigger_channel
+        )
+        cell_plan.validate_against(compiled_artifact, capture.dataset.block.schema)
+        if capture.source_cell_schedule != cell_plan.expected_cells:
+            raise ValueError("cell plan and captured source schedule differ")
+        if (
+            cell_plan.cell_permutation_digest
+            != capture.dataset.provenance.join_plan_digest
+        ):
             raise ValueError("cell plan and sealed dataset permutation differ")
         validate_pulse_terminal_for_artifact(
-            self.pulse_terminal,
-            self.compiled_artifact,
+            pulse_terminal,
+            compiled_artifact,
         )
         counts = dict(
-            self.pulse_terminal.expected_trigger_counts_from_completed_schedule
+            pulse_terminal.expected_trigger_counts_from_completed_schedule
         )
-        if self.trigger_channel not in counts:
+        if trigger_channel not in counts:
             raise ValueError("pulse terminal omits the bound camera trigger channel")
-        expected = counts[self.trigger_channel]
+        expected = counts[trigger_channel]
         if (
-            self.capture.capture_terminal.produced_count != expected
-            or self.capture.capture_terminal.drained_count != expected
+            capture.capture_terminal.produced_count != expected
+            or capture.capture_terminal.drained_count != expected
         ):
-            raise RuntimeError("camera terminal count differs from completed pulse schedule")
+            raise RuntimeError(
+                "camera terminal count differs from completed pulse schedule"
+            )
+        object.__setattr__(self, "_authority", authority)
+        object.__setattr__(self, "_capture", capture)
+        object.__setattr__(self, "_pulse_session_id", pulse_session_id)
+        object.__setattr__(self, "_pulse_terminal", pulse_terminal)
+        object.__setattr__(self, "_trigger_channel", trigger_channel)
+        object.__setattr__(self, "_compiled_artifact", compiled_artifact)
+        object.__setattr__(self, "_cell_plan", cell_plan)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("TriggeredPipelineResult is immutable")
+
+    def __reduce__(self):
+        raise TypeError("TriggeredPipelineResult is process-local")
+
+    def __reduce_ex__(self, _protocol: int):
+        raise TypeError("TriggeredPipelineResult is process-local")
+
+    @property
+    def capture(self) -> PipelineResult:
+        return self._capture
+
+    @property
+    def pulse_session_id(self) -> str:
+        return self._pulse_session_id
+
+    @property
+    def pulse_terminal(self) -> PulseTerminalAck:
+        return self._pulse_terminal
+
+    @property
+    def trigger_channel(self) -> str:
+        return self._trigger_channel
+
+    @property
+    def compiled_artifact(self) -> CompiledPulseArtifact:
+        return self._compiled_artifact
+
+    @property
+    def cell_plan(self) -> CompiledCaptureCellPlan:
+        return self._cell_plan
 
     @property
     def dataset(self):
@@ -159,18 +243,6 @@ class TriggeredPipelineResult:
 class _PreparedTriggeredCapture:
     capture: ExactCaptureTransaction
     pulse: PulseSession
-
-
-def _merge_cleanup(*reports: CleanupReport) -> CleanupReport:
-    return CleanupReport(
-        safety_proofs=tuple(
-            proof for report in reports for proof in report.safety_proofs
-        ),
-        decisions=tuple(
-            decision for report in reports for decision in report.decisions
-        ),
-        errors=tuple(error for report in reports for error in report.errors),
-    )
 
 
 def compile_triggered_pipeline(spec: TriggeredCaptureSpec) -> RunPlan:
@@ -204,13 +276,19 @@ def compile_triggered_pipeline(spec: TriggeredCaptureSpec) -> RunPlan:
             prepared.pulse.fire(context)
             prepared.capture.capture_all(context)
             pulse_terminal = prepared.pulse.complete(context)
+            if not prepared.pulse.owns_terminal(pulse_terminal):
+                raise PermissionError(
+                    "pulse terminal was not minted by the current pulse session"
+                )
             capture_result = prepared.capture.complete(context)
             return TriggeredPipelineResult(
-                capture_result,
-                pulse_terminal,
-                spec.trigger_channel,
-                spec.pulse_request.artifact,
-                spec.cell_plan,
+                _TRIGGERED_RESULT_TOKEN,
+                capture=capture_result,
+                pulse_session_id=prepared.pulse.session_id,
+                pulse_terminal=pulse_terminal,
+                trigger_channel=spec.trigger_channel,
+                compiled_artifact=spec.pulse_request.artifact,
+                cell_plan=spec.cell_plan,
             )
         except BaseException as error:
             prepared.capture.fail(error)
@@ -223,15 +301,27 @@ def compile_triggered_pipeline(spec: TriggeredCaptureSpec) -> RunPlan:
         _primary: BaseException | None,
     ) -> CleanupReport:
         if prepared is None:
-            return _merge_cleanup(
-                pulse_port.verify_idle(context),
-                camera_port.verify_idle(context),
+            return run_cleanup_steps(
+                lambda: pulse_port.verify_idle(context),
+                lambda: camera_port.verify_idle(context),
             )
         # On failure/cancel, stop new hardware edges before terminating the
         # camera session.  On success both calls are idempotent terminal checks.
-        pulse_report = prepared.pulse.cleanup(context)
-        camera_report = prepared.capture.cleanup(context)
-        return _merge_cleanup(pulse_report, camera_report)
+        return run_cleanup_steps(
+            lambda: prepared.pulse.cleanup(context),
+            lambda: prepared.capture.cleanup(context),
+        )
+
+    def finalize(
+        context: PostSafetyContext,
+        result: TriggeredPipelineResult,
+    ) -> TriggeredPipelineResult:
+        if type(result) is not TriggeredPipelineResult:
+            raise TypeError("triggered capture finalize requires its compiler result")
+        if result.capture.run_id != context.run_id.value:
+            raise ValueError("triggered capture result belongs to another Run")
+        context.checkpoint()
+        return result
 
     return RunPlan(
         name=spec.capture.name,
@@ -242,7 +332,7 @@ def compile_triggered_pipeline(spec: TriggeredCaptureSpec) -> RunPlan:
         preflight=preflight,
         execute=execute,
         cleanup=cleanup,
-        finalize=lambda _context, result: result,
+        finalize=finalize,
         interrupt_operations=(
             *pulse_port.interrupt_operations,
             *camera_port.interrupt_operations,

@@ -602,6 +602,15 @@ class PulseSession:
             raise RuntimeError("pulse session has no terminal acknowledgement")
         return self._terminal
 
+    def owns_terminal(self, terminal: PulseTerminalAck) -> bool:
+        """Prove that this exact session minted and retained ``terminal``."""
+
+        self._assert_owner_thread()
+        return (
+            self._state is PulseSessionState.COMPLETED
+            and self._terminal is terminal
+        )
+
     def prepare(self, context: RunContext) -> None:
         self._assert_owner_thread()
         if self._state is not PulseSessionState.NEW:

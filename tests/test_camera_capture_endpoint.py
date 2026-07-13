@@ -45,6 +45,12 @@ from zlc_neutral_atom.runtime import (
     SafetyOperation,
     compile_pipeline,
 )
+from zlc_neutral_atom.runtime.capture import (
+    camera_capability_evidence_from_tree,
+    camera_capability_evidence_to_tree,
+    camera_physical_facts_from_tree,
+    camera_physical_facts_to_tree,
+)
 from zlc_storage import canonical_digest
 from zlc_workbench.camera_capture import (
     CameraCaptureBindingRequest,
@@ -118,7 +124,6 @@ def _bound_endpoint(camera: VirtualCamera):
             description.source_id,
             description.payload_contract,
             description.settings_fingerprint,
-            description.trigger_channels,
             description.physical_facts,
         )
     frame_bytes = int(np.prod(camera.frame_shape)) * 2
@@ -154,6 +159,30 @@ def _pipeline(camera: VirtualCamera):
         ),
     )
     return broker, endpoint, binding, compile_pipeline(spec)
+
+
+def _one_frame_prepare_command(capability, description):
+    from zlc_neutral_atom.runtime import PrepareCaptureCommand
+
+    frozen = freeze_camera_capture_spec(
+        CameraCaptureSpec(
+            CameraAcquisitionMode.EXTERNAL_TRIGGERED,
+            1,
+            description.settings_fingerprint,
+        )
+    )
+    return PrepareCaptureCommand(
+        "session",
+        "run",
+        "readout",
+        frozen.payload,
+        frozen.owner_fingerprint,
+        frozen.digest,
+        capability.capability_fingerprint,
+        capability.settings_fingerprint,
+        1,
+        capability.max_blocking_call_seconds,
+    )
 
 
 def test_camera_endpoint_runs_the_real_exact_pipeline_without_raw_device_escape():
@@ -205,29 +234,24 @@ def test_camera_endpoint_rejects_settings_drift_before_hardware_arm():
     camera.exposure = 2e-3
     target = endpoint.target_endpoint
     capability = attestation.snapshot
-    frozen = freeze_camera_capture_spec(
-        CameraCaptureSpec(
-            CameraAcquisitionMode.EXTERNAL_TRIGGERED,
-            1,
-            description.settings_fingerprint,
-        )
-    )
-    from zlc_neutral_atom.runtime import PrepareCaptureCommand
-
-    command = PrepareCaptureCommand(
-        "session",
-        "run",
-        "readout",
-        frozen.payload,
-        frozen.owner_fingerprint,
-        frozen.digest,
-        capability.capability_fingerprint,
-        capability.settings_fingerprint,
-        1,
-        capability.max_blocking_call_seconds,
-    )
+    command = _one_frame_prepare_command(capability, description)
     with pytest.raises(RuntimeError, match="settings changed"):
         target.execute_command(binding, command)
+    assert camera._recent_state()["armed"] is False
+    assert broker.current_binding(binding.key) is binding
+
+
+def test_camera_endpoint_rejects_physical_trigger_wiring_drift_before_arm():
+    camera = _camera()
+    broker, _registry, endpoint, binding, attestation, description = _bound_endpoint(
+        camera
+    )
+    original = description.capture_trigger_channels
+    camera.capture_trigger_channels = ("physically-rewired",)
+    assert description.capture_trigger_channels == original
+    command = _one_frame_prepare_command(attestation.snapshot, description)
+    with pytest.raises(RuntimeError, match="settings changed"):
+        endpoint.target_endpoint.execute_command(binding, command)
     assert camera._recent_state()["armed"] is False
     assert broker.current_binding(binding.key) is binding
 
@@ -269,6 +293,63 @@ def test_capability_physical_facts_use_applied_roi_and_payload_geometry():
     assert evidence.physical_facts is facts
     assert evidence.fingerprint == attestation.snapshot.capability_fingerprint
     assert evidence.source_id == "readout"
+
+
+def test_trigger_wiring_has_one_physical_owner_and_v2_canonical_round_trip():
+    camera = _camera()
+    camera.capture_trigger_channels = ("ch11", "ch12")
+    _broker, _registry, _endpoint, _binding, attestation, description = (
+        _bound_endpoint(camera)
+    )
+    evidence = attestation.snapshot.camera_capability_evidence
+    assert evidence is not None
+    facts = evidence.physical_facts
+
+    assert facts.capture_trigger_channels == ("ch11", "ch12")
+    assert description.capture_trigger_channels is facts.capture_trigger_channels
+    assert "trigger_channels" not in CameraCaptureDescription.__dataclass_fields__
+    facts.validate_capture_trigger_channel("ch12")
+    with pytest.raises(ValueError, match="not wired"):
+        facts.validate_capture_trigger_channel("ch10")
+    with pytest.raises(ValueError, match="exactly one"):
+        facts.require_single_capture_trigger_channel("ch12")
+
+    facts_tree = camera_physical_facts_to_tree(facts)
+    assert facts_tree["schema"] == "zlc_neutral_atom.CameraPhysicalFacts/v2"
+    assert facts_tree["capture_trigger_channels"] == ["ch11", "ch12"]
+    assert camera_physical_facts_from_tree(facts_tree) == facts
+    single_tree = dict(facts_tree)
+    single_tree["capture_trigger_channels"] = ["ch11"]
+    single_facts = camera_physical_facts_from_tree(single_tree)
+    single_facts.require_single_capture_trigger_channel("ch11")
+
+    evidence_tree = camera_capability_evidence_to_tree(evidence)
+    assert evidence_tree["schema"] == "zlc_neutral_atom.CameraCapabilityEvidence/v2"
+    assert camera_capability_evidence_from_tree(evidence_tree) == evidence
+    legacy_facts_tree = dict(facts_tree)
+    legacy_facts_tree["schema"] = "zlc_neutral_atom.CameraPhysicalFacts/v1"
+    with pytest.raises(ValueError, match="expected.*v2"):
+        camera_physical_facts_from_tree(legacy_facts_tree)
+    legacy_evidence_tree = dict(evidence_tree)
+    legacy_evidence_tree["schema"] = (
+        "zlc_neutral_atom.CameraCapabilityEvidence/v1"
+    )
+    with pytest.raises(ValueError, match="expected.*v2"):
+        camera_capability_evidence_from_tree(legacy_evidence_tree)
+
+    empty_tree = dict(facts_tree)
+    empty_tree["capture_trigger_channels"] = []
+    empty_facts = camera_physical_facts_from_tree(empty_tree)
+    assert empty_facts.capture_trigger_channels == ()
+    assert camera_physical_facts_from_tree(
+        camera_physical_facts_to_tree(empty_facts)
+    ) == empty_facts
+    with pytest.raises(ValueError, match="not wired"):
+        empty_facts.require_single_capture_trigger_channel("ch11")
+    duplicate_tree = dict(facts_tree)
+    duplicate_tree["capture_trigger_channels"] = ["ch11", "ch11"]
+    with pytest.raises(ValueError, match="unique"):
+        camera_physical_facts_from_tree(duplicate_tree)
 
 
 def test_installation_runtime_binds_camera_role_without_returning_raw_graph():

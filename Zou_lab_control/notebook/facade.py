@@ -402,12 +402,12 @@ def _compile(token: object, request: CaptureRequest):
         camera_description = services.runtime.describe_camera(request.camera_role)
         trigger_channel = request.trigger_channel
         if trigger_channel is None:
-            if len(camera_description.trigger_channels) != 1:
+            if len(camera_description.capture_trigger_channels) != 1:
                 raise ValueError(
-                    "camera has multiple trigger channels; choose trigger_channel explicitly"
+                    "exact capture requires exactly one physical camera trigger channel"
                 )
-            trigger_channel = camera_description.trigger_channels[0]
-        if trigger_channel not in camera_description.trigger_channels:
+            trigger_channel = camera_description.capture_trigger_channels[0]
+        if trigger_channel not in camera_description.capture_trigger_channels:
             raise ValueError(
                 f"camera {request.camera_role!r} is not wired to {trigger_channel!r}"
             )

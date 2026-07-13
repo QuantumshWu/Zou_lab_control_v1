@@ -193,6 +193,20 @@ def test_exact_pipeline_commits_and_reloads_capture_artifact(tmp_path):
         assert artifact.camera_arm_spec.digest == artifact.terminal.capture_spec_fingerprint
         assert artifact.camera_arm_spec == spec.measurement.capture_spec
 
+        legacy_manifest = decode(encode(manifest))
+        legacy_manifest["schema"] = "zlc_neutral_atom.CaptureArtifact/v9"
+        legacy = repository._store.publish_manifest(
+            "capture",
+            encode(legacy_manifest),
+        )
+        with pytest.raises(ValueError, match="CaptureArtifact/v10"):
+            repository.load(
+                CaptureArtifactRef(
+                    repository.repository_id,
+                    legacy.content.digest,
+                )
+            )
+
         changed_pixels = np.array(artifact.block.values, copy=True)
         changed_pixels[0, 0, 0, 0] += 1
         changed_block = replace(artifact.block, values=changed_pixels)
