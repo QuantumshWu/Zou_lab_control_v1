@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from importlib.metadata import version as distribution_version
 from itertools import permutations, product
 import math
 from types import SimpleNamespace
@@ -64,6 +65,7 @@ from zlc_neutral_atom.readout import (
     build_calibration_work_plan,
     decode_calibration_artifact,
     encode_calibration_artifact,
+    encode_readout_model,
     validate_calibration_analysis_contract,
 )
 from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
@@ -1599,7 +1601,6 @@ def test_resource_rejection_precedes_layout_detector_assignment_and_templates(mo
     monkeypatch.setattr(analysis_impl, "gaussian_filter", forbidden)
     monkeypatch.setattr(analysis_impl, "linear_sum_assignment", forbidden)
     monkeypatch.setattr(analysis_impl, "_training_reference_template", forbidden)
-    monkeypatch.setattr(analysis_impl, "_numeric_backend", forbidden)
 
     with pytest.raises(CalibrationResourceExceeded, match="kernels"):
         analyze_calibration(capture, kernel_heavy)
@@ -1962,59 +1963,49 @@ def test_clopper_pearson_gate_uses_per_class_evidence_and_defaults_to_all_sites(
         analyze_calibration(_replace_block(capture, values), request)
 
 
-def test_numeric_backend_identity_excludes_build_paths_and_unstable_metadata():
-    class FakeNumericModule:
-        @staticmethod
-        def show_config(*, mode):
-            assert mode == "dicts"
-            return {
-                "Compilers": {
-                    "c": {
-                        "name": "clang",
-                        "version": "19.0",
-                        "path": "C:/private/toolchain/bin/clang.exe",
-                        "commands": "clang -I C:/private/include",
-                    }
-                },
-                "Build Dependencies": {
-                    "blas": {
-                        "name": "OpenBLAS",
-                        "version": "0.3.29",
-                        "lib directory": "C:/private/lib",
-                        "has ilp64": False,
-                    },
-                    "lapack": {
-                        "name": "OpenBLAS",
-                        "version": "0.3.29",
-                        "include directory": "C:/private/include",
-                    },
-                },
-                "Machine Information": {
-                    "host": {
-                        "cpu": "x86_64",
-                        "family": "x86_64",
-                        "endian": "little",
-                        "system": "windows",
-                        "build": "runner-ephemeral-123",
-                    }
-                },
-                "SIMD Extensions": {
-                    "baseline": ["SSE2"],
-                    "found": ["AVX2"],
-                    "dispatch path": "C:/private/generated",
-                },
-            }
+def test_numeric_package_versions_are_bounded_passive_artifact_notes(monkeypatch):
+    capture = _capture(invalid_sample=False)
+    request = _request()
+    plan = build_calibration_work_plan(capture, request)
+    result = analyze_calibration(capture, request)
+    parameters = {item.name: item.value for item in result.artifact.parameters}
+    assert "numeric-backend-digest" not in parameters
+    assert parameters["numpy-version"] == distribution_version("numpy")
+    assert parameters["scipy-version"] == distribution_version("scipy")
+    assert all(
+        len(str(parameters[name])) <= 64
+        for name in ("numpy-version", "scipy-version")
+    )
+    assert all(
+        "numpy-version" not in {item.name for item in model.header.parameters}
+        and "scipy-version" not in {item.name for item in model.header.parameters}
+        for model in result.artifact.models
+    )
 
-    identity = analysis_impl._sanitized_build_identity(FakeNumericModule())
-    rendered = repr(identity)
-    assert "C:/private" not in rendered
-    assert "runner-ephemeral" not in rendered
-    assert identity["compilers"]["c"] == {"name": "clang", "version": "19.0"}
-    assert identity["blas"] == {
-        "name": "OpenBLAS",
-        "version": "0.3.29",
-        "has ilp64": False,
-    }
+    monkeypatch.setattr(analysis_impl.np, "__version__", "numpy/" + "x" * 200)
+    monkeypatch.setattr(analysis_impl.scipy, "__version__", "scipy path " + "y" * 200)
+    assert build_calibration_work_plan(capture, request) == plan
+    changed_notes = analyze_calibration(capture, request)
+    assert changed_notes.diagnostics == result.diagnostics
+    assert (
+        changed_notes.artifact.site_map.fingerprint
+        == result.artifact.site_map.fingerprint
+    )
+    assert tuple(map(encode_readout_model, changed_notes.artifact.models)) == tuple(
+        map(encode_readout_model, result.artifact.models)
+    )
+    assert changed_notes.artifact.fingerprint != result.artifact.fingerprint
+
+    without_notes = replace(
+        result.artifact,
+        parameters=tuple(
+            item
+            for item in result.artifact.parameters
+            if item.name not in {"numpy-version", "scipy-version"}
+        ),
+    )
+    stripped = CalibrationAnalysisResult(without_notes, result.diagnostics)
+    assert validate_calibration_analysis_contract(stripped, request, plan) is stripped
 
 
 def test_analysis_result_rejects_diagnostic_lineage_and_evidence_drift():

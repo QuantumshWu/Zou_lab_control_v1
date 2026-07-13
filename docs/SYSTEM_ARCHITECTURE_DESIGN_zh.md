@@ -1914,6 +1914,8 @@ ReadoutModel =
 
 一次 calibration 可产生共享 artifact 中的多种 model。artifact 的 `capabilities/stage` 明确区分 site-map-only、含 threshold、含完整 readout model 等完成态；这是合法的 typed capability，不是 partial-success 模糊状态。每个 Analysis 声明自己需要的 capability/model kind。Occupancy request 可显式选择 model；若用户未指定，只允许按 Definition 声明的稳定 default model policy 在 artifact 内唯一选择，并把实际 model id/version冻结进 request/lineage。没有唯一 default 时构造 request 即提示选择，不能按 tuple 第一项猜，也不能让 notebook 短路径退化成每次手写冗长参数。
 
+NumPy/SciPy 的版本只作为 `CalibrationArtifact.parameters` 顶层的有界、只读 producer lineage 备注。当前 producer 尽力写入两条备注；读取端允许备注缺失或为 `unknown`，不能因此拒绝 load/admit。它们不进入 WorkPlan、模型参数、SiteMap/detection lineage、derivation、manifest 专属字段、科学兼容性判断或 replay，也不与当前进程环境比较。artifact 的 CAS/fingerprint 仍像覆盖其它持久字节一样覆盖这些备注；这是内容完整性，不是数值后端准入权威。资源计划对两条备注使用固定宽度上界，因此环境版本字符串不能改变 WorkPlan 或 plan binding。
+
 ```text
 FrameContract:
   DatasetSchema/ValueSchema fingerprint
@@ -3217,6 +3219,7 @@ Artifact/Calibration：
 - live/offline calibration 在 CaptureArtifactRef 后走同一算法路径；
 - FrameContract/SiteMap/model applicability 不匹配明确失败。
 - calibration 默认按 ReadoutBindingKey 与声明的 model policy选择，site-map-only/完整 model capability 不混淆。
+- NumPy/SciPy 版本只在顶层 artifact 作为可选被动备注；版本改变不改变 WorkPlan、SiteMap、模型或诊断，load/admit 不探测当前数值环境。
 
 Pulse/FPGA：
 

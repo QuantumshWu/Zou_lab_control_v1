@@ -122,3 +122,43 @@ def test_artifact_finalizers_do_not_replay_published_payload_digests():
         "code must consume EventRef provenance instead of re-reading arrays:\n"
         + "\n".join(violations)
     )
+
+
+def test_calibration_numeric_versions_are_not_admission_authority():
+    forbidden = (
+        "CalibrationNumericBackend",
+        "numeric-backend-digest",
+        "numeric_backend_digest",
+        "backend_digest",
+        "frozen_numeric_backend",
+        "_sanitized_build_identity",
+        "_numeric_backend",
+    )
+    violations = []
+    for path in (ROOT / "zlc_neutral_atom" / "readout").rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for token in forbidden:
+            if token in text:
+                violations.append(f"{path.relative_to(ROOT)} contains {token}")
+    assert not violations, (
+        "numeric package versions are passive CalibrationArtifact notes; they "
+        "must not regain a digest, replay, model, manifest, or admission role:\n"
+        + "\n".join(violations)
+    )
+
+    analysis_path = ROOT / "zlc_neutral_atom" / "readout" / "analysis.py"
+    tree = ast.parse(
+        analysis_path.read_text(encoding="utf-8"),
+        filename=str(analysis_path),
+    )
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_numeric_lineage_notes"
+    ]
+    assert len(calls) == 1, (
+        "numeric version notes must be sampled once, only when constructing "
+        "the top-level CalibrationArtifact"
+    )

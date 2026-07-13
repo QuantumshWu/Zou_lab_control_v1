@@ -490,7 +490,7 @@ def test_request_rejects_unknown_analysis_planning_assumption():
 def test_work_plan_and_diagnostics_reject_bool_integer_and_nonfinite_float():
     plan = decode(encode_calibration_work_plan(_work_plan()))
     plan["source_cell_count"] = True
-    with pytest.raises(ValueError, match="canonical integer"):
+    with pytest.raises(TypeError, match="must be an integer"):
         decode_calibration_work_plan(encode(plan))
 
     diagnostics = decode(encode_calibration_analysis_diagnostics(_diagnostics()))

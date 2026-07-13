@@ -114,6 +114,8 @@ _REFERENCE_AMBIGUITY_GATE_VERSION = "1"
 _REFERENCE_EVIDENCE_ASSUMPTION = (
     "INDEPENDENT_STATIONARY_BRACKETS_COMPLETE_REFERENCE_FEATURES"
 )
+_NUMERIC_LINEAGE_NOTE_MAX_CHARS = 64
+_NUMERIC_LINEAGE_PARAMETER_NAMES = ("numpy-version", "scipy-version")
 
 
 class CalibrationAnalysisError(ValueError):
@@ -1054,7 +1056,6 @@ class CalibrationAnalysisResult:
         for name in (
             "analysis-request-fingerprint",
             "analysis-work-plan-fingerprint",
-            "numeric-backend-digest",
         ):
             value = artifact_parameters.get(name)
             if (
@@ -1238,7 +1239,6 @@ class CalibrationAnalysisResult:
             for name in (
                 "analysis-request-fingerprint",
                 "analysis-work-plan-fingerprint",
-                "numeric-backend-digest",
                 "bracket-sampling-assumption",
                 "analysis-planning-assumption",
                 "held-out-family-scope",
@@ -1529,9 +1529,6 @@ class _CalibrationWorkPreparation:
     source_binding: CalibrationSourceBinding
     frame_contract: FrameContract
     partition: _BracketPartition
-    numpy_version: str
-    scipy_version: str
-    backend_digest: str
 
 
 @dataclass(frozen=True)
@@ -1596,60 +1593,36 @@ class _RawCapture(Protocol):
     source_cell_schedule: tuple[object, ...]
 
 
-def _sanitized_build_identity(module: object) -> dict[str, object]:
+def _bounded_numeric_version(value: object) -> str:
+    """Return a small passive lineage note, never an admission identity."""
+
     try:
-        raw = module.show_config(mode="dicts")  # type: ignore[attr-defined]
-    except (AttributeError, TypeError):
-        return {"available": False}
-    if not isinstance(raw, dict):
-        return {"available": False}
-    compilers = raw.get("Compilers", {})
-    dependencies = raw.get("Build Dependencies", {})
-    machine = raw.get("Machine Information", {})
-    simd = raw.get("SIMD Extensions", {})
-
-    def selected(mapping: object, names: tuple[str, ...]) -> dict[str, object]:
-        if not isinstance(mapping, dict):
-            return {}
-        return {name: mapping[name] for name in names if name in mapping}
-
-    return {
-        "available": True,
-        "compilers": {
-            name: selected(value, ("name", "version"))
-            for name, value in sorted(
-                compilers.items() if isinstance(compilers, dict) else ()
-            )
-        },
-        "blas": selected(
-            dependencies.get("blas", {}) if isinstance(dependencies, dict) else {},
-            ("name", "version", "openblas configuration", "has ilp64"),
-        ),
-        "lapack": selected(
-            dependencies.get("lapack", {}) if isinstance(dependencies, dict) else {},
-            ("name", "version", "openblas configuration", "has ilp64"),
-        ),
-        "machine": selected(
-            machine.get("host", {}) if isinstance(machine, dict) else {},
-            ("cpu", "family", "endian", "system"),
-        ),
-        "simd": selected(simd, ("baseline", "found")),
-    }
-
-
-def _numeric_backend() -> tuple[str, str, str]:
-    numpy_version = str(np.__version__)
-    scipy_version = str(scipy.__version__)
-    digest = canonical_digest(
-        {
-            "schema": "zlc_neutral_atom.CalibrationNumericBackend/v2",
-            "numpy": numpy_version,
-            "scipy": scipy_version,
-            "numpy_build": _sanitized_build_identity(np),
-            "scipy_build": _sanitized_build_identity(scipy),
-        }
+        text = str(value).strip()
+    except Exception:
+        return "unknown"
+    if not text:
+        return "unknown"
+    # Package versions are normally PEP-440 ASCII.  Restricting the note keeps
+    # its encoded upper bound independent of the executing environment.
+    safe = "".join(
+        character
+        if character.isascii()
+        and (character.isalnum() or character in ".+-_")
+        else "_"
+        for character in text
     )
-    return numpy_version, scipy_version, digest
+    return safe[:_NUMERIC_LINEAGE_NOTE_MAX_CHARS] or "unknown"
+
+
+def _numeric_lineage_notes() -> dict[str, str]:
+    return {
+        "numpy-version": _bounded_numeric_version(
+            getattr(np, "__version__", "unknown")
+        ),
+        "scipy-version": _bounded_numeric_version(
+            getattr(scipy, "__version__", "unknown")
+        ),
+    }
 
 
 def _validate_partition_capacity(
@@ -1728,16 +1701,8 @@ def _planned_model_resources(
 def _prepare_calibration_work(
     capture: _RawCapture,
     request: CalibrationAnalysisRequest,
-    *,
-    frozen_numeric_backend: tuple[str, str, str] | None = None,
 ) -> _CalibrationWorkPreparation:
-    """Freeze source-specific work, lineage metadata, and resource bounds.
-
-    A persistent replay supplies the backend identity frozen in the artifact.
-    Resource-plan reconstruction must not depend on the package versions of
-    the process performing admission: those versions are lineage of the
-    original analysis, not a compatibility policy for reading its evidence.
-    """
+    """Freeze source-specific work and resource bounds."""
 
     if not isinstance(request, CalibrationAnalysisRequest):
         raise TypeError("request must be CalibrationAnalysisRequest")
@@ -1950,48 +1915,16 @@ def _prepare_calibration_work(
         request,
         label="resolved bracket partition",
     )
-    if frozen_numeric_backend is None:
-        numpy_version, scipy_version, backend_digest = _numeric_backend()
-    else:
-        if (
-            type(frozen_numeric_backend) is not tuple
-            or len(frozen_numeric_backend) != 3
-        ):
-            raise TypeError(
-                "frozen_numeric_backend must be a three-text tuple"
-            )
-        numpy_version, scipy_version, backend_digest = frozen_numeric_backend
-        for name, value in (
-            ("numpy_version", numpy_version),
-            ("scipy_version", scipy_version),
-        ):
-            if type(value) is not str or not value:
-                raise ValueError(f"{name} must be non-empty text")
-        if (
-            type(backend_digest) is not str
-            or len(backend_digest) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in backend_digest
-            )
-        ):
-            raise ValueError(
-                "backend_digest must be a lowercase SHA-256 digest"
-            )
     placeholder_digest = "f" * 64
-    artifact_parameters = tuple(
-        CalibrationParameter(name, value)
-        for name, value in _artifact_parameter_values(
+    artifact_parameters = _artifact_parameters_for_resource_plan(
+        _artifact_parameter_values(
             request,
             partition_digest=partition.digest,
             train_count=len(partition.train_indices),
             reference_evidence_count=len(partition.reference_evidence_indices),
             test_count=len(partition.test_indices),
             work_plan_digest=placeholder_digest,
-            backend_digest=backend_digest,
-            numpy_version=numpy_version,
-            scipy_version=scipy_version,
-        ).items()
+        )
     )
     model_parameters = tuple(
         CalibrationParameter(name, value)
@@ -2001,7 +1934,6 @@ def _prepare_calibration_work(
             train_count=len(partition.train_indices),
             reference_evidence_count=len(partition.reference_evidence_indices),
             test_count=len(partition.test_indices),
-            backend_digest=backend_digest,
             work_plan_digest=placeholder_digest,
         ).items()
     )
@@ -2114,9 +2046,6 @@ def _prepare_calibration_work(
         source_binding=source_binding,
         frame_contract=frame_contract,
         partition=partition,
-        numpy_version=numpy_version,
-        scipy_version=scipy_version,
-        backend_digest=backend_digest,
     )
 
 
@@ -3659,13 +3588,11 @@ def _model_parameter_values(
     train_count: int,
     reference_evidence_count: int,
     test_count: int,
-    backend_digest: str,
     work_plan_digest: str,
 ) -> dict[str, bool | int | float | str]:
     return {
         "analysis-request-fingerprint": request.fingerprint,
         "bracket-partition-digest": partition_digest,
-        "numeric-backend-digest": backend_digest,
         "analysis-work-plan-fingerprint": work_plan_digest,
         "bracket-sampling-assumption": request.bracket_sampling_assumption.value,
         "analysis-planning-assumption": (
@@ -3700,9 +3627,6 @@ def _artifact_parameter_values(
     reference_evidence_count: int,
     test_count: int,
     work_plan_digest: str,
-    backend_digest: str,
-    numpy_version: str,
-    scipy_version: str,
 ) -> dict[str, bool | int | float | str]:
     return {
         "analysis-request-fingerprint": request.fingerprint,
@@ -3711,9 +3635,6 @@ def _artifact_parameter_values(
         "grid-rows": request.grid_shape_yx[0],
         "grid-columns": request.grid_shape_yx[1],
         "grid-order": request.grid_order.value,
-        "numeric-backend-digest": backend_digest,
-        "numpy-version": numpy_version,
-        "scipy-version": scipy_version,
         "strict-reference-consensus": True,
         "bracket-sampling-assumption": request.bracket_sampling_assumption.value,
         "analysis-planning-assumption": (
@@ -3747,6 +3668,23 @@ def _artifact_parameter_values(
     }
 
 
+def _artifact_parameters_for_resource_plan(
+    authoritative_values: dict[str, bool | int | float | str],
+) -> tuple[CalibrationParameter, ...]:
+    """Use fixed-width placeholders so package versions cannot alter a plan."""
+
+    values = {
+        **authoritative_values,
+        **{
+            name: "x" * _NUMERIC_LINEAGE_NOTE_MAX_CHARS
+            for name in _NUMERIC_LINEAGE_PARAMETER_NAMES
+        },
+    }
+    return tuple(
+        CalibrationParameter(name, value) for name, value in values.items()
+    )
+
+
 def _model_header(
     kind: ReadoutModelKind,
     *,
@@ -3755,7 +3693,6 @@ def _model_header(
     site_map: SiteMap,
     request: CalibrationAnalysisRequest,
     partition: _BracketPartition,
-    backend_digest: str,
     work_plan_digest: str,
 ) -> ReadoutModelHeader:
     usable_count = int(np.count_nonzero(training.usable))
@@ -3810,7 +3747,6 @@ def _model_header(
                     partition.reference_evidence_indices
                 ),
                 test_count=len(partition.test_indices),
-                backend_digest=backend_digest,
                 work_plan_digest=work_plan_digest,
             ).items()
         ),
@@ -3914,13 +3850,12 @@ def validate_calibration_analysis_contract(
     if work_plan.planned_kernel_elements != expected_kernel_elements:
         raise ValueError("work plan kernel elements are not canonical")
     artifact_values = {item.name: item.value for item in artifact.parameters}
-    backend_digest = artifact_values.get("numeric-backend-digest")
-    numpy_version = artifact_values.get("numpy-version")
-    scipy_version = artifact_values.get("scipy-version")
-    if not isinstance(backend_digest, str):
-        raise ValueError("artifact omits numeric backend digest")
-    if not isinstance(numpy_version, str) or not isinstance(scipy_version, str):
-        raise ValueError("artifact omits numeric backend versions")
+    for name in _NUMERIC_LINEAGE_PARAMETER_NAMES:
+        note = artifact_values.pop(name, None)
+        if note is not None and (
+            type(note) is not str or note != _bounded_numeric_version(note)
+        ):
+            raise ValueError(f"artifact {name} lineage note is not bounded text")
     expected_artifact_values = _artifact_parameter_values(
         request,
         partition_digest=diagnostics.partition_digest,
@@ -3928,9 +3863,6 @@ def validate_calibration_analysis_contract(
         reference_evidence_count=evidence_count,
         test_count=test_count,
         work_plan_digest=work_plan.fingerprint,
-        backend_digest=backend_digest,
-        numpy_version=numpy_version,
-        scipy_version=scipy_version,
     )
     if not _typed_parameter_maps_equal(artifact_values, expected_artifact_values):
         raise ValueError("artifact parameters differ from frozen analysis request")
@@ -3965,7 +3897,6 @@ def validate_calibration_analysis_contract(
         train_count=train_count,
         reference_evidence_count=evidence_count,
         test_count=test_count,
-        backend_digest=backend_digest,
         work_plan_digest=work_plan.fingerprint,
     )
     from .calibration_codec import (
@@ -3976,9 +3907,8 @@ def validate_calibration_analysis_contract(
     expected_metadata_bound = calibration_artifact_metadata_encoding_upper_bound(
         source_binding=artifact.source_binding,
         frame_contract=artifact.frame_contract,
-        artifact_parameters=tuple(
-            CalibrationParameter(name, value)
-            for name, value in expected_artifact_values.items()
+        artifact_parameters=_artifact_parameters_for_resource_plan(
+            expected_artifact_values
         ),
         model_parameters=tuple(
             tuple(
@@ -4078,7 +4008,6 @@ def _build_model(
     site_map: SiteMap,
     request: CalibrationAnalysisRequest,
     partition: _BracketPartition,
-    backend_digest: str,
     work_plan_digest: str,
 ) -> tuple[ReadoutModel, ModelAnalysisDiagnostic]:
     header = _model_header(
@@ -4088,7 +4017,6 @@ def _build_model(
         site_map=site_map,
         request=request,
         partition=partition,
-        backend_digest=backend_digest,
         work_plan_digest=work_plan_digest,
     )
     boxes = _canonical_boxes(
@@ -4173,9 +4101,6 @@ def analyze_calibration(
         request.site_count,
         coordinates=tuple(range(request.site_count)),
     )
-    numpy_version = preparation.numpy_version
-    scipy_version = preparation.scipy_version
-    backend_digest = preparation.backend_digest
     template_hasher = hashlib.sha256()
     template_hasher.update(np.ascontiguousarray(average, dtype="<f8").tobytes())
     template_hasher.update(
@@ -4183,12 +4108,11 @@ def analyze_calibration(
     )
     detection_lineage = canonical_digest(
         {
-            "schema": "zlc_neutral_atom.SiteDetectionLineage/v3",
+            "schema": "zlc_neutral_atom.SiteDetectionLineage",
             "source_binding": source_binding.bracket_witness_digest,
             "partition": partition.digest,
             "request": request.fingerprint,
             "template_digest": template_hasher.hexdigest(),
-            "numeric_backend": backend_digest,
             "work_plan": work_plan.fingerprint,
             "algorithm": CALIBRATION_ANALYSIS_ALGORITHM_ID,
             "version": CALIBRATION_ANALYSIS_ALGORITHM_VERSION,
@@ -4306,7 +4230,6 @@ def analyze_calibration(
             site_map=site_map,
             request=request,
             partition=partition,
-            backend_digest=backend_digest,
             work_plan_digest=work_plan.fingerprint,
         )
         models.append(model)
@@ -4328,19 +4251,19 @@ def analyze_calibration(
         CALIBRATION_ANALYSIS_ALGORITHM_VERSION,
         tuple(
             CalibrationParameter(name, value)
-            for name, value in _artifact_parameter_values(
-                request,
-                partition_digest=partition.digest,
-                train_count=len(partition.train_indices),
-                reference_evidence_count=len(
-                    partition.reference_evidence_indices
+            for name, value in {
+                **_artifact_parameter_values(
+                    request,
+                    partition_digest=partition.digest,
+                    train_count=len(partition.train_indices),
+                    reference_evidence_count=len(
+                        partition.reference_evidence_indices
+                    ),
+                    test_count=len(partition.test_indices),
+                    work_plan_digest=work_plan.fingerprint,
                 ),
-                test_count=len(partition.test_indices),
-                work_plan_digest=work_plan.fingerprint,
-                backend_digest=backend_digest,
-                numpy_version=numpy_version,
-                scipy_version=scipy_version,
-            ).items()
+                **_numeric_lineage_notes(),
+            }.items()
         ),
     )
     validate_calibration_artifact_resources(

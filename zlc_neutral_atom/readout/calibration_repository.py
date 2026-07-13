@@ -111,8 +111,8 @@ else:
     CaptureRepository = Any
 
 
-CALIBRATION_MANIFEST_SCHEMA = "zlc_neutral_atom.calibration-manifest.v2"
-_CALIBRATION_DERIVATION_SCHEMA = "zlc_neutral_atom.CalibrationDerivation/v1"
+CALIBRATION_MANIFEST_SCHEMA = "zlc_neutral_atom.calibration-manifest"
+_CALIBRATION_DERIVATION_SCHEMA = "zlc_neutral_atom.CalibrationDerivation"
 _CALIBRATION_PLAN_BINDING_SCHEMA = "zlc_neutral_atom.CalibrationPlanBinding/v1"
 _CALIBRATION_ANALYSIS_RESULT_SCHEMA = "zlc_neutral_atom.CalibrationAnalysisResult/v1"
 _ADMITTED_CALIBRATION_EVIDENCE_SCHEMA = (
@@ -219,16 +219,6 @@ def _optional_canonical_text(value: object, field_name: str) -> str | None:
 def _parameter_digest(artifact: CalibrationArtifact, name: str) -> str:
     parameters = {item.name: item.value for item in artifact.parameters}
     return _sha256(parameters.get(name), f"calibration artifact {name}")
-
-
-def _parameter_text(artifact: CalibrationArtifact, name: str) -> str:
-    parameters = {item.name: item.value for item in artifact.parameters}
-    value = parameters.get(name)
-    if type(value) is not str or not value:
-        raise ValueError(
-            f"calibration artifact {name} must be non-empty text"
-        )
-    return value
 
 
 def _source_binding_fingerprint(binding: CalibrationSourceBinding) -> str:
@@ -493,7 +483,6 @@ class _CalibrationDerivation:
     request_fingerprint: str
     work_plan_fingerprint: str
     diagnostics_digest: str
-    numeric_backend_digest: str
     analysis_result_digest: str
     plan_binding_digest: str
     algorithm_id: str
@@ -528,7 +517,6 @@ class _CalibrationDerivation:
             "request_fingerprint",
             "work_plan_fingerprint",
             "diagnostics_digest",
-            "numeric_backend_digest",
             "analysis_result_digest",
             "plan_binding_digest",
         ):
@@ -1149,10 +1137,6 @@ class CalibrationRepository:
             request_fingerprint=prepared.request.fingerprint,
             work_plan_fingerprint=prepared.work_plan.fingerprint,
             diagnostics_digest=diagnostics_digest,
-            numeric_backend_digest=_parameter_digest(
-                artifact,
-                "numeric-backend-digest",
-            ),
             analysis_result_digest=_analysis_result_digest(
                 artifact,
                 diagnostics_digest,
@@ -1396,7 +1380,6 @@ _DERIVATION_METADATA_FIELDS = frozenset(
         "request_fingerprint",
         "work_plan_fingerprint",
         "diagnostics_digest",
-        "numeric_backend_digest",
         "analysis_result_digest",
         "plan_binding_digest",
         "algorithm_id",
@@ -1420,7 +1403,6 @@ def _derivation_metadata_values(
     request_fingerprint: str,
     work_plan_fingerprint: str,
     diagnostics_digest: str,
-    numeric_backend_digest: str,
     analysis_result_digest: str,
     plan_binding_digest: str,
     algorithm_id: str,
@@ -1440,7 +1422,6 @@ def _derivation_metadata_values(
         "request_fingerprint": request_fingerprint,
         "work_plan_fingerprint": work_plan_fingerprint,
         "diagnostics_digest": diagnostics_digest,
-        "numeric_backend_digest": numeric_backend_digest,
         "analysis_result_digest": analysis_result_digest,
         "plan_binding_digest": plan_binding_digest,
         "algorithm_id": algorithm_id,
@@ -1504,7 +1485,6 @@ def _manifest_tree_from_metadata(
         "request_fingerprint": metadata["request_fingerprint"],
         "work_plan_fingerprint": metadata["work_plan_fingerprint"],
         "diagnostics_digest": metadata["diagnostics_digest"],
-        "numeric_backend_digest": metadata["numeric_backend_digest"],
         "analysis_result_digest": metadata["analysis_result_digest"],
         "plan_binding_digest": metadata["plan_binding_digest"],
         "algorithm_id": metadata["algorithm_id"],
@@ -1583,7 +1563,6 @@ def _validate_prepared_repository_resources(
         request_fingerprint=request.fingerprint,
         work_plan_fingerprint=plan.fingerprint,
         diagnostics_digest=digest,
-        numeric_backend_digest=digest,
         analysis_result_digest=digest,
         plan_binding_digest=prepared.plan_binding_digest,
         algorithm_id=CALIBRATION_ANALYSIS_ALGORITHM_ID,
@@ -1787,7 +1766,6 @@ def _validate_analysis_result(
         prepared.work_plan.fingerprint
     ):
         raise ValueError("analysis work-plan fingerprint differs from preflight")
-    _parameter_digest(artifact, "numeric-backend-digest")
 
 
 def _validate_persistent_record(
@@ -1821,10 +1799,6 @@ def _validate_persistent_record(
         derivation.work_plan_fingerprint
     ):
         raise ValueError("artifact work-plan fingerprint differs from derivation")
-    if _parameter_digest(artifact, "numeric-backend-digest") != (
-        derivation.numeric_backend_digest
-    ):
-        raise ValueError("artifact numeric backend differs from derivation")
     if sha256_digest(diagnostics_payload) != derivation.diagnostics_digest:
         raise ValueError("diagnostics digest differs from derivation")
     if _analysis_result_digest(artifact, derivation.diagnostics_digest) != (
@@ -1877,15 +1851,7 @@ def _validate_source_capture(
         raise ValueError("resolved source capture run_id differs from derivation")
     if capture.safety_bundle_id != derivation.source_capture_safety_bundle_id:
         raise ValueError("resolved source capture safety bundle differs from derivation")
-    preparation = _prepare_calibration_work(
-        capture,
-        derivation.request,
-        frozen_numeric_backend=(
-            _parameter_text(artifact, "numpy-version"),
-            _parameter_text(artifact, "scipy-version"),
-            _parameter_digest(artifact, "numeric-backend-digest"),
-        ),
-    )
+    preparation = _prepare_calibration_work(capture, derivation.request)
     if preparation.source_binding != artifact.source_binding:
         raise ValueError("calibration source binding differs from resolved capture")
     if encode_frame_contract(preparation.frame_contract) != encode_frame_contract(
@@ -1938,7 +1904,6 @@ def _derivation_tree(
         request_fingerprint=derivation.request_fingerprint,
         work_plan_fingerprint=derivation.work_plan_fingerprint,
         diagnostics_digest=derivation.diagnostics_digest,
-        numeric_backend_digest=derivation.numeric_backend_digest,
         analysis_result_digest=derivation.analysis_result_digest,
         plan_binding_digest=derivation.plan_binding_digest,
         algorithm_id=derivation.algorithm_id,
@@ -1999,7 +1964,6 @@ def _derivation_from_payload(
         "request_fingerprint",
         "work_plan_fingerprint",
         "diagnostics_digest",
-        "numeric_backend_digest",
         "analysis_result_digest",
         "plan_binding_digest",
         "algorithm_id",
@@ -2045,7 +2009,6 @@ def _derivation_from_payload(
         tree["request_fingerprint"],
         tree["work_plan_fingerprint"],
         tree["diagnostics_digest"],
-        tree["numeric_backend_digest"],
         tree["analysis_result_digest"],
         tree["plan_binding_digest"],
         tree["algorithm_id"],
@@ -2083,7 +2046,6 @@ def _manifest_payload(
         request_fingerprint=derivation.request_fingerprint,
         work_plan_fingerprint=derivation.work_plan_fingerprint,
         diagnostics_digest=derivation.diagnostics_digest,
-        numeric_backend_digest=derivation.numeric_backend_digest,
         analysis_result_digest=derivation.analysis_result_digest,
         plan_binding_digest=derivation.plan_binding_digest,
         algorithm_id=derivation.algorithm_id,
@@ -2120,7 +2082,6 @@ def _manifest_from_tree(tree: Any) -> dict[str, Any]:
         "request_fingerprint",
         "work_plan_fingerprint",
         "diagnostics_digest",
-        "numeric_backend_digest",
         "analysis_result_digest",
         "plan_binding_digest",
         "algorithm_id",
@@ -2147,7 +2108,6 @@ def _manifest_from_tree(tree: Any) -> dict[str, Any]:
         "request_fingerprint",
         "work_plan_fingerprint",
         "diagnostics_digest",
-        "numeric_backend_digest",
         "analysis_result_digest",
         "plan_binding_digest",
         "evidence_digest",
@@ -2196,7 +2156,6 @@ def _validate_manifest_evidence(
         "request_fingerprint": derivation.request_fingerprint,
         "work_plan_fingerprint": derivation.work_plan_fingerprint,
         "diagnostics_digest": derivation.diagnostics_digest,
-        "numeric_backend_digest": derivation.numeric_backend_digest,
         "analysis_result_digest": derivation.analysis_result_digest,
         "plan_binding_digest": derivation.plan_binding_digest,
         "algorithm_id": derivation.algorithm_id,

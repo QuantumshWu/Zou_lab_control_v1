@@ -396,33 +396,6 @@ def test_flat_run_commits_reopens_and_admits_only_after_exact_source_reload(
         reopened.close()
 
 
-def test_admission_replays_the_frozen_backend_after_environment_upgrade(
-    committed,
-    monkeypatch,
-):
-    artifact = committed.calibration_repository.load(committed.calibration_ref)
-    parameters = {item.name: item.value for item in artifact.parameters}
-    current_backend_calls = 0
-
-    def changed_environment():
-        nonlocal current_backend_calls
-        current_backend_calls += 1
-        return (
-            str(parameters["numpy-version"]) + ".future-with-longer-text",
-            str(parameters["scipy-version"]) + ".future-with-longer-text",
-            "a" * 64,
-        )
-
-    monkeypatch.setattr(analysis_impl, "_numeric_backend", changed_environment)
-    admitted = committed.calibration_repository.admit(
-        committed.calibration_ref,
-        committed.capture_repository,
-    )
-
-    assert admitted.reference == committed.calibration_ref
-    assert current_backend_calls == 0
-
-
 def test_visible_calibration_without_final_intent_is_inspectable_not_admitted(
     committed,
     tmp_path,
@@ -452,6 +425,77 @@ def test_visible_calibration_without_final_intent_is_inspectable_not_admitted(
         assert not hasattr(repository, "put")
     finally:
         repository.close()
+
+
+def test_passive_numeric_lineage_notes_are_not_required_for_admission(
+    committed,
+    tmp_path,
+    monkeypatch,
+):
+    real_analyze = repository_impl.analyze_calibration
+
+    def analyze_without_notes(*args, **kwargs):
+        result = real_analyze(*args, **kwargs)
+        artifact = replace(
+            result.artifact,
+            parameters=tuple(
+                item
+                for item in result.artifact.parameters
+                if item.name not in {"numpy-version", "scipy-version"}
+            ),
+        )
+        return CalibrationAnalysisResult(artifact, result.diagnostics)
+
+    monkeypatch.setattr(
+        repository_impl,
+        "analyze_calibration",
+        analyze_without_notes,
+    )
+    repository = CalibrationRepository(
+        tmp_path / "calibrations-without-numeric-notes",
+        repository_id="calibrations-without-numeric-notes",
+    )
+    try:
+        handle = committed.runtime.controller.start(
+            compile_calibration_artifact_plan(
+                committed.capture_ref,
+                committed.capture_repository,
+                repository,
+                committed.request,
+            )
+        )
+        reference = handle.result(20.0)
+        artifact = repository.load(reference)
+        assert not {
+            "numpy-version",
+            "scipy-version",
+        } & {item.name for item in artifact.parameters}
+        assert repository.admit(
+            reference,
+            committed.capture_repository,
+        ).reference == reference
+    finally:
+        repository.close()
+
+
+def test_load_and_admission_never_probe_the_current_numeric_environment(
+    committed,
+    monkeypatch,
+):
+    def forbidden():
+        pytest.fail("persistent calibration access probed the numeric environment")
+
+    monkeypatch.setattr(analysis_impl, "_numeric_lineage_notes", forbidden)
+    artifact = committed.calibration_repository.load(committed.calibration_ref)
+    result = committed.calibration_repository.load_analysis_result(
+        committed.calibration_ref
+    )
+    admitted = committed.calibration_repository.admit(
+        committed.calibration_ref,
+        committed.capture_repository,
+    )
+    assert result.artifact.fingerprint == artifact.fingerprint
+    assert admitted.artifact.fingerprint == artifact.fingerprint
 
 
 def test_repository_root_has_one_live_owner_and_close_is_terminal(tmp_path):
@@ -813,7 +857,6 @@ def test_manifest_and_derivation_tampering_are_rejected_current_only(committed):
 def test_admission_requires_the_concrete_exact_source_repository(
     committed,
     tmp_path,
-    monkeypatch,
 ):
     with pytest.raises(TypeError, match="final"):
         class LyingCaptureRepository(CaptureRepository):
@@ -827,42 +870,6 @@ def test_admission_requires_the_concrete_exact_source_repository(
             committed.calibration_ref,
             lambda _reference: committed.capture_repository.load(committed.capture_ref),
         )
-    real_prepare = repository_impl._prepare_calibration_work
-    capture = committed.capture_repository.load(committed.capture_ref)
-    artifact = committed.calibration_repository.load(committed.calibration_ref)
-    parameters = {item.name: item.value for item in artifact.parameters}
-    expected_preparation = real_prepare(
-        capture,
-        committed.request,
-        frozen_numeric_backend=(
-            parameters["numpy-version"],
-            parameters["scipy-version"],
-            parameters["numeric-backend-digest"],
-        ),
-    )
-    drifted_work_plan = replace(
-        expected_preparation.plan,
-        source_cell_count=expected_preparation.plan.source_cell_count + 1,
-    )
-
-    def drifted_prepare(*args, **kwargs):
-        return replace(
-            real_prepare(*args, **kwargs),
-            plan=drifted_work_plan,
-        )
-
-    monkeypatch.setattr(
-        repository_impl,
-        "_prepare_calibration_work",
-        drifted_prepare,
-    )
-    with pytest.raises(ValueError, match="work plan differs"):
-        committed.calibration_repository.admit(
-            committed.calibration_ref,
-            committed.capture_repository,
-        )
-
-    monkeypatch.setattr(repository_impl, "_prepare_calibration_work", real_prepare)
     uncommitted_root = tmp_path / "visible-uncommitted-captures"
     shutil.copytree(
         committed.capture_repository.root / "content",
