@@ -6,8 +6,12 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
-from zlc_storage import FramedJournal, canonical_digest
-from zlc_storage.framed_journal import _fsync_directory
+from zlc_storage import (
+    FramedJournal,
+    canonical_digest,
+    durable_mkdir,
+    flush_directory,
+)
 
 from .resources import (
     HazardRecord,
@@ -34,7 +38,8 @@ class SafetyAuthorityBusy(RuntimeError):
 
 class _InstallationOwnerLock:
     def __init__(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        durable_mkdir(path.parent)
+        flush_directory(path.parent)
         existed = path.exists()
         self._stream = path.open("a+b")
         self._closed = False
@@ -67,7 +72,7 @@ class _InstallationOwnerLock:
                         "another process owns the installation safety authority"
                     ) from exc
             if not existed:
-                _fsync_directory(path.parent)
+                flush_directory(path.parent)
         except BaseException:
             self._stream.close()
             raise

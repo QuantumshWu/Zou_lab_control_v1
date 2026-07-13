@@ -17,12 +17,18 @@ from pathlib import Path
 from zlc_data import (
     DataBlock,
     StreamGenerationId,
-    decode_data_block,
+    data_block_from_tree,
     encode_data_block,
 )
 from zlc_storage import (
+    CanonicalArrayEvent,
+    CanonicalDecodeLimits,
+    CanonicalListEvent,
     ContentAddressedStore,
     ContentRef,
+    ContentSizeLimitError,
+    ContentStoreAuthority,
+    RepositoryRootLease,
     decode,
     encode,
     sha256_digest,
@@ -45,6 +51,7 @@ from zlc_neutral_atom.camera_operator import (
 from zlc_neutral_atom.capture_reference import (
     CAPTURE_ARTIFACT_NAMESPACE,
     CaptureArtifactRef,
+    capture_artifact_ref_to_tree,
 )
 from zlc_neutral_atom.runtime.commit import (
     CheckpointCommit,
@@ -54,6 +61,7 @@ from zlc_neutral_atom.runtime.commit import (
     CommitTarget,
     FinalCommit,
     PersistentCommitJournal,
+    PublishVisibilityUnknown,
     PublishedManifest,
     RepositoryCommitCoordinator,
 )
@@ -108,6 +116,171 @@ from zlc_pulse import (
 CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact/v8"
 _CAPTURE_METADATA_SCHEMA = "zlc_neutral_atom.CameraFrameMetadataSequence/v1"
 _CAPTURE_NAMESPACE = CAPTURE_ARTIFACT_NAMESPACE
+_ADMITTED_CAPTURE_EVIDENCE_SCHEMA = "zlc_neutral_atom.AdmittedCaptureEvidence/v1"
+_ADMITTED_CAPTURE_TOKEN = object()
+
+
+class CaptureResourceExceeded(RuntimeError):
+    """A capture exceeds an explicit repository admission budget."""
+
+
+@dataclass(frozen=True)
+class CaptureRepositoryResourcePolicy:
+    """Whole-object limits; multidimensional payloads are rejected, never reduced.
+
+    The defaults cover multi-gigabyte exact qCMOS datasets while retaining a
+    finite pre-read ceiling.  Deployments with a larger validated host-retention
+    budget may pass a larger immutable policy explicitly.
+    """
+
+    max_cells: int = 1_000_000
+    max_manifest_bytes: int = 512 * 1024 * 1024
+    max_data_block_blob_bytes: int = 4 * 1024 * 1024 * 1024
+    max_data_array_bytes: int = 3 * 1024 * 1024 * 1024
+    max_metadata_blob_bytes: int = 512 * 1024 * 1024
+    max_compiled_pulse_blob_bytes: int = 256 * 1024 * 1024
+    max_cell_plan_blob_bytes: int = 512 * 1024 * 1024
+    max_canonical_nodes: int = 32_000_000
+    max_canonical_container_entries: int = 16_000_000
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_cells",
+            "max_manifest_bytes",
+            "max_data_block_blob_bytes",
+            "max_data_array_bytes",
+            "max_metadata_blob_bytes",
+            "max_compiled_pulse_blob_bytes",
+            "max_cell_plan_blob_bytes",
+            "max_canonical_nodes",
+            "max_canonical_container_entries",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
+    @property
+    def snapshot(self) -> tuple[int, ...]:
+        return (
+            self.max_cells,
+            self.max_manifest_bytes,
+            self.max_data_block_blob_bytes,
+            self.max_data_array_bytes,
+            self.max_metadata_blob_bytes,
+            self.max_compiled_pulse_blob_bytes,
+            self.max_cell_plan_blob_bytes,
+            self.max_canonical_nodes,
+            self.max_canonical_container_entries,
+        )
+
+
+DEFAULT_CAPTURE_REPOSITORY_RESOURCE_POLICY = CaptureRepositoryResourcePolicy()
+
+
+@dataclass(frozen=True)
+class _CaptureRepositoryAuthority:
+    root: Path
+    repository_id: str
+    root_lease: RepositoryRootLease
+    resource_policy: CaptureRepositoryResourcePolicy
+    resource_policy_snapshot: tuple[int, ...]
+    store: ContentAddressedStore
+    store_authority: ContentStoreAuthority
+    journal: PersistentCommitJournal
+    coordinator: RepositoryCommitCoordinator[CaptureArtifactRef]
+    token: object
+
+
+class AdmittedCapture:
+    """Process-local proof that one exact CaptureArtifact target was committed."""
+
+    __slots__ = (
+        "_token",
+        "_repository_token",
+        "_reference",
+        "_artifact",
+        "_commit_kind",
+        "_commit_id",
+        "_evidence_digest",
+    )
+
+    def __init_subclass__(cls, **_kwargs) -> None:
+        raise TypeError("AdmittedCapture is final and cannot be subclassed")
+
+    def __init__(
+        self,
+        token: object,
+        *,
+        repository_token: object,
+        reference: CaptureArtifactRef,
+        artifact: "CaptureArtifact",
+        commit_kind: CommitKind,
+        commit_id: str,
+        evidence_digest: str,
+    ) -> None:
+        if token is not _ADMITTED_CAPTURE_TOKEN:
+            raise PermissionError(
+                "AdmittedCapture can only be minted by CaptureRepository.admit"
+            )
+        if repository_token is None:
+            raise ValueError("AdmittedCapture repository authority is absent")
+        if not isinstance(reference, CaptureArtifactRef):
+            raise TypeError("reference must be CaptureArtifactRef")
+        if not isinstance(artifact, CaptureArtifact):
+            raise TypeError("artifact must be CaptureArtifact")
+        if not isinstance(commit_kind, CommitKind):
+            raise TypeError("commit_kind must be CommitKind")
+        _canonical_text(commit_id, "commit_id")
+        _sha256(evidence_digest, "evidence_digest")
+        object.__setattr__(self, "_token", token)
+        object.__setattr__(self, "_repository_token", repository_token)
+        object.__setattr__(self, "_reference", reference)
+        object.__setattr__(self, "_artifact", artifact)
+        object.__setattr__(self, "_commit_kind", commit_kind)
+        object.__setattr__(self, "_commit_id", commit_id)
+        object.__setattr__(self, "_evidence_digest", evidence_digest)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("AdmittedCapture is immutable")
+
+    def __reduce__(self):
+        raise TypeError("AdmittedCapture is process-local and cannot be serialized")
+
+    def __reduce_ex__(self, _protocol: int):
+        raise TypeError("AdmittedCapture is process-local and cannot be serialized")
+
+    def _require_authority(self) -> None:
+        if (
+            type(self) is not AdmittedCapture
+            or self._token is not _ADMITTED_CAPTURE_TOKEN
+            or self._repository_token is None
+        ):
+            raise PermissionError("AdmittedCapture authority is invalid")
+
+    @property
+    def reference(self) -> CaptureArtifactRef:
+        self._require_authority()
+        return self._reference
+
+    @property
+    def artifact(self) -> "CaptureArtifact":
+        self._require_authority()
+        return self._artifact
+
+    @property
+    def commit_kind(self) -> CommitKind:
+        self._require_authority()
+        return self._commit_kind
+
+    @property
+    def commit_id(self) -> str:
+        self._require_authority()
+        return self._commit_id
+
+    @property
+    def evidence_digest(self) -> str:
+        self._require_authority()
+        return self._evidence_digest
 
 
 def _canonical_text(value: object, field: str) -> str:
@@ -439,37 +612,270 @@ class CaptureArtifact:
                 )
 
 
+def _capture_decode_limits(
+    policy: CaptureRepositoryResourcePolicy,
+    *,
+    max_arrays: int,
+    max_total_array_bytes: int,
+) -> CanonicalDecodeLimits:
+    return CanonicalDecodeLimits(
+        max_depth=128,
+        max_nodes=policy.max_canonical_nodes,
+        max_container_entries=policy.max_canonical_container_entries,
+        max_arrays=max_arrays,
+        max_total_array_bytes=max_total_array_bytes,
+    )
+
+
+def _decode_data_block_payload(
+    payload: bytes,
+    policy: CaptureRepositoryResourcePolicy,
+) -> DataBlock:
+    def admit_structure(events) -> None:
+        array_bytes = sum(
+            event.nbytes for event in events if isinstance(event, CanonicalArrayEvent)
+        )
+        if array_bytes > policy.max_data_array_bytes:
+            raise CaptureResourceExceeded(
+                "capture DataBlock arrays exceed repository resource policy"
+            )
+
+    tree = decode(
+        payload,
+        admit_structure=admit_structure,
+        limits=_capture_decode_limits(
+            policy,
+            max_arrays=4,
+            max_total_array_bytes=policy.max_data_block_blob_bytes,
+        ),
+    )
+    block = data_block_from_tree(tree)
+    if encode_data_block(block) != payload:
+        raise ValueError("DataBlock payload is not canonical current schema")
+    return block
+
+
+def _require_content_size(
+    reference: ContentRef,
+    maximum: int,
+    field: str,
+) -> None:
+    if reference.size > maximum:
+        raise CaptureResourceExceeded(
+            f"capture {field} blob exceeds repository resource policy"
+        )
+
+
 class CaptureRepository:
-    """One neutral-domain repository with a durable commit-intent gate."""
+    """Current-only raw-capture CAS with durable commit/admission authority."""
+
+    __slots__ = (
+        "root",
+        "repository_id",
+        "resource_policy",
+        "_root_lease",
+        "_store",
+        "_store_authority",
+        "_journal",
+        "_coordinator",
+        "_authority",
+        "_sealed",
+    )
+
+    def __init_subclass__(cls, **_kwargs) -> None:
+        raise TypeError("CaptureRepository is final and cannot be subclassed")
 
     def __init__(
         self,
         root: str | Path,
         *,
         repository_id: str = "zlc-neutral-capture",
+        resource_policy: CaptureRepositoryResourcePolicy = (
+            DEFAULT_CAPTURE_REPOSITORY_RESOURCE_POLICY
+        ),
     ) -> None:
-        self.root = Path(root).expanduser().resolve()
-        self.repository_id = _canonical_text(repository_id, "repository_id")
-        self._store = ContentAddressedStore(self.root / "content")
-        self._journal = PersistentCommitJournal(
-            self.root / "capture-commit.journal",
-            self.repository_id,
+        object.__setattr__(self, "_sealed", False)
+        object.__setattr__(self, "root", Path(root).expanduser().resolve())
+        object.__setattr__(
+            self,
+            "repository_id",
+            _canonical_text(repository_id, "repository_id"),
         )
-        self._coordinator: RepositoryCommitCoordinator[CaptureArtifactRef] = (
-            RepositoryCommitCoordinator(self._journal, self._recover)
+        if not isinstance(resource_policy, CaptureRepositoryResourcePolicy):
+            raise TypeError(
+                "resource_policy must be CaptureRepositoryResourcePolicy"
+            )
+        owned_policy = CaptureRepositoryResourcePolicy(*resource_policy.snapshot)
+        object.__setattr__(self, "resource_policy", owned_policy)
+        root_lease = RepositoryRootLease(
+            self.root,
+            owner=f"capture:{self.repository_id}",
         )
+        object.__setattr__(self, "_root_lease", root_lease)
+        try:
+            # The root lease is deliberately acquired before any content-store,
+            # journal, or startup-reconciliation I/O.  A losing second writer
+            # therefore cannot inspect or resolve another live owner's intents.
+            store = ContentAddressedStore(self.root / "content")
+            object.__setattr__(self, "_store", store)
+            object.__setattr__(self, "_store_authority", store.authority())
+            journal = PersistentCommitJournal(
+                self.root / "capture-commit.journal",
+                self.repository_id,
+            )
+            object.__setattr__(self, "_journal", journal)
+            # RepositoryCommitCoordinator performs synchronous startup recovery.
+            # The full immutable snapshot is installed immediately afterwards.
+            object.__setattr__(self, "_authority", None)
+            coordinator: RepositoryCommitCoordinator[CaptureArtifactRef] = (
+                RepositoryCommitCoordinator(
+                    journal,
+                    self._recover,
+                    root_lease=root_lease,
+                )
+            )
+            object.__setattr__(self, "_coordinator", coordinator)
+            object.__setattr__(
+                self,
+                "_authority",
+                _CaptureRepositoryAuthority(
+                    root=self.root,
+                    repository_id=self.repository_id,
+                    root_lease=root_lease,
+                    resource_policy=self.resource_policy,
+                    resource_policy_snapshot=self.resource_policy.snapshot,
+                    store=store,
+                    store_authority=self._store_authority,
+                    journal=journal,
+                    coordinator=coordinator,
+                    token=object(),
+                ),
+            )
+        except BaseException:
+            root_lease.close()
+            raise
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("CaptureRepository authority is immutable")
+        object.__setattr__(self, _name, _value)
+
+    def _assert_authority_integrity(self) -> _CaptureRepositoryAuthority | None:
+        authority = self._authority
+        if authority is None:
+            if getattr(self, "_sealed", False):
+                raise RuntimeError("capture repository authority is absent")
+            return None
+        if (
+            type(self) is not CaptureRepository
+            or self.root != authority.root
+            or self.repository_id != authority.repository_id
+            or self._root_lease is not authority.root_lease
+            or self.resource_policy is not authority.resource_policy
+            or self.resource_policy.snapshot != authority.resource_policy_snapshot
+            or self._store is not authority.store
+            or self._store_authority is not authority.store_authority
+            or self._journal is not authority.journal
+            or self._coordinator is not authority.coordinator
+            or self._journal.repository_id != authority.repository_id
+            or self._journal.repository_root != authority.root
+            or self._coordinator.repository_id != authority.repository_id
+        ):
+            raise RuntimeError("capture repository durability authority changed")
+        authority.root_lease.require_active()
+        if authority.store_authority.root != authority.root / "content":
+            raise RuntimeError("capture content store escaped its repository root")
+        return authority
+
+    def close(self) -> None:
+        """Close only after every prepared/in-flight commit authority is resolved."""
+
+        root_lease = getattr(self, "_root_lease", None)
+        if root_lease is not None:
+            root_lease.close()
+
+    def __enter__(self) -> "CaptureRepository":
+        self._assert_authority_integrity()
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
 
     @property
     def startup_reconciliations(self):
+        self._assert_authority_integrity()
         return self._coordinator.startup_reconciliations
 
     def load(self, reference: CaptureArtifactRef) -> CaptureArtifact:
+        """Fully validate a structurally visible artifact for inspection only."""
+
+        authority = self._assert_authority_integrity()
+        assert authority is not None
         self._validate_ref(reference)
-        manifest_payload = self._store.read_manifest(
-            _CAPTURE_NAMESPACE,
-            reference.manifest_digest,
+        try:
+            manifest_payload = authority.store_authority.read_manifest(
+                _CAPTURE_NAMESPACE,
+                reference.manifest_digest,
+                max_bytes=authority.resource_policy.max_manifest_bytes,
+            )
+        except ContentSizeLimitError as exc:
+            raise CaptureResourceExceeded(
+                "capture manifest exceeds repository resource policy"
+            ) from exc
+        return self._load_manifest(
+            reference,
+            manifest_payload,
+            store_authority=authority.store_authority,
+            policy=authority.resource_policy,
+            repository_id=authority.repository_id,
         )
-        tree = decode(manifest_payload)
+
+    def _load_manifest(
+        self,
+        reference: CaptureArtifactRef,
+        manifest_payload: bytes,
+        *,
+        store_authority: ContentStoreAuthority,
+        policy: CaptureRepositoryResourcePolicy,
+        repository_id: str,
+    ) -> CaptureArtifact:
+        self._assert_authority_integrity()
+        if len(manifest_payload) > policy.max_manifest_bytes:
+            raise CaptureResourceExceeded(
+                "capture manifest exceeds repository resource policy"
+            )
+        def admit_manifest_structure(events) -> None:
+            for event in events:
+                if isinstance(event, CanonicalArrayEvent):
+                    raise CaptureResourceExceeded(
+                        "capture manifest cannot embed ndarray payloads"
+                    )
+                if (
+                    isinstance(event, CanonicalListEvent)
+                    and event.path == ("source_cell_schedule",)
+                    and event.length > policy.max_cells
+                ):
+                    raise CaptureResourceExceeded(
+                        "capture metadata count or cell count exceeds repository "
+                        "resource policy"
+                    )
+
+        tree = decode(
+            manifest_payload,
+            admit_structure=admit_manifest_structure,
+            limits=_capture_decode_limits(
+                policy,
+                max_arrays=0,
+                max_total_array_bytes=0,
+            ),
+        )
         data = _exact_map(
             tree,
             {
@@ -495,7 +901,7 @@ class CaptureRepository:
             },
             CAPTURE_ARTIFACT_SCHEMA,
         )
-        if data["repository_id"] != self.repository_id:
+        if data["repository_id"] != repository_id:
             raise ValueError("CaptureArtifact belongs to another repository")
         block_ref = _content_ref_from_tree(data["data_block_blob"])
         metadata_ref = _content_ref_from_tree(data["metadata_blob"])
@@ -509,26 +915,102 @@ class CaptureRepository:
             if data["cell_plan_blob"] is None
             else _content_ref_from_tree(data["cell_plan_blob"])
         )
-        block = decode_data_block(self._store.read_blob(block_ref))
-        metadata_payload = self._store.read_blob(metadata_ref)
+        _require_content_size(
+            block_ref,
+            policy.max_data_block_blob_bytes,
+            "DataBlock",
+        )
+        _require_content_size(
+            metadata_ref,
+            policy.max_metadata_blob_bytes,
+            "metadata",
+        )
+        if pulse_ref is not None:
+            _require_content_size(
+                pulse_ref,
+                policy.max_compiled_pulse_blob_bytes,
+                "compiled-pulse",
+            )
+        if plan_ref is not None:
+            _require_content_size(
+                plan_ref,
+                policy.max_cell_plan_blob_bytes,
+                "cell-plan",
+            )
+        try:
+            block_payload = store_authority.read_blob(
+                block_ref,
+                max_bytes=policy.max_data_block_blob_bytes,
+            )
+            metadata_payload = store_authority.read_blob(
+                metadata_ref,
+                max_bytes=policy.max_metadata_blob_bytes,
+            )
+        except ContentSizeLimitError as exc:
+            raise CaptureResourceExceeded(
+                "capture content blob exceeds repository resource policy"
+            ) from exc
+        block = _decode_data_block_payload(block_payload, policy)
+        def admit_metadata_structure(events) -> None:
+            for event in events:
+                if isinstance(event, CanonicalArrayEvent):
+                    raise CaptureResourceExceeded(
+                        "capture metadata cannot embed ndarray payloads"
+                    )
+                if (
+                    isinstance(event, CanonicalListEvent)
+                    and event.path == ("items",)
+                    and event.length > policy.max_cells
+                ):
+                    raise CaptureResourceExceeded(
+                        "capture metadata count exceeds repository resource policy"
+                    )
+
         metadata_tree = _exact_map(
-            decode(metadata_payload),
+            decode(
+                metadata_payload,
+                admit_structure=admit_metadata_structure,
+                limits=_capture_decode_limits(
+                    policy,
+                    max_arrays=0,
+                    max_total_array_bytes=0,
+                ),
+            ),
             {"schema", "items"},
             _CAPTURE_METADATA_SCHEMA,
         )
         items = metadata_tree["items"]
         if not isinstance(items, list):
             raise ValueError("camera metadata items must be a list")
-        cell_plan = (
-            None
-            if plan_ref is None
-            else decode_compiled_capture_cell_plan(self._store.read_blob(plan_ref))
-        )
-        compiled_pulse = (
-            None
-            if pulse_ref is None
-            else decode_compiled_pulse_artifact(self._store.read_blob(pulse_ref))
-        )
+        if len(items) > policy.max_cells:
+            raise CaptureResourceExceeded(
+                "capture metadata count exceeds repository resource policy"
+            )
+        try:
+            cell_plan = (
+                None
+                if plan_ref is None
+                else decode_compiled_capture_cell_plan(
+                    store_authority.read_blob(
+                        plan_ref,
+                        max_bytes=policy.max_cell_plan_blob_bytes,
+                    )
+                )
+            )
+            compiled_pulse = (
+                None
+                if pulse_ref is None
+                else decode_compiled_pulse_artifact(
+                    store_authority.read_blob(
+                        pulse_ref,
+                        max_bytes=policy.max_compiled_pulse_blob_bytes,
+                    )
+                )
+            )
+        except ContentSizeLimitError as exc:
+            raise CaptureResourceExceeded(
+                "capture lineage blob exceeds repository resource policy"
+            ) from exc
         if compiled_pulse is not None and pulse_ref is not None:
             if pulse_ref.digest != compiled_pulse.fingerprint:
                 raise ValueError(
@@ -537,6 +1019,13 @@ class CaptureRepository:
         if cell_plan is not None and plan_ref is not None:
             if plan_ref.digest != cell_plan.fingerprint:
                 raise ValueError("cell-plan blob digest differs from plan fingerprint")
+        source_cell_schedule = _cell_schedule_from_tree(
+            data["source_cell_schedule"]
+        )
+        if len(source_cell_schedule) > policy.max_cells:
+            raise CaptureResourceExceeded(
+                "capture cell count exceeds repository resource policy"
+            )
         artifact = CaptureArtifact(
             ref=reference,
             block=block,
@@ -555,9 +1044,7 @@ class CaptureRepository:
                 data["camera_capability_evidence"]
             ),
             camera_arm_spec=_frozen_capture_spec_from_tree(data["camera_arm_spec"]),
-            source_cell_schedule=_cell_schedule_from_tree(
-                data["source_cell_schedule"]
-            ),
+            source_cell_schedule=source_cell_schedule,
             run_id=data["run_id"],
             safety_bundle_id=data["safety_bundle_id"],
             chain_contract_digest=data["chain_contract_digest"],
@@ -581,6 +1068,86 @@ class CaptureRepository:
         ):
             raise ValueError("CaptureArtifact manifest is not canonical")
         return artifact
+
+    def admit(self, reference: CaptureArtifactRef) -> AdmittedCapture:
+        """Mint authority only for an exact journal-committed capture target."""
+
+        authority = self._assert_authority_integrity()
+        assert authority is not None
+        artifact = self.load(reference)
+        target = CommitTarget(
+            authority.repository_id,
+            "capture",
+            CAPTURE_ARTIFACT_SCHEMA,
+            reference.target_ref,
+            reference.manifest_digest,
+        )
+        matching = tuple(
+            intent
+            for intent in authority.coordinator.committed_intents()
+            if intent.target == target
+        )
+        if not matching:
+            raise PermissionError(
+                "CaptureArtifact is visible but has no committed journal authority"
+            )
+        for intent in matching:
+            expected_kind = (
+                "final" if intent.kind is CommitKind.FINAL else "checkpoint"
+            )
+            expected_commit_id = (
+                f"capture-{expected_kind}-{artifact.run_id}-"
+                f"{reference.manifest_digest}"
+            )
+            if (
+                intent.run_id != artifact.run_id
+                or intent.safety_bundle_id != artifact.safety_bundle_id
+                or intent.commit_id != expected_commit_id
+            ):
+                raise ValueError(
+                    "committed capture intent differs from persisted artifact evidence"
+                )
+        selected = min(
+            matching,
+            key=lambda intent: (
+                0 if intent.kind is CommitKind.FINAL else 1,
+                intent.commit_id,
+            ),
+        )
+        evidence_digest = sha256_digest(
+            encode(
+                {
+                    "schema": _ADMITTED_CAPTURE_EVIDENCE_SCHEMA,
+                    "repository_id": authority.repository_id,
+                    "reference": capture_artifact_ref_to_tree(reference),
+                    "commit": {
+                        "kind": selected.kind.value,
+                        "commit_id": selected.commit_id,
+                        "run_id": selected.run_id,
+                        "safety_bundle_id": selected.safety_bundle_id,
+                        "created_at": selected.created_at,
+                        "target": {
+                            "repository_id": selected.target.repository_id,
+                            "artifact_kind": selected.target.artifact_kind,
+                            "schema_version": selected.target.schema_version,
+                            "target_ref": selected.target.target_ref,
+                            "expected_manifest_digest": (
+                                selected.target.expected_manifest_digest
+                            ),
+                        },
+                    },
+                }
+            )
+        )
+        return AdmittedCapture(
+            _ADMITTED_CAPTURE_TOKEN,
+            repository_token=authority.token,
+            reference=reference,
+            artifact=artifact,
+            commit_kind=selected.kind,
+            commit_id=selected.commit_id,
+            evidence_digest=evidence_digest,
+        )
 
     def final_commit(
         self,
@@ -615,6 +1182,8 @@ class CaptureRepository:
         *,
         checkpoint: bool,
     ) -> FinalCommit[CaptureArtifactRef] | CheckpointCommit[CaptureArtifactRef]:
+        authority = self._assert_authority_integrity()
+        assert authority is not None
         if not isinstance(context, PostSafetyContext):
             raise TypeError("capture commit requires PostSafetyContext")
         if not isinstance(result, (PipelineResult, TriggeredPipelineResult)):
@@ -628,7 +1197,7 @@ class CaptureRepository:
         if confirmed_subject != subject:
             raise RuntimeError("capture commit subject changed while staging")
         target = CommitTarget(
-            self.repository_id,
+            authority.repository_id,
             "capture",
             CAPTURE_ARTIFACT_SCHEMA,
             reference.target_ref,
@@ -636,11 +1205,39 @@ class CaptureRepository:
         )
 
         def publish() -> PublishedManifest[CaptureArtifactRef]:
-            stored = self._store.publish_manifest(
-                _CAPTURE_NAMESPACE,
-                manifest_payload,
-                expected_digest=reference.manifest_digest,
-            )
+            self._assert_authority_integrity()
+            try:
+                stored = authority.store_authority.publish_manifest(
+                    _CAPTURE_NAMESPACE,
+                    manifest_payload,
+                    expected_digest=reference.manifest_digest,
+                )
+            except PublishVisibilityUnknown:
+                raise
+            except BaseException as publish_error:
+                # Atomic replace can become visible before its durability ack
+                # fails.  Only an absent target is a deterministic publish
+                # failure; any visible/unreadable target is reconciled.
+                try:
+                    visible = authority.store_authority.read_manifest(
+                        _CAPTURE_NAMESPACE,
+                        reference.manifest_digest,
+                        max_bytes=authority.resource_policy.max_manifest_bytes,
+                    )
+                except FileNotFoundError:
+                    raise publish_error
+                except BaseException as visibility_error:
+                    raise PublishVisibilityUnknown(
+                        "capture manifest visibility could not be verified"
+                    ) from visibility_error
+                if visible != manifest_payload:
+                    raise PublishVisibilityUnknown(
+                        "capture manifest target is visible with unexpected bytes"
+                    ) from publish_error
+                raise PublishVisibilityUnknown(
+                    "capture manifest became visible before publication "
+                    "acknowledgement completed"
+                ) from publish_error
             if stored.content.digest != reference.manifest_digest:
                 raise RuntimeError("published capture manifest digest changed")
             return PublishedManifest(
@@ -655,8 +1252,8 @@ class CaptureRepository:
             f"capture-{operation_kind}-{subject.run_id}-"
             f"{reference.manifest_digest}"
         )
-        return operation_type(
-            self._coordinator.prepare(
+        operation = operation_type(
+            authority.coordinator.prepare(
                 kind,
                 commit_id,
                 subject,
@@ -664,12 +1261,29 @@ class CaptureRepository:
                 publish,
             )
         )
+        try:
+            context._track_prepared_commit(operation)
+        except BaseException:
+            operation.abandon()
+            raise
+        return operation
 
     def _recover(self, intent: CommitIntent) -> CommitRecovery[CaptureArtifactRef]:
+        authority = self._assert_authority_integrity()
+        if authority is None:
+            # Synchronous constructor-time recovery uses the already frozen
+            # concrete fields before the aggregate snapshot is installed.
+            store_authority = self._store_authority
+            policy = self.resource_policy
+            repository_id = self.repository_id
+        else:
+            store_authority = authority.store_authority
+            policy = authority.resource_policy
+            repository_id = authority.repository_id
         target = intent.target
         prefix = f"{_CAPTURE_NAMESPACE}/"
         if (
-            target.repository_id != self.repository_id
+            target.repository_id != repository_id
             or target.artifact_kind != "capture"
             or target.schema_version != CAPTURE_ARTIFACT_SCHEMA
             or not target.target_ref.startswith(prefix)
@@ -678,15 +1292,55 @@ class CaptureRepository:
         digest = _sha256(target.target_ref[len(prefix) :], "target manifest digest")
         if digest != target.expected_manifest_digest:
             raise ValueError("capture commit target ref and digest differ")
-        if not self._store.has_manifest(_CAPTURE_NAMESPACE, digest):
+        operation_kind = (
+            "final" if intent.kind is CommitKind.FINAL else "checkpoint"
+        )
+        expected_commit_id = (
+            f"capture-{operation_kind}-{intent.run_id}-{digest}"
+        )
+        if intent.commit_id != expected_commit_id:
+            raise ValueError("capture commit id differs from kind/run/target")
+        try:
+            manifest_payload = store_authority.read_manifest(
+                _CAPTURE_NAMESPACE,
+                digest,
+                max_bytes=policy.max_manifest_bytes,
+            )
+        except FileNotFoundError:
             return CommitRecovery(False)
-        reference = CaptureArtifactRef(self.repository_id, digest)
-        artifact = self.load(reference)
+        except ContentSizeLimitError as exc:
+            raise CaptureResourceExceeded(
+                "capture manifest exceeds repository resource policy"
+            ) from exc
+        reference = CaptureArtifactRef(repository_id, digest)
+        # The manifest was observed first.  Any missing/corrupt referenced blob
+        # is now a visible corrupt artifact and must fail startup closed rather
+        # than be misreported as an absent/uncommitted manifest.
+        artifact = self._load_manifest(
+            reference,
+            manifest_payload,
+            store_authority=store_authority,
+            policy=policy,
+            repository_id=repository_id,
+        )
         if artifact.run_id != intent.run_id:
             raise ValueError("capture manifest run_id differs from commit intent")
         if artifact.safety_bundle_id != intent.safety_bundle_id:
             raise ValueError(
                 "capture manifest safety bundle differs from commit intent"
+            )
+        # A readable target may be the visible residue of a replace whose
+        # parent-directory flush acknowledgement failed.  This storage-owned
+        # barrier verifies/fsyncs only an existing immutable target and never
+        # creates one.  Recovery cannot resolve COMMITTED until it succeeds.
+        confirmed_payload = store_authority.confirm_manifest_durable(
+            _CAPTURE_NAMESPACE,
+            digest,
+            max_bytes=policy.max_manifest_bytes,
+        )
+        if confirmed_payload != manifest_payload:
+            raise RuntimeError(
+                "capture recovery durability confirmation changed payload"
             )
         return CommitRecovery(
             True,
@@ -698,6 +1352,7 @@ class CaptureRepository:
         result: PipelineResult | TriggeredPipelineResult,
         context: PostSafetyContext,
     ) -> tuple[CaptureArtifactRef, bytes]:
+        self._assert_authority_integrity()
         lineage = None
         if isinstance(result, TriggeredPipelineResult):
             lineage = PulseCaptureLineage(
@@ -749,7 +1404,33 @@ class CaptureRepository:
         self,
         artifact: CaptureArtifact,
     ) -> tuple[CaptureArtifactRef, bytes]:
-        block_ref = self._store.put_blob(encode_data_block(artifact.block))
+        authority = self._assert_authority_integrity()
+        assert authority is not None
+        policy = authority.resource_policy
+        cell_count = len(artifact.source_cell_schedule)
+        if cell_count > policy.max_cells:
+            raise CaptureResourceExceeded(
+                "capture cell count exceeds repository resource policy"
+            )
+        if len(artifact.event_metadata) > policy.max_cells:
+            raise CaptureResourceExceeded(
+                "capture metadata count exceeds repository resource policy"
+            )
+        validity_mask = getattr(artifact.block.validity, "mask", None)
+        validity_nbytes = 0 if validity_mask is None else validity_mask.nbytes
+        if (
+            artifact.block.values.nbytes + validity_nbytes
+            > policy.max_data_array_bytes
+        ):
+            raise CaptureResourceExceeded(
+                "capture DataBlock arrays exceed repository resource policy"
+            )
+        block_payload = encode_data_block(artifact.block)
+        if len(block_payload) > policy.max_data_block_blob_bytes:
+            raise CaptureResourceExceeded(
+                "capture DataBlock blob exceeds repository resource policy"
+            )
+        block_ref = authority.store_authority.put_blob(block_payload)
         metadata_payload = encode(
             {
                 "schema": _CAPTURE_METADATA_SCHEMA,
@@ -759,22 +1440,46 @@ class CaptureRepository:
                 ],
             }
         )
-        metadata_ref = self._store.put_blob(metadata_payload)
-        pulse_ref = (
+        if len(metadata_payload) > policy.max_metadata_blob_bytes:
+            raise CaptureResourceExceeded(
+                "capture metadata blob exceeds repository resource policy"
+            )
+        metadata_ref = authority.store_authority.put_blob(metadata_payload)
+        pulse_payload = (
             None
             if artifact.pulse_lineage is None
-            else self._store.put_blob(
-                encode_compiled_pulse_artifact(
-                    artifact.pulse_lineage.compiled_artifact
-                )
+            else encode_compiled_pulse_artifact(
+                artifact.pulse_lineage.compiled_artifact
             )
         )
-        plan_ref = (
+        if (
+            pulse_payload is not None
+            and len(pulse_payload) > policy.max_compiled_pulse_blob_bytes
+        ):
+            raise CaptureResourceExceeded(
+                "capture compiled-pulse blob exceeds repository resource policy"
+            )
+        pulse_ref = (
+            None
+            if pulse_payload is None
+            else authority.store_authority.put_blob(pulse_payload)
+        )
+        plan_payload = (
             None
             if artifact.pulse_lineage is None
-            else self._store.put_blob(
-                encode_compiled_capture_cell_plan(artifact.pulse_lineage.cell_plan)
+            else encode_compiled_capture_cell_plan(artifact.pulse_lineage.cell_plan)
+        )
+        if (
+            plan_payload is not None
+            and len(plan_payload) > policy.max_cell_plan_blob_bytes
+        ):
+            raise CaptureResourceExceeded(
+                "capture cell-plan blob exceeds repository resource policy"
             )
+        plan_ref = (
+            None
+            if plan_payload is None
+            else authority.store_authority.put_blob(plan_payload)
         )
         manifest_payload = _manifest_payload(
             artifact,
@@ -783,8 +1488,12 @@ class CaptureRepository:
             pulse_ref,
             plan_ref,
         )
+        if len(manifest_payload) > policy.max_manifest_bytes:
+            raise CaptureResourceExceeded(
+                "capture manifest exceeds repository resource policy"
+            )
         reference = CaptureArtifactRef(
-            self.repository_id,
+            authority.repository_id,
             sha256_digest(manifest_payload),
         )
         return reference, manifest_payload
@@ -792,7 +1501,9 @@ class CaptureRepository:
     def _validate_ref(self, reference: CaptureArtifactRef) -> None:
         if not isinstance(reference, CaptureArtifactRef):
             raise TypeError("load requires CaptureArtifactRef")
-        if reference.repository_id != self.repository_id:
+        authority = self._assert_authority_integrity()
+        repository_id = self.repository_id if authority is None else authority.repository_id
+        if reference.repository_id != repository_id:
             raise ValueError("CaptureArtifactRef belongs to another repository")
 
 
@@ -802,7 +1513,7 @@ def compile_capture_artifact_pipeline(
 ) -> RunPlan:
     """Add one post-safety CaptureArtifact commit to the exact pipeline."""
 
-    if not isinstance(repository, CaptureRepository):
+    if type(repository) is not CaptureRepository:
         raise TypeError("repository must be CaptureRepository")
     capture_spec = spec.capture if isinstance(spec, TriggeredCaptureSpec) else spec
     if not isinstance(capture_spec, MinimalPipelineSpec):
@@ -1169,10 +1880,14 @@ def _exact_map(tree: object, fields: set[str], schema: str) -> dict:
 
 
 __all__ = [
+    "AdmittedCapture",
     "CAPTURE_ARTIFACT_SCHEMA",
     "CaptureArtifact",
     "CaptureArtifactRef",
+    "CaptureRepositoryResourcePolicy",
     "CaptureRepository",
+    "CaptureResourceExceeded",
+    "DEFAULT_CAPTURE_REPOSITORY_RESOURCE_POLICY",
     "PulseCaptureLineage",
     "compile_capture_artifact_pipeline",
 ]

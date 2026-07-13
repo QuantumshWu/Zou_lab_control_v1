@@ -18,8 +18,19 @@ from .canonical import (
     sha256_digest,
 )
 from .framed_journal import FramedJournal, JournalCorruptionError
+from .durability import (
+    DirectoryDurabilityError,
+    durable_mkdir,
+    flush_directory,
+)
+from .repository_lease import (
+    RepositoryRootBusy,
+    RepositoryRootLease,
+    RepositoryRootLeaseBorrow,
+)
 from .content_store import (
     ContentAddressedStore,
+    ContentStoreAuthority,
     ContentCorruptionError,
     ContentSizeLimitError,
     ContentRef,
@@ -35,15 +46,22 @@ __all__ = [
     "CanonicalStructureAdmission",
     "CanonicalStructureEvent",
     "DEFAULT_CANONICAL_DECODE_LIMITS",
+    "DirectoryDurabilityError",
     "ContentAddressedStore",
+    "ContentStoreAuthority",
     "ContentCorruptionError",
     "ContentSizeLimitError",
     "ContentRef",
     "canonical_digest",
     "FramedJournal",
     "JournalCorruptionError",
+    "RepositoryRootBusy",
+    "RepositoryRootLease",
+    "RepositoryRootLeaseBorrow",
     "StoredManifest",
     "decode",
+    "durable_mkdir",
     "encode",
+    "flush_directory",
     "sha256_digest",
 ]

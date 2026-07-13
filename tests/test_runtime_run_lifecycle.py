@@ -42,7 +42,6 @@ from zlc_neutral_atom.runtime import (
     ResourceKey,
     ResourceLease,
     ResourceQuarantined,
-    RepositoryCommitCoordinator,
     RunCancelled,
     RunContext,
     RunController,
@@ -58,6 +57,7 @@ from zlc_neutral_atom.runtime import (
     SafetyInterrupt,
     SafetyOperation,
 )
+from zlc_neutral_atom.runtime.commit import RepositoryCommitCoordinator
 
 
 _COMMIT_IDS = count()

@@ -25,6 +25,8 @@ from zlc_neutral_atom.runtime import (
     RunId,
     compile_pipeline,
 )
+from zlc_neutral_atom.runtime.commit import PersistentCommitJournal
+from zlc_storage import ContentStoreAuthority
 
 
 @pytest.fixture
@@ -115,18 +117,25 @@ def test_capture_checkpoint_recovers_visible_manifest_after_lost_ack(
 ):
     camera, runtime, spec = capture_runtime
     repository = CaptureRepository(tmp_path / "captures")
-    real_publish = repository._store.publish_manifest
+    repository_store_authority = repository._store.authority()
+    real_publish = ContentStoreAuthority.publish_manifest
     publish_calls = 0
 
-    def publish_then_lose_ack(*args, **kwargs):
+    def publish_then_lose_ack(authority, *args, **kwargs):
         nonlocal publish_calls
-        stored = real_publish(*args, **kwargs)
+        stored = real_publish(authority, *args, **kwargs)
+        if authority is not repository_store_authority:
+            return stored
         publish_calls += 1
         if publish_calls == 1:
             raise PublishVisibilityUnknown("capture manifest acknowledgement lost")
         return stored
 
-    monkeypatch.setattr(repository._store, "publish_manifest", publish_then_lose_ack)
+    monkeypatch.setattr(
+        ContentStoreAuthority,
+        "publish_manifest",
+        publish_then_lose_ack,
+    )
     base = compile_pipeline(spec)
 
     def finalize(context, result):
@@ -292,7 +301,10 @@ def test_capture_checkpoint_authority_cannot_be_transplanted_between_runs(
     )
     first_handle, _first_result = _run_plan(camera, runtime, first_plan)
     assert first_handle.run_id.value == captured["run_id"]
-    assert len(repository._coordinator._authorities) == 1
+    # Leaving finalize without consuming the prepared operation abandons its
+    # coordinator snapshot immediately.  The caller-held wrapper remains an
+    # inert, run-bound value and cannot retain the repository-root lease.
+    assert repository._coordinator._authorities == {}
 
     def finalize_second(context, _result):
         # A public wrapper can be recreated, but it cannot rewrite the complete
@@ -370,16 +382,22 @@ def test_capture_staging_crossing_deadline_cannot_mint_commit_authority(
 ):
     camera, runtime, spec = capture_runtime
     repository = CaptureRepository(tmp_path / "captures")
-    real_stage = repository._stage_pipeline_result
+    real_stage = CaptureRepository._stage_pipeline_result
 
-    def stage_then_expire(result, context):
-        staged = real_stage(result, context)
+    def stage_then_expire(owner, result, context):
+        staged = real_stage(owner, result, context)
+        if owner is not repository:
+            return staged
         assert context.deadline is not None
         while time.monotonic() <= context.deadline:
             time.sleep(0.001)
         return staged
 
-    monkeypatch.setattr(repository, "_stage_pipeline_result", stage_then_expire)
+    monkeypatch.setattr(
+        CaptureRepository,
+        "_stage_pipeline_result",
+        stage_then_expire,
+    )
     base = compile_pipeline(spec)
 
     def finalize(context, result):
@@ -419,16 +437,18 @@ def test_capture_journal_begin_crossing_deadline_aborts_before_manifest_publish(
 ):
     camera, runtime, spec = capture_runtime
     repository = CaptureRepository(tmp_path / "captures")
-    real_begin = repository._journal.begin
+    real_begin = PersistentCommitJournal._begin
     deadline_box = {}
 
-    def begin_then_expire(intent):
-        real_begin(intent)
+    def begin_then_expire(journal, token, intent):
+        real_begin(journal, token, intent)
+        if journal is not repository._journal:
+            return
         deadline = deadline_box["deadline"]
         while time.monotonic() <= deadline:
             time.sleep(0.001)
 
-    monkeypatch.setattr(repository._journal, "begin", begin_then_expire)
+    monkeypatch.setattr(PersistentCommitJournal, "_begin", begin_then_expire)
     base = compile_pipeline(spec)
 
     def finalize(context, result):

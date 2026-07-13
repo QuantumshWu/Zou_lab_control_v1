@@ -153,12 +153,6 @@ def test_exact_pipeline_commits_and_reloads_capture_artifact(tmp_path):
         assert not hasattr(artifact, "camera")
         assert not hasattr(reference, "repository")
 
-        reopened = CaptureRepository(tmp_path / "captures")
-        assert reopened.startup_reconciliations == ()
-        reloaded = reopened.load(reference)
-        assert np.array_equal(reloaded.block.values, artifact.block.values)
-        assert reloaded.event_metadata == artifact.event_metadata
-
         # Current-only codec: a content-addressed manifest with even one legacy
         # or unknown field is not treated as a compatible CaptureArtifact.
         manifest = decode(
@@ -409,6 +403,14 @@ def test_exact_pipeline_commits_and_reloads_capture_artifact(tmp_path):
             repository.load(
                 CaptureArtifactRef(repository.repository_id, invalid.content.digest)
             )
+
+        repository.close()
+        reopened = CaptureRepository(tmp_path / "captures")
+        assert reopened.startup_reconciliations == ()
+        reloaded = reopened.load(reference)
+        assert np.array_equal(reloaded.block.values, artifact.block.values)
+        assert reloaded.event_metadata == artifact.event_metadata
+        reopened.close()
     finally:
         if thread.is_alive():
             camera.finish_record_capture()

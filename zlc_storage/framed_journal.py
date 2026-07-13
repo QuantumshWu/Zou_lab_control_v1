@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .canonical import decode, encode
+from . import durability
 
 
 _MAGIC = b"ZLCJNL1\n"
@@ -22,49 +23,6 @@ class JournalCorruptionError(RuntimeError):
     pass
 
 
-def _fsync_directory(path: Path) -> None:
-    """Persist directory entries where the host exposes directory fsync."""
-
-    if os.name == "nt":
-        import ctypes
-        from ctypes import wintypes
-
-        create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
-        create_file.argtypes = (
-            wintypes.LPCWSTR,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.HANDLE,
-        )
-        create_file.restype = wintypes.HANDLE
-        handle = create_file(
-            str(path),
-            0x40000000,  # GENERIC_WRITE is required for FlushFileBuffers on directories.
-            0x00000001 | 0x00000002 | 0x00000004,
-            None,
-            3,  # OPEN_EXISTING
-            0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS
-            None,
-        )
-        invalid = wintypes.HANDLE(-1).value
-        if handle == invalid:
-            raise ctypes.WinError(ctypes.get_last_error())
-        try:
-            if not ctypes.WinDLL("kernel32", use_last_error=True).FlushFileBuffers(handle):
-                raise ctypes.WinError(ctypes.get_last_error())
-        finally:
-            ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
-        return
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def _record_id(value: str) -> str:
     if not isinstance(value, str) or not value or value.strip() != value:
         raise ValueError("journal record_id must be canonical non-empty text")
@@ -73,7 +31,7 @@ def _record_id(value: str) -> str:
 
 @contextmanager
 def _interprocess_lock(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    durability.durable_mkdir(path.parent)
     existed = path.exists()
     lock_file = path.open("a+b")
     try:
@@ -83,7 +41,7 @@ def _interprocess_lock(path: Path) -> Iterator[None]:
             lock_file.flush()
             os.fsync(lock_file.fileno())
             if not existed:
-                _fsync_directory(path.parent)
+                durability.flush_directory(path.parent)
         lock_file.seek(0)
         if os.name == "nt":
             import msvcrt
@@ -123,7 +81,8 @@ class FramedJournal:
         self.lock_path = self.path.with_name(self.path.name + ".lock")
         self.max_record_bytes = max_record_bytes
         self._thread_lock = threading.Lock()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        durability.durable_mkdir(self.path.parent)
+        durability.flush_directory(self.path.parent)
         existed = self.path.exists()
         with self._thread_lock, _interprocess_lock(self.lock_path):
             with self.path.open("a+b") as stream:
@@ -132,7 +91,7 @@ class FramedJournal:
                     stream.flush()
                     os.fsync(stream.fileno())
             if not existed:
-                _fsync_directory(self.path.parent)
+                durability.flush_directory(self.path.parent)
 
     def append(self, record_id: str, value: Any) -> bool:
         return self.append_checked(record_id, value, lambda _records: None)

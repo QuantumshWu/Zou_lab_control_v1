@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -10,12 +11,15 @@ from zlc_storage import (
     ContentAddressedStore,
     ContentCorruptionError,
     ContentSizeLimitError,
+    ContentStoreAuthority,
+    DirectoryDurabilityError,
     sha256_digest,
 )
 
 
 def test_content_store_publishes_blobs_and_manifests_idempotently(tmp_path):
     store = ContentAddressedStore(tmp_path / "repository")
+    assert not (store.root / "tmp").exists()
     blob = store.put_blob(b"frame-bytes")
     assert store.put_blob(b"frame-bytes") == blob
     assert store.read_blob(blob) == b"frame-bytes"
@@ -29,6 +33,72 @@ def test_content_store_publishes_blobs_and_manifests_idempotently(tmp_path):
     assert store.read_manifest("capture", digest) == payload
 
 
+@pytest.mark.parametrize("content_kind", ["blob", "manifest"])
+def test_visible_target_is_not_acknowledged_until_retry_reconfirms_durability(
+    tmp_path,
+    monkeypatch,
+    content_kind,
+):
+    import zlc_storage.content_store as content_store
+
+    store = ContentAddressedStore(tmp_path / "repository")
+    payload = f"lost-{content_kind}-directory-flush".encode()
+    digest = sha256_digest(payload)
+    target = (
+        store._blob_path(digest)
+        if content_kind == "blob"
+        else store._manifest_path("capture", digest)
+    )
+    content_store.durability.durable_mkdir(target.parent)
+    real_flush = content_store.durability.flush_directory
+    failed = False
+
+    def fail_first_target_flush(directory):
+        nonlocal failed
+        if directory == target.parent and not failed:
+            failed = True
+            raise DirectoryDurabilityError("lost target-directory acknowledgement")
+        return real_flush(directory)
+
+    monkeypatch.setattr(
+        content_store.durability,
+        "flush_directory",
+        fail_first_target_flush,
+    )
+    publish = (
+        (lambda: store.put_blob(payload))
+        if content_kind == "blob"
+        else (lambda: store.publish_manifest("capture", payload))
+    )
+
+    with pytest.raises(DirectoryDurabilityError, match="acknowledgement"):
+        publish()
+    assert target.is_file()
+
+    # The exact-target retry must not equate visibility with durability: it
+    # verifies/fsyncs the existing file and repeats the parent flush.
+    published = publish()
+    if content_kind == "blob":
+        assert published.digest == digest
+    else:
+        assert published.content.digest == digest
+    assert failed
+
+
+def test_content_store_construction_fails_if_directory_flush_is_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    import zlc_storage.content_store as content_store
+
+    def fail_flush(_directory):
+        raise DirectoryDurabilityError("directory backend unavailable")
+
+    monkeypatch.setattr(content_store.durability, "flush_directory", fail_flush)
+    with pytest.raises(DirectoryDurabilityError, match="unavailable"):
+        ContentAddressedStore(tmp_path / "repository")
+
+
 def test_manifest_is_the_only_visibility_point(tmp_path):
     store = ContentAddressedStore(tmp_path / "repository")
     store.put_blob(b"orphaned-before-commit")
@@ -36,6 +106,9 @@ def test_manifest_is_the_only_visibility_point(tmp_path):
     assert not store.has_manifest("capture", missing)
     with pytest.raises(FileNotFoundError):
         store.read_manifest("capture", missing)
+    with pytest.raises(FileNotFoundError):
+        store.confirm_manifest_durable("capture", missing)
+    assert not store._manifest_path("capture", missing).exists()
 
 
 def test_manifest_size_admission_happens_before_file_bytes_are_read(tmp_path):
@@ -94,3 +167,40 @@ def test_manifest_namespace_cannot_escape_repository(tmp_path, namespace):
     store = ContentAddressedStore(tmp_path / "repository")
     with pytest.raises(ValueError):
         store.publish_manifest(namespace, b"payload")
+
+
+def test_content_store_authority_is_final_process_local_and_integrity_checked(
+    tmp_path,
+):
+    store = ContentAddressedStore(tmp_path / "repository")
+    authority = store.authority()
+    assert isinstance(authority, ContentStoreAuthority)
+    assert authority is store.authority()
+    reference = authority.put_blob(b"authority-bound")
+    assert authority.read_blob(reference) == b"authority-bound"
+
+    with pytest.raises(TypeError, match="final"):
+        class _StoreSubclass(ContentAddressedStore):
+            pass
+
+    with pytest.raises(TypeError, match="final"):
+        class _AuthoritySubclass(ContentStoreAuthority):
+            pass
+
+    with pytest.raises(AttributeError, match="immutable"):
+        store.root = tmp_path / "redirected"
+    with pytest.raises(AttributeError, match="immutable"):
+        store.read_blob = lambda _reference: b"forged"
+    with pytest.raises(AttributeError, match="immutable"):
+        authority._root = tmp_path / "redirected"
+    with pytest.raises(TypeError, match="process-local"):
+        pickle.dumps(authority)
+
+    original_root = store.root
+    object.__setattr__(store, "root", (tmp_path / "redirected").resolve())
+    try:
+        with pytest.raises(RuntimeError, match="authority changed"):
+            authority.read_blob(reference)
+    finally:
+        object.__setattr__(store, "root", original_root)
+    assert authority.read_blob(reference) == b"authority-bound"

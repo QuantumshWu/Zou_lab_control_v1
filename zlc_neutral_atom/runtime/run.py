@@ -689,6 +689,7 @@ class PostSafetyContext:
         "_deadline",
         "_safety_bundle_id",
         "_handle",
+        "_prepared_commits",
     )
 
     def __init__(
@@ -716,6 +717,7 @@ class PostSafetyContext:
         object.__setattr__(self, "_deadline", deadline)
         object.__setattr__(self, "_safety_bundle_id", safety_bundle_id)
         object.__setattr__(self, "_handle", handle)
+        object.__setattr__(self, "_prepared_commits", [])
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("PostSafetyContext is immutable")
@@ -748,6 +750,40 @@ class PostSafetyContext:
             raise TypeError("commit preparation kind must be CommitKind")
         self._handle._validate_commit_preparation(kind, self.deadline)
         return CommitSubject(self.run_id.value, self.safety_bundle_id)
+
+    def _track_prepared_commit(
+        self,
+        operation: CheckpointCommit[object] | FinalCommit[object],
+    ) -> None:
+        """Own a prepared capability until Run consumes it or finalize exits."""
+
+        if not isinstance(operation, (CheckpointCommit, FinalCommit)):
+            raise TypeError("prepared commit tracking requires a commit operation")
+        if operation.run_id != self.run_id.value:
+            raise ValueError("prepared commit belongs to another Run")
+        if operation.safety_bundle_id != self.safety_bundle_id:
+            raise ValueError("prepared commit safety bundle differs from this Run")
+        if any(existing is operation for existing in self._prepared_commits):
+            raise ValueError("prepared commit operation is already tracked")
+        self._prepared_commits.append(operation)
+
+    def _abandon_unconsumed_commits(self) -> None:
+        operations = tuple(self._prepared_commits)
+        self._prepared_commits.clear()
+        errors = []
+        for operation in operations:
+            try:
+                operation.abandon()
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            primary = errors[0]
+            for additional in errors[1:]:
+                if hasattr(primary, "add_note"):
+                    primary.add_note(
+                        f"additional prepared commit abandonment failed: {additional!r}"
+                    )
+            raise primary
 
     def _validate_commit_entry(
         self,
@@ -1297,9 +1333,20 @@ class RunHandle(Generic[ResultT]):
         resolution_mode: _CommitResolutionMode,
         committed_result: object = _NO_COMMITTED_RESULT,
     ) -> CheckpointReconciliationRequired | FinalCommitReconciliationRequired:
-        if kind is CommitKind.CHECKPOINT:
-            assert isinstance(operation, CheckpointCommit)
-            return self._pause_checkpoint_reconciliation(
+        try:
+            if kind is CommitKind.CHECKPOINT:
+                assert isinstance(operation, CheckpointCommit)
+                return self._pause_checkpoint_reconciliation(
+                    operation,
+                    authority,
+                    intent,
+                    publish_error,
+                    recovery_error,
+                    resolution_mode,
+                    committed_result,
+                )
+            assert isinstance(operation, FinalCommit)
+            return self._pause_final_commit_reconciliation(
                 operation,
                 authority,
                 intent,
@@ -1308,16 +1355,11 @@ class RunHandle(Generic[ResultT]):
                 resolution_mode,
                 committed_result,
             )
-        assert isinstance(operation, FinalCommit)
-        return self._pause_final_commit_reconciliation(
-            operation,
-            authority,
-            intent,
-            publish_error,
-            recovery_error,
-            resolution_mode,
-            committed_result,
-        )
+        except BaseException:
+            # A failed hand-off produced no retry owner.  Release the consumed
+            # repository borrow instead of leaving a root locked forever.
+            authority.release_lifetime()
+            raise
 
     def _clear_commit_inflight_after_error(self) -> None:
         with self._condition:
@@ -1336,8 +1378,10 @@ class RunHandle(Generic[ResultT]):
     ) -> _DurableCommitOutcome[CommitT]:
         """Run one intent/publish/recover/marker transaction after atomic admission."""
 
+        authority.require_lifetime()
         preparation = authority.preparation
         if preparation.kind is not kind:
+            authority.release_lifetime()
             raise RuntimeError("consumed commit authority kind changed after admission")
         intent = CommitIntent(
             kind=preparation.kind,
@@ -1364,6 +1408,7 @@ class RunHandle(Generic[ResultT]):
                     _CommitResolutionMode.FORCE_ABORT,
                 )
                 raise pending from reconciliation_error
+            authority.release_lifetime()
             raise
 
         try:
@@ -1394,6 +1439,7 @@ class RunHandle(Generic[ResultT]):
                     _CommitResolutionMode.FORCE_ABORT,
                 )
                 raise pending from reconciliation_error
+            authority.release_lifetime()
             raise
 
         publish_error: BaseException | None = None
@@ -1429,6 +1475,7 @@ class RunHandle(Generic[ResultT]):
                         _CommitResolutionMode.FORCE_ABORT,
                     )
                     raise pending from marker_error
+                authority.release_lifetime()
                 if kind is CommitKind.CHECKPOINT:
                     self._token.checkpoint()
                 raise visibility_error
@@ -1449,6 +1496,7 @@ class RunHandle(Generic[ResultT]):
                     _CommitResolutionMode.FORCE_ABORT,
                 )
                 raise pending from marker_error
+            authority.release_lifetime()
             raise
 
         try:
@@ -1465,6 +1513,7 @@ class RunHandle(Generic[ResultT]):
                 committed,
             )
             raise pending from marker_error
+        authority.release_lifetime()
         return _DurableCommitOutcome(committed, recovered_error)
 
     def _reconcile_durable_commit(
@@ -1476,6 +1525,7 @@ class RunHandle(Generic[ResultT]):
 
         operation = pending.operation
         authority = pending._authority_snapshot
+        authority.require_lifetime()
         mode = pending._resolution_mode
         committed_result = pending._committed_result
         if mode is _CommitResolutionMode.RECOVER_VISIBILITY:
@@ -1521,6 +1571,7 @@ class RunHandle(Generic[ResultT]):
                 committed_result,
             )
             raise refreshed from marker_error
+        authority.release_lifetime()
         return _DurableReconciliationOutcome(
             committed=mode is _CommitResolutionMode.FORCE_COMMIT,
             result=committed_result,
@@ -2044,6 +2095,17 @@ class RunController:
                     result = plan.finalize(post_safety, result)  # type: ignore[arg-type, assignment]
                 except BaseException as exc:
                     finalize_error = exc
+                finally:
+                    try:
+                        post_safety._abandon_unconsumed_commits()
+                    except BaseException as abandonment_error:
+                        if finalize_error is None:
+                            finalize_error = abandonment_error
+                        elif hasattr(finalize_error, "add_note"):
+                            finalize_error.add_note(
+                                "prepared commit abandonment also failed: "
+                                f"{abandonment_error!r}"
+                            )
 
                 checkpoint_pending, final_pending = handle._pending_reconciliation_snapshot()
                 if checkpoint_pending is not None and final_pending is not None:

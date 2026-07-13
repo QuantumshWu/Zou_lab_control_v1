@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable, Generic, Protocol, TypeVar
 
 from zlc_storage.framed_journal import FramedJournal
+from zlc_storage import RepositoryRootLease, RepositoryRootLeaseBorrow
 
 
 CommitT = TypeVar("CommitT")
@@ -111,13 +112,9 @@ class CommitJournal(Protocol):
     repository_id: str
     durable: bool
 
-    def begin(self, intent: CommitIntent) -> None: ...
-
-    def mark_committed(self, commit_id: str) -> None: ...
-
-    def mark_aborted(self, commit_id: str) -> None: ...
-
     def pending(self) -> tuple[CommitIntent, ...]: ...
+
+    def committed(self) -> tuple[CommitIntent, ...]: ...
 
 
 @dataclass(frozen=True)
@@ -161,6 +158,50 @@ def _validate_commit_recovery(
 
 
 _COMMIT_AUTHORITY_TOKEN = object()
+_COMMIT_AUTHORITY_ABANDON_TOKEN = object()
+_JOURNAL_MUTATION_TOKEN = object()
+
+
+class _JournalMutationAuthority:
+    """Opaque writer retained only inside coordinator/commit snapshots."""
+
+    __slots__ = ("_journal",)
+
+    def __init__(self, token: object, journal: CommitJournal) -> None:
+        if token is not _JOURNAL_MUTATION_TOKEN:
+            raise PermissionError(
+                "journal mutation authority can only be minted by commit runtime"
+            )
+        for name in ("_begin", "_mark_committed", "_mark_aborted"):
+            if not callable(getattr(journal, name, None)):
+                raise TypeError("commit journal lacks internal mutation protocol")
+        object.__setattr__(self, "_journal", journal)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("journal mutation authority is immutable")
+
+    @property
+    def repository_id(self) -> str:
+        return self._journal.repository_id
+
+    def begin(self, intent: CommitIntent) -> None:
+        self._journal._begin(_JOURNAL_MUTATION_TOKEN, intent)
+
+    def mark_committed(self, commit_id: str) -> None:
+        self._journal._mark_committed(_JOURNAL_MUTATION_TOKEN, commit_id)
+
+    def mark_aborted(self, commit_id: str) -> None:
+        self._journal._mark_aborted(_JOURNAL_MUTATION_TOKEN, commit_id)
+
+    def pending(self) -> tuple[CommitIntent, ...]:
+        return self._journal.pending()
+
+    def committed(self) -> tuple[CommitIntent, ...]:
+        return self._journal.committed()
+
+
+def _journal_mutation_authority(journal: CommitJournal) -> _JournalMutationAuthority:
+    return _JournalMutationAuthority(_JOURNAL_MUTATION_TOKEN, journal)
 
 
 @dataclass(frozen=True)
@@ -228,13 +269,28 @@ class CommitAuthority(Generic[CommitT]):
     def safety_bundle_id(self) -> str | None:
         return self._preparation.subject.safety_bundle_id
 
+    def abandon(self) -> None:
+        """Explicitly abandon this authority if RunController has not consumed it."""
+
+        self._coordinator._abandon_authority(  # noqa: SLF001
+            _COMMIT_AUTHORITY_ABANDON_TOKEN,
+            self,
+        )
+
+    def __del__(self) -> None:
+        try:
+            self.abandon()
+        except BaseException:
+            pass
+
 
 @dataclass(frozen=True)
 class _CommitAuthoritySnapshot(Generic[CommitT]):
     preparation: _CommitPreparation
-    journal: CommitJournal
+    journal: _JournalMutationAuthority
     publish_callback: Callable[[], PublishedManifest[CommitT]]
     recover_callback: Callable[[CommitIntent], CommitRecovery[CommitT]]
+    lease_borrow: RepositoryRootLeaseBorrow | None
 
     @property
     def target(self) -> CommitTarget:
@@ -254,12 +310,22 @@ class _CommitAuthoritySnapshot(Generic[CommitT]):
             raise ValueError("CommitIntent differs from authority preparation")
 
     def publish_validated(self, intent: CommitIntent) -> CommitT:
+        self.require_lifetime()
         self._validate_intent(intent)
         return _validate_published_manifest(self.publish_callback(), self.target)
 
     def recover_validated(self, intent: CommitIntent) -> CommitRecovery[CommitT]:
+        self.require_lifetime()
         self._validate_intent(intent)
         return _validate_commit_recovery(self.recover_callback(intent), self.target)
+
+    def require_lifetime(self) -> None:
+        if self.lease_borrow is not None:
+            self.lease_borrow.require_active()
+
+    def release_lifetime(self) -> None:
+        if self.lease_borrow is not None:
+            self.lease_borrow.close()
 
 
 _COMMIT_AUTHORITY_CONSUMER_TOKEN = object()
@@ -277,9 +343,11 @@ def _consume_commit_authority(
 
 
 def _discard_commit_authority(authority: CommitAuthority[object]) -> None:
-    """Consume an operation rejected before an intent so its capability cannot leak."""
+    """Abandon an operation rejected before an intent so its capability cannot leak."""
 
-    _consume_commit_authority(authority)
+    if not isinstance(authority, CommitAuthority):
+        raise TypeError("commit authority is invalid")
+    authority.abandon()
 
 
 @dataclass(frozen=True)
@@ -307,6 +375,9 @@ class FinalCommit(Generic[CommitT]):
     @property
     def target(self) -> CommitTarget:
         return self.authority.target
+
+    def abandon(self) -> None:
+        self.authority.abandon()
 
 
 @dataclass(frozen=True)
@@ -337,9 +408,12 @@ class CheckpointCommit(Generic[CommitT]):
     def target(self) -> CommitTarget:
         return self.authority.target
 
+    def abandon(self) -> None:
+        self.authority.abandon()
+
 
 def reconcile_pending_commits(
-    journal: CommitJournal,
+    journal: _JournalMutationAuthority,
     repository_id: str,
     recover: Callable[[CommitIntent], CommitRecovery[CommitT]],
 ) -> tuple[ReconciledCommit[CommitT], ...]:
@@ -366,13 +440,32 @@ def reconcile_pending_commits(
 class RepositoryCommitCoordinator(Generic[CommitT]):
     """Startup gate and sole factory for one repository's commit authority."""
 
+    __slots__ = (
+        "repository_id",
+        "_journal",
+        "_journal_writer",
+        "_root_lease",
+        "_recover",
+        "_authority_lock",
+        "_authorities",
+        "_startup_reconciliations",
+        "_sealed",
+    )
+
+    def __init_subclass__(cls, **_kwargs) -> None:
+        raise TypeError(
+            "RepositoryCommitCoordinator is final and cannot be subclassed"
+        )
+
     def __init__(
         self,
         journal: CommitJournal,
         recover: Callable[[CommitIntent], CommitRecovery[CommitT]],
         *,
         allow_ephemeral: bool = False,
+        root_lease: RepositoryRootLease | None = None,
     ) -> None:
+        object.__setattr__(self, "_sealed", False)
         repository_id = getattr(journal, "repository_id", None)
         if not isinstance(repository_id, str):
             raise TypeError("commit journal must expose repository_id")
@@ -385,20 +478,59 @@ class RepositoryCommitCoordinator(Generic[CommitT]):
             raise TypeError("commit journal must declare durability")
         if not durable and not allow_ephemeral:
             raise ValueError("ephemeral commit journals are forbidden for production authority")
-        self.repository_id = repository_id
-        self._journal = journal
-        self._recover = recover
-        self._authority_lock = threading.Lock()
-        self._authorities: dict[object, _CommitAuthoritySnapshot[CommitT]] = {}
-        self._startup_reconciliations = reconcile_pending_commits(
-            journal,
-            repository_id,
-            recover,
+        if durable:
+            if type(root_lease) is not RepositoryRootLease:
+                raise ValueError(
+                    "durable commit coordinator requires RepositoryRootLease"
+                )
+            root_lease.require_active()
+            repository_root = getattr(journal, "repository_root", None)
+            if not isinstance(repository_root, Path):
+                raise TypeError(
+                    "durable commit journal must expose its resolved repository_root"
+                )
+            if repository_root != root_lease.root:
+                raise ValueError(
+                    "commit journal and repository root lease bind different roots"
+                )
+        elif root_lease is not None:
+            raise ValueError("ephemeral commit coordinator cannot own a root lease")
+        object.__setattr__(self, "repository_id", repository_id)
+        object.__setattr__(self, "_journal", journal)
+        journal_writer = _journal_mutation_authority(journal)
+        object.__setattr__(self, "_journal_writer", journal_writer)
+        object.__setattr__(self, "_root_lease", root_lease)
+        object.__setattr__(self, "_recover", recover)
+        object.__setattr__(self, "_authority_lock", threading.Lock())
+        object.__setattr__(self, "_authorities", {})
+        object.__setattr__(
+            self,
+            "_startup_reconciliations",
+            reconcile_pending_commits(
+                journal_writer,
+                repository_id,
+                recover,
+            ),
         )
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("RepositoryCommitCoordinator wiring is immutable")
+        object.__setattr__(self, _name, _value)
 
     @property
     def startup_reconciliations(self) -> tuple[ReconciledCommit[CommitT], ...]:
+        if self._root_lease is not None:
+            self._root_lease.require_active()
         return self._startup_reconciliations
+
+    def committed_intents(self) -> tuple[CommitIntent, ...]:
+        """Sealed repository-owner view used to mint downstream admission proof."""
+
+        if self._root_lease is not None:
+            self._root_lease.require_active()
+        return self._journal_writer.committed()
 
     def prepare(
         self,
@@ -415,21 +547,35 @@ class RepositoryCommitCoordinator(Generic[CommitT]):
             raise ValueError("CommitTarget belongs to another repository")
         if not callable(publish):
             raise TypeError("publish must be callable")
-        snapshot = _CommitAuthoritySnapshot(
-            preparation=preparation,
-            journal=self._journal,
-            publish_callback=publish,
-            recover_callback=self._recover,
+        lease_borrow = (
+            None if self._root_lease is None else self._root_lease.borrow()
         )
-        nonce = object()
-        with self._authority_lock:
-            self._authorities[nonce] = snapshot
-        return CommitAuthority(
-            _COMMIT_AUTHORITY_TOKEN,
-            coordinator=self,
-            nonce=nonce,
-            preparation=preparation,
-        )
+        try:
+            snapshot = _CommitAuthoritySnapshot(
+                preparation=preparation,
+                journal=self._journal_writer,
+                publish_callback=publish,
+                recover_callback=self._recover,
+                lease_borrow=lease_borrow,
+            )
+            nonce = object()
+            with self._authority_lock:
+                self._authorities[nonce] = snapshot
+            try:
+                return CommitAuthority(
+                    _COMMIT_AUTHORITY_TOKEN,
+                    coordinator=self,
+                    nonce=nonce,
+                    preparation=preparation,
+                )
+            except BaseException:
+                with self._authority_lock:
+                    self._authorities.pop(nonce, None)
+                raise
+        except BaseException:
+            if lease_borrow is not None:
+                lease_borrow.close()
+            raise
 
     def _consume_authority(
         self,
@@ -446,8 +592,25 @@ class RepositoryCommitCoordinator(Generic[CommitT]):
             except KeyError as exc:
                 raise RuntimeError("commit authority was already consumed") from exc
         if snapshot.preparation != authority._preparation:  # noqa: SLF001
+            snapshot.release_lifetime()
             raise RuntimeError("commit authority preparation snapshot mismatch")
         return snapshot
+
+    def _abandon_authority(
+        self,
+        token: object,
+        authority: CommitAuthority[object],
+    ) -> None:
+        if token is not _COMMIT_AUTHORITY_ABANDON_TOKEN:
+            raise PermissionError("commit authority abandonment is private")
+        if not isinstance(authority, CommitAuthority):
+            raise TypeError("commit authority is invalid")
+        if authority._coordinator is not self:  # noqa: SLF001
+            raise ValueError("commit authority belongs to another coordinator")
+        with self._authority_lock:
+            snapshot = self._authorities.pop(authority._nonce, None)  # noqa: SLF001
+        if snapshot is not None:
+            snapshot.release_lifetime()
 
 
 class MemoryCommitJournal:
@@ -471,6 +634,11 @@ class MemoryCommitJournal:
                 raise ValueError("commit_id has conflicting intent")
             self._intents[intent.commit_id] = intent
 
+    def _begin(self, token: object, intent: CommitIntent) -> None:
+        if token is not _JOURNAL_MUTATION_TOKEN:
+            raise PermissionError("journal mutation requires coordinator authority")
+        self.begin(intent)
+
     def mark_committed(self, commit_id: str) -> None:
         commit_id = _canonical(commit_id, "commit_id")
         with self._lock:
@@ -479,6 +647,11 @@ class MemoryCommitJournal:
             if commit_id in self._aborted:
                 raise ValueError("aborted commit cannot become committed")
             self._committed.add(commit_id)
+
+    def _mark_committed(self, token: object, commit_id: str) -> None:
+        if token is not _JOURNAL_MUTATION_TOKEN:
+            raise PermissionError("journal mutation requires coordinator authority")
+        self.mark_committed(commit_id)
 
     def mark_aborted(self, commit_id: str) -> None:
         commit_id = _canonical(commit_id, "commit_id")
@@ -489,6 +662,11 @@ class MemoryCommitJournal:
                 raise ValueError("committed commit cannot become aborted")
             self._aborted.add(commit_id)
 
+    def _mark_aborted(self, token: object, commit_id: str) -> None:
+        if token is not _JOURNAL_MUTATION_TOKEN:
+            raise PermissionError("journal mutation requires coordinator authority")
+        self.mark_aborted(commit_id)
+
     def pending(self) -> tuple[CommitIntent, ...]:
         with self._lock:
             return tuple(
@@ -497,26 +675,70 @@ class MemoryCommitJournal:
                 if commit_id not in self._committed and commit_id not in self._aborted
             )
 
+    def committed(self) -> tuple[CommitIntent, ...]:
+        """Return an immutable snapshot of successfully committed intents."""
+
+        with self._lock:
+            return tuple(
+                sorted(
+                    (
+                        intent
+                        for commit_id, intent in self._intents.items()
+                        if commit_id in self._committed
+                    ),
+                    key=lambda intent: intent.commit_id,
+                )
+            )
+
 
 class PersistentCommitJournal:
     """Repository-owned intent log; unresolved entries are startup reconciliation gates."""
 
     durable = True
 
+    __slots__ = (
+        "repository_id",
+        "repository_root",
+        "_journal",
+        "_lock",
+        "_intents",
+        "_committed",
+        "_aborted",
+        "_sealed",
+    )
+
+    def __init_subclass__(cls, **_kwargs) -> None:
+        raise TypeError("PersistentCommitJournal is final and cannot be subclassed")
+
     def __init__(self, path: str | Path, repository_id: str) -> None:
-        self.repository_id = _canonical(repository_id, "repository_id")
-        self._journal = FramedJournal(path)
+        object.__setattr__(self, "_sealed", False)
+        object.__setattr__(
+            self,
+            "repository_id",
+            _canonical(repository_id, "repository_id"),
+        )
+        journal = FramedJournal(path)
+        object.__setattr__(self, "_journal", journal)
+        object.__setattr__(self, "repository_root", journal.path.parent)
         self._journal.append(
             "repository",
             {"kind": "REPOSITORY", "repository_id": self.repository_id},
         )
-        self._lock = threading.Lock()
-        self._intents: dict[str, CommitIntent] = {}
-        self._committed: set[str] = set()
-        self._aborted: set[str] = set()
+        object.__setattr__(self, "_lock", threading.Lock())
+        object.__setattr__(self, "_intents", {})
+        object.__setattr__(self, "_committed", set())
+        object.__setattr__(self, "_aborted", set())
         self._replay()
+        object.__setattr__(self, "_sealed", True)
 
-    def begin(self, intent: CommitIntent) -> None:
+    def __setattr__(self, _name: str, _value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("PersistentCommitJournal wiring is immutable")
+        object.__setattr__(self, _name, _value)
+
+    def _begin(self, token: object, intent: CommitIntent) -> None:
+        if token is not _JOURNAL_MUTATION_TOKEN:
+            raise PermissionError("journal mutation requires coordinator authority")
         if not isinstance(intent, CommitIntent):
             raise TypeError("begin requires CommitIntent")
         if intent.target.repository_id != self.repository_id:
@@ -544,7 +766,9 @@ class PersistentCommitJournal:
             )
             self._replay()
 
-    def mark_committed(self, commit_id: str) -> None:
+    def _mark_committed(self, token: object, commit_id: str) -> None:
+        if token is not _JOURNAL_MUTATION_TOKEN:
+            raise PermissionError("journal mutation requires coordinator authority")
         commit_id = _canonical(commit_id, "commit_id")
         with self._lock:
             self._journal.append_checked(
@@ -557,7 +781,9 @@ class PersistentCommitJournal:
             )
             self._replay()
 
-    def mark_aborted(self, commit_id: str) -> None:
+    def _mark_aborted(self, token: object, commit_id: str) -> None:
+        if token is not _JOURNAL_MUTATION_TOKEN:
+            raise PermissionError("journal mutation requires coordinator authority")
         commit_id = _canonical(commit_id, "commit_id")
         with self._lock:
             self._journal.append_checked(
@@ -576,36 +802,75 @@ class PersistentCommitJournal:
                 if commit_id not in self._committed and commit_id not in self._aborted
             )
 
+    def committed(self) -> tuple[CommitIntent, ...]:
+        """Replay and return an immutable snapshot of committed intent records."""
+
+        with self._lock:
+            self._replay()
+            return tuple(
+                sorted(
+                    (
+                        intent
+                        for commit_id, intent in self._intents.items()
+                        if commit_id in self._committed
+                    ),
+                    key=lambda intent: intent.commit_id,
+                )
+            )
+
     def _replay(self) -> None:
-        intents, committed, aborted = self._state_from_records(self._journal.records())
+        intents, committed, aborted = self._state_from_records(
+            self._journal.records(),
+            expected_repository_id=self.repository_id,
+        )
         if any(
             intent.target.repository_id != self.repository_id
             for intent in intents.values()
         ):
             raise ValueError("commit journal contains an intent for another repository")
-        self._intents = intents
-        self._committed = committed
-        self._aborted = aborted
+        object.__setattr__(self, "_intents", intents)
+        object.__setattr__(self, "_committed", committed)
+        object.__setattr__(self, "_aborted", aborted)
 
-    @classmethod
-    def _validate_records(cls, records: tuple[tuple[str, object], ...]) -> None:
-        cls._state_from_records(records)
+    def _validate_records(self, records: tuple[tuple[str, object], ...]) -> None:
+        self._state_from_records(
+            records,
+            expected_repository_id=self.repository_id,
+        )
 
     @staticmethod
     def _state_from_records(
         records: tuple[tuple[str, object], ...],
+        *,
+        expected_repository_id: str,
     ) -> tuple[dict[str, CommitIntent], set[str], set[str]]:
+        expected_repository_id = _canonical(
+            expected_repository_id,
+            "expected_repository_id",
+        )
         intents: dict[str, CommitIntent] = {}
         committed: set[str] = set()
         aborted: set[str] = set()
-        for _record_id, value in records:
+        repository_markers = 0
+        for index, (record_id, value) in enumerate(records):
             if not isinstance(value, dict):
                 raise ValueError("commit journal record must be an object")
             kind = value.get("kind")
             if kind == "REPOSITORY":
+                repository_markers += 1
+                if index != 0 or repository_markers != 1 or record_id != "repository":
+                    raise ValueError(
+                        "commit journal repository marker must be unique and first"
+                    )
                 if set(value) != {"kind", "repository_id"}:
                     raise ValueError("invalid repository marker fields")
-                _canonical(value["repository_id"], "repository_id")
+                if (
+                    _canonical(value["repository_id"], "repository_id")
+                    != expected_repository_id
+                ):
+                    raise ValueError(
+                        "commit journal repository marker belongs to another repository"
+                    )
             elif kind == "INTENT":
                 if set(value) != {
                     "kind",
@@ -634,6 +899,8 @@ class PersistentCommitJournal:
                     target=CommitTarget(**target),
                     created_at=value["created_at"],
                 )
+                if record_id != f"intent:{intent.commit_id}":
+                    raise ValueError("commit intent record_id differs from payload")
                 previous = intents.get(intent.commit_id)
                 if previous is not None and previous != intent:
                     raise ValueError("commit journal contains conflicting intent")
@@ -642,6 +909,8 @@ class PersistentCommitJournal:
                 if set(value) != {"kind", "commit_id"}:
                     raise ValueError("invalid committed marker fields")
                 commit_id = _canonical(value["commit_id"], "commit_id")
+                if record_id != f"committed:{commit_id}":
+                    raise ValueError("committed record_id differs from payload")
                 if commit_id not in intents:
                     raise ValueError("commit marker precedes its intent")
                 if commit_id in aborted:
@@ -651,6 +920,8 @@ class PersistentCommitJournal:
                 if set(value) != {"kind", "commit_id"}:
                     raise ValueError("invalid aborted marker fields")
                 commit_id = _canonical(value["commit_id"], "commit_id")
+                if record_id != f"aborted:{commit_id}":
+                    raise ValueError("aborted record_id differs from payload")
                 if commit_id not in intents:
                     raise ValueError("abort marker precedes its intent")
                 if commit_id in committed:
@@ -658,8 +929,31 @@ class PersistentCommitJournal:
                 aborted.add(commit_id)
             else:
                 raise ValueError("unknown commit journal record kind")
+        if repository_markers != 1:
+            raise ValueError("commit journal requires exactly one repository marker")
         return intents, committed, aborted
 
 
 def commit_now() -> float:
     return time.time()
+
+
+# Durable journal mutation and coordinator construction are repository-owner
+# implementation details.  They intentionally remain importable by the domain
+# repository modules that own them, but are excluded from both this module's
+# declared public API and ``zlc_neutral_atom.runtime``'s package facade.
+__all__ = [
+    "CheckpointCommit",
+    "CommitAuthority",
+    "CommitIntent",
+    "CommitJournal",
+    "CommitKind",
+    "CommitRecovery",
+    "CommitSubject",
+    "CommitTarget",
+    "FinalCommit",
+    "MemoryCommitJournal",
+    "PublishVisibilityUnknown",
+    "PublishedManifest",
+    "ReconciledCommit",
+]
