@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -34,6 +34,7 @@ class ValueSchema:
     validity_contract: ValidityContract
     dtype: np.dtype
     value_unit: str | None = None
+    _fingerprint: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         axes = tuple(self.data_axes)
@@ -57,6 +58,9 @@ class ValueSchema:
             declared, available
         ):
             raise ValueError("validity component axes must be an ordered subset of data axes")
+        from .codec import value_schema_fingerprint
+
+        object.__setattr__(self, "_fingerprint", value_schema_fingerprint(self))
 
     @property
     def data_shape(self) -> tuple[int, ...]:
@@ -64,9 +68,7 @@ class ValueSchema:
 
     @property
     def fingerprint(self) -> str:
-        from .codec import value_schema_fingerprint
-
-        return value_schema_fingerprint(self)
+        return self._fingerprint
 
     def axis(self, axis_id: AxisId) -> AxisSpec:
         for axis in self.data_axes:
@@ -81,6 +83,7 @@ class DatasetSchema:
     point_axes: tuple[AxisSpec, ...]
     point_layout: PointLayout
     cell_schema: ValueSchema
+    _fingerprint: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.repeat_axis, AxisSpec) or self.repeat_axis.role != REPEAT:
@@ -100,6 +103,9 @@ class DatasetSchema:
             )
         all_axes = (self.repeat_axis,) + points + self.cell_schema.data_axes
         _unique_axis_ids(all_axes, context="dataset")
+        from .codec import dataset_schema_fingerprint
+
+        object.__setattr__(self, "_fingerprint", dataset_schema_fingerprint(self))
 
     @property
     def physical_shape(self) -> tuple[int, ...]:
@@ -111,6 +117,4 @@ class DatasetSchema:
 
     @property
     def fingerprint(self) -> str:
-        from .codec import dataset_schema_fingerprint
-
-        return dataset_schema_fingerprint(self)
+        return self._fingerprint

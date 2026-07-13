@@ -25,10 +25,14 @@ from .transform import (
     Select,
     TransformOperation,
     TransformOrigin,
+    TransformRecord,
     TransformRevision,
     TransformedSchema,
     ValidityPolicy,
 )
+
+
+TRANSFORM_RECORD_SCHEMA = "zlc_data.TransformRecord/v1"
 
 
 def transformed_schema_to_tree(schema: TransformedSchema) -> dict[str, Any]:
@@ -189,6 +193,57 @@ def decode_committed_transform(payload: bytes) -> CommittedTransform:
     return transform
 
 
+def transform_record_to_tree(record: TransformRecord) -> dict[str, Any]:
+    if not isinstance(record, TransformRecord):
+        raise TypeError("record must be TransformRecord")
+    return {
+        "schema": TRANSFORM_RECORD_SCHEMA,
+        "operation_index": record.operation_index,
+        "operation_kind": record.operation_kind,
+        "operation_digest": record.operation_digest,
+        "input_schema_fingerprint": record.input_schema_fingerprint,
+        "output_schema_fingerprint": record.output_schema_fingerprint,
+        "input_present_cells": record.input_present_cells,
+        "output_present_cells": record.output_present_cells,
+    }
+
+
+def transform_record_from_tree(tree: Any) -> TransformRecord:
+    if not isinstance(tree, dict) or set(tree) != {
+        "schema",
+        "operation_index",
+        "operation_kind",
+        "operation_digest",
+        "input_schema_fingerprint",
+        "output_schema_fingerprint",
+        "input_present_cells",
+        "output_present_cells",
+    }:
+        raise ValueError("invalid TransformRecord field set")
+    if tree["schema"] != TRANSFORM_RECORD_SCHEMA:
+        raise ValueError(f"expected schema {TRANSFORM_RECORD_SCHEMA!r}")
+    return TransformRecord(
+        _integer(tree["operation_index"], "operation_index"),
+        _text(tree["operation_kind"], "operation_kind"),
+        _text(tree["operation_digest"], "operation_digest"),
+        _text(tree["input_schema_fingerprint"], "input_schema_fingerprint"),
+        _text(tree["output_schema_fingerprint"], "output_schema_fingerprint"),
+        _integer(tree["input_present_cells"], "input_present_cells"),
+        _integer(tree["output_present_cells"], "output_present_cells"),
+    )
+
+
+def encode_transform_record(record: TransformRecord) -> bytes:
+    return encode(transform_record_to_tree(record))
+
+
+def decode_transform_record(payload: bytes) -> TransformRecord:
+    record = transform_record_from_tree(decode(payload))
+    if bytes(payload) != encode_transform_record(record):
+        raise ValueError("TransformRecord payload uses a non-canonical typed representation")
+    return record
+
+
 def _text(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field} must be non-empty text")
@@ -209,6 +264,10 @@ __all__ = [
     "data_transform_spec_to_tree",
     "decode_committed_transform",
     "encode_committed_transform",
+    "decode_transform_record",
+    "encode_transform_record",
+    "transform_record_from_tree",
+    "transform_record_to_tree",
     "transformed_schema_from_tree",
     "transformed_schema_to_tree",
 ]

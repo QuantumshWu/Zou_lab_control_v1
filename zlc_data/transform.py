@@ -14,6 +14,7 @@ from zlc_storage.canonical import canonical_digest
 from ._arrays import canonical_dtype, immutable_array
 from .axis import AxisId, AxisSpec
 from .layout import AxisLayout, AxisLayoutMode
+from .numeric import canonical_mean_dtype, canonical_sum_dtype, checked_numeric_sum
 from .schema import DatasetSchema
 from .selection import (
     CoordinateRangeSelection,
@@ -487,16 +488,15 @@ def commit_transform(
         raise ValueError("identity input uses None; an empty transform cannot be committed")
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
-    state = _source_state(schema, values=None, validity=None)
     if not isinstance(revision, TransformRevision):
         raise TypeError("revision must be TransformRevision")
     if not isinstance(origin, TransformOrigin):
         raise TypeError("origin must be TransformOrigin")
-    state = _run_operations(state, authoritative_spec)
+    output_schema = _compile_transform_schema(schema, authoritative_spec)
     provisional = object.__new__(CommittedTransform)
     object.__setattr__(provisional, "input_schema_fingerprint", schema.fingerprint)
     object.__setattr__(provisional, "spec", authoritative_spec)
-    object.__setattr__(provisional, "output_schema_fingerprint", state.schema.fingerprint)
+    object.__setattr__(provisional, "output_schema_fingerprint", output_schema.fingerprint)
     object.__setattr__(provisional, "revision", revision)
     object.__setattr__(provisional, "origin", origin)
     object.__setattr__(provisional, "transform_digest", "0" * 64)
@@ -506,11 +506,38 @@ def commit_transform(
     return CommittedTransform(
         schema.fingerprint,
         authoritative_spec,
-        state.schema.fingerprint,
+        output_schema.fingerprint,
         revision,
         origin,
         digest,
     )
+
+
+def resolve_transformed_schema(
+    schema: DatasetSchema,
+    transform: CommittedTransform,
+) -> TransformedSchema:
+    """Resolve and verify a committed transform without allocating dataset values."""
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("schema must be DatasetSchema")
+    if not isinstance(transform, CommittedTransform):
+        raise TypeError("transform must be CommittedTransform")
+    if transform.input_schema_fingerprint != schema.fingerprint:
+        raise ValueError("CommittedTransform input schema fingerprint is stale")
+    output = _compile_transform_schema(schema, transform.spec)
+    if output.fingerprint != transform.output_schema_fingerprint:
+        raise ValueError("CommittedTransform output schema fingerprint is inconsistent")
+    return output
+
+
+def _compile_transform_schema(
+    schema: DatasetSchema,
+    spec: DataTransformSpec,
+) -> TransformedSchema:
+    return _run_operations(
+        _source_state(schema, values=None, validity=None), spec
+    ).schema
 
 
 def apply_transform(
@@ -1078,16 +1105,9 @@ def _reduce_arrays(
 def _reduction_dtype(dtype: np.dtype, method: ReductionMethod) -> np.dtype:
     dtype = canonical_dtype(dtype)
     if method is ReductionMethod.MEAN:
-        return np.dtype("<c16") if dtype.kind == "c" else np.dtype("<f8")
+        return canonical_mean_dtype(dtype)
     if method is ReductionMethod.SUM:
-        if dtype.kind == "b" or dtype.kind == "i":
-            return np.dtype("<i8")
-        if dtype.kind == "u":
-            return np.dtype("<u8")
-        if dtype.kind == "f":
-            return np.dtype("<f8")
-        if dtype.kind == "c":
-            return np.dtype("<c16")
+        return canonical_sum_dtype(dtype)
     return dtype
 
 
@@ -1096,23 +1116,11 @@ def _checked_integer_sum(
     axes: tuple[int, ...],
     output_dtype: np.dtype,
 ) -> np.ndarray:
-    contributor_bound = math.prod(safe_values.shape[axis] for axis in axes)
-    input_info = np.iinfo(safe_values.dtype) if safe_values.dtype.kind != "b" else None
-    info = np.iinfo(output_dtype)
-    statically_safe = safe_values.dtype.kind == "b" or (
-        input_info is not None
-        and input_info.max * contributor_bound <= info.max
-        and (safe_values.dtype.kind != "i" or input_info.min * contributor_bound >= info.min)
+    return checked_numeric_sum(
+        safe_values,
+        axes,
+        output_dtype=output_dtype,
     )
-    if statically_safe:
-        return np.sum(safe_values, axis=axes, dtype=output_dtype)
-    exact = safe_values.astype(object)
-    for axis in sorted(axes, reverse=True):
-        exact = np.sum(exact, axis=axis, dtype=object)
-    flat = np.asarray(exact, dtype=object).reshape(-1)
-    if any(value < info.min or value > info.max for value in flat):
-        raise OverflowError("integer SUM exceeds its canonical output dtype")
-    return np.asarray(exact, dtype=output_dtype)
 
 
 def _layout_mapping(layout: AxisLayout) -> tuple[tuple[int, ...], ...]:
@@ -1120,42 +1128,7 @@ def _layout_mapping(layout: AxisLayout) -> tuple[tuple[int, ...], ...]:
 
 
 def _axis_index_vector(layout: AxisLayout, position: int) -> np.ndarray:
-    if not 0 <= position < len(layout.logical_shape):
-        raise IndexError("layout axis position is out of range")
-    if layout.mode in (AxisLayoutMode.RECT_C, AxisLayoutMode.RECT_F):
-        if layout.mode is AxisLayoutMode.RECT_C:
-            stride = math.prod(layout.logical_shape[position + 1 :])
-        else:
-            stride = math.prod(layout.logical_shape[:position])
-        return (
-            np.arange(layout.storage_size, dtype=np.int64) // stride
-        ) % layout.logical_shape[position]
-    if layout.mode is AxisLayoutMode.EXPLICIT:
-        assert layout.storage_to_multi is not None
-        return np.fromiter(
-            (multi[position] for multi in layout.storage_to_multi),
-            dtype=np.int64,
-            count=layout.storage_size,
-        )
-    assert layout.factors is not None
-    axis_offset = 0
-    for factor_index, factor in enumerate(layout.factors):
-        next_offset = axis_offset + len(factor.logical_shape)
-        if position < next_offset:
-            child = _axis_index_vector(factor, position - axis_offset)
-            after = math.prod(
-                item.storage_size for item in layout.factors[factor_index + 1 :]
-            )
-            before = math.prod(
-                item.storage_size for item in layout.factors[:factor_index]
-            )
-            physical = np.tile(
-                np.repeat(np.arange(factor.storage_size, dtype=np.int64), after),
-                before,
-            )
-            return child[physical]
-        axis_offset = next_offset
-    raise RuntimeError("PRODUCT axis resolution failed")
+    return layout.axis_indices(position)
 
 
 def _select_layout(
@@ -1259,17 +1232,7 @@ def _layout_from_mapping(
     logical_shape: tuple[int, ...],
     mapping: tuple[tuple[int, ...], ...],
 ) -> AxisLayout:
-    logical_shape = tuple(logical_shape)
-    mapping = tuple(tuple(index) for index in mapping)
-    total = math.prod(logical_shape)
-    if len(mapping) == total:
-        rectangular_c = AxisLayout.rect_c(logical_shape)
-        if mapping == _layout_mapping(rectangular_c):
-            return rectangular_c
-        rectangular_f = AxisLayout.rect_f(logical_shape)
-        if mapping == _layout_mapping(rectangular_f):
-            return rectangular_f
-    return AxisLayout.explicit(logical_shape, mapping)
+    return AxisLayout.from_mapping(logical_shape, mapping)
 
 
 def _require_digest(value: str, field: str) -> None:
@@ -1299,4 +1262,5 @@ __all__ = [
     "apply_transform",
     "commit_transform",
     "preview_transform",
+    "resolve_transformed_schema",
 ]

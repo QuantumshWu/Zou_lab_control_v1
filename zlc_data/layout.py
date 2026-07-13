@@ -139,6 +139,31 @@ class AxisLayout:
         return cls(tuple(logical_shape), AxisLayoutMode.EXPLICIT, len(mapping), mapping)
 
     @classmethod
+    def from_mapping(
+        cls,
+        logical_shape: tuple[int, ...],
+        storage_to_multi: tuple[tuple[int, ...], ...],
+    ) -> "AxisLayout":
+        """Canonicalize a physical row mapping without losing sparse holes."""
+
+        shape = tuple(logical_shape)
+        mapping = tuple(tuple(index) for index in storage_to_multi)
+        if len(mapping) == math.prod(shape):
+            rectangular_c = cls.rect_c(shape)
+            if all(
+                multi == rectangular_c.multi_index(index)
+                for index, multi in enumerate(mapping)
+            ):
+                return rectangular_c
+            rectangular_f = cls.rect_f(shape)
+            if all(
+                multi == rectangular_f.multi_index(index)
+                for index, multi in enumerate(mapping)
+            ):
+                return rectangular_f
+        return cls.explicit(shape, mapping)
+
+    @classmethod
     def product(cls, *factors: "AxisLayout") -> "AxisLayout":
         flattened: list[AxisLayout] = []
         for factor in factors:
@@ -227,6 +252,58 @@ class AxisLayout:
             )
         order = "C" if self.mode is AxisLayoutMode.RECT_C else "F"
         return int(np.ravel_multi_index(multi, self.logical_shape, order=order))
+
+    def axis_indices(self, position: int) -> np.ndarray:
+        """Return physical-row logical indices for one axis without densifying holes."""
+
+        if (
+            isinstance(position, bool)
+            or not isinstance(position, Integral)
+            or not 0 <= position < len(self.logical_shape)
+        ):
+            raise IndexError("layout axis position is out of range")
+        position = int(position)
+        if self.mode in (AxisLayoutMode.RECT_C, AxisLayoutMode.RECT_F):
+            stride = (
+                math.prod(self.logical_shape[position + 1 :])
+                if self.mode is AxisLayoutMode.RECT_C
+                else math.prod(self.logical_shape[:position])
+            )
+            result = (
+                np.arange(self.storage_size, dtype=np.int64) // stride
+            ) % self.logical_shape[position]
+        elif self.mode is AxisLayoutMode.EXPLICIT:
+            assert self.storage_to_multi is not None
+            result = np.fromiter(
+                (multi[position] for multi in self.storage_to_multi),
+                dtype=np.int64,
+                count=self.storage_size,
+            )
+        else:
+            assert self.factors is not None
+            axis_offset = 0
+            result = None
+            for factor_index, factor in enumerate(self.factors):
+                next_offset = axis_offset + len(factor.logical_shape)
+                if position < next_offset:
+                    child = factor.axis_indices(position - axis_offset)
+                    after = math.prod(
+                        item.storage_size for item in self.factors[factor_index + 1 :]
+                    )
+                    before = math.prod(
+                        item.storage_size for item in self.factors[:factor_index]
+                    )
+                    physical = np.tile(
+                        np.repeat(np.arange(factor.storage_size, dtype=np.int64), after),
+                        before,
+                    )
+                    result = child[physical]
+                    break
+                axis_offset = next_offset
+            if result is None:  # pragma: no cover - validated shape guarantees a factor
+                raise RuntimeError("PRODUCT axis resolution failed")
+        result.setflags(write=False)
+        return result
 
     def _validate_storage_index(self, index: int) -> None:
         if isinstance(index, bool) or not isinstance(index, Integral) or not 0 <= index < self.storage_size:

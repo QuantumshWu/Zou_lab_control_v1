@@ -292,6 +292,21 @@ def test_schema_fingerprint_normalizes_dtype_endianness():
     assert little.fingerprint == big.fingerprint
 
 
+def test_immutable_schema_fingerprints_are_computed_once(monkeypatch):
+    schema = dataset_schema()
+    dataset_fingerprint = schema.fingerprint
+    value_fingerprint = schema.cell_schema.fingerprint
+    import zlc_data.codec as codec
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("immutable schema fingerprint was recomputed")
+
+    monkeypatch.setattr(codec, "dataset_schema_fingerprint", forbidden)
+    monkeypatch.setattr(codec, "value_schema_fingerprint", forbidden)
+    assert schema.fingerprint == dataset_fingerprint
+    assert schema.cell_schema.fingerprint == value_fingerprint
+
+
 def test_value_schema_rejects_non_numeric_payload_dtypes():
     with pytest.raises(TypeError, match="numeric"):
         ValueSchema((), ValidityContract.value(), np.dtype("U4"))

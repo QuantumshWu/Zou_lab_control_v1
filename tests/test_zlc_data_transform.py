@@ -49,9 +49,17 @@ from zlc_data import (
     commit_transform,
     decode_committed_transform,
     decode_selection,
+    decode_transform_record,
     encode_committed_transform,
     encode_selection,
+    encode_transform_record,
     preview_transform,
+    resolve_transformed_schema,
+)
+from zlc_data.numeric import (
+    canonical_mean_dtype,
+    canonical_sum_dtype,
+    checked_numeric_sum,
 )
 
 
@@ -125,6 +133,10 @@ def test_empty_axis_layout_is_only_for_derived_sparse_results():
     assert empty.storage_size == 0
     with pytest.raises(ValueError, match="positive"):
         PointLayout.explicit((4,), ())
+    assert AxisLayout.from_mapping((2, 2), ((0, 0), (0, 1), (1, 0), (1, 1))).mode \
+        is AxisLayoutMode.RECT_C
+    assert AxisLayout.from_mapping((2, 2), ((0, 0), (1, 0), (0, 1), (1, 1))).mode \
+        is AxisLayoutMode.RECT_F
 
 
 def test_rect_f_multi_point_mapping_is_recovered_before_selecting():
@@ -363,11 +375,15 @@ def test_commit_is_schema_bound_nonempty_and_strictly_round_trips():
     )
     restored = decode_committed_transform(encode_committed_transform(committed))
     assert restored == committed
+    assert resolve_transformed_schema(block.schema, restored).fingerprint \
+        == restored.output_schema_fingerprint
     snapshot = OwnedSnapshot(block.ref(StreamGenerationId("generation-1")), block)
     authoritative = apply_transform(snapshot, restored)
     np.testing.assert_array_equal(authoritative.values, [1])
     assert authoritative.source_ref == snapshot.ref
     assert authoritative.transform_digest == restored.transform_digest
+    assert decode_transform_record(encode_transform_record(authoritative.records[0])) \
+        == authoritative.records[0]
 
     wrong = CommittedTransform(
         committed.input_schema_fingerprint,
@@ -717,6 +733,9 @@ def test_product_layout_codec_has_one_canonical_factorization():
             None,
             (AxisLayout.rect_c((2,)), AxisLayout.rect_c((3,))),
         )
+    np.testing.assert_array_equal(layout.axis_indices(0), [0, 0, 1, 1])
+    np.testing.assert_array_equal(layout.axis_indices(1), [1, 3, 1, 3])
+    assert not layout.axis_indices(0).flags.writeable
 
 
 def test_factored_f_order_reduction_has_a_vectorized_performance_guard():
@@ -747,3 +766,23 @@ def test_factored_f_order_reduction_has_a_vectorized_performance_guard():
     assert result.values.shape == (10 * 50,)
     np.testing.assert_array_equal(result.values, 100)
     assert elapsed < 1.0
+
+
+def test_shared_reduction_numeric_policy_rejects_wraparound_and_unsafe_dtype():
+    assert canonical_mean_dtype(np.dtype(np.int16)) == np.dtype("<f8")
+    assert canonical_sum_dtype(np.dtype(np.uint16)) == np.dtype("<u8")
+    np.testing.assert_array_equal(
+        checked_numeric_sum(np.array([1, 2, 3], dtype=np.int16), (0,)),
+        np.array(6, dtype=np.int64),
+    )
+    with pytest.raises(OverflowError, match="integer SUM"):
+        checked_numeric_sum(
+            np.array([np.iinfo(np.int64).max, 1], dtype=np.int64),
+            (0,),
+        )
+    with pytest.raises(TypeError, match="canonical"):
+        checked_numeric_sum(
+            np.array([1, 2], dtype=np.int16),
+            (0,),
+            output_dtype=np.dtype(np.int16),
+        )
