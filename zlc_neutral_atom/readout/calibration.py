@@ -25,6 +25,7 @@ from zlc_data import (
     CoordinateFrameId,
     DataBlock,
     Value,
+    ValueSchema,
     expand_value_validity,
 )
 from zlc_data.codec import validity_to_tree
@@ -1537,6 +1538,75 @@ def bind_readout_feature_spec(
     return ReadoutFeatureSpec._from_validated_model(model)
 
 
+def readout_application_scratch_nbytes(
+    spec: ReadoutFeatureSpec,
+    frame_schema: ValueSchema,
+) -> int:
+    """Bound transient numerical buffers for the serial readout operator.
+
+    The bound includes feature/classifier vectors, immutable-freeze copies,
+    masked-index workspaces, and the largest one-site BOX/PSF/background window.
+    It excludes the retained input frame, immutable calibration arrays, the final
+    occupancy payload, and fixed interpreter/allocator overhead; those have
+    separate owners in pipeline admission.  The maximum window is correct only
+    while feature extraction remains the serial site loop below.
+    """
+
+    if not isinstance(spec, ReadoutFeatureSpec):
+        raise TypeError("spec must be ReadoutFeatureSpec")
+    if not isinstance(frame_schema, ValueSchema):
+        raise TypeError("frame_schema must be ValueSchema")
+    # Re-derive the frozen feature identity so reflective mutation cannot lower
+    # a safety bound without first failing the same contract used by execution.
+    _ = spec.fingerprint
+    if len(frame_schema.data_shape) != 2:
+        raise ValueError("readout scratch requires one two-dimensional frame schema")
+    if frame_schema.dtype.kind not in "iuf":
+        raise TypeError("readout frame dtype must be a real integer or floating dtype")
+
+    image_height, image_width = (
+        int(value) for value in frame_schema.data_shape
+    )
+    frame_itemsize = int(frame_schema.dtype.itemsize)
+    index_itemsize = int(np.dtype(np.intp).itemsize)
+    site_count = int(spec.boxes_xywh.shape[0])
+    maximum_window = 0
+    for site_index, box in enumerate(spec.boxes_xywh):
+        y_slice, x_slice = _checked_box_slices(
+            box,
+            image_shape_yx=(image_height, image_width),
+            site_index=site_index,
+        )
+        if not spec.site_validity.mask[site_index]:
+            continue
+        kernel_pixels = int(
+            (y_slice.stop - y_slice.start) * (x_slice.stop - x_slice.start)
+        )
+        if spec.kind is ReadoutModelKind.BOX:
+            window = 8 * kernel_pixels
+        elif spec.background is BackgroundMode.NONE:
+            window = 24 * kernel_pixels
+        else:
+            padding = int(spec.background_padding)
+            outer_y0 = max(0, y_slice.start - padding)
+            outer_x0 = max(0, x_slice.start - padding)
+            outer_y1 = min(image_height, y_slice.stop + padding)
+            outer_x1 = min(image_width, x_slice.stop + padding)
+            outer_pixels = int(
+                (outer_y1 - outer_y0) * (outer_x1 - outer_x0)
+            )
+            ring_pixels = outer_pixels - kernel_pixels
+            annulus = outer_pixels + (
+                2 * frame_itemsize + 2 + 2 * index_itemsize
+            ) * ring_pixels
+            window = max(24 * kernel_pixels, annulus)
+        maximum_window = max(maximum_window, window)
+
+    # 96 bytes/site covers the current maximum live set of signal values,
+    # validity/classifier masks, immutable freezes, and advanced-index work.
+    return 96 * site_count + maximum_window
+
+
 def extract_readout_features(
     spec: ReadoutFeatureSpec,
     frame: Value,
@@ -1845,6 +1915,7 @@ __all__ = [
     "classify_occupancy",
     "extract_readout_signals",
     "extract_readout_features",
+    "readout_application_scratch_nbytes",
     "readout_background_value",
     "validate_calibration_artifact_resources",
     "validate_calibration_artifact_source_compatibility",

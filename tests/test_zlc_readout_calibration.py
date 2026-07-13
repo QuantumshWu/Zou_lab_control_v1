@@ -71,6 +71,7 @@ from zlc_neutral_atom.readout import (
     encode_site_map,
     extract_readout_features,
     extract_readout_signals,
+    readout_application_scratch_nbytes,
     calibration_resource_summary,
     validate_calibration_artifact_resources,
     validate_calibration_artifact_source_compatibility,
@@ -284,6 +285,65 @@ def _models(contract, site_map, quality, boxes):
         0,
     )
     return box, per_site, uniform
+
+
+def test_readout_application_scratch_bound_matches_serial_operator_allocations():
+    contract, site_map, quality, boxes = _contracts()
+    box_model, psf_model, _ = _models(contract, site_map, quality, boxes)
+    box_spec = bind_readout_feature_spec(box_model, site_map)
+    psf_spec = bind_readout_feature_spec(psf_model, site_map)
+    site_bytes = 96 * site_map.site_axis.size
+
+    assert readout_application_scratch_nbytes(
+        box_spec,
+        contract.frame_schema,
+    ) == site_bytes + 8
+    assert readout_application_scratch_nbytes(
+        psf_spec,
+        contract.frame_schema,
+    ) == site_bytes + 24
+
+    annulus_spec = replace(
+        psf_spec,
+        background=BackgroundMode.ANNULUS_MEDIAN,
+        background_padding=1,
+    )
+    index_bytes = np.dtype(np.intp).itemsize
+    # Both usable 1x1 boxes touch a corner: the clipped outer window has four
+    # pixels and its annulus has three, rather than the unbounded 3x3 window.
+    float64_annulus = max(
+        24,
+        4 + (2 * np.dtype("<f8").itemsize + 2 + 2 * index_bytes) * 3,
+    )
+    assert readout_application_scratch_nbytes(
+        annulus_spec,
+        contract.frame_schema,
+    ) == site_bytes + float64_annulus
+
+    uint16_schema = replace(contract.frame_schema, dtype=np.dtype("<u2"))
+    uint16_annulus = max(
+        24,
+        4 + (2 * np.dtype("<u2").itemsize + 2 + 2 * index_bytes) * 3,
+    )
+    assert readout_application_scratch_nbytes(
+        annulus_spec,
+        uint16_schema,
+    ) == site_bytes + uint16_annulus
+    assert uint16_annulus < float64_annulus
+
+    # Geometry validation includes unusable sites even though their windows do
+    # not contribute to the serial live-set maximum.
+    outside = np.array(box_spec.boxes_xywh, copy=True)
+    outside[1] = np.array([np.iinfo(np.int64).max, 0, 1, 1], dtype="<i8")
+    with pytest.raises(ValueError, match="outside the FrameContract"):
+        readout_application_scratch_nbytes(
+            replace(box_spec, boxes_xywh=outside),
+            contract.frame_schema,
+        )
+
+    complex_schema = replace(contract.frame_schema, dtype=np.dtype("<c16"))
+    with pytest.raises(TypeError, match="real integer or floating"):
+        readout_application_scratch_nbytes(box_spec, complex_schema)
 
 
 def _artifact(*, model_order=(2, 0, 1)):

@@ -51,6 +51,7 @@ from zlc_neutral_atom.readout.calibration import (
     CalibrationResourceExceeded,
     ReadoutModelKind,
     bind_readout_feature_spec,
+    readout_application_scratch_nbytes,
 )
 from zlc_neutral_atom.readout.calibration_repository import (
     AdmittedCalibration,
@@ -444,6 +445,11 @@ def test_bind_requires_admitted_calibration_and_freezes_default_model(trusted_ca
     assert not hasattr(bound, "config")
 
     artifact = trusted_calibration.admitted.artifact
+    selected_model = artifact.select_model(model_id=selection.model_id)
+    assert bound.operator_scratch_nbytes == readout_application_scratch_nbytes(
+        bind_readout_feature_spec(selected_model, artifact.site_map),
+        artifact.frame_contract.frame_schema,
+    )
     with pytest.raises(TypeError, match="AdmittedCalibration"):
         OccupancyStreamProcessorSpec(
             calibration=artifact,

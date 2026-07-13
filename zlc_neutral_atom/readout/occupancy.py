@@ -66,6 +66,7 @@ from .calibration import (
     bind_readout_feature_spec,
     classify_occupancy,
     extract_readout_features,
+    readout_application_scratch_nbytes,
     validate_readout_feature_spec_model,
     validate_readout_model_resources,
 )
@@ -1081,6 +1082,18 @@ class BoundOccupancyStreamProcessor:
         contract = self.output_edge.payload_contract
         assert isinstance(contract, OccupancySampleContract)
         return contract
+
+    @property
+    def operator_scratch_nbytes(self) -> int:
+        """Owner-derived transient numerical-buffer bound for one invocation."""
+
+        self._validate_identity()
+        config = self._processor.config
+        assert isinstance(config, _OccupancyStreamProcessorConfig)
+        return readout_application_scratch_nbytes(
+            config.feature_spec,
+            config.input_schema,
+        )
 
     def evaluate(self, sample: CameraSample) -> OccupancySample:
         """Evaluate the frozen pure operator without minting runtime lineage."""
