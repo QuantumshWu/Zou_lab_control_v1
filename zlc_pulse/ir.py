@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Sequence
 
 from zlc_storage import (
     canonical_digest,
@@ -248,7 +249,7 @@ class TargetIR:
         object.__setattr__(self, "clk_enable", clk_enable)
         for point_index, point in enumerate(points):
             effective = tuple(
-                _effective_tick(base, coeff, point, frac)
+                evaluate_affine_tick(base, coeff, point, frac)
                 for base, coeff in zip(ticks, coeff_rows)
             )
             if effective[0] != 0 or any(
@@ -257,7 +258,12 @@ class TargetIR:
                 raise ValueError(
                     f"scan point {point_index} produces non-increasing effective ticks"
                 )
-            effective_loop_end = _effective_tick(loop_end, loop_coeffs, point, frac)
+            effective_loop_end = evaluate_affine_tick(
+                loop_end,
+                loop_coeffs,
+                point,
+                frac,
+            )
             if not effective[loop_start] < effective_loop_end <= effective[-1]:
                 raise ValueError(f"scan point {point_index} produces an invalid loop end")
             expected_duration = (
@@ -281,7 +287,7 @@ class TargetIR:
         if not _same_duration(self.duration_seconds, expected_total):
             raise ValueError("TargetIR duration disagrees with its executable schedule")
         for point_index, point in enumerate(points or ((),)):
-            effective_final = _effective_tick(
+            effective_final = evaluate_affine_tick(
                 ticks[-1],
                 coeff_rows[-1],
                 point,
@@ -289,13 +295,13 @@ class TargetIR:
             )
             previous_by_bus: dict[int, tuple[int, int]] = {}
             for segment in segments:
-                start = _effective_tick(
+                start = evaluate_affine_tick(
                     segment.start_tick,
                     segment.start_tick_coeffs,
                     point,
                     frac,
                 )
-                stop = _effective_tick(
+                stop = evaluate_affine_tick(
                     segment.stop_tick,
                     segment.stop_tick_coeffs,
                     point,
@@ -328,8 +334,21 @@ class TargetIR:
         return canonical_digest(target_ir_to_tree(self))
 
 
-def _effective_tick(base: int, coeffs: tuple[int, ...], point: tuple[int, ...], frac: int) -> int:
-    return int(base) + (sum(coefficient * value for coefficient, value in zip(coeffs, point)) >> frac)
+def evaluate_affine_tick(
+    base: int,
+    coefficients: Sequence[int],
+    point: Sequence[int],
+    frac_bits: int,
+) -> int:
+    """Evaluate the one fixed-point affine timing formula used by pulse IR."""
+
+    return int(base) + (
+        sum(
+            int(coefficient) * int(value)
+            for coefficient, value in zip(coefficients, point)
+        )
+        >> int(frac_bits)
+    )
 
 
 def _same_duration(left: float, right: float) -> bool:
@@ -517,6 +536,7 @@ __all__ = [
     "TargetBusDelay",
     "TargetBusSegment",
     "TargetIR",
+    "evaluate_affine_tick",
     "target_ir_from_tree",
     "target_ir_to_tree",
 ]

@@ -25,9 +25,10 @@ from .document import (
     PulsePeriod,
     ScanParameter,
     _exact_ticks,
+    _integral_code,
 )
 from .fpga import pack_target_ir
-from .ir import TargetBusDelay, TargetBusSegment, TargetIR
+from .ir import TargetBusDelay, TargetBusSegment, TargetIR, evaluate_affine_tick
 from .schedule import DigitalTriggerSchedule, build_digital_trigger_schedules
 from .target import PORT_CLOCK, PORT_DAC, PORT_DIGITAL, PulseTarget
 from .validation import validate_target_ir_for_target
@@ -419,16 +420,16 @@ def _compile_scan(
     loop_start_coeffs = tick_coeffs[loop_start_index]
     point_durations = tuple(
         (
-            _apply_affine(ticks[-1], tick_coeffs[-1], point, coeff_frac_bits)
+            evaluate_affine_tick(ticks[-1], tick_coeffs[-1], point, coeff_frac_bits)
             + (loop_count - 1)
             * (
-                _apply_affine(
+                evaluate_affine_tick(
                     loop_end_tick,
                     loop_end_coeffs,
                     point,
                     coeff_frac_bits,
                 )
-                - _apply_affine(
+                - evaluate_affine_tick(
                     loop_start_base,
                     loop_start_coeffs,
                     point,
@@ -594,13 +595,23 @@ def _affine_edge_rows(
     ordered = sorted(
         events,
         key=lambda expression: (
-            _apply_affine(expression[0], expression[1], point0, coeff_frac_bits),
+            evaluate_affine_tick(
+                expression[0],
+                expression[1],
+                point0,
+                coeff_frac_bits,
+            ),
             not any(lane is not None for lane, _value in events[expression]),
             expression,
         ),
     )
     reference_ticks = [
-        _apply_affine(expression[0], expression[1], point0, coeff_frac_bits)
+        evaluate_affine_tick(
+            expression[0],
+            expression[1],
+            point0,
+            coeff_frac_bits,
+        )
         for expression in ordered
     ]
     if any(right <= left for left, right in zip(reference_ticks, reference_ticks[1:])):
@@ -622,7 +633,7 @@ def _affine_edge_rows(
         raise ValueError("hardware scan template does not return every digital lane to zero")
     for point_index, point in enumerate(scan_points):
         effective = [
-            _apply_affine(base, coeffs, point, coeff_frac_bits)
+            evaluate_affine_tick(base, coeffs, point, coeff_frac_bits)
             for base, _mask, coeffs in rows
         ]
         if effective[0] != 0 or any(
@@ -737,7 +748,7 @@ def _period_starts(
                 raise ValueError("scan-bound period start requires a frozen scan row")
             value = scan_row[selector]
             unit = columns[selector].unit
-        ticks = _exact_positive_ticks(value, unit, step_ns, "period duration")
+        ticks = _exact_ticks(value, unit, step_ns, "period duration")
         starts.append(starts[-1] + ticks)
     return starts
 
@@ -755,7 +766,7 @@ def _affine_period_starts(
     for period_index, period in enumerate(view.periods):
         selector = binding.get(_duration_ref(view, period_index))
         if selector is None:
-            base = _exact_positive_ticks(
+            base = _exact_ticks(
                 period.duration, period.unit, step_ns, "period duration"
             )
             coefficients = tuple(0 for _ in range(slot_count))
@@ -785,12 +796,12 @@ def _wire_scan_points(
         for parameter, value in zip(columns, row):
             if parameter.field.kind == FIELD_DURATION:
                 point.append(
-                    _exact_positive_ticks(value, parameter.unit, step_ns, "scan duration")
+                    _exact_ticks(value, parameter.unit, step_ns, "scan duration")
                 )
             else:
                 port = view.target.by_key[parameter.field.port]
                 assert port.signed_range is not None
-                code = _exact_integer(value, "scan DAC value")
+                code = _integral_code(value, "scan DAC value")
                 if not port.signed_range[0] <= code <= port.signed_range[1]:
                     raise ValueError("scan DAC value exceeds target range")
                 point.append(code - port.signed_range[0])
@@ -875,36 +886,6 @@ def _validate_target_geometry(target: PulseTarget, params: StreamerParams) -> No
         raise ValueError("PulseTarget has more DAC buses than the frozen streamer geometry")
     if any(port.width > int(params.bus_width) for port in dac):
         raise ValueError("PulseTarget DAC width exceeds the frozen streamer geometry")
-
-
-def _exact_integer(value: object, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{field} must be numeric")
-    result = float(value)
-    rounded = round(result)
-    if not math.isfinite(result) or not math.isclose(
-        result, rounded, rel_tol=0.0, abs_tol=1e-9
-    ):
-        raise ValueError(f"{field} must be an integral value")
-    return int(rounded)
-
-
-def _exact_positive_ticks(
-    value: object,
-    unit: str,
-    step_ns: float,
-    field: str,
-) -> int:
-    return _exact_ticks(value, unit, step_ns, field)
-
-
-def _apply_affine(
-    base: int, coefficients: Sequence[int], point: Sequence[int], frac_bits: int
-) -> int:
-    return int(base) + (
-        sum(int(coefficient) * int(value) for coefficient, value in zip(coefficients, point))
-        >> int(frac_bits)
-    )
 
 
 __all__ = [

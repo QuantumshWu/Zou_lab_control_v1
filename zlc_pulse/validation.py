@@ -16,7 +16,7 @@ from fpga.pulse_streamer.host.image import (
     check_rtl_assumptions,
 )
 
-from .ir import TargetIR
+from .ir import TargetIR, evaluate_affine_tick
 from .target import PORT_CLOCK, PORT_DAC, PORT_DIGITAL, PulseTarget
 
 
@@ -120,7 +120,7 @@ def validate_target_ir_for_geometry(
                 f"scan point {point_index} effective tick does not fit "
                 f"{geometry.tick_width} bits"
             )
-        loop_end = _effective(
+        loop_end = evaluate_affine_tick(
             ir.loop_end_tick,
             ir.loop_end_slot_coeffs,
             point,
@@ -481,7 +481,7 @@ def _play_bus_sweep(
     for point in ir.scan_points or ((),):
         effective, loop_start, loop_end, loop_span, duration = _point_timing(ir, point)
         starts = tuple(
-            _effective(
+            evaluate_affine_tick(
                 segment.start_tick,
                 segment.start_tick_coeffs,
                 point,
@@ -605,7 +605,7 @@ def _point_timing(
 ) -> tuple[tuple[int, ...], int, int, int, int]:
     effective = _effective_ticks(ir, point)
     loop_start = effective[ir.loop_start_index]
-    loop_end = _effective(
+    loop_end = evaluate_affine_tick(
         ir.loop_end_tick,
         ir.loop_end_slot_coeffs,
         point,
@@ -668,20 +668,8 @@ def _max_finite_periodic_window(
 
 def _effective_ticks(ir: TargetIR, point: Sequence[int]) -> tuple[int, ...]:
     return tuple(
-        _effective(base, coefficients, point, ir.scan_coeff_frac_bits)
+        evaluate_affine_tick(base, coefficients, point, ir.scan_coeff_frac_bits)
         for base, coefficients in zip(ir.ticks, ir.tick_slot_coeffs)
-    )
-
-
-def _effective(
-    base: int,
-    coefficients: Sequence[int],
-    point: Sequence[int],
-    frac_bits: int,
-) -> int:
-    return int(base) + (
-        sum(int(coefficient) * int(value) for coefficient, value in zip(coefficients, point))
-        >> int(frac_bits)
     )
 
 

@@ -55,8 +55,7 @@ class CompiledPulseArtifact:
             raise TypeError("target_ir must be TargetIR")
         if not isinstance(self.wire_image, PulseWireImage):
             raise TypeError("wire_image must be PulseWireImage")
-        ir_digest = canonical_digest(target_ir_to_tree(self.target_ir))
-        if self.wire_image.source_ir_digest != ir_digest:
+        if self.wire_image.source_ir_digest != self.target_ir.fingerprint:
             raise ValueError("wire image is not bound to target_ir")
         schedules = tuple(self.trigger_schedules)
         if any(not isinstance(item, DigitalTriggerSchedule) for item in schedules):

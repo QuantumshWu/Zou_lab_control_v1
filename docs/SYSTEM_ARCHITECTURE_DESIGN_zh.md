@@ -2315,6 +2315,8 @@ zlc_pulse 拥有：
 
 Pulse authoring 与加载只保留一个当前合同：`schema="zlc_pulse.PulseDocument"`，并以显式`kind=table|sequence`区分可编辑table与raw sequence。`zlc_pulse.load()`和`PulseDocument.from_dict`只接受这一格式名；所有save也只写这一格式，compiled artifact不作为同名`_program.json` sibling。仓库中受版本控制的 pulse JSON 资产与当前 codec 同步提交并通过 round-trip/golden；不存在历史 fixture、旧 parser、逐版本 upgrader 或一次性转换器。仓库外旧文件不属于终态产品合同；loader 遇到未知格式名必须返回明确的`UnsupportedPulseSchema`，不得按字段存在、shape或名字猜测，也不得提示 runtime fallback。
 
+`TargetIR.fingerprint` 是 TargetIR canonical identity 的唯一 owner；packer、artifact 与 repository 只能消费该派生值，不能把 IR 再编码并重复算 digest。固定点 scan timing 的仿射求值只由 `zlc_pulse.ir.evaluate_affine_tick` 定义，duration-to-ticks 与 integral DAC code 的精确转换分别复用 PulseDocument 的单源转换函数；compiler、validator 与 model 不得各自保留等价公式或“更保险”的第二次解释。
+
 ### 15.2 Authoring spec 与 resolved manifest
 
 ```text

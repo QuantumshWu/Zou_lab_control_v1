@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .ir import TargetIR
+from .ir import TargetIR, evaluate_affine_tick
 
 
 MAX_MATERIALIZED_TRIGGER_EDGES = 1_000_000
@@ -144,12 +144,12 @@ def build_digital_trigger_schedules(
         edges: list[TriggerEdge] = []
         for point_index, point in enumerate(points):
             effective = tuple(
-                _effective_tick(base, coeffs, point, ir.scan_coeff_frac_bits)
+                evaluate_affine_tick(base, coeffs, point, ir.scan_coeff_frac_bits)
                 for base, coeffs in zip(ir.ticks, ir.tick_slot_coeffs)
             )
             final_tick = effective[-1]
             loop_start_tick = effective[ir.loop_start_index]
-            loop_end_tick = _effective_tick(
+            loop_end_tick = evaluate_affine_tick(
                 ir.loop_end_tick,
                 ir.loop_end_slot_coeffs,
                 point,
@@ -255,18 +255,6 @@ def _rising_ticks(
             rises.append(int(tick))
         state = current
     return tuple(rises), state
-
-
-def _effective_tick(
-    base: int,
-    coeffs: tuple[int, ...],
-    point: tuple[int, ...],
-    frac_bits: int,
-) -> int:
-    return int(base) + (
-        sum(coefficient * value for coefficient, value in zip(coeffs, point))
-        >> frac_bits
-    )
 
 
 def digital_trigger_schedule_to_tree(value: DigitalTriggerSchedule) -> dict[str, object]:

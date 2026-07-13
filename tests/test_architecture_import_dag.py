@@ -196,6 +196,55 @@ def test_text_normalization_is_confined_to_named_input_adapters():
     )
 
 
+def test_pulse_ir_digest_and_affine_formulas_have_one_owner():
+    violations = []
+    for relative in (
+        Path("zlc_pulse/fpga.py"),
+        Path("zlc_pulse/artifact.py"),
+    ):
+        tree = ast.parse(
+            (ROOT / relative).read_text(encoding="utf-8"),
+            filename=str(relative),
+        )
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            if not isinstance(node.func, ast.Name) or node.func.id != "canonical_digest":
+                continue
+            argument = node.args[0]
+            if (
+                isinstance(argument, ast.Call)
+                and isinstance(argument.func, ast.Name)
+                and argument.func.id == "target_ir_to_tree"
+            ):
+                violations.append(f"{relative}:{node.lineno} recomputes TargetIR fingerprint")
+
+    forbidden_helpers = {
+        "_apply_affine",
+        "_effective",
+        "_effective_tick",
+        "_exact_integer",
+        "_exact_positive_ticks",
+    }
+    for source in (ROOT / "zlc_pulse").rglob("*.py"):
+        relative = source.relative_to(ROOT)
+        tree = ast.parse(
+            source.read_text(encoding="utf-8"),
+            filename=str(relative),
+        )
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name in forbidden_helpers
+            ):
+                violations.append(f"{relative}:{node.lineno} defines duplicate {node.name}")
+    assert not violations, (
+        "TargetIR.fingerprint, ir.evaluate_affine_tick, document._integral_code, "
+        "and document._exact_ticks are the sole pulse formula owners:\n"
+        + "\n".join(violations)
+    )
+
+
 def test_artifact_finalizers_do_not_replay_published_payload_digests():
     violations = []
     for relative in (

@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass
 
 from .artifact import CompiledPulseArtifact
-from .ir import TargetIR
+from .ir import TargetIR, evaluate_affine_tick
 
 
 MAX_MATERIALIZED_PLAYBACK_TRANSITIONS = 1_000_000
@@ -281,12 +281,12 @@ def _expanded_mask_transitions(ir: TargetIR) -> tuple[list[tuple[int, int]], int
     run_offset = 0
     for point in points:
         effective = tuple(
-            _effective_tick(base, coeffs, point, ir.scan_coeff_frac_bits)
+            evaluate_affine_tick(base, coeffs, point, ir.scan_coeff_frac_bits)
             for base, coeffs in zip(ir.ticks, ir.tick_slot_coeffs)
         )
         final_tick = effective[-1]
         loop_start_tick = effective[ir.loop_start_index]
-        loop_end_tick = _effective_tick(
+        loop_end_tick = evaluate_affine_tick(
             ir.loop_end_tick,
             ir.loop_end_slot_coeffs,
             point,
@@ -340,18 +340,6 @@ def _expanded_mask_transitions(ir: TargetIR) -> tuple[list[tuple[int, int]], int
         else:
             merged.append((tick, mask))
     return merged, run_offset
-
-
-def _effective_tick(
-    base: int,
-    coefficients: tuple[int, ...],
-    point: tuple[int, ...],
-    frac_bits: int,
-) -> int:
-    return int(base) + (
-        sum(coefficient * value for coefficient, value in zip(coefficients, point))
-        >> frac_bits
-    )
 
 
 __all__ = [

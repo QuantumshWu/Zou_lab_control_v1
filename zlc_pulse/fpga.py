@@ -91,7 +91,7 @@ def pack_target_ir(
     packed = pack_program(carrier, geometry)
     return PulseWireImage(
         geometry_fingerprint=build_fingerprint(geometry) & 0xFFFFFFFF,
-        source_ir_digest=canonical_digest(target_ir_to_tree(value)),
+        source_ir_digest=value.fingerprint,
         words=tuple(
             sorted((int(address), int(word) & 0xFFFFFFFF) for address, word in packed.items())
         ),
