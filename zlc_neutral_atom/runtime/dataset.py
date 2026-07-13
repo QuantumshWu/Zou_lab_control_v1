@@ -1213,6 +1213,27 @@ class OrderedDatasetEventHasher:
         return self._hasher.copy().hexdigest()
 
 
+class OrderedDatasetMetadataHasher:
+    """Single owner of the metadata-order digest used by exact datasets."""
+
+    __slots__ = ("_hasher",)
+
+    def __init__(self, metadata_contract_fingerprint: str) -> None:
+        fingerprint = _sha256_digest(
+            metadata_contract_fingerprint,
+            "metadata_contract_fingerprint",
+        )
+        self._hasher = hashlib.sha256()
+        self._hasher.update(fingerprint.encode("ascii"))
+
+    def update(self, metadata_digest: str) -> None:
+        digest = _sha256_digest(metadata_digest, "metadata_digest")
+        self._hasher.update(digest.encode("ascii"))
+
+    def digest(self) -> str:
+        return self._hasher.copy().hexdigest()
+
+
 class DatasetBuilder(Generic[PayloadT]):
     """Private mutable materializer; public reads are immutable owned snapshots."""
 
@@ -1269,9 +1290,8 @@ class DatasetBuilder(Generic[PayloadT]):
             if self._reservation is not None
             else None
         )
-        self._ordered_metadata_hasher = hashlib.sha256()
-        self._ordered_metadata_hasher.update(
-            self._metadata_contract_fingerprint.encode("ascii")
+        self._ordered_metadata_hasher = OrderedDatasetMetadataHasher(
+            self._metadata_contract_fingerprint
         )
         self._lock = threading.RLock()
         self._values = np.zeros(schema.physical_shape, dtype=schema.cell_schema.dtype)
@@ -1416,7 +1436,7 @@ class DatasetBuilder(Generic[PayloadT]):
             if self.mode is DatasetMode.FINITE_EXACT:
                 self._expected_sequence += 1
                 self._ordered_event_metadata[schedule_index] = metadata
-                self._ordered_metadata_hasher.update(metadata_digest.encode("ascii"))
+                self._ordered_metadata_hasher.update(metadata_digest)
                 assert self._ordered_event_hasher is not None
                 self._ordered_event_hasher.update(envelope.ref, metadata_digest)
             else:
@@ -1476,7 +1496,7 @@ class DatasetBuilder(Generic[PayloadT]):
             ordered_event_digest=self._ordered_event_hasher.digest(
                 self._reservation.end_sequence
             ),
-            ordered_metadata_digest=self._ordered_metadata_hasher.copy().hexdigest(),
+            ordered_metadata_digest=self._ordered_metadata_hasher.digest(),
             metadata_contract_fingerprint=self._metadata_contract_fingerprint,
             trace_binding=self._reservation.trace_binding,
             event_metadata=tuple(self._ordered_event_metadata),
@@ -1705,6 +1725,7 @@ __all__ = [
     "MissingDatasetCells",
     "NoDatasetMetadataContract",
     "OrderedDatasetEventHasher",
+    "OrderedDatasetMetadataHasher",
     "SnapshotExpired",
     "SealedDatasetArtifact",
     "ValueDatasetEventAdapter",

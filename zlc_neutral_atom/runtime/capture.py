@@ -33,6 +33,7 @@ from .dataset import (
     DatasetCellKeyContract,
     DatasetEventAdapter,
     FrozenDatasetEdge,
+    OrderedDatasetMetadataHasher,
     dataset_cell_key_fingerprint,
 )
 from .ports import (
@@ -1655,9 +1656,8 @@ class CaptureSession:
         self._processor_input_binding = processor_input_binding
         self._state = CaptureSessionState.NEW
         self._delivered = 0
-        self._metadata_hasher = hashlib.sha256()
-        self._metadata_hasher.update(
-            contract.dataset_edge.metadata_contract_fingerprint.encode("ascii")
+        self._metadata_hasher = OrderedDatasetMetadataHasher(
+            contract.dataset_edge.metadata_contract_fingerprint
         )
         self._completion: CaptureCompletion | None = None
         self._reservation: ExactReservation | None = None
@@ -1929,7 +1929,7 @@ class CaptureSession:
                 )
                 raise
             with self._lock:
-                self._metadata_hasher.update(metadata_digest.encode("ascii"))
+                self._metadata_hasher.update(metadata_digest)
                 self._delivered += 1
 
     def complete(self, context: RunContext) -> CaptureCompletion:
@@ -1962,7 +1962,7 @@ class CaptureSession:
                     raise StreamError(
                         "capture terminal counters/stop/drain/join proof failed"
                     )
-                expected_digest = self._metadata_hasher.copy().hexdigest()
+                expected_digest = self._metadata_hasher.digest()
                 if ack.ordered_metadata_digest != expected_digest:
                     raise StreamError("capture terminal metadata digest differs")
                 if (

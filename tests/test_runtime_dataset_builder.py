@@ -39,6 +39,7 @@ from zlc_neutral_atom.runtime.dataset import (
     DuplicateDatasetCell,
     FrozenDatasetEdge,
     MissingDatasetCells,
+    OrderedDatasetMetadataHasher,
     SnapshotExpired,
     SealedDatasetArtifact,
     ValueDatasetEventAdapter,
@@ -58,6 +59,26 @@ from zlc_neutral_atom.runtime.streams import (
 
 FINGERPRINT = "3" * 64
 TRACE_BINDING = TraceBinding("run", "camera")
+
+
+def test_ordered_metadata_hasher_owns_the_exact_digest_algorithm():
+    fingerprint = "a" * 64
+    metadata_digests = ("b" * 64, "c" * 64)
+    expected = hashlib.sha256()
+    expected.update(fingerprint.encode("ascii"))
+    for digest in metadata_digests:
+        expected.update(digest.encode("ascii"))
+
+    hasher = OrderedDatasetMetadataHasher(fingerprint)
+    for digest in metadata_digests:
+        hasher.update(digest)
+
+    assert hasher.digest() == expected.hexdigest()
+    assert hasher.digest() == expected.hexdigest()
+    with pytest.raises(ValueError, match="SHA-256"):
+        OrderedDatasetMetadataHasher("not-a-digest")
+    with pytest.raises(ValueError, match="SHA-256"):
+        hasher.update("not-a-digest")
 
 
 def axis(name: str, role, size: int) -> AxisSpec:
