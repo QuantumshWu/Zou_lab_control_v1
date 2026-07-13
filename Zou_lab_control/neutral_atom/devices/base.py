@@ -956,8 +956,15 @@ class CameraDevice(BaseDevice):
         out: list[CameraFrameRecord] = []
         while len(out) < n:
             with state["cond"]:
+                drained = False
                 while state["pending"] and len(out) < n:
                     out.append(state["pending"].popleft())
+                    drained = True
+                if drained:
+                    # A bounded push source may be waiting for one driver-ring slot.
+                    # Wake it at the actual dequeue linearization point rather than
+                    # making delivery depend on a polling timeout.
+                    state["cond"].notify_all()
             if len(out) >= n:
                 break
             if not self._grab(n - len(out), timeout=timeout, stop=stop, **kwargs):
@@ -1115,6 +1122,9 @@ class CameraDevice(BaseDevice):
         deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
         with state["cond"]:
             while not state["pending"]:
+                source_error = state["last_terminal_error"]
+                if source_error is not None:
+                    raise RuntimeError("camera frame source failed") from source_error
                 if not state["armed"]:
                     return False
                 if stop is not None and stop.is_set():

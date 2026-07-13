@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +37,7 @@ from zlc_neutral_atom.timing import (
 )
 from zlc_pulse import (
     PulseExecutionForm,
+    RepeatRegion,
     bind_pulse_document_target,
     compile_pulse_artifact,
     load_pulse_document,
@@ -52,8 +54,17 @@ def _axis(name, role, size):
     return AxisSpec(AxisId(name), name, role, size, tuple(range(size)))
 
 
-def _runtime(point_count=3):
+def _runtime(point_count=3, repeat_count=1):
     document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    if repeat_count > 1:
+        document = replace(
+            document,
+            repeat=RepeatRegion(
+                document.periods[0].period_id,
+                document.periods[-1].period_id,
+                repeat_count,
+            ),
+        )
     catalog = PortCatalog(
         document.target.raw_lanes,
         tuple(
@@ -96,10 +107,14 @@ def _runtime(point_count=3):
     measurement = runtime.bind_camera_measurement(
         CameraCaptureBindingRequest(
             "readout",
-            _axis("repeat", REPEAT, 1),
+            _axis("repeat", REPEAT, repeat_count),
             (_axis("frame", READOUT_EVENT, point_count),),
             PointLayout.rect_c((point_count,)),
-            tuple(DatasetCellAddress(0, point) for point in range(point_count)),
+            tuple(
+                DatasetCellAddress(repeat, point)
+                for repeat in range(repeat_count)
+                for point in range(point_count)
+            ),
             CameraAcquisitionMode.EXTERNAL_TRIGGERED,
             0,
             4 << 20,
@@ -124,13 +139,22 @@ def _runtime(point_count=3):
         live_target=document.target,
     )
     plan = None
-    if artifact.trigger_schedules[0].total == point_count:
+    if artifact.trigger_schedules[0].total == repeat_count * point_count:
         plan = compile_capture_cell_plan(
             artifact,
             "ch11",
             measurement.capture_contract.dataset_schema,
             readout_event_axis_id=AxisId("frame"),
             scan_point_layout=PointLayout.rect_c(()),
+            within_point_grouping=(
+                tuple(
+                    (repeat, event)
+                    for repeat in range(repeat_count)
+                    for event in range(point_count)
+                )
+                if repeat_count > 1 and point_count > 1
+                else None
+            ),
         )
     return runtime, camera, sequencer, capture, document, pulse_port, artifact, plan
 
@@ -175,6 +199,40 @@ def test_camera_is_armed_before_one_fire_and_all_frames_are_exactly_materialized
         assert dict(sequencer.snapshot())["state"] == "safe"
         state = camera._recent_state()
         with state["cond"]:
+            assert not state["armed"] and not state["pending"]
+    finally:
+        assert runtime.shutdown(timeout=2.0)
+
+
+def test_repeated_three_event_capture_streams_all_frames_through_bounded_ring():
+    runtime, camera, _sequencer, capture, document, pulse_port, artifact, plan = _runtime(
+        repeat_count=12
+    )
+    assert plan is not None
+    assert artifact.trigger_schedules[0].loop_count == 12
+    assert plan.within_point_grouping == tuple(
+        (repeat, event)
+        for repeat in range(12)
+        for event in range(3)
+    )
+    spec = TriggeredCaptureSpec(
+        capture,
+        pulse_port,
+        FinitePulseExecutionRequest(document, artifact),
+        "ch11",
+        plan,
+    )
+    try:
+        result = runtime.controller.run(compile_triggered_pipeline(spec))
+        assert result.dataset.block.values.shape == (12, 3, 6, 8)
+        assert result.capture_terminal.produced_count == 36
+        assert result.capture_terminal.drained_count == 36
+        assert tuple(item.source_ordinal for item in result.dataset.event_metadata) == tuple(
+            range(36)
+        )
+        state = camera._recent_state()
+        with state["cond"]:
+            assert state["pending_capacity"] < 36
             assert not state["armed"] and not state["pending"]
     finally:
         assert runtime.shutdown(timeout=2.0)

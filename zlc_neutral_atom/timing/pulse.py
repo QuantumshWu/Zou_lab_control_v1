@@ -81,6 +81,20 @@ class FinitePulseExecutionRequest:
             raise ValueError("compiled artifact belongs to another PulseDocument")
         if self.artifact.target_abi_fingerprint != self.document.target.abi_fingerprint:
             raise ValueError("compiled artifact target differs from PulseDocument")
+        repeat = self.document.repeat
+        expected_loop_count = 1 if repeat is None else repeat.count
+        expected_full_point_loop = repeat is None or (
+            repeat.start_period_id == self.document.periods[0].period_id
+            and repeat.end_period_id == self.document.periods[-1].period_id
+        )
+        if any(
+            schedule.loop_count != expected_loop_count
+            or schedule.full_point_loop is not expected_full_point_loop
+            for schedule in self.artifact.trigger_schedules
+        ):
+            raise ValueError(
+                "compiled trigger execution groups differ from PulseDocument"
+            )
         validate_target_ir_for_target(
             self.artifact.target_ir,
             self.document.target,

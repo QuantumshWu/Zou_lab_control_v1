@@ -42,6 +42,31 @@ class PlaybackPulse:
 
 
 @dataclass(frozen=True)
+class PlaybackTriggerGroup:
+    """Compiled trigger cardinality for one pulse point/loop iteration."""
+
+    point_index: int
+    loop_iteration: int
+    channel_counts: tuple[tuple[str, int], ...]
+
+    def __post_init__(self) -> None:
+        for field in ("point_index", "loop_iteration"):
+            value = getattr(self, field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field} must be a non-negative integer")
+        counts = tuple(self.channel_counts)
+        channels = tuple(channel for channel, _count in counts)
+        if len(channels) != len(set(channels)):
+            raise ValueError("playback trigger-group channels must be unique")
+        for channel, count in counts:
+            if not isinstance(channel, str) or not channel:
+                raise ValueError("playback trigger-group channel must be non-empty text")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                raise ValueError("playback trigger-group counts must be positive integers")
+        object.__setattr__(self, "channel_counts", counts)
+
+
+@dataclass(frozen=True)
 class PulsePlayback:
     name: str
     pulses: tuple[PlaybackPulse, ...]
@@ -49,6 +74,9 @@ class PulsePlayback:
     duration: float
     repeat_forever: bool
     repeat_count: int = 1
+    trigger_channels: tuple[str, ...] = ()
+    full_point_loop_channels: tuple[str, ...] = ()
+    trigger_groups: tuple[PlaybackTriggerGroup, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
@@ -74,9 +102,80 @@ class PulsePlayback:
             raise ValueError("repeat_count must be a positive integer")
         if any(pulse.stop > self.duration + 1e-12 for pulse in pulses):
             raise ValueError("playback pulse exceeds playback duration")
+        trigger_channels = tuple(self.trigger_channels)
+        if any(not isinstance(channel, str) or not channel for channel in trigger_channels):
+            raise ValueError("playback trigger channels must be non-empty text")
+        if len(trigger_channels) != len(set(trigger_channels)):
+            raise ValueError("playback trigger channels must be unique")
+        object.__setattr__(self, "trigger_channels", trigger_channels)
+        full_point = tuple(self.full_point_loop_channels)
+        if len(full_point) != len(set(full_point)) or any(
+            channel not in trigger_channels for channel in full_point
+        ):
+            raise ValueError(
+                "full-point loop channels must be a unique trigger-channel subset"
+            )
+        object.__setattr__(self, "full_point_loop_channels", full_point)
+        groups = tuple(self.trigger_groups)
+        if any(not isinstance(group, PlaybackTriggerGroup) for group in groups):
+            raise TypeError("trigger_groups must contain PlaybackTriggerGroup values")
+        keys = tuple((group.point_index, group.loop_iteration) for group in groups)
+        if keys != tuple(sorted(set(keys))):
+            raise ValueError("playback trigger groups must use unique point/loop order")
+        if any(
+            channel not in trigger_channels
+            for group in groups
+            for channel, _count in group.channel_counts
+        ):
+            raise ValueError("playback trigger group contains an undeclared channel")
+        object.__setattr__(self, "trigger_groups", groups)
 
     def base_pulses(self) -> tuple[PlaybackPulse, ...]:
         return self.pulses
+
+    def effective_pulses(self) -> tuple[PlaybackPulse, ...]:
+        """The playback is already the exact fully expanded finite timeline."""
+
+        return self.pulses
+
+    def trigger_group_sizes(self, channels: tuple[str, ...]) -> tuple[int, ...]:
+        """Frame counts per compiled point/loop group for selected trigger lines."""
+
+        selected = tuple(channels)
+        if len(selected) != len(set(selected)):
+            raise ValueError("selected trigger channels must be unique")
+        if len(selected) != 1:
+            raise ValueError(
+                "virtual shot grouping requires exactly one trigger channel; "
+                "multiple delayed lines can interleave source groups"
+            )
+        unknown = tuple(channel for channel in selected if channel not in self.trigger_channels)
+        if unknown:
+            raise ValueError(
+                f"playback has no compiled trigger grouping for channels {unknown!r}"
+            )
+        partial = tuple(
+            channel
+            for channel in selected
+            if channel not in self.full_point_loop_channels
+        )
+        if partial:
+            raise ValueError(
+                "virtual shot grouping requires a full-point source loop; "
+                f"partial-loop trigger channels are {partial!r}"
+            )
+        wanted = set(selected)
+        return tuple(
+            count
+            for group in self.trigger_groups
+            if (
+                count := sum(
+                    value
+                    for channel, value in group.channel_counts
+                    if channel in wanted
+                )
+            )
+        )
 
 
 def build_pulse_playback(
@@ -135,6 +234,34 @@ def build_pulse_playback(
                 )
             )
     terminal_with_delay = terminal_tick + max(ir.channel_delays, default=0)
+    group_counts: dict[tuple[int, int], dict[str, int]] = {}
+    for schedule in artifact.trigger_schedules:
+        for edge in schedule.edges:
+            counts = group_counts.setdefault(
+                (edge.point_index, edge.loop_iteration),
+                {},
+            )
+            counts[schedule.channel] = counts.get(schedule.channel, 0) + 1
+    trigger_channels = tuple(
+        schedule.channel for schedule in artifact.trigger_schedules
+    )
+    full_point_loop_channels = tuple(
+        schedule.channel
+        for schedule in artifact.trigger_schedules
+        if schedule.full_point_loop
+    )
+    trigger_groups = tuple(
+        PlaybackTriggerGroup(
+            point_index,
+            loop_iteration,
+            tuple(
+                (channel, counts[channel])
+                for channel in trigger_channels
+                if channel in counts
+            ),
+        )
+        for (point_index, loop_iteration), counts in sorted(group_counts.items())
+    )
     return PulsePlayback(
         name=name,
         pulses=tuple(sorted(pulses, key=lambda pulse: (pulse.start, pulse.channel))),
@@ -142,6 +269,9 @@ def build_pulse_playback(
         duration=terminal_with_delay / ir.clock_hz,
         repeat_forever=ir.repeat_forever,
         repeat_count=1,
+        trigger_channels=trigger_channels,
+        full_point_loop_channels=full_point_loop_channels,
+        trigger_groups=trigger_groups,
     )
 
 
@@ -227,6 +357,7 @@ def _effective_tick(
 __all__ = [
     "MAX_MATERIALIZED_PLAYBACK_TRANSITIONS",
     "PlaybackPulse",
+    "PlaybackTriggerGroup",
     "PulsePlayback",
     "build_pulse_playback",
 ]

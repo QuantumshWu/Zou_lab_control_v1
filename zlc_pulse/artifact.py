@@ -21,7 +21,7 @@ from .schedule import (
 )
 
 
-COMPILED_PULSE_ARTIFACT_SCHEMA = "zlc_pulse.CompiledPulseArtifact/v1"
+COMPILED_PULSE_ARTIFACT_SCHEMA = "zlc_pulse.CompiledPulseArtifact/v2"
 
 
 class PulseExecutionForm(str, Enum):
@@ -93,10 +93,12 @@ class CompiledPulseArtifact:
         if (
             not self.target_ir.repeat_forever
             and bool(schedules)
-            and schedules
-            != build_digital_trigger_schedules(
-                self.target_ir,
-                tuple(item.channel for item in schedules),
+            and not _same_physical_trigger_schedule(
+                schedules,
+                build_digital_trigger_schedules(
+                    self.target_ir,
+                    tuple(item.channel for item in schedules),
+                ),
             )
         ):
             raise ValueError("trigger schedules are not the deterministic TargetIR expansion")
@@ -114,6 +116,34 @@ class CompiledPulseArtifact:
     @property
     def fingerprint(self) -> str:
         return canonical_digest(compiled_pulse_artifact_to_tree(self))
+
+
+def _same_physical_trigger_schedule(
+    actual: tuple[DigitalTriggerSchedule, ...],
+    expected: tuple[DigitalTriggerSchedule, ...],
+) -> bool:
+    """Compare wire facts while retaining source loop provenance sidecars."""
+
+    if len(actual) != len(expected):
+        return False
+    for left, right in zip(actual, expected, strict=True):
+        if (
+            left.channel != right.channel
+            or left.point_count != right.point_count
+            or len(left.edges) != len(right.edges)
+        ):
+            return False
+        for left_edge, right_edge in zip(left.edges, right.edges, strict=True):
+            if (
+                left_edge.channel != right_edge.channel
+                or left_edge.point_index != right_edge.point_index
+                or left_edge.trigger_ordinal != right_edge.trigger_ordinal
+                or left_edge.point_trigger_ordinal
+                != right_edge.point_trigger_ordinal
+                or left_edge.tick_from_run_start != right_edge.tick_from_run_start
+            ):
+                return False
+    return True
 
 
 def compiled_pulse_artifact_to_tree(value: CompiledPulseArtifact) -> dict[str, object]:

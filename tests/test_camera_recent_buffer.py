@@ -73,6 +73,526 @@ def test_recent_capacity_bounds_retention():
     assert cam.drain() == []
 
 
+def test_fast_forward_finite_source_streams_through_bounded_pending_ring():
+    """Removing virtual wall time must not collapse a whole hardware run into one
+    atomic host-side burst.  The finite producer and exact reader advance together
+    through the same bounded driver-retention contract used by a real camera.
+    """
+
+    from Zou_lab_control.neutral_atom.devices.virtual import (
+        VirtualCamera,
+        VirtualSequencer,
+        VirtualTrapArray,
+    )
+    from Zou_lab_control.neutral_atom.timing import imaging_sequence
+
+    sequencer = VirtualSequencer(sleep_scale=0)
+    camera = VirtualCamera(
+        VirtualTrapArray(grid_shape=(2, 2), image_shape=(6, 8), seed=31),
+        exposure=0.001,
+        sequencer=sequencer,
+    )
+    program = imaging_sequence(exposure=0.001, load=True).repeated(36)
+    camera.arm(36, max_inflight_frames=16)
+    try:
+        sequencer.prepare(program)
+        sequencer.fire(program)
+        frames = camera.read_frames(36)
+        assert len(frames) == 36
+        state = camera._recent_state()
+        with state["cond"]:
+            assert state["pending_capacity"] == 16
+            assert not state["pending"]
+            assert state["source_ordinal"] == 36
+            assert state["cond"].wait_for(
+                lambda: state["_finite_delivery_phase"].value in {"done", "failed"},
+                timeout=1.0,
+            )
+            assert state["_finite_delivery_phase"].value == "done"
+    finally:
+        terminal = camera.finish_record_capture()
+    assert terminal.produced_count == 36
+    assert terminal.source_stopped and terminal.no_more_frames and terminal.joined
+
+
+def test_finite_fire_returns_before_camera_rendering_completes():
+    """FIRE is a non-blocking hardware command; camera production is asynchronous."""
+
+    import threading
+    import time
+
+    from Zou_lab_control.neutral_atom.devices.virtual import (
+        VirtualCamera,
+        VirtualSequencer,
+        VirtualTrapArray,
+    )
+    from Zou_lab_control.neutral_atom.timing import imaging_sequence
+
+    sequencer = VirtualSequencer(sleep_scale=0)
+    camera = VirtualCamera(
+        VirtualTrapArray(grid_shape=(1, 1), image_shape=(4, 4), seed=32),
+        exposure=0.001,
+        sequencer=sequencer,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_frames(_sequence, frames):
+        assert frames == 1
+        entered.set()
+        assert release.wait(2.0)
+        yield np.ones((4, 4), dtype=np.float64)
+
+    camera._iter_render_frames = blocked_frames
+    program = imaging_sequence(exposure=0.001, load=True)
+    camera.arm(1)
+    try:
+        sequencer.prepare(program)
+        started = time.monotonic()
+        sequencer.fire(program)
+        assert time.monotonic() - started < 0.5
+        assert entered.wait(1.0)
+        release.set()
+        frames = camera.read_frames(1)
+        assert len(frames) == 1
+        np.testing.assert_array_equal(frames[0], np.ones((4, 4)))
+    finally:
+        release.set()
+        camera.disarm()
+
+
+def test_default_finite_read_timeout_bounds_a_wedged_frame_source():
+    """``timeout=None`` means the camera default, never an infinite source wait."""
+
+    import threading
+
+    from Zou_lab_control.neutral_atom.devices.virtual import (
+        VirtualCamera,
+        VirtualSequencer,
+        VirtualTrapArray,
+    )
+    from Zou_lab_control.neutral_atom.timing import imaging_sequence
+
+    sequencer = VirtualSequencer(sleep_scale=0)
+    camera = VirtualCamera(
+        VirtualTrapArray(grid_shape=(1, 1), image_shape=(4, 4), seed=43),
+        exposure=0.001,
+        timeout=0.05,
+        sequencer=sequencer,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_frames(_sequence, _frames):
+        entered.set()
+        assert release.wait(2.0)
+        yield np.zeros((4, 4), dtype=np.float64)
+
+    camera._iter_render_frames = blocked_frames
+    program = imaging_sequence(exposure=0.001, load=True)
+    camera.arm(1)
+    sequencer.prepare(program)
+    sequencer.fire(program)
+    assert entered.wait(1.0)
+    errors = []
+
+    def read():
+        try:
+            camera.read_frames(1)
+        except BaseException as error:
+            errors.append(error)
+
+    reader = threading.Thread(target=read)
+    reader.start()
+    reader.join(0.3)
+    completed_within_default = not reader.is_alive()
+    release.set()
+    reader.join(2.0)
+    try:
+        assert completed_within_default
+        assert len(errors) == 1
+        assert isinstance(errors[0], TimeoutError)
+    finally:
+        camera.disarm()
+
+
+def test_finite_camera_worker_failure_reaches_reader_and_terminal():
+    """A background renderer may never turn into a silent short capture."""
+
+    from Zou_lab_control.neutral_atom.devices.virtual import (
+        VirtualCamera,
+        VirtualSequencer,
+        VirtualTrapArray,
+    )
+    from Zou_lab_control.neutral_atom.timing import imaging_sequence
+
+    sequencer = VirtualSequencer(sleep_scale=0)
+    camera = VirtualCamera(
+        VirtualTrapArray(grid_shape=(1, 1), image_shape=(4, 4), seed=33),
+        exposure=0.001,
+        sequencer=sequencer,
+    )
+
+    def broken_frames(_sequence, _frames):
+        raise ValueError("render failed")
+        yield  # pragma: no cover - make this a generator without hiding the fault
+
+    camera._iter_render_frames = broken_frames
+    program = imaging_sequence(exposure=0.001, load=True)
+    camera.arm(1)
+    sequencer.prepare(program)
+    sequencer.fire(program)
+    with pytest.raises(RuntimeError, match="finite-frame source failed") as read_error:
+        camera.read_frames(1)
+    assert isinstance(read_error.value.__cause__, ValueError)
+    with pytest.raises(RuntimeError, match="finite-frame source failed"):
+        camera.finish_record_capture()
+    state = camera._recent_state()
+    with state["cond"]:
+        assert not state["armed"]
+        assert not state["pending"]
+
+
+def test_zero_edge_finite_fire_is_immediate_loud_deficit():
+    cam, seqr = _rig(seed=34)
+    from Zou_lab_control.neutral_atom.timing import imaging_sequence
+
+    cam.capture_trigger_channels = ("not-connected",)
+    program = imaging_sequence(exposure=0.001, load=True)
+    cam.arm(1)
+    try:
+        seqr.prepare(program)
+        seqr.fire(program)
+        with pytest.raises(TimeoutError, match="only 0 trigger edge"):
+            cam.read_frames(1)
+    finally:
+        cam.disarm()
+
+
+def test_stop_while_finite_source_is_running_is_cancellation_not_deficit():
+    import threading
+
+    from Zou_lab_control.neutral_atom.devices.base import AcquisitionCancelled
+    from Zou_lab_control.neutral_atom.timing import imaging_sequence
+
+    cam, seqr = _rig(seed=35)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_frames(_sequence, _frames):
+        entered.set()
+        assert release.wait(2.0)
+        yield np.zeros((20, 24), dtype=np.float64)
+
+    cam._iter_render_frames = blocked_frames
+    program = imaging_sequence(exposure=0.001, load=True)
+    cam.arm(1)
+    seqr.prepare(program)
+    seqr.fire(program)
+    assert entered.wait(1.0)
+    stop = threading.Event()
+    stop.set()
+    try:
+        with pytest.raises(AcquisitionCancelled):
+            cam.read_frames(1, stop=stop)
+    finally:
+        release.set()
+        terminal = cam.finish_record_capture()
+    assert terminal.joined
+    with cam._recent_state()["cond"]:
+        assert not cam._recent_state()["armed"]
+
+
+def test_finite_worker_start_and_disarm_have_one_linearization_point(monkeypatch):
+    """Terminal completion may not observe an installed-but-unstarted thread."""
+
+    import threading
+
+    from Zou_lab_control.neutral_atom.timing import imaging_sequence
+
+    cam, seqr = _rig(seed=36)
+    entered_start = threading.Event()
+    release_start = threading.Event()
+    original_start = threading.Thread.start
+
+    def gated_start(thread):
+        if thread.name.startswith("zlc-virtual-camera-fire-"):
+            entered_start.set()
+            assert release_start.wait(2.0)
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", gated_start)
+    program = imaging_sequence(exposure=0.001, load=True)
+    cam.arm(1)
+    seqr.prepare(program)
+    fire_errors = []
+    terminal_errors = []
+
+    def fire():
+        try:
+            seqr.fire(program)
+        except BaseException as error:  # pragma: no cover - asserted below
+            fire_errors.append(error)
+
+    def finish():
+        try:
+            cam.finish_record_capture()
+        except BaseException as error:  # pragma: no cover - asserted below
+            terminal_errors.append(error)
+
+    fire_thread = threading.Thread(target=fire, name="test-fire")
+    fire_thread.start()
+    assert entered_start.wait(1.0)
+    finish_thread = threading.Thread(target=finish, name="test-finish")
+    finish_thread.start()
+    release_start.set()
+    fire_thread.join(2.0)
+    finish_thread.join(2.0)
+    assert not fire_thread.is_alive() and not finish_thread.is_alive()
+    assert fire_errors == [] and terminal_errors == []
+    # The out-of-band finisher stopped the source but could not release the
+    # RLock owned by this arm thread.  Consume its cached terminal here so the
+    # acquisition authority itself is also proven reusable.
+    cam.finish_record_capture()
+    state = cam._recent_state()
+    with state["cond"]:
+        assert not state["armed"]
+        assert not state["pending"]
+
+
+def test_disarm_of_ring_blocked_source_cannot_leak_into_rearm():
+    from Zou_lab_control.neutral_atom.timing import imaging_sequence
+
+    cam, seqr = _rig(seed=37)
+    many = imaging_sequence(exposure=0.001, load=True).repeated(3)
+    cam.arm(3, max_inflight_frames=1)
+    seqr.prepare(many)
+    seqr.fire(many)
+    state = cam._recent_state()
+    with state["cond"]:
+        assert state["cond"].wait_for(
+            lambda: state["source_ordinal"] == 1,
+            timeout=1.0,
+        )
+    cam.disarm()
+
+    one = imaging_sequence(exposure=0.001, load=True)
+    cam.arm(1, max_inflight_frames=1)
+    try:
+        seqr.prepare(one)
+        seqr.fire(one)
+        frames = cam.read_frames(1)
+        assert len(frames) == 1
+        with state["cond"]:
+            assert state["source_ordinal"] == 1
+    finally:
+        cam.disarm()
+
+
+def test_close_stops_ring_blocked_source_and_unplugs_trigger_wire():
+    from Zou_lab_control.neutral_atom.timing import imaging_sequence
+
+    cam, seqr = _rig(seed=38)
+    program = imaging_sequence(exposure=0.001, load=True).repeated(3)
+    cam.arm(3, max_inflight_frames=1)
+    seqr.prepare(program)
+    seqr.fire(program)
+    state = cam._recent_state()
+    with state["cond"]:
+        assert state["cond"].wait_for(
+            lambda: state["source_ordinal"] == 1,
+            timeout=1.0,
+        )
+        worker = state["_finite_delivery_thread"]
+        assert worker.is_alive()
+
+    cam.close()
+
+    assert not worker.is_alive()
+    with state["cond"]:
+        assert not state["armed"]
+        assert not state["pending"]
+    assert cam._on_wire_fired not in seqr._fire_listeners
+    with pytest.raises(RuntimeError, match="closed virtual camera"):
+        cam.arm(1)
+
+
+def test_close_retries_a_residual_subclass_source_when_epoch_is_unarmed():
+    """A failed prior terminal join must not hide a subclass producer from close."""
+
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualMotCamera
+
+    class ResidualProducer:
+        def __init__(self):
+            self.alive = True
+            self.join_calls = 0
+
+        def join(self, timeout=None):
+            assert timeout == 2.0
+            self.join_calls += 1
+            self.alive = False
+
+        def is_alive(self):
+            return self.alive
+
+    camera = VirtualMotCamera(width=8, height=6, exposure=0.001)
+    producer = ResidualProducer()
+    camera._producer = producer
+
+    camera.close()
+
+    assert producer.join_calls == 1
+    assert camera._producer is None
+
+
+def test_nonzero_time_scale_ring_overrun_is_loud():
+    from Zou_lab_control.neutral_atom.devices.base import CameraBufferOverrun
+    from Zou_lab_control.neutral_atom.devices.virtual import (
+        VirtualCamera,
+        VirtualSequencer,
+        VirtualTrapArray,
+    )
+    from Zou_lab_control.neutral_atom.timing import imaging_sequence
+
+    seqr = VirtualSequencer(sleep_scale=1.0)
+    cam = VirtualCamera(
+        VirtualTrapArray(grid_shape=(1, 1), image_shape=(4, 4), seed=39),
+        exposure=0.0001,
+        timeout=0.2,
+        sequencer=seqr,
+    )
+    program = imaging_sequence(exposure=0.0001, load=True).repeated(2)
+    cam.arm(2, max_inflight_frames=1)
+    seqr.prepare(program)
+    seqr.fire(program)
+    state = cam._recent_state()
+    with state["cond"]:
+        assert state["cond"].wait_for(
+            lambda: state["_finite_delivery_phase"].value == "failed",
+            timeout=2.0,
+        )
+        assert len(state["pending"]) == 1
+        assert state["source_ordinal"] == 1
+        assert isinstance(state["_finite_delivery_error"], CameraBufferOverrun)
+
+    with pytest.raises(RuntimeError) as read_error:
+        cam.read_frames(2)
+    assert isinstance(read_error.value.__cause__, CameraBufferOverrun)
+    with pytest.raises(RuntimeError, match="finite-frame source failed"):
+        cam.finish_record_capture()
+
+
+def test_close_racing_backend_arm_cannot_leave_a_closed_armed_camera():
+    import threading
+
+    cam, _seqr = _rig(seed=40)
+    entered = threading.Event()
+    release = threading.Event()
+    real_arm = cam._arm
+
+    def blocked_arm(frames, *, max_inflight_frames=None):
+        entered.set()
+        assert release.wait(2.0)
+        return real_arm(frames, max_inflight_frames=max_inflight_frames)
+
+    cam._arm = blocked_arm
+    arm_errors = []
+    close_errors = []
+
+    def arm():
+        try:
+            cam.arm(1)
+        except BaseException as error:
+            arm_errors.append(error)
+
+    def close():
+        try:
+            cam.close()
+        except BaseException as error:  # pragma: no cover - asserted below
+            close_errors.append(error)
+
+    arm_thread = threading.Thread(target=arm)
+    arm_thread.start()
+    assert entered.wait(1.0)
+    close_thread = threading.Thread(target=close)
+    close_thread.start()
+    release.set()
+    arm_thread.join(2.0)
+    close_thread.join(2.0)
+
+    assert not arm_thread.is_alive() and not close_thread.is_alive()
+    assert len(arm_errors) == 1
+    assert "closed virtual camera" in str(arm_errors[0])
+    assert close_errors == []
+    state = cam._recent_state()
+    with state["cond"]:
+        assert not state["arming"] and not state["armed"]
+
+
+def test_old_fire_schedule_parse_cannot_cross_into_a_new_arm_epoch(monkeypatch):
+    import threading
+
+    import Zou_lab_control.neutral_atom.devices.virtual as virtual_devices
+    from Zou_lab_control.neutral_atom.timing import imaging_sequence
+
+    cam, seqr = _rig(seed=42)
+    entered = threading.Event()
+    release = threading.Event()
+    original_offsets = virtual_devices.camera_trigger_pulse_offsets
+
+    def blocked_offsets(camera, sequence):
+        if sequence.name == "epoch-a":
+            entered.set()
+            assert release.wait(2.0)
+        return original_offsets(camera, sequence)
+
+    monkeypatch.setattr(
+        virtual_devices,
+        "camera_trigger_pulse_offsets",
+        blocked_offsets,
+    )
+
+    def sentinel_frames(sequence, _frames):
+        value = 1.0 if sequence.name == "epoch-a" else 9.0
+        yield np.full((20, 24), value, dtype=np.float64)
+
+    cam._iter_render_frames = sentinel_frames
+    first = imaging_sequence(exposure=0.001, load=True, name="epoch-a")
+    second = imaging_sequence(exposure=0.001, load=True, name="epoch-b")
+    cam.arm(1)
+    seqr.prepare(first)
+    fire_errors = []
+
+    def fire_first():
+        try:
+            seqr.fire(first)
+        except BaseException as error:  # pragma: no cover - asserted below
+            fire_errors.append(error)
+
+    fire_thread = threading.Thread(target=fire_first)
+    fire_thread.start()
+    assert entered.wait(1.0)
+    cam.disarm()
+    cam.arm(1)
+    release.set()
+    fire_thread.join(2.0)
+    assert not fire_thread.is_alive() and fire_errors == []
+    state = cam._recent_state()
+    with state["cond"]:
+        assert state["source_ordinal"] == 0
+        assert not state["pending"]
+        assert state["_finite_delivery_phase"].value == "idle"
+
+    try:
+        seqr.prepare(second)
+        seqr.fire(second)
+        frames = cam.read_frames(1)
+        assert len(frames) == 1
+        np.testing.assert_array_equal(frames[0], np.full((20, 24), 9.0))
+    finally:
+        cam.disarm()
+
+
 def test_real_camera_inherits_the_same_buffer():
     # The buffer API is defined ONCE on CameraDevice; the real qCMOS adapter must
     # NOT override it -- so virtual and real retain frames through the identical path.

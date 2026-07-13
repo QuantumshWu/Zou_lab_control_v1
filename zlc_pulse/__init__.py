@@ -73,7 +73,12 @@ from .schedule import (
     digital_trigger_schedule_from_tree,
     digital_trigger_schedule_to_tree,
 )
-from .simulation import PlaybackPulse, PulsePlayback, build_pulse_playback
+from .simulation import (
+    PlaybackPulse,
+    PlaybackTriggerGroup,
+    PulsePlayback,
+    build_pulse_playback,
+)
 from .server import (
     PREPARED_PULSE_REF_SCHEMA,
     PULSE_COMPLETION_SCHEMA,
@@ -181,6 +186,7 @@ __all__ = [
     "PulseBackendCompletion",
     "PulseHardwareTerminalEvidence",
     "PlaybackPulse",
+    "PlaybackTriggerGroup",
     "PulsePlayback",
     "PulseWireImage",
     "PreparedPulseRef",

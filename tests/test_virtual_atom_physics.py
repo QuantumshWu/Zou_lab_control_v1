@@ -10,6 +10,7 @@ layer reading only frames is guarded by test_virtual_equals_real_contract.py).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import sys
 
@@ -95,7 +96,72 @@ def test_repeated_single_trigger_frames_all_use_the_window_exposure():
     assert over_bg.min() > 0                                   # every frame imaged a real atom
     # all frames at the SAME short-exposure brightness; the bug made the repeats ~6x brighter
     # (camera-default 20 ms) than the 2 ms window-0 frame, blowing this ratio far past 2.
-    assert over_bg.max() <= 2.0 * over_bg.min()
+    # Poisson extrema over only eight frames can cross 2x even at one exact
+    # exposure; the historical mixed-exposure defect was about 6x.
+    assert over_bg.max() <= 2.5 * over_bg.min()
+
+
+def test_compiled_twelve_by_three_bracket_reloads_only_between_explicit_groups():
+    from zlc_pulse import (
+        PulseExecutionForm,
+        RepeatRegion,
+        build_pulse_playback,
+        compile_pulse_artifact,
+        load_pulse_document,
+    )
+
+    document = load_pulse_document(REPO_ROOT / "pulses" / "imaging_template.json")
+    document = replace(
+        document,
+        repeat=RepeatRegion(
+            document.periods[0].period_id,
+            document.periods[-1].period_id,
+            12,
+        ),
+    )
+    artifact = compile_pulse_artifact(
+        document,
+        clock_hz=50e6,
+        execution_form=PulseExecutionForm.STATIC_ONCE,
+        trigger_channels=("ch11",),
+    )
+    playback = build_pulse_playback(artifact)
+    trap = VirtualTrapArray(
+        grid_shape=(1, 1),
+        image_shape=(4, 4),
+        seed=41,
+        cooling_channels=("ch00", "ch01"),
+        probe_channels=("ch03",),
+        trap_channels=("ch09",),
+    )
+    reload_cooling = []
+    rendered_exposures = []
+    original_reload = trap.reload
+
+    def record_reload(*, cooling_duration=None):
+        reload_cooling.append(cooling_duration)
+        return original_reload(cooling_duration=cooling_duration)
+
+    def record_render(*, exposure=None, all_sites=False):
+        assert not all_sites
+        rendered_exposures.append(float(exposure))
+        return np.zeros((4, 4), dtype=np.float64)
+
+    trap.reload = record_reload
+    trap.render_image = record_render
+    frames = list(
+        trap.iter_image_frames(
+            playback,
+            36,
+            capture_trigger_channels=("ch11",),
+            exposure=0.123,
+        )
+    )
+
+    assert len(frames) == 36
+    assert len(reload_cooling) == 12
+    assert reload_cooling == pytest.approx([0.002] * 12)
+    assert rendered_exposures == pytest.approx([0.020, 0.005, 0.020] * 12)
 
 
 def test_release_recapture_survival_decays_with_trap_off_temperature():

@@ -157,7 +157,7 @@ def test_scan_rejects_dac_segments_inside_compact_inner_repeat():
         )
 
 
-def test_artifact_uses_v2_compiler_identity_and_one_geometry_for_ir_and_wire():
+def test_artifact_uses_v3_compiler_identity_and_one_geometry_for_ir_and_wire():
     document = load_pulse_document(ROOT / "pulses" / "mot_field_template.json")
     trigger = next(
         port.lanes[0]
@@ -177,7 +177,7 @@ def test_artifact_uses_v2_compiler_identity_and_one_geometry_for_ir_and_wire():
     )
 
     assert artifact.compiler_id == COMPILER_ID
-    assert artifact.compiler_version == COMPILER_VERSION == "2"
+    assert artifact.compiler_version == COMPILER_VERSION == "3"
     assert artifact.target_ir.scan_coeff_frac_bits == 8
     assert artifact.wire_image.source_ir_digest == artifact.target_ir.fingerprint
 

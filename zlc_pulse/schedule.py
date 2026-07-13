@@ -14,6 +14,7 @@ MAX_MATERIALIZED_TRIGGER_EDGES = 1_000_000
 class TriggerEdge:
     channel: str
     point_index: int
+    loop_iteration: int
     trigger_ordinal: int
     point_trigger_ordinal: int
     tick_from_run_start: int
@@ -23,6 +24,7 @@ class TriggerEdge:
             raise ValueError("trigger channel must be non-empty text")
         for field in (
             "point_index",
+            "loop_iteration",
             "trigger_ordinal",
             "point_trigger_ordinal",
             "tick_from_run_start",
@@ -37,6 +39,8 @@ class DigitalTriggerSchedule:
     channel: str
     edges: tuple[TriggerEdge, ...]
     point_count: int
+    loop_count: int = 1
+    full_point_loop: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.channel, str) or not self.channel:
@@ -50,14 +54,42 @@ class DigitalTriggerSchedule:
             raise ValueError("trigger edge ticks must strictly increase")
         if isinstance(self.point_count, bool) or not isinstance(self.point_count, int) or self.point_count < 1:
             raise ValueError("point_count must be a positive integer")
+        if (
+            isinstance(self.loop_count, bool)
+            or not isinstance(self.loop_count, int)
+            or self.loop_count < 1
+        ):
+            raise ValueError("loop_count must be a positive integer")
+        if type(self.full_point_loop) is not bool:
+            raise TypeError("full_point_loop must be bool")
         if any(edge.point_index >= self.point_count for edge in edges):
             raise ValueError("trigger edge point index exceeds point_count")
+        if any(edge.loop_iteration >= self.loop_count for edge in edges):
+            raise ValueError("trigger edge loop iteration exceeds loop_count")
         per_point: dict[int, int] = {}
+        previous_loop_by_point: dict[int, int] = {}
         for edge in edges:
             expected = per_point.get(edge.point_index, 0)
             if edge.point_trigger_ordinal != expected:
                 raise ValueError("per-point trigger ordinals must be contiguous")
             per_point[edge.point_index] = expected + 1
+            previous_loop = previous_loop_by_point.get(edge.point_index, 0)
+            if edge.loop_iteration < previous_loop:
+                raise ValueError("loop iterations must be monotonic within each point")
+            previous_loop_by_point[edge.point_index] = edge.loop_iteration
+        if self.full_point_loop:
+            per_group: dict[tuple[int, int], int] = {}
+            for edge in edges:
+                key = (edge.point_index, edge.loop_iteration)
+                per_group[key] = per_group.get(key, 0) + 1
+            total_groups = self.point_count * self.loop_count
+            if per_group and (
+                len(per_group) != total_groups
+                or len(set(per_group.values())) > 1
+            ):
+                raise ValueError(
+                    "a full-point loop must emit the same trigger count in every group"
+                )
         object.__setattr__(self, "edges", edges)
 
     @property
@@ -142,7 +174,11 @@ def build_digital_trigger_schedules(
             )
             point_ordinal = 0
 
-            def append_rises(rises: tuple[int, ...], shift: int = 0) -> None:
+            def append_rises(
+                rises: tuple[int, ...],
+                shift: int = 0,
+                loop_iteration: int = 0,
+            ) -> None:
                 nonlocal point_ordinal
                 if len(edges) + len(rises) > remaining_budget:
                     raise ValueError(
@@ -154,6 +190,7 @@ def build_digital_trigger_schedules(
                         TriggerEdge(
                             channel,
                             point_index,
+                            loop_iteration,
                             len(edges),
                             point_ordinal,
                             run_offset
@@ -178,13 +215,29 @@ def build_digital_trigger_schedules(
                     )
                 if steady_rises:
                     for iteration in range(1, ir.loop_count):
-                        append_rises(steady_rises, iteration * loop_span)
+                        append_rises(
+                            steady_rises,
+                            iteration * loop_span,
+                            iteration,
+                        )
                 previous = steady_end
             tail_shift = (ir.loop_count - 1) * loop_span
             rises, previous = _rising_ticks(tail, bit_index, previous)
-            append_rises(rises, tail_shift)
+            append_rises(rises, tail_shift, ir.loop_count - 1)
             run_offset += final_tick + tail_shift
-        schedules.append(DigitalTriggerSchedule(channel, tuple(edges), len(points)))
+        schedules.append(
+            DigitalTriggerSchedule(
+                channel,
+                tuple(edges),
+                len(points),
+                ir.loop_count,
+                (
+                    ir.loop_start_index == 0
+                    and ir.loop_end_tick == ir.ticks[-1]
+                    and ir.loop_end_slot_coeffs == ir.tick_slot_coeffs[-1]
+                ),
+            )
+        )
         remaining_budget -= len(edges)
     return tuple(schedules)
 
@@ -222,10 +275,13 @@ def digital_trigger_schedule_to_tree(value: DigitalTriggerSchedule) -> dict[str,
     return {
         "channel": value.channel,
         "point_count": value.point_count,
+        "loop_count": value.loop_count,
+        "full_point_loop": value.full_point_loop,
         "edges": [
             {
                 "channel": edge.channel,
                 "point_index": edge.point_index,
+                "loop_iteration": edge.loop_iteration,
                 "trigger_ordinal": edge.trigger_ordinal,
                 "point_trigger_ordinal": edge.point_trigger_ordinal,
                 "tick_from_run_start": edge.tick_from_run_start,
@@ -236,7 +292,13 @@ def digital_trigger_schedule_to_tree(value: DigitalTriggerSchedule) -> dict[str,
 
 
 def digital_trigger_schedule_from_tree(tree: object) -> DigitalTriggerSchedule:
-    if not isinstance(tree, dict) or set(tree) != {"channel", "point_count", "edges"}:
+    if not isinstance(tree, dict) or set(tree) != {
+        "channel",
+        "point_count",
+        "loop_count",
+        "full_point_loop",
+        "edges",
+    }:
         raise ValueError("DigitalTriggerSchedule has an unknown field set")
     if not isinstance(tree["edges"], list):
         raise TypeError("DigitalTriggerSchedule edges must be a list")
@@ -244,6 +306,7 @@ def digital_trigger_schedule_from_tree(tree: object) -> DigitalTriggerSchedule:
     fields = {
         "channel",
         "point_index",
+        "loop_iteration",
         "trigger_ordinal",
         "point_trigger_ordinal",
         "tick_from_run_start",
@@ -252,7 +315,13 @@ def digital_trigger_schedule_from_tree(tree: object) -> DigitalTriggerSchedule:
         if not isinstance(item, dict) or set(item) != fields:
             raise ValueError("TriggerEdge has an unknown field set")
         edges.append(TriggerEdge(**item))
-    return DigitalTriggerSchedule(tree["channel"], tuple(edges), tree["point_count"])
+    return DigitalTriggerSchedule(
+        tree["channel"],
+        tuple(edges),
+        tree["point_count"],
+        tree["loop_count"],
+        tree["full_point_loop"],
+    )
 
 
 __all__ = [

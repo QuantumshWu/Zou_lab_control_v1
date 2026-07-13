@@ -27,13 +27,13 @@ from .document import (
 )
 from .fpga import pack_target_ir
 from .ir import TargetBusDelay, TargetBusSegment, TargetIR
-from .schedule import build_digital_trigger_schedules
+from .schedule import DigitalTriggerSchedule, build_digital_trigger_schedules
 from .target import PORT_CLOCK, PORT_DAC, PORT_DIGITAL, PulseTarget
 from .validation import validate_target_ir_for_target
 
 
 COMPILER_ID = "zlc-pulse-native"
-COMPILER_VERSION = "2"
+COMPILER_VERSION = "3"
 
 
 @dataclass(frozen=True)
@@ -159,6 +159,26 @@ def compile_pulse_artifact(
         if execution_form is PulseExecutionForm.CONTINUOUS_MONITOR or not channels
         else build_digital_trigger_schedules(target_ir, channels)
     )
+    source_loop_count = 1 if document.repeat is None else document.repeat.count
+    if schedules and target_ir.loop_count != source_loop_count:
+        # Output-delay lowering may have to unroll the hardware loop, but that
+        # wire-level decision must not erase the source execution groups used
+        # by host simulation and capture cross-validation.  Recompile only the
+        # host-side grouping projection without output delays, then join its
+        # point/loop ownership onto the unchanged physical ticks by ordinal.
+        grouping_document = replace(document, delays=())
+        grouping_ir = compile_pulse_document(
+            grouping_document,
+            clock_hz=clock_hz,
+            execution_form=execution_form,
+            live_target=live_target,
+            params=geometry,
+        )
+        grouping_schedules = build_digital_trigger_schedules(
+            grouping_ir,
+            channels,
+        )
+        schedules = _join_source_trigger_groups(schedules, grouping_schedules)
     return CompiledPulseArtifact(
         source_document_digest=document.fingerprint,
         compiler_id=COMPILER_ID,
@@ -168,6 +188,57 @@ def compile_pulse_artifact(
         wire_image=pack_target_ir(target_ir, geometry),
         trigger_schedules=schedules,
     )
+
+
+def _join_source_trigger_groups(
+    physical: tuple[DigitalTriggerSchedule, ...],
+    grouped: tuple[DigitalTriggerSchedule, ...],
+) -> tuple[DigitalTriggerSchedule, ...]:
+    if tuple(item.channel for item in physical) != tuple(
+        item.channel for item in grouped
+    ):
+        raise RuntimeError("source and physical trigger schedule channels differ")
+    joined = []
+    for physical_schedule, grouped_schedule in zip(
+        physical,
+        grouped,
+        strict=True,
+    ):
+        if (
+            physical_schedule.point_count != grouped_schedule.point_count
+            or len(physical_schedule.edges) != len(grouped_schedule.edges)
+        ):
+            raise RuntimeError("source and physical trigger cardinality differ")
+        edges = []
+        for physical_edge, grouped_edge in zip(
+            physical_schedule.edges,
+            grouped_schedule.edges,
+            strict=True,
+        ):
+            if (
+                physical_edge.channel != grouped_edge.channel
+                or physical_edge.point_index != grouped_edge.point_index
+                or physical_edge.trigger_ordinal != grouped_edge.trigger_ordinal
+                or physical_edge.point_trigger_ordinal
+                != grouped_edge.point_trigger_ordinal
+            ):
+                raise RuntimeError("source and physical trigger order differ")
+            edges.append(
+                replace(
+                    physical_edge,
+                    loop_iteration=grouped_edge.loop_iteration,
+                )
+            )
+        joined.append(
+            DigitalTriggerSchedule(
+                physical_schedule.channel,
+                tuple(edges),
+                physical_schedule.point_count,
+                grouped_schedule.loop_count,
+                grouped_schedule.full_point_loop,
+            )
+        )
+    return tuple(joined)
 
 
 def _compile_static(

@@ -93,6 +93,62 @@ def count_trigger_pulses(
     return base_count * int(sequence.repeat_count)
 
 
+def trigger_pulse_offsets(
+    sequence: PulseSequence,
+    *,
+    trigger_channels: "Sequence[str] | None" = None,
+) -> tuple[float, ...]:
+    """Return every finite capture-edge offset in authoritative playback order.
+
+    Legacy :class:`PulseSequence` exposes ``effective_pulses()`` while the
+    pulse-owned virtual playback projection deliberately exposes only its
+    already-expanded ``base_pulses()``.  This camera-owned adapter seam accepts
+    both without teaching a camera backend either pulse representation.
+    """
+
+    if bool(getattr(sequence, "repeat_forever", False)):
+        raise ValueError("an unbounded pulse train has no finite trigger schedule")
+    channels = set(normalize_trigger_channels(trigger_channels))
+    if not channels:
+        return ()
+    effective = getattr(sequence, "effective_pulses", None)
+    if callable(effective):
+        return tuple(
+            sorted(
+                float(pulse.start)
+                for pulse in effective()
+                if pulse.value and pulse.channel in channels
+            )
+        )
+    base = tuple(sequence.base_pulses())
+    repeats = int(getattr(sequence, "repeat_count", 1))
+    if repeats < 1:
+        raise ValueError("pulse repeat_count must be positive")
+    base_offsets = tuple(
+        sorted(
+            float(pulse.start)
+            for pulse in base
+            if pulse.value and pulse.channel in channels
+        )
+    )
+    if repeats == 1 or not base_offsets:
+        return base_offsets
+    repeat_period = getattr(sequence, "repeat_period", None)
+    if repeat_period is None:
+        repeat_period = max(
+            (float(pulse.start) + float(pulse.duration) for pulse in base),
+            default=0.0,
+        )
+    period = float(repeat_period)
+    if period <= 0.0:
+        raise ValueError("repeated pulse playback requires a positive period")
+    return tuple(
+        offset + repeat * period
+        for repeat in range(repeats)
+        for offset in base_offsets
+    )
+
+
 def base_cycle_camera_trigger_pulses(camera, sequence: PulseSequence) -> int:
     """:func:`base_cycle_trigger_pulses` on ``camera``'s own counting line(s) -- the one-call
     spelling of "how many windows does ONE base cycle image through THIS camera"."""
@@ -107,12 +163,23 @@ def count_camera_trigger_pulses(camera, sequence: PulseSequence) -> int:
         sequence, trigger_channels=resolve_camera_trigger_channels(camera))
 
 
+def camera_trigger_pulse_offsets(camera, sequence: PulseSequence) -> tuple[float, ...]:
+    """Finite capture-edge offsets on ``camera``'s declared trigger line."""
+
+    return trigger_pulse_offsets(
+        sequence,
+        trigger_channels=resolve_camera_trigger_channels(camera),
+    )
+
+
 __all__ = [
     "DEFAULT_CAMERA_TRIGGER_CHANNELS",
     "base_cycle_camera_trigger_pulses",
     "base_cycle_trigger_pulses",
+    "camera_trigger_pulse_offsets",
     "count_camera_trigger_pulses",
     "count_trigger_pulses",
     "normalize_trigger_channels",
     "resolve_camera_trigger_channels",
+    "trigger_pulse_offsets",
 ]

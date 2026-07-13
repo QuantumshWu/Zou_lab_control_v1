@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from math import cos, radians, sin, sqrt
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Iterator, Mapping, Sequence
 import threading
 import time
 
@@ -24,12 +25,14 @@ from Zou_lab_control._readout_math import normal_cdf
 from ..core.utils import site_index
 from ..ports import PortCatalog, PortSpec, coerce_port_catalog
 from .base import (
-    ROI_CLEAR_SENTINELS, SOFTWARE_TRIGGER, CameraDevice, DeviceProperty, LaserDevice, RFSourceDevice,
-    SequencerDevice, TrapArrayDevice, snap_subarray)
+    ROI_CLEAR_SENTINELS, SOFTWARE_TRIGGER, AcquisitionCancelled, CameraDevice,
+    DeviceProperty, LaserDevice, RFSourceDevice, SequencerDevice, TrapArrayDevice,
+    snap_subarray)
 from .camera_trigger import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
     base_cycle_camera_trigger_pulses,
     base_cycle_trigger_pulses,
+    camera_trigger_pulse_offsets,
     count_camera_trigger_pulses,
     normalize_trigger_channels,
 )
@@ -738,8 +741,8 @@ class VirtualTrapArray(TrapArrayDevice):
         self.occupancy = self.occupancy & survive
         return self.occupancy.copy()
 
-    def image_frames(self, sequence, frames: int, *, capture_trigger_channels, exposure: float,
-                     all_sites: bool = False) -> list[np.ndarray]:
+    def iter_image_frames(self, sequence, frames: int, *, capture_trigger_channels, exposure: float,
+                          all_sites: bool = False) -> Iterator[np.ndarray]:
         """The virtual 'physical world': evolve THIS atom array under the fired ``sequence`` and
         render the ``frames`` camera images its capture triggers gate.
 
@@ -754,7 +757,7 @@ class VirtualTrapArray(TrapArrayDevice):
         frames = positive_int(frames, "frames")
         trig = normalize_trigger_channels(capture_trigger_channels)
         if sequence is None:
-            return []
+            return
         # How many camera-trigger windows does ONE base cycle carry on this camera's line?  The
         # ONE authoritative "does/how much does this pulse trigger the camera" reading
         # (camera_trigger.base_cycle_trigger_pulses: rising edges only -- ``pulse.value`` -- on
@@ -770,7 +773,7 @@ class VirtualTrapArray(TrapArrayDevice):
         # parsed against the camera's trigger line, defaulting to independent re-loads when the
         # bound pulse carries no trigger of its own.
         if getattr(sequence, "repeat_forever", False) and base_windows <= 0:
-            return []
+            return
         probe_set = self.probe_channels
         exposures = exposures_per_frame(sequence, frames, default=exposure,
                                         trigger_channels=trig, probe_channels=probe_set)
@@ -792,61 +795,72 @@ class VirtualTrapArray(TrapArrayDevice):
             trigger_channels=trig,
             trap_channels=self.trap_channels,
         )
-        # Does ONE BASE CYCLE carry a camera-trigger window for EVERY frame?  If so this shot is a
-        # single-loading BRACKET -- a release-recapture bracket (2 windows around a readout) or a
-        # long-short-long imaging bracket (3 windows) -- and the SAME atoms are imaged through each
-        # window (a mid-cycle cooling phase RE-COOLS the held atoms), so every frame uses ITS OWN
-        # window's exposure / cooling.  Otherwise the frames come from REPEATS of a SHORTER base cycle:
-        # a ``.repeated(N)`` single-window sitemap / threshold / detect, or a continuous single-window
-        # live monitor -- each frame a FRESH independent loading through the base window.
-        #
-        # The criterion is the BASE-CYCLE window count vs frames -- NOT repeat_count / repeat_forever.
-        # A ``repeat_forever`` imaging bracket (a long-short-long On-Pulse looped live) is STILL a
-        # bracket per cycle, so keying off ``repeat_forever`` collapsed frames 1..n onto window 0 and
-        # EVERY emCCD frame came out at the FIRST window's (long) exposure -- the reported "看不到
-        # long-short-long exposure" bug.  (The raw FIRED trigger total cannot distinguish a repeated
-        # single-trigger from an N-window bracket -- both total N -- but the per-BASE-CYCLE count can:
-        # 1 for the repeated single-trigger, N for the bracket.)
-        single_cycle = base_windows >= frames
-        # A repeated SINGLE-trigger sequence images a fresh independent loading every frame; each
-        # repeat is one base cycle, so every frame's cooling window equals the base cooling
-        # (``cooling_durations[0]``; None when the pulse has no cooling phase -> saturated load).
-        repeated_shot_cooling = cooling_durations[0] if cooling_durations else 0.0
-        # A repeated single-trigger shot images EVERY frame through the SAME one trigger window, so
-        # every frame uses THAT window's exposure -- not the camera-default `exposures_per_frame`
-        # falls back to for frames past the (single) trigger.  Mixing a short window-0 with
-        # default-length repeats skews a per-site threshold learnt across the frames ABOVE the real
-        # readout brightness, so a freshly loaded atom at the readout exposure reads as EMPTY
-        # (release-recapture survival / readout fidelity collapse to 0).  Mirrors repeated_shot_cooling.
-        repeated_shot_exposure = exposures[0] if exposures else float(exposure)
-        images: list[np.ndarray] = []
+        # A physical shot group is explicit in the pulse representation.  A legacy
+        # PulseSequence retains one base cycle, so its per-cycle trigger count is
+        # the group size.  A compiled PulsePlayback is already fully expanded and
+        # therefore carries compiler-minted point/loop trigger groups; using its
+        # flattened rank or total edge count would turn 12 independent 3-window
+        # shots into one 36-window loading.
+        group_sizes_method = getattr(sequence, "trigger_group_sizes", None)
+        if callable(group_sizes_method) and not getattr(
+            sequence, "repeat_forever", False
+        ):
+            group_sizes = tuple(group_sizes_method(tuple(trig)))
+        else:
+            group_size = max(1, int(base_windows))
+            group_sizes = tuple(
+                min(group_size, frames - start)
+                for start in range(0, frames, group_size)
+            )
+        group_starts: set[int] = set()
+        covered = 0
+        for group_size in group_sizes:
+            if group_size < 1:
+                raise RuntimeError("pulse playback contains an empty trigger group")
+            if covered < frames:
+                group_starts.add(covered)
+            covered += int(group_size)
+        if covered < frames:
+            raise RuntimeError(
+                "pulse playback trigger groups do not cover the requested frames"
+            )
         for frame_index in range(frames):
-            frame_exposure = (
-                repeated_shot_exposure if (not single_cycle and frame_index >= 1) else exposures[frame_index])
+            frame_exposure = exposures[frame_index]
+            group_start = frame_index in group_starts
             if not all_sites:
                 cool_dt = cooling_durations[frame_index]
                 trap_off = trap_off_per_frame[frame_index]
                 trap_hold = trap_hold_per_frame[frame_index]
-                if frame_index == 0:
-                    # Each shot starts from a fresh loading -- unless a deterministic test pinned a
-                    # specific occupancy (consume_pin), which this one shot images instead.
-                    if not self.consume_pin():
+                if group_start:
+                    # Every compiler-declared point/loop group starts from a
+                    # fresh physical loading.  A deterministic occupancy pin is
+                    # consumed only by the first group of this finite run.
+                    if frame_index != 0 or not self.consume_pin():
                         self.reload(cooling_duration=(cool_dt if cool_dt > 0.0 else None))
-                elif not single_cycle:
-                    # A repeated single-trigger shot: a fresh independent loading every frame (the same
-                    # base cooling each time), so threshold/scan frames are independent shots -- NOT one
-                    # decaying loading imaged N times.
-                    self.reload(cooling_duration=(repeated_shot_cooling if repeated_shot_cooling > 0.0 else None))
                 elif cool_dt > 0.0:
-                    self.cool(cool_dt)       # mid-cycle cooling re-cools the held single-cycle atoms
+                    self.cool(cool_dt)
                 # Cool THEN release (so heat -> re-cool -> release drops the re-cooled cloud).
                 if trap_off > 0.0:
                     self.apply_recapture_loss(trap_off)
-                # Dark trap-ON hold loses atoms to vacuum collisions; skipped on frame 0 (the load).
-                if trap_hold > 0.0 and frame_index >= 1:
+                # A group's first frame is its newly loaded baseline, not a
+                # continuation of the preceding group's dark hold.
+                if trap_hold > 0.0 and not group_start:
                     self.apply_trap_loss(trap_hold)
-            images.append(self.render_image(exposure=frame_exposure, all_sites=all_sites))
-        return images
+            yield self.render_image(exposure=frame_exposure, all_sites=all_sites)
+
+    def image_frames(self, sequence, frames: int, *, capture_trigger_channels, exposure: float,
+                     all_sites: bool = False) -> list[np.ndarray]:
+        """Materialize a legacy frame list from the bounded streaming source."""
+
+        return list(
+            self.iter_image_frames(
+                sequence,
+                frames,
+                capture_trigger_channels=capture_trigger_channels,
+                exposure=exposure,
+                all_sites=all_sites,
+            )
+        )
 
     def snapshot(self) -> dict[str, object]:
         out = super().snapshot()          # the ``type`` key has ONE producer: BaseDevice.snapshot
@@ -866,6 +880,14 @@ class VirtualTrapArray(TrapArrayDevice):
 
     def close(self) -> None:
         pass
+
+
+class _FiniteDeliveryPhase(Enum):
+    IDLE = "idle"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+    STOPPING = "stopping"
 
 
 class _TriggerWiredCamera(CameraDevice):
@@ -897,14 +919,34 @@ class _TriggerWiredCamera(CameraDevice):
             sequencer.add_fire_listener(self._on_wire_fired)
 
     def close(self) -> None:
-        """Unplug the trigger cable: stop listening to the wired streamer's fires (the mirror of
-        the physical trigger wire being disconnected).  Symmetric with :meth:`_wire_to` -- so a
-        closed camera stops rendering frames on every fire (and does not linger as a fire listener
-        holding a reference).  Concrete cameras override ``close`` for their own teardown but call
-        ``super().close()`` to unwire."""
+        """Stop an active source, then unplug the virtual trigger cable."""
+
         wire = getattr(self, "sequencer", None)
-        if wire is not None and hasattr(wire, "remove_fire_listener"):
-            wire.remove_fire_listener(self._on_wire_fired)
+        try:
+            state = self._recent_state()
+            with state["cond"]:
+                state["_virtual_closed"] = True
+                state["_finite_accepting_fires"] = False
+                state["cond"].notify_all()
+                # CameraDevice.arm owns the acquisition RLock before setting
+                # arming=True.  Closing the acceptance gate and waiting for
+                # that hook to publish armed/failed makes close linearizable
+                # without stealing the arm owner's lock.
+                while state["arming"]:
+                    state["cond"].wait()
+                armed = bool(state["armed"])
+            if armed:
+                self.finish_record_capture()
+            else:
+                # A failed terminal hook clears the common armed flag in its
+                # finally block even when a backend-owned source did not join.
+                # Retry polymorphic source teardown unconditionally: this also
+                # covers a subclass source such as the MOT free-run producer.
+                # Every virtual _disarm hook is idempotent without a source.
+                self._disarm()
+        finally:
+            if wire is not None and hasattr(wire, "remove_fire_listener"):
+                wire.remove_fire_listener(self._on_wire_fired)
 
     @property
     def sleep_scale(self) -> float:
@@ -928,6 +970,11 @@ class _TriggerWiredCamera(CameraDevice):
     def _render_frames(self, sequence, frames: int) -> list[np.ndarray]:
         raise NotImplementedError
 
+    def _iter_render_frames(self, sequence, frames: int) -> Iterator[np.ndarray]:
+        """Yield a finite fire without requiring one total-run frame batch."""
+
+        return iter(self._render_frames(sequence, frames))
+
     def _pace(self, sequence, stop) -> None:
         """Optional per-frame wall-clock pacing for a continuous firing (subclass hook)."""
 
@@ -941,7 +988,18 @@ class _TriggerWiredCamera(CameraDevice):
         # loud-fault check in read_frames only ever sees THIS session's trigger edges.
         state = self._recent_state()
         with state["cond"]:
-            state["_finite_fire_seen"] = False
+            if state.get("_virtual_closed", False):
+                raise RuntimeError("cannot arm a closed virtual camera")
+            previous = state.get("_finite_delivery_thread")
+            if previous is not None and previous.is_alive():
+                raise RuntimeError("previous virtual finite delivery is still running")
+            state["_finite_delivery_thread"] = None
+            state["_finite_delivery_stop"] = None
+            state["_finite_delivery_error"] = None
+            state["_finite_delivery_phase"] = _FiniteDeliveryPhase.IDLE
+            state["_finite_delivery_token"] = object()
+            state["_finite_accepting_fires"] = True
+            state.pop("_finite_pace_until", None)
 
     def _on_wire_fired(self, sequence) -> None:
         # A FINITE fire = the burst of trigger edges this camera's wire carries.  A continuous
@@ -950,14 +1008,12 @@ class _TriggerWiredCamera(CameraDevice):
             return
         state = self._recent_state()
         with state["cond"]:
-            if not state["armed"]:
+            if not state["armed"] or not state.get(
+                "_finite_accepting_fires", False
+            ):
                 return              # an unarmed camera misses the trigger, exactly like hardware
             armed_frames = state["armed_frames"]
-            # Mark that a FINITE fire reached this armed session: read_frames uses this to tell a
-            # genuine trigger DEFICIT (a finite program that under-delivered its edges -> raise,
-            # like the real qCMOS) apart from the frozen live monitor (a continuous/idle wire that
-            # legitimately produced no frame -> return [] and hold the last image).
-            state["_finite_fire_seen"] = True
+            arm_token = state["_finite_delivery_token"]
         # EDGE-FAITHFUL: the number of frames this fire delivers is the number of camera-trigger
         # EDGES the fired program carries on THIS camera's own trigger line -- exactly what a real
         # sensor reads out (one frame per rising edge), never the count the consumer happened to arm
@@ -969,8 +1025,21 @@ class _TriggerWiredCamera(CameraDevice):
         edges = count_camera_trigger_pulses(self, sequence)
         wanted = edges if armed_frames is None else min(int(armed_frames), edges)
         if wanted <= 0:
+            with state["cond"]:
+                if (
+                    state["armed"]
+                    and state.get("_finite_accepting_fires", False)
+                    and state.get("_finite_delivery_token") is arm_token
+                ):
+                    state["_finite_delivery_phase"] = _FiniteDeliveryPhase.DONE
+                    state["cond"].notify_all()
             return
-        self._deliver(self._render_frames(sequence, int(wanted)))
+        trigger_offsets = camera_trigger_pulse_offsets(self, sequence)
+        if len(trigger_offsets) != edges:
+            raise RuntimeError("virtual trigger count and expanded schedule differ")
+        trigger_offsets = trigger_offsets[:wanted]
+        fire_monotonic = time.monotonic()
+        time_scale = self.sleep_scale
         # REAL-TIME pacing of the FINITE readout: on real hardware read_frames() blocks until the
         # triggered exposures have been read out, which takes ~= the fired sequence's play duration
         # (the FPGA plays the pulse in real time, the camera exposes/reads out per trigger edge).
@@ -979,10 +1048,178 @@ class _TriggerWiredCamera(CameraDevice):
         # mirror of the qCMOS wait_capevent block.  Single-sourced with _pace / wait_done / the scan
         # base_dt: per-shot wall-clock = duration * sleep_scale, so sleep_scale=0 (pytest) stamps
         # nothing and the suite stays instant.
-        pace = float(getattr(sequence, "duration", 0.0)) * self.sleep_scale
-        if pace > 0.0:
-            with state["cond"]:
-                state["_finite_pace_until"] = time.monotonic() + pace
+        pace = float(getattr(sequence, "duration", 0.0)) * time_scale
+        with state["cond"]:
+            if (
+                not state["armed"]
+                or not state.get("_finite_accepting_fires", False)
+                or state.get("_finite_delivery_token") is not arm_token
+            ):
+                return
+            previous = state.get("_finite_delivery_thread")
+            if previous is not None and previous.is_alive():
+                raise RuntimeError("virtual camera received overlapping finite fires")
+            token = arm_token
+            stop = threading.Event()
+            state["_finite_delivery_phase"] = _FiniteDeliveryPhase.RUNNING
+            if pace > 0.0:
+                state["_finite_pace_until"] = fire_monotonic + pace
+
+            def deliver_finite_fire() -> None:
+                try:
+                    frames = iter(self._iter_render_frames(sequence, int(wanted)))
+                    for trigger_offset in trigger_offsets:
+                        with state["cond"]:
+                            if time_scale > 0.0:
+                                deadline = (
+                                    fire_monotonic + float(trigger_offset) * time_scale
+                                )
+                                while (
+                                    state["armed"]
+                                    and not stop.is_set()
+                                    and state.get("_finite_delivery_token") is token
+                                ):
+                                    remaining = deadline - time.monotonic()
+                                    if remaining <= 0.0:
+                                        break
+                                    state["cond"].wait(remaining)
+                            else:
+                                # Fast-forward removes physical wall time, not
+                                # the bounded driver ring.  Let the exact drain
+                                # free one slot before advancing simulated time.
+                                while (
+                                    state["armed"]
+                                    and not stop.is_set()
+                                    and state.get("_finite_delivery_token") is token
+                                    and len(state["pending"])
+                                    >= int(state["pending_capacity"])
+                                ):
+                                    state["cond"].wait()
+                            if (
+                                not state["armed"]
+                                or stop.is_set()
+                                or state.get("_finite_delivery_token") is not token
+                            ):
+                                return
+                        try:
+                            frame = next(frames)
+                        except StopIteration as error:
+                            raise RuntimeError(
+                                "virtual camera rendered fewer frames than trigger edges"
+                            ) from error
+                        with state["cond"]:
+                            if (
+                                not state["armed"]
+                                or stop.is_set()
+                                or state.get("_finite_delivery_token") is not token
+                            ):
+                                return
+                            # The condition lock is an RLock.  Holding it across
+                            # this one-frame delivery makes disarm vs. delivery a
+                            # real boundary: no frame can appear after source stop.
+                            # At non-zero time scale a full ring remains a real
+                            # overrun and _deliver fails loudly; only explicit
+                            # fast-forward waits for a host slot above.
+                            self._deliver([frame])
+                    try:
+                        next(frames)
+                    except StopIteration:
+                        pass
+                    else:
+                        raise RuntimeError(
+                            "virtual camera rendered more frames than trigger edges"
+                        )
+                except BaseException as error:
+                    with state["cond"]:
+                        if state.get("_finite_delivery_token") is token:
+                            state["_finite_delivery_error"] = error
+                            state["_finite_delivery_phase"] = (
+                                _FiniteDeliveryPhase.FAILED
+                            )
+                            state["last_terminal_error"] = error
+                            state["cond"].notify_all()
+                finally:
+                    with state["cond"]:
+                        if (
+                            state.get("_finite_delivery_token") is token
+                            and state.get("_finite_delivery_phase")
+                            is _FiniteDeliveryPhase.RUNNING
+                        ):
+                            state["_finite_delivery_phase"] = (
+                                _FiniteDeliveryPhase.DONE
+                            )
+                        state["cond"].notify_all()
+
+            thread = threading.Thread(
+                target=deliver_finite_fire,
+                name=f"zlc-virtual-camera-fire-{id(self):x}",
+                daemon=False,
+            )
+            state["_finite_delivery_stop"] = stop
+            state["_finite_delivery_thread"] = thread
+            try:
+                # Publish and start under one linearization lock.  The worker
+                # can be scheduled immediately but cannot enter its first state
+                # check until this lock is released; disarm therefore sees
+                # either no worker or a genuinely started, joinable worker.
+                thread.start()
+            except BaseException:
+                if state.get("_finite_delivery_thread") is thread:
+                    state["_finite_delivery_thread"] = None
+                    state["_finite_delivery_stop"] = None
+                    state["_finite_delivery_phase"] = _FiniteDeliveryPhase.FAILED
+                    state["cond"].notify_all()
+                raise
+
+    def _disarm(self) -> None:
+        """Stop and join the virtual finite-frame source before terminal ack."""
+
+        state = self._recent_state()
+        with state["cond"]:
+            # Close the arm epoch's fire gate before observing its worker.  No
+            # listener may install a producer after this teardown snapshot.
+            state["_finite_accepting_fires"] = False
+            if state.get("_finite_delivery_phase") is _FiniteDeliveryPhase.RUNNING:
+                state["_finite_delivery_phase"] = _FiniteDeliveryPhase.STOPPING
+            stop = state.get("_finite_delivery_stop")
+            thread = state.get("_finite_delivery_thread")
+            if stop is not None:
+                stop.set()
+            state["cond"].notify_all()
+        if thread is not None and thread is not threading.current_thread():
+            timeout = max(1.0, float(getattr(self, "timeout", 1.0)))
+            thread.join(timeout)
+            if thread.is_alive():
+                error = RuntimeError(
+                    "virtual finite-frame source did not terminate"
+                )
+                with state["cond"]:
+                    # Freeze this failed epoch.  A renderer that eventually
+                    # unwinds carries the old token and cannot publish a frame,
+                    # error, or phase transition into a later arm.
+                    state["_finite_delivery_token"] = object()
+                    state["_finite_delivery_error"] = error
+                    state["_finite_delivery_phase"] = _FiniteDeliveryPhase.FAILED
+                    state["last_terminal_error"] = error
+                    state["cond"].notify_all()
+                raise error
+        elif thread is threading.current_thread():
+            raise RuntimeError(
+                "virtual finite-frame source cannot terminalize its own arm epoch"
+            )
+        with state["cond"]:
+            error = state.get("_finite_delivery_error")
+            state["_finite_delivery_thread"] = None
+            state["_finite_delivery_stop"] = None
+            state["_finite_delivery_phase"] = (
+                _FiniteDeliveryPhase.FAILED
+                if error is not None
+                else _FiniteDeliveryPhase.DONE
+            )
+            state.pop("_finite_pace_until", None)
+            state["cond"].notify_all()
+        if error is not None:
+            raise RuntimeError("virtual finite-frame source failed") from error
 
     def _grab(
         self,
@@ -1001,6 +1238,43 @@ class _TriggerWiredCamera(CameraDevice):
             None if wire is None else wire.firing
         )
         if firing is None:
+            state = self._recent_state()
+            wait_budget = max(
+                0.0,
+                float(self.timeout if timeout is None else timeout),
+            )
+            deadline = time.monotonic() + wait_budget
+            with state["cond"]:
+                if state.get(
+                    "_finite_delivery_phase", _FiniteDeliveryPhase.IDLE
+                ) is not _FiniteDeliveryPhase.IDLE:
+                    while not state["pending"]:
+                        source_error = state["last_terminal_error"]
+                        if source_error is not None:
+                            raise RuntimeError(
+                                "virtual finite-frame source failed"
+                            ) from source_error
+                        if stop is not None and stop.is_set():
+                            raise AcquisitionCancelled(
+                                "virtual camera read cancelled while waiting for a "
+                                "finite trigger frame"
+                            )
+                        phase = state.get(
+                            "_finite_delivery_phase", _FiniteDeliveryPhase.IDLE
+                        )
+                        if phase in {
+                            _FiniteDeliveryPhase.DONE,
+                            _FiniteDeliveryPhase.FAILED,
+                            _FiniteDeliveryPhase.STOPPING,
+                        }:
+                            return False
+                        if not state["armed"]:
+                            return False
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0.0:
+                            return False
+                        state["cond"].wait(min(0.05, remaining))
+                    return True
             if exact:
                 return super()._grab(
                     n,
@@ -1045,9 +1319,9 @@ class _TriggerWiredCamera(CameraDevice):
         ``read_frames(n)`` waits for ``n`` trigger edges and the qCMOS raises ``TimeoutError`` when
         an edge never comes (``qcmos.py``: "qCMOS timed out ... waiting for frame N"); a virtual
         camera that quietly returned a short list would let a trigger/edge DEFICIT pass in
-        simulation that aborts the whole chain on the real sensor.  The armed session's budget is
-        the camera's own ``timeout`` (the L6 knob), scaled by ``sleep_scale`` so a finite deficit is
-        surfaced without a real wall-clock wait under the pytest fast-forward.  A CONTINUOUS live
+        simulation that aborts the whole chain on the real sensor.  The armed session's source-wait
+        budget is the camera's own ``timeout`` (the L6 knob), even when virtual pulse pacing is
+        fast-forwarded, so a wedged renderer cannot create an infinite read.  A CONTINUOUS live
         read (``armed_frames is None``) is unbounded and never raises -- it legitimately returns
         whatever the still-firing wire produced this poll."""
         out = super().read_frames(n, timeout=timeout, stop=stop, **kwargs)
@@ -1055,7 +1329,9 @@ class _TriggerWiredCamera(CameraDevice):
         with state["cond"]:
             until = state.pop("_finite_pace_until", None)   # pop unconditionally: never leak a stale deadline
             armed_frames = state["armed_frames"]
-            finite_fire_seen = bool(state.get("_finite_fire_seen", False))
+            finite_delivery_started = state.get(
+                "_finite_delivery_phase", _FiniteDeliveryPhase.IDLE
+            ) is not _FiniteDeliveryPhase.IDLE
         if out and until is not None:
             wall = until - time.monotonic()
             if wall > 0.0:
@@ -1065,13 +1341,21 @@ class _TriggerWiredCamera(CameraDevice):
         # program under-delivered its camera-trigger edges, so the sensor is still waiting for an edge
         # that never comes -- exactly the condition the real qCMOS raises TimeoutError for.  Fail LOUD
         # (never a silent short list) so a deficit that aborts a real run is caught the same way in
-        # simulation.  The ``_finite_fire_seen`` gate is what separates this from the PASSIVE live
+        # simulation.  The finite-delivery phase gate separates this from the PASSIVE live
         # monitor, whose continuous/idle wire legitimately produces no frame (it never fires a finite
         # program) and must keep returning [] to hold its last image and freeze -- never raise.  The
         # wait budget is the camera's own ``timeout`` (the one L6 knob), reported in ms like the qCMOS
-        # message; scaled by ``sleep_scale`` so the pytest fast-forward (sleep_scale=0) is instant.
-        if armed_frames is not None and finite_fire_seen and len(out) < n:
-            budget_s = float(getattr(self, "timeout", 0.0)) * self.sleep_scale
+        # message.  Virtual pulse pacing may be fast-forwarded, but waiting on a
+        # wedged frame producer is always bounded by the real camera timeout.
+        if armed_frames is not None and finite_delivery_started and len(out) < n:
+            if stop is not None and stop.is_set():
+                raise AcquisitionCancelled(
+                    "virtual camera read cancelled before its finite frame budget completed"
+                )
+            budget_s = max(
+                0.0,
+                float(self.timeout if timeout is None else timeout),
+            )
             raise TimeoutError(
                 f"virtual camera timed out after {budget_s * 1000.0:.0f} ms waiting for frame "
                 f"{len(out)} of {n} (only {len(out)} trigger edge(s) arrived).")
@@ -1138,7 +1422,11 @@ class VirtualCamera(_TriggerWiredCamera):
                 h, w = self.trap_array.image_shape
                 self._roi = snap_subarray(tuple(roi), step=self.subarray_step, max_w=w, max_h=h)
 
-    def _render_frames(self, sequence: PulseSequence | None, frames: int) -> list[np.ndarray]:
+    def _iter_render_frames(
+        self,
+        sequence: PulseSequence | None,
+        frames: int,
+    ) -> Iterator[np.ndarray]:
         # Image what the atoms (the VirtualTrapArray) are doing under the fired pulse.  The
         # pulse-driven physics lives in the ATOM device -- mirroring real hardware where the FPGA
         # outputs drive the atoms and the camera merely images them; the camera owns ONLY its
@@ -1146,21 +1434,26 @@ class VirtualCamera(_TriggerWiredCamera):
         # the trigger wire (a finite fire event, or the continuous firing _grab pulls from) --
         # nothing above the device layer ever hands the camera a pulse.
         frames = positive_int(frames, "frames")
-        images = self.trap_array.image_frames(
+        images = self.trap_array.iter_image_frames(
             sequence, frames,
             capture_trigger_channels=self.effective_trigger_channels,
             exposure=self.exposure,
             all_sites=bool(self.force_all_sites),
         )
-        out: list[np.ndarray] = []
-        for image in images:
-            if self._roi is not None:
-                # crop to the applied sub-array, exactly as a real camera reads out only its ROI
-                x, w, y, h = self._roi
-                image = image[y:y + h, x:x + w]
-            out.append(image)
-        self.last_sequence = None if sequence is None else getattr(sequence, "name", None)
-        return out
+        try:
+            for image in images:
+                if self._roi is not None:
+                    # crop to the applied sub-array, exactly as a real camera reads out only its ROI
+                    x, w, y, h = self._roi
+                    image = image[y:y + h, x:x + w]
+                yield image
+        finally:
+            self.last_sequence = (
+                None if sequence is None else getattr(sequence, "name", None)
+            )
+
+    def _render_frames(self, sequence: PulseSequence | None, frames: int) -> list[np.ndarray]:
+        return list(self._iter_render_frames(sequence, frames))
 
     def _pace(self, sequence, stop) -> None:
         # Block for the trigger cycle's wall-clock when imaging a CONTINUOUS (live) firing, exactly
@@ -1348,7 +1641,11 @@ class VirtualMotCamera(_TriggerWiredCamera):
                 return self._sense_levels(point)
         return self._sense_levels(sequence)
 
-    def _render_at_levels(self, levels: Mapping[str, float], frames: int) -> list[np.ndarray]:
+    def _iter_render_at_levels(
+        self,
+        levels: Mapping[str, float],
+        frames: int,
+    ) -> Iterator[np.ndarray]:
         """THE one rendering core (levels -> efficiency -> spot + noise) BOTH acquisition modes
         share -- free-run and hardware trigger differ only in where ``levels`` come from, never in
         how a frame is made (no forked physics).
@@ -1373,7 +1670,6 @@ class VirtualMotCamera(_TriggerWiredCamera):
         yy, xx = np.mgrid[y0:y1, x0:x1]
         spot = np.exp(-(((xx - cx) / sx) ** 2 + ((yy - cy) / sy) ** 2) / 2.0)
         spot_rate = self.peak_counts * eff * spot            # mean SIGNAL counts inside the window
-        out: list[np.ndarray] = []
         for _k in range(frames):
             frame = self.offset_counts + self._rng.normal(0.0, self.read_noise, size=(h, w))
             frame[y0:y1, x0:x1] += self._rng.poisson(spot_rate)
@@ -1381,21 +1677,31 @@ class VirtualMotCamera(_TriggerWiredCamera):
             if self._roi is not None:
                 x, w_roi, y, h_roi = self._roi
                 frame = frame[y:y + h_roi, x:x + w_roi]
-            out.append(frame)
-        return out
+            yield frame
 
-    def _render_frames(self, sequence: PulseSequence | None, frames: int) -> list[np.ndarray]:
+    def _render_at_levels(self, levels: Mapping[str, float], frames: int) -> list[np.ndarray]:
+        return list(self._iter_render_at_levels(levels, frames))
+
+    def _iter_render_frames(
+        self,
+        sequence: PulseSequence | None,
+        frames: int,
+    ) -> Iterator[np.ndarray]:
         # The HARDWARE-TRIGGER path (edge-gated frames over the wire): a trigger edge exists only
         # when a sequence actually fired pulses -- no fired pulses -> no edge -> no frame, exactly
         # like a real externally-triggered sensor.  (Free-run never gates on this: its frames come
         # from the exposure clock in _grab, through the same _render_at_levels core.)
         frames = positive_int(frames, "frames")
         if sequence is None or not getattr(sequence, "pulses", None):
-            return []
-        out: list[np.ndarray] = []
+            return
         for _ in range(frames):
-            out.extend(self._render_at_levels(self._next_scene_levels(sequence), 1))
-        return out
+            yield from self._iter_render_at_levels(
+                self._next_scene_levels(sequence),
+                1,
+            )
+
+    def _render_frames(self, sequence: PulseSequence | None, frames: int) -> list[np.ndarray]:
+        return list(self._iter_render_frames(sequence, frames))
 
     def _on_wire_fired(self, sequence) -> None:
         # ``Software`` mode ignores its trigger input entirely (the real Basler sets TriggerMode
@@ -1512,11 +1818,7 @@ class VirtualMotCamera(_TriggerWiredCamera):
         return out
 
     def close(self) -> None:
-        # A camera closed (or abandoned) while still armed must not leave the free-run producer
-        # thread rendering 2.3 MP frames at the exposure rate forever -- stop it first (idempotent:
-        # _disarm on an unarmed camera is a no-op), then unplug the trigger cable.
-        self._disarm()
-        super().close()          # unplug the trigger cable (stop rendering on the streamer's fires)
+        super().close()
 
     def stop(self) -> None:
         pass
