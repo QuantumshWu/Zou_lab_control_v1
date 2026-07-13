@@ -9,7 +9,7 @@ by its header.  Invalid or non-finite image components remain invalid data;
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 import math
 from numbers import Integral, Real
@@ -1421,6 +1421,53 @@ def calibration_resource_summary(
     )
 
 
+def calibration_retained_array_nbytes(
+    artifact: CalibrationArtifact,
+) -> int:
+    """Count unique immutable ndarray allocations retained by one artifact.
+
+    The artifact may expose the same allocation through several semantic views
+    (for example a model's validity and its bound feature specification).  The
+    memory owner is the ultimate array buffer, not the number of references, so
+    this traversal counts each live allocation exactly once by identity.  It is
+    intentionally derived from the closed dataclass graph so a future array
+    field cannot be added without automatically entering pipeline admission.
+    """
+
+    if not isinstance(artifact, CalibrationArtifact):
+        raise TypeError("artifact must be CalibrationArtifact")
+    pending: list[object] = [artifact]
+    visited_objects: set[int] = set()
+    allocations: dict[int, int] = {}
+    while pending:
+        value = pending.pop()
+        if isinstance(value, np.ndarray):
+            owner: object = value
+            while isinstance(owner, np.ndarray) and owner.base is not None:
+                owner = owner.base
+            while isinstance(owner, memoryview):
+                owner = owner.obj
+            if isinstance(owner, bytes):
+                allocation_nbytes = len(owner)
+            elif isinstance(owner, np.ndarray):
+                allocation_nbytes = int(owner.nbytes)
+            else:
+                allocation_nbytes = int(value.nbytes)
+            allocations.setdefault(id(owner), allocation_nbytes)
+            continue
+        object_id = id(value)
+        if object_id in visited_objects:
+            continue
+        visited_objects.add(object_id)
+        if isinstance(value, ComponentValidity):
+            pending.append(value.mask)
+        if is_dataclass(value) and not isinstance(value, type):
+            pending.extend(getattr(value, item.name) for item in fields(value))
+        elif isinstance(value, tuple):
+            pending.extend(value)
+    return sum(allocations.values())
+
+
 def validate_calibration_resource_summary(
     summary: CalibrationResourceSummary,
     resource_policy: CalibrationResourcePolicy = DEFAULT_CALIBRATION_RESOURCE_POLICY,
@@ -1910,6 +1957,7 @@ __all__ = [
     "UniformPsfReadoutModel",
     "apply_readout_model",
     "bind_readout_feature_spec",
+    "calibration_retained_array_nbytes",
     "calibration_resource_summary",
     "derive_calibration_source_binding",
     "classify_occupancy",

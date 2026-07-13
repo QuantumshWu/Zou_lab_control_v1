@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass, replace
 import pickle
 import threading
 import time
+import weakref
 
 import numpy as np
 import pytest
@@ -21,6 +23,7 @@ from zlc_data import (
     BlockId,
     ComponentValidity,
     PointLayout,
+    StreamGenerationId,
     INVALID,
     VALID,
     Value,
@@ -50,7 +53,9 @@ from zlc_neutral_atom.readout.calibration import (
     BoxReducer,
     CalibrationResourceExceeded,
     ReadoutModelKind,
+    apply_readout_model,
     bind_readout_feature_spec,
+    calibration_retained_array_nbytes,
     readout_application_scratch_nbytes,
 )
 from zlc_neutral_atom.readout.calibration_repository import (
@@ -69,6 +74,7 @@ from zlc_neutral_atom.readout.contracts import (
 from zlc_neutral_atom.readout.occupancy import (
     BoundOccupancyStreamProcessor,
     OccupancyDatasetEventAdapter,
+    OccupancyDatasetField,
     OccupancyDatasetMetadata,
     OccupancyModelSelection,
     OccupancySample,
@@ -76,6 +82,13 @@ from zlc_neutral_atom.readout.occupancy import (
     OccupancyStreamProcessorSpec,
     bind_occupancy_stream_processor,
     resolve_occupancy_model_selection,
+)
+from zlc_neutral_atom.readout.occupancy_pipeline import (
+    FrozenOccupancyDataset,
+    OccupancyDatasetMaterializerSpec,
+    OccupancyPipelineResult,
+    OccupancyPipelineSpec,
+    compile_occupancy_pipeline,
 )
 from zlc_neutral_atom.runtime import (
     DatasetBuilder,
@@ -86,7 +99,10 @@ from zlc_neutral_atom.runtime import (
     CleanupReport,
     MinimalPipelineSpec,
     PipelineMemoryProfile,
+    PostSafetyContext,
     RunContext,
+    RunCancelled,
+    RunFailed,
     RunMode,
     RunPlan,
 )
@@ -311,6 +327,7 @@ def _source_measurement(
     repeat_count: int = 1,
     point_layout: PointLayout | None = None,
     repeat_axis_id: str = "occupancy-repeat",
+    cell_schedule: tuple[DatasetCellAddress, ...] | None = None,
 ):
     description = trusted.runtime.describe_camera("readout")
     repeat_axis = _axis(repeat_axis_id, REPEAT, repeat_count)
@@ -333,10 +350,14 @@ def _source_measurement(
             if event_settings is None
             else tuple(event_settings)
         )
-    cells = tuple(
-        DatasetCellAddress(repeat, point)
-        for repeat in range(repeat_axis.size)
-        for point in range(layout.storage_size)
+    cells = (
+        tuple(
+            DatasetCellAddress(repeat, point)
+            for repeat in range(repeat_axis.size)
+            for point in range(layout.storage_size)
+        )
+        if cell_schedule is None
+        else tuple(cell_schedule)
     )
     measurement = trusted.runtime.bind_camera_measurement(
         CameraCaptureBindingRequest(
@@ -363,14 +384,45 @@ def _bind(
     if selection is None:
         selection = resolve_occupancy_model_selection(trusted.admitted)
     return bind_occupancy_stream_processor(
-        OccupancyStreamProcessorSpec(
-            calibration=trusted.admitted,
-            readout_binding=ReadoutBindingKey("readout"),
-            model=selection,
-            output_stream_id=StreamId("occupancy.output"),
-            output_source_id="occupancy",
-        ),
+        _processor_spec(trusted, selection=selection),
         session.processor_input_binding,
+    )
+
+
+def _processor_spec(
+    trusted: _TrustedCalibration,
+    *,
+    selection: OccupancyModelSelection | None = None,
+    output_stream_id: str = "occupancy.output",
+    output_source_id: str = "occupancy",
+) -> OccupancyStreamProcessorSpec:
+    if selection is None:
+        selection = resolve_occupancy_model_selection(trusted.admitted)
+    return OccupancyStreamProcessorSpec(
+        calibration=trusted.admitted,
+        readout_binding=ReadoutBindingKey("readout"),
+        model=selection,
+        output_stream_id=StreamId(output_stream_id),
+        output_source_id=output_source_id,
+    )
+
+
+def _occupancy_pipeline_spec(
+    trusted: _TrustedCalibration,
+    measurement,
+    *,
+    memory_limit: int = 256 << 20,
+) -> OccupancyPipelineSpec:
+    return OccupancyPipelineSpec(
+        name="typed camera to occupancy",
+        measurement=measurement,
+        processor=_processor_spec(trusted),
+        materializer=OccupancyDatasetMaterializerSpec(
+            BlockId("occupancy-counts"),
+            BlockId("occupancy-occupied"),
+            PipelineMemoryProfile.for_current_runtime(memory_limit),
+        ),
+        timeout_seconds=12.0,
     )
 
 
@@ -489,6 +541,52 @@ def test_bind_requires_admitted_calibration_and_freezes_default_model(trusted_ca
             ),
             session.processor_input_binding,
         )
+
+
+def test_calibration_memory_owner_counts_every_unique_array(trusted_calibration):
+    artifact = trusted_calibration.admitted.artifact
+    arrays = [artifact.site_map.coordinates_xy, artifact.site_map.validity.mask]
+    quality_fields = (
+        "dark_training_sample_counts",
+        "bright_training_sample_counts",
+        "held_out_dark_success_counts",
+        "held_out_dark_total_counts",
+        "held_out_bright_success_counts",
+        "held_out_bright_total_counts",
+        "held_out_dark_accuracy_lower_bounds",
+        "held_out_bright_accuracy_lower_bounds",
+        "held_out_fidelity",
+    )
+    for model in artifact.models:
+        header = model.header
+        arrays.extend(
+            (
+                header.thresholds,
+                header.occupied_above_thresholds,
+                header.quality.usable_sites.mask,
+                header.quality.held_out_validity.mask,
+                model.boxes_xywh,
+            )
+        )
+        arrays.extend(getattr(header.quality, name) for name in quality_fields)
+        if hasattr(model, "kernels"):
+            arrays.append(model.kernels)
+        if hasattr(model, "kernel"):
+            arrays.append(model.kernel)
+
+    allocations = {}
+    for array in arrays:
+        owner = array
+        while isinstance(owner, np.ndarray) and owner.base is not None:
+            owner = owner.base
+        while isinstance(owner, memoryview):
+            owner = owner.obj
+        allocations.setdefault(
+            id(owner),
+            len(owner) if isinstance(owner, bytes) else int(array.nbytes),
+        )
+
+    assert calibration_retained_array_nbytes(artifact) == sum(allocations.values())
 
 
 def test_reusable_processor_spec_binds_each_capture_session_generation(
@@ -1187,12 +1285,436 @@ def test_real_exact_worker_materializes_both_fields_by_frozen_cell_schedule(
         )
 
 
+def test_compiled_occupancy_pipeline_returns_two_coherent_standard_snapshots(
+    trusted_calibration,
+):
+    repeats = 2
+    points = 3
+    layout = PointLayout.explicit((points,), ((2,), (0,), (1,)))
+    event_schedule = (
+        DatasetCellAddress(0, 2),
+        DatasetCellAddress(1, 0),
+        DatasetCellAddress(0, 0),
+        DatasetCellAddress(1, 2),
+        DatasetCellAddress(0, 1),
+        DatasetCellAddress(1, 1),
+    )
+    measurement = _source_measurement(
+        trusted_calibration,
+        points=points,
+        repeat_count=repeats,
+        point_layout=layout,
+        cell_schedule=event_schedule,
+    )
+    spec = _occupancy_pipeline_spec(trusted_calibration, measurement)
+    events = measurement.capture_contract.total_events
+    frames = []
+    for ordinal in range(events):
+        image = np.array(_frame(ordinal, 1, 0), copy=True)
+        x, y = _CENTERS[0]
+        site = image[y - 1 : y + 2, x - 1 : x + 2].astype(np.uint32)
+        image[y - 1 : y + 2, x - 1 : x + 2] = (
+            site + ordinal * 11
+        ).astype(np.uint16)
+        frames.append(image)
+    source_thread, source_failures = _deliver_when_armed(
+        trusted_calibration.camera,
+        frames,
+    )
+    try:
+        result = trusted_calibration.runtime.controller.start(
+            compile_occupancy_pipeline(spec)
+        ).result(15.0)
+    finally:
+        if source_thread.is_alive():
+            trusted_calibration.camera.finish_record_capture()
+        source_thread.join(3.0)
+
+    assert source_failures == []
+    assert not source_thread.is_alive()
+    assert isinstance(result, OccupancyPipelineResult)
+    assert isinstance(result.dataset, FrozenOccupancyDataset)
+    assert result.aggregate_peak_bytes <= (
+        spec.materializer.memory.memory_limit_bytes
+    )
+    assert result.source_dataset_schema is measurement.capture_contract.dataset_schema
+    assert not hasattr(result, "pipeline")
+    assert result.capture_terminal.produced_count == events
+    assert result.terminal_provenance.generation == (
+        result.dataset.counts.ref.stream_generation
+    )
+    assert result.model_selection == spec.processor.model
+    assert result.calibration_reference == trusted_calibration.calibration_ref
+    assert result.calibration_admission_evidence_digest == (
+        trusted_calibration.admitted.evidence_digest
+    )
+    assert result.processor_binding_digest == (
+        result.terminal_provenance.derivation.stages[0].processor_binding_digest
+    )
+    with pytest.raises(TypeError, match="process-local"):
+        pickle.dumps(result)
+    with pytest.raises(TypeError, match="process-local"):
+        pickle.dumps(result.dataset)
+    with pytest.raises(AttributeError, match="immutable"):
+        result.run_id = "forged-run"
+    with pytest.raises(PermissionError, match="occupancy finalization"):
+        FrozenOccupancyDataset(
+            None,
+            counts=result.dataset.counts,
+            occupied=result.dataset.occupied,
+            source_metadata=result.dataset.source_metadata_in_event_order,
+            cell_schedule=result.dataset.cell_schedule,
+        )
+    with pytest.raises(PermissionError, match="compiler"):
+        OccupancyPipelineResult(
+            None,
+            pipeline=object(),
+            dataset=result.dataset,
+            bound=object(),
+        )
+    assert result.dataset.counts is result.dataset.field(OccupancyDatasetField.COUNTS)
+    assert result.dataset.occupied is result.dataset.field(
+        OccupancyDatasetField.OCCUPIED
+    )
+    assert result.dataset.counts.ref.block_id == spec.materializer.counts_block_id
+    assert result.dataset.occupied.ref.block_id == spec.materializer.occupied_block_id
+    assert result.dataset.counts.ref.stream_generation == (
+        result.dataset.occupied.ref.stream_generation
+    )
+    assert result.dataset.counts.block.schema.point_layout == layout
+    assert result.dataset.occupied.block.schema.point_layout == layout
+    assert result.dataset.counts.block.values.shape == (repeats, points, 4)
+    assert result.dataset.occupied.block.values.shape == (repeats, points, 4)
+    assert result.dataset.counts.block.values.dtype == np.dtype("<f8")
+    assert result.dataset.occupied.block.values.dtype == np.dtype(bool)
+    assert result.dataset.cell_schedule == measurement.capture_contract.expected_cells
+    assert tuple(
+        item.source_ordinal
+        for item in result.dataset.source_metadata_in_event_order
+    ) == tuple(range(events))
+    assert result.dataset.events == tuple(
+        zip(
+            result.dataset.cell_schedule,
+            result.dataset.source_metadata_in_event_order,
+            strict=True,
+        )
+    )
+
+    model = trusted_calibration.admitted.artifact.select_model(
+        model_id=spec.processor.model.model_id
+    )
+    artifact = trusted_calibration.admitted.artifact
+    frame_schema = measurement.capture_contract.dataset_schema.cell_schema
+    expected_counts = tuple(
+        apply_readout_model(
+            model,
+            frame_contract=artifact.frame_contract,
+            site_map=artifact.site_map,
+            frame=Value(frame, VALID, frame_schema),
+        ).signals.values
+        for frame in frames
+    )
+    assert len({float(values[0]) for values in expected_counts}) == events
+    counts = result.dataset.counts.block
+    occupied = result.dataset.occupied.block
+    assert isinstance(counts.validity, ComponentValidity)
+    assert isinstance(occupied.validity, ComponentValidity)
+    assert counts.validity is occupied.validity
+    for ordinal, ((cell, metadata), expected) in enumerate(
+        zip(result.dataset.events, expected_counts, strict=True)
+    ):
+        assert metadata.source_ordinal == ordinal
+        location = (cell.repeat_index, cell.point_storage_index)
+        np.testing.assert_allclose(counts.values[location], expected)
+    for cell in result.dataset.cell_schedule:
+        location = (cell.repeat_index, cell.point_storage_index)
+        np.testing.assert_array_equal(
+            counts.validity.mask[location],
+            occupied.validity.mask[location],
+        )
+        valid = counts.validity.mask[location]
+        expected = np.zeros(valid.shape, dtype=bool)
+        above = valid & model.header.occupied_above_thresholds
+        below = valid & ~model.header.occupied_above_thresholds
+        expected[above] = counts.values[location][above] > model.header.thresholds[above]
+        expected[below] = counts.values[location][below] < model.header.thresholds[below]
+        np.testing.assert_array_equal(occupied.values[location], expected)
+
+
+def test_occupancy_pipeline_memory_rejects_before_camera_prepare(
+    trusted_calibration,
+):
+    measurement = _source_measurement(trusted_calibration, points=1)
+    state = trusted_calibration.camera._recent_state()
+    with state["cond"]:
+        assert not state["armed"]
+    handle = trusted_calibration.runtime.controller.start(
+        compile_occupancy_pipeline(
+            _occupancy_pipeline_spec(
+                trusted_calibration,
+                measurement,
+                memory_limit=1,
+            )
+        )
+    )
+    with pytest.raises(RunFailed) as failure:
+        handle.result(5.0)
+    assert failure.value.primary is not None
+    assert failure.value.primary.original_type == "MemoryError"
+    assert failure.value.primary.__traceback__ is None
+    assert tuple(
+        note
+        for note in getattr(failure.value.primary, "__notes__", ())
+        if note.startswith("detached run traceback: ")
+    )
+    assert not any(
+        "teardown" in note.lower()
+        for note in getattr(failure.value.primary, "__notes__", ())
+    )
+    with state["cond"]:
+        assert not state["armed"]
+
+
+def test_occupancy_pipeline_admits_retained_calibration_memory_before_prepare(
+    trusted_calibration,
+    monkeypatch,
+):
+    import zlc_neutral_atom.readout.occupancy_pipeline as occupancy_pipeline
+
+    measurement = _source_measurement(trusted_calibration, points=1)
+    state = trusted_calibration.camera._recent_state()
+    with state["cond"]:
+        assert not state["armed"]
+    monkeypatch.setattr(
+        occupancy_pipeline,
+        "calibration_retained_array_nbytes",
+        lambda _artifact: 1 << 40,
+    )
+    handle = trusted_calibration.runtime.controller.start(
+        compile_occupancy_pipeline(
+            _occupancy_pipeline_spec(
+                trusted_calibration,
+                measurement,
+                memory_limit=256 << 20,
+            )
+        )
+    )
+    with pytest.raises(RunFailed) as failure:
+        handle.result(5.0)
+
+    assert failure.value.primary is not None
+    assert failure.value.primary.original_type == "MemoryError"
+    with state["cond"]:
+        assert not state["armed"]
+
+
+def test_occupancy_pipeline_spec_and_plan_are_reusable_across_runs(
+    trusted_calibration,
+):
+    measurement = _source_measurement(trusted_calibration, points=2)
+    plan = compile_occupancy_pipeline(
+        _occupancy_pipeline_spec(trusted_calibration, measurement)
+    )
+    results = []
+    for run_index in range(2):
+        source_thread, source_failures = _deliver_when_armed(
+            trusted_calibration.camera,
+            [_frame(run_index, event, run_index) for event in range(2)],
+        )
+        try:
+            result = trusted_calibration.runtime.controller.start(plan).result(15.0)
+        finally:
+            if source_thread.is_alive():
+                trusted_calibration.camera.finish_record_capture()
+            source_thread.join(3.0)
+        assert source_failures == []
+        assert not source_thread.is_alive()
+        results.append(result)
+
+    assert results[0].run_id != results[1].run_id
+    assert (
+        results[0].dataset.counts.ref.stream_generation
+        != results[1].dataset.counts.ref.stream_generation
+    )
+
+
+def test_occupancy_pipeline_releases_live_graph_without_cyclic_gc(
+    trusted_calibration,
+):
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        measurement = _source_measurement(trusted_calibration, points=1)
+        base = compile_occupancy_pipeline(
+            _occupancy_pipeline_spec(trusted_calibration, measurement)
+        )
+        references = {}
+        original_preflight = base.preflight
+
+        def observed_preflight(context):
+            prepared = original_preflight(context)
+            worker = prepared.worker
+            assert worker is not None
+            builder = worker._output_sink._builder
+            references.update(
+                session=weakref.ref(prepared.session),
+                worker=weakref.ref(worker),
+                builder=weakref.ref(builder),
+            )
+            return prepared
+
+        plan = replace(base, preflight=observed_preflight)
+        source_thread, source_failures = _deliver_when_armed(
+            trusted_calibration.camera,
+            [_frame(0, 0, 0)],
+        )
+        try:
+            result = trusted_calibration.runtime.controller.start(plan).result(15.0)
+        finally:
+            if source_thread.is_alive():
+                trusted_calibration.camera.finish_record_capture()
+            source_thread.join(3.0)
+
+        assert isinstance(result, OccupancyPipelineResult)
+        assert source_failures == []
+        assert all(reference() is None for reference in references.values())
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def test_occupancy_finalizer_checkpoints_each_event(
+    trusted_calibration,
+    monkeypatch,
+):
+    measurement = _source_measurement(trusted_calibration, points=4)
+    plan = compile_occupancy_pipeline(
+        _occupancy_pipeline_spec(trusted_calibration, measurement)
+    )
+    original_checkpoint = PostSafetyContext.checkpoint
+    calls = []
+
+    def cancelling_checkpoint(context):
+        calls.append(len(calls))
+        if len(calls) == 3:
+            context.cancellation.request("cancel occupancy finalization")
+        return original_checkpoint(context)
+
+    monkeypatch.setattr(PostSafetyContext, "checkpoint", cancelling_checkpoint)
+    source_thread, source_failures = _deliver_when_armed(
+        trusted_calibration.camera,
+        [_frame(0, event, 0) for event in range(4)],
+    )
+    try:
+        handle = trusted_calibration.runtime.controller.start(plan)
+        with pytest.raises((RunCancelled, RunFailed)):
+            handle.result(15.0)
+    finally:
+        if source_thread.is_alive():
+            trusted_calibration.camera.finish_record_capture()
+        source_thread.join(3.0)
+
+    assert source_failures == []
+    assert len(calls) == 3
+
+
+def test_occupancy_finalizer_rejects_source_metadata_not_proven_by_camera(
+    trusted_calibration,
+):
+    measurement = _source_measurement(trusted_calibration, points=2)
+    plan = compile_occupancy_pipeline(
+        _occupancy_pipeline_spec(trusted_calibration, measurement)
+    )
+    trusted_finalize = plan.finalize
+
+    def tampering_finalize(context, executed):
+        terminal = executed.pipeline.dataset
+        metadata = terminal.event_metadata
+        first = metadata[0]
+        assert isinstance(first, OccupancyDatasetMetadata)
+        forged_source = replace(
+            first.source_metadata,
+            correlation_id="forged-processor-source-metadata",
+        )
+        object.__setattr__(
+            terminal,
+            "_event_metadata",
+            (replace(first, source_metadata=forged_source), *metadata[1:]),
+        )
+        return trusted_finalize(context, executed)
+
+    source_thread, source_failures = _deliver_when_armed(
+        trusted_calibration.camera,
+        [_frame(0, event, 0) for event in range(2)],
+    )
+    try:
+        handle = trusted_calibration.runtime.controller.start(
+            replace(plan, finalize=tampering_finalize)
+        )
+        with pytest.raises(RunFailed) as failure:
+            handle.result(15.0)
+    finally:
+        if source_thread.is_alive():
+            trusted_calibration.camera.finish_record_capture()
+        source_thread.join(3.0)
+
+    assert source_failures == []
+    assert failure.value.primary is not None
+    assert failure.value.primary.original_type == "RuntimeError"
+    assert "source metadata differs from physical capture" in str(
+        failure.value.primary
+    )
+
+
+def test_occupancy_finalizer_rejects_terminal_ref_generation_mismatch(
+    trusted_calibration,
+):
+    measurement = _source_measurement(trusted_calibration, points=1)
+    plan = compile_occupancy_pipeline(
+        _occupancy_pipeline_spec(trusted_calibration, measurement)
+    )
+    trusted_finalize = plan.finalize
+
+    def tampering_finalize(context, executed):
+        terminal = executed.pipeline.dataset
+        object.__setattr__(
+            terminal,
+            "_provenance",
+            replace(
+                terminal.provenance,
+                generation=StreamGenerationId("forged-occupancy-generation"),
+            ),
+        )
+        return trusted_finalize(context, executed)
+
+    source_thread, source_failures = _deliver_when_armed(
+        trusted_calibration.camera,
+        [_frame(0, 0, 0)],
+    )
+    try:
+        handle = trusted_calibration.runtime.controller.start(
+            replace(plan, finalize=tampering_finalize)
+        )
+        with pytest.raises(RunFailed) as failure:
+            handle.result(15.0)
+    finally:
+        if source_thread.is_alive():
+            trusted_calibration.camera.finish_record_capture()
+        source_thread.join(3.0)
+
+    assert source_failures == []
+    assert failure.value.primary is not None
+    assert failure.value.primary.original_type == "RuntimeError"
+    assert "ref generation differs from provenance" in str(failure.value.primary)
+
+
 def test_contract_rejects_divergent_validity_and_noncanonical_invalid_fillers(
     trusted_calibration,
 ):
     session = _source_session(trusted_calibration, points=1)
     bundle = _bind(trusted_calibration, session)
     contract = bundle.output_payload_contract
+    assert contract.finalization_scratch_nbytes == 32 * 4
     site_axis = contract.occupied_schema.data_axes[0]
     validity = ComponentValidity(
         (site_axis.axis_id,),

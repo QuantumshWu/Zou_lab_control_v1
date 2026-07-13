@@ -279,6 +279,16 @@ class OccupancySampleContract:
             + self.metadata_contract.max_retained_nbytes
         )
 
+    @property
+    def finalization_scratch_nbytes(self) -> int:
+        """Conservative NumPy workspace for one digest/semantic recheck."""
+
+        site_count = self.counts_schema.data_axes[0].size
+        # The widest simultaneous path is float64 canonicalization plus
+        # component-mask expansion and boolean semantic checks.  Thirty-two
+        # bytes per site conservatively covers those serial temporaries.
+        return 32 * int(site_count)
+
     def snapshot(self, payload: OccupancySample) -> OccupancySample:
         self.validate(payload)
         return payload
@@ -1024,6 +1034,13 @@ class BoundOccupancyStreamProcessor:
                 "output_schedule": self._output_edge.schedule_digest,
             }
         )
+
+    @property
+    def processor_binding_digest(self) -> str:
+        """Exact processor-stage identity recorded in runtime derivation."""
+
+        self._validate_identity()
+        return self._processor.fingerprint
 
     @property
     def artifact_inputs(self) -> tuple[ArtifactInputRef, ...]:
