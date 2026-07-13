@@ -365,7 +365,7 @@ def _admitted_calibration_evidence_digest(
                     "target": {
                         "repository_id": target.repository_id,
                         "artifact_kind": target.artifact_kind,
-                        "schema_version": target.schema_version,
+                        "artifact_format": target.artifact_format,
                         "target_ref": target.target_ref,
                         "expected_manifest_digest": (
                             target.expected_manifest_digest
@@ -1310,7 +1310,7 @@ class CalibrationRepository:
             intent.kind is not CommitKind.FINAL
             or target.repository_id != self.repository_id
             or target.artifact_kind != "calibration"
-            or target.schema_version != CALIBRATION_MANIFEST_SCHEMA
+            or target.artifact_format != CALIBRATION_MANIFEST_SCHEMA
             or not target.target_ref.startswith(prefix)
         ):
             raise ValueError("commit intent is not a CalibrationArtifact target")

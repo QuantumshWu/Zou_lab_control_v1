@@ -99,7 +99,7 @@ def test_capture_checkpoint_publishes_typed_artifact_without_finalizing_run(
     assert snapshot.committed_checkpoint.target == target
     assert target.repository_id == repository.repository_id
     assert target.artifact_kind == "capture"
-    assert target.schema_version == CAPTURE_ARTIFACT_SCHEMA
+    assert target.artifact_format == CAPTURE_ARTIFACT_SCHEMA
     assert target.target_ref == reference.target_ref
     assert target.expected_manifest_digest == reference.manifest_digest
     assert operation.commit_id == (

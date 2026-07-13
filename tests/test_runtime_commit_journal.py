@@ -46,7 +46,7 @@ def intent(commit_id: str) -> CommitIntent:
         target=CommitTarget(
             repository_id=REPOSITORY_ID,
             artifact_kind="test-artifact",
-            schema_version="1",
+            artifact_format="tests.Artifact",
             target_ref=f"artifacts/{commit_id}",
             expected_manifest_digest="0" * 64,
         ),

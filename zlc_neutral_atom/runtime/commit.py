@@ -44,14 +44,14 @@ class CommitSubject:
 class CommitTarget:
     repository_id: str
     artifact_kind: str
-    schema_version: str
+    artifact_format: str
     target_ref: str
     expected_manifest_digest: str
 
     def __post_init__(self) -> None:
         _canonical(self.repository_id, "repository_id")
         _canonical(self.artifact_kind, "artifact_kind")
-        _canonical(self.schema_version, "schema_version")
+        _canonical(self.artifact_format, "artifact_format")
         _canonical(self.target_ref, "target_ref")
         _sha256(self.expected_manifest_digest, "expected_manifest_digest")
 
@@ -744,7 +744,7 @@ class PersistentCommitJournal:
             "target": {
                 "repository_id": intent.target.repository_id,
                 "artifact_kind": intent.target.artifact_kind,
-                "schema_version": intent.target.schema_version,
+                "artifact_format": intent.target.artifact_format,
                 "target_ref": intent.target.target_ref,
                 "expected_manifest_digest": intent.target.expected_manifest_digest,
             },
@@ -878,7 +878,7 @@ class PersistentCommitJournal:
                 if not isinstance(target, dict) or set(target) != {
                     "repository_id",
                     "artifact_kind",
-                    "schema_version",
+                    "artifact_format",
                     "target_ref",
                     "expected_manifest_digest",
                 }:

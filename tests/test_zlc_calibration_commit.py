@@ -311,7 +311,7 @@ def _append_pending_intent(root, intent: CommitIntent) -> None:
             "target": {
                 "repository_id": intent.target.repository_id,
                 "artifact_kind": intent.target.artifact_kind,
-                "schema_version": intent.target.schema_version,
+                "artifact_format": intent.target.artifact_format,
                 "target_ref": intent.target.target_ref,
                 "expected_manifest_digest": (
                     intent.target.expected_manifest_digest

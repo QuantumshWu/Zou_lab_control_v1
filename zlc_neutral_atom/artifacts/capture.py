@@ -1118,7 +1118,7 @@ class CaptureRepository:
                         "target": {
                             "repository_id": selected.target.repository_id,
                             "artifact_kind": selected.target.artifact_kind,
-                            "schema_version": selected.target.schema_version,
+                            "artifact_format": selected.target.artifact_format,
                             "target_ref": selected.target.target_ref,
                             "expected_manifest_digest": (
                                 selected.target.expected_manifest_digest
@@ -1274,7 +1274,7 @@ class CaptureRepository:
         if (
             target.repository_id != repository_id
             or target.artifact_kind != "capture"
-            or target.schema_version != CAPTURE_ARTIFACT_SCHEMA
+            or target.artifact_format != CAPTURE_ARTIFACT_SCHEMA
             or not target.target_ref.startswith(prefix)
         ):
             raise ValueError("commit intent is not a CaptureArtifact target")

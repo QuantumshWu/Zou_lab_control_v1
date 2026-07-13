@@ -134,7 +134,7 @@ def commit(
     target = CommitTarget(
         repository_id="test-repository",
         artifact_kind="test-artifact",
-        schema_version="1",
+        artifact_format="tests.Artifact",
         target_ref=f"artifacts/{commit_id}",
         expected_manifest_digest="0" * 64,
     )
@@ -178,7 +178,7 @@ def checkpoint_commit(
     target = CommitTarget(
         repository_id="test-repository",
         artifact_kind="test-checkpoint",
-        schema_version="1",
+        artifact_format="tests.Artifact",
         target_ref=f"artifacts/{commit_id}",
         expected_manifest_digest="0" * 64,
     )
@@ -2981,7 +2981,7 @@ def test_publish_digest_must_match_repository_commit_target():
     target = CommitTarget(
         repository_id="test-repository",
         artifact_kind="test-artifact",
-        schema_version="1",
+        artifact_format="tests.Artifact",
         target_ref="artifacts/digest-mismatch",
         expected_manifest_digest="0" * 64,
     )
@@ -3037,7 +3037,7 @@ def test_wrong_digest_remains_force_abort_after_abort_marker_failure():
     target = CommitTarget(
         repository_id="test-repository",
         artifact_kind="test-artifact",
-        schema_version="1",
+        artifact_format="tests.Artifact",
         target_ref="artifacts/wrong-digest-marker-failure",
         expected_manifest_digest="0" * 64,
     )
@@ -3277,7 +3277,7 @@ def test_commit_authority_is_single_use_and_bound_to_its_minting_run():
     target = CommitTarget(
         repository_id="test-repository",
         artifact_kind="test-artifact",
-        schema_version="1",
+        artifact_format="tests.Artifact",
         target_ref="artifacts/single-use-authority",
         expected_manifest_digest="0" * 64,
     )
@@ -3336,7 +3336,7 @@ def test_final_commit_must_reference_this_runs_safety_bundle():
         target = CommitTarget(
             repository_id="test-repository",
             artifact_kind="test-artifact",
-            schema_version="1",
+            artifact_format="tests.Artifact",
             target_ref="artifacts/wrong-safety-bundle-commit",
             expected_manifest_digest="0" * 64,
         )
