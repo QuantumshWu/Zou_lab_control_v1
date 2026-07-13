@@ -670,7 +670,7 @@ class BoundStreamProcessor:
         ):
             if getattr(contract, "fingerprint", None) != expected:
                 raise ValueError(f"{name} fingerprint differs from definition")
-            for member in ("snapshot", "validate", "retained_nbytes"):
+            for member in ("snapshot", "validate", "retained_nbytes", "digest"):
                 if not callable(getattr(contract, member, None)):
                     raise TypeError(f"{name}.{member} must be callable")
         if (

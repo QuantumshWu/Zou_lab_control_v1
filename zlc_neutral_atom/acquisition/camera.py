@@ -12,7 +12,17 @@ from dataclasses import dataclass
 from enum import Enum
 from numbers import Integral
 
-from zlc_data import VALID, Valid, Value, ValuePayloadContract, ValueSchema
+import numpy as np
+
+from zlc_data import (
+    VALID,
+    ComponentValidity,
+    Invalid,
+    Valid,
+    Value,
+    ValuePayloadContract,
+    ValueSchema,
+)
 from zlc_storage import canonical_digest, decode, encode
 
 from zlc_neutral_atom.runtime.capture import FrozenCaptureSpec
@@ -313,7 +323,7 @@ class CameraSampleContract:
     def fingerprint(self) -> str:
         return canonical_digest(
             {
-                "contract": "zlc.camera-sample.v1",
+                "contract": "zlc.camera-sample.v2",
                 "value_schema_fingerprint": self.value_schema.fingerprint,
                 "metadata_contract_fingerprint": self.metadata_contract.fingerprint,
             }
@@ -341,6 +351,36 @@ class CameraSampleContract:
         return (
             ValuePayloadContract(self.value_schema).retained_nbytes(payload.image)
             + self.metadata_contract.retained_nbytes(payload.metadata)
+        )
+
+    def digest(self, payload: CameraSample) -> str:
+        """Bind one physical frame's pixels and acquisition metadata together."""
+
+        self.validate(payload)
+        return self.digest_components(
+            payload.image.values,
+            payload.image.validity,
+            payload.metadata,
+        )
+
+    def digest_components(
+        self,
+        image_values: np.ndarray,
+        image_validity: Valid | Invalid | ComponentValidity,
+        metadata: CameraFrameMetadata,
+    ) -> str:
+        """Digest a durable frame cell through the transient payload owner."""
+
+        self.metadata_contract.validate(metadata)
+        return canonical_digest(
+            {
+                "schema": "zlc.camera-sample-content.v2",
+                "image": ValuePayloadContract(self.value_schema).digest_content(
+                    image_values,
+                    image_validity,
+                ),
+                "metadata": self.metadata_contract.digest(metadata),
+            }
         )
 
     @staticmethod

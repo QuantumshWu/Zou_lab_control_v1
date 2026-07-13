@@ -54,6 +54,7 @@ from .dataset import (
     FrozenDatasetEdge,
     MissingDatasetCells,
     NoDatasetMetadataContract,
+    OrderedDatasetEventHasher,
     SnapshotExpired,
     SealedDatasetArtifact,
     ValueDatasetEventAdapter,
@@ -183,6 +184,8 @@ from .streams import (
     StreamId,
     TraceContext,
     TraceBinding,
+    event_id_for_sequence,
+    event_ref_to_tree,
 )
 
 __all__ = [
@@ -249,6 +252,8 @@ __all__ = [
     "EventId",
     "EventRef",
     "EventSpanRef",
+    "event_id_for_sequence",
+    "event_ref_to_tree",
     "ExactReservation",
     "ExactConsumerReadiness",
     "estimate_pipeline_peak_bytes",
@@ -275,6 +280,7 @@ __all__ = [
     "MinimalPipelineSpec",
     "MissingDatasetCells",
     "NoDatasetMetadataContract",
+    "OrderedDatasetEventHasher",
     "MonitorTap",
     "MonitorUpdate",
     "OrderedEventSpanHasher",

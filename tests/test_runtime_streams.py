@@ -58,7 +58,13 @@ def test_ordered_event_span_hasher_is_canonical_contiguous_and_owner_independent
     stream_id = StreamId("camera.exact")
     generation = StreamGenerationId("generation-one")
     references = tuple(
-        EventRef(stream_id, generation, sequence, EventId(f"event-{sequence}"))
+        EventRef(
+            stream_id,
+            generation,
+            sequence,
+            EventId(f"event-{sequence}"),
+            f"{sequence + 1:064x}",
+        )
         for sequence in range(3)
     )
 
@@ -76,12 +82,26 @@ def test_ordered_event_span_hasher_is_canonical_contiguous_and_owner_independent
                 EventId("changed-event")
                 if reference.sequence == 1
                 else reference.event_id,
+                reference.payload_digest,
             )
         )
 
     producer_span = producer_owner.seal(3)
     assert consumer_owner.seal(3) == producer_span
     assert changed_owner.seal(3).ordered_digest != producer_span.ordered_digest
+
+    changed_payload_owner = OrderedEventSpanHasher(stream_id, generation, 0)
+    for reference in references:
+        changed_payload_owner.update(
+            EventRef(
+                reference.stream_id,
+                reference.generation,
+                reference.sequence,
+                reference.event_id,
+                "f" * 64 if reference.sequence == 1 else reference.payload_digest,
+            )
+        )
+    assert changed_payload_owner.seal(3).ordered_digest != producer_span.ordered_digest
 
     discontinuous = OrderedEventSpanHasher(stream_id, generation, 0)
     with pytest.raises(ValueError, match="stream/generation/sequence"):
@@ -191,6 +211,37 @@ def test_exact_reservation_retains_every_event_until_ordered_ack():
     assert reservation.state is ReservationState.COMPLETED
     reservation.release()
     assert source.retained_bytes <= 32
+
+
+def test_exact_consumer_revalidates_published_payload_content_and_identity():
+    source, producer = stream(events=1)
+    reservation = source.reserve(
+        total_events=1,
+        max_inflight_events=1,
+        max_inflight_bytes=8,
+        trace_binding=TRACE_BINDING,
+    )
+    cursor = reservation.activate()
+    owner = bind_terminal_consumer(source, reservation)
+    emitted = emit(producer, 1.0)
+    delivery = cursor.next()
+    original_payload = emitted.payload
+    original_digest = emitted.payload_digest
+
+    object.__setattr__(emitted, "payload", scalar_value(2.0))
+    with pytest.raises(StreamError, match="payload changed after publication"):
+        source._validate_consumer_delivery(reservation, delivery, owner)
+
+    object.__setattr__(emitted, "payload", original_payload)
+    object.__setattr__(emitted, "payload_digest", "f" * 64)
+    with pytest.raises(StreamError, match="identity changed after publication"):
+        source._validate_consumer_delivery(reservation, delivery, owner)
+
+    object.__setattr__(emitted, "payload_digest", original_digest)
+    acknowledge(source, reservation, delivery, owner)
+    eos = producer.finish()
+    source._complete_consumer(reservation, eos, owner, lambda: None)
+    reservation.release()
 
 
 def test_unreserved_cursor_gets_typed_gap_instead_of_latest_fallback():
@@ -516,6 +567,10 @@ def test_stream_rejects_materialized_dataset_payloads():
         def retained_nbytes(payload):
             return payload.values.nbytes
 
+        @staticmethod
+        def digest(_payload):
+            return "0" * 64
+
     source, producer = AcquisitionStream.create(
         StreamId("illegal.dataset"),
         IllegalContract(),
@@ -539,6 +594,33 @@ def test_stream_rejects_materialized_dataset_payloads():
             block,
             captured_at=0.0,
             trace=trace(),
+        )
+
+
+def test_stream_requires_payload_contract_owned_content_digest():
+    class MissingDigestContract:
+        fingerprint = PAYLOAD_FINGERPRINT
+        max_retained_nbytes = 8
+
+        @staticmethod
+        def snapshot(payload):
+            return payload
+
+        @staticmethod
+        def validate(_payload):
+            return None
+
+        @staticmethod
+        def retained_nbytes(_payload):
+            return 8
+
+    with pytest.raises(TypeError, match="payload_contract.digest"):
+        AcquisitionStream.create(
+            StreamId("missing.payload-digest"),
+            MissingDigestContract(),
+            flow_control=ProducerFlowControl.BACKPRESSURE_CAPABLE,
+            retention_events=1,
+            retention_bytes=8,
         )
 
 

@@ -11,7 +11,15 @@ import pytest
 
 from Zou_lab_control.neutral_atom.devices.registry import DeviceSet
 from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualTrapArray
-from zlc_data import AxisId, AxisSpec, BlockId, PointLayout, REPEAT, SCAN_POINT
+from zlc_data import (
+    AxisId,
+    AxisSpec,
+    BlockId,
+    PointLayout,
+    REPEAT,
+    SCAN_POINT,
+    encode_data_block,
+)
 from zlc_neutral_atom.acquisition import (
     CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
     CameraAcquisitionMode,
@@ -51,7 +59,13 @@ def _axis(name, role, size):
     return AxisSpec(AxisId(name), name, role, size, tuple(range(size)))
 
 
-def _runtime_and_spec():
+def _runtime_and_spec(
+    *,
+    repeat_size=1,
+    point_size=2,
+    point_layout=None,
+    source_cell_schedule=None,
+):
     camera = VirtualCamera(
         VirtualTrapArray(grid_shape=(2, 2), image_shape=(6, 8), seed=4),
         exposure=1e-3,
@@ -62,13 +76,19 @@ def _runtime_and_spec():
             {"readout": {"type": "VirtualCamera", "params": {}}},
         )
     )
+    point_layout = point_layout or PointLayout.rect_c((point_size,))
+    source_cell_schedule = source_cell_schedule or tuple(
+        DatasetCellAddress(repeat, point)
+        for repeat in range(repeat_size)
+        for point in range(point_layout.storage_size)
+    )
     measurement = runtime.bind_camera_measurement(
         CameraCaptureBindingRequest(
             "readout",
-            _axis("repeat", REPEAT, 1),
-            (_axis("point", SCAN_POINT, 2),),
-            PointLayout.rect_c((2,)),
-            (DatasetCellAddress(0, 0), DatasetCellAddress(0, 1)),
+            _axis("repeat", REPEAT, repeat_size),
+            (_axis("point", SCAN_POINT, point_size),),
+            point_layout,
+            source_cell_schedule,
             CameraAcquisitionMode.EXTERNAL_TRIGGERED,
             0,
             4 << 20,
@@ -172,6 +192,58 @@ def test_exact_pipeline_commits_and_reloads_capture_artifact(tmp_path):
         )
         assert artifact.camera_arm_spec.digest == artifact.terminal.capture_spec_fingerprint
         assert artifact.camera_arm_spec == spec.measurement.capture_spec
+
+        changed_pixels = np.array(artifact.block.values, copy=True)
+        changed_pixels[0, 0, 0, 0] += 1
+        changed_block = replace(artifact.block, values=changed_pixels)
+        with pytest.raises(ValueError, match="payload event digest"):
+            replace(
+                artifact,
+                block=changed_block,
+            )
+
+        with pytest.raises(ValueError, match="payload event digest"):
+            replace(
+                artifact,
+                provenance=replace(
+                    artifact.provenance,
+                    ordered_event_digest="f" * 64,
+                ),
+            )
+
+        forged_event_digest = decode(encode(manifest))
+        forged_event_digest["provenance"]["ordered_event_digest"] = "f" * 64
+        invalid_event_digest = repository._store.publish_manifest(
+            "capture",
+            encode(forged_event_digest),
+        )
+        with pytest.raises(ValueError, match="payload event digest"):
+            repository.load(
+                CaptureArtifactRef(
+                    repository.repository_id,
+                    invalid_event_digest.content.digest,
+                )
+            )
+
+        changed_block_ref = repository._store.put_blob(
+            encode_data_block(changed_block)
+        )
+        forged_block_manifest = decode(encode(manifest))
+        forged_block_manifest["data_block_blob"] = {
+            "digest": changed_block_ref.digest,
+            "size": changed_block_ref.size,
+        }
+        invalid_block = repository._store.publish_manifest(
+            "capture",
+            encode(forged_block_manifest),
+        )
+        with pytest.raises(ValueError, match="payload event digest"):
+            repository.load(
+                CaptureArtifactRef(
+                    repository.repository_id,
+                    invalid_block.content.digest,
+                )
+            )
 
         opaque_digest = "f" * 64
         opaque_provenance = replace(
@@ -415,6 +487,52 @@ def test_exact_pipeline_commits_and_reloads_capture_artifact(tmp_path):
         if thread.is_alive():
             camera.finish_record_capture()
             thread.join(2.0)
+        assert runtime.shutdown(timeout=2.0)
+
+
+def test_capture_payload_digest_replays_repeat_and_explicit_point_schedule(tmp_path):
+    layout = PointLayout.explicit((3,), ((2,), (0,), (1,)))
+    schedule = (
+        DatasetCellAddress(1, 2),
+        DatasetCellAddress(0, 1),
+        DatasetCellAddress(1, 0),
+        DatasetCellAddress(0, 2),
+        DatasetCellAddress(1, 1),
+        DatasetCellAddress(0, 0),
+    )
+    camera, runtime, spec = _runtime_and_spec(
+        repeat_size=2,
+        point_size=3,
+        point_layout=layout,
+        source_cell_schedule=schedule,
+    )
+    repository = CaptureRepository(tmp_path / "captures")
+    plan = compile_capture_artifact_pipeline(spec, repository)
+    images = tuple(
+        np.full((6, 8), ordinal + 1, dtype=np.uint16)
+        for ordinal in range(len(schedule))
+    )
+    thread, failures = _deliver_when_armed(camera, images)
+    try:
+        reference = runtime.controller.run(plan)
+        thread.join(2.0)
+        assert not thread.is_alive() and failures == []
+        artifact = repository.load(reference)
+        assert artifact.source_cell_schedule == schedule
+        assert artifact.block.values.shape == (2, 3, 6, 8)
+        for ordinal, address in enumerate(schedule):
+            assert np.all(
+                artifact.block.values[
+                    address.repeat_index,
+                    address.point_storage_index,
+                ]
+                == ordinal + 1
+            )
+    finally:
+        if thread.is_alive():
+            camera.finish_record_capture()
+            thread.join(2.0)
+        repository.close()
         assert runtime.shutdown(timeout=2.0)
 
 

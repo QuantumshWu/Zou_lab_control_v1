@@ -11,7 +11,7 @@ from numbers import Integral
 from typing import Callable, Generic, Protocol, TypeVar
 
 import numpy as np
-from zlc_storage import canonical_digest
+from zlc_storage import canonical_digest, encode
 
 from zlc_data import (
     BlockId,
@@ -36,6 +36,7 @@ from zlc_data import (
     ValuePayloadContract,
     ValueSchema,
     axis_to_tree,
+    expand_component_validity,
     point_layout_to_tree,
 )
 
@@ -45,6 +46,7 @@ from .streams import (
     Delivery,
     EndOfStream,
     Envelope,
+    EventRef,
     EventSpanRef,
     ExactConsumerReadiness,
     ExactReservation,
@@ -54,6 +56,7 @@ from .streams import (
     ProcessorStageProvenance,
     StreamId,
     TraceBinding,
+    event_ref_to_tree,
 )
 
 
@@ -696,7 +699,7 @@ class FrozenDatasetEdge(Generic[PayloadT]):
             operator_fingerprint,
             "event adapter operator fingerprint",
         )
-        for member in ("snapshot", "validate", "retained_nbytes"):
+        for member in ("snapshot", "validate", "retained_nbytes", "digest"):
             if not callable(getattr(payload_contract, member, None)):
                 raise TypeError(f"event_adapter.payload_contract.{member} must be callable")
         metadata_fingerprint = _sha256_digest(
@@ -1142,6 +1145,74 @@ class SealedDatasetArtifact:
         )
 
 
+class OrderedDatasetEventHasher:
+    """Streaming owner for exact materialization content plus metadata identity."""
+
+    __slots__ = (
+        "_stream_id",
+        "_generation",
+        "_start_sequence",
+        "_next_sequence",
+        "_hasher",
+    )
+
+    def __init__(
+        self,
+        stream_id: StreamId,
+        generation: StreamGenerationId,
+        start_sequence: int,
+    ) -> None:
+        if not isinstance(stream_id, StreamId):
+            raise TypeError("stream_id must be StreamId")
+        if not isinstance(generation, StreamGenerationId):
+            raise TypeError("generation must be StreamGenerationId")
+        if (
+            isinstance(start_sequence, bool)
+            or not isinstance(start_sequence, Integral)
+            or start_sequence < 0
+        ):
+            raise ValueError("start_sequence must be a non-negative integer")
+        self._stream_id = stream_id
+        self._generation = generation
+        self._start_sequence = int(start_sequence)
+        self._next_sequence = int(start_sequence)
+        self._hasher = hashlib.sha256()
+        self._hasher.update(
+            b"zlc_neutral_atom.DatasetOrderedPayloadEvents/v2\x00"
+        )
+
+    def update(self, reference: EventRef, metadata_digest: str) -> None:
+        if not isinstance(reference, EventRef):
+            raise TypeError("reference must be EventRef")
+        if (
+            reference.stream_id != self._stream_id
+            or reference.generation != self._generation
+            or reference.sequence != self._next_sequence
+        ):
+            raise ValueError(
+                "EventRef differs from the ordered dataset stream/generation/sequence"
+            )
+        metadata_digest = _sha256_digest(metadata_digest, "metadata_digest")
+        encoded = encode(
+            {
+                "event_ref": event_ref_to_tree(reference),
+                "metadata_digest": metadata_digest,
+            }
+        )
+        self._hasher.update(len(encoded).to_bytes(8, "big"))
+        self._hasher.update(encoded)
+        self._next_sequence += 1
+
+    def digest(self, end_sequence: int) -> str:
+        if (
+            isinstance(end_sequence, bool)
+            or not isinstance(end_sequence, Integral)
+            or int(end_sequence) != self._next_sequence
+        ):
+            raise ValueError("ordered dataset event digest has incomplete coverage")
+        return self._hasher.copy().hexdigest()
+
+
 class DatasetBuilder(Generic[PayloadT]):
     """Private mutable materializer; public reads are immutable owned snapshots."""
 
@@ -1189,7 +1260,15 @@ class DatasetBuilder(Generic[PayloadT]):
                 raise DatasetError("exact reservation length must equal DatasetSchema cell count")
         self._expected_cells = expected_cells
         self._join_plan_digest = edge.schedule_digest
-        self._ordered_event_hasher = hashlib.sha256()
+        self._ordered_event_hasher = (
+            OrderedDatasetEventHasher(
+                self.stream_id,
+                self.generation,
+                self._reservation.start_sequence,
+            )
+            if self._reservation is not None
+            else None
+        )
         self._ordered_metadata_hasher = hashlib.sha256()
         self._ordered_metadata_hasher.update(
             self._metadata_contract_fingerprint.encode("ascii")
@@ -1338,11 +1417,8 @@ class DatasetBuilder(Generic[PayloadT]):
                 self._expected_sequence += 1
                 self._ordered_event_metadata[schedule_index] = metadata
                 self._ordered_metadata_hasher.update(metadata_digest.encode("ascii"))
-                self._ordered_event_hasher.update(
-                    f"{envelope.sequence}:{envelope.event_id.value}:{metadata_digest};".encode(
-                        "utf-8"
-                    )
-                )
+                assert self._ordered_event_hasher is not None
+                self._ordered_event_hasher.update(envelope.ref, metadata_digest)
             else:
                 self._last_monitor_sequence = envelope.sequence
             flat_cell = (
@@ -1387,6 +1463,7 @@ class DatasetBuilder(Generic[PayloadT]):
             raise DatasetError("rolling monitor datasets cannot become formal sealed datasets")
         self._source._complete_consumer(self._reservation, eos, self, self._seal_locked)
         preview = self.materialize()
+        assert self._ordered_event_hasher is not None
         return SealedDatasetArtifact(
             _SEALED_TOKEN,
             snapshot=preview.snapshot,
@@ -1396,7 +1473,9 @@ class DatasetBuilder(Generic[PayloadT]):
             start_sequence=self._reservation.start_sequence,
             end_sequence=self._reservation.end_sequence,
             join_plan_digest=self._join_plan_digest,
-            ordered_event_digest=self._ordered_event_hasher.copy().hexdigest(),
+            ordered_event_digest=self._ordered_event_hasher.digest(
+                self._reservation.end_sequence
+            ),
             ordered_metadata_digest=self._ordered_metadata_hasher.copy().hexdigest(),
             metadata_contract_fingerprint=self._metadata_contract_fingerprint,
             trace_binding=self._reservation.trace_binding,
@@ -1555,19 +1634,7 @@ class DatasetBuilder(Generic[PayloadT]):
             if isinstance(validity, Invalid):
                 return False
             raise ValueError("component validity cannot enter a VALUE dataset contract")
-        declared = contract.component_axis_ids
-        declared_shape = tuple(self.schema.cell_schema.axis(axis_id).size for axis_id in declared)
-        if isinstance(validity, Valid):
-            return np.ones(declared_shape, dtype=bool)
-        if isinstance(validity, Invalid):
-            return np.zeros(declared_shape, dtype=bool)
-        if not isinstance(validity, ComponentValidity):
-            raise TypeError("unsupported Value validity")
-        positions = tuple(declared.index(axis_id) for axis_id in validity.axis_ids)
-        shape = [1] * len(declared)
-        for mask_axis, declared_axis in enumerate(positions):
-            shape[declared_axis] = validity.mask.shape[mask_axis]
-        return np.broadcast_to(validity.mask.reshape(tuple(shape)), declared_shape)
+        return expand_component_validity(validity, self.schema.cell_schema)
 
     def _apply_patch_locked(
         self,
@@ -1637,6 +1704,7 @@ __all__ = [
     "FrozenDatasetEdge",
     "MissingDatasetCells",
     "NoDatasetMetadataContract",
+    "OrderedDatasetEventHasher",
     "SnapshotExpired",
     "SealedDatasetArtifact",
     "ValueDatasetEventAdapter",

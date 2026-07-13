@@ -46,6 +46,8 @@ class PayloadContract(Protocol[PayloadT]):
 
     def retained_nbytes(self, payload: PayloadT) -> int: ...
 
+    def digest(self, payload: PayloadT) -> str: ...
+
 
 class JoinKeyContract(Protocol):
     fingerprint: str
@@ -144,6 +146,7 @@ class EventRef:
     generation: StreamGenerationId
     sequence: int
     event_id: EventId
+    payload_digest: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.stream_id, StreamId):
@@ -153,6 +156,36 @@ class EventRef:
         object.__setattr__(self, "sequence", _nonnegative_int(self.sequence, "sequence"))
         if not isinstance(self.event_id, EventId):
             raise TypeError("event_id must be EventId")
+        _digest(self.payload_digest, "payload_digest")
+
+
+def event_id_for_sequence(
+    stream_id: StreamId,
+    generation: StreamGenerationId,
+    sequence: int,
+) -> EventId:
+    """Return the one owner-defined identity for a generated stream event."""
+
+    if not isinstance(stream_id, StreamId):
+        raise TypeError("stream_id must be StreamId")
+    if not isinstance(generation, StreamGenerationId):
+        raise TypeError("generation must be StreamGenerationId")
+    sequence = _nonnegative_int(sequence, "sequence")
+    return EventId(f"{stream_id.value}:{generation.value}:{sequence}")
+
+
+def event_ref_to_tree(reference: EventRef) -> dict[str, object]:
+    """Canonical field projection owned beside ``EventRef`` itself."""
+
+    if not isinstance(reference, EventRef):
+        raise TypeError("reference must be EventRef")
+    return {
+        "stream_id": reference.stream_id.value,
+        "generation": reference.generation.value,
+        "sequence": reference.sequence,
+        "event_id": reference.event_id.value,
+        "payload_digest": reference.payload_digest,
+    }
 
 
 @dataclass(frozen=True)
@@ -208,7 +241,7 @@ class OrderedEventSpanHasher:
         self._start_sequence = start
         self._next_sequence = start
         self._hasher = hashlib.sha256()
-        self._hasher.update(b"zlc_neutral_atom.OrderedEventRefs/v1\x00")
+        self._hasher.update(b"zlc_neutral_atom.OrderedEventRefs/v2\x00")
         self._sealed = False
 
     def update(self, reference: EventRef) -> None:
@@ -224,14 +257,7 @@ class OrderedEventSpanHasher:
             raise ValueError(
                 "EventRef differs from the ordered span stream/generation/sequence"
             )
-        encoded = encode(
-            {
-                "stream_id": reference.stream_id.value,
-                "generation": reference.generation.value,
-                "sequence": reference.sequence,
-                "event_id": reference.event_id.value,
-            }
-        )
+        encoded = encode(event_ref_to_tree(reference))
         self._hasher.update(len(encoded).to_bytes(8, "big"))
         self._hasher.update(encoded)
         self._next_sequence += 1
@@ -406,6 +432,7 @@ class Envelope(Generic[PayloadT]):
     emitted_at: float
     captured_at: float
     payload_contract_fingerprint: str
+    payload_digest: str
     trace: TraceContext
     payload: PayloadT
     join_key: object | None = None
@@ -424,6 +451,7 @@ class Envelope(Generic[PayloadT]):
         object.__setattr__(self, "emitted_at", _finite_time(self.emitted_at, "emitted_at"))
         object.__setattr__(self, "captured_at", _finite_time(self.captured_at, "captured_at"))
         _digest(self.payload_contract_fingerprint, "payload_contract_fingerprint")
+        _digest(self.payload_digest, "payload_digest")
         if not isinstance(self.trace, TraceContext):
             raise TypeError("trace must be TraceContext")
         if (self.join_key is None) != (self.join_key_schema_fingerprint is None):
@@ -442,6 +470,7 @@ class Envelope(Generic[PayloadT]):
             self.stream_generation,
             self.sequence,
             self.event_id,
+            self.payload_digest,
         )
 
 
@@ -572,6 +601,7 @@ class ProducerFlowControl(str, Enum):
 class _Stored(Generic[PayloadT]):
     envelope: Envelope[PayloadT]
     payload_bytes: int
+    event_ref: EventRef
 
 
 class Delivery(Generic[PayloadT]):
@@ -1372,7 +1402,7 @@ class AcquisitionStream(Generic[PayloadT]):
         self.max_payload_bytes = _positive_int(max_payload_bytes, "max_payload_bytes")
         if self.max_payload_bytes > self.retention_bytes:
             raise ValueError("max_payload_bytes cannot exceed retention_bytes")
-        for method in ("snapshot", "validate", "retained_nbytes"):
+        for method in ("snapshot", "validate", "retained_nbytes", "digest"):
             if not callable(getattr(payload_contract, method, None)):
                 raise TypeError(f"payload_contract.{method} must be callable")
         if join_key_contract is not None:
@@ -1387,7 +1417,6 @@ class AcquisitionStream(Generic[PayloadT]):
         self._order: deque[int] = deque()
         self._retained_bytes = 0
         self._next_sequence = 0
-        self._event_namespace = f"{self.stream_id.value}:{self.generation.value}"
         self._reservations: dict[object, ExactReservation[PayloadT]] = {}
         self._formal_consumer_claimed = False
         self._formal_rebind_required = False
@@ -1520,6 +1549,10 @@ class AcquisitionStream(Generic[PayloadT]):
     ) -> Envelope[PayloadT]:
         payload = self._payload_contract.snapshot(payload)
         self._payload_contract.validate(payload)
+        payload_digest = _digest(
+            self._payload_contract.digest(payload),
+            "payload digest",
+        )
         if _contains_materialization(payload):
             raise TypeError("DataBlock/DataPatch are materialization values, not stream payloads")
         size = _positive_int(
@@ -1579,7 +1612,11 @@ class AcquisitionStream(Generic[PayloadT]):
                     raise ReservationStateError(
                         "exact data cannot be emitted before its formal consumer is bound"
                     )
-            selected_event_id = EventId(f"{self._event_namespace}:{sequence}")
+            selected_event_id = event_id_for_sequence(
+                self.stream_id,
+                self.generation,
+                sequence,
+            )
             envelope = Envelope(
                 event_id=selected_event_id,
                 stream_id=self.stream_id,
@@ -1588,6 +1625,7 @@ class AcquisitionStream(Generic[PayloadT]):
                 emitted_at=time.time(),
                 captured_at=captured_at,
                 payload_contract_fingerprint=self.payload_contract_fingerprint,
+                payload_digest=payload_digest,
                 trace=trace,
                 payload=payload,
                 join_key=join_key,
@@ -1633,7 +1671,7 @@ class AcquisitionStream(Generic[PayloadT]):
                     monitor._source_ended(overrun)
                 self._condition.notify_all()
                 raise overrun from error
-            stored = _Stored(envelope, size)
+            stored = _Stored(envelope, size, envelope.ref)
             self._records[sequence] = stored
             self._order.append(sequence)
             self._retained_bytes += size
@@ -1809,7 +1847,19 @@ class AcquisitionStream(Generic[PayloadT]):
             raise PermissionError("Delivery belongs to another stream authority")
         if delivery.acknowledged:
             raise ReservationStateError("Delivery was already acknowledged")
-        reservation.trace_binding.validate(delivery.envelope.trace)
+        envelope = delivery.envelope
+        stored = self._records.get(envelope.sequence)
+        if stored is None or stored.envelope is not envelope:
+            raise PermissionError("Delivery no longer names its retained stream event")
+        if envelope.ref != stored.event_ref:
+            raise StreamError("retained event identity changed after publication")
+        current_payload_digest = _digest(
+            self._payload_contract.digest(envelope.payload),
+            "payload digest",
+        )
+        if current_payload_digest != stored.event_ref.payload_digest:
+            raise StreamError("retained event payload changed after publication")
+        reservation.trace_binding.validate(envelope.trace)
         return cursor
 
     def _ack_consumer(
@@ -2108,6 +2158,8 @@ __all__ = [
     "EventId",
     "EventRef",
     "EventSpanRef",
+    "event_id_for_sequence",
+    "event_ref_to_tree",
     "ExactConsumerReadiness",
     "ExactReservation",
     "JoinKeyContract",

@@ -630,6 +630,17 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
             self.validate(payload)
             return payload.image.values.nbytes + 16
 
+        def digest(self, payload):
+            self.validate(payload)
+            value_digest = ValuePayloadContract(self.schema).digest(payload.image)
+            metadata = payload.metadata
+            metadata_digest = hashlib.sha256(
+                f"{metadata.physical_ordinal}:{metadata.frame_stamp}".encode("ascii")
+            ).hexdigest()
+            return hashlib.sha256(
+                f"{value_digest}:{metadata_digest}".encode("ascii")
+            ).hexdigest()
+
     @dataclass(frozen=True)
     class FrameMetadataContract:
         fingerprint: str = "5" * 64
@@ -881,6 +892,10 @@ def test_builder_freezes_one_metadata_contract_identity_for_the_generation():
         def retained_nbytes(self, payload):
             self.validate(payload)
             return payload.values.nbytes + 8
+
+        def digest(self, payload):
+            self.validate(payload)
+            return ValuePayloadContract(self.schema).digest(payload)
 
     @dataclass(frozen=True)
     class SwitchingMetadataContract:

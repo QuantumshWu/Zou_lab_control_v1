@@ -186,6 +186,20 @@ class CameraPayloadContract:
     def retained_nbytes(payload: CameraPayload) -> int:
         return int(payload.pixels.nbytes) + 32
 
+    def digest(self, payload: CameraPayload) -> str:
+        self.validate(payload)
+        hasher = hashlib.sha256()
+        for part in (
+            str(payload.ordinal).encode("ascii"),
+            payload.captured_at.hex().encode("ascii"),
+            payload.correlation_id.encode("utf-8"),
+            str(payload.stamp).encode("ascii"),
+            memoryview(payload.pixels).cast("B"),
+        ):
+            hasher.update(len(part).to_bytes(8, "big"))
+            hasher.update(part)
+        return hasher.hexdigest()
+
     @staticmethod
     def source_ordinal(payload: CameraPayload) -> int:
         return payload.ordinal

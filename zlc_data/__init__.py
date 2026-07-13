@@ -63,6 +63,7 @@ from .value import (
     Value,
     ValuePayloadContract,
     expand_dataset_validity,
+    expand_component_validity,
     expand_value_validity,
 )
 from .selection import (
@@ -243,6 +244,7 @@ __all__ = [
     "encode_selection",
     "encode_value",
     "expand_dataset_validity",
+    "expand_component_validity",
     "expand_value_validity",
     "evaluate_fit_model",
     "fit_analysis",

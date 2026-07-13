@@ -106,7 +106,7 @@ class ValuePayloadContract:
 
     @property
     def fingerprint(self) -> str:
-        source = f"zlc.value-payload.v1:{self.schema.fingerprint}".encode("ascii")
+        source = f"zlc.value-payload.v2:{self.schema.fingerprint}".encode("ascii")
         return hashlib.sha256(source).hexdigest()
 
     @property
@@ -138,6 +138,86 @@ class ValuePayloadContract:
             else 0
         )
         return int(payload.values.nbytes + validity_bytes)
+
+    def digest(self, payload: Value) -> str:
+        """Canonical content identity including schema, values, and validity."""
+
+        self.validate(payload)
+        return self.digest_content(payload.values, payload.validity)
+
+    def digest_content(
+        self,
+        values: np.ndarray,
+        validity: Valid | Invalid | ComponentValidity,
+    ) -> str:
+        """Digest owner-shaped content without constructing another ``Value``.
+
+        Durable artifacts already own immutable arrays at a wider dataset shape.
+        This method lets them verify one cell through the same payload owner while
+        avoiding a full image copy merely to reconstruct the transient wrapper.
+        """
+
+        array = np.asarray(values)
+        if array.dtype != self.schema.dtype:
+            raise TypeError(
+                f"values dtype {array.dtype} does not match schema dtype "
+                f"{self.schema.dtype}"
+            )
+        if array.shape != self.schema.data_shape:
+            raise ValueError(
+                f"values shape {array.shape} does not match expected "
+                f"{self.schema.data_shape}"
+            )
+        _validate_value_validity(validity, self.schema)
+
+        hasher = hashlib.sha256()
+        hasher.update(b"zlc_data.ValuePayloadContent/v2\x00")
+
+        def update(part: bytes | memoryview) -> None:
+            hasher.update(len(part).to_bytes(8, "big"))
+            hasher.update(part)
+
+        update(self.schema.fingerprint.encode("ascii"))
+        if self.schema.validity_contract.mode is ValidityMode.COMPONENTS:
+            canonical_validity = expand_component_validity(validity, self.schema)
+            update(b"components")
+            for axis_id in self.schema.validity_contract.component_axis_ids:
+                update(axis_id.value.encode("utf-8"))
+            update(memoryview(np.ascontiguousarray(canonical_validity)).cast("B"))
+            expanded = expand_value_validity(validity, self.schema)
+            if np.all(expanded):
+                normalized = array
+            else:
+                normalized = np.array(array, copy=True, order="C")
+                normalized[~expanded] = 0
+        elif isinstance(validity, Valid):
+            update(b"valid")
+            normalized = array
+        elif isinstance(validity, Invalid):
+            update(b"invalid")
+            # Invalid values are semantically absent.  The schema already binds
+            # dtype/shape, so arbitrary storage fillers must not change identity.
+            update(b"canonical-invalid-values")
+            return hasher.hexdigest()
+        else:  # pragma: no cover - validation closes VALUE validity above
+            raise TypeError("VALUE validity requires Valid or Invalid")
+
+        if normalized.dtype.kind in "fc" and np.any(np.isnan(normalized)):
+            normalized = np.array(normalized, copy=True, order="C")
+            if normalized.dtype.kind == "f":
+                canonical_nan = np.array(float("nan"), dtype=normalized.dtype)
+                np.copyto(normalized, canonical_nan, where=np.isnan(normalized))
+            else:
+                component_dtype = np.dtype(
+                    "<f4" if normalized.dtype.itemsize == 8 else "<f8"
+                )
+                components = normalized.reshape(-1).view(component_dtype)
+                canonical_nan = np.array(float("nan"), dtype=component_dtype)
+                np.copyto(components, canonical_nan, where=np.isnan(components))
+        if not normalized.flags.c_contiguous:
+            normalized = np.ascontiguousarray(normalized)
+        update(memoryview(normalized).cast("B"))
+        return hasher.hexdigest()
 
 
 @dataclass(frozen=True, eq=False)
@@ -201,6 +281,32 @@ def expand_value_validity(
     for mask_index, axis_position in enumerate(positions):
         broadcast_shape[axis_position] = validity.mask.shape[mask_index]
     return np.broadcast_to(validity.mask.reshape(tuple(broadcast_shape)), schema.data_shape)
+
+
+def expand_component_validity(
+    validity: Valid | Invalid | ComponentValidity,
+    schema: ValueSchema,
+) -> np.ndarray:
+    """Return validity over the schema's declared component axes only.
+
+    This is the canonical mask stored by materialization and hashed by payload
+    identity, independent of whether a producer supplied a scalar Valid/Invalid
+    marker or a mask over a smaller named-axis subset.
+    """
+
+    _validate_value_validity(validity, schema)
+    contract = schema.validity_contract
+    if contract.mode is not ValidityMode.COMPONENTS:
+        raise ValueError("component validity expansion requires a COMPONENTS contract")
+    declared = contract.component_axis_ids
+    declared_shape = tuple(schema.axis(axis_id).size for axis_id in declared)
+    if isinstance(validity, (Valid, Invalid)):
+        return np.broadcast_to(isinstance(validity, Valid), declared_shape)
+    positions = tuple(declared.index(axis_id) for axis_id in validity.axis_ids)
+    broadcast_shape = [1] * len(declared)
+    for mask_index, declared_position in enumerate(positions):
+        broadcast_shape[declared_position] = validity.mask.shape[mask_index]
+    return np.broadcast_to(validity.mask.reshape(tuple(broadcast_shape)), declared_shape)
 
 
 def expand_dataset_validity(

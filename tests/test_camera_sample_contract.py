@@ -154,6 +154,28 @@ def test_metadata_digest_covers_every_physical_observation():
     assert all(contract.digest(value) != baseline_digest for value in variants)
 
 
+def test_camera_sample_digest_binds_pixels_and_physical_metadata_atomically():
+    value_schema, _dataset_schema = _schemas()
+    contract = CameraSampleContract(value_schema)
+    baseline = _sample(value_schema)
+    baseline_digest = contract.digest(baseline)
+    changed_pixels = np.array(baseline.image.values, copy=True)
+    changed_pixels[1, 2] += 1
+    pixel_variant = CameraSample(
+        Value(changed_pixels, VALID, value_schema),
+        baseline.metadata,
+    )
+    metadata_variant = CameraSample(
+        baseline.image,
+        replace(baseline.metadata, frame_stamp=baseline.metadata.frame_stamp + 1),
+    )
+
+    assert len(baseline_digest) == 64
+    assert contract.digest(_sample(value_schema)) == baseline_digest
+    assert contract.digest(pixel_variant) != baseline_digest
+    assert contract.digest(metadata_variant) != baseline_digest
+
+
 def test_camera_metadata_rejects_partial_timestamp_and_unbounded_correlation():
     with pytest.raises(ValueError, match="must appear together"):
         _metadata(timestamp_microseconds=None)

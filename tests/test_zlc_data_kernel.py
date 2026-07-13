@@ -30,6 +30,7 @@ from zlc_data import (
     VALID,
     ValidityContract,
     Value,
+    ValuePayloadContract,
     ValueSchema,
     decode_dataset_schema,
     decode_data_block,
@@ -38,6 +39,7 @@ from zlc_data import (
     encode_dataset_schema,
     encode_value,
     expand_value_validity,
+    expand_component_validity,
 )
 
 
@@ -284,6 +286,59 @@ def test_invalid_storage_bytes_do_not_change_logical_content_encoding():
     assert encode_data_block(left) == encode_data_block(right)
     restored = decode_data_block(encode_data_block(left))
     np.testing.assert_array_equal(restored.values, [[7, 0]])
+
+
+def test_value_payload_digest_binds_valid_content_and_normalizes_invalid_fillers():
+    schema = image_schema(component_validity=True)
+    x = schema.data_axes[1]
+    validity = ComponentValidity(
+        (x.axis_id,),
+        np.array([True, False, True, False]),
+    )
+    left_values = np.arange(12, dtype=np.uint16).reshape(3, 4)
+    right_values = np.array(left_values, copy=True)
+    right_values[:, 1] = 500
+    right_values[:, 3] = 700
+    contract = ValuePayloadContract(schema)
+    left = Value(left_values, validity, schema)
+    right = Value(right_values, validity, schema)
+
+    assert contract.digest(left) == contract.digest(right)
+    assert contract.digest(left) == contract.digest_content(left.values, validity)
+    canonical_mask = expand_component_validity(validity, schema)
+    canonical_validity = ComponentValidity(
+        schema.validity_contract.component_axis_ids,
+        canonical_mask,
+    )
+    assert contract.digest(left) == contract.digest_content(
+        left_values,
+        canonical_validity,
+    )
+
+    changed_valid = np.array(right_values, copy=True)
+    changed_valid[0, 0] += 1
+    assert (
+        contract.digest_content(changed_valid, validity)
+        != contract.digest_content(left_values, validity)
+    )
+
+    value_schema = image_schema(component_validity=False)
+    value_contract = ValuePayloadContract(value_schema)
+    assert value_contract.digest_content(left_values, INVALID) == value_contract.digest_content(
+        right_values,
+        INVALID,
+    )
+
+    all_valid = np.ones(schema.data_shape, dtype=bool)
+    all_invalid = np.zeros(schema.data_shape, dtype=bool)
+    assert contract.digest_content(left_values, VALID) == contract.digest_content(
+        left_values,
+        ComponentValidity(schema.validity_contract.component_axis_ids, all_valid),
+    )
+    assert contract.digest_content(left_values, INVALID) == contract.digest_content(
+        right_values,
+        ComponentValidity(schema.validity_contract.component_axis_ids, all_invalid),
+    )
 
 
 def test_schema_fingerprint_normalizes_dtype_endianness():

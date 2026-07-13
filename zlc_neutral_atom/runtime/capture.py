@@ -483,6 +483,8 @@ class CapturePayloadContract(Protocol[PayloadT]):
 
     def retained_nbytes(self, payload: PayloadT) -> int: ...
 
+    def digest(self, payload: PayloadT) -> str: ...
+
     def source_ordinal(self, payload: PayloadT) -> int: ...
 
     def captured_at(self, payload: PayloadT) -> float: ...
@@ -741,6 +743,7 @@ class CaptureStreamContract:
             "snapshot",
             "validate",
             "retained_nbytes",
+            "digest",
             "source_ordinal",
             "captured_at",
             "correlation_id",
