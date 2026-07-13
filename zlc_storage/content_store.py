@@ -71,6 +71,10 @@ class ContentCorruptionError(RuntimeError):
     """Stored bytes do not match the immutable reference naming them."""
 
 
+class ContentSizeLimitError(RuntimeError):
+    """Stored content exceeds a caller's pre-read byte admission limit."""
+
+
 class ContentAddressedStore:
     """Filesystem store whose manifest file is the artifact visibility point."""
 
@@ -89,10 +93,19 @@ class ContentAddressedStore:
         self._publish_bytes(self._blob_path(reference.digest), data, reference)
         return reference
 
-    def read_blob(self, reference: ContentRef) -> bytes:
+    def read_blob(
+        self,
+        reference: ContentRef,
+        *,
+        max_bytes: int | None = None,
+    ) -> bytes:
         if not isinstance(reference, ContentRef):
             raise TypeError("read_blob requires ContentRef")
-        return self._read_verified(self._blob_path(reference.digest), reference)
+        return self._read_verified(
+            self._blob_path(reference.digest),
+            reference,
+            max_bytes=max_bytes,
+        )
 
     def publish_manifest(
         self,
@@ -116,15 +129,17 @@ class ContentAddressedStore:
         )
         return StoredManifest(namespace, reference)
 
-    def read_manifest(self, namespace: str, digest: str) -> bytes:
+    def read_manifest(
+        self,
+        namespace: str,
+        digest: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> bytes:
         namespace = _canonical_namespace(namespace)
         digest = _sha256(digest, "manifest digest")
         path = self._manifest_path(namespace, digest)
-        try:
-            size = path.stat().st_size
-        except FileNotFoundError:
-            raise
-        return self._read_verified(path, ContentRef(digest, size))
+        return self._read_verified_digest(path, digest, max_bytes=max_bytes)
 
     def has_manifest(self, namespace: str, digest: str) -> bool:
         namespace = _canonical_namespace(namespace)
@@ -173,12 +188,67 @@ class ContentAddressedStore:
                 except FileNotFoundError:
                     pass
 
+    @classmethod
+    def _read_verified(
+        cls,
+        path: Path,
+        reference: ContentRef,
+        *,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        return cls._read_open_handle(
+            path,
+            expected_digest=reference.digest,
+            expected_size=reference.size,
+            max_bytes=max_bytes,
+        )
+
+    @classmethod
+    def _read_verified_digest(
+        cls,
+        path: Path,
+        digest: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        return cls._read_open_handle(
+            path,
+            expected_digest=digest,
+            expected_size=None,
+            max_bytes=max_bytes,
+        )
+
     @staticmethod
-    def _read_verified(path: Path, reference: ContentRef) -> bytes:
-        data = path.read_bytes()
-        if len(data) != reference.size or sha256_digest(data) != reference.digest:
+    def _read_open_handle(
+        path: Path,
+        *,
+        expected_digest: str,
+        expected_size: int | None,
+        max_bytes: int | None,
+    ) -> bytes:
+        if max_bytes is not None and (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or max_bytes < 0
+        ):
+            raise ValueError("max_bytes must be a non-negative integer or None")
+        with path.open("rb") as stream:
+            actual_size = os.fstat(stream.fileno()).st_size
+            if max_bytes is not None and actual_size > max_bytes:
+                raise ContentSizeLimitError(
+                    f"stored content size {actual_size} exceeds limit {max_bytes}"
+                )
+            if expected_size is not None and actual_size != expected_size:
+                raise ContentCorruptionError(
+                    f"stored content does not match immutable reference {expected_digest}"
+                )
+            # Read through the same handle that was fstat'ed.  The extra byte
+            # detects in-place growth after fstat without permitting an
+            # unbounded read from a concurrently replaced/corrupt file.
+            data = stream.read(actual_size + 1)
+        if len(data) != actual_size or sha256_digest(data) != expected_digest:
             raise ContentCorruptionError(
-                f"stored content does not match immutable reference {reference.digest}"
+                f"stored content does not match immutable reference {expected_digest}"
             )
         return data
 
@@ -200,6 +270,7 @@ class ContentAddressedStore:
 __all__ = [
     "ContentAddressedStore",
     "ContentCorruptionError",
+    "ContentSizeLimitError",
     "ContentRef",
     "StoredManifest",
 ]

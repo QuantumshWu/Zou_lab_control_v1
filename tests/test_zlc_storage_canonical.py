@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import math
 
 import numpy as np
 import pytest
 
-from zlc_storage.canonical import CanonicalEncodingError, canonical_digest, decode, encode
+from zlc_storage.canonical import (
+    CanonicalArrayEvent,
+    CanonicalDecodeLimits,
+    CanonicalEncodingError,
+    CanonicalListEvent,
+    canonical_digest,
+    decode,
+    encode,
+)
 
 
 def test_mapping_order_and_sequence_container_do_not_change_bytes():
@@ -45,6 +54,29 @@ def test_ndarray_nan_payloads_have_one_canonical_spelling():
         [0x7FF8000000000001, 0x7FF8000000000002], dtype=np.uint64
     ).view(np.complex128)
     assert encode(complex_ordinary) == encode(complex_alternate)
+
+
+@pytest.mark.parametrize(
+    ("complex_dtype", "integer_dtype", "payloads"),
+    [
+        ("<c8", "<u4", [0x7FC00001, 0x7FC00002]),
+        ("<c16", "<u8", [0x7FF8000000000001, 0x7FF8000000000002]),
+    ],
+)
+def test_zero_dimensional_complex_nan_round_trips_canonically(
+    complex_dtype,
+    integer_dtype,
+    payloads,
+):
+    ordinary = np.array(complex(float("nan"), float("nan")), dtype=complex_dtype)
+    alternate = np.array(payloads, dtype=integer_dtype).view(complex_dtype).reshape(())
+
+    assert encode(ordinary) == encode(alternate)
+    restored = decode(encode(alternate))
+    assert restored.shape == ()
+    assert restored.dtype == np.dtype(complex_dtype)
+    assert np.isnan(restored.real)
+    assert np.isnan(restored.imag)
 
 
 def test_floating_scalar_wider_than_float64_is_not_silently_narrowed():
@@ -88,3 +120,195 @@ def test_decoder_rejects_unframed_and_noncanonical_json():
     padded = canonical.replace(b'[["a",', b'[[ "a",', 1)
     with pytest.raises(CanonicalEncodingError, match="not in canonical form"):
         decode(padded)
+
+
+def test_structure_admission_receives_complete_named_list_and_array_inventory():
+    payload = encode(
+        {
+            "models": [
+                {"kernel": np.ones((2, 3), dtype="<f8")},
+                {"kernel": np.ones((1, 4), dtype="<f4")},
+            ]
+        }
+    )
+    observed = None
+
+    def admit(events):
+        nonlocal observed
+        observed = events
+
+    restored = decode(payload, admit_structure=admit)
+    assert len(restored["models"]) == 2
+    assert observed == (
+        CanonicalListEvent(("models",), 2),
+        CanonicalArrayEvent(("models", 0, "kernel"), (2, 3), "<f8", 48),
+        CanonicalArrayEvent(("models", 1, "kernel"), (1, 4), "<f4", 16),
+    )
+
+
+def test_structure_admission_rejects_before_any_ndarray_materialization(monkeypatch):
+    payload = encode(
+        {
+            "sites": [
+                np.arange(4, dtype="<u2"),
+                np.arange(8, dtype="<u2"),
+            ]
+        }
+    )
+    materializations = 0
+
+    import zlc_storage.canonical as canonical
+
+    original = canonical._decode_array
+
+    def counted(payload, *, path):
+        nonlocal materializations
+        materializations += 1
+        return original(payload, path=path)
+
+    monkeypatch.setattr(canonical, "_decode_array", counted)
+
+    def reject(events):
+        sites = next(
+            event
+            for event in events
+            if isinstance(event, CanonicalListEvent) and event.path == ("sites",)
+        )
+        if sites.length > 1:
+            raise RuntimeError("site budget exceeded")
+
+    with pytest.raises(RuntimeError, match="site budget"):
+        decode(payload, admit_structure=reject)
+    assert materializations == 0
+
+
+def test_structure_paths_do_not_confuse_dotted_keys_with_nested_maps():
+    observed = []
+
+    def admit(events):
+        observed.extend(event.path for event in events if isinstance(event, CanonicalArrayEvent))
+
+    decode(
+        encode(
+            {
+                "a.b": np.ones(1, dtype="<u1"),
+                "a": {"b": np.ones(1, dtype="<u1")},
+            }
+        ),
+        admit_structure=admit,
+    )
+    assert observed == [("a", "b"), ("a.b",)]
+
+
+def test_generic_array_count_limit_rejects_before_materialization(monkeypatch):
+    payload = encode([np.empty(0, dtype="<u1"), np.empty(0, dtype="<u1")])
+    materializations = 0
+
+    import zlc_storage.canonical as canonical
+
+    original = canonical._decode_array
+
+    def counted(payload, *, path):
+        nonlocal materializations
+        materializations += 1
+        return original(payload, path=path)
+
+    monkeypatch.setattr(canonical, "_decode_array", counted)
+    with pytest.raises(CanonicalEncodingError, match="ndarray count"):
+        decode(payload, limits=CanonicalDecodeLimits(max_arrays=1))
+    assert materializations == 0
+
+
+def test_noncanonical_dtype_spelling_rejects_before_materialization(monkeypatch):
+    payload = encode(np.arange(2, dtype="<i4")).replace(b'"<i4"', b'"int32"')
+    materializations = 0
+
+    import zlc_storage.canonical as canonical
+
+    original = canonical._decode_array
+
+    def counted(payload, *, path):
+        nonlocal materializations
+        materializations += 1
+        return original(payload, path=path)
+
+    monkeypatch.setattr(canonical, "_decode_array", counted)
+    with pytest.raises(CanonicalEncodingError, match="dtype"):
+        decode(payload)
+    assert materializations == 0
+
+
+def test_zero_itemsize_ndarray_is_outside_canonical_model():
+    with pytest.raises(CanonicalEncodingError, match="zero-itemsize"):
+        encode(np.empty(1, dtype="V0"))
+
+
+def test_unsupported_ndarray_rank_rejects_before_callback_or_materialization(monkeypatch):
+    import zlc_storage.canonical as canonical
+
+    tagged = ["ndarray", ["|u1", ["0"] * (canonical._NUMPY_MAX_NDIM + 1), ""]]
+    payload = b"ZLC-CANONICAL-1\n" + json.dumps(
+        tagged,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    callback_calls = 0
+    materializations = 0
+    original = canonical._decode_array
+
+    def counted(payload, *, path):
+        nonlocal materializations
+        materializations += 1
+        return original(payload, path=path)
+
+    def admit(_events):
+        nonlocal callback_calls
+        callback_calls += 1
+
+    monkeypatch.setattr(canonical, "_decode_array", counted)
+    with pytest.raises(CanonicalEncodingError, match="rank"):
+        decode(payload, admit_structure=admit)
+    assert callback_calls == 0
+    assert materializations == 0
+
+
+@pytest.mark.parametrize(
+    ("dtype_text", "shape_text"),
+    [
+        ("|u1", [str(2**40), str(2**40), "0"]),
+        ("|V8", [str(2**60), "0"]),
+    ],
+)
+def test_zero_sized_shape_with_stride_overflow_rejects_before_callback(
+    monkeypatch,
+    dtype_text,
+    shape_text,
+):
+    import zlc_storage.canonical as canonical
+
+    tagged = ["ndarray", [dtype_text, shape_text, ""]]
+    payload = b"ZLC-CANONICAL-1\n" + json.dumps(
+        tagged,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    callback_calls = 0
+    materializations = 0
+    original = canonical._decode_array
+
+    def counted(payload, *, path):
+        nonlocal materializations
+        materializations += 1
+        return original(payload, path=path)
+
+    def admit(_events):
+        nonlocal callback_calls
+        callback_calls += 1
+
+    monkeypatch.setattr(canonical, "_decode_array", counted)
+    with pytest.raises(CanonicalEncodingError, match="logical extent"):
+        decode(payload, admit_structure=admit)
+    assert callback_calls == 0
+    assert materializations == 0
