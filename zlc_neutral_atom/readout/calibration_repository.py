@@ -879,6 +879,24 @@ class CalibrationRepository:
         self._assert_authority_integrity()
         return self._load_record(reference).artifact
 
+    def load_analysis_result(
+        self,
+        reference: CalibrationArtifactRef,
+    ) -> CalibrationAnalysisResult:
+        """Load the artifact and its persisted diagnostics as one inspection value.
+
+        This does not mint runtime admission authority.  Occupancy composition
+        must still call :meth:`admit`, which reloads and validates the exact
+        source CaptureArtifact and FINAL commit evidence.
+        """
+
+        self._assert_authority_integrity()
+        loaded = self._load_record(reference)
+        return CalibrationAnalysisResult(
+            loaded.artifact,
+            loaded.derivation.diagnostics,
+        )
+
     def admit(
         self,
         reference: CalibrationArtifactRef,

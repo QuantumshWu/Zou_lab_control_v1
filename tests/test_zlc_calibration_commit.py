@@ -313,6 +313,11 @@ def test_flat_run_commits_reopens_and_admits_only_after_exact_source_reload(
     repository = committed.calibration_repository
     reference = committed.calibration_ref
     artifact = repository.load(reference)
+    analysis_result = repository.load_analysis_result(reference)
+    assert analysis_result.artifact.fingerprint == artifact.fingerprint
+    assert analysis_result.diagnostics.bracket_count == (
+        artifact.source_binding.bracket_count
+    )
     assert artifact.source_binding.source_capture_ref == committed.capture_ref
     assert not isinstance(artifact, AdmittedCalibration)
 
