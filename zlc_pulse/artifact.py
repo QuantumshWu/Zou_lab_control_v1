@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from zlc_storage import (
@@ -45,6 +45,7 @@ class CompiledPulseArtifact:
     target_ir: TargetIR
     wire_image: PulseWireImage
     trigger_schedules: tuple[DigitalTriggerSchedule, ...] = ()
+    _fingerprint: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _sha256(self.source_document_digest, "source_document_digest")
@@ -89,6 +90,11 @@ class CompiledPulseArtifact:
             )
         ):
             raise ValueError("trigger schedules are not the deterministic TargetIR expansion")
+        object.__setattr__(
+            self,
+            "_fingerprint",
+            canonical_digest(compiled_pulse_artifact_to_tree(self)),
+        )
 
     @property
     def target_abi_fingerprint(self) -> str:
@@ -102,7 +108,7 @@ class CompiledPulseArtifact:
 
     @property
     def fingerprint(self) -> str:
-        return canonical_digest(compiled_pulse_artifact_to_tree(self))
+        return self._fingerprint
 
 
 def _same_physical_trigger_schedule(

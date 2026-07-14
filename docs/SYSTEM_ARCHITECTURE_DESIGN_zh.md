@@ -3213,6 +3213,8 @@ apps/
 
 Pulse RPC 的 artifact message 不是第二个 wire owner：`encode_artifact_message/decode_artifact_message` 只能委托 `zlc_pulse.artifact` 的 current typed canonical codec，不能自行拼 `to_tree -> encode` 或 `decode -> from_tree`。这样 RPC、文件与本地调用共享同一 canonical/semantic admission；结构测试直接替换 owner 函数并验证委托，避免两个实现以后悄悄漂移。Prepared-ref 与 completion 仍由各自类型 owner 编码；此项不允许借机删除 pulse server 或任何现有/计划 consumer。
 
+PulseTarget ABI、TargetIR、PulseWireImage、CompiledPulseArtifact 与已经通过构造验证的 terminal/tail evidence 都是 immutable value；其 canonical identity 在成功 `__post_init__`/root decode 的末尾计算一次，getter 只返回缓存，不为检测 `object.__setattr__` 反射而反复重建全树。Wire image 的 digest payload 与公开 tree 必须共用同一个不含 digest 的 private projection，禁止维护两份字段表。Raw STATUS/CURSOR/tail observation 的 u32、recipe、sample-count、稳定性与 artifact binding 仍在对应硬件证据 owner 边界验证，缓存不能提前到 raw observation，也不能替代 completion admission。golden digest 向量和“构造后 monkeypatch `canonical_digest`”结构测试共同锁定值不变与只计算一次。
+
 中间迁移态的“当前 production 调用数”只是一条证据，不能单独裁决目标能力：
 
 | 能力 | 明确的终态 consumer | 审查动作 | 允许物理删除的条件 |

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 from fpga.pulse_streamer.host.image import (
@@ -21,6 +21,7 @@ class PulseWireImage:
     geometry_fingerprint: int
     source_ir_digest: str
     words: tuple[tuple[int, int], ...]
+    _digest: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         fingerprint = self.geometry_fingerprint
@@ -44,17 +45,15 @@ class PulseWireImage:
             previous = address
         object.__setattr__(self, "geometry_fingerprint", fingerprint)
         object.__setattr__(self, "words", words)
+        object.__setattr__(
+            self,
+            "_digest",
+            canonical_digest(_pulse_wire_image_payload_tree(self)),
+        )
 
     @property
     def digest(self) -> str:
-        return canonical_digest(
-            {
-                "schema": "zlc_pulse.PulseWireImage",
-                "geometry_fingerprint": self.geometry_fingerprint,
-                "source_ir_digest": self.source_ir_digest,
-                "words": [list(item) for item in self.words],
-            }
-        )
+        return self._digest
 
     def as_dict(self) -> dict[int, int]:
         return dict(self.words)
@@ -98,7 +97,7 @@ def pack_target_ir(
     )
 
 
-def pulse_wire_image_to_tree(value: PulseWireImage) -> dict[str, object]:
+def _pulse_wire_image_payload_tree(value: PulseWireImage) -> dict[str, object]:
     if not isinstance(value, PulseWireImage):
         raise TypeError("value must be PulseWireImage")
     return {
@@ -106,8 +105,11 @@ def pulse_wire_image_to_tree(value: PulseWireImage) -> dict[str, object]:
         "geometry_fingerprint": value.geometry_fingerprint,
         "source_ir_digest": value.source_ir_digest,
         "words": [list(item) for item in value.words],
-        "digest": value.digest,
     }
+
+
+def pulse_wire_image_to_tree(value: PulseWireImage) -> dict[str, object]:
+    return {**_pulse_wire_image_payload_tree(value), "digest": value.digest}
 
 
 def pulse_wire_image_from_tree(tree: object) -> PulseWireImage:

@@ -6,6 +6,9 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import zlc_pulse.artifact as pulse_artifact_module
+import zlc_pulse.fpga as pulse_fpga_module
+import zlc_pulse.ir as pulse_ir_module
 
 from zlc_pulse import (
     PORT_CLOCK,
@@ -45,6 +48,31 @@ def test_static_artifact_binds_source_ir_wire_and_trigger_schedule():
     assert decode_compiled_pulse_artifact(
         encode_compiled_pulse_artifact(artifact)
     ) == artifact
+
+
+def test_compiled_identity_getters_do_not_rehash_after_construction(monkeypatch):
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    artifact = compile_pulse_artifact(
+        document,
+        clock_hz=50e6,
+        execution_form=PulseExecutionForm.STATIC_ONCE,
+        trigger_channels=("ch11",),
+    )
+    expected = (
+        artifact.target_ir.fingerprint,
+        artifact.wire_image.digest,
+        artifact.fingerprint,
+    )
+
+    def unexpected_digest(*_args, **_kwargs):
+        raise AssertionError("immutable identity getter recomputed its canonical digest")
+
+    for module in (pulse_ir_module, pulse_fpga_module, pulse_artifact_module):
+        monkeypatch.setattr(module, "canonical_digest", unexpected_digest)
+    for _ in range(2):
+        assert artifact.target_ir.fingerprint == expected[0]
+        assert artifact.wire_image.digest == expected[1]
+        assert artifact.fingerprint == expected[2]
 
 
 def test_scan_artifact_preserves_each_physical_point_in_trigger_provenance():

@@ -9,7 +9,7 @@ none of those claims may be manufactured here.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from fpga.pulse_streamer.host.image import (
     STATUS_DONE,
@@ -61,6 +61,7 @@ class StaticOnceTerminalEvidence:
     status_second: int
     underflow_observed: bool
     status_sample_count: int
+    _fingerprint: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.read_recipe_id != STATIC_STATUS_READ_RECIPE:
@@ -73,10 +74,15 @@ class StaticOnceTerminalEvidence:
         samples = _nonnegative_int(self.status_sample_count, "status_sample_count")
         if samples < 2:
             raise ValueError("terminal evidence requires at least two STATUS samples")
+        object.__setattr__(
+            self,
+            "_fingerprint",
+            canonical_digest(hardware_terminal_evidence_to_tree(self)),
+        )
 
     @property
     def fingerprint(self) -> str:
-        return canonical_digest(hardware_terminal_evidence_to_tree(self))
+        return self._fingerprint
 
 
 @dataclass(frozen=True)
@@ -91,6 +97,7 @@ class AutonomousTableTerminalEvidence:
     cursor_second: int
     underflow_observed: bool
     status_sample_count: int
+    _fingerprint: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.read_recipe_id != AUTONOMOUS_TABLE_READ_RECIPE:
@@ -108,10 +115,15 @@ class AutonomousTableTerminalEvidence:
         samples = _nonnegative_int(self.status_sample_count, "status_sample_count")
         if samples < 2:
             raise ValueError("terminal evidence requires at least two STATUS samples")
+        object.__setattr__(
+            self,
+            "_fingerprint",
+            canonical_digest(hardware_terminal_evidence_to_tree(self)),
+        )
 
     @property
     def fingerprint(self) -> str:
-        return canonical_digest(hardware_terminal_evidence_to_tree(self))
+        return self._fingerprint
 
 
 PulseHardwareTerminalEvidence = (
@@ -128,6 +140,7 @@ class PostTerminalTailEvidence:
     required_tail_ticks: int
     clock_hz: float
     elapsed_ns: int
+    _fingerprint: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _sha256(self.terminal_evidence_digest, "terminal_evidence_digest")
@@ -143,10 +156,15 @@ class PostTerminalTailEvidence:
             raise ValueError("clock_hz must be finite and positive")
         object.__setattr__(self, "clock_hz", float(self.clock_hz))
         _nonnegative_int(self.elapsed_ns, "elapsed_ns")
+        object.__setattr__(
+            self,
+            "_fingerprint",
+            canonical_digest(post_terminal_tail_evidence_to_tree(self)),
+        )
 
     @property
     def fingerprint(self) -> str:
-        return canonical_digest(post_terminal_tail_evidence_to_tree(self))
+        return self._fingerprint
 
 
 @dataclass(frozen=True)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import zlc_pulse.target as pulse_target_module
 
 from zlc_pulse.target import (
     PORT_CLOCK,
@@ -49,6 +50,18 @@ def test_target_current_tree_round_trips_and_labels_do_not_change_abi():
     )
     assert relabeled.abi_fingerprint == value.abi_fingerprint
     assert len(value.abi_fingerprint) == 64
+
+
+def test_target_abi_fingerprint_is_bound_once_at_construction(monkeypatch):
+    value = target()
+    expected = value.abi_fingerprint
+
+    def unexpected_digest(*_args, **_kwargs):
+        raise AssertionError("ABI getter recomputed its canonical digest")
+
+    monkeypatch.setattr(pulse_target_module, "canonical_digest", unexpected_digest)
+    assert value.abi_fingerprint == expected
+    assert value.abi_fingerprint == expected
 
 
 def test_shipped_current_target_loads_without_neutral_import():

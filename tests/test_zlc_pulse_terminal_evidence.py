@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import zlc_pulse.evidence as pulse_evidence_module
 import zlc_pulse.transport as pulse_transport
 
 from conftest import pulse_backend_completion_for
@@ -82,6 +83,21 @@ def test_owner_codecs_round_trip_static_table_and_host_tail_evidence():
             post_terminal_tail_evidence_to_tree(tail)
         ) == tail
         validate_backend_completion_for_artifact(completion, artifact)
+
+
+def test_validated_terminal_evidence_identity_is_bound_once(monkeypatch):
+    completion = pulse_backend_completion_for(_static_artifact())
+    terminal = completion.hardware_terminal
+    tail = completion.post_terminal_tail
+    expected = (terminal.fingerprint, tail.fingerprint)
+
+    def unexpected_digest(*_args, **_kwargs):
+        raise AssertionError("terminal evidence getter recomputed its canonical digest")
+
+    monkeypatch.setattr(pulse_evidence_module, "canonical_digest", unexpected_digest)
+    for _ in range(2):
+        assert terminal.fingerprint == expected[0]
+        assert tail.fingerprint == expected[1]
 
 
 def test_neutral_terminal_ack_codec_preserves_hardware_and_simulated_receipts():

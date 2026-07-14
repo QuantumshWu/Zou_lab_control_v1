@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from importlib.resources import files
 from pathlib import Path
@@ -94,6 +94,7 @@ class PulsePortSpec:
 class PulseTarget:
     raw_lanes: tuple[str, ...]
     ports: tuple[PulsePortSpec, ...]
+    _abi_fingerprint: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         raw = tuple(_text(lane, "target raw lane") for lane in self.raw_lanes)
@@ -134,6 +135,25 @@ class PulseTarget:
             raise ValueError("DAC bus indices must be contiguous from zero")
         object.__setattr__(self, "raw_lanes", raw)
         object.__setattr__(self, "ports", ports)
+        # Labels are presentation-only and intentionally excluded from the ABI.
+        object.__setattr__(
+            self,
+            "_abi_fingerprint",
+            canonical_digest(
+                {
+                    "schema": "zlc_pulse.PulseTargetABI/v1",
+                    "raw_lanes": list(raw),
+                    "ports": [
+                        {
+                            key: value
+                            for key, value in pulse_port_to_tree(port).items()
+                            if key != "label"
+                        }
+                        for port in ports
+                    ],
+                }
+            ),
+        )
 
     @property
     def by_key(self) -> dict[str, PulsePortSpec]:
@@ -141,21 +161,7 @@ class PulseTarget:
 
     @property
     def abi_fingerprint(self) -> str:
-        # Labels are presentation-only and intentionally excluded from the ABI.
-        return canonical_digest(
-            {
-                "schema": "zlc_pulse.PulseTargetABI/v1",
-                "raw_lanes": list(self.raw_lanes),
-                "ports": [
-                    {
-                        key: value
-                        for key, value in pulse_port_to_tree(port).items()
-                        if key != "label"
-                    }
-                    for port in self.ports
-                ],
-            }
-        )
+        return self._abi_fingerprint
 
 
 def pulse_port_to_tree(port: PulsePortSpec) -> dict[str, object]:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 from zlc_storage import (
@@ -89,6 +89,7 @@ class TargetIR:
     bus_delays: tuple[TargetBusDelay, ...] = ()
     channel_delays: tuple[int, ...] = ()
     clk_enable: int = 0
+    _fingerprint: str = field(init=False, repr=False, compare=False)
 
     @property
     def slot_count(self) -> int:
@@ -324,6 +325,11 @@ class TargetIR:
                         f"bus segment order overlaps or regresses at scan point {point_index}"
                     )
                 previous_by_bus[segment.bus_index] = (start, stop)
+        object.__setattr__(
+            self,
+            "_fingerprint",
+            canonical_digest(target_ir_to_tree(self)),
+        )
 
     @property
     def scan_enabled(self) -> bool:
@@ -331,7 +337,7 @@ class TargetIR:
 
     @property
     def fingerprint(self) -> str:
-        return canonical_digest(target_ir_to_tree(self))
+        return self._fingerprint
 
 
 def evaluate_affine_tick(
