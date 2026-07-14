@@ -3221,6 +3221,8 @@ Finite exact 的“event ordinal 到每个 dataset cell 的完整唯一排列”
 
 规则 4 的第一条物理 golden 使用 archived `Rb87_readout_2ms_2ms_2000_Image1` 的同一真实 qCMOS frame crop 和相邻两个 site，固定 legacy commit `6c337d49`、原始 frame/analysis 文件 SHA-256、frame/site/crop 坐标、boxes、PSF kernels 与旧 `roi_counts`/`psf_signals` 输出。测试独立比较 migrated BOX mean/sum、per-site PSF（无背景与 annulus-median）、site validity/order 及 bright-above occupancy，fixture 只有 13×22 crop，不依赖 ignored 的 32 MB archive。它证明的是“给定 legacy site/PSF 几何与阈值时，核心 feature/application 物理等价”；**不证明**当前 5×7 detector、35-site lattice、训练/阈值/quality gate 或四套 archive 的 end-to-end calibration 等价，因此规则 4 仍是 PARTIAL，必须继续建立真实 35-site detection/training golden，不能用这两个 site 宣称完成。
 
+`MonitorTap`/rolling live capability 是终态 GUI consumer 所需能力，不因当前 composition 尚未接线而删除。订阅时 `max_bytes` 必须至少覆盖 stream contract 的一个 `max_payload_bytes`；不足立即拒绝且不注册 tap，不能接受订阅后对每个合法 full-frame 都静默 drop、让 `next()` 永久等待。合法 monitor 仍使用 bounded overwrite、`missed` 计数和 latest/ordered update，且从不参与 finite exact retention 或 backpressure。
+
 中间迁移态的“当前 production 调用数”只是一条证据，不能单独裁决目标能力：
 
 | 能力 | 明确的终态 consumer | 审查动作 | 允许物理删除的条件 |

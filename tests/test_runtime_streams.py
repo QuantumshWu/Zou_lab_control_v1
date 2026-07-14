@@ -285,6 +285,13 @@ def test_exact_backlog_fails_before_overwrite_and_monitor_still_overwrites():
     monitor.close()
 
 
+def test_monitor_budget_must_retain_one_contract_payload():
+    source, _producer = stream(events=2)
+    with pytest.raises(ValueError, match="retain one maximum payload"):
+        source.monitor(max_events=2, max_bytes=source.max_payload_bytes - 1)
+    assert not source._monitors
+
+
 def test_reservation_admission_is_atomic_over_event_and_byte_capacity():
     source, _producer = stream(events=4)
     first = source.reserve(

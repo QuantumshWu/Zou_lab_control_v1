@@ -1290,6 +1290,8 @@ class MonitorTap(Generic[PayloadT]):
         self._stream = stream
         self.max_events = _positive_int(max_events, "monitor max_events")
         self.max_bytes = _positive_int(max_bytes, "monitor max_bytes")
+        if self.max_bytes < stream.max_payload_bytes:
+            raise ValueError("monitor max_bytes must retain one maximum payload")
         self._condition = threading.Condition(threading.Lock())
         self._queue: deque[_Stored[PayloadT]] = deque()
         self._retained_bytes = 0
@@ -1306,12 +1308,6 @@ class MonitorTap(Generic[PayloadT]):
     def _offer(self, stored: _Stored[PayloadT]) -> None:
         with self._condition:
             if self._closed or self._source_finished:
-                return
-            if stored.payload_bytes > self.max_bytes:
-                self._missed += len(self._queue) + 1
-                self._queue.clear()
-                self._retained_bytes = 0
-                self._condition.notify_all()
                 return
             while self._queue and (
                 len(self._queue) >= self.max_events
