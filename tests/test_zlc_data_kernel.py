@@ -199,7 +199,11 @@ def test_dataset_component_validity_includes_repeat_and_physical_point_axes():
 
 def test_datablock_owns_intrinsically_immutable_bytes():
     schema = dataset_schema()
-    source = np.arange(np.prod(schema.physical_shape), dtype=np.uint16).reshape(schema.physical_shape)
+    source = np.arange(np.prod(schema.physical_shape), dtype=np.uint16).reshape(
+        schema.physical_shape
+    )[..., ::-1]
+    assert not source.flags.c_contiguous
+    expected = source.copy()
     block = DataBlock(
         BlockId("capture-immutable"),
         DatasetRevision(7),
@@ -207,6 +211,7 @@ def test_datablock_owns_intrinsically_immutable_bytes():
         CellValidity(np.ones((2, 3), dtype=bool)),
         schema,
     )
+    np.testing.assert_array_equal(block.values, expected)
     before = block.values.copy()
     source[...] = 0
     np.testing.assert_array_equal(block.values, before)

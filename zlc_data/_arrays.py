@@ -38,7 +38,7 @@ def immutable_array(values, *, dtype: np.dtype, shape: tuple[int, ...]) -> np.nd
         raise TypeError(f"values dtype {source.dtype} does not match schema dtype {dtype}")
     if source.shape != shape:
         raise ValueError(f"values shape {source.shape} does not match expected {shape}")
-    normalized = np.ascontiguousarray(source.astype(dtype, copy=False)).reshape(shape)
+    normalized = source.astype(dtype, copy=False)
     result = np.frombuffer(normalized.tobytes(order="C"), dtype=dtype).reshape(shape)
     result.setflags(write=False)
     return result

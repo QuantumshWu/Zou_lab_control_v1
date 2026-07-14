@@ -177,7 +177,7 @@ def display_axis_indices(
     if isinstance(term, IndexSelection):
         if term.index >= axis.size:
             raise IndexError(f"selection index is outside axis {axis.axis_id}")
-        return (term.index,)
+        return range(term.index, term.index + 1)
     if isinstance(term, IndexRangeSelection):
         if term.stop > axis.size:
             raise IndexError(f"selection range is outside axis {axis.axis_id}")
@@ -193,14 +193,16 @@ def display_axis_indices(
         for coordinate in axis.coordinates
     ):
         raise ValueError(f"coordinate selection axis {axis.axis_id} is not numeric")
-    indices = tuple(
+    indices = [
         index
         for index, coordinate in enumerate(axis.coordinates)
         if term.lower <= coordinate <= term.upper
-    )
+    ]
     if not indices:
         raise ValueError(f"coordinate selection is empty for axis {axis.axis_id}")
-    return indices
+    if indices[-1] - indices[0] + 1 == len(indices):
+        return range(indices[0], indices[-1] + 1)
+    return tuple(indices)
 
 
 def _display_axis_cardinality(axis, selections) -> int:
@@ -226,6 +228,17 @@ def _repeat_mode_for_binding(binding) -> RepeatViewMode:
     raise ValueError("repeat axis has an unsupported presentation binding")
 
 
+def _display_dtype_issue(schema: DatasetSchema, intent: ViewIntent) -> str | None:
+    """Return the one value-domain issue the current ViewSpec cannot express."""
+
+    if schema.cell_schema.dtype.kind == "c" and intent is not ViewIntent.METER:
+        return (
+            f"{intent.value} does not define a complex-value projection; "
+            "select an explicit real, imaginary, magnitude, or phase transform first"
+        )
+    return None
+
+
 def validate_view_spec(
     schema: DatasetSchema,
     spec: ViewSpec,
@@ -242,6 +255,9 @@ def validate_view_spec(
         raise ValueError("view contract does not match ViewSpec intent")
     if spec.schema_fingerprint != schema.fingerprint:
         raise ValueError("ViewSpec schema fingerprint is stale")
+    dtype_issue = _display_dtype_issue(schema, spec.intent)
+    if dtype_issue is not None:
+        raise ValueError(dtype_issue)
     axes = dataset_axes(schema)
     expected_ids = tuple(axis.axis_id for axis in axes)
     actual_ids = tuple(binding.axis_id for binding in spec.axis_bindings)

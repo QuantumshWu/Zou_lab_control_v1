@@ -14,7 +14,13 @@ from typing import Any
 
 import numpy as np
 
-from zlc_data import AxisId, AxisRoleId, DatasetRevisionRef, Selection
+from zlc_data import (
+    AxisId,
+    AxisRoleId,
+    DatasetRevisionRef,
+    Selection,
+    immutable_array,
+)
 from zlc_storage.canonical import (
     canonical_text as _text,
     nonnegative_integer as _nonnegative,
@@ -22,16 +28,26 @@ from zlc_storage.canonical import (
 )
 
 
-def readonly_array(value: object, *, ndim: int | None = None) -> np.ndarray:
-    """Return an owned read-only array for transient evaluator DTOs."""
+def _immutable_evaluated_array(
+    value: object,
+    *,
+    ndim: int | None = None,
+    boolean: bool = False,
+) -> np.ndarray:
+    """Freeze one evaluator DTO array on the shared immutable-bytes primitive."""
 
-    result = np.array(value, copy=True)
-    if ndim is not None and result.ndim != ndim:
-        raise ValueError(f"array must have rank {ndim}, got {result.ndim}")
-    if result.dtype.kind not in "biufc":
+    source = np.asarray(value)
+    if ndim is not None and source.ndim != ndim:
+        raise ValueError(f"array must have rank {ndim}, got {source.ndim}")
+    if source.dtype.kind not in "biufc":
         raise TypeError("evaluated arrays must have a numeric or boolean dtype")
-    result.setflags(write=False)
-    return result
+    if boolean and source.dtype != np.dtype(bool):
+        raise TypeError(f"evaluated validity dtype must be bool, got {source.dtype}")
+    return immutable_array(
+        source,
+        dtype=source.dtype.newbyteorder("<"),
+        shape=source.shape,
+    )
 
 
 class ViewIntent(str, Enum):
@@ -516,9 +532,12 @@ class EvaluatedImage:
     def __post_init__(self) -> None:
         if not isinstance(self.x_axis, EvaluatedAxis) or not isinstance(self.y_axis, EvaluatedAxis):
             raise TypeError("image axes must be EvaluatedAxis values")
-        values = readonly_array(self.values, ndim=2)
-        validity = readonly_array(self.validity, ndim=2).astype(bool, copy=False)
-        validity.setflags(write=False)
+        values = _immutable_evaluated_array(self.values, ndim=2)
+        validity = _immutable_evaluated_array(
+            self.validity,
+            ndim=2,
+            boolean=True,
+        )
         expected = (len(self.y_axis.indices), len(self.x_axis.indices))
         if values.shape != expected or validity.shape != expected:
             raise ValueError("image arrays do not match y/x axes")
@@ -535,9 +554,12 @@ class EvaluatedCurve:
     def __post_init__(self) -> None:
         if not isinstance(self.x_axis, EvaluatedAxis):
             raise TypeError("curve x_axis must be EvaluatedAxis")
-        values = readonly_array(self.values, ndim=1)
-        validity = readonly_array(self.validity, ndim=1).astype(bool, copy=False)
-        validity.setflags(write=False)
+        values = _immutable_evaluated_array(self.values, ndim=1)
+        validity = _immutable_evaluated_array(
+            self.validity,
+            ndim=1,
+            boolean=True,
+        )
         if values.shape != (len(self.x_axis.indices),) or validity.shape != values.shape:
             raise ValueError("curve arrays do not match x axis")
         object.__setattr__(self, "values", values)
@@ -562,7 +584,7 @@ class EvaluatedHistogram:
     dropped_count: int
 
     def __post_init__(self) -> None:
-        samples = readonly_array(self.samples, ndim=1)
+        samples = _immutable_evaluated_array(self.samples, ndim=1)
         coordinates = tuple(self.sample_coordinates)
         if any(not isinstance(item, SampleCoordinates) for item in coordinates):
             raise TypeError("sample_coordinates must contain SampleCoordinates values")

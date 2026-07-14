@@ -6,6 +6,7 @@ from dataclasses import replace
 import importlib
 from pathlib import Path
 import time
+import tracemalloc
 
 import numpy as np
 import pytest
@@ -41,6 +42,7 @@ from zlc_frontend.figure import (
     DatasetId,
     DisplayReduction,
     DisplayReductionMethod,
+    EvaluatedAxis,
     EvaluatedCurve,
     EvaluatedHistogram,
     EvaluatedImage,
@@ -550,17 +552,17 @@ def test_evaluation_policy_cancels_and_rejects_before_materialization(monkeypatc
     large_doc, large_datasets = document(large_block, large_view)
     with pytest.raises(FigureEvaluationLimitExceeded, match="physical_rows"):
         FigureEvaluator().evaluate(large_doc, large_datasets)
-    materialized_policy = FigureEvaluationPolicy(
+    live_memory_policy = FigureEvaluationPolicy(
         max_physical_rows=2_000_000,
         max_reduction_contributions=2_000_000,
-        max_materialized_nbytes=6_000_000,
+        max_live_nbytes=6_000_000,
     )
-    with pytest.raises(FigureEvaluationLimitExceeded, match="materialized_nbytes"):
-        FigureEvaluator(materialized_policy).evaluate(large_doc, large_datasets)
+    with pytest.raises(FigureEvaluationLimitExceeded, match="live_nbytes"):
+        FigureEvaluator(live_memory_policy).evaluate(large_doc, large_datasets)
     contribution_policy = FigureEvaluationPolicy(
         max_physical_rows=2_000_000,
         max_reduction_contributions=500_000,
-        max_materialized_nbytes=512 * 1024 * 1024,
+        max_live_nbytes=512 * 1024 * 1024,
     )
     with pytest.raises(FigureEvaluationLimitExceeded, match="reduction_contributions"):
         FigureEvaluator(contribution_policy).evaluate(large_doc, large_datasets)
@@ -603,35 +605,268 @@ def test_real_36_by_32_grid_has_bounded_end_to_end_latency():
     assert elapsed < 1.25
 
 
-def test_default_resource_policy_preserves_one_qcmos_frame():
+def test_public_evaluator_preserves_one_full_qcmos_frame_with_bounded_peak():
     repeat = AxisSpec(AxisId("camera-repeat"), "camera repeat", REPEAT, 1)
     point = AxisSpec(AxisId("camera-point"), "camera point", SCAN_POINT, 1)
-    x = AxisSpec(AxisId("camera-x"), "camera x", SPATIAL_X, 1920)
-    y = AxisSpec(AxisId("camera-y"), "camera y", SPATIAL_Y, 1200)
+    y = AxisSpec(AxisId("camera-y"), "camera y", SPATIAL_Y, 2304)
+    x = AxisSpec(AxisId("camera-x"), "camera x", SPATIAL_X, 2304)
+    values = np.zeros((1, 1, 2304, 2304), dtype=np.uint16)
+    values[0, 0, 0, 0] = 11
+    values[0, 0, -1, -1] = 22
     block = make_block(
-        np.zeros((1, 1, 1920, 1200), dtype=np.uint16),
+        values,
         repeat_axis=repeat,
         point_axes=(point,),
         point_layout=PointLayout.rect_c((1,)),
-        data_axes=(x, y),
+        data_axes=(y, x),
     )
     view = suggest_view(block.schema, ViewIntent.IMAGE).spec
-    evaluator_module = importlib.import_module("zlc_frontend.figure.evaluate")
-    allowed = evaluator_module._selection_index_sets(block, view)
-    physical_rows, contributions, workspace = (
-        evaluator_module._layer_resource_upper_bound(block, allowed, {}, view)
+    doc, datasets = document(block, view)
+
+    tracemalloc.start()
+    with pytest.raises(FigureEvaluationLimitExceeded, match="live_nbytes"):
+        FigureEvaluator(
+            FigureEvaluationPolicy(max_live_nbytes=16 * 1024 * 1024)
+        ).evaluate(doc, datasets)
+    _, rejected_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert rejected_peak < 2 * 1024 * 1024
+
+    tracemalloc.start()
+    started = time.perf_counter()
+    evaluated = FigureEvaluator().evaluate(doc, datasets)
+    elapsed = time.perf_counter() - started
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    series = only_series(evaluated)
+    image = series.data
+    assert isinstance(image, EvaluatedImage)
+    assert image.x_axis.axis_id == x.axis_id
+    assert image.y_axis.axis_id == y.axis_id
+    assert image.values.shape == (2304, 2304)
+    assert image.values.dtype == np.dtype("<u2")
+    assert (image.values[0, 0], image.values[-1, -1]) == (11, 22)
+    assert image.validity.dtype == np.dtype(bool) and bool(np.all(image.validity))
+    assert series.reductions[0].axis_ids == (repeat.axis_id,)
+    assert series.reductions[0].minimum_contributors == 1
+    assert series.reductions[0].maximum_contributors == 1
+    assert not np.shares_memory(image.values, block.values)
+    with pytest.raises(ValueError):
+        image.values.setflags(write=True)
+    with pytest.raises(ValueError):
+        image.validity.setflags(write=True)
+    retained = image.values.nbytes + image.validity.nbytes
+    assert peak < 2.75 * retained
+    assert elapsed < 1.0
+    assert block.values.shape == (1, 1, 2304, 2304)
+    assert block.values.dtype == np.dtype("<u2")
+    assert (block.values[0, 0, 0, 0], block.values[0, 0, -1, -1]) == (11, 22)
+
+
+@pytest.mark.parametrize("data_order", ("yx", "xy"))
+def test_image_orientation_follows_axis_ids_not_trailing_shape(data_order):
+    repeat = axis("orientation-repeat", REPEAT, 1)
+    point = axis("orientation-point", SCAN_POINT, 1)
+    y = axis("orientation-y", SPATIAL_Y, 2)
+    x = axis("orientation-x", SPATIAL_X, 3)
+    expected = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.uint16)
+    data_axes = (y, x) if data_order == "yx" else (x, y)
+    stored = expected if data_order == "yx" else expected.T
+    block = make_block(
+        stored.reshape((1, 1, *stored.shape)),
+        repeat_axis=repeat,
+        point_axes=(point,),
+        point_layout=PointLayout.rect_c((1,)),
+        data_axes=data_axes,
     )
-    cells, series, output_elements, histogram_samples = (
-        evaluator_module._layer_budget(view, allowed)
+    image = only_series(
+        evaluated_data(block, suggest_view(block.schema, ViewIntent.IMAGE).spec)
+    ).data
+    np.testing.assert_array_equal(image.values, expected)
+    assert image.values.shape == (y.size, x.size)
+
+
+def test_sparse_coordinate_image_selects_narrowest_axis_before_large_gather():
+    frame = CoordinateFrameId("sparse-camera")
+    repeat = axis("sparse-repeat", REPEAT, 1)
+    point = axis("sparse-point", SCAN_POINT, 1)
+    y_coordinates = tuple(
+        index // 2 if index % 2 == 0 else 10_000 + index // 2
+        for index in range(1024)
     )
-    policy = FigureEvaluationPolicy()
-    assert physical_rows <= policy.max_physical_rows
-    assert contributions <= policy.max_reduction_contributions
-    assert workspace <= policy.max_materialized_nbytes
-    assert cells <= policy.max_cells and series <= policy.max_series
-    assert output_elements == 1920 * 1200
-    assert output_elements <= policy.max_output_elements
-    assert histogram_samples == 0
+    x_coordinates = (0, *(10_000 + index for index in range(1022)), 1)
+    y = axis("sparse-y", SPATIAL_Y, 1024, coordinates=y_coordinates, frame=frame)
+    x = axis("sparse-x", SPATIAL_X, 1024, coordinates=x_coordinates, frame=frame)
+    values = np.arange(1024 * 1024, dtype=np.uint16).reshape(1, 1, 1024, 1024)
+    block = make_block(
+        values,
+        repeat_axis=repeat,
+        point_axes=(point,),
+        point_layout=PointLayout.rect_c((1,)),
+        data_axes=(y, x),
+    )
+    selection = Selection.rectangle(
+        x.axis_id,
+        y.axis_id,
+        0,
+        1,
+        0,
+        511,
+        coordinate_frame=frame,
+    )
+    view = suggest_view(block.schema, ViewIntent.IMAGE, selection).spec
+    doc, datasets = document(block, view)
+    tracemalloc.start()
+    image = only_series(
+        FigureEvaluator(
+            FigureEvaluationPolicy(max_live_nbytes=512 * 1024)
+        ).evaluate(doc, datasets)
+    ).data
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    np.testing.assert_array_equal(
+        image.values,
+        block.values[0, 0, ::2][:, (0, -1)],
+    )
+    assert image.values.shape == (512, 2)
+    assert peak < 512 * 1024
+
+
+def test_single_repeat_image_keeps_component_axes_and_invalid_components():
+    repeat = axis("component-repeat", REPEAT, 1)
+    point = axis("component-point", SCAN_POINT, 1)
+    component = axis("component", COMPONENT, 2)
+    y = axis("component-y", SPATIAL_Y, 2)
+    x = axis("component-x", SPATIAL_X, 3)
+    values = np.arange(1, 13, dtype=np.uint16).reshape(1, 1, 2, 2, 3)
+    valid = np.ones(values.shape, dtype=bool)
+    valid[0, 0, 1, 1, 2] = False
+    block = make_block(
+        values,
+        repeat_axis=repeat,
+        point_axes=(point,),
+        point_layout=PointLayout.rect_c((1,)),
+        data_axes=(component, y, x),
+        validity=ComponentValidity(
+            (component.axis_id, y.axis_id, x.axis_id),
+            valid,
+        ),
+        component_axes=(component.axis_id, y.axis_id, x.axis_id),
+    )
+    suggestion = suggest_view(block.schema, ViewIntent.IMAGE)
+    assert suggestion.status is SuggestionStatus.RESOLVED
+    evaluated = evaluated_data(block, suggestion.spec)
+    assert len(evaluated.layers[0].cells) == 2
+    for component_index, cell in enumerate(evaluated.layers[0].cells):
+        assert cell.facet_address[0].axis_id == component.axis_id
+        assert cell.facet_address[0].index == component_index
+        image = cell.series[0].data
+        expected = values[0, 0, component_index].copy()
+        expected_valid = valid[0, 0, component_index]
+        expected = np.where(expected_valid, expected, np.uint16(0))
+        np.testing.assert_array_equal(image.values, expected)
+        np.testing.assert_array_equal(image.validity, expected_valid)
+        assert image.values.dtype == np.dtype("<u2")
+    second_reduction = evaluated.layers[0].cells[1].series[0].reductions[0]
+    assert second_reduction.minimum_contributors == 0
+    assert second_reduction.maximum_contributors == 1
+
+
+def test_multi_repeat_integer_mean_remains_canonical_and_fractional():
+    repeat = axis("integer-repeat", REPEAT, 2)
+    point = axis("integer-point", SCAN_POINT, 1)
+    y = axis("integer-y", SPATIAL_Y, 1)
+    x = axis("integer-x", SPATIAL_X, 2)
+    values = np.array([[[[0, 2]]], [[[1, 3]]]], dtype=np.uint16)
+    block = make_block(
+        values,
+        repeat_axis=repeat,
+        point_axes=(point,),
+        point_layout=PointLayout.rect_c((1,)),
+        data_axes=(y, x),
+    )
+    series = only_series(
+        evaluated_data(block, suggest_view(block.schema, ViewIntent.IMAGE).spec)
+    )
+    assert series.data.values.dtype == np.dtype("<f8")
+    np.testing.assert_array_equal(series.data.values, [[0.5, 2.5]])
+    assert series.reductions[0].minimum_contributors == 2
+    assert series.reductions[0].maximum_contributors == 2
+
+
+def test_latest_point_admission_counts_visible_frame_not_rolling_history():
+    repeat = axis("rolling-repeat", REPEAT, 1)
+    point = axis("rolling-point", SCAN_POINT, 8)
+    y = axis("rolling-y", SPATIAL_Y, 64)
+    x = axis("rolling-x", SPATIAL_X, 64)
+    values = np.empty((1, 8, 64, 64), dtype=np.uint16)
+    for point_index in range(point.size):
+        values[0, point_index] = point_index
+    block = make_block(
+        values,
+        repeat_axis=repeat,
+        point_axes=(point,),
+        point_layout=PointLayout.rect_c((point.size,)),
+        data_axes=(y, x),
+    )
+    view = suggest_view(block.schema, ViewIntent.IMAGE).spec
+    doc, datasets = document(block, view)
+    evaluated = FigureEvaluator(
+        FigureEvaluationPolicy(max_reduction_contributions=4_100)
+    ).evaluate(doc, datasets)
+    layer = evaluated.layers[0]
+    assert layer.resolutions[0].axis_id == point.axis_id
+    assert layer.resolutions[0].index == 7
+    np.testing.assert_array_equal(only_series(evaluated).data.values, 7.0)
+
+
+def test_evaluated_validity_is_exact_bool_and_complex_views_fail_closed():
+    x_out = EvaluatedAxis(AxisId("dto-x"), "x", None, (0,), (0,))
+    y_out = EvaluatedAxis(AxisId("dto-y"), "y", None, (0,), (0,))
+    with pytest.raises(TypeError, match="validity dtype must be bool"):
+        EvaluatedImage(
+            x_out,
+            y_out,
+            np.zeros((1, 1), dtype=np.float64),
+            np.ones((1, 1), dtype=np.uint8),
+        )
+    with pytest.raises(TypeError, match="validity dtype must be bool"):
+        EvaluatedCurve(
+            x_out,
+            np.zeros((1,), dtype=np.float64),
+            np.array([np.nan]),
+        )
+
+    repeat = axis("complex-repeat", REPEAT, 1)
+    point = axis("complex-point", SCAN_POINT, 1)
+    y = axis("complex-y", SPATIAL_Y, 1)
+    x = axis("complex-x", SPATIAL_X, 1)
+    complex_block = make_block(
+        np.ones((1, 1, 1, 1), dtype=np.complex128),
+        repeat_axis=repeat,
+        point_axes=(point,),
+        point_layout=PointLayout.rect_c((1,)),
+        data_axes=(y, x),
+    )
+    suggestion = suggest_view(complex_block.schema, ViewIntent.IMAGE)
+    assert suggestion.status is SuggestionStatus.NEEDS_INPUT
+    assert suggestion.reasons[0].code == "CONTRACT_REJECTED"
+    assert "complex-value projection" in suggestion.reasons[0].message
+
+    real_block = make_block(
+        np.ones((1, 1, 1, 1), dtype=np.float64),
+        repeat_axis=repeat,
+        point_axes=(point,),
+        point_layout=PointLayout.rect_c((1,)),
+        data_axes=(y, x),
+    )
+    manual_complex_view = replace(
+        suggest_view(real_block.schema, ViewIntent.IMAGE).spec,
+        schema_fingerprint=complex_block.schema.fingerprint,
+    )
+    with pytest.raises(ValueError, match="complex-value projection"):
+        validate_view_spec(complex_block.schema, manual_complex_view)
 
 
 def test_500k_histogram_default_budget_rejects_before_materialization(monkeypatch):
