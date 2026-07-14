@@ -246,6 +246,25 @@ def test_pulse_ir_digest_and_affine_formulas_have_one_owner():
     )
 
 
+def test_zlc_data_typed_byte_admission_has_one_owner():
+    violations = []
+    for source in (ROOT / "zlc_data").rglob("*.py"):
+        relative = source.relative_to(ROOT)
+        if relative == Path("zlc_data/codec.py"):
+            continue
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(relative))
+        for node in tree.body:
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name in {"_require_canonical", "_require_typed_canonical"}
+            ):
+                violations.append(f"{relative}:{node.lineno} defines {node.name}")
+    assert not violations, (
+        "zlc_data.codec owns typed canonical-byte admission; sibling codecs "
+        "must delegate:\n" + "\n".join(violations)
+    )
+
+
 def test_readout_artifacts_do_not_restore_edit_counter_metadata():
     forbidden = {
         "algorithm_id",

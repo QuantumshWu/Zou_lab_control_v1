@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from numbers import Real
 from typing import Any
 
 import numpy as np
@@ -12,11 +11,18 @@ from zlc_storage.canonical import (
     decode,
     encode,
     exact_mapping as _exact_map,
+    finite_real,
     integer as _integer,
 )
 
 from .axis import AxisId
-from .codec import TypedCodecError, axis_from_tree, axis_layout_from_tree, axis_layout_to_tree, axis_to_tree
+from .codec import (
+    _require_typed_canonical,
+    axis_from_tree,
+    axis_layout_from_tree,
+    axis_layout_to_tree,
+    axis_to_tree,
+)
 from .fit_contract import (
     FitAcceptance,
     FitBatchStatus,
@@ -101,7 +107,7 @@ def encode_fit_spec(spec: FitSpec) -> bytes:
 
 def decode_fit_spec(payload: bytes) -> FitSpec:
     spec = fit_spec_from_tree(decode(payload))
-    _require_canonical(payload, encode_fit_spec(spec), FIT_SPEC_SCHEMA)
+    _require_typed_canonical(payload, encode_fit_spec(spec), FIT_SPEC_SCHEMA)
     return spec
 
 
@@ -228,7 +234,11 @@ def encode_fit_result_batch(result: FitResultBatch) -> bytes:
 
 def decode_fit_result_batch(payload: bytes) -> FitResultBatch:
     result = fit_result_batch_from_tree(decode(payload))
-    _require_canonical(payload, encode_fit_result_batch(result), FIT_RESULT_BATCH_SCHEMA)
+    _require_typed_canonical(
+        payload,
+        encode_fit_result_batch(result),
+        FIT_RESULT_BATCH_SCHEMA,
+    )
     return result
 
 
@@ -288,10 +298,13 @@ def _numeric_policy_from_tree(tree: Any) -> FitNumericPolicy:
     )
     return FitNumericPolicy(
         max_evaluations=_integer(data["max_evaluations"], "max_evaluations"),
-        max_seconds_per_batch=_real(
+        max_seconds_per_batch=finite_real(
             data["max_seconds_per_batch"], "max_seconds_per_batch"
         ),
-        max_total_seconds=_real(data["max_total_seconds"], "max_total_seconds"),
+        max_total_seconds=finite_real(
+            data["max_total_seconds"],
+            "max_total_seconds",
+        ),
         max_batch_cells=_integer(data["max_batch_cells"], "max_batch_cells"),
         sample_budget_per_batch=_integer(
             data["sample_budget_per_batch"], "sample_budget_per_batch"
@@ -299,7 +312,10 @@ def _numeric_policy_from_tree(tree: Any) -> FitNumericPolicy:
         max_packed_observations=_integer(
             data["max_packed_observations"], "max_packed_observations"
         ),
-        covariance_rcond=_real(data["covariance_rcond"], "covariance_rcond"),
+        covariance_rcond=finite_real(
+            data["covariance_rcond"],
+            "covariance_rcond",
+        ),
     )
 
 
@@ -327,22 +343,8 @@ def _revision_ref_from_tree(tree: Any) -> DatasetRevisionRef:
     )
 
 
-def _require_canonical(got: bytes, expected: bytes, schema_id: str) -> None:
-    if bytes(got) != expected:
-        raise TypedCodecError(f"{schema_id} payload uses a non-canonical typed representation")
-
-
-def _real(value: Any, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise ValueError(f"{field} must be a real number")
-    result = float(value)
-    if not np.isfinite(result):
-        raise ValueError(f"{field} must be finite")
-    return result
-
-
 def _optional_real(value: Any, field: str) -> float | None:
-    return None if value is None else _real(value, field)
+    return None if value is None else finite_real(value, field)
 
 
 __all__ = [
