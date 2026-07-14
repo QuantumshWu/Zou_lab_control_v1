@@ -707,7 +707,7 @@ def test_raw_worker_cannot_bypass_guard_and_guard_runs_before_consumer_claim():
     assert call["bound"].execution_guard is guard
 
 
-def test_bound_processor_rejects_execution_guard_identity_drift():
+def test_worker_authorization_rejects_execution_guard_identity_drift():
     guard = RecordingExecutionGuard()
     item = chain(
         execution_guard_schema_id=guard.schema_id,
@@ -718,8 +718,9 @@ def test_bound_processor_rejects_execution_guard_identity_drift():
     assert len(original_fingerprint) == 64
 
     guard._binding_fingerprint = "f" * 64
+    assert bound.fingerprint == original_fingerprint
     with pytest.raises(ValueError, match="binding fingerprint changed"):
-        _ = bound.fingerprint
+        bound._validated_execution_guard()
 
     guard._binding_fingerprint = "e" * 64
     guard._schema_id = "test.mutated-guard"
@@ -732,6 +733,20 @@ def test_bound_processor_rejects_execution_guard_identity_drift():
     with pytest.raises(ValueError, match="owner changed"):
         bound._validated_execution_guard()
     object.__setattr__(bound, "execution_guard", guard)
+    item.worker.close(2.0)
+
+
+def test_bound_processor_fingerprint_is_computed_once_at_bind(monkeypatch):
+    item = chain()
+    bound = item.worker._bound
+    expected = bound.fingerprint
+
+    def unexpected_digest(_value):
+        raise AssertionError("fingerprint access recalculated its canonical digest")
+
+    monkeypatch.setattr(stream_contract, "canonical_digest", unexpected_digest)
+    assert bound.fingerprint == expected
+    assert bound.fingerprint == expected
     item.worker.close(2.0)
 
 

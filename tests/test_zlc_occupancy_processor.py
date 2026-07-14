@@ -940,7 +940,7 @@ def test_dataset_adapter_has_one_canonical_counts_projection_and_occupied_metada
         bound.output_edge.metadata_contract.digest(scalar_validity_metadata)
 
 
-def test_bound_authority_is_sealed_and_rejects_config_drift(
+def test_bound_authority_hides_generic_processor_and_validates_replacements(
     trusted_calibration,
 ):
     session = _source_session(trusted_calibration, points=1)
@@ -991,20 +991,6 @@ def test_bound_authority_is_sealed_and_rejects_config_drift(
             counts_schema=replace(config.counts_schema, value_unit="electron"),
         )
 
-    object.__setattr__(
-        processor,
-        "config",
-        replace(config, calibration_artifact_fingerprint="0" * 64),
-    )
-    with pytest.raises(PermissionError, match="processor semantics changed"):
-        _ = bundle.fingerprint
-    object.__setattr__(processor, "config", config)
-
-    original_inputs = processor.artifact_inputs
-    object.__setattr__(processor, "artifact_inputs", ())
-    with pytest.raises(PermissionError, match="processor semantics changed"):
-        _ = bundle.fingerprint
-    object.__setattr__(processor, "artifact_inputs", original_inputs)
     assert len(bundle.fingerprint) == 64
 
 

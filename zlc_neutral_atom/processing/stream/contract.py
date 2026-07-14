@@ -588,6 +588,7 @@ class BoundStreamProcessor:
         repr=False,
         compare=False,
     )
+    _fingerprint: str = field(init=False, repr=False, compare=False)
     execution_guard: ProcessorExecutionGuard | None = None
 
     def __post_init__(self) -> None:
@@ -596,7 +597,7 @@ class BoundStreamProcessor:
         definition = _snapshot_binding_value(self.definition)
         if not isinstance(definition, StreamProcessorDefinition):
             raise TypeError("definition snapshot changed its declared type")
-        _tree(definition)
+        definition_tree = _tree(definition)
         object.__setattr__(self, "definition", definition)
         source_output_stream_id = self.output_stream_id
         if not isinstance(source_output_stream_id, StreamId):
@@ -621,7 +622,7 @@ class BoundStreamProcessor:
         )
         if not _is_processor_binding_value(config):
             raise TypeError("processor config snapshot violated its binding contract")
-        _tree(config)
+        config_tree = _tree(config)
         object.__setattr__(self, "config", config)
         for name, contract, expected in (
             (
@@ -721,6 +722,27 @@ class BoundStreamProcessor:
             or any(parameter.default is not inspect.Parameter.empty for parameter in parameters)
         ):
             raise TypeError("operator must accept exactly payload and frozen config")
+        object.__setattr__(
+            self,
+            "_fingerprint",
+            canonical_digest(
+                {
+                    "contract": "zlc_neutral_atom.BoundStreamProcessor",
+                    "definition_key": str(definition.key),
+                    "definition": definition_tree,
+                    "config": config_tree,
+                    "output_stream_id": output_stream_id.value,
+                    "output_source_id": self.output_source_id,
+                    "operator": f"{operator.__module__}.{operator.__qualname__}",
+                    "artifact_inputs": [
+                        item.fingerprint for item in self.artifact_inputs
+                    ],
+                    "execution_guard_binding_fingerprint": (
+                        guard_binding_fingerprint
+                    ),
+                }
+            ),
+        )
 
     def _validated_execution_guard(self) -> ProcessorExecutionGuard | None:
         """Return the frozen guard only while its authority identity is stable."""
@@ -752,23 +774,7 @@ class BoundStreamProcessor:
 
     @property
     def fingerprint(self) -> str:
-        definition = self.definition
-        self._validated_execution_guard()
-        return canonical_digest(
-            {
-                "contract": "zlc_neutral_atom.BoundStreamProcessor",
-                "definition_key": str(definition.key),
-                "definition": _tree(definition),
-                "config": _tree(self.config),
-                "output_stream_id": self.output_stream_id.value,
-                "output_source_id": self.output_source_id,
-                "operator": f"{self.operator.__module__}.{self.operator.__qualname__}",
-                "artifact_inputs": [item.fingerprint for item in self.artifact_inputs],
-                "execution_guard_binding_fingerprint": (
-                    self._execution_guard_binding_fingerprint
-                ),
-            }
-        )
+        return self._fingerprint
 
 
 __all__ = [

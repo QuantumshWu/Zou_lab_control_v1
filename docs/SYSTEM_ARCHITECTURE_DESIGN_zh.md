@@ -1313,6 +1313,8 @@ output = operator(joined_inputs, config)
 
 StreamProcessor 只处理当前 Envelope payload 或声明的完整 key group，不访问设备、Hub 私有状态、latest、累计 DataBlock、Repository 或 QWidget，也不创建 Envelope。`StreamProcessorWorker` 负责 subscription、join、validation 和 publish。
 
+`BoundStreamProcessor` 在 bind 边界完成 config owner snapshot、合同匹配和一次 canonical fingerprint；之后把它当作冻结值使用，读取 lineage 只返回缓存 fingerprint，不能为了防 `object.__setattr__` 反射篡改而在每次属性访问重新遍历/哈希大 ndarray。worker 建立时仍执行一次真实的 execution authorization；Python 恶意反射不属于这里的安全模型，进程内普通代码约束依赖公开不可变接口与 composition owner。
+
 每个 StreamProcessor invocation 原则上发布一个 frozen typed payload。多个同 shot 结果组成一个 record，例如 `OccupancySample(occupied, counts, source_metadata)`；UI/下游通过 field projection 读取字段，不把同一物理结果拆成多个需要分布式原子提交的 signal。只有字段具有不同 cardinality、key 或生命周期时才拆成独立节点。
 
 operator 不读 wall clock、module global config 或 global RNG；需要随机算法时 seed/RNG algorithm 是 immutable config 与 lineage 的一部分。相同 input/config/immutable model identity 必须可重放，允许的浮点容差由 operator contract 声明。
