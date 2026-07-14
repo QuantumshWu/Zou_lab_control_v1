@@ -2002,6 +2002,8 @@ Occupancy request 携带 CalibrationArtifactRef 和已解析的 `ReadoutModelKin
 
 2026-07 的追溯整改发现，已提交的 `occupancy.py + occupancy_pipeline.py + timing/occupancy.py` 共约 2.7k production LOC，却没有 composition-root 或 notebook production caller；其唯一“大量使用者”是约 2.3k LOC 的实现镜像测试。该实现因此在本轮整改中删除，不能计为 S3 已完成能力。同一审计还删除了没有 producer/commit caller 的 `CalibrationRepository/CalibrationArtifactRef`、notebook load-only API，以及零 production consumer 的 analysis/artifact/model/codec 图。当前只保留已经有真实消费者或数据正确性依据的 FrameContract/context join、ComponentValidity、Capture exact reservation 与硬件 cleanup。S3 恢复时必须先建立上述最短公共纵切和独立 oracle，再按真实第二消费者决定是否抽象。
 
+occupancy 删除后，`zlc_neutral_atom.processing.stream` 的 1,651 production LOC、`CaptureProcessorInputBinding` 防伪 authority 和 1,915 LOC worker 测试也变成零 production consumer；本轮一并物理删除。CaptureSession 继续直接铸造唯一 exact reservation，DatasetBuilder 直接消费它；未来 concrete readout processor 若出现，先在该真实纵切内组合现有 reservation/cursor，不预建 Definition -> Bound -> Guard -> Readiness -> Worker -> StageOutput 通用层。只有第二个 production processor 证明生命周期、背压和 terminal 语义相同后才提取共享 worker。
+
 ## 14. PulseScan
 
 ### 14.1 两种明确语义

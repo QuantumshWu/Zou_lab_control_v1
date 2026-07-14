@@ -6,7 +6,6 @@ import hashlib
 import math
 import threading
 import uuid
-import weakref
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol, TypeVar
@@ -77,7 +76,6 @@ from .streams import (
 
 PayloadT = TypeVar("PayloadT")
 _COMPLETION_TOKEN = object()
-_PROCESSOR_INPUT_BINDING_TOKEN = object()
 
 
 @dataclass(frozen=True)
@@ -1363,254 +1361,6 @@ class BoundCapturePort:
         return CleanupReport.safe((proof,))
 
 
-@dataclass
-class _CaptureProcessorInputAuthority:
-    capture_contract: CaptureStreamContract
-    stream: AcquisitionStream
-    payload_contract: CapturePayloadContract
-    join_key_contract: DatasetCellKeyContract
-    input_edge: FrozenDatasetEdge
-    stream_generation: StreamGenerationId
-    session_reservation: ExactReservation | None = None
-
-
-_CAPTURE_PROCESSOR_INPUT_AUTHORITIES = weakref.WeakKeyDictionary()
-_CAPTURE_PROCESSOR_INPUT_AUTHORITIES_LOCK = threading.RLock()
-
-
-class CaptureProcessorInputBinding:
-    """Sealed process-local input authority shared with one capture session.
-
-    The binding exposes the exact owners already frozen by ``CaptureSession``;
-    it never reconstructs an equivalent payload or join-key contract.  That
-    identity is required by exact stream processors, while the redundant
-    fingerprint checks fail closed if a future construction path wires
-    semantically different contracts together.
-    """
-
-    __slots__ = (
-        "_authority",
-        "_capture_contract",
-        "_stream",
-        "_payload_contract",
-        "_join_key_contract",
-        "_input_edge",
-        "_stream_generation",
-        "__weakref__",
-    )
-
-    def __init_subclass__(cls, **_kwargs) -> None:
-        raise TypeError("CaptureProcessorInputBinding is sealed")
-
-    def __init__(
-        self,
-        authority: object,
-        *,
-        capture_contract: CaptureStreamContract,
-        stream: AcquisitionStream,
-    ) -> None:
-        if authority is not _PROCESSOR_INPUT_BINDING_TOKEN:
-            raise PermissionError(
-                "CaptureProcessorInputBinding can only be minted by CaptureSession"
-            )
-        if not isinstance(capture_contract, CaptureStreamContract):
-            raise TypeError("capture_contract must be CaptureStreamContract")
-        if not isinstance(stream, AcquisitionStream):
-            raise TypeError("stream must be AcquisitionStream")
-        input_edge = capture_contract.dataset_edge
-        if not isinstance(input_edge, FrozenDatasetEdge):
-            raise TypeError("capture contract has no FrozenDatasetEdge")
-        payload_contract = capture_contract.payload_contract
-        join_key_contract = stream._join_key_contract
-        if not isinstance(join_key_contract, DatasetCellKeyContract):
-            raise TypeError("capture stream has no DatasetCellKeyContract owner")
-        object.__setattr__(self, "_authority", authority)
-        object.__setattr__(self, "_capture_contract", capture_contract)
-        object.__setattr__(self, "_stream", stream)
-        object.__setattr__(self, "_payload_contract", payload_contract)
-        object.__setattr__(self, "_join_key_contract", join_key_contract)
-        object.__setattr__(self, "_input_edge", input_edge)
-        object.__setattr__(self, "_stream_generation", stream.generation)
-        with _CAPTURE_PROCESSOR_INPUT_AUTHORITIES_LOCK:
-            _CAPTURE_PROCESSOR_INPUT_AUTHORITIES[self] = (
-                _CaptureProcessorInputAuthority(
-                    capture_contract,
-                    stream,
-                    payload_contract,
-                    join_key_contract,
-                    input_edge,
-                    stream.generation,
-                )
-            )
-        self._validate_identity()
-
-    def __setattr__(self, _name: str, _value: object) -> None:
-        raise AttributeError("CaptureProcessorInputBinding is immutable")
-
-    def __reduce__(self):
-        raise TypeError("CaptureProcessorInputBinding is process-local")
-
-    def __reduce_ex__(self, _protocol: int):
-        raise TypeError("CaptureProcessorInputBinding is process-local")
-
-    def _require_authority(self) -> None:
-        try:
-            authority = object.__getattribute__(self, "_authority")
-        except AttributeError:
-            raise PermissionError(
-                "CaptureProcessorInputBinding was not minted by CaptureSession"
-            ) from None
-        if (
-            type(self) is not CaptureProcessorInputBinding
-            or authority is not _PROCESSOR_INPUT_BINDING_TOKEN
-        ):
-            raise PermissionError(
-                "CaptureProcessorInputBinding was not minted by CaptureSession"
-            )
-
-    def _authority_record(self) -> _CaptureProcessorInputAuthority:
-        with _CAPTURE_PROCESSOR_INPUT_AUTHORITIES_LOCK:
-            record = _CAPTURE_PROCESSOR_INPUT_AUTHORITIES.get(self)
-        if not isinstance(record, _CaptureProcessorInputAuthority):
-            raise PermissionError(
-                "CaptureProcessorInputBinding was not registered by CaptureSession"
-            )
-        return record
-
-    def _validate_identity(self) -> _CaptureProcessorInputAuthority:
-        self._require_authority()
-        record = self._authority_record()
-        capture_contract = object.__getattribute__(self, "_capture_contract")
-        stream = object.__getattribute__(self, "_stream")
-        payload_contract = object.__getattribute__(self, "_payload_contract")
-        join_key_contract = object.__getattribute__(self, "_join_key_contract")
-        input_edge = object.__getattribute__(self, "_input_edge")
-        stream_generation = object.__getattribute__(self, "_stream_generation")
-        if (
-            capture_contract is not record.capture_contract
-            or stream is not record.stream
-            or payload_contract is not record.payload_contract
-            or join_key_contract is not record.join_key_contract
-            or input_edge is not record.input_edge
-            or stream_generation is not record.stream_generation
-        ):
-            raise PermissionError(
-                "CaptureProcessorInputBinding owner graph changed after minting"
-            )
-        if capture_contract.dataset_edge is not input_edge:
-            raise RuntimeError("processor input edge differs from capture contract owner")
-        if input_edge.schema is not capture_contract.dataset_schema:
-            raise RuntimeError("processor input edge differs from capture schema owner")
-        if input_edge.event_adapter is not capture_contract.event_adapter:
-            raise RuntimeError("processor input edge differs from capture adapter owner")
-        if input_edge.expected_cells is not capture_contract.expected_cells:
-            raise RuntimeError("processor input edge differs from capture cell schedule")
-        if capture_contract.payload_contract is not payload_contract:
-            raise RuntimeError("processor payload differs from capture contract owner")
-        if input_edge.payload_contract is not payload_contract:
-            raise RuntimeError("processor payload differs from dataset edge owner")
-        if stream._payload_contract is not payload_contract:
-            raise RuntimeError("processor payload differs from capture stream owner")
-        if stream._join_key_contract is not join_key_contract:
-            raise RuntimeError("processor join key differs from capture stream owner")
-        if stream.stream_id != capture_contract.stream_id:
-            raise RuntimeError("processor stream id differs from capture contract")
-        if stream.generation != stream_generation:
-            raise RuntimeError("processor stream generation differs from its minting witness")
-        if (
-            record.session_reservation is not None
-            and record.session_reservation._stream is not stream
-        ):
-            raise RuntimeError("processor reservation belongs to another stream generation")
-        payload_fingerprint = input_edge.payload_contract_fingerprint
-        if payload_contract.fingerprint != payload_fingerprint:
-            raise RuntimeError("processor payload owner fingerprint changed")
-        if stream.payload_contract_fingerprint != payload_fingerprint:
-            raise RuntimeError("processor stream payload fingerprint differs")
-        if (
-            capture_contract.capability.payload_contract_fingerprint
-            != payload_fingerprint
-        ):
-            raise RuntimeError("processor capability payload fingerprint differs")
-        if stream.max_payload_bytes != input_edge.payload_max_retained_nbytes:
-            raise RuntimeError("processor payload byte bound differs from input edge")
-        if join_key_contract.fingerprint != input_edge.key_contract_fingerprint:
-            raise RuntimeError("processor join-key fingerprint differs from input edge")
-        input_edge.validate_stream(stream)
-        return record
-
-    @property
-    def capture_contract(self) -> CaptureStreamContract:
-        self._validate_identity()
-        return self._capture_contract
-
-    @property
-    def stream(self) -> AcquisitionStream:
-        self._validate_identity()
-        return self._stream
-
-    @property
-    def payload_contract(self) -> CapturePayloadContract:
-        self._validate_identity()
-        return self._payload_contract
-
-    @property
-    def join_key_contract(self) -> DatasetCellKeyContract:
-        self._validate_identity()
-        return self._join_key_contract
-
-    @property
-    def input_edge(self) -> FrozenDatasetEdge:
-        self._validate_identity()
-        return self._input_edge
-
-    def _bind_session_reservation(
-        self,
-        authority: object,
-        reservation: ExactReservation,
-    ) -> None:
-        """Record the one reservation minted through ``CaptureSession`` itself."""
-
-        if authority is not _PROCESSOR_INPUT_BINDING_TOKEN:
-            raise PermissionError("capture reservation binding is session-owned")
-        if type(reservation) is not ExactReservation:
-            raise TypeError("reservation must be an exact ExactReservation")
-        record = self._validate_identity()
-        stream = self._stream
-        if reservation._stream is not stream:
-            raise PermissionError("reservation belongs to another capture stream")
-        with stream._condition:
-            if self._validate_identity() is not record:
-                raise PermissionError("capture processor input authority changed")
-            if record.session_reservation is not None:
-                raise RuntimeError("capture session reservation was already bound")
-            if stream._reservations.get(reservation._token) is not reservation:
-                raise RuntimeError("capture session reservation is not registered")
-            if reservation.state is not ReservationState.RESERVED:
-                raise RuntimeError("capture session reservation is not RESERVED")
-            record.session_reservation = reservation
-
-    def require_reservation(self, reservation: ExactReservation) -> None:
-        """Require the active reservation minted by this exact CaptureSession."""
-
-        if type(reservation) is not ExactReservation:
-            raise TypeError("reservation must be an exact ExactReservation")
-        record = self._validate_identity()
-        stream = self._stream
-        if reservation is not record.session_reservation:
-            raise PermissionError(
-                "reservation was not minted by this CaptureSession"
-            )
-        with stream._condition:
-            if self._validate_identity() is not record:
-                raise PermissionError("capture processor input authority changed")
-            if stream._reservations.get(reservation._token) is not reservation:
-                raise RuntimeError(
-                    "reservation is no longer registered with the capture stream"
-                )
-            if reservation.state is not ReservationState.ACTIVE:
-                raise RuntimeError("capture session reservation is not ACTIVE")
-
 
 class CaptureSession:
     """One owner of producer, device session id, ordinal, and terminal receipt."""
@@ -1646,14 +1396,8 @@ class CaptureSession:
             retention_bytes=contract.max_inflight_bytes,
             join_key_contract=DatasetCellKeyContract(contract.dataset_schema),
         )
-        processor_input_binding = CaptureProcessorInputBinding(
-            _PROCESSOR_INPUT_BINDING_TOKEN,
-            capture_contract=contract,
-            stream=stream,
-        )
         self._stream = stream
         self._producer: AcquisitionProducer = producer
-        self._processor_input_binding = processor_input_binding
         self._state = CaptureSessionState.NEW
         self._delivered = 0
         self._metadata_hasher = OrderedDatasetMetadataHasher(
@@ -1671,17 +1415,6 @@ class CaptureSession:
     @property
     def stream(self) -> AcquisitionStream:
         return self._stream
-
-    @property
-    def processor_input_binding(self) -> CaptureProcessorInputBinding:
-        with self._lock:
-            if self._state is not CaptureSessionState.NEW:
-                raise RuntimeError(
-                    "processor input binding is only available while capture session is NEW"
-                )
-            binding = self._processor_input_binding
-            binding._validate_identity()
-            return binding
 
     @property
     def state(self) -> CaptureSessionState:
@@ -1713,15 +1446,6 @@ class CaptureSession:
                 self._stream.generation,
                 reservation.start_sequence,
             )
-            try:
-                self._processor_input_binding._bind_session_reservation(
-                    _PROCESSOR_INPUT_BINDING_TOKEN,
-                    reservation,
-                )
-            except BaseException:
-                reservation.abort()
-                reservation.release()
-                raise
             with self._lock:
                 self._reservation = reservation
                 self._source_event_span_hasher = source_event_span_hasher
@@ -2175,7 +1899,6 @@ __all__ = [
     "CaptureCompletion",
     "CapturePayloadContract",
     "CapturePreparedAck",
-    "CaptureProcessorInputBinding",
     "CaptureRuntimeProfile",
     "FrozenCaptureSpec",
     "CaptureSession",
