@@ -1915,6 +1915,15 @@ Calibration 是 `neutral_atom.readout.calibration` 的内建 feature，不使用
 
 **当前实现状态（2026-07 追溯整改）**：S3 尚未交付，不能把目标模型当作现有能力。此前实现只有一个 notebook `load_calibration(ref)` 入口和一套 `CalibrationRepository/CalibrationArtifactRef`，仓内没有 production producer、calibrate/commit 调用或可到达的 occupancy consumer；它只能读取一类本系统从未能正式产生的 artifact。本轮删除这条 producerless load-only 路径。未来只有在同一个 dependency-closed 纵向切片同时交付“真实 capture -> 校准 -> 保存 -> load/admit -> readout consumer”时，才重新引入 typed ref/repository；repository 必须复用 zlc_storage/Capture 已有 canonical、CAS、commit authority，不能提前建立空壳。旧 `neutral_atom/session.py` 的文件路径式 TrapCalibration 是尚待 S3 迁走的 legacy island，不是新领域 API，也不为新格式建立兼容 reader。
 
+同一轮还删除了没有 package-external production caller 的 `analysis.py/analysis_codec.py`，把 calibration 明确退回“物理算法尚未迁移”。原因不是测试数量不足，而是其约 4.3k LOC 实现已经改变实验算法，却没有按同一批真机 frame 对 main 做独立 golden：
+
+- main 的 site path 是 Gaussian blur -> top-N local maxima -> 2D Gaussian subpixel refinement -> 可修补缺失暗 site 的 axis-aligned lattice，并支持四种 ordering；被删实现改成 topographic-prominence forest、half-prominence centroid、strict affine/Hungarian/second-best assignment，只接受精确 candidate 数和 row/column ordering。常见暗 site 从“由格点插值得到可用 site”变成“整次 calibration 拒绝”。
+- PSF 路径虽有相似卷积结构，但 smoothing、Gaussian refinement 与边界处理没有逐帧等价证据。
+- main 的 label/threshold 路径使用 pooled bimodal/Otsu、strict reference consensus，并以 histogram balanced-fidelity optimum 为短阈值、Gaussian 为 tie/fallback；被删实现改为 independent train/evidence/test、reference valley + Holm、最终 median midpoint 与 Clopper-Pearson/Holm admission。这是新的统计实验，不是等价重构。
+- main 的 fidelity 提供 per-site/global/drop-worst 与分布报告；被删实现改变 evidence/report 语义，且其内部 validator/codec/result 多次重放同一推导，测试主要证明实现自洽，不能证明物理正确。
+
+该实现的 strict assignment 还通过 Floyd-Warshall 搜索 second-best，复杂度 O(N^3)；本机审计仅该步骤实测 512/768/1024/1152 sites 约为 0.406/1.212/3.012/4.825 s，尚未包含检测、Hungarian 和统计。未来 S3 默认逐字继承 main 已验证物理算法；每个偏离必须先指出 main 的可复现错误，再用同一真实 frame 的旧结果、独立参考实现或实验 ground truth 证明差异正是预期。不得用新实现自身生成 expected、私有字段断言或 codec round-trip 代替 oracle，也不得在无第二生产消费者前恢复 analysis work-plan/resource-policy/diagnostics object graph。
+
 `zlc_neutral_atom.readout` 包根不重导出 contracts、codec、analysis、repository 的宽 API；调用方必须从语义 owner 子模块导入。追溯整改实测旧包根的 122 个 eager re-export 会让单独导入 `readout.contracts` 也加载 SciPy，冷导入约 0.86 s、tracemalloc 峰值约 51.8 MiB。删除包根聚合后，同一探针不再加载 SciPy（当前机器约 0.35 s、10 MiB，主要为 NumPy/zlc_data 基础值）。这不是 lazy `__getattr__` 兼容表：本项目没有需要维护的旧公共格式，重复出口清单只会形成第二个 owner；稳定公共用户面由 notebook/workbench facade 组合，领域实现直接依赖 leaf owner。
 
 ### 13.1 Artifact
