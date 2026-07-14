@@ -34,6 +34,7 @@ frontend.panel_plot and never part of the layout.
 
 from __future__ import annotations
 
+import copy
 import json
 import hashlib
 import inspect
@@ -1665,14 +1666,26 @@ class TaskConsoleState:
         self.name = str(name)
         self.interval_ms = max(50, int(interval_ms))
         self.panels = [
-            panel if isinstance(panel, PanelConfig) else PanelConfig.from_dict(panel)
+            PanelConfig.from_dict(
+                copy.deepcopy(
+                    panel.to_dict()
+                    if isinstance(panel, PanelConfig)
+                    else panel
+                )
+            )
             for panel in (panels or [])
         ]
         # The Logic-tab nodes (measurement / processor / task), saved alongside the
         # plot panels so a layout restores the whole dashboard -- nodes always come
         # back STOPPED (the layout records what to build, not a running thread).
         self.logic = [
-            node if isinstance(node, LogicNodeConfig) else LogicNodeConfig.from_dict(node)
+            LogicNodeConfig.from_dict(
+                copy.deepcopy(
+                    node.to_dict()
+                    if isinstance(node, LogicNodeConfig)
+                    else node
+                )
+            )
             for node in (logic or [])
         ]
 
@@ -6922,6 +6935,12 @@ class TaskConsole(QtWidgets.QWidget):
     ) -> None:
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
             raise ValueError("state-load timeout must be a non-negative number")
+        if not isinstance(state, TaskConsoleState):
+            raise TypeError("state must be TaskConsoleState")
+        # Loading consumes no caller-owned objects.  Teardown intentionally mutates
+        # the live PanelConfig/LogicNodeConfig graph, so freeze a private desired
+        # graph before the first stop/remove and install only that graph.
+        desired_state = TaskConsoleState.from_dict(state.to_dict())
         replacement_nodes = None
         if _replacement_running_nodes is not None:
             replacement_nodes = list(_replacement_running_nodes)
@@ -6951,11 +6970,11 @@ class TaskConsole(QtWidgets.QWidget):
                     )
             if replacement_nodes is not None:
                 self.running_nodes = replacement_nodes
-            self.state = state
-            self.name_edit.setText(state.name)
-            for config in state.panels:
+            self.state = desired_state
+            self.name_edit.setText(desired_state.name)
+            for config in desired_state.panels:
                 self._attach_card(self._new_panel_card(config))
-            for node in state.logic:
+            for node in desired_state.logic:
                 self._attach_logic_node(node)    # always STOPPED -- Start is manual
             # Replay every panel's persisted REGION as its control signal, so a loaded Analysis row
             # (still STOPPED) sees the saved selection the moment the user Starts it -- never a silent

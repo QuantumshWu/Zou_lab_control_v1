@@ -161,13 +161,57 @@ def test_save_load_keeps_association_and_region():
         card.config.params["selection_action"] = "roi"
         con._on_panel_area_select(card, Selection.rectangle(100.0, 400.0, 50.0, 250.0))
         region = card.config.params["region_signal"]
+        live_panel_config = card.config
+        live_logic_configs = tuple(row.node for row in con.logic_nodes)
         state = con.read_state()
+        before = state.to_dict()
+        assert all(config is not live_panel_config for config in state.panels)
+        assert all(
+            config is not live
+            for config in state.logic
+            for live in live_logic_configs
+        )
         con.load_state(state)
         loaded = con.cards[-1]
         assert loaded.config.params.get("region_signal") == region
-        assert con._panel_analysis_row(loaded) is not None
+        loaded_row = con._panel_analysis_row(loaded)
+        assert loaded_row is not None
         assert region in set(con.hub.registered_names())     # replayed as a control signal
         assert con._is_control_signal(region)
+        assert state.to_dict() == before
+
+        # The caller-held snapshot is reusable and cannot be mutated by later
+        # edits to the newly installed live graph.
+        assert loaded.config is not state.panels[-1]
+        assert all(loaded_row.node is not config for config in state.logic)
+        loaded.config.params["selection_action"] = "none"
+        loaded_row.node.values["action"] = "fit"
+        assert state.to_dict() == before
+
+        con.load_state(state)
+        loaded_again = con.cards[-1]
+        assert loaded_again.config.params.get("region_signal") == region
+        assert loaded_again.config.params.get("region") == before["panels"][-1]["params"]["region"]
+        loaded_analysis = con._panel_analysis_row(loaded_again)
+        assert loaded_analysis is not None
+        assert state.to_dict() == before
+
+        loaded_camera = next(
+            row for row in con.logic_nodes if row.node.kind == "camera"
+        )
+        con._start_logic_node(loaded_camera)
+        con._start_logic_node(loaded_analysis)
+        camera_node = con._logic_nodes[id(loaded_camera)]
+        analysis_node = con._logic_nodes[id(loaded_analysis)]
+        camera_node.step()
+        analysis_node.step()
+        roi_signal = next(
+            name
+            for name in analysis_node.published_signals()
+            if name.endswith("roi_frame")
+        )
+        crop = con.hub.latest(roi_signal)
+        assert crop.shape[-2:] == (200, 300)
     finally:
         con.shutdown()
         exp.close()
