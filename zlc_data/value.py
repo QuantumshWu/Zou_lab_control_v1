@@ -86,6 +86,56 @@ class Value:
         object.__setattr__(self, "values", array)
 
 
+def canonical_value_array(
+    values: np.ndarray,
+    validity: Valid | Invalid | ComponentValidity,
+    schema: ValueSchema,
+) -> np.ndarray | None:
+    """Return canonical values, or ``None`` for schema-level invalid values."""
+
+    if not isinstance(schema, ValueSchema):
+        raise TypeError("schema must be ValueSchema")
+    array = np.asarray(values)
+    if array.dtype != schema.dtype:
+        raise TypeError(
+            f"values dtype {array.dtype} does not match schema dtype {schema.dtype}"
+        )
+    if array.shape != schema.data_shape:
+        raise ValueError(
+            f"values shape {array.shape} does not match expected {schema.data_shape}"
+        )
+    _validate_value_validity(validity, schema)
+    if (
+        isinstance(validity, Invalid)
+        and schema.validity_contract.mode is not ValidityMode.COMPONENTS
+    ):
+        return None
+    normalized = array
+    if isinstance(validity, (Invalid, ComponentValidity)):
+        expanded = expand_value_validity(validity, schema)
+        if not np.all(expanded):
+            # Build the canonical array from zero rather than copying and then
+            # indexing with ``~expanded``.  The latter materializes another
+            # dense boolean frame for component validity, which breaks the
+            # capture source's bounded read-scratch contract on large images.
+            normalized = np.zeros_like(array, order="C")
+            np.copyto(normalized, array, where=expanded)
+    if normalized.dtype.kind in "fc" and np.any(np.isnan(normalized)):
+        if normalized is array:
+            normalized = np.array(array, copy=True, order="C")
+        if normalized.dtype.kind == "f":
+            canonical_nan = np.array(float("nan"), dtype=normalized.dtype)
+            np.copyto(normalized, canonical_nan, where=np.isnan(normalized))
+        else:
+            component_dtype = np.dtype(
+                "<f4" if normalized.dtype.itemsize == 8 else "<f8"
+            )
+            components = normalized.reshape(-1).view(component_dtype)
+            canonical_nan = np.array(float("nan"), dtype=component_dtype)
+            np.copyto(components, canonical_nan, where=np.isnan(components))
+    return np.ascontiguousarray(normalized, dtype=schema.dtype)
+
+
 @dataclass(frozen=True)
 class ValuePayloadContract:
     """Single owner for Value snapshot, schema validation, and retained-byte accounting."""
@@ -149,19 +199,6 @@ class ValuePayloadContract:
         avoiding a full image copy merely to reconstruct the transient wrapper.
         """
 
-        array = np.asarray(values)
-        if array.dtype != self.schema.dtype:
-            raise TypeError(
-                f"values dtype {array.dtype} does not match schema dtype "
-                f"{self.schema.dtype}"
-            )
-        if array.shape != self.schema.data_shape:
-            raise ValueError(
-                f"values shape {array.shape} does not match expected "
-                f"{self.schema.data_shape}"
-            )
-        _validate_value_validity(validity, self.schema)
-
         hasher = hashlib.sha256()
         hasher.update(b"zlc_data.ValuePayloadContent\x00")
 
@@ -176,39 +213,19 @@ class ValuePayloadContract:
             for axis_id in self.schema.validity_contract.component_axis_ids:
                 update(axis_id.value.encode("utf-8"))
             update(memoryview(np.ascontiguousarray(canonical_validity)).cast("B"))
-            expanded = expand_value_validity(validity, self.schema)
-            if np.all(expanded):
-                normalized = array
-            else:
-                normalized = np.array(array, copy=True, order="C")
-                normalized[~expanded] = 0
         elif isinstance(validity, Valid):
             update(b"valid")
-            normalized = array
         elif isinstance(validity, Invalid):
             update(b"invalid")
-            # Invalid values are semantically absent.  The schema already binds
-            # dtype/shape, so arbitrary storage fillers must not change identity.
+            # Invalid values are semantically absent.  Keep their event digest
+            # independent of frame size and arbitrary producer filler bytes.
             update(b"canonical-invalid-values")
             return hasher.hexdigest()
         else:  # pragma: no cover - validation closes VALUE validity above
             raise TypeError("VALUE validity requires Valid or Invalid")
-
-        if normalized.dtype.kind in "fc" and np.any(np.isnan(normalized)):
-            normalized = np.array(normalized, copy=True, order="C")
-            if normalized.dtype.kind == "f":
-                canonical_nan = np.array(float("nan"), dtype=normalized.dtype)
-                np.copyto(normalized, canonical_nan, where=np.isnan(normalized))
-            else:
-                component_dtype = np.dtype(
-                    "<f4" if normalized.dtype.itemsize == 8 else "<f8"
-                )
-                components = normalized.reshape(-1).view(component_dtype)
-                canonical_nan = np.array(float("nan"), dtype=component_dtype)
-                np.copyto(components, canonical_nan, where=np.isnan(components))
-        if not normalized.flags.c_contiguous:
-            normalized = np.ascontiguousarray(normalized)
-        update(memoryview(normalized).cast("B"))
+        canonical_values = canonical_value_array(values, validity, self.schema)
+        assert canonical_values is not None
+        update(memoryview(canonical_values).cast("B"))
         return hasher.hexdigest()
 
 
@@ -391,6 +408,7 @@ __all__ = [
     "VALID",
     "Value",
     "ValuePayloadContract",
+    "canonical_value_array",
     "expand_dataset_validity",
     "expand_value_validity",
 ]

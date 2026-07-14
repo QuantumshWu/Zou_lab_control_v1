@@ -1,5 +1,6 @@
 """Headless, domain-neutral semantics for named multidimensional data."""
 
+from ._arrays import immutable_array
 from .axis import (
     COMPONENT,
     HISTOGRAM_BIN,
@@ -63,6 +64,7 @@ from .value import (
     StreamGenerationId,
     Value,
     ValuePayloadContract,
+    canonical_value_array,
     expand_dataset_validity,
     expand_component_validity,
     expand_value_validity,
@@ -191,6 +193,7 @@ __all__ = [
     "RowComponentValidity",
     "IndexRangeSelection",
     "IndexSelection",
+    "immutable_array",
     "CoordinateRangeSelection",
     "MissingPolicy",
     "PreviewTransformedData",
@@ -260,6 +263,7 @@ __all__ = [
     "resolve_transformed_schema",
     "encode_selection",
     "encode_value",
+    "canonical_value_array",
     "expand_dataset_validity",
     "expand_component_validity",
     "expand_value_validity",

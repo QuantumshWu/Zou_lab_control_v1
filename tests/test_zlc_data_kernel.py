@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import subprocess
+import tracemalloc
 
 import numpy as np
 import pytest
@@ -32,6 +33,7 @@ from zlc_data import (
     Value,
     ValuePayloadContract,
     ValueSchema,
+    canonical_value_array,
     decode_dataset_schema,
     decode_data_block,
     decode_value,
@@ -300,6 +302,9 @@ def test_value_payload_digest_binds_valid_content_and_normalizes_invalid_fillers
     right_values[:, 1] = 500
     right_values[:, 3] = 700
     contract = ValuePayloadContract(schema)
+    canonical_valid = canonical_value_array(left_values, VALID, schema)
+    assert canonical_valid is not None
+    assert np.shares_memory(canonical_valid, left_values)
     left = Value(left_values, validity, schema)
     right = Value(right_values, validity, schema)
 
@@ -324,6 +329,7 @@ def test_value_payload_digest_binds_valid_content_and_normalizes_invalid_fillers
 
     value_schema = image_schema(component_validity=False)
     value_contract = ValuePayloadContract(value_schema)
+    assert canonical_value_array(left_values, INVALID, value_schema) is None
     assert value_contract.digest_content(left_values, INVALID) == value_contract.digest_content(
         right_values,
         INVALID,
@@ -339,6 +345,37 @@ def test_value_payload_digest_binds_valid_content_and_normalizes_invalid_fillers
         right_values,
         ComponentValidity(schema.validity_contract.component_axis_ids, all_invalid),
     )
+
+
+def test_component_canonicalization_does_not_allocate_an_inverse_frame_mask():
+    y = axis("large.camera.y", SPATIAL_Y, 512)
+    x = axis("large.camera.x", SPATIAL_X, 512)
+    schema = ValueSchema(
+        (y, x),
+        ValidityContract.components(y.axis_id, x.axis_id),
+        np.dtype(np.uint16),
+        "count",
+    )
+    values = np.arange(512 * 512, dtype=np.uint16).reshape(512, 512)
+    mask = np.ones(schema.data_shape, dtype=bool)
+    mask[0, 0] = False
+    validity = ComponentValidity((y.axis_id, x.axis_id), mask)
+
+    was_tracing = tracemalloc.is_tracing()
+    if not was_tracing:
+        tracemalloc.start()
+    tracemalloc.clear_traces()
+    canonical = canonical_value_array(values, validity, schema)
+    _current, peak = tracemalloc.get_traced_memory()
+    if not was_tracing:
+        tracemalloc.stop()
+
+    assert canonical is not None
+    assert canonical[0, 0] == 0
+    np.testing.assert_array_equal(canonical[1:], values[1:])
+    # One canonical value frame is necessary.  A dense ``~validity`` mask
+    # would add 256 KiB and make this independent peak check fail.
+    assert peak <= values.nbytes + (128 << 10)
 
 
 def test_schema_fingerprint_normalizes_dtype_endianness():
