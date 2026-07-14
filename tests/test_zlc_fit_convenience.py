@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import replace
 from itertools import permutations
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -26,7 +28,6 @@ from zlc_data import (
     DataBlock,
     DatasetRevision,
     DatasetSchema,
-    FitResultArtifactRef,
     OwnedSnapshot,
     PointLayout,
     StreamGenerationId,
@@ -34,15 +35,40 @@ from zlc_data import (
     ValidityContract,
     ValueSchema,
     bind_fit,
-    build_fit_problem,
-    decode_fit_result_artifact_ref,
-    encode_fit_result_artifact_ref,
-    evaluate_fit_model,
-    fit_result_artifact_ref_from_tree,
-    fit_result_artifact_ref_to_tree,
     fit_spec_for,
-    validate_fit_result_binding,
+    validate_fit_result_source_binding,
 )
+from zlc_data.fit_problem import build_fit_problem
+from zlc_data.fit_model import evaluate_fit_model
+
+
+def test_production_fit_consumers_use_the_public_zlc_data_facade():
+    repository = Path(__file__).resolve().parents[1]
+    roots = (
+        repository / "zlc_neutral_atom",
+        repository / "zlc_frontend",
+        repository / "zlc_workbench",
+        repository / "Zou_lab_control" / "notebook",
+    )
+    implementation_modules = {
+        "zlc_data.fit_codec",
+        "zlc_data.fit_contract",
+        "zlc_data.fit_model",
+        "zlc_data.fit_problem",
+        "zlc_data.fit_solver",
+    }
+    violations = []
+    for root in roots:
+        for path in root.rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module in implementation_modules:
+                    violations.append(f"{path.relative_to(repository)}:{node.lineno}")
+                elif isinstance(node, ast.Import) and any(
+                    alias.name in implementation_modules for alias in node.names
+                ):
+                    violations.append(f"{path.relative_to(repository)}:{node.lineno}")
+    assert violations == []
 
 
 def _axis(
@@ -77,24 +103,6 @@ def _schema(
         PointLayout.rect_c(tuple(axis.size for axis in point_axes)),
         ValueSchema(data_axes, ValidityContract.value(), np.dtype("<f8"), "count"),
     )
-
-
-def test_fit_result_artifact_ref_has_one_strict_current_codec():
-    reference = FitResultArtifactRef("fit-repository", "a" * 64)
-    tree = fit_result_artifact_ref_to_tree(reference)
-    payload = encode_fit_result_artifact_ref(reference)
-
-    assert set(tree) == {"schema", "repository_id", "manifest_digest"}
-    assert decode_fit_result_artifact_ref(payload) == reference
-    assert fit_result_artifact_ref_from_tree(tree) == reference
-    assert reference.target_ref == f"fit-result/{'a' * 64}"
-
-    with pytest.raises(ValueError, match="contain exactly"):
-        fit_result_artifact_ref_from_tree({**tree, "version": 1})
-    with pytest.raises(ValueError, match="schema"):
-        fit_result_artifact_ref_from_tree({**tree, "schema": "old.FitRef"})
-    with pytest.raises(ValueError, match="canonical"):
-        FitResultArtifactRef(" fit-repository", "a" * 64)
 
 
 def test_authoritative_curve_auto_requires_one_complete_semantic_matching():
@@ -242,8 +250,10 @@ def test_arbitrary_multidimensional_data_axes_remain_named_batches(
         expected = values[(batch_index[0], slice(None), *batch_index[1:])]
         if batch_index == (invalid_repeat, *invalid_data_index):
             expected = np.delete(expected, invalid_scan)
+        start = int(problem.batch_offsets[storage_index])
+        stop = int(problem.batch_offsets[storage_index + 1])
         np.testing.assert_array_equal(
-            problem.cell(storage_index).observations,
+            problem.observations[start:stop],
             expected,
         )
 
@@ -345,14 +355,18 @@ def _gaussian_snapshot() -> OwnedSnapshot:
     )
 
 
-def test_result_binding_replays_the_packing_owner_and_rejects_drift():
+def test_result_binding_uses_schema_facts_without_repacking_values():
     snapshot = _gaussian_snapshot()
     bound = bind_fit(
         fit_spec_for(snapshot.block.schema, "gaussian_offset"),
         snapshot.block.schema,
     )
     result = bound.run(snapshot)
-    validate_fit_result_binding(result, snapshot)
+    validate_fit_result_source_binding(
+        result,
+        snapshot.ref,
+        snapshot.block.schema,
+    )
 
     changed_axis = replace(result.fit_axis_specs[0], name="forged detuning")
     axis_drift = replace(
@@ -360,15 +374,27 @@ def test_result_binding_replays_the_packing_owner_and_rejects_drift():
         fit_axis_specs=(changed_axis,),
     )
     with pytest.raises(ValueError, match="axis specifications"):
-        validate_fit_result_binding(axis_drift, snapshot)
+        validate_fit_result_source_binding(
+            axis_drift,
+            snapshot.ref,
+            snapshot.block.schema,
+        )
 
     reversed_layout = AxisLayout.explicit((2,), ((1,), (0,)))
     layout_drift = replace(result, batch_layout=reversed_layout)
     with pytest.raises(ValueError, match="batch layout"):
-        validate_fit_result_binding(layout_drift, snapshot)
+        validate_fit_result_source_binding(
+            layout_drift,
+            snapshot.ref,
+            snapshot.block.schema,
+        )
 
     present = np.asarray(result.present_observation_counts).copy()
     present[0] += 1
     count_drift = replace(result, present_observation_counts=present)
     with pytest.raises(ValueError, match="present_observation_counts"):
-        validate_fit_result_binding(count_drift, snapshot)
+        validate_fit_result_source_binding(
+            count_drift,
+            snapshot.ref,
+            snapshot.block.schema,
+        )

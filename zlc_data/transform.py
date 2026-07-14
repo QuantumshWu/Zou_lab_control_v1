@@ -702,13 +702,25 @@ def _selection_indices(axis: AxisSpec, term) -> tuple[tuple[int, ...], bool]:
 
 
 def _selected_axis(axis: AxisSpec, indices: tuple[int, ...]) -> AxisSpec:
+    if axis.coordinates is None:
+        # A range selection changes the output axis length, not the physical
+        # meaning of its surviving logical indices.  Keeping ``coordinates``
+        # as ``None`` would silently rebase e.g. camera x[20:41] to 0..20 in
+        # every downstream fit/overlay.  Materialize the original logical
+        # indices and their canonical coordinate unit so repeated selections
+        # remain absolute and serializable.
+        coordinates = tuple(indices)
+        unit = "index"
+    else:
+        coordinates = tuple(axis.coordinates[index] for index in indices)
+        unit = axis.unit
     return AxisSpec(
         axis.axis_id,
         axis.name,
         axis.role,
         len(indices),
-        None if axis.coordinates is None else tuple(axis.coordinates[index] for index in indices),
-        axis.unit,
+        coordinates,
+        unit,
         axis.coordinate_frame,
     )
 

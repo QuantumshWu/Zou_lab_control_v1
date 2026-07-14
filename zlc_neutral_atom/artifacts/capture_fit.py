@@ -1,8 +1,8 @@
 """Persist one concrete committed-capture -> fit-result derivation.
 
-``zlc_data`` owns fitting and the persisted result identity.  This module owns
-only the neutral-atom seam that resolves a committed ``CaptureArtifact`` and
-binds it to those data-owned bytes.  It deliberately provides no generic
+``zlc_data`` owns fitting and the result payload.  This module owns the
+neutral-atom seam that resolves a committed ``CaptureArtifact`` and binds it
+to a concrete capture-fit artifact identity.  It deliberately provides no generic
 analysis repository, workflow, compatibility reader, plugin registry, or
 commit journal.
 """
@@ -13,15 +13,13 @@ from pathlib import Path
 import threading
 
 from zlc_data import (
-    FIT_RESULT_ARTIFACT_NAMESPACE,
-    FitResultArtifactRef,
     FitResultBatch,
     FitSpec,
     OwnedSnapshot,
     bind_fit,
     decode_fit_result_batch,
     encode_fit_result_batch,
-    validate_fit_result_binding,
+    validate_fit_result_source_binding,
 )
 from zlc_storage import (
     ContentAddressedStore,
@@ -40,7 +38,10 @@ from zlc_neutral_atom.capture_reference import (
     capture_artifact_ref_from_tree,
     capture_artifact_ref_to_tree,
 )
-
+from zlc_neutral_atom.capture_fit_reference import (
+    CAPTURE_FIT_RESULT_ARTIFACT_NAMESPACE,
+    CaptureFitResultArtifactRef,
+)
 from .capture import AdmittedCapture, CaptureRepository
 
 
@@ -49,6 +50,8 @@ CAPTURE_FIT_RESULT_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureFitResultArtifact"
 _FIT_EXECUTION_TOKEN = object()
 _ADMITTED_FIT_TOKEN = object()
 _DEFAULT_MATERIALIZATION_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
+_MAX_MANIFEST_BYTES = 64 * 1024
+_MAX_RESULT_BLOB_BYTES = 64 * 1024 * 1024
 
 
 def _capture_snapshot(
@@ -107,6 +110,7 @@ class FitExecution(_ProcessLocalProof):
             raise TypeError("repository must be CaptureFitResultRepository")
         if type(source_admission) is not AdmittedCapture:
             raise TypeError("source_admission must be AdmittedCapture")
+        source_admission._require_authority()
         if not isinstance(result, FitResultBatch):
             raise TypeError("result must be FitResultBatch")
         object.__setattr__(self, "_token", token)
@@ -122,8 +126,11 @@ class FitExecution(_ProcessLocalProof):
             type(self) is not FitExecution
             or self._token is not _FIT_EXECUTION_TOKEN
             or self._repository is not repository
+            or type(self._source_admission) is not AdmittedCapture
+            or not isinstance(self._result, FitResultBatch)
         ):
             raise PermissionError("FitExecution authority is invalid")
+        self._source_admission._require_authority()
 
     @property
     def source_capture_ref(self) -> CaptureArtifactRef:
@@ -135,7 +142,7 @@ class FitExecution(_ProcessLocalProof):
         self._require_authority(self._repository)
         return self._result
 
-    def save(self) -> FitResultArtifactRef:
+    def save(self) -> CaptureFitResultArtifactRef:
         return self._repository._save_execution(self)
 
 
@@ -158,7 +165,7 @@ class AdmittedCaptureFitResult(_ProcessLocalProof):
         self,
         token: object,
         *,
-        reference: FitResultArtifactRef,
+        reference: CaptureFitResultArtifactRef,
         source_capture_ref: CaptureArtifactRef,
         result: FitResultBatch,
     ) -> None:
@@ -167,8 +174,8 @@ class AdmittedCaptureFitResult(_ProcessLocalProof):
                 "AdmittedCaptureFitResult can only be minted by "
                 "CaptureFitResultRepository.load"
             )
-        if not isinstance(reference, FitResultArtifactRef):
-            raise TypeError("reference must be FitResultArtifactRef")
+        if not isinstance(reference, CaptureFitResultArtifactRef):
+            raise TypeError("reference must be CaptureFitResultArtifactRef")
         if not isinstance(source_capture_ref, CaptureArtifactRef):
             raise TypeError("source_capture_ref must be CaptureArtifactRef")
         if not isinstance(result, FitResultBatch):
@@ -182,13 +189,14 @@ class AdmittedCaptureFitResult(_ProcessLocalProof):
         if (
             type(self) is not AdmittedCaptureFitResult
             or self._token is not _ADMITTED_FIT_TOKEN
+            or not isinstance(self._reference, CaptureFitResultArtifactRef)
+            or not isinstance(self._source_capture_ref, CaptureArtifactRef)
+            or not isinstance(self._result, FitResultBatch)
         ):
-            raise PermissionError(
-                "AdmittedCaptureFitResult authority is invalid"
-            )
+            raise PermissionError("AdmittedCaptureFitResult authority is invalid")
 
     @property
-    def reference(self) -> FitResultArtifactRef:
+    def reference(self) -> CaptureFitResultArtifactRef:
         self._require_authority()
         return self._reference
 
@@ -293,15 +301,16 @@ class CaptureFitResultRepository:
     def _save_execution(
         self,
         execution: FitExecution,
-    ) -> FitResultArtifactRef:
+    ) -> CaptureFitResultArtifactRef:
         with self._lifecycle_lock:
             self._require_integrity()
             FitExecution._require_authority(execution, self)
             with self._root_lease.borrow() as lease_borrow:
                 lease_borrow.require_active()
-                result_ref = self._store_authority.put_blob(
-                    encode_fit_result_batch(execution._result)
-                )
+                result_payload = encode_fit_result_batch(execution._result)
+                if len(result_payload) > _MAX_RESULT_BLOB_BYTES:
+                    raise ValueError("capture-fit result blob exceeds repository limit")
+                result_ref = self._store_authority.put_blob(result_payload)
                 manifest_payload = encode(
                     {
                         "schema": CAPTURE_FIT_RESULT_ARTIFACT_SCHEMA,
@@ -312,33 +321,38 @@ class CaptureFitResultRepository:
                         "result_blob": content_ref_to_tree(result_ref),
                     }
                 )
+                if len(manifest_payload) > _MAX_MANIFEST_BYTES:
+                    raise ValueError("capture-fit manifest exceeds repository limit")
                 stored = self._store_authority.publish_manifest(
-                    FIT_RESULT_ARTIFACT_NAMESPACE,
+                    CAPTURE_FIT_RESULT_ARTIFACT_NAMESPACE,
                     manifest_payload,
                 )
-                return FitResultArtifactRef(
+                return CaptureFitResultArtifactRef(
                     self.repository_id,
                     stored.content.digest,
                 )
 
     def load(
         self,
-        reference: FitResultArtifactRef,
+        reference: CaptureFitResultArtifactRef,
         capture_repository: CaptureRepository,
     ) -> AdmittedCaptureFitResult:
         with self._lifecycle_lock:
             self._require_integrity()
-            if not isinstance(reference, FitResultArtifactRef):
-                raise TypeError("reference must be FitResultArtifactRef")
+            if not isinstance(reference, CaptureFitResultArtifactRef):
+                raise TypeError(
+                    "reference must be CaptureFitResultArtifactRef"
+                )
             if reference.repository_id != self.repository_id:
                 raise ValueError(
-                    "FitResultArtifactRef belongs to another repository"
+                    "CaptureFitResultArtifactRef belongs to another repository"
                 )
             if type(capture_repository) is not CaptureRepository:
                 raise TypeError("capture_repository must be CaptureRepository")
             manifest_payload = self._store_authority.read_manifest(
-                FIT_RESULT_ARTIFACT_NAMESPACE,
+                CAPTURE_FIT_RESULT_ARTIFACT_NAMESPACE,
                 reference.manifest_digest,
+                max_bytes=_MAX_MANIFEST_BYTES,
             )
             manifest = exact_mapping(
                 decode(manifest_payload),
@@ -361,18 +375,22 @@ class CaptureFitResultRepository:
             source_ref = capture_artifact_ref_from_tree(
                 manifest["source_capture_ref"]
             )
+            result_ref = content_ref_from_tree(manifest["result_blob"])
+            if result_ref.size > _MAX_RESULT_BLOB_BYTES:
+                raise ValueError("capture-fit result blob exceeds repository limit")
             result = decode_fit_result_batch(
                 self._store_authority.read_blob(
-                    content_ref_from_tree(manifest["result_blob"])
+                    result_ref,
+                    max_bytes=_MAX_RESULT_BLOB_BYTES,
                 )
             )
             source = capture_repository.admit(source_ref)
-            validate_fit_result_binding(
+            validate_fit_result_source_binding(
                 result,
-                _capture_snapshot(
-                    source,
-                    self.materialization_memory_limit_bytes,
+                source.artifact.frame_source.ref(
+                    source.artifact.provenance.generation
                 ),
+                source.artifact.frame_source.schema,
             )
             return AdmittedCaptureFitResult(
                 _ADMITTED_FIT_TOKEN,

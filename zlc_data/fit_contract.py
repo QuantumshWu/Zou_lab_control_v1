@@ -10,7 +10,7 @@ from typing import Callable
 
 import numpy as np
 
-from zlc_storage.canonical import canonical_digest, canonical_text, sha256_text
+from zlc_storage.canonical import canonical_text, sha256_text
 
 from ._arrays import immutable_array, immutable_bool_array
 from .axis import AxisId, AxisSpec
@@ -27,11 +27,6 @@ from .fit_model import (
 )
 
 
-FIT_SOLVER_CONTRACT_ID = (
-    "scipy-trf-two-point-linear-exact-tol1e-8-cond1e8-local-support-baseband"
-)
-
-
 class FitCoordinateSource(str, Enum):
     DECLARED = "DECLARED"
     LOGICAL_INDEX = "LOGICAL_INDEX"
@@ -43,17 +38,8 @@ class FitBatchStatus(str, Enum):
     INSUFFICIENT_POINTS = "INSUFFICIENT_POINTS"
     INITIALIZATION_FAILED = "INITIALIZATION_FAILED"
     EVALUATION_LIMIT = "EVALUATION_LIMIT"
-    TIMEOUT = "TIMEOUT"
     SOLVER_FAILED = "SOLVER_FAILED"
     NUMERIC_ERROR = "NUMERIC_ERROR"
-
-
-class FitAcceptance(str, Enum):
-    """Scientific-use decision, deliberately separate from numeric execution."""
-
-    NOT_EVALUATED = "NOT_EVALUATED"
-    ACCEPTED = "ACCEPTED"
-    REJECTED = "REJECTED"
 
 
 class FitCancelled(RuntimeError):
@@ -103,8 +89,6 @@ class FitParameterConstraint:
 @dataclass(frozen=True)
 class FitNumericPolicy:
     max_evaluations: int = 4_000
-    max_seconds_per_batch: float = 5.0
-    max_total_seconds: float = 120.0
     max_batch_cells: int = 100_000
     sample_budget_per_batch: int = 12_000
     max_packed_observations: int = 2_000_000
@@ -121,14 +105,13 @@ class FitNumericPolicy:
             if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
                 raise ValueError(f"{field} must be a positive integer")
             object.__setattr__(self, field, int(value))
-        for field in ("max_seconds_per_batch", "max_total_seconds", "covariance_rcond"):
-            value = getattr(self, field)
-            if isinstance(value, bool) or not isinstance(value, Real):
-                raise TypeError(f"{field} must be a positive finite real number")
-            normalized = float(value)
-            if not math.isfinite(normalized) or normalized <= 0:
-                raise ValueError(f"{field} must be a positive finite real number")
-            object.__setattr__(self, field, normalized)
+        value = self.covariance_rcond
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise TypeError("covariance_rcond must be a positive finite real number")
+        normalized = float(value)
+        if not math.isfinite(normalized) or normalized <= 0:
+            raise ValueError("covariance_rcond must be a positive finite real number")
+        object.__setattr__(self, "covariance_rcond", normalized)
 
 
 @dataclass(frozen=True)
@@ -140,8 +123,6 @@ class FitSpec:
     model_id: str
     constraints: tuple[FitParameterConstraint, ...] = ()
     numeric_policy: FitNumericPolicy = FitNumericPolicy()
-    solver_contract_id: str = FIT_SOLVER_CONTRACT_ID
-    initializer_id: str | None = None
 
     def __post_init__(self) -> None:
         sha256_text(self.input_schema_fingerprint, "input_schema_fingerprint")
@@ -162,13 +143,6 @@ class FitSpec:
             raise ValueError("fit and batch axes cannot overlap")
         canonical_text(self.model_id, "model_id")
         model = fit_model_definition(self.model_id)
-        canonical_text(self.solver_contract_id, "solver_contract_id")
-        if self.solver_contract_id != FIT_SOLVER_CONTRACT_ID:
-            raise ValueError(f"unsupported fit solver contract {self.solver_contract_id!r}")
-        initializer_id = model.initializer_id if self.initializer_id is None else self.initializer_id
-        canonical_text(initializer_id, "initializer_id")
-        if initializer_id != model.initializer_id:
-            raise ValueError("initializer_id disagrees with the selected model")
         constraints = tuple(self.constraints)
         if any(not isinstance(item, FitParameterConstraint) for item in constraints):
             raise TypeError("constraints must contain FitParameterConstraint values")
@@ -200,14 +174,7 @@ class FitSpec:
             raise TypeError("numeric_policy must be FitNumericPolicy")
         object.__setattr__(self, "fit_axis_ids", fit_axes)
         object.__setattr__(self, "batch_axis_ids", batch_axes)
-        object.__setattr__(self, "initializer_id", initializer_id)
         object.__setattr__(self, "constraints", tuple(sorted(constraints, key=lambda item: item.parameter_name)))
-
-    @property
-    def digest(self) -> str:
-        from .fit_codec import fit_spec_to_tree
-
-        return canonical_digest(fit_spec_to_tree(self))
 
 
 def _minimum_observation_count(spec: FitSpec, model: FitModelDefinition) -> int:
@@ -291,8 +258,8 @@ class BoundFit:
         for position, (axis, requirement) in enumerate(
             zip(fit_axes, self.model.axis_requirements)
         ):
-            if axis.role not in requirement.allowed_roles:
-                roles = ", ".join(role.value for role in requirement.allowed_roles)
+            if axis.role not in requirement:
+                roles = ", ".join(role.value for role in requirement)
                 raise ValueError(
                     f"fit axis {position} ({axis.axis_id}) role {axis.role.value!r} "
                     f"does not satisfy model roles [{roles}]"
@@ -318,9 +285,9 @@ class BoundFit:
         cancel_check: Callable[[], bool] | None = None,
         deadline_monotonic: float | None = None,
     ) -> "FitResultBatch":
-        from .fit_solver import fit_analysis
+        from .fit_solver import _fit_analysis
 
-        return fit_analysis(
+        return _fit_analysis(
             self,
             snapshot,
             cancel_check=cancel_check,
@@ -331,63 +298,21 @@ class BoundFit:
     def minimum_observation_count(self) -> int:
         return _minimum_observation_count(self.spec, self.model)
 
+    @property
+    def parameter_definitions(self) -> tuple[FitParameterDefinition, ...]:
+        return self.model.parameters
 
-@dataclass(frozen=True, eq=False)
-class FitCellProblem:
-    """A transient zero-copy view of one row in a packed :class:`FitProblem`."""
-
-    batch_multi_index: tuple[int, ...]
-    independent_values: tuple[np.ndarray, ...]
-    sampling_quanta: np.ndarray
-    observations: np.ndarray
-    present_observation_count: int
-    valid_observation_count: int
-    used_observation_count: int
-    __hash__ = None
-
-    def __post_init__(self) -> None:
-        multi = tuple(self.batch_multi_index)
-        if any(isinstance(value, bool) or not isinstance(value, Integral) or value < 0 for value in multi):
-            raise ValueError("batch_multi_index must contain non-negative integers")
-        observations = np.asarray(self.observations)
-        coords = tuple(np.asarray(value) for value in self.independent_values)
-        sampling_quanta = np.asarray(self.sampling_quanta)
-        if observations.dtype != np.dtype("<f8") or observations.ndim != 1:
-            raise TypeError("fit cell observations must be a canonical float64 vector")
-        if any(value.dtype != np.dtype("<f8") or value.ndim != 1 for value in coords):
-            raise TypeError("fit cell coordinates must be canonical float64 vectors")
-        if sampling_quanta.dtype != np.dtype("<f8") or sampling_quanta.shape != (len(coords),):
-            raise TypeError("fit cell sampling quanta must be a canonical float64 vector")
-        if np.any(~np.isfinite(sampling_quanta)) or np.any(sampling_quanta < 0.0):
-            raise ValueError("fit cell sampling quanta must be finite and non-negative")
-        if not coords or any(value.shape != observations.shape for value in coords):
-            raise ValueError("fit cell coordinates and observations must share one shape")
-        for field in (
-            "present_observation_count",
-            "valid_observation_count",
-            "used_observation_count",
-        ):
-            value = getattr(self, field)
-            if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
-                raise ValueError(f"{field} must be a non-negative integer")
-            object.__setattr__(self, field, int(value))
-        if not (
-            observations.size
-            == self.used_observation_count
-            <= self.valid_observation_count
-            <= self.present_observation_count
-        ):
-            raise ValueError("fit cell observation counts disagree")
-        object.__setattr__(self, "batch_multi_index", tuple(int(value) for value in multi))
-        if (
-            observations.flags.writeable
-            or any(value.flags.writeable for value in coords)
-            or sampling_quanta.flags.writeable
-        ):
-            raise ValueError("fit cell views must be read-only")
-        object.__setattr__(self, "observations", observations)
-        object.__setattr__(self, "independent_values", coords)
-        object.__setattr__(self, "sampling_quanta", sampling_quanta)
+    @property
+    def parameter_units(self) -> tuple[str, ...]:
+        fit_axes = tuple(
+            self.effective_schema.axis(axis_id) for axis_id in self.spec.fit_axis_ids
+        )
+        return resolve_parameter_units(
+            self.parameter_definitions,
+            fit_axes,
+            tuple(_coordinate_source_for_axis(axis) for axis in fit_axes),
+            self.effective_schema.value_unit,
+        )
 
 
 @dataclass(frozen=True)
@@ -400,7 +325,6 @@ class FitProblem:
     value_unit: str | None
     batch_offsets: np.ndarray
     independent_values: tuple[np.ndarray, ...]
-    sampling_quanta: np.ndarray
     observations: np.ndarray
     present_observation_counts: np.ndarray
     valid_observation_counts: np.ndarray
@@ -447,13 +371,6 @@ class FitProblem:
         )
         if len(independent) != len(fit_axes):
             raise ValueError("fit problem needs one packed coordinate vector per fit axis")
-        sampling_quanta = _immutable_numeric(
-            self.sampling_quanta,
-            "<f8",
-            (batch_size, len(fit_axes)),
-        )
-        if np.any(~np.isfinite(sampling_quanta)) or np.any(sampling_quanta < 0.0):
-            raise ValueError("fit problem sampling quanta must be finite and non-negative")
         counts = {}
         for field in (
             "present_observation_counts",
@@ -480,23 +397,6 @@ class FitProblem:
         object.__setattr__(self, "batch_offsets", offsets)
         object.__setattr__(self, "observations", observations)
         object.__setattr__(self, "independent_values", independent)
-        object.__setattr__(self, "sampling_quanta", sampling_quanta)
-
-    def cell(self, storage_index: int) -> FitCellProblem:
-        """Create a transient read-only view without retaining per-batch objects."""
-
-        multi = self.batch_layout.multi_index(storage_index)
-        start = int(self.batch_offsets[storage_index])
-        stop = int(self.batch_offsets[storage_index + 1])
-        return FitCellProblem(
-            multi,
-            tuple(values[start:stop] for values in self.independent_values),
-            self.sampling_quanta[storage_index],
-            self.observations[start:stop],
-            int(self.present_observation_counts[storage_index]),
-            int(self.valid_observation_counts[storage_index]),
-            int(self.used_observation_counts[storage_index]),
-        )
 
     @property
     def effective_schema_fingerprint(self) -> str:
@@ -522,8 +422,6 @@ class FitResultBatch:
     covariance_valid: np.ndarray
     statuses: tuple[FitBatchStatus, ...]
     errors: tuple[str | None, ...]
-    acceptances: tuple[FitAcceptance, ...]
-    acceptance_reasons: tuple[str | None, ...]
     present_observation_counts: np.ndarray
     valid_observation_counts: np.ndarray
     used_observation_counts: np.ndarray
@@ -599,8 +497,6 @@ class FitResultBatch:
         )
         statuses = tuple(self.statuses)
         errors = tuple(self.errors)
-        acceptances = tuple(self.acceptances)
-        acceptance_reasons = tuple(self.acceptance_reasons)
         if len(statuses) != batch_size or any(not isinstance(item, FitBatchStatus) for item in statuses):
             raise ValueError("statuses must match batch layout")
         if len(errors) != batch_size:
@@ -611,20 +507,6 @@ class FitResultBatch:
             canonical_text(value, "errors item")
             if len(value) > 512:
                 raise ValueError("errors must contain bounded text or None per batch")
-        if len(acceptances) != batch_size or any(
-            not isinstance(item, FitAcceptance) for item in acceptances
-        ):
-            raise ValueError("acceptances must match batch layout")
-        if len(acceptance_reasons) != batch_size:
-            raise ValueError("acceptance_reasons must contain bounded text or None per batch")
-        for value in acceptance_reasons:
-            if value is None:
-                continue
-            canonical_text(value, "acceptance_reasons item")
-            if len(value) > 512:
-                raise ValueError(
-                    "acceptance_reasons must contain bounded text or None per batch"
-                )
         fixed_indices = tuple(
             index
             for index, parameter in enumerate(parameters)
@@ -634,15 +516,9 @@ class FitResultBatch:
             )
         )
         for index, status in enumerate(statuses):
-            acceptance = acceptances[index]
-            acceptance_reason = acceptance_reasons[index]
             if status is FitBatchStatus.CONVERGED:
                 if errors[index] is not None or not np.all(np.isfinite(self.parameter_values[index])):
                     raise ValueError("converged batch result must have finite parameters and no execution error")
-                if acceptance is FitAcceptance.NOT_EVALUATED:
-                    raise ValueError("converged batch result requires an acceptance decision")
-                if (acceptance is FitAcceptance.ACCEPTED) != (acceptance_reason is None):
-                    raise ValueError("accepted batches have no reason; rejected batches require one")
                 for parameter, value in zip(parameters, self.parameter_values[index]):
                     if not parameter.accepts(float(value)):
                         raise ValueError(
@@ -722,19 +598,9 @@ class FitResultBatch:
                         raise ValueError("valid r_squared must be finite and no greater than one")
                 elif self.r_squared[index] != 0:
                     raise ValueError("invalid r_squared payload must be canonical zero")
-                if acceptance is FitAcceptance.ACCEPTED and (
-                    not self.covariance_valid[index]
-                    or not self.r_squared_valid[index]
-                    or self.r_squared[index] < 0.0
-                ):
-                    raise ValueError(
-                        "accepted batch requires identifiable covariance and non-negative valid r_squared"
-                    )
             else:
                 if errors[index] is None:
                     raise ValueError("failed batch result requires an error")
-                if acceptance is not FitAcceptance.NOT_EVALUATED or acceptance_reason is not None:
-                    raise ValueError("failed batch cannot claim a scientific acceptance decision")
                 if np.any(self.parameter_values[index]) or np.any(self.covariance[index]):
                     raise ValueError("failed batch result numeric payload must be canonical zero")
                 if self.covariance_valid[index] or self.r_squared_valid[index]:
@@ -776,14 +642,6 @@ class FitResultBatch:
         object.__setattr__(self, "batch_axis_specs", batch_axes)
         object.__setattr__(self, "statuses", statuses)
         object.__setattr__(self, "errors", errors)
-        object.__setattr__(self, "acceptances", acceptances)
-        object.__setattr__(self, "acceptance_reasons", acceptance_reasons)
-
-    @property
-    def digest(self) -> str:
-        from .fit_codec import fit_result_batch_to_tree
-
-        return canonical_digest(fit_result_batch_to_tree(self))
 
     @property
     def rmse(self) -> np.ndarray:
@@ -823,15 +681,6 @@ class FitResultBatch:
             self.coordinate_sources,
             self.value_unit,
         )
-
-    @property
-    def solver_contract_id(self) -> str:
-        return self.spec.solver_contract_id
-
-    @property
-    def initializer_id(self) -> str:
-        assert self.spec.initializer_id is not None
-        return self.spec.initializer_id
 
     def evaluate_batch(
         self,
@@ -973,15 +822,12 @@ def _resolve_fit_effective_schema(
 
 __all__ = [
     "BoundFit",
-    "FitAcceptance",
     "FitBatchStatus",
     "FitCancelled",
-    "FitCellProblem",
     "FitCoordinateSource",
     "FitDeadlineExceeded",
     "FitNumericPolicy",
     "FitParameterConstraint",
-    "FitProblem",
     "FitResultBatch",
     "FitSpec",
 ]

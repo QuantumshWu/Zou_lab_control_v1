@@ -12,6 +12,10 @@ from .capture import (
     compile_capture_artifact_pipeline,
 )
 from .capture_frames import CaptureFrameSource
+from zlc_neutral_atom.capture_fit_reference import (
+    CAPTURE_FIT_RESULT_ARTIFACT_NAMESPACE,
+    CaptureFitResultArtifactRef,
+)
 from .capture_fit import (
     AdmittedCaptureFitResult,
     CAPTURE_FIT_RESULT_ARTIFACT_SCHEMA,
@@ -33,5 +37,7 @@ __all__ = [
     "AdmittedCaptureFitResult",
     "CAPTURE_FIT_RESULT_ARTIFACT_SCHEMA",
     "CaptureFitResultRepository",
+    "CAPTURE_FIT_RESULT_ARTIFACT_NAMESPACE",
+    "CaptureFitResultArtifactRef",
     "FitExecution",
 ]

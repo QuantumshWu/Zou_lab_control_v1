@@ -14,15 +14,23 @@ from tests.test_capture_artifact_repository import (
     _deliver_when_armed,
     _runtime_and_spec,
 )
-from zlc_data import BlockId, FitResultArtifactRef, SCAN_POINT, fit_spec_for
+from zlc_data import (
+    BlockId,
+    SCAN_POINT,
+    encode_fit_result_batch,
+    fit_spec_for,
+)
 from zlc_neutral_atom.artifacts import (
     AdmittedCaptureFitResult,
     CaptureFitResultRepository,
+    CaptureFitResultArtifactRef,
+    CaptureFrameSource,
     CaptureRepository,
     FitExecution,
     compile_capture_artifact_pipeline,
 )
 from zlc_storage import (
+    ContentStoreAuthority,
     ContentCorruptionError,
     RepositoryRootBusy,
     content_ref_from_tree,
@@ -92,6 +100,7 @@ def _execution(fit_repository, capture_repository, capture_reference):
 def test_execution_save_load_is_idempotent_and_manifest_has_no_mirror_truths(
     tmp_path,
     committed_capture,
+    monkeypatch,
 ):
     capture_repository, capture_reference = committed_capture
     fit_root = tmp_path / "fits"
@@ -105,7 +114,7 @@ def test_execution_save_load_is_idempotent_and_manifest_has_no_mirror_truths(
     first = execution.save()
     second = execution.save()
     assert first == second
-    assert isinstance(first, FitResultArtifactRef)
+    assert isinstance(first, CaptureFitResultArtifactRef)
     assert execution.source_capture_ref == capture_reference
     assert execution.result.batch_layout.storage_size == 6 * 8
 
@@ -120,28 +129,92 @@ def test_execution_save_load_is_idempotent_and_manifest_has_no_mirror_truths(
         "source_capture_ref",
         "result_blob",
     }
-    assert not {
-        "result_digest",
-        "source_ref",
-        "fit_spec_digest",
-        "solver_contract_id",
-        "version",
-    } & set(manifest)
     assert len(list((fit_root / "content" / "manifests" / "fit-result").glob("*"))) == 1
     assert not list(fit_root.rglob("*.journal"))
 
+    source = capture_repository.admit(capture_reference).artifact.frame_source
+    frame_chunk_digests = frozenset(item.digest for item in source._chunk_refs)
+    owner_read_blob = ContentStoreAuthority.read_blob
+
+    def reject_frame_chunk_read(self, reference, *args, **kwargs):
+        if reference.digest in frame_chunk_digests:
+            raise AssertionError("loading a fit result must not read frame chunks")
+        return owner_read_blob(self, reference, *args, **kwargs)
+
+    def fail_materialization(*_args, **_kwargs):
+        raise AssertionError("loading a fit result must not materialize frames")
+
+    monkeypatch.setattr(ContentStoreAuthority, "read_blob", reject_frame_chunk_read)
+    monkeypatch.setattr(CaptureFrameSource, "materialize", fail_materialization)
     loaded = fit_repository.load(first, capture_repository)
     assert isinstance(loaded, AdmittedCaptureFitResult)
     assert loaded.reference == first
     assert loaded.source_capture_ref == capture_reference
-    assert loaded.result.digest == execution.result.digest
+    assert encode_fit_result_batch(loaded.result) == encode_fit_result_batch(
+        execution.result
+    )
     with pytest.raises(TypeError, match="process-local"):
         pickle.dumps(execution)
     with pytest.raises(TypeError, match="process-local"):
         pickle.dumps(loaded)
 
     fit_repository.close()
-    assert execution.result.digest == loaded.result.digest
+    assert encode_fit_result_batch(execution.result) == encode_fit_result_batch(
+        loaded.result
+    )
+
+
+def test_save_rejects_an_unreloadable_result_before_publishing_manifest(
+    tmp_path,
+    committed_capture,
+    monkeypatch,
+):
+    capture_repository, capture_reference = committed_capture
+    fit_root = tmp_path / "fits"
+    repository = CaptureFitResultRepository(fit_root)
+    try:
+        execution = _execution(repository, capture_repository, capture_reference)
+        monkeypatch.setattr(capture_fit_module, "_MAX_RESULT_BLOB_BYTES", 1)
+        with pytest.raises(ValueError, match="result blob exceeds"):
+            execution.save()
+        manifests = fit_root / "content" / "manifests" / "fit-result"
+        assert not manifests.exists() or not tuple(manifests.iterdir())
+    finally:
+        repository.close()
+
+
+def test_declared_oversized_result_is_rejected_before_blob_open(
+    tmp_path,
+    committed_capture,
+):
+    capture_repository, capture_reference = committed_capture
+    repository = CaptureFitResultRepository(tmp_path / "fits")
+    try:
+        reference = _execution(
+            repository,
+            capture_repository,
+            capture_reference,
+        ).save()
+        manifest = decode(
+            repository._store_authority.read_manifest(
+                "fit-result",
+                reference.manifest_digest,
+            )
+        )
+        oversized_blob = dict(manifest["result_blob"])
+        oversized_blob["size"] = capture_fit_module._MAX_RESULT_BLOB_BYTES + 1
+        stored = repository._store_authority.publish_manifest(
+            "fit-result",
+            encode({**manifest, "result_blob": oversized_blob}),
+        )
+        oversized_ref = CaptureFitResultArtifactRef(
+            repository.repository_id,
+            stored.content.digest,
+        )
+        with pytest.raises(ValueError, match="result blob exceeds"):
+            repository.load(oversized_ref, capture_repository)
+    finally:
+        repository.close()
 
 
 def test_raw_result_cannot_be_promoted_and_repository_root_has_one_owner(
@@ -163,9 +236,54 @@ def test_raw_result_cannot_be_promoted_and_repository_root_has_one_owner(
                 source_admission=capture_repository.admit(capture_reference),
                 result=execution.result,
             )
+        forged_result = replace(
+            execution.result,
+            residual_sum_squares=np.full_like(
+                execution.result.residual_sum_squares,
+                12_345.0,
+            ),
+        )
+        with pytest.raises(TypeError, match="dataclass"):
+            replace(execution, _result=forged_result)
+        with pytest.raises(AttributeError, match="immutable"):
+            execution._result = forged_result
+        reference = execution.save()
+        with pytest.raises(PermissionError, match="only be minted"):
+            AdmittedCaptureFitResult(
+                object(),
+                reference=reference,
+                source_capture_ref=capture_reference,
+                result=forged_result,
+            )
+        with pytest.raises(AttributeError, match="immutable"):
+            repository.repository_id = "forged"
+        foreign = CaptureFitResultRepository(tmp_path / "foreign-fits")
+        try:
+            with pytest.raises(PermissionError, match="authority"):
+                foreign._save_execution(execution)
+        finally:
+            foreign.close()
         with pytest.raises(RepositoryRootBusy):
             CaptureFitResultRepository(root)
     finally:
+        repository.close()
+
+
+def test_capture_fit_repository_is_final_and_detects_root_authority_drift(
+    tmp_path,
+):
+    with pytest.raises(TypeError, match="final"):
+        class _DerivedCaptureFitRepository(CaptureFitResultRepository):
+            pass
+
+    repository = CaptureFitResultRepository(tmp_path / "fits")
+    original_root = repository.root
+    try:
+        object.__setattr__(repository, "root", tmp_path / "other")
+        with pytest.raises(RuntimeError, match="authority changed"):
+            repository._require_integrity()
+    finally:
+        object.__setattr__(repository, "root", original_root)
         repository.close()
 
 
@@ -248,9 +366,21 @@ def test_load_rejects_foreign_fit_repository_and_wrong_capture_source(
 
         second_capture = _commit_capture(
             capture_repository,
-            block_id="fit-source-b",
+            block_id="fit-source-a",
             curve=tuple(reversed(_CURVE)),
         )
+        first_admission = capture_repository.admit(first_capture)
+        second_admission = capture_repository.admit(second_capture)
+        first_source = first_admission.artifact.frame_source.ref(
+            first_admission.artifact.provenance.generation
+        )
+        second_source = second_admission.artifact.frame_source.ref(
+            second_admission.artifact.provenance.generation
+        )
+        assert first_source.block_id == second_source.block_id
+        assert first_source.schema_fingerprint == second_source.schema_fingerprint
+        assert first_source.revision == second_source.revision
+        assert first_source.stream_generation != second_source.stream_generation
         manifest = decode(
             repository._store_authority.read_manifest(
                 "fit-result",
@@ -264,7 +394,7 @@ def test_load_rejects_foreign_fit_repository_and_wrong_capture_source(
             "fit-result",
             forged_payload,
         )
-        wrong_source_ref = FitResultArtifactRef(
+        wrong_source_ref = CaptureFitResultArtifactRef(
             repository.repository_id,
             stored.content.digest,
         )

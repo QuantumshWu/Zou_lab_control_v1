@@ -24,7 +24,6 @@ from .codec import (
     axis_to_tree,
 )
 from .fit_contract import (
-    FitAcceptance,
     FitBatchStatus,
     FitNumericPolicy,
     FitParameterConstraint,
@@ -54,8 +53,6 @@ def fit_spec_to_tree(spec: FitSpec) -> dict[str, Any]:
         "model_id": spec.model_id,
         "constraints": [_constraint_to_tree(item) for item in spec.constraints],
         "numeric_policy": _numeric_policy_to_tree(spec.numeric_policy),
-        "solver_contract_id": spec.solver_contract_id,
-        "initializer_id": spec.initializer_id,
     }
 
 
@@ -71,8 +68,6 @@ def fit_spec_from_tree(tree: Any) -> FitSpec:
             "model_id",
             "constraints",
             "numeric_policy",
-            "solver_contract_id",
-            "initializer_id",
         },
         FIT_SPEC_SCHEMA,
     )
@@ -96,8 +91,6 @@ def fit_spec_from_tree(tree: Any) -> FitSpec:
         model_id=_text(data["model_id"], "model_id"),
         constraints=tuple(_constraint_from_tree(value) for value in constraints),
         numeric_policy=_numeric_policy_from_tree(data["numeric_policy"]),
-        solver_contract_id=_text(data["solver_contract_id"], "solver_contract_id"),
-        initializer_id=_text(data["initializer_id"], "initializer_id"),
     )
 
 
@@ -111,7 +104,7 @@ def decode_fit_spec(payload: bytes) -> FitSpec:
     return spec
 
 
-def fit_result_batch_to_tree(result: FitResultBatch) -> dict[str, Any]:
+def _fit_result_batch_to_tree(result: FitResultBatch) -> dict[str, Any]:
     if not isinstance(result, FitResultBatch):
         raise TypeError("result must be FitResultBatch")
     return {
@@ -127,8 +120,6 @@ def fit_result_batch_to_tree(result: FitResultBatch) -> dict[str, Any]:
         "covariance_valid": result.covariance_valid,
         "statuses": [value.value for value in result.statuses],
         "errors": list(result.errors),
-        "acceptances": [value.value for value in result.acceptances],
-        "acceptance_reasons": list(result.acceptance_reasons),
         "present_observation_counts": result.present_observation_counts,
         "valid_observation_counts": result.valid_observation_counts,
         "used_observation_counts": result.used_observation_counts,
@@ -140,7 +131,7 @@ def fit_result_batch_to_tree(result: FitResultBatch) -> dict[str, Any]:
     }
 
 
-def fit_result_batch_from_tree(tree: Any) -> FitResultBatch:
+def _fit_result_batch_from_tree(tree: Any) -> FitResultBatch:
     fields = {
         "schema",
         "source_ref",
@@ -154,8 +145,6 @@ def fit_result_batch_from_tree(tree: Any) -> FitResultBatch:
         "covariance_valid",
         "statuses",
         "errors",
-        "acceptances",
-        "acceptance_reasons",
         "present_observation_counts",
         "valid_observation_counts",
         "used_observation_counts",
@@ -171,8 +160,6 @@ def fit_result_batch_from_tree(tree: Any) -> FitResultBatch:
         "batch_axis_specs",
         "statuses",
         "errors",
-        "acceptances",
-        "acceptance_reasons",
     ):
         if not isinstance(data[field], list):
             raise ValueError(f"FitResultBatch {field} must be a list")
@@ -191,10 +178,6 @@ def fit_result_batch_from_tree(tree: Any) -> FitResultBatch:
     if any(not isinstance(data[field], np.ndarray) for field in arrays):
         raise ValueError("FitResultBatch numeric fields must be ndarrays")
     errors = tuple(None if value is None else _text(value, "fit error") for value in data["errors"])
-    acceptance_reasons = tuple(
-        None if value is None else _text(value, "fit acceptance reason")
-        for value in data["acceptance_reasons"]
-    )
     value_unit = data["value_unit"]
     if value_unit is not None:
         value_unit = _text(value_unit, "value_unit")
@@ -212,11 +195,6 @@ def fit_result_batch_from_tree(tree: Any) -> FitResultBatch:
             FitBatchStatus(_text(value, "fit_status")) for value in data["statuses"]
         ),
         errors=errors,
-        acceptances=tuple(
-            FitAcceptance(_text(value, "fit_acceptance"))
-            for value in data["acceptances"]
-        ),
-        acceptance_reasons=acceptance_reasons,
         present_observation_counts=data["present_observation_counts"],
         valid_observation_counts=data["valid_observation_counts"],
         used_observation_counts=data["used_observation_counts"],
@@ -229,11 +207,11 @@ def fit_result_batch_from_tree(tree: Any) -> FitResultBatch:
 
 
 def encode_fit_result_batch(result: FitResultBatch) -> bytes:
-    return encode(fit_result_batch_to_tree(result))
+    return encode(_fit_result_batch_to_tree(result))
 
 
 def decode_fit_result_batch(payload: bytes) -> FitResultBatch:
-    result = fit_result_batch_from_tree(decode(payload))
+    result = _fit_result_batch_from_tree(decode(payload))
     _require_typed_canonical(
         payload,
         encode_fit_result_batch(result),
@@ -271,8 +249,6 @@ def _constraint_from_tree(tree: Any) -> FitParameterConstraint:
 def _numeric_policy_to_tree(value: FitNumericPolicy) -> dict[str, Any]:
     return {
         "max_evaluations": value.max_evaluations,
-        "max_seconds_per_batch": value.max_seconds_per_batch,
-        "max_total_seconds": value.max_total_seconds,
         "max_batch_cells": value.max_batch_cells,
         "sample_budget_per_batch": value.sample_budget_per_batch,
         "max_packed_observations": value.max_packed_observations,
@@ -283,8 +259,6 @@ def _numeric_policy_to_tree(value: FitNumericPolicy) -> dict[str, Any]:
 def _numeric_policy_from_tree(tree: Any) -> FitNumericPolicy:
     fields = {
         "max_evaluations",
-        "max_seconds_per_batch",
-        "max_total_seconds",
         "max_batch_cells",
         "sample_budget_per_batch",
         "max_packed_observations",
@@ -298,13 +272,6 @@ def _numeric_policy_from_tree(tree: Any) -> FitNumericPolicy:
     )
     return FitNumericPolicy(
         max_evaluations=_integer(data["max_evaluations"], "max_evaluations"),
-        max_seconds_per_batch=finite_real(
-            data["max_seconds_per_batch"], "max_seconds_per_batch"
-        ),
-        max_total_seconds=finite_real(
-            data["max_total_seconds"],
-            "max_total_seconds",
-        ),
         max_batch_cells=_integer(data["max_batch_cells"], "max_batch_cells"),
         sample_budget_per_batch=_integer(
             data["sample_budget_per_batch"], "sample_budget_per_batch"
@@ -348,12 +315,10 @@ def _optional_real(value: Any, field: str) -> float | None:
 
 
 __all__ = [
-    "decode_fit_result_batch",
     "decode_fit_spec",
-    "encode_fit_result_batch",
+    "decode_fit_result_batch",
     "encode_fit_spec",
-    "fit_result_batch_from_tree",
-    "fit_result_batch_to_tree",
+    "encode_fit_result_batch",
     "fit_spec_from_tree",
     "fit_spec_to_tree",
 ]

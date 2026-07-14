@@ -94,40 +94,29 @@ class FitParameterDefinition:
 
 
 @dataclass(frozen=True)
-class FitAxisRequirement:
-    allowed_roles: tuple[AxisRoleId, ...]
-
-    def __post_init__(self) -> None:
-        roles = tuple(self.allowed_roles)
-        if not roles or any(not isinstance(role, AxisRoleId) for role in roles):
-            raise ValueError("fit axis requirement needs declared AxisRoleId values")
-        if len(set(roles)) != len(roles):
-            raise ValueError("fit axis requirement roles must be unique")
-        object.__setattr__(self, "allowed_roles", tuple(sorted(roles, key=lambda item: item.value)))
-
-
-@dataclass(frozen=True)
 class FitModelDefinition:
     model_id: str
     display_name: str
-    axis_requirements: tuple[FitAxisRequirement, ...]
+    axis_requirements: tuple[tuple[AxisRoleId, ...], ...]
     parameters: tuple[FitParameterDefinition, ...]
-    initializer_id: str
     require_common_axis_unit: bool = False
     require_common_coordinate_frame: bool = False
 
     def __post_init__(self) -> None:
-        for field, value in (
-            ("model_id", self.model_id),
-            ("display_name", self.display_name),
-            ("initializer_id", self.initializer_id),
-        ):
+        for field, value in (("model_id", self.model_id), ("display_name", self.display_name)):
             canonical_text(value, field)
-        requirements = tuple(self.axis_requirements)
-        if len(requirements) not in (1, 2) or any(
-            not isinstance(item, FitAxisRequirement) for item in requirements
-        ):
+        requirements = tuple(tuple(item) for item in self.axis_requirements)
+        if len(requirements) not in (1, 2):
             raise ValueError("axis_requirements must describe one or two independent axes")
+        normalized_requirements: list[tuple[AxisRoleId, ...]] = []
+        for roles in requirements:
+            if not roles or any(not isinstance(role, AxisRoleId) for role in roles):
+                raise ValueError("fit axis requirement needs declared AxisRoleId values")
+            if len(set(roles)) != len(roles):
+                raise ValueError("fit axis requirement roles must be unique")
+            normalized_requirements.append(
+                tuple(sorted(roles, key=lambda item: item.value))
+            )
         parameters = tuple(self.parameters)
         if not parameters or any(not isinstance(item, FitParameterDefinition) for item in parameters):
             raise ValueError("model requires FitParameterDefinition values")
@@ -138,7 +127,7 @@ class FitModelDefinition:
             raise TypeError("require_common_axis_unit must be bool")
         if not isinstance(self.require_common_coordinate_frame, bool):
             raise TypeError("require_common_coordinate_frame must be bool")
-        object.__setattr__(self, "axis_requirements", requirements)
+        object.__setattr__(self, "axis_requirements", tuple(normalized_requirements))
         object.__setattr__(self, "parameters", parameters)
 
     @property
@@ -158,11 +147,9 @@ RADIAN = ParameterUnitRelation.RADIAN
 POSITIVE = FitParameterDomain.POSITIVE
 NONNEGATIVE = FitParameterDomain.NONNEGATIVE
 PHASE_RADIANS = FitParameterDomain.PHASE_RADIANS
-GENERIC_CURVE = FitAxisRequirement(
-    (HISTOGRAM_BIN, SCAN_POINT, SPATIAL_X, SPATIAL_Y, SPECTRAL)
-)
-SPACE_X = FitAxisRequirement((SPATIAL_X,))
-SPACE_Y = FitAxisRequirement((SPATIAL_Y,))
+GENERIC_CURVE = (HISTOGRAM_BIN, SCAN_POINT, SPATIAL_X, SPATIAL_Y, SPECTRAL)
+SPACE_X = (SPATIAL_X,)
+SPACE_Y = (SPATIAL_Y,)
 
 
 _MODELS = (
@@ -176,7 +163,6 @@ _MODELS = (
             FitParameterDefinition("amplitude", VALUE),
             FitParameterDefinition("offset", VALUE),
         ),
-        "lorentzian-signed-extrema",
     ),
     FitModelDefinition(
         "gaussian_offset",
@@ -188,7 +174,6 @@ _MODELS = (
             FitParameterDefinition("sigma", AXIS_0, POSITIVE),
             FitParameterDefinition("center", AXIS_0),
         ),
-        "gaussian-signed-extrema",
     ),
     FitModelDefinition(
         "symmetric_lorentzian_doublet",
@@ -201,7 +186,6 @@ _MODELS = (
             FitParameterDefinition("offset", VALUE),
             FitParameterDefinition("center_splitting", AXIS_0, NONNEGATIVE),
         ),
-        "symmetric-doublet-peak-dip-pair",
     ),
     FitModelDefinition(
         "damped_sine",
@@ -214,7 +198,6 @@ _MODELS = (
             FitParameterDefinition("decay_time", AXIS_0, POSITIVE),
             FitParameterDefinition("phase", RADIAN, PHASE_RADIANS),
         ),
-        "damped-sine-uniform-rfft-or-span",
     ),
     FitModelDefinition(
         "exponential_decay",
@@ -225,7 +208,6 @@ _MODELS = (
             FitParameterDefinition("offset", VALUE),
             FitParameterDefinition("decay_time", AXIS_0, POSITIVE),
         ),
-        "exponential-signed-extrema",
     ),
     FitModelDefinition(
         "radial_gaussian_center",
@@ -238,7 +220,6 @@ _MODELS = (
             FitParameterDefinition("center_x", AXIS_0),
             FitParameterDefinition("center_y", AXIS_1),
         ),
-        "radial-signed-centroid",
         require_common_axis_unit=True,
         require_common_coordinate_frame=True,
     ),
@@ -286,21 +267,8 @@ def evaluate_fit_model(
             raise ValueError(
                 f"parameter {parameter.name!r} violates its {parameter.domain.value} domain"
             )
-    key = definition.model_id
-    if key == "lorentzian":
-        result = _lorentzian(coords[0], *params)
-    elif key == "gaussian_offset":
-        result = _gaussian_offset(coords[0], *params)
-    elif key == "symmetric_lorentzian_doublet":
-        result = _symmetric_lorentzian_doublet(coords[0], *params)
-    elif key == "damped_sine":
-        result = _damped_sine(coords[0], *params)
-    elif key == "exponential_decay":
-        result = _exponential_decay(coords[0], *params)
-    elif key == "radial_gaussian_center":
-        result = _radial_gaussian_center(coords[0], coords[1], *params)
-    else:  # pragma: no cover - the catalogue is a closed union
-        raise RuntimeError(f"no evaluator for {key}")
+    evaluator, _ = _IMPLEMENTATION_BY_ID[definition.model_id]
+    result = evaluator(*coords, *params)
     return np.asarray(result, dtype=np.float64)
 
 
@@ -321,21 +289,8 @@ def initialize_fit_model(
         raise ValueError("model initialization requires at least two observations")
     if not np.all(np.isfinite(y)) or any(not np.all(np.isfinite(item)) for item in coords):
         raise ValueError("fit initialization requires finite authoritative observations")
-    key = model.model_id
-    if key == "lorentzian":
-        seeds = _init_lorentzian(coords[0], y)
-    elif key == "gaussian_offset":
-        seeds = _init_gaussian(coords[0], y)
-    elif key == "symmetric_lorentzian_doublet":
-        seeds = _init_symmetric_lorentzian_doublet(coords[0], y)
-    elif key == "damped_sine":
-        seeds = _init_damped_sine(coords[0], y)
-    elif key == "exponential_decay":
-        seeds = _init_exponential(coords[0], y)
-    elif key == "radial_gaussian_center":
-        seeds = _init_center(coords[0], coords[1], y)
-    else:  # pragma: no cover - closed catalog
-        raise RuntimeError(f"no initializer for {key}")
+    _, initializer = _IMPLEMENTATION_BY_ID[model.model_id]
+    seeds = initializer(*coords, y)
     canonical = tuple(tuple(float(value) for value in seed) for seed in seeds)
     if not canonical or any(len(seed) != len(model.parameters) for seed in canonical):
         raise ValueError("model initializer returned an invalid seed shape")
@@ -566,14 +521,28 @@ def _init_center(
     return tuple(seeds)
 
 
+_IMPLEMENTATION_BY_ID = MappingProxyType(
+    {
+        "lorentzian": (_lorentzian, _init_lorentzian),
+        "gaussian_offset": (_gaussian_offset, _init_gaussian),
+        "symmetric_lorentzian_doublet": (
+            _symmetric_lorentzian_doublet,
+            _init_symmetric_lorentzian_doublet,
+        ),
+        "damped_sine": (_damped_sine, _init_damped_sine),
+        "exponential_decay": (_exponential_decay, _init_exponential),
+        "radial_gaussian_center": (_radial_gaussian_center, _init_center),
+    }
+)
+if _IMPLEMENTATION_BY_ID.keys() != _MODEL_BY_ID.keys():  # pragma: no cover
+    raise RuntimeError("fit model metadata and implementations must share one closed key set")
+
+
 __all__ = [
-    "FitAxisRequirement",
     "FitModelDefinition",
-    "FitParameterDomain",
     "FitParameterDefinition",
+    "FitParameterDomain",
     "ParameterUnitRelation",
-    "evaluate_fit_model",
     "fit_model_catalog",
     "fit_model_definition",
-    "initialize_fit_model",
 ]

@@ -13,10 +13,16 @@ import Zou_lab_control.notebook.facade as facade_impl
 from Zou_lab_control.neutral_atom.devices.base import BaseDevice
 from Zou_lab_control.neutral_atom.devices.registry import DeviceSet
 from Zou_lab_control.neutral_atom.device_catalog import DeviceRef
-from zlc_data import FitNumericPolicy, FitResultArtifactRef, SPATIAL_X, SPATIAL_Y
+from zlc_data import (
+    FitNumericPolicy,
+    SPATIAL_X,
+    SPATIAL_Y,
+    encode_fit_result_batch,
+)
 from zlc_neutral_atom.artifacts import (
     CaptureArtifactRef,
     CaptureFitResultRepository,
+    CaptureFitResultArtifactRef,
     CaptureRepository,
 )
 from zlc_neutral_atom.readout.calibration_repository import CalibrationRepository
@@ -90,8 +96,6 @@ def test_capture_fit_save_load_is_short_headless_and_preserves_named_batch_axes(
             model="radial_gaussian_center",
             numeric_policy=FitNumericPolicy(
                 max_evaluations=500,
-                max_seconds_per_batch=1.0,
-                max_total_seconds=5.0,
                 sample_budget_per_batch=512,
                 max_packed_observations=4_096,
             ),
@@ -106,11 +110,13 @@ def test_capture_fit_save_load_is_short_headless_and_preserves_named_batch_axes(
         assert len(execution.result.batch_axis_specs) == 2
 
         fit_ref = execution.save()
-        assert isinstance(fit_ref, FitResultArtifactRef)
+        assert isinstance(fit_ref, CaptureFitResultArtifactRef)
         admitted = exp.load_fit(fit_ref)
         assert admitted.reference == fit_ref
         assert admitted.source_capture_ref == capture_ref
-        assert admitted.result.digest == execution.result.digest
+        assert encode_fit_result_batch(admitted.result) == encode_fit_result_batch(
+            execution.result
+        )
 
 
 def test_public_experiment_graph_contains_no_drive_capability(tmp_path):

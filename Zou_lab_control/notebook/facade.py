@@ -23,7 +23,6 @@ from zlc_data import (
     CommittedTransform,
     FitNumericPolicy,
     FitParameterConstraint,
-    FitResultArtifactRef,
     FitSpec,
     fit_spec_for,
 )
@@ -32,6 +31,7 @@ from zlc_neutral_atom.artifacts import (
     CaptureArtifact,
     CaptureArtifactRef,
     CaptureFitResultRepository,
+    CaptureFitResultArtifactRef,
     CaptureRepository,
     FitExecution,
     compile_capture_artifact_pipeline,
@@ -434,7 +434,7 @@ class Experiment:
 
     def load_fit(
         self,
-        reference: FitResultArtifactRef,
+        reference: CaptureFitResultArtifactRef,
     ) -> AdmittedCaptureFitResult:
         services = _services(self._authority_token)
         return services.fit_repository.load(

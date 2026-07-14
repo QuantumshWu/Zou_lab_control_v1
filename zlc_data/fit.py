@@ -7,48 +7,31 @@ from .fit_codec import (
     decode_fit_spec,
     encode_fit_result_batch,
     encode_fit_spec,
-    fit_result_batch_from_tree,
-    fit_result_batch_to_tree,
     fit_spec_from_tree,
     fit_spec_to_tree,
 )
 from .fit_contract import (
     BoundFit,
-    FitAcceptance,
     FitBatchStatus,
     FitCancelled,
     FitCoordinateSource,
     FitDeadlineExceeded,
     FitNumericPolicy,
     FitParameterConstraint,
-    FitProblem,
     FitResultBatch,
     FitSpec,
-    resolve_parameter_units,
 )
 from .fit_model import (
-    FitAxisRequirement,
     FitModelDefinition,
-    FitParameterDomain,
     FitParameterDefinition,
+    FitParameterDomain,
     ParameterUnitRelation,
-    evaluate_fit_model,
     fit_model_catalog,
     fit_model_definition,
 )
-from .fit_reference import (
-    FIT_RESULT_ARTIFACT_NAMESPACE,
-    FIT_RESULT_ARTIFACT_REF_SCHEMA,
-    FitResultArtifactRef,
-    decode_fit_result_artifact_ref,
-    encode_fit_result_artifact_ref,
-    fit_result_artifact_ref_from_tree,
-    fit_result_artifact_ref_to_tree,
-)
 from .fit_problem import (
     bind_fit,
-    build_fit_problem,
-    validate_fit_result_binding,
+    validate_fit_result_source_binding,
 )
 from .schema import DatasetSchema
 from .transform import CommittedTransform, resolve_transformed_schema
@@ -73,7 +56,7 @@ def _unique_role_matching(model, effective_axes) -> tuple[AxisId, ...]:
         for axis in effective_axes:
             if (
                 axis.axis_id not in selected
-                and axis.role in requirement.allowed_roles
+                and axis.role in requirement
             ):
                 visit(position + 1, (*selected, axis.axis_id))
 
@@ -150,31 +133,8 @@ def fit_spec_for(
     return bind_fit(spec, schema).spec
 
 
-def fit_analysis(
-    bound: BoundFit,
-    snapshot,
-    *,
-    cancel_check=None,
-    deadline_monotonic=None,
-) -> FitResultBatch:
-    """Lazy public solver entrypoint; importing ``zlc_data`` does not import SciPy."""
-
-    from .fit_solver import fit_analysis as _fit_analysis
-
-    return _fit_analysis(
-        bound,
-        snapshot,
-        cancel_check=cancel_check,
-        deadline_monotonic=deadline_monotonic,
-    )
-
-
 __all__ = [
     "BoundFit",
-    "FIT_RESULT_ARTIFACT_NAMESPACE",
-    "FIT_RESULT_ARTIFACT_REF_SCHEMA",
-    "FitAcceptance",
-    "FitAxisRequirement",
     "FitBatchStatus",
     "FitCancelled",
     "FitCoordinateSource",
@@ -182,32 +142,20 @@ __all__ = [
     "FitModelDefinition",
     "FitNumericPolicy",
     "FitParameterConstraint",
-    "FitParameterDomain",
     "FitParameterDefinition",
-    "FitProblem",
-    "FitResultArtifactRef",
+    "FitParameterDomain",
     "FitResultBatch",
     "FitSpec",
     "ParameterUnitRelation",
     "bind_fit",
-    "build_fit_problem",
     "decode_fit_result_batch",
-    "decode_fit_result_artifact_ref",
     "decode_fit_spec",
     "encode_fit_result_batch",
-    "encode_fit_result_artifact_ref",
     "encode_fit_spec",
-    "evaluate_fit_model",
     "fit_model_catalog",
     "fit_model_definition",
-    "fit_result_artifact_ref_from_tree",
-    "fit_result_artifact_ref_to_tree",
-    "fit_analysis",
-    "fit_spec_for",
-    "fit_result_batch_from_tree",
-    "fit_result_batch_to_tree",
     "fit_spec_from_tree",
+    "fit_spec_for",
     "fit_spec_to_tree",
-    "resolve_parameter_units",
-    "validate_fit_result_binding",
+    "validate_fit_result_source_binding",
 ]

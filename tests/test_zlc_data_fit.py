@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import subprocess
 import sys
 import time
@@ -18,6 +19,7 @@ from zlc_data import (
     SPATIAL_X,
     SPATIAL_Y,
     AxisId,
+    AxisLayout,
     AxisLayoutMode,
     AxisRoleId,
     AxisSpec,
@@ -30,14 +32,18 @@ from zlc_data import (
     DataTransformSpec,
     DatasetRevision,
     DatasetSchema,
-    FitAcceptance,
     FitBatchStatus,
     FitCancelled,
     FitDeadlineExceeded,
+    FitModelDefinition,
     FitNumericPolicy,
     FitParameterConstraint,
+    FitParameterDefinition,
+    FitParameterDomain,
+    FitResultBatch,
     FitSpec,
     OwnedSnapshot,
+    ParameterUnitRelation,
     PointLayout,
     Select,
     Selection,
@@ -48,20 +54,22 @@ from zlc_data import (
     ValidityContract,
     ValueSchema,
     bind_fit,
-    build_fit_problem,
     commit_transform,
     decode_fit_result_batch,
     decode_fit_spec,
     encode_fit_result_batch,
     encode_fit_spec,
-    evaluate_fit_model,
-    fit_analysis,
     fit_model_catalog,
     fit_model_definition,
+    fit_spec_from_tree,
+    fit_spec_to_tree,
 )
-from zlc_data.fit_codec import fit_result_batch_to_tree, fit_spec_to_tree
-from zlc_data.fit_model import initialize_fit_model
-from zlc_storage.canonical import encode
+from zlc_data.fit_problem import build_fit_problem
+from zlc_data.fit_model import (
+    evaluate_fit_model,
+    initialize_fit_model,
+)
+from zlc_storage.canonical import decode, encode
 
 
 def axis(
@@ -149,8 +157,16 @@ def gaussian_spec(snapshot: OwnedSnapshot, scan: AxisSpec, **kwargs) -> FitSpec:
     )
 
 
-def test_catalog_is_closed_canonical_and_has_no_legacy_aliases():
+def test_catalog_is_closed_canonical_and_rejects_unknown_models():
     catalog = fit_model_catalog()
+    assert all(isinstance(model, FitModelDefinition) for model in catalog)
+    assert all(
+        isinstance(parameter, FitParameterDefinition)
+        and isinstance(parameter.domain, FitParameterDomain)
+        and isinstance(parameter.unit_relation, ParameterUnitRelation)
+        for model in catalog
+        for parameter in model.parameters
+    )
     assert tuple(model.model_id for model in catalog) == (
         "lorentzian",
         "gaussian_offset",
@@ -159,16 +175,8 @@ def test_catalog_is_closed_canonical_and_has_no_legacy_aliases():
         "exponential_decay",
         "radial_gaussian_center",
     )
-    for legacy in (
-        "lorent",
-        "lorent_zeeman",
-        "zeeman_double_lorentzian",
-        "rabi",
-        "decay",
-        "center",
-    ):
-        with pytest.raises(ValueError, match="unknown fit model"):
-            fit_model_definition(legacy)
+    with pytest.raises(ValueError, match="unknown fit model"):
+        fit_model_definition("unknown-model")
     by_id = {model.model_id: model for model in catalog}
     assert {model_id: model.parameter_names for model_id, model in by_id.items()} == {
         "lorentzian": ("center", "fwhm", "amplitude", "offset"),
@@ -190,14 +198,23 @@ def test_catalog_is_closed_canonical_and_has_no_legacy_aliases():
             "center_y",
         ),
     }
-    assert tuple(model.initializer_id for model in catalog) == (
-        "lorentzian-signed-extrema",
-        "gaussian-signed-extrema",
-        "symmetric-doublet-peak-dip-pair",
-        "damped-sine-uniform-rfft-or-span",
-        "exponential-signed-extrema",
-        "radial-signed-centroid",
-    )
+
+
+def test_public_fit_spec_codec_and_bound_editor_metadata_have_one_owner():
+    snapshot, scan = gaussian_snapshot()
+    spec = gaussian_spec(snapshot, scan)
+    payload = encode_fit_spec(spec)
+    tree = fit_spec_to_tree(spec)
+
+    assert encode(tree) == payload
+    assert decode_fit_spec(payload) == spec
+    assert fit_spec_from_tree(tree) == spec
+    with pytest.raises(ValueError):
+        fit_spec_from_tree({**tree, "legacy_version": 1})
+
+    bound = bind_fit(spec, snapshot.block.schema)
+    assert bound.parameter_definitions == bound.model.parameters
+    assert bound.parameter_units == ("count", "count", "MHz", "MHz")
 
 
 def test_model_characteristic_points_define_physical_parameter_semantics():
@@ -247,7 +264,7 @@ def test_model_characteristic_points_define_physical_parameter_semantics():
     )
 
 
-def test_initializer_identities_are_pinned_by_independent_seed_examples():
+def test_initializers_match_independent_seed_examples():
     x = np.arange(5.0)
     peak = np.array([1.0, 2.0, 5.0, 2.0, 1.0])
     lorentzian = initialize_fit_model(fit_model_definition("lorentzian"), (x,), peak)
@@ -345,7 +362,8 @@ def test_importing_zlc_data_keeps_scipy_solver_lazy():
             sys.executable,
             "-c",
             "import sys, zlc_data; assert 'scipy' not in sys.modules; "
-            "assert callable(zlc_data.fit_analysis)",
+            "assert callable(zlc_data.BoundFit.run); "
+            "assert not hasattr(zlc_data, 'fit_analysis')",
         ],
         check=False,
         capture_output=True,
@@ -384,9 +402,8 @@ def test_every_curve_model_recovers_clean_synthetic_data(model_id, x, parameters
         (snapshot.block.schema.repeat_axis.axis_id,),
         model_id,
     )
-    result = fit_analysis(bind_fit(spec, snapshot.block.schema), snapshot)
+    result = bind_fit(spec, snapshot.block.schema).run(snapshot)
     assert result.statuses == (FitBatchStatus.CONVERGED,)
-    assert result.acceptances == (FitAcceptance.ACCEPTED,)
     np.testing.assert_allclose(result.parameter_values[0], parameters, rtol=2e-5, atol=2e-5)
 
 
@@ -549,11 +566,6 @@ def test_grid_site_batch_uses_component_validity_without_collapsing_sites():
         FitBatchStatus.NO_VALID_DATA,
         FitBatchStatus.INSUFFICIENT_POINTS,
     )
-    assert result.acceptances == (
-        FitAcceptance.ACCEPTED,
-        FitAcceptance.NOT_EVALUATED,
-        FitAcceptance.NOT_EVALUATED,
-    )
     np.testing.assert_array_equal(result.present_observation_counts, (9, 9, 9))
     np.testing.assert_array_equal(result.valid_observation_counts, (9, 0, 3))
     np.testing.assert_array_equal(result.used_observation_counts, (9, 0, 3))
@@ -643,6 +655,80 @@ def test_batch_layout_preserves_rectangular_c_and_f(point_layout, expected_mode)
     assert problem.batch_layout.mode is expected_mode
 
 
+@pytest.mark.parametrize(
+    "point_layout",
+    (
+        PointLayout.rect_f((3, 6)),
+        PointLayout.explicit(
+            (3, 6),
+            tuple((group, scan) for group in (0, 2) for scan in range(6)),
+        ),
+    ),
+    ids=("rect-f", "sparse-explicit"),
+)
+def test_mixed_cell_data_batch_plan_matches_source_values(point_layout):
+    group = axis("group", SITE, 3)
+    scan = axis("scan", SCAN_POINT, 6, coordinates=np.linspace(-2, 2, 6))
+    site = axis("site", AxisRoleId("grid-x"), 2)
+    group_indices = point_layout.axis_indices(0)
+    scan_indices = point_layout.axis_indices(1)
+    values = np.empty((2, point_layout.storage_size, site.size), dtype=np.float64)
+    for repeat_index in range(2):
+        for point_storage_index in range(point_layout.storage_size):
+            for site_index in range(site.size):
+                values[repeat_index, point_storage_index, site_index] = (
+                    100 * repeat_index
+                    + 10 * group_indices[point_storage_index]
+                    + site_index
+                    + scan_indices[point_storage_index] / 10
+                )
+    snapshot = snapshot_for(
+        repeat=2,
+        point_axes=(group, scan),
+        point_layout=point_layout,
+        data_axes=(site,),
+        values=values,
+    )
+    repeat_axis = snapshot.block.schema.repeat_axis
+    spec = FitSpec(
+        snapshot.block.schema.fingerprint,
+        None,
+        (scan.axis_id,),
+        (site.axis_id, group.axis_id, repeat_axis.axis_id),
+        "gaussian_offset",
+    )
+    problem = build_fit_problem(bind_fit(spec, snapshot.block.schema), snapshot)
+
+    present_groups = tuple(sorted(set(int(item) for item in group_indices)))
+    expected_keys = {
+        (site_index, group_index, repeat_index)
+        for site_index in range(site.size)
+        for group_index in present_groups
+        for repeat_index in range(repeat_axis.size)
+    }
+    actual_keys = tuple(
+        problem.batch_layout.multi_index(index)
+        for index in range(problem.batch_layout.storage_size)
+    )
+    assert set(actual_keys) == expected_keys
+    for batch_index, (site_index, group_index, repeat_index) in enumerate(actual_keys):
+        rows = np.flatnonzero(group_indices == group_index)
+        rows = rows[np.argsort(scan_indices[rows], kind="stable")]
+        start, stop = problem.batch_offsets[batch_index : batch_index + 2]
+        np.testing.assert_array_equal(
+            problem.present_observation_counts[batch_index],
+            rows.size,
+        )
+        np.testing.assert_allclose(
+            problem.independent_values[0][start:stop],
+            np.asarray(scan.coordinates)[scan_indices[rows]],
+        )
+        np.testing.assert_allclose(
+            problem.observations[start:stop],
+            values[repeat_index, rows, site_index],
+        )
+
+
 def test_nonfactor_sparse_mapping_stays_explicit_after_authoritative_repeat_selection():
     first = axis("first", SITE, 2)
     second = axis("second", AxisRoleId("grid-y"), 2)
@@ -713,12 +799,184 @@ def test_large_radial_image_is_sampled_before_coordinate_packing_and_fits_2d():
     assert problem.used_observation_counts[0] == 1_000
     assert problem.observations.size == 1_000
     assert tuple(values.size for values in problem.independent_values) == (1_000, 1_000)
-    assert problem.sampling_quanta.shape == (1, 2)
-    assert np.all(problem.sampling_quanta > 0.0)
     result = bound.run(snapshot)
     assert result.statuses == (FitBatchStatus.CONVERGED,)
-    assert result.acceptances == (FitAcceptance.ACCEPTED,)
     np.testing.assert_allclose(result.parameter_values[0], expected, rtol=2e-3, atol=2e-3)
+
+
+def test_radial_roi_keeps_absolute_coordinate_less_centers_and_index_units():
+    x = axis("x", SPATIAL_X, 61)
+    y = axis("y", SPATIAL_Y, 41)
+    xx, yy = np.meshgrid(np.arange(x.size), np.arange(y.size), indexing="ij")
+    expected = (8.0, 0.4, 4.0, 30.0, 15.0)
+    image = (
+        expected[1]
+        + expected[0]
+        * np.exp(
+            -(
+                (xx - expected[3]) ** 2
+                + (yy - expected[4]) ** 2
+            )
+            / expected[2] ** 2
+        )
+    )
+    snapshot = snapshot_for(
+        repeat=1,
+        point_axes=(),
+        point_layout=PointLayout.rect_c(()),
+        data_axes=(x, y),
+        values=image.reshape(1, 1, *image.shape),
+    )
+
+    def run(committed_transform):
+        spec = FitSpec(
+            snapshot.block.schema.fingerprint,
+            committed_transform,
+            (x.axis_id, y.axis_id),
+            (snapshot.block.schema.repeat_axis.axis_id,),
+            "radial_gaussian_center",
+        )
+        return bind_fit(spec, snapshot.block.schema).run(snapshot)
+
+    full = run(None)
+    roi_transform = commit_transform(
+        snapshot.block.schema,
+        DataTransformSpec(
+            (
+                Select(Selection.index_range(x.axis_id, 20, 41)),
+                Select(Selection.index_range(y.axis_id, 5, 26)),
+            )
+        ),
+        revision=TransformRevision(3),
+        origin=TransformOrigin.USER,
+    )
+    roi = run(roi_transform)
+
+    assert full.statuses == roi.statuses == (FitBatchStatus.CONVERGED,)
+    np.testing.assert_allclose(full.parameter_values[0], expected, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(roi.parameter_values[0], expected, rtol=1e-5, atol=1e-5)
+    assert roi.parameter_units == ("count", "count", "index", "index", "index")
+    assert tuple(axis.unit for axis in roi.fit_axis_specs) == ("index", "index")
+    assert tuple(axis.coordinates[0] for axis in roi.fit_axis_specs) == (20, 5)
+
+
+def test_value_aware_2d_sampling_keeps_a_narrow_feature_between_grid_points():
+    x = axis("x", SPATIAL_X, 600)
+    y = axis("y", SPATIAL_Y, 600)
+    xx, yy = np.meshgrid(np.arange(x.size), np.arange(y.size), indexing="ij")
+    expected = (5_000.0, 100.0, 2.0, 8.0, 13.0)
+    image = (
+        expected[1]
+        + expected[0]
+        * np.exp(
+            -(
+                (xx - expected[3]) ** 2
+                + (yy - expected[4]) ** 2
+            )
+            / expected[2] ** 2
+        )
+    )
+    snapshot = snapshot_for(
+        repeat=1,
+        point_axes=(),
+        point_layout=PointLayout.rect_c(()),
+        data_axes=(x, y),
+        values=image.reshape(1, 1, *image.shape),
+    )
+    spec = FitSpec(
+        snapshot.block.schema.fingerprint,
+        None,
+        (x.axis_id, y.axis_id),
+        (snapshot.block.schema.repeat_axis.axis_id,),
+        "radial_gaussian_center",
+        numeric_policy=FitNumericPolicy(sample_budget_per_batch=12_000),
+    )
+
+    problem = build_fit_problem(bind_fit(spec, snapshot.block.schema), snapshot)
+    assert problem.used_observation_counts[0] == 12_000
+    assert np.max(problem.observations) == pytest.approx(5_100.0)
+    result = bind_fit(spec, snapshot.block.schema).run(snapshot)
+    assert result.statuses == (FitBatchStatus.CONVERGED,)
+    np.testing.assert_allclose(result.parameter_values[0], expected, rtol=2e-3, atol=2e-3)
+
+
+def test_value_aware_sampling_does_not_turn_one_outlier_into_the_only_feature():
+    x = axis("x", SPATIAL_X, 240)
+    y = axis("y", SPATIAL_Y, 240)
+    xx, yy = np.meshgrid(np.arange(x.size), np.arange(y.size), indexing="ij")
+    expected = (4.0, 0.5, 35.0, 125.0, 112.0)
+    image = (
+        expected[1]
+        + expected[0]
+        * np.exp(
+            -(
+                (xx - expected[3]) ** 2
+                + (yy - expected[4]) ** 2
+            )
+            / expected[2] ** 2
+        )
+    )
+    image[7, 13] = 1_000.0
+    snapshot = snapshot_for(
+        repeat=1,
+        point_axes=(),
+        point_layout=PointLayout.rect_c(()),
+        data_axes=(x, y),
+        values=image.reshape(1, 1, *image.shape),
+    )
+    spec = FitSpec(
+        snapshot.block.schema.fingerprint,
+        None,
+        (x.axis_id, y.axis_id),
+        (snapshot.block.schema.repeat_axis.axis_id,),
+        "radial_gaussian_center",
+        numeric_policy=FitNumericPolicy(sample_budget_per_batch=12_000),
+    )
+
+    result = bind_fit(spec, snapshot.block.schema).run(snapshot)
+    assert result.statuses == (FitBatchStatus.CONVERGED,)
+    assert result.parameter_values[0, 2] > 30.0
+    np.testing.assert_allclose(
+        result.parameter_values[0, 3:5],
+        expected[3:5],
+        atol=0.05,
+    )
+
+
+def test_valid_nonfinite_is_sampled_fail_closed_while_invalid_nonfinite_is_absent():
+    coordinate_values = np.linspace(-5.0, 5.0, 100)
+    scan = axis(
+        "nonfinite_scan",
+        SCAN_POINT,
+        coordinate_values.size,
+        coordinates=coordinate_values,
+    )
+    signal = 0.5 + 3.0 * np.exp(-((coordinate_values - 0.7) ** 2) / (2.0 * 1.1**2))
+    signal[90:92] = np.nan
+    validity = np.ones((1, scan.size), dtype=bool)
+    validity[0, 91] = False
+    snapshot = snapshot_for(
+        repeat=1,
+        point_axes=(scan,),
+        point_layout=PointLayout.rect_c((scan.size,)),
+        values=signal.reshape(1, -1),
+        validity=CellValidity(validity),
+    )
+    spec = FitSpec(
+        snapshot.block.schema.fingerprint,
+        None,
+        (scan.axis_id,),
+        (snapshot.block.schema.repeat_axis.axis_id,),
+        "gaussian_offset",
+        numeric_policy=FitNumericPolicy(sample_budget_per_batch=5),
+    )
+
+    problem = build_fit_problem(bind_fit(spec, snapshot.block.schema), snapshot)
+    assert np.count_nonzero(np.isnan(problem.observations)) == 1
+    assert coordinate_values[90] in problem.independent_values[0]
+    assert coordinate_values[91] not in problem.independent_values[0]
+    result = bind_fit(spec, snapshot.block.schema).run(snapshot)
+    assert result.statuses == (FitBatchStatus.NUMERIC_ERROR,)
 
 
 def test_total_packed_observation_budget_rejects_before_concatenation(monkeypatch):
@@ -831,7 +1089,6 @@ def test_2d_sampling_is_cartesian_not_a_rank_deficient_flattened_diagonal():
     )
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
     assert result.statuses == (FitBatchStatus.CONVERGED,)
-    assert result.acceptances == (FitAcceptance.ACCEPTED,)
     assert result.r_squared[0] > 0.999999
     np.testing.assert_allclose(result.parameter_values[0], expected, rtol=2e-4, atol=2e-4)
 
@@ -872,7 +1129,6 @@ def test_2d_point_axes_sampling_recovers_center_and_ignores_storage_permutation(
     np.random.default_rng(11).shuffle(mapping)
     permuted = run(PointLayout.explicit((100, 100), tuple(mapping)))
     assert ordered.statuses == permuted.statuses == (FitBatchStatus.CONVERGED,)
-    assert ordered.acceptances == permuted.acceptances == (FitAcceptance.ACCEPTED,)
     np.testing.assert_allclose(ordered.parameter_values[0], expected, rtol=2e-4, atol=2e-4)
     np.testing.assert_array_equal(ordered.parameter_values, permuted.parameter_values)
 
@@ -942,6 +1198,60 @@ def test_sampling_is_invariant_to_explicit_physical_row_permutation():
     np.testing.assert_array_equal(ordered.parameter_values, randomized.parameter_values)
 
 
+def test_duplicate_coordinates_use_logical_index_not_storage_order_as_tie_break():
+    coordinate_values = np.repeat(np.linspace(-4.0, 4.0, 20), 2)
+    scan = axis(
+        "duplicate_scan",
+        SCAN_POINT,
+        coordinate_values.size,
+        coordinates=coordinate_values,
+        unit="MHz",
+    )
+    logical_signal = (
+        3.0 * np.exp(-((coordinate_values - 0.4) ** 2) / (2.0 * 1.1**2))
+        + 0.5
+        + np.tile((-0.2, 0.3), 20)
+    )
+    logical_validity = np.ones(scan.size, dtype=bool)
+    logical_validity[7] = False
+
+    def pack(permutation: np.ndarray):
+        layout = PointLayout.explicit(
+            (scan.size,),
+            tuple((int(index),) for index in permutation),
+        )
+        snapshot = snapshot_for(
+            repeat=1,
+            point_axes=(scan,),
+            point_layout=layout,
+            values=logical_signal[permutation].reshape(1, -1),
+            validity=CellValidity(logical_validity[permutation].reshape(1, -1)),
+        )
+        spec = FitSpec(
+            snapshot.block.schema.fingerprint,
+            None,
+            (scan.axis_id,),
+            (snapshot.block.schema.repeat_axis.axis_id,),
+            "gaussian_offset",
+            numeric_policy=FitNumericPolicy(sample_budget_per_batch=8),
+        )
+        return build_fit_problem(bind_fit(spec, snapshot.block.schema), snapshot)
+
+    ordered = pack(np.arange(scan.size))
+    pair_swapped = pack(
+        np.arange(scan.size).reshape(-1, 2)[:, ::-1].reshape(-1)
+    )
+    np.testing.assert_array_equal(
+        ordered.independent_values[0],
+        pair_swapped.independent_values[0],
+    )
+    np.testing.assert_array_equal(ordered.observations, pair_swapped.observations)
+    np.testing.assert_array_equal(
+        ordered.used_observation_counts,
+        pair_swapped.used_observation_counts,
+    )
+
+
 @pytest.mark.parametrize(
     ("model_id", "parameters"),
     (
@@ -979,85 +1289,6 @@ def test_time_models_keep_absolute_declared_coordinates_for_replay(model_id, par
     if model_id == "damped_sine":
         assert result.parameter_values[0, 0] >= 0.0
         assert -np.pi <= result.parameter_values[0, 4] <= np.pi
-
-
-def test_numeric_convergence_keeps_diagnostics_but_rejects_unresolved_physics():
-    x = np.linspace(-4.0, 4.0, 81)
-    scan = axis("scan", SCAN_POINT, x.size, coordinates=x)
-    spike = np.zeros((1, x.size))
-    spike[0, x.size // 2] = 1.0
-    snapshot = snapshot_for(
-        repeat=1,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
-        values=spike,
-    )
-    result = bind_fit(gaussian_spec(snapshot, scan), snapshot.block.schema).run(snapshot)
-    assert result.statuses == (FitBatchStatus.CONVERGED,)
-    assert result.errors == (None,)
-    assert result.acceptances == (FitAcceptance.REJECTED,)
-    assert "float-visible" in result.acceptance_reasons[0]
-    assert np.any(result.parameter_values)
-
-    flat_snapshot = snapshot_for(
-        repeat=1,
-        point_axes=(scan,),
-        point_layout=PointLayout.rect_c((scan.size,)),
-        values=np.ones((1, scan.size)),
-    )
-    flat = bind_fit(
-        gaussian_spec(flat_snapshot, scan),
-        flat_snapshot.block.schema,
-    ).run(flat_snapshot)
-    assert flat.statuses == (FitBatchStatus.CONVERGED,)
-    assert flat.acceptances == (FitAcceptance.REJECTED,)
-    assert "no resolved variation" in flat.acceptance_reasons[0]
-
-    fixed = gaussian_spec(
-        snapshot,
-        scan,
-        constraints=(
-            FitParameterConstraint("amplitude", fixed=1.0),
-            FitParameterConstraint("offset", fixed=0.0),
-            FitParameterConstraint("sigma", fixed=0.01),
-            FitParameterConstraint("center", fixed=0.0),
-        ),
-    )
-    fixed_result = bind_fit(fixed, snapshot.block.schema).run(snapshot)
-    assert fixed_result.statuses == (FitBatchStatus.CONVERGED,)
-    assert fixed_result.acceptances == (FitAcceptance.ACCEPTED,)
-
-    time_coordinates = np.arange(8.0)
-    time_axis = axis(
-        "time",
-        SCAN_POINT,
-        time_coordinates.size,
-        coordinates=time_coordinates,
-    )
-    time_snapshot = snapshot_for(
-        repeat=1,
-        point_axes=(time_axis,),
-        point_layout=PointLayout.rect_c((time_axis.size,)),
-        values=np.zeros((1, time_axis.size)),
-    )
-    aliased = FitSpec(
-        time_snapshot.block.schema.fingerprint,
-        None,
-        (time_axis.axis_id,),
-        (time_snapshot.block.schema.repeat_axis.axis_id,),
-        "damped_sine",
-        constraints=(
-            FitParameterConstraint("amplitude", fixed=1.0),
-            FitParameterConstraint("offset", fixed=0.0),
-            FitParameterConstraint("baseband_frequency", fixed=1.0),
-            FitParameterConstraint("decay_time", fixed=10.0),
-            FitParameterConstraint("phase", fixed=0.0),
-        ),
-    )
-    aliased_result = bind_fit(aliased, time_snapshot.block.schema).run(time_snapshot)
-    assert aliased_result.statuses == (FitBatchStatus.CONVERGED,)
-    assert aliased_result.acceptances == (FitAcceptance.REJECTED,)
-    assert "Nyquist" in aliased_result.acceptance_reasons[0]
 
 
 @pytest.mark.parametrize(
@@ -1099,11 +1330,10 @@ def test_absolute_time_parameters_are_not_clipped_to_selected_window_contrast(
     )
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
     assert result.statuses == (FitBatchStatus.CONVERGED,)
-    assert result.acceptances == (FitAcceptance.ACCEPTED,)
     np.testing.assert_allclose(result.parameter_values[0], parameters, rtol=2e-5, atol=2e-5)
 
 
-def test_exponential_acceptance_uses_identifiability_not_an_arbitrary_one_tau_span():
+def test_short_exponential_window_recovers_absolute_decay_parameters():
     x_values = np.linspace(0.0, 0.5, 101)
     signal = 2.0 * np.exp(-x_values / 1.0) + 0.3
     scan = axis("short_decay_window", SCAN_POINT, x_values.size, coordinates=x_values)
@@ -1124,7 +1354,6 @@ def test_exponential_acceptance_uses_identifiability_not_an_arbitrary_one_tau_sp
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
 
     assert result.statuses == (FitBatchStatus.CONVERGED,)
-    assert result.acceptances == (FitAcceptance.ACCEPTED,)
     np.testing.assert_allclose(result.parameter_values[0], (2.0, 0.3, 1.0), rtol=2e-5)
 
 
@@ -1153,8 +1382,6 @@ def test_fully_fixed_hypothesis_bypasses_data_derived_initializer():
     )
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
     assert result.statuses == (FitBatchStatus.CONVERGED,)
-    assert result.acceptances == (FitAcceptance.REJECTED,)
-    assert "no resolved variation" in result.acceptance_reasons[0]
     np.testing.assert_array_equal(result.parameter_values[0], values)
 
     explicit_seed = replace(
@@ -1166,7 +1393,6 @@ def test_fully_fixed_hypothesis_bypasses_data_derived_initializer():
     )
     seeded = bind_fit(explicit_seed, snapshot.block.schema).run(snapshot)
     assert seeded.statuses == (FitBatchStatus.CONVERGED,)
-    assert seeded.acceptances == (FitAcceptance.REJECTED,)
 
 
 def test_fixed_gaussian_geometry_is_a_hypothesis_not_a_location_inference():
@@ -1198,7 +1424,6 @@ def test_fixed_gaussian_geometry_is_a_hypothesis_not_a_location_inference():
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
 
     assert result.statuses == (FitBatchStatus.CONVERGED,)
-    assert result.acceptances == (FitAcceptance.ACCEPTED,)
     assert result.r_squared[0] == 1.0
 
 
@@ -1233,7 +1458,6 @@ def test_minimum_observations_follow_the_free_parameters_not_a_catalog_constant(
 
     assert bound.minimum_observation_count == 2
     assert result.statuses == (FitBatchStatus.CONVERGED,)
-    assert result.acceptances == (FitAcceptance.ACCEPTED,)
 
 
 def test_one_numeric_overflow_isolated_from_sibling_fit_cells():
@@ -1268,10 +1492,6 @@ def test_one_numeric_overflow_isolated_from_sibling_fit_cells():
         FitBatchStatus.CONVERGED,
         FitBatchStatus.NUMERIC_ERROR,
     )
-    assert result.acceptances == (
-        FitAcceptance.ACCEPTED,
-        FitAcceptance.NOT_EVALUATED,
-    )
     assert "sum of squares overflowed" in result.errors[1]
 
 
@@ -1288,35 +1508,6 @@ def test_internal_fit_contract_defects_abort_the_whole_analysis(monkeypatch, ent
     monkeypatch.setattr(solver_module, entrypoint, broken)
     with pytest.raises(AssertionError, match="implementation invariant"):
         bound.run(snapshot)
-
-
-def test_known_linear_algebra_failure_is_isolated_to_one_batch_cell(monkeypatch):
-    import zlc_data.fit_solver as solver_module
-
-    snapshot, scan = gaussian_snapshot(repeat=2)
-    decide = solver_module._acceptance_decision
-    calls = 0
-
-    def singular_first_cell(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise np.linalg.LinAlgError("singular acceptance geometry")
-        return decide(*args, **kwargs)
-
-    monkeypatch.setattr(solver_module, "_acceptance_decision", singular_first_cell)
-    result = bind_fit(gaussian_spec(snapshot, scan), snapshot.block.schema).run(snapshot)
-
-    assert result.statuses == (
-        FitBatchStatus.NUMERIC_ERROR,
-        FitBatchStatus.CONVERGED,
-    )
-    assert result.acceptances == (
-        FitAcceptance.NOT_EVALUATED,
-        FitAcceptance.ACCEPTED,
-    )
-    assert "singular acceptance geometry" in result.errors[0]
-    assert result.errors[1] is None
 
 
 def test_r_squared_centers_huge_finite_observations_without_sum_overflow():
@@ -1349,141 +1540,68 @@ def test_r_squared_centers_huge_finite_observations_without_sum_overflow():
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
 
     assert result.statuses == (FitBatchStatus.CONVERGED,)
-    assert result.acceptances == (FitAcceptance.ACCEPTED,)
     assert result.r_squared[0] == 1.0
 
 
-def test_acceptance_uses_local_support_jacobian_and_active_solver_bounds():
-    def run(x, signal, constraints=()):
-        scan = axis("adversarial_scan", SCAN_POINT, x.size, coordinates=x)
-        snapshot = snapshot_for(
-            repeat=1,
-            point_axes=(scan,),
-            point_layout=PointLayout.rect_c((scan.size,)),
-            values=np.asarray(signal).reshape(1, -1),
-        )
-        return bind_fit(
-            gaussian_spec(snapshot, scan, constraints=constraints),
-            snapshot.block.schema,
-        ).run(snapshot)
-
-    locally_dense = np.r_[
-        np.linspace(-0.3, 0.3, 13),
-        np.arange(10.0, 210.0, 10.0),
-    ]
-    dense_signal = 3.0 * np.exp(-(locally_dense**2) / (2.0 * 0.1**2)) + 0.2
-    dense = run(locally_dense, dense_signal)
-    assert dense.acceptances == (FitAcceptance.ACCEPTED,)
-    np.testing.assert_allclose(dense.parameter_values[0], (3.0, 0.2, 0.1, 0.0), atol=1e-7)
-
-    beyond_two_sigma = np.array([-4.2, -2.1, 0.0, 2.1, 4.2])
-    exact_signal = 3.0 * np.exp(-(beyond_two_sigma**2) / 2.0) + 0.2
-    resolved = run(beyond_two_sigma, exact_signal)
-    assert resolved.acceptances == (FitAcceptance.ACCEPTED,)
-    np.testing.assert_allclose(resolved.parameter_values[0], (3.0, 0.2, 1.0, 0.0), atol=1e-7)
-
-    unrelated_dense = np.r_[np.linspace(-2.0, -1.0, 100), 0.0]
-    isolated_signal = np.zeros_like(unrelated_dense)
-    isolated_signal[-1] = 1.0
-    isolated = run(unrelated_dense, isolated_signal)
-    assert isolated.statuses == (FitBatchStatus.CONVERGED,)
-    assert isolated.acceptances == (FitAcceptance.REJECTED,)
-    assert "float-visible" in isolated.acceptance_reasons[0]
-
-    repeated = np.repeat(np.array([-1.0, 0.0, 1.0]), 3)
-    repeated_signal = 3.0 * np.exp(-(repeated**2) / (2.0 * 0.8**2)) + 0.2
-    rank_deficient = run(repeated, repeated_signal)
-    assert rank_deficient.acceptances == (FitAcceptance.REJECTED,)
-
+def test_active_solver_bound_invalidates_covariance_without_hiding_result():
     bounded_x = np.linspace(-2.0, 2.0, 81)
     bounded_signal = 3.0 * np.exp(-(bounded_x**2) / (2.0 * 0.1**2)) + 0.2
-    active_bound = run(
-        bounded_x,
-        bounded_signal,
-        (FitParameterConstraint("sigma", lower=0.5),),
+    scan = axis("bounded_scan", SCAN_POINT, bounded_x.size, coordinates=bounded_x)
+    snapshot = snapshot_for(
+        repeat=1,
+        point_axes=(scan,),
+        point_layout=PointLayout.rect_c((scan.size,)),
+        values=bounded_signal.reshape(1, -1),
+    )
+    active_bound = bind_fit(
+        gaussian_spec(
+            snapshot,
+            scan,
+            constraints=(FitParameterConstraint("sigma", lower=0.5),),
+        ),
+        snapshot.block.schema,
+    ).run(
+        snapshot,
     )
     assert active_bound.statuses == (FitBatchStatus.CONVERGED,)
-    assert active_bound.acceptances == (FitAcceptance.REJECTED,)
-    assert "active bound" in active_bound.acceptance_reasons[0]
     assert active_bound.parameter_values[0, 2] == pytest.approx(0.5)
+    assert not active_bound.covariance_valid[0]
+    np.testing.assert_array_equal(active_bound.covariance[0], 0.0)
 
 
-def test_damped_sine_alias_gate_uses_source_lattice_and_selected_index_gcd():
-    names = ("amplitude", "offset", "baseband_frequency", "decay_time", "phase")
+def test_covariance_matches_the_independent_normal_equation_oracle():
+    from zlc_data.fit_solver import _covariance
 
-    def run(x, parameters, *, validity=VALID, sample_budget=12_000):
-        amplitude, offset, frequency, decay_time, phase = parameters
-        signal = (
-            amplitude
-            * np.sin(2.0 * np.pi * frequency * x + phase)
-            * np.exp(-x / decay_time)
-            + offset
+    jacobian = np.array(
+        (
+            (1.0, -2.0),
+            (1.0, -1.0),
+            (1.0, 0.5),
+            (1.0, 2.0),
+            (1.0, 4.0),
         )
-        time_axis = axis("lattice_time", SCAN_POINT, x.size, coordinates=x)
-        snapshot = snapshot_for(
-            repeat=1,
-            point_axes=(time_axis,),
-            point_layout=PointLayout.rect_c((time_axis.size,)),
-            values=signal.reshape(1, -1),
-            validity=validity,
-        )
-        constraints = tuple(
-            FitParameterConstraint(name, fixed=value)
-            for name, value in zip(names, parameters)
-        )
-        spec = FitSpec(
-            snapshot.block.schema.fingerprint,
-            None,
-            (time_axis.axis_id,),
-            (snapshot.block.schema.repeat_axis.axis_id,),
-            "damped_sine",
-            constraints=constraints,
-            numeric_policy=FitNumericPolicy(sample_budget_per_batch=sample_budget),
-        )
-        return bind_fit(spec, snapshot.block.schema).run(snapshot)
-
-    full_axis = np.arange(1000, dtype=float) * 0.01
-    sampled = run(full_axis, (1.5, 0.1, 2.0, 20.0, 0.3), sample_budget=50)
-    assert sampled.used_observation_counts[0] == 50
-    assert sampled.acceptances == (FitAcceptance.ACCEPTED,)
-
-    slotted_axis = np.arange(11, dtype=float)
-    valid = np.ones((1, slotted_axis.size), dtype=bool)
-    valid[0, (2, 5, 8)] = False
-    baseband = run(
-        slotted_axis,
-        (1.5, 0.1, 0.2, 20.0, 0.3),
-        validity=CellValidity(valid),
     )
-    assert baseband.acceptances == (FitAcceptance.ACCEPTED,)
-    out_of_band = run(
-        slotted_axis,
-        (1.5, 0.1, 2.2, 20.0, 0.3),
-        validity=CellValidity(valid),
+    residual = np.array((0.2, -0.1, 0.3, -0.2, 0.1))
+    free_indices = np.array((0, 2), dtype=np.int64)
+
+    covariance, valid = _covariance(
+        jacobian,
+        residual,
+        free_indices,
+        parameter_count=4,
+        rcond=1e-12,
     )
-    assert out_of_band.acceptances == (FitAcceptance.REJECTED,)
-    assert "Nyquist" in out_of_band.acceptance_reasons[0]
-
-    nonuniform = np.array([0.0, 1.0, 2.1, 3.1, 4.2, 5.2, 6.3, 7.3])
-    unproven = run(nonuniform, (1.5, 0.1, 0.2, 20.0, 0.3))
-    assert unproven.acceptances == (FitAcceptance.REJECTED,)
-    assert "alias safety is unproven" in unproven.acceptance_reasons[0]
-
-    nearly_uniform = np.arange(16, dtype=float)
-    nearly_uniform[8] += 1e-10
-    not_a_float_lattice = run(nearly_uniform, (1.5, 0.1, 0.2, 20.0, 0.3))
-    assert not_a_float_lattice.acceptances == (FitAcceptance.REJECTED,)
-    assert "alias safety is unproven" in not_a_float_lattice.acceptance_reasons[0]
-
-    ulp = np.spacing(1e9)
-    quantized_duplicates = 1e9 + np.arange(33) * (ulp / 2.0)
-    assert np.unique(quantized_duplicates).size == 17
-    quantized = run(
-        quantized_duplicates,
-        (1.5, 0.1, 6e6, 1e10, 0.3),
+    residual_variance = float(residual @ residual) / (
+        residual.size - free_indices.size
     )
-    assert quantized.acceptances == (FitAcceptance.REJECTED,)
-    assert "alias safety is unproven" in quantized.acceptance_reasons[0]
+    expected_free = np.linalg.inv(jacobian.T @ jacobian) * residual_variance
+    expected = np.zeros((4, 4))
+    expected[np.ix_(free_indices, free_indices)] = expected_free
+
+    assert valid
+    np.testing.assert_allclose(covariance, expected, rtol=2e-15, atol=1e-18)
+    np.testing.assert_array_equal(covariance[1], 0.0)
+    np.testing.assert_array_equal(covariance[3], 0.0)
 
 
 def test_parameter_domains_guard_requests_evaluation_and_converged_artifacts():
@@ -1576,7 +1694,7 @@ def test_parameter_domains_guard_requests_evaluation_and_converged_artifacts():
         replace(fixed_result, parameter_values=violates_fixed)
 
 
-def test_solver_contract_is_a_descriptive_identity_with_explicit_scipy_options(monkeypatch):
+def test_solver_uses_explicit_scipy_options(monkeypatch):
     import zlc_data.fit_solver as solver_module
 
     observed = []
@@ -1588,10 +1706,7 @@ def test_solver_contract_is_a_descriptive_identity_with_explicit_scipy_options(m
 
     monkeypatch.setattr(solver_module, "least_squares", record)
     snapshot, scan = gaussian_snapshot(repeat=1)
-    result = bind_fit(gaussian_spec(snapshot, scan), snapshot.block.schema).run(snapshot)
-    assert result.solver_contract_id == (
-        "scipy-trf-two-point-linear-exact-tol1e-8-cond1e8-local-support-baseband"
-    )
+    bind_fit(gaussian_spec(snapshot, scan), snapshot.block.schema).run(snapshot)
     assert observed
     for options in observed:
         assert options["jac"] == "2-point"
@@ -1603,11 +1718,6 @@ def test_solver_contract_is_a_descriptive_identity_with_explicit_scipy_options(m
         assert options["diff_step"] is None
         assert options["tr_solver"] == "exact"
         assert options["tr_options"] is None
-
-    with pytest.raises(ValueError, match="unsupported fit solver contract"):
-        replace(result.spec, solver_contract_id="unrecognized-solver-contract")
-    with pytest.raises(ValueError, match="initializer_id disagrees"):
-        replace(result.spec, initializer_id="unrecognized-initializer")
 
 
 def test_fixed_bounded_initial_constraints_and_numeric_budgets_fail_closed():
@@ -1644,8 +1754,6 @@ def test_fixed_bounded_initial_constraints_and_numeric_budgets_fail_closed():
     )
     failed = bind_fit(bad_initial, snapshot.block.schema).run(snapshot)
     assert failed.statuses == (FitBatchStatus.CONVERGED,)
-    assert failed.acceptances == (FitAcceptance.REJECTED,)
-    assert "no resolved variation" in failed.acceptance_reasons[0]
     assert np.any(failed.parameter_values)
 
     limited = gaussian_spec(
@@ -1656,14 +1764,6 @@ def test_fixed_bounded_initial_constraints_and_numeric_budgets_fail_closed():
     limited_result = bind_fit(limited, snapshot.block.schema).run(snapshot)
     assert limited_result.statuses == (FitBatchStatus.EVALUATION_LIMIT,)
     assert limited_result.evaluation_counts[0] == 1
-
-    timed = gaussian_spec(
-        snapshot,
-        scan,
-        numeric_policy=FitNumericPolicy(max_seconds_per_batch=1e-12),
-    )
-    timed_result = bind_fit(timed, snapshot.block.schema).run(snapshot)
-    assert timed_result.statuses == (FitBatchStatus.TIMEOUT,)
 
 
 def test_cancel_is_checked_inside_model_evaluations_and_host_deadline_aborts():
@@ -1680,7 +1780,7 @@ def test_cancel_is_checked_inside_model_evaluations_and_host_deadline_aborts():
         bound.run(snapshot, cancel_check=cancel)
     assert checks >= 15
     with pytest.raises(FitDeadlineExceeded):
-        fit_analysis(bound, snapshot, deadline_monotonic=time.monotonic() - 1.0)
+        bound.run(snapshot, deadline_monotonic=time.monotonic() - 1.0)
 
     large_x = np.linspace(-5.0, 5.0, 2_048)
     large_scan = axis("large_scan", SCAN_POINT, large_x.size, coordinates=large_x)
@@ -1744,8 +1844,30 @@ def test_complex_observations_are_rejected_before_float_conversion():
             integer_snapshot,
         )
 
+    ordered_integers = np.array(
+        [0, 1, 2, 3, 4, 5, 2**53, 2**53 + 1],
+        dtype=np.uint64,
+    )
+    ordered_snapshot = snapshot_for(
+        repeat=1,
+        point_axes=(scan,),
+        point_layout=PointLayout.rect_c((scan.size,)),
+        values=ordered_integers.reshape(1, -1),
+        dtype=np.dtype("<u8"),
+    )
+    ordered_spec = replace(
+        spec,
+        input_schema_fingerprint=ordered_snapshot.block.schema.fingerprint,
+        numeric_policy=FitNumericPolicy(sample_budget_per_batch=5),
+    )
+    with pytest.raises(ValueError, match="not exactly float64-representable"):
+        build_fit_problem(
+            bind_fit(ordered_spec, ordered_snapshot.block.schema),
+            ordered_snapshot,
+        )
 
-def test_fit_spec_and_result_strict_codecs_and_public_entrypoints_agree():
+
+def test_fit_result_strict_codec_embeds_the_current_fit_spec():
     snapshot, scan = gaussian_snapshot(repeat=1)
     spec = gaussian_spec(
         snapshot,
@@ -1755,39 +1877,74 @@ def test_fit_spec_and_result_strict_codecs_and_public_entrypoints_agree():
             FitParameterConstraint("amplitude", initial=2.5),
         ),
     )
-    restored_spec = decode_fit_spec(encode_fit_spec(spec))
-    assert restored_spec == spec
-    bound = bind_fit(restored_spec, snapshot.block.schema)
-    from_method = bound.run(snapshot)
-    from_function = fit_analysis(bound, snapshot)
-    assert from_method.digest == from_function.digest
-    assert from_method.parameter_units == ("count", "count", "MHz", "MHz")
+    result = bind_fit(spec, snapshot.block.schema).run(snapshot)
+    assert result.parameter_units == ("count", "count", "MHz", "MHz")
 
-    payload = encode_fit_result_batch(from_method)
+    payload = encode_fit_result_batch(result)
     restored = decode_fit_result_batch(payload)
-    assert restored.digest == from_method.digest
     assert encode_fit_result_batch(restored) == payload
 
-    spec_tree = fit_spec_to_tree(spec)
-    assert spec_tree["numeric_policy"]["max_packed_observations"] == 2_000_000
-    spec_tree["model_version"] = 1
-    with pytest.raises(ValueError, match="exactly"):
-        decode_fit_spec(encode(spec_tree))
-
-    result_tree = fit_result_batch_to_tree(from_method)
-    result_tree["parameter_values"] = from_method.parameter_values.astype(np.float32)
+    result_tree = decode(payload)
+    assert result_tree["fit_spec"]["numeric_policy"]["max_packed_observations"] \
+        == 2_000_000
+    result_tree["parameter_values"] = result.parameter_values.astype(np.float32)
     with pytest.raises(TypeError, match="dtype float32.*float64"):
         decode_fit_result_batch(encode(result_tree))
 
-    obsolete_metric = fit_result_batch_to_tree(from_method)
-    obsolete_metric["rmse"] = from_method.rmse
+    unexpected = decode(payload)
+    unexpected["unexpected_field"] = 1
     with pytest.raises(ValueError, match="exactly"):
-        decode_fit_result_batch(encode(obsolete_metric))
+        decode_fit_result_batch(encode(unexpected))
 
-    duplicate_identity = fit_result_batch_to_tree(from_method)
-    duplicate_identity["solver_contract_id"] = from_method.solver_contract_id
+    unexpected_spec = decode(payload)
+    unexpected_spec["fit_spec"]["unexpected_field"] = 1
     with pytest.raises(ValueError, match="exactly"):
-        decode_fit_result_batch(encode(duplicate_identity))
+        decode_fit_result_batch(encode(unexpected_spec))
+
+
+def test_fit_result_wire_format_has_one_frozen_current_golden():
+    scan = axis(
+        "golden-scan",
+        SCAN_POINT,
+        5,
+        coordinates=(-2.0, -1.0, 0.0, 1.0, 2.0),
+        unit="MHz",
+    )
+    snapshot = snapshot_for(
+        repeat=1,
+        point_axes=(scan,),
+        point_layout=PointLayout.rect_c((scan.size,)),
+        values=np.zeros((1, scan.size)),
+        block_id="golden-fit-source",
+    )
+    spec = gaussian_spec(snapshot, scan)
+    result = FitResultBatch(
+        source_ref=snapshot.ref,
+        spec=spec,
+        fit_axis_specs=(scan,),
+        batch_axis_specs=(snapshot.block.schema.repeat_axis,),
+        batch_layout=AxisLayout.rect_c((1,)),
+        value_unit="count",
+        parameter_values=np.array(((2.0, 0.5, 1.0, 0.25),)),
+        covariance=np.diag((0.1, 0.2, 0.3, 0.4)).reshape(1, 4, 4),
+        covariance_valid=np.array((True,)),
+        statuses=(FitBatchStatus.CONVERGED,),
+        errors=(None,),
+        present_observation_counts=np.array((5,), dtype=np.int64),
+        valid_observation_counts=np.array((5,), dtype=np.int64),
+        used_observation_counts=np.array((5,), dtype=np.int64),
+        evaluation_counts=np.array((7,), dtype=np.int64),
+        residual_sum_squares=np.array((0.25,)),
+        r_squared=np.array((0.75,)),
+        r_squared_valid=np.array((True,)),
+        scipy_version="oracle-scipy",
+    )
+
+    payload = encode_fit_result_batch(result)
+    assert len(payload) == 2770
+    assert hashlib.sha256(payload).hexdigest() == (
+        "c443df1a06cf185db803da50ce2a5b2f68a4e9b0dd4bdd51b35ee08fa4b14186"
+    )
 
 
 def test_result_constructor_rejects_impossible_success_and_noncanonical_payloads():
@@ -1819,15 +1976,6 @@ def test_result_constructor_rejects_impossible_success_and_noncanonical_payloads
         )
     with pytest.raises(ValueError, match="no greater than one"):
         replace(result, r_squared=np.array([1.01]), r_squared_valid=np.array([True]))
-    with pytest.raises(ValueError, match="accepted batches have no reason"):
-        replace(result, acceptance_reasons=("forged rejection",))
-    with pytest.raises(ValueError, match="acceptance_reasons"):
-        replace(
-            result,
-            acceptances=(FitAcceptance.REJECTED,),
-            acceptance_reasons=(" padded ",),
-        )
-
     fixed_spec = gaussian_spec(
         snapshot,
         scan,
@@ -1857,8 +2005,6 @@ def test_result_constructor_rejects_impossible_success_and_noncanonical_payloads
             parameter_values=np.zeros_like(result.parameter_values),
             covariance=np.zeros_like(result.covariance),
             covariance_valid=np.array([False]),
-            acceptances=(FitAcceptance.NOT_EVALUATED,),
-            acceptance_reasons=(None,),
             evaluation_counts=np.array([0]),
             residual_sum_squares=np.array([0.0]),
             r_squared=np.array([0.0]),
@@ -1866,5 +2012,5 @@ def test_result_constructor_rejects_impossible_success_and_noncanonical_payloads
         )
     positive_zero = replace(result, residual_sum_squares=np.array([0.0]))
     negative_zero = replace(result, residual_sum_squares=np.array([-0.0]))
-    assert positive_zero.digest == negative_zero.digest
+    assert encode_fit_result_batch(positive_zero) == encode_fit_result_batch(negative_zero)
     assert not np.signbit(FitParameterConstraint("center", fixed=-0.0).fixed)

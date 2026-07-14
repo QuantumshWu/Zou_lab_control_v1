@@ -17,8 +17,10 @@ from zlc_data import (
     ComponentValidity,
     DataBlock,
     DatasetRevision,
+    DatasetRevisionRef,
     DatasetSchema,
     Invalid,
+    StreamGenerationId,
     Valid,
     ValidityMode,
     Value,
@@ -419,6 +421,16 @@ class CaptureFrameSource:
     @property
     def revision(self) -> DatasetRevision:
         return self._revision
+
+    def ref(self, generation: StreamGenerationId) -> DatasetRevisionRef:
+        if not isinstance(generation, StreamGenerationId):
+            raise TypeError("generation must be StreamGenerationId")
+        return DatasetRevisionRef(
+            self._block_id,
+            generation,
+            self._schema.fingerprint,
+            self._revision,
+        )
 
     @property
     def cell_schedule(self) -> tuple[DatasetCellAddress, ...]:

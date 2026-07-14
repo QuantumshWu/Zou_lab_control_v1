@@ -128,6 +128,41 @@ def test_selection_is_canonical_as_an_axis_constraint_set():
     assert encode_selection(integer_bounds) == encode_selection(float_bounds)
 
 
+def test_repeated_index_ranges_preserve_absolute_coordinate_less_axis_indices():
+    point = AxisSpec(AxisId("point"), "point", SCAN_POINT, 8)
+    block = block_for(
+        repeat=1,
+        point_axes=(point,),
+        layout=PointLayout.rect_c((point.size,)),
+        values=np.arange(point.size, dtype=np.int16).reshape(1, -1),
+    )
+    spec = DataTransformSpec(
+        (
+            Select(Selection((IndexRangeSelection(point.axis_id, 2, 7),))),
+            Select(Selection((IndexRangeSelection(point.axis_id, 1, 4),))),
+        )
+    )
+
+    preview = preview_transform(block, spec)
+    selected_axis = preview.schema.axis(point.axis_id)
+    assert selected_axis.coordinates == (3, 4, 5)
+    assert selected_axis.unit == "index"
+
+    committed = commit_transform(
+        block.schema,
+        spec,
+        revision=TransformRevision(2),
+        origin=TransformOrigin.USER,
+    )
+    restored = decode_committed_transform(encode_committed_transform(committed))
+    assert resolve_transformed_schema(block.schema, restored).axis(point.axis_id) \
+        == selected_axis
+    snapshot = OwnedSnapshot(block.ref(StreamGenerationId("selection-generation")), block)
+    replayed = apply_transform(snapshot, restored)
+    assert replayed.schema.axis(point.axis_id) == selected_axis
+    np.testing.assert_array_equal(replayed.values, (3, 4, 5))
+
+
 def test_empty_axis_layout_is_only_for_derived_sparse_results():
     empty = AxisLayout.explicit((4,), ())
     assert empty.storage_size == 0
