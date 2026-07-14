@@ -1913,6 +1913,8 @@ reject new commands
 
 Calibration 是 `neutral_atom.readout.calibration` 的内建 feature，不使用 plugin、entry point、包扫描或动态 registry 覆盖。
 
+`zlc_neutral_atom.readout` 包根不重导出 contracts、codec、analysis、repository 的宽 API；调用方必须从语义 owner 子模块导入。追溯整改实测旧包根的 122 个 eager re-export 会让单独导入 `readout.contracts` 也加载 SciPy，冷导入约 0.86 s、tracemalloc 峰值约 51.8 MiB。删除包根聚合后，同一探针不再加载 SciPy（当前机器约 0.35 s、10 MiB，主要为 NumPy/zlc_data 基础值）。这不是 lazy `__getattr__` 兼容表：本项目没有需要维护的旧公共格式，重复出口清单只会形成第二个 owner；稳定公共用户面由 notebook/workbench facade 组合，领域实现直接依赖 leaf owner。
+
 ### 13.1 Artifact
 
 ```text

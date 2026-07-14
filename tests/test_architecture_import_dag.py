@@ -298,6 +298,20 @@ def test_notebook_facade_has_no_implicit_current_calibration_state():
     )
 
 
+def test_readout_package_root_does_not_eagerly_aggregate_leaf_owners():
+    path = ROOT / "zlc_neutral_atom" / "readout" / "__init__.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    imports = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+    ]
+    assert not imports, (
+        "readout callers import the contracts/model/analysis/repository owner leaf; "
+        "the package root must not make a light contract import initialize SciPy"
+    )
+
+
 def test_headless_notebook_import_does_not_load_frontend_renderer():
     code = (
         "import sys; import Zou_lab_control.notebook; "
