@@ -114,15 +114,32 @@ def test_long_short_long_imaging_bracket_shows_distinct_per_window_exposures():
     off ``repeat_forever``, so a continuously-looped bracket was mistaken for repeated single-window
     shots and EVERY frame collapsed onto window 0's (long) exposure -- all three frames came out equally
     bright.  The criterion is the BASE-CYCLE window count (a bracket carries >= frames per cycle)."""
-    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+    from Zou_lab_control.neutral_atom.timing import (
+        default_imaging_template,
+        imaging_channel_kwargs,
+    )
     from Zou_lab_control.neutral_atom.devices.camera_trigger import base_cycle_trigger_pulses
 
     exp = na.connect("virtual")
     try:
-        atoms = raw_device_set(exp).trap_array
-        seq = PulseTableState.load(str(REPO_ROOT / "pulses" / "imaging_template.json")).to_sequence().forever()
-        assert seq.repeat_forever and base_cycle_trigger_pulses(seq) == 3   # ONE cycle, 3 emCCD windows
-        imgs = atoms.image_frames(seq, 3, capture_trigger_channels=("emCCD",),
+        devices = raw_device_set(exp)
+        atoms = devices.trap_array
+        channels = imaging_channel_kwargs(
+            devices.sequencer,
+            trigger_channel=devices.camera.primary_trigger_channel,
+        )
+        seq = default_imaging_template(
+            port_catalog=devices.sequencer.port_catalog,
+            **channels,
+        ).to_sequence().forever()
+        assert seq.repeat_forever and base_cycle_trigger_pulses(
+            seq,
+            trigger_channels=devices.camera.effective_trigger_channels,
+        ) == 3   # ONE cycle, 3 emCCD windows
+        imgs = atoms.image_frames(
+            seq,
+            3,
+            capture_trigger_channels=devices.camera.effective_trigger_channels,
                                   exposure=raw_device_set(exp).camera.exposure)
         bright = [float(np.mean(im)) for im in imgs]
         # long, SHORT, long -> the short middle frame is dimmer than BOTH long frames (not all equal).
@@ -143,12 +160,23 @@ def test_live_camera_measurement_shows_the_bracket_exposures_window_for_window()
     fresh loading: the bracket physics was lost too).  ``_grab`` now renders one whole BASE CYCLE
     per grab (the same block path), so the consumer stays phase-aligned window-for-window.  This
     test pins the REAL call side (shot() -> acquire), not the mechanism layer."""
-    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+    from Zou_lab_control.neutral_atom.timing import (
+        default_imaging_template,
+        imaging_channel_kwargs,
+    )
 
     exp = na.connect("virtual")
     try:
-        seqr = raw_device_set(exp).sequencer
-        seq = PulseTableState.load(str(REPO_ROOT / "pulses" / "imaging_template.json")).to_sequence().forever()
+        devices = raw_device_set(exp)
+        seqr = devices.sequencer
+        channels = imaging_channel_kwargs(
+            seqr,
+            trigger_channel=devices.camera.primary_trigger_channel,
+        )
+        seq = default_imaging_template(
+            port_catalog=seqr.port_catalog,
+            **channels,
+        ).to_sequence().forever()
         seqr.prepare(seq)
         seqr.fire()                                   # the pulse GUI's "On Pulse"
         node = CameraMeasurement(SignalHub(), raw_device_set(exp).camera, sequencer=seqr, frames_per_cycle=3)
@@ -389,7 +417,7 @@ def test_arm_fire_read_yields_the_armed_frame_count_end_to_end():
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     try:
         cam, seqr = raw_device_set(exp).camera, raw_device_set(exp).sequencer
-        seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")
+        seq = exp.build_imaging_sequence(exposure=1e-3, load=True, name="readout")
         program = seq.repeated(2)                    # emit TWO camera-trigger edges (two shots)
         cam.arm(2)
         try:
@@ -414,7 +442,7 @@ def test_armed_buffer_is_lossless_for_late_consumption():
     try:
         cam, seqr = raw_device_set(exp).camera, raw_device_set(exp).sequencer
         cam.recent_capacity = 2                     # tiny live-view ring (set before first frame)
-        seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")
+        seq = exp.build_imaging_sequence(exposure=1e-3, load=True, name="readout")
         program = seq.repeated(5)                   # FIVE camera-trigger edges in one fired program
         cam.arm(5)
         try:
@@ -440,7 +468,7 @@ def test_single_trigger_armed_for_more_raises_timeout_edge_faithful():
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     try:
         cam, seqr = raw_device_set(exp).camera, raw_device_set(exp).sequencer
-        seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")   # ONE emCCD edge
+        seq = exp.build_imaging_sequence(exposure=1e-3, load=True, name="readout")   # ONE emCCD edge
         cam.arm(20)                                  # arm generously ...
         try:
             seqr.prepare(seq)
@@ -462,8 +490,11 @@ def test_triggered_frames_repeats_single_trigger_to_n_edges():
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     try:
         cam, seqr = raw_device_set(exp).camera, raw_device_set(exp).sequencer
-        seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")
-        assert count_trigger_pulses(seq.repeated(20)) == 20          # the repeated program carries 20 edges
+        seq = exp.build_imaging_sequence(exposure=1e-3, load=True, name="readout")
+        assert count_trigger_pulses(
+            seq.repeated(20),
+            trigger_channels=cam.effective_trigger_channels,
+        ) == 20          # the repeated program carries 20 edges
         frames = triggered_frames(cam, seqr, seq, 20)
         assert len(frames) == 20 and all(np.asarray(f).shape == (40, 50) for f in frames)
     finally:
@@ -490,7 +521,7 @@ def test_unarmed_camera_misses_the_trigger_like_hardware():
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     try:
         cam, seqr = raw_device_set(exp).camera, raw_device_set(exp).sequencer
-        seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")
+        seq = exp.build_imaging_sequence(exposure=1e-3, load=True, name="readout")
         seqr.prepare(seq)
         seqr.fire(seq)                              # nobody armed -> the edge is lost
         assert cam.acquire(1) == []                 # arming afterwards finds nothing

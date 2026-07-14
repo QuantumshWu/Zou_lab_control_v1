@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import tracked_repo_files
+
 from zlc_pulse import (
     PULSE_DOCUMENT_SCHEMA,
     FrozenScanTable,
@@ -22,18 +24,8 @@ from zlc_pulse import (
 ROOT = Path(__file__).parents[1]
 
 
-@pytest.mark.parametrize(
-    "name",
-    [
-        "camera_imaging_address_switch.json",
-        "imaging_template.json",
-        "mot_field_template.json",
-        "probe_template.json",
-        "release_recapture.json",
-    ],
-)
-def test_all_shipped_authoring_json_loads_into_current_document(name):
-    path = ROOT / "pulses" / name
+@pytest.mark.parametrize("path", tracked_repo_files("pulses/*.json"), ids=lambda path: path.name)
+def test_all_shipped_authoring_json_loads_into_current_document(path):
     document = load_pulse_document(path)
     assert isinstance(document, PulseDocument)
     assert pulse_document_from_tree(pulse_document_to_tree(document)) == document

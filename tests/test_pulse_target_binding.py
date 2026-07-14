@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-import subprocess
 
 import pytest
+
+from conftest import tracked_repo_files
 
 from zlc_pulse import (
     PORT_CLOCK,
@@ -25,13 +26,7 @@ ROOT = Path(__file__).parents[1]
 
 def test_every_shipped_document_matches_the_packaged_deployment_target():
     target = load_deployed_pulse_target()
-    tracked = subprocess.run(
-        ["git", "ls-files", "-z", "--", ":(glob)pulses/*.json"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-    ).stdout.decode("utf-8")
-    paths = tuple(ROOT / item for item in tracked.split("\0") if item)
+    paths = tracked_repo_files("pulses/*.json")
     assert paths, "the repository must ship at least one pulse document"
     for path in sorted(paths):
         assert load_pulse_document(path).target == target, path.name

@@ -109,7 +109,7 @@ def test_prepare_replaces_the_continuous_firing():
         triggered_frames(
             raw_device_set(exp).camera,
             seqr,
-            na.imaging_sequence(exposure=1e-3, load=True),
+            exp.build_imaging_sequence(exposure=1e-3, load=True),
             2,
         )
         assert seqr.firing is None                   # the continuous On Pulse is no longer firing
@@ -121,15 +121,27 @@ def test_closing_the_camera_unplugs_the_trigger_cable():
     """F6: a closed camera stops rendering on the streamer's fires -- ``close`` unplugs the trigger
     cable (removes the fire listener), symmetric with the constructor-time wire-up, so a closed
     camera does not linger as a fire listener still producing frames."""
+    import gc
+    import weakref
+
     from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualSequencer, VirtualTrapArray
+    from Zou_lab_control.neutral_atom.timing import imaging_channel_kwargs
+
     seqr = VirtualSequencer()
     cam = VirtualCamera(VirtualTrapArray(grid_shape=(2, 3), image_shape=(16, 20), seed=1),
                         exposure=1e-3, sequencer=seqr)
-    seq = na.imaging_sequence(exposure=1e-3, load=True, name="readout")
-    cam.arm(1)
+    seq = na.imaging_sequence(
+        exposure=1e-3,
+        load=True,
+        name="readout",
+        **imaging_channel_kwargs(seqr, trigger_channel="ch11"),
+    )
+    camera_ref = weakref.ref(cam)
     cam.close()                                      # unplug the cable
+    del cam
+    gc.collect()
+    assert camera_ref() is None                      # the sequencer retained no bound listener
     seqr.prepare(seq); seqr.fire(seq)                # a fire the closed camera must NOT see
-    assert cam.read_frames(1, timeout=0.05) == []    # nothing rendered: the listener was removed
 
 
 def test_camera_sleep_scale_is_owned_by_the_sequencer():

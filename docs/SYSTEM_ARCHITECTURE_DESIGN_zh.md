@@ -2813,6 +2813,7 @@ Public hardware capability boundary：
 - config swap在不可逆边界前只存在inert candidate且失败保持完整旧AVAILABLE；不允许第二authority/journal owner或pre-close connection generation；DeviceSwapIntent durable后、first close前必须先发布不含raw/facade的UNAVAILABLE/SWAPPING state，之后任一点失败只推进完整RECOVERY_REQUIRED state且稳定InstallationSupervisor/私有SwapRecoveryContext仍被强持有；成功后以另一installation generation发布完整AVAILABLE；GUI缺席、卡住或销毁不影响结果；
 - public capture、PulseGUI、TaskConsole、DeviceControlPort与notebook路径在claim conflict、quarantine、stale generation和swap gate下全部fail closed；
 - adapter contract tests从adapter SDK/owner module导入并由fixture在composition前保留raw spy；runtime/public/GUI tests不得为了断言底层调用从Experiment反向取得raw object；
+- 仓库级 fixture 集合只能从 Git tracked set 或显式 committed manifest 枚举，禁止用目录 glob 把开发者本机的 ignored 实验文件变成隐形测试输入；可选私有文件不存在时 skip 的测试不计入回归覆盖，观测事故必须转成 committed 最小 golden 或由独立模型生成的确定性场景；
 - docs、notebook templates与生成的notebooks grep禁止`exp.devices` raw、`exp.camera/sequencer`、直接QCMOSCamera/RemoteSequencer构造及直接open/acquire/prepare/fire；关键virtual notebook在CI执行。
 
 Artifact/Calibration：
@@ -2890,6 +2891,8 @@ producer/adapter
 ```
 
 同一个 use case 不允许双写、双读或自动 fallback；尚未迁移的其它 use case 可以暂时停留在旧实现，但不能通过 bridge 污染新合同。S0.5 只允许 host/catalog/render/resource containment，不允许把旧 Hub/LogicNode/metadata vocabulary 适配成新 event/data/runtime 类型；这叫迁移隔离，不是领域兼容层。旧 panel 可由 LegacyPanelHost 逐项托管，旧 hardware workflow 必须经过 LegacyRuntimeFence 使用同一 ResourceArbiter/DeviceControlLease。共享 primitive 只在首个消费它的切片中建立最小正式版本；后续若无第二用例，不提前泛化。
+
+追溯审查判断“是否保留”时必须看终态职责和已排期 consumer，不能把中间提交的 production reachability 当成唯一标准。`MonitorTap/ROLLING_MONITOR` 的未来 GUI live/rolling consumer、calibration/occupancy 的 S3 consumer、FitResultBatch 的 gridplot consumer 都是明确需求；它们可以因职责混杂、重复 owner 或过度包装而重构、压缩或替换，但不能仅因当前 composition 尚未接线就整簇删除。只有目标职责已有更小的唯一 owner、全部当前与已排期 consumer 都完成迁移，并有 dependency-closed 删除证据时才物理删除。
 
 依赖关系是：
 
@@ -2978,6 +2981,8 @@ S0.6完成不等于旧DeviceSet实现已物理删除；它可以继续作为封�
 ### H1：Pulse bounded-context 与冻结 bitstream bring-up（与 S0.5-S3 并行）
 
 先建立PulseDocument/TargetIR/CompiledPulseArtifact canonical seam，并以当前已部署bitstream对应的host/model/wire golden bytes、现有xsim/真机回读保护语义。按consumer纵向切换：compiler/server -> neutral Sequencer adapter -> workbench PulsePreviewProjector；每切一个consumer删除其旧timing/compiler/reader，不维持自动fallback。整个H1默认不修改RTL、不生成新bitstream。
+
+2026-07 追溯审查确认了一处已经发生的迁移排序错误：tracked `pulses/*.json` 已全部是 `zlc_pulse.PulseDocument`，但 legacy `CalibrateReadout`、部分 Camera/Task/PulseScan 测试与 `resolve_fireable_template` 路径仍调用 `PulseTableState.load()` 读取这些同名资产；开发机 ignored 的 `T.json/pulse_test.json` 又曾使测试输入集合随工作区变化，掩盖了断口。该状态不是需要兼容的双格式需求，而是未闭合的 consumer cut：禁止恢复旧 tracked 资产、在 `PulseTableState` 中增加 `PulseDocument` 猜测/转换器，或让测试继续依赖 ignored 文件。H1/S3 必须把每个仍需保留的 calibration、camera、PulseScan 与 GUI consumer 直接迁到 current document/compiler/endpoint owner，并在同一 dependency-closed 切片删除相应 legacy reader；完成前这些具体 legacy 用户路径明确 NO-GO，不能靠只测新栈宣称系统全绿。
 
 H1完成现有`image.build_fingerprint`/几何/ABI握手、PreparedProgramRef软件guard、repeat轴展开的finite autonomous table与camera-trigger schedule digest、当前UART/AXI/JTAG容量/错误行为，以及raw STATUS/CURSOR的组合读序、logical终态值和双读稳定规则的contract kit。H1同时根据当前RTL delay scheduler语义与CompiledPulseArtifact的冻结channel delay/最后edge推导`max_physical_output_tail_after_logical_done`，用golden/xsim/真机观测验证正常与safe/abort变体并给出保守margin；raw DONE/CURSOR本身不算tail-idle证据。高层`scan_progress()`镜像只供UI，不进入Formal proof。Formal compiler明确强制`repeat_forever=False, scan_repeats=0`并拒绝host wrap-stop；`AUTONOMOUS_RESIDENT`形成近期装载方式基线。超过resident window默认明确拒绝；只有单一I/O owner、保守refill硬上界以及覆盖每个潜在seam的硬件时间观测/完整schedule residual均由contract kit证明，才发布`AUTONOMOUS_REFILLED`条件execution capability。只测试现有RTL实际提供的能力，不增加ProgramToken/CellFireToken、ROM attestation、CRC verifier、PHYSICAL_DONE或telemetry。preview通过S0.5 workbench projector使用frontend FigureDocument，不制造frontend -> pulse反向边。
 

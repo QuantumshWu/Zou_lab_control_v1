@@ -26,7 +26,6 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-import numpy as np
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -138,25 +137,6 @@ def test_real_pulse_test_scan_geometry_had_seven_crossings_now_zero(tmp_path):
     new = s._burst_runs(pending)
     assert _crossings(new) == []
     assert _flatten(new) == list(pending)
-
-
-def test_matches_the_saved_pulse_test_scan_file_if_present(tmp_path):
-    """If the actual saved artifact the user ran is in the tree, the fix must yield 0
-    crossings on it too (belt-and-suspenders over the deterministic geometry test)."""
-    npy = REPO_ROOT / "pulses" / "pulse_test_scan.npy"
-    if not npy.exists():
-        pytest.skip("pulses/pulse_test_scan.npy not in this checkout")
-    arr = np.load(npy)
-    p = im.default_params()
-
-    class _Prog:
-        scan_points = [list(r) for r in arr]
-        slot_count = arr.shape[1]
-
-    words = im.scan_bank_words(_Prog(), p, 0, target_bank=0)
-    pending = [(off * 4, words[off]) for off in sorted(words)]
-    s = _make_session(tmp_path, 256)
-    assert _crossings(s._burst_runs(pending)) == []
 
 
 # --------------------------------------------------------------- synthetic edge cases

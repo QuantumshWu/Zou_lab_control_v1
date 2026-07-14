@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -24,6 +25,27 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 root_text = str(REPO_ROOT)
 if sys.path[0] != root_text:
     sys.path.insert(0, root_text)
+
+
+def tracked_repo_files(pattern: str) -> tuple[Path, ...]:
+    """Return repository fixtures selected from Git's tracked-file set only.
+
+    Test coverage must not change when a developer has ignored experiment files
+    next to the committed fixtures.  Repository-level tests may depend on Git,
+    but they must never discover their input set with a filesystem glob.
+    """
+
+    result = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "ls-files", "--", pattern],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return tuple(
+        REPO_ROOT / relative
+        for relative in result.stdout.splitlines()
+        if relative
+    )
 
 
 # The virtual backend is a REAL-TIME hardware simulator (sleep_scale=1.0 by default), so a
@@ -57,7 +79,13 @@ def fit_thread_guard(monkeypatch):
     yield
 
 
-def fire_imaging_pulse(sequencer, *, exposure=20e-3, cooling=2e-3):
+def fire_imaging_pulse(
+    sequencer,
+    *,
+    exposure=20e-3,
+    cooling=2e-3,
+    trigger_channel=None,
+):
     """Fire a CONTINUOUS imaging pulse (``repeat_forever``) on a raw sequencer -- the
     software model of the pulse GUI's "On Pulse".  An externally-triggered camera produces
     frames ONLY while the streamer is firing such a pulse; ``sequencer.set_safe_state()``
@@ -65,8 +93,33 @@ def fire_imaging_pulse(sequencer, *, exposure=20e-3, cooling=2e-3):
 
     Camera tests use this so they take the SAME firing path as real hardware (the camera is
     purely trigger-driven -- there is no fabricated live frame)."""
-    from Zou_lab_control.neutral_atom.timing import imaging_sequence
-    seq = imaging_sequence(exposure=exposure, load=True, name="live", cooling=cooling).forever()
+    from Zou_lab_control.neutral_atom.timing import (
+        imaging_channel_kwargs,
+        imaging_sequence,
+    )
+
+    if trigger_channel is None:
+        catalog = getattr(sequencer, "port_catalog", None)
+        if catalog is not None:
+            trigger_channel = next(
+                (
+                    port.lanes[0]
+                    for port in catalog.digital_ports
+                    if port.label == "emCCD"
+                ),
+                None,
+            )
+    channel_kwargs = imaging_channel_kwargs(
+        sequencer,
+        trigger_channel=trigger_channel,
+    )
+    seq = imaging_sequence(
+        exposure=exposure,
+        load=True,
+        name="live",
+        cooling=cooling,
+        **channel_kwargs,
+    ).forever()
     sequencer.prepare(seq)
     sequencer.fire()
     return seq
@@ -80,7 +133,12 @@ def fire_live_imaging(exp, *, exposure=None):
     kw = {} if cooling is None else {"cooling": float(cooling)}
     if exposure is None:
         exposure = devs.camera.exposure
-    return fire_imaging_pulse(devs.sequencer, exposure=exposure, **kw)
+    return fire_imaging_pulse(
+        devs.sequencer,
+        exposure=exposure,
+        trigger_channel=devs.camera.primary_trigger_channel,
+        **kw,
+    )
 
 
 def raw_device_set(exp):

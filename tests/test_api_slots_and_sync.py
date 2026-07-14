@@ -1,14 +1,15 @@
-"""MECHANICAL guards for the API-slot handle + the "GUI and API are the same data" sync
-contract (the two things the user demanded be impossible to regress):
+"""Legacy-PulseGUI guards retained until its final consumer moves to ``zlc_pulse``.
 
   * an API slot (a1/a2...) is a NAMED handle on a period duration / channel delay / DAC value
     that ``set_api`` (and the ``state.aN`` sugar) set BY NAME, WITHOUT rewriting the field --
     every handle binds exactly one field and names are unique;
-  * the SHIPPED ``pulses/imaging_template.json`` is, on disk, the continuous long-short-long
-    bracket (THREE emCCD frames + API handles a1/a2/a3) -- not a single window;
   * EVERY fire path records a syncable ``PulseTableState`` (with ``periods``) -- a bare
     ``PulseSequence`` (a Task firing ``to_sequence()``) is reconstructed into a period table,
     so the pulse GUI's Sync can ALWAYS reload the editor from whatever was fired.
+
+Tracked authoring assets are current ``zlc_pulse.PulseDocument`` values and are tested by
+``test_zlc_pulse_document.py``; this migration-island test must not parse those assets through
+the historical ``PulseTableState`` loader.
 """
 
 from __future__ import annotations
@@ -47,28 +48,6 @@ def test_dac_api_slot_unit_is_normalized_to_value():
     assert ApiSlot(name="a3", kind="dac", target="da_z@0").unit == "value"       # default path too
     # non-dac kinds keep their declared unit untouched
     assert ApiSlot(name="a4", kind="duration", target="0", unit="us").unit == "us"
-
-
-def test_shipped_pulse_tables_carry_value_unit_on_every_dac_api_slot():
-    """Every shipped pulse table uses the typed ``value`` unit on each DAC API slot; the MOT
-    template instead exposes three semantic hardware scan slots and no API slots."""
-    pulses = REPO_ROOT / "pulses"
-    dac_slots = 0
-    for path in sorted(pulses.glob("*.json")):
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("schema") != PulseTableState.schema:
-            continue                                    # runtime-program snapshots are not tables
-        state = PulseTableState.load(path)
-        for slot in state.api_slots:
-            if slot.kind == "dac":
-                dac_slots += 1
-                assert slot.unit == "value", f"{path.name}: dac api slot {slot.name} unit={slot.unit!r}"
-    # MOT deliberately uses three semantically named hardware scan slots.  Generic PulseScan may
-    # sweep API slots too; this template chooses hardware execution for synchronized field updates.
-    mot = PulseTableState.load(pulses / "mot_field_template.json")
-    assert mot.api_slots == []
-    assert mot.scan_names == ["da_x", "da_y", "da_z"]
-    assert all(slot.kind == "dac" and slot.unit == "value" for slot in mot.scan_slots)
 
 
 def test_unrolled_bracket_preserves_api_slots_with_remapped_targets():
@@ -136,21 +115,6 @@ def test_api_slot_on_delay_is_allowed():
     assert st.delays[ch] == pytest.approx(1.5)
 
 
-def test_shipped_imaging_template_file_is_three_emccd_bracket():
-    """The FILE on disk is the long-short-long bracket (THREE emCCD frames) and exposes ONE
-    api handle per exposure cell (a1 / a2 / a3, unique like the GUI allocates)."""
-    data = PulseTableState.load(REPO_ROOT / "pulses" / "imaging_template.json")
-    emccd = data.port_catalog.raw_lanes.index("emCCD")
-    n_triggers = sum(1 for period in data.periods if period.states[emccd])
-    assert n_triggers == 3                                          # long-short-long, on disk
-    names = [slot.name for slot in data.api_slots]
-    assert names == ["a1", "a2", "a3"]                              # unique, one per exposure cell
-    # the shipped probe template (the Pulse-scan default) is the SINGLE-image counterpart
-    probe = PulseTableState.load(REPO_ROOT / "pulses" / "probe_template.json")
-    emccd = probe.port_catalog.raw_lanes.index("emCCD")
-    assert sum(1 for period in probe.periods if period.states[emccd]) == 1
-
-
 def test_every_fire_path_records_a_syncable_table():
     """The pulse GUI's Sync reads ``snapshot()['last_payload_json']`` and needs a table (a dict
     WITH ``periods``).  Firing a BARE PulseSequence (what a Task does) must still record one --
@@ -172,7 +136,10 @@ def test_every_fire_path_records_a_syncable_table():
         data = json.loads(seqr.snapshot()["last_payload_json"])
         assert isinstance(data, dict) and "periods" in data        # syncable (NOT a raw sequence)
         synced = PulseTableState.from_dict(data)                    # the GUI's exact sync step
-        emccd = synced.port_catalog.raw_lanes.index("emCCD")
+        emccd_port = next(
+            port for port in synced.port_catalog.digital_ports if port.label == "emCCD"
+        )
+        emccd = synced.port_catalog.raw_lanes.index(emccd_port.lanes[0])
         assert sum(1 for p in synced.periods if p.states[emccd]) == 3   # the fired long-short-long
 
         # a GUI-authored PulseTableState round-trips with its api slots intact (names preserved)
