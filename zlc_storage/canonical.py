@@ -244,7 +244,7 @@ CanonicalStructureAdmission: TypeAlias = Callable[
 def sha256_digest(data: bytes | bytearray | memoryview) -> str:
     """Return the lowercase SHA-256 digest of an already encoded byte sequence."""
 
-    return hashlib.sha256(bytes(data)).hexdigest()
+    return hashlib.sha256(data).hexdigest()
 
 
 def canonical_digest(value: Any) -> str:

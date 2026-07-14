@@ -67,6 +67,83 @@ def test_content_store_publishes_blobs_and_manifests_idempotently(tmp_path):
     assert store.read_manifest("capture", digest) == payload
 
 
+def test_put_blob_borrows_a_mutable_buffer_without_calling_bytes(tmp_path):
+    class NoCopyBuffer(bytearray):
+        def __bytes__(self):
+            raise AssertionError("large blob buffer was duplicated")
+
+    store = ContentAddressedStore(tmp_path / "repository")
+    payload = NoCopyBuffer(b"bounded-frame-chunk")
+    reference = store.put_blob(payload)
+
+    assert payload == b"bounded-frame-chunk"
+    assert store.read_blob(reference) == b"bounded-frame-chunk"
+
+
+def test_identify_blob_uses_the_storage_owner_without_publishing(tmp_path):
+    store = ContentAddressedStore(tmp_path / "repository")
+    payload = bytearray(b"identified-before-publication")
+
+    expected = store.identify_blob(payload)
+
+    assert not store._blob_path_for_digest(expected.digest).exists()
+    assert store.put_blob(payload) == expected
+
+
+def test_mutated_borrowed_blob_cannot_poison_a_digest_target(
+    tmp_path,
+    monkeypatch,
+):
+    store = ContentAddressedStore(tmp_path / "repository")
+    payload = bytearray(b"stable-before-publication")
+    expected = store.identify_blob(payload)
+    original_publish = ContentAddressedStore._publish_bytes
+
+    def raced_publish(owner, target, data, reference):
+        payload[0] ^= 0x01
+        return original_publish(owner, target, data, reference)
+
+    monkeypatch.setattr(
+        ContentAddressedStore,
+        "_publish_bytes",
+        raced_publish,
+    )
+    with pytest.raises(ContentCorruptionError):
+        store.put_blob(payload)
+    assert not store._blob_path_for_digest(expected.digest).exists()
+
+
+def test_failed_post_publish_verification_restores_absence_for_retry(
+    tmp_path,
+    monkeypatch,
+):
+    store = ContentAddressedStore(tmp_path / "repository")
+    payload = b"verified-or-absent"
+    expected = store.identify_blob(payload)
+    target = store._blob_path_for_digest(expected.digest)
+    original_verify = ContentAddressedStore._verify_open_handle
+
+    def fail_verify(*_args, **_kwargs):
+        raise ContentCorruptionError("injected post-publish verification failure")
+
+    monkeypatch.setattr(
+        ContentAddressedStore,
+        "_verify_open_handle",
+        fail_verify,
+    )
+    with pytest.raises(ContentCorruptionError, match="injected"):
+        store.put_blob(payload)
+    assert not target.exists()
+
+    monkeypatch.setattr(
+        ContentAddressedStore,
+        "_verify_open_handle",
+        original_verify,
+    )
+    assert store.put_blob(payload) == expected
+    assert store.read_blob(expected) == payload
+
+
 def test_typed_blob_reference_is_trusted_after_construction(tmp_path, monkeypatch):
     import zlc_storage.content_store as content_store
 
@@ -234,6 +311,9 @@ def test_verify_blob_streams_without_materializing_payload(tmp_path, monkeypatch
 
         def fileno(self):
             return self._stream.fileno()
+
+        def seek(self, offset, whence=0):
+            return self._stream.seek(offset, whence)
 
         def read(self, size=-1):
             read_sizes.append(size)

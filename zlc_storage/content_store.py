@@ -42,6 +42,17 @@ def _payload(value: object, field: str) -> bytes:
     return bytes(value)
 
 
+def _blob_payload(value: object, field: str) -> memoryview:
+    """Borrow one synchronous blob buffer without duplicating large payloads."""
+
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        raise TypeError(f"{field} must be bytes-like")
+    view = memoryview(value)
+    if not view.c_contiguous:
+        raise ValueError(f"{field} must be C-contiguous")
+    return view.cast("B")
+
+
 @dataclass(frozen=True)
 class ContentRef:
     digest: str
@@ -151,9 +162,15 @@ class ContentStoreAuthority:
         self._require_integrity()
         return self._root
 
-    def put_blob(self, payload: bytes) -> ContentRef:
+    def put_blob(self, payload: bytes | bytearray | memoryview) -> ContentRef:
         self._require_integrity()
         return ContentAddressedStore._put_blob(self._store, payload)
+
+    def identify_blob(self, payload: bytes | bytearray | memoryview) -> ContentRef:
+        """Return the canonical CAS identity without publishing the payload."""
+
+        self._require_integrity()
+        return ContentAddressedStore._identify_blob(payload)
 
     def read_blob(
         self,
@@ -308,12 +325,20 @@ class ContentAddressedStore:
     def authority(self) -> ContentStoreAuthority:
         return self._authority
 
-    def put_blob(self, payload: bytes) -> ContentRef:
+    def put_blob(self, payload: bytes | bytearray | memoryview) -> ContentRef:
         return self.authority().put_blob(payload)
 
-    def _put_blob(self, payload: bytes) -> ContentRef:
-        data = _payload(payload, "blob payload")
-        reference = ContentRef(sha256_digest(data), len(data))
+    def identify_blob(self, payload: bytes | bytearray | memoryview) -> ContentRef:
+        return self.authority().identify_blob(payload)
+
+    @staticmethod
+    def _identify_blob(payload: bytes | bytearray | memoryview) -> ContentRef:
+        data = _blob_payload(payload, "blob payload")
+        return ContentRef(sha256_digest(data), len(data))
+
+    def _put_blob(self, payload: bytes | bytearray | memoryview) -> ContentRef:
+        data = _blob_payload(payload, "blob payload")
+        reference = ContentAddressedStore._identify_blob(data)
         ContentAddressedStore._publish_bytes(
             self,
             self._blob_path_for_digest(reference.digest),
@@ -513,7 +538,12 @@ class ContentAddressedStore:
     def _manifest_path_for_identity(self, namespace: str, digest: str) -> Path:
         return self._manifests / namespace / f"{digest}.manifest"
 
-    def _publish_bytes(self, target: Path, data: bytes, reference: ContentRef) -> None:
+    def _publish_bytes(
+        self,
+        target: Path,
+        data: bytes | bytearray | memoryview,
+        reference: ContentRef,
+    ) -> None:
         with self._lock:
             durability.durable_mkdir(target.parent)
             if target.exists():
@@ -521,34 +551,74 @@ class ContentAddressedStore:
                 # barrier after a prior replace became visible but its parent
                 # directory flush acknowledgement failed.  Verify and fsync
                 # the exact same open file, then persist its directory entry.
-                existing = ContentAddressedStore._confirm_existing_durable(
+                ContentAddressedStore._confirm_existing_reference_durable(
                     self,
                     target,
-                    expected_digest=reference.digest,
-                    expected_size=reference.size,
-                    max_bytes=None,
+                    reference,
                 )
-                if existing != data:
-                    raise ContentCorruptionError(
-                        f"content collision at immutable path {target}"
-                    )
                 return
             temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
             try:
-                with temporary.open("xb") as stream:
+                with temporary.open("x+b") as stream:
                     stream.write(data)
                     stream.flush()
                     os.fsync(stream.fileno())
+                    # Mutable borrowed buffers may change after their identity
+                    # was computed.  Verify the staged file before replace so
+                    # a race can fail this call but can never make mismatched
+                    # bytes visible under a digest-derived target name.
+                    ContentAddressedStore._verify_stream(
+                        stream,
+                        reference,
+                        max_bytes=None,
+                    )
                 # The destination name is derived from the payload digest.  A
                 # concurrent writer can only publish the same verified bytes.
                 os.replace(temporary, target)
                 durability.flush_directory(target.parent)
-                ContentAddressedStore._read_verified(target, reference)
+                try:
+                    ContentAddressedStore._verify_open_handle(
+                        target,
+                        reference,
+                        max_bytes=None,
+                    )
+                except BaseException as verification_error:
+                    # This call created the target while holding the store
+                    # lock.  If its post-publish verification fails, remove
+                    # that target and durably restore absence so a correct
+                    # retry is never blocked by poisoned digest storage.
+                    try:
+                        target.unlink()
+                        durability.flush_directory(target.parent)
+                    except BaseException as cleanup_error:
+                        verification_error.add_note(
+                            "failed to durably remove the unverified CAS target: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                    raise
             finally:
                 try:
                     temporary.unlink()
                 except FileNotFoundError:
                     pass
+
+    def _confirm_existing_reference_durable(
+        self,
+        target: Path,
+        reference: ContentRef,
+    ) -> None:
+        """Verify/fsync an existing immutable target without reading it into RAM."""
+
+        with self._lock:
+            with target.open("r+b") as stream:
+                ContentAddressedStore._verify_stream(
+                    stream,
+                    reference,
+                    max_bytes=None,
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+            durability.flush_directory(target.parent)
 
     def _confirm_existing_durable(
         self,
@@ -659,36 +729,47 @@ class ContentAddressedStore:
         if max_bytes is not None:
             max_bytes = nonnegative_integer(max_bytes, "max_bytes")
         with path.open("rb") as stream:
-            actual_size = os.fstat(stream.fileno()).st_size
-            if max_bytes is not None and actual_size > max_bytes:
-                raise ContentSizeLimitError(
-                    f"stored content size {actual_size} exceeds limit {max_bytes}"
-                )
-            if actual_size != reference.size:
+            ContentAddressedStore._verify_stream(
+                stream,
+                reference,
+                max_bytes=max_bytes,
+            )
+
+    @staticmethod
+    def _verify_stream(stream, reference: ContentRef, *, max_bytes: int | None) -> None:
+        if max_bytes is not None:
+            max_bytes = nonnegative_integer(max_bytes, "max_bytes")
+        actual_size = os.fstat(stream.fileno()).st_size
+        if max_bytes is not None and actual_size > max_bytes:
+            raise ContentSizeLimitError(
+                f"stored content size {actual_size} exceeds limit {max_bytes}"
+            )
+        if actual_size != reference.size:
+            raise ContentCorruptionError(
+                "stored content does not match immutable reference "
+                f"{reference.digest}"
+            )
+
+        stream.seek(0)
+        digest = hashlib.sha256()
+        remaining = actual_size
+        while remaining:
+            chunk = stream.read(min(_VERIFY_CHUNK_SIZE, remaining))
+            if not chunk:
                 raise ContentCorruptionError(
                     "stored content does not match immutable reference "
                     f"{reference.digest}"
                 )
+            digest.update(chunk)
+            remaining -= len(chunk)
 
-            digest = hashlib.sha256()
-            remaining = actual_size
-            while remaining:
-                chunk = stream.read(min(_VERIFY_CHUNK_SIZE, remaining))
-                if not chunk:
-                    raise ContentCorruptionError(
-                        "stored content does not match immutable reference "
-                        f"{reference.digest}"
-                    )
-                digest.update(chunk)
-                remaining -= len(chunk)
-
-            # The extra byte detects growth after fstat while keeping the read
-            # bounded to the admitted physical size plus one byte.
-            if stream.read(1) or digest.hexdigest() != reference.digest:
-                raise ContentCorruptionError(
-                    "stored content does not match immutable reference "
-                    f"{reference.digest}"
-                )
+        # The extra byte detects growth after fstat while keeping the read
+        # bounded to the admitted physical size plus one byte.
+        if stream.read(1) or digest.hexdigest() != reference.digest:
+            raise ContentCorruptionError(
+                "stored content does not match immutable reference "
+                f"{reference.digest}"
+            )
 
 __all__ = [
     "ContentAddressedStore",
