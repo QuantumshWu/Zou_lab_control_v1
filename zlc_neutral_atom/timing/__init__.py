@@ -5,11 +5,6 @@ from .capture import (
     TriggeredCaptureSpec,
     TriggeredPipelineResult,
 )
-from .occupancy import (
-    compile_triggered_occupancy_pipeline,
-    TriggeredOccupancyPipelineResult,
-    TriggeredOccupancySpec,
-)
 from .capture_plan import (
     COMPILED_CAPTURE_CELL_PLAN_SCHEMA,
     CaptureCellAssignment,
@@ -73,7 +68,4 @@ __all__ = [
     "repeat_major_capture_grouping",
     "TriggeredCaptureSpec",
     "TriggeredPipelineResult",
-    "compile_triggered_occupancy_pipeline",
-    "TriggeredOccupancyPipelineResult",
-    "TriggeredOccupancySpec",
 ]

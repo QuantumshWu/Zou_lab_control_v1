@@ -1990,6 +1990,10 @@ live 路径先提交原始 CaptureArtifact，再与 offline 路径汇合；算�
 
 Occupancy request 携带 CalibrationArtifactRef 和已解析的 `ReadoutModelKind`；RunPlan 在绑定 `OccupancyStreamProcessor` 前解析并 admit immutable CalibrationArtifact，验证 artifact fingerprint/evidence/commit、输入 sample/capture 的 FrameContract、SiteMap/coordinate frame、model kind 与 applicability。任何 mismatch 明确失败，不按相同 shape 猜“应该兼容”。
 
+整改后的实现顺序以真实消费者为门，而不是先造通用执行框架。第一条可交付路径是“已提交 CaptureArtifact + 已 admit CalibrationArtifact -> 纯 `apply_readout_model` -> immutable counts/occupied/ComponentValidity/provenance”；硬件 arm/fire/exact reservation/cleanup 仍由既有 Capture/Pulse owner 持有。只有这个离线路径与旧真机算法的同帧 golden 一致后，才为 live monitor 建立一个 concrete `BoundReadoutProcessor`。在出现第二个具有相同生命周期和 backpressure 语义的领域 processor 前，不建立 generic `processing.stream` worker、额外 execution guard、anti-rebadge token、occupancy 专用 transaction/result wrapper，也不把 occupied 偷塞进 metadata 后再重建第二个 dataset。counts 与 occupied 若同时落盘，必须是同一原子 typed record 的两个字段，并共享同一个 ComponentValidity 与 source cell provenance。
+
+2026-07 的追溯整改发现，已提交的 `occupancy.py + occupancy_pipeline.py + timing/occupancy.py` 共约 2.7k production LOC，却没有 composition-root 或 notebook production caller；其唯一“大量使用者”是约 2.3k LOC 的实现镜像测试。该实现因此在本轮整改中删除，不能计为 S3 已完成能力。保留的是已经有真实消费者或数据正确性依据的 FrameContract/context join、ComponentValidity、纯 readout math、typed CalibrationArtifactRef、Capture exact reservation 与硬件 cleanup；S3 恢复时必须先建立上述最短公共纵切和独立 oracle，再按真实第二消费者决定是否抽象。
+
 ## 14. PulseScan
 
 ### 14.1 两种明确语义
@@ -3015,10 +3019,10 @@ H2默认不排期。只有以下任一证据成立才可创建提案：
 
 ### S3：StreamProcessor、Calibration 与 Occupancy/readout
 
-1. 在已工作的 camera event 上加入最小 `StreamProcessorWorker`、typed record、join/cardinality/budget 和 exact propagation；不让 StreamProcessor 读取累计 DataBlock。
-2. 完成 CaptureArtifact -> CalibrationAnalysis -> CalibrationArtifact 的 live/offline 同路算法，以及 FrameContract/SiteMap/ReadoutModel。
-3. 迁 `OccupancyStreamProcessor`，输出单个 `OccupancySample(occupied, counts, metadata)` typed record，并显式绑定 CalibrationArtifactRef/model。
-4. DatasetBuilder 把 occupancy events 物化为 dataset；frontend Figure 与 zlc_data Fit 直接消费该冻结 dataset，证明四平面边界贯通。
+1. 先以 main 中真机验证过的 site/PSF/threshold/fidelity 算法为默认基线，建立同一批 frame 的 golden 对照；每个偏离都必须写明旧实现具体错误并证明差异正是预期结果。完成 CaptureArtifact -> CalibrationAnalysis -> CalibrationArtifact 的 live/offline 同路纯函数，以及最小 FrameContract/SiteMap/ReadoutModel。
+2. 先交付离线 `CaptureArtifactRef + CalibrationArtifactRef/model -> counts/occupied/validity/provenance`，由同一个 `apply_readout_model` 同时服务 notebook、GUI 与未来 live processor；不建立 0 resource/0 hazard/0 device 的伪硬件 RunPlan。
+3. 真实 live consumer 接通时只建立一个 concrete `BoundReadoutProcessor`，输出单个原子 typed record；它消费 CaptureSession 已有的 exact cursor/reservation，不再叠一套 guard/token/transaction authority。只有第二个生产 processor 证明相同抽象确有复用价值后，才提取 generic StreamProcessor worker。
+4. DatasetBuilder 把该 typed record 物化为一个具有 counts/occupied 两字段和共同 ComponentValidity 的 dataset；frontend Figure 与 zlc_data Fit 直接消费该冻结 dataset，证明四平面边界贯通。禁止 values/metadata 双真相。
 5. integration 通过后删除旧 camera frame producer/LogicNode 与最后一个 Occupancy/ROI/readout reactive consumer组成的完整旧链，同时删除 `read_frames()/acquire()` 等 array-only acquisition reader及其专用测试，不在adapter_sdk保留无metadata便利入口。并删除 runtime/session calibration 回查 fallback、filesystem fallback、legacy search、拆散 scalar signals 和会碰硬件的旧 Processor；保留的只有 notebook/workbench composition 在 request 构造时按 ReadoutBindingKey 冻结显式 CalibrationArtifactRef/model 的可见 convenience pointer。
 
 ### S4：近期 Formal PulseScan（AUTONOMOUS_STREAMED）

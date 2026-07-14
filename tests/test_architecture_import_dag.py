@@ -431,10 +431,7 @@ def test_content_ref_codec_and_cas_address_have_one_storage_owner():
 
 def test_artifact_finalizers_do_not_replay_published_payload_digests():
     violations = []
-    for relative in (
-        Path("zlc_neutral_atom/artifacts/capture.py"),
-        Path("zlc_neutral_atom/readout/occupancy_pipeline.py"),
-    ):
+    for relative in (Path("zlc_neutral_atom/artifacts/capture.py"),):
         path = ROOT / relative
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
