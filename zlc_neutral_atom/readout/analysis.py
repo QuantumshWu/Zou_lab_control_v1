@@ -2137,7 +2137,7 @@ def _freeze_partition(
         {
             "schema": "zlc_neutral_atom.CalibrationBracketPartition",
             "source_schema": request.layout.readout_event_axis_id.value,
-            "partition_policy": "ALGORITHM_FIXED_HASH_ORDER_V1",
+            "partition_policy": "fixed-hash-order",
             "train": [_context_tree(brackets[index].context_key) for index in train],
             "reference_evidence": [
                 _context_tree(brackets[index].context_key)

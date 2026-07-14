@@ -345,6 +345,23 @@ def _mutate_partition_reference_evidence_only(capture, request):
     return _replace_block(capture, values)
 
 
+def test_partition_digest_uses_descriptive_policy_identity(monkeypatch):
+    request = _request()
+    brackets = request.layout.brackets(_capture().block.schema)
+    captured = {}
+    canonical_digest = analysis_impl.canonical_digest
+
+    def capture_partition_tree(tree):
+        if tree.get("schema") == "zlc_neutral_atom.CalibrationBracketPartition":
+            captured.update(tree)
+        return canonical_digest(tree)
+
+    monkeypatch.setattr(analysis_impl, "canonical_digest", capture_partition_tree)
+    analysis_impl._freeze_partition(brackets, request)
+
+    assert captured["partition_policy"] == "fixed-hash-order"
+
+
 def _replace_all_reference_images(capture, painter):
     values = capture.block.values.copy()
     schema = capture.block.schema
