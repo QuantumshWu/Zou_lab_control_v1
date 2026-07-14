@@ -3195,6 +3195,32 @@ apps/
 
 ## 22. 最终验收
 
+### 22.1 追溯整改范围与当前 gate
+
+规则 1–7 的审查集合必须每次由 Git 机械产生，不能靠上下文记忆或“我记得写过哪些提交”。整改启动时的固定证据是 `git rev-list --count main..HEAD = 113`、`git diff --name-only main...HEAD = 315`；在纠正误删并完成 tracked-fixture 整改的 checkpoint `12f3414`，分支已变为 139 个领先提交、323 个 changed files。后续数字会随整改提交增长，因此报告必须同时写 checkpoint commit，不能把 113/315 或 139/323 当永久常量。
+
+`12f3414` 的 323 文件第一集合按顶层 owner 分布为：tests 142、旧树 `Zou_lab_control` 48、`zlc_neutral_atom` 42、`zlc_pulse` 23、`zlc_data` 20、`zlc_workbench` 10、`zlc_frontend` 8、FPGA host/config 8、tracked pulse assets 6、`zlc_storage` 6、tutorials 5、docs 2、root/config 3；文件类型为 Python 298、JSON 9、Markdown 7、notebook 5，其余 TOML/gitignore/TeX body/batch 各 1。每个文件必须分配一个 primary owner/slice，测试跟随被测 owner审查；跨域文件还要记录 secondary seam，不能因“另一路 agent 看过相邻包”漏掉。
+
+机械覆盖至少包含：完整 changed-file set；Python AST 的 class/dataclass/enum/function/import/call-site 清点；重复 validator/digest/codec/版本常量的符号与语义搜索；production + 已排期 target consumer 图；测试 oracle/fixture 来源；main 等价物的 NCLOC/class/dataclass 比；以及对大帧 digest/copy、fit/calibration、journal、pulse compile/pack 的针对性 profile。每条规则的完成报告必须给出覆盖 checkpoint、发现总数（包含点名样本之外的新发现）、净行数变化、涉及 owner、独立验证和未来 ratchet。只给抽样或只说测试通过，不算完成。
+
+当前 gate 是 **NO-GO：迁移继续冻结**。已有整改提交覆盖了一部分 canonical owner、payload digest、格式身份、edit counter、content ref、camera primitive 和 checkout-independent tests，但规则 1–7 尚未全仓闭合；尤其 calibration 物理同帧 golden、monitor/rolling 最小职责、occupancy 原子多字段物化、剩余重复 terminal/deployment validation、镜像 oracle 和各切片海拔压缩仍未完成。
+
+中间迁移态的“当前 production 调用数”只是一条证据，不能单独裁决目标能力：
+
+| 能力 | 明确的终态 consumer | 审查动作 | 允许物理删除的条件 |
+|---|---|---|---|
+| `MonitorTap` 与 bounded live/rolling | Workbench live image、rolling curve、histogram、board coherent present | 保留 broker fan-out 语义；审查 window ownership、sequence/EventRef、copy 与 missed/expiry | 同等 GUI capability 已由更小唯一 owner 交付并迁完全部 panel |
+| finite exact DatasetBuilder | capture、scan、processor、artifact | 保留 exact schedule/cursor/gap-fatal；与 display window 分责并收敛重复 patch/materialize | 不删除；只替换内部实现且 exact oracle 等价 |
+| StreamProcessor/occupancy | S3 readout、未来 analysis processor | 保留 task/measurement/processor 语义；合并 anti-forgery wrapper、重复 guard 和不可达 policy | 真实 replacement 同时交付 offline/live consumer、E2E 与 lifecycle oracle |
+| calibration/readout | notebook、Workbench、occupancy、site-map/gridplot | 默认继承 main 真机数学；压缩 artifact/codec/evidence 图并建立同帧 golden | 不因未接 composition 删除；只有产品明确取消该实验能力才可删除 |
+| `FitResultBatch`/batch axes | gridplot/site/component fit | 保留；收敛重复 fit owner 与镜像模型测试 | gridplot 不再需要批量 fit 或出现更小等价值类型 |
+| `zlc_frontend` Figure/View/selector | S0.5/S2/S5 Workbench 与 notebook render | 审查 target DAG、最小入口与性能，不以旧 GUI 尚未迁入为由删除 | 新 frontend 设计被正式替换且所有目标用户面有闭环 |
+| legacy PulseTableState readers | 尚未迁完的 CalibrateReadout/PulseScan/PulseGUI 岛 | 先迁每个保留 consumer 到 current PulseDocument/compiler | 最后 consumer 迁走的 H1/S3 dependency-closed commit |
+
+规则状态必须诚实记录为 `NOT_STARTED/PARTIAL/COMPLETE`；只有 `COMPLETE` 才能恢复新迁移。目前：规则 1 PARTIAL，规则 2 PARTIAL（已纠正“零当前消费者即删除”的错误判据），规则 3 PARTIAL，规则 4 NOT COMPLETE，规则 5 PARTIAL，规则 6 NOT COMPLETE，规则 7 PARTIAL。最终还需独立对抗审查证明没有 P0/P1 correctness、边界或可实现性漏洞。
+
+### 22.2 终态验收清单
+
 架构：
 
 - import DAG 通过；
