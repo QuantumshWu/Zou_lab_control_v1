@@ -85,6 +85,39 @@ def test_mapping_order_and_sequence_container_do_not_change_bytes():
     assert canonical_digest(left) == canonical_digest(right)
 
 
+def test_mixed_primitive_tree_matches_frozen_canonical_bytes():
+    value = {
+        "items": [
+            None,
+            True,
+            -7,
+            -0.0,
+            float("inf"),
+            float("-inf"),
+            float("nan"),
+            "原子",
+        ],
+        "bytes": b"\x00\xff",
+        "array": np.array([[float("nan"), 2.0]], dtype=">f8"),
+    }
+    expected = (
+        b"ZLC-CANONICAL-1\n"
+        b'['
+        b'"map",[["array",["ndarray",["<f8",["1","2"],'
+        b'"AAAAAAAA+H8AAAAAAAAAQA=="]]],["bytes",["bytes","AP8="]],'
+        b'["items",["list",[["null"],["bool",true],["int","-7"],'
+        b'["float64","8000000000000000"],["float64","+inf"],'
+        b'["float64","-inf"],["float64","nan"],'
+        b'["str","\xe5\x8e\x9f\xe5\xad\x90"]]]]]'
+        b']'
+    )
+
+    assert encode(value) == expected
+    assert canonical_digest(value) == (
+        "9128f6c452f37d70295eae6f9de5d9beb1842a1e6958c3ce43ef35e36871c66e"
+    )
+
+
 @pytest.mark.parametrize("value", [0.0, -0.0, float("inf"), float("-inf"), float("nan")])
 def test_float_edges_round_trip_canonically(value):
     restored = decode(encode(value))
