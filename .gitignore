@@ -44,14 +44,14 @@ tutorials/_executed_check/
 **/results/
 
 # Figures + data dumps are NEVER committed: panel "Save Fig" (tasks/<name>.png + .npz),
-# calibration reports, scan exports, scratch captures.  The ONLY images that belong in git
-# are the deliverable manual figures under docs/**/assets/ (rebuilt by the doc build
-# scripts) -- re-allow exactly those; every other .png / .npz / .npy is local output.
+# calibration reports, scan exports, scratch captures.  The only binary assets admitted
+# to git are deliverable manual figures and explicitly named independent test oracles.
 # (Saved task LAYOUTS tasks/*.json are not data, so they stay committable.)
 *.png
 *.npz
 *.npy
 !docs/**/assets/*.png
+!tests/fixtures/main_readout_oracle.npz
 _shots/
 **/_shots/
 

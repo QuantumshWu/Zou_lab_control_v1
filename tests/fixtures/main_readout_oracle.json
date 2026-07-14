@@ -1,0 +1,37 @@
+{
+  "format": "main-readout-oracle",
+  "authority_commit": "6c337d49c7086fa0ff21f879cd159bdf0e753f51",
+  "authority_functions": [
+    "Zou_lab_control.neutral_atom.core.analysis.find_site_centers",
+    "Zou_lab_control.neutral_atom.core.analysis.roi_counts",
+    "Zou_lab_control.neutral_atom.core.psf.fit_site_psfs",
+    "Zou_lab_control.neutral_atom.core.psf.fit_uniform_psf",
+    "Zou_lab_control.neutral_atom.core.psf.psf_signals",
+    "Zou_lab_control.neutral_atom.operations.calibration.calibrate_all_methods_from_images",
+    "Zou_lab_control.neutral_atom.operations.fidelity.reference_labels",
+    "Zou_lab_control.neutral_atom.operations.fidelity.train_test_split",
+    "Zou_lab_control.neutral_atom.operations.fidelity.characterize_readout",
+    "Zou_lab_control.neutral_atom.core.calibration.TrapCalibration.detect"
+  ],
+  "input": {
+    "origin": "deterministic synthetic raw camera frames, frozen in the NPZ",
+    "reference_shape": [60, 2, 34, 40],
+    "short_shape": [60, 34, 40],
+    "grid_shape_yx": [2, 3]
+  },
+  "settings": {
+    "ordering": "row-major",
+    "box_radius": 1,
+    "box_reducer": "mean",
+    "psf_half_width": 3,
+    "psf_background": "annulus",
+    "psf_background_padding": 3,
+    "train_fraction": 0.9,
+    "split_seed": 0,
+    "histogram_bins": 120,
+    "max_drop": 5,
+    "readout_exposure_seconds": 0.005
+  },
+  "scope": "Detector, three feature models, quick thresholds, strict-consensus labels, split, empirical thresholds, held-out/model fidelity, drop-worst, threshold writeback, and runtime occupancy.",
+  "excluded_from_equivalence": "Known main defects involving non-finite validity and reversed fluorescence polarity are tested separately as intentional corrections."
+}
