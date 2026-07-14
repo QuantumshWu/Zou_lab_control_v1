@@ -12,8 +12,10 @@ from typing import Callable, Generic, Protocol, TypeVar
 
 from zlc_storage.framed_journal import FramedJournal
 from zlc_storage import (
+    ContentStoreAuthority,
     RepositoryRootLease,
     RepositoryRootLeaseBorrow,
+    StoredManifest,
     canonical_text as _canonical,
     sha256_text as _sha256,
 )
@@ -122,6 +124,53 @@ class PublishedManifest(Generic[CommitT]):
 
 class PublishVisibilityUnknown(RuntimeError):
     """The repository cannot yet determine whether its manifest became visible."""
+
+
+def publish_manifest_with_visibility_reconciliation(
+    authority: ContentStoreAuthority,
+    namespace: str,
+    payload: bytes,
+    *,
+    expected_digest: str,
+    max_bytes: int,
+) -> StoredManifest:
+    """Publish once and classify an ordinary failure from the visible target.
+
+    An explicit :class:`PublishVisibilityUnknown` already carries the storage
+    owner's verdict and is propagated unchanged.  For every other publication
+    error, only a verified absent target is a known failure.  A visible expected
+    target, an unreadable target, or unexpected visible bytes all leave commit
+    visibility unknown and must be reconciled by the commit coordinator.
+    """
+
+    try:
+        return authority.publish_manifest(
+            namespace,
+            payload,
+            expected_digest=expected_digest,
+        )
+    except PublishVisibilityUnknown:
+        raise
+    except BaseException as publish_error:
+        try:
+            visible = authority.read_manifest(
+                namespace,
+                expected_digest,
+                max_bytes=max_bytes,
+            )
+        except FileNotFoundError:
+            raise publish_error
+        except BaseException as visibility_error:
+            raise PublishVisibilityUnknown(
+                "manifest visibility could not be verified"
+            ) from visibility_error
+        if visible != payload:
+            raise PublishVisibilityUnknown(
+                "manifest target is visible with unexpected bytes"
+            ) from publish_error
+        raise PublishVisibilityUnknown(
+            "manifest became visible before publication acknowledgement completed"
+        ) from publish_error
 
 
 def _validate_published_manifest(

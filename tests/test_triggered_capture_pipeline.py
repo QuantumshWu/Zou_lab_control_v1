@@ -18,7 +18,16 @@ from Zou_lab_control.neutral_atom.devices.virtual import (
     VirtualTrapArray,
 )
 from Zou_lab_control.neutral_atom.ports import PortCatalog, PortSpec
-from zlc_data import AxisId, AxisSpec, BlockId, PointLayout, READOUT_EVENT, REPEAT
+from zlc_data import (
+    AxisId,
+    AxisSpec,
+    BlockId,
+    DatasetSchema,
+    PointLayout,
+    READOUT_EVENT,
+    REPEAT,
+    SCAN_POINT,
+)
 from zlc_neutral_atom.acquisition import CameraAcquisitionMode
 from zlc_neutral_atom.artifacts import (
     CaptureArtifactRef,
@@ -34,20 +43,30 @@ from zlc_neutral_atom.runtime import (
     RunCancelled,
     RunFailed,
 )
-from zlc_neutral_atom.timing._coordination import run_cleanup_steps
-from zlc_neutral_atom.timing import (
+from zlc_neutral_atom.timing._coordination import (
+    execute_autonomous_single_fire,
+    run_cleanup_steps,
+    validate_single_trigger_capture_binding,
+)
+from zlc_neutral_atom.timing.capture import (
+    TriggeredCaptureSpec,
+    TriggeredPipelineResult,
+    compile_triggered_pipeline,
+)
+from zlc_neutral_atom.timing.capture_plan import compile_capture_cell_plan
+from zlc_neutral_atom.timing.lineage import PulseCaptureBinding, PulseCaptureLineage
+from zlc_neutral_atom.timing.pulse import (
     FinitePulseExecutionRequest,
     PulseTerminalEvidenceKind,
     SimulatedPulseReceipt,
-    TriggeredCaptureSpec,
-    TriggeredPipelineResult,
-    compile_capture_cell_plan,
-    compile_triggered_pipeline,
 )
 from zlc_pulse import (
     PulseExecutionForm,
+    PulseFieldRef,
     RepeatRegion,
+    ScanParameter,
     compile_pulse_artifact,
+    freeze_scan_table,
     load_pulse_document,
 )
 from zlc_storage import decode, encode
@@ -79,6 +98,35 @@ def test_ordered_cleanup_runs_later_physical_steps_after_an_earlier_exception():
 
     assert calls == ["pulse", "camera"]
     assert report.errors == (failure, later_failure)
+
+
+def test_single_fire_failure_attempts_both_software_poisons():
+    calls = []
+    primary = RuntimeError("pulse prepare failed")
+
+    class Pulse:
+        def prepare(self, _context):
+            calls.append("prepare")
+            raise primary
+
+        def fail(self):
+            calls.append("pulse-fail")
+
+    class Capture:
+        def fail(self, error):
+            assert error is primary
+            calls.append("capture-fail")
+            raise RuntimeError("capture poison failed")
+
+    with pytest.raises(RuntimeError) as failure:
+        execute_autonomous_single_fire(
+            object(),
+            pulse=Pulse(),
+            capture=Capture(),
+        )
+
+    assert failure.value is primary
+    assert calls == ["prepare", "capture-fail", "pulse-fail"]
 
 
 def _runtime(
@@ -187,6 +235,185 @@ def _runtime(
     return runtime, camera, sequencer, capture, document, pulse_port, artifact, plan
 
 
+def _contract_with_required_trigger_interval(capture, seconds):
+    """Re-mint the canonical evidence chain with one changed physical fact."""
+
+    contract = capture.measurement.capture_contract
+    evidence = contract.capability.camera_capability_evidence
+    assert evidence is not None
+    facts = replace(
+        evidence.physical_facts,
+        required_external_trigger_interval_seconds=seconds,
+    )
+    evidence = replace(evidence, physical_facts=facts)
+    capability = replace(
+        contract.capability,
+        capability_fingerprint=evidence.fingerprint,
+        camera_capability_evidence=evidence,
+    )
+    provenance = contract.camera_provenance
+    assert provenance is not None
+    provenance = replace(
+        provenance,
+        capability_fingerprint=evidence.fingerprint,
+    )
+    return replace(
+        contract,
+        capability=capability,
+        camera_provenance=provenance,
+    )
+
+
+def test_trigger_interval_gate_rejects_only_strictly_shorter_schedules():
+    runtime, _camera, sequencer, capture, _document, _port, artifact, plan = (
+        _runtime()
+    )
+    assert plan is not None
+    schedule = artifact.trigger_schedules[0]
+    assert schedule.minimum_interval_ticks is not None
+    actual = schedule.minimum_interval_ticks / artifact.target_ir.clock_hz
+    pulse_binding = PulseCaptureBinding(artifact, "ch11", plan)
+    try:
+        for required in (0.0, actual / 2, actual):
+            accepted = validate_single_trigger_capture_binding(
+                capture_spec=capture.measurement.capture_spec,
+                contract=_contract_with_required_trigger_interval(
+                    capture,
+                    required,
+                ),
+                pulse_binding=pulse_binding,
+            )
+            assert accepted is schedule
+
+        with pytest.raises(ValueError, match="shorter.*required external trigger"):
+            validate_single_trigger_capture_binding(
+                capture_spec=capture.measurement.capture_spec,
+                contract=_contract_with_required_trigger_interval(
+                    capture,
+                    float(np.nextafter(actual, np.inf)),
+                ),
+                pulse_binding=pulse_binding,
+            )
+        assert sequencer.history == []
+    finally:
+        assert runtime.shutdown(timeout=2.0)
+
+
+def test_single_camera_trigger_edge_has_no_interval_to_reject():
+    runtime, _camera, sequencer, capture, document, _port, _artifact, _plan = (
+        _runtime(point_count=1)
+    )
+    trigger_index = document.target.raw_lanes.index("ch11")
+    periods = []
+    for index, period in enumerate(document.periods):
+        states = list(period.states)
+        if index > 1:
+            states[trigger_index] = 0
+        periods.append(replace(period, states=tuple(states)))
+    single_edge_document = replace(document, periods=tuple(periods))
+    single_edge_artifact = compile_pulse_artifact(
+        single_edge_document,
+        clock_hz=sequencer.clock_hz,
+        execution_form=PulseExecutionForm.STATIC_ONCE,
+        trigger_channels=("ch11",),
+        live_target=single_edge_document.target,
+    )
+    assert single_edge_artifact.trigger_schedules[0].minimum_interval_ticks is None
+    single_edge_plan = compile_capture_cell_plan(
+        single_edge_artifact,
+        "ch11",
+        capture.measurement.capture_contract.dataset_schema,
+        readout_event_axis_id=AxisId("frame"),
+        scan_point_layout=PointLayout.rect_c(()),
+    )
+    try:
+        accepted = validate_single_trigger_capture_binding(
+            capture_spec=capture.measurement.capture_spec,
+            contract=_contract_with_required_trigger_interval(capture, 1000.0),
+            pulse_binding=PulseCaptureBinding(
+                single_edge_artifact,
+                "ch11",
+                single_edge_plan,
+            ),
+        )
+        assert accepted.total == 1
+        assert sequencer.history == []
+    finally:
+        assert runtime.shutdown(timeout=2.0)
+
+
+def test_trigger_interval_gate_includes_the_shortest_scan_point_boundary():
+    runtime, _camera, sequencer, capture, document, _port, _artifact, plan = (
+        _runtime()
+    )
+    assert plan is not None
+    document = replace(
+        document,
+        periods=document.periods[:3],
+        api_parameters=(),
+    )
+    first = document.periods[0]
+    parameter = ScanParameter(
+        "capture_scan",
+        PulseFieldRef("duration", first.period_id),
+        "capture scan",
+        first.unit,
+    )
+    document = replace(document, scan_parameters=(parameter,))
+    table, _report = freeze_scan_table(
+        document,
+        (parameter.parameter_id,),
+        ((0.003,), (0.0002,), (0.004,)),
+    )
+    document = replace(document, scan_table=table)
+    artifact = compile_pulse_artifact(
+        document,
+        clock_hz=sequencer.clock_hz,
+        execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
+        trigger_channels=("ch11",),
+        live_target=document.target,
+    )
+    schedule = artifact.trigger_schedules[0]
+    assert tuple(edge.point_index for edge in schedule.edges) == (0, 1, 2)
+    intervals = tuple(
+        right.tick_from_run_start - left.tick_from_run_start
+        for left, right in zip(schedule.edges, schedule.edges[1:])
+    )
+    assert schedule.minimum_interval_ticks == min(intervals)
+    required = float(
+        np.nextafter(
+            min(intervals) / artifact.target_ir.clock_hz,
+            np.inf,
+        )
+    )
+    current_schema = capture.measurement.capture_contract.dataset_schema
+    scan_axis = _axis("scan", SCAN_POINT, 3)
+    event_axis = _axis("frame", READOUT_EVENT, 1)
+    schedule_schema = DatasetSchema(
+        current_schema.repeat_axis,
+        (scan_axis, event_axis),
+        PointLayout.rect_c((3, 1)),
+        current_schema.cell_schema,
+    )
+    plan = compile_capture_cell_plan(
+        artifact,
+        "ch11",
+        schedule_schema,
+        readout_event_axis_id=event_axis.axis_id,
+        scan_point_layout=PointLayout.rect_c((3,)),
+    )
+    try:
+        with pytest.raises(ValueError, match="shorter.*required external trigger"):
+            validate_single_trigger_capture_binding(
+                capture_spec=capture.measurement.capture_spec,
+                contract=_contract_with_required_trigger_interval(capture, required),
+                pulse_binding=PulseCaptureBinding(artifact, "ch11", plan),
+            )
+        assert sequencer.history == []
+    finally:
+        assert runtime.shutdown(timeout=2.0)
+
+
 def test_camera_is_armed_before_one_fire_and_all_frames_are_exactly_materialized():
     runtime, camera, sequencer, capture, document, pulse_port, artifact, plan = _runtime()
     assert plan is not None
@@ -208,16 +435,16 @@ def test_camera_is_armed_before_one_fire_and_all_frames_are_exactly_materialized
     try:
         result = runtime.controller.run(compile_triggered_pipeline(spec))
         assert armed_at_fire == [True]
-        assert result.dataset.block.values.shape == (1, 3, 6, 8)
-        assert np.all(result.dataset.block.validity)
-        assert [item.source_ordinal for item in result.dataset.event_metadata] == [0, 1, 2]
-        assert [item.produced_count for item in result.dataset.event_metadata] == [1, 2, 3]
-        assert result.capture_terminal.produced_count == 3
+        assert result.capture.dataset.block.values.shape == (1, 3, 6, 8)
+        assert np.all(result.capture.dataset.block.validity)
+        assert [item.source_ordinal for item in result.capture.dataset.event_metadata] == [0, 1, 2]
+        assert [item.produced_count for item in result.capture.dataset.event_metadata] == [1, 2, 3]
+        assert result.capture.capture_terminal.produced_count == 3
         assert (
-            result.pulse_terminal.expected_trigger_counts_from_completed_schedule
+            result.lineage.terminal.expected_trigger_counts_from_completed_schedule
             == (("ch11", 3),)
         )
-        assert result.pulse_terminal.evidence_kind is PulseTerminalEvidenceKind.SIMULATED
+        assert result.lineage.terminal.evidence_kind is PulseTerminalEvidenceKind.SIMULATED
         assert [item["action"] for item in sequencer.history] == [
             "prepare",
             "fire",
@@ -231,10 +458,28 @@ def test_camera_is_armed_before_one_fire_and_all_frames_are_exactly_materialized
                 object(),
                 capture=result.capture,
                 pulse_session_id=result.pulse_session_id,
-                pulse_terminal=result.pulse_terminal,
-                trigger_channel=result.trigger_channel,
-                compiled_artifact=result.compiled_artifact,
-                cell_plan=result.cell_plan,
+                lineage=result.lineage,
+            )
+        tampered_receipt = replace(
+            result.lineage.terminal.receipt,
+            expected_trigger_counts_from_completed_schedule=(("ch11", 2),),
+        )
+        with pytest.raises(ValueError, match="expected counts differ"):
+            PulseCaptureLineage(
+                result.lineage.binding,
+                replace(result.lineage.terminal, receipt=tampered_receipt),
+            )
+        with pytest.raises(ValueError, match="trigger channel differs"):
+            PulseCaptureBinding(
+                artifact,
+                "ch11",
+                replace(plan, trigger_channel="ch12"),
+            )
+        with pytest.raises(ValueError, match="schedule digest differs"):
+            PulseCaptureBinding(
+                artifact,
+                "ch11",
+                replace(plan, trigger_schedule_digest="0" * 64),
             )
         assert dict(sequencer.snapshot())["state"] == "safe"
         state = camera._recent_state()
@@ -296,8 +541,8 @@ def test_triggered_capture_rejects_a_terminal_from_another_pulse_session(
 
         def stale_complete(self, context):
             current = original_complete(self, context)
-            assert current.session_id != first.pulse_terminal.session_id
-            return first.pulse_terminal
+            assert current.session_id != first.lineage.terminal.session_id
+            return first.lineage.terminal
 
         monkeypatch.setattr(
             timing_capture.PulseSession,
@@ -338,7 +583,7 @@ def test_triggered_capture_rejects_a_stale_receipt_rebadged_to_current_session(
         def rebadged_complete(self, context):
             current = original_complete(self, context)
             return replace(
-                first.pulse_terminal,
+                first.lineage.terminal,
                 session_id=current.session_id,
             )
 
@@ -445,10 +690,10 @@ def test_repeated_three_event_capture_streams_all_frames_through_bounded_ring():
     )
     try:
         result = runtime.controller.run(compile_triggered_pipeline(spec))
-        assert result.dataset.block.values.shape == (12, 3, 6, 8)
-        assert result.capture_terminal.produced_count == 36
-        assert result.capture_terminal.drained_count == 36
-        assert tuple(item.source_ordinal for item in result.dataset.event_metadata) == tuple(
+        assert result.capture.dataset.block.values.shape == (12, 3, 6, 8)
+        assert result.capture.capture_terminal.produced_count == 36
+        assert result.capture.capture_terminal.drained_count == 36
+        assert tuple(item.source_ordinal for item in result.capture.dataset.event_metadata) == tuple(
             range(36)
         )
         state = camera._recent_state()
@@ -553,14 +798,17 @@ def test_triggered_capture_artifact_persists_pulse_lineage(tmp_path):
         )
         stored = repository.load(reference)
         lineage = stored.pulse_lineage
-        assert lineage is not None
-        assert lineage.compiled_artifact_digest == artifact.fingerprint
-        assert lineage.source_document_digest == document.fingerprint
-        assert lineage.execution_form is PulseExecutionForm.STATIC_ONCE
+        assert isinstance(lineage, PulseCaptureLineage)
+        assert lineage.compiled_artifact.fingerprint == artifact.fingerprint
+        assert lineage.compiled_artifact.source_document_digest == document.fingerprint
+        assert lineage.compiled_artifact.execution_form is PulseExecutionForm.STATIC_ONCE
         assert lineage.trigger_channel == "ch11"
         assert lineage.expected_trigger_count == 3
         assert lineage.cell_plan == plan
-        assert lineage.cell_plan.dataset_schema_fingerprint == stored.block.schema.fingerprint
+        assert (
+            lineage.cell_plan.dataset_schema_fingerprint
+            == stored.frame_source.schema.fingerprint
+        )
         assert lineage.cell_plan.cell_permutation_digest == stored.provenance.join_plan_digest
         assert isinstance(lineage.terminal.receipt, SimulatedPulseReceipt)
         assert lineage.terminal.evidence_kind is PulseTerminalEvidenceKind.SIMULATED
@@ -569,7 +817,7 @@ def test_triggered_capture_artifact_persists_pulse_lineage(tmp_path):
             stored.camera_provenance
             == capture.measurement.capture_contract.camera_provenance
         )
-        assert stored.source_cell_schedule == plan.expected_cells
+        assert stored.frame_source.cell_schedule == plan.expected_cells
         assert stored.run_id == stored.provenance.trace_binding.run_id
         assert stored.safety_bundle_id is not None
         assert len(stored.chain_contract_digest) == 64

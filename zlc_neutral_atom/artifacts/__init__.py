@@ -10,8 +10,8 @@ from .capture import (
     CaptureResourceExceeded,
     DEFAULT_CAPTURE_REPOSITORY_RESOURCE_POLICY,
     compile_capture_artifact_pipeline,
-    PulseCaptureLineage,
 )
+from .capture_frames import CaptureFrameSource
 from .capture_fit import (
     AdmittedCaptureFitResult,
     CAPTURE_FIT_RESULT_ARTIFACT_SCHEMA,
@@ -24,12 +24,12 @@ __all__ = [
     "CAPTURE_ARTIFACT_SCHEMA",
     "CaptureArtifact",
     "CaptureArtifactRef",
+    "CaptureFrameSource",
     "CaptureRepository",
     "CaptureRepositoryResourcePolicy",
     "CaptureResourceExceeded",
     "DEFAULT_CAPTURE_REPOSITORY_RESOURCE_POLICY",
     "compile_capture_artifact_pipeline",
-    "PulseCaptureLineage",
     "AdmittedCaptureFitResult",
     "CAPTURE_FIT_RESULT_ARTIFACT_SCHEMA",
     "CaptureFitResultRepository",

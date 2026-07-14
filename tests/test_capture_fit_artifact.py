@@ -77,12 +77,12 @@ def _execution(fit_repository, capture_repository, capture_reference):
     source = capture_repository.admit(capture_reference)
     scan_axes = tuple(
         axis.axis_id
-        for axis in source.artifact.block.schema.point_axes
+        for axis in source.artifact.frame_source.schema.point_axes
         if axis.role == SCAN_POINT
     )
     assert len(scan_axes) == 1
     spec = fit_spec_for(
-        source.artifact.block.schema,
+        source.artifact.frame_source.schema,
         "exponential_decay",
         fit_axis_ids=scan_axes,
     )

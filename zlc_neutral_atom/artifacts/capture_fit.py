@@ -32,6 +32,7 @@ from zlc_storage import (
     decode,
     encode,
     exact_mapping,
+    positive_integer,
 )
 
 from zlc_neutral_atom.capture_reference import (
@@ -47,15 +48,22 @@ CAPTURE_FIT_RESULT_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureFitResultArtifact"
 
 _FIT_EXECUTION_TOKEN = object()
 _ADMITTED_FIT_TOKEN = object()
+_DEFAULT_MATERIALIZATION_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
 
 
-def _capture_snapshot(admission: AdmittedCapture) -> OwnedSnapshot:
+def _capture_snapshot(
+    admission: AdmittedCapture,
+    memory_limit_bytes: int,
+) -> OwnedSnapshot:
     if type(admission) is not AdmittedCapture:
         raise TypeError("capture source must be an AdmittedCapture")
     capture = admission.artifact
+    block = capture.frame_source.materialize(
+        memory_limit_bytes=memory_limit_bytes,
+    )
     return OwnedSnapshot(
-        capture.block.ref(capture.provenance.generation),
-        capture.block,
+        block.ref(capture.provenance.generation),
+        block,
     )
 
 
@@ -205,6 +213,7 @@ class CaptureFitResultRepository:
         "_lifecycle_lock",
         "_store",
         "_store_authority",
+        "materialization_memory_limit_bytes",
     )
 
     def __init_subclass__(cls, **_kwargs) -> None:
@@ -217,9 +226,16 @@ class CaptureFitResultRepository:
         root: str | Path,
         *,
         repository_id: str = "zlc-neutral-capture-fit",
+        materialization_memory_limit_bytes: int = (
+            _DEFAULT_MATERIALIZATION_MEMORY_LIMIT_BYTES
+        ),
     ) -> None:
         self.root = Path(root).expanduser().resolve()
         self.repository_id = canonical_text(repository_id, "repository_id")
+        self.materialization_memory_limit_bytes = positive_integer(
+            materialization_memory_limit_bytes,
+            "materialization_memory_limit_bytes",
+        )
         lease = RepositoryRootLease(
             self.root,
             owner=f"capture-fit:{self.repository_id}",
@@ -260,7 +276,10 @@ class CaptureFitResultRepository:
     ) -> FitExecution:
         with self._lifecycle_lock:
             self._require_integrity()
-        snapshot = _capture_snapshot(source)
+        snapshot = _capture_snapshot(
+            source,
+            self.materialization_memory_limit_bytes,
+        )
         result = bind_fit(spec, snapshot.block.schema).run(snapshot)
         with self._lifecycle_lock:
             self._require_integrity()
@@ -348,7 +367,13 @@ class CaptureFitResultRepository:
                 )
             )
             source = capture_repository.admit(source_ref)
-            validate_fit_result_binding(result, _capture_snapshot(source))
+            validate_fit_result_binding(
+                result,
+                _capture_snapshot(
+                    source,
+                    self.materialization_memory_limit_bytes,
+                ),
+            )
             return AdmittedCaptureFitResult(
                 _ADMITTED_FIT_TOKEN,
                 reference=reference,

@@ -255,24 +255,6 @@ class CompiledCaptureCellPlan:
                     "capture plan assignment differs from persisted scan layout"
                 )
 
-    def validate_against(
-        self,
-        artifact: CompiledPulseArtifact,
-        dataset_schema: DatasetSchema,
-    ) -> None:
-        """Recompile from both authorities and require byte-exact plan identity."""
-
-        rebuilt = compile_capture_cell_plan(
-            artifact,
-            self.trigger_channel,
-            dataset_schema,
-            readout_event_axis_id=self.readout_event_axis_id,
-            scan_point_layout=self.scan_point_layout,
-            within_point_grouping=self.within_point_grouping,
-        )
-        if rebuilt != self:
-            raise ValueError("capture cell plan differs from compiled pulse and DatasetSchema")
-
     @property
     def total_events(self) -> int:
         return len(self.assignments)

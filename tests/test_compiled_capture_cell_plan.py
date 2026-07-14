@@ -23,7 +23,7 @@ from zlc_data import (
     ValueSchema,
 )
 from zlc_neutral_atom.runtime import DatasetCellAddress
-from zlc_neutral_atom.timing import (
+from zlc_neutral_atom.timing.capture_plan import (
     CaptureCellAssignment,
     CompiledCaptureCellPlan,
     compile_capture_cell_plan,
@@ -31,6 +31,7 @@ from zlc_neutral_atom.timing import (
     encode_compiled_capture_cell_plan,
     repeat_major_capture_grouping,
 )
+from zlc_neutral_atom.timing.lineage import PulseCaptureBinding
 from zlc_pulse import (
     PulseExecutionForm,
     PulseFieldRef,
@@ -339,8 +340,10 @@ def test_explicit_repeat_major_and_event_major_groupings_remain_distinct():
         DatasetCellAddress(1, 1),
     )
     assert repeat_major != event_major
-    repeat_major.validate_against(artifact, schema)
-    event_major.validate_against(artifact, schema)
+    PulseCaptureBinding(artifact, "ch11", repeat_major)
+    PulseCaptureBinding(artifact, "ch11", event_major)
+    repeat_major.validate_dataset_schema(schema)
+    event_major.validate_dataset_schema(schema)
 
 
 @pytest.mark.parametrize(
@@ -394,5 +397,23 @@ def test_persisted_scan_layout_is_revalidated_not_only_hashed():
     )
     with pytest.raises(ValueError, match="persisted scan layout"):
         tampered.validate_dataset_schema(schema)
-    with pytest.raises(ValueError, match="compiled pulse and DatasetSchema"):
-        tampered.validate_against(artifact, schema)
+
+    assignments = tuple(
+        replace(
+            item,
+            pulse_point_index=(
+                1
+                if item.pulse_point_index == 0
+                else 0
+                if item.pulse_point_index == 1
+                else item.pulse_point_index
+            ),
+        )
+        for item in plan.assignments
+    )
+    with pytest.raises(ValueError, match="edge association differs"):
+        PulseCaptureBinding(
+            artifact,
+            "ch11",
+            replace(plan, assignments=assignments),
+        )

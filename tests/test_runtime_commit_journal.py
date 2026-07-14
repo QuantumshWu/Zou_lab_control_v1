@@ -17,6 +17,7 @@ from zlc_neutral_atom.runtime import (
     CommitSubject,
     CommitTarget,
     MemoryCommitJournal,
+    PublishVisibilityUnknown,
     PublishedManifest,
     FinalCommit,
 )
@@ -25,12 +26,134 @@ from zlc_neutral_atom.runtime.commit import (
     RepositoryCommitCoordinator,
     _consume_commit_authority,
     _journal_mutation_authority,
+    publish_manifest_with_visibility_reconciliation,
     reconcile_pending_commits,
 )
-from zlc_storage import RepositoryRootLease
+from zlc_storage import ContentRef, RepositoryRootLease, StoredManifest, sha256_digest
 
 
 REPOSITORY_ID = "test-repository"
+MANIFEST_NAMESPACE = "test-manifest"
+MANIFEST_PAYLOAD = b"expected manifest payload"
+MANIFEST_DIGEST = sha256_digest(MANIFEST_PAYLOAD)
+
+
+class _ManifestFaultAuthority:
+    def __init__(
+        self,
+        *,
+        publish_result=None,
+        publish_error: BaseException | None = None,
+        visible: bytes | None = None,
+        read_error: BaseException | None = None,
+    ) -> None:
+        self.publish_result = publish_result
+        self.publish_error = publish_error
+        self.visible = visible
+        self.read_error = read_error
+        self.publish_calls = []
+        self.read_calls = []
+
+    def publish_manifest(self, namespace, payload, *, expected_digest=None):
+        self.publish_calls.append((namespace, payload, expected_digest))
+        if self.publish_error is not None:
+            raise self.publish_error
+        return self.publish_result
+
+    def read_manifest(self, namespace, digest, *, max_bytes=None):
+        self.read_calls.append((namespace, digest, max_bytes))
+        if self.read_error is not None:
+            raise self.read_error
+        return self.visible
+
+
+def _publish_with_reconciliation(authority):
+    return publish_manifest_with_visibility_reconciliation(
+        authority,
+        MANIFEST_NAMESPACE,
+        MANIFEST_PAYLOAD,
+        expected_digest=MANIFEST_DIGEST,
+        max_bytes=4096,
+    )
+
+
+def test_manifest_visibility_reconciliation_returns_success_without_readback():
+    stored = StoredManifest(
+        MANIFEST_NAMESPACE,
+        ContentRef(MANIFEST_DIGEST, len(MANIFEST_PAYLOAD)),
+    )
+    authority = _ManifestFaultAuthority(publish_result=stored)
+
+    assert _publish_with_reconciliation(authority) is stored
+    assert authority.publish_calls == [
+        (MANIFEST_NAMESPACE, MANIFEST_PAYLOAD, MANIFEST_DIGEST)
+    ]
+    assert authority.read_calls == []
+
+
+def test_manifest_visibility_reconciliation_propagates_explicit_unknown():
+    unknown = PublishVisibilityUnknown("storage owner already classified visibility")
+    authority = _ManifestFaultAuthority(publish_error=unknown)
+
+    with pytest.raises(PublishVisibilityUnknown) as failure:
+        _publish_with_reconciliation(authority)
+
+    assert failure.value is unknown
+    assert authority.read_calls == []
+
+
+def test_manifest_visibility_reconciliation_absence_preserves_publish_failure():
+    publish_error = OSError("publication failed before replace")
+    authority = _ManifestFaultAuthority(
+        publish_error=publish_error,
+        read_error=FileNotFoundError("manifest absent"),
+    )
+
+    with pytest.raises(OSError) as failure:
+        _publish_with_reconciliation(authority)
+
+    assert failure.value is publish_error
+    assert authority.read_calls == [(MANIFEST_NAMESPACE, MANIFEST_DIGEST, 4096)]
+
+
+def test_manifest_visibility_reconciliation_expected_visible_is_unknown():
+    publish_error = OSError("durability acknowledgement failed")
+    authority = _ManifestFaultAuthority(
+        publish_error=publish_error,
+        visible=MANIFEST_PAYLOAD,
+    )
+
+    with pytest.raises(PublishVisibilityUnknown, match="acknowledgement") as failure:
+        _publish_with_reconciliation(authority)
+
+    assert failure.value.__cause__ is publish_error
+
+
+def test_manifest_visibility_reconciliation_unexpected_bytes_are_unknown():
+    publish_error = OSError("durability acknowledgement failed")
+    authority = _ManifestFaultAuthority(
+        publish_error=publish_error,
+        visible=b"unexpected manifest payload",
+    )
+
+    with pytest.raises(PublishVisibilityUnknown, match="unexpected bytes") as failure:
+        _publish_with_reconciliation(authority)
+
+    assert failure.value.__cause__ is publish_error
+
+
+def test_manifest_visibility_reconciliation_unreadable_target_is_unknown():
+    publish_error = OSError("durability acknowledgement failed")
+    visibility_error = PermissionError("visible target cannot be read")
+    authority = _ManifestFaultAuthority(
+        publish_error=publish_error,
+        read_error=visibility_error,
+    )
+
+    with pytest.raises(PublishVisibilityUnknown, match="could not be verified") as failure:
+        _publish_with_reconciliation(authority)
+
+    assert failure.value.__cause__ is visibility_error
 
 
 def mutation(journal: PersistentCommitJournal):
@@ -83,6 +206,7 @@ def test_durable_commit_writer_types_are_not_public_runtime_api(tmp_path):
     for name in (
         "PersistentCommitJournal",
         "RepositoryCommitCoordinator",
+        "publish_manifest_with_visibility_reconciliation",
         "reconcile_pending_commits",
     ):
         assert not hasattr(runtime_api, name)

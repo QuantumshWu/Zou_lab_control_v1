@@ -27,7 +27,6 @@ from zlc_neutral_atom import artifacts as artifact_api
 from zlc_neutral_atom.runtime import (
     CommitIntent,
     CommitKind,
-    CommitRecovery,
     CommitTarget,
     PublishVisibilityUnknown,
     RunFailed,
@@ -35,15 +34,13 @@ from zlc_neutral_atom.runtime import (
 )
 from zlc_neutral_atom.runtime.commit import (
     PersistentCommitJournal,
-    RepositoryCommitCoordinator,
     _journal_mutation_authority,
 )
 from zlc_storage import (
     ContentAddressedStore,
-    ContentRef,
     DirectoryDurabilityError,
     RepositoryRootBusy,
-    RepositoryRootLease,
+    content_ref_from_tree,
     decode,
 )
 
@@ -480,6 +477,7 @@ def test_checkpoint_and_final_admission_are_process_local_and_final_wins(
     assert admitted.commit_kind is CommitKind.FINAL
     assert admitted.commit_id.startswith("capture-final-")
     assert len(admitted.evidence_digest) == 64
+    assert admitted._matches_admission(repository.admit(reference))
     with pytest.raises(TypeError, match="process-local"):
         pickle.dumps(admitted)
     with pytest.raises(AttributeError, match="immutable"):
@@ -496,6 +494,7 @@ def test_checkpoint_and_final_admission_are_process_local_and_final_wins(
     reopened_admitted = reopened.admit(reference)
     assert reopened_admitted.commit_kind is CommitKind.FINAL
     assert reopened_admitted.evidence_digest == admitted.evidence_digest
+    assert not admitted._matches_admission(reopened_admitted)
 
 
 def test_checkpoint_only_capture_is_admitted_as_checkpoint(
@@ -516,7 +515,7 @@ def test_checkpoint_only_capture_is_admitted_as_checkpoint(
     assert admitted.commit_id.startswith("capture-checkpoint-")
 
 
-def test_repository_is_final_and_rejects_shadow_or_authority_drift(tmp_path):
+def test_repository_is_final_and_sealed(tmp_path):
     repository = CaptureRepository(tmp_path / "captures", repository_id="captures")
     with pytest.raises(TypeError, match="final"):
         class _RepositorySubclass(CaptureRepository):
@@ -531,61 +530,8 @@ def test_repository_is_final_and_rejects_shadow_or_authority_drift(tmp_path):
         with pytest.raises(AttributeError, match="immutable"):
             setattr(repository, name, value)
 
-    original_root = repository.root
-    object.__setattr__(repository, "root", (tmp_path / "redirected").resolve())
-    try:
-        with pytest.raises(RuntimeError, match="authority changed"):
-            _ = repository.startup_reconciliations
-    finally:
-        object.__setattr__(repository, "root", original_root)
 
-    original_id = repository.repository_id
-    object.__setattr__(repository, "repository_id", "redirected")
-    try:
-        with pytest.raises(RuntimeError, match="authority changed"):
-            _ = repository.startup_reconciliations
-    finally:
-        object.__setattr__(repository, "repository_id", original_id)
-
-    fake_store = ContentAddressedStore(tmp_path / "fake-store")
-    original_store = repository._store
-    object.__setattr__(repository, "_store", fake_store)
-    try:
-        with pytest.raises(RuntimeError, match="authority changed"):
-            _ = repository.startup_reconciliations
-    finally:
-        object.__setattr__(repository, "_store", original_store)
-
-    fake_root = tmp_path / "fake-repository"
-    fake_lease = RepositoryRootLease(fake_root, owner="fake-capture")
-    fake_journal = PersistentCommitJournal(
-        fake_root / "fake-commit.journal",
-        repository.repository_id,
-    )
-    original_journal = repository._journal
-    object.__setattr__(repository, "_journal", fake_journal)
-    try:
-        with pytest.raises(RuntimeError, match="authority changed"):
-            _ = repository.startup_reconciliations
-    finally:
-        object.__setattr__(repository, "_journal", original_journal)
-
-    fake_coordinator = RepositoryCommitCoordinator(
-        fake_journal,
-        lambda _intent: CommitRecovery(False),
-        root_lease=fake_lease,
-    )
-    original_coordinator = repository._coordinator
-    object.__setattr__(repository, "_coordinator", fake_coordinator)
-    try:
-        with pytest.raises(RuntimeError, match="authority changed"):
-            _ = repository.startup_reconciliations
-    finally:
-        object.__setattr__(repository, "_coordinator", original_coordinator)
-        fake_lease.close()
-
-
-def test_repository_copies_caller_policy_and_detects_internal_policy_drift(tmp_path):
+def test_repository_defensively_copies_caller_policy(tmp_path):
     caller_policy = CaptureRepositoryResourcePolicy(max_cells=17)
     repository = CaptureRepository(
         tmp_path / "captures",
@@ -598,19 +544,15 @@ def test_repository_copies_caller_policy_and_detects_internal_policy_drift(tmp_p
     assert repository.resource_policy.max_cells == 17
     assert repository.startup_reconciliations == ()
 
-    object.__setattr__(repository.resource_policy, "max_cells", 1)
-    with pytest.raises(RuntimeError, match="authority changed"):
-        _ = repository.startup_reconciliations
-
 
 @pytest.mark.parametrize(
     ("field", "limit", "message"),
     (
-        ("max_cells", 1, "metadata count"),
+        ("max_cells", 1, "frame storage"),
         ("max_manifest_bytes", 1, "manifest"),
-        ("max_data_block_blob_bytes", 1, "DataBlock blob"),
-        ("max_data_array_bytes", 1, "DataBlock arrays"),
-        ("max_metadata_blob_bytes", 1, "metadata blob"),
+        ("max_total_frame_bytes", 1, "frame storage"),
+        ("max_frame_chunk_blob_bytes", 1, "frame storage"),
+        ("max_frame_index_blob_bytes", 1, "frame-index"),
     ),
 )
 def test_load_rejects_whole_oversized_multidimensional_content_without_reduction(
@@ -637,7 +579,7 @@ def test_load_rejects_whole_oversized_multidimensional_content_without_reduction
         reopened.load(reference)
 
 
-def test_cell_budget_rejects_manifest_before_canonical_value_materialization(
+def test_cell_budget_rejects_frame_index_before_its_value_materialization(
     tmp_path,
     capture_runtime,
     monkeypatch,
@@ -655,18 +597,22 @@ def test_cell_budget_rejects_manifest_before_canonical_value_materialization(
             max_cells=1,
         ),
     )
-    materialized = False
+    top_level_decodes = 0
     real_decode_value = canonical._decode_value
 
     def observed_materialization(*args, **kwargs):
-        nonlocal materialized
-        materialized = True
+        nonlocal top_level_decodes
+        if kwargs.get("path") == "$":
+            top_level_decodes += 1
         return real_decode_value(*args, **kwargs)
 
     monkeypatch.setattr(canonical, "_decode_value", observed_materialization)
-    with pytest.raises(CaptureResourceExceeded, match="metadata count"):
+    with pytest.raises(CaptureResourceExceeded, match="frame storage"):
         constrained.load(reference)
-    assert not materialized
+    # The small capture manifest is decoded once to find its frame-index ref;
+    # the oversized frame index itself is rejected by structural admission
+    # before a second top-level value materialization.
+    assert top_level_decodes == 1
     constrained.close()
 
 
@@ -688,11 +634,15 @@ def test_visible_manifest_with_missing_blob_fails_recovery_closed(
         _pending_intent(reference, artifact, kind=CommitKind.FINAL)
     )
     manifest = _manifest(repository, reference)
-    block_ref = ContentRef(
-        manifest["data_block_blob"]["digest"],
-        manifest["data_block_blob"]["size"],
+    frame_index_ref = content_ref_from_tree(manifest["frame_index_blob"])
+    frame_index = decode(
+        repository._store_authority.read_blob(
+            frame_index_ref,
+            max_bytes=repository.resource_policy.max_frame_index_blob_bytes,
+        )
     )
-    repository._store._blob_path(block_ref.digest).unlink()
+    chunk_ref = content_ref_from_tree(frame_index["frame_chunks"][0])
+    repository._store._blob_path(chunk_ref.digest).unlink()
     repository.close()
 
     with pytest.raises(FileNotFoundError):
