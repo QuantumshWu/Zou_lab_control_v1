@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import threading
 from dataclasses import dataclass
 from numbers import Integral
@@ -58,6 +57,7 @@ from zlc_neutral_atom.runtime import (
     CompleteCaptureCommand,
     DatasetCellAddress,
     MeasurementDefinition,
+    OrderedDatasetMetadataHasher,
     PrepareCaptureCommand,
     ProducerFlowControl,
     ReadCaptureCommand,
@@ -304,7 +304,7 @@ class _EndpointSession:
     spec_fingerprint: str
     expected_frames: int
     payload_contract: CameraSampleContract
-    metadata_hasher: object
+    metadata_hasher: OrderedDatasetMetadataHasher
     started: bool = False
     drained_count: int = 0
     terminal: object | None = None
@@ -661,14 +661,14 @@ class CameraCaptureEndpoint:
                 raise ValueError(
                     "free-running cameras are monitor sources, not finite exact captures"
                 )
-            hasher = hashlib.sha256()
-            hasher.update(payload_contract.metadata_contract.fingerprint.encode("ascii"))
             self._session = _EndpointSession(
                 command.session_id,
                 command.capture_spec_fingerprint,
                 spec.expected_frames,
                 payload_contract,
-                hasher,
+                OrderedDatasetMetadataHasher(
+                    payload_contract.metadata_contract.fingerprint
+                ),
             )
             return CapturePreparedAck(
                 command.session_id,
@@ -755,7 +755,7 @@ class CameraCaptureEndpoint:
             session = self._active_session(binding, command.session_id)
             if session.closed or session.drained_count != expected_ordinal:
                 raise RuntimeError("camera session changed during frame read")
-            session.metadata_hasher.update(metadata_digest.encode("ascii"))
+            session.metadata_hasher.update(metadata_digest)
             session.drained_count += 1
         return CapturedPayloadAck(
             command.session_id,
@@ -819,7 +819,7 @@ class CameraCaptureEndpoint:
                 terminal.source_stopped,
                 terminal.no_more_frames,
                 terminal.joined,
-                session.metadata_hasher.hexdigest(),
+                session.metadata_hasher.digest(),
                 self._settings_fingerprint,
                 self._capability_fingerprint,
                 session.spec_fingerprint,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 from enum import Enum
 from types import MappingProxyType
@@ -39,6 +39,7 @@ from zlc_neutral_atom.runtime.dataset import (
     DuplicateDatasetCell,
     FrozenDatasetEdge,
     MissingDatasetCells,
+    OrderedDatasetEventHasher,
     OrderedDatasetMetadataHasher,
     SnapshotExpired,
     SealedDatasetArtifact,
@@ -48,6 +49,8 @@ from zlc_neutral_atom.runtime.dataset import (
 )
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionStream,
+    EventId,
+    EventRef,
     ReservationCapacityExceeded,
     StreamEndedEarly,
     StreamId,
@@ -61,24 +64,75 @@ FINGERPRINT = "3" * 64
 TRACE_BINDING = TraceBinding("run", "camera")
 
 
-def test_ordered_metadata_hasher_owns_the_exact_digest_algorithm():
+def test_ordered_metadata_hasher_matches_frozen_golden_and_preserves_order():
     fingerprint = "a" * 64
     metadata_digests = ("b" * 64, "c" * 64)
-    expected = hashlib.sha256()
-    expected.update(fingerprint.encode("ascii"))
-    for digest in metadata_digests:
-        expected.update(digest.encode("ascii"))
+    expected = "b20dd8bdd812e18599a5f4b49437265f5ef51619181f1b0f6f57775bf1fbae60"
 
     hasher = OrderedDatasetMetadataHasher(fingerprint)
     for digest in metadata_digests:
         hasher.update(digest)
 
-    assert hasher.digest() == expected.hexdigest()
-    assert hasher.digest() == expected.hexdigest()
+    assert hasher.digest() == expected
+    assert hasher.digest() == expected
+
+    reversed_order = OrderedDatasetMetadataHasher(fingerprint)
+    for digest in reversed(metadata_digests):
+        reversed_order.update(digest)
+    changed_content = OrderedDatasetMetadataHasher(fingerprint)
+    for digest in (metadata_digests[0], "d" * 64):
+        changed_content.update(digest)
+    assert reversed_order.digest() != expected
+    assert changed_content.digest() != expected
+
     with pytest.raises(ValueError, match="SHA-256"):
         OrderedDatasetMetadataHasher("not-a-digest")
     with pytest.raises(ValueError, match="SHA-256"):
         hasher.update("not-a-digest")
+
+
+def test_ordered_dataset_event_hasher_matches_frozen_golden_and_all_identities():
+    stream_id = StreamId("camera.exact")
+    generation = StreamGenerationId("generation-one")
+    references = tuple(
+        EventRef(
+            stream_id,
+            generation,
+            sequence,
+            EventId(f"event-{sequence}"),
+            f"{sequence + 1:064x}",
+        )
+        for sequence in range(3)
+    )
+    metadata_digests = ("b" * 64, "c" * 64, "d" * 64)
+
+    def digest(refs, metadata):
+        hasher = OrderedDatasetEventHasher(stream_id, generation, 0)
+        for reference, metadata_digest in zip(refs, metadata, strict=True):
+            hasher.update(reference, metadata_digest)
+        return hasher.digest(3)
+
+    expected = "bc8f115874accd1f02060c18c48939e9360992c4ab033579694b8a630a072433"
+    assert digest(references, metadata_digests) == expected
+
+    assert digest(
+        (references[0], replace(references[1], event_id=EventId("changed-event")), references[2]),
+        metadata_digests,
+    ) != expected
+    assert digest(
+        (references[0], replace(references[1], payload_digest="f" * 64), references[2]),
+        metadata_digests,
+    ) != expected
+    assert digest(references, (metadata_digests[0], "e" * 64, metadata_digests[2])) != expected
+
+    discontinuous = OrderedDatasetEventHasher(stream_id, generation, 0)
+    with pytest.raises(ValueError, match="stream/generation/sequence"):
+        discontinuous.update(references[1], metadata_digests[0])
+    complete = OrderedDatasetEventHasher(stream_id, generation, 0)
+    for reference, metadata_digest in zip(references, metadata_digests, strict=True):
+        complete.update(reference, metadata_digest)
+    with pytest.raises(ValueError, match="incomplete coverage"):
+        complete.digest(2)
 
 
 def axis(name: str, role, size: int) -> AxisSpec:

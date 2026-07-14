@@ -57,7 +57,7 @@ SCALAR_SCHEMA = ValueSchema((), ValidityContract.value(), np.dtype("<f8"))
 TRACE_BINDING = TraceBinding("run-one", "camera-one")
 
 
-def test_ordered_event_span_hasher_is_canonical_contiguous_and_owner_independent():
+def test_ordered_event_span_hasher_matches_frozen_golden_and_rejects_drift():
     stream_id = StreamId("camera.exact")
     generation = StreamGenerationId("generation-one")
     references = tuple(
@@ -72,11 +72,9 @@ def test_ordered_event_span_hasher_is_canonical_contiguous_and_owner_independent
     )
 
     producer_owner = OrderedEventSpanHasher(stream_id, generation, 0)
-    consumer_owner = OrderedEventSpanHasher(stream_id, generation, 0)
     changed_owner = OrderedEventSpanHasher(stream_id, generation, 0)
     for reference in references:
         producer_owner.update(reference)
-        consumer_owner.update(reference)
         changed_owner.update(
             EventRef(
                 stream_id,
@@ -90,7 +88,9 @@ def test_ordered_event_span_hasher_is_canonical_contiguous_and_owner_independent
         )
 
     producer_span = producer_owner.seal(3)
-    assert consumer_owner.seal(3) == producer_span
+    assert producer_span.ordered_digest == (
+        "d49a43d8dd78705137efee489fe682478ef97bcd80307bbe2eb40be0ac844d42"
+    )
     assert changed_owner.seal(3).ordered_digest != producer_span.ordered_digest
 
     changed_payload_owner = OrderedEventSpanHasher(stream_id, generation, 0)

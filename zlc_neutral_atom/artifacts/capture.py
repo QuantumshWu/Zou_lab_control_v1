@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -72,6 +71,7 @@ from zlc_neutral_atom.runtime.capture import (
 from zlc_neutral_atom.runtime.dataset import (
     DatasetCoverage,
     DatasetSealProvenance,
+    OrderedDatasetMetadataHasher,
     dataset_cell_permutation_digest,
     dataset_consumer_contract_digest,
 )
@@ -463,13 +463,12 @@ class CaptureArtifact:
         metadata_contract = CameraFrameMetadataContract()
         if self.provenance.metadata_contract_fingerprint != metadata_contract.fingerprint:
             raise ValueError("capture metadata contract is not the current camera contract")
-        hasher = hashlib.sha256()
-        hasher.update(metadata_contract.fingerprint.encode("ascii"))
+        hasher = OrderedDatasetMetadataHasher(metadata_contract.fingerprint)
         for item in metadata:
             metadata_contract.validate(item)
             metadata_digest = metadata_contract.digest(item)
-            hasher.update(metadata_digest.encode("ascii"))
-        if hasher.hexdigest() != self.provenance.ordered_metadata_digest:
+            hasher.update(metadata_digest)
+        if hasher.digest() != self.provenance.ordered_metadata_digest:
             raise ValueError("capture metadata sequence digest differs from provenance")
         if (
             self.terminal.produced_count != count

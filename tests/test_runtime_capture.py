@@ -50,6 +50,7 @@ from zlc_neutral_atom.runtime.dataset import (
     DatasetCellAddress,
     DatasetMode,
     FrozenDatasetEdge,
+    OrderedDatasetMetadataHasher,
     SealedDatasetArtifact,
     dataset_cell_key_fingerprint,
 )
@@ -305,13 +306,12 @@ def cells(dataset_schema: DatasetSchema) -> tuple[DatasetCellAddress, ...]:
 
 
 def metadata_digest(payloads, contract, count: int) -> str:
-    hasher = hashlib.sha256()
-    hasher.update(contract.fingerprint.encode("ascii"))
+    hasher = OrderedDatasetMetadataHasher(contract.fingerprint)
     for payload in payloads[:count]:
         frozen = payload if not payload.pixels.flags.writeable else np_payload_copy(payload)
         metadata = contract.snapshot(frozen)
-        hasher.update(contract.digest(metadata).encode("ascii"))
-    return hasher.hexdigest()
+        hasher.update(contract.digest(metadata))
+    return hasher.digest()
 
 
 def np_payload_copy(payload: CameraPayload) -> CameraPayload:
