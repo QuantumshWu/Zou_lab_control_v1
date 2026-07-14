@@ -89,6 +89,8 @@ class TargetIR:
     bus_delays: tuple[TargetBusDelay, ...] = ()
     channel_delays: tuple[int, ...] = ()
     clk_enable: int = 0
+    logical_digital_outputs: tuple[tuple[str, str], ...] = ()
+    bus_safe_values: tuple[int, ...] = ()
     _fingerprint: str = field(init=False, repr=False, compare=False)
 
     @property
@@ -248,6 +250,48 @@ class TargetIR:
         if clk_enable >= mask_limit or any(mask & clk_enable for mask in masks):
             raise ValueError("clk_enable exceeds channel width or conflicts with edge masks")
         object.__setattr__(self, "clk_enable", clk_enable)
+        logical_outputs_list = []
+        for raw_pair in self.logical_digital_outputs:
+            try:
+                pair = tuple(raw_pair)
+            except TypeError as exc:
+                raise TypeError(
+                    "logical_digital_outputs entries must be (key, lane) pairs"
+                ) from exc
+            if len(pair) != 2:
+                raise ValueError(
+                    "logical_digital_outputs entries must be (key, lane) pairs"
+                )
+            logical_outputs_list.append(
+                (
+                    _text(pair[0], "logical digital output key"),
+                    _text(pair[1], "logical digital output lane"),
+                )
+            )
+        logical_outputs = tuple(logical_outputs_list)
+        keys = tuple(key for key, _lane in logical_outputs)
+        lanes = tuple(lane for _key, lane in logical_outputs)
+        if len(keys) != len(set(keys)) or len(lanes) != len(set(lanes)):
+            raise ValueError("logical digital output keys and lanes must be unique")
+        unknown_lanes = tuple(lane for lane in lanes if lane not in channels)
+        if unknown_lanes:
+            raise ValueError(
+                f"logical digital outputs reference unknown lanes {unknown_lanes!r}"
+            )
+        if any(clk_enable & (1 << channels.index(lane)) for lane in lanes):
+            raise ValueError("clock-mux lanes cannot be logical digital outputs")
+        object.__setattr__(
+            self,
+            "logical_digital_outputs",
+            tuple(sorted(logical_outputs)),
+        )
+        safe_values = tuple(
+            _integer(value, "bus safe value", nonnegative=True)
+            for value in self.bus_safe_values
+        )
+        if len(safe_values) != len(bus_names):
+            raise ValueError("bus_safe_values must align exactly with bus_names")
+        object.__setattr__(self, "bus_safe_values", safe_values)
         for point_index, point in enumerate(points):
             effective = tuple(
                 evaluate_affine_tick(base, coeff, point, frac)
@@ -403,6 +447,11 @@ def target_ir_to_tree(value: TargetIR) -> dict[str, object]:
         ],
         "channel_delays": list(value.channel_delays),
         "clk_enable": value.clk_enable,
+        "logical_digital_outputs": [
+            {"key": key, "lane": lane}
+            for key, lane in value.logical_digital_outputs
+        ],
+        "bus_safe_values": list(value.bus_safe_values),
     }
 
 
@@ -430,6 +479,8 @@ def target_ir_from_tree(tree: object) -> TargetIR:
         "bus_delays",
         "channel_delays",
         "clk_enable",
+        "logical_digital_outputs",
+        "bus_safe_values",
     }
     if not isinstance(tree, dict) or set(tree) != fields:
         raise ValueError("TargetIR has an unknown field set")
@@ -448,6 +499,8 @@ def target_ir_from_tree(tree: object) -> TargetIR:
         "bus_segments",
         "bus_delays",
         "channel_delays",
+        "logical_digital_outputs",
+        "bus_safe_values",
     ):
         if not isinstance(tree[field], list):
             raise TypeError(f"TargetIR {field} must be a list")
@@ -473,7 +526,15 @@ def target_ir_from_tree(tree: object) -> TargetIR:
         tuple(_bus_delay_from_tree(item) for item in tree["bus_delays"]),
         tuple(tree["channel_delays"]),
         tree["clk_enable"],
+        tuple(_logical_digital_output_from_tree(item) for item in tree["logical_digital_outputs"]),
+        tuple(tree["bus_safe_values"]),
     )
+
+
+def _logical_digital_output_from_tree(tree: object) -> tuple[object, object]:
+    if not isinstance(tree, dict) or set(tree) != {"key", "lane"}:
+        raise ValueError("logical digital output has an unknown field set")
+    return tree["key"], tree["lane"]
 
 
 def _bus_segment_to_tree(value: TargetBusSegment) -> dict[str, object]:

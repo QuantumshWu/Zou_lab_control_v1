@@ -318,6 +318,8 @@ def _compile_static(
         ),
         channel_delays=tuple(channel_delays),
         clk_enable=clk_enable,
+        logical_digital_outputs=_logical_digital_outputs(work.target),
+        bus_safe_values=_bus_safe_values(work.target),
     )
 
 
@@ -466,6 +468,28 @@ def _compile_scan(
         ),
         channel_delays=tuple(channel_delays),
         clk_enable=clk_enable,
+        logical_digital_outputs=_logical_digital_outputs(work.target),
+        bus_safe_values=_bus_safe_values(work.target),
+    )
+
+
+def _logical_digital_outputs(target: PulseTarget) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        sorted(
+            (port.key, port.lanes[0])
+            for port in target.ports
+            if port.kind == PORT_DIGITAL
+        )
+    )
+
+
+def _bus_safe_values(target: PulseTarget) -> tuple[int, ...]:
+    return tuple(
+        port.safe_value
+        for port in sorted(
+            (item for item in target.ports if item.kind == PORT_DAC),
+            key=lambda item: int(item.bus_index),
+        )
     )
 
 

@@ -190,6 +190,7 @@ def test_wire_geometry_gate_rejects_every_silent_integer_truncation_class():
                 static,
                 channels=too_many_channels,
                 channel_delays=(0,) * len(too_many_channels),
+                logical_digital_outputs=(),
             )
         )
 
@@ -289,6 +290,7 @@ def test_wire_geometry_gate_enforces_frozen_event_fifo_capacities():
         loop_count=1,
         tick_slot_coeffs=((), ()),
         bus_names=("dac",),
+        bus_safe_values=(512,),
         bus_segments=segments,
         bus_delays=(
             # A 200-tick physical delay spans multiple 40-descriptor frames.
@@ -324,6 +326,7 @@ def _bus_capacity_ir(
         loop_count=loop_count,
         tick_slot_coeffs=((), ()),
         bus_names=("dac",),
+        bus_safe_values=(512,),
         bus_segments=tuple(
             TargetBusSegment(
                 0,
@@ -483,9 +486,31 @@ def test_target_gate_rejects_ir_that_lies_under_a_valid_abi_fingerprint():
     )
     target = document.target
 
+    with pytest.raises(ValueError, match="logical digital outputs"):
+        validate_target_ir_for_target(
+            replace(
+                ir,
+                logical_digital_outputs=ir.logical_digital_outputs[:-1],
+            ),
+            target,
+        )
+    forged_safe_values = (
+        ir.bus_safe_values[0] + 1,
+        *ir.bus_safe_values[1:],
+    )
+    with pytest.raises(ValueError, match="DAC safe values"):
+        validate_target_ir_for_target(
+            replace(ir, bus_safe_values=forged_safe_values),
+            target,
+        )
+
     with pytest.raises(ValueError, match="channel order"):
         validate_target_ir_for_target(
-            replace(ir, channels=tuple(reversed(ir.channels))),
+            replace(
+                ir,
+                channels=tuple(reversed(ir.channels)),
+                logical_digital_outputs=(),
+            ),
             target,
         )
     clock_document = load_pulse_document(

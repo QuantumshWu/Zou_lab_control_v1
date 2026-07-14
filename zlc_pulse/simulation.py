@@ -13,6 +13,46 @@ MAX_MATERIALIZED_PLAYBACK_TRANSITIONS = 1_000_000
 
 
 @dataclass(frozen=True)
+class PhysicalDigitalHighInterval:
+    """One exact delayed high interval on an external logical digital output."""
+
+    output_key: str
+    lane: str
+    start_tick: int
+    stop_tick: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.output_key, str) or not self.output_key:
+            raise ValueError("digital output key must be non-empty text")
+        if not isinstance(self.lane, str) or not self.lane:
+            raise ValueError("digital output lane must be non-empty text")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in (self.start_tick, self.stop_tick)
+        ):
+            raise ValueError("digital interval ticks must be non-negative integers")
+        if self.stop_tick <= self.start_tick:
+            raise ValueError("digital high interval must have positive duration")
+
+
+@dataclass(frozen=True)
+class PhysicalBusValueChange:
+    """One exact delayed decoded-DAC value change in run tick coordinates."""
+
+    bus_name: str
+    tick: int
+    value: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.bus_name, str) or not self.bus_name:
+            raise ValueError("bus name must be non-empty text")
+        if isinstance(self.tick, bool) or not isinstance(self.tick, int) or self.tick < 0:
+            raise ValueError("bus change tick must be a non-negative integer")
+        if isinstance(self.value, bool) or not isinstance(self.value, int) or self.value < 0:
+            raise ValueError("bus value must be a non-negative integer")
+
+
+@dataclass(frozen=True)
 class PlaybackPulse:
     channel: str
     start: float
@@ -193,46 +233,17 @@ def build_pulse_playback(
     if not isinstance(artifact, CompiledPulseArtifact):
         raise TypeError("artifact must be CompiledPulseArtifact")
     ir = artifact.target_ir
-    transitions, terminal_tick = _expanded_mask_transitions(ir)
-    pulses: list[PlaybackPulse] = []
-    for bit, channel in enumerate(ir.channels):
-        if ir.clk_enable & (1 << bit):
-            continue
-        delay = ir.channel_delays[bit]
-        active: int | None = None
-        previous = 0
-        for tick, mask in transitions:
-            current = (mask >> bit) & 1
-            shifted = tick + delay
-            if current and not previous:
-                active = shifted
-            elif previous and not current:
-                if active is None or shifted <= active:
-                    raise ValueError("compiled digital waveform contains an invalid high interval")
-                pulses.append(
-                    PlaybackPulse(
-                        channel,
-                        active / ir.clock_hz,
-                        (shifted - active) / ir.clock_hz,
-                        1,
-                        channel,
-                    )
-                )
-                active = None
-            previous = current
-        if active is not None:
-            stop = terminal_tick + delay
-            if stop <= active:
-                raise ValueError("compiled digital waveform remains high without a terminal interval")
-            pulses.append(
-                PlaybackPulse(
-                    channel,
-                    active / ir.clock_hz,
-                    (stop - active) / ir.clock_hz,
-                    1,
-                    channel,
-                )
-            )
+    _transitions, terminal_tick = _expanded_mask_transitions(ir)
+    pulses = [
+        PlaybackPulse(
+            interval.lane,
+            interval.start_tick / ir.clock_hz,
+            (interval.stop_tick - interval.start_tick) / ir.clock_hz,
+            1,
+            interval.output_key,
+        )
+        for interval in expand_physical_digital_high_intervals(ir)
+    ]
     terminal_with_delay = terminal_tick + max(ir.channel_delays, default=0)
     group_counts: dict[tuple[int, int], dict[str, int]] = {}
     for schedule in artifact.trigger_schedules:
@@ -273,6 +284,158 @@ def build_pulse_playback(
         full_point_loop_channels=full_point_loop_channels,
         trigger_groups=trigger_groups,
     )
+
+
+def expand_physical_digital_high_intervals(
+    ir: TargetIR,
+) -> tuple[PhysicalDigitalHighInterval, ...]:
+    """Expand the finite TargetIR digital waveform with output delays exactly once."""
+
+    if not isinstance(ir, TargetIR):
+        raise TypeError("ir must be TargetIR")
+    transitions, terminal_tick = _expanded_mask_transitions(ir)
+    intervals: list[PhysicalDigitalHighInterval] = []
+    for output_key, lane in ir.logical_digital_outputs:
+        bit = ir.channels.index(lane)
+        delay = ir.channel_delays[bit]
+        active: int | None = None
+        previous = 0
+        for tick, mask in transitions:
+            current = (mask >> bit) & 1
+            shifted = tick + delay
+            if current and not previous:
+                active = shifted
+            elif previous and not current:
+                if active is None or shifted <= active:
+                    raise ValueError(
+                        "compiled digital waveform contains an invalid high interval"
+                    )
+                intervals.append(
+                    PhysicalDigitalHighInterval(
+                        output_key,
+                        lane,
+                        active,
+                        shifted,
+                    )
+                )
+                active = None
+            previous = current
+        if active is not None:
+            stop = terminal_tick + delay
+            if stop <= active:
+                raise ValueError(
+                    "compiled digital waveform remains high without a terminal interval"
+                )
+            intervals.append(
+                PhysicalDigitalHighInterval(
+                    output_key,
+                    lane,
+                    active,
+                    stop,
+                )
+            )
+    return tuple(
+        sorted(
+            intervals,
+            key=lambda item: (item.start_tick, item.output_key, item.stop_tick),
+        )
+    )
+
+
+def expand_physical_bus_value_changes(
+    ir: TargetIR,
+) -> tuple[PhysicalBusValueChange, ...]:
+    """Expand decoded DAC edges and the finite-DONE safe transition.
+
+    The current readout-context baseline supports exact held values and edge
+    updates.  A compact repeated DAC program or a live-state ramp is rejected
+    because its registered carry semantics cannot be represented by an edge
+    stream without guessing.
+    """
+
+    if not isinstance(ir, TargetIR):
+        raise TypeError("ir must be TargetIR")
+    if ir.bus_names and len(ir.bus_safe_values) != len(ir.bus_names):
+        raise ValueError("TargetIR omits decoded DAC safe values")
+    if any(segment.mode != "edge" for segment in ir.bus_segments):
+        raise ValueError(
+            "readout physical context cannot derive a live-state DAC ramp exactly"
+        )
+    if ir.bus_segments and ir.loop_count != 1:
+        raise ValueError(
+            "readout physical context cannot derive compact repeated DAC updates exactly"
+        )
+    delay_by_bus = {item.bus_index: item.delay_ticks for item in ir.bus_delays}
+    segments_by_bus = {
+        index: tuple(
+            segment
+            for segment in ir.bus_segments
+            if segment.bus_index == index
+        )
+        for index in range(len(ir.bus_names))
+    }
+    changes: list[PhysicalBusValueChange] = []
+    state = list(ir.bus_safe_values)
+    run_offset = 0
+    for point in ir.scan_points or ((),):
+        final_tick = evaluate_affine_tick(
+            ir.ticks[-1],
+            ir.tick_slot_coeffs[-1],
+            point,
+            ir.scan_coeff_frac_bits,
+        )
+        for bus_index, bus_name in enumerate(ir.bus_names):
+            delay = delay_by_bus.get(bus_index, 0)
+            ordered = sorted(
+                segments_by_bus[bus_index],
+                key=lambda item: evaluate_affine_tick(
+                    item.start_tick,
+                    item.start_tick_coeffs,
+                    point,
+                    ir.scan_coeff_frac_bits,
+                ),
+            )
+            for segment in ordered:
+                source_tick = evaluate_affine_tick(
+                    segment.start_tick,
+                    segment.start_tick_coeffs,
+                    point,
+                    ir.scan_coeff_frac_bits,
+                )
+                selector = segment.stop_value_select
+                value = (
+                    int(point[selector - 1])
+                    if selector
+                    else int(segment.stop_value)
+                )
+                if value == state[bus_index]:
+                    continue
+                # A tick-zero segment is pre-applied; a mid-frame segment is
+                # registered after its source tick and becomes visible next tick.
+                visible_tick = run_offset + source_tick + delay + (source_tick != 0)
+                changes.append(
+                    PhysicalBusValueChange(bus_name, visible_tick, value)
+                )
+                state[bus_index] = value
+        run_offset += final_tick
+    # RTL clears the undelayed bus only at finite DONE.  That registered update
+    # is visible one tick later; physical output delay shifts it by ``d`` more
+    # ticks (out[t] = in[t-d]).  Append only a real value transition: a bus
+    # already returned to safe before DONE needs no duplicate descriptor.
+    if not ir.repeat_forever:
+        for bus_index, bus_name in enumerate(ir.bus_names):
+            safe = ir.bus_safe_values[bus_index]
+            if state[bus_index] == safe:
+                continue
+            delay = delay_by_bus.get(bus_index, 0)
+            changes.append(
+                PhysicalBusValueChange(
+                    bus_name,
+                    run_offset + delay + 1,
+                    safe,
+                )
+            )
+    return tuple(sorted(changes, key=lambda item: (item.tick, item.bus_name)))
 
 
 def _expanded_mask_transitions(ir: TargetIR) -> tuple[list[tuple[int, int]], int]:
@@ -345,7 +508,11 @@ def _expanded_mask_transitions(ir: TargetIR) -> tuple[list[tuple[int, int]], int
 __all__ = [
     "MAX_MATERIALIZED_PLAYBACK_TRANSITIONS",
     "PlaybackPulse",
+    "PhysicalDigitalHighInterval",
+    "PhysicalBusValueChange",
     "PlaybackTriggerGroup",
     "PulsePlayback",
     "build_pulse_playback",
+    "expand_physical_digital_high_intervals",
+    "expand_physical_bus_value_changes",
 ]

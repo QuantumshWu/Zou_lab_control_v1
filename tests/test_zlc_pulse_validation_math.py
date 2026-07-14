@@ -233,6 +233,7 @@ def test_capacity_gate_matches_independent_small_ir_expansion():
             loop_count=bus_loop_count,
             tick_slot_coeffs=((), ()),
             bus_names=("dac",),
+            bus_safe_values=(512,),
             bus_segments=tuple(
                 TargetBusSegment(
                     0,

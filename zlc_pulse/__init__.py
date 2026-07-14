@@ -74,10 +74,14 @@ from .schedule import (
     digital_trigger_schedule_to_tree,
 )
 from .simulation import (
+    PhysicalDigitalHighInterval,
+    PhysicalBusValueChange,
     PlaybackPulse,
     PlaybackTriggerGroup,
     PulsePlayback,
     build_pulse_playback,
+    expand_physical_digital_high_intervals,
+    expand_physical_bus_value_changes,
 )
 from .server import (
     PREPARED_PULSE_REF_SCHEMA,
@@ -184,6 +188,8 @@ __all__ = [
     "PulseBackendCompletion",
     "PulseHardwareTerminalEvidence",
     "PlaybackPulse",
+    "PhysicalDigitalHighInterval",
+    "PhysicalBusValueChange",
     "PlaybackTriggerGroup",
     "PulsePlayback",
     "PulseWireImage",
@@ -206,6 +212,8 @@ __all__ = [
     "TriggerEdge",
     "build_digital_trigger_schedules",
     "build_pulse_playback",
+    "expand_physical_digital_high_intervals",
+    "expand_physical_bus_value_changes",
     "attach_scan_recipe",
     "bind_pulse_document_target",
     "compiled_pulse_artifact_from_tree",

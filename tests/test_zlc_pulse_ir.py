@@ -69,6 +69,8 @@ def scan_ir():
         (TargetBusDelay(0, 4),),
         (0, 0, 0),
         0,
+        (),
+        (512,),
     )
 
 
@@ -190,6 +192,7 @@ def test_bus_segments_cannot_cross_typed_slot_or_physical_time_boundaries():
             loop_count=1,
             tick_slot_coeffs=((), ()),
             bus_names=("dac",),
+            bus_safe_values=(512,),
             bus_segments=(
                 TargetBusSegment(
                     0,

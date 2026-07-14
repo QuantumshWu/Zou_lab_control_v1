@@ -195,6 +195,17 @@ def validate_target_ir_for_target(ir: TargetIR, target: PulseTarget) -> None:
         raise ValueError("TargetIR ABI fingerprint differs from PulseTarget")
     if ir.channels != target.raw_lanes:
         raise ValueError("TargetIR channel order differs from PulseTarget raw lanes")
+    expected_digital_outputs = tuple(
+        sorted(
+            (port.key, port.lanes[0])
+            for port in target.ports
+            if port.kind == PORT_DIGITAL
+        )
+    )
+    if ir.logical_digital_outputs != expected_digital_outputs:
+        raise ValueError(
+            "TargetIR logical digital outputs differ from PulseTarget topology"
+        )
 
     lane_index = {lane: index for index, lane in enumerate(target.raw_lanes)}
     digital_mask = sum(
@@ -220,6 +231,8 @@ def validate_target_ir_for_target(ir: TargetIR, target: PulseTarget) -> None:
     )
     if ir.bus_names != tuple(port.key for port in buses):
         raise ValueError("TargetIR DAC bus order differs from PulseTarget")
+    if ir.bus_safe_values != tuple(port.safe_value for port in buses):
+        raise ValueError("TargetIR DAC safe values differ from PulseTarget")
     for segment in ir.bus_segments:
         port = buses[segment.bus_index]
         limit = (1 << port.width) - 1
