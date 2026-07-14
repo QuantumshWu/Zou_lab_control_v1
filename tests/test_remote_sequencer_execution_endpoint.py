@@ -18,7 +18,7 @@ from zlc_neutral_atom.runtime import (
     SafeStateAck,
     SafetyOperation,
 )
-from zlc_neutral_atom.timing import (
+from zlc_neutral_atom.timing.pulse import (
     FinitePulseExecutionRequest,
     PreparePulseCommand,
     PulseTerminalEvidenceKind,

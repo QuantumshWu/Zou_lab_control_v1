@@ -15,7 +15,7 @@ from zlc_neutral_atom.runtime import (
     SessionClosedAck,
     SessionCloseCommand,
 )
-from zlc_neutral_atom.timing import (
+from zlc_neutral_atom.timing.pulse import (
     BoundPulsePort,
     CompletePulseCommand,
     FirePulseCommand,

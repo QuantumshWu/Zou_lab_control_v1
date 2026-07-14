@@ -11,7 +11,7 @@ import zlc_pulse.transport as pulse_transport
 
 from conftest import pulse_backend_completion_for
 from fpga.pulse_streamer.host.image import STATUS_DONE, STATUS_UNDERFLOW
-from zlc_neutral_atom.timing import (
+from zlc_neutral_atom.timing.pulse import (
     PulseTerminalAck,
     SimulatedPulseReceipt,
     pulse_terminal_ack_from_tree,
