@@ -1,7 +1,7 @@
 """Contract for the SAVE -> LOAD round-trip of a front-end figure (the data layer, no GUI window).
 
-``DataFigure.save`` writes ``<name>_<time>.png`` + a matching ``.npz`` (``data_x`` / ``data_y`` /
-``info``).  ``frontend.load_figure`` (and its ``na.load_figure`` facade) reopen that npz -- with no
+``DataFigure.save`` writes ``<name>_<time>.png`` + a matching exact-envelope ``.npz``.
+``frontend.load_figure`` (and its ``na.load_figure`` facade) reopen that npz -- with no
 hardware or session -- as a lightweight :class:`SavedFigure` that answers "what was saved"
 (``info_summary``), lists how the data can be viewed (``compatible_kinds``) and re-renders it
 (``plot`` / ``plot(kind=...)``) through the SAME ``plot()`` factory the live figure used.
@@ -12,8 +12,7 @@ These pin:
 2. ``.plot(kind=<saved kind>)`` reproduces a DataFigure (does not raise);
 3. ``.plot(kind=<another compatible kind>)`` re-interprets the SAME arrays (does not raise);
 4. ``.compatible_kinds()`` contains the saved kind;
-5. an OLD payload (only ``data_x`` / ``data_y`` + a minimal ``info``) loads without crashing and the
-   view state defaults.
+5. a noncurrent payload is rejected instead of being guessed or upgraded.
 """
 
 from __future__ import annotations
@@ -87,6 +86,25 @@ def test_save_load_round_trips_arrays_and_info(tmp_path):
         plt.close("all")
 
 
+def test_saved_figure_envelope_has_one_plain_current_schema(tmp_path):
+    out, _ = _saved_hist(tmp_path)
+    with np.load(out["data"], allow_pickle=False) as data:
+        assert set(data.files) == {
+            "schema",
+            "data_x",
+            "data_y",
+            "plot",
+            "signals",
+            "recipe",
+            "provenance",
+            "metadata",
+        }
+        schema = data["schema"]
+        assert schema.shape == ()
+        assert schema.dtype.kind in "US"
+        assert str(schema.item()) == "zou_lab_control.saved_figure"
+
+
 def test_plot_saved_kind_reproduces_a_datafigure(tmp_path):
     out, _ = _saved_hist(tmp_path)
     saved = load_figure(out["data"])
@@ -121,15 +139,12 @@ def test_compatible_kinds_contains_the_saved_kind(tmp_path):
     assert "2d" not in kinds and "sites" not in kinds
 
 
-def test_old_format_npz_is_rejected_with_a_clear_error(tmp_path):
-    """An OLD ``info``-blob payload is DELIBERATELY not loadable: the current envelope is a fixed set of
-    typed records (``plot`` / ``signals`` / ``recipe`` / ``provenance`` / ``metadata`` / ``schema`` /
-    ``version``), and the loader rejects anything else with an actionable message rather than silently
-    guessing at a legacy shape (no backward-compat scaffolding -- the break is intentional and pinned)."""
+def test_noncurrent_envelope_is_rejected_instead_of_inferred(tmp_path):
+    """Only the exact typed envelope is admitted; arbitrary fields are never inferred."""
     x = np.linspace(0, 1, 40).reshape(-1, 1)
     y = np.sin(np.linspace(0, 6, 40)).reshape(-1, 1)
-    path = tmp_path / "legacy.npz"
-    np.savez(path, data_x=x, data_y=y, info={"labels": ["X", "Y", "Z"], "name": "legacy"})
+    path = tmp_path / "noncurrent.npz"
+    np.savez(path, data_x=x, data_y=y, info={"labels": ["X", "Y", "Z"], "name": "unsupported"})
     with pytest.raises(ValueError, match="envelope keys must be exactly"):
         load_figure(path)
 
@@ -428,8 +443,7 @@ def test_pulse_preview_save_stores_a_faithful_figure_recipe(tmp_path):
         assert rebuilt.port_catalog.analog_buses == state.port_catalog.analog_buses
         out = df.save(str(tmp_path / "demo_pulse.png"))
         assert Path(out["figure"]).exists() and Path(out["data"]).exists()
-        data = np.load(out["data"], allow_pickle=True)
-        recipe = data["recipe"].item()                      # the recipe record is its own envelope key now
+        recipe = load_figure(out["data"]).figure_recipe
         assert recipe["kind"] == "pulse"
         assert "periods" in recipe["pulse_state"]
     finally:

@@ -61,11 +61,10 @@ def resolve_save_base(path, stem: str) -> Path:
 
 
 # Saved figures are an artifact boundary, not an append-only bag of optional
-# ``info`` fields.  The npz has one exact envelope and one current version.
+# ``info`` fields.  The npz has one exact current-schema envelope.
 _SAVED_FIGURE_SCHEMA = "zou_lab_control.saved_figure"
-_SAVED_FIGURE_VERSION = 1
 _SAVED_FIGURE_KEYS = frozenset(
-    {"schema", "version", "data_x", "data_y", "plot", "signals", "recipe", "provenance", "metadata"}
+    {"schema", "data_x", "data_y", "plot", "signals", "recipe", "provenance", "metadata"}
 )
 _SAVED_PLOT_KEYS = frozenset(
     {"name", "kind", "labels", "unit", "points_done", "repeat_cur", "view", "fit", "size"}
@@ -313,7 +312,6 @@ def _write_saved_npz(path: str | Path, *, data_x, data_y, info: Mapping[str, Any
     np.savez(
         path,
         schema=np.asarray(_SAVED_FIGURE_SCHEMA),
-        version=np.asarray(_SAVED_FIGURE_VERSION, dtype=np.int64),
         data_x=x,
         data_y=y,
         plot=_object_scalar(plot),
@@ -536,7 +534,7 @@ class DataFigure:
         extra_info: Mapping[str, Any] | None = None,
         image_ext: str = "png",
     ) -> dict[str, Path]:
-        """Save the image plus the one current, versioned saved-figure artifact.
+        """Save the image plus the one current-schema saved-figure artifact.
 
         The artifact always names its plot kind, typed signal blocks and replay recipe (``None`` for an
         array figure).  A source-bound figure must capture its value signal; a structured figure must
@@ -1442,7 +1440,7 @@ def _load_saved_npz(path) -> tuple[np.ndarray, np.ndarray, dict]:
     """Read and validate the one current saved-figure artifact envelope.
 
     SECURITY: object records are trusted local experiment artifacts and therefore use pickle.  The
-    exact schema/version/key/type checks happen before a :class:`SavedFigure` is constructed."""
+    exact schema/key/type checks happen before a :class:`SavedFigure` is constructed."""
     with np.load(str(path), allow_pickle=True) as data:  # noqa: S301 - local experiment tool, trusted input only
         actual = frozenset(data.files)
         if actual != _SAVED_FIGURE_KEYS:
@@ -1452,15 +1450,10 @@ def _load_saved_npz(path) -> tuple[np.ndarray, np.ndarray, dict]:
                 f"{path} is not a current saved figure; envelope keys must be exactly "
                 f"{sorted(_SAVED_FIGURE_KEYS)}, missing={missing}, extra={extra}.")
         schema_array = data["schema"]
-        version_array = data["version"]
         if schema_array.shape != () or schema_array.dtype.kind not in "US" \
                 or str(schema_array.item()) != _SAVED_FIGURE_SCHEMA:
             raise ValueError(
                 f"{path} has invalid saved-figure schema; expected {_SAVED_FIGURE_SCHEMA!r}.")
-        if version_array.shape != () or version_array.dtype.kind not in "iu" \
-                or int(version_array.item()) != _SAVED_FIGURE_VERSION:
-            raise ValueError(
-                f"{path} has unsupported saved-figure version; expected {_SAVED_FIGURE_VERSION}.")
 
         def record(key: str, expected_type):
             array = data[key]

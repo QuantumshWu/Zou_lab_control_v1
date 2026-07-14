@@ -1,6 +1,6 @@
 """Reopen a saved figure ``.npz`` INTO the Task console -- ``exp.figure_viewer()``.
 
-A saved panel / overnight scan writes a versioned ``<name>_<time>.npz`` artifact
+A saved panel / overnight scan writes a current-schema ``<name>_<time>.npz`` artifact
 next to its ``.png`` (see :meth:`~.data_figure.DataFigure.save`).  This window is the GUI
 counterpart of the notebook one-liner ``na.load_figure('scan.npz')`` -- but instead of a bespoke
 viewer, the loaded figure becomes ONE hub SIGNAL and the whole reuse is the Task console board:

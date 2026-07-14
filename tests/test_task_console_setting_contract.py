@@ -560,7 +560,7 @@ def test_edit_save_image_format_writes_chosen_container(tmp_path):
             assert img.exists() and img.stat().st_size > 0, fmt
             assert img.read_bytes()[: len(magic[fmt])] == magic[fmt], (fmt, "not a real container")
             assert npz.exists(), fmt
-            info = load_figure(str(npz)).info    # 9-key envelope, read through the production loader
+            info = load_figure(str(npz)).info    # exact envelope, read through the production loader
             infos[fmt] = {k: info.get(k) for k in ("kind", "source", "size", "name", "labels")}
 
         # the .npz payload is the SAME data regardless of the image container chosen
