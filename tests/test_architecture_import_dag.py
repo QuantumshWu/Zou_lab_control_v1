@@ -282,8 +282,8 @@ def test_readout_artifacts_do_not_restore_edit_counter_metadata():
             if candidate in forbidden:
                 violations.append(f"{relative}:{node.lineno} restores {candidate}")
     assert not violations, (
-        "readout identity is CalibrationArtifactRef + ReadoutModelKind; descriptive "
-        "gate ids and content fingerprints replace edit-counter metadata:\n"
+        "future readout identity must be content-addressed plus a semantic model kind; "
+        "descriptive gate ids and content fingerprints replace edit-counter metadata:\n"
         + "\n".join(violations)
     )
 
@@ -411,7 +411,6 @@ def test_content_ref_codec_and_cas_address_have_one_storage_owner():
 
     for relative in (
         Path("zlc_neutral_atom/artifacts/capture.py"),
-        Path("zlc_neutral_atom/readout/calibration_repository.py"),
     ):
         tree = ast.parse(
             (ROOT / relative).read_text(encoding="utf-8"),

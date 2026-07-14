@@ -1913,6 +1913,8 @@ reject new commands
 
 Calibration 是 `neutral_atom.readout.calibration` 的内建 feature，不使用 plugin、entry point、包扫描或动态 registry 覆盖。
 
+**当前实现状态（2026-07 追溯整改）**：S3 尚未交付，不能把目标模型当作现有能力。此前实现只有一个 notebook `load_calibration(ref)` 入口和一套 `CalibrationRepository/CalibrationArtifactRef`，仓内没有 production producer、calibrate/commit 调用或可到达的 occupancy consumer；它只能读取一类本系统从未能正式产生的 artifact。本轮删除这条 producerless load-only 路径。未来只有在同一个 dependency-closed 纵向切片同时交付“真实 capture -> 校准 -> 保存 -> load/admit -> readout consumer”时，才重新引入 typed ref/repository；repository 必须复用 zlc_storage/Capture 已有 canonical、CAS、commit authority，不能提前建立空壳。旧 `neutral_atom/session.py` 的文件路径式 TrapCalibration 是尚待 S3 迁走的 legacy island，不是新领域 API，也不为新格式建立兼容 reader。
+
 `zlc_neutral_atom.readout` 包根不重导出 contracts、codec、analysis、repository 的宽 API；调用方必须从语义 owner 子模块导入。追溯整改实测旧包根的 122 个 eager re-export 会让单独导入 `readout.contracts` 也加载 SciPy，冷导入约 0.86 s、tracemalloc 峰值约 51.8 MiB。删除包根聚合后，同一探针不再加载 SciPy（当前机器约 0.35 s、10 MiB，主要为 NumPy/zlc_data 基础值）。这不是 lazy `__getattr__` 兼容表：本项目没有需要维护的旧公共格式，重复出口清单只会形成第二个 owner；稳定公共用户面由 notebook/workbench facade 组合，领域实现直接依赖 leaf owner。
 
 ### 13.1 Artifact
@@ -1986,6 +1988,8 @@ CalibrationTask:
   -> CalibrationArtifactRef
 ```
 
+上图是 S3 的**目标纵切**，不是当前已实现流程。typed artifact、codec、repository 与 notebook/workbench 入口必须随第一个真实 producer 和 consumer 一起出现；单独实现 value graph、load-only repository、analysis wrapper 或只验证内部私有结构的测试，都不计为进度。
+
 live 路径先提交原始 CaptureArtifact，再与 offline 路径汇合；算法或模型质量 gate 失败时不产生 CalibrationArtifact，但原始 capture 仍可用于诊断和重跑。virtual/real 只在 CaptureSession adapter 不同，提交后的校准代码完全相同。
 
 不需要 CalibrationService、child Measurement Run、calibration StreamProcessor 或 reducer 包装。普通批量校准就是 neutral-owned `CalibrationAnalysisDefinition` 绑定出的 AnalysisStep，在该 Task 的 run-owner/必要时 disposable compute process 中运行，不占用 view/Fit executor，并受同一 RunHandle cancellation/revision 管理。只有出现一个必须在采集完成前产生控制反馈、且不能保存原始样本后批处理的真实用例，才另行设计领域 StreamReducer；baseline 不为 calibration 预留它。
@@ -1994,7 +1998,7 @@ Occupancy request 携带 CalibrationArtifactRef 和已解析的 `ReadoutModelKin
 
 整改后的实现顺序以真实消费者为门，而不是先造通用执行框架。第一条可交付路径是“已提交 CaptureArtifact + 已 admit CalibrationArtifact -> 纯 `apply_readout_model` -> immutable counts/occupied/ComponentValidity/provenance”；硬件 arm/fire/exact reservation/cleanup 仍由既有 Capture/Pulse owner 持有。只有这个离线路径与旧真机算法的同帧 golden 一致后，才为 live monitor 建立一个 concrete `BoundReadoutProcessor`。在出现第二个具有相同生命周期和 backpressure 语义的领域 processor 前，不建立 generic `processing.stream` worker、额外 execution guard、anti-rebadge token、occupancy 专用 transaction/result wrapper，也不把 occupied 偷塞进 metadata 后再重建第二个 dataset。counts 与 occupied 若同时落盘，必须是同一原子 typed record 的两个字段，并共享同一个 ComponentValidity 与 source cell provenance。
 
-2026-07 的追溯整改发现，已提交的 `occupancy.py + occupancy_pipeline.py + timing/occupancy.py` 共约 2.7k production LOC，却没有 composition-root 或 notebook production caller；其唯一“大量使用者”是约 2.3k LOC 的实现镜像测试。该实现因此在本轮整改中删除，不能计为 S3 已完成能力。保留的是已经有真实消费者或数据正确性依据的 FrameContract/context join、ComponentValidity、纯 readout math、typed CalibrationArtifactRef、Capture exact reservation 与硬件 cleanup；S3 恢复时必须先建立上述最短公共纵切和独立 oracle，再按真实第二消费者决定是否抽象。
+2026-07 的追溯整改发现，已提交的 `occupancy.py + occupancy_pipeline.py + timing/occupancy.py` 共约 2.7k production LOC，却没有 composition-root 或 notebook production caller；其唯一“大量使用者”是约 2.3k LOC 的实现镜像测试。该实现因此在本轮整改中删除，不能计为 S3 已完成能力。同一审计也删除了没有 producer/commit caller 的 `CalibrationRepository/CalibrationArtifactRef` 与 notebook load-only API。当前只保留已经有真实消费者或数据正确性依据的 FrameContract/context join、ComponentValidity、Capture exact reservation 与硬件 cleanup；calibration artifact/model/math 是否保留，继续由本节物理算法同帧审计和 consumer census 裁决，不能因代码已经存在就默认保留。S3 恢复时必须先建立上述最短公共纵切和独立 oracle，再按真实第二消费者决定是否抽象。
 
 ## 14. PulseScan
 

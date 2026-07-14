@@ -19,7 +19,6 @@ from zlc_neutral_atom.artifacts import (
     CaptureFitResultRepository,
     CaptureRepository,
 )
-from zlc_neutral_atom.readout.calibration_repository import CalibrationRepository
 from zlc_neutral_atom.readout.contracts import ReadoutBindingKey
 from zlc_storage import RepositoryRootBusy
 from zlc_neutral_atom.runtime import BoundDevice, RunPlan
@@ -173,21 +172,18 @@ def test_capture_request_rejects_wrong_domain_and_stale_device_generation(tmp_pa
             exp.inspect(replace(request, camera_ref=stale))
 
 
-def test_experiment_owns_typed_sibling_repositories_until_close(tmp_path):
+def test_experiment_owns_its_active_repositories_until_close(tmp_path):
     root = tmp_path / "experiment-workspace"
     exp = zlc.connect("virtual", repository=root)
     try:
         with pytest.raises(RepositoryRootBusy, match="live owner"):
             CaptureRepository(root / "captures")
         with pytest.raises(RepositoryRootBusy, match="live owner"):
-            CalibrationRepository(root / "calibrations")
-        with pytest.raises(RepositoryRootBusy, match="live owner"):
             CaptureFitResultRepository(root / "fits")
     finally:
         exp.close()
 
     CaptureRepository(root / "captures").close()
-    CalibrationRepository(root / "calibrations").close()
     CaptureFitResultRepository(root / "fits").close()
 
 
@@ -199,7 +195,6 @@ def test_failed_composition_releases_all_repository_roots(tmp_path):
             repository=root,
         )
     CaptureRepository(root / "captures").close()
-    CalibrationRepository(root / "calibrations").close()
     CaptureFitResultRepository(root / "fits").close()
 
 
@@ -231,7 +226,6 @@ def test_failed_composition_reports_runtime_that_did_not_shutdown(
         zlc.connect("virtual", repository=root)
     assert isinstance(caught.value.__cause__, ValueError)
     CaptureRepository(root / "captures").close()
-    CalibrationRepository(root / "calibrations").close()
     CaptureFitResultRepository(root / "fits").close()
 
 

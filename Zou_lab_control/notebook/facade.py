@@ -36,9 +36,6 @@ from zlc_neutral_atom.artifacts import (
     FitExecution,
     compile_capture_artifact_pipeline,
 )
-from zlc_neutral_atom.readout.calibration import CalibrationArtifact
-from zlc_neutral_atom.readout.calibration_reference import CalibrationArtifactRef
-from zlc_neutral_atom.readout.calibration_repository import CalibrationRepository
 from zlc_neutral_atom.readout.contracts import ReadoutBindingKey
 from zlc_neutral_atom.runtime import (
     DatasetMaterializerSpec,
@@ -218,7 +215,6 @@ class _ExperimentServices:
     runtime: LegacyNeutralAtomRuntime
     devices: object
     capture_repository: CaptureRepository
-    calibration_repository: CalibrationRepository
     fit_repository: CaptureFitResultRepository
     catalog: DeviceCatalogView
     operation_lock: threading.RLock
@@ -347,13 +343,6 @@ class ReadoutFacade:
     def load_capture(self, reference: CaptureArtifactRef) -> CaptureArtifact:
         return _services(self._token).capture_repository.load(reference)
 
-    def load_calibration(
-        self,
-        reference: CalibrationArtifactRef,
-    ) -> CalibrationArtifact:
-        return _services(self._token).calibration_repository.load(reference)
-
-
 class Experiment:
     """Public notebook root containing values, requests, and narrow facades only."""
 
@@ -458,7 +447,6 @@ class Experiment:
                 _cleanup_failures(
                     services.devices.close,
                     services.fit_repository.close,
-                    services.calibration_repository.close,
                     services.capture_repository.close,
                 )
             )
@@ -595,15 +583,11 @@ def connect(
         raise TypeError("repository must be an explicit experiment workspace root")
     repository_root = Path(repository).expanduser().resolve()
     capture_repository = None
-    calibration_repository = None
     fit_repository = None
     devices = None
     runtime = None
     try:
         capture_repository = CaptureRepository(repository_root / "captures")
-        calibration_repository = CalibrationRepository(
-            repository_root / "calibrations"
-        )
         fit_repository = CaptureFitResultRepository(repository_root / "fits")
         device_config, device_overrides, _defaults = resolve_connect_config(
             config,
@@ -637,7 +621,6 @@ def connect(
             runtime,
             devices,
             capture_repository,
-            calibration_repository,
             fit_repository,
             catalog,
             threading.RLock(),
@@ -653,7 +636,6 @@ def connect(
             ),
             None if devices is None else devices.close,
             None if fit_repository is None else fit_repository.close,
-            None if calibration_repository is None else calibration_repository.close,
             None if capture_repository is None else capture_repository.close,
         )
         if failures and isinstance(error, Exception):

@@ -71,11 +71,6 @@ from zlc_neutral_atom.readout.calibration_codec import (
     encode_readout_model,
     encode_site_map,
 )
-from zlc_neutral_atom.readout.calibration_reference import (
-    CalibrationArtifactRef,
-    decode_calibration_artifact_ref,
-    encode_calibration_artifact_ref,
-)
 from zlc_neutral_atom.readout.contracts import (
     CalibrationCaptureLayout,
     CameraCaptureDescriptor,
@@ -1397,14 +1392,6 @@ def test_obsolete_readout_identity_and_derived_fields_fail_closed(
     target[obsolete_field] = obsolete_value
     with pytest.raises(ValueError, match="exactly"):
         decode_calibration_artifact(encode(tree))
-
-
-def test_calibration_reference_codec_is_stable_and_namespace_typed():
-    reference = CalibrationArtifactRef("lab-a", "a" * 64)
-    assert decode_calibration_artifact_ref(
-        encode_calibration_artifact_ref(reference)
-    ) == reference
-    assert CalibrationArtifactRef("lab-b", reference.manifest_digest) != reference
 
 
 def test_out_of_frame_geometry_is_rejected_at_application_not_silently_clipped():
