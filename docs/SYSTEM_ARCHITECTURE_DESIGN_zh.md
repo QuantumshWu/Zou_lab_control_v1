@@ -3262,7 +3262,9 @@ apps/
 
 ### 22.1 追溯整改范围与当前 gate
 
-规则 1–7 的审查集合必须每次由 Git 机械产生，不能靠上下文记忆或“我记得写过哪些提交”。整改启动时的固定证据是 `git rev-list --count main..HEAD = 113`、`git diff --name-only main...HEAD = 315`；在纠正误删并完成 tracked-fixture 整改的 checkpoint `12f3414`，分支变为 139/323；清除错误 calibration 历史并把唯一 oracle 重新冻结到 exact main 后，checkpoint `455ff97` 为 160 个领先提交、330 个 changed files；当前已提交 checkpoint `e31cb9407ae8` 为 161/330。其后的 Rule 1–7 工作树整改尚未提交，不能混进该 checkpoint 数字。后续数字会随整改提交增长，因此报告必须同时写 checkpoint commit，不能把任一组历史数字当永久常量。
+规则 1–7 的审查集合必须每次由 Git 机械产生，不能靠上下文记忆或“我记得写过哪些提交”。整改启动时的固定证据是 `git rev-list --count main..HEAD = 113`、`git diff --name-only main...HEAD = 315`；在纠正误删并完成 tracked-fixture 整改的 checkpoint `12f3414`，分支变为 139/323；清除错误 calibration 历史并把唯一 oracle 重新冻结到 exact main 后，checkpoint `455ff97` 为 160 个领先提交、330 个 changed files；`e31cb9407ae8` 为 161/330；完成 superseded calibration/readout graph 删除后的当前已提交 checkpoint `5e2e2f6` 为 170/375。后续数字会随整改提交增长，因此报告必须同时写 checkpoint commit，不能把任一组历史数字当永久常量。
+
+本文件是目标架构、迁移顺序和 Rules 1–7 gate 的唯一计划级权威。`docs/MAINTAINER_NOTES.md` 以及 `Zou_lab_control/frontend` 内的说明和结构测试只描述仍在 `SerializedLegacyAggBridge` 后运行的 legacy island；它们可以在最后 consumer 迁走前保护现状，但不得反向规定 `zlc_frontend`、`zlc_workbench` 或其它目标包的类型、继承树和 UI/runtime 架构。旧 roadmap 不再作为并行计划源；计划级决定必须与实现同 commit 回填本文件。
 
 `12f3414` 的 323 文件第一集合按顶层 owner 分布为：tests 142、旧树 `Zou_lab_control` 48、`zlc_neutral_atom` 42、`zlc_pulse` 23、`zlc_data` 20、`zlc_workbench` 10、`zlc_frontend` 8、FPGA host/config 8、tracked pulse assets 6、`zlc_storage` 6、tutorials 5、docs 2、root/config 3；文件类型为 Python 298、JSON 9、Markdown 7、notebook 5，其余 TOML/gitignore/TeX body/batch 各 1。每个文件必须分配一个 primary owner/slice，测试跟随被测 owner审查；跨域文件还要记录 secondary seam，不能因“另一路 agent 看过相邻包”漏掉。
 

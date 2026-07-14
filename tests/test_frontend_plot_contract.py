@@ -1,4 +1,8 @@
-"""MECHANICAL guard for a core frontend design principle.
+"""Legacy-island regression guard for ``Zou_lab_control.frontend`` only.
+
+This file does not define the target ``zlc_frontend`` architecture. It keeps
+the unmigrated SerializedLegacyAggBridge internally coherent until its final
+dependency-closed removal.
 
 The frontend exists so every plot reuses ONE layer: selectors (zoom/pan, area,
 cross, draggable lines) and the DataFigure fitting/post-processing stack.  A plot
@@ -6,7 +10,7 @@ type gets that layer by being a ``BaseLivePlot`` subclass and going through its
 ``show()`` lifecycle.  Hand-rolling a raw-matplotlib figure silently loses it --
 that is exactly what happened to the multi-site histogram grid (2026-06).
 
-This test encodes the principle as a contract so it cannot regress to prose:
+Within that legacy package, this test encodes the existing contract:
 
 1. structural -- no plot-shaped class in ``live.py`` may bypass ``BaseLivePlot``;
 2. behavioural -- every public plot entry point produces a figure whose

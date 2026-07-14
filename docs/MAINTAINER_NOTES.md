@@ -1,12 +1,13 @@
 # Maintainer Notes
 
-This is the single agent/maintainer note for `Zou_lab_control`. It consolidates
-the former `DOCUMENTATION_GUIDE.md`, `PROJECT_OVERVIEW.md`,
-`FPGA_PULSE_STREAMER_CAPACITY.md`, `FRONTEND_FLUENT_STYLE_GUIDE.md`,
-`AGENTS.md`, and the implementation half of the old hardware runbook.
+These notes describe the still-running `Zou_lab_control/` legacy island and its
+hardware implementation details. They are not the target architecture or an
+agent instruction source; `docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md` is the sole
+architecture and migration authority. Sections about `BaseLivePlot`,
+Confocal-derived geometry, selectors, or the shared Figure model apply only
+while that island remains behind `SerializedLegacyAggBridge`.
 
-It records architecture constraints, invariants, anti-patterns, and review
-findings. User-facing tutorials live in the four PDF manuals
+User-facing tutorials live in the four PDF manuals
 (`docs/main_manual`, `docs/frontend_manual`, `docs/fpga_manual`,
 `docs/device_manual`) and must stay
 tutorial-like: explain behaviour and state ownership, not blame.
@@ -28,7 +29,8 @@ Style rules for manuals:
   calibration, frontend plot.
 - Do not put sentences like "this is a serious architecture error" into a
   manual. Rephrase as neutral behaviour. That invariant belongs here.
-- Keep historical-code discussion in `references/`, not in quickstarts.
+- Describe only the active implementation and its current contracts; do not carry retired
+  implementations into user-facing documentation.
 
 Source of truth for generated docs (edit the template, then rebuild the PDF):
 
@@ -245,9 +247,8 @@ which share the `quantized_time_steps` floor/round-to-nearest logic in
 
 ## 5. Frontend Fluent Rules
 
-Source of truth is the historical Confocal GUI Fluent layer under
-`references/source_archives/Confocal_GUIv2_refactored_v6/...`. Reuse
-`Zou_lab_control/frontend/qt_fluent.py`; do not create one-off Qt styles per GUI.
+The single source of truth is `Zou_lab_control/frontend/qt_fluent.py`; do not
+create one-off Qt styles per GUI.
 
 Layout primitives that structurally prevent cutoff/overlap (use these instead of
 hand-tuned fixed geometry):
@@ -723,18 +724,6 @@ leaves only a `.build.log` next to the target PDF. `render_tex_pdf(tex, out_pdf)
 accepts a tex **string** or a `.tex` **path**. `write_notes_tex` is the explicit
 source-inspection path; PDF compilation always goes through the temporary-directory
 renderer. See §18.
-
-## §18. frontend public-API seal (the visual-design contract)
-
-The frontend exposes a **small, sealed** surface: callers pass DATA, the frontend
-owns ART/GEOMETRY/dpi/typography. The **single authoritative, numbered statement
-of the rules — plus the failure history that motivates each — is
-`Zou_lab_control/frontend/AGENTS.md`** (do not re-list the rule text here; it
-drifts). `frontend/__init__.py`'s module docstring is the in-code pointer to it.
-Mechanically enforced by `tests/test_frontend_plot_contract.py` (every plot is a
-`BaseLivePlot`), `tests/test_frontend_layout_uniformity.py` (one form system) and
-`tests/test_frontend_smoke.py` (sealed-kwargs rejection, `DEFAULT_STYLE`
-read-only, scale parity).
 
 ## 11. Verification
 

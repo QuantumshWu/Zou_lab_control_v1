@@ -1,4 +1,8 @@
-"""MECHANICAL guard for the ONE plot-kind table (#H3r-F7).
+"""Legacy-island guard for the existing plot-kind table (#H3r-F7).
+
+This test is scoped to ``Zou_lab_control.frontend`` behind
+SerializedLegacyAggBridge; it is not an architecture contract for
+``zlc_frontend``.
 
 Each plot kind used to be described in SEVERAL parallel places: a ``_normalize_kind`` /
 ``plot()`` dispatch ladder in ``frontend/live.py`` and the separate ``PANEL_KINDS`` /

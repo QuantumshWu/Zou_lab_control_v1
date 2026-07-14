@@ -834,7 +834,6 @@ def test_user_facing_markdown_local_links_exist():
     expected_present = {
         "README.md",
         "AGENTS.md",
-        "docs/ROADMAP.md",
         "docs/MAINTAINER_NOTES.md",
         "fpga/README.md",
         "fpga/pulse_streamer/README.md",
