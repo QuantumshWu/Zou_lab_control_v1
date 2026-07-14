@@ -6,6 +6,7 @@ import threading
 import time
 
 import pytest
+import zlc_pulse.server as server_module
 from conftest import pulse_backend_completion_for
 
 from fpga.pulse_streamer.host.image import StreamerParams
@@ -114,6 +115,30 @@ def test_server_messages_are_current_canonical_owner_codecs():
     service.fire(reference)
     completion = service.complete(reference, timeout=1.0)
     assert decode_completion_message(encode_completion_message(completion)) == completion
+
+
+def test_artifact_rpc_message_delegates_to_the_artifact_owner(monkeypatch):
+    artifact = _artifact()
+    encoded = object()
+    decoded = object()
+    encode_calls = []
+    decode_calls = []
+
+    def owner_encode(value):
+        encode_calls.append(value)
+        return encoded
+
+    def owner_decode(payload):
+        decode_calls.append(payload)
+        return decoded
+
+    monkeypatch.setattr(server_module, "encode_compiled_pulse_artifact", owner_encode)
+    monkeypatch.setattr(server_module, "decode_compiled_pulse_artifact", owner_decode)
+
+    assert server_module.encode_artifact_message(artifact) is encoded
+    assert server_module.decode_artifact_message(b"owner-payload") is decoded
+    assert encode_calls == [artifact]
+    assert decode_calls == [b"owner-payload"]
 
 
 def test_completed_receipt_is_replayed_without_reentering_the_backend():

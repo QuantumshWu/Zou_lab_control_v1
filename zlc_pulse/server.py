@@ -20,8 +20,8 @@ from zlc_storage import (
 from .artifact import (
     CompiledPulseArtifact,
     PulseExecutionForm,
-    compiled_pulse_artifact_from_tree,
-    compiled_pulse_artifact_to_tree,
+    decode_compiled_pulse_artifact,
+    encode_compiled_pulse_artifact,
 )
 from .fpga import pack_target_ir
 from .deployment import validate_resident_scan_capacity
@@ -535,11 +535,11 @@ def pulse_completion_from_tree(tree: object) -> PulseCompletion:
 
 
 def encode_artifact_message(value: CompiledPulseArtifact) -> bytes:
-    return encode(compiled_pulse_artifact_to_tree(value))
+    return encode_compiled_pulse_artifact(value)
 
 
 def decode_artifact_message(payload: bytes) -> CompiledPulseArtifact:
-    return compiled_pulse_artifact_from_tree(decode(payload))
+    return decode_compiled_pulse_artifact(payload)
 
 
 def encode_prepared_ref_message(value: PreparedPulseRef) -> bytes:

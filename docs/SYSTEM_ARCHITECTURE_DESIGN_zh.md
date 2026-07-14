@@ -3211,6 +3211,8 @@ apps/
 
 规则 1 的 storage journal 整改以“扫描边界一次解码”为唯一 owner：`FramedJournal._scan()` 在校验 frame 长度、digest 与 canonical record 后同时保留原始 payload 和已解码 value；原始 bytes 继续负责同 id 冲突/幂等判定，`records()` 与 `append_checked()` 只消费已验证 value，不得再次 decode 已有记录。新 append 的候选仍须经过 canonical `encode -> decode` 规范化，torn-tail repair、跨进程锁、fsync 与 corruption fail-closed 语义不变。调用计数测试必须锁定 N 条已有记录每次扫描恰好 N 次 decode，避免以后以 wrapper 或 getter 的形式恢复重复工作。
 
+Pulse RPC 的 artifact message 不是第二个 wire owner：`encode_artifact_message/decode_artifact_message` 只能委托 `zlc_pulse.artifact` 的 current typed canonical codec，不能自行拼 `to_tree -> encode` 或 `decode -> from_tree`。这样 RPC、文件与本地调用共享同一 canonical/semantic admission；结构测试直接替换 owner 函数并验证委托，避免两个实现以后悄悄漂移。Prepared-ref 与 completion 仍由各自类型 owner 编码；此项不允许借机删除 pulse server 或任何现有/计划 consumer。
+
 中间迁移态的“当前 production 调用数”只是一条证据，不能单独裁决目标能力：
 
 | 能力 | 明确的终态 consumer | 审查动作 | 允许物理删除的条件 |
