@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 
 import pytest
+import zlc_storage.framed_journal as journal_module
 
 from zlc_storage import FramedJournal, JournalCorruptionError
 
@@ -62,3 +63,52 @@ def test_framed_journal_serializes_concurrent_appenders(tmp_path):
 
     assert not errors
     assert len(journal.records()) == 16
+
+
+def test_framed_journal_decodes_each_existing_record_once_per_scan(
+    tmp_path,
+    monkeypatch,
+):
+    journal = FramedJournal(tmp_path / "journal.zlcj")
+    expected = tuple(
+        (f"record-{index}", {"index": index})
+        for index in range(4)
+    )
+    for record_id, value in expected:
+        journal.append(record_id, value)
+
+    decode_calls = 0
+    real_decode = journal_module.decode
+
+    def counting_decode(payload):
+        nonlocal decode_calls
+        decode_calls += 1
+        return real_decode(payload)
+
+    monkeypatch.setattr(journal_module, "decode", counting_decode)
+
+    assert journal.records() == expected
+    assert decode_calls == len(expected)
+
+    decode_calls = 0
+    validated = []
+    assert journal.append_checked(
+        "record-next",
+        {"index": len(expected)},
+        validated.append,
+    )
+    expected_after_append = expected + (
+        ("record-next", {"index": len(expected)}),
+    )
+    assert validated == [expected_after_append]
+    assert decode_calls == len(expected) + 1  # existing records + candidate normalization
+
+    decode_calls = 0
+    validated.clear()
+    assert not journal.append_checked(
+        "record-next",
+        {"index": len(expected)},
+        validated.append,
+    )
+    assert validated == [expected_after_append]
+    assert decode_calls == len(expected_after_append)

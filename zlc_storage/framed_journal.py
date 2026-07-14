@@ -114,13 +114,14 @@ class FramedJournal:
                 existing = self._scan(stream, repair_torn_tail=True)
                 previous = existing.get(record_id)
                 if previous is not None:
-                    if previous != payload:
+                    previous_payload, _previous_value = previous
+                    if previous_payload != payload:
                         raise ValueError(
                             f"journal record id {record_id!r} has conflicting content"
                         )
-                    validate(self._decode_payloads(existing))
+                    validate(self._record_values(existing))
                     return False
-                decoded = self._decode_payloads(existing)
+                decoded = self._record_values(existing)
                 candidate_value = decode(payload)["value"]
                 validate(decoded + ((record_id, candidate_value),))
                 stream.seek(0, os.SEEK_END)
@@ -132,20 +133,26 @@ class FramedJournal:
     def records(self) -> tuple[tuple[str, Any], ...]:
         with self._thread_lock, _interprocess_lock(self.lock_path):
             with self.path.open("r+b") as stream:
-                payloads = self._scan(stream, repair_torn_tail=True)
-        return self._decode_payloads(payloads)
+                records = self._scan(stream, repair_torn_tail=True)
+        return self._record_values(records)
 
     @staticmethod
-    def _decode_payloads(payloads: dict[str, bytes]) -> tuple[tuple[str, Any], ...]:
-        result = []
-        for record_id, payload in payloads.items():
-            decoded = decode(payload)
-            result.append((record_id, decoded["value"]))
-        return tuple(result)
+    def _record_values(
+        records: dict[str, tuple[bytes, Any]],
+    ) -> tuple[tuple[str, Any], ...]:
+        return tuple(
+            (record_id, value)
+            for record_id, (_payload, value) in records.items()
+        )
 
-    def _scan(self, stream, *, repair_torn_tail: bool) -> dict[str, bytes]:
+    def _scan(
+        self,
+        stream,
+        *,
+        repair_torn_tail: bool,
+    ) -> dict[str, tuple[bytes, Any]]:
         stream.seek(0)
-        payloads: dict[str, bytes] = {}
+        records: dict[str, tuple[bytes, Any]] = {}
         valid_end = 0
         while True:
             frame_start = stream.tell()
@@ -182,12 +189,12 @@ class FramedJournal:
                 raise JournalCorruptionError(
                     f"invalid canonical journal record at byte {frame_start}"
                 ) from exc
-            previous = payloads.get(record_id)
-            if previous is not None and previous != payload:
+            previous = records.get(record_id)
+            if previous is not None and previous[0] != payload:
                 raise JournalCorruptionError(
                     f"journal record id {record_id!r} has conflicting content"
                 )
-            payloads[record_id] = payload
+            records[record_id] = (payload, decoded["value"])
             valid_end = stream.tell()
         stream.seek(0, os.SEEK_END)
         end = stream.tell()
@@ -197,4 +204,4 @@ class FramedJournal:
             stream.truncate(valid_end)
             stream.flush()
             os.fsync(stream.fileno())
-        return payloads
+        return records

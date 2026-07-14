@@ -3209,6 +3209,8 @@ apps/
 
 当前 gate 是 **NO-GO：迁移继续冻结**。已有整改提交覆盖了一部分 canonical owner、payload digest、格式身份、edit counter、content ref、camera primitive 和 checkout-independent tests，但规则 1–7 尚未全仓闭合；尤其 calibration 物理同帧 golden、monitor/rolling 最小职责、occupancy 原子多字段物化、剩余重复 terminal/deployment validation、镜像 oracle 和各切片海拔压缩仍未完成。
 
+规则 1 的 storage journal 整改以“扫描边界一次解码”为唯一 owner：`FramedJournal._scan()` 在校验 frame 长度、digest 与 canonical record 后同时保留原始 payload 和已解码 value；原始 bytes 继续负责同 id 冲突/幂等判定，`records()` 与 `append_checked()` 只消费已验证 value，不得再次 decode 已有记录。新 append 的候选仍须经过 canonical `encode -> decode` 规范化，torn-tail repair、跨进程锁、fsync 与 corruption fail-closed 语义不变。调用计数测试必须锁定 N 条已有记录每次扫描恰好 N 次 decode，避免以后以 wrapper 或 getter 的形式恢复重复工作。
+
 中间迁移态的“当前 production 调用数”只是一条证据，不能单独裁决目标能力：
 
 | 能力 | 明确的终态 consumer | 审查动作 | 允许物理删除的条件 |
