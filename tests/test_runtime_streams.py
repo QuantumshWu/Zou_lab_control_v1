@@ -702,7 +702,7 @@ def test_rejected_emit_has_no_retention_side_effects():
     source, producer = stream(events=1)
     cursor = source.subscribe(start_sequence=0)
     expected = emit(producer, 1.0)
-    with pytest.raises(ValueError, match="finite timestamp"):
+    with pytest.raises(ValueError):
         producer.emit(
             scalar_value(2.0),
             captured_at=float("nan"),

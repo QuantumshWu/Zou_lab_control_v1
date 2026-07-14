@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import math
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Generic, TypeVar
-from zlc_storage import canonical_text as _canonical_text
+from zlc_storage import canonical_text as _canonical_text, finite_real
 
 from ._failure import (
     clear_exception_traceback,
@@ -67,17 +66,6 @@ PreparedT = TypeVar("PreparedT")
 ResultT = TypeVar("ResultT")
 CommitT = TypeVar("CommitT")
 _MISSING = object()
-
-
-def _validate_timeout(value: float | None, field: str) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{field} must be a finite non-negative number or None")
-    normalized = float(value)
-    if not math.isfinite(normalized) or normalized < 0:
-        raise ValueError(f"{field} must be a finite non-negative number or None")
-    return normalized
 
 
 @dataclass(frozen=True, order=True)
@@ -328,7 +316,15 @@ class RunPlan(Generic[PreparedT, ResultT]):
         object.__setattr__(
             self,
             "timeout_seconds",
-            _validate_timeout(self.timeout_seconds, "timeout_seconds"),
+            (
+                None
+                if self.timeout_seconds is None
+                else finite_real(
+                    self.timeout_seconds,
+                    "timeout_seconds",
+                    minimum=0.0,
+                )
+            ),
         )
 
 
@@ -998,7 +994,11 @@ class RunHandle(Generic[ResultT]):
                 self._condition.notify_all()
 
     def wait(self, timeout: float | None = None) -> RunSnapshot:
-        timeout = _validate_timeout(timeout, "wait timeout") if timeout is not None else None
+        timeout = (
+            finite_real(timeout, "wait timeout", minimum=0.0)
+            if timeout is not None
+            else None
+        )
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._condition:
             while not self._state.terminal:
@@ -1019,7 +1019,11 @@ class RunHandle(Generic[ResultT]):
     ) -> RunSnapshot:
         if not callable(predicate):
             raise TypeError("predicate must be callable")
-        timeout = _validate_timeout(timeout, "wait timeout") if timeout is not None else None
+        timeout = (
+            finite_real(timeout, "wait timeout", minimum=0.0)
+            if timeout is not None
+            else None
+        )
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._condition:
             while True:
@@ -2027,10 +2031,11 @@ class RunController:
         *,
         cancel_join_timeout: float = 5.0,
     ) -> ResultT:
-        cancel_join_timeout = _validate_timeout(
-            cancel_join_timeout, "cancel_join_timeout"
+        cancel_join_timeout = finite_real(
+            cancel_join_timeout,
+            "cancel_join_timeout",
+            minimum=0.0,
         )
-        assert cancel_join_timeout is not None
         handle = self.start(plan)
         try:
             return handle.result()

@@ -7,16 +7,11 @@ from enum import Enum
 import threading
 from typing import Callable
 
-from zlc_storage import canonical_text as _text
-
-
-def _normalize_human_text(value: object, field: str) -> str:
-    if not isinstance(value, str):
-        raise TypeError(f"{field} must be a string")
-    normalized = value.strip()
-    if not normalized:
-        raise ValueError(f"{field} cannot be empty")
-    return normalized
+from zlc_storage import (
+    canonical_text as _text,
+    normalized_text,
+    positive_real,
+)
 
 
 class CatalogRoute(Enum):
@@ -41,7 +36,7 @@ class CatalogEntry:
             object.__setattr__(
                 self,
                 "hidden_reason",
-                _normalize_human_text(self.hidden_reason, "hidden_reason"),
+                normalized_text(self.hidden_reason, "hidden_reason"),
             )
         elif self.hidden_reason is not None:
             raise ValueError("hidden_reason is only valid for HIDDEN routes")
@@ -119,7 +114,7 @@ class SerializedLegacyAggBridge:
     def settle(self, timeout: float = 5.0) -> None:
         self._require_owner()
         self._ensure_usable()
-        timeout = self._timeout(timeout)
+        timeout = positive_real(timeout, "timeout")
         try:
             settled = self._render_loop.barrier(timeout)
         except BaseException as exc:
@@ -135,7 +130,7 @@ class SerializedLegacyAggBridge:
 
     def close(self, timeout: float = 5.0) -> None:
         self._require_owner()
-        timeout = self._timeout(timeout)
+        timeout = positive_real(timeout, "timeout")
         if self._closed:
             return
         if not self._poisoned:
@@ -166,13 +161,6 @@ class SerializedLegacyAggBridge:
             raise RuntimeError("legacy Agg bridge is closed")
         if self._poisoned:
             raise RuntimeError("legacy Agg bridge is poisoned after failed handoff")
-
-    @staticmethod
-    def _timeout(value: object) -> float:
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
-            raise ValueError("timeout must be positive")
-        return float(value)
-
 
 __all__ = [
     "CatalogEntry",

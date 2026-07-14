@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol
-from zlc_storage import canonical_text as _canonical_text
+from zlc_storage import canonical_text as _canonical_text, finite_real
 
 
 def _canonical_segment(value: str, field: str) -> str:
@@ -17,15 +17,6 @@ def _canonical_segment(value: str, field: str) -> str:
     if "/" in value:
         raise ValueError(f"{field} cannot contain '/'")
     return value
-
-
-def _finite_timestamp(value: float, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{field} must be a finite timestamp")
-    normalized = float(value)
-    if normalized != normalized or normalized in (float("inf"), float("-inf")):
-        raise ValueError(f"{field} must be a finite timestamp")
-    return normalized
 
 
 @dataclass(frozen=True, order=True)
@@ -141,7 +132,7 @@ class HazardRecord:
         _canonical_text(self.stable_device_identity, "stable_device_identity")
         _canonical_segment(self.connection_generation, "connection_generation")
         _canonical_text(self.run_id, "hazard run_id")
-        _finite_timestamp(self.activated_at, "hazard activated_at")
+        finite_real(self.activated_at, "hazard activated_at")
 
 
 class SafetyOutcome(str, Enum):
@@ -299,7 +290,7 @@ class SafetyDispositionBundle:
         if len(set(hazard_ids)) != len(hazard_ids):
             raise ValueError("one hazard cannot have multiple safety dispositions")
         object.__setattr__(self, "records", records)
-        _finite_timestamp(self.recorded_at, "safety bundle recorded_at")
+        finite_real(self.recorded_at, "safety bundle recorded_at")
 
 
 @dataclass(frozen=True)
@@ -321,7 +312,7 @@ class QuarantineRecord:
         _canonical_text(self.run_id, "quarantine run_id")
         _canonical_text(self.reason, "quarantine reason")
         _canonical_text(self.recovery_action, "quarantine recovery action")
-        _finite_timestamp(self.recorded_at, "quarantine recorded_at")
+        finite_real(self.recorded_at, "quarantine recorded_at")
         _canonical_segment(self.safety_bundle_id, "safety bundle id")
 
 
@@ -338,7 +329,7 @@ class RecoveryEvidence:
         _canonical_segment(self.connection_generation, "connection generation")
         _canonical_segment(self.health_digest, "health digest")
         _canonical_segment(self.safe_state_digest, "safe-state digest")
-        _finite_timestamp(self.verified_at, "recovery verified_at")
+        finite_real(self.verified_at, "recovery verified_at")
 
 
 @dataclass(frozen=True)
@@ -422,7 +413,7 @@ class RecoveryBundle:
             raise TypeError("recovery bundle claim must be RecoveryClaim")
         if not isinstance(self.evidence, RecoveryEvidence):
             raise TypeError("recovery bundle evidence must be RecoveryEvidence")
-        _finite_timestamp(self.recorded_at, "recovery recorded_at")
+        finite_real(self.recorded_at, "recovery recorded_at")
 
 
 @dataclass(frozen=True)

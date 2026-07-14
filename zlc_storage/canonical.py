@@ -42,6 +42,17 @@ def canonical_text(
     return value
 
 
+def normalized_text(value: object, field: str) -> str:
+    """Normalize one non-empty human/external text input before binding it."""
+
+    if not isinstance(value, str):
+        raise TypeError(f"{field} must be a string")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field} cannot be empty")
+    return normalized
+
+
 def sha256_text(value: object, field: str, *, optional: bool = False) -> str | None:
     """Validate a lowercase SHA-256 text value without recomputing its content."""
 

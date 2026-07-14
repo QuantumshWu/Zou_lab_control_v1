@@ -20,6 +20,7 @@ from zlc_storage.canonical import (
     exact_mapping,
     finite_real,
     integer,
+    normalized_text,
     positive_integer,
     sha256_text,
 )
@@ -35,6 +36,7 @@ def test_canonical_scalar_validators_are_the_single_primitive_boundary():
     assert integer(np.int64(3), "count") == 3
     assert positive_integer(2, "count") == 2
     assert finite_real(np.float64(-0.0), "value") == 0.0
+    assert normalized_text("  user stop  ", "reason") == "user stop"
 
     with pytest.raises(ValueError):
         canonical_text(" padded ", "owner")
@@ -46,6 +48,8 @@ def test_canonical_scalar_validators_are_the_single_primitive_boundary():
         positive_integer(0, "count")
     with pytest.raises(ValueError):
         finite_real(float("nan"), "value")
+    with pytest.raises(ValueError):
+        normalized_text("  ", "reason")
 
 
 def test_exact_mapping_owns_field_and_discriminator_admission():

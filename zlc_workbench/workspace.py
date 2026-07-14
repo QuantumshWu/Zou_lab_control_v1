@@ -10,17 +10,9 @@ from zlc_frontend import BoardFrame, BoardPresenter, RenderSurface
 from zlc_storage import (
     canonical_text as _text,
     nonnegative_integer,
+    normalized_text,
     sha256_text,
 )
-
-
-def _normalize_human_text(value: object, field: str) -> str:
-    if not isinstance(value, str):
-        raise TypeError(f"{field} must be a string")
-    normalized = value.strip()
-    if not normalized:
-        raise ValueError(f"{field} cannot be empty")
-    return normalized
 
 
 @dataclass(frozen=True)
@@ -384,7 +376,7 @@ class RunHandleStatusBinding:
         )
 
     def cancel(self, reason: str = "user requested stop") -> object:
-        return self._handle.cancel(_normalize_human_text(reason, "cancel reason"))
+        return self._handle.cancel(normalized_text(reason, "cancel reason"))
 
 
 __all__ = [

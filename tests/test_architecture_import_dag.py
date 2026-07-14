@@ -28,6 +28,8 @@ CANONICAL_HELPER_NAMES = frozenset(
         "_exact_map",
         "_exact_tree",
         "_finite_real",
+        "_finite_time",
+        "_finite_timestamp",
         "_integer",
         "_nonempty_text",
         "_nonnegative_int",
@@ -39,6 +41,7 @@ CANONICAL_HELPER_NAMES = frozenset(
         "_require_digest",
         "_sha256",
         "_text",
+        "_validate_timeout",
     }
 )
 
@@ -48,10 +51,8 @@ ALLOWED_STRIP_CONTEXTS = frozenset(
         (Path("zlc_pulse/transport/axi.py"), "VivadoAxiRegisterTransport._parse_read"),
         (Path("zlc_neutral_atom/readout/analysis.py"), "_bounded_numeric_version"),
         (Path("zlc_workbench/camera_capture.py"), "_camera_dtype"),
-        (Path("zlc_workbench/legacy.py"), "_normalize_human_text"),
         (Path("zlc_workbench/legacy_neutral_atom.py"), "_qcmos_identity_probe.probe"),
         (Path("zlc_workbench/legacy_neutral_atom.py"), "_pylon_live_identity"),
-        (Path("zlc_workbench/workspace.py"), "_normalize_human_text"),
     }
 )
 

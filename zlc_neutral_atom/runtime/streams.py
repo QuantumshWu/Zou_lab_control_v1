@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import math
 import threading
 import time
 import uuid
@@ -19,6 +18,7 @@ from zlc_storage import (
     canonical_text as _canonical_text,
     decode,
     encode,
+    finite_real,
     nonnegative_integer as _nonnegative_int,
     positive_integer as _positive_int,
     sha256_digest,
@@ -62,15 +62,6 @@ class JoinKeyContract(Protocol):
     def snapshot(self, key: object) -> object: ...
 
     def validate(self, key: object) -> None: ...
-
-
-def _finite_time(value: float, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{field} must be a finite timestamp")
-    value = float(value)
-    if not math.isfinite(value):
-        raise ValueError(f"{field} must be a finite timestamp")
-    return value
 
 
 def _contains_materialization(value: object, seen: set[int] | None = None) -> bool:
@@ -420,8 +411,8 @@ class Envelope(Generic[PayloadT]):
             raise TypeError("DataBlock/DataPatch are materialization values, not stream payloads")
         if not isinstance(self.event_ref, EventRef):
             raise TypeError("event_ref must be EventRef")
-        object.__setattr__(self, "emitted_at", _finite_time(self.emitted_at, "emitted_at"))
-        object.__setattr__(self, "captured_at", _finite_time(self.captured_at, "captured_at"))
+        object.__setattr__(self, "emitted_at", finite_real(self.emitted_at, "emitted_at"))
+        object.__setattr__(self, "captured_at", finite_real(self.captured_at, "captured_at"))
         _digest(self.payload_contract_fingerprint, "payload_contract_fingerprint")
         if not isinstance(self.trace, TraceContext):
             raise TypeError("trace must be TraceContext")
@@ -491,7 +482,7 @@ class EndOfStream:
         object.__setattr__(self, "_stream_id", stream_id)
         object.__setattr__(self, "_stream_generation", stream_generation)
         object.__setattr__(self, "_end_sequence", _nonnegative_int(end_sequence, "end_sequence"))
-        object.__setattr__(self, "_ended_at", _finite_time(ended_at, "ended_at"))
+        object.__setattr__(self, "_ended_at", finite_real(ended_at, "ended_at"))
         object.__setattr__(self, "_owner_ref", weakref.ref(owner))
         object.__setattr__(self, "_nonce", nonce)
 
@@ -1067,7 +1058,7 @@ class ExactConsumerReadiness:
             raise TypeError("event_ref must be EventRef")
         if not callable(checkpoint):
             raise TypeError("checkpoint must be callable")
-        deadline = _finite_time(deadline_monotonic, "deadline_monotonic")
+        deadline = finite_real(deadline_monotonic, "deadline_monotonic")
         reservation = self._source_reservation
         stream = reservation._stream
         if (
@@ -1120,7 +1111,7 @@ class ExactConsumerReadiness:
     ) -> object:
         """Await the immediate processor, which itself includes terminal completion."""
 
-        deadline = _finite_time(deadline_monotonic, "deadline_monotonic")
+        deadline = finite_real(deadline_monotonic, "deadline_monotonic")
         reservation = self._source_reservation
         stream = reservation._stream
         with stream._condition:
